@@ -161,6 +161,15 @@ pub enum UcfxNode {
 
 /// Builds a `UCFX` container from a section tree.
 pub fn ucfx(nodes: &[UcfxNode]) -> Vec<u8> {
+    fn descendants(nodes: &[UcfxNode]) -> u32 {
+        nodes
+            .iter()
+            .map(|n| match n {
+                UcfxNode::Leaf(..) => 1,
+                UcfxNode::Container(_, c) => 1 + descendants(c),
+            })
+            .sum()
+    }
     fn walk(nodes: &[UcfxNode], records: &mut Vec<u8>, data: &mut Vec<u8>, count: &mut u32) {
         for (i, node) in nodes.iter().enumerate() {
             let after = (nodes.len() - 1 - i) as u32;
@@ -175,7 +184,7 @@ pub fn ucfx(nodes: &[UcfxNode]) -> Vec<u8> {
                 }
                 UcfxNode::Container(cc, children) => {
                     records.extend_from_slice(cc);
-                    for v in [u32::MAX, 0, after, children.len() as u32] {
+                    for v in [u32::MAX, 0, after, descendants(children)] {
                         records.extend_from_slice(&v.to_le_bytes());
                     }
                     walk(children, records, data, count);

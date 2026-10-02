@@ -11,13 +11,14 @@
 //!       u32      offset from the end of the header (0xFFFFFFFF on containers)
 //!       u32      length (0 on containers)
 //!       u32      number of siblings after this one at the same level
-//!       u32      number of direct children (nonzero = container)
+//!       u32      number of records in this one's subtree (nonzero = container)
 //! then the leaf sections' data, followed by "CSUM" and a u32 whose meaning
 //! is unknown.
 //! ```
 //!
-//! The records form a tree written depth-first: a container's children
-//! follow it directly. The asset's name, where it has one, is the
+//! The records form a tree written depth-first: a container's whole subtree
+//! follows it directly, and its direct children are found by skipping over
+//! each child's own subtree. The asset's name, where it has one, is the
 //! NUL-terminated string in the top-level `NAME` section; so far only
 //! texture assets carry one.
 
@@ -42,14 +43,10 @@ pub enum UcfxError {
     Truncated { offset: usize, len: usize },
     #[error("header length {len:#x} does not match {count} sections")]
     HeaderLength { len: u32, count: u32 },
-    #[error("section {index} has {found} siblings after it, expected {expected}")]
-    BadSiblingCount {
-        index: usize,
-        expected: u32,
-        found: u32,
-    },
-    #[error("section tree uses {used} of {count} records")]
-    RecordCount { used: usize, count: usize },
+    #[error("section {index} has a sibling count of {found} that does not fit the tree")]
+    BadSiblingCount { index: usize, found: u32 },
+    #[error("section {index}'s subtree runs past its parent")]
+    SubtreeOverrun { index: usize },
     #[error("sections nest deeper than {MAX_DEPTH} levels")]
     TooDeep,
     #[error("section {index} ({offset:#x}+{len:#x}) lies outside the {size:#x}-byte payload")]
@@ -76,8 +73,8 @@ pub struct Section<'a> {
     pub fourcc: [u8; 4],
     /// 0 for top-level sections.
     pub depth: usize,
-    /// Number of direct children; nonzero for containers.
-    pub children: u32,
+    /// Number of records in this section's subtree; nonzero for containers.
+    pub descendants: u32,
     /// The section's bytes; `None` for containers.
     pub data: Option<&'a [u8]>,
 }
@@ -94,7 +91,7 @@ struct Raw {
     offset: u32,
     len: u32,
     siblings_after: u32,
-    children: u32,
+    descendants: u32,
 }
 
 impl<'a> Ucfx<'a> {
@@ -127,34 +124,44 @@ impl<'a> Ucfx<'a> {
                     offset: r.u32()?,
                     len: r.u32()?,
                     siblings_after: r.u32()?,
-                    children: r.u32()?,
+                    descendants: r.u32()?,
                 })
             })
             .collect::<Result<Vec<_>, OutOfBounds>>()?;
 
         let mut sections = Vec::with_capacity(raws.len());
-        // Each frame: sections still expected at that level.
-        let mut stack: Vec<u32> = Vec::new();
-        if let Some(first) = raws.first() {
-            stack.push(first.siblings_after.saturating_add(1));
-        }
+        // Open levels: (index one past the level's last record, the sibling
+        // count the next record at this level must carry).
+        let mut levels: Vec<(u64, Option<u32>)> = vec![(raws.len() as u64, None)];
         for (index, raw) in raws.iter().enumerate() {
-            let Some(remaining) = stack.last_mut() else {
-                return Err(UcfxError::RecordCount {
-                    used: index,
-                    count: raws.len(),
-                });
-            };
-            if raw.siblings_after != *remaining - 1 {
-                return Err(UcfxError::BadSiblingCount {
-                    index,
-                    expected: *remaining - 1,
-                    found: raw.siblings_after,
-                });
+            while levels.len() > 1 && levels.last().is_some_and(|l| l.0 == index as u64) {
+                levels.pop();
             }
-            *remaining -= 1;
-            let depth = stack.len() - 1;
-            let data = if raw.children == 0 {
+            let depth = levels.len() - 1;
+            let Some(level) = levels.last_mut() else {
+                unreachable!("the top level is never popped");
+            };
+            let bad_siblings = UcfxError::BadSiblingCount {
+                index,
+                found: raw.siblings_after,
+            };
+            if level.1.is_some_and(|e| e != raw.siblings_after) {
+                return Err(bad_siblings);
+            }
+            let subtree_end = index as u64 + 1 + u64::from(raw.descendants);
+            if subtree_end > level.0 {
+                return Err(UcfxError::SubtreeOverrun { index });
+            }
+            if subtree_end == level.0 {
+                // Last record at this level.
+                if raw.siblings_after != 0 {
+                    return Err(bad_siblings);
+                }
+            } else {
+                level.1 = Some(raw.siblings_after.checked_sub(1).ok_or(bad_siblings)?);
+            }
+
+            let data = if raw.descendants == 0 {
                 let end = u64::from(raw.offset) + u64::from(raw.len);
                 if end > payload.len() as u64 {
                     return Err(UcfxError::SectionOutOfBounds {
@@ -166,31 +173,17 @@ impl<'a> Ucfx<'a> {
                 }
                 Some(&payload[raw.offset as usize..end as usize])
             } else {
+                if depth + 1 == MAX_DEPTH {
+                    return Err(UcfxError::TooDeep);
+                }
+                levels.push((subtree_end, None));
                 None
             };
             sections.push(Section {
                 fourcc: raw.fourcc,
                 depth,
-                children: raw.children,
+                descendants: raw.descendants,
                 data,
-            });
-            if raw.children > 0 {
-                if stack.len() == MAX_DEPTH {
-                    return Err(UcfxError::TooDeep);
-                }
-                stack.push(raw.children);
-            }
-            while stack.last() == Some(&0) {
-                stack.pop();
-            }
-        }
-        if !stack.is_empty() {
-            return Err(UcfxError::RecordCount {
-                used: raws.len(),
-                count: stack
-                    .iter()
-                    .map(|&n| n as usize)
-                    .fold(raws.len(), usize::saturating_add),
             });
         }
         Ok(Self { sections, payload })
@@ -277,6 +270,9 @@ mod tests {
                 ("BODY", 0)
             ]
         );
+        // The last field counts the whole subtree, not direct children.
+        assert_eq!(u.sections()[0].descendants, 5);
+        assert_eq!(u.sections()[2].descendants, 2);
         // A nested NAME is not the asset's name.
         assert_eq!(u.name(), None);
         assert_eq!(u.top_level(*b"BODY"), Some(&b"body"[..]));
@@ -337,6 +333,26 @@ mod tests {
             Ucfx::parse(&a),
             Err(UcfxError::SectionOutOfBounds { index: 1, .. })
         ));
+    }
+
+    #[test]
+    fn counting_direct_children_is_rejected() {
+        // COMP has three direct children but four records in its subtree.
+        let good = ucfx(&[
+            UcfxNode::Container(
+                *b"COMP",
+                vec![
+                    UcfxNode::Container(*b"schm", vec![leaf(b"decl", b"")]),
+                    leaf(b"info", b"i"),
+                    leaf(b"data", b"d"),
+                ],
+            ),
+            leaf(b"BODY", b"b"),
+        ]);
+        assert!(Ucfx::parse(&good).is_ok());
+        let mut a = good;
+        a[0x14 + 16..0x14 + 20].copy_from_slice(&3u32.to_le_bytes());
+        assert!(Ucfx::parse(&a).is_err());
     }
 
     #[test]
