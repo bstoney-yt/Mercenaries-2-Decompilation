@@ -412,9 +412,17 @@ fn check_group(model: &Model<'_>, g: &PrimitiveGroup<'_>) -> Vec<String> {
             if let Some(pos) = g.decl.find(DeclUsage::Position, 0)
                 && let Some(p) = g.vertices.read(pos)
             {
+                // The bounds were computed before positions were rounded to
+                // half floats, so allow for the rounding.
+                let slack = |b: f32| b.abs() * 2e-3 + 1e-3;
                 let outside = p
                     .iter()
-                    .filter(|v| !aabb.contains([v[0], v[1], v[2]]))
+                    .filter(|v| {
+                        (0..3).any(|i| {
+                            v[i] < aabb.min[i] - slack(aabb.min[i])
+                                || v[i] > aabb.max[i] + slack(aabb.max[i])
+                        })
+                    })
                     .count();
                 if outside > 0 {
                     problems.push(format!("{outside} vertices outside the group bounds"));
