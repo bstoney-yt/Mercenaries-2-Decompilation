@@ -1,0 +1,15 @@
+[package]
+name = "m2-game"
+description = "Gameplay logic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+m2-engine.workspace = true
+m2-math.workspace = true
+
+[lints]
+workspace = true

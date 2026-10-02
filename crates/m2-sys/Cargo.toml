@@ -1,0 +1,17 @@
+[package]
+name = "m2-sys"
+description = "All raw FFI: Win32, Direct3D 9 and the original executable's functions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+m2-layout.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

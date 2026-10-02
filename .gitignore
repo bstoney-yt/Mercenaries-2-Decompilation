@@ -1,0 +1,14 @@
+/target
+
+# Never commit the game or anything extracted from it.
+*.exe
+*.dll
+*.pdb
+*.idb
+*.i64
+*.gzf
+*.rep/
+*.gpr
+/dumps/
+/game/
+/local/

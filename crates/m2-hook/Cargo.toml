@@ -1,0 +1,17 @@
+[package]
+name = "m2-hook"
+description = "Symbol tables and the per-function original/Rust switch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+m2-layout.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
