@@ -70,6 +70,8 @@ name = "m2-assets"
 version = "0.1.0"
 dependencies = [
  "m2-layout",
+ "m2-math",
+ "m2-render",
  "miniz_oxide",
  "thiserror",
 ]
