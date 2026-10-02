@@ -9,6 +9,7 @@
 //! cargo run -p m2-assets --example wad -- dds     <archive.wad> <texture name> <out.dds>
 //! cargo run -p m2-assets --example wad -- models  <archive.wad>
 //! cargo run -p m2-assets --example wad -- obj     <archive.wad> <model hash> <out.obj> [lod]
+//! cargo run -p m2-assets --example wad -- anims   <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -16,6 +17,9 @@
 //! `models` parses every model with its streamed chunks and checks indices,
 //! bounds and bone palettes; `obj` writes one level of detail of one model
 //! (by its name hash in hex) as a Wavefront `.obj` file, in model space.
+//! `anims` decodes every animation clip, finds a model whose nodes cover its
+//! tracks, and checks quaternion lengths, frame rates, the first frame
+//! against the model's bind pose, and that sampled poses are finite.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -27,12 +31,13 @@ use std::process::ExitCode;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
-use m2_assets::model::{GroupExtra, MODEL_TYPE};
+use m2_assets::animation::{ANIMATION_TYPE, AnimationError};
+use m2_assets::model::{GroupExtra, MODEL_TYPE, Node};
 use m2_assets::texture::{BODY, INFO};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{
-    BlockContents, Model, PixelFormat, PrimitiveGroup, Texture, TextureInfo, TextureKind, Ucfx,
-    WadArchive,
+    BlockContents, Clip, Codec, Model, PixelFormat, PrimitiveGroup, Texture, TextureInfo,
+    TextureKind, Ucfx, WadArchive,
 };
 
 /// Type hash of texture assets.
@@ -54,7 +59,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         [cmd, path, ..] => (cmd.as_str(), path),
         _ => {
             return Err(
-                "usage: wad <list|assets|names|extract|textures|dds|models|obj> <archive.wad> [args]".into(),
+                "usage: wad <list|assets|names|extract|textures|dds|models|obj|anims> <archive.wad> [args]".into(),
             );
         }
     };
@@ -139,6 +144,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {} bytes to {out}", dds.len());
         }
         ("models", []) => models(&mut wad)?,
+        ("anims", []) => anims(&mut wad)?,
         ("obj", [hash, out, rest @ ..]) => {
             let hash = u32::from_str_radix(hash.trim_start_matches("0x"), 16)?;
             let lod = match rest {
@@ -597,4 +603,129 @@ fn model_obj<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, lod: u32) -> An
         }
     }
     Ok(obj)
+}
+
+fn anims<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    // Model node lists and raw clip assets, in one pass over the blocks.
+    let mut skeletons: Vec<(u32, Vec<Node>)> = Vec::new();
+    let mut clips: Vec<(u32, Vec<u8>)> = Vec::new();
+    for block in 0..wad.index().blocks().len() {
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (entry, data) in contents.iter() {
+            match entry.type_hash {
+                MODEL_TYPE if entry.unk_0x08 == 0 => match Model::parse(data) {
+                    Ok(m) => skeletons.push((entry.name_hash, m.nodes)),
+                    Err(e) => eprintln!("model {:08x}: {e}", entry.name_hash),
+                },
+                ANIMATION_TYPE => clips.push((entry.name_hash, data.to_vec())),
+                _ => {}
+            }
+        }
+    }
+    let mut by_node: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (i, (_, nodes)) in skeletons.iter().enumerate() {
+        for n in nodes {
+            by_node.entry(n.name_hash).or_default().push(i);
+        }
+    }
+
+    let mut codecs: HashMap<&str, usize> = HashMap::new();
+    let mut rates: HashMap<String, usize> = HashMap::new();
+    let (mut material, mut errors, mut covered, mut events) = (0, 0, 0, 0);
+    let (mut bind_checked, mut bind_matched, mut non_finite) = (0usize, 0usize, 0);
+    let mut worst_quat = 0.0f32;
+    for (hash, data) in &clips {
+        let clip = match Clip::parse(data) {
+            Ok(c) => c,
+            Err(AnimationError::MaterialAnimation) => {
+                material += 1;
+                continue;
+            }
+            Err(e) => {
+                errors += 1;
+                if errors <= 20 {
+                    eprintln!("clip {hash:08x}: {e}");
+                }
+                continue;
+            }
+        };
+        let name = match clip.header.codec {
+            Codec::Interleaved => "interleaved",
+            Codec::Delta => "delta",
+            Codec::Wavelet => "wavelet",
+        };
+        *codecs.entry(name).or_default() += 1;
+        let rate = clip
+            .frame_rate()
+            .map_or("-".to_owned(), |r| format!("{r:.2}"));
+        *rates.entry(rate).or_default() += 1;
+        events += clip.events.len();
+        for f in 0..clip.frame_count {
+            for t in clip.frame(f).unwrap_or_default() {
+                worst_quat = worst_quat.max((t.rotation.length() - 1.0).abs());
+            }
+        }
+
+        // The first model whose nodes include every track.
+        let model = clip.track_nodes.first().and_then(|first| {
+            by_node.get(first)?.iter().copied().find(|&m| {
+                let nodes = &skeletons[m].1;
+                clip.track_nodes
+                    .iter()
+                    .all(|h| nodes.iter().any(|n| n.name_hash == *h))
+            })
+        });
+        let Some(model) = model else { continue };
+        covered += 1;
+        let nodes = &skeletons[model].1;
+        let binding = clip.bind(nodes);
+        if let Some(first) = clip.frame(0) {
+            for (node, track) in nodes.iter().zip(binding.node_tracks()) {
+                let Some(t) = track.and_then(|t| first.get(t)) else {
+                    continue;
+                };
+                bind_checked += 1;
+                let row = node.local.m[3];
+                let p = t.translation;
+                if (row[0] - p.x).abs() < 1e-3
+                    && (row[1] - p.y).abs() < 1e-3
+                    && (row[2] - p.z).abs() < 1e-3
+                {
+                    bind_matched += 1;
+                }
+            }
+        }
+        let d = clip.header.duration;
+        for time in [0.0, d * 0.37, d] {
+            let world = binding.model_matrices(&clip.sample(time));
+            if world
+                .iter()
+                .flat_map(|m| m.m.iter().flatten())
+                .any(|v| !v.is_finite())
+            {
+                non_finite += 1;
+            }
+        }
+    }
+    let mut codecs: Vec<_> = codecs.into_iter().collect();
+    codecs.sort();
+    let mut rates: Vec<_> = rates.into_iter().collect();
+    rates.sort();
+    println!(
+        "{} animation assets: {} clips decoded {codecs:?}, {material} material animations, {errors} errors",
+        clips.len(),
+        clips.len() - material - errors
+    );
+    println!("frame rates {rates:?}");
+    println!("{events} events; largest |quaternion length - 1| {worst_quat:.5}");
+    println!(
+        "{covered} clips covered by one of {} models",
+        skeletons.len()
+    );
+    println!(
+        "frame 0 translation matches the HIER local on {bind_matched} of {bind_checked} bound tracks"
+    );
+    println!("{non_finite} sampled poses with non-finite matrices");
+    Ok(())
 }
