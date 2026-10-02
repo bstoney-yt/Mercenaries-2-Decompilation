@@ -146,6 +146,7 @@ name = "m2-render"
 version = "0.1.0"
 dependencies = [
  "m2-math",
+ "thiserror",
 ]
 
 [[package]]
