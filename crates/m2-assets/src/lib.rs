@@ -18,6 +18,8 @@
 //!   wavelet encoded node tracks, timed events, a pose sampler and model
 //!   posing.
 //! - [`havok`]: the binary object packfiles animation clips are stored in.
+//! - [`material_animation`]: material animations (keyed material
+//!   parameters), stored under the animation type hash.
 //! - [`vertex`]: Direct3D 9 vertex declarations and vertex streams, mapped
 //!   onto `m2-render` vertex layouts.
 //!
@@ -36,6 +38,7 @@ pub mod block;
 mod bytes;
 pub mod dxt;
 pub mod havok;
+pub mod material_animation;
 pub mod model;
 pub mod sges;
 pub mod texture;
@@ -50,6 +53,7 @@ pub use animation::{AnimationError, Clip, Codec, Transform};
 pub use block::{BlockContents, BlockEntry, BlockError};
 pub use dxt::{DxtError, DxtFormat};
 pub use havok::{Packfile, PackfileError};
+pub use material_animation::{MaterialAnimError, MaterialAnimation};
 pub use model::{Model, ModelError, PrimitiveGroup};
 pub use sges::{Segment, SgesError, SgesHeader};
 pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};
