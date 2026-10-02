@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bstoney-yt/Mercenaries-2-Decompilation"
+publish = false
+
+[workspace.dependencies]
+m2-layout = { path = "crates/m2-layout" }
+m2-math = { path = "crates/m2-math" }
+m2-mem = { path = "crates/m2-mem" }
+m2-sys = { path = "crates/m2-sys" }
+m2-hook = { path = "crates/m2-hook" }
+m2-engine = { path = "crates/m2-engine" }
+m2-game = { path = "crates/m2-game" }
+m2-render = { path = "crates/m2-render" }
+m2-assets = { path = "crates/m2-assets" }
+m2-modapi = { path = "crates/m2-modapi" }
+
+anyhow = "1"
+bitflags = "2"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck", "scalar-math"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.9"
+tracing = "0.1"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D9",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+debug = true
+panic = "abort"
