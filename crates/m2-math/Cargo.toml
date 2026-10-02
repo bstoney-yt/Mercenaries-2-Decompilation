@@ -1,0 +1,16 @@
+[package]
+name = "m2-math"
+description = "Raw D3DX-style math types and conversions to glam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+m2-layout.workspace = true
+
+[lints]
+workspace = true

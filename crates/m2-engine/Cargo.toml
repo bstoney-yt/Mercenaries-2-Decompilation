@@ -1,0 +1,16 @@
+[package]
+name = "m2-engine"
+description = "Reconstructed engine classes with a safe API over the raw layouts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+m2-layout.workspace = true
+m2-math.workspace = true
+m2-mem.workspace = true
+
+[lints]
+workspace = true
