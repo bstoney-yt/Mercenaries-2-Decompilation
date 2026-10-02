@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 m2-layout.workspace = true
+m2-math.workspace = true
+m2-render.workspace = true
 miniz_oxide.workspace = true
 thiserror.workspace = true
 
