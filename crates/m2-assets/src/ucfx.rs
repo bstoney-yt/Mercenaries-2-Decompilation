@@ -199,6 +199,28 @@ impl<'a> Ucfx<'a> {
         self.payload
     }
 
+    /// Indices into [`sections`](Self::sections) of the direct children of
+    /// section `parent`, or of the top-level sections when `parent` is
+    /// `None`. Empty for a leaf or an out-of-range index.
+    pub fn children(&self, parent: Option<usize>) -> impl Iterator<Item = usize> + '_ {
+        let (mut next, end) = match parent {
+            None => (0, self.sections.len()),
+            Some(p) => match self.sections.get(p) {
+                // Parsing checked every subtree fits inside its parent.
+                Some(s) => (p + 1, p + 1 + s.descendants as usize),
+                None => (0, 0),
+            },
+        };
+        std::iter::from_fn(move || {
+            if next >= end {
+                return None;
+            }
+            let index = next;
+            next += 1 + self.sections[index].descendants as usize;
+            Some(index)
+        })
+    }
+
     /// The first top-level leaf section with this fourcc.
     pub fn top_level(&self, fourcc: [u8; 4]) -> Option<&'a [u8]> {
         self.sections
@@ -277,6 +299,11 @@ mod tests {
         assert_eq!(u.name(), None);
         assert_eq!(u.top_level(*b"BODY"), Some(&b"body"[..]));
         assert_eq!(u.top_level(*b"COMP"), None);
+        assert_eq!(u.children(None).collect::<Vec<_>>(), [0, 6]);
+        assert_eq!(u.children(Some(0)).collect::<Vec<_>>(), [1, 2, 5]);
+        assert_eq!(u.children(Some(2)).collect::<Vec<_>>(), [3, 4]);
+        assert_eq!(u.children(Some(1)).count(), 0);
+        assert_eq!(u.children(Some(99)).count(), 0);
     }
 
     #[test]
