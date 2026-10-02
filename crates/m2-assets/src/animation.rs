@@ -16,8 +16,8 @@
 //! ```
 //!
 //! A further 29 assets of the same type hold material animations in a
-//! different layout (`MANM`, `MINF`, `TRCK` sections); [`Clip::parse`]
-//! reports them as [`AnimationError::MaterialAnimation`].
+//! different layout, parsed by [`material_animation`](crate::material_animation).
+//! [`Clip::parse`] reports them as [`AnimationError::MaterialAnimation`].
 //!
 //! The packfile's contents object is the container:
 //!

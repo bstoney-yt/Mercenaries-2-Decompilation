@@ -19,7 +19,8 @@
 //! (by its name hash in hex) as a Wavefront `.obj` file, in model space.
 //! `anims` decodes every animation clip, finds a model whose nodes cover its
 //! tracks, and checks quaternion lengths, frame rates, the first frame
-//! against the model's bind pose, and that sampled poses are finite.
+//! against the model's bind pose, and that sampled poses are finite; it
+//! also parses every material animation.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -32,6 +33,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 use m2_assets::animation::{ANIMATION_TYPE, AnimationError};
+use m2_assets::material_animation::MaterialAnimation;
 use m2_assets::model::{GroupExtra, MODEL_TYPE, Node};
 use m2_assets::texture::{BODY, INFO};
 use m2_assets::vertex::DeclUsage;
@@ -633,13 +635,24 @@ fn anims<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
     let mut codecs: HashMap<&str, usize> = HashMap::new();
     let mut rates: HashMap<String, usize> = HashMap::new();
     let (mut material, mut errors, mut covered, mut events) = (0, 0, 0, 0);
+    let mut material_tracks = 0;
     let (mut bind_checked, mut bind_matched, mut non_finite) = (0usize, 0usize, 0);
     let mut worst_quat = 0.0f32;
     for (hash, data) in &clips {
         let clip = match Clip::parse(data) {
             Ok(c) => c,
             Err(AnimationError::MaterialAnimation) => {
-                material += 1;
+                match MaterialAnimation::parse(data) {
+                    Ok(m) => {
+                        material += 1;
+                        material_tracks +=
+                            m.materials.iter().map(|m| m.tracks.len()).sum::<usize>();
+                    }
+                    Err(e) => {
+                        errors += 1;
+                        eprintln!("material animation {hash:08x}: {e}");
+                    }
+                }
                 continue;
             }
             Err(e) => {
@@ -713,7 +726,7 @@ fn anims<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
     let mut rates: Vec<_> = rates.into_iter().collect();
     rates.sort();
     println!(
-        "{} animation assets: {} clips decoded {codecs:?}, {material} material animations, {errors} errors",
+        "{} animation assets: {} clips decoded {codecs:?}, {material} material animations ({material_tracks} parameter tracks), {errors} errors",
         clips.len(),
         clips.len() - material - errors
     );
