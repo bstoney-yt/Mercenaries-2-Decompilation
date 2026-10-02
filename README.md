@@ -32,5 +32,6 @@ A Cargo workspace targeting the original 32-bit process (`i686-pc-windows-msvc`)
 cargo test --workspace
 cargo xtask symbols                                   # validate symbol tables
 cargo clippy --workspace --target i686-pc-windows-msvc
+cargo run -p m2-assets --example wad -- list "<install dir>\data\Loading.wad"
 ```
 
