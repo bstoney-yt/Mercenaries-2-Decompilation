@@ -9,6 +9,9 @@
 //! - [`block`]: the asset directory at the start of a decoded block.
 //! - [`ucfx`]: the sectioned container each asset is stored in, including
 //!   the asset's name where it has one.
+//! - [`texture`]: texture assets: header, mip chain (including mips streamed
+//!   from other blocks) and conversion to RGBA8.
+//! - [`dxt`]: DXT1, DXT3 and DXT5 decoding.
 //!
 //! # Provenance
 //!
@@ -22,7 +25,9 @@
 
 pub mod block;
 mod bytes;
+pub mod dxt;
 pub mod sges;
+pub mod texture;
 pub mod ucfx;
 pub mod wad;
 
@@ -30,6 +35,8 @@ pub mod wad;
 mod testutil;
 
 pub use block::{BlockContents, BlockEntry, BlockError};
+pub use dxt::{DxtError, DxtFormat};
 pub use sges::{Segment, SgesError, SgesHeader};
+pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};
 pub use ucfx::{Section, Ucfx, UcfxError};
 pub use wad::{Asset, Block, Header, WadArchive, WadError, WadIndex};
