@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run -p m2-assets --example wad -- list    <archive.wad>
 //! cargo run -p m2-assets --example wad -- assets  <archive.wad>
+//! cargo run -p m2-assets --example wad -- names   <archive.wad>
 //! cargo run -p m2-assets --example wad -- extract <archive.wad> <block path> <out file>
 //! ```
 //!
@@ -13,7 +14,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::process::ExitCode;
 
-use m2_assets::WadArchive;
+use m2_assets::{BlockContents, Ucfx, WadArchive};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -31,7 +32,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         [cmd, path, ..] => (cmd.as_str(), path),
         _ => {
             return Err(
-                "usage: wad <list|assets|extract> <archive.wad> [block path] [out file]".into(),
+                "usage: wad <list|assets|names|extract> <archive.wad> [block path] [out file]"
+                    .into(),
             );
         }
     };
@@ -67,6 +69,39 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     a.block,
                     alt.join(",")
                 );
+            }
+        }
+        ("names", []) => {
+            // Decodes every block; use --release for the large archives.
+            let types = index.type_hashes().to_vec();
+            for block in 0..index.blocks().len() {
+                let decoded = match wad.read_block(block) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("block {block}: {e}");
+                        continue;
+                    }
+                };
+                let contents = match BlockContents::parse(&decoded) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("block {block}: {e}");
+                        continue;
+                    }
+                };
+                for (entry, data) in contents.iter() {
+                    let ty = types.iter().position(|&t| t == entry.type_hash);
+                    let name = match Ucfx::parse(data) {
+                        Ok(u) => u.name().unwrap_or("-").to_owned(),
+                        Err(e) => format!("<{e}>"),
+                    };
+                    println!(
+                        "{block:5} {:08x} type {:>2} {:#9x} {name}",
+                        entry.name_hash,
+                        ty.map_or("?".to_owned(), |t| t.to_string()),
+                        entry.len,
+                    );
+                }
             }
         }
         ("extract", [block, out]) => {
