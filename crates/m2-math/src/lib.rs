@@ -6,6 +6,8 @@
 //! converts to `glam` (column-major, column vectors) at the boundary instead
 //! of embedding glam types in raw structs.
 
+mod d3dx;
+
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 use m2_layout::assert_layout;
