@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 m2-layout.workspace = true
+miniz_oxide.workspace = true
 thiserror.workspace = true
 
 [lints]

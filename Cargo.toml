@@ -26,6 +26,7 @@ anyhow = "1"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck", "scalar-math"] }
+miniz_oxide = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.9"
