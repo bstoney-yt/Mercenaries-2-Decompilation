@@ -138,3 +138,59 @@ impl WadBuilder {
         f
     }
 }
+
+/// Builds a decoded block from `(name_hash, type_hash, unk_0x08, data)`.
+pub fn block_contents(assets: &[(u32, u32, u32, Vec<u8>)]) -> Vec<u8> {
+    let mut out = (assets.len() as u32).to_le_bytes().to_vec();
+    for (name, ty, unk, data) in assets {
+        for v in [*name, *ty, *unk, data.len() as u32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for (.., data) in assets {
+        out.extend_from_slice(data);
+    }
+    out
+}
+
+/// A section for [`ucfx`].
+pub enum UcfxNode {
+    Leaf([u8; 4], Vec<u8>),
+    Container([u8; 4], Vec<UcfxNode>),
+}
+
+/// Builds a `UCFX` container from a section tree.
+pub fn ucfx(nodes: &[UcfxNode]) -> Vec<u8> {
+    fn walk(nodes: &[UcfxNode], records: &mut Vec<u8>, data: &mut Vec<u8>, count: &mut u32) {
+        for (i, node) in nodes.iter().enumerate() {
+            let after = (nodes.len() - 1 - i) as u32;
+            *count += 1;
+            match node {
+                UcfxNode::Leaf(cc, bytes) => {
+                    records.extend_from_slice(cc);
+                    for v in [data.len() as u32, bytes.len() as u32, after, 0] {
+                        records.extend_from_slice(&v.to_le_bytes());
+                    }
+                    data.extend_from_slice(bytes);
+                }
+                UcfxNode::Container(cc, children) => {
+                    records.extend_from_slice(cc);
+                    for v in [u32::MAX, 0, after, children.len() as u32] {
+                        records.extend_from_slice(&v.to_le_bytes());
+                    }
+                    walk(children, records, data, count);
+                }
+            }
+        }
+    }
+    let (mut records, mut data, mut count) = (Vec::new(), Vec::new(), 0);
+    walk(nodes, &mut records, &mut data, &mut count);
+    let mut out = b"UCFX".to_vec();
+    for v in [0x14 + 20 * count, 0, 0, count] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&records);
+    out.extend_from_slice(&data);
+    out.extend_from_slice(b"CSUM\0\0\0\0");
+    out
+}
