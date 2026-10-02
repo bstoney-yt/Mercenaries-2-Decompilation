@@ -12,6 +12,10 @@
 //! - [`texture`]: texture assets: header, mip chain (including mips streamed
 //!   from other blocks) and conversion to RGBA8.
 //! - [`dxt`]: DXT1, DXT3 and DXT5 decoding.
+//! - [`model`]: model assets: node hierarchy, materials, LOD segments and
+//!   primitive groups (including geometry streamed from other blocks).
+//! - [`vertex`]: Direct3D 9 vertex declarations and vertex streams, mapped
+//!   onto `m2-render` vertex layouts.
 //!
 //! # Provenance
 //!
@@ -26,9 +30,11 @@
 pub mod block;
 mod bytes;
 pub mod dxt;
+pub mod model;
 pub mod sges;
 pub mod texture;
 pub mod ucfx;
+pub mod vertex;
 pub mod wad;
 
 #[cfg(test)]
@@ -36,7 +42,9 @@ mod testutil;
 
 pub use block::{BlockContents, BlockEntry, BlockError};
 pub use dxt::{DxtError, DxtFormat};
+pub use model::{Model, ModelError, PrimitiveGroup};
 pub use sges::{Segment, SgesError, SgesHeader};
 pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};
 pub use ucfx::{Section, Ucfx, UcfxError};
+pub use vertex::{VertexDecl, VertexError, VertexStream};
 pub use wad::{Asset, Block, Header, WadArchive, WadError, WadIndex};
