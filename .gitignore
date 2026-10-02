@@ -9,6 +9,10 @@
 *.gzf
 *.rep/
 *.gpr
+*.wad
+*.block
+*.pws
+*.bik
 /dumps/
 /game/
 /local/
