@@ -797,4 +797,43 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn names_assets_through_blocks_and_ucfx() {
+        use crate::testutil::{UcfxNode, block_contents, ucfx};
+        use crate::{BlockContents, Ucfx};
+
+        let named = ucfx(&[
+            UcfxNode::Leaf(*b"NAME", b"global_loading_skull\0".to_vec()),
+            UcfxNode::Leaf(*b"BODY", vec![7; 0x1000]),
+        ]);
+        let unnamed = ucfx(&[UcfxNode::Leaf(*b"data", vec![1, 2, 3])]);
+        let decoded = block_contents(&[
+            (0x443f_889b, 0xf011_157a, 0, named),
+            (0x96fb_0f27, 0xBBBB_0001, 0, unnamed),
+        ]);
+        let mut w = WadBuilder::new(&[0xf011_157a, 0xBBBB_0001]);
+        w.block(
+            "blocks\\Test\\skull_P000_Q3.block",
+            &decoded,
+            SegmentKind::Deflate,
+        );
+        w.asset(0x443f_889b, 0, 0, [NO_BLOCK; 3]);
+        w.asset(0x96fb_0f27, 1, 0, [NO_BLOCK; 3]);
+
+        let mut wad = WadArchive::open(Cursor::new(w.build())).unwrap();
+        let data = wad.read_block(0).unwrap();
+        let block = BlockContents::parse(&data).unwrap();
+        let names: Vec<_> = wad
+            .index()
+            .assets()
+            .iter()
+            .map(|a| {
+                let ty = wad.index().type_hash(a);
+                let entry = block.find(a.name_hash, ty).unwrap();
+                Ucfx::parse(block.asset_data(entry)).unwrap().name()
+            })
+            .collect();
+        assert_eq!(names, [Some("global_loading_skull"), None]);
+    }
 }
