@@ -289,12 +289,20 @@ fn texture_dds<R: Read + Seek>(wad: &mut WadArchive<R>, name: &str) -> AnyResult
 fn dds(info: &TextureInfo, chain: &[u8]) -> Vec<u8> {
     let mut out = b"DDS ".to_vec();
     let mut put = |v: u32| out.extend_from_slice(&v.to_le_bytes());
-    // Header: size; flags CAPS|HEIGHT|WIDTH|PIXELFORMAT|MIPMAPCOUNT|LINEARSIZE.
+    // Header: size; flags CAPS|HEIGHT|WIDTH|PIXELFORMAT|MIPMAPCOUNT plus
+    // LINEARSIZE (compressed) or PITCH (uncompressed).
+    let (size_flag, pitch) = match info.format {
+        PixelFormat::A8R8G8B8 => (0x8, u32::from(info.width) * 4),
+        f => (
+            0x8_0000,
+            f.image_len(info.width.into(), info.height.into()) as u32,
+        ),
+    };
     put(124);
-    put(0x1 | 0x2 | 0x4 | 0x1000 | 0x2_0000 | 0x8_0000);
+    put(0x1 | 0x2 | 0x4 | 0x1000 | 0x2_0000 | size_flag);
     put(info.height.into());
     put(info.width.into());
-    put(info.format.image_len(info.width.into(), info.height.into()) as u32);
+    put(pitch);
     put(0);
     put(info.mip_count.into());
     (0..11).for_each(|_| put(0));
