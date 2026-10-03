@@ -119,8 +119,8 @@
 //! 27 resident voice sets (`m2_assets::voice`) and decodes their lines from
 //! `vo_stream.english.pws`, so soldiers and civilians shout in Play mode.
 //! Which set is the VZ army is named only by hash, so the page picks the
-//! soldiers' and civilians' sets by ear (Voices panel); the defaults and
-//! the moments they shout are guesses.
+//! soldiers' and civilians' sets by ear (Voices panel); the defaults were
+//! checked by ear, and the moments they shout are invented.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
