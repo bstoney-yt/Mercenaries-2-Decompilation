@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>m2 glTF viewer</title>
+<style>
+  :root { color-scheme: dark; --bg: #1b1d22; --panel: #262a31; --text: #e6e6e6; --muted: #9aa0aa; --accent: #6aa9ff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px system-ui, sans-serif; }
+  #view { position: fixed; inset: 0; }
+  #panel { position: fixed; top: 12px; left: 12px; width: 320px; max-height: calc(100% - 24px); overflow: auto;
+           background: var(--panel); border-radius: 8px; padding: 12px; box-shadow: 0 4px 16px #0006; }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  label { display: block; color: var(--muted); margin: 10px 0 4px; }
+  select, input[type=range] { width: 100%; }
+  select { background: var(--bg); color: var(--text); border: 1px solid #444; border-radius: 4px; padding: 4px; }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+  button { background: var(--accent); color: #000; border: 0; border-radius: 4px; padding: 6px 10px; cursor: pointer; }
+  #status { color: var(--muted); margin-top: 10px; white-space: pre-wrap; }
+  #drop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+          background: #000a; font-size: 20px; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="panel">
+  <h1>m2 glTF viewer</h1>
+  <div id="name"></div>
+  <label for="anim">Animation</label>
+  <select id="anim"></select>
+  <div class="row">
+    <button id="play">Pause</button>
+    <button id="prev">◀</button>
+    <button id="next">▶</button>
+    <label style="margin:0"><input type="checkbox" id="skel"> skeleton</label>
+  </div>
+  <label for="speed">Speed <span id="speedv">1.0</span>x</label>
+  <input type="range" id="speed" min="0.1" max="2" step="0.1" value="1">
+  <label for="time">Time <span id="timev"></span></label>
+  <input type="range" id="time" min="0" max="1" step="0.001" value="0">
+  <div id="status">Loading…</div>
+  <div style="color:var(--muted);margin-top:8px">Drag a .glb onto the page to open another.</div>
+</div>
+<div id="drop">Drop a .glb to open it</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const view = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+view.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x30343c);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 2.2));
+const sun = new THREE.DirectionalLight(0xffffff, 2.0);
+sun.position.set(3, 6, 4);
+scene.add(sun);
+const grid = new THREE.GridHelper(20, 20, 0x666666, 0x444444);
+scene.add(grid);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.01, 5000);
+camera.position.set(2, 1.6, 3);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1, 0);
+
+const ui = id => document.getElementById(id);
+const status = msg => ui('status').textContent = msg;
+const clock = new THREE.Clock();
+let mixer = null, action = null, clips = [], root = null, skeleton = null, playing = true, speed = 1;
+
+function frame(obj) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3()).length() || 1;
+  const centre = box.getCenter(new THREE.Vector3());
+  controls.target.copy(centre);
+  camera.position.copy(centre).add(new THREE.Vector3(0.6, 0.35, 1).multiplyScalar(size));
+  camera.near = size / 1000; camera.far = size * 100; camera.updateProjectionMatrix();
+  grid.position.y = box.min.y;
+}
+
+let rest = [];
+function play(i) {
+  if (!mixer) return;
+  mixer.stopAllAction();
+  if (i < 0 || !clips[i]) {
+    // The model's own node transforms, before any clip.
+    for (const [o, p, q, s] of rest) { o.position.copy(p); o.quaternion.copy(q); o.scale.copy(s); }
+    action = null;
+    ui('anim').value = -1;
+    return;
+  }
+  action = mixer.clipAction(clips[i]);
+  action.reset().play();
+  action.paused = !playing;
+  ui('anim').value = i;
+  ui('time').max = clips[i].duration || 1;
+}
+
+function open(gltf, name) {
+  if (root) scene.remove(root);
+  if (skeleton) scene.remove(skeleton);
+  root = gltf.scene;
+  scene.add(root);
+  rest = [];
+  root.traverse(o => rest.push([o, o.position.clone(), o.quaternion.clone(), o.scale.clone()]));
+  skeleton = new THREE.SkeletonHelper(root);
+  skeleton.visible = ui('skel').checked;
+  scene.add(skeleton);
+  mixer = new THREE.AnimationMixer(root);
+  clips = gltf.animations;
+  const sel = ui('anim');
+  sel.innerHTML = '';
+  sel.add(new Option('(rest pose)', -1));
+  clips.forEach((c, i) => sel.add(new Option(`${c.name}  (${c.duration.toFixed(2)}s)`, i)));
+  ui('name').textContent = name;
+  frame(root);
+  // For inspecting from the browser console.
+  window.viewer = { root, mixer, clips, play, THREE };
+  let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
+  status(`${meshes} mesh primitives, ${clips.length} animations`);
+  play(-1);
+}
+
+const loader = new GLTFLoader();
+function load(url, name) {
+  status('Loading…');
+  loader.load(url, g => open(g, name), undefined, e => status('Failed to load: ' + e.message));
+}
+function loadBuffer(buf, name) {
+  loader.parse(buf, '', g => open(g, name), e => status('Failed to parse: ' + e.message));
+}
+
+ui('anim').onchange = e => play(+e.target.value);
+ui('play').onclick = () => { playing = !playing; if (action) action.paused = !playing; ui('play').textContent = playing ? 'Pause' : 'Play'; };
+ui('prev').onclick = () => play((+ui('anim').value - 1 + clips.length) % clips.length);
+ui('next').onclick = () => play((+ui('anim').value + 1) % clips.length);
+ui('skel').onchange = e => { if (skeleton) skeleton.visible = e.target.checked; };
+ui('speed').oninput = e => { speed = +e.target.value; ui('speedv').textContent = speed.toFixed(1); };
+ui('time').oninput = e => { if (action) { action.time = +e.target.value; mixer.update(0); } };
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+addEventListener('dragover', e => { e.preventDefault(); ui('drop').style.display = 'flex'; });
+addEventListener('dragleave', () => ui('drop').style.display = 'none');
+addEventListener('drop', async e => {
+  e.preventDefault(); ui('drop').style.display = 'none';
+  const f = e.dataTransfer.files[0];
+  if (f) loadBuffer(await f.arrayBuffer(), f.name);
+});
+
+renderer.setAnimationLoop(() => {
+  const dt = clock.getDelta();
+  if (mixer && playing) mixer.update(dt * speed);
+  if (action) { ui('time').value = action.time; ui('timev').textContent = action.time.toFixed(2) + 's'; }
+  controls.update();
+  renderer.render(scene, camera);
+});
+
+load('model.glb', new URLSearchParams(location.search).get('name') || 'model.glb');
+</script>
+</body>
+</html>
