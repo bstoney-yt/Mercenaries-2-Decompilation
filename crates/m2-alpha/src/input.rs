@@ -21,6 +21,8 @@ pub enum Action {
     Walk,
     /// Switch between playing on foot and the free camera.
     ToggleFly,
+    /// Play the next music track, or stop the music.
+    ToggleMusic,
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
@@ -51,6 +53,7 @@ impl Default for Bindings {
             (Sprint, vec![ShiftLeft, ShiftRight]),
             (Walk, vec![KeyQ]),
             (ToggleFly, vec![KeyV]),
+            (ToggleMusic, vec![KeyM]),
             (ToggleMouse, vec![Tab]),
             (Fullscreen, vec![F11]),
             (NextGait, vec![KeyN]),

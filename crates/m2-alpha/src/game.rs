@@ -88,6 +88,14 @@ impl Game {
         }
     }
 
+    /// Where sound is heard from: the camera's position and direction.
+    pub fn listener(&self) -> (Vec3, Vec3) {
+        match self.walking() {
+            Some(p) => (p.eye(), p.camera_forward()),
+            None => (self.camera.position, self.camera.forward()),
+        }
+    }
+
     pub fn view(&self, fov: f32, aspect: f32) -> View {
         match self.walking() {
             Some(p) => p.view(fov, aspect),

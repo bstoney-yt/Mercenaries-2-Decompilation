@@ -12,7 +12,7 @@ use crate::scene::Rig;
 /// Movement speeds, m/s, inside the bands the game's clips move at.
 const WALK: f32 = 1.4;
 const RUN: f32 = 5.0;
-const SPRINT: f32 = 6.5;
+const SPRINT: f32 = 7.2;
 /// Take-off speed of a jump, m/s (about 0.8 m high).
 const JUMP: f32 = 4.0;
 /// How fast she turns to face where she is going, radians per second.
@@ -158,7 +158,7 @@ impl Player {
         self.character.position + Vec3::Y * LOOK_HEIGHT
     }
 
-    fn camera_forward(&self) -> Vec3 {
+    pub fn camera_forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         Vec3::new(sy * cp, sp, cy * cp)

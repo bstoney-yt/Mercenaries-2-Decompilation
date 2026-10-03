@@ -20,5 +20,10 @@ serde.workspace = true
 toml.workspace = true
 winit = { workspace = true, features = ["serde"] }
 
+# Sound output. Windows only for now: elsewhere cpal needs the system's
+# ALSA development files, and the game is played on Windows.
+[target.'cfg(windows)'.dependencies]
+cpal = "0.18"
+
 [lints]
 workspace = true

@@ -35,6 +35,7 @@ mod game;
 mod input;
 mod player;
 mod scene;
+mod sound;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -338,6 +339,7 @@ struct Running {
     window: Arc<Window>,
     backend: WgpuBackend,
     game: Game,
+    audio: sound::GameAudio,
     input: Input,
     mouse_look: bool,
     /// Keyboard input is ignored while another window has focus.
@@ -394,6 +396,7 @@ impl App {
             window,
             backend,
             game,
+            audio: sound::GameAudio::start(self.install.as_ref()),
             input: Input::default(),
             mouse_look: false,
             focused,
@@ -472,6 +475,9 @@ impl Running {
             self.window
                 .set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
         }
+        if self.input.take_pressed(Action::ToggleMusic) {
+            self.audio.toggle_music();
+        }
         if self.input.take_pressed(Action::NextGait) {
             self.game.scene.cycle_gaits();
         }
@@ -496,6 +502,8 @@ impl Running {
             self.mouse_look,
             TICK.as_secs_f32(),
         );
+        let (ear, facing) = self.game.listener();
+        self.audio.update(ear, facing);
     }
 }
 
