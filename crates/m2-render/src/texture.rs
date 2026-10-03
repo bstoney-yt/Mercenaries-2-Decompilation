@@ -137,6 +137,18 @@ pub struct MaterialDesc {
     /// maps that cover one surface exactly (terrain cells), whose filtering
     /// would otherwise pick up the opposite edge.
     pub clamp: bool,
+    /// A texture tiled in world space over the base colour near the
+    /// camera, for close-up grain (terrain).
+    pub detail: Option<DetailMap>,
+}
+
+/// A detail texture: tiled every `tile` metres along world x and z, it
+/// scales the base colour by how each texel compares with the texture's
+/// average, fading out with distance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DetailMap {
+    pub texture: TextureHandle,
+    pub tile: f32,
 }
 
 impl Default for MaterialDesc {
@@ -150,6 +162,7 @@ impl Default for MaterialDesc {
             vertex_color: false,
             fog: true,
             clamp: false,
+            detail: None,
         }
     }
 }

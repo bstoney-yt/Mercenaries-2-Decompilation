@@ -771,6 +771,8 @@ fn sphere() -> (Vec<Vec3>, Vec<[u16; 3]>) {
 #[derive(Debug)]
 struct Effects {
     mesh: (VertexBufferHandle, IndexBufferHandle),
+    /// Indices in the mesh.
+    count: u32,
     /// Tracer and flash, fire, smoke.
     light: MaterialId,
     fire: MaterialId,
@@ -823,6 +825,7 @@ impl Effects {
         };
         Ok(Self {
             mesh: (vb, ib),
+            count: faces.len() as u32 * 3,
             light: define([1.0, 0.85, 0.45, 1.0], false, BlendMode::Opaque)?,
             fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
             smoke: define([0.35, 0.35, 0.35, 0.5], true, BlendMode::Translucent)?,
@@ -882,7 +885,7 @@ impl Effects {
                 geometry: Geometry::Indexed {
                     buffer: ib,
                     first: 0,
-                    count: 24,
+                    count: self.count,
                     base_vertex: 0,
                 },
                 world,

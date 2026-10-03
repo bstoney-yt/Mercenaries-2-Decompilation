@@ -782,6 +782,38 @@ mod tests {
     }
 
     #[test]
+    fn the_crosshair_finds_a_soldier_off_to_the_side() {
+        let physics = ground();
+        let dt = 1.0 / 60.0;
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        people.npcs.push(Npc::new(
+            0,
+            &rig(),
+            Vec3::new(17.0, 1.0, 18.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        ));
+        for _ in 0..30 {
+            people.update(&physics, &[], Vec3::ZERO, None, dt);
+            player.update(&physics, Default::default(), dt);
+        }
+        let chest = people.npcs[0].chest();
+        for _ in 0..4 {
+            let to = chest - player.eye();
+            player.yaw = to.x.atan2(to.z);
+            player.pitch = (to.y / to.length()).asin();
+        }
+        let hit = Combat::aim_probe(&physics, &people, &player);
+        assert!(
+            matches!(hit, Some((_, Some(0)))),
+            "{hit:?} eye {} chest {chest}",
+            player.eye()
+        );
+    }
+
+    #[test]
     fn rays_hit_capsules_they_pass_close_to() {
         let a = Vec3::new(0.0, 0.25, 10.0);
         let seg = Vec3::Y * 1.45;

@@ -255,6 +255,8 @@ pub struct TerrainMesh {
     pub indices: Vec<u32>,
     /// The colour map to texture it with.
     pub colour_map: Option<u32>,
+    /// The shared detail texture tiled over it up close (cells only).
+    pub detail_map: Option<u32>,
     /// Lowest and highest vertex, relative to `origin`.
     pub bounds: (Vec3, Vec3),
     /// The ground surface (without skirts) for collision, relative to
@@ -415,6 +417,12 @@ pub fn terrain_cell<R: Read + Seek>(
         message: e.to_string(),
     })?;
     let mut mesh = TerrainMesh::empty(centre, cell.colour_map());
+    // Texture slot 1 of the cell's material, by the format notes.
+    mesh.detail_map = cell
+        .materials
+        .first()
+        .and_then(|m| m.material.textures.get(1).copied())
+        .filter(|&t| t != 0);
     for patch in &cell.patches {
         let offset = Vec3::from(patch.offset);
         for g in &patch.groups {

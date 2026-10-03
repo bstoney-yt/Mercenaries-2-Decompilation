@@ -183,7 +183,12 @@ impl NullBackend {
     }
 
     fn validate_draw(&self, call: &DrawCall) -> Result<(), BackendError> {
-        if let Some(t) = self.material(call.material).texture {
+        let material = self.material(call.material);
+        for t in material
+            .texture
+            .into_iter()
+            .chain(material.detail.map(|d| d.texture))
+        {
             self.textures.get(t.0)?;
         }
         if let Some(skin) = call.skin {

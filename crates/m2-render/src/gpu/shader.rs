@@ -32,6 +32,8 @@ struct Material {
     color: vec4<f32>,
     // x: alpha cutoff, y: lit, z: vertex colour, w: fog
     params: vec4<f32>,
+    // x: detail tiles per metre (0: none), y: fade-out distance
+    detail: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -40,6 +42,8 @@ struct Material {
 @group(2) @binding(0) var<uniform> material: Material;
 @group(2) @binding(1) var base_map: texture_2d<f32>;
 @group(2) @binding(2) var base_sampler: sampler;
+@group(2) @binding(3) var detail_map: texture_2d<f32>;
+@group(2) @binding(4) var detail_sampler: sampler;
 
 struct Varyings {
     @builtin(position) clip: vec4<f32>,
@@ -61,6 +65,15 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         discard;
     }
     var rgb = base.rgb;
+    if material.detail.x > 0.0 {
+        // Each texel against the map's average (its smallest mip), so the
+        // base colour keeps its brightness.
+        let uv = v.world_pos.xz * material.detail.x;
+        let texel = textureSample(detail_map, detail_sampler, uv).rgb;
+        let mean = textureSampleLevel(detail_map, detail_sampler, uv, 16.0).rgb;
+        let fade = clamp(1.0 - distance(v.world_pos, frame.eye.xyz) / material.detail.y, 0.0, 1.0);
+        rgb = rgb * mix(vec3<f32>(1.0), texel / max(mean, vec3<f32>(0.05)), fade);
+    }
     if material.params.y > 0.5 {
         var n = normalize(v.normal);
         if !front {
