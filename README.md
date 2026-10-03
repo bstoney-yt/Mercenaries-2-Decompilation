@@ -36,5 +36,6 @@ cargo run -p m2-assets --example wad -- list "<install dir>\data\Loading.wad"
 cargo run --release -p m2-assets --example gltf -- rigs "<install dir>\data\vz.wad"
 cargo run --release -p m2-assets --example gltf -- export "<install dir>\data\vz.wad" 15d89832 dumps/jen.glb --filter jennifer
 cargo run --release -p m2-assets --example gltf -- view dumps/jen.glb   # open http://127.0.0.1:8765
+cargo run --release -p m2-assets --example gltf -- export "<install dir>\data\vz.wad" 15d89832 dumps/play.glb --filter resident --clips 1000   # then view it and tick Play mode (WASD, Shift, Q)
 ```
 
