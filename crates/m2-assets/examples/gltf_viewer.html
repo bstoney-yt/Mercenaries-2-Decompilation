@@ -1090,6 +1090,130 @@ function nextLeg(n) {
   return end;
 }
 
+// ---- Sight -----------------------------------------------------------------
+// Soldiers on patrol or at their posts notice the player by sight: within
+// 40 m (60 m for a vehicle) and a 120-degree cone ahead of them, or 6 m in
+// any direction, with nothing solid in between. Suspicion builds while they
+// see the player, faster up close, and fades when they do not. Half way they
+// stop, call out, show a "?" and stare; if they lose sight they walk to
+// where the player was last seen and look around, then go back to the
+// nearest point of their route. Full suspicion is a fight: a "!", and
+// soldiers within 25 m join in. After a fight they search the same way.
+// ALL OF THIS IS INVENTED, not the game's AI; only the routes are the game's.
+const SIGHT = { range: 40, cone: Math.PI * 2 / 3, near: 6, call: 25 };
+
+// How well soldier `n` sees `me`: 0 not at all, up to 1 when close. In a
+// fight (`fighting`) he looks the player's way and sees as far as he shoots.
+function canSee(n, me, fighting = false) {
+  const eye = n.body.position.clone().add(new THREE.Vector3(0, 1.6, 0));
+  const to = me.clone().add(new THREE.Vector3(0, 1.2, 0)).sub(eye);
+  const d = to.length(), range = fighting ? 80 : driving ? SIGHT.range * 1.5 : SIGHT.range;
+  if (d > range) return 0;
+  if (fighting) {
+    const hit = castShot(eye, to.normalize(), Math.max(0, d - 0.6), n);
+    return hit && !hit.npc ? 0 : 1;
+  }
+  const facing = n.body.rotation.y + Math.atan2(loco.fwd.x, loco.fwd.y);
+  let off = Math.atan2(to.x, to.z) - facing;
+  off = Math.atan2(Math.sin(off), Math.cos(off));
+  if (d > SIGHT.near && Math.abs(off) > SIGHT.cone / 2) return 0;
+  // People in the way do not hide the player; terrain and buildings do.
+  const hit = castShot(eye, to.normalize(), Math.max(0, d - 0.6), n);
+  if (hit && !hit.npc) return 0;
+  return 1 - 0.7 * d / range;
+}
+
+function turnTo(n, p, dt) {
+  const want = Math.atan2(p.x - n.body.position.x, p.z - n.body.position.z) - Math.atan2(loco.fwd.x, loco.fwd.y);
+  let r = want - n.body.rotation.y;
+  r = Math.atan2(Math.sin(r), Math.cos(r));
+  n.body.rotation.y += r * Math.min(1, dt * 5);
+}
+
+function nearestLeg(n) {
+  let best = 0;
+  n.route.forEach((p, i) => { if (p.distanceTo(n.body.position) < n.route[best].distanceTo(n.body.position)) best = i; });
+  return best;
+}
+
+// "?" and "!" over a soldier's head.
+const marks = {};
+function showMark(n, ch) {
+  if (!ch) { if (n.mark) n.mark.visible = false; return; }
+  if (!marks[ch]) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const g = c.getContext('2d');
+    g.font = 'bold 56px system-ui, sans-serif';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.lineWidth = 6; g.strokeStyle = '#000';
+    g.strokeText(ch, 32, 34);
+    g.fillStyle = ch === '!' ? '#ff4a3a' : '#ffd23a';
+    g.fillText(ch, 32, 34);
+    marks[ch] = new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false });
+  }
+  if (!n.mark) {
+    n.mark = new THREE.Sprite(marks[ch]);
+    n.mark.scale.set(0.45, 0.45, 1);
+    n.mark.position.set(0, 2.25, 0);
+    n.mark.renderOrder = 10;
+    n.body.add(n.mark);
+  }
+  n.mark.material = marks[ch];
+  n.mark.visible = true;
+}
+
+// A soldier not yet fighting: look, grow suspicious, search. Returns true if
+// it moved him this frame.
+function watch(n, me, dt) {
+  n.lookIn = (n.lookIn ?? Math.random() * 0.25) - dt;
+  if (n.lookIn <= 0) { n.lookIn = 0.25; n.sees = canSee(n, me); }
+  const sus = n.sus || 0;
+  if (n.sees) {
+    // About 2 s from first sight to a fight at 25 m, 1.5 s up close.
+    n.sus = Math.min(1, sus + dt * (0.15 + 0.6 * n.sees) * (driving ? 1.5 : 1));
+    n.lastSeen = me.clone();
+  } else {
+    // Not while walking to where the player was seen (for up to 20 s);
+    // once there, it fades as he looks around.
+    const walking = n.state === 'search' && (n.searchFor = (n.searchFor || 0) + dt) < 20;
+    n.sus = Math.max(0, sus - dt * (walking ? 0 : n.state === 'look' ? 0.15 : 0.12));
+  }
+  if (n.sus >= 1) {
+    n.alert = true;
+    n.searching = false;
+    showMark(n, '!');
+    n.markOff = performance.now() + 2500;
+    for (const o of npcs) if (o.soldier && o.alive && o.body.position.distanceTo(n.body.position) < SIGHT.call) o.alert = true;
+    return false;
+  }
+  if (n.sus >= 0.35 && !n.searching) { n.searching = true; bark(n); }
+  if (!n.searching) { showMark(n, null); return false; }
+  if (n.sus <= 0) {
+    // Gave up: back to the nearest point of the route (or home).
+    n.searching = false;
+    showMark(n, null);
+    if (n.route) n.leg = nearestLeg(n);
+    n.state = 'idle'; n.timer = 1 + Math.random() * 2;
+    return false;
+  }
+  showMark(n, '?');
+  if (n.sees) {
+    // Stops and stares.
+    setNpcGait(n, n.actions.aim ? 'aim' : 'idle');
+    turnTo(n, me, dt);
+    n.state = 'stare';
+    return true;
+  }
+  if (n.state === 'look') {
+    setNpcGait(n, 'idle');
+    n.body.rotation.y += dt * 0.9;
+    return true;
+  }
+  if (n.state !== 'search' && n.lastSeen) { n.state = 'search'; n.target = n.lastSeen.clone(); n.searchFor = 0; }
+  return false;
+}
+
 function stepNpcs(dt) {
   if (!npcsSpawned) { spawnNpcs(); return; }
   const me = driving ? driving.root.position : player.position;
@@ -1106,11 +1230,19 @@ function stepNpcs(dt) {
       n.placed = true;
     }
     n.mixer.update(dt);
-    if (!n.alive) continue;
+    if (!n.alive) { showMark(n, null); continue; }
     // Shouts (see `voices`): on turning alert, then now and then in a fight.
     if (n.alert && !n.wasAlert) bark(n);
     else if (n.alert && n.soldier) bark(n, dt * 0.08);
+    // Out of a fight (the player got away or went down): search where he
+    // was last seen (see `watch`).
+    if (n.soldier && n.wasAlert && !n.alert) {
+      const seen = (n.lastSeen || me).clone();
+      Object.assign(n, { sus: 0.6, searching: true, lastSeen: seen, state: 'search', target: seen.clone(), searchFor: 0 });
+    }
     n.wasAlert = n.alert;
+    if (n.mark && n.alert && performance.now() > (n.markOff || 0)) showMark(n, null);
+    if (n.soldier && !n.alert && combat.ready && watch(n, me, dt)) continue;
     if (n.soldier && n.alert && combat.ready && stepSoldier(n, dt)) continue;
     // React: step aside from the character, run from a fast vehicle.
     const dx = b.position.x - me.x, dz = b.position.z - me.z;
@@ -1123,6 +1255,10 @@ function stepNpcs(dt) {
       n.target = new THREE.Vector3(b.position.x + dir.x * dist, b.position.y, b.position.z + dir.y * dist);
       if (fast) bark(n, 0.5);
       n.state = fast ? 'flee' : 'aside';
+    }
+    // Staring or looking around is `watch`'s; anywhere else it is idling.
+    if (n.state !== 'idle' && (!n.target || n.state === 'stare' || n.state === 'look')) {
+      n.state = 'idle'; n.timer = 1 + Math.random();
     }
     if (n.state === 'idle') {
       setNpcGait(n, 'idle');
@@ -1142,6 +1278,7 @@ function stepNpcs(dt) {
     const tx = n.target.x - b.position.x, tz = n.target.z - b.position.z;
     const left = Math.hypot(tx, tz);
     if (left < 0.4) {
+      if (n.state === 'search') { n.state = 'look'; continue; }
       if (n.route && n.state === 'walk') {
         // On to the next point; a short look around at the ends.
         const end = nextLeg(n);
@@ -1151,7 +1288,7 @@ function stepNpcs(dt) {
       }
       n.state = 'idle'; n.timer = 2 + Math.random() * 5; continue;
     }
-    const gait = n.state === 'walk' ? 'walk' : 'run';
+    const gait = n.state === 'walk' || n.state === 'search' ? 'walk' : 'run';
     setNpcGait(n, gait);
     const speed = loco.info[+ui(gait).value].speed;
     const step = Math.min(left, speed * dt);
@@ -1165,7 +1302,8 @@ function stepNpcs(dt) {
     const moved = Math.hypot(next.x - b.position.x, next.z - b.position.z);
     // (Pushed out the far side of a building counts as blocked too.)
     if (moved < step * 0.3 || moved > step * 3 + 0.05 || Math.abs(floor.y - b.position.y) > 1) {
-      // Stuck: a patrol skips to its next point.
+      // Stuck: a search looks around from here; a patrol skips to its next point.
+      if (n.state === 'search') { n.state = 'look'; continue; }
       if (n.route) nextLeg(n);
       n.state = 'idle'; n.timer = 1 + Math.random() * 2; continue;
     }
@@ -1382,14 +1520,21 @@ function stepSoldier(n, dt) {
   const me = driving ? driving.root.position : player.position;
   const d = n.body.position.distanceTo(me);
   if (d > 80 || performance.now() < combat.downUntil) { n.alert = false; return false; }
+  // He fires only while he can see the player (in any direction: he knows
+  // where to look); out of sight for 4 s, he goes to search (see `watch`).
+  n.lookIn = (n.lookIn ?? Math.random() * 0.25) - dt;
+  if (n.lookIn <= 0) { n.lookIn = 0.25; n.sees = canSee(n, me, true); }
+  if (n.sees) { n.lastSeen = me.clone(); n.hidden = 0; }
+  else if ((n.hidden = (n.hidden || 0) + dt) > 4) { n.alert = false; n.hidden = 0; return false; }
   if (n.actions.aim) setNpcGait(n, 'aim');
-  const tx = me.x - n.body.position.x, tz = me.z - n.body.position.z;
+  const aimAt = n.sees ? me : (n.lastSeen || me);
+  const tx = aimAt.x - n.body.position.x, tz = aimAt.z - n.body.position.z;
   const want = Math.atan2(tx, tz) - Math.atan2(loco.fwd.x, loco.fwd.y);
   let r = want - n.body.rotation.y;
   r = Math.atan2(Math.sin(r), Math.cos(r));
   n.body.rotation.y += r * Math.min(1, dt * 6);
   n.cooldown = (n.cooldown ?? Math.random()) - dt;
-  if (n.cooldown <= 0 && Math.abs(r) < 0.3 && d < 70) {
+  if (n.sees && n.cooldown <= 0 && Math.abs(r) < 0.3 && d < 70) {
     npcShoot(n);
     n.cooldown = 0.9 + Math.random() * 0.8;
   }
@@ -2008,7 +2153,7 @@ function open(gltf, name) {
   ui('name').textContent = name;
   frame(root);
   // For inspecting from the browser console.
-  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut, voices, shout, bark, audio, startAudio, hurtNpc, panic,
+  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut, voices, shout, bark, audio, startAudio, hurtNpc, panic, canSee, watch, SIGHT, combat, stepSoldier,
     vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, switchWeapon, throwGrenade, explode, projectiles, audio, startAudio, stepAudio, music, toggleMusic, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
