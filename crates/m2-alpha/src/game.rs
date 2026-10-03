@@ -1,14 +1,15 @@
 //! What a tick does: the player on foot (or the free camera), physics and
 //! animation, and where the frame is seen from.
 
-use m2_math::glam::Vec3;
+use m2_engine::{Physics, VehicleControls};
+use m2_math::glam::{Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
-use crate::player::Intent;
-use crate::scene::Scene;
+use crate::player::{Intent, Player};
+use crate::scene::{ParkedVehicle, Scene};
 
 #[derive(Debug)]
 pub struct Game {
@@ -44,15 +45,76 @@ impl Game {
 
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
-        if let Some(world) = &mut self.scene.world {
-            world.physics.step(dt);
-            if self.on_foot
-                && let Some(player) = &mut self.scene.player
-            {
-                player.update(&world.physics, intent, dt);
+        let scene = &mut self.scene;
+        if let Some(world) = &mut scene.world {
+            let physics = &mut world.physics;
+            let player = scene.player.as_mut().filter(|_| self.on_foot);
+            if let Some(player) = player {
+                if player.landed {
+                    park(physics, &mut scene.vehicles, player);
+                }
+                if intent.use_pressed {
+                    match player.driving {
+                        Some(i) => get_out(physics, &scene.vehicles[i], player),
+                        None => player.driving = nearest(physics, &scene.vehicles, player, REACH),
+                    }
+                }
+                let id = player
+                    .driving
+                    .and_then(|i| scene.vehicles.get(i))
+                    .and_then(|v| v.id.map(|id| (id, v)));
+                if let Some((id, _)) = id {
+                    physics.drive(
+                        id,
+                        VehicleControls {
+                            throttle: intent.movement.y,
+                            steer: intent.movement.x,
+                            brake: intent.hold_jump,
+                        },
+                    );
+                    if intent.right_vehicle {
+                        physics.right_vehicle(id);
+                    }
+                }
+                physics.step(dt);
+                match id.and_then(|(id, v)| Some((physics.vehicle_transform(id)?, v))) {
+                    Some((at, v)) => {
+                        let length = v.spec.bounds.1.z - v.spec.bounds.0.z;
+                        player.chase(at, length, intent.look, dt);
+                    }
+                    None => {
+                        player.driving = None;
+                        player.chase_target = None;
+                        player.update(physics, intent, dt);
+                    }
+                }
+            } else {
+                physics.step(dt);
             }
         }
         self.scene.tick(dt);
+    }
+
+    /// Puts the player in the nearest vehicle within `reach` metres (any
+    /// distance for `f32::INFINITY`). False if there is none.
+    pub fn enter_nearest(&mut self, reach: f32) -> bool {
+        let (Some(world), Some(player)) = (&self.scene.world, &mut self.scene.player) else {
+            return false;
+        };
+        player.driving = nearest(&world.physics, &self.scene.vehicles, player, reach);
+        player.driving.is_some()
+    }
+
+    /// The vehicle being driven: its position and speed (m/s).
+    pub fn driving(&self) -> Option<(Vec3, f32)> {
+        let world = self.scene.world.as_ref()?;
+        let i = self.scene.player.as_ref()?.driving?;
+        let id = self.scene.vehicles.get(i)?.id?;
+        let at = world.physics.vehicle_transform(id)?;
+        Some((
+            at.transform_point3(Vec3::ZERO),
+            world.physics.vehicle_speed(id),
+        ))
     }
 
     /// Switches between walking and flying. Flying starts from the player's
@@ -102,4 +164,96 @@ impl Game {
             None => self.camera.view(fov, aspect),
         }
     }
+}
+
+/// How close she must be to a vehicle's door (or side) to get in, metres.
+const REACH: f32 = 4.0;
+/// Where the parked row starts ahead of her, and the gap between vehicles.
+const PARK_AHEAD: f32 = 12.0;
+const PARK_GAP: f32 = 2.0;
+const PARK_LEFT: f32 = 6.0;
+
+/// Parks vehicles that have loaded but have no body yet, side by side in a
+/// row ahead of the player, facing the way she faces.
+fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player) {
+    if vehicles.iter().all(|v| v.id.is_some()) {
+        return;
+    }
+    let (s, c) = player.facing.sin_cos();
+    let forward = Vec3::new(s, 0.0, c);
+    let right = Vec3::new(c, 0.0, -s);
+    // Across the row: each vehicle takes its width plus a gap, starting a
+    // little to her left.
+    let mut across = 0.0;
+    for v in vehicles.iter_mut() {
+        let width = v.spec.bounds.1.x - v.spec.bounds.0.x;
+        let length = v.spec.bounds.1.z - v.spec.bounds.0.z;
+        let offset = across + width * 0.5;
+        across += width + PARK_GAP;
+        if v.id.is_some() {
+            continue;
+        }
+        let base = player.character.position
+            + forward * (PARK_AHEAD + length * 0.5)
+            + right * (offset - PARK_LEFT);
+        let top = base + Vec3::Y * 50.0;
+        let Some((d, _)) = physics.cast_ray(top, -Vec3::Y, 200.0) else {
+            // Ground not loaded there yet: try again next tick.
+            continue;
+        };
+        let ground = top.y - d;
+        let at = Vec3::new(base.x, ground + v.spec.ride_height() + 0.3, base.z);
+        v.id = Some(physics.add_vehicle(&v.spec, at, player.facing));
+    }
+}
+
+/// The vehicle nearest her within `reach` metres of its door marker (or its
+/// hull, for those without one).
+fn nearest(
+    physics: &Physics,
+    vehicles: &[ParkedVehicle],
+    player: &Player,
+    reach: f32,
+) -> Option<usize> {
+    let p = player.character.position;
+    vehicles
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            let at = physics.vehicle_transform(v.id?)?;
+            let local = at.inverse() * p.extend(1.0);
+            let (lo, hi) = v.spec.bounds;
+            let d = match v.spec.door {
+                Some(door) => (local.xyz() - door).length(),
+                None => (local.xyz().clamp(lo, hi) - local.xyz()).length(),
+            };
+            (d <= reach).then_some((i, d))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+/// Gets her out on the driver's side, beside the hull, to drop to the
+/// ground there.
+fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player) {
+    if let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) {
+        let (lo, hi) = v.spec.bounds;
+        let door = v
+            .spec
+            .door
+            .unwrap_or(Vec3::new(lo.x, 0.0, (lo.z + hi.z) * 0.5));
+        let x = if door.x < (lo.x + hi.x) * 0.5 {
+            lo.x - 0.8
+        } else {
+            hi.x + 0.8
+        };
+        let out = at.transform_point3(Vec3::new(x, 0.0, door.z));
+        player.character.position = Vec3::new(out.x, 0.0, out.z);
+        player.character.velocity = Vec3::ZERO;
+        let f = at.transform_vector3(Vec3::Z);
+        player.facing = f.x.atan2(f.z);
+        player.landed = false;
+    }
+    player.driving = None;
+    player.chase_target = None;
 }

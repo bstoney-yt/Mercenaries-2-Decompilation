@@ -31,6 +31,12 @@ pub struct Intent {
     pub sprint: bool,
     pub walk: bool,
     pub jump: bool,
+    /// Jump held: the brake when driving.
+    pub hold_jump: bool,
+    /// Get in or out of a vehicle.
+    pub use_pressed: bool,
+    /// Turn an overturned vehicle back up.
+    pub right_vehicle: bool,
     /// Camera turn, radians: (yaw, pitch).
     pub look: Vec2,
 }
@@ -56,6 +62,9 @@ impl Intent {
             sprint: input.held(Action::Sprint),
             walk: input.held(Action::Walk),
             jump: input.take_pressed(Action::MoveUp),
+            hold_jump: input.held(Action::MoveUp),
+            use_pressed: input.take_pressed(Action::Use),
+            right_vehicle: input.take_pressed(Action::Reset),
             look,
         }
     }
@@ -72,9 +81,14 @@ pub struct Player {
     pub pitch: f32,
     /// Distance from the look point to the camera this frame.
     camera_distance: f32,
+    /// While driving: the point the chase camera looks at, and the
+    /// vehicle's length.
+    pub chase_target: Option<(Vec3, f32)>,
     /// False until there is ground under the spawn point to land on.
     pub landed: bool,
     pub model: Option<(GpuModel, Rig)>,
+    /// The vehicle she is driving (index into the scene's vehicles).
+    pub driving: Option<usize>,
 }
 
 impl Player {
@@ -86,8 +100,10 @@ impl Player {
             yaw,
             pitch: -0.2,
             camera_distance: CAMERA_DISTANCE,
+            chase_target: None,
             landed: false,
             model,
+            driving: None,
         }
     }
 
@@ -173,8 +189,32 @@ impl Player {
         };
     }
 
+    /// Chase camera for a vehicle at `transform` `length` metres long:
+    /// turns `look` and drifts behind the vehicle's heading when the mouse
+    /// is still.
+    pub fn chase(&mut self, transform: Mat4, length: f32, look: Vec2, dt: f32) {
+        self.chase_target = Some((transform.transform_point3(Vec3::Y * 2.0), length));
+        self.yaw += look.x;
+        self.pitch = (self.pitch + look.y).clamp(-1.2, 0.9);
+        if look == Vec2::ZERO {
+            let f = transform.transform_vector3(Vec3::Z);
+            let heading = f.x.atan2(f.z);
+            let mut turn = (heading - self.yaw).rem_euclid(std::f32::consts::TAU);
+            if turn > std::f32::consts::PI {
+                turn -= std::f32::consts::TAU;
+            }
+            self.yaw += turn * (2.0 * dt).min(1.0);
+        }
+        // She rides along, so streaming and sound follow the vehicle.
+        self.character.position = transform.transform_point3(Vec3::ZERO);
+        self.character.velocity = Vec3::ZERO;
+    }
+
     pub fn eye(&self) -> Vec3 {
-        self.look_at() - self.camera_forward() * self.camera_distance
+        match self.chase_target {
+            Some((at, length)) => at - self.camera_forward() * (length * 0.9 + 3.0),
+            None => self.look_at() - self.camera_forward() * self.camera_distance,
+        }
     }
 
     pub fn view(&self, fov_degrees: f32, aspect: f32) -> View {

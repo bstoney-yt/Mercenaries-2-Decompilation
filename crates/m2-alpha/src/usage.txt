@@ -14,9 +14,13 @@ m2-alpha [options]
   --fullscreen
   --double-sided         start with back-face culling off (as F3)
   --screenshot <out.ppm> render one frame offscreen and exit
+  --drive                with --screenshot on the island: get in the
+                         nearest parked vehicle and drive it forward first
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
+E gets in or out of a vehicle (a row is parked ahead of where you start).
+Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
 V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
-Tab or right mouse captures the mouse, N next gait (--model), F11
-fullscreen, F3 culling, Escape releases the mouse / quits.
+M music on/off, Tab or right mouse captures the mouse, N next gait
+(--model), F11 fullscreen, F3 culling, Escape releases the mouse / quits.

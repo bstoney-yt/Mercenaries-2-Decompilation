@@ -3,13 +3,14 @@
 
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::mpsc::{Receiver, channel};
 
-use crate::player::Player;
 use anyhow::Context as _;
 use m2_engine::anim::load_clips;
+use m2_engine::vehicle::{DRIVABLE, catalogue};
 use m2_engine::{
-    Animator, AssetSource, BoundClip, Gait, GpuModel, Install, Locomotion, MaterialCache, Skeleton,
-    World, WorldSettings,
+    Animator, AssetSource, BoundClip, CatalogueEntry, CpuModel, Gait, GpuModel, Install,
+    Locomotion, MaterialCache, Skeleton, VehicleId, VehicleSpec, World, WorldSettings,
 };
 use m2_math::glam::{Mat4, Vec3};
 use m2_render::{
@@ -18,6 +19,8 @@ use m2_render::{
     Topology, VertexBufferDesc, VertexBufferHandle, VertexFormat, VertexLayout, VertexSemantic,
     generate_mips,
 };
+
+use crate::player::Player;
 
 /// Jennifer Mui, the playable mercenary whose model the README's export
 /// examples use.
@@ -142,6 +145,110 @@ pub struct Scene {
     pub focus: (Vec3, Vec3),
     /// Jennifer, on the island.
     pub player: Option<Player>,
+    /// Drivable vehicles near the spawn.
+    pub vehicles: Vec<ParkedVehicle>,
+    vehicle_loads: Option<Receiver<(VehicleSpec, CpuModel)>>,
+}
+
+/// A vehicle to drive: what it is, its model, and its body once placed.
+#[derive(Debug)]
+pub struct ParkedVehicle {
+    pub spec: VehicleSpec,
+    pub model: GpuModel,
+    pub id: Option<VehicleId>,
+}
+
+/// Kinds that don't drive on wheels (or aren't vehicles to sit in).
+const NOT_DRIVABLE: [&str; 13] = [
+    "boat",
+    "plane",
+    "airstrike",
+    "vtol",
+    "towed",
+    "trailer",
+    "outboardmotor",
+    "winch",
+    "transport",
+    "motorcycle",
+    "helicopter",
+    "jetski",
+    "gunboat",
+];
+
+/// Vehicles parked by the spawn: one of each drivable kind first.
+const PARKED: usize = 8;
+
+/// Finds the island's vehicle models and decodes up to [`PARKED`] of them,
+/// on a thread (the search reads the whole archive).
+fn load_vehicles(install: Install) -> Receiver<(VehicleSpec, CpuModel)> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let result = (|| -> anyhow::Result<()> {
+            let mut source = install.open_world()?;
+            let all = catalogue(&mut source)?;
+            let drivable: Vec<&CatalogueEntry> = all
+                .iter()
+                .filter(|e| {
+                    DRIVABLE.contains(&e.kind.as_str())
+                        // `global_veh_<model>`: civilian cars and trucks,
+                        // named by model rather than kind.
+                        || (e.label.starts_with("global_") && !NOT_DRIVABLE.contains(&e.kind.as_str()))
+                })
+                .collect();
+            eprintln!(
+                "vehicles: {} models by texture name, {} drivable kinds ({:.1} s)",
+                all.len(),
+                drivable.len(),
+                started.elapsed().as_secs_f32()
+            );
+            let rank = |e: &CatalogueEntry| {
+                DRIVABLE
+                    .iter()
+                    .position(|k| *k == e.kind)
+                    .unwrap_or(DRIVABLE.len())
+            };
+            let mut order = drivable.clone();
+            order.sort_by_key(|e| rank(e));
+            // One of each kind, then the rest, one model per name.
+            let mut kinds = std::collections::HashSet::new();
+            let firsts: Vec<&CatalogueEntry> = order
+                .iter()
+                .copied()
+                .filter(|e| kinds.insert(e.kind.clone()))
+                .collect();
+            let mut labels = std::collections::HashSet::new();
+            let mut sent = 0;
+            for e in firsts.into_iter().chain(order) {
+                if sent >= PARKED || !labels.insert(e.label.clone()) {
+                    continue;
+                }
+                let data = source.model(e.model)?;
+                let model = data.parse()?;
+                let Some(spec) = VehicleSpec::from_model(e, &model) else {
+                    labels.remove(&e.label);
+                    continue;
+                };
+                eprintln!(
+                    "vehicle {:08x}: {} ({}, {} wheels)",
+                    e.model,
+                    e.label,
+                    e.kind,
+                    spec.wheels.len()
+                );
+                let cpu = CpuModel::build(e.model, &model, 0);
+                if tx.send((spec, cpu)).is_err() {
+                    return Ok(());
+                }
+                sent += 1;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("vehicles: {e:#}");
+        }
+    });
+    rx
 }
 
 impl Scene {
@@ -156,6 +263,8 @@ impl Scene {
             source: None,
             focus: (Vec3::new(0.0, 2.0, 6.0), Vec3::new(0.0, 1.0, 0.0)),
             player: None,
+            vehicles: Vec::new(),
+            vehicle_loads: None,
         })
     }
 
@@ -260,6 +369,7 @@ impl Scene {
             }
         };
         self.player = Some(Player::new(x, z, 0.0, model));
+        self.vehicle_loads = Some(load_vehicles(install.clone()));
         Ok(())
     }
 
@@ -268,7 +378,32 @@ impl Scene {
         if let Some(world) = &mut self.world {
             world.update(backend, &mut self.materials, eye)?;
         }
+        // At most one vehicle a frame: each uploads a model.
+        if let (Some(rx), Some(source)) = (&self.vehicle_loads, &mut self.source) {
+            match rx.try_recv() {
+                Ok((spec, cpu)) => {
+                    self.materials.load_textures(
+                        backend,
+                        source,
+                        cpu.texture_hashes().collect::<Vec<_>>(),
+                    )?;
+                    let model = GpuModel::upload(backend, &mut self.materials, &cpu)?;
+                    self.vehicles.push(ParkedVehicle {
+                        spec,
+                        model,
+                        id: None,
+                    });
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.vehicle_loads = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         Ok(())
+    }
+
+    /// Vehicles are still being found and decoded.
+    pub fn vehicles_loading(&self) -> bool {
+        self.vehicle_loads.is_some()
     }
 
     /// Advances animation by `dt` seconds.
@@ -299,8 +434,19 @@ impl Scene {
         } else {
             self.draw_ground(queue);
         }
+        if let Some(world) = &self.world {
+            for v in &self.vehicles {
+                let Some(id) = v.id else { continue };
+                let Some(at) = world.physics.vehicle_transform(id) else {
+                    continue;
+                };
+                let nodes = v.spec.posed_nodes(&world.physics.vehicle_wheels(id));
+                v.model.draw_posed(backend, queue, at, &nodes, &[])?;
+            }
+        }
         if let Some(player) = &self.player
             && player.landed
+            && player.driving.is_none()
             && let Some((model, rig)) = &player.model
         {
             let (nodes, skin) = rig.posed();
