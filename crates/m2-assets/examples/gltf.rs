@@ -43,6 +43,15 @@
 //! follows the ground; objects are drawn within `?view=` metres (default
 //! 1500) and scatter within `?veg=` metres (default 150).
 //!
+//! Collision: a placed model's `PHY2` shapes (see `m2_assets::physics`) are
+//! exported as a child node `col ...` of each placement. The viewer stops
+//! the character at them, lets it step up 0.5 m onto them, and slides it
+//! along walls. Placements without `PHY2`, which are mostly the merged
+//! building batches (`TINY` models), collide through their render triangles
+//! instead: a fallback the page labels as such. The character also cannot
+//! climb terrain steeper than 50 degrees, slows down uphill, and falls off
+//! edges.
+//!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
 //! `local/` are ignored) and do not share them.
@@ -444,6 +453,16 @@ impl Gltf {
         self.accessors.push(format!(
             r#"{{"bufferView":{view},"componentType":5123,"count":{},"type":"{ty}"}}"#,
             values.len() / width
+        ));
+        self.accessors.len() - 1
+    }
+
+    fn u32s(&mut self, values: &[u32], target: Option<u32>) -> usize {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let view = self.view(&bytes, target);
+        self.accessors.push(format!(
+            r#"{{"bufferView":{view},"componentType":5125,"count":{},"type":"SCALAR"}}"#,
+            values.len()
         ));
         self.accessors.len() - 1
     }
@@ -1130,20 +1149,63 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
     // Placed models: one glTF mesh per model at its finest complete level
     // of detail, one node per placement (named "obj ..." so the viewer can
     // hide distant ones). Object textures repeat, so they use sampler 1.
+    // A model's collision (its PHY2 shapes) is a second mesh, placed as a
+    // child node "col ..." of each of its placements.
     let mut image_sampler = vec![0u8; images.len()];
-    let mut mesh_of_model: HashMap<u32, Option<usize>> = HashMap::new();
+    let mut mesh_of_model: HashMap<u32, (Option<usize>, Option<usize>)> = HashMap::new();
     let mut material_of_texture: HashMap<u32, usize> = HashMap::new();
     let mut untextured = None;
+    let mut collision_material = None;
+    let mut child_nodes = std::collections::HashSet::new();
     let (mut object_count, mut object_triangles) = (0, 0);
+    let (mut collided, mut collision_triangles) = (0, 0);
     for (model_hash, position, rotation) in &placed {
-        let mesh = match mesh_of_model.get(model_hash) {
+        let (mesh, col) = match mesh_of_model.get(model_hash) {
             Some(m) => *m,
             None => {
+                let mut col = None;
                 let built = (|| -> AnyResult<Option<usize>> {
                     let (base, chunks) = load_model(wad, *model_hash)?;
                     let mut model = Model::parse(&base)?;
                     for c in &chunks {
                         model.add_streamed(c)?;
+                    }
+                    let phy2 = m2_assets::Ucfx::parse(&base)?.top_level(*b"PHY2");
+                    match phy2.map(m2_assets::Physics::parse).transpose() {
+                        Ok(Some(p)) => {
+                            let (mut pos, mut idx) = (Vec::new(), Vec::new());
+                            for (k, s) in p.shapes.iter().enumerate() {
+                                // A shape is in its body node's space.
+                                let to_model = p
+                                    .shape_node(k)
+                                    .and_then(|n| model.node_to_model(n as u16))
+                                    .unwrap_or(Mat4::IDENTITY);
+                                let (v, t) = s.geometry.triangles(s.radius);
+                                let first = (pos.len() / 3) as u32;
+                                for x in v {
+                                    pos.extend(flip_v(
+                                        to_model.transform_point3(Vec3::from(x)).to_array(),
+                                    ));
+                                }
+                                idx.extend(
+                                    t.iter().flat_map(|&[a, b, c]| [a, c, b].map(|i| first + i)),
+                                );
+                            }
+                            if !idx.is_empty() {
+                                let material = *collision_material.get_or_insert_with(|| {
+                                    materials.push(r#"{"name":"collision","pbrMetallicRoughness":{"baseColorFactor":[1,0.35,0.1,0.35],"metallicFactor":0,"roughnessFactor":1},"alphaMode":"BLEND","doubleSided":true}"#.to_owned());
+                                    materials.len() - 1
+                                });
+                                let a = g.floats(&pos, 3, true, Some(34962));
+                                let i = g.u32s(&idx, Some(34963));
+                                meshes.push(format!(
+                                    r#"{{"name":"col {model_hash:08x}","primitives":[{{"attributes":{{"POSITION":{a}}},"indices":{i},"material":{material}}}]}}"#
+                                ));
+                                col = Some((meshes.len() - 1, idx.len() / 3));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => eprintln!("collision {model_hash:08x}: {e}"),
                     }
                     let lod = (0..model.info.lod_count)
                         .find(|&l| model.has_lod(l))
@@ -1260,21 +1322,41 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
                     eprintln!("model {model_hash:08x}: {e}");
                     None
                 });
-                mesh_of_model.insert(*model_hash, mesh);
-                mesh
+                let col = col.map(|(m, tris)| {
+                    collision_triangles += tris;
+                    m
+                });
+                mesh_of_model.insert(*model_hash, (mesh, col));
+                (mesh, col)
             }
         };
         let Some(mesh) = mesh else { continue };
         object_count += 1;
+        let children = match col {
+            Some(col) => {
+                collided += 1;
+                nodes.push(format!(r#"{{"name":"col {model_hash:08x}","mesh":{col}}}"#));
+                child_nodes.insert(nodes.len() - 1);
+                format!(r#","children":[{}]"#, nodes.len() - 1)
+            }
+            None => String::new(),
+        };
         nodes.push(format!(
-            r#"{{"name":"obj {model_hash:08x}","mesh":{mesh},"translation":{:?},"rotation":{:?}}}"#,
+            r#"{{"name":"obj {model_hash:08x}","mesh":{mesh},"translation":{:?},"rotation":{:?}{children}}}"#,
             flip_v(*position),
             flip_q(*rotation)
         ));
     }
     eprintln!(
         "{object_count} placed objects from {} models, {object_triangles} triangles",
-        mesh_of_model.values().flatten().count()
+        mesh_of_model.values().filter(|m| m.0.is_some()).count()
+    );
+    eprintln!(
+        "collision: {collided} of {object_count} placed objects have PHY2 shapes ({} models, {collision_triangles} triangles); the viewer uses the rest's render triangles instead",
+        mesh_of_model
+            .values()
+            .filter(|m| m.0.is_some() && m.1.is_some())
+            .count()
     );
 
     // Vegetation in the detailed cells, GPU-instanced: one node per run of
@@ -1419,7 +1501,9 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
         pieces.iter().map(|p| p.positions.len() / 3).sum::<usize>(),
         images.len()
     );
-    let roots: Vec<usize> = (0..nodes.len()).collect();
+    let roots: Vec<usize> = (0..nodes.len())
+        .filter(|i| !child_nodes.contains(i))
+        .collect();
     let textures: Vec<String> = (0..images.len())
         .map(|i| {
             format!(
