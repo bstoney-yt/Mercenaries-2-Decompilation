@@ -42,6 +42,7 @@ mod game;
 mod input;
 mod npc;
 mod player;
+mod save;
 mod scene;
 mod sound;
 mod ui;
@@ -355,6 +356,29 @@ fn screenshot(
         people.npcs.iter().filter(|n| n.landed).count(),
         started.elapsed().as_secs_f32()
     );
+    if let Some(world) = &game.scene.world {
+        // Where the soldiers' spawns are, for checking placement.
+        let focus = game.focus();
+        let spawns = &world.index.spawns;
+        let mut near: Vec<(f32, &str)> = spawns
+            .iter()
+            .map(|s| (s.position.distance(focus), s.name.as_str()))
+            .collect();
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        eprintln!(
+            "spawns: {} ({} named for a soldier); nearest: {}",
+            spawns.len(),
+            spawns
+                .iter()
+                .filter(|s| people.kind_for(&s.name).is_some())
+                .count(),
+            near.iter()
+                .take(6)
+                .map(|(d, n)| format!("{n:?} {d:.0} m"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if options.fight && game.on_foot && game.scene.player.is_some() {
         fight_for_screenshot(&mut backend, &mut game, fov, aspect)?;
     } else if options.drive && game.on_foot && game.scene.player.is_some() {
@@ -738,6 +762,11 @@ impl Running {
                     Err(e) => eprintln!("could not save {}: {e}", path.display()),
                 }
             }
+            Some(ui::MenuAction::SaveGame) => self.save_game(),
+            Some(ui::MenuAction::LoadGame) => {
+                self.load_game();
+                self.close_menu();
+            }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
             None => {}
         }
@@ -775,6 +804,27 @@ impl Running {
         self.set_mouse_look(true);
     }
 
+    fn save_game(&mut self) {
+        let path = save::SaveGame::default_path();
+        match self.game.save() {
+            Some(s) => match s.write(&path) {
+                Ok(()) => eprintln!("game saved to {}", path.display()),
+                Err(e) => eprintln!("could not save: {e:#}"),
+            },
+            None => eprintln!("nothing to save until the island has loaded"),
+        }
+    }
+
+    fn load_game(&mut self) {
+        match save::SaveGame::read(&save::SaveGame::default_path()) {
+            Ok(s) => {
+                self.game.load(s);
+                eprintln!("game loaded");
+            }
+            Err(e) => eprintln!("could not load: {e:#}"),
+        }
+    }
+
     fn tick(&mut self, config: &Config, _event_loop: &ActiveEventLoop) {
         if self.input.take_pressed(Action::Quit) {
             if self.hud.menu {
@@ -796,6 +846,12 @@ impl Running {
             let full = self.window.fullscreen().is_none();
             self.window
                 .set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
+        }
+        if self.input.take_pressed(Action::QuickSave) {
+            self.save_game();
+        }
+        if self.input.take_pressed(Action::QuickLoad) {
+            self.load_game();
         }
         if self.input.take_pressed(Action::ToggleMusic) {
             self.audio.toggle_music();

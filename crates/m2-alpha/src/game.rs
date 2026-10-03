@@ -6,10 +6,11 @@ use m2_math::glam::{Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
-use crate::combat::{Combat, Field};
+use crate::combat::{Combat, Field, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::player::{Intent, Player};
+use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
 use crate::ui::HudInfo;
 
@@ -24,6 +25,8 @@ pub struct Game {
     /// Looks for parking so far; each widens the search and allows
     /// steeper ground, until [`PARK_TRIES`] give up.
     park_tries: u32,
+    /// Vehicles from a loaded save, placed as their models load.
+    restore: Vec<VehicleSave>,
     pub combat: Combat,
 }
 
@@ -36,6 +39,7 @@ impl Game {
             on_foot,
             park_wait: 0.0,
             park_tries: 0,
+            restore: Vec::new(),
             combat: Combat::default(),
         }
     }
@@ -62,6 +66,9 @@ impl Game {
             let player = scene.player.as_mut().filter(|_| self.on_foot);
             if let Some(player) = player {
                 self.park_wait -= dt;
+                if !self.restore.is_empty() {
+                    restore(physics, &mut scene.vehicles, &mut self.restore);
+                }
                 let waiting = scene.vehicles.iter().any(|v| v.id.is_none());
                 if player.landed && waiting && self.park_wait <= 0.0 && self.park_tries < PARK_TRIES
                 {
@@ -138,6 +145,91 @@ impl Game {
             self.combat.step(&mut field, intent.trigger, dt);
         }
         self.scene.tick(dt);
+    }
+
+    /// The game as it stands, to save; `None` without an island or player.
+    pub fn save(&self) -> Option<SaveGame> {
+        let world = self.scene.world.as_ref()?;
+        let player = self.scene.player.as_ref()?;
+        let mut at = player.character.position;
+        if let Some(v) = player.driving.and_then(|i| self.scene.vehicles.get(i))
+            && let Some(m) = v.id.and_then(|id| world.physics.vehicle_transform(id))
+        {
+            // Saved beside the vehicle, not in it.
+            at = m.transform_point3(Vec3::new(v.spec.bounds.0.x - 1.0, 0.0, 0.0));
+        }
+        let vehicles = self
+            .scene
+            .vehicles
+            .iter()
+            .filter_map(|v| {
+                let m = world.physics.vehicle_transform(v.id?)?;
+                let f = m.transform_vector3(Vec3::Z);
+                Some(VehicleSave {
+                    model: v.spec.model,
+                    position: m.transform_point3(Vec3::ZERO).to_array(),
+                    yaw: f.x.atan2(f.z),
+                    wrecked: v.wrecked,
+                })
+            })
+            // Vehicles a save placed whose models haven't loaded yet.
+            .chain(self.restore.iter().cloned())
+            .collect();
+        Some(SaveGame {
+            version: save::VERSION,
+            player: PlayerSave {
+                position: at.to_array(),
+                facing: player.facing,
+                yaw: player.yaw,
+                pitch: player.pitch,
+                hp: self.combat.hp,
+                weapon: match self.combat.weapon {
+                    Weapon::Rifle => "rifle",
+                    Weapon::Rpg => "rpg",
+                }
+                .into(),
+            },
+            vehicles,
+            killed: self.scene.people.all_killed(),
+        })
+    }
+
+    /// Puts the game back as `save` left it: the player drops to the ground
+    /// where she was, vehicles go back as their models load, and the dead
+    /// stay dead.
+    pub fn load(&mut self, save: SaveGame) {
+        let (Some(world), Some(player)) = (&mut self.scene.world, &mut self.scene.player) else {
+            return;
+        };
+        for v in &mut self.scene.vehicles {
+            if let Some(id) = v.id.take() {
+                world.physics.remove_vehicle(id);
+            }
+            v.wrecked = false;
+        }
+        let p = &save.player;
+        player.character.position = Vec3::from(p.position);
+        player.character.velocity = Vec3::ZERO;
+        player.landed = false;
+        player.driving = None;
+        player.chase_target = None;
+        player.down = false;
+        player.hold = None;
+        player.facing = p.facing;
+        player.yaw = p.yaw;
+        player.pitch = p.pitch;
+        self.combat = Combat::default();
+        self.combat.hp = p.hp.clamp(1.0, 100.0);
+        self.combat.weapon = if p.weapon == "rpg" {
+            Weapon::Rpg
+        } else {
+            Weapon::Rifle
+        };
+        self.scene.people.reset(save.killed);
+        self.restore = save.vehicles;
+        // Vehicles not in the save park afresh.
+        self.park_tries = 0;
+        self.on_foot = true;
     }
 
     /// Parking is finished: every vehicle loaded is parked, or the search
@@ -341,6 +433,20 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
         let at = Vec3::new(origin.x, top + v.spec.ride_height() + 0.3, origin.z);
         v.id = Some(physics.add_vehicle(&v.spec, at, player.facing));
         taken.push((centre, radius));
+    }
+}
+
+/// Puts vehicles from a save back where they were, as their models load.
+fn restore(physics: &mut Physics, vehicles: &mut [ParkedVehicle], saved: &mut Vec<VehicleSave>) {
+    for v in vehicles.iter_mut().filter(|v| v.id.is_none()) {
+        let Some(k) = saved.iter().position(|s| s.model == v.spec.model) else {
+            continue;
+        };
+        let s = saved.swap_remove(k);
+        // A little high, to settle onto its wheels.
+        let at = s.position() + Vec3::Y * 0.3;
+        v.id = Some(physics.add_vehicle(&v.spec, at, s.yaw));
+        v.wrecked = s.wrecked;
     }
 }
 

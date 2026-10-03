@@ -35,6 +35,9 @@ pub enum MenuAction {
     Resume,
     /// Write the settings file.
     SaveSettings,
+    /// Save the game, or load the saved game.
+    SaveGame,
+    LoadGame,
     Quit,
 }
 
@@ -327,6 +330,14 @@ fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
             if ui.button("Resume").clicked() {
                 action = Some(MenuAction::Resume);
             }
+            ui.horizontal(|ui| {
+                if ui.button("Save game (F5)").clicked() {
+                    action = Some(MenuAction::SaveGame);
+                }
+                if ui.button("Load game (F9)").clicked() {
+                    action = Some(MenuAction::LoadGame);
+                }
+            });
             ui.separator();
             ui.heading("Settings");
             ui.add(egui::Slider::new(&mut config.camera.fov, 40.0..=100.0).text("Field of view"));

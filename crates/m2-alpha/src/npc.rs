@@ -18,8 +18,8 @@ use m2_math::glam::{Mat4, Vec2, Vec3};
 use crate::scene::Rig;
 
 /// Soldiers come and go within these distances of the player, metres.
-const ACTIVE: f32 = 250.0;
-const INACTIVE: f32 = 300.0;
+const ACTIVE: f32 = 450.0;
+const INACTIVE: f32 = 500.0;
 /// Most soldiers about at once.
 const MAX_SOLDIERS: usize = 48;
 /// Civilians about the player, and how far from her they stroll.
@@ -370,6 +370,8 @@ pub struct People {
     pub npcs: Vec<Npc>,
     /// The player's aim and fall clips.
     pub clips: FightClips,
+    /// Soldiers (by spawn entity) killed: they stay dead.
+    pub killed: HashSet<u32>,
     active: HashSet<u32>,
     rng: Rng,
 }
@@ -416,6 +418,32 @@ impl People {
         }
     }
 
+    /// Every soldier killed so far, about or not.
+    pub fn all_killed(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .killed
+            .iter()
+            .copied()
+            .chain(
+                self.npcs
+                    .iter()
+                    .filter(|n| !n.alive)
+                    .filter_map(|n| n.spawn),
+            )
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Starts over with these soldiers dead and nobody about (they come
+    /// back round the player on the next tick).
+    pub fn reset(&mut self, killed: impl IntoIterator<Item = u32>) {
+        self.npcs.clear();
+        self.active.clear();
+        self.killed = killed.into_iter().collect();
+    }
+
     /// Calls off every fight (the player went down).
     pub fn stand_down(&mut self) {
         for n in &mut self.npcs {
@@ -427,10 +455,13 @@ impl People {
         let far = |p: Vec3, d: f32| Vec2::new(p.x - focus.x, p.z - focus.z).length() > d;
         // Soldiers out of range go; civilians left behind come back round
         // the player.
-        let active = &mut self.active;
+        let (active, killed) = (&mut self.active, &mut self.killed);
         self.npcs.retain(|n| match n.spawn {
             Some(id) if far(n.character.position, INACTIVE) => {
                 active.remove(&id);
+                if !n.alive {
+                    killed.insert(id);
+                }
                 false
             }
             _ => true,
@@ -459,7 +490,11 @@ impl People {
         let soldiers = self.npcs.iter().filter(|n| n.spawn.is_some()).count();
         let mut near: Vec<(f32, &SpawnPoint)> = spawns
             .iter()
-            .filter(|s| !self.active.contains(&s.entity) && !far(s.position, ACTIVE))
+            .filter(|s| {
+                !self.active.contains(&s.entity)
+                    && !self.killed.contains(&s.entity)
+                    && !far(s.position, ACTIVE)
+            })
             .map(|s| (s.position.distance(focus), s))
             .collect();
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -662,6 +697,19 @@ pub(crate) mod tests {
             people.npcs.iter().map(|n| n.spawn).collect::<Vec<_>>(),
             [Some(2)]
         );
+        // The dead stay dead through a save and load.
+        people.npcs[0].alive = false;
+        let killed = people.all_killed();
+        assert_eq!(killed, [2]);
+        people.reset(killed);
+        people.update(
+            &physics,
+            &spawns,
+            Vec3::new(1000.0, 0.0, 0.0),
+            None,
+            1.0 / 60.0,
+        );
+        assert!(people.npcs.iter().all(|n| n.spawn.is_none()));
     }
 
     #[test]
