@@ -21,9 +21,9 @@ pub struct ClumpMesh {
     pub vertices: Vec<u8>,
     pub indices: Vec<u32>,
     pub material: Material,
-    /// Instances further than this from the camera are not drawn (the
-    /// mesh's own fade-out end), metres.
-    pub fade_end: f32,
+    /// The mesh's fade-out distances as read (metres, per the format
+    /// notes); not yet used, as stopping there left the ground bare.
+    pub fade: [f32; 2],
     /// Object to world, one per instance.
     pub instances: Vec<Mat4>,
 }
@@ -133,7 +133,7 @@ fn clump_mesh(m: &ScatterMesh<'_>) -> ClumpMesh {
         vertices,
         indices: m.triangles().into_iter().flatten().map(u32::from).collect(),
         material: m.material.clone(),
-        fade_end: m.fade[1],
+        fade: m.fade,
         instances: Vec::new(),
     }
 }

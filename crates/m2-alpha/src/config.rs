@@ -113,6 +113,20 @@ impl Config {
             .filter(|p| p.is_file())
             .unwrap_or(here)
     }
+
+    /// Where the game keeps its other files (saves, the catalogue cache,
+    /// crash reports): beside the settings file if there is one, else
+    /// beside the executable.
+    pub fn file_beside(name: &str) -> PathBuf {
+        let settings = Self::default_path();
+        if settings.is_file() {
+            return settings.with_file_name(name);
+        }
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join(name)))
+            .unwrap_or_else(|| PathBuf::from(name))
+    }
 }
 
 #[cfg(test)]

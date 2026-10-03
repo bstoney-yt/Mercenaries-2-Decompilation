@@ -55,9 +55,9 @@ impl VehicleSave {
 }
 
 impl SaveGame {
-    /// Where saves go: beside the settings file.
+    /// Where saves go (see [`Config::file_beside`](crate::config::Config::file_beside)).
     pub fn default_path() -> PathBuf {
-        crate::config::Config::default_path().with_file_name(FILE_NAME)
+        crate::config::Config::file_beside(FILE_NAME)
     }
 
     pub fn to_toml(&self) -> String {

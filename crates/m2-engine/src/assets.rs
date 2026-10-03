@@ -90,13 +90,10 @@ impl Install {
 
     /// [`detect`](Self::detect), under the given program-files folders.
     pub fn detect_in(program_files: impl IntoIterator<Item = PathBuf>) -> Option<Self> {
-        const FOLDERS: [&str; 2] = [
-            "EA Games/Mercenaries 2 World in Flames",
-            "Origin Games/Mercenaries 2 World in Flames",
-        ];
+        const FOLDERS: [&str; 2] = ["EA Games", "Origin Games"];
         program_files
             .into_iter()
-            .flat_map(|p| FOLDERS.map(|f| p.join(f)))
+            .flat_map(|p| FOLDERS.map(|f| p.join(f).join("Mercenaries 2 World in Flames")))
             .find_map(|root| Self::find(&root).ok())
     }
 
@@ -413,7 +410,7 @@ mod tests {
     #[test]
     fn installs_are_found_in_the_usual_folders() {
         let pf = std::env::temp_dir().join(format!("m2-detect-{}", std::process::id()));
-        let root = pf.join("EA Games/Mercenaries 2 World in Flames");
+        let root = pf.join("EA Games").join("Mercenaries 2 World in Flames");
         std::fs::create_dir_all(root.join("data")).unwrap();
         assert!(Install::detect_in([pf.clone()]).is_none());
         std::fs::write(root.join("data").join("vz.wad"), b"").unwrap();
