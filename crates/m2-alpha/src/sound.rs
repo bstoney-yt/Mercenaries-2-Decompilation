@@ -1,11 +1,18 @@
 //! The game's sound: an output device fed by the engine's mixer, the
-//! island's ambience, and music on demand.
+//! island's ambience, music on demand, and the fight's gunshots and blasts.
+//!
+//! Which sound in a bank is a shot or a blast is not known (sounds are
+//! named by hash), so they are picked by measuring, as in the viewer: the
+//! rifle bank's loudest short mono sound, the RPG bank's loudest short one,
+//! and the artillery bank's loudest 1.5-3 s mono sound.
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use m2_engine::audio::Play;
+use m2_engine::audio::{Play, SoundLibrary};
 use m2_engine::{Install, Mixer, SoundBuffer, Streams, VoiceId};
+
+use crate::combat::Sound;
 use m2_math::glam::Vec3;
 
 /// The mixer, and the device stream playing it (none where there is no
@@ -118,6 +125,46 @@ pub struct GameAudio {
     music: Option<VoiceId>,
     next_track: usize,
     decoded: (Sender<Decoded>, Receiver<Decoded>),
+    /// Rifle shot, rocket launch, explosion.
+    fight: [Option<SoundBuffer>; 3],
+}
+
+/// Picks the loudest sound in `bank` passing `keep`.
+fn pick(
+    library: &SoundLibrary,
+    bank: &str,
+    keep: impl Fn(&SoundBuffer) -> bool,
+) -> Option<SoundBuffer> {
+    library
+        .bank(bank)
+        .iter()
+        .filter(|s| s.frames() > 0 && keep(s))
+        .max_by(|a, b| a.loudness().total_cmp(&b.loudness()))
+        .cloned()
+}
+
+fn fight_sounds(install: &Install) -> [Option<SoundBuffer>; 3] {
+    let library = install.open_world().and_then(|mut source| {
+        SoundLibrary::load(
+            &mut source,
+            &["wpn_assaultrifle", "wpn_rpg", "support_artillery"],
+        )
+    });
+    match library {
+        Ok(l) => [
+            pick(&l, "wpn_assaultrifle", |s| {
+                s.channels == 1 && s.seconds() < 0.6
+            }),
+            pick(&l, "wpn_rpg", |s| s.seconds() < 1.5),
+            pick(&l, "support_artillery", |s| {
+                s.channels == 1 && (1.5..=3.0).contains(&s.seconds())
+            }),
+        ],
+        Err(e) => {
+            eprintln!("sound: no weapon sounds ({e})");
+            [None, None, None]
+        }
+    }
 }
 
 /// A finished decode: which kind of stream, and its samples.
@@ -145,6 +192,7 @@ impl GameAudio {
             music: None,
             next_track: 0,
             decoded: channel(),
+            fight: install.map(fight_sounds).unwrap_or_default(),
         };
         audio.decode("ambience", 0);
         audio
@@ -167,6 +215,20 @@ impl GameAudio {
                 Err(e) => eprintln!("sound: {which} {i}: {e}"),
             }
         });
+    }
+
+    /// Plays the fight's sounds where they happened.
+    pub fn play_fight(&mut self, sounds: &[Sound]) {
+        for sound in sounds {
+            let (i, at, gain) = match *sound {
+                Sound::Shot(at) => (0, at, 0.9),
+                Sound::Launch(at) => (1, at, 1.0),
+                Sound::Explosion(at) => (2, at, 1.4),
+            };
+            if let Some(buffer) = self.fight[i].clone() {
+                self.out.with(|m| m.play(Play::at(buffer, at).gain(gain)));
+            }
+        }
     }
 
     /// Starts the next music track, or stops the music.

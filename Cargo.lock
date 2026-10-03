@@ -935,6 +935,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cpal",
+ "m2-assets",
  "m2-engine",
  "m2-math",
  "m2-render",

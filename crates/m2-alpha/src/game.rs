@@ -6,6 +6,7 @@ use m2_math::glam::{Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
+use crate::combat::{Combat, Field};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::player::{Intent, Player};
@@ -19,6 +20,7 @@ pub struct Game {
     pub on_foot: bool,
     /// Seconds to the next look for parking spots.
     park_wait: f32,
+    pub combat: Combat,
 }
 
 impl Game {
@@ -29,6 +31,7 @@ impl Game {
             camera,
             on_foot,
             park_wait: 0.0,
+            combat: Combat::default(),
         }
     }
 
@@ -69,7 +72,9 @@ impl Game {
                     .driving
                     .and_then(|i| scene.vehicles.get(i))
                     .and_then(|v| v.id.map(|id| (id, v)));
-                if let Some((id, _)) = id {
+                if let Some((id, v)) = id
+                    && !v.wrecked
+                {
                     physics.drive(
                         id,
                         VehicleControls {
@@ -99,12 +104,30 @@ impl Game {
             }
         }
         let focus = self.focus();
+        let threat = self
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| self.combat.target(p, self.on_foot));
         if let Some(world) = &self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
             self.scene
                 .people
-                .update(&world.physics, &world.index.spawns, focus, dt);
+                .update(&world.physics, &world.index.spawns, focus, threat, dt);
+        }
+        let scene = &mut self.scene;
+        if self.on_foot
+            && let (Some(world), Some(player)) = (&mut scene.world, &mut scene.player)
+        {
+            let mut field = Field {
+                physics: &mut world.physics,
+                player,
+                people: &mut scene.people,
+                vehicles: &mut scene.vehicles,
+                arsenal: &scene.arsenal,
+            };
+            self.combat.step(&mut field, intent.trigger, dt);
         }
         self.scene.tick(dt);
     }
@@ -286,6 +309,7 @@ fn nearest(
     vehicles
         .iter()
         .enumerate()
+        .filter(|(_, v)| !v.wrecked)
         .filter_map(|(i, v)| {
             let at = physics.vehicle_transform(v.id?)?;
             let local = at.inverse() * p.extend(1.0);

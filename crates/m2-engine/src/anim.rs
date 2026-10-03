@@ -426,11 +426,20 @@ impl Locomotion {
     }
 }
 
+/// A clip playing: which, how far in, and whether it holds its last frame
+/// rather than looping.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Playing {
+    clip: usize,
+    time: f32,
+    once: bool,
+}
+
 /// Plays one clip at a time with crossfades, pinning the root horizontally.
 #[derive(Clone, Debug)]
 pub struct Animator {
-    current: Option<(usize, f32)>,
-    previous: Option<(usize, f32)>,
+    current: Option<Playing>,
+    previous: Option<Playing>,
     fade: f32,
     fade_time: f32,
 }
@@ -447,15 +456,39 @@ impl Default for Animator {
 }
 
 impl Animator {
-    /// Switches to clip `index` (no-op if it is already playing), fading
-    /// from the current one.
+    /// Switches to clip `index`, looped (no-op if it is already playing),
+    /// fading from the current one.
     pub fn play(&mut self, index: usize) {
-        if self.current.map(|c| c.0) == Some(index) {
+        self.start(index, false);
+    }
+
+    /// Plays clip `index` once from the start and holds its last frame
+    /// (a fall, a reaction), fading quickly from the current one.
+    pub fn play_once(&mut self, index: usize) {
+        self.start(index, true);
+        self.fade_time = 0.1;
+    }
+
+    fn start(&mut self, clip: usize, once: bool) {
+        if self
+            .current
+            .is_some_and(|c| c.clip == clip && c.once == once)
+        {
             return;
         }
+        self.fade_time = 0.25;
         self.previous = self.current;
-        self.current = Some((index, 0.0));
+        self.current = Some(Playing {
+            clip,
+            time: 0.0,
+            once,
+        });
         self.fade = if self.previous.is_some() { 0.0 } else { 1.0 };
+    }
+
+    /// The clip playing and how far in it is, seconds.
+    pub fn current(&self) -> Option<(usize, f32)> {
+        self.current.map(|c| (c.clip, c.time))
     }
 
     pub fn advance(&mut self, dt: f32) {
@@ -463,7 +496,7 @@ impl Animator {
             .into_iter()
             .flatten()
         {
-            c.1 += dt;
+            c.time += dt;
         }
         self.fade = (self.fade + dt / self.fade_time).min(1.0);
         if self.fade >= 1.0 {
@@ -473,11 +506,15 @@ impl Animator {
 
     /// The blended pose, root pinned.
     pub fn pose(&self, skeleton: &Skeleton, clips: &[BoundClip]) -> Pose {
-        let sample = |(i, t): (usize, f32)| {
-            clips.get(i).map(|c| {
-                let mut p = c.sample_looped(skeleton, t);
-                p.strip_root_motion(skeleton.root(), c.info.pin);
-                p
+        let sample = |p: Playing| {
+            clips.get(p.clip).map(|c| {
+                let mut pose = if p.once {
+                    c.sample(skeleton, p.time.min(c.info.duration))
+                } else {
+                    c.sample_looped(skeleton, p.time)
+                };
+                pose.strip_root_motion(skeleton.root(), c.info.pin);
+                pose
             })
         };
         let Some(mut pose) = self.current.and_then(sample) else {

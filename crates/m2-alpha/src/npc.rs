@@ -5,7 +5,9 @@
 //! from its entity name (`VZ Soldier ..`, `VZ Heavy ..`, `VZ Deathsquad ..`),
 //! as in the browser viewer. The behaviour (standing at posts, walking
 //! routes there and back with pauses, civilians strolling about) is
-//! invented: the game's AI is not decoded.
+//! invented: the game's AI is not decoded. So is how they fight (see
+//! [`combat`](crate::combat)): a soldier who hears gunfire close by or is
+//! hit turns on the player and fires, civilians run.
 
 use std::collections::HashSet;
 
@@ -24,8 +26,19 @@ const MAX_SOLDIERS: usize = 48;
 const CIVILIANS: usize = 24;
 const CIVILIAN_RANGE: (f32, f32) = (15.0, 120.0);
 const WANDER: f32 = 30.0;
-/// Walking speed, m/s, and the pause at each end of a route or stroll.
+/// Walking and fleeing speeds, m/s, and the pause at each end of a route
+/// or stroll.
 const WALK: f32 = 1.4;
+const FLEE: f32 = 5.0;
+const FLEE_TIME: f32 = 6.0;
+/// A soldier fights within this range of the player, and fires within
+/// `FIRE_RANGE` once facing within `FIRE_ARC` radians of them.
+const FIGHT_RANGE: f32 = 80.0;
+const FIRE_RANGE: f32 = 70.0;
+const FIRE_ARC: f32 = 0.3;
+/// Seconds between a soldier's shots: at least this, plus up to as much
+/// again at random.
+const FIRE_GAP: (f32, f32) = (0.9, 0.8);
 const PAUSE: (f32, f32) = (2.0, 6.0);
 /// People are drawn this close to the camera, metres.
 pub const DRAW_DISTANCE: f32 = 200.0;
@@ -42,7 +55,7 @@ pub struct PersonKind {
 
 /// What a person is doing.
 #[derive(Clone, Debug, PartialEq)]
-enum Brain {
+pub(crate) enum Brain {
     /// Standing at a post, facing `facing`.
     Post { facing: f32 },
     /// Walking a route: heading to point `next`, `step` +1 or -1 along it
@@ -57,9 +70,33 @@ enum Brain {
     Wander { home: Vec3, target: Vec3, wait: f32 },
 }
 
+/// The clips a fight plays, indices into every human rig's clips (they
+/// share one list).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FightClips {
+    /// Standing, rifle held in both hands (resident 57fe91b4).
+    pub aim: Option<usize>,
+    /// Falling down dead (resident 479c4a51).
+    pub die: Option<usize>,
+}
+
+impl FightClips {
+    pub const AIM: u32 = 0x57fe_91b4;
+    pub const DIE: u32 = 0x479c_4a51;
+
+    pub fn find(rig: &Rig) -> Self {
+        let find = |hash| rig.clips.iter().position(|c| c.hash == hash);
+        Self {
+            aim: find(Self::AIM),
+            die: find(Self::DIE),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Npc {
     pub kind: usize,
+    pub soldier: bool,
     pub character: Character,
     pub facing: f32,
     pub rig: Rig,
@@ -67,11 +104,20 @@ pub struct Npc {
     pub landed: bool,
     /// The layer entity that placed them (soldiers).
     pub spawn: Option<u32>,
+    pub hp: f32,
+    pub alive: bool,
+    /// A soldier turned on the player.
+    pub alert: bool,
+    /// Set by a tick when a soldier fires; the fight takes the shot.
+    pub fires: bool,
+    cooldown: f32,
+    /// Running from gunfire: where to, and for how much longer.
+    flee: Option<(Vec3, f32)>,
     brain: Brain,
 }
 
 impl Npc {
-    fn new(
+    pub(crate) fn new(
         kind: usize,
         rig: &Rig,
         at: Vec3,
@@ -83,13 +129,92 @@ impl Npc {
         rig.set_gait(Gait::Idle);
         Self {
             kind,
+            soldier: spawn.is_some(),
             character: Character::new(at),
             facing,
             rig,
             landed: false,
             spawn,
+            hp: 100.0,
+            alive: true,
+            alert: false,
+            fires: false,
+            cooldown: 0.0,
+            flee: None,
             brain,
         }
+    }
+
+    /// Takes `damage`; at no health left, falls with `clips.die`.
+    pub fn hurt(&mut self, damage: f32, clips: FightClips) {
+        if !self.alive {
+            return;
+        }
+        self.hp -= damage;
+        self.alert = self.soldier;
+        if self.hp <= 0.0 {
+            self.alive = false;
+            self.alert = false;
+            self.flee = None;
+            if let Some(die) = clips.die {
+                self.rig.animator.play_once(die);
+            }
+        }
+    }
+
+    /// Runs from `danger` (civilians).
+    pub fn panic(&mut self, danger: Vec3) {
+        if !self.alive || self.soldier {
+            return;
+        }
+        let away = (self.character.position - danger)
+            .with_y(0.0)
+            .normalize_or(Vec3::X);
+        self.flee = Some((self.character.position + away * FLEE * FLEE_TIME, FLEE_TIME));
+    }
+
+    /// Chest height, where shots aim.
+    pub fn chest(&self) -> Vec3 {
+        self.character.position + Vec3::Y * 1.3
+    }
+
+    fn turn_to(&mut self, target: f32, dt: f32) -> f32 {
+        let mut turn = (target - self.facing).rem_euclid(std::f32::consts::TAU);
+        if turn > std::f32::consts::PI {
+            turn -= std::f32::consts::TAU;
+        }
+        self.facing += turn.clamp(-TURN_RATE * dt, TURN_RATE * dt);
+        turn.abs()
+    }
+
+    /// A soldier's tick in a fight with the player at `threat`: stand, turn
+    /// to them, aim and fire. False when out of range (the fight is off).
+    fn fight(
+        &mut self,
+        physics: &Physics,
+        threat: Vec3,
+        rng: &mut Rng,
+        clips: FightClips,
+        dt: f32,
+    ) -> bool {
+        let to = threat - self.character.position;
+        let distance = to.with_y(0.0).length();
+        if distance > FIGHT_RANGE {
+            return false;
+        }
+        physics.move_character(&mut self.character, Vec3::ZERO, None, dt);
+        let off = self.turn_to(to.x.atan2(to.z), dt);
+        match clips.aim {
+            Some(aim) => self.rig.animator.play(aim),
+            None => self.rig.set_gait(Gait::Idle),
+        }
+        self.cooldown -= dt;
+        if self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
+            self.fires = true;
+            self.cooldown = FIRE_GAP.0 + rng.range(0.0, FIRE_GAP.1);
+        }
+        self.rig.animator.advance(dt);
+        true
     }
 
     pub fn patrolling(&self) -> bool {
@@ -103,7 +228,14 @@ impl Npc {
             * Mat4::from_rotation_y(self.facing - forward.x.atan2(forward.y))
     }
 
-    fn update(&mut self, physics: &Physics, rng: &mut Rng, dt: f32) {
+    fn update(
+        &mut self,
+        physics: &Physics,
+        rng: &mut Rng,
+        threat: Option<Vec3>,
+        clips: FightClips,
+        dt: f32,
+    ) {
         if !self.landed {
             // Onto the ground (or the roof or floor of their post) under
             // where they were placed.
@@ -123,10 +255,38 @@ impl Npc {
             }
             return;
         }
+        if !self.alive {
+            self.rig.animator.advance(dt);
+            return;
+        }
+        if self.alert {
+            match threat {
+                Some(t) if self.fight(physics, t, rng, clips, dt) => return,
+                _ => self.alert = false,
+            }
+        }
         let at = self.character.position;
         let mut wanted = Vec3::ZERO;
         let mut face = None;
+        let mut speed = WALK;
+        if let Some((target, left)) = &mut self.flee {
+            *left -= dt;
+            let to = (*target - at).with_y(0.0);
+            if *left <= 0.0 || to.length() < 1.0 {
+                // Settle down where they ran to.
+                self.brain = Brain::Wander {
+                    home: at,
+                    target: at,
+                    wait: rng.range(PAUSE.0, PAUSE.1),
+                };
+                self.flee = None;
+            } else {
+                wanted = to.normalize() * FLEE;
+                speed = FLEE;
+            }
+        }
         match &mut self.brain {
+            _ if self.flee.is_some() => {}
             Brain::Post { facing } => face = Some(*facing),
             Brain::Patrol {
                 route,
@@ -155,7 +315,7 @@ impl Npc {
                             *next = n as usize;
                         }
                     } else {
-                        wanted = flat.normalize() * WALK;
+                        wanted = flat.normalize() * speed;
                     }
                 }
             }
@@ -169,7 +329,7 @@ impl Npc {
                         *wait = rng.range(PAUSE.0, PAUSE.1);
                         *target = *home + rng.disc(WANDER);
                     } else {
-                        wanted = flat.normalize() * WALK;
+                        wanted = flat.normalize() * speed;
                     }
                 }
             }
@@ -189,16 +349,16 @@ impl Npc {
             face = Some(wanted.x.atan2(wanted.z));
         }
         if let Some(target) = face {
-            let mut turn = (target - self.facing).rem_euclid(std::f32::consts::TAU);
-            if turn > std::f32::consts::PI {
-                turn -= std::f32::consts::TAU;
-            }
-            self.facing += turn.clamp(-TURN_RATE * dt, TURN_RATE * dt);
+            self.turn_to(target, dt);
         }
-        let gait = if moved < 0.3 { Gait::Idle } else { Gait::Walk };
-        if gait != self.rig.gait {
-            self.rig.set_gait(gait);
-        }
+        let gait = if moved < 0.3 {
+            Gait::Idle
+        } else if moved > 2.5 {
+            Gait::Run
+        } else {
+            Gait::Walk
+        };
+        self.rig.set_gait(gait);
         let rate = match self.rig.gait_speed(gait) {
             Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
             _ => 1.0,
@@ -212,6 +372,7 @@ impl Npc {
 pub struct People {
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
+    pub clips: FightClips,
     active: HashSet<u32>,
     rng: Rng,
 }
@@ -237,11 +398,36 @@ impl People {
         self.kinds.iter().position(|k| k.role == role)
     }
 
-    /// One fixed tick: people come and go around `focus`, then move.
-    pub fn update(&mut self, physics: &Physics, spawns: &[SpawnPoint], focus: Vec3, dt: f32) {
+    /// Adds a person model; the first sets the fight clips if the player's
+    /// rig has not.
+    pub fn add_kind(&mut self, kind: PersonKind) {
+        if self.clips == FightClips::default() {
+            self.clips = FightClips::find(&kind.rig);
+        }
+        self.kinds.push(kind);
+    }
+
+    /// One fixed tick: people come and go around `focus`, then move;
+    /// soldiers on alert fight the player at `threat` (her chest; `None`
+    /// while she is down or not playing).
+    pub fn update(
+        &mut self,
+        physics: &Physics,
+        spawns: &[SpawnPoint],
+        focus: Vec3,
+        threat: Option<Vec3>,
+        dt: f32,
+    ) {
         self.populate(spawns, focus);
         for npc in &mut self.npcs {
-            npc.update(physics, &mut self.rng, dt);
+            npc.update(physics, &mut self.rng, threat, self.clips, dt);
+        }
+    }
+
+    /// Calls off every fight (the player went down).
+    pub fn stand_down(&mut self) {
+        for n in &mut self.npcs {
+            n.alert = false;
         }
     }
 
@@ -266,6 +452,10 @@ impl People {
                 n.character.position = Vec3::new(home.x, focus.y, home.z);
                 n.character.velocity = Vec3::ZERO;
                 n.landed = false;
+                n.alive = true;
+                n.hp = 100.0;
+                n.flee = None;
+                n.rig.set_gait(Gait::Idle);
                 n.brain = Brain::Wander {
                     home,
                     target: home,
@@ -369,13 +559,13 @@ impl Rng {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use m2_engine::{Animator, CollisionShape, Skeleton, StaticKey};
     use m2_math::glam::Quat;
     use std::sync::Arc;
 
-    fn ground() -> Physics {
+    pub(crate) fn ground() -> Physics {
         let mut p = Physics::new();
         let h = 200.0;
         let v = [
@@ -390,7 +580,7 @@ mod tests {
         p
     }
 
-    fn empty_model() -> GpuModel {
+    pub(crate) fn empty_model() -> GpuModel {
         let cpu = m2_engine::CpuModel {
             hash: 0,
             pieces: Vec::new(),
@@ -404,7 +594,7 @@ mod tests {
         GpuModel::upload(&mut backend, &mut materials, &cpu).unwrap()
     }
 
-    fn rig() -> Rig {
+    pub(crate) fn rig() -> Rig {
         Rig {
             skeleton: Arc::new(Skeleton::from_nodes(&[])),
             clips: Arc::new(Vec::new()),
@@ -429,7 +619,7 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut furthest: f32 = 0.0;
         for _ in 0..60 * 12 {
-            npc.update(&physics, &mut rng, dt);
+            npc.update(&physics, &mut rng, None, FightClips::default(), dt);
             furthest = furthest.max(npc.character.position.z);
         }
         assert!(npc.landed);
@@ -437,7 +627,7 @@ mod tests {
         // Back at the start (or pausing near it) by now: 10 m at 1.4 m/s
         // each way plus a pause.
         for _ in 0..60 * 14 {
-            npc.update(&physics, &mut rng, dt);
+            npc.update(&physics, &mut rng, None, FightClips::default(), dt);
         }
         assert!(npc.character.position.z < 2.0, "{}", npc.character.position);
     }
@@ -464,16 +654,74 @@ mod tests {
             spawn(2, "VZ Soldier 02", 1000.0),
             spawn(3, "VZ Hind 01", 20.0),
         ];
-        people.update(&physics, &spawns, Vec3::ZERO, 1.0 / 60.0);
+        people.update(&physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
         assert_eq!(
             people.npcs.iter().map(|n| n.spawn).collect::<Vec<_>>(),
             [Some(1)]
         );
-        people.update(&physics, &spawns, Vec3::new(1000.0, 0.0, 0.0), 1.0 / 60.0);
+        people.update(
+            &physics,
+            &spawns,
+            Vec3::new(1000.0, 0.0, 0.0),
+            None,
+            1.0 / 60.0,
+        );
         assert_eq!(
             people.npcs.iter().map(|n| n.spawn).collect::<Vec<_>>(),
             [Some(2)]
         );
+    }
+
+    #[test]
+    fn alert_soldiers_turn_and_fire_civilians_run() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let dt = 1.0 / 60.0;
+        let clips = FightClips::default();
+        let post = Brain::Post { facing: 0.0 };
+        let mut soldier = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
+        soldier.update(&physics, &mut rng, None, clips, dt);
+        soldier.alert = true;
+        // The player off to +x: he turns that way and fires.
+        let threat = Some(Vec3::new(30.0, 1.2, 0.0));
+        let mut shots = 0;
+        for _ in 0..60 * 5 {
+            soldier.update(&physics, &mut rng, threat, clips, dt);
+            shots += usize::from(std::mem::take(&mut soldier.fires));
+        }
+        assert!((soldier.facing - std::f32::consts::FRAC_PI_2).abs() < 0.05);
+        assert!((2..=6).contains(&shots), "{shots}");
+        // Out of range: he stands down.
+        soldier.update(
+            &physics,
+            &mut rng,
+            Some(Vec3::new(500.0, 0.0, 0.0)),
+            clips,
+            dt,
+        );
+        assert!(!soldier.alert);
+
+        let stroll = Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let mut civilian = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, stroll, None);
+        civilian.update(&physics, &mut rng, None, clips, dt);
+        civilian.panic(Vec3::new(-5.0, 0.0, 0.0));
+        for _ in 0..60 * 2 {
+            civilian.update(&physics, &mut rng, None, clips, dt);
+        }
+        assert!(
+            civilian.character.position.x > 7.0,
+            "{}",
+            civilian.character.position
+        );
+        // Hurt to death.
+        civilian.hurt(60.0, clips);
+        assert!(civilian.alive);
+        civilian.hurt(60.0, clips);
+        assert!(!civilian.alive);
     }
 
     #[test]

@@ -27,6 +27,16 @@ pub enum Action {
     Use,
     /// Turn an overturned vehicle back up.
     Reset,
+    /// Fire the weapon in hand (also the left mouse button).
+    Fire,
+    /// Raise the weapon (also the right mouse button, once the mouse is
+    /// captured).
+    Aim,
+    /// Throw a grenade.
+    Throw,
+    /// Take up the rifle, or the rocket launcher.
+    Rifle,
+    Launcher,
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
@@ -60,6 +70,11 @@ impl Default for Bindings {
             (ToggleMusic, vec![KeyM]),
             (Use, vec![KeyE]),
             (Reset, vec![KeyR]),
+            (Fire, vec![KeyF]),
+            (Aim, vec![]),
+            (Throw, vec![KeyG]),
+            (Rifle, vec![Digit1]),
+            (Launcher, vec![Digit2]),
             (ToggleMouse, vec![Tab]),
             (Fullscreen, vec![F11]),
             (NextGait, vec![KeyN]),
@@ -98,6 +113,16 @@ impl Input {
             } else {
                 self.held.remove(&action);
             }
+        }
+    }
+
+    /// A mouse button bound to `action` went down or up.
+    pub fn button(&mut self, action: Action, down: bool) {
+        if down {
+            self.pressed.insert(action);
+            self.held.insert(action);
+        } else {
+            self.held.remove(&action);
         }
     }
 

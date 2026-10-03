@@ -5,6 +5,7 @@ use m2_engine::{Character, Gait, GpuModel, Physics};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
 
+use crate::combat::{Trigger, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::scene::Rig;
@@ -39,6 +40,8 @@ pub struct Intent {
     pub right_vehicle: bool,
     /// Camera turn, radians: (yaw, pitch).
     pub look: Vec2,
+    /// Weapons.
+    pub trigger: Trigger,
 }
 
 impl Intent {
@@ -66,6 +69,18 @@ impl Intent {
             use_pressed: input.take_pressed(Action::Use),
             right_vehicle: input.take_pressed(Action::Reset),
             look,
+            trigger: Trigger {
+                fire: input.held(Action::Fire),
+                aim: input.held(Action::Aim),
+                throw: input.take_pressed(Action::Throw),
+                select: if input.take_pressed(Action::Rifle) {
+                    Some(Weapon::Rifle)
+                } else if input.take_pressed(Action::Launcher) {
+                    Some(Weapon::Rpg)
+                } else {
+                    None
+                },
+            },
         }
     }
 }
@@ -89,6 +104,11 @@ pub struct Player {
     pub model: Option<(GpuModel, Rig)>,
     /// The vehicle she is driving (index into the scene's vehicles).
     pub driving: Option<usize>,
+    /// A clip to hold when standing still (aiming), facing the camera's
+    /// way.
+    pub hold: Option<usize>,
+    /// Down (out of health): she lies where she fell.
+    pub down: bool,
 }
 
 impl Player {
@@ -104,6 +124,8 @@ impl Player {
             landed: false,
             model,
             driving: None,
+            hold: None,
+            down: false,
         }
     }
 
@@ -118,6 +140,15 @@ impl Player {
             if let Some((d, _)) = physics.cast_ray(Vec3::new(p.x, 3000.0, p.z), -Vec3::Y, 6000.0) {
                 self.character.position.y = 3000.0 - d + 0.05;
                 self.landed = true;
+            }
+            self.camera(physics);
+            return;
+        }
+
+        if self.down {
+            physics.move_character(&mut self.character, Vec3::ZERO, None, dt);
+            if let Some((_, rig)) = &mut self.model {
+                rig.animator.advance(dt);
             }
             self.camera(physics);
             return;
@@ -138,8 +169,12 @@ impl Player {
         let jump = (intent.jump && self.character.grounded).then_some(JUMP);
         physics.move_character(&mut self.character, wanted, jump, dt);
 
-        if direction.length_squared() > 0.01 {
-            let target = direction.x.atan2(direction.z);
+        let heading = if self.hold.is_some() {
+            Some(self.yaw)
+        } else {
+            (direction.length_squared() > 0.01).then(|| direction.x.atan2(direction.z))
+        };
+        if let Some(target) = heading {
             let mut turn = (target - self.facing).rem_euclid(std::f32::consts::TAU);
             if turn > std::f32::consts::PI {
                 turn -= std::f32::consts::TAU;
@@ -158,7 +193,10 @@ impl Player {
             } else {
                 Gait::Run
             };
-            rig.set_gait(gait);
+            match (gait, self.hold) {
+                (Gait::Idle, Some(clip)) => rig.animator.play(clip),
+                _ => rig.set_gait(gait),
+            }
             // Play the clip at the speed she actually moves, so feet don't
             // slide (within reason: against a wall the legs keep going).
             let rate = match rig.gait_speed(gait) {

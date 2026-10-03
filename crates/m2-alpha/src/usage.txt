@@ -17,11 +17,15 @@ m2-alpha [options]
   --screenshot <out.ppm> render one frame offscreen and exit
   --drive                with --screenshot on the island: get in the
                          nearest parked vehicle and drive it forward first
+  --fight                with --screenshot on the island: shoot the nearest
+                         soldier, rocket a vehicle, throw a grenade first
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
 E gets in or out of a vehicle (a row is parked ahead of where you start).
 Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
+Fighting (mouse captured): left button or F fires, right button aims,
+1 rifle, 2 rocket launcher, G throws a grenade.
 V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
 M music on/off, Tab or right mouse captures the mouse, N next gait
 (--model), F11 fullscreen, F3 culling, Escape releases the mouse / quits.
