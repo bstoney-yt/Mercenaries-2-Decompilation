@@ -148,3 +148,6 @@ only) once item 11 lands.
   vehicles, soldiers killed).
 - Item 14 started: the model catalogue search (12-14 s) is kept between
   runs in `m2-alpha-catalogue.toml`.
+- Item 15 started: the game is found in the EA app's Program Files folder
+  without `--install`, and every CI run keeps a release `m2-alpha.exe` as
+  an artifact.

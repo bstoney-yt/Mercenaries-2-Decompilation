@@ -181,13 +181,19 @@ fn main() -> anyhow::Result<()> {
     }
     let install = match &config.install {
         Some(dir) => Some(Install::find(dir)?),
-        None => {
-            eprintln!(
-                "No install configured: set `install` in {} or pass --install <dir>. Showing the ground only.",
-                config_path.display()
-            );
-            None
-        }
+        None => match Install::detect() {
+            Some(found) => {
+                eprintln!("found the game in {}", found.root.display());
+                Some(found)
+            }
+            None => {
+                eprintln!(
+                    "Mercenaries 2 not found: set `install` in {} or pass --install <dir>. Showing the ground only.",
+                    config_path.display()
+                );
+                None
+            }
+        },
     };
     // No models named: the island (or, without an install, Jennifer's
     // grid, which shows only the ground).
