@@ -1,6 +1,16 @@
-//! Reconstructed engine classes.
+//! The engine runtime the native game is built on.
 //!
-//! Each class gets a raw `#[repr(C)]` mirror (with its vtable as an explicit
-//! struct of function pointers) in a `raw` module, and a safe Rust type or
-//! trait on top. Rust `dyn Trait` vtables are not ABI-compatible with MSVC C++
-//! vtables, so the two are never mixed.
+//! - [`assets`]: finding the install and reading models and textures from
+//!   its archives.
+//! - [`model`]: models and their textures uploaded to a render backend.
+//!
+//! The original plan put raw `#[repr(C)]` mirrors of the executable's
+//! classes here for hooking. The engine code is encrypted and can't be
+//! read, so this crate instead hosts the clean-room runtime that reads the
+//! game's data directly (see `docs/alpha-roadmap.md`).
+
+pub mod assets;
+pub mod model;
+
+pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
+pub use model::{GpuModel, MaterialCache};

@@ -10,7 +10,10 @@
 //! - [`queue`]: the per-frame draw queue (after `PgPrimitive`'s
 //!   `AssignKeys` / `Sort` / `SubmitToGPU`).
 //! - [`backend`]: the [`RenderBackend`] trait and draw description.
+//! - [`texture`]: textures and materials.
 //! - [`null`]: GPU-less backends for tests and headless runs.
+//! - `gpu` (feature `wgpu`): the GPU backend, on Direct3D 12, Vulkan or
+//!   Metal through wgpu.
 //!
 //! # Provenance
 //!
@@ -21,15 +24,21 @@
 
 pub mod backend;
 pub mod buffer;
+#[cfg(feature = "wgpu")]
+pub mod gpu;
 pub mod key;
 pub mod null;
 pub mod queue;
+pub mod texture;
 
-pub use backend::{BackendError, DrawCall, Geometry, LiveBuffers, RenderBackend, Topology, View};
+pub use backend::{
+    BackendError, DrawCall, Geometry, Lighting, LiveBuffers, RenderBackend, Topology, View,
+};
 pub use buffer::{
-    BufferUsage, IndexBufferDesc, IndexBufferHandle, IndexFormat, VertexBufferDesc,
+    BufferUsage, IndexBufferDesc, IndexBufferHandle, IndexFormat, TextureHandle, VertexBufferDesc,
     VertexBufferHandle, VertexElement, VertexFormat, VertexLayout, VertexSemantic,
 };
 pub use key::{Layer, MaterialId, SortKey};
 pub use null::{Command, NullBackend, RecordingBackend};
 pub use queue::{DrawQueue, Primitive, QueueError, SubmitStats};
+pub use texture::{BlendMode, MaterialDesc, TextureDesc, TextureFormat, generate_mips};

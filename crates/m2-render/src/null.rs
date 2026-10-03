@@ -7,6 +7,9 @@ use crate::buffer::{
     IndexBufferDesc, IndexBufferHandle, IndexFormat, RawHandle, VertexBufferDesc,
     VertexBufferHandle,
 };
+use crate::key::MaterialId;
+use crate::texture::{MaterialDesc, TextureDesc, TextureHandle};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 struct Slot<T> {
@@ -143,6 +146,8 @@ fn check_range(first: u32, count: u32, available: u32) -> Result<(), BackendErro
 pub struct NullBackend {
     vertex_buffers: Slots<VertexBuffer>,
     index_buffers: Slots<IndexBuffer>,
+    textures: Slots<TextureDesc>,
+    materials: HashMap<MaterialId, MaterialDesc>,
     in_frame: bool,
     frames: u64,
 }
@@ -165,7 +170,19 @@ impl NullBackend {
         Ok(&self.index_buffers.get(buffer.0)?.data)
     }
 
+    /// The material draws with `id` shade with.
+    pub fn material(&self, id: MaterialId) -> MaterialDesc {
+        self.materials.get(&id).copied().unwrap_or_default()
+    }
+
+    pub fn texture_desc(&self, texture: TextureHandle) -> Result<&TextureDesc, BackendError> {
+        self.textures.get(texture.0)
+    }
+
     fn validate_draw(&self, call: &DrawCall) -> Result<(), BackendError> {
+        if let Some(t) = self.material(call.material).texture {
+            self.textures.get(t.0)?;
+        }
         let vb = self.vertex_buffers.get(call.vertex_buffer.0)?;
         let vertex_count = vb.desc.vertex_count;
         match call.geometry {
@@ -261,10 +278,32 @@ impl RenderBackend for NullBackend {
         self.index_buffers.remove(buffer.0).map(drop)
     }
 
+    fn create_texture(
+        &mut self,
+        desc: &TextureDesc,
+        mips: &[&[u8]],
+    ) -> Result<TextureHandle, BackendError> {
+        desc.validate(mips)?;
+        Ok(TextureHandle(self.textures.insert(*desc)))
+    }
+
+    fn destroy_texture(&mut self, texture: TextureHandle) -> Result<(), BackendError> {
+        self.textures.remove(texture.0).map(drop)
+    }
+
+    fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError> {
+        if let Some(t) = desc.texture {
+            self.textures.get(t.0)?;
+        }
+        self.materials.insert(id, *desc);
+        Ok(())
+    }
+
     fn live_buffers(&self) -> LiveBuffers {
         LiveBuffers {
             vertex: self.vertex_buffers.live,
             index: self.index_buffers.live,
+            texture: self.textures.live,
         }
     }
 
@@ -316,6 +355,13 @@ pub enum Command {
     },
     DestroyVertexBuffer(VertexBufferHandle),
     DestroyIndexBuffer(IndexBufferHandle),
+    CreateTexture {
+        handle: TextureHandle,
+        desc: TextureDesc,
+        mips: usize,
+    },
+    DestroyTexture(TextureHandle),
+    SetMaterial(MaterialId, MaterialDesc),
     BeginFrame(View),
     Draw(DrawCall),
     EndFrame,
@@ -430,6 +476,29 @@ impl RenderBackend for RecordingBackend {
     fn destroy_index_buffer(&mut self, handle: IndexBufferHandle) -> Result<(), BackendError> {
         let result = self.inner.destroy_index_buffer(handle);
         self.log(result, |()| Command::DestroyIndexBuffer(handle))
+    }
+
+    fn create_texture(
+        &mut self,
+        desc: &TextureDesc,
+        mips: &[&[u8]],
+    ) -> Result<TextureHandle, BackendError> {
+        let result = self.inner.create_texture(desc, mips);
+        self.log(result, |&handle| Command::CreateTexture {
+            handle,
+            desc: *desc,
+            mips: mips.len(),
+        })
+    }
+
+    fn destroy_texture(&mut self, handle: TextureHandle) -> Result<(), BackendError> {
+        let result = self.inner.destroy_texture(handle);
+        self.log(result, |()| Command::DestroyTexture(handle))
+    }
+
+    fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError> {
+        let result = self.inner.set_material(id, desc);
+        self.log(result, |()| Command::SetMaterial(id, *desc))
     }
 
     fn live_buffers(&self) -> LiveBuffers {

@@ -1,0 +1,14 @@
+m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
+
+m2-alpha [options]
+  --install <dir>        the game's install folder (holding data\vz.wad)
+  --model <hash>         a model to show (hex name hash; repeatable)
+  --config <file>        settings file (default m2-alpha.toml)
+  --size <w>x<h>         window size
+  --vsync on|off
+  --fullscreen
+  --screenshot <out.ppm> render one frame offscreen and exit
+  --write-config         print the settings file and exit
+
+Keys: Tab or right mouse captures the mouse, WASD moves, Space/C up/down,
+Shift faster, F11 fullscreen, F3 culling, Escape releases the mouse / quits.

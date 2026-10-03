@@ -7,9 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+## The GPU backend (Direct3D 12, Vulkan or Metal through wgpu).
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
 [dependencies]
 m2-math.workspace = true
 thiserror.workspace = true
+bytemuck = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
 
 [lints]
 workspace = true

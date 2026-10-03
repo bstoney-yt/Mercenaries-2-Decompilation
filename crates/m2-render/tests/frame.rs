@@ -172,7 +172,8 @@ fn live_buffer_count_tracks_leaks() {
         backend.live_buffers(),
         LiveBuffers {
             vertex: 1,
-            index: 1
+            index: 1,
+            texture: 0,
         }
     );
     backend.destroy_vertex_buffer(vb).unwrap();
@@ -266,4 +267,40 @@ fn draws_reading_past_buffers_are_rejected() {
         base_vertex: -1,
     };
     backend.draw(&c).unwrap();
+}
+
+#[test]
+fn materials_check_their_textures() {
+    use m2_render::{MaterialDesc, TextureDesc, TextureFormat};
+
+    let mut backend = NullBackend::new();
+    let (vb, ib) = triangle_buffers(&mut backend);
+    let desc = TextureDesc {
+        width: 2,
+        height: 2,
+        format: TextureFormat::Rgba8Srgb,
+    };
+    let tex = backend.create_texture(&desc, &[&[255; 16]]).unwrap();
+    assert_eq!(backend.live_buffers().texture, 1);
+    let material = MaterialDesc {
+        texture: Some(tex),
+        ..MaterialDesc::default()
+    };
+    backend.set_material(MaterialId(7), &material).unwrap();
+    assert_eq!(backend.material(MaterialId(7)), material);
+    assert_eq!(backend.material(MaterialId(8)), MaterialDesc::default());
+
+    backend.begin_frame(&View::default()).unwrap();
+    backend.draw(&call(vb, ib, 7)).unwrap();
+    backend.end_frame().unwrap();
+
+    // Drawing with a material whose texture is gone is caught.
+    backend.destroy_texture(tex).unwrap();
+    backend.begin_frame(&View::default()).unwrap();
+    assert!(matches!(
+        backend.draw(&call(vb, ib, 7)),
+        Err(BackendError::InvalidHandle(_))
+    ));
+    backend.end_frame().unwrap();
+    assert!(backend.set_material(MaterialId(9), &material).is_err());
 }

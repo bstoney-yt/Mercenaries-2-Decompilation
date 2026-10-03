@@ -105,13 +105,22 @@ only) once item 11 lands.
 - Third-party crates are permissively licensed (MIT/Apache/zlib/BSD only).
 - README states that a legally owned copy is required.
 
-## Decisions for Brendan
+## Decisions (taken 2026-10-03)
 
-1. **Graphics API: wgpu (recommended) or a native D3D9 backend first.**
-   wgpu gives D3D12 and Vulkan through one backend and matches the
-   "modern APIs" goal. D3D9 matches the original but is legacy-only.
-2. **Physics: use a library such as Rapier (recommended) or hand-roll.**
-   A library saves weeks on character, vehicle and debris physics; tuning
-   stays invented either way.
-3. **Missions in alpha: out (recommended) or in.** Mission data isn't
-   decoded yet; putting it in alpha makes alpha date depend on an unknown.
+1. **Graphics API: wgpu.** D3D12 and Vulkan through one backend, matching
+   the "modern APIs" goal, rather than a legacy D3D9 backend.
+2. **Physics: Rapier.** Saves weeks on character, vehicle and debris
+   physics; tuning stays invented either way.
+3. **Missions: out of alpha.** Mission data isn't decoded; alpha doesn't
+   wait on it.
+
+## Progress
+
+- Items 1 and 2: `m2-render::gpu::WgpuBackend` (textures, materials, sun
+  and fog lighting, reversed depth, D3D9 winding; offscreen mode for tests)
+  and the `m2-alpha` binary (winit window, settings file, rebindable keys,
+  60 Hz fixed step, free-fly camera, `--screenshot`). Skinning and
+  instancing move to items 5 and 4, where they are first needed.
+- Item 3 started: `m2-engine::assets` (install discovery, models and
+  textures by hash with a block cache) and `m2-engine::model` (models and
+  textures uploaded to any backend).
