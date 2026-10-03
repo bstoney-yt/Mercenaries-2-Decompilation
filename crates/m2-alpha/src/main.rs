@@ -542,7 +542,7 @@ fn fight_for_screenshot(
     use combat::{Trigger, Weapon};
     let tick = TICK.as_secs_f32();
     let here = game.focus();
-    let soldier = game
+    let mut soldier = game
         .scene
         .people
         .npcs
@@ -577,10 +577,21 @@ fn fight_for_screenshot(
             p.character.velocity = m2_math::glam::Vec3::ZERO;
             p.landed = false;
         }
+        // People come and go as she moves, so find him again by spawn.
+        let spawn = game.scene.people.npcs[i].spawn;
         for _ in 0..90 {
             game.step(Intent::default(), tick);
         }
+        soldier = game
+            .scene
+            .people
+            .npcs
+            .iter()
+            .position(|n| n.spawn.is_some() && n.spawn == spawn);
+    }
+    if let Some(i) = soldier {
         let here = game.focus();
+        let at = game.scene.people.npcs[i].character.position;
         eprintln!(
             "fight: shooting the soldier at {at:.1} ({:.1} m)",
             at.distance(here)

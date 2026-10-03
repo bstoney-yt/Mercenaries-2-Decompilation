@@ -828,7 +828,7 @@ impl Effects {
             count: faces.len() as u32 * 3,
             light: define([1.0, 0.85, 0.45, 1.0], false, BlendMode::Opaque)?,
             fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
-            smoke: define([0.35, 0.35, 0.35, 0.5], true, BlendMode::Translucent)?,
+            smoke: define([0.35, 0.35, 0.35, 0.22], true, BlendMode::Translucent)?,
         })
     }
 
@@ -876,27 +876,36 @@ impl Effects {
                 true,
             ),
         };
+        // Smoke as nested shells, fainter outwards, for a softer edge.
+        let shells: &[f32] = if material == self.smoke {
+            &[0.55, 0.8, 1.0]
+        } else {
+            &[1.0]
+        };
         let (vb, ib) = self.mesh;
-        queue.push(Primitive {
-            call: DrawCall {
-                material,
-                topology: Topology::TriangleList,
-                vertex_buffer: vb,
-                geometry: Geometry::Indexed {
-                    buffer: ib,
-                    first: 0,
-                    count: self.count,
-                    base_vertex: 0,
+        for &shell in shells {
+            let world = world * Mat4::from_scale(Vec3::splat(shell));
+            queue.push(Primitive {
+                call: DrawCall {
+                    material,
+                    topology: Topology::TriangleList,
+                    vertex_buffer: vb,
+                    geometry: Geometry::Indexed {
+                        buffer: ib,
+                        first: 0,
+                        count: self.count,
+                        base_vertex: 0,
+                    },
+                    world,
+                    skin: None,
+                    instances: None,
                 },
-                world,
-                skin: None,
-                instances: None,
-            },
-            layer: Layer::WORLD,
-            translucent,
-            sort_origin: world.transform_point3(Vec3::ZERO),
-            user: 0,
-        });
+                layer: Layer::WORLD,
+                translucent,
+                sort_origin: world.transform_point3(Vec3::ZERO),
+                user: 0,
+            });
+        }
     }
 }
 
