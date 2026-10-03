@@ -34,6 +34,8 @@ pub struct MaterialCache {
     materials: HashMap<(u32, Option<u32>), MaterialId>,
     defined: Vec<(MaterialId, MaterialDesc)>,
     next_material: u32,
+    /// Every material, including ones defined later, draws both faces.
+    all_double_sided: bool,
     /// Largest texture width to read for models; bigger mips are skipped.
     pub max_texture_width: u32,
 }
@@ -46,6 +48,7 @@ impl Default for MaterialCache {
             defined: Vec::new(),
             // 0 stays the backend's default material.
             next_material: 1,
+            all_double_sided: false,
             max_texture_width: 1024,
         }
     }
@@ -145,18 +148,25 @@ impl MaterialCache {
     ) -> Result<MaterialId, BackendError> {
         let id = MaterialId(self.next_material);
         self.next_material += 1;
-        backend.set_material(id, desc)?;
+        backend.set_material(
+            id,
+            &MaterialDesc {
+                double_sided: self.all_double_sided || desc.double_sided,
+                ..*desc
+            },
+        )?;
         self.defined.push((id, *desc));
         Ok(id)
     }
 
-    /// Redefines every material drawing both faces (`true`) or as defined
-    /// (`false`); a debugging aid for checking winding.
+    /// Redefines every material, and defines later ones, drawing both faces
+    /// (`true`) or as defined (`false`); a debugging aid for checking winding.
     pub fn set_double_sided(
-        &self,
+        &mut self,
         backend: &mut dyn RenderBackend,
         on: bool,
     ) -> Result<(), BackendError> {
+        self.all_double_sided = on;
         for (id, desc) in &self.defined {
             let desc = MaterialDesc {
                 double_sided: on || desc.double_sided,

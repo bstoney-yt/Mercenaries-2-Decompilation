@@ -30,6 +30,11 @@ use crate::assets::{AssetError, AssetSource};
 /// Side of the island in metres (20 cells of 400 m).
 pub const ISLAND: f32 = 8000.0;
 
+/// Skirt depth under full-detail cells and under low-resolution tiles,
+/// whose coarser edges leave wider gaps.
+const CELL_SKIRT: f32 = 4.0;
+const TILE_SKIRT: f32 = 30.0;
+
 /// One placed model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectPlacement {
@@ -232,6 +237,42 @@ impl TerrainMesh {
         }
     }
 
+    /// Hangs a strip `depth` metres deep below every open edge (an edge of
+    /// one triangle only), so cracks where neighbouring cells, patches or
+    /// detail levels meet show ground instead of sky. Drawn both ways round,
+    /// as the crack may be seen from either side.
+    fn add_skirts(&mut self, depth: f32) {
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in self.indices.chunks_exact(3) {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let mut open: Vec<(u32, u32)> = edges
+            .into_iter()
+            .filter(|&(_, n)| n == 1)
+            .map(|(e, _)| e)
+            .collect();
+        open.sort_unstable();
+        let mut lowered: HashMap<u32, u32> = HashMap::new();
+        let mut lower = |mesh: &mut Self, v: u32| {
+            *lowered.entry(v).or_insert_with(|| {
+                let at = v as usize * 32;
+                let mut vertex: [u8; 32] = mesh.vertices[at..at + 32].try_into().expect("32 bytes");
+                let y = f32::from_le_bytes(vertex[4..8].try_into().expect("4 bytes")) - depth;
+                vertex[4..8].copy_from_slice(&y.to_le_bytes());
+                mesh.bounds.0.y = mesh.bounds.0.y.min(y);
+                mesh.vertices.extend(vertex);
+                mesh.vertex_count() - 1
+            })
+        };
+        for (a, b) in open {
+            let (la, lb) = (lower(self, a), lower(self, b));
+            self.indices
+                .extend([a, b, lb, a, lb, la, a, lb, b, a, la, lb]);
+        }
+    }
+
     fn empty(origin: Vec3, colour_map: Option<u32>) -> Self {
         Self {
             origin,
@@ -260,6 +301,7 @@ pub fn terrain_cell<R: Read + Seek>(
             mesh.add_group(g, offset, |p| colour_map_uv(p.x, p.z));
         }
     }
+    mesh.add_skirts(CELL_SKIRT);
     Ok(mesh)
 }
 
@@ -286,6 +328,7 @@ pub fn low_res_tile<R: Read + Seek>(
         let w = p + centre;
         [(ISLAND / 2.0 - w.x) / ISLAND, (ISLAND / 2.0 - w.z) / ISLAND]
     });
+    mesh.add_skirts(TILE_SKIRT);
     Ok(mesh)
 }
 
@@ -300,6 +343,24 @@ mod tests {
         assert_eq!(square_distance(c, 199.0, -150.0), 0.0);
         assert_eq!(square_distance(c, 300.0, 0.0), 100.0);
         assert!((square_distance(c, 230.0, 240.0) - 50.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn skirts_hang_below_open_edges_only() {
+        let mut mesh = TerrainMesh::empty(Vec3::ZERO, None);
+        // Two triangles sharing the edge 0-2: four open edges.
+        for (x, z) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+            for f in [x, 2.0, z, 0.0, 1.0, 0.0, 0.0, 0.0] {
+                mesh.vertices.extend(f.to_le_bytes());
+            }
+        }
+        mesh.indices = vec![0, 1, 2, 0, 2, 3];
+        mesh.bounds = (Vec3::new(0.0, 2.0, 0.0), Vec3::new(1.0, 2.0, 1.0));
+        mesh.add_skirts(4.0);
+        assert_eq!(mesh.vertex_count(), 8);
+        assert_eq!(mesh.indices.len(), 6 + 4 * 12);
+        assert_eq!(mesh.bounds.0.y, -2.0);
+        assert!(mesh.indices.iter().all(|&i| i < 8));
     }
 
     #[test]

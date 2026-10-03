@@ -133,6 +133,10 @@ pub struct MaterialDesc {
     pub vertex_color: bool,
     /// Apply distance fog.
     pub fog: bool,
+    /// Clamp texture coordinates to the edge instead of repeating, for
+    /// maps that cover one surface exactly (terrain cells), whose filtering
+    /// would otherwise pick up the opposite edge.
+    pub clamp: bool,
 }
 
 impl Default for MaterialDesc {
@@ -145,6 +149,7 @@ impl Default for MaterialDesc {
             lit: true,
             vertex_color: false,
             fog: true,
+            clamp: false,
         }
     }
 }
