@@ -158,7 +158,7 @@ pub enum Geometry {
     },
     Convex {
         vertices: Vec<[f32; 3]>,
-        /// Outward normal and offset: `n Ã‚Â· v + d <= 0` inside (the planes
+        /// Outward normal and offset: `n · v + d <= 0` inside (the planes
         /// sit `radius` outside the vertices).
         planes: Vec<[f32; 4]>,
     },
@@ -602,7 +602,7 @@ fn hull_faces(vertices: &[[f32; 3]], planes: &[[f32; 4]]) -> Vec<[u32; 3]> {
                 c[a] += vertices[i as usize][a] / face.len() as f32;
             }
         }
-        // An in-plane basis (u, w) with u Ãƒâ€” w = n.
+        // An in-plane basis (u, w) with u × w = n.
         let helper = if n[0].abs() < 0.9 {
             [1.0, 0.0, 0.0]
         } else {
@@ -707,7 +707,7 @@ mod tests {
         b.object(0x40, "hkpBoxShape");
         put(&mut d, 0x50, &lef(&[0.05]));
         put(&mut d, 0x60, &lef(&[1.0, 2.0, 3.0]));
-        // Convex cube (Ã‚Â±1) at 0x80: 8 vertices in 2 blocks at 0xE0, 6 planes at 0x140.
+        // Convex cube (±1) at 0x80: 8 vertices in 2 blocks at 0xE0, 6 planes at 0x140.
         b.object(0x80, "hkpConvexVerticesShape");
         put(&mut d, 0x90, &lef(&[0.05]));
         put(&mut d, 0xC4, &le(&[2, 0x8000_0000, 8]));
