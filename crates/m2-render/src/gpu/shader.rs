@@ -23,7 +23,8 @@ struct Frame {
 
 struct Draw {
     world: mat4x4<f32>,
-    // x: first palette matrix, y: palette length (0: not skinned)
+    // x: first palette matrix, y: palette length (0: not skinned),
+    // z: first instance matrix, w: instance count (0: not instanced)
     skin: vec4<u32>,
 };
 
@@ -159,14 +160,18 @@ pub fn source(layout: &VertexLayout) -> String {
         s,
         r#"
 @vertex
-fn vs_main(v: VertexIn) -> Varyings {{
+fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
     var local = vec4<f32>({position}, 1.0);
     var normal = {normal};{skin}
-    let world = draw.world * local;
+    var model = draw.world;
+    if draw.skin.w > 0u {{
+        model = model * palette[draw.skin.z + min(instance, draw.skin.w - 1u)];
+    }}
+    let world = model * local;
     var out: Varyings;
     out.clip = frame.view_proj * world;
     out.world_pos = world.xyz;
-    out.normal = (draw.world * vec4<f32>(normal, 0.0)).xyz;
+    out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
     out.uv = {uv};
     out.color = {color};
     return out;

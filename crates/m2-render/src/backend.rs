@@ -60,6 +60,10 @@ pub struct DrawCall {
     /// which takes a vertex from bind pose to posed object space. `None`
     /// draws skinned vertices in their bind pose.
     pub skin: Option<SkinHandle>,
+    /// Draws the geometry once per matrix of this range (stored with
+    /// [`RenderBackend::set_skin`]): instance `i` goes to world space by
+    /// `world * matrices[i]`. `None` draws it once.
+    pub instances: Option<SkinHandle>,
 }
 
 /// Light and atmosphere for a frame.
@@ -251,7 +255,8 @@ pub trait RenderBackend {
     /// Opens a frame rendered from `view`. Draws are only valid inside a frame.
     fn begin_frame(&mut self, view: &View) -> Result<(), BackendError>;
 
-    /// Stores a bone palette for this frame's skinned draws.
+    /// Stores matrices for this frame's draws: a skinned draw's bone
+    /// palette, or an instanced draw's instance transforms.
     fn set_skin(&mut self, matrices: &[Mat4]) -> Result<SkinHandle, BackendError>;
 
     fn draw(&mut self, call: &DrawCall) -> Result<(), BackendError>;

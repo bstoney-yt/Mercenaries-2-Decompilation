@@ -127,8 +127,9 @@ only) once item 11 lands.
   first, uploads within a per-frame budget).
 - Item 4 started: `m2-engine::world` indexes the island from its entity
   layers alone, and the window streams low-res tiles everywhere, detailed
-  cells within 600 m, placed models within 1.2 km and a sea plane. Still to
-  come: terrain detail layers, scatter (needs instancing).
+  cells within 600 m, placed models within 1.2 km and a sea plane. Ground
+  scatter (grass, shrubs, rubble) streams within 150 m as instanced draws
+  (`DrawCall::instances`). Still to come: terrain detail layers.
 - Item 5: `m2-engine::anim` binds clips to any skeleton by bone name, blends
   gaits, plays one-shot clips (aim, death) and builds skinning palettes;
   the wgpu backend skins on the GPU.
