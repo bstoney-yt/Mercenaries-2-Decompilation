@@ -6,13 +6,14 @@
 //! cargo run --release -p m2-assets --example gltf -- rigs   <vz.wad>
 //! cargo run --release -p m2-assets --example gltf -- export <vz.wad> <model hash> <out.glb> [options]
 //!     --clips N       export at most N animation clips (default 40)
-//!     --filter TEXT   only clips from blocks whose path contains TEXT
+//!     --filter TEXT   only clips from blocks whose name contains TEXT (or any of TEXT,TEXT,...)
 //!     --lod N         level of detail to export (default 0, the finest)
 //! cargo run --release -p m2-assets --example gltf -- world  <vz.wad> <out.glb> [options]
 //!     --detail X,Z    full-detail terrain around this point (game x, z)
 //!     --radius M      ... out to this distance (default 600)
 //!     --objects WHICH static (default: layers_static), all (mission states too) or none
 //!     --sea Y         sea surface height (default -35, an estimate)
+//!     --vehicles N    drivable vehicles parked near --detail (default 8, 0 for none)
 //! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--port N]
 //! ```
 //!
@@ -51,6 +52,26 @@
 //! instead: a fallback the page labels as such. The character also cannot
 //! climb terrain steeper than 50 degrees, slows down uphill, and falls off
 //! edges.
+//!
+//! Vehicles: `--vehicles N` parks N drivable ground vehicles in a row 12 m
+//! north of `--detail`, one of each kind first (car, truck, civilian model,
+//! APC, tank, then the rest). Each is a node `veh ...` holding the body and
+//! one `wheel N` node per wheel, centred on the wheel so the viewer can
+//! spin and steer it, with the kind, wheels, bounds and PHY2 mass in the
+//! node's extras. Kinds come from texture names and wheels from geometry
+//! (see `m2_assets::vehicle`). In play mode, E gets in and out; W/S drive,
+//! A/D steer and Space brakes. The handling is a simple arcade model tuned
+//! by hand, not the game's. Helicopters (a UH-1 first) come with their main
+//! and tail rotors as `rotor N` nodes, found by their marker names, and fly
+//! with an arcade model also tuned by hand: Space climbs, Shift descends,
+//! W/S fly forward and back, A/D turn, and E gets out once landed.
+//! Vehicles collide with each other through their footprint boxes. The
+//! extras also carry the driver's seat and
+//! door markers. With the character exported with its vehicle clips
+//! (`--filter resident,vehicleclassanimgroup`), it climbs in with the
+//! game's enter clip for the vehicle's class, sits in the seated loop while
+//! driving, and climbs out with the enter clip played backwards; the clips
+//! are told apart by their root motion, relative to the driver's seat.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
@@ -122,6 +143,7 @@ fn run(args: &[String]) -> AnyResult<()> {
                 radius: 600.0,
                 objects: Objects::Static,
                 sea: -35.0,
+                vehicles: 8,
             };
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
@@ -133,6 +155,7 @@ fn run(args: &[String]) -> AnyResult<()> {
                     }
                     "--radius" => w.radius = value.parse()?,
                     "--sea" => w.sea = value.parse()?,
+                    "--vehicles" => w.vehicles = value.parse()?,
                     "--objects" => {
                         w.objects = match value.as_str() {
                             "static" => Objects::Static,
@@ -720,7 +743,7 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
         let name = block_name(&path).to_owned();
         if o.filter
             .as_ref()
-            .is_some_and(|f| !name.to_lowercase().contains(f))
+            .is_some_and(|f| !f.split(',').any(|f| name.to_lowercase().contains(f.trim())))
         {
             continue;
         }
@@ -880,6 +903,8 @@ struct WorldOptions {
     /// -33 m, so the water is just below; where the game stores it is not
     /// known yet.
     sea: f32,
+    /// How many drivable vehicles to park near the detail point.
+    vehicles: usize,
 }
 
 /// Which placed models to export.
@@ -964,6 +989,133 @@ fn piece(
     }
 }
 
+/// Where model primitives go: the glTF buffers, images and materials of a
+/// world export, and the materials already made for model textures.
+struct Sink<'a> {
+    g: &'a mut Gltf,
+    images: &'a mut Vec<String>,
+    image_sampler: &'a mut Vec<u8>,
+    materials: &'a mut Vec<String>,
+    by_texture: &'a mut HashMap<u32, usize>,
+    untextured: &'a mut Option<usize>,
+}
+
+/// glTF primitives for `model`'s finest complete level of detail, split
+/// into `groups` lists. `group(node)` gives the list for a segment on
+/// `node` and the matrix taking model space into that list's space, or
+/// `None` to leave the segment out. Also returns the triangle count.
+fn model_primitives<R: Read + Seek>(
+    wad: &mut WadArchive<R>,
+    s: &mut Sink,
+    model: &Model,
+    groups: usize,
+    group: &dyn Fn(u16) -> Option<(usize, Mat4)>,
+) -> (Vec<Vec<String>>, usize) {
+    let mut out = vec![Vec::new(); groups];
+    let mut triangles = 0;
+    let lod = (0..model.info.lod_count)
+        .find(|&l| model.has_lod(l))
+        .unwrap_or(0);
+    for (segment, geom) in model.lod(lod) {
+        let Some((list, post)) = group(segment.node) else {
+            continue;
+        };
+        // Skinned positions are already in model space.
+        let to_model = match geom.kind {
+            GeometryKind::Skin => Mat4::IDENTITY,
+            _ => model.node_to_model(segment.node).unwrap_or(Mat4::IDENTITY),
+        };
+        let to_group = post * to_model;
+        for grp in &geom.groups {
+            let read = |u| grp.decl.find(u, 0).and_then(|e| grp.vertices.read(e));
+            let Some(pos) = read(DeclUsage::Position) else {
+                continue;
+            };
+            let p: Vec<f32> = pos
+                .iter()
+                .flat_map(|v| {
+                    flip_v(
+                        to_group
+                            .transform_point3(Vec3::new(v[0], v[1], v[2]))
+                            .to_array(),
+                    )
+                })
+                .collect();
+            let mut attrs = format!(r#""POSITION":{}"#, s.g.floats(&p, 3, true, Some(34962)));
+            if let Some(nrm) = read(DeclUsage::Normal) {
+                let n: Vec<f32> = nrm
+                    .iter()
+                    .flat_map(|v| {
+                        let n = to_group.transform_vector3(Vec3::new(v[0], v[1], v[2]));
+                        flip_v(n.try_normalize().unwrap_or(Vec3::Y).to_array())
+                    })
+                    .collect();
+                let _ = write!(
+                    attrs,
+                    r#","NORMAL":{}"#,
+                    s.g.floats(&n, 3, false, Some(34962))
+                );
+            }
+            if let Some(uv) = read(DeclUsage::TexCoord) {
+                let t: Vec<f32> = uv.iter().flat_map(|v| [v[0], v[1]]).collect();
+                let _ = write!(
+                    attrs,
+                    r#","TEXCOORD_0":{}"#,
+                    s.g.floats(&t, 2, false, Some(34962))
+                );
+            }
+            for range in &grp.material_ranges {
+                let tris: Vec<u16> = grp
+                    .triangles(range)
+                    .into_iter()
+                    .flat_map(|[a, b, c]| [a, c, b])
+                    .collect();
+                if tris.is_empty() {
+                    continue;
+                }
+                triangles += tris.len() / 3;
+                let ind = s.g.u16s(&tris, 1, Some(34963));
+                let texture = model
+                    .materials
+                    .get(range.material as usize)
+                    .and_then(|m| m.textures.first().copied())
+                    .filter(|&t| t != 0);
+                let material = match texture.and_then(|t| s.by_texture.get(&t).copied()) {
+                    Some(m) => m,
+                    None => {
+                        let loaded =
+                            texture.and_then(|t| load_texture(wad, t, 256).map(|x| (t, x)));
+                        match loaded {
+                            Some((t, (w, h, rgba, alpha))) => {
+                                let view = s.g.view(&png(w, h, &rgba), None);
+                                s.images.push(format!(
+                                    r#"{{"bufferView":{view},"mimeType":"image/png","name":"{t:08x}"}}"#
+                                ));
+                                s.image_sampler.push(1);
+                                s.materials.push(format!(
+                                    r#"{{"name":"{t:08x}","pbrMetallicRoughness":{{"baseColorTexture":{{"index":{}}},"metallicFactor":0,"roughnessFactor":0.9}}{}}}"#,
+                                    s.images.len() - 1,
+                                    if alpha { r#","alphaMode":"MASK","alphaCutoff":0.5,"doubleSided":true"# } else { "" }
+                                ));
+                                s.by_texture.insert(t, s.materials.len() - 1);
+                                s.materials.len() - 1
+                            }
+                            None => *s.untextured.get_or_insert_with(|| {
+                                s.materials.push(r#"{"name":"untextured object","pbrMetallicRoughness":{"baseColorFactor":[0.6,0.6,0.6,1],"metallicFactor":0,"roughnessFactor":0.9}}"#.to_owned());
+                                s.materials.len() - 1
+                            }),
+                        }
+                    }
+                };
+                out[list].push(format!(
+                    r#"{{"attributes":{{{attrs}}},"indices":{ind},"material":{material}}}"#
+                ));
+            }
+        }
+    }
+    (out, triangles)
+}
+
 fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> AnyResult<Vec<u8>> {
     use m2_assets::layer::LAYER_TYPE;
     use m2_assets::terrain::{CELL_SIZE, LOW_RES_TYPE, TERRAIN_TYPE, colour_map_uv};
@@ -977,12 +1129,31 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
     let mut placed: Vec<(u32, [f32; 3], [f32; 4])> = Vec::new();
     // Scatter assets by the terrain cell sharing their block.
     let mut scatter_of: Vec<(u32, Vec<u8>)> = Vec::new();
+    // Texture names, and the texture hashes of every model, to find vehicles.
+    let mut texture_names: HashMap<u32, String> = HashMap::new();
+    let mut model_textures: Vec<(u32, Vec<u32>)> = Vec::new();
     for block in 0..wad.index().blocks().len() {
         let is_static = wad.index().blocks()[block].path.contains("layers_static");
         let (mut block_cell, mut block_scatter) = (None, Vec::new());
         let decoded = wad.read_block(block)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
             match e.type_hash {
+                TEXTURE_TYPE if o.vehicles > 0 => {
+                    if let Some(n) = m2_assets::Ucfx::parse(data).ok().and_then(|u| u.name()) {
+                        texture_names.insert(e.name_hash, n.to_ascii_lowercase());
+                    }
+                }
+                MODEL_TYPE if o.vehicles > 0 && e.unk_0x08 == 0 => {
+                    if let Ok(m) = Model::parse(data) {
+                        model_textures.push((
+                            e.name_hash,
+                            m.materials
+                                .iter()
+                                .flat_map(|mt| mt.textures.iter().copied())
+                                .collect(),
+                        ));
+                    }
+                }
                 LAYER_TYPE => {
                     let layer = Layer::parse(data)?;
                     let placements = layer.placements();
@@ -1207,108 +1378,18 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
                         Ok(None) => {}
                         Err(e) => eprintln!("collision {model_hash:08x}: {e}"),
                     }
-                    let lod = (0..model.info.lod_count)
-                        .find(|&l| model.has_lod(l))
-                        .unwrap_or(0);
-                    let mut prims = Vec::new();
-                    for (segment, geom) in model.lod(lod) {
-                        // Skinned positions are already in model space.
-                        let to_model = match geom.kind {
-                            GeometryKind::Skin => Mat4::IDENTITY,
-                            _ => model.node_to_model(segment.node).unwrap_or(Mat4::IDENTITY),
-                        };
-                        for grp in &geom.groups {
-                            let read = |u| grp.decl.find(u, 0).and_then(|e| grp.vertices.read(e));
-                            let Some(pos) = read(DeclUsage::Position) else {
-                                continue;
-                            };
-                            let p: Vec<f32> = pos
-                                .iter()
-                                .flat_map(|v| {
-                                    flip_v(
-                                        to_model
-                                            .transform_point3(Vec3::new(v[0], v[1], v[2]))
-                                            .to_array(),
-                                    )
-                                })
-                                .collect();
-                            let mut attrs =
-                                format!(r#""POSITION":{}"#, g.floats(&p, 3, true, Some(34962)));
-                            if let Some(nrm) = read(DeclUsage::Normal) {
-                                let n: Vec<f32> = nrm
-                                    .iter()
-                                    .flat_map(|v| {
-                                        let n =
-                                            to_model.transform_vector3(Vec3::new(v[0], v[1], v[2]));
-                                        flip_v(n.try_normalize().unwrap_or(Vec3::Y).to_array())
-                                    })
-                                    .collect();
-                                let _ = write!(
-                                    attrs,
-                                    r#","NORMAL":{}"#,
-                                    g.floats(&n, 3, false, Some(34962))
-                                );
-                            }
-                            if let Some(uv) = read(DeclUsage::TexCoord) {
-                                let t: Vec<f32> = uv.iter().flat_map(|v| [v[0], v[1]]).collect();
-                                let _ = write!(
-                                    attrs,
-                                    r#","TEXCOORD_0":{}"#,
-                                    g.floats(&t, 2, false, Some(34962))
-                                );
-                            }
-                            for range in &grp.material_ranges {
-                                let tris: Vec<u16> = grp
-                                    .triangles(range)
-                                    .into_iter()
-                                    .flat_map(|[a, b, c]| [a, c, b])
-                                    .collect();
-                                if tris.is_empty() {
-                                    continue;
-                                }
-                                object_triangles += tris.len() / 3;
-                                let ind = g.u16s(&tris, 1, Some(34963));
-                                let texture = model
-                                    .materials
-                                    .get(range.material as usize)
-                                    .and_then(|m| m.textures.first().copied())
-                                    .filter(|&t| t != 0);
-                                let material = match texture
-                                    .and_then(|t| material_of_texture.get(&t).copied())
-                                {
-                                    Some(m) => m,
-                                    None => {
-                                        let loaded = texture.and_then(|t| {
-                                            load_texture(wad, t, 256).map(|x| (t, x))
-                                        });
-                                        match loaded {
-                                            Some((t, (w, h, rgba, alpha))) => {
-                                                let view = g.view(&png(w, h, &rgba), None);
-                                                images.push(format!(
-                                                    r#"{{"bufferView":{view},"mimeType":"image/png","name":"{t:08x}"}}"#
-                                                ));
-                                                image_sampler.push(1);
-                                                materials.push(format!(
-                                                    r#"{{"name":"{t:08x}","pbrMetallicRoughness":{{"baseColorTexture":{{"index":{}}},"metallicFactor":0,"roughnessFactor":0.9}}{}}}"#,
-                                                    images.len() - 1,
-                                                    if alpha { r#","alphaMode":"MASK","alphaCutoff":0.5,"doubleSided":true"# } else { "" }
-                                                ));
-                                                material_of_texture.insert(t, materials.len() - 1);
-                                                materials.len() - 1
-                                            }
-                                            None => *untextured.get_or_insert_with(|| {
-                                                materials.push(r#"{"name":"untextured object","pbrMetallicRoughness":{"baseColorFactor":[0.6,0.6,0.6,1],"metallicFactor":0,"roughnessFactor":0.9}}"#.to_owned());
-                                                materials.len() - 1
-                                            }),
-                                        }
-                                    }
-                                };
-                                prims.push(format!(
-                                    r#"{{"attributes":{{{attrs}}},"indices":{ind},"material":{material}}}"#
-                                ));
-                            }
-                        }
-                    }
+                    let mut sink = Sink {
+                        g: &mut g,
+                        images: &mut images,
+                        image_sampler: &mut image_sampler,
+                        materials: &mut materials,
+                        by_texture: &mut material_of_texture,
+                        untextured: &mut untextured,
+                    };
+                    let (lists, tris) =
+                        model_primitives(wad, &mut sink, &model, 1, &|_| Some((0, Mat4::IDENTITY)));
+                    object_triangles += tris;
+                    let prims = &lists[0];
                     if prims.is_empty() {
                         return Ok(None);
                     }
@@ -1358,6 +1439,217 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
             .filter(|m| m.0.is_some() && m.1.is_some())
             .count()
     );
+
+    // Vehicles: up to `o.vehicles` drivable ground vehicles parked in a row
+    // north of the detail point, each a node "veh ..." holding a body mesh
+    // and one node per wheel ("wheel N", at the wheel's centre) that the
+    // viewer turns, with the driving data in the node's extras. Kinds come
+    // from texture names and wheels from geometry (`m2_assets::vehicle`).
+    let mut candidates: Vec<(usize, String, String, u32)> = Vec::new();
+    for (hash, textures) in &model_textures {
+        let names = textures
+            .iter()
+            .filter_map(|t| texture_names.get(t).map(String::as_str));
+        let Some((kind, label)) = m2_assets::vehicle::kind_from_textures(names) else {
+            continue;
+        };
+        // Ground vehicles and helicopters, in the order they are offered.
+        let rank = match kind.as_str() {
+            "car" => 0,
+            "truck" => 1,
+            "helicopter" if label.contains("huey") => 2,
+            "apc" => 4,
+            "tank" => 5,
+            "bus" | "van" | "semi" => 6,
+            "helicopter" => 7,
+            "boat" | "plane" | "airstrike" | "vtol" | "towed" | "trailer" | "outboardmotor"
+            | "winch" | "transport" | "motorcycle" => continue,
+            // `global_veh_<model>` textures: civilian cars and trucks.
+            _ => 3,
+        };
+        candidates.push((rank, label, kind, *hash));
+    }
+    candidates.sort();
+    let base = o.detail.unwrap_or([0.0, 0.0]);
+    let mut used = HashSet::new();
+    let mut parked = Vec::new();
+    let cursor = &mut (base[0] - 20.0);
+    // One of each kind first, then the rest in order.
+    let mut per_rank: HashMap<usize, usize> = HashMap::new();
+    let mut failed = HashSet::new();
+    let order = candidates
+        .iter()
+        .map(|c| (true, c))
+        .chain(candidates.iter().map(|c| (false, c)));
+    for (first_pass, (rank, label, kind, hash)) in order {
+        if parked.len() >= o.vehicles {
+            break;
+        }
+        if used.contains(label)
+            || failed.contains(hash)
+            || (first_pass && per_rank.get(rank).copied().unwrap_or(0) >= 1)
+        {
+            continue;
+        }
+        let built = (|| -> AnyResult<Option<String>> {
+            let (base_bytes, chunks) = load_model(wad, *hash)?;
+            let mut model = Model::parse(&base_bytes)?;
+            for c in &chunks {
+                model.add_streamed(c)?;
+            }
+            let flying = kind == "helicopter";
+            let tracked = kind == "tank" || kind == "apc";
+            let (wheels, rotors) = if flying {
+                (Vec::new(), m2_assets::vehicle::rotors(&model))
+            } else {
+                (m2_assets::vehicle::find_wheels(&model), Vec::new())
+            };
+            if flying && !rotors.iter().any(|r| r.axis[1] == 1.0) {
+                return Ok(None);
+            }
+            if !flying
+                && !tracked
+                && (!(4..=10).contains(&wheels.len())
+                    || wheels.iter().any(|w| !(0.15..=1.3).contains(&w.radius)))
+            {
+                return Ok(None);
+            }
+            // Turning parts: the wheels, then the rotors.
+            let spinners: Vec<(&[u16], [f32; 3])> = wheels
+                .iter()
+                .map(|w| (&w.nodes[..], w.centre))
+                .chain(rotors.iter().map(|r| (&r.nodes[..], r.centre)))
+                .collect();
+            let spinner_of = |node: u16| {
+                let mut n = Some(node);
+                for _ in 0..=model.nodes.len() {
+                    let cur = n?;
+                    if let Some(i) = spinners.iter().position(|s| s.0.contains(&cur)) {
+                        return Some(i);
+                    }
+                    n = model.nodes.get(usize::from(cur))?.parent;
+                }
+                None
+            };
+            let group = |node: u16| {
+                Some(match spinner_of(node) {
+                    Some(i) => (1 + i, Mat4::from_translation(-Vec3::from(spinners[i].1))),
+                    None => (0, Mat4::IDENTITY),
+                })
+            };
+            let mut sink = Sink {
+                g: &mut g,
+                images: &mut images,
+                image_sampler: &mut image_sampler,
+                materials: &mut materials,
+                by_texture: &mut material_of_texture,
+                untextured: &mut untextured,
+            };
+            let (lists, _) = model_primitives(wad, &mut sink, &model, 1 + spinners.len(), &group);
+            if lists[0].is_empty() {
+                return Ok(None);
+            }
+            let mut children = Vec::new();
+            for (i, prims) in lists.iter().enumerate() {
+                let mesh = if prims.is_empty() {
+                    String::new()
+                } else {
+                    meshes.push(format!(r#"{{"primitives":[{}]}}"#, prims.join(",")));
+                    format!(r#","mesh":{}"#, meshes.len() - 1)
+                };
+                nodes.push(match i {
+                    0 => format!(r#"{{"name":"vbody"{mesh}}}"#),
+                    _ if i <= wheels.len() => format!(
+                        r#"{{"name":"wheel {}","translation":{:?}{mesh}}}"#,
+                        i - 1,
+                        flip_v(spinners[i - 1].1)
+                    ),
+                    _ => format!(
+                        r#"{{"name":"rotor {}","translation":{:?}{mesh}}}"#,
+                        i - 1 - wheels.len(),
+                        flip_v(spinners[i - 1].1)
+                    ),
+                });
+                child_nodes.insert(nodes.len() - 1);
+                children.push(nodes.len() - 1);
+            }
+            // The front axle steers.
+            let front = wheels
+                .iter()
+                .map(|w| w.centre[2])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let wheel_json: Vec<String> = wheels
+                .iter()
+                .map(|w| {
+                    format!(
+                        r#"{{"radius":{},"width":{},"steer":{}}}"#,
+                        w.radius,
+                        w.width,
+                        w.centre[2] >= front - 0.3
+                    )
+                })
+                .collect();
+            // Mass: the heaviest PHY2 body, in the game's units.
+            let mass = m2_assets::Ucfx::parse(&base_bytes)?
+                .top_level(*b"PHY2")
+                .and_then(|d| m2_assets::Physics::parse(d).ok())
+                .map(|p| p.bodies.iter().map(|b| b.mass).fold(0.0f32, f32::max))
+                .filter(|m| m.is_finite() && *m > 0.0);
+            // The driver's seat and door markers (see m2_assets::vehicle).
+            use m2_assets::vehicle::{DRIVER_DOOR, DRIVER_SEAT};
+            let marker = |h| {
+                m2_assets::vehicle::marker(&model, h)
+                    .map_or("null".to_owned(), |p| format!("{:?}", flip_v(p)))
+            };
+            let rotor_json: Vec<String> = rotors
+                .iter()
+                .map(|r| format!(r#"{{"axis":{:?}}}"#, r.axis))
+                .collect();
+            // In a row, side by side with 3 m between them.
+            let b = &model.info.bounds;
+            let width = b.max[0] - b.min[0];
+            let at = [*cursor + width / 2.0, 0.0, base[1] + 12.0];
+            *cursor += width + 3.0;
+            nodes.push(format!(
+                r#"{{"name":"veh {hash:08x}","translation":{:?},"children":{children:?},"extras":{{"vehicle":{{"model":"{hash:08x}","kind":"{kind}","name":"{label}","tracked":{tracked},"mass":{},"min":{:?},"max":{:?},"seat":{},"door":{},"flying":{flying},"wheels":[{}],"rotors":[{}]}}}}}}"#,
+                flip_v(at),
+                mass.map_or("null".to_owned(), |m| m.to_string()),
+                flip_v(b.min),
+                flip_v(b.max),
+                marker(DRIVER_SEAT),
+                marker(DRIVER_DOOR),
+                wheel_json.join(","),
+                rotor_json.join(",")
+            ));
+            Ok(Some(format!(
+                "{label} ({kind}, {} wheels, {} rotors)",
+                wheels.len(),
+                rotors.len()
+            )))
+        })();
+        match built {
+            Ok(Some(desc)) => {
+                used.insert(label.clone());
+                *per_rank.entry(*rank).or_default() += 1;
+                parked.push(desc);
+            }
+            Ok(None) => {
+                failed.insert(*hash);
+            }
+            Err(e) => {
+                failed.insert(*hash);
+                eprintln!("vehicle {hash:08x}: {e}");
+            }
+        }
+    }
+    if o.vehicles > 0 {
+        eprintln!(
+            "{} vehicle models found by texture name; parked {}: {}",
+            candidates.len(),
+            parked.len(),
+            parked.join(", ")
+        );
+    }
 
     // Vegetation in the detailed cells, GPU-instanced: one node per run of
     // a patch (named "veg ..." for the viewer's culling), carrying its

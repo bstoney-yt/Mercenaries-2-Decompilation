@@ -17,6 +17,9 @@
   .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
   button { background: var(--accent); color: #000; border: 0; border-radius: 4px; padding: 6px 10px; cursor: pointer; }
   #status { color: var(--muted); margin-top: 10px; white-space: pre-wrap; }
+  #hint { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: #000a; color: #fff;
+          padding: 6px 12px; border-radius: 6px; pointer-events: none; }
+  #hint:empty { display: none; }
   #drop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
           background: #000a; font-size: 20px; pointer-events: none; }
 </style>
@@ -42,7 +45,7 @@
   <div id="playpanel" style="display:none">
     <h1 style="margin-top:14px">Play</h1>
     <label style="color:var(--text)"><input type="checkbox" id="playmode"> Play mode</label>
-    <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run. Drag to orbit.</div>
+    <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run, E to get in or out of a vehicle. Drag to orbit.</div>
     <label style="color:var(--text)"><input type="checkbox" id="showcol"> show collision shapes (PHY2)</label>
     <label for="idle">Idle</label><select id="idle"></select>
     <label for="walk">Walk</label><select id="walk"></select>
@@ -52,6 +55,7 @@
   <div style="color:var(--muted);margin-top:8px">Drag a .glb onto the page to open another.</div>
 </div>
 <div id="drop">Drop a .glb to open it</div>
+<div id="hint"></div>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -344,21 +348,21 @@ function closest(p, t) {
 // Pushes a body (three spheres above the step height) out of walls,
 // horizontally, so it slides along them. Moves `pos` in place.
 const _p = new THREE.Vector3();
-function pushOut(pos) {
-  const tris = trisNear(pos.x, pos.z, RADIUS + 0.1);
+function pushOut(pos, radius = RADIUS, heights = [STEP + RADIUS, 1.2, 1.6]) {
+  const tris = trisNear(pos.x, pos.z, radius + 0.1);
   if (!tris.length) return;
   for (let iter = 0; iter < 3; iter++) {
     let moved = false;
-    for (const h of [STEP + RADIUS, 1.2, 1.6]) {
+    for (const h of heights) {
       _p.set(pos.x, pos.y + h, pos.z);
       for (const t of tris) {
         const q = closest(_p, t);
         const dx = _p.x - q.x, dz = _p.z - q.z, dy = _p.y - q.y;
         const dist = Math.hypot(dx, dy, dz);
-        if (dist >= RADIUS) continue;
+        if (dist >= radius) continue;
         const flat = Math.hypot(dx, dz);
         if (flat < 1e-4) continue; // straight above or below: floor or ceiling
-        const push = (RADIUS - dist) * (dist / flat) + 1e-3;
+        const push = (radius - dist) * (dist / flat) + 1e-3;
         pos.x += dx / flat * push; pos.z += dz / flat * push;
         _p.x = pos.x; _p.z = pos.z;
         moved = true;
@@ -375,10 +379,11 @@ function openWorld(gltf) {
   world.traverse(o => {
     if (o.name.startsWith('obj_')) { objects.push(o); addCollider(o); return; }
     if (o.name.startsWith('veg_')) { plants.push(o); return; }
+    if (o.name.startsWith('veh_')) { addVehicle(o); return; }
     if (o.isMesh && (o.name === 'sea' || o.parent?.name === 'sea')) seaLevel = new THREE.Box3().setFromObject(o).max.y;
     if (!o.isMesh || o.name === 'sea' || o.parent?.name === 'sea') return;
     // Placed objects are not ground (yet): only terrain is walked on.
-    for (let p = o; p; p = p.parent) if (p.name.startsWith('obj_') || p.name.startsWith('veg_')) return;
+    for (let p = o; p; p = p.parent) if (/^(obj|veg|veh)_/.test(p.name)) return;
     const b = new THREE.Box3().setFromObject(o);
     for (let x = Math.floor(b.min.x / BUCKET); x <= Math.floor(b.max.x / BUCKET); x++)
       for (let z = Math.floor(b.min.z / BUCKET); z <= Math.floor(b.max.z / BUCKET); z++) {
@@ -432,6 +437,10 @@ function follow() {
 
 function startPlay(on) {
   mixer.stopAllAction();
+  driving = null;
+  ride = null;
+  player.visible = true;
+  ui('hint').textContent = '';
   action = null; current = null; gear = null;
   player.rotation.set(0, 0, 0);
   if (world && on) {
@@ -458,7 +467,13 @@ let fall = 0, lastLoad = 0;
 function moveInWorld(step, dt) {
   const p = player.position;
   const now = performance.now();
-  if (now - lastLoad > 250) { lastLoad = now; loadNear(p.x, p.z); }
+  if (now - lastLoad > 250) {
+    lastLoad = now;
+    loadNear(p.x, p.z);
+    settleNear(p.x, p.z);
+    const v = vehicleInReach();
+    ui('hint').textContent = v ? `E: get in the ${v.data.name} (${v.data.kind})` : '';
+  }
   if (step.lengthSq() > 0) {
     const ahead = floorAt(p.x + step.x, p.z + step.z, p.y);
     if (!ahead.onObject) {
@@ -476,6 +491,7 @@ function moveInWorld(step, dt) {
   }
   const next = p.clone().add(step);
   pushOut(next);
+  pushOutOfVehicles(next);
   const floor = floorAt(next.x, next.z, p.y);
   if (fall === 0 && floor.y >= p.y - 0.4) {
     // On the ground: follow it up a step or down a slope.
@@ -488,7 +504,468 @@ function moveInWorld(step, dt) {
   step.subVectors(next, p);
 }
 
+// ---- Vehicles --------------------------------------------------------
+// Parked by `gltf world --vehicles`: a node "veh_..." holding the body and
+// one "wheel_N" node per wheel, with the driving data (kind, wheels, mass,
+// bounds) in its extras. E gets in and out. The handling is a simple
+// arcade model TUNED BY HAND, not the game's: top speeds, acceleration,
+// grip, steering and the climb limit are guesses. glTF forward is -z.
+const vehicles = [];
+let driving = null;
+const _fwd = new THREE.Vector3(), _left = new THREE.Vector3();
+
+function addVehicle(o) {
+  const d = o.userData.vehicle;
+  if (!d) return;
+  // The loader renames repeated names ("wheel_0_1"), so read the index.
+  const index = c => +(/^wheel_(\d+)/.exec(c.name) || [])[1];
+  const wheels = o.children.filter(c => Number.isInteger(index(c)))
+    .sort((a, b) => index(a) - index(b))
+    .map(node => ({ node, base: node.position.clone(), radius: 0.4, steer: false, ...d.wheels[index(node)], spin: 0 }));
+  for (const w of wheels) w.node.rotation.order = 'YXZ';
+  const rotorIndex = c => +(/^rotor_(\d+)/.exec(c.name) || [])[1];
+  const rotors = o.children.filter(c => Number.isInteger(rotorIndex(c)))
+    .map(node => ({ node, axis: (d.rotors || [])[rotorIndex(node)]?.axis || [0, 1, 0], spin: 0 }));
+  o.rotation.order = 'YXZ';
+  // The export mirrors z, so the bounds' z may come swapped.
+  const a = new THREE.Vector3(...d.min), b = new THREE.Vector3(...d.max);
+  const lo = a.clone().min(b), hi = a.clone().max(b);
+  const zs = wheels.map(w => w.base.z);
+  vehicles.push({
+    root: o, data: d, wheels, rotors, lo, hi, speed: 0, steer: 0, vy: 0, pitch: 0, roll: 0, yaw: o.rotation.y, placed: false,
+    wheelbase: zs.length >= 2 ? Math.max(1, Math.max(...zs) - Math.min(...zs)) : Math.max(1, (hi.z - lo.z) * 0.6),
+    halfWidth: Math.max(0.4, (hi.x - lo.x) / 2),
+    length: Math.max(1, hi.z - lo.z),
+  });
+}
+
+// Vehicle-local (x, z) to world (x, z), and back, for heading `yaw`.
+const toWorld = (v, lx, lz) => {
+  const c = Math.cos(v.yaw), s = Math.sin(v.yaw), p = v.root.position;
+  return [p.x + lx * c + lz * s, p.z - lx * s + lz * c];
+};
+const toLocal = (v, wx, wz) => {
+  const c = Math.cos(v.yaw), s = Math.sin(v.yaw), dx = wx - v.root.position.x, dz = wz - v.root.position.z;
+  return [dx * c - dz * s, dx * s + dz * c];
+};
+
+// Puts vehicles within 400 m of (x, z) on the ground, once.
+function settleNear(x, z) {
+  for (const v of vehicles) {
+    const p = v.root.position;
+    if (v.placed || Math.hypot(p.x - x, p.z - z) > 400) continue;
+    loadNear(p.x, p.z);
+    p.y = floorAt(p.x, p.z, terrainAt(p.x, p.z).y + 1).y;
+    v.placed = true;
+  }
+}
+
+// Where a vehicle touches the ground, vehicle-local (x, z): its wheels, or
+// the corners of its footprint for tracked ones.
+function contacts(v) {
+  if (v.wheels.length >= 3 && !v.data.tracked) return v.wheels.map(w => [w.base.x, w.base.z]);
+  const x = v.halfWidth * 0.8, z0 = v.lo.z * 0.8, z1 = v.hi.z * 0.8;
+  return [[-x, z0], [x, z0], [-x, z1], [x, z1]];
+}
+
+// The nearest parked vehicle within reach of the character.
+function vehicleInReach() {
+  const p = player.position;
+  let best = null, bestD = Infinity;
+  for (const v of vehicles) {
+    const [lx, lz] = toLocal(v, p.x, p.z);
+    const dx = Math.max(v.lo.x - lx, 0, lx - v.hi.x), dz = Math.max(v.lo.z - lz, 0, lz - v.hi.z);
+    const d = Math.hypot(dx, dz);
+    if (d < 2 && d < bestD) { best = v; bestD = d; }
+  }
+  return best;
+}
+
+// ---- Getting in and out ---------------------------------------------
+// The game's character clips for each vehicle class come from blocks named
+// "vehicleclassanimgroup_<class>" (export the character with them in
+// --filter). Clip names are only hashes, so the clips are told apart by
+// their root motion, which is relative to the seat: a seated loop stays on
+// the seat (the clip origin) throughout; an enter clip starts 0.7 m or more
+// beside it, on the driver's (-x) side, and ends on it. Getting out plays
+// the enter clip backwards. Clips are placed on the vehicle's driver seat
+// marker (see seatFit).
+const vehicleAnims = new Map(); // group -> { seat, enter } clip indices
+function analyseVehicleClips() {
+  vehicleAnims.clear();
+  if (!loco) return;
+  clips.forEach((c, i) => {
+    const group = c.name.split(' ')[0];
+    if (!group.startsWith('vehicle')) return;
+    const t = c.tracks.find(t => t.name === `${loco.rootName}.position`);
+    if (!t) return;
+    const a = t.values, n = a.length;
+    let far = 0;
+    for (let k = 0; k < n; k += 3) far = Math.max(far, Math.hypot(a[k], a[k + 2]));
+    const start = Math.hypot(a[0], a[2]), end = Math.hypot(a[n - 3], a[n - 1]);
+    const g = vehicleAnims.get(group) || { seat: null, enter: null };
+    if (far < 0.05 && c.duration >= 1.5 && (g.seat === null || c.duration > clips[g.seat].duration)) g.seat = i;
+    if (start >= 0.7 && end < 0.05 && a[0] < 0 && c.duration >= 0.8
+        && (g.enter === null || c.duration < clips[g.enter].duration)) g.enter = i;
+    vehicleAnims.set(group, g);
+  });
+}
+
+// The clip group for a vehicle, by its kind and name.
+function animsFor(d) {
+  const key = `${d.kind} ${d.name}`;
+  for (const [re, cls] of [[/hmmwv/, 'hmmwv'], [/monster/, 'monstertruck'], [/tank/, 'tank'], [/apc/, 'apc'],
+    [/semi|bus|m35|mtv/, 'autolargea'], [/truck/, 'truckmid'], [/./, 'automedium']]) {
+    if (!re.test(key)) continue;
+    const g = vehicleAnims.get(`vehicleclassanimgroup_${cls}`);
+    if (g && g.seat !== null && g.enter !== null) return g;
+  }
+  return null;
+}
+
+// Where the rider goes: { theta, q, t } maps clip space into vehicle space.
+// The clips share the vehicle's axes with their origin on the driver's
+// seat marker (checked by eye on the HMMWV: seated, facing forward, in the
+// driver's seat). The door marker is not where the enter clips start (it
+// sits mirrored in z from it), so it is not used here.
+function seatFit(v) {
+  const s = v.data.seat;
+  if (!s) return null;
+  return { theta: 0, q: new THREE.Quaternion(), t: new THREE.Vector3(s[0], s[1], s[2]) };
+}
+
+// Puts the character at its seat in the vehicle.
+function placeRider() {
+  if (!ride || !ride.fit) return;
+  const o = ride.v.root;
+  o.updateMatrixWorld(true);
+  player.position.copy(ride.fit.t).applyMatrix4(o.matrixWorld);
+  player.quaternion.copy(o.quaternion).multiply(ride.fit.q);
+}
+
+let ride = null; // { v, anims, fit, phase: 'enter' | 'drive' | 'exit', action }
+function playOnce(i, backwards) {
+  const a = mixer.clipAction(clips[i]);
+  a.reset();
+  a.setLoop(THREE.LoopOnce);
+  a.clampWhenFinished = true;
+  a.timeScale = backwards ? -1 : 1;
+  if (backwards) a.time = clips[i].duration;
+  return a;
+}
+
+function enterOrLeave() {
+  if (!world) return;
+  if (driving) {
+    if (!ride || ride.phase !== 'drive' || Math.abs(driving.speed) > 2) return;
+    if (driving.data.flying && !driving.landed) return;
+    if (ride.fit) {
+      // Climb out: the enter clip, backwards.
+      ride.phase = 'exit';
+      ride.action = playOnce(ride.anims.enter, true);
+      ride.action.crossFadeFrom(current, 0.2, false).play();
+      current = ride.action;
+    } else leave();
+    return;
+  }
+  const v = vehicleInReach();
+  if (!v) return;
+  driving = v;
+  v.speed = 0;
+  const anims = v.data.flying ? null : animsFor(v.data);
+  const fit = anims && seatFit(v);
+  ride = { v, anims, fit, phase: 'enter', action: null };
+  if (fit) {
+    mixer.stopAllAction();
+    gear = null;
+    ride.action = current = playOnce(anims.enter, false);
+    current.play();
+    placeRider();
+  } else {
+    // No seat or clips for this vehicle: the character rides out of sight.
+    player.visible = false;
+    ride.phase = 'drive';
+  }
+  const p = v.root.position;
+  _fwd.set(-Math.sin(v.yaw), 0, -Math.cos(v.yaw));
+  controls.target.copy(p).add(new THREE.Vector3(0, 1.5, 0));
+  camera.position.copy(p).addScaledVector(_fwd, -(v.length + 5)).add(new THREE.Vector3(0, 3, 0));
+}
+
+// Back on foot: where the exit clip ends (its start), or beside the door.
+function leave() {
+  const v = driving;
+  let x, z, yaw = v.yaw;
+  if (ride && ride.fit) {
+    const c = clips[ride.anims.enter].tracks.find(t => t.name === `${loco.rootName}.position`).values;
+    const p = new THREE.Vector3(c[0], 0, c[2]).applyQuaternion(ride.fit.q).add(ride.fit.t);
+    v.root.updateMatrixWorld(true);
+    p.applyMatrix4(v.root.matrixWorld);
+    x = p.x; z = p.z;
+    yaw = v.yaw + ride.fit.theta;
+  } else [x, z] = toWorld(v, v.data.flying ? -2.5 : v.lo.x - 0.8, 0); // a helicopter's bounds include its rotor
+  driving = null;
+  ride = null;
+  player.position.set(x, 0, z);
+  loadNear(x, z);
+  player.position.y = floorAt(x, z, v.root.position.y + 1).y;
+  player.rotation.set(0, yaw, 0);
+  player.visible = true;
+  fall = 0;
+  mixer.stopAllAction();
+  current = null; gear = null; setGear('idle');
+  follow();
+}
+
+// Moves the getting-in and getting-out clips along.
+function stepRide() {
+  if (!ride || !ride.action) return;
+  const a = ride.action, dur = a.getClip().duration;
+  if (ride.phase === 'enter' && a.time >= dur - 1e-3) {
+    ride.phase = 'drive';
+    const seat = mixer.clipAction(clips[ride.anims.seat]);
+    seat.reset().setLoop(THREE.LoopRepeat).play();
+    seat.crossFadeFrom(a, 0.2, false);
+    current = ride.action = seat;
+  } else if (ride.phase === 'exit' && a.time <= 1e-3) leave();
+}
+
+// A vehicle's footprint, vehicle-local: its bounds, or for a helicopter
+// (whose bounds include the rotor disc) a hand-picked fuselage box.
+function footprint(v) {
+  if (v.data.flying) return { x0: -1.4, x1: 1.4, z0: v.lo.z * 0.6, z1: v.hi.z * 0.6 };
+  return { x0: v.lo.x, x1: v.hi.x, z0: v.lo.z, z1: v.hi.z };
+}
+
+// Pushes the driven vehicle `a` out of every other vehicle's footprint
+// (separating axes on the two boxes), moving `next`; returns the push.
+function pushOutOfOthers(a, next) {
+  const push = new THREE.Vector3();
+  const box = (v, pos) => {
+    const f = footprint(v), c = Math.cos(v.yaw), s = Math.sin(v.yaw);
+    const lx = (f.x0 + f.x1) / 2, lz = (f.z0 + f.z1) / 2;
+    return {
+      cx: pos.x + lx * c + lz * s, cz: pos.z - lx * s + lz * c,
+      axes: [[c, -s], [s, c]], half: [(f.x1 - f.x0) / 2, (f.z1 - f.z0) / 2],
+    };
+  };
+  for (const b of vehicles) {
+    if (b === a || Math.hypot(b.root.position.x - next.x, b.root.position.z - next.z) > 40) continue;
+    // Above it (a helicopter) or below it: no contact.
+    if (next.y > b.root.position.y + b.hi.y || next.y + a.hi.y < b.root.position.y) continue;
+    const A = box(a, next), B = box(b, b.root.position);
+    const dx = B.cx - A.cx, dz = B.cz - A.cz;
+    let best = Infinity, axis = null;
+    for (const [ux, uz] of [...A.axes, ...B.axes]) {
+      const reach = o => o.half[0] * Math.abs(o.axes[0][0] * ux + o.axes[0][1] * uz)
+        + o.half[1] * Math.abs(o.axes[1][0] * ux + o.axes[1][1] * uz);
+      const d = dx * ux + dz * uz;
+      const overlap = reach(A) + reach(B) - Math.abs(d);
+      if (overlap <= 0) { axis = null; best = 0; break; }
+      if (overlap < best) { best = overlap; axis = [ux * -Math.sign(d || 1), uz * -Math.sign(d || 1)]; }
+    }
+    if (!axis) continue;
+    next.x += axis[0] * best; next.z += axis[1] * best;
+    push.x += axis[0] * best; push.z += axis[1] * best;
+  }
+  return push;
+}
+
+// Keeps the character out of parked vehicles (their footprints).
+function pushOutOfVehicles(pos) {
+  for (const v of vehicles) {
+    if (v === driving || Math.hypot(pos.x - v.root.position.x, pos.z - v.root.position.z) > 15) continue;
+    if (pos.y > v.root.position.y + v.hi.y) continue;
+    let [lx, lz] = toLocal(v, pos.x, pos.z);
+    const f = footprint(v);
+    const x0 = f.x0 - RADIUS, x1 = f.x1 + RADIUS, z0 = f.z0 - RADIUS, z1 = f.z1 + RADIUS;
+    if (lx <= x0 || lx >= x1 || lz <= z0 || lz >= z1) continue;
+    const m = Math.min(lx - x0, x1 - lx, lz - z0, z1 - lz);
+    if (m === lx - x0) lx = x0; else if (m === x1 - lx) lx = x1; else if (m === lz - z0) lz = z0; else lz = z1;
+    [pos.x, pos.z] = toWorld(v, lx, lz);
+  }
+}
+
+function drive(dt) {
+  const v = driving, o = v.root, d = v.data;
+  const now = performance.now();
+  if (now - lastLoad > 250) { lastLoad = now; loadNear(o.position.x, o.position.z); settleNear(o.position.x, o.position.z); }
+  // Only the driver, seated, drives.
+  const seated = !ride || ride.phase === 'drive';
+  const held = k => seated && keys.has(k);
+  const throttle = (held('KeyW') ? 1 : 0) - (held('KeyS') ? 1 : 0);
+  const steerIn = (held('KeyA') ? 1 : 0) - (held('KeyD') ? 1 : 0);
+  // Hand-tuned: top speed (m/s), acceleration and braking (m/s²).
+  const top = d.tracked ? 14 : 32, accel = d.tracked ? 4 : 8, brake = 16;
+  if (throttle > 0) v.speed += (v.speed < 0 ? brake : accel) * dt;
+  else if (throttle < 0) v.speed -= (v.speed > 0 ? brake : accel * 0.6) * dt;
+  else v.speed -= Math.sign(v.speed) * Math.min(Math.abs(v.speed), 1.5 * dt);
+  if (held('Space')) v.speed -= Math.sign(v.speed) * Math.min(Math.abs(v.speed), 25 * dt);
+  // Gravity along the slope.
+  v.speed -= 9.8 * Math.sin(v.pitch) * dt;
+  v.speed = Math.max(-top * 0.35, Math.min(top, v.speed * (1 - 0.02 * dt)));
+  // Steering: a bicycle model for wheels, turning on the spot for tracks.
+  const maxSteer = 0.6 / (1 + Math.abs(v.speed) / 12);
+  v.steer += (steerIn * maxSteer - v.steer) * Math.min(1, dt * 6);
+  const yawRate = d.tracked
+    ? steerIn * 1.1 * (v.speed < -0.5 ? -1 : 1)
+    : v.speed * Math.tan(v.steer) / v.wheelbase;
+  const yaw0 = v.yaw;
+  v.yaw += yawRate * dt;
+  _fwd.set(-Math.sin(v.yaw), 0, -Math.cos(v.yaw));
+
+  const before = o.position.clone();
+  const next = before.clone().addScaledVector(_fwd, v.speed * dt);
+  // Walls: spheres along the body, above kerb height, push it out.
+  const r = v.halfWidth, n = Math.max(2, Math.ceil(v.length / r));
+  const push = new THREE.Vector3();
+  for (let i = 0; i < n; i++) {
+    const lz = v.lo.z + r + (v.length - 2 * r) * (n === 1 ? 0.5 : i / (n - 1));
+    const c = next.clone().addScaledVector(_fwd, -lz).add(push);
+    const c0 = c.clone();
+    pushOut(c, r, [0.5 + r]);
+    push.add(c.sub(c0));
+  }
+  next.add(push);
+  // Other vehicles push back too.
+  push.add(pushOutOfOthers(v, next));
+  if (push.lengthSq() > 1e-8) {
+    // Lose the speed that went into the wall or vehicle.
+    const into = -push.clone().normalize().dot(_fwd) * Math.sign(v.speed);
+    if (into > 0) v.speed *= Math.max(0, 1 - 1.5 * into);
+  }
+  // Ground under each contact; pitch and roll from front/back and left/right.
+  const pts = contacts(v);
+  let sum = 0, front = 0, back = 0, left = 0, right = 0, nf = 0, nb = 0, nl = 0, nr = 0;
+  const posSave = o.position.clone();
+  o.position.copy(next);
+  for (const [lx, lz] of pts) {
+    const [wx, wz] = toWorld(v, lx, lz);
+    const h = floorAt(wx, wz, before.y + 0.8).y;
+    sum += h;
+    if (lz < (v.lo.z + v.hi.z) / 2) { front += h; nf++; } else { back += h; nb++; }
+    if (lx < 0) { left += h; nl++; } else { right += h; nr++; }
+  }
+  o.position.copy(posSave);
+  const ground = sum / pts.length;
+  const pitch = nf && nb ? Math.atan2(front / nf - back / nb, v.wheelbase) : 0;
+  const roll = nl && nr ? Math.atan2(left / nl - right / nr, 2 * v.halfWidth) : 0;
+  // Hand-tuned climb limit: about 40 degrees, or a ledge over 0.6 m.
+  if ((pitch > 0.7 && v.speed > 0) || (pitch < -0.7 && v.speed < 0) || ground > before.y + 0.6) {
+    next.x = before.x; next.z = before.z;
+    v.speed *= -0.2;
+  } else if (before.y > ground + 0.3 || v.vy > 0) {
+    v.vy -= 9.8 * dt;
+    next.y = before.y + v.vy * dt;
+    if (next.y <= ground) { next.y = ground; v.vy = 0; }
+  } else {
+    next.y = ground;
+    v.vy = 0;
+  }
+  v.pitch += (pitch - v.pitch) * Math.min(1, dt * 8);
+  v.roll += (roll - v.roll) * Math.min(1, dt * 8);
+  o.position.copy(next);
+  o.rotation.set(v.pitch, v.yaw, -v.roll);
+  // Wheels roll and the front ones steer.
+  for (const w of v.wheels) {
+    w.spin += v.speed * dt / w.radius;
+    w.node.rotation.set(-w.spin, w.steer ? v.steer : 0, 0);
+  }
+  if (!rideAlong(v, before, yaw0)) return;
+  ui('hint').textContent = `${d.name} (${d.kind}) · ${Math.round(Math.abs(v.speed) * 3.6)} km/h · W/S drive, A/D steer, Space brake, E get out`;
+}
+
+// The character rides along; the camera follows and turns with the
+// vehicle. False once the character has got out.
+function rideAlong(v, before, yaw0) {
+  const o = v.root;
+  if (ride && ride.fit) placeRider(); else player.position.copy(o.position);
+  stepRide();
+  if (!driving) return false;
+  const delta = o.position.clone().sub(before);
+  camera.position.add(delta);
+  controls.target.add(delta);
+  const off = camera.position.clone().sub(controls.target).applyAxisAngle(_up, v.yaw - yaw0);
+  camera.position.copy(controls.target).add(off);
+  return true;
+}
+
+// Helicopters. An arcade model TUNED BY HAND, not the game's: the rotor
+// spins up for 2.5 s before it lifts; Space climbs and Shift descends at up
+// to 8 m/s, W/S push the nose down or up to fly forward or back (to about
+// 45 m/s), A/D turn. The fuselage is a row of 1.5 m spheres against the
+// collision; it lands on whatever is under its skids.
+const _axis = new THREE.Vector3();
+function fly(dt) {
+  const v = driving, o = v.root, d = v.data;
+  const now = performance.now();
+  if (now - lastLoad > 250) { lastLoad = now; loadNear(o.position.x, o.position.z); settleNear(o.position.x, o.position.z); }
+  const seated = !ride || ride.phase === 'drive';
+  const held = k => seated && keys.has(k);
+  const ahead = (held('KeyW') ? 1 : 0) - (held('KeyS') ? 1 : 0);
+  const turn = (held('KeyA') ? 1 : 0) - (held('KeyD') ? 1 : 0);
+  const lift = (held('Space') ? 1 : 0) - (held('ShiftLeft') || held('ShiftRight') ? 1 : 0);
+  v.rpm = Math.min(1, (v.rpm || 0) + (seated ? dt / 2.5 : 0));
+  v.vel = v.vel || new THREE.Vector3();
+  const before = o.position.clone(), yaw0 = v.yaw;
+  const ground0 = floorAt(before.x, before.z, before.y + 0.5).y;
+  v.landed = before.y <= ground0 + 0.05;
+  const flying = v.rpm > 0.8 && (!v.landed || lift > 0);
+  if (flying) v.yaw += turn * 1.1 * dt;
+  _fwd.set(-Math.sin(v.yaw), 0, -Math.cos(v.yaw));
+  if (flying) v.vel.addScaledVector(_fwd, ahead * 9 * dt);
+  const drag = Math.exp(-(v.landed ? 3 : 0.6) * dt);
+  v.vel.x *= drag; v.vel.z *= drag;
+  const flat = Math.hypot(v.vel.x, v.vel.z);
+  if (flat > 45) { v.vel.x *= 45 / flat; v.vel.z *= 45 / flat; }
+  // Climb, sink or hover; without lift it falls.
+  const wantVy = v.rpm > 0.8 ? lift * 8 : -20;
+  v.vel.y += (wantVy - v.vel.y) * Math.min(1, dt * (v.rpm > 0.8 ? 2 : 1));
+  const next = before.clone().addScaledVector(v.vel, dt);
+  // Buildings and hills: spheres along the fuselage.
+  const push = new THREE.Vector3();
+  for (let i = 0; i < 4; i++) {
+    const lz = v.lo.z * 0.4 + (v.hi.z * 0.3 - v.lo.z * 0.4) * (i / 3);
+    const c = next.clone().addScaledVector(_fwd, -lz).add(push);
+    const c0 = c.clone();
+    pushOut(c, 1.5, [1.6]);
+    push.add(c.sub(c0));
+  }
+  next.add(push);
+  push.add(pushOutOfOthers(v, next));
+  if (push.lengthSq() > 1e-8) {
+    const n = push.clone().normalize();
+    const into = v.vel.dot(n);
+    if (into < 0) v.vel.addScaledVector(n, -into);
+  }
+  const ground = floorAt(next.x, next.z, Math.max(before.y, next.y) + 0.5).y;
+  if (next.y <= ground) {
+    next.y = ground;
+    if (v.vel.y < 0) v.vel.y = 0;
+  }
+  // Lean into the motion.
+  const fwdSpeed = v.vel.dot(_fwd);
+  const pitch = v.landed ? 0 : -0.012 * fwdSpeed - 0.08 * ahead;
+  const roll = v.landed ? 0 : 0.25 * turn;
+  v.pitch += (pitch - v.pitch) * Math.min(1, dt * 3);
+  v.roll += (roll - v.roll) * Math.min(1, dt * 3);
+  o.position.copy(next);
+  o.rotation.set(v.pitch, v.yaw, -v.roll);
+  for (const r of v.rotors) {
+    r.spin += v.rpm * 30 * dt;
+    r.node.quaternion.setFromAxisAngle(_axis.set(...r.axis), r.spin);
+  }
+  v.speed = flat;
+  if (!rideAlong(v, before, yaw0)) return;
+  const height = next.y - ground;
+  ui('hint').textContent = v.rpm < 0.8
+    ? `${d.name} · rotor spinning up…`
+    : `${d.name} · ${Math.round(flat * 3.6)} km/h · ${Math.round(height)} m up · Space up, Shift down, W/S forward/back, A/D turn${v.landed ? ', E get out' : ''}`;
+}
+
 function stepPlay(dt) {
+  dt = Math.min(dt, 0.05);
+  if (driving) { if (driving.data.flying) fly(dt); else drive(dt); return; }
   const ahead = new THREE.Vector3();
   camera.getWorldDirection(ahead);
   const fwd = new THREE.Vector2(ahead.x, ahead.z).normalize();
@@ -523,6 +1000,8 @@ function stepPlay(dt) {
 addEventListener('keydown', e => {
   if (!ui('playmode').checked || e.target.tagName === 'SELECT') return;
   if (e.code === 'KeyQ') walking = !walking;
+  if (e.code === 'KeyE' && !e.repeat) enterOrLeave();
+  if (e.code === 'Space') e.preventDefault();
   keys.add(e.code);
 });
 addEventListener('keyup', e => keys.delete(e.code));
@@ -554,7 +1033,7 @@ function open(gltf, name) {
   frame(root);
   // For inspecting from the browser console.
   window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut,
-    get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
+    vehicles, enterOrLeave, stepPlay, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
   player.position.set(0, 0, 0);
@@ -562,6 +1041,7 @@ function open(gltf, name) {
   ui('playmode').checked = false;
   loco = analyse(gltf);
   ui('playpanel').style.display = loco && fillGears() ? '' : 'none';
+  analyseVehicleClips();
   play(-1);
 }
 
