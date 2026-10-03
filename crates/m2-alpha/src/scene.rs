@@ -4,6 +4,7 @@
 use std::fs::File;
 use std::io::BufReader;
 
+use crate::player::Player;
 use anyhow::Context as _;
 use m2_engine::anim::load_clips;
 use m2_engine::{
@@ -49,6 +50,43 @@ pub struct Rig {
 }
 
 impl Rig {
+    /// Reads model `hash`'s skeleton and every clip that fits it.
+    pub fn load(
+        source: &mut AssetSource<BufReader<File>>,
+        hash: u32,
+        gait: Gait,
+    ) -> anyhow::Result<Self> {
+        let started = std::time::Instant::now();
+        let skeleton = Skeleton::from_nodes(&source.model(hash)?.parse()?.nodes);
+        let clips = load_clips(source, &skeleton, &[""])?;
+        let rig = Rig::new(skeleton, clips, gait);
+        eprintln!(
+            "model {hash:08x}: {} bones, {} clips fit ({:.1} s), locomotion {}",
+            rig.skeleton.len(),
+            rig.clips.len(),
+            started.elapsed().as_secs_f32(),
+            match &rig.locomotion {
+                Some(l) => {
+                    let mut c: Vec<_> = l
+                        .clips
+                        .iter()
+                        .map(|(g, &i)| (*g, format!("{:08x}", rig.clips[i].hash)))
+                        .collect();
+                    c.sort();
+                    format!("{c:?}")
+                }
+                None => "not found".into(),
+            }
+        );
+        Ok(rig)
+    }
+
+    /// Root speed (m/s) of the clip `gait` plays, if there is one.
+    pub fn gait_speed(&self, gait: Gait) -> Option<f32> {
+        let &i = self.locomotion.as_ref()?.clips.get(&gait)?;
+        Some(self.clips[i].info.speed)
+    }
+
     fn new(skeleton: Skeleton, clips: Vec<BoundClip>, gait: Gait) -> Self {
         let locomotion = Locomotion::choose(&clips);
         let mut rig = Self {
@@ -79,9 +117,16 @@ impl Rig {
         });
     }
 
-    fn skin(&self) -> Vec<Mat4> {
-        self.skeleton
-            .skin_matrices(&self.animator.pose(&self.skeleton, &self.clips))
+    /// Posed node matrices and skinning matrices, model space.
+    pub fn posed(&self) -> (Vec<Mat4>, Vec<Mat4>) {
+        let pose = self.animator.pose(&self.skeleton, &self.clips);
+        let nodes = self.skeleton.model_matrices(&pose);
+        let skin = nodes
+            .iter()
+            .zip(&self.skeleton.inverse_bind)
+            .map(|(m, ib)| *m * *ib)
+            .collect();
+        (nodes, skin)
     }
 }
 
@@ -95,6 +140,8 @@ pub struct Scene {
     pub source: Option<AssetSource<BufReader<File>>>,
     /// Where the camera should start: (eye, target).
     pub focus: (Vec3, Vec3),
+    /// Jennifer, on the island.
+    pub player: Option<Player>,
 }
 
 impl Scene {
@@ -108,6 +155,7 @@ impl Scene {
             materials,
             source: None,
             focus: (Vec3::new(0.0, 2.0, 6.0), Vec3::new(0.0, 1.0, 0.0)),
+            player: None,
         })
     }
 
@@ -134,29 +182,7 @@ impl Scene {
         for &hash in hashes {
             let gpu = GpuModel::load(backend, source, &mut self.materials, hash, 0)?;
             let rig = if gpu.is_skinned() {
-                let started = std::time::Instant::now();
-                let skeleton = Skeleton::from_nodes(&source.model(hash)?.parse()?.nodes);
-                let clips = load_clips(source, &skeleton, &[""])?;
-                let rig = Rig::new(skeleton, clips, gait);
-                eprintln!(
-                    "model {hash:08x}: {} bones, {} clips fit ({:.1} s), locomotion {}",
-                    rig.skeleton.len(),
-                    rig.clips.len(),
-                    started.elapsed().as_secs_f32(),
-                    match &rig.locomotion {
-                        Some(l) => format!("{:?}", {
-                            let mut c: Vec<_> = l
-                                .clips
-                                .iter()
-                                .map(|(g, &i)| (*g, format!("{:08x}", rig.clips[i].hash)))
-                                .collect();
-                            c.sort();
-                            c
-                        }),
-                        None => "not found".into(),
-                    }
-                );
-                Some(rig)
+                Some(Rig::load(source, hash, gait)?)
             } else {
                 None
             };
@@ -219,6 +245,21 @@ impl Scene {
         let y = world.index.rough_height(x, z) + 40.0;
         self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));
         self.world = Some(world);
+
+        // Jennifer, to walk the island as.
+        self.open(install)?;
+        let source = self.source.as_mut().context("no install open")?;
+        let model = match GpuModel::load(backend, source, &mut self.materials, DEFAULT_MODEL, 0)
+            .map_err(anyhow::Error::from)
+            .and_then(|gpu| Ok((gpu, Rig::load(source, DEFAULT_MODEL, Gait::Idle)?)))
+        {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("player model: {e:#}");
+                None
+            }
+        };
+        self.player = Some(Player::new(x, z, 0.0, model));
         Ok(())
     }
 
@@ -258,9 +299,19 @@ impl Scene {
         } else {
             self.draw_ground(queue);
         }
+        if let Some(player) = &self.player
+            && player.landed
+            && let Some((model, rig)) = &player.model
+        {
+            let (nodes, skin) = rig.posed();
+            model.draw_posed(backend, queue, player.model_matrix(), &nodes, &skin)?;
+        }
         for p in &self.models {
             match &p.rig {
-                Some(rig) => p.model.draw_posed(backend, queue, p.world, &rig.skin())?,
+                Some(rig) => {
+                    let (nodes, skin) = rig.posed();
+                    p.model.draw_posed(backend, queue, p.world, &nodes, &skin)?;
+                }
                 None => p.model.draw(queue, p.world),
             }
         }

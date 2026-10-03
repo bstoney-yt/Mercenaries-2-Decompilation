@@ -17,6 +17,10 @@ pub enum Action {
     MoveUp,
     MoveDown,
     Sprint,
+    /// Hold to walk instead of run.
+    Walk,
+    /// Switch between playing on foot and the free camera.
+    ToggleFly,
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
@@ -45,6 +49,8 @@ impl Default for Bindings {
             (MoveUp, vec![Space]),
             (MoveDown, vec![KeyC, ControlLeft]),
             (Sprint, vec![ShiftLeft, ShiftRight]),
+            (Walk, vec![KeyQ]),
+            (ToggleFly, vec![KeyV]),
             (ToggleMouse, vec![Tab]),
             (Fullscreen, vec![F11]),
             (NextGait, vec![KeyN]),
