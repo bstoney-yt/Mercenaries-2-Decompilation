@@ -27,6 +27,7 @@
 //!   buildings, props and everything else in the world.
 //! - [`material_animation`]: material animations (keyed material
 //!   parameters), stored under the animation type hash.
+//! - [`vehicle`]: vehicle kinds from texture names and wheels from geometry.
 //! - [`vertex`]: Direct3D 9 vertex declarations and vertex streams, mapped
 //!   onto `m2-render` vertex layouts.
 //!
@@ -54,6 +55,7 @@ pub mod sges;
 pub mod terrain;
 pub mod texture;
 pub mod ucfx;
+pub mod vehicle;
 pub mod vertex;
 pub mod wad;
 
