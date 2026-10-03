@@ -35,6 +35,7 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+mod cache;
 mod camera;
 mod combat;
 mod config;
