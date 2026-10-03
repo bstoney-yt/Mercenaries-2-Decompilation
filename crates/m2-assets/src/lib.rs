@@ -21,6 +21,7 @@
 //!   shapes are stored in.
 //! - [`physics`]: model collision (`PHY2`): shapes, rigid bodies and the
 //!   nodes they attach to.
+//! - [`sound`]: sound banks (16-bit PCM sound effects and ambience).
 //! - [`terrain`]: the 400 m terrain cells and low-resolution tiles.
 //! - [`scatter`]: the grass and shrub clumps instanced over each cell.
 //! - [`layer`]: entity layers, the component tables that place terrain,
@@ -52,6 +53,7 @@ pub mod model;
 pub mod physics;
 pub mod scatter;
 pub mod sges;
+pub mod sound;
 pub mod terrain;
 pub mod texture;
 pub mod ucfx;
@@ -72,6 +74,7 @@ pub use model::{Model, ModelError, PrimitiveGroup};
 pub use physics::{Physics, PhysicsError};
 pub use scatter::{Scatter, ScatterError};
 pub use sges::{Segment, SgesError, SgesHeader};
+pub use sound::{SoundBank, SoundError};
 pub use terrain::{LowResTile, TerrainCell, TerrainError};
 pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};
 pub use ucfx::{Section, Ucfx, UcfxError};
