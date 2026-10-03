@@ -129,3 +129,21 @@ only) once item 11 lands.
   layers alone, and the window streams low-res tiles everywhere, detailed
   cells within 600 m, placed models within 1.2 km and a sea plane. Still to
   come: terrain detail layers, scatter (needs instancing).
+- Item 5: `m2-engine::anim` binds clips to any skeleton by bone name, blends
+  gaits, plays one-shot clips (aim, death) and builds skinning palettes;
+  the wgpu backend skins on the GPU.
+- Item 6: `m2-engine::physics` (Rapier) loads PHY2 shapes and the
+  triangle fallback, with a kinematic character controller (0.5 m step,
+  50° slope) and raycast vehicles.
+- Item 7: `m2-alpha::sound` plays the PCM banks and the streamed music,
+  ambience and voice tracks in 3D.
+- Items 8 to 11, in `m2-alpha` for now: Jennifer on foot, enter, drive and
+  get out of the parked vehicles, soldiers at their spawns (patrols where
+  the layer names a route) and wandering civilians, rifle, RPG, grenades,
+  wrecks. Handling, damage and AI timings are invented.
+- Item 12: egui HUD (health, weapon, speed, prompts, crosshair) and an Esc
+  pause menu (field of view, mouse, vsync, controls, save, load, quit).
+- Item 13: F5/F9 quick save and load (`m2-alpha-save.toml`: player,
+  vehicles, soldiers killed).
+- Item 14 started: the model catalogue search (12-14 s) is kept between
+  runs in `m2-alpha-catalogue.toml`.
