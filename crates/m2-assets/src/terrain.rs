@@ -8,10 +8,11 @@
 //! INFO  0x20 bytes
 //!       0x00  f32 x 3  bounding box minimum, cell space
 //!       0x0C  f32 x 3  bounding box maximum (x and z are ±200)
-//!       0x18  u32      unknown
+//!       0x18  u32      material count n
 //!       0x1C  u32      patch count (16)
-//! MTRL  terrain materials: model-style records, some followed by blend
-//!       and projection data whose layout is not decoded yet (kept raw)
+//! MTRL  n material records as in models, then n × 256 bytes: per
+//!       material four f32 x 16 UV transforms, one per texture layer
+//!       (unused slots usually zero)
 //! GEOM/ one per patch, each 100 m × 100 m:
 //!       INFO  0x2C bytes: u32 group count, f32 x 4 bounding sphere,
 //!             f32 x 6 bounding box (patch space)
@@ -35,8 +36,8 @@
 //! INFO  0x2C bytes: u32 material range count, u32 full range count, then
 //!       u32 x 9 unknown (terrain cells only)
 //! PRMT  20 bytes per range:
-//!       0x00  u32  material name hash (an MTRL record's)
-//!       0x04  u32  unknown, small
+//!       0x00  u32  shader hash (8 distinct values across the island)
+//!       0x04  u32  material index
 //!       0x08  u32  first index
 //!       0x0C  u16  primitive count (strip triangles, degenerates included)
 //!       0x0E  u16  minimum vertex index
@@ -47,6 +48,15 @@
 //!       colours and half-float normals
 //! IBUF/ info {u32 n}, data u16 indices (a triangle strip)
 //! ```
+//!
+//! A cell material's textures are: the cell's colour map
+//! (`vz_terrainglobal_rRR_cCC`, 512 × 512, covering the whole cell), a
+//! shared detail texture, then a (colour, normal) pair per tiled layer such
+//! as `tt_sand01`, `tt_junglemoss` or `tt_junglewall`. A layer's UV transform
+//! maps cell-space (x, y, z, 1) to its texture coordinates, typically
+//! tiling every 16 or 20 m; the vertex colours look like the layers' blend
+//! weights. The colour map's coordinates are
+//! `((200 - x) / 400, (200 - z) / 400)`; see [`colour_map_uv`].
 //!
 //! Cells carry no world position. The entity layer that places them (see
 //! [`layer`](crate::layer)) gives each cell's centre; the 400 cells form a
@@ -110,6 +120,12 @@ pub enum TerrainError {
     },
     #[error("group {group}: range {range} is outside the group's indices or vertices")]
     Range { group: usize, range: usize },
+    #[error("group {group}: a range uses material {material} of {count}")]
+    MaterialIndex {
+        group: usize,
+        material: u32,
+        count: usize,
+    },
 }
 
 impl From<OutOfBounds> for TerrainError {
@@ -124,8 +140,9 @@ impl From<OutOfBounds> for TerrainError {
 /// One `PRMT` record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerrainRange {
-    pub material_hash: u32,
-    pub unk_0x04: u32,
+    pub shader_hash: u32,
+    /// Index into the cell's (or tile's) materials.
+    pub material: u32,
     pub start_index: u32,
     pub primitive_count: u16,
     pub min_vertex: u16,
@@ -178,15 +195,54 @@ pub struct Patch<'a> {
     pub groups: Vec<TerrainGroup<'a>>,
 }
 
+/// One cell material: a model-style record and its layers' UV transforms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerrainMaterial {
+    pub material: Material,
+    /// Per layer slot, a row-major 4 × 4 matrix from cell-space
+    /// (x, y, z, 1) to texture coordinates (u in row 0, v in row 1).
+    pub uv: [[f32; 16]; 4],
+}
+
+impl TerrainMaterial {
+    /// The cell's colour map (texture slot 0).
+    pub fn colour_map(&self) -> Option<u32> {
+        self.material.textures.first().copied().filter(|&t| t != 0)
+    }
+
+    /// The tiled layers' colour textures (slots 2, 4, ...), in UV slot order.
+    pub fn layers(&self) -> Vec<u32> {
+        self.material
+            .textures
+            .iter()
+            .skip(2)
+            .step_by(2)
+            .copied()
+            .collect()
+    }
+}
+
+/// The colour map coordinates of cell-space `(x, z)`.
+pub fn colour_map_uv(x: f32, z: f32) -> [f32; 2] {
+    [
+        (CELL_SIZE / 2.0 - x) / CELL_SIZE,
+        (CELL_SIZE / 2.0 - z) / CELL_SIZE,
+    ]
+}
+
 /// A terrain cell.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerrainCell<'a> {
     pub bounds: Aabb,
-    pub unk_0x18: u32,
-    /// The `MTRL` section, undecoded: its first record follows the model
-    /// layout, but later ones carry extra data of varying shape.
-    pub material_data: &'a [u8],
+    pub materials: Vec<TerrainMaterial>,
     pub patches: Vec<Patch<'a>>,
+}
+
+impl TerrainCell<'_> {
+    /// The cell's colour map, shared by all its materials.
+    pub fn colour_map(&self) -> Option<u32> {
+        self.materials.first().and_then(TerrainMaterial::colour_map)
+    }
 }
 
 /// A low-resolution terrain tile.
@@ -229,6 +285,27 @@ fn materials(mtrl: &[u8]) -> Result<Vec<Material>, TerrainError> {
         out.push(read_material(&mut r)?);
     }
     Ok(out)
+}
+
+/// A cell's `n` materials followed by their UV transforms.
+fn cell_materials(mtrl: &[u8], n: u32) -> Result<Vec<TerrainMaterial>, TerrainError> {
+    let mut r = Reader::at(mtrl, 0);
+    // Each record is at least 0x74 bytes, bounding the allocation.
+    let mut records = Vec::with_capacity((n as usize).min(mtrl.len() / 0x74));
+    for _ in 0..n {
+        records.push(read_material(&mut r)?);
+    }
+    exact("MTRL UV transforms", &mtrl[r.pos()..], records.len() * 256)?;
+    records
+        .into_iter()
+        .map(|material| {
+            let mut uv = [[0.0; 16]; 4];
+            for slot in &mut uv {
+                *slot = f32x(&mut r)?;
+            }
+            Ok(TerrainMaterial { material, uv })
+        })
+        .collect()
 }
 
 fn exact(what: &'static str, data: &[u8], expected: usize) -> Result<(), TerrainError> {
@@ -318,8 +395,8 @@ fn group<'a>(
     let mut r = Reader::at(prmt, 0);
     for range in 0..prmt.len() / RANGE_LEN {
         let x = TerrainRange {
-            material_hash: r.u32()?,
-            unk_0x04: r.u32()?,
+            shader_hash: r.u32()?,
+            material: r.u32()?,
             start_index: r.u32()?,
             primitive_count: r.u16()?,
             min_vertex: r.u16()?,
@@ -361,9 +438,9 @@ impl<'a> TerrainCell<'a> {
             min: [b[0], b[1], b[2]],
             max: [b[3], b[4], b[5]],
         };
-        let unk_0x18 = r.u32()?;
+        let material_count = r.u32()?;
         let patch_count = r.u32()?;
-        let material_data = top(&u, b"MTRL", "MTRL")?;
+        let materials = cell_materials(top(&u, b"MTRL", "MTRL")?, material_count)?;
 
         let geoms: Vec<usize> = u
             .children(None)
@@ -400,7 +477,19 @@ impl<'a> TerrainCell<'a> {
             let mut parsed = Vec::with_capacity(prmgs.len());
             for p in prmgs {
                 let info = child(&u, p, b"INFO").ok_or(TerrainError::Missing("PRMG/INFO"))?;
-                parsed.push(group(&u, p, Some(info), group_id)?);
+                let g = group(&u, p, Some(info), group_id)?;
+                if let Some(r) = g
+                    .material_ranges
+                    .iter()
+                    .find(|r| r.material as usize >= materials.len())
+                {
+                    return Err(TerrainError::MaterialIndex {
+                        group: group_id,
+                        material: r.material,
+                        count: materials.len(),
+                    });
+                }
+                parsed.push(g);
                 group_id += 1;
             }
             patches.push(Patch {
@@ -412,8 +501,7 @@ impl<'a> TerrainCell<'a> {
         }
         Ok(Self {
             bounds,
-            unk_0x18,
-            material_data,
+            materials,
             patches,
         })
     }
@@ -465,7 +553,7 @@ mod tests {
     }
 
     fn range(material: u32, start: u32, prims: u16, min: u16, max: u16) -> Vec<u8> {
-        let mut r = le(&[material, 7, start]);
+        let mut r = le(&[material, 1, start]);
         for v in [prims, min, max, max - min + 1] {
             r.extend(v.to_le_bytes());
         }
@@ -532,9 +620,13 @@ mod tests {
 
     fn cell() -> Vec<u8> {
         let mut info = floats(&[-200.0, -10.0, -200.0, 200.0, 50.0, 200.0]);
-        info.extend(le(&[0x10b, 2]));
+        info.extend(le(&[2, 2]));
         let mut mtrl = material(0x11);
         mtrl.extend(material(0x22));
+        // UV transforms: material 0 slot 0 tiles every 16 m.
+        let mut uv = vec![0.0f32; 2 * 64];
+        uv[..8].copy_from_slice(&[-0.0625, 0.0, 0.0, 12.5, 0.0, 0.0, -0.0625, 12.5]);
+        mtrl.extend(floats(&uv));
         ucfx(&[
             UcfxNode::Leaf(*b"INFO", info),
             UcfxNode::Leaf(*b"MTRL", mtrl),
@@ -560,8 +652,13 @@ mod tests {
         let a = cell();
         let c = TerrainCell::parse(&a).unwrap();
         assert_eq!(c.bounds.max, [200.0, 50.0, 200.0]);
-        assert_eq!(c.unk_0x18, 0x10b);
-        assert_eq!(c.material_data.len(), 2 * 0x78);
+        assert_eq!(c.materials.len(), 2);
+        assert_eq!(c.materials[0].material.name_hash, 0x11);
+        assert_eq!(c.materials[0].uv[0][3], 12.5);
+        assert_eq!(c.materials[1].uv[0], [0.0; 16]);
+        assert_eq!(c.colour_map(), Some(0xAAAA));
+        assert!(c.materials[0].layers().is_empty());
+        assert_eq!(colour_map_uv(200.0, -200.0), [0.0, 1.0]);
         assert_eq!(c.patches.len(), 2);
         let p = &c.patches[1];
         assert_eq!(p.offset, [-50.0, 0.0, -150.0]);
@@ -569,7 +666,8 @@ mod tests {
         let g = &p.groups[0];
         assert_eq!(g.material_ranges.len(), 1);
         assert_eq!(g.full_ranges.len(), 1);
-        assert_eq!(g.material_ranges[0].material_hash, 0x11);
+        assert_eq!(g.material_ranges[0].shader_hash, 0x11);
+        assert_eq!(g.material_ranges[0].material, 1);
         assert_eq!(g.material_ranges[0].vertex_count, 4);
         assert_eq!(g.positions()[3], [10.0, 3.0, 10.0]);
         assert_eq!(g.triangles(&g.material_ranges[0]), [[0, 1, 2], [2, 1, 3]]);
@@ -591,11 +689,8 @@ mod tests {
     fn rejects_bad_ranges_and_counts() {
         let mut a = cell();
         // Patch count 2 -> 3.
-        let at = a
-            .windows(4)
-            .position(|w| w == 0x10bu32.to_le_bytes())
-            .unwrap()
-            + 4;
+        let marker = floats(&[200.0, 50.0, 200.0]);
+        let at = a.windows(12).position(|w| w == marker.as_slice()).unwrap() + 16;
         a[at] = 3;
         assert_eq!(
             TerrainCell::parse(&a).unwrap_err(),
@@ -620,6 +715,29 @@ mod tests {
             LowResTile::parse(&a).unwrap_err(),
             TerrainError::Range { group: 0, range: 0 }
         );
+    }
+
+    #[test]
+    fn rejects_material_indices_past_the_materials() {
+        let mut a = cell();
+        // The first range of the first group: shader 0x11, then the index.
+        let marker = le(&[0x11, 1, 0]);
+        let at = a.windows(12).position(|w| w == marker.as_slice()).unwrap() + 4;
+        a[at] = 9;
+        assert_eq!(
+            TerrainCell::parse(&a).unwrap_err(),
+            TerrainError::MaterialIndex {
+                group: 0,
+                material: 9,
+                count: 2
+            }
+        );
+        // UV transform values are data, not checked.
+        let mut b = cell();
+        let uv = floats(&[-0.0625, 0.0, 0.0, 12.5]);
+        let at = b.windows(16).position(|w| w == uv.as_slice()).unwrap();
+        b[at..at + 4].copy_from_slice(&[0; 4]);
+        assert!(TerrainCell::parse(&b).is_ok());
     }
 
     #[test]
