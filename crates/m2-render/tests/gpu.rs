@@ -436,6 +436,32 @@ fn detail_maps_add_grain_up_close() {
 }
 
 #[test]
+fn soft_edges_fade_where_the_surface_turns_away() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    let soft = MaterialDesc {
+        lit: false,
+        color: [1.0, 1.0, 1.0, 1.0],
+        blend: BlendMode::Translucent,
+        double_sided: true,
+        soft_edge: true,
+        ..MaterialDesc::default()
+    };
+    b.set_material(MaterialId(1), &soft).unwrap();
+    let centre = |b: &mut WgpuBackend, world| {
+        b.begin_frame(&view()).unwrap();
+        b.draw(&draw(vb, ib, 1, world)).unwrap();
+        b.end_frame().unwrap();
+        pixel(&b.read_pixels().unwrap(), 32, 32)
+    };
+    // Face on: opaque white over the blue sky.
+    assert_eq!(centre(&mut b, Mat4::IDENTITY), [255, 255, 255, 255]);
+    // Turned 70° away: mostly sky.
+    let turned = centre(&mut b, Mat4::from_rotation_y(70f32.to_radians()));
+    assert!(turned[2] > 200 && turned[0] < 120, "{turned:?}");
+}
+
+#[test]
 fn overlays_draw_over_the_finished_world() {
     let Some(mut backend) = backend() else { return };
     backend.begin_frame(&view()).unwrap();

@@ -140,6 +140,9 @@ pub struct MaterialDesc {
     /// A texture tiled in world space over the base colour near the
     /// camera, for close-up grain (terrain).
     pub detail: Option<DetailMap>,
+    /// Fades alpha towards the silhouette, where the surface turns away
+    /// from the camera (smoke and other soft volumes).
+    pub soft_edge: bool,
 }
 
 /// A detail texture: tiled every `tile` metres along world x and z, it
@@ -163,6 +166,7 @@ impl Default for MaterialDesc {
             fog: true,
             clamp: false,
             detail: None,
+            soft_edge: false,
         }
     }
 }

@@ -173,7 +173,8 @@ struct FrameUniforms {
 struct MaterialUniforms {
     color: [f32; 4],
     params: [f32; 4],
-    /// x: detail tiles per metre (0: none), y: distance it fades out by.
+    /// x: detail tiles per metre (0: none), y: distance it fades out by,
+    /// z: soft edge.
     detail: [f32; 4],
 }
 
@@ -653,8 +654,8 @@ impl WgpuBackend {
                 flag(desc.fog),
             ],
             detail: match desc.detail {
-                Some(d) if d.tile > 0.0 => [1.0 / d.tile, DETAIL_FADE, 0.0, 0.0],
-                _ => [0.0; 4],
+                Some(d) if d.tile > 0.0 => [1.0 / d.tile, DETAIL_FADE, flag(desc.soft_edge), 0.0],
+                _ => [0.0, 0.0, flag(desc.soft_edge), 0.0],
             },
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

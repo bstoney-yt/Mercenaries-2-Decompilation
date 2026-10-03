@@ -819,6 +819,8 @@ impl Effects {
                     lit,
                     blend,
                     double_sided: true,
+                    // Fire and smoke fade out towards their outline.
+                    soft_edge: blend == BlendMode::Translucent,
                     ..MaterialDesc::default()
                 },
             )
@@ -828,7 +830,7 @@ impl Effects {
             count: faces.len() as u32 * 3,
             light: define([1.0, 0.85, 0.45, 1.0], false, BlendMode::Opaque)?,
             fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
-            smoke: define([0.35, 0.35, 0.35, 0.22], true, BlendMode::Translucent)?,
+            smoke: define([0.35, 0.35, 0.35, 0.4], true, BlendMode::Translucent)?,
         })
     }
 

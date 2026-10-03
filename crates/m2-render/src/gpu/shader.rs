@@ -32,7 +32,8 @@ struct Material {
     color: vec4<f32>,
     // x: alpha cutoff, y: lit, z: vertex colour, w: fog
     params: vec4<f32>,
-    // x: detail tiles per metre (0: none), y: fade-out distance
+    // x: detail tiles per metre (0: none), y: fade-out distance,
+    // z: soft edge
     detail: vec4<f32>,
 };
 
@@ -87,7 +88,12 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         let f = exp(-frame.sky.a * dist);
         rgb = mix(frame.sky.rgb, rgb, f);
     }
-    return vec4<f32>(rgb, base.a);
+    var alpha = base.a;
+    if material.detail.z > 0.5 {
+        let facing = abs(dot(normalize(v.normal), normalize(frame.eye.xyz - v.world_pos)));
+        alpha = alpha * facing * facing;
+    }
+    return vec4<f32>(rgb, alpha);
 }
 "#;
 
