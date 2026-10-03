@@ -86,7 +86,13 @@
 //! entity name asks for ("VZ Soldier", "VZ Heavy", "VZ Deathsquad");
 //! civilians (`?npcs=N` in the page address) are scattered around the start.
 //! Their behaviour (idling, wandering near home, stepping aside, running
-//! from fast vehicles) is invented, not the game's AI.
+//! from fast vehicles) is invented, not the game's AI. `npcs` also writes a
+//! rifle (`wpn_<hash>.glb`, the AK-47, with its muzzle marker). The viewer
+//! puts it in the right hand of the player and of every soldier, held the
+//! way the game's two-handed rifle clip holds it; click or hold F to fire,
+//! hold the right button to aim. Soldiers that hear gunfire shoot back,
+//! civilians run, and the hit and fall reactions use the game's clips. The
+//! combat rules (damage, accuracy, fire rates, health) are invented.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
@@ -923,7 +929,7 @@ fn view(glb: &str, world: Option<&str>, npcs: Option<&str>, port: u16) -> AnyRes
                 "/npcs.json" => "npcs.json",
                 p => p.strip_prefix("/npc/").filter(|n| {
                     n.len() == 16
-                        && n.starts_with("npc_")
+                        && (n.starts_with("npc_") || n.starts_with("wpn_"))
                         && n.ends_with(".glb")
                         && n[4..12].chars().all(|c| c.is_ascii_hexdigit())
                 })?,
@@ -981,6 +987,8 @@ fn export_npcs<R: Read + Seek>(
     use m2_assets::layer::LAYER_TYPE;
     let mut texture_names: HashMap<u32, String> = HashMap::new();
     let mut humans: Vec<(u32, Vec<u32>)> = Vec::new();
+    // Small static models: (hash, textures, nodes), for hand weapons.
+    let mut weapons: Vec<(u32, Vec<u32>, usize)> = Vec::new();
     // (glTF position, entity name, component)
     let mut spawns: Vec<([f32; 3], String, &'static str)> = Vec::new();
     for block in 0..wad.index().blocks().len() {
@@ -994,6 +1002,17 @@ fn export_npcs<R: Read + Seek>(
                 }
                 MODEL_TYPE if e.unk_0x08 == 0 => {
                     let Ok(m) = Model::parse(data) else { continue };
+                    let b = &m.info.bounds;
+                    if m.info.flags & 0x800 == 0 && (0.5..1.5).contains(&(b.max[2] - b.min[2])) {
+                        weapons.push((
+                            e.name_hash,
+                            m.materials
+                                .iter()
+                                .flat_map(|mt| mt.textures.iter().copied())
+                                .collect(),
+                            m.nodes.len(),
+                        ));
+                    }
                     if m.info.flags & 0x800 != 0
                         && m.nodes.first().map(|n| n.name_hash) == Some(HUMAN_ROOT)
                     {
@@ -1104,6 +1123,44 @@ fn export_npcs<R: Read + Seek>(
             r#"{{"file":"{file}","name":"{role}","soldier":{soldier}}}"#
         ));
     }
+    // A rifle for everyone: the AK-47 (texture global_weapon_ak47), with
+    // its muzzle marker (node b1486ef3; the grip is the model's origin).
+    let mut weapons_json = Vec::new();
+    let rifle = weapons
+        .iter()
+        .filter(|w| {
+            w.1.iter()
+                .filter_map(|t| texture_names.get(t))
+                .any(|n| n.starts_with("global_weapon_ak47"))
+        })
+        .max_by_key(|w| w.2);
+    if let Some(&(hash, _, _)) = rifle {
+        let (base, chunks) = load_model(wad, hash)?;
+        let mut model = Model::parse(&base)?;
+        for c in &chunks {
+            model.add_streamed(c)?;
+        }
+        let muzzle = m2_assets::vehicle::marker(&model, 0xb148_6ef3).unwrap_or([
+            0.0,
+            0.0,
+            model.info.bounds.max[2],
+        ]);
+        let glb = export(
+            wad,
+            hash,
+            &Options {
+                clips: 0,
+                filter: None,
+                lod: 0,
+            },
+        )?;
+        let file = format!("wpn_{hash:08x}.glb");
+        std::fs::write(std::path::Path::new(dir).join(&file), glb)?;
+        weapons_json.push(format!(
+            r#"{{"file":"{file}","name":"ak47","muzzle":{:?}}}"#,
+            flip_v(muzzle)
+        ));
+    }
     let clean = |s: &str| {
         s.chars()
             .filter(|c| *c != '"' && *c != '\\' && !c.is_control())
@@ -1122,8 +1179,9 @@ fn export_npcs<R: Read + Seek>(
     std::fs::write(
         std::path::Path::new(dir).join("npcs.json"),
         format!(
-            "{{\"models\":[{}],\n\"spawns\":[{}]}}\n",
+            "{{\"models\":[{}],\n\"weapons\":[{}],\n\"spawns\":[{}]}}\n",
             models_json.join(","),
+            weapons_json.join(","),
             spawns_json.join(",\n")
         ),
     )?;
