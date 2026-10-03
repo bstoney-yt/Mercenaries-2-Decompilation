@@ -218,6 +218,9 @@ const ray = new THREE.Raycaster();
 const down = new THREE.Vector3(0, -1, 0);
 // Placed objects, shown only within this distance (?view=metres).
 const objects = [];
+// Vegetation runs, shown only within this distance (?veg=metres).
+const plants = [];
+const VEG_VIEW = +(new URLSearchParams(location.search).get('veg') || 150);
 const VIEW = +(new URLSearchParams(location.search).get('view') || 1500);
 let lastCull = 0;
 function cullObjects(force) {
@@ -226,6 +229,7 @@ function cullObjects(force) {
   lastCull = now;
   const c = controls.target;
   for (const o of objects) o.visible = Math.hypot(o.position.x - c.x, o.position.z - c.z) < VIEW;
+  for (const o of plants) o.visible = Math.hypot(o.position.x - c.x, o.position.z - c.z) < VEG_VIEW;
 }
 
 function openWorld(gltf) {
@@ -234,10 +238,11 @@ function openWorld(gltf) {
   world.updateMatrixWorld(true);
   world.traverse(o => {
     if (o.name.startsWith('obj_')) { objects.push(o); return; }
+    if (o.name.startsWith('veg_')) { plants.push(o); return; }
     if (o.isMesh && (o.name === 'sea' || o.parent?.name === 'sea')) seaLevel = new THREE.Box3().setFromObject(o).max.y;
     if (!o.isMesh || o.name === 'sea' || o.parent?.name === 'sea') return;
     // Placed objects are not ground (yet): only terrain is walked on.
-    for (let p = o; p; p = p.parent) if (p.name.startsWith('obj_')) return;
+    for (let p = o; p; p = p.parent) if (p.name.startsWith('obj_') || p.name.startsWith('veg_')) return;
     const b = new THREE.Box3().setFromObject(o);
     for (let x = Math.floor(b.min.x / BUCKET); x <= Math.floor(b.max.x / BUCKET); x++)
       for (let z = Math.floor(b.min.z / BUCKET); z <= Math.floor(b.max.z / BUCKET); z++) {

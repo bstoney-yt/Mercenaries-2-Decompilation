@@ -753,6 +753,7 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
     use m2_assets::terrain::{CELL_SIZE, LOW_RES_TYPE, TERRAIN_TYPE};
     use m2_assets::{Layer, LowResTile, TerrainCell};
     let (mut cells, mut tiles, mut layers) = (HashMap::new(), HashMap::new(), Vec::new());
+    let mut scatter: Vec<Vec<u8>> = Vec::new();
     for block in 0..wad.index().blocks().len() {
         let decoded = wad.read_block(block)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -764,6 +765,7 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
                     tiles.insert(e.name_hash, data.to_vec());
                 }
                 LAYER_TYPE => layers.push((e.name_hash, data.to_vec())),
+                m2_assets::scatter::SCATTER_TYPE => scatter.push(data.to_vec()),
                 _ => {}
             }
         }
@@ -795,6 +797,23 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
             eprintln!("tile {hash:08x}: {e}");
         }
     }
+    let (mut meshes, mut instances) = (0, 0);
+    for data in &scatter {
+        match m2_assets::Scatter::parse(data) {
+            Ok(s) => {
+                meshes += s.meshes.len();
+                instances += s.placements().count();
+            }
+            Err(e) => {
+                errors += 1;
+                eprintln!("scatter: {e}");
+            }
+        }
+    }
+    println!(
+        "{} scatter assets: {meshes} clump meshes, {instances} instances",
+        scatter.len()
+    );
     println!(
         "{} terrain cells ({groups} groups, {ranges} material ranges, {triangles} triangles, {materials} materials, {bad_index} ranges past their materials), {} low-res tiles",
         cells.len(),
