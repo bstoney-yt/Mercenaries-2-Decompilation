@@ -11,10 +11,11 @@
 //! handle after that is an error rather than undefined behaviour, and
 //! [`RenderBackend::live_buffers`] lets tests catch leaks.
 
-use m2_math::glam::Mat4;
+use m2_math::glam::{Mat4, Vec3};
 
 use crate::buffer::{IndexBufferDesc, IndexBufferHandle, VertexBufferDesc, VertexBufferHandle};
 use crate::key::MaterialId;
+use crate::texture::{MaterialDesc, TextureDesc, TextureHandle};
 
 /// How vertices are assembled into primitives.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -55,10 +56,42 @@ pub struct DrawCall {
     pub world: Mat4,
 }
 
+/// Light and atmosphere for a frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lighting {
+    /// Direction the sunlight travels (from the sun towards the ground),
+    /// world space. Need not be normalised.
+    pub sun_direction: Vec3,
+    /// Linear RGB.
+    pub sun_color: Vec3,
+    /// Linear RGB light reaching every surface.
+    pub ambient: Vec3,
+    /// Linear RGB of the background and of the fog.
+    pub sky_color: Vec3,
+    /// Exponential fog density per metre; 0 disables fog.
+    pub fog_density: f32,
+}
+
+impl Default for Lighting {
+    fn default() -> Self {
+        Self {
+            sun_direction: Vec3::new(-0.4, -1.0, 0.3),
+            sun_color: Vec3::new(1.0, 0.95, 0.85),
+            ambient: Vec3::new(0.35, 0.38, 0.45),
+            sky_color: Vec3::new(0.45, 0.62, 0.85),
+            fog_density: 0.0,
+        }
+    }
+}
+
 /// Camera state for a frame.
 ///
 /// View space is left-handed with `+z` forward, as `D3DXMatrixLookAtLH`
 /// produces; sort depth is measured along that axis.
+///
+/// GPU backends use reversed depth (near maps to 1, far to 0) for precision
+/// over the island's kilometres; build `projection` with
+/// [`View::perspective`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
     /// World to view.
@@ -67,6 +100,7 @@ pub struct View {
     pub projection: Mat4,
     pub near: f32,
     pub far: f32,
+    pub lighting: Lighting,
 }
 
 impl View {
@@ -85,7 +119,36 @@ impl Default for View {
             projection: Mat4::IDENTITY,
             near: 0.1,
             far: 1000.0,
+            lighting: Lighting::default(),
         }
+    }
+}
+
+impl View {
+    /// A camera at `eye` looking along `forward`, `fov_y` radians tall, with
+    /// a reversed-depth left-handed projection.
+    pub fn perspective(
+        eye: Vec3,
+        forward: Vec3,
+        fov_y: f32,
+        aspect: f32,
+        near: f32,
+        far: f32,
+    ) -> Self {
+        Self {
+            view: Mat4::look_to_lh(eye, forward, Vec3::Y),
+            // Swapping the planes of a left-handed projection maps near to
+            // depth 1 and far to 0.
+            projection: Mat4::perspective_lh(fov_y, aspect, far, near),
+            near,
+            far,
+            lighting: Lighting::default(),
+        }
+    }
+
+    /// The camera's world position.
+    pub fn eye(&self) -> Vec3 {
+        self.view.inverse().w_axis.truncate()
     }
 }
 
@@ -94,6 +157,7 @@ impl Default for View {
 pub struct LiveBuffers {
     pub vertex: usize,
     pub index: usize,
+    pub texture: usize,
 }
 
 /// Errors a backend reports.
@@ -115,6 +179,10 @@ pub enum BackendError {
     NotInFrame(&'static str),
     #[error("begin_frame called while a frame is already open")]
     FrameAlreadyOpen,
+    #[error("bad texture: {0}")]
+    Texture(String),
+    #[error("{0} is not supported by this backend")]
+    Unsupported(&'static str),
     #[error("device error: {0}")]
     Device(String),
 }
@@ -154,6 +222,21 @@ pub trait RenderBackend {
     fn destroy_vertex_buffer(&mut self, buffer: VertexBufferHandle) -> Result<(), BackendError>;
 
     fn destroy_index_buffer(&mut self, buffer: IndexBufferHandle) -> Result<(), BackendError>;
+
+    /// Creates a texture from its top mip and as many lower mips as given
+    /// (see [`TextureDesc::validate`]).
+    fn create_texture(
+        &mut self,
+        desc: &TextureDesc,
+        mips: &[&[u8]],
+    ) -> Result<TextureHandle, BackendError>;
+
+    fn destroy_texture(&mut self, texture: TextureHandle) -> Result<(), BackendError>;
+
+    /// Defines or redefines what draws with `id` shade with. Draws with a
+    /// material that was never defined use [`MaterialDesc::default`]. The
+    /// material's texture must be live when it is drawn.
+    fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError>;
 
     fn live_buffers(&self) -> LiveBuffers;
 

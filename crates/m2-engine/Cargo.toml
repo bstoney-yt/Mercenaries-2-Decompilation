@@ -1,6 +1,6 @@
 [package]
 name = "m2-engine"
-description = "Reconstructed engine classes with a safe API over the raw layouts."
+description = "Engine runtime: assets from the install, models on the GPU, and the systems built on them."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+m2-assets.workspace = true
 m2-layout.workspace = true
 m2-math.workspace = true
 m2-mem.workspace = true
+m2-render.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

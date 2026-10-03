@@ -228,6 +228,10 @@ handle!(
     /// An index buffer owned by a backend.
     IndexBufferHandle
 );
+handle!(
+    /// A texture owned by a backend.
+    TextureHandle
+);
 
 #[cfg(test)]
 mod tests {

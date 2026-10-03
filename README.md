@@ -18,15 +18,24 @@ A Cargo workspace targeting the original 32-bit process (`i686-pc-windows-msvc`)
 | `m2-mem` | Ownership-based replacements for the original allocators |
 | `m2-sys` | All raw FFI: Win32, Direct3D 9, original functions |
 | `m2-hook` | Symbol tables and the per-function original/Rust switch |
-| `m2-engine` | Reconstructed engine classes |
+| `m2-engine` | Engine runtime: assets from your install, models on the GPU |
 | `m2-game` | Gameplay logic |
-| `m2-render` | Rendering abstraction over Direct3D 9 |
+| `m2-render` | Rendering abstraction, with a wgpu backend (Direct3D 12 / Vulkan) |
 | `m2-assets` | Parsers for files from your own installation |
 | `m2-modapi` | Data-driven mod definitions and hooks |
 | `m2-oracle` | Differential tests against the original (opt-in, needs your exe) |
-| `m2-loader` | The DLL loaded into the game process |
+| `m2-loader` | The DLL loaded into the game process (parked) |
+| `m2-alpha` | The native game executable |
 
 `symbols/` tracks every identified function (name, RVA, signature, translation status); see `symbols/README.md`. Conventions for translating code are in `docs/conventions.md`.
+
+The plan to a playable alpha is in `docs/alpha-roadmap.md`. The native game so far opens a window with a free-flying camera and shows models from your install:
+
+```sh
+cargo run --release -p m2-alpha -- --install "<install dir>"   # Jennifer on a ground grid; Tab captures the mouse, WASD/Space/C fly
+cargo run --release -p m2-alpha -- --install "<install dir>" --model 15d89832 --model <hash>   # other models side by side
+cargo run --release -p m2-alpha -- --write-config > m2-alpha.toml   # settings file (install path, window, keys)
+```
 
 ```sh
 cargo test --workspace
