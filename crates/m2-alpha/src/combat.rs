@@ -94,10 +94,21 @@ impl Arsenal {
     }
 
     /// Weapon to world for a character drawn at `body` with posed node
-    /// matrices `nodes`.
-    pub fn in_hand(&self, weapon: &WeaponModel, body: Mat4, nodes: &[Mat4]) -> Option<Mat4> {
-        Some(body * *nodes.get(self.hand?)? * weapon.grip)
+    /// matrices `nodes` and its right hand at node `hand`.
+    pub fn in_hand(
+        &self,
+        weapon: &WeaponModel,
+        body: Mat4,
+        nodes: &[Mat4],
+        hand: Option<usize>,
+    ) -> Option<Mat4> {
+        Some(body * *nodes.get(hand?)? * weapon.grip)
     }
+}
+
+/// The right-hand node of a human skeleton.
+pub fn right_hand(skeleton: &Skeleton) -> Option<usize> {
+    node(skeleton, RIGHT_HAND)
 }
 
 fn node(skeleton: &Skeleton, hash: u32) -> Option<usize> {
@@ -335,7 +346,7 @@ impl Combat {
         };
         let (nodes, _) = rig.posed();
         f.arsenal
-            .in_hand(w, f.player.model_matrix(), &nodes)
+            .in_hand(w, f.player.model_matrix(), &nodes, f.arsenal.hand)
             .map_or(chest, |m| m.transform_point3(w.muzzle))
     }
 
@@ -350,7 +361,7 @@ impl Combat {
         self.effect(Effect::Flash { at: from }, 0.05);
         self.sounds.push(Sound::Shot(from));
         if let Some((_, Some(i))) = hit {
-            f.people.npcs[i].hurt(RIFLE_DAMAGE, f.people.clips);
+            f.people.npcs[i].hurt(RIFLE_DAMAGE);
             self.hits += 1;
         }
         alarm(f.people, f.player.character.position);
@@ -363,7 +374,7 @@ impl Combat {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
                 f.arsenal
-                    .in_hand(w, n.model_matrix(), &nodes)
+                    .in_hand(w, n.model_matrix(), &nodes, n.hand)
                     .map_or(n.chest(), |m| m.transform_point3(w.muzzle))
             }
             _ => n.chest(),
@@ -534,13 +545,12 @@ impl Combat {
                 2.5,
             );
         }
-        let clips = f.people.clips;
         for n in &mut f.people.npcs {
             let d = n.chest().distance(at);
             if d < KILL {
-                n.hurt(1000.0, clips);
+                n.hurt(1000.0);
             } else if d < REACH {
-                n.hurt(100.0 * (1.0 - d / REACH), clips);
+                n.hurt(100.0 * (1.0 - d / REACH));
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);

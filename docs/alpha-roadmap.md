@@ -91,7 +91,7 @@ only) once item 11 lands.
 | Save format | Game saves are unknown | Our own format; not compatible with the original. |
 | Dialogue triggers | 12,988 voice lines unused | Owned by the voice-work thread; alpha just exposes an audio API for it. |
 | Bink movies (`.bik`) | No cutscenes | Skip for alpha. |
-| Sea level | -35 m is an estimate | Adjustable in config. |
+| Sea level | -45 m, fitted by eye to the beaches (-35 m drowned them) | `[world] sea_level` in the settings file, or `--sea`. |
 
 ## Legal guardrails
 

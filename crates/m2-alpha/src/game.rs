@@ -11,6 +11,7 @@ use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::player::{Intent, Player};
 use crate::scene::{ParkedVehicle, Scene};
+use crate::ui::HudInfo;
 
 #[derive(Debug)]
 pub struct Game {
@@ -20,6 +21,9 @@ pub struct Game {
     pub on_foot: bool,
     /// Seconds to the next look for parking spots.
     park_wait: f32,
+    /// Looks for parking so far; each widens the search and allows
+    /// steeper ground, until [`PARK_TRIES`] give up.
+    park_tries: u32,
     pub combat: Combat,
 }
 
@@ -31,6 +35,7 @@ impl Game {
             camera,
             on_foot,
             park_wait: 0.0,
+            park_tries: 0,
             combat: Combat::default(),
         }
     }
@@ -57,10 +62,13 @@ impl Game {
             let player = scene.player.as_mut().filter(|_| self.on_foot);
             if let Some(player) = player {
                 self.park_wait -= dt;
-                if player.landed && self.park_wait <= 0.0 {
+                let waiting = scene.vehicles.iter().any(|v| v.id.is_none());
+                if player.landed && waiting && self.park_wait <= 0.0 && self.park_tries < PARK_TRIES
+                {
                     // Each look can cast thousands of rays: not every tick.
                     self.park_wait = 0.5;
-                    park(physics, &mut scene.vehicles, player);
+                    self.park_tries += 1;
+                    park(physics, &mut scene.vehicles, player, self.park_tries);
                 }
                 if intent.use_pressed {
                     match player.driving {
@@ -130,6 +138,45 @@ impl Game {
             self.combat.step(&mut field, intent.trigger, dt);
         }
         self.scene.tick(dt);
+    }
+
+    /// Parking is finished: every vehicle loaded is parked, or the search
+    /// gave up.
+    pub fn parking_done(&self) -> bool {
+        self.park_tries >= PARK_TRIES || self.scene.vehicles.iter().all(|v| v.id.is_some())
+    }
+
+    /// What the HUD shows.
+    pub fn hud_info(&self) -> HudInfo {
+        let player = self.scene.player.as_ref();
+        let loading = match &self.scene.world {
+            Some(w) if w.stats().pending > 0 => Some("Loading the island...".to_owned()),
+            Some(_) if self.scene.vehicles_loading() => {
+                Some("Finding vehicles and people...".to_owned())
+            }
+            _ => None,
+        };
+        let driving = player.and_then(|p| p.driving).and_then(|i| {
+            let v = self.scene.vehicles.get(i)?;
+            let speed = self.driving().map_or(0.0, |d| d.1);
+            Some((v.spec.label.clone(), speed, v.wrecked))
+        });
+        let can_enter = match (&self.scene.world, player) {
+            (Some(w), Some(p)) if p.driving.is_none() && p.landed => {
+                nearest(&w.physics, &self.scene.vehicles, p, REACH)
+                    .map(|i| self.scene.vehicles[i].spec.label.clone())
+            }
+            _ => None,
+        };
+        HudInfo {
+            playing: self.on_foot && player.is_some(),
+            hp: self.combat.hp,
+            down: self.combat.down > 0.0,
+            weapon: self.combat.weapon,
+            driving,
+            can_enter,
+            loading,
+        }
     }
 
     /// Puts the player in the nearest vehicle within `reach` metres (any
@@ -211,6 +258,9 @@ const REACH: f32 = 4.0;
 const PARK_AHEAD: f32 = 14.0;
 const PARK_GRID: f32 = 4.0;
 const PARK_SPOTS: i32 = 12;
+/// Looks before parking gives up on the vehicles left (cramped ground: a
+/// ledge, a town).
+const PARK_TRIES: u32 = 40;
 /// A spot is flat enough when the ground under the footprint's corners
 /// varies by less than this fraction of its length (about 10°) plus a
 /// little, near the height of her feet (not a roof).
@@ -221,7 +271,7 @@ const PARK_GAP: f32 = 1.5;
 
 /// Parks vehicles that have loaded but have no body yet on flat, clear
 /// ground near the spot ahead of the player, facing the way she faces.
-fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player) {
+fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, tries: u32) {
     if vehicles.iter().all(|v| v.id.is_some()) {
         return;
     }
@@ -231,8 +281,11 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player) 
     let feet = player.character.position;
     let ahead = feet + forward * PARK_AHEAD;
     // Spots nearest the one ahead first.
-    let mut spots: Vec<Vec3> = (-PARK_SPOTS..=PARK_SPOTS)
-        .flat_map(|i| (-PARK_SPOTS..=PARK_SPOTS).map(move |j| (i, j)))
+    // Later looks reach further and take steeper ground.
+    let reach = PARK_SPOTS + (tries / 2) as i32;
+    let flat = PARK_FLAT * (1.0 + tries as f32 / 8.0).min(3.0);
+    let mut spots: Vec<Vec3> = (-reach..=reach)
+        .flat_map(|i| (-reach..=reach).map(move |j| (i, j)))
         .map(|(i, j)| ahead + right * (i as f32 * PARK_GRID) + forward * (j as f32 * PARK_GRID))
         .filter(|p| p.distance(feet) > 6.0)
         .collect();
@@ -279,7 +332,7 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player) 
             let (min, max) = heights
                 .iter()
                 .fold((f32::MAX, f32::MIN), |(a, b), &h| (a.min(h), b.max(h)));
-            (max - min <= length * PARK_FLAT + 0.2 && (max - feet.y).abs() < PARK_ROOF)
+            (max - min <= length * flat + 0.2 && (max - feet.y).abs() < PARK_ROOF)
                 .then_some((centre, max))
         });
         // Nowhere yet (the ground may still be loading): try next tick.

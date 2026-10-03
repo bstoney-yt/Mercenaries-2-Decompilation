@@ -94,16 +94,56 @@ impl Rig {
         Some(self.clips[i].info.speed)
     }
 
-    /// This rig's clips on another model's `skeleton`, if it has the same
-    /// bones (every human model shares one skeleton).
+    /// This rig's clips on another model's `skeleton`: shared when it has
+    /// the same bones, otherwise the clips people play (locomotion, aim,
+    /// fall) bound again by bone name. `None` if they don't fit.
     pub fn for_skeleton(&self, skeleton: Skeleton) -> Option<Self> {
-        (skeleton.name_hashes == self.skeleton.name_hashes
-            && skeleton.parents == self.skeleton.parents)
-            .then(|| Self {
+        if skeleton.name_hashes == self.skeleton.name_hashes
+            && skeleton.parents == self.skeleton.parents
+        {
+            return Some(Self {
                 skeleton: Arc::new(skeleton),
                 animator: Animator::default(),
                 ..self.clone()
-            })
+            });
+        }
+        let locomotion = self.locomotion.as_ref()?;
+        let fight = npc::FightClips::find(self);
+        let mut wanted: Vec<usize> = locomotion
+            .clips
+            .values()
+            .copied()
+            .chain(fight.aim)
+            .chain(fight.die)
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut clips = Vec::new();
+        let mut moved = std::collections::HashMap::new();
+        for i in wanted {
+            if let Some(b) = self.clips[i].rebind(&skeleton) {
+                moved.insert(i, clips.len());
+                clips.push(b);
+            }
+        }
+        let gaits: std::collections::HashMap<Gait, usize> = locomotion
+            .clips
+            .iter()
+            .filter_map(|(g, i)| Some((*g, *moved.get(i)?)))
+            .collect();
+        if gaits.len() < locomotion.clips.len() {
+            return None;
+        }
+        Some(Self {
+            skeleton: Arc::new(skeleton),
+            clips: Arc::new(clips),
+            locomotion: Some(Locomotion {
+                clips: gaits,
+                forward: locomotion.forward,
+            }),
+            animator: Animator::default(),
+            gait: Gait::Idle,
+        })
     }
 
     fn new(skeleton: Skeleton, clips: Vec<BoundClip>, gait: Gait) -> Self {
@@ -509,13 +549,24 @@ impl Scene {
                                 .and_then(|pl| pl.model.as_ref())
                                 .and_then(|(_, rig)| rig.for_skeleton(skeleton));
                             match template {
-                                Some(rig) => self.people.add_kind(PersonKind {
-                                    role: p.role,
-                                    soldier: p.soldier,
-                                    model,
-                                    rig,
-                                }),
-                                None => eprintln!("person {}: skeleton differs; left out", p.role),
+                                Some(rig) => {
+                                    eprintln!(
+                                        "person {}: {} bones, {} clips",
+                                        p.role,
+                                        rig.skeleton.len(),
+                                        rig.clips.len()
+                                    );
+                                    self.people.add_kind(PersonKind {
+                                        role: p.role,
+                                        soldier: p.soldier,
+                                        model,
+                                        rig,
+                                    });
+                                }
+                                None => eprintln!(
+                                    "person {}: the clips don't fit its skeleton; left out",
+                                    p.role
+                                ),
                             }
                         }
                     }
@@ -585,7 +636,7 @@ impl Scene {
             };
             if !player.down
                 && let Some(w) = weapon
-                && let Some(at) = self.arsenal.in_hand(w, body, &nodes)
+                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, self.arsenal.hand)
             {
                 w.model.draw(queue, at);
             }
@@ -601,7 +652,7 @@ impl Scene {
             if n.soldier
                 && n.alive
                 && let Some(w) = &self.arsenal.rifle
-                && let Some(at) = self.arsenal.in_hand(w, body, &nodes)
+                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, n.hand)
             {
                 w.model.draw(queue, at);
             }

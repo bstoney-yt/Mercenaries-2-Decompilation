@@ -342,3 +342,40 @@ fn skinned_vertices_follow_their_bones() {
     assert!(matches!(stale, Err(BackendError::StaleSkin { .. })));
     b.end_frame().unwrap();
 }
+
+#[test]
+fn overlays_draw_over_the_finished_world() {
+    let Some(mut backend) = backend() else { return };
+    backend.begin_frame(&view()).unwrap();
+    let mut called = 0;
+    backend
+        .end_frame_with(&mut |t| {
+            called += 1;
+            assert_eq!(t.size, (SIZE, SIZE));
+            // A pass that keeps what the world drew.
+            let mut pass =
+                t.encoder
+                    .begin_render_pass(&m2_render::gpu::wgpu::RenderPassDescriptor {
+                        label: Some("overlay"),
+                        color_attachments: &[Some(
+                            m2_render::gpu::wgpu::RenderPassColorAttachment {
+                                view: t.view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: m2_render::gpu::wgpu::Operations {
+                                    load: m2_render::gpu::wgpu::LoadOp::Load,
+                                    store: m2_render::gpu::wgpu::StoreOp::Store,
+                                },
+                            },
+                        )],
+                        ..Default::default()
+                    });
+            pass.set_scissor_rect(0, 0, SIZE / 2, SIZE);
+        })
+        .unwrap();
+    assert_eq!(called, 1);
+    // The world (all sky) is still there.
+    let pixels = backend.read_pixels().unwrap();
+    let sky = &pixels[..4];
+    assert!(sky[2] > sky[0], "{sky:?}");
+}

@@ -205,14 +205,35 @@ pub struct ClipInfo {
 impl BoundClip {
     /// Binds `clip` to `skeleton`; `None` unless every track names a node.
     pub fn bind(hash: u32, clip: Clip, skeleton: &Skeleton) -> Option<Self> {
-        if clip.track_count() == 0 || clip.frame_count == 0 {
-            return None;
-        }
         if !clip
             .track_nodes
             .iter()
             .all(|h| skeleton.name_hashes.contains(h))
         {
+            return None;
+        }
+        Self::bind_by_name(hash, clip, skeleton)
+    }
+
+    /// Binds `clip` to another `skeleton` of the same character family
+    /// (people models differ from the player's in a few bones): tracks for
+    /// bones it lacks are dropped, nodes no track names keep their rest
+    /// pose. `None` unless most tracks find their bone.
+    pub fn rebind(&self, skeleton: &Skeleton) -> Option<Self> {
+        let found = self
+            .clip
+            .track_nodes
+            .iter()
+            .filter(|h| skeleton.name_hashes.contains(h))
+            .count();
+        if found * 10 < self.clip.track_nodes.len() * 8 {
+            return None;
+        }
+        Self::bind_by_name(self.hash, self.clip.clone(), skeleton)
+    }
+
+    fn bind_by_name(hash: u32, clip: Clip, skeleton: &Skeleton) -> Option<Self> {
+        if clip.track_count() == 0 || clip.frame_count == 0 {
             return None;
         }
         let node_tracks = skeleton
