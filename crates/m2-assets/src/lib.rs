@@ -19,6 +19,7 @@
 //!   posing.
 //! - [`havok`]: the binary object packfiles animation clips and collision
 //!   shapes are stored in.
+//! - [`path`]: patrol and vehicle routes (point lists placed by `Path` entities).
 //! - [`physics`]: model collision (`PHY2`): shapes, rigid bodies and the
 //!   nodes they attach to.
 //! - [`sound`]: sound banks (16-bit PCM sound effects and ambience).
@@ -29,6 +30,7 @@
 //! - [`material_animation`]: material animations (keyed material
 //!   parameters), stored under the animation type hash.
 //! - [`vehicle`]: vehicle kinds from texture names and wheels from geometry.
+//! - [`voice`]: voice cue tables (which streamed lines a voice set says, and how).
 //! - [`vertex`]: Direct3D 9 vertex declarations and vertex streams, mapped
 //!   onto `m2-render` vertex layouts.
 //!
@@ -50,6 +52,7 @@ pub mod havok;
 pub mod layer;
 pub mod material_animation;
 pub mod model;
+pub mod path;
 pub mod physics;
 pub mod scatter;
 pub mod sges;
@@ -59,6 +62,7 @@ pub mod texture;
 pub mod ucfx;
 pub mod vehicle;
 pub mod vertex;
+pub mod voice;
 pub mod wad;
 
 #[cfg(test)]
@@ -71,10 +75,13 @@ pub use havok::{Packfile, PackfileError};
 pub use layer::{Component, Layer, LayerError, Placement};
 pub use material_animation::{MaterialAnimError, MaterialAnimation};
 pub use model::{Model, ModelError, PrimitiveGroup};
+pub use path::{Path, PathError};
 pub use physics::{Physics, PhysicsError};
 pub use scatter::{Scatter, ScatterError};
 pub use sges::{Segment, SgesError, SgesHeader};
 pub use sound::{SoundBank, SoundError, StreamIndex};
+pub use voice::{CueTable, VoiceError};
+
 pub use terrain::{LowResTile, TerrainCell, TerrainError};
 pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};
 pub use ucfx::{Section, Ucfx, UcfxError};
