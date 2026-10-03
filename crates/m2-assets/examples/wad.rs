@@ -769,15 +769,17 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         }
     }
     let mut errors = 0;
-    let (mut groups, mut ranges, mut triangles) = (0, 0, 0);
+    let (mut groups, mut ranges, mut triangles, mut materials, mut bad_index) = (0, 0, 0, 0, 0);
     for (hash, data) in &cells {
         match TerrainCell::parse(data) {
             Ok(c) => {
+                materials += c.materials.len();
                 for g in c.patches.iter().flat_map(|p| &p.groups) {
                     groups += 1;
                     for r in &g.material_ranges {
                         ranges += 1;
                         triangles += g.triangles(r).len();
+                        bad_index += usize::from(r.material as usize >= c.materials.len());
                     }
                 }
             }
@@ -794,7 +796,7 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         }
     }
     println!(
-        "{} terrain cells ({groups} groups, {ranges} material ranges, {triangles} triangles), {} low-res tiles",
+        "{} terrain cells ({groups} groups, {ranges} material ranges, {triangles} triangles, {materials} materials, {bad_index} ranges past their materials), {} low-res tiles",
         cells.len(),
         tiles.len()
     );

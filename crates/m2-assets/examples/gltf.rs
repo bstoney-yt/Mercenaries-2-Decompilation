@@ -32,8 +32,8 @@
 //!
 //! `world` exports the island's terrain placed by the layout layer: the
 //! low-resolution tiles everywhere, full-detail cells near `--detail`, a sea
-//! plane, and colours from height and slope (the terrain materials are not
-//! decoded yet). With `view --world`, play mode starts on the island
+//! plane; full-detail cells use their own 512 px colour maps and the tiles
+//! the island-wide one (`vz_lrterrain`). With `view --world`, play mode starts on the island
 //! (`?spawn=X,Z` in the page address picks the point) and the character
 //! follows the ground.
 //!
@@ -263,11 +263,12 @@ fn load_model<R: Read + Seek>(
     Ok((base, chunks.into_iter().map(|c| c.1).collect()))
 }
 
-/// Decodes a texture's largest mip (with its streamed tiers if present) to
-/// RGBA8. Returns (width, height, pixels, has alpha).
+/// Decodes a texture's largest mip no wider than `max` (with its streamed
+/// tiers if present) to RGBA8. Returns (width, height, pixels, has alpha).
 fn load_texture<R: Read + Seek>(
     wad: &mut WadArchive<R>,
     hash: u32,
+    max: u32,
 ) -> Option<(u32, u32, Vec<u8>, bool)> {
     let mut blocks: Vec<usize> = wad
         .index()
@@ -306,8 +307,12 @@ fn load_texture<R: Read + Seek>(
         tiers[2].as_deref(),
     ]);
     let mip = match &chain {
-        Ok(c) => tex.chain_mips(c).ok()?.into_iter().next()?,
-        Err(_) => tex.resident_mips().into_iter().next()?,
+        Ok(c) => tex
+            .chain_mips(c)
+            .ok()?
+            .into_iter()
+            .find(|m| m.width <= max)?,
+        Err(_) => tex.resident_mips().into_iter().find(|m| m.width <= max)?,
     };
     let rgba = mip.to_rgba8(tex.info.format).ok()?;
     Some((mip.width, mip.height, rgba, alpha))
@@ -474,7 +479,7 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
     for m in &model.materials {
         let tex = match m.textures.first().copied().filter(|&t| t != 0) {
             Some(t) => *textures.entry(t).or_insert_with(|| {
-                let (w, h, rgba, alpha) = load_texture(wad, t)?;
+                let (w, h, rgba, alpha) = load_texture(wad, t, u32::MAX)?;
                 let view = g.view(&png(w, h, &rgba), None);
                 images.push(format!(
                     r#"{{"bufferView":{view},"mimeType":"image/png","name":"{t:08x}"}}"#
@@ -836,46 +841,37 @@ struct WorldOptions {
     radius: f32,
 }
 
-/// A ground colour from height and steepness, standing in for the terrain
-/// materials, which are not decoded yet.
-fn ground_colour(height: f32, up: f32) -> [f32; 3] {
-    let mix = |a: [f32; 3], b: [f32; 3], t: f32| {
-        let t = t.clamp(0.0, 1.0);
-        [
-            a[0] + (b[0] - a[0]) * t,
-            a[1] + (b[1] - a[1]) * t,
-            a[2] + (b[2] - a[2]) * t,
-        ]
-    };
-    let (sand, jungle, dry, rock) = (
-        [0.76, 0.70, 0.52],
-        [0.20, 0.34, 0.13],
-        [0.45, 0.45, 0.25],
-        [0.42, 0.39, 0.35],
-    );
-    let land = mix(jungle, dry, (height - 40.0) / 120.0);
-    let shore = mix(sand, land, (height - 1.0) / 3.0);
-    mix(shore, rock, (0.85 - up) / 0.2)
-}
+/// Side of the island in metres (20 cells of 400 m).
+const ISLAND: f32 = 8000.0;
 
 /// A world-space mesh piece: positions and normals already mirrored for
-/// glTF, triangles in glTF winding.
+/// glTF, triangles in glTF winding, texture coordinates for its colour map.
 struct Piece {
     name: String,
+    /// Texture hash of the colour map to draw it with.
+    map: u32,
     positions: Vec<f32>,
     normals: Vec<f32>,
-    colours: Vec<f32>,
+    uvs: Vec<f32>,
     indices: Vec<u16>,
 }
 
-fn piece(name: String, origin: [f32; 3], group: &m2_assets::terrain::TerrainGroup<'_>) -> Piece {
+/// `origin` places the group in the world; `uv` maps a vertex's world
+/// position (game axes) to its colour-map coordinates.
+fn piece(
+    name: String,
+    map: u32,
+    origin: [f32; 3],
+    group: &m2_assets::terrain::TerrainGroup<'_>,
+    uv: impl Fn([f32; 3]) -> [f32; 2],
+) -> Piece {
     let pos = group.positions();
     let nrm = group
         .decl
         .find(DeclUsage::Normal, 0)
         .and_then(|e| group.vertices.read(e))
         .unwrap_or_default();
-    let (mut positions, mut normals, mut colours) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut positions, mut normals, mut uvs) = (Vec::new(), Vec::new(), Vec::new());
     for (i, p) in pos.iter().enumerate() {
         let world = [p[0] + origin[0], p[1] + origin[1], p[2] + origin[2]];
         let n = nrm
@@ -888,7 +884,7 @@ fn piece(name: String, origin: [f32; 3], group: &m2_assets::terrain::TerrainGrou
             .unwrap_or(Vec3::Y);
         positions.extend(flip_v(world));
         normals.extend(flip_v(n.to_array()));
-        colours.extend(ground_colour(world[1], n.y));
+        uvs.extend(uv(world));
     }
     // Full ranges draw the whole group; fall back to the material ranges.
     let ranges = if group.full_ranges.is_empty() {
@@ -909,16 +905,17 @@ fn piece(name: String, origin: [f32; 3], group: &m2_assets::terrain::TerrainGrou
     }
     Piece {
         name,
+        map,
         positions,
         normals,
-        colours,
+        uvs,
         indices,
     }
 }
 
 fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> AnyResult<Vec<u8>> {
     use m2_assets::layer::LAYER_TYPE;
-    use m2_assets::terrain::{CELL_SIZE, LOW_RES_TYPE, TERRAIN_TYPE};
+    use m2_assets::terrain::{CELL_SIZE, LOW_RES_TYPE, TERRAIN_TYPE, colour_map_uv};
     use m2_assets::{Layer, LowResTile, TerrainCell};
 
     // The layout layer: positions of every cell and low-res tile.
@@ -972,6 +969,7 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
             continue;
         }
         let cell = TerrainCell::parse(data)?;
+        let map = cell.colour_map().unwrap_or(0);
         detailed += 1;
         for (pi, patch) in cell.patches.iter().enumerate() {
             let origin = [
@@ -982,14 +980,16 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
             for (gi, g) in patch.groups.iter().enumerate() {
                 pieces.push(piece(
                     format!("cell {hash:08x} patch {pi} group {gi}"),
+                    map,
                     origin,
                     g,
+                    |w| colour_map_uv(w[0] - centre[0], w[2] - centre[2]),
                 ));
             }
         }
     }
-    // Low-res tiles everywhere else; a detailed cell's tile has the same
-    // centre, so skip those.
+    // Low-res tiles everywhere else, drawn with the island-wide map; a
+    // detailed cell's tile has the same centre, so skip those.
     let detailed_centres: Vec<[f32; 3]> = cell_at.values().copied().filter(|c| near(*c)).collect();
     for (hash, data) in &tiles {
         let Some(&centre) = tile_at.get(hash) else {
@@ -1002,10 +1002,56 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
             continue;
         }
         let tile = LowResTile::parse(data)?;
-        pieces.push(piece(format!("tile {hash:08x}"), centre, &tile.group));
+        let map = tile
+            .materials
+            .first()
+            .and_then(|m| m.textures.first().copied())
+            .unwrap_or(0);
+        // The island map follows the cell maps' axes at island scale.
+        pieces.push(piece(
+            format!("tile {hash:08x}"),
+            map,
+            centre,
+            &tile.group,
+            |w| {
+                [
+                    (ISLAND / 2.0 - w[0]) / ISLAND,
+                    (ISLAND / 2.0 - w[2]) / ISLAND,
+                ]
+            },
+        ));
     }
 
     let mut g = Gltf::default();
+    // One material per colour map; the island map stays at full size, the
+    // cell maps likewise (512 × 512).
+    let mut material_of: HashMap<u32, usize> = HashMap::new();
+    let mut materials = Vec::new();
+    let mut images = Vec::new();
+    for p in &pieces {
+        if material_of.contains_key(&p.map) {
+            continue;
+        }
+        let texture = load_texture(wad, p.map, 2048).map(|(w, h, rgba, _)| {
+            let view = g.view(&png(w, h, &rgba), None);
+            images.push(format!(
+                r#"{{"bufferView":{view},"mimeType":"image/png","name":"{:08x}"}}"#,
+                p.map
+            ));
+            images.len() - 1
+        });
+        materials.push(match texture {
+            Some(i) => format!(
+                r#"{{"name":"{:08x}","pbrMetallicRoughness":{{"baseColorTexture":{{"index":{i}}},"metallicFactor":0,"roughnessFactor":1}}}}"#,
+                p.map
+            ),
+            None => r#"{"name":"untextured","pbrMetallicRoughness":{"baseColorFactor":[0.3,0.4,0.2,1],"metallicFactor":0,"roughnessFactor":1}}"#.to_owned(),
+        });
+        material_of.insert(p.map, materials.len() - 1);
+    }
+    let sea = materials.len();
+    materials.push(r#"{"name":"sea","pbrMetallicRoughness":{"baseColorFactor":[0.10,0.30,0.42,0.75],"metallicFactor":0,"roughnessFactor":0.2},"alphaMode":"BLEND","doubleSided":true}"#.to_owned());
+
     let mut nodes = Vec::new();
     let mut meshes = Vec::new();
     for p in &pieces {
@@ -1014,10 +1060,11 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
         }
         let pos = g.floats(&p.positions, 3, true, Some(34962));
         let nrm = g.floats(&p.normals, 3, false, Some(34962));
-        let col = g.floats(&p.colours, 3, false, Some(34962));
+        let uv = g.floats(&p.uvs, 2, false, Some(34962));
         let ind = g.u16s(&p.indices, 1, Some(34963));
         meshes.push(format!(
-            r#"{{"primitives":[{{"attributes":{{"POSITION":{pos},"NORMAL":{nrm},"COLOR_0":{col}}},"indices":{ind},"material":0}}]}}"#
+            r#"{{"primitives":[{{"attributes":{{"POSITION":{pos},"NORMAL":{nrm},"TEXCOORD_0":{uv}}},"indices":{ind},"material":{}}}]}}"#,
+            material_of[&p.map]
         ));
         nodes.push(format!(
             r#"{{"name":"{}","mesh":{}}}"#,
@@ -1026,7 +1073,7 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
         ));
     }
     // Sea level water.
-    let half = 10.0 * CELL_SIZE + 4000.0;
+    let half = ISLAND / 2.0 + 4000.0;
     let water = g.floats(
         &[
             -half, 0.0, -half, half, 0.0, -half, half, 0.0, half, -half, 0.0, half,
@@ -1037,21 +1084,27 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
     );
     let water_ind = g.u16s(&[0, 2, 1, 0, 3, 2], 1, Some(34963));
     meshes.push(format!(
-        r#"{{"name":"sea","primitives":[{{"attributes":{{"POSITION":{water}}},"indices":{water_ind},"material":1}}]}}"#
+        r#"{{"name":"sea","primitives":[{{"attributes":{{"POSITION":{water}}},"indices":{water_ind},"material":{sea}}}]}}"#
     ));
     nodes.push(format!(r#"{{"name":"sea","mesh":{}}}"#, meshes.len() - 1));
     eprintln!(
-        "{} detailed cells, {} pieces, {} vertices",
+        "{} detailed cells, {} pieces, {} vertices, {} colour maps",
         detailed,
         nodes.len() - 1,
-        pieces.iter().map(|p| p.positions.len() / 3).sum::<usize>()
+        pieces.iter().map(|p| p.positions.len() / 3).sum::<usize>(),
+        images.len()
     );
     let roots: Vec<usize> = (0..nodes.len()).collect();
-    let materials = r#"[{"name":"ground","pbrMetallicRoughness":{"metallicFactor":0,"roughnessFactor":1}},{"name":"sea","pbrMetallicRoughness":{"baseColorFactor":[0.10,0.30,0.42,0.75],"metallicFactor":0,"roughnessFactor":0.2},"alphaMode":"BLEND","doubleSided":true}]"#;
+    let textures: Vec<String> = (0..images.len())
+        .map(|i| format!(r#"{{"source":{i},"sampler":0}}"#))
+        .collect();
     let json = format!(
-        r#"{{"asset":{{"version":"2.0","generator":"m2-assets gltf example"}},"scene":0,"scenes":[{{"name":"world","nodes":{roots:?}}}],"nodes":[{}],"meshes":[{}],"materials":{materials},"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
+        r#"{{"asset":{{"version":"2.0","generator":"m2-assets gltf example"}},"scene":0,"scenes":[{{"name":"world","nodes":{roots:?}}}],"nodes":[{}],"meshes":[{}],"materials":[{}],"images":[{}],"textures":[{}],"samplers":[{{"magFilter":9729,"minFilter":9987,"wrapS":33071,"wrapT":33071}}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
         nodes.join(","),
         meshes.join(","),
+        materials.join(","),
+        images.join(","),
+        textures.join(","),
         g.accessors.join(","),
         g.views.join(","),
         g.bin.len().next_multiple_of(4)
