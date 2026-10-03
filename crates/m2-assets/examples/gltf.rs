@@ -11,6 +11,8 @@
 //! cargo run --release -p m2-assets --example gltf -- world  <vz.wad> <out.glb> [options]
 //!     --detail X,Z    full-detail terrain around this point (game x, z)
 //!     --radius M      ... out to this distance (default 600)
+//!     --objects WHICH static (default: layers_static), all (mission states too) or none
+//!     --sea Y         sea surface height (default -35, an estimate)
 //! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--port N]
 //! ```
 //!
@@ -105,6 +107,8 @@ fn run(args: &[String]) -> AnyResult<()> {
             let mut w = WorldOptions {
                 detail: None,
                 radius: 600.0,
+                objects: Objects::Static,
+                sea: -35.0,
             };
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
@@ -115,6 +119,15 @@ fn run(args: &[String]) -> AnyResult<()> {
                         w.detail = Some([x.trim().parse()?, z.trim().parse()?]);
                     }
                     "--radius" => w.radius = value.parse()?,
+                    "--sea" => w.sea = value.parse()?,
+                    "--objects" => {
+                        w.objects = match value.as_str() {
+                            "static" => Objects::Static,
+                            "all" => Objects::All,
+                            "none" => Objects::None,
+                            _ => return Err("--objects takes static, all or none".into()),
+                        }
+                    }
                     _ => return Err(format!("unknown option {flag}").into()),
                 }
             }
@@ -839,6 +852,21 @@ struct WorldOptions {
     /// Centre of the full-detail area in game coordinates (x, z).
     detail: Option<[f32; 2]>,
     radius: f32,
+    objects: Objects,
+    /// Sea surface height. An estimate: towns and coastal flats sit at about
+    /// -33 m, so the water is just below; where the game stores it is not
+    /// known yet.
+    sea: f32,
+}
+
+/// Which placed models to export.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Objects {
+    /// Only `layers_static`, the world as it always is.
+    Static,
+    /// Every layer, mission states included (they add alternate versions).
+    All,
+    None,
 }
 
 /// Side of the island in metres (20 cells of 400 m).
@@ -922,13 +950,28 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
     let mut cell_at: HashMap<u32, [f32; 3]> = HashMap::new();
     let mut tile_at: HashMap<u32, [f32; 3]> = HashMap::new();
     let (mut tiles, mut cells) = (HashMap::new(), HashMap::new());
+    // Placed models: (model hash, position, rotation).
+    let mut placed: Vec<(u32, [f32; 3], [f32; 4])> = Vec::new();
     for block in 0..wad.index().blocks().len() {
+        let is_static = wad.index().blocks()[block].path.contains("layers_static");
         let decoded = wad.read_block(block)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
             match e.type_hash {
                 LAYER_TYPE => {
                     let layer = Layer::parse(data)?;
                     let placements = layer.placements();
+                    let wanted = match o.objects {
+                        Objects::Static => is_static,
+                        Objects::All => true,
+                        Objects::None => false,
+                    };
+                    if wanted {
+                        for (entity, model) in layer.hashes("ModelName") {
+                            if let Some(p) = placements.get(&entity) {
+                                placed.push((model, p.position, p.rotation));
+                            }
+                        }
+                    }
                     for (out, component) in [
                         (&mut cell_at, "TerrainObject"),
                         (&mut tile_at, "LowResTerrainObject"),
@@ -1072,11 +1115,161 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
             meshes.len() - 1
         ));
     }
+    // Placed models: one glTF mesh per model at its finest complete level
+    // of detail, one node per placement (named "obj ..." so the viewer can
+    // hide distant ones). Object textures repeat, so they use sampler 1.
+    let mut image_sampler = vec![0u8; images.len()];
+    let mut mesh_of_model: HashMap<u32, Option<usize>> = HashMap::new();
+    let mut material_of_texture: HashMap<u32, usize> = HashMap::new();
+    let mut untextured = None;
+    let (mut object_count, mut object_triangles) = (0, 0);
+    for (model_hash, position, rotation) in &placed {
+        let mesh = match mesh_of_model.get(model_hash) {
+            Some(m) => *m,
+            None => {
+                let built = (|| -> AnyResult<Option<usize>> {
+                    let (base, chunks) = load_model(wad, *model_hash)?;
+                    let mut model = Model::parse(&base)?;
+                    for c in &chunks {
+                        model.add_streamed(c)?;
+                    }
+                    let lod = (0..model.info.lod_count)
+                        .find(|&l| model.has_lod(l))
+                        .unwrap_or(0);
+                    let mut prims = Vec::new();
+                    for (segment, geom) in model.lod(lod) {
+                        // Skinned positions are already in model space.
+                        let to_model = match geom.kind {
+                            GeometryKind::Skin => Mat4::IDENTITY,
+                            _ => model.node_to_model(segment.node).unwrap_or(Mat4::IDENTITY),
+                        };
+                        for grp in &geom.groups {
+                            let read = |u| grp.decl.find(u, 0).and_then(|e| grp.vertices.read(e));
+                            let Some(pos) = read(DeclUsage::Position) else {
+                                continue;
+                            };
+                            let p: Vec<f32> = pos
+                                .iter()
+                                .flat_map(|v| {
+                                    flip_v(
+                                        to_model
+                                            .transform_point3(Vec3::new(v[0], v[1], v[2]))
+                                            .to_array(),
+                                    )
+                                })
+                                .collect();
+                            let mut attrs =
+                                format!(r#""POSITION":{}"#, g.floats(&p, 3, true, Some(34962)));
+                            if let Some(nrm) = read(DeclUsage::Normal) {
+                                let n: Vec<f32> = nrm
+                                    .iter()
+                                    .flat_map(|v| {
+                                        let n =
+                                            to_model.transform_vector3(Vec3::new(v[0], v[1], v[2]));
+                                        flip_v(n.try_normalize().unwrap_or(Vec3::Y).to_array())
+                                    })
+                                    .collect();
+                                let _ = write!(
+                                    attrs,
+                                    r#","NORMAL":{}"#,
+                                    g.floats(&n, 3, false, Some(34962))
+                                );
+                            }
+                            if let Some(uv) = read(DeclUsage::TexCoord) {
+                                let t: Vec<f32> = uv.iter().flat_map(|v| [v[0], v[1]]).collect();
+                                let _ = write!(
+                                    attrs,
+                                    r#","TEXCOORD_0":{}"#,
+                                    g.floats(&t, 2, false, Some(34962))
+                                );
+                            }
+                            for range in &grp.material_ranges {
+                                let tris: Vec<u16> = grp
+                                    .triangles(range)
+                                    .into_iter()
+                                    .flat_map(|[a, b, c]| [a, c, b])
+                                    .collect();
+                                if tris.is_empty() {
+                                    continue;
+                                }
+                                object_triangles += tris.len() / 3;
+                                let ind = g.u16s(&tris, 1, Some(34963));
+                                let texture = model
+                                    .materials
+                                    .get(range.material as usize)
+                                    .and_then(|m| m.textures.first().copied())
+                                    .filter(|&t| t != 0);
+                                let material = match texture
+                                    .and_then(|t| material_of_texture.get(&t).copied())
+                                {
+                                    Some(m) => m,
+                                    None => {
+                                        let loaded = texture.and_then(|t| {
+                                            load_texture(wad, t, 256).map(|x| (t, x))
+                                        });
+                                        match loaded {
+                                            Some((t, (w, h, rgba, alpha))) => {
+                                                let view = g.view(&png(w, h, &rgba), None);
+                                                images.push(format!(
+                                                    r#"{{"bufferView":{view},"mimeType":"image/png","name":"{t:08x}"}}"#
+                                                ));
+                                                image_sampler.push(1);
+                                                materials.push(format!(
+                                                    r#"{{"name":"{t:08x}","pbrMetallicRoughness":{{"baseColorTexture":{{"index":{}}},"metallicFactor":0,"roughnessFactor":0.9}}{}}}"#,
+                                                    images.len() - 1,
+                                                    if alpha { r#","alphaMode":"MASK","alphaCutoff":0.5,"doubleSided":true"# } else { "" }
+                                                ));
+                                                material_of_texture.insert(t, materials.len() - 1);
+                                                materials.len() - 1
+                                            }
+                                            None => *untextured.get_or_insert_with(|| {
+                                                materials.push(r#"{"name":"untextured object","pbrMetallicRoughness":{"baseColorFactor":[0.6,0.6,0.6,1],"metallicFactor":0,"roughnessFactor":0.9}}"#.to_owned());
+                                                materials.len() - 1
+                                            }),
+                                        }
+                                    }
+                                };
+                                prims.push(format!(
+                                    r#"{{"attributes":{{{attrs}}},"indices":{ind},"material":{material}}}"#
+                                ));
+                            }
+                        }
+                    }
+                    if prims.is_empty() {
+                        return Ok(None);
+                    }
+                    meshes.push(format!(
+                        r#"{{"name":"{model_hash:08x}","primitives":[{}]}}"#,
+                        prims.join(",")
+                    ));
+                    Ok(Some(meshes.len() - 1))
+                })();
+                let mesh = built.unwrap_or_else(|e| {
+                    eprintln!("model {model_hash:08x}: {e}");
+                    None
+                });
+                mesh_of_model.insert(*model_hash, mesh);
+                mesh
+            }
+        };
+        let Some(mesh) = mesh else { continue };
+        object_count += 1;
+        nodes.push(format!(
+            r#"{{"name":"obj {model_hash:08x}","mesh":{mesh},"translation":{:?},"rotation":{:?}}}"#,
+            flip_v(*position),
+            flip_q(*rotation)
+        ));
+    }
+    eprintln!(
+        "{object_count} placed objects from {} models, {object_triangles} triangles",
+        mesh_of_model.values().flatten().count()
+    );
+
     // Sea level water.
     let half = ISLAND / 2.0 + 4000.0;
     let water = g.floats(
         &[
-            -half, 0.0, -half, half, 0.0, -half, half, 0.0, half, -half, 0.0, half,
+            -half, o.sea, -half, half, o.sea, -half, half, o.sea, half, -half, o.sea, half,
         ],
         3,
         true,
@@ -1088,18 +1281,23 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
     ));
     nodes.push(format!(r#"{{"name":"sea","mesh":{}}}"#, meshes.len() - 1));
     eprintln!(
-        "{} detailed cells, {} pieces, {} vertices, {} colour maps",
+        "{} detailed cells, {} terrain pieces, {} vertices, {} images",
         detailed,
-        nodes.len() - 1,
+        pieces.len(),
         pieces.iter().map(|p| p.positions.len() / 3).sum::<usize>(),
         images.len()
     );
     let roots: Vec<usize> = (0..nodes.len()).collect();
     let textures: Vec<String> = (0..images.len())
-        .map(|i| format!(r#"{{"source":{i},"sampler":0}}"#))
+        .map(|i| {
+            format!(
+                r#"{{"source":{i},"sampler":{}}}"#,
+                image_sampler.get(i).copied().unwrap_or(0)
+            )
+        })
         .collect();
     let json = format!(
-        r#"{{"asset":{{"version":"2.0","generator":"m2-assets gltf example"}},"scene":0,"scenes":[{{"name":"world","nodes":{roots:?}}}],"nodes":[{}],"meshes":[{}],"materials":[{}],"images":[{}],"textures":[{}],"samplers":[{{"magFilter":9729,"minFilter":9987,"wrapS":33071,"wrapT":33071}}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
+        r#"{{"asset":{{"version":"2.0","generator":"m2-assets gltf example"}},"scene":0,"scenes":[{{"name":"world","nodes":{roots:?}}}],"nodes":[{}],"meshes":[{}],"materials":[{}],"images":[{}],"textures":[{}],"samplers":[{{"magFilter":9729,"minFilter":9987,"wrapS":33071,"wrapT":33071}},{{"magFilter":9729,"minFilter":9987,"wrapS":10497,"wrapT":10497}}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
         nodes.join(","),
         meshes.join(","),
         materials.join(","),
