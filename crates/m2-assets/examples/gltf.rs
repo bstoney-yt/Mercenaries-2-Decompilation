@@ -8,7 +8,10 @@
 //!     --clips N       export at most N animation clips (default 40)
 //!     --filter TEXT   only clips from blocks whose path contains TEXT
 //!     --lod N         level of detail to export (default 0, the finest)
-//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [port]
+//! cargo run --release -p m2-assets --example gltf -- world  <vz.wad> <out.glb> [options]
+//!     --detail X,Z    full-detail terrain around this point (game x, z)
+//!     --radius M      ... out to this distance (default 600)
+//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--port N]
 //! ```
 //!
 //! `rigs` lists the models that animation clips fit (every track names one
@@ -26,6 +29,13 @@
 //! carry their motion on the root node and are otherwise in place, so the
 //! page measures each clip's speed and direction from the root track, strips
 //! the root's horizontal motion, and moves the character at that speed.
+//!
+//! `world` exports the island's terrain placed by the layout layer: the
+//! low-resolution tiles everywhere, full-detail cells near `--detail`, a sea
+//! plane, and colours from height and slope (the terrain materials are not
+//! decoded yet). With `view --world`, play mode starts on the island
+//! (`?spawn=X,Z` in the page address picks the point) and the character
+//! follows the ground.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and

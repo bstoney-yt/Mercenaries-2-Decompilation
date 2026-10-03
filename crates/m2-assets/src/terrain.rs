@@ -274,7 +274,7 @@ fn group<'a>(
         }
         // Tiles: every range is a material range.
         None => {
-            if prmt.len() % RANGE_LEN != 0 {
+            if !prmt.len().is_multiple_of(RANGE_LEN) {
                 return Err(TerrainError::Length {
                     what: "PRMT",
                     len: prmt.len(),
