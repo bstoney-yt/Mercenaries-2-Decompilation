@@ -1102,12 +1102,17 @@ function nextLeg(n) {
 // ALL OF THIS IS INVENTED, not the game's AI; only the routes are the game's.
 const SIGHT = { range: 40, cone: Math.PI * 2 / 3, near: 6, call: 25 };
 
-// How well soldier `n` sees `me`: 0 not at all, up to 1 when close.
-function canSee(n, me) {
+// How well soldier `n` sees `me`: 0 not at all, up to 1 when close. In a
+// fight (`fighting`) he looks the player's way and sees as far as he shoots.
+function canSee(n, me, fighting = false) {
   const eye = n.body.position.clone().add(new THREE.Vector3(0, 1.6, 0));
   const to = me.clone().add(new THREE.Vector3(0, 1.2, 0)).sub(eye);
-  const d = to.length(), range = driving ? SIGHT.range * 1.5 : SIGHT.range;
+  const d = to.length(), range = fighting ? 80 : driving ? SIGHT.range * 1.5 : SIGHT.range;
   if (d > range) return 0;
+  if (fighting) {
+    const hit = castShot(eye, to.normalize(), Math.max(0, d - 0.6), n);
+    return hit && !hit.npc ? 0 : 1;
+  }
   const facing = n.body.rotation.y + Math.atan2(loco.fwd.x, loco.fwd.y);
   let off = Math.atan2(to.x, to.z) - facing;
   off = Math.atan2(Math.sin(off), Math.cos(off));
@@ -1232,7 +1237,8 @@ function stepNpcs(dt) {
     // Out of a fight (the player got away or went down): search where he
     // was last seen (see `watch`).
     if (n.soldier && n.wasAlert && !n.alert) {
-      Object.assign(n, { sus: 0.6, searching: true, lastSeen: me.clone(), state: 'search', target: me.clone(), searchFor: 0 });
+      const seen = (n.lastSeen || me).clone();
+      Object.assign(n, { sus: 0.6, searching: true, lastSeen: seen, state: 'search', target: seen.clone(), searchFor: 0 });
     }
     n.wasAlert = n.alert;
     if (n.mark && n.alert && performance.now() > (n.markOff || 0)) showMark(n, null);
@@ -1514,14 +1520,21 @@ function stepSoldier(n, dt) {
   const me = driving ? driving.root.position : player.position;
   const d = n.body.position.distanceTo(me);
   if (d > 80 || performance.now() < combat.downUntil) { n.alert = false; return false; }
+  // He fires only while he can see the player (in any direction: he knows
+  // where to look); out of sight for 4 s, he goes to search (see `watch`).
+  n.lookIn = (n.lookIn ?? Math.random() * 0.25) - dt;
+  if (n.lookIn <= 0) { n.lookIn = 0.25; n.sees = canSee(n, me, true); }
+  if (n.sees) { n.lastSeen = me.clone(); n.hidden = 0; }
+  else if ((n.hidden = (n.hidden || 0) + dt) > 4) { n.alert = false; n.hidden = 0; return false; }
   if (n.actions.aim) setNpcGait(n, 'aim');
-  const tx = me.x - n.body.position.x, tz = me.z - n.body.position.z;
+  const aimAt = n.sees ? me : (n.lastSeen || me);
+  const tx = aimAt.x - n.body.position.x, tz = aimAt.z - n.body.position.z;
   const want = Math.atan2(tx, tz) - Math.atan2(loco.fwd.x, loco.fwd.y);
   let r = want - n.body.rotation.y;
   r = Math.atan2(Math.sin(r), Math.cos(r));
   n.body.rotation.y += r * Math.min(1, dt * 6);
   n.cooldown = (n.cooldown ?? Math.random()) - dt;
-  if (n.cooldown <= 0 && Math.abs(r) < 0.3 && d < 70) {
+  if (n.sees && n.cooldown <= 0 && Math.abs(r) < 0.3 && d < 70) {
     npcShoot(n);
     n.cooldown = 0.9 + Math.random() * 0.8;
   }
@@ -2140,7 +2153,7 @@ function open(gltf, name) {
   ui('name').textContent = name;
   frame(root);
   // For inspecting from the browser console.
-  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut, voices, shout, bark, audio, startAudio, hurtNpc, panic, canSee, watch, SIGHT,
+  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut, voices, shout, bark, audio, startAudio, hurtNpc, panic, canSee, watch, SIGHT, combat, stepSoldier,
     vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, switchWeapon, throwGrenade, explode, projectiles, audio, startAudio, stepAudio, music, toggleMusic, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
