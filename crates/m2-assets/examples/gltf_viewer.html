@@ -730,13 +730,55 @@ function stepRide() {
   } else if (ride.phase === 'exit' && a.time <= 1e-3) leave();
 }
 
-// Keeps the character out of parked vehicles (their bounding boxes).
+// A vehicle's footprint, vehicle-local: its bounds, or for a helicopter
+// (whose bounds include the rotor disc) a hand-picked fuselage box.
+function footprint(v) {
+  if (v.data.flying) return { x0: -1.4, x1: 1.4, z0: v.lo.z * 0.6, z1: v.hi.z * 0.6 };
+  return { x0: v.lo.x, x1: v.hi.x, z0: v.lo.z, z1: v.hi.z };
+}
+
+// Pushes the driven vehicle `a` out of every other vehicle's footprint
+// (separating axes on the two boxes), moving `next`; returns the push.
+function pushOutOfOthers(a, next) {
+  const push = new THREE.Vector3();
+  const box = (v, pos) => {
+    const f = footprint(v), c = Math.cos(v.yaw), s = Math.sin(v.yaw);
+    const lx = (f.x0 + f.x1) / 2, lz = (f.z0 + f.z1) / 2;
+    return {
+      cx: pos.x + lx * c + lz * s, cz: pos.z - lx * s + lz * c,
+      axes: [[c, -s], [s, c]], half: [(f.x1 - f.x0) / 2, (f.z1 - f.z0) / 2],
+    };
+  };
+  for (const b of vehicles) {
+    if (b === a || Math.hypot(b.root.position.x - next.x, b.root.position.z - next.z) > 40) continue;
+    // Above it (a helicopter) or below it: no contact.
+    if (next.y > b.root.position.y + b.hi.y || next.y + a.hi.y < b.root.position.y) continue;
+    const A = box(a, next), B = box(b, b.root.position);
+    const dx = B.cx - A.cx, dz = B.cz - A.cz;
+    let best = Infinity, axis = null;
+    for (const [ux, uz] of [...A.axes, ...B.axes]) {
+      const reach = o => o.half[0] * Math.abs(o.axes[0][0] * ux + o.axes[0][1] * uz)
+        + o.half[1] * Math.abs(o.axes[1][0] * ux + o.axes[1][1] * uz);
+      const d = dx * ux + dz * uz;
+      const overlap = reach(A) + reach(B) - Math.abs(d);
+      if (overlap <= 0) { axis = null; best = 0; break; }
+      if (overlap < best) { best = overlap; axis = [ux * -Math.sign(d || 1), uz * -Math.sign(d || 1)]; }
+    }
+    if (!axis) continue;
+    next.x += axis[0] * best; next.z += axis[1] * best;
+    push.x += axis[0] * best; push.z += axis[1] * best;
+  }
+  return push;
+}
+
+// Keeps the character out of parked vehicles (their footprints).
 function pushOutOfVehicles(pos) {
   for (const v of vehicles) {
     if (v === driving || Math.hypot(pos.x - v.root.position.x, pos.z - v.root.position.z) > 15) continue;
     if (pos.y > v.root.position.y + v.hi.y) continue;
     let [lx, lz] = toLocal(v, pos.x, pos.z);
-    const x0 = v.lo.x - RADIUS, x1 = v.hi.x + RADIUS, z0 = v.lo.z - RADIUS, z1 = v.hi.z + RADIUS;
+    const f = footprint(v);
+    const x0 = f.x0 - RADIUS, x1 = f.x1 + RADIUS, z0 = f.z0 - RADIUS, z1 = f.z1 + RADIUS;
     if (lx <= x0 || lx >= x1 || lz <= z0 || lz >= z1) continue;
     const m = Math.min(lx - x0, x1 - lx, lz - z0, z1 - lz);
     if (m === lx - x0) lx = x0; else if (m === x1 - lx) lx = x1; else if (m === lz - z0) lz = z0; else lz = z1;
@@ -784,9 +826,11 @@ function drive(dt) {
     pushOut(c, r, [0.5 + r]);
     push.add(c.sub(c0));
   }
+  next.add(push);
+  // Other vehicles push back too.
+  push.add(pushOutOfOthers(v, next));
   if (push.lengthSq() > 1e-8) {
-    next.add(push);
-    // Lose the speed that went into the wall.
+    // Lose the speed that went into the wall or vehicle.
     const into = -push.clone().normalize().dot(_fwd) * Math.sign(v.speed);
     if (into > 0) v.speed *= Math.max(0, 1 - 1.5 * into);
   }
@@ -887,8 +931,9 @@ function fly(dt) {
     pushOut(c, 1.5, [1.6]);
     push.add(c.sub(c0));
   }
+  next.add(push);
+  push.add(pushOutOfOthers(v, next));
   if (push.lengthSq() > 1e-8) {
-    next.add(push);
     const n = push.clone().normalize();
     const into = v.vel.dot(n);
     if (into < 0) v.vel.addScaledVector(n, -into);
