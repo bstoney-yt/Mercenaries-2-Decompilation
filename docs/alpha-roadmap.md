@@ -121,6 +121,11 @@ only) once item 11 lands.
   and the `m2-alpha` binary (winit window, settings file, rebindable keys,
   60 Hz fixed step, free-fly camera, `--screenshot`). Skinning and
   instancing move to items 5 and 4, where they are first needed.
-- Item 3 started: `m2-engine::assets` (install discovery, models and
-  textures by hash with a block cache) and `m2-engine::model` (models and
-  textures uploaded to any backend).
+- Item 3: `m2-engine::assets` (install discovery, models and textures by
+  hash with a block cache), `m2-engine::model` (decode on any thread,
+  upload to any backend) and `m2-engine::stream` (a loader thread, nearest
+  first, uploads within a per-frame budget).
+- Item 4 started: `m2-engine::world` indexes the island from its entity
+  layers alone, and the window streams low-res tiles everywhere, detailed
+  cells within 600 m, placed models within 1.2 km and a sea plane. Still to
+  come: terrain detail layers, scatter (needs instancing).

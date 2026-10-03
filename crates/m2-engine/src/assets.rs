@@ -41,6 +41,10 @@ pub enum AssetError {
     Model { hash: u32, source: ModelError },
     #[error("texture {hash:08x}: {source}")]
     Texture { hash: u32, source: TextureError },
+    #[error("terrain {hash:08x}: {message}")]
+    Terrain { hash: u32, message: String },
+    #[error(transparent)]
+    Backend(#[from] m2_render::BackendError),
     #[error("no {kind} with hash {hash:08x}")]
     Missing { kind: &'static str, hash: u32 },
 }
@@ -190,6 +194,22 @@ impl<R: Read + Seek> AssetSource<R> {
         blocks.sort_unstable();
         blocks.dedup();
         blocks
+    }
+
+    /// The (unstreamed) asset `hash` of type `type_hash`.
+    pub fn asset(&mut self, hash: u32, type_hash: u32) -> Result<Vec<u8>, AssetError> {
+        for b in self.blocks_of(hash) {
+            let decoded = self.block(b)?;
+            for (e, data) in BlockContents::parse(&decoded)?.iter() {
+                if e.type_hash == type_hash && e.name_hash == hash && e.unk_0x08 == 0 {
+                    return Ok(data.to_vec());
+                }
+            }
+        }
+        Err(AssetError::Missing {
+            kind: "asset",
+            hash,
+        })
     }
 
     /// Model `hash` with all its streamed geometry.

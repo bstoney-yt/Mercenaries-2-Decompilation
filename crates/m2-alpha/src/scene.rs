@@ -1,11 +1,11 @@
-//! What is drawn: a ground grid and models from the install, until the
-//! island streaming replaces it.
+//! What is drawn: the streamed island, or (with `--model`) a ground grid
+//! with models from the install standing on it.
 
 use std::fs::File;
 use std::io::BufReader;
 
 use anyhow::Context as _;
-use m2_engine::{AssetSource, GpuModel, Install, MaterialCache};
+use m2_engine::{AssetSource, GpuModel, Install, MaterialCache, World, WorldSettings};
 use m2_math::glam::{Mat4, Vec3};
 use m2_render::{
     BufferUsage, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle, IndexFormat,
@@ -17,6 +17,9 @@ use m2_render::{
 /// Jennifer Mui, the playable mercenary whose model the README's export
 /// examples use.
 pub const DEFAULT_MODEL: u32 = 0x15d8_9832;
+
+/// Where the island opens: the first town, as in the viewer's examples.
+pub const DEFAULT_SPAWN: (f32, f32) = (450.0, -1950.0);
 
 /// Half the ground's width in metres.
 const GROUND_HALF: f32 = 1000.0;
@@ -31,7 +34,9 @@ pub struct Placed {
 
 #[derive(Debug)]
 pub struct Scene {
+    /// The grid, drawn when there is no island.
     ground: (VertexBufferHandle, IndexBufferHandle, MaterialId),
+    pub world: Option<World>,
     pub models: Vec<Placed>,
     pub materials: MaterialCache,
     pub source: Option<AssetSource<BufReader<File>>>,
@@ -45,10 +50,11 @@ impl Scene {
         let ground = ground(backend, &mut materials)?;
         Ok(Self {
             ground,
+            world: None,
             models: Vec::new(),
             materials,
             source: None,
-            focus: (Vec3::new(0.0, 2.0, -6.0), Vec3::new(0.0, 1.0, 0.0)),
+            focus: (Vec3::new(0.0, 2.0, 6.0), Vec3::new(0.0, 1.0, 0.0)),
         })
     }
 
@@ -62,7 +68,7 @@ impl Scene {
     }
 
     /// Loads models `hashes` and stands them in a row on the ground, 3 m
-    /// apart, facing the camera.
+    /// apart, facing the camera (models face `+z`).
     pub fn load_models(
         &mut self,
         backend: &mut dyn RenderBackend,
@@ -72,9 +78,7 @@ impl Scene {
         let mut x = 0.0;
         let mut widest = 2.0f32;
         for &hash in hashes {
-            let data = source.model(hash)?;
-            let model = data.parse()?;
-            let gpu = GpuModel::upload(backend, source, &mut self.materials, hash, &model, 0)?;
+            let gpu = GpuModel::load(backend, source, &mut self.materials, hash, 0)?;
             let (lo, hi) = gpu.bounds;
             eprintln!(
                 "model {hash:08x}: {} draws, {:.1} x {:.1} x {:.1} m{}",
@@ -103,13 +107,59 @@ impl Scene {
         }
         let centre = Vec3::new((x - 3.0).max(0.0) * 0.5, widest * 0.5, 0.0);
         self.focus = (
-            centre + Vec3::new(0.0, widest * 0.3, -widest * 1.6 - x * 0.5),
+            // Models face +z, so the camera stands on that side.
+            centre + Vec3::new(0.0, widest * 0.3, widest * 1.6 + x * 0.5),
             centre,
         );
         Ok(())
     }
 
-    pub fn draw(&self, queue: &mut DrawQueue) {
+    /// Indexes the island and starts streaming it, with the camera placed
+    /// above `(x, z)`.
+    pub fn open_world(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        install: &Install,
+        settings: WorldSettings,
+        spawn: (f32, f32),
+    ) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        let world = World::open(install, backend, &mut self.materials, settings)
+            .context("indexing the island")?;
+        eprintln!(
+            "island: {} cells, {} tiles, {} placed objects (indexed in {:.1} s)",
+            world.index.cells.len(),
+            world.index.tiles.len(),
+            world.index.objects.len(),
+            started.elapsed().as_secs_f32()
+        );
+        let (x, z) = spawn;
+        let y = world.index.rough_height(x, z) + 40.0;
+        self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));
+        self.world = Some(world);
+        Ok(())
+    }
+
+    /// Streams around `eye`.
+    pub fn update(&mut self, backend: &mut dyn RenderBackend, eye: Vec3) -> anyhow::Result<()> {
+        if let Some(world) = &mut self.world {
+            world.update(backend, &mut self.materials, eye)?;
+        }
+        Ok(())
+    }
+
+    pub fn draw(&mut self, queue: &mut DrawQueue, eye: Vec3) {
+        if let Some(world) = &mut self.world {
+            world.draw(queue, eye);
+        } else {
+            self.draw_ground(queue);
+        }
+        for p in &self.models {
+            p.model.draw(queue, p.world);
+        }
+    }
+
+    fn draw_ground(&self, queue: &mut DrawQueue) {
         let (vb, ib, material) = self.ground;
         queue.push(Primitive {
             call: DrawCall {
@@ -129,9 +179,6 @@ impl Scene {
             sort_origin: Vec3::ZERO,
             user: 0,
         });
-        for p in &self.models {
-            p.model.draw(queue, p.world);
-        }
     }
 }
 
@@ -217,9 +264,9 @@ mod tests {
     #[test]
     fn ground_draws_through_the_null_backend() {
         let mut backend = NullBackend::new();
-        let scene = Scene::new(&mut backend).unwrap();
+        let mut scene = Scene::new(&mut backend).unwrap();
         let mut queue = DrawQueue::new();
-        scene.draw(&mut queue);
+        scene.draw(&mut queue, Vec3::ZERO);
         let view = m2_render::View::default();
         backend.begin_frame(&view).unwrap();
         queue.assign_keys(&view);
