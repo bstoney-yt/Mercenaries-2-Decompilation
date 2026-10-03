@@ -27,7 +27,7 @@ use crate::backend::{
     BackendError, DrawCall, Geometry, LiveBuffers, RenderBackend, Topology, View,
 };
 use crate::buffer::{
-    IndexBufferDesc, IndexBufferHandle, IndexFormat, RawHandle, VertexBufferDesc,
+    IndexBufferDesc, IndexBufferHandle, IndexFormat, RawHandle, SkinHandle, VertexBufferDesc,
     VertexBufferHandle, VertexFormat, VertexLayout,
 };
 use crate::key::MaterialId;
@@ -35,6 +35,11 @@ use crate::texture::{BlendMode, MaterialDesc, TextureDesc, TextureFormat, Textur
 
 pub use ::wgpu;
 
+/// Bytes of a draw's uniforms: its world matrix, then the first palette
+/// matrix and the palette length.
+const DRAW_UNIFORM_SIZE: u64 = 80;
+/// Bone matrices the palette buffer starts with.
+const INITIAL_PALETTE: u64 = 1024;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Per-draw uniforms are packed at this stride (wgpu's minimum dynamic
 /// offset alignment on every backend).
@@ -168,6 +173,17 @@ struct MaterialUniforms {
     params: [f32; 4],
 }
 
+/// A frame between `begin_frame` and `end_frame`.
+#[derive(Debug)]
+struct OpenFrame {
+    view: View,
+    draws: Vec<RecordedDraw>,
+    /// Per-draw uniforms at `DRAW_STRIDE`.
+    uniforms: Vec<u8>,
+    /// Bone matrices set with `set_skin`, column-major.
+    palette: Vec<[f32; 16]>,
+}
+
 #[derive(Debug)]
 struct RecordedDraw {
     pipeline: PipelineKey,
@@ -214,6 +230,7 @@ pub struct WgpuBackend {
     frame_buffer: wgpu::Buffer,
     frame_group: wgpu::BindGroup,
     draw_buffer: wgpu::Buffer,
+    palette_buffer: wgpu::Buffer,
     draw_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
     white: wgpu::TextureView,
@@ -226,7 +243,8 @@ pub struct WgpuBackend {
     textures: Slots<Texture>,
     materials: HashMap<MaterialId, Material>,
 
-    frame: Option<(View, Vec<RecordedDraw>, Vec<u8>)>,
+    frame: Option<OpenFrame>,
+    /// Frames ended so far, which is also the number of the open frame.
     frames: u64,
 }
 
@@ -240,7 +258,7 @@ fn wgpu_vertex_format(f: VertexFormat) -> wgpu::VertexFormat {
         VertexFormat::Float2 => wgpu::VertexFormat::Float32x2,
         VertexFormat::Float3 => wgpu::VertexFormat::Float32x3,
         VertexFormat::Float4 => wgpu::VertexFormat::Float32x4,
-        VertexFormat::UNorm4x8 => wgpu::VertexFormat::Unorm8x4,
+        VertexFormat::UNorm4x8 | VertexFormat::Bgra8 => wgpu::VertexFormat::Unorm8x4,
         VertexFormat::UInt4x8 => wgpu::VertexFormat::Uint8x4,
         VertexFormat::Half2 => wgpu::VertexFormat::Float16x2,
         VertexFormat::Half4 => wgpu::VertexFormat::Float16x4,
@@ -393,7 +411,19 @@ impl WgpuBackend {
         });
         let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("draw"),
-            entries: &[uniform_entry(0, true)],
+            entries: &[
+                uniform_entry(0, true),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("material"),
@@ -440,7 +470,9 @@ impl WgpuBackend {
                 resource: frame_buffer.as_entire_binding(),
             }],
         });
-        let (draw_buffer, draw_group) = Self::draw_uniforms(&device, &draw_layout, 1024);
+        let draw_buffer = Self::draw_uniforms(&device, 1024);
+        let palette_buffer = Self::palette(&device, INITIAL_PALETTE);
+        let draw_group = Self::draw_group(&device, &draw_layout, &draw_buffer, &palette_buffer);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("base"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -495,6 +527,7 @@ impl WgpuBackend {
             frame_buffer,
             frame_group,
             draw_buffer,
+            palette_buffer,
             draw_group,
             sampler,
             white,
@@ -509,30 +542,48 @@ impl WgpuBackend {
         }
     }
 
-    fn draw_uniforms(
-        device: &wgpu::Device,
-        layout: &wgpu::BindGroupLayout,
-        draws: u64,
-    ) -> (wgpu::Buffer, wgpu::BindGroup) {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    fn draw_uniforms(device: &wgpu::Device, draws: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("draw uniforms"),
             size: draws * DRAW_STRIDE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        })
+    }
+
+    fn palette(device: &wgpu::Device, matrices: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bone palette"),
+            size: matrices * 64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn draw_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        uniforms: &wgpu::Buffer,
+        palette: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draw"),
             layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(64),
-                }),
-            }],
-        });
-        (buffer, group)
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: uniforms,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(DRAW_UNIFORM_SIZE),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: palette.as_entire_binding(),
+                },
+            ],
+        })
     }
 
     fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
@@ -1132,8 +1183,29 @@ impl RenderBackend for WgpuBackend {
         if self.frame.is_some() {
             return Err(BackendError::FrameAlreadyOpen);
         }
-        self.frame = Some((*view, Vec::new(), Vec::new()));
+        self.frame = Some(OpenFrame {
+            view: *view,
+            draws: Vec::new(),
+            uniforms: Vec::new(),
+            palette: Vec::new(),
+        });
         Ok(())
+    }
+
+    fn set_skin(&mut self, matrices: &[Mat4]) -> Result<SkinHandle, BackendError> {
+        let frame = self
+            .frame
+            .as_mut()
+            .ok_or(BackendError::NotInFrame("set_skin"))?;
+        let handle = SkinHandle {
+            frame: self.frames,
+            first: frame.palette.len() as u32,
+            count: matrices.len() as u32,
+        };
+        frame
+            .palette
+            .extend(matrices.iter().map(|m| m.to_cols_array()));
+        Ok(handle)
     }
 
     fn draw(&mut self, call: &DrawCall) -> Result<(), BackendError> {
@@ -1154,13 +1226,28 @@ impl RenderBackend for WgpuBackend {
                 self.index_buffers.get(buffer.0)?.desc.index_count,
             )?,
         }
+        let (first, count) = match call.skin {
+            Some(skin) => {
+                if skin.frame != self.frames {
+                    return Err(BackendError::StaleSkin {
+                        skin_frame: skin.frame,
+                        frame: self.frames,
+                    });
+                }
+                let available = self.frame.as_ref().map_or(0, |f| f.palette.len() as u32);
+                check_range(skin.first, skin.count, available)?;
+                (skin.first, skin.count)
+            }
+            None => (0, 0),
+        };
         let key = self.pipeline_key(call)?;
         self.ensure_pipeline(&key)?;
-        let (_, draws, uniforms) = self.frame.as_mut().expect("checked above");
-        let world: Mat4 = call.world;
-        uniforms.extend_from_slice(bytemuck::cast_slice(&world.to_cols_array()));
+        let frame = self.frame.as_mut().expect("checked above");
+        let uniforms = &mut frame.uniforms;
+        uniforms.extend_from_slice(bytemuck::cast_slice(&call.world.to_cols_array()));
+        uniforms.extend_from_slice(bytemuck::cast_slice(&[first, count, 0, 0]));
         uniforms.resize(uniforms.len().next_multiple_of(DRAW_STRIDE as usize), 0);
-        draws.push(RecordedDraw {
+        frame.draws.push(RecordedDraw {
             pipeline: key,
             vertex_buffer: call.vertex_buffer,
             geometry: call.geometry,
@@ -1170,17 +1257,43 @@ impl RenderBackend for WgpuBackend {
     }
 
     fn end_frame(&mut self) -> Result<(), BackendError> {
-        let (view, draws, uniforms) = self
+        let OpenFrame {
+            view,
+            draws,
+            uniforms,
+            palette,
+        } = self
             .frame
             .take()
             .ok_or(BackendError::NotInFrame("end_frame"))?;
+        // Counted even if the frame is skipped below, so palettes set for it
+        // are never accepted by the next.
+        self.frames += 1;
+        let mut regroup = false;
         if uniforms.len() as u64 > self.draw_buffer.size() {
             let draws = (uniforms.len() as u64 / DRAW_STRIDE).next_power_of_two();
-            (self.draw_buffer, self.draw_group) =
-                Self::draw_uniforms(&self.device, &self.draw_layout, draws);
+            self.draw_buffer = Self::draw_uniforms(&self.device, draws);
+            regroup = true;
+        }
+        if palette.len() as u64 * 64 > self.palette_buffer.size() {
+            self.palette_buffer =
+                Self::palette(&self.device, (palette.len() as u64).next_power_of_two());
+            regroup = true;
+        }
+        if regroup {
+            self.draw_group = Self::draw_group(
+                &self.device,
+                &self.draw_layout,
+                &self.draw_buffer,
+                &self.palette_buffer,
+            );
         }
         if !uniforms.is_empty() {
             self.queue.write_buffer(&self.draw_buffer, 0, &uniforms);
+        }
+        if !palette.is_empty() {
+            self.queue
+                .write_buffer(&self.palette_buffer, 0, bytemuck::cast_slice(&palette));
         }
         match &self.target {
             Target::Offscreen { texture, .. } => {
@@ -1207,7 +1320,6 @@ impl RenderBackend for WgpuBackend {
                 self.queue.present(frame);
             }
         }
-        self.frames += 1;
         Ok(())
     }
 }

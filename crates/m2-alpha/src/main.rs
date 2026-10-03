@@ -1,7 +1,8 @@
 //! `m2-alpha`: the native game, playing from the player's own install.
 //!
 //! ```text
-//! m2-alpha [--install <dir>] [--spawn <x>,<z>] [--model <hash>]... [--config <file>]
+//! m2-alpha [--install <dir>] [--spawn <x>,<z>] [--model <hash>]... [--gait <gait>]
+//!          [--config <file>]
 //!          [--size <w>x<h>] [--vsync on|off] [--fullscreen]
 //!          [--screenshot <out.ppm>] [--write-config]
 //! ```
@@ -15,7 +16,9 @@
 //! Right now this opens a window with a free-flying camera over the island,
 //! streamed from the install around the camera (`--spawn` picks where to
 //! start; the default is the first town). With `--model` it shows those
-//! models on a ground grid instead. Tab or the right mouse button captures
+//! models on a ground grid instead, characters playing the game's
+//! locomotion clips in place (N steps through idle, walk, run and sprint;
+//! `--gait` picks the first). Tab or the right mouse button captures
 //! the mouse, WASD/Space/C fly, Shift speeds up, F11 toggles fullscreen, F3
 //! toggles back-face culling, Escape releases the mouse, then quits.
 
@@ -29,7 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
-use m2_engine::{Install, WorldSettings};
+use m2_engine::{Gait, Install, WorldSettings};
 use m2_render::gpu::WgpuBackend;
 use m2_render::{DrawQueue, RenderBackend};
 use winit::application::ApplicationHandler;
@@ -56,6 +59,7 @@ struct Options {
     install: Option<PathBuf>,
     models: Vec<u32>,
     spawn: Option<(f32, f32)>,
+    gait: Option<Gait>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
     fullscreen: bool,
@@ -82,6 +86,15 @@ fn parse_args() -> anyhow::Result<Options> {
                 let v = value()?;
                 let (x, z) = v.split_once(',').context("--spawn expects X,Z")?;
                 o.spawn = Some((x.trim().parse()?, z.trim().parse()?));
+            }
+            "--gait" => {
+                o.gait = Some(match value()?.as_str() {
+                    "idle" => Gait::Idle,
+                    "walk" => Gait::Walk,
+                    "run" => Gait::Run,
+                    "sprint" => Gait::Sprint,
+                    v => bail!("--gait {v}: expected idle, walk, run or sprint"),
+                });
             }
             "--size" => {
                 let v = value()?;
@@ -142,12 +155,13 @@ fn main() -> anyhow::Result<()> {
     };
     // No models named: the island (or, without an install, Jennifer's
     // grid, which shows only the ground).
+    let gait = options.gait.unwrap_or(Gait::Idle);
     let mode = if !options.models.is_empty() {
-        Mode::Models(options.models.clone())
+        Mode::Models(options.models.clone(), gait)
     } else if install.is_some() {
         Mode::Island(options.spawn.unwrap_or(scene::DEFAULT_SPAWN))
     } else {
-        Mode::Models(vec![scene::DEFAULT_MODEL])
+        Mode::Models(vec![scene::DEFAULT_MODEL], gait)
     };
 
     if let Some(out) = &options.screenshot {
@@ -175,8 +189,8 @@ fn main() -> anyhow::Result<()> {
 enum Mode {
     /// The streamed island, starting above (x, z).
     Island((f32, f32)),
-    /// These models on a ground grid.
-    Models(Vec<u32>),
+    /// These models on a ground grid, characters in this gait.
+    Models(Vec<u32>, Gait),
 }
 
 /// Builds the scene on `backend` and points a camera at it.
@@ -191,9 +205,9 @@ fn build_scene(
             Mode::Island(spawn) => {
                 scene.open_world(backend, install, WorldSettings::default(), *spawn)?;
             }
-            Mode::Models(models) => {
+            Mode::Models(models, gait) => {
                 scene.open(install)?;
-                if let Err(e) = scene.load_models(backend, models) {
+                if let Err(e) = scene.load_models(backend, models, *gait) {
                     eprintln!("could not load models: {e:#}");
                 }
             }
@@ -217,8 +231,8 @@ fn render(
     }
     scene.update(backend, camera.position)?;
     let mut queue = DrawQueue::new();
-    scene.draw(&mut queue, camera.position);
     backend.begin_frame(&view)?;
+    scene.draw(backend, &mut queue, camera.position)?;
     queue.flush(&view, backend)?;
     backend.end_frame()?;
     Ok(())
@@ -237,6 +251,8 @@ fn screenshot(
     let (mut scene, camera) = build_scene(&mut backend, install, mode)?;
     let fov = config.camera.fov;
     let aspect = w as f32 / h as f32;
+    // Characters a little way into their clip, mid-stride when moving.
+    scene.tick(0.4);
     render(&mut backend, &mut scene, &camera, fov, aspect)?;
     // Let the island stream in before the picture is taken.
     let started = Instant::now();
@@ -389,6 +405,9 @@ impl Running {
             self.window
                 .set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
         }
+        if self.input.take_pressed(Action::NextGait) {
+            self.scene.cycle_gaits();
+        }
         if self.input.take_pressed(Action::ToggleCulling) {
             self.culling = !self.culling;
             if let Err(e) = self
@@ -409,6 +428,7 @@ impl Running {
             self.mouse_look,
             TICK.as_secs_f32(),
         );
+        self.scene.tick(TICK.as_secs_f32());
     }
 }
 

@@ -20,8 +20,8 @@ use m2_assets::vertex::DeclUsage;
 use m2_math::glam::{Mat4, Vec3};
 use m2_render::{
     BackendError, BlendMode, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
-    Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, TextureDesc, TextureFormat,
-    TextureHandle, VertexBufferDesc, VertexBufferHandle, generate_mips,
+    Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, SkinHandle, TextureDesc,
+    TextureFormat, TextureHandle, VertexBufferDesc, VertexBufferHandle, generate_mips,
 };
 
 use crate::assets::{AssetSource, DecodedTexture};
@@ -215,6 +215,9 @@ pub struct CpuPiece {
     pub ranges: Vec<(u32, u32, usize)>,
     /// Model-space centre, for sorting.
     pub centre: Vec3,
+    /// For skinned geometry, the node each blend index names; empty for
+    /// rigid geometry.
+    pub bones: Vec<u16>,
 }
 
 /// A model's geometry at one level of detail, decoded but not uploaded.
@@ -242,6 +245,7 @@ impl CpuModel {
         let mut hi = Vec3::splat(f32::MIN);
         for (segment, geometry) in model.lod(lod) {
             // Skinned positions are already in model space.
+            let skinned = geometry.kind == GeometryKind::Skin;
             let local = match geometry.kind {
                 GeometryKind::Skin => Mat4::IDENTITY,
                 _ => model.node_to_model(segment.node).unwrap_or(Mat4::IDENTITY),
@@ -290,6 +294,11 @@ impl CpuModel {
                     local,
                     ranges,
                     centre,
+                    bones: if skinned {
+                        group.info.bone_nodes()
+                    } else {
+                        Vec::new()
+                    },
                 });
             }
         }
@@ -319,6 +328,7 @@ struct Piece {
     local: Mat4,
     ranges: Vec<(u32, u32, MaterialId)>,
     centre: Vec3,
+    bones: Vec<u16>,
 }
 
 /// A model's geometry on the GPU, ready to draw.
@@ -359,6 +369,7 @@ impl GpuModel {
                     })
                     .collect(),
                 centre: p.centre,
+                bones: p.bones.clone(),
             });
         }
         Ok(Self {
@@ -384,31 +395,70 @@ impl GpuModel {
         Ok(Self::upload(backend, materials, &cpu)?)
     }
 
-    /// Queues every piece at `world`.
+    /// Queues every piece at `world`, skinned geometry in its bind pose.
     pub fn draw(&self, queue: &mut DrawQueue, world: Mat4) {
         for piece in &self.pieces {
-            let transform = world * piece.local;
-            let origin = world.transform_point3(piece.centre);
-            for &(first, count, material) in &piece.ranges {
-                queue.push(Primitive {
-                    call: DrawCall {
-                        material,
-                        topology: TOPOLOGY,
-                        vertex_buffer: piece.vertex_buffer,
-                        geometry: Geometry::Indexed {
-                            buffer: piece.index_buffer,
-                            first,
-                            count,
-                            base_vertex: 0,
-                        },
-                        world: transform,
+            Self::push(queue, piece, world, None);
+        }
+    }
+
+    /// Whether any piece is skinned.
+    pub fn is_skinned(&self) -> bool {
+        self.pieces.iter().any(|p| !p.bones.is_empty())
+    }
+
+    /// Queues every piece at `world`, skinned geometry posed by `skin`
+    /// (per node, as [`Skeleton::skin_matrices`](crate::Skeleton::skin_matrices)
+    /// returns). Palettes are set on `backend`, so call this inside a frame.
+    pub fn draw_posed(
+        &self,
+        backend: &mut dyn RenderBackend,
+        queue: &mut DrawQueue,
+        world: Mat4,
+        skin: &[Mat4],
+    ) -> Result<(), BackendError> {
+        let mut palette = Vec::new();
+        for piece in &self.pieces {
+            let handle = if piece.bones.is_empty() {
+                None
+            } else {
+                palette.clear();
+                palette.extend(
+                    piece
+                        .bones
+                        .iter()
+                        .map(|&n| skin.get(usize::from(n)).copied().unwrap_or(Mat4::IDENTITY)),
+                );
+                Some(backend.set_skin(&palette)?)
+            };
+            Self::push(queue, piece, world, handle);
+        }
+        Ok(())
+    }
+
+    fn push(queue: &mut DrawQueue, piece: &Piece, world: Mat4, skin: Option<SkinHandle>) {
+        let transform = world * piece.local;
+        let origin = world.transform_point3(piece.centre);
+        for &(first, count, material) in &piece.ranges {
+            queue.push(Primitive {
+                call: DrawCall {
+                    material,
+                    topology: TOPOLOGY,
+                    vertex_buffer: piece.vertex_buffer,
+                    geometry: Geometry::Indexed {
+                        buffer: piece.index_buffer,
+                        first,
+                        count,
+                        base_vertex: 0,
                     },
-                    layer: Layer::WORLD,
-                    translucent: false,
-                    sort_origin: origin,
-                    user: 0,
-                });
-            }
+                    world: transform,
+                    skin,
+                },
+                layer: Layer::WORLD,
+                translucent: false,
+                sort_origin: origin,
+                user: 0,
+            });
         }
     }
 

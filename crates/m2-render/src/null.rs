@@ -4,11 +4,12 @@
 
 use crate::backend::{BackendError, DrawCall, Geometry, LiveBuffers, RenderBackend, View};
 use crate::buffer::{
-    IndexBufferDesc, IndexBufferHandle, IndexFormat, RawHandle, VertexBufferDesc,
+    IndexBufferDesc, IndexBufferHandle, IndexFormat, RawHandle, SkinHandle, VertexBufferDesc,
     VertexBufferHandle,
 };
 use crate::key::MaterialId;
 use crate::texture::{MaterialDesc, TextureDesc, TextureHandle};
+use m2_math::glam::Mat4;
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -150,6 +151,8 @@ pub struct NullBackend {
     materials: HashMap<MaterialId, MaterialDesc>,
     in_frame: bool,
     frames: u64,
+    /// Palette matrices set this frame.
+    skin_matrices: u32,
 }
 
 impl NullBackend {
@@ -182,6 +185,15 @@ impl NullBackend {
     fn validate_draw(&self, call: &DrawCall) -> Result<(), BackendError> {
         if let Some(t) = self.material(call.material).texture {
             self.textures.get(t.0)?;
+        }
+        if let Some(skin) = call.skin {
+            if skin.frame != self.frames {
+                return Err(BackendError::StaleSkin {
+                    skin_frame: skin.frame,
+                    frame: self.frames,
+                });
+            }
+            check_range(skin.first, skin.count, self.skin_matrices)?;
         }
         let vb = self.vertex_buffers.get(call.vertex_buffer.0)?;
         let vertex_count = vb.desc.vertex_count;
@@ -312,7 +324,21 @@ impl RenderBackend for NullBackend {
             return Err(BackendError::FrameAlreadyOpen);
         }
         self.in_frame = true;
+        self.skin_matrices = 0;
         Ok(())
+    }
+
+    fn set_skin(&mut self, matrices: &[Mat4]) -> Result<SkinHandle, BackendError> {
+        if !self.in_frame {
+            return Err(BackendError::NotInFrame("set_skin"));
+        }
+        let handle = SkinHandle {
+            frame: self.frames,
+            first: self.skin_matrices,
+            count: matrices.len() as u32,
+        };
+        self.skin_matrices += matrices.len() as u32;
+        Ok(handle)
     }
 
     fn draw(&mut self, call: &DrawCall) -> Result<(), BackendError> {
@@ -362,6 +388,7 @@ pub enum Command {
     },
     DestroyTexture(TextureHandle),
     SetMaterial(MaterialId, MaterialDesc),
+    SetSkin(SkinHandle),
     BeginFrame(View),
     Draw(DrawCall),
     EndFrame,
@@ -508,6 +535,11 @@ impl RenderBackend for RecordingBackend {
     fn begin_frame(&mut self, view: &View) -> Result<(), BackendError> {
         let result = self.inner.begin_frame(view);
         self.log(result, |()| Command::BeginFrame(*view))
+    }
+
+    fn set_skin(&mut self, matrices: &[Mat4]) -> Result<SkinHandle, BackendError> {
+        let result = self.inner.set_skin(matrices);
+        self.log(result, |&h| Command::SetSkin(h))
     }
 
     fn draw(&mut self, call: &DrawCall) -> Result<(), BackendError> {

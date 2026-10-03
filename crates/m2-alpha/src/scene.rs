@@ -5,7 +5,11 @@ use std::fs::File;
 use std::io::BufReader;
 
 use anyhow::Context as _;
-use m2_engine::{AssetSource, GpuModel, Install, MaterialCache, World, WorldSettings};
+use m2_engine::anim::load_clips;
+use m2_engine::{
+    Animator, AssetSource, BoundClip, Gait, GpuModel, Install, Locomotion, MaterialCache, Skeleton,
+    World, WorldSettings,
+};
 use m2_math::glam::{Mat4, Vec3};
 use m2_render::{
     BufferUsage, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle, IndexFormat,
@@ -30,6 +34,55 @@ const GRID_TILE: f32 = 4.0;
 pub struct Placed {
     pub model: GpuModel,
     pub world: Mat4,
+    /// Skinned models play the game's locomotion clips in place.
+    pub rig: Option<Rig>,
+}
+
+/// A skinned model's skeleton, the clips that fit it, and what it plays.
+#[derive(Debug)]
+pub struct Rig {
+    pub skeleton: Skeleton,
+    pub clips: Vec<BoundClip>,
+    pub locomotion: Option<Locomotion>,
+    pub animator: Animator,
+    pub gait: Gait,
+}
+
+impl Rig {
+    fn new(skeleton: Skeleton, clips: Vec<BoundClip>, gait: Gait) -> Self {
+        let locomotion = Locomotion::choose(&clips);
+        let mut rig = Self {
+            skeleton,
+            clips,
+            locomotion,
+            animator: Animator::default(),
+            gait,
+        };
+        rig.set_gait(gait);
+        rig
+    }
+
+    pub fn set_gait(&mut self, gait: Gait) {
+        self.gait = gait;
+        if let Some(&clip) = self.locomotion.as_ref().and_then(|l| l.clips.get(&gait)) {
+            self.animator.play(clip);
+        }
+    }
+
+    /// The next gait, slowest after fastest.
+    pub fn cycle_gait(&mut self) {
+        self.set_gait(match self.gait {
+            Gait::Idle => Gait::Walk,
+            Gait::Walk => Gait::Run,
+            Gait::Run => Gait::Sprint,
+            Gait::Sprint => Gait::Idle,
+        });
+    }
+
+    fn skin(&self) -> Vec<Mat4> {
+        self.skeleton
+            .skin_matrices(&self.animator.pose(&self.skeleton, &self.clips))
+    }
 }
 
 #[derive(Debug)]
@@ -73,12 +126,40 @@ impl Scene {
         &mut self,
         backend: &mut dyn RenderBackend,
         hashes: &[u32],
+        gait: Gait,
     ) -> anyhow::Result<()> {
         let source = self.source.as_mut().context("no install open")?;
         let mut x = 0.0;
         let mut widest = 2.0f32;
         for &hash in hashes {
             let gpu = GpuModel::load(backend, source, &mut self.materials, hash, 0)?;
+            let rig = if gpu.is_skinned() {
+                let started = std::time::Instant::now();
+                let skeleton = Skeleton::from_nodes(&source.model(hash)?.parse()?.nodes);
+                let clips = load_clips(source, &skeleton, &[""])?;
+                let rig = Rig::new(skeleton, clips, gait);
+                eprintln!(
+                    "model {hash:08x}: {} bones, {} clips fit ({:.1} s), locomotion {}",
+                    rig.skeleton.len(),
+                    rig.clips.len(),
+                    started.elapsed().as_secs_f32(),
+                    match &rig.locomotion {
+                        Some(l) => format!("{:?}", {
+                            let mut c: Vec<_> = l
+                                .clips
+                                .iter()
+                                .map(|(g, &i)| (*g, format!("{:08x}", rig.clips[i].hash)))
+                                .collect();
+                            c.sort();
+                            c
+                        }),
+                        None => "not found".into(),
+                    }
+                );
+                Some(rig)
+            } else {
+                None
+            };
             let (lo, hi) = gpu.bounds;
             eprintln!(
                 "model {hash:08x}: {} draws, {:.1} x {:.1} x {:.1} m{}",
@@ -102,6 +183,7 @@ impl Scene {
             self.models.push(Placed {
                 model: gpu,
                 world: Mat4::from_translation(offset),
+                rig,
             });
             x += size.x.max(1.0) + 3.0;
         }
@@ -148,15 +230,41 @@ impl Scene {
         Ok(())
     }
 
-    pub fn draw(&mut self, queue: &mut DrawQueue, eye: Vec3) {
+    /// Advances animation by `dt` seconds.
+    pub fn tick(&mut self, dt: f32) {
+        for rig in self.models.iter_mut().filter_map(|p| p.rig.as_mut()) {
+            rig.animator.advance(dt);
+        }
+    }
+
+    /// Steps every rig to its next gait.
+    pub fn cycle_gaits(&mut self) {
+        for rig in self.models.iter_mut().filter_map(|p| p.rig.as_mut()) {
+            rig.cycle_gait();
+            eprintln!("gait: {:?}", rig.gait);
+        }
+    }
+
+    /// Queues the frame's draws; call inside the backend's frame, as skinned
+    /// models set their palettes on it.
+    pub fn draw(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        queue: &mut DrawQueue,
+        eye: Vec3,
+    ) -> anyhow::Result<()> {
         if let Some(world) = &mut self.world {
             world.draw(queue, eye);
         } else {
             self.draw_ground(queue);
         }
         for p in &self.models {
-            p.model.draw(queue, p.world);
+            match &p.rig {
+                Some(rig) => p.model.draw_posed(backend, queue, p.world, &rig.skin())?,
+                None => p.model.draw(queue, p.world),
+            }
         }
+        Ok(())
     }
 
     fn draw_ground(&self, queue: &mut DrawQueue) {
@@ -173,6 +281,7 @@ impl Scene {
                     base_vertex: 0,
                 },
                 world: Mat4::IDENTITY,
+                skin: None,
             },
             layer: Layer::WORLD,
             translucent: false,
@@ -266,9 +375,9 @@ mod tests {
         let mut backend = NullBackend::new();
         let mut scene = Scene::new(&mut backend).unwrap();
         let mut queue = DrawQueue::new();
-        scene.draw(&mut queue, Vec3::ZERO);
         let view = m2_render::View::default();
         backend.begin_frame(&view).unwrap();
+        scene.draw(&mut backend, &mut queue, Vec3::ZERO).unwrap();
         queue.assign_keys(&view);
         queue.sort().unwrap();
         assert_eq!(queue.submit(&mut backend).unwrap().draws, 1);

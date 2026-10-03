@@ -13,7 +13,9 @@
 
 use m2_math::glam::{Mat4, Vec3};
 
-use crate::buffer::{IndexBufferDesc, IndexBufferHandle, VertexBufferDesc, VertexBufferHandle};
+use crate::buffer::{
+    IndexBufferDesc, IndexBufferHandle, SkinHandle, VertexBufferDesc, VertexBufferHandle,
+};
 use crate::key::MaterialId;
 use crate::texture::{MaterialDesc, TextureDesc, TextureHandle};
 
@@ -54,6 +56,10 @@ pub struct DrawCall {
     /// Object to world, in glam's column-vector convention. Convert from the
     /// engine's D3DX row-vector matrices with `Mat4::from(RawMatrix44)`.
     pub world: Mat4,
+    /// Bone palette for skinned vertices: blend index `i` picks matrix `i`,
+    /// which takes a vertex from bind pose to posed object space. `None`
+    /// draws skinned vertices in their bind pose.
+    pub skin: Option<SkinHandle>,
 }
 
 /// Light and atmosphere for a frame.
@@ -175,6 +181,8 @@ pub enum BackendError {
         end: u64,
         available: u64,
     },
+    #[error("skin palette from frame {skin_frame} used in frame {frame}")]
+    StaleSkin { skin_frame: u64, frame: u64 },
     #[error("{0} called outside begin_frame/end_frame")]
     NotInFrame(&'static str),
     #[error("begin_frame called while a frame is already open")]
@@ -242,6 +250,9 @@ pub trait RenderBackend {
 
     /// Opens a frame rendered from `view`. Draws are only valid inside a frame.
     fn begin_frame(&mut self, view: &View) -> Result<(), BackendError>;
+
+    /// Stores a bone palette for this frame's skinned draws.
+    fn set_skin(&mut self, matrices: &[Mat4]) -> Result<SkinHandle, BackendError>;
 
     fn draw(&mut self, call: &DrawCall) -> Result<(), BackendError>;
 

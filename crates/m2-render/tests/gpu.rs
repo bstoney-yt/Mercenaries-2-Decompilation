@@ -102,6 +102,7 @@ fn draw(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32, world: Mat
             base_vertex: 0,
         },
         world,
+        skin: None,
     }
 }
 
@@ -257,4 +258,87 @@ fn odd_index_writes_keep_their_neighbours() {
     let rgba = b.read_pixels().unwrap();
     assert_eq!(pixel(&rgba, 24, 40), [255; 4]);
     assert_eq!(pixel(&rgba, 40, 24), [255; 4]);
+}
+
+#[test]
+fn skinned_vertices_follow_their_bones() {
+    use VertexFormat::*;
+    use VertexSemantic::*;
+    let Some(mut b) = backend() else { return };
+    let layout = VertexLayout::packed(&[
+        (Position, Float3),
+        (Color, Bgra8),
+        (BlendIndices, UInt4x8),
+        (BlendWeight, UNorm4x8),
+    ])
+    .unwrap();
+    // A small quad bound wholly to bone 1, coloured red stored B, G, R, A.
+    let mut vertices = Vec::new();
+    for (x, y) in [
+        (-0.25f32, 0.25f32),
+        (0.25, 0.25),
+        (0.25, -0.25),
+        (-0.25, -0.25),
+    ] {
+        for f in [x, y, 0.0] {
+            vertices.extend(f.to_le_bytes());
+        }
+        vertices.extend([0, 0, 255, 255, 1, 0, 0, 0, 255, 0, 0, 0]);
+    }
+    let vb = b
+        .create_vertex_buffer(
+            &VertexBufferDesc {
+                layout,
+                vertex_count: 4,
+                usage: BufferUsage::Static,
+            },
+            Some(&vertices),
+        )
+        .unwrap();
+    let (_, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            lit: false,
+            vertex_color: true,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    let red = [255, 0, 0, 255];
+    let sky = [0, 0, 255, 255];
+
+    // Bind pose without a palette.
+    b.begin_frame(&view()).unwrap();
+    b.draw(&draw(vb, ib, 1, Mat4::IDENTITY)).unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    assert_eq!(pixel(&rgba, 32, 32), red, "bind pose");
+
+    // Bone 1 moves the quad right.
+    b.begin_frame(&view()).unwrap();
+    let skin = b
+        .set_skin(&[
+            Mat4::IDENTITY,
+            Mat4::from_translation(Vec3::new(0.6, 0.0, 0.0)),
+        ])
+        .unwrap();
+    b.draw(&DrawCall {
+        skin: Some(skin),
+        ..draw(vb, ib, 1, Mat4::IDENTITY)
+    })
+    .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    assert_eq!(pixel(&rgba, 32, 32), sky, "moved away");
+    assert_eq!(pixel(&rgba, 43, 32), red, "moved right");
+
+    // A palette lasts one frame.
+    b.begin_frame(&view()).unwrap();
+    let stale = b.draw(&DrawCall {
+        skin: Some(skin),
+        ..draw(vb, ib, 1, Mat4::IDENTITY)
+    });
+    assert!(matches!(stale, Err(BackendError::StaleSkin { .. })));
+    b.end_frame().unwrap();
 }
