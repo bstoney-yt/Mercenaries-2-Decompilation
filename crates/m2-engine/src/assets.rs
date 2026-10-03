@@ -267,7 +267,7 @@ impl<R: Read + Seek> AssetSource<R> {
         let err = |source| AssetError::Texture { hash, source };
         let tex = Texture::parse(&base).map_err(err)?;
         let format = tex.info.format;
-        let alpha = matches!(
+        let has_alpha = matches!(
             format,
             PixelFormat::Dxt3 | PixelFormat::Dxt5 | PixelFormat::A8R8G8B8
         );
@@ -302,6 +302,7 @@ impl<R: Read + Seek> AssetSource<R> {
                 kind: "texture mip",
                 hash,
             })?;
+        let alpha = has_alpha && mips.first().is_some_and(|m| looks_cut_out(m));
         Ok(DecodedTexture {
             width,
             height,
@@ -311,8 +312,39 @@ impl<R: Read + Seek> AssetSource<R> {
     }
 }
 
+/// Whether an RGBA8 image's alpha cuts shapes out (leaves, fences: some
+/// pixels clear, most fully clear or fully solid) rather than holding a
+/// mask for something else (shine, dirt), which is mostly in between.
+pub fn looks_cut_out(rgba: &[u8]) -> bool {
+    let n = rgba.len() / 4;
+    if n == 0 {
+        return false;
+    }
+    let (mut clear, mut between) = (0usize, 0usize);
+    for p in rgba.chunks_exact(4) {
+        if p[3] < 128 {
+            clear += 1;
+        }
+        if (32..224).contains(&p[3]) {
+            between += 1;
+        }
+    }
+    clear * 100 >= n && between * 100 <= n * 35
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cut_outs_are_mostly_clear_or_solid() {
+        let image =
+            |alphas: &[u8]| -> Vec<u8> { alphas.iter().flat_map(|&a| [9, 9, 9, a]).collect() };
+        assert!(super::looks_cut_out(&image(&[0, 0, 255, 255, 255, 128])));
+        // A shine mask: all in between.
+        assert!(!super::looks_cut_out(&image(&[60, 90, 120, 150, 200, 100])));
+        // Solid everywhere.
+        assert!(!super::looks_cut_out(&image(&[255; 8])));
+    }
+
     use super::*;
 
     #[test]

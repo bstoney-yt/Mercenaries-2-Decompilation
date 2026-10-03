@@ -1,5 +1,5 @@
 //! Drivable vehicles: what the island's vehicle models are, how they are
-//! built, and how they drive.
+//! built, and how they drive. [`catalogue`] also finds the person models.
 //!
 //! [`catalogue`] finds the vehicle models in the archive by their texture
 //! names, and [`VehicleSpec`] reads one model's wheels, seat and door with
@@ -35,14 +35,37 @@ pub struct CatalogueEntry {
 /// Ground vehicle kinds offered for driving, in the order to offer them.
 pub const DRIVABLE: [&str; 7] = ["car", "truck", "apc", "tank", "bus", "van", "semi"];
 
-/// Every vehicle model in the archive, found by texture name. This reads
-/// every block, so run it off the main thread.
-pub fn catalogue<R: Read + Seek>(
-    source: &mut AssetSource<R>,
-) -> Result<Vec<CatalogueEntry>, AssetError> {
+/// A person model: one per role, by texture name
+/// (`<faction>_hum_<role>_..`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonModel {
+    pub model: u32,
+    /// `vz_hum_soldier`, `civ_hum_female`, ...
+    pub role: String,
+    pub soldier: bool,
+}
+
+/// The vehicle and person models the archive holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Catalogue {
+    pub vehicles: Vec<CatalogueEntry>,
+    /// One model per role, soldiers and civilians; not the player
+    /// characters (`pmc_`).
+    pub people: Vec<PersonModel>,
+}
+
+/// Root node of every human skeleton.
+const HUMAN_ROOT: u32 = 0xcbc1_eb51;
+/// Model flag of skinned models.
+const SKINNED: u32 = 0x800;
+
+/// Every vehicle and person model in the archive, found by texture name.
+/// This reads every block, so run it off the main thread.
+pub fn catalogue<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<Catalogue, AssetError> {
     let blocks = source.archive().index().blocks().len();
     let mut texture_names: HashMap<u32, String> = HashMap::new();
-    let mut model_textures: Vec<(u32, Vec<u32>)> = Vec::new();
+    // (model, textures, human)
+    let mut model_textures: Vec<(u32, Vec<u32>, bool)> = Vec::new();
     for b in 0..blocks {
         let decoded = source.block(b)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -54,12 +77,15 @@ pub fn catalogue<R: Read + Seek>(
                 }
                 MODEL_TYPE if e.unk_0x08 == 0 => {
                     if let Ok(m) = Model::parse(data) {
+                        let human = m.info.flags & SKINNED != 0
+                            && m.nodes.first().map(|n| n.name_hash) == Some(HUMAN_ROOT);
                         model_textures.push((
                             e.name_hash,
                             m.materials
                                 .iter()
                                 .flat_map(|mt| mt.textures.iter().copied())
                                 .collect(),
+                            human,
                         ));
                     }
                 }
@@ -67,17 +93,34 @@ pub fn catalogue<R: Read + Seek>(
             }
         }
     }
-    let mut out: Vec<CatalogueEntry> = model_textures
-        .into_iter()
-        .filter_map(|(model, textures)| {
-            let names = textures
-                .iter()
-                .filter_map(|t| texture_names.get(t).map(String::as_str));
-            let (kind, label) = vehicle::kind_from_textures(names)?;
-            Some(CatalogueEntry { model, kind, label })
-        })
-        .collect();
-    out.sort_by(|a, b| (&a.kind, &a.label, a.model).cmp(&(&b.kind, &b.label, b.model)));
+    let mut out = Catalogue::default();
+    for (model, textures, human) in model_textures {
+        let mut names = textures
+            .iter()
+            .filter_map(|t| texture_names.get(t).map(String::as_str));
+        if human {
+            let Some(name) = names.find(|n| n.contains("_hum_")) else {
+                continue;
+            };
+            let words: Vec<&str> = name.split('_').collect();
+            if words.len() < 3 || words[0] == "pmc" || name.contains("chicken") {
+                continue;
+            }
+            let role = words[..3].join("_");
+            if !out.people.iter().any(|p| p.role == role) {
+                out.people.push(PersonModel {
+                    model,
+                    soldier: words[0] != "civ",
+                    role,
+                });
+            }
+        } else if let Some((kind, label)) = vehicle::kind_from_textures(names) {
+            out.vehicles.push(CatalogueEntry { model, kind, label });
+        }
+    }
+    out.vehicles
+        .sort_by(|a, b| (&a.kind, &a.label, a.model).cmp(&(&b.kind, &b.label, b.model)));
+    out.people.sort_by(|a, b| a.role.cmp(&b.role));
     Ok(out)
 }
 

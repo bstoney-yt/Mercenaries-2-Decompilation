@@ -15,7 +15,23 @@ pub struct Config {
     pub install: Option<PathBuf>,
     pub window: WindowConfig,
     pub camera: CameraConfig,
+    pub world: WorldConfig,
     pub keys: Bindings,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorldConfig {
+    /// Height of the sea, metres (an estimate: the game's is not decoded).
+    pub sea_level: f32,
+}
+
+impl Default for WorldConfig {
+    fn default() -> Self {
+        Self {
+            sea_level: m2_engine::WorldSettings::default().sea_level,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

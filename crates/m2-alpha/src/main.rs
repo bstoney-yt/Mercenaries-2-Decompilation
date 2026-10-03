@@ -4,6 +4,7 @@
 //! m2-alpha [--install <dir>] [--spawn <x>,<z>] [--model <hash>]... [--gait <gait>]
 //!          [--config <file>]
 //!          [--size <w>x<h>] [--vsync on|off] [--fullscreen] [--double-sided] [--fly]
+//!          [--sea <metres>]
 //!          [--screenshot <out.ppm> [--drive]] [--write-config]
 //! ```
 //!
@@ -36,6 +37,7 @@ mod camera;
 mod config;
 mod game;
 mod input;
+mod npc;
 mod player;
 mod scene;
 mod sound;
@@ -78,6 +80,7 @@ struct Options {
     double_sided: bool,
     fly: bool,
     drive: bool,
+    sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
     fullscreen: bool,
@@ -130,6 +133,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--drive" => o.drive = true,
+            "--sea" => o.sea = Some(value()?.parse().context("--sea expects metres")?),
             "--screenshot" => o.screenshot = Some(value()?.into()),
             "--write-config" => o.write_config = true,
             "-h" | "--help" => {
@@ -160,6 +164,9 @@ fn main() -> anyhow::Result<()> {
         config.window.vsync = v;
     }
     config.window.fullscreen |= options.fullscreen;
+    if let Some(sea) = options.sea {
+        config.world.sea_level = sea;
+    }
     if options.write_config {
         print!("{}", config.to_toml());
         return Ok(());
@@ -222,6 +229,7 @@ fn build_scene(
     install: Option<&Install>,
     mode: &Mode,
     double_sided: bool,
+    sea_level: f32,
 ) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
     if double_sided {
@@ -230,7 +238,11 @@ fn build_scene(
     if let Some(install) = install {
         match mode {
             Mode::Island(spawn) => {
-                scene.open_world(backend, install, WorldSettings::default(), *spawn)?;
+                let settings = WorldSettings {
+                    sea_level,
+                    ..WorldSettings::default()
+                };
+                scene.open_world(backend, install, settings, *spawn)?;
             }
             Mode::Models(models, gait) => {
                 scene.open(install)?;
@@ -278,7 +290,13 @@ fn screenshot(
     let (w, h) = (config.window.width, config.window.height);
     let mut backend = WgpuBackend::headless(w, h)?;
     eprintln!("adapter: {:?}", backend.adapter_summary());
-    let mut game = build_scene(&mut backend, install, mode, options.double_sided)?;
+    let mut game = build_scene(
+        &mut backend,
+        install,
+        mode,
+        options.double_sided,
+        config.world.sea_level,
+    )?;
     if options.fly {
         game.on_foot = false;
     }
@@ -304,6 +322,28 @@ fn screenshot(
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect)?;
     }
+    // And for the vehicles and people, and the people to find their feet.
+    while game.scene.world.is_some()
+        && game.scene.vehicles_loading()
+        && started.elapsed() < Duration::from_secs(300)
+    {
+        game.step(Intent::default(), tick);
+        render(&mut backend, &mut game, fov, aspect)?;
+    }
+    for _ in 0..30 {
+        game.step(Intent::default(), tick);
+        render(&mut backend, &mut game, fov, aspect)?;
+    }
+    let people = &game.scene.people;
+    eprintln!(
+        "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",
+        people.kinds.len(),
+        people.npcs.len(),
+        people.npcs.iter().filter(|n| n.spawn.is_some()).count(),
+        people.npcs.iter().filter(|n| n.patrolling()).count(),
+        people.npcs.iter().filter(|n| n.landed).count(),
+        started.elapsed().as_secs_f32()
+    );
     if options.drive && game.on_foot && game.scene.player.is_some() {
         drive_for_screenshot(&mut backend, &mut game, fov, aspect)?;
     } else if game.on_foot && game.scene.player.is_some() {
@@ -454,6 +494,7 @@ impl App {
             self.install.as_ref(),
             &self.mode,
             self.double_sided,
+            self.config.world.sea_level,
         )?;
         if self.fly {
             game.on_foot = false;
