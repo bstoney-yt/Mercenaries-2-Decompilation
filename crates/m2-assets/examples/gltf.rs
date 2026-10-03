@@ -35,9 +35,13 @@
 //! `world` exports the island's terrain placed by the layout layer: the
 //! low-resolution tiles everywhere, full-detail cells near `--detail`, a sea
 //! plane; full-detail cells use their own 512 px colour maps and the tiles
-//! the island-wide one (`vz_lrterrain`). With `view --world`, play mode starts on the island
+//! the island-wide one (`vz_lrterrain`). It also places the buildings and
+//! props named by `ModelName` entities, and in full-detail cells the
+//! scatter (grass, bushes, rubble, litter) as GPU-instanced meshes
+//! (`EXT_mesh_gpu_instancing`). With `view --world`, play mode starts on the island
 //! (`?spawn=X,Z` in the page address picks the point) and the character
-//! follows the ground.
+//! follows the ground; objects are drawn within `?view=` metres (default
+//! 1500) and scatter within `?veg=` metres (default 150).
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
@@ -952,8 +956,11 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
     let (mut tiles, mut cells) = (HashMap::new(), HashMap::new());
     // Placed models: (model hash, position, rotation).
     let mut placed: Vec<(u32, [f32; 3], [f32; 4])> = Vec::new();
+    // Scatter assets by the terrain cell sharing their block.
+    let mut scatter_of: Vec<(u32, Vec<u8>)> = Vec::new();
     for block in 0..wad.index().blocks().len() {
         let is_static = wad.index().blocks()[block].path.contains("layers_static");
+        let (mut block_cell, mut block_scatter) = (None, Vec::new());
         let decoded = wad.read_block(block)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
             match e.type_hash {
@@ -988,9 +995,14 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
                 }
                 TERRAIN_TYPE => {
                     cells.insert(e.name_hash, data.to_vec());
+                    block_cell = Some(e.name_hash);
                 }
+                m2_assets::scatter::SCATTER_TYPE => block_scatter.push(data.to_vec()),
                 _ => {}
             }
+        }
+        if let Some(cell) = block_cell {
+            scatter_of.extend(block_scatter.into_iter().map(|s| (cell, s)));
         }
     }
     let near = |c: [f32; 3]| {
@@ -1265,6 +1277,126 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
         mesh_of_model.values().flatten().count()
     );
 
+    // Vegetation in the detailed cells, GPU-instanced: one node per run of
+    // a patch (named "veg ..." for the viewer's culling), carrying its
+    // instances in EXT_mesh_gpu_instancing.
+    let mirror = m2_math::glam::Mat3::from_diagonal(Vec3::new(1.0, 1.0, -1.0));
+    let mut veg_material: HashMap<u32, usize> = HashMap::new();
+    let (mut veg_nodes, mut veg_instances) = (0, 0);
+    for (cell, data) in &scatter_of {
+        let Some(&centre) = cell_at.get(cell) else {
+            continue;
+        };
+        if !near(centre) {
+            continue;
+        }
+        let s = match m2_assets::Scatter::parse(data) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("scatter in cell {cell:08x}: {e}");
+                continue;
+            }
+        };
+        let mesh_ids: Vec<Option<usize>> = s
+            .meshes
+            .iter()
+            .map(|m| {
+                let tris: Vec<u16> = m.triangles().into_iter().flat_map(|[a, b, c]| [a, c, b]).collect();
+                if tris.is_empty() {
+                    return None;
+                }
+                let p: Vec<f32> = m.positions().into_iter().flat_map(flip_v).collect();
+                let n: Vec<f32> = m
+                    .read(DeclUsage::Normal)
+                    .iter()
+                    .flat_map(|v| flip_v(Vec3::new(v[0], v[1], v[2]).try_normalize().unwrap_or(Vec3::Y).to_array()))
+                    .collect();
+                let t: Vec<f32> = m.read(DeclUsage::TexCoord).iter().flat_map(|v| [v[0], v[1]]).collect();
+                let mut attrs = format!(r#""POSITION":{}"#, g.floats(&p, 3, true, Some(34962)));
+                if n.len() == p.len() {
+                    let _ = write!(attrs, r#","NORMAL":{}"#, g.floats(&n, 3, false, Some(34962)));
+                }
+                if t.len() * 3 == p.len() * 2 {
+                    let _ = write!(attrs, r#","TEXCOORD_0":{}"#, g.floats(&t, 2, false, Some(34962)));
+                }
+                let ind = g.u16s(&tris, 1, Some(34963));
+                let texture = m.material.textures.first().copied().filter(|&t| t != 0).unwrap_or(0);
+                let material = *veg_material.entry(texture).or_insert_with(|| {
+                    let image = load_texture(wad, texture, 256).map(|(w, h, rgba, _)| {
+                        let view = g.view(&png(w, h, &rgba), None);
+                        images.push(format!(
+                            r#"{{"bufferView":{view},"mimeType":"image/png","name":"{texture:08x}"}}"#
+                        ));
+                        image_sampler.push(1);
+                        images.len() - 1
+                    });
+                    materials.push(match image {
+                        Some(i) => format!(
+                            r#"{{"name":"veg {texture:08x}","pbrMetallicRoughness":{{"baseColorTexture":{{"index":{i}}},"metallicFactor":0,"roughnessFactor":1}},"alphaMode":"MASK","alphaCutoff":0.5,"doubleSided":true}}"#
+                        ),
+                        None => r#"{"name":"veg","pbrMetallicRoughness":{"baseColorFactor":[0.2,0.35,0.1,1],"metallicFactor":0,"roughnessFactor":1},"doubleSided":true}"#.to_owned(),
+                    });
+                    materials.len() - 1
+                });
+                meshes.push(format!(
+                    r#"{{"name":"veg {:08x}","primitives":[{{"attributes":{{{attrs}}},"indices":{ind},"material":{material}}}]}}"#,
+                    m.hash
+                ));
+                Some(meshes.len() - 1)
+            })
+            .collect();
+        for patch in &s.patches {
+            let first = usize::from(patch.first_run);
+            for run in &s.runs[first..first + usize::from(patch.run_count)] {
+                let Some(mesh) = mesh_ids.get(usize::from(run.mesh)).copied().flatten() else {
+                    continue;
+                };
+                let (mut t, mut q, mut sc) = (Vec::new(), Vec::new(), Vec::new());
+                let start = run.first as usize;
+                for m in &s.instances[start..start + usize::from(run.count)] {
+                    // Rows of R (rotation x uniform scale) and the offset t.
+                    let r = m2_math::glam::Mat3::from_cols(
+                        Vec3::new(m[0], m[1], m[2]),
+                        Vec3::new(m[4], m[5], m[6]),
+                        Vec3::new(m[8], m[9], m[10]),
+                    )
+                    .transpose();
+                    let scale = r.x_axis.length();
+                    if scale <= 0.0 || !scale.is_finite() {
+                        continue;
+                    }
+                    let rot = Quat::from_mat3(&(mirror * r * mirror * (1.0 / scale))).normalize();
+                    let pos = [
+                        centre[0] + patch.centre[0] + m[3],
+                        centre[1] + patch.centre[1] + m[7],
+                        centre[2] + patch.centre[2] + m[11],
+                    ];
+                    t.extend(flip_v(pos));
+                    q.extend(rot.to_array());
+                    sc.extend([scale; 3]);
+                }
+                if t.is_empty() {
+                    continue;
+                }
+                veg_instances += t.len() / 3;
+                let (qa, sa) = (g.floats(&q, 4, false, None), g.floats(&sc, 3, false, None));
+                // The node sits at the run's first instance, for culling;
+                // instances are relative to it.
+                let origin = [t[0], t[1], t[2]];
+                let local: Vec<f32> = t
+                    .chunks_exact(3)
+                    .flat_map(|p| [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]])
+                    .collect();
+                let la = g.floats(&local, 3, true, None);
+                nodes.push(format!(
+                    r#"{{"name":"veg {cell:08x}","mesh":{mesh},"translation":{origin:?},"extensions":{{"EXT_mesh_gpu_instancing":{{"attributes":{{"TRANSLATION":{la},"ROTATION":{qa},"SCALE":{sa}}}}}}}}}"#
+                ));
+                veg_nodes += 1;
+            }
+        }
+    }
+    eprintln!("{veg_nodes} vegetation runs, {veg_instances} instances");
+
     // Sea level water.
     let half = ISLAND / 2.0 + 4000.0;
     let water = g.floats(
@@ -1297,7 +1429,7 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
         })
         .collect();
     let json = format!(
-        r#"{{"asset":{{"version":"2.0","generator":"m2-assets gltf example"}},"scene":0,"scenes":[{{"name":"world","nodes":{roots:?}}}],"nodes":[{}],"meshes":[{}],"materials":[{}],"images":[{}],"textures":[{}],"samplers":[{{"magFilter":9729,"minFilter":9987,"wrapS":33071,"wrapT":33071}},{{"magFilter":9729,"minFilter":9987,"wrapS":10497,"wrapT":10497}}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
+        r#"{{"asset":{{"version":"2.0","generator":"m2-assets gltf example"}},"extensionsUsed":["EXT_mesh_gpu_instancing"],"scene":0,"scenes":[{{"name":"world","nodes":{roots:?}}}],"nodes":[{}],"meshes":[{}],"materials":[{}],"images":[{}],"textures":[{}],"samplers":[{{"magFilter":9729,"minFilter":9987,"wrapS":33071,"wrapT":33071}},{{"magFilter":9729,"minFilter":9987,"wrapS":10497,"wrapT":10497}}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
         nodes.join(","),
         meshes.join(","),
         materials.join(","),
