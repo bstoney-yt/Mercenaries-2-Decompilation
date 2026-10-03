@@ -29,11 +29,12 @@ A Cargo workspace targeting the original 32-bit process (`i686-pc-windows-msvc`)
 
 `symbols/` tracks every identified function (name, RVA, signature, translation status); see `symbols/README.md`. Conventions for translating code are in `docs/conventions.md`.
 
-The plan to a playable alpha is in `docs/alpha-roadmap.md`. The native game so far opens a window with a free-flying camera and shows models from your install:
+The plan to a playable alpha is in `docs/alpha-roadmap.md`. The native game so far opens a window with a free-flying camera over the island, streamed from your install:
 
 ```sh
-cargo run --release -p m2-alpha -- --install "<install dir>"   # Jennifer on a ground grid; Tab captures the mouse, WASD/Space/C fly
-cargo run --release -p m2-alpha -- --install "<install dir>" --model 15d89832 --model <hash>   # other models side by side
+cargo run --release -p m2-alpha -- --install "<install dir>"   # the island from above the first town; Tab captures the mouse, WASD/Space/C fly, Shift faster
+cargo run --release -p m2-alpha -- --install "<install dir>" --spawn 0,0   # start somewhere else (game x, z)
+cargo run --release -p m2-alpha -- --install "<install dir>" --model 15d89832 --model <hash>   # models side by side on a ground grid
 cargo run --release -p m2-alpha -- --write-config > m2-alpha.toml   # settings file (install path, window, keys)
 ```
 

@@ -1,7 +1,7 @@
 //! `m2-alpha`: the native game, playing from the player's own install.
 //!
 //! ```text
-//! m2-alpha [--install <dir>] [--model <hash>]... [--config <file>]
+//! m2-alpha [--install <dir>] [--spawn <x>,<z>] [--model <hash>]... [--config <file>]
 //!          [--size <w>x<h>] [--vsync on|off] [--fullscreen]
 //!          [--screenshot <out.ppm>] [--write-config]
 //! ```
@@ -12,10 +12,12 @@
 //! `--screenshot` renders one frame without opening a window, for checking
 //! a machine's GPU setup.
 //!
-//! Right now this opens a window with a free-flying camera over a ground
-//! grid and the models named with `--model` (Jennifer by default) read from
-//! the install. Tab captures the mouse, WASD/Space/C fly, Shift speeds up,
-//! F11 toggles fullscreen, F3 toggles back-face culling, Escape quits.
+//! Right now this opens a window with a free-flying camera over the island,
+//! streamed from the install around the camera (`--spawn` picks where to
+//! start; the default is the first town). With `--model` it shows those
+//! models on a ground grid instead. Tab or the right mouse button captures
+//! the mouse, WASD/Space/C fly, Shift speeds up, F11 toggles fullscreen, F3
+//! toggles back-face culling, Escape releases the mouse, then quits.
 
 mod camera;
 mod config;
@@ -27,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
-use m2_engine::Install;
+use m2_engine::{Install, WorldSettings};
 use m2_render::gpu::WgpuBackend;
 use m2_render::{DrawQueue, RenderBackend};
 use winit::application::ApplicationHandler;
@@ -53,6 +55,7 @@ struct Options {
     config_path: Option<PathBuf>,
     install: Option<PathBuf>,
     models: Vec<u32>,
+    spawn: Option<(f32, f32)>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
     fullscreen: bool,
@@ -74,6 +77,11 @@ fn parse_args() -> anyhow::Result<Options> {
                     u32::from_str_radix(v.trim_start_matches("0x"), 16)
                         .with_context(|| format!("--model {v}: expected a hex hash"))?,
                 );
+            }
+            "--spawn" => {
+                let v = value()?;
+                let (x, z) = v.split_once(',').context("--spawn expects X,Z")?;
+                o.spawn = Some((x.trim().parse()?, z.trim().parse()?));
             }
             "--size" => {
                 let v = value()?;
@@ -132,14 +140,18 @@ fn main() -> anyhow::Result<()> {
             None
         }
     };
-    let models = if options.models.is_empty() {
-        vec![scene::DEFAULT_MODEL]
+    // No models named: the island (or, without an install, Jennifer's
+    // grid, which shows only the ground).
+    let mode = if !options.models.is_empty() {
+        Mode::Models(options.models.clone())
+    } else if install.is_some() {
+        Mode::Island(options.spawn.unwrap_or(scene::DEFAULT_SPAWN))
     } else {
-        options.models.clone()
+        Mode::Models(vec![scene::DEFAULT_MODEL])
     };
 
     if let Some(out) = &options.screenshot {
-        return screenshot(&config, install.as_ref(), &models, out);
+        return screenshot(&config, install.as_ref(), &mode, out);
     }
 
     let event_loop = EventLoop::new()?;
@@ -147,7 +159,7 @@ fn main() -> anyhow::Result<()> {
     let mut app = App {
         config,
         install,
-        models,
+        mode,
         state: None,
         error: None,
     };
@@ -158,33 +170,54 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// What to show.
+#[derive(Clone, Debug)]
+enum Mode {
+    /// The streamed island, starting above (x, z).
+    Island((f32, f32)),
+    /// These models on a ground grid.
+    Models(Vec<u32>),
+}
+
 /// Builds the scene on `backend` and points a camera at it.
 fn build_scene(
     backend: &mut dyn RenderBackend,
     install: Option<&Install>,
-    models: &[u32],
+    mode: &Mode,
 ) -> anyhow::Result<(Scene, FlyCamera)> {
     let mut scene = Scene::new(backend)?;
     if let Some(install) = install {
-        scene.open(install)?;
-        if let Err(e) = scene.load_models(backend, models) {
-            eprintln!("could not load models: {e:#}");
+        match mode {
+            Mode::Island(spawn) => {
+                scene.open_world(backend, install, WorldSettings::default(), *spawn)?;
+            }
+            Mode::Models(models) => {
+                scene.open(install)?;
+                if let Err(e) = scene.load_models(backend, models) {
+                    eprintln!("could not load models: {e:#}");
+                }
+            }
         }
     }
     let (eye, target) = scene.focus;
     Ok((scene, FlyCamera::looking_at(eye, target)))
 }
 
+/// Streams around the camera and draws a frame.
 fn render(
     backend: &mut dyn RenderBackend,
-    scene: &Scene,
+    scene: &mut Scene,
     camera: &FlyCamera,
     fov: f32,
     aspect: f32,
 ) -> anyhow::Result<()> {
-    let view = camera.view(fov, aspect);
+    let mut view = camera.view(fov, aspect);
+    if scene.world.is_some() {
+        view.lighting.fog_density = 0.00025;
+    }
+    scene.update(backend, camera.position)?;
     let mut queue = DrawQueue::new();
-    scene.draw(&mut queue);
+    scene.draw(&mut queue, camera.position);
     backend.begin_frame(&view)?;
     queue.flush(&view, backend)?;
     backend.end_frame()?;
@@ -195,20 +228,30 @@ fn render(
 fn screenshot(
     config: &Config,
     install: Option<&Install>,
-    models: &[u32],
+    mode: &Mode,
     out: &std::path::Path,
 ) -> anyhow::Result<()> {
     let (w, h) = (config.window.width, config.window.height);
     let mut backend = WgpuBackend::headless(w, h)?;
     eprintln!("adapter: {:?}", backend.adapter_summary());
-    let (scene, camera) = build_scene(&mut backend, install, models)?;
-    render(
-        &mut backend,
-        &scene,
-        &camera,
-        config.camera.fov,
-        w as f32 / h as f32,
-    )?;
+    let (mut scene, camera) = build_scene(&mut backend, install, mode)?;
+    let fov = config.camera.fov;
+    let aspect = w as f32 / h as f32;
+    render(&mut backend, &mut scene, &camera, fov, aspect)?;
+    // Let the island stream in before the picture is taken.
+    let started = Instant::now();
+    while let Some(world) = &scene.world {
+        if world.stats().pending == 0 || started.elapsed() > Duration::from_secs(180) {
+            eprintln!(
+                "{:?} after {:.1} s",
+                world.stats(),
+                started.elapsed().as_secs_f32()
+            );
+            break;
+        }
+        render(&mut backend, &mut scene, &camera, fov, aspect)?;
+    }
+    render(&mut backend, &mut scene, &camera, fov, aspect)?;
     let rgba = backend.read_pixels()?;
     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
     ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
@@ -224,6 +267,8 @@ struct Running {
     camera: FlyCamera,
     input: Input,
     mouse_look: bool,
+    /// Keyboard input is ignored while another window has focus.
+    focused: bool,
     culling: bool,
     last: Instant,
     lag: Duration,
@@ -234,7 +279,7 @@ struct Running {
 struct App {
     config: Config,
     install: Option<Install>,
-    models: Vec<u32>,
+    mode: Mode,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -254,7 +299,8 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
-        let (scene, camera) = build_scene(&mut backend, self.install.as_ref(), &self.models)?;
+        let (scene, camera) = build_scene(&mut backend, self.install.as_ref(), &self.mode)?;
+        let focused = window.has_focus();
         Ok(Running {
             title: format!(
                 "Mercenaries 2 (alpha) - {} on {}",
@@ -266,6 +312,7 @@ impl App {
             camera,
             input: Input::default(),
             mouse_look: false,
+            focused,
             culling: true,
             last: Instant::now(),
             lag: Duration::ZERO,
@@ -307,7 +354,7 @@ impl Running {
         let (w, h) = self.backend.size();
         render(
             &mut self.backend,
-            &self.scene,
+            &mut self.scene,
             &self.camera,
             config.camera.fov,
             w as f32 / h as f32,
@@ -383,11 +430,16 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.backend.resize(size.width, size.height),
-            WindowEvent::Focused(false) => {
+            WindowEvent::Focused(focused) => {
+                // Keys pressed or released elsewhere never reach us, so start
+                // clean either way.
+                state.focused = focused;
                 state.input.clear();
-                state.set_mouse_look(false);
+                if !focused {
+                    state.set_mouse_look(false);
+                }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, .. } if state.focused => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     state.input.key(
                         &self.config.keys,

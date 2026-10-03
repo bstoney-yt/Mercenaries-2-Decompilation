@@ -3,6 +3,8 @@
 //! - [`assets`]: finding the install and reading models and textures from
 //!   its archives.
 //! - [`model`]: models and their textures uploaded to a render backend.
+//! - [`world`]: the island's layout and its terrain as meshes.
+//! - [`stream`]: a loader thread and the streamed island around the camera.
 //!
 //! The original plan put raw `#[repr(C)]` mirrors of the executable's
 //! classes here for hooking. The engine code is encrypted and can't be
@@ -11,6 +13,10 @@
 
 pub mod assets;
 pub mod model;
+pub mod stream;
+pub mod world;
 
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
-pub use model::{GpuModel, MaterialCache};
+pub use model::{CpuModel, GpuModel, MaterialCache};
+pub use stream::{World, WorldSettings, WorldStats};
+pub use world::WorldIndex;
