@@ -38,7 +38,7 @@ cargo run --release -p m2-assets --example gltf -- export "<install dir>\data\vz
 cargo run --release -p m2-assets --example gltf -- view dumps/jen.glb   # open http://127.0.0.1:8765
 cargo run --release -p m2-assets --example gltf -- export "<install dir>\data\vz.wad" 15d89832 dumps/play.glb --filter resident --clips 1000   # then view it and tick Play mode (WASD, Shift, Q)
 cargo run --release -p m2-assets --example gltf -- world "<install dir>\data\vz.wad" dumps/world.glb --detail 450,-1950 --radius 500   # terrain, buildings, props and ground scatter (--objects static|all|none)
-cargo run --release -p m2-assets --example gltf -- view dumps/play.glb --world dumps/world.glb   # open http://127.0.0.1:8765/?spawn=450,-1950 for the town (&view=M, &veg=M draw distances)
-cargo run --release -p m2-assets --example wad -- world "<install dir>\data\vz.wad"   # check every terrain cell, tile, entity layer and scatter asset
+cargo run --release -p m2-assets --example gltf -- view dumps/play.glb --world dumps/world.glb   # open http://127.0.0.1:8765/?spawn=450,-1950 for the town (&view=M, &veg=M draw distances); buildings and props collide
+cargo run --release -p m2-assets --example wad -- world "<install dir>\data\vz.wad"   # check every terrain cell, tile, entity layer, scatter asset and model collision (PHY2)
 ```
 
