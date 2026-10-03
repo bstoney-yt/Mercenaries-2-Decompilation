@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
-use m2_math::glam::{Mat4, Vec3};
+use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
     BackendError, BlendMode, BufferUsage, DrawCall, DrawQueue, Geometry, IndexBufferDesc,
     IndexBufferHandle, IndexFormat, Layer, MaterialDesc, MaterialId, Primitive, RenderBackend,
@@ -25,6 +25,7 @@ use m2_render::{
 
 use crate::assets::{AssetError, DecodedTexture, Install};
 use crate::model::{CpuModel, GpuModel, MaterialCache};
+use crate::physics::{Physics, StaticKey};
 use crate::world::{self, TerrainMesh, WorldIndex};
 
 /// Something for the loader to read.
@@ -129,9 +130,7 @@ impl Loader {
                             Loaded::Terrain(request, mesh)
                         }
                         Request::Model(h) => {
-                            let model = source
-                                .model(h)
-                                .and_then(|d| Ok(CpuModel::build(h, &d.parse()?, 0)));
+                            let model = source.model(h).and_then(|d| CpuModel::from_data(&d, 0));
                             if let Ok(m) = &model {
                                 for t in m.texture_hashes().collect::<Vec<_>>() {
                                     if !texture(&mut source, t, limits.models) {
@@ -259,6 +258,10 @@ pub struct World {
     terrain_materials: HashMap<Option<u32>, MaterialId>,
     sea: (VertexBufferHandle, IndexBufferHandle, MaterialId),
     stats: WorldStats,
+    /// Full-detail cells and placed models as static colliders. Step it
+    /// each tick; colliders added by [`update`](Self::update) join scene
+    /// queries on the next step.
+    pub physics: Physics,
 }
 
 impl World {
@@ -295,6 +298,7 @@ impl World {
             terrain_materials: HashMap::new(),
             sea,
             stats: WorldStats::default(),
+            physics: Physics::new(),
         };
         // Every tile, so the whole island shows from the start.
         let mut tiles: Vec<u32> = world.index.tiles.keys().copied().collect();
@@ -340,6 +344,7 @@ impl World {
             })
             .collect();
         for h in far {
+            self.physics.remove_static(StaticKey::Cell(h));
             if let Some(Slot::Ready(t)) = self.cells.remove(&h) {
                 backend.destroy_vertex_buffer(t.vertex_buffer)?;
                 backend.destroy_index_buffer(t.index_buffer)?;
@@ -419,6 +424,10 @@ impl World {
                 Loaded::Texture(hash, t) => materials.add_texture(backend, hash, t.as_ref())?,
                 Loaded::Terrain(request, mesh) => {
                     self.in_flight.remove(&request);
+                    let collision = mesh
+                        .as_ref()
+                        .ok()
+                        .and_then(|m| m.collision.clone().map(|c| (c, m.origin)));
                     let slot = match mesh {
                         Ok(m) if !m.indices.is_empty() => {
                             Slot::Ready(self.upload_terrain(backend, materials, &m)?)
@@ -437,6 +446,16 @@ impl World {
                     // A cell dropped while loading is not wanted any more.
                     match (table.get(&h), slot) {
                         (Some(Slot::Loading), slot) => {
+                            if let (Request::Cell(_), Slot::Ready(_), Some((shape, origin))) =
+                                (request, &slot, &collision)
+                            {
+                                self.physics.add_static(
+                                    StaticKey::Cell(h),
+                                    shape,
+                                    *origin,
+                                    Quat::IDENTITY,
+                                );
+                            }
                             table.insert(h, slot);
                         }
                         (_, Slot::Ready(t)) => {
@@ -450,6 +469,18 @@ impl World {
                     self.in_flight.remove(&Request::Model(hash));
                     let slot = match model {
                         Ok(m) if !m.pieces.is_empty() => {
+                            if let Some(shape) = &m.collision {
+                                for (i, o) in self.index.objects.iter().enumerate() {
+                                    if o.model == hash {
+                                        self.physics.add_static(
+                                            StaticKey::Object(i),
+                                            shape,
+                                            o.position,
+                                            o.rotation,
+                                        );
+                                    }
+                                }
+                            }
                             Slot::Ready(GpuModel::upload(backend, materials, &m)?)
                         }
                         Ok(_) => Slot::Failed,
