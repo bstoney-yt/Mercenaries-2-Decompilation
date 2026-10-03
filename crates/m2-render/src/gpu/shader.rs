@@ -23,6 +23,8 @@ struct Frame {
 
 struct Draw {
     world: mat4x4<f32>,
+    // x: first palette matrix, y: palette length (0: not skinned)
+    skin: vec4<u32>,
 };
 
 struct Material {
@@ -33,6 +35,7 @@ struct Material {
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(1) @binding(0) var<uniform> draw: Draw;
+@group(1) @binding(1) var<storage, read> palette: array<mat4x4<f32>>;
 @group(2) @binding(0) var<uniform> material: Material;
 @group(2) @binding(1) var base_map: texture_2d<f32>;
 @group(2) @binding(2) var base_sampler: sampler;
@@ -79,7 +82,10 @@ fn wgsl_type(format: VertexFormat) -> &'static str {
         VertexFormat::Float1 => "f32",
         VertexFormat::Float2 | VertexFormat::Half2 => "vec2<f32>",
         VertexFormat::Float3 => "vec3<f32>",
-        VertexFormat::Float4 | VertexFormat::Half4 | VertexFormat::UNorm4x8 => "vec4<f32>",
+        VertexFormat::Float4
+        | VertexFormat::Half4
+        | VertexFormat::UNorm4x8
+        | VertexFormat::Bgra8 => "vec4<f32>",
         VertexFormat::UInt4x8 => "vec4<u32>",
     }
 }
@@ -91,6 +97,8 @@ fn as_vec4(name: &str, format: VertexFormat) -> String {
         VertexFormat::Float2 | VertexFormat::Half2 => format!("vec4<f32>({name}, 0.0, 1.0)"),
         VertexFormat::Float3 => format!("vec4<f32>({name}, 1.0)"),
         VertexFormat::Float4 | VertexFormat::Half4 | VertexFormat::UNorm4x8 => name.to_string(),
+        // Direct3D 9 colours are stored B, G, R, A.
+        VertexFormat::Bgra8 => format!("{name}.zyxw"),
         VertexFormat::UInt4x8 => format!("vec4<f32>({name})"),
     }
 }
@@ -122,13 +130,29 @@ pub fn source(layout: &VertexLayout) -> String {
     let uv = find(VertexSemantic::TexCoord(0))
         .map(|t| format!("{t}.xy"))
         .unwrap_or_else(|| "vec2<f32>(0.0)".into());
-    // Direct3D 9 colours are stored B, G, R, A.
-    let color = match layout.find(VertexSemantic::Color) {
-        Some(e) if e.format == VertexFormat::UNorm4x8 => {
-            format!("{}.zyxw", find(VertexSemantic::Color).expect("found above"))
-        }
-        Some(_) => find(VertexSemantic::Color).expect("found above"),
-        None => "vec4<f32>(1.0)".into(),
+    let color = find(VertexSemantic::Color).unwrap_or_else(|| "vec4<f32>(1.0)".into());
+    // Skinned layouts blend up to four palette matrices, weights normalised
+    // by their sum; a zero sum leaves the vertex in its bind pose.
+    let indices = layout.elements().iter().position(|e| {
+        e.semantic == VertexSemantic::BlendIndices && e.format == VertexFormat::UInt4x8
+    });
+    let skin = match (indices, find(VertexSemantic::BlendWeight)) {
+        (Some(i), Some(weights)) => format!(
+            r#"
+    if draw.skin.y > 0u {{
+        let w = {weights};
+        let total = w.x + w.y + w.z + w.w;
+        if total > 0.0 {{
+            let last = vec4<u32>(draw.skin.y - 1u);
+            let b = min(v.a{i}, last) + vec4<u32>(draw.skin.x);
+            let m = palette[b.x] * (w.x / total) + palette[b.y] * (w.y / total)
+                + palette[b.z] * (w.z / total) + palette[b.w] * (w.w / total);
+            local = m * local;
+            normal = (m * vec4<f32>(normal, 0.0)).xyz;
+        }}
+    }}"#
+        ),
+        _ => String::new(),
     };
 
     let _ = write!(
@@ -136,11 +160,13 @@ pub fn source(layout: &VertexLayout) -> String {
         r#"
 @vertex
 fn vs_main(v: VertexIn) -> Varyings {{
-    let world = draw.world * vec4<f32>({position}, 1.0);
+    var local = vec4<f32>({position}, 1.0);
+    var normal = {normal};{skin}
+    let world = draw.world * local;
     var out: Varyings;
     out.clip = frame.view_proj * world;
     out.world_pos = world.xyz;
-    out.normal = (draw.world * vec4<f32>({normal}, 0.0)).xyz;
+    out.normal = (draw.world * vec4<f32>(normal, 0.0)).xyz;
     out.uv = {uv};
     out.color = {color};
     return out;
@@ -176,7 +202,7 @@ mod tests {
             vec![
                 (Position, Half4),
                 (Normal, UNorm4x8),
-                (Color, UNorm4x8),
+                (Color, Bgra8),
                 (TexCoord(0), Half2),
                 (BlendWeight, UNorm4x8),
                 (BlendIndices, UInt4x8),
@@ -194,7 +220,24 @@ mod tests {
 
     #[test]
     fn colour_is_swizzled_from_bgra() {
-        let layout = VertexLayout::packed(&[(Position, Float3), (Color, UNorm4x8)]).unwrap();
+        let layout = VertexLayout::packed(&[(Position, Float3), (Color, Bgra8)]).unwrap();
         assert!(source(&layout).contains("out.color = v.a1.zyxw;"));
+        let layout = VertexLayout::packed(&[(Position, Float3), (Color, UNorm4x8)]).unwrap();
+        assert!(source(&layout).contains("out.color = v.a1;"));
+    }
+
+    #[test]
+    fn skinned_layouts_blend_the_palette() {
+        let skinned = VertexLayout::packed(&[
+            (Position, Half4),
+            (BlendIndices, UInt4x8),
+            (BlendWeight, UNorm4x8),
+        ])
+        .unwrap();
+        let src = source(&skinned);
+        validate(&src);
+        assert!(src.contains("palette[b.x]"));
+        let rigid = VertexLayout::packed(&[(Position, Half4), (BlendIndices, UInt4x8)]).unwrap();
+        assert!(!source(&rigid).contains("palette[b.x]"));
     }
 }

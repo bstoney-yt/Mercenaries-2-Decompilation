@@ -20,6 +20,8 @@ pub enum Action {
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
+    /// Step the shown characters through idle, walk, run and sprint.
+    NextGait,
     /// Draw back faces too (a debugging aid while formats are checked).
     ToggleCulling,
     Quit,
@@ -45,6 +47,7 @@ impl Default for Bindings {
             (Sprint, vec![ShiftLeft, ShiftRight]),
             (ToggleMouse, vec![Tab]),
             (Fullscreen, vec![F11]),
+            (NextGait, vec![KeyN]),
             (ToggleCulling, vec![F3]),
             (Quit, vec![Escape]),
         ]))

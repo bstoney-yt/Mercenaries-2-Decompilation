@@ -35,8 +35,9 @@ pub use backend::{
     BackendError, DrawCall, Geometry, Lighting, LiveBuffers, RenderBackend, Topology, View,
 };
 pub use buffer::{
-    BufferUsage, IndexBufferDesc, IndexBufferHandle, IndexFormat, TextureHandle, VertexBufferDesc,
-    VertexBufferHandle, VertexElement, VertexFormat, VertexLayout, VertexSemantic,
+    BufferUsage, IndexBufferDesc, IndexBufferHandle, IndexFormat, SkinHandle, TextureHandle,
+    VertexBufferDesc, VertexBufferHandle, VertexElement, VertexFormat, VertexLayout,
+    VertexSemantic,
 };
 pub use key::{Layer, MaterialId, SortKey};
 pub use null::{Command, NullBackend, RecordingBackend};

@@ -1,5 +1,6 @@
 //! The engine runtime the native game is built on.
 //!
+//! - [`anim`]: skeletons, clip sampling, blending and locomotion.
 //! - [`assets`]: finding the install and reading models and textures from
 //!   its archives.
 //! - [`model`]: models and their textures uploaded to a render backend.
@@ -11,11 +12,13 @@
 //! read, so this crate instead hosts the clean-room runtime that reads the
 //! game's data directly (see `docs/alpha-roadmap.md`).
 
+pub mod anim;
 pub mod assets;
 pub mod model;
 pub mod stream;
 pub mod world;
 
+pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use model::{CpuModel, GpuModel, MaterialCache};
 pub use stream::{World, WorldSettings, WorldStats};

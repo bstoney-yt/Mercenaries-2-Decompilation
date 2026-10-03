@@ -43,6 +43,7 @@ fn call(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32) -> DrawCal
             base_vertex: 0,
         },
         world: Mat4::IDENTITY,
+        skin: None,
     }
 }
 
