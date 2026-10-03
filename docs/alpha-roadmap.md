@@ -129,7 +129,7 @@ only) once item 11 lands.
   layers alone, and the window streams low-res tiles everywhere, detailed
   cells within 600 m, placed models within 1.2 km and a sea plane. Ground
   scatter (grass, shrubs, rubble) streams within 150 m as instanced draws
-  (`DrawCall::instances`). Still to come: terrain detail layers.
+  (`DrawCall::instances`). Near the camera the cells' shared detail texture (material slot 1) is tiled over the colour map every 6 m (an invented scale). Still to come: the tiled layer textures (`tt_sand01`...), whose blending by vertex colour is not confirmed.
 - Item 5: `m2-engine::anim` binds clips to any skeleton by bone name, blends
   gaits, plays one-shot clips (aim, death) and builds skinning palettes;
   the wgpu backend skins on the GPU.

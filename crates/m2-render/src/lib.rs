@@ -42,4 +42,4 @@ pub use buffer::{
 pub use key::{Layer, MaterialId, SortKey};
 pub use null::{Command, NullBackend, RecordingBackend};
 pub use queue::{DrawQueue, Primitive, QueueError, SubmitStats};
-pub use texture::{BlendMode, MaterialDesc, TextureDesc, TextureFormat, generate_mips};
+pub use texture::{BlendMode, DetailMap, MaterialDesc, TextureDesc, TextureFormat, generate_mips};

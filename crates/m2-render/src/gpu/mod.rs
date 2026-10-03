@@ -40,6 +40,8 @@ pub use ::wgpu;
 const DRAW_UNIFORM_SIZE: u64 = 80;
 /// Bone matrices the palette buffer starts with.
 const INITIAL_PALETTE: u64 = 1024;
+/// Metres from the camera by which a detail map has faded out.
+const DETAIL_FADE: f32 = 80.0;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Per-draw uniforms are packed at this stride (wgpu's minimum dynamic
 /// offset alignment on every backend).
@@ -171,6 +173,8 @@ struct FrameUniforms {
 struct MaterialUniforms {
     color: [f32; 4],
     params: [f32; 4],
+    /// x: detail tiles per metre (0: none), y: distance it fades out by.
+    detail: [f32; 4],
 }
 
 /// A frame between `begin_frame` and `end_frame`.
@@ -448,6 +452,22 @@ impl WgpuBackend {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -515,8 +535,8 @@ impl WgpuBackend {
             default_material: Self::material_group(
                 &device,
                 &material_layout,
-                &samplers[0],
-                &white,
+                &samplers,
+                (&white, &white),
                 &MaterialDesc::default(),
             ),
             adapter,
@@ -610,11 +630,13 @@ impl WgpuBackend {
             .create_view(&Default::default())
     }
 
+    /// `samplers` are the repeating and clamping ones; `textures` the base
+    /// and detail maps.
     fn material_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        texture: &wgpu::TextureView,
+        samplers: &[wgpu::Sampler; 2],
+        (texture, detail): (&wgpu::TextureView, &wgpu::TextureView),
         desc: &MaterialDesc,
     ) -> wgpu::BindGroup {
         let cutoff = match desc.blend {
@@ -630,6 +652,10 @@ impl WgpuBackend {
                 flag(desc.vertex_color),
                 flag(desc.fog),
             ],
+            detail: match desc.detail {
+                Some(d) if d.tile > 0.0 => [1.0 / d.tile, DETAIL_FADE, 0.0, 0.0],
+                _ => [0.0; 4],
+            },
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("material uniforms"),
@@ -650,7 +676,15 @@ impl WgpuBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(sampler),
+                    resource: wgpu::BindingResource::Sampler(&samplers[usize::from(desc.clamp)]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(detail),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&samplers[0]),
                 },
             ],
         })
@@ -1159,11 +1193,15 @@ impl RenderBackend for WgpuBackend {
             Some(t) => &self.textures.get(t.0)?.view,
             None => &self.white,
         };
+        let detail = match desc.detail {
+            Some(d) => &self.textures.get(d.texture.0)?.view,
+            None => &self.white,
+        };
         let bind_group = Self::material_group(
             &self.device,
             &self.material_layout,
-            &self.samplers[usize::from(desc.clamp)],
-            view,
+            &self.samplers,
+            (view, detail),
             desc,
         );
         self.materials.insert(

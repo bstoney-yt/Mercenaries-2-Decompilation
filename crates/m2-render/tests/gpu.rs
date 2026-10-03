@@ -379,6 +379,63 @@ fn instanced_draws_repeat_the_geometry() {
 }
 
 #[test]
+fn detail_maps_add_grain_up_close() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    // Dark and light stripes along x, tiled every metre of world x.
+    let texels: Vec<u8> = (0..64)
+        .flat_map(|i| {
+            if i % 8 < 4 {
+                [60, 60, 60, 255]
+            } else {
+                [200, 200, 200, 255]
+            }
+        })
+        .collect();
+    let mips = generate_mips(8, 8, &texels);
+    let levels: Vec<&[u8]> = mips.iter().map(Vec::as_slice).collect();
+    let detail = b
+        .create_texture(
+            &TextureDesc {
+                width: 8,
+                height: 8,
+                format: TextureFormat::Rgba8Srgb,
+            },
+            &levels,
+        )
+        .unwrap();
+    let plain = MaterialDesc {
+        lit: false,
+        color: [0.5, 0.5, 0.5, 1.0],
+        ..MaterialDesc::default()
+    };
+    b.set_material(MaterialId(1), &plain).unwrap();
+    b.set_material(
+        MaterialId(2),
+        &MaterialDesc {
+            detail: Some(DetailMap {
+                texture: detail,
+                tile: 1.0,
+            }),
+            ..plain
+        },
+    )
+    .unwrap();
+    let row = |b: &mut WgpuBackend, material| {
+        b.begin_frame(&view()).unwrap();
+        b.draw(&draw(vb, ib, material, Mat4::IDENTITY)).unwrap();
+        b.end_frame().unwrap();
+        let rgba = b.read_pixels().unwrap();
+        let reds: Vec<u8> = (18..46).map(|x| pixel(&rgba, x, 32)[0]).collect();
+        (*reds.iter().min().unwrap(), *reds.iter().max().unwrap())
+    };
+    let (lo, hi) = row(&mut b, 1);
+    assert!(hi - lo <= 1, "flat without detail: {lo}..{hi}");
+    let (lo, hi) = row(&mut b, 2);
+    assert!(hi - lo > 40, "striped with detail: {lo}..{hi}");
+}
+
+#[test]
 fn overlays_draw_over_the_finished_world() {
     let Some(mut backend) = backend() else { return };
     backend.begin_frame(&view()).unwrap();

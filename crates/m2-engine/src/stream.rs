@@ -18,9 +18,9 @@ use std::thread::JoinHandle;
 
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
-    BackendError, BlendMode, BufferUsage, DrawCall, DrawQueue, Geometry, IndexBufferDesc,
-    IndexBufferHandle, IndexFormat, Layer, MaterialDesc, MaterialId, Primitive, RenderBackend,
-    Topology, VertexBufferDesc, VertexBufferHandle,
+    BackendError, BlendMode, BufferUsage, DetailMap, DrawCall, DrawQueue, Geometry,
+    IndexBufferDesc, IndexBufferHandle, IndexFormat, Layer, MaterialDesc, MaterialId, Primitive,
+    RenderBackend, Topology, VertexBufferDesc, VertexBufferHandle,
 };
 
 use crate::assets::{AssetError, DecodedTexture, Install};
@@ -126,13 +126,16 @@ impl Loader {
                                 Request::Cell(_) => world::terrain_cell(&mut source, h, centre),
                                 _ => world::low_res_tile(&mut source, h, centre),
                             };
-                            if let Ok(TerrainMesh {
-                                colour_map: Some(map),
-                                ..
-                            }) = &mesh
-                                && !texture(&mut source, *map, limits.terrain)
-                            {
-                                return;
+                            if let Ok(m) = &mesh {
+                                let maps = [
+                                    m.colour_map.map(|t| (t, limits.terrain)),
+                                    m.detail_map.map(|t| (t, limits.models)),
+                                ];
+                                for (t, max) in maps.into_iter().flatten() {
+                                    if !texture(&mut source, t, max) {
+                                        return;
+                                    }
+                                }
                             }
                             Loaded::Terrain(request, mesh)
                         }
@@ -258,6 +261,10 @@ enum Slot<T> {
     Failed,
 }
 
+/// Metres per repeat of the terrain detail texture. Invented: the game's
+/// own scale for it has not been found.
+const DETAIL_TILE: f32 = 6.0;
+
 /// Grid cell size for finding placed models near the camera.
 const BUCKET: f32 = 200.0;
 
@@ -292,7 +299,8 @@ pub struct World {
     models: HashMap<u32, Slot<GpuModel>>,
     scatter: HashMap<u32, Slot<Vec<ClumpGpu>>>,
     objects: HashMap<(i32, i32), Vec<usize>>,
-    terrain_materials: HashMap<Option<u32>, MaterialId>,
+    /// By colour map and detail map.
+    terrain_materials: HashMap<(Option<u32>, Option<u32>), MaterialId>,
     sea: (VertexBufferHandle, IndexBufferHandle, MaterialId),
     stats: WorldStats,
     /// Full-detail cells and placed models as static colliders. Step it
@@ -629,10 +637,12 @@ impl World {
         materials: &mut MaterialCache,
         mesh: &TerrainMesh,
     ) -> Result<TerrainGpu, BackendError> {
-        let material = match self.terrain_materials.get(&mesh.colour_map) {
+        let key = (mesh.colour_map, mesh.detail_map);
+        let material = match self.terrain_materials.get(&key) {
             Some(&m) => m,
             None => {
                 let texture = mesh.colour_map.and_then(|t| materials.texture(t));
+                let detail = mesh.detail_map.and_then(|t| materials.texture(t));
                 let m = materials.define(
                     backend,
                     &MaterialDesc {
@@ -643,10 +653,14 @@ impl World {
                             [0.32, 0.42, 0.22, 1.0]
                         },
                         clamp: true,
+                        detail: detail.map(|(texture, _)| DetailMap {
+                            texture,
+                            tile: DETAIL_TILE,
+                        }),
                         ..MaterialDesc::default()
                     },
                 )?;
-                self.terrain_materials.insert(mesh.colour_map, m);
+                self.terrain_materials.insert(key, m);
                 m
             }
         };

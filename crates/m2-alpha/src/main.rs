@@ -587,6 +587,19 @@ fn fight_for_screenshot(
         );
         aim_at(game, game.scene.people.npcs[i].chest());
         if let (Some(world), Some(player)) = (&game.scene.world, &game.scene.player) {
+            let n = &game.scene.people.npcs[i];
+            let (eye, dir) = (player.eye(), player.camera_forward());
+            let to = n.chest() - eye;
+            let miss = (to - dir * to.dot(dir)).length();
+            let blocked = world.physics.cast_ray(eye, to, to.length()).map(|h| h.0);
+            eprintln!(
+                "fight: eye {eye:.1} dir {dir:.2} chest {:.1} ({:.1} m, ray passes {miss:.2} m off); \
+                 alive {} landed {}; world between at {blocked:?}",
+                n.chest(),
+                to.length(),
+                n.alive,
+                n.landed,
+            );
             let probe = combat::Combat::aim_probe(&world.physics, &game.scene.people, player);
             eprintln!(
                 "fight: aim hits {}",
