@@ -523,13 +523,16 @@ function addVehicle(o) {
     .sort((a, b) => index(a) - index(b))
     .map(node => ({ node, base: node.position.clone(), radius: 0.4, steer: false, ...d.wheels[index(node)], spin: 0 }));
   for (const w of wheels) w.node.rotation.order = 'YXZ';
+  const rotorIndex = c => +(/^rotor_(\d+)/.exec(c.name) || [])[1];
+  const rotors = o.children.filter(c => Number.isInteger(rotorIndex(c)))
+    .map(node => ({ node, axis: (d.rotors || [])[rotorIndex(node)]?.axis || [0, 1, 0], spin: 0 }));
   o.rotation.order = 'YXZ';
   // The export mirrors z, so the bounds' z may come swapped.
   const a = new THREE.Vector3(...d.min), b = new THREE.Vector3(...d.max);
   const lo = a.clone().min(b), hi = a.clone().max(b);
   const zs = wheels.map(w => w.base.z);
   vehicles.push({
-    root: o, data: d, wheels, lo, hi, speed: 0, steer: 0, vy: 0, pitch: 0, roll: 0, yaw: o.rotation.y, placed: false,
+    root: o, data: d, wheels, rotors, lo, hi, speed: 0, steer: 0, vy: 0, pitch: 0, roll: 0, yaw: o.rotation.y, placed: false,
     wheelbase: zs.length >= 2 ? Math.max(1, Math.max(...zs) - Math.min(...zs)) : Math.max(1, (hi.z - lo.z) * 0.6),
     halfWidth: Math.max(0.4, (hi.x - lo.x) / 2),
     length: Math.max(1, hi.z - lo.z),
@@ -655,6 +658,7 @@ function enterOrLeave() {
   if (!world) return;
   if (driving) {
     if (!ride || ride.phase !== 'drive' || Math.abs(driving.speed) > 2) return;
+    if (driving.data.flying && !driving.landed) return;
     if (ride.fit) {
       // Climb out: the enter clip, backwards.
       ride.phase = 'exit';
@@ -668,7 +672,7 @@ function enterOrLeave() {
   if (!v) return;
   driving = v;
   v.speed = 0;
-  const anims = animsFor(v.data);
+  const anims = v.data.flying ? null : animsFor(v.data);
   const fit = anims && seatFit(v);
   ride = { v, anims, fit, phase: 'enter', action: null };
   if (fit) {
@@ -699,7 +703,7 @@ function leave() {
     p.applyMatrix4(v.root.matrixWorld);
     x = p.x; z = p.z;
     yaw = v.yaw + ride.fit.theta;
-  } else [x, z] = toWorld(v, v.lo.x - 0.8, 0);
+  } else [x, z] = toWorld(v, v.data.flying ? -2.5 : v.lo.x - 0.8, 0); // a helicopter's bounds include its rotor
   driving = null;
   ride = null;
   player.position.set(x, 0, z);
@@ -823,21 +827,100 @@ function drive(dt) {
     w.spin += v.speed * dt / w.radius;
     w.node.rotation.set(-w.spin, w.steer ? v.steer : 0, 0);
   }
-  // The character rides along; the camera follows and turns with it.
+  if (!rideAlong(v, before, yaw0)) return;
+  ui('hint').textContent = `${d.name} (${d.kind}) · ${Math.round(Math.abs(v.speed) * 3.6)} km/h · W/S drive, A/D steer, Space brake, E get out`;
+}
+
+// The character rides along; the camera follows and turns with the
+// vehicle. False once the character has got out.
+function rideAlong(v, before, yaw0) {
+  const o = v.root;
   if (ride && ride.fit) placeRider(); else player.position.copy(o.position);
   stepRide();
-  if (!driving) return;
+  if (!driving) return false;
   const delta = o.position.clone().sub(before);
   camera.position.add(delta);
   controls.target.add(delta);
   const off = camera.position.clone().sub(controls.target).applyAxisAngle(_up, v.yaw - yaw0);
   camera.position.copy(controls.target).add(off);
-  ui('hint').textContent = `${d.name} (${d.kind}) · ${Math.round(Math.abs(v.speed) * 3.6)} km/h · W/S drive, A/D steer, Space brake, E get out`;
+  return true;
+}
+
+// Helicopters. An arcade model TUNED BY HAND, not the game's: the rotor
+// spins up for 2.5 s before it lifts; Space climbs and Shift descends at up
+// to 8 m/s, W/S push the nose down or up to fly forward or back (to about
+// 45 m/s), A/D turn. The fuselage is a row of 1.5 m spheres against the
+// collision; it lands on whatever is under its skids.
+const _axis = new THREE.Vector3();
+function fly(dt) {
+  const v = driving, o = v.root, d = v.data;
+  const now = performance.now();
+  if (now - lastLoad > 250) { lastLoad = now; loadNear(o.position.x, o.position.z); settleNear(o.position.x, o.position.z); }
+  const seated = !ride || ride.phase === 'drive';
+  const held = k => seated && keys.has(k);
+  const ahead = (held('KeyW') ? 1 : 0) - (held('KeyS') ? 1 : 0);
+  const turn = (held('KeyA') ? 1 : 0) - (held('KeyD') ? 1 : 0);
+  const lift = (held('Space') ? 1 : 0) - (held('ShiftLeft') || held('ShiftRight') ? 1 : 0);
+  v.rpm = Math.min(1, (v.rpm || 0) + (seated ? dt / 2.5 : 0));
+  v.vel = v.vel || new THREE.Vector3();
+  const before = o.position.clone(), yaw0 = v.yaw;
+  const ground0 = floorAt(before.x, before.z, before.y + 0.5).y;
+  v.landed = before.y <= ground0 + 0.05;
+  const flying = v.rpm > 0.8 && (!v.landed || lift > 0);
+  if (flying) v.yaw += turn * 1.1 * dt;
+  _fwd.set(-Math.sin(v.yaw), 0, -Math.cos(v.yaw));
+  if (flying) v.vel.addScaledVector(_fwd, ahead * 9 * dt);
+  const drag = Math.exp(-(v.landed ? 3 : 0.6) * dt);
+  v.vel.x *= drag; v.vel.z *= drag;
+  const flat = Math.hypot(v.vel.x, v.vel.z);
+  if (flat > 45) { v.vel.x *= 45 / flat; v.vel.z *= 45 / flat; }
+  // Climb, sink or hover; without lift it falls.
+  const wantVy = v.rpm > 0.8 ? lift * 8 : -20;
+  v.vel.y += (wantVy - v.vel.y) * Math.min(1, dt * (v.rpm > 0.8 ? 2 : 1));
+  const next = before.clone().addScaledVector(v.vel, dt);
+  // Buildings and hills: spheres along the fuselage.
+  const push = new THREE.Vector3();
+  for (let i = 0; i < 4; i++) {
+    const lz = v.lo.z * 0.4 + (v.hi.z * 0.3 - v.lo.z * 0.4) * (i / 3);
+    const c = next.clone().addScaledVector(_fwd, -lz).add(push);
+    const c0 = c.clone();
+    pushOut(c, 1.5, [1.6]);
+    push.add(c.sub(c0));
+  }
+  if (push.lengthSq() > 1e-8) {
+    next.add(push);
+    const n = push.clone().normalize();
+    const into = v.vel.dot(n);
+    if (into < 0) v.vel.addScaledVector(n, -into);
+  }
+  const ground = floorAt(next.x, next.z, Math.max(before.y, next.y) + 0.5).y;
+  if (next.y <= ground) {
+    next.y = ground;
+    if (v.vel.y < 0) v.vel.y = 0;
+  }
+  // Lean into the motion.
+  const fwdSpeed = v.vel.dot(_fwd);
+  const pitch = v.landed ? 0 : -0.012 * fwdSpeed - 0.08 * ahead;
+  const roll = v.landed ? 0 : 0.25 * turn;
+  v.pitch += (pitch - v.pitch) * Math.min(1, dt * 3);
+  v.roll += (roll - v.roll) * Math.min(1, dt * 3);
+  o.position.copy(next);
+  o.rotation.set(v.pitch, v.yaw, -v.roll);
+  for (const r of v.rotors) {
+    r.spin += v.rpm * 30 * dt;
+    r.node.quaternion.setFromAxisAngle(_axis.set(...r.axis), r.spin);
+  }
+  v.speed = flat;
+  if (!rideAlong(v, before, yaw0)) return;
+  const height = next.y - ground;
+  ui('hint').textContent = v.rpm < 0.8
+    ? `${d.name} · rotor spinning up…`
+    : `${d.name} · ${Math.round(flat * 3.6)} km/h · ${Math.round(height)} m up · Space up, Shift down, W/S forward/back, A/D turn${v.landed ? ', E get out' : ''}`;
 }
 
 function stepPlay(dt) {
   dt = Math.min(dt, 0.05);
-  if (driving) { drive(dt); return; }
+  if (driving) { if (driving.data.flying) fly(dt); else drive(dt); return; }
   const ahead = new THREE.Vector3();
   camera.getWorldDirection(ahead);
   const fwd = new THREE.Vector2(ahead.x, ahead.z).normalize();

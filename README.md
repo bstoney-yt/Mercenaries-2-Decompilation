@@ -37,7 +37,7 @@ cargo run --release -p m2-assets --example gltf -- rigs "<install dir>\data\vz.w
 cargo run --release -p m2-assets --example gltf -- export "<install dir>\data\vz.wad" 15d89832 dumps/jen.glb --filter jennifer
 cargo run --release -p m2-assets --example gltf -- view dumps/jen.glb   # open http://127.0.0.1:8765
 cargo run --release -p m2-assets --example gltf -- export "<install dir>\data\vz.wad" 15d89832 dumps/play.glb --filter resident,vehicleclassanimgroup --clips 2000   # then view it and tick Play mode (WASD, Shift, Q, E)
-cargo run --release -p m2-assets --example gltf -- world "<install dir>\data\vz.wad" dumps/world.glb --detail 450,-1950 --radius 500   # terrain, buildings, props, ground scatter and 6 drivable vehicles (--objects static|all|none, --vehicles N)
+cargo run --release -p m2-assets --example gltf -- world "<install dir>\data\vz.wad" dumps/world.glb --detail 450,-1950 --radius 500   # terrain, buildings, props, ground scatter and 8 vehicles to drive or fly (--objects static|all|none, --vehicles N)
 cargo run --release -p m2-assets --example gltf -- view dumps/play.glb --world dumps/world.glb   # open http://127.0.0.1:8765/?spawn=450,-1950 for the town (&view=M, &veg=M draw distances); buildings and props collide; E gets in a vehicle
 cargo run --release -p m2-assets --example wad -- world "<install dir>\data\vz.wad"   # check every terrain cell, tile, entity layer, scatter asset and model collision (PHY2)
 ```

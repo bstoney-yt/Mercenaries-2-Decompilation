@@ -61,6 +61,46 @@ pub const DRIVER_DOOR: u32 = 0x688c_4858;
 /// The marker outside the passenger's door.
 pub const PASSENGER_DOOR: u32 = 0x8869_e876;
 
+/// Node name hashes of a helicopter's main rotor: the blades and the blur
+/// disc (texture `global_veh_rotorblur`), both centred on the hub. Shared
+/// by the UH-1 and the Mi-26 (hub at y 3.55 and 8.16).
+pub const MAIN_ROTOR: [u32; 2] = [0x2c9f_4cec, 0x4cc6_28fa];
+/// The tail rotor's blades and blur disc, flat in the y-z plane at the end
+/// of the tail boom (UH-1 z -7.34, Mi-26 z -19.79).
+pub const TAIL_ROTOR: [u32; 2] = [0x05f6_5f7e, 0xc065_7b1c];
+
+/// A rotor: the nodes to turn, the hub, and the axis it turns about
+/// (model space: `[0, 1, 0]` for a main rotor, `[1, 0, 0]` for a tail).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rotor {
+    pub nodes: Vec<u16>,
+    pub centre: [f32; 3],
+    pub axis: [f32; 3],
+}
+
+/// The main and tail rotors of a helicopter model, by their marker names.
+pub fn rotors(model: &Model) -> Vec<Rotor> {
+    let mut out = Vec::new();
+    for (names, axis) in [(MAIN_ROTOR, [0.0, 1.0, 0.0]), (TAIL_ROTOR, [1.0, 0.0, 0.0])] {
+        let nodes: Vec<u16> = (0..model.nodes.len())
+            .filter(|&i| names.contains(&model.nodes[i].name_hash))
+            .map(|i| i as u16)
+            .collect();
+        let Some(&first) = nodes.first() else {
+            continue;
+        };
+        let Some(m) = model.node_to_model(first) else {
+            continue;
+        };
+        out.push(Rotor {
+            nodes,
+            centre: m.w_axis.truncate().to_array(),
+            axis,
+        });
+    }
+    out
+}
+
 /// The model-space position of the first node named `hash`.
 pub fn marker(model: &Model, hash: u32) -> Option<[f32; 3]> {
     let i = model.nodes.iter().position(|n| n.name_hash == hash)?;

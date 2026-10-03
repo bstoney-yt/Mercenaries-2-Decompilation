@@ -13,7 +13,7 @@
 //!     --radius M      ... out to this distance (default 600)
 //!     --objects WHICH static (default: layers_static), all (mission states too) or none
 //!     --sea Y         sea surface height (default -35, an estimate)
-//!     --vehicles N    drivable vehicles parked near --detail (default 6, 0 for none)
+//!     --vehicles N    drivable vehicles parked near --detail (default 8, 0 for none)
 //! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--port N]
 //! ```
 //!
@@ -61,7 +61,11 @@
 //! node's extras. Kinds come from texture names and wheels from geometry
 //! (see `m2_assets::vehicle`). In play mode, E gets in and out; W/S drive,
 //! A/D steer and Space brakes. The handling is a simple arcade model tuned
-//! by hand, not the game's. The extras also carry the driver's seat and
+//! by hand, not the game's. Helicopters (a UH-1 first) come with their main
+//! and tail rotors as `rotor N` nodes, found by their marker names, and fly
+//! with an arcade model also tuned by hand: Space climbs, Shift descends,
+//! W/S fly forward and back, A/D turn, and E gets out once landed. The
+//! extras also carry the driver's seat and
 //! door markers. With the character exported with its vehicle clips
 //! (`--filter resident,vehicleclassanimgroup`), it climbs in with the
 //! game's enter clip for the vehicle's class, sits in the seated loop while
@@ -138,7 +142,7 @@ fn run(args: &[String]) -> AnyResult<()> {
                 radius: 600.0,
                 objects: Objects::Static,
                 sea: -35.0,
-                vehicles: 6,
+                vehicles: 8,
             };
             let mut it = rest.iter();
             while let Some(flag) = it.next() {
@@ -1448,17 +1452,19 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
         let Some((kind, label)) = m2_assets::vehicle::kind_from_textures(names) else {
             continue;
         };
-        // Ground vehicles, in the order they are offered.
+        // Ground vehicles and helicopters, in the order they are offered.
         let rank = match kind.as_str() {
             "car" => 0,
             "truck" => 1,
-            "apc" => 3,
-            "tank" => 4,
-            "bus" | "van" | "semi" => 5,
-            "boat" | "helicopter" | "plane" | "airstrike" | "vtol" | "towed" | "trailer"
-            | "outboardmotor" | "winch" | "transport" | "motorcycle" => continue,
+            "helicopter" if label.contains("huey") => 2,
+            "apc" => 4,
+            "tank" => 5,
+            "bus" | "van" | "semi" => 6,
+            "helicopter" => 7,
+            "boat" | "plane" | "airstrike" | "vtol" | "towed" | "trailer" | "outboardmotor"
+            | "winch" | "transport" | "motorcycle" => continue,
             // `global_veh_<model>` textures: civilian cars and trucks.
-            _ => 2,
+            _ => 3,
         };
         candidates.push((rank, label, kind, *hash));
     }
@@ -1466,6 +1472,7 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
     let base = o.detail.unwrap_or([0.0, 0.0]);
     let mut used = HashSet::new();
     let mut parked = Vec::new();
+    let cursor = &mut (base[0] - 20.0);
     // One of each kind first, then the rest in order.
     let mut per_rank: HashMap<usize, usize> = HashMap::new();
     let mut failed = HashSet::new();
@@ -1489,19 +1496,34 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
             for c in &chunks {
                 model.add_streamed(c)?;
             }
-            let wheels = m2_assets::vehicle::find_wheels(&model);
+            let flying = kind == "helicopter";
             let tracked = kind == "tank" || kind == "apc";
-            if !tracked
+            let (wheels, rotors) = if flying {
+                (Vec::new(), m2_assets::vehicle::rotors(&model))
+            } else {
+                (m2_assets::vehicle::find_wheels(&model), Vec::new())
+            };
+            if flying && !rotors.iter().any(|r| r.axis[1] == 1.0) {
+                return Ok(None);
+            }
+            if !flying
+                && !tracked
                 && (!(4..=10).contains(&wheels.len())
                     || wheels.iter().any(|w| !(0.15..=1.3).contains(&w.radius)))
             {
                 return Ok(None);
             }
-            let wheel_of = |node: u16| {
+            // Turning parts: the wheels, then the rotors.
+            let spinners: Vec<(&[u16], [f32; 3])> = wheels
+                .iter()
+                .map(|w| (&w.nodes[..], w.centre))
+                .chain(rotors.iter().map(|r| (&r.nodes[..], r.centre)))
+                .collect();
+            let spinner_of = |node: u16| {
                 let mut n = Some(node);
                 for _ in 0..=model.nodes.len() {
                     let cur = n?;
-                    if let Some(i) = wheels.iter().position(|w| w.nodes.contains(&cur)) {
+                    if let Some(i) = spinners.iter().position(|s| s.0.contains(&cur)) {
                         return Some(i);
                     }
                     n = model.nodes.get(usize::from(cur))?.parent;
@@ -1509,8 +1531,8 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
                 None
             };
             let group = |node: u16| {
-                Some(match wheel_of(node) {
-                    Some(i) => (1 + i, Mat4::from_translation(-Vec3::from(wheels[i].centre))),
+                Some(match spinner_of(node) {
+                    Some(i) => (1 + i, Mat4::from_translation(-Vec3::from(spinners[i].1))),
                     None => (0, Mat4::IDENTITY),
                 })
             };
@@ -1522,7 +1544,7 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
                 by_texture: &mut material_of_texture,
                 untextured: &mut untextured,
             };
-            let (lists, _) = model_primitives(wad, &mut sink, &model, 1 + wheels.len(), &group);
+            let (lists, _) = model_primitives(wad, &mut sink, &model, 1 + spinners.len(), &group);
             if lists[0].is_empty() {
                 return Ok(None);
             }
@@ -1536,10 +1558,15 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
                 };
                 nodes.push(match i {
                     0 => format!(r#"{{"name":"vbody"{mesh}}}"#),
-                    _ => format!(
+                    _ if i <= wheels.len() => format!(
                         r#"{{"name":"wheel {}","translation":{:?}{mesh}}}"#,
                         i - 1,
-                        flip_v(wheels[i - 1].centre)
+                        flip_v(spinners[i - 1].1)
+                    ),
+                    _ => format!(
+                        r#"{{"name":"rotor {}","translation":{:?}{mesh}}}"#,
+                        i - 1 - wheels.len(),
+                        flip_v(spinners[i - 1].1)
                     ),
                 });
                 child_nodes.insert(nodes.len() - 1);
@@ -1573,20 +1600,31 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
                 m2_assets::vehicle::marker(&model, h)
                     .map_or("null".to_owned(), |p| format!("{:?}", flip_v(p)))
             };
+            let rotor_json: Vec<String> = rotors
+                .iter()
+                .map(|r| format!(r#"{{"axis":{:?}}}"#, r.axis))
+                .collect();
+            // In a row, side by side with 3 m between them.
             let b = &model.info.bounds;
-            let k = parked.len() as f32;
-            let at = [base[0] - 3.0 * 7.0 + 7.0 * k, 0.0, base[1] + 12.0];
+            let width = b.max[0] - b.min[0];
+            let at = [*cursor + width / 2.0, 0.0, base[1] + 12.0];
+            *cursor += width + 3.0;
             nodes.push(format!(
-                r#"{{"name":"veh {hash:08x}","translation":{:?},"children":{children:?},"extras":{{"vehicle":{{"model":"{hash:08x}","kind":"{kind}","name":"{label}","tracked":{tracked},"mass":{},"min":{:?},"max":{:?},"seat":{},"door":{},"wheels":[{}]}}}}}}"#,
+                r#"{{"name":"veh {hash:08x}","translation":{:?},"children":{children:?},"extras":{{"vehicle":{{"model":"{hash:08x}","kind":"{kind}","name":"{label}","tracked":{tracked},"mass":{},"min":{:?},"max":{:?},"seat":{},"door":{},"flying":{flying},"wheels":[{}],"rotors":[{}]}}}}}}"#,
                 flip_v(at),
                 mass.map_or("null".to_owned(), |m| m.to_string()),
                 flip_v(b.min),
                 flip_v(b.max),
                 marker(DRIVER_SEAT),
                 marker(DRIVER_DOOR),
-                wheel_json.join(",")
+                wheel_json.join(","),
+                rotor_json.join(",")
             ));
-            Ok(Some(format!("{label} ({kind}, {} wheels)", wheels.len())))
+            Ok(Some(format!(
+                "{label} ({kind}, {} wheels, {} rotors)",
+                wheels.len(),
+                rotors.len()
+            )))
         })();
         match built {
             Ok(Some(desc)) => {
