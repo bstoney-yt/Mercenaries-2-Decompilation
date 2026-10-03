@@ -135,8 +135,9 @@ only) once item 11 lands.
 - Item 6: `m2-engine::physics` (Rapier) loads PHY2 shapes and the
   triangle fallback, with a kinematic character controller (0.5 m step,
   50° slope) and raycast vehicles.
-- Item 7: `m2-alpha::sound` plays the PCM banks and the streamed music,
-  ambience and voice tracks in 3D.
+- Item 7: `m2-engine` mixes the PCM banks and the streamed music and
+  ambience; `m2-alpha::sound` plays ambience, music and fight sounds in 3D
+  (voice chatter is not wired in yet).
 - Items 8 to 11, in `m2-alpha` for now: Jennifer on foot, enter, drive and
   get out of the parked vehicles, soldiers at their spawns (patrols where
   the layer names a route) and wandering civilians, rifle, RPG, grenades,
