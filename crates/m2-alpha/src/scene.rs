@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 
 use anyhow::Context as _;
@@ -10,7 +11,7 @@ use m2_engine::anim::load_clips;
 use m2_engine::vehicle::{DRIVABLE, catalogue};
 use m2_engine::{
     Animator, AssetSource, BoundClip, CatalogueEntry, CpuModel, Gait, GpuModel, Install,
-    Locomotion, MaterialCache, Skeleton, VehicleId, VehicleSpec, World, WorldSettings,
+    Locomotion, MaterialCache, PersonModel, Skeleton, VehicleId, VehicleSpec, World, WorldSettings,
 };
 use m2_math::glam::{Mat4, Vec3};
 use m2_render::{
@@ -20,6 +21,7 @@ use m2_render::{
     generate_mips,
 };
 
+use crate::npc::{self, People, PersonKind};
 use crate::player::Player;
 
 /// Jennifer Mui, the playable mercenary whose model the README's export
@@ -43,10 +45,11 @@ pub struct Placed {
 }
 
 /// A skinned model's skeleton, the clips that fit it, and what it plays.
-#[derive(Debug)]
+/// Clones share the skeleton and clips, each with its own animator.
+#[derive(Clone, Debug)]
 pub struct Rig {
-    pub skeleton: Skeleton,
-    pub clips: Vec<BoundClip>,
+    pub skeleton: Arc<Skeleton>,
+    pub clips: Arc<Vec<BoundClip>>,
     pub locomotion: Option<Locomotion>,
     pub animator: Animator,
     pub gait: Gait,
@@ -90,11 +93,23 @@ impl Rig {
         Some(self.clips[i].info.speed)
     }
 
+    /// This rig's clips on another model's `skeleton`, if it has the same
+    /// bones (every human model shares one skeleton).
+    pub fn for_skeleton(&self, skeleton: Skeleton) -> Option<Self> {
+        (skeleton.name_hashes == self.skeleton.name_hashes
+            && skeleton.parents == self.skeleton.parents)
+            .then(|| Self {
+                skeleton: Arc::new(skeleton),
+                animator: Animator::default(),
+                ..self.clone()
+            })
+    }
+
     fn new(skeleton: Skeleton, clips: Vec<BoundClip>, gait: Gait) -> Self {
         let locomotion = Locomotion::choose(&clips);
         let mut rig = Self {
-            skeleton,
-            clips,
+            skeleton: Arc::new(skeleton),
+            clips: Arc::new(clips),
             locomotion,
             animator: Animator::default(),
             gait,
@@ -147,7 +162,9 @@ pub struct Scene {
     pub player: Option<Player>,
     /// Drivable vehicles near the spawn.
     pub vehicles: Vec<ParkedVehicle>,
-    vehicle_loads: Option<Receiver<(VehicleSpec, CpuModel)>>,
+    /// Soldiers and civilians.
+    pub people: People,
+    vehicle_loads: Option<Receiver<Loaded>>,
 }
 
 /// A vehicle to drive: what it is, its model, and its body once placed.
@@ -178,15 +195,57 @@ const NOT_DRIVABLE: [&str; 13] = [
 /// Vehicles parked by the spawn: one of each drivable kind first.
 const PARKED: usize = 8;
 
-/// Finds the island's vehicle models and decodes up to [`PARKED`] of them,
-/// on a thread (the search reads the whole archive).
-fn load_vehicles(install: Install) -> Receiver<(VehicleSpec, CpuModel)> {
+/// Person models loaded: the soldiers the spawn names ask for, then
+/// civilians.
+const ARMY: [&str; 3] = ["vz_hum_soldier", "vz_hum_soldierelite", "vz_hum_deathsquad"];
+const CIVILIAN_MODELS: usize = 6;
+
+/// A model the loading thread has decoded.
+pub enum Loaded {
+    Vehicle(VehicleSpec, CpuModel),
+    Person(PersonModel, CpuModel, Skeleton),
+}
+
+/// Finds the island's vehicle and person models and decodes the soldiers,
+/// a few civilians and up to [`PARKED`] vehicles, on a thread (the search
+/// reads the whole archive).
+fn load_cast(install: Install) -> Receiver<Loaded> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         let result = (|| -> anyhow::Result<()> {
             let mut source = install.open_world()?;
-            let all = catalogue(&mut source)?;
+            let found = catalogue(&mut source)?;
+            let people: Vec<&PersonModel> = found
+                .people
+                .iter()
+                .filter(|p| ARMY.contains(&p.role.as_str()))
+                .chain(
+                    found
+                        .people
+                        .iter()
+                        .filter(|p| !p.soldier)
+                        .take(CIVILIAN_MODELS),
+                )
+                .collect();
+            eprintln!(
+                "people: {} roles; loading {}",
+                found.people.len(),
+                people
+                    .iter()
+                    .map(|p| p.role.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for p in people {
+                let data = source.model(p.model)?;
+                let cpu = CpuModel::from_data(&data, 0)?;
+                let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
+                if tx.send(Loaded::Person(p.clone(), cpu, skeleton)).is_err() {
+                    return Ok(());
+                }
+            }
+            let all = &found.vehicles;
             let drivable: Vec<&CatalogueEntry> = all
                 .iter()
                 .filter(|e| {
@@ -237,7 +296,7 @@ fn load_vehicles(install: Install) -> Receiver<(VehicleSpec, CpuModel)> {
                     spec.wheels.len()
                 );
                 let cpu = CpuModel::build(e.model, &model, 0);
-                if tx.send((spec, cpu)).is_err() {
+                if tx.send(Loaded::Vehicle(spec, cpu)).is_err() {
                     return Ok(());
                 }
                 sent += 1;
@@ -245,7 +304,7 @@ fn load_vehicles(install: Install) -> Receiver<(VehicleSpec, CpuModel)> {
             Ok(())
         })();
         if let Err(e) = result {
-            eprintln!("vehicles: {e:#}");
+            eprintln!("vehicles and people: {e:#}");
         }
     });
     rx
@@ -264,6 +323,7 @@ impl Scene {
             focus: (Vec3::new(0.0, 2.0, 6.0), Vec3::new(0.0, 1.0, 0.0)),
             player: None,
             vehicles: Vec::new(),
+            people: People::default(),
             vehicle_loads: None,
         })
     }
@@ -369,7 +429,7 @@ impl Scene {
             }
         };
         self.player = Some(Player::new(x, z, 0.0, model));
-        self.vehicle_loads = Some(load_vehicles(install.clone()));
+        self.vehicle_loads = Some(load_cast(install.clone()));
         Ok(())
     }
 
@@ -381,18 +441,40 @@ impl Scene {
         // At most one vehicle a frame: each uploads a model.
         if let (Some(rx), Some(source)) = (&self.vehicle_loads, &mut self.source) {
             match rx.try_recv() {
-                Ok((spec, cpu)) => {
+                Ok(loaded) => {
+                    let cpu = match &loaded {
+                        Loaded::Vehicle(_, cpu) | Loaded::Person(_, cpu, _) => cpu,
+                    };
                     self.materials.load_textures(
                         backend,
                         source,
                         cpu.texture_hashes().collect::<Vec<_>>(),
                     )?;
-                    let model = GpuModel::upload(backend, &mut self.materials, &cpu)?;
-                    self.vehicles.push(ParkedVehicle {
-                        spec,
-                        model,
-                        id: None,
-                    });
+                    let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
+                    match loaded {
+                        Loaded::Vehicle(spec, _) => self.vehicles.push(ParkedVehicle {
+                            spec,
+                            model,
+                            id: None,
+                        }),
+                        Loaded::Person(p, _, skeleton) => {
+                            // Her clips fit every human skeleton.
+                            let template = self
+                                .player
+                                .as_ref()
+                                .and_then(|pl| pl.model.as_ref())
+                                .and_then(|(_, rig)| rig.for_skeleton(skeleton));
+                            match template {
+                                Some(rig) => self.people.kinds.push(PersonKind {
+                                    role: p.role,
+                                    soldier: p.soldier,
+                                    model,
+                                    rig,
+                                }),
+                                None => eprintln!("person {}: skeleton differs; left out", p.role),
+                            }
+                        }
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.vehicle_loads = None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -401,7 +483,7 @@ impl Scene {
         Ok(())
     }
 
-    /// Vehicles are still being found and decoded.
+    /// Vehicles and people are still being found and decoded.
     pub fn vehicles_loading(&self) -> bool {
         self.vehicle_loads.is_some()
     }
@@ -451,6 +533,14 @@ impl Scene {
         {
             let (nodes, skin) = rig.posed();
             model.draw_posed(backend, queue, player.model_matrix(), &nodes, &skin)?;
+        }
+        for n in &self.people.npcs {
+            if !n.landed || n.character.position.distance(eye) > npc::DRAW_DISTANCE {
+                continue;
+            }
+            let (nodes, skin) = n.rig.posed();
+            let model = &self.people.kinds[n.kind].model;
+            model.draw_posed(backend, queue, n.model_matrix(), &nodes, &skin)?;
         }
         for p in &self.models {
             match &p.rig {

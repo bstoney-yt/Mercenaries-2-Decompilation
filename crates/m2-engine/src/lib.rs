@@ -27,5 +27,5 @@ pub use audio::{Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId};
 pub use model::{CpuModel, GpuModel, MaterialCache};
 pub use physics::{Character, CollisionShape, Physics, StaticKey, VehicleControls, VehicleId};
 pub use stream::{World, WorldSettings, WorldStats};
-pub use vehicle::{CatalogueEntry, VehicleSpec};
+pub use vehicle::{Catalogue, CatalogueEntry, PersonModel, VehicleSpec};
 pub use world::WorldIndex;

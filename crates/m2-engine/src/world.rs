@@ -4,7 +4,8 @@
 //! [`WorldIndex::build`] reads only the entity layers (finding them through
 //! the archive's asset table, so the rest of the 2.5 GB archive is not
 //! decoded) and records the `TerrainObject`, `LowResTerrainObject` and
-//! `ModelName` placements. Terrain is read later, cell by cell, by
+//! `ModelName` placements, and the people the layers place (soldiers at
+//! their posts and on their patrol routes). Terrain is read later, cell by cell, by
 //! [`terrain_cell`] and [`low_res_tile`].
 //!
 //! # Provenance
@@ -16,9 +17,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
 use m2_assets::layer::LAYER_TYPE;
+use m2_assets::path::PATH_TYPE;
 use m2_assets::terrain::{CELL_SIZE, TerrainGroup, colour_map_uv};
 use m2_assets::vertex::DeclUsage;
-use m2_assets::{BlockContents, Layer, LowResTile, TerrainCell};
+use m2_assets::{BlockContents, Layer, LowResTile, Path, TerrainCell};
 use m2_math::glam::{Quat, Vec3};
 use m2_render::{
     BufferUsage, IndexBufferDesc, IndexFormat, VertexBufferDesc, VertexFormat, VertexLayout,
@@ -44,6 +46,21 @@ pub struct ObjectPlacement {
     pub rotation: Quat,
 }
 
+/// A person a layer places: a soldier at a post or on a patrol route,
+/// from the `PopulationSimpleSpawner`, `Ai` and `AiPatrol` components.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpawnPoint {
+    pub entity: u32,
+    /// The entity's name (`VZ Soldier 03`, ...): the only hint of who it
+    /// spawns, as which model a spawner uses is not decoded.
+    pub name: String,
+    pub position: Vec3,
+    pub rotation: Quat,
+    /// The patrol route its `AiPatrol` names, world space; empty for a
+    /// post.
+    pub route: Vec<Vec3>,
+}
+
 /// Where everything on the island is.
 #[derive(Clone, Debug, Default)]
 pub struct WorldIndex {
@@ -54,6 +71,27 @@ pub struct WorldIndex {
     /// Models placed by the static layers (the world as it always is,
     /// without mission states).
     pub objects: Vec<ObjectPlacement>,
+    /// People the layers place, all layers.
+    pub spawns: Vec<SpawnPoint>,
+}
+
+/// What [`WorldIndex::build`] gathers to find patrol routes: soldier to
+/// path entity (`AiPatrol`'s third field), path entity to path asset
+/// (`Path`'s field), and every entity's placement.
+#[derive(Default)]
+struct Routes {
+    patrol_of: HashMap<u32, u32>,
+    path_of: HashMap<u32, u32>,
+    placed: HashMap<u32, (Vec3, Quat)>,
+}
+
+fn rotation(q: [f32; 4]) -> Quat {
+    let r = Quat::from_array(q);
+    if r.is_finite() && r.length() > 0.5 {
+        r.normalize()
+    } else {
+        Quat::IDENTITY
+    }
 }
 
 impl WorldIndex {
@@ -73,6 +111,7 @@ impl WorldIndex {
         blocks.sort_unstable();
 
         let mut world = Self::default();
+        let mut routes = Routes::default();
         for (block, is_static) in blocks {
             let decoded = source.block(block)?;
             for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -83,9 +122,71 @@ impl WorldIndex {
                     continue;
                 };
                 world.add_layer(&layer, is_static);
+                world.add_people(&layer, &mut routes);
             }
         }
+        let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
+        for spawn in &mut world.spawns {
+            let Some(&target) = routes.patrol_of.get(&spawn.entity) else {
+                continue;
+            };
+            let (Some(&(at, q)), Some(&asset)) =
+                (routes.placed.get(&target), routes.path_of.get(&target))
+            else {
+                continue;
+            };
+            let points = paths.entry(asset).or_insert_with(|| {
+                source
+                    .asset(asset, PATH_TYPE)
+                    .ok()
+                    .and_then(|data| Path::parse(&data).ok())
+                    .map(|p| p.points.into_iter().map(Vec3::from).collect())
+                    .unwrap_or_default()
+            });
+            spawn.route = points.iter().map(|&p| at + q * p).collect();
+        }
         Ok(world)
+    }
+
+    fn add_people(&mut self, layer: &Layer<'_>, routes: &mut Routes) {
+        let placements = layer.placements();
+        routes.placed.extend(
+            placements
+                .iter()
+                .map(|(&e, p)| (e, (Vec3::from(p.position), rotation(p.rotation)))),
+        );
+        routes.path_of.extend(layer.hashes("Path"));
+        if let Some(c) = layer.component("AiPatrol") {
+            for (id, rec) in c.records().unwrap_or_default() {
+                if let Some(b) = rec.get(8..12) {
+                    routes
+                        .patrol_of
+                        .insert(id, u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                }
+            }
+        }
+        let names = layer.names();
+        let mut seen: HashSet<u32> = HashSet::new();
+        for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
+            let Some(c) = layer.component(component) else {
+                continue;
+            };
+            for (id, _) in c.records().unwrap_or_default() {
+                let Some(p) = placements.get(&id) else {
+                    continue;
+                };
+                if !seen.insert(id) {
+                    continue;
+                }
+                self.spawns.push(SpawnPoint {
+                    entity: id,
+                    name: names.get(&id).copied().unwrap_or("").to_owned(),
+                    position: Vec3::from(p.position),
+                    rotation: rotation(p.rotation),
+                    route: Vec::new(),
+                });
+            }
+        }
     }
 
     fn add_layer(&mut self, layer: &Layer<'_>, is_static: bool) {
@@ -104,15 +205,10 @@ impl WorldIndex {
         if is_static {
             for (entity, model) in layer.hashes("ModelName") {
                 if let Some(p) = at(entity) {
-                    let rotation = Quat::from_array(p.rotation);
                     self.objects.push(ObjectPlacement {
                         model,
                         position: Vec3::from(p.position),
-                        rotation: if rotation.is_finite() && rotation.length() > 0.5 {
-                            rotation.normalize()
-                        } else {
-                            Quat::IDENTITY
-                        },
+                        rotation: rotation(p.rotation),
                     });
                 }
             }

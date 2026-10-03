@@ -12,6 +12,7 @@ m2-alpha [options]
   --size <w>x<h>         window size
   --vsync on|off
   --fullscreen
+  --sea <metres>         sea level (default -35, an estimate)
   --double-sided         start with back-face culling off (as F3)
   --screenshot <out.ppm> render one frame offscreen and exit
   --drive                with --screenshot on the island: get in the

@@ -17,6 +17,8 @@ pub struct Game {
     pub camera: FlyCamera,
     /// Playing as Jennifer rather than flying the camera.
     pub on_foot: bool,
+    /// Seconds to the next look for parking spots.
+    park_wait: f32,
 }
 
 impl Game {
@@ -26,6 +28,7 @@ impl Game {
             scene,
             camera,
             on_foot,
+            park_wait: 0.0,
         }
     }
 
@@ -50,7 +53,10 @@ impl Game {
             let physics = &mut world.physics;
             let player = scene.player.as_mut().filter(|_| self.on_foot);
             if let Some(player) = player {
-                if player.landed {
+                self.park_wait -= dt;
+                if player.landed && self.park_wait <= 0.0 {
+                    // Each look can cast thousands of rays: not every tick.
+                    self.park_wait = 0.5;
                     park(physics, &mut scene.vehicles, player);
                 }
                 if intent.use_pressed {
@@ -91,6 +97,14 @@ impl Game {
             } else {
                 physics.step(dt);
             }
+        }
+        let focus = self.focus();
+        if let Some(world) = &self.scene.world
+            && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
+        {
+            self.scene
+                .people
+                .update(&world.physics, &world.index.spawns, focus, dt);
         }
         self.scene.tick(dt);
     }
@@ -168,13 +182,22 @@ impl Game {
 
 /// How close she must be to a vehicle's door (or side) to get in, metres.
 const REACH: f32 = 4.0;
-/// Where the parked row starts ahead of her, and the gap between vehicles.
-const PARK_AHEAD: f32 = 12.0;
-const PARK_GAP: f32 = 2.0;
-const PARK_LEFT: f32 = 6.0;
 
-/// Parks vehicles that have loaded but have no body yet, side by side in a
-/// row ahead of the player, facing the way she faces.
+/// Parking: the first spot looked at is this far ahead of her; spots are
+/// tried on a grid this fine, out to this far.
+const PARK_AHEAD: f32 = 14.0;
+const PARK_GRID: f32 = 4.0;
+const PARK_SPOTS: i32 = 12;
+/// A spot is flat enough when the ground under the footprint's corners
+/// varies by less than this fraction of its length (about 10°) plus a
+/// little, near the height of her feet (not a roof).
+const PARK_FLAT: f32 = 0.18;
+const PARK_ROOF: f32 = 8.0;
+/// Room left between parked vehicles, metres.
+const PARK_GAP: f32 = 1.5;
+
+/// Parks vehicles that have loaded but have no body yet on flat, clear
+/// ground near the spot ahead of the player, facing the way she faces.
 fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player) {
     if vehicles.iter().all(|v| v.id.is_some()) {
         return;
@@ -182,29 +205,73 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player) 
     let (s, c) = player.facing.sin_cos();
     let forward = Vec3::new(s, 0.0, c);
     let right = Vec3::new(c, 0.0, -s);
-    // Across the row: each vehicle takes its width plus a gap, starting a
-    // little to her left.
-    let mut across = 0.0;
-    for v in vehicles.iter_mut() {
-        let width = v.spec.bounds.1.x - v.spec.bounds.0.x;
-        let length = v.spec.bounds.1.z - v.spec.bounds.0.z;
-        let offset = across + width * 0.5;
-        across += width + PARK_GAP;
-        if v.id.is_some() {
-            continue;
-        }
-        let base = player.character.position
-            + forward * (PARK_AHEAD + length * 0.5)
-            + right * (offset - PARK_LEFT);
-        let top = base + Vec3::Y * 50.0;
-        let Some((d, _)) = physics.cast_ray(top, -Vec3::Y, 200.0) else {
-            // Ground not loaded there yet: try again next tick.
-            continue;
+    let feet = player.character.position;
+    let ahead = feet + forward * PARK_AHEAD;
+    // Spots nearest the one ahead first.
+    let mut spots: Vec<Vec3> = (-PARK_SPOTS..=PARK_SPOTS)
+        .flat_map(|i| (-PARK_SPOTS..=PARK_SPOTS).map(move |j| (i, j)))
+        .map(|(i, j)| ahead + right * (i as f32 * PARK_GRID) + forward * (j as f32 * PARK_GRID))
+        .filter(|p| p.distance(feet) > 6.0)
+        .collect();
+    spots.sort_by(|a, b| a.distance(ahead).total_cmp(&b.distance(ahead)));
+    // Footprints taken: centre and radius.
+    let mut taken: Vec<(Vec3, f32)> = vehicles
+        .iter()
+        .filter_map(|v| {
+            let at = physics.vehicle_transform(v.id?)?;
+            let (lo, hi) = v.spec.bounds;
+            Some((
+                at.transform_point3((lo + hi) * 0.5),
+                footprint_radius(&v.spec),
+            ))
+        })
+        .collect();
+    for v in vehicles.iter_mut().filter(|v| v.id.is_none()) {
+        let (lo, hi) = v.spec.bounds;
+        let radius = footprint_radius(&v.spec);
+        let middle = Vec3::new((lo.x + hi.x) * 0.5, 0.0, (lo.z + hi.z) * 0.5);
+        let length = (hi.z - lo.z).max(hi.x - lo.x);
+        let ground = |p: Vec3| {
+            let top = Vec3::new(p.x, feet.y + PARK_ROOF, p.z);
+            physics
+                .cast_ray(top, -Vec3::Y, PARK_ROOF * 3.0)
+                .map(|(d, _)| top.y - d)
         };
-        let ground = top.y - d;
-        let at = Vec3::new(base.x, ground + v.spec.ride_height() + 0.3, base.z);
+        let spot = spots.iter().find_map(|&centre| {
+            if taken
+                .iter()
+                .any(|&(c, r)| (c - centre).with_y(0.0).length() < r + radius + PARK_GAP)
+            {
+                return None;
+            }
+            let corner = |x: f32, z: f32| centre + right * x + forward * z;
+            let (hx, hz) = ((hi.x - lo.x) * 0.5, (hi.z - lo.z) * 0.5);
+            let heights = [
+                ground(centre)?,
+                ground(corner(-hx, -hz))?,
+                ground(corner(hx, -hz))?,
+                ground(corner(-hx, hz))?,
+                ground(corner(hx, hz))?,
+            ];
+            let (min, max) = heights
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &h| (a.min(h), b.max(h)));
+            (max - min <= length * PARK_FLAT + 0.2 && (max - feet.y).abs() < PARK_ROOF)
+                .then_some((centre, max))
+        });
+        // Nowhere yet (the ground may still be loading): try next tick.
+        let Some((centre, top)) = spot else { continue };
+        let origin = centre - (right * middle.x + forward * middle.z);
+        let at = Vec3::new(origin.x, top + v.spec.ride_height() + 0.3, origin.z);
         v.id = Some(physics.add_vehicle(&v.spec, at, player.facing));
+        taken.push((centre, radius));
     }
+}
+
+/// Half the diagonal of a vehicle's footprint.
+fn footprint_radius(spec: &m2_engine::VehicleSpec) -> f32 {
+    let (lo, hi) = spec.bounds;
+    (hi.x - lo.x).hypot(hi.z - lo.z) * 0.5
 }
 
 /// The vehicle nearest her within `reach` metres of its door marker (or its

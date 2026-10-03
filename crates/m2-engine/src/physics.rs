@@ -330,9 +330,23 @@ impl Physics {
                 .angular_damping(0.5)
                 .can_sleep(false),
         );
+        // Mass low in the hull (as an engine and axles put it) and inertia
+        // a little above a solid box's, so it takes a steep slope or a
+        // hard turn without rolling over.
+        let m = spec.mass;
+        let size = half * 2.0;
+        let inertia = Vec3::new(
+            size.y * size.y + size.z * size.z,
+            size.x * size.x + size.z * size.z,
+            size.x * size.x + size.y * size.y,
+        ) * (m / 12.0 * 1.5);
         let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
             .translation(vector(centre))
-            .mass(spec.mass)
+            .mass_properties(r::MassProperties::new(
+                vector(Vec3::new(0.0, -half.y * 0.8, 0.0)),
+                m,
+                vector(inertia),
+            ))
             .friction(0.6);
         self.world.insert_collider(collider, Some(body));
 
@@ -637,6 +651,37 @@ mod tests {
             node_wheel: Vec::new(),
             mass: 1400.0,
         }
+    }
+
+    #[test]
+    fn cars_cross_a_steep_side_slope_upright() {
+        let mut p = Physics::new();
+        // A 30° slope falling away to +x; the car drives across it (+z).
+        let half = 100.0;
+        let v = [
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(-half, 0.0, half),
+        ];
+        let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        let tilt = Quat::from_rotation_z(-30f32.to_radians());
+        p.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, tilt);
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.3, 0.0), 0.0);
+        for _ in 0..240 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    steer: -0.3,
+                    brake: false,
+                },
+            );
+            p.step(DT);
+        }
+        let up = p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
+        assert!(up.y > 0.7, "rolled: {up}");
     }
 
     #[test]
