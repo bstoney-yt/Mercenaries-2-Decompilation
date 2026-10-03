@@ -1,7 +1,8 @@
 m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
 
 m2-alpha [options]
-  --install <dir>        the game's install folder (holding data\vz.wad)
+  --install <dir>        the game's install folder (holding data\vz.wad); the EA app
+                         folder in Program Files is found without it
   --spawn <x>,<z>        where on the island to start (default 450,-1950)
   --fly                  start with the free camera instead of on foot
   --model <hash>         a model to show (hex name hash; repeatable)

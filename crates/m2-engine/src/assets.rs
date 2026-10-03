@@ -76,6 +76,30 @@ impl Install {
         }
     }
 
+    /// Looks for the game in its usual folders: where the EA app installs
+    /// it (seen on a real install) and the older Origin folder (assumed).
+    /// `None` when neither holds it.
+    pub fn detect() -> Option<Self> {
+        Self::detect_in(
+            ["ProgramFiles(x86)", "ProgramFiles"]
+                .iter()
+                .filter_map(std::env::var_os)
+                .map(PathBuf::from),
+        )
+    }
+
+    /// [`detect`](Self::detect), under the given program-files folders.
+    pub fn detect_in(program_files: impl IntoIterator<Item = PathBuf>) -> Option<Self> {
+        const FOLDERS: [&str; 2] = [
+            "EA Games/Mercenaries 2 World in Flames",
+            "Origin Games/Mercenaries 2 World in Flames",
+        ];
+        program_files
+            .into_iter()
+            .flat_map(|p| FOLDERS.map(|f| p.join(f)))
+            .find_map(|root| Self::find(&root).ok())
+    }
+
     pub fn world_archive(&self) -> PathBuf {
         self.data.join("vz.wad")
     }
@@ -368,5 +392,16 @@ mod tests {
         let via_data = Install::find(&dir.join("data")).unwrap();
         assert_eq!(via_data.root, dir);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn installs_are_found_in_the_usual_folders() {
+        let pf = std::env::temp_dir().join(format!("m2-detect-{}", std::process::id()));
+        let root = pf.join("EA Games/Mercenaries 2 World in Flames");
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        assert!(Install::detect_in([pf.clone()]).is_none());
+        std::fs::write(root.join("data").join("vz.wad"), b"").unwrap();
+        assert_eq!(Install::detect_in([pf.clone()]).unwrap().root, root);
+        std::fs::remove_dir_all(&pf).unwrap();
     }
 }

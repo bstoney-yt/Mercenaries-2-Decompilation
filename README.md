@@ -29,13 +29,17 @@ A Cargo workspace targeting the original 32-bit process (`i686-pc-windows-msvc`)
 
 `symbols/` tracks every identified function (name, RVA, signature, translation status); see `symbols/README.md`. Conventions for translating code are in `docs/conventions.md`.
 
-The plan to a playable alpha is in `docs/alpha-roadmap.md`. The native game so far opens a window with a free-flying camera over the island, streamed from your install:
+The plan to a playable alpha is in `docs/alpha-roadmap.md`. `m2-alpha` is the native game: it plays the island from your own install of Mercenaries 2 (the EA app edition is found on its own; otherwise pass `--install`). Nothing from the game ships with it. Jennifer starts in the first town on foot, with vehicles parked ahead, soldiers at their posts and civilians about. Esc opens the menu (settings, controls, save, load, quit); F5 and F9 quick save and load. Handling, damage and AI are our own, not the game's.
+
+Each CI run builds `m2-alpha.exe` (32-bit Windows) and keeps it as a downloadable artifact. To build it yourself:
 
 ```sh
-cargo run --release -p m2-alpha -- --install "<install dir>"   # the island from above the first town; Tab captures the mouse, WASD/Space/C fly, Shift faster
+cargo run --release -p m2-alpha                                 # finds the game in Program Files, or:
+cargo run --release -p m2-alpha -- --install "<install dir>"   # on foot in the first town
 cargo run --release -p m2-alpha -- --install "<install dir>" --spawn 0,0   # start somewhere else (game x, z)
 cargo run --release -p m2-alpha -- --install "<install dir>" --model 15d89832 --model <hash>   # models side by side on a ground grid
 cargo run --release -p m2-alpha -- --write-config > m2-alpha.toml   # settings file (install path, window, keys)
+cargo run --release -p m2-alpha -- --help                       # every option and control
 ```
 
 ```sh
