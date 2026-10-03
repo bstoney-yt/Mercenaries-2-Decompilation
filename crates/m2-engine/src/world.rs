@@ -26,6 +26,7 @@ use m2_render::{
 };
 
 use crate::assets::{AssetError, AssetSource};
+use crate::physics::CollisionShape;
 
 /// Side of the island in metres (20 cells of 400 m).
 pub const ISLAND: f32 = 8000.0;
@@ -160,6 +161,9 @@ pub struct TerrainMesh {
     pub colour_map: Option<u32>,
     /// Lowest and highest vertex, relative to `origin`.
     pub bounds: (Vec3, Vec3),
+    /// The ground surface (without skirts) for collision, relative to
+    /// `origin`; built for full-detail cells only.
+    pub collision: Option<CollisionShape>,
 }
 
 impl TerrainMesh {
@@ -174,6 +178,26 @@ impl TerrainMesh {
 
     pub fn vertex_count(&self) -> u32 {
         (self.vertices.len() / 32) as u32
+    }
+
+    /// Vertex positions, relative to `origin`.
+    pub fn positions(&self) -> Vec<Vec3> {
+        self.vertices
+            .chunks_exact(32)
+            .map(|v| {
+                let f = |i: usize| f32::from_le_bytes(v[i..i + 4].try_into().expect("4 bytes"));
+                Vec3::new(f(0), f(4), f(8))
+            })
+            .collect()
+    }
+
+    fn build_collision(&mut self) {
+        let triangles: Vec<[u32; 3]> = self
+            .indices
+            .chunks_exact(3)
+            .map(|t| [t[0], t[1], t[2]])
+            .collect();
+        self.collision = CollisionShape::mesh(&self.positions(), &triangles);
     }
 
     pub fn vertex_desc(&self) -> VertexBufferDesc {
@@ -301,6 +325,7 @@ pub fn terrain_cell<R: Read + Seek>(
             mesh.add_group(g, offset, |p| colour_map_uv(p.x, p.z));
         }
     }
+    mesh.build_collision();
     mesh.add_skirts(CELL_SKIRT);
     Ok(mesh)
 }

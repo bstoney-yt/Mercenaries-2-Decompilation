@@ -14,9 +14,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
-use m2_assets::Model;
 use m2_assets::model::{GeometryKind, Material, TOPOLOGY};
 use m2_assets::vertex::DeclUsage;
+use m2_assets::{Model, Ucfx};
 use m2_math::glam::{Mat4, Vec3};
 use m2_render::{
     BackendError, BlendMode, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
@@ -24,7 +24,8 @@ use m2_render::{
     TextureFormat, TextureHandle, VertexBufferDesc, VertexBufferHandle, generate_mips,
 };
 
-use crate::assets::{AssetSource, DecodedTexture};
+use crate::assets::{AssetError, AssetSource, DecodedTexture, ModelData};
+use crate::physics::CollisionShape;
 
 /// Textures and materials shared between models.
 #[derive(Debug)]
@@ -240,6 +241,9 @@ pub struct CpuModel {
     pub bounds: (Vec3, Vec3),
     /// Groups left out because their vertex format isn't supported.
     pub skipped_groups: usize,
+    /// Static collision in model space; [`from_data`](Self::from_data)
+    /// builds it, [`build`](Self::build) does not.
+    pub collision: Option<CollisionShape>,
 }
 
 impl CpuModel {
@@ -321,7 +325,19 @@ impl CpuModel {
             materials: model.materials.clone(),
             bounds: (lo, hi),
             skipped_groups,
+            collision: None,
         }
+    }
+
+    /// Parses `data` and builds its geometry at `lod`, with its collision.
+    pub fn from_data(data: &ModelData, lod: u32) -> Result<Self, AssetError> {
+        let model = data.parse()?;
+        let mut cpu = Self::build(data.hash, &model, lod);
+        let phy2 = Ucfx::parse(&data.base)
+            .ok()
+            .and_then(|u| u.top_level(*b"PHY2"));
+        cpu.collision = CollisionShape::for_model(&model, phy2, lod);
+        Ok(cpu)
     }
 
     /// Base-colour textures the model's materials use.

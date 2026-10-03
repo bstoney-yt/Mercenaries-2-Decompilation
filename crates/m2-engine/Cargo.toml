@@ -13,6 +13,7 @@ m2-layout.workspace = true
 m2-math.workspace = true
 m2-mem.workspace = true
 m2-render.workspace = true
+rapier3d.workspace = true
 thiserror.workspace = true
 
 [lints]
