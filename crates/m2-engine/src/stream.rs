@@ -248,7 +248,6 @@ struct ClumpGpu {
     index_buffer: IndexBufferHandle,
     count: u32,
     material: MaterialId,
-    fade_end: f32,
     instances: Vec<Mat4>,
 }
 
@@ -273,7 +272,8 @@ pub struct WorldStats {
     pub cells: usize,
     pub models: usize,
     pub objects_drawn: usize,
-    /// Scatter instances drawn last frame.
+    /// Scatter instances loaded, and drawn last frame.
+    pub scatter_loaded: usize,
     pub scatter_drawn: usize,
     pub pending: usize,
     pub failed: usize,
@@ -579,7 +579,6 @@ impl World {
                                     )?,
                                     count: m.indices.len() as u32,
                                     material: materials.material(backend, &m.material)?,
-                                    fade_end: m.fade_end,
                                     instances: m.instances,
                                 });
                             }
@@ -612,6 +611,14 @@ impl World {
         self.stats.tiles = ready(&self.tiles);
         self.stats.cells = ready(&self.cells);
         self.stats.models = ready(&self.models);
+        self.stats.scatter_loaded = self
+            .scatter
+            .values()
+            .map(|s| match s {
+                Slot::Ready(c) => c.iter().map(|c| c.instances.len()).sum(),
+                _ => 0,
+            })
+            .sum();
         self.stats.failed = failed(&self.tiles) + failed(&self.cells) + failed(&self.models);
         Ok(())
     }
@@ -772,8 +779,10 @@ impl World {
         for slot in self.scatter.values() {
             let Slot::Ready(clumps) = slot else { continue };
             for c in clumps {
-                let reach = c.fade_end.min(self.settings.scatter_distance);
-                let reach2 = reach * reach;
+                // Stopping at the meshes' fade distances left the ground
+                // nearly bare on the device; until what they mean is
+                // checked, everything within reach draws.
+                let reach2 = self.settings.scatter_distance.powi(2);
                 near.clear();
                 near.extend(
                     c.instances

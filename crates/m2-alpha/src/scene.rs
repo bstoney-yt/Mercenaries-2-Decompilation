@@ -730,7 +730,43 @@ impl Scene {
 }
 
 /// A 2 km square at height 0 with a grid texture.
-/// A small round mesh (an octahedron) and the materials shots, flashes,
+/// A unit sphere: an octahedron split three times, 512 faces.
+fn sphere() -> (Vec<Vec3>, Vec<[u16; 3]>) {
+    let mut points = vec![Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+    let mut faces: Vec<[u16; 3]> = vec![
+        [0, 2, 4],
+        [2, 1, 4],
+        [1, 3, 4],
+        [3, 0, 4],
+        [2, 0, 5],
+        [1, 2, 5],
+        [3, 1, 5],
+        [0, 3, 5],
+    ];
+    for _ in 0..3 {
+        let mut middle = std::collections::HashMap::new();
+        let mut mid = |a: u16, b: u16, points: &mut Vec<Vec3>| -> u16 {
+            *middle.entry((a.min(b), a.max(b))).or_insert_with(|| {
+                points.push((points[usize::from(a)] + points[usize::from(b)]).normalize());
+                (points.len() - 1) as u16
+            })
+        };
+        faces = faces
+            .iter()
+            .flat_map(|&[a, b, c]| {
+                let (ab, bc, ca) = (
+                    mid(a, b, &mut points),
+                    mid(b, c, &mut points),
+                    mid(c, a, &mut points),
+                );
+                [[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]]
+            })
+            .collect();
+    }
+    (points, faces)
+}
+
+/// A small sphere and the materials shots, flashes,
 /// fire and smoke are drawn with, stretched and scaled per effect.
 #[derive(Debug)]
 struct Effects {
@@ -746,7 +782,7 @@ impl Effects {
         use VertexFormat::*;
         use VertexSemantic::*;
         let layout = VertexLayout::packed(&[(Position, Float3), (Normal, Float3)])?;
-        let points = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+        let (points, faces) = sphere();
         let vertices: Vec<u8> = points
             .iter()
             .flat_map(|p| [p.x, p.y, p.z, p.x, p.y, p.z])
@@ -760,16 +796,6 @@ impl Effects {
             },
             Some(&vertices),
         )?;
-        let faces: [[u16; 3]; 8] = [
-            [0, 2, 4],
-            [2, 1, 4],
-            [1, 3, 4],
-            [3, 0, 4],
-            [2, 0, 5],
-            [1, 2, 5],
-            [3, 1, 5],
-            [0, 3, 5],
-        ];
         let indices: Vec<u8> = faces
             .iter()
             .flatten()
@@ -778,7 +804,7 @@ impl Effects {
         let ib = backend.create_index_buffer(
             &IndexBufferDesc {
                 format: IndexFormat::U16,
-                index_count: 24,
+                index_count: faces.len() as u32 * 3,
                 usage: BufferUsage::Static,
             },
             Some(&indices),

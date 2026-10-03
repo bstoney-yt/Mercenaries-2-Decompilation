@@ -398,6 +398,11 @@ impl People {
     }
 
     pub fn add_kind(&mut self, kind: PersonKind) {
+        if !kind.soldier {
+            // Civilians are dealt out across the kinds in: start them
+            // again so the new one gets its share.
+            self.npcs.retain(|n| n.spawn.is_some());
+        }
         self.kinds.push(kind);
     }
 

@@ -1,7 +1,7 @@
 //! The catalogue of vehicle, person and weapon models, kept between runs.
 //!
 //! Finding them reads the whole world archive (12 to 14 seconds on a
-//! desktop), so the result is written beside the settings file and reused
+//! desktop), so the result is written beside the settings file (or the exe) and reused
 //! while the archive's size and modified time are unchanged. The cache
 //! holds only asset hashes and the role names taken from texture names; it
 //! lives on the player's machine and is never shipped.
@@ -42,9 +42,9 @@ struct Person {
     soldier: bool,
 }
 
-/// Where the cache goes: beside the settings file.
+/// Where the cache goes (see [`Config::file_beside`](crate::config::Config::file_beside)).
 pub fn default_path() -> PathBuf {
-    crate::config::Config::default_path().with_file_name(FILE_NAME)
+    crate::config::Config::file_beside(FILE_NAME)
 }
 
 /// What identifies this version of `archive`: its size and modified time.

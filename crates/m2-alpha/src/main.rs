@@ -154,13 +154,14 @@ fn parse_args() -> anyhow::Result<Options> {
     Ok(o)
 }
 
-/// Panics are also written to `m2-alpha-crash.log` beside the settings
-/// file, with a backtrace, since a windowed game has no console to read.
+/// Panics are also written to `m2-alpha-crash.log` (beside the settings
+/// file or the exe), with a backtrace, since a windowed game has no console
+/// to read.
 fn keep_crash_reports() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
-        let path = Config::default_path().with_file_name("m2-alpha-crash.log");
+        let path = Config::file_beside("m2-alpha-crash.log");
         let report = format!(
             "m2-alpha {} crashed: {info}\n\n{}\n",
             env!("CARGO_PKG_VERSION"),
@@ -565,7 +566,21 @@ fn fight_for_screenshot(
         ..Intent::default()
     };
     if let Some(i) = soldier {
+        // Spawns are hundreds of metres out: start the fight 25 m away.
         let at = game.scene.people.npcs[i].character.position;
+        if let Some(p) = game.scene.player.as_mut() {
+            let away = (here - at)
+                .with_y(0.0)
+                .try_normalize()
+                .unwrap_or(m2_math::glam::Vec3::X);
+            p.character.position = at + away * 25.0 + m2_math::glam::Vec3::Y * 2.0;
+            p.character.velocity = m2_math::glam::Vec3::ZERO;
+            p.landed = false;
+        }
+        for _ in 0..90 {
+            game.step(Intent::default(), tick);
+        }
+        let here = game.focus();
         eprintln!(
             "fight: shooting the soldier at {at:.1} ({:.1} m)",
             at.distance(here)
