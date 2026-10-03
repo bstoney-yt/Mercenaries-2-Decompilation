@@ -114,6 +114,10 @@ pub struct Npc {
     /// Running from gunfire: where to, and for how much longer.
     flee: Option<(Vec3, f32)>,
     brain: Brain,
+    /// The aim and fall clips in this person's rig.
+    clips: FightClips,
+    /// The right-hand node, where the rifle is held.
+    pub hand: Option<usize>,
 }
 
 impl Npc {
@@ -127,7 +131,11 @@ impl Npc {
     ) -> Self {
         let mut rig = rig.clone();
         rig.set_gait(Gait::Idle);
+        let clips = FightClips::find(&rig);
+        let hand = crate::combat::right_hand(&rig.skeleton);
         Self {
+            clips,
+            hand,
             kind,
             soldier: spawn.is_some(),
             character: Character::new(at),
@@ -145,8 +153,9 @@ impl Npc {
         }
     }
 
-    /// Takes `damage`; at no health left, falls with `clips.die`.
-    pub fn hurt(&mut self, damage: f32, clips: FightClips) {
+    /// Takes `damage`; at no health left, falls.
+    pub fn hurt(&mut self, damage: f32) {
+        let clips = self.clips;
         if !self.alive {
             return;
         }
@@ -189,14 +198,8 @@ impl Npc {
 
     /// A soldier's tick in a fight with the player at `threat`: stand, turn
     /// to them, aim and fire. False when out of range (the fight is off).
-    fn fight(
-        &mut self,
-        physics: &Physics,
-        threat: Vec3,
-        rng: &mut Rng,
-        clips: FightClips,
-        dt: f32,
-    ) -> bool {
+    fn fight(&mut self, physics: &Physics, threat: Vec3, rng: &mut Rng, dt: f32) -> bool {
+        let clips = self.clips;
         let to = threat - self.character.position;
         let distance = to.with_y(0.0).length();
         if distance > FIGHT_RANGE {
@@ -228,14 +231,7 @@ impl Npc {
             * Mat4::from_rotation_y(self.facing - forward.x.atan2(forward.y))
     }
 
-    fn update(
-        &mut self,
-        physics: &Physics,
-        rng: &mut Rng,
-        threat: Option<Vec3>,
-        clips: FightClips,
-        dt: f32,
-    ) {
+    fn update(&mut self, physics: &Physics, rng: &mut Rng, threat: Option<Vec3>, dt: f32) {
         if !self.landed {
             // Onto the ground (or the roof or floor of their post) under
             // where they were placed.
@@ -261,7 +257,7 @@ impl Npc {
         }
         if self.alert {
             match threat {
-                Some(t) if self.fight(physics, t, rng, clips, dt) => return,
+                Some(t) if self.fight(physics, t, rng, dt) => return,
                 _ => self.alert = false,
             }
         }
@@ -372,6 +368,7 @@ impl Npc {
 pub struct People {
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
+    /// The player's aim and fall clips.
     pub clips: FightClips,
     active: HashSet<u32>,
     rng: Rng,
@@ -398,12 +395,7 @@ impl People {
         self.kinds.iter().position(|k| k.role == role)
     }
 
-    /// Adds a person model; the first sets the fight clips if the player's
-    /// rig has not.
     pub fn add_kind(&mut self, kind: PersonKind) {
-        if self.clips == FightClips::default() {
-            self.clips = FightClips::find(&kind.rig);
-        }
         self.kinds.push(kind);
     }
 
@@ -420,7 +412,7 @@ impl People {
     ) {
         self.populate(spawns, focus);
         for npc in &mut self.npcs {
-            npc.update(physics, &mut self.rng, threat, self.clips, dt);
+            npc.update(physics, &mut self.rng, threat, dt);
         }
     }
 
@@ -619,7 +611,7 @@ pub(crate) mod tests {
         let dt = 1.0 / 60.0;
         let mut furthest: f32 = 0.0;
         for _ in 0..60 * 12 {
-            npc.update(&physics, &mut rng, None, FightClips::default(), dt);
+            npc.update(&physics, &mut rng, None, dt);
             furthest = furthest.max(npc.character.position.z);
         }
         assert!(npc.landed);
@@ -627,7 +619,7 @@ pub(crate) mod tests {
         // Back at the start (or pausing near it) by now: 10 m at 1.4 m/s
         // each way plus a pause.
         for _ in 0..60 * 14 {
-            npc.update(&physics, &mut rng, None, FightClips::default(), dt);
+            npc.update(&physics, &mut rng, None, dt);
         }
         assert!(npc.character.position.z < 2.0, "{}", npc.character.position);
     }
@@ -677,28 +669,21 @@ pub(crate) mod tests {
         let physics = ground();
         let mut rng = Rng::default();
         let dt = 1.0 / 60.0;
-        let clips = FightClips::default();
         let post = Brain::Post { facing: 0.0 };
         let mut soldier = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
-        soldier.update(&physics, &mut rng, None, clips, dt);
+        soldier.update(&physics, &mut rng, None, dt);
         soldier.alert = true;
         // The player off to +x: he turns that way and fires.
         let threat = Some(Vec3::new(30.0, 1.2, 0.0));
         let mut shots = 0;
         for _ in 0..60 * 5 {
-            soldier.update(&physics, &mut rng, threat, clips, dt);
+            soldier.update(&physics, &mut rng, threat, dt);
             shots += usize::from(std::mem::take(&mut soldier.fires));
         }
         assert!((soldier.facing - std::f32::consts::FRAC_PI_2).abs() < 0.05);
         assert!((2..=6).contains(&shots), "{shots}");
         // Out of range: he stands down.
-        soldier.update(
-            &physics,
-            &mut rng,
-            Some(Vec3::new(500.0, 0.0, 0.0)),
-            clips,
-            dt,
-        );
+        soldier.update(&physics, &mut rng, Some(Vec3::new(500.0, 0.0, 0.0)), dt);
         assert!(!soldier.alert);
 
         let stroll = Brain::Wander {
@@ -707,10 +692,10 @@ pub(crate) mod tests {
             wait: 10.0,
         };
         let mut civilian = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, stroll, None);
-        civilian.update(&physics, &mut rng, None, clips, dt);
+        civilian.update(&physics, &mut rng, None, dt);
         civilian.panic(Vec3::new(-5.0, 0.0, 0.0));
         for _ in 0..60 * 2 {
-            civilian.update(&physics, &mut rng, None, clips, dt);
+            civilian.update(&physics, &mut rng, None, dt);
         }
         assert!(
             civilian.character.position.x > 7.0,
@@ -718,9 +703,9 @@ pub(crate) mod tests {
             civilian.character.position
         );
         // Hurt to death.
-        civilian.hurt(60.0, clips);
+        civilian.hurt(60.0);
         assert!(civilian.alive);
-        civilian.hurt(60.0, clips);
+        civilian.hurt(60.0);
         assert!(!civilian.alive);
     }
 

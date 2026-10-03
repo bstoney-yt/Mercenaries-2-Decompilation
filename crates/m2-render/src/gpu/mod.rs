@@ -1260,6 +1260,38 @@ impl RenderBackend for WgpuBackend {
     }
 
     fn end_frame(&mut self) -> Result<(), BackendError> {
+        self.finish_frame(None)
+    }
+}
+
+/// Where an overlay (a HUD, a menu) draws, after the world and before the
+/// frame is shown. The colour target holds the finished world; there is no
+/// depth.
+#[derive(Debug)]
+pub struct OverlayTarget<'a> {
+    pub device: &'a wgpu::Device,
+    pub queue: &'a wgpu::Queue,
+    pub encoder: &'a mut wgpu::CommandEncoder,
+    pub view: &'a wgpu::TextureView,
+    pub format: wgpu::TextureFormat,
+    /// Width and height in pixels.
+    pub size: (u32, u32),
+}
+
+impl WgpuBackend {
+    /// Ends the frame as [`RenderBackend::end_frame`] does, letting
+    /// `overlay` draw over the world first.
+    pub fn end_frame_with(
+        &mut self,
+        overlay: &mut dyn FnMut(OverlayTarget<'_>),
+    ) -> Result<(), BackendError> {
+        self.finish_frame(Some(overlay))
+    }
+
+    fn finish_frame(
+        &mut self,
+        mut overlay: Option<&mut dyn FnMut(OverlayTarget<'_>)>,
+    ) -> Result<(), BackendError> {
         let OpenFrame {
             view,
             draws,
@@ -1298,11 +1330,29 @@ impl RenderBackend for WgpuBackend {
             self.queue
                 .write_buffer(&self.palette_buffer, 0, bytemuck::cast_slice(&palette));
         }
+        let size = self.size();
+        let format = self.color_format();
+        let over = |target: &wgpu::TextureView,
+                    overlay: &mut Option<&mut dyn FnMut(OverlayTarget<'_>)>| {
+            overlay.as_mut().map(|f| {
+                let mut encoder = self.device.create_command_encoder(&Default::default());
+                f(OverlayTarget {
+                    device: &self.device,
+                    queue: &self.queue,
+                    encoder: &mut encoder,
+                    view: target,
+                    format,
+                    size,
+                });
+                encoder.finish()
+            })
+        };
         match &self.target {
             Target::Offscreen { texture, .. } => {
                 let target = texture.create_view(&Default::default());
                 let commands = self.encode(&view, &draws, &target)?;
-                self.queue.submit([commands]);
+                let overlay = over(&target, &mut overlay);
+                self.queue.submit(std::iter::once(commands).chain(overlay));
             }
             Target::Window { surface, config } => {
                 let frame = match surface.get_current_texture() {
@@ -1319,7 +1369,8 @@ impl RenderBackend for WgpuBackend {
                 };
                 let target = frame.texture.create_view(&Default::default());
                 let commands = self.encode(&view, &draws, &target)?;
-                self.queue.submit([commands]);
+                let overlay = over(&target, &mut overlay);
+                self.queue.submit(std::iter::once(commands).chain(overlay));
                 self.queue.present(frame);
             }
         }

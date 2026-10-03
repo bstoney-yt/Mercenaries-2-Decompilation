@@ -44,6 +44,7 @@ mod npc;
 mod player;
 mod scene;
 mod sound;
+mod ui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -263,10 +264,11 @@ fn build_scene(
 
 /// Streams around the player (or camera) and draws a frame.
 fn render(
-    backend: &mut dyn RenderBackend,
+    backend: &mut WgpuBackend,
     game: &mut Game,
     fov: f32,
     aspect: f32,
+    hud: Option<&mut ui::Hud>,
 ) -> anyhow::Result<()> {
     let mut view = game.view(fov, aspect);
     if game.scene.world.is_some() {
@@ -279,7 +281,10 @@ fn render(
     game.scene
         .draw(backend, &mut queue, view.eye(), &game.combat)?;
     queue.flush(&view, backend)?;
-    backend.end_frame()?;
+    match hud {
+        Some(hud) => backend.end_frame_with(&mut |t| hud.paint(t))?,
+        None => backend.end_frame()?,
+    }
     Ok(())
 }
 
@@ -311,7 +316,7 @@ fn screenshot(
     let tick = TICK.as_secs_f32();
     // Characters a little way into their clip, mid-stride when moving.
     game.scene.tick(0.4);
-    render(&mut backend, &mut game, fov, aspect)?;
+    render(&mut backend, &mut game, fov, aspect, None)?;
     // Let the island stream in before the picture is taken.
     let started = Instant::now();
     while let Some(world) = &game.scene.world {
@@ -326,7 +331,7 @@ fn screenshot(
             break;
         }
         game.step(Intent::default(), tick);
-        render(&mut backend, &mut game, fov, aspect)?;
+        render(&mut backend, &mut game, fov, aspect, None)?;
     }
     // And for the vehicles and people, and the people to find their feet.
     while game.scene.world.is_some()
@@ -334,11 +339,11 @@ fn screenshot(
         && started.elapsed() < Duration::from_secs(300)
     {
         game.step(Intent::default(), tick);
-        render(&mut backend, &mut game, fov, aspect)?;
+        render(&mut backend, &mut game, fov, aspect, None)?;
     }
     for _ in 0..30 {
         game.step(Intent::default(), tick);
-        render(&mut backend, &mut game, fov, aspect)?;
+        render(&mut backend, &mut game, fov, aspect, None)?;
     }
     let people = &game.scene.people;
     eprintln!(
@@ -371,7 +376,7 @@ fn screenshot(
             game.step(intent, tick);
             if i % 30 == 0 {
                 // Keep streaming around her as she goes.
-                render(&mut backend, &mut game, fov, aspect)?;
+                render(&mut backend, &mut game, fov, aspect, None)?;
             }
         }
         if let (Some(p), Some(from)) = (&game.scene.player, from) {
@@ -381,7 +386,15 @@ fn screenshot(
             );
         }
     }
-    render(&mut backend, &mut game, fov, aspect)?;
+    // The picture, with the HUD.
+    let mut hud = ui::Hud::new();
+    let mut settings = config.clone();
+    let _ = hud.build(
+        ui::headless_input(w, h, 1.0),
+        &game.hud_info(),
+        &mut settings,
+    );
+    render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
     let rgba = backend.read_pixels()?;
     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
     ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
@@ -402,9 +415,8 @@ fn drive_for_screenshot(
     let started = Instant::now();
     loop {
         game.step(Intent::default(), tick);
-        render(backend, game, fov, aspect)?;
-        let parked = game.scene.vehicles.iter().all(|v| v.id.is_some());
-        if (!game.scene.vehicles_loading() && parked)
+        render(backend, game, fov, aspect, None)?;
+        if (!game.scene.vehicles_loading() && game.parking_done())
             || started.elapsed() > Duration::from_secs(300)
         {
             break;
@@ -442,7 +454,7 @@ fn drive_for_screenshot(
     for i in 0..240 {
         game.step(throttle, tick);
         if i % 30 == 0 {
-            render(backend, game, fov, aspect)?;
+            render(backend, game, fov, aspect, None)?;
         }
     }
     if let (Some(from), Some((to, speed))) = (from, game.driving()) {
@@ -588,7 +600,7 @@ fn fight_for_screenshot(
             tick,
         );
     }
-    render(backend, game, fov, aspect)?;
+    render(backend, game, fov, aspect, None)?;
     Ok(())
 }
 
@@ -606,6 +618,8 @@ struct Running {
     lag: Duration,
     fps: (Instant, u32),
     title: String,
+    hud: ui::Hud,
+    egui: egui_winit::State,
 }
 
 struct App {
@@ -646,6 +660,15 @@ impl App {
             game.on_foot = false;
         }
         let focused = window.has_focus();
+        let hud = ui::Hud::new();
+        let egui = egui_winit::State::new(
+            hud.ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
         Ok(Running {
             title: format!(
                 "Mercenaries 2 (alpha) - {} on {}",
@@ -662,6 +685,8 @@ impl App {
             last: Instant::now(),
             lag: Duration::ZERO,
             fps: (Instant::now(), 0),
+            egui,
+            hud,
         })
     }
 
@@ -687,8 +712,9 @@ impl Running {
         }
     }
 
-    /// Advances the simulation by whole ticks and draws a frame.
-    fn frame(&mut self, config: &Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
+    /// Advances the simulation by whole ticks (none while the menu is
+    /// open) and draws a frame with the HUD.
+    fn frame(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
         let now = Instant::now();
         self.lag += (now - self.last).min(MAX_FRAME);
         self.last = now;
@@ -696,12 +722,32 @@ impl Running {
             self.lag -= TICK;
             self.tick(config, event_loop);
         }
+        let vsync = config.window.vsync;
+        let input = self.egui.take_egui_input(&self.window);
+        let (action, output) = self.hud.build(input, &self.game.hud_info(), config);
+        self.egui.handle_platform_output(&self.window, output);
+        if config.window.vsync != vsync {
+            self.backend.set_vsync(config.window.vsync);
+        }
+        match action {
+            Some(ui::MenuAction::Resume) => self.close_menu(),
+            Some(ui::MenuAction::SaveSettings) => {
+                let path = config::Config::default_path();
+                match std::fs::write(&path, config.to_toml()) {
+                    Ok(()) => eprintln!("settings saved to {}", path.display()),
+                    Err(e) => eprintln!("could not save {}: {e}", path.display()),
+                }
+            }
+            Some(ui::MenuAction::Quit) => event_loop.exit(),
+            None => {}
+        }
         let (w, h) = self.backend.size();
         render(
             &mut self.backend,
             &mut self.game,
             config.camera.fov,
             w as f32 / h as f32,
+            Some(&mut self.hud),
         )?;
         self.fps.1 += 1;
         let elapsed = now - self.fps.0;
@@ -717,13 +763,31 @@ impl Running {
         Ok(())
     }
 
-    fn tick(&mut self, config: &Config, event_loop: &ActiveEventLoop) {
+    fn open_menu(&mut self) {
+        self.hud.menu = true;
+        self.set_mouse_look(false);
+        self.input.clear();
+    }
+
+    fn close_menu(&mut self) {
+        self.hud.menu = false;
+        self.input.clear();
+        self.set_mouse_look(true);
+    }
+
+    fn tick(&mut self, config: &Config, _event_loop: &ActiveEventLoop) {
         if self.input.take_pressed(Action::Quit) {
-            if self.mouse_look {
-                self.set_mouse_look(false);
+            if self.hud.menu {
+                self.close_menu();
             } else {
-                event_loop.exit();
+                self.open_menu();
             }
+        }
+        if self.hud.menu {
+            // Paused: the world waits, sound carries on.
+            let (ear, facing) = self.game.listener();
+            self.audio.update(ear, facing);
+            return;
         }
         if self.input.take_pressed(Action::ToggleMouse) {
             self.set_mouse_look(!self.mouse_look);
@@ -782,6 +846,18 @@ impl ApplicationHandler for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        // The menu takes the mouse and keys while it is open (Escape still
+        // closes it).
+        let to_menu = state.hud.menu
+            && state.egui.on_window_event(&state.window, &event).consumed
+            && !matches!(event, WindowEvent::KeyboardInput { .. });
+        if to_menu {
+            return;
+        }
+        if !state.hud.menu && !matches!(event, WindowEvent::KeyboardInput { .. }) {
+            // Keep egui's idea of the window (size, scale) current.
+            let _ = state.egui.on_window_event(&state.window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.backend.resize(size.width, size.height),
@@ -806,9 +882,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
-                button: winit::event::MouseButton::Right,
+                button: winit::event::MouseButton::Right | winit::event::MouseButton::Left,
                 ..
-            } if !state.mouse_look => state.set_mouse_look(true),
+            } if !state.mouse_look && !state.hud.menu => state.set_mouse_look(true),
             // With the mouse captured, the buttons fire and aim.
             WindowEvent::MouseInput {
                 state: pressed,
@@ -825,7 +901,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Err(e) = state.frame(&self.config, event_loop) {
+                if let Err(e) = state.frame(&mut self.config, event_loop) {
                     self.fail(event_loop, e);
                 }
             }
