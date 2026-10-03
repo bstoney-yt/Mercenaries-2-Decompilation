@@ -50,7 +50,7 @@
   <div id="playpanel" style="display:none">
     <h1 style="margin-top:14px">Play</h1>
     <label style="color:var(--text)"><input type="checkbox" id="playmode"> Play mode</label>
-    <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run, E to get in or out of a vehicle. Click or hold F to fire, hold the right button to aim, 1/2 rifle or RPG, G grenade. Drag to orbit.</div>
+    <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run, E to get in or out of a vehicle. Click or hold F to fire, hold the right button to aim, 1/2 rifle or RPG, G grenade, M music. Drag to orbit.</div>
     <label style="color:var(--text)"><input type="checkbox" id="showcol"> show collision shapes (PHY2)</label>
     <label for="idle">Idle</label><select id="idle"></select>
     <label for="walk">Walk</label><select id="walk"></select>
@@ -1626,6 +1626,7 @@ async function loadSounds() {
 
 // Audio starts on the first key press or click (browsers require one).
 function startAudio() {
+  playMusic();
   if (!audio.banks) return;
   if (!audio.ctx) audio.ctx = new AudioContext();
   if (audio.ctx.state === 'suspended') audio.ctx.resume();
@@ -1719,6 +1720,45 @@ function stepAmbience() {
   playAt(one.file, new THREE.Vector3(p.x + Math.cos(a) * d, p.y + 2, p.z + Math.sin(a) * d), 0.5);
 }
 
+// Music: with `view --streams <install data dir>`, the server decodes the
+// game's soundtrack (music.pws, 145 tracks) and recorded ambience
+// (ambience.pws, 20) from the install when asked. A random track of 40 s or
+// more plays, then another; one ambience recording loops quietly beneath.
+// M turns them off and on.
+const music = { list: null, track: null, ambience: null, on: true };
+
+async function loadStreams() {
+  const r = await fetch('streams.json').catch(() => null);
+  if (r && r.ok) music.list = await r.json();
+}
+
+function playMusic() {
+  if (!music.list || !music.on) return;
+  const long = music.list.music.map((s, i) => [s, i]).filter(([s]) => s >= 40);
+  if (!music.track && long.length) {
+    const [, i] = long[Math.floor(Math.random() * long.length)];
+    const el = new Audio(`stream/music/${i}.wav`);
+    el.volume = 0.3;
+    el.onended = () => { music.track = null; playMusic(); };
+    el.play().catch(() => { music.track = null; });
+    music.track = el;
+  }
+  if (!music.ambience && music.list.ambience.length) {
+    const i = Math.floor(Math.random() * music.list.ambience.length);
+    const el = new Audio(`stream/ambience/${i}.wav`);
+    el.loop = true;
+    el.volume = 0.25;
+    el.play().catch(() => { music.ambience = null; });
+    music.ambience = el;
+  }
+}
+
+function toggleMusic() {
+  music.on = !music.on;
+  for (const el of [music.track, music.ambience]) if (el) { if (music.on) el.play(); else el.pause(); }
+  if (music.on) playMusic();
+}
+
 function stepAudio() {
   if (!audio.ctx) return;
   const l = audio.ctx.listener, f = camera.getWorldDirection(new THREE.Vector3());
@@ -1777,6 +1817,7 @@ addEventListener('keydown', e => {
   if (e.code === 'Digit1') switchWeapon('rifle');
   if (e.code === 'Digit2') switchWeapon('rpg');
   if (e.code === 'KeyG' && !e.repeat) throwGrenade();
+  if (e.code === 'KeyM' && !e.repeat) toggleMusic();
   if (e.code === 'Space') e.preventDefault();
   keys.add(e.code);
 });
@@ -1826,7 +1867,7 @@ function open(gltf, name) {
   frame(root);
   // For inspecting from the browser console.
   window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut,
-    vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, switchWeapon, throwGrenade, explode, projectiles, audio, startAudio, stepAudio, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
+    vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, switchWeapon, throwGrenade, explode, projectiles, audio, startAudio, stepAudio, music, toggleMusic, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
   player.position.set(0, 0, 0);
@@ -1884,7 +1925,7 @@ renderer.setAnimationLoop(() => {
 load('model.glb', new URLSearchParams(location.search).get('name') || 'model.glb');
 // The world is optional: the server only has one with `view --world`.
 fetch('world.glb').then(r => r.ok ? r.arrayBuffer() : null).then(buf => {
-  if (buf) loader.parse(buf, '', g => { openWorld(g); loadNpcs(); loadSounds(); }, e => status('World failed to parse: ' + e.message));
+  if (buf) loader.parse(buf, '', g => { openWorld(g); loadNpcs(); loadSounds(); loadStreams(); }, e => status('World failed to parse: ' + e.message));
 });
 </script>
 </body>

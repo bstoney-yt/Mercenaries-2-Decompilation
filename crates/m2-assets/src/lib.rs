@@ -74,7 +74,7 @@ pub use model::{Model, ModelError, PrimitiveGroup};
 pub use physics::{Physics, PhysicsError};
 pub use scatter::{Scatter, ScatterError};
 pub use sges::{Segment, SgesError, SgesHeader};
-pub use sound::{SoundBank, SoundError};
+pub use sound::{SoundBank, SoundError, StreamIndex};
 pub use terrain::{LowResTile, TerrainCell, TerrainError};
 pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};
 pub use ucfx::{Section, Ucfx, UcfxError};

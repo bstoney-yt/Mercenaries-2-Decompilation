@@ -19,7 +19,8 @@
 //!     --radius M      ... out to this distance (default 400)
 //!     --models N      character models to export (default 8)
 //! cargo run --release -p m2-assets --example gltf -- sounds <vz.wad> <out dir>
-//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--npcs <dir>] [--sounds <dir>] [--port N]
+//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--npcs <dir>] [--sounds <dir>]
+//!     [--streams <install data dir>] [--port N]
 //! ```
 //!
 //! `rigs` lists the models that animation clips fit (every track names one
@@ -106,6 +107,12 @@
 //! bank is named only by hash, so the viewer picks by those measurements:
 //! the loudest short mono sound for the shot, the loudest long loop for an
 //! engine.
+//!
+//! `view --streams <install data dir>` also plays the game's music and
+//! recorded ambience: the server reads their indexes from `vz.wad` (see
+//! `m2_assets::sound::StreamIndex`) and decodes a track from
+//! `Audios/music.pws` or `ambience.pws` when the page asks for it; nothing
+//! is written to disk.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
@@ -229,7 +236,8 @@ fn run(args: &[String]) -> AnyResult<()> {
             export_npcs(&mut open(wad)?, dir, &o)
         }
         [cmd, glb, rest @ ..] if cmd == "view" => {
-            let (mut port, mut world, mut npcs, mut sounds) = (8765, None, None, None);
+            let (mut port, mut world, mut npcs, mut sounds, mut streams) =
+                (8765, None, None, None, None);
             let mut it = rest.iter();
             while let Some(arg) = it.next() {
                 match arg.as_str() {
@@ -238,11 +246,14 @@ fn run(args: &[String]) -> AnyResult<()> {
                     "--sounds" => {
                         sounds = Some(it.next().ok_or("--sounds needs a folder")?.as_str())
                     }
+                    "--streams" => {
+                        streams = Some(it.next().ok_or("--streams needs a data folder")?.as_str())
+                    }
                     "--port" => port = it.next().ok_or("--port needs a value")?.parse()?,
                     p => port = p.parse()?,
                 }
             }
-            view(glb, world, npcs, sounds, port)
+            view(glb, world, npcs, sounds, streams, port)
         }
         _ => Err(
             "usage: gltf rigs <vz.wad> | gltf export <vz.wad> <model hash> <out.glb> \
@@ -920,16 +931,84 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
     Ok(g.glb(json))
 }
 
+/// The streamed music and ambience of an installation: the index banks
+/// (see `m2_assets::sound::StreamIndex`) and where the `.pws` files are.
+struct Streams {
+    dir: std::path::PathBuf,
+    music: m2_assets::StreamIndex,
+    ambience: m2_assets::StreamIndex,
+}
+
+/// Reads the music and ambience indexes from the install's `vz.wad`.
+fn load_streams(data_dir: &str) -> AnyResult<Streams> {
+    use m2_assets::sound::SOUND_BANK_TYPE;
+    let dir = std::path::PathBuf::from(data_dir);
+    let mut wad = open(&dir.join("vz.wad").to_string_lossy())?;
+    let (mut music, mut ambience) = (None, None);
+    for block in 0..wad.index().blocks().len() {
+        let path = wad.index().blocks()[block].path.clone();
+        if !path.contains("music") && !path.contains("sound_resident") {
+            continue;
+        }
+        let decoded = wad.read_block(block)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != SOUND_BANK_TYPE {
+                continue;
+            }
+            let Ok(idx) = m2_assets::StreamIndex::parse(data) else {
+                continue;
+            };
+            match idx.file.as_str() {
+                "music.pws" => music = Some(idx),
+                "ambience.pws" => ambience = Some(idx),
+                _ => {}
+            }
+        }
+    }
+    Ok(Streams {
+        dir: dir.join("Audios"),
+        music: music.ok_or("no music index in vz.wad")?,
+        ambience: ambience.ok_or("no ambience index in vz.wad")?,
+    })
+}
+
+/// Decodes stream `i` of `music` or `ambience` to a WAV file.
+fn stream_wav(s: &Streams, which: &str, i: usize) -> Option<Vec<u8>> {
+    use std::io::SeekFrom;
+    let idx = match which {
+        "music" => &s.music,
+        "ambience" => &s.ambience,
+        _ => return None,
+    };
+    let t = idx.streams.get(i)?;
+    let mut f = File::open(s.dir.join(&idx.file)).ok()?;
+    f.seek(SeekFrom::Start(u64::from(t.offset))).ok()?;
+    let mut buf = vec![0u8; t.encoded_len as usize];
+    f.read_exact(&mut buf).ok()?;
+    let pcm = m2_assets::sound::decode_xbox_adpcm(&buf, t.channels);
+    Some(m2_assets::sound::wav_from_samples(&pcm, t.channels, t.rate))
+}
+
 /// Serves the viewer page and `glb` on 127.0.0.1 until stopped.
 fn view(
     glb: &str,
     world: Option<&str>,
     npcs: Option<&str>,
     sounds: Option<&str>,
+    streams: Option<&str>,
     port: u16,
 ) -> AnyResult<()> {
     use std::io::{BufRead, Write};
     let page = include_str!("gltf_viewer.html");
+    let streams = streams.map(load_streams).transpose()?;
+    if let Some(s) = &streams {
+        println!(
+            "streaming {} music tracks and {} ambience recordings from {}",
+            s.music.streams.len(),
+            s.ambience.streams.len(),
+            s.dir.display()
+        );
+    }
     let model = std::fs::read(glb)?;
     let world = world.map(std::fs::read).transpose()?;
     let name = std::path::Path::new(glb)
@@ -973,6 +1052,44 @@ fn view(
             };
             std::fs::read(std::path::Path::new(dir).join(name)).ok()
         });
+        // Music and ambience, decoded from the install when asked for.
+        let stream_file = streams.as_ref().and_then(|s| {
+            if path == "/streams.json" {
+                let secs = |i: &m2_assets::StreamIndex| {
+                    i.streams
+                        .iter()
+                        .map(|t| format!("{:.1}", t.seconds()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                return Some(
+                    format!(
+                        r#"{{"music":[{}],"ambience":[{}]}}"#,
+                        secs(&s.music),
+                        secs(&s.ambience)
+                    )
+                    .into_bytes(),
+                );
+            }
+            let rest = path.strip_prefix("/stream/")?.strip_suffix(".wav")?;
+            let (which, i) = rest.split_once('/')?;
+            stream_wav(s, which, i.parse().ok()?)
+        });
+        if let Some(f) = &stream_file {
+            let ty = if path.ends_with(".json") {
+                "application/json"
+            } else {
+                "audio/wav"
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                f.len()
+            );
+            let _ = stream
+                .write_all(head.as_bytes())
+                .and_then(|()| stream.write_all(f));
+            continue;
+        }
         let (status, ty, body): (&str, &str, &[u8]) = match (path, &npc_file, &sound_file) {
             ("/npcs.json", Some(f), _) => ("200 OK", "application/json", f),
             (_, Some(f), _) => ("200 OK", "model/gltf-binary", f),
