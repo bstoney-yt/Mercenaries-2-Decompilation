@@ -23,6 +23,7 @@
   #crosshair { position: fixed; left: 50%; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; pointer-events: none;
                border: 2px solid #fffc; border-radius: 50%; box-shadow: 0 0 2px #000; }
   #health { position: fixed; right: 18px; bottom: 18px; width: 180px; height: 10px; background: #0008; border-radius: 5px; pointer-events: none; }
+  #weapon { position: fixed; right: 18px; bottom: 34px; color: #fff; font-size: 13px; text-shadow: 0 1px 2px #000; pointer-events: none; }
   #healthbar { height: 100%; width: 100%; background: #6c6; border-radius: 5px; }
   #drop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
           background: #000a; font-size: 20px; pointer-events: none; }
@@ -49,7 +50,7 @@
   <div id="playpanel" style="display:none">
     <h1 style="margin-top:14px">Play</h1>
     <label style="color:var(--text)"><input type="checkbox" id="playmode"> Play mode</label>
-    <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run, E to get in or out of a vehicle. Click or hold F to fire, hold the right button to aim. Drag to orbit.</div>
+    <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run, E to get in or out of a vehicle. Click or hold F to fire, hold the right button to aim, 1/2 rifle or RPG, G grenade. Drag to orbit.</div>
     <label style="color:var(--text)"><input type="checkbox" id="showcol"> show collision shapes (PHY2)</label>
     <label for="idle">Idle</label><select id="idle"></select>
     <label for="walk">Walk</label><select id="walk"></select>
@@ -62,6 +63,7 @@
 <div id="hint"></div>
 <div id="crosshair" style="display:none"></div>
 <div id="health" style="display:none"><div id="healthbar"></div></div>
+<div id="weapon" style="display:none"></div>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -581,8 +583,10 @@ function vehicleInReach() {
   const p = player.position;
   let best = null, bestD = Infinity;
   for (const v of vehicles) {
+    if (v.wrecked) continue;
     const [lx, lz] = toLocal(v, p.x, p.z);
-    const dx = Math.max(v.lo.x - lx, 0, lx - v.hi.x), dz = Math.max(v.lo.z - lz, 0, lz - v.hi.z);
+    const f = footprint(v);
+    const dx = Math.max(f.x0 - lx, 0, lx - f.x1), dz = Math.max(f.z0 - lz, 0, lz - f.z1);
     const d = Math.hypot(dx, dz);
     if (d < 2 && d < bestD) { best = v; bestD = d; }
   }
@@ -1017,7 +1021,7 @@ function spawnNpcs() {
     scene.add(body);
     const mixer = new THREE.AnimationMixer(root);
     const actions = Object.fromEntries(['idle', 'walk', 'run'].map(g => [g, mixer.clipAction(clipOf(g))]));
-    for (const [g, hash] of [['aim', '57fe91b4'], ['die', '479c4a51']]) {
+    for (const [g, hash] of [['aim', '57fe91b4'], ['die', '479c4a51'], ['blown', 'd85fd0ed']]) {
       const c = clipNamed(hash);
       if (c) actions[g] = mixer.clipAction(fit(modelIndex, `${modelIndex} ${g}`, c));
     }
@@ -1026,9 +1030,13 @@ function spawnNpcs() {
     npcs.push({
       body, root, mixer, actions, current: actions.idle, gait: 'idle', home: at.clone(), soldier, name, hp: 100, alive: true, alert: false,
       state: 'idle', timer: 1 + Math.random() * 4, target: null, placed: false, speed: 0,
-      rifle: combat.ready && soldier ? giveRifle(root) : null,
+      rifle: combat.ready && soldier ? giveRifle(root) : null, blownDir,
     });
   };
+  // Which way the knock-back clip carries the body (its root's travel).
+  const blownClip = clipNamed('d85fd0ed');
+  const bt = blownClip && blownClip.tracks.find(t => t.name === `${loco.rootName}.position`);
+  const blownDir = bt ? new THREE.Vector2(bt.values[bt.values.length - 3] - bt.values[0], bt.values[bt.values.length - 1] - bt.values[2]).normalize() : null;
   const civilians = npcData.models.map((m, i) => [m, i]).filter(([m]) => !m.soldier).map(([, i]) => i);
   for (const s of npcData.spawns) add(s.model, new THREE.Vector3(...s.at), true, s.name);
   const p = player.position;
@@ -1188,6 +1196,9 @@ function setupCombat() {
   if (!combat.grip) return;
   combat.ready = true;
   combat.mine = giveRifle(root);
+  combat.mineMuzzle = combat.muzzle;
+  combat.current = 'rifle';
+  ui('weapon').style.display = '';
   for (const n of npcs) if (n.soldier) n.rifle = giveRifle(n.root);
   ui('crosshair').style.display = '';
   ui('health').style.display = '';
@@ -1262,13 +1273,15 @@ function hurtNpc(n, dmg) {
 // The player fires: from the camera through the crosshair, out of the rifle.
 function playerShoot() {
   const now = performance.now();
-  if (!combat.ready || driving || now < combat.downUntil || now - combat.lastShot < 110) return;
+  if (!combat.ready || driving || now < combat.downUntil) return;
+  if (combat.current === 'rpg') { launchRocket(); return; }
+  if (now - combat.lastShot < 110) return;
   combat.lastShot = now;
   combat.shootUntil = now + 600;
   const dir = camera.getWorldDirection(new THREE.Vector3());
   const hit = castShot(camera.position.clone(), dir, 400, null);
   const to = hit ? hit.point : camera.position.clone().addScaledVector(dir, 400);
-  const from = muzzleOf(combat.mine) || player.position.clone().add(new THREE.Vector3(0, 1.4, 0));
+  const from = combat.mine ? combat.mine.localToWorld(combat.mineMuzzle.clone()) : player.position.clone().add(new THREE.Vector3(0, 1.4, 0));
   tracer(from, to);
   playAt(shotSound(), from, 0.9);
   if (hit && hit.npc) hurtNpc(hit.npc, 34);
@@ -1340,11 +1353,18 @@ function stepCombat(dt) {
   const now = performance.now();
   combat.effects = combat.effects.filter(e => {
     if (now < e.until) return true;
-    for (const o of e.objs) { scene.remove(o); o.geometry !== flashGeo && o.geometry.dispose(); }
+    for (const o of e.objs) {
+      scene.remove(o);
+      if (o.geometry !== flashGeo && o.geometry !== puffGeo) o.geometry.dispose();
+      if (e.grow) o.material.dispose();
+    }
     return false;
   });
   if (!combat.ready) return;
   if (keys.has('KeyF')) playerShoot();
+  stepProjectiles(dt);
+  stepWrecks(dt);
+  ui('weapon').textContent = combat.current === 'rpg' ? 'RPG  ·  1 rifle  ·  G grenade' : 'AK-47  ·  2 RPG  ·  G grenade';
   // Health comes back after four quiet seconds.
   if (combat.downUntil && now > combat.downUntil) {
     combat.downUntil = 0;
@@ -1355,6 +1375,223 @@ function stepCombat(dt) {
   if (now - combat.hurtAt > 4000) combat.hp = Math.min(100, combat.hp + 6 * dt);
   ui('healthbar').style.width = `${combat.hp}%`;
   ui('crosshair').style.display = driving ? 'none' : '';
+}
+
+// ---- Explosives ----------------------------------------------------------
+// 1 and 2 switch between the rifle and the RPG; G throws a grenade (the
+// game's models: global_weapon_rpg, _rpgrocket, _fraggrenade). Blasts throw
+// people with the game's knock-back fall (resident d85fd0ed, the pelvis
+// drops while the root travels 3.2 m), wreck vehicles and hurt the player.
+// THE BLAST, ITS LOOK AND ITS NUMBERS ARE INVENTED: radius, damage, speeds,
+// the fireball and smoke. Sounds are picked by measurement: the RPG's
+// loudest short sound for the launch, the artillery bank's loudest 1.5-3 s
+// sound for the blast, the destruction bank's for a wreck.
+const projectiles = [];
+const smokeMat = new THREE.MeshBasicMaterial({ color: 0x777777, transparent: true, opacity: 0.6, depthWrite: false });
+const fireMat = new THREE.MeshBasicMaterial({ color: 0xffa040, transparent: true, opacity: 0.9, depthWrite: false });
+const puffGeo = new THREE.SphereGeometry(1, 10, 8);
+
+function weaponModel(name) {
+  const i = (npcData?.weapons || []).findIndex(w => w.name === name);
+  return i >= 0 && npcWeapons[i] ? { scene: npcWeapons[i].scene, muzzle: new THREE.Vector3(...npcData.weapons[i].muzzle) } : null;
+}
+
+function switchWeapon(name) {
+  if (!combat.ready || combat.current === name || driving) return;
+  const m = name === 'rpg' ? weaponModel('rpg') : { scene: combat.weapon, muzzle: combat.muzzle };
+  if (!m) return;
+  const hand = combat.mine.parent;
+  hand.remove(combat.mine);
+  const w = m.scene.clone();
+  w.matrixAutoUpdate = false;
+  w.matrix.copy(combat.grip);
+  hand.add(w);
+  combat.mine = w;
+  combat.mineMuzzle = m.muzzle;
+  combat.current = name;
+}
+
+// Puffs: spheres that grow and fade.
+function puff(at, size, life, mat, rise = 0) {
+  const m = new THREE.Mesh(puffGeo, mat.clone());
+  m.position.copy(at);
+  m.scale.setScalar(size * 0.3);
+  scene.add(m);
+  combat.effects.push({ objs: [m], until: performance.now() + life * 1000, grow: { size, born: performance.now(), life, rise, base: mat.opacity } });
+}
+
+function launchRocket() {
+  const now = performance.now();
+  if (now - combat.lastShot < 1200) return;
+  combat.lastShot = now;
+  combat.shootUntil = now + 900;
+  const from = combat.mine.localToWorld(combat.mineMuzzle.clone());
+  const dir = camera.getWorldDirection(new THREE.Vector3());
+  // Aim at what the crosshair covers, from the launcher.
+  const hit = castShot(camera.position.clone(), dir, 400, null);
+  const target = hit ? hit.point : camera.position.clone().addScaledVector(dir, 400);
+  const vel = target.sub(from).normalize().multiplyScalar(70);
+  const r = weaponModel('rocket');
+  const obj = r ? r.scene.clone() : new THREE.Mesh(puffGeo, fireMat);
+  obj.position.copy(from);
+  obj.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), vel.clone().normalize());
+  scene.add(obj);
+  projectiles.push({ obj, vel, kind: 'rocket', life: 6, smokeAt: 0 });
+  playAt(pickSound('wpn_rpg', s => s.channels === 1 && s.seconds < 1, s => s.rms), from, 1);
+  alertNear(player.position, 80);
+}
+
+function throwGrenade() {
+  const now = performance.now();
+  if (!combat.ready || driving || now < combat.downUntil || now - (combat.lastThrow || 0) < 1500) return;
+  combat.lastThrow = now;
+  const dir = camera.getWorldDirection(new THREE.Vector3());
+  const from = player.position.clone().add(new THREE.Vector3(0, 1.6, 0)).addScaledVector(dir, 0.5);
+  const g = weaponModel('grenade');
+  const obj = g ? g.scene.clone() : new THREE.Mesh(puffGeo, smokeMat);
+  if (!g) obj.scale.setScalar(0.06);
+  obj.position.copy(from);
+  scene.add(obj);
+  projectiles.push({ obj, vel: dir.multiplyScalar(14).add(new THREE.Vector3(0, 5, 0)), kind: 'grenade', life: 2.5 });
+}
+
+function alertNear(p, r) {
+  for (const n of npcs) {
+    if (!n.alive) continue;
+    const d = n.body.position.distanceTo(p);
+    if (n.soldier && d < r) n.alert = true;
+    if (!n.soldier && d < r * 0.6) panic(n);
+  }
+}
+
+function stepProjectiles(dt) {
+  const now = performance.now();
+  for (let i = projectiles.length - 1; i >= 0; i--) {
+    const p = projectiles[i], o = p.obj;
+    p.life -= dt;
+    if (p.kind === 'grenade') p.vel.y -= 9.8 * dt;
+    const step = p.vel.clone().multiplyScalar(dt);
+    const len = step.length();
+    let boom = p.life <= 0 ? o.position.clone() : null;
+    if (!boom && len > 0) {
+      const hit = castShot(o.position.clone(), step.clone().normalize(), len, null);
+      const ground = terrainAt(o.position.x + step.x, o.position.z + step.z).y;
+      if (hit) {
+        if (p.kind === 'rocket') boom = hit.point;
+        else { o.position.copy(hit.point); p.vel.multiplyScalar(-0.3); continue; }
+      } else if (o.position.y + step.y <= ground) {
+        if (p.kind === 'rocket') boom = new THREE.Vector3(o.position.x + step.x, ground, o.position.z + step.z);
+        else { o.position.y = ground + 0.05; p.vel.set(p.vel.x * 0.5, Math.abs(p.vel.y) * 0.35, p.vel.z * 0.5); continue; }
+      }
+    }
+    if (boom) {
+      scene.remove(o);
+      projectiles.splice(i, 1);
+      explode(boom, p.kind === 'rocket' ? 1 : 0.8);
+      continue;
+    }
+    o.position.add(step);
+    if (p.kind === 'grenade') o.rotation.x += dt * 8;
+    if (p.kind === 'rocket' && now > p.smokeAt) {
+      p.smokeAt = now + 30;
+      puff(o.position, 0.35, 0.9, smokeMat, 0.4);
+    }
+  }
+  // Growing, fading and rising puffs.
+  for (const e of combat.effects) {
+    if (!e.grow) continue;
+    const g = e.grow, t = Math.min(1, (now - g.born) / (g.life * 1000));
+    const m = e.objs[0];
+    m.scale.setScalar(g.size * (0.3 + 0.7 * Math.sqrt(t)));
+    m.material.opacity = g.base * (1 - t);
+    m.position.y += g.rise * dt;
+  }
+}
+
+function explode(at, power) {
+  const R = 7 * power;
+  puff(at, 4.5 * power, 0.5, fireMat);
+  for (let k = 0; k < 6; k++) {
+    const off = new THREE.Vector3((Math.random() - 0.5) * 3, Math.random() * 2, (Math.random() - 0.5) * 3).multiplyScalar(power);
+    puff(at.clone().add(off), (2.5 + Math.random() * 2) * power, 2.5 + Math.random() * 1.5, smokeMat, 1.5);
+  }
+  playAt(pickSound('support_artillery', s => s.channels === 1 && s.seconds >= 1.5 && s.seconds <= 3, s => s.rms), at, 1.4);
+  // People: killed close in, thrown back; hurt further out.
+  for (const n of npcs) {
+    if (!n.alive || !n.placed) continue;
+    const d = n.body.position.distanceTo(at);
+    if (d > R) continue;
+    const dmg = 160 * (1 - d / R);
+    if (n.hp - dmg <= 0 && n.actions.blown && d < R * 0.7) {
+      n.hp = 0;
+      n.alive = false;
+      n.state = 'dead';
+      // Turn so the clip's travel points away from the blast.
+      const away = n.body.position.clone().sub(at).setY(0);
+      if (away.lengthSq() > 1e-6 && n.blownDir) {
+        n.body.rotation.y = Math.atan2(away.x, away.z) - Math.atan2(n.blownDir.x, n.blownDir.y);
+      }
+      const b = n.actions.blown;
+      b.reset();
+      b.setLoop(THREE.LoopOnce);
+      b.clampWhenFinished = true;
+      b.play();
+      n.current.crossFadeTo(b, 0.05, false);
+      n.current = b;
+      n.gait = 'blown';
+    } else hurtNpc(n, dmg);
+  }
+  // Vehicles: wrecked by a close blast.
+  for (const v of vehicles) {
+    const d = v.root.position.distanceTo(at);
+    if (v.wrecked || d > R + 2) continue;
+    v.hp = (v.hp ?? 100) - 140 * (1 - d / (R + 2));
+    if (v.hp <= 0) wreck(v);
+  }
+  // The player.
+  const me = driving ? null : player.position.clone().add(new THREE.Vector3(0, 1, 0));
+  if (me && me.distanceTo(at) < R) hurtPlayer(90 * (1 - me.distanceTo(at) / R));
+  alertNear(at, 80);
+}
+
+// A wreck: burnt black, popped up, smoking, never to drive again.
+function wreck(v) {
+  v.wrecked = true;
+  v.root.traverse(m => {
+    if (!m.isMesh) return;
+    m.material = m.material.clone();
+    m.material.color = new THREE.Color(0x1a1a1a);
+    if (m.material.map) m.material.color.setScalar(0.18);
+  });
+  v.vy = 5;
+  v.smoke = performance.now();
+  playAt(pickSound('bulding_destruct', s => s.channels === 1 && s.seconds >= 1.5 && s.seconds <= 3, s => s.rms), v.root.position, 1.2);
+  if (driving === v) {
+    v.speed = 0;
+    if (ride) ride.phase = 'drive';
+    leave();
+    hurtPlayer(40);
+  }
+}
+
+// Wrecks settle back down and keep smoking.
+function stepWrecks(dt) {
+  const now = performance.now();
+  for (const v of vehicles) {
+    if (!v.wrecked) continue;
+    const p = v.root.position;
+    const ground = floorAt(p.x, p.z, p.y + 1).y;
+    if (v.vy > 0 || p.y > ground) {
+      v.vy -= 9.8 * dt;
+      p.y = Math.max(ground, p.y + v.vy * dt);
+      v.root.rotation.z += dt * 0.6 * (v.vy > 0 ? 1 : 0);
+      if (p.y === ground) v.vy = 0;
+    }
+    if (now - v.smoke > 250 && now - v.smoke < 60000 + 250) {
+      v.smoke = now;
+      puff(p.clone().add(new THREE.Vector3((Math.random() - 0.5), 1.5 + Math.random(), (Math.random() - 0.5))), 1.5, 3, smokeMat, 2);
+    }
+  }
 }
 
 // Facing where the camera looks, for aiming.
@@ -1537,6 +1774,9 @@ addEventListener('keydown', e => {
   startAudio();
   if (e.code === 'KeyQ') walking = !walking;
   if (e.code === 'KeyE' && !e.repeat) enterOrLeave();
+  if (e.code === 'Digit1') switchWeapon('rifle');
+  if (e.code === 'Digit2') switchWeapon('rpg');
+  if (e.code === 'KeyG' && !e.repeat) throwGrenade();
   if (e.code === 'Space') e.preventDefault();
   keys.add(e.code);
 });
@@ -1586,7 +1826,7 @@ function open(gltf, name) {
   frame(root);
   // For inspecting from the browser console.
   window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut,
-    vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, audio, startAudio, stepAudio, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
+    vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, switchWeapon, throwGrenade, explode, projectiles, audio, startAudio, stepAudio, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
   player.position.set(0, 0, 0);
