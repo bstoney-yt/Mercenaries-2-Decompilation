@@ -39,6 +39,15 @@
   <label for="time">Time <span id="timev"></span></label>
   <input type="range" id="time" min="0" max="1" step="0.001" value="0">
   <div id="status">Loading…</div>
+  <div id="playpanel" style="display:none">
+    <h1 style="margin-top:14px">Play</h1>
+    <label style="color:var(--text)"><input type="checkbox" id="playmode"> Play mode</label>
+    <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run. Drag to orbit.</div>
+    <label for="idle">Idle</label><select id="idle"></select>
+    <label for="walk">Walk</label><select id="walk"></select>
+    <label for="run">Run</label><select id="run"></select>
+    <label for="sprint">Sprint</label><select id="sprint"></select>
+  </div>
   <div style="color:var(--muted);margin-top:8px">Drag a .glb onto the page to open another.</div>
 </div>
 <div id="drop">Drop a .glb to open it</div>
@@ -107,11 +116,146 @@ function play(i) {
   ui('time').max = clips[i].duration || 1;
 }
 
+// ---- Play mode -------------------------------------------------------
+// Locomotion clips carry their motion on the root node's translation and
+// are otherwise loops, so each clip's speed and direction are measured from
+// the root track. In play mode the root's horizontal motion is removed and
+// the page moves the character at the clip's speed instead.
+const player = new THREE.Group();
+scene.add(player);
+const keys = new Set();
+const gears = ['idle', 'walk', 'run', 'sprint'];
+const bands = { walk: [0.9, 1.9], run: [4.5, 5.6], sprint: [5.6, 7.5] };
+let loco = null; // { fwd: Vector2, info: [{speed, dir, hips, still}], inPlace: Map }
+let gear = null, current = null, walking = false;
+
+function analyse(gltf) {
+  const json = gltf.parser.json;
+  const rootName = json.nodes[0]?.name;
+  // The pelvis: the root's child that sits highest in the rest pose.
+  const rootNode = root.getObjectByName(rootName);
+  if (!rootNode) return null;
+  root.updateMatrixWorld(true);
+  let pelvis = null, best = -1;
+  for (const c of rootNode.children) {
+    const y = c.getWorldPosition(new THREE.Vector3()).y;
+    if (y > best) { best = y; pelvis = c; }
+  }
+  const info = clips.map(c => {
+    const t = c.tracks.find(t => t.name === `${rootName}.position`);
+    const p = pelvis && c.tracks.find(t => t.name === `${pelvis.name}.position`);
+    if (!t || c.duration <= 0) return null;
+    const v = t.values, n = v.length;
+    const d = new THREE.Vector2(v[n - 3] - v[0], v[n - 1] - v[2]);
+    return {
+      speed: d.length() / c.duration,
+      dir: d.lengthSq() > 0 ? d.normalize() : new THREE.Vector2(),
+      hips: p ? p.values[1] : 1,
+      still: d.length() < 1e-3,
+    };
+  });
+  return { rootName, info, inPlace: new Map() };
+}
+
+// A copy of clip `i` whose root keeps its first horizontal position.
+function inPlace(i) {
+  if (!loco.inPlace.has(i)) {
+    const c = clips[i].clone();
+    const t = c.tracks.find(t => t.name === `${loco.rootName}.position`);
+    if (t) {
+      const v = t.values;
+      for (let k = 0; k < v.length; k += 3) { v[k] = v[0]; v[k + 2] = v[2]; }
+    }
+    loco.inPlace.set(i, c);
+  }
+  return loco.inPlace.get(i);
+}
+
+function fillGears() {
+  // Character forward is the direction of the fastest forward runs.
+  const movers = loco.info.map((x, i) => [x, i]).filter(([x]) => x && x.speed > 4);
+  if (!movers.length) return false;
+  const f = new THREE.Vector2();
+  movers.forEach(([x]) => f.add(x.dir));
+  loco.fwd = f.normalize();
+  const forward = ([x]) => x && !x.still && x.dir.dot(loco.fwd) > 0.95 && x.hips > 0.85;
+  const lists = {
+    idle: loco.info.map((x, i) => [x, i]).filter(([x, i]) => x && x.still && x.hips > 0.95 && x.hips < 1.15
+      && clips[i].duration >= 1.3).sort((a, b) => clips[b[1]].duration - clips[a[1]].duration),
+  };
+  for (const g of ['walk', 'run', 'sprint']) {
+    lists[g] = loco.info.map((x, i) => [x, i]).filter(x => forward(x) && x[0].speed >= bands[g][0] && x[0].speed < bands[g][1]);
+  }
+  for (const g of gears) {
+    const sel = ui(g);
+    sel.innerHTML = '';
+    for (const [x, i] of lists[g]) sel.add(new Option(`${clips[i].name.split(' ').pop()}  ${x.speed.toFixed(1)} m/s`, i));
+    if (!lists[g].length) return false;
+  }
+  return true;
+}
+
+function setGear(g) {
+  if (g === gear) return;
+  gear = g;
+  const next = mixer.clipAction(inPlace(+ui(g).value));
+  next.reset().play();
+  if (current && current !== next) current.crossFadeTo(next, 0.25, false);
+  current = next;
+}
+
+function startPlay(on) {
+  mixer.stopAllAction();
+  action = null; current = null; gear = null;
+  player.position.set(0, 0, 0);
+  player.rotation.set(0, 0, 0);
+  grid.position.x = grid.position.z = 0;
+  frame(root);
+  if (on) setGear('idle'); else play(-1);
+}
+
+function stepPlay(dt) {
+  const ahead = new THREE.Vector3();
+  camera.getWorldDirection(ahead);
+  const fwd = new THREE.Vector2(ahead.x, ahead.z).normalize();
+  const right = new THREE.Vector2(-fwd.y, fwd.x);
+  const move = new THREE.Vector2();
+  if (keys.has('KeyW')) move.add(fwd);
+  if (keys.has('KeyS')) move.sub(fwd);
+  if (keys.has('KeyD')) move.add(right);
+  if (keys.has('KeyA')) move.sub(right);
+  if (move.lengthSq() === 0) { setGear('idle'); return; }
+  move.normalize();
+  setGear(keys.has('ShiftLeft') || keys.has('ShiftRight') ? 'sprint' : walking ? 'walk' : 'run');
+  // Turn the character's forward towards the move, smoothly.
+  const want = Math.atan2(move.x, move.y) - Math.atan2(loco.fwd.x, loco.fwd.y);
+  let d = want - player.rotation.y;
+  d = Math.atan2(Math.sin(d), Math.cos(d));
+  player.rotation.y += d * Math.min(1, dt * 10);
+  const speed = loco.info[+ui(gear).value].speed;
+  const step = new THREE.Vector3(move.x, 0, move.y).multiplyScalar(speed * dt);
+  player.position.add(step);
+  camera.position.add(step);
+  controls.target.add(step);
+  grid.position.x = Math.round(player.position.x);
+  grid.position.z = Math.round(player.position.z);
+}
+
+addEventListener('keydown', e => {
+  if (!ui('playmode').checked || e.target.tagName === 'SELECT') return;
+  if (e.code === 'KeyQ') walking = !walking;
+  keys.add(e.code);
+});
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+ui('playmode').onchange = e => { startPlay(e.target.checked); e.target.blur(); };
+for (const g of gears) ui(g).onchange = e => { if (gear === g) { gear = null; setGear(g); } e.target.blur(); };
+
 function open(gltf, name) {
-  if (root) scene.remove(root);
+  if (root) player.remove(root);
   if (skeleton) scene.remove(skeleton);
   root = gltf.scene;
-  scene.add(root);
+  player.add(root);
   rest = [];
   root.traverse(o => rest.push([o, o.position.clone(), o.quaternion.clone(), o.scale.clone()]));
   skeleton = new THREE.SkeletonHelper(root);
@@ -126,9 +270,14 @@ function open(gltf, name) {
   ui('name').textContent = name;
   frame(root);
   // For inspecting from the browser console.
-  window.viewer = { root, mixer, clips, play, THREE };
+  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, get loco() { return loco; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
+  player.position.set(0, 0, 0);
+  player.rotation.set(0, 0, 0);
+  ui('playmode').checked = false;
+  loco = analyse(gltf);
+  ui('playpanel').style.display = loco && fillGears() ? '' : 'none';
   play(-1);
 }
 
@@ -141,7 +290,11 @@ function loadBuffer(buf, name) {
   loader.parse(buf, '', g => open(g, name), e => status('Failed to parse: ' + e.message));
 }
 
-ui('anim').onchange = e => play(+e.target.value);
+ui('anim').onchange = e => {
+  const i = +e.target.value;
+  if (ui('playmode').checked) { ui('playmode').checked = false; startPlay(false); }
+  play(i);
+};
 ui('play').onclick = () => { playing = !playing; if (action) action.paused = !playing; ui('play').textContent = playing ? 'Pause' : 'Play'; };
 ui('prev').onclick = () => play((+ui('anim').value - 1 + clips.length) % clips.length);
 ui('next').onclick = () => play((+ui('anim').value + 1) % clips.length);
@@ -163,7 +316,8 @@ addEventListener('drop', async e => {
 
 renderer.setAnimationLoop(() => {
   const dt = clock.getDelta();
-  if (mixer && playing) mixer.update(dt * speed);
+  if (mixer && ui('playmode').checked) { stepPlay(dt); mixer.update(dt); }
+  else if (mixer && playing) mixer.update(dt * speed);
   if (action) { ui('time').value = action.time; ui('timev').textContent = action.time.toFixed(2) + 's'; }
   controls.update();
   renderer.render(scene, camera);
