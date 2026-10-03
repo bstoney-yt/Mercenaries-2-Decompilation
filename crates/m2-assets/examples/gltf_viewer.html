@@ -210,17 +210,34 @@ function setGear(g) {
 // terrain pieces are bucketed by 100 m square so the ground under the
 // character can be found with a short downward ray each frame.
 let world = null;
+// The sea surface, read from the world's sea mesh.
+let seaLevel = 0;
 const buckets = new Map();
 const BUCKET = 100;
 const ray = new THREE.Raycaster();
 const down = new THREE.Vector3(0, -1, 0);
+// Placed objects, shown only within this distance (?view=metres).
+const objects = [];
+const VIEW = +(new URLSearchParams(location.search).get('view') || 1500);
+let lastCull = 0;
+function cullObjects(force) {
+  const now = performance.now();
+  if (!force && now - lastCull < 500) return;
+  lastCull = now;
+  const c = controls.target;
+  for (const o of objects) o.visible = Math.hypot(o.position.x - c.x, o.position.z - c.z) < VIEW;
+}
 
 function openWorld(gltf) {
   world = gltf.scene;
   scene.add(world);
   world.updateMatrixWorld(true);
   world.traverse(o => {
+    if (o.name.startsWith('obj_')) { objects.push(o); return; }
+    if (o.isMesh && (o.name === 'sea' || o.parent?.name === 'sea')) seaLevel = new THREE.Box3().setFromObject(o).max.y;
     if (!o.isMesh || o.name === 'sea' || o.parent?.name === 'sea') return;
+    // Placed objects are not ground (yet): only terrain is walked on.
+    for (let p = o; p; p = p.parent) if (p.name.startsWith('obj_')) return;
     const b = new THREE.Box3().setFromObject(o);
     for (let x = Math.floor(b.min.x / BUCKET); x <= Math.floor(b.max.x / BUCKET); x++)
       for (let z = Math.floor(b.min.z / BUCKET); z <= Math.floor(b.max.z / BUCKET); z++) {
@@ -230,6 +247,7 @@ function openWorld(gltf) {
       }
   });
   grid.visible = false;
+  cullObjects(true);
   scene.background = new THREE.Color(0x9cc3dc);
   scene.fog = new THREE.Fog(0x9cc3dc, 800, 7000);
   camera.near = 0.5; camera.far = 30000; camera.updateProjectionMatrix();
@@ -240,10 +258,10 @@ function openWorld(gltf) {
 /// Ground height under (x, z), or sea level.
 function groundAt(x, z) {
   const near = buckets.get(`${Math.floor(x / BUCKET)},${Math.floor(z / BUCKET)}`);
-  if (!near) return 0;
+  if (!near) return seaLevel;
   ray.set(new THREE.Vector3(x, 5000, z), down);
   const hit = ray.intersectObjects(near, false)[0];
-  return hit ? Math.max(hit.point.y, 0) : 0;
+  return hit ? Math.max(hit.point.y, seaLevel) : seaLevel;
 }
 
 /// Puts the camera behind and above the character.
@@ -381,6 +399,7 @@ renderer.setAnimationLoop(() => {
   if (mixer && ui('playmode').checked) { stepPlay(dt); mixer.update(dt); }
   else if (mixer && playing) mixer.update(dt * speed);
   if (action) { ui('time').value = action.time; ui('timev').textContent = action.time.toFixed(2) + 's'; }
+  if (world) cullObjects(false);
   controls.update();
   renderer.render(scene, camera);
 });
