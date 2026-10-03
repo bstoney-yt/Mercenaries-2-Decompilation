@@ -14,7 +14,11 @@
 //!     --objects WHICH static (default: layers_static), all (mission states too) or none
 //!     --sea Y         sea surface height (default -35, an estimate)
 //!     --vehicles N    drivable vehicles parked near --detail (default 8, 0 for none)
-//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--port N]
+//! cargo run --release -p m2-assets --example gltf -- npcs   <vz.wad> <out dir> [options]
+//!     --detail X,Z    take spawn points around this point (game x, z)
+//!     --radius M      ... out to this distance (default 400)
+//!     --models N      character models to export (default 8)
+//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--npcs <dir>] [--port N]
 //! ```
 //!
 //! `rigs` lists the models that animation clips fit (every track names one
@@ -72,6 +76,17 @@
 //! game's enter clip for the vehicle's class, sits in the seated loop while
 //! driving, and climbs out with the enter clip played backwards; the clips
 //! are told apart by their root motion, relative to the driver's seat.
+//!
+//! `npcs` writes character models for the world (`npc_<hash>.glb`, skinned
+//! and textured, without clips) and `npcs.json` with spawn points from
+//! layer entities that place soldiers (`Ai`, `AiPatrol`,
+//! `PopulationSimpleSpawner`). Every skinned human model shares the
+//! playable character's skeleton (root node `cbc1eb51`), so the viewer
+//! drives them with its clips. Soldier spawns get the army model their
+//! entity name asks for ("VZ Soldier", "VZ Heavy", "VZ Deathsquad");
+//! civilians (`?npcs=N` in the page address) are scattered around the start.
+//! Their behaviour (idling, wandering near home, stepping aside, running
+//! from fast vehicles) is invented, not the game's AI.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
@@ -172,17 +187,39 @@ fn run(args: &[String]) -> AnyResult<()> {
             println!("wrote {out}");
             Ok(())
         }
+        [cmd, wad, dir, rest @ ..] if cmd == "npcs" => {
+            let mut o = NpcOptions {
+                detail: [0.0, 0.0],
+                radius: 400.0,
+                models: 8,
+            };
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                match flag.as_str() {
+                    "--detail" => {
+                        let (x, z) = value.split_once(',').ok_or("--detail takes X,Z")?;
+                        o.detail = [x.trim().parse()?, z.trim().parse()?];
+                    }
+                    "--radius" => o.radius = value.parse()?,
+                    "--models" => o.models = value.parse()?,
+                    _ => return Err(format!("unknown option {flag}").into()),
+                }
+            }
+            export_npcs(&mut open(wad)?, dir, &o)
+        }
         [cmd, glb, rest @ ..] if cmd == "view" => {
-            let (mut port, mut world) = (8765, None);
+            let (mut port, mut world, mut npcs) = (8765, None, None);
             let mut it = rest.iter();
             while let Some(arg) = it.next() {
                 match arg.as_str() {
                     "--world" => world = Some(it.next().ok_or("--world needs a file")?.as_str()),
+                    "--npcs" => npcs = Some(it.next().ok_or("--npcs needs a folder")?.as_str()),
                     "--port" => port = it.next().ok_or("--port needs a value")?.parse()?,
                     p => port = p.parse()?,
                 }
             }
-            view(glb, world, port)
+            view(glb, world, npcs, port)
         }
         _ => Err(
             "usage: gltf rigs <vz.wad> | gltf export <vz.wad> <model hash> <out.glb> \
@@ -730,7 +767,13 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
         .collect();
     let mut animations = Vec::new();
     let mut fitting = 0;
-    for (chash, path, data) in all_clips(wad)? {
+    // No clips wanted: skip reading every clip in the archive.
+    let clips = if o.clips == 0 {
+        Vec::new()
+    } else {
+        all_clips(wad)?
+    };
+    for (chash, path, data) in clips {
         if animations.len() >= o.clips {
             break;
         }
@@ -855,7 +898,7 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
 }
 
 /// Serves the viewer page and `glb` on 127.0.0.1 until stopped.
-fn view(glb: &str, world: Option<&str>, port: u16) -> AnyResult<()> {
+fn view(glb: &str, world: Option<&str>, npcs: Option<&str>, port: u16) -> AnyResult<()> {
     use std::io::{BufRead, Write};
     let page = include_str!("gltf_viewer.html");
     let model = std::fs::read(glb)?;
@@ -873,15 +916,33 @@ fn view(glb: &str, world: Option<&str>, port: u16) -> AnyResult<()> {
         }
         let path = line.split_whitespace().nth(1).unwrap_or("/");
         let path = path.split('?').next().unwrap_or("/");
-        let (status, ty, body): (&str, &str, &[u8]) = match path {
-            "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", page.as_bytes()),
-            "/model.glb" => ("200 OK", "model/gltf-binary", &model),
-            "/world.glb" if world.is_some() => (
-                "200 OK",
-                "model/gltf-binary",
-                world.as_deref().unwrap_or_default(),
-            ),
-            _ => ("404 Not Found", "text/plain", b"not found"),
+        // NPCs from `gltf npcs`: the list and the model files, read per
+        // request; only names the export writes are served.
+        let npc_file = npcs.and_then(|dir| {
+            let name = match path {
+                "/npcs.json" => "npcs.json",
+                p => p.strip_prefix("/npc/").filter(|n| {
+                    n.len() == 16
+                        && n.starts_with("npc_")
+                        && n.ends_with(".glb")
+                        && n[4..12].chars().all(|c| c.is_ascii_hexdigit())
+                })?,
+            };
+            std::fs::read(std::path::Path::new(dir).join(name)).ok()
+        });
+        let (status, ty, body): (&str, &str, &[u8]) = match (path, &npc_file) {
+            ("/npcs.json", Some(f)) => ("200 OK", "application/json", f),
+            (_, Some(f)) => ("200 OK", "model/gltf-binary", f),
+            _ => match path {
+                "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", page.as_bytes()),
+                "/model.glb" => ("200 OK", "model/gltf-binary", &model),
+                "/world.glb" if world.is_some() => (
+                    "200 OK",
+                    "model/gltf-binary",
+                    world.as_deref().unwrap_or_default(),
+                ),
+                _ => ("404 Not Found", "text/plain", b"not found"),
+            },
         };
         let head = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
@@ -891,6 +952,202 @@ fn view(glb: &str, world: Option<&str>, port: u16) -> AnyResult<()> {
             .write_all(head.as_bytes())
             .and_then(|()| stream.write_all(body));
     }
+    Ok(())
+}
+
+struct NpcOptions {
+    /// Centre (game x, z) of the area to take spawn points from.
+    detail: [f32; 2],
+    radius: f32,
+    /// How many character models to export.
+    models: usize,
+}
+
+/// Root node name of the shared human skeleton (Jennifer's and every
+/// skinned human model's), so the character's clips drive them all.
+const HUMAN_ROOT: u32 = 0xcbc1_eb51;
+
+/// Writes `npc_<hash>.glb` character models (skinned, textured, without
+/// clips: the viewer drives them with the playable character's clips) and
+/// `npcs.json`: the models, and spawn points from layer entities that
+/// place people (`PopulationSimpleSpawner`, `Ai`, `AiPatrol`) near
+/// `detail`. Models are chosen by texture name (`<faction>_hum_<role>_..`),
+/// civilians first; which model a spawner really spawns is not decoded.
+fn export_npcs<R: Read + Seek>(
+    wad: &mut WadArchive<R>,
+    dir: &str,
+    o: &NpcOptions,
+) -> AnyResult<()> {
+    use m2_assets::layer::LAYER_TYPE;
+    let mut texture_names: HashMap<u32, String> = HashMap::new();
+    let mut humans: Vec<(u32, Vec<u32>)> = Vec::new();
+    // (glTF position, entity name, component)
+    let mut spawns: Vec<([f32; 3], String, &'static str)> = Vec::new();
+    for block in 0..wad.index().blocks().len() {
+        let decoded = wad.read_block(block)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            match e.type_hash {
+                TEXTURE_TYPE => {
+                    if let Some(n) = Ucfx::parse(data).ok().and_then(|u| u.name()) {
+                        texture_names.insert(e.name_hash, n.to_ascii_lowercase());
+                    }
+                }
+                MODEL_TYPE if e.unk_0x08 == 0 => {
+                    let Ok(m) = Model::parse(data) else { continue };
+                    if m.info.flags & 0x800 != 0
+                        && m.nodes.first().map(|n| n.name_hash) == Some(HUMAN_ROOT)
+                    {
+                        humans.push((
+                            e.name_hash,
+                            m.materials
+                                .iter()
+                                .flat_map(|mt| mt.textures.iter().copied())
+                                .collect(),
+                        ));
+                    }
+                }
+                LAYER_TYPE => {
+                    let Ok(layer) = m2_assets::Layer::parse(data) else {
+                        continue;
+                    };
+                    let names = layer.names();
+                    let places = layer.placements();
+                    for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
+                        let Some(c) = layer.component(component) else {
+                            continue;
+                        };
+                        for (id, _) in c.records().unwrap_or_default() {
+                            let Some(p) = places.get(&id) else { continue };
+                            let [x, y, z] = p.position;
+                            if (x - o.detail[0]).hypot(z - o.detail[1]) > o.radius
+                                || spawns
+                                    .iter()
+                                    .any(|s| s.1 == names.get(&id).copied().unwrap_or(""))
+                            {
+                                continue;
+                            }
+                            let name = names.get(&id).copied().unwrap_or("-").to_owned();
+                            spawns.push((flip_v([x, y, z]), name, component));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Models: one per role, civilians first, then soldiers; not the
+    // player characters.
+    let mut roles: Vec<(bool, String, u32)> = Vec::new();
+    for (hash, textures) in &humans {
+        let Some(name) = textures
+            .iter()
+            .filter_map(|t| texture_names.get(t))
+            .find(|n| n.contains("_hum_"))
+        else {
+            continue;
+        };
+        let words: Vec<&str> = name.split('_').collect();
+        if words.len() < 3 || words[0] == "pmc" || name.contains("chicken") {
+            continue;
+        }
+        let role = words[..3].join("_");
+        if roles.iter().any(|r| r.1 == role) {
+            continue;
+        }
+        roles.push((words[0] != "civ", role, *hash));
+    }
+    roles.sort();
+    let civilians = roles.iter().filter(|r| !r.0).count();
+    // The army roles the spawn names ask for ("VZ Soldier", "VZ Heavy ...",
+    // "VZ Deathsquad ..."), then civilians for the rest.
+    let army = ["vz_hum_soldier", "vz_hum_soldierelite", "vz_hum_deathsquad"];
+    let chosen: Vec<&(bool, String, u32)> = roles
+        .iter()
+        .filter(|r| army.contains(&r.1.as_str()))
+        .chain(roles.iter().filter(|r| !r.0))
+        .take(o.models.max(army.len() + 1))
+        .collect();
+    // A spawn's model, by its entity name; spawns of vehicles, targets and
+    // buildings, and of other armies, are left out.
+    let model_for = |name: &str| -> Option<usize> {
+        let n = name.to_ascii_lowercase();
+        let other = [
+            "amx30", "scorpion", "hind", "m151", "boat", "target", "_bld_", "heli", "tank", "truck",
+        ];
+        if other.iter().any(|w| n.contains(w)) || !n.starts_with("vz ") {
+            return None;
+        }
+        let role = if n.contains("deathsquad") || n.contains("mook") {
+            "vz_hum_deathsquad"
+        } else if n.contains("heavy") || n.contains("elite") {
+            "vz_hum_soldierelite"
+        } else {
+            "vz_hum_soldier"
+        };
+        chosen.iter().position(|r| r.1 == role)
+    };
+    std::fs::create_dir_all(dir)?;
+    let mut models_json = Vec::new();
+    for (soldier, role, hash) in &chosen {
+        let glb = export(
+            wad,
+            *hash,
+            &Options {
+                clips: 0,
+                filter: None,
+                lod: 0,
+            },
+        )?;
+        let file = format!("npc_{hash:08x}.glb");
+        std::fs::write(std::path::Path::new(dir).join(&file), glb)?;
+        models_json.push(format!(
+            r#"{{"file":"{file}","name":"{role}","soldier":{soldier}}}"#
+        ));
+    }
+    let clean = |s: &str| {
+        s.chars()
+            .filter(|c| *c != '"' && *c != '\\' && !c.is_control())
+            .collect::<String>()
+    };
+    let spawns_json: Vec<String> = spawns
+        .iter()
+        .filter_map(|(at, name, from)| {
+            let model = model_for(name)?;
+            Some(format!(
+                r#"{{"at":{at:?},"name":"{}","from":"{from}","model":{model}}}"#,
+                clean(name)
+            ))
+        })
+        .collect();
+    std::fs::write(
+        std::path::Path::new(dir).join("npcs.json"),
+        format!(
+            "{{\"models\":[{}],\n\"spawns\":[{}]}}\n",
+            models_json.join(","),
+            spawns_json.join(",\n")
+        ),
+    )?;
+    println!(
+        "{} human models ({} roles, {civilians} civilian); exported {}: {}",
+        humans.len(),
+        roles.len(),
+        chosen.len(),
+        chosen
+            .iter()
+            .map(|r| r.1.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut from: BTreeMap<&str, usize> = BTreeMap::new();
+    for s in &spawns {
+        *from.entry(s.2).or_default() += 1;
+    }
+    println!(
+        "{} spawn points within {} m: {from:?}; {} placed with a soldier model",
+        spawns.len(),
+        o.radius,
+        spawns_json.len()
+    );
     Ok(())
 }
 
