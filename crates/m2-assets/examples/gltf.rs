@@ -1249,6 +1249,8 @@ fn export_npcs<R: Read + Seek>(
     let mut path_of: HashMap<u32, u32> = HashMap::new();
     let mut paths: HashMap<u32, Vec<[f32; 3]>> = HashMap::new();
     let mut placed_at: HashMap<u32, m2_assets::Placement> = HashMap::new();
+    let mut roads: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut intersections: HashMap<u32, Vec<u32>> = HashMap::new();
     for block in 0..wad.index().blocks().len() {
         let decoded = wad.read_block(block)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -1306,6 +1308,26 @@ fn export_npcs<R: Read + Seek>(
                             if let Some(h) = word(rec, 0) {
                                 path_of.insert(id, h);
                             }
+                        }
+                    }
+                    // Roads: centreline path asset, then the intersections
+                    // at its ends (0 where it joins another road directly).
+                    if let Some(c) = layer.component("Road") {
+                        for (id, rec) in c.records().unwrap_or_default() {
+                            if let (Some(p), Some(a), Some(b)) =
+                                (word(rec, 0), word(rec, 8), word(rec, 12))
+                            {
+                                roads.push((id, p, a, b));
+                            }
+                        }
+                    }
+                    if let Some(c) = layer.component("RoadIntersection") {
+                        for (id, rec) in c.records().unwrap_or_default() {
+                            let joined: Vec<u32> = (0..4)
+                                .filter_map(|i| word(rec, i * 4))
+                                .filter(|&r| r != 0)
+                                .collect();
+                            intersections.insert(id, joined);
                         }
                     }
                     placed_at.extend(places.iter().map(|(&id, p)| (id, *p)));
@@ -1460,6 +1482,22 @@ fn export_npcs<R: Read + Seek>(
             .filter(|c| *c != '"' && *c != '\\' && !c.is_control())
             .collect::<String>()
     };
+    // A path's points placed by the entity that names it (game axes).
+    let placed = |place: &m2_assets::Placement, points: &[[f32; 3]]| -> Vec<[f32; 3]> {
+        let [qx, qy, qz, qw] = place.rotation;
+        let q = Quat::from_xyzw(qx, qy, qz, qw).normalize();
+        let at = Vec3::from(place.position);
+        points
+            .iter()
+            .map(|p| (at + q * Vec3::from(*p)).to_array())
+            .collect()
+    };
+    let points_json = |pts: &[[f32; 3]]| {
+        pts.iter()
+            .map(|p| format!("{:?}", flip_v(*p)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let spawns_json: Vec<String> = spawns
         .iter()
         .filter_map(|(at, name, from, id)| {
@@ -1469,14 +1507,7 @@ fn export_npcs<R: Read + Seek>(
                 .get(id)
                 .and_then(|target| Some((placed_at.get(target)?, paths.get(path_of.get(target)?)?)))
                 .map(|(place, points)| {
-                    let [qx, qy, qz, qw] = place.rotation;
-                    let q = Quat::from_xyzw(qx, qy, qz, qw).normalize();
-                    let at = Vec3::from(place.position);
-                    let pts: Vec<String> = points
-                        .iter()
-                        .map(|p| format!("{:?}", flip_v((at + q * Vec3::from(*p)).to_array())))
-                        .collect();
-                    format!(r#","route":[{}]"#, pts.join(","))
+                    format!(r#","route":[{}]"#, points_json(&placed(place, points)))
                 })
                 .unwrap_or_default();
             Some(format!(
@@ -1489,15 +1520,81 @@ fn export_npcs<R: Read + Seek>(
         .iter()
         .filter(|s| s.contains("\"route\""))
         .count();
+    // Roads near `detail`: centrelines in glTF axes, and the intersections
+    // (by entity id) at their two ends, 0 where none is named.
+    let near = |p: &[f32; 3]| (p[0] - o.detail[0]).hypot(p[2] - o.detail[1]) <= o.radius;
+    let mut road_lines: Vec<(u32, u32, u32, Vec<[f32; 3]>)> = Vec::new();
+    for &(id, path, a, b) in &roads {
+        let (Some(place), Some(points)) = (placed_at.get(&id), paths.get(&path)) else {
+            continue;
+        };
+        let pts = placed(place, points);
+        if pts.len() >= 2 && pts.iter().any(near) {
+            road_lines.push((id, a, b, pts));
+        }
+    }
+    // How the data fits: does the first point end at intersection `a`, and
+    // do the other ends meet another road's end?
+    let (mut a_first, mut a_named) = (0, 0);
+    for (_, a, _, pts) in &road_lines {
+        if let Some(p) = placed_at.get(a) {
+            a_named += 1;
+            let at = Vec3::from(p.position);
+            let (first, last) = (Vec3::from(pts[0]), Vec3::from(pts[pts.len() - 1]));
+            if first.distance(at) < last.distance(at) {
+                a_first += 1;
+            }
+        }
+    }
+    let ends: Vec<Vec3> = road_lines
+        .iter()
+        .flat_map(|r| [Vec3::from(r.3[0]), Vec3::from(r.3[r.3.len() - 1])])
+        .collect();
+    let met = ends
+        .iter()
+        .enumerate()
+        .filter(|&(i, e)| {
+            ends.iter()
+                .enumerate()
+                .any(|(j, f)| j / 2 != i / 2 && e.distance(*f) < 1.5)
+        })
+        .count();
+    let roads_json: Vec<String> = road_lines
+        .iter()
+        .map(|(id, a, b, pts)| {
+            format!(
+                r#"{{"id":{id},"a":{a},"b":{b},"points":[{}]}}"#,
+                points_json(pts)
+            )
+        })
+        .collect();
+    let junctions_json: Vec<String> = intersections
+        .iter()
+        .filter(|(_, joined)| joined.iter().any(|r| road_lines.iter().any(|l| l.0 == *r)))
+        .filter_map(|(id, joined)| {
+            let at = flip_v(placed_at.get(id)?.position);
+            Some(format!(r#"{{"id":{id},"at":{at:?},"roads":{joined:?}}}"#))
+        })
+        .collect();
     std::fs::write(
         std::path::Path::new(dir).join("npcs.json"),
         format!(
-            "{{\"models\":[{}],\n\"weapons\":[{}],\n\"spawns\":[{}]}}\n",
+            "{{\"models\":[{}],\n\"weapons\":[{}],\n\"spawns\":[{}],\n\"roads\":[{}],\n\"junctions\":[{}]}}\n",
             models_json.join(","),
             weapons_json.join(","),
-            spawns_json.join(",\n")
+            spawns_json.join(",\n"),
+            roads_json.join(",\n"),
+            junctions_json.join(",\n")
         ),
     )?;
+    println!(
+        "{} roads within {} m ({} in all): first point at intersection a on {a_first} of {a_named}; {met} of {} road ends meet another road's end; {} intersections",
+        road_lines.len(),
+        o.radius,
+        roads.len(),
+        ends.len(),
+        junctions_json.len()
+    );
     println!(
         "{} human models ({} roles, {civilians} civilian); exported {}: {}",
         humans.len(),
