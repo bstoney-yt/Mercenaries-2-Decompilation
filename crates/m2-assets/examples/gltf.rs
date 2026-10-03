@@ -6,7 +6,7 @@
 //! cargo run --release -p m2-assets --example gltf -- rigs   <vz.wad>
 //! cargo run --release -p m2-assets --example gltf -- export <vz.wad> <model hash> <out.glb> [options]
 //!     --clips N       export at most N animation clips (default 40)
-//!     --filter TEXT   only clips from blocks whose path contains TEXT
+//!     --filter TEXT   only clips from blocks whose name contains TEXT (or any of TEXT,TEXT,...)
 //!     --lod N         level of detail to export (default 0, the finest)
 //! cargo run --release -p m2-assets --example gltf -- world  <vz.wad> <out.glb> [options]
 //!     --detail X,Z    full-detail terrain around this point (game x, z)
@@ -61,7 +61,12 @@
 //! node's extras. Kinds come from texture names and wheels from geometry
 //! (see `m2_assets::vehicle`). In play mode, E gets in and out; W/S drive,
 //! A/D steer and Space brakes. The handling is a simple arcade model tuned
-//! by hand, not the game's.
+//! by hand, not the game's. The extras also carry the driver's seat and
+//! door markers. With the character exported with its vehicle clips
+//! (`--filter resident,vehicleclassanimgroup`), it climbs in with the
+//! game's enter clip for the vehicle's class, sits in the seated loop while
+//! driving, and climbs out with the enter clip played backwards; the clips
+//! are told apart by their root motion, relative to the driver's seat.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
@@ -733,7 +738,7 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
         let name = block_name(&path).to_owned();
         if o.filter
             .as_ref()
-            .is_some_and(|f| !name.to_lowercase().contains(f))
+            .is_some_and(|f| !f.split(',').any(|f| name.to_lowercase().contains(f.trim())))
         {
             continue;
         }
@@ -1562,15 +1567,23 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
                 .and_then(|d| m2_assets::Physics::parse(d).ok())
                 .map(|p| p.bodies.iter().map(|b| b.mass).fold(0.0f32, f32::max))
                 .filter(|m| m.is_finite() && *m > 0.0);
+            // The driver's seat and door markers (see m2_assets::vehicle).
+            use m2_assets::vehicle::{DRIVER_DOOR, DRIVER_SEAT};
+            let marker = |h| {
+                m2_assets::vehicle::marker(&model, h)
+                    .map_or("null".to_owned(), |p| format!("{:?}", flip_v(p)))
+            };
             let b = &model.info.bounds;
             let k = parked.len() as f32;
             let at = [base[0] - 3.0 * 7.0 + 7.0 * k, 0.0, base[1] + 12.0];
             nodes.push(format!(
-                r#"{{"name":"veh {hash:08x}","translation":{:?},"children":{children:?},"extras":{{"vehicle":{{"model":"{hash:08x}","kind":"{kind}","name":"{label}","tracked":{tracked},"mass":{},"min":{:?},"max":{:?},"wheels":[{}]}}}}}}"#,
+                r#"{{"name":"veh {hash:08x}","translation":{:?},"children":{children:?},"extras":{{"vehicle":{{"model":"{hash:08x}","kind":"{kind}","name":"{label}","tracked":{tracked},"mass":{},"min":{:?},"max":{:?},"seat":{},"door":{},"wheels":[{}]}}}}}}"#,
                 flip_v(at),
                 mass.map_or("null".to_owned(), |m| m.to_string()),
                 flip_v(b.min),
                 flip_v(b.max),
+                marker(DRIVER_SEAT),
+                marker(DRIVER_DOOR),
                 wheel_json.join(",")
             ));
             Ok(Some(format!("{label} ({kind}, {} wheels)", wheels.len())))

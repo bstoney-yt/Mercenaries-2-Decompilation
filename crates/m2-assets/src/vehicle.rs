@@ -48,6 +48,25 @@ pub struct NodeBox {
     pub max: [f32; 3],
 }
 
+/// Node name hash of the driver's seat marker: a leaf node at floor height
+/// at the left front seat, the same hash on every car and truck sampled
+/// (PMC car x -0.37, civilian car -0.42, HMMWV -0.73, M35 -0.42, semi
+/// -0.42). The right front seat is [`PASSENGER_SEAT`].
+pub const DRIVER_SEAT: u32 = 0xd6eb_e292;
+/// The right front seat marker.
+pub const PASSENGER_SEAT: u32 = 0xd721_fc8c;
+/// The marker outside the driver's door, where a character stands to get
+/// in (PMC car x -1.40, civilian car -1.70, HMMWV -1.93, semi -2.10).
+pub const DRIVER_DOOR: u32 = 0x688c_4858;
+/// The marker outside the passenger's door.
+pub const PASSENGER_DOOR: u32 = 0x8869_e876;
+
+/// The model-space position of the first node named `hash`.
+pub fn marker(model: &Model, hash: u32) -> Option<[f32; 3]> {
+    let i = model.nodes.iter().position(|n| n.name_hash == hash)?;
+    Some(model.node_to_model(i as u16)?.w_axis.truncate().to_array())
+}
+
 /// Texture-name words that mark textures shared across vehicles.
 const SHARED: [&str; 12] = [
     "ruin",

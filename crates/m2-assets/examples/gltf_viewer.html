@@ -438,6 +438,7 @@ function follow() {
 function startPlay(on) {
   mixer.stopAllAction();
   driving = null;
+  ride = null;
   player.visible = true;
   ui('hint').textContent = '';
   action = null; current = null; gear = null;
@@ -577,32 +578,152 @@ function vehicleInReach() {
   return best;
 }
 
+// ---- Getting in and out ---------------------------------------------
+// The game's character clips for each vehicle class come from blocks named
+// "vehicleclassanimgroup_<class>" (export the character with them in
+// --filter). Clip names are only hashes, so the clips are told apart by
+// their root motion, which is relative to the seat: a seated loop stays on
+// the seat (the clip origin) throughout; an enter clip starts 0.7 m or more
+// beside it, on the driver's (-x) side, and ends on it. Getting out plays
+// the enter clip backwards. Clips are placed on the vehicle's driver seat
+// marker (see seatFit).
+const vehicleAnims = new Map(); // group -> { seat, enter } clip indices
+function analyseVehicleClips() {
+  vehicleAnims.clear();
+  if (!loco) return;
+  clips.forEach((c, i) => {
+    const group = c.name.split(' ')[0];
+    if (!group.startsWith('vehicle')) return;
+    const t = c.tracks.find(t => t.name === `${loco.rootName}.position`);
+    if (!t) return;
+    const a = t.values, n = a.length;
+    let far = 0;
+    for (let k = 0; k < n; k += 3) far = Math.max(far, Math.hypot(a[k], a[k + 2]));
+    const start = Math.hypot(a[0], a[2]), end = Math.hypot(a[n - 3], a[n - 1]);
+    const g = vehicleAnims.get(group) || { seat: null, enter: null };
+    if (far < 0.05 && c.duration >= 1.5 && (g.seat === null || c.duration > clips[g.seat].duration)) g.seat = i;
+    if (start >= 0.7 && end < 0.05 && a[0] < 0 && c.duration >= 0.8
+        && (g.enter === null || c.duration < clips[g.enter].duration)) g.enter = i;
+    vehicleAnims.set(group, g);
+  });
+}
+
+// The clip group for a vehicle, by its kind and name.
+function animsFor(d) {
+  const key = `${d.kind} ${d.name}`;
+  for (const [re, cls] of [[/hmmwv/, 'hmmwv'], [/monster/, 'monstertruck'], [/tank/, 'tank'], [/apc/, 'apc'],
+    [/semi|bus|m35|mtv/, 'autolargea'], [/truck/, 'truckmid'], [/./, 'automedium']]) {
+    if (!re.test(key)) continue;
+    const g = vehicleAnims.get(`vehicleclassanimgroup_${cls}`);
+    if (g && g.seat !== null && g.enter !== null) return g;
+  }
+  return null;
+}
+
+// Where the rider goes: { theta, q, t } maps clip space into vehicle space.
+// The clips share the vehicle's axes with their origin on the driver's
+// seat marker (checked by eye on the HMMWV: seated, facing forward, in the
+// driver's seat). The door marker is not where the enter clips start (it
+// sits mirrored in z from it), so it is not used here.
+function seatFit(v) {
+  const s = v.data.seat;
+  if (!s) return null;
+  return { theta: 0, q: new THREE.Quaternion(), t: new THREE.Vector3(s[0], s[1], s[2]) };
+}
+
+// Puts the character at its seat in the vehicle.
+function placeRider() {
+  if (!ride || !ride.fit) return;
+  const o = ride.v.root;
+  o.updateMatrixWorld(true);
+  player.position.copy(ride.fit.t).applyMatrix4(o.matrixWorld);
+  player.quaternion.copy(o.quaternion).multiply(ride.fit.q);
+}
+
+let ride = null; // { v, anims, fit, phase: 'enter' | 'drive' | 'exit', action }
+function playOnce(i, backwards) {
+  const a = mixer.clipAction(clips[i]);
+  a.reset();
+  a.setLoop(THREE.LoopOnce);
+  a.clampWhenFinished = true;
+  a.timeScale = backwards ? -1 : 1;
+  if (backwards) a.time = clips[i].duration;
+  return a;
+}
+
 function enterOrLeave() {
   if (!world) return;
   if (driving) {
-    // Out on the driver's (left) side.
-    const v = driving;
-    const [x, z] = toWorld(v, v.lo.x - 0.8, 0);
-    driving = null;
-    player.position.set(x, 0, z);
-    loadNear(x, z);
-    player.position.y = floorAt(x, z, v.root.position.y + 1).y;
-    player.rotation.y = v.yaw;
-    player.visible = true;
-    fall = 0;
-    gear = null; setGear('idle');
-    follow();
+    if (!ride || ride.phase !== 'drive' || Math.abs(driving.speed) > 2) return;
+    if (ride.fit) {
+      // Climb out: the enter clip, backwards.
+      ride.phase = 'exit';
+      ride.action = playOnce(ride.anims.enter, true);
+      ride.action.crossFadeFrom(current, 0.2, false).play();
+      current = ride.action;
+    } else leave();
     return;
   }
   const v = vehicleInReach();
   if (!v) return;
   driving = v;
   v.speed = 0;
-  player.visible = false;
+  const anims = animsFor(v.data);
+  const fit = anims && seatFit(v);
+  ride = { v, anims, fit, phase: 'enter', action: null };
+  if (fit) {
+    mixer.stopAllAction();
+    gear = null;
+    ride.action = current = playOnce(anims.enter, false);
+    current.play();
+    placeRider();
+  } else {
+    // No seat or clips for this vehicle: the character rides out of sight.
+    player.visible = false;
+    ride.phase = 'drive';
+  }
   const p = v.root.position;
   _fwd.set(-Math.sin(v.yaw), 0, -Math.cos(v.yaw));
   controls.target.copy(p).add(new THREE.Vector3(0, 1.5, 0));
   camera.position.copy(p).addScaledVector(_fwd, -(v.length + 5)).add(new THREE.Vector3(0, 3, 0));
+}
+
+// Back on foot: where the exit clip ends (its start), or beside the door.
+function leave() {
+  const v = driving;
+  let x, z, yaw = v.yaw;
+  if (ride && ride.fit) {
+    const c = clips[ride.anims.enter].tracks.find(t => t.name === `${loco.rootName}.position`).values;
+    const p = new THREE.Vector3(c[0], 0, c[2]).applyQuaternion(ride.fit.q).add(ride.fit.t);
+    v.root.updateMatrixWorld(true);
+    p.applyMatrix4(v.root.matrixWorld);
+    x = p.x; z = p.z;
+    yaw = v.yaw + ride.fit.theta;
+  } else [x, z] = toWorld(v, v.lo.x - 0.8, 0);
+  driving = null;
+  ride = null;
+  player.position.set(x, 0, z);
+  loadNear(x, z);
+  player.position.y = floorAt(x, z, v.root.position.y + 1).y;
+  player.rotation.set(0, yaw, 0);
+  player.visible = true;
+  fall = 0;
+  mixer.stopAllAction();
+  current = null; gear = null; setGear('idle');
+  follow();
+}
+
+// Moves the getting-in and getting-out clips along.
+function stepRide() {
+  if (!ride || !ride.action) return;
+  const a = ride.action, dur = a.getClip().duration;
+  if (ride.phase === 'enter' && a.time >= dur - 1e-3) {
+    ride.phase = 'drive';
+    const seat = mixer.clipAction(clips[ride.anims.seat]);
+    seat.reset().setLoop(THREE.LoopRepeat).play();
+    seat.crossFadeFrom(a, 0.2, false);
+    current = ride.action = seat;
+  } else if (ride.phase === 'exit' && a.time <= 1e-3) leave();
 }
 
 // Keeps the character out of parked vehicles (their bounding boxes).
@@ -623,14 +744,17 @@ function drive(dt) {
   const v = driving, o = v.root, d = v.data;
   const now = performance.now();
   if (now - lastLoad > 250) { lastLoad = now; loadNear(o.position.x, o.position.z); settleNear(o.position.x, o.position.z); }
-  const throttle = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
-  const steerIn = (keys.has('KeyA') ? 1 : 0) - (keys.has('KeyD') ? 1 : 0);
+  // Only the driver, seated, drives.
+  const seated = !ride || ride.phase === 'drive';
+  const held = k => seated && keys.has(k);
+  const throttle = (held('KeyW') ? 1 : 0) - (held('KeyS') ? 1 : 0);
+  const steerIn = (held('KeyA') ? 1 : 0) - (held('KeyD') ? 1 : 0);
   // Hand-tuned: top speed (m/s), acceleration and braking (m/s²).
   const top = d.tracked ? 14 : 32, accel = d.tracked ? 4 : 8, brake = 16;
   if (throttle > 0) v.speed += (v.speed < 0 ? brake : accel) * dt;
   else if (throttle < 0) v.speed -= (v.speed > 0 ? brake : accel * 0.6) * dt;
   else v.speed -= Math.sign(v.speed) * Math.min(Math.abs(v.speed), 1.5 * dt);
-  if (keys.has('Space')) v.speed -= Math.sign(v.speed) * Math.min(Math.abs(v.speed), 25 * dt);
+  if (held('Space')) v.speed -= Math.sign(v.speed) * Math.min(Math.abs(v.speed), 25 * dt);
   // Gravity along the slope.
   v.speed -= 9.8 * Math.sin(v.pitch) * dt;
   v.speed = Math.max(-top * 0.35, Math.min(top, v.speed * (1 - 0.02 * dt)));
@@ -700,7 +824,9 @@ function drive(dt) {
     w.node.rotation.set(-w.spin, w.steer ? v.steer : 0, 0);
   }
   // The character rides along; the camera follows and turns with it.
-  player.position.copy(o.position);
+  if (ride && ride.fit) placeRider(); else player.position.copy(o.position);
+  stepRide();
+  if (!driving) return;
   const delta = o.position.clone().sub(before);
   camera.position.add(delta);
   controls.target.add(delta);
@@ -779,7 +905,7 @@ function open(gltf, name) {
   frame(root);
   // For inspecting from the browser console.
   window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut,
-    vehicles, enterOrLeave, stepPlay, keys, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
+    vehicles, enterOrLeave, stepPlay, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
   player.position.set(0, 0, 0);
@@ -787,6 +913,7 @@ function open(gltf, name) {
   ui('playmode').checked = false;
   loco = analyse(gltf);
   ui('playpanel').style.display = loco && fillGears() ? '' : 'none';
+  analyseVehicleClips();
   play(-1);
 }
 
