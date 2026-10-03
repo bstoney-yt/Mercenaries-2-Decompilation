@@ -333,9 +333,24 @@ impl Combat {
         self.smoke_wrecks(f, dt);
     }
 
-    /// Her eye, and the way the crosshair points.
+    /// Where shots start and the way the crosshair points: along the
+    /// camera's line from where it passes her, so walls and slopes between
+    /// the camera and her don't stop them.
     fn aim_ray(player: &Player) -> (Vec3, Vec3) {
-        (player.eye(), player.camera_forward())
+        let (eye, dir) = (player.eye(), player.camera_forward());
+        let past = (player.character.position - eye).dot(dir).max(0.0);
+        (eye + dir * past, dir)
+    }
+
+    /// What a shot fired now would hit: the distance, and the person if
+    /// one (for checking aim).
+    pub fn aim_probe(
+        physics: &Physics,
+        people: &People,
+        player: &Player,
+    ) -> Option<(f32, Option<usize>)> {
+        let (from, dir) = Self::aim_ray(player);
+        cast_shot(physics, people, from, dir, RIFLE_RANGE, None)
     }
 
     /// A weapon's muzzle in her hands, or her chest.

@@ -585,6 +585,18 @@ fn fight_for_screenshot(
             "fight: shooting the soldier at {at:.1} ({:.1} m)",
             at.distance(here)
         );
+        aim_at(game, game.scene.people.npcs[i].chest());
+        if let (Some(world), Some(player)) = (&game.scene.world, &game.scene.player) {
+            let probe = combat::Combat::aim_probe(&world.physics, &game.scene.people, player);
+            eprintln!(
+                "fight: aim hits {}",
+                match probe {
+                    Some((d, Some(j))) => format!("person {j} at {d:.1} m (target {i})"),
+                    Some((d, None)) => format!("the world at {d:.1} m"),
+                    None => "nothing".to_owned(),
+                }
+            );
+        }
         for _ in 0..90 {
             let chest = game.scene.people.npcs[i].chest();
             aim_at(game, chest);
@@ -595,7 +607,9 @@ fn fight_for_screenshot(
     } else {
         eprintln!("fight: no soldier near");
     }
-    // A rocket at the nearest parked vehicle.
+    // A rocket at the nearest parked vehicle in range, else by the
+    // soldier.
+    let here = game.focus();
     let vehicle = game
         .scene
         .vehicles
@@ -610,7 +624,13 @@ fn fight_for_screenshot(
                     .transform_point3(m2_math::glam::Vec3::Y),
             )
         })
-        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)));
+        .filter(|at| at.distance(here) < 80.0)
+        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)))
+        .or_else(|| {
+            soldier.map(|i| {
+                game.scene.people.npcs[i].character.position + m2_math::glam::Vec3::X * 2.0
+            })
+        });
     if let Some(at) = vehicle {
         aim_at(game, at);
         game.step(fire(Some(Weapon::Rpg)), tick);
