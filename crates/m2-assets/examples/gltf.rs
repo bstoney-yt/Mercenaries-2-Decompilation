@@ -87,8 +87,11 @@
 //! drives them with its clips. Soldier spawns get the army model their
 //! entity name asks for ("VZ Soldier", "VZ Heavy", "VZ Deathsquad");
 //! civilians (`?npcs=N` in the page address) are scattered around the start.
-//! Their behaviour (idling, wandering near home, stepping aside, running
-//! from fast vehicles) is invented, not the game's AI. `npcs` also writes a
+//! A soldier whose `AiPatrol` names a `Path` entity gets that path as a
+//! `route` (world points, glTF axes) and walks it: round again if it closes
+//! on itself, back the way it came otherwise. The rest of their behaviour
+//! (idling, wandering near home, stepping aside, running from fast vehicles,
+//! the pauses at a route's ends) is invented, not the game's AI. `npcs` also writes a
 //! rifle (`wpn_<hash>.glb`, the AK-47, with its muzzle marker). The viewer
 //! puts it in the right hand of the player and of every soldier, held the
 //! way the game's two-handed rifle clip holds it; click or hold F to fire,
@@ -1133,8 +1136,9 @@ const HUMAN_ROOT: u32 = 0xcbc1_eb51;
 /// clips: the viewer drives them with the playable character's clips) and
 /// `npcs.json`: the models, and spawn points from layer entities that
 /// place people (`PopulationSimpleSpawner`, `Ai`, `AiPatrol`) near
-/// `detail`. Models are chosen by texture name (`<faction>_hum_<role>_..`),
-/// civilians first; which model a spawner really spawns is not decoded.
+/// `detail`, with the patrol route of each that has one. Models are chosen by
+/// texture name (`<faction>_hum_<role>_..`), civilians first; which model a
+/// spawner really spawns is not decoded.
 fn export_npcs<R: Read + Seek>(
     wad: &mut WadArchive<R>,
     dir: &str,
@@ -1145,8 +1149,15 @@ fn export_npcs<R: Read + Seek>(
     let mut humans: Vec<(u32, Vec<u32>)> = Vec::new();
     // Small static models: (hash, textures, nodes), for hand weapons.
     let mut weapons: Vec<(u32, Vec<u32>, usize)> = Vec::new();
-    // (glTF position, entity name, component)
-    let mut spawns: Vec<([f32; 3], String, &'static str)> = Vec::new();
+    // (glTF position, entity name, component, entity)
+    let mut spawns: Vec<([f32; 3], String, &'static str, u32)> = Vec::new();
+    // Patrol routes: soldier -> path entity (AiPatrol's third field), path
+    // entity -> path asset (Path's field), path assets, and every entity's
+    // placement.
+    let mut patrol_of: HashMap<u32, u32> = HashMap::new();
+    let mut path_of: HashMap<u32, u32> = HashMap::new();
+    let mut paths: HashMap<u32, Vec<[f32; 3]>> = HashMap::new();
+    let mut placed_at: HashMap<u32, m2_assets::Placement> = HashMap::new();
     for block in 0..wad.index().blocks().len() {
         let decoded = wad.read_block(block)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -1188,6 +1199,25 @@ fn export_npcs<R: Read + Seek>(
                     };
                     let names = layer.names();
                     let places = layer.placements();
+                    let word = |rec: &[u8], at: usize| {
+                        rec.get(at..at + 4)
+                            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    };
+                    if let Some(c) = layer.component("AiPatrol") {
+                        for (id, rec) in c.records().unwrap_or_default() {
+                            if let Some(t) = word(rec, 8) {
+                                patrol_of.insert(id, t);
+                            }
+                        }
+                    }
+                    if let Some(c) = layer.component("Path") {
+                        for (id, rec) in c.records().unwrap_or_default() {
+                            if let Some(h) = word(rec, 0) {
+                                path_of.insert(id, h);
+                            }
+                        }
+                    }
+                    placed_at.extend(places.iter().map(|(&id, p)| (id, *p)));
                     for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
                         let Some(c) = layer.component(component) else {
                             continue;
@@ -1203,8 +1233,13 @@ fn export_npcs<R: Read + Seek>(
                                 continue;
                             }
                             let name = names.get(&id).copied().unwrap_or("-").to_owned();
-                            spawns.push((flip_v([x, y, z]), name, component));
+                            spawns.push((flip_v([x, y, z]), name, component, id));
                         }
+                    }
+                }
+                m2_assets::path::PATH_TYPE => {
+                    if let Ok(p) = m2_assets::Path::parse(data) {
+                        paths.insert(e.name_hash, p.points);
                     }
                 }
                 _ => {}
@@ -1336,14 +1371,33 @@ fn export_npcs<R: Read + Seek>(
     };
     let spawns_json: Vec<String> = spawns
         .iter()
-        .filter_map(|(at, name, from)| {
+        .filter_map(|(at, name, from, id)| {
             let model = model_for(name)?;
+            // The patrol route, placed by its path entity, in glTF axes.
+            let route = patrol_of
+                .get(id)
+                .and_then(|target| Some((placed_at.get(target)?, paths.get(path_of.get(target)?)?)))
+                .map(|(place, points)| {
+                    let [qx, qy, qz, qw] = place.rotation;
+                    let q = Quat::from_xyzw(qx, qy, qz, qw).normalize();
+                    let at = Vec3::from(place.position);
+                    let pts: Vec<String> = points
+                        .iter()
+                        .map(|p| format!("{:?}", flip_v((at + q * Vec3::from(*p)).to_array())))
+                        .collect();
+                    format!(r#","route":[{}]"#, pts.join(","))
+                })
+                .unwrap_or_default();
             Some(format!(
-                r#"{{"at":{at:?},"name":"{}","from":"{from}","model":{model}}}"#,
+                r#"{{"at":{at:?},"name":"{}","from":"{from}","model":{model}{route}}}"#,
                 clean(name)
             ))
         })
         .collect();
+    let routes = spawns_json
+        .iter()
+        .filter(|s| s.contains("\"route\""))
+        .count();
     std::fs::write(
         std::path::Path::new(dir).join("npcs.json"),
         format!(
@@ -1369,10 +1423,11 @@ fn export_npcs<R: Read + Seek>(
         *from.entry(s.2).or_default() += 1;
     }
     println!(
-        "{} spawn points within {} m: {from:?}; {} placed with a soldier model",
+        "{} spawn points within {} m: {from:?}; {} placed with a soldier model, {routes} with a patrol route ({} paths in all)",
         spawns.len(),
         o.radius,
-        spawns_json.len()
+        spawns_json.len(),
+        paths.len()
     );
     Ok(())
 }

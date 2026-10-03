@@ -1009,7 +1009,7 @@ function spawnNpcs() {
     return cache.get(key);
   };
   const clipFor = (modelIndex, g) => fit(modelIndex, `${modelIndex} ${g}`, inPlace(+ui(g).value));
-  const add = (modelIndex, at, soldier, name) => {
+  const add = (modelIndex, at, soldier, name, route = null) => {
     const src = npcModels[modelIndex];
     if (!src) return;
     const clipOf = g => clipFor(modelIndex, g);
@@ -1031,6 +1031,9 @@ function spawnNpcs() {
       body, root, mixer, actions, current: actions.idle, gait: 'idle', home: at.clone(), soldier, name, hp: 100, alive: true, alert: false,
       state: 'idle', timer: 1 + Math.random() * 4, target: null, placed: false, speed: 0,
       rifle: combat.ready && soldier ? giveRifle(root) : null, blownDir,
+      // A patrol: the game's route (from its AiPatrol and Path entities),
+      // walked as a loop if its ends meet, else back and forth.
+      route, leg: 0, step: 1, loop: !!route && route[0].distanceTo(route[route.length - 1]) < 3,
     });
   };
   // Which way the knock-back clip carries the body (its root's travel).
@@ -1038,7 +1041,10 @@ function spawnNpcs() {
   const bt = blownClip && blownClip.tracks.find(t => t.name === `${loco.rootName}.position`);
   const blownDir = bt ? new THREE.Vector2(bt.values[bt.values.length - 3] - bt.values[0], bt.values[bt.values.length - 1] - bt.values[2]).normalize() : null;
   const civilians = npcData.models.map((m, i) => [m, i]).filter(([m]) => !m.soldier).map(([, i]) => i);
-  for (const s of npcData.spawns) add(s.model, new THREE.Vector3(...s.at), true, s.name);
+  for (const s of npcData.spawns) {
+    const route = s.route && s.route.length >= 2 ? s.route.map(p => new THREE.Vector3(...p)) : null;
+    add(s.model, new THREE.Vector3(...s.at), true, s.name, route);
+  }
   const p = player.position;
   for (let k = 0; k < NPC_COUNT && civilians.length; k++) {
     const a = Math.random() * Math.PI * 2, d = 8 + Math.random() * 50;
@@ -1064,6 +1070,17 @@ function pushOutOfPeople(pos, r, skip) {
     const ux = d > 1e-4 ? dx / d : 1, uz = d > 1e-4 ? dz / d : 0;
     pos.x = q.x + ux * min; pos.z = q.z + uz * min;
   }
+}
+
+// A patrol's next point: round again on a loop, back the way it came
+// otherwise. Returns whether it hit an end of the route.
+function nextLeg(n) {
+  let next = n.leg + n.step;
+  const end = next < 0 || next >= n.route.length;
+  if (end && n.loop) next = 0;
+  else if (end) { n.step = -n.step; next = n.leg + n.step; }
+  n.leg = Math.max(0, Math.min(n.route.length - 1, next));
+  return end;
 }
 
 function stepNpcs(dt) {
@@ -1099,8 +1116,12 @@ function stepNpcs(dt) {
       setNpcGait(n, 'idle');
       n.timer -= dt;
       if (n.timer <= 0) {
-        const a = Math.random() * Math.PI * 2, d = Math.random() * (n.soldier ? 5 : 12);
-        n.target = n.home.clone().add(new THREE.Vector3(Math.cos(a) * d, 0, Math.sin(a) * d));
+        if (n.route) {
+          n.target = n.route[n.leg].clone();
+        } else {
+          const a = Math.random() * Math.PI * 2, d = Math.random() * (n.soldier ? 5 : 12);
+          n.target = n.home.clone().add(new THREE.Vector3(Math.cos(a) * d, 0, Math.sin(a) * d));
+        }
         n.state = 'walk';
       }
       continue;
@@ -1108,7 +1129,16 @@ function stepNpcs(dt) {
     // Walking, stepping aside or fleeing towards the target.
     const tx = n.target.x - b.position.x, tz = n.target.z - b.position.z;
     const left = Math.hypot(tx, tz);
-    if (left < 0.4) { n.state = 'idle'; n.timer = 2 + Math.random() * 5; continue; }
+    if (left < 0.4) {
+      if (n.route && n.state === 'walk') {
+        // On to the next point; a short look around at the ends.
+        const end = nextLeg(n);
+        if (end) { n.state = 'idle'; n.timer = 1 + Math.random() * 2; }
+        else n.target = n.route[n.leg].clone();
+        continue;
+      }
+      n.state = 'idle'; n.timer = 2 + Math.random() * 5; continue;
+    }
     const gait = n.state === 'walk' ? 'walk' : 'run';
     setNpcGait(n, gait);
     const speed = loco.info[+ui(gait).value].speed;
@@ -1121,7 +1151,12 @@ function stepNpcs(dt) {
     const floor = floorAt(next.x, next.z, b.position.y);
     // A wall, a car or a drop in the way: give up on this target.
     const moved = Math.hypot(next.x - b.position.x, next.z - b.position.z);
-    if (moved < step * 0.3 || Math.abs(floor.y - b.position.y) > 1) { n.state = 'idle'; n.timer = 1 + Math.random() * 2; continue; }
+    // (Pushed out the far side of a building counts as blocked too.)
+    if (moved < step * 0.3 || moved > step * 3 + 0.05 || Math.abs(floor.y - b.position.y) > 1) {
+      // Stuck: a patrol skips to its next point.
+      if (n.route) nextLeg(n);
+      n.state = 'idle'; n.timer = 1 + Math.random() * 2; continue;
+    }
     next.y = floor.y;
     // Face the way it goes (the clips' forward is loco.fwd).
     const want = Math.atan2(tx, tz) - Math.atan2(loco.fwd.x, loco.fwd.y);
