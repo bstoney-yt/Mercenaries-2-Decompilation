@@ -43,6 +43,7 @@
     <h1 style="margin-top:14px">Play</h1>
     <label style="color:var(--text)"><input type="checkbox" id="playmode"> Play mode</label>
     <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run. Drag to orbit.</div>
+    <label style="color:var(--text)"><input type="checkbox" id="showcol"> show collision shapes (PHY2)</label>
     <label for="idle">Idle</label><select id="idle"></select>
     <label for="walk">Walk</label><select id="walk"></select>
     <label for="run">Run</label><select id="run"></select>
@@ -232,12 +233,147 @@ function cullObjects(force) {
   for (const o of plants) o.visible = Math.hypot(o.position.x - c.x, o.position.z - c.z) < VEG_VIEW;
 }
 
+// ---- Collision -------------------------------------------------------
+// Each placed object collides through its "col_" child (the model's PHY2
+// shapes) or, where the model has none, through its own render triangles:
+// a fallback, labelled as such in the status line. An object's triangles
+// are gathered, in world space, into a grid of 4 m squares when the
+// character first comes near it.
+const colliders = []; // { obj, box, source: 'phy2' | 'render', loaded }
+const CELL = 4;
+const triGrid = new Map(); // "x,z" -> [{ t: Float32Array(9), id }]
+let triCount = 0, stamp = 0;
+const STEP = 0.5, RADIUS = 0.35, MAX_SLOPE = 50 * Math.PI / 180;
+const showCollision = () => ui('showcol').checked;
+
+function addCollider(o) {
+  const col = o.children.find(c => c.name.startsWith('col_'));
+  const box = new THREE.Box3().setFromObject(col || o);
+  if (col) col.traverse(m => { if (m.isMesh) m.visible = showCollision(); });
+  colliders.push({ obj: o, src: col || o, box, source: col ? 'phy2' : 'render', loaded: false });
+}
+
+function loadCollider(c) {
+  c.loaded = true;
+  const v = new THREE.Vector3();
+  c.src.updateMatrixWorld(true);
+  c.src.traverse(m => {
+    if (!m.isMesh || m.isInstancedMesh) return;
+    // Render fallback: only the object's own meshes, not its collision child.
+    if (c.source === 'render' && m.name.startsWith('col_')) return;
+    const pos = m.geometry.attributes.position, idx = m.geometry.index;
+    const n = idx ? idx.count : pos.count;
+    for (let i = 0; i + 2 < n; i += 3) {
+      const t = new Float32Array(9);
+      for (let k = 0; k < 3; k++) {
+        v.fromBufferAttribute(pos, idx ? idx.getX(i + k) : i + k).applyMatrix4(m.matrixWorld);
+        t[3 * k] = v.x; t[3 * k + 1] = v.y; t[3 * k + 2] = v.z;
+      }
+      const entry = { t, id: 0 };
+      const x0 = Math.floor(Math.min(t[0], t[3], t[6]) / CELL), x1 = Math.floor(Math.max(t[0], t[3], t[6]) / CELL);
+      const z0 = Math.floor(Math.min(t[2], t[5], t[8]) / CELL), z1 = Math.floor(Math.max(t[2], t[5], t[8]) / CELL);
+      for (let x = x0; x <= x1; x++) for (let z = z0; z <= z1; z++) {
+        const k = `${x},${z}`;
+        if (!triGrid.has(k)) triGrid.set(k, []);
+        triGrid.get(k).push(entry);
+      }
+      triCount++;
+    }
+  });
+}
+
+// Loads the colliders within 40 m of (x, z).
+function loadNear(x, z) {
+  for (const c of colliders) {
+    if (c.loaded) continue;
+    const b = c.box;
+    if (x > b.min.x - 40 && x < b.max.x + 40 && z > b.min.z - 40 && z < b.max.z + 40) loadCollider(c);
+  }
+}
+
+// Triangles in the grid squares within r of (x, z), each once.
+function trisNear(x, z, r) {
+  const out = [];
+  stamp++;
+  for (let gx = Math.floor((x - r) / CELL); gx <= Math.floor((x + r) / CELL); gx++)
+    for (let gz = Math.floor((z - r) / CELL); gz <= Math.floor((z + r) / CELL); gz++)
+      for (const e of triGrid.get(`${gx},${gz}`) || []) if (e.id !== stamp) { e.id = stamp; out.push(e.t); }
+  return out;
+}
+
+// The highest collider surface under (x, z) at or below y, or -Infinity.
+function colliderFloor(x, z, y) {
+  let best = -Infinity;
+  for (const t of trisNear(x, z, 0)) {
+    const [ax, ay, az, bx, by, bz, cx, cy, cz] = t;
+    const d = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+    if (Math.abs(d) < 1e-9) continue;
+    const l1 = ((bz - cz) * (x - cx) + (cx - bx) * (z - cz)) / d;
+    const l2 = ((cz - az) * (x - cx) + (ax - cx) * (z - cz)) / d;
+    const l3 = 1 - l1 - l2;
+    if (l1 < 0 || l2 < 0 || l3 < 0) continue;
+    const h = l1 * ay + l2 * by + l3 * cy;
+    if (h <= y && h > best) best = h;
+  }
+  return best;
+}
+
+// Closest point on triangle t to p (Ericson, Real-Time Collision Detection 5.1.5).
+const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _c = new THREE.Vector3();
+const _ab = new THREE.Vector3(), _ac = new THREE.Vector3(), _ap = new THREE.Vector3(), _q = new THREE.Vector3();
+function closest(p, t) {
+  _a.set(t[0], t[1], t[2]); _b.set(t[3], t[4], t[5]); _c.set(t[6], t[7], t[8]);
+  _ab.subVectors(_b, _a); _ac.subVectors(_c, _a); _ap.subVectors(p, _a);
+  const d1 = _ab.dot(_ap), d2 = _ac.dot(_ap);
+  if (d1 <= 0 && d2 <= 0) return _q.copy(_a);
+  const bp = _ap.clone().sub(_ab), d3 = _ab.dot(bp), d4 = _ac.dot(bp);
+  if (d3 >= 0 && d4 <= d3) return _q.copy(_b);
+  const vc = d1 * d4 - d3 * d2;
+  if (vc <= 0 && d1 >= 0 && d3 <= 0) return _q.copy(_a).addScaledVector(_ab, d1 / (d1 - d3));
+  const cp = _ap.clone().sub(_ac), d5 = _ab.dot(cp), d6 = _ac.dot(cp);
+  if (d6 >= 0 && d5 <= d6) return _q.copy(_c);
+  const vb = d5 * d2 - d1 * d6;
+  if (vb <= 0 && d2 >= 0 && d6 <= 0) return _q.copy(_a).addScaledVector(_ac, d2 / (d2 - d6));
+  const va = d3 * d6 - d5 * d4;
+  if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0)
+    return _q.copy(_b).addScaledVector(_c.clone().sub(_b), (d4 - d3) / ((d4 - d3) + (d5 - d6)));
+  const denom = 1 / (va + vb + vc);
+  return _q.copy(_a).addScaledVector(_ab, vb * denom).addScaledVector(_ac, vc * denom);
+}
+
+// Pushes a body (three spheres above the step height) out of walls,
+// horizontally, so it slides along them. Moves `pos` in place.
+const _p = new THREE.Vector3();
+function pushOut(pos) {
+  const tris = trisNear(pos.x, pos.z, RADIUS + 0.1);
+  if (!tris.length) return;
+  for (let iter = 0; iter < 3; iter++) {
+    let moved = false;
+    for (const h of [STEP + RADIUS, 1.2, 1.6]) {
+      _p.set(pos.x, pos.y + h, pos.z);
+      for (const t of tris) {
+        const q = closest(_p, t);
+        const dx = _p.x - q.x, dz = _p.z - q.z, dy = _p.y - q.y;
+        const dist = Math.hypot(dx, dy, dz);
+        if (dist >= RADIUS) continue;
+        const flat = Math.hypot(dx, dz);
+        if (flat < 1e-4) continue; // straight above or below: floor or ceiling
+        const push = (RADIUS - dist) * (dist / flat) + 1e-3;
+        pos.x += dx / flat * push; pos.z += dz / flat * push;
+        _p.x = pos.x; _p.z = pos.z;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+}
+
 function openWorld(gltf) {
   world = gltf.scene;
   scene.add(world);
   world.updateMatrixWorld(true);
   world.traverse(o => {
-    if (o.name.startsWith('obj_')) { objects.push(o); return; }
+    if (o.name.startsWith('obj_')) { objects.push(o); addCollider(o); return; }
     if (o.name.startsWith('veg_')) { plants.push(o); return; }
     if (o.isMesh && (o.name === 'sea' || o.parent?.name === 'sea')) seaLevel = new THREE.Box3().setFromObject(o).max.y;
     if (!o.isMesh || o.name === 'sea' || o.parent?.name === 'sea') return;
@@ -257,16 +393,34 @@ function openWorld(gltf) {
   scene.fog = new THREE.Fog(0x9cc3dc, 800, 7000);
   camera.near = 0.5; camera.far = 30000; camera.updateProjectionMatrix();
   sun.position.set(2000, 3000, 1000);
-  status(ui('status').textContent + ' · world loaded (Play mode starts you on the island)');
+  const phy2 = colliders.filter(c => c.source === 'phy2').length;
+  status(ui('status').textContent + ` · world loaded (Play mode starts you on the island) · collision: ${phy2} objects with PHY2 shapes, ${colliders.length - phy2} using render triangles (fallback)`);
+}
+
+/// Terrain under (x, z): { y, normal }, or the sea.
+const _up = new THREE.Vector3(0, 1, 0);
+function terrainAt(x, z) {
+  const near = buckets.get(`${Math.floor(x / BUCKET)},${Math.floor(z / BUCKET)}`);
+  if (!near) return { y: seaLevel, normal: _up };
+  ray.set(new THREE.Vector3(x, 5000, z), down);
+  const hit = ray.intersectObjects(near, false)[0];
+  if (!hit || hit.point.y < seaLevel) return { y: seaLevel, normal: _up };
+  const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+  if (normal.y < 0) normal.negate();
+  return { y: hit.point.y, normal };
 }
 
 /// Ground height under (x, z), or sea level.
 function groundAt(x, z) {
-  const near = buckets.get(`${Math.floor(x / BUCKET)},${Math.floor(z / BUCKET)}`);
-  if (!near) return seaLevel;
-  ray.set(new THREE.Vector3(x, 5000, z), down);
-  const hit = ray.intersectObjects(near, false)[0];
-  return hit ? Math.max(hit.point.y, seaLevel) : seaLevel;
+  return terrainAt(x, z).y;
+}
+
+/// The surface a character with feet at y stands on at (x, z): the terrain
+/// or a collider no more than a step above the feet.
+function floorAt(x, z, y) {
+  const t = terrainAt(x, z);
+  const c = colliderFloor(x, z, y + STEP);
+  return c > t.y ? { y: c, normal: _up, onObject: true } : t;
 }
 
 /// Puts the camera behind and above the character.
@@ -284,7 +438,10 @@ function startPlay(on) {
     // ?spawn=x,z in game coordinates (the export mirrors z).
     const [sx, sz] = (new URLSearchParams(location.search).get('spawn') || '0,0').split(',').map(Number);
     player.position.set(sx, 0, -sz);
-    player.position.y = groundAt(player.position.x, player.position.z);
+    loadNear(player.position.x, player.position.z);
+    // Start on top of whatever is there.
+    player.position.y = floorAt(player.position.x, player.position.z, 1e4).y;
+    fall = 0;
     follow();
   } else {
     player.position.set(0, 0, 0);
@@ -292,6 +449,43 @@ function startPlay(on) {
     frame(root);
   }
   if (on) setGear('idle'); else play(-1);
+}
+
+// Turns a wanted horizontal step into the actual move (step.y included):
+// no climbing terrain steeper than MAX_SLOPE, slower uphill, sliding along
+// walls, stepping up to STEP onto objects, and falling off edges.
+let fall = 0, lastLoad = 0;
+function moveInWorld(step, dt) {
+  const p = player.position;
+  const now = performance.now();
+  if (now - lastLoad > 250) { lastLoad = now; loadNear(p.x, p.z); }
+  if (step.lengthSq() > 0) {
+    const ahead = floorAt(p.x + step.x, p.z + step.z, p.y);
+    if (!ahead.onObject) {
+      const n = ahead.normal;
+      const slope = Math.acos(Math.min(1, n.y));
+      const flat = Math.hypot(n.x, n.z);
+      if (flat > 1e-6) {
+        // Uphill is against the normal's horizontal part.
+        const ux = -n.x / flat, uz = -n.z / flat;
+        const up = step.x * ux + step.z * uz;
+        if (up > 0 && slope > MAX_SLOPE) { step.x -= ux * up; step.z -= uz * up; }
+        else if (up > 0) step.multiplyScalar(1 - 0.5 * Math.sin(slope));
+      }
+    }
+  }
+  const next = p.clone().add(step);
+  pushOut(next);
+  const floor = floorAt(next.x, next.z, p.y);
+  if (fall === 0 && floor.y >= p.y - 0.4) {
+    // On the ground: follow it up a step or down a slope.
+    next.y = floor.y;
+  } else {
+    fall += 20 * dt;
+    next.y = p.y - fall * dt;
+    if (next.y <= floor.y) { next.y = floor.y; fall = 0; }
+  }
+  step.subVectors(next, p);
 }
 
 function stepPlay(dt) {
@@ -304,21 +498,21 @@ function stepPlay(dt) {
   if (keys.has('KeyS')) move.sub(fwd);
   if (keys.has('KeyD')) move.add(right);
   if (keys.has('KeyA')) move.sub(right);
-  if (move.lengthSq() === 0) { setGear('idle'); return; }
-  move.normalize();
-  setGear(keys.has('ShiftLeft') || keys.has('ShiftRight') ? 'sprint' : walking ? 'walk' : 'run');
-  // Turn the character's forward towards the move, smoothly.
-  const want = Math.atan2(move.x, move.y) - Math.atan2(loco.fwd.x, loco.fwd.y);
-  let d = want - player.rotation.y;
-  d = Math.atan2(Math.sin(d), Math.cos(d));
-  player.rotation.y += d * Math.min(1, dt * 10);
-  const speed = loco.info[+ui(gear).value].speed;
-  const step = new THREE.Vector3(move.x, 0, move.y).multiplyScalar(speed * dt);
-  if (world) {
-    // Follow the ground; the camera moves with the character.
-    const y = groundAt(player.position.x + step.x, player.position.z + step.z);
-    step.y = y - player.position.y;
+  const step = new THREE.Vector3();
+  if (move.lengthSq() === 0) setGear('idle');
+  else {
+    move.normalize();
+    setGear(keys.has('ShiftLeft') || keys.has('ShiftRight') ? 'sprint' : walking ? 'walk' : 'run');
+    // Turn the character's forward towards the move, smoothly.
+    const want = Math.atan2(move.x, move.y) - Math.atan2(loco.fwd.x, loco.fwd.y);
+    let d = want - player.rotation.y;
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    player.rotation.y += d * Math.min(1, dt * 10);
+    const speed = loco.info[+ui(gear).value].speed;
+    step.set(move.x, 0, move.y).multiplyScalar(speed * dt);
   }
+  if (world) moveInWorld(step, dt);
+  else if (step.lengthSq() === 0) return;
   player.position.add(step);
   camera.position.add(step);
   controls.target.add(step);
@@ -334,6 +528,10 @@ addEventListener('keydown', e => {
 addEventListener('keyup', e => keys.delete(e.code));
 addEventListener('blur', () => keys.clear());
 ui('playmode').onchange = e => { startPlay(e.target.checked); e.target.blur(); };
+ui('showcol').onchange = e => {
+  for (const c of colliders) if (c.source === 'phy2') c.src.traverse(m => { if (m.isMesh) m.visible = e.target.checked; });
+  e.target.blur();
+};
 for (const g of gears) ui(g).onchange = e => { if (gear === g) { gear = null; setGear(g); } e.target.blur(); };
 
 function open(gltf, name) {
@@ -355,7 +553,8 @@ function open(gltf, name) {
   ui('name').textContent = name;
   frame(root);
   // For inspecting from the browser console.
-  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, get loco() { return loco; }, get world() { return world; } };
+  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut,
+    get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
   player.position.set(0, 0, 0);

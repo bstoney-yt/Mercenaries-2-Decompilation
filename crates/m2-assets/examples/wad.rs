@@ -748,16 +748,74 @@ fn anims<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
     Ok(())
 }
 
+/// Counts from parsing every model's `PHY2` section.
+#[derive(Default)]
+struct PhysicsTally {
+    models: usize,
+    with: usize,
+    kinds: std::collections::BTreeMap<&'static str, usize>,
+    triangles: usize,
+    bodies: usize,
+    fixed: usize,
+    bad_node: usize,
+    errors: usize,
+}
+
+impl PhysicsTally {
+    fn add(&mut self, hash: u32, data: &[u8]) {
+        use m2_assets::physics::Geometry;
+        self.models += 1;
+        let Some(phy2) = Ucfx::parse(data).ok().and_then(|u| u.top_level(*b"PHY2")) else {
+            return;
+        };
+        self.with += 1;
+        let parsed = Model::parse(data).map_err(|e| e.to_string()).and_then(|m| {
+            Ok((
+                m,
+                m2_assets::Physics::parse(phy2).map_err(|e| e.to_string())?,
+            ))
+        });
+        let (model, p) = match parsed {
+            Ok(x) => x,
+            Err(e) => {
+                self.errors += 1;
+                eprintln!("collision {hash:08x}: {e}");
+                return;
+            }
+        };
+        self.bodies += p.bodies.len();
+        self.fixed += p.bodies.iter().filter(|b| b.is_fixed()).count();
+        for (k, s) in p.shapes.iter().enumerate() {
+            let kind = match s.geometry {
+                Geometry::Box { .. } => "box",
+                Geometry::Sphere => "sphere",
+                Geometry::Capsule { .. } => "capsule",
+                Geometry::Convex { .. } => "convex",
+                Geometry::Mesh { .. } => "mesh",
+            };
+            *self.kinds.entry(kind).or_default() += 1;
+            self.triangles += s.geometry.triangles(s.radius).1.len();
+            if p.shape_node(k)
+                .is_none_or(|n| n as usize >= model.nodes.len())
+            {
+                self.bad_node += 1;
+            }
+        }
+    }
+}
+
 fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
     use m2_assets::layer::LAYER_TYPE;
     use m2_assets::terrain::{CELL_SIZE, LOW_RES_TYPE, TERRAIN_TYPE};
     use m2_assets::{Layer, LowResTile, TerrainCell};
     let (mut cells, mut tiles, mut layers) = (HashMap::new(), HashMap::new(), Vec::new());
     let mut scatter: Vec<Vec<u8>> = Vec::new();
+    let mut phys = PhysicsTally::default();
     for block in 0..wad.index().blocks().len() {
         let decoded = wad.read_block(block)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
             match e.type_hash {
+                MODEL_TYPE if e.unk_0x08 == 0 => phys.add(e.name_hash, data),
                 TERRAIN_TYPE => {
                     cells.insert(e.name_hash, data.to_vec());
                 }
@@ -770,7 +828,18 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
             }
         }
     }
-    let mut errors = 0;
+    let mut errors = phys.errors;
+    println!(
+        "{} models, {} with collision: {} shapes ({:?}), {} triangles; {} bodies ({} fixed); {} shapes on a node the model lacks",
+        phys.models,
+        phys.with,
+        phys.kinds.values().sum::<usize>(),
+        phys.kinds,
+        phys.triangles,
+        phys.bodies,
+        phys.fixed,
+        phys.bad_node
+    );
     let (mut groups, mut ranges, mut triangles, mut materials, mut bad_index) = (0, 0, 0, 0, 0);
     for (hash, data) in &cells {
         match TerrainCell::parse(data) {
