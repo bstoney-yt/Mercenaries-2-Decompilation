@@ -56,6 +56,13 @@
     <label for="walk">Walk</label><select id="walk"></select>
     <label for="run">Run</label><select id="run"></select>
     <label for="sprint">Sprint</label><select id="sprint"></select>
+    <div id="voicepanel" style="display:none">
+      <label for="vsoldier">Soldier voice (▶ plays a sample)</label>
+      <div class="row" style="margin-top:0"><select id="vsoldier"></select><button id="vsoldierplay">▶</button></div>
+      <label for="vcivilian">Civilian voice</label>
+      <div class="row" style="margin-top:0"><select id="vcivilian"></select><button id="vcivilianplay">▶</button></div>
+      <div style="color:var(--muted)">The game names its 27 voice sets only by hash, so which is the VZ army is picked by ear here; the defaults are guesses.</div>
+    </div>
   </div>
   <div style="color:var(--muted);margin-top:8px">Drag a .glb onto the page to open another.</div>
 </div>
@@ -1100,6 +1107,10 @@ function stepNpcs(dt) {
     }
     n.mixer.update(dt);
     if (!n.alive) continue;
+    // Shouts (see `voices`): on turning alert, then now and then in a fight.
+    if (n.alert && !n.wasAlert) bark(n);
+    else if (n.alert && n.soldier) bark(n, dt * 0.08);
+    n.wasAlert = n.alert;
     if (n.soldier && n.alert && combat.ready && stepSoldier(n, dt)) continue;
     // React: step aside from the character, run from a fast vehicle.
     const dx = b.position.x - me.x, dz = b.position.z - me.z;
@@ -1110,6 +1121,7 @@ function stepNpcs(dt) {
       const dir = fast ? away : new THREE.Vector2(away.x - side * away.y, away.y + side * away.x).normalize();
       const dist = fast ? 8 : 2;
       n.target = new THREE.Vector3(b.position.x + dir.x * dist, b.position.y, b.position.z + dir.y * dist);
+      if (fast) bark(n, 0.5);
       n.state = fast ? 'flee' : 'aside';
     }
     if (n.state === 'idle') {
@@ -1290,7 +1302,7 @@ function castShot(origin, dir, far, skip) {
 
 function hurtNpc(n, dmg) {
   n.hp -= dmg;
-  if (n.hp > 0) { n.alert = true; return; }
+  if (n.hp > 0) { n.alert = true; bark(n); return; }
   n.alive = false;
   n.state = 'dead';
   if (n.actions.die) {
@@ -1333,6 +1345,7 @@ function playerShoot() {
 function panic(n) {
   const away = n.body.position.clone().sub(player.position).setY(0).normalize().multiplyScalar(18);
   n.target = n.body.position.clone().add(away);
+  if (n.state !== 'flee') bark(n, 0.5);
   n.state = 'flee';
 }
 
@@ -1662,14 +1675,16 @@ async function loadSounds() {
 // Audio starts on the first key press or click (browsers require one).
 function startAudio() {
   playMusic();
-  if (!audio.banks) return;
+  if (!audio.banks && !voices.sets) return;
   if (!audio.ctx) audio.ctx = new AudioContext();
   if (audio.ctx.state === 'suspended') audio.ctx.resume();
 }
 
 function soundBuffer(file) {
   if (!audio.buffers.has(file)) {
-    audio.buffers.set(file, fetch('snd/' + file).then(r => r.arrayBuffer()).then(b => audio.ctx.decodeAudioData(b)).catch(() => null));
+    // Voice lines (`voice:<stream>`) are decoded by the server on request.
+    const url = file.startsWith('voice:') ? `stream/voice/${file.slice(6)}.wav` : 'snd/' + file;
+    audio.buffers.set(file, fetch(url).then(r => r.arrayBuffer()).then(b => audio.ctx.decodeAudioData(b)).catch(() => null));
   }
   return audio.buffers.get(file);
 }
@@ -1765,6 +1780,7 @@ const music = { list: null, track: null, ambience: null, on: true };
 async function loadStreams() {
   const r = await fetch('streams.json').catch(() => null);
   if (r && r.ok) music.list = await r.json();
+  loadVoices();
 }
 
 function playMusic() {
@@ -1792,6 +1808,82 @@ function toggleMusic() {
   music.on = !music.on;
   for (const el of [music.track, music.ambience]) if (el) { if (music.on) el.play(); else el.pause(); }
   if (music.on) playMusic();
+}
+
+// Voices: `--streams` also lists the game's 27 resident voice sets (cue
+// tables in English.wad), each with its positional lines: shouts heard from
+// where the speaker stands, fading from the distance the table gives (most
+// 10 m) and silent beyond its cut-off (125 m). Which set is which character
+// is named only by hash, so the panel plays samples and picks the set
+// soldiers and civilians use, kept in this browser; the defaults are
+// GUESSES. When a soldier turns alert or is hit, and now and then in a
+// fight, he shouts a random line of 0.5-3 s from his set; a civilian shouts
+// when running away. The triggers and timing are invented, not the game's.
+const voices = { sets: null, picked: { soldier: '6cffc547', civilian: 'cf4f8b9c' }, speaking: 0 };
+
+function loadVoices() {
+  const sets = music.list && music.list.voices && music.list.voices.filter(s => s.lines.length);
+  if (!sets || !sets.length) return;
+  voices.sets = new Map(sets.map(s => [s.set, s.lines.filter(([, secs]) => secs >= 0.5 && secs <= 3)]));
+  for (const role of ['soldier', 'civilian']) {
+    try {
+      const saved = localStorage.getItem('m2voice.' + role);
+      if (saved && voices.sets.has(saved)) voices.picked[role] = saved;
+    } catch { /* storage unavailable: keep the default */ }
+    const sel = ui('v' + role);
+    for (const s of sets) {
+      const o = document.createElement('option');
+      o.value = s.set;
+      o.textContent = `${s.set} (${voices.sets.get(s.set).length} shouts)`;
+      sel.append(o);
+    }
+    sel.value = voices.picked[role];
+    sel.onchange = () => {
+      voices.picked[role] = sel.value;
+      try { localStorage.setItem('m2voice.' + role, sel.value); } catch { /* not kept */ }
+      sample(role);
+    };
+    ui('v' + role + 'play').onclick = () => sample(role);
+  }
+  ui('voicepanel').style.display = '';
+}
+
+// One random shout of `role`'s set, from `pos` (or beside the camera).
+async function shout(role, pos) {
+  const lines = voices.sets && voices.sets.get(voices.picked[role]);
+  if (!lines || !lines.length || !audio.ctx || audio.ctx.state !== 'running' || voices.speaking >= 2) return false;
+  const [stream, secs, near, far] = lines[Math.floor(Math.random() * lines.length)];
+  voices.speaking++;
+  setTimeout(() => voices.speaking--, secs * 1000 + 300);
+  const buf = await soundBuffer('voice:' + stream);
+  if (!buf) return true;
+  const src = audio.ctx.createBufferSource();
+  src.buffer = buf;
+  const pan = new PannerNode(audio.ctx, {
+    panningModel: 'equalpower', distanceModel: 'linear', refDistance: near, maxDistance: far, rolloffFactor: 1,
+    positionX: pos.x, positionY: pos.y + 1.6, positionZ: pos.z,
+  });
+  src.connect(pan).connect(audio.ctx.destination);
+  src.start();
+  return true;
+}
+
+function sample(role) {
+  startAudio();
+  const p = camera.getWorldDirection(new THREE.Vector3()).multiplyScalar(3).add(camera.position);
+  voices.speaking = 0;
+  shout(role, p.setY(p.y - 1.6));
+}
+
+// An NPC shouts if he has not lately, the player could hear him, and no
+// more than one other voice is talking.
+function bark(n, chance = 1) {
+  const now = performance.now();
+  if (!voices.sets || !audio.ctx || audio.ctx.state !== 'running' || voices.speaking >= 2) return;
+  if (now < (n.nextBark || 0) || Math.random() > chance) return;
+  if (n.body.position.distanceTo(player.position) > 125) return;
+  n.nextBark = now + 4000 + Math.random() * 4000;
+  shout(n.soldier ? 'soldier' : 'civilian', n.body.position);
 }
 
 function stepAudio() {
@@ -1901,7 +1993,7 @@ function open(gltf, name) {
   ui('name').textContent = name;
   frame(root);
   // For inspecting from the browser console.
-  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut,
+  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut, voices, shout, bark, audio, startAudio, hurtNpc, panic,
     vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, switchWeapon, throwGrenade, explode, projectiles, audio, startAudio, stepAudio, music, toggleMusic, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
