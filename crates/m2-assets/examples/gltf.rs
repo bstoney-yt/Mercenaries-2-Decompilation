@@ -8,7 +8,10 @@
 //!     --clips N       export at most N animation clips (default 40)
 //!     --filter TEXT   only clips from blocks whose path contains TEXT
 //!     --lod N         level of detail to export (default 0, the finest)
-//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [port]
+//! cargo run --release -p m2-assets --example gltf -- world  <vz.wad> <out.glb> [options]
+//!     --detail X,Z    full-detail terrain around this point (game x, z)
+//!     --radius M      ... out to this distance (default 600)
+//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--port N]
 //! ```
 //!
 //! `rigs` lists the models that animation clips fit (every track names one
@@ -26,6 +29,13 @@
 //! carry their motion on the root node and are otherwise in place, so the
 //! page measures each clip's speed and direction from the root track, strips
 //! the root's horizontal motion, and moves the character at that speed.
+//!
+//! `world` exports the island's terrain placed by the layout layer: the
+//! low-resolution tiles everywhere, full-detail cells near `--detail`, a sea
+//! plane, and colours from height and slope (the terrain materials are not
+//! decoded yet). With `view --world`, play mode starts on the island
+//! (`?spawn=X,Z` in the page address picks the point) and the character
+//! follows the ground.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
@@ -91,17 +101,44 @@ fn run(args: &[String]) -> AnyResult<()> {
             println!("wrote {out}");
             Ok(())
         }
-        [cmd, glb, rest @ ..] if cmd == "view" => {
-            let port = match rest {
-                [] => 8765,
-                [p] => p.parse()?,
-                _ => return Err("usage: gltf view <file.glb> [port]".into()),
+        [cmd, wad, out, rest @ ..] if cmd == "world" => {
+            let mut w = WorldOptions {
+                detail: None,
+                radius: 600.0,
             };
-            view(glb, port)
+            let mut it = rest.iter();
+            while let Some(flag) = it.next() {
+                let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                match flag.as_str() {
+                    "--detail" => {
+                        let (x, z) = value.split_once(',').ok_or("--detail takes X,Z")?;
+                        w.detail = Some([x.trim().parse()?, z.trim().parse()?]);
+                    }
+                    "--radius" => w.radius = value.parse()?,
+                    _ => return Err(format!("unknown option {flag}").into()),
+                }
+            }
+            let glb = export_world(&mut open(wad)?, &w)?;
+            std::fs::write(out, glb)?;
+            println!("wrote {out}");
+            Ok(())
+        }
+        [cmd, glb, rest @ ..] if cmd == "view" => {
+            let (mut port, mut world) = (8765, None);
+            let mut it = rest.iter();
+            while let Some(arg) = it.next() {
+                match arg.as_str() {
+                    "--world" => world = Some(it.next().ok_or("--world needs a file")?.as_str()),
+                    "--port" => port = it.next().ok_or("--port needs a value")?.parse()?,
+                    p => port = p.parse()?,
+                }
+            }
+            view(glb, world, port)
         }
         _ => Err(
             "usage: gltf rigs <vz.wad> | gltf export <vz.wad> <model hash> <out.glb> \
-                  [--clips N] [--filter TEXT] [--lod N] | gltf view <file.glb> [port]"
+                  [--clips N] [--filter TEXT] [--lod N] | gltf world <vz.wad> <out.glb> \
+                  [--detail X,Z] [--radius M] | gltf view <file.glb> [--world world.glb] [--port N]"
                 .into(),
         ),
     }
@@ -754,10 +791,11 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
 }
 
 /// Serves the viewer page and `glb` on 127.0.0.1 until stopped.
-fn view(glb: &str, port: u16) -> AnyResult<()> {
+fn view(glb: &str, world: Option<&str>, port: u16) -> AnyResult<()> {
     use std::io::{BufRead, Write};
     let page = include_str!("gltf_viewer.html");
     let model = std::fs::read(glb)?;
+    let world = world.map(std::fs::read).transpose()?;
     let name = std::path::Path::new(glb)
         .file_name()
         .map_or("model.glb".into(), |n| n.to_string_lossy().into_owned());
@@ -774,6 +812,11 @@ fn view(glb: &str, port: u16) -> AnyResult<()> {
         let (status, ty, body): (&str, &str, &[u8]) = match path {
             "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", page.as_bytes()),
             "/model.glb" => ("200 OK", "model/gltf-binary", &model),
+            "/world.glb" if world.is_some() => (
+                "200 OK",
+                "model/gltf-binary",
+                world.as_deref().unwrap_or_default(),
+            ),
             _ => ("404 Not Found", "text/plain", b"not found"),
         };
         let head = format!(
@@ -785,4 +828,233 @@ fn view(glb: &str, port: u16) -> AnyResult<()> {
             .and_then(|()| stream.write_all(body));
     }
     Ok(())
+}
+
+struct WorldOptions {
+    /// Centre of the full-detail area in game coordinates (x, z).
+    detail: Option<[f32; 2]>,
+    radius: f32,
+}
+
+/// A ground colour from height and steepness, standing in for the terrain
+/// materials, which are not decoded yet.
+fn ground_colour(height: f32, up: f32) -> [f32; 3] {
+    let mix = |a: [f32; 3], b: [f32; 3], t: f32| {
+        let t = t.clamp(0.0, 1.0);
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ]
+    };
+    let (sand, jungle, dry, rock) = (
+        [0.76, 0.70, 0.52],
+        [0.20, 0.34, 0.13],
+        [0.45, 0.45, 0.25],
+        [0.42, 0.39, 0.35],
+    );
+    let land = mix(jungle, dry, (height - 40.0) / 120.0);
+    let shore = mix(sand, land, (height - 1.0) / 3.0);
+    mix(shore, rock, (0.85 - up) / 0.2)
+}
+
+/// A world-space mesh piece: positions and normals already mirrored for
+/// glTF, triangles in glTF winding.
+struct Piece {
+    name: String,
+    positions: Vec<f32>,
+    normals: Vec<f32>,
+    colours: Vec<f32>,
+    indices: Vec<u16>,
+}
+
+fn piece(name: String, origin: [f32; 3], group: &m2_assets::terrain::TerrainGroup<'_>) -> Piece {
+    let pos = group.positions();
+    let nrm = group
+        .decl
+        .find(DeclUsage::Normal, 0)
+        .and_then(|e| group.vertices.read(e))
+        .unwrap_or_default();
+    let (mut positions, mut normals, mut colours) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, p) in pos.iter().enumerate() {
+        let world = [p[0] + origin[0], p[1] + origin[1], p[2] + origin[2]];
+        let n = nrm
+            .get(i)
+            .map(|n| {
+                Vec3::new(n[0], n[1], n[2])
+                    .try_normalize()
+                    .unwrap_or(Vec3::Y)
+            })
+            .unwrap_or(Vec3::Y);
+        positions.extend(flip_v(world));
+        normals.extend(flip_v(n.to_array()));
+        colours.extend(ground_colour(world[1], n.y));
+    }
+    // Full ranges draw the whole group; fall back to the material ranges.
+    let ranges = if group.full_ranges.is_empty() {
+        &group.material_ranges
+    } else {
+        &group.full_ranges
+    };
+    let mut seen = HashSet::new();
+    let mut indices = Vec::new();
+    for r in ranges {
+        for [a, b, c] in group.triangles(r) {
+            let mut key = [a, b, c];
+            key.sort_unstable();
+            if seen.insert(key) {
+                indices.extend([a, c, b]);
+            }
+        }
+    }
+    Piece {
+        name,
+        positions,
+        normals,
+        colours,
+        indices,
+    }
+}
+
+fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> AnyResult<Vec<u8>> {
+    use m2_assets::layer::LAYER_TYPE;
+    use m2_assets::terrain::{CELL_SIZE, LOW_RES_TYPE, TERRAIN_TYPE};
+    use m2_assets::{Layer, LowResTile, TerrainCell};
+
+    // The layout layer: positions of every cell and low-res tile.
+    let mut cell_at: HashMap<u32, [f32; 3]> = HashMap::new();
+    let mut tile_at: HashMap<u32, [f32; 3]> = HashMap::new();
+    let (mut tiles, mut cells) = (HashMap::new(), HashMap::new());
+    for block in 0..wad.index().blocks().len() {
+        let decoded = wad.read_block(block)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            match e.type_hash {
+                LAYER_TYPE => {
+                    let layer = Layer::parse(data)?;
+                    let placements = layer.placements();
+                    for (out, component) in [
+                        (&mut cell_at, "TerrainObject"),
+                        (&mut tile_at, "LowResTerrainObject"),
+                    ] {
+                        for (entity, asset) in layer.hashes(component) {
+                            if let Some(p) = placements.get(&entity) {
+                                out.insert(asset, p.position);
+                            }
+                        }
+                    }
+                }
+                LOW_RES_TYPE => {
+                    tiles.insert(e.name_hash, data.to_vec());
+                }
+                TERRAIN_TYPE => {
+                    cells.insert(e.name_hash, data.to_vec());
+                }
+                _ => {}
+            }
+        }
+    }
+    let near = |c: [f32; 3]| {
+        o.detail.is_some_and(|[x, z]| {
+            // Distance from the point to the cell's square.
+            let dx = ((c[0] - x).abs() - CELL_SIZE / 2.0).max(0.0);
+            let dz = ((c[2] - z).abs() - CELL_SIZE / 2.0).max(0.0);
+            (dx * dx + dz * dz).sqrt() <= o.radius
+        })
+    };
+
+    let mut pieces = Vec::new();
+    let mut detailed = 0;
+    for (hash, data) in &cells {
+        let Some(&centre) = cell_at.get(hash) else {
+            continue;
+        };
+        if !near(centre) {
+            continue;
+        }
+        let cell = TerrainCell::parse(data)?;
+        detailed += 1;
+        for (pi, patch) in cell.patches.iter().enumerate() {
+            let origin = [
+                centre[0] + patch.offset[0],
+                centre[1] + patch.offset[1],
+                centre[2] + patch.offset[2],
+            ];
+            for (gi, g) in patch.groups.iter().enumerate() {
+                pieces.push(piece(
+                    format!("cell {hash:08x} patch {pi} group {gi}"),
+                    origin,
+                    g,
+                ));
+            }
+        }
+    }
+    // Low-res tiles everywhere else; a detailed cell's tile has the same
+    // centre, so skip those.
+    let detailed_centres: Vec<[f32; 3]> = cell_at.values().copied().filter(|c| near(*c)).collect();
+    for (hash, data) in &tiles {
+        let Some(&centre) = tile_at.get(hash) else {
+            continue;
+        };
+        let covered = detailed_centres
+            .iter()
+            .any(|c| (c[0] - centre[0]).abs() < 1.0 && (c[2] - centre[2]).abs() < 1.0);
+        if covered {
+            continue;
+        }
+        let tile = LowResTile::parse(data)?;
+        pieces.push(piece(format!("tile {hash:08x}"), centre, &tile.group));
+    }
+
+    let mut g = Gltf::default();
+    let mut nodes = Vec::new();
+    let mut meshes = Vec::new();
+    for p in &pieces {
+        if p.indices.is_empty() {
+            continue;
+        }
+        let pos = g.floats(&p.positions, 3, true, Some(34962));
+        let nrm = g.floats(&p.normals, 3, false, Some(34962));
+        let col = g.floats(&p.colours, 3, false, Some(34962));
+        let ind = g.u16s(&p.indices, 1, Some(34963));
+        meshes.push(format!(
+            r#"{{"primitives":[{{"attributes":{{"POSITION":{pos},"NORMAL":{nrm},"COLOR_0":{col}}},"indices":{ind},"material":0}}]}}"#
+        ));
+        nodes.push(format!(
+            r#"{{"name":"{}","mesh":{}}}"#,
+            p.name,
+            meshes.len() - 1
+        ));
+    }
+    // Sea level water.
+    let half = 10.0 * CELL_SIZE + 4000.0;
+    let water = g.floats(
+        &[
+            -half, 0.0, -half, half, 0.0, -half, half, 0.0, half, -half, 0.0, half,
+        ],
+        3,
+        true,
+        Some(34962),
+    );
+    let water_ind = g.u16s(&[0, 2, 1, 0, 3, 2], 1, Some(34963));
+    meshes.push(format!(
+        r#"{{"name":"sea","primitives":[{{"attributes":{{"POSITION":{water}}},"indices":{water_ind},"material":1}}]}}"#
+    ));
+    nodes.push(format!(r#"{{"name":"sea","mesh":{}}}"#, meshes.len() - 1));
+    eprintln!(
+        "{} detailed cells, {} pieces, {} vertices",
+        detailed,
+        nodes.len() - 1,
+        pieces.iter().map(|p| p.positions.len() / 3).sum::<usize>()
+    );
+    let roots: Vec<usize> = (0..nodes.len()).collect();
+    let materials = r#"[{"name":"ground","pbrMetallicRoughness":{"metallicFactor":0,"roughnessFactor":1}},{"name":"sea","pbrMetallicRoughness":{"baseColorFactor":[0.10,0.30,0.42,0.75],"metallicFactor":0,"roughnessFactor":0.2},"alphaMode":"BLEND","doubleSided":true}]"#;
+    let json = format!(
+        r#"{{"asset":{{"version":"2.0","generator":"m2-assets gltf example"}},"scene":0,"scenes":[{{"name":"world","nodes":{roots:?}}}],"nodes":[{}],"meshes":[{}],"materials":{materials},"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
+        nodes.join(","),
+        meshes.join(","),
+        g.accessors.join(","),
+        g.views.join(","),
+        g.bin.len().next_multiple_of(4)
+    );
+    Ok(g.glb(json))
 }

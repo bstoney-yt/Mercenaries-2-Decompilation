@@ -204,13 +204,69 @@ function setGear(g) {
   current = next;
 }
 
+// ---- World -----------------------------------------------------------
+// An optional world.glb (from `gltf world`) loads beside the model. Its
+// terrain pieces are bucketed by 100 m square so the ground under the
+// character can be found with a short downward ray each frame.
+let world = null;
+const buckets = new Map();
+const BUCKET = 100;
+const ray = new THREE.Raycaster();
+const down = new THREE.Vector3(0, -1, 0);
+
+function openWorld(gltf) {
+  world = gltf.scene;
+  scene.add(world);
+  world.updateMatrixWorld(true);
+  world.traverse(o => {
+    if (!o.isMesh || o.name === 'sea' || o.parent?.name === 'sea') return;
+    const b = new THREE.Box3().setFromObject(o);
+    for (let x = Math.floor(b.min.x / BUCKET); x <= Math.floor(b.max.x / BUCKET); x++)
+      for (let z = Math.floor(b.min.z / BUCKET); z <= Math.floor(b.max.z / BUCKET); z++) {
+        const k = `${x},${z}`;
+        if (!buckets.has(k)) buckets.set(k, []);
+        buckets.get(k).push(o);
+      }
+  });
+  grid.visible = false;
+  scene.background = new THREE.Color(0x9cc3dc);
+  scene.fog = new THREE.Fog(0x9cc3dc, 800, 7000);
+  camera.far = 20000; camera.updateProjectionMatrix();
+  sun.position.set(2000, 3000, 1000);
+  status(ui('status').textContent + ' · world loaded (Play mode starts you on the island)');
+}
+
+/// Ground height under (x, z), or sea level.
+function groundAt(x, z) {
+  const near = buckets.get(`${Math.floor(x / BUCKET)},${Math.floor(z / BUCKET)}`);
+  if (!near) return 0;
+  ray.set(new THREE.Vector3(x, 5000, z), down);
+  const hit = ray.intersectObjects(near, false)[0];
+  return hit ? Math.max(hit.point.y, 0) : 0;
+}
+
+/// Puts the camera behind and above the character.
+function follow() {
+  const back = new THREE.Vector3(0, 0, 1).applyQuaternion(player.quaternion).multiplyScalar(5);
+  controls.target.copy(player.position).add(new THREE.Vector3(0, 1.4, 0));
+  camera.position.copy(controls.target).add(back).add(new THREE.Vector3(0, 1.6, 0));
+}
+
 function startPlay(on) {
   mixer.stopAllAction();
   action = null; current = null; gear = null;
-  player.position.set(0, 0, 0);
   player.rotation.set(0, 0, 0);
-  grid.position.x = grid.position.z = 0;
-  frame(root);
+  if (world && on) {
+    // ?spawn=x,z in game coordinates (the export mirrors z).
+    const [sx, sz] = (new URLSearchParams(location.search).get('spawn') || '0,0').split(',').map(Number);
+    player.position.set(sx, 0, -sz);
+    player.position.y = groundAt(player.position.x, player.position.z);
+    follow();
+  } else {
+    player.position.set(0, 0, 0);
+    grid.position.x = grid.position.z = 0;
+    frame(root);
+  }
   if (on) setGear('idle'); else play(-1);
 }
 
@@ -234,6 +290,11 @@ function stepPlay(dt) {
   player.rotation.y += d * Math.min(1, dt * 10);
   const speed = loco.info[+ui(gear).value].speed;
   const step = new THREE.Vector3(move.x, 0, move.y).multiplyScalar(speed * dt);
+  if (world) {
+    // Follow the ground; the camera moves with the character.
+    const y = groundAt(player.position.x + step.x, player.position.z + step.z);
+    step.y = y - player.position.y;
+  }
   player.position.add(step);
   camera.position.add(step);
   controls.target.add(step);
@@ -270,7 +331,7 @@ function open(gltf, name) {
   ui('name').textContent = name;
   frame(root);
   // For inspecting from the browser console.
-  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, get loco() { return loco; } };
+  window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
   player.position.set(0, 0, 0);
@@ -324,6 +385,10 @@ renderer.setAnimationLoop(() => {
 });
 
 load('model.glb', new URLSearchParams(location.search).get('name') || 'model.glb');
+// The world is optional: the server only has one with `view --world`.
+fetch('world.glb').then(r => r.ok ? r.arrayBuffer() : null).then(buf => {
+  if (buf) loader.parse(buf, '', openWorld, e => status('World failed to parse: ' + e.message));
+});
 </script>
 </body>
 </html>
