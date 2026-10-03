@@ -18,7 +18,8 @@
 //!     --detail X,Z    take spawn points around this point (game x, z)
 //!     --radius M      ... out to this distance (default 400)
 //!     --models N      character models to export (default 8)
-//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--npcs <dir>] [--port N]
+//! cargo run --release -p m2-assets --example gltf -- sounds <vz.wad> <out dir>
+//! cargo run --release -p m2-assets --example gltf -- view   <file.glb> [--world <world.glb>] [--npcs <dir>] [--sounds <dir>] [--port N]
 //! ```
 //!
 //! `rigs` lists the models that animation clips fit (every track names one
@@ -93,6 +94,14 @@
 //! hold the right button to aim. Soldiers that hear gunfire shoot back,
 //! civilians run, and the hit and fall reactions use the game's clips. The
 //! combat rules (damage, accuracy, fire rates, health) are invented.
+//!
+//! `sounds` writes the game's sound banks the viewer uses (the rifle,
+//! vehicle engines, town and jungle ambience) as WAV files, with
+//! `sounds.json` giving each sound's length, loudness and whether it loops.
+//! The banks are 16-bit PCM (see `m2_assets::sound`). A sound's role in its
+//! bank is named only by hash, so the viewer picks by those measurements:
+//! the loudest short mono sound for the shot, the loudest long loop for an
+//! engine.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
@@ -193,6 +202,7 @@ fn run(args: &[String]) -> AnyResult<()> {
             println!("wrote {out}");
             Ok(())
         }
+        [cmd, wad, dir] if cmd == "sounds" => export_sounds(&mut open(wad)?, dir),
         [cmd, wad, dir, rest @ ..] if cmd == "npcs" => {
             let mut o = NpcOptions {
                 detail: [0.0, 0.0],
@@ -215,17 +225,20 @@ fn run(args: &[String]) -> AnyResult<()> {
             export_npcs(&mut open(wad)?, dir, &o)
         }
         [cmd, glb, rest @ ..] if cmd == "view" => {
-            let (mut port, mut world, mut npcs) = (8765, None, None);
+            let (mut port, mut world, mut npcs, mut sounds) = (8765, None, None, None);
             let mut it = rest.iter();
             while let Some(arg) = it.next() {
                 match arg.as_str() {
                     "--world" => world = Some(it.next().ok_or("--world needs a file")?.as_str()),
                     "--npcs" => npcs = Some(it.next().ok_or("--npcs needs a folder")?.as_str()),
+                    "--sounds" => {
+                        sounds = Some(it.next().ok_or("--sounds needs a folder")?.as_str())
+                    }
                     "--port" => port = it.next().ok_or("--port needs a value")?.parse()?,
                     p => port = p.parse()?,
                 }
             }
-            view(glb, world, npcs, port)
+            view(glb, world, npcs, sounds, port)
         }
         _ => Err(
             "usage: gltf rigs <vz.wad> | gltf export <vz.wad> <model hash> <out.glb> \
@@ -904,7 +917,13 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
 }
 
 /// Serves the viewer page and `glb` on 127.0.0.1 until stopped.
-fn view(glb: &str, world: Option<&str>, npcs: Option<&str>, port: u16) -> AnyResult<()> {
+fn view(
+    glb: &str,
+    world: Option<&str>,
+    npcs: Option<&str>,
+    sounds: Option<&str>,
+    port: u16,
+) -> AnyResult<()> {
     use std::io::{BufRead, Write};
     let page = include_str!("gltf_viewer.html");
     let model = std::fs::read(glb)?;
@@ -936,9 +955,25 @@ fn view(glb: &str, world: Option<&str>, npcs: Option<&str>, port: u16) -> AnyRes
             };
             std::fs::read(std::path::Path::new(dir).join(name)).ok()
         });
-        let (status, ty, body): (&str, &str, &[u8]) = match (path, &npc_file) {
-            ("/npcs.json", Some(f)) => ("200 OK", "application/json", f),
-            (_, Some(f)) => ("200 OK", "model/gltf-binary", f),
+        // Sounds from `gltf sounds`: the list and WAV files named as written.
+        let sound_file = sounds.and_then(|dir| {
+            let name = match path {
+                "/sounds.json" => "sounds.json",
+                p => p.strip_prefix("/snd/").filter(|n| {
+                    n.starts_with("snd_")
+                        && n.ends_with(".wav")
+                        && n.len() < 80
+                        && n.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                })?,
+            };
+            std::fs::read(std::path::Path::new(dir).join(name)).ok()
+        });
+        let (status, ty, body): (&str, &str, &[u8]) = match (path, &npc_file, &sound_file) {
+            ("/npcs.json", Some(f), _) => ("200 OK", "application/json", f),
+            (_, Some(f), _) => ("200 OK", "model/gltf-binary", f),
+            ("/sounds.json", _, Some(f)) => ("200 OK", "application/json", f),
+            (_, _, Some(f)) => ("200 OK", "audio/wav", f),
             _ => match path {
                 "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", page.as_bytes()),
                 "/model.glb" => ("200 OK", "model/gltf-binary", &model),
@@ -1205,6 +1240,81 @@ fn export_npcs<R: Read + Seek>(
         spawns.len(),
         o.radius,
         spawns_json.len()
+    );
+    Ok(())
+}
+
+/// Sound banks the viewer uses, by block name: the rifle, vehicle engines
+/// and town ambience.
+const SOUND_BANKS: [&str; 10] = [
+    "wpn_assaultrifle",
+    "veh_4cylindernew",
+    "veh_jeep",
+    "veh_8cylinderold",
+    "veh_tankbig",
+    "veh_tankmed",
+    "veh_semi",
+    "veh_helicoptermedium",
+    "amb_citymed",
+    "amb_jungle",
+];
+
+/// Writes the sounds of `SOUND_BANKS` as WAV files and `sounds.json`
+/// describing them. A sound's role within its bank is named only by hash,
+/// so each is described by measurements the viewer picks from: length,
+/// loudness, and whether it loops (as loud at its end as at its start).
+fn export_sounds<R: Read + Seek>(wad: &mut WadArchive<R>, dir: &str) -> AnyResult<()> {
+    use m2_assets::sound::{SOUND_BANK_TYPE, SoundBank};
+    std::fs::create_dir_all(dir)?;
+    let mut banks_json = Vec::new();
+    let (mut files, mut bytes) = (0, 0);
+    for block in 0..wad.index().blocks().len() {
+        let name = block_name(&wad.index().blocks()[block].path).to_owned();
+        if !SOUND_BANKS.contains(&name.as_str()) {
+            continue;
+        }
+        let decoded = wad.read_block(block)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != SOUND_BANK_TYPE {
+                continue;
+            }
+            let bank = SoundBank::parse(data)?;
+            let mut sounds = Vec::new();
+            for s in &bank.sounds {
+                let v: Vec<f32> = s
+                    .pcm
+                    .chunks_exact(2)
+                    .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
+                    .collect();
+                let rms = |x: &[f32]| {
+                    (x.iter().map(|a| a * a).sum::<f32>() / x.len().max(1) as f32).sqrt()
+                };
+                let edge = (s.rate as usize / 10 * usize::from(s.channels)).min(v.len());
+                let (all, head, tail) = (rms(&v), rms(&v[..edge]), rms(&v[v.len() - edge..]));
+                let loops =
+                    head > 0.05 && tail > 0.05 && (head - tail).abs() < 0.4 * head.max(tail);
+                let file = format!("snd_{name}_{:08x}.wav", s.hash);
+                let wav = s.wav();
+                bytes += wav.len();
+                files += 1;
+                std::fs::write(std::path::Path::new(dir).join(&file), wav)?;
+                sounds.push(format!(
+                    r#"{{"file":"{file}","seconds":{:.3},"channels":{},"rms":{all:.3},"loops":{loops}}}"#,
+                    s.seconds(),
+                    s.channels
+                ));
+            }
+            banks_json.push(format!(r#""{name}":[{}]"#, sounds.join(",")));
+        }
+    }
+    std::fs::write(
+        std::path::Path::new(dir).join("sounds.json"),
+        format!("{{{}}}\n", banks_json.join(",\n")),
+    )?;
+    println!(
+        "{} banks, {files} sounds, {} MB of WAV in {dir}",
+        banks_json.len(),
+        bytes / (1 << 20)
     );
     Ok(())
 }

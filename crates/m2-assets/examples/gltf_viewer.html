@@ -1268,7 +1268,9 @@ function playerShoot() {
   const dir = camera.getWorldDirection(new THREE.Vector3());
   const hit = castShot(camera.position.clone(), dir, 400, null);
   const to = hit ? hit.point : camera.position.clone().addScaledVector(dir, 400);
-  tracer(muzzleOf(combat.mine) || player.position.clone().add(new THREE.Vector3(0, 1.4, 0)), to);
+  const from = muzzleOf(combat.mine) || player.position.clone().add(new THREE.Vector3(0, 1.4, 0));
+  tracer(from, to);
+  playAt(shotSound(), from, 0.9);
   if (hit && hit.npc) hurtNpc(hit.npc, 34);
   // Gunfire carries: soldiers within 60 m come for the player, civilians
   // within 40 m run.
@@ -1297,6 +1299,7 @@ function npcShoot(n) {
   const hit = castShot(from, dir, dist + 2, n);
   const end = hit ? hit.point : from.clone().addScaledVector(dir, dist + 2);
   tracer(from, end);
+  playAt(shotSound(), from, 0.9);
   const closest = from.clone().addScaledVector(dir, Math.max(0, aim.clone().sub(from).dot(dir)));
   const blocked = hit && hit.t < dist - 1;
   if (!driving && !blocked && closest.distanceTo(aim) < 0.45) hurtPlayer(8);
@@ -1370,6 +1373,127 @@ function aimPose() {
   current = next;
 }
 
+// ---- Sound -------------------------------------------------------------
+// From `gltf sounds` (served with `view --sounds`): the game's sound banks
+// as WAV files. Which sound in a bank is the gunshot or the engine is named
+// only by hash, so the page picks by measurement, a GUESS: the shot is the
+// loudest mono sound under 0.6 s in the rifle bank; an engine is the
+// loudest loop of 2 to 8 s in the vehicle's bank, pitched up with speed.
+// Ambience plays the town or jungle bank's one-shots around the player.
+const audio = { ctx: null, banks: null, buffers: new Map(), engine: null, nextAmbience: 0 };
+
+async function loadSounds() {
+  const r = await fetch('sounds.json').catch(() => null);
+  if (r && r.ok) audio.banks = await r.json();
+}
+
+// Audio starts on the first key press or click (browsers require one).
+function startAudio() {
+  if (!audio.banks) return;
+  if (!audio.ctx) audio.ctx = new AudioContext();
+  if (audio.ctx.state === 'suspended') audio.ctx.resume();
+}
+
+function soundBuffer(file) {
+  if (!audio.buffers.has(file)) {
+    audio.buffers.set(file, fetch('snd/' + file).then(r => r.arrayBuffer()).then(b => audio.ctx.decodeAudioData(b)).catch(() => null));
+  }
+  return audio.buffers.get(file);
+}
+
+// The best sound in a bank by `score` among those passing `keep`.
+function pickSound(bank, keep, score) {
+  const list = (audio.banks && audio.banks[bank]) || [];
+  let best = null;
+  for (const s of list) if (keep(s) && (!best || score(s) > score(best))) best = s;
+  return best && best.file;
+}
+const shotSound = () => pickSound('wpn_assaultrifle', s => s.channels === 1 && s.seconds < 0.6, s => s.rms);
+// Engine loops run 2-8 s; longer looping sounds are rev sweeps, probably.
+const loopOf = bank => pickSound(bank, s => s.loops && s.seconds >= 2 && s.seconds <= 8, s => s.rms);
+
+// Plays a sound at a place in the world, quieter with distance.
+async function playAt(file, pos, volume = 1) {
+  if (!file || !audio.ctx || audio.ctx.state !== 'running') return;
+  const buf = await soundBuffer(file);
+  if (!buf) return;
+  const src = audio.ctx.createBufferSource();
+  src.buffer = buf;
+  src.playbackRate.value = 0.94 + Math.random() * 0.12;
+  const gain = audio.ctx.createGain();
+  gain.gain.value = volume;
+  const pan = new PannerNode(audio.ctx, {
+    panningModel: 'equalpower', distanceModel: 'inverse', refDistance: 6, rolloffFactor: 1.2, maxDistance: 600,
+    positionX: pos.x, positionY: pos.y, positionZ: pos.z,
+  });
+  src.connect(gain).connect(pan).connect(audio.ctx.destination);
+  src.start();
+}
+
+function engineBank(d) {
+  const key = `${d.kind} ${d.name}`;
+  for (const [re, bank] of [[/helicopter/, 'veh_helicoptermedium'], [/hmmwv/, 'veh_jeep'], [/tank/, 'veh_tankbig'],
+    [/apc/, 'veh_tankmed'], [/semi|bus|truck/, 'veh_semi'], [/global_veh/, 'veh_8cylinderold'], [/./, 'veh_4cylindernew']]) {
+    if (re.test(key)) return bank;
+  }
+}
+
+// The engine of the vehicle being driven, pitched with its speed.
+async function stepEngine() {
+  if (!audio.ctx || audio.ctx.state !== 'running') return;
+  const want = driving ? engineBank(driving.data) : null;
+  if (audio.engine && audio.engine.bank !== want) {
+    audio.engine.src.stop();
+    audio.engine = null;
+  }
+  if (want && !audio.engine) {
+    const file = loopOf(want);
+    if (!file) return;
+    audio.engine = { bank: want, src: null, gain: null };
+    const buf = await soundBuffer(file);
+    if (!buf || !audio.engine || audio.engine.bank !== want) return;
+    const src = audio.ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    const gain = audio.ctx.createGain();
+    gain.gain.value = 0.45;
+    src.connect(gain).connect(audio.ctx.destination);
+    src.start();
+    Object.assign(audio.engine, { src, gain });
+  }
+  if (audio.engine && audio.engine.src && driving) {
+    const top = driving.data.flying ? 45 : driving.data.tracked ? 14 : 32;
+    const rate = driving.data.flying ? 0.5 + 0.6 * (driving.rpm || 0) : 0.75 + Math.abs(driving.speed) / top;
+    audio.engine.src.playbackRate.value = rate;
+  }
+}
+
+// Now and then, a one-shot from the town (among buildings) or the jungle.
+function stepAmbience() {
+  const now = performance.now();
+  if (!audio.ctx || audio.ctx.state !== 'running' || now < audio.nextAmbience) return;
+  audio.nextAmbience = now + 3000 + Math.random() * 6000;
+  const p = player.position;
+  const town = objects.filter(o => Math.hypot(o.position.x - p.x, o.position.z - p.z) < 150).length > 3;
+  const list = (audio.banks && audio.banks[town ? 'amb_citymed' : 'amb_jungle']) || [];
+  const one = list.filter(s => !s.loops)[Math.floor(Math.random() * list.length)];
+  if (!one) return;
+  const a = Math.random() * Math.PI * 2, d = 10 + Math.random() * 30;
+  playAt(one.file, new THREE.Vector3(p.x + Math.cos(a) * d, p.y + 2, p.z + Math.sin(a) * d), 0.5);
+}
+
+function stepAudio() {
+  if (!audio.ctx) return;
+  const l = audio.ctx.listener, f = camera.getWorldDirection(new THREE.Vector3());
+  if (l.positionX) {
+    l.positionX.value = camera.position.x; l.positionY.value = camera.position.y; l.positionZ.value = camera.position.z;
+    l.forwardX.value = f.x; l.forwardY.value = f.y; l.forwardZ.value = f.z;
+    l.upX.value = 0; l.upY.value = 1; l.upZ.value = 0;
+  }
+  stepEngine();
+  stepAmbience();
+}
+
 function stepPlay(dt) {
   dt = Math.min(dt, 0.05);
   if (driving) { if (driving.data.flying) fly(dt); else drive(dt); return; }
@@ -1410,6 +1534,7 @@ function stepPlay(dt) {
 
 addEventListener('keydown', e => {
   if (!ui('playmode').checked || e.target.tagName === 'SELECT') return;
+  startAudio();
   if (e.code === 'KeyQ') walking = !walking;
   if (e.code === 'KeyE' && !e.repeat) enterOrLeave();
   if (e.code === 'Space') e.preventDefault();
@@ -1419,6 +1544,7 @@ addEventListener('keyup', e => keys.delete(e.code));
 let pressAt = null;
 renderer.domElement.addEventListener('pointerdown', e => {
   if (!ui('playmode').checked) return;
+  startAudio();
   if (e.button === 0) pressAt = [e.clientX, e.clientY, performance.now()];
   if (e.button === 2) combat.aiming = true;
 });
@@ -1460,7 +1586,7 @@ function open(gltf, name) {
   frame(root);
   // For inspecting from the browser console.
   window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut,
-    vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
+    vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, audio, startAudio, stepAudio, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
   player.position.set(0, 0, 0);
@@ -1507,7 +1633,7 @@ addEventListener('drop', async e => {
 
 renderer.setAnimationLoop(() => {
   const dt = clock.getDelta();
-  if (mixer && ui('playmode').checked) { stepPlay(dt); mixer.update(dt); if (world) { stepNpcs(Math.min(dt, 0.05)); stepCombat(Math.min(dt, 0.05)); } }
+  if (mixer && ui('playmode').checked) { stepPlay(dt); mixer.update(dt); if (world) { stepNpcs(Math.min(dt, 0.05)); stepCombat(Math.min(dt, 0.05)); stepAudio(); } }
   else if (mixer && playing) mixer.update(dt * speed);
   if (action) { ui('time').value = action.time; ui('timev').textContent = action.time.toFixed(2) + 's'; }
   if (world) cullObjects(false);
@@ -1518,7 +1644,7 @@ renderer.setAnimationLoop(() => {
 load('model.glb', new URLSearchParams(location.search).get('name') || 'model.glb');
 // The world is optional: the server only has one with `view --world`.
 fetch('world.glb').then(r => r.ok ? r.arrayBuffer() : null).then(buf => {
-  if (buf) loader.parse(buf, '', g => { openWorld(g); loadNpcs(); }, e => status('World failed to parse: ' + e.message));
+  if (buf) loader.parse(buf, '', g => { openWorld(g); loadNpcs(); loadSounds(); }, e => status('World failed to parse: ' + e.message));
 });
 </script>
 </body>

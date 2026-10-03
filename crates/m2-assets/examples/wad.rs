@@ -811,11 +811,22 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
     let (mut cells, mut tiles, mut layers) = (HashMap::new(), HashMap::new(), Vec::new());
     let mut scatter: Vec<Vec<u8>> = Vec::new();
     let mut phys = PhysicsTally::default();
+    // Sound banks: (parsed, sounds, seconds, other layout).
+    let mut banks = (0usize, 0usize, 0f64, 0usize);
     for block in 0..wad.index().blocks().len() {
         let decoded = wad.read_block(block)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
             match e.type_hash {
                 MODEL_TYPE if e.unk_0x08 == 0 => phys.add(e.name_hash, data),
+                m2_assets::sound::SOUND_BANK_TYPE => match m2_assets::SoundBank::parse(data) {
+                    Ok(b) => {
+                        banks.0 += 1;
+                        banks.1 += b.sounds.len();
+                        banks.2 += b.sounds.iter().map(|s| f64::from(s.seconds())).sum::<f64>();
+                    }
+                    // The music bank and one other use a streaming layout.
+                    Err(_) => banks.3 += 1,
+                },
                 TERRAIN_TYPE => {
                     cells.insert(e.name_hash, data.to_vec());
                 }
@@ -829,6 +840,13 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         }
     }
     let mut errors = phys.errors;
+    println!(
+        "{} sound banks: {} sounds, {:.0} minutes of 16-bit PCM; {} in another layout (streamed)",
+        banks.0,
+        banks.1,
+        banks.2 / 60.0,
+        banks.3
+    );
     println!(
         "{} models, {} with collision: {} shapes ({:?}), {} triangles; {} bodies ({} fixed); {} shapes on a node the model lacks",
         phys.models,
