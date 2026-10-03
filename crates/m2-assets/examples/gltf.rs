@@ -20,6 +20,13 @@
 //! 8765 by default) with an animation picker; open the printed address in a
 //! browser. The page loads three.js from cdn.jsdelivr.net.
 //!
+//! The viewer also has a play mode for characters exported with their
+//! locomotion clips (for a human rig, `--filter resident`): WASD moves
+//! relative to the camera, Shift sprints, Q switches walk and run. Clips
+//! carry their motion on the root node and are otherwise in place, so the
+//! page measures each clip's speed and direction from the root track, strips
+//! the root's horizontal motion, and moves the character at that speed.
+//!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
 //! `local/` are ignored) and do not share them.
@@ -531,7 +538,14 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
                         skinned = true;
                     }
                     for range in &grp.material_ranges {
-                        let tris: Vec<u16> = grp.triangles(range).into_iter().flatten().collect();
+                        // Direct3D's front faces are clockwise, glTF's are
+                        // counter-clockwise; the Z mirror alone does not
+                        // reconcile them, so reverse each triangle.
+                        let tris: Vec<u16> = grp
+                            .triangles(range)
+                            .into_iter()
+                            .flat_map(|[a, b, c]| [a, c, b])
+                            .collect();
                         if tris.is_empty() {
                             continue;
                         }
