@@ -64,7 +64,8 @@
 //! by hand, not the game's. Helicopters (a UH-1 first) come with their main
 //! and tail rotors as `rotor N` nodes, found by their marker names, and fly
 //! with an arcade model also tuned by hand: Space climbs, Shift descends,
-//! W/S fly forward and back, A/D turn, and E gets out once landed. The
+//! W/S fly forward and back, A/D turn, and E gets out once landed.
+//! Vehicles collide with each other through their footprint boxes. The
 //! extras also carry the driver's seat and
 //! door markers. With the character exported with its vehicle clips
 //! (`--filter resident,vehicleclassanimgroup`), it climbs in with the
