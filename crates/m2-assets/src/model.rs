@@ -615,25 +615,7 @@ impl<'a> PrimitiveGroup<'a> {
     /// triangles and flipping every other one so all keep the strip's
     /// winding. Returns nothing for a range outside the index buffer.
     pub fn triangles(&self, range: &Range) -> Vec<[u16; 3]> {
-        let start = range.start_index as usize;
-        let Some(strip) = self
-            .indices
-            .get(start..start + range.index_count() as usize)
-        else {
-            return Vec::new();
-        };
-        strip
-            .windows(3)
-            .enumerate()
-            .filter(|(_, t)| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
-            .map(|(i, t)| {
-                if i % 2 == 0 {
-                    [t[0], t[1], t[2]]
-                } else {
-                    [t[1], t[0], t[2]]
-                }
-            })
-            .collect()
+        strip_triangles(&self.indices, range.start_index, range.index_count())
     }
 
     fn parse(
@@ -1158,6 +1140,48 @@ fn parse_nodes(hier: &[u8], count: u32) -> Result<Vec<Node>, ModelError> {
     Ok(nodes)
 }
 
+/// The triangles of the strip `indices[start..start + count]`, skipping
+/// degenerates and alternating winding as strips do. Empty if the range is
+/// outside `indices`.
+pub(crate) fn strip_triangles(indices: &[u16], start: u32, count: u32) -> Vec<[u16; 3]> {
+    let start = start as usize;
+    let Some(strip) = indices.get(start..start + count as usize) else {
+        return Vec::new();
+    };
+    strip
+        .windows(3)
+        .enumerate()
+        .filter(|(_, t)| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
+        .map(|(i, t)| {
+            if i % 2 == 0 {
+                [t[0], t[1], t[2]]
+            } else {
+                [t[1], t[0], t[2]]
+            }
+        })
+        .collect()
+}
+
+/// Reads one `MTRL` record.
+pub(crate) fn read_material(r: &mut Reader<'_>) -> Result<Material, OutOfBounds> {
+    let name_hash = r.u32()?;
+    let mut constants = [0.0; MATERIAL_CONSTANTS];
+    for c in &mut constants {
+        *c = f32(r)?;
+    }
+    let flags = r.u16()?;
+    let ntex = r.u16()?;
+    let textures = (0..ntex).map(|_| r.u32()).collect::<Result<_, _>>()?;
+    Ok(Material {
+        name_hash,
+        constants,
+        flags,
+        textures,
+        technique: r.u32()?,
+        unk_tail: r.u32()?,
+    })
+}
+
 fn parse_materials(mtrl: &[u8], count: u32) -> Result<Vec<Material>, ModelError> {
     let mut r = Reader::at(mtrl, 0);
     // Each record is at least MATERIAL_FIXED_LEN bytes, which bounds the
@@ -1168,25 +1192,7 @@ fn parse_materials(mtrl: &[u8], count: u32) -> Result<Vec<Material>, ModelError>
         expected: count,
     };
     for i in 0..count as usize {
-        let mut record = || -> Result<Material, OutOfBounds> {
-            let name_hash = r.u32()?;
-            let mut constants = [0.0; MATERIAL_CONSTANTS];
-            for c in &mut constants {
-                *c = f32(&mut r)?;
-            }
-            let flags = r.u16()?;
-            let ntex = r.u16()?;
-            let textures = (0..ntex).map(|_| r.u32()).collect::<Result<_, _>>()?;
-            Ok(Material {
-                name_hash,
-                constants,
-                flags,
-                textures,
-                technique: r.u32()?,
-                unk_tail: r.u32()?,
-            })
-        };
-        out.push(record().map_err(|_| short(i))?);
+        out.push(read_material(&mut r).map_err(|_| short(i))?);
     }
     if r.pos() != mtrl.len() {
         return Err(short(count as usize + 1));

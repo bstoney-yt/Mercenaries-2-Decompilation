@@ -18,6 +18,9 @@
 //!   wavelet encoded node tracks, timed events, a pose sampler and model
 //!   posing.
 //! - [`havok`]: the binary object packfiles animation clips are stored in.
+//! - [`terrain`]: the 400 m terrain cells and low-resolution tiles.
+//! - [`layer`]: entity layers, the component tables that place terrain,
+//!   buildings, props and everything else in the world.
 //! - [`material_animation`]: material animations (keyed material
 //!   parameters), stored under the animation type hash.
 //! - [`vertex`]: Direct3D 9 vertex declarations and vertex streams, mapped
@@ -38,9 +41,11 @@ pub mod block;
 mod bytes;
 pub mod dxt;
 pub mod havok;
+pub mod layer;
 pub mod material_animation;
 pub mod model;
 pub mod sges;
+pub mod terrain;
 pub mod texture;
 pub mod ucfx;
 pub mod vertex;
@@ -53,9 +58,11 @@ pub use animation::{AnimationError, Clip, Codec, Transform};
 pub use block::{BlockContents, BlockEntry, BlockError};
 pub use dxt::{DxtError, DxtFormat};
 pub use havok::{Packfile, PackfileError};
+pub use layer::{Component, Layer, LayerError, Placement};
 pub use material_animation::{MaterialAnimError, MaterialAnimation};
 pub use model::{Model, ModelError, PrimitiveGroup};
 pub use sges::{Segment, SgesError, SgesHeader};
+pub use terrain::{LowResTile, TerrainCell, TerrainError};
 pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};
 pub use ucfx::{Section, Ucfx, UcfxError};
 pub use vertex::{VertexDecl, VertexError, VertexStream};
