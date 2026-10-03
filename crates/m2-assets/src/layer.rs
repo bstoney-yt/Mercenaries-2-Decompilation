@@ -115,7 +115,10 @@ impl<'a> Component<'a> {
     /// (the data divides evenly by the count and no field is a string).
     pub fn records(&self) -> Option<Vec<(u32, &'a [u8])>> {
         let n = self.count as usize;
-        if n == 0 || self.data.len() % n != 0 || self.fields.iter().any(|f| f.ty == STRING_FIELD) {
+        if n == 0
+            || !self.data.len().is_multiple_of(n)
+            || self.fields.iter().any(|f| f.ty == STRING_FIELD)
+        {
             return None;
         }
         let len = self.data.len() / n;
