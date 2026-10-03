@@ -103,6 +103,7 @@ fn draw(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32, world: Mat
         },
         world,
         skin: None,
+        instances: None,
     }
 }
 
@@ -341,6 +342,40 @@ fn skinned_vertices_follow_their_bones() {
     });
     assert!(matches!(stale, Err(BackendError::StaleSkin { .. })));
     b.end_frame().unwrap();
+}
+
+#[test]
+fn instanced_draws_repeat_the_geometry() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    // Two small quads, left and right, and nothing in the middle.
+    b.begin_frame(&view()).unwrap();
+    let small = Mat4::from_scale(Vec3::splat(0.2));
+    let instances = b
+        .set_skin(&[
+            Mat4::from_translation(Vec3::new(-1.0, 0.0, 0.0)) * small,
+            Mat4::from_translation(Vec3::new(1.0, 0.0, 0.0)) * small,
+        ])
+        .unwrap();
+    b.draw(&DrawCall {
+        instances: Some(instances),
+        ..draw(vb, ib, 1, Mat4::IDENTITY)
+    })
+    .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    let (white, sky) = ([255; 4], [0, 0, 255, 255]);
+    assert_eq!(pixel(&rgba, 32, 32), sky, "middle");
+    assert_eq!(pixel(&rgba, 14, 32), white, "left");
+    assert_eq!(pixel(&rgba, 50, 32), white, "right");
 }
 
 #[test]

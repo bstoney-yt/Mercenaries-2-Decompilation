@@ -236,6 +236,22 @@ impl<R: Read + Seek> AssetSource<R> {
         })
     }
 
+    /// Every asset of type `type_hash` stored in the same blocks as asset
+    /// `hash` (a terrain cell's scatter, say), each once.
+    pub fn assets_beside(&mut self, hash: u32, type_hash: u32) -> Result<Vec<Vec<u8>>, AssetError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for b in self.blocks_of(hash) {
+            let decoded = self.block(b)?;
+            for (e, data) in BlockContents::parse(&decoded)?.iter() {
+                if e.type_hash == type_hash && e.unk_0x08 == 0 && seen.insert(e.name_hash) {
+                    out.push(data.to_vec());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Model `hash` with all its streamed geometry.
     pub fn model(&mut self, hash: u32) -> Result<ModelData, AssetError> {
         let (mut base, mut chunks) = (None, Vec::new());

@@ -623,7 +623,7 @@ impl Scene {
         fight: &combat::Combat,
     ) -> anyhow::Result<()> {
         if let Some(world) = &mut self.world {
-            world.draw(queue, eye);
+            world.draw(backend, queue, eye)?;
         } else {
             self.draw_ground(queue);
         }
@@ -719,6 +719,7 @@ impl Scene {
                 },
                 world: Mat4::IDENTITY,
                 skin: None,
+                instances: None,
             },
             layer: Layer::WORLD,
             translucent: false,
@@ -860,6 +861,7 @@ impl Effects {
                 },
                 world,
                 skin: None,
+                instances: None,
             },
             layer: Layer::WORLD,
             translucent,

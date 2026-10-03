@@ -26,6 +26,7 @@ use m2_render::{
 use crate::assets::{AssetError, DecodedTexture, Install};
 use crate::model::{CpuModel, GpuModel, MaterialCache};
 use crate::physics::{Physics, StaticKey};
+use crate::scatter::{self, CellScatter};
 use crate::world::{self, TerrainMesh, WorldIndex};
 
 /// Something for the loader to read.
@@ -34,6 +35,8 @@ pub enum Request {
     Cell(u32),
     Tile(u32),
     Model(u32),
+    /// A terrain cell's ground scatter.
+    Scatter(u32),
 }
 
 /// What the loader sends back.
@@ -41,6 +44,7 @@ pub enum Request {
 pub enum Loaded {
     Terrain(Request, Result<TerrainMesh, AssetError>),
     Model(u32, Result<CpuModel, AssetError>),
+    Scatter(u32, Result<CellScatter, AssetError>),
     /// Sent before the terrain or model that first uses it.
     Texture(u32, Option<DecodedTexture>),
 }
@@ -56,6 +60,7 @@ impl Loaded {
                 .map(|p| p.vertices.len() + p.indices.len())
                 .sum(),
             Self::Texture(_, Some(t)) => t.mips.iter().map(Vec::len).sum(),
+            Self::Scatter(_, Ok(s)) => s.size(),
             _ => 0,
         }
     }
@@ -66,6 +71,7 @@ impl Loaded {
 pub struct TextureLimits {
     pub models: u32,
     pub terrain: u32,
+    pub scatter: u32,
 }
 
 impl Default for TextureLimits {
@@ -73,6 +79,7 @@ impl Default for TextureLimits {
         Self {
             models: 1024,
             terrain: 2048,
+            scatter: 256,
         }
     }
 }
@@ -140,6 +147,18 @@ impl Loader {
                             }
                             Loaded::Model(h, model)
                         }
+                        Request::Scatter(h) => {
+                            let centre = index.cells.get(&h).copied().unwrap_or_default();
+                            let found = scatter::cell_scatter(&mut source, h, centre);
+                            if let Ok(s) = &found {
+                                for t in s.meshes.iter().filter_map(|m| m.texture()) {
+                                    if !texture(&mut source, t, limits.scatter) {
+                                        return;
+                                    }
+                                }
+                            }
+                            Loaded::Scatter(h, found)
+                        }
                     };
                     if res_tx.send(loaded).is_err() {
                         return;
@@ -194,6 +213,9 @@ pub struct WorldSettings {
     /// -45 m the waterline follows the beaches; where the game stores it is
     /// not known yet.
     pub sea_level: f32,
+    /// Grass and other ground scatter within this many metres (each clump
+    /// mesh also stops at its own fade distance).
+    pub scatter_distance: f32,
 }
 
 impl Default for WorldSettings {
@@ -206,6 +228,7 @@ impl Default for WorldSettings {
             upload_budget: 24 << 20,
             in_flight: 6,
             sea_level: -45.0,
+            scatter_distance: 150.0,
         }
     }
 }
@@ -217,6 +240,16 @@ struct TerrainGpu {
     count: u32,
     material: MaterialId,
     origin: Vec3,
+}
+
+#[derive(Debug)]
+struct ClumpGpu {
+    vertex_buffer: VertexBufferHandle,
+    index_buffer: IndexBufferHandle,
+    count: u32,
+    material: MaterialId,
+    fade_end: f32,
+    instances: Vec<Mat4>,
 }
 
 #[derive(Debug)]
@@ -240,6 +273,8 @@ pub struct WorldStats {
     pub cells: usize,
     pub models: usize,
     pub objects_drawn: usize,
+    /// Scatter instances drawn last frame.
+    pub scatter_drawn: usize,
     pub pending: usize,
     pub failed: usize,
 }
@@ -255,6 +290,7 @@ pub struct World {
     tiles: HashMap<u32, Slot<TerrainGpu>>,
     cells: HashMap<u32, Slot<TerrainGpu>>,
     models: HashMap<u32, Slot<GpuModel>>,
+    scatter: HashMap<u32, Slot<Vec<ClumpGpu>>>,
     objects: HashMap<(i32, i32), Vec<usize>>,
     terrain_materials: HashMap<Option<u32>, MaterialId>,
     sea: (VertexBufferHandle, IndexBufferHandle, MaterialId),
@@ -295,6 +331,7 @@ impl World {
             tiles: HashMap::new(),
             cells: HashMap::new(),
             models: HashMap::new(),
+            scatter: HashMap::new(),
             objects,
             terrain_materials: HashMap::new(),
             sea,
@@ -357,6 +394,35 @@ impl World {
             .map(|&(h, c)| (world::square_distance(c, eye.x, eye.z), Request::Cell(h)))
             .collect();
 
+        // Scatter, nearer still.
+        let reach = self.settings.scatter_distance;
+        let near = self.index.cells_near(eye.x, eye.z, reach);
+        let far: Vec<u32> = self
+            .scatter
+            .keys()
+            .copied()
+            .filter(|h| {
+                self.index
+                    .cells
+                    .get(h)
+                    .is_none_or(|&c| world::square_distance(c, eye.x, eye.z) > reach + 100.0)
+            })
+            .collect();
+        for h in far {
+            if let Some(Slot::Ready(clumps)) = self.scatter.remove(&h) {
+                destroy_clumps(backend, clumps)?;
+            }
+        }
+        requests.extend(
+            near.iter()
+                .filter(|(h, _)| !self.scatter.contains_key(h))
+                .map(|&(h, c)| {
+                    // After the ground under it.
+                    let d = world::square_distance(c, eye.x, eye.z) + 50.0;
+                    (d, Request::Scatter(h))
+                }),
+        );
+
         // Models of placed objects in range.
         let reach = self.settings.object_distance;
         let (b0, b1) = (
@@ -387,6 +453,7 @@ impl World {
                     Request::Cell(h) => drop(self.cells.insert(h, Slot::Loading)),
                     Request::Model(h) => drop(self.models.insert(h, Slot::Loading)),
                     Request::Tile(h) => drop(self.tiles.insert(h, Slot::Loading)),
+                    Request::Scatter(h) => drop(self.scatter.insert(h, Slot::Loading)),
                 }
                 self.loader.request(r);
             }
@@ -443,7 +510,10 @@ impl World {
                         Request::Cell(_) => &mut self.cells,
                         _ => &mut self.tiles,
                     };
-                    let (Request::Cell(h) | Request::Tile(h) | Request::Model(h)) = request;
+                    let (Request::Cell(h)
+                    | Request::Tile(h)
+                    | Request::Model(h)
+                    | Request::Scatter(h)) = request;
                     // A cell dropped while loading is not wanted any more.
                     match (table.get(&h), slot) {
                         (Some(Slot::Loading), slot) => {
@@ -491,6 +561,42 @@ impl World {
                         }
                     };
                     self.models.insert(hash, slot);
+                }
+                Loaded::Scatter(cell, found) => {
+                    self.in_flight.remove(&Request::Scatter(cell));
+                    let slot = match found {
+                        Ok(s) if !s.meshes.is_empty() => {
+                            let mut clumps = Vec::with_capacity(s.meshes.len());
+                            for m in s.meshes {
+                                clumps.push(ClumpGpu {
+                                    vertex_buffer: backend.create_vertex_buffer(
+                                        &m.vertex_desc(),
+                                        Some(&m.vertices),
+                                    )?,
+                                    index_buffer: backend.create_index_buffer(
+                                        &m.index_desc(),
+                                        Some(&m.index_bytes()),
+                                    )?,
+                                    count: m.indices.len() as u32,
+                                    material: materials.material(backend, &m.material)?,
+                                    fade_end: m.fade_end,
+                                    instances: m.instances,
+                                });
+                            }
+                            Slot::Ready(clumps)
+                        }
+                        Ok(_) => Slot::Failed,
+                        Err(e) => {
+                            eprintln!("scatter {cell:08x}: {e}");
+                            Slot::Failed
+                        }
+                    };
+                    // Dropped while loading: not wanted any more.
+                    match (self.scatter.get(&cell), slot) {
+                        (Some(Slot::Loading), slot) => drop(self.scatter.insert(cell, slot)),
+                        (_, Slot::Ready(clumps)) => destroy_clumps(backend, clumps)?,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -548,8 +654,15 @@ impl World {
         })
     }
 
-    /// Queues terrain, sea and the placed models in range of `eye`.
-    pub fn draw(&mut self, queue: &mut DrawQueue, eye: Vec3) {
+    /// Queues terrain, scatter, sea and the placed models in range of
+    /// `eye`. Call inside the backend's frame: scatter stores its instance
+    /// transforms on it.
+    pub fn draw(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        queue: &mut DrawQueue,
+        eye: Vec3,
+    ) -> Result<(), BackendError> {
         let terrain = |t: &TerrainGpu, queue: &mut DrawQueue| {
             queue.push(Primitive {
                 call: DrawCall {
@@ -564,6 +677,7 @@ impl World {
                     },
                     world: Mat4::from_translation(t.origin),
                     skin: None,
+                    instances: None,
                 },
                 layer: Layer::WORLD,
                 translucent: false,
@@ -617,6 +731,7 @@ impl World {
             }
         }
         self.stats.objects_drawn = drawn;
+        self.stats.scatter_drawn = self.draw_scatter(backend, queue, eye)?;
 
         let (vb, ib, material) = self.sea;
         // Follows the camera so its edge is never in view.
@@ -634,13 +749,77 @@ impl World {
                 },
                 world: Mat4::from_translation(Vec3::new(eye.x, 0.0, eye.z)),
                 skin: None,
+                instances: None,
             },
             layer: Layer::WORLD,
             translucent: true,
             sort_origin: centre,
             user: 0,
         });
+        Ok(())
     }
+
+    /// Queues each clump mesh once, instanced at its instances in range.
+    /// Returns the instances drawn.
+    fn draw_scatter(
+        &self,
+        backend: &mut dyn RenderBackend,
+        queue: &mut DrawQueue,
+        eye: Vec3,
+    ) -> Result<usize, BackendError> {
+        let mut drawn = 0;
+        let mut near: Vec<Mat4> = Vec::new();
+        for slot in self.scatter.values() {
+            let Slot::Ready(clumps) = slot else { continue };
+            for c in clumps {
+                let reach = c.fade_end.min(self.settings.scatter_distance);
+                let reach2 = reach * reach;
+                near.clear();
+                near.extend(
+                    c.instances
+                        .iter()
+                        .filter(|m| m.w_axis.truncate().distance_squared(eye) <= reach2),
+                );
+                if near.is_empty() {
+                    continue;
+                }
+                drawn += near.len();
+                let instances = backend.set_skin(&near)?;
+                queue.push(Primitive {
+                    call: DrawCall {
+                        material: c.material,
+                        topology: Topology::TriangleList,
+                        vertex_buffer: c.vertex_buffer,
+                        geometry: Geometry::Indexed {
+                            buffer: c.index_buffer,
+                            first: 0,
+                            count: c.count,
+                            base_vertex: 0,
+                        },
+                        world: Mat4::IDENTITY,
+                        skin: None,
+                        instances: Some(instances),
+                    },
+                    layer: Layer::WORLD,
+                    translucent: false,
+                    sort_origin: near[0].w_axis.truncate(),
+                    user: 0,
+                });
+            }
+        }
+        Ok(drawn)
+    }
+}
+
+fn destroy_clumps(
+    backend: &mut dyn RenderBackend,
+    clumps: Vec<ClumpGpu>,
+) -> Result<(), BackendError> {
+    for c in clumps {
+        backend.destroy_vertex_buffer(c.vertex_buffer)?;
+        backend.destroy_index_buffer(c.index_buffer)?;
+    }
+    Ok(())
 }
 
 /// A 20 km square of translucent water at `level`, centred on the origin.

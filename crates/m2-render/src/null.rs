@@ -195,6 +195,15 @@ impl NullBackend {
             }
             check_range(skin.first, skin.count, self.skin_matrices)?;
         }
+        if let Some(range) = call.instances {
+            if range.frame != self.frames {
+                return Err(BackendError::StaleSkin {
+                    skin_frame: range.frame,
+                    frame: self.frames,
+                });
+            }
+            check_range(range.first, range.count, self.skin_matrices)?;
+        }
         let vb = self.vertex_buffers.get(call.vertex_buffer.0)?;
         let vertex_count = vb.desc.vertex_count;
         match call.geometry {

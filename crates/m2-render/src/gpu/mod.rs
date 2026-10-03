@@ -36,7 +36,7 @@ use crate::texture::{BlendMode, MaterialDesc, TextureDesc, TextureFormat, Textur
 pub use ::wgpu;
 
 /// Bytes of a draw's uniforms: its world matrix, then the first palette
-/// matrix and the palette length.
+/// matrix and the palette length, then the same for its instances.
 const DRAW_UNIFORM_SIZE: u64 = 80;
 /// Bone matrices the palette buffer starts with.
 const INITIAL_PALETTE: u64 = 1024;
@@ -190,6 +190,8 @@ struct RecordedDraw {
     vertex_buffer: VertexBufferHandle,
     geometry: Geometry,
     material: MaterialId,
+    /// Instances drawn (1 when not instanced).
+    instances: u32,
 }
 
 /// Where frames go.
@@ -924,7 +926,7 @@ impl WgpuBackend {
                 pass.set_vertex_buffer(0, vb.buffer.slice(..));
                 match d.geometry {
                     Geometry::Vertices { first, count } => {
-                        pass.draw(first..first + count, 0..1);
+                        pass.draw(first..first + count, 0..d.instances);
                     }
                     Geometry::Indexed {
                         buffer,
@@ -937,7 +939,7 @@ impl WgpuBackend {
                             ib.buffer.slice(..),
                             wgpu_index_format(ib.desc.format),
                         );
-                        pass.draw_indexed(first..first + count, base_vertex, 0..1);
+                        pass.draw_indexed(first..first + count, base_vertex, 0..d.instances);
                     }
                 }
             }
@@ -1243,18 +1245,38 @@ impl RenderBackend for WgpuBackend {
             }
             None => (0, 0),
         };
+        let (instance_first, instances) = match call.instances {
+            Some(range) => {
+                if range.frame != self.frames {
+                    return Err(BackendError::StaleSkin {
+                        skin_frame: range.frame,
+                        frame: self.frames,
+                    });
+                }
+                let available = self.frame.as_ref().map_or(0, |f| f.palette.len() as u32);
+                check_range(range.first, range.count, available)?;
+                (range.first, range.count)
+            }
+            None => (0, 0),
+        };
         let key = self.pipeline_key(call)?;
         self.ensure_pipeline(&key)?;
         let frame = self.frame.as_mut().expect("checked above");
         let uniforms = &mut frame.uniforms;
         uniforms.extend_from_slice(bytemuck::cast_slice(&call.world.to_cols_array()));
-        uniforms.extend_from_slice(bytemuck::cast_slice(&[first, count, 0, 0]));
+        uniforms.extend_from_slice(bytemuck::cast_slice(&[
+            first,
+            count,
+            instance_first,
+            instances,
+        ]));
         uniforms.resize(uniforms.len().next_multiple_of(DRAW_STRIDE as usize), 0);
         frame.draws.push(RecordedDraw {
             pipeline: key,
             vertex_buffer: call.vertex_buffer,
             geometry: call.geometry,
             material: call.material,
+            instances: instances.max(1),
         });
         Ok(())
     }

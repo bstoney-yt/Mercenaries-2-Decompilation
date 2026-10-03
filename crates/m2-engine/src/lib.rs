@@ -17,6 +17,7 @@ pub mod assets;
 pub mod audio;
 pub mod model;
 pub mod physics;
+pub mod scatter;
 pub mod stream;
 pub mod vehicle;
 pub mod world;

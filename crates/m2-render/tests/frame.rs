@@ -44,6 +44,7 @@ fn call(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32) -> DrawCal
         },
         world: Mat4::IDENTITY,
         skin: None,
+        instances: None,
     }
 }
 

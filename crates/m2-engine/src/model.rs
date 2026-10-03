@@ -498,6 +498,7 @@ impl GpuModel {
                     },
                     world: transform,
                     skin,
+                    instances: None,
                 },
                 layer: Layer::WORLD,
                 translucent: false,
