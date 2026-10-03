@@ -242,7 +242,10 @@ impl Game {
     pub fn hud_info(&self) -> HudInfo {
         let player = self.scene.player.as_ref();
         let loading = match &self.scene.world {
-            Some(w) if w.stats().pending > 0 => Some("Loading the island...".to_owned()),
+            // The island-wide tiles; nearby detail streams in quietly.
+            Some(w) if w.stats().tiles + w.stats().failed < w.index.tiles.len() => {
+                Some("Loading the island...".to_owned())
+            }
             Some(_) if self.scene.vehicles_loading() => {
                 Some("Finding vehicles and people...".to_owned())
             }
