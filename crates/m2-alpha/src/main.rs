@@ -3,7 +3,7 @@
 //! ```text
 //! m2-alpha [--install <dir>] [--spawn <x>,<z>] [--model <hash>]... [--gait <gait>]
 //!          [--config <file>]
-//!          [--size <w>x<h>] [--vsync on|off] [--fullscreen]
+//!          [--size <w>x<h>] [--vsync on|off] [--fullscreen] [--double-sided]
 //!          [--screenshot <out.ppm>] [--write-config]
 //! ```
 //!
@@ -60,6 +60,7 @@ struct Options {
     models: Vec<u32>,
     spawn: Option<(f32, f32)>,
     gait: Option<Gait>,
+    double_sided: bool,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
     fullscreen: bool,
@@ -109,6 +110,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 })
             }
             "--fullscreen" => o.fullscreen = true,
+            "--double-sided" => o.double_sided = true,
             "--screenshot" => o.screenshot = Some(value()?.into()),
             "--write-config" => o.write_config = true,
             "-h" | "--help" => {
@@ -165,7 +167,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     if let Some(out) = &options.screenshot {
-        return screenshot(&config, install.as_ref(), &mode, out);
+        return screenshot(&config, install.as_ref(), &mode, options.double_sided, out);
     }
 
     let event_loop = EventLoop::new()?;
@@ -174,6 +176,7 @@ fn main() -> anyhow::Result<()> {
         config,
         install,
         mode,
+        double_sided: options.double_sided,
         state: None,
         error: None,
     };
@@ -198,8 +201,12 @@ fn build_scene(
     backend: &mut dyn RenderBackend,
     install: Option<&Install>,
     mode: &Mode,
+    double_sided: bool,
 ) -> anyhow::Result<(Scene, FlyCamera)> {
     let mut scene = Scene::new(backend)?;
+    if double_sided {
+        scene.materials.set_double_sided(backend, true)?;
+    }
     if let Some(install) = install {
         match mode {
             Mode::Island(spawn) => {
@@ -243,12 +250,13 @@ fn screenshot(
     config: &Config,
     install: Option<&Install>,
     mode: &Mode,
+    double_sided: bool,
     out: &std::path::Path,
 ) -> anyhow::Result<()> {
     let (w, h) = (config.window.width, config.window.height);
     let mut backend = WgpuBackend::headless(w, h)?;
     eprintln!("adapter: {:?}", backend.adapter_summary());
-    let (mut scene, camera) = build_scene(&mut backend, install, mode)?;
+    let (mut scene, camera) = build_scene(&mut backend, install, mode, double_sided)?;
     let fov = config.camera.fov;
     let aspect = w as f32 / h as f32;
     // Characters a little way into their clip, mid-stride when moving.
@@ -296,6 +304,8 @@ struct App {
     config: Config,
     install: Option<Install>,
     mode: Mode,
+    /// Start with back-face culling off.
+    double_sided: bool,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -315,7 +325,12 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
-        let (scene, camera) = build_scene(&mut backend, self.install.as_ref(), &self.mode)?;
+        let (scene, camera) = build_scene(
+            &mut backend,
+            self.install.as_ref(),
+            &self.mode,
+            self.double_sided,
+        )?;
         let focused = window.has_focus();
         Ok(Running {
             title: format!(
@@ -329,7 +344,7 @@ impl App {
             input: Input::default(),
             mouse_look: false,
             focused,
-            culling: true,
+            culling: !self.double_sided,
             last: Instant::now(),
             lag: Duration::ZERO,
             fps: (Instant::now(), 0),

@@ -199,8 +199,10 @@ pub struct WorldSettings {
 impl Default for WorldSettings {
     fn default() -> Self {
         Self {
-            detail_radius: 600.0,
-            object_distance: 1200.0,
+            // Equal, so placed models always stand on full-detail ground
+            // (the low-resolution tiles leave out small stretches of land).
+            detail_radius: 1000.0,
+            object_distance: 1000.0,
             upload_budget: 24 << 20,
             in_flight: 6,
             sea_level: -35.0,
@@ -495,6 +497,7 @@ impl World {
                         } else {
                             [0.32, 0.42, 0.22, 1.0]
                         },
+                        clamp: true,
                         ..MaterialDesc::default()
                     },
                 )?;
@@ -643,7 +646,8 @@ fn sea_plane(
     let material = materials.define(
         backend,
         &MaterialDesc {
-            color: [0.10, 0.30, 0.42, 0.75],
+            // Opaque enough that the seabed's tile edges don't show.
+            color: [0.10, 0.30, 0.42, 0.9],
             blend: BlendMode::Translucent,
             double_sided: true,
             ..MaterialDesc::default()

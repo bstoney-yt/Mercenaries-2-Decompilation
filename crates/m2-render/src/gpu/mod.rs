@@ -232,7 +232,8 @@ pub struct WgpuBackend {
     draw_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
     draw_group: wgpu::BindGroup,
-    sampler: wgpu::Sampler,
+    /// Repeating, then clamping.
+    samplers: [wgpu::Sampler; 2],
     white: wgpu::TextureView,
     default_material: wgpu::BindGroup,
 
@@ -473,16 +474,18 @@ impl WgpuBackend {
         let draw_buffer = Self::draw_uniforms(&device, 1024);
         let palette_buffer = Self::palette(&device, INITIAL_PALETTE);
         let draw_group = Self::draw_group(&device, &draw_layout, &draw_buffer, &palette_buffer);
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("base"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: 8,
-            ..Default::default()
+        let samplers = [wgpu::AddressMode::Repeat, wgpu::AddressMode::ClampToEdge].map(|mode| {
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("base"),
+                address_mode_u: mode,
+                address_mode_v: mode,
+                address_mode_w: mode,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                anisotropy_clamp: 8,
+                ..Default::default()
+            })
         });
         let white = device
             .create_texture_with_data(
@@ -510,7 +513,7 @@ impl WgpuBackend {
             default_material: Self::material_group(
                 &device,
                 &material_layout,
-                &sampler,
+                &samplers[0],
                 &white,
                 &MaterialDesc::default(),
             ),
@@ -529,7 +532,7 @@ impl WgpuBackend {
             draw_buffer,
             palette_buffer,
             draw_group,
-            sampler,
+            samplers,
             white,
             shaders: HashMap::new(),
             pipelines: HashMap::new(),
@@ -1157,7 +1160,7 @@ impl RenderBackend for WgpuBackend {
         let bind_group = Self::material_group(
             &self.device,
             &self.material_layout,
-            &self.sampler,
+            &self.samplers[usize::from(desc.clamp)],
             view,
             desc,
         );
