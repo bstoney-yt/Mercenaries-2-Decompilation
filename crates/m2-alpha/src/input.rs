@@ -23,6 +23,10 @@ pub enum Action {
     ToggleFly,
     /// Play the next music track, or stop the music.
     ToggleMusic,
+    /// Get in or out of a vehicle.
+    Use,
+    /// Turn an overturned vehicle back up.
+    Reset,
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
@@ -54,6 +58,8 @@ impl Default for Bindings {
             (Walk, vec![KeyQ]),
             (ToggleFly, vec![KeyV]),
             (ToggleMusic, vec![KeyM]),
+            (Use, vec![KeyE]),
+            (Reset, vec![KeyR]),
             (ToggleMouse, vec![Tab]),
             (Fullscreen, vec![F11]),
             (NextGait, vec![KeyN]),

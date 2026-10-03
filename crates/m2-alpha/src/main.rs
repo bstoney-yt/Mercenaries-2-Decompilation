@@ -4,7 +4,7 @@
 //! m2-alpha [--install <dir>] [--spawn <x>,<z>] [--model <hash>]... [--gait <gait>]
 //!          [--config <file>]
 //!          [--size <w>x<h>] [--vsync on|off] [--fullscreen] [--double-sided] [--fly]
-//!          [--screenshot <out.ppm>] [--write-config]
+//!          [--screenshot <out.ppm> [--drive]] [--write-config]
 //! ```
 //!
 //! Settings come from `m2-alpha.toml` (in the working directory or beside
@@ -16,7 +16,9 @@
 //! Right now this opens a window on the island, streamed from the install
 //! around the player: Jennifer on foot with a third-person camera
 //! (`--spawn` picks where to start; the default is the first town). WASD
-//! runs, Shift sprints, Q held walks, Space jumps. V switches to a
+//! runs, Shift sprints, Q held walks, Space jumps. E gets in and out of
+//! the vehicles parked ahead of the spawn (WASD drive, Space brakes, R
+//! rights an overturned one). V switches to a
 //! free-flying camera and back (`--fly` starts flying): WASD/Space/C fly,
 //! Shift speeds up. With `--model` it shows those models on a ground grid
 //! instead, characters playing the game's locomotion clips in place (N
@@ -27,7 +29,8 @@
 //!
 //! `--screenshot` on the island waits for the ground, lands the player and,
 //! with `--gait walk|run|sprint`, runs her forward for three seconds before
-//! taking the picture, printing where she got to.
+//! taking the picture, printing where she got to. With `--drive` she gets
+//! in the nearest parked vehicle instead and drives it forward.
 
 mod camera;
 mod config;
@@ -74,6 +77,7 @@ struct Options {
     gait: Option<Gait>,
     double_sided: bool,
     fly: bool,
+    drive: bool,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
     fullscreen: bool,
@@ -125,6 +129,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--fullscreen" => o.fullscreen = true,
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
+            "--drive" => o.drive = true,
             "--screenshot" => o.screenshot = Some(value()?.into()),
             "--write-config" => o.write_config = true,
             "-h" | "--help" => {
@@ -299,7 +304,9 @@ fn screenshot(
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect)?;
     }
-    if game.on_foot && game.scene.player.is_some() {
+    if options.drive && game.on_foot && game.scene.player.is_some() {
+        drive_for_screenshot(&mut backend, &mut game, fov, aspect)?;
+    } else if game.on_foot && game.scene.player.is_some() {
         let gait = options.gait.unwrap_or(Gait::Idle);
         let intent = Intent {
             movement: if gait == Gait::Idle {
@@ -332,6 +339,70 @@ fn screenshot(
     ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
     std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))?;
     eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+/// Waits for the parked vehicles, gets in the nearest and drives it
+/// forward for four seconds, printing how it went.
+fn drive_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    let tick = TICK.as_secs_f32();
+    let started = Instant::now();
+    loop {
+        game.step(Intent::default(), tick);
+        render(backend, game, fov, aspect)?;
+        let parked = game.scene.vehicles.iter().all(|v| v.id.is_some());
+        if (!game.scene.vehicles_loading() && parked)
+            || started.elapsed() > Duration::from_secs(300)
+        {
+            break;
+        }
+    }
+    eprintln!(
+        "vehicles: {} parked after {:.1} s",
+        game.scene
+            .vehicles
+            .iter()
+            .filter(|v| v.id.is_some())
+            .count(),
+        started.elapsed().as_secs_f32()
+    );
+    // Let them settle on their suspension.
+    for _ in 0..90 {
+        game.step(Intent::default(), tick);
+    }
+    if !game.enter_nearest(f32::INFINITY) {
+        eprintln!("drive: no vehicle to get in");
+        return Ok(());
+    }
+    let label = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|p| p.driving)
+        .map(|i| game.scene.vehicles[i].spec.label.clone())
+        .unwrap_or_default();
+    let from = game.driving().map(|(at, _)| at);
+    let throttle = Intent {
+        movement: m2_math::glam::Vec2::Y,
+        ..Intent::default()
+    };
+    for i in 0..240 {
+        game.step(throttle, tick);
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect)?;
+        }
+    }
+    if let (Some(from), Some((to, speed))) = (from, game.driving()) {
+        eprintln!(
+            "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s",
+            (to - from).length()
+        );
+    }
     Ok(())
 }
 
