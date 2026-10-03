@@ -154,7 +154,26 @@ fn parse_args() -> anyhow::Result<Options> {
     Ok(o)
 }
 
+/// Panics are also written to `m2-alpha-crash.log` beside the settings
+/// file, with a backtrace, since a windowed game has no console to read.
+fn keep_crash_reports() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let path = Config::default_path().with_file_name("m2-alpha-crash.log");
+        let report = format!(
+            "m2-alpha {} crashed: {info}\n\n{}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::backtrace::Backtrace::force_capture()
+        );
+        if std::fs::write(&path, report).is_ok() {
+            eprintln!("crash report written to {}", path.display());
+        }
+    }));
+}
+
 fn main() -> anyhow::Result<()> {
+    keep_crash_reports();
     let options = parse_args()?;
     let config_path = options
         .config_path
