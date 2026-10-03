@@ -20,6 +20,10 @@
   #hint { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: #000a; color: #fff;
           padding: 6px 12px; border-radius: 6px; pointer-events: none; }
   #hint:empty { display: none; }
+  #crosshair { position: fixed; left: 50%; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px; pointer-events: none;
+               border: 2px solid #fffc; border-radius: 50%; box-shadow: 0 0 2px #000; }
+  #health { position: fixed; right: 18px; bottom: 18px; width: 180px; height: 10px; background: #0008; border-radius: 5px; pointer-events: none; }
+  #healthbar { height: 100%; width: 100%; background: #6c6; border-radius: 5px; }
   #drop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
           background: #000a; font-size: 20px; pointer-events: none; }
 </style>
@@ -45,7 +49,7 @@
   <div id="playpanel" style="display:none">
     <h1 style="margin-top:14px">Play</h1>
     <label style="color:var(--text)"><input type="checkbox" id="playmode"> Play mode</label>
-    <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run, E to get in or out of a vehicle. Drag to orbit.</div>
+    <div style="color:var(--muted)">WASD to move (relative to the camera), Shift to sprint, Q to walk or run, E to get in or out of a vehicle. Click or hold F to fire, hold the right button to aim. Drag to orbit.</div>
     <label style="color:var(--text)"><input type="checkbox" id="showcol"> show collision shapes (PHY2)</label>
     <label for="idle">Idle</label><select id="idle"></select>
     <label for="walk">Walk</label><select id="walk"></select>
@@ -56,6 +60,8 @@
 </div>
 <div id="drop">Drop a .glb to open it</div>
 <div id="hint"></div>
+<div id="crosshair" style="display:none"></div>
+<div id="health" style="display:none"><div id="healthbar"></div></div>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -974,7 +980,7 @@ function fly(dt) {
 // wander near home; step aside when the character comes close; run from a
 // vehicle coming fast.
 const npcs = [];
-let npcData = null, npcModels = null, npcsSpawned = false;
+let npcData = null, npcModels = null, npcWeapons = null, npcsSpawned = false;
 const NPC_COUNT = +(new URLSearchParams(location.search).get('npcs') ?? 12);
 
 async function loadNpcs() {
@@ -982,6 +988,7 @@ async function loadNpcs() {
   if (!r || !r.ok) return;
   npcData = await r.json();
   npcModels = await Promise.all(npcData.models.map(m => loader.loadAsync('npc/' + m.file).catch(() => null)));
+  npcWeapons = await Promise.all((npcData.weapons || []).map(w => loader.loadAsync('npc/' + w.file).catch(() => null)));
 }
 
 function spawnNpcs() {
@@ -989,16 +996,15 @@ function spawnNpcs() {
   npcsSpawned = true;
   // The character's clips, keeping only tracks for nodes the model has.
   const cache = new Map();
-  const clipFor = (modelIndex, g) => {
-    const key = `${modelIndex} ${g}`;
+  const fit = (modelIndex, key, c) => {
     if (!cache.has(key)) {
       const names = new Set();
       npcModels[modelIndex].scene.traverse(o => names.add(o.name));
-      const c = inPlace(+ui(g).value);
       cache.set(key, new THREE.AnimationClip(c.name, c.duration, c.tracks.filter(t => names.has(t.name.split('.')[0]))));
     }
     return cache.get(key);
   };
+  const clipFor = (modelIndex, g) => fit(modelIndex, `${modelIndex} ${g}`, inPlace(+ui(g).value));
   const add = (modelIndex, at, soldier, name) => {
     const src = npcModels[modelIndex];
     if (!src) return;
@@ -1011,11 +1017,16 @@ function spawnNpcs() {
     scene.add(body);
     const mixer = new THREE.AnimationMixer(root);
     const actions = Object.fromEntries(['idle', 'walk', 'run'].map(g => [g, mixer.clipAction(clipOf(g))]));
+    for (const [g, hash] of [['aim', '57fe91b4'], ['die', '479c4a51']]) {
+      const c = clipNamed(hash);
+      if (c) actions[g] = mixer.clipAction(fit(modelIndex, `${modelIndex} ${g}`, c));
+    }
     actions.idle.time = Math.random() * clipOf('idle').duration;
     actions.idle.play();
     npcs.push({
-      body, mixer, actions, current: actions.idle, gait: 'idle', home: at.clone(), soldier, name,
+      body, root, mixer, actions, current: actions.idle, gait: 'idle', home: at.clone(), soldier, name, hp: 100, alive: true, alert: false,
       state: 'idle', timer: 1 + Math.random() * 4, target: null, placed: false, speed: 0,
+      rifle: combat.ready && soldier ? giveRifle(root) : null,
     });
   };
   const civilians = npcData.models.map((m, i) => [m, i]).filter(([m]) => !m.soldier).map(([, i]) => i);
@@ -1039,7 +1050,7 @@ function setNpcGait(n, g) {
 // Keeps a point out of the people near it (radius r around the point).
 function pushOutOfPeople(pos, r, skip) {
   for (const n of npcs) {
-    if (n === skip || !n.placed) continue;
+    if (n === skip || !n.placed || !n.alive) continue;
     const q = n.body.position, dx = pos.x - q.x, dz = pos.z - q.z, d = Math.hypot(dx, dz), min = r + RADIUS;
     if (d >= min || Math.abs(pos.y - q.y) > 1.8) continue;
     const ux = d > 1e-4 ? dx / d : 1, uz = d > 1e-4 ? dz / d : 0;
@@ -1063,6 +1074,8 @@ function stepNpcs(dt) {
       n.placed = true;
     }
     n.mixer.update(dt);
+    if (!n.alive) continue;
+    if (n.soldier && n.alert && combat.ready && stepSoldier(n, dt)) continue;
     // React: step aside from the character, run from a fast vehicle.
     const dx = b.position.x - me.x, dz = b.position.z - me.z;
     const near = Math.hypot(dx, dz);
@@ -1111,6 +1124,252 @@ function stepNpcs(dt) {
   }
 }
 
+// ---- Combat ------------------------------------------------------------
+// Everyone carries the rifle exported by `gltf npcs` (the AK-47). It sits in
+// the right hand (bone eb6f1b2d) the way the game's two-handed aim clip
+// (resident 57fe91b4: standing, rifle held low in both hands, the left hand
+// leading; picked from the clips by hand positions and checked by eye) holds it: grip in the right hand,
+// barrel towards the left hand (d34f7713). Death is a fall clip (resident
+// 479c4a51: the pelvis drops from standing to the ground in place).
+// THE COMBAT RULES ARE INVENTED, not the game's: damage, fire rates,
+// accuracy, health and how soldiers and civilians react are guesses.
+const combat = {
+  ready: false, weapon: null, muzzle: null, grip: null, aimClip: null, deathClip: null,
+  hp: 100, hurtAt: 0, downUntil: 0, aiming: false, shootUntil: 0, lastShot: 0, effects: [],
+};
+const RIGHT_HAND = 'eb6f1b2d', LEFT_HAND = 'd34f7713';
+
+function clipNamed(hash) { return clips.find(c => c.name.endsWith(' ' + hash)) || null; }
+
+// Where the rifle sits in the right hand, from the aim clip's pose.
+function computeGrip() {
+  const copy = cloneSkinned(root);
+  const m = new THREE.AnimationMixer(copy);
+  const a = m.clipAction(combat.aimClip);
+  a.play();
+  a.time = combat.aimClip.duration / 2;
+  m.update(0);
+  copy.updateMatrixWorld(true);
+  const rh = copy.getObjectByName(RIGHT_HAND), lh = copy.getObjectByName(LEFT_HAND);
+  if (!rh || !lh) return null;
+  const pr = rh.getWorldPosition(new THREE.Vector3()), pl = lh.getWorldPosition(new THREE.Vector3());
+  const dir = pl.clone().sub(pr).normalize();
+  const barrel = combat.muzzle.clone().normalize();
+  const q = new THREE.Quaternion().setFromUnitVectors(barrel, dir);
+  // Roll the rifle upright about the barrel.
+  const up = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+  const flat = v => v.sub(dir.clone().multiplyScalar(v.dot(dir))).normalize();
+  const have = flat(up.clone()), want = flat(new THREE.Vector3(0, 1, 0));
+  q.premultiply(new THREE.Quaternion().setFromAxisAngle(dir, Math.atan2(have.clone().cross(want).dot(dir), have.dot(want))));
+  // The grip a little way into the palm, towards the fingers.
+  const fingers = rh.children.find(c => c.isBone) || rh;
+  const at = pr.clone().lerp(fingers.getWorldPosition(new THREE.Vector3()), 0.6);
+  return rh.matrixWorld.clone().invert().multiply(new THREE.Matrix4().compose(at, q, new THREE.Vector3(1, 1, 1)));
+}
+
+function giveRifle(character) {
+  const hand = character.getObjectByName(RIGHT_HAND);
+  if (!hand || !combat.weapon) return null;
+  const w = combat.weapon.clone();
+  w.matrixAutoUpdate = false;
+  w.matrix.copy(combat.grip);
+  hand.add(w);
+  return w;
+}
+
+function setupCombat() {
+  if (combat.ready || !npcWeapons || !npcWeapons[0] || !root || !loco) return;
+  combat.aimClip = clipNamed('57fe91b4');
+  combat.deathClip = clipNamed('479c4a51');
+  if (!combat.aimClip) return;
+  combat.weapon = npcWeapons[0].scene;
+  combat.muzzle = new THREE.Vector3(...npcData.weapons[0].muzzle);
+  combat.grip = computeGrip();
+  if (!combat.grip) return;
+  combat.ready = true;
+  combat.mine = giveRifle(root);
+  for (const n of npcs) if (n.soldier) n.rifle = giveRifle(n.root);
+  ui('crosshair').style.display = '';
+  ui('health').style.display = '';
+}
+
+// The muzzle of a rifle in the world.
+function muzzleOf(w) { return w ? w.localToWorld(combat.muzzle.clone()) : null; }
+
+// A shot's line, briefly.
+const tracerMat = new THREE.LineBasicMaterial({ color: 0xffe08a });
+const flashMat = new THREE.MeshBasicMaterial({ color: 0xffd060 });
+const flashGeo = new THREE.SphereGeometry(0.08, 6, 4);
+function tracer(from, to) {
+  const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([from, to]), tracerMat);
+  const flash = new THREE.Mesh(flashGeo, flashMat);
+  flash.position.copy(from);
+  scene.add(line, flash);
+  combat.effects.push({ objs: [line, flash], until: performance.now() + 70 });
+}
+
+// What a ray hits first: { t, point, npc } within `far`, or null.
+const shotRay = new THREE.Raycaster();
+function castShot(origin, dir, far, skip) {
+  let best = null;
+  // People: capsules from the shins to the head.
+  for (const n of npcs) {
+    if (n === skip || !n.alive || !n.placed || !n.body.visible) continue;
+    const a = n.body.position.clone().add(new THREE.Vector3(0, 0.25, 0));
+    const seg = new THREE.Vector3(0, 1.45, 0);
+    const w0 = origin.clone().sub(a);
+    const b = dir.dot(seg), c = seg.dot(seg), d = dir.dot(w0), e = seg.dot(w0);
+    const den = c - b * b;
+    let s = den > 1e-6 ? (b * e - c * d) / den : 0;
+    let u = den > 1e-6 ? (e - b * d) / den : e / c;
+    u = Math.max(0, Math.min(1, u));
+    s = Math.max(0, dir.dot(a.clone().addScaledVector(seg, u).sub(origin)));
+    const p = origin.clone().addScaledVector(dir, s);
+    if (s > far || p.distanceTo(a.clone().addScaledVector(seg, u)) > 0.3) continue;
+    if (!best || s < best.t) best = { t: s, point: p, npc: n };
+  }
+  // The world: terrain under the ray's path, and the placed objects near it.
+  const meshes = new Set();
+  for (let k = 0; k <= far; k += 50) {
+    const q = origin.clone().addScaledVector(dir, k);
+    for (const m of buckets.get(`${Math.floor(q.x / BUCKET)},${Math.floor(q.z / BUCKET)}`) || []) meshes.add(m);
+  }
+  const near = objects.filter(o => o.visible && o.position.distanceTo(origin) < far + 60);
+  shotRay.set(origin, dir);
+  shotRay.far = best ? best.t : far;
+  const hit = shotRay.intersectObjects([...meshes, ...near], true).find(h => !h.object.name.startsWith('col'));
+  if (hit) best = { t: hit.distance, point: hit.point, npc: null };
+  return best;
+}
+
+function hurtNpc(n, dmg) {
+  n.hp -= dmg;
+  if (n.hp > 0) { n.alert = true; return; }
+  n.alive = false;
+  n.state = 'dead';
+  if (n.actions.die) {
+    const d = n.actions.die;
+    d.reset();
+    d.setLoop(THREE.LoopOnce);
+    d.clampWhenFinished = true;
+    d.play();
+    n.current.crossFadeTo(d, 0.1, false);
+    n.current = d;
+    n.gait = 'die';
+  }
+}
+
+// The player fires: from the camera through the crosshair, out of the rifle.
+function playerShoot() {
+  const now = performance.now();
+  if (!combat.ready || driving || now < combat.downUntil || now - combat.lastShot < 110) return;
+  combat.lastShot = now;
+  combat.shootUntil = now + 600;
+  const dir = camera.getWorldDirection(new THREE.Vector3());
+  const hit = castShot(camera.position.clone(), dir, 400, null);
+  const to = hit ? hit.point : camera.position.clone().addScaledVector(dir, 400);
+  tracer(muzzleOf(combat.mine) || player.position.clone().add(new THREE.Vector3(0, 1.4, 0)), to);
+  if (hit && hit.npc) hurtNpc(hit.npc, 34);
+  // Gunfire carries: soldiers within 60 m come for the player, civilians
+  // within 40 m run.
+  for (const n of npcs) {
+    if (!n.alive) continue;
+    const d = n.body.position.distanceTo(player.position);
+    if (n.soldier && d < 60) n.alert = true;
+    if (!n.soldier && d < 40) panic(n);
+  }
+}
+
+function panic(n) {
+  const away = n.body.position.clone().sub(player.position).setY(0).normalize().multiplyScalar(18);
+  n.target = n.body.position.clone().add(away);
+  n.state = 'flee';
+}
+
+// A soldier's shot at the player.
+function npcShoot(n) {
+  const from = muzzleOf(n.rifle) || n.body.position.clone().add(new THREE.Vector3(0, 1.4, 0));
+  const aim = (driving ? driving.root.position.clone().add(new THREE.Vector3(0, 1, 0)) : player.position.clone().add(new THREE.Vector3(0, 1.2, 0)));
+  const dist = from.distanceTo(aim);
+  // Spread grows with range: about a third hit at 20 m.
+  const spread = 0.02 + dist * 0.004;
+  const dir = aim.clone().sub(from).normalize().add(new THREE.Vector3((Math.random() - 0.5) * spread * 2, (Math.random() - 0.5) * spread, (Math.random() - 0.5) * spread * 2)).normalize();
+  const hit = castShot(from, dir, dist + 2, n);
+  const end = hit ? hit.point : from.clone().addScaledVector(dir, dist + 2);
+  tracer(from, end);
+  const closest = from.clone().addScaledVector(dir, Math.max(0, aim.clone().sub(from).dot(dir)));
+  const blocked = hit && hit.t < dist - 1;
+  if (!driving && !blocked && closest.distanceTo(aim) < 0.45) hurtPlayer(8);
+}
+
+function hurtPlayer(dmg) {
+  const now = performance.now();
+  if (now < combat.downUntil) return;
+  combat.hp = Math.max(0, combat.hp - dmg);
+  combat.hurtAt = now;
+  if (combat.hp === 0) {
+    combat.downUntil = now + 2500;
+    ui('hint').textContent = 'Down! Back on your feet in a moment.';
+  }
+}
+
+// Soldiers in a fight: face the player and fire every second or so.
+function stepSoldier(n, dt) {
+  const me = driving ? driving.root.position : player.position;
+  const d = n.body.position.distanceTo(me);
+  if (d > 80 || performance.now() < combat.downUntil) { n.alert = false; return false; }
+  if (n.actions.aim) setNpcGait(n, 'aim');
+  const tx = me.x - n.body.position.x, tz = me.z - n.body.position.z;
+  const want = Math.atan2(tx, tz) - Math.atan2(loco.fwd.x, loco.fwd.y);
+  let r = want - n.body.rotation.y;
+  r = Math.atan2(Math.sin(r), Math.cos(r));
+  n.body.rotation.y += r * Math.min(1, dt * 6);
+  n.cooldown = (n.cooldown ?? Math.random()) - dt;
+  if (n.cooldown <= 0 && Math.abs(r) < 0.3 && d < 70) {
+    npcShoot(n);
+    n.cooldown = 0.9 + Math.random() * 0.8;
+  }
+  return true;
+}
+
+function stepCombat(dt) {
+  setupCombat();
+  const now = performance.now();
+  combat.effects = combat.effects.filter(e => {
+    if (now < e.until) return true;
+    for (const o of e.objs) { scene.remove(o); o.geometry !== flashGeo && o.geometry.dispose(); }
+    return false;
+  });
+  if (!combat.ready) return;
+  if (keys.has('KeyF')) playerShoot();
+  // Health comes back after four quiet seconds.
+  if (combat.downUntil && now > combat.downUntil) {
+    combat.downUntil = 0;
+    combat.hp = 100;
+    for (const n of npcs) n.alert = false;
+    startPlay(true);
+  }
+  if (now - combat.hurtAt > 4000) combat.hp = Math.min(100, combat.hp + 6 * dt);
+  ui('healthbar').style.width = `${combat.hp}%`;
+  ui('crosshair').style.display = driving ? 'none' : '';
+}
+
+// Facing where the camera looks, for aiming.
+function faceCamera() {
+  const d = camera.getWorldDirection(new THREE.Vector3());
+  player.rotation.y = Math.atan2(d.x, d.z) - Math.atan2(loco.fwd.x, loco.fwd.y);
+}
+
+function aimPose() {
+  faceCamera();
+  if (gear === 'aim' || !combat.aimClip) return;
+  gear = 'aim';
+  const next = mixer.clipAction(combat.aimClip);
+  next.reset().play();
+  if (current && current !== next) current.crossFadeTo(next, 0.15, false);
+  current = next;
+}
+
 function stepPlay(dt) {
   dt = Math.min(dt, 0.05);
   if (driving) { if (driving.data.flying) fly(dt); else drive(dt); return; }
@@ -1124,8 +1383,12 @@ function stepPlay(dt) {
   if (keys.has('KeyD')) move.add(right);
   if (keys.has('KeyA')) move.sub(right);
   const step = new THREE.Vector3();
-  if (move.lengthSq() === 0) setGear('idle');
-  else {
+  const now = performance.now();
+  if (now < combat.downUntil) move.set(0, 0);
+  if (move.lengthSq() === 0) {
+    if (combat.ready && now >= combat.downUntil && (combat.aiming || now < combat.shootUntil)) aimPose();
+    else setGear('idle');
+  } else {
     move.normalize();
     setGear(keys.has('ShiftLeft') || keys.has('ShiftRight') ? 'sprint' : walking ? 'walk' : 'run');
     // Turn the character's forward towards the move, smoothly.
@@ -1153,6 +1416,22 @@ addEventListener('keydown', e => {
   keys.add(e.code);
 });
 addEventListener('keyup', e => keys.delete(e.code));
+let pressAt = null;
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (!ui('playmode').checked) return;
+  if (e.button === 0) pressAt = [e.clientX, e.clientY, performance.now()];
+  if (e.button === 2) combat.aiming = true;
+});
+addEventListener('pointerup', e => {
+  if (e.button === 2) combat.aiming = false;
+  if (e.button !== 0 || !pressAt) return;
+  const [x, y, t] = pressAt;
+  pressAt = null;
+  // A click, not a drag of the camera.
+  if (Math.hypot(e.clientX - x, e.clientY - y) < 6 && performance.now() - t < 400) playerShoot();
+});
+renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+controls.enablePan = false;
 addEventListener('blur', () => keys.clear());
 ui('playmode').onchange = e => { startPlay(e.target.checked); e.target.blur(); };
 ui('showcol').onchange = e => {
@@ -1181,7 +1460,7 @@ function open(gltf, name) {
   frame(root);
   // For inspecting from the browser console.
   window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut,
-    vehicles, enterOrLeave, stepPlay, stepNpcs, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
+    vehicles, enterOrLeave, stepPlay, stepNpcs, stepCombat, playerShoot, combat, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
   player.position.set(0, 0, 0);
@@ -1228,7 +1507,7 @@ addEventListener('drop', async e => {
 
 renderer.setAnimationLoop(() => {
   const dt = clock.getDelta();
-  if (mixer && ui('playmode').checked) { stepPlay(dt); mixer.update(dt); if (world) stepNpcs(Math.min(dt, 0.05)); }
+  if (mixer && ui('playmode').checked) { stepPlay(dt); mixer.update(dt); if (world) { stepNpcs(Math.min(dt, 0.05)); stepCombat(Math.min(dt, 0.05)); } }
   else if (mixer && playing) mixer.update(dt * speed);
   if (action) { ui('time').value = action.time; ui('timev').textContent = action.time.toFixed(2) + 's'; }
   if (world) cullObjects(false);
