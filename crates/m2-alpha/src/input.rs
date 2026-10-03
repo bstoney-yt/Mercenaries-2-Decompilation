@@ -44,6 +44,9 @@ pub enum Action {
     NextGait,
     /// Draw back faces too (a debugging aid while formats are checked).
     ToggleCulling,
+    /// Save the game to the quick-save file, or load it back.
+    QuickSave,
+    QuickLoad,
     Quit,
 }
 
@@ -79,6 +82,8 @@ impl Default for Bindings {
             (Fullscreen, vec![F11]),
             (NextGait, vec![KeyN]),
             (ToggleCulling, vec![F3]),
+            (QuickSave, vec![F5]),
+            (QuickLoad, vec![F9]),
             (Quit, vec![Escape]),
         ]))
     }
