@@ -3,7 +3,7 @@
 //! ```text
 //! m2-alpha [--install <dir>] [--spawn <x>,<z>] [--model <hash>]... [--gait <gait>]
 //!          [--config <file>]
-//!          [--size <w>x<h>] [--vsync on|off] [--fullscreen] [--double-sided]
+//!          [--size <w>x<h>] [--vsync on|off] [--fullscreen] [--double-sided] [--fly]
 //!          [--screenshot <out.ppm>] [--write-config]
 //! ```
 //!
@@ -13,18 +13,27 @@
 //! `--screenshot` renders one frame without opening a window, for checking
 //! a machine's GPU setup.
 //!
-//! Right now this opens a window with a free-flying camera over the island,
-//! streamed from the install around the camera (`--spawn` picks where to
-//! start; the default is the first town). With `--model` it shows those
-//! models on a ground grid instead, characters playing the game's
-//! locomotion clips in place (N steps through idle, walk, run and sprint;
-//! `--gait` picks the first). Tab or the right mouse button captures
-//! the mouse, WASD/Space/C fly, Shift speeds up, F11 toggles fullscreen, F3
-//! toggles back-face culling, Escape releases the mouse, then quits.
+//! Right now this opens a window on the island, streamed from the install
+//! around the player: Jennifer on foot with a third-person camera
+//! (`--spawn` picks where to start; the default is the first town). WASD
+//! runs, Shift sprints, Q held walks, Space jumps. V switches to a
+//! free-flying camera and back (`--fly` starts flying): WASD/Space/C fly,
+//! Shift speeds up. With `--model` it shows those models on a ground grid
+//! instead, characters playing the game's locomotion clips in place (N
+//! steps through idle, walk, run and sprint; `--gait` picks the first).
+//! Tab or the right mouse button captures the mouse, F11 toggles
+//! fullscreen, F3 toggles back-face culling, Escape releases the mouse,
+//! then quits.
+//!
+//! `--screenshot` on the island waits for the ground, lands the player and,
+//! with `--gait walk|run|sprint`, runs her forward for three seconds before
+//! taking the picture, printing where she got to.
 
 mod camera;
 mod config;
+mod game;
 mod input;
+mod player;
 mod scene;
 
 use std::path::PathBuf;
@@ -44,7 +53,9 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use camera::FlyCamera;
 use config::Config;
+use game::Game;
 use input::{Action, Input};
+use player::Intent;
 use scene::Scene;
 
 /// Simulation rate; rendering runs as fast as presentation allows.
@@ -61,6 +72,7 @@ struct Options {
     spawn: Option<(f32, f32)>,
     gait: Option<Gait>,
     double_sided: bool,
+    fly: bool,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
     fullscreen: bool,
@@ -111,6 +123,7 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--fullscreen" => o.fullscreen = true,
             "--double-sided" => o.double_sided = true,
+            "--fly" => o.fly = true,
             "--screenshot" => o.screenshot = Some(value()?.into()),
             "--write-config" => o.write_config = true,
             "-h" | "--help" => {
@@ -167,7 +180,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     if let Some(out) = &options.screenshot {
-        return screenshot(&config, install.as_ref(), &mode, options.double_sided, out);
+        return screenshot(&config, install.as_ref(), &mode, &options, out);
     }
 
     let event_loop = EventLoop::new()?;
@@ -177,6 +190,7 @@ fn main() -> anyhow::Result<()> {
         install,
         mode,
         double_sided: options.double_sided,
+        fly: options.fly,
         state: None,
         error: None,
     };
@@ -202,7 +216,7 @@ fn build_scene(
     install: Option<&Install>,
     mode: &Mode,
     double_sided: bool,
-) -> anyhow::Result<(Scene, FlyCamera)> {
+) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
     if double_sided {
         scene.materials.set_double_sided(backend, true)?;
@@ -221,61 +235,97 @@ fn build_scene(
         }
     }
     let (eye, target) = scene.focus;
-    Ok((scene, FlyCamera::looking_at(eye, target)))
+    Ok(Game::new(scene, FlyCamera::looking_at(eye, target)))
 }
 
-/// Streams around the camera and draws a frame.
+/// Streams around the player (or camera) and draws a frame.
 fn render(
     backend: &mut dyn RenderBackend,
-    scene: &mut Scene,
-    camera: &FlyCamera,
+    game: &mut Game,
     fov: f32,
     aspect: f32,
 ) -> anyhow::Result<()> {
-    let mut view = camera.view(fov, aspect);
-    if scene.world.is_some() {
+    let mut view = game.view(fov, aspect);
+    if game.scene.world.is_some() {
         view.lighting.fog_density = 0.00025;
     }
-    scene.update(backend, camera.position)?;
+    let focus = game.focus();
+    game.scene.update(backend, focus)?;
     let mut queue = DrawQueue::new();
     backend.begin_frame(&view)?;
-    scene.draw(backend, &mut queue, camera.position)?;
+    game.scene.draw(backend, &mut queue, view.eye())?;
     queue.flush(&view, backend)?;
     backend.end_frame()?;
     Ok(())
 }
 
-/// Renders one frame offscreen and writes it as a binary PPM.
+/// Renders one frame offscreen and writes it as a binary PPM. On the
+/// island, once it has streamed in, the player lands and (with `gait`
+/// walk, run or sprint) heads forward for three seconds first.
 fn screenshot(
     config: &Config,
     install: Option<&Install>,
     mode: &Mode,
-    double_sided: bool,
+    options: &Options,
     out: &std::path::Path,
 ) -> anyhow::Result<()> {
     let (w, h) = (config.window.width, config.window.height);
     let mut backend = WgpuBackend::headless(w, h)?;
     eprintln!("adapter: {:?}", backend.adapter_summary());
-    let (mut scene, camera) = build_scene(&mut backend, install, mode, double_sided)?;
+    let mut game = build_scene(&mut backend, install, mode, options.double_sided)?;
+    if options.fly {
+        game.on_foot = false;
+    }
     let fov = config.camera.fov;
     let aspect = w as f32 / h as f32;
+    let tick = TICK.as_secs_f32();
     // Characters a little way into their clip, mid-stride when moving.
-    scene.tick(0.4);
-    render(&mut backend, &mut scene, &camera, fov, aspect)?;
+    game.scene.tick(0.4);
+    render(&mut backend, &mut game, fov, aspect)?;
     // Let the island stream in before the picture is taken.
     let started = Instant::now();
-    while let Some(world) = &scene.world {
-        if world.stats().pending == 0 || started.elapsed() > Duration::from_secs(180) {
-            eprintln!(
-                "{:?} after {:.1} s",
-                world.stats(),
-                started.elapsed().as_secs_f32()
-            );
+    while let Some(world) = &game.scene.world {
+        let stats = world.stats();
+        let waiting = game
+            .scene
+            .player
+            .as_ref()
+            .is_some_and(|p| game.on_foot && !p.landed);
+        if (stats.pending == 0 && !waiting) || started.elapsed() > Duration::from_secs(180) {
+            eprintln!("{stats:?} after {:.1} s", started.elapsed().as_secs_f32());
             break;
         }
-        render(&mut backend, &mut scene, &camera, fov, aspect)?;
+        game.step(Intent::default(), tick);
+        render(&mut backend, &mut game, fov, aspect)?;
     }
-    render(&mut backend, &mut scene, &camera, fov, aspect)?;
+    if game.on_foot && game.scene.player.is_some() {
+        let gait = options.gait.unwrap_or(Gait::Idle);
+        let intent = Intent {
+            movement: if gait == Gait::Idle {
+                Default::default()
+            } else {
+                m2_math::glam::Vec2::Y
+            },
+            walk: gait == Gait::Walk,
+            sprint: gait == Gait::Sprint,
+            ..Intent::default()
+        };
+        let from = game.scene.player.as_ref().map(|p| p.character.position);
+        for i in 0..180 {
+            game.step(intent, tick);
+            if i % 30 == 0 {
+                // Keep streaming around her as she goes.
+                render(&mut backend, &mut game, fov, aspect)?;
+            }
+        }
+        if let (Some(p), Some(from)) = (&game.scene.player, from) {
+            eprintln!(
+                "player: {:?} from {from:.2} to {:.2}, grounded {}",
+                gait, p.character.position, p.character.grounded
+            );
+        }
+    }
+    render(&mut backend, &mut game, fov, aspect)?;
     let rgba = backend.read_pixels()?;
     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
     ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
@@ -287,8 +337,7 @@ fn screenshot(
 struct Running {
     window: Arc<Window>,
     backend: WgpuBackend,
-    scene: Scene,
-    camera: FlyCamera,
+    game: Game,
     input: Input,
     mouse_look: bool,
     /// Keyboard input is ignored while another window has focus.
@@ -306,6 +355,8 @@ struct App {
     mode: Mode,
     /// Start with back-face culling off.
     double_sided: bool,
+    /// Start flying rather than on foot.
+    fly: bool,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -325,12 +376,15 @@ impl App {
             WgpuBackend::for_window(window.clone(), size.width, size.height, w.vsync)?;
         let adapter = backend.adapter_summary();
         eprintln!("adapter: {adapter:?}");
-        let (scene, camera) = build_scene(
+        let mut game = build_scene(
             &mut backend,
             self.install.as_ref(),
             &self.mode,
             self.double_sided,
         )?;
+        if self.fly {
+            game.on_foot = false;
+        }
         let focused = window.has_focus();
         Ok(Running {
             title: format!(
@@ -339,8 +393,7 @@ impl App {
             ),
             window,
             backend,
-            scene,
-            camera,
+            game,
             input: Input::default(),
             mouse_look: false,
             focused,
@@ -385,8 +438,7 @@ impl Running {
         let (w, h) = self.backend.size();
         render(
             &mut self.backend,
-            &mut self.scene,
-            &self.camera,
+            &mut self.game,
             config.camera.fov,
             w as f32 / h as f32,
         )?;
@@ -394,7 +446,7 @@ impl Running {
         let elapsed = now - self.fps.0;
         if elapsed >= Duration::from_secs(1) {
             let fps = f64::from(self.fps.1) / elapsed.as_secs_f64();
-            let p = self.camera.position;
+            let p = self.game.focus();
             self.window.set_title(&format!(
                 "{} - {fps:.0} fps - ({:.0}, {:.0}, {:.0})",
                 self.title, p.x, p.y, p.z
@@ -421,11 +473,12 @@ impl Running {
                 .set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
         }
         if self.input.take_pressed(Action::NextGait) {
-            self.scene.cycle_gaits();
+            self.game.scene.cycle_gaits();
         }
         if self.input.take_pressed(Action::ToggleCulling) {
             self.culling = !self.culling;
             if let Err(e) = self
+                .game
                 .scene
                 .materials
                 .set_double_sided(&mut self.backend, !self.culling)
@@ -437,13 +490,12 @@ impl Running {
                 if self.culling { "on" } else { "off" }
             );
         }
-        self.camera.update(
+        self.game.tick(
             &mut self.input,
             &config.camera,
             self.mouse_look,
             TICK.as_secs_f32(),
         );
-        self.scene.tick(TICK.as_secs_f32());
     }
 }
 

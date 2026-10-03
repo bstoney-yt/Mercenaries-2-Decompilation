@@ -3,9 +3,11 @@ m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
 m2-alpha [options]
   --install <dir>        the game's install folder (holding data\vz.wad)
   --spawn <x>,<z>        where on the island to start (default 450,-1950)
+  --fly                  start with the free camera instead of on foot
   --model <hash>         a model to show (hex name hash; repeatable)
-  --gait <gait>          what characters shown with --model play first:
-                         idle, walk, run or sprint
+  --gait <gait>          idle, walk, run or sprint: what characters shown
+                         with --model play first; with --screenshot on the
+                         island, how the player moves before the picture
   --config <file>        settings file (default m2-alpha.toml)
   --size <w>x<h>         window size
   --vsync on|off
@@ -14,6 +16,7 @@ m2-alpha [options]
   --screenshot <out.ppm> render one frame offscreen and exit
   --write-config         print the settings file and exit
 
-Keys: Tab or right mouse captures the mouse, WASD moves, Space/C up/down,
-Shift faster, N next gait, F11 fullscreen, F3 culling, Escape releases the
-mouse / quits.
+On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
+V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
+Tab or right mouse captures the mouse, N next gait (--model), F11
+fullscreen, F3 culling, Escape releases the mouse / quits.

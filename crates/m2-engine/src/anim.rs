@@ -181,6 +181,8 @@ pub struct BoundClip {
     /// The track driving each node.
     node_tracks: Vec<Option<usize>>,
     pub info: ClipInfo,
+    /// Every node's rotation on the first frame, to compare postures.
+    first_rotations: Vec<Quat>,
 }
 
 /// What a clip does to the character as a whole.
@@ -193,6 +195,9 @@ pub struct ClipInfo {
     pub direction: Vec2,
     /// The root's horizontal position on the first frame.
     pub root_start: Vec2,
+    /// Where to pin the root horizontally so the pelvis starts over the
+    /// origin (clips may be authored away from it).
+    pub pin: Vec2,
     /// The pelvis height on the first frame, metres.
     pub hips: f32,
 }
@@ -224,10 +229,18 @@ impl BoundClip {
                 speed: 0.0,
                 direction: Vec2::ZERO,
                 root_start: Vec2::ZERO,
+                pin: Vec2::ZERO,
                 hips: 0.0,
             },
+            first_rotations: Vec::new(),
         };
         bound.info = bound.measure(skeleton);
+        bound.first_rotations = bound
+            .sample(skeleton, 0.0)
+            .0
+            .iter()
+            .map(|l| l.rotation)
+            .collect();
         Some(bound)
     }
 
@@ -241,10 +254,13 @@ impl BoundClip {
         let travel = Vec2::new(b.x - a.x, b.z - a.z);
         // The pelvis: the root's child that sits highest.
         let models = skeleton.model_matrices(&first);
-        let hips = (0..skeleton.len())
+        let pelvis = (0..skeleton.len())
             .filter(|&i| skeleton.parents[i] == Some(root))
-            .map(|i| models[i].w_axis.y)
-            .fold(f32::MIN, f32::max);
+            .max_by(|&a, &b| models[a].w_axis.y.total_cmp(&models[b].w_axis.y));
+        let hips = pelvis.map_or(f32::MIN, |i| models[i].w_axis.y);
+        let pelvis_xz = pelvis.map_or(Vec2::new(a.x, a.z), |i| {
+            Vec2::new(models[i].w_axis.x, models[i].w_axis.z)
+        });
         ClipInfo {
             duration,
             speed: if duration > 0.0 {
@@ -254,6 +270,8 @@ impl BoundClip {
             },
             direction: travel.normalize_or_zero(),
             root_start: Vec2::new(a.x, a.z),
+            // Moving the root by -offset moves the pelvis to the origin.
+            pin: Vec2::new(a.x, a.z) - pelvis_xz,
             hips: if hips.is_finite() { hips } else { 0.0 },
         }
     }
@@ -320,6 +338,12 @@ pub fn load_clips<R: Read + Seek>(
     Ok(out)
 }
 
+/// How differently two poses hold their joints: 0 for the same rotations,
+/// growing with each joint turned away.
+fn posture_distance(a: &[Quat], b: &[Quat]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| 1.0 - x.dot(*y).abs()).sum()
+}
+
 /// Movement speeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Gait {
@@ -370,13 +394,6 @@ impl Locomotion {
         }
         let standing = |i: &ClipInfo| i.hips > 0.85;
         let mut chosen = HashMap::new();
-        let idle = clips
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.info.speed * c.info.duration < 1e-3)
-            .filter(|(_, c)| c.info.hips > 0.95 && c.info.hips < 1.15 && c.info.duration >= 1.3)
-            .max_by(|a, b| a.1.info.duration.total_cmp(&b.1.info.duration))?;
-        chosen.insert(Gait::Idle, idle.0);
         for gait in [Gait::Walk, Gait::Run, Gait::Sprint] {
             let (lo, hi) = gait.band();
             let (i, _) = clips.iter().enumerate().find(|(_, c)| {
@@ -385,6 +402,23 @@ impl Locomotion {
             })?;
             chosen.insert(gait, i);
         }
+        // Idle: of the clips that stay put and hold the pelvis at standing
+        // height, the one whose first frame looks most like the walk's
+        // (many still clips are sitting, lying or scripted poses).
+        let walk = &clips[chosen[&Gait::Walk]];
+        let idle = clips
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.info.speed * c.info.duration < 1e-3 && c.info.duration >= 1.0)
+            .filter(|(_, c)| c.info.hips > 0.85 && c.info.hips < 1.3)
+            .map(|(i, c)| {
+                (
+                    i,
+                    posture_distance(&walk.first_rotations, &c.first_rotations),
+                )
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        chosen.insert(Gait::Idle, idle.0);
         Some(Self {
             clips: chosen,
             forward,
@@ -442,7 +476,7 @@ impl Animator {
         let sample = |(i, t): (usize, f32)| {
             clips.get(i).map(|c| {
                 let mut p = c.sample_looped(skeleton, t);
-                p.strip_root_motion(skeleton.root(), c.info.root_start);
+                p.strip_root_motion(skeleton.root(), c.info.pin);
                 p
             })
         };

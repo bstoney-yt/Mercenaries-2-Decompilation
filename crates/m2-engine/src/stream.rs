@@ -198,10 +198,10 @@ pub struct WorldSettings {
 impl Default for WorldSettings {
     fn default() -> Self {
         Self {
-            // Equal, so placed models always stand on full-detail ground
-            // (the low-resolution tiles leave out small stretches of land).
+            // Models reach past the full-detail ground, so the skyline
+            // (towers, bridges, pylons) stays in view.
             detail_radius: 1000.0,
-            object_distance: 1000.0,
+            object_distance: 2000.0,
             upload_budget: 24 << 20,
             in_flight: 6,
             sea_level: -35.0,

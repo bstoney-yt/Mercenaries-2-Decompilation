@@ -229,6 +229,9 @@ pub struct CpuPiece {
     /// For skinned geometry, the node each blend index names; empty for
     /// rigid geometry.
     pub bones: Vec<u16>,
+    /// For rigid geometry, the node it hangs from (`local` is that node's
+    /// rest transform), so posed models can move it with the node.
+    pub node: Option<u16>,
 }
 
 /// A model's geometry at one level of detail, decoded but not uploaded.
@@ -313,6 +316,7 @@ impl CpuModel {
                     } else {
                         Vec::new()
                     },
+                    node: (!skinned).then_some(segment.node),
                 });
             }
         }
@@ -355,6 +359,7 @@ struct Piece {
     ranges: Vec<(u32, u32, MaterialId)>,
     centre: Vec3,
     bones: Vec<u16>,
+    node: Option<u16>,
 }
 
 /// A model's geometry on the GPU, ready to draw.
@@ -394,8 +399,10 @@ impl GpuModel {
                         (first, count, ids.get(m).copied().unwrap_or_default())
                     })
                     .collect(),
-                centre: p.centre,
+                // Kept in geometry space, so any transform places it.
+                centre: p.local.inverse().transform_point3(p.centre),
                 bones: p.bones.clone(),
+                node: p.node,
             });
         }
         Ok(Self {
@@ -433,19 +440,27 @@ impl GpuModel {
         self.pieces.iter().any(|p| !p.bones.is_empty())
     }
 
-    /// Queues every piece at `world`, skinned geometry posed by `skin`
-    /// (per node, as [`Skeleton::skin_matrices`](crate::Skeleton::skin_matrices)
-    /// returns). Palettes are set on `backend`, so call this inside a frame.
+    /// Queues every piece at `world`, posed: rigid pieces follow their
+    /// node's posed matrix in `nodes` (as
+    /// [`Skeleton::model_matrices`](crate::Skeleton::model_matrices)
+    /// returns) and skinned ones blend `skin` (as
+    /// [`Skeleton::skin_matrices`](crate::Skeleton::skin_matrices)). Palettes
+    /// are set on `backend`, so call this inside a frame.
     pub fn draw_posed(
         &self,
         backend: &mut dyn RenderBackend,
         queue: &mut DrawQueue,
         world: Mat4,
+        nodes: &[Mat4],
         skin: &[Mat4],
     ) -> Result<(), BackendError> {
         let mut palette = Vec::new();
         for piece in &self.pieces {
             let handle = if piece.bones.is_empty() {
+                if let Some(&m) = piece.node.and_then(|n| nodes.get(usize::from(n))) {
+                    Self::push_at(queue, piece, world * m, None);
+                    continue;
+                }
                 None
             } else {
                 palette.clear();
@@ -463,8 +478,12 @@ impl GpuModel {
     }
 
     fn push(queue: &mut DrawQueue, piece: &Piece, world: Mat4, skin: Option<SkinHandle>) {
-        let transform = world * piece.local;
-        let origin = world.transform_point3(piece.centre);
+        Self::push_at(queue, piece, world * piece.local, skin);
+    }
+
+    /// Queues `piece` with geometry-to-world `transform`.
+    fn push_at(queue: &mut DrawQueue, piece: &Piece, transform: Mat4, skin: Option<SkinHandle>) {
+        let origin = transform.transform_point3(piece.centre);
         for &(first, count, material) in &piece.ranges {
             queue.push(Primitive {
                 call: DrawCall {
