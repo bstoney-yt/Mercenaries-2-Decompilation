@@ -19,6 +19,7 @@
 //!   posing.
 //! - [`havok`]: the binary object packfiles animation clips are stored in.
 //! - [`terrain`]: the 400 m terrain cells and low-resolution tiles.
+//! - [`scatter`]: the grass and shrub clumps instanced over each cell.
 //! - [`layer`]: entity layers, the component tables that place terrain,
 //!   buildings, props and everything else in the world.
 //! - [`material_animation`]: material animations (keyed material
@@ -44,6 +45,7 @@ pub mod havok;
 pub mod layer;
 pub mod material_animation;
 pub mod model;
+pub mod scatter;
 pub mod sges;
 pub mod terrain;
 pub mod texture;
@@ -61,6 +63,7 @@ pub use havok::{Packfile, PackfileError};
 pub use layer::{Component, Layer, LayerError, Placement};
 pub use material_animation::{MaterialAnimError, MaterialAnimation};
 pub use model::{Model, ModelError, PrimitiveGroup};
+pub use scatter::{Scatter, ScatterError};
 pub use sges::{Segment, SgesError, SgesHeader};
 pub use terrain::{LowResTile, TerrainCell, TerrainError};
 pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};
