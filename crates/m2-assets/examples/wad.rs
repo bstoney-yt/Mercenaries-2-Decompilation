@@ -10,6 +10,7 @@
 //! cargo run -p m2-assets --example wad -- models  <archive.wad>
 //! cargo run -p m2-assets --example wad -- obj     <archive.wad> <model hash> <out.obj> [lod]
 //! cargo run -p m2-assets --example wad -- anims   <archive.wad>
+//! cargo run -p m2-assets --example wad -- world   <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -21,6 +22,9 @@
 //! tracks, and checks quaternion lengths, frame rates, the first frame
 //! against the model's bind pose, and that sampled poses are finite; it
 //! also parses every material animation.
+//! `world` parses every terrain cell, low-resolution tile and entity layer,
+//! checks material references and that the layout layer places each cell
+//! on the 400 m grid, and summarises the components.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -61,7 +65,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         [cmd, path, ..] => (cmd.as_str(), path),
         _ => {
             return Err(
-                "usage: wad <list|assets|names|extract|textures|dds|models|obj|anims> <archive.wad> [args]".into(),
+                "usage: wad <list|assets|names|extract|textures|dds|models|obj|anims|world> <archive.wad> [args]".into(),
             );
         }
     };
@@ -147,6 +151,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         ("models", []) => models(&mut wad)?,
         ("anims", []) => anims(&mut wad)?,
+        ("world", []) => world(&mut wad)?,
         ("obj", [hash, out, rest @ ..]) => {
             let hash = u32::from_str_radix(hash.trim_start_matches("0x"), 16)?;
             let lod = match rest {
@@ -740,5 +745,113 @@ fn anims<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         "frame 0 translation matches the HIER local on {bind_matched} of {bind_checked} bound tracks"
     );
     println!("{non_finite} sampled poses with non-finite matrices");
+    Ok(())
+}
+
+fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    use m2_assets::layer::LAYER_TYPE;
+    use m2_assets::terrain::{CELL_SIZE, LOW_RES_TYPE, TERRAIN_TYPE};
+    use m2_assets::{Layer, LowResTile, TerrainCell};
+    let (mut cells, mut tiles, mut layers) = (HashMap::new(), HashMap::new(), Vec::new());
+    for block in 0..wad.index().blocks().len() {
+        let decoded = wad.read_block(block)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            match e.type_hash {
+                TERRAIN_TYPE => {
+                    cells.insert(e.name_hash, data.to_vec());
+                }
+                LOW_RES_TYPE => {
+                    tiles.insert(e.name_hash, data.to_vec());
+                }
+                LAYER_TYPE => layers.push((e.name_hash, data.to_vec())),
+                _ => {}
+            }
+        }
+    }
+    let mut errors = 0;
+    let (mut groups, mut ranges, mut triangles) = (0, 0, 0);
+    for (hash, data) in &cells {
+        match TerrainCell::parse(data) {
+            Ok(c) => {
+                for g in c.patches.iter().flat_map(|p| &p.groups) {
+                    groups += 1;
+                    for r in &g.material_ranges {
+                        ranges += 1;
+                        triangles += g.triangles(r).len();
+                    }
+                }
+            }
+            Err(e) => {
+                errors += 1;
+                eprintln!("cell {hash:08x}: {e}");
+            }
+        }
+    }
+    for (hash, data) in &tiles {
+        if let Err(e) = LowResTile::parse(data) {
+            errors += 1;
+            eprintln!("tile {hash:08x}: {e}");
+        }
+    }
+    println!(
+        "{} terrain cells ({groups} groups, {ranges} material ranges, {triangles} triangles), {} low-res tiles",
+        cells.len(),
+        tiles.len()
+    );
+
+    let mut comps: HashMap<String, (usize, usize, bool)> = HashMap::new();
+    let (mut entities, mut placed, mut placed_cells, mut on_grid, mut placed_tiles, mut models) =
+        (0, 0, 0, 0, 0, 0);
+    for (hash, data) in &layers {
+        let layer = match Layer::parse(data) {
+            Ok(l) => l,
+            Err(e) => {
+                errors += 1;
+                eprintln!("layer {hash:08x}: {e}");
+                continue;
+            }
+        };
+        for c in &layer.components {
+            let fixed = c.records().is_some() || c.name == "Name" || c.name == "PointLocation";
+            let e = comps.entry(c.name.to_owned()).or_insert((0, 0, true));
+            e.0 += 1;
+            e.1 += c.count as usize;
+            e.2 &= fixed;
+        }
+        let placements = layer.placements();
+        entities += layer.names().len();
+        placed += placements.len();
+        models += layer.hashes("ModelName").len();
+        for (entity, cell) in layer.hashes("TerrainObject") {
+            placed_cells += usize::from(cells.contains_key(&cell));
+            if let Some(p) = placements.get(&entity) {
+                let grid = |v: f32| ((v + CELL_SIZE / 2.0) / CELL_SIZE).fract().abs() < 1e-4;
+                on_grid += usize::from(grid(p.position[0]) && grid(p.position[2]));
+            }
+        }
+        for (_, tile) in layer.hashes("LowResTerrainObject") {
+            placed_tiles += usize::from(tiles.contains_key(&tile));
+        }
+    }
+    println!(
+        "{} layers: {entities} named entities, {placed} placements, {models} with a model; \
+         layout places {placed_cells} cells ({on_grid} centred on the 400 m grid) and {placed_tiles} low-res tiles",
+        layers.len()
+    );
+    let mut comps: Vec<_> = comps.into_iter().collect();
+    comps.sort_by_key(|c| std::cmp::Reverse(c.1.1));
+    let irregular: Vec<&str> = comps
+        .iter()
+        .filter(|c| !c.1.2)
+        .map(|c| c.0.as_str())
+        .collect();
+    println!(
+        "{} component types; irregular record sizes: {irregular:?}",
+        comps.len()
+    );
+    for (name, (layers, count, _)) in comps.iter().take(12) {
+        println!("  {name:24} {count:7} records in {layers} layers");
+    }
+    eprintln!("{errors} errors");
     Ok(())
 }
