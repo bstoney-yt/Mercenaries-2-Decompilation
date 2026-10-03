@@ -66,6 +66,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 
 const view = document.getElementById('view');
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -492,6 +493,7 @@ function moveInWorld(step, dt) {
   const next = p.clone().add(step);
   pushOut(next);
   pushOutOfVehicles(next);
+  pushOutOfPeople(next, RADIUS, null);
   const floor = floorAt(next.x, next.z, p.y);
   if (fall === 0 && floor.y >= p.y - 0.4) {
     // On the ground: follow it up a step or down a slope.
@@ -772,9 +774,9 @@ function pushOutOfOthers(a, next) {
 }
 
 // Keeps the character out of parked vehicles (their footprints).
-function pushOutOfVehicles(pos) {
+function pushOutOfVehicles(pos, skip = driving) {
   for (const v of vehicles) {
-    if (v === driving || Math.hypot(pos.x - v.root.position.x, pos.z - v.root.position.z) > 15) continue;
+    if (v === skip || Math.hypot(pos.x - v.root.position.x, pos.z - v.root.position.z) > 15) continue;
     if (pos.y > v.root.position.y + v.hi.y) continue;
     let [lx, lz] = toLocal(v, pos.x, pos.z);
     const f = footprint(v);
@@ -963,6 +965,152 @@ function fly(dt) {
     : `${d.name} · ${Math.round(flat * 3.6)} km/h · ${Math.round(height)} m up · Space up, Shift down, W/S forward/back, A/D turn${v.landed ? ', E get out' : ''}`;
 }
 
+// ---- People ------------------------------------------------------------
+// From `gltf npcs` (served with `view --npcs`): character models sharing
+// the playable character's skeleton, so its clips drive them, and spawn
+// points from layer entities that place soldiers. Soldiers stand at those
+// points; civilians (?npcs=N, default 12) are scattered around the start.
+// THE BEHAVIOUR IS INVENTED, not the game's AI: idle a few seconds, then
+// wander near home; step aside when the character comes close; run from a
+// vehicle coming fast.
+const npcs = [];
+let npcData = null, npcModels = null, npcsSpawned = false;
+const NPC_COUNT = +(new URLSearchParams(location.search).get('npcs') ?? 12);
+
+async function loadNpcs() {
+  const r = await fetch('npcs.json').catch(() => null);
+  if (!r || !r.ok) return;
+  npcData = await r.json();
+  npcModels = await Promise.all(npcData.models.map(m => loader.loadAsync('npc/' + m.file).catch(() => null)));
+}
+
+function spawnNpcs() {
+  if (npcsSpawned || !npcData || !npcModels || !world || !loco || !loco.fwd) return;
+  npcsSpawned = true;
+  // The character's clips, keeping only tracks for nodes the model has.
+  const cache = new Map();
+  const clipFor = (modelIndex, g) => {
+    const key = `${modelIndex} ${g}`;
+    if (!cache.has(key)) {
+      const names = new Set();
+      npcModels[modelIndex].scene.traverse(o => names.add(o.name));
+      const c = inPlace(+ui(g).value);
+      cache.set(key, new THREE.AnimationClip(c.name, c.duration, c.tracks.filter(t => names.has(t.name.split('.')[0]))));
+    }
+    return cache.get(key);
+  };
+  const add = (modelIndex, at, soldier, name) => {
+    const src = npcModels[modelIndex];
+    if (!src) return;
+    const clipOf = g => clipFor(modelIndex, g);
+    const root = cloneSkinned(src.scene);
+    const body = new THREE.Group();
+    body.add(root);
+    body.position.copy(at);
+    body.visible = false;
+    scene.add(body);
+    const mixer = new THREE.AnimationMixer(root);
+    const actions = Object.fromEntries(['idle', 'walk', 'run'].map(g => [g, mixer.clipAction(clipOf(g))]));
+    actions.idle.time = Math.random() * clipOf('idle').duration;
+    actions.idle.play();
+    npcs.push({
+      body, mixer, actions, current: actions.idle, gait: 'idle', home: at.clone(), soldier, name,
+      state: 'idle', timer: 1 + Math.random() * 4, target: null, placed: false, speed: 0,
+    });
+  };
+  const civilians = npcData.models.map((m, i) => [m, i]).filter(([m]) => !m.soldier).map(([, i]) => i);
+  for (const s of npcData.spawns) add(s.model, new THREE.Vector3(...s.at), true, s.name);
+  const p = player.position;
+  for (let k = 0; k < NPC_COUNT && civilians.length; k++) {
+    const a = Math.random() * Math.PI * 2, d = 8 + Math.random() * 50;
+    add(civilians[k % civilians.length], new THREE.Vector3(p.x + Math.cos(a) * d, p.y, p.z + Math.sin(a) * d), false, 'civilian');
+  }
+}
+
+function setNpcGait(n, g) {
+  if (n.gait === g) return;
+  const next = n.actions[g];
+  next.reset().play();
+  n.current.crossFadeTo(next, 0.25, false);
+  n.current = next;
+  n.gait = g;
+}
+
+// Keeps a point out of the people near it (radius r around the point).
+function pushOutOfPeople(pos, r, skip) {
+  for (const n of npcs) {
+    if (n === skip || !n.placed) continue;
+    const q = n.body.position, dx = pos.x - q.x, dz = pos.z - q.z, d = Math.hypot(dx, dz), min = r + RADIUS;
+    if (d >= min || Math.abs(pos.y - q.y) > 1.8) continue;
+    const ux = d > 1e-4 ? dx / d : 1, uz = d > 1e-4 ? dz / d : 0;
+    pos.x = q.x + ux * min; pos.z = q.z + uz * min;
+  }
+}
+
+function stepNpcs(dt) {
+  if (!npcsSpawned) { spawnNpcs(); return; }
+  const me = driving ? driving.root.position : player.position;
+  const fast = driving && Math.abs(driving.speed) > 4;
+  for (const n of npcs) {
+    const b = n.body;
+    const far = Math.hypot(b.position.x - me.x, b.position.z - me.z);
+    b.visible = far < 300;
+    if (far > 150) continue;
+    if (!n.placed) {
+      loadNear(b.position.x, b.position.z);
+      b.position.y = floorAt(b.position.x, b.position.z, terrainAt(b.position.x, b.position.z).y + 1).y;
+      n.home.copy(b.position);
+      n.placed = true;
+    }
+    n.mixer.update(dt);
+    // React: step aside from the character, run from a fast vehicle.
+    const dx = b.position.x - me.x, dz = b.position.z - me.z;
+    const near = Math.hypot(dx, dz);
+    if (n.state !== 'flee' && ((fast && near < 10) || (!driving && near < 2.2 && n.state !== 'aside'))) {
+      const len = Math.max(near, 1e-3), side = (dx * 0.6 - dz * 0.8 > 0) ? 1 : -1;
+      const away = new THREE.Vector2(dx / len, dz / len);
+      const dir = fast ? away : new THREE.Vector2(away.x - side * away.y, away.y + side * away.x).normalize();
+      const dist = fast ? 8 : 2;
+      n.target = new THREE.Vector3(b.position.x + dir.x * dist, b.position.y, b.position.z + dir.y * dist);
+      n.state = fast ? 'flee' : 'aside';
+    }
+    if (n.state === 'idle') {
+      setNpcGait(n, 'idle');
+      n.timer -= dt;
+      if (n.timer <= 0) {
+        const a = Math.random() * Math.PI * 2, d = Math.random() * (n.soldier ? 5 : 12);
+        n.target = n.home.clone().add(new THREE.Vector3(Math.cos(a) * d, 0, Math.sin(a) * d));
+        n.state = 'walk';
+      }
+      continue;
+    }
+    // Walking, stepping aside or fleeing towards the target.
+    const tx = n.target.x - b.position.x, tz = n.target.z - b.position.z;
+    const left = Math.hypot(tx, tz);
+    if (left < 0.4) { n.state = 'idle'; n.timer = 2 + Math.random() * 5; continue; }
+    const gait = n.state === 'walk' ? 'walk' : 'run';
+    setNpcGait(n, gait);
+    const speed = loco.info[+ui(gait).value].speed;
+    const step = Math.min(left, speed * dt);
+    const next = b.position.clone();
+    next.x += tx / left * step; next.z += tz / left * step;
+    pushOut(next);
+    pushOutOfVehicles(next, null);
+    pushOutOfPeople(next, RADIUS, n);
+    const floor = floorAt(next.x, next.z, b.position.y);
+    // A wall, a car or a drop in the way: give up on this target.
+    const moved = Math.hypot(next.x - b.position.x, next.z - b.position.z);
+    if (moved < step * 0.3 || Math.abs(floor.y - b.position.y) > 1) { n.state = 'idle'; n.timer = 1 + Math.random() * 2; continue; }
+    next.y = floor.y;
+    // Face the way it goes (the clips' forward is loco.fwd).
+    const want = Math.atan2(tx, tz) - Math.atan2(loco.fwd.x, loco.fwd.y);
+    let d = want - b.rotation.y;
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    b.rotation.y += d * Math.min(1, dt * 8);
+    b.position.copy(next);
+  }
+}
+
 function stepPlay(dt) {
   dt = Math.min(dt, 0.05);
   if (driving) { if (driving.data.flying) fly(dt); else drive(dt); return; }
@@ -1033,7 +1181,7 @@ function open(gltf, name) {
   frame(root);
   // For inspecting from the browser console.
   window.viewer = { root, mixer, clips, play, THREE, camera, controls, player, groundAt, floorAt, colliders, loadNear, pushOut,
-    vehicles, enterOrLeave, stepPlay, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
+    vehicles, enterOrLeave, stepPlay, stepNpcs, npcs, keys, vehicleAnims, get ride() { return ride; }, get driving() { return driving; }, get triCount() { return triCount; }, get loco() { return loco; }, get world() { return world; } };
   let meshes = 0; root.traverse(o => { if (o.isMesh) meshes++; });
   status(`${meshes} mesh primitives, ${clips.length} animations`);
   player.position.set(0, 0, 0);
@@ -1080,7 +1228,7 @@ addEventListener('drop', async e => {
 
 renderer.setAnimationLoop(() => {
   const dt = clock.getDelta();
-  if (mixer && ui('playmode').checked) { stepPlay(dt); mixer.update(dt); }
+  if (mixer && ui('playmode').checked) { stepPlay(dt); mixer.update(dt); if (world) stepNpcs(Math.min(dt, 0.05)); }
   else if (mixer && playing) mixer.update(dt * speed);
   if (action) { ui('time').value = action.time; ui('timev').textContent = action.time.toFixed(2) + 's'; }
   if (world) cullObjects(false);
@@ -1091,7 +1239,7 @@ renderer.setAnimationLoop(() => {
 load('model.glb', new URLSearchParams(location.search).get('name') || 'model.glb');
 // The world is optional: the server only has one with `view --world`.
 fetch('world.glb').then(r => r.ok ? r.arrayBuffer() : null).then(buf => {
-  if (buf) loader.parse(buf, '', openWorld, e => status('World failed to parse: ' + e.message));
+  if (buf) loader.parse(buf, '', g => { openWorld(g); loadNpcs(); }, e => status('World failed to parse: ' + e.message));
 });
 </script>
 </body>
