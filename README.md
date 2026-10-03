@@ -37,7 +37,7 @@ cargo run --release -p m2-assets --example gltf -- rigs "<install dir>\data\vz.w
 cargo run --release -p m2-assets --example gltf -- export "<install dir>\data\vz.wad" 15d89832 dumps/jen.glb --filter jennifer
 cargo run --release -p m2-assets --example gltf -- view dumps/jen.glb   # open http://127.0.0.1:8765
 cargo run --release -p m2-assets --example gltf -- export "<install dir>\data\vz.wad" 15d89832 dumps/play.glb --filter resident --clips 1000   # then view it and tick Play mode (WASD, Shift, Q)
-cargo run --release -p m2-assets --example gltf -- world "<install dir>dataz.wad" dumps/world.glb --detail 450,-1950 --radius 500   # terrain, buildings and props (--objects static|all|none)
+cargo run --release -p m2-assets --example gltf -- world "<install dir>datavz.wad" dumps/world.glb --detail 450,-1950 --radius 500   # terrain, buildings and props (--objects static|all|none)
 cargo run --release -p m2-assets --example gltf -- view dumps/play.glb --world dumps/world.glb   # open http://127.0.0.1:8765/?spawn=450,-1950 for the town
 cargo run --release -p m2-assets --example wad -- world "<install dir>\data\vz.wad"   # check every terrain cell, tile and entity layer
 ```
