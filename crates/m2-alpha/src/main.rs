@@ -5,7 +5,7 @@
 //!          [--config <file>]
 //!          [--size <w>x<h>] [--vsync on|off] [--fullscreen] [--double-sided] [--fly]
 //!          [--sea <metres>]
-//!          [--screenshot <out.ppm> [--drive]] [--write-config]
+//!          [--screenshot <out.ppm> [--drive | --fight]] [--write-config]
 //! ```
 //!
 //! Settings come from `m2-alpha.toml` (in the working directory or beside
@@ -31,9 +31,12 @@
 //! `--screenshot` on the island waits for the ground, lands the player and,
 //! with `--gait walk|run|sprint`, runs her forward for three seconds before
 //! taking the picture, printing where she got to. With `--drive` she gets
-//! in the nearest parked vehicle instead and drives it forward.
+//! in the nearest parked vehicle instead and drives it forward; with
+//! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
+//! throws a grenade.
 
 mod camera;
+mod combat;
 mod config;
 mod game;
 mod input;
@@ -80,6 +83,7 @@ struct Options {
     double_sided: bool,
     fly: bool,
     drive: bool,
+    fight: bool,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -133,6 +137,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--drive" => o.drive = true,
+            "--fight" => o.fight = true,
             "--sea" => o.sea = Some(value()?.parse().context("--sea expects metres")?),
             "--screenshot" => o.screenshot = Some(value()?.into()),
             "--write-config" => o.write_config = true,
@@ -271,7 +276,8 @@ fn render(
     game.scene.update(backend, focus)?;
     let mut queue = DrawQueue::new();
     backend.begin_frame(&view)?;
-    game.scene.draw(backend, &mut queue, view.eye())?;
+    game.scene
+        .draw(backend, &mut queue, view.eye(), &game.combat)?;
     queue.flush(&view, backend)?;
     backend.end_frame()?;
     Ok(())
@@ -344,7 +350,9 @@ fn screenshot(
         people.npcs.iter().filter(|n| n.landed).count(),
         started.elapsed().as_secs_f32()
     );
-    if options.drive && game.on_foot && game.scene.player.is_some() {
+    if options.fight && game.on_foot && game.scene.player.is_some() {
+        fight_for_screenshot(&mut backend, &mut game, fov, aspect)?;
+    } else if options.drive && game.on_foot && game.scene.player.is_some() {
         drive_for_screenshot(&mut backend, &mut game, fov, aspect)?;
     } else if game.on_foot && game.scene.player.is_some() {
         let gait = options.gait.unwrap_or(Gait::Idle);
@@ -443,6 +451,144 @@ fn drive_for_screenshot(
             (to - from).length()
         );
     }
+    Ok(())
+}
+
+/// Turns the player's camera so the crosshair is on `target`.
+fn aim_at(game: &mut Game, target: m2_math::glam::Vec3) {
+    let Some(p) = game.scene.player.as_mut() else {
+        return;
+    };
+    // The eye moves as the camera turns: settle in a few steps.
+    for _ in 0..4 {
+        let to = target - p.eye();
+        p.yaw = to.x.atan2(to.z);
+        p.pitch = (to.y / to.length().max(0.01)).asin();
+    }
+}
+
+/// Fights for the screenshot: shoots the nearest soldier, fires a rocket
+/// at the nearest parked vehicle and throws a grenade, printing how it
+/// went, then takes the picture aiming at the soldier.
+fn fight_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    use combat::{Trigger, Weapon};
+    let tick = TICK.as_secs_f32();
+    let here = game.focus();
+    let soldier = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.soldier && n.alive && n.landed)
+        .min_by(|a, b| {
+            a.1.character
+                .position
+                .distance(here)
+                .total_cmp(&b.1.character.position.distance(here))
+        })
+        .map(|(i, _)| i);
+    let fire = |select| Intent {
+        trigger: Trigger {
+            fire: true,
+            aim: true,
+            select,
+            ..Trigger::default()
+        },
+        ..Intent::default()
+    };
+    if let Some(i) = soldier {
+        let at = game.scene.people.npcs[i].character.position;
+        eprintln!(
+            "fight: shooting the soldier at {at:.1} ({:.1} m)",
+            at.distance(here)
+        );
+        for _ in 0..90 {
+            let chest = game.scene.people.npcs[i].chest();
+            aim_at(game, chest);
+            game.step(fire(Some(Weapon::Rifle)), tick);
+        }
+        let n = &game.scene.people.npcs[i];
+        eprintln!("fight: soldier alive {}, hp {:.0}", n.alive, n.hp);
+    } else {
+        eprintln!("fight: no soldier near");
+    }
+    // A rocket at the nearest parked vehicle.
+    let vehicle = game
+        .scene
+        .vehicles
+        .iter()
+        .filter_map(|v| {
+            let id = v.id?;
+            let world = game.scene.world.as_ref()?;
+            Some(
+                world
+                    .physics
+                    .vehicle_transform(id)?
+                    .transform_point3(m2_math::glam::Vec3::Y),
+            )
+        })
+        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)));
+    if let Some(at) = vehicle {
+        aim_at(game, at);
+        game.step(fire(Some(Weapon::Rpg)), tick);
+        for _ in 0..120 {
+            game.step(Intent::default(), tick);
+        }
+        eprintln!(
+            "fight: rocket at {at:.1}; {} wrecked",
+            game.scene.vehicles.iter().filter(|v| v.wrecked).count()
+        );
+    }
+    game.step(
+        Intent {
+            trigger: Trigger {
+                throw: true,
+                select: Some(Weapon::Rifle),
+                ..Trigger::default()
+            },
+            ..Intent::default()
+        },
+        tick,
+    );
+    for _ in 0..200 {
+        game.step(Intent::default(), tick);
+    }
+    let c = &game.combat;
+    let people = &game.scene.people.npcs;
+    eprintln!(
+        "fight: {} hits, {} blasts; player hp {:.0}{}; {} of {} people dead, {} soldiers alert",
+        c.hits,
+        c.blasts,
+        c.hp,
+        if c.down > 0.0 { " (down)" } else { "" },
+        people.iter().filter(|n| !n.alive).count(),
+        people.len(),
+        people.iter().filter(|n| n.alert).count(),
+    );
+    // The picture: aiming, with soldiers firing back.
+    if let Some(i) = soldier {
+        let chest = game.scene.people.npcs[i].chest();
+        aim_at(game, chest + m2_math::glam::Vec3::Y * 0.5);
+    }
+    for _ in 0..20 {
+        game.step(
+            Intent {
+                trigger: Trigger {
+                    aim: true,
+                    ..Trigger::default()
+                },
+                ..Intent::default()
+            },
+            tick,
+        );
+    }
+    render(backend, game, fov, aspect)?;
     Ok(())
 }
 
@@ -616,6 +762,8 @@ impl Running {
         );
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
+        let sounds = self.game.combat.take_sounds();
+        self.audio.play_fight(&sounds);
     }
 }
 
@@ -661,6 +809,21 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Right,
                 ..
             } if !state.mouse_look => state.set_mouse_look(true),
+            // With the mouse captured, the buttons fire and aim.
+            WindowEvent::MouseInput {
+                state: pressed,
+                button,
+                ..
+            } if state.mouse_look && state.focused => {
+                let action = match button {
+                    winit::event::MouseButton::Left => Some(Action::Fire),
+                    winit::event::MouseButton::Right => Some(Action::Aim),
+                    _ => None,
+                };
+                if let Some(a) = action {
+                    state.input.button(a, pressed == ElementState::Pressed);
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(e) = state.frame(&self.config, event_loop) {
                     self.fail(event_loop, e);

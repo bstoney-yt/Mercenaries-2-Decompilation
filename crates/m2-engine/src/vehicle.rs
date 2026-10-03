@@ -45,14 +45,25 @@ pub struct PersonModel {
     pub soldier: bool,
 }
 
-/// The vehicle and person models the archive holds.
+/// The vehicle, person and hand-weapon models the archive holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Catalogue {
     pub vehicles: Vec<CatalogueEntry>,
     /// One model per role, soldiers and civilians; not the player
     /// characters (`pmc_`).
     pub people: Vec<PersonModel>,
+    /// Hand weapons by name (see [`WEAPONS`]): (name, model).
+    pub weapons: Vec<(&'static str, u32)>,
 }
+
+/// Hand weapons found by texture name: the AK-47 everyone carries, the RPG
+/// launcher, its rocket and a frag grenade.
+pub const WEAPONS: [(&str, &str); 4] = [
+    ("ak47", "global_weapon_ak47"),
+    ("rpg", "global_weapon_rpg"),
+    ("rocket", "global_weapon_rpgrocket"),
+    ("grenade", "global_weapon_fraggrenade"),
+];
 
 /// Root node of every human skeleton.
 const HUMAN_ROOT: u32 = 0xcbc1_eb51;
@@ -64,8 +75,8 @@ const SKINNED: u32 = 0x800;
 pub fn catalogue<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<Catalogue, AssetError> {
     let blocks = source.archive().index().blocks().len();
     let mut texture_names: HashMap<u32, String> = HashMap::new();
-    // (model, textures, human)
-    let mut model_textures: Vec<(u32, Vec<u32>, bool)> = Vec::new();
+    // (model, textures, human, small static model's node count)
+    let mut model_textures: Vec<(u32, Vec<u32>, bool, Option<usize>)> = Vec::new();
     for b in 0..blocks {
         let decoded = source.block(b)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -79,6 +90,10 @@ pub fn catalogue<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<Catalogu
                     if let Ok(m) = Model::parse(data) {
                         let human = m.info.flags & SKINNED != 0
                             && m.nodes.first().map(|n| n.name_hash) == Some(HUMAN_ROOT);
+                        let b = &m.info.bounds;
+                        let size = (0..3).map(|a| b.max[a] - b.min[a]).fold(0.0f32, f32::max);
+                        let small = (m.info.flags & SKINNED == 0 && (0.05..1.6).contains(&size))
+                            .then_some(m.nodes.len());
                         model_textures.push((
                             e.name_hash,
                             m.materials
@@ -86,6 +101,7 @@ pub fn catalogue<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<Catalogu
                                 .flat_map(|mt| mt.textures.iter().copied())
                                 .collect(),
                             human,
+                            small,
                         ));
                     }
                 }
@@ -94,7 +110,25 @@ pub fn catalogue<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<Catalogu
         }
     }
     let mut out = Catalogue::default();
-    for (model, textures, human) in model_textures {
+    // Weapons: the small model with the most nodes wearing the weapon's
+    // texture; the launcher wears the rocket's too, so one model per name.
+    for (name, texture) in WEAPONS {
+        let prefix = format!("{texture}_");
+        let found = model_textures
+            .iter()
+            .filter(|m| !out.weapons.iter().any(|w| w.1 == m.0))
+            .filter_map(|m| Some((m, m.3?)))
+            .filter(|(m, _)| {
+                m.1.iter()
+                    .filter_map(|t| texture_names.get(t))
+                    .any(|n| n == texture || n.starts_with(&prefix))
+            })
+            .max_by_key(|&(_, nodes)| nodes);
+        if let Some((m, _)) = found {
+            out.weapons.push((name, m.0));
+        }
+    }
+    for (model, textures, human, _) in model_textures {
         let mut names = textures
             .iter()
             .filter_map(|t| texture_names.get(t).map(String::as_str));

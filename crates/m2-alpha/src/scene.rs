@@ -13,14 +13,15 @@ use m2_engine::{
     Animator, AssetSource, BoundClip, CatalogueEntry, CpuModel, Gait, GpuModel, Install,
     Locomotion, MaterialCache, PersonModel, Skeleton, VehicleId, VehicleSpec, World, WorldSettings,
 };
-use m2_math::glam::{Mat4, Vec3};
+use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
-    BufferUsage, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle, IndexFormat,
-    Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, TextureDesc, TextureFormat,
-    Topology, VertexBufferDesc, VertexBufferHandle, VertexFormat, VertexLayout, VertexSemantic,
-    generate_mips,
+    BlendMode, BufferUsage, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
+    IndexFormat, Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, TextureDesc,
+    TextureFormat, Topology, VertexBufferDesc, VertexBufferHandle, VertexFormat, VertexLayout,
+    VertexSemantic, generate_mips,
 };
 
+use crate::combat::{self, Arsenal, Effect, Weapon};
 use crate::npc::{self, People, PersonKind};
 use crate::player::Player;
 
@@ -164,6 +165,9 @@ pub struct Scene {
     pub vehicles: Vec<ParkedVehicle>,
     /// Soldiers and civilians.
     pub people: People,
+    pub arsenal: Arsenal,
+    /// Mesh and materials for shots, flashes, fire and smoke.
+    effects: Effects,
     vehicle_loads: Option<Receiver<Loaded>>,
 }
 
@@ -173,6 +177,8 @@ pub struct ParkedVehicle {
     pub spec: VehicleSpec,
     pub model: GpuModel,
     pub id: Option<VehicleId>,
+    /// Blown up: can't be driven.
+    pub wrecked: bool,
 }
 
 /// Kinds that don't drive on wheels (or aren't vehicles to sit in).
@@ -204,6 +210,8 @@ const CIVILIAN_MODELS: usize = 6;
 pub enum Loaded {
     Vehicle(VehicleSpec, CpuModel),
     Person(PersonModel, CpuModel, Skeleton),
+    /// A hand weapon: name, model, muzzle (model space).
+    Weapon(&'static str, CpuModel, Vec3),
 }
 
 /// Finds the island's vehicle and person models and decodes the soldiers,
@@ -245,6 +253,25 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                     return Ok(());
                 }
             }
+            for &(name, hash) in &found.weapons {
+                let data = source.model(hash)?;
+                let model = data.parse()?;
+                let muzzle = m2_assets::vehicle::marker(&model, combat::MUZZLE)
+                    .map_or(Vec3::new(0.0, 0.0, model.info.bounds.max[2]), Vec3::from);
+                let cpu = CpuModel::build(hash, &model, 0);
+                if tx.send(Loaded::Weapon(name, cpu, muzzle)).is_err() {
+                    return Ok(());
+                }
+            }
+            eprintln!(
+                "weapons: {}",
+                found
+                    .weapons
+                    .iter()
+                    .map(|(n, h)| format!("{n} {h:08x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             let all = &found.vehicles;
             let drivable: Vec<&CatalogueEntry> = all
                 .iter()
@@ -314,6 +341,7 @@ impl Scene {
     pub fn new(backend: &mut dyn RenderBackend) -> anyhow::Result<Self> {
         let mut materials = MaterialCache::new();
         let ground = ground(backend, &mut materials)?;
+        let effects = Effects::new(backend, &mut materials)?;
         Ok(Self {
             ground,
             world: None,
@@ -324,6 +352,8 @@ impl Scene {
             player: None,
             vehicles: Vec::new(),
             people: People::default(),
+            arsenal: Arsenal::default(),
+            effects,
             vehicle_loads: None,
         })
     }
@@ -428,6 +458,9 @@ impl Scene {
                 None
             }
         };
+        if let Some((_, rig)) = &model {
+            self.people.clips = npc::FightClips::find(rig);
+        }
         self.player = Some(Player::new(x, z, 0.0, model));
         self.vehicle_loads = Some(load_cast(install.clone()));
         Ok(())
@@ -443,7 +476,9 @@ impl Scene {
             match rx.try_recv() {
                 Ok(loaded) => {
                     let cpu = match &loaded {
-                        Loaded::Vehicle(_, cpu) | Loaded::Person(_, cpu, _) => cpu,
+                        Loaded::Vehicle(_, cpu)
+                        | Loaded::Person(_, cpu, _)
+                        | Loaded::Weapon(_, cpu, _) => cpu,
                     };
                     self.materials.load_textures(
                         backend,
@@ -456,7 +491,16 @@ impl Scene {
                             spec,
                             model,
                             id: None,
+                            wrecked: false,
                         }),
+                        Loaded::Weapon(name, _, muzzle) => {
+                            let rig = self
+                                .player
+                                .as_ref()
+                                .and_then(|pl| pl.model.as_ref())
+                                .map(|(_, rig)| rig);
+                            self.arsenal.add(name, model, muzzle, rig);
+                        }
                         Loaded::Person(p, _, skeleton) => {
                             // Her clips fit every human skeleton.
                             let template = self
@@ -465,7 +509,7 @@ impl Scene {
                                 .and_then(|pl| pl.model.as_ref())
                                 .and_then(|(_, rig)| rig.for_skeleton(skeleton));
                             match template {
-                                Some(rig) => self.people.kinds.push(PersonKind {
+                                Some(rig) => self.people.add_kind(PersonKind {
                                     role: p.role,
                                     soldier: p.soldier,
                                     model,
@@ -510,6 +554,7 @@ impl Scene {
         backend: &mut dyn RenderBackend,
         queue: &mut DrawQueue,
         eye: Vec3,
+        fight: &combat::Combat,
     ) -> anyhow::Result<()> {
         if let Some(world) = &mut self.world {
             world.draw(queue, eye);
@@ -532,7 +577,18 @@ impl Scene {
             && let Some((model, rig)) = &player.model
         {
             let (nodes, skin) = rig.posed();
-            model.draw_posed(backend, queue, player.model_matrix(), &nodes, &skin)?;
+            let body = player.model_matrix();
+            model.draw_posed(backend, queue, body, &nodes, &skin)?;
+            let weapon = match fight.weapon {
+                Weapon::Rifle => &self.arsenal.rifle,
+                Weapon::Rpg => &self.arsenal.rpg,
+            };
+            if !player.down
+                && let Some(w) = weapon
+                && let Some(at) = self.arsenal.in_hand(w, body, &nodes)
+            {
+                w.model.draw(queue, at);
+            }
         }
         for n in &self.people.npcs {
             if !n.landed || n.character.position.distance(eye) > npc::DRAW_DISTANCE {
@@ -540,7 +596,35 @@ impl Scene {
             }
             let (nodes, skin) = n.rig.posed();
             let model = &self.people.kinds[n.kind].model;
-            model.draw_posed(backend, queue, n.model_matrix(), &nodes, &skin)?;
+            let body = n.model_matrix();
+            model.draw_posed(backend, queue, body, &nodes, &skin)?;
+            if n.soldier
+                && n.alive
+                && let Some(w) = &self.arsenal.rifle
+                && let Some(at) = self.arsenal.in_hand(w, body, &nodes)
+            {
+                w.model.draw(queue, at);
+            }
+        }
+        for (rocket, at, velocity) in fight.projectiles() {
+            let model = if rocket {
+                &self.arsenal.rocket
+            } else {
+                &self.arsenal.grenade
+            };
+            if let Some(w) = model {
+                // The rocket's nose (its muzzle marker) along its flight.
+                let turn = Quat::from_rotation_arc(
+                    w.muzzle.normalize_or(Vec3::Z),
+                    velocity.normalize_or(Vec3::Z),
+                );
+                let spin = if rocket { turn } else { Quat::IDENTITY };
+                w.model
+                    .draw(queue, Mat4::from_rotation_translation(spin, at));
+            }
+        }
+        for &(effect, left, life) in &fight.effects {
+            self.effects.draw(queue, effect, 1.0 - left / life);
         }
         for p in &self.models {
             match &p.rig {
@@ -579,6 +663,146 @@ impl Scene {
 }
 
 /// A 2 km square at height 0 with a grid texture.
+/// A small round mesh (an octahedron) and the materials shots, flashes,
+/// fire and smoke are drawn with, stretched and scaled per effect.
+#[derive(Debug)]
+struct Effects {
+    mesh: (VertexBufferHandle, IndexBufferHandle),
+    /// Tracer and flash, fire, smoke.
+    light: MaterialId,
+    fire: MaterialId,
+    smoke: MaterialId,
+}
+
+impl Effects {
+    fn new(backend: &mut dyn RenderBackend, materials: &mut MaterialCache) -> anyhow::Result<Self> {
+        use VertexFormat::*;
+        use VertexSemantic::*;
+        let layout = VertexLayout::packed(&[(Position, Float3), (Normal, Float3)])?;
+        let points = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+        let vertices: Vec<u8> = points
+            .iter()
+            .flat_map(|p| [p.x, p.y, p.z, p.x, p.y, p.z])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let vb = backend.create_vertex_buffer(
+            &VertexBufferDesc {
+                layout,
+                vertex_count: points.len() as u32,
+                usage: BufferUsage::Static,
+            },
+            Some(&vertices),
+        )?;
+        let faces: [[u16; 3]; 8] = [
+            [0, 2, 4],
+            [2, 1, 4],
+            [1, 3, 4],
+            [3, 0, 4],
+            [2, 0, 5],
+            [1, 2, 5],
+            [3, 1, 5],
+            [0, 3, 5],
+        ];
+        let indices: Vec<u8> = faces
+            .iter()
+            .flatten()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let ib = backend.create_index_buffer(
+            &IndexBufferDesc {
+                format: IndexFormat::U16,
+                index_count: 24,
+                usage: BufferUsage::Static,
+            },
+            Some(&indices),
+        )?;
+        let mut define = |color: [f32; 4], lit: bool, blend: BlendMode| {
+            materials.define(
+                backend,
+                &MaterialDesc {
+                    color,
+                    lit,
+                    blend,
+                    double_sided: true,
+                    ..MaterialDesc::default()
+                },
+            )
+        };
+        Ok(Self {
+            mesh: (vb, ib),
+            light: define([1.0, 0.85, 0.45, 1.0], false, BlendMode::Opaque)?,
+            fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
+            smoke: define([0.35, 0.35, 0.35, 0.5], true, BlendMode::Translucent)?,
+        })
+    }
+
+    /// Queues `effect`, `age` of the way (0 to 1) through its life.
+    fn draw(&self, queue: &mut DrawQueue, effect: Effect, age: f32) {
+        let (world, material, translucent) = match effect {
+            Effect::Tracer { from, to } => {
+                let along = to - from;
+                let len = along.length();
+                if len < 0.01 {
+                    return;
+                }
+                let turn = Quat::from_rotation_arc(Vec3::Z, along / len);
+                (
+                    Mat4::from_scale_rotation_translation(
+                        Vec3::new(0.02, 0.02, len * 0.5),
+                        turn,
+                        (from + to) * 0.5,
+                    ),
+                    self.light,
+                    false,
+                )
+            }
+            Effect::Flash { at } => (
+                Mat4::from_scale_rotation_translation(Vec3::splat(0.12), Quat::IDENTITY, at),
+                self.light,
+                false,
+            ),
+            Effect::Fire { at, size } => (
+                Mat4::from_scale_rotation_translation(
+                    Vec3::splat(size * (0.4 + age)),
+                    Quat::IDENTITY,
+                    at,
+                ),
+                self.fire,
+                true,
+            ),
+            Effect::Smoke { at, size } => (
+                Mat4::from_scale_rotation_translation(
+                    Vec3::splat(size * (0.5 + age)),
+                    Quat::IDENTITY,
+                    at + Vec3::Y * (age * size * 1.5),
+                ),
+                self.smoke,
+                true,
+            ),
+        };
+        let (vb, ib) = self.mesh;
+        queue.push(Primitive {
+            call: DrawCall {
+                material,
+                topology: Topology::TriangleList,
+                vertex_buffer: vb,
+                geometry: Geometry::Indexed {
+                    buffer: ib,
+                    first: 0,
+                    count: 24,
+                    base_vertex: 0,
+                },
+                world,
+                skin: None,
+            },
+            layer: Layer::WORLD,
+            translucent,
+            sort_origin: world.transform_point3(Vec3::ZERO),
+            user: 0,
+        });
+    }
+}
+
 fn ground(
     backend: &mut dyn RenderBackend,
     materials: &mut MaterialCache,
@@ -664,7 +888,14 @@ mod tests {
         let mut queue = DrawQueue::new();
         let view = m2_render::View::default();
         backend.begin_frame(&view).unwrap();
-        scene.draw(&mut backend, &mut queue, Vec3::ZERO).unwrap();
+        scene
+            .draw(
+                &mut backend,
+                &mut queue,
+                Vec3::ZERO,
+                &crate::combat::Combat::default(),
+            )
+            .unwrap();
         queue.assign_keys(&view);
         queue.sort().unwrap();
         assert_eq!(queue.submit(&mut backend).unwrap().draws, 1);

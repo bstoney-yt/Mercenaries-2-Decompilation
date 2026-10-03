@@ -466,6 +466,16 @@ impl Physics {
         }
     }
 
+    /// Shoves a vehicle: `impulse` (kg m/s) applied at world point `at`.
+    pub fn push_vehicle(&mut self, id: VehicleId, impulse: Vec3, at: Vec3) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.apply_impulse_at_point(vector(impulse), vector(at), true);
+        }
+    }
+
     /// The first static surface along a ray: (distance, normal).
     pub fn cast_ray(&self, origin: Vec3, direction: Vec3, max: f32) -> Option<(f32, Vec3)> {
         let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
