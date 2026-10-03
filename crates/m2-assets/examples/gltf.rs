@@ -93,7 +93,11 @@
 //! way the game's two-handed rifle clip holds it; click or hold F to fire,
 //! hold the right button to aim. Soldiers that hear gunfire shoot back,
 //! civilians run, and the hit and fall reactions use the game's clips. The
-//! combat rules (damage, accuracy, fire rates, health) are invented.
+//! combat rules (damage, accuracy, fire rates, health) are invented. 1 and 2
+//! switch between the rifle and the RPG (the game's launcher and rocket
+//! models), G throws a grenade; blasts throw people with the game's
+//! knock-back fall clip and wreck vehicles. The blast's look and numbers
+//! are invented.
 //!
 //! `sounds` writes the game's sound banks the viewer uses (the rifle,
 //! vehicle engines, town and jungle ambience) as WAV files, with
@@ -1038,7 +1042,8 @@ fn export_npcs<R: Read + Seek>(
                 MODEL_TYPE if e.unk_0x08 == 0 => {
                     let Ok(m) = Model::parse(data) else { continue };
                     let b = &m.info.bounds;
-                    if m.info.flags & 0x800 == 0 && (0.5..1.5).contains(&(b.max[2] - b.min[2])) {
+                    let size = (0..3).map(|a| b.max[a] - b.min[a]).fold(0.0f32, f32::max);
+                    if m.info.flags & 0x800 == 0 && (0.05..1.6).contains(&size) {
                         weapons.push((
                             e.name_hash,
                             m.materials
@@ -1158,18 +1163,29 @@ fn export_npcs<R: Read + Seek>(
             r#"{{"file":"{file}","name":"{role}","soldier":{soldier}}}"#
         ));
     }
-    // A rifle for everyone: the AK-47 (texture global_weapon_ak47), with
-    // its muzzle marker (node b1486ef3; the grip is the model's origin).
+    // Weapons, by texture name: the AK-47 everyone carries, the RPG
+    // launcher, its rocket and a frag grenade; with the muzzle marker (node
+    // b1486ef3; the grip is the model's origin) where there is one.
     let mut weapons_json = Vec::new();
-    let rifle = weapons
-        .iter()
-        .filter(|w| {
-            w.1.iter()
-                .filter_map(|t| texture_names.get(t))
-                .any(|n| n.starts_with("global_weapon_ak47"))
-        })
-        .max_by_key(|w| w.2);
-    if let Some(&(hash, _, _)) = rifle {
+    let mut weapons_used = Vec::new();
+    for (name, texture) in [
+        ("ak47", "global_weapon_ak47"),
+        ("rpg", "global_weapon_rpg"),
+        ("rocket", "global_weapon_rpgrocket"),
+        ("grenade", "global_weapon_fraggrenade"),
+    ] {
+        // The launcher carries the rocket's texture too: one model per name.
+        let found = weapons
+            .iter()
+            .filter(|w| !weapons_used.contains(&w.0))
+            .filter(|w| {
+                w.1.iter()
+                    .filter_map(|t| texture_names.get(t))
+                    .any(|n| n == texture || n.starts_with(&format!("{texture}_")))
+            })
+            .max_by_key(|w| w.2);
+        let Some(&(hash, _, _)) = found else { continue };
+        weapons_used.push(hash);
         let (base, chunks) = load_model(wad, hash)?;
         let mut model = Model::parse(&base)?;
         for c in &chunks {
@@ -1192,7 +1208,7 @@ fn export_npcs<R: Read + Seek>(
         let file = format!("wpn_{hash:08x}.glb");
         std::fs::write(std::path::Path::new(dir).join(&file), glb)?;
         weapons_json.push(format!(
-            r#"{{"file":"{file}","name":"ak47","muzzle":{:?}}}"#,
+            r#"{{"file":"{file}","name":"{name}","muzzle":{:?}}}"#,
             flip_v(muzzle)
         ));
     }
@@ -1244,9 +1260,9 @@ fn export_npcs<R: Read + Seek>(
     Ok(())
 }
 
-/// Sound banks the viewer uses, by block name: the rifle, vehicle engines
-/// and town ambience.
-const SOUND_BANKS: [&str; 10] = [
+/// Sound banks the viewer uses, by block name: the rifle, vehicle engines,
+/// town ambience, the RPG and explosions.
+const SOUND_BANKS: [&str; 13] = [
     "wpn_assaultrifle",
     "veh_4cylindernew",
     "veh_jeep",
@@ -1257,6 +1273,9 @@ const SOUND_BANKS: [&str; 10] = [
     "veh_helicoptermedium",
     "amb_citymed",
     "amb_jungle",
+    "wpn_rpg",
+    "bulding_destruct",
+    "support_artillery",
 ];
 
 /// Writes the sounds of `SOUND_BANKS` as WAV files and `sounds.json`
