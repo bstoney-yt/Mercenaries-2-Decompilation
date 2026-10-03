@@ -58,8 +58,20 @@
 //! per track at the mask index, `f32` static values, then per dynamic value
 //! (a *DOF*) an `f32` offset, an `f32` scale and a `u8` bit width, then the
 //! quantized blocks. Each mask splits into a 2-bit type per group (bits 0-1
-//! translation, 2-3 rotation, 4-5 scale) and a dynamic flag per component
-//! (bit `6 + k` for the track's value `k`):
+//! translation, 2-3 rotation, 4-5 scale) and a dynamic flag per component.
+//! Each group's flags start where its values do (bit `6 + first`) but run in
+//! reverse component order:
+//!
+//! ```text
+//! bits  6-8    translation z, y, x
+//! bits  9-12   rotation w, z, y, x
+//! bits 13-15   scale z, y, x
+//! ```
+//!
+//! The reversal is invisible to counting checks and to quaternion lengths;
+//! it was found by skinning a model with every clip that fits it, which
+//! matches the uncompressed clips only with the flags read this way.
+//! Group types:
 //!
 //! ```text
 //! type 0  per component: dynamic if its flag is set, otherwise static
@@ -175,6 +187,18 @@ const INTERLEAVED_LEN: usize = 48;
 /// Track value index where each group starts, and its identity value.
 const GROUPS: [(usize, usize); 3] = [(0, 3), (3, 4), (7, 3)];
 const IDENTITY: [f32; DOFS] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+
+/// The static mask bit flagging track value `k` as dynamic. Each group's
+/// flags start at bit `6 + first` but run in reverse component order, so
+/// rotation `w` is bit 9 and `x` bit 12.
+fn dynamic_bit(k: usize) -> u16 {
+    let (first, len) = GROUPS
+        .iter()
+        .copied()
+        .find(|&(first, len)| (first..first + len).contains(&k))
+        .unwrap_or((k, 1));
+    1 << (6 + first + (first + len - 1 - k))
+}
 
 /// How a clip's keys are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -775,7 +799,7 @@ impl Compressed<'_> {
             for (g, &(first, len)) in GROUPS.iter().enumerate() {
                 let ty = (mask >> (2 * g)) & 3;
                 for k in first..first + len {
-                    let dynamic_flag = mask & (1 << (6 + k)) != 0;
+                    let dynamic_flag = mask & dynamic_bit(k) != 0;
                     src[k] = match ty {
                         0 if dynamic_flag => {
                             dynamic += 1;
@@ -1177,7 +1201,7 @@ mod tests {
                     let ty = (mask >> (2 * g)) & 3;
                     for k in first..first + len {
                         match ty {
-                            0 if mask & (1 << (6 + k)) != 0 => dynamic
+                            0 if mask & dynamic_bit(k) != 0 => dynamic
                                 .push(self.values[t].iter().map(|f| f[k]).collect::<Vec<_>>()),
                             0 | 1 => {
                                 let m = self.markers.iter().find(|m| m.0 == t && m.1 == k);
@@ -1442,7 +1466,7 @@ mod tests {
         // Track 0: translation x, z and the whole rotation dynamic; scale
         // static. Track 1: translation static, rotation y dynamic with w
         // as a marker, scale static. Track 2: identity.
-        let dyn_bits = |ks: &[usize]| ks.iter().fold(0u16, |m, k| m | 1 << (6 + k));
+        let dyn_bits = |ks: &[usize]| ks.iter().fold(0u16, |m, &k| m | dynamic_bit(k));
         Source {
             masks: vec![
                 dyn_bits(&[0, 2, 3, 4, 5, 6]) | 1 << 4,
@@ -1487,6 +1511,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dynamic_flags_run_in_reverse_component_order() {
+        // Literal bits, so the round trips below cannot pass with encoder
+        // and decoder agreeing on a wrong layout.
+        let bits: Vec<u16> = (0..DOFS).map(dynamic_bit).collect();
+        assert_eq!(
+            bits,
+            [8, 7, 6, 12, 11, 10, 9, 15, 14, 13].map(|b| 1u16 << b)
+        );
+        // Track 0: translation x and z (bits 8, 6) and all of the rotation
+        // dynamic, scale static. Track 1: rotation y (bit 11) dynamic.
+        let src = source(4);
+        assert_eq!(src.masks[0], 1 << 8 | 1 << 6 | 0xF << 9 | 1 << 4);
+        assert_eq!(src.masks[1], 1 | 1 << 11 | 1 << 4);
     }
 
     #[test]
