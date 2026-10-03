@@ -21,6 +21,7 @@ use m2_render::{
     VertexSemantic, generate_mips,
 };
 
+use crate::cache;
 use crate::combat::{self, Arsenal, Effect, Weapon};
 use crate::npc::{self, People, PersonKind};
 use crate::player::Player;
@@ -263,7 +264,21 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
         let started = std::time::Instant::now();
         let result = (|| -> anyhow::Result<()> {
             let mut source = install.open_world()?;
-            let found = catalogue(&mut source)?;
+            // The search reads the whole archive, so its result is kept.
+            let stamp = cache::stamp(&install.world_archive());
+            let path = cache::default_path();
+            let found = match stamp.and_then(|s| cache::read(&path, s)) {
+                Some(found) => found,
+                None => {
+                    let found = catalogue(&mut source)?;
+                    if let Some(s) = stamp
+                        && let Err(e) = cache::write(&path, s, &found)
+                    {
+                        eprintln!("could not keep the catalogue in {}: {e}", path.display());
+                    }
+                    found
+                }
+            };
             let people: Vec<&PersonModel> = found
                 .people
                 .iter()
