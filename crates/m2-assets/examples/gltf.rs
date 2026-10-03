@@ -115,7 +115,12 @@
 //! recorded ambience: the server reads their indexes from `vz.wad` (see
 //! `m2_assets::sound::StreamIndex`) and decodes a track from
 //! `Audios/music.pws` or `ambience.pws` when the page asks for it; nothing
-//! is written to disk.
+//! is written to disk. With `English.wad` beside `vz.wad` it also lists the
+//! 27 resident voice sets (`m2_assets::voice`) and decodes their lines from
+//! `vo_stream.english.pws`, so soldiers and civilians shout in Play mode.
+//! Which set is the VZ army is named only by hash, so the page picks the
+//! soldiers' and civilians' sets by ear (Voices panel); the defaults were
+//! checked by ear, and the moments they shout are invented.
 //!
 //! The engine is left-handed; the export mirrors Z to suit glTF. Exported
 //! files hold game data: keep them out of the repository (`dumps/` and
@@ -934,12 +939,59 @@ fn export<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32, o: &Options) -> An
     Ok(g.glb(json))
 }
 
-/// The streamed music and ambience of an installation: the index banks
-/// (see `m2_assets::sound::StreamIndex`) and where the `.pws` files are.
+/// The streamed music, ambience and voices of an installation: the index
+/// banks (see `m2_assets::sound::StreamIndex`) and where the `.pws` files are.
 struct Streams {
     dir: std::path::PathBuf,
     music: m2_assets::StreamIndex,
     ambience: m2_assets::StreamIndex,
+    voice: Option<Voices>,
+}
+
+/// The voice stream (from `English.wad`) and the resident voice sets' cue
+/// tables (see `m2_assets::voice`).
+struct Voices {
+    index: m2_assets::StreamIndex,
+    /// On disk the index's `vo_stream.pws` carries the language:
+    /// `vo_stream.english.pws`.
+    file: String,
+    sets: Vec<m2_assets::CueTable>,
+}
+
+/// Reads the voice stream index and the `vo_resident` cue tables.
+fn load_voices(wad_path: &std::path::Path) -> AnyResult<Voices> {
+    use m2_assets::sound::SOUND_BANK_TYPE;
+    use m2_assets::voice::CUE_TABLE_TYPE;
+    let mut wad = open(&wad_path.to_string_lossy())?;
+    let (mut index, mut sets) = (None, Vec::new());
+    for block in 0..wad.index().blocks().len() {
+        let path = wad.index().blocks()[block].path.clone();
+        let resident = path.contains("vo_resident");
+        if !resident && !path.contains("\\resident_P") {
+            continue;
+        }
+        let decoded = wad.read_block(block)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            match e.type_hash {
+                SOUND_BANK_TYPE => {
+                    if let Ok(i) = m2_assets::StreamIndex::parse(data)
+                        && i.file.starts_with("vo_stream")
+                    {
+                        index = Some(i);
+                    }
+                }
+                CUE_TABLE_TYPE if resident => sets.push(m2_assets::CueTable::parse(data)?),
+                _ => {}
+            }
+        }
+    }
+    let index = index.ok_or("no voice stream index")?;
+    let language = wad_path
+        .file_stem()
+        .map_or("english".into(), |s| s.to_string_lossy().to_lowercase());
+    let file = index.file.replace(".pws", &format!(".{language}.pws"));
+    sets.sort_by_key(|t| t.hash);
+    Ok(Voices { index, file, sets })
 }
 
 /// Reads the music and ambience indexes from the install's `vz.wad`.
@@ -968,23 +1020,30 @@ fn load_streams(data_dir: &str) -> AnyResult<Streams> {
             }
         }
     }
+    let english = dir.join("English.wad");
+    let voice = english
+        .exists()
+        .then(|| load_voices(&english))
+        .transpose()?;
     Ok(Streams {
         dir: dir.join("Audios"),
         music: music.ok_or("no music index in vz.wad")?,
         ambience: ambience.ok_or("no ambience index in vz.wad")?,
+        voice,
     })
 }
 
-/// Decodes stream `i` of `music` or `ambience` to a WAV file.
+/// Decodes stream `i` of `music`, `ambience` or `voice` to a WAV file.
 fn stream_wav(s: &Streams, which: &str, i: usize) -> Option<Vec<u8>> {
     use std::io::SeekFrom;
-    let idx = match which {
-        "music" => &s.music,
-        "ambience" => &s.ambience,
+    let (idx, file) = match which {
+        "music" => (&s.music, &s.music.file),
+        "ambience" => (&s.ambience, &s.ambience.file),
+        "voice" => s.voice.as_ref().map(|v| (&v.index, &v.file))?,
         _ => return None,
     };
     let t = idx.streams.get(i)?;
-    let mut f = File::open(s.dir.join(&idx.file)).ok()?;
+    let mut f = File::open(s.dir.join(file)).ok()?;
     f.seek(SeekFrom::Start(u64::from(t.offset))).ok()?;
     let mut buf = vec![0u8; t.encoded_len as usize];
     f.read_exact(&mut buf).ok()?;
@@ -1006,9 +1065,11 @@ fn view(
     let streams = streams.map(load_streams).transpose()?;
     if let Some(s) = &streams {
         println!(
-            "streaming {} music tracks and {} ambience recordings from {}",
+            "streaming {} music tracks, {} ambience recordings and {} voice lines in {} voice sets from {}",
             s.music.streams.len(),
             s.ambience.streams.len(),
+            s.voice.as_ref().map_or(0, |v| v.index.streams.len()),
+            s.voice.as_ref().map_or(0, |v| v.sets.len()),
             s.dir.display()
         );
     }
@@ -1065,9 +1126,39 @@ fn view(
                         .collect::<Vec<_>>()
                         .join(",")
                 };
+                // Each voice set's positional lines: [stream, seconds,
+                // fade-from and silent-beyond distances].
+                let voices = s.voice.as_ref().map_or(String::new(), |v| {
+                    v.sets
+                        .iter()
+                        .map(|t| {
+                            let lines: Vec<String> = t
+                                .lines
+                                .iter()
+                                .filter(|l| l.is_positional())
+                                .filter_map(|l| {
+                                    let st = v.index.streams.get(l.stream as usize)?;
+                                    Some(format!(
+                                        "[{},{:.1},{},{}]",
+                                        l.stream,
+                                        st.seconds(),
+                                        l.min_distance,
+                                        l.max_distance
+                                    ))
+                                })
+                                .collect();
+                            format!(
+                                r#"{{"set":"{:08x}","lines":[{}]}}"#,
+                                t.hash,
+                                lines.join(",")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                });
                 return Some(
                     format!(
-                        r#"{{"music":[{}],"ambience":[{}]}}"#,
+                        r#"{{"music":[{}],"ambience":[{}],"voices":[{voices}]}}"#,
                         secs(&s.music),
                         secs(&s.ambience)
                     )
