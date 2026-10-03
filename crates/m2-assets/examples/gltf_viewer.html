@@ -61,7 +61,7 @@
       <div class="row" style="margin-top:0"><select id="vsoldier"></select><button id="vsoldierplay">▶</button></div>
       <label for="vcivilian">Civilian voice</label>
       <div class="row" style="margin-top:0"><select id="vcivilian"></select><button id="vcivilianplay">▶</button></div>
-      <div style="color:var(--muted)">The game names its 27 voice sets only by hash, so which is the VZ army is picked by ear here; the defaults are guesses.</div>
+      <div style="color:var(--muted)">The game names its 27 voice sets only by hash, so which is the VZ army is picked by ear here; the defaults were checked by ear.</div>
     </div>
   </div>
   <div style="color:var(--muted);margin-top:8px">Drag a .glb onto the page to open another.</div>
@@ -1815,8 +1815,10 @@ function toggleMusic() {
 // where the speaker stands, fading from the distance the table gives (most
 // 10 m) and silent beyond its cut-off (125 m). Which set is which character
 // is named only by hash, so the panel plays samples and picks the set
-// soldiers and civilians use, kept in this browser; the defaults are
-// GUESSES. When a soldier turns alert or is hit, and now and then in a
+// soldiers and civilians use, kept in this browser. The defaults were picked
+// blind, then checked by ear (the soldier set sounds like soldiers, most of
+// the civilian set like civilians), not from the game's data; music and
+// ambience dip while a voice plays. When a soldier turns alert or is hit, and now and then in a
 // fight, he shouts a random line of 0.5-3 s from his set; a civilian shouts
 // when running away. The triggers and timing are invented, not the game's.
 const voices = { sets: null, picked: { soldier: '6cffc547', civilian: 'cf4f8b9c' }, speaking: 0 };
@@ -1865,7 +1867,20 @@ async function shout(role, pos) {
   });
   src.connect(pan).connect(audio.ctx.destination);
   src.start();
+  duckMusic(secs);
   return true;
+}
+
+// Music and ambience dip while someone shouts, so the voice is heard.
+function duckMusic(secs) {
+  voices.ducks = (voices.ducks || 0) + 1;
+  if (music.track) music.track.volume = 0.1;
+  if (music.ambience) music.ambience.volume = 0.08;
+  setTimeout(() => {
+    if (--voices.ducks > 0) return;
+    if (music.track) music.track.volume = 0.3;
+    if (music.ambience) music.ambience.volume = 0.25;
+  }, secs * 1000 + 400);
 }
 
 function sample(role) {
