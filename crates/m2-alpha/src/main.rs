@@ -931,6 +931,23 @@ fn fight_for_screenshot(
             tick,
         );
     }
+    // How far the aim clip alone points off the crosshair, and what is
+    // left once the pose is turned to it.
+    if let Some((_, rig)) = game.scene.player.as_ref().and_then(|p| p.model.as_ref())
+        && let Some(want) = rig.aim
+    {
+        let pose = rig.animator.pose(&rig.skeleton, &rig.clips);
+        let off = rig.aim_error(&pose, want);
+        let left = rig.aimed_pose().and_then(|p| rig.aim_error(&p, want));
+        let deg = |e: Option<(f32, f32)>| {
+            e.map(|(y, p)| format!("yaw {:.0} pitch {:.0}", y.to_degrees(), p.to_degrees()))
+        };
+        eprintln!(
+            "aim: clip off by {:?}, turned off by {:?}",
+            deg(off),
+            deg(left)
+        );
+    }
     render(backend, game, fov, aspect, None)?;
     Ok(())
 }

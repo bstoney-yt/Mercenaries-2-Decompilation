@@ -216,6 +216,7 @@ impl Player {
         }
 
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        let look = self.camera_forward();
         if let Some((_, rig)) = &mut self.model {
             let gait = if moved < 0.3 {
                 Gait::Idle
@@ -253,6 +254,7 @@ impl Player {
             } else {
                 rig.hold_rifle(gait, &self.clips, carry);
             }
+            rig.aim_along(self.facing, self.aiming.then_some(look));
             // Play the clip at the speed she actually moves, so feet don't
             // slide (within reason: against a wall the legs keep going).
             let rate = match rig.gait_speed(gait) {

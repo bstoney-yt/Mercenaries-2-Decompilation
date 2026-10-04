@@ -245,6 +245,7 @@ impl Npc {
         physics.move_character(&mut self.character, Vec3::ZERO, None, dt);
         let off = self.turn_to(to.x.atan2(to.z), dt);
         self.rig.hold_rifle(Gait::Idle, &clips, Carry::Aim);
+        self.rig.aim_along(self.facing, Some(threat - self.chest()));
         self.cooldown -= dt;
         if self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
             self.fires = true;
@@ -714,6 +715,7 @@ pub(crate) mod tests {
             gait: Gait::Idle,
             upper: None,
             two_handed: false,
+            aim: None,
         }
     }
 

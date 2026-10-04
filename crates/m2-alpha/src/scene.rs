@@ -12,7 +12,7 @@ use m2_engine::anim::load_clips;
 use m2_engine::vehicle::{DRIVABLE, catalogue};
 use m2_engine::{
     Animator, AssetSource, BoundClip, Catalogue, CatalogueEntry, CpuModel, Frustum, Gait, GpuModel,
-    Install, Locomotion, MaterialCache, PersonModel, Skeleton, VehicleId, VehicleSpec, World,
+    Install, Locomotion, MaterialCache, PersonModel, Pose, Skeleton, VehicleId, VehicleSpec, World,
     WorldSettings,
 };
 use m2_math::glam::{Mat4, Quat, Vec3};
@@ -61,6 +61,9 @@ pub struct Rig {
     pub upper: Option<Arc<[bool]>>,
     /// The pose holds a rifle in both hands (aiming, or at the ready).
     pub two_handed: bool,
+    /// Where an aimed rifle should point, model space: the pose is turned
+    /// so the barrel (right hand to left) lies along it.
+    pub aim: Option<Vec3>,
 }
 
 /// How a rifle is held.
@@ -159,6 +162,7 @@ impl Rig {
         Some(Self {
             upper: crate::combat::upper_body(&skeleton),
             two_handed: false,
+            aim: None,
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion: Some(Locomotion {
@@ -175,6 +179,7 @@ impl Rig {
         let mut rig = Self {
             upper: crate::combat::upper_body(&skeleton),
             two_handed: false,
+            aim: None,
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion,
@@ -214,7 +219,94 @@ impl Rig {
         }
         let upper = upper.zip(self.upper.clone());
         self.two_handed = whole.is_some() || upper.is_some();
+        if carry != Carry::Aim {
+            self.aim = None;
+        }
         self.animator.set_upper(upper);
+    }
+
+    /// The pose turned to aim along [`Rig::aim`], when aiming.
+    pub fn aimed_pose(&self) -> Option<Pose> {
+        let want = self.aim.filter(|_| self.two_handed)?;
+        let mut pose = self.animator.pose(&self.skeleton, &self.clips);
+        self.point(&mut pose, want);
+        Some(pose)
+    }
+
+    /// Aims along `dir` (world space) for a body turned to `facing`, or
+    /// stops aiming (`None`).
+    pub fn aim_along(&mut self, facing: f32, dir: Option<Vec3>) {
+        let forward = self
+            .locomotion
+            .as_ref()
+            .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
+        let turn = Quat::from_rotation_y(facing - forward.x.atan2(forward.y));
+        self.aim = dir.map(|d| turn.inverse() * d);
+    }
+
+    /// How far the rifle in an aiming pose points off `want` (model
+    /// space): (yaw, pitch) radians to turn it by, the barrel taken as the
+    /// line from the right hand to the left.
+    pub fn aim_error(&self, pose: &Pose, want: Vec3) -> Option<(f32, f32)> {
+        let (rh, lh) = crate::combat::hands(&self.skeleton)?;
+        let nodes = self.skeleton.model_matrices(pose);
+        let barrel = (nodes[lh].w_axis - nodes[rh].w_axis).truncate();
+        let (b, w) = (barrel.normalize_or_zero(), want.normalize_or_zero());
+        if b == Vec3::ZERO || w == Vec3::ZERO {
+            return None;
+        }
+        let yaw = |v: Vec3| v.x.atan2(v.z);
+        let mut turn = (yaw(w) - yaw(b)).rem_euclid(std::f32::consts::TAU);
+        if turn > std::f32::consts::PI {
+            turn -= std::f32::consts::TAU;
+        }
+        Some((
+            turn,
+            w.y.clamp(-1.0, 1.0).asin() - b.y.clamp(-1.0, 1.0).asin(),
+        ))
+    }
+
+    /// Turns an aiming pose so the rifle points along `want` (model
+    /// space): standing, the whole body turns to it (the aim clip stands
+    /// side-on to the target); over moving legs, the upper body twists at
+    /// the waist (within reason). The barrel's rise or drop is made up at
+    /// the waist either way.
+    fn point(&self, pose: &mut Pose, want: Vec3) {
+        let Some((yaw, _)) = self.aim_error(pose, want) else {
+            return;
+        };
+        let root = self.skeleton.root();
+        let waist = self.upper.as_ref().and_then(|mask| {
+            (0..mask.len()).find(|&n| mask[n] && self.skeleton.parents[n].is_none_or(|p| !mask[p]))
+        });
+        let turn_at = |pose: &mut Pose, node: usize, by: Quat| {
+            // The node's turn in model space, made local to its parent.
+            let nodes = self.skeleton.model_matrices(pose);
+            let parent = self.skeleton.parents[node].map_or(Quat::IDENTITY, |p| {
+                nodes[p].to_scale_rotation_translation().1
+            });
+            let local = &mut pose.0[node];
+            local.rotation = (parent.inverse() * by * parent * local.rotation).normalize();
+        };
+        if self.animator.upper().is_none() {
+            let local = &mut pose.0[root];
+            let by = Quat::from_rotation_y(yaw);
+            local.rotation = (by * local.rotation).normalize();
+            local.translation = by * local.translation;
+        } else if let Some(w) = waist {
+            turn_at(
+                pose,
+                w,
+                Quat::from_rotation_y(yaw.clamp(-MAX_TWIST, MAX_TWIST)),
+            );
+        }
+        let Some(((_, pitch), w)) = self.aim_error(pose, want).zip(waist) else {
+            return;
+        };
+        let level = want.with_y(0.0).normalize_or(Vec3::Z);
+        let axis = level.cross(Vec3::Y);
+        let pitch = pitch.clamp(-MAX_BEND, MAX_BEND);
+        turn_at(pose, w, Quat::from_axis_angle(axis, pitch));
     }
 
     /// The next gait, slowest after fastest.
@@ -229,7 +321,9 @@ impl Rig {
 
     /// Posed node matrices and skinning matrices, model space.
     pub fn posed(&self) -> (Vec<Mat4>, Vec<Mat4>) {
-        let pose = self.animator.pose(&self.skeleton, &self.clips);
+        let pose = self
+            .aimed_pose()
+            .unwrap_or_else(|| self.animator.pose(&self.skeleton, &self.clips));
         let nodes = self.skeleton.model_matrices(&pose);
         let skin = nodes
             .iter()
@@ -239,6 +333,12 @@ impl Rig {
         (nodes, skin)
     }
 }
+
+/// The most an aiming upper body twists at the waist from the legs,
+/// radians.
+const MAX_TWIST: f32 = 1.3;
+/// And bends up or down.
+const MAX_BEND: f32 = 0.9;
 
 #[derive(Debug)]
 pub struct Scene {

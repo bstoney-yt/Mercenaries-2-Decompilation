@@ -129,13 +129,18 @@ pub fn upper_body(skeleton: &Skeleton) -> Option<std::sync::Arc<[bool]>> {
     skeleton.upper_body(node(skeleton, RIGHT_HAND)?, node(skeleton, LEFT_HAND)?)
 }
 
+/// The right- and left-hand nodes of a human skeleton.
+pub fn hands(skeleton: &Skeleton) -> Option<(usize, usize)> {
+    Some((node(skeleton, RIGHT_HAND)?, node(skeleton, LEFT_HAND)?))
+}
+
 /// The right-hand node of a human skeleton.
 pub fn right_hand(skeleton: &Skeleton) -> Option<usize> {
     node(skeleton, RIGHT_HAND)
 }
 
 /// How far below level a weapon carried in one hand points, radians.
-const CARRY_DOWN: f32 = 0.6;
+const CARRY_DOWN: f32 = 1.05;
 /// And how far out to the side, radians.
 const CARRY_OUT: f32 = 0.17;
 
@@ -807,6 +812,53 @@ mod tests {
     use super::*;
     use crate::npc::tests::{ground, rig};
     use crate::npc::{Brain, Npc};
+
+    /// A pose standing side-on, as the game's aim clip does: the rifle
+    /// (right hand to left) points along +x while the body faces +z.
+    fn side_on() -> Rig {
+        let local = |x: f32, y: f32| m2_engine::anim::Local {
+            translation: Vec3::new(x, y, 0.0),
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        };
+        let skeleton = Skeleton {
+            name_hashes: vec![1, 2, 3, RIGHT_HAND, LEFT_HAND],
+            parents: vec![None, Some(0), Some(1), Some(2), Some(2)],
+            rest: vec![
+                local(0.0, 0.0),
+                local(0.0, 1.0),
+                local(0.0, 0.3),
+                local(0.0, 0.3),
+                local(0.5, 0.3),
+            ],
+            inverse_bind: vec![Mat4::IDENTITY; 5],
+        };
+        let mut r = rig();
+        r.upper = Some(vec![false, false, true, true, true].into());
+        r.skeleton = std::sync::Arc::new(skeleton);
+        r.two_handed = true;
+        r
+    }
+
+    #[test]
+    fn an_aimed_rifle_points_where_she_looks() {
+        let mut r = side_on();
+        let barrel = |r: &Rig| {
+            let (nodes, _) = r.posed();
+            (nodes[4].w_axis - nodes[3].w_axis).truncate().normalize()
+        };
+        assert!(barrel(&r).abs_diff_eq(Vec3::X, 1e-4));
+        // Ahead: the whole body turns, as she stands to aim.
+        r.aim_along(0.0, Some(Vec3::Z));
+        assert!(barrel(&r).abs_diff_eq(Vec3::Z, 1e-4), "{}", barrel(&r));
+        // Ahead and up: the rise is made at the waist.
+        let up = Vec3::new(0.0, 1.0, 1.0).normalize();
+        r.aim_along(0.0, Some(up));
+        assert!(barrel(&r).abs_diff_eq(up, 1e-3), "{}", barrel(&r));
+        // Not aiming, nothing turns.
+        r.two_handed = false;
+        assert!(barrel(&r).abs_diff_eq(Vec3::X, 1e-4));
+    }
 
     #[test]
     fn her_rifle_drops_a_soldier_and_alerts_the_rest() {
