@@ -150,12 +150,21 @@ pub struct MaterialDesc {
     /// needs vertex tangents (without them the map is ignored).
     pub normal_map: Option<NormalMap>,
     /// Tiled ground layers blended by the vertex colour (`r` weights the
-    /// first, `a` the fourth), over the base map as a whole-cell tint.
-    /// While any is set the vertex colour is a weight, not a colour.
+    /// first, `a` the fourth); see [`ground`](Self::ground).
     pub layers: [Option<TerrainLayer>; 4],
     /// Pulls the surface towards the camera in the depth test, so a
     /// surface laid on another (roads on the ground) wins.
     pub depth_bias: bool,
+    /// Shade as the game's ground: `texture` is the cell's colour map,
+    /// `layers` are weighted by the vertex colour and the colour map makes
+    /// up the rest and takes over with distance; `detail` adds signed grain
+    /// (upload it [`TextureFormat::Rgba8Unorm`]). Unclamped sun plus
+    /// ambient light.
+    pub ground: bool,
+    /// Linear RGB scale of the sunlight a lit surface takes.
+    pub direct: [f32; 3],
+    /// Linear RGB scale of the ambient light a lit surface takes.
+    pub ambient: [f32; 3],
 }
 
 /// Specular highlights (Blinn-Phong).
@@ -182,8 +191,7 @@ pub struct NormalMap {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TerrainLayer {
     pub texture: TextureHandle,
-    /// `u` and `v` as dot products with the vertex's model-space
-    /// `(x, y, z, 1)`.
+    /// `u` and `v` as dot products with the world-space `(x, y, z, 1)`.
     pub uv: [[f32; 4]; 2],
 }
 
@@ -213,6 +221,9 @@ impl Default for MaterialDesc {
             normal_map: None,
             layers: [None; 4],
             depth_bias: false,
+            ground: false,
+            direct: [1.0; 3],
+            ambient: [1.0; 3],
         }
     }
 }

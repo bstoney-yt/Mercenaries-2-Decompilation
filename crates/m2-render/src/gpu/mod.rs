@@ -42,6 +42,15 @@ const DRAW_UNIFORM_SIZE: u64 = 80;
 const INITIAL_PALETTE: u64 = 1024;
 /// Metres from the camera by which a detail map has faded out.
 const DETAIL_FADE: f32 = 80.0;
+/// Metres from the camera where ground's colour map starts to take over
+/// from its tiled layers, and over how many metres. The game passes these
+/// to its terrain shaders from code; these values are a guess.
+const GROUND_MAP_START: f32 = 80.0;
+const GROUND_MAP_LENGTH: f32 = 170.0;
+/// Where ground's detail map starts to fade out, and over how many metres
+/// (also a guess).
+const GROUND_DETAIL_START: f32 = 15.0;
+const GROUND_DETAIL_LENGTH: f32 = 35.0;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Per-draw uniforms are packed at this stride (wgpu's minimum dynamic
 /// offset alignment on every backend).
@@ -179,9 +188,14 @@ struct MaterialUniforms {
     detail: [f32; 4],
     /// rgb: highlight colour (0: none), a: exponent.
     specular: [f32; 4],
-    /// x: specular map, y: normal map, z: normal x in alpha.
+    /// x: specular map, y: normal map, z: normal x in alpha, w: ground.
     maps: [f32; 4],
-    /// Per ground layer, the u row then the v row.
+    direct: [f32; 4],
+    ambient: [f32; 4],
+    /// Colour map takeover start and 1 / length, detail fade start and
+    /// 1 / length.
+    ground: [f32; 4],
+    /// Per ground layer, the u row then the v row (world space).
     layer_uv: [[f32; 4]; 8],
 }
 
@@ -693,7 +707,15 @@ impl WgpuBackend {
                 flag(desc.specular.is_some_and(|s| s.map.is_some())),
                 flag(desc.normal_map.is_some()),
                 flag(desc.normal_map.is_some_and(|n| n.alpha_x)),
-                0.0,
+                flag(desc.ground),
+            ],
+            direct: [desc.direct[0], desc.direct[1], desc.direct[2], 0.0],
+            ambient: [desc.ambient[0], desc.ambient[1], desc.ambient[2], 0.0],
+            ground: [
+                GROUND_MAP_START,
+                1.0 / GROUND_MAP_LENGTH,
+                GROUND_DETAIL_START,
+                1.0 / GROUND_DETAIL_LENGTH,
             ],
             layer_uv: {
                 let mut rows = [[0.0; 4]; 8];
