@@ -289,7 +289,13 @@ impl ScriptHost {
             if let Some(env) = cache.raw_get::<Option<Table>>(key.as_str())? {
                 return Ok(MultiValue::from_vec(vec![Value::Table(env)]));
             }
-            let resolved = library.resolve(&name).map(|(s, _, _)| s);
+            // A script is one module: one already loaded under another
+            // name is a wrong match for this one.
+            let resolved = library.resolve(&name).map(|(s, _, _)| s).filter(|s| {
+                !modules.borrow().iter().any(|(other, hash)| {
+                    *hash == Some(s.hash) && !other.eq_ignore_ascii_case(&name)
+                })
+            });
             modules
                 .borrow_mut()
                 .push((name.clone(), resolved.map(|s| s.hash)));
@@ -641,6 +647,27 @@ mod tests {
         assert!(host.init_modules().unwrap().is_empty());
         let ready: bool = host.lua().load("return Util.ready").eval().unwrap();
         assert!(ready);
+    }
+
+    #[test]
+    fn a_script_is_only_one_module() {
+        let host = ScriptHost::new().unwrap();
+        let library = Rc::new(crate::library::tests::library());
+        host.install_library(library, false).unwrap();
+        // Neither name is a module; both fall back to the script naming
+        // them (user.lua), which can only be the first.
+        host.lua()
+            .load("import('There'); import('Greet')")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            host.modules(),
+            [
+                ("There".to_owned(), Some(4)),
+                ("Util".to_owned(), Some(1)),
+                ("Greet".to_owned(), None)
+            ]
+        );
     }
 
     #[test]

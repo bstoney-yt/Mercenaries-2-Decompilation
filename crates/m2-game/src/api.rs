@@ -134,6 +134,12 @@ pub struct ScriptWorld {
     pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
     goal_callbacks: Vec<(u32, Function, Option<Table>)>,
+    /// The outlines of region objects (`LineRegion`), by the region's guid;
+    /// placed at the object's position and yaw.
+    pub regions: HashMap<u32, m2_assets::Region>,
+    /// What `Pg.GetAllLandingZones(kind)` answers, by kind (the transit
+    /// script asks for kinds 1 and 2 and needs some of each).
+    pub landing_zones: HashMap<i64, Vec<u32>>,
 }
 
 impl ScriptWorld {
@@ -147,7 +153,7 @@ impl ScriptWorld {
     pub fn by_name(&self, name: &str) -> Option<u32> {
         self.objects
             .iter()
-            .filter(|(_, o)| o.name == name)
+            .filter(|(_, o)| o.name.eq_ignore_ascii_case(name))
             .map(|(&g, _)| g)
             .min()
     }
@@ -179,8 +185,16 @@ impl World for ScriptWorld {
     fn is_awake(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.awake)
     }
-    fn inside(&self, _: u32, _: u32) -> Option<bool> {
-        None
+    fn inside(&self, guid: u32, boundary: u32) -> Option<bool> {
+        let region = self.regions.get(&boundary)?;
+        let at = self.objects.get(&boundary)?;
+        // A rider is where its vehicle is.
+        let o = self.objects.get(&guid)?;
+        let p = o
+            .vehicle
+            .and_then(|v| self.objects.get(&v))
+            .map_or(o.position, |v| v.position);
+        Some(region.contains([at.position[0], at.position[2]], at.yaw, p[0], p[2]))
     }
     fn labelled(&self, label: &str) -> Vec<u32> {
         let mut out: Vec<u32> = self
@@ -230,11 +244,7 @@ pub fn goal_finished(world: &Shared, guid: u32) -> Vec<mlua::Error> {
 }
 
 fn id(v: Option<&Value>) -> Option<u32> {
-    match v? {
-        Value::Integer(i) => u32::try_from(*i).ok(),
-        Value::Number(n) if *n >= 0.0 => Some(*n as u32),
-        _ => None,
-    }
+    crate::events::as_guid(v?)
 }
 
 fn num(v: Option<&Value>) -> Option<f32> {
@@ -246,7 +256,7 @@ fn num(v: Option<&Value>) -> Option<f32> {
 }
 
 fn guid_value(g: Option<u32>) -> Value {
-    g.map_or(Value::Nil, |g| Value::Number(f64::from(g)))
+    g.map_or(Value::Nil, crate::events::guid_value)
 }
 
 fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
@@ -364,7 +374,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             position,
             yaw,
         });
-        values([Value::Number(f64::from(guid))])
+        values([crate::events::guid_value(guid)])
     })?;
 
     let object = lib("Object")?;
@@ -510,7 +520,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "GetAllCharacters", |w, lua, _| {
         let t = lua.create_table()?;
         if let Some(p) = w.player {
-            t.raw_push(i64::from(p))?;
+            t.raw_push(crate::events::guid_value(p))?;
         }
         values([Value::Table(t)])
     })?;
@@ -558,7 +568,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .collect();
         riders.sort_unstable();
         for r in riders {
-            t.raw_push(i64::from(r))?;
+            t.raw_push(crate::events::guid_value(r))?;
         }
         values([Value::Table(t)])
     })?;
@@ -655,6 +665,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     ] {
         pg.set(name, notifier(lua, world, format!("Pg.{name}"))?)?;
     }
+    add(&pg, "GetAllLandingZones", |w, lua, a| {
+        let kind = num(a.first()).map_or(1, |k| k as i64);
+        let t = lua.create_table()?;
+        for &g in w.landing_zones.get(&kind).into_iter().flatten() {
+            t.raw_push(crate::events::guid_value(g))?;
+        }
+        values([Value::Table(t)])
+    })?;
     add(&pg, "LoadIsRetry", |_, _, _| {
         values([Value::Boolean(false)])
     })?;
@@ -671,6 +689,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         add(&sys, name, |_, _, _| values([Value::Nil]))?;
     }
     add(&sys, "SetSkipMission", |_, _, _| values([]))?;
+    // Guids print as their number.
+    add(&sys, "GuidToString", |_, lua, a| {
+        let text = id(a.first()).map_or_else(|| "nil".to_owned(), |g| g.to_string());
+        values([Value::String(lua.create_string(&text)?)])
+    })?;
     add(&sys, "RequestGameState", |w, _, a| {
         if let Some(Value::String(s)) = a.first() {
             let state = s.to_string_lossy();
@@ -727,6 +750,59 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         "#,
     )
     .set_name("=m2-math")
+    .exec()?;
+
+    // Object filters: sets of objects scripts build (objects added or
+    // excluded one by one, the players, a label) and hand to objectives
+    // and events. Events read the same fields (see `events::objects`).
+    lua.load(
+        r#"
+        local F = {}
+        local meta = { __index = F }
+        local function has(f, g)
+            for _, v in ipairs(f.objs) do if v == g then return true end end
+            return false
+        end
+        local function ok(f) return type(f) == "table" and getmetatable(f) == meta end
+        function F.Create() return setmetatable({ objs = {}, ex = {}, players = false }, meta) end
+        function F.UsePlayers(f, b) if ok(f) then f.players = b and true or false end end
+        function F.SetFilter(f, label) if ok(f) then f.label = label end end
+        function F.AddObject(f, g, exclude)
+            if not ok(f) or g == nil then return end
+            if exclude then f.ex[g] = true elseif not has(f, g) then f.objs[#f.objs + 1] = g end
+        end
+        function F.RemoveObject(f, g)
+            if not ok(f) then return end
+            for i, v in ipairs(f.objs) do
+                if v == g then table.remove(f.objs, i) return end
+            end
+        end
+        function F.GetObjects(f)
+            local r = {}
+            if not ok(f) then return r end
+            for _, v in ipairs(f.objs) do if not f.ex[v] then r[#r + 1] = v end end
+            if f.players then
+                local p = Player.GetAnyCharacter()
+                if p ~= nil and not has(f, p) and not f.ex[p] then r[#r + 1] = p end
+            end
+            return r
+        end
+        function F.GetCoopPlayerGuid(f)
+            if not ok(f) then return nil end
+            local p = Player.GetAnyCharacter()
+            if p ~= nil and (f.players or has(f, p)) then return p end
+            return nil
+        end
+        function F.Eval(f, g)
+            if not ok(f) or g == nil or f.ex[g] then return false end
+            if has(f, g) then return true end
+            if f.players and g == Player.GetAnyCharacter() then return true end
+            return f.label ~= nil and Object.HasLabel(g, f.label) or false
+        end
+        ObjectFilter = F
+        "#,
+    )
+    .set_name("=m2-objectfilter")
     .exec()?;
 
     // The game's assert: logged, and the script carries on, as a release
@@ -915,7 +991,9 @@ mod tests {
                 r#"
                 seated = nil
                 Event.Create(Event.ObjectInSeat, {1, "_global_veh_jeep 0x0001", "d", "enter"},
-                    function(tag, who, what) seated = tag .. who .. "/" .. what end, {"in:"})
+                    function(tag, who, what)
+                        seated = tag .. Sys.GuidToString(who) .. "/" .. Sys.GuidToString(what)
+                    end, {"in:"})
                 assert(Vehicle.Enter(50, 1, "d", true))
                 "#,
             )
@@ -942,7 +1020,8 @@ mod tests {
             )
             .exec()
             .unwrap();
-        let g: u32 = host.lua().globals().get("spawned").unwrap();
+        let g =
+            crate::events::as_guid(&host.lua().globals().get::<Value>("spawned").unwrap()).unwrap();
         assert!(g > FIRST_SPAWNED);
         assert_eq!(world.borrow().objects[&g].position, [1.0, 2.0, 3.0]);
         let commands = world.borrow_mut().take_commands();
@@ -959,6 +1038,47 @@ mod tests {
         assert!(goal_finished(&world, g).is_empty());
         let done: String = host.lua().globals().get("done").unwrap();
         assert_eq!(done, "arrived!");
+    }
+
+    #[test]
+    fn entering_a_named_region_fires_boundary_events() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(70, Object::new("region_vza_beach", [100.0, 0.0, 100.0]));
+            let corners = vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]];
+            w.regions.insert(
+                70,
+                m2_assets::Region {
+                    flags: 0x0004_0002,
+                    unk_0x04: 0,
+                    corners,
+                },
+            );
+        }
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                arrived = nil
+                local f = ObjectFilter.Create()
+                ObjectFilter.UsePlayers(f, true)
+                Event.Create(Event.Boundary, {f, "region_vza_beach", "enter", true},
+                    function(who, where)
+                        arrived = Sys.GuidToString(who) .. "@" .. Sys.GuidToString(where)
+                    end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert!(events.update_shared(0.1, &world).is_empty());
+        let arrived: Option<String> = host.lua().globals().get("arrived").unwrap();
+        assert_eq!(arrived, None);
+        world.borrow_mut().objects.get_mut(&1).unwrap().position = [103.0, 9.0, 98.0];
+        assert!(events.update_shared(0.1, &world).is_empty());
+        let arrived: String = host.lua().globals().get("arrived").unwrap();
+        assert_eq!(arrived, "1@70");
     }
 
     #[test]
