@@ -11,6 +11,7 @@
 //! cargo run -p m2-assets --example wad -- obj     <archive.wad> <model hash> <out.obj> [lod]
 //! cargo run -p m2-assets --example wad -- anims   <archive.wad>
 //! cargo run -p m2-assets --example wad -- world   <archive.wad>
+//! cargo run -p m2-assets --example wad -- entities <archive.wad>
 //! cargo run -p m2-assets --example wad -- types   <archive.wad>
 //! cargo run -p m2-assets --example wad -- scripts <archive.wad>
 //! cargo run -p m2-assets --example wad -- script  <archive.wad> <script hash>
@@ -30,6 +31,9 @@
 //! `world` parses every terrain cell, low-resolution tile and entity layer,
 //! checks material references and that the layout layer places each cell
 //! on the 400 m grid, and summarises the components.
+//! `entities` lists every layer entity template (`civ_car 0x0012abcd` is
+//! the template `civ_car`), how many entities it has, which components they
+//! carry and which asset types its name's hash finds.
 //! `types` summarises every asset type: how many, their sizes, a few names
 //! and block paths, the section layout of one, any `Lua` bytecode or
 //! script-like text, and the longest readable strings in one sample, to
@@ -194,6 +198,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("models", []) => models(&mut wad)?,
         ("anims", []) => anims(&mut wad)?,
         ("world", []) => world(&mut wad)?,
+        ("entities", []) => entities(&mut wad)?,
         ("obj", [hash, out, rest @ ..]) => {
             let hash = u32::from_str_radix(hash.trim_start_matches("0x"), 16)?;
             let lod = match rest {
@@ -1480,5 +1485,120 @@ fn call_sites<R: std::io::Read + std::io::Seek>(
         }
     }
     println!("{shown} call sites shown");
+    Ok(())
+}
+
+/// Every layer entity's template, which assets its name finds, and which
+/// components its entities carry: `entity name 0x001384eb` or
+/// `_entity name 26` stems to `entity name`, whose `name_hash` is looked
+/// up in every type of the archive.
+fn entities<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use m2_assets::Layer;
+    use m2_assets::layer::LAYER_TYPE;
+
+    #[derive(Default)]
+    struct Template {
+        entities: usize,
+        layers: BTreeSet<String>,
+        components: BTreeSet<String>,
+        /// Type indices of the assets the stem's hash finds.
+        types: BTreeSet<usize>,
+    }
+
+    let types = wad.index().type_hashes().to_vec();
+    let paths: Vec<String> = wad
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    let mut assets: HashMap<u32, BTreeSet<usize>> = HashMap::new();
+    let mut layers: Vec<(String, Vec<u8>)> = Vec::new();
+    for (block, path) in paths.iter().enumerate() {
+        let decoded = wad.read_block(block)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if let Some(t) = types.iter().position(|&t| t == e.type_hash) {
+                assets.entry(e.name_hash).or_default().insert(t);
+            }
+            if e.type_hash == LAYER_TYPE {
+                layers.push((path.clone(), data.to_vec()));
+            }
+        }
+    }
+
+    let stem = |name: &str| -> String {
+        let name = name.trim_start_matches('_');
+        name.rsplit_once(' ').map_or(name, |(s, _)| s).to_owned()
+    };
+    let mut templates: BTreeMap<String, Template> = BTreeMap::new();
+    // Per component: entities, and how many of them stem to an asset.
+    let mut by_component: BTreeMap<String, (usize, usize, BTreeSet<usize>)> = BTreeMap::new();
+    let mut errors = 0;
+    for (path, data) in &layers {
+        let layer = match Layer::parse(data) {
+            Ok(l) => l,
+            Err(e) => {
+                errors += 1;
+                eprintln!("layer in {path}: {e}");
+                continue;
+            }
+        };
+        let mut components: HashMap<u32, BTreeSet<String>> = HashMap::new();
+        for c in &layer.components {
+            for (entity, _) in c.records().unwrap_or_default() {
+                components
+                    .entry(entity)
+                    .or_default()
+                    .insert(c.name.to_owned());
+            }
+        }
+        for (entity, name) in layer.names() {
+            let stem = stem(name);
+            let found = assets.get(&m2_assets::name_hash(&stem));
+            let comps = components.remove(&entity).unwrap_or_default();
+            for c in &comps {
+                let e = by_component.entry(c.clone()).or_default();
+                e.0 += 1;
+                if let Some(f) = found {
+                    e.1 += 1;
+                    e.2.extend(f.iter().copied());
+                }
+            }
+            let t = templates.entry(stem).or_default();
+            t.entities += 1;
+            t.layers.insert(path.clone());
+            t.components.extend(comps);
+            if let Some(f) = found {
+                t.types.extend(f.iter().copied());
+            }
+        }
+    }
+    println!("components: entities, of which the name finds an asset (of these types)");
+    for (name, (entities, found, types)) in &by_component {
+        println!("  {name:28} {entities:7} {found:7} {types:?}");
+    }
+    let mut list: Vec<(&String, &Template)> = templates.iter().collect();
+    list.sort_by_key(|(_, t)| std::cmp::Reverse(t.entities));
+    println!(
+        "{} templates over {} entities: count, asset types found, name, components, layers",
+        list.len(),
+        list.iter().map(|(_, t)| t.entities).sum::<usize>()
+    );
+    for (name, t) in list {
+        let types: Vec<String> = t.types.iter().map(|t| t.to_string()).collect();
+        let comps: Vec<&str> = t.components.iter().map(String::as_str).collect();
+        let layers: Vec<&str> = t.layers.iter().map(String::as_str).collect();
+        println!(
+            "{:6} [{}] {name} {comps:?} {}",
+            t.entities,
+            types.join(","),
+            layers.join(",")
+        );
+    }
+    eprintln!("{errors} errors");
     Ok(())
 }
