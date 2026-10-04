@@ -32,6 +32,9 @@ pub struct Library {
     scripts: Vec<ScriptInfo>,
     /// Lower-case module name to the members scripts use on it.
     used: BTreeMap<String, BTreeSet<String>>,
+    /// Lower-case module name to (script index, members it defines),
+    /// worked out on first use.
+    assigned: std::cell::OnceCell<BTreeMap<String, (usize, usize)>>,
 }
 
 /// Functions that load a module by name.
@@ -88,30 +91,59 @@ impl Library {
     }
 
     /// The script that is module `name` (any case), with how many of the
-    /// members used on it it defines, out of how many. A script whose
-    /// strings mention the name counts two members more. `None` when no
+    /// members used on it it defines, out of how many. `None` when no
     /// script defines any of them (or nothing is used on it).
+    ///
+    /// Every module is scored against every script that doesn't load it:
+    /// one point per member used on the module that the script defines,
+    /// and two more when the script's strings name the module (scripts
+    /// often name themselves in their messages, which settles classes
+    /// whose few used members, such as `Activated`, many scripts define).
+    /// The best pairs are taken first and a script is one module only.
     pub fn resolve(&self, name: &str) -> Option<(&ScriptInfo, usize, usize)> {
         let key = name.to_ascii_lowercase();
-        let used = self.used.get(&key)?;
-        self.scripts
-            .iter()
-            .filter(|s| !s.loads.contains(&key))
-            .filter_map(|s| {
+        let &(index, hits) = self.assigned.get_or_init(|| self.assign()).get(&key)?;
+        Some((&self.scripts[index], hits, self.used.get(&key)?.len()))
+    }
+
+    fn assign(&self) -> BTreeMap<String, (usize, usize)> {
+        // (score, hits, module, script index)
+        let mut pairs = Vec::new();
+        for (module, used) in &self.used {
+            for (i, s) in self.scripts.iter().enumerate() {
+                if s.loads.contains(module) {
+                    continue;
+                }
                 let hits = used.iter().filter(|m| s.defines.contains(*m)).count();
-                // Scripts often name themselves in their messages; that
-                // settles classes whose few used members (`Activated`) many
-                // scripts define.
-                let named = s.strings.iter().any(|t| t.contains(&key));
-                (hits > 0).then_some((s, hits, hits + if named { 2 } else { 0 }))
-            })
-            // Best score; then the script defining least else.
-            .max_by(|(a, _, sa), (b, _, sb)| {
-                sa.cmp(sb)
-                    .then_with(|| b.defines.len().cmp(&a.defines.len()))
-                    .then_with(|| b.hash.cmp(&a.hash))
-            })
-            .map(|(s, hits, _)| (s, hits, used.len()))
+                if hits == 0 {
+                    continue;
+                }
+                let named = s.strings.iter().any(|t| mentions(t, module));
+                pairs.push((hits + if named { 2 } else { 0 }, hits, module, i));
+            }
+        }
+        // Best score; then the script defining least else; then stable.
+        pairs.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| {
+                    self.scripts[a.3]
+                        .defines
+                        .len()
+                        .cmp(&self.scripts[b.3].defines.len())
+                })
+                .then_with(|| a.2.cmp(b.2))
+                .then_with(|| self.scripts[a.3].hash.cmp(&self.scripts[b.3].hash))
+        });
+        let mut out = BTreeMap::new();
+        let mut taken = BTreeSet::new();
+        for (_, hits, module, i) in pairs {
+            if out.contains_key(module) || taken.contains(&i) {
+                continue;
+            }
+            taken.insert(i);
+            out.insert(module.clone(), (i, hits));
+        }
+        out
     }
 
     /// Every module name some script loads, lower case.
@@ -121,6 +153,15 @@ impl Library {
             .flat_map(|s| s.loads.iter().map(String::as_str))
             .collect()
     }
+}
+
+/// Whether `text` names `module` as a whole word (`mrxtaskjob` is not
+/// named by `mrxtaskjobverifyset`).
+fn mentions(text: &str, module: &str) -> bool {
+    text.match_indices(module).any(|(at, _)| {
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        !word(text[..at].chars().next_back()) && !word(text[at + module.len()..].chars().next())
+    })
 }
 
 #[cfg(test)]
@@ -151,6 +192,8 @@ pub(crate) mod tests {
         // The contract defines Activated too, but it inherits Task.
         assert_eq!(lib.resolve("task").map(|(s, _, _)| s.hash), Some(2));
         assert!(lib.resolve("Nothing").is_none());
+        assert!(mentions("mrxtaskjob: started", "mrxtaskjob"));
+        assert!(!mentions("mrxtaskjobverifyset", "mrxtaskjob"));
         assert_eq!(
             lib.module_names().into_iter().collect::<Vec<_>>(),
             ["task", "util"]
