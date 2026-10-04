@@ -22,6 +22,8 @@ pub struct ScriptInfo {
     pub defines: BTreeSet<String>,
     /// Module names it loads, lower case.
     pub loads: BTreeSet<String>,
+    /// Its string constants, lower case.
+    pub strings: Vec<String>,
 }
 
 /// Every script, indexed for module lookups.
@@ -62,11 +64,18 @@ impl Library {
             .filter_map(|c| c.first)
             .map(|n| n.to_ascii_lowercase())
             .collect();
+        let strings = chunk
+            .main
+            .strings()
+            .into_iter()
+            .map(str::to_ascii_lowercase)
+            .collect();
         self.scripts.push(ScriptInfo {
             hash,
             chunk,
             defines,
             loads,
+            strings,
         });
     }
 
@@ -79,7 +88,8 @@ impl Library {
     }
 
     /// The script that is module `name` (any case), with how many of the
-    /// members used on it it defines, out of how many. `None` when no
+    /// members used on it it defines, out of how many. A script whose
+    /// strings mention the name counts two members more. `None` when no
     /// script defines any of them (or nothing is used on it).
     pub fn resolve(&self, name: &str) -> Option<(&ScriptInfo, usize, usize)> {
         let key = name.to_ascii_lowercase();
@@ -87,18 +97,21 @@ impl Library {
         self.scripts
             .iter()
             .filter(|s| !s.loads.contains(&key))
-            .map(|s| {
+            .filter_map(|s| {
                 let hits = used.iter().filter(|m| s.defines.contains(*m)).count();
-                (s, hits)
+                // Scripts often name themselves in their messages; that
+                // settles classes whose few used members (`Activated`) many
+                // scripts define.
+                let named = s.strings.iter().any(|t| t.contains(&key));
+                (hits > 0).then_some((s, hits, hits + if named { 2 } else { 0 }))
             })
-            .filter(|&(_, hits)| hits > 0)
-            // Most members used; then the script defining least else.
-            .max_by(|(a, ha), (b, hb)| {
-                ha.cmp(hb)
+            // Best score; then the script defining least else.
+            .max_by(|(a, _, sa), (b, _, sb)| {
+                sa.cmp(sb)
                     .then_with(|| b.defines.len().cmp(&a.defines.len()))
                     .then_with(|| b.hash.cmp(&a.hash))
             })
-            .map(|(s, hits)| (s, hits, used.len()))
+            .map(|(s, hits, _)| (s, hits, used.len()))
     }
 
     /// Every module name some script loads, lower case.
