@@ -59,8 +59,9 @@ pub fn layer_name(block_path: &str) -> String {
 }
 
 /// Reports the request for `name` (any case) done, and calls the callbacks
-/// waiting on it with their values, then the layer's name and whether it
-/// worked. Returns the callbacks that failed.
+/// waiting on it as the layer manager expects: the values of the request's
+/// table, the layer's name, an unused value, and whether it worked.
+/// Returns the callbacks that failed.
 pub fn finished(world: &Shared, name: &str, ok: bool) -> Vec<mlua::Error> {
     let name = name.to_ascii_lowercase();
     let done: Vec<_> = {
@@ -82,7 +83,9 @@ pub fn finished(world: &Shared, name: &str, ok: bool) -> Vec<mlua::Error> {
     let mut errors = Vec::new();
     for (_, _, callback, mut args) in done {
         let Some(f) = callback else { continue };
-        // The request's values end with the layer's name as a Lua string.
+        // The request's values end with the layer's name as a Lua string;
+        // then a value the layer manager never reads, and the result.
+        args.push(Value::Nil);
         args.push(Value::Boolean(ok));
         if let Err(e) = f.call::<()>(MultiValue::from_vec(args)) {
             errors.push(e);
@@ -129,7 +132,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                         let Value::Function(f) = &args[i] else {
                             unreachable!()
                         };
-                        (Some(f.clone()), args[i + 1..].to_vec())
+                        // The values come as a table (`{"Load"}`).
+                        let data = match args.get(i + 1) {
+                            Some(Value::Table(t)) => {
+                                t.sequence_values().collect::<mlua::Result<Vec<Value>>>()?
+                            }
+                            _ => Vec::new(),
+                        };
+                        (Some(f.clone()), data)
                     }
                     None => (None, Vec::new()),
                 };
@@ -147,11 +157,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         "AssetExists",
         safe_function(lua, move |_, args| {
             let name = text(args.front()).unwrap_or_default().to_ascii_lowercase();
-            let w = w.borrow();
-            // Layers are checked against the archives; other assets are
-            // taken on trust.
-            let layer_like = name.starts_with("vz_state") || name.starts_with("layers_");
-            let exists = w.layers.known.contains(&name) || !layer_like;
+            let kind = text(args.get(1)).unwrap_or_default();
+            // Layers (`Pg.AssetExists(name, "layer")`) are checked against
+            // the archives; other assets are taken on trust.
+            let exists =
+                !kind.eq_ignore_ascii_case("layer") || w.borrow().layers.known.contains(&name);
             Ok(MultiValue::from_vec(vec![Value::Boolean(exists)]))
         })?,
     )?;
@@ -213,12 +223,15 @@ mod tests {
             .load(
                 r#"
                 done = {}
-                assert(Pg.AssetExists("Vz_State_VzaCon001"))
-                assert(not Pg.AssetExists("vz_state_nothing"))
+                assert(Pg.AssetExists("Vz_State_VzaCon001", "layer"))
+                assert(not Pg.AssetExists("vz_state_nothing", "layer"))
                 assert(Pg.AssetExists("some_model"))
-                Pg.LoadLayer("Vz_State_VzaCon001", false, false, function(tag, name, ok)
-                    done[#done + 1] = tag .. " " .. name .. " " .. tostring(ok)
-                end, "request 1")
+                -- As MrxLayerManager calls it: name, dynamic, callback,
+                -- its values, needs a loading screen.
+                local ok = Pg.LoadLayer("vz_state_vzacon001", true, function(op, name, _, ok)
+                    done[#done + 1] = op .. " " .. name .. " " .. tostring(ok)
+                end, {"Load"}, false)
+                assert(ok)
                 "#,
             )
             .exec()
@@ -232,7 +245,7 @@ mod tests {
         );
         assert!(finished(&world, "VZ_STATE_VZACON001", true).is_empty());
         let done: Vec<String> = host.lua().load("return done").eval().unwrap();
-        assert_eq!(done, ["request 1 vz_state_vzacon001 true"]);
+        assert_eq!(done, ["Load vz_state_vzacon001 true"]);
         assert!(world.borrow().layers.loaded.contains("vz_state_vzacon001"));
     }
 }

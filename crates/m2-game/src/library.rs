@@ -35,7 +35,17 @@ pub struct Library {
     /// Lower-case module name to (script index, members it defines),
     /// worked out on first use.
     assigned: std::cell::OnceCell<BTreeMap<String, (usize, usize)>>,
+    /// Lower-case module name to the script it is known to be, where the
+    /// member match goes wrong.
+    pinned: BTreeMap<String, u32>,
 }
+
+/// Modules the member match gets wrong, by the script they are.
+///
+/// `MrxTask` is the task base class; `MrxTaskMission` uses so many of its
+/// members that the match gave it the base, leaving `MrxTask` to a job
+/// script that defines only `Activated`.
+pub const KNOWN_MODULES: [(&str, u32); 1] = [("MrxTask", 0xd302_a66f)];
 
 /// Functions that load a module by name.
 pub const LOADERS: [&str; 3] = ["import", "inherit", "dynamic_import"];
@@ -80,6 +90,12 @@ impl Library {
             loads,
             strings,
         });
+    }
+
+    /// Makes module `name` script `hash`, whatever the member match says.
+    /// Call before the first [`Library::resolve`].
+    pub fn pin(&mut self, name: &str, hash: u32) {
+        self.pinned.insert(name.to_ascii_lowercase(), hash);
     }
 
     pub fn scripts(&self) -> &[ScriptInfo] {
@@ -151,6 +167,17 @@ impl Library {
         });
         let mut out = BTreeMap::new();
         let mut taken = BTreeSet::new();
+        for (module, &hash) in &self.pinned {
+            if let Some(i) = self.scripts.iter().position(|s| s.hash == hash) {
+                let hits = self.used.get(module).map_or(0, |used| {
+                    used.iter()
+                        .filter(|m| self.scripts[i].defines.contains(*m))
+                        .count()
+                });
+                taken.insert(i);
+                out.insert(module.clone(), (i, hits));
+            }
+        }
         for (_, hits, module, i) in pairs {
             if out.contains_key(module) || taken.contains(&i) {
                 continue;
@@ -216,5 +243,17 @@ pub(crate) mod tests {
             lib.module_names().into_iter().collect::<Vec<_>>(),
             ["task", "util"]
         );
+    }
+
+    #[test]
+    fn pins_win_over_the_match() {
+        let mut lib = library();
+        lib.pin("Task", 5);
+        assert_eq!(
+            lib.resolve("task").map(|(s, h, _)| (s.hash, h)),
+            Some((5, 1))
+        );
+        // The pinned script is no other module's.
+        assert_eq!(lib.resolve("Util").map(|(s, _, _)| s.hash), Some(1));
     }
 }

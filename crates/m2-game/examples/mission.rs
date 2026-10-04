@@ -17,7 +17,10 @@
 //!
 //! Every module some script loads is imported first, then every other
 //! script runs once, as in the `scripts` example; then the `--run` code,
-//! then the ticks.
+//! then the ticks. In `--run` code every module is a global, and
+//! `Scripts.<hash>` is an entry script's environment (to call the
+//! bootstrap's `Init`, say). The player has the label of its name in lower
+//! case (`mattias`), which is how scripts tell the heroes apart.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -32,7 +35,7 @@ use m2_assets::{BlockContents, Layer, WadArchive};
 use m2_game::api::{self, Command, Object, ScriptWorld, Shared};
 use m2_game::events::Events;
 use m2_game::layers::{LayerOp, LayerState, finished, layer_name};
-use m2_game::library::{LOADERS, Library};
+use m2_game::library::{KNOWN_MODULES, LOADERS, Library};
 use m2_game::script::ScriptHost;
 
 #[derive(Default)]
@@ -189,6 +192,8 @@ fn run(o: &Options) -> Result<()> {
         let mut w = world.borrow_mut();
         let mut hero = Object::new(&o.hero, o.at);
         hero.player_controlled = true;
+        // Scripts tell the heroes apart by these labels.
+        hero.labels.push(o.hero.to_ascii_lowercase());
         w.insert(1, hero);
         w.player = Some(1);
     }
@@ -199,6 +204,9 @@ fn run(o: &Options) -> Result<()> {
         world.borrow().objects.len() - 1,
         preload.join(", ")
     );
+    for (name, hash) in KNOWN_MODULES {
+        library.pin(name, hash);
+    }
     let library = Rc::new(library);
 
     let host = ScriptHost::new()?;
@@ -231,13 +239,18 @@ fn run(o: &Options) -> Result<()> {
         }
     }
     let modules: Vec<u32> = host.modules().iter().filter_map(|m| m.1).collect();
+    // Entry scripts' environments, for `--run` code: `Scripts.b4420059`.
+    let entries = host.lua().create_table()?;
     for script in library.scripts() {
-        if !modules.contains(&script.hash)
-            && let Err(e) = host.run_script(&library, script.hash)
-        {
-            failures.push(format!("script {:08x}: {e}", script.hash));
+        if modules.contains(&script.hash) {
+            continue;
+        }
+        match host.run_script(&library, script.hash) {
+            Ok(env) => entries.raw_set(format!("{:08x}", script.hash), env)?,
+            Err(e) => failures.push(format!("script {:08x}: {e}", script.hash)),
         }
     }
+    globals.raw_set("Scripts", entries)?;
     println!(
         "started: {} modules, {} failures",
         host.modules().len(),

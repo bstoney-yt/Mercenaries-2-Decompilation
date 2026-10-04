@@ -222,7 +222,8 @@ impl ScriptHost {
     }
     /// Provides `import`, `inherit`, `dynamic_import` and `dynamic_remove`
     /// over `library`. A module runs once, in its own environment (which
-    /// falls back to the globals), and that environment is the module:
+    /// falls back to the globals), and that environment is the module (and
+    /// a global of that name, unless one is already defined):
     /// `import("MrxUtil")` binds it as `MrxUtil` in the caller's
     /// environment, and `inherit("MrxTask")` also makes the caller's
     /// environment fall back to it, so the script extends that class. A
@@ -272,6 +273,17 @@ impl ScriptHost {
             env.set_metatable(Some(meta))?;
             // Cached before it runs, so modules loading each other finish.
             cache.raw_set(key.as_str(), &env)?;
+            // Loaded modules are globals too: scripts use some they never
+            // import themselves (MrxMissionFlow reads WifMissionData).
+            let globals = lua.globals();
+            let free = match globals.raw_get::<Value>(name.as_str())? {
+                Value::Nil => true,
+                Value::Table(t) => t.raw_get::<Value>(STUB_NAME)? != Value::Nil,
+                _ => false,
+            };
+            if free {
+                globals.raw_set(name.as_str(), &env)?;
+            }
             if let Some(script) = resolved {
                 let source = format!("={name}");
                 let bytes = script
@@ -486,6 +498,14 @@ mod tests {
             host.modules(),
             [("Util".to_owned(), Some(1)), ("Task".to_owned(), Some(2))]
         );
+        // Loaded modules are globals too, for scripts that never import
+        // them.
+        let greet: String = host
+            .lua()
+            .load("return Util.Greet('you')")
+            .eval()
+            .unwrap();
+        assert_eq!(greet, "hi you");
     }
 
     #[test]
