@@ -820,6 +820,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&sound, "_GetLibVersion", |_, _, _| {
         values([Value::Integer(10)])
     })?;
+    // Where the sound banks are, relative to the install (`data\Audios`
+    // holds `music.pws` and the rest), and the language of the voice
+    // banks (`vo_stream.english.pws`).
+    add(&sound, "GetAudioDir", |_, lua, _| {
+        values([Value::String(lua.create_string(r"data\Audios")?)])
+    })?;
+    let gui = lib("Gui")?;
+    add(&gui, "GetLanguageName", |_, lua, _| {
+        values([Value::String(lua.create_string("english")?)])
+    })?;
 
     let ai = lib("Ai")?;
     // Faction relations are not modelled yet: everyone is neutral (0 on
@@ -1494,6 +1504,7 @@ mod tests {
                 local copter = Pg.Spawn("Mi26 (VZA Intro) (Driver)", 0, 50, 0, 0)
                 local jeep = Pg.Spawn("M151 Softtop (VZ)", 5, 0, 0, 0)
                 assert(Vehicle.GetDriver(jeep) == nil)
+                assert(Sound.GetAudioDir() .. "\\vo_x." .. Gui.GetLanguageName() == "data\\Audios\\vo_x.english")
                 Player.SetFuel(40)
                 return Object.GetName(Vehicle.GetDriver(copter)), #Vehicle.GetRiders(copter),
                     Player.GetFuel(), Player.GetMaximumPlayers(), Sound._GetLibVersion()
