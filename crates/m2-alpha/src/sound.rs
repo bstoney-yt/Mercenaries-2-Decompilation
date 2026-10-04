@@ -1,5 +1,6 @@
 //! The game's sound: an output device fed by the engine's mixer, the
-//! island's ambience, music on demand, and the fight's gunshots and blasts.
+//! island's ambient sounds, music on demand, and the fight's gunshots and
+//! blasts.
 //!
 //! Which sound in a bank is a shot or a blast is not known (sounds are
 //! named by hash), so they are picked by measuring, as in the viewer: the
@@ -127,6 +128,12 @@ pub struct GameAudio {
     decoded: (Sender<Decoded>, Receiver<Decoded>),
     /// Rifle shot, rocket launch, explosion.
     fight: [Option<SoundBuffer>; 3],
+    /// Short sounds of the town (`amb_citymed`) and the jungle
+    /// (`amb_jungle`) played now and then around the listener.
+    ambient: [Vec<SoundBuffer>; 2],
+    /// Seconds to the next one.
+    ambient_wait: f32,
+    seed: u64,
 }
 
 /// Picks the loudest sound in `bank` passing `keep`.
@@ -143,26 +150,49 @@ fn pick(
         .cloned()
 }
 
-fn fight_sounds(install: &Install) -> [Option<SoundBuffer>; 3] {
+/// Ambient one-shots no longer than this, seconds (the banks' longer
+/// sounds are loops).
+const AMBIENT_LONGEST: f32 = 8.0;
+
+/// The fight's sounds and the ambient one-shots.
+fn bank_sounds(install: &Install) -> ([Option<SoundBuffer>; 3], [Vec<SoundBuffer>; 2]) {
     let library = install.open_world().and_then(|mut source| {
         SoundLibrary::load(
             &mut source,
-            &["wpn_assaultrifle", "wpn_rpg", "support_artillery"],
+            &[
+                "wpn_assaultrifle",
+                "wpn_rpg",
+                "support_artillery",
+                "amb_citymed",
+                "amb_jungle",
+            ],
         )
     });
     match library {
-        Ok(l) => [
-            pick(&l, "wpn_assaultrifle", |s| {
-                s.channels == 1 && s.seconds() < 0.6
-            }),
-            pick(&l, "wpn_rpg", |s| s.seconds() < 1.5),
-            pick(&l, "support_artillery", |s| {
-                s.channels == 1 && (1.5..=3.0).contains(&s.seconds())
-            }),
-        ],
+        Ok(l) => {
+            let short = |bank: &str| -> Vec<SoundBuffer> {
+                l.bank(bank)
+                    .iter()
+                    .filter(|s| s.frames() > 0 && s.seconds() <= AMBIENT_LONGEST)
+                    .cloned()
+                    .collect()
+            };
+            (
+                [
+                    pick(&l, "wpn_assaultrifle", |s| {
+                        s.channels == 1 && s.seconds() < 0.6
+                    }),
+                    pick(&l, "wpn_rpg", |s| s.seconds() < 1.5),
+                    pick(&l, "support_artillery", |s| {
+                        s.channels == 1 && (1.5..=3.0).contains(&s.seconds())
+                    }),
+                ],
+                [short("amb_citymed"), short("amb_jungle")],
+            )
+        }
         Err(e) => {
-            eprintln!("sound: no weapon sounds ({e})");
-            [None, None, None]
+            eprintln!("sound: no weapon or ambient sounds ({e})");
+            Default::default()
         }
     }
 }
@@ -186,16 +216,50 @@ impl GameAudio {
                 }
             }
         });
-        let mut audio = Self {
+        let (fight, ambient) = install.map(bank_sounds).unwrap_or_default();
+        // The recorded ambience (ambience.pws) isn't played: which of its
+        // tracks is which place is not known, and the first is a tank
+        // rolling by. The banks' short sounds stand in, as in the viewer.
+        Self {
             out,
             streams,
             music: None,
             next_track: 0,
             decoded: channel(),
-            fight: install.map(fight_sounds).unwrap_or_default(),
-        };
-        audio.decode("ambience", 0);
-        audio
+            fight,
+            ambient,
+            ambient_wait: 3.0,
+            seed: 0x9e37_79b9_7f4a_7c15,
+        }
+    }
+
+    fn random(&mut self) -> f32 {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 7;
+        self.seed ^= self.seed << 17;
+        (self.seed >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Counts down to the next ambient sound: true when one is due.
+    pub fn ambient_due(&mut self, dt: f32) -> bool {
+        self.ambient_wait -= dt;
+        self.ambient_wait <= 0.0
+    }
+
+    /// Plays a town or jungle sound 10 to 40 m from `listener`, and waits
+    /// 3 to 9 s for the next.
+    pub fn play_ambient(&mut self, town: bool, listener: Vec3) {
+        self.ambient_wait = 3.0 + self.random() * 6.0;
+        let n = self.ambient[usize::from(!town)].len();
+        if n == 0 {
+            return;
+        }
+        let pick = ((self.random() * n as f32) as usize).min(n - 1);
+        let angle = self.random() * std::f32::consts::TAU;
+        let distance = 10.0 + self.random() * 30.0;
+        let at = listener + Vec3::new(angle.cos() * distance, 2.0, angle.sin() * distance);
+        let buffer = self.ambient[usize::from(!town)][pick].clone();
+        self.out.with(|m| m.play(Play::at(buffer, at).gain(0.5)));
     }
 
     /// Decodes stream `i` of `which` ("music" or "ambience") on a thread.

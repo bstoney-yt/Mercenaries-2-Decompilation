@@ -43,6 +43,8 @@ const PAUSE: (f32, f32) = (2.0, 6.0);
 /// People are drawn this close to the camera, metres.
 pub const DRAW_DISTANCE: f32 = 200.0;
 const TURN_RATE: f32 = 6.0;
+/// Seconds the dead take to topple when no fall clip fits their model.
+const TOPPLE: f32 = 0.6;
 
 /// A person model and the rig that animates it.
 #[derive(Debug)]
@@ -118,6 +120,8 @@ pub struct Npc {
     clips: FightClips,
     /// The right-hand node, where the rifle is held.
     pub hand: Option<usize>,
+    /// Seconds since they died.
+    dead_for: f32,
 }
 
 impl Npc {
@@ -136,6 +140,7 @@ impl Npc {
         Self {
             clips,
             hand,
+            dead_for: 0.0,
             kind,
             soldier: spawn.is_some(),
             character: Character::new(at),
@@ -224,11 +229,19 @@ impl Npc {
         matches!(self.brain, Brain::Patrol { .. })
     }
 
-    /// Model to world, turned so the model faces `facing`.
+    /// Model to world, turned so the model faces `facing`. The dead
+    /// whose model has no fall clip that fits topple over backwards about
+    /// their feet instead.
     pub fn model_matrix(&self) -> Mat4 {
         let forward = self.rig.locomotion.as_ref().map_or(Vec2::Y, |l| l.forward);
-        Mat4::from_translation(self.character.position)
-            * Mat4::from_rotation_y(self.facing - forward.x.atan2(forward.y))
+        let turned = Mat4::from_translation(self.character.position)
+            * Mat4::from_rotation_y(self.facing - forward.x.atan2(forward.y));
+        if self.alive || self.clips.die.is_some() {
+            return turned;
+        }
+        let t = (self.dead_for / TOPPLE).min(1.0);
+        // Eased: slow to start, fast at the end, as a fall is.
+        turned * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2 * t * t)
     }
 
     fn update(&mut self, physics: &Physics, rng: &mut Rng, threat: Option<Vec3>, dt: f32) {
@@ -252,6 +265,7 @@ impl Npc {
             return;
         }
         if !self.alive {
+            self.dead_for += dt;
             self.rig.animator.advance(dt);
             return;
         }
@@ -485,6 +499,7 @@ impl People {
                 n.landed = false;
                 n.alive = true;
                 n.hp = 100.0;
+                n.dead_for = 0.0;
                 n.flee = None;
                 n.rig.set_gait(Gait::Idle);
                 n.brain = Brain::Wander {

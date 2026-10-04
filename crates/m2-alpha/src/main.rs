@@ -277,6 +277,9 @@ enum Mode {
 }
 
 /// Builds the scene on `backend` and points a camera at it.
+/// Frames timed before a screenshot.
+const FRAMES_TIMED: u32 = 60;
+
 fn build_scene(
     backend: &mut dyn RenderBackend,
     install: Option<&Install>,
@@ -415,10 +418,18 @@ fn screenshot(
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
-    for _ in 0..30 {
+    // The last frames are timed: the frame rate here, for checking.
+    let timed = Instant::now();
+    for _ in 0..FRAMES_TIMED {
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
+    let each = timed.elapsed().as_secs_f32() / FRAMES_TIMED as f32;
+    eprintln!(
+        "frames: {:.2} ms each ({:.0} fps) over {FRAMES_TIMED}, with a tick each",
+        each * 1000.0,
+        1.0 / each.max(1e-6)
+    );
     let people = &game.scene.people;
     eprintln!(
         "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",
@@ -1120,6 +1131,10 @@ impl Running {
         }
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
+        if self.audio.ambient_due(TICK.as_secs_f32()) {
+            let town = self.game.near_town();
+            self.audio.play_ambient(town, ear);
+        }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);
     }

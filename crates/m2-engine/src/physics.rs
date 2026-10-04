@@ -204,6 +204,8 @@ pub struct VehicleControls {
 struct VehicleBody {
     controller: DynamicRayCastVehicleController,
     mass: f32,
+    /// Which wheels steer (the front axle), in wheel order.
+    steers: Vec<bool>,
 }
 
 /// A character's capsule and motion.
@@ -405,6 +407,7 @@ impl Physics {
         self.vehicles.push(Some(VehicleBody {
             controller,
             mass: spec.mass,
+            steers: spec.wheels.iter().map(|w| w.steers).collect(),
         }));
         id
     }
@@ -434,9 +437,15 @@ impl Physics {
         } else {
             0.0
         };
-        for w in v.controller.wheels_mut() {
+        // Only the front axle steers: steering every wheel the same way
+        // slides the vehicle sideways instead of turning it.
+        for (i, w) in v.controller.wheels_mut().iter_mut().enumerate() {
             w.engine_force = force;
-            w.steering = steer;
+            w.steering = if v.steers.get(i).copied().unwrap_or(false) {
+                steer
+            } else {
+                0.0
+            };
             w.brake = brake;
         }
     }
@@ -771,7 +780,11 @@ mod tests {
         }
         let turned = at(&p);
         assert!(turned.x > ahead.x + 2.0, "{ahead} -> {turned}");
-        assert!(p.vehicle_wheels(id).iter().any(|w| w.0 > 0.1));
+        // It turns, not slides: the nose points right of where it was.
+        let nose = p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Z);
+        assert!(nose.x > 0.3, "still facing {nose}");
+        let wheels = p.vehicle_wheels(id);
+        assert!(wheels[0].0 > 0.1 && wheels[2].0 == 0.0, "{wheels:?}");
 
         // Braking stops it.
         for _ in 0..240 {

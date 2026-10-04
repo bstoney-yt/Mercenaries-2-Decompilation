@@ -26,6 +26,9 @@ struct Spot<'a> {
     yaw: f32,
 }
 
+/// How near a building the town's sounds play, metres.
+const TOWN_REACH: f32 = 150.0;
+
 /// The scripts put vehicles they don't need yet far under the island:
 /// those below this height aren't placed.
 const HIDDEN_BELOW: f32 = -1000.0;
@@ -69,6 +72,18 @@ impl Game {
             vehicle_wait: 0.0,
             startup: None,
         }
+    }
+
+    /// Among the town's buildings: a building placement (a town's batch
+    /// or a lone building) within [`TOWN_REACH`] of the listener.
+    pub fn near_town(&self) -> bool {
+        let (ear, _) = self.listener();
+        self.scene.world.as_ref().is_some_and(|w| {
+            w.index
+                .objects
+                .iter()
+                .any(|o| !o.named && o.position.distance(ear) < TOWN_REACH)
+        })
     }
 
     /// Island vehicles asked for that have not been placed yet.
