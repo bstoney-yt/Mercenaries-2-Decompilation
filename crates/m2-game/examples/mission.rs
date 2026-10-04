@@ -439,6 +439,24 @@ fn settle(
                 events,
             ));
         }
+        // Deliveries arrive at once, as layers load at once.
+        let mut delivered = 0;
+        for c in &commands {
+            if let Command::Goal {
+                guid,
+                goal,
+                location: Some(at),
+                ..
+            } = c
+                && goal == "Deliver"
+            {
+                println!("  delivery by {guid} arrived at {at:?}");
+                for e in api::arrived(world, *guid, *at) {
+                    println!("  goal callback: {}", first_lines(&e.to_string()));
+                }
+                delivered += 1;
+            }
+        }
         let requests: Vec<(LayerOp, String)> = commands
             .into_iter()
             .filter_map(|c| match c {
@@ -447,6 +465,10 @@ fn settle(
             })
             .collect();
         if requests.is_empty() {
+            if delivered > 0 {
+                commands = report(&format!("{when}, deliveries done"), host, world, events);
+                continue;
+            }
             if ran == 0 {
                 return;
             }
