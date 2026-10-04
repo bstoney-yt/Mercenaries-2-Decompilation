@@ -59,6 +59,8 @@ pub struct Game {
     pub startup: Option<Startup>,
     /// The start-up's state layers have their models up.
     props_up: bool,
+    /// The driver's throttle last tick, -1 (reverse) to 1.
+    pub throttle: f32,
 }
 
 impl Game {
@@ -76,6 +78,7 @@ impl Game {
             vehicle_wait: 0.0,
             startup: None,
             props_up: false,
+            throttle: 0.0,
         }
     }
 
@@ -262,9 +265,11 @@ impl Game {
                     .driving
                     .and_then(|i| scene.vehicles.get(i))
                     .and_then(|v| v.id.map(|id| (id, v)));
+                self.throttle = 0.0;
                 if let Some((id, v)) = id
                     && !v.wrecked
                 {
+                    self.throttle = intent.movement.y;
                     physics.drive(
                         id,
                         VehicleControls {
@@ -523,16 +528,27 @@ impl Game {
         ))
     }
 
-    /// The vehicle being driven's engine: its sound bank, speed (m/s) and
-    /// top speed.
-    pub fn engine(&self) -> Option<(&'static str, f32)> {
+    /// The vehicle being driven's engine: its sound bank (the one its
+    /// template names, else one for its kind), speed and throttle. A wreck
+    /// has none.
+    pub fn engine(&self) -> Option<crate::sound::EngineInput> {
         let i = self.scene.player.as_ref()?.driving?;
-        let v = self.scene.vehicles.get(i)?;
+        let v = self.scene.vehicles.get(i).filter(|v| !v.wrecked)?;
         let (_, speed) = self.driving()?;
-        Some((
-            crate::sound::engine_bank(&v.spec.kind, &v.spec.label),
+        let bank = self
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.index.template_db.engine_for_model(v.spec.model))
+            .unwrap_or_else(|| {
+                m2_assets::name_hash(crate::sound::engine_bank(&v.spec.kind, &v.spec.label))
+            });
+        Some(crate::sound::EngineInput {
+            bank,
             speed,
-        ))
+            top: if v.spec.tracked { 14.0 } else { 32.0 },
+            throttle: self.throttle,
+        })
     }
 
     /// Switches between walking and flying. Flying starts from the player's

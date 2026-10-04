@@ -638,7 +638,7 @@ fn screenshot(
     } else if options.blast && game.on_foot && game.scene.player.is_some() {
         blast_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
     } else if options.drive && game.on_foot && game.scene.player.is_some() {
-        drive_for_screenshot(&mut backend, &mut game, fov, aspect, options)?;
+        drive_for_screenshot(&mut backend, &mut game, fov, aspect, options, install)?;
     } else if game.on_foot && game.scene.player.is_some() {
         let gait = options.gait.unwrap_or(Gait::Idle);
         let intent = Intent {
@@ -996,6 +996,7 @@ fn drive_for_screenshot(
     fov: f32,
     aspect: f32,
     options: &Options,
+    install: Option<&Install>,
 ) -> anyhow::Result<()> {
     let tick = TICK.as_secs_f32();
     let started = Instant::now();
@@ -1098,6 +1099,29 @@ fn drive_for_screenshot(
             v.rolled,
             v.spec.pivot
         );
+        let templated = game
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.index.template_db.engine_for_model(v.spec.model))
+            .is_some();
+        if let Some(e) = game.engine() {
+            eprintln!(
+                "drive: engine bank {:08x} {} ({}), throttle {:.1}",
+                e.bank,
+                sound::bank_name(e.bank).unwrap_or("?"),
+                if templated {
+                    "its template's"
+                } else {
+                    "by kind"
+                },
+                e.throttle
+            );
+            // What it plays (read here: the picture has no sound).
+            if let Some(install) = install {
+                sound::load_engine(install, e.bank);
+            }
+        }
     }
     let npcs = &game.scene.people.npcs;
     let moved = npcs
@@ -1884,15 +1908,8 @@ impl Running {
         }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);
-        let engine = self.game.engine().map(|(bank, speed)| {
-            let top = if bank.starts_with("veh_tank") {
-                14.0
-            } else {
-                32.0
-            };
-            (bank, speed, top)
-        });
-        self.audio.engine(engine);
+        let engine = self.game.engine();
+        self.audio.engine(engine, TICK.as_secs_f32());
         let driving = self.game.driving().is_some();
         let mut remarks = self.game.combat.take_remarks();
         if driving && !self.was_driving {

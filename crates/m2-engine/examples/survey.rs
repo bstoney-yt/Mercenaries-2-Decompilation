@@ -41,8 +41,16 @@
 //!                           word, or whose own name does, with its
 //!                           components' fields (400 a layer at most)
 //! collision:<model>[,..]    a model's collision: each PHY2 shape (kind,
-//!                           node, radius, box in model space, sizes), or
-//!                           the visible geometry it falls back to
+//!                           node, radius, box in model space, sizes) and
+//!                           part (node, body, shape, place), or the
+//!                           visible geometry it falls back to
+//! phy2rules                 across all models, how many collision shapes
+//!                           land inside their model by each way of
+//!                           placing them (node, part places)
+//! engines[:<bank>,..]       engine banks (default all) by name hash: each
+//!                           sound's length, level, steadiness, zero
+//!                           crossings and pitch, what the alpha plays
+//!                           from it, and which templates name it
 //! vehicle:<word|model>[,..] vehicles whose label holds a word: what the
 //!                           alpha makes of them (wheels, tracked, turret),
 //!                           and every node with its geometry box and how
@@ -617,6 +625,8 @@ fn main() -> Result<(), Error> {
                 )
             }
             "collision" => collision(&mut source, &names, arg),
+            "phy2rules" => phy2_rules(&mut source),
+            "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
             "find" => {
@@ -1678,7 +1688,7 @@ fn collision<R: Read + Seek>(
                 .and_then(|n| m.nodes.get(n as usize))
                 .map_or("?", |n| names.show(n.name_hash));
             println!(
-                "  shape {k}: {kind}, node {node:?} {node_name}, radius {:.3}, {} vertices, {} triangles, box ({:.2} {:.2} {:.2}) to ({:.2} {:.2} {:.2})",
+                "  shape {k}: {kind}, node {node:?} {node_name}, radius {:.3}, {} vertices, {} triangles, box ({:.2} {:.2} {:.2}) to ({:.2} {:.2} {:.2}), part {}",
                 shape.radius,
                 v.len(),
                 t.len(),
@@ -1687,9 +1697,281 @@ fn collision<R: Read + Seek>(
                 lo.z,
                 hi.x,
                 hi.y,
-                hi.z
+                hi.z,
+                shape.part
             );
         }
+        for (i, part) in p.parts.iter().enumerate() {
+            let at = m
+                .node_to_model(part.node as u16)
+                .map(|n| n.w_axis.truncate());
+            println!(
+                "  part {i}: node {} {} at {:?}, body {:?}, shape {:?}, parent {:?}, position ({:.3} {:.3} {:.3}), rotation ({:.3} {:.3} {:.3} {:.3})",
+                part.node,
+                names.show(part.node_hash),
+                at.map(|a| format!("({:.2} {:.2} {:.2})", a.x, a.y, a.z)),
+                part.body,
+                part.shape,
+                part.parent,
+                part.position[0],
+                part.position[1],
+                part.position[2],
+                part.rotation[0],
+                part.rotation[1],
+                part.rotation[2],
+                part.rotation[3]
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Over every model's `PHY2`, how many shapes land inside the model's
+/// bounds (0.25 m slack) when placed by each rule: the body part's node
+/// (the alpha's), that node then the shape part's own place, that node
+/// then the body part's place, the shape part's place alone, and the
+/// shape part's own node then its place. Counts by shape kind, and how
+/// many parts carry a place at all.
+fn phy2_rules<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<(), Error> {
+    use m2_assets::physics::{Geometry, Physics as Phy2};
+    use m2_math::glam::{Mat4, Quat};
+    let index = source.archive().index();
+    let mut models: Vec<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    const RULES: [&str; 5] = [
+        "body node",
+        "body node * shape part",
+        "body node * body part",
+        "shape part alone",
+        "shape part's node * shape part",
+    ];
+    // Per kind: shapes, inside per rule.
+    let mut tally: BTreeMap<&str, (usize, [usize; 5])> = BTreeMap::new();
+    let (mut parts, mut placed_parts, mut with_phy2) = (0usize, 0usize, 0usize);
+    let mut examples: Vec<String> = Vec::new();
+    for h in models {
+        let Ok(data) = source.model(h) else { continue };
+        let Ok(m) = data.parse() else { continue };
+        let Some(Ok(p)) = m2_assets::Ucfx::parse(&data.base)
+            .ok()
+            .and_then(|u| u.top_level(*b"PHY2"))
+            .map(Phy2::parse)
+        else {
+            continue;
+        };
+        with_phy2 += 1;
+        let b = &m.info.bounds;
+        let (lo, hi) = (
+            Vec3::from(b.min) - Vec3::splat(0.25),
+            Vec3::from(b.max) + Vec3::splat(0.25),
+        );
+        let place = |part: &m2_assets::physics::Part| {
+            Mat4::from_rotation_translation(
+                Quat::from_array(part.rotation).normalize(),
+                Vec3::from(part.position),
+            )
+        };
+        let node = |n: u32| {
+            u16::try_from(n)
+                .ok()
+                .and_then(|n| m.node_to_model(n))
+                .unwrap_or(Mat4::IDENTITY)
+        };
+        for part in &p.parts {
+            parts += 1;
+            let q = Quat::from_array(part.rotation);
+            if Vec3::from(part.position).length() > 1e-3 || (q.w.abs() - 1.0).abs() > 1e-3 {
+                placed_parts += 1;
+            }
+        }
+        for (k, shape) in p.shapes.iter().enumerate() {
+            let kind = match &shape.geometry {
+                Geometry::Box { .. } => "box",
+                Geometry::Sphere => "sphere",
+                Geometry::Capsule { .. } => "capsule",
+                Geometry::Convex { .. } => "convex",
+                Geometry::Mesh { .. } => "mesh",
+            };
+            let Some(own) = p.parts.get(shape.part) else {
+                continue;
+            };
+            let body_part = p
+                .body_of(k)
+                .and_then(|body| p.parts.iter().find(|x| x.body == Some(body)));
+            let body_node = p.shape_node(k).map_or(Mat4::IDENTITY, node);
+            let rules = [
+                body_node,
+                body_node * place(own),
+                body_node * body_part.map_or(Mat4::IDENTITY, place),
+                place(own),
+                node(own.node) * place(own),
+            ];
+            let (v, _) = shape.geometry.triangles(shape.radius);
+            if v.is_empty() {
+                continue;
+            }
+            let e = tally.entry(kind).or_default();
+            e.0 += 1;
+            for (r, to_model) in rules.iter().enumerate() {
+                let (mut a, mut z) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                for x in &v {
+                    let q = to_model.transform_point3(Vec3::from(*x));
+                    a = a.min(q);
+                    z = z.max(q);
+                }
+                let mid = (a + z) * 0.5;
+                if mid.cmpge(lo).all() && mid.cmple(hi).all() {
+                    e.1[r] += 1;
+                }
+            }
+            if examples.len() < 12 && (Vec3::from(own.position).length() > 1e-3) {
+                examples.push(format!(
+                    "{h:08x} shape {k} {kind}: part {} node {} position ({:.2} {:.2} {:.2}) rotation ({:.2} {:.2} {:.2} {:.2}), body part node {:?}",
+                    shape.part,
+                    own.node,
+                    own.position[0],
+                    own.position[1],
+                    own.position[2],
+                    own.rotation[0],
+                    own.rotation[1],
+                    own.rotation[2],
+                    own.rotation[3],
+                    body_part.map(|b| b.node)
+                ));
+            }
+        }
+    }
+    println!(
+        "{with_phy2} models with PHY2; {parts} parts, {placed_parts} of them with a place (not identity)"
+    );
+    for (kind, (n, inside)) in &tally {
+        let shown: Vec<String> = RULES
+            .iter()
+            .zip(inside)
+            .map(|(r, k)| format!("{r} {k}"))
+            .collect();
+        println!(
+            "  {kind}: {n} shapes; inside the bounds by {}",
+            shown.join(", ")
+        );
+    }
+    for e in examples {
+        println!("  e.g. {e}");
+    }
+    Ok(())
+}
+
+/// The engine banks (all, or those named), read by name hash as the
+/// template database names them: each sound's measurements as the alpha
+/// takes them (length, level range over its tenths, steady or not, zero
+/// crossings and repeating pitch), with its name if known, then what the
+/// alpha would play (its loops, start and stop) and which templates name
+/// the bank.
+fn engines<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_engine::audio::EngineSounds;
+    const BANKS: [&str; 22] = [
+        "veh_semi",
+        "veh_bus",
+        "veh_jeep",
+        "veh_tankbig",
+        "veh_tankmed",
+        "veh_tanksmall",
+        "veh_tankdiesel",
+        "veh_8cylinderold",
+        "veh_8cylinderold_cobra",
+        "veh_8cylindertruck",
+        "veh_8cylindernew",
+        "veh_8cylinderluxury",
+        "veh_8cylinderjapanese",
+        "veh_4cylindernew",
+        "veh_4cylinderold",
+        "veh_4cylinderracing",
+        "veh_largedieselnew",
+        "veh_largedieselold",
+        "veh_largegasnew",
+        "veh_largegasold",
+        "veh_largegascrappy",
+        "veh_helicoptermedium",
+    ];
+    let banks: Vec<&str> = if arg.is_empty() {
+        BANKS.to_vec()
+    } else {
+        arg.split(',').collect()
+    };
+    let hashes: Vec<u32> = banks.iter().map(|b| m2_assets::name_hash(b)).collect();
+    let library = SoundLibrary::load_hashes(source, &hashes)?;
+    // Which templates name each bank.
+    let mut users: HashMap<u32, Vec<String>> = HashMap::new();
+    if let Ok(index) = WorldIndex::build(source) {
+        for (name, t) in &index.template_db.0 {
+            if let Some(bank) = t.engine {
+                users.entry(bank).or_default().push(name.clone());
+            }
+        }
+    }
+    for (bank, hash) in banks.iter().zip(&hashes) {
+        let Some((name, sounds)) = library.bank_hash(*hash) else {
+            println!("bank {bank} ({hash:08x}): not found");
+            continue;
+        };
+        let mut used = users.remove(hash).unwrap_or_default();
+        used.sort();
+        let shown = used.len().min(12);
+        println!(
+            "bank {name} ({hash:08x}): {} sounds; templates {}: {}{}",
+            sounds.len(),
+            used.len(),
+            used[..shown].join(" | "),
+            if used.len() > shown { " | ..." } else { "" }
+        );
+        for (i, s) in sounds.iter().enumerate() {
+            let tenths = s.tenths_db();
+            let (lo, hi) = tenths
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(lo, hi), &d| (lo.min(d), hi.max(d)));
+            println!(
+                "  {i:2} {:08x} {:7.2} s, tenths {lo:6.1}..{hi:6.1} dB (first {:6.1}, last {:6.1}), {}, {:5.0} crossings/s, pitch {}  {}",
+                s.hash,
+                s.seconds(),
+                tenths.first().copied().unwrap_or(-100.0),
+                tenths.last().copied().unwrap_or(-100.0),
+                if s.is_steady() { "steady" } else { "varies" },
+                s.crossing_rate(),
+                s.fundamental()
+                    .map_or("-".to_owned(), |f| format!("{f:.0} Hz")),
+                names.show(s.hash)
+            );
+        }
+        let e = EngineSounds::pick(name, sounds);
+        let loops: Vec<String> = e
+            .loops
+            .iter()
+            .map(|(s, f)| {
+                format!(
+                    "{:08x} ({})",
+                    s.hash,
+                    f.map_or("-".to_owned(), |f| format!("{f:.0} Hz"))
+                )
+            })
+            .collect();
+        println!(
+            "  plays {} loops{}: {}; start {:?}, stop {:?}",
+            e.loops.len(),
+            if e.named { " by name" } else { " measured" },
+            loops.join(", "),
+            e.start.map(|s| format!("{:08x}", s.hash)),
+            e.stop.map(|s| format!("{:08x}", s.hash))
+        );
     }
     Ok(())
 }
