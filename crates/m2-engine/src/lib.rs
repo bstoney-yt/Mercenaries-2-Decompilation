@@ -27,6 +27,6 @@ pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use audio::{Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
 pub use model::{CpuModel, GpuModel, MaterialCache};
 pub use physics::{Character, CollisionShape, Physics, StaticKey, VehicleControls, VehicleId};
-pub use stream::{World, WorldSettings, WorldStats};
+pub use stream::{Frustum, World, WorldSettings, WorldStats};
 pub use vehicle::{Catalogue, CatalogueEntry, PersonModel, VehicleSpec};
 pub use world::{TemplateInfo, TemplatePlacement, Templates, VehicleKind, WorldIndex};

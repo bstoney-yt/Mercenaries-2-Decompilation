@@ -948,17 +948,32 @@ impl WgpuBackend {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.frame_group, &[]);
+            // State is set only when it changes: the queue has sorted the
+            // draws so neighbours share pipelines, materials and buffers,
+            // and each command costs time to record and submit.
+            let mut pipeline_now: Option<&PipelineKey> = None;
+            let mut material_now = None;
+            let mut vertices_now = None;
+            let mut indices_now = None;
             for (i, d) in draws.iter().enumerate() {
-                let pipeline = &self.pipelines[&d.pipeline];
-                pass.set_pipeline(pipeline);
+                if pipeline_now != Some(&d.pipeline) {
+                    pass.set_pipeline(&self.pipelines[&d.pipeline]);
+                    pipeline_now = Some(&d.pipeline);
+                }
                 pass.set_bind_group(1, &self.draw_group, &[(i as u64 * DRAW_STRIDE) as u32]);
-                let material = self
-                    .materials
-                    .get(&d.material)
-                    .map_or(&self.default_material, |m| &m.bind_group);
-                pass.set_bind_group(2, material, &[]);
-                let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
-                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                if material_now != Some(d.material) {
+                    let material = self
+                        .materials
+                        .get(&d.material)
+                        .map_or(&self.default_material, |m| &m.bind_group);
+                    pass.set_bind_group(2, material, &[]);
+                    material_now = Some(d.material);
+                }
+                if vertices_now != Some(d.vertex_buffer.0) {
+                    let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
+                    pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                    vertices_now = Some(d.vertex_buffer.0);
+                }
                 match d.geometry {
                     Geometry::Vertices { first, count } => {
                         pass.draw(first..first + count, 0..d.instances);
@@ -969,11 +984,14 @@ impl WgpuBackend {
                         count,
                         base_vertex,
                     } => {
-                        let ib = self.index_buffers.get(buffer.0)?;
-                        pass.set_index_buffer(
-                            ib.buffer.slice(..),
-                            wgpu_index_format(ib.desc.format),
-                        );
+                        if indices_now != Some(buffer.0) {
+                            let ib = self.index_buffers.get(buffer.0)?;
+                            pass.set_index_buffer(
+                                ib.buffer.slice(..),
+                                wgpu_index_format(ib.desc.format),
+                            );
+                            indices_now = Some(buffer.0);
+                        }
                         pass.draw_indexed(first..first + count, base_vertex, 0..d.instances);
                     }
                 }

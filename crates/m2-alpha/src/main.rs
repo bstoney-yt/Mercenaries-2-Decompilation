@@ -83,6 +83,10 @@ struct Options {
     config_path: Option<PathBuf>,
     install: Option<PathBuf>,
     models: Vec<u32>,
+    /// With `--model`: a clip for each model to hold instead of a gait.
+    clips: Vec<u32>,
+    /// With `--model`: degrees to turn the models (90 shows their side).
+    turn: f32,
     spawn: Option<(f32, f32)>,
     gait: Option<Gait>,
     double_sided: bool,
@@ -115,6 +119,14 @@ fn parse_args() -> anyhow::Result<Options> {
                         .with_context(|| format!("--model {v}: expected a hex hash"))?,
                 );
             }
+            "--clip" => {
+                let v = value()?;
+                o.clips.push(
+                    u32::from_str_radix(v.trim_start_matches("0x"), 16)
+                        .with_context(|| format!("--clip {v}: expected a hex hash"))?,
+                );
+            }
+            "--turn" => o.turn = value()?.parse().context("--turn expects degrees")?,
             "--spawn" => {
                 let v = value()?;
                 let (x, z) = v.split_once(',').context("--spawn expects X,Z")?;
@@ -236,11 +248,21 @@ fn main() -> anyhow::Result<()> {
     // grid, which shows only the ground).
     let gait = options.gait.unwrap_or(Gait::Idle);
     let mode = if !options.models.is_empty() {
-        Mode::Models(options.models.clone(), gait)
+        Mode::Models(Showcase {
+            models: options.models.clone(),
+            gait,
+            clips: options.clips.clone(),
+            turn: options.turn,
+        })
     } else if install.is_some() {
         Mode::Island(options.spawn.unwrap_or(scene::DEFAULT_SPAWN))
     } else {
-        Mode::Models(vec![scene::DEFAULT_MODEL], gait)
+        Mode::Models(Showcase {
+            models: vec![scene::DEFAULT_MODEL],
+            gait,
+            clips: Vec::new(),
+            turn: 0.0,
+        })
     };
 
     if let Some(out) = &options.screenshot {
@@ -273,7 +295,18 @@ enum Mode {
     /// The streamed island, starting above (x, z).
     Island((f32, f32)),
     /// These models on a ground grid, characters in this gait.
-    Models(Vec<u32>, Gait),
+    Models(Showcase),
+}
+
+/// Models shown side by side (`--model`): what characters play.
+#[derive(Clone, Debug)]
+pub struct Showcase {
+    pub models: Vec<u32>,
+    pub gait: Gait,
+    /// A clip per model (by hash) held instead of the gait.
+    pub clips: Vec<u32>,
+    /// Degrees each model is turned about the vertical.
+    pub turn: f32,
 }
 
 /// Builds the scene on `backend` and points a camera at it.
@@ -301,9 +334,9 @@ fn build_scene(
                 };
                 scene.open_world(backend, install, settings, *spawn)?;
             }
-            Mode::Models(models, gait) => {
+            Mode::Models(show) => {
                 scene.open(install)?;
-                if let Err(e) = scene.load_models(backend, models, *gait) {
+                if let Err(e) = scene.load_models(backend, show) {
                     eprintln!("could not load models: {e:#}");
                 }
             }
@@ -352,8 +385,7 @@ fn render(
     game.scene.update(backend, focus)?;
     let mut queue = DrawQueue::new();
     backend.begin_frame(&view)?;
-    game.scene
-        .draw(backend, &mut queue, view.eye(), &game.combat)?;
+    game.scene.draw(backend, &mut queue, &view, &game.combat)?;
     queue.flush(&view, backend)?;
     match hud {
         Some(hud) => backend.end_frame_with(&mut |t| hud.paint(t))?,
@@ -439,7 +471,7 @@ fn screenshot(
         let mut queue = DrawQueue::new();
         backend.begin_frame(&view)?;
         game.scene
-            .draw(&mut backend, &mut queue, view.eye(), &game.combat)?;
+            .draw(&mut backend, &mut queue, &view, &game.combat)?;
         queue.flush(&view, &mut backend)?;
         split(2, &mut lap);
         backend.end_frame()?;

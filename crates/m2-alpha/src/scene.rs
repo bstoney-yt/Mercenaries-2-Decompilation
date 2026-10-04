@@ -1,6 +1,7 @@
 //! What is drawn: the streamed island, or (with `--model`) a ground grid
 //! with models from the install standing on it.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -10,15 +11,16 @@ use anyhow::Context as _;
 use m2_engine::anim::load_clips;
 use m2_engine::vehicle::{DRIVABLE, catalogue};
 use m2_engine::{
-    Animator, AssetSource, BoundClip, Catalogue, CatalogueEntry, CpuModel, Gait, GpuModel, Install,
-    Locomotion, MaterialCache, PersonModel, Skeleton, VehicleId, VehicleSpec, World, WorldSettings,
+    Animator, AssetSource, BoundClip, Catalogue, CatalogueEntry, CpuModel, Frustum, Gait, GpuModel,
+    Install, Locomotion, MaterialCache, PersonModel, Skeleton, VehicleId, VehicleSpec, World,
+    WorldSettings,
 };
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
     BlendMode, BufferUsage, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
     IndexFormat, Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, TextureDesc,
     TextureFormat, Topology, VertexBufferDesc, VertexBufferHandle, VertexFormat, VertexLayout,
-    VertexSemantic, generate_mips,
+    VertexSemantic, View, generate_mips,
 };
 
 use crate::cache;
@@ -450,16 +452,33 @@ impl Scene {
     pub fn load_models(
         &mut self,
         backend: &mut dyn RenderBackend,
-        hashes: &[u32],
-        gait: Gait,
+        show: &crate::Showcase,
     ) -> anyhow::Result<()> {
         let source = self.source.as_mut().context("no install open")?;
         let mut x = 0.0;
         let mut widest = 2.0f32;
-        for &hash in hashes {
+        let mut rigs: HashMap<u32, Rig> = HashMap::new();
+        for (i, &hash) in show.models.iter().enumerate() {
             let gpu = GpuModel::load(backend, source, &mut self.materials, hash, 0)?;
             let rig = if gpu.is_skinned() {
-                Some(Rig::load(source, hash, gait)?)
+                let mut rig = match rigs.get(&hash) {
+                    Some(r) => r.clone(),
+                    None => {
+                        let r = Rig::load(source, hash, show.gait)?;
+                        rigs.insert(hash, r.clone());
+                        r
+                    }
+                };
+                if let Some(&clip) = show.clips.get(i) {
+                    match rig.clips.iter().position(|c| c.hash == clip) {
+                        Some(k) => {
+                            eprintln!("model {i}: clip {clip:08x}");
+                            rig.animator.play(k);
+                        }
+                        None => eprintln!("model {i}: no clip {clip:08x} fits"),
+                    }
+                }
+                Some(rig)
             } else {
                 None
             };
@@ -483,9 +502,12 @@ impl Scene {
             widest = widest.max(size.x.max(size.z)).max(size.y);
             // Stand it on the ground, centred on x.
             let offset = Vec3::new(x - (lo.x + hi.x) * 0.5, -lo.y, -(lo.z + hi.z) * 0.5);
+            let centre = Vec3::new(x, 0.0, 0.0);
             self.models.push(Placed {
                 model: gpu,
-                world: Mat4::from_translation(offset),
+                world: Mat4::from_translation(centre)
+                    * Mat4::from_rotation_y(show.turn.to_radians())
+                    * Mat4::from_translation(offset - centre),
                 rig,
             });
             x += size.x.max(1.0) + 3.0;
@@ -734,11 +756,13 @@ impl Scene {
         &mut self,
         backend: &mut dyn RenderBackend,
         queue: &mut DrawQueue,
-        eye: Vec3,
+        view: &View,
         fight: &combat::Combat,
     ) -> anyhow::Result<()> {
+        let eye = view.eye();
         if let Some(world) = &mut self.world {
-            world.draw(backend, queue, eye)?;
+            let frustum = Frustum::from_view_proj(view.projection * view.view);
+            world.draw(backend, queue, eye, &frustum)?;
         } else {
             self.draw_ground(queue);
         }
@@ -1115,7 +1139,7 @@ mod tests {
             .draw(
                 &mut backend,
                 &mut queue,
-                Vec3::ZERO,
+                &view,
                 &crate::combat::Combat::default(),
             )
             .unwrap();
