@@ -49,6 +49,28 @@ Counted across the 645 scripts. The full lists are on the dev PC in
 The rest are the scripts' own `Mrx*` and `Wif*` modules and the standard
 Lua library.
 
+## Objectives on screen (traced 2026-10-04, VzaCon001)
+
+The scripts tell the HUD about objectives through these calls; the alpha
+draws its own HUD from them. Text is never literal: every visible string is
+a bracketed id such as `[VzaCon001.Objectives.001]`, joined with others and
+inline icon tags (`[objt][objdeliver]`), with progress appended as
+` (0/4)`. Where the string table is stored is not known yet (no plain or
+UTF-16 copy of the ids in English.wad).
+
+| Call | Arguments | Removed by |
+|---|---|---|
+| `Net.SendEvent_AddPDAMission` | mission index (VzaCon001 is 36), list of {text id, icon tag}, repeatable | re-sent whole when the list changes |
+| `Net.SendEvent_AddPdaObjective` | name, target guid, text id, PDA icon index, mission index, state (0-2), sort order | `RemovePdaObjective(name)` |
+| `Net.SendEvent_ObjectiveMessage` | inline icon index, `"add"` or `"cpl"`, text id, player guid or nil | (a message) |
+| `Net.SendEvent_AddRadarObjective` | name, x, y, z offset, r, g, b, width, height, radar icon index, target guid, sticky, rotate, oriented, sort order | `RemoveRadarObjective(name)` |
+| `Marker.AddBlip` | target guid, icon (`HUD_objective_deliverable`, `_action`, `_destroy`), size, r, g, b, a, height offset, near (5 m), far (175 m), size, mission id, 2D only; returns a handle | `Marker.Remove(handle)` |
+| `Net.SendEvent_AddMarkerObjective` | target guid, marker handle, r, g, b, height offset, world icon index, ..., near, far, mission id hash | `RemoveMarkerObjective(handle)` |
+
+`name` is the target guid as a string (`"734801"`), or `<mission>_PreMission`
+for the blip that starts a mission. `Net.SendCustomEvent(module, event,
+data, bool)` is script-to-script, not HUD.
+
 ## Plan
 
 1. **Run the scripts.** Load the game's bytecode into a stock Lua 5.1 VM

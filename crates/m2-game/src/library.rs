@@ -46,10 +46,22 @@ pub struct Library {
 /// The task classes are the trouble: subclasses call so many base-class
 /// members through `MrxTaskMission` and `MrxTaskObjective` that the match
 /// gave those names the base class and contracts.
-pub const KNOWN_MODULES: [(&str, u32); 4] = [
+pub const KNOWN_MODULES: [(&str, u32); 16] = [
+    ("MrxBoatDelivery", 0x5b6a_0cf6),
+    ("MrxClusterBomb", 0xeaf4_7b4a),
+    ("MrxCopterDrop", 0x3cca_21b4),
+    ("MrxCrateDelivery", 0x3534_ce91),
+    ("MrxDaisyCutter", 0xd913_5f63),
+    ("MrxMOAB", 0x0f1b_9dfd),
+    ("MrxSupportDelivery", 0x0eac_5ae9),
+    ("MrxSupportDesignatorFlare", 0x27c3_28f1),
+    ("MrxSupportDesignatorSmoke", 0xecb5_bbea),
     ("MrxTask", 0xd302_a66f),
     ("MrxTaskMission", 0xcfcd_908f),
     ("MrxTaskObjective", 0x517a_1910),
+    ("MrxTaskObjectiveDeliver", 0x72c1_306f),
+    ("MrxTaskObjectiveDestroy", 0xf554_9eba),
+    ("MrxTaskObjectiveVerify", 0x3cec_2cbb),
     ("MrxTaskRace", 0x2595_ba98),
 ];
 
@@ -125,7 +137,7 @@ impl Library {
     /// `Activated`, many scripts define.
     /// The best pairs are taken first and a script is one module only.
     ///
-    /// A module no script uses members of (a mission module such as
+    /// A module the member match leaves out (a mission such as
     /// `VzaCon001`, loaded by a name from data) is the script not already
     /// some module's that names it most often in its strings.
     pub fn resolve(&self, name: &str) -> Option<(&ScriptInfo, usize, usize)> {
@@ -135,14 +147,13 @@ impl Library {
             let used = self.used.get(&key).map_or(0, BTreeSet::len);
             return Some((&self.scripts[index], hits, used));
         }
-        if self.used.contains_key(&key) {
-            return None;
-        }
         let taken: BTreeSet<usize> = assigned.values().map(|&(i, _)| i).collect();
         self.scripts
             .iter()
             .enumerate()
-            .filter(|(i, _)| !taken.contains(i))
+            // A script never is a module it loads (a subclass inherits
+            // its base).
+            .filter(|(i, s)| !taken.contains(i) && !s.loads.contains(&key))
             .map(|(_, s)| (s.strings.iter().filter(|t| mentions(t, &key)).count(), s))
             .filter(|&(n, _)| n > 0)
             .max_by(|a, b| {
