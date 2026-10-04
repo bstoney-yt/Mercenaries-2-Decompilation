@@ -140,16 +140,21 @@ impl ScriptHost {
     }
 
     /// Makes every global the host doesn't define a stub, so a script runs
-    /// past libraries not written yet.
+    /// past libraries not written yet; see `default_for` for the globals
+    /// that get plain values instead.
     pub fn stub_missing_globals(&self) -> Result<(), ScriptError> {
         let meta = self.lua.create_table()?;
         meta.set(
             "__index",
             safe_function(&self.lua, |lua, args| match (args.front(), args.get(1)) {
                 (Some(Value::Table(g)), Some(Value::String(s))) => {
-                    let s = stub(lua, &s.to_string_lossy())?;
-                    g.raw_set(s.raw_get::<String>(STUB_NAME)?, &s)?;
-                    Ok(MultiValue::from_vec(vec![Value::Table(s)]))
+                    let name = s.to_string_lossy();
+                    let value = match default_for(lua, &name)? {
+                        Some(v) => v,
+                        None => Value::Table(stub(lua, &name)?),
+                    };
+                    g.raw_set(name, &value)?;
+                    Ok(MultiValue::from_vec(vec![value]))
                 }
                 _ => Ok(MultiValue::new()),
             })?,
@@ -251,22 +256,60 @@ impl ScriptHost {
             Ok(MultiValue::from_vec(vec![Value::Table(env)]))
         })?;
         self.lua.globals().set("__m2_module", module)?;
+        let notes = Rc::clone(&self.log);
+        self.lua.globals().set(
+            "__m2_note",
+            safe_function(&self.lua, move |_, args| {
+                if let Some(Value::String(s)) = args.front() {
+                    notes
+                        .borrow_mut()
+                        .push(format!("note: {}", s.to_string_lossy()));
+                }
+                Ok(MultiValue::new())
+            })?,
+        )?;
         self.lua
             .load(
                 r#"
                 local module = __m2_module
+                -- The environment of import's caller; the globals when the
+                -- host calls import itself. (Under pcall, level 1 is pcall,
+                -- 2 this function, 3 import and 4 its caller.)
+                local function caller()
+                    local ok, env = pcall(getfenv, 4)
+                    if ok and type(env) == "table" then return env end
+                    return _G
+                end
                 local function bind(env, name)
                     local m = module(name)
                     rawset(env, name, m)
                     return m
                 end
-                function import(name) return bind(getfenv(2), name) end
-                function dynamic_import(name) return bind(getfenv(2), name) end
+                -- Whether t's fallback chain reaches target.
+                local function reaches(t, target)
+                    for _ = 1, 64 do
+                        if t == target then return true end
+                        local meta = getmetatable(t)
+                        if type(meta) ~= "table" or type(meta.__index) ~= "table" then
+                            return false
+                        end
+                        t = meta.__index
+                    end
+                    return true
+                end
+                function import(name) return bind(caller(), name) end
+                function dynamic_import(name) return bind(caller(), name) end
                 function dynamic_remove(name) end
                 function inherit(name)
-                    local env = getfenv(2)
+                    local env = caller()
                     local base = bind(env, name)
-                    setmetatable(env, { __index = base })
+                    -- A wrongly resolved module could make a class its own
+                    -- ancestor; keep the globals as the fallback then.
+                    if env ~= _G and not reaches(base, env) then
+                        setmetatable(env, { __index = base })
+                    else
+                        __m2_note("inherit " .. tostring(name) .. " would loop")
+                    end
                     return base
                 end
                 "#,
@@ -299,6 +342,38 @@ impl ScriptHost {
     }
 }
 
+/// A value for a global the scripts read but nothing defines, from the
+/// type prefix of their naming convention (`nCount`, `sName`, `bActive`,
+/// `tList`): 0, "", false or an empty table. The screen size is the
+/// alpha's default window. `None` for other names, which become stubs.
+fn default_for(lua: &Lua, name: &str) -> mlua::Result<Option<Value>> {
+    let mut chars = name.chars();
+    let (Some(prefix), Some(next)) = (chars.next(), chars.next()) else {
+        return Ok(None);
+    };
+    if !next.is_ascii_uppercase() {
+        return Ok(None);
+    }
+    Ok(match (prefix, name) {
+        (_, "nScreenWidth") => Some(Value::Number(1600.0)),
+        (_, "nScreenHeight") => Some(Value::Number(900.0)),
+        ('n', _) => Some(Value::Number(0.0)),
+        ('s', _) => Some(Value::String(lua.create_string("")?)),
+        ('b', _) => Some(Value::Boolean(false)),
+        ('t', _) => Some(Value::Table(lua.create_table()?)),
+        _ => None,
+    })
+}
+
+/// Drops the "runtime error: " each nested call adds to a message.
+fn tidy(message: &str) -> &str {
+    let mut m = message;
+    while let Some(rest) = m.strip_prefix("runtime error: ") {
+        m = rest;
+    }
+    m
+}
+
 /// A function scripts can call that runs `f`.
 ///
 /// A Rust callback must never raise a Lua error itself: Lua 5.1 built as C
@@ -318,7 +393,7 @@ where
             }
             Err(e) => MultiValue::from_vec(vec![
                 Value::Boolean(false),
-                Value::String(lua.create_string(e.to_string())?),
+                Value::String(lua.create_string(tidy(&e.to_string()))?),
             ]),
         })
     })?;
@@ -414,6 +489,24 @@ mod tests {
             .unwrap();
         assert_eq!(ok.0, 7);
         assert!(ok.1.contains("no arguments"), "{}", ok.1);
+    }
+
+    #[test]
+    fn missing_globals_default_by_their_prefix() {
+        let host = ScriptHost::new().unwrap();
+        host.stub_missing_globals().unwrap();
+        let (h, n, s, b): (f64, f64, String, bool) = host
+            .lua()
+            .load("tList[1] = 2; return nScreenHeight / 2, nCount + 1, sName .. 'x', bActive")
+            .eval()
+            .unwrap();
+        assert_eq!((h, n, s.as_str(), b), (450.0, 1.0, "x", false));
+        let is_stub: bool = host
+            .lua()
+            .load("return getmetatable(Event) ~= nil and tList[1] == 2")
+            .eval()
+            .unwrap();
+        assert!(is_stub);
     }
 
     #[test]
