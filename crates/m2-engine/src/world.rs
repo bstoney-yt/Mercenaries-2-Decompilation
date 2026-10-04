@@ -556,7 +556,7 @@ pub enum TerrainSurface {
     Ground {
         colour_map: Option<u32>,
         detail_map: Option<u32>,
-        /// Texture and its (u, v) rows over cell-space (x, y, z, 1).
+        /// Texture and its (u, v) rows over world-space (x, y, z, 1).
         layers: Vec<(u32, [[f32; 4]; 2])>,
     },
     /// Roads, pavements, markings and other pieces laid into the cell,
@@ -576,7 +576,8 @@ impl TerrainSurface {
             } => colour_map
                 .map(|t| (t, false, true))
                 .into_iter()
-                .chain(detail_map.map(|t| (t, false, false)))
+                // Signed grain around mid-grey: data, not colour.
+                .chain(detail_map.map(|t| (t, true, false)))
                 .chain(layers.iter().map(|&(t, _)| (t, false, false)))
                 .collect(),
             Self::Surface(m) => crate::model::material_textures(m)

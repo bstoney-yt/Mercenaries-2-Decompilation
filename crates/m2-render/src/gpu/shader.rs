@@ -37,9 +37,16 @@ struct Material {
     detail: vec4<f32>,
     // rgb: highlight colour (0: none), a: exponent
     specular: vec4<f32>,
-    // x: specular map, y: normal map, z: normal x in alpha
+    // x: specular map, y: normal map, z: normal x in alpha, w: ground
     maps: vec4<f32>,
-    // Per ground layer, u then v as rows over model-space (x, y, z, 1).
+    // rgb: direct light tint, w: unused
+    direct: vec4<f32>,
+    // rgb: ambient light tint, w: unused
+    ambient: vec4<f32>,
+    // Ground: x, y: distance the colour map starts taking over and 1 / the
+    // distance it takes; z, w: the same for the detail map fading out.
+    ground: vec4<f32>,
+    // Per ground layer, u then v as rows over world-space (x, y, z, 1).
     layer_uv: array<vec4<f32>, 8>,
 };
 
@@ -66,8 +73,6 @@ struct Varyings {
     @location(3) color: vec4<f32>,
     // xyz: world-space tangent (0: none), w: handedness
     @location(4) tangent: vec4<f32>,
-    // Position before the model transform (ground layer coordinates).
-    @location(5) local_pos: vec3<f32>,
 };
 "#;
 
@@ -78,77 +83,96 @@ fn layer_uv(i: u32, p: vec4<f32>) -> vec2<f32> {
 
 @fragment
 fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let ground = material.maps.w > 0.5;
     var base = textureSample(base_map, base_sampler, v.uv) * material.color;
-    let layers = material.detail.w;
-    if material.params.z > 0.5 && layers < 0.5 {
-        base = base * v.color;
+    let ao = material.params.z > 0.5 && !ground;
+    if ao {
+        base.a = base.a * v.color.a;
     }
     if base.a < material.params.x {
         discard;
     }
     var rgb = base.rgb;
-    if layers > 0.5 {
-        // Ground: tiled layers weighted by the vertex colour, tinted by the
-        // whole-cell map against its own average.
-        let p = vec4<f32>(v.local_pos, 1.0);
-        let w = v.color;
-        let t0 = textureSample(layer0, detail_sampler, layer_uv(0u, p)).rgb;
-        let t1 = textureSample(layer1, detail_sampler, layer_uv(1u, p)).rgb;
-        let t2 = textureSample(layer2, detail_sampler, layer_uv(2u, p)).rgb;
-        let t3 = textureSample(layer3, detail_sampler, layer_uv(3u, p)).rgb;
-        var weights = vec4<f32>(w.x, select(0.0, w.y, layers > 1.5), select(0.0, w.z, layers > 2.5), select(0.0, w.w, layers > 3.5));
-        let total = weights.x + weights.y + weights.z + weights.w;
-        if total < 0.001 {
-            weights = vec4<f32>(1.0, 0.0, 0.0, 0.0);
-        } else {
-            weights = weights / total;
+    let dist = distance(v.world_pos, frame.eye.xyz);
+    // Sampled outside branches: derivatives need uniform control flow.
+    let p = vec4<f32>(v.world_pos, 1.0);
+    let t0 = textureSample(layer0, detail_sampler, layer_uv(0u, p)).rgb;
+    let t1 = textureSample(layer1, detail_sampler, layer_uv(1u, p)).rgb;
+    let t2 = textureSample(layer2, detail_sampler, layer_uv(2u, p)).rgb;
+    let t3 = textureSample(layer3, detail_sampler, layer_uv(3u, p)).rgb;
+    let detail_uv = v.world_pos.xz * material.detail.x;
+    let detail_texel = textureSample(detail_map, detail_sampler, detail_uv).rgb;
+    if ground {
+        // As the game's terrain shaders: the vertex colour weights the
+        // tiled layers (r the first), the colour map makes up any shortfall
+        // and takes over with distance, and the detail map adds signed
+        // grain up close.
+        let layers = material.detail.w;
+        let c = v.color * vec4<f32>(1.0, select(0.0, 1.0, layers > 1.5), select(0.0, 1.0, layers > 2.5), select(0.0, 1.0, layers > 3.5));
+        let s = select(0.0, c.x + c.y + c.z + c.w, layers > 0.5);
+        let w_global = clamp(max((dist - material.ground.x) * material.ground.y, 1.0 - s), 0.0, 1.0);
+        let w = c * clamp((1.0 - w_global) / (s + 1e-5), 0.0, 1.0);
+        rgb = base.rgb * w_global + t0 * w.x + t1 * w.y + t2 * w.z + t3 * w.w;
+        if material.detail.x > 0.0 {
+            let w_detail = clamp(1.0 - (dist - material.ground.z) * material.ground.w, 0.0, 1.0);
+            rgb = max(rgb + 2.0 * (detail_texel - 0.5) * w_detail, vec3<f32>(0.0));
         }
-        let tiled = t0 * weights.x + t1 * weights.y + t2 * weights.z + t3 * weights.w;
-        rgb = rgb * tiled * 2.0;
-    }
-    if material.detail.x > 0.0 {
+    } else if material.detail.x > 0.0 {
         // Each texel against the map's average (its smallest mip), so the
         // base colour keeps its brightness.
-        let uv = v.world_pos.xz * material.detail.x;
-        let texel = textureSample(detail_map, detail_sampler, uv).rgb;
-        let mean = textureSampleLevel(detail_map, detail_sampler, uv, 16.0).rgb;
-        let fade = clamp(1.0 - distance(v.world_pos, frame.eye.xyz) / material.detail.y, 0.0, 1.0);
-        rgb = rgb * mix(vec3<f32>(1.0), texel / max(mean, vec3<f32>(0.05)), fade);
+        let mean = textureSampleLevel(detail_map, detail_sampler, detail_uv, 16.0).rgb;
+        let fade = clamp(1.0 - dist / material.detail.y, 0.0, 1.0);
+        rgb = rgb * mix(vec3<f32>(1.0), detail_texel / max(mean, vec3<f32>(0.05)), fade);
     }
     let spec_texel = textureSample(specular_map, base_sampler, v.uv).rgb;
     let normal_texel = textureSample(normal_map, base_sampler, v.uv);
     if material.params.y > 0.5 {
-        var n = normalize(v.normal);
+        var n = v.normal;
         if !front {
             n = -n;
         }
         if material.maps.y > 0.5 && dot(v.tangent.xyz, v.tangent.xyz) > 1e-6 {
-            let t = normalize(v.tangent.xyz - n * dot(n, v.tangent.xyz));
+            // As the game decodes them: x in alpha, y in green, and z from
+            // 1 - x² - 2y (linear in y, as its shaders have it).
+            let t = v.tangent.xyz;
             let b = cross(n, t) * select(1.0, sign(v.tangent.w), abs(v.tangent.w) > 0.5);
             var xy = normal_texel.xy;
             if material.maps.z > 0.5 {
                 xy = normal_texel.wy;
             }
             xy = xy * 2.0 - 1.0;
-            let z = sqrt(max(1.0 - dot(xy, xy), 0.0));
-            n = normalize(t * xy.x + b * xy.y + n * z);
+            let z = sqrt(abs(1.0 - xy.x * xy.x - 2.0 * xy.y));
+            n = t * xy.x + b * xy.y + n * z;
         }
+        n = normalize(n);
         let l = -normalize(frame.sun_dir.xyz);
-        let diffuse = max(dot(n, l), 0.0);
-        var lit = rgb * (frame.ambient.rgb + frame.sun_color.rgb * diffuse);
-        if dot(material.specular.rgb, material.specular.rgb) > 0.0 && diffuse > 0.0 {
+        let n_dot_l = dot(n, l);
+        var lit: vec3<f32>;
+        if ground {
+            lit = rgb * (frame.sun_color.rgb * max(n_dot_l, 0.0) + frame.ambient.rgb);
+        } else {
+            let direct = clamp(frame.sun_color.rgb * max(n_dot_l, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
+            lit = rgb * (direct * material.direct.rgb + frame.ambient.rgb * material.ambient.rgb);
+        }
+        if dot(material.specular.rgb, material.specular.rgb) > 0.0 && n_dot_l > 0.0 {
+            // Blinn-Phong, never shadowed below a quarter.
             let view = normalize(frame.eye.xyz - v.world_pos);
             let h = normalize(l + view);
             var strength = material.specular.rgb;
             if material.maps.x > 0.5 {
                 strength = strength * spec_texel;
             }
-            lit = lit + frame.sun_color.rgb * strength * pow(max(dot(n, h), 0.0), material.specular.a);
+            let n_dot_h = dot(n, h);
+            if n_dot_h > 0.0 {
+                lit = lit + frame.sun_color.rgb * strength * pow(n_dot_h, material.specular.a);
+            }
         }
         rgb = lit;
     }
+    if ao {
+        rgb = rgb * v.color.rgb;
+    }
     if material.params.w > 0.5 && frame.sky.a > 0.0 {
-        let dist = distance(v.world_pos, frame.eye.xyz);
         let f = exp(-frame.sky.a * dist);
         rgb = mix(frame.sky.rgb, rgb, f);
     }
@@ -248,8 +272,7 @@ pub fn source(layout: &VertexLayout) -> String {
 fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
     var local = vec4<f32>({position}, 1.0);
     var normal = {normal};
-    var tangent = {tangent};
-    let rest = local.xyz;{skin}
+    var tangent = {tangent};{skin}
     var model = draw.world;
     if draw.skin.w > 0u {{
         model = model * palette[draw.skin.z + min(instance, draw.skin.w - 1u)];
@@ -262,7 +285,6 @@ fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
     out.uv = {uv};
     out.color = {color};
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
-    out.local_pos = rest;
     return out;
 }}
 "#

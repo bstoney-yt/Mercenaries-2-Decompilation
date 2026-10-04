@@ -997,9 +997,9 @@ fn ground_key(
     key
 }
 
-/// How ground is drawn: the cell's colour map clamped over the cell, the
-/// detail map tiled up close, and the tiled layers. Textures not yet loaded
-/// are left out.
+/// How ground is drawn (see [`MaterialDesc::ground`]): the cell's colour
+/// map clamped over the cell, the detail map tiled up close, and the tiled
+/// layers. Textures not yet loaded are left out.
 fn ground_material(
     materials: &MaterialCache,
     colour_map: Option<u32>,
@@ -1035,6 +1035,7 @@ fn ground_material(
             tile: DETAIL_TILE,
         }),
         layers: out,
+        ground: true,
         ..MaterialDesc::default()
     }
 }

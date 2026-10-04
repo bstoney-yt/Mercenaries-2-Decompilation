@@ -212,6 +212,26 @@ impl MaterialCache {
                 [0.6, 0.6, 0.6, 1.0]
             },
             vertex_color: technique.is_some_and(|t| t.ambient_occlusion),
+            // materialData's diffuse and ambient colours; which constants
+            // feed them is read from how they vary, not confirmed.
+            direct: if technique.is_some() {
+                [
+                    material.constants[0],
+                    material.constants[1],
+                    material.constants[2],
+                ]
+            } else {
+                [1.0; 3]
+            },
+            ambient: if technique.is_some() {
+                [
+                    material.constants[6],
+                    material.constants[7],
+                    material.constants[8],
+                ]
+            } else {
+                [1.0; 3]
+            },
             specular,
             normal_map,
             depth_bias,
