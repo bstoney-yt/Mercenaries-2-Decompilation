@@ -151,7 +151,7 @@ pub fn hands(skeleton: &Skeleton) -> Option<(usize, usize)> {
 }
 
 /// How far below level a weapon carried in one hand points, radians.
-const CARRY_DOWN: f32 = 0.9;
+const CARRY_DOWN: f32 = 0.75;
 /// And how far out to the side, radians.
 const CARRY_OUT: f32 = 0.17;
 
