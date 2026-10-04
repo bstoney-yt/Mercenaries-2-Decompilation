@@ -62,8 +62,10 @@ pub struct Rig {
     /// The pose holds a rifle in both hands (aiming, or at the ready).
     pub two_handed: bool,
     /// Where an aimed rifle should point, model space: the pose is turned
-    /// so the barrel (right hand to left) lies along it.
+    /// so the barrel (rear hand to front) lies along it.
     pub aim: Option<Vec3>,
+    /// (rear, front) hands of the aim pose, found once.
+    pub(crate) hands: std::sync::OnceLock<Option<(usize, usize)>>,
 }
 
 /// How a rifle is held.
@@ -163,6 +165,7 @@ impl Rig {
             upper: crate::combat::upper_body(&skeleton),
             two_handed: false,
             aim: None,
+            hands: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion: Some(Locomotion {
@@ -180,6 +183,7 @@ impl Rig {
             upper: crate::combat::upper_body(&skeleton),
             two_handed: false,
             aim: None,
+            hands: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion,
@@ -233,6 +237,12 @@ impl Rig {
         Some(pose)
     }
 
+    /// The (rear, front) hands of the aim pose
+    /// ([`aim_hands`](crate::combat::aim_hands)).
+    pub fn aim_hands(&self) -> Option<(usize, usize)> {
+        *self.hands.get_or_init(|| crate::combat::aim_hands(self))
+    }
+
     /// Aims along `dir` (world space) for a body turned to `facing`, or
     /// stops aiming (`None`).
     pub fn aim_along(&mut self, facing: f32, dir: Option<Vec3>) {
@@ -246,9 +256,9 @@ impl Rig {
 
     /// How far the rifle in an aiming pose points off `want` (model
     /// space): (yaw, pitch) radians to turn it by, the barrel taken as the
-    /// line from the right hand to the left.
+    /// line from the rear hand to the front.
     pub fn aim_error(&self, pose: &Pose, want: Vec3) -> Option<(f32, f32)> {
-        let (rh, lh) = crate::combat::hands(&self.skeleton)?;
+        let (rh, lh) = self.aim_hands()?;
         let nodes = self.skeleton.model_matrices(pose);
         let barrel = (nodes[lh].w_axis - nodes[rh].w_axis).truncate();
         let (b, w) = (barrel.normalize_or_zero(), want.normalize_or_zero());
