@@ -59,6 +59,8 @@ pub struct Rig {
     pub gait: Gait,
     /// The upper body's nodes, for clips laid over the legs.
     pub upper: Option<Arc<[bool]>>,
+    /// The pose holds a rifle in both hands (aiming, or at the ready).
+    pub two_handed: bool,
 }
 
 /// How a rifle is held.
@@ -156,6 +158,7 @@ impl Rig {
         }
         Some(Self {
             upper: crate::combat::upper_body(&skeleton),
+            two_handed: false,
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion: Some(Locomotion {
@@ -171,6 +174,7 @@ impl Rig {
         let locomotion = Locomotion::choose(&clips);
         let mut rig = Self {
             upper: crate::combat::upper_body(&skeleton),
+            two_handed: false,
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion,
@@ -208,7 +212,9 @@ impl Rig {
             }
             None => self.set_gait(gait),
         }
-        self.animator.set_upper(upper.zip(self.upper.clone()));
+        let upper = upper.zip(self.upper.clone());
+        self.two_handed = whole.is_some() || upper.is_some();
+        self.animator.set_upper(upper);
     }
 
     /// The next gait, slowest after fastest.
@@ -836,7 +842,9 @@ impl Scene {
             };
             if !player.down
                 && let Some(w) = weapon
-                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, self.arsenal.hands)
+                && let Some(at) =
+                    self.arsenal
+                        .in_hand(w, body, &nodes, self.arsenal.hand, rig.two_handed)
             {
                 w.model.draw(queue, at);
             }
@@ -852,7 +860,9 @@ impl Scene {
             if n.soldier
                 && n.alive
                 && let Some(w) = &self.arsenal.rifle
-                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, n.hands)
+                && let Some(at) = self
+                    .arsenal
+                    .in_hand(w, body, &nodes, n.hand, n.rig.two_handed)
             {
                 w.model.draw(queue, at);
             }

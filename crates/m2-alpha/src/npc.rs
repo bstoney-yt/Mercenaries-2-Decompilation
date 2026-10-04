@@ -136,7 +136,7 @@ pub struct Npc {
     /// The aim and fall clips in this person's rig.
     clips: FightClips,
     /// The hand nodes (right, left), where the rifle is held.
-    pub hands: Option<crate::combat::Hands>,
+    pub hand: Option<usize>,
     /// Seconds since they died.
     dead_for: f32,
     /// Has shouted since they were last calm.
@@ -164,10 +164,10 @@ impl Npc {
         let mut rig = rig.clone();
         rig.set_gait(Gait::Idle);
         let clips = FightClips::find(&rig);
-        let hands = crate::combat::hands(&rig.skeleton);
+        let hand = crate::combat::right_hand(&rig.skeleton);
         Self {
             clips,
-            hands,
+            hand,
             dead_for: 0.0,
             shouted: false,
             kind,
@@ -200,6 +200,7 @@ impl Npc {
             self.alert = false;
             self.flee = None;
             self.rig.animator.set_upper(None);
+            self.rig.two_handed = false;
             if let Some(die) = clips.die {
                 self.rig.animator.play_once(die);
             }
@@ -712,6 +713,7 @@ pub(crate) mod tests {
             animator: Animator::default(),
             gait: Gait::Idle,
             upper: None,
+            two_handed: false,
         }
     }
 

@@ -223,7 +223,12 @@ impl Player {
             if jump.is_some() {
                 self.jumping = true;
                 if let Some(clip) = self.clips.jump {
-                    rig.animator.play_leveled(clip);
+                    // At the height she stands at, so the take-off's
+                    // crouch doesn't sink her.
+                    let hips = rig
+                        .gait_clip(Gait::Idle)
+                        .map_or(1.0, |i| rig.clips[i].info.hips);
+                    rig.animator.play_leveled(clip, hips);
                 }
             } else if self.jumping && self.character.grounded {
                 self.jumping = false;
@@ -237,6 +242,7 @@ impl Player {
                 } else {
                     rig.gait_clip(Gait::Idle)
                 };
+                rig.two_handed = self.aiming && upper.is_some();
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
             } else {
                 rig.hold_rifle(gait, &self.clips, carry);

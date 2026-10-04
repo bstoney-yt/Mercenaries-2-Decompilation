@@ -74,8 +74,8 @@ pub struct Arsenal {
     pub rpg: Option<WeaponModel>,
     pub rocket: Option<WeaponModel>,
     pub grenade: Option<WeaponModel>,
-    /// The hands' and pelvis's nodes in the human skeleton.
-    pub hands: Option<Hands>,
+    /// The right hand's node in the human skeleton.
+    pub hand: Option<usize>,
 }
 
 impl Arsenal {
@@ -84,7 +84,7 @@ impl Arsenal {
         let grip = rig.and_then(|r| grip(r, muzzle)).unwrap_or(Mat4::IDENTITY);
         let carry = rig.and_then(|r| carry(r, muzzle));
         if let Some(r) = rig {
-            self.hands = hands(&r.skeleton);
+            self.hand = right_hand(&r.skeleton);
         }
         let w = Some(WeaponModel {
             model,
@@ -102,23 +102,20 @@ impl Arsenal {
     }
 
     /// Weapon to world for a character drawn at `body` with posed node
-    /// matrices `nodes` and its hands at `hands`: held in both when they
-    /// are raised above the waist close together, else carried in the
-    /// right.
+    /// matrices `nodes` and its right hand at node `hand`: held in both
+    /// hands (`two_handed`: a pose made for it, aiming or at the ready),
+    /// else carried in the right.
     pub fn in_hand(
         &self,
         weapon: &WeaponModel,
         body: Mat4,
         nodes: &[Mat4],
-        hands: Option<Hands>,
+        hand: Option<usize>,
+        two_handed: bool,
     ) -> Option<Mat4> {
-        let h = hands?;
-        let (right, left) = (nodes.get(h.right)?, nodes.get(h.left)?);
-        let (pr, pl) = (right.w_axis.truncate(), left.w_axis.truncate());
-        let waist = nodes.get(h.pelvis)?.w_axis.y + RAISED;
-        let both = pr.distance(pl) < TWO_HANDED && pr.y > waist && pl.y > waist;
+        let right = nodes.get(hand?)?;
         match weapon.carry {
-            Some((at, turn)) if !both => {
+            Some((at, turn)) if !two_handed => {
                 Some(body * Mat4::from_rotation_translation(turn, right.transform_point3(at)))
             }
             _ => Some(body * *right * weapon.grip),
@@ -132,28 +129,11 @@ pub fn upper_body(skeleton: &Skeleton) -> Option<std::sync::Arc<[bool]>> {
     skeleton.upper_body(node(skeleton, RIGHT_HAND)?, node(skeleton, LEFT_HAND)?)
 }
 
-/// The nodes a weapon is held by.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Hands {
-    pub right: usize,
-    pub left: usize,
-    pub pelvis: usize,
+/// The right-hand node of a human skeleton.
+pub fn right_hand(skeleton: &Skeleton) -> Option<usize> {
+    node(skeleton, RIGHT_HAND)
 }
 
-/// The hand and pelvis nodes of a human skeleton.
-pub fn hands(skeleton: &Skeleton) -> Option<Hands> {
-    Some(Hands {
-        right: node(skeleton, RIGHT_HAND)?,
-        left: node(skeleton, LEFT_HAND)?,
-        pelvis: skeleton.pelvis()?,
-    })
-}
-
-/// Hands closer than this, metres, and both this far above the pelvis,
-/// hold a weapon between them (hands hanging at the sides are about as
-/// close, but low).
-const TWO_HANDED: f32 = 0.7;
-const RAISED: f32 = 0.1;
 /// How far below level a weapon carried in one hand points, radians.
 const CARRY_DOWN: f32 = 0.6;
 /// And how far out to the side, radians.
@@ -478,7 +458,13 @@ impl Combat {
         };
         let (nodes, _) = rig.posed();
         f.arsenal
-            .in_hand(w, f.player.model_matrix(), &nodes, f.arsenal.hands)
+            .in_hand(
+                w,
+                f.player.model_matrix(),
+                &nodes,
+                f.arsenal.hand,
+                rig.two_handed,
+            )
             .map_or(chest, |m| m.transform_point3(w.muzzle))
     }
 
@@ -509,7 +495,7 @@ impl Combat {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
                 f.arsenal
-                    .in_hand(w, n.model_matrix(), &nodes, n.hands)
+                    .in_hand(w, n.model_matrix(), &nodes, n.hand, n.rig.two_handed)
                     .map_or(n.chest(), |m| m.transform_point3(w.muzzle))
             }
             _ => n.chest(),
@@ -578,6 +564,7 @@ impl Combat {
             f.player.aiming = false;
             if let (Some(die), Some((_, rig))) = (f.people.clips.die, &mut f.player.model) {
                 rig.animator.set_upper(None);
+                rig.two_handed = false;
                 rig.animator.play_once(die);
             }
             f.people.stand_down();

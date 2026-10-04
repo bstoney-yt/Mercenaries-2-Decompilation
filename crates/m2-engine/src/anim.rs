@@ -504,9 +504,9 @@ struct Playing {
     clip: usize,
     time: f32,
     once: bool,
-    /// Keeps the pelvis at its first frame's height (a jump: the body
-    /// rises in the game's physics, not in the clip).
-    level: bool,
+    /// Keeps the pelvis at this height, metres (a jump: the body rises in
+    /// the game's physics, not in the clip).
+    level: Option<f32>,
 }
 
 /// A clip the upper body plays over the rest (a rifle held while the legs
@@ -545,25 +545,26 @@ impl Animator {
     /// Switches to clip `index`, looped (no-op if it is already playing),
     /// fading from the current one.
     pub fn play(&mut self, index: usize) {
-        self.start(index, false, false);
+        self.start(index, false, None);
     }
 
     /// Plays clip `index` once from the start and holds its last frame
     /// (a fall, a reaction), fading quickly from the current one.
     pub fn play_once(&mut self, index: usize) {
-        self.start(index, true, false);
+        self.start(index, true, None);
         self.fade_time = 0.1;
     }
 
     /// Plays clip `index` once like [`play_once`](Self::play_once), with
-    /// the pelvis held at its starting height: a jump whose rise the
-    /// physics already gives the character.
-    pub fn play_leveled(&mut self, index: usize) {
-        self.start(index, true, true);
+    /// the pelvis held at `hips` metres (standing height): a jump whose
+    /// rise the physics already gives the character, and whose crouch
+    /// shouldn't sink her into the ground.
+    pub fn play_leveled(&mut self, index: usize, hips: f32) {
+        self.start(index, true, Some(hips));
         self.fade_time = 0.1;
     }
 
-    fn start(&mut self, clip: usize, once: bool, level: bool) {
+    fn start(&mut self, clip: usize, once: bool, level: Option<f32>) {
         if self
             .current
             .is_some_and(|c| c.clip == clip && c.once == once && c.level == level)
@@ -628,10 +629,10 @@ impl Animator {
                     c.sample_looped(skeleton, p.time)
                 };
                 pose.strip_root_motion(skeleton.root(), c.info.pin);
-                if p.level
+                if let Some(hips) = p.level
                     && let Some(pelvis) = skeleton.pelvis()
                 {
-                    let rise = skeleton.model_matrices(&pose)[pelvis].w_axis.y - c.info.hips;
+                    let rise = skeleton.model_matrices(&pose)[pelvis].w_axis.y - hips;
                     pose.0[skeleton.root()].translation.y -= rise;
                 }
                 pose
