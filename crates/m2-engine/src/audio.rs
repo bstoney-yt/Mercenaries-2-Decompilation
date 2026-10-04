@@ -23,7 +23,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use m2_assets::sound::{SOUND_BANK_TYPE, decode_xbox_adpcm};
-use m2_assets::{BlockContents, SoundBank, StreamIndex};
+use m2_assets::voice::CUE_TABLE_TYPE;
+use m2_assets::{BlockContents, CueTable, SoundBank, StreamIndex};
 use m2_math::glam::Vec3;
 
 use crate::assets::{AssetError, AssetSource, Install};
@@ -477,27 +478,115 @@ impl Streams {
 
     /// Reads and decodes stream `i` of `index` (one of this set's).
     pub fn decode(&self, index: &StreamIndex, i: usize) -> Result<SoundBuffer, AssetError> {
-        let path = self.dir.join(&index.file);
+        decode_stream(&self.dir.join(&index.file), index, i)
+    }
+}
+
+/// Reads and decodes stream `i` of `index` from the stream file at `path`.
+fn decode_stream(
+    path: &std::path::Path,
+    index: &StreamIndex,
+    i: usize,
+) -> Result<SoundBuffer, AssetError> {
+    let io = |source| AssetError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let s = index.streams.get(i).ok_or_else(|| {
+        io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no stream {i}"),
+        ))
+    })?;
+    let mut f = File::open(path).map_err(io)?;
+    f.seek(SeekFrom::Start(u64::from(s.offset))).map_err(io)?;
+    let mut data = vec![0u8; s.encoded_len as usize];
+    f.read_exact(&mut data).map_err(io)?;
+    Ok(SoundBuffer {
+        hash: s.hash,
+        channels: s.channels,
+        rate: s.rate,
+        samples: decode_xbox_adpcm(&data, s.channels).into(),
+    })
+}
+
+/// The characters' voices: the voice stream (`vo_stream.english.pws`)
+/// and the resident voice sets' cue tables, from `English.wad`. A set is
+/// keyed by the name hash of its name (`vo_jen`); each line names the
+/// stream it plays and is keyed by its subtitle's text id.
+#[derive(Debug, Clone)]
+pub struct Voices {
+    path: PathBuf,
+    pub index: StreamIndex,
+    pub sets: Vec<CueTable>,
+}
+
+impl Voices {
+    /// Reads the voice index and the `vo_resident` cue tables from the
+    /// install's `English.wad`.
+    pub fn load(install: &Install) -> Result<Self, AssetError> {
+        let wad = install.data.join("English.wad");
         let io = |source| AssetError::Io {
-            path: path.clone(),
+            path: wad.clone(),
             source,
         };
-        let s = index.streams.get(i).ok_or_else(|| {
+        let file = File::open(&wad).map_err(io)?;
+        let mut source = AssetSource::new(std::io::BufReader::new(file))?;
+        let paths: Vec<String> = source
+            .archive()
+            .index()
+            .blocks()
+            .iter()
+            .map(|b| b.path.clone())
+            .collect();
+        let (mut index, mut sets) = (None, Vec::new());
+        for (b, path) in paths.iter().enumerate() {
+            let resident = path.contains("vo_resident");
+            if !resident && !path.contains("\\resident_P") {
+                continue;
+            }
+            let decoded = source.block(b)?;
+            for (e, data) in BlockContents::parse(&decoded)?.iter() {
+                match e.type_hash {
+                    SOUND_BANK_TYPE => {
+                        if let Ok(i) = StreamIndex::parse(data)
+                            && i.file.starts_with("vo_stream")
+                        {
+                            index = Some(i);
+                        }
+                    }
+                    CUE_TABLE_TYPE if resident => {
+                        if let Ok(t) = CueTable::parse(data) {
+                            sets.push(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let index = index.ok_or_else(|| {
             io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("no stream {i}"),
+                "no voice stream index",
             ))
         })?;
-        let mut f = File::open(&path).map_err(io)?;
-        f.seek(SeekFrom::Start(u64::from(s.offset))).map_err(io)?;
-        let mut data = vec![0u8; s.encoded_len as usize];
-        f.read_exact(&mut data).map_err(io)?;
-        Ok(SoundBuffer {
-            hash: s.hash,
-            channels: s.channels,
-            rate: s.rate,
-            samples: decode_xbox_adpcm(&data, s.channels).into(),
+        // On disk the stream carries the language: `vo_stream.english.pws`.
+        let file = index.file.replace(".pws", ".english.pws");
+        Ok(Self {
+            path: install.data.join("Audios").join(file),
+            index,
+            sets,
         })
+    }
+
+    /// The voice set keyed by `hash` (`name_hash("vo_jen")`).
+    pub fn set(&self, hash: u32) -> Option<&CueTable> {
+        self.sets.iter().find(|t| t.hash == hash)
+    }
+
+    /// Reads and decodes voice stream `i`.
+    pub fn decode(&self, i: usize) -> Result<SoundBuffer, AssetError> {
+        decode_stream(&self.path, &self.index, i)
     }
 }
 

@@ -10,8 +10,10 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use m2_engine::audio::{Play, SoundLibrary};
-use m2_engine::{Install, Mixer, SoundBuffer, Streams, VoiceId};
+use std::time::Instant;
+
+use m2_engine::audio::{Falloff, Play, SoundLibrary};
+use m2_engine::{Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
 use crate::combat::Sound;
 use m2_math::glam::Vec3;
@@ -134,7 +136,30 @@ pub struct GameAudio {
     /// Seconds to the next one.
     ambient_wait: f32,
     seed: u64,
+    /// The characters' voices, once read (on a thread: `English.wad`).
+    voices: Option<Arc<Voices>>,
+    voices_loading: Option<Receiver<Voices>>,
+    /// Decoded lines waiting to play: where (`None` flat) and how.
+    said: (Sender<Spoken>, Receiver<Spoken>),
+    /// When each line now playing or decoding ends.
+    speaking: Vec<Instant>,
 }
+
+/// A decoded voice line: the sound, where it is said (`None` flat: the
+/// player's own), its falloff and volume.
+type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32);
+
+/// Voice sets, by the name hash of their name. The soldiers' and
+/// civilians' sets are named only by hash, and were told apart by their
+/// subtitles: two sets of Venezuelan army soldiers (so not everyone sounds
+/// alike) and civilians complaining. (Jennifer's is `vo_jen`, 7f746c16;
+/// which of her lines go with what is not known yet.)
+pub const VZ_SOLDIERS: [u32; 2] = [0xcf4f_8b9c, 0x6cff_c547];
+pub const CIVILIANS: u32 = 0x910e_b574;
+/// Shouts are the sets' short lines said where the speaker stands.
+const SHOUT_LONGEST: f32 = 3.5;
+/// Most lines said at once.
+const MAX_SPEAKING: usize = 2;
 
 /// Picks the loudest sound in `bank` passing `keep`.
 fn pick(
@@ -230,7 +255,74 @@ impl GameAudio {
             ambient,
             ambient_wait: 3.0,
             seed: 0x9e37_79b9_7f4a_7c15,
+            voices: None,
+            voices_loading: install.map(|install| {
+                let install = install.clone();
+                let (tx, rx) = channel();
+                std::thread::spawn(move || match Voices::load(&install) {
+                    Ok(v) => {
+                        eprintln!(
+                            "voices: {} sets, {} lines",
+                            v.sets.len(),
+                            v.index.streams.len()
+                        );
+                        let _ = tx.send(v);
+                    }
+                    Err(e) => eprintln!("voices: {e}"),
+                });
+                rx
+            }),
+            said: channel(),
+            speaking: Vec::new(),
         }
+    }
+
+    /// Says a short line of voice set `set` where `at` is (`None`: flat,
+    /// the player's own), unless enough people are talking already.
+    pub fn shout(&mut self, set: u32, at: Option<Vec3>) {
+        let now = Instant::now();
+        self.speaking.retain(|end| *end > now);
+        if self.speaking.len() >= MAX_SPEAKING {
+            return;
+        }
+        let Some(voices) = self.voices.clone() else {
+            return;
+        };
+        let Some(table) = voices.set(set) else {
+            return;
+        };
+        let lines: Vec<_> = table
+            .lines
+            .iter()
+            .filter(|l| {
+                l.is_positional()
+                    && voices
+                        .index
+                        .streams
+                        .get(l.stream as usize)
+                        .is_some_and(|s| s.seconds() <= SHOUT_LONGEST)
+            })
+            .cloned()
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let pick = ((self.random() * lines.len() as f32) as usize).min(lines.len() - 1);
+        let line = lines[pick].clone();
+        let seconds = voices.index.streams[line.stream as usize].seconds();
+        self.speaking
+            .push(now + std::time::Duration::from_secs_f32(seconds + 0.3));
+        let tx = self.said.0.clone();
+        std::thread::spawn(move || match voices.decode(line.stream as usize) {
+            Ok(b) => {
+                let falloff = Falloff {
+                    near: line.min_distance.max(1.0),
+                    far: line.max_distance.max(line.min_distance + 1.0),
+                };
+                let _ = tx.send((b, at, falloff, line.volume.clamp(0.0, 2.0)));
+            }
+            Err(e) => eprintln!("voice line {}: {e}", line.stream),
+        });
     }
 
     fn random(&mut self) -> f32 {
@@ -315,6 +407,22 @@ impl GameAudio {
 
     /// Starts what finished decoding and moves the listener.
     pub fn update(&mut self, listener: Vec3, forward: Vec3) {
+        if let Some(rx) = &self.voices_loading
+            && let Ok(v) = rx.try_recv()
+        {
+            self.voices = Some(Arc::new(v));
+            self.voices_loading = None;
+        }
+        while let Ok((buffer, at, falloff, gain)) = self.said.1.try_recv() {
+            let play = match at {
+                Some(at) => Play {
+                    falloff,
+                    ..Play::at(buffer, at)
+                },
+                None => Play::flat(buffer),
+            };
+            self.out.with(|m| m.play(play.gain(gain)));
+        }
         while let Ok((which, buffer)) = self.decoded.1.try_recv() {
             let id = self.out.with(|m| match which {
                 "music" => m.play(Play::flat(buffer).gain(0.6)),
