@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
 use m2_assets::layer::LAYER_TYPE;
+use m2_assets::model::MODEL_TYPE;
 use m2_assets::path::PATH_TYPE;
 use m2_assets::terrain::{CELL_SIZE, TerrainGroup, colour_map_uv};
 use m2_assets::vertex::DeclUsage;
@@ -44,7 +45,47 @@ pub struct ObjectPlacement {
     pub model: u32,
     pub position: Vec3,
     pub rotation: Quat,
+    /// Placed by its entity's name (`global_env_rocksbeach01 0x00123abc`
+    /// is the model `global_env_rocksbeach01`) rather than a `ModelName`:
+    /// the island's rocks, plants, fences and sandbags, kept within
+    /// [`WorldSettings::prop_distance`](crate::WorldSettings::prop_distance).
+    pub named: bool,
 }
+
+/// An entity of the static layers whose name is a template, not an
+/// asset: the game's own parked vehicles (`M151 Softtop (VZ)`, `HMMWV
+/// (Softtop)`, `Small Fishing Boat`), pickups and emplacements. Which
+/// model a template is isn't stored in the archives in a form decoded
+/// yet; the name's words say.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemplatePlacement {
+    pub entity: u32,
+    /// The template (`M151 Softtop (VZ)`), without the entity's `0x…` id.
+    pub name: String,
+    pub position: Vec3,
+    pub rotation: Quat,
+}
+
+/// Components whose entities are never a template placement: roads,
+/// paths, regions, lights, sounds and such.
+const NOT_TEMPLATES: [&str; 16] = [
+    "Road",
+    "RoadIntersection",
+    "Path",
+    "LineRegion",
+    "PointLocation",
+    "LightObject",
+    "ScrubObject",
+    "TerrainObject",
+    "LowResTerrainObject",
+    "PopulationDensity",
+    "PopulationSimpleSpawner",
+    "MusicRegion",
+    "MusicSource",
+    "SoundAmbience",
+    "AtmosphereBase",
+    "LandingZone",
+];
 
 /// A person a layer places: a soldier at a post or on a patrol route,
 /// from the `PopulationSimpleSpawner`, `Ai` and `AiPatrol` components.
@@ -77,6 +118,9 @@ pub struct WorldIndex {
     /// the merged town batches are among them (see
     /// [`Model::tiny_members`](m2_assets::Model::tiny_members)).
     pub members: HashMap<u32, Member>,
+    /// Entities of the static layers placed by a template name that is no
+    /// asset: the game's own vehicles among them.
+    pub templates: Vec<TemplatePlacement>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -95,6 +139,14 @@ pub struct Member {
 pub fn member_stem(name: &str) -> &str {
     let name = name.trim_start_matches('_');
     name.rsplit_once(' ').map_or(name, |(stem, _)| stem)
+}
+
+/// Which names the archive holds, for placing entities by name.
+struct Assets {
+    /// Name hashes of the models.
+    models: HashSet<u32>,
+    /// Name hashes of every asset of every type.
+    any: HashSet<u32>,
 }
 
 /// What [`WorldIndex::build`] gathers to find patrol routes: soldier to
@@ -131,6 +183,15 @@ impl WorldIndex {
             .map(|b| (b, index.blocks()[b].path.contains("layers_static")))
             .collect();
         blocks.sort_unstable();
+        let assets = Assets {
+            models: index
+                .assets()
+                .iter()
+                .filter(|a| index.type_hash(a) == MODEL_TYPE)
+                .map(|a| a.name_hash)
+                .collect(),
+            any: index.assets().iter().map(|a| a.name_hash).collect(),
+        };
 
         let mut world = Self::default();
         let mut routes = Routes::default();
@@ -143,7 +204,7 @@ impl WorldIndex {
                 let Ok(layer) = Layer::parse(data) else {
                     continue;
                 };
-                world.add_layer(&layer, is_static);
+                world.add_layer(&layer, is_static, &assets);
                 world.add_people(&layer, &mut routes);
             }
         }
@@ -211,7 +272,7 @@ impl WorldIndex {
         }
     }
 
-    fn add_layer(&mut self, layer: &Layer<'_>, is_static: bool) {
+    fn add_layer(&mut self, layer: &Layer<'_>, is_static: bool, assets: &Assets) {
         let placements = layer.placements();
         let at = |entity| placements.get(&entity);
         for (entity, asset) in layer.hashes("TerrainObject") {
@@ -232,25 +293,50 @@ impl WorldIndex {
                         model: *model,
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),
+                        named: false,
                     });
                 }
             }
+            let not_templates: HashSet<u32> = NOT_TEMPLATES
+                .iter()
+                .filter_map(|c| layer.component(c))
+                .flat_map(|c| c.records().unwrap_or_default())
+                .map(|(entity, _)| entity)
+                .collect();
             for (entity, name) in layer.names() {
                 let Some(p) = at(entity) else { continue };
+                let (position, rotation) = (Vec3::from(p.position), rotation(p.rotation));
                 let mut candidates: Vec<u32> = models.get(&entity).copied().into_iter().collect();
                 let stem = member_stem(name);
-                if !stem.is_empty() {
-                    candidates.push(name_hash(stem));
-                }
+                let stem_hash = (!stem.is_empty()).then(|| name_hash(stem));
+                candidates.extend(stem_hash);
                 candidates.dedup();
                 self.members.insert(
                     entity,
                     Member {
-                        position: Vec3::from(p.position),
-                        rotation: rotation(p.rotation),
+                        position,
+                        rotation,
                         models: candidates,
                     },
                 );
+                if models.contains_key(&entity) || not_templates.contains(&entity) {
+                    continue;
+                }
+                match stem_hash {
+                    Some(h) if assets.models.contains(&h) => self.objects.push(ObjectPlacement {
+                        model: h,
+                        position,
+                        rotation,
+                        named: true,
+                    }),
+                    Some(h) if !assets.any.contains(&h) => self.templates.push(TemplatePlacement {
+                        entity,
+                        name: stem.to_owned(),
+                        position,
+                        rotation,
+                    }),
+                    _ => {}
+                }
             }
         }
     }

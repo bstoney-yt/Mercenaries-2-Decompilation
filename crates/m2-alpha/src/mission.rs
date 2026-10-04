@@ -23,14 +23,14 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use m2_assets::WadArchive;
 use m2_engine::vehicle::DRIVABLE;
-use m2_engine::{CatalogueEntry, Install, Physics};
+use m2_engine::{CatalogueEntry, Install};
 use m2_game::api::Command;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
 use crate::config::Config;
-use crate::game::{Game, get_out};
-use crate::scene::{NOT_DRIVABLE, ParkedVehicle};
+use crate::game::{Game, get_out, place};
+use crate::scene::NOT_DRIVABLE;
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
@@ -566,7 +566,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
 /// starts like it, `alouette` of `Alouette3`), its faction's first. Only
 /// ground vehicles to drive. `name` is an object's (`"M151 Softtop (VZ)
 /// 0x0012abcd"`) or a template's.
-fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<CatalogueEntry> {
+pub(crate) fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<CatalogueEntry> {
     let template = name
         .rfind(" 0x")
         .map_or(name, |i| &name[..i])
@@ -615,19 +615,6 @@ fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<CatalogueEntr
         .collect();
     out.sort_by_key(|e| !e.label.starts_with(faction));
     out
-}
-
-/// Puts one of the scripts' vehicles on the ground at `at`; false while
-/// the ground there hasn't loaded.
-fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw: f32) -> bool {
-    let top = at + Vec3::Y * 30.0;
-    let Some((d, _)) = physics.cast_ray(top, Vec3::NEG_Y, 80.0) else {
-        return false;
-    };
-    let ground = top.y - d;
-    let at = Vec3::new(at.x, ground + v.spec.ride_height() + 0.3, at.z);
-    v.id = Some(physics.add_vehicle(&v.spec, at, yaw));
-    true
 }
 
 #[cfg(test)]
