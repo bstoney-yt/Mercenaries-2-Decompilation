@@ -50,28 +50,47 @@ impl ScriptHost {
         // verifier on load, are loaded as binary.
         let lua = unsafe { Lua::unsafe_new() };
         let log: Rc<RefCell<Vec<String>>> = Rc::default();
+        let wrap: Function = lua
+            .load(
+                r#"
+                local function check(ok, ...)
+                    if ok then return ... end
+                    error((...), 2)
+                end
+                return function(raw)
+                    return function(...) return check(raw(...)) end
+                end
+                "#,
+            )
+            .set_name("=m2-wrap")
+            .set_mode(ChunkMode::Text)
+            .eval()?;
+        lua.set_named_registry_value("m2_wrap", wrap)?;
         let stub_meta = lua.create_table()?;
         stub_meta.set(
             "__index",
-            lua.create_function(|lua, (t, key): (Table, Value)| {
+            safe_function(&lua, |lua, args| {
+                let (Some(Value::Table(t)), key) = (args.front().cloned(), args.get(1)) else {
+                    return Ok(MultiValue::new());
+                };
                 let parent: String = t.raw_get(STUB_NAME)?;
                 let key = match key {
-                    Value::String(s) => s.to_string_lossy(),
-                    other => format!("[{}]", other.type_name()),
+                    Some(Value::String(s)) => s.to_string_lossy(),
+                    other => format!("[{}]", other.map_or("nil", Value::type_name)),
                 };
                 let child = stub(lua, &format!("{parent}.{key}"))?;
                 // Remember it, so repeated lookups see the same table.
                 t.raw_set(key, &child)?;
-                Ok(child)
+                Ok(MultiValue::from_vec(vec![Value::Table(child)]))
             })?,
         )?;
         let call_log = Rc::clone(&log);
         stub_meta.set(
             "__call",
-            lua.create_function(move |lua, args: MultiValue| {
+            safe_function(&lua, move |lua, args| {
                 let mut args = args.into_iter();
                 let Some(Value::Table(callee)) = args.next() else {
-                    return Ok(Value::Nil);
+                    return Ok(MultiValue::new());
                 };
                 let name: String = callee.raw_get(STUB_NAME)?;
                 // A method call passes a stub as self: `m:SetTimer` rather
@@ -87,7 +106,10 @@ impl ScriptHost {
                     _ => name.clone(),
                 };
                 call_log.borrow_mut().push(shown);
-                Ok(Value::Table(stub(lua, &format!("{name}()"))?))
+                Ok(MultiValue::from_vec(vec![Value::Table(stub(
+                    lua,
+                    &format!("{name}()"),
+                )?)]))
             })?,
         )?;
         lua.set_named_registry_value("m2_stub_meta", &stub_meta)?;
@@ -123,15 +145,14 @@ impl ScriptHost {
         let meta = self.lua.create_table()?;
         meta.set(
             "__index",
-            self.lua
-                .create_function(|lua, (g, key): (Table, Value)| match key {
-                    Value::String(s) => {
-                        let s = stub(lua, &s.to_string_lossy())?;
-                        g.raw_set(s.raw_get::<String>(STUB_NAME)?, &s)?;
-                        Ok(Value::Table(s))
-                    }
-                    _ => Ok(Value::Nil),
-                })?,
+            safe_function(&self.lua, |lua, args| match (args.front(), args.get(1)) {
+                (Some(Value::Table(g)), Some(Value::String(s))) => {
+                    let s = stub(lua, &s.to_string_lossy())?;
+                    g.raw_set(s.raw_get::<String>(STUB_NAME)?, &s)?;
+                    Ok(MultiValue::from_vec(vec![Value::Table(s)]))
+                }
+                _ => Ok(MultiValue::new()),
+            })?,
         )?;
         self.lua.globals().set_metatable(Some(meta))?;
         Ok(())
@@ -178,10 +199,14 @@ impl ScriptHost {
     ) -> Result<(), ScriptError> {
         let cache = self.lua.create_table()?;
         let modules = Rc::clone(&self.modules);
-        let module = self.lua.create_function(move |lua, name: String| {
+        let module = safe_function(&self.lua, move |lua, args| {
+            let Some(Value::String(name)) = args.front() else {
+                return Err(mlua::Error::runtime("module name must be a string"));
+            };
+            let name = name.to_string_lossy();
             let key = name.to_ascii_lowercase();
             if let Some(env) = cache.raw_get::<Option<Table>>(key.as_str())? {
-                return Ok(env);
+                return Ok(MultiValue::from_vec(vec![Value::Table(env)]));
             }
             let resolved = library.resolve(&name).map(|(s, _, _)| s);
             modules
@@ -193,11 +218,16 @@ impl ScriptHost {
                 let prefix = name.clone();
                 meta.set(
                     "__index",
-                    lua.create_function(move |lua, (_, k): (Table, String)| {
-                        match lua.globals().get::<Value>(k.as_str())? {
-                            Value::Nil => Ok(Value::Table(stub(lua, &format!("{prefix}.{k}"))?)),
-                            v => Ok(v),
-                        }
+                    safe_function(lua, move |lua, args| {
+                        let Some(Value::String(k)) = args.get(1) else {
+                            return Ok(MultiValue::new());
+                        };
+                        let k = k.to_string_lossy();
+                        let v = match lua.globals().get::<Value>(k.as_str())? {
+                            Value::Nil => Value::Table(stub(lua, &format!("{prefix}.{k}"))?),
+                            v => v,
+                        };
+                        Ok(MultiValue::from_vec(vec![v]))
                     })?,
                 )?;
             } else {
@@ -218,7 +248,7 @@ impl ScriptHost {
                     .set_environment(env.clone())
                     .exec()?;
             }
-            Ok(env)
+            Ok(MultiValue::from_vec(vec![Value::Table(env)]))
         })?;
         self.lua.globals().set("__m2_module", module)?;
         self.lua
@@ -267,6 +297,33 @@ impl ScriptHost {
     pub fn modules(&self) -> Vec<LoadedModule> {
         self.modules.borrow().clone()
     }
+}
+
+/// A function scripts can call that runs `f`.
+///
+/// A Rust callback must never raise a Lua error itself: Lua 5.1 built as C
+/// raises errors with `longjmp`, which on Windows unwinds through the Rust
+/// frames between and aborts the process. So the Rust side returns
+/// `true, results...` or `false, message`, and a small Lua wrapper raises
+/// the error from Lua.
+pub fn safe_function<F>(lua: &Lua, f: F) -> mlua::Result<Function>
+where
+    F: Fn(&Lua, MultiValue) -> mlua::Result<MultiValue> + 'static,
+{
+    let raw = lua.create_function(move |lua, args: MultiValue| {
+        Ok(match f(lua, args) {
+            Ok(mut results) => {
+                results.push_front(Value::Boolean(true));
+                results
+            }
+            Err(e) => MultiValue::from_vec(vec![
+                Value::Boolean(false),
+                Value::String(lua.create_string(e.to_string())?),
+            ]),
+        })
+    })?;
+    let wrap: Function = lua.named_registry_value("m2_wrap")?;
+    wrap.call(raw)
 }
 
 fn stub(lua: &Lua, name: &str) -> mlua::Result<Table> {
@@ -336,6 +393,27 @@ mod tests {
             .unwrap();
         assert_eq!(host.take_calls(), ["Hud.Show"]);
         assert_eq!(host.modules(), [("Hud".to_owned(), None)]);
+    }
+
+    #[test]
+    fn host_function_errors_are_raised_from_lua() {
+        let host = ScriptHost::new().unwrap();
+        let f = safe_function(host.lua(), |_, args| {
+            if args.is_empty() {
+                Err(mlua::Error::runtime("no arguments"))
+            } else {
+                Ok(args)
+            }
+        })
+        .unwrap();
+        host.lua().globals().set("echo", f).unwrap();
+        let ok: (i64, String) = host
+            .lua()
+            .load("local ok, e = pcall(echo); assert(not ok); return echo(7, e)")
+            .eval()
+            .unwrap();
+        assert_eq!(ok.0, 7);
+        assert!(ok.1.contains("no arguments"), "{}", ok.1);
     }
 
     #[test]
