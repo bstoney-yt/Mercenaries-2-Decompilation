@@ -46,8 +46,16 @@ pub struct Library {
 /// The task classes are the trouble: subclasses call so many base-class
 /// members through `MrxTaskMission` and `MrxTaskObjective` that the match
 /// gave those names the base class and contracts.
-pub const KNOWN_MODULES: [(&str, u32); 8] = [
+pub const KNOWN_MODULES: [(&str, u32); 16] = [
+    ("MrxBoatDelivery", 0x5b6a_0cf6),
+    ("MrxClusterBomb", 0xeaf4_7b4a),
     ("MrxCopterDrop", 0x3cca_21b4),
+    ("MrxCrateDelivery", 0x3534_ce91),
+    ("MrxDaisyCutter", 0xd913_5f63),
+    ("MrxMOAB", 0x0f1b_9dfd),
+    ("MrxSupportDelivery", 0x0eac_5ae9),
+    ("MrxSupportDesignatorFlare", 0x27c3_28f1),
+    ("MrxSupportDesignatorSmoke", 0xecb5_bbea),
     ("MrxTask", 0xd302_a66f),
     ("MrxTaskMission", 0xcfcd_908f),
     ("MrxTaskObjective", 0x517a_1910),
@@ -143,7 +151,9 @@ impl Library {
         self.scripts
             .iter()
             .enumerate()
-            .filter(|(i, _)| !taken.contains(i))
+            // A script never is a module it loads (a subclass inherits
+            // its base).
+            .filter(|(i, s)| !taken.contains(i) && !s.loads.contains(&key))
             .map(|(_, s)| (s.strings.iter().filter(|t| mentions(t, &key)).count(), s))
             .filter(|&(n, _)| n > 0)
             .max_by(|a, b| {
