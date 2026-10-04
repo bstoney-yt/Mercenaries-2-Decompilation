@@ -92,6 +92,14 @@ pub enum Command {
         target: Option<u32>,
     },
     ExitVehicle(u32),
+    /// Seat a character in a vehicle (seat as the scripts name it, `"d"`
+    /// for the driver); `instant` skips the climb-in.
+    EnterVehicle {
+        guid: u32,
+        vehicle: u32,
+        seat: String,
+        instant: bool,
+    },
     /// Stream a layer in or out; report it done with
     /// [`crate::layers::finished`].
     Layer {
@@ -187,6 +195,10 @@ impl World for ScriptWorld {
 
     fn game_state(&self) -> Option<String> {
         Some(self.game_state.clone())
+    }
+
+    fn named(&self, name: &str) -> Option<u32> {
+        self.by_name(name)
     }
 }
 
@@ -550,11 +562,37 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([Value::Table(t)])
     })?;
+    // Riders change seats at once here, so seat events see it on the next
+    // update; the command lets the game animate it.
     add(&vehicle, "Exit", |w, _, a| {
         if let Some(guid) = id(a.first()) {
+            if let Some(o) = w.objects.get_mut(&guid) {
+                o.vehicle = None;
+            }
             w.commands.push(Command::ExitVehicle(guid));
         }
         values([])
+    })?;
+    // Vehicle.Enter(vehicle, character, seat, instant).
+    add(&vehicle, "Enter", |w, _, a| {
+        let (Some(vehicle), Some(guid)) = (id(a.first()), id(a.get(1))) else {
+            return values([Value::Boolean(false)]);
+        };
+        let seat = match a.get(2) {
+            Some(Value::String(s)) => s.to_string_lossy(),
+            _ => String::new(),
+        };
+        let instant = matches!(a.get(3), Some(Value::Boolean(true)));
+        if let Some(o) = w.objects.get_mut(&guid) {
+            o.vehicle = Some(vehicle);
+        }
+        w.commands.push(Command::EnterVehicle {
+            guid,
+            vehicle,
+            seat,
+            instant,
+        });
+        values([Value::Boolean(true)])
     })?;
 
     let ai = lib("Ai")?;
@@ -865,6 +903,27 @@ mod tests {
             .eval()
             .unwrap();
         assert!(r);
+    }
+
+    #[test]
+    fn entering_a_named_vehicle_fires_seat_events() {
+        let (host, world) = setup();
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                seated = nil
+                Event.Create(Event.ObjectInSeat, {1, "_global_veh_jeep 0x0001", "d", "enter"},
+                    function(tag, who, what) seated = tag .. who .. "/" .. what end, {"in:"})
+                assert(Vehicle.Enter(50, 1, "d", true))
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert!(events.update_shared(0.1, &world).is_empty());
+        let seated: String = host.lua().globals().get("seated").unwrap();
+        assert_eq!(seated, "in:1/50");
     }
 
     #[test]

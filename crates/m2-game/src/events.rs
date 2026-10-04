@@ -49,6 +49,11 @@ pub trait World {
     fn game_state(&self) -> Option<String> {
         None
     }
+    /// The object with this name in its layer (`"VzaCon001_StartingBoat"`),
+    /// for parameters that name one object by name.
+    fn named(&self, _name: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// The kinds the scripts use, by how often.
@@ -320,7 +325,12 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
             if s.eq_ignore_ascii_case("hero") {
                 world.player().into_iter().collect()
             } else {
-                world.labelled(&s)
+                let labelled = world.labelled(&s);
+                if labelled.is_empty() {
+                    world.named(&s).into_iter().collect()
+                } else {
+                    labelled
+                }
             }
         }
         Ok(v) => as_id(&v).into_iter().collect(),
@@ -378,7 +388,9 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
         // seat type ("Gunner", "Any"; not told apart yet). Passes the
         // rider and vehicle.
         "ObjectInSeat" => {
-            let vehicle = guid(&p.params, 2);
+            // The vehicle may be named rather than a guid.
+            let vehicle =
+                guid(&p.params, 2).or_else(|| objects(&p.params, 2, world).first().copied());
             let exit = text(&p.params, 4).as_deref() == Some("exit");
             for r in objects(&p.params, 1, world) {
                 let seated = world

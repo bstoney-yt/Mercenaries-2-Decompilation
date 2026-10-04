@@ -125,7 +125,7 @@ impl Library {
     /// `Activated`, many scripts define.
     /// The best pairs are taken first and a script is one module only.
     ///
-    /// A module no script uses members of (a mission module such as
+    /// A module the member match leaves out (a mission such as
     /// `VzaCon001`, loaded by a name from data) is the script not already
     /// some module's that names it most often in its strings.
     pub fn resolve(&self, name: &str) -> Option<(&ScriptInfo, usize, usize)> {
@@ -134,9 +134,6 @@ impl Library {
         if let Some(&(index, hits)) = assigned.get(&key) {
             let used = self.used.get(&key).map_or(0, BTreeSet::len);
             return Some((&self.scripts[index], hits, used));
-        }
-        if self.used.contains_key(&key) {
-            return None;
         }
         let taken: BTreeSet<usize> = assigned.values().map(|&(i, _)| i).collect();
         self.scripts

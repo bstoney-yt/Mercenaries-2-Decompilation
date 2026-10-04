@@ -256,11 +256,8 @@ fn run(o: &Options) -> Result<()> {
     for f in host.init_modules()? {
         failures.push(format!("Init of {f}"));
     }
-    println!(
-        "started: {} modules, {} failures",
-        host.modules().len(),
-        failures.len()
-    );
+    let started = host.modules().len();
+    println!("started: {started} modules, {} failures", failures.len());
     for f in &failures {
         println!("  {}", first_lines(f));
     }
@@ -313,6 +310,14 @@ fn run(o: &Options) -> Result<()> {
             );
         }
         settle(&format!("t={now:.1}"), &host, &world, &events, &layers);
+    }
+    println!();
+    println!("modules loaded while running (name -> script):");
+    for (name, hash) in host.modules().iter().skip(started) {
+        println!(
+            "  {name} -> {}",
+            hash.map_or("unresolved".into(), |h| format!("{h:08x}"))
+        );
     }
     println!();
     println!(
