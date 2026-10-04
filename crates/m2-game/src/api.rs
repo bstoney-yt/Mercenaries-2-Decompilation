@@ -587,6 +587,29 @@ mod tests {
     }
 
     #[test]
+    fn event_callbacks_change_the_world() {
+        let (host, world) = setup();
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                local hero = Player.GetLocalCharacter()
+                Event.Create(Event.ObjectProximity, {hero, 50, "<", 5}, function()
+                    Object.Kill(50)
+                end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert!(events.update_shared(0.1, &world).is_empty());
+        assert!(world.borrow().objects[&50].alive);
+        world.borrow_mut().objects.get_mut(&1).unwrap().position = [1.0, 0.0, 1.0];
+        assert!(events.update_shared(0.1, &world).is_empty());
+        assert!(!world.borrow().objects[&50].alive);
+    }
+
+    #[test]
     fn spawns_get_guids_and_goals_call_back() {
         let (host, world) = setup();
         host.lua()

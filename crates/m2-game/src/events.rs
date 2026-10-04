@@ -212,7 +212,20 @@ impl Events {
     /// condition holds. Callbacks run after the checks, so events they
     /// create wait for the next update. Returns the callbacks that failed.
     pub fn update(&self, dt: f64, world: &dyn World) -> Vec<EventError> {
-        let fired = {
+        let fired = self.due(dt, world);
+        fire(fired)
+    }
+
+    /// [`Events::update`] for a world the scripts also change: it is
+    /// borrowed only while the conditions are checked, so callbacks can
+    /// move, spawn and kill.
+    pub fn update_shared<W: World>(&self, dt: f64, world: &RefCell<W>) -> Vec<EventError> {
+        let fired = self.due(dt, &*world.borrow());
+        fire(fired)
+    }
+
+    fn due(&self, dt: f64, world: &dyn World) -> Vec<Fired> {
+        {
             let mut s = self.store.borrow_mut();
             s.now += dt;
             let now = s.now;
@@ -242,18 +255,25 @@ impl Events {
             }
             s.pending = keep;
             fired
-        };
-        let mut errors = Vec::new();
-        for (kind, callback, data, extra) in fired {
-            let Value::Function(f) = callback else {
-                continue;
-            };
-            if let Err(error) = call(&f, data.as_ref(), extra) {
-                errors.push(EventError { kind, error });
-            }
         }
-        errors
     }
+}
+
+/// An event that fired: kind, callback, its data, and the values to pass
+/// after the data.
+type Fired = (String, Value, Option<Table>, Vec<Value>);
+
+fn fire(fired: Vec<Fired>) -> Vec<EventError> {
+    let mut errors = Vec::new();
+    for (kind, callback, data, extra) in fired {
+        let Value::Function(f) = callback else {
+            continue;
+        };
+        if let Err(error) = call(&f, data.as_ref(), extra) {
+            errors.push(EventError { kind, error });
+        }
+    }
+    errors
 }
 
 fn as_id(v: &Value) -> Option<u32> {
