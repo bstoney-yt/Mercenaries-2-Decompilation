@@ -188,6 +188,13 @@ pub enum StaticKey {
 const SUSPENSION: f32 = 0.3;
 /// Steering lock at a standstill, radians.
 const MAX_STEER: f32 = 0.6;
+/// Braking with the throttle against the motion, the handbrake (on the
+/// wheels that don't steer), rolling with no throttle, and holding still,
+/// m/s² (as if all wheels braked so).
+const SERVICE_BRAKE: f32 = 8.0;
+const HANDBRAKE: f32 = 9.0;
+const ROLLING: f32 = 0.6;
+const HOLD: f32 = 3.0;
 
 /// A vehicle in the physics world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -420,33 +427,47 @@ impl Physics {
     }
 
     /// Sets a vehicle's throttle (-1 reverse to 1 full ahead), steering
-    /// (-1 left to 1 right) and brake.
+    /// (-1 left to 1 right) and handbrake. Throttle against the way the
+    /// vehicle rolls brakes it; with no throttle it rolls to a stop.
     pub fn drive(&mut self, id: VehicleId, controls: VehicleControls) {
+        let dt = self.world.integration_parameters.dt.max(1e-3);
         let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
             return;
         };
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
+        // A wheel's brake is the most impulse it may take off per step:
+        // this many m/s² over the whole vehicle.
+        let slowing = |decel: f32| v.mass * decel * dt / wheels;
+        let throttle = controls.throttle.clamp(-1.0, 1.0);
+        let against = speed.abs() > 0.5 && throttle * speed < 0.0;
         // Accelerates at about 4 m/s² flat out, slower near top speed.
-        let top = if controls.throttle >= 0.0 { 30.0 } else { 8.0 };
+        let top = if throttle >= 0.0 { 30.0 } else { 8.0 };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
-        let force = controls.throttle * v.mass * 4.0 * headroom / wheels;
-        let steer = controls.steer.clamp(-1.0, 1.0) * MAX_STEER / (1.0 + speed.abs() * 0.04);
-        let brake = if controls.brake {
-            v.mass * 0.6 / wheels
+        let (force, brake) = if controls.brake {
+            (0.0, slowing(ROLLING))
+        } else if against {
+            (0.0, slowing(SERVICE_BRAKE * throttle.abs()))
+        } else if throttle != 0.0 {
+            (throttle * v.mass * 4.0 * headroom / wheels, 0.0)
+        } else if speed.abs() < 1.0 {
+            (0.0, slowing(HOLD))
         } else {
-            0.0
+            (0.0, slowing(ROLLING))
         };
+        let steer = controls.steer.clamp(-1.0, 1.0) * MAX_STEER / (1.0 + speed.abs() * 0.04);
         // Only the front axle steers: steering every wheel the same way
-        // slides the vehicle sideways instead of turning it.
+        // slides the vehicle sideways instead of turning it. The handbrake
+        // locks the rest, so the back can slide out.
         for (i, w) in v.controller.wheels_mut().iter_mut().enumerate() {
+            let front = v.steers.get(i).copied().unwrap_or(false);
             w.engine_force = force;
-            w.steering = if v.steers.get(i).copied().unwrap_or(false) {
-                steer
+            w.steering = if front { steer } else { 0.0 };
+            w.brake = if controls.brake && !front {
+                slowing(HANDBRAKE)
             } else {
-                0.0
+                brake
             };
-            w.brake = brake;
         }
     }
 
