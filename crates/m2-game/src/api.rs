@@ -156,6 +156,8 @@ pub struct ScriptWorld {
     pub landing_zones: HashMap<i64, BTreeMap<i64, u32>>,
     /// Cargo on winches: what carries each, `None` once let go.
     pub winch: HashMap<u32, Option<u32>>,
+    /// What the scripts want on the player's screen.
+    pub hud: crate::hud::Hud,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
     /// name in lower case.
     templates: HashMap<String, u32>,
@@ -1117,6 +1119,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             }
         })?,
     )?;
+    crate::hud::install(lua, world)?;
     crate::layers::install(lua, world)
 }
 

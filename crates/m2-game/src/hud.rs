@@ -1,0 +1,339 @@
+//! What the scripts put on the player's screen: the mission's objective
+//! list, objectives on the map and radar, markers over targets in the
+//! world, and "objective added / completed" messages.
+//!
+//! The game draws these with its own (Flash) interface; scripts reach it
+//! through `Net.SendEvent_*` calls (sent to every player in co-op) and
+//! `Marker`. Here they fill a [`Hud`] the game draws its own way. Texts are
+//! ids such as `[VzaCon001.Objectives.001]` into a string table not found
+//! yet; [`readable`] makes something showable of them meanwhile.
+
+use std::collections::BTreeMap;
+
+use mlua::{Lua, MultiValue, Table, Value};
+
+use crate::api::Shared;
+use crate::events::{as_guid, guid_value};
+use crate::script::safe_function;
+
+/// An objective on the map (the PDA) or radar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Objective {
+    /// What it is about, if an object (a place, a target).
+    pub target: Option<u32>,
+    /// Text id, with progress appended (`"[VzaCon001.Objectives.003] (0/4)"`).
+    pub text: String,
+    /// The game's icon index.
+    pub icon: i64,
+}
+
+/// A blip on the radar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Blip {
+    pub target: Option<u32>,
+    /// Offset from the target, metres.
+    pub offset: [f32; 3],
+    pub colour: [u8; 3],
+    pub icon: i64,
+}
+
+/// A marker over a target in the world.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Marker {
+    pub target: Option<u32>,
+    /// `"HUD_objective_deliverable"`, `"HUD_objective_action"`,
+    /// `"HUD_objective_destroy"`.
+    pub icon: String,
+    pub colour: [u8; 4],
+    /// Height above the target, metres.
+    pub height: f32,
+    /// Shown from `near` to `far` metres away.
+    pub near: f32,
+    pub far: f32,
+}
+
+/// What the scripts want shown.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Hud {
+    /// The current mission's objective list: text id and icon tag.
+    pub mission: Vec<(String, String)>,
+    /// Objectives on the map, by the scripts' name for them (the target's
+    /// guid as text, or `<mission>_PreMission`).
+    pub objectives: BTreeMap<String, Objective>,
+    pub radar: BTreeMap<String, Blip>,
+    /// World markers by handle.
+    pub markers: BTreeMap<u32, Marker>,
+    /// Messages not yet shown: completed (or else added), and the text id.
+    pub messages: Vec<(bool, String)>,
+    next_marker: u32,
+}
+
+/// Marker handles start here.
+const FIRST_MARKER: u32 = 0x5000_0000;
+
+/// A text id made readable until the string table is decoded: icon tags
+/// dropped, `[VzaCon001.Objectives.003] (0/4)` as
+/// `VzaCon001 objective 3 (0/4)`.
+pub fn readable(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let before = rest[..open].trim();
+        if !before.is_empty() {
+            out.push(before.to_owned());
+        }
+        let Some(close) = rest[open..].find(']') else {
+            break;
+        };
+        let id = &rest[open + 1..open + close];
+        rest = &rest[open + close + 1..];
+        let parts: Vec<&str> = id.split('.').collect();
+        match parts.as_slice() {
+            // An icon tag: `[objdeliver]`.
+            [_] => {}
+            [mission, "Objectives", n] => {
+                let n = n.trim_start_matches('0');
+                out.push(format!(
+                    "{mission} objective {}",
+                    if n.is_empty() { "0" } else { n }
+                ));
+            }
+            [.., last] => out.push(last.replace('_', " ")),
+            [] => {}
+        }
+    }
+    let rest = rest.trim();
+    if !rest.is_empty() {
+        out.push(rest.to_owned());
+    }
+    out.join(" ")
+}
+
+fn text(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.to_string_lossy(),
+        Some(Value::Integer(i)) => i.to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn number(v: Option<&Value>) -> Option<f64> {
+    match v? {
+        Value::Integer(i) => Some(*i as f64),
+        Value::Number(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn int(v: Option<&Value>) -> i64 {
+    number(v).map_or(0, |n| n as i64)
+}
+
+fn byte(v: Option<&Value>) -> u8 {
+    number(v).map_or(255, |n| n.clamp(0.0, 255.0) as u8)
+}
+
+fn guid(v: Option<&Value>) -> Option<u32> {
+    as_guid(v?)
+}
+
+/// Installs the HUD calls on `Net` and `Marker`.
+pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
+    let globals = lua.globals();
+    let lib = |name: &str| -> mlua::Result<Table> {
+        match globals.raw_get::<Value>(name)? {
+            Value::Table(t) if t.metatable().is_none() => Ok(t),
+            _ => {
+                let t = lua.create_table()?;
+                globals.raw_set(name, &t)?;
+                Ok(t)
+            }
+        }
+    };
+    let add = |table: &Table,
+               name: &str,
+               f: fn(&mut Hud, &Lua, &[Value]) -> mlua::Result<MultiValue>|
+     -> mlua::Result<()> {
+        let w = std::rc::Rc::clone(world);
+        table.set(
+            name,
+            safe_function(lua, move |lua, args| {
+                let args: Vec<Value> = args.into_iter().collect();
+                f(&mut w.borrow_mut().hud, lua, &args)
+            })?,
+        )
+    };
+    let none = || Ok(MultiValue::new());
+
+    let net = lib("Net")?;
+    // (mission index, {{text id, icon tag}, ...}, repeatable): the whole
+    // list, sent again whenever it changes.
+    add(&net, "SendEvent_AddPDAMission", |hud, _, a| {
+        hud.mission.clear();
+        if let Some(Value::Table(list)) = a.get(1) {
+            for pair in list.sequence_values::<Table>() {
+                let pair = pair?;
+                let get = |i| text(pair.raw_get::<Value>(i).ok().as_ref());
+                hud.mission.push((get(1), get(2)));
+            }
+        }
+        Ok(MultiValue::new())
+    })?;
+    // (name, target, text id, icon, mission index, state, sort order).
+    add(&net, "SendEvent_AddPdaObjective", |hud, _, a| {
+        hud.objectives.insert(
+            text(a.first()),
+            Objective {
+                target: guid(a.get(1)),
+                text: text(a.get(2)),
+                icon: int(a.get(3)),
+            },
+        );
+        Ok(MultiValue::new())
+    })?;
+    add(&net, "SendEvent_RemovePdaObjective", |hud, _, a| {
+        hud.objectives.remove(&text(a.first()));
+        Ok(MultiValue::new())
+    })?;
+    // (name, x, y, z, r, g, b, width, height, icon, target, sticky,
+    // rotate, oriented, sort order).
+    add(&net, "SendEvent_AddRadarObjective", |hud, _, a| {
+        let f = |i: usize| number(a.get(i)).unwrap_or(0.0) as f32;
+        hud.radar.insert(
+            text(a.first()),
+            Blip {
+                target: guid(a.get(10)),
+                offset: [f(1), f(2), f(3)],
+                colour: [byte(a.get(4)), byte(a.get(5)), byte(a.get(6))],
+                icon: int(a.get(9)),
+            },
+        );
+        Ok(MultiValue::new())
+    })?;
+    add(&net, "SendEvent_RemoveRadarObjective", |hud, _, a| {
+        hud.radar.remove(&text(a.first()));
+        Ok(MultiValue::new())
+    })?;
+    // (icon index, "add" or "cpl", text id, player).
+    add(&net, "SendEvent_ObjectiveMessage", |hud, _, a| {
+        hud.messages.push((text(a.get(1)) == "cpl", text(a.get(2))));
+        Ok(MultiValue::new())
+    })?;
+    // The network copies of world markers: the markers are already here.
+    for name in [
+        "SendEvent_AddMarkerObjective",
+        "SendEvent_RemoveMarkerObjective",
+    ] {
+        net.set(name, safe_function(lua, move |_, _| none())?)?;
+    }
+
+    let marker = lib("Marker")?;
+    // (target, icon, size, r, g, b, a, height, near, far, size, mission,
+    // 2D only): returns the marker's handle.
+    add(&marker, "AddBlip", |hud, _, a| {
+        let handle = FIRST_MARKER + hud.next_marker;
+        hud.next_marker += 1;
+        let f = |i: usize, d: f64| number(a.get(i)).unwrap_or(d) as f32;
+        hud.markers.insert(
+            handle,
+            Marker {
+                target: guid(a.first()),
+                icon: text(a.get(1)),
+                colour: [
+                    byte(a.get(3)),
+                    byte(a.get(4)),
+                    byte(a.get(5)),
+                    byte(a.get(6)),
+                ],
+                height: f(7, 0.0),
+                near: f(8, 5.0),
+                far: f(9, 175.0),
+            },
+        );
+        Ok(MultiValue::from_vec(vec![guid_value(handle)]))
+    })?;
+    add(&marker, "Remove", |hud, _, a| {
+        if let Some(h) = guid(a.first()) {
+            hud.markers.remove(&h);
+        }
+        Ok(MultiValue::new())
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{self, ScriptWorld};
+    use crate::script::ScriptHost;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn texts_read_until_the_string_table_is_known() {
+        assert_eq!(
+            readable("[VzaCon001.Objectives.003] (0/4)"),
+            "VzaCon001 objective 3 (0/4)"
+        );
+        assert_eq!(
+            readable(
+                "[objt][objdeliver] [objective.Objectivecompleted] [VzaCon001.Objectives.001]"
+            ),
+            "Objectivecompleted VzaCon001 objective 1"
+        );
+        assert_eq!(readable("plain"), "plain");
+    }
+
+    #[test]
+    fn objectives_and_markers_come_and_go() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        host.lua()
+            .load(
+                r#"
+                local beach = Sys.StringToGuid("734801")
+                Net.SendEvent_AddPDAMission(36, {{"[VzaCon001.Objectives.001]", "[objdeliver]"}}, false)
+                Net.SendEvent_AddPdaObjective("734801", beach, "[VzaCon001.Objectives.001]", 17, 36, 0, 2)
+                Net.SendEvent_AddRadarObjective("734801", 0, 2, 0, 255, 200, 0, 10.667, 10.667, 2, beach, true, false, false, 5)
+                Net.SendEvent_ObjectiveMessage(5, "add", "[VzaCon001.Objectives.001]", nil)
+                handle = Marker.AddBlip(beach, "HUD_objective_deliverable", 32, 255, 200, 0, 255, 2, 5, 175, 32, "VzaCon001", false)
+                Net.SendEvent_AddMarkerObjective(beach, handle, 255, 200, 0, 2, 8, 1, 16, false, 5, 175, 0)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        {
+            let w = world.borrow();
+            let hud = &w.hud;
+            assert_eq!(
+                hud.mission,
+                [(
+                    "[VzaCon001.Objectives.001]".to_owned(),
+                    "[objdeliver]".to_owned()
+                )]
+            );
+            assert_eq!(hud.objectives["734801"].target, Some(734_801));
+            assert_eq!(hud.radar["734801"].colour, [255, 200, 0]);
+            assert_eq!(
+                hud.messages,
+                [(false, "[VzaCon001.Objectives.001]".to_owned())]
+            );
+            let m = hud.markers.values().next().unwrap();
+            assert_eq!((m.target, m.height, m.far), (Some(734_801), 2.0, 175.0));
+        }
+        host.lua()
+            .load(
+                r#"
+                Net.SendEvent_RemovePdaObjective("734801")
+                Net.SendEvent_RemoveRadarObjective("734801")
+                Marker.Remove(handle)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        assert!(w.hud.objectives.is_empty() && w.hud.radar.is_empty() && w.hud.markers.is_empty());
+    }
+}
