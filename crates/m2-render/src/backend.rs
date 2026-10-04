@@ -74,8 +74,9 @@ pub struct Lighting {
     pub sun_direction: Vec3,
     /// Linear RGB.
     pub sun_color: Vec3,
-    /// Linear RGB light reaching every surface.
-    pub ambient: Vec3,
+    /// Linear RGB light reaching surfaces from every side, by the way they
+    /// face: +x, -x, +y, -y, +z, -z (the game's ambient cube).
+    pub ambient_cube: [Vec3; 6],
     /// Linear RGB of the background and of the fog.
     pub sky_color: Vec3,
     /// Exponential fog density per metre; 0 disables fog.
@@ -87,7 +88,15 @@ impl Default for Lighting {
         Self {
             sun_direction: Vec3::new(-0.4, -1.0, 0.3),
             sun_color: Vec3::new(1.0, 0.95, 0.85),
-            ambient: Vec3::new(0.35, 0.38, 0.45),
+            // Sky above, warm bounce from the ground below.
+            ambient_cube: [
+                Vec3::new(0.35, 0.38, 0.45),
+                Vec3::new(0.35, 0.38, 0.45),
+                Vec3::new(0.42, 0.48, 0.60),
+                Vec3::new(0.24, 0.22, 0.18),
+                Vec3::new(0.35, 0.38, 0.45),
+                Vec3::new(0.35, 0.38, 0.45),
+            ],
             sky_color: Vec3::new(0.45, 0.62, 0.85),
             fog_density: 0.0,
         }

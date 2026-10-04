@@ -20,9 +20,9 @@ use m2_assets::{Model, Ucfx};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
     BackendError, BlendMode, DrawCall, DrawQueue, Emissive, Geometry, IndexBufferDesc,
-    IndexBufferHandle, Layer, MaterialDesc, MaterialId, NormalMap, Primitive, RenderBackend,
-    SkinHandle, Specular, TextureDesc, TextureFormat, TextureHandle, VertexBufferDesc,
-    VertexBufferHandle, generate_mips,
+    IndexBufferHandle, Layer, MaterialDesc, MaterialId, NormalMap, Primitive, Reflection,
+    RenderBackend, SkinHandle, Specular, TextureDesc, TextureFormat, TextureHandle,
+    VertexBufferDesc, VertexBufferHandle, generate_mips,
 };
 
 use crate::assets::{AssetError, AssetSource, DecodedTexture, ModelData};
@@ -224,6 +224,18 @@ impl MaterialCache {
                 map: slot(1).and_then(|t| self.uploaded(t)).map(|t| t.handle),
             })
         });
+        // Refl and Metal techniques mirror the surroundings, scaled by
+        // constant 14 (the shaders' constant0.x) and the specular map.
+        // Metal also weights it by Fresnel, from a reflectance whose
+        // constant is not yet known, so it is left out.
+        let reflection = technique
+            .filter(|t| t.reflection || t.metal)
+            .map(|_| material.constants[14])
+            .filter(|&s| s > 0.0)
+            .map(|strength| Reflection {
+                strength,
+                fresnel: None,
+            });
         let normal_map = technique
             .filter(|t| t.normal)
             .and_then(|_| slot(2))
@@ -278,6 +290,7 @@ impl MaterialCache {
             specular,
             normal_map,
             emissive,
+            reflection,
             depth_bias,
             ..MaterialDesc::default()
         };
@@ -949,6 +962,14 @@ mod tests {
         let glow = backend.material(m).emissive.unwrap();
         assert_eq!(glow.color, [4.0, 4.0, 2.5]);
         assert!(glow.map.is_some());
+        // Paint: PgDiffSpecMetalNormFP mirrors by constant 14.
+        let mut paint = Material {
+            technique: 0xb68e_1be7,
+            ..material(7, 10)
+        };
+        paint.constants[14] = 0.25;
+        let m = cache.material(&mut backend, &paint).unwrap();
+        assert_eq!(backend.material(m).reflection.unwrap().strength, 0.25);
 
         let m = cache.material(&mut backend, &material(3, 12)).unwrap();
         assert!(backend.material(m).texture.is_none());

@@ -179,6 +179,18 @@ pub struct MaterialDesc {
     /// Light the surface gives off itself (lamps, screens), added after
     /// lighting.
     pub emissive: Option<Emissive>,
+    /// Mirror-like reflection of the surroundings (glass, paint, metal).
+    pub reflection: Option<Reflection>,
+}
+
+/// A reflection of the surroundings, along the view mirrored in the
+/// surface, scaled by the specular map when there is one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reflection {
+    pub strength: f32,
+    /// Schlick's reflectance facing the eye, rising to 1 at grazing
+    /// angles; `None` reflects alike at every angle.
+    pub fresnel: Option<f32>,
 }
 
 /// Light a surface gives off.
@@ -249,6 +261,7 @@ impl Default for MaterialDesc {
             direct: [1.0; 3],
             ambient: [1.0; 3],
             emissive: None,
+            reflection: None,
         }
     }
 }
