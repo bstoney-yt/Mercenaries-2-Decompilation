@@ -700,6 +700,7 @@ pub(crate) mod tests {
             skipped_groups: 0,
             collision: None,
             members: Vec::new(),
+            hidden: Default::default(),
         };
         let mut backend = m2_render::NullBackend::default();
         let mut materials = m2_engine::MaterialCache::new();

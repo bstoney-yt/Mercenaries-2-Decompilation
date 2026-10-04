@@ -232,6 +232,9 @@ pub struct CpuPiece {
     /// For rigid geometry, the node it hangs from (`local` is that node's
     /// rest transform), so posed models can move it with the node.
     pub node: Option<u16>,
+    /// The node its segment places it at (skinned or not), for showing
+    /// and hiding parts.
+    pub at: u16,
 }
 
 /// A model's geometry at one level of detail, decoded but not uploaded.
@@ -250,6 +253,10 @@ pub struct CpuModel {
     pub collision: Option<CollisionShape>,
     /// The collision of a merged batch's buildings, one each.
     pub members: Vec<MemberShape>,
+    /// Per node, whether its parts are hidden: intact, and wrecked (see
+    /// [`PartStates`](m2_assets::model::PartStates)). Empty when the model
+    /// switches nothing.
+    pub hidden: [Vec<bool>; 2],
 }
 
 /// The collision of one building of a merged batch (a `TINY` model).
@@ -273,7 +280,14 @@ impl CpuModel {
         let mut skipped_groups = 0;
         let mut lo = Vec3::splat(f32::MAX);
         let mut hi = Vec3::splat(f32::MIN);
+        let hidden = model.states.as_ref().map_or_else(Default::default, |s| {
+            [s.hidden(&model.nodes, false), s.hidden(&model.nodes, true)]
+        });
         for (segment, geometry) in model.lod(lod) {
+            let shown = !hidden[0]
+                .get(usize::from(segment.node))
+                .copied()
+                .unwrap_or(false);
             // Skinned positions are already in model space.
             let skinned = geometry.kind == GeometryKind::Skin;
             let local = match geometry.kind {
@@ -312,8 +326,10 @@ impl CpuModel {
                         plo = plo.min(v);
                         phi = phi.max(v);
                     }
-                    lo = lo.min(plo);
-                    hi = hi.max(phi);
+                    if shown {
+                        lo = lo.min(plo);
+                        hi = hi.max(phi);
+                    }
                     centre = (plo + phi) * 0.5;
                 }
                 pieces.push(CpuPiece {
@@ -330,6 +346,7 @@ impl CpuModel {
                         Vec::new()
                     },
                     node: (!skinned).then_some(segment.node),
+                    at: segment.node,
                 });
             }
         }
@@ -344,6 +361,7 @@ impl CpuModel {
             skipped_groups,
             collision: None,
             members: Vec::new(),
+            hidden,
         }
     }
 
@@ -374,6 +392,7 @@ struct Piece {
     centre: Vec3,
     bones: Vec<u16>,
     node: Option<u16>,
+    at: u16,
 }
 
 /// A model's geometry on the GPU, ready to draw.
@@ -385,6 +404,10 @@ pub struct GpuModel {
     pub bounds: (Vec3, Vec3),
     /// Groups left out because their vertex format isn't supported.
     pub skipped_groups: usize,
+    /// Per node, hidden intact and wrecked ([`CpuModel::hidden`]).
+    hidden: [Vec<bool>; 2],
+    /// Draw the wrecked parts instead of the intact ones.
+    pub wrecked: bool,
 }
 
 impl GpuModel {
@@ -417,6 +440,7 @@ impl GpuModel {
                 centre: p.local.inverse().transform_point3(p.centre),
                 bones: p.bones.clone(),
                 node: p.node,
+                at: p.at,
             });
         }
         Ok(Self {
@@ -424,6 +448,8 @@ impl GpuModel {
             pieces,
             bounds: cpu.bounds,
             skipped_groups: cpu.skipped_groups,
+            hidden: cpu.hidden.clone(),
+            wrecked: false,
         })
     }
 
@@ -444,7 +470,7 @@ impl GpuModel {
 
     /// Queues every piece at `world`, skinned geometry in its bind pose.
     pub fn draw(&self, queue: &mut DrawQueue, world: Mat4) {
-        for piece in &self.pieces {
+        for piece in self.shown() {
             Self::push(queue, piece, world, None);
         }
     }
@@ -469,7 +495,7 @@ impl GpuModel {
         skin: &[Mat4],
     ) -> Result<(), BackendError> {
         let mut palette = Vec::new();
-        for piece in &self.pieces {
+        for piece in self.shown() {
             let handle = if piece.bones.is_empty() {
                 if let Some(&m) = piece.node.and_then(|n| nodes.get(usize::from(n))) {
                     Self::push_at(queue, piece, world * m, None);
@@ -489,6 +515,14 @@ impl GpuModel {
             Self::push(queue, piece, world, handle);
         }
         Ok(())
+    }
+
+    /// The pieces drawn as the model stands, intact or wrecked.
+    fn shown(&self) -> impl Iterator<Item = &Piece> {
+        let hidden = &self.hidden[usize::from(self.wrecked)];
+        self.pieces
+            .iter()
+            .filter(|p| !hidden.get(usize::from(p.at)).copied().unwrap_or(false))
     }
 
     fn push(queue: &mut DrawQueue, piece: &Piece, world: Mat4, skin: Option<SkinHandle>) {
