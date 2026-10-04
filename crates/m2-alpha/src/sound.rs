@@ -627,7 +627,10 @@ mod tests {
         assert_eq!(engine_bank("tank", "al_veh_tank_m1"), "veh_tankbig");
         assert_eq!(engine_bank("car", "al_veh_apc_stryker"), "veh_tankmed");
         assert_eq!(engine_bank("truck", "semi_orange"), "veh_semi");
-        assert_eq!(engine_bank("car", "global_veh_68valiant4door"), "veh_8cylinderold");
+        assert_eq!(
+            engine_bank("car", "global_veh_68valiant4door"),
+            "veh_8cylinderold"
+        );
         assert_eq!(engine_bank("car", "m151"), "veh_4cylindernew");
     }
 }
