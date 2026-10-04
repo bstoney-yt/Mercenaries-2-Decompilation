@@ -24,8 +24,16 @@ m2-alpha [options]
   --jump                 with --screenshot on the island: jump just before
                          the picture
   --fight                with --screenshot on the island: shoot the nearest
-                         soldier, rocket a vehicle, throw a grenade first
-  --fight-wait <s>       with --fight: wait this long before the picture
+                         soldier, rocket a vehicle, throw a grenade first,
+                         then look at the body
+  --fight-wait <s>       with --fight or --blast: wait this long before
+                         the picture
+  --blast                with --screenshot on the island: fire a rocket at
+                         the fuel tank or barrel nearest where she starts
+  --vehicle <name>       with --drive: get in the nearest vehicle whose
+                         name holds this (stryker, m1a1, amx30, hmmwv...)
+  --look <degrees>       with --drive: stop and swing the camera this far
+                         before the picture (turrets follow it)
   --spawns <n>           with --screenshot: list the n spawns nearest where
                          she starts (name, place, who they spawn)
   --mission              run the game's mission scripts: the first contract

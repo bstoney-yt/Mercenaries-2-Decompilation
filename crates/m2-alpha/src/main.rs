@@ -95,6 +95,12 @@ struct Options {
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
     fight: bool,
+    /// With `--screenshot`: rocket the nearest fuel tank or barrel.
+    blast: bool,
+    /// With `--drive`: a vehicle whose name holds this.
+    vehicle: Option<String>,
+    /// With `--drive`: swing the camera this far (radians) before the picture.
+    look: f32,
     /// With `--screenshot`: how many of the nearest spawns to list.
     list_spawns: usize,
     /// With `--fight`: seconds to wait after it before the picture.
@@ -165,6 +171,14 @@ fn parse_args() -> anyhow::Result<Options> {
             "--drive" => o.drive = true,
             "--jump" => o.jump = true,
             "--fight" => o.fight = true,
+            "--blast" => o.blast = true,
+            "--vehicle" => o.vehicle = Some(value()?.to_ascii_lowercase()),
+            "--look" => {
+                o.look = value()?
+                    .parse::<f32>()
+                    .context("--look expects degrees")?
+                    .to_radians()
+            }
             "--mission" => o.mission = true,
             "--mission-driver" => {
                 let path = value()?;
@@ -564,8 +578,10 @@ fn screenshot(
     }
     if options.fight && game.on_foot && game.scene.player.is_some() {
         fight_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
+    } else if options.blast && game.on_foot && game.scene.player.is_some() {
+        blast_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
     } else if options.drive && game.on_foot && game.scene.player.is_some() {
-        drive_for_screenshot(&mut backend, &mut game, fov, aspect)?;
+        drive_for_screenshot(&mut backend, &mut game, fov, aspect, options)?;
     } else if game.on_foot && game.scene.player.is_some() {
         let gait = options.gait.unwrap_or(Gait::Idle);
         let intent = Intent {
@@ -707,6 +723,7 @@ fn drive_for_screenshot(
     game: &mut Game,
     fov: f32,
     aspect: f32,
+    options: &Options,
 ) -> anyhow::Result<()> {
     let tick = TICK.as_secs_f32();
     let started = Instant::now();
@@ -732,7 +749,33 @@ fn drive_for_screenshot(
     for _ in 0..90 {
         game.step(Intent::default(), tick);
     }
-    if !game.enter_nearest(f32::INFINITY) {
+    let entered = match &options.vehicle {
+        Some(want) => {
+            let here = game.focus();
+            let world = game.scene.world.as_ref();
+            let pick = game
+                .scene
+                .vehicles
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.spec.label.to_ascii_lowercase().contains(want.as_str()))
+                .filter_map(|(i, v)| {
+                    let at = world?
+                        .physics
+                        .vehicle_transform(v.id?)?
+                        .transform_point3(m2_math::glam::Vec3::ZERO);
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i);
+            if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+                p.driving = Some(i);
+            }
+            pick.is_some()
+        }
+        None => game.enter_nearest(f32::INFINITY),
+    };
+    if !entered {
         eprintln!("drive: no vehicle to get in");
         return Ok(());
     }
@@ -759,6 +802,38 @@ fn drive_for_screenshot(
             "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s",
             (to - from).length()
         );
+    }
+    if options.look != 0.0 {
+        // Stop, then swing the camera and watch the turret follow.
+        let brake = Intent {
+            hold_jump: true,
+            ..Intent::default()
+        };
+        for _ in 0..60 {
+            game.step(brake, tick);
+        }
+        let swing = 10;
+        for i in 0..90 {
+            let look = if i < swing {
+                m2_math::glam::Vec2::new(options.look / swing as f32, 0.0)
+            } else {
+                m2_math::glam::Vec2::ZERO
+            };
+            game.step(Intent { look, ..brake }, tick);
+            if i % 15 == 14
+                && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
+            {
+                let v = &game.scene.vehicles[i];
+                eprintln!(
+                    "drive: turret at {:.0} deg, camera yaw {:.0} deg",
+                    v.turret.to_degrees(),
+                    game.scene
+                        .player
+                        .as_ref()
+                        .map_or(0.0, |p| p.yaw.to_degrees())
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -913,27 +988,6 @@ fn fight_for_screenshot(
             game.scene.vehicles.iter().filter(|v| v.wrecked).count()
         );
     }
-    // A rocket at the nearest fuel tank or barrel in range.
-    let here = game.focus();
-    let tank = game
-        .scene
-        .explosives
-        .iter()
-        .filter(|e| !e.gone && e.at.distance(here) < 80.0)
-        .map(|e| e.at)
-        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)));
-    if let Some(at) = tank {
-        aim_at(game, at);
-        game.step(fire(Some(Weapon::Rpg)), tick);
-        for _ in 0..120 {
-            game.step(Intent::default(), tick);
-        }
-        let spent = game.scene.explosives.iter().filter(|e| e.gone).count();
-        eprintln!(
-            "fight: rocket at the explosive at {at:.1}; {spent} of {} spent",
-            game.scene.explosives.len()
-        );
-    }
     game.step(
         Intent {
             trigger: Trigger {
@@ -968,8 +1022,48 @@ fn fight_for_screenshot(
             render(backend, game, fov, aspect, None)?;
         }
     }
+    // A body to look at: stand a few metres from it.
+    let body = soldier.and_then(|i| {
+        let doll = game.scene.people.npcs.get(i)?.ragdoll?;
+        let nodes = game.scene.world.as_ref()?.physics.ragdoll_nodes(doll)?;
+        let points: Vec<_> = nodes
+            .iter()
+            .map(|m| m.transform_point3(m2_math::glam::Vec3::ZERO))
+            .collect();
+        let (lo, hi) = points.iter().fold(
+            (
+                m2_math::glam::Vec3::splat(f32::MAX),
+                m2_math::glam::Vec3::splat(f32::MIN),
+            ),
+            |(lo, hi), p| (lo.min(*p), hi.max(*p)),
+        );
+        eprintln!(
+            "fight: body at {:.1}, {} nodes spanning {:.2}",
+            (lo + hi) / 2.0,
+            points.len(),
+            hi - lo
+        );
+        Some((lo + hi) / 2.0)
+    });
+    if let Some(at) = body {
+        let here = game.focus();
+        if let Some(p) = game.scene.player.as_mut() {
+            let away = (here - at)
+                .with_y(0.0)
+                .try_normalize()
+                .unwrap_or(m2_math::glam::Vec3::X);
+            p.character.position = at + away * 5.0 + m2_math::glam::Vec3::Y * 2.0;
+            p.character.velocity = m2_math::glam::Vec3::ZERO;
+            p.landed = false;
+        }
+        for _ in 0..60 {
+            game.step(Intent::default(), tick);
+        }
+    }
     // The picture: aiming, with soldiers firing back.
-    if let Some(i) = soldier {
+    if let Some(at) = body {
+        aim_at(game, at);
+    } else if let Some(i) = soldier {
         let chest = game.scene.people.npcs[i].chest();
         aim_at(game, chest + m2_math::glam::Vec3::Y * 0.5);
     }
@@ -1002,6 +1096,87 @@ fn fight_for_screenshot(
             deg(left)
         );
     }
+    render(backend, game, fov, aspect, None)?;
+    Ok(())
+}
+
+/// Blows up the fuel tank or barrel nearest where she starts for the
+/// screenshot: stands 25 m off, fires a rocket at it, and takes the
+/// picture looking at where it stood.
+fn blast_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    wait: f32,
+) -> anyhow::Result<()> {
+    use combat::{Trigger, Weapon};
+    let tick = TICK.as_secs_f32();
+    let here = game.focus();
+    let Some(at) = game
+        .scene
+        .explosives
+        .iter()
+        .map(|e| e.at)
+        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)))
+    else {
+        eprintln!("blast: no explosives");
+        return Ok(());
+    };
+    let near = |game: &Game, r: f32| {
+        game.scene
+            .explosives
+            .iter()
+            .filter(|e| e.at.distance(at) < r)
+            .count()
+    };
+    eprintln!(
+        "blast: explosive at {at:.1} ({:.0} m off); {} within 10 m, {} within 30 m",
+        at.distance(here),
+        near(game, 10.0),
+        near(game, 30.0)
+    );
+    if let Some(p) = game.scene.player.as_mut() {
+        let away = (here - at)
+            .with_y(0.0)
+            .try_normalize()
+            .unwrap_or(m2_math::glam::Vec3::X);
+        p.character.position = at + away * 25.0 + m2_math::glam::Vec3::Y * 2.0;
+        p.character.velocity = m2_math::glam::Vec3::ZERO;
+        p.landed = false;
+    }
+    for _ in 0..90 {
+        game.step(Intent::default(), tick);
+    }
+    aim_at(game, at);
+    let fire = Intent {
+        trigger: Trigger {
+            fire: true,
+            aim: true,
+            select: Some(Weapon::Rpg),
+            ..Trigger::default()
+        },
+        ..Intent::default()
+    };
+    game.step(fire, tick);
+    for _ in 0..120 {
+        game.step(Intent::default(), tick);
+    }
+    let spent = game.scene.explosives.iter().filter(|e| e.gone).count();
+    eprintln!(
+        "blast: {} blasts; {spent} of {} explosives spent; player hp {:.0}",
+        game.combat.blasts,
+        game.scene.explosives.len(),
+        game.combat.hp
+    );
+    for i in 0..(wait / tick) as usize {
+        game.step(Intent::default(), tick);
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    aim_at(game, at);
+    game.step(Intent::default(), tick);
     render(backend, game, fov, aspect, None)?;
     Ok(())
 }
