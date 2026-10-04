@@ -13,6 +13,7 @@
 //! cargo run -p m2-assets --example wad -- world   <archive.wad>
 //! cargo run -p m2-assets --example wad -- entities <archive.wad>
 //! cargo run -p m2-assets --example wad -- hash    <archive.wad> <name>...
+//! cargo run -p m2-assets --example wad -- grep    <archive.wad> <text> [max hits shown]
 //! cargo run -p m2-assets --example wad -- types   <archive.wad>
 //! cargo run -p m2-assets --example wad -- scripts <archive.wad>
 //! cargo run -p m2-assets --example wad -- script  <archive.wad> <script hash>
@@ -36,6 +37,8 @@
 //! the template `civ_car`), how many entities it has, which components they
 //! carry and which asset types its name's hash finds.
 //! `hash` prints each name's hash and the assets of the archive it keys.
+//! `grep` finds which assets hold a piece of text and shows the readable
+//! bytes around each hit, to find where a name is defined.
 //! `types` summarises every asset type: how many, their sizes, a few names
 //! and block paths, the section layout of one, any `Lua` bytecode or
 //! script-like text, and the longest readable strings in one sample, to
@@ -201,6 +204,57 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("anims", []) => anims(&mut wad)?,
         ("world", []) => world(&mut wad)?,
         ("entities", []) => entities(&mut wad)?,
+        ("grep", [text, rest @ ..]) => {
+            // Which assets hold `text`, and the readable text around it.
+            let limit: usize = rest.first().map_or(Ok(40), |n| n.parse())?;
+            let types = index.type_hashes().to_vec();
+            let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+            let needle = text.as_bytes();
+            let mut shown = 0;
+            let mut hits = 0;
+            for (block, path) in paths.iter().enumerate() {
+                let decoded = match wad.read_block(block) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("block {block}: {e}");
+                        continue;
+                    }
+                };
+                let Ok(contents) = BlockContents::parse(&decoded) else {
+                    continue;
+                };
+                for (entry, data) in contents.iter() {
+                    let ty = types.iter().position(|&t| t == entry.type_hash);
+                    for at in memchr_all(needle, data) {
+                        hits += 1;
+                        if shown >= limit {
+                            continue;
+                        }
+                        shown += 1;
+                        let from = at.saturating_sub(48);
+                        let to = (at + needle.len() + 48).min(data.len());
+                        let around: String = data[from..to]
+                            .iter()
+                            .map(|&b| {
+                                if (0x20..0x7f).contains(&b) {
+                                    b as char
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect();
+                        println!(
+                            "{path} {:08x} type {} {:#x}/{:#x}: {around}",
+                            entry.name_hash,
+                            ty.map_or("?".to_owned(), |t| t.to_string()),
+                            at,
+                            data.len()
+                        );
+                    }
+                }
+            }
+            println!("{hits} hits, {shown} shown");
+        }
         ("hash", names) => {
             // The index alone: which assets, of which types, each name finds.
             for name in names {
@@ -1630,4 +1684,12 @@ fn entities<R: std::io::Read + std::io::Seek>(
     }
     eprintln!("{errors} errors");
     Ok(())
+}
+
+/// Every offset at which `needle` occurs in `hay`.
+fn memchr_all<'a>(needle: &'a [u8], hay: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    hay.windows(needle.len().max(1))
+        .enumerate()
+        .filter(move |(_, w)| !needle.is_empty() && *w == needle)
+        .map(|(i, _)| i)
 }
