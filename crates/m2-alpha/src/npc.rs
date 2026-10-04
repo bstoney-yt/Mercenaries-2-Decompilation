@@ -717,6 +717,7 @@ pub(crate) mod tests {
             upper: None,
             two_handed: false,
             aim: None,
+            hands: Default::default(),
         }
     }
 
