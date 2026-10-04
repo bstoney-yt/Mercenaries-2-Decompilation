@@ -1137,8 +1137,9 @@ struct Effects {
     mesh: (VertexBufferHandle, IndexBufferHandle),
     /// Indices in the mesh.
     count: u32,
-    /// Tracer and flash, fire, smoke.
+    /// Tracer, muzzle flash, fire, smoke.
     light: MaterialId,
+    flash: MaterialId,
     fire: MaterialId,
     smoke: MaterialId,
 }
@@ -1193,6 +1194,7 @@ impl Effects {
             mesh: (vb, ib),
             count: faces.len() as u32 * 3,
             light: define([1.0, 0.85, 0.45, 1.0], false, BlendMode::Opaque)?,
+            flash: define([1.0, 0.78, 0.32, 0.9], false, BlendMode::Translucent)?,
             fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
             smoke: define([0.35, 0.35, 0.35, 0.4], true, BlendMode::Translucent)?,
         })
@@ -1200,6 +1202,27 @@ impl Effects {
 
     /// Queues `effect`, `age` of the way (0 to 1) through its life.
     fn draw(&self, queue: &mut DrawQueue, effect: Effect, age: f32) {
+        if let Effect::Flash { at, dir, size } = effect {
+            // A narrow plume out along the barrel and a small glow at the
+            // muzzle, both soft-edged, shrinking as they go.
+            let dir = dir.normalize_or(Vec3::Z);
+            let turn = Quat::from_rotation_arc(Vec3::Z, dir);
+            let fade = 1.0 - 0.5 * age;
+            let reach = size * fade;
+            let plume = Mat4::from_scale_rotation_translation(
+                Vec3::new(reach * 0.16, reach * 0.16, reach * 0.5),
+                turn,
+                at + dir * (reach * 0.5),
+            );
+            let glow = Mat4::from_scale_rotation_translation(
+                Vec3::splat(reach * 0.14),
+                turn,
+                at + dir * (reach * 0.08),
+            );
+            self.push(queue, plume, self.flash, true);
+            self.push(queue, glow, self.flash, true);
+            return;
+        }
         let (world, material, translucent) = match effect {
             Effect::Tracer { from, to } => {
                 let along = to - from;
@@ -1218,11 +1241,7 @@ impl Effects {
                     false,
                 )
             }
-            Effect::Flash { at } => (
-                Mat4::from_scale_rotation_translation(Vec3::splat(0.12), Quat::IDENTITY, at),
-                self.light,
-                false,
-            ),
+            Effect::Flash { .. } => return,
             Effect::Fire { at, size } => (
                 Mat4::from_scale_rotation_translation(
                     Vec3::splat(size * (0.4 + age)),
@@ -1248,30 +1267,39 @@ impl Effects {
         } else {
             &[1.0]
         };
-        let (vb, ib) = self.mesh;
         for &shell in shells {
-            let world = world * Mat4::from_scale(Vec3::splat(shell));
-            queue.push(Primitive {
-                call: DrawCall {
-                    material,
-                    topology: Topology::TriangleList,
-                    vertex_buffer: vb,
-                    geometry: Geometry::Indexed {
-                        buffer: ib,
-                        first: 0,
-                        count: self.count,
-                        base_vertex: 0,
-                    },
-                    world,
-                    skin: None,
-                    instances: None,
-                },
-                layer: Layer::WORLD,
+            self.push(
+                queue,
+                world * Mat4::from_scale(Vec3::splat(shell)),
+                material,
                 translucent,
-                sort_origin: world.transform_point3(Vec3::ZERO),
-                user: 0,
-            });
+            );
         }
+    }
+
+    /// Queues the sphere at `world` in `material`.
+    fn push(&self, queue: &mut DrawQueue, world: Mat4, material: MaterialId, translucent: bool) {
+        let (vb, ib) = self.mesh;
+        queue.push(Primitive {
+            call: DrawCall {
+                material,
+                topology: Topology::TriangleList,
+                vertex_buffer: vb,
+                geometry: Geometry::Indexed {
+                    buffer: ib,
+                    first: 0,
+                    count: self.count,
+                    base_vertex: 0,
+                },
+                world,
+                skin: None,
+                instances: None,
+            },
+            layer: Layer::WORLD,
+            translucent,
+            sort_origin: world.transform_point3(Vec3::ZERO),
+            user: 0,
+        });
     }
 }
 
