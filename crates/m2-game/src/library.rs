@@ -124,10 +124,32 @@ impl Library {
     /// it. The names settle classes whose few used members, such as
     /// `Activated`, many scripts define.
     /// The best pairs are taken first and a script is one module only.
+    ///
+    /// A module no script uses members of (a mission module such as
+    /// `VzaCon001`, loaded by a name from data) is the script not already
+    /// some module's that names it most often in its strings.
     pub fn resolve(&self, name: &str) -> Option<(&ScriptInfo, usize, usize)> {
         let key = name.to_ascii_lowercase();
-        let &(index, hits) = self.assigned.get_or_init(|| self.assign()).get(&key)?;
-        Some((&self.scripts[index], hits, self.used.get(&key)?.len()))
+        let assigned = self.assigned.get_or_init(|| self.assign());
+        if let Some(&(index, hits)) = assigned.get(&key) {
+            let used = self.used.get(&key).map_or(0, BTreeSet::len);
+            return Some((&self.scripts[index], hits, used));
+        }
+        if self.used.contains_key(&key) {
+            return None;
+        }
+        let taken: BTreeSet<usize> = assigned.values().map(|&(i, _)| i).collect();
+        self.scripts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !taken.contains(i))
+            .map(|(_, s)| (s.strings.iter().filter(|t| mentions(t, &key)).count(), s))
+            .filter(|&(n, _)| n > 0)
+            .max_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then(b.1.defines.len().cmp(&a.1.defines.len()))
+            })
+            .map(|(_, s)| (s, 0, 0))
     }
 
     fn assign(&self) -> BTreeMap<String, (usize, usize)> {

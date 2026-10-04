@@ -252,6 +252,10 @@ fn run(o: &Options) -> Result<()> {
         }
     }
     globals.raw_set("Scripts", entries)?;
+    // The bootstraps' module set-up.
+    for f in host.init_modules()? {
+        failures.push(format!("Init of {f}"));
+    }
     println!(
         "started: {} modules, {} failures",
         host.modules().len(),
@@ -275,6 +279,7 @@ fn run(o: &Options) -> Result<()> {
     let mut teleports = o.teleports.clone();
     teleports.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut teleports = teleports.into_iter().peekable();
+    let mut waiting_since: Option<f64> = None;
     while now < o.seconds {
         now += o.step;
         while let Some(&(_, at)) = teleports.peek().filter(|t| t.0 <= now) {
@@ -284,6 +289,20 @@ fn run(o: &Options) -> Result<()> {
             }
             println!();
             println!("t={now:.1} player moved to {at:?}");
+        }
+        // Streaming is instant here: a waiting state ends a second after
+        // it was asked for, and the scripts hear that it did.
+        {
+            let mut w = world.borrow_mut();
+            if w.game_state.starts_with("WaitFor") {
+                let since = *waiting_since.get_or_insert(now);
+                if now - since >= 1.0 {
+                    println!();
+                    println!("t={now:.1} game state {} done", w.game_state);
+                    w.game_state = "Game".into();
+                    waiting_since = None;
+                }
+            }
         }
         let errors = events.update_shared(o.step, &world);
         for e in &errors {
@@ -320,6 +339,27 @@ fn settle(
 ) {
     let mut commands = report(when, host, world, events);
     for _ in 0..50 {
+        // Modules a script loaded "in the background" are ready.
+        let ran = match host.run_deferred() {
+            Ok((ran, errors)) => {
+                for e in errors {
+                    println!("  dynamic_import callback: {}", first_lines(&e));
+                }
+                ran
+            }
+            Err(e) => {
+                println!("  dynamic_import callbacks: {e}");
+                0
+            }
+        };
+        if ran > 0 {
+            commands.extend(report(
+                &format!("{when}, {ran} modules loaded"),
+                host,
+                world,
+                events,
+            ));
+        }
         let requests: Vec<(LayerOp, String)> = commands
             .into_iter()
             .filter_map(|c| match c {
@@ -328,7 +368,11 @@ fn settle(
             })
             .collect();
         if requests.is_empty() {
-            return;
+            if ran == 0 {
+                return;
+            }
+            commands = Vec::new();
+            continue;
         }
         for (op, name) in requests {
             let found = layers.get(&name);

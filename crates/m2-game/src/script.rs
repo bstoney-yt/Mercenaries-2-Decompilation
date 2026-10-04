@@ -385,7 +385,29 @@ impl ScriptHost {
                     return true
                 end
                 function import(name) return bind(caller(), name) end
-                function dynamic_import(name) return bind(caller(), name) end
+                -- dynamic_import(name, callback, args) loads in the
+                -- background in the game: the callback runs later, with
+                -- the args unpacked, when the host runs the deferred
+                -- calls.
+                __m2_deferred = {}
+                function dynamic_import(name, callback, args)
+                    local m = bind(caller(), name)
+                    if type(callback) == "function" then
+                        local q = __m2_deferred
+                        q[#q + 1] = { callback, args or {} }
+                    end
+                    return m
+                end
+                function __m2_run_deferred()
+                    local q = __m2_deferred
+                    __m2_deferred = {}
+                    local errors = {}
+                    for _, d in ipairs(q) do
+                        local ok, e = pcall(d[1], unpack(d[2]))
+                        if not ok then errors[#errors + 1] = tostring(e) end
+                    end
+                    return #q, errors
+                end
                 function dynamic_remove(name) end
                 function inherit(name)
                     local env = caller()
@@ -405,6 +427,39 @@ impl ScriptHost {
             .set_mode(ChunkMode::Text)
             .exec()?;
         Ok(())
+    }
+
+    /// Runs the callbacks of `dynamic_import`s made since the last call
+    /// (the modules are loaded; the game would have streamed them).
+    /// Returns how many ran and the errors of those that failed. Call
+    /// once a tick.
+    pub fn run_deferred(&self) -> Result<(usize, Vec<String>), ScriptError> {
+        let Ok(run) = self.lua.globals().raw_get::<Function>("__m2_run_deferred") else {
+            return Ok((0, Vec::new()));
+        };
+        Ok(run.call::<(usize, Vec<String>)>(())?)
+    }
+
+    /// Calls `Init` on every module loaded so far that defines one, in the
+    /// order they loaded, as the game's bootstraps do before play: many
+    /// modules set up their tables there. Returns those that failed.
+    pub fn init_modules(&self) -> Result<Vec<String>, ScriptError> {
+        let mut failed = Vec::new();
+        let globals = self.lua.globals();
+        for (name, hash) in self.modules() {
+            if hash.is_none() {
+                continue;
+            }
+            let Ok(Value::Table(m)) = globals.raw_get::<Value>(name.as_str()) else {
+                continue;
+            };
+            if let Ok(Value::Function(init)) = m.raw_get::<Value>("Init")
+                && let Err(e) = init.call::<()>(())
+            {
+                failed.push(format!("{name}: {}", tidy(&e.to_string())));
+            }
+        }
+        Ok(failed)
     }
 
     /// Runs script `hash` from `library` as an entry point: in its own
@@ -546,6 +601,30 @@ mod tests {
         // them.
         let greet: String = host.lua().load("return Util.Greet('you')").eval().unwrap();
         assert_eq!(greet, "hi you");
+    }
+
+    #[test]
+    fn dynamic_imports_call_back_later_and_modules_init() {
+        let host = ScriptHost::new().unwrap();
+        let library = Rc::new(crate::library::tests::library());
+        host.install_library(Rc::clone(&library), false).unwrap();
+        host.lua()
+            .load(
+                r#"
+                got = nil
+                local m = dynamic_import("Util", function(a, b) got = a .. b end, {"x", "y"})
+                assert(m.Greet ~= nil and got == nil)
+                Util.Init = function() Util.ready = true end
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(host.run_deferred().unwrap(), (1, Vec::new()));
+        let got: String = host.lua().globals().get("got").unwrap();
+        assert_eq!(got, "xy");
+        assert!(host.init_modules().unwrap().is_empty());
+        let ready: bool = host.lua().load("return Util.ready").eval().unwrap();
+        assert!(ready);
     }
 
     #[test]

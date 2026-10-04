@@ -98,6 +98,10 @@ pub enum Command {
         op: crate::layers::LayerOp,
         name: String,
     },
+    /// The scripts asked for a game state (`"WaitForStreaming"`): the
+    /// game goes into it, and sets [`ScriptWorld::game_state`] back to
+    /// `"Game"` when it is done (the world has streamed in).
+    GameState(String),
     /// A call the game only needs to hear about: `"Pg.SaveGame"`,
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
@@ -116,6 +120,8 @@ pub struct ScriptWorld {
     /// What `Sys.GetAssetRequestMax` answers; scripts raise it while
     /// layers load and put it back.
     pub asset_request_max: u32,
+    /// The game state (`Sys.RequestGameState`), `"Game"` while playing.
+    pub game_state: String,
     /// Layers the archives hold and which are loaded.
     pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
@@ -177,6 +183,10 @@ impl World for ScriptWorld {
             .collect();
         out.sort_unstable();
         out
+    }
+
+    fn game_state(&self) -> Option<String> {
+        Some(self.game_state.clone())
     }
 }
 
@@ -465,6 +475,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let player = lib("Player")?;
+    // A new game starts at the usual marker.
+    add(&player, "GetPlayerStart", |_, lua, _| {
+        values([Value::String(lua.create_string("PlayerLocation_Start")?)])
+    })?;
     // The PMC's fuel tank: invented, the game's figure is not decoded.
     add(&player, "GetFuelCapacity", |_, _, _| {
         values([Value::Number(100.0)])
@@ -544,6 +558,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let ai = lib("Ai")?;
+    // Faction relations are not modelled yet: everyone is neutral (0 on
+    // the scale the faction manager converts to attitude levels).
+    add(&ai, "GetRelation", |_, _, _| values([Value::Number(0.0)]))?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -615,13 +632,31 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     for name in ["GetSkipMission", "GetINIBriefing", "GetForceNewGame"] {
         add(&sys, name, |_, _, _| values([Value::Nil]))?;
     }
-    for name in ["SetSkipMission", "RequestGameState"] {
-        add(&sys, name, |_, _, _| values([]))?;
-    }
+    add(&sys, "SetSkipMission", |_, _, _| values([]))?;
+    add(&sys, "RequestGameState", |w, _, a| {
+        if let Some(Value::String(s)) = a.first() {
+            let state = s.to_string_lossy();
+            w.game_state = state.clone();
+            w.commands.push(Command::GameState(state));
+        }
+        values([])
+    })?;
+    add(&sys, "GetLevelName", |_, lua, _| {
+        values([Value::String(lua.create_string("vz")?)])
+    })?;
     add(&sys, "GetIgnoreLayers", |_, lua, _| {
         values([Value::Table(lua.create_table()?)])
     })?;
     // The streaming budget the layer manager raises while it loads.
+    {
+        let mut w = world.borrow_mut();
+        if w.asset_request_max == 0 {
+            w.asset_request_max = 8;
+        }
+        if w.game_state.is_empty() {
+            w.game_state = "Game".into();
+        }
+    }
     add(&sys, "GetAssetRequestMax", |w, _, _| {
         values([Value::Number(f64::from(w.asset_request_max))])
     })?;
@@ -631,6 +666,30 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+
+    // The engine's additions to the math library: random integers in
+    // [a, b] (or [1, a]) and random reals in [a, b].
+    lua.load(
+        r#"
+        local function randi(a, b)
+            if b then return math.random(a, b) end
+            return math.random(a)
+        end
+        local function randf(a, b)
+            a, b = a or 0, b or 1
+            return a + (b - a) * math.random()
+        end
+        math.randi, math.randf = randi, randf
+        local M = rawget(_G, "Math")
+        if type(M) ~= "table" then
+            M = {}
+            rawset(_G, "Math", M)
+        end
+        M.randi, M.randf = randi, randf
+        "#,
+    )
+    .set_name("=m2-math")
+    .exec()?;
 
     // The game's assert: logged, and the script carries on, as a release
     // build would.
@@ -763,13 +822,49 @@ mod tests {
             )
             .eval()
             .unwrap();
-        assert_eq!(n, 8.0);
+        assert_eq!(n, 16.0);
         let mut w = world.borrow_mut();
         assert_eq!(w.printed, ["ASSERT failed: Unable to load layer"]);
         assert_eq!(
             w.take_commands(),
             [Command::Notify("Pg.ContractActivated".into())]
         );
+    }
+
+    #[test]
+    fn game_state_changes_fire_events() {
+        let (host, world) = setup();
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                left = nil
+                Sys.RequestGameState("WaitForStreaming")
+                Event.Create(Event.GameStateChange, {"WaitForStreaming", "exit"},
+                    function(state, name, how) left = state .. " " .. name .. " " .. how end,
+                    {"streaming"})
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::GameState("WaitForStreaming".into())]
+        );
+        events.update_shared(0.5, &world);
+        let left: Option<String> = host.lua().globals().get("left").unwrap();
+        assert_eq!(left, None);
+        world.borrow_mut().game_state = "Game".into();
+        events.update_shared(0.5, &world);
+        let left: String = host.lua().globals().get("left").unwrap();
+        assert_eq!(left, "streaming WaitForStreaming exit");
+        let r: bool = host
+            .lua()
+            .load("local n = math.randi(3); return n >= 1 and n <= 3 and Math.randf(2, 2) == 2")
+            .eval()
+            .unwrap();
+        assert!(r);
     }
 
     #[test]
