@@ -277,6 +277,17 @@ impl Game {
             self.scene
                 .people
                 .update(&mut world.physics, &world.index.spawns, focus, threat, dt);
+            let cars: Vec<_> = self
+                .scene
+                .vehicles
+                .iter()
+                .filter_map(|v| {
+                    let id = v.id?;
+                    let at = world.physics.vehicle_transform(id)?;
+                    Some((at, world.physics.vehicle_velocity(id), v.model.bounds))
+                })
+                .collect();
+            self.scene.people.traffic(&cars);
         }
         let scene = &mut self.scene;
         if self.on_foot
