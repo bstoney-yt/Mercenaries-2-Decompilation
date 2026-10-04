@@ -98,6 +98,8 @@ struct Options {
     fight: bool,
     /// With `--screenshot`: rocket the nearest fuel tank or barrel.
     blast: bool,
+    /// With `--drive`: wreck it at speed at the end and watch it stop.
+    wreck: bool,
     /// With `--drive`: a vehicle whose name holds this.
     vehicle: Option<String>,
     /// With `--drive`: swing the camera this far (radians) before the picture.
@@ -193,6 +195,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--jump" => o.jump = true,
             "--fight" => o.fight = true,
             "--blast" => o.blast = true,
+            "--wreck" => o.wreck = true,
             "--vehicle" => o.vehicle = Some(value()?.to_ascii_lowercase()),
             "--look" => {
                 o.look = value()?
@@ -1106,6 +1109,9 @@ fn drive_for_screenshot(
         "drive: {moved} of {} people moved more than 0.5 m during the drive",
         npcs.len().min(before.len())
     );
+    if options.wreck {
+        wreck_at_speed(game, tick);
+    }
     if options.look != 0.0 {
         // Stop, then swing the camera and watch the turret follow.
         let brake = Intent {
@@ -1150,6 +1156,46 @@ fn drive_for_screenshot(
         }
     }
     Ok(())
+}
+
+/// Wrecks the vehicle she drives, as it goes, and logs how it comes to
+/// rest: how fast it went, how far it slid, and how much lower it sits.
+fn wreck_at_speed(game: &mut Game, tick: f32) {
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return;
+    };
+    let state = |game: &Game| {
+        let physics = &game.scene.world.as_ref()?.physics;
+        Some((
+            physics.vehicle_transform(id)?.w_axis.truncate(),
+            physics.vehicle_velocity(id).length(),
+        ))
+    };
+    let Some((from, speed)) = state(game) else {
+        return;
+    };
+    game.scene.vehicles[i].wrecked = true;
+    if let Some(world) = game.scene.world.as_mut() {
+        world.physics.wreck_vehicle(id);
+    }
+    let mut stopped = None;
+    for k in 0..240 {
+        game.step(Intent::default(), tick);
+        if stopped.is_none() && state(game).is_some_and(|(_, v)| v < 0.3) {
+            stopped = Some(k as f32 * tick);
+        }
+    }
+    if let Some((to, now)) = state(game) {
+        eprintln!(
+            "drive: wrecked at {speed:.1} m/s; slid {:.1} m, {:.2} m lower, moving {now:.2} m/s after 4 s, stopped {}",
+            (to - from).with_y(0.0).length(),
+            from.y - to.y,
+            stopped.map_or("never".to_owned(), |t| format!("after {t:.1} s"))
+        );
+    }
 }
 
 /// Turns the player's camera so the crosshair is on `target`.
