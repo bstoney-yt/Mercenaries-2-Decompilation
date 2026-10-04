@@ -195,6 +195,8 @@ const SERVICE_BRAKE: f32 = 8.0;
 const HANDBRAKE: f32 = 9.0;
 const ROLLING: f32 = 0.6;
 const HOLD: f32 = 3.0;
+/// How fast tracks turn a hull standing still, radians per second.
+const TRACK_TURN: f32 = 0.9;
 
 /// A vehicle in the physics world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -213,6 +215,8 @@ struct VehicleBody {
     mass: f32,
     /// Which wheels steer (the front axle), in wheel order.
     steers: Vec<bool>,
+    /// On tracks: turns on the spot instead of steering wheels.
+    tracked: bool,
 }
 
 /// A character's capsule and motion.
@@ -415,6 +419,7 @@ impl Physics {
             controller,
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
+            tracked: spec.tracked,
         }));
         id
     }
@@ -456,6 +461,10 @@ impl Physics {
             (0.0, slowing(ROLLING))
         };
         let steer = controls.steer.clamp(-1.0, 1.0) * MAX_STEER / (1.0 + speed.abs() * 0.04);
+        let steer = if v.tracked { 0.0 } else { steer };
+        let tracked = v
+            .tracked
+            .then(|| (v.controller.chassis, controls.steer.clamp(-1.0, 1.0)));
         // Only the front axle steers: steering every wheel the same way
         // slides the vehicle sideways instead of turning it. The handbrake
         // locks the rest, so the back can slide out.
@@ -468,6 +477,17 @@ impl Physics {
             } else {
                 brake
             };
+        }
+        // Tracks turn the hull on the spot (one track forward, the other
+        // back), so the yaw is set directly; a little slower on the move.
+        if let Some((chassis, turn)) = tracked
+            && let Some(body) = self.world.bodies.get_mut(chassis)
+        {
+            let w = body.angvel();
+            let rate = turn * TRACK_TURN / (1.0 + speed.abs() * 0.05);
+            let up = body.position().rotation * r::Vector::Y;
+            let keep = w - up * w.dot(up);
+            body.set_angvel(keep + up * rate, true);
         }
     }
 
@@ -821,6 +841,39 @@ mod tests {
         assert!(p.vehicle_speed(id).abs() < 0.5, "{}", p.vehicle_speed(id));
         p.remove_vehicle(id);
         assert!(p.vehicle_transform(id).is_none());
+    }
+
+    #[test]
+    fn tanks_turn_on_the_spot() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        p.step(DT);
+        let tank = VehicleSpec {
+            tracked: true,
+            mass: 30_000.0,
+            ..car()
+        };
+        let id = p.add_vehicle(&tank, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..120 {
+            p.step(DT);
+        }
+        for _ in 0..60 {
+            p.drive(
+                id,
+                VehicleControls {
+                    steer: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let t = p.vehicle_transform(id).unwrap();
+        let nose = t.transform_vector3(Vec3::Z);
+        let at = t.transform_point3(Vec3::ZERO);
+        assert!(nose.x > 0.4, "facing {nose}");
+        assert!(at.x.hypot(at.z) < 0.5, "moved to {at}");
+        let wheels = p.vehicle_wheels(id);
+        assert!(wheels.iter().all(|w| w.0 == 0.0), "{wheels:?}");
     }
 
     #[test]
