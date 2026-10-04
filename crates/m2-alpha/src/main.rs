@@ -1045,24 +1045,19 @@ fn fight_for_screenshot(
         );
         Some((lo + hi) / 2.0)
     });
-    if let Some(at) = body {
-        let here = game.focus();
-        if let Some(p) = game.scene.player.as_mut() {
-            let away = (here - at)
-                .with_y(0.0)
-                .try_normalize()
-                .unwrap_or(m2_math::glam::Vec3::X);
-            p.character.position = at + away * 5.0 + m2_math::glam::Vec3::Y * 2.0;
-            p.character.velocity = m2_math::glam::Vec3::ZERO;
-            p.landed = false;
-        }
-        for _ in 0..60 {
-            game.step(Intent::default(), tick);
-        }
-    }
-    // The picture: aiming, with soldiers firing back.
-    if let Some(at) = body {
-        aim_at(game, at);
+    // The picture: the body from close above, else aiming, with
+    // soldiers firing back.
+    if let (Some(at), Some(i)) = (body, soldier) {
+        let n = &game.scene.people.npcs[i];
+        eprintln!(
+            "fight: body drawn: landed {}, {:.1} m from her",
+            n.landed,
+            n.character.position.distance(game.focus())
+        );
+        game.on_foot = false;
+        game.camera = FlyCamera::looking_at(at + m2_math::glam::Vec3::new(1.5, 2.5, 1.5), at);
+        render(backend, game, fov, aspect, None)?;
+        return Ok(());
     } else if let Some(i) = soldier {
         let chest = game.scene.people.npcs[i].chest();
         aim_at(game, chest + m2_math::glam::Vec3::Y * 0.5);
@@ -1136,12 +1131,30 @@ fn blast_for_screenshot(
         near(game, 10.0),
         near(game, 30.0)
     );
+    // Somewhere 20 m off with a clear line to it, trying round from
+    // where she starts.
+    let toward = (here - at).with_y(0.0);
+    let start = toward.z.atan2(toward.x);
+    let stand = (0..16)
+        .map(|k| {
+            let a = start + k as f32 * std::f32::consts::TAU / 16.0;
+            at + m2_math::glam::Vec3::new(a.cos(), 0.0, a.sin()) * 20.0
+        })
+        .find(|&p| {
+            let Some(world) = &game.scene.world else {
+                return false;
+            };
+            let eye = p + m2_math::glam::Vec3::Y * 1.5;
+            let to = at - eye;
+            world
+                .physics
+                .cast_ray(eye, to, to.length())
+                .is_none_or(|h| h.0 > to.length() - 6.0)
+        });
+    eprintln!("blast: standing at {stand:.1?}");
     if let Some(p) = game.scene.player.as_mut() {
-        let away = (here - at)
-            .with_y(0.0)
-            .try_normalize()
-            .unwrap_or(m2_math::glam::Vec3::X);
-        p.character.position = at + away * 25.0 + m2_math::glam::Vec3::Y * 2.0;
+        let toward = toward.try_normalize().unwrap_or(m2_math::glam::Vec3::X);
+        p.character.position = stand.unwrap_or(at + toward * 20.0) + m2_math::glam::Vec3::Y * 2.0;
         p.character.velocity = m2_math::glam::Vec3::ZERO;
         p.landed = false;
     }
@@ -1149,6 +1162,14 @@ fn blast_for_screenshot(
         game.step(Intent::default(), tick);
     }
     aim_at(game, at);
+    if let (Some(world), Some(player)) = (&game.scene.world, &game.scene.player) {
+        let (eye, dir) = (player.eye(), player.camera_forward());
+        eprintln!(
+            "blast: eye {eye:.1}, {:.1} m to it, aim ray hits at {:?}",
+            eye.distance(at),
+            world.physics.cast_ray(eye, dir, 100.0).map(|h| h.0)
+        );
+    }
     let fire = Intent {
         trigger: Trigger {
             fire: true,
@@ -1164,8 +1185,9 @@ fn blast_for_screenshot(
     }
     let spent = game.scene.explosives.iter().filter(|e| e.gone).count();
     eprintln!(
-        "blast: {} blasts; {spent} of {} explosives spent; player hp {:.0}",
+        "blast: {} blasts, the last at {:.1?}; {spent} of {} explosives spent; player hp {:.0}",
         game.combat.blasts,
+        game.combat.last_blast,
         game.scene.explosives.len(),
         game.combat.hp
     );

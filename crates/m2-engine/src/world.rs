@@ -111,13 +111,8 @@ impl Templates {
 }
 
 impl Templates {
-    /// Reads the one template database asset, if the archive has it, and
-    /// the names (lower case) of the templates that house people
-    /// (`PopulationSimpleSpawner`: guard towers, barracks).
-    fn read<R: Read + Seek>(
-        source: &mut AssetSource<R>,
-        models: &HashSet<u32>,
-    ) -> (Self, HashSet<String>) {
+    /// Reads the one template database asset, if the archive has it.
+    fn read<R: Read + Seek>(source: &mut AssetSource<R>, models: &HashSet<u32>) -> Self {
         let index = source.archive().index();
         let Some(hash) = index
             .assets()
@@ -125,27 +120,14 @@ impl Templates {
             .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
             .map(|a| a.name_hash)
         else {
-            return Default::default();
+            return Self::default();
         };
         let Ok(data) = source.asset(hash, TEMPLATE_DB_TYPE) else {
-            return Default::default();
+            return Self::default();
         };
         let Ok(db) = Layer::parse(&data) else {
-            return Default::default();
+            return Self::default();
         };
-        let housing: HashSet<u32> = db
-            .component("PopulationSimpleSpawner")
-            .and_then(|c| c.records())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        let garrisons = db
-            .names()
-            .into_iter()
-            .filter(|(id, _)| housing.contains(id))
-            .map(|(_, name)| name.to_ascii_lowercase())
-            .collect();
         let model_of = db.hashes("ModelName");
         let mut kinds: HashMap<u32, VehicleKind> = HashMap::new();
         for (component, kind) in [
@@ -161,7 +143,7 @@ impl Templates {
                 kinds.insert(id, kind);
             }
         }
-        let templates = Self(
+        Self(
             db.names()
                 .into_iter()
                 .map(|(id, name)| {
@@ -174,8 +156,7 @@ impl Templates {
                     )
                 })
                 .collect(),
-        );
-        (templates, garrisons)
+        )
     }
 }
 
@@ -199,9 +180,6 @@ const NOT_TEMPLATES: [&str; 16] = [
     "AtmosphereBase",
     "LandingZone",
 ];
-
-/// How far from a building its garrison stands, metres (invented).
-const GARRISON_OFFSET: f32 = 8.0;
 
 /// A person a layer places: a soldier at a post or on a patrol route,
 /// from the `PopulationSimpleSpawner`, `Ai` and `AiPatrol` components.
@@ -285,8 +263,6 @@ struct Assets {
     any: HashSet<u32>,
     /// The template database.
     templates: Templates,
-    /// Templates that house people, lower case.
-    garrisons: HashSet<String>,
 }
 
 /// What [`WorldIndex::build`] gathers to find patrol routes: soldier to
@@ -332,9 +308,8 @@ impl WorldIndex {
                 .collect(),
             any: index.assets().iter().map(|a| a.name_hash).collect(),
             templates: Templates::default(),
-            garrisons: HashSet::new(),
         };
-        (assets.templates, assets.garrisons) = Templates::read(source, &assets.models);
+        assets.templates = Templates::read(source, &assets.models);
 
         let mut world = Self::default();
         let mut routes = Routes::default();
@@ -348,7 +323,7 @@ impl WorldIndex {
                     continue;
                 };
                 world.add_layer(&layer, e.name_hash, is_static, &assets);
-                world.add_people(&layer, &mut routes, &assets.garrisons);
+                world.add_people(&layer, &mut routes);
             }
         }
         world.template_db = assets.templates;
@@ -375,7 +350,7 @@ impl WorldIndex {
         Ok(world)
     }
 
-    fn add_people(&mut self, layer: &Layer<'_>, routes: &mut Routes, garrisons: &HashSet<String>) {
+    fn add_people(&mut self, layer: &Layer<'_>, routes: &mut Routes) {
         let placements = layer.placements();
         routes.placed.extend(
             placements
@@ -410,30 +385,6 @@ impl WorldIndex {
                     name: names.get(&id).copied().unwrap_or("").to_owned(),
                     position: Vec3::from(p.position),
                     rotation: rotation(p.rotation),
-                    route: Vec::new(),
-                });
-            }
-        }
-        // Buildings that house people (a guard tower, barracks): their
-        // garrison stands outside, in front and behind. Which people and
-        // how many is not decoded: two of the building's faction.
-        for (&id, name) in &names {
-            let stem = member_stem(name).to_ascii_lowercase();
-            let Some(p) = placements.get(&id).filter(|_| garrisons.contains(&stem)) else {
-                continue;
-            };
-            let (at, turn) = (Vec3::from(p.position), rotation(p.rotation));
-            let who = if stem.starts_with("vz") {
-                "VZ Soldier (garrison)".to_owned()
-            } else {
-                stem.clone()
-            };
-            for (k, side) in [1.0f32, -1.0].into_iter().enumerate() {
-                self.spawns.push(SpawnPoint {
-                    entity: id ^ ((k as u32 + 1) << 28),
-                    name: who.clone(),
-                    position: at + turn * (Vec3::Z * GARRISON_OFFSET * side),
-                    rotation: turn,
                     route: Vec::new(),
                 });
             }

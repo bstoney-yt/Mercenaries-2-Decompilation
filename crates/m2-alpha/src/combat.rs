@@ -345,6 +345,8 @@ pub struct Combat {
     /// People shot and blasts set off, for the screenshot check.
     pub hits: u32,
     pub blasts: u32,
+    /// Where the last one went off.
+    pub last_blast: Option<Vec3>,
     /// Blasts about to go off (something explosive caught): where, and
     /// seconds left.
     fuses: Vec<(Vec3, f32)>,
@@ -367,6 +369,7 @@ impl Default for Combat {
             remarks: Vec::new(),
             hits: 0,
             blasts: 0,
+            last_blast: None,
             fuses: Vec::new(),
             seed: 0x2545_f491_4f6c_dd1d,
         }
@@ -390,45 +393,51 @@ pub struct Explosive {
     pub object: usize,
     /// Its middle.
     pub at: Vec3,
+    /// About how far its sides are from its middle, metres.
+    pub size: f32,
     pub hp: f32,
     pub gone: bool,
 }
 
 /// Models that blow up when hit, by name (invented list, from what the
 /// bases hold).
-const EXPLOSIVE_MODELS: [&str; 6] = [
-    "vzoutpost_fueltanks",
-    "global_barrelb",
-    "global_barrelc",
-    "global_barreloil",
-    "global_barrel",
-    "global_barrela",
+/// Sizes are guesses from how they look.
+const EXPLOSIVE_MODELS: [(&str, f32); 6] = [
+    ("vzoutpost_fueltanks", 5.0),
+    ("global_barrelb", 0.5),
+    ("global_barrelc", 0.5),
+    ("global_barreloil", 0.5),
+    ("global_barrel", 0.5),
+    ("global_barrela", 0.5),
 ];
 /// How much rifle fire an explosive takes.
 const EXPLOSIVE_HP: f32 = 100.0;
-/// How near a blast sets one off, metres.
-const IGNITE: f32 = 5.0;
-/// How near a round has to land to hit one, metres.
-const EXPLOSIVE_SIZE: f32 = 2.5;
+/// How near its side a blast sets one off, metres.
+const IGNITE: f32 = 4.0;
+/// How far past its size a round can land and still hit it, metres.
+const HIT_SLACK: f32 = 0.5;
 /// How long one burns before it goes, seconds.
 const CHAIN_DELAY: f32 = 0.3;
 
 /// The island's explosives.
 pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
-    let models: Vec<u32> = EXPLOSIVE_MODELS
+    let models: Vec<(u32, f32)> = EXPLOSIVE_MODELS
         .iter()
-        .map(|n| m2_assets::name_hash(n))
+        .map(|&(n, size)| (m2_assets::name_hash(n), size))
         .collect();
     index
         .objects
         .iter()
         .enumerate()
-        .filter(|(_, o)| models.contains(&o.model))
-        .map(|(object, o)| Explosive {
-            object,
-            at: o.position + Vec3::Y * 1.2,
-            hp: EXPLOSIVE_HP,
-            gone: false,
+        .filter_map(|(object, o)| {
+            let &(_, size) = models.iter().find(|m| m.0 == o.model)?;
+            Some(Explosive {
+                object,
+                at: o.position + Vec3::Y * size.min(1.2),
+                size,
+                hp: EXPLOSIVE_HP,
+                gone: false,
+            })
         })
         .collect()
 }
@@ -578,7 +587,7 @@ impl Combat {
         if let Some((t, None)) = hit {
             let at = eye + dir * t;
             for e in f.explosives.iter_mut() {
-                if !e.gone && e.at.distance(at) < EXPLOSIVE_SIZE {
+                if !e.gone && e.at.distance(at) < e.size + HIT_SLACK {
                     e.hp -= RIFLE_DAMAGE;
                     if e.hp <= 0.0 {
                         e.gone = true;
@@ -775,6 +784,7 @@ impl Combat {
     /// near it wrecked and thrown.
     pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.blasts += 1;
+        self.last_blast = Some(at);
         self.sounds.push(Sound::Explosion(at));
         self.effect(Effect::Fire { at, size: 4.0 }, 0.6);
         for k in 0..6 {
@@ -806,7 +816,7 @@ impl Combat {
         }
         // Fuel tanks and barrels near it catch and go off in turn.
         for e in f.explosives.iter_mut() {
-            if !e.gone && e.at.distance(at) < IGNITE {
+            if !e.gone && e.at.distance(at) < e.size + IGNITE {
                 e.gone = true;
                 self.fuses.push((e.at, CHAIN_DELAY));
             }
@@ -1052,6 +1062,7 @@ mod tests {
         let tank = |object, x| Explosive {
             object,
             at: Vec3::new(x, 1.2, 40.0),
+            size: 0.5,
             hp: EXPLOSIVE_HP,
             gone: false,
         };
