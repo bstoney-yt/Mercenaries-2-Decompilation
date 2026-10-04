@@ -12,6 +12,9 @@ use crate::npc::FightClips;
 use crate::scene::{Carry, Rig};
 
 /// Movement speeds, m/s, inside the bands the game's clips move at.
+/// Seconds the mouse must be still before the chase camera swings back
+/// behind the vehicle.
+const CHASE_HOLD: f32 = 1.5;
 const WALK: f32 = 1.4;
 const RUN: f32 = 5.0;
 const SPRINT: f32 = 7.2;
@@ -100,6 +103,8 @@ pub struct Player {
     pub pitch: f32,
     /// Distance from the look point to the camera this frame.
     camera_distance: f32,
+    /// Seconds since the mouse last turned the camera.
+    look_still: f32,
     /// While driving: the point the chase camera looks at, and the
     /// vehicle's length.
     pub chase_target: Option<(Vec3, f32)>,
@@ -134,6 +139,7 @@ impl Player {
             pitch: -0.2,
             camera_distance: CAMERA_DISTANCE,
             chase_target: None,
+            look_still: 0.0,
             landed: false,
             streaming: false,
             settled: 0,
@@ -278,21 +284,29 @@ impl Player {
         };
     }
 
-    /// Chase camera for a vehicle at `transform` `length` metres long:
-    /// turns `look` and drifts behind the vehicle's heading when the mouse
-    /// is still.
-    pub fn chase(&mut self, transform: Mat4, length: f32, look: Vec2, dt: f32) {
+    /// Chase camera for a vehicle at `transform` `length` metres long,
+    /// rolling at `speed` m/s: turns `look`, and drifts back behind the
+    /// vehicle's heading only once it is moving and the mouse has been
+    /// still for a moment, so you can look around.
+    pub fn chase(&mut self, transform: Mat4, length: f32, look: Vec2, speed: f32, dt: f32) {
         self.chase_target = Some((transform.transform_point3(Vec3::Y * 2.0), length));
         self.yaw += look.x;
         self.pitch = (self.pitch + look.y).clamp(-1.2, 0.9);
-        if look == Vec2::ZERO {
+        self.look_still = if look == Vec2::ZERO {
+            self.look_still + dt
+        } else {
+            0.0
+        };
+        if self.look_still > CHASE_HOLD && speed.abs() > 2.0 {
             let f = transform.transform_vector3(Vec3::Z);
             let heading = f.x.atan2(f.z);
             let mut turn = (heading - self.yaw).rem_euclid(std::f32::consts::TAU);
             if turn > std::f32::consts::PI {
                 turn -= std::f32::consts::TAU;
             }
-            self.yaw += turn * (2.0 * dt).min(1.0);
+            // Eases in over a second after the hold.
+            let ease = ((self.look_still - CHASE_HOLD) / 1.0).min(1.0);
+            self.yaw += turn * (1.5 * ease * dt).min(1.0);
         }
         // She rides along, so streaming and sound follow the vehicle.
         self.character.position = transform.transform_point3(Vec3::ZERO);
