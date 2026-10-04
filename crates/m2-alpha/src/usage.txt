@@ -44,6 +44,8 @@ m2-alpha [options]
                          her right side, to see her hands
   --probe                with --screenshot: list what rays from where she
                          stands hit (unseen walls, steps in the ground)
+  --wreck                with --drive: wreck the vehicle at speed at the
+                         end and log how it comes to rest
   --fire                 with --aim, or --drive --look: fire just before the
                          picture
   --grip attach|hands    draw weapons on the hand's attach node as posed
