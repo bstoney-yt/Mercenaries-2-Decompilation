@@ -1,16 +1,19 @@
 //! The game's scripts as modules: which script `import("MrxUtil")` means.
 //!
 //! Scripts load each other by module name (`import`, `inherit`,
-//! `dynamic_import`), but the archives key scripts by a hash of their name
-//! that is not solved. Each script runs in its own environment and defines
-//! its module's functions there as globals, and other scripts call them as
-//! `MrxUtil.GetRandomTableElement`. So a module is the script that defines
-//! most of the members other scripts use on that name, among the scripts
-//! that don't themselves load it.
+//! `dynamic_import`), and the archives key scripts by [`name_hash`] of that
+//! name, so a module is the script with its name's hash. For a name no
+//! script has (a test module, or a name the hash somehow misses), each
+//! script runs in its own environment and defines its module's functions
+//! there as globals, and other scripts call them as
+//! `MrxUtil.GetRandomTableElement`; so the module is then the script that
+//! defines most of the members other scripts use on that name, among the
+//! scripts that don't themselves load it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use m2_assets::lua::{Chunk, NameUse};
+use m2_assets::name_hash;
 
 /// One compiled script and what it defines and loads.
 #[derive(Clone, Debug)]
@@ -35,15 +38,16 @@ pub struct Library {
     /// Lower-case module name to (script index, members it defines),
     /// worked out on first use.
     assigned: std::cell::OnceCell<BTreeMap<String, (usize, usize)>>,
-    /// Lower-case module name to the script it is known to be, where the
-    /// member match goes wrong.
+    /// Lower-case module name to the script it is known to be, whatever
+    /// its hash and the member match say.
     pinned: BTreeMap<String, u32>,
 }
 
-/// Modules the member match gets wrong, by the script they are, found by
-/// what each script inherits and defines.
+/// Modules the member match got wrong before the name hash was known, by
+/// the script they are, found then by what each script inherits and
+/// defines; now a check of the hash.
 ///
-/// The task classes are the trouble: subclasses call so many base-class
+/// The task classes were the trouble: subclasses call so many base-class
 /// members through `MrxTaskMission` and `MrxTaskObjective` that the match
 /// gave those names the base class and contracts.
 pub const KNOWN_MODULES: [(&str, u32); 16] = [
@@ -126,9 +130,11 @@ impl Library {
 
     /// The script that is module `name` (any case), with how many of the
     /// members used on it it defines, out of how many. `None` when no
-    /// script defines any of them (or nothing is used on it).
+    /// script has the name's hash and none defines any of them (or nothing
+    /// is used on it).
     ///
-    /// Every module is scored against every script that doesn't load it:
+    /// Without a script of the name's hash, every module is scored against
+    /// every script that doesn't load it:
     /// one point per member used on the module that the script defines,
     /// ten more when one of its strings starts with the module's name and
     /// a colon (scripts prefix their debug messages with their own name,
@@ -146,6 +152,9 @@ impl Library {
         if let Some(&(index, hits)) = assigned.get(&key) {
             let used = self.used.get(&key).map_or(0, BTreeSet::len);
             return Some((&self.scripts[index], hits, used));
+        }
+        if let Some(s) = self.by_hash(name_hash(&key)) {
+            return Some((s, 0, 0));
         }
         let taken: BTreeSet<usize> = assigned.values().map(|&(i, _)| i).collect();
         self.scripts
@@ -206,7 +215,19 @@ impl Library {
         });
         let mut out = BTreeMap::new();
         let mut taken = BTreeSet::new();
-        for (module, &hash) in &self.pinned {
+        let by_name: Vec<(String, u32)> = self
+            .module_names()
+            .into_iter()
+            .map(|m| (m.to_owned(), name_hash(m)))
+            .collect();
+        for (module, &hash) in self
+            .pinned
+            .iter()
+            .chain(by_name.iter().map(|(m, h)| (m, h)))
+        {
+            if out.contains_key(module) {
+                continue;
+            }
             if let Some(i) = self.scripts.iter().position(|s| s.hash == hash) {
                 let hits = self.used.get(module).map_or(0, |used| {
                     used.iter()
@@ -281,6 +302,31 @@ pub(crate) mod tests {
         assert_eq!(
             lib.module_names().into_iter().collect::<Vec<_>>(),
             ["task", "util"]
+        );
+    }
+
+    #[test]
+    fn known_modules_have_their_names_hash() {
+        for (name, hash) in KNOWN_MODULES {
+            assert_eq!(name_hash(name), hash, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_script_with_the_names_hash_is_the_module() {
+        let mut lib = library();
+        // The decoy defines only Activated, but it has the name's hash.
+        let bytes = &include_bytes!("../tests/data/decoy.luac")[..];
+        lib.add(name_hash("Task"), Chunk::parse(bytes).unwrap());
+        assert_eq!(
+            lib.resolve("task").map(|(s, h, _)| (s.hash, h)),
+            Some((name_hash("Task"), 1))
+        );
+        // A name nothing loads is found by hash too.
+        lib.add(name_hash("Lonely"), Chunk::parse(bytes).unwrap());
+        assert_eq!(
+            lib.resolve("Lonely").map(|(s, _, _)| s.hash),
+            Some(name_hash("Lonely"))
         );
     }
 

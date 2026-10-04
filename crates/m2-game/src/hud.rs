@@ -5,11 +5,13 @@
 //! The game draws these with its own (Flash) interface; scripts reach it
 //! through `Net.SendEvent_*` calls (sent to every player in co-op) and
 //! `Marker`. Here they fill a [`Hud`] the game draws its own way. Texts are
-//! ids such as `[VzaCon001.Objectives.001]` into a string table not found
-//! yet; [`readable`] makes something showable of them meanwhile.
+//! ids such as `[VzaCon001.Objectives.001]` into the language's string
+//! table; [`render`] puts the table's text in, and [`readable`] makes
+//! something showable of an id the table lacks.
 
 use std::collections::BTreeMap;
 
+use m2_assets::StringTable;
 use mlua::{Lua, MultiValue, Table, Value};
 
 use crate::api::Shared;
@@ -71,10 +73,20 @@ pub struct Hud {
 /// Marker handles start here.
 const FIRST_MARKER: u32 = 0x5000_0000;
 
-/// A text id made readable until the string table is decoded: icon tags
-/// dropped, `[VzaCon001.Objectives.003] (0/4)` as
-/// `VzaCon001 objective 3 (0/4)`.
+/// A text with its ids replaced by the table's strings
+/// (`[VzaCon001.Objectives.003] (0/4)` as `Secure the beach (0/4)`), and
+/// ids the table lacks made [`readable`].
+pub fn render(text: &str, table: &StringTable) -> String {
+    render_with(text, |id| table.lookup(id).map(str::to_owned))
+}
+
+/// A text id made readable without the string table: icon tags dropped,
+/// `[VzaCon001.Objectives.003] (0/4)` as `VzaCon001 objective 3 (0/4)`.
 pub fn readable(text: &str) -> String {
+    render_with(text, |_| None)
+}
+
+fn render_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find('[') {
@@ -87,6 +99,13 @@ pub fn readable(text: &str) -> String {
         };
         let id = &rest[open + 1..open + close];
         rest = &rest[open + close + 1..];
+        if let Some(found) = lookup(id) {
+            let found = found.trim();
+            if !found.is_empty() {
+                out.push(found.to_owned());
+            }
+            continue;
+        }
         let parts: Vec<&str> = id.split('.').collect();
         match parts.as_slice() {
             // An icon tag: `[objdeliver]`.
@@ -283,6 +302,30 @@ mod tests {
             "Objectivecompleted VzaCon001 objective 1"
         );
         assert_eq!(readable("plain"), "plain");
+    }
+
+    #[test]
+    fn the_tables_text_replaces_the_id() {
+        let mut table = StringTable::default();
+        for (id, text) in [
+            ("VzaCon001.Objectives.001", "Secure the beach"),
+            ("objective.Objectivecompleted", "Objective completed:"),
+        ] {
+            table
+                .strings
+                .insert(m2_assets::name_hash(id), text.to_owned());
+        }
+        assert_eq!(
+            render("[VzaCon001.Objectives.001] (0/4)", &table),
+            "Secure the beach (0/4)"
+        );
+        assert_eq!(
+            render(
+                "[objt][objdeliver] [objective.Objectivecompleted] [VzaCon001.Objectives.002]",
+                &table
+            ),
+            "Objective completed: VzaCon001 objective 2"
+        );
     }
 
     #[test]

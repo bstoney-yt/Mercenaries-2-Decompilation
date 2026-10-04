@@ -5,7 +5,9 @@
 //!
 //! The scripts' world is [`m2_game::mission`]'s: the layers' entities by
 //! name, with mission layers streamed in and out as the scripts ask.
-//! Soldiers of the island killed in play die in the scripts' world too.
+//! Objective texts are the game's own English strings (read from `vz.wad`
+//! by [`m2_game::mission::GameData`]). Soldiers of the island killed in
+//! play die in the scripts' world too.
 //! Ground vehicles of theirs near the player (dropped jeeps, a tank) are
 //! loaded and placed where they say, to be driven; which model a vehicle
 //! template is (`"M151 Softtop (VZ)"`) is guessed from the models' texture
@@ -23,7 +25,6 @@ use m2_assets::WadArchive;
 use m2_engine::vehicle::DRIVABLE;
 use m2_engine::{CatalogueEntry, Install, Physics};
 use m2_game::api::Command;
-use m2_game::hud::readable;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
@@ -236,7 +237,7 @@ impl MissionLink {
             }
             let w = mission.world().borrow();
             if let Some((done, text)) = w.hud.messages.last() {
-                self.message = Some((*done, readable(text), 0.0));
+                self.message = Some((*done, mission.text(text), 0.0));
             }
             drop(w);
             mission.world().borrow_mut().hud.messages.clear();
@@ -329,10 +330,10 @@ impl MissionLink {
             .objectives
             .iter()
             .filter(|(name, _)| !name.ends_with("_PreMission"))
-            .map(|(_, o)| readable(&o.text))
+            .map(|(_, o)| mission.text(&o.text))
             .collect();
         if objectives.is_empty() {
-            objectives = hud.mission.iter().map(|(t, _)| readable(t)).collect();
+            objectives = hud.mission.iter().map(|(t, _)| mission.text(t)).collect();
         }
         objectives.dedup();
         let markers = hud

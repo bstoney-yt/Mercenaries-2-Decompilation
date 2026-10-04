@@ -47,7 +47,8 @@
 //! instructions building the call and the start of any callback function
 //! named in it: how the engine function is used.
 //! `strings` lists every string table (block, count, whether its keys are
-//! sorted) and, for the strings that are exactly `text` (else contain it),
+//! sorted) and, for the text with id `text` (`VzaCon001.Objectives.001`)
+//! else the strings that are exactly `text` (else contain it),
 //! their key and the few strings stored either side, cut to 60
 //! characters: pairs of key and text to find the key hash with.
 //!
@@ -1049,8 +1050,9 @@ fn string_tables<R: Read + Seek>(
             );
             let Some(text) = text else { continue };
             order.sort_by_key(|e| e.1);
+            let id = m2_assets::name_hash(text);
             let exact: Vec<usize> = (0..order.len())
-                .filter(|&i| table.get(order[i].0) == Some(text))
+                .filter(|&i| order[i].0 == id || table.get(order[i].0) == Some(text))
                 .collect();
             let hits = if exact.is_empty() {
                 (0..order.len())
