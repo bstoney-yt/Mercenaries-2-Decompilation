@@ -95,6 +95,8 @@ struct Options {
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
     fight: bool,
+    /// With `--fight`: seconds to wait after it before the picture.
+    fight_wait: f32,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
@@ -167,6 +169,9 @@ fn parse_args() -> anyhow::Result<Options> {
                 let code =
                     std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
                 o.mission_drivers.push((path, code));
+            }
+            "--fight-wait" => {
+                o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
             "--mission-seconds" => {
                 o.mission_seconds = value()?
@@ -539,7 +544,7 @@ fn screenshot(
         )?);
     }
     if options.fight && game.on_foot && game.scene.player.is_some() {
-        fight_for_screenshot(&mut backend, &mut game, fov, aspect)?;
+        fight_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
     } else if options.drive && game.on_foot && game.scene.player.is_some() {
         drive_for_screenshot(&mut backend, &mut game, fov, aspect)?;
     } else if game.on_foot && game.scene.player.is_some() {
@@ -760,6 +765,7 @@ fn fight_for_screenshot(
     game: &mut Game,
     fov: f32,
     aspect: f32,
+    wait: f32,
 ) -> anyhow::Result<()> {
     use combat::{Trigger, Weapon};
     let tick = TICK.as_secs_f32();
@@ -915,6 +921,13 @@ fn fight_for_screenshot(
         people.iter().filter(|n| n.ragdoll.is_some()).count(),
         people.iter().filter(|n| n.alert).count(),
     );
+    // Smoke clears and bodies settle.
+    for i in 0..(wait / tick) as usize {
+        game.step(Intent::default(), tick);
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
     // The picture: aiming, with soldiers firing back.
     if let Some(i) = soldier {
         let chest = game.scene.people.npcs[i].chest();
