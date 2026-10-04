@@ -836,7 +836,7 @@ impl Scene {
             };
             if !player.down
                 && let Some(w) = weapon
-                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, self.arsenal.hand)
+                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, self.arsenal.hands)
             {
                 w.model.draw(queue, at);
             }
@@ -852,7 +852,7 @@ impl Scene {
             if n.soldier
                 && n.alive
                 && let Some(w) = &self.arsenal.rifle
-                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, n.hand)
+                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, n.hands)
             {
                 w.model.draw(queue, at);
             }

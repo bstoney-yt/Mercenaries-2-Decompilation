@@ -57,8 +57,12 @@ const WRECK: f32 = 6.0;
 pub struct WeaponModel {
     pub model: GpuModel,
     pub muzzle: Vec3,
-    /// Weapon to right-hand transform.
+    /// Weapon to right-hand transform held in both hands (aiming, or at
+    /// the ready).
     pub grip: Mat4,
+    /// The same, carried low in the right hand alone: muzzle forward and
+    /// down, as the game's player carries a rifle.
+    pub carry: Mat4,
 }
 
 /// The weapon models, once loaded.
@@ -68,21 +72,23 @@ pub struct Arsenal {
     pub rpg: Option<WeaponModel>,
     pub rocket: Option<WeaponModel>,
     pub grenade: Option<WeaponModel>,
-    /// The right hand's node in the human skeleton.
-    pub hand: Option<usize>,
+    /// The hands' nodes (right, left) in the human skeleton.
+    pub hands: Option<(usize, usize)>,
 }
 
 impl Arsenal {
     /// Adds weapon `name`, gripped in `rig`'s right hand.
     pub fn add(&mut self, name: &str, model: GpuModel, muzzle: Vec3, rig: Option<&Rig>) {
         let grip = rig.and_then(|r| grip(r, muzzle)).unwrap_or(Mat4::IDENTITY);
+        let carry = rig.and_then(|r| carry(r, muzzle)).unwrap_or(grip);
         if let Some(r) = rig {
-            self.hand = node(&r.skeleton, RIGHT_HAND);
+            self.hands = hands(&r.skeleton);
         }
         let w = Some(WeaponModel {
             model,
             muzzle,
             grip,
+            carry,
         });
         match name {
             "ak47" => self.rifle = w,
@@ -94,15 +100,24 @@ impl Arsenal {
     }
 
     /// Weapon to world for a character drawn at `body` with posed node
-    /// matrices `nodes` and its right hand at node `hand`.
+    /// matrices `nodes` and its hands at nodes `hands` (right, left): held
+    /// in both when they are close together, else carried in the right.
     pub fn in_hand(
         &self,
         weapon: &WeaponModel,
         body: Mat4,
         nodes: &[Mat4],
-        hand: Option<usize>,
+        hands: Option<(usize, usize)>,
     ) -> Option<Mat4> {
-        Some(body * *nodes.get(hand?)? * weapon.grip)
+        let (r, l) = hands?;
+        let (right, left) = (nodes.get(r)?, nodes.get(l)?);
+        let apart = right.w_axis.truncate().distance(left.w_axis.truncate());
+        let grip = if apart < TWO_HANDED {
+            weapon.grip
+        } else {
+            weapon.carry
+        };
+        Some(body * *right * grip)
     }
 }
 
@@ -112,10 +127,17 @@ pub fn upper_body(skeleton: &Skeleton) -> Option<std::sync::Arc<[bool]>> {
     skeleton.upper_body(node(skeleton, RIGHT_HAND)?, node(skeleton, LEFT_HAND)?)
 }
 
-/// The right-hand node of a human skeleton.
-pub fn right_hand(skeleton: &Skeleton) -> Option<usize> {
-    node(skeleton, RIGHT_HAND)
+/// The hand nodes of a human skeleton: (right, left).
+pub fn hands(skeleton: &Skeleton) -> Option<(usize, usize)> {
+    Some((node(skeleton, RIGHT_HAND)?, node(skeleton, LEFT_HAND)?))
 }
+
+/// Hands closer than this, metres, hold a weapon between them.
+const TWO_HANDED: f32 = 0.5;
+/// How far below level a weapon carried in one hand points, radians.
+const CARRY_DOWN: f32 = 0.6;
+/// And how far out to the side, radians.
+const CARRY_OUT: f32 = 0.17;
 
 fn node(skeleton: &Skeleton, hash: u32) -> Option<usize> {
     skeleton.name_hashes.iter().position(|&h| h == hash)
@@ -138,7 +160,38 @@ fn grip(rig: &Rig, muzzle: Vec3) -> Option<Mat4> {
     let pr = nodes[rh].transform_point3(Vec3::ZERO);
     let pl = nodes[lh].transform_point3(Vec3::ZERO);
     let pf = fingers.map_or(pr, |f| nodes[f].transform_point3(Vec3::ZERO));
-    let dir = (pl - pr).normalize_or_zero();
+    place(nodes[rh], pr.lerp(pf, 0.6), muzzle, pl - pr)
+}
+
+/// Where a weapon with its muzzle at `muzzle` sits in the right hand when
+/// carried in it alone, from the idle clip's pose: the barrel forward
+/// (a little out to the side) and [`CARRY_DOWN`] below level, upright
+/// about the barrel.
+fn carry(rig: &Rig, muzzle: Vec3) -> Option<Mat4> {
+    let skeleton = &rig.skeleton;
+    let idle = rig.gait_clip(m2_engine::Gait::Idle)?;
+    let clip = &rig.clips[idle];
+    let forward = rig.locomotion.as_ref()?.forward;
+    let pose = clip.sample(skeleton, clip.info.duration * 0.5);
+    let nodes = skeleton.model_matrices(&pose);
+    let rh = node(skeleton, RIGHT_HAND)?;
+    let fingers = skeleton.parents.iter().position(|&p| p == Some(rh));
+    let pr = nodes[rh].transform_point3(Vec3::ZERO);
+    let pf = fingers.map_or(pr, |f| nodes[f].transform_point3(Vec3::ZERO));
+    let ahead = Vec3::new(forward.x, 0.0, forward.y).normalize_or(Vec3::Z);
+    // Turned a little out to the hand's side, clear of the leg.
+    let side = Vec3::new(pr.x, 0.0, pr.z);
+    let out = (side - ahead * side.dot(ahead)).normalize_or_zero();
+    let ahead = (ahead * CARRY_OUT.cos() + out * CARRY_OUT.sin()).normalize();
+    let dir = ahead * CARRY_DOWN.cos() - Vec3::Y * CARRY_DOWN.sin();
+    place(nodes[rh], pr.lerp(pf, 0.6), muzzle, dir)
+}
+
+/// The weapon-to-hand transform putting a weapon's grip at `at` (model
+/// space) with its barrel (towards `muzzle`) along `dir`, upright about
+/// the barrel, for a hand posed at `hand`.
+fn place(hand: Mat4, at: Vec3, muzzle: Vec3, dir: Vec3) -> Option<Mat4> {
+    let dir = dir.normalize_or_zero();
     let barrel = muzzle.normalize_or_zero();
     if dir == Vec3::ZERO || barrel == Vec3::ZERO {
         return None;
@@ -147,8 +200,7 @@ fn grip(rig: &Rig, muzzle: Vec3) -> Option<Mat4> {
     let flat = |v: Vec3| (v - dir * v.dot(dir)).normalize_or_zero();
     let (have, want) = (flat(q * Vec3::Y), flat(Vec3::Y));
     q = Quat::from_axis_angle(dir, have.cross(want).dot(dir).atan2(have.dot(want))) * q;
-    let at = pr.lerp(pf, 0.6);
-    Some(nodes[rh].inverse() * Mat4::from_rotation_translation(q, at))
+    Some(hand.inverse() * Mat4::from_rotation_translation(q, at))
 }
 
 /// Which weapon she has up.
@@ -397,7 +449,7 @@ impl Combat {
         };
         let (nodes, _) = rig.posed();
         f.arsenal
-            .in_hand(w, f.player.model_matrix(), &nodes, f.arsenal.hand)
+            .in_hand(w, f.player.model_matrix(), &nodes, f.arsenal.hands)
             .map_or(chest, |m| m.transform_point3(w.muzzle))
     }
 
@@ -428,7 +480,7 @@ impl Combat {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
                 f.arsenal
-                    .in_hand(w, n.model_matrix(), &nodes, n.hand)
+                    .in_hand(w, n.model_matrix(), &nodes, n.hands)
                     .map_or(n.chest(), |m| m.transform_point3(w.muzzle))
             }
             _ => n.chest(),
