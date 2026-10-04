@@ -4,13 +4,13 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use anyhow::Context as _;
 use m2_engine::anim::load_clips;
 use m2_engine::vehicle::{DRIVABLE, catalogue};
 use m2_engine::{
-    Animator, AssetSource, BoundClip, CatalogueEntry, CpuModel, Gait, GpuModel, Install,
+    Animator, AssetSource, BoundClip, Catalogue, CatalogueEntry, CpuModel, Gait, GpuModel, Install,
     Locomotion, MaterialCache, PersonModel, Skeleton, VehicleId, VehicleSpec, World, WorldSettings,
 };
 use m2_math::glam::{Mat4, Quat, Vec3};
@@ -210,6 +210,11 @@ pub struct Scene {
     /// Mesh and materials for shots, flashes, fire and smoke.
     effects: Effects,
     vehicle_loads: Option<Receiver<Loaded>>,
+    /// The archive's vehicle, person and weapon models, once found.
+    pub catalogue: Option<Catalogue>,
+    install: Option<Install>,
+    /// Vehicles loaded on request ([`Scene::load_vehicle`]).
+    requests: (Sender<Loaded>, Receiver<Loaded>),
 }
 
 /// A vehicle to drive: what it is, its model, and its body once placed.
@@ -220,10 +225,13 @@ pub struct ParkedVehicle {
     pub id: Option<VehicleId>,
     /// Blown up: can't be driven.
     pub wrecked: bool,
+    /// The mission scripts' object it is, if theirs; placed where they
+    /// say rather than parked.
+    pub guid: Option<u32>,
 }
 
 /// Kinds that don't drive on wheels (or aren't vehicles to sit in).
-const NOT_DRIVABLE: [&str; 13] = [
+pub const NOT_DRIVABLE: [&str; 13] = [
     "boat",
     "plane",
     "airstrike",
@@ -250,6 +258,9 @@ const CIVILIAN_MODELS: usize = 6;
 /// A model the loading thread has decoded.
 pub enum Loaded {
     Vehicle(VehicleSpec, CpuModel),
+    /// A vehicle asked for by the mission scripts' object `guid`.
+    MissionVehicle(u32, VehicleSpec, CpuModel),
+    Catalogue(Catalogue),
     Person(PersonModel, CpuModel, Skeleton),
     /// A hand weapon: name, model, muzzle (model space).
     Weapon(&'static str, CpuModel, Vec3),
@@ -279,6 +290,9 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                     found
                 }
             };
+            if tx.send(Loaded::Catalogue(found.clone())).is_err() {
+                return Ok(());
+            }
             let people: Vec<&PersonModel> = found
                 .people
                 .iter()
@@ -410,6 +424,9 @@ impl Scene {
             arsenal: Arsenal::default(),
             effects,
             vehicle_loads: None,
+            catalogue: None,
+            install: None,
+            requests: channel(),
         })
     }
 
@@ -518,7 +535,36 @@ impl Scene {
         }
         self.player = Some(Player::new(x, z, 0.0, model));
         self.vehicle_loads = Some(load_cast(install.clone()));
+        self.install = Some(install.clone());
         Ok(())
+    }
+
+    /// Loads a vehicle for the mission scripts' object `guid` on a thread:
+    /// the first of `models` that makes a drivable vehicle. It joins
+    /// [`Scene::vehicles`] unplaced, with its guid.
+    pub fn load_vehicle(&self, guid: u32, models: Vec<CatalogueEntry>) {
+        let Some(install) = self.install.clone() else {
+            return;
+        };
+        let tx = self.requests.0.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut source = install.open_world()?;
+                for e in &models {
+                    let data = source.model(e.model)?;
+                    let model = data.parse()?;
+                    if let Some(spec) = VehicleSpec::from_model(e, &model) {
+                        let cpu = CpuModel::build(e.model, &model, 0);
+                        let _ = tx.send(Loaded::MissionVehicle(guid, spec, cpu));
+                        return Ok(());
+                    }
+                }
+                anyhow::bail!("no drivable model")
+            })();
+            if let Err(e) = result {
+                eprintln!("mission vehicle {guid:#x}: {e:#}");
+            }
+        });
     }
 
     /// Streams around `eye`.
@@ -526,68 +572,92 @@ impl Scene {
         if let Some(world) = &mut self.world {
             world.update(backend, &mut self.materials, eye)?;
         }
-        // At most one vehicle a frame: each uploads a model.
-        if let (Some(rx), Some(source)) = (&self.vehicle_loads, &mut self.source) {
+        // At most one model a frame from each: each uploads a model.
+        if let Some(rx) = &self.vehicle_loads {
             match rx.try_recv() {
-                Ok(loaded) => {
-                    let cpu = match &loaded {
-                        Loaded::Vehicle(_, cpu)
-                        | Loaded::Person(_, cpu, _)
-                        | Loaded::Weapon(_, cpu, _) => cpu,
-                    };
-                    self.materials.load_textures(
-                        backend,
-                        source,
-                        cpu.texture_hashes().collect::<Vec<_>>(),
-                    )?;
-                    let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
-                    match loaded {
-                        Loaded::Vehicle(spec, _) => self.vehicles.push(ParkedVehicle {
-                            spec,
+                Ok(loaded) => self.take(backend, loaded)?,
+                Err(TryRecvError::Disconnected) => self.vehicle_loads = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Ok(loaded) = self.requests.1.try_recv() {
+            self.take(backend, loaded)?;
+        }
+        Ok(())
+    }
+
+    /// Uploads a model the loading threads decoded and puts it to use.
+    fn take(&mut self, backend: &mut dyn RenderBackend, loaded: Loaded) -> anyhow::Result<()> {
+        let Some(source) = &mut self.source else {
+            return Ok(());
+        };
+        let cpu = match &loaded {
+            Loaded::Catalogue(c) => {
+                self.catalogue = Some(c.clone());
+                return Ok(());
+            }
+            Loaded::Vehicle(_, cpu)
+            | Loaded::MissionVehicle(_, _, cpu)
+            | Loaded::Person(_, cpu, _)
+            | Loaded::Weapon(_, cpu, _) => cpu,
+        };
+        self.materials
+            .load_textures(backend, source, cpu.texture_hashes().collect::<Vec<_>>())?;
+        let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
+        match loaded {
+            Loaded::Catalogue(_) => {}
+            Loaded::Vehicle(spec, _) => self.vehicles.push(ParkedVehicle {
+                spec,
+                model,
+                id: None,
+                wrecked: false,
+                guid: None,
+            }),
+            Loaded::MissionVehicle(guid, spec, _) => {
+                eprintln!("mission vehicle {guid:#x}: {}", spec.label);
+                self.vehicles.push(ParkedVehicle {
+                    spec,
+                    model,
+                    id: None,
+                    wrecked: false,
+                    guid: Some(guid),
+                });
+            }
+            Loaded::Weapon(name, _, muzzle) => {
+                let rig = self
+                    .player
+                    .as_ref()
+                    .and_then(|pl| pl.model.as_ref())
+                    .map(|(_, rig)| rig);
+                self.arsenal.add(name, model, muzzle, rig);
+            }
+            Loaded::Person(p, _, skeleton) => {
+                // Her clips fit every human skeleton.
+                let template = self
+                    .player
+                    .as_ref()
+                    .and_then(|pl| pl.model.as_ref())
+                    .and_then(|(_, rig)| rig.for_skeleton(skeleton));
+                match template {
+                    Some(rig) => {
+                        eprintln!(
+                            "person {}: {} bones, {} clips",
+                            p.role,
+                            rig.skeleton.len(),
+                            rig.clips.len()
+                        );
+                        self.people.add_kind(PersonKind {
+                            role: p.role,
+                            soldier: p.soldier,
                             model,
-                            id: None,
-                            wrecked: false,
-                        }),
-                        Loaded::Weapon(name, _, muzzle) => {
-                            let rig = self
-                                .player
-                                .as_ref()
-                                .and_then(|pl| pl.model.as_ref())
-                                .map(|(_, rig)| rig);
-                            self.arsenal.add(name, model, muzzle, rig);
-                        }
-                        Loaded::Person(p, _, skeleton) => {
-                            // Her clips fit every human skeleton.
-                            let template = self
-                                .player
-                                .as_ref()
-                                .and_then(|pl| pl.model.as_ref())
-                                .and_then(|(_, rig)| rig.for_skeleton(skeleton));
-                            match template {
-                                Some(rig) => {
-                                    eprintln!(
-                                        "person {}: {} bones, {} clips",
-                                        p.role,
-                                        rig.skeleton.len(),
-                                        rig.clips.len()
-                                    );
-                                    self.people.add_kind(PersonKind {
-                                        role: p.role,
-                                        soldier: p.soldier,
-                                        model,
-                                        rig,
-                                    });
-                                }
-                                None => eprintln!(
-                                    "person {}: the clips don't fit its skeleton; left out",
-                                    p.role
-                                ),
-                            }
-                        }
+                            rig,
+                        });
                     }
+                    None => eprintln!(
+                        "person {}: the clips don't fit its skeleton; left out",
+                        p.role
+                    ),
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.vehicle_loads = None,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
         Ok(())

@@ -395,6 +395,23 @@ impl Mission {
         }
     }
 
+    /// Puts the player in a vehicle (or out of one, with `None`): seat
+    /// events fire on the next tick.
+    pub fn ride(&mut self, vehicle: Option<u32>) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&PLAYER) {
+            o.vehicle = vehicle;
+        }
+    }
+
+    /// Reports where an object is in play (a vehicle that was driven or
+    /// pushed about).
+    pub fn place(&mut self, guid: u32, at: [f32; 3], yaw: f32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            o.position = at;
+            o.yaw = yaw;
+        }
+    }
+
     /// Reports that an object died in play (a soldier the player shot).
     pub fn kill(&mut self, guid: u32) {
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
@@ -585,6 +602,19 @@ mod tests {
         assert_eq!(landing_zone("03_mar_airport_llz_playerone"), Some((3, 1)));
         assert_eq!(landing_zone("lz_helipad_playerone"), None);
         assert_eq!(landing_zone("06_gua_upperclass_playerone"), None);
+    }
+
+    #[test]
+    fn play_reports_rides_and_places() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.ride(Some(77));
+        m.place(PLAYER, [1.0, 2.0, 3.0], 0.5);
+        let w = m.world().borrow();
+        let p = &w.objects[&PLAYER];
+        assert_eq!(
+            (p.vehicle, p.position, p.yaw),
+            (Some(77), [1.0, 2.0, 3.0], 0.5)
+        );
     }
 
     #[test]

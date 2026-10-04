@@ -4,27 +4,32 @@
 //! handed to the HUD.
 //!
 //! The scripts' world is [`m2_game::mission`]'s: the layers' entities by
-//! name, with mission layers streamed in and out as the scripts ask. The
-//! island the player sees doesn't show those layers' people and vehicles
-//! yet, so objectives about them (guards to kill, dropped vehicles) can't
-//! be done in play; places to reach can. Soldiers of the island killed in
-//! play die in the scripts' world too.
+//! name, with mission layers streamed in and out as the scripts ask.
+//! Soldiers of the island killed in play die in the scripts' world too.
+//! Ground vehicles of theirs near the player (dropped jeeps, a tank) are
+//! loaded and placed where they say, to be driven; which model a vehicle
+//! template is (`"M151 Softtop (VZ)"`) is guessed from the models' texture
+//! names (`vz_veh_truck_m151`). Their helicopters, boats and supply drops
+//! are not shown yet.
 //!
 //! The scripts' log goes to `m2-alpha-mission.log` beside the settings.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use m2_assets::WadArchive;
-use m2_engine::Install;
+use m2_engine::vehicle::DRIVABLE;
+use m2_engine::{CatalogueEntry, Install, Physics};
 use m2_game::api::Command;
 use m2_game::hud::readable;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
 use crate::config::Config;
-use crate::game::Game;
+use crate::game::{Game, get_out};
+use crate::scene::{NOT_DRIVABLE, ParkedVehicle};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
@@ -35,6 +40,12 @@ const WATERLINE: f32 = -36.0;
 const BLAST_REACH: f32 = 10.0;
 /// Seconds an objective message stays up.
 const MESSAGE_TIME: f32 = 6.0;
+/// The scripts' vehicles are loaded within this far of the player, metres,
+/// and at most this many.
+const VEHICLE_REACH: f32 = 300.0;
+const MAX_VEHICLES: usize = 16;
+/// Steps between looks for the scripts' vehicles near the player.
+const VEHICLE_LOOK: u32 = 10;
 
 /// What the HUD shows for the mission.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -62,12 +73,28 @@ pub struct MissionLink {
     lag: f32,
     log: Option<BufWriter<File>>,
     message: Option<(bool, String, f32)>,
+    drivers: Vec<(String, String)>,
     /// The scripts put the player somewhere the island has no way to hold
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
     /// Blasts since the scripts last ran.
     blasts: Vec<Vec3>,
+    vehicles: Fleet,
+}
+
+/// The scripts' vehicles in play.
+#[derive(Default)]
+struct Fleet {
+    /// Those asked for (loaded or loading).
+    requested: HashSet<u32>,
+    /// The one the player is in, as last told the scripts.
+    riding: Option<u32>,
+    /// Steps to the next look for vehicles near her.
+    look: u32,
+    /// The one she was driving when the scripts moved it: she gets back in
+    /// once it is placed again.
+    reenter: Option<u32>,
 }
 
 impl std::fmt::Debug for MissionLink {
@@ -85,8 +112,10 @@ impl std::fmt::Debug for MissionLink {
 
 impl MissionLink {
     /// Starts reading the scripts and layers from `install` in the
-    /// background; play goes on meanwhile.
-    pub fn start(install: &Install) -> Self {
+    /// background; play goes on meanwhile. `drivers` (a name for errors,
+    /// and Lua) run before play starts, as the `mission` example's
+    /// `--driver` files do: for testing.
+    pub fn start(install: &Install, drivers: Vec<(String, String)>) -> Self {
         let wad = install.data.join("vz.wad");
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -113,8 +142,10 @@ impl MissionLink {
             lag: 0.0,
             log,
             message: None,
+            drivers,
             ashore: 0,
             blasts: Vec::new(),
+            vehicles: Fleet::default(),
         }
     }
 
@@ -157,9 +188,17 @@ impl MissionLink {
         let mut lines = Vec::new();
         while self.lag >= STEP {
             self.lag -= STEP;
-            if let Some(p) = game.scene.player.as_ref() {
-                mission.put_player(p.character.position.to_array());
+            // Driving, she is where her vehicle is.
+            let at = game
+                .driving()
+                .map(|(at, _)| at)
+                .or_else(|| game.scene.player.as_ref().map(|p| p.character.position));
+            if let Some(at) = at
+                && self.vehicles.reenter.is_none()
+            {
+                mission.put_player(at.to_array());
             }
+            self.vehicles.sync(game, mission);
             for guid in game.scene.people.all_killed() {
                 mission.kill(guid);
             }
@@ -188,7 +227,7 @@ impl MissionLink {
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
-                if obey(game, mission, &c) {
+                if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
                 }
             }
@@ -210,10 +249,15 @@ impl MissionLink {
             .map_or([0.0; 3], |p| p.character.position.to_array());
         match Mission::new(data, "Mattias", at) {
             Ok(mut mission) => {
+                for (name, code) in std::mem::take(&mut self.drivers) {
+                    if let Err(e) = mission.run(&code, &name) {
+                        self.write([format!("{name}: {e}")]);
+                    }
+                }
                 mission.start();
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
-                    if obey(game, &mission, &c) {
+                    if obey(game, &mission, &mut self.vehicles, &c) {
                         self.ashore = ASHORE_TRIES;
                     }
                 }
@@ -233,6 +277,24 @@ impl MissionLink {
     /// The scripts are running (not still loading, not failed).
     pub fn running(&self) -> bool {
         matches!(self.state, State::Running(_))
+    }
+
+    /// The scripts' vehicles in play: label, and where it stands if
+    /// placed.
+    pub fn vehicles(game: &Game) -> Vec<(String, Option<Vec3>)> {
+        let physics = game.scene.world.as_ref().map(|w| &w.physics);
+        game.scene
+            .vehicles
+            .iter()
+            .filter(|v| v.guid.is_some())
+            .map(|v| {
+                let at =
+                    v.id.zip(physics)
+                        .and_then(|(id, p)| p.vehicle_transform(id))
+                        .map(|m| m.transform_point3(Vec3::ZERO));
+                (v.spec.label.clone(), at)
+            })
+            .collect()
     }
 
     /// What the HUD shows.
@@ -291,6 +353,90 @@ impl MissionLink {
     }
 }
 
+impl Fleet {
+    /// Keeps the scripts' vehicles and the island's in step: loads those
+    /// near the player, places them where the scripts say, tells the
+    /// scripts where they went, which one she is in, and which are wrecked.
+    fn sync(&mut self, game: &mut Game, mission: &mut Mission) {
+        let Some(world) = &mut game.scene.world else {
+            return;
+        };
+        let physics = &mut world.physics;
+        let riding = game
+            .scene
+            .player
+            .as_ref()
+            .and_then(|p| p.driving)
+            .and_then(|i| game.scene.vehicles.get(i)?.guid);
+        if riding != self.riding && self.reenter.is_none() {
+            mission.ride(riding);
+            self.riding = riding;
+        }
+        {
+            let w = mission.world().borrow();
+            for (i, v) in game.scene.vehicles.iter_mut().enumerate() {
+                let Some(g) = v.guid else { continue };
+                // Placed once the scripts have let go of it (a winch) and
+                // the ground under it has loaded.
+                if v.id.is_none()
+                    && let Some(o) = w.objects.get(&g).filter(|o| o.alive)
+                    && !w.winch.get(&g).is_some_and(Option::is_some)
+                    && place(physics, v, Vec3::from(o.position), o.yaw)
+                    && self.reenter == Some(g)
+                    && let Some(p) = game.scene.player.as_mut()
+                {
+                    p.driving = Some(i);
+                    self.reenter = None;
+                }
+            }
+        }
+        for v in &game.scene.vehicles {
+            let (Some(g), Some(id)) = (v.guid, v.id) else {
+                continue;
+            };
+            if v.wrecked {
+                mission.kill(g);
+            }
+            if let Some(m) = physics.vehicle_transform(id) {
+                let f = m.transform_vector3(Vec3::Z);
+                mission.place(g, m.transform_point3(Vec3::ZERO).to_array(), f.x.atan2(f.z));
+            }
+        }
+        if self.look > 0 {
+            self.look -= 1;
+            return;
+        }
+        self.look = VEHICLE_LOOK;
+        let (Some(catalogue), Some(player)) = (&game.scene.catalogue, &game.scene.player) else {
+            return;
+        };
+        let near = player.character.position;
+        let w = mission.world().borrow();
+        let mut wanted: Vec<(f32, u32, Vec<CatalogueEntry>)> = w
+            .objects
+            .iter()
+            .filter(|(g, o)| o.alive && !self.requested.contains(g))
+            .filter_map(|(&g, o)| {
+                let d = Vec3::from(o.position).distance(near);
+                (d <= VEHICLE_REACH).then_some((d, g, o))
+            })
+            .filter_map(|(d, g, o)| {
+                let models = vehicle_models(&o.name, &catalogue.vehicles);
+                (!models.is_empty()).then_some((d, g, models))
+            })
+            .collect();
+        drop(w);
+        wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, g, models) in wanted {
+            if self.requested.len() >= MAX_VEHICLES {
+                break;
+            }
+            self.requested.insert(g);
+            game.scene.load_vehicle(g, models);
+        }
+    }
+}
+
 /// Ticks the player gets to go ashore: about ten seconds for the ground
 /// around her to load.
 const ASHORE_TRIES: u32 = 600;
@@ -332,10 +478,58 @@ fn go_ashore(game: &mut Game) -> bool {
     false
 }
 
-/// Carries out a script command that is about the player; true when it
-/// seated her in a vehicle the island doesn't show, so she stands where
-/// it is.
-fn obey(game: &mut Game, mission: &Mission, c: &Command) -> bool {
+/// Carries out a script command about the player or the scripts'
+/// vehicles; true when it seated her in a vehicle the island doesn't show,
+/// so she stands where it is.
+fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
+    let index = |guid: &u32| {
+        game.scene
+            .vehicles
+            .iter()
+            .position(|v| v.guid == Some(*guid))
+    };
+    match c {
+        // Seated in one of the scripts' vehicles that is placed: drive it.
+        Command::EnterVehicle { guid, vehicle, .. } if *guid == PLAYER => {
+            if let Some(i) = index(vehicle).filter(|&i| game.scene.vehicles[i].id.is_some())
+                && let Some(p) = game.scene.player.as_mut()
+            {
+                p.driving = Some(i);
+                return false;
+            }
+        }
+        Command::ExitVehicle(guid) if *guid == PLAYER => {
+            fleet.reenter = None;
+            let (Some(world), Some(p)) = (&game.scene.world, game.scene.player.as_mut()) else {
+                return false;
+            };
+            if let Some(v) = p.driving.and_then(|i| game.scene.vehicles.get(i)) {
+                get_out(&world.physics, v, p);
+            }
+            return false;
+        }
+        // Moved by the scripts: placed afresh where they now say, with
+        // her back in it if she was driving it.
+        Command::Move { guid, .. } | Command::Remove(guid) if *guid != PLAYER => {
+            if let (Some(i), Some(world)) = (index(guid), &mut game.scene.world)
+                && let Some(id) = game.scene.vehicles[i].id.take()
+            {
+                world.physics.remove_vehicle(id);
+                let driving = game.scene.player.as_ref().and_then(|p| p.driving);
+                if matches!(c, Command::Move { .. }) && driving == Some(i) {
+                    fleet.reenter = Some(*guid);
+                }
+            }
+            return false;
+        }
+        Command::Kill(guid) => {
+            if let Some(i) = index(guid) {
+                game.scene.vehicles[i].wrecked = true;
+            }
+            return false;
+        }
+        _ => {}
+    }
     let to = match c {
         Command::Move { guid, position } if *guid == PLAYER => Some(*position),
         // Seated in a vehicle the island doesn't show (the start's boat):
@@ -357,4 +551,112 @@ fn obey(game: &mut Game, mission: &Mission, c: &Command) -> bool {
         p.chase_target = None;
     }
     matches!(c, Command::EnterVehicle { .. })
+}
+
+/// Catalogue models that could be a vehicle template of the scripts', best
+/// first: those whose model name (the texture name's last part,
+/// `m151` of `vz_veh_truck_m151`) is a word of the template's name (or
+/// starts like it, `alouette` of `Alouette3`), its faction's first. Only
+/// ground vehicles to drive. `name` is an object's (`"M151 Softtop (VZ)
+/// 0x0012abcd"`) or a template's.
+fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<CatalogueEntry> {
+    let template = name
+        .rfind(" 0x")
+        .map_or(name, |i| &name[..i])
+        .to_ascii_lowercase();
+    let faction = [
+        ("(vz)", "vz_"),
+        ("(gl)", "gr_"),
+        ("(gr)", "gr_"),
+        ("(ch)", "ch_"),
+        ("(al)", "al_"),
+        ("(pmc)", "pmc_"),
+        ("(civ)", "civ_"),
+    ]
+    .iter()
+    .find(|(tag, _)| template.contains(tag))
+    .map_or("vz_", |(_, prefix)| prefix);
+    // The name without its (tags).
+    let mut plain = String::new();
+    let mut depth = 0;
+    for c in template.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if depth == 0 => plain.push(c),
+            _ => {}
+        }
+    }
+    let words: Vec<&str> = plain
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .collect();
+    let fits = |part: &str| {
+        words.iter().any(|w| {
+            let stem = w.trim_end_matches(|c: char| c.is_ascii_digit());
+            part == *w || (stem.len() >= 4 && stem.len() < w.len() && part.starts_with(stem))
+        })
+    };
+    let mut out: Vec<CatalogueEntry> = catalogue
+        .iter()
+        .filter(|e| {
+            DRIVABLE.contains(&e.kind.as_str())
+                || (e.label.starts_with("global_") && !NOT_DRIVABLE.contains(&e.kind.as_str()))
+        })
+        .filter(|e| e.label.rsplit('_').next().is_some_and(fits))
+        .cloned()
+        .collect();
+    out.sort_by_key(|e| !e.label.starts_with(faction));
+    out
+}
+
+/// Puts one of the scripts' vehicles on the ground at `at`; false while
+/// the ground there hasn't loaded.
+fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw: f32) -> bool {
+    let top = at + Vec3::Y * 30.0;
+    let Some((d, _)) = physics.cast_ray(top, Vec3::NEG_Y, 80.0) else {
+        return false;
+    };
+    let ground = top.y - d;
+    let at = Vec3::new(at.x, ground + v.spec.ride_height() + 0.3, at.z);
+    v.id = Some(physics.add_vehicle(&v.spec, at, yaw));
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(model: u32, kind: &str, label: &str) -> CatalogueEntry {
+        CatalogueEntry {
+            model,
+            kind: kind.into(),
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn templates_find_their_vehicles() {
+        let catalogue = [
+            entry(1, "truck", "gr_veh_truck_m151"),
+            entry(2, "truck", "vz_veh_truck_m151"),
+            entry(3, "tank", "vz_veh_tank_amx30"),
+            entry(4, "helicopter", "vz_veh_helicopter_alouetteiii"),
+            entry(5, "transport", "global_veh_transport"),
+            entry(6, "car", "civ_veh_car_van"),
+        ];
+        let models = |n: &str| -> Vec<u32> {
+            vehicle_models(n, &catalogue)
+                .iter()
+                .map(|e| e.model)
+                .collect()
+        };
+        assert_eq!(models("M151 Softtop (VZ) 0x0012abcd"), [2, 1]);
+        assert_eq!(models("M151 Softtop (GL)"), [1, 2]);
+        assert_eq!(models("AMX30"), [3]);
+        // Not ground vehicles to drive.
+        assert!(models("Alouette3 Transport (VZA Intro) (Driver)").is_empty());
+        assert!(models("VZ Soldier 0x00000001").is_empty());
+        assert!(models("Supply Drop (GL)").is_empty());
+    }
 }
