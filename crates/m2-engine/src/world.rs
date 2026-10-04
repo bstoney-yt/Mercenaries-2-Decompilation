@@ -87,14 +87,24 @@ pub enum VehicleKind {
 
 /// What the template database says of one template.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TemplateInfo {
-    model: Option<u32>,
-    vehicle: Option<VehicleKind>,
+pub struct TemplateInfo {
+    /// Its `ModelName`, when that is a model the archive holds.
+    pub model: Option<u32>,
+    /// Its physics component's kind, when it has one.
+    pub vehicle: Option<VehicleKind>,
 }
 
-/// The template database by template name.
-#[derive(Default)]
-struct Templates(HashMap<String, TemplateInfo>);
+/// The template database by template name, lower case.
+#[derive(Clone, Debug, Default)]
+pub struct Templates(pub HashMap<String, TemplateInfo>);
+
+impl Templates {
+    /// The template an entity or template name (`M151 Softtop (VZ)
+    /// 0x0012abcd`, `AMX30`) names, whatever its case.
+    pub fn get(&self, name: &str) -> Option<&TemplateInfo> {
+        self.0.get(&member_stem(name).to_ascii_lowercase())
+    }
+}
 
 impl Templates {
     /// Reads the one template database asset, if the archive has it.
@@ -134,7 +144,7 @@ impl Templates {
                 .into_iter()
                 .map(|(id, name)| {
                     (
-                        name.to_owned(),
+                        name.to_ascii_lowercase(),
                         TemplateInfo {
                             model: model_of.get(&id).copied().filter(|m| models.contains(m)),
                             vehicle: kinds.get(&id).copied(),
@@ -201,6 +211,9 @@ pub struct WorldIndex {
     /// Entities of the static layers placed by a template name that is a
     /// vehicle, or that the template database doesn't define.
     pub templates: Vec<TemplatePlacement>,
+    /// The template database, for names the scripts and mission layers
+    /// use.
+    pub template_db: Templates,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -215,10 +228,27 @@ pub struct Member {
 }
 
 /// An entity name without its leading `_` and its trailing ` 26` or
-/// ` 0x001384eb`: the name of the model it is.
+/// ` 0x001384eb`: the name of the model or template it is. A name with
+/// no such id (`AMX30 (Full)`) is kept whole.
 pub fn member_stem(name: &str) -> &str {
     let name = name.trim_start_matches('_');
-    name.rsplit_once(' ').map_or(name, |(stem, _)| stem)
+    match name.rsplit_once(' ') {
+        Some((stem, id)) if is_id(id) => stem,
+        _ => name,
+    }
+}
+
+/// `26` or `0x001384eb`.
+fn is_id(token: &str) -> bool {
+    let digits = |t: &str, radix| !t.is_empty() && t.chars().all(|c| c.is_digit(radix));
+    token
+        .strip_prefix("0x")
+        .map_or(digits(token, 10), |hex| digits(hex, 16))
+}
+
+/// A designer's test entity (`68valiant test`, `RIB36 Test`).
+fn is_test(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(" test")
 }
 
 /// Which names the archive holds, for placing entities by name.
@@ -292,6 +322,7 @@ impl WorldIndex {
                 world.add_people(&layer, &mut routes);
             }
         }
+        world.template_db = assets.templates;
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
         for spawn in &mut world.spawns {
             let Some(&target) = routes.patrol_of.get(&spawn.entity) else {
@@ -406,7 +437,7 @@ impl WorldIndex {
                 if models.contains_key(&entity) || not_templates.contains(&entity) {
                     continue;
                 }
-                let template = assets.templates.0.get(stem);
+                let template = assets.templates.get(stem);
                 match (stem_hash, template) {
                     // Its name is a model.
                     (Some(h), _) if assets.models.contains(&h) => {
@@ -446,8 +477,9 @@ impl WorldIndex {
                         rotation,
                         named: true,
                     }),
-                    // A name no asset or template defines: the words may.
-                    (Some(h), None) if !assets.any.contains(&h) => {
+                    // A name no asset or template defines: the words may
+                    // (not the designers' test entities).
+                    (Some(h), None) if !assets.any.contains(&h) && !is_test(stem) => {
                         self.templates.push(TemplatePlacement {
                             entity,
                             name: stem.to_owned(),
@@ -752,6 +784,11 @@ mod tests {
         );
         assert_eq!(member_stem("plain"), "plain");
         assert_eq!(member_stem("_"), "");
+        assert_eq!(member_stem("AMX30 (Full)"), "AMX30 (Full)");
+        assert_eq!(
+            member_stem("M151 Softtop (VZ) 0x0012abcd"),
+            "M151 Softtop (VZ)"
+        );
     }
 
     #[test]
