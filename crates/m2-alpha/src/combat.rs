@@ -352,6 +352,9 @@ pub struct Combat {
     /// Blasts about to go off (something explosive caught): where, and
     /// seconds left.
     fuses: Vec<(Vec3, f32)>,
+    /// Spent explosives burning: where, how big, seconds left, seconds to
+    /// the next flame.
+    fires: Vec<(Vec3, f32, f32, f32)>,
     seed: u64,
 }
 
@@ -374,6 +377,7 @@ impl Default for Combat {
             last_blast: None,
             last_launch: None,
             fuses: Vec::new(),
+            fires: Vec::new(),
             seed: 0x2545_f491_4f6c_dd1d,
         }
     }
@@ -421,6 +425,9 @@ const IGNITE: f32 = 4.0;
 const HIT_SLACK: f32 = 0.5;
 /// How long one burns before it goes, seconds.
 const CHAIN_DELAY: f32 = 0.3;
+/// How long what is left of one burns, seconds (wrecks burn 20 s and
+/// more in the Xbox 360 game).
+const BURN: f32 = 25.0;
 
 /// The island's explosives.
 pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
@@ -595,6 +602,7 @@ impl Combat {
                     if e.hp <= 0.0 {
                         e.gone = true;
                         self.fuses.push((e.at, CHAIN_DELAY));
+                        self.fires.push((e.at, e.size, BURN, 0.0));
                     }
                 }
             }
@@ -823,6 +831,7 @@ impl Combat {
             if !e.gone && e.at.distance(at) < e.size + IGNITE {
                 e.gone = true;
                 self.fuses.push((e.at, CHAIN_DELAY));
+                self.fires.push((e.at, e.size, BURN, 0.0));
             }
         }
         if f.player.driving.is_none() && f.player.landed {
@@ -875,6 +884,33 @@ impl Combat {
         }
         for at in puffs {
             self.effect(Effect::Smoke { at, size: 1.5 }, 3.0);
+        }
+        let mut flames = Vec::new();
+        self.fires.retain_mut(|(at, size, left, next)| {
+            *left -= dt;
+            *next -= dt;
+            if *next <= 0.0 {
+                *next = 0.3;
+                flames.push((*at, *size));
+            }
+            *left > 0.0
+        });
+        for (at, size) in flames {
+            let low = at.with_y(at.y - size.min(1.2) + 0.5);
+            self.effect(
+                Effect::Fire {
+                    at: low,
+                    size: (size * 0.5).clamp(0.8, 2.5),
+                },
+                0.5,
+            );
+            self.effect(
+                Effect::Smoke {
+                    at: low + Vec3::Y * 2.0,
+                    size: (size * 0.6).clamp(1.0, 3.0),
+                },
+                3.0,
+            );
         }
     }
 }
@@ -1086,6 +1122,7 @@ mod tests {
             combat.step(&mut field, Trigger::default(), dt);
         }
         assert!(field.explosives[1].gone, "the first tank sets off the next");
+        assert_eq!(combat.fires.len(), 2, "what is left of both burns");
         assert!(!field.explosives[2].gone);
     }
 
