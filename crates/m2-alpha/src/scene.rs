@@ -9,6 +9,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use anyhow::Context as _;
 use m2_engine::anim::load_clips;
+use m2_engine::model::MODEL_TEXTURE_WIDTH;
 use m2_engine::vehicle::{DRIVABLE, catalogue};
 use m2_engine::{
     Animator, AssetSource, BoundClip, Catalogue, CatalogueEntry, CpuModel, Frustum, Gait, GpuModel,
@@ -518,7 +519,8 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
             );
             for p in people {
                 let data = source.model(p.model)?;
-                let cpu = CpuModel::from_data(&data, 0)?;
+                let mut cpu = CpuModel::from_data(&data, 0)?;
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                 let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
                 if tx.send(Loaded::Person(p.clone(), cpu, skeleton)).is_err() {
                     return Ok(());
@@ -529,7 +531,8 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                 let model = data.parse()?;
                 let muzzle = m2_assets::vehicle::marker(&model, combat::MUZZLE)
                     .map_or(Vec3::new(0.0, 0.0, model.info.bounds.max[2]), Vec3::from);
-                let cpu = CpuModel::build(hash, &model, 0);
+                let mut cpu = CpuModel::build(hash, &model, 0);
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                 if tx.send(Loaded::Weapon(name, cpu, muzzle)).is_err() {
                     return Ok(());
                 }
@@ -593,7 +596,8 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                     e.kind,
                     spec.wheels.len()
                 );
-                let cpu = CpuModel::build(e.model, &model, 0);
+                let mut cpu = CpuModel::build(e.model, &model, 0);
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                 if tx.send(Loaded::Vehicle(spec, cpu)).is_err() {
                     return Ok(());
                 }
@@ -810,7 +814,8 @@ impl Scene {
                     let data = source.model(e.model)?;
                     let model = data.parse()?;
                     if let Some(spec) = VehicleSpec::from_model(e, &model) {
-                        let cpu = CpuModel::build(e.model, &model, 0);
+                        let mut cpu = CpuModel::build(e.model, &model, 0);
+                        cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                         let _ = tx.send(make(spec, cpu));
                         return Ok(());
                     }
@@ -871,8 +876,7 @@ impl Scene {
             | Loaded::Person(_, cpu, _)
             | Loaded::Weapon(_, cpu, _) => cpu,
         };
-        self.materials
-            .load_textures(backend, source, cpu.texture_requests())?;
+        self.materials.load_model_textures(backend, source, cpu)?;
         let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
         match loaded {
             Loaded::Catalogue(_) => {}

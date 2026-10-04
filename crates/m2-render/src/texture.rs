@@ -114,6 +114,17 @@ pub enum BlendMode {
     /// Alpha blended over the scene, depth-tested but not depth-written.
     /// Draw these back to front (the [`DrawQueue`](crate::DrawQueue) does).
     Translucent,
+    /// Added to the scene, scaled by alpha (lights, glows, trails);
+    /// depth-tested but not depth-written, drawn with the translucent.
+    Additive,
+}
+
+impl BlendMode {
+    /// Whether it draws over the scene without writing depth, after the
+    /// opaque world.
+    pub fn is_translucent(self) -> bool {
+        matches!(self, Self::Translucent | Self::Additive)
+    }
 }
 
 /// Everything a draw shades with besides its geometry and transform.

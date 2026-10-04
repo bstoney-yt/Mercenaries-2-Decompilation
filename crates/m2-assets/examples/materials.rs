@@ -18,7 +18,9 @@
 //! - textures whose names mention roads or decals, and what uses them;
 //! - model materials by flags word and by trailing word: techniques, the
 //!   base texture's format, the opacity constant and example base textures
-//!   (to read which bits mean blending, cut-outs or two-sided faces).
+//!   (to read which bits mean blending, cut-outs or two-sided faces);
+//! - ground scatter meshes by flags, technique and base texture: their
+//!   fade distances, how flat they are, and example textures.
 //!
 //! Every extra argument is a file of candidate names: a text file is read
 //! one name per line, anything else (`shader*.bin`) for its readable
@@ -31,12 +33,13 @@ use std::io::BufReader;
 use std::process::ExitCode;
 
 use m2_assets::model::{MODEL_TYPE, Material};
+use m2_assets::scatter::SCATTER_TYPE;
 use m2_assets::terrain::{LOW_RES_TYPE, TERRAIN_TYPE};
 use m2_assets::texture::INFO;
 use m2_assets::vertex::{DeclUsage, VertexDecl};
 use m2_assets::{
-    BlockContents, LowResTile, Model, PixelFormat, TerrainCell, TextureInfo, Ucfx, WadArchive,
-    name_hash,
+    BlockContents, LowResTile, Model, PixelFormat, Scatter, TerrainCell, TextureInfo, Ucfx,
+    WadArchive, name_hash,
 };
 
 const TEXTURE_TYPE: u32 = 0xf011_157a;
@@ -325,6 +328,7 @@ fn run(path: &str, name_files: &[String]) -> AnyResult<()> {
     let mut models: HashMap<u32, Vec<u8>> = HashMap::new();
     let mut cells: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut tiles: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut scatters: Vec<Vec<u8>> = Vec::new();
     for block in 0..wad.index().blocks().len() {
         let decoded = match wad.read_block(block) {
             Ok(d) => d,
@@ -360,6 +364,7 @@ fn run(path: &str, name_files: &[String]) -> AnyResult<()> {
                 }
                 TERRAIN_TYPE => cells.push((e.name_hash, data.to_vec())),
                 LOW_RES_TYPE => tiles.push((e.name_hash, data.to_vec())),
+                SCATTER_TYPE => scatters.push(data.to_vec()),
                 _ => {}
             }
         }
@@ -476,6 +481,74 @@ fn run(path: &str, name_files: &[String]) -> AnyResult<()> {
     println!("\n== model materials by trailing word");
     for (t, u) in &by_tail {
         u.print(&format!("tail {t:08x}{}", named(&names, *t)));
+    }
+
+    // Ground scatter.
+    #[derive(Default)]
+    struct Clumps {
+        meshes: usize,
+        instances: usize,
+        fade: Tally<String>,
+        unk: Tally<String>,
+        shape: Tally<String>,
+        names: Vec<String>,
+    }
+    let mut clumps: BTreeMap<String, Clumps> = BTreeMap::new();
+    for data in &scatters {
+        let Ok(sc) = Scatter::parse(data) else {
+            continue;
+        };
+        let mut used = vec![0usize; sc.meshes.len()];
+        for (mesh, _, _) in sc.placements() {
+            if let Some(n) = used.get_mut(usize::from(mesh)) {
+                *n += 1;
+            }
+        }
+        for (m, n) in sc.meshes.iter().zip(used) {
+            let base = m.material.textures.first().copied().unwrap_or(0);
+            let key = format!(
+                "flags {:#06x} {:08x}{} base {}",
+                m.material.flags,
+                m.material.technique,
+                named(&names, m.material.technique),
+                describe_slot(&textures, base)
+            );
+            let c = clumps.entry(key).or_default();
+            c.meshes += 1;
+            c.instances += n;
+            c.fade.add(format!("{}-{}", m.fade[0], m.fade[1]));
+            c.unk.add(format!("{:08x}/{}", m.unk_0x04, m.unk_0x10));
+            let pos = m.positions();
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pos {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let (w, h) = ((hi[0] - lo[0]).max(hi[2] - lo[2]), hi[1] - lo[1]);
+            c.shape.add(format!(
+                "{} {}v {:.1}x{:.1}m",
+                if h < 0.2 * w { "flat" } else { "upright" },
+                pos.len(),
+                w,
+                h
+            ));
+            if let Some(t) = textures.get(&base)
+                && c.names.len() < 6
+                && !c.names.contains(&t.name)
+            {
+                c.names.push(t.name.clone());
+            }
+        }
+    }
+    println!("\n== ground scatter: {} assets", scatters.len());
+    for (k, c) in &clumps {
+        println!("{k}: {} meshes, {} instances", c.meshes, c.instances);
+        println!("    fade [{}]", c.fade.top(6));
+        println!("    0x04/0x10 [{}]", c.unk.top(6));
+        println!("    shape [{}]", c.shape.top(6));
+        println!("    e.g. {}", c.names.join(", "));
     }
 
     // Terrain.

@@ -41,6 +41,9 @@ pub const ISLAND: f32 = 8000.0;
 const CELL_SKIRT: f32 = 4.0;
 const TILE_SKIRT: f32 = 30.0;
 
+/// Side of a cell's patches in metres; skirts follow their borders.
+const PATCH_SIZE: f32 = 100.0;
+
 /// One placed model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectPlacement {
@@ -874,8 +877,11 @@ impl TerrainMesh {
     /// one triangle only), so cracks where neighbouring cells, patches or
     /// detail levels meet show ground instead of sky. Drawn both ways round,
     /// as the crack may be seen from either side. Only ground ranges get
-    /// skirts; they join the first ground range.
-    fn add_skirts(&mut self, depth: f32) {
+    /// skirts; they join the first ground range. With `grid`, only edges
+    /// running along a grid line (every `grid` metres, the patch borders)
+    /// get one: open edges inside a patch border holes the ground leaves
+    /// under roads and buildings, where a skirt would show as a dark wall.
+    fn add_skirts(&mut self, depth: f32, grid: Option<f32>) {
         let ground: Vec<usize> = self
             .ranges
             .iter()
@@ -895,10 +901,31 @@ impl TerrainMesh {
                 }
             }
         }
+        let at = |v: u32| {
+            let at = v as usize * TERRAIN_STRIDE;
+            let f = |o: usize| {
+                f32::from_le_bytes(
+                    self.vertices[at + o..at + o + 4]
+                        .try_into()
+                        .expect("4 bytes"),
+                )
+            };
+            (f(0), f(8))
+        };
+        let on_line = |a: f32, b: f32, step: f32| {
+            let line = (a / step).round() * step;
+            (a - line).abs() < 0.05 && (b - line).abs() < 0.05
+        };
         let mut open: Vec<(u32, u32)> = edges
             .into_iter()
             .filter(|&(_, n)| n == 1)
             .map(|(e, _)| e)
+            .filter(|&(a, b)| {
+                grid.is_none_or(|step| {
+                    let (pa, pb) = (at(a), at(b));
+                    on_line(pa.0, pb.0, step) || on_line(pa.1, pb.1, step)
+                })
+            })
             .collect();
         open.sort_unstable();
         let mut lowered: HashMap<u32, u32> = HashMap::new();
@@ -1026,7 +1053,7 @@ pub fn terrain_cell<R: Read + Seek>(
     }
     mesh.finish(buckets);
     mesh.build_collision();
-    mesh.add_skirts(CELL_SKIRT);
+    mesh.add_skirts(CELL_SKIRT, Some(PATCH_SIZE));
     Ok(mesh)
 }
 
@@ -1065,7 +1092,7 @@ pub fn low_res_tile<R: Read + Seek>(
         &mut HashSet::new(),
     );
     mesh.finish(buckets);
-    mesh.add_skirts(TILE_SKIRT);
+    mesh.add_skirts(TILE_SKIRT, None);
     Ok(mesh)
 }
 
@@ -1101,7 +1128,11 @@ mod tests {
         mesh.indices = vec![0, 1, 2, 0, 2, 3];
         mesh.ranges = vec![(0, 6, 0)];
         mesh.bounds = (Vec3::new(0.0, 2.0, 0.0), Vec3::new(1.0, 2.0, 1.0));
-        mesh.add_skirts(4.0);
+        // On a 100 m grid only the edges along x = 0 and z = 0 lie on lines.
+        let mut gridded = mesh.clone();
+        gridded.add_skirts(4.0, Some(100.0));
+        assert_eq!(gridded.indices.len(), 6 + 2 * 12);
+        mesh.add_skirts(4.0, None);
         assert_eq!(mesh.vertex_count(), 8);
         assert_eq!(mesh.indices.len(), 6 + 4 * 12);
         assert_eq!(mesh.ranges, vec![(0, 6 + 4 * 12, 0)]);

@@ -65,7 +65,7 @@ impl Default for MaterialCache {
             // 0 stays the backend's default material.
             next_material: 1,
             all_double_sided: false,
-            max_texture_width: 2048,
+            max_texture_width: MODEL_TEXTURE_WIDTH,
         }
     }
 }
@@ -140,6 +140,22 @@ impl MaterialCache {
         Ok(())
     }
 
+    /// Adds `cpu`'s textures: those it decoded ahead as they are, the rest
+    /// read from `source`.
+    pub fn load_model_textures<R: Read + Seek>(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        source: &mut AssetSource<R>,
+        cpu: &CpuModel,
+    ) -> Result<(), BackendError> {
+        for (hash, t) in &cpu.textures {
+            if !self.has_texture(*hash) {
+                self.add_texture(backend, *hash, t.as_ref())?;
+            }
+        }
+        self.load_textures(backend, source, cpu.texture_requests())
+    }
+
     /// The material for a model material record, shaded as its technique
     /// says (see [`Technique`]): base colour from slot 0, alpha-tested when
     /// that texture has alpha, and the specular and normal maps when the
@@ -202,18 +218,27 @@ impl MaterialCache {
                 texture: t.handle,
                 alpha_x: t.alpha_x,
             });
+        let has = |bit: u16| material.flags & bit != 0;
+        let alpha = matches!(texture, Some((_, true)));
+        let blend = if has(flags::ADDITIVE) {
+            BlendMode::Additive
+        } else if has(flags::BLENDED) {
+            BlendMode::Translucent
+        } else if alpha || has(flags::CUT_OUT) {
+            BlendMode::Masked { cutoff: 0.5 }
+        } else {
+            BlendMode::Opaque
+        };
+        // The opacity constant scales the texture's alpha.
+        let opacity = material.constants[12].clamp(0.0, 1.0);
         let desc = MaterialDesc {
             texture: texture.map(|t| t.0),
-            blend: match texture {
-                Some((_, true)) if material.flags & BLENDED != 0 => BlendMode::Translucent,
-                Some((_, true)) => BlendMode::Masked { cutoff: 0.5 },
-                _ => BlendMode::Opaque,
-            },
-            double_sided: matches!(texture, Some((_, true))),
+            blend,
+            double_sided: has(flags::TWO_SIDED) || alpha,
             color: if texture.is_some() {
-                [1.0; 4]
+                [1.0, 1.0, 1.0, opacity]
             } else {
-                [0.6, 0.6, 0.6, 1.0]
+                [0.6, 0.6, 0.6, opacity]
             },
             vertex_color: technique.is_some_and(|t| t.ambient_occlusion),
             // materialData's diffuse and ambient colours; which constants
@@ -268,7 +293,7 @@ impl MaterialCache {
             },
         )?;
         self.defined.push((id, *desc));
-        if desc.blend == BlendMode::Translucent {
+        if desc.blend.is_translucent() {
             self.translucent.insert(id);
         }
         Ok(id)
@@ -308,10 +333,25 @@ impl MaterialCache {
     }
 }
 
-/// Material flags bit for surfaces blended over what is behind them, such
-/// as vehicle glass (flags 0x0091 where the body has 0x0080). Read from
-/// which materials carry it; not confirmed in the game's code.
-pub const BLENDED: u16 = 0x0001;
+/// Widest model texture read by default; bigger mips are skipped.
+pub const MODEL_TEXTURE_WIDTH: u32 = 2048;
+
+/// Material flags bits, read from which materials carry them (a survey of
+/// every model material); not confirmed in the game's code.
+pub mod flags {
+    /// Alpha blended over what is behind: glass, blob shadows, water,
+    /// boards (vehicle glass is 0x0091 where the body is 0x0080).
+    pub const BLENDED: u16 = 0x0001;
+    /// Added to what is behind: lights, neon, light cones, trails.
+    pub const ADDITIVE: u16 = 0x0002;
+    /// Cut out by the texture's alpha: leaves, hedges, hair, nets.
+    pub const CUT_OUT: u16 = 0x0008;
+    /// Both faces drawn: hair, wires, plants, helmets' visors.
+    pub const TWO_SIDED: u16 = 0x0010;
+    /// Never drawn: every material carrying it is coloured with the
+    /// default normal map.
+    pub const HIDDEN: u16 = 0x0800;
+}
 
 /// A material record's base-colour texture (slot 0).
 pub fn base_texture(material: &Material) -> Option<u32> {
@@ -428,6 +468,10 @@ pub struct CpuModel {
     /// [`PartStates`](m2_assets::model::PartStates)). Empty when the model
     /// switches nothing.
     pub hidden: [Vec<bool>; 2],
+    /// Textures decoded ahead (on a loading thread, by
+    /// [`decode_textures`](Self::decode_textures)), for
+    /// [`MaterialCache::load_model_textures`] to upload without reading.
+    pub textures: Vec<(u32, Option<DecodedTexture>)>,
 }
 
 /// The collision of one building of a merged batch (a `TINY` model).
@@ -482,6 +526,12 @@ impl CpuModel {
                     .material_ranges
                     .iter()
                     .filter(|r| r.start_index + r.index_count() <= group.indices.len() as u32)
+                    .filter(|r| {
+                        model
+                            .materials
+                            .get(r.material as usize)
+                            .is_none_or(|m| m.flags & flags::HIDDEN == 0)
+                    })
                     .map(|r| (r.start_index, r.index_count(), r.material as usize))
                     .collect();
                 let mut centre = Vec3::ZERO;
@@ -533,6 +583,7 @@ impl CpuModel {
             collision: None,
             members: Vec::new(),
             hidden,
+            textures: Vec::new(),
         }
     }
 
@@ -554,6 +605,23 @@ impl CpuModel {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// Reads and decodes the model's textures (up to `max_width` wide) into
+    /// [`textures`](Self::textures), so a loading thread does the work
+    /// rather than the frame that uploads the model.
+    pub fn decode_textures<R: Read + Seek>(&mut self, source: &mut AssetSource<R>, max_width: u32) {
+        self.textures = self
+            .texture_requests()
+            .into_iter()
+            .map(|(hash, linear)| {
+                let t = source.texture(hash, max_width).ok().map(|mut t| {
+                    t.linear = linear;
+                    t
+                });
+                (hash, t)
+            })
+            .collect();
     }
 }
 
@@ -836,13 +904,24 @@ mod tests {
         let m = cache.material(&mut backend, &material(2, 11)).unwrap();
         assert_eq!(backend.material(m).blend, BlendMode::Masked { cutoff: 0.5 });
         assert!(!cache.is_translucent(m));
-        // Glass: the blend bit set.
-        let glass = Material {
+        // Glass: the blend bit set, its opacity in the colour's alpha.
+        let mut glass = Material {
             flags: 0x0091,
             ..material(4, 11)
         };
+        glass.constants[12] = 0.5;
         let m = cache.material(&mut backend, &glass).unwrap();
         assert_eq!(backend.material(m).blend, BlendMode::Translucent);
+        assert_eq!(backend.material(m).color[3], 0.5);
+        assert!(backend.material(m).double_sided);
+        assert!(cache.is_translucent(m));
+        // A light: added, even without alpha.
+        let light = Material {
+            flags: 0x0012,
+            ..material(5, 10)
+        };
+        let m = cache.material(&mut backend, &light).unwrap();
+        assert_eq!(backend.material(m).blend, BlendMode::Additive);
         assert!(cache.is_translucent(m));
 
         let m = cache.material(&mut backend, &material(3, 12)).unwrap();
