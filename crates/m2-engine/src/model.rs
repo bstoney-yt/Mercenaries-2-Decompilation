@@ -19,9 +19,10 @@ use m2_assets::vertex::DeclUsage;
 use m2_assets::{Model, Ucfx};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
-    BackendError, BlendMode, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
-    Layer, MaterialDesc, MaterialId, NormalMap, Primitive, RenderBackend, SkinHandle, Specular,
-    TextureDesc, TextureFormat, TextureHandle, VertexBufferDesc, VertexBufferHandle, generate_mips,
+    BackendError, BlendMode, DrawCall, DrawQueue, Emissive, Geometry, IndexBufferDesc,
+    IndexBufferHandle, Layer, MaterialDesc, MaterialId, NormalMap, Primitive, RenderBackend,
+    SkinHandle, Specular, TextureDesc, TextureFormat, TextureHandle, VertexBufferDesc,
+    VertexBufferHandle, generate_mips,
 };
 
 use crate::assets::{AssetError, AssetSource, DecodedTexture, ModelData};
@@ -210,6 +211,19 @@ impl MaterialCache {
                 .and_then(|t| self.uploaded(t))
                 .map(|t| t.handle),
         });
+        // Emis techniques: slot 1 is the emissive map, constants 9-11 its
+        // colour (lamps 2 to 4, everything else 0).
+        let emissive = technique.filter(|t| t.emissive).and_then(|_| {
+            let color = [
+                material.constants[9],
+                material.constants[10],
+                material.constants[11],
+            ];
+            (color.iter().any(|&c| c > 0.0)).then(|| Emissive {
+                color,
+                map: slot(1).and_then(|t| self.uploaded(t)).map(|t| t.handle),
+            })
+        });
         let normal_map = technique
             .filter(|t| t.normal)
             .and_then(|_| slot(2))
@@ -263,6 +277,7 @@ impl MaterialCache {
             },
             specular,
             normal_map,
+            emissive,
             depth_bias,
             ..MaterialDesc::default()
         };
@@ -923,6 +938,17 @@ mod tests {
         let m = cache.material(&mut backend, &light).unwrap();
         assert_eq!(backend.material(m).blend, BlendMode::Additive);
         assert!(cache.is_translucent(m));
+        // A lamp lens: PgDiffEmisFP glows with constants 9-11 through slot 1.
+        let mut lamp = Material {
+            technique: 0x7ed2_de27,
+            textures: vec![10, 10],
+            ..material(6, 10)
+        };
+        lamp.constants[9..12].copy_from_slice(&[4.0, 4.0, 2.5]);
+        let m = cache.material(&mut backend, &lamp).unwrap();
+        let glow = backend.material(m).emissive.unwrap();
+        assert_eq!(glow.color, [4.0, 4.0, 2.5]);
+        assert!(glow.map.is_some());
 
         let m = cache.material(&mut backend, &material(3, 12)).unwrap();
         assert!(backend.material(m).texture.is_none());
