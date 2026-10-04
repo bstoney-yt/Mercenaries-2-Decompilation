@@ -146,6 +146,24 @@ impl Skeleton {
         Some(mask.into())
     }
 
+    /// The nodes of the arm ending in `hand` (the other hand `other`
+    /// finds the chest): everything from the bone below the chest on the
+    /// way to the hand down.
+    pub fn arm(&self, hand: usize, other: usize) -> Option<Arc<[bool]>> {
+        let up = |mut n: usize| {
+            let mut path = vec![n];
+            while let Some(p) = self.parents.get(n).copied().flatten() {
+                path.push(p);
+                n = p;
+            }
+            path
+        };
+        let (ph, po) = (up(hand), up(other));
+        let below = ph.windows(2).find(|w| po.contains(&w[1])).map(|w| w[0])?;
+        let mask: Vec<bool> = (0..self.len()).map(|i| up(i).contains(&below)).collect();
+        Some(mask.into())
+    }
+
     /// The pelvis: the root's child that sits highest at rest (as
     /// [`ClipInfo::hips`] measures it).
     pub fn pelvis(&self) -> Option<usize> {
@@ -773,6 +791,12 @@ mod tests {
         };
         let s = skeleton(parents.clone(), &rise);
         assert_eq!(upper(&s), vec![4, 5, 6, 7, 8, 9, 14, 15]);
+        let arm = |s: &Skeleton, hand: usize, other: usize| {
+            let mask = s.arm(hand, other).expect("an arm");
+            (0..mask.len()).filter(|&i| mask[i]).collect::<Vec<_>>()
+        };
+        let (a, b) = (arm(&s, 7, 9), arm(&s, 9, 7));
+        assert!(a.contains(&7) && !a.contains(&9) && !b.contains(&7) && b.contains(&9));
         // Thighs on the spine instead (as some rigs have them): the upper
         // body starts at the chest.
         let mut biped = parents;

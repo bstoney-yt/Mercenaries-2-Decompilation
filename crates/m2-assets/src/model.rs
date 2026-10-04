@@ -788,9 +788,9 @@ pub struct Geometry<'a> {
 /// holds its intact and its wrecked parts (body, turret, doors, wheels)
 /// side by side, and shows one or the other.
 ///
-/// `STAM` holds `INFO`, then `SWIT` (u32 node index per switchable node),
-/// then repeated `STAT` / `CHDR` / `CEXE` records; a `CEXE` holds commands
-/// as u32 (node index, verb) pairs, the verbs being name hashes such as
+/// `STAM` holds `INFO`, then `SWIT` (the name hash of each switchable
+/// node), then `STAT` / `CHDR` / `CEXE` records; a `CEXE` holds commands
+/// as u32 (node name, verb) pairs, the verbs being name hashes such as
 /// `show` and `hide`. Switchable nodes with the same parent are a part's
 /// alternatives, shown in order: the first is the intact part, the next
 /// the wrecked one. A switchable node never shown is a light's glow.
@@ -803,24 +803,29 @@ pub struct PartStates {
 }
 
 impl PartStates {
-    fn parse(u: &Ucfx<'_>, stam: usize, node_count: u32) -> Self {
+    fn parse(u: &Ucfx<'_>, stam: usize, nodes: &[Node]) -> Self {
         let show = crate::name_hash("show");
         let words = |d: &[u8]| -> Vec<u32> {
             d.chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         };
+        // Nodes are named by their name hashes.
+        let named = |h: u32| {
+            nodes
+                .iter()
+                .enumerate()
+                .filter(move |(_, n)| n.name_hash == h)
+                .map(|(i, _)| i as u16)
+        };
         let mut states = Self::default();
-        for c in u.children(Some(stam)) {
-            let sec = &u.sections()[c];
+        let sections = u.sections();
+        let last = (stam + sections[stam].descendants as usize).min(sections.len() - 1);
+        for sec in &sections[stam + 1..=last] {
             let Some(data) = sec.data else { continue };
             match &sec.fourcc {
                 b"SWIT" => {
-                    states.switchable = words(data)
-                        .into_iter()
-                        .filter(|&n| n < node_count)
-                        .map(|n| n as u16)
-                        .collect();
+                    states.switchable = words(data).into_iter().flat_map(named).collect();
                 }
                 b"CEXE" => {
                     let w = words(data);
@@ -830,15 +835,21 @@ impl PartStates {
                         }
                         // The node shown: the word before the verb, or
                         // after it.
-                        let node = [k.checked_sub(1), Some(k + 1)]
+                        let shown: Vec<u16> = [k.checked_sub(1), Some(k + 1)]
                             .into_iter()
                             .flatten()
                             .filter_map(|i| w.get(i))
-                            .find(|&&n| n < node_count && states.switchable.contains(&(n as u16)));
-                        if let Some(&n) = node
-                            && !states.shown.contains(&(n as u16))
-                        {
-                            states.shown.push(n as u16);
+                            .map(|&h| {
+                                named(h)
+                                    .filter(|n| states.switchable.contains(n))
+                                    .collect::<Vec<u16>>()
+                            })
+                            .find(|found| !found.is_empty())
+                            .unwrap_or_default();
+                        for n in shown {
+                            if !states.shown.contains(&n) {
+                                states.shown.push(n);
+                            }
                         }
                     }
                 }
@@ -966,6 +977,7 @@ impl<'a> Model<'a> {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
+        let states = stam.map(|c| PartStates::parse(&u, c, &nodes));
         let mut model = Self {
             info,
             nodes,
@@ -973,7 +985,7 @@ impl<'a> Model<'a> {
             segments,
             blend_shapes,
             tiny: sections[5],
-            states: stam.map(|c| PartStates::parse(&u, c, info.node_count)),
+            states,
             slots: vec![None; info.slot_count as usize],
         };
         model.add_geom(&u, geom.ok_or(ModelError::MissingSection(*b"GEOM"))?)?;
@@ -1615,22 +1627,24 @@ mod tests {
             b"STAM",
             vec![
                 leaf(b"INFO", vec![0; 12]),
-                leaf(b"SWIT", le(&[1, 2, 3])),
+                leaf(b"SWIT", le(&[101, 102, 103])),
                 leaf(b"STAT", le(&[0x1234_5678])),
                 leaf(b"CHDR", le(&[2])),
-                leaf(b"CEXE", le(&[1, show, 2, hide, 3, hide])),
-                leaf(b"STAT", le(&[0x8765_4321])),
-                leaf(b"CHDR", le(&[2])),
-                leaf(b"CEXE", le(&[1, hide, 2, show])),
+                leaf(b"CEXE", le(&[101, show, 102, hide, 103, hide])),
+                node(
+                    b"STAS",
+                    vec![
+                        leaf(b"STAT", le(&[0x8765_4321])),
+                        leaf(b"CHDR", le(&[2])),
+                        leaf(b"CEXE", le(&[101, hide, 102, show])),
+                    ],
+                ),
             ],
         )]);
         let u = Ucfx::parse(&data).unwrap();
         let stam = u.children(None).next().unwrap();
-        let states = PartStates::parse(&u, stam, 5);
-        assert_eq!(states.switchable, vec![1, 2, 3]);
-        assert_eq!(states.shown, vec![1, 2]);
-        let n = |parent: Option<u16>| Node {
-            name_hash: 0,
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
             flags: 0,
             first_child: None,
             parent,
@@ -1641,7 +1655,16 @@ mod tests {
             bounds_min: [0.0; 4],
             bounds_max: [0.0; 4],
         };
-        let nodes = [n(None), n(Some(0)), n(Some(0)), n(Some(1)), n(Some(1))];
+        let nodes = [
+            n(100, None),
+            n(101, Some(0)),
+            n(102, Some(0)),
+            n(103, Some(1)),
+            n(104, Some(1)),
+        ];
+        let states = PartStates::parse(&u, stam, &nodes);
+        assert_eq!(states.switchable, vec![1, 2, 3]);
+        assert_eq!(states.shown, vec![1, 2]);
         assert_eq!(
             states.hidden(&nodes, false),
             vec![false, false, true, true, false]
