@@ -67,6 +67,10 @@ pub struct TemplatePlacement {
     pub model: Option<u32>,
     /// What drives it, from the database's physics components.
     pub kind: VehicleKind,
+    /// The name hash of the layer holding it: `layers_static` is many
+    /// layers in one block (`vz_mar_village`, ...), which the game loads
+    /// by name.
+    pub layer: u32,
 }
 
 /// What a vehicle template drives as, by which physics component the
@@ -318,7 +322,7 @@ impl WorldIndex {
                 let Ok(layer) = Layer::parse(data) else {
                     continue;
                 };
-                world.add_layer(&layer, is_static, &assets);
+                world.add_layer(&layer, e.name_hash, is_static, &assets);
                 world.add_people(&layer, &mut routes);
             }
         }
@@ -387,7 +391,7 @@ impl WorldIndex {
         }
     }
 
-    fn add_layer(&mut self, layer: &Layer<'_>, is_static: bool, assets: &Assets) {
+    fn add_layer(&mut self, layer: &Layer<'_>, layer_hash: u32, is_static: bool, assets: &Assets) {
         let placements = layer.placements();
         let at = |entity| placements.get(&entity);
         for (entity, asset) in layer.hashes("TerrainObject") {
@@ -462,6 +466,7 @@ impl WorldIndex {
                         rotation,
                         model,
                         kind,
+                        layer: layer_hash,
                     }),
                     // A template with a model that doesn't drive yet (a
                     // boat, a helicopter) or has no physics (a pickup, an
@@ -487,6 +492,7 @@ impl WorldIndex {
                             rotation,
                             model: None,
                             kind: VehicleKind::Unknown,
+                            layer: layer_hash,
                         })
                     }
                     _ => {}
