@@ -135,8 +135,8 @@ pub struct Npc {
     brain: Brain,
     /// The aim and fall clips in this person's rig.
     clips: FightClips,
-    /// The right-hand node, where the rifle is held.
-    pub hand: Option<usize>,
+    /// The hand nodes (right, left), where the rifle is held.
+    pub hands: Option<(usize, usize)>,
     /// Seconds since they died.
     dead_for: f32,
     /// Has shouted since they were last calm.
@@ -164,10 +164,10 @@ impl Npc {
         let mut rig = rig.clone();
         rig.set_gait(Gait::Idle);
         let clips = FightClips::find(&rig);
-        let hand = crate::combat::right_hand(&rig.skeleton);
+        let hands = crate::combat::hands(&rig.skeleton);
         Self {
             clips,
-            hand,
+            hands,
             dead_for: 0.0,
             shouted: false,
             kind,
