@@ -572,6 +572,15 @@ where
     wrap.call(raw)
 }
 
+/// The name of a stub (`"HealthCounter.Update"`), `None` for any other
+/// value.
+pub fn stub_name(value: &Value) -> Option<String> {
+    match value {
+        Value::Table(t) => t.raw_get::<Option<String>>(STUB_NAME).ok().flatten(),
+        _ => None,
+    }
+}
+
 fn stub(lua: &Lua, name: &str) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.raw_set(STUB_NAME, name)?;
