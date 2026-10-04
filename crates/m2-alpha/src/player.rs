@@ -9,7 +9,7 @@ use crate::combat::{Trigger, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::npc::FightClips;
-use crate::scene::Rig;
+use crate::scene::{Carry, Rig};
 
 /// Movement speeds, m/s, inside the bands the game's clips move at.
 const WALK: f32 = 1.4;
@@ -228,16 +228,18 @@ impl Player {
             } else if self.jumping && self.character.grounded {
                 self.jumping = false;
             }
+            let carry = if self.aiming { Carry::Aim } else { Carry::Low };
             if self.jumping && self.clips.jump.is_some() {
-                // The legs jump; the arms keep the rifle.
+                // The legs jump; the arms keep the rifle as they were (the
+                // jump's own arms fly out).
                 let upper = if self.aiming {
                     self.clips.aim
                 } else {
-                    self.clips.ready
+                    rig.gait_clip(Gait::Idle)
                 };
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
             } else {
-                rig.hold_rifle(gait, &self.clips, self.aiming);
+                rig.hold_rifle(gait, &self.clips, carry);
             }
             // Play the clip at the speed she actually moves, so feet don't
             // slide (within reason: against a wall the legs keep going).
