@@ -19,6 +19,8 @@
 //! cargo run -p m2-assets --example wad -- script  <archive.wad> <script hash>
 //! cargo run -p m2-assets --example wad -- calls   <archive.wad> <callee> [first arg] [count]
 //! cargo run -p m2-assets --example wad -- strings <archive.wad> [text]
+//! cargo run -p m2-assets --example wad -- movies  <archive.wad>
+//! cargo run -p m2-assets --example wad -- fonts   <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -60,6 +62,14 @@
 //! else the strings that are exactly `text` (else contain it),
 //! their key and the few strings stored either side, cut to 60
 //! characters: pairs of key and text to find the key hash with.
+//! `movies` parses every Scaleform movie (each copy, block by block) and
+//! lists its name (the exporter's swf name), size, stage, frame rate and
+//! count, tag and character counts and any tags that did not parse, then
+//! checks every external image names a texture in the archive.
+//! `fonts` parses every bitmap font: line height, glyph and material counts,
+//! the glyphs' code range and largest size, and each material's texture
+//! (by asset hash) with its size, checking every glyph rectangle lies on
+//! its page and agrees with the glyph's pixel size.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -81,6 +91,11 @@ use m2_assets::{
     TextureKind, Ucfx, WadArchive,
 };
 use m2_assets::{StringTable, strings::STRINGS_TYPE};
+use m2_assets::{
+    font::{FONT_TYPE, Font},
+    gfx::{Character, MOVIE_TYPE, movie_from_asset},
+    name_hash,
+};
 
 /// Type hash of texture assets.
 const TEXTURE_TYPE: u32 = 0xf011_157a;
@@ -195,6 +210,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {} bytes to {out}", data.len());
         }
         ("textures", []) => textures(&mut wad)?,
+        ("movies", []) => movies(&mut wad)?,
+        ("fonts", []) => fonts(&mut wad)?,
         ("dds", [name, out]) => {
             let dds = texture_dds(&mut wad, name)?;
             std::fs::write(out, &dds)?;
@@ -1777,4 +1794,189 @@ fn memchr_all<'a>(needle: &'a [u8], hay: &'a [u8]) -> impl Iterator<Item = usize
         .enumerate()
         .filter(move |(_, w)| !needle.is_empty() && *w == needle)
         .map(|(i, _)| i)
+}
+
+/// The decoded blocks holding assets of `ty`, with those assets' entries.
+fn blocks_with_type<R: Read + Seek>(wad: &mut WadArchive<R>, ty: u32) -> Vec<usize> {
+    let index = wad.index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == ty)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
+}
+
+/// A texture's header, found by its asset hash.
+fn texture_info<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32) -> Option<TextureInfo> {
+    let blocks: Vec<usize> = wad
+        .index()
+        .assets_by_hash(hash)
+        .map(|a| usize::from(a.block))
+        .collect();
+    for b in blocks {
+        let decoded = wad.read_block(b).ok()?;
+        let contents = BlockContents::parse(&decoded).ok()?;
+        if let Some(e) = contents.find(hash, TEXTURE_TYPE)
+            && let Ok(t) = Texture::parse(contents.asset_data(e))
+        {
+            return Some(t.info);
+        }
+    }
+    None
+}
+
+fn movies<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    let (mut count, mut failed, mut tag_errors, mut images, mut missing) = (0, 0, 0, 0, 0);
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let path = wad.index().blocks()[block].path.clone();
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != MOVIE_TYPE {
+                continue;
+            }
+            count += 1;
+            let movie = match movie_from_asset(data) {
+                Ok(m) => m,
+                Err(err) => {
+                    println!("{:08x} {path}: {err}", e.name_hash);
+                    failed += 1;
+                    continue;
+                }
+            };
+            let s = movie.summary();
+            let name = s.exporter.as_ref().map_or("-", |x| x.4.as_str());
+            let (w, h) = movie.frame_size.size_px();
+            let tags: u32 = s.tag_counts.values().sum();
+            println!(
+                "{:08x} {name:<24} {:>8} bytes {w:>5}x{h:<4} {:>4} fps {:>5} frames {tags:>6} tags {:>4} chars {} errors  {}",
+                e.name_hash,
+                movie.body.len(),
+                movie.frame_rate,
+                movie.frame_count,
+                s.characters.len(),
+                s.errors.len(),
+                path.rsplit('\\').next().unwrap_or(&path),
+            );
+            tag_errors += s.errors.len();
+            for (timeline, code, offset) in &s.errors {
+                println!(
+                    "    tag {code} ({}) at {offset:#x} in timeline {timeline} did not parse",
+                    m2_assets::gfx::tag::name(*code)
+                );
+            }
+            for c in s.characters.values() {
+                let Character::ExternalImage(img) = c else {
+                    continue;
+                };
+                images += 1;
+                let key = if img.export_name.is_empty() {
+                    let f = img.file_name.rsplit(['\\', '/']).next().unwrap_or("");
+                    f.split('.').next().unwrap_or(f)
+                } else {
+                    img.export_name.as_str()
+                };
+                let hash = name_hash(key);
+                let index = wad.index();
+                if !index
+                    .assets_by_hash(hash)
+                    .any(|a| index.type_hash(a) == TEXTURE_TYPE)
+                {
+                    println!("    image {key:?} ({hash:08x}): no texture");
+                    missing += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "{count} movies, {failed} failed to parse, {tag_errors} tag errors, \
+         {images} external images, {missing} without a texture"
+    );
+    Ok(())
+}
+
+fn fonts<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    let (mut count, mut bad) = (0, 0);
+    let mut sizes: HashMap<u32, Option<(u16, u16)>> = HashMap::new();
+    for block in blocks_with_type(wad, FONT_TYPE) {
+        let path = wad.index().blocks()[block].path.clone();
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        let fonts: Vec<(u32, Vec<u8>)> = contents
+            .iter()
+            .filter(|(e, _)| e.type_hash == FONT_TYPE)
+            .map(|(e, d)| (e.name_hash, d.to_vec()))
+            .collect();
+        for (hash, data) in fonts {
+            count += 1;
+            let font = match Font::parse(&data) {
+                Ok(f) => f,
+                Err(err) => {
+                    println!("{hash:08x} {path}: {err}");
+                    bad += 1;
+                    continue;
+                }
+            };
+            let codes = font.glyphs.iter().map(|g| g.code);
+            let (lo, hi) = (codes.clone().min().unwrap_or(0), codes.max().unwrap_or(0));
+            let tallest = font.glyphs.iter().map(|g| g.height).max().unwrap_or(0);
+            let off_page = font.glyphs.iter().filter(|g| g.material != 0).count();
+            println!(
+                "{hash:08x} line {} tallest {} ({tallest} by glyph) +0x04 {} \
+                 {} glyphs ({off_page} off page 0) U+{lo:04X}..U+{hi:04X}  {}",
+                font.line_height,
+                font.tallest,
+                font.unk_0x04,
+                font.glyphs.len(),
+                path.rsplit('\\').next().unwrap_or(&path),
+            );
+            let sample: Vec<String> = "0 9 A g ."
+                .split(' ')
+                .filter_map(|c| {
+                    let g = font.glyph(u16::from(c.as_bytes()[0]))?;
+                    Some(format!("{c} {}x{} y+{}", g.width, g.height, g.y_offset))
+                })
+                .collect();
+            println!("    glyphs: {}", sample.join(", "));
+            for (i, m) in font.materials.iter().enumerate() {
+                let size = *sizes
+                    .entry(m.texture)
+                    .or_insert_with(|| texture_info(wad, m.texture).map(|t| (t.width, t.height)));
+                let glyphs: Vec<_> = font
+                    .glyphs
+                    .iter()
+                    .filter(|g| usize::from(g.material) == i)
+                    .collect();
+                let mut mismatched = 0;
+                if let Some((w, h)) = size {
+                    for g in &glyphs {
+                        let pw = (g.uv[2] - g.uv[0]) * f32::from(w);
+                        let ph = (g.uv[3] - g.uv[1]) * f32::from(h);
+                        let on_page = g.uv.iter().all(|x| (0.0..=1.0).contains(x));
+                        if !on_page
+                            || (pw - f32::from(g.width)).abs() > 1.5
+                            || (ph - f32::from(g.height)).abs() > 1.5
+                        {
+                            mismatched += 1;
+                        }
+                    }
+                }
+                println!(
+                    "    material {i}: texture {:08x} {} {} glyphs, {mismatched} off their rectangle",
+                    m.texture,
+                    size.map_or("not found".to_owned(), |(w, h)| format!("{w}x{h}")),
+                    glyphs.len(),
+                );
+                if size.is_none() || mismatched > 0 {
+                    bad += 1;
+                }
+            }
+        }
+    }
+    println!("{count} fonts, {bad} problems");
+    Ok(())
 }

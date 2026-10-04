@@ -12,6 +12,7 @@
 //! - [`texture`]: texture assets: header, mip chain (including mips streamed
 //!   from other blocks) and conversion to RGBA8.
 //! - [`dxt`]: DXT1, DXT3 and DXT5 decoding.
+//! - [`font`]: the bitmap fonts the game's own GUI widgets draw text with.
 //! - [`gfx`]: Scaleform GFx (Flash) movies the interface is built from:
 //!   header, tags, and the layout and names they describe.
 //! - [`model`]: model assets: node hierarchy, materials, LOD segments and
@@ -50,6 +51,7 @@ pub mod animation;
 pub mod block;
 mod bytes;
 pub mod dxt;
+pub mod font;
 pub mod gfx;
 pub mod hash;
 pub mod havok;
@@ -78,6 +80,7 @@ mod testutil;
 pub use animation::{AnimationError, Clip, Codec, Transform};
 pub use block::{BlockContents, BlockEntry, BlockError};
 pub use dxt::{DxtError, DxtFormat};
+pub use font::{Font, FontError, Glyph};
 pub use hash::name_hash;
 pub use havok::{Packfile, PackfileError};
 pub use layer::{Component, Layer, LayerError, Placement};
