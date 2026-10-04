@@ -162,6 +162,14 @@ impl Templates {
     }
 }
 
+/// Components of people and vehicles, which a state layer's models
+/// leave to the game.
+const NOT_PROPS: [&str; 5] = ["Ai", "AiPatrol", "Rider", "_TankPhysics", "PopulationFlow"];
+
+/// The scripts keep what they don't need yet about 40 km under the island:
+/// below this height it isn't placed.
+const HIDDEN_BELOW: f32 = -1000.0;
+
 /// Components whose entities are never a template placement: roads,
 /// paths, regions, lights, sounds and such.
 const NOT_TEMPLATES: [&str; 16] = [
@@ -220,6 +228,11 @@ pub struct WorldIndex {
     /// The template database, for names the scripts and mission layers
     /// use.
     pub template_db: Templates,
+    /// Models the state layers place (blocks of their own, which the
+    /// mission scripts load and unload: `vz_state_vzacon001`), by entity:
+    /// what stands while the layer is in, such as a mission's gates.
+    /// Vehicles and people are left out (the alpha places those itself).
+    pub state_objects: HashMap<u32, ObjectPlacement>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -231,6 +244,24 @@ pub struct Member {
     /// `ModelName`, if it has one, then the hash of its name's stem
     /// (`_commercial_bld_corner8x16a 26` is `commercial_bld_corner8x16a`).
     pub models: Vec<u32>,
+}
+
+/// The layer a block holds, from its path:
+/// `blocks\VZ\vz_state_vzacon001_P000_Q3.block` is `vz_state_vzacon001`.
+/// (`layers_static` is many layers in one block, keyed by name hash.)
+pub fn layer_name(block_path: &str) -> String {
+    let file = block_path.rsplit(['\\', '/']).next().unwrap_or(block_path);
+    let stem = file.strip_suffix(".block").unwrap_or(file);
+    // Drop a trailing `_P<digits>_Q<digits>` (the block's partition).
+    let mut parts: Vec<&str> = stem.split('_').collect();
+    let tagged = |p: &str, c: char| {
+        p.len() > 1 && p.starts_with(c) && p[1..].bytes().all(|b| b.is_ascii_digit())
+    };
+    if parts.len() > 2 && tagged(parts[parts.len() - 1], 'Q') && tagged(parts[parts.len() - 2], 'P')
+    {
+        parts.truncate(parts.len() - 2);
+    }
+    parts.join("_").to_ascii_lowercase()
 }
 
 /// An entity name without its leading `_` and its trailing ` 26` or
@@ -406,7 +437,9 @@ impl WorldIndex {
                 self.tiles.insert(asset, Vec3::from(p.position));
             }
         }
-        if is_static {
+        if !is_static {
+            self.add_state_objects(layer, assets);
+        } else {
             let models = layer.hashes("ModelName");
             for (&entity, model) in &models {
                 if let Some(p) = at(entity) {
@@ -499,6 +532,53 @@ impl WorldIndex {
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+
+    /// A state layer's models: by `ModelName`, by a name that is a model,
+    /// or by a template with a model and no physics (not a vehicle).
+    /// People, vehicles and what the scripts keep far under the island
+    /// are left out.
+    fn add_state_objects(&mut self, layer: &Layer<'_>, assets: &Assets) {
+        let placements = layer.placements();
+        let models = layer.hashes("ModelName");
+        let names = layer.names();
+        let not_props: HashSet<u32> = NOT_TEMPLATES
+            .iter()
+            .chain(&NOT_PROPS)
+            .filter_map(|c| layer.component(c))
+            .flat_map(|c| c.records().unwrap_or_default())
+            .map(|(entity, _)| entity)
+            .collect();
+        for (&entity, p) in &placements {
+            if not_props.contains(&entity) || p.position[1] < HIDDEN_BELOW {
+                continue;
+            }
+            let stem = names.get(&entity).map_or("", |n| member_stem(n));
+            let model = models.get(&entity).copied().or_else(|| {
+                let h = (!stem.is_empty()).then(|| name_hash(stem))?;
+                if assets.models.contains(&h) {
+                    return Some(h);
+                }
+                match assets.templates.get(stem) {
+                    Some(&TemplateInfo {
+                        model: Some(m),
+                        vehicle: None,
+                    }) => Some(m),
+                    _ => None,
+                }
+            });
+            if let Some(model) = model {
+                self.state_objects.insert(
+                    entity,
+                    ObjectPlacement {
+                        model,
+                        position: Vec3::from(p.position),
+                        rotation: rotation(p.rotation),
+                        named: !models.contains_key(&entity),
+                    },
+                );
             }
         }
     }

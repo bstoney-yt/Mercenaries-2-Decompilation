@@ -42,22 +42,7 @@ impl LayerState {
     }
 }
 
-/// The layer a block holds, from its path:
-/// `blocks\VZ\vz_state_vzacon001_P000_Q3.block` is `vz_state_vzacon001`.
-pub fn layer_name(block_path: &str) -> String {
-    let file = block_path.rsplit(['\\', '/']).next().unwrap_or(block_path);
-    let stem = file.strip_suffix(".block").unwrap_or(file);
-    // Drop a trailing `_P<digits>_Q<digits>` (the block's partition).
-    let mut parts: Vec<&str> = stem.split('_').collect();
-    let tagged = |p: &str, c: char| {
-        p.len() > 1 && p.starts_with(c) && p[1..].bytes().all(|b| b.is_ascii_digit())
-    };
-    if parts.len() > 2 && tagged(parts[parts.len() - 1], 'Q') && tagged(parts[parts.len() - 2], 'P')
-    {
-        parts.truncate(parts.len() - 2);
-    }
-    parts.join("_").to_ascii_lowercase()
-}
+pub use m2_engine::world::layer_name;
 
 /// Reports the request for `name` (any case) done, and calls the callbacks
 /// waiting on it as the layer manager expects: the values of the request's

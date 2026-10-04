@@ -155,12 +155,13 @@ pub struct GameAudio {
 /// player's own), its falloff and volume.
 type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32);
 
-/// Voice sets, by the name hash of their name. The soldiers' and
-/// civilians' sets are named only by hash, and were told apart by their
-/// subtitles: two sets of Venezuelan army soldiers (so not everyone sounds
-/// alike) and civilians complaining.
-pub const VZ_SOLDIERS: [u32; 2] = [0xcf4f_8b9c, 0x6cff_c547];
-pub const CIVILIANS: u32 = 0x910e_b574;
+/// Voice sets, by the name hash of their name: two of Venezuelan army
+/// soldiers, `vo_vzSoldier_01` and `_02` (so not everyone sounds alike),
+/// and two each of civilian men and women, `vo_vzCiv_01`, `_02`,
+/// `vo_vzCiv_female_01` and `_02`.
+pub const VZ_SOLDIERS: [u32; 2] = [0x5078_7bff, 0x467a_aad8];
+pub const CIVILIANS: [u32; 2] = [0x6b0c_3b0b, 0x910e_b574];
+pub const CIVILIAN_WOMEN: [u32; 2] = [0x3a6e_c728, 0xc46b_cecf];
 /// Jennifer's voice set, `vo_jen`.
 pub const JENNIFER: u32 = 0x7f74_6c16;
 /// Her lines for what happens to her, by cue (a line, or a group of

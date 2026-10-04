@@ -27,6 +27,7 @@ use crate::cache;
 use crate::combat::{self, Arsenal, Effect, Weapon};
 use crate::npc::{self, People, PersonKind};
 use crate::player::Player;
+use crate::props::Props;
 
 /// Jennifer Mui, the playable mercenary whose model the README's export
 /// examples use.
@@ -394,6 +395,8 @@ pub struct Scene {
     pub arsenal: Arsenal,
     /// Fuel tanks and barrels that blow up when hit.
     pub explosives: Vec<crate::combat::Explosive>,
+    /// What the loaded state layers place (a mission's gates).
+    pub props: Props,
     /// Mesh and materials for shots, flashes, fire and smoke.
     effects: Effects,
     vehicle_loads: Option<Receiver<Loaded>>,
@@ -622,6 +625,7 @@ impl Scene {
             people: People::default(),
             arsenal: Arsenal::default(),
             explosives: Vec::new(),
+            props: Props::default(),
             effects,
             vehicle_loads: None,
             catalogue: None,
@@ -835,7 +839,20 @@ impl Scene {
         if let Ok(loaded) = self.requests.1.try_recv() {
             self.take(backend, loaded)?;
         }
+        if let (Some(world), Some(source)) = (&mut self.world, &mut self.source) {
+            self.props
+                .update(backend, &mut self.materials, source, &mut world.physics)?;
+        }
         Ok(())
+    }
+
+    /// Puts up what the state layers place for `entities` (see
+    /// [`Props::show`]).
+    pub fn show_props(&mut self, entities: impl IntoIterator<Item = u32>) -> usize {
+        match (&self.install, &self.world) {
+            (Some(install), Some(world)) => self.props.show(install, &world.index, entities),
+            _ => 0,
+        }
     }
 
     /// Uploads a model the loading threads decoded and puts it to use.
@@ -967,6 +984,7 @@ impl Scene {
         if let Some(world) = &mut self.world {
             let frustum = Frustum::from_view_proj(view.projection * view.view);
             world.draw(backend, queue, eye, &frustum)?;
+            self.props.draw(queue, eye, world.settings.object_distance);
         } else {
             self.draw_ground(queue);
         }
@@ -998,9 +1016,13 @@ impl Scene {
             };
             if !player.down
                 && let Some(w) = weapon
-                && let Some(at) =
-                    self.arsenal
-                        .in_hand(w, body, &nodes, self.arsenal.hand, rig.two_handed)
+                && let Some(at) = self.arsenal.in_hand(
+                    w,
+                    body,
+                    &nodes,
+                    (self.arsenal.hand, self.arsenal.attach),
+                    rig.two_handed,
+                )
             {
                 w.model.draw(queue, at);
             }
@@ -1029,9 +1051,9 @@ impl Scene {
             if n.soldier
                 && n.alive
                 && let Some(w) = &self.arsenal.rifle
-                && let Some(at) = self
-                    .arsenal
-                    .in_hand(w, body, &nodes, n.hand, n.rig.two_handed)
+                && let Some(at) =
+                    self.arsenal
+                        .in_hand(w, body, &nodes, (n.hand, n.attach), n.rig.two_handed)
             {
                 w.model.draw(queue, at);
             }
@@ -1137,8 +1159,9 @@ struct Effects {
     mesh: (VertexBufferHandle, IndexBufferHandle),
     /// Indices in the mesh.
     count: u32,
-    /// Tracer and flash, fire, smoke.
+    /// Tracer, muzzle flash, fire, smoke.
     light: MaterialId,
+    flash: MaterialId,
     fire: MaterialId,
     smoke: MaterialId,
 }
@@ -1193,6 +1216,7 @@ impl Effects {
             mesh: (vb, ib),
             count: faces.len() as u32 * 3,
             light: define([1.0, 0.85, 0.45, 1.0], false, BlendMode::Opaque)?,
+            flash: define([1.0, 0.78, 0.32, 0.9], false, BlendMode::Translucent)?,
             fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
             smoke: define([0.35, 0.35, 0.35, 0.4], true, BlendMode::Translucent)?,
         })
@@ -1200,6 +1224,27 @@ impl Effects {
 
     /// Queues `effect`, `age` of the way (0 to 1) through its life.
     fn draw(&self, queue: &mut DrawQueue, effect: Effect, age: f32) {
+        if let Effect::Flash { at, dir, size } = effect {
+            // A narrow plume out along the barrel and a small glow at the
+            // muzzle, both soft-edged, shrinking as they go.
+            let dir = dir.normalize_or(Vec3::Z);
+            let turn = Quat::from_rotation_arc(Vec3::Z, dir);
+            let fade = 1.0 - 0.5 * age;
+            let reach = size * fade;
+            let plume = Mat4::from_scale_rotation_translation(
+                Vec3::new(reach * 0.16, reach * 0.16, reach * 0.5),
+                turn,
+                at + dir * (reach * 0.5),
+            );
+            let glow = Mat4::from_scale_rotation_translation(
+                Vec3::splat(reach * 0.14),
+                turn,
+                at + dir * (reach * 0.08),
+            );
+            self.push(queue, plume, self.flash, true);
+            self.push(queue, glow, self.flash, true);
+            return;
+        }
         let (world, material, translucent) = match effect {
             Effect::Tracer { from, to } => {
                 let along = to - from;
@@ -1218,11 +1263,7 @@ impl Effects {
                     false,
                 )
             }
-            Effect::Flash { at } => (
-                Mat4::from_scale_rotation_translation(Vec3::splat(0.12), Quat::IDENTITY, at),
-                self.light,
-                false,
-            ),
+            Effect::Flash { .. } => return,
             Effect::Fire { at, size } => (
                 Mat4::from_scale_rotation_translation(
                     Vec3::splat(size * (0.4 + age)),
@@ -1248,30 +1289,39 @@ impl Effects {
         } else {
             &[1.0]
         };
-        let (vb, ib) = self.mesh;
         for &shell in shells {
-            let world = world * Mat4::from_scale(Vec3::splat(shell));
-            queue.push(Primitive {
-                call: DrawCall {
-                    material,
-                    topology: Topology::TriangleList,
-                    vertex_buffer: vb,
-                    geometry: Geometry::Indexed {
-                        buffer: ib,
-                        first: 0,
-                        count: self.count,
-                        base_vertex: 0,
-                    },
-                    world,
-                    skin: None,
-                    instances: None,
-                },
-                layer: Layer::WORLD,
+            self.push(
+                queue,
+                world * Mat4::from_scale(Vec3::splat(shell)),
+                material,
                 translucent,
-                sort_origin: world.transform_point3(Vec3::ZERO),
-                user: 0,
-            });
+            );
         }
+    }
+
+    /// Queues the sphere at `world` in `material`.
+    fn push(&self, queue: &mut DrawQueue, world: Mat4, material: MaterialId, translucent: bool) {
+        let (vb, ib) = self.mesh;
+        queue.push(Primitive {
+            call: DrawCall {
+                material,
+                topology: Topology::TriangleList,
+                vertex_buffer: vb,
+                geometry: Geometry::Indexed {
+                    buffer: ib,
+                    first: 0,
+                    count: self.count,
+                    base_vertex: 0,
+                },
+                world,
+                skin: None,
+                instances: None,
+            },
+            layer: Layer::WORLD,
+            translucent,
+            sort_origin: world.transform_point3(Vec3::ZERO),
+            user: 0,
+        });
     }
 }
 
