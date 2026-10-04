@@ -46,6 +46,9 @@ m2-alpha [options]
                          stands hit (unseen walls, steps in the ground)
   --fire                 with --aim, or --drive --look: fire just before the
                          picture
+  --grip attach|hands    draw weapons on the hand's attach node as posed
+                         (attach), or held as worked out from the hands
+                         (hands, the default)
   --mission              run the game's mission scripts: the first contract
                          starts as in the game, with its objectives and
                          markers on screen (log: m2-alpha-mission.log);
