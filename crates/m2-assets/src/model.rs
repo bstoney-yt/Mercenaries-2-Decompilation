@@ -8,7 +8,7 @@
 //! INFO  0x48 bytes                      header, below
 //! HIER  0xB0 bytes per node             node hierarchy
 //! MTRL  variable records                materials
-//! TINY  u32 n + 4 bytes * n             (optional) per-sub-object records, opaque
+//! TINY  u32 n + u32 * n                (optional) per sub-object, the layer entity it is
 //! BSHP  8 bytes per blend shape         (optional) {u32 name hash, u32 0}
 //! SEGM  4 bytes per segment             {u16 node, u8 geometry slot, u8 LOD mask}
 //! PHY2, STAM/, MIXR/                    (optional) collision, state machine and
@@ -793,7 +793,7 @@ pub struct Model<'a> {
     pub segments: Vec<Segment>,
     /// Name hashes of the blend shape channels (top-level `BSHP`).
     pub blend_shapes: Vec<u32>,
-    /// Top-level `TINY` data, opaque.
+    /// Top-level `TINY` data: see [`tiny_members`](Self::tiny_members).
     pub tiny: Option<&'a [u8]>,
     /// Indexed by geometry slot; `None` until its chunk is added.
     slots: Vec<Option<Geometry<'a>>>,
@@ -854,6 +854,14 @@ impl<'a> Model<'a> {
         };
         model.add_geom(&u, geom.ok_or(ModelError::MissingSection(*b"GEOM"))?)?;
         Ok(model)
+    }
+
+    /// The sub-objects of a merged batch (a `TINY` model): the id of the
+    /// layer entity each one is (its own building, placed in the static
+    /// layers), indexed by the `w` of the batch's vertex positions. Empty
+    /// on other models.
+    pub fn tiny_members(&self) -> Vec<u32> {
+        tiny_members(self.tiny.unwrap_or_default())
     }
 
     /// Adds a streamed chunk: an asset with the same name and type hash
@@ -1233,9 +1241,33 @@ fn parse_segments(segm: &[u8], info: &ModelInfo) -> Result<Vec<Segment>, ModelEr
         .collect()
 }
 
+/// The records of a `TINY` section: a count, then that many entity ids.
+fn tiny_members(tiny: &[u8]) -> Vec<u32> {
+    let Some(count) = tiny.get(..4) else {
+        return Vec::new();
+    };
+    let count = u32::from_le_bytes([count[0], count[1], count[2], count[3]]) as usize;
+    tiny[4..]
+        .chunks_exact(4)
+        .take(count)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_records_are_entity_ids() {
+        let mut tiny = 2u32.to_le_bytes().to_vec();
+        tiny.extend(0x0001_0419u32.to_le_bytes());
+        tiny.extend(0x0013_84ebu32.to_le_bytes());
+        tiny.extend([7, 7]);
+        assert_eq!(tiny_members(&tiny), [0x0001_0419, 0x0013_84eb]);
+        assert_eq!(tiny_members(&[]), []);
+        assert_eq!(tiny_members(&9u32.to_le_bytes()), []);
+    }
     use crate::testutil::{UcfxNode, ucfx};
     use crate::vertex::tests::{decl, f32_to_half};
     use crate::vertex::{DeclType::*, DeclUsage::*};

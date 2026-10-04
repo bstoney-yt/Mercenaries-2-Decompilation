@@ -17,7 +17,7 @@ use std::io::{Read, Seek};
 use m2_assets::model::{GeometryKind, Material, TOPOLOGY};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{Model, Ucfx};
-use m2_math::glam::{Mat4, Vec3};
+use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
     BackendError, BlendMode, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
     Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, SkinHandle, TextureDesc,
@@ -245,8 +245,21 @@ pub struct CpuModel {
     /// Groups left out because their vertex format isn't supported.
     pub skipped_groups: usize,
     /// Static collision in model space; [`from_data`](Self::from_data)
-    /// builds it, [`build`](Self::build) does not.
+    /// builds it, [`build`](Self::build) does not. A merged batch has none
+    /// of its own: its buildings' are in `members`.
     pub collision: Option<CollisionShape>,
+    /// The collision of a merged batch's buildings, one each.
+    pub members: Vec<MemberShape>,
+}
+
+/// The collision of one building of a merged batch (a `TINY` model).
+#[derive(Clone, Debug)]
+pub struct MemberShape {
+    pub shape: CollisionShape,
+    /// Where the shape goes: the building's own place in the world, when
+    /// it is its own model's `PHY2`; `None` for a shape cut from the
+    /// batch's geometry, which goes where the batch does.
+    pub placed: Option<(Vec3, Quat)>,
 }
 
 impl CpuModel {
@@ -330,6 +343,7 @@ impl CpuModel {
             bounds: (lo, hi),
             skipped_groups,
             collision: None,
+            members: Vec::new(),
         }
     }
 

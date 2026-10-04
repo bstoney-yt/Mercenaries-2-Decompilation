@@ -82,8 +82,8 @@ only) once item 11 lands.
 
 | Gap | Effect on alpha | Plan |
 |---|---|---|
-| Asset lookup by name | Solved: `m2_assets::name_hash` (FNV-1a over the name with bit 5 set in each byte, plus `*`) keys assets, string tables, text ids and script modules. Not yet used for: town batch models (render-triangle collision), the game's parked cars, voice sets | Look the town models, parked vehicles and voice sets up by name, in that order. |
-| Per-building collision | Some walls are triangle soup, not shapes | Same as above; triangle-mesh colliders in the physics library. |
+| Asset lookup by name | Solved: `m2_assets::name_hash` (FNV-1a over the name with bit 5 set in each byte, plus `*`) keys assets, string tables, text ids and script modules. Not yet used for: the game's parked cars, voice sets | Look parked vehicles and voice sets up by name. |
+| Per-building collision | Solved: a town batch (`TINY` model) names the static-layer entity of each building, the entity's name stems to its model, and that model's `PHY2` is placed where the entity stands (`WorldIndex::members`, `stream::batch_members`); a building whose model isn't found collides through its triangles of the batch | Check in town that walls and doorways match the drawn buildings. |
 | Parked cars | Vehicles are placed by us | Keep invented placement near roads (`Road` layer component). |
 | Soldier types, patrol routes | Every soldier looks and acts the same | Inspect the `Ai` layer component during item 10; otherwise invent. |
 | Mission scripts, objectives | First contract only | `--mission` runs the game's own scripts: VzaCon001 plays to completion in the alpha with objectives, markers and the scripts' jeeps and tank. Objective text is the game's own English strings; the scripts' helicopters, boats and supply crates aren't shown. |
