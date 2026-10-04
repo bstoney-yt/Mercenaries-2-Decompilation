@@ -15,7 +15,10 @@
 //!   carry and the techniques of the materials drawn with them;
 //! - terrain cell materials, terrain range shader hashes, terrain vertex
 //!   elements and what their vertex colours look like (blend weights?);
-//! - textures whose names mention roads or decals, and what uses them.
+//! - textures whose names mention roads or decals, and what uses them;
+//! - model materials by flags word and by trailing word: techniques, the
+//!   base texture's format, the opacity constant and example base textures
+//!   (to read which bits mean blending, cut-outs or two-sided faces).
 //!
 //! Every extra argument is a file of candidate names: a text file is read
 //! one name per line, anything else (`shader*.bin`) for its readable
@@ -99,6 +102,41 @@ struct Technique {
     effects: Tally<String>,
     /// Vertex signatures of those groups.
     decls: Tally<String>,
+}
+
+/// Per flags (or trailing) word: what its materials look like.
+#[derive(Default)]
+struct Usage {
+    count: usize,
+    techniques: Tally<String>,
+    base: Tally<String>,
+    opacity: Tally<String>,
+    names: Vec<String>,
+}
+
+impl Usage {
+    fn add(&mut self, textures: &HashMap<u32, Tex>, m: &Material, names: &HashMap<u32, String>) {
+        self.count += 1;
+        self.techniques
+            .add(format!("{:08x}{}", m.technique, named(names, m.technique)));
+        let base = m.textures.first().copied().unwrap_or(0);
+        self.base.add(describe_slot(textures, base));
+        self.opacity.add(format!("{}", m.constants[12]));
+        if let Some(t) = textures.get(&base)
+            && self.names.len() < 10
+            && !self.names.contains(&t.name)
+        {
+            self.names.push(t.name.clone());
+        }
+    }
+
+    fn print(&self, label: &str) {
+        println!("{label}: {} materials", self.count);
+        println!("    techniques [{}]", self.techniques.top(8));
+        println!("    base [{}]", self.base.top(8));
+        println!("    c12 [{}]", self.opacity.top(6));
+        println!("    e.g. {}", self.names.join(", "));
+    }
 }
 
 /// A texture name's last `_` token (`tt_sand01_n` -> `n`), or `-`.
@@ -350,6 +388,8 @@ fn run(path: &str, name_files: &[String]) -> AnyResult<()> {
     let mut format_ids: HashSet<u32> = HashSet::new();
     let mut material_names: HashSet<u32> = HashSet::new();
     let mut tails = Tally::default();
+    let mut by_flags: BTreeMap<u16, Usage> = BTreeMap::new();
+    let mut by_tail: BTreeMap<u32, Usage> = BTreeMap::new();
     let mut model_errors = 0;
     let mut road_users: HashMap<u32, usize> = HashMap::new();
     // Groups the renderer cannot lay out (so the alpha skips them).
@@ -367,6 +407,14 @@ fn run(path: &str, name_files: &[String]) -> AnyResult<()> {
         for m in &model.materials {
             material_names.insert(m.name_hash);
             tails.add(format!("{:08x}", m.unk_tail));
+            by_flags
+                .entry(m.flags)
+                .or_default()
+                .add(&textures, m, &names);
+            by_tail
+                .entry(m.unk_tail)
+                .or_default()
+                .add(&textures, m, &names);
             for &t in &m.textures {
                 *road_users.entry(t).or_default() += 1;
             }
@@ -420,6 +468,14 @@ fn run(path: &str, name_files: &[String]) -> AnyResult<()> {
     order.sort_by_key(|t| std::cmp::Reverse(t.1.count));
     for (id, t) in order {
         t.print(*id, &names);
+    }
+    println!("\n== model materials by flags");
+    for (f, u) in &by_flags {
+        u.print(&format!("flags {f:#06x}"));
+    }
+    println!("\n== model materials by trailing word");
+    for (t, u) in &by_tail {
+        u.print(&format!("tail {t:08x}{}", named(&names, *t)));
     }
 
     // Terrain.

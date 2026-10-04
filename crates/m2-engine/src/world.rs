@@ -801,10 +801,11 @@ impl TerrainMesh {
         first
     }
 
-    /// Adds every triangle of `group`, each with the surface its material
-    /// range names (`surface(material index)`), into `buckets` (per
-    /// surface, its triangles); full ranges draw it all with `fallback`
-    /// when the group has no material ranges.
+    /// Adds the finest level of detail of `group`, each triangle with the
+    /// surface its material range names (`surface(material index)`), into
+    /// `buckets` (per surface, its triangles); the first full range draws
+    /// it all with `fallback` when the group has no material ranges. The
+    /// coarser levels lie over the same ground and are left out.
     #[allow(clippy::too_many_arguments)]
     fn add_group(
         &mut self,
@@ -818,10 +819,15 @@ impl TerrainMesh {
     ) {
         let count = group.positions().len();
         let ranges: Vec<_> = if group.material_ranges.is_empty() {
-            group.full_ranges.iter().map(|r| (r, fallback)).collect()
+            group
+                .full_ranges
+                .iter()
+                .take(1)
+                .map(|r| (r, fallback))
+                .collect()
         } else {
             group
-                .material_ranges
+                .lod_ranges(0)
                 .iter()
                 .map(|r| (r, surface(r.material).unwrap_or(fallback)))
                 .collect()
@@ -994,6 +1000,14 @@ pub fn terrain_cell<R: Read + Seek>(
             TerrainSurface::Surface(_) => UvSource::Own,
         })
         .collect();
+    // Materials that draw alike share one range (cells repeat them).
+    let same: Vec<usize> = (0..mesh.surfaces.len())
+        .map(|i| {
+            (0..i)
+                .find(|&j| mesh.surfaces[j] == mesh.surfaces[i])
+                .unwrap_or(i)
+        })
+        .collect();
     let mut buckets = HashMap::new();
     let mut seen = HashSet::new();
     for patch in &cell.patches {
@@ -1003,7 +1017,7 @@ pub fn terrain_cell<R: Read + Seek>(
                 g,
                 offset,
                 centre,
-                |m| sources.get(m as usize).map(|&s| (m as usize, s)),
+                |m| sources.get(m as usize).map(|&s| (same[m as usize], s)),
                 (fallback, UvSource::CellMap),
                 &mut buckets,
                 &mut seen,
