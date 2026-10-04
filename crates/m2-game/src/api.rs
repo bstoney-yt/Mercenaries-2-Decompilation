@@ -210,7 +210,7 @@ fn num(v: Option<&Value>) -> Option<f32> {
 }
 
 fn guid_value(g: Option<u32>) -> Value {
-    g.map_or(Value::Nil, |g| Value::Integer(i64::from(g)))
+    g.map_or(Value::Nil, |g| Value::Number(f64::from(g)))
 }
 
 fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
@@ -293,7 +293,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             position,
             yaw,
         });
-        values([Value::Integer(i64::from(guid))])
+        values([Value::Number(f64::from(guid))])
     })?;
 
     let object = lib("Object")?;
