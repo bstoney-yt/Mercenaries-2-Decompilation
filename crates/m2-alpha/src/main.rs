@@ -51,6 +51,7 @@ mod sound;
 mod startup;
 mod ui;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -423,10 +424,14 @@ fn build_scene(
     }
     let (eye, target) = scene.focus;
     let mut game = Game::new(scene, FlyCamera::looking_at(eye, target));
-    // Free roam: the island's vehicles stand where the game's start-up
-    // layers put them (with `--mission` the scripts' own layers do).
-    if let (Some(install), Mode::Island(_), false) = (install, mode, mission) {
-        game.startup = Some(startup::Startup::start(install));
+    if let (Some(install), Mode::Island(_)) = (install, mode) {
+        // A state layer's people wait for the scripts to load it.
+        game.scene.people.state_layers = Some(HashSet::new());
+        // Free roam: the island's vehicles stand where the game's start-up
+        // layers put them (with `--mission` the scripts' own layers do).
+        if !mission {
+            game.startup = Some(startup::Startup::start(install));
+        }
     }
     Ok(game)
 }

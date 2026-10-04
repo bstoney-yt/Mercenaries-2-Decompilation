@@ -116,8 +116,18 @@ impl Game {
         }
         let Some(s) = &mut self.startup else { return };
         s.poll();
-        let Startup::Ready(set) = s else { return };
+        let set = match s {
+            Startup::Ready(set) => set,
+            // Not knowing which, every state layer's people stand.
+            Startup::Failed => {
+                self.props_up = true;
+                self.scene.people.state_layers = None;
+                return;
+            }
+            Startup::Loading(_) => return,
+        };
         self.props_up = true;
+        self.scene.people.state_layers = Some(set.hashes.clone());
         let shown = self.scene.show_props(set.entities.iter().map(|e| e.entity));
         eprintln!("start-up state layers: {shown} models put up");
     }

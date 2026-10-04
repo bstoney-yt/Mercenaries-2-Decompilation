@@ -39,7 +39,7 @@
 //!
 //! ```text
 //! Transform  f32 x 4 position (w unused), f32 x 4 rotation (x, y, z, w),
-//!            u32 unknown, u16 packed bitfields
+//!            u32 Parent (the entity's template), u16 packed bitfields
 //! Name       cstr name, u8 unknown
 //! ```
 //!
@@ -185,7 +185,12 @@ pub struct Placement {
     pub position: [f32; 3],
     /// (x, y, z, w).
     pub rotation: [f32; 4],
-    pub unk_0x20: u32,
+    /// The `Parent` field (named by its hash): the template the entity is
+    /// an instance of, by its id in the template database (bit 31 set,
+    /// as the database's `UNIQ` ids have). An entity renamed in the
+    /// editor (`vza001_gate`) names no template, and may carry no
+    /// components of its own: what it is comes from here.
+    pub parent: u32,
     pub flags: u16,
 }
 
@@ -341,7 +346,7 @@ impl<'a> Layer<'a> {
                     Placement {
                         position: [f(4), f(8), f(12)],
                         rotation: [f(20), f(24), f(28), f(32)],
-                        unk_0x20: u32::from_le_bytes([r[36], r[37], r[38], r[39]]),
+                        parent: u32::from_le_bytes([r[36], r[37], r[38], r[39]]),
                         flags: u16::from_le_bytes([r[40], r[41]]),
                     },
                 )
@@ -466,7 +471,7 @@ mod tests {
         let p = l.placements()[&11];
         assert_eq!(p.position, [-3400.0, 5.0, -3800.0]);
         assert_eq!(p.rotation, [0.0, 0.0, 0.0, 1.0]);
-        assert_eq!(p.unk_0x20, 0x8000_6911);
+        assert_eq!(p.parent, 0x8000_6911);
         // Strings make Name variable-size.
         assert!(l.component("Name").unwrap().records().is_none());
         assert!(l.hashes("Missing").is_empty());
