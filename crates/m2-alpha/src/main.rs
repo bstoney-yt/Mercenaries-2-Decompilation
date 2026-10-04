@@ -95,6 +95,8 @@ struct Options {
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
     fight: bool,
+    /// With `--screenshot`: how many of the nearest spawns to list.
+    list_spawns: usize,
     /// With `--fight`: seconds to wait after it before the picture.
     fight_wait: f32,
     mission: bool,
@@ -170,6 +172,7 @@ fn parse_args() -> anyhow::Result<Options> {
                     std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
                 o.mission_drivers.push((path, code));
             }
+            "--spawns" => o.list_spawns = value()?.parse().context("--spawns expects a count")?,
             "--fight-wait" => {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
@@ -511,9 +514,9 @@ fn screenshot(
         // Where the soldiers' spawns are, for checking placement.
         let focus = game.focus();
         let spawns = &world.index.spawns;
-        let mut near: Vec<(f32, &str)> = spawns
+        let mut near: Vec<(f32, &m2_engine::world::SpawnPoint)> = spawns
             .iter()
-            .map(|s| (s.position.distance(focus), s.name.as_str()))
+            .map(|s| (s.position.distance(focus), s))
             .collect();
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         eprintln!(
@@ -525,10 +528,26 @@ fn screenshot(
                 .count(),
             near.iter()
                 .take(6)
-                .map(|(d, n)| format!("{n:?} {d:.0} m"))
+                .map(|(d, s)| format!("{:?} {d:.0} m", s.name))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        for (d, s) in near.iter().take(options.list_spawns) {
+            eprintln!(
+                "  spawn {:08x} {:?} {d:.0} m at {:.0}, {} route points, {}",
+                s.entity,
+                s.name,
+                s.position,
+                s.route.len(),
+                if people.kind_for(&s.name).is_some() {
+                    "a soldier"
+                } else if people.mission_soldiers.contains(&s.entity) {
+                    "a mission soldier"
+                } else {
+                    "nobody"
+                }
+            );
+        }
     }
     let mut link = None;
     if options.mission
