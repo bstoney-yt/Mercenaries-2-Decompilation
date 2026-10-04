@@ -7,7 +7,7 @@
 //! the game's: damage, fire rates, accuracy, blast radius and health are
 //! guesses.
 
-use m2_engine::{GpuModel, Physics, Skeleton};
+use m2_engine::{GpuModel, Physics, Skeleton, VehicleId};
 use m2_math::glam::{Mat4, Quat, Vec3};
 
 use crate::npc::People;
@@ -31,6 +31,16 @@ const AIM_AFTER_SHOT: f32 = 0.6;
 const FLASH_TIME: f32 = 0.05;
 const RIFLE_FLASH: f32 = 0.3;
 const RPG_FLASH: f32 = 0.7;
+const MG_FLASH: f32 = 0.45;
+const CANNON_FLASH: f32 = 2.2;
+/// Vehicle guns: a tank's cannon (seconds to reload, shell speed m/s)
+/// and the machine gun on anything else with a turret (seconds between
+/// rounds, damage, range). Invented, like the rest of the rules.
+const CANNON_RELOAD: f32 = 2.5;
+const SHELL_SPEED: f32 = 150.0;
+const MG_GAP: f32 = 0.09;
+const MG_DAMAGE: f32 = 45.0;
+const MG_RANGE: f32 = 500.0;
 /// Gunfire puts soldiers this close on alert and sends civilians running.
 const ALERT_RANGE: f32 = 60.0;
 const PANIC_RANGE: f32 = 40.0;
@@ -306,10 +316,14 @@ pub enum Remark {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Projectile {
+    /// A rocket, or a tank's shell (no smoke trail, drawn as a streak),
+    /// passing through the vehicle that fired it.
     Rocket {
         at: Vec3,
         velocity: Vec3,
         flown: f32,
+        shell: bool,
+        owner: Option<VehicleId>,
     },
     Grenade {
         at: Vec3,
@@ -461,9 +475,10 @@ pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
 impl Combat {
     /// Rockets and grenades in flight: (is a rocket, where, velocity).
     pub fn projectiles(&self) -> impl Iterator<Item = (bool, Vec3, Vec3)> + '_ {
-        self.projectiles.iter().map(|p| match *p {
-            Projectile::Rocket { at, velocity, .. } => (true, at, velocity),
-            Projectile::Grenade { at, velocity, .. } => (false, at, velocity),
+        self.projectiles.iter().filter_map(|p| match *p {
+            Projectile::Rocket { shell: true, .. } => None,
+            Projectile::Rocket { at, velocity, .. } => Some((true, at, velocity)),
+            Projectile::Grenade { at, velocity, .. } => Some((false, at, velocity)),
         })
     }
 
@@ -538,6 +553,13 @@ impl Combat {
                 self.throw(f);
             }
         }
+        if let Some(i) = f.player.driving
+            && self.down <= 0.0
+            && trigger.fire
+            && self.reload <= 0.0
+        {
+            self.vehicle_fire(f, i);
+        }
         let holding = on_foot && (trigger.aim || self.aim_left > 0.0);
         f.player.aiming = holding;
 
@@ -569,7 +591,7 @@ impl Combat {
         player: &Player,
     ) -> Option<(f32, Option<usize>)> {
         let (from, dir) = Self::aim_ray(player);
-        cast_shot(physics, people, from, dir, RIFLE_RANGE, None)
+        cast_shot(physics, people, from, dir, RIFLE_RANGE, None, None)
     }
 
     /// A weapon's muzzle in her hands, or her chest.
@@ -594,7 +616,7 @@ impl Combat {
         self.reload = RIFLE_GAP;
         self.aim_left = AIM_AFTER_SHOT;
         let (eye, dir) = Self::aim_ray(f.player);
-        let hit = cast_shot(f.physics, f.people, eye, dir, RIFLE_RANGE, None);
+        let hit = cast_shot(f.physics, f.people, eye, dir, RIFLE_RANGE, None, None);
         let to = hit.map_or(eye + dir * RIFLE_RANGE, |h| eye + dir * h.0);
         let from = Self::muzzle(f, f.arsenal.rifle.as_ref());
         self.effect(Effect::Tracer { from, to }, 0.07);
@@ -608,17 +630,7 @@ impl Combat {
         );
         self.sounds.push(Sound::Shot(from));
         if let Some((t, None)) = hit {
-            let at = eye + dir * t;
-            for e in f.explosives.iter_mut() {
-                if !e.gone && e.at.distance(at) < e.size + HIT_SLACK {
-                    e.hp -= RIFLE_DAMAGE;
-                    if e.hp <= 0.0 {
-                        e.gone = true;
-                        self.fuses.push((e.at, CHAIN_DELAY));
-                        self.fires.push((e.at, e.size, BURN, 0.0));
-                    }
-                }
-            }
+            self.hit_explosives_in(f.explosives, eye + dir * t, RIFLE_DAMAGE);
         }
         if let Some((_, Some(i))) = hit {
             let soldier = f.people.npcs[i].soldier;
@@ -652,7 +664,15 @@ impl Combat {
                 self.random() * spread * 2.0,
             ))
         .normalize_or_zero();
-        let hit = cast_shot(f.physics, f.people, from, dir, distance + 2.0, Some(i));
+        let hit = cast_shot(
+            f.physics,
+            f.people,
+            from,
+            dir,
+            distance + 2.0,
+            Some(i),
+            None,
+        );
         let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
         self.effect(Effect::Tracer { from, to: end }, 0.07);
         self.effect(
@@ -729,7 +749,7 @@ impl Combat {
         let (eye, dir) = Self::aim_ray(f.player);
         let from = Self::muzzle(f, f.arsenal.rpg.as_ref());
         // Aim the rocket from the launcher at what the crosshair is on.
-        let goal = cast_shot(f.physics, f.people, eye, dir, ROCKET_RANGE, None)
+        let goal = cast_shot(f.physics, f.people, eye, dir, ROCKET_RANGE, None, None)
             .map_or(eye + dir * ROCKET_RANGE, |h| eye + dir * h.0);
         let velocity = (goal - from).normalize_or(dir) * ROCKET_SPEED;
         self.last_launch = Some((from, goal));
@@ -737,6 +757,8 @@ impl Combat {
             at: from,
             velocity,
             flown: 0.0,
+            shell: false,
+            owner: None,
         });
         self.effect(
             Effect::Flash {
@@ -757,6 +779,94 @@ impl Combat {
         );
         self.sounds.push(Sound::Launch(from));
         alarm(f.people, f.player.character.position);
+    }
+
+    /// Fires the gun on the turret of vehicle `i`, which she drives, at
+    /// what the crosshair is on: a tank's cannon fires a shell that bursts
+    /// like a rocket, anything else's a machine gun.
+    fn vehicle_fire(&mut self, f: &mut Field<'_>, i: usize) {
+        let Some(v) = f.vehicles.get(i) else {
+            return;
+        };
+        let (Some(id), Some(muzzle), false) = (v.id, v.spec.muzzle, v.wrecked) else {
+            return;
+        };
+        let Some(body) = f.physics.vehicle_transform(id) else {
+            return;
+        };
+        let cannon = v.spec.kind == "tank";
+        let from =
+            body.transform_point3(v.spec.turret_transform(v.turret).transform_point3(muzzle));
+        let (eye, dir) = Self::aim_ray(f.player);
+        let goal = cast_shot(f.physics, f.people, eye, dir, MG_RANGE, None, Some(id))
+            .map_or(eye + dir * MG_RANGE, |h| eye + dir * h.0);
+        let aim = (goal - from).normalize_or(dir);
+        if cannon {
+            self.reload = CANNON_RELOAD;
+            self.projectiles.push(Projectile::Rocket {
+                at: from,
+                velocity: aim * SHELL_SPEED,
+                flown: 0.0,
+                shell: true,
+                owner: Some(id),
+            });
+            self.effect(
+                Effect::Flash {
+                    at: from,
+                    dir: aim,
+                    size: CANNON_FLASH,
+                },
+                FLASH_TIME * 2.0,
+            );
+            self.effect(
+                Effect::Smoke {
+                    at: from + aim * 1.5,
+                    size: 1.5,
+                },
+                1.5,
+            );
+            self.sounds.push(Sound::Launch(from));
+        } else {
+            self.reload = MG_GAP;
+            let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
+            let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
+            self.effect(Effect::Tracer { from, to }, 0.07);
+            self.effect(
+                Effect::Flash {
+                    at: from,
+                    dir: aim,
+                    size: MG_FLASH,
+                },
+                FLASH_TIME,
+            );
+            self.sounds.push(Sound::Shot(from));
+            if let Some((_, Some(j))) = hit {
+                let soldier = f.people.npcs[j].soldier;
+                if f.people.npcs[j].hurt(MG_DAMAGE, aim * SHOT_PUSH) && soldier {
+                    self.remarks.push(Remark::Kill);
+                }
+                self.hits += 1;
+            }
+            if let Some((t, None)) = hit {
+                self.hit_explosives_in(f.explosives, from + aim * t, MG_DAMAGE);
+            }
+        }
+        alarm(f.people, from);
+    }
+
+    /// A round landing at `at` hurts the explosive it hits, which goes up
+    /// (after a moment) once spent.
+    fn hit_explosives_in(&mut self, explosives: &mut [Explosive], at: Vec3, damage: f32) {
+        for e in explosives.iter_mut() {
+            if !e.gone && e.at.distance(at) < e.size + HIT_SLACK {
+                e.hp -= damage;
+                if e.hp <= 0.0 {
+                    e.gone = true;
+                    self.fuses.push((e.at, CHAIN_DELAY));
+                    self.fires.push((e.at, e.size, BURN, 0.0));
+                }
+            }
+        }
     }
 
     fn throw(&mut self, f: &mut Field<'_>) {
@@ -781,22 +891,29 @@ impl Combat {
             *left > 0.0
         });
         let mut puffs = Vec::new();
+        let mut streaks = Vec::new();
         self.projectiles.retain_mut(|p| match p {
             Projectile::Rocket {
                 at,
                 velocity,
                 flown,
+                shell,
+                owner,
             } => {
                 let step = *velocity * dt;
                 let len = step.length();
-                let hit = cast_shot(f.physics, f.people, *at, step, len, None);
+                let hit = cast_shot(f.physics, f.people, *at, step, len, None, *owner);
                 if let Some((d, _)) = hit {
                     blasts.push(*at + step.normalize_or_zero() * d);
                     return false;
                 }
+                if *shell {
+                    streaks.push((*at, *at + step));
+                } else {
+                    puffs.push(*at);
+                }
                 *at += step;
                 *flown += len;
-                puffs.push(*at);
                 if *flown > ROCKET_RANGE {
                     blasts.push(*at);
                     return false;
@@ -822,6 +939,9 @@ impl Combat {
         });
         for at in puffs {
             self.effect(Effect::Smoke { at, size: 0.4 }, 0.8);
+        }
+        for (from, to) in streaks {
+            self.effect(Effect::Tracer { from, to }, dt * 1.5);
         }
         for at in blasts {
             self.explode(f, at);
@@ -978,6 +1098,7 @@ fn cast_shot(
     dir: Vec3,
     far: f32,
     skip: Option<usize>,
+    own: Option<VehicleId>,
 ) -> Option<(f32, Option<usize>)> {
     let dir = dir.normalize_or_zero();
     let mut best: Option<(f32, Option<usize>)> = None;
@@ -995,7 +1116,11 @@ fn cast_shot(
         }
     }
     let limit = best.map_or(far, |b| b.0);
-    if let Some((t, _)) = physics.cast_ray(origin, dir, limit) {
+    let world = match own {
+        Some(v) => physics.cast_ray_past(origin, dir, limit, v),
+        None => physics.cast_ray(origin, dir, limit),
+    };
+    if let Some((t, _)) = world {
         best = Some((t, None));
     }
     best

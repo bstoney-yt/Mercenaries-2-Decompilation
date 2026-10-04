@@ -199,7 +199,14 @@ pub struct VehicleSpec {
     /// Where the turret turns about, model space, when its mount node sits
     /// off the turret (else the mount).
     pub pivot: Option<Vec3>,
+    /// The turret gun's muzzle, model space, with the turret straight
+    /// ahead: a muzzle marker on the turret, else the front of the turret
+    /// part reaching furthest forward (the barrel).
+    pub muzzle: Option<Vec3>,
 }
+
+/// Node name hash of a gun's muzzle marker (the hand weapons have it).
+pub const GUN_MUZZLE: u32 = 0xb148_6ef3;
 
 /// The node a turret turns about, in every vehicle that has one: both the
 /// intact and the wrecked turret hang from it.
@@ -297,17 +304,20 @@ impl VehicleSpec {
                 false
             })
             .collect();
+        let on_turret = |node: u16| turret.get(usize::from(node)).copied().unwrap_or(false);
+        let boxes = if mount.is_some() {
+            vehicle::node_boxes(model)
+        } else {
+            Vec::new()
+        };
         // Some mounts sit away from their turret (the Stryker's, off the
         // ring): turn about the middle of the turret's biggest part instead.
         let pivot = mount.and_then(|m| {
             let at = model.node_to_model(m as u16)?.w_axis.truncate();
-            let b = vehicle::node_boxes(model)
-                .into_iter()
-                .filter(|b| turret.get(usize::from(b.node)).copied().unwrap_or(false))
-                .max_by(|a, b| {
-                    let area = |b: &vehicle::NodeBox| (b.max[0] - b.min[0]) * (b.max[2] - b.min[2]);
-                    area(a).total_cmp(&area(b))
-                })?;
+            let b = boxes.iter().filter(|b| on_turret(b.node)).max_by(|a, b| {
+                let area = |b: &vehicle::NodeBox| (b.max[0] - b.min[0]) * (b.max[2] - b.min[2]);
+                area(a).total_cmp(&area(b))
+            })?;
             let inside =
                 (b.min[0]..=b.max[0]).contains(&at.x) && (b.min[2]..=b.max[2]).contains(&at.z);
             (!inside).then(|| {
@@ -318,6 +328,24 @@ impl VehicleSpec {
                 )
             })
         });
+        let muzzle = model
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(i, n)| n.name_hash == GUN_MUZZLE && on_turret(*i as u16))
+            .and_then(|(i, _)| model.node_to_model(i as u16))
+            .map(|m| m.w_axis.truncate())
+            .or_else(|| {
+                let b = boxes
+                    .iter()
+                    .filter(|b| on_turret(b.node))
+                    .max_by(|a, b| a.max[2].total_cmp(&b.max[2]))?;
+                Some(Vec3::new(
+                    (b.min[0] + b.max[0]) * 0.5,
+                    (b.min[1] + b.max[1]) * 0.5,
+                    b.max[2],
+                ))
+            });
         let marker = |h| vehicle::marker(model, h).map(Vec3::from);
         let mass = match entry.kind.as_str() {
             "car" => 1400.0,
@@ -342,6 +370,22 @@ impl VehicleSpec {
             mass,
             turret,
             pivot,
+            muzzle,
+        })
+    }
+
+    /// How the turret's nodes move with the turret turned `turret`
+    /// radians (anticlockwise from above): about the pivot, or its mount.
+    pub fn turret_transform(&self, turret: f32) -> Mat4 {
+        let mount = self.pivot.or_else(|| {
+            self.turret
+                .iter()
+                .zip(&self.rest)
+                .find(|(on, _)| **on)
+                .map(|(_, m)| m.w_axis.truncate())
+        });
+        mount.map_or(Mat4::IDENTITY, |at| {
+            Mat4::from_translation(at) * Mat4::from_rotation_y(turret) * Mat4::from_translation(-at)
         })
     }
 
@@ -380,16 +424,7 @@ impl VehicleSpec {
                 })
                 .collect()
         };
-        let mount = self.pivot.or_else(|| {
-            self.turret
-                .iter()
-                .zip(&self.rest)
-                .find(|(on, _)| **on)
-                .map(|(_, m)| m.w_axis.truncate())
-        });
-        let aim = mount.map_or(Mat4::IDENTITY, |at| {
-            Mat4::from_translation(at) * Mat4::from_rotation_y(turret) * Mat4::from_translation(-at)
-        });
+        let aim = self.turret_transform(turret);
         self.rest
             .iter()
             .zip(&self.node_wheel)
@@ -443,6 +478,7 @@ mod tests {
             mass: 1400.0,
             turret: vec![false, false],
             pivot: None,
+            muzzle: None,
         }
     }
 
@@ -460,6 +496,28 @@ mod tests {
         let barrel = posed[3].w_axis.truncate();
         assert!(barrel.abs_diff_eq(mount + Vec3::X * 2.0, 1e-5), "{barrel}");
         assert_eq!(posed[0], s.rest[0], "the hull stays");
+    }
+
+    #[test]
+    fn the_gun_muzzle_turns_with_the_turret() {
+        let mut s = spec();
+        let mount = Vec3::new(0.0, 1.5, -0.5);
+        s.rest.push(Mat4::from_translation(mount));
+        s.node_wheel.push(None);
+        s.turret = vec![false, false, true];
+        s.muzzle = Some(mount + Vec3::new(0.0, 0.3, 3.0));
+        let quarter = s.turret_transform(std::f32::consts::FRAC_PI_2);
+        let at = quarter.transform_point3(s.muzzle.unwrap());
+        assert!(
+            at.abs_diff_eq(mount + Vec3::new(3.0, 0.3, 0.0), 1e-5),
+            "{at}"
+        );
+        // Turned about the pivot instead when there is one.
+        s.pivot = Some(Vec3::new(0.0, 1.5, 0.5));
+        let at = s
+            .turret_transform(std::f32::consts::PI)
+            .transform_point3(Vec3::new(0.0, 1.8, 2.5));
+        assert!(at.abs_diff_eq(Vec3::new(0.0, 1.8, -1.5), 1e-5), "{at}");
     }
 
     #[test]
