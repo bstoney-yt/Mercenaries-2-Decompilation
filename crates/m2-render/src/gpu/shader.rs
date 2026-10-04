@@ -16,9 +16,10 @@ struct Frame {
     eye: vec4<f32>,
     sun_dir: vec4<f32>,
     sun_color: vec4<f32>,
-    ambient: vec4<f32>,
     // rgb: sky and fog colour, a: fog density per metre
     sky: vec4<f32>,
+    // Ambient light from +x, -x, +y, -y, +z, -z
+    ambient_cube: array<vec4<f32>, 6>,
 };
 
 struct Draw {
@@ -50,6 +51,9 @@ struct Material {
     layer_uv: array<vec4<f32>, 8>,
     // rgb: emitted colour (0: none), w: scaled by the specular map's texel
     emissive: vec4<f32>,
+    // x: reflection strength (0: none), y: Fresnel reflectance facing the
+    // eye (negative: no Fresnel)
+    reflection: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -79,6 +83,25 @@ struct Varyings {
 "#;
 
 const FRAGMENT: &str = r#"
+// The game's ambient cube: each axis's face, picked by the normal's sign,
+// weighted by that component squared.
+fn ambient_light(n: vec3<f32>) -> vec3<f32> {
+    let n2 = n * n;
+    return n2.x * select(frame.ambient_cube[1], frame.ambient_cube[0], n.x >= 0.0).rgb
+        + n2.y * select(frame.ambient_cube[3], frame.ambient_cube[2], n.y >= 0.0).rgb
+        + n2.z * select(frame.ambient_cube[5], frame.ambient_cube[4], n.z >= 0.0).rgb;
+}
+
+// What a reflection sees along r, standing in for the game's environment
+// cube: sky above, paler towards the horizon, the ground's light below.
+fn environment(r: vec3<f32>) -> vec3<f32> {
+    let horizon = mix(frame.sky.rgb, vec3<f32>(1.0), 0.35);
+    if r.y >= 0.0 {
+        return mix(horizon, frame.sky.rgb, sqrt(r.y));
+    }
+    return mix(horizon * 0.6, frame.ambient_cube[3].rgb, sqrt(-r.y));
+}
+
 fn layer_uv(i: u32, p: vec4<f32>) -> vec2<f32> {
     return vec2<f32>(dot(material.layer_uv[i * 2u], p), dot(material.layer_uv[i * 2u + 1u], p));
 }
@@ -128,6 +151,9 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     }
     let spec_texel = textureSample(specular_map, base_sampler, v.uv).rgb;
     let normal_texel = textureSample(normal_map, base_sampler, v.uv);
+    // Highlight and reflection, added after any ambient occlusion.
+    var shine = vec3<f32>(0.0);
+    var spec_light = vec3<f32>(0.0);
     if material.params.y > 0.5 {
         var n = v.normal;
         if !front {
@@ -149,31 +175,43 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         n = normalize(n);
         let l = -normalize(frame.sun_dir.xyz);
         let n_dot_l = dot(n, l);
+        let view = normalize(frame.eye.xyz - v.world_pos);
         var lit: vec3<f32>;
         if ground {
-            lit = rgb * (frame.sun_color.rgb * max(n_dot_l, 0.0) + frame.ambient.rgb);
+            lit = rgb * (frame.sun_color.rgb * max(n_dot_l, 0.0) + ambient_light(n));
         } else {
             let direct = clamp(frame.sun_color.rgb * max(n_dot_l, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
-            lit = rgb * (direct * material.direct.rgb + frame.ambient.rgb * material.ambient.rgb);
+            lit = rgb * (direct * material.direct.rgb + ambient_light(n) * material.ambient.rgb);
+        }
+        var tint = vec3<f32>(1.0);
+        if material.maps.x > 0.5 {
+            tint = spec_texel;
         }
         if dot(material.specular.rgb, material.specular.rgb) > 0.0 && n_dot_l > 0.0 {
             // Blinn-Phong, never shadowed below a quarter.
-            let view = normalize(frame.eye.xyz - v.world_pos);
             let h = normalize(l + view);
-            var strength = material.specular.rgb;
-            if material.maps.x > 0.5 {
-                strength = strength * spec_texel;
-            }
             let n_dot_h = dot(n, h);
             if n_dot_h > 0.0 {
-                lit = lit + frame.sun_color.rgb * strength * pow(n_dot_h, material.specular.a);
+                spec_light = frame.sun_color.rgb * material.specular.rgb * tint * pow(n_dot_h, material.specular.a);
             }
+        }
+        shine = spec_light;
+        if material.reflection.x > 0.0 {
+            // The view mirrored in the surface, through the specular map;
+            // metal weights it by Schlick's Fresnel.
+            var strength = material.reflection.x;
+            if material.reflection.y >= 0.0 {
+                let f0 = material.reflection.y;
+                strength = strength * (f0 + (1.0 - f0) * pow(1.0 - max(dot(n, view), 0.0), 5.0));
+            }
+            shine = shine + environment(reflect(-view, n)) * tint * strength;
         }
         rgb = lit;
     }
     if ao {
         rgb = rgb * v.color.rgb;
     }
+    rgb = rgb + shine;
     // Light the surface gives off, on top of what it reflects.
     var glow = material.emissive.rgb;
     if material.emissive.w > 0.5 {
@@ -184,7 +222,8 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         let f = exp(-frame.sky.a * dist);
         rgb = mix(frame.sky.rgb, rgb, f);
     }
-    var alpha = base.a;
+    // Bright highlights make glass more opaque, as the game's shaders have it.
+    var alpha = clamp(max(base.a, dot(spec_light, vec3<f32>(0.299, 0.587, 0.114))), 0.0, 1.0);
     if material.detail.z > 0.5 {
         let facing = abs(dot(normalize(v.normal), normalize(frame.eye.xyz - v.world_pos)));
         alpha = alpha * facing * facing;

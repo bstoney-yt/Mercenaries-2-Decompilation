@@ -43,6 +43,6 @@ pub use key::{Layer, MaterialId, SortKey};
 pub use null::{Command, NullBackend, RecordingBackend};
 pub use queue::{DrawQueue, Primitive, QueueError, SubmitStats};
 pub use texture::{
-    BlendMode, DetailMap, Emissive, MaterialDesc, NormalMap, Specular, TerrainLayer, TextureDesc,
-    TextureFormat, generate_mips,
+    BlendMode, DetailMap, Emissive, MaterialDesc, NormalMap, Reflection, Specular, TerrainLayer,
+    TextureDesc, TextureFormat, generate_mips,
 };

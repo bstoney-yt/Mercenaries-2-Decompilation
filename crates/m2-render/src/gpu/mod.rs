@@ -175,8 +175,8 @@ struct FrameUniforms {
     eye: [f32; 4],
     sun_dir: [f32; 4],
     sun_color: [f32; 4],
-    ambient: [f32; 4],
     sky: [f32; 4],
+    ambient_cube: [[f32; 4]; 6],
 }
 
 #[repr(C)]
@@ -200,6 +200,9 @@ struct MaterialUniforms {
     layer_uv: [[f32; 4]; 8],
     /// rgb: emitted colour (0: none), w: from the specular map's slot.
     emissive: [f32; 4],
+    /// x: reflection strength (0: none), y: Fresnel reflectance facing
+    /// the eye (negative: none).
+    reflection: [f32; 4],
 }
 
 /// Texture views a material binds besides its uniforms.
@@ -734,6 +737,10 @@ impl WgpuBackend {
                 Some(e) => [e.color[0], e.color[1], e.color[2], flag(e.map.is_some())],
                 None => [0.0; 4],
             },
+            reflection: match desc.reflection {
+                Some(r) => [r.strength, r.fresnel.unwrap_or(-1.0), 0.0, 0.0],
+                None => [0.0, -1.0, 0.0, 0.0],
+            },
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("material uniforms"),
@@ -1039,8 +1046,8 @@ impl WgpuBackend {
             eye: view.eye().extend(1.0).to_array(),
             sun_dir: l.sun_direction.extend(0.0).to_array(),
             sun_color: l.sun_color.extend(0.0).to_array(),
-            ambient: l.ambient.extend(0.0).to_array(),
             sky: l.sky_color.extend(l.fog_density).to_array(),
+            ambient_cube: l.ambient_cube.map(|c| c.extend(0.0).to_array()),
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
