@@ -136,7 +136,7 @@ pub struct Npc {
     /// The aim and fall clips in this person's rig.
     clips: FightClips,
     /// The hand nodes (right, left), where the rifle is held.
-    pub hands: Option<(usize, usize)>,
+    pub hands: Option<crate::combat::Hands>,
     /// Seconds since they died.
     dead_for: f32,
     /// Has shouted since they were last calm.

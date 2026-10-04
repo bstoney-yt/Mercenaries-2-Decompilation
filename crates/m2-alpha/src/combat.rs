@@ -74,8 +74,8 @@ pub struct Arsenal {
     pub rpg: Option<WeaponModel>,
     pub rocket: Option<WeaponModel>,
     pub grenade: Option<WeaponModel>,
-    /// The hands' nodes (right, left) in the human skeleton.
-    pub hands: Option<(usize, usize)>,
+    /// The hands' and pelvis's nodes in the human skeleton.
+    pub hands: Option<Hands>,
 }
 
 impl Arsenal {
@@ -102,20 +102,23 @@ impl Arsenal {
     }
 
     /// Weapon to world for a character drawn at `body` with posed node
-    /// matrices `nodes` and its hands at nodes `hands` (right, left): held
-    /// in both when they are close together, else carried in the right.
+    /// matrices `nodes` and its hands at `hands`: held in both when they
+    /// are raised above the waist close together, else carried in the
+    /// right.
     pub fn in_hand(
         &self,
         weapon: &WeaponModel,
         body: Mat4,
         nodes: &[Mat4],
-        hands: Option<(usize, usize)>,
+        hands: Option<Hands>,
     ) -> Option<Mat4> {
-        let (r, l) = hands?;
-        let (right, left) = (nodes.get(r)?, nodes.get(l)?);
-        let apart = right.w_axis.truncate().distance(left.w_axis.truncate());
+        let h = hands?;
+        let (right, left) = (nodes.get(h.right)?, nodes.get(h.left)?);
+        let (pr, pl) = (right.w_axis.truncate(), left.w_axis.truncate());
+        let waist = nodes.get(h.pelvis)?.w_axis.y + RAISED;
+        let both = pr.distance(pl) < TWO_HANDED && pr.y > waist && pl.y > waist;
         match weapon.carry {
-            Some((at, turn)) if apart >= TWO_HANDED => {
+            Some((at, turn)) if !both => {
                 Some(body * Mat4::from_rotation_translation(turn, right.transform_point3(at)))
             }
             _ => Some(body * *right * weapon.grip),
@@ -129,13 +132,28 @@ pub fn upper_body(skeleton: &Skeleton) -> Option<std::sync::Arc<[bool]>> {
     skeleton.upper_body(node(skeleton, RIGHT_HAND)?, node(skeleton, LEFT_HAND)?)
 }
 
-/// The hand nodes of a human skeleton: (right, left).
-pub fn hands(skeleton: &Skeleton) -> Option<(usize, usize)> {
-    Some((node(skeleton, RIGHT_HAND)?, node(skeleton, LEFT_HAND)?))
+/// The nodes a weapon is held by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hands {
+    pub right: usize,
+    pub left: usize,
+    pub pelvis: usize,
 }
 
-/// Hands closer than this, metres, hold a weapon between them.
-const TWO_HANDED: f32 = 0.5;
+/// The hand and pelvis nodes of a human skeleton.
+pub fn hands(skeleton: &Skeleton) -> Option<Hands> {
+    Some(Hands {
+        right: node(skeleton, RIGHT_HAND)?,
+        left: node(skeleton, LEFT_HAND)?,
+        pelvis: skeleton.pelvis()?,
+    })
+}
+
+/// Hands closer than this, metres, and both this far above the pelvis,
+/// hold a weapon between them (hands hanging at the sides are about as
+/// close, but low).
+const TWO_HANDED: f32 = 0.7;
+const RAISED: f32 = 0.1;
 /// How far below level a weapon carried in one hand points, radians.
 const CARRY_DOWN: f32 = 0.6;
 /// And how far out to the side, radians.
