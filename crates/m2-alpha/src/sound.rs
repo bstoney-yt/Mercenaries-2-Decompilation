@@ -189,13 +189,13 @@ pub fn jennifer_cues(remark: Remark) -> &'static [u32] {
 /// hit), and the least time between her remarks, seconds.
 fn remark_chance(remark: Remark) -> f32 {
     match remark {
-        Remark::Kill => 0.5,
+        Remark::Kill => 0.3,
         Remark::Wreck | Remark::Vehicle => 0.8,
         Remark::Hurt => 0.3,
         Remark::Down => 1.0,
     }
 }
-const REMARK_GAP: f32 = 6.0;
+const REMARK_GAP: f32 = 10.0;
 /// Shouts are the sets' short lines said where the speaker stands.
 const SHOUT_LONGEST: f32 = 3.5;
 /// Most lines said at once.
