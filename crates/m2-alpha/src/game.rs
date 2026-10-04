@@ -363,7 +363,7 @@ impl Game {
         player.driving = None;
         player.chase_target = None;
         player.down = false;
-        player.hold = None;
+        player.aiming = false;
         player.facing = p.facing;
         player.yaw = p.yaw;
         player.pitch = p.pitch;

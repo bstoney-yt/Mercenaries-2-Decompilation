@@ -8,6 +8,7 @@ use m2_render::View;
 use crate::combat::{Trigger, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
+use crate::npc::FightClips;
 use crate::scene::Rig;
 
 /// Movement speeds, m/s, inside the bands the game's clips move at.
@@ -113,9 +114,12 @@ pub struct Player {
     pub model: Option<(GpuModel, Rig)>,
     /// The vehicle she is driving (index into the scene's vehicles).
     pub driving: Option<usize>,
-    /// A clip to hold when standing still (aiming), facing the camera's
-    /// way.
-    pub hold: Option<usize>,
+    /// Aiming: she faces the camera's way with the rifle shouldered.
+    pub aiming: bool,
+    /// Her rifle, jump and fall clips.
+    pub clips: FightClips,
+    /// In a jump, until she lands.
+    jumping: bool,
     /// Down (out of health): she lies where she fell.
     pub down: bool,
 }
@@ -135,7 +139,9 @@ impl Player {
             settled: 0,
             model,
             driving: None,
-            hold: None,
+            aiming: false,
+            clips: FightClips::default(),
+            jumping: false,
             down: false,
         }
     }
@@ -190,7 +196,7 @@ impl Player {
         let jump = (intent.jump && self.character.grounded).then_some(JUMP);
         physics.move_character(&mut self.character, wanted, jump, dt);
 
-        let heading = if self.hold.is_some() {
+        let heading = if self.aiming {
             Some(self.yaw)
         } else {
             (direction.length_squared() > 0.01).then(|| direction.x.atan2(direction.z))
@@ -214,13 +220,29 @@ impl Player {
             } else {
                 Gait::Run
             };
-            match (gait, self.hold) {
-                (Gait::Idle, Some(clip)) => rig.animator.play(clip),
-                _ => rig.set_gait(gait),
+            if jump.is_some() {
+                self.jumping = true;
+                if let Some(clip) = self.clips.jump {
+                    rig.animator.play_leveled(clip);
+                }
+            } else if self.jumping && self.character.grounded {
+                self.jumping = false;
+            }
+            if self.jumping && self.clips.jump.is_some() {
+                // The legs jump; the arms keep the rifle.
+                let upper = if self.aiming {
+                    self.clips.aim
+                } else {
+                    self.clips.ready
+                };
+                rig.animator.set_upper(upper.zip(rig.upper.clone()));
+            } else {
+                rig.hold_rifle(gait, &self.clips, self.aiming);
             }
             // Play the clip at the speed she actually moves, so feet don't
             // slide (within reason: against a wall the legs keep going).
             let rate = match rig.gait_speed(gait) {
+                _ if self.jumping => 1.0,
                 Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
                 _ => 1.0,
             };

@@ -106,6 +106,12 @@ impl Arsenal {
     }
 }
 
+/// The upper body of a human skeleton (from its hands), for clips laid
+/// over the legs.
+pub fn upper_body(skeleton: &Skeleton) -> Option<std::sync::Arc<[bool]>> {
+    skeleton.upper_body(node(skeleton, RIGHT_HAND)?, node(skeleton, LEFT_HAND)?)
+}
+
 /// The right-hand node of a human skeleton.
 pub fn right_hand(skeleton: &Skeleton) -> Option<usize> {
     node(skeleton, RIGHT_HAND)
@@ -183,6 +189,8 @@ pub enum Remark {
     Wreck,
     /// She was hit.
     Hurt,
+    /// She went down.
+    Down,
     /// She got into a vehicle.
     Vehicle,
 }
@@ -326,7 +334,7 @@ impl Combat {
             if self.down <= 0.0 {
                 self.hp = 100.0;
                 f.player.down = false;
-                f.player.hold = None;
+                f.player.aiming = false;
             }
         } else if self.quiet > REGEN_AFTER {
             self.hp = (self.hp + REGEN_RATE * dt).min(100.0);
@@ -348,7 +356,7 @@ impl Combat {
             }
         }
         let holding = on_foot && (trigger.aim || self.aim_left > 0.0);
-        f.player.hold = if holding { f.people.clips.aim } else { None };
+        f.player.aiming = holding;
 
         // Soldiers' shots.
         let target = self.target(f.player, true);
@@ -404,7 +412,8 @@ impl Combat {
         self.effect(Effect::Flash { at: from }, 0.05);
         self.sounds.push(Sound::Shot(from));
         if let Some((_, Some(i))) = hit {
-            if f.people.npcs[i].hurt(RIFLE_DAMAGE) {
+            let soldier = f.people.npcs[i].soldier;
+            if f.people.npcs[i].hurt(RIFLE_DAMAGE) && soldier {
                 self.remarks.push(Remark::Kill);
             }
             self.hits += 1;
@@ -481,15 +490,18 @@ impl Combat {
         }
         self.quiet = 0.0;
         self.hp = (self.hp - damage).max(0.0);
-        self.remarks.push(Remark::Hurt);
         if self.hp <= 0.0 {
+            self.remarks.push(Remark::Down);
             self.down = DOWN_TIME;
             f.player.down = true;
-            f.player.hold = None;
+            f.player.aiming = false;
             if let (Some(die), Some((_, rig))) = (f.people.clips.die, &mut f.player.model) {
+                rig.animator.set_upper(None);
                 rig.animator.play_once(die);
             }
             f.people.stand_down();
+        } else {
+            self.remarks.push(Remark::Hurt);
         }
     }
 
@@ -595,9 +607,9 @@ impl Combat {
         for n in &mut f.people.npcs {
             let d = n.chest().distance(at);
             if d < KILL {
-                killed |= n.hurt(1000.0);
+                killed |= n.hurt(1000.0) && n.soldier;
             } else if d < REACH {
-                killed |= n.hurt(100.0 * (1.0 - d / REACH));
+                killed |= n.hurt(100.0 * (1.0 - d / REACH)) && n.soldier;
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);

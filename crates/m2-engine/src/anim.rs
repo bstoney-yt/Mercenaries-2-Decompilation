@@ -154,6 +154,16 @@ impl Skeleton {
         Some(mask.into())
     }
 
+    /// The pelvis: the root's child that sits highest at rest (as
+    /// [`ClipInfo::hips`] measures it).
+    pub fn pelvis(&self) -> Option<usize> {
+        let root = self.root();
+        let models = self.model_matrices(&self.rest_pose());
+        (0..self.len())
+            .filter(|&i| self.parents[i] == Some(root))
+            .max_by(|&a, &b| models[a].w_axis.y.total_cmp(&models[b].w_axis.y))
+    }
+
     pub fn rest_pose(&self) -> Pose {
         Pose(self.rest.clone())
     }
@@ -502,6 +512,9 @@ struct Playing {
     clip: usize,
     time: f32,
     once: bool,
+    /// Keeps the pelvis at its first frame's height (a jump: the body
+    /// rises in the game's physics, not in the clip).
+    level: bool,
 }
 
 /// A clip the upper body plays over the rest (a rifle held while the legs
@@ -540,20 +553,28 @@ impl Animator {
     /// Switches to clip `index`, looped (no-op if it is already playing),
     /// fading from the current one.
     pub fn play(&mut self, index: usize) {
-        self.start(index, false);
+        self.start(index, false, false);
     }
 
     /// Plays clip `index` once from the start and holds its last frame
     /// (a fall, a reaction), fading quickly from the current one.
     pub fn play_once(&mut self, index: usize) {
-        self.start(index, true);
+        self.start(index, true, false);
         self.fade_time = 0.1;
     }
 
-    fn start(&mut self, clip: usize, once: bool) {
+    /// Plays clip `index` once like [`play_once`](Self::play_once), with
+    /// the pelvis held at its starting height: a jump whose rise the
+    /// physics already gives the character.
+    pub fn play_leveled(&mut self, index: usize) {
+        self.start(index, true, true);
+        self.fade_time = 0.1;
+    }
+
+    fn start(&mut self, clip: usize, once: bool, level: bool) {
         if self
             .current
-            .is_some_and(|c| c.clip == clip && c.once == once)
+            .is_some_and(|c| c.clip == clip && c.once == once && c.level == level)
         {
             return;
         }
@@ -563,6 +584,7 @@ impl Animator {
             clip,
             time: 0.0,
             once,
+            level,
         });
         self.fade = if self.previous.is_some() { 0.0 } else { 1.0 };
     }
@@ -614,6 +636,12 @@ impl Animator {
                     c.sample_looped(skeleton, p.time)
                 };
                 pose.strip_root_motion(skeleton.root(), c.info.pin);
+                if p.level
+                    && let Some(pelvis) = skeleton.pelvis()
+                {
+                    let rise = skeleton.model_matrices(&pose)[pelvis].w_axis.y - c.info.hips;
+                    pose.0[skeleton.root()].translation.y -= rise;
+                }
                 pose
             })
         };
@@ -666,6 +694,7 @@ mod tests {
         let s = skeleton();
         let models = s.model_matrices(&s.rest_pose());
         assert!((models[2].w_axis.y - 1.5).abs() < 1e-6);
+        assert_eq!(s.pelvis(), Some(1));
         for m in s.skin_matrices(&s.rest_pose()) {
             assert!(m.abs_diff_eq(Mat4::IDENTITY, 1e-6), "{m}");
         }

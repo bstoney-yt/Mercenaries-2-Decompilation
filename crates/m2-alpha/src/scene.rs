@@ -57,6 +57,8 @@ pub struct Rig {
     pub locomotion: Option<Locomotion>,
     pub animator: Animator,
     pub gait: Gait,
+    /// The upper body's nodes, for clips laid over the legs.
+    pub upper: Option<Arc<[bool]>>,
 }
 
 impl Rig {
@@ -116,8 +118,7 @@ impl Rig {
             .clips
             .values()
             .copied()
-            .chain(fight.aim)
-            .chain(fight.die)
+            .chain(fight.all())
             .collect();
         wanted.sort_unstable();
         wanted.dedup();
@@ -138,6 +139,7 @@ impl Rig {
             return None;
         }
         Some(Self {
+            upper: crate::combat::upper_body(&skeleton),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion: Some(Locomotion {
@@ -152,6 +154,7 @@ impl Rig {
     fn new(skeleton: Skeleton, clips: Vec<BoundClip>, gait: Gait) -> Self {
         let locomotion = Locomotion::choose(&clips);
         let mut rig = Self {
+            upper: crate::combat::upper_body(&skeleton),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion,
@@ -167,6 +170,27 @@ impl Rig {
         if let Some(&clip) = self.locomotion.as_ref().and_then(|l| l.clips.get(&gait)) {
             self.animator.play(clip);
         }
+    }
+
+    /// Moves at `gait` with a rifle: standing, the whole body holds it
+    /// shouldered (`aiming`) or at the ready; moving, the legs play the
+    /// gait and the upper body holds it the same way, or up at the ready
+    /// as when running. Falls back to the plain gait without the clips.
+    pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, aiming: bool) {
+        let (whole, upper) = match (gait, aiming) {
+            (Gait::Idle, true) => (clips.aim, None),
+            (Gait::Idle, false) => (clips.ready, None),
+            (_, true) => (None, clips.aim),
+            (_, false) => (None, clips.run),
+        };
+        match whole {
+            Some(clip) => {
+                self.gait = gait;
+                self.animator.play(clip);
+            }
+            None => self.set_gait(gait),
+        }
+        self.animator.set_upper(upper.zip(self.upper.clone()));
     }
 
     /// The next gait, slowest after fastest.
@@ -560,10 +584,14 @@ impl Scene {
                 None
             }
         };
-        if let Some((_, rig)) = &model {
-            self.people.clips = npc::FightClips::find(rig);
-        }
-        self.player = Some(Player::new(x, z, 0.0, model));
+        let clips = model
+            .as_ref()
+            .map(|(_, rig)| npc::FightClips::find(rig))
+            .unwrap_or_default();
+        self.people.clips = clips;
+        let mut player = Player::new(x, z, 0.0, model);
+        player.clips = clips;
+        self.player = Some(player);
         self.vehicle_loads = Some(load_cast(install.clone()));
         self.install = Some(install.clone());
         Ok(())

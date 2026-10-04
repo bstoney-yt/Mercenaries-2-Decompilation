@@ -154,17 +154,35 @@ type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32);
 /// Voice sets, by the name hash of their name. The soldiers' and
 /// civilians' sets are named only by hash, and were told apart by their
 /// subtitles: two sets of Venezuelan army soldiers (so not everyone sounds
-/// alike) and civilians complaining. (Jennifer's is `vo_jen`, 7f746c16;
-/// which of her lines go with what is not known yet.)
+/// alike) and civilians complaining.
 pub const VZ_SOLDIERS: [u32; 2] = [0xcf4f_8b9c, 0x6cff_c547];
 pub const CIVILIANS: u32 = 0x910e_b574;
 /// Jennifer's voice set, `vo_jen`.
 pub const JENNIFER: u32 = 0x7f74_6c16;
-/// Her lines for what happens to her, by cue (a line or a group of
-/// variants): none are known yet, so she stays quiet.
+/// Her lines for what happens to her, by cue (a line, or a group of
+/// variants to pick from), chosen by reading their subtitles.
 pub fn jennifer_cues(remark: Remark) -> &'static [u32] {
     match remark {
-        Remark::Kill | Remark::Wreck | Remark::Hurt | Remark::Vehicle => &[],
+        // Two about dead Venezuelan troops (everyone she fights here) and
+        // two said to anyone.
+        Remark::Kill => &[0xdcad_44ab, 0x02af_bf14, 0x5157_a743, 0x8eee_b3db],
+        // There is no line for wrecking a vehicle: one of the kill lines
+        // that suits it.
+        Remark::Wreck => &[0x8eee_b3db],
+        // Her group of pain grunts, and short lines about being hit.
+        Remark::Hurt => &[
+            0x559f_e5ef,
+            0x3aab_17ee,
+            0x8dae_e9a4,
+            0x85aa_5fde,
+            0x8fbb_b8bd,
+            0x339d_71d2,
+            0x0db4_3052,
+        ],
+        // Her group of death cries.
+        Remark::Down => &[0x33e7_b94d],
+        // Two of her lines for taking someone's car.
+        Remark::Vehicle => &[0x84b6_cf3b, 0x88d4_409c],
     }
 }
 /// How often she says something about it (she doesn't remark on every
@@ -174,6 +192,7 @@ fn remark_chance(remark: Remark) -> f32 {
         Remark::Kill => 0.5,
         Remark::Wreck | Remark::Vehicle => 0.8,
         Remark::Hurt => 0.3,
+        Remark::Down => 1.0,
     }
 }
 const REMARK_GAP: f32 = 6.0;
@@ -342,7 +361,10 @@ impl GameAudio {
     /// [`jennifer_cues`] (one of a group's variants), flat, as her own.
     pub fn remark(&mut self, remark: Remark) {
         let now = Instant::now();
-        if now < self.quiet_until || self.random() >= remark_chance(remark) {
+        // Going down cuts in; anything else waits its turn.
+        if (now < self.quiet_until && remark != Remark::Down)
+            || self.random() >= remark_chance(remark)
+        {
             return;
         }
         let Some(voices) = self.voices.clone() else {

@@ -73,25 +73,47 @@ pub(crate) enum Brain {
 }
 
 /// The clips a fight plays, indices into every human rig's clips (they
-/// share one list).
+/// share one list). Clips are named only by hash; these were picked by
+/// looking at each pose.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FightClips {
-    /// Standing, rifle held in both hands (resident 57fe91b4).
+    /// Standing, rifle shouldered and aimed (resident 0163f2aa).
     pub aim: Option<usize>,
+    /// Standing, rifle held low across the chest (resident 178a5642).
+    pub ready: Option<usize>,
+    /// Running with the rifle up at the ready (resident 8c8509b3): its
+    /// upper body is laid over the legs' gait.
+    pub run: Option<usize>,
+    /// A jump: take-off and the air, ending off the ground (resident
+    /// c846e6fd).
+    pub jump: Option<usize>,
     /// Falling down dead (resident 479c4a51).
     pub die: Option<usize>,
 }
 
 impl FightClips {
-    pub const AIM: u32 = 0x57fe_91b4;
+    pub const AIM: u32 = 0x0163_f2aa;
+    pub const READY: u32 = 0x178a_5642;
+    pub const RUN: u32 = 0x8c85_09b3;
+    pub const JUMP: u32 = 0xc846_e6fd;
     pub const DIE: u32 = 0x479c_4a51;
 
     pub fn find(rig: &Rig) -> Self {
         let find = |hash| rig.clips.iter().position(|c| c.hash == hash);
         Self {
             aim: find(Self::AIM),
+            ready: find(Self::READY),
+            run: find(Self::RUN),
+            jump: find(Self::JUMP),
             die: find(Self::DIE),
         }
+    }
+
+    /// Every clip, for rebinding.
+    pub fn all(&self) -> impl Iterator<Item = usize> {
+        [self.aim, self.ready, self.run, self.jump, self.die]
+            .into_iter()
+            .flatten()
     }
 }
 
@@ -170,8 +192,7 @@ impl Npc {
         }
     }
 
-    /// Takes `damage`; at no health left, falls.
-    /// Takes `damage`; true if it killed.
+    /// Takes `damage`; at no health left, falls: true if it killed.
     pub fn hurt(&mut self, damage: f32) -> bool {
         let clips = self.clips;
         if !self.alive {
@@ -183,6 +204,7 @@ impl Npc {
             self.alive = false;
             self.alert = false;
             self.flee = None;
+            self.rig.animator.set_upper(None);
             if let Some(die) = clips.die {
                 self.rig.animator.play_once(die);
             }
@@ -226,10 +248,7 @@ impl Npc {
         }
         physics.move_character(&mut self.character, Vec3::ZERO, None, dt);
         let off = self.turn_to(to.x.atan2(to.z), dt);
-        match clips.aim {
-            Some(aim) => self.rig.animator.play(aim),
-            None => self.rig.set_gait(Gait::Idle),
-        }
+        self.rig.hold_rifle(Gait::Idle, &clips, true);
         self.cooldown -= dt;
         if self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
             self.fires = true;
@@ -382,7 +401,12 @@ impl Npc {
         } else {
             Gait::Walk
         };
-        self.rig.set_gait(gait);
+        if self.soldier {
+            let clips = self.clips;
+            self.rig.hold_rifle(gait, &clips, false);
+        } else {
+            self.rig.set_gait(gait);
+        }
         let rate = match self.rig.gait_speed(gait) {
             Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
             _ => 1.0,
@@ -692,6 +716,7 @@ pub(crate) mod tests {
             locomotion: None,
             animator: Animator::default(),
             gait: Gait::Idle,
+            upper: None,
         }
     }
 
