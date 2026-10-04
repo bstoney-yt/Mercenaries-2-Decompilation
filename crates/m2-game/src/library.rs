@@ -46,7 +46,8 @@ pub struct Library {
 /// The task classes are the trouble: subclasses call so many base-class
 /// members through `MrxTaskMission` and `MrxTaskObjective` that the match
 /// gave those names the base class and contracts.
-pub const KNOWN_MODULES: [(&str, u32); 7] = [
+pub const KNOWN_MODULES: [(&str, u32); 8] = [
+    ("MrxCopterDrop", 0x3cca_21b4),
     ("MrxTask", 0xd302_a66f),
     ("MrxTaskMission", 0xcfcd_908f),
     ("MrxTaskObjective", 0x517a_1910),

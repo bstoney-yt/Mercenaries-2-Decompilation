@@ -17,6 +17,7 @@
 //! (see `wad -- calls`); the readings are noted per kind below.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use mlua::{Function, Lua, MultiValue, Table, Value};
@@ -86,6 +87,8 @@ struct Pending {
     /// For conditions: whether it held at the last check, so persistent
     /// events fire as it starts to hold, not every frame.
     held: bool,
+    /// For conditions on each of several objects: those it held for.
+    held_by: BTreeSet<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -159,6 +162,7 @@ impl Events {
                         persistent,
                         last: now,
                         held: false,
+                        held_by: BTreeSet::new(),
                     });
                     Ok(MultiValue::from_vec(vec![Value::Number(f64::from(id))]))
                 })?,
@@ -246,17 +250,38 @@ impl Events {
             let mut keep = Vec::with_capacity(s.pending.len());
             for mut p in std::mem::take(&mut s.pending) {
                 let extra = match check(&p, now, &posted, world) {
-                    Check::Fire(extra) => Some(extra),
+                    Check::Fire(extra) => Some(vec![extra]),
                     // Fires as the condition starts to hold.
                     Check::Holds(holds, extra) => {
                         let rising = holds && !p.held;
                         p.held = holds;
-                        rising.then_some(extra)
+                        rising.then_some(vec![extra])
+                    }
+                    // Fires for each object as the condition starts to
+                    // hold for it; once only, unless persistent.
+                    Check::Each(members) => {
+                        let mut rising = Vec::new();
+                        let mut held_by = BTreeSet::new();
+                        for (g, holds, extra) in members {
+                            if holds {
+                                held_by.insert(g);
+                                if !p.held_by.contains(&g) {
+                                    rising.push(extra);
+                                }
+                            }
+                        }
+                        p.held_by = held_by;
+                        if !p.persistent {
+                            rising.truncate(1);
+                        }
+                        (!rising.is_empty()).then_some(rising)
                     }
                 };
                 match extra {
-                    Some(extra) => {
-                        fired.push((p.kind.clone(), p.callback.clone(), p.data.clone(), extra));
+                    Some(extras) => {
+                        for extra in extras {
+                            fired.push((p.kind.clone(), p.callback.clone(), p.data.clone(), extra));
+                        }
                         if p.persistent {
                             p.last = now;
                             keep.push(p);
@@ -328,6 +353,9 @@ enum Check {
     /// A condition: whether it holds, and the values to pass when it
     /// starts to.
     Holds(bool, Vec<Value>),
+    /// A condition on each of several objects (an object filter's): per
+    /// object, whether it holds and the values to pass.
+    Each(Vec<(u32, bool, Vec<Value>)>),
 }
 
 /// The objects a parameter names: a guid, `"hero"` (the player), or a
@@ -401,11 +429,15 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             Some(delay) if now - p.last >= delay => Check::Fire(Vec::new()),
             _ => no,
         },
-        // { object }: when it dies or is removed; passes the object.
-        "ObjectDeath" => match guid(&p.params, 1) {
-            Some(g) => Check::Holds(!world.is_alive(g), vec![id(g)]),
-            None => no,
-        },
+        // { object }: when it dies or is removed; passes the object. A
+        // filter or label names several, each firing as it dies (a
+        // Destroy objective counts its targets this way).
+        "ObjectDeath" => Check::Each(
+            objects(&p.params, 1, world)
+                .into_iter()
+                .map(|g| (g, !world.is_alive(g), vec![id(g)]))
+                .collect(),
+        ),
         // { a, b, "<" or ">", metres, ... }: when some a is within (or
         // beyond) the distance of some b; a and b are guids, "hero" or
         // labels. Passes the pair.
