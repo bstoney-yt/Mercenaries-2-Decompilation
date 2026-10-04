@@ -112,6 +112,37 @@ impl ScriptHost {
                 )?)]))
             })?,
         )?;
+        // Stubs stand in for numbers too (`nHeight = Graphics.GetHeight()`):
+        // in arithmetic a stub is 0, and joined to a string it is its name.
+        let arithmetic: Table = lua
+            .load(
+                r#"
+                local function n(v) return type(v) == "number" and v or 0 end
+                local function s(v)
+                    if type(v) == "table" then return rawget(v, "__m2_stub") or "" end
+                    return v
+                end
+                return {
+                    __add = function(a, b) return n(a) + n(b) end,
+                    __sub = function(a, b) return n(a) - n(b) end,
+                    __mul = function(a, b) return n(a) * n(b) end,
+                    __div = function(a, b) return n(a) / n(b) end,
+                    __mod = function(a, b) return n(a) % n(b) end,
+                    __pow = function(a, b) return n(a) ^ n(b) end,
+                    __unm = function() return 0 end,
+                    __concat = function(a, b) return s(a) .. s(b) end,
+                    __lt = function() return false end,
+                    __le = function() return true end,
+                }
+                "#,
+            )
+            .set_name("=m2-stub-arithmetic")
+            .set_mode(ChunkMode::Text)
+            .eval()?;
+        for pair in arithmetic.pairs::<String, Function>() {
+            let (k, v) = pair?;
+            stub_meta.set(k, v)?;
+        }
         lua.set_named_registry_value("m2_stub_meta", &stub_meta)?;
         Ok(Self {
             lua,
@@ -507,6 +538,12 @@ mod tests {
             .eval()
             .unwrap();
         assert!(is_stub);
+        let (sum, text): (f64, String) = host
+            .lua()
+            .load("local h = Graphics.GetHeight(); return h / 2 + 3, 'w=' .. h")
+            .eval()
+            .unwrap();
+        assert_eq!((sum, text.as_str()), (3.0, "w=Graphics.GetHeight()"));
     }
 
     #[test]
