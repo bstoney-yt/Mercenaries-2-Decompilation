@@ -148,7 +148,7 @@ impl Events {
                         last: now,
                         held: false,
                     });
-                    Ok(MultiValue::from_vec(vec![Value::Integer(i64::from(id))]))
+                    Ok(MultiValue::from_vec(vec![Value::Number(f64::from(id))]))
                 })?,
             )?;
         }
@@ -332,7 +332,7 @@ fn text(t: &Table, i: i64) -> Option<String> {
 /// from the game's call sites.
 fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -> Check {
     let no = Check::Holds(false, Vec::new());
-    let id = |g: u32| Value::Integer(i64::from(g));
+    let id = |g: u32| Value::Number(f64::from(g));
     match p.kind.as_str() {
         // { seconds }: that long after it was made (persistent: every
         // that long).
