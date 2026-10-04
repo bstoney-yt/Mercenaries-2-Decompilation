@@ -172,7 +172,7 @@ impl Props {
                 return Ok(());
             }
         };
-        materials.load_textures(backend, source, cpu.texture_hashes().collect::<Vec<_>>())?;
+        materials.load_textures(backend, source, cpu.texture_requests())?;
         let gpu = GpuModel::upload(backend, materials, &cpu)?;
         if let Some(shape) = &cpu.collision {
             for (&e, p) in self.shown.iter().filter(|(_, p)| p.model == hash) {
