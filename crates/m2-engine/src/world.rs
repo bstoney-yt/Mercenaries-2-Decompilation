@@ -96,7 +96,14 @@ pub struct TemplateInfo {
     pub model: Option<u32>,
     /// Its physics component's kind, when it has one.
     pub vehicle: Option<VehicleKind>,
+    /// The name hash of its engine's sound bank (`veh_jeep`), from its
+    /// `SoundEffect`.
+    pub engine: Option<u32>,
 }
+
+/// The `SoundEffect` field naming a vehicle's engine sound bank, by name
+/// hash (`veh_largegascrappy` for the HMMWVs and Valiants).
+const ENGINE_BANK_FIELD: u32 = 0x14a6_7fa6;
 
 /// The template database by template name, lower case.
 #[derive(Clone, Debug, Default)]
@@ -107,6 +114,21 @@ impl Templates {
     /// 0x0012abcd`, `AMX30`) names, whatever its case.
     pub fn get(&self, name: &str) -> Option<&TemplateInfo> {
         self.0.get(&member_stem(name).to_ascii_lowercase())
+    }
+
+    /// The engine sound bank most templates of `model` use (a model's
+    /// templates are variants: drivers, guns, factions).
+    pub fn engine_for_model(&self, model: u32) -> Option<u32> {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for t in self.0.values().filter(|t| t.model == Some(model)) {
+            if let Some(bank) = t.engine {
+                *counts.entry(bank).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(bank, n)| (n, std::cmp::Reverse(bank)))
+            .map(|(bank, _)| bank)
     }
 }
 
@@ -129,6 +151,7 @@ impl Templates {
             return Self::default();
         };
         let model_of = db.hashes("ModelName");
+        let engines = engine_banks(&db);
         let mut kinds: HashMap<u32, VehicleKind> = HashMap::new();
         for (component, kind) in [
             ("_CarPhysicsV2", VehicleKind::Car),
@@ -152,12 +175,38 @@ impl Templates {
                         TemplateInfo {
                             model: model_of.get(&id).copied().filter(|m| models.contains(m)),
                             vehicle: kinds.get(&id).copied(),
+                            engine: engines.get(&id).copied(),
                         },
                     )
                 })
                 .collect(),
         )
     }
+}
+
+/// Each template's engine sound bank: the `SoundEffect` field that names
+/// one, where it isn't zero.
+fn engine_banks(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let Some(c) = db.component("SoundEffect") else {
+        return HashMap::new();
+    };
+    let Some(at) = c
+        .fields
+        .iter()
+        .find(|f| f.name_hash == ENGINE_BANK_FIELD)
+        .map(|f| usize::from(f.offset))
+    else {
+        return HashMap::new();
+    };
+    c.records()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, r)| {
+            let b = r.get(at..at + 4)?;
+            let bank = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            (bank != 0).then_some((id, bank))
+        })
+        .collect()
 }
 
 /// Components of people and vehicles, which a state layer's models
@@ -491,6 +540,7 @@ impl WorldIndex {
                         Some(&TemplateInfo {
                             model,
                             vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank)),
+                            ..
                         }),
                     ) => self.templates.push(TemplatePlacement {
                         entity,
@@ -563,6 +613,7 @@ impl WorldIndex {
                     Some(&TemplateInfo {
                         model: Some(m),
                         vehicle: None,
+                        ..
                     }) => Some(m),
                     _ => None,
                 }
@@ -830,6 +881,25 @@ pub fn low_res_tile<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_models_engine_is_the_one_most_of_its_templates_use() {
+        let t = |model, engine| TemplateInfo {
+            model: Some(model),
+            vehicle: Some(VehicleKind::Car),
+            engine,
+        };
+        let db = Templates(HashMap::from([
+            ("valiant".to_owned(), t(1, Some(0xaa))),
+            ("valiant (driver)".to_owned(), t(1, Some(0xaa))),
+            ("valiant (python)".to_owned(), t(1, Some(0xbb))),
+            ("valiant (base)".to_owned(), t(1, None)),
+            ("hmmwv".to_owned(), t(2, None)),
+        ]));
+        assert_eq!(db.engine_for_model(1), Some(0xaa));
+        assert_eq!(db.engine_for_model(2), None);
+        assert_eq!(db.engine_for_model(3), None);
+    }
 
     #[test]
     fn distance_to_a_cell_square() {

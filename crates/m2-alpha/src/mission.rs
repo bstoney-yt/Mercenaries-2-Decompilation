@@ -776,6 +776,7 @@ pub(crate) fn template_models(
         Some(&TemplateInfo {
             model: Some(model),
             vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank)),
+            ..
         }) => vec![CatalogueEntry {
             model,
             kind: if kind == VehicleKind::Tank {
@@ -893,7 +894,11 @@ mod tests {
     #[test]
     fn the_template_database_names_the_model_first() {
         let catalogue = [entry(1, "truck", "gr_veh_truck_m151")];
-        let info = |model, vehicle| TemplateInfo { model, vehicle };
+        let info = |model, vehicle| TemplateInfo {
+            model,
+            vehicle,
+            engine: None,
+        };
         let db = Templates(HashMap::from([
             (
                 "m151 softtop (vz)".to_owned(),
