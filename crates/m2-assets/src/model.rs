@@ -784,6 +784,125 @@ pub struct Geometry<'a> {
     pub groups: Vec<PrimitiveGroup<'a>>,
 }
 
+/// The parts of a model its state machine (`STAM`) switches: a vehicle
+/// holds its intact and its wrecked parts (body, turret, doors, wheels)
+/// side by side, and shows one or the other.
+///
+/// `STAM` holds `INFO`, then `SWIT` (u32 node index per switchable node),
+/// then repeated `STAT` / `CHDR` / `CEXE` records; a `CEXE` holds commands
+/// as u32 (node index, verb) pairs, the verbs being name hashes such as
+/// `show` and `hide`. Switchable nodes with the same parent are a part's
+/// alternatives, shown in order: the first is the intact part, the next
+/// the wrecked one. A switchable node never shown is a light's glow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartStates {
+    /// The switchable nodes (`SWIT`).
+    pub switchable: Vec<u16>,
+    /// Switchable nodes in the order commands first show them.
+    pub shown: Vec<u16>,
+}
+
+impl PartStates {
+    fn parse(u: &Ucfx<'_>, stam: usize, node_count: u32) -> Self {
+        let show = crate::name_hash("show");
+        let words = |d: &[u8]| -> Vec<u32> {
+            d.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let mut states = Self::default();
+        for c in u.children(Some(stam)) {
+            let sec = &u.sections()[c];
+            let Some(data) = sec.data else { continue };
+            match &sec.fourcc {
+                b"SWIT" => {
+                    states.switchable = words(data)
+                        .into_iter()
+                        .filter(|&n| n < node_count)
+                        .map(|n| n as u16)
+                        .collect();
+                }
+                b"CEXE" => {
+                    let w = words(data);
+                    for (k, &v) in w.iter().enumerate() {
+                        if v != show {
+                            continue;
+                        }
+                        // The node shown: the word before the verb, or
+                        // after it.
+                        let node = [k.checked_sub(1), Some(k + 1)]
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|i| w.get(i))
+                            .find(|&&n| n < node_count && states.switchable.contains(&(n as u16)));
+                        if let Some(&n) = node
+                            && !states.shown.contains(&(n as u16))
+                        {
+                            states.shown.push(n as u16);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        states
+    }
+
+    /// Which of `nodes` are hidden (with everything under them) intact,
+    /// or `wrecked`: of each part's alternatives the first shown when
+    /// intact, the next when wrecked; parts with one alternative always;
+    /// glows never.
+    pub fn hidden(&self, nodes: &[Node], wrecked: bool) -> Vec<bool> {
+        let mut off = vec![false; nodes.len()];
+        for &n in &self.switchable {
+            if let Some(o) = off.get_mut(usize::from(n)) {
+                *o = true;
+            }
+        }
+        let parent = |n: u16| nodes.get(usize::from(n)).and_then(|x| x.parent);
+        let mut done = Vec::new();
+        for &n in &self.shown {
+            let p = parent(n);
+            if done.contains(&p) {
+                continue;
+            }
+            done.push(p);
+            let options: Vec<u16> = self
+                .shown
+                .iter()
+                .copied()
+                .filter(|&m| parent(m) == p)
+                .collect();
+            let pick = if wrecked && options.len() > 1 {
+                options[1]
+            } else {
+                options[0]
+            };
+            if let Some(o) = off.get_mut(usize::from(pick)) {
+                *o = false;
+            }
+        }
+        // Hidden with an ancestor hidden.
+        (0..nodes.len())
+            .map(|i| {
+                let mut at = Some(i as u16);
+                let mut steps = 0;
+                while let Some(n) = at {
+                    if off.get(usize::from(n)).copied().unwrap_or(false) {
+                        return true;
+                    }
+                    at = parent(n);
+                    steps += 1;
+                    if steps > nodes.len() {
+                        break;
+                    }
+                }
+                false
+            })
+            .collect()
+    }
+}
+
 /// A parsed model, with whichever streamed chunks have been added.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model<'a> {
@@ -795,6 +914,8 @@ pub struct Model<'a> {
     pub blend_shapes: Vec<u32>,
     /// Top-level `TINY` data: see [`tiny_members`](Self::tiny_members).
     pub tiny: Option<&'a [u8]>,
+    /// The parts the state machine (`STAM`) shows and hides, if any.
+    pub states: Option<PartStates>,
     /// Indexed by geometry slot; `None` until its chunk is added.
     slots: Vec<Option<Geometry<'a>>>,
 }
@@ -806,6 +927,7 @@ impl<'a> Model<'a> {
         let mut sections: [Option<&'a [u8]>; 6] = [None; 6];
         const NAMES: [[u8; 4]; 6] = [*b"INFO", *b"HIER", *b"MTRL", *b"SEGM", *b"BSHP", *b"TINY"];
         let mut geom = None;
+        let mut stam = None;
         for c in u.children(None) {
             let sec = &u.sections()[c];
             match (sec.fourcc, sec.data) {
@@ -814,7 +936,8 @@ impl<'a> Model<'a> {
                     sections[i] = Some(d);
                 }
                 (cc, None) if &cc == b"GEOM" => geom = Some(c),
-                // Collision, state machine and mixer data are not decoded.
+                (cc, None) if &cc == b"STAM" => stam = Some(c),
+                // Collision and mixer data are not decoded here.
                 (cc, _) if [*b"PHY2", *b"STAM", *b"MIXR"].contains(&cc) => {}
                 (found, _) => {
                     return Err(ModelError::UnexpectedSection {
@@ -850,6 +973,7 @@ impl<'a> Model<'a> {
             segments,
             blend_shapes,
             tiny: sections[5],
+            states: stam.map(|c| PartStates::parse(&u, c, info.node_count)),
             slots: vec![None; info.slot_count as usize],
         };
         model.add_geom(&u, geom.ok_or(ModelError::MissingSection(*b"GEOM"))?)?;
@@ -1480,6 +1604,52 @@ mod tests {
         ]);
         let chunk = ucfx(&[geom(&[1], vec![kind(b"SKIN", vec![skin_group()])])]);
         (base, chunk)
+    }
+
+    #[test]
+    fn wrecks_swap_switchable_parts() {
+        let (show, hide) = (crate::name_hash("show"), crate::name_hash("hide"));
+        // Root 0 holds the intact body 1 and the wrecked body 2; the intact
+        // body holds a glow 3 (never shown) and a turret 4.
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", vec![0; 12]),
+                leaf(b"SWIT", le(&[1, 2, 3])),
+                leaf(b"STAT", le(&[0x1234_5678])),
+                leaf(b"CHDR", le(&[2])),
+                leaf(b"CEXE", le(&[1, show, 2, hide, 3, hide])),
+                leaf(b"STAT", le(&[0x8765_4321])),
+                leaf(b"CHDR", le(&[2])),
+                leaf(b"CEXE", le(&[1, hide, 2, show])),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let states = PartStates::parse(&u, stam, 5);
+        assert_eq!(states.switchable, vec![1, 2, 3]);
+        assert_eq!(states.shown, vec![1, 2]);
+        let n = |parent: Option<u16>| Node {
+            name_hash: 0,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [n(None), n(Some(0)), n(Some(0)), n(Some(1)), n(Some(1))];
+        assert_eq!(
+            states.hidden(&nodes, false),
+            vec![false, false, true, true, false]
+        );
+        assert_eq!(
+            states.hidden(&nodes, true),
+            vec![false, true, false, true, true]
+        );
     }
 
     #[test]

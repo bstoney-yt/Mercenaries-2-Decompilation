@@ -919,7 +919,9 @@ impl Scene {
             self.draw_ground(queue);
         }
         if let Some(world) = &self.world {
-            for v in &self.vehicles {
+            for v in &mut self.vehicles {
+                // A wreck shows its wrecked body, turret and wheels.
+                v.model.wrecked = v.wrecked;
                 let Some(id) = v.id else { continue };
                 let Some(at) = world.physics.vehicle_transform(id) else {
                     continue;
