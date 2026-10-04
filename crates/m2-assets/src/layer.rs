@@ -22,8 +22,15 @@
 //! ```
 //!
 //! The template database ([`TEMPLATE_DB_TYPE`]) has `CHDR`, `enum`, a
-//! `UNIQ` section (not decoded) and the `COMP` tables, and no `flgt` or
-//! `flgs`; its entities are templates, named by its `Name` component.
+//! `UNIQ` section (`u32` count, then every template id, bit 31 set), the
+//! `COMP` tables and `flgs`, and no `flgt`; its entities are templates,
+//! named by its `Name` component. Its component data is grouped: each
+//! group is `u32 k`, `k` template ids, then one stored record they all
+//! share (`record_size` bytes; a string field is a cstr; bitfields are
+//! packed), and `info`'s count is the number of groups. The database is
+//! flat: a template carries every component of its own, so there is no
+//! base-template link to follow. `ModelName` groups give 3,351 of the
+//! 6,126 templates a model, the parked vehicles among them.
 //!
 //! In the data a record is usually exactly the schema's record size. Two
 //! exceptions are known: string fields (type 8) are stored inline as
@@ -114,17 +121,31 @@ pub struct Component<'a> {
     pub record_size: u32,
     pub fields: Vec<Field>,
     pub data: &'a [u8],
+    /// Template database layout: the data is `count` groups of `u32 k`,
+    /// `k` template ids and one record they share, rather than a record
+    /// per entity.
+    pub grouped: bool,
 }
 
 impl<'a> Component<'a> {
     /// `(entity, record)` pairs, if every record has the same stored size
-    /// (the data divides evenly by the count and no field is a string).
+    /// (the data divides evenly by the count and no field is a string);
+    /// in the template database, every template of a group with the
+    /// group's record, if the groups walk exactly to the end of the data.
     pub fn records(&self) -> Option<Vec<(u32, &'a [u8])>> {
+        if self.fields.iter().any(|f| f.ty == STRING_FIELD) {
+            return None;
+        }
+        if self.grouped {
+            return self.groups(self.record_size as usize).map(|groups| {
+                groups
+                    .into_iter()
+                    .flat_map(|(ids, record)| ids.into_iter().map(move |id| (id, record)))
+                    .collect()
+            });
+        }
         let n = self.count as usize;
-        if n == 0
-            || !self.data.len().is_multiple_of(n)
-            || self.fields.iter().any(|f| f.ty == STRING_FIELD)
-        {
+        if n == 0 || !self.data.len().is_multiple_of(n) {
             return None;
         }
         let len = self.data.len() / n;
@@ -137,6 +158,24 @@ impl<'a> Component<'a> {
                 .map(|r| (u32::from_le_bytes([r[0], r[1], r[2], r[3]]), &r[4..]))
                 .collect(),
         )
+    }
+
+    /// The template database's groups: the ids sharing each record of
+    /// `stored` bytes, if `count` groups walk exactly to the end of the
+    /// data.
+    fn groups(&self, stored: usize) -> Option<Vec<(Vec<u32>, &'a [u8])>> {
+        let mut r = Reader::at(self.data, 0);
+        let mut out = Vec::with_capacity(self.count as usize);
+        for _ in 0..self.count {
+            let k = r.u32().ok()?;
+            let ids = (0..k)
+                .map(|_| r.u32())
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            let record = r.take(stored).ok()?;
+            out.push((ids, record));
+        }
+        (r.remaining() == 0).then_some(out)
     }
 }
 
@@ -159,19 +198,19 @@ pub struct Layer<'a> {
     pub components: Vec<Component<'a>>,
     /// 0 in the template database, which has no `flgt`.
     pub flgt: u32,
-    /// The `flgs` section, undecoded; empty in the template database.
+    /// The `flgs` section, undecoded.
     pub flags: &'a [u8],
-    /// The template database's `UNIQ` section, undecoded; empty in a
-    /// layer.
+    /// The template database's `UNIQ` section: `u32` count, then every
+    /// template id; empty in a layer.
     pub uniq: &'a [u8],
 }
 
 /// Asset type hash of the template database: one asset
-/// (`resident_P000_Q3`, 1.8 MB) in the same component-table layout as a
-/// layer, whose entities are the templates the layers' entities are
-/// named after (`M151 Softtop (VZ)`, `Van (Crappy)`, `Small Fishing
-/// Boat`), with their `ModelName` and other components, base templates
-/// (`Van (base)`) and seats among them.
+/// (`resident_P000_Q3`, 1.8 MB) in the component-table layout of a
+/// layer with grouped records, whose 6,126 entities are the templates
+/// the layers' entities are named after (`M151 Softtop (VZ)`, `Van
+/// (Crappy)`, `Small Fishing Boat`), with their `ModelName`, physics,
+/// seats, health and other components.
 pub const TEMPLATE_DB_TYPE: u32 = 0x5647_c35d;
 
 impl<'a> Layer<'a> {
@@ -242,6 +281,7 @@ impl<'a> Layer<'a> {
                 record_size,
                 fields,
                 data: part(b"data", "COMP/data")?,
+                grouped: !uniq.is_empty(),
             });
         }
         Ok(Self {
@@ -264,18 +304,16 @@ impl<'a> Layer<'a> {
         let Some(c) = self.component("Name") else {
             return out;
         };
-        // A layer stores one byte after the name; the template database
-        // the schema's whole record.
-        let tail = if self.uniq.is_empty() {
-            1
-        } else {
-            c.record_size as usize
-        };
         let mut r = Reader::at(c.data, 0);
         for _ in 0..c.count {
+            // The template database groups each name under a count of
+            // the (one) template it names.
+            if c.grouped && r.u32().is_ok_and(|k| k != 1) {
+                break;
+            }
             let Ok(entity) = r.u32() else { break };
             let Ok(name) = r.cstr() else { break };
-            if r.take(tail).is_err() {
+            if r.take(1).is_err() {
                 break;
             }
             if let Ok(name) = std::str::from_utf8(name) {
@@ -439,20 +477,27 @@ mod tests {
     #[test]
     fn parses_the_template_database() {
         let mut names = Vec::new();
-        for (t, n) in [(7u32, "M151 Softtop (VZ)"), (8, "Van (base)")] {
+        for (t, n) in [
+            (7u32, "M151 Softtop (VZ)"),
+            (8, "M151 .50Cal (VZ)"),
+            (9, "Van (base)"),
+        ] {
+            // A group of one, the name, one byte.
+            names.extend(1u32.to_le_bytes());
             names.extend(t.to_le_bytes());
             names.extend(n.as_bytes());
-            // The whole 5-byte record follows the name.
-            names.extend([0, 1, 2, 3, 4, 5]);
+            names.extend([0, 0]);
         }
+        // Two groups: the two jeeps share a model, the van has its own.
+        let models = le(&[2, 7, 8, 0xCCCC, 1, 9, 0xDDDD]);
         let a = ucfx(&[
             UcfxNode::Leaf(*b"CHDR", le(&[0x0038_0000, 2])),
             UcfxNode::Leaf(*b"enum", le(&[0])),
-            UcfxNode::Leaf(*b"UNIQ", le(&[1, 2, 3])),
+            UcfxNode::Leaf(*b"UNIQ", le(&[3, 7, 8, 9])),
             comp(
                 "Name",
                 0x1de5_c824,
-                2,
+                3,
                 &[(8, 0x1de5_c824, 0), (1, 0x12af_a0b8, 4)],
                 5,
                 names,
@@ -460,18 +505,32 @@ mod tests {
             comp(
                 "ModelName",
                 0x4b7c_8ad1,
-                1,
+                2,
                 &[(6, 0xc47b_227c, 0)],
                 4,
-                le(&[7, 0xCCCC]),
+                models,
             ),
         ]);
         let db = Layer::parse(&a).unwrap();
         assert_eq!(db.flgt, 0);
         assert!(db.flags.is_empty());
-        assert_eq!(db.uniq, le(&[1, 2, 3]));
+        assert_eq!(db.uniq, le(&[3, 7, 8, 9]));
         assert_eq!(db.names()[&7], "M151 Softtop (VZ)");
-        assert_eq!(db.hashes("ModelName"), HashMap::from([(7, 0xCCCC)]));
+        assert_eq!(db.names()[&9], "Van (base)");
+        assert_eq!(
+            db.hashes("ModelName"),
+            HashMap::from([(7, 0xCCCC), (8, 0xCCCC), (9, 0xDDDD)])
+        );
+        // A walk that doesn't end on the data is no record list: claim
+        // three groups where there are two.
+        let at = a
+            .windows(8)
+            .position(|w| w == le(&[2, 7]).as_slice())
+            .unwrap();
+        let mut b = a.clone();
+        b[at] = 3;
+        let bad = Layer::parse(&b).unwrap();
+        assert!(bad.component("ModelName").unwrap().records().is_none());
     }
 
     #[test]

@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
-use m2_assets::layer::LAYER_TYPE;
+use m2_assets::layer::{LAYER_TYPE, TEMPLATE_DB_TYPE};
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::path::PATH_TYPE;
 use m2_assets::terrain::{CELL_SIZE, TerrainGroup, colour_map_uv};
@@ -52,11 +52,9 @@ pub struct ObjectPlacement {
     pub named: bool,
 }
 
-/// An entity of the static layers whose name is a template, not an
-/// asset: the game's own parked vehicles (`M151 Softtop (VZ)`, `HMMWV
-/// (Softtop)`, `Small Fishing Boat`), pickups and emplacements. Which
-/// model a template is isn't stored in the archives in a form decoded
-/// yet; the name's words say.
+/// An entity of the static layers whose name is a vehicle template
+/// (`M151 Softtop (VZ)`, `HMMWV (Softtop)`, `Small Fishing Boat`), or a
+/// template the database doesn't know: the game's own parked vehicles.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TemplatePlacement {
     pub entity: u32,
@@ -64,6 +62,88 @@ pub struct TemplatePlacement {
     pub name: String,
     pub position: Vec3,
     pub rotation: Quat,
+    /// The template's model, from the template database's `ModelName`;
+    /// `None` when the database doesn't give it one.
+    pub model: Option<u32>,
+    /// What drives it, from the database's physics components.
+    pub kind: VehicleKind,
+}
+
+/// What a vehicle template drives as, by which physics component the
+/// template database gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VehicleKind {
+    /// `_CarPhysicsV2`: cars, trucks, vans, bikes.
+    Car,
+    /// `_TankPhysics`: tanks and tracked APCs.
+    Tank,
+    /// `_BoatPhysics`.
+    Boat,
+    /// `_HelicopterPhysics`.
+    Helicopter,
+    /// No physics the database names: a template it doesn't define.
+    Unknown,
+}
+
+/// What the template database says of one template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TemplateInfo {
+    model: Option<u32>,
+    vehicle: Option<VehicleKind>,
+}
+
+/// The template database by template name.
+#[derive(Default)]
+struct Templates(HashMap<String, TemplateInfo>);
+
+impl Templates {
+    /// Reads the one template database asset, if the archive has it.
+    fn read<R: Read + Seek>(source: &mut AssetSource<R>, models: &HashSet<u32>) -> Self {
+        let index = source.archive().index();
+        let Some(hash) = index
+            .assets()
+            .iter()
+            .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+            .map(|a| a.name_hash)
+        else {
+            return Self::default();
+        };
+        let Ok(data) = source.asset(hash, TEMPLATE_DB_TYPE) else {
+            return Self::default();
+        };
+        let Ok(db) = Layer::parse(&data) else {
+            return Self::default();
+        };
+        let model_of = db.hashes("ModelName");
+        let mut kinds: HashMap<u32, VehicleKind> = HashMap::new();
+        for (component, kind) in [
+            ("_CarPhysicsV2", VehicleKind::Car),
+            ("_TankPhysics", VehicleKind::Tank),
+            ("_BoatPhysics", VehicleKind::Boat),
+            ("_HelicopterPhysics", VehicleKind::Helicopter),
+        ] {
+            let Some(c) = db.component(component) else {
+                continue;
+            };
+            for (id, _) in c.records().unwrap_or_default() {
+                kinds.insert(id, kind);
+            }
+        }
+        Self(
+            db.names()
+                .into_iter()
+                .map(|(id, name)| {
+                    (
+                        name.to_owned(),
+                        TemplateInfo {
+                            model: model_of.get(&id).copied().filter(|m| models.contains(m)),
+                            vehicle: kinds.get(&id).copied(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Components whose entities are never a template placement: roads,
@@ -118,8 +198,8 @@ pub struct WorldIndex {
     /// the merged town batches are among them (see
     /// [`Model::tiny_members`](m2_assets::Model::tiny_members)).
     pub members: HashMap<u32, Member>,
-    /// Entities of the static layers placed by a template name that is no
-    /// asset: the game's own vehicles among them.
+    /// Entities of the static layers placed by a template name that is a
+    /// vehicle, or that the template database doesn't define.
     pub templates: Vec<TemplatePlacement>,
 }
 
@@ -147,6 +227,8 @@ struct Assets {
     models: HashSet<u32>,
     /// Name hashes of every asset of every type.
     any: HashSet<u32>,
+    /// The template database.
+    templates: Templates,
 }
 
 /// What [`WorldIndex::build`] gathers to find patrol routes: soldier to
@@ -183,7 +265,7 @@ impl WorldIndex {
             .map(|b| (b, index.blocks()[b].path.contains("layers_static")))
             .collect();
         blocks.sort_unstable();
-        let assets = Assets {
+        let mut assets = Assets {
             models: index
                 .assets()
                 .iter()
@@ -191,7 +273,9 @@ impl WorldIndex {
                 .map(|a| a.name_hash)
                 .collect(),
             any: index.assets().iter().map(|a| a.name_hash).collect(),
+            templates: Templates::default(),
         };
+        assets.templates = Templates::read(source, &assets.models);
 
         let mut world = Self::default();
         let mut routes = Routes::default();
@@ -322,19 +406,57 @@ impl WorldIndex {
                 if models.contains_key(&entity) || not_templates.contains(&entity) {
                     continue;
                 }
-                match stem_hash {
-                    Some(h) if assets.models.contains(&h) => self.objects.push(ObjectPlacement {
-                        model: h,
-                        position,
-                        rotation,
-                        named: true,
-                    }),
-                    Some(h) if !assets.any.contains(&h) => self.templates.push(TemplatePlacement {
+                let template = assets.templates.0.get(stem);
+                match (stem_hash, template) {
+                    // Its name is a model.
+                    (Some(h), _) if assets.models.contains(&h) => {
+                        self.objects.push(ObjectPlacement {
+                            model: h,
+                            position,
+                            rotation,
+                            named: true,
+                        })
+                    }
+                    // A vehicle template that drives: the alpha places it.
+                    (
+                        _,
+                        Some(&TemplateInfo {
+                            model,
+                            vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank)),
+                        }),
+                    ) => self.templates.push(TemplatePlacement {
                         entity,
                         name: stem.to_owned(),
                         position,
                         rotation,
+                        model,
+                        kind,
                     }),
+                    // A template with a model that doesn't drive yet (a
+                    // boat, a helicopter) or has no physics (a pickup, an
+                    // emplacement, a prop): placed as it stands.
+                    (
+                        _,
+                        Some(&TemplateInfo {
+                            model: Some(model), ..
+                        }),
+                    ) => self.objects.push(ObjectPlacement {
+                        model,
+                        position,
+                        rotation,
+                        named: true,
+                    }),
+                    // A name no asset or template defines: the words may.
+                    (Some(h), None) if !assets.any.contains(&h) => {
+                        self.templates.push(TemplatePlacement {
+                            entity,
+                            name: stem.to_owned(),
+                            position,
+                            rotation,
+                            model: None,
+                            kind: VehicleKind::Unknown,
+                        })
+                    }
                     _ => {}
                 }
             }

@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use m2_engine::{Physics, TemplatePlacement, VehicleControls};
+use m2_engine::{CatalogueEntry, Physics, TemplatePlacement, VehicleControls, VehicleKind};
 use m2_math::glam::{Vec3, Vec4Swizzles};
 use m2_render::View;
 
@@ -108,7 +108,21 @@ impl Game {
             if placed >= WORLD_VEHICLES {
                 break;
             }
-            let models = vehicle_models(&t.name, &catalogue.vehicles);
+            let models = match t.model {
+                // The database's model.
+                Some(model) => vec![CatalogueEntry {
+                    model,
+                    kind: if t.kind == VehicleKind::Tank {
+                        "tank"
+                    } else {
+                        "car"
+                    }
+                    .to_owned(),
+                    label: t.name.clone(),
+                }],
+                // The name's words pick a catalogue model.
+                None => vehicle_models(&t.name, &catalogue.vehicles),
+            };
             if models.is_empty() {
                 continue;
             }
