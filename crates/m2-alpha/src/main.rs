@@ -89,6 +89,8 @@ struct Options {
     drive: bool,
     fight: bool,
     mission: bool,
+    mission_drivers: Vec<(String, String)>,
+    mission_seconds: f32,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -144,6 +146,17 @@ fn parse_args() -> anyhow::Result<Options> {
             "--drive" => o.drive = true,
             "--fight" => o.fight = true,
             "--mission" => o.mission = true,
+            "--mission-driver" => {
+                let path = value()?;
+                let code =
+                    std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
+                o.mission_drivers.push((path, code));
+            }
+            "--mission-seconds" => {
+                o.mission_seconds = value()?
+                    .parse()
+                    .context("--mission-seconds expects seconds")?
+            }
             "--sea" => o.sea = Some(value()?.parse().context("--sea expects metres")?),
             "--screenshot" => o.screenshot = Some(value()?.into()),
             "--write-config" => o.write_config = true,
@@ -242,6 +255,7 @@ fn main() -> anyhow::Result<()> {
         double_sided: options.double_sided,
         fly: options.fly,
         mission: options.mission,
+        mission_drivers: options.mission_drivers.clone(),
         state: None,
         error: None,
     };
@@ -435,6 +449,7 @@ fn screenshot(
             &mut backend,
             &mut game,
             install,
+            options,
             fov,
             aspect,
         )?);
@@ -491,11 +506,12 @@ fn mission_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
     install: &Install,
+    options: &Options,
     fov: f32,
     aspect: f32,
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
-    let mut link = mission::MissionLink::start(install);
+    let mut link = mission::MissionLink::start(install, options.mission_drivers.clone());
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -517,8 +533,13 @@ fn mission_for_screenshot(
         },
         started.elapsed().as_secs_f32()
     );
-    // Ten seconds of play, streaming as it goes.
-    for i in 0..600 {
+    // Ten seconds of play (or as asked), streaming as it goes.
+    let seconds = if options.mission_seconds > 0.0 {
+        options.mission_seconds
+    } else {
+        10.0
+    };
+    for i in 0..(seconds / tick).round() as u32 {
         game.step(Intent::default(), tick);
         link.tick(game, tick);
         if i % 30 == 0 {
@@ -544,6 +565,12 @@ fn mission_for_screenshot(
         view.message,
         view.status
     );
+    for (label, at) in mission::MissionLink::vehicles(game) {
+        match at {
+            Some(at) => eprintln!("mission vehicle {label} at {at:.1}"),
+            None => eprintln!("mission vehicle {label} not placed"),
+        }
+    }
     Ok(link)
 }
 
@@ -835,6 +862,8 @@ struct App {
     fly: bool,
     /// Run the mission scripts.
     mission: bool,
+    /// Lua to run before they start (`--mission-driver`).
+    mission_drivers: Vec<(String, String)>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -893,9 +922,9 @@ impl App {
             egui,
             hud,
             mission: match (&self.install, &self.mode) {
-                (Some(install), Mode::Island(_)) if self.mission => {
-                    Some(mission::MissionLink::start(install))
-                }
+                (Some(install), Mode::Island(_)) if self.mission => Some(
+                    mission::MissionLink::start(install, self.mission_drivers.clone()),
+                ),
                 _ => None,
             },
         })
