@@ -29,4 +29,4 @@ pub use model::{CpuModel, GpuModel, MaterialCache};
 pub use physics::{Character, CollisionShape, Physics, StaticKey, VehicleControls, VehicleId};
 pub use stream::{World, WorldSettings, WorldStats};
 pub use vehicle::{Catalogue, CatalogueEntry, PersonModel, VehicleSpec};
-pub use world::{TemplatePlacement, VehicleKind, WorldIndex};
+pub use world::{TemplateInfo, TemplatePlacement, Templates, VehicleKind, WorldIndex};

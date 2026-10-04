@@ -23,7 +23,8 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use m2_assets::WadArchive;
 use m2_engine::vehicle::DRIVABLE;
-use m2_engine::{CatalogueEntry, Install};
+use m2_engine::world::member_stem;
+use m2_engine::{CatalogueEntry, Install, TemplateInfo, Templates, VehicleKind};
 use m2_game::api::Command;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
@@ -418,6 +419,12 @@ impl Fleet {
             return;
         };
         let near = player.character.position;
+        let templates = game
+            .scene
+            .world
+            .as_ref()
+            .map(|w| w.index.template_db.clone())
+            .unwrap_or_default();
         let w = mission.world().borrow();
         let mut wanted: Vec<(f32, u32, Vec<CatalogueEntry>)> = w
             .objects
@@ -428,7 +435,7 @@ impl Fleet {
                 (d <= VEHICLE_REACH).then_some((d, g, o))
             })
             .filter_map(|(d, g, o)| {
-                let models = vehicle_models(&o.name, &catalogue.vehicles);
+                let models = template_models(&o.name, &templates, &catalogue.vehicles);
                 (!models.is_empty()).then_some((d, g, models))
             })
             .collect();
@@ -560,6 +567,37 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
     matches!(c, Command::EnterVehicle { .. })
 }
 
+/// The model a vehicle template of the scripts' drives as: the template
+/// database's, when it has the template and it drives on the ground
+/// (boats and helicopters don't drive yet); else the catalogue models
+/// whose name fits the template's words ([`vehicle_models`]).
+pub(crate) fn template_models(
+    name: &str,
+    templates: &Templates,
+    catalogue: &[CatalogueEntry],
+) -> Vec<CatalogueEntry> {
+    match templates.get(name) {
+        Some(&TemplateInfo {
+            model: Some(model),
+            vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank)),
+        }) => vec![CatalogueEntry {
+            model,
+            kind: if kind == VehicleKind::Tank {
+                "tank"
+            } else {
+                "car"
+            }
+            .to_owned(),
+            label: member_stem(name).to_owned(),
+        }],
+        Some(&TemplateInfo {
+            vehicle: Some(VehicleKind::Boat | VehicleKind::Helicopter),
+            ..
+        }) => Vec::new(),
+        _ => vehicle_models(name, catalogue),
+    }
+}
+
 /// Catalogue models that could be a vehicle template of the scripts', best
 /// first: those whose model name (the texture name's last part,
 /// `m151` of `vz_veh_truck_m151`) is a word of the template's name (or
@@ -619,6 +657,8 @@ pub(crate) fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<Ca
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn entry(model: u32, kind: &str, label: &str) -> CatalogueEntry {
@@ -652,5 +692,45 @@ mod tests {
         assert!(models("Alouette3 Transport (VZA Intro) (Driver)").is_empty());
         assert!(models("VZ Soldier 0x00000001").is_empty());
         assert!(models("Supply Drop (GL)").is_empty());
+    }
+
+    #[test]
+    fn the_template_database_names_the_model_first() {
+        let catalogue = [entry(1, "truck", "gr_veh_truck_m151")];
+        let info = |model, vehicle| TemplateInfo { model, vehicle };
+        let db = Templates(HashMap::from([
+            (
+                "m151 softtop (vz)".to_owned(),
+                info(Some(0xabc), Some(VehicleKind::Car)),
+            ),
+            (
+                "amx30 (full)".to_owned(),
+                info(Some(0xdef), Some(VehicleKind::Tank)),
+            ),
+            (
+                "patrol boat (vz)".to_owned(),
+                info(Some(0x123), Some(VehicleKind::Boat)),
+            ),
+            (
+                "m151 softtop (gl)".to_owned(),
+                info(None, Some(VehicleKind::Car)),
+            ),
+        ]));
+        let models = |n: &str| -> Vec<(u32, String)> {
+            template_models(n, &db, &catalogue)
+                .into_iter()
+                .map(|e| (e.model, e.kind))
+                .collect()
+        };
+        // The database's model, whatever the case and the entity's id.
+        assert_eq!(
+            models("M151 Softtop (VZ) 0x0012abcd"),
+            [(0xabc, "car".to_owned())]
+        );
+        assert_eq!(models("AMX30 (Full)"), [(0xdef, "tank".to_owned())]);
+        // A boat doesn't drive yet.
+        assert!(models("Patrol Boat (VZ)").is_empty());
+        // Without a model in the database, the words find the catalogue's.
+        assert_eq!(models("M151 Softtop (GL)"), [(1, "truck".to_owned())]);
     }
 }
