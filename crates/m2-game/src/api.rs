@@ -92,6 +92,19 @@ pub enum Command {
         target: Option<u32>,
     },
     ExitVehicle(u32),
+    /// Stream a layer in or out; report it done with
+    /// [`crate::layers::finished`].
+    Layer {
+        op: crate::layers::LayerOp,
+        name: String,
+    },
+    /// The scripts asked for a game state (`"WaitForStreaming"`): the
+    /// game goes into it, and sets [`ScriptWorld::game_state`] back to
+    /// `"Game"` when it is done (the world has streamed in).
+    GameState(String),
+    /// A call the game only needs to hear about: `"Pg.SaveGame"`,
+    /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
+    Notify(String),
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -104,6 +117,13 @@ pub struct ScriptWorld {
     /// `Debug.Printf` output, oldest first.
     pub printed: Vec<String>,
     next_spawn: u32,
+    /// What `Sys.GetAssetRequestMax` answers; scripts raise it while
+    /// layers load and put it back.
+    pub asset_request_max: u32,
+    /// The game state (`Sys.RequestGameState`), `"Game"` while playing.
+    pub game_state: String,
+    /// Layers the archives hold and which are loaded.
+    pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
     goal_callbacks: Vec<(u32, Function, Option<Table>)>,
 }
@@ -164,6 +184,10 @@ impl World for ScriptWorld {
         out.sort_unstable();
         out
     }
+
+    fn game_state(&self) -> Option<String> {
+        Some(self.game_state.clone())
+    }
 }
 
 /// The world shared between the game and the script libraries.
@@ -219,6 +243,37 @@ fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
 
 /// Installs the libraries over `world`. Functions not written here stay
 /// missing (or stubs, with `ScriptHost::stub_missing_globals`).
+/// The engine's libraries (the rest of the globals scripts use are their
+/// own modules); see `ScriptHost::complete_libraries`.
+pub const LIBRARIES: [&str; 26] = [
+    "Ai",
+    "Airstrike",
+    "Camera",
+    "Controller",
+    "Debug",
+    "Event",
+    "Graphics",
+    "Gui",
+    "Hud",
+    "Human",
+    "Marker",
+    "Math",
+    "Munitions",
+    "Net",
+    "Object",
+    "ObjectFilter",
+    "ObjectState",
+    "Pda",
+    "Pg",
+    "Player",
+    "Sound",
+    "String",
+    "Sys",
+    "Vehicle",
+    "VO",
+    "Weapon",
+];
+
 pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     let globals = lua.globals();
     let lib = |name: &str| -> mlua::Result<Table> {
@@ -257,6 +312,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .collect();
         w.printed.push(text.concat());
         values([])
+    })?;
+
+    add(&debug, "GetCallstack", |_, lua, _| {
+        values([Value::String(lua.create_string("")?)])
     })?;
 
     let pg = lib("Pg")?;
@@ -416,6 +475,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let player = lib("Player")?;
+    // A new game starts at the usual marker.
+    add(&player, "GetPlayerStart", |_, lua, _| {
+        values([Value::String(lua.create_string("PlayerLocation_Start")?)])
+    })?;
+    // The PMC's fuel tank: invented, the game's figure is not decoded.
+    add(&player, "GetFuelCapacity", |_, _, _| {
+        values([Value::Number(100.0)])
+    })?;
     for name in [
         "GetLocalCharacter",
         "GetAnyCharacter",
@@ -491,6 +558,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let ai = lib("Ai")?;
+    // Faction relations are not modelled yet: everyone is neutral (0 on
+    // the scale the faction manager converts to attitude levels).
+    add(&ai, "GetRelation", |_, _, _| values([Value::Number(0.0)]))?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -529,7 +599,133 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     for name in ["IsClient", "IsActive", "IsMultiplayer"] {
         add(&net, name, |_, _, _| values([Value::Boolean(false)]))?;
     }
-    Ok(())
+    // Co-op bookkeeping around layer loads: nothing to do.
+    for name in [
+        "BeginLayerEventGroup",
+        "EndLayerEventGroup",
+        "DoneReloadingLayers",
+    ] {
+        add(&net, name, |_, _, _| values([]))?;
+    }
+
+    // Calls the game only needs to hear about.
+    for name in [
+        "SaveGame",
+        "ContractActivated",
+        "ContractCompleted",
+        "ContractCancelled",
+    ] {
+        pg.set(name, notifier(lua, world, format!("Pg.{name}"))?)?;
+    }
+    add(&pg, "LoadIsRetry", |_, _, _| {
+        values([Value::Boolean(false)])
+    })?;
+    // No saves yet: every load is a new game, which the bootstrap starts
+    // itself (`LoadSingleton(nil)`) when this answers false.
+    add(&pg, "LoadGame", |w, _, _| {
+        w.commands.push(Command::Notify("Pg.LoadGame".into()));
+        values([Value::Boolean(false)])
+    })?;
+
+    // Developer switches (skip to a mission, force a briefing): all off.
+    let sys = lib("Sys")?;
+    for name in ["GetSkipMission", "GetINIBriefing", "GetForceNewGame"] {
+        add(&sys, name, |_, _, _| values([Value::Nil]))?;
+    }
+    add(&sys, "SetSkipMission", |_, _, _| values([]))?;
+    add(&sys, "RequestGameState", |w, _, a| {
+        if let Some(Value::String(s)) = a.first() {
+            let state = s.to_string_lossy();
+            w.game_state = state.clone();
+            w.commands.push(Command::GameState(state));
+        }
+        values([])
+    })?;
+    add(&sys, "GetLevelName", |_, lua, _| {
+        values([Value::String(lua.create_string("vz")?)])
+    })?;
+    add(&sys, "GetIgnoreLayers", |_, lua, _| {
+        values([Value::Table(lua.create_table()?)])
+    })?;
+    // The streaming budget the layer manager raises while it loads.
+    {
+        let mut w = world.borrow_mut();
+        if w.asset_request_max == 0 {
+            w.asset_request_max = 8;
+        }
+        if w.game_state.is_empty() {
+            w.game_state = "Game".into();
+        }
+    }
+    add(&sys, "GetAssetRequestMax", |w, _, _| {
+        values([Value::Number(f64::from(w.asset_request_max))])
+    })?;
+    add(&sys, "SetAssetRequestMax", |w, _, a| {
+        if let Some(n) = num(a.first()) {
+            w.asset_request_max = n as u32;
+        }
+        values([])
+    })?;
+
+    // The engine's additions to the math library: random integers in
+    // [a, b] (or [1, a]) and random reals in [a, b].
+    lua.load(
+        r#"
+        local function randi(a, b)
+            if b then return math.random(a, b) end
+            return math.random(a)
+        end
+        local function randf(a, b)
+            a, b = a or 0, b or 1
+            return a + (b - a) * math.random()
+        end
+        math.randi, math.randf = randi, randf
+        local M = rawget(_G, "Math")
+        if type(M) ~= "table" then
+            M = {}
+            rawset(_G, "Math", M)
+        end
+        M.randi, M.randf = randi, randf
+        "#,
+    )
+    .set_name("=m2-math")
+    .exec()?;
+
+    // The game's assert: logged, and the script carries on, as a release
+    // build would.
+    lua.globals().raw_set(
+        "ASSERT",
+        safe_function(lua, {
+            let w = Rc::clone(world);
+            move |_, args| {
+                let args: Vec<Value> = args.into_iter().collect();
+                let holds = !matches!(
+                    args.first(),
+                    None | Some(Value::Nil | Value::Boolean(false))
+                );
+                if !holds {
+                    let what = match args.get(1) {
+                        Some(Value::String(s)) => s.to_string_lossy(),
+                        _ => String::new(),
+                    };
+                    w.borrow_mut()
+                        .printed
+                        .push(format!("ASSERT failed: {what}"));
+                }
+                Ok(MultiValue::new())
+            }
+        })?,
+    )?;
+    crate::layers::install(lua, world)
+}
+
+/// A function that records `call` as a [`Command::Notify`].
+fn notifier(lua: &Lua, world: &Shared, call: String) -> mlua::Result<Function> {
+    let w = Rc::clone(world);
+    safe_function(lua, move |_, _| {
+        w.borrow_mut().commands.push(Command::Notify(call.clone()));
+        Ok(MultiValue::new())
+    })
 }
 
 #[cfg(test)]
@@ -607,6 +803,68 @@ mod tests {
         world.borrow_mut().objects.get_mut(&1).unwrap().position = [1.0, 0.0, 1.0];
         assert!(events.update_shared(0.1, &world).is_empty());
         assert!(!world.borrow().objects[&50].alive);
+    }
+
+    #[test]
+    fn asserts_log_and_switches_are_off() {
+        let (host, world) = setup();
+        let n: f64 = host
+            .lua()
+            .load(
+                r#"
+                ASSERT(true, "fine")
+                ASSERT(false, "Unable to load layer")
+                Sys.SetAssetRequestMax(Sys.GetAssetRequestMax() + 8)
+                Pg.ContractActivated()
+                assert(Sys.GetSkipMission() == nil and #Sys.GetIgnoreLayers() == 0)
+                return Sys.GetAssetRequestMax()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(n, 16.0);
+        let mut w = world.borrow_mut();
+        assert_eq!(w.printed, ["ASSERT failed: Unable to load layer"]);
+        assert_eq!(
+            w.take_commands(),
+            [Command::Notify("Pg.ContractActivated".into())]
+        );
+    }
+
+    #[test]
+    fn game_state_changes_fire_events() {
+        let (host, world) = setup();
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                left = nil
+                Sys.RequestGameState("WaitForStreaming")
+                Event.Create(Event.GameStateChange, {"WaitForStreaming", "exit"},
+                    function(state, name, how) left = state .. " " .. name .. " " .. how end,
+                    {"streaming"})
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::GameState("WaitForStreaming".into())]
+        );
+        events.update_shared(0.5, &world);
+        let left: Option<String> = host.lua().globals().get("left").unwrap();
+        assert_eq!(left, None);
+        world.borrow_mut().game_state = "Game".into();
+        events.update_shared(0.5, &world);
+        let left: String = host.lua().globals().get("left").unwrap();
+        assert_eq!(left, "streaming WaitForStreaming exit");
+        let r: bool = host
+            .lua()
+            .load("local n = math.randi(3); return n >= 1 and n <= 3 and Math.randf(2, 2) == 2")
+            .eval()
+            .unwrap();
+        assert!(r);
     }
 
     #[test]

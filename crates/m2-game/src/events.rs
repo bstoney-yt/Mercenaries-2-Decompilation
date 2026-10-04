@@ -43,10 +43,16 @@ pub trait World {
     /// Objects carrying a label (`"Prisoner"`), for parameters that name
     /// a kind of object rather than one.
     fn labelled(&self, label: &str) -> Vec<u32>;
+    /// The game state the scripts last asked for with
+    /// `Sys.RequestGameState` and the game is in (`"WaitForStreaming"`
+    /// while the world streams in), if the world tracks it.
+    fn game_state(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 12] = [
+pub const KINDS: [&str; 13] = [
     "TimerRelative",
     "ObjectHibernation",
     "Boundary",
@@ -59,6 +65,7 @@ pub const KINDS: [&str; 12] = [
     "ObjectIsReady",
     "TimerAbsolute",
     "ObjectDamage",
+    "GameStateChange",
 ];
 
 #[derive(Debug)]
@@ -383,6 +390,21 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
                 }
             }
             no
+        }
+        // { state, "enter" or "exit" }: as the game enters or leaves a
+        // state; passes both.
+        "GameStateChange" => {
+            let (Some(state), Some(current)) = (text(&p.params, 1), world.game_state()) else {
+                return no;
+            };
+            let exit = text(&p.params, 2).as_deref() == Some("exit");
+            Check::Holds(
+                current.eq_ignore_ascii_case(&state) != exit,
+                vec![
+                    p.params.raw_get::<Value>(1).unwrap_or(Value::Nil),
+                    p.params.raw_get::<Value>(2).unwrap_or(Value::Nil),
+                ],
+            )
         }
         // { object, boundary, "enter" or "exit" }.
         "Boundary" => {

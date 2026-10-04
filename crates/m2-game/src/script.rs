@@ -180,6 +180,12 @@ impl ScriptHost {
             safe_function(&self.lua, |lua, args| match (args.front(), args.get(1)) {
                 (Some(Value::Table(g)), Some(Value::String(s))) => {
                     let name = s.to_string_lossy();
+                    // `_bBootstrapComplete` and the like: a script's own
+                    // state, nil until it sets it (and again after it sets
+                    // it to nil).
+                    if name.starts_with('_') {
+                        return Ok(MultiValue::from_vec(vec![Value::Nil]));
+                    }
                     let value = match default_for(lua, &name)? {
                         Some(v) => v,
                         None => Value::Table(stub(lua, &name)?),
@@ -191,6 +197,44 @@ impl ScriptHost {
             })?,
         )?;
         self.lua.globals().set_metatable(Some(meta))?;
+        Ok(())
+    }
+
+    /// Makes the members `libraries` (host tables such as `Pg`) don't
+    /// define functions that record the call, as stubs do, and return
+    /// nothing: an engine call not written yet answers nil rather than
+    /// failing the script.
+    pub fn complete_libraries(&self, libraries: &[&str]) -> Result<(), ScriptError> {
+        for &library in libraries {
+            let Value::Table(t) = self.lua.globals().raw_get::<Value>(library)? else {
+                continue;
+            };
+            if t.metatable().is_some() {
+                continue;
+            }
+            let meta = self.lua.create_table()?;
+            let log = Rc::clone(&self.log);
+            let library = library.to_owned();
+            meta.set(
+                "__index",
+                safe_function(&self.lua, move |lua, args| {
+                    let (Some(Value::Table(t)), Some(Value::String(k))) =
+                        (args.front(), args.get(1))
+                    else {
+                        return Ok(MultiValue::new());
+                    };
+                    let name = format!("{library}.{}", k.to_string_lossy());
+                    let log = Rc::clone(&log);
+                    let f = safe_function(lua, move |_, _| {
+                        log.borrow_mut().push(name.clone());
+                        Ok(MultiValue::new())
+                    })?;
+                    t.raw_set(k.clone(), &f)?;
+                    Ok(MultiValue::from_vec(vec![Value::Function(f)]))
+                })?,
+            )?;
+            t.set_metatable(Some(meta))?;
+        }
         Ok(())
     }
 
@@ -222,7 +266,8 @@ impl ScriptHost {
     }
     /// Provides `import`, `inherit`, `dynamic_import` and `dynamic_remove`
     /// over `library`. A module runs once, in its own environment (which
-    /// falls back to the globals), and that environment is the module:
+    /// falls back to the globals), and that environment is the module (and
+    /// a global of that name, unless one is already defined):
     /// `import("MrxUtil")` binds it as `MrxUtil` in the caller's
     /// environment, and `inherit("MrxTask")` also makes the caller's
     /// environment fall back to it, so the script extends that class. A
@@ -272,6 +317,17 @@ impl ScriptHost {
             env.set_metatable(Some(meta))?;
             // Cached before it runs, so modules loading each other finish.
             cache.raw_set(key.as_str(), &env)?;
+            // Loaded modules are globals too: scripts use some they never
+            // import themselves (MrxMissionFlow reads WifMissionData).
+            let globals = lua.globals();
+            let free = match globals.raw_get::<Value>(name.as_str())? {
+                Value::Nil => true,
+                Value::Table(t) => t.raw_get::<Value>(STUB_NAME)? != Value::Nil,
+                _ => false,
+            };
+            if free {
+                globals.raw_set(name.as_str(), &env)?;
+            }
             if let Some(script) = resolved {
                 let source = format!("={name}");
                 let bytes = script
@@ -329,7 +385,29 @@ impl ScriptHost {
                     return true
                 end
                 function import(name) return bind(caller(), name) end
-                function dynamic_import(name) return bind(caller(), name) end
+                -- dynamic_import(name, callback, args) loads in the
+                -- background in the game: the callback runs later, with
+                -- the args unpacked, when the host runs the deferred
+                -- calls.
+                __m2_deferred = {}
+                function dynamic_import(name, callback, args)
+                    local m = bind(caller(), name)
+                    if type(callback) == "function" then
+                        local q = __m2_deferred
+                        q[#q + 1] = { callback, args or {} }
+                    end
+                    return m
+                end
+                function __m2_run_deferred()
+                    local q = __m2_deferred
+                    __m2_deferred = {}
+                    local errors = {}
+                    for _, d in ipairs(q) do
+                        local ok, e = pcall(d[1], unpack(d[2]))
+                        if not ok then errors[#errors + 1] = tostring(e) end
+                    end
+                    return #q, errors
+                end
                 function dynamic_remove(name) end
                 function inherit(name)
                     local env = caller()
@@ -349,6 +427,39 @@ impl ScriptHost {
             .set_mode(ChunkMode::Text)
             .exec()?;
         Ok(())
+    }
+
+    /// Runs the callbacks of `dynamic_import`s made since the last call
+    /// (the modules are loaded; the game would have streamed them).
+    /// Returns how many ran and the errors of those that failed. Call
+    /// once a tick.
+    pub fn run_deferred(&self) -> Result<(usize, Vec<String>), ScriptError> {
+        let Ok(run) = self.lua.globals().raw_get::<Function>("__m2_run_deferred") else {
+            return Ok((0, Vec::new()));
+        };
+        Ok(run.call::<(usize, Vec<String>)>(())?)
+    }
+
+    /// Calls `Init` on every module loaded so far that defines one, in the
+    /// order they loaded, as the game's bootstraps do before play: many
+    /// modules set up their tables there. Returns those that failed.
+    pub fn init_modules(&self) -> Result<Vec<String>, ScriptError> {
+        let mut failed = Vec::new();
+        let globals = self.lua.globals();
+        for (name, hash) in self.modules() {
+            if hash.is_none() {
+                continue;
+            }
+            let Ok(Value::Table(m)) = globals.raw_get::<Value>(name.as_str()) else {
+                continue;
+            };
+            if let Ok(Value::Function(init)) = m.raw_get::<Value>("Init")
+                && let Err(e) = init.call::<()>(())
+            {
+                failed.push(format!("{name}: {}", tidy(&e.to_string())));
+            }
+        }
+        Ok(failed)
     }
 
     /// Runs script `hash` from `library` as an entry point: in its own
@@ -486,6 +597,34 @@ mod tests {
             host.modules(),
             [("Util".to_owned(), Some(1)), ("Task".to_owned(), Some(2))]
         );
+        // Loaded modules are globals too, for scripts that never import
+        // them.
+        let greet: String = host.lua().load("return Util.Greet('you')").eval().unwrap();
+        assert_eq!(greet, "hi you");
+    }
+
+    #[test]
+    fn dynamic_imports_call_back_later_and_modules_init() {
+        let host = ScriptHost::new().unwrap();
+        let library = Rc::new(crate::library::tests::library());
+        host.install_library(Rc::clone(&library), false).unwrap();
+        host.lua()
+            .load(
+                r#"
+                got = nil
+                local m = dynamic_import("Util", function(a, b) got = a .. b end, {"x", "y"})
+                assert(m.Greet ~= nil and got == nil)
+                Util.Init = function() Util.ready = true end
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(host.run_deferred().unwrap(), (1, Vec::new()));
+        let got: String = host.lua().globals().get("got").unwrap();
+        assert_eq!(got, "xy");
+        assert!(host.init_modules().unwrap().is_empty());
+        let ready: bool = host.lua().load("return Util.ready").eval().unwrap();
+        assert!(ready);
     }
 
     #[test]
@@ -544,6 +683,30 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((sum, text.as_str()), (3.0, "w=Graphics.GetHeight()"));
+        // A script's own state reads nil until set, and after it is unset.
+        let unset: bool = host
+            .lua()
+            .load("_bDone = true; _bDone = nil; return _bDone == nil and _tList == nil")
+            .eval()
+            .unwrap();
+        assert!(unset);
+    }
+
+    #[test]
+    fn library_members_not_written_answer_nil() {
+        let host = ScriptHost::new().unwrap();
+        host.lua()
+            .load("Pg = { Known = function() return 1 end }")
+            .exec()
+            .unwrap();
+        host.complete_libraries(&["Pg", "Nothing"]).unwrap();
+        let (known, missing): (i64, Option<i64>) = host
+            .lua()
+            .load("return Pg.Known(), Pg.LoadSomething('x')")
+            .eval()
+            .unwrap();
+        assert_eq!((known, missing), (1, None));
+        assert_eq!(host.take_calls(), ["Pg.LoadSomething"]);
     }
 
     #[test]
