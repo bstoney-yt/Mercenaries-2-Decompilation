@@ -264,11 +264,18 @@ impl<'a> Layer<'a> {
         let Some(c) = self.component("Name") else {
             return out;
         };
+        // A layer stores one byte after the name; the template database
+        // the schema's whole record.
+        let tail = if self.uniq.is_empty() {
+            1
+        } else {
+            c.record_size as usize
+        };
         let mut r = Reader::at(c.data, 0);
         for _ in 0..c.count {
             let Ok(entity) = r.u32() else { break };
             let Ok(name) = r.cstr() else { break };
-            if r.take(1).is_err() {
+            if r.take(tail).is_err() {
                 break;
             }
             if let Ok(name) = std::str::from_utf8(name) {
@@ -435,7 +442,8 @@ mod tests {
         for (t, n) in [(7u32, "M151 Softtop (VZ)"), (8, "Van (base)")] {
             names.extend(t.to_le_bytes());
             names.extend(n.as_bytes());
-            names.extend([0, 0]);
+            // The whole 5-byte record follows the name.
+            names.extend([0, 1, 2, 3, 4, 5]);
         }
         let a = ucfx(&[
             UcfxNode::Leaf(*b"CHDR", le(&[0x0038_0000, 2])),

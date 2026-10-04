@@ -53,6 +53,17 @@ impl Game {
         }
     }
 
+    /// Island vehicles asked for that have not been placed yet.
+    pub fn island_vehicles_loading(&self) -> bool {
+        let placed = self
+            .scene
+            .vehicles
+            .iter()
+            .filter(|v| v.spot.is_some() && v.id.is_some())
+            .count();
+        placed < self.fetched.len()
+    }
+
     /// Asks for the island's own vehicles near the player, once the
     /// vehicle catalogue is known, and places the ones that have loaded
     /// where the layers park them.
@@ -62,8 +73,13 @@ impl Game {
             return;
         };
         for v in scene.vehicles.iter_mut().filter(|v| v.id.is_none()) {
-            if let Some((_, at, yaw)) = v.spot {
-                place(&mut world.physics, v, at, yaw);
+            if let Some((entity, at, yaw)) = v.spot
+                && place(&mut world.physics, v, at, yaw)
+            {
+                eprintln!(
+                    "island vehicle {entity:#x}: {} parked at ({:.0}, {:.0}, {:.0})",
+                    v.spec.label, at.x, at.y, at.z
+                );
             }
         }
         self.vehicle_wait -= dt;
@@ -98,6 +114,10 @@ impl Game {
             }
             self.fetched.insert(t.entity);
             placed += 1;
+            eprintln!(
+                "island vehicle {:#x}: {} as {}",
+                t.entity, t.name, models[0].label
+            );
             let f = t.rotation * Vec3::Z;
             loads.push((t.entity, t.position, f.x.atan2(f.z), models));
         }
