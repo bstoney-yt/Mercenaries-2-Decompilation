@@ -37,6 +37,9 @@
 //! spot:<x>,<z>[,<r>]        what stands near a spot (default 30 m): models
 //!                           with their techniques and textures, and the
 //!                           layer entities with their components' fields
+//! entities:<word>[,..]      every entity of the layers whose name holds a
+//!                           word, or whose own name does, with its
+//!                           components' fields (400 a layer at most)
 //! find:<hash>[,..]          names for hashes
 //! ```
 //!
@@ -583,6 +586,25 @@ fn main() -> Result<(), Error> {
                     p.first().copied().unwrap_or(0.0),
                     p.get(1).copied().unwrap_or(0.0),
                     p.get(2).copied().unwrap_or(30.0),
+                )
+            }
+            "entities" => {
+                // Layers whose name holds a word, or entities whose name
+                // does; at most 400 a layer.
+                let words: Vec<String> = arg
+                    .split(',')
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+                layer_entities(
+                    &mut source,
+                    &names,
+                    400,
+                    |layer, name, _| {
+                        let name = name.to_ascii_lowercase();
+                        words.iter().any(|w| layer.contains(w) || name.contains(w))
+                    },
+                    |p| p.x,
                 )
             }
             "find" => {
@@ -1562,6 +1584,18 @@ fn spot<R: Read + Seek>(
         }
     }
     // The layer entities near the spot, with their components' fields.
+    layer_entities(source, names, usize::MAX, |_, _, p| d(p) < radius, d)
+}
+
+/// Every layer entity `keep` (layer, entity name, place) keeps, with its
+/// components' fields, at most `most` per layer, ordered by `order`.
+fn layer_entities<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    most: usize,
+    keep: impl Fn(&str, &str, Vec3) -> bool,
+    order: impl Fn(Vec3) -> f32,
+) -> Result<(), Error> {
     let index = source.archive().index();
     let mut blocks: Vec<usize> = index
         .assets()
@@ -1574,6 +1608,7 @@ fn spot<R: Read + Seek>(
     let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
     for b in blocks {
         let decoded = source.block(b)?;
+        let layer_name = m2_engine::world::layer_name(&paths[b]);
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
             if e.type_hash != LAYER_TYPE {
                 continue;
@@ -1582,18 +1617,21 @@ fn spot<R: Read + Seek>(
                 continue;
             };
             let placements = layer.placements();
+            let entity_names = layer.names();
             let mut near: Vec<(f32, u32)> = placements
                 .iter()
-                .map(|(&id, p)| (d(Vec3::from(p.position)), id))
-                .filter(|(dist, _)| *dist < radius)
+                .filter(|(id, p)| {
+                    let name = entity_names.get(id).copied().unwrap_or("");
+                    keep(&layer_name, name, Vec3::from(p.position))
+                })
+                .map(|(&id, p)| (order(Vec3::from(p.position)), id))
                 .collect();
             if near.is_empty() {
                 continue;
             }
-            near.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let entity_names = layer.names();
+            near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             println!(
-                "layer {:08x} {} in {}: {} entities near",
+                "layer {:08x} {} in {}: {} entities",
                 e.name_hash,
                 names.show(e.name_hash),
                 paths[b],
@@ -1611,10 +1649,10 @@ fn spot<R: Read + Seek>(
                     )
                 })
                 .collect();
-            for (dist, id) in near {
+            for (dist, id) in near.into_iter().take(most) {
                 let p = placements[&id];
                 println!(
-                    "  {id:08x} {dist:.1} m at ({:.1} {:.1} {:.1}) {:?}",
+                    "  {id:08x} {dist:.1} at ({:.1} {:.1} {:.1}) {:?}",
                     p.position[0],
                     p.position[1],
                     p.position[2],

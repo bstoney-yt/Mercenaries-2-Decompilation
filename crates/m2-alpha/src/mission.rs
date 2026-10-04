@@ -10,9 +10,12 @@
 //! play die in the scripts' world too.
 //! Ground vehicles of theirs near the player (dropped jeeps, a tank) are
 //! loaded and placed where they say, to be driven; which model a vehicle
-//! template is (`"M151 Softtop (VZ)"`) is guessed from the models' texture
-//! names (`vz_veh_truck_m151`). Their helicopters, boats and supply drops
-//! are not shown yet.
+//! template is (`"M151 Softtop (VZ)"`) comes from the template database,
+//! or is guessed from the models' texture names (`vz_veh_truck_m151`).
+//! The models of the state layers they load (a mission's gates) stand
+//! while the layer is in, and break when the scripts' object dies: a gate
+//! to destroy breaks to a blast by it or a vehicle driven into it. Their
+//! helicopters, boats and supply drops are not shown yet.
 //!
 //! The scripts' log goes to `m2-alpha-mission.log` beside the settings.
 
@@ -26,6 +29,7 @@ use m2_engine::vehicle::DRIVABLE;
 use m2_engine::world::member_stem;
 use m2_engine::{CatalogueEntry, Install, TemplateInfo, Templates, VehicleKind};
 use m2_game::api::Command;
+use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
@@ -38,8 +42,16 @@ const STEP: f32 = 0.1;
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 const WATERLINE: f32 = -36.0;
-/// How close a blast destroys a target the scripts named (a gate), metres.
+/// How close a blast destroys a target the scripts named (a gate), metres:
+/// from its model's box, or from its place when it shows no model.
+const BLAST_PAD: f32 = 4.0;
 const BLAST_REACH: f32 = 10.0;
+/// A target is rammed by driving into its box (padded this much, metres,
+/// for the vehicle's front to its middle) at this speed or more (m/s), as
+/// fast as it went in the last half second or so.
+const RAM_PAD: f32 = 4.0;
+const RAM_SPEED: f32 = 6.0;
+const SPEED_FADE: f32 = 12.0;
 /// Seconds an objective message stays up.
 const MESSAGE_TIME: f32 = 6.0;
 /// The scripts' vehicles are loaded within this far of the player, metres,
@@ -63,7 +75,12 @@ pub struct MissionView {
     pub markers: Vec<(Vec3, String, [u8; 4])>,
     /// The newest objective message: completed (or else added), and text.
     pub message: Option<(bool, String)>,
+    /// The contract was just completed (for [`BANNER_TIME`] seconds).
+    pub contract_complete: bool,
 }
+
+/// Seconds the contract's completion stays up.
+const BANNER_TIME: f32 = 10.0;
 
 enum State {
     Loading(Receiver<Result<GameData, String>>),
@@ -86,6 +103,10 @@ pub struct MissionLink {
     /// Blasts since the scripts last ran.
     blasts: Vec<Vec3>,
     vehicles: Fleet,
+    /// Seconds since the scripts said the contract was completed.
+    completed: Option<f32>,
+    /// The speed of the vehicle she drives, held a little (m/s).
+    speed: f32,
 }
 
 /// The scripts' vehicles in play.
@@ -151,6 +172,8 @@ impl MissionLink {
             ashore: 0,
             blasts: Vec::new(),
             vehicles: Fleet::default(),
+            completed: None,
+            speed: 0.0,
         }
     }
 
@@ -168,6 +191,9 @@ impl MissionLink {
     /// player.
     pub fn tick(&mut self, game: &mut Game, dt: f32) {
         if let Some((_, _, age)) = &mut self.message {
+            *age += dt;
+        }
+        if let Some(age) = &mut self.completed {
             *age += dt;
         }
         if let State::Loading(rx) = &self.state {
@@ -223,8 +249,24 @@ impl MissionLink {
                     .collect()
             };
             game.scene.people.mission_soldiers = targets.iter().map(|t| t.0).collect();
+            // A vehicle driven hard into a target (a gate) breaks it too:
+            // by its speed of late, as the gate stops it.
+            let driving = game.driving();
+            let speed = driving.map_or(0.0, |(_, v)| v.abs());
+            self.speed = speed.max(self.speed - SPEED_FADE * STEP);
+            let ram = driving
+                .filter(|_| self.speed >= RAM_SPEED)
+                .map(|(at, _)| at);
             for (g, at) in &targets {
-                if self.blasts.iter().any(|b| b.distance(*at) <= BLAST_REACH) {
+                let props = &game.scene.props;
+                let hit = |p: Vec3, pad: f32| {
+                    props
+                        .touches(*g, p, pad)
+                        .unwrap_or_else(|| p.distance(*at) <= BLAST_REACH)
+                };
+                if self.blasts.iter().any(|&b| hit(b, BLAST_PAD))
+                    || ram.is_some_and(|r| props.touches(*g, r, RAM_PAD) == Some(true))
+                {
                     mission.kill(*g);
                 }
             }
@@ -235,7 +277,11 @@ impl MissionLink {
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
                 }
+                if c == Command::Notify("Pg.ContractCompleted".into()) {
+                    self.completed = Some(0.0);
+                }
             }
+            break_props(game, mission);
             let w = mission.world().borrow();
             if let Some((done, text)) = w.hud.messages.last() {
                 self.message = Some((*done, mission.text(text), 0.0));
@@ -302,6 +348,80 @@ impl MissionLink {
             .collect()
     }
 
+    /// A readable account of where the mission stands, for screenshot
+    /// runs: the state layers loaded, and each marker with what stands at
+    /// it (a soldier of the island, one of the scripts' vehicles).
+    pub fn report(&self, game: &Game) -> Vec<String> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let layers: Vec<String> = mission
+            .loaded_layers()
+            .into_iter()
+            .filter(|n| !m2_game::layers::LayerState::is_static(n))
+            .collect();
+        out.push(format!("state layers loaded: {}", layers.join(", ")));
+        let at = game.focus();
+        let w = mission.world().borrow();
+        let spawns = game
+            .scene
+            .world
+            .as_ref()
+            .map(|w| w.index.spawns.as_slice())
+            .unwrap_or_default();
+        for m in w.hud.markers.values() {
+            let Some(g) = m.target else { continue };
+            let Some(o) = w.objects.get(&g) else {
+                out.push(format!("marker {} on {g:#x}: no such object", m.icon));
+                continue;
+            };
+            let p = Vec3::from(o.position);
+            let mut what = Vec::new();
+            if let Some(s) = spawns.iter().find(|s| s.entity == g) {
+                what.push(format!(
+                    "spawn {:?} {:.1} m off",
+                    s.name,
+                    s.position.distance(p)
+                ));
+            }
+            if let Some(n) = game.scene.people.npcs.iter().find(|n| n.spawn == Some(g)) {
+                what.push(format!(
+                    "soldier {} at {:.1}",
+                    if n.alive { "alive" } else { "dead" },
+                    n.character.position
+                ));
+            }
+            if game.scene.people.all_killed().contains(&g) {
+                what.push("killed".into());
+            }
+            if let Some(v) = game.scene.vehicles.iter().find(|v| v.guid == Some(g)) {
+                what.push(format!(
+                    "vehicle {} {}",
+                    v.spec.label,
+                    if v.id.is_some() {
+                        "placed"
+                    } else {
+                        "not placed"
+                    }
+                ));
+            }
+            out.push(format!(
+                "marker {} on {:?} ({g:#x}) at {p:.1}, {:.0} m away, {}: {}",
+                m.icon.trim_start_matches("HUD_objective_"),
+                o.name,
+                p.distance(at),
+                if o.alive { "alive" } else { "dead" },
+                if what.is_empty() {
+                    "nothing of the island's there".to_owned()
+                } else {
+                    what.join("; ")
+                }
+            ));
+        }
+        out
+    }
+
     /// What the HUD shows.
     pub fn view(&self) -> MissionView {
         let message = self
@@ -354,6 +474,7 @@ impl MissionLink {
             objectives,
             markers,
             message,
+            contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
         }
     }
 }
@@ -492,9 +613,41 @@ fn go_ashore(game: &mut Game) -> bool {
     false
 }
 
-/// Carries out a script command about the player or the scripts'
-/// vehicles; true when it seated her in a vehicle the island doesn't show,
-/// so she stands where it is.
+/// Whether `guid` is a layer entity that places a person.
+fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
+    world.index.spawns.iter().any(|s| s.entity == guid)
+}
+
+/// Breaks the state layers' models whose objects the scripts' world has
+/// dead (a gate blown up), and takes down those it no longer has.
+fn break_props(game: &mut Game, mission: &Mission) {
+    let scene = &mut game.scene;
+    let Some(world) = &mut scene.world else {
+        return;
+    };
+    let w = mission.world().borrow();
+    let (dead, gone): (Vec<u32>, Vec<u32>) = {
+        let mut dead = Vec::new();
+        let mut gone = Vec::new();
+        for (e, p) in scene.props.shown() {
+            match w.objects.get(&e) {
+                Some(o) if !o.alive && !p.wrecked => dead.push(e),
+                None => gone.push(e),
+                _ => {}
+            }
+        }
+        (dead, gone)
+    };
+    drop(w);
+    for e in dead {
+        scene.props.wreck(&mut world.physics, e);
+    }
+    scene.props.hide(&mut world.physics, gone);
+}
+
+/// Carries out a script command about the player, the scripts' vehicles
+/// or the layers they stream; true when it seated her in a vehicle the
+/// island doesn't show, so she stands where it is.
 fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> bool {
     let index = |guid: &u32| {
         game.scene
@@ -522,8 +675,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
-        // Moved by the scripts: placed afresh where they now say, with
-        // her back in it if she was driving it.
+        // Moved by the scripts: a vehicle is placed afresh where they now
+        // say, with her back in it if she was driving it; a layer's model
+        // just moves.
         Command::Move { guid, .. } | Command::Remove(guid) if *guid != PLAYER => {
             if let (Some(i), Some(world)) = (index(guid), &mut game.scene.world)
                 && let Some(id) = game.scene.vehicles[i].id.take()
@@ -534,11 +688,53 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     fleet.reenter = Some(*guid);
                 }
             }
+            let scene = &mut game.scene;
+            if let Some(world) = &mut scene.world {
+                match c {
+                    Command::Move { position, .. } => {
+                        scene
+                            .props
+                            .put(&mut world.physics, *guid, Vec3::from(*position));
+                    }
+                    _ if is_spawn(world, *guid) => {
+                        scene.people.script_kill(&mut world.physics, *guid, true);
+                    }
+                    _ => {}
+                }
+            }
             return false;
         }
         Command::Kill(guid) => {
             if let Some(i) = index(guid) {
                 game.scene.vehicles[i].wrecked = true;
+            }
+            let scene = &mut game.scene;
+            if let Some(world) = &mut scene.world
+                && is_spawn(world, *guid)
+            {
+                scene.people.script_kill(&mut world.physics, *guid, false);
+            }
+            return false;
+        }
+        // A state layer in or out: its models with it.
+        Command::Layer { op, name } => {
+            let entities: Vec<u32> = mission
+                .layer(name)
+                .map(|es| es.iter().map(|e| e.guid).collect())
+                .unwrap_or_default();
+            let scene = &mut game.scene;
+            if let Some(world) = &mut scene.world
+                && *op != LayerOp::Load
+            {
+                scene
+                    .props
+                    .hide(&mut world.physics, entities.iter().copied());
+            }
+            if *op != LayerOp::Unload {
+                let shown = scene.show_props(entities);
+                if shown > 0 {
+                    eprintln!("layer {name}: {shown} models put up");
+                }
             }
             return false;
         }

@@ -27,6 +27,7 @@ use crate::cache;
 use crate::combat::{self, Arsenal, Effect, Weapon};
 use crate::npc::{self, People, PersonKind};
 use crate::player::Player;
+use crate::props::Props;
 
 /// Jennifer Mui, the playable mercenary whose model the README's export
 /// examples use.
@@ -394,6 +395,8 @@ pub struct Scene {
     pub arsenal: Arsenal,
     /// Fuel tanks and barrels that blow up when hit.
     pub explosives: Vec<crate::combat::Explosive>,
+    /// What the loaded state layers place (a mission's gates).
+    pub props: Props,
     /// Mesh and materials for shots, flashes, fire and smoke.
     effects: Effects,
     vehicle_loads: Option<Receiver<Loaded>>,
@@ -622,6 +625,7 @@ impl Scene {
             people: People::default(),
             arsenal: Arsenal::default(),
             explosives: Vec::new(),
+            props: Props::default(),
             effects,
             vehicle_loads: None,
             catalogue: None,
@@ -835,7 +839,20 @@ impl Scene {
         if let Ok(loaded) = self.requests.1.try_recv() {
             self.take(backend, loaded)?;
         }
+        if let (Some(world), Some(source)) = (&mut self.world, &mut self.source) {
+            self.props
+                .update(backend, &mut self.materials, source, &mut world.physics)?;
+        }
         Ok(())
+    }
+
+    /// Puts up what the state layers place for `entities` (see
+    /// [`Props::show`]).
+    pub fn show_props(&mut self, entities: impl IntoIterator<Item = u32>) -> usize {
+        match (&self.install, &self.world) {
+            (Some(install), Some(world)) => self.props.show(install, &world.index, entities),
+            _ => 0,
+        }
     }
 
     /// Uploads a model the loading threads decoded and puts it to use.
@@ -967,6 +984,7 @@ impl Scene {
         if let Some(world) = &mut self.world {
             let frustum = Frustum::from_view_proj(view.projection * view.view);
             world.draw(backend, queue, eye, &frustum)?;
+            self.props.draw(queue, eye, world.settings.object_distance);
         } else {
             self.draw_ground(queue);
         }

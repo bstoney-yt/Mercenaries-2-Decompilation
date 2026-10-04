@@ -44,6 +44,7 @@ mod input;
 mod mission;
 mod npc;
 mod player;
+mod props;
 mod save;
 mod scene;
 mod sound;
@@ -720,6 +721,10 @@ fn probe_for_screenshot(game: &Game) {
                 |o| format!("building {k} of object {i} (batch {:08x})", o.model),
             ),
             Some(StaticKey::Cell(h)) => format!("terrain cell {h:08x}"),
+            Some(StaticKey::Entity(e)) => world.index.state_objects.get(&e).map_or_else(
+                || format!("state layer entity {e:08x}"),
+                |o| format!("state layer entity {e:08x}, model {:08x}", o.model),
+            ),
             None => "something not static".to_owned(),
         }
     };
@@ -858,6 +863,9 @@ fn mission_for_screenshot(
             Some(at) => eprintln!("mission vehicle {label} at {at:.1}"),
             None => eprintln!("mission vehicle {label} not placed"),
         }
+    }
+    for line in link.report(game) {
+        eprintln!("mission: {line}");
     }
     Ok(link)
 }
