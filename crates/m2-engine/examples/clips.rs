@@ -89,6 +89,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => eprintln!("upper body: not found"),
     }
+    // The bones from the root to each hand, to check how the body hangs
+    // together: index, name hash, children, rest height, and the lowest
+    // rest height under each child off the path.
+    let rest = skeleton.model_matrices(&skeleton.rest_pose());
+    let below = |n: usize| -> f32 {
+        (0..skeleton.len())
+            .filter(|&i| {
+                let mut at = Some(i);
+                while let Some(j) = at {
+                    if j == n {
+                        return true;
+                    }
+                    at = skeleton.parents[j];
+                }
+                false
+            })
+            .map(|i| rest[i].w_axis.y)
+            .fold(f32::INFINITY, f32::min)
+    };
+    for (name, hand) in [("right hand", rh), ("left hand", lh)] {
+        let mut path = vec![hand];
+        while let Some(p) = skeleton.parents[*path.last().unwrap()] {
+            path.push(p);
+        }
+        path.reverse();
+        eprintln!("root to {name}:");
+        for (k, &n) in path.iter().enumerate() {
+            let off: Vec<String> = (0..skeleton.len())
+                .filter(|&c| skeleton.parents[c] == Some(n) && path.get(k + 1) != Some(&c))
+                .map(|c| format!("{c}:{:.2}", below(c)))
+                .collect();
+            eprintln!(
+                "  {n:3} {:08x} y {:5.2}  off-path children (lowest y under) {}",
+                skeleton.name_hashes[n],
+                rest[n].w_axis.y,
+                off.join(" ")
+            );
+        }
+    }
 
     let index = source.archive().index();
     let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
