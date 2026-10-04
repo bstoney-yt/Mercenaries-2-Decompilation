@@ -133,6 +133,10 @@ pub struct GameAudio {
     /// Short sounds of the town (`amb_citymed`) and the jungle
     /// (`amb_jungle`) played now and then around the listener.
     ambient: [Vec<SoundBuffer>; 2],
+    /// Each engine bank's loop, by bank name.
+    engines: Vec<(&'static str, SoundBuffer)>,
+    /// The engine running now: its bank and voice.
+    engine: Option<(&'static str, VoiceId)>,
     /// Seconds to the next one.
     ambient_wait: f32,
     seed: u64,
@@ -219,8 +223,37 @@ fn pick(
 /// sounds are loops).
 const AMBIENT_LONGEST: f32 = 8.0;
 
-/// The fight's sounds and the ambient one-shots.
-fn bank_sounds(install: &Install) -> ([Option<SoundBuffer>; 3], [Vec<SoundBuffer>; 2]) {
+/// Engine banks, and which vehicles use them (by kind and label words,
+/// first match; as the browser viewer picks them).
+const ENGINES: [(&str, &str); 7] = [
+    ("helicopter", "veh_helicoptermedium"),
+    ("hmmwv", "veh_jeep"),
+    ("tank", "veh_tankbig"),
+    ("apc", "veh_tankmed"),
+    ("semi|bus|truck", "veh_semi"),
+    ("global_veh", "veh_8cylinderold"),
+    ("", "veh_4cylindernew"),
+];
+
+/// The engine bank for a vehicle of `kind` named `label`.
+pub fn engine_bank(kind: &str, label: &str) -> &'static str {
+    let key = format!("{kind} {label}").to_lowercase();
+    ENGINES
+        .iter()
+        .find(|(words, _)| words.is_empty() || words.split('|').any(|w| key.contains(w)))
+        .map_or("veh_4cylindernew", |e| e.1)
+}
+
+/// Sounds read from the banks: the fight's, the ambient one-shots and the
+/// engine loops.
+type BankSounds = (
+    [Option<SoundBuffer>; 3],
+    [Vec<SoundBuffer>; 2],
+    Vec<(&'static str, SoundBuffer)>,
+);
+
+/// The fight's sounds, the ambient one-shots and the engine loops.
+fn bank_sounds(install: &Install) -> BankSounds {
     let library = install.open_world().and_then(|mut source| {
         SoundLibrary::load(
             &mut source,
@@ -230,6 +263,13 @@ fn bank_sounds(install: &Install) -> ([Option<SoundBuffer>; 3], [Vec<SoundBuffer
                 "support_artillery",
                 "amb_citymed",
                 "amb_jungle",
+                "veh_helicoptermedium",
+                "veh_jeep",
+                "veh_tankbig",
+                "veh_tankmed",
+                "veh_semi",
+                "veh_8cylinderold",
+                "veh_4cylindernew",
             ],
         )
     });
@@ -253,6 +293,16 @@ fn bank_sounds(install: &Install) -> ([Option<SoundBuffer>; 3], [Vec<SoundBuffer
                     }),
                 ],
                 [short("amb_citymed"), short("amb_jungle")],
+                // Engine loops run 2-8 s; longer ones are rev sweeps.
+                ENGINES
+                    .iter()
+                    .filter_map(|&(_, bank)| {
+                        Some((
+                            bank,
+                            pick(&l, bank, |s| (2.0..=8.0).contains(&s.seconds()))?,
+                        ))
+                    })
+                    .collect(),
             )
         }
         Err(e) => {
@@ -281,7 +331,7 @@ impl GameAudio {
                 }
             }
         });
-        let (fight, ambient) = install.map(bank_sounds).unwrap_or_default();
+        let (fight, ambient, engines) = install.map(bank_sounds).unwrap_or_default();
         // The recorded ambience (ambience.pws) isn't played: which of its
         // tracks is which place is not known, and the first is a tank
         // rolling by. The banks' short sounds stand in, as in the viewer.
@@ -293,6 +343,8 @@ impl GameAudio {
             decoded: channel(),
             fight,
             ambient,
+            engines,
+            engine: None,
             ambient_wait: 3.0,
             seed: 0x9e37_79b9_7f4a_7c15,
             voices: None,
@@ -489,6 +541,34 @@ impl GameAudio {
         }
     }
 
+    /// Runs the engine of the vehicle being driven (`None`: on foot):
+    /// its bank's loop, pitched up with speed (m/s) towards `top`.
+    pub fn engine(&mut self, driving: Option<(&'static str, f32, f32)>) {
+        let want = driving.map(|d| d.0);
+        if let Some((bank, id)) = self.engine
+            && Some(bank) != want
+        {
+            self.out.with(|m| m.stop(id));
+            self.engine = None;
+        }
+        let Some((bank, speed, top)) = driving else {
+            return;
+        };
+        if self.engine.is_none()
+            && let Some((_, buffer)) = self.engines.iter().find(|e| e.0 == bank)
+        {
+            let buffer = buffer.clone();
+            let id = self
+                .out
+                .with(|m| m.play(Play::flat(buffer).looped().gain(0.45)));
+            self.engine = Some((bank, id));
+        }
+        if let Some((_, id)) = self.engine {
+            let pitch = 0.75 + speed.abs() / top.max(1.0);
+            self.out.with(|m| m.set_pitch(id, pitch));
+        }
+    }
+
     /// Starts the next music track, or stops the music.
     pub fn toggle_music(&mut self) {
         if let Some(id) = self.music.take() {
@@ -535,5 +615,19 @@ impl GameAudio {
             }
         }
         self.out.with(|m| m.set_listener(listener, forward));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engines_go_by_kind_and_name() {
+        assert_eq!(engine_bank("tank", "al_veh_tank_m1"), "veh_tankbig");
+        assert_eq!(engine_bank("car", "al_veh_apc_stryker"), "veh_tankmed");
+        assert_eq!(engine_bank("truck", "semi_orange"), "veh_semi");
+        assert_eq!(engine_bank("car", "global_veh_68valiant4door"), "veh_8cylinderold");
+        assert_eq!(engine_bank("car", "m151"), "veh_4cylindernew");
     }
 }

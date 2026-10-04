@@ -1227,6 +1227,15 @@ impl Running {
         }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);
+        let engine = self.game.engine().map(|(bank, speed)| {
+            let top = if bank.starts_with("veh_tank") {
+                14.0
+            } else {
+                32.0
+            };
+            (bank, speed, top)
+        });
+        self.audio.engine(engine);
         let driving = self.game.driving().is_some();
         let mut remarks = self.game.combat.take_remarks();
         if driving && !self.was_driving {

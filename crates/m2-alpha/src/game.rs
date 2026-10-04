@@ -447,6 +447,18 @@ impl Game {
         ))
     }
 
+    /// The vehicle being driven's engine: its sound bank, speed (m/s) and
+    /// top speed.
+    pub fn engine(&self) -> Option<(&'static str, f32)> {
+        let i = self.scene.player.as_ref()?.driving?;
+        let v = self.scene.vehicles.get(i)?;
+        let (_, speed) = self.driving()?;
+        Some((
+            crate::sound::engine_bank(&v.spec.kind, &v.spec.label),
+            speed,
+        ))
+    }
+
     /// Switches between walking and flying. Flying starts from the player's
     /// camera; walking starts by dropping to the ground under the camera.
     pub fn toggle_fly(&mut self) {
