@@ -44,6 +44,8 @@ m2-alpha [options]
                          her right side, to see her hands
   --probe                with --screenshot: list what rays from where she
                          stands hit (unseen walls, steps in the ground)
+  --fire                 with --aim, or --drive --look: fire just before the
+                         picture
   --mission              run the game's mission scripts: the first contract
                          starts as in the game, with its objectives and
                          markers on screen (log: m2-alpha-mission.log);
@@ -52,6 +54,8 @@ m2-alpha [options]
                          (crates/m2-game/examples/drivers/vzacon001.lua
                          plays the first contract); repeatable
   --mission-seconds <s>  with --screenshot: play this long instead of ten
+  --mission-look <m>     with --mission --screenshot: take the picture from
+                         this far from the nearest marker, looking at it
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.

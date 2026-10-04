@@ -661,7 +661,8 @@ impl People {
                 };
             }
         }
-        // Soldiers who come into range, nearest first.
+        // Soldiers who come into range: a mission's targets first, then
+        // the nearest.
         let soldiers = self.npcs.iter().filter(|n| n.spawn.is_some()).count();
         let mut near: Vec<(f32, &SpawnPoint)> = spawns
             .iter()
@@ -672,17 +673,27 @@ impl People {
             })
             .map(|s| (s.position.distance(focus), s))
             .collect();
-        near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (_, s) in near.into_iter().take(MAX_SOLDIERS.saturating_sub(soldiers)) {
-            let kind = self.kind_for(&s.name).or_else(|| {
-                self.mission_soldiers
-                    .contains(&s.entity)
-                    .then(|| self.kind_for("vz soldier"))
-                    .flatten()
-            });
+        let targets = &self.mission_soldiers;
+        near.sort_by(|a, b| {
+            (!targets.contains(&a.1.entity))
+                .cmp(&!targets.contains(&b.1.entity))
+                .then(a.0.total_cmp(&b.0))
+        });
+        // A mission's targets come even when the island's soldiers fill
+        // the place up.
+        let mut room = MAX_SOLDIERS.saturating_sub(soldiers);
+        for (_, s) in near {
+            let target = self.mission_soldiers.contains(&s.entity);
+            if room == 0 && !target {
+                break;
+            }
+            let kind = self
+                .kind_for(&s.name)
+                .or_else(|| target.then(|| self.kind_for("vz soldier")).flatten());
             let Some(kind) = kind else {
                 continue;
             };
+            room = room.saturating_sub(1);
             let forward = s.rotation * Vec3::Z;
             let facing = forward.x.atan2(forward.z);
             let brain = if s.route.len() >= 2 {
