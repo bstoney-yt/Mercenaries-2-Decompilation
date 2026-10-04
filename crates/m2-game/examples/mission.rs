@@ -8,6 +8,7 @@
 //!   --layers a,b       also take entities from blocks whose path contains
 //!                      any of these (layers_static always)
 //!   --at x,y,z         where the player stands (default 0,0,0)
+//!   --hero name        the player character's name (default Mattias)
 //!   --run <lua>        Lua to run after the scripts start (repeatable)
 //!   --teleport t,x,y,z move the player at time t (repeatable)
 //!   --seconds n        how long to run (default 60)
@@ -30,7 +31,7 @@ use m2_assets::lua::{Chunk, SCRIPT_TYPE};
 use m2_assets::{BlockContents, Layer, WadArchive};
 use m2_game::api::{self, Object, ScriptWorld, Shared};
 use m2_game::events::Events;
-use m2_game::library::Library;
+use m2_game::library::{LOADERS, Library};
 use m2_game::script::ScriptHost;
 
 #[derive(Default)]
@@ -38,6 +39,7 @@ struct Options {
     wad: String,
     layers: Vec<String>,
     at: [f32; 3],
+    hero: String,
     run: Vec<String>,
     teleports: Vec<(f64, [f32; 3])>,
     seconds: f64,
@@ -70,6 +72,7 @@ fn options() -> Result<Options> {
     let mut o = Options {
         seconds: 60.0,
         step: 0.5,
+        hero: "Mattias".into(),
         ..Options::default()
     };
     let mut args = std::env::args().skip(1);
@@ -85,6 +88,7 @@ fn options() -> Result<Options> {
                 o.at = point(&n);
             }
             "--run" => o.run.push(value()?),
+            "--hero" => o.hero = value()?,
             "--teleport" => {
                 let n = numbers(&value()?)?;
                 if n.len() != 4 {
@@ -154,7 +158,7 @@ fn run(o: &Options) -> Result<()> {
     }
     {
         let mut w = world.borrow_mut();
-        let mut hero = Object::new("hero", o.at);
+        let mut hero = Object::new(&o.hero, o.at);
         hero.player_controlled = true;
         w.insert(1, hero);
         w.player = Some(1);
@@ -178,10 +182,25 @@ fn run(o: &Options) -> Result<()> {
     host.install_library(Rc::clone(&library), true)?;
 
     let mut failures = Vec::new();
-    let import: mlua::Function = host.lua().globals().get("import")?;
-    for name in library.module_names() {
-        if let Err(e) = import.call::<mlua::Value>(name) {
-            failures.push(format!("module {name}: {e}"));
+    // Modules by the name scripts spell them with, so `--run` code can
+    // use them as globals without importing them first.
+    let mut spelled: BTreeMap<String, String> = BTreeMap::new();
+    for script in library.scripts() {
+        for call in script.chunk.main.calls() {
+            if let Some(name) = call
+                .first
+                .filter(|_| LOADERS.contains(&call.callee.as_str()))
+            {
+                spelled.entry(name.to_ascii_lowercase()).or_insert(name);
+            }
+        }
+    }
+    let globals = host.lua().globals();
+    let import: mlua::Function = globals.get("import")?;
+    for name in spelled.values() {
+        match import.call::<mlua::Value>(name.as_str()) {
+            Ok(module) => globals.raw_set(name.as_str(), module)?,
+            Err(e) => failures.push(format!("module {name}: {e}")),
         }
     }
     let modules: Vec<u32> = host.modules().iter().filter_map(|m| m.1).collect();
