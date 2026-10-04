@@ -57,6 +57,13 @@
 //!                           it fares in the wheel tests
 //! templates:<word>[,..]     templates whose name holds a word, with their
 //!                           components' fields (text fields not read)
+//! parents[:<word>,..]       how entities' Transform `Parent` matches the
+//!                           template database (counts, and whether named
+//!                           entities' parents carry their name), then
+//!                           every entity of the layers holding a word
+//!                           (default vzacon001,vza_con001) with its parent
+//!                           template: name, model, components, and what
+//!                           the alpha's world index makes of it
 //! find:<hash>[,..]          names for hashes
 //! ```
 //!
@@ -629,6 +636,7 @@ fn main() -> Result<(), Error> {
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
+            "parents" => parents(&mut source, &names, arg),
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -1913,7 +1921,7 @@ fn engines<R: Read + Seek>(
     // Which templates name each bank.
     let mut users: HashMap<u32, Vec<String>> = HashMap::new();
     if let Ok(index) = WorldIndex::build(source) {
-        for (name, t) in &index.template_db.0 {
+        for (name, t) in &index.template_db.by_name {
             if let Some(bank) = t.engine {
                 users.entry(bank).or_default().push(name.clone());
             }
@@ -2169,6 +2177,312 @@ fn templates<R: Read + Seek>(
             let values: Vec<String> = fields.iter().map(|f| field_value(names, f, rec)).collect();
             println!("    {cname}: {}", values.join(", "));
         }
+    }
+    Ok(())
+}
+
+/// How the layers' entities name their template through `Transform`'s
+/// `Parent`, and the parents of the entities of some layers in full.
+fn parents<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = if arg.is_empty() {
+        vec!["vzacon001".into(), "vza_con001".into()]
+    } else {
+        arg.split(',')
+            .filter(|w| !w.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    };
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames: HashMap<u32, String> = db
+        .names()
+        .into_iter()
+        .map(|(id, n)| (id, n.to_owned()))
+        .collect();
+    let uniq: HashSet<u32> = db
+        .uniq
+        .get(4..)
+        .unwrap_or_default()
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut comps: HashMap<u32, Vec<&str>> = HashMap::new();
+    for c in &db.components {
+        for (id, _) in c.records().unwrap_or_default() {
+            comps.entry(id).or_default().push(c.name);
+        }
+    }
+    let tmodels = db.hashes("ModelName");
+    println!(
+        "template database: {} names, {} UNIQ ids",
+        tnames.len(),
+        uniq.len()
+    );
+
+    // Every layer's entities.
+    struct Row {
+        layer: String,
+        is_static: bool,
+        id: u32,
+        name: String,
+        parent: u32,
+        at: [f32; 3],
+        components: Vec<String>,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        let is_static = paths[b].contains("layers_static");
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            let layer_name = names.show(e.name_hash).to_owned();
+            let entity_names = layer.names();
+            let mut own: HashMap<u32, Vec<String>> = HashMap::new();
+            for c in &layer.components {
+                if matches!(c.name, "Transform" | "Name") {
+                    continue;
+                }
+                for (id, _) in c.records().unwrap_or_default() {
+                    own.entry(id).or_default().push(c.name.to_owned());
+                }
+            }
+            for (id, p) in layer.placements() {
+                rows.push(Row {
+                    layer: layer_name.clone(),
+                    is_static,
+                    id,
+                    name: entity_names.get(&id).copied().unwrap_or("").to_owned(),
+                    parent: p.parent,
+                    at: p.position,
+                    components: own.remove(&id).unwrap_or_default(),
+                });
+            }
+        }
+    }
+    let entity_ids: HashSet<u32> = rows.iter().map(|r| r.id).collect();
+    let count = |f: &dyn Fn(&Row) -> bool| rows.iter().filter(|r| f(r)).count();
+    println!("entities: {}", rows.len());
+    println!("  parent 0: {}", count(&|r| r.parent == 0));
+    println!(
+        "  parent with bit 31: {}",
+        count(&|r| r.parent & 0x8000_0000 != 0)
+    );
+    println!(
+        "  parent a template's id (names): {}",
+        count(&|r| tnames.contains_key(&r.parent))
+    );
+    println!("  parent in UNIQ: {}", count(&|r| uniq.contains(&r.parent)));
+    println!(
+        "  parent an entity's id: {}",
+        count(&|r| entity_ids.contains(&r.parent))
+    );
+    let mut distinct: HashMap<u32, usize> = HashMap::new();
+    for r in &rows {
+        *distinct.entry(r.parent).or_default() += 1;
+    }
+    println!("  distinct parents: {}", distinct.len());
+    let mut top: Vec<(usize, u32)> = distinct.iter().map(|(&p, &n)| (n, p)).collect();
+    top.sort_unstable_by(|a, b| b.cmp(a));
+    for (n, p) in top.iter().take(15) {
+        println!(
+            "    {p:08x} x{n}: {:?}",
+            tnames.get(p).map_or("(not a template)", String::as_str)
+        );
+    }
+    // Entities whose name carries a template (`VZ Soldier 0x0012abcd`,
+    // `_global_pile02 3`): is the parent that template?
+    let mut same = 0;
+    let mut differ: Vec<&Row> = Vec::new();
+    let mut unnamed_parent = 0;
+    for r in &rows {
+        let stem = m2_engine::world::member_stem(&r.name);
+        if stem == r.name.trim_start_matches('_') {
+            continue;
+        }
+        match tnames.get(&r.parent) {
+            Some(t) if t.eq_ignore_ascii_case(stem) => same += 1,
+            Some(_) => differ.push(r),
+            None => unnamed_parent += 1,
+        }
+    }
+    println!(
+        "named entities: parent is the named template {same}, another template {}, not a template {unnamed_parent}",
+        differ.len()
+    );
+    for r in differ.iter().take(20) {
+        println!(
+            "    {:?} -> {:08x} {:?}",
+            r.name,
+            r.parent,
+            tnames.get(&r.parent).map_or("", String::as_str)
+        );
+    }
+    let missing: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.parent != 0 && !tnames.contains_key(&r.parent))
+        .take(12)
+        .collect();
+    for r in missing {
+        println!(
+            "    not a template: {:?} in {} -> {:08x}",
+            r.name, r.layer, r.parent
+        );
+    }
+
+    // What a parent would add: props (a model, no vehicle physics, not a
+    // person) and people, for entities with no ModelName.
+    let vehicle = |id: u32| {
+        comps.get(&id).is_some_and(|c| {
+            c.iter().any(|n| {
+                matches!(
+                    *n,
+                    "_CarPhysicsV2" | "_TankPhysics" | "_BoatPhysics" | "_HelicopterPhysics"
+                )
+            })
+        })
+    };
+    let has = |id: u32, what: &str| comps.get(&id).is_some_and(|c| c.contains(&what));
+    let person = |id: u32| {
+        has(id, "_HumanPhysics") || ((has(id, "Ai") || has(id, "AiBehavior")) && !vehicle(id))
+    };
+    for is_static in [true, false] {
+        let of =
+            |r: &&Row| r.is_static == is_static && !r.components.iter().any(|c| c == "ModelName");
+        let props = rows
+            .iter()
+            .filter(of)
+            .filter(|r| tmodels.contains_key(&r.parent) && !vehicle(r.parent) && !person(r.parent))
+            .count();
+        let people = rows.iter().filter(of).filter(|r| person(r.parent)).count();
+        println!(
+            "{} layers, entities without ModelName: parent a prop with a model {props}, a person {people}",
+            if is_static { "static" } else { "state" }
+        );
+    }
+    println!(
+        "templates with _HumanPhysics {}, with Ai {}, with AiBehavior {}",
+        comps
+            .values()
+            .filter(|c| c.contains(&"_HumanPhysics"))
+            .count(),
+        comps.values().filter(|c| c.contains(&"Ai")).count(),
+        comps.values().filter(|c| c.contains(&"AiBehavior")).count()
+    );
+    let mut people_templates: Vec<(&str, u32)> = tnames
+        .iter()
+        .filter(|&(&id, n)| {
+            let n = n.to_ascii_lowercase();
+            person(id)
+                || ["soldier", "elite", "deathsquad", "gate", "carmona", "guard"]
+                    .iter()
+                    .any(|w| n.contains(w))
+        })
+        .map(|(&id, n)| (n.as_str(), id))
+        .collect();
+    people_templates.sort_unstable();
+    println!(
+        "person templates and names with soldier, elite, deathsquad, gate, carmona, guard: {}",
+        people_templates.len()
+    );
+    for (n, id) in people_templates.iter().take(60) {
+        let mut c = comps.get(id).cloned().unwrap_or_default();
+        c.sort_unstable();
+        println!(
+            "    {id:08x} {n:?} person {} model {}: {}",
+            person(*id),
+            tmodels
+                .get(id)
+                .map_or("-".to_owned(), |m| format!("{m:08x} {}", names.show(*m))),
+            c.join(" ")
+        );
+    }
+
+    // The entities of the layers asked for, with their parents.
+    let world = WorldIndex::build(source).ok();
+    let mut human: HashMap<u32, bool> = HashMap::new();
+    let mut wanted: Vec<&Row> = rows
+        .iter()
+        .filter(|r| {
+            let l = r.layer.to_ascii_lowercase();
+            words.iter().any(|w| l.contains(w.as_str()))
+        })
+        .collect();
+    wanted.sort_by(|a, b| a.layer.cmp(&b.layer).then(a.name.cmp(&b.name)));
+    if wanted.len() > 400 {
+        println!("  ({} entities; the first 400)", wanted.len());
+    }
+    for r in wanted.into_iter().take(400) {
+        let model = tmodels.get(&r.parent).copied();
+        let skinned = model.map(|m| {
+            *human.entry(m).or_insert_with(|| {
+                source
+                    .asset(m, MODEL_TYPE)
+                    .ok()
+                    .and_then(|d| Model::parse(&d).ok().map(|m| m.info.flags & 0x800 != 0))
+                    .unwrap_or(false)
+            })
+        });
+        let mut c = comps.get(&r.parent).cloned().unwrap_or_default();
+        c.sort_unstable();
+        let alpha = world.as_ref().map_or(String::new(), |w| {
+            let mut out = Vec::new();
+            if let Some(o) = w.state_objects.get(&r.id) {
+                out.push(format!("prop {:08x}", o.model));
+            }
+            if let Some(s) = w.spawns.iter().find(|s| s.entity == r.id) {
+                out.push(format!("spawn as {:?}", s.template));
+            }
+            out.join(", ")
+        });
+        println!(
+            "  [{}] {:08x} at ({:.1} {:.1} {:.1}) {:?} own [{}] parent {:08x} {:?} model {}{} person {} [{}] alpha: {}",
+            r.layer,
+            r.id,
+            r.at[0],
+            r.at[1],
+            r.at[2],
+            r.name,
+            r.components.join(" "),
+            r.parent,
+            tnames.get(&r.parent).map_or("", String::as_str),
+            model.map_or("-".to_owned(), |m| format!("{m:08x} {}", names.show(m))),
+            if skinned == Some(true) {
+                " (skinned)"
+            } else {
+                ""
+            },
+            person(r.parent),
+            c.join(" "),
+            if alpha.is_empty() { "-" } else { &alpha }
+        );
     }
     Ok(())
 }

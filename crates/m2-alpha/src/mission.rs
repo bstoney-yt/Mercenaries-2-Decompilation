@@ -24,7 +24,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
-use m2_assets::WadArchive;
+use m2_assets::{WadArchive, name_hash};
 use m2_engine::vehicle::DRIVABLE;
 use m2_engine::world::member_stem;
 use m2_engine::{CatalogueEntry, Install, TemplateInfo, Templates, VehicleKind};
@@ -202,6 +202,10 @@ impl MissionLink {
                 Ok(Err(e)) => self.fail(format!("could not read the scripts: {e}")),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => self.fail("script reader stopped".into()),
+            }
+            // Without the scripts, every state layer's people stand.
+            if matches!(self.state, State::Failed(_)) {
+                game.scene.people.state_layers = None;
             }
         }
         let State::Running(mission) = &mut self.state else {
@@ -395,6 +399,15 @@ impl MissionLink {
             if game.scene.people.all_killed().contains(&g) {
                 what.push("killed".into());
             }
+            if let Some((prop, loaded)) = game.scene.props.get(g) {
+                what.push(format!(
+                    "model {:08x} at {:.1}{}{}",
+                    prop.model,
+                    prop.position,
+                    if loaded { "" } else { " (loading)" },
+                    if prop.wrecked { ", wrecked" } else { "" }
+                ));
+            }
             if let Some(v) = game.scene.vehicles.iter().find(|v| v.guid == Some(g)) {
                 what.push(format!(
                     "vehicle {} {}",
@@ -540,12 +553,12 @@ impl Fleet {
             return;
         };
         let near = player.character.position;
+        let none = Templates::default();
         let templates = game
             .scene
             .world
             .as_ref()
-            .map(|w| w.index.template_db.clone())
-            .unwrap_or_default();
+            .map_or(&none, |w| &w.index.template_db);
         let w = mission.world().borrow();
         let mut wanted: Vec<(f32, u32, Vec<CatalogueEntry>)> = w
             .objects
@@ -556,7 +569,7 @@ impl Fleet {
                 (d <= VEHICLE_REACH).then_some((d, g, o))
             })
             .filter_map(|(d, g, o)| {
-                let models = template_models(&o.name, &templates, &catalogue.vehicles);
+                let models = template_models(&o.name, templates, &catalogue.vehicles);
                 (!models.is_empty()).then_some((d, g, models))
             })
             .collect();
@@ -716,13 +729,20 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
-        // A state layer in or out: its models with it.
+        // A state layer in or out: its models and people with it.
         Command::Layer { op, name } => {
             let entities: Vec<u32> = mission
                 .layer(name)
                 .map(|es| es.iter().map(|e| e.guid).collect())
                 .unwrap_or_default();
             let scene = &mut game.scene;
+            if let Some(set) = &mut scene.people.state_layers {
+                if *op == LayerOp::Unload {
+                    set.remove(&name_hash(name));
+                } else {
+                    set.insert(name_hash(name));
+                }
+            }
             if let Some(world) = &mut scene.world
                 && *op != LayerOp::Load
             {
@@ -898,25 +918,29 @@ mod tests {
             model,
             vehicle,
             engine: None,
+            person: false,
         };
-        let db = Templates(HashMap::from([
-            (
-                "m151 softtop (vz)".to_owned(),
-                info(Some(0xabc), Some(VehicleKind::Car)),
-            ),
-            (
-                "amx30 (full)".to_owned(),
-                info(Some(0xdef), Some(VehicleKind::Tank)),
-            ),
-            (
-                "patrol boat (vz)".to_owned(),
-                info(Some(0x123), Some(VehicleKind::Boat)),
-            ),
-            (
-                "m151 softtop (gl)".to_owned(),
-                info(None, Some(VehicleKind::Car)),
-            ),
-        ]));
+        let db = Templates {
+            by_name: HashMap::from([
+                (
+                    "m151 softtop (vz)".to_owned(),
+                    info(Some(0xabc), Some(VehicleKind::Car)),
+                ),
+                (
+                    "amx30 (full)".to_owned(),
+                    info(Some(0xdef), Some(VehicleKind::Tank)),
+                ),
+                (
+                    "patrol boat (vz)".to_owned(),
+                    info(Some(0x123), Some(VehicleKind::Boat)),
+                ),
+                (
+                    "m151 softtop (gl)".to_owned(),
+                    info(None, Some(VehicleKind::Car)),
+                ),
+            ]),
+            names: HashMap::new(),
+        };
         let models = |n: &str| -> Vec<(u32, String)> {
             template_models(n, &db, &catalogue)
                 .into_iter()
