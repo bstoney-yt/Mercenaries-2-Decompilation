@@ -152,11 +152,12 @@ fn draws_a_textured_unlit_quad() {
     b.draw(&draw(vb, ib, 1, Mat4::IDENTITY)).unwrap();
     b.end_frame().unwrap();
     let rgba = b.read_pixels().unwrap();
-    // Texture v runs down the screen, as in Direct3D.
-    assert_eq!(pixel(&rgba, 24, 24), [255, 0, 0, 255], "top left");
-    assert_eq!(pixel(&rgba, 40, 24), [0, 255, 0, 255], "top right");
-    assert_eq!(pixel(&rgba, 24, 40), [255, 255, 255, 255], "bottom left");
-    assert_eq!(pixel(&rgba, 40, 40), [0, 0, 0, 255], "bottom right");
+    // Texture v runs down the screen, as in Direct3D. The world is
+    // right-handed: looking along +z, +x is to the left.
+    assert_eq!(pixel(&rgba, 40, 24), [255, 0, 0, 255], "u 0, top");
+    assert_eq!(pixel(&rgba, 24, 24), [0, 255, 0, 255], "u 1, top");
+    assert_eq!(pixel(&rgba, 40, 40), [255, 255, 255, 255], "u 0, bottom");
+    assert_eq!(pixel(&rgba, 24, 40), [0, 0, 0, 255], "u 1, bottom");
     assert_eq!(pixel(&rgba, 2, 2), [0, 0, 255, 255], "sky outside");
     assert_eq!(b.live_buffers().texture, 1);
 }
@@ -316,7 +317,7 @@ fn skinned_vertices_follow_their_bones() {
     let rgba = b.read_pixels().unwrap();
     assert_eq!(pixel(&rgba, 32, 32), red, "bind pose");
 
-    // Bone 1 moves the quad right.
+    // Bone 1 moves the quad along +x: left, looking along +z.
     b.begin_frame(&view()).unwrap();
     let skin = b
         .set_skin(&[
@@ -332,7 +333,7 @@ fn skinned_vertices_follow_their_bones() {
     b.end_frame().unwrap();
     let rgba = b.read_pixels().unwrap();
     assert_eq!(pixel(&rgba, 32, 32), sky, "moved away");
-    assert_eq!(pixel(&rgba, 43, 32), red, "moved right");
+    assert_eq!(pixel(&rgba, 20, 32), red, "moved left");
 
     // A palette lasts one frame.
     b.begin_frame(&view()).unwrap();

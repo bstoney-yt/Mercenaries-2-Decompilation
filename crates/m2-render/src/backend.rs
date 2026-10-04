@@ -117,7 +117,8 @@ impl View {
     /// Depth of a world-space point, `0.0` at `near` and `1.0` at `far`.
     /// Not clamped; [`SortKey`](crate::SortKey) clamps when packing.
     pub fn normalized_depth(&self, world_pos: m2_math::glam::Vec3) -> f32 {
-        let z = self.view.transform_point3(world_pos).z;
+        // Right-handed: the camera looks down view-space -z.
+        let z = -self.view.transform_point3(world_pos).z;
         (z - self.near) / (self.far - self.near)
     }
 }
@@ -136,7 +137,8 @@ impl Default for View {
 
 impl View {
     /// A camera at `eye` looking along `forward`, `fov_y` radians tall, with
-    /// a reversed-depth left-handed projection.
+    /// a reversed-depth right-handed projection: the game's world is
+    /// right-handed (+y up), and drawn left-handed it comes out mirrored.
     pub fn perspective(
         eye: Vec3,
         forward: Vec3,
@@ -146,10 +148,9 @@ impl View {
         far: f32,
     ) -> Self {
         Self {
-            view: Mat4::look_to_lh(eye, forward, Vec3::Y),
-            // Swapping the planes of a left-handed projection maps near to
-            // depth 1 and far to 0.
-            projection: Mat4::perspective_lh(fov_y, aspect, far, near),
+            view: Mat4::look_to_rh(eye, forward, Vec3::Y),
+            // Swapping the planes maps near to depth 1 and far to 0.
+            projection: Mat4::perspective_rh(fov_y, aspect, far, near),
             near,
             far,
             lighting: Lighting::default(),

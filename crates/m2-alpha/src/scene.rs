@@ -421,6 +421,9 @@ pub struct ParkedVehicle {
     /// How far its turret is turned from straight ahead, radians
     /// (anticlockwise from above).
     pub turret: f32,
+    /// How far it has rolled, metres (backwards less), for turning a
+    /// tracked vehicle's road wheels.
+    pub rolled: f32,
 }
 
 /// Kinds that don't drive on wheels (or aren't vehicles to sit in).
@@ -864,6 +867,7 @@ impl Scene {
                 guid: None,
                 spot: None,
                 turret: 0.0,
+                rolled: 0.0,
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
@@ -875,6 +879,7 @@ impl Scene {
                     guid: Some(guid),
                     spot: None,
                     turret: 0.0,
+                    rolled: 0.0,
                 });
             }
             Loaded::WorldVehicle(entity, at, yaw, spec, _) => {
@@ -886,6 +891,7 @@ impl Scene {
                     guid: None,
                     spot: Some((entity, at, yaw)),
                     turret: 0.0,
+                    rolled: 0.0,
                 });
             }
             Loaded::Weapon(name, _, muzzle) => {
@@ -972,9 +978,9 @@ impl Scene {
                 let Some(at) = world.physics.vehicle_transform(id) else {
                     continue;
                 };
-                let nodes = v
-                    .spec
-                    .posed_nodes(&world.physics.vehicle_wheels(id), v.turret);
+                let nodes =
+                    v.spec
+                        .posed_nodes(&world.physics.vehicle_wheels(id), v.rolled, v.turret);
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
             }
         }

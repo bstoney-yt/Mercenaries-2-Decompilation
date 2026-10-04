@@ -250,9 +250,9 @@ impl Mixer {
     /// Where the listener is and which way they face.
     pub fn set_listener(&mut self, position: Vec3, forward: Vec3) {
         self.listener = position;
-        // Left-handed, +y up: right is forward turned clockwise from above.
+        // Right-handed, +y up: facing +z, right is -x.
         let f = Vec3::new(forward.x, 0.0, forward.z).normalize_or(Vec3::Z);
-        self.right = Vec3::new(f.z, 0.0, -f.x);
+        self.right = Vec3::new(-f.z, 0.0, f.x);
     }
 
     /// Left and right gain for `play` from the listener.
@@ -636,10 +636,10 @@ mod tests {
         let mut m = Mixer::new(100);
         m.master = 1.0;
         m.set_listener(Vec3::ZERO, Vec3::Z);
-        let right = Play::at(tone(100, 1000), Vec3::new(10.0, 0.0, 0.0)).looped();
+        let right = Play::at(tone(100, 1000), Vec3::new(-10.0, 0.0, 0.0)).looped();
         let near = m.gains(&right);
         assert!(near.1 > near.0, "louder in the right ear: {near:?}");
-        let far = m.gains(&Play::at(tone(100, 1000), Vec3::new(100.0, 0.0, 0.0)));
+        let far = m.gains(&Play::at(tone(100, 1000), Vec3::new(-100.0, 0.0, 0.0)));
         assert!(far.1 < near.1 * 0.2);
         let gone = m.gains(&Play::at(tone(100, 1000), Vec3::new(400.0, 0.0, 0.0)));
         assert_eq!(gone, (0.0, 0.0));

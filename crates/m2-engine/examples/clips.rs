@@ -22,8 +22,8 @@ use m2_engine::anim::{BoundClip, Locomotion, Skeleton};
 use m2_engine::{Install, Pose};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 
-const RIGHT_HAND: u32 = 0xeb6f_1b2d;
-const LEFT_HAND: u32 = 0xd34f_7713;
+const RIGHT_HAND: u32 = 0xd34f_7713;
+const LEFT_HAND: u32 = 0xeb6f_1b2d;
 /// Jennifer.
 const DEFAULT_MODEL: u32 = 0x15d8_9832;
 /// Samples taken over each clip.

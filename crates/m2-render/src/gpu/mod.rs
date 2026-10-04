@@ -868,7 +868,9 @@ impl WgpuBackend {
             primitive: wgpu::PrimitiveState {
                 topology: wgpu_topology(key.topology)?,
                 strip_index_format: key.strip_index.map(wgpu_index_format),
-                front_face: wgpu::FrontFace::Cw,
+                // The game's triangles wind clockwise seen from their front in
+                // its right-handed world: anticlockwise on screen.
+                front_face: wgpu::FrontFace::Ccw,
                 cull_mode: (!key.double_sided).then_some(wgpu::Face::Back),
                 ..Default::default()
             },
