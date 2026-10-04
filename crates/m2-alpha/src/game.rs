@@ -318,16 +318,10 @@ impl Game {
             for (i, v) in self.scene.vehicles.iter_mut().enumerate() {
                 let Some(id) = v.id else { continue };
                 v.rolled += world.physics.vehicle_speed(id) * dt;
-                // Nobody at the wheel: it coasts to a stop and stays put; a
-                // wreck's brakes are locked.
+                // Nobody at the wheel: it coasts to a stop and stays put (a
+                // wreck drags on its rims, driven by nobody).
                 if driven != Some(i) {
-                    world.physics.drive(
-                        id,
-                        VehicleControls {
-                            brake: v.wrecked,
-                            ..VehicleControls::default()
-                        },
-                    );
+                    world.physics.drive(id, VehicleControls::default());
                 }
             }
         }
