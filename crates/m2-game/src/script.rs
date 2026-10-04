@@ -315,6 +315,9 @@ impl ScriptHost {
                 meta.set("__index", lua.globals())?;
             }
             env.set_metatable(Some(meta))?;
+            // Each module sees itself as `_THIS` (MrxTask.CreateChild
+            // makes children with `_THIS:Create()`).
+            env.raw_set("_THIS", &env)?;
             // Cached before it runs, so modules loading each other finish.
             cache.raw_set(key.as_str(), &env)?;
             // Loaded modules are globals too: scripts use some they never
@@ -387,14 +390,17 @@ impl ScriptHost {
                 function import(name) return bind(caller(), name) end
                 -- dynamic_import(name, callback, args) loads in the
                 -- background in the game: the callback runs later, with
-                -- the args unpacked, when the host runs the deferred
-                -- calls.
+                -- the args unpacked and then the module, when the host
+                -- runs the deferred calls.
                 __m2_deferred = {}
                 function dynamic_import(name, callback, args)
                     local m = bind(caller(), name)
                     if type(callback) == "function" then
+                        local a = {}
+                        for i, v in ipairs(args or {}) do a[i] = v end
+                        a[#a + 1] = m
                         local q = __m2_deferred
-                        q[#q + 1] = { callback, args or {} }
+                        q[#q + 1] = { callback, a }
                     end
                     return m
                 end
@@ -472,6 +478,7 @@ impl ScriptHost {
         let meta = self.lua.create_table()?;
         meta.set("__index", self.lua.globals())?;
         env.set_metatable(Some(meta))?;
+        env.raw_set("_THIS", &env)?;
         let f = self.load(&script.chunk, &format!("{hash:08x}"))?;
         f.set_environment(env.clone())?;
         f.call::<()>(())?;
@@ -612,7 +619,10 @@ mod tests {
             .load(
                 r#"
                 got = nil
-                local m = dynamic_import("Util", function(a, b) got = a .. b end, {"x", "y"})
+                local m = dynamic_import("Util", function(a, b, mod)
+                    got = a .. b
+                    last_module = mod
+                end, {"x", "y"})
                 assert(m.Greet ~= nil and got == nil)
                 Util.Init = function() Util.ready = true end
                 "#,
@@ -622,6 +632,12 @@ mod tests {
         assert_eq!(host.run_deferred().unwrap(), (1, Vec::new()));
         let got: String = host.lua().globals().get("got").unwrap();
         assert_eq!(got, "xy");
+        let (this, module): (bool, bool) = host
+            .lua()
+            .load("return Util._THIS == Util, last_module == Util")
+            .eval()
+            .unwrap();
+        assert_eq!((this, module), (true, true));
         assert!(host.init_modules().unwrap().is_empty());
         let ready: bool = host.lua().load("return Util.ready").eval().unwrap();
         assert!(ready);
