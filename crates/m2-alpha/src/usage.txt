@@ -26,6 +26,8 @@ m2-alpha [options]
   --fight                with --screenshot on the island: shoot the nearest
                          soldier, rocket a vehicle, throw a grenade first
   --fight-wait <s>       with --fight: wait this long before the picture
+  --spawns <n>           with --screenshot: list the n spawns nearest where
+                         she starts (name, place, who they spawn)
   --mission              run the game's mission scripts: the first contract
                          starts as in the game, with its objectives and
                          markers on screen (log: m2-alpha-mission.log);
