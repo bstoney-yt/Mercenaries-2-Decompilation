@@ -913,6 +913,27 @@ fn fight_for_screenshot(
             game.scene.vehicles.iter().filter(|v| v.wrecked).count()
         );
     }
+    // A rocket at the nearest fuel tank or barrel in range.
+    let here = game.focus();
+    let tank = game
+        .scene
+        .explosives
+        .iter()
+        .filter(|e| !e.gone && e.at.distance(here) < 80.0)
+        .map(|e| e.at)
+        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)));
+    if let Some(at) = tank {
+        aim_at(game, at);
+        game.step(fire(Some(Weapon::Rpg)), tick);
+        for _ in 0..120 {
+            game.step(Intent::default(), tick);
+        }
+        let spent = game.scene.explosives.iter().filter(|e| e.gone).count();
+        eprintln!(
+            "fight: rocket at the explosive at {at:.1}; {spent} of {} spent",
+            game.scene.explosives.len()
+        );
+    }
     game.step(
         Intent {
             trigger: Trigger {
