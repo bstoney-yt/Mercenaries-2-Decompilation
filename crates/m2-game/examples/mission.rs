@@ -212,6 +212,7 @@ fn run(o: &Options) -> Result<()> {
     let host = ScriptHost::new()?;
     host.stub_missing_globals()?;
     api::install(host.lua(), &world)?;
+    host.complete_libraries(&api::LIBRARIES)?;
     let events = Events::default();
     events.install(host.lua())?;
     host.install_library(Rc::clone(&library), true)?;
@@ -343,12 +344,12 @@ fn settle(
             }
             println!(
                 "  layer {op:?} {name}: {}",
-                found.map_or("not in the archive".to_owned(), |e| format!(
+                found.map_or("part of layers_static".to_owned(), |e| format!(
                     "{} entities",
                     e.len()
                 ))
             );
-            for e in finished(world, &name, found.is_some()) {
+            for e in finished(world, &name, true) {
                 println!("  layer callback: {}", first_lines(&e.to_string()));
             }
         }

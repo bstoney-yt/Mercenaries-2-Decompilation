@@ -26,7 +26,8 @@ pub enum LayerOp {
 /// Layers the game has and which are in the world.
 #[derive(Debug, Default)]
 pub struct LayerState {
-    /// Every layer the archives hold, lower case (`vz_state_vzacon001`).
+    /// Every layer that is a block of its own, lower case
+    /// (`vz_state_vzacon001`).
     pub known: BTreeSet<String>,
     /// Layers in the world now, lower case.
     pub loaded: BTreeSet<String>,
@@ -152,17 +153,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             })?,
         )?;
     }
-    let w = std::rc::Rc::clone(world);
     pg.set(
         "AssetExists",
-        safe_function(lua, move |_, args| {
-            let name = text(args.front()).unwrap_or_default().to_ascii_lowercase();
-            let kind = text(args.get(1)).unwrap_or_default();
-            // Layers (`Pg.AssetExists(name, "layer")`) are checked against
-            // the archives; other assets are taken on trust.
-            let exists =
-                !kind.eq_ignore_ascii_case("layer") || w.borrow().layers.known.contains(&name);
-            Ok(MultiValue::from_vec(vec![Value::Boolean(exists)]))
+        // Every asset exists. Most static layers (`vz_all_hq`, ...) share
+        // the `layers_static` block, whose layers are keyed by the unsolved
+        // name hash, so a layer that is not a block of its own is taken to
+        // be one of those, which the game keeps loaded.
+        safe_function(lua, |_, _| {
+            Ok(MultiValue::from_vec(vec![Value::Boolean(true)]))
         })?,
     )?;
     pg.set(
@@ -174,20 +172,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             )]))
         })?,
     )?;
-    pg.set(
-        "GetUnloadingStaticLayers",
-        safe_function(lua, |lua, _| {
-            Ok(MultiValue::from_vec(vec![Value::Table(
-                lua.create_table()?,
-            )]))
-        })?,
-    )?;
-    pg.set(
-        "UnloadingStaticLayers",
-        safe_function(lua, |_, _| {
-            Ok(MultiValue::from_vec(vec![Value::Boolean(false)]))
-        })?,
-    )?;
+    // Static layers never unload while the scripts run.
+    for name in ["GetUnloadingStaticLayers", "UnloadingStaticLayers"] {
+        pg.set(
+            name,
+            safe_function(lua, |_, _| {
+                Ok(MultiValue::from_vec(vec![Value::Boolean(false)]))
+            })?,
+        )?;
+    }
     Ok(())
 }
 
@@ -223,9 +216,8 @@ mod tests {
             .load(
                 r#"
                 done = {}
-                assert(Pg.AssetExists("Vz_State_VzaCon001", "layer"))
-                assert(not Pg.AssetExists("vz_state_nothing", "layer"))
-                assert(Pg.AssetExists("some_model"))
+                assert(Pg.AssetExists("vz_all_hq", "layer"))
+                assert(not Pg.GetUnloadingStaticLayers())
                 -- As MrxLayerManager calls it: name, dynamic, callback,
                 -- its values, needs a loading screen.
                 local ok = Pg.LoadLayer("vz_state_vzacon001", true, function(op, name, _, ok)
