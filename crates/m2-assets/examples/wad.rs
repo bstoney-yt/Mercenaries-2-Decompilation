@@ -957,7 +957,7 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         "{} component types; irregular record sizes: {irregular:?}",
         comps.len()
     );
-    for (name, (layers, count, _)) in comps.iter().take(12) {
+    for (name, (layers, count, _)) in comps.iter() {
         println!("  {name:24} {count:7} records in {layers} layers");
     }
     eprintln!("{errors} errors");

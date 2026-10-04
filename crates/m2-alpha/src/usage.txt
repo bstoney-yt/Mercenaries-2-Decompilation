@@ -1,0 +1,33 @@
+m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
+
+m2-alpha [options]
+  --install <dir>        the game's install folder (holding data\vz.wad); the EA app
+                         folder in Program Files is found without it
+  --spawn <x>,<z>        where on the island to start (default 450,-1950)
+  --fly                  start with the free camera instead of on foot
+  --model <hash>         a model to show (hex name hash; repeatable)
+  --gait <gait>          idle, walk, run or sprint: what characters shown
+                         with --model play first; with --screenshot on the
+                         island, how the player moves before the picture
+  --config <file>        settings file (default m2-alpha.toml)
+  --size <w>x<h>         window size
+  --vsync on|off
+  --fullscreen
+  --sea <metres>         sea level (default -45, fitted by eye)
+  --double-sided         start with back-face culling off (as F3)
+  --screenshot <out.ppm> render one frame offscreen and exit
+  --drive                with --screenshot on the island: get in the
+                         nearest parked vehicle and drive it forward first
+  --fight                with --screenshot on the island: shoot the nearest
+                         soldier, rocket a vehicle, throw a grenade first
+  --write-config         print the settings file and exit
+
+On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
+E gets in or out of a vehicle (a row is parked ahead of where you start).
+Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
+Fighting (mouse captured): left button or F fires, right button aims,
+1 rifle, 2 rocket launcher, G throws a grenade.
+V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
+M music on/off, Tab or right mouse captures the mouse, N next gait
+(--model), F11 fullscreen, F3 culling, F5 quick save, F9 quick load,
+Escape opens the menu (settings, save and load, quit).
