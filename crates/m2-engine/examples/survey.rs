@@ -40,6 +40,9 @@
 //! entities:<word>[,..]      every entity of the layers whose name holds a
 //!                           word, or whose own name does, with its
 //!                           components' fields (400 a layer at most)
+//! collision:<model>[,..]    a model's collision: each PHY2 shape (kind,
+//!                           node, radius, box in model space, sizes), or
+//!                           the visible geometry it falls back to
 //! find:<hash>[,..]          names for hashes
 //! ```
 //!
@@ -607,6 +610,7 @@ fn main() -> Result<(), Error> {
                     |p| p.x,
                 )
             }
+            "collision" => collision(&mut source, &names, arg),
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -1585,6 +1589,101 @@ fn spot<R: Read + Seek>(
     }
     // The layer entities near the spot, with their components' fields.
     layer_entities(source, names, usize::MAX, |_, _, p| d(p) < radius, d)
+}
+
+/// Each model's collision as the alpha builds it: its `PHY2` shapes
+/// placed in model space, or else its visible triangles.
+fn collision<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_assets::physics::{Geometry, Physics as Phy2};
+    for h in arg.split(',').filter_map(hex) {
+        let data = match source.model(h) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("{h:08x}: {e}");
+                continue;
+            }
+        };
+        let m = data.parse()?;
+        let b = &m.info.bounds;
+        println!(
+            "{h:08x} {}: bounds ({:.2} {:.2} {:.2}) to ({:.2} {:.2} {:.2}), {} nodes",
+            names.show(h),
+            b.min[0],
+            b.min[1],
+            b.min[2],
+            b.max[0],
+            b.max[1],
+            b.max[2],
+            m.nodes.len()
+        );
+        let phy2 = m2_assets::Ucfx::parse(&data.base)
+            .ok()
+            .and_then(|u| u.top_level(*b"PHY2"));
+        let Some(p) = phy2.map(Phy2::parse) else {
+            let cpu = m2_engine::CpuModel::from_data(&data, 0)?;
+            println!(
+                "  no PHY2: visible triangles stand in ({} collision)",
+                if cpu.collision.is_some() { "a" } else { "no" }
+            );
+            continue;
+        };
+        let p = match p {
+            Ok(p) => p,
+            Err(e) => {
+                println!("  PHY2 does not parse: {e}");
+                continue;
+            }
+        };
+        println!(
+            "  PHY2: {} parts, {} bodies ({} fixed), {} shapes",
+            p.parts.len(),
+            p.bodies.len(),
+            p.bodies.iter().filter(|b| b.is_fixed()).count(),
+            p.shapes.len()
+        );
+        for (k, shape) in p.shapes.iter().enumerate() {
+            let node = p.shape_node(k);
+            let to_model = node
+                .and_then(|n| u16::try_from(n).ok())
+                .and_then(|n| m.node_to_model(n))
+                .unwrap_or(m2_math::glam::Mat4::IDENTITY);
+            let (v, t) = shape.geometry.triangles(shape.radius);
+            let mut lo = Vec3::splat(f32::MAX);
+            let mut hi = Vec3::splat(f32::MIN);
+            for x in &v {
+                let q = to_model.transform_point3(Vec3::from(*x));
+                lo = lo.min(q);
+                hi = hi.max(q);
+            }
+            let kind = match &shape.geometry {
+                Geometry::Box { .. } => "box",
+                Geometry::Sphere => "sphere",
+                Geometry::Capsule { .. } => "capsule",
+                Geometry::Convex { .. } => "convex",
+                Geometry::Mesh { .. } => "mesh",
+            };
+            let node_name = node
+                .and_then(|n| m.nodes.get(n as usize))
+                .map_or("?", |n| names.show(n.name_hash));
+            println!(
+                "  shape {k}: {kind}, node {node:?} {node_name}, radius {:.3}, {} vertices, {} triangles, box ({:.2} {:.2} {:.2}) to ({:.2} {:.2} {:.2})",
+                shape.radius,
+                v.len(),
+                t.len(),
+                lo.x,
+                lo.y,
+                lo.z,
+                hi.x,
+                hi.y,
+                hi.z
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Every layer entity `keep` (layer, entity name, place) keeps, with its
