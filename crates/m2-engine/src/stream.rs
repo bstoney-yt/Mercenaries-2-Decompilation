@@ -863,7 +863,7 @@ impl World {
             }
         }
         self.stats.objects_drawn = drawn;
-        self.stats.scatter_drawn = self.draw_scatter(backend, queue, eye)?;
+        self.stats.scatter_drawn = self.draw_scatter(backend, queue, eye, frustum)?;
 
         let (vb, ib, material) = self.sea;
         // Follows the camera so its edge is never in view.
@@ -891,13 +891,14 @@ impl World {
         Ok(())
     }
 
-    /// Queues each clump mesh once, instanced at its instances in range.
-    /// Returns the instances drawn.
+    /// Queues each clump mesh once, instanced at its instances in range
+    /// and in view. Returns the instances drawn.
     fn draw_scatter(
         &self,
         backend: &mut dyn RenderBackend,
         queue: &mut DrawQueue,
         eye: Vec3,
+        frustum: &Frustum,
     ) -> Result<usize, BackendError> {
         let mut drawn = 0;
         let mut near: Vec<Mat4> = Vec::new();
@@ -910,9 +911,10 @@ impl World {
                 let reach2 = self.settings.scatter_distance.powi(2);
                 near.clear();
                 near.extend(
-                    c.instances
-                        .iter()
-                        .filter(|m| m.w_axis.truncate().distance_squared(eye) <= reach2),
+                    c.instances.iter().filter(|m| {
+                        let at = m.w_axis.truncate();
+                        at.distance_squared(eye) <= reach2 && frustum.sees(at, CLUMP_RADIUS)
+                    }),
                 );
                 if near.is_empty() {
                     continue;
@@ -944,6 +946,10 @@ impl World {
         Ok(drawn)
     }
 }
+
+/// How far a scatter clump reaches from its origin, metres, for culling
+/// (grass and bushes; generous so nothing pops at the screen's edge).
+const CLUMP_RADIUS: f32 = 4.0;
 
 fn destroy_clumps(
     backend: &mut dyn RenderBackend,
