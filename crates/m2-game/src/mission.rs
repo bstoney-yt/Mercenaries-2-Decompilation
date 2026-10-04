@@ -323,6 +323,18 @@ impl Mission {
         names
     }
 
+    /// The layers in the world now, lower case: blocks of their own
+    /// (`vz_state_vzacon001`) and the layers inside `layers_static`
+    /// (`vz_mar_village`), which the game loads by name.
+    pub fn loaded_layers(&self) -> Vec<String> {
+        self.world.borrow().layers.loaded.iter().cloned().collect()
+    }
+
+    /// The entities of a layer that is a block of its own (lower case).
+    pub fn layer(&self, name: &str) -> Option<&[Entity]> {
+        self.layers.get(name).map(Vec::as_slice)
+    }
+
     /// The world as the scripts see it.
     pub fn world(&self) -> &Shared {
         &self.world

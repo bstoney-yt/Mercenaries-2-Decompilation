@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use m2_engine::{Physics, TemplatePlacement, VehicleControls};
+use m2_engine::{Physics, VehicleControls};
 use m2_math::glam::{Vec3, Vec4Swizzles};
 use m2_render::View;
 
@@ -15,7 +15,20 @@ use crate::mission::template_models;
 use crate::player::{Intent, Player};
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
+use crate::startup::Startup;
 use crate::ui::HudInfo;
+
+/// Where a vehicle of the layers stands.
+struct Spot<'a> {
+    entity: u32,
+    name: &'a str,
+    at: Vec3,
+    yaw: f32,
+}
+
+/// The scripts put vehicles they don't need yet far under the island:
+/// those below this height aren't placed.
+const HIDDEN_BELOW: f32 = -1000.0;
 
 #[derive(Debug)]
 pub struct Game {
@@ -35,6 +48,10 @@ pub struct Game {
     fetched: HashSet<u32>,
     /// Seconds to the next look for the island's vehicles near the player.
     vehicle_wait: f32,
+    /// The layers the game starts with, which the island's vehicles come
+    /// from; `None` places them from every static layer (`--mission`,
+    /// where the scripts' own layers rule).
+    pub startup: Option<Startup>,
 }
 
 impl Game {
@@ -50,11 +67,15 @@ impl Game {
             combat: Combat::default(),
             fetched: HashSet::new(),
             vehicle_wait: 0.0,
+            startup: None,
         }
     }
 
     /// Island vehicles asked for that have not been placed yet.
     pub fn island_vehicles_loading(&self) -> bool {
+        if self.startup.as_ref().is_some_and(Startup::loading) {
+            return true;
+        }
         let placed = self
             .scene
             .vehicles
@@ -90,14 +111,40 @@ impl Game {
         let Some(catalogue) = &scene.catalogue else {
             return;
         };
+        if let Some(s) = &mut self.startup {
+            s.poll();
+        }
+        // Where they may stand: the static layers the game starts with
+        // (all of them if that set isn't known) and its state layers.
+        let (static_layers, state_layers) = match &self.startup {
+            Some(Startup::Loading(_)) => return,
+            Some(Startup::Ready(set)) => (Some(&set.hashes), set.entities.as_slice()),
+            _ => (None, &[][..]),
+        };
         let near = player.character.position;
-        let mut wanted: Vec<(f32, &TemplatePlacement)> = world
+        let mut wanted: Vec<(f32, Spot<'_>)> = world
             .index
             .templates
             .iter()
-            .filter(|t| !self.fetched.contains(&t.entity))
+            .filter(|t| static_layers.is_none_or(|h| h.contains(&t.layer)))
+            .map(|t| {
+                let f = t.rotation * Vec3::Z;
+                Spot {
+                    entity: t.entity,
+                    name: &t.name,
+                    at: t.position,
+                    yaw: f.x.atan2(f.z),
+                }
+            })
+            .chain(state_layers.iter().map(|e| Spot {
+                entity: e.entity,
+                name: &e.name,
+                at: e.position,
+                yaw: e.yaw,
+            }))
+            .filter(|t| !self.fetched.contains(&t.entity) && t.at.y > HIDDEN_BELOW)
             .filter_map(|t| {
-                let d = t.position.distance(near);
+                let d = t.at.distance(near);
                 (d <= VEHICLE_REACH).then_some((d, t))
             })
             .collect();
@@ -108,7 +155,7 @@ impl Game {
             if placed >= WORLD_VEHICLES {
                 break;
             }
-            let models = template_models(&t.name, &world.index.template_db, &catalogue.vehicles);
+            let models = template_models(t.name, &world.index.template_db, &catalogue.vehicles);
             if models.is_empty() {
                 continue;
             }
@@ -118,8 +165,7 @@ impl Game {
                 "island vehicle {:#x}: {} as {}",
                 t.entity, t.name, models[0].label
             );
-            let f = t.rotation * Vec3::Z;
-            loads.push((t.entity, t.position, f.x.atan2(f.z), models));
+            loads.push((t.entity, t.at, t.yaw, models));
         }
         for (entity, at, yaw, models) in loads {
             scene.load_world_vehicle(entity, at, yaw, models);

@@ -47,6 +47,7 @@ mod player;
 mod save;
 mod scene;
 mod sound;
+mod startup;
 mod ui;
 
 use std::path::PathBuf;
@@ -282,6 +283,7 @@ fn build_scene(
     mode: &Mode,
     double_sided: bool,
     sea_level: f32,
+    mission: bool,
 ) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
     if double_sided {
@@ -305,7 +307,13 @@ fn build_scene(
         }
     }
     let (eye, target) = scene.focus;
-    Ok(Game::new(scene, FlyCamera::looking_at(eye, target)))
+    let mut game = Game::new(scene, FlyCamera::looking_at(eye, target));
+    // Free roam: the island's vehicles stand where the game's start-up
+    // layers put them (with `--mission` the scripts' own layers do).
+    if let (Some(install), Mode::Island(_), false) = (install, mode, mission) {
+        game.startup = Some(startup::Startup::start(install));
+    }
+    Ok(game)
 }
 
 /// What the HUD shows: the game's, with the mission's objectives and the
@@ -370,6 +378,7 @@ fn screenshot(
         mode,
         options.double_sided,
         config.world.sea_level,
+        options.mission,
     )?;
     if options.fly {
         game.on_foot = false;
@@ -891,6 +900,7 @@ impl App {
             &self.mode,
             self.double_sided,
             self.config.world.sea_level,
+            self.mission,
         )?;
         if self.fly {
             game.on_foot = false;
