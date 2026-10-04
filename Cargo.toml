@@ -38,6 +38,7 @@ egui = "0.36"
 egui-wgpu = { version = "0.36", default-features = false }
 egui-winit = { version = "0.36", default-features = false }
 tracing = "0.1"
+mlua = { version = "0.11", features = ["lua51", "vendored"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D9",
