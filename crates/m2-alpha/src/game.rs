@@ -1,7 +1,9 @@
 //! What a tick does: the player on foot (or the free camera), physics and
 //! animation, and where the frame is seen from.
 
-use m2_engine::{Physics, VehicleControls};
+use std::collections::HashSet;
+
+use m2_engine::{Physics, TemplatePlacement, VehicleControls};
 use m2_math::glam::{Vec3, Vec4Swizzles};
 use m2_render::View;
 
@@ -9,6 +11,7 @@ use crate::camera::FlyCamera;
 use crate::combat::{Combat, Field, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
+use crate::mission::vehicle_models;
 use crate::player::{Intent, Player};
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
@@ -28,6 +31,10 @@ pub struct Game {
     /// Vehicles from a loaded save, placed as their models load.
     restore: Vec<VehicleSave>,
     pub combat: Combat,
+    /// Layer entities of the island's vehicles asked for so far.
+    fetched: HashSet<u32>,
+    /// Seconds to the next look for the island's vehicles near the player.
+    vehicle_wait: f32,
 }
 
 impl Game {
@@ -41,6 +48,61 @@ impl Game {
             park_tries: 0,
             restore: Vec::new(),
             combat: Combat::default(),
+            fetched: HashSet::new(),
+            vehicle_wait: 0.0,
+        }
+    }
+
+    /// Asks for the island's own vehicles near the player, once the
+    /// vehicle catalogue is known, and places the ones that have loaded
+    /// where the layers park them.
+    fn fetch_world_vehicles(&mut self, dt: f32) {
+        let scene = &mut self.scene;
+        let (Some(world), Some(player)) = (&mut scene.world, &scene.player) else {
+            return;
+        };
+        for v in scene.vehicles.iter_mut().filter(|v| v.id.is_none()) {
+            if let Some((_, at, yaw)) = v.spot {
+                place(&mut world.physics, v, at, yaw);
+            }
+        }
+        self.vehicle_wait -= dt;
+        if self.vehicle_wait > 0.0 || !player.landed {
+            return;
+        }
+        self.vehicle_wait = VEHICLE_LOOK;
+        let Some(catalogue) = &scene.catalogue else {
+            return;
+        };
+        let near = player.character.position;
+        let mut wanted: Vec<(f32, &TemplatePlacement)> = world
+            .index
+            .templates
+            .iter()
+            .filter(|t| !self.fetched.contains(&t.entity))
+            .filter_map(|t| {
+                let d = t.position.distance(near);
+                (d <= VEHICLE_REACH).then_some((d, t))
+            })
+            .collect();
+        wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut placed = scene.vehicles.iter().filter(|v| v.spot.is_some()).count();
+        let mut loads = Vec::new();
+        for (_, t) in wanted {
+            if placed >= WORLD_VEHICLES {
+                break;
+            }
+            let models = vehicle_models(&t.name, &catalogue.vehicles);
+            if models.is_empty() {
+                continue;
+            }
+            self.fetched.insert(t.entity);
+            placed += 1;
+            let f = t.rotation * Vec3::Z;
+            loads.push((t.entity, t.position, f.x.atan2(f.z), models));
+        }
+        for (entity, at, yaw, models) in loads {
+            scene.load_world_vehicle(entity, at, yaw, models);
         }
     }
 
@@ -60,6 +122,7 @@ impl Game {
 
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
+        self.fetch_world_vehicles(dt);
         let scene = &mut self.scene;
         if let Some(world) = &mut scene.world {
             let streaming = world.stats().pending > 0;
@@ -164,8 +227,9 @@ impl Game {
             .scene
             .vehicles
             .iter()
-            // The mission's vehicles are the scripts' to place.
-            .filter(|v| v.guid.is_none())
+            // The mission's vehicles are the scripts' to place, the
+            // island's the layers'.
+            .filter(|v| v.guid.is_none() && v.spot.is_none())
             .filter_map(|v| {
                 let m = world.physics.vehicle_transform(v.id?)?;
                 let f = m.transform_vector3(Vec3::Z);
@@ -444,10 +508,31 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
     }
 }
 
-/// A vehicle of ours (not the mission's) still to park.
+/// A vehicle of ours (not the mission's or the island's) still to park.
 fn parkable(v: &ParkedVehicle) -> bool {
-    v.id.is_none() && v.guid.is_none()
+    v.id.is_none() && v.guid.is_none() && v.spot.is_none()
 }
+
+/// Puts a vehicle on the ground at `at` facing `yaw`; false while the
+/// ground there hasn't loaded.
+pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw: f32) -> bool {
+    let top = at + Vec3::Y * 30.0;
+    let Some((d, _)) = physics.cast_ray(top, Vec3::NEG_Y, 80.0) else {
+        return false;
+    };
+    let ground = top.y - d;
+    let at = Vec3::new(at.x, ground + v.spec.ride_height() + 0.3, at.z);
+    v.id = Some(physics.add_vehicle(&v.spec, at, yaw));
+    true
+}
+
+/// The game's own parked vehicles within this many metres of the player
+/// are loaded and placed where the layers put them, nearest first, up to
+/// [`WORLD_VEHICLES`] at a time; ones she drives away stay.
+const VEHICLE_REACH: f32 = 400.0;
+const WORLD_VEHICLES: usize = 12;
+/// Seconds between looks for vehicles to load.
+const VEHICLE_LOOK: f32 = 1.0;
 
 /// Puts vehicles from a save back where they were, as their models load.
 fn restore(physics: &mut Physics, vehicles: &mut [ParkedVehicle], saved: &mut Vec<VehicleSave>) {

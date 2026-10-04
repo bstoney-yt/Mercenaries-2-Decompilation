@@ -228,6 +228,9 @@ pub struct ParkedVehicle {
     /// The mission scripts' object it is, if theirs; placed where they
     /// say rather than parked.
     pub guid: Option<u32>,
+    /// Where the island's layers park it (position, yaw), if the game's
+    /// own: the entity and its spot.
+    pub spot: Option<(u32, Vec3, f32)>,
 }
 
 /// Kinds that don't drive on wheels (or aren't vehicles to sit in).
@@ -260,6 +263,9 @@ pub enum Loaded {
     Vehicle(VehicleSpec, CpuModel),
     /// A vehicle asked for by the mission scripts' object `guid`.
     MissionVehicle(u32, VehicleSpec, CpuModel),
+    /// One of the game's own parked vehicles: its layer entity, where it
+    /// stands (position, yaw), its spec and model.
+    WorldVehicle(u32, Vec3, f32, VehicleSpec, CpuModel),
     Catalogue(Catalogue),
     Person(PersonModel, CpuModel, Skeleton),
     /// A hand weapon: name, model, muzzle (model space).
@@ -506,10 +512,12 @@ impl Scene {
         let world = World::open(install, backend, &mut self.materials, settings)
             .context("indexing the island")?;
         eprintln!(
-            "island: {} cells, {} tiles, {} placed objects (indexed in {:.1} s)",
+            "island: {} cells, {} tiles, {} placed objects ({} by name), {} template placements (indexed in {:.1} s)",
             world.index.cells.len(),
             world.index.tiles.len(),
             world.index.objects.len(),
+            world.index.objects.iter().filter(|o| o.named).count(),
+            world.index.templates.len(),
             started.elapsed().as_secs_f32()
         );
         let (x, z) = spawn;
@@ -543,6 +551,30 @@ impl Scene {
     /// the first of `models` that makes a drivable vehicle. It joins
     /// [`Scene::vehicles`] unplaced, with its guid.
     pub fn load_vehicle(&self, guid: u32, models: Vec<CatalogueEntry>) {
+        self.load_vehicle_as(
+            models,
+            format!("mission vehicle {guid:#x}"),
+            move |spec, cpu| Loaded::MissionVehicle(guid, spec, cpu),
+        );
+    }
+
+    /// Loads one of the game's own parked vehicles, layer entity `entity`
+    /// standing at `at` facing `yaw`, from the first of `models` that
+    /// drives.
+    pub fn load_world_vehicle(&self, entity: u32, at: Vec3, yaw: f32, models: Vec<CatalogueEntry>) {
+        self.load_vehicle_as(models, format!("vehicle {entity:#x}"), move |spec, cpu| {
+            Loaded::WorldVehicle(entity, at, yaw, spec, cpu)
+        });
+    }
+
+    /// Decodes the first of `models` that drives on a thread and sends it
+    /// as `make` wraps it; `what` names it in errors.
+    fn load_vehicle_as(
+        &self,
+        models: Vec<CatalogueEntry>,
+        what: String,
+        make: impl FnOnce(VehicleSpec, CpuModel) -> Loaded + Send + 'static,
+    ) {
         let Some(install) = self.install.clone() else {
             return;
         };
@@ -555,14 +587,14 @@ impl Scene {
                     let model = data.parse()?;
                     if let Some(spec) = VehicleSpec::from_model(e, &model) {
                         let cpu = CpuModel::build(e.model, &model, 0);
-                        let _ = tx.send(Loaded::MissionVehicle(guid, spec, cpu));
+                        let _ = tx.send(make(spec, cpu));
                         return Ok(());
                     }
                 }
                 anyhow::bail!("no drivable model")
             })();
             if let Err(e) = result {
-                eprintln!("mission vehicle {guid:#x}: {e:#}");
+                eprintln!("{what}: {e:#}");
             }
         });
     }
@@ -598,6 +630,7 @@ impl Scene {
             }
             Loaded::Vehicle(_, cpu)
             | Loaded::MissionVehicle(_, _, cpu)
+            | Loaded::WorldVehicle(_, _, _, _, cpu)
             | Loaded::Person(_, cpu, _)
             | Loaded::Weapon(_, cpu, _) => cpu,
         };
@@ -612,6 +645,7 @@ impl Scene {
                 id: None,
                 wrecked: false,
                 guid: None,
+                spot: None,
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
@@ -621,6 +655,17 @@ impl Scene {
                     id: None,
                     wrecked: false,
                     guid: Some(guid),
+                    spot: None,
+                });
+            }
+            Loaded::WorldVehicle(entity, at, yaw, spec, _) => {
+                self.vehicles.push(ParkedVehicle {
+                    spec,
+                    model,
+                    id: None,
+                    wrecked: false,
+                    guid: None,
+                    spot: Some((entity, at, yaw)),
                 });
             }
             Loaded::Weapon(name, _, muzzle) => {

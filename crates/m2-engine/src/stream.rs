@@ -289,6 +289,19 @@ pub struct WorldSettings {
     /// Grass and other ground scatter within this many metres (each clump
     /// mesh also stops at its own fade distance).
     pub scatter_distance: f32,
+    /// Props placed by name (rocks, plants, fences, sandbags: tens of
+    /// thousands) within this many metres at most; each is also drawn no
+    /// further than [`PROP_SIZES`] times its size.
+    pub prop_distance: f32,
+}
+
+/// A prop placed by name is drawn within this many times its size, so a
+/// 2 m rock stops at 160 m and a 10 m fence at 800 m.
+pub const PROP_SIZES: f32 = 80.0;
+
+/// How far a prop with `bounds` is drawn, at most `limit`.
+fn draw_reach(bounds: (Vec3, Vec3), limit: f32) -> f32 {
+    ((bounds.1 - bounds.0).length() * PROP_SIZES).min(limit)
 }
 
 impl Default for WorldSettings {
@@ -302,6 +315,7 @@ impl Default for WorldSettings {
             in_flight: 6,
             sea_level: -45.0,
             scatter_distance: 150.0,
+            prop_distance: 800.0,
         }
     }
 }
@@ -369,6 +383,8 @@ pub struct World {
     models: HashMap<u32, Slot<GpuModel>>,
     scatter: HashMap<u32, Slot<Vec<ClumpGpu>>>,
     objects: HashMap<(i32, i32), Vec<usize>>,
+    /// Placed objects by model hash.
+    by_model: HashMap<u32, Vec<usize>>,
     /// By colour map and detail map.
     terrain_materials: HashMap<(Option<u32>, Option<u32>), MaterialId>,
     sea: (VertexBufferHandle, IndexBufferHandle, MaterialId),
@@ -393,11 +409,13 @@ impl World {
         drop(source);
         let loader = Loader::spawn(install, index.clone(), TextureLimits::default())?;
         let mut objects: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        let mut by_model: HashMap<u32, Vec<usize>> = HashMap::new();
         for (i, o) in index.objects.iter().enumerate() {
             objects
                 .entry(bucket(o.position.x, o.position.z))
                 .or_default()
                 .push(i);
+            by_model.entry(o.model).or_default().push(i);
         }
         let sea = sea_plane(backend, materials, settings.sea_level)?;
         let mut world = Self {
@@ -411,6 +429,7 @@ impl World {
             models: HashMap::new(),
             scatter: HashMap::new(),
             objects,
+            by_model,
             terrain_materials: HashMap::new(),
             sea,
             stats: WorldStats::default(),
@@ -503,6 +522,7 @@ impl World {
 
         // Models of placed objects in range.
         let reach = self.settings.object_distance;
+        let props = self.settings.prop_distance;
         let (b0, b1) = (
             bucket(eye.x - reach, eye.z - reach),
             bucket(eye.x + reach, eye.z + reach),
@@ -515,6 +535,7 @@ impl World {
                         continue;
                     }
                     let d = o.position.distance(eye);
+                    let reach = if o.named { props } else { reach };
                     if d <= reach {
                         requests.push((d, Request::Model(o.model)));
                     }
@@ -618,10 +639,8 @@ impl World {
                     self.in_flight.remove(&Request::Model(hash));
                     let slot = match model {
                         Ok(m) if !m.pieces.is_empty() => {
-                            for (i, o) in self.index.objects.iter().enumerate() {
-                                if o.model != hash {
-                                    continue;
-                                }
+                            for &i in self.by_model.get(&hash).map_or(&[][..], Vec::as_slice) {
+                                let o = &self.index.objects[i];
                                 if let Some(shape) = &m.collision {
                                     self.physics.add_static(
                                         StaticKey::Object(i),
@@ -810,6 +829,7 @@ impl World {
         }
 
         let reach = self.settings.object_distance;
+        let props = self.settings.prop_distance;
         let (b0, b1) = (
             bucket(eye.x - reach, eye.z - reach),
             bucket(eye.x + reach, eye.z + reach),
@@ -819,10 +839,13 @@ impl World {
             for bz in b0.1..=b1.1 {
                 for &i in self.objects.get(&(bx, bz)).map_or(&[][..], Vec::as_slice) {
                     let o = &self.index.objects[i];
-                    if o.position.distance(eye) > reach {
+                    let d = o.position.distance(eye);
+                    if d > if o.named { props } else { reach } {
                         continue;
                     }
-                    if let Some(Slot::Ready(m)) = self.models.get(&o.model) {
+                    if let Some(Slot::Ready(m)) = self.models.get(&o.model)
+                        && (!o.named || d <= draw_reach(m.bounds, props))
+                    {
                         m.draw(
                             queue,
                             Mat4::from_rotation_translation(o.rotation, o.position),
