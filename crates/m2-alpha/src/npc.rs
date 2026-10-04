@@ -171,10 +171,11 @@ impl Npc {
     }
 
     /// Takes `damage`; at no health left, falls.
-    pub fn hurt(&mut self, damage: f32) {
+    /// Takes `damage`; true if it killed.
+    pub fn hurt(&mut self, damage: f32) -> bool {
         let clips = self.clips;
         if !self.alive {
-            return;
+            return false;
         }
         self.hp -= damage;
         self.alert = self.soldier;
@@ -186,6 +187,7 @@ impl Npc {
                 self.rig.animator.play_once(die);
             }
         }
+        !self.alive
     }
 
     /// Runs from `danger` (civilians).
@@ -813,10 +815,11 @@ pub(crate) mod tests {
             civilian.character.position
         );
         // Hurt to death.
-        civilian.hurt(60.0);
+        assert!(!civilian.hurt(60.0));
         assert!(civilian.alive);
-        civilian.hurt(60.0);
+        assert!(civilian.hurt(60.0));
         assert!(!civilian.alive);
+        assert!(!civilian.hurt(60.0), "only dies once");
     }
 
     #[test]
