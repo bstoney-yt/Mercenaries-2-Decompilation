@@ -581,6 +581,28 @@ impl People {
         out
     }
 
+    /// The scripts killed the soldier of spawn `entity` (or took it away,
+    /// `gone`): dead where they stand, or not there at all. Either way they
+    /// don't come back.
+    pub fn script_kill(&mut self, physics: &mut Physics, entity: u32, gone: bool) {
+        self.killed.insert(entity);
+        if gone {
+            let (npcs, active) = (&mut self.npcs, &mut self.active);
+            npcs.retain(|n| {
+                if n.spawn != Some(entity) {
+                    return true;
+                }
+                if let Some(doll) = n.ragdoll {
+                    physics.remove_ragdoll(doll);
+                }
+                active.remove(&entity);
+                false
+            });
+        } else if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(entity)) {
+            n.hurt(f32::INFINITY, Vec3::ZERO);
+        }
+    }
+
     /// Starts over with these soldiers dead and nobody about (they come
     /// back round the player on the next tick).
     pub fn reset(&mut self, killed: impl IntoIterator<Item = u32>) {

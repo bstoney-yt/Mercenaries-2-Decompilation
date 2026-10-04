@@ -182,6 +182,8 @@ pub enum StaticKey {
     /// A building of a placed batch: the object's index, then the
     /// building's in the batch.
     Member(usize, usize),
+    /// A model a state layer places while it is in, by entity.
+    Entity(u32),
 }
 
 /// Suspension rest length and travel, metres.

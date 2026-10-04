@@ -57,6 +57,8 @@ pub struct Game {
     /// from; `None` places them from every static layer (`--mission`,
     /// where the scripts' own layers rule).
     pub startup: Option<Startup>,
+    /// The start-up's state layers have their models up.
+    props_up: bool,
 }
 
 impl Game {
@@ -73,6 +75,7 @@ impl Game {
             fetched: HashSet::new(),
             vehicle_wait: 0.0,
             startup: None,
+            props_up: false,
         }
     }
 
@@ -100,6 +103,20 @@ impl Game {
             .filter(|v| v.spot.is_some() && v.id.is_some())
             .count();
         placed < self.fetched.len()
+    }
+
+    /// Puts up the models of the state layers the game starts with, once
+    /// the start-up has said which.
+    fn startup_props(&mut self) {
+        if self.props_up {
+            return;
+        }
+        let Some(s) = &mut self.startup else { return };
+        s.poll();
+        let Startup::Ready(set) = s else { return };
+        self.props_up = true;
+        let shown = self.scene.show_props(set.entities.iter().map(|e| e.entity));
+        eprintln!("start-up state layers: {shown} models put up");
     }
 
     /// Asks for the island's own vehicles near the player, once the
@@ -138,6 +155,7 @@ impl Game {
             Some(Startup::Ready(set)) => (Some(&set.hashes), set.entities.as_slice()),
             _ => (None, &[][..]),
         };
+
         let near = player.character.position;
         let mut wanted: Vec<(f32, Spot<'_>)> = world
             .index
@@ -205,6 +223,7 @@ impl Game {
 
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
+        self.startup_props();
         self.fetch_world_vehicles(dt);
         let scene = &mut self.scene;
         if let Some(world) = &mut scene.world {
