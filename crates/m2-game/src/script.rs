@@ -500,11 +500,7 @@ mod tests {
         );
         // Loaded modules are globals too, for scripts that never import
         // them.
-        let greet: String = host
-            .lua()
-            .load("return Util.Greet('you')")
-            .eval()
-            .unwrap();
+        let greet: String = host.lua().load("return Util.Greet('you')").eval().unwrap();
         assert_eq!(greet, "hi you");
     }
 
