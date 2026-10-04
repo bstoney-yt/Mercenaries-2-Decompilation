@@ -389,6 +389,9 @@ pub struct World {
     terrain_materials: HashMap<(Option<u32>, Option<u32>), MaterialId>,
     sea: (VertexBufferHandle, IndexBufferHandle, MaterialId),
     stats: WorldStats,
+    /// Placed objects (index into the index's `objects`) blown up: drawn
+    /// as their wrecks, or not at all without one.
+    pub destroyed: HashSet<usize>,
     /// Full-detail cells and placed models as static colliders. Step it
     /// each tick; colliders added by [`update`](Self::update) join scene
     /// queries on the next step.
@@ -433,6 +436,7 @@ impl World {
             terrain_materials: HashMap::new(),
             sea,
             stats: WorldStats::default(),
+            destroyed: HashSet::new(),
             physics: Physics::new(),
         };
         // Every tile, so the whole island shows from the start.
@@ -853,9 +857,14 @@ impl World {
                             frustum.sees(centre, (hi - lo).length() * 0.5)
                         }
                     {
-                        m.draw(
+                        let destroyed = self.destroyed.contains(&i);
+                        if destroyed && !m.has_wreck() {
+                            continue;
+                        }
+                        m.draw_as(
                             queue,
                             Mat4::from_rotation_translation(o.rotation, o.position),
+                            destroyed,
                         );
                         drawn += 1;
                     }

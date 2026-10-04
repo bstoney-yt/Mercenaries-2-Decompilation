@@ -392,6 +392,8 @@ pub struct Scene {
     /// Soldiers and civilians.
     pub people: People,
     pub arsenal: Arsenal,
+    /// Fuel tanks and barrels that blow up when hit.
+    pub explosives: Vec<crate::combat::Explosive>,
     /// Mesh and materials for shots, flashes, fire and smoke.
     effects: Effects,
     vehicle_loads: Option<Receiver<Loaded>>,
@@ -616,6 +618,7 @@ impl Scene {
             vehicles: Vec::new(),
             people: People::default(),
             arsenal: Arsenal::default(),
+            explosives: Vec::new(),
             effects,
             vehicle_loads: None,
             catalogue: None,
@@ -728,6 +731,8 @@ impl Scene {
             world.index.templates.len(),
             started.elapsed().as_secs_f32()
         );
+        self.explosives = crate::combat::explosives(&world.index);
+        eprintln!("explosives: {}", self.explosives.len());
         let (x, z) = spawn;
         let y = world.index.rough_height(x, z) + 40.0;
         self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));

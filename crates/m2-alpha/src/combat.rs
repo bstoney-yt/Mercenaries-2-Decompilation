@@ -345,6 +345,9 @@ pub struct Combat {
     /// People shot and blasts set off, for the screenshot check.
     pub hits: u32,
     pub blasts: u32,
+    /// Blasts about to go off (something explosive caught): where, and
+    /// seconds left.
+    fuses: Vec<(Vec3, f32)>,
     seed: u64,
 }
 
@@ -364,6 +367,7 @@ impl Default for Combat {
             remarks: Vec::new(),
             hits: 0,
             blasts: 0,
+            fuses: Vec::new(),
             seed: 0x2545_f491_4f6c_dd1d,
         }
     }
@@ -376,6 +380,57 @@ pub struct Field<'a> {
     pub people: &'a mut People,
     pub vehicles: &'a mut [ParkedVehicle],
     pub arsenal: &'a Arsenal,
+    pub explosives: &'a mut [Explosive],
+}
+
+/// Something placed on the island that blows up: fuel tanks, barrels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Explosive {
+    /// Its index among the island's placed objects.
+    pub object: usize,
+    /// Its middle.
+    pub at: Vec3,
+    pub hp: f32,
+    pub gone: bool,
+}
+
+/// Models that blow up when hit, by name (invented list, from what the
+/// bases hold).
+const EXPLOSIVE_MODELS: [&str; 6] = [
+    "vzoutpost_fueltanks",
+    "global_barrelb",
+    "global_barrelc",
+    "global_barreloil",
+    "global_barrel",
+    "global_barrela",
+];
+/// How much rifle fire an explosive takes.
+const EXPLOSIVE_HP: f32 = 100.0;
+/// How near a blast sets one off, metres.
+const IGNITE: f32 = 5.0;
+/// How near a round has to land to hit one, metres.
+const EXPLOSIVE_SIZE: f32 = 2.5;
+/// How long one burns before it goes, seconds.
+const CHAIN_DELAY: f32 = 0.3;
+
+/// The island's explosives.
+pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
+    let models: Vec<u32> = EXPLOSIVE_MODELS
+        .iter()
+        .map(|n| m2_assets::name_hash(n))
+        .collect();
+    index
+        .objects
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| models.contains(&o.model))
+        .map(|(object, o)| Explosive {
+            object,
+            at: o.position + Vec3::Y * 1.2,
+            hp: EXPLOSIVE_HP,
+            gone: false,
+        })
+        .collect()
 }
 
 impl Combat {
@@ -520,6 +575,18 @@ impl Combat {
         self.effect(Effect::Tracer { from, to }, 0.07);
         self.effect(Effect::Flash { at: from }, 0.05);
         self.sounds.push(Sound::Shot(from));
+        if let Some((t, None)) = hit {
+            let at = eye + dir * t;
+            for e in f.explosives.iter_mut() {
+                if !e.gone && e.at.distance(at) < EXPLOSIVE_SIZE {
+                    e.hp -= RIFLE_DAMAGE;
+                    if e.hp <= 0.0 {
+                        e.gone = true;
+                        self.fuses.push((e.at, CHAIN_DELAY));
+                    }
+                }
+            }
+        }
         if let Some((_, Some(i))) = hit {
             let soldier = f.people.npcs[i].soldier;
             if f.people.npcs[i].hurt(RIFLE_DAMAGE, dir * SHOT_PUSH) && soldier {
@@ -589,6 +656,7 @@ impl Combat {
             people,
             vehicles,
             arsenal,
+            explosives: &mut [],
         };
         self.npc_shoot(&mut f, 0, target);
     }
@@ -648,6 +716,13 @@ impl Combat {
 
     fn fly(&mut self, f: &mut Field<'_>, dt: f32) {
         let mut blasts = Vec::new();
+        self.fuses.retain_mut(|(at, left)| {
+            *left -= dt;
+            if *left <= 0.0 {
+                blasts.push(*at);
+            }
+            *left > 0.0
+        });
         let mut puffs = Vec::new();
         self.projectiles.retain_mut(|p| match p {
             Projectile::Rocket {
@@ -727,6 +802,13 @@ impl Combat {
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
+            }
+        }
+        // Fuel tanks and barrels near it catch and go off in turn.
+        for e in f.explosives.iter_mut() {
+            if !e.gone && e.at.distance(at) < IGNITE {
+                e.gone = true;
+                self.fuses.push((e.at, CHAIN_DELAY));
             }
         }
         if f.player.driving.is_none() && f.player.landed {
@@ -943,6 +1025,7 @@ mod tests {
                 people: &mut people,
                 vehicles: &mut vehicles,
                 arsenal: &arsenal,
+                explosives: &mut [],
             };
             combat.step(&mut field, fire, dt);
         }
@@ -955,6 +1038,40 @@ mod tests {
                 .iter()
                 .all(|s| matches!(s, Sound::Shot(_)))
         );
+    }
+
+    #[test]
+    fn fuel_tanks_go_off_one_after_another() {
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut combat = Combat::default();
+        let tank = |object, x| Explosive {
+            object,
+            at: Vec3::new(x, 1.2, 40.0),
+            hp: EXPLOSIVE_HP,
+            gone: false,
+        };
+        // Two tanks 4 m apart, a third well clear of both.
+        let mut explosives = [tank(0, 0.0), tank(1, 4.0), tank(2, 30.0)];
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut explosives,
+        };
+        combat.explode(&mut field, Vec3::new(-2.0, 1.0, 40.0));
+        assert!(field.explosives[0].gone && !field.explosives[1].gone);
+        for _ in 0..60 {
+            combat.step(&mut field, Trigger::default(), dt);
+        }
+        assert!(field.explosives[1].gone, "the first tank sets off the next");
+        assert!(!field.explosives[2].gone);
     }
 
     #[test]
@@ -988,6 +1105,7 @@ mod tests {
             people: &mut people,
             vehicles: &mut vehicles,
             arsenal: &arsenal,
+            explosives: &mut [],
         };
         combat.explode(&mut field, at);
         assert!(combat.down > 0.0 && player.down);

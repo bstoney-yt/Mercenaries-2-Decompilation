@@ -314,8 +314,12 @@ impl Game {
                 people: &mut scene.people,
                 vehicles: &mut scene.vehicles,
                 arsenal: &scene.arsenal,
+                explosives: &mut scene.explosives,
             };
             self.combat.step(&mut field, intent.trigger, dt);
+            world
+                .destroyed
+                .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
         }
         self.scene.tick(dt);
     }
