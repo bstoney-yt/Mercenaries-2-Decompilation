@@ -12,6 +12,7 @@
 //! cargo run -p m2-assets --example wad -- anims   <archive.wad>
 //! cargo run -p m2-assets --example wad -- world   <archive.wad>
 //! cargo run -p m2-assets --example wad -- types   <archive.wad>
+//! cargo run -p m2-assets --example wad -- scripts <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -30,6 +31,10 @@
 //! and block paths, the section layout of one, any `Lua` bytecode or
 //! script-like text, and the longest readable strings in one sample, to
 //! find which types hold what (missions, scripts) without dumping data.
+//! `scripts` reads every compiled Lua script and lists, per script, its
+//! name, block and the globals it defines, then counts across all scripts
+//! the globals they read, the `Global.key` members they use and the method
+//! names they call: the engine functions the scripts expect to exist.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -109,6 +114,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         ("types", []) => types(&mut wad)?,
+        ("scripts", []) => scripts(&mut wad)?,
         ("names", []) => {
             // Decodes every block; use --release for the large archives.
             let types = index.type_hashes().to_vec();
@@ -1077,4 +1083,105 @@ fn readable(data: &[u8], min: usize) -> Vec<String> {
         .take(12)
         .map(|r| String::from_utf8_lossy(&r[..r.len().min(60)]).into_owned())
         .collect()
+}
+
+fn scripts<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use m2_assets::lua::{Chunk, NameUse, SCRIPT_TYPE};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let paths: Vec<String> = wad
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    // Per use, per name: (uses, scripts using it).
+    let mut totals: BTreeMap<NameUse, BTreeMap<String, (usize, usize)>> = BTreeMap::new();
+    let mut versions: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut parsed, mut failed) = (0, 0);
+    for (block, path) in paths.iter().enumerate() {
+        let decoded = match wad.read_block(block) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("block {block}: {e}");
+                continue;
+            }
+        };
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (entry, data) in contents.iter() {
+            if entry.type_hash != SCRIPT_TYPE {
+                continue;
+            }
+            let name = Ucfx::parse(data)
+                .ok()
+                .and_then(|u| u.name().map(str::to_owned))
+                .unwrap_or_else(|| format!("{:08x}", entry.name_hash));
+            let chunk = match Chunk::from_asset(data) {
+                Ok(c) => c,
+                Err(e) => {
+                    failed += 1;
+                    let at = data.windows(4).position(|w| w == b"\x1bLua");
+                    let head = at.map(|a| &data[a..data.len().min(a + 24)]);
+                    println!(
+                        "FAILED {name} [{path}] {} bytes: {e}; header {head:02x?}",
+                        data.len()
+                    );
+                    continue;
+                }
+            };
+            parsed += 1;
+            *versions
+                .entry(format!(
+                    "{:?} {}",
+                    chunk.version,
+                    if chunk.big_endian {
+                        "big-endian"
+                    } else {
+                        "little-endian"
+                    }
+                ))
+                .or_default() += 1;
+            let names = chunk.main.names(chunk.version);
+            let mut seen: BTreeSet<(NameUse, &str)> = BTreeSet::new();
+            for (u, n) in &names {
+                let t = totals.entry(*u).or_default().entry(n.clone()).or_default();
+                t.0 += 1;
+                if seen.insert((*u, n)) {
+                    t.1 += 1;
+                }
+            }
+            let defines: Vec<&str> = seen
+                .iter()
+                .filter(|(u, _)| *u == NameUse::SetGlobal)
+                .map(|(_, n)| *n)
+                .take(12)
+                .collect();
+            println!(
+                "script {name} [{path}] {} bytes, {} functions, {} instructions; defines {}",
+                data.len(),
+                chunk.main.all().len(),
+                chunk.main.all().iter().map(|f| f.code.len()).sum::<usize>(),
+                defines.join(" "),
+            );
+        }
+    }
+    println!();
+    println!("{parsed} scripts read, {failed} failed");
+    for (v, n) in &versions {
+        println!("  {v}: {n}");
+    }
+    for (u, names) in &totals {
+        let mut sorted: Vec<_> = names.iter().collect();
+        sorted.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(b.1.0.cmp(&a.1.0)).then(a.0.cmp(b.0)));
+        println!();
+        println!("{u:?}: {} names (uses, scripts)", sorted.len());
+        for (n, (uses, scripts)) in sorted {
+            println!("  {n} {uses} {scripts}");
+        }
+    }
+    Ok(())
 }
