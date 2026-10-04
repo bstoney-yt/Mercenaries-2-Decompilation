@@ -260,6 +260,14 @@ impl Combat {
         })
     }
 
+    /// Where blasts went off since sounds were last taken.
+    pub fn explosions(&self) -> impl Iterator<Item = Vec3> + '_ {
+        self.sounds.iter().filter_map(|s| match s {
+            Sound::Explosion(at) => Some(*at),
+            _ => None,
+        })
+    }
+
     pub fn take_sounds(&mut self) -> Vec<Sound> {
         std::mem::take(&mut self.sounds)
     }

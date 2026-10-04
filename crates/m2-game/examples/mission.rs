@@ -5,39 +5,34 @@
 //!
 //! ```text
 //! cargo run -p m2-game --example mission -- <vz.wad> [options]
-//!   --layers a,b       load layers whose name contains any of these at the
-//!                      start (layers_static always); scripts load the rest
+//!   --layers a,b       also load layers whose name contains any of these
+//!                      at the start (layers_static always); scripts load
+//!                      the rest
 //!   --at x,y,z         where the player stands (default 0,0,0)
 //!   --hero name        the player character's name (default Mattias)
-//!   --run <lua>        Lua to run after the scripts start (repeatable)
+//!   --driver file.lua  Lua to run before play starts (repeatable), such
+//!                      as examples/drivers/vzacon001.lua
+//!   --run <lua>        the same, inline (repeatable)
+//!   --no-start         don't start play (the bootstrap's Init and the
+//!                      "GUI loaded" step); only set the modules up
 //!   --teleport t,x,y,z move the player at time t (repeatable)
 //!   --seconds n        how long to run (default 60)
 //!   --step s           tick length (default 0.5)
 //! ```
 //!
 //! Every module some script loads is imported first, then every other
-//! script runs once, as in the `scripts` example; then the `--run` code,
-//! then the ticks. In `--run` code every module is a global, and
-//! `Scripts.<hash>` is an entry script's environment (to call the
-//! bootstrap's `Init`, say). The player has the label of its name in lower
+//! script runs once, as in the `scripts` example; then the drivers and
+//! `--run` code, then play starts (unless `--no-start`), then the ticks. In
+//! driver code every module is a global, and `Scripts.<hash>` is an entry
+//! script's environment. The player has the label of its name in lower
 //! case (`mattias`), which is how scripts tell the heroes apart.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::process::ExitCode;
-use std::rc::Rc;
 
-use m2_assets::layer::LAYER_TYPE;
-use m2_assets::lua::{Chunk, SCRIPT_TYPE};
-use m2_assets::region::REGION_TYPE;
-use m2_assets::{BlockContents, Layer, Region, WadArchive};
-use m2_game::api::{self, Command, Object, ScriptWorld, Shared};
-use m2_game::events::Events;
-use m2_game::layers::{LayerOp, LayerState, finished, layer_name};
-use m2_game::library::{KNOWN_MODULES, LOADERS, Library};
-use m2_game::script::ScriptHost;
+use m2_assets::WadArchive;
+use m2_game::mission::{GameData, Mission};
 
 #[derive(Default)]
 struct Options {
@@ -45,7 +40,9 @@ struct Options {
     layers: Vec<String>,
     at: [f32; 3],
     hero: String,
-    run: Vec<String>,
+    /// Code to run before play starts: a name for errors, and the code.
+    run: Vec<(String, String)>,
+    start: bool,
     teleports: Vec<(f64, [f32; 3])>,
     seconds: f64,
     step: f64,
@@ -78,6 +75,7 @@ fn options() -> Result<Options> {
         seconds: 60.0,
         step: 0.5,
         hero: "Mattias".into(),
+        start: true,
         ..Options::default()
     };
     let mut args = std::env::args().skip(1);
@@ -92,7 +90,16 @@ fn options() -> Result<Options> {
                 }
                 o.at = point(&n);
             }
-            "--run" => o.run.push(value()?),
+            "--driver" => {
+                let path = value()?;
+                let code = std::fs::read_to_string(&path)?;
+                o.run.push((path, code));
+            }
+            "--run" => {
+                let n = o.run.len() + 1;
+                o.run.push((format!("run {n}"), value()?));
+            }
+            "--no-start" => o.start = false,
             "--hero" => o.hero = value()?,
             "--teleport" => {
                 let n = numbers(&value()?)?;
@@ -116,437 +123,61 @@ fn options() -> Result<Options> {
     Ok(o)
 }
 
-/// A named entity of a layer.
-struct Entity {
-    /// The layer's entity id.
-    guid: u32,
-    name: String,
-    at: [f32; 3],
-    yaw: f32,
-    /// The shape a `LineRegion` names, by hash, and once read, the shape.
-    region_hash: Option<u32>,
-    region: Option<Region>,
-}
-
-type Entities = Vec<Entity>;
-
-fn entities(layer: &Layer<'_>) -> Entities {
-    let placements = layer.placements();
-    let regions = layer.hashes("LineRegion");
-    layer
-        .names()
-        .into_iter()
-        .map(|(guid, name)| {
-            let p = placements.get(&guid);
-            Entity {
-                guid,
-                name: name.to_owned(),
-                at: p.map_or([0.0; 3], |p| p.position),
-                yaw: p.map_or(0.0, |p| yaw(p.rotation)),
-                region_hash: regions.get(&guid).copied(),
-                region: None,
-            }
-        })
-        .collect()
-}
-
-/// A transit landing zone's number and player (1 or 2), from its name:
-/// `06_gua_upperclass_lz_playerone` is zone 6 for player 1 (one is
-/// spelled `_llz_`).
-fn landing_zone(name: &str) -> Option<(i64, usize)> {
-    let lower = name.to_ascii_lowercase();
-    let (rest, player) = if let Some(r) = lower.strip_suffix("z_playerone") {
-        (r, 1)
-    } else {
-        (lower.strip_suffix("z_playertwo")?, 2)
-    };
-    let rest = rest
-        .strip_suffix('l')?
-        .trim_end_matches('l')
-        .strip_suffix('_')?;
-    let n = rest.get(..2)?.parse().ok()?;
-    rest[2..].starts_with('_').then_some((n, player))
-}
-
-/// The turn about the vertical axis of an (x, y, z, w) rotation.
-fn yaw([x, y, z, w]: [f32; 4]) -> f32 {
-    (2.0 * (w * y + x * z)).atan2(1.0 - 2.0 * (x * x + y * y))
-}
-
-/// Puts a layer's entities in the world as objects scripts can find with
-/// `Pg.GetGuidByName`, or takes them out.
-fn place(world: &Shared, entities: &Entities, load: bool) {
-    let mut w = world.borrow_mut();
-    for e in entities {
-        if load {
-            let mut o = Object::new(&e.name, e.at);
-            o.yaw = e.yaw;
-            w.insert(e.guid, o);
-            if let Some(r) = &e.region {
-                w.regions.insert(e.guid, r.clone());
-            }
-        } else {
-            w.objects.remove(&e.guid);
-            w.regions.remove(&e.guid);
-        }
+fn print(mission: &mut Mission) {
+    for line in mission.take_log() {
+        println!("{line}");
     }
+    // Commands are in the log; the game would carry them out.
+    mission.take_commands();
 }
 
 fn run(o: &Options) -> Result<()> {
     let mut wad = WadArchive::open(BufReader::new(File::open(&o.wad)?))?;
-    let paths: Vec<String> = wad
-        .index()
-        .blocks()
-        .iter()
-        .map(|b| b.path.clone())
-        .collect();
-    let mut library = Library::default();
-    let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
-    let mut layers: BTreeMap<String, Entities> = BTreeMap::new();
-    let mut shapes: HashMap<u32, Region> = HashMap::new();
-    for (block, path) in paths.iter().enumerate() {
-        let decoded = wad.read_block(block)?;
-        let Ok(contents) = BlockContents::parse(&decoded) else {
-            continue;
-        };
-        for (entry, data) in contents.iter() {
-            if entry.type_hash == SCRIPT_TYPE {
-                if let Ok(c) = Chunk::from_asset(data) {
-                    library.add(entry.name_hash, c);
-                }
-            } else if entry.type_hash == REGION_TYPE {
-                if let Ok(r) = Region::parse(data) {
-                    shapes.insert(entry.name_hash, r);
-                }
-            } else if entry.type_hash == LAYER_TYPE
-                && let Ok(layer) = Layer::parse(data)
-            {
-                layers
-                    .entry(layer_name(path))
-                    .or_default()
-                    .extend(entities(&layer));
-            }
-        }
+    let data = GameData::read(&mut wad)?;
+    let mut mission = Mission::new(data, &o.hero, o.at)?;
+    for part in &o.layers {
+        println!("preloaded {}", mission.preload(part).join(", "));
     }
-    // Regions get their shapes; landing zones are told apart by name.
-    let mut regions = 0;
-    let mut lzs: [BTreeMap<i64, u32>; 2] = Default::default();
-    for e in layers.values_mut().flatten() {
-        e.region = e.region_hash.and_then(|h| shapes.get(&h)).cloned();
-        regions += usize::from(e.region.is_some());
-        if let Some((n, player)) = landing_zone(&e.name) {
-            lzs[player - 1].insert(n, e.guid);
-        }
-    }
-    println!(
-        "{} region shapes; {regions} region entities; {} landing zones",
-        shapes.len(),
-        lzs[0].len()
-    );
-    {
-        let mut w = world.borrow_mut();
-        w.layers.known = layers.keys().cloned().collect();
-        let [one, two] = lzs;
-        w.landing_zones.insert(1, one);
-        w.landing_zones.insert(2, two);
-    }
-    // The static layers are always in; `--layers` adds others up front.
-    let preload: Vec<String> = layers
-        .keys()
-        .filter(|n| {
-            LayerState::is_static(n) || o.layers.iter().any(|l| n.contains(&l.to_ascii_lowercase()))
-        })
-        .cloned()
-        .collect();
-    for name in &preload {
-        place(&world, &layers[name], true);
-        world.borrow_mut().layers.loaded.insert(name.clone());
-    }
-    {
-        let mut w = world.borrow_mut();
-        let mut hero = Object::new(&o.hero, o.at);
-        hero.player_controlled = true;
-        // Scripts tell the heroes apart by these labels.
-        hero.labels.push(o.hero.to_ascii_lowercase());
-        w.insert(1, hero);
-        w.player = Some(1);
-    }
-    println!(
-        "{} scripts; {} layers; {} named entities in from {}",
-        library.scripts().len(),
-        layers.len(),
-        world.borrow().objects.len() - 1,
-        preload.join(", ")
-    );
-    for (name, hash) in KNOWN_MODULES {
-        library.pin(name, hash);
-    }
-    let library = Rc::new(library);
-
-    let host = ScriptHost::new()?;
-    host.stub_missing_globals()?;
-    api::install(host.lua(), &world)?;
-    host.complete_libraries(&api::LIBRARIES)?;
-    let events = Events::default();
-    events.install(host.lua())?;
-    host.install_library(Rc::clone(&library), true)?;
-
-    let mut failures = Vec::new();
-    // Modules by the name scripts spell them with, so `--run` code can
-    // use them as globals without importing them first.
-    let mut spelled: BTreeMap<String, String> = BTreeMap::new();
-    for script in library.scripts() {
-        for call in script.chunk.main.calls() {
-            if let Some(name) = call
-                .first
-                .filter(|_| LOADERS.contains(&call.callee.as_str()))
-            {
-                spelled.entry(name.to_ascii_lowercase()).or_insert(name);
-            }
-        }
-    }
-    let globals = host.lua().globals();
-    let import: mlua::Function = globals.get("import")?;
-    for name in spelled.values() {
-        match import.call::<mlua::Value>(name.as_str()) {
-            Ok(module) => globals.raw_set(name.as_str(), module)?,
-            Err(e) => failures.push(format!("module {name}: {e}")),
-        }
-    }
-    let modules: Vec<u32> = host.modules().iter().filter_map(|m| m.1).collect();
-    // Entry scripts' environments, for `--run` code: `Scripts.b4420059`.
-    let entries = host.lua().create_table()?;
-    for script in library.scripts() {
-        if modules.contains(&script.hash) {
-            continue;
-        }
-        match host.run_script(&library, script.hash) {
-            Ok(env) => entries.raw_set(format!("{:08x}", script.hash), env)?,
-            Err(e) => failures.push(format!("script {:08x}: {e}", script.hash)),
-        }
-    }
-    globals.raw_set("Scripts", entries)?;
-    // The bootstraps' module set-up.
-    for f in host.init_modules()? {
-        failures.push(format!("Init of {f}"));
-    }
-    let started = host.modules().len();
-    println!("started: {started} modules, {} failures", failures.len());
-    for f in &failures {
-        println!("  {}", first_lines(f));
-    }
-    settle("start", &host, &world, &events, &layers);
-
-    for (i, code) in o.run.iter().enumerate() {
+    print(&mut mission);
+    for (name, code) in &o.run {
         println!();
-        println!("run {}: {code}", i + 1);
-        if let Err(e) = host.lua().load(code.as_str()).exec() {
-            println!("  error: {}", first_lines(&e.to_string()));
+        println!("{name}");
+        if let Err(e) = mission.run(code, name) {
+            println!("  error: {e}");
         }
-        settle("after run", &host, &world, &events, &layers);
+        print(&mut mission);
+    }
+    if o.start {
+        println!();
+        println!("start");
+        mission.start();
+        print(&mut mission);
     }
 
-    let mut now = 0.0;
     let mut teleports = o.teleports.clone();
     teleports.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut teleports = teleports.into_iter().peekable();
-    let mut waiting_since: Option<f64> = None;
-    while now < o.seconds {
-        now += o.step;
+    while mission.now() < o.seconds {
+        let now = mission.now() + o.step;
         while let Some(&(_, at)) = teleports.peek().filter(|t| t.0 <= now) {
             teleports.next();
-            if let Some(hero) = world.borrow_mut().objects.get_mut(&1) {
-                hero.position = at;
-            }
+            mission.put_player(at);
             println!();
             println!("t={now:.1} player moved to {at:?}");
         }
-        // Streaming is instant here: a waiting state ends a second after
-        // it was asked for, and the scripts hear that it did.
-        {
-            let mut w = world.borrow_mut();
-            if w.game_state.starts_with("WaitFor") {
-                let since = *waiting_since.get_or_insert(now);
-                if now - since >= 1.0 {
-                    println!();
-                    println!("t={now:.1} game state {} done", w.game_state);
-                    w.game_state = "Game".into();
-                    waiting_since = None;
-                }
-            }
-        }
-        let errors = events.update_shared(o.step, &world);
-        for e in &errors {
-            println!(
-                "  t={now:.1} {} callback: {}",
-                e.kind,
-                first_lines(&e.error.to_string())
-            );
-        }
-        settle(&format!("t={now:.1}"), &host, &world, &events, &layers);
+        mission.tick(o.step);
+        print(&mut mission);
     }
     println!();
     println!("modules loaded while running (name -> script):");
-    for (name, hash) in host.modules().iter().skip(started) {
+    for (name, hash) in mission.late_modules() {
         println!(
             "  {name} -> {}",
             hash.map_or("unresolved".into(), |h| format!("{h:08x}"))
         );
     }
     println!();
-    println!(
-        "{} events pending at the end: {:?}",
-        events.len(),
-        events.kinds()
-    );
+    let pending = mission.pending_events();
+    println!("{} events pending at the end: {pending:?}", pending.len());
     Ok(())
-}
-
-fn first_lines(s: &str) -> String {
-    s.lines().take(4).collect::<Vec<_>>().join(" | ")
-}
-
-/// Reports what happened, then carries out the layer requests (at once:
-/// headless, nothing has to stream) and reports what their callbacks did,
-/// until no requests are left.
-fn settle(
-    when: &str,
-    host: &ScriptHost,
-    world: &Shared,
-    events: &Events,
-    layers: &BTreeMap<String, Entities>,
-) {
-    let mut commands = report(when, host, world, events);
-    for _ in 0..50 {
-        // Modules a script loaded "in the background" are ready.
-        let ran = match host.run_deferred() {
-            Ok((ran, errors)) => {
-                for e in errors {
-                    println!("  dynamic_import callback: {}", first_lines(&e));
-                }
-                ran
-            }
-            Err(e) => {
-                println!("  dynamic_import callbacks: {e}");
-                0
-            }
-        };
-        if ran > 0 {
-            commands.extend(report(
-                &format!("{when}, {ran} modules loaded"),
-                host,
-                world,
-                events,
-            ));
-        }
-        // Deliveries arrive at once, as layers load at once.
-        let mut delivered = 0;
-        for c in &commands {
-            if let Command::Goal {
-                guid,
-                goal,
-                location: Some(at),
-                ..
-            } = c
-                && goal == "Deliver"
-            {
-                println!("  delivery by {guid} arrived at {at:?}");
-                for e in api::arrived(world, *guid, *at) {
-                    println!("  goal callback: {}", first_lines(&e.to_string()));
-                }
-                delivered += 1;
-            }
-        }
-        let requests: Vec<(LayerOp, String)> = commands
-            .into_iter()
-            .filter_map(|c| match c {
-                Command::Layer { op, name } => Some((op, name)),
-                _ => None,
-            })
-            .collect();
-        if requests.is_empty() {
-            if delivered > 0 {
-                commands = report(&format!("{when}, deliveries done"), host, world, events);
-                continue;
-            }
-            if ran == 0 {
-                return;
-            }
-            commands = Vec::new();
-            continue;
-        }
-        for (op, name) in requests {
-            let found = layers.get(&name);
-            if let Some(entities) = found {
-                match op {
-                    LayerOp::Load => place(world, entities, true),
-                    LayerOp::Unload => place(world, entities, false),
-                    LayerOp::Reload => {
-                        place(world, entities, false);
-                        place(world, entities, true);
-                    }
-                }
-            }
-            println!(
-                "  layer {op:?} {name}: {}",
-                found.map_or("part of layers_static".to_owned(), |e| format!(
-                    "{} entities",
-                    e.len()
-                ))
-            );
-            for e in finished(world, &name, true) {
-                println!("  layer callback: {}", first_lines(&e.to_string()));
-            }
-        }
-        commands = report(&format!("{when}, layers done"), host, world, events);
-    }
-    println!("  layer requests still coming after 50 rounds; carrying on");
-}
-
-/// What happened since the last report, if anything; returns the commands.
-fn report(when: &str, host: &ScriptHost, world: &Shared, events: &Events) -> Vec<Command> {
-    let calls = host.take_calls();
-    let (commands, printed) = {
-        let mut w = world.borrow_mut();
-        (w.take_commands(), std::mem::take(&mut w.printed))
-    };
-    if calls.is_empty() && commands.is_empty() && printed.is_empty() {
-        return commands;
-    }
-    println!();
-    println!("{when} ({} events pending):", events.len());
-    for p in printed.iter().take(60) {
-        println!("  print {p}");
-    }
-    for c in commands.iter().take(60) {
-        println!("  command {c:?}");
-    }
-    // Repeated calls in a row collapse to one line with a count.
-    let mut last: Option<(&str, usize)> = None;
-    let mut lines = 0;
-    let mut flush = |l: Option<(&str, usize)>| {
-        if let Some((c, n)) = l
-            && lines < 120
-        {
-            lines += 1;
-            match n {
-                1 => println!("  stub {c}"),
-                _ => println!("  stub {c} x{n}"),
-            }
-        }
-    };
-    for c in &calls {
-        match &mut last {
-            Some((l, n)) if *l == c.as_str() => *n += 1,
-            _ => {
-                flush(last.take());
-                last = Some((c.as_str(), 1));
-            }
-        }
-    }
-    flush(last);
-    if lines >= 120 {
-        println!("  ... {} stub calls in all", calls.len());
-    }
-    commands
 }

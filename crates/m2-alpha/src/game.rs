@@ -69,7 +69,7 @@ impl Game {
                 if !self.restore.is_empty() {
                     restore(physics, &mut scene.vehicles, &mut self.restore);
                 }
-                let waiting = scene.vehicles.iter().any(|v| v.id.is_none());
+                let waiting = scene.vehicles.iter().any(parkable);
                 if player.landed && waiting && self.park_wait <= 0.0 && self.park_tries < PARK_TRIES
                 {
                     // Each look can cast thousands of rays: not every tick.
@@ -162,6 +162,8 @@ impl Game {
             .scene
             .vehicles
             .iter()
+            // The mission's vehicles are the scripts' to place.
+            .filter(|v| v.guid.is_none())
             .filter_map(|v| {
                 let m = world.physics.vehicle_transform(v.id?)?;
                 let f = m.transform_vector3(Vec3::Z);
@@ -235,7 +237,7 @@ impl Game {
     /// Parking is finished: every vehicle loaded is parked, or the search
     /// gave up.
     pub fn parking_done(&self) -> bool {
-        self.park_tries >= PARK_TRIES || self.scene.vehicles.iter().all(|v| v.id.is_some())
+        self.park_tries >= PARK_TRIES || !self.scene.vehicles.iter().any(parkable)
     }
 
     /// What the HUD shows.
@@ -271,6 +273,7 @@ impl Game {
             driving,
             can_enter,
             loading,
+            ..HudInfo::default()
         }
     }
 
@@ -367,7 +370,7 @@ const PARK_GAP: f32 = 1.5;
 /// Parks vehicles that have loaded but have no body yet on flat, clear
 /// ground near the spot ahead of the player, facing the way she faces.
 fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, tries: u32) {
-    if vehicles.iter().all(|v| v.id.is_some()) {
+    if !vehicles.iter().any(parkable) {
         return;
     }
     let (s, c) = player.facing.sin_cos();
@@ -397,7 +400,7 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
             ))
         })
         .collect();
-    for v in vehicles.iter_mut().filter(|v| v.id.is_none()) {
+    for v in vehicles.iter_mut().filter(|v| parkable(v)) {
         let (lo, hi) = v.spec.bounds;
         let radius = footprint_radius(&v.spec);
         let middle = Vec3::new((lo.x + hi.x) * 0.5, 0.0, (lo.z + hi.z) * 0.5);
@@ -439,9 +442,14 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
     }
 }
 
+/// A vehicle of ours (not the mission's) still to park.
+fn parkable(v: &ParkedVehicle) -> bool {
+    v.id.is_none() && v.guid.is_none()
+}
+
 /// Puts vehicles from a save back where they were, as their models load.
 fn restore(physics: &mut Physics, vehicles: &mut [ParkedVehicle], saved: &mut Vec<VehicleSave>) {
-    for v in vehicles.iter_mut().filter(|v| v.id.is_none()) {
+    for v in vehicles.iter_mut().filter(|v| parkable(v)) {
         let Some(k) = saved.iter().position(|s| s.model == v.spec.model) else {
             continue;
         };
@@ -488,7 +496,7 @@ fn nearest(
 
 /// Gets her out on the driver's side, beside the hull, to drop to the
 /// ground there.
-fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player) {
+pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player) {
     if let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) {
         let (lo, hi) = v.spec.bounds;
         let door = v

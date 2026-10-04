@@ -86,7 +86,7 @@ only) once item 11 lands.
 | Per-building collision | Some walls are triangle soup, not shapes | Same as above; triangle-mesh colliders in the physics library. |
 | Parked cars | Vehicles are placed by us | Keep invented placement near roads (`Road` layer component). |
 | Soldier types, patrol routes | Every soldier looks and acts the same | Inspect the `Ai` layer component during item 10; otherwise invent. |
-| Mission scripts, objectives | No missions | Out of alpha scope; investigate after alpha (decision 3). |
+| Mission scripts, objectives | First contract only | `--mission` runs the game's own scripts: VzaCon001 plays to completion in the alpha with objectives, markers and the scripts' jeeps and tank. Objective text shows as ids until the string table's key hash is found; the scripts' helicopters, boats and supply crates aren't shown. |
 | UI / HUD / fonts | Game's Scaleform GFx menus are Flash files | Our own HUD for alpha; GFx is a separate project. |
 | Save format | Game saves are unknown | Our own format; not compatible with the original. |
 | Dialogue triggers | 12,988 voice lines unused | Owned by the voice-work thread; alpha just exposes an audio API for it. |

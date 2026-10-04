@@ -59,6 +59,7 @@ pub mod region;
 pub mod scatter;
 pub mod sges;
 pub mod sound;
+pub mod strings;
 pub mod terrain;
 pub mod texture;
 pub mod ucfx;
@@ -83,6 +84,7 @@ pub use region::{Region, RegionError};
 pub use scatter::{Scatter, ScatterError};
 pub use sges::{Segment, SgesError, SgesHeader};
 pub use sound::{SoundBank, SoundError, StreamIndex};
+pub use strings::{StringTable, StringsError};
 pub use voice::{CueTable, VoiceError};
 
 pub use terrain::{LowResTile, TerrainCell, TerrainError};

@@ -372,6 +372,9 @@ pub struct People {
     pub clips: FightClips,
     /// Soldiers (by spawn entity) killed: they stay dead.
     pub killed: HashSet<u32>,
+    /// Spawns a mission wants soldiers at though their names don't say
+    /// so (`vza_beachguard_1`): plain VZ soldiers.
+    pub mission_soldiers: HashSet<u32>,
     active: HashSet<u32>,
     rng: Rng,
 }
@@ -504,7 +507,13 @@ impl People {
             .collect();
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (_, s) in near.into_iter().take(MAX_SOLDIERS.saturating_sub(soldiers)) {
-            let Some(kind) = self.kind_for(&s.name) else {
+            let kind = self.kind_for(&s.name).or_else(|| {
+                self.mission_soldiers
+                    .contains(&s.entity)
+                    .then(|| self.kind_for("vz soldier"))
+                    .flatten()
+            });
+            let Some(kind) = kind else {
                 continue;
             };
             let forward = s.rotation * Vec3::Z;

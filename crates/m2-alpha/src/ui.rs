@@ -9,8 +9,11 @@ use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use m2_render::gpu::OverlayTarget;
 use m2_render::gpu::wgpu;
 
+use m2_math::glam::{Mat4, Vec3};
+
 use crate::combat::Weapon;
 use crate::config::Config;
+use crate::mission::MissionView;
 
 /// What the HUD shows this frame.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -27,6 +30,10 @@ pub struct HudInfo {
     pub can_enter: Option<String>,
     /// Shown while the island or its people are still loading.
     pub loading: Option<String>,
+    /// The mission's objectives and markers (`--mission`).
+    pub mission: Option<MissionView>,
+    /// World to clip, for placing markers.
+    pub view_proj: Option<Mat4>,
 }
 
 /// What the pause menu asked for.
@@ -213,6 +220,9 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
             white,
         );
     }
+    if let Some(m) = &info.mission {
+        mission(&painter, screen, info.view_proj, m, &text);
+    }
     if !info.playing {
         text(
             screen.left_bottom() + vec2(20.0, -20.0),
@@ -312,6 +322,77 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
     }
 }
 
+/// The mission's objectives (top left), its newest message (top centre)
+/// and markers over its targets.
+fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    view_proj: Option<Mat4>,
+    m: &MissionView,
+    text: &T,
+) {
+    let white = Color32::from_gray(235);
+    let gold = Color32::from_rgb(255, 200, 0);
+    let mut at = screen.left_top() + vec2(20.0, 20.0);
+    if let Some(status) = &m.status {
+        text(at, Align2::LEFT_TOP, status, 15.0, white);
+        at.y += 22.0;
+    }
+    if !m.objectives.is_empty() {
+        text(at, Align2::LEFT_TOP, "Objectives", 16.0, gold);
+        at.y += 22.0;
+        for o in &m.objectives {
+            text(at, Align2::LEFT_TOP, &format!("•  {o}"), 15.0, white);
+            at.y += 20.0;
+        }
+    }
+    if let Some((done, line)) = &m.message {
+        let head = if *done {
+            "Objective complete"
+        } else {
+            "New objective"
+        };
+        text(
+            screen.center_top() + vec2(0.0, 90.0),
+            Align2::CENTER_TOP,
+            &format!("{head}: {line}"),
+            20.0,
+            gold,
+        );
+    }
+    let Some(vp) = view_proj else { return };
+    for (world, label, [r, g, b, _]) in &m.markers {
+        let Some(p) = to_screen(vp, *world, screen) else {
+            continue;
+        };
+        let colour = Color32::from_rgb(*r, *g, *b);
+        painter.circle_stroke(p, 9.0, Stroke::new(2.5, colour));
+        text(
+            p + vec2(0.0, -14.0),
+            Align2::CENTER_BOTTOM,
+            label,
+            14.0,
+            colour,
+        );
+    }
+}
+
+/// Where a world point lands on the screen, if in front of the camera.
+fn to_screen(view_proj: Mat4, world: Vec3, screen: egui::Rect) -> Option<egui::Pos2> {
+    let clip = view_proj * world.extend(1.0);
+    if clip.w <= 0.01 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    // Off to the side: pinned to the screen's edge.
+    let x = ndc.x.clamp(-0.95, 0.95);
+    let y = ndc.y.clamp(-0.9, 0.9);
+    Some(pos2(
+        screen.left() + (x + 1.0) * 0.5 * screen.width(),
+        screen.top() + (1.0 - y) * 0.5 * screen.height(),
+    ))
+}
+
 fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
     let mut action = None;
     // Dim the game behind the menu.
@@ -373,6 +454,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn markers_in_front_land_on_screen() {
+        let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let vp = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 100.0);
+        let p = to_screen(vp, Vec3::new(0.0, 0.0, -10.0), screen).unwrap();
+        assert!((p.x - 400.0).abs() < 0.5 && (p.y - 300.0).abs() < 0.5);
+        assert!(to_screen(vp, Vec3::new(0.0, 0.0, 10.0), screen).is_none());
+    }
+
+    #[test]
     fn hud_and_menu_lay_out() {
         let mut hud = Hud::new();
         let mut config = Config::default();
@@ -380,6 +470,17 @@ mod tests {
             playing: true,
             hp: 40.0,
             driving: Some(("global_veh_hondacrx".into(), 12.0, false)),
+            mission: Some(MissionView {
+                objectives: vec!["VzaCon001 objective 1".into()],
+                markers: vec![(
+                    Vec3::new(0.0, 0.0, -10.0),
+                    "deliverable".into(),
+                    [255, 200, 0, 255],
+                )],
+                message: Some((false, "VzaCon001 objective 1".into())),
+                status: None,
+            }),
+            view_proj: Some(Mat4::perspective_rh(1.0, 1.333, 0.1, 100.0)),
             ..HudInfo::default()
         };
         let (action, _) = hud.build(headless_input(800, 600, 0.0), &info, &mut config);
