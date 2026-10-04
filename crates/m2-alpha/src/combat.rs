@@ -60,9 +60,11 @@ pub struct WeaponModel {
     /// Weapon to right-hand transform held in both hands (aiming, or at
     /// the ready).
     pub grip: Mat4,
-    /// The same, carried low in the right hand alone: muzzle forward and
-    /// down, as the game's player carries a rifle.
-    pub carry: Mat4,
+    /// Carried low in the right hand alone, muzzle forward and down as
+    /// the game's player carries a rifle: where the grip sits in the hand
+    /// (hand space), and the weapon's turn in the body's space, so it
+    /// points the same way however the hand turns.
+    pub carry: Option<(Vec3, Quat)>,
 }
 
 /// The weapon models, once loaded.
@@ -80,7 +82,7 @@ impl Arsenal {
     /// Adds weapon `name`, gripped in `rig`'s right hand.
     pub fn add(&mut self, name: &str, model: GpuModel, muzzle: Vec3, rig: Option<&Rig>) {
         let grip = rig.and_then(|r| grip(r, muzzle)).unwrap_or(Mat4::IDENTITY);
-        let carry = rig.and_then(|r| carry(r, muzzle)).unwrap_or(grip);
+        let carry = rig.and_then(|r| carry(r, muzzle));
         if let Some(r) = rig {
             self.hands = hands(&r.skeleton);
         }
@@ -112,12 +114,12 @@ impl Arsenal {
         let (r, l) = hands?;
         let (right, left) = (nodes.get(r)?, nodes.get(l)?);
         let apart = right.w_axis.truncate().distance(left.w_axis.truncate());
-        let grip = if apart < TWO_HANDED {
-            weapon.grip
-        } else {
-            weapon.carry
-        };
-        Some(body * *right * grip)
+        match weapon.carry {
+            Some((at, turn)) if apart >= TWO_HANDED => {
+                Some(body * Mat4::from_rotation_translation(turn, right.transform_point3(at)))
+            }
+            _ => Some(body * *right * weapon.grip),
+        }
     }
 }
 
@@ -163,11 +165,11 @@ fn grip(rig: &Rig, muzzle: Vec3) -> Option<Mat4> {
     place(nodes[rh], pr.lerp(pf, 0.6), muzzle, pl - pr)
 }
 
-/// Where a weapon with its muzzle at `muzzle` sits in the right hand when
-/// carried in it alone, from the idle clip's pose: the barrel forward
-/// (a little out to the side) and [`CARRY_DOWN`] below level, upright
-/// about the barrel.
-fn carry(rig: &Rig, muzzle: Vec3) -> Option<Mat4> {
+/// How a weapon with its muzzle at `muzzle` is carried in the right hand
+/// alone, from the idle clip's pose: the grip in the hand, and the barrel
+/// forward (a little out to the hand's side) and [`CARRY_DOWN`] below
+/// level, upright about the barrel, in the body's space.
+fn carry(rig: &Rig, muzzle: Vec3) -> Option<(Vec3, Quat)> {
     let skeleton = &rig.skeleton;
     let idle = rig.gait_clip(m2_engine::Gait::Idle)?;
     let clip = &rig.clips[idle];
@@ -178,29 +180,38 @@ fn carry(rig: &Rig, muzzle: Vec3) -> Option<Mat4> {
     let fingers = skeleton.parents.iter().position(|&p| p == Some(rh));
     let pr = nodes[rh].transform_point3(Vec3::ZERO);
     let pf = fingers.map_or(pr, |f| nodes[f].transform_point3(Vec3::ZERO));
+    let at = nodes[rh].inverse().transform_point3(pr.lerp(pf, 0.6));
     let ahead = Vec3::new(forward.x, 0.0, forward.y).normalize_or(Vec3::Z);
-    // Turned a little out to the hand's side, clear of the leg.
-    let side = Vec3::new(pr.x, 0.0, pr.z);
+    // Turned a little out to the hand's side of the body, clear of the leg.
+    let centre = skeleton
+        .pelvis()
+        .map_or(Vec3::ZERO, |p| nodes[p].w_axis.truncate());
+    let side = (pr - centre).with_y(0.0);
     let out = (side - ahead * side.dot(ahead)).normalize_or_zero();
     let ahead = (ahead * CARRY_OUT.cos() + out * CARRY_OUT.sin()).normalize();
     let dir = ahead * CARRY_DOWN.cos() - Vec3::Y * CARRY_DOWN.sin();
-    place(nodes[rh], pr.lerp(pf, 0.6), muzzle, dir)
+    Some((at, turn(muzzle, dir)?))
 }
 
 /// The weapon-to-hand transform putting a weapon's grip at `at` (model
 /// space) with its barrel (towards `muzzle`) along `dir`, upright about
 /// the barrel, for a hand posed at `hand`.
 fn place(hand: Mat4, at: Vec3, muzzle: Vec3, dir: Vec3) -> Option<Mat4> {
+    Some(hand.inverse() * Mat4::from_rotation_translation(turn(muzzle, dir)?, at))
+}
+
+/// The turn putting a weapon's barrel (towards `muzzle`) along `dir`,
+/// upright about the barrel.
+fn turn(muzzle: Vec3, dir: Vec3) -> Option<Quat> {
     let dir = dir.normalize_or_zero();
     let barrel = muzzle.normalize_or_zero();
     if dir == Vec3::ZERO || barrel == Vec3::ZERO {
         return None;
     }
-    let mut q = Quat::from_rotation_arc(barrel, dir);
+    let q = Quat::from_rotation_arc(barrel, dir);
     let flat = |v: Vec3| (v - dir * v.dot(dir)).normalize_or_zero();
     let (have, want) = (flat(q * Vec3::Y), flat(Vec3::Y));
-    q = Quat::from_axis_angle(dir, have.cross(want).dot(dir).atan2(have.dot(want))) * q;
-    Some(hand.inverse() * Mat4::from_rotation_translation(q, at))
+    Some(Quat::from_axis_angle(dir, have.cross(want).dot(dir).atan2(have.dot(want))) * q)
 }
 
 /// Which weapon she has up.
