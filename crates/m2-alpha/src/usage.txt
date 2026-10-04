@@ -36,6 +36,14 @@ m2-alpha [options]
                          before the picture (turrets follow it)
   --spawns <n>           with --screenshot: list the n spawns nearest where
                          she starts (name, place, who they spawn)
+  --face <degrees>       with --screenshot on foot: face this way first
+                         (0 is +z, 90 is +x)
+  --aim                  with --screenshot on foot: weapon up for the picture
+  --weapon rifle|rpg     with --screenshot on foot: the weapon she has up
+  --closeup              with --screenshot on foot: the picture from close by
+                         her right side, to see her hands
+  --probe                with --screenshot: list what rays from where she
+                         stands hit (unseen walls, steps in the ground)
   --mission              run the game's mission scripts: the first contract
                          starts as in the game, with its objectives and
                          markers on screen (log: m2-alpha-mission.log);

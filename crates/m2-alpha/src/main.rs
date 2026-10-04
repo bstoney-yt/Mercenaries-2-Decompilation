@@ -105,6 +105,19 @@ struct Options {
     list_spawns: usize,
     /// With `--fight`: seconds to wait after it before the picture.
     fight_wait: f32,
+    /// With `--screenshot` on foot: face this way (radians from +z towards
+    /// +x) before the picture.
+    face: Option<f32>,
+    /// With `--screenshot` on foot: hold the weapon up to aim at the end.
+    aim: bool,
+    /// With `--screenshot` on foot: the weapon she has up.
+    weapon: Option<combat::Weapon>,
+    /// With `--screenshot` on foot: take the picture close up, from her
+    /// right and a little ahead, at chest height, to see her hands.
+    closeup: bool,
+    /// With `--screenshot`: cast rays around where she stands and list
+    /// what they hit, to find unseen obstacles.
+    probe: bool,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
@@ -187,6 +200,24 @@ fn parse_args() -> anyhow::Result<Options> {
                 o.mission_drivers.push((path, code));
             }
             "--spawns" => o.list_spawns = value()?.parse().context("--spawns expects a count")?,
+            "--face" => {
+                o.face = Some(
+                    value()?
+                        .parse::<f32>()
+                        .context("--face expects degrees")?
+                        .to_radians(),
+                )
+            }
+            "--aim" => o.aim = true,
+            "--weapon" => {
+                o.weapon = Some(match value()?.as_str() {
+                    "rifle" => combat::Weapon::Rifle,
+                    "rpg" => combat::Weapon::Rpg,
+                    v => bail!("--weapon {v}: expected rifle or rpg"),
+                })
+            }
+            "--closeup" => o.closeup = true,
+            "--probe" => o.probe = true,
             "--fight-wait" => {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
@@ -563,6 +594,9 @@ fn screenshot(
             );
         }
     }
+    if options.probe {
+        probe_for_screenshot(&game);
+    }
     let mut link = None;
     if options.mission
         && let Some(install) = install
@@ -596,12 +630,25 @@ fn screenshot(
         };
         let from = game.scene.player.as_ref().map(|p| p.character.position);
         for i in 0..180 {
-            // A jump takes the picture on the way up.
+            if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
+                p.yaw = face;
+                if i == 0 {
+                    p.facing = face;
+                }
+            }
+            // A jump takes the picture on the way up; aiming, the weapon
+            // comes up for the last second.
             let jump = options.jump && i == 168;
+            let trigger = combat::Trigger {
+                aim: options.aim && i >= 120,
+                select: options.weapon.filter(|_| i == 0),
+                ..combat::Trigger::default()
+            };
             game.step(
                 Intent {
                     jump,
                     hold_jump: jump,
+                    trigger,
                     ..intent
                 },
                 tick,
@@ -627,6 +674,17 @@ fn screenshot(
             );
         }
     }
+    if options.closeup
+        && let Some(p) = &game.scene.player
+    {
+        // From her right and a little ahead, at chest height.
+        let chest = p.character.position + m2_math::glam::Vec3::Y * 1.25;
+        let ahead = m2_math::glam::Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
+        let right = m2_math::glam::Vec3::new(-ahead.z, 0.0, ahead.x);
+        game.on_foot = false;
+        game.camera = FlyCamera::looking_at(chest + right * 1.3 + ahead * 0.9, chest);
+        eprintln!("closeup: chest {chest:.2}, facing {ahead:.2}");
+    }
     // The picture, with the HUD.
     let mut hud = ui::Hud::new();
     let mut settings = config.clone();
@@ -639,6 +697,94 @@ fn screenshot(
     std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))?;
     eprintln!("wrote {}", out.display());
     Ok(())
+}
+
+/// Looks for what stops vehicles where she stands: rays out to 25 m in
+/// 16 directions at four heights over the ground, and the ground's height
+/// every metre along lines through the spot, printing what each hits.
+fn probe_for_screenshot(game: &Game) {
+    use m2_engine::StaticKey;
+    use m2_math::glam::Vec3;
+    let (Some(world), Some(player)) = (&game.scene.world, &game.scene.player) else {
+        return;
+    };
+    let here = player.character.position;
+    let what = |key: Option<StaticKey>| -> String {
+        match key {
+            Some(StaticKey::Object(i)) => world.index.objects.get(i).map_or_else(
+                || format!("object {i}"),
+                |o| format!("object {i}, model {:08x} at {:.1}", o.model, o.position),
+            ),
+            Some(StaticKey::Member(i, k)) => world.index.objects.get(i).map_or_else(
+                || format!("building {k} of object {i}"),
+                |o| format!("building {k} of object {i} (batch {:08x})", o.model),
+            ),
+            Some(StaticKey::Cell(h)) => format!("terrain cell {h:08x}"),
+            None => "something not static".to_owned(),
+        }
+    };
+    let down = |x: f32, z: f32| {
+        let top = here.y + 60.0;
+        world
+            .physics
+            .cast_ray_keyed(Vec3::new(x, top, z), -Vec3::Y, 200.0)
+            .map(|(d, n, k)| (top - d, n, k))
+    };
+    let Some((ground, normal, key)) = down(here.x, here.z) else {
+        eprintln!("probe: no ground under {here:.1}");
+        return;
+    };
+    eprintln!(
+        "probe: at {here:.1}, ground {ground:.2}, normal {normal:.2} ({})",
+        what(key)
+    );
+    for up in [0.2, 0.6, 1.2, 2.5] {
+        let from = Vec3::new(here.x, ground + up, here.z);
+        let mut hits = Vec::new();
+        for k in 0..16 {
+            let a = k as f32 * std::f32::consts::TAU / 16.0;
+            let dir = Vec3::new(a.sin(), 0.0, a.cos());
+            if let Some((d, n, key)) = world.physics.cast_ray_keyed(from, dir, 25.0) {
+                hits.push(format!(
+                    "{:>3.0} deg: {d:4.1} m, normal {n:.2}, {}",
+                    a.to_degrees(),
+                    what(key)
+                ));
+            }
+        }
+        eprintln!("probe: {up} m up, {} of 16 rays hit:", hits.len());
+        for h in hits {
+            eprintln!("  {h}");
+        }
+    }
+    for (label, axis) in [("x", Vec3::X), ("z", Vec3::Z)] {
+        let mut last: Option<(f32, Option<StaticKey>)> = None;
+        let mut notes = Vec::new();
+        for step in -30..=30 {
+            let p = here + axis * step as f32;
+            match down(p.x, p.z) {
+                Some((y, _, key)) => {
+                    if let Some((ly, lk)) = last {
+                        if (y - ly).abs() > 0.25 {
+                            notes.push(format!("{:+.2} m at {step:+} ({})", y - ly, what(key)));
+                        } else if lk != key {
+                            notes.push(format!("onto {} at {step:+}", what(key)));
+                        }
+                    }
+                    last = Some((y, key));
+                }
+                None => notes.push(format!("no ground at {step:+}")),
+            }
+        }
+        eprintln!(
+            "probe: along {label} from -30 to +30 m: {}",
+            if notes.is_empty() {
+                "smooth".to_owned()
+            } else {
+                notes.join("; ")
+            }
+        );
+    }
 }
 
 /// Starts the mission scripts, waits for them to read the archive and
