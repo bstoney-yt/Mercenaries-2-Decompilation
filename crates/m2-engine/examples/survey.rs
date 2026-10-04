@@ -37,6 +37,18 @@
 //! spot:<x>,<z>[,<r>]        what stands near a spot (default 30 m): models
 //!                           with their techniques and textures, and the
 //!                           layer entities with their components' fields
+//! entities:<word>[,..]      every entity of the layers whose name holds a
+//!                           word, or whose own name does, with its
+//!                           components' fields (400 a layer at most)
+//! collision:<model>[,..]    a model's collision: each PHY2 shape (kind,
+//!                           node, radius, box in model space, sizes), or
+//!                           the visible geometry it falls back to
+//! vehicle:<word|model>[,..] vehicles whose label holds a word: what the
+//!                           alpha makes of them (wheels, tracked, turret),
+//!                           and every node with its geometry box and how
+//!                           it fares in the wheel tests
+//! templates:<word>[,..]     templates whose name holds a word, with their
+//!                           components' fields (text fields not read)
 //! find:<hash>[,..]          names for hashes
 //! ```
 //!
@@ -51,7 +63,7 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use m2_assets::animation::ANIMATION_TYPE;
-use m2_assets::layer::{LAYER_TYPE, STRING_FIELD};
+use m2_assets::layer::{LAYER_TYPE, STRING_FIELD, TEMPLATE_DB_TYPE};
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::scatter::SCATTER_TYPE;
 use m2_assets::sound::SOUND_BANK_TYPE;
@@ -61,7 +73,7 @@ use m2_assets::{BlockContents, Clip, Layer, Model, Scatter, SoundBank, TerrainCe
 use m2_engine::anim::{BoundClip, Skeleton};
 use m2_engine::assets::TEXTURE_TYPE;
 use m2_engine::audio::SoundLibrary;
-use m2_engine::vehicle::{Catalogue, catalogue};
+use m2_engine::vehicle::{Catalogue, CatalogueEntry, VehicleSpec, catalogue};
 use m2_engine::{AssetSource, Install, Voices, WorldIndex};
 use m2_math::glam::Vec3;
 
@@ -585,6 +597,28 @@ fn main() -> Result<(), Error> {
                     p.get(2).copied().unwrap_or(30.0),
                 )
             }
+            "entities" => {
+                // Layers whose name holds a word, or entities whose name
+                // does; at most 400 a layer.
+                let words: Vec<String> = arg
+                    .split(',')
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+                layer_entities(
+                    &mut source,
+                    &names,
+                    400,
+                    |layer, name, _| {
+                        let name = name.to_ascii_lowercase();
+                        words.iter().any(|w| layer.contains(w) || name.contains(w))
+                    },
+                    |p| p.x,
+                )
+            }
+            "collision" => collision(&mut source, &names, arg),
+            "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
+            "templates" => templates(&mut source, &names, arg),
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -1562,6 +1596,308 @@ fn spot<R: Read + Seek>(
         }
     }
     // The layer entities near the spot, with their components' fields.
+    layer_entities(source, names, usize::MAX, |_, _, p| d(p) < radius, d)
+}
+
+/// Each model's collision as the alpha builds it: its `PHY2` shapes
+/// placed in model space, or else its visible triangles.
+fn collision<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_assets::physics::{Geometry, Physics as Phy2};
+    for h in arg.split(',').filter_map(hex) {
+        let data = match source.model(h) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("{h:08x}: {e}");
+                continue;
+            }
+        };
+        let m = data.parse()?;
+        let b = &m.info.bounds;
+        println!(
+            "{h:08x} {}: bounds ({:.2} {:.2} {:.2}) to ({:.2} {:.2} {:.2}), {} nodes",
+            names.show(h),
+            b.min[0],
+            b.min[1],
+            b.min[2],
+            b.max[0],
+            b.max[1],
+            b.max[2],
+            m.nodes.len()
+        );
+        let phy2 = m2_assets::Ucfx::parse(&data.base)
+            .ok()
+            .and_then(|u| u.top_level(*b"PHY2"));
+        let Some(p) = phy2.map(Phy2::parse) else {
+            let cpu = m2_engine::CpuModel::from_data(&data, 0)?;
+            println!(
+                "  no PHY2: visible triangles stand in ({} collision)",
+                if cpu.collision.is_some() { "a" } else { "no" }
+            );
+            continue;
+        };
+        let p = match p {
+            Ok(p) => p,
+            Err(e) => {
+                println!("  PHY2 does not parse: {e}");
+                continue;
+            }
+        };
+        println!(
+            "  PHY2: {} parts, {} bodies ({} fixed), {} shapes",
+            p.parts.len(),
+            p.bodies.len(),
+            p.bodies.iter().filter(|b| b.is_fixed()).count(),
+            p.shapes.len()
+        );
+        for (k, shape) in p.shapes.iter().enumerate() {
+            let node = p.shape_node(k);
+            let to_model = node
+                .and_then(|n| u16::try_from(n).ok())
+                .and_then(|n| m.node_to_model(n))
+                .unwrap_or(m2_math::glam::Mat4::IDENTITY);
+            let (v, t) = shape.geometry.triangles(shape.radius);
+            let mut lo = Vec3::splat(f32::MAX);
+            let mut hi = Vec3::splat(f32::MIN);
+            for x in &v {
+                let q = to_model.transform_point3(Vec3::from(*x));
+                lo = lo.min(q);
+                hi = hi.max(q);
+            }
+            let kind = match &shape.geometry {
+                Geometry::Box { .. } => "box",
+                Geometry::Sphere => "sphere",
+                Geometry::Capsule { .. } => "capsule",
+                Geometry::Convex { .. } => "convex",
+                Geometry::Mesh { .. } => "mesh",
+            };
+            let node_name = node
+                .and_then(|n| m.nodes.get(n as usize))
+                .map_or("?", |n| names.show(n.name_hash));
+            println!(
+                "  shape {k}: {kind}, node {node:?} {node_name}, radius {:.3}, {} vertices, {} triangles, box ({:.2} {:.2} {:.2}) to ({:.2} {:.2} {:.2})",
+                shape.radius,
+                v.len(),
+                t.len(),
+                lo.x,
+                lo.y,
+                lo.z,
+                hi.x,
+                hi.y,
+                hi.z
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Every layer entity `keep` (layer, entity name, place) keeps, with its
+/// components' fields, at most `most` per layer, ordered by `order`.
+/// Vehicles whose label (or kind) holds one of the words, or of a model
+/// hash: the spec the alpha builds, the wheels found, then every node with
+/// its own geometry's box and the wheel tests (`d` the box's larger side
+/// seen from the side; round, thin, grounded; `off` how far the box's
+/// middle is from the node's origin).
+fn vehicles<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    lazy: &mut Lazy,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let list: Vec<CatalogueEntry> = lazy
+        .catalogue(source)?
+        .vehicles
+        .iter()
+        .filter(|v| {
+            words.iter().any(|w| {
+                v.label.contains(w.as_str())
+                    || v.kind == *w
+                    || (w.len() == 8 && hex(w) == Some(v.model))
+            })
+        })
+        .cloned()
+        .collect();
+    println!("{} vehicles", list.len());
+    let v3 = |v: Vec3| format!("({:.3} {:.3} {:.3})", v.x, v.y, v.z);
+    let a3 = |v: [f32; 3]| format!("({:.3} {:.3} {:.3})", v[0], v[1], v[2]);
+    for e in list.iter().take(12) {
+        let data = source.model(e.model)?;
+        let m = data.parse()?;
+        let b = &m.info.bounds;
+        println!();
+        println!(
+            "{:08x} {} {}: {} nodes, bounds {} to {}",
+            e.model,
+            e.kind,
+            e.label,
+            m.nodes.len(),
+            a3(b.min),
+            a3(b.max)
+        );
+        match VehicleSpec::from_model(e, &m) {
+            None => println!("  spec: none (no wheels found)"),
+            Some(spec) => {
+                println!(
+                    "  spec: {} wheels, tracked {}, {} road wheels, pivot {}, muzzle {}, seat {}, door {}",
+                    spec.wheels.len(),
+                    spec.tracked,
+                    spec.road_wheels.len(),
+                    spec.pivot.map_or("-".to_owned(), v3),
+                    spec.muzzle.map_or("-".to_owned(), v3),
+                    spec.seat.map_or("-".to_owned(), v3),
+                    spec.door.map_or("-".to_owned(), v3),
+                );
+                for (i, w) in spec.wheels.iter().enumerate() {
+                    println!(
+                        "    wheel {i}: centre {} radius {:.3} width {:.3} steers {}",
+                        v3(w.centre),
+                        w.radius,
+                        w.width,
+                        w.steers
+                    );
+                }
+            }
+        }
+        let found = m2_assets::vehicle::find_wheels(&m);
+        println!("  found wheels: {}", found.len());
+        for w in &found {
+            println!(
+                "    nodes {:?} centre {} radius {:.3} width {:.3}",
+                w.nodes,
+                a3(w.centre),
+                w.radius,
+                w.width
+            );
+        }
+        let boxes = m2_assets::vehicle::node_boxes(&m);
+        let floor = boxes.iter().map(|b| b.min[1]).fold(f32::INFINITY, f32::min);
+        println!("  floor {floor:.3}, {} nodes with geometry", boxes.len());
+        let hashes: Vec<u32> = m.nodes.iter().map(|n| n.name_hash).collect();
+        let named = node_names(names, &hashes);
+        for (i, n) in m.nodes.iter().enumerate() {
+            let at = m
+                .node_to_model(i as u16)
+                .map_or(Vec3::ZERO, |t| t.w_axis.truncate());
+            let mut line = format!(
+                "  {i:3} {:08x} parent {:>3} at {}",
+                n.name_hash,
+                n.parent.map_or("-".to_owned(), |p| p.to_string()),
+                v3(at)
+            );
+            if let Some(bx) = boxes.iter().find(|bx| usize::from(bx.node) == i) {
+                let sz = [0, 1, 2].map(|a| bx.max[a] - bx.min[a]);
+                let d = sz[1].max(sz[2]);
+                let round = (sz[1] - sz[2]).abs() <= 0.15 * d;
+                let thin = sz[0] <= 0.85 * d && sz[0] >= 0.03;
+                let grounded = bx.min[1] <= floor + 0.1 * d + 0.05;
+                let mid = Vec3::from([0, 1, 2].map(|a| 0.5 * (bx.min[a] + bx.max[a])));
+                line += &format!(
+                    " box {} to {} d {d:.3}{}{}{} off {:.3}",
+                    a3(bx.min),
+                    a3(bx.max),
+                    if round { " round" } else { "" },
+                    if thin { " thin" } else { "" },
+                    if grounded { " grounded" } else { "" },
+                    mid.distance(at)
+                );
+            }
+            println!(
+                "{line}  {}",
+                named.get(&n.name_hash).map_or("?", String::as_str)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Templates of the template database whose name holds one of the words,
+/// each with every component it has and that component's fields. Text
+/// fields are not read (a component with one is only listed).
+fn templates<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let index = source.archive().index();
+    let Some(hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let data = source.asset(hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let tnames = db.names();
+    println!(
+        "template database: {} templates, {} components",
+        tnames.len(),
+        db.components.len()
+    );
+    let records: Vec<ComponentRecords<'_>> = db
+        .components
+        .iter()
+        .filter(|c| c.name != "Name")
+        .map(|c| {
+            (
+                c.name,
+                c.fields.clone(),
+                c.records().unwrap_or_default().into_iter().collect(),
+            )
+        })
+        .collect();
+    let texty: Vec<&str> = db
+        .components
+        .iter()
+        .filter(|c| c.fields.iter().any(|f| f.ty == STRING_FIELD))
+        .map(|c| c.name)
+        .collect();
+    println!("components with text (not read): {}", texty.join(", "));
+    let mut picked: Vec<(&str, u32)> = tnames
+        .iter()
+        .filter(|(_, n)| {
+            let n = n.to_ascii_lowercase();
+            words.iter().any(|w| n.contains(w.as_str()))
+        })
+        .map(|(&id, &n)| (n, id))
+        .collect();
+    picked.sort_unstable();
+    println!("{} templates match", picked.len());
+    for (name, id) in picked.into_iter().take(150) {
+        println!("  {id:08x} {name:?}");
+        for (cname, fields, recs) in &records {
+            let Some(rec) = recs.get(&id) else {
+                continue;
+            };
+            let values: Vec<String> = fields.iter().map(|f| field_value(names, f, rec)).collect();
+            println!("    {cname}: {}", values.join(", "));
+        }
+    }
+    Ok(())
+}
+
+fn layer_entities<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    most: usize,
+    keep: impl Fn(&str, &str, Vec3) -> bool,
+    order: impl Fn(Vec3) -> f32,
+) -> Result<(), Error> {
     let index = source.archive().index();
     let mut blocks: Vec<usize> = index
         .assets()
@@ -1574,6 +1910,7 @@ fn spot<R: Read + Seek>(
     let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
     for b in blocks {
         let decoded = source.block(b)?;
+        let layer_name = m2_engine::world::layer_name(&paths[b]);
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
             if e.type_hash != LAYER_TYPE {
                 continue;
@@ -1582,18 +1919,21 @@ fn spot<R: Read + Seek>(
                 continue;
             };
             let placements = layer.placements();
+            let entity_names = layer.names();
             let mut near: Vec<(f32, u32)> = placements
                 .iter()
-                .map(|(&id, p)| (d(Vec3::from(p.position)), id))
-                .filter(|(dist, _)| *dist < radius)
+                .filter(|(id, p)| {
+                    let name = entity_names.get(id).copied().unwrap_or("");
+                    keep(&layer_name, name, Vec3::from(p.position))
+                })
+                .map(|(&id, p)| (order(Vec3::from(p.position)), id))
                 .collect();
             if near.is_empty() {
                 continue;
             }
-            near.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let entity_names = layer.names();
+            near.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             println!(
-                "layer {:08x} {} in {}: {} entities near",
+                "layer {:08x} {} in {}: {} entities",
                 e.name_hash,
                 names.show(e.name_hash),
                 paths[b],
@@ -1611,10 +1951,10 @@ fn spot<R: Read + Seek>(
                     )
                 })
                 .collect();
-            for (dist, id) in near {
+            for (dist, id) in near.into_iter().take(most) {
                 let p = placements[&id];
                 println!(
-                    "  {id:08x} {dist:.1} m at ({:.1} {:.1} {:.1}) {:?}",
+                    "  {id:08x} {dist:.1} at ({:.1} {:.1} {:.1}) {:?}",
                     p.position[0],
                     p.position[1],
                     p.position[2],

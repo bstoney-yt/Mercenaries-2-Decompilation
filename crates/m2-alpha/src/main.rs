@@ -44,6 +44,7 @@ mod input;
 mod mission;
 mod npc;
 mod player;
+mod props;
 mod save;
 mod scene;
 mod sound;
@@ -112,12 +113,19 @@ struct Options {
     aim: bool,
     /// With `--screenshot` on foot: the weapon she has up.
     weapon: Option<combat::Weapon>,
+    /// Weapons on the hand's attach node as posed (`--grip attach`).
+    attach_grip: bool,
     /// With `--screenshot` on foot: take the picture close up, from her
     /// right and a little ahead, at chest height, to see her hands.
     closeup: bool,
     /// With `--screenshot`: cast rays around where she stands and list
     /// what they hit, to find unseen obstacles.
     probe: bool,
+    /// With `--aim` (or `--drive --look`): fire just before the picture.
+    fire: bool,
+    /// With `--mission --screenshot`: take the picture from this far from
+    /// the nearest marker, looking at it.
+    mission_look: Option<f32>,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
@@ -217,7 +225,18 @@ fn parse_args() -> anyhow::Result<Options> {
                 })
             }
             "--closeup" => o.closeup = true,
+            "--grip" => {
+                o.attach_grip = match value()?.as_str() {
+                    "attach" => true,
+                    "hands" => false,
+                    v => bail!("--grip {v}: expected attach or hands"),
+                }
+            }
             "--probe" => o.probe = true,
+            "--fire" => o.fire = true,
+            "--mission-look" => {
+                o.mission_look = Some(value()?.parse().context("--mission-look expects metres")?)
+            }
             "--fight-wait" => {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
@@ -261,6 +280,7 @@ fn keep_crash_reports() {
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
     let options = parse_args()?;
+    combat::use_attach_frame(options.attach_grip);
     let config_path = options
         .config_path
         .clone()
@@ -641,6 +661,8 @@ fn screenshot(
             let jump = options.jump && i == 168;
             let trigger = combat::Trigger {
                 aim: options.aim && i >= 120,
+                // The last shot's flash is still up for the picture.
+                fire: options.fire && i == 177,
                 select: options.weapon.filter(|_| i == 0),
                 ..combat::Trigger::default()
             };
@@ -684,6 +706,12 @@ fn screenshot(
         game.on_foot = false;
         game.camera = FlyCamera::looking_at(chest + right * 1.3 + ahead * 0.9, chest);
         eprintln!("closeup: chest {chest:.2}, facing {ahead:.2}");
+        if let Some(line) = describe_hold(&game) {
+            eprintln!("closeup: {line}");
+        }
+    }
+    if let (Some(reach), Some(link)) = (options.mission_look, &link) {
+        look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
     }
     // The picture, with the HUD.
     let mut hud = ui::Hud::new();
@@ -696,6 +724,94 @@ fn screenshot(
     ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
     std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))?;
     eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+/// How she holds her weapon, for close-ups: where its barrel and its top
+/// point (ahead, to her right, up; and degrees below level), and where the
+/// grip and muzzle are from her right hand's attach point, in metres
+/// (ahead, right, up).
+fn describe_hold(game: &Game) -> Option<String> {
+    use m2_math::glam::Vec3;
+    let p = game.scene.player.as_ref()?;
+    let (_, rig) = p.model.as_ref()?;
+    let arsenal = &game.scene.arsenal;
+    let w = match game.combat.weapon {
+        combat::Weapon::Rifle => arsenal.rifle.as_ref()?,
+        combat::Weapon::Rpg => arsenal.rpg.as_ref()?,
+    };
+    let (nodes, _) = rig.posed();
+    let body = p.model_matrix();
+    let held = arsenal.in_hand(
+        w,
+        body,
+        &nodes,
+        (arsenal.hand, arsenal.attach),
+        rig.two_handed,
+    )?;
+    let ahead = Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
+    let right = Vec3::new(-ahead.z, 0.0, ahead.x);
+    let local = |v: Vec3| Vec3::new(v.dot(ahead), v.dot(right), v.y);
+    let barrel = held.transform_vector3(w.muzzle).normalize_or_zero();
+    let top = held.transform_vector3(Vec3::Y).normalize_or_zero();
+    let palm = (body * nodes[arsenal.attach?]).w_axis.truncate();
+    let grip = held.w_axis.truncate();
+    let muzzle = held.transform_point3(w.muzzle);
+    Some(format!(
+        "{:?} held {}, barrel {:.2} ({:.0} deg below level), top {:.2}, grip {:.2} and muzzle {:.2} from the palm",
+        game.combat.weapon,
+        if rig.two_handed {
+            "two-handed"
+        } else {
+            "in the right hand"
+        },
+        local(barrel),
+        (-barrel.y).asin().to_degrees(),
+        local(top),
+        local(grip - palm),
+        local(muzzle - palm),
+    ))
+}
+
+/// Puts the camera `reach` metres from the mission marker nearest the
+/// player, on her side of it and a little above, looking at it, and lets
+/// the island stream in around it.
+fn look_at_marker(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    link: &mission::MissionLink,
+    reach: f32,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    use m2_math::glam::Vec3;
+    let here = game.focus();
+    let Some((at, label, _)) = link
+        .view()
+        .markers
+        .into_iter()
+        .min_by(|a, b| a.0.distance(here).total_cmp(&b.0.distance(here)))
+    else {
+        eprintln!("mission look: no markers");
+        return Ok(());
+    };
+    let side = (here - at).with_y(0.0).normalize_or(Vec3::X);
+    let eye = at + side * reach + Vec3::Y * (reach * 0.4);
+    eprintln!("mission look: {label} at {at:.1} from {eye:.1}");
+    game.on_foot = false;
+    game.camera = FlyCamera::looking_at(eye, at);
+    let tick = TICK.as_secs_f32();
+    let started = Instant::now();
+    for i in 0.. {
+        game.step(Intent::default(), tick);
+        if i % 10 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
+        if (i > 120 && pending == 0) || started.elapsed() > Duration::from_secs(60) {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -720,6 +836,10 @@ fn probe_for_screenshot(game: &Game) {
                 |o| format!("building {k} of object {i} (batch {:08x})", o.model),
             ),
             Some(StaticKey::Cell(h)) => format!("terrain cell {h:08x}"),
+            Some(StaticKey::Entity(e)) => world.index.state_objects.get(&e).map_or_else(
+                || format!("state layer entity {e:08x}"),
+                |o| format!("state layer entity {e:08x}, model {:08x}", o.model),
+            ),
             None => "something not static".to_owned(),
         }
     };
@@ -859,6 +979,9 @@ fn mission_for_screenshot(
             None => eprintln!("mission vehicle {label} not placed"),
         }
     }
+    for line in link.report(game) {
+        eprintln!("mission: {line}");
+    }
     Ok(link)
 }
 
@@ -937,6 +1060,14 @@ fn drive_for_screenshot(
         movement: m2_math::glam::Vec2::Y,
         ..Intent::default()
     };
+    // Who is about, to see they keep moving while she drives.
+    let before: Vec<m2_math::glam::Vec3> = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .map(|n| n.character.position)
+        .collect();
     for i in 0..240 {
         game.step(throttle, tick);
         if i % 30 == 0 {
@@ -949,6 +1080,32 @@ fn drive_for_screenshot(
             (to - from).length()
         );
     }
+    if let Some(v) = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|p| p.driving)
+        .map(|i| &game.scene.vehicles[i])
+    {
+        eprintln!(
+            "drive: {} wheels, {} road wheels, tracked {}, wheels rolled {:.1} m, turret pivot {:?}",
+            v.spec.wheels.len(),
+            v.spec.road_wheels.len(),
+            v.spec.tracked,
+            v.rolled,
+            v.spec.pivot
+        );
+    }
+    let npcs = &game.scene.people.npcs;
+    let moved = npcs
+        .iter()
+        .zip(&before)
+        .filter(|(n, b)| n.alive && n.character.position.distance(**b) > 0.5)
+        .count();
+    eprintln!(
+        "drive: {moved} of {} people moved more than 0.5 m during the drive",
+        npcs.len().min(before.len())
+    );
     if options.look != 0.0 {
         // Stop, then swing the camera and watch the turret follow.
         let brake = Intent {
@@ -965,7 +1122,18 @@ fn drive_for_screenshot(
             } else {
                 m2_math::glam::Vec2::ZERO
             };
-            game.step(Intent { look, ..brake }, tick);
+            let trigger = combat::Trigger {
+                fire: options.fire && i == 87,
+                ..combat::Trigger::default()
+            };
+            game.step(
+                Intent {
+                    look,
+                    trigger,
+                    ..brake
+                },
+                tick,
+            );
             if i % 15 == 14
                 && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
             {
@@ -1147,6 +1315,23 @@ fn fight_for_screenshot(
     );
     for _ in 0..200 {
         game.step(Intent::default(), tick);
+    }
+    // Wrecks should stay put, not slide on.
+    if let Some(world) = &game.scene.world {
+        for v in game.scene.vehicles.iter().filter(|v| v.wrecked) {
+            if let Some(id) = v.id {
+                eprintln!(
+                    "fight: wreck {} at {:.1}, moving {:.2} m/s",
+                    v.spec.label,
+                    world
+                        .physics
+                        .vehicle_transform(id)
+                        .map_or(m2_math::glam::Vec3::ZERO, |t| t
+                            .transform_point3(m2_math::glam::Vec3::ZERO)),
+                    world.physics.vehicle_velocity(id).length()
+                );
+            }
+        }
     }
     let c = &game.combat;
     let people = &game.scene.people.npcs;
@@ -1644,11 +1829,12 @@ impl Running {
             self.audio.play_ambient(town, ear);
         }
         for (i, shout, at) in self.game.scene.people.take_shouts() {
-            let set = match shout {
-                npc::Shout::Alert => sound::VZ_SOLDIERS[i % sound::VZ_SOLDIERS.len()],
+            let sets = match shout {
+                npc::Shout::Alert => sound::VZ_SOLDIERS,
+                npc::Shout::Flee if self.game.scene.people.is_woman(i) => sound::CIVILIAN_WOMEN,
                 npc::Shout::Flee => sound::CIVILIANS,
             };
-            self.audio.shout(set, Some(at));
+            self.audio.shout(sets[i % sets.len()], Some(at));
         }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);

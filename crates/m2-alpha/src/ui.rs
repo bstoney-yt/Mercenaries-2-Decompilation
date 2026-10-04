@@ -346,6 +346,15 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             at.y += 20.0;
         }
     }
+    if m.contract_complete {
+        text(
+            screen.center() + vec2(0.0, -60.0),
+            Align2::CENTER_CENTER,
+            "Contract complete",
+            40.0,
+            gold,
+        );
+    }
     if let Some((done, line)) = &m.message {
         let head = if *done {
             "Objective complete"
@@ -479,6 +488,7 @@ mod tests {
                 )],
                 message: Some((false, "VzaCon001 objective 1".into())),
                 status: None,
+                contract_complete: true,
             }),
             view_proj: Some(Mat4::perspective_rh(1.0, 1.333, 0.1, 100.0)),
             ..HudInfo::default()

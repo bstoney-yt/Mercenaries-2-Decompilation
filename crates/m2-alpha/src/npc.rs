@@ -139,8 +139,10 @@ pub struct Npc {
     brain: Brain,
     /// The aim and fall clips in this person's rig.
     clips: FightClips,
-    /// The hand nodes (right, left), where the rifle is held.
+    /// The right hand's node, where the rifle is held, and its attach
+    /// point.
     pub hand: Option<usize>,
+    pub attach: Option<usize>,
     /// Seconds since they died.
     dead_for: f32,
     /// Their body gone limp, once dead.
@@ -177,6 +179,7 @@ impl Npc {
         Self {
             clips,
             hand,
+            attach: crate::combat::right_attach(&rig.skeleton),
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
@@ -463,6 +466,15 @@ impl People {
         self.kinds.iter().position(|k| k.role == role)
     }
 
+    /// Whether `npcs[i]` is a woman (her model's role says so,
+    /// `civ_hum_*female`).
+    pub fn is_woman(&self, i: usize) -> bool {
+        self.npcs
+            .get(i)
+            .and_then(|n| self.kinds.get(n.kind))
+            .is_some_and(|k| k.role.contains("female"))
+    }
+
     pub fn add_kind(&mut self, kind: PersonKind) {
         if !kind.soldier {
             // Civilians are dealt out across the kinds in: start them
@@ -581,6 +593,28 @@ impl People {
         out
     }
 
+    /// The scripts killed the soldier of spawn `entity` (or took it away,
+    /// `gone`): dead where they stand, or not there at all. Either way they
+    /// don't come back.
+    pub fn script_kill(&mut self, physics: &mut Physics, entity: u32, gone: bool) {
+        self.killed.insert(entity);
+        if gone {
+            let (npcs, active) = (&mut self.npcs, &mut self.active);
+            npcs.retain(|n| {
+                if n.spawn != Some(entity) {
+                    return true;
+                }
+                if let Some(doll) = n.ragdoll {
+                    physics.remove_ragdoll(doll);
+                }
+                active.remove(&entity);
+                false
+            });
+        } else if let Some(n) = self.npcs.iter_mut().find(|n| n.spawn == Some(entity)) {
+            n.hurt(f32::INFINITY, Vec3::ZERO);
+        }
+    }
+
     /// Starts over with these soldiers dead and nobody about (they come
     /// back round the player on the next tick).
     pub fn reset(&mut self, killed: impl IntoIterator<Item = u32>) {
@@ -639,7 +673,8 @@ impl People {
                 };
             }
         }
-        // Soldiers who come into range, nearest first.
+        // Soldiers who come into range: a mission's targets first, then
+        // the nearest.
         let soldiers = self.npcs.iter().filter(|n| n.spawn.is_some()).count();
         let mut near: Vec<(f32, &SpawnPoint)> = spawns
             .iter()
@@ -650,17 +685,27 @@ impl People {
             })
             .map(|s| (s.position.distance(focus), s))
             .collect();
-        near.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (_, s) in near.into_iter().take(MAX_SOLDIERS.saturating_sub(soldiers)) {
-            let kind = self.kind_for(&s.name).or_else(|| {
-                self.mission_soldiers
-                    .contains(&s.entity)
-                    .then(|| self.kind_for("vz soldier"))
-                    .flatten()
-            });
+        let targets = &self.mission_soldiers;
+        near.sort_by(|a, b| {
+            (!targets.contains(&a.1.entity))
+                .cmp(&!targets.contains(&b.1.entity))
+                .then(a.0.total_cmp(&b.0))
+        });
+        // A mission's targets come even when the island's soldiers fill
+        // the place up.
+        let mut room = MAX_SOLDIERS.saturating_sub(soldiers);
+        for (_, s) in near {
+            let target = self.mission_soldiers.contains(&s.entity);
+            if room == 0 && !target {
+                break;
+            }
+            let kind = self
+                .kind_for(&s.name)
+                .or_else(|| target.then(|| self.kind_for("vz soldier")).flatten());
             let Some(kind) = kind else {
                 continue;
             };
+            room = room.saturating_sub(1);
             let forward = s.rotation * Vec3::Z;
             let facing = forward.x.atan2(forward.z);
             let brain = if s.route.len() >= 2 {
