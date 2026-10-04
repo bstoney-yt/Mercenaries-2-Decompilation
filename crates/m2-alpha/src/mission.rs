@@ -57,6 +57,10 @@ pub struct MissionLink {
     lag: f32,
     log: Option<BufWriter<File>>,
     message: Option<(bool, String, f32)>,
+    /// The scripts put the player somewhere the island has no way to hold
+    /// her (in the start's boat, at sea): she goes ashore once the ground
+    /// there has loaded. Tries left.
+    ashore: u32,
 }
 
 impl std::fmt::Debug for MissionLink {
@@ -102,6 +106,7 @@ impl MissionLink {
             lag: 0.0,
             log,
             message: None,
+            ashore: 0,
         }
     }
 
@@ -132,6 +137,13 @@ impl MissionLink {
         let State::Running(mission) = &mut self.state else {
             return;
         };
+        if self.ashore > 0 && game.scene.player.as_ref().is_some_and(|p| p.landed) {
+            self.ashore -= 1;
+            // Thousands of rays a look: twice a second is plenty.
+            if self.ashore.is_multiple_of(30) && go_ashore(game) {
+                self.ashore = 0;
+            }
+        }
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {
@@ -145,7 +157,9 @@ impl MissionLink {
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
-                obey(game, mission, &c);
+                if obey(game, mission, &c) {
+                    self.ashore = ASHORE_TRIES;
+                }
             }
             let w = mission.world().borrow();
             if let Some((done, text)) = w.hud.messages.last() {
@@ -168,7 +182,9 @@ impl MissionLink {
                 mission.start();
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
-                    obey(game, &mission, &c);
+                    if obey(game, &mission, &c) {
+                        self.ashore = ASHORE_TRIES;
+                    }
                 }
                 self.write(lines);
                 self.state = State::Running(Box::new(mission));
@@ -244,8 +260,49 @@ impl MissionLink {
     }
 }
 
-/// Carries out a script command that is about the player.
-fn obey(game: &mut Game, mission: &Mission, c: &Command) {
+/// Ticks the player gets to go ashore: about ten seconds for the ground
+/// around her to load.
+const ASHORE_TRIES: u32 = 600;
+
+/// Moves a player standing under the sea to the nearest dry ground within
+/// 1.5 km. True once she stands on dry ground (moved there, or there
+/// already); false while none around her has loaded.
+fn go_ashore(game: &mut Game) -> bool {
+    let (Some(world), Some(player)) = (&game.scene.world, &mut game.scene.player) else {
+        return true;
+    };
+    let sea = world.settings.sea_level;
+    let from = player.character.position;
+    if from.y > sea {
+        return true;
+    }
+    let ground = |x: f32, z: f32| {
+        let top = 600.0;
+        let (t, normal) = world
+            .physics
+            .cast_ray(Vec3::new(x, top, z), Vec3::NEG_Y, 1200.0)?;
+        let y = top - t;
+        (y > sea + 0.5 && normal.y > 0.7).then_some(Vec3::new(x, y + 1.0, z))
+    };
+    for r in (1..=60).map(|i| i as f32 * 25.0) {
+        let n = ((r / 10.0) as usize).max(8);
+        for k in 0..n {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            if let Some(to) = ground(from.x + r * a.cos(), from.z + r * a.sin()) {
+                player.character.position = to;
+                player.character.velocity = Vec3::ZERO;
+                player.landed = false;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Carries out a script command that is about the player; true when it
+/// seated her in a vehicle the island doesn't show, so she stands where
+/// it is.
+fn obey(game: &mut Game, mission: &Mission, c: &Command) -> bool {
     let to = match c {
         Command::Move { guid, position } if *guid == PLAYER => Some(*position),
         // Seated in a vehicle the island doesn't show (the start's boat):
@@ -258,7 +315,7 @@ fn obey(game: &mut Game, mission: &Mission, c: &Command) {
             .map(|o| o.position),
         _ => None,
     };
-    let Some(to) = to else { return };
+    let Some(to) = to else { return false };
     if let Some(p) = game.scene.player.as_mut() {
         p.character.position = Vec3::from(to);
         p.character.velocity = Vec3::ZERO;
@@ -266,4 +323,5 @@ fn obey(game: &mut Game, mission: &Mission, c: &Command) {
         p.driving = None;
         p.chase_target = None;
     }
+    matches!(c, Command::EnterVehicle { .. })
 }
