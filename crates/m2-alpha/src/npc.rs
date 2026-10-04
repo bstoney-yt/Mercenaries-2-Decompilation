@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use m2_engine::world::SpawnPoint;
-use m2_engine::{Character, Gait, GpuModel, Physics};
+use m2_engine::{Character, Gait, GpuModel, Physics, RagdollId};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 
 use crate::scene::{Carry, Rig};
@@ -139,6 +139,11 @@ pub struct Npc {
     pub hand: Option<usize>,
     /// Seconds since they died.
     dead_for: f32,
+    /// Their body gone limp, once dead.
+    pub ragdoll: Option<RagdollId>,
+    /// A shove not yet given to their body (m/s): they went limp, or
+    /// were hit again after.
+    fling: Option<Vec3>,
     /// Has shouted since they were last calm.
     shouted: bool,
 }
@@ -169,6 +174,8 @@ impl Npc {
             clips,
             hand,
             dead_for: 0.0,
+            ragdoll: None,
+            fling: None,
             shouted: false,
             kind,
             soldier: spawn.is_some(),
@@ -188,9 +195,11 @@ impl Npc {
     }
 
     /// Takes `damage`; at no health left, falls: true if it killed.
-    pub fn hurt(&mut self, damage: f32) -> bool {
+    /// `push` (m/s) shoves the body if it kills or is dead already.
+    pub fn hurt(&mut self, damage: f32, push: Vec3) -> bool {
         let clips = self.clips;
         if !self.alive {
+            self.fling = Some(self.fling.unwrap_or_default() + push);
             return false;
         }
         self.hp -= damage;
@@ -201,6 +210,7 @@ impl Npc {
             self.flee = None;
             self.rig.animator.set_upper(None);
             self.rig.two_handed = false;
+            self.fling = Some(push);
             if let Some(die) = clips.die {
                 self.rig.animator.play_once(die);
             }
@@ -463,15 +473,30 @@ impl People {
     /// while she is down or not playing).
     pub fn update(
         &mut self,
-        physics: &Physics,
+        physics: &mut Physics,
         spawns: &[SpawnPoint],
         focus: Vec3,
         threat: Option<Vec3>,
         dt: f32,
     ) {
-        self.populate(spawns, focus);
+        self.populate(physics, spawns, focus);
         for npc in &mut self.npcs {
             npc.update(physics, &mut self.rng, threat, dt);
+            // The dead go limp from where they stood, shoved as they were
+            // hit.
+            let Some(push) = npc.fling.take() else {
+                continue;
+            };
+            match npc.ragdoll {
+                Some(id) => physics.push_ragdoll(id, push),
+                None => {
+                    let (nodes, _) = npc.rig.posed();
+                    let body = npc.model_matrix();
+                    let world: Vec<Mat4> = nodes.iter().map(|m| body * *m).collect();
+                    let id = physics.add_ragdoll(&npc.rig.skeleton.parents, &world, push);
+                    npc.ragdoll = Some(id);
+                }
+            }
         }
     }
 
@@ -528,13 +553,16 @@ impl People {
         }
     }
 
-    fn populate(&mut self, spawns: &[SpawnPoint], focus: Vec3) {
+    fn populate(&mut self, physics: &mut Physics, spawns: &[SpawnPoint], focus: Vec3) {
         let far = |p: Vec3, d: f32| Vec2::new(p.x - focus.x, p.z - focus.z).length() > d;
         // Soldiers out of range go; civilians left behind come back round
         // the player.
         let (active, killed) = (&mut self.active, &mut self.killed);
         self.npcs.retain(|n| match n.spawn {
             Some(id) if far(n.character.position, INACTIVE) => {
+                if let Some(doll) = n.ragdoll {
+                    physics.remove_ragdoll(doll);
+                }
                 active.remove(&id);
                 if !n.alive {
                     killed.insert(id);
@@ -555,6 +583,10 @@ impl People {
                 n.alive = true;
                 n.hp = 100.0;
                 n.dead_for = 0.0;
+                if let Some(doll) = n.ragdoll.take() {
+                    physics.remove_ragdoll(doll);
+                }
+                n.fling = None;
                 n.flee = None;
                 n.rig.set_gait(Gait::Idle);
                 n.brain = Brain::Wander {
@@ -751,7 +783,7 @@ pub(crate) mod tests {
 
     #[test]
     fn soldiers_come_and_go_with_the_player() {
-        let physics = ground();
+        let mut physics = ground();
         let mut people = People::default();
         people.kinds.push(PersonKind {
             role: "vz_hum_soldier".into(),
@@ -771,13 +803,13 @@ pub(crate) mod tests {
             spawn(2, "VZ Soldier 02", 1000.0),
             spawn(3, "VZ Hind 01", 20.0),
         ];
-        people.update(&physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
         assert_eq!(
             people.npcs.iter().map(|n| n.spawn).collect::<Vec<_>>(),
             [Some(1)]
         );
         people.update(
-            &physics,
+            &mut physics,
             &spawns,
             Vec3::new(1000.0, 0.0, 0.0),
             None,
@@ -793,7 +825,7 @@ pub(crate) mod tests {
         assert_eq!(killed, [2]);
         people.reset(killed);
         people.update(
-            &physics,
+            &mut physics,
             &spawns,
             Vec3::new(1000.0, 0.0, 0.0),
             None,
@@ -841,11 +873,11 @@ pub(crate) mod tests {
             civilian.character.position
         );
         // Hurt to death.
-        assert!(!civilian.hurt(60.0));
+        assert!(!civilian.hurt(60.0, Vec3::ZERO));
         assert!(civilian.alive);
-        assert!(civilian.hurt(60.0));
+        assert!(civilian.hurt(60.0, Vec3::ZERO));
         assert!(!civilian.alive);
-        assert!(!civilian.hurt(60.0), "only dies once");
+        assert!(!civilian.hurt(60.0, Vec3::ZERO), "only dies once");
     }
 
     #[test]

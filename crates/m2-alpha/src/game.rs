@@ -271,12 +271,12 @@ impl Game {
             .player
             .as_ref()
             .and_then(|p| self.combat.target(p, self.on_foot));
-        if let Some(world) = &self.scene.world
+        if let Some(world) = &mut self.scene.world
             && (!self.on_foot || self.scene.player.as_ref().is_none_or(|p| p.landed))
         {
             self.scene
                 .people
-                .update(&world.physics, &world.index.spawns, focus, threat, dt);
+                .update(&mut world.physics, &world.index.spawns, focus, threat, dt);
         }
         let scene = &mut self.scene;
         if self.on_foot

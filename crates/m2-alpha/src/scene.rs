@@ -965,8 +965,21 @@ impl Scene {
             if !n.landed || n.character.position.distance(eye) > npc::DRAW_DISTANCE {
                 continue;
             }
-            let (nodes, skin) = n.rig.posed();
             let model = &self.people.kinds[n.kind].model;
+            // The dead lie as their limp bodies fell.
+            if let Some(doll) = n.ragdoll
+                && let Some(world) = &self.world
+                && let Some(nodes) = world.physics.ragdoll_nodes(doll)
+            {
+                let skin: Vec<Mat4> = nodes
+                    .iter()
+                    .zip(&n.rig.skeleton.inverse_bind)
+                    .map(|(m, ib)| *m * *ib)
+                    .collect();
+                model.draw_posed(backend, queue, Mat4::IDENTITY, &nodes, &skin)?;
+                continue;
+            }
+            let (nodes, skin) = n.rig.posed();
             let body = n.model_matrix();
             model.draw_posed(backend, queue, body, &nodes, &skin)?;
             if n.soldier
