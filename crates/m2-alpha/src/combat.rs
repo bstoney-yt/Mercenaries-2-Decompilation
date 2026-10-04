@@ -26,6 +26,11 @@ const RIFLE_RANGE: f32 = 400.0;
 const RIFLE_DAMAGE: f32 = 34.0;
 /// How long she keeps the rifle up after a shot, seconds.
 const AIM_AFTER_SHOT: f32 = 0.6;
+/// Muzzle flashes: how long they last (a few frames) and how far they
+/// reach from the muzzle, metres. Invented, to look like the game's.
+const FLASH_TIME: f32 = 0.05;
+const RIFLE_FLASH: f32 = 0.3;
+const RPG_FLASH: f32 = 0.7;
 /// Gunfire puts soldiers this close on alert and sends civilians running.
 const ALERT_RANGE: f32 = 60.0;
 const PANIC_RANGE: f32 = 40.0;
@@ -267,8 +272,9 @@ pub enum Weapon {
 pub enum Effect {
     /// A shot's line.
     Tracer { from: Vec3, to: Vec3 },
-    /// A muzzle flash.
-    Flash { at: Vec3 },
+    /// A muzzle flash at the muzzle, `dir` the way the barrel points,
+    /// `size` its length in metres.
+    Flash { at: Vec3, dir: Vec3, size: f32 },
     /// Smoke, growing and rising.
     Smoke { at: Vec3, size: f32 },
     /// A fireball, growing.
@@ -592,7 +598,14 @@ impl Combat {
         let to = hit.map_or(eye + dir * RIFLE_RANGE, |h| eye + dir * h.0);
         let from = Self::muzzle(f, f.arsenal.rifle.as_ref());
         self.effect(Effect::Tracer { from, to }, 0.07);
-        self.effect(Effect::Flash { at: from }, 0.05);
+        self.effect(
+            Effect::Flash {
+                at: from,
+                dir: (to - from).normalize_or(dir),
+                size: RIFLE_FLASH,
+            },
+            FLASH_TIME,
+        );
         self.sounds.push(Sound::Shot(from));
         if let Some((t, None)) = hit {
             let at = eye + dir * t;
@@ -642,7 +655,14 @@ impl Combat {
         let hit = cast_shot(f.physics, f.people, from, dir, distance + 2.0, Some(i));
         let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
         self.effect(Effect::Tracer { from, to: end }, 0.07);
-        self.effect(Effect::Flash { at: from }, 0.05);
+        self.effect(
+            Effect::Flash {
+                at: from,
+                dir,
+                size: RIFLE_FLASH,
+            },
+            FLASH_TIME,
+        );
         self.sounds.push(Sound::Shot(from));
         let closest = from + dir * (aim - from).dot(dir).max(0.0);
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
@@ -718,7 +738,23 @@ impl Combat {
             velocity,
             flown: 0.0,
         });
-        self.effect(Effect::Flash { at: from }, 0.08);
+        self.effect(
+            Effect::Flash {
+                at: from,
+                dir: velocity.normalize_or(dir),
+                size: RPG_FLASH,
+            },
+            FLASH_TIME * 1.6,
+        );
+        // The back-blast: a puff of smoke behind the launcher.
+        let back = from - velocity.normalize_or(dir) * 1.4;
+        self.effect(
+            Effect::Smoke {
+                at: back,
+                size: 0.7,
+            },
+            1.2,
+        );
         self.sounds.push(Sound::Launch(from));
         alarm(f.people, f.player.character.position);
     }
