@@ -563,6 +563,9 @@ pub struct Call {
     /// What each argument is, as far as straight-line reading tells;
     /// `None` when the count is only known at run time (`f(g())`).
     pub args: Option<Vec<Arg>>,
+    /// Where: the function's index in [`Function::all`], the instruction
+    /// that loaded the callee and the `CALL` itself.
+    pub site: (usize, usize, usize),
 }
 
 /// An argument's kind, from [`Function::calls`].
@@ -613,6 +616,20 @@ impl Function {
             self.upvalue_count,
             self.constants.len()
         );
+        for pc in 0..self.code.len() {
+            let _ = writeln!(out, "  {}", self.instruction_text(pc));
+        }
+        for (n, f) in self.functions.iter().enumerate() {
+            f.list_into(out, &format!("{path}.F{n}"));
+        }
+    }
+
+    /// Instruction `pc` as one listing line: number, opcode, operands with
+    /// constants spelled out, and its source line when known.
+    pub fn instruction_text(&self, pc: usize) -> String {
+        let Some(&word) = self.code.get(pc) else {
+            return format!("{pc:4} ?");
+        };
         let rk = |x: u32| {
             if x & 0x100 != 0 {
                 self.constant_text((x & 0xff) as usize)
@@ -620,25 +637,20 @@ impl Function {
                 format!("R{x}")
             }
         };
-        for (pc, &word) in self.code.iter().enumerate() {
-            let i = Instruction::decode51(word);
-            let args = match i.op {
-                1 | 5 | 7 => format!("R{} {}", i.a, self.constant_text(i.bx as usize)),
-                36 => format!("R{} F{}", i.a, i.bx),
-                22 | 31 | 32 => format!("{} -> {}", i.sbx(), pc as i32 + 1 + i.sbx()),
-                6 | 11 => format!("R{} R{} {}", i.a, i.b, rk(i.c)),
-                9 | 12..=17 | 23..=25 => format!("R{} {} {}", i.a, rk(i.b), rk(i.c)),
-                _ => format!("R{} {} {}", i.a, i.b, i.c),
-            };
-            let line = self
-                .lines
-                .get(pc)
-                .map_or(String::new(), |l| format!(" ; line {l}"));
-            let _ = writeln!(out, "  {pc:4} {:<9} {args}{line}", i.name());
-        }
-        for (n, f) in self.functions.iter().enumerate() {
-            f.list_into(out, &format!("{path}.F{n}"));
-        }
+        let i = Instruction::decode51(word);
+        let args = match i.op {
+            1 | 5 | 7 => format!("R{} {}", i.a, self.constant_text(i.bx as usize)),
+            36 => format!("R{} F{}", i.a, i.bx),
+            22 | 31 | 32 => format!("{} -> {}", i.sbx(), pc as i32 + 1 + i.sbx()),
+            6 | 11 => format!("R{} R{} {}", i.a, i.b, rk(i.c)),
+            9 | 12..=17 | 23..=25 => format!("R{} {} {}", i.a, rk(i.b), rk(i.c)),
+            _ => format!("R{} {} {}", i.a, i.b, i.c),
+        };
+        let line = self
+            .lines
+            .get(pc)
+            .map_or(String::new(), |l| format!(" ; line {l}"));
+        format!("{pc:4} {:<9} {args}{line}", i.name())
     }
 
     /// Calls in this function and its nested ones (Lua 5.1) whose callee
@@ -650,7 +662,8 @@ impl Function {
     pub fn calls(&self) -> Vec<Call> {
         #[derive(Clone)]
         enum Held<'f> {
-            Global(String),
+            /// A global and the instruction that loaded it.
+            Global(String, usize),
             Str(&'f str),
             Num(f64),
             Bool,
@@ -659,7 +672,7 @@ impl Function {
             Closure,
         }
         let arg = |h: Option<&Option<Held<'_>>>| match h {
-            Some(Some(Held::Global(g))) => Arg::Global(g.clone()),
+            Some(Some(Held::Global(g, _))) => Arg::Global(g.clone()),
             Some(Some(Held::Str(s))) => Arg::Str((*s).to_owned()),
             Some(Some(Held::Num(n))) => Arg::Number(*n),
             Some(Some(Held::Bool)) => Arg::Bool,
@@ -669,16 +682,16 @@ impl Function {
             _ => Arg::Other,
         };
         let mut out = Vec::new();
-        for f in self.all() {
+        for (index, f) in self.all().into_iter().enumerate() {
             let mut held: Vec<Option<Held<'_>>> = vec![None; 256];
-            for &word in &f.code {
+            for (pc, &word) in f.code.iter().enumerate() {
                 let i = Instruction::decode51(word);
                 let a = i.a as usize;
                 let value = match i.op {
                     // GETGLOBAL
                     5 => f
                         .constant_name(i.bx as usize)
-                        .map(|n| Held::Global(n.to_owned())),
+                        .map(|n| Held::Global(n.to_owned(), pc)),
                     // LOADK
                     1 => match f.constants.get(i.bx as usize) {
                         Some(Constant::String(s)) => Some(Held::Str(s)),
@@ -691,16 +704,16 @@ impl Function {
                     36 => Some(Held::Closure),
                     // GETTABLE on a held global with a constant key.
                     6 => match (held.get(i.b as usize), i.c & 0x100 != 0) {
-                        (Some(Some(Held::Global(g))), true) => f
+                        (Some(Some(Held::Global(g, start))), true) => f
                             .constant_name((i.c & 0xff) as usize)
-                            .map(|k| Held::Global(format!("{g}.{k}"))),
+                            .map(|k| Held::Global(format!("{g}.{k}"), *start)),
                         _ => None,
                     },
                     // MOVE
                     0 => held.get(i.b as usize).cloned().flatten(),
                     // CALL / TAILCALL
                     28 | 29 => {
-                        if let Some(Some(Held::Global(g))) = held.get(a) {
+                        if let Some(Some(Held::Global(g, start))) = held.get(a) {
                             let first = match held.get(a + 1) {
                                 Some(Some(Held::Str(s))) if i.b != 1 => Some((*s).to_owned()),
                                 _ => None,
@@ -713,6 +726,7 @@ impl Function {
                                 callee: g.clone(),
                                 first,
                                 args,
+                                site: (index, *start, pc),
                             });
                         }
                         None
@@ -869,11 +883,13 @@ mod tests {
             callee: "Objective_Add".into(),
             first: Some("Destroy the depot".into()),
             args: Some(vec![Arg::Str("Destroy the depot".into()), Arg::Number(3.0)]),
+            site: (1, 0, 3),
         }));
         assert!(calls.contains(&Call {
             callee: "Hud.Show".into(),
             first: Some("timer".into()),
             args: Some(vec![Arg::Str("timer".into())]),
+            site: (1, 4, 7),
         }));
         let listing = chunk.main.listing();
         assert!(listing.contains("GETGLOBAL"), "{listing}");

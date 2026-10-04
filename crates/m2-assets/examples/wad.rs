@@ -14,6 +14,7 @@
 //! cargo run -p m2-assets --example wad -- types   <archive.wad>
 //! cargo run -p m2-assets --example wad -- scripts <archive.wad>
 //! cargo run -p m2-assets --example wad -- script  <archive.wad> <script hash>
+//! cargo run -p m2-assets --example wad -- calls   <archive.wad> <callee> [first arg] [count]
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -39,7 +40,11 @@
 //! also counts module loads (`import`, `inherit`, ...) by name and guesses
 //! which script each module is, from the members other scripts use on it
 //! and the globals each script defines. `script` prints one script's
-//! instruction listing.
+//! instruction listing. `calls` prints a few places scripts call
+//! `callee` (`Event.Create`), optionally only those whose first argument
+//! is the given global or string (`Event.TimerRelative`), with the
+//! instructions building the call and the start of any callback function
+//! named in it: how the engine function is used.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -121,6 +126,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("types", []) => types(&mut wad)?,
         ("scripts", []) => scripts(&mut wad)?,
         ("script", [hash]) => script_listing(&mut wad, u32::from_str_radix(hash, 16)?)?,
+        ("calls", [callee, rest @ ..]) => {
+            let shape = rest.first().map(String::as_str);
+            let count = rest.get(1).map_or(Ok(8), |n| n.parse())?;
+            call_sites(&mut wad, callee, shape, count)?
+        }
         ("names", []) => {
             // Decodes every block; use --release for the large archives.
             let types = index.type_hashes().to_vec();
@@ -1291,4 +1301,99 @@ fn script_listing<R: std::io::Read + std::io::Seek>(
         }
     }
     Err(format!("no script {hash:08x}").into())
+}
+
+fn call_sites<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+    callee: &str,
+    first: Option<&str>,
+    count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use m2_assets::lua::{Arg, Chunk, Function, SCRIPT_TYPE};
+
+    /// The function a script binds to global `name` at its top level
+    /// (`CLOSURE Rn Fk` then `SETGLOBAL Rn "name"`).
+    fn bound<'f>(main: &'f Function, name: &str) -> Option<&'f Function> {
+        let mut closure = None;
+        for &word in &main.code {
+            let op = word & 0x3f;
+            if op == 36 {
+                closure = Some((word >> 14) as usize);
+            } else if op == 7 {
+                let k = (word >> 14) as usize;
+                if matches!(main.constants.get(k), Some(m2_assets::lua::Constant::String(s)) if s == name)
+                {
+                    return closure.and_then(|c| main.functions.get(c));
+                }
+                closure = None;
+            }
+        }
+        None
+    }
+
+    let mut shown = 0;
+    let mut scripts = std::collections::BTreeSet::new();
+    'blocks: for block in 0..wad.index().blocks().len() {
+        let decoded = wad.read_block(block)?;
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (entry, data) in contents.iter() {
+            if entry.type_hash != SCRIPT_TYPE || scripts.contains(&entry.name_hash) {
+                continue;
+            }
+            let Ok(chunk) = Chunk::from_asset(data) else {
+                continue;
+            };
+            let all = chunk.main.all();
+            for call in chunk.main.calls() {
+                if call.callee != callee {
+                    continue;
+                }
+                let matches_first = match (first, call.args.as_ref().and_then(|a| a.first())) {
+                    (None, _) => true,
+                    (Some(want), Some(Arg::Global(g))) => g == want,
+                    (Some(want), Some(Arg::Str(s))) => s == want,
+                    _ => false,
+                };
+                if !matches_first {
+                    continue;
+                }
+                let (index, start, end) = call.site;
+                let f = all[index];
+                println!(
+                    "== script {:08x}, function {index} (line {}), instructions {start}..={end}",
+                    entry.name_hash, f.line_defined
+                );
+                // A few instructions before the callee load show where
+                // the arguments came from.
+                for pc in start.saturating_sub(4)..=end {
+                    println!("  {}", f.instruction_text(pc));
+                }
+                for a in call.args.iter().flatten() {
+                    if let Arg::Global(name) = a
+                        && let Some(cb) = bound(&chunk.main, name)
+                    {
+                        println!(
+                            "  -- callback {name}: {} params{}",
+                            cb.param_count,
+                            if cb.is_vararg != 0 { ", vararg" } else { "" }
+                        );
+                        for pc in 0..cb.code.len().min(16) {
+                            println!("    {}", cb.instruction_text(pc));
+                        }
+                    }
+                }
+                scripts.insert(entry.name_hash);
+                shown += 1;
+                if shown >= count {
+                    break 'blocks;
+                }
+                // One site per script, for variety.
+                break;
+            }
+        }
+    }
+    println!("{shown} call sites shown");
+    Ok(())
 }
