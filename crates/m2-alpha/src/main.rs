@@ -937,6 +937,14 @@ fn drive_for_screenshot(
         movement: m2_math::glam::Vec2::Y,
         ..Intent::default()
     };
+    // Who is about, to see they keep moving while she drives.
+    let before: Vec<m2_math::glam::Vec3> = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .map(|n| n.character.position)
+        .collect();
     for i in 0..240 {
         game.step(throttle, tick);
         if i % 30 == 0 {
@@ -949,6 +957,32 @@ fn drive_for_screenshot(
             (to - from).length()
         );
     }
+    if let Some(v) = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|p| p.driving)
+        .map(|i| &game.scene.vehicles[i])
+    {
+        eprintln!(
+            "drive: {} wheels, {} road wheels, tracked {}, wheels rolled {:.1} m, turret pivot {:?}",
+            v.spec.wheels.len(),
+            v.spec.road_wheels.len(),
+            v.spec.tracked,
+            v.rolled,
+            v.spec.pivot
+        );
+    }
+    let npcs = &game.scene.people.npcs;
+    let moved = npcs
+        .iter()
+        .zip(&before)
+        .filter(|(n, b)| n.alive && n.character.position.distance(**b) > 0.5)
+        .count();
+    eprintln!(
+        "drive: {moved} of {} people moved more than 0.5 m during the drive",
+        npcs.len().min(before.len())
+    );
     if options.look != 0.0 {
         // Stop, then swing the camera and watch the turret follow.
         let brake = Intent {
@@ -1147,6 +1181,23 @@ fn fight_for_screenshot(
     );
     for _ in 0..200 {
         game.step(Intent::default(), tick);
+    }
+    // Wrecks should stay put, not slide on.
+    if let Some(world) = &game.scene.world {
+        for v in game.scene.vehicles.iter().filter(|v| v.wrecked) {
+            if let Some(id) = v.id {
+                eprintln!(
+                    "fight: wreck {} at {:.1}, moving {:.2} m/s",
+                    v.spec.label,
+                    world
+                        .physics
+                        .vehicle_transform(id)
+                        .map_or(m2_math::glam::Vec3::ZERO, |t| t
+                            .transform_point3(m2_math::glam::Vec3::ZERO)),
+                    world.physics.vehicle_velocity(id).length()
+                );
+            }
+        }
     }
     let c = &game.combat;
     let people = &game.scene.people.npcs;
