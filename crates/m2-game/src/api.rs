@@ -233,6 +233,37 @@ fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
 
 /// Installs the libraries over `world`. Functions not written here stay
 /// missing (or stubs, with `ScriptHost::stub_missing_globals`).
+/// The engine's libraries (the rest of the globals scripts use are their
+/// own modules); see `ScriptHost::complete_libraries`.
+pub const LIBRARIES: [&str; 26] = [
+    "Ai",
+    "Airstrike",
+    "Camera",
+    "Controller",
+    "Debug",
+    "Event",
+    "Graphics",
+    "Gui",
+    "Hud",
+    "Human",
+    "Marker",
+    "Math",
+    "Munitions",
+    "Net",
+    "Object",
+    "ObjectFilter",
+    "ObjectState",
+    "Pda",
+    "Pg",
+    "Player",
+    "Sound",
+    "String",
+    "Sys",
+    "Vehicle",
+    "VO",
+    "Weapon",
+];
+
 pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     let globals = lua.globals();
     let lib = |name: &str| -> mlua::Result<Table> {
@@ -271,6 +302,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             .collect();
         w.printed.push(text.concat());
         values([])
+    })?;
+
+    add(&debug, "GetCallstack", |_, lua, _| {
+        values([Value::String(lua.create_string("")?)])
     })?;
 
     let pg = lib("Pg")?;
@@ -430,6 +465,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let player = lib("Player")?;
+    // The PMC's fuel tank: invented, the game's figure is not decoded.
+    add(&player, "GetFuelCapacity", |_, _, _| {
+        values([Value::Number(100.0)])
+    })?;
     for name in [
         "GetLocalCharacter",
         "GetAnyCharacter",
@@ -562,6 +601,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         pg.set(name, notifier(lua, world, format!("Pg.{name}"))?)?;
     }
     add(&pg, "LoadIsRetry", |_, _, _| {
+        values([Value::Boolean(false)])
+    })?;
+    // No saves yet: every load is a new game, which the bootstrap starts
+    // itself (`LoadSingleton(nil)`) when this answers false.
+    add(&pg, "LoadGame", |w, _, _| {
+        w.commands.push(Command::Notify("Pg.LoadGame".into()));
         values([Value::Boolean(false)])
     })?;
 

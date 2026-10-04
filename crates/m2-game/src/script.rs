@@ -180,6 +180,12 @@ impl ScriptHost {
             safe_function(&self.lua, |lua, args| match (args.front(), args.get(1)) {
                 (Some(Value::Table(g)), Some(Value::String(s))) => {
                     let name = s.to_string_lossy();
+                    // `_bBootstrapComplete` and the like: a script's own
+                    // state, nil until it sets it (and again after it sets
+                    // it to nil).
+                    if name.starts_with('_') {
+                        return Ok(MultiValue::from_vec(vec![Value::Nil]));
+                    }
                     let value = match default_for(lua, &name)? {
                         Some(v) => v,
                         None => Value::Table(stub(lua, &name)?),
@@ -191,6 +197,44 @@ impl ScriptHost {
             })?,
         )?;
         self.lua.globals().set_metatable(Some(meta))?;
+        Ok(())
+    }
+
+    /// Makes the members `libraries` (host tables such as `Pg`) don't
+    /// define functions that record the call, as stubs do, and return
+    /// nothing: an engine call not written yet answers nil rather than
+    /// failing the script.
+    pub fn complete_libraries(&self, libraries: &[&str]) -> Result<(), ScriptError> {
+        for &library in libraries {
+            let Value::Table(t) = self.lua.globals().raw_get::<Value>(library)? else {
+                continue;
+            };
+            if t.metatable().is_some() {
+                continue;
+            }
+            let meta = self.lua.create_table()?;
+            let log = Rc::clone(&self.log);
+            let library = library.to_owned();
+            meta.set(
+                "__index",
+                safe_function(&self.lua, move |lua, args| {
+                    let (Some(Value::Table(t)), Some(Value::String(k))) =
+                        (args.front(), args.get(1))
+                    else {
+                        return Ok(MultiValue::new());
+                    };
+                    let name = format!("{library}.{}", k.to_string_lossy());
+                    let log = Rc::clone(&log);
+                    let f = safe_function(lua, move |_, _| {
+                        log.borrow_mut().push(name.clone());
+                        Ok(MultiValue::new())
+                    })?;
+                    t.raw_set(k.clone(), &f)?;
+                    Ok(MultiValue::from_vec(vec![Value::Function(f)]))
+                })?,
+            )?;
+            t.set_metatable(Some(meta))?;
+        }
         Ok(())
     }
 
@@ -560,6 +604,30 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((sum, text.as_str()), (3.0, "w=Graphics.GetHeight()"));
+        // A script's own state reads nil until set, and after it is unset.
+        let unset: bool = host
+            .lua()
+            .load("_bDone = true; _bDone = nil; return _bDone == nil and _tList == nil")
+            .eval()
+            .unwrap();
+        assert!(unset);
+    }
+
+    #[test]
+    fn library_members_not_written_answer_nil() {
+        let host = ScriptHost::new().unwrap();
+        host.lua()
+            .load("Pg = { Known = function() return 1 end }")
+            .exec()
+            .unwrap();
+        host.complete_libraries(&["Pg", "Nothing"]).unwrap();
+        let (known, missing): (i64, Option<i64>) = host
+            .lua()
+            .load("return Pg.Known(), Pg.LoadSomething('x')")
+            .eval()
+            .unwrap();
+        assert_eq!((known, missing), (1, None));
+        assert_eq!(host.take_calls(), ["Pg.LoadSomething"]);
     }
 
     #[test]

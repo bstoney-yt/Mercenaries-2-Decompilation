@@ -40,12 +40,18 @@ pub struct Library {
     pinned: BTreeMap<String, u32>,
 }
 
-/// Modules the member match gets wrong, by the script they are.
+/// Modules the member match gets wrong, by the script they are, found by
+/// what each script inherits and defines.
 ///
-/// `MrxTask` is the task base class; `MrxTaskMission` uses so many of its
-/// members that the match gave it the base, leaving `MrxTask` to a job
-/// script that defines only `Activated`.
-pub const KNOWN_MODULES: [(&str, u32); 1] = [("MrxTask", 0xd302_a66f)];
+/// The task classes are the trouble: subclasses call so many base-class
+/// members through `MrxTaskMission` and `MrxTaskObjective` that the match
+/// gave those names the base class and contracts.
+pub const KNOWN_MODULES: [(&str, u32); 4] = [
+    ("MrxTask", 0xd302_a66f),
+    ("MrxTaskMission", 0xcfcd_908f),
+    ("MrxTaskObjective", 0x517a_1910),
+    ("MrxTaskRace", 0x2595_ba98),
+];
 
 /// Functions that load a module by name.
 pub const LOADERS: [&str; 3] = ["import", "inherit", "dynamic_import"];
