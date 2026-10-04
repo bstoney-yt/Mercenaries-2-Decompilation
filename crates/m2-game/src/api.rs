@@ -92,6 +92,9 @@ pub enum Command {
         target: Option<u32>,
     },
     ExitVehicle(u32),
+    /// A call the game only needs to hear about: `"Pg.SaveGame"`,
+    /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
+    Notify(String),
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -104,6 +107,9 @@ pub struct ScriptWorld {
     /// `Debug.Printf` output, oldest first.
     pub printed: Vec<String>,
     next_spawn: u32,
+    /// What `Sys.GetAssetRequestMax` answers; scripts raise it while
+    /// layers load and put it back.
+    pub asset_request_max: u32,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
     goal_callbacks: Vec<(u32, Function, Option<Table>)>,
 }
@@ -529,7 +535,85 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     for name in ["IsClient", "IsActive", "IsMultiplayer"] {
         add(&net, name, |_, _, _| values([Value::Boolean(false)]))?;
     }
+    // Co-op bookkeeping around layer loads: nothing to do.
+    for name in [
+        "BeginLayerEventGroup",
+        "EndLayerEventGroup",
+        "DoneReloadingLayers",
+    ] {
+        add(&net, name, |_, _, _| values([]))?;
+    }
+
+    // Calls the game only needs to hear about.
+    for name in [
+        "SaveGame",
+        "ContractActivated",
+        "ContractCompleted",
+        "ContractCancelled",
+    ] {
+        pg.set(name, notifier(lua, world, format!("Pg.{name}"))?)?;
+    }
+    add(&pg, "LoadIsRetry", |_, _, _| {
+        values([Value::Boolean(false)])
+    })?;
+
+    // Developer switches (skip to a mission, force a briefing): all off.
+    let sys = lib("Sys")?;
+    for name in ["GetSkipMission", "GetINIBriefing", "GetForceNewGame"] {
+        add(&sys, name, |_, _, _| values([Value::Nil]))?;
+    }
+    for name in ["SetSkipMission", "RequestGameState"] {
+        add(&sys, name, |_, _, _| values([]))?;
+    }
+    add(&sys, "GetIgnoreLayers", |_, lua, _| {
+        values([Value::Table(lua.create_table()?)])
+    })?;
+    // The streaming budget the layer manager raises while it loads.
+    add(&sys, "GetAssetRequestMax", |w, _, _| {
+        values([Value::Number(f64::from(w.asset_request_max))])
+    })?;
+    add(&sys, "SetAssetRequestMax", |w, _, a| {
+        if let Some(n) = num(a.first()) {
+            w.asset_request_max = n as u32;
+        }
+        values([])
+    })?;
+
+    // The game's assert: logged, and the script carries on, as a release
+    // build would.
+    lua.globals().raw_set(
+        "ASSERT",
+        safe_function(lua, {
+            let w = Rc::clone(world);
+            move |_, args| {
+                let args: Vec<Value> = args.into_iter().collect();
+                let holds = !matches!(
+                    args.first(),
+                    None | Some(Value::Nil | Value::Boolean(false))
+                );
+                if !holds {
+                    let what = match args.get(1) {
+                        Some(Value::String(s)) => s.to_string_lossy(),
+                        _ => String::new(),
+                    };
+                    w.borrow_mut()
+                        .printed
+                        .push(format!("ASSERT failed: {what}"));
+                }
+                Ok(MultiValue::new())
+            }
+        })?,
+    )?;
     Ok(())
+}
+
+/// A function that records `call` as a [`Command::Notify`].
+fn notifier(lua: &Lua, world: &Shared, call: String) -> mlua::Result<Function> {
+    let w = Rc::clone(world);
+    safe_function(lua, move |_, _| {
+        w.borrow_mut().commands.push(Command::Notify(call.clone()));
+        Ok(MultiValue::new())
+    })
 }
 
 #[cfg(test)]
@@ -607,6 +691,32 @@ mod tests {
         world.borrow_mut().objects.get_mut(&1).unwrap().position = [1.0, 0.0, 1.0];
         assert!(events.update_shared(0.1, &world).is_empty());
         assert!(!world.borrow().objects[&50].alive);
+    }
+
+    #[test]
+    fn asserts_log_and_switches_are_off() {
+        let (host, world) = setup();
+        let n: f64 = host
+            .lua()
+            .load(
+                r#"
+                ASSERT(true, "fine")
+                ASSERT(false, "Unable to load layer")
+                Sys.SetAssetRequestMax(Sys.GetAssetRequestMax() + 8)
+                Pg.ContractActivated()
+                assert(Sys.GetSkipMission() == nil and #Sys.GetIgnoreLayers() == 0)
+                return Sys.GetAssetRequestMax()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(n, 8.0);
+        let mut w = world.borrow_mut();
+        assert_eq!(w.printed, ["ASSERT failed: Unable to load layer"]);
+        assert_eq!(
+            w.take_commands(),
+            [Command::Notify("Pg.ContractActivated".into())]
+        );
     }
 
     #[test]
