@@ -310,11 +310,21 @@ impl Movie {
             body.extend_from_slice(&inflated[..want.min(inflated.len())]);
             body
         } else {
-            // Stored movies inside archives can carry padding after them.
-            let len = (declared as usize).min(bytes.len());
+            // The game's stored movies declare their length without the
+            // 8-byte header: the tags run 8 bytes past it, to an End tag.
+            // Others carry padding after them inside archives.
+            let with_header = declared as usize + 8;
+            let len = if bytes.get(with_header - 2..with_header) == Some(&[0, 0])
+                && read_tags(bytes, header_end(bytes)?, with_header)
+                    .is_ok_and(|t| t.last().is_some_and(|t| t.code == tag::END))
+            {
+                with_header
+            } else {
+                (declared as usize).min(bytes.len())
+            };
             bytes[..len].to_vec()
         };
-        if body.len() != declared as usize {
+        if body.len() != declared as usize && body.len() != declared as usize + 8 {
             return Err(GfxError::Length {
                 declared,
                 actual: body.len(),
@@ -380,6 +390,14 @@ impl Movie {
             }
         }
     }
+}
+
+/// Where the tags start in an uncompressed movie: after the header, the
+/// frame rectangle, the frame rate and the frame count.
+fn header_end(bytes: &[u8]) -> Result<usize, GfxError> {
+    let mut bits = Bits::at(bytes, 8);
+    bits.rect()?;
+    Ok(bits.byte_pos() + 4)
 }
 
 /// Reads tags from `start` to `end`, stopping after an `End` tag.
@@ -679,7 +697,13 @@ fn read_tag(
                 width: r.u16()?,
                 height: r.u16()?,
                 export_name: pstring(&mut r)?,
-                file_name: pstring(&mut r)?,
+                // Some of the game's movies end the tag after the export
+                // name.
+                file_name: if r.remaining() > 0 {
+                    pstring(&mut r)?
+                } else {
+                    String::new()
+                },
             };
             s.characters
                 .insert(id as u16, Character::ExternalImage(image));
@@ -1131,6 +1155,35 @@ mod tests {
         let mut bytes = movie(b"FWS", &hud_tags());
         bytes.extend_from_slice(&[0; 13]);
         check(&Movie::parse(&bytes).unwrap());
+    }
+
+    #[test]
+    fn stored_movie_may_declare_its_length_without_the_header() {
+        let mut bytes = movie(b"GFX", &hud_tags());
+        let declared = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) - 8;
+        bytes[4..8].copy_from_slice(&declared.to_le_bytes());
+        bytes.extend_from_slice(&[0; 5]);
+        let m = Movie::parse(&bytes).unwrap();
+        assert_eq!(m.body.len(), declared as usize + 8);
+        check(&m);
+    }
+
+    #[test]
+    fn external_image_may_have_no_file_name() {
+        let mut image = vec![5, 0, 13, 0, 0, 2, 128, 0, 4];
+        image.extend_from_slice(b"card");
+        let m = Movie::parse(&movie(
+            b"GFX",
+            &[tag(tag::GFX_DEFINE_EXTERNAL_IMAGE, &image)],
+        ))
+        .unwrap();
+        let s = m.summary();
+        assert!(s.errors.is_empty());
+        let Some(Character::ExternalImage(i)) = s.characters.get(&5) else {
+            panic!("no external image");
+        };
+        assert_eq!((i.export_name.as_str(), i.file_name.as_str()), ("card", ""));
+        assert_eq!((i.width, i.height), (512, 128));
     }
 
     #[test]

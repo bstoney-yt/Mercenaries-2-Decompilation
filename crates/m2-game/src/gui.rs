@@ -7,13 +7,31 @@
 //!
 //! ```text
 //! name                        the widget's name ("Health Counter")
-//! WidgetType                  image, text, sprite, flash, minimap (none: a container)
-//! x1, y1, x2, y2              its box on a 640 x 480 virtual screen
-//! HorizontalAnchor, VerticalAnchor
-//! Red, Green, Blue, TranslucencyLevel
-//! visible
-//! texture, textureFile, u1, v1, u2, v2, rotation, nTileWidth, nTileHeight
+//! WidgetType                  image, text, sprite, flash, minimap; absent: a
+//!                             plain widget that only groups its children
+//! container                   true: a plain, invisible widget whatever
+//!                             WidgetType says (draws nothing itself)
+//! x1, y1, x2, y2              its box on a 640 x 480 virtual screen, in
+//!                             screen coordinates for children too
+//! HorizontalAnchor            left, center, right
+//! VerticalAnchor              top, center, bottom
+//! RedLevel, GreenLevel, BlueLevel, TranslucencyLevel
+//!                             tint and opacity, 0..=255 (255 opaque)
+//! visible                     shown if > 0 (layouts use 1 and -1)
+//! texture                     an image's texture name (textureFile is the
+//!                             source path, dropped when loading)
+//! u1, v1, u2, v2              its texture rectangle (default 0, 0, 1, 1);
+//!                             u2 < u1 or v2 < v1 mirrors the image
+//! rotation                    degrees, 0 in every layout
+//! nTileWidth, nTileHeight     repeat the texture every so many virtual units
+//! textureWidth, textureHeight a sprite's texture size: its frame is
+//!                             (u2 - u1) x (v2 - v1) of that
 //! font, text, scale, Justification
+//!                             a text widget's font name, text (an id in
+//!                             brackets is looked up), size factor and left,
+//!                             center or right
+//! nRadius, nTextureWidth, nWorldXMin..., sBorderTexture
+//!                             a minimap's set-up (the HUD's sets none)
 //! EventHandlerFile            the script module handling its events
 //! EventHandlers               { GameEvent = Module.Function, ... }
 //! Children                    more widgets
@@ -24,6 +42,15 @@
 //! `Module.Function` come back as that text. Every field is kept as read
 //! (keys as the script spells them); the accessors on [`Widget`] read the
 //! ones above whatever their case.
+//!
+//! The game builds widgets from these tables in `MrxGuiBase`
+//! (`LoadAndAddWidgetFromLayoutFileData`): it creates the native widget
+//! for the type, sets texture, rotation and texture rectangle (images and
+//! sprites) or text, font, scale and justification (text), the box, the
+//! anchoring, the visibility (then hides containers) and the colour, adds
+//! the handlers and builds the children, each with its own visibility:
+//! showing or hiding a widget does not touch its children. Only top-level
+//! widgets are then corrected for the screen's shape; see [`Correction`].
 //!
 //! Layout script hashes: the HUD [`HUD_LAYOUT`], binoculars and sniper
 //! scope `95708d95`, the satellite view `0d60703a`, the PDA `b1f189b4`.
@@ -130,28 +157,55 @@ impl Widget {
         ])
     }
 
-    /// Whether it starts shown (absent means shown).
+    /// Whether it starts shown: `visible > 0`, as the game reads it
+    /// (absent means shown). Containers start hidden whatever this says;
+    /// see [`draws`](Self::draws).
     pub fn visible(&self) -> bool {
         match self.field("visible") {
             Some(Field::Bool(b)) => *b,
-            Some(Field::Number(n)) => *n != 0.0,
+            Some(Field::Number(n)) => *n > 0.0,
             _ => true,
         }
     }
 
-    /// Colour and opacity, 0..=1. `TranslucencyLevel` is read as opacity
-    /// in 0..=255 or 0..=1, whichever range it is in.
+    /// `container = true`: the game makes it a plain widget, hidden.
+    pub fn container(&self) -> bool {
+        matches!(self.field("container"), Some(Field::Bool(true)))
+    }
+
+    /// Whether the widget itself draws when the layout loads: shown and
+    /// not a container. Its children decide for themselves.
+    pub fn draws(&self) -> bool {
+        self.visible() && !self.container()
+    }
+
+    /// `nTileWidth`, `nTileHeight` of a (non-container) image: the
+    /// texture repeats every so many virtual units.
+    pub fn tile(&self) -> Option<(f32, f32)> {
+        let (w, h) = (self.number("nTileWidth")?, self.number("nTileHeight")?);
+        (w > 0.0 && h > 0.0).then_some((w, h))
+    }
+
+    /// A text widget's justification, as an anchor (left, centre, right).
+    pub fn justification(&self) -> Anchor {
+        anchor(self.field("Justification"))
+    }
+
+    /// A text widget's size factor (1 when unset).
+    pub fn scale(&self) -> f32 {
+        self.number("scale").unwrap_or(1.0)
+    }
+
+    /// `RedLevel`, `GreenLevel`, `BlueLevel` and `TranslucencyLevel` as
+    /// the layout sets them, 0..=255 (255 where unset).
+    pub fn levels(&self) -> [f32; 4] {
+        ["RedLevel", "GreenLevel", "BlueLevel", "TranslucencyLevel"]
+            .map(|name| self.number(name).unwrap_or(255.0))
+    }
+
+    /// Colour and opacity, 0..=1: [`levels`](Self::levels) over 255.
     pub fn colour(&self) -> [f32; 4] {
-        let channel = |name: &str| {
-            self.number(name)
-                .map_or(1.0, |v| if v > 1.0 { v / 255.0 } else { v })
-        };
-        [
-            channel("Red"),
-            channel("Green"),
-            channel("Blue"),
-            channel("TranslucencyLevel"),
-        ]
+        self.levels().map(|v| (v / 255.0).clamp(0.0, 1.0))
     }
 
     /// The texture's name: `texture`, else `textureFile` without its
@@ -227,26 +281,76 @@ fn anchor(field: Option<&Field>) -> Anchor {
     }
 }
 
-/// Maps a virtual-screen box onto a `width` x `height` screen. The
-/// virtual screen is scaled to the screen's height; on a wider screen a
-/// box keeps its distance from the side its anchor names (the middle for
-/// centre), so start-anchored widgets hug the left edge and end-anchored
-/// ones the right.
+/// How a top-level widget and everything under it map from the virtual
+/// screen onto a real one.
+///
+/// The widget's anchor point (its left edge, middle or right edge, and top,
+/// middle or bottom) moves with the screen: it lands where the same
+/// fraction of the screen is. Sizes scale with the screen's height, so the
+/// widget keeps its shape, and its children keep their offsets from the
+/// anchor point at that scale. On a 16:9 screen a left-anchored box keeps
+/// its left edge at the same fraction of the width and grows rightwards
+/// at height scale; a right-anchored one does the same from its right edge.
+///
+/// This matches the HUD in footage of the game at 16:9 (health counter,
+/// ammo box, minimap, message box, reticle, within a few pixels).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Correction {
+    /// Screen pixels per virtual unit.
+    pub scale: f32,
+    /// Added after scaling.
+    pub offset: [f32; 2],
+}
+
+impl Correction {
+    /// The correction of a top-level widget with box `rect` and `anchors`
+    /// on a `width` x `height` screen.
+    pub fn new(rect: [f32; 4], anchors: (Anchor, Anchor), width: f32, height: f32) -> Self {
+        let scale = height / VIRTUAL_SIZE.1;
+        let axis = |a: Anchor, lo: f32, hi: f32, screen: f32, virt: f32| {
+            let point = match a {
+                Anchor::Start => lo,
+                Anchor::Centre => (lo + hi) / 2.0,
+                Anchor::End => hi,
+            };
+            point * screen / virt - point * scale
+        };
+        Self {
+            scale,
+            offset: [
+                axis(anchors.0, rect[0], rect[2], width, VIRTUAL_SIZE.0),
+                axis(anchors.1, rect[1], rect[3], height, VIRTUAL_SIZE.1),
+            ],
+        }
+    }
+
+    /// The correction of `w` as a top-level widget (identity scale for one
+    /// without a box).
+    pub fn for_widget(w: &Widget, width: f32, height: f32) -> Self {
+        match w.rect() {
+            Some(r) => Self::new(r, w.anchors(), width, height),
+            None => Self {
+                scale: height / VIRTUAL_SIZE.1,
+                offset: [0.0; 2],
+            },
+        }
+    }
+
+    /// A virtual-screen box in screen pixels.
+    pub fn apply(&self, rect: [f32; 4]) -> [f32; 4] {
+        [
+            rect[0] * self.scale + self.offset[0],
+            rect[1] * self.scale + self.offset[1],
+            rect[2] * self.scale + self.offset[0],
+            rect[3] * self.scale + self.offset[1],
+        ]
+    }
+}
+
+/// Maps a top-level widget's box onto a `width` x `height` screen; see
+/// [`Correction`].
 pub fn place(rect: [f32; 4], anchors: (Anchor, Anchor), width: f32, height: f32) -> [f32; 4] {
-    let s = height / VIRTUAL_SIZE.1;
-    let shift = |a: Anchor, screen: f32, virt: f32| match a {
-        Anchor::Start => 0.0,
-        Anchor::Centre => (screen - virt * s) / 2.0,
-        Anchor::End => screen - virt * s,
-    };
-    let dx = shift(anchors.0, width, VIRTUAL_SIZE.0);
-    let dy = shift(anchors.1, height, VIRTUAL_SIZE.1);
-    [
-        rect[0] * s + dx,
-        rect[1] * s + dy,
-        rect[2] * s + dx,
-        rect[3] * s + dy,
-    ]
+    Correction::new(rect, anchors, width, height).apply(rect)
 }
 
 /// Errors from loading a layout.
@@ -384,7 +488,7 @@ mod tests {
                     { name = "Gauge", WidgetType = "image", texture = "global_gui_hud02",
                       u1 = 0.5, v1 = 0, u2 = 0.75, v2 = 0.25,
                       x1 = 10, y1 = 400, x2 = 90, y2 = 470,
-                      Red = 255, Green = 200, Blue = 0, TranslucencyLevel = 128 },
+                      RedLevel = 255, GreenLevel = 200, BlueLevel = 0, TranslucencyLevel = 128 },
                     { name = "Number", WidgetType = "text", font = "english_20",
                       text = "100", visible = false, Justification = "center" },
                 },
@@ -429,14 +533,21 @@ mod tests {
     #[test]
     fn places_by_anchor_on_wide_screens() {
         let r = [540.0, 380.0, 630.0, 470.0];
-        // 4:3 is the virtual screen scaled.
-        assert_eq!(
-            place(r, (Anchor::End, Anchor::End), 1280.0, 960.0),
-            [1080.0, 760.0, 1260.0, 940.0]
-        );
-        // 16:9 at 720 lines: scale 1.5, right-anchored keeps its margin.
+        // 4:3 is the virtual screen scaled, whatever the anchors.
+        for a in [Anchor::Start, Anchor::Centre, Anchor::End] {
+            assert_eq!(
+                place(r, (a, a), 1280.0, 960.0),
+                [1080.0, 760.0, 1260.0, 940.0]
+            );
+        }
+        // 16:9 at 720 lines: scale 1.5; the right edge lands at 630/640 of
+        // the width and the box grows leftwards from it.
         let p = place(r, (Anchor::End, Anchor::Start), 1280.0, 720.0);
-        assert_eq!(p, [1280.0 - 100.0 * 1.5, 570.0, 1280.0 - 10.0 * 1.5, 705.0]);
+        assert_eq!(p, [1260.0 - 135.0, 570.0, 1260.0, 705.0]);
+        // Left-anchored: the left edge at 540/640 of the width.
+        let p = place(r, (Anchor::Start, Anchor::End), 1280.0, 720.0);
+        assert_eq!(p, [1080.0, 570.0, 1080.0 + 135.0, 705.0]);
+        // Centred: the middle stays the middle.
         let p = place(
             [0.0, 0.0, 640.0, 480.0],
             (Anchor::Centre, Anchor::Start),
@@ -444,6 +555,35 @@ mod tests {
             720.0,
         );
         assert_eq!(p, [160.0, 0.0, 1120.0, 720.0]);
+    }
+
+    #[test]
+    fn children_move_with_their_top_level_widget() {
+        let top = [460.0, 40.0, 600.0, 110.0];
+        let c = Correction::new(top, (Anchor::End, Anchor::Start), 1280.0, 720.0);
+        assert_eq!(c.apply(top), [1200.0 - 210.0, 60.0, 1200.0, 165.0]);
+        // A child 10 units in from the right edge keeps that at scale 1.5.
+        let child = c.apply([500.0, 50.0, 590.0, 70.0]);
+        assert_eq!(child, [1200.0 - 150.0, 75.0, 1200.0 - 15.0, 105.0]);
+    }
+
+    #[test]
+    fn containers_and_hidden_widgets_do_not_draw() {
+        let list = load_layout(&compile(
+            r#"LocalWidgetList = {
+                { name = "a", WidgetType = "image", visible = 1, container = true },
+                { name = "b", WidgetType = "image", visible = -1, container = false },
+                { name = "c", WidgetType = "text", visible = 1, container = false,
+                  Justification = "right", scale = 0.67, nTileWidth = 6, nTileHeight = 8 },
+            }"#,
+        ))
+        .unwrap();
+        assert!(list[0].visible() && list[0].container() && !list[0].draws());
+        assert!(!list[1].visible() && !list[1].draws());
+        assert!(list[2].draws());
+        assert_eq!(list[2].justification(), Anchor::End);
+        assert!((list[2].scale() - 0.67).abs() < 1e-6);
+        assert_eq!(list[2].tile(), Some((6.0, 8.0)));
     }
 
     #[test]
