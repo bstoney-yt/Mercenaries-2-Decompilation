@@ -11,6 +11,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use m2_assets::lua::Chunk;
+
+use crate::library::Library;
 use mlua::{ChunkMode, Function, Lua, MultiValue, Table, Value};
 
 /// Errors from loading or running a script.
@@ -30,7 +32,12 @@ pub struct ScriptHost {
     log: Rc<RefCell<Vec<String>>>,
     /// The metatable shared by every stub.
     stub_meta: Table,
+    /// Modules loaded so far, in order, with the script each resolved to.
+    modules: Rc<RefCell<Vec<LoadedModule>>>,
 }
+
+/// A module name as loaded, and the script hash it resolved to.
+pub type LoadedModule = (String, Option<u32>);
 
 /// Key in a stub table holding its name.
 const STUB_NAME: &str = "__m2_stub";
@@ -88,6 +95,7 @@ impl ScriptHost {
             lua,
             log,
             stub_meta,
+            modules: Rc::default(),
         })
     }
 
@@ -155,6 +163,110 @@ impl ScriptHost {
             _ => false,
         }
     }
+    /// Provides `import`, `inherit`, `dynamic_import` and `dynamic_remove`
+    /// over `library`. A module runs once, in its own environment (which
+    /// falls back to the globals), and that environment is the module:
+    /// `import("MrxUtil")` binds it as `MrxUtil` in the caller's
+    /// environment, and `inherit("MrxTask")` also makes the caller's
+    /// environment fall back to it, so the script extends that class. A
+    /// module no script resolves to is empty, or with `stub_unresolved`
+    /// answers every missing member with a stub.
+    pub fn install_library(
+        &self,
+        library: Rc<Library>,
+        stub_unresolved: bool,
+    ) -> Result<(), ScriptError> {
+        let cache = self.lua.create_table()?;
+        let modules = Rc::clone(&self.modules);
+        let module = self.lua.create_function(move |lua, name: String| {
+            let key = name.to_ascii_lowercase();
+            if let Some(env) = cache.raw_get::<Option<Table>>(key.as_str())? {
+                return Ok(env);
+            }
+            let resolved = library.resolve(&name).map(|(s, _, _)| s);
+            modules
+                .borrow_mut()
+                .push((name.clone(), resolved.map(|s| s.hash)));
+            let env = lua.create_table()?;
+            let meta = lua.create_table()?;
+            if resolved.is_none() && stub_unresolved {
+                let prefix = name.clone();
+                meta.set(
+                    "__index",
+                    lua.create_function(move |lua, (_, k): (Table, String)| {
+                        match lua.globals().get::<Value>(k.as_str())? {
+                            Value::Nil => Ok(Value::Table(stub(lua, &format!("{prefix}.{k}"))?)),
+                            v => Ok(v),
+                        }
+                    })?,
+                )?;
+            } else {
+                meta.set("__index", lua.globals())?;
+            }
+            env.set_metatable(Some(meta))?;
+            // Cached before it runs, so modules loading each other finish.
+            cache.raw_set(key.as_str(), &env)?;
+            if let Some(script) = resolved {
+                let source = format!("={name}");
+                let bytes = script
+                    .chunk
+                    .to_host_lua51(&source)
+                    .ok_or_else(|| mlua::Error::runtime(format!("{name}: Lua 5.0 chunk")))?;
+                lua.load(&bytes[..])
+                    .set_name(source)
+                    .set_mode(ChunkMode::Binary)
+                    .set_environment(env.clone())
+                    .exec()?;
+            }
+            Ok(env)
+        })?;
+        self.lua.globals().set("__m2_module", module)?;
+        self.lua
+            .load(
+                r#"
+                local module = __m2_module
+                local function bind(env, name)
+                    local m = module(name)
+                    rawset(env, name, m)
+                    return m
+                end
+                function import(name) return bind(getfenv(2), name) end
+                function dynamic_import(name) return bind(getfenv(2), name) end
+                function dynamic_remove(name) end
+                function inherit(name)
+                    local env = getfenv(2)
+                    local base = bind(env, name)
+                    setmetatable(env, { __index = base })
+                    return base
+                end
+                "#,
+            )
+            .set_name("=m2-modules")
+            .set_mode(ChunkMode::Text)
+            .exec()?;
+        Ok(())
+    }
+
+    /// Runs script `hash` from `library` as an entry point: in its own
+    /// environment, like a module, returning that environment.
+    pub fn run_script(&self, library: &Library, hash: u32) -> Result<Table, ScriptError> {
+        let script = library
+            .by_hash(hash)
+            .ok_or_else(|| mlua::Error::runtime(format!("no script {hash:08x}")))?;
+        let env = self.lua.create_table()?;
+        let meta = self.lua.create_table()?;
+        meta.set("__index", self.lua.globals())?;
+        env.set_metatable(Some(meta))?;
+        let f = self.load(&script.chunk, &format!("{hash:08x}"))?;
+        f.set_environment(env.clone())?;
+        f.call::<()>(())?;
+        Ok(env)
+    }
+
+    /// Modules loaded so far, in order, with the script each resolved to.
+    pub fn modules(&self) -> Vec<LoadedModule> {
+        self.modules.borrow().clone()
+    }
 }
 
 fn stub(lua: &Lua, name: &str) -> mlua::Result<Table> {
@@ -189,6 +301,41 @@ mod tests {
             host.take_calls(),
             ["Objective_Add", "Hud.Show", "m:SetTimer"]
         );
+    }
+
+    #[test]
+    fn modules_import_and_inherit_each_other() {
+        let host = ScriptHost::new().unwrap();
+        let library = Rc::new(crate::library::tests::library());
+        host.install_library(Rc::clone(&library), false).unwrap();
+        let user = host.run_script(&library, 4).unwrap();
+        assert_eq!(user.get::<String>("Result").unwrap(), "hi there");
+        let contract = host.run_script(&library, 3).unwrap();
+        let task = host.lua().create_table().unwrap();
+        task.set("n", 5).unwrap();
+        // Its own Activated calls the base's: 5 * 2 + 1.
+        let activated: Function = contract.get("Activated").unwrap();
+        assert_eq!(activated.call::<i64>(&task).unwrap(), 11);
+        // Inherited, not defined by the contract.
+        let describe: Function = contract.get("Describe").unwrap();
+        assert_eq!(describe.call::<String>(&task).unwrap(), "task");
+        assert_eq!(
+            host.modules(),
+            [("Util".to_owned(), Some(1)), ("Task".to_owned(), Some(2))]
+        );
+    }
+
+    #[test]
+    fn unresolved_modules_can_be_stubs() {
+        let host = ScriptHost::new().unwrap();
+        host.install_library(Rc::new(Library::default()), true)
+            .unwrap();
+        host.lua()
+            .load("import('Hud'); Hud.Show('x'); assert(tostring(1) == '1')")
+            .exec()
+            .unwrap();
+        assert_eq!(host.take_calls(), ["Hud.Show"]);
+        assert_eq!(host.modules(), [("Hud".to_owned(), None)]);
     }
 
     #[test]
