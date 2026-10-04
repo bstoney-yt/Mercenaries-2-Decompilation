@@ -23,6 +23,9 @@ const TURN_RATE: f32 = 10.0;
 const LOOK_HEIGHT: f32 = 1.6;
 const CAMERA_DISTANCE: f32 = 4.0;
 const CAMERA_MIN: f32 = 0.6;
+/// Ticks the world must have been quiet before she lands: a building's
+/// collision can arrive a few frames after the ground under it.
+const SETTLED: u8 = 3;
 
 /// What the player asks for this tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -101,6 +104,12 @@ pub struct Player {
     pub chase_target: Option<(Vec3, f32)>,
     /// False until there is ground under the spawn point to land on.
     pub landed: bool,
+    /// Set each tick the world around her is still streaming in: she does
+    /// not land until it has been quiet for [`SETTLED`] ticks, so that she
+    /// lands on the buildings and not inside one that loads a moment later.
+    pub streaming: bool,
+    /// Ticks in a row the world has been quiet while she waits to land.
+    settled: u8,
     pub model: Option<(GpuModel, Rig)>,
     /// The vehicle she is driving (index into the scene's vehicles).
     pub driving: Option<usize>,
@@ -122,6 +131,8 @@ impl Player {
             camera_distance: CAMERA_DISTANCE,
             chase_target: None,
             landed: false,
+            streaming: false,
+            settled: 0,
             model,
             driving: None,
             hold: None,
@@ -135,11 +146,21 @@ impl Player {
         self.pitch = (self.pitch + intent.look.y).clamp(-1.2, 0.9);
 
         if !self.landed {
-            // Wait for the ground, then stand on it.
+            // Wait for the ground and whatever stands on it, then stand on
+            // the top of that.
+            self.settled = if self.streaming {
+                0
+            } else {
+                self.settled.saturating_add(1)
+            };
             let p = self.character.position;
-            if let Some((d, _)) = physics.cast_ray(Vec3::new(p.x, 3000.0, p.z), -Vec3::Y, 6000.0) {
+            if self.settled >= SETTLED
+                && let Some((d, _)) =
+                    physics.cast_ray(Vec3::new(p.x, 3000.0, p.z), -Vec3::Y, 6000.0)
+            {
                 self.character.position.y = 3000.0 - d + 0.05;
                 self.landed = true;
+                self.settled = 0;
             }
             self.camera(physics);
             return;
@@ -311,7 +332,11 @@ mod tests {
         // Camera facing +x.
         let mut p = Player::new(0.0, 0.0, std::f32::consts::FRAC_PI_2, None);
         let dt = 1.0 / 60.0;
-        p.update(&physics, Intent::default(), dt);
+        // A few quiet ticks, then she lands.
+        for _ in 0..usize::from(SETTLED) {
+            assert!(!p.landed);
+            p.update(&physics, Intent::default(), dt);
+        }
         assert!(p.landed);
         assert!((p.character.position.y - 10.0).abs() < 0.2);
         let forward = Intent {

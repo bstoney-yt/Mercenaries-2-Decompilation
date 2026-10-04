@@ -62,9 +62,11 @@ impl Game {
     pub fn step(&mut self, intent: Intent, dt: f32) {
         let scene = &mut self.scene;
         if let Some(world) = &mut scene.world {
+            let streaming = world.stats().pending > 0;
             let physics = &mut world.physics;
             let player = scene.player.as_mut().filter(|_| self.on_foot);
             if let Some(player) = player {
+                player.streaming = streaming;
                 self.park_wait -= dt;
                 if !self.restore.is_empty() {
                     restore(physics, &mut scene.vehicles, &mut self.restore);

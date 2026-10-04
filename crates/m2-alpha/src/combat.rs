@@ -716,8 +716,10 @@ mod tests {
                 Some(1),
             ));
         }
-        people.update(&physics, &[], Vec3::ZERO, None, dt);
-        player.update(&physics, Default::default(), dt);
+        for _ in 0..3 {
+            people.update(&physics, &[], Vec3::ZERO, None, dt);
+            player.update(&physics, Default::default(), dt);
+        }
         assert!(player.landed && people.npcs.iter().all(|n| n.landed));
         // Crosshair on the near soldier's chest.
         let chest = people.npcs[0].chest();
@@ -759,7 +761,9 @@ mod tests {
         let mut physics = ground();
         let dt = 1.0 / 60.0;
         let mut player = Player::new(0.0, 0.0, 0.0, None);
-        player.update(&physics, Default::default(), dt);
+        for _ in 0..3 {
+            player.update(&physics, Default::default(), dt);
+        }
         let mut people = People::default();
         let mut combat = Combat::default();
         let arsenal = Arsenal::default();
