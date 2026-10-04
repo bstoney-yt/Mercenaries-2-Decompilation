@@ -41,6 +41,7 @@ mod combat;
 mod config;
 mod game;
 mod input;
+mod mission;
 mod npc;
 mod player;
 mod save;
@@ -87,6 +88,7 @@ struct Options {
     fly: bool,
     drive: bool,
     fight: bool,
+    mission: bool,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -141,6 +143,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--fly" => o.fly = true,
             "--drive" => o.drive = true,
             "--fight" => o.fight = true,
+            "--mission" => o.mission = true,
             "--sea" => o.sea = Some(value()?.parse().context("--sea expects metres")?),
             "--screenshot" => o.screenshot = Some(value()?.into()),
             "--write-config" => o.write_config = true,
@@ -238,6 +241,7 @@ fn main() -> anyhow::Result<()> {
         mode,
         double_sided: options.double_sided,
         fly: options.fly,
+        mission: options.mission,
         state: None,
         error: None,
     };
@@ -288,6 +292,23 @@ fn build_scene(
     }
     let (eye, target) = scene.focus;
     Ok(Game::new(scene, FlyCamera::looking_at(eye, target)))
+}
+
+/// What the HUD shows: the game's, with the mission's objectives and the
+/// view their markers are placed with.
+fn hud_info(
+    game: &Game,
+    mission: Option<&mission::MissionLink>,
+    fov: f32,
+    aspect: f32,
+) -> ui::HudInfo {
+    let mut info = game.hud_info();
+    if let Some(m) = mission {
+        info.mission = Some(m.view());
+        let view = game.view(fov, aspect);
+        info.view_proj = Some(view.projection * view.view);
+    }
+    info
 }
 
 /// Streams around the player (or camera) and draws a frame.
@@ -406,6 +427,18 @@ fn screenshot(
                 .join(", ")
         );
     }
+    let mut link = None;
+    if options.mission
+        && let Some(install) = install
+    {
+        link = Some(mission_for_screenshot(
+            &mut backend,
+            &mut game,
+            install,
+            fov,
+            aspect,
+        )?);
+    }
     if options.fight && game.on_foot && game.scene.player.is_some() {
         fight_for_screenshot(&mut backend, &mut game, fov, aspect)?;
     } else if options.drive && game.on_foot && game.scene.player.is_some() {
@@ -440,11 +473,8 @@ fn screenshot(
     // The picture, with the HUD.
     let mut hud = ui::Hud::new();
     let mut settings = config.clone();
-    let _ = hud.build(
-        ui::headless_input(w, h, 1.0),
-        &game.hud_info(),
-        &mut settings,
-    );
+    let info = hud_info(&game, link.as_ref(), fov, aspect);
+    let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
     let rgba = backend.read_pixels()?;
     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
@@ -452,6 +482,69 @@ fn screenshot(
     std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))?;
     eprintln!("wrote {}", out.display());
     Ok(())
+}
+
+/// Starts the mission scripts, waits for them to read the archive and
+/// start the first contract, then plays on while the island streams in
+/// where they put the player, printing the objectives.
+fn mission_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    install: &Install,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<mission::MissionLink> {
+    let tick = TICK.as_secs_f32();
+    let mut link = mission::MissionLink::start(install);
+    let started = Instant::now();
+    while !link.running() && started.elapsed() < Duration::from_secs(300) {
+        link.tick(game, tick);
+        if link
+            .view()
+            .status
+            .is_some_and(|s| s.starts_with("Mission scripts stopped"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!(
+        "mission scripts {} after {:.1} s",
+        if link.running() {
+            "running"
+        } else {
+            "not running"
+        },
+        started.elapsed().as_secs_f32()
+    );
+    // Ten seconds of play, streaming as it goes.
+    for i in 0..600 {
+        game.step(Intent::default(), tick);
+        link.tick(game, tick);
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    while let Some(world) = &game.scene.world {
+        let waiting = game.scene.player.as_ref().is_some_and(|p| !p.landed);
+        if (world.stats().pending == 0 && !waiting) || started.elapsed() > Duration::from_secs(400)
+        {
+            break;
+        }
+        game.step(Intent::default(), tick);
+        link.tick(game, tick);
+        render(backend, game, fov, aspect, None)?;
+    }
+    let view = link.view();
+    eprintln!(
+        "mission: player at {:.1}; objectives {:?}; {} markers; message {:?}; status {:?}",
+        game.focus(),
+        view.objectives,
+        view.markers.len(),
+        view.message,
+        view.status
+    );
+    Ok(link)
 }
 
 /// Waits for the parked vehicles, gets in the nearest and drives it
@@ -729,6 +822,7 @@ struct Running {
     title: String,
     hud: ui::Hud,
     egui: egui_winit::State,
+    mission: Option<mission::MissionLink>,
 }
 
 struct App {
@@ -739,6 +833,8 @@ struct App {
     double_sided: bool,
     /// Start flying rather than on foot.
     fly: bool,
+    /// Run the mission scripts.
+    mission: bool,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -796,6 +892,12 @@ impl App {
             fps: (Instant::now(), 0),
             egui,
             hud,
+            mission: match (&self.install, &self.mode) {
+                (Some(install), Mode::Island(_)) if self.mission => {
+                    Some(mission::MissionLink::start(install))
+                }
+                _ => None,
+            },
         })
     }
 
@@ -833,7 +935,14 @@ impl Running {
         }
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
-        let (action, output) = self.hud.build(input, &self.game.hud_info(), config);
+        let (w, h) = self.backend.size();
+        let info = hud_info(
+            &self.game,
+            self.mission.as_ref(),
+            config.camera.fov,
+            w as f32 / h as f32,
+        );
+        let (action, output) = self.hud.build(input, &info, config);
         self.egui.handle_platform_output(&self.window, output);
         if config.window.vsync != vsync {
             self.backend.set_vsync(config.window.vsync);
@@ -965,6 +1074,9 @@ impl Running {
             self.mouse_look,
             TICK.as_secs_f32(),
         );
+        if let Some(m) = &mut self.mission {
+            m.tick(&mut self.game, TICK.as_secs_f32());
+        }
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
         let sounds = self.game.combat.take_sounds();

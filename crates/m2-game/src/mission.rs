@@ -395,6 +395,14 @@ impl Mission {
         }
     }
 
+    /// Reports that an object died in play (a soldier the player shot).
+    pub fn kill(&mut self, guid: u32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            o.alive = false;
+            o.health = 0.0;
+        }
+    }
+
     /// Everything the scripts asked the game to do since the last call.
     pub fn take_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.outbox)

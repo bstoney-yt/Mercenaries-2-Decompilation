@@ -271,6 +271,7 @@ impl Game {
             driving,
             can_enter,
             loading,
+            ..HudInfo::default()
         }
     }
 
