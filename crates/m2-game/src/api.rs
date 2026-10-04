@@ -92,6 +92,12 @@ pub enum Command {
         target: Option<u32>,
     },
     ExitVehicle(u32),
+    /// Stream a layer in or out; report it done with
+    /// [`crate::layers::finished`].
+    Layer {
+        op: crate::layers::LayerOp,
+        name: String,
+    },
     /// A call the game only needs to hear about: `"Pg.SaveGame"`,
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
@@ -110,6 +116,8 @@ pub struct ScriptWorld {
     /// What `Sys.GetAssetRequestMax` answers; scripts raise it while
     /// layers load and put it back.
     pub asset_request_max: u32,
+    /// Layers the archives hold and which are loaded.
+    pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
     goal_callbacks: Vec<(u32, Function, Option<Table>)>,
 }
@@ -604,7 +612,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             }
         })?,
     )?;
-    Ok(())
+    crate::layers::install(lua, world)
 }
 
 /// A function that records `call` as a [`Command::Notify`].
