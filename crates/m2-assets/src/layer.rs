@@ -1,5 +1,7 @@
 //! Entity layers: the tables that place everything in the world, from the
-//! terrain cells to buildings, props, AI and spawners.
+//! terrain cells to buildings, props, AI and spawners; and the template
+//! database, in the same layout, that defines what the layers' entities
+//! are named after.
 //!
 //! A layer (asset type hash `e6b81a54`, in `layers_static` and the
 //! `vz_state_*` blocks) is a `UCFX` container of components, each a table
@@ -18,6 +20,10 @@
 //! flgt  u32
 //! flgs  per-entity flags (layout not decoded)
 //! ```
+//!
+//! The template database ([`TEMPLATE_DB_TYPE`]) has `CHDR`, `enum`, a
+//! `UNIQ` section (not decoded) and the `COMP` tables, and no `flgt` or
+//! `flgs`; its entities are templates, named by its `Name` component.
 //!
 //! In the data a record is usually exactly the schema's record size. Two
 //! exceptions are known: string fields (type 8) are stored inline as
@@ -151,10 +157,22 @@ pub struct Layer<'a> {
     /// The `enum` section, undecoded.
     pub enums: &'a [u8],
     pub components: Vec<Component<'a>>,
+    /// 0 in the template database, which has no `flgt`.
     pub flgt: u32,
-    /// The `flgs` section, undecoded.
+    /// The `flgs` section, undecoded; empty in the template database.
     pub flags: &'a [u8],
+    /// The template database's `UNIQ` section, undecoded; empty in a
+    /// layer.
+    pub uniq: &'a [u8],
 }
+
+/// Asset type hash of the template database: one asset
+/// (`resident_P000_Q3`, 1.8 MB) in the same component-table layout as a
+/// layer, whose entities are the templates the layers' entities are
+/// named after (`M151 Softtop (VZ)`, `Van (Crappy)`, `Small Fishing
+/// Boat`), with their `ModelName` and other components, base templates
+/// (`Van (base)`) and seats among them.
+pub const TEMPLATE_DB_TYPE: u32 = 0x5647_c35d;
 
 impl<'a> Layer<'a> {
     pub fn parse(asset: &'a [u8]) -> Result<Self, LayerError> {
@@ -163,8 +181,14 @@ impl<'a> Layer<'a> {
         let mut r = Reader::at(top(*b"CHDR", "CHDR")?, 0);
         let header = [r.u32()?, r.u32()?];
         let enums = top(*b"enum", "enum")?;
-        let flgt = Reader::at(top(*b"flgt", "flgt")?, 0).u32()?;
-        let flags = top(*b"flgs", "flgs")?;
+        // A layer has per-entity flags; the template database has a
+        // `UNIQ` section instead.
+        let flgt = match u.top_level(*b"flgt") {
+            Some(d) => Reader::at(d, 0).u32()?,
+            None => 0,
+        };
+        let flags = u.top_level(*b"flgs").unwrap_or(&[]);
+        let uniq = u.top_level(*b"UNIQ").unwrap_or(&[]);
 
         let mut components = Vec::new();
         for (index, c) in u
@@ -226,6 +250,7 @@ impl<'a> Layer<'a> {
             components,
             flgt,
             flags,
+            uniq,
         })
     }
 
@@ -400,6 +425,45 @@ mod tests {
         // Strings make Name variable-size.
         assert!(l.component("Name").unwrap().records().is_none());
         assert!(l.hashes("Missing").is_empty());
+    }
+
+    // The template database: no flags, a `UNIQ` section, and templates
+    // named like layer entities are.
+    #[test]
+    fn parses_the_template_database() {
+        let mut names = Vec::new();
+        for (t, n) in [(7u32, "M151 Softtop (VZ)"), (8, "Van (base)")] {
+            names.extend(t.to_le_bytes());
+            names.extend(n.as_bytes());
+            names.extend([0, 0]);
+        }
+        let a = ucfx(&[
+            UcfxNode::Leaf(*b"CHDR", le(&[0x0038_0000, 2])),
+            UcfxNode::Leaf(*b"enum", le(&[0])),
+            UcfxNode::Leaf(*b"UNIQ", le(&[1, 2, 3])),
+            comp(
+                "Name",
+                0x1de5_c824,
+                2,
+                &[(8, 0x1de5_c824, 0), (1, 0x12af_a0b8, 4)],
+                5,
+                names,
+            ),
+            comp(
+                "ModelName",
+                0x4b7c_8ad1,
+                1,
+                &[(6, 0xc47b_227c, 0)],
+                4,
+                le(&[7, 0xCCCC]),
+            ),
+        ]);
+        let db = Layer::parse(&a).unwrap();
+        assert_eq!(db.flgt, 0);
+        assert!(db.flags.is_empty());
+        assert_eq!(db.uniq, le(&[1, 2, 3]));
+        assert_eq!(db.names()[&7], "M151 Softtop (VZ)");
+        assert_eq!(db.hashes("ModelName"), HashMap::from([(7, 0xCCCC)]));
     }
 
     #[test]
