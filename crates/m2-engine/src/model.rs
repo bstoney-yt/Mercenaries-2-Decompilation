@@ -470,9 +470,20 @@ impl GpuModel {
 
     /// Queues every piece at `world`, skinned geometry in its bind pose.
     pub fn draw(&self, queue: &mut DrawQueue, world: Mat4) {
-        for piece in self.shown() {
+        self.draw_as(queue, world, self.wrecked);
+    }
+
+    /// As [`draw`](Self::draw), intact or `wrecked` whatever
+    /// [`wrecked`](Self::wrecked) says (one model drawn in many places).
+    pub fn draw_as(&self, queue: &mut DrawQueue, world: Mat4, wrecked: bool) {
+        for piece in self.shown(wrecked) {
             Self::push(queue, piece, world, None);
         }
+    }
+
+    /// Whether the model has wrecked parts to show.
+    pub fn has_wreck(&self) -> bool {
+        self.hidden[0] != self.hidden[1]
     }
 
     /// Whether any piece is skinned.
@@ -495,7 +506,7 @@ impl GpuModel {
         skin: &[Mat4],
     ) -> Result<(), BackendError> {
         let mut palette = Vec::new();
-        for piece in self.shown() {
+        for piece in self.shown(self.wrecked) {
             let handle = if piece.bones.is_empty() {
                 if let Some(&m) = piece.node.and_then(|n| nodes.get(usize::from(n))) {
                     Self::push_at(queue, piece, world * m, None);
@@ -518,8 +529,8 @@ impl GpuModel {
     }
 
     /// The pieces drawn as the model stands, intact or wrecked.
-    fn shown(&self) -> impl Iterator<Item = &Piece> {
-        let hidden = &self.hidden[usize::from(self.wrecked)];
+    fn shown(&self, wrecked: bool) -> impl Iterator<Item = &Piece> {
+        let hidden = &self.hidden[usize::from(wrecked)];
         self.pieces
             .iter()
             .filter(|p| !hidden.get(usize::from(p.at)).copied().unwrap_or(false))
