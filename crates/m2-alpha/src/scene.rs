@@ -66,6 +66,8 @@ pub struct Rig {
     pub aim: Option<Vec3>,
     /// (rear, front) hands of the aim pose, found once.
     pub(crate) hands: std::sync::OnceLock<Option<(usize, usize)>>,
+    /// The arm that carries the rifle low, found once.
+    pub(crate) arm: std::sync::OnceLock<Option<Arc<[bool]>>>,
 }
 
 /// How a rifle is held.
@@ -166,6 +168,7 @@ impl Rig {
             two_handed: false,
             aim: None,
             hands: Default::default(),
+            arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion: Some(Locomotion {
@@ -184,6 +187,7 @@ impl Rig {
             two_handed: false,
             aim: None,
             hands: Default::default(),
+            arm: Default::default(),
             skeleton: Arc::new(skeleton),
             clips: Arc::new(clips),
             locomotion,
@@ -226,7 +230,12 @@ impl Rig {
         if carry != Carry::Aim {
             self.aim = None;
         }
-        self.animator.set_upper(upper);
+        // Carried low on the move, the rifle arm hangs as it does standing
+        // while the rest of her runs (the game's carry).
+        let arm = (carry == Carry::Low && gait != Gait::Idle)
+            .then(|| self.gait_clip(Gait::Idle).zip(self.carry_arm()))
+            .flatten();
+        self.animator.set_upper(upper.or(arm));
     }
 
     /// The pose turned to aim along [`Rig::aim`], when aiming.
@@ -241,6 +250,22 @@ impl Rig {
     /// ([`aim_hands`](crate::combat::aim_hands)).
     pub fn aim_hands(&self) -> Option<(usize, usize)> {
         *self.hands.get_or_init(|| crate::combat::aim_hands(self))
+    }
+
+    /// The arm of the hand that carries the rifle ([`Rig::aim_hands`]'s
+    /// rear hand).
+    pub fn carry_arm(&self) -> Option<Arc<[bool]>> {
+        self.arm
+            .get_or_init(|| {
+                let (rear, front) = self.aim_hands()?;
+                self.skeleton.arm(rear, front)
+            })
+            .clone()
+    }
+
+    /// The hand that holds the rifle, aimed or carried.
+    pub fn rifle_hand(&self) -> Option<usize> {
+        self.aim_hands().map(|(rear, _)| rear)
     }
 
     /// Aims along `dir` (world space) for a body turned to `facing`, or

@@ -96,7 +96,7 @@ impl Arsenal {
         };
         let carry = rig.and_then(|r| carry(r, muzzle));
         if let Some(r) = rig {
-            self.hand = right_hand(&r.skeleton);
+            self.hand = r.rifle_hand();
         }
         let w = Some(WeaponModel {
             model,
@@ -148,11 +148,6 @@ pub fn upper_body(skeleton: &Skeleton) -> Option<std::sync::Arc<[bool]>> {
 /// The right- and left-hand nodes of a human skeleton.
 pub fn hands(skeleton: &Skeleton) -> Option<(usize, usize)> {
     Some((node(skeleton, RIGHT_HAND)?, node(skeleton, LEFT_HAND)?))
-}
-
-/// The right-hand node of a human skeleton.
-pub fn right_hand(skeleton: &Skeleton) -> Option<usize> {
-    node(skeleton, RIGHT_HAND)
 }
 
 /// How far below level a weapon carried in one hand points, radians.
@@ -221,7 +216,7 @@ fn carry(rig: &Rig, muzzle: Vec3) -> Option<(Vec3, Quat)> {
     let forward = rig.locomotion.as_ref()?.forward;
     let pose = clip.sample(skeleton, clip.info.duration * 0.5);
     let nodes = skeleton.model_matrices(&pose);
-    let rh = node(skeleton, RIGHT_HAND)?;
+    let rh = rig.rifle_hand()?;
     let fingers = skeleton.parents.iter().position(|&p| p == Some(rh));
     let pr = nodes[rh].transform_point3(Vec3::ZERO);
     let pf = fingers.map_or(pr, |f| nodes[f].transform_point3(Vec3::ZERO));

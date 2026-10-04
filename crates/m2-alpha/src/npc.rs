@@ -173,7 +173,7 @@ impl Npc {
         let mut rig = rig.clone();
         rig.set_gait(Gait::Idle);
         let clips = FightClips::find(&rig);
-        let hand = crate::combat::right_hand(&rig.skeleton);
+        let hand = rig.rifle_hand();
         Self {
             clips,
             hand,
@@ -793,6 +793,7 @@ pub(crate) mod tests {
             two_handed: false,
             aim: None,
             hands: Default::default(),
+            arm: Default::default(),
         }
     }
 
