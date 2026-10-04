@@ -122,6 +122,17 @@ pub struct Npc {
     pub hand: Option<usize>,
     /// Seconds since they died.
     dead_for: f32,
+    /// Has shouted since they were last calm.
+    shouted: bool,
+}
+
+/// What a person shouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shout {
+    /// A soldier turning on the player.
+    Alert,
+    /// A civilian running from gunfire.
+    Flee,
 }
 
 impl Npc {
@@ -141,6 +152,7 @@ impl Npc {
             clips,
             hand,
             dead_for: 0.0,
+            shouted: false,
             kind,
             soldier: spawn.is_some(),
             character: Character::new(at),
@@ -438,6 +450,26 @@ impl People {
         for npc in &mut self.npcs {
             npc.update(physics, &mut self.rng, threat, dt);
         }
+    }
+
+    /// Who shouts this tick: a soldier the first tick they are on alert,
+    /// a civilian the first tick they run (once until they calm down).
+    /// Index into `npcs`, what, and where (their head).
+    pub fn take_shouts(&mut self) -> Vec<(usize, Shout, Vec3)> {
+        let mut out = Vec::new();
+        for (i, n) in self.npcs.iter_mut().enumerate() {
+            let calm = !n.alive || (!n.alert && n.flee.is_none());
+            if calm {
+                n.shouted = false;
+                continue;
+            }
+            if !n.shouted {
+                n.shouted = true;
+                let what = if n.soldier { Shout::Alert } else { Shout::Flee };
+                out.push((i, what, n.character.position + Vec3::Y * 1.7));
+            }
+        }
+        out
     }
 
     /// Every soldier killed so far, about or not.

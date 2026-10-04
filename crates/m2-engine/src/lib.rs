@@ -24,7 +24,7 @@ pub mod world;
 
 pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
-pub use audio::{Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId};
+pub use audio::{Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
 pub use model::{CpuModel, GpuModel, MaterialCache};
 pub use physics::{Character, CollisionShape, Physics, StaticKey, VehicleControls, VehicleId};
 pub use stream::{World, WorldSettings, WorldStats};

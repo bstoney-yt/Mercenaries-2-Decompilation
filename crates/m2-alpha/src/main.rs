@@ -1162,6 +1162,13 @@ impl Running {
             let town = self.game.near_town();
             self.audio.play_ambient(town, ear);
         }
+        for (i, shout, at) in self.game.scene.people.take_shouts() {
+            let set = match shout {
+                npc::Shout::Alert => sound::VZ_SOLDIERS[i % sound::VZ_SOLDIERS.len()],
+                npc::Shout::Flee => sound::CIVILIANS,
+            };
+            self.audio.shout(set, Some(at));
+        }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);
     }
