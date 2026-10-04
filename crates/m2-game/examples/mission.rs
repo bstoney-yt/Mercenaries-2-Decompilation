@@ -23,7 +23,7 @@
 //! case (`mattias`), which is how scripts tell the heroes apart.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::process::ExitCode;
@@ -31,7 +31,8 @@ use std::rc::Rc;
 
 use m2_assets::layer::LAYER_TYPE;
 use m2_assets::lua::{Chunk, SCRIPT_TYPE};
-use m2_assets::{BlockContents, Layer, WadArchive};
+use m2_assets::region::REGION_TYPE;
+use m2_assets::{BlockContents, Layer, Region, WadArchive};
 use m2_game::api::{self, Command, Object, ScriptWorld, Shared};
 use m2_game::events::Events;
 use m2_game::layers::{LayerOp, LayerState, finished, layer_name};
@@ -115,31 +116,78 @@ fn options() -> Result<Options> {
     Ok(o)
 }
 
-/// A layer's named entities: guid (the layer's entity id), name and
-/// position.
-type Entities = Vec<(u32, String, [f32; 3])>;
+/// A named entity of a layer.
+struct Entity {
+    /// The layer's entity id.
+    guid: u32,
+    name: String,
+    at: [f32; 3],
+    yaw: f32,
+    /// The shape a `LineRegion` names, by hash, and once read, the shape.
+    region_hash: Option<u32>,
+    region: Option<Region>,
+}
+
+type Entities = Vec<Entity>;
 
 fn entities(layer: &Layer<'_>) -> Entities {
     let placements = layer.placements();
+    let regions = layer.hashes("LineRegion");
     layer
         .names()
         .into_iter()
-        .map(|(entity, name)| {
-            let at = placements.get(&entity).map_or([0.0; 3], |p| p.position);
-            (entity, name.to_owned(), at)
+        .map(|(guid, name)| {
+            let p = placements.get(&guid);
+            Entity {
+                guid,
+                name: name.to_owned(),
+                at: p.map_or([0.0; 3], |p| p.position),
+                yaw: p.map_or(0.0, |p| yaw(p.rotation)),
+                region_hash: regions.get(&guid).copied(),
+                region: None,
+            }
         })
         .collect()
+}
+
+/// A transit landing zone's number and player (1 or 2), from its name:
+/// `06_gua_upperclass_lz_playerone` is zone 6 for player 1 (one is
+/// spelled `_llz_`).
+fn landing_zone(name: &str) -> Option<(i64, usize)> {
+    let lower = name.to_ascii_lowercase();
+    let (rest, player) = if let Some(r) = lower.strip_suffix("z_playerone") {
+        (r, 1)
+    } else {
+        (lower.strip_suffix("z_playertwo")?, 2)
+    };
+    let rest = rest
+        .strip_suffix('l')?
+        .trim_end_matches('l')
+        .strip_suffix('_')?;
+    let n = rest.get(..2)?.parse().ok()?;
+    rest[2..].starts_with('_').then_some((n, player))
+}
+
+/// The turn about the vertical axis of an (x, y, z, w) rotation.
+fn yaw([x, y, z, w]: [f32; 4]) -> f32 {
+    (2.0 * (w * y + x * z)).atan2(1.0 - 2.0 * (x * x + y * y))
 }
 
 /// Puts a layer's entities in the world as objects scripts can find with
 /// `Pg.GetGuidByName`, or takes them out.
 fn place(world: &Shared, entities: &Entities, load: bool) {
     let mut w = world.borrow_mut();
-    for (guid, name, at) in entities {
+    for e in entities {
         if load {
-            w.insert(*guid, Object::new(name, *at));
+            let mut o = Object::new(&e.name, e.at);
+            o.yaw = e.yaw;
+            w.insert(e.guid, o);
+            if let Some(r) = &e.region {
+                w.regions.insert(e.guid, r.clone());
+            }
         } else {
-            w.objects.remove(guid);
+            w.objects.remove(&e.guid);
+            w.regions.remove(&e.guid);
         }
     }
 }
@@ -155,6 +203,7 @@ fn run(o: &Options) -> Result<()> {
     let mut library = Library::default();
     let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
     let mut layers: BTreeMap<String, Entities> = BTreeMap::new();
+    let mut shapes: HashMap<u32, Region> = HashMap::new();
     for (block, path) in paths.iter().enumerate() {
         let decoded = wad.read_block(block)?;
         let Ok(contents) = BlockContents::parse(&decoded) else {
@@ -164,6 +213,10 @@ fn run(o: &Options) -> Result<()> {
             if entry.type_hash == SCRIPT_TYPE {
                 if let Ok(c) = Chunk::from_asset(data) {
                     library.add(entry.name_hash, c);
+                }
+            } else if entry.type_hash == REGION_TYPE {
+                if let Ok(r) = Region::parse(data) {
+                    shapes.insert(entry.name_hash, r);
                 }
             } else if entry.type_hash == LAYER_TYPE
                 && let Ok(layer) = Layer::parse(data)
@@ -175,7 +228,28 @@ fn run(o: &Options) -> Result<()> {
             }
         }
     }
-    world.borrow_mut().layers.known = layers.keys().cloned().collect();
+    // Regions get their shapes; landing zones are told apart by name.
+    let mut regions = 0;
+    let mut lzs: [BTreeMap<i64, u32>; 2] = Default::default();
+    for e in layers.values_mut().flatten() {
+        e.region = e.region_hash.and_then(|h| shapes.get(&h)).cloned();
+        regions += usize::from(e.region.is_some());
+        if let Some((n, player)) = landing_zone(&e.name) {
+            lzs[player - 1].insert(n, e.guid);
+        }
+    }
+    println!(
+        "{} region shapes; {regions} region entities; {} landing zones",
+        shapes.len(),
+        lzs[0].len()
+    );
+    {
+        let mut w = world.borrow_mut();
+        w.layers.known = layers.keys().cloned().collect();
+        let [one, two] = lzs;
+        w.landing_zones.insert(1, one);
+        w.landing_zones.insert(2, two);
+    }
     // The static layers are always in; `--layers` adds others up front.
     let preload: Vec<String> = layers
         .keys()
@@ -256,11 +330,8 @@ fn run(o: &Options) -> Result<()> {
     for f in host.init_modules()? {
         failures.push(format!("Init of {f}"));
     }
-    println!(
-        "started: {} modules, {} failures",
-        host.modules().len(),
-        failures.len()
-    );
+    let started = host.modules().len();
+    println!("started: {started} modules, {} failures", failures.len());
     for f in &failures {
         println!("  {}", first_lines(f));
     }
@@ -315,6 +386,14 @@ fn run(o: &Options) -> Result<()> {
         settle(&format!("t={now:.1}"), &host, &world, &events, &layers);
     }
     println!();
+    println!("modules loaded while running (name -> script):");
+    for (name, hash) in host.modules().iter().skip(started) {
+        println!(
+            "  {name} -> {}",
+            hash.map_or("unresolved".into(), |h| format!("{h:08x}"))
+        );
+    }
+    println!();
     println!(
         "{} events pending at the end: {:?}",
         events.len(),
@@ -360,6 +439,24 @@ fn settle(
                 events,
             ));
         }
+        // Deliveries arrive at once, as layers load at once.
+        let mut delivered = 0;
+        for c in &commands {
+            if let Command::Goal {
+                guid,
+                goal,
+                location: Some(at),
+                ..
+            } = c
+                && goal == "Deliver"
+            {
+                println!("  delivery by {guid} arrived at {at:?}");
+                for e in api::arrived(world, *guid, *at) {
+                    println!("  goal callback: {}", first_lines(&e.to_string()));
+                }
+                delivered += 1;
+            }
+        }
         let requests: Vec<(LayerOp, String)> = commands
             .into_iter()
             .filter_map(|c| match c {
@@ -368,6 +465,10 @@ fn settle(
             })
             .collect();
         if requests.is_empty() {
+            if delivered > 0 {
+                commands = report(&format!("{when}, deliveries done"), host, world, events);
+                continue;
+            }
             if ran == 0 {
                 return;
             }

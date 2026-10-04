@@ -17,6 +17,7 @@
 //! (see `wad -- calls`); the readings are noted per kind below.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use mlua::{Function, Lua, MultiValue, Table, Value};
@@ -49,10 +50,20 @@ pub trait World {
     fn game_state(&self) -> Option<String> {
         None
     }
+    /// The object with this name in its layer (`"VzaCon001_StartingBoat"`),
+    /// for parameters that name one object by name.
+    fn named(&self, _name: &str) -> Option<u32> {
+        None
+    }
+    /// Cargo on a winch: `None` if it never was, else what carries it now
+    /// (`None` once let go).
+    fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
+        None
+    }
 }
 
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 13] = [
+pub const KINDS: [&str; 14] = [
     "TimerRelative",
     "ObjectHibernation",
     "Boundary",
@@ -66,6 +77,7 @@ pub const KINDS: [&str; 13] = [
     "TimerAbsolute",
     "ObjectDamage",
     "GameStateChange",
+    "ObjectWinched",
 ];
 
 #[derive(Debug)]
@@ -81,6 +93,8 @@ struct Pending {
     /// For conditions: whether it held at the last check, so persistent
     /// events fire as it starts to hold, not every frame.
     held: bool,
+    /// For conditions on each of several objects: those it held for.
+    held_by: BTreeSet<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -154,6 +168,7 @@ impl Events {
                         persistent,
                         last: now,
                         held: false,
+                        held_by: BTreeSet::new(),
                     });
                     Ok(MultiValue::from_vec(vec![Value::Number(f64::from(id))]))
                 })?,
@@ -241,17 +256,38 @@ impl Events {
             let mut keep = Vec::with_capacity(s.pending.len());
             for mut p in std::mem::take(&mut s.pending) {
                 let extra = match check(&p, now, &posted, world) {
-                    Check::Fire(extra) => Some(extra),
+                    Check::Fire(extra) => Some(vec![extra]),
                     // Fires as the condition starts to hold.
                     Check::Holds(holds, extra) => {
                         let rising = holds && !p.held;
                         p.held = holds;
-                        rising.then_some(extra)
+                        rising.then_some(vec![extra])
+                    }
+                    // Fires for each object as the condition starts to
+                    // hold for it; once only, unless persistent.
+                    Check::Each(members) => {
+                        let mut rising = Vec::new();
+                        let mut held_by = BTreeSet::new();
+                        for (g, holds, extra) in members {
+                            if holds {
+                                held_by.insert(g);
+                                if !p.held_by.contains(&g) {
+                                    rising.push(extra);
+                                }
+                            }
+                        }
+                        p.held_by = held_by;
+                        if !p.persistent {
+                            rising.truncate(1);
+                        }
+                        (!rising.is_empty()).then_some(rising)
                     }
                 };
                 match extra {
-                    Some(extra) => {
-                        fired.push((p.kind.clone(), p.callback.clone(), p.data.clone(), extra));
+                    Some(extras) => {
+                        for extra in extras {
+                            fired.push((p.kind.clone(), p.callback.clone(), p.data.clone(), extra));
+                        }
                         if p.persistent {
                             p.last = now;
                             keep.push(p);
@@ -283,12 +319,26 @@ fn fire(fired: Vec<Fired>) -> Vec<EventError> {
     errors
 }
 
-fn as_id(v: &Value) -> Option<u32> {
+/// A guid as scripts see it: userdata, as in the game (scripts check
+/// `type(target) == "userdata"`). Light userdata compares by value, so the
+/// same guid is equal to itself and works as a table key.
+pub fn guid_value(guid: u32) -> Value {
+    Value::LightUserData(mlua::LightUserData(guid as usize as *mut std::ffi::c_void))
+}
+
+/// The guid a script value names: guid userdata, or a number (scripts and
+/// tests write some guids as numbers).
+pub fn as_guid(v: &Value) -> Option<u32> {
     match v {
+        Value::LightUserData(p) => u32::try_from(p.0 as usize).ok(),
         Value::Integer(i) => u32::try_from(*i).ok(),
         Value::Number(n) if *n >= 0.0 => Some(*n as u32),
         _ => None,
     }
+}
+
+fn as_id(v: &Value) -> Option<u32> {
+    as_guid(v)
 }
 
 fn number(t: &Table, i: i64) -> Option<f64> {
@@ -309,6 +359,9 @@ enum Check {
     /// A condition: whether it holds, and the values to pass when it
     /// starts to.
     Holds(bool, Vec<Value>),
+    /// A condition on each of several objects (an object filter's): per
+    /// object, whether it holds and the values to pass.
+    Each(Vec<(u32, bool, Vec<Value>)>),
 }
 
 /// The objects a parameter names: a guid, `"hero"` (the player), or a
@@ -320,8 +373,43 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
             if s.eq_ignore_ascii_case("hero") {
                 world.player().into_iter().collect()
             } else {
-                world.labelled(&s)
+                let labelled = world.labelled(&s);
+                if labelled.is_empty() {
+                    world.named(&s).into_iter().collect()
+                } else {
+                    labelled
+                }
             }
+        }
+        // An object filter (see `api`): its objects, the player when it
+        // uses players, and objects with its label, less those excluded.
+        Ok(Value::Table(f)) => {
+            let mut out: Vec<u32> = f
+                .raw_get::<Option<Table>>("objs")
+                .ok()
+                .flatten()
+                .map(|t| {
+                    t.sequence_values::<Value>()
+                        .filter_map(|v| as_id(&v.ok()?))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if f.raw_get::<bool>("players").unwrap_or(false) {
+                out.extend(world.player());
+            }
+            if let Ok(Some(label)) = f.raw_get::<Option<String>>("label") {
+                out.extend(world.labelled(&label));
+            }
+            if let Ok(Some(ex)) = f.raw_get::<Option<Table>>("ex") {
+                let excluded: Vec<u32> = ex
+                    .pairs::<Value, Value>()
+                    .filter_map(|p| as_id(&p.ok()?.0))
+                    .collect();
+                out.retain(|g| !excluded.contains(g));
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
         }
         Ok(v) => as_id(&v).into_iter().collect(),
         Err(_) => Vec::new(),
@@ -339,7 +427,7 @@ fn text(t: &Table, i: i64) -> Option<String> {
 /// from the game's call sites.
 fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -> Check {
     let no = Check::Holds(false, Vec::new());
-    let id = |g: u32| Value::Number(f64::from(g));
+    let id = guid_value;
     match p.kind.as_str() {
         // { seconds }: that long after it was made (persistent: every
         // that long).
@@ -347,11 +435,15 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             Some(delay) if now - p.last >= delay => Check::Fire(Vec::new()),
             _ => no,
         },
-        // { object }: when it dies or is removed; passes the object.
-        "ObjectDeath" => match guid(&p.params, 1) {
-            Some(g) => Check::Holds(!world.is_alive(g), vec![id(g)]),
-            None => no,
-        },
+        // { object }: when it dies or is removed; passes the object. A
+        // filter or label names several, each firing as it dies (a
+        // Destroy objective counts its targets this way).
+        "ObjectDeath" => Check::Each(
+            objects(&p.params, 1, world)
+                .into_iter()
+                .map(|g| (g, !world.is_alive(g), vec![id(g)]))
+                .collect(),
+        ),
         // { a, b, "<" or ">", metres, ... }: when some a is within (or
         // beyond) the distance of some b; a and b are guids, "hero" or
         // labels. Passes the pair.
@@ -378,7 +470,9 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
         // seat type ("Gunner", "Any"; not told apart yet). Passes the
         // rider and vehicle.
         "ObjectInSeat" => {
-            let vehicle = guid(&p.params, 2);
+            // The vehicle may be named rather than a guid.
+            let vehicle =
+                guid(&p.params, 2).or_else(|| objects(&p.params, 2, world).first().copied());
             let exit = text(&p.params, 4).as_deref() == Some("exit");
             for r in objects(&p.params, 1, world) {
                 let seated = world
@@ -408,10 +502,12 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
         }
         // { object, boundary, "enter" or "exit" }.
         "Boundary" => {
-            let (Some(b), exit) = (
-                guid(&p.params, 2),
-                text(&p.params, 3).as_deref() == Some("exit"),
-            ) else {
+            // The boundary is a guid or the region's name.
+            let boundary = guid(&p.params, 2).or_else(|| match p.params.raw_get::<Value>(2) {
+                Ok(Value::String(s)) => world.named(&s.to_string_lossy()),
+                _ => None,
+            });
+            let (Some(b), exit) = (boundary, text(&p.params, 3).as_deref() == Some("exit")) else {
                 return no;
             };
             for o in objects(&p.params, 1, world) {
@@ -422,6 +518,25 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
                 }
             }
             no
+        }
+        // { cargo, carrier, "Attach" or "Detach" }: when the cargo is
+        // hooked onto (or let go from) a winch. Passes cargo and carrier.
+        "ObjectWinched" => {
+            let (Some(cargo), detach) = (
+                guid(&p.params, 1),
+                text(&p.params, 3).is_some_and(|t| t.eq_ignore_ascii_case("detach")),
+            ) else {
+                return no;
+            };
+            let carrier = guid(&p.params, 2);
+            let holds = match world.winch(cargo) {
+                Some(None) => detach,
+                Some(Some(c)) => !detach && carrier.is_none_or(|w| w == c),
+                None => false,
+            };
+            let mut extra = vec![id(cargo)];
+            extra.extend(carrier.map(id));
+            Check::Holds(holds, extra)
         }
         // { object, "awake" or "hibernate" }.
         "ObjectHibernation" => match guid(&p.params, 1) {
@@ -503,6 +618,16 @@ mod tests {
         let events = Events::default();
         events.install(host.lua()).unwrap();
         host.lua().load("log = {}").exec().unwrap();
+        // Guids reach callbacks as userdata; tests note them as numbers.
+        let gid = safe_function(host.lua(), |_, args| {
+            let v = args.front().cloned().unwrap_or(Value::Nil);
+            Ok(MultiValue::from_vec(vec![match as_guid(&v) {
+                Some(g) if matches!(v, Value::LightUserData(_)) => Value::Number(f64::from(g)),
+                _ => v,
+            }]))
+        })
+        .unwrap();
+        host.lua().globals().set("gid", gid).unwrap();
         (host, events)
     }
 
@@ -562,7 +687,11 @@ mod tests {
         host.lua()
             .load(
                 r#"
-                local function note(s) return function(...) table.insert(log, s .. table.concat({...}, ",")) end end
+                local function note(s) return function(...)
+                    local t = {}
+                    for i, v in ipairs({...}) do t[i] = tostring(gid(v)) end
+                    table.insert(log, s .. table.concat(t, ","))
+                end end
                 Event.Create(Event.ObjectDeath, { 7 }, note("dead "), { 7 })
                 Event.Create(Event.ObjectProximity, { "hero", 2, "<", 10, false, false }, note("near "), {})
                 Event.Create(Event.ObjectInSeat, { "hero", nil, "Any", "enter" }, note("seat "), {})
