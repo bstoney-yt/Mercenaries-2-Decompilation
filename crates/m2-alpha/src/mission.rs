@@ -28,6 +28,8 @@ use crate::game::Game;
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
+/// How close a blast destroys a target the scripts named (a gate), metres.
+const BLAST_REACH: f32 = 10.0;
 /// Seconds an objective message stays up.
 const MESSAGE_TIME: f32 = 6.0;
 
@@ -61,6 +63,8 @@ pub struct MissionLink {
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
+    /// Blasts since the scripts last ran.
+    blasts: Vec<Vec3>,
 }
 
 impl std::fmt::Debug for MissionLink {
@@ -107,6 +111,7 @@ impl MissionLink {
             log,
             message: None,
             ashore: 0,
+            blasts: Vec::new(),
         }
     }
 
@@ -144,6 +149,7 @@ impl MissionLink {
                 self.ashore = 0;
             }
         }
+        self.blasts.extend(game.combat.explosions());
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {
@@ -154,6 +160,28 @@ impl MissionLink {
             for guid in game.scene.people.all_killed() {
                 mission.kill(guid);
             }
+            // Targets to destroy: soldiers stand at those that are spawns,
+            // and blasts close to the rest (gates, buildings) destroy them.
+            let targets: Vec<(u32, Vec3)> = {
+                let w = mission.world().borrow();
+                w.hud
+                    .markers
+                    .values()
+                    .filter(|m| m.icon.contains("destroy"))
+                    .filter_map(|m| {
+                        let g = m.target?;
+                        let o = w.objects.get(&g).filter(|o| o.alive)?;
+                        Some((g, Vec3::from(o.position)))
+                    })
+                    .collect()
+            };
+            game.scene.people.mission_soldiers = targets.iter().map(|t| t.0).collect();
+            for (g, at) in &targets {
+                if self.blasts.iter().any(|b| b.distance(*at) <= BLAST_REACH) {
+                    mission.kill(*g);
+                }
+            }
+            self.blasts.clear();
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
