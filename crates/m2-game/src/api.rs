@@ -102,6 +102,11 @@ pub enum Command {
         seat: String,
         instant: bool,
     },
+    /// Hook cargo onto a carrier's winch, or let it go (`carrier` `None`).
+    Winch {
+        cargo: u32,
+        carrier: Option<u32>,
+    },
     /// Stream a layer in or out; report it done with
     /// [`crate::layers::finished`].
     Layer {
@@ -143,6 +148,8 @@ pub struct ScriptWorld {
     /// their number. The transit script reads kinds 1 and 2 (where each
     /// player lands) as tables keyed alike.
     pub landing_zones: HashMap<i64, BTreeMap<i64, u32>>,
+    /// Cargo on winches: what carries each, `None` once let go.
+    pub winch: HashMap<u32, Option<u32>>,
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
     /// name in lower case.
     templates: HashMap<String, u32>,
@@ -244,6 +251,9 @@ impl World for ScriptWorld {
             .map_or(o.position, |v| v.position);
         Some(region.contains([at.position[0], at.position[2]], at.yaw, p[0], p[2]))
     }
+    fn winch(&self, cargo: u32) -> Option<Option<u32>> {
+        self.winch.get(&cargo).copied()
+    }
     fn labelled(&self, label: &str) -> Vec<u32> {
         let mut out: Vec<u32> = self
             .objects
@@ -266,6 +276,41 @@ impl World for ScriptWorld {
 
 /// The world shared between the game and the script libraries.
 pub type Shared = Rc<RefCell<ScriptWorld>>;
+
+/// Reports that `guid` reached `at` (its AI goal's location): it, its
+/// vehicle and any cargo on that vehicle's winch are there, the cargo is
+/// let go (a delivery), and the goal's callbacks run. Returns any errors.
+pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
+    {
+        let mut w = world.borrow_mut();
+        let carrier = w.vehicle_of(guid).unwrap_or(guid);
+        let cargo: Vec<u32> = w
+            .winch
+            .iter()
+            .filter(|(_, c)| **c == Some(carrier))
+            .map(|(&g, _)| g)
+            .collect();
+        let riders: Vec<u32> = w
+            .objects
+            .iter()
+            .filter(|(_, o)| o.vehicle == Some(carrier))
+            .map(|(&g, _)| g)
+            .collect();
+        for g in [carrier]
+            .into_iter()
+            .chain(riders)
+            .chain(cargo.iter().copied())
+        {
+            if let Some(o) = w.objects.get_mut(&g) {
+                o.position = at;
+            }
+        }
+        for g in cargo {
+            w.winch.insert(g, None);
+        }
+    }
+    goal_finished(world, guid)
+}
 
 /// Calls the goal callbacks of `guid`'s finished AI goals, with their data
 /// unpacked. Returns any errors.
@@ -571,6 +616,31 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             None => Value::Nil,
         }])
     })?;
+    // Winches: cargo hangs under a helicopter until it is let go.
+    add(&object, "AttachCargoToWinch", |w, _, a| {
+        if let (Some(cargo), Some(carrier)) = (id(a.first()), id(a.get(1))) {
+            w.winch.insert(cargo, Some(carrier));
+            w.commands.push(Command::Winch {
+                cargo,
+                carrier: Some(carrier),
+            });
+        }
+        values([])
+    })?;
+    add(&object, "DetachCargoFromWinch", |w, _, a| {
+        if let Some(cargo) = id(a.first())
+            && w.winch.get(&cargo).is_some_and(Option::is_some)
+        {
+            w.winch.insert(cargo, None);
+            w.commands.push(Command::Winch {
+                cargo,
+                carrier: None,
+            });
+        }
+        values([])
+    })?;
+    // How far the winch is let out: the game's to animate.
+    add(&object, "SetWinchState", |_, _, _| values([]))?;
     // No string tables yet: an object's own name.
     add(&object, "GetLocalizedName", |w, lua, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
@@ -726,6 +796,25 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             goal,
             location,
             target,
+        });
+        values([])
+    })?;
+
+    // A pilot flies its vehicle, with any cargo on the winch, to a point
+    // and lets the cargo go there: pilot, x, y, z, then how it flies.
+    add(&ai, "Deliver", |w, _, a| {
+        let Some(guid) = id(a.first()) else {
+            return values([]);
+        };
+        let location = match (num(a.get(1)), num(a.get(2)), num(a.get(3))) {
+            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+            _ => None,
+        };
+        w.commands.push(Command::Goal {
+            guid,
+            goal: "Deliver".into(),
+            location,
+            target: None,
         });
         values([])
     })?;
@@ -1274,6 +1363,49 @@ mod tests {
             [Command::Spawn { what, position, .. }]
                 if what == "Supply Drop (GL)" && *position == [10.0, 0.0, 9.0]
         ));
+    }
+
+    #[test]
+    fn copters_deliver_winched_cargo() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.insert(80, Object::new("copter", [0.0, 100.0, 0.0]));
+            let mut pilot = Object::new("pilot", [0.0, 100.0, 0.0]);
+            pilot.vehicle = Some(80);
+            w.insert(81, pilot);
+            w.insert(82, Object::new("crate", [0.0, 95.0, 0.0]));
+        }
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                dropped = nil
+                local copter, crate = Sys.StringToGuid("80"), Sys.StringToGuid("82")
+                Object.AttachCargoToWinch(crate, copter)
+                Ai.Deliver(Vehicle.GetDriver(copter) or Sys.StringToGuid("81"), 50, 0, 60, 0.5)
+                Event.Create(Event.ObjectWinched, {crate, copter, "Detach"}, function(c)
+                    dropped = Sys.GuidToString(c)
+                    Object.DetachCargoFromWinch(c, copter)
+                end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        events.update_shared(0.1, &world);
+        let dropped: Option<String> = host.lua().globals().get("dropped").unwrap();
+        assert_eq!(dropped, None);
+        let commands = world.borrow_mut().take_commands();
+        assert!(matches!(
+            commands.last(),
+            Some(Command::Goal { guid: 81, location: Some(at), .. }) if *at == [50.0, 0.0, 60.0]
+        ));
+        assert!(arrived(&world, 81, [50.0, 0.0, 60.0]).is_empty());
+        assert_eq!(world.borrow().objects[&82].position, [50.0, 0.0, 60.0]);
+        events.update_shared(0.1, &world);
+        let dropped: String = host.lua().globals().get("dropped").unwrap();
+        assert_eq!(dropped, "82");
     }
 
     #[test]

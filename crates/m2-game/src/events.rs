@@ -55,10 +55,15 @@ pub trait World {
     fn named(&self, _name: &str) -> Option<u32> {
         None
     }
+    /// Cargo on a winch: `None` if it never was, else what carries it now
+    /// (`None` once let go).
+    fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
+        None
+    }
 }
 
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 13] = [
+pub const KINDS: [&str; 14] = [
     "TimerRelative",
     "ObjectHibernation",
     "Boundary",
@@ -72,6 +77,7 @@ pub const KINDS: [&str; 13] = [
     "TimerAbsolute",
     "ObjectDamage",
     "GameStateChange",
+    "ObjectWinched",
 ];
 
 #[derive(Debug)]
@@ -512,6 +518,25 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
                 }
             }
             no
+        }
+        // { cargo, carrier, "Attach" or "Detach" }: when the cargo is
+        // hooked onto (or let go from) a winch. Passes cargo and carrier.
+        "ObjectWinched" => {
+            let (Some(cargo), detach) = (
+                guid(&p.params, 1),
+                text(&p.params, 3).is_some_and(|t| t.eq_ignore_ascii_case("detach")),
+            ) else {
+                return no;
+            };
+            let carrier = guid(&p.params, 2);
+            let holds = match world.winch(cargo) {
+                Some(None) => detach,
+                Some(Some(c)) => !detach && carrier.is_none_or(|w| w == c),
+                None => false,
+            };
+            let mut extra = vec![id(cargo)];
+            extra.extend(carrier.map(id));
+            Check::Holds(holds, extra)
         }
         // { object, "awake" or "hibernate" }.
         "ObjectHibernation" => match guid(&p.params, 1) {
