@@ -83,6 +83,8 @@ pub enum Constant {
 pub struct Function {
     pub source: Option<String>,
     pub line_defined: i32,
+    /// Lua 5.1 only (0 in 5.0 chunks).
+    pub last_line_defined: i32,
     pub upvalue_count: u8,
     pub param_count: u8,
     pub is_vararg: u8,
@@ -326,9 +328,11 @@ impl Parser<'_, '_> {
         }
         let source = self.string()?;
         let line_defined = self.int()?;
-        if self.layout.version == Version::Lua51 {
-            let _last_line = self.int()?;
-        }
+        let last_line_defined = if self.layout.version == Version::Lua51 {
+            self.int()?
+        } else {
+            0
+        };
         let upvalue_count = self.r.u8()?;
         let param_count = self.r.u8()?;
         let is_vararg = self.r.u8()?;
@@ -336,6 +340,7 @@ impl Parser<'_, '_> {
         let mut f = Function {
             source,
             line_defined,
+            last_line_defined,
             upvalue_count,
             param_count,
             is_vararg,
@@ -473,6 +478,300 @@ impl Function {
     }
 }
 
+/// Lua 5.1 opcode names, by number.
+const OPCODES_51: [&str; 38] = [
+    "MOVE",
+    "LOADK",
+    "LOADBOOL",
+    "LOADNIL",
+    "GETUPVAL",
+    "GETGLOBAL",
+    "GETTABLE",
+    "SETGLOBAL",
+    "SETUPVAL",
+    "SETTABLE",
+    "NEWTABLE",
+    "SELF",
+    "ADD",
+    "SUB",
+    "MUL",
+    "DIV",
+    "MOD",
+    "POW",
+    "UNM",
+    "NOT",
+    "LEN",
+    "CONCAT",
+    "JMP",
+    "EQ",
+    "LT",
+    "LE",
+    "TEST",
+    "TESTSET",
+    "CALL",
+    "TAILCALL",
+    "RETURN",
+    "FORLOOP",
+    "FORPREP",
+    "TFORLOOP",
+    "SETLIST",
+    "CLOSE",
+    "CLOSURE",
+    "VARARG",
+];
+
+/// One Lua 5.1 instruction's fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Instruction {
+    pub op: u8,
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    pub bx: u32,
+}
+
+impl Instruction {
+    /// Splits a Lua 5.1 instruction: B:9 C:9 A:8 above a 6-bit opcode.
+    pub fn decode51(i: u32) -> Self {
+        Self {
+            op: (i & 0x3f) as u8,
+            a: (i >> 6) & 0xff,
+            b: (i >> 23) & 0x1ff,
+            c: (i >> 14) & 0x1ff,
+            bx: i >> 14,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        OPCODES_51.get(usize::from(self.op)).copied().unwrap_or("?")
+    }
+
+    /// The signed jump offset of `JMP`, `FORLOOP` and `FORPREP`.
+    pub fn sbx(&self) -> i32 {
+        self.bx as i32 - 131_071
+    }
+}
+
+/// A call whose callee is a global or a global's member, from
+/// [`Function::calls`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Call {
+    /// `"import"`, `"Pg.GetGuidByName"`, ...
+    pub callee: String,
+    /// The first argument when it is a string constant.
+    pub first: Option<String>,
+}
+
+impl Function {
+    fn constant_text(&self, index: usize) -> String {
+        match self.constants.get(index) {
+            Some(Constant::String(s)) => format!("{s:?}"),
+            Some(Constant::Number(n)) => n.to_string(),
+            Some(Constant::Bool(b)) => b.to_string(),
+            Some(Constant::Nil) => "nil".into(),
+            None => format!("K{index}?"),
+        }
+    }
+
+    /// A Lua 5.1 listing of this function and its nested ones, one
+    /// instruction per line with constants spelled out, for reading a
+    /// script's control flow locally.
+    pub fn listing(&self) -> String {
+        let mut out = String::new();
+        self.list_into(&mut out, "main");
+        out
+    }
+
+    fn list_into(&self, out: &mut String, path: &str) {
+        use std::fmt::Write;
+        let _ = writeln!(
+            out,
+            "function {path} (line {}, {} params{}, {} upvalues, {} constants)",
+            self.line_defined,
+            self.param_count,
+            if self.is_vararg != 0 { ", vararg" } else { "" },
+            self.upvalue_count,
+            self.constants.len()
+        );
+        let rk = |x: u32| {
+            if x & 0x100 != 0 {
+                self.constant_text((x & 0xff) as usize)
+            } else {
+                format!("R{x}")
+            }
+        };
+        for (pc, &word) in self.code.iter().enumerate() {
+            let i = Instruction::decode51(word);
+            let args = match i.op {
+                1 | 5 | 7 => format!("R{} {}", i.a, self.constant_text(i.bx as usize)),
+                36 => format!("R{} F{}", i.a, i.bx),
+                22 | 31 | 32 => format!("{} -> {}", i.sbx(), pc as i32 + 1 + i.sbx()),
+                6 | 11 => format!("R{} R{} {}", i.a, i.b, rk(i.c)),
+                9 | 12..=17 | 23..=25 => format!("R{} {} {}", i.a, rk(i.b), rk(i.c)),
+                _ => format!("R{} {} {}", i.a, i.b, i.c),
+            };
+            let line = self
+                .lines
+                .get(pc)
+                .map_or(String::new(), |l| format!(" ; line {l}"));
+            let _ = writeln!(out, "  {pc:4} {:<9} {args}{line}", i.name());
+        }
+        for (n, f) in self.functions.iter().enumerate() {
+            f.list_into(out, &format!("{path}.F{n}"));
+        }
+    }
+
+    /// Calls in this function and its nested ones (Lua 5.1) whose callee
+    /// is a global or a global's constant member, with the first argument
+    /// when it is a string constant: `import("...")`,
+    /// `Pg.GetGuidByName("...")`. Registers are followed in straight-line
+    /// order only, so a value set on another branch can be misread; this
+    /// is for inventories, not for running anything.
+    pub fn calls(&self) -> Vec<Call> {
+        #[derive(Clone)]
+        enum Held<'f> {
+            Global(String),
+            Str(&'f str),
+        }
+        let mut out = Vec::new();
+        for f in self.all() {
+            let mut held: Vec<Option<Held<'_>>> = vec![None; 256];
+            for &word in &f.code {
+                let i = Instruction::decode51(word);
+                let a = i.a as usize;
+                let value = match i.op {
+                    // GETGLOBAL
+                    5 => f
+                        .constant_name(i.bx as usize)
+                        .map(|n| Held::Global(n.to_owned())),
+                    // LOADK
+                    1 => f.constant_name(i.bx as usize).map(Held::Str),
+                    // GETTABLE on a held global with a constant key.
+                    6 => match (held.get(i.b as usize), i.c & 0x100 != 0) {
+                        (Some(Some(Held::Global(g))), true) => f
+                            .constant_name((i.c & 0xff) as usize)
+                            .map(|k| Held::Global(format!("{g}.{k}"))),
+                        _ => None,
+                    },
+                    // MOVE
+                    0 => held.get(i.b as usize).cloned().flatten(),
+                    // CALL / TAILCALL
+                    28 | 29 => {
+                        if let Some(Some(Held::Global(g))) = held.get(a) {
+                            let first = match held.get(a + 1) {
+                                Some(Some(Held::Str(s))) if i.b != 1 => Some((*s).to_owned()),
+                                _ => None,
+                            };
+                            out.push(Call {
+                                callee: g.clone(),
+                                first,
+                            });
+                        }
+                        None
+                    }
+                    _ => None,
+                };
+                // SETGLOBAL, SETTABLE, SETUPVAL, comparisons, tests, jumps,
+                // RETURN and SETLIST don't write register A.
+                if !matches!(i.op, 7 | 8 | 9 | 22..=27 | 30 | 34 | 35)
+                    && let Some(r) = held.get_mut(a)
+                {
+                    *r = value;
+                }
+            }
+        }
+        out
+    }
+}
+
+impl Chunk {
+    /// The chunk rewritten as a stock Lua 5.1 loader on this machine
+    /// expects it: little-endian, `int` of 4 bytes, `size_t` of the host's
+    /// pointer size, 8-byte double numbers. Line numbers and upvalue names
+    /// are kept, local variable names are dropped. `source` names the
+    /// chunk in error messages. `None` for a Lua 5.0 chunk.
+    pub fn to_host_lua51(&self, source: &str) -> Option<Vec<u8>> {
+        if self.version != Version::Lua51 {
+            return None;
+        }
+        let size_t = std::mem::size_of::<usize>() as u8;
+        let mut out = b"\x1bLua\x51\x00\x01\x04".to_vec();
+        out.extend([size_t, 4, 8, 0]);
+        write_function(&mut out, &self.main, Some(source));
+        Some(out)
+    }
+}
+
+fn write_int(out: &mut Vec<u8>, v: i32) {
+    out.extend(v.to_le_bytes());
+}
+
+fn write_size(out: &mut Vec<u8>, v: usize) {
+    out.extend(&v.to_le_bytes()[..std::mem::size_of::<usize>()]);
+}
+
+fn write_string(out: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        None => write_size(out, 0),
+        Some(s) => {
+            write_size(out, s.len() + 1);
+            out.extend(s.as_bytes());
+            out.push(0);
+        }
+    }
+}
+
+fn write_function(out: &mut Vec<u8>, f: &Function, source: Option<&str>) {
+    write_string(out, source);
+    write_int(out, f.line_defined);
+    write_int(out, f.last_line_defined);
+    out.extend([f.upvalue_count, f.param_count, f.is_vararg, f.max_stack]);
+    write_int(out, f.code.len() as i32);
+    for &i in &f.code {
+        out.extend(i.to_le_bytes());
+    }
+    write_int(out, f.constants.len() as i32);
+    for c in &f.constants {
+        match c {
+            Constant::Nil => out.push(0),
+            Constant::Bool(b) => out.extend([1, u8::from(*b)]),
+            Constant::Number(n) => {
+                out.push(3);
+                out.extend(n.to_le_bytes());
+            }
+            Constant::String(s) => {
+                out.push(4);
+                write_string(out, Some(s));
+            }
+        }
+    }
+    write_int(out, f.functions.len() as i32);
+    for p in &f.functions {
+        write_function(out, p, None);
+    }
+    // Line info must cover every instruction or be absent.
+    let lines: &[i32] = if f.lines.len() == f.code.len() {
+        &f.lines
+    } else {
+        &[]
+    };
+    write_int(out, lines.len() as i32);
+    for &l in lines {
+        write_int(out, l);
+    }
+    write_int(out, 0);
+    // Upvalue names must match the count or be absent.
+    let names: &[String] = if f.upvalues.len() == usize::from(f.upvalue_count) {
+        &f.upvalues
+    } else {
+        &[]
+    };
+    write_int(out, names.len() as i32);
+    for n in names {
+        write_string(out, Some(n));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +811,33 @@ mod tests {
                 "{want:?} in {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn lists_calls_with_their_string_arguments() {
+        let chunk = Chunk::parse(LUA51).unwrap();
+        let calls = chunk.main.calls();
+        assert!(calls.contains(&Call {
+            callee: "Objective_Add".into(),
+            first: Some("Destroy the depot".into()),
+        }));
+        assert!(calls.contains(&Call {
+            callee: "Hud.Show".into(),
+            first: Some("timer".into()),
+        }));
+        let listing = chunk.main.listing();
+        assert!(listing.contains("GETGLOBAL"), "{listing}");
+        assert!(listing.contains("\"Destroy the depot\""), "{listing}");
+    }
+
+    #[test]
+    fn rewrites_for_the_host_and_reads_back() {
+        let chunk = Chunk::parse(LUA51).unwrap();
+        let host = chunk.to_host_lua51("=mission").unwrap();
+        let back = Chunk::parse(&host).unwrap();
+        assert_eq!(back.main.functions, chunk.main.functions);
+        assert_eq!(back.main.code, chunk.main.code);
+        assert_eq!(back.main.source.as_deref(), Some("=mission"));
     }
 
     #[test]
