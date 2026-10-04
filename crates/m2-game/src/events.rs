@@ -32,6 +32,17 @@ pub trait World {
     fn is_alive(&self, guid: u32) -> bool;
     /// The vehicle an object rides in, if any.
     fn vehicle_of(&self, guid: u32) -> Option<u32>;
+    /// The player's character (scripts write it `"hero"`).
+    fn player(&self) -> Option<u32>;
+    /// Whether an object is simulated near the player rather than
+    /// hibernating far away.
+    fn is_awake(&self, guid: u32) -> bool;
+    /// Whether an object is inside a boundary object's area; `None` when
+    /// the boundary's shape isn't known.
+    fn inside(&self, guid: u32, boundary: u32) -> Option<bool>;
+    /// Objects carrying a label (`"Prisoner"`), for parameters that name
+    /// a kind of object rather than one.
+    fn labelled(&self, label: &str) -> Vec<u32>;
 }
 
 /// The kinds the scripts use, by how often.
@@ -60,6 +71,9 @@ struct Pending {
     persistent: bool,
     /// For persistent timers: when it last fired.
     last: f64,
+    /// For conditions: whether it held at the last check, so persistent
+    /// events fire as it starts to hold, not every frame.
+    held: bool,
 }
 
 #[derive(Debug, Default)]
@@ -132,6 +146,7 @@ impl Events {
                         data,
                         persistent,
                         last: now,
+                        held: false,
                     });
                     Ok(MultiValue::from_vec(vec![Value::Integer(i64::from(id))]))
                 })?,
@@ -162,6 +177,14 @@ impl Events {
                 Ok(MultiValue::new())
             })?,
         )?;
+        // Kinds not listed (`Event.Minigame`) read as their own name, so
+        // events of them can be made and simply never fire.
+        let meta = lua.create_table()?;
+        meta.set(
+            "__index",
+            lua.create_function(|_, (_, k): (Value, Value)| Ok(k))?,
+        )?;
+        event.set_metatable(Some(meta))?;
         lua.globals().set("Event", event)?;
         Ok(())
     }
@@ -197,7 +220,15 @@ impl Events {
             let mut fired = Vec::new();
             let mut keep = Vec::with_capacity(s.pending.len());
             for mut p in std::mem::take(&mut s.pending) {
-                let extra = fires(&p, now, &posted, world);
+                let extra = match check(&p, now, &posted, world) {
+                    Check::Fire(extra) => Some(extra),
+                    // Fires as the condition starts to hold.
+                    Check::Holds(holds, extra) => {
+                        let rising = holds && !p.held;
+                        p.held = holds;
+                        rising.then_some(extra)
+                    }
+                };
                 match extra {
                     Some(extra) => {
                         fired.push((p.kind.clone(), p.callback.clone(), p.data.clone(), extra));
@@ -245,48 +276,132 @@ fn guid(t: &Table, i: i64) -> Option<u32> {
     as_id(&t.raw_get::<Value>(i).ok()?)
 }
 
-/// Whether `p` fires now; `Some` with any values the callback gets after
-/// its data.
-fn fires(
-    p: &Pending,
-    now: f64,
-    posted: &[(String, Value)],
-    world: &dyn World,
-) -> Option<Vec<Value>> {
-    match p.kind.as_str() {
-        // { seconds }: once that long after it was made (or, persistent,
-        // every that long).
-        "TimerRelative" => {
-            let delay = number(&p.params, 1)?;
-            (now - p.last >= delay).then(Vec::new)
+enum Check {
+    /// Fire now with these values after the callback's data.
+    Fire(Vec<Value>),
+    /// A condition: whether it holds, and the values to pass when it
+    /// starts to.
+    Holds(bool, Vec<Value>),
+}
+
+/// The objects a parameter names: a guid, `"hero"` (the player), or a
+/// label. Anything else (an object filter) names none yet.
+fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
+    match t.raw_get::<Value>(i) {
+        Ok(Value::String(s)) => {
+            let s = s.to_string_lossy();
+            if s.eq_ignore_ascii_case("hero") {
+                world.player().into_iter().collect()
+            } else {
+                world.labelled(&s)
+            }
         }
-        // { object }: when it dies or is removed.
-        "ObjectDeath" => {
-            let g = guid(&p.params, 1)?;
-            (!world.is_alive(g)).then(Vec::new)
-        }
-        // { object, other, radius }: when the two are within the radius.
-        "ObjectProximity" => {
-            let a = world.position(guid(&p.params, 1)?)?;
-            let b = world.position(guid(&p.params, 2)?)?;
-            let r = number(&p.params, 3)?;
-            let d2: f32 = (0..3).map(|i| (a[i] - b[i]).powi(2)).sum();
-            (f64::from(d2) <= r * r).then(Vec::new)
-        }
-        // { rider }: when it is in a vehicle.
-        "ObjectInSeat" => {
-            let v = world.vehicle_of(guid(&p.params, 1)?)?;
-            Some(vec![Value::Integer(i64::from(v))])
-        }
-        // { name }: when something posts that name; the posted data
-        // follows the callback's own.
-        "ScriptEvent" => {
-            let name: String = p.params.raw_get(1).ok()?;
-            let (_, data) = posted.iter().find(|(n, _)| *n == name)?;
-            Some(vec![data.clone()])
-        }
-        // Not simulated yet: never fire.
+        Ok(v) => as_id(&v).into_iter().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn text(t: &Table, i: i64) -> Option<String> {
+    match t.raw_get::<Value>(i).ok()? {
+        Value::String(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
         _ => None,
+    }
+}
+
+/// Checks `p` against the world. Readings of each kind's parameters come
+/// from the game's call sites.
+fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -> Check {
+    let no = Check::Holds(false, Vec::new());
+    let id = |g: u32| Value::Integer(i64::from(g));
+    match p.kind.as_str() {
+        // { seconds }: that long after it was made (persistent: every
+        // that long).
+        "TimerRelative" => match number(&p.params, 1) {
+            Some(delay) if now - p.last >= delay => Check::Fire(Vec::new()),
+            _ => no,
+        },
+        // { object }: when it dies or is removed; passes the object.
+        "ObjectDeath" => match guid(&p.params, 1) {
+            Some(g) => Check::Holds(!world.is_alive(g), vec![id(g)]),
+            None => no,
+        },
+        // { a, b, "<" or ">", metres, ... }: when some a is within (or
+        // beyond) the distance of some b; a and b are guids, "hero" or
+        // labels. Passes the pair.
+        "ObjectProximity" => {
+            let r = number(&p.params, 4).unwrap_or(0.0);
+            let beyond = text(&p.params, 3).as_deref() == Some(">");
+            let (aa, bb) = (objects(&p.params, 1, world), objects(&p.params, 2, world));
+            for &a in &aa {
+                for &b in &bb {
+                    let (Some(pa), Some(pb)) = (world.position(a), world.position(b)) else {
+                        continue;
+                    };
+                    let d2: f32 = (0..3).map(|i| (pa[i] - pb[i]).powi(2)).sum();
+                    let within = f64::from(d2) <= r * r;
+                    if within != beyond {
+                        return Check::Holds(true, vec![id(a), id(b)]);
+                    }
+                }
+            }
+            no
+        }
+        // { rider, vehicle, seat, "enter" or "exit" }: rider is a guid,
+        // "hero" or a label, vehicle a guid (or anything for any), seat a
+        // seat type ("Gunner", "Any"; not told apart yet). Passes the
+        // rider and vehicle.
+        "ObjectInSeat" => {
+            let vehicle = guid(&p.params, 2);
+            let exit = text(&p.params, 4).as_deref() == Some("exit");
+            for r in objects(&p.params, 1, world) {
+                let seated = world
+                    .vehicle_of(r)
+                    .filter(|v| vehicle.is_none_or(|want| want == *v));
+                if seated.is_some() != exit {
+                    let v = seated.or(vehicle).unwrap_or(0);
+                    return Check::Holds(true, vec![id(r), id(v)]);
+                }
+            }
+            no
+        }
+        // { object, boundary, "enter" or "exit" }.
+        "Boundary" => {
+            let (Some(b), exit) = (
+                guid(&p.params, 2),
+                text(&p.params, 3).as_deref() == Some("exit"),
+            ) else {
+                return no;
+            };
+            for o in objects(&p.params, 1, world) {
+                if let Some(inside) = world.inside(o, b)
+                    && inside != exit
+                {
+                    return Check::Holds(true, vec![id(o), id(b)]);
+                }
+            }
+            no
+        }
+        // { object, "awake" or "hibernate" }.
+        "ObjectHibernation" => match guid(&p.params, 1) {
+            Some(g) => {
+                let want_awake = text(&p.params, 2).as_deref() != Some("hibernate");
+                Check::Holds(world.is_awake(g) == want_awake, vec![id(g)])
+            }
+            None => no,
+        },
+        // { name, ... }: when something posts that name; passes the
+        // posted data.
+        "ScriptEvent" => {
+            let Ok(name) = p.params.raw_get::<String>(1) else {
+                return no;
+            };
+            match posted.iter().find(|(n, _)| *n == name) {
+                Some((_, data)) => Check::Fire(vec![data.clone()]),
+                None => no,
+            }
+        }
+        // Not simulated yet: never fires.
+        _ => no,
     }
 }
 
@@ -322,6 +437,22 @@ mod tests {
         }
         fn vehicle_of(&self, guid: u32) -> Option<u32> {
             self.seats.get(&guid).copied()
+        }
+        fn player(&self) -> Option<u32> {
+            Some(1)
+        }
+        fn is_awake(&self, guid: u32) -> bool {
+            self.positions.contains_key(&guid)
+        }
+        fn inside(&self, _: u32, _: u32) -> Option<bool> {
+            None
+        }
+        fn labelled(&self, label: &str) -> Vec<u32> {
+            if label == "Prisoner" {
+                vec![2]
+            } else {
+                Vec::new()
+            }
         }
     }
 
@@ -391,8 +522,9 @@ mod tests {
                 r#"
                 local function note(s) return function(...) table.insert(log, s .. table.concat({...}, ",")) end end
                 Event.Create(Event.ObjectDeath, { 7 }, note("dead "), { 7 })
-                Event.Create(Event.ObjectProximity, { 1, 2, 10 }, note("near "), {})
-                Event.Create(Event.ObjectInSeat, { 1 }, note("seat "), {})
+                Event.Create(Event.ObjectProximity, { "hero", 2, "<", 10, false, false }, note("near "), {})
+                Event.Create(Event.ObjectInSeat, { "hero", nil, "Any", "enter" }, note("seat "), {})
+                Event.Create(Event.ObjectHibernation, { 3, "awake" }, note("awake "), {})
                 Event.Create(Event.ScriptEvent, { "Go" }, note("posted "), { "x" })
                 "#,
             )
@@ -405,13 +537,47 @@ mod tests {
         assert!(log(&host).is_empty());
         world.dead.push(7);
         world.positions.insert(2, [5.0, 0.0, 0.0]);
+        world.positions.insert(3, [0.0, 0.0, 0.0]);
         world.seats.insert(1, 99);
         host.lua().load("Event.Post('Go', 'y')").exec().unwrap();
         events.update(0.1, &world);
         let mut got = log(&host);
         got.sort();
-        assert_eq!(got, ["dead 7", "near ", "posted x,y", "seat 99"]);
+        assert_eq!(
+            got,
+            ["awake 3", "dead 7,7", "near 1,2", "posted x,y", "seat 1,99"]
+        );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn persistent_conditions_fire_as_they_start_to_hold() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.ObjectProximity, { 'Prisoner', 'hero', '>', 50 }, \
+                 function() table.insert(log, 'far') end)",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        world.positions.insert(1, [0.0, 0.0, 0.0]);
+        world.positions.insert(2, [100.0, 0.0, 0.0]);
+        events.update(0.1, &world);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["far"]);
+        world.positions.insert(2, [10.0, 0.0, 0.0]);
+        events.update(0.1, &world);
+        world.positions.insert(2, [60.0, 0.0, 0.0]);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["far", "far"]);
+        // Unknown kinds can be made and never fire.
+        host.lua()
+            .load("Event.Create(Event.Minigame, {}, function() table.insert(log, 'x') end)")
+            .exec()
+            .unwrap();
+        events.update(0.1, &world);
+        assert_eq!(log(&host).len(), 2);
     }
 
     #[test]
