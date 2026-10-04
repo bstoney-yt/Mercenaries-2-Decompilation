@@ -48,6 +48,8 @@ struct Material {
     ground: vec4<f32>,
     // Per ground layer, u then v as rows over world-space (x, y, z, 1).
     layer_uv: array<vec4<f32>, 8>,
+    // rgb: emitted colour (0: none), w: scaled by the specular map's texel
+    emissive: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -172,6 +174,12 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     if ao {
         rgb = rgb * v.color.rgb;
     }
+    // Light the surface gives off, on top of what it reflects.
+    var glow = material.emissive.rgb;
+    if material.emissive.w > 0.5 {
+        glow = glow * spec_texel;
+    }
+    rgb = rgb + glow;
     if material.params.w > 0.5 && frame.sky.a > 0.0 {
         let f = exp(-frame.sky.a * dist);
         rgb = mix(frame.sky.rgb, rgb, f);

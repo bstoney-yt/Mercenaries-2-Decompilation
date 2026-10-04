@@ -198,6 +198,8 @@ struct MaterialUniforms {
     ground: [f32; 4],
     /// Per ground layer, the u row then the v row (world space).
     layer_uv: [[f32; 4]; 8],
+    /// rgb: emitted colour (0: none), w: from the specular map's slot.
+    emissive: [f32; 4],
 }
 
 /// Texture views a material binds besides its uniforms.
@@ -727,6 +729,10 @@ impl WgpuBackend {
                     }
                 }
                 rows
+            },
+            emissive: match desc.emissive {
+                Some(e) => [e.color[0], e.color[1], e.color[2], flag(e.map.is_some())],
+                None => [0.0; 4],
             },
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1341,7 +1347,11 @@ impl RenderBackend for WgpuBackend {
         let views = MaterialViews {
             base: view(desc.texture)?,
             detail: view(desc.detail.map(|d| d.texture))?,
-            specular: view(desc.specular.and_then(|s| s.map))?,
+            specular: view(
+                desc.specular
+                    .and_then(|s| s.map)
+                    .or(desc.emissive.and_then(|e| e.map)),
+            )?,
             normal: view(desc.normal_map.map(|n| n.texture))?,
             layers: [
                 view(desc.layers[0].map(|l| l.texture))?,

@@ -176,6 +176,19 @@ pub struct MaterialDesc {
     pub direct: [f32; 3],
     /// Linear RGB scale of the ambient light a lit surface takes.
     pub ambient: [f32; 3],
+    /// Light the surface gives off itself (lamps, screens), added after
+    /// lighting.
+    pub emissive: Option<Emissive>,
+}
+
+/// Light a surface gives off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Emissive {
+    /// Linear RGB scale.
+    pub color: [f32; 3],
+    /// Per-texel colour, sampled with the base map's coordinates; takes
+    /// the specular map's place, so a material has one or the other.
+    pub map: Option<TextureHandle>,
 }
 
 /// Specular highlights (Blinn-Phong).
@@ -235,6 +248,7 @@ impl Default for MaterialDesc {
             ground: false,
             direct: [1.0; 3],
             ambient: [1.0; 3],
+            emissive: None,
         }
     }
 }
