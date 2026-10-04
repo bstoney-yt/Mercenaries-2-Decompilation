@@ -43,6 +43,12 @@
 //! collision:<model>[,..]    a model's collision: each PHY2 shape (kind,
 //!                           node, radius, box in model space, sizes), or
 //!                           the visible geometry it falls back to
+//! vehicle:<word|model>[,..] vehicles whose label holds a word: what the
+//!                           alpha makes of them (wheels, tracked, turret),
+//!                           and every node with its geometry box and how
+//!                           it fares in the wheel tests
+//! templates:<word>[,..]     templates whose name holds a word, with their
+//!                           components' fields (text fields not read)
 //! find:<hash>[,..]          names for hashes
 //! ```
 //!
@@ -57,7 +63,7 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use m2_assets::animation::ANIMATION_TYPE;
-use m2_assets::layer::{LAYER_TYPE, STRING_FIELD};
+use m2_assets::layer::{LAYER_TYPE, STRING_FIELD, TEMPLATE_DB_TYPE};
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::scatter::SCATTER_TYPE;
 use m2_assets::sound::SOUND_BANK_TYPE;
@@ -67,7 +73,7 @@ use m2_assets::{BlockContents, Clip, Layer, Model, Scatter, SoundBank, TerrainCe
 use m2_engine::anim::{BoundClip, Skeleton};
 use m2_engine::assets::TEXTURE_TYPE;
 use m2_engine::audio::SoundLibrary;
-use m2_engine::vehicle::{Catalogue, catalogue};
+use m2_engine::vehicle::{Catalogue, CatalogueEntry, VehicleSpec, catalogue};
 use m2_engine::{AssetSource, Install, Voices, WorldIndex};
 use m2_math::glam::Vec3;
 
@@ -611,6 +617,8 @@ fn main() -> Result<(), Error> {
                 )
             }
             "collision" => collision(&mut source, &names, arg),
+            "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
+            "templates" => templates(&mut source, &names, arg),
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -1688,6 +1696,201 @@ fn collision<R: Read + Seek>(
 
 /// Every layer entity `keep` (layer, entity name, place) keeps, with its
 /// components' fields, at most `most` per layer, ordered by `order`.
+/// Vehicles whose label (or kind) holds one of the words, or of a model
+/// hash: the spec the alpha builds, the wheels found, then every node with
+/// its own geometry's box and the wheel tests (`d` the box's larger side
+/// seen from the side; round, thin, grounded; `off` how far the box's
+/// middle is from the node's origin).
+fn vehicles<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    lazy: &mut Lazy,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let list: Vec<CatalogueEntry> = lazy
+        .catalogue(source)?
+        .vehicles
+        .iter()
+        .filter(|v| {
+            words.iter().any(|w| {
+                v.label.contains(w.as_str())
+                    || v.kind == *w
+                    || (w.len() == 8 && hex(w) == Some(v.model))
+            })
+        })
+        .cloned()
+        .collect();
+    println!("{} vehicles", list.len());
+    let v3 = |v: Vec3| format!("({:.3} {:.3} {:.3})", v.x, v.y, v.z);
+    let a3 = |v: [f32; 3]| format!("({:.3} {:.3} {:.3})", v[0], v[1], v[2]);
+    for e in list.iter().take(12) {
+        let data = source.model(e.model)?;
+        let m = data.parse()?;
+        let b = &m.info.bounds;
+        println!();
+        println!(
+            "{:08x} {} {}: {} nodes, bounds {} to {}",
+            e.model,
+            e.kind,
+            e.label,
+            m.nodes.len(),
+            a3(b.min),
+            a3(b.max)
+        );
+        match VehicleSpec::from_model(e, &m) {
+            None => println!("  spec: none (no wheels found)"),
+            Some(spec) => {
+                println!(
+                    "  spec: {} wheels, tracked {}, {} road wheels, pivot {}, muzzle {}, seat {}, door {}",
+                    spec.wheels.len(),
+                    spec.tracked,
+                    spec.road_wheels.len(),
+                    spec.pivot.map_or("-".to_owned(), v3),
+                    spec.muzzle.map_or("-".to_owned(), v3),
+                    spec.seat.map_or("-".to_owned(), v3),
+                    spec.door.map_or("-".to_owned(), v3),
+                );
+                for (i, w) in spec.wheels.iter().enumerate() {
+                    println!(
+                        "    wheel {i}: centre {} radius {:.3} width {:.3} steers {}",
+                        v3(w.centre),
+                        w.radius,
+                        w.width,
+                        w.steers
+                    );
+                }
+            }
+        }
+        let found = m2_assets::vehicle::find_wheels(&m);
+        println!("  found wheels: {}", found.len());
+        for w in &found {
+            println!(
+                "    nodes {:?} centre {} radius {:.3} width {:.3}",
+                w.nodes,
+                a3(w.centre),
+                w.radius,
+                w.width
+            );
+        }
+        let boxes = m2_assets::vehicle::node_boxes(&m);
+        let floor = boxes.iter().map(|b| b.min[1]).fold(f32::INFINITY, f32::min);
+        println!("  floor {floor:.3}, {} nodes with geometry", boxes.len());
+        let hashes: Vec<u32> = m.nodes.iter().map(|n| n.name_hash).collect();
+        let named = node_names(names, &hashes);
+        for (i, n) in m.nodes.iter().enumerate() {
+            let at = m
+                .node_to_model(i as u16)
+                .map_or(Vec3::ZERO, |t| t.w_axis.truncate());
+            let mut line = format!(
+                "  {i:3} {:08x} parent {:>3} at {}",
+                n.name_hash,
+                n.parent.map_or("-".to_owned(), |p| p.to_string()),
+                v3(at)
+            );
+            if let Some(bx) = boxes.iter().find(|bx| usize::from(bx.node) == i) {
+                let sz = [0, 1, 2].map(|a| bx.max[a] - bx.min[a]);
+                let d = sz[1].max(sz[2]);
+                let round = (sz[1] - sz[2]).abs() <= 0.15 * d;
+                let thin = sz[0] <= 0.85 * d && sz[0] >= 0.03;
+                let grounded = bx.min[1] <= floor + 0.1 * d + 0.05;
+                let mid = Vec3::from([0, 1, 2].map(|a| 0.5 * (bx.min[a] + bx.max[a])));
+                line += &format!(
+                    " box {} to {} d {d:.3}{}{}{} off {:.3}",
+                    a3(bx.min),
+                    a3(bx.max),
+                    if round { " round" } else { "" },
+                    if thin { " thin" } else { "" },
+                    if grounded { " grounded" } else { "" },
+                    mid.distance(at)
+                );
+            }
+            println!(
+                "{line}  {}",
+                named.get(&n.name_hash).map_or("?", String::as_str)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Templates of the template database whose name holds one of the words,
+/// each with every component it has and that component's fields. Text
+/// fields are not read (a component with one is only listed).
+fn templates<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let index = source.archive().index();
+    let Some(hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let data = source.asset(hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let tnames = db.names();
+    println!(
+        "template database: {} templates, {} components",
+        tnames.len(),
+        db.components.len()
+    );
+    let records: Vec<ComponentRecords<'_>> = db
+        .components
+        .iter()
+        .filter(|c| c.name != "Name")
+        .map(|c| {
+            (
+                c.name,
+                c.fields.clone(),
+                c.records().unwrap_or_default().into_iter().collect(),
+            )
+        })
+        .collect();
+    let texty: Vec<&str> = db
+        .components
+        .iter()
+        .filter(|c| c.fields.iter().any(|f| f.ty == STRING_FIELD))
+        .map(|c| c.name)
+        .collect();
+    println!("components with text (not read): {}", texty.join(", "));
+    let mut picked: Vec<(&str, u32)> = tnames
+        .iter()
+        .filter(|(_, n)| {
+            let n = n.to_ascii_lowercase();
+            words.iter().any(|w| n.contains(w.as_str()))
+        })
+        .map(|(&id, &n)| (n, id))
+        .collect();
+    picked.sort_unstable();
+    println!("{} templates match", picked.len());
+    for (name, id) in picked.into_iter().take(150) {
+        println!("  {id:08x} {name:?}");
+        for (cname, fields, recs) in &records {
+            let Some(rec) = recs.get(&id) else {
+                continue;
+            };
+            let values: Vec<String> = fields.iter().map(|f| field_value(names, f, rec)).collect();
+            println!("    {cname}: {}", values.join(", "));
+        }
+    }
+    Ok(())
+}
+
 fn layer_entities<R: Read + Seek>(
     source: &mut AssetSource<R>,
     names: &Names,
