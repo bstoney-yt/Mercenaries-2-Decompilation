@@ -10,6 +10,12 @@
 //! What is drawn: the low-resolution tiles everywhere (the whole island is
 //! always visible), full-detail cells near the camera in place of their
 //! tiles, placed models within the object distance, and a sea plane.
+//!
+//! A town is drawn as merged batches (`TINY` models), but collides
+//! building by building: each batch names the layer entity of each of its
+//! buildings, that entity names its own model, and that model's `PHY2`
+//! goes where the entity stands. A building whose model isn't found
+//! collides through its own triangles of the batch.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,9 +29,14 @@ use m2_render::{
     RenderBackend, Topology, VertexBufferDesc, VertexBufferHandle,
 };
 
+use m2_assets::model::ModelInfo;
+use m2_assets::{Model, Ucfx};
+
+use m2_assets::model::MODEL_TYPE;
+
 use crate::assets::{AssetError, DecodedTexture, Install};
-use crate::model::{CpuModel, GpuModel, MaterialCache};
-use crate::physics::{Physics, StaticKey};
+use crate::model::{CpuModel, GpuModel, MaterialCache, MemberShape};
+use crate::physics::{CollisionShape, Physics, StaticKey};
 use crate::scatter::{self, CellScatter};
 use crate::world::{self, TerrainMesh, WorldIndex};
 
@@ -105,6 +116,7 @@ impl Loader {
             .name("asset loader".into())
             .spawn(move || {
                 let mut sent_textures = HashSet::new();
+                let mut building_shapes = HashMap::new();
                 let mut texture = |source: &mut crate::AssetSource<_>, hash: u32, max: u32| {
                     if sent_textures.insert(hash) {
                         let t = source.texture(hash, max).ok();
@@ -140,7 +152,20 @@ impl Loader {
                             Loaded::Terrain(request, mesh)
                         }
                         Request::Model(h) => {
-                            let model = source.model(h).and_then(|d| CpuModel::from_data(&d, 0));
+                            let model = source.model(h).and_then(|d| {
+                                let mut m = CpuModel::from_data(&d, 0)?;
+                                let parsed = d.parse()?;
+                                if parsed.info.flags & ModelInfo::FLAG_TINY != 0 {
+                                    m.collision = None;
+                                    m.members = batch_members(
+                                        &mut source,
+                                        &index,
+                                        &parsed,
+                                        &mut building_shapes,
+                                    );
+                                }
+                                Ok(m)
+                            });
                             if let Ok(m) = &model {
                                 for t in m.texture_hashes().collect::<Vec<_>>() {
                                     if !texture(&mut source, t, limits.models) {
@@ -188,6 +213,51 @@ impl Loader {
     pub fn try_recv(&self) -> Option<Loaded> {
         self.results.try_recv().ok()
     }
+}
+
+/// The collision of a merged batch's buildings: each building's own
+/// model's shape at the building's place, else its triangles of the
+/// batch. `shapes` caches the buildings' models' shapes between batches.
+fn batch_members<R: std::io::Read + std::io::Seek>(
+    source: &mut crate::AssetSource<R>,
+    index: &WorldIndex,
+    batch: &Model<'_>,
+    shapes: &mut HashMap<u32, Option<CollisionShape>>,
+) -> Vec<MemberShape> {
+    let mut out = Vec::new();
+    for (i, entity) in batch.tiny_members().into_iter().enumerate() {
+        let own = index.members.get(&entity).and_then(|member| {
+            member.models.iter().find_map(|&model| {
+                let shape = shapes
+                    .entry(model)
+                    .or_insert_with(|| building_shape(source, model))
+                    .clone()?;
+                Some(MemberShape {
+                    shape,
+                    placed: Some((member.position, member.rotation)),
+                })
+            })
+        });
+        let shape = own.or_else(|| {
+            CollisionShape::for_sub_object(batch, i as u32, 0).map(|shape| MemberShape {
+                shape,
+                placed: None,
+            })
+        });
+        out.extend(shape);
+    }
+    out
+}
+
+/// The collision of a building's own model, from its resident asset.
+fn building_shape<R: std::io::Read + std::io::Seek>(
+    source: &mut crate::AssetSource<R>,
+    model: u32,
+) -> Option<CollisionShape> {
+    let base = source.asset(model, MODEL_TYPE).ok()?;
+    let parsed = Model::parse(&base).ok()?;
+    let phy2 = Ucfx::parse(&base).ok().and_then(|u| u.top_level(*b"PHY2"));
+    CollisionShape::for_model(&parsed, phy2, 0)
 }
 
 impl Drop for Loader {
@@ -548,16 +618,27 @@ impl World {
                     self.in_flight.remove(&Request::Model(hash));
                     let slot = match model {
                         Ok(m) if !m.pieces.is_empty() => {
-                            if let Some(shape) = &m.collision {
-                                for (i, o) in self.index.objects.iter().enumerate() {
-                                    if o.model == hash {
-                                        self.physics.add_static(
-                                            StaticKey::Object(i),
-                                            shape,
-                                            o.position,
-                                            o.rotation,
-                                        );
-                                    }
+                            for (i, o) in self.index.objects.iter().enumerate() {
+                                if o.model != hash {
+                                    continue;
+                                }
+                                if let Some(shape) = &m.collision {
+                                    self.physics.add_static(
+                                        StaticKey::Object(i),
+                                        shape,
+                                        o.position,
+                                        o.rotation,
+                                    );
+                                }
+                                for (k, member) in m.members.iter().enumerate() {
+                                    let (position, rotation) =
+                                        member.placed.unwrap_or((o.position, o.rotation));
+                                    self.physics.add_static(
+                                        StaticKey::Member(i, k),
+                                        &member.shape,
+                                        position,
+                                        rotation,
+                                    );
                                 }
                             }
                             Slot::Ready(GpuModel::upload(backend, materials, &m)?)

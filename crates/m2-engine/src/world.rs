@@ -20,7 +20,7 @@ use m2_assets::layer::LAYER_TYPE;
 use m2_assets::path::PATH_TYPE;
 use m2_assets::terrain::{CELL_SIZE, TerrainGroup, colour_map_uv};
 use m2_assets::vertex::DeclUsage;
-use m2_assets::{BlockContents, Layer, LowResTile, Path, TerrainCell};
+use m2_assets::{BlockContents, Layer, LowResTile, Path, TerrainCell, name_hash};
 use m2_math::glam::{Quat, Vec3};
 use m2_render::{
     BufferUsage, IndexBufferDesc, IndexFormat, VertexBufferDesc, VertexFormat, VertexLayout,
@@ -73,6 +73,28 @@ pub struct WorldIndex {
     pub objects: Vec<ObjectPlacement>,
     /// People the layers place, all layers.
     pub spawns: Vec<SpawnPoint>,
+    /// Every placed entity of the static layers by id: the buildings of
+    /// the merged town batches are among them (see
+    /// [`Model::tiny_members`](m2_assets::Model::tiny_members)).
+    pub members: HashMap<u32, Member>,
+}
+
+/// A placed entity of the static layers, as a building of a merged batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Member {
+    pub position: Vec3,
+    pub rotation: Quat,
+    /// Model hashes that may be its own model, likeliest first: its
+    /// `ModelName`, if it has one, then the hash of its name's stem
+    /// (`_commercial_bld_corner8x16a 26` is `commercial_bld_corner8x16a`).
+    pub models: Vec<u32>,
+}
+
+/// An entity name without its leading `_` and its trailing ` 26` or
+/// ` 0x001384eb`: the name of the model it is.
+pub fn member_stem(name: &str) -> &str {
+    let name = name.trim_start_matches('_');
+    name.rsplit_once(' ').map_or(name, |(stem, _)| stem)
 }
 
 /// What [`WorldIndex::build`] gathers to find patrol routes: soldier to
@@ -203,14 +225,32 @@ impl WorldIndex {
             }
         }
         if is_static {
-            for (entity, model) in layer.hashes("ModelName") {
+            let models = layer.hashes("ModelName");
+            for (&entity, model) in &models {
                 if let Some(p) = at(entity) {
                     self.objects.push(ObjectPlacement {
-                        model,
+                        model: *model,
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),
                     });
                 }
+            }
+            for (entity, name) in layer.names() {
+                let Some(p) = at(entity) else { continue };
+                let mut candidates: Vec<u32> = models.get(&entity).copied().into_iter().collect();
+                let stem = member_stem(name);
+                if !stem.is_empty() {
+                    candidates.push(name_hash(stem));
+                }
+                candidates.dedup();
+                self.members.insert(
+                    entity,
+                    Member {
+                        position: Vec3::from(p.position),
+                        rotation: rotation(p.rotation),
+                        models: candidates,
+                    },
+                );
             }
         }
     }
@@ -490,6 +530,20 @@ mod tests {
         assert_eq!(mesh.indices.len(), 6 + 4 * 12);
         assert_eq!(mesh.bounds.0.y, -2.0);
         assert!(mesh.indices.iter().all(|&i| i < 8));
+    }
+
+    #[test]
+    fn member_names_stem_to_their_model() {
+        assert_eq!(
+            member_stem("_commercial_bld_corner8x16a 26"),
+            "commercial_bld_corner8x16a"
+        );
+        assert_eq!(
+            member_stem("_commercial_bld_segment8x16a 0x001384eb"),
+            "commercial_bld_segment8x16a"
+        );
+        assert_eq!(member_stem("plain"), "plain");
+        assert_eq!(member_stem("_"), "");
     }
 
     #[test]

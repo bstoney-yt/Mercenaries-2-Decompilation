@@ -629,6 +629,7 @@ pub(crate) mod tests {
             bounds: (Vec3::ZERO, Vec3::ZERO),
             skipped_groups: 0,
             collision: None,
+            members: Vec::new(),
         };
         let mut backend = m2_render::NullBackend::default();
         let mut materials = m2_engine::MaterialCache::new();

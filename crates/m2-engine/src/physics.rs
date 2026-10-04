@@ -94,6 +94,22 @@ impl CollisionShape {
     /// A model's collision in model space: its `PHY2` shapes if `phy2` is
     /// given and parses, else its rigid visible geometry at `lod`.
     pub fn for_model(model: &Model<'_>, phy2: Option<&[u8]>, lod: u32) -> Option<Self> {
+        Self::for_model_part(model, phy2, lod, None)
+    }
+
+    /// One sub-object of a merged batch (a `TINY` model), by the index its
+    /// vertices carry in their position's `w`: its visible geometry at
+    /// `lod`, in model space.
+    pub fn for_sub_object(model: &Model<'_>, index: u32, lod: u32) -> Option<Self> {
+        Self::for_model_part(model, None, lod, Some(index))
+    }
+
+    fn for_model_part(
+        model: &Model<'_>,
+        phy2: Option<&[u8]>,
+        lod: u32,
+        sub_object: Option<u32>,
+    ) -> Option<Self> {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
         if let Some(p) = phy2.and_then(|d| Phy2::parse(d).ok()) {
@@ -132,11 +148,20 @@ impl CollisionShape {
                         pos.iter()
                             .map(|p| local.transform_point3(Vec3::new(p[0], p[1], p[2]))),
                     );
+                    // A batch sub-object is the triangles whose vertices
+                    // carry its index.
+                    let mine = |i: u16| {
+                        sub_object.is_none_or(|index| {
+                            pos.get(usize::from(i))
+                                .is_some_and(|p| (p[3] - index as f32).abs() < 0.5)
+                        })
+                    };
                     for range in &group.material_ranges {
                         triangles.extend(
                             group
                                 .triangles(range)
                                 .into_iter()
+                                .filter(|t| t.iter().all(|&i| mine(i)))
                                 .map(|t| t.map(|i| first + u32::from(i))),
                         );
                     }
@@ -154,6 +179,9 @@ pub enum StaticKey {
     Cell(u32),
     /// A placed object, by index in the world index.
     Object(usize),
+    /// A building of a placed batch: the object's index, then the
+    /// building's in the batch.
+    Member(usize, usize),
 }
 
 /// Suspension rest length and travel, metres.
