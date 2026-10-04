@@ -127,8 +127,14 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("scripts", []) => scripts(&mut wad)?,
         ("script", [hash]) => script_listing(&mut wad, u32::from_str_radix(hash, 16)?)?,
         ("calls", [callee, rest @ ..]) => {
-            let shape = rest.first().map(String::as_str);
-            let count = rest.get(1).map_or(Ok(8), |n| n.parse())?;
+            // `[first arg] [count]`; a lone number is the count, and "-"
+            // is no filter.
+            let (shape, count) = match rest {
+                [n] if n.parse::<usize>().is_ok() => (None, n.parse()?),
+                [f, n, ..] => (Some(f.as_str()).filter(|f| *f != "-"), n.parse()?),
+                [f] => (Some(f.as_str()).filter(|f| *f != "-"), 8),
+                [] => (None, 8),
+            };
             call_sites(&mut wad, callee, shape, count)?
         }
         ("names", []) => {
