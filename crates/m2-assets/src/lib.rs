@@ -12,6 +12,8 @@
 //! - [`texture`]: texture assets: header, mip chain (including mips streamed
 //!   from other blocks) and conversion to RGBA8.
 //! - [`dxt`]: DXT1, DXT3 and DXT5 decoding.
+//! - [`gfx`]: Scaleform GFx (Flash) movies the interface is built from:
+//!   header, tags, and the layout and names they describe.
 //! - [`model`]: model assets: node hierarchy, materials, LOD segments and
 //!   primitive groups (including geometry streamed from other blocks).
 //! - [`animation`]: skeletal animation clips: interleaved, delta and
@@ -48,6 +50,7 @@ pub mod animation;
 pub mod block;
 mod bytes;
 pub mod dxt;
+pub mod gfx;
 pub mod hash;
 pub mod havok;
 pub mod layer;
