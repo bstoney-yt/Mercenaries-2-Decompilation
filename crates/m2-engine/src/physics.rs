@@ -835,6 +835,26 @@ impl Physics {
             .map(|(d, n, _)| (d, n))
     }
 
+    /// [`cast_ray`](Self::cast_ray) that passes through vehicle `skip`:
+    /// shots from its own gun.
+    pub fn cast_ray_past(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+        skip: VehicleId,
+    ) -> Option<(f32, Vec3)> {
+        let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
+        let mut filter = solid();
+        if let Some(v) = self.vehicles.get(skip.0).and_then(Option::as_ref) {
+            filter = filter.exclude_rigid_body(v.controller.chassis);
+        }
+        self.world
+            .query_pipeline_with_filter(filter)
+            .cast_ray_and_get_normal(&ray, max, true)
+            .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
+    }
+
     /// [`cast_ray`](Self::cast_ray), with the key of the static hit (`None`
     /// for anything else solid, such as a vehicle), to find what an
     /// unseen obstacle is.
@@ -1081,6 +1101,7 @@ mod tests {
             mass: 1400.0,
             turret: Vec::new(),
             pivot: None,
+            muzzle: None,
         }
     }
 
