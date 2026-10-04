@@ -327,7 +327,6 @@ impl Default for WorldSettings {
 struct TerrainGpu {
     vertex_buffer: VertexBufferHandle,
     index_buffer: IndexBufferHandle,
-    /// (first index, index count, material).
     /// First index, index count, material, and whether it blends.
     ranges: Vec<(u32, u32, MaterialId, bool)>,
     origin: Vec3,
@@ -339,6 +338,7 @@ struct ClumpGpu {
     index_buffer: IndexBufferHandle,
     count: u32,
     material: MaterialId,
+    translucent: bool,
     instances: Vec<Mat4>,
 }
 
@@ -685,6 +685,7 @@ impl World {
                         Ok(s) if !s.meshes.is_empty() => {
                             let mut clumps = Vec::with_capacity(s.meshes.len());
                             for m in s.meshes {
+                                let material = materials.material(backend, &m.material)?;
                                 clumps.push(ClumpGpu {
                                     vertex_buffer: backend.create_vertex_buffer(
                                         &m.vertex_desc(),
@@ -695,7 +696,8 @@ impl World {
                                         Some(&m.index_bytes()),
                                     )?,
                                     count: m.indices.len() as u32,
-                                    material: materials.material(backend, &m.material)?,
+                                    material,
+                                    translucent: materials.is_translucent(material),
                                     instances: m.instances,
                                 });
                             }
@@ -958,7 +960,7 @@ impl World {
                         instances: Some(instances),
                     },
                     layer: Layer::WORLD,
-                    translucent: false,
+                    translucent: c.translucent,
                     sort_origin: near[0].w_axis.truncate(),
                     user: 0,
                 });

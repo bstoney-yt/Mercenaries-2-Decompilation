@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use m2_engine::model::MODEL_TEXTURE_WIDTH;
 use m2_engine::{
     AssetSource, CollisionShape, CpuModel, GpuModel, Install, MaterialCache, Physics, StaticKey,
     WorldIndex,
@@ -172,7 +173,7 @@ impl Props {
                 return Ok(());
             }
         };
-        materials.load_textures(backend, source, cpu.texture_requests())?;
+        materials.load_model_textures(backend, source, &cpu)?;
         let gpu = GpuModel::upload(backend, materials, &cpu)?;
         if let Some(shape) = &cpu.collision {
             for (&e, p) in self.shown.iter().filter(|(_, p)| p.model == hash) {
@@ -221,6 +222,10 @@ fn load(install: Install, models: Vec<u32>, tx: Sender<Load>) {
             let cpu = source
                 .model(m)
                 .and_then(|data| CpuModel::from_data(&data, 0))
+                .map(|mut cpu| {
+                    cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
+                    cpu
+                })
                 .map_err(|e| e.to_string());
             // The game may have quit meanwhile.
             if tx.send((m, cpu)).is_err() {

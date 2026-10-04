@@ -155,6 +155,7 @@ enum BlendKind {
     Opaque,
     Masked,
     Translucent,
+    Additive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -917,6 +918,7 @@ impl WgpuBackend {
                 BlendMode::Opaque => BlendKind::Opaque,
                 BlendMode::Masked { .. } => BlendKind::Masked,
                 BlendMode::Translucent => BlendKind::Translucent,
+                BlendMode::Additive => BlendKind::Additive,
             },
             double_sided: desc.double_sided,
             depth_bias: desc.depth_bias,
@@ -946,7 +948,23 @@ impl WgpuBackend {
                 shader_location: i as u32,
             })
             .collect();
-        let translucent = key.blend == BlendKind::Translucent;
+        let translucent = matches!(key.blend, BlendKind::Translucent | BlendKind::Additive);
+        let blend = match key.blend {
+            BlendKind::Translucent => Some(wgpu::BlendState::ALPHA_BLENDING),
+            BlendKind::Additive => Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            }),
+            _ => None,
+        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("standard"),
             layout: Some(&self.pipeline_layout),
@@ -992,7 +1010,7 @@ impl WgpuBackend {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: color_format,
-                    blend: translucent.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
