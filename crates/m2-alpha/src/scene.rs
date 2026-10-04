@@ -1,0 +1,1013 @@
+//! What is drawn: the streamed island, or (with `--model`) a ground grid
+//! with models from the install standing on it.
+
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, channel};
+
+use anyhow::Context as _;
+use m2_engine::anim::load_clips;
+use m2_engine::vehicle::{DRIVABLE, catalogue};
+use m2_engine::{
+    Animator, AssetSource, BoundClip, CatalogueEntry, CpuModel, Gait, GpuModel, Install,
+    Locomotion, MaterialCache, PersonModel, Skeleton, VehicleId, VehicleSpec, World, WorldSettings,
+};
+use m2_math::glam::{Mat4, Quat, Vec3};
+use m2_render::{
+    BlendMode, BufferUsage, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
+    IndexFormat, Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, TextureDesc,
+    TextureFormat, Topology, VertexBufferDesc, VertexBufferHandle, VertexFormat, VertexLayout,
+    VertexSemantic, generate_mips,
+};
+
+use crate::cache;
+use crate::combat::{self, Arsenal, Effect, Weapon};
+use crate::npc::{self, People, PersonKind};
+use crate::player::Player;
+
+/// Jennifer Mui, the playable mercenary whose model the README's export
+/// examples use.
+pub const DEFAULT_MODEL: u32 = 0x15d8_9832;
+
+/// Where the island opens: the first town, as in the viewer's examples.
+pub const DEFAULT_SPAWN: (f32, f32) = (450.0, -1950.0);
+
+/// Half the ground's width in metres.
+const GROUND_HALF: f32 = 1000.0;
+/// Metres per repeat of the grid texture.
+const GRID_TILE: f32 = 4.0;
+
+#[derive(Debug)]
+pub struct Placed {
+    pub model: GpuModel,
+    pub world: Mat4,
+    /// Skinned models play the game's locomotion clips in place.
+    pub rig: Option<Rig>,
+}
+
+/// A skinned model's skeleton, the clips that fit it, and what it plays.
+/// Clones share the skeleton and clips, each with its own animator.
+#[derive(Clone, Debug)]
+pub struct Rig {
+    pub skeleton: Arc<Skeleton>,
+    pub clips: Arc<Vec<BoundClip>>,
+    pub locomotion: Option<Locomotion>,
+    pub animator: Animator,
+    pub gait: Gait,
+}
+
+impl Rig {
+    /// Reads model `hash`'s skeleton and every clip that fits it.
+    pub fn load(
+        source: &mut AssetSource<BufReader<File>>,
+        hash: u32,
+        gait: Gait,
+    ) -> anyhow::Result<Self> {
+        let started = std::time::Instant::now();
+        let skeleton = Skeleton::from_nodes(&source.model(hash)?.parse()?.nodes);
+        let clips = load_clips(source, &skeleton, &[""])?;
+        let rig = Rig::new(skeleton, clips, gait);
+        eprintln!(
+            "model {hash:08x}: {} bones, {} clips fit ({:.1} s), locomotion {}",
+            rig.skeleton.len(),
+            rig.clips.len(),
+            started.elapsed().as_secs_f32(),
+            match &rig.locomotion {
+                Some(l) => {
+                    let mut c: Vec<_> = l
+                        .clips
+                        .iter()
+                        .map(|(g, &i)| (*g, format!("{:08x}", rig.clips[i].hash)))
+                        .collect();
+                    c.sort();
+                    format!("{c:?}")
+                }
+                None => "not found".into(),
+            }
+        );
+        Ok(rig)
+    }
+
+    /// Root speed (m/s) of the clip `gait` plays, if there is one.
+    pub fn gait_speed(&self, gait: Gait) -> Option<f32> {
+        let &i = self.locomotion.as_ref()?.clips.get(&gait)?;
+        Some(self.clips[i].info.speed)
+    }
+
+    /// This rig's clips on another model's `skeleton`: shared when it has
+    /// the same bones, otherwise the clips people play (locomotion, aim,
+    /// fall) bound again by bone name. `None` if they don't fit.
+    pub fn for_skeleton(&self, skeleton: Skeleton) -> Option<Self> {
+        if skeleton.name_hashes == self.skeleton.name_hashes
+            && skeleton.parents == self.skeleton.parents
+        {
+            return Some(Self {
+                skeleton: Arc::new(skeleton),
+                animator: Animator::default(),
+                ..self.clone()
+            });
+        }
+        let locomotion = self.locomotion.as_ref()?;
+        let fight = npc::FightClips::find(self);
+        let mut wanted: Vec<usize> = locomotion
+            .clips
+            .values()
+            .copied()
+            .chain(fight.aim)
+            .chain(fight.die)
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut clips = Vec::new();
+        let mut moved = std::collections::HashMap::new();
+        for i in wanted {
+            if let Some(b) = self.clips[i].rebind(&skeleton) {
+                moved.insert(i, clips.len());
+                clips.push(b);
+            }
+        }
+        let gaits: std::collections::HashMap<Gait, usize> = locomotion
+            .clips
+            .iter()
+            .filter_map(|(g, i)| Some((*g, *moved.get(i)?)))
+            .collect();
+        if gaits.len() < locomotion.clips.len() {
+            return None;
+        }
+        Some(Self {
+            skeleton: Arc::new(skeleton),
+            clips: Arc::new(clips),
+            locomotion: Some(Locomotion {
+                clips: gaits,
+                forward: locomotion.forward,
+            }),
+            animator: Animator::default(),
+            gait: Gait::Idle,
+        })
+    }
+
+    fn new(skeleton: Skeleton, clips: Vec<BoundClip>, gait: Gait) -> Self {
+        let locomotion = Locomotion::choose(&clips);
+        let mut rig = Self {
+            skeleton: Arc::new(skeleton),
+            clips: Arc::new(clips),
+            locomotion,
+            animator: Animator::default(),
+            gait,
+        };
+        rig.set_gait(gait);
+        rig
+    }
+
+    pub fn set_gait(&mut self, gait: Gait) {
+        self.gait = gait;
+        if let Some(&clip) = self.locomotion.as_ref().and_then(|l| l.clips.get(&gait)) {
+            self.animator.play(clip);
+        }
+    }
+
+    /// The next gait, slowest after fastest.
+    pub fn cycle_gait(&mut self) {
+        self.set_gait(match self.gait {
+            Gait::Idle => Gait::Walk,
+            Gait::Walk => Gait::Run,
+            Gait::Run => Gait::Sprint,
+            Gait::Sprint => Gait::Idle,
+        });
+    }
+
+    /// Posed node matrices and skinning matrices, model space.
+    pub fn posed(&self) -> (Vec<Mat4>, Vec<Mat4>) {
+        let pose = self.animator.pose(&self.skeleton, &self.clips);
+        let nodes = self.skeleton.model_matrices(&pose);
+        let skin = nodes
+            .iter()
+            .zip(&self.skeleton.inverse_bind)
+            .map(|(m, ib)| *m * *ib)
+            .collect();
+        (nodes, skin)
+    }
+}
+
+#[derive(Debug)]
+pub struct Scene {
+    /// The grid, drawn when there is no island.
+    ground: (VertexBufferHandle, IndexBufferHandle, MaterialId),
+    pub world: Option<World>,
+    pub models: Vec<Placed>,
+    pub materials: MaterialCache,
+    pub source: Option<AssetSource<BufReader<File>>>,
+    /// Where the camera should start: (eye, target).
+    pub focus: (Vec3, Vec3),
+    /// Jennifer, on the island.
+    pub player: Option<Player>,
+    /// Drivable vehicles near the spawn.
+    pub vehicles: Vec<ParkedVehicle>,
+    /// Soldiers and civilians.
+    pub people: People,
+    pub arsenal: Arsenal,
+    /// Mesh and materials for shots, flashes, fire and smoke.
+    effects: Effects,
+    vehicle_loads: Option<Receiver<Loaded>>,
+}
+
+/// A vehicle to drive: what it is, its model, and its body once placed.
+#[derive(Debug)]
+pub struct ParkedVehicle {
+    pub spec: VehicleSpec,
+    pub model: GpuModel,
+    pub id: Option<VehicleId>,
+    /// Blown up: can't be driven.
+    pub wrecked: bool,
+}
+
+/// Kinds that don't drive on wheels (or aren't vehicles to sit in).
+const NOT_DRIVABLE: [&str; 13] = [
+    "boat",
+    "plane",
+    "airstrike",
+    "vtol",
+    "towed",
+    "trailer",
+    "outboardmotor",
+    "winch",
+    "transport",
+    "motorcycle",
+    "helicopter",
+    "jetski",
+    "gunboat",
+];
+
+/// Vehicles parked by the spawn: one of each drivable kind first.
+const PARKED: usize = 8;
+
+/// Person models loaded: the soldiers the spawn names ask for, then
+/// civilians.
+const ARMY: [&str; 3] = ["vz_hum_soldier", "vz_hum_soldierelite", "vz_hum_deathsquad"];
+const CIVILIAN_MODELS: usize = 6;
+
+/// A model the loading thread has decoded.
+pub enum Loaded {
+    Vehicle(VehicleSpec, CpuModel),
+    Person(PersonModel, CpuModel, Skeleton),
+    /// A hand weapon: name, model, muzzle (model space).
+    Weapon(&'static str, CpuModel, Vec3),
+}
+
+/// Finds the island's vehicle and person models and decodes the soldiers,
+/// a few civilians and up to [`PARKED`] vehicles, on a thread (the search
+/// reads the whole archive).
+fn load_cast(install: Install) -> Receiver<Loaded> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let result = (|| -> anyhow::Result<()> {
+            let mut source = install.open_world()?;
+            // The search reads the whole archive, so its result is kept.
+            let stamp = cache::stamp(&install.world_archive());
+            let path = cache::default_path();
+            let found = match stamp.and_then(|s| cache::read(&path, s)) {
+                Some(found) => found,
+                None => {
+                    let found = catalogue(&mut source)?;
+                    if let Some(s) = stamp
+                        && let Err(e) = cache::write(&path, s, &found)
+                    {
+                        eprintln!("could not keep the catalogue in {}: {e}", path.display());
+                    }
+                    found
+                }
+            };
+            let people: Vec<&PersonModel> = found
+                .people
+                .iter()
+                .filter(|p| ARMY.contains(&p.role.as_str()))
+                .chain(
+                    found
+                        .people
+                        .iter()
+                        .filter(|p| !p.soldier)
+                        .take(CIVILIAN_MODELS),
+                )
+                .collect();
+            eprintln!(
+                "people: {} roles; loading {}",
+                found.people.len(),
+                people
+                    .iter()
+                    .map(|p| p.role.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for p in people {
+                let data = source.model(p.model)?;
+                let cpu = CpuModel::from_data(&data, 0)?;
+                let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
+                if tx.send(Loaded::Person(p.clone(), cpu, skeleton)).is_err() {
+                    return Ok(());
+                }
+            }
+            for &(name, hash) in &found.weapons {
+                let data = source.model(hash)?;
+                let model = data.parse()?;
+                let muzzle = m2_assets::vehicle::marker(&model, combat::MUZZLE)
+                    .map_or(Vec3::new(0.0, 0.0, model.info.bounds.max[2]), Vec3::from);
+                let cpu = CpuModel::build(hash, &model, 0);
+                if tx.send(Loaded::Weapon(name, cpu, muzzle)).is_err() {
+                    return Ok(());
+                }
+            }
+            eprintln!(
+                "weapons: {}",
+                found
+                    .weapons
+                    .iter()
+                    .map(|(n, h)| format!("{n} {h:08x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let all = &found.vehicles;
+            let drivable: Vec<&CatalogueEntry> = all
+                .iter()
+                .filter(|e| {
+                    DRIVABLE.contains(&e.kind.as_str())
+                        // `global_veh_<model>`: civilian cars and trucks,
+                        // named by model rather than kind.
+                        || (e.label.starts_with("global_") && !NOT_DRIVABLE.contains(&e.kind.as_str()))
+                })
+                .collect();
+            eprintln!(
+                "vehicles: {} models by texture name, {} drivable kinds ({:.1} s)",
+                all.len(),
+                drivable.len(),
+                started.elapsed().as_secs_f32()
+            );
+            let rank = |e: &CatalogueEntry| {
+                DRIVABLE
+                    .iter()
+                    .position(|k| *k == e.kind)
+                    .unwrap_or(DRIVABLE.len())
+            };
+            let mut order = drivable.clone();
+            order.sort_by_key(|e| rank(e));
+            // One of each kind, then the rest, one model per name.
+            let mut kinds = std::collections::HashSet::new();
+            let firsts: Vec<&CatalogueEntry> = order
+                .iter()
+                .copied()
+                .filter(|e| kinds.insert(e.kind.clone()))
+                .collect();
+            let mut labels = std::collections::HashSet::new();
+            let mut sent = 0;
+            for e in firsts.into_iter().chain(order) {
+                if sent >= PARKED || !labels.insert(e.label.clone()) {
+                    continue;
+                }
+                let data = source.model(e.model)?;
+                let model = data.parse()?;
+                let Some(spec) = VehicleSpec::from_model(e, &model) else {
+                    labels.remove(&e.label);
+                    continue;
+                };
+                eprintln!(
+                    "vehicle {:08x}: {} ({}, {} wheels)",
+                    e.model,
+                    e.label,
+                    e.kind,
+                    spec.wheels.len()
+                );
+                let cpu = CpuModel::build(e.model, &model, 0);
+                if tx.send(Loaded::Vehicle(spec, cpu)).is_err() {
+                    return Ok(());
+                }
+                sent += 1;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("vehicles and people: {e:#}");
+        }
+    });
+    rx
+}
+
+impl Scene {
+    pub fn new(backend: &mut dyn RenderBackend) -> anyhow::Result<Self> {
+        let mut materials = MaterialCache::new();
+        let ground = ground(backend, &mut materials)?;
+        let effects = Effects::new(backend, &mut materials)?;
+        Ok(Self {
+            ground,
+            world: None,
+            models: Vec::new(),
+            materials,
+            source: None,
+            focus: (Vec3::new(0.0, 2.0, 6.0), Vec3::new(0.0, 1.0, 0.0)),
+            player: None,
+            vehicles: Vec::new(),
+            people: People::default(),
+            arsenal: Arsenal::default(),
+            effects,
+            vehicle_loads: None,
+        })
+    }
+
+    /// Opens the install's world archive.
+    pub fn open(&mut self, install: &Install) -> anyhow::Result<()> {
+        let source = install
+            .open_world()
+            .with_context(|| format!("opening {}", install.world_archive().display()))?;
+        self.source = Some(source);
+        Ok(())
+    }
+
+    /// Loads models `hashes` and stands them in a row on the ground, 3 m
+    /// apart, facing the camera (models face `+z`).
+    pub fn load_models(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        hashes: &[u32],
+        gait: Gait,
+    ) -> anyhow::Result<()> {
+        let source = self.source.as_mut().context("no install open")?;
+        let mut x = 0.0;
+        let mut widest = 2.0f32;
+        for &hash in hashes {
+            let gpu = GpuModel::load(backend, source, &mut self.materials, hash, 0)?;
+            let rig = if gpu.is_skinned() {
+                Some(Rig::load(source, hash, gait)?)
+            } else {
+                None
+            };
+            let (lo, hi) = gpu.bounds;
+            eprintln!(
+                "model {hash:08x}: {} draws, {:.1} x {:.1} x {:.1} m{}",
+                gpu.draw_count(),
+                hi.x - lo.x,
+                hi.y - lo.y,
+                hi.z - lo.z,
+                if gpu.skipped_groups > 0 {
+                    format!(
+                        ", {} groups in unsupported vertex formats",
+                        gpu.skipped_groups
+                    )
+                } else {
+                    String::new()
+                }
+            );
+            let size = hi - lo;
+            widest = widest.max(size.x.max(size.z)).max(size.y);
+            // Stand it on the ground, centred on x.
+            let offset = Vec3::new(x - (lo.x + hi.x) * 0.5, -lo.y, -(lo.z + hi.z) * 0.5);
+            self.models.push(Placed {
+                model: gpu,
+                world: Mat4::from_translation(offset),
+                rig,
+            });
+            x += size.x.max(1.0) + 3.0;
+        }
+        let centre = Vec3::new((x - 3.0).max(0.0) * 0.5, widest * 0.5, 0.0);
+        self.focus = (
+            // Models face +z, so the camera stands on that side.
+            centre + Vec3::new(0.0, widest * 0.3, widest * 1.6 + x * 0.5),
+            centre,
+        );
+        Ok(())
+    }
+
+    /// Indexes the island and starts streaming it, with the camera placed
+    /// above `(x, z)`.
+    pub fn open_world(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        install: &Install,
+        settings: WorldSettings,
+        spawn: (f32, f32),
+    ) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        let world = World::open(install, backend, &mut self.materials, settings)
+            .context("indexing the island")?;
+        eprintln!(
+            "island: {} cells, {} tiles, {} placed objects (indexed in {:.1} s)",
+            world.index.cells.len(),
+            world.index.tiles.len(),
+            world.index.objects.len(),
+            started.elapsed().as_secs_f32()
+        );
+        let (x, z) = spawn;
+        let y = world.index.rough_height(x, z) + 40.0;
+        self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));
+        self.world = Some(world);
+
+        // Jennifer, to walk the island as.
+        self.open(install)?;
+        let source = self.source.as_mut().context("no install open")?;
+        let model = match GpuModel::load(backend, source, &mut self.materials, DEFAULT_MODEL, 0)
+            .map_err(anyhow::Error::from)
+            .and_then(|gpu| Ok((gpu, Rig::load(source, DEFAULT_MODEL, Gait::Idle)?)))
+        {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("player model: {e:#}");
+                None
+            }
+        };
+        if let Some((_, rig)) = &model {
+            self.people.clips = npc::FightClips::find(rig);
+        }
+        self.player = Some(Player::new(x, z, 0.0, model));
+        self.vehicle_loads = Some(load_cast(install.clone()));
+        Ok(())
+    }
+
+    /// Streams around `eye`.
+    pub fn update(&mut self, backend: &mut dyn RenderBackend, eye: Vec3) -> anyhow::Result<()> {
+        if let Some(world) = &mut self.world {
+            world.update(backend, &mut self.materials, eye)?;
+        }
+        // At most one vehicle a frame: each uploads a model.
+        if let (Some(rx), Some(source)) = (&self.vehicle_loads, &mut self.source) {
+            match rx.try_recv() {
+                Ok(loaded) => {
+                    let cpu = match &loaded {
+                        Loaded::Vehicle(_, cpu)
+                        | Loaded::Person(_, cpu, _)
+                        | Loaded::Weapon(_, cpu, _) => cpu,
+                    };
+                    self.materials.load_textures(
+                        backend,
+                        source,
+                        cpu.texture_hashes().collect::<Vec<_>>(),
+                    )?;
+                    let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
+                    match loaded {
+                        Loaded::Vehicle(spec, _) => self.vehicles.push(ParkedVehicle {
+                            spec,
+                            model,
+                            id: None,
+                            wrecked: false,
+                        }),
+                        Loaded::Weapon(name, _, muzzle) => {
+                            let rig = self
+                                .player
+                                .as_ref()
+                                .and_then(|pl| pl.model.as_ref())
+                                .map(|(_, rig)| rig);
+                            self.arsenal.add(name, model, muzzle, rig);
+                        }
+                        Loaded::Person(p, _, skeleton) => {
+                            // Her clips fit every human skeleton.
+                            let template = self
+                                .player
+                                .as_ref()
+                                .and_then(|pl| pl.model.as_ref())
+                                .and_then(|(_, rig)| rig.for_skeleton(skeleton));
+                            match template {
+                                Some(rig) => {
+                                    eprintln!(
+                                        "person {}: {} bones, {} clips",
+                                        p.role,
+                                        rig.skeleton.len(),
+                                        rig.clips.len()
+                                    );
+                                    self.people.add_kind(PersonKind {
+                                        role: p.role,
+                                        soldier: p.soldier,
+                                        model,
+                                        rig,
+                                    });
+                                }
+                                None => eprintln!(
+                                    "person {}: the clips don't fit its skeleton; left out",
+                                    p.role
+                                ),
+                            }
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.vehicle_loads = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Vehicles and people are still being found and decoded.
+    pub fn vehicles_loading(&self) -> bool {
+        self.vehicle_loads.is_some()
+    }
+
+    /// Advances animation by `dt` seconds.
+    pub fn tick(&mut self, dt: f32) {
+        for rig in self.models.iter_mut().filter_map(|p| p.rig.as_mut()) {
+            rig.animator.advance(dt);
+        }
+    }
+
+    /// Steps every rig to its next gait.
+    pub fn cycle_gaits(&mut self) {
+        for rig in self.models.iter_mut().filter_map(|p| p.rig.as_mut()) {
+            rig.cycle_gait();
+            eprintln!("gait: {:?}", rig.gait);
+        }
+    }
+
+    /// Queues the frame's draws; call inside the backend's frame, as skinned
+    /// models set their palettes on it.
+    pub fn draw(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        queue: &mut DrawQueue,
+        eye: Vec3,
+        fight: &combat::Combat,
+    ) -> anyhow::Result<()> {
+        if let Some(world) = &mut self.world {
+            world.draw(backend, queue, eye)?;
+        } else {
+            self.draw_ground(queue);
+        }
+        if let Some(world) = &self.world {
+            for v in &self.vehicles {
+                let Some(id) = v.id else { continue };
+                let Some(at) = world.physics.vehicle_transform(id) else {
+                    continue;
+                };
+                let nodes = v.spec.posed_nodes(&world.physics.vehicle_wheels(id));
+                v.model.draw_posed(backend, queue, at, &nodes, &[])?;
+            }
+        }
+        if let Some(player) = &self.player
+            && player.landed
+            && player.driving.is_none()
+            && let Some((model, rig)) = &player.model
+        {
+            let (nodes, skin) = rig.posed();
+            let body = player.model_matrix();
+            model.draw_posed(backend, queue, body, &nodes, &skin)?;
+            let weapon = match fight.weapon {
+                Weapon::Rifle => &self.arsenal.rifle,
+                Weapon::Rpg => &self.arsenal.rpg,
+            };
+            if !player.down
+                && let Some(w) = weapon
+                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, self.arsenal.hand)
+            {
+                w.model.draw(queue, at);
+            }
+        }
+        for n in &self.people.npcs {
+            if !n.landed || n.character.position.distance(eye) > npc::DRAW_DISTANCE {
+                continue;
+            }
+            let (nodes, skin) = n.rig.posed();
+            let model = &self.people.kinds[n.kind].model;
+            let body = n.model_matrix();
+            model.draw_posed(backend, queue, body, &nodes, &skin)?;
+            if n.soldier
+                && n.alive
+                && let Some(w) = &self.arsenal.rifle
+                && let Some(at) = self.arsenal.in_hand(w, body, &nodes, n.hand)
+            {
+                w.model.draw(queue, at);
+            }
+        }
+        for (rocket, at, velocity) in fight.projectiles() {
+            let model = if rocket {
+                &self.arsenal.rocket
+            } else {
+                &self.arsenal.grenade
+            };
+            if let Some(w) = model {
+                // The rocket's nose (its muzzle marker) along its flight.
+                let turn = Quat::from_rotation_arc(
+                    w.muzzle.normalize_or(Vec3::Z),
+                    velocity.normalize_or(Vec3::Z),
+                );
+                let spin = if rocket { turn } else { Quat::IDENTITY };
+                w.model
+                    .draw(queue, Mat4::from_rotation_translation(spin, at));
+            }
+        }
+        for &(effect, left, life) in &fight.effects {
+            self.effects.draw(queue, effect, 1.0 - left / life);
+        }
+        for p in &self.models {
+            match &p.rig {
+                Some(rig) => {
+                    let (nodes, skin) = rig.posed();
+                    p.model.draw_posed(backend, queue, p.world, &nodes, &skin)?;
+                }
+                None => p.model.draw(queue, p.world),
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_ground(&self, queue: &mut DrawQueue) {
+        let (vb, ib, material) = self.ground;
+        queue.push(Primitive {
+            call: DrawCall {
+                material,
+                topology: Topology::TriangleList,
+                vertex_buffer: vb,
+                geometry: Geometry::Indexed {
+                    buffer: ib,
+                    first: 0,
+                    count: 6,
+                    base_vertex: 0,
+                },
+                world: Mat4::IDENTITY,
+                skin: None,
+                instances: None,
+            },
+            layer: Layer::WORLD,
+            translucent: false,
+            sort_origin: Vec3::ZERO,
+            user: 0,
+        });
+    }
+}
+
+/// A 2 km square at height 0 with a grid texture.
+/// A unit sphere: an octahedron split three times, 512 faces.
+fn sphere() -> (Vec<Vec3>, Vec<[u16; 3]>) {
+    let mut points = vec![Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+    let mut faces: Vec<[u16; 3]> = vec![
+        [0, 2, 4],
+        [2, 1, 4],
+        [1, 3, 4],
+        [3, 0, 4],
+        [2, 0, 5],
+        [1, 2, 5],
+        [3, 1, 5],
+        [0, 3, 5],
+    ];
+    for _ in 0..3 {
+        let mut middle = std::collections::HashMap::new();
+        let mut mid = |a: u16, b: u16, points: &mut Vec<Vec3>| -> u16 {
+            *middle.entry((a.min(b), a.max(b))).or_insert_with(|| {
+                points.push((points[usize::from(a)] + points[usize::from(b)]).normalize());
+                (points.len() - 1) as u16
+            })
+        };
+        faces = faces
+            .iter()
+            .flat_map(|&[a, b, c]| {
+                let (ab, bc, ca) = (
+                    mid(a, b, &mut points),
+                    mid(b, c, &mut points),
+                    mid(c, a, &mut points),
+                );
+                [[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]]
+            })
+            .collect();
+    }
+    (points, faces)
+}
+
+/// A small sphere and the materials shots, flashes,
+/// fire and smoke are drawn with, stretched and scaled per effect.
+#[derive(Debug)]
+struct Effects {
+    mesh: (VertexBufferHandle, IndexBufferHandle),
+    /// Indices in the mesh.
+    count: u32,
+    /// Tracer and flash, fire, smoke.
+    light: MaterialId,
+    fire: MaterialId,
+    smoke: MaterialId,
+}
+
+impl Effects {
+    fn new(backend: &mut dyn RenderBackend, materials: &mut MaterialCache) -> anyhow::Result<Self> {
+        use VertexFormat::*;
+        use VertexSemantic::*;
+        let layout = VertexLayout::packed(&[(Position, Float3), (Normal, Float3)])?;
+        let (points, faces) = sphere();
+        let vertices: Vec<u8> = points
+            .iter()
+            .flat_map(|p| [p.x, p.y, p.z, p.x, p.y, p.z])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let vb = backend.create_vertex_buffer(
+            &VertexBufferDesc {
+                layout,
+                vertex_count: points.len() as u32,
+                usage: BufferUsage::Static,
+            },
+            Some(&vertices),
+        )?;
+        let indices: Vec<u8> = faces
+            .iter()
+            .flatten()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let ib = backend.create_index_buffer(
+            &IndexBufferDesc {
+                format: IndexFormat::U16,
+                index_count: faces.len() as u32 * 3,
+                usage: BufferUsage::Static,
+            },
+            Some(&indices),
+        )?;
+        let mut define = |color: [f32; 4], lit: bool, blend: BlendMode| {
+            materials.define(
+                backend,
+                &MaterialDesc {
+                    color,
+                    lit,
+                    blend,
+                    double_sided: true,
+                    // Fire and smoke fade out towards their outline.
+                    soft_edge: blend == BlendMode::Translucent,
+                    ..MaterialDesc::default()
+                },
+            )
+        };
+        Ok(Self {
+            mesh: (vb, ib),
+            count: faces.len() as u32 * 3,
+            light: define([1.0, 0.85, 0.45, 1.0], false, BlendMode::Opaque)?,
+            fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
+            smoke: define([0.35, 0.35, 0.35, 0.4], true, BlendMode::Translucent)?,
+        })
+    }
+
+    /// Queues `effect`, `age` of the way (0 to 1) through its life.
+    fn draw(&self, queue: &mut DrawQueue, effect: Effect, age: f32) {
+        let (world, material, translucent) = match effect {
+            Effect::Tracer { from, to } => {
+                let along = to - from;
+                let len = along.length();
+                if len < 0.01 {
+                    return;
+                }
+                let turn = Quat::from_rotation_arc(Vec3::Z, along / len);
+                (
+                    Mat4::from_scale_rotation_translation(
+                        Vec3::new(0.02, 0.02, len * 0.5),
+                        turn,
+                        (from + to) * 0.5,
+                    ),
+                    self.light,
+                    false,
+                )
+            }
+            Effect::Flash { at } => (
+                Mat4::from_scale_rotation_translation(Vec3::splat(0.12), Quat::IDENTITY, at),
+                self.light,
+                false,
+            ),
+            Effect::Fire { at, size } => (
+                Mat4::from_scale_rotation_translation(
+                    Vec3::splat(size * (0.4 + age)),
+                    Quat::IDENTITY,
+                    at,
+                ),
+                self.fire,
+                true,
+            ),
+            Effect::Smoke { at, size } => (
+                Mat4::from_scale_rotation_translation(
+                    Vec3::splat(size * (0.5 + age)),
+                    Quat::IDENTITY,
+                    at + Vec3::Y * (age * size * 1.5),
+                ),
+                self.smoke,
+                true,
+            ),
+        };
+        // Smoke as nested shells, fainter outwards, for a softer edge.
+        let shells: &[f32] = if material == self.smoke {
+            &[0.55, 0.8, 1.0]
+        } else {
+            &[1.0]
+        };
+        let (vb, ib) = self.mesh;
+        for &shell in shells {
+            let world = world * Mat4::from_scale(Vec3::splat(shell));
+            queue.push(Primitive {
+                call: DrawCall {
+                    material,
+                    topology: Topology::TriangleList,
+                    vertex_buffer: vb,
+                    geometry: Geometry::Indexed {
+                        buffer: ib,
+                        first: 0,
+                        count: self.count,
+                        base_vertex: 0,
+                    },
+                    world,
+                    skin: None,
+                    instances: None,
+                },
+                layer: Layer::WORLD,
+                translucent,
+                sort_origin: world.transform_point3(Vec3::ZERO),
+                user: 0,
+            });
+        }
+    }
+}
+
+fn ground(
+    backend: &mut dyn RenderBackend,
+    materials: &mut MaterialCache,
+) -> anyhow::Result<(VertexBufferHandle, IndexBufferHandle, MaterialId)> {
+    use VertexFormat::*;
+    use VertexSemantic::*;
+    let layout =
+        VertexLayout::packed(&[(Position, Float3), (Normal, Float3), (TexCoord(0), Float2)])?;
+    let (h, t) = (GROUND_HALF, GROUND_HALF / GRID_TILE);
+    let corners = [
+        (-h, h, 0.0, 0.0),
+        (h, h, t, 0.0),
+        (h, -h, t, t),
+        (-h, -h, 0.0, t),
+    ];
+    let vertices: Vec<u8> = corners
+        .iter()
+        .flat_map(|&(x, z, u, v)| [x, 0.0, z, 0.0, 1.0, 0.0, u, v])
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let vb = backend.create_vertex_buffer(
+        &VertexBufferDesc {
+            layout,
+            vertex_count: 4,
+            usage: BufferUsage::Static,
+        },
+        Some(&vertices),
+    )?;
+    // Clockwise seen from above.
+    let indices: Vec<u8> = [0u16, 1, 2, 0, 2, 3]
+        .iter()
+        .flat_map(|i| i.to_le_bytes())
+        .collect();
+    let ib = backend.create_index_buffer(
+        &IndexBufferDesc {
+            format: IndexFormat::U16,
+            index_count: 6,
+            usage: BufferUsage::Static,
+        },
+        Some(&indices),
+    )?;
+    const SIZE: u32 = 128;
+    let texels: Vec<u8> = (0..SIZE * SIZE)
+        .flat_map(|i| {
+            let (x, y) = (i % SIZE, i / SIZE);
+            let line = x < 2 || y < 2;
+            if line {
+                [90, 96, 90, 255]
+            } else {
+                [150, 160, 140, 255]
+            }
+        })
+        .collect();
+    let mips = generate_mips(SIZE, SIZE, &texels);
+    let mips: Vec<&[u8]> = mips.iter().map(Vec::as_slice).collect();
+    let texture = backend.create_texture(
+        &TextureDesc {
+            width: SIZE,
+            height: SIZE,
+            format: TextureFormat::Rgba8Srgb,
+        },
+        &mips,
+    )?;
+    let material = materials.define(
+        backend,
+        &MaterialDesc {
+            texture: Some(texture),
+            ..MaterialDesc::default()
+        },
+    )?;
+    Ok((vb, ib, material))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use m2_render::NullBackend;
+
+    #[test]
+    fn ground_draws_through_the_null_backend() {
+        let mut backend = NullBackend::new();
+        let mut scene = Scene::new(&mut backend).unwrap();
+        let mut queue = DrawQueue::new();
+        let view = m2_render::View::default();
+        backend.begin_frame(&view).unwrap();
+        scene
+            .draw(
+                &mut backend,
+                &mut queue,
+                Vec3::ZERO,
+                &crate::combat::Combat::default(),
+            )
+            .unwrap();
+        queue.assign_keys(&view);
+        queue.sort().unwrap();
+        assert_eq!(queue.submit(&mut backend).unwrap().draws, 1);
+        backend.end_frame().unwrap();
+        assert_eq!(backend.live_buffers().texture, 1);
+    }
+}

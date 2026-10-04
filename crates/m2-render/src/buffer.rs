@@ -29,9 +29,11 @@ pub enum VertexFormat {
     Float2,
     Float3,
     Float4,
-    /// Four bytes, normalised to `0.0..=1.0` (D3D9 `D3DCOLOR` order is a
-    /// backend concern).
+    /// Four bytes, normalised to `0.0..=1.0`, in component order.
     UNorm4x8,
+    /// Four bytes, normalised to `0.0..=1.0`, stored B, G, R, A (Direct3D
+    /// 9's `D3DCOLOR`); shaders see them as R, G, B, A.
+    Bgra8,
     /// Four unsigned bytes, read as integers (blend indices).
     UInt4x8,
     Half2,
@@ -42,7 +44,7 @@ impl VertexFormat {
     /// Size in bytes.
     pub const fn size(self) -> u32 {
         match self {
-            Self::Float1 | Self::UNorm4x8 | Self::UInt4x8 | Self::Half2 => 4,
+            Self::Float1 | Self::UNorm4x8 | Self::Bgra8 | Self::UInt4x8 | Self::Half2 => 4,
             Self::Float2 | Self::Half4 => 8,
             Self::Float3 => 12,
             Self::Float4 => 16,
@@ -228,6 +230,22 @@ handle!(
     /// An index buffer owned by a backend.
     IndexBufferHandle
 );
+handle!(
+    /// A texture owned by a backend.
+    TextureHandle
+);
+
+/// A bone palette set for the current frame with
+/// [`set_skin`](crate::RenderBackend::set_skin). Valid only until that
+/// frame ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SkinHandle {
+    /// The frame it belongs to (the backend's frame counter).
+    pub frame: u64,
+    /// First matrix in the frame's palette storage.
+    pub first: u32,
+    pub count: u32,
+}
 
 #[cfg(test)]
 mod tests {

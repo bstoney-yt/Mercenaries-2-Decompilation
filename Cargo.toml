@@ -30,6 +30,13 @@ miniz_oxide = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.9"
+wgpu = "30"
+winit = "0.30"
+pollster = "1"
+rapier3d = "0.36"
+egui = "0.36"
+egui-wgpu = { version = "0.36", default-features = false }
+egui-winit = { version = "0.36", default-features = false }
 tracing = "0.1"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
