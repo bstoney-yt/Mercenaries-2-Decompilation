@@ -12,7 +12,6 @@
 //! and the calls they make are listed in order. Without hashes it also
 //! lists which entity components in the archive's layers name a script.
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -24,10 +23,6 @@ use m2_assets::lua::{Chunk, SCRIPT_TYPE};
 use m2_assets::{BlockContents, Layer, WadArchive};
 use m2_game::library::Library;
 use m2_game::script::ScriptHost;
-use mlua::{HookTriggers, VmState};
-
-/// Instructions one script may run before it is stopped.
-const BUDGET: u64 = 50_000_000;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -82,24 +77,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let host = ScriptHost::new()?;
     host.stub_missing_globals()?;
     host.install_library(Rc::clone(&library), true)?;
-    let spent = Rc::new(Cell::new(0u64));
-    let counter = Rc::clone(&spent);
-    host.lua().set_hook(
-        HookTriggers::new().every_nth_instruction(100_000),
-        move |_, _| {
-            counter.set(counter.get() + 100_000);
-            if counter.get() > BUDGET {
-                return Err(mlua::Error::runtime("instruction budget spent"));
-            }
-            Ok(VmState::Continue)
-        },
-    )?;
-
     let mut failures = Vec::new();
     if only.is_empty() {
         let import: mlua::Function = host.lua().globals().get("import")?;
         for name in library.module_names() {
-            spent.set(0);
             if let Err(e) = import.call::<mlua::Value>(name) {
                 failures.push(format!("module {name}: {e}"));
             }
@@ -117,7 +98,6 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         entries += 1;
-        spent.set(0);
         if let Err(e) = host.run_script(&library, script.hash) {
             failures.push(format!("script {:08x}: {e}", script.hash));
         }

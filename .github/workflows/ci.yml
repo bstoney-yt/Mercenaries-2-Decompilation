@@ -34,6 +34,10 @@ jobs:
       # in m2-game) can be compiled.
       - run: cargo clippy --workspace --all-targets --target i686-pc-windows-msvc
       - run: cargo build --workspace --target i686-pc-windows-msvc
+      # The script host's Lua raises errors with longjmp, which unwinds
+      # differently on Windows; run its tests there on both targets.
+      - run: cargo test -p m2-game
+      - run: cargo test -p m2-game --target i686-pc-windows-msvc
       - name: Build the alpha exe
         run: cargo build --release -p m2-alpha --target i686-pc-windows-msvc
       # Our code only: the exe reads the game from the player's own install.
