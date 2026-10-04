@@ -466,15 +466,26 @@ impl ScriptHost {
     pub fn init_modules(&self) -> Result<Vec<String>, ScriptError> {
         let mut failed = Vec::new();
         let globals = self.lua.globals();
-        for name in self.finished.borrow().clone() {
-            let Ok(Value::Table(m)) = globals.raw_get::<Value>(name.as_str()) else {
-                continue;
-            };
-            if let Ok(Value::Function(init)) = m.raw_get::<Value>("Init")
-                && let Err(e) = init.call::<()>(())
-            {
-                failed.push(format!("{name}: {}", tidy(&e.to_string())));
+        // An Init may import more modules, which append to the list (and
+        // must not find it borrowed): snapshot it, and go round again for
+        // the ones that joined.
+        let mut done = 0;
+        loop {
+            let order = self.finished.borrow().clone();
+            if done >= order.len() {
+                break;
             }
+            for name in &order[done..] {
+                let Ok(Value::Table(m)) = globals.raw_get::<Value>(name.as_str()) else {
+                    continue;
+                };
+                if let Ok(Value::Function(init)) = m.raw_get::<Value>("Init")
+                    && let Err(e) = init.call::<()>(())
+                {
+                    failed.push(format!("{name}: {}", tidy(&e.to_string())));
+                }
+            }
+            done = order.len();
         }
         Ok(failed)
     }
@@ -667,7 +678,11 @@ mod tests {
                 import("Task")
                 order = {}
                 Util.Init = function() order[#order + 1] = "Util" end
-                Task.Init = function() order[#order + 1] = "Task" end
+                -- An Init may import more: those run their Init too.
+                Task.Init = function()
+                    order[#order + 1] = "Task"
+                    import("There").Init = function() order[#order + 1] = "There" end
+                end
                 "#,
             )
             .exec()
@@ -685,7 +700,7 @@ mod tests {
             .sequence_values()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(order, ["Util", "Task"]);
+        assert_eq!(order, ["Util", "Task", "There"]);
     }
 
     #[test]
