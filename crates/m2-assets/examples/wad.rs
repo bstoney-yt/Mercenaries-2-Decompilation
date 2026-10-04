@@ -11,6 +11,7 @@
 //! cargo run -p m2-assets --example wad -- obj     <archive.wad> <model hash> <out.obj> [lod]
 //! cargo run -p m2-assets --example wad -- anims   <archive.wad>
 //! cargo run -p m2-assets --example wad -- world   <archive.wad>
+//! cargo run -p m2-assets --example wad -- types   <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -25,6 +26,10 @@
 //! `world` parses every terrain cell, low-resolution tile and entity layer,
 //! checks material references and that the layout layer places each cell
 //! on the 400 m grid, and summarises the components.
+//! `types` summarises every asset type: how many, their sizes, a few names
+//! and block paths, the section layout of one, any `Lua` bytecode or
+//! script-like text, and the longest readable strings in one sample, to
+//! find which types hold what (missions, scripts) without dumping data.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -65,7 +70,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         [cmd, path, ..] => (cmd.as_str(), path),
         _ => {
             return Err(
-                "usage: wad <list|assets|names|extract|textures|dds|models|obj|anims|world> <archive.wad> [args]".into(),
+                "usage: wad <list|assets|names|extract|textures|dds|models|obj|anims|world|types> <archive.wad> [args]".into(),
             );
         }
     };
@@ -103,6 +108,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        ("types", []) => types(&mut wad)?,
         ("names", []) => {
             // Decodes every block; use --release for the large archives.
             let types = index.type_hashes().to_vec();
@@ -962,4 +968,113 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
     }
     eprintln!("{errors} errors");
     Ok(())
+}
+
+/// Per type: count, bytes, sample names and paths, layout and strings.
+fn types<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[derive(Default)]
+    struct Seen {
+        count: usize,
+        bytes: usize,
+        largest: usize,
+        names: Vec<String>,
+        paths: Vec<String>,
+        lua: usize,
+        layout: String,
+        strings: Vec<String>,
+    }
+    let paths: Vec<String> = wad
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    let mut seen: std::collections::BTreeMap<u32, Seen> = Default::default();
+    for (block, path) in paths.iter().enumerate() {
+        let decoded = match wad.read_block(block) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("block {block}: {e}");
+                continue;
+            }
+        };
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (entry, data) in contents.iter() {
+            let s = seen.entry(entry.type_hash).or_default();
+            s.count += 1;
+            s.bytes += data.len();
+            if data.windows(4).any(|w| w == b"\x1bLua") {
+                s.lua += 1;
+            }
+            let ucfx = Ucfx::parse(data).ok();
+            if let Some(n) = ucfx.as_ref().and_then(|u| u.name())
+                && s.names.len() < 6
+            {
+                s.names.push(n.to_owned());
+            }
+            if s.paths.len() < 3 && !s.paths.contains(path) {
+                s.paths.push(path.clone());
+            }
+            // The largest instance stands for the type.
+            if data.len() > s.largest {
+                s.largest = data.len();
+                s.layout = match &ucfx {
+                    Some(u) => u
+                        .sections()
+                        .iter()
+                        .take(24)
+                        .map(|x| {
+                            format!(
+                                "{}{}{}",
+                                "  ".repeat(x.depth),
+                                String::from_utf8_lossy(&x.fourcc),
+                                x.data.map_or(String::new(), |d| format!(" {}", d.len()))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" |"),
+                    None => format!("not UCFX: {:02x?}", &data[..data.len().min(16)]),
+                };
+                s.strings = readable(data, 6);
+            }
+        }
+    }
+    let known = wad.index().type_hashes().to_vec();
+    for (ty, s) in &seen {
+        println!(
+            "type {ty:08x} (#{}): {} assets, {} bytes (largest {}), lua {}",
+            known
+                .iter()
+                .position(|t| t == ty)
+                .map_or("?".into(), |i| i.to_string()),
+            s.count,
+            s.bytes,
+            s.largest,
+            s.lua
+        );
+        println!("  names: {}", s.names.join(", "));
+        println!("  blocks: {}", s.paths.join(", "));
+        println!("  layout: {}", s.layout);
+        println!("  strings: {}", s.strings.join(" | "));
+    }
+    Ok(())
+}
+
+/// Up to 12 of the longest runs of printable ASCII at least `min` long,
+/// each cut to 60 characters.
+fn readable(data: &[u8], min: usize) -> Vec<String> {
+    let mut runs: Vec<&[u8]> = data
+        .split(|b| !(0x20..0x7f).contains(b))
+        .filter(|r| r.len() >= min)
+        .collect();
+    runs.sort_by_key(|r| std::cmp::Reverse(r.len()));
+    runs.dedup();
+    runs.iter()
+        .take(12)
+        .map(|r| String::from_utf8_lossy(&r[..r.len().min(60)]).into_owned())
+        .collect()
 }
