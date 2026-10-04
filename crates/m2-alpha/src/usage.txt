@@ -20,6 +20,10 @@ m2-alpha [options]
                          nearest parked vehicle and drive it forward first
   --fight                with --screenshot on the island: shoot the nearest
                          soldier, rocket a vehicle, throw a grenade first
+  --mission              run the game's mission scripts: the first contract
+                         starts as in the game, with its objectives and
+                         markers on screen (log: m2-alpha-mission.log);
+                         with --screenshot, plays ten seconds of it first
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
