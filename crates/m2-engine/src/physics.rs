@@ -195,6 +195,11 @@ const SERVICE_BRAKE: f32 = 8.0;
 const HANDBRAKE: f32 = 9.0;
 const ROLLING: f32 = 0.6;
 const HOLD: f32 = 3.0;
+/// How far a ragdoll's limb may drift off its joint before it is put
+/// back, metres.
+const RAGDOLL_SLACK: f32 = 0.02;
+/// How quickly a wreck stops sliding and spinning (invented).
+const WRECK_DAMPING: f32 = 1.5;
 /// How fast tracks turn a hull standing still, radians per second.
 const TRACK_TURN: f32 = 0.9;
 
@@ -283,6 +288,11 @@ struct Ragdoll {
     /// it went limp.
     locals: Vec<Mat4>,
     bodies: Vec<Option<r::RigidBodyHandle>>,
+    /// The roots follow the first limb: (root, limb, root from limb).
+    roots: Vec<(usize, usize, Mat4)>,
+    /// Each limb's joint: (limb, the limb it hangs from, where in that
+    /// limb), parents first.
+    joints: Vec<(usize, usize, Vec3)>,
 }
 
 /// The physics world.
@@ -378,6 +388,41 @@ impl Physics {
             v.controller.update_vehicle(dt, queries);
         }
         self.world.step();
+        self.hold_ragdolls_together();
+    }
+
+    /// Puts each limb back on its joint where the solver let it drift (a
+    /// hard landing or a car can pull joints apart), and takes away the
+    /// speed it was drifting off with.
+    fn hold_ragdolls_together(&mut self) {
+        for doll in self.ragdolls.iter().flatten() {
+            for &(limb, on, anchor) in &doll.joints {
+                let (Some(lh), Some(oh)) = (doll.bodies[limb], doll.bodies[on]) else {
+                    continue;
+                };
+                let Some(parent) = self.world.bodies.get(oh) else {
+                    continue;
+                };
+                let p = parent.position();
+                let want = vec3(p.translation) + Quat::from_array(p.rotation.to_array()) * anchor;
+                let parent_v = vec3(parent.linvel());
+                let Some(b) = self.world.bodies.get_mut(lh) else {
+                    continue;
+                };
+                let here = vec3(b.translation());
+                let off = here - want;
+                if off.length() < RAGDOLL_SLACK {
+                    continue;
+                }
+                b.set_translation(vector(want), true);
+                let dir = off.normalize();
+                let v = vec3(b.linvel());
+                let apart = (v - parent_v).dot(dir);
+                if apart > 0.0 {
+                    b.set_linvel(vector(v - dir * apart), true);
+                }
+            }
+        }
     }
 
     /// Adds a vehicle built from `spec`, its wheels resting on the ground
@@ -552,7 +597,6 @@ impl Physics {
             .unwrap_or_default()
     }
 
-    /// Signed forward speed, m/s.
     /// A vehicle's velocity, m/s.
     pub fn vehicle_velocity(&self, id: VehicleId) -> Vec3 {
         self.vehicles
@@ -562,11 +606,27 @@ impl Physics {
             .map_or(Vec3::ZERO, |b| vec3(b.linvel()))
     }
 
+    /// Signed forward speed, m/s.
     pub fn vehicle_speed(&self, id: VehicleId) -> f32 {
         self.vehicles
             .get(id.0)
             .and_then(Option::as_ref)
             .map_or(0.0, |v| v.controller.current_vehicle_speed)
+    }
+
+    /// Makes a vehicle a wreck: its wheels no longer roll freely and it
+    /// soon stops sliding (burst tyres, bent axles).
+    pub fn wreck_vehicle(&mut self, id: VehicleId) {
+        let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
+            return;
+        };
+        for w in v.controller.wheels_mut() {
+            w.friction_slip *= 0.5;
+        }
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_linear_damping(WRECK_DAMPING);
+            body.set_angular_damping(WRECK_DAMPING);
+        }
     }
 
     /// Turns an overturned vehicle upright where it is.
@@ -634,6 +694,7 @@ impl Physics {
             r::InteractionTestMode::And,
         );
         let mut bodies: Vec<Option<r::RigidBodyHandle>> = vec![None; n];
+        let mut joints = Vec::new();
         // Parents come before their children.
         for i in 0..n {
             let Some(parent) = parents[i].filter(|&p| p < n) else {
@@ -679,6 +740,7 @@ impl Physics {
             while let Some(a) = up {
                 if let Some(other) = bodies[a] {
                     let anchor = at[a].1.inverse() * (p - at[a].0);
+                    joints.push((i, a, anchor));
                     self.world.insert_impulse_joint(
                         other,
                         body,
@@ -698,10 +760,24 @@ impl Physics {
                 None => nodes[i],
             })
             .collect();
+        // Roots have no limb of their own (nor whatever hangs from them
+        // without one): they go with the first limb, as they stood.
+        let first = (0..n).find(|&i| bodies[i].is_some());
+        let roots = first
+            .map(|k| {
+                let limb = Mat4::from_rotation_translation(at[k].1, at[k].0);
+                (0..n)
+                    .filter(|&i| parents[i].is_none_or(|p| p >= n) && bodies[i].is_none())
+                    .map(|i| (i, k, limb.inverse() * nodes[i]))
+                    .collect()
+            })
+            .unwrap_or_default();
         self.ragdolls.push(Some(Ragdoll {
             parents: parents[..n].to_vec(),
             locals,
             bodies,
+            roots,
+            joints,
         }));
         RagdollId(self.ragdolls.len() - 1)
     }
@@ -709,19 +785,23 @@ impl Physics {
     /// A ragdoll's node matrices, world space; `None` once removed.
     pub fn ragdoll_nodes(&self, id: RagdollId) -> Option<Vec<Mat4>> {
         let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        let limb = |i: usize| {
+            let b = doll.bodies[i].and_then(|h| self.world.bodies.get(h))?;
+            let p = b.position();
+            Some(Mat4::from_rotation_translation(
+                Quat::from_array(p.rotation.to_array()),
+                vec3(p.translation),
+            ))
+        };
         let mut out: Vec<Mat4> = Vec::with_capacity(doll.locals.len());
         for i in 0..doll.locals.len() {
-            let limb = doll.bodies[i].and_then(|h| self.world.bodies.get(h));
-            let m = match (limb, doll.parents[i]) {
-                (Some(b), _) => {
-                    let p = b.position();
-                    Mat4::from_rotation_translation(
-                        Quat::from_array(p.rotation.to_array()),
-                        vec3(p.translation),
-                    )
-                }
+            let m = match (limb(i), doll.parents[i]) {
+                (Some(m), _) => m,
                 (None, Some(p)) if p < i => out[p] * doll.locals[i],
-                _ => doll.locals[i],
+                _ => match doll.roots.iter().find(|r| r.0 == i) {
+                    Some(&(_, k, rel)) => limb(k).map_or(doll.locals[i], |m| m * rel),
+                    None => doll.locals[i],
+                },
             };
             out.push(m);
         }
@@ -848,8 +928,23 @@ mod tests {
             assert!(at.y > -0.1 && at.y < 0.8, "{at}");
             assert!(at.x > 0.5, "carried along: {at}");
         }
-        // Limbs stay joined.
+        // Limbs stay joined, and the root (no limb of its own) goes with
+        // them.
         assert!(now[1].w_axis.distance(now[2].w_axis) < 0.6);
+        assert!(
+            now[0].w_axis.distance(now[1].w_axis) < 1.2,
+            "{}",
+            now[0].w_axis
+        );
+        p.push_ragdoll(id, Vec3::new(0.0, 15.0, 25.0));
+        for _ in 0..30 {
+            p.step(DT);
+            let now = p.ragdoll_nodes(id).unwrap();
+            for (a, b) in [(1, 2), (2, 3), (2, 4)] {
+                let gap = now[a].w_axis.distance(now[b].w_axis);
+                assert!(gap < 0.7, "{a}-{b} {gap}");
+            }
+        }
         let (d, _) = p
             .cast_ray(Vec3::new(now[2].w_axis.x, 5.0, 0.0), -Vec3::Y, 10.0)
             .unwrap();
@@ -961,10 +1056,12 @@ mod tests {
             seat: None,
             door: None,
             tracked: false,
+            road_wheels: Vec::new(),
             rest: Vec::new(),
             node_wheel: Vec::new(),
             mass: 1400.0,
             turret: Vec::new(),
+            pivot: None,
         }
     }
 

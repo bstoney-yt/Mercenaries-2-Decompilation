@@ -228,7 +228,15 @@ impl Game {
                 if intent.use_pressed {
                     match player.driving {
                         Some(i) => get_out(physics, &scene.vehicles[i], player),
-                        None => player.driving = nearest(physics, &scene.vehicles, player, REACH),
+                        None => {
+                            player.driving = nearest(physics, &scene.vehicles, player, REACH);
+                            // Seated: she no longer waits to land (people
+                            // wait on that, and she may have hopped out and
+                            // back in before the ground streamed).
+                            if player.driving.is_some() {
+                                player.landed = true;
+                            }
+                        }
                     }
                 }
                 let id = player
@@ -242,7 +250,8 @@ impl Game {
                         id,
                         VehicleControls {
                             throttle: intent.movement.y,
-                            steer: intent.movement.x,
+                            // Wheels turned the positive way steer left.
+                            steer: -intent.movement.x,
                             brake: intent.hold_jump,
                         },
                     );
@@ -278,6 +287,29 @@ impl Game {
                 }
             } else {
                 physics.step(dt);
+            }
+        }
+        if let Some(world) = &mut self.scene.world {
+            let driven = self
+                .scene
+                .player
+                .as_ref()
+                .filter(|_| self.on_foot)
+                .and_then(|p| p.driving);
+            for (i, v) in self.scene.vehicles.iter_mut().enumerate() {
+                let Some(id) = v.id else { continue };
+                v.rolled += world.physics.vehicle_speed(id) * dt;
+                // Nobody at the wheel: it coasts to a stop and stays put; a
+                // wreck's brakes are locked.
+                if driven != Some(i) {
+                    world.physics.drive(
+                        id,
+                        VehicleControls {
+                            brake: v.wrecked,
+                            ..VehicleControls::default()
+                        },
+                    );
+                }
             }
         }
         let focus = self.focus();
@@ -462,6 +494,7 @@ impl Game {
             return false;
         };
         player.driving = nearest(&world.physics, &self.scene.vehicles, player, reach);
+        player.landed |= player.driving.is_some();
         player.driving.is_some()
     }
 
@@ -667,8 +700,12 @@ fn restore(physics: &mut Physics, vehicles: &mut [ParkedVehicle], saved: &mut Ve
         let s = saved.swap_remove(k);
         // A little high, to settle onto its wheels.
         let at = s.position() + Vec3::Y * 0.3;
-        v.id = Some(physics.add_vehicle(&v.spec, at, s.yaw));
+        let id = physics.add_vehicle(&v.spec, at, s.yaw);
+        v.id = Some(id);
         v.wrecked = s.wrecked;
+        if v.wrecked {
+            physics.wreck_vehicle(id);
+        }
     }
 }
 

@@ -15,8 +15,8 @@ use crate::player::Player;
 use crate::scene::{ParkedVehicle, Rig};
 
 /// Skeleton nodes the rifle is held between.
-const RIGHT_HAND: u32 = 0xeb6f_1b2d;
-const LEFT_HAND: u32 = 0xd34f_7713;
+const RIGHT_HAND: u32 = 0xd34f_7713;
+const LEFT_HAND: u32 = 0xeb6f_1b2d;
 /// Muzzle marker node of the weapon models.
 pub const MUZZLE: u32 = 0xb148_6ef3;
 
@@ -856,6 +856,7 @@ impl Combat {
                     .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
                 if !v.wrecked {
                     v.wrecked = true;
+                    f.physics.wreck_vehicle(id);
                     self.wrecks.push((i, 0.0));
                     self.remarks.push(Remark::Wreck);
                 }

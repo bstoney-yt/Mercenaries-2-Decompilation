@@ -180,18 +180,25 @@ pub struct VehicleSpec {
     /// Driver's seat and door markers, model space.
     pub seat: Option<Vec3>,
     pub door: Option<Vec3>,
-    /// Tracked vehicles (tanks, APCs) drive on wheels found or made up;
-    /// their wheels are not turned when drawn.
+    /// Tracked vehicles (tanks, APCs without usable wheels) drive on four
+    /// made-up wheels; their road wheels turn with the ground covered.
     pub tracked: bool,
+    /// A tracked vehicle's road wheels as drawn: centre and radius, model
+    /// space.
+    pub road_wheels: Vec<(Vec3, f32)>,
     /// Each node's rest transform (node to model).
     pub rest: Vec<Mat4>,
-    /// The wheel each node turns with, if any.
+    /// The wheel each node turns with, if any: an index into `wheels`, or
+    /// into `road_wheels` when tracked.
     pub node_wheel: Vec<Option<usize>>,
     /// Mass, kg (by kind; invented).
     pub mass: f32,
     /// The nodes that turn with the turret (its mount, every node under
     /// it), if it has one.
     pub turret: Vec<bool>,
+    /// Where the turret turns about, model space, when its mount node sits
+    /// off the turret (else the mount).
+    pub pivot: Option<Vec3>,
 }
 
 /// The node a turret turns about, in every vehicle that has one: both the
@@ -207,37 +214,40 @@ impl VehicleSpec {
         if !bounds.0.is_finite() || !bounds.1.is_finite() || bounds.0.cmpge(bounds.1).any() {
             return None;
         }
-        let tracked = entry.kind == "tank" || entry.kind == "apc";
         let found = vehicle::find_wheels(model);
         let usable = (4..=10).contains(&found.len())
             && found.iter().all(|w| (0.15..=1.3).contains(&w.radius));
+        // A wheeled APC (the Stryker) drives on its wheels.
+        let tracked = entry.kind == "tank" || (entry.kind == "apc" && !usable);
         let n = model.nodes.len();
         let mut node_wheel = vec![None; n];
-        let wheels: Vec<WheelSpec> = if usable {
+        // Each found wheel's subtree: every node with one of its roots as
+        // an ancestor (or itself).
+        let mut mark = |i: usize, roots: &[u16]| {
+            for &root in roots {
+                for (k, slot) in node_wheel.iter_mut().enumerate() {
+                    let mut at = Some(k as u16);
+                    for _ in 0..=n {
+                        match at {
+                            Some(c) if c == root => {
+                                *slot = Some(i);
+                                break;
+                            }
+                            Some(c) => at = model.nodes.get(usize::from(c)).and_then(|x| x.parent),
+                            None => break,
+                        }
+                    }
+                }
+            }
+        };
+        let mut road_wheels = Vec::new();
+        let wheels: Vec<WheelSpec> = if usable && !tracked {
             let front = found
                 .iter()
                 .map(|w| w.centre[2])
                 .fold(f32::NEG_INFINITY, f32::max);
             for (i, w) in found.iter().enumerate() {
-                for &root in &w.nodes {
-                    // The wheel's subtree: every node with `root` as an
-                    // ancestor (or itself).
-                    for (k, slot) in node_wheel.iter_mut().enumerate() {
-                        let mut at = Some(k as u16);
-                        for _ in 0..=n {
-                            match at {
-                                Some(c) if c == root => {
-                                    *slot = Some(i);
-                                    break;
-                                }
-                                Some(c) => {
-                                    at = model.nodes.get(usize::from(c)).and_then(|x| x.parent)
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                }
+                mark(i, &w.nodes);
             }
             found
                 .iter()
@@ -249,6 +259,10 @@ impl VehicleSpec {
                 })
                 .collect()
         } else if tracked {
+            for w in found.iter().filter(|w| (0.1..=1.3).contains(&w.radius)) {
+                mark(road_wheels.len(), &w.nodes);
+                road_wheels.push((Vec3::from(w.centre), w.radius));
+            }
             // Four stand-in wheels under the hull's corners.
             let (lo, hi) = bounds;
             let r = 0.45;
@@ -270,7 +284,7 @@ impl VehicleSpec {
             .map(|i| model.node_to_model(i as u16).unwrap_or(Mat4::IDENTITY))
             .collect();
         let mount = model.nodes.iter().position(|x| x.name_hash == TURRET_MOUNT);
-        let turret = (0..n)
+        let turret: Vec<bool> = (0..n)
             .map(|k| {
                 let mut at = Some(k as u16);
                 for _ in 0..=n {
@@ -283,6 +297,27 @@ impl VehicleSpec {
                 false
             })
             .collect();
+        // Some mounts sit away from their turret (the Stryker's, off the
+        // ring): turn about the middle of the turret's biggest part instead.
+        let pivot = mount.and_then(|m| {
+            let at = model.node_to_model(m as u16)?.w_axis.truncate();
+            let b = vehicle::node_boxes(model)
+                .into_iter()
+                .filter(|b| turret.get(usize::from(b.node)).copied().unwrap_or(false))
+                .max_by(|a, b| {
+                    let area = |b: &vehicle::NodeBox| (b.max[0] - b.min[0]) * (b.max[2] - b.min[2]);
+                    area(a).total_cmp(&area(b))
+                })?;
+            let inside =
+                (b.min[0]..=b.max[0]).contains(&at.x) && (b.min[2]..=b.max[2]).contains(&at.z);
+            (!inside).then(|| {
+                Vec3::new(
+                    (b.min[0] + b.max[0]) * 0.5,
+                    at.y,
+                    (b.min[2] + b.max[2]) * 0.5,
+                )
+            })
+        });
         let marker = |h| vehicle::marker(model, h).map(Vec3::from);
         let mass = match entry.kind.as_str() {
             "car" => 1400.0,
@@ -301,10 +336,12 @@ impl VehicleSpec {
             seat: marker(DRIVER_SEAT),
             door: marker(DRIVER_DOOR),
             tracked,
+            road_wheels,
             rest,
             node_wheel,
             mass,
             turret,
+            pivot,
         })
     }
 
@@ -319,29 +356,37 @@ impl VehicleSpec {
     }
 
     /// Node matrices (model space) with each wheel steered by `steer` and
-    /// spun by `spin` radians about its centre, and the turret turned
+    /// spun by `spin` radians about its centre (a tracked vehicle's road
+    /// wheels rolled `rolled` metres instead), and the turret turned
     /// `turret` radians (anticlockwise from above) about its mount.
-    pub fn posed_nodes(&self, wheels: &[(f32, f32)], turret: f32) -> Vec<Mat4> {
-        let turns: Vec<Mat4> = self
-            .wheels
-            .iter()
-            .zip(wheels)
-            .map(|(w, &(steer, spin))| {
-                if self.tracked {
-                    return Mat4::IDENTITY;
-                }
-                Mat4::from_translation(w.centre)
-                    * Mat4::from_rotation_y(if w.steers { steer } else { 0.0 })
-                    * Mat4::from_rotation_x(spin)
-                    * Mat4::from_translation(-w.centre)
-            })
-            .collect();
-        let mount = self
-            .turret
-            .iter()
-            .zip(&self.rest)
-            .find(|(on, _)| **on)
-            .map(|(_, m)| m.w_axis.truncate());
+    pub fn posed_nodes(&self, wheels: &[(f32, f32)], rolled: f32, turret: f32) -> Vec<Mat4> {
+        let about = |centre: Vec3, steer: f32, spin: f32| {
+            Mat4::from_translation(centre)
+                * Mat4::from_rotation_y(steer)
+                * Mat4::from_rotation_x(spin)
+                * Mat4::from_translation(-centre)
+        };
+        let turns: Vec<Mat4> = if self.tracked {
+            self.road_wheels
+                .iter()
+                .map(|&(centre, radius)| about(centre, 0.0, rolled / radius))
+                .collect()
+        } else {
+            self.wheels
+                .iter()
+                .zip(wheels)
+                .map(|(w, &(steer, spin))| {
+                    about(w.centre, if w.steers { steer } else { 0.0 }, spin)
+                })
+                .collect()
+        };
+        let mount = self.pivot.or_else(|| {
+            self.turret
+                .iter()
+                .zip(&self.rest)
+                .find(|(on, _)| **on)
+                .map(|(_, m)| m.w_axis.truncate())
+        });
         let aim = mount.map_or(Mat4::IDENTITY, |at| {
             Mat4::from_translation(at) * Mat4::from_rotation_y(turret) * Mat4::from_translation(-at)
         });
@@ -389,6 +434,7 @@ mod tests {
             seat: None,
             door: None,
             tracked: false,
+            road_wheels: Vec::new(),
             rest: vec![
                 Mat4::IDENTITY,
                 Mat4::from_translation(Vec3::new(-0.9, 0.35, 1.4)),
@@ -396,6 +442,7 @@ mod tests {
             node_wheel: vec![None, Some(0)],
             mass: 1400.0,
             turret: vec![false, false],
+            pivot: None,
         }
     }
 
@@ -408,7 +455,7 @@ mod tests {
         s.node_wheel.extend([None, None]);
         s.turret = vec![false, false, true, true];
         let still = [(0.0, 0.0); 4];
-        let posed = s.posed_nodes(&still, std::f32::consts::FRAC_PI_2);
+        let posed = s.posed_nodes(&still, 0.0, std::f32::consts::FRAC_PI_2);
         assert!(posed[2].w_axis.truncate().abs_diff_eq(mount, 1e-5));
         let barrel = posed[3].w_axis.truncate();
         assert!(barrel.abs_diff_eq(mount + Vec3::X * 2.0, 1e-5), "{barrel}");
@@ -418,7 +465,7 @@ mod tests {
     #[test]
     fn wheels_turn_their_nodes_about_their_centres() {
         let s = spec();
-        let posed = s.posed_nodes(&[(0.5, 1.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], 0.0);
+        let posed = s.posed_nodes(&[(0.5, 1.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], 0.0, 0.0);
         assert_eq!(posed[0], Mat4::IDENTITY);
         // The wheel node sits at the wheel's centre, so turning keeps it
         // there.

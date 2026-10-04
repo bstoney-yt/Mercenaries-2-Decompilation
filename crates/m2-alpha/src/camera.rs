@@ -35,7 +35,7 @@ impl FlyCamera {
 
     pub fn right(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
-        Vec3::new(cy, 0.0, -sy)
+        Vec3::new(-cy, 0.0, sy)
     }
 
     /// One fixed tick of `dt` seconds.
@@ -43,7 +43,7 @@ impl FlyCamera {
         let (dx, dy) = input.take_mouse();
         if mouse_look {
             let invert = if config.invert_y { -1.0 } else { 1.0 };
-            self.yaw += dx as f32 * config.mouse_sensitivity;
+            self.yaw -= dx as f32 * config.mouse_sensitivity;
             self.pitch -= dy as f32 * config.mouse_sensitivity * invert;
             self.pitch = self.pitch.clamp(-1.55, 1.55);
         }
@@ -78,8 +78,8 @@ mod tests {
     fn looking_at_points_the_right_way() {
         let c = FlyCamera::looking_at(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0));
         assert!((c.forward() - Vec3::X).length() < 1e-5);
-        // Left-handed: facing +x, right is -z.
-        assert!((c.right() - Vec3::NEG_Z).length() < 1e-5);
+        // Right-handed: facing +x, right is +z.
+        assert!((c.right() - Vec3::Z).length() < 1e-5);
         let c = FlyCamera::looking_at(Vec3::ZERO, Vec3::new(0.0, 5.0, 5.0));
         assert!((c.pitch - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
     }

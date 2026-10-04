@@ -56,8 +56,9 @@ impl Intent {
         let (dx, dy) = input.take_mouse();
         let look = if mouse_look {
             let invert = if config.invert_y { -1.0 } else { 1.0 };
+            // Turning right turns the yaw (from +z towards +x) back.
             Vec2::new(
-                dx as f32 * config.mouse_sensitivity,
+                -dx as f32 * config.mouse_sensitivity,
                 -dy as f32 * config.mouse_sensitivity * invert,
             )
         } else {
@@ -189,7 +190,8 @@ impl Player {
 
         let (s, c) = self.yaw.sin_cos();
         let forward = Vec3::new(s, 0.0, c);
-        let right = Vec3::new(c, 0.0, -s);
+        // Right-handed, +y up: right is forward turned clockwise from above.
+        let right = Vec3::new(-c, 0.0, s);
         let direction = forward * intent.movement.y + right * intent.movement.x;
         let speed = if intent.walk {
             WALK
