@@ -1105,6 +1105,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     )
     .set_name("=m2-gui")
     .exec()?;
+    // The widget store the HUD draws from replaces the stand-in above.
+    crate::gui_runtime::install(lua)?;
 
     // Object filters: sets of objects scripts build (objects added or
     // excluded one by one, the players, a label) and hand to objectives
