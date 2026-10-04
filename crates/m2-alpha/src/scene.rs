@@ -252,20 +252,20 @@ impl Rig {
         *self.hands.get_or_init(|| crate::combat::aim_hands(self))
     }
 
-    /// The arm of the hand that carries the rifle ([`Rig::aim_hands`]'s
-    /// rear hand).
+    /// The arm of the hand that carries the rifle low.
     pub fn carry_arm(&self) -> Option<Arc<[bool]>> {
         self.arm
             .get_or_init(|| {
-                let (rear, front) = self.aim_hands()?;
-                self.skeleton.arm(rear, front)
+                let (right, left) = crate::combat::hands(&self.skeleton)?;
+                self.skeleton.arm(right, left)
             })
             .clone()
     }
 
-    /// The hand that holds the rifle, aimed or carried.
+    /// The hand that carries the rifle low: her right (the aim pose holds
+    /// it in whichever hand is rear, [`Rig::aim_hands`]).
     pub fn rifle_hand(&self) -> Option<usize> {
-        self.aim_hands().map(|(rear, _)| rear)
+        crate::combat::hands(&self.skeleton).map(|(right, _)| right)
     }
 
     /// Aims along `dir` (world space) for a body turned to `facing`, or
