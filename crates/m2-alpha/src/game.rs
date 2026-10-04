@@ -249,10 +249,11 @@ impl Game {
                     }
                 }
                 physics.step(dt);
-                match id.and_then(|(id, v)| Some((physics.vehicle_transform(id)?, v))) {
-                    Some((at, v)) => {
+                match id.and_then(|(id, v)| Some((physics.vehicle_transform(id)?, v, id))) {
+                    Some((at, v, id)) => {
                         let length = v.spec.bounds.1.z - v.spec.bounds.0.z;
-                        player.chase(at, length, intent.look, dt);
+                        let speed = physics.vehicle_speed(id);
+                        player.chase(at, length, intent.look, speed, dt);
                     }
                     None => {
                         player.driving = None;
