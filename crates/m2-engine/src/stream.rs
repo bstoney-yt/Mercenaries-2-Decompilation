@@ -910,12 +910,10 @@ impl World {
                 // checked, everything within reach draws.
                 let reach2 = self.settings.scatter_distance.powi(2);
                 near.clear();
-                near.extend(
-                    c.instances.iter().filter(|m| {
-                        let at = m.w_axis.truncate();
-                        at.distance_squared(eye) <= reach2 && frustum.sees(at, CLUMP_RADIUS)
-                    }),
-                );
+                near.extend(c.instances.iter().filter(|m| {
+                    let at = m.w_axis.truncate();
+                    at.distance_squared(eye) <= reach2 && frustum.sees(at, CLUMP_RADIUS)
+                }));
                 if near.is_empty() {
                     continue;
                 }
