@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
-use m2_math::glam::{Mat4, Quat, Vec3};
+use m2_math::glam::{Mat4, Quat, Vec3, Vec4, Vec4Swizzles};
 use m2_render::{
     BackendError, BlendMode, BufferUsage, DetailMap, DrawCall, DrawQueue, Geometry,
     IndexBufferDesc, IndexBufferHandle, IndexFormat, Layer, MaterialDesc, MaterialId, Primitive,
@@ -783,6 +783,7 @@ impl World {
         backend: &mut dyn RenderBackend,
         queue: &mut DrawQueue,
         eye: Vec3,
+        frustum: &Frustum,
     ) -> Result<(), BackendError> {
         let terrain = |t: &TerrainGpu, queue: &mut DrawQueue| {
             queue.push(Primitive {
@@ -845,6 +846,12 @@ impl World {
                     }
                     if let Some(Slot::Ready(m)) = self.models.get(&o.model)
                         && (!o.named || d <= draw_reach(m.bounds, props))
+                        && {
+                            // Out of view: not drawn.
+                            let (lo, hi) = m.bounds;
+                            let centre = o.position + o.rotation * ((lo + hi) * 0.5);
+                            frustum.sees(centre, (hi - lo).length() * 0.5)
+                        }
                     {
                         m.draw(
                             queue,
@@ -994,9 +1001,46 @@ fn sea_plane(
     Ok((vb, ib, material))
 }
 
+/// The four side planes of a view's frustum, facing in. Near and far are
+/// left out: distance limits what is drawn already, and so the planes
+/// hold for either depth convention.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frustum([Vec4; 4]);
+
+impl Frustum {
+    /// The frustum of `view_proj` (projection times view).
+    pub fn from_view_proj(m: Mat4) -> Self {
+        let (r0, r1, r3) = (m.row(0), m.row(1), m.row(3));
+        Self([r3 + r0, r3 - r0, r3 + r1, r3 - r1].map(|p| p / p.xyz().length().max(1e-6)))
+    }
+
+    /// Everything is in view.
+    pub fn everything() -> Self {
+        Self([Vec4::new(0.0, 0.0, 0.0, 1.0); 4])
+    }
+
+    /// Whether any of the sphere at `centre` of `radius` may be in view.
+    pub fn sees(&self, centre: Vec3, radius: f32) -> bool {
+        self.0.iter().all(|p| p.xyz().dot(centre) + p.w >= -radius)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frustum_sees_ahead_not_behind() {
+        let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(0.0, 0.0, -1.0), Vec3::Y);
+        let proj = Mat4::perspective_rh(1.0, 1.5, 0.1, 1000.0);
+        let f = Frustum::from_view_proj(proj * view);
+        assert!(f.sees(Vec3::new(0.0, 0.0, -50.0), 1.0));
+        assert!(!f.sees(Vec3::new(0.0, 0.0, 50.0), 1.0));
+        assert!(!f.sees(Vec3::new(200.0, 0.0, -50.0), 1.0));
+        // Big enough to reach into view from just outside it.
+        assert!(f.sees(Vec3::new(60.0, 0.0, -50.0), 40.0));
+        assert!(Frustum::everything().sees(Vec3::new(0.0, 0.0, 50.0), 0.0));
+    }
 
     #[test]
     fn buckets_floor_negative_coordinates() {

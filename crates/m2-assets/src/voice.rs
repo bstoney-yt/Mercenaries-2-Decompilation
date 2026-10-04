@@ -30,9 +30,12 @@
 //! 0x38  u32  stream index: which voice stream to play
 //! ```
 //!
-//! Longer records (128 to 392 bytes) are something else, probably groups of
-//! lines to choose between; they are counted but not decoded. A line's length
-//! is best taken from the stream it plays.
+//! A line's stream is the one variant at 0x34: `u32` bank (the voice
+//! index's hash), `u32` stream index, `f32` weight. Longer records are
+//! groups: one cue with the same first 0x30 bytes that picks at random among
+//! several variants, which start at 0x68 and run to the record's end
+//! (12 bytes each, weights summing to 1). A line's length is best taken
+//! from the stream it plays.
 //!
 //! # Provenance
 //!
@@ -101,14 +104,46 @@ impl Line {
     }
 }
 
+/// One cue that picks at random among several streams.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group {
+    pub cue: u32,
+    pub category: u32,
+    pub volume: f32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    /// What it may play: stream index and weight.
+    pub streams: Vec<(u32, f32)>,
+}
+
+impl Group {
+    pub fn is_positional(&self) -> bool {
+        self.category == POSITIONAL
+    }
+}
+
 /// A parsed cue table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CueTable {
     pub hash: u32,
     pub lines: Vec<Line>,
-    /// Records that are not single lines (not decoded).
-    pub groups: usize,
+    pub groups: Vec<Group>,
 }
+
+impl CueTable {
+    /// The cue keyed by `cue` (a line, or a group's streams), as the
+    /// streams it may play.
+    pub fn streams(&self, cue: u32) -> Option<Vec<u32>> {
+        if let Some(l) = self.lines.iter().find(|l| l.cue == cue) {
+            return Some(vec![l.stream]);
+        }
+        let g = self.groups.iter().find(|g| g.cue == cue)?;
+        Some(g.streams.iter().map(|s| s.0).collect())
+    }
+}
+
+/// Where a group's variants start.
+const GROUP_VARIANTS: usize = 0x68;
 
 impl CueTable {
     /// Parses a cue table asset.
@@ -136,7 +171,7 @@ impl CueTable {
         let starts = (0..count)
             .map(|_| r.u32().map(|o| o as usize))
             .collect::<Result<Vec<_>, _>>()?;
-        let (mut lines, mut groups) = (Vec::new(), 0);
+        let (mut lines, mut groups) = (Vec::new(), Vec::new());
         for (index, &start) in starts.iter().enumerate() {
             // A record runs to the next one, the last to the offset table.
             let end = starts
@@ -148,7 +183,28 @@ impl CueTable {
                 return Err(VoiceError::Record { index, offset });
             }
             if end - start != LINE_RECORD {
-                groups += 1;
+                let size = end - start;
+                if size < GROUP_VARIANTS {
+                    continue;
+                }
+                let rec = data
+                    .get(offset..offset + size)
+                    .ok_or(VoiceError::Record { index, offset })?;
+                let word = |at: usize| {
+                    u32::from_le_bytes([rec[at], rec[at + 1], rec[at + 2], rec[at + 3]])
+                };
+                groups.push(Group {
+                    cue: word(0),
+                    category: word(4),
+                    volume: f32::from_bits(word(0x10)),
+                    min_distance: f32::from_bits(word(0x18)),
+                    max_distance: f32::from_bits(word(0x1c)),
+                    streams: (GROUP_VARIANTS..size)
+                        .step_by(12)
+                        .filter(|at| at + 12 <= size)
+                        .map(|at| (word(at + 4), f32::from_bits(word(at + 8))))
+                        .collect(),
+                });
                 continue;
             }
             let rec: [u8; LINE_RECORD] = Reader::at(data, offset).array()?;
@@ -215,15 +271,31 @@ mod tests {
         w.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
+    fn group(cue: u32, streams: &[u32]) -> Vec<u8> {
+        let mut w = vec![0u32; GROUP_VARIANTS / 4];
+        w[0] = cue;
+        w[1] = POSITIONAL;
+        w[4] = 1.0f32.to_bits();
+        for &s in streams {
+            w.extend([0x4216_80b7, s, (1.0 / streams.len() as f32).to_bits()]);
+        }
+        w.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
     #[test]
-    fn parses_lines_and_skips_groups() {
+    fn parses_lines_and_groups() {
         let d = table(&[
             line(1, POSITIONAL, 35.0, 125.0, 609),
-            vec![0; 128],
+            group(9, &[7, 8]),
             line(2, RADIO, 10.0, 1000.0, 610),
         ]);
         let t = CueTable::parse_data(&d).unwrap();
-        assert_eq!((t.hash, t.groups, t.lines.len()), (0xabcd, 1, 2));
+        assert_eq!((t.hash, t.groups.len(), t.lines.len()), (0xabcd, 1, 2));
+        assert_eq!(t.groups[0].streams, [(7, 0.5), (8, 0.5)]);
+        assert!(t.groups[0].is_positional());
+        assert_eq!(t.streams(9), Some(vec![7, 8]));
+        assert_eq!(t.streams(2), Some(vec![610]));
+        assert_eq!(t.streams(3), None);
         let (a, b) = (&t.lines[0], &t.lines[1]);
         assert!(a.is_positional() && !b.is_positional());
         assert_eq!((a.cue, a.stream), (1, 609));
