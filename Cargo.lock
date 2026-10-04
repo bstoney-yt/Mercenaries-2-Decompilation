@@ -1219,6 +1219,7 @@ dependencies = [
  "m2-assets",
  "m2-engine",
  "m2-math",
+ "miniz_oxide",
  "mlua",
  "thiserror 2.0.21",
 ]
