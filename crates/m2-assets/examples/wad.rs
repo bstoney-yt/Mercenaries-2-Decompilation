@@ -1581,7 +1581,7 @@ fn entities<R: std::io::Read + std::io::Seek>(
     use std::collections::{BTreeMap, BTreeSet};
 
     use m2_assets::Layer;
-    use m2_assets::layer::LAYER_TYPE;
+    use m2_assets::layer::{LAYER_TYPE, TEMPLATE_DB_TYPE};
 
     #[derive(Default)]
     struct Template {
@@ -1590,6 +1590,10 @@ fn entities<R: std::io::Read + std::io::Seek>(
         components: BTreeSet<String>,
         /// Type indices of the assets the stem's hash finds.
         types: BTreeSet<usize>,
+        /// The template database's model for the name, and the
+        /// database's components of it.
+        db_model: Option<u32>,
+        db_components: Option<BTreeSet<String>>,
     }
 
     let types = wad.index().type_hashes().to_vec();
@@ -1601,6 +1605,7 @@ fn entities<R: std::io::Read + std::io::Seek>(
         .collect();
     let mut assets: HashMap<u32, BTreeSet<usize>> = HashMap::new();
     let mut layers: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut template_db: Option<Vec<u8>> = None;
     for (block, path) in paths.iter().enumerate() {
         let decoded = wad.read_block(block)?;
         for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -1610,6 +1615,70 @@ fn entities<R: std::io::Read + std::io::Seek>(
             if e.type_hash == LAYER_TYPE {
                 layers.push((path.clone(), data.to_vec()));
             }
+            if e.type_hash == TEMPLATE_DB_TYPE {
+                template_db = Some(data.to_vec());
+            }
+        }
+    }
+
+    // The template database: template name to its id, model and
+    // components.
+    let mut db_models: HashMap<String, u32> = HashMap::new();
+    let mut db_components: HashMap<String, BTreeSet<String>> = HashMap::new();
+    if let Some(data) = &template_db {
+        match Layer::parse(data) {
+            Ok(db) => {
+                println!(
+                    "template database: {} components, enum {} bytes, UNIQ {} bytes, {} names",
+                    db.components.len(),
+                    db.enums.len(),
+                    db.uniq.len(),
+                    db.names().len()
+                );
+                let uniq: Vec<String> = db
+                    .uniq
+                    .iter()
+                    .take(64)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                println!("  UNIQ starts {}", uniq.join(" "));
+                let mut by_id: HashMap<u32, BTreeSet<String>> = HashMap::new();
+                for c in &db.components {
+                    let records = c.records();
+                    println!(
+                        "  {:28} {:6} records, {} fields, record {} bytes, data {} bytes{}",
+                        c.name,
+                        c.count,
+                        c.fields.len(),
+                        c.record_size,
+                        c.data.len(),
+                        if records.is_some() {
+                            ""
+                        } else {
+                            " (irregular)"
+                        }
+                    );
+                    for (id, _) in records.unwrap_or_default() {
+                        by_id.entry(id).or_default().insert(c.name.to_owned());
+                    }
+                }
+                let models = db.hashes("ModelName");
+                for (id, name) in db.names() {
+                    if let Some(&m) = models.get(&id) {
+                        db_models.insert(name.to_owned(), m);
+                    }
+                    db_components.insert(name.to_owned(), by_id.remove(&id).unwrap_or_default());
+                }
+                println!(
+                    "  {} templates have a ModelName, {} of them a model the archive holds",
+                    db_models.len(),
+                    db_models
+                        .values()
+                        .filter(|m| assets.get(m).is_some_and(|t| t.contains(&19)))
+                        .count()
+                );
+            }
+            Err(e) => eprintln!("template database: {e}"),
         }
     }
 
@@ -1651,6 +1720,8 @@ fn entities<R: std::io::Read + std::io::Seek>(
                     e.2.extend(f.iter().copied());
                 }
             }
+            let db_model = db_models.get(&stem).copied();
+            let db_comps = db_components.get(&stem).cloned();
             let t = templates.entry(stem).or_default();
             t.entities += 1;
             t.layers.insert(path.clone());
@@ -1658,6 +1729,8 @@ fn entities<R: std::io::Read + std::io::Seek>(
             if let Some(f) = found {
                 t.types.extend(f.iter().copied());
             }
+            t.db_model = db_model;
+            t.db_components = db_comps;
         }
     }
     println!("components: entities, of which the name finds an asset (of these types)");
@@ -1667,18 +1740,30 @@ fn entities<R: std::io::Read + std::io::Seek>(
     let mut list: Vec<(&String, &Template)> = templates.iter().collect();
     list.sort_by_key(|(_, t)| std::cmp::Reverse(t.entities));
     println!(
-        "{} templates over {} entities: count, asset types found, name, components, layers",
+        "{} templates over {} entities ({} in the template database, {} with a model there, {} with a model by name): count, asset types found, db model, name, components, db components, layers",
         list.len(),
-        list.iter().map(|(_, t)| t.entities).sum::<usize>()
+        list.iter().map(|(_, t)| t.entities).sum::<usize>(),
+        list.iter()
+            .filter(|(_, t)| t.db_components.is_some())
+            .count(),
+        list.iter().filter(|(_, t)| t.db_model.is_some()).count(),
+        list.iter().filter(|(_, t)| t.types.contains(&19)).count(),
     );
     for (name, t) in list {
         let types: Vec<String> = t.types.iter().map(|t| t.to_string()).collect();
         let comps: Vec<&str> = t.components.iter().map(String::as_str).collect();
         let layers: Vec<&str> = t.layers.iter().map(String::as_str).collect();
+        let db_comps: Vec<&str> = t
+            .db_components
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
         println!(
-            "{:6} [{}] {name} {comps:?} {}",
+            "{:6} [{}] {} {name} {comps:?} db{db_comps:?} {}",
             t.entities,
             types.join(","),
+            t.db_model.map_or("-".to_owned(), |m| format!("{m:08x}")),
             layers.join(",")
         );
     }
