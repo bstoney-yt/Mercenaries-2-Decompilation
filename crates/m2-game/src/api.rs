@@ -25,6 +25,8 @@ use crate::script::safe_function;
 /// Guids handed to objects scripts spawn start here, above any layer's
 /// entity ids.
 pub const FIRST_SPAWNED: u32 = 0x4000_0000;
+/// What crews a vehicle spawned with its driver.
+pub const PILOT: &str = "Pilot";
 /// Guids of object templates start here.
 pub const FIRST_TEMPLATE: u32 = 0x3000_0000;
 
@@ -44,11 +46,15 @@ pub struct Object {
     pub player_controlled: bool,
     /// Simulated near the player rather than hibernating.
     pub awake: bool,
+    /// Fuel for the player's support (`Player.GetFuel`), in the units of
+    /// `Player.GetFuelCapacity`.
+    pub fuel: f32,
 }
 
 impl Object {
     pub fn new(name: &str, position: [f32; 3]) -> Self {
         Self {
+            fuel: 100.0,
             name: name.to_owned(),
             position,
             health: 100.0,
@@ -191,8 +197,11 @@ impl ScriptWorld {
         g
     }
 
-    /// Spawns a copy of `what` and tells the game to.
+    /// Spawns a copy of `what` and tells the game to. A crewed vehicle
+    /// (`"Mi26 (VZA Intro) (Driver)"`) comes with its pilot in the
+    /// driver's seat, as scripts expect of `Vehicle.GetDriver`.
     fn spawn(&mut self, what: String, position: [f32; 3], yaw: f32) -> u32 {
+        let crewed = what.to_ascii_lowercase().ends_with("(driver)");
         let guid = self.spawn_guid();
         let mut object = Object::new(&what, position);
         object.yaw = yaw;
@@ -203,6 +212,24 @@ impl ScriptWorld {
             position,
             yaw,
         });
+        if crewed {
+            let pilot = self.spawn_guid();
+            let mut o = Object::new(PILOT, position);
+            o.vehicle = Some(guid);
+            self.insert(pilot, o);
+            self.commands.push(Command::Spawn {
+                guid: pilot,
+                what: PILOT.into(),
+                position,
+                yaw,
+            });
+            self.commands.push(Command::EnterVehicle {
+                guid: pilot,
+                vehicle: guid,
+                seat: "d".into(),
+                instant: true,
+            });
+        }
         guid
     }
 
@@ -664,6 +691,29 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&player, "GetFuelCapacity", |_, _, _| {
         values([Value::Number(100.0)])
     })?;
+    add(&player, "GetFuel", |w, _, _| {
+        let fuel = w
+            .player
+            .and_then(|p| w.objects.get(&p))
+            .map_or(0.0, |o| o.fuel);
+        values([Value::Number(f64::from(fuel))])
+    })?;
+    add(&player, "SetFuel", |w, _, a| {
+        if let (Some(p), Some(f)) = (w.player, num(a.first()))
+            && let Some(o) = w.objects.get_mut(&p)
+        {
+            o.fuel = f;
+        }
+        values([])
+    })?;
+    // One player slot; the game creates the player itself.
+    add(&player, "GetMaximumPlayers", |_, _, _| {
+        values([Value::Integer(1)])
+    })?;
+    add(&player, "CreatePlayer", |w, _, a| {
+        let first = matches!(num(a.first()), Some(n) if n == 0.0);
+        values([guid_value(w.player.filter(|_| first))])
+    })?;
     for name in [
         "GetLocalCharacter",
         "GetAnyCharacter",
@@ -762,6 +812,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             instant,
         });
         values([Value::Boolean(true)])
+    })?;
+
+    // The sound library's version: the bootstrap picks named reverb
+    // presets from version 10.
+    let sound = lib("Sound")?;
+    add(&sound, "_GetLibVersion", |_, _, _| {
+        values([Value::Integer(10)])
     })?;
 
     let ai = lib("Ai")?;
@@ -1425,6 +1482,29 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((a, b, w, m), (1, 2, 0.0, 2.0));
+    }
+
+    #[test]
+    fn crewed_vehicles_spawn_with_a_pilot_and_the_player_has_fuel() {
+        let (host, _) = setup();
+        let (pilot, riders, fuel, slots, version): (String, i64, f64, i64, i64) = host
+            .lua()
+            .load(
+                r#"
+                local copter = Pg.Spawn("Mi26 (VZA Intro) (Driver)", 0, 50, 0, 0)
+                local jeep = Pg.Spawn("M151 Softtop (VZ)", 5, 0, 0, 0)
+                assert(Vehicle.GetDriver(jeep) == nil)
+                Player.SetFuel(40)
+                return Object.GetName(Vehicle.GetDriver(copter)), #Vehicle.GetRiders(copter),
+                    Player.GetFuel(), Player.GetMaximumPlayers(), Sound._GetLibVersion()
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(
+            (pilot.as_str(), riders, fuel, slots, version),
+            (PILOT, 1, 40.0, 1, 10)
+        );
     }
 
     #[test]
