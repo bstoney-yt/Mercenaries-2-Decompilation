@@ -9,7 +9,8 @@
 //! First every module some script loads is imported; then every other
 //! script runs once as an entry point (its top level only: it defines its
 //! functions and loads its modules). With hashes, only those scripts run,
-//! and the calls they make are listed in order.
+//! and the calls they make are listed in order. Without hashes it also
+//! lists which entity components in the archive's layers name a script.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -18,8 +19,9 @@ use std::io::BufReader;
 use std::process::ExitCode;
 use std::rc::Rc;
 
+use m2_assets::layer::LAYER_TYPE;
 use m2_assets::lua::{Chunk, SCRIPT_TYPE};
-use m2_assets::{BlockContents, WadArchive};
+use m2_assets::{BlockContents, Layer, WadArchive};
 use m2_game::library::Library;
 use m2_game::script::ScriptHost;
 use mlua::{HookTriggers, VmState};
@@ -48,7 +50,14 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<_, _>>()?;
     let mut wad = WadArchive::open(BufReader::new(File::open(path)?))?;
     let mut library = Library::default();
-    for block in 0..wad.index().blocks().len() {
+    let paths: Vec<String> = wad
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    let mut layers: Vec<(usize, Vec<u8>)> = Vec::new();
+    for block in 0..paths.len() {
         let decoded = wad.read_block(block)?;
         let Ok(contents) = BlockContents::parse(&decoded) else {
             continue;
@@ -59,10 +68,15 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(c) => library.add(entry.name_hash, c),
                     Err(e) => println!("script {:08x}: {e}", entry.name_hash),
                 }
+            } else if entry.type_hash == LAYER_TYPE && only.is_empty() {
+                layers.push((block, data.to_vec()));
             }
         }
     }
     println!("{} scripts", library.scripts().len());
+    if only.is_empty() {
+        script_references(&library, &paths, &layers);
+    }
     let library = Rc::new(library);
 
     let host = ScriptHost::new()?;
@@ -158,4 +172,74 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Which entity components name scripts: every aligned word of every
+/// fixed-size record that equals a script's hash, counted by component and
+/// offset, with a few examples.
+fn script_references(library: &Library, paths: &[String], layers: &[(usize, Vec<u8>)]) {
+    let scripts: std::collections::HashSet<u32> =
+        library.scripts().iter().map(|s| s.hash).collect();
+    // (component, offset) -> (count, distinct scripts, examples)
+    #[allow(clippy::type_complexity)]
+    let mut found: BTreeMap<
+        (String, usize),
+        (usize, std::collections::BTreeSet<u32>, Vec<String>),
+    > = BTreeMap::new();
+    let mut referenced = std::collections::BTreeSet::new();
+    let mut components: BTreeMap<String, usize> = BTreeMap::new();
+    for (block, data) in layers {
+        let Ok(layer) = Layer::parse(data) else {
+            continue;
+        };
+        let names = layer.names();
+        for c in &layer.components {
+            if c.name.to_ascii_lowercase().contains("script") {
+                *components
+                    .entry(format!(
+                        "{} (record {} bytes, {} fields)",
+                        c.name,
+                        c.record_size,
+                        c.fields.len()
+                    ))
+                    .or_default() += c.count as usize;
+            }
+            let Some(records) = c.records() else { continue };
+            for (entity, record) in records {
+                for (i, w) in record.chunks_exact(4).enumerate() {
+                    let word = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                    if !scripts.contains(&word) {
+                        continue;
+                    }
+                    referenced.insert(word);
+                    let e = found.entry((c.name.to_owned(), i * 4)).or_default();
+                    e.0 += 1;
+                    e.1.insert(word);
+                    if e.2.len() < 6 {
+                        e.2.push(format!(
+                            "{word:08x} on {:?} in {}",
+                            names.get(&entity).copied().unwrap_or("?"),
+                            paths[*block]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    println!();
+    println!("components with \"script\" in their name (component: entities):");
+    for (c, n) in &components {
+        println!("  {c}: {n}");
+    }
+    println!();
+    println!(
+        "entity components naming a script ({} scripts referenced):",
+        referenced.len()
+    );
+    for ((c, offset), (n, distinct, examples)) in &found {
+        println!("  {c} +{offset}: {n} records, {} scripts", distinct.len());
+        for e in examples {
+            println!("      {e}");
+        }
+    }
 }
