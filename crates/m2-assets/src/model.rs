@@ -865,6 +865,10 @@ impl PartStates {
     /// glows never.
     pub fn hidden(&self, nodes: &[Node], wrecked: bool) -> Vec<bool> {
         let mut off = vec![false; nodes.len()];
+        if self.shown.is_empty() {
+            // Nothing read as shown: draw everything rather than nothing.
+            return off;
+        }
         for &n in &self.switchable {
             if let Some(o) = off.get_mut(usize::from(n)) {
                 *o = true;

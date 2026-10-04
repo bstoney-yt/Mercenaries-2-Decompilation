@@ -182,7 +182,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             notes.push(format!("@{:#x}=\"{w}\"", k * 4));
                         }
                     }
-                    println!("{indent}{tag} {} bytes  {}", d.len(), notes.join(" "));
+                    if d.len() <= 64 {
+                        // Small records in full: nodes, words, else hex.
+                        let all: Vec<String> = d
+                            .chunks_exact(4)
+                            .map(|w| {
+                                let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                                match model.nodes.iter().position(|n| n.name_hash == v) {
+                                    Some(n) => format!("n{n}"),
+                                    None => word(v).map_or(format!("{v:#x}"), str::to_owned),
+                                }
+                            })
+                            .collect();
+                        println!("{indent}{tag} [{}]", all.join(" "));
+                    } else {
+                        println!("{indent}{tag} {} bytes  {}", d.len(), notes.join(" "));
+                    }
                 }
             }
         }
