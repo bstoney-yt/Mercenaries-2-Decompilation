@@ -328,7 +328,8 @@ struct TerrainGpu {
     vertex_buffer: VertexBufferHandle,
     index_buffer: IndexBufferHandle,
     /// (first index, index count, material).
-    ranges: Vec<(u32, u32, MaterialId)>,
+    /// First index, index count, material, and whether it blends.
+    ranges: Vec<(u32, u32, MaterialId, bool)>,
     origin: Vec3,
 }
 
@@ -784,7 +785,7 @@ impl World {
             ranges: mesh
                 .ranges
                 .iter()
-                .map(|&(first, count, s)| (first, count, ids[s]))
+                .map(|&(first, count, s)| (first, count, ids[s], materials.is_translucent(ids[s])))
                 .collect(),
             origin: mesh.origin,
         })
@@ -801,7 +802,7 @@ impl World {
         frustum: &Frustum,
     ) -> Result<(), BackendError> {
         let terrain = |t: &TerrainGpu, queue: &mut DrawQueue| {
-            for &(first, count, material) in &t.ranges {
+            for &(first, count, material, translucent) in &t.ranges {
                 queue.push(Primitive {
                     call: DrawCall {
                         material,
@@ -818,7 +819,7 @@ impl World {
                         instances: None,
                     },
                     layer: Layer::WORLD,
-                    translucent: false,
+                    translucent,
                     sort_origin: t.origin,
                     user: 0,
                 });

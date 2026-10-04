@@ -11,7 +11,7 @@
 //! Skinned geometry is drawn in its bind pose for now; animation drives it
 //! once the animation runtime lands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
 use m2_assets::model::{GeometryKind, Material, TOPOLOGY};
@@ -46,6 +46,8 @@ pub struct MaterialCache {
     /// By name, base texture, technique and depth bias.
     materials: HashMap<(u32, Option<u32>, u32, bool), MaterialId>,
     defined: Vec<(MaterialId, MaterialDesc)>,
+    /// Materials that blend over what is behind them.
+    translucent: HashSet<MaterialId>,
     next_material: u32,
     /// Every material, including ones defined later, draws both faces.
     all_double_sided: bool,
@@ -59,6 +61,7 @@ impl Default for MaterialCache {
             textures: HashMap::new(),
             materials: HashMap::new(),
             defined: Vec::new(),
+            translucent: HashSet::new(),
             // 0 stays the backend's default material.
             next_material: 1,
             all_double_sided: false,
@@ -202,6 +205,7 @@ impl MaterialCache {
         let desc = MaterialDesc {
             texture: texture.map(|t| t.0),
             blend: match texture {
+                Some((_, true)) if material.flags & BLENDED != 0 => BlendMode::Translucent,
                 Some((_, true)) => BlendMode::Masked { cutoff: 0.5 },
                 _ => BlendMode::Opaque,
             },
@@ -264,7 +268,16 @@ impl MaterialCache {
             },
         )?;
         self.defined.push((id, *desc));
+        if desc.blend == BlendMode::Translucent {
+            self.translucent.insert(id);
+        }
         Ok(id)
+    }
+
+    /// Whether material `id` blends over what is behind it (draw it after
+    /// the opaque world, farthest first).
+    pub fn is_translucent(&self, id: MaterialId) -> bool {
+        self.translucent.contains(&id)
     }
 
     /// Redefines every material, and defines later ones, drawing both faces
@@ -294,6 +307,11 @@ impl MaterialCache {
         self.defined.is_empty()
     }
 }
+
+/// Material flags bit for surfaces blended over what is behind them, such
+/// as vehicle glass (flags 0x0091 where the body has 0x0080). Read from
+/// which materials carry it; not confirmed in the game's code.
+pub const BLENDED: u16 = 0x0001;
 
 /// A material record's base-colour texture (slot 0).
 pub fn base_texture(material: &Material) -> Option<u32> {
@@ -545,7 +563,8 @@ struct Piece {
     vertex_buffer: VertexBufferHandle,
     index_buffer: IndexBufferHandle,
     local: Mat4,
-    ranges: Vec<(u32, u32, MaterialId)>,
+    /// First index, index count, material, and whether it blends.
+    ranges: Vec<(u32, u32, MaterialId, bool)>,
     centre: Vec3,
     bones: Vec<u16>,
     node: Option<u16>,
@@ -590,7 +609,8 @@ impl GpuModel {
                     .ranges
                     .iter()
                     .map(|&(first, count, m)| {
-                        (first, count, ids.get(m).copied().unwrap_or_default())
+                        let id = ids.get(m).copied().unwrap_or_default();
+                        (first, count, id, materials.is_translucent(id))
                     })
                     .collect(),
                 // Kept in geometry space, so any transform places it.
@@ -700,7 +720,7 @@ impl GpuModel {
     /// Queues `piece` with geometry-to-world `transform`.
     fn push_at(queue: &mut DrawQueue, piece: &Piece, transform: Mat4, skin: Option<SkinHandle>) {
         let origin = transform.transform_point3(piece.centre);
-        for &(first, count, material) in &piece.ranges {
+        for &(first, count, material, translucent) in &piece.ranges {
             queue.push(Primitive {
                 call: DrawCall {
                     material,
@@ -717,7 +737,7 @@ impl GpuModel {
                     instances: None,
                 },
                 layer: Layer::WORLD,
-                translucent: false,
+                translucent,
                 sort_origin: origin,
                 user: 0,
             });
@@ -815,6 +835,15 @@ mod tests {
 
         let m = cache.material(&mut backend, &material(2, 11)).unwrap();
         assert_eq!(backend.material(m).blend, BlendMode::Masked { cutoff: 0.5 });
+        assert!(!cache.is_translucent(m));
+        // Glass: the blend bit set.
+        let glass = Material {
+            flags: 0x0091,
+            ..material(4, 11)
+        };
+        let m = cache.material(&mut backend, &glass).unwrap();
+        assert_eq!(backend.material(m).blend, BlendMode::Translucent);
+        assert!(cache.is_translucent(m));
 
         let m = cache.material(&mut backend, &material(3, 12)).unwrap();
         assert!(backend.material(m).texture.is_none());
