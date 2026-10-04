@@ -288,12 +288,26 @@ fn fire(fired: Vec<Fired>) -> Vec<EventError> {
     errors
 }
 
-fn as_id(v: &Value) -> Option<u32> {
+/// A guid as scripts see it: userdata, as in the game (scripts check
+/// `type(target) == "userdata"`). Light userdata compares by value, so the
+/// same guid is equal to itself and works as a table key.
+pub fn guid_value(guid: u32) -> Value {
+    Value::LightUserData(mlua::LightUserData(guid as usize as *mut std::ffi::c_void))
+}
+
+/// The guid a script value names: guid userdata, or a number (scripts and
+/// tests write some guids as numbers).
+pub fn as_guid(v: &Value) -> Option<u32> {
     match v {
+        Value::LightUserData(p) => u32::try_from(p.0 as usize).ok(),
         Value::Integer(i) => u32::try_from(*i).ok(),
         Value::Number(n) if *n >= 0.0 => Some(*n as u32),
         _ => None,
     }
+}
+
+fn as_id(v: &Value) -> Option<u32> {
+    as_guid(v)
 }
 
 fn number(t: &Table, i: i64) -> Option<f64> {
@@ -333,6 +347,36 @@ fn objects(t: &Table, i: i64, world: &dyn World) -> Vec<u32> {
                 }
             }
         }
+        // An object filter (see `api`): its objects, the player when it
+        // uses players, and objects with its label, less those excluded.
+        Ok(Value::Table(f)) => {
+            let mut out: Vec<u32> = f
+                .raw_get::<Option<Table>>("objs")
+                .ok()
+                .flatten()
+                .map(|t| {
+                    t.sequence_values::<Value>()
+                        .filter_map(|v| as_id(&v.ok()?))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if f.raw_get::<bool>("players").unwrap_or(false) {
+                out.extend(world.player());
+            }
+            if let Ok(Some(label)) = f.raw_get::<Option<String>>("label") {
+                out.extend(world.labelled(&label));
+            }
+            if let Ok(Some(ex)) = f.raw_get::<Option<Table>>("ex") {
+                let excluded: Vec<u32> = ex
+                    .pairs::<Value, Value>()
+                    .filter_map(|p| as_id(&p.ok()?.0))
+                    .collect();
+                out.retain(|g| !excluded.contains(g));
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
         Ok(v) => as_id(&v).into_iter().collect(),
         Err(_) => Vec::new(),
     }
@@ -349,7 +393,7 @@ fn text(t: &Table, i: i64) -> Option<String> {
 /// from the game's call sites.
 fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -> Check {
     let no = Check::Holds(false, Vec::new());
-    let id = |g: u32| Value::Number(f64::from(g));
+    let id = guid_value;
     match p.kind.as_str() {
         // { seconds }: that long after it was made (persistent: every
         // that long).
@@ -420,10 +464,12 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
         }
         // { object, boundary, "enter" or "exit" }.
         "Boundary" => {
-            let (Some(b), exit) = (
-                guid(&p.params, 2),
-                text(&p.params, 3).as_deref() == Some("exit"),
-            ) else {
+            // The boundary is a guid or the region's name.
+            let boundary = guid(&p.params, 2).or_else(|| match p.params.raw_get::<Value>(2) {
+                Ok(Value::String(s)) => world.named(&s.to_string_lossy()),
+                _ => None,
+            });
+            let (Some(b), exit) = (boundary, text(&p.params, 3).as_deref() == Some("exit")) else {
                 return no;
             };
             for o in objects(&p.params, 1, world) {
@@ -515,6 +561,16 @@ mod tests {
         let events = Events::default();
         events.install(host.lua()).unwrap();
         host.lua().load("log = {}").exec().unwrap();
+        // Guids reach callbacks as userdata; tests note them as numbers.
+        let gid = safe_function(host.lua(), |_, args| {
+            let v = args.front().cloned().unwrap_or(Value::Nil);
+            Ok(MultiValue::from_vec(vec![match as_guid(&v) {
+                Some(g) if matches!(v, Value::LightUserData(_)) => Value::Number(f64::from(g)),
+                _ => v,
+            }]))
+        })
+        .unwrap();
+        host.lua().globals().set("gid", gid).unwrap();
         (host, events)
     }
 
@@ -574,7 +630,11 @@ mod tests {
         host.lua()
             .load(
                 r#"
-                local function note(s) return function(...) table.insert(log, s .. table.concat({...}, ",")) end end
+                local function note(s) return function(...)
+                    local t = {}
+                    for i, v in ipairs({...}) do t[i] = tostring(gid(v)) end
+                    table.insert(log, s .. table.concat(t, ","))
+                end end
                 Event.Create(Event.ObjectDeath, { 7 }, note("dead "), { 7 })
                 Event.Create(Event.ObjectProximity, { "hero", 2, "<", 10, false, false }, note("near "), {})
                 Event.Create(Event.ObjectInSeat, { "hero", nil, "Any", "enter" }, note("seat "), {})
