@@ -15,6 +15,7 @@
 //! cargo run -p m2-assets --example wad -- scripts <archive.wad>
 //! cargo run -p m2-assets --example wad -- script  <archive.wad> <script hash>
 //! cargo run -p m2-assets --example wad -- calls   <archive.wad> <callee> [first arg] [count]
+//! cargo run -p m2-assets --example wad -- strings <archive.wad> [text]
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -45,6 +46,10 @@
 //! is the given global or string (`Event.TimerRelative`), with the
 //! instructions building the call and the start of any callback function
 //! named in it: how the engine function is used.
+//! `strings` lists every string table (block, count, whether its keys are
+//! sorted) and, for the strings that are exactly `text` (else contain it),
+//! their key and the few strings stored either side, cut to 60
+//! characters: pairs of key and text to find the key hash with.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -65,6 +70,7 @@ use m2_assets::{
     BlockContents, Clip, Codec, Model, PixelFormat, PrimitiveGroup, Texture, TextureInfo,
     TextureKind, Ucfx, WadArchive,
 };
+use m2_assets::{StringTable, strings::STRINGS_TYPE};
 
 /// Type hash of texture assets.
 const TEXTURE_TYPE: u32 = 0xf011_157a;
@@ -124,6 +130,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         ("types", []) => types(&mut wad)?,
+        ("strings", rest) => string_tables(&mut wad, rest.first().map(String::as_str))?,
         ("scripts", []) => scripts(&mut wad)?,
         ("script", [hash]) => script_listing(&mut wad, u32::from_str_radix(hash, 16)?)?,
         ("calls", [callee, rest @ ..]) => {
@@ -999,6 +1006,76 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
 }
 
 /// Per type: count, bytes, sample names and paths, layout and strings.
+fn string_tables<R: Read + Seek>(
+    wad: &mut WadArchive<R>,
+    text: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let short = |s: &str| -> String {
+        let s: String = s.chars().take(60).collect();
+        format!("{s:?}")
+    };
+    for block in 0..wad.index().blocks().len() {
+        let path = wad.index().blocks()[block].path.clone();
+        let Ok(decoded) = wad.read_block(block) else {
+            continue;
+        };
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (entry, data) in contents.iter() {
+            if entry.type_hash != STRINGS_TYPE {
+                continue;
+            }
+            let table = StringTable::parse(data)?;
+            // The keys in stored order, by where their text is.
+            let ucfx = Ucfx::parse(data)?;
+            let keys = ucfx.top_level(*b"KEYS").unwrap_or_default();
+            let mut order: Vec<(u32, u32)> = keys
+                .get(4..)
+                .unwrap_or_default()
+                .chunks_exact(8)
+                .map(|c| {
+                    let k = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    let o = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+                    (k, o)
+                })
+                .collect();
+            let sorted = order.is_sorted_by_key(|e| e.0);
+            let by_text = order.is_sorted_by_key(|e| e.1);
+            println!(
+                "{path} asset {:08x}: {} strings, keys sorted {sorted}, texts in key order {by_text}",
+                entry.name_hash,
+                table.strings.len()
+            );
+            let Some(text) = text else { continue };
+            order.sort_by_key(|e| e.1);
+            let exact: Vec<usize> = (0..order.len())
+                .filter(|&i| table.get(order[i].0) == Some(text))
+                .collect();
+            let hits = if exact.is_empty() {
+                (0..order.len())
+                    .filter(|&i| table.get(order[i].0).is_some_and(|s| s.contains(text)))
+                    .take(10)
+                    .collect()
+            } else {
+                exact
+            };
+            for i in hits {
+                println!("  match:");
+                let from = i.saturating_sub(4);
+                for (j, &(k, o)) in order.iter().enumerate().skip(from).take(i + 5 - from) {
+                    let mark = if j == i { '>' } else { ' ' };
+                    println!(
+                        "  {mark} {k:08x} at {o:#8x} {}",
+                        short(table.get(k).unwrap_or_default())
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn types<R: std::io::Read + std::io::Seek>(
     wad: &mut WadArchive<R>,
 ) -> Result<(), Box<dyn std::error::Error>> {
