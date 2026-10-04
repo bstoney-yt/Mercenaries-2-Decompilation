@@ -174,6 +174,19 @@ pub enum Sound {
     Explosion(Vec3),
 }
 
+/// Something that happened to her worth a word from her.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Remark {
+    /// She killed someone.
+    Kill,
+    /// She wrecked a vehicle.
+    Wreck,
+    /// She was hit.
+    Hurt,
+    /// She got into a vehicle.
+    Vehicle,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Projectile {
     Rocket {
@@ -216,6 +229,8 @@ pub struct Combat {
     sounds: Vec<Sound>,
     /// Wrecks smoke: (vehicle index, seconds to the next puff).
     wrecks: Vec<(usize, f32)>,
+    /// What happened to her since [`take_remarks`](Self::take_remarks).
+    remarks: Vec<Remark>,
     /// People shot and blasts set off, for the screenshot check.
     pub hits: u32,
     pub blasts: u32,
@@ -235,6 +250,7 @@ impl Default for Combat {
             effects: Vec::new(),
             sounds: Vec::new(),
             wrecks: Vec::new(),
+            remarks: Vec::new(),
             hits: 0,
             blasts: 0,
             seed: 0x2545_f491_4f6c_dd1d,
@@ -270,6 +286,10 @@ impl Combat {
 
     pub fn take_sounds(&mut self) -> Vec<Sound> {
         std::mem::take(&mut self.sounds)
+    }
+
+    pub fn take_remarks(&mut self) -> Vec<Remark> {
+        std::mem::take(&mut self.remarks)
     }
 
     fn random(&mut self) -> f32 {
@@ -384,7 +404,9 @@ impl Combat {
         self.effect(Effect::Flash { at: from }, 0.05);
         self.sounds.push(Sound::Shot(from));
         if let Some((_, Some(i))) = hit {
-            f.people.npcs[i].hurt(RIFLE_DAMAGE);
+            if f.people.npcs[i].hurt(RIFLE_DAMAGE) {
+                self.remarks.push(Remark::Kill);
+            }
             self.hits += 1;
         }
         alarm(f.people, f.player.character.position);
@@ -459,6 +481,7 @@ impl Combat {
         }
         self.quiet = 0.0;
         self.hp = (self.hp - damage).max(0.0);
+        self.remarks.push(Remark::Hurt);
         if self.hp <= 0.0 {
             self.down = DOWN_TIME;
             f.player.down = true;
@@ -568,12 +591,13 @@ impl Combat {
                 2.5,
             );
         }
+        let mut killed = false;
         for n in &mut f.people.npcs {
             let d = n.chest().distance(at);
             if d < KILL {
-                n.hurt(1000.0);
+                killed |= n.hurt(1000.0);
             } else if d < REACH {
-                n.hurt(100.0 * (1.0 - d / REACH));
+                killed |= n.hurt(100.0 * (1.0 - d / REACH));
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
@@ -602,8 +626,12 @@ impl Combat {
                 if !v.wrecked {
                     v.wrecked = true;
                     self.wrecks.push((i, 0.0));
+                    self.remarks.push(Remark::Wreck);
                 }
             }
+        }
+        if killed {
+            self.remarks.push(Remark::Kill);
         }
         alarm(f.people, at);
     }

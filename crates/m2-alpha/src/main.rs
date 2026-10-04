@@ -919,6 +919,8 @@ struct Running {
     backend: WgpuBackend,
     game: Game,
     audio: sound::GameAudio,
+    /// Whether she was driving last tick (getting in is worth a word).
+    was_driving: bool,
     input: Input,
     mouse_look: bool,
     /// Keyboard input is ignored while another window has focus.
@@ -994,6 +996,7 @@ impl App {
             backend,
             game,
             audio: sound::GameAudio::start(self.install.as_ref()),
+            was_driving: false,
             input: Input::default(),
             mouse_look: false,
             focused,
@@ -1203,6 +1206,15 @@ impl Running {
         }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);
+        let driving = self.game.driving().is_some();
+        let mut remarks = self.game.combat.take_remarks();
+        if driving && !self.was_driving {
+            remarks.push(combat::Remark::Vehicle);
+        }
+        self.was_driving = driving;
+        for remark in remarks {
+            self.audio.remark(remark);
+        }
     }
 }
 

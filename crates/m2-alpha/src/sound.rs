@@ -10,12 +10,12 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use m2_engine::audio::{Falloff, Play, SoundLibrary};
 use m2_engine::{Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
-use crate::combat::Sound;
+use crate::combat::{Remark, Sound};
 use m2_math::glam::Vec3;
 
 /// The mixer, and the device stream playing it (none where there is no
@@ -143,6 +143,8 @@ pub struct GameAudio {
     said: (Sender<Spoken>, Receiver<Spoken>),
     /// When each line now playing or decoding ends.
     speaking: Vec<Instant>,
+    /// When Jennifer may speak again.
+    quiet_until: Instant,
 }
 
 /// A decoded voice line: the sound, where it is said (`None` flat: the
@@ -156,6 +158,25 @@ type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32);
 /// which of her lines go with what is not known yet.)
 pub const VZ_SOLDIERS: [u32; 2] = [0xcf4f_8b9c, 0x6cff_c547];
 pub const CIVILIANS: u32 = 0x910e_b574;
+/// Jennifer's voice set, `vo_jen`.
+pub const JENNIFER: u32 = 0x7f74_6c16;
+/// Her lines for what happens to her, by cue (a line or a group of
+/// variants): none are known yet, so she stays quiet.
+pub fn jennifer_cues(remark: Remark) -> &'static [u32] {
+    match remark {
+        Remark::Kill | Remark::Wreck | Remark::Hurt | Remark::Vehicle => &[],
+    }
+}
+/// How often she says something about it (she doesn't remark on every
+/// hit), and the least time between her remarks, seconds.
+fn remark_chance(remark: Remark) -> f32 {
+    match remark {
+        Remark::Kill => 0.5,
+        Remark::Wreck | Remark::Vehicle => 0.8,
+        Remark::Hurt => 0.3,
+    }
+}
+const REMARK_GAP: f32 = 6.0;
 /// Shouts are the sets' short lines said where the speaker stands.
 const SHOUT_LONGEST: f32 = 3.5;
 /// Most lines said at once.
@@ -274,6 +295,7 @@ impl GameAudio {
             }),
             said: channel(),
             speaking: Vec::new(),
+            quiet_until: Instant::now(),
         }
     }
 
@@ -309,19 +331,76 @@ impl GameAudio {
         }
         let pick = ((self.random() * lines.len() as f32) as usize).min(lines.len() - 1);
         let line = lines[pick].clone();
-        let seconds = voices.index.streams[line.stream as usize].seconds();
+        let falloff = Falloff {
+            near: line.min_distance.max(1.0),
+            far: line.max_distance.max(line.min_distance + 1.0),
+        };
+        self.speak(voices, line.stream, at, falloff, line.volume);
+    }
+
+    /// Jennifer says something about `remark`, now and then: a cue from
+    /// [`jennifer_cues`] (one of a group's variants), flat, as her own.
+    pub fn remark(&mut self, remark: Remark) {
+        let now = Instant::now();
+        if now < self.quiet_until || self.random() >= remark_chance(remark) {
+            return;
+        }
+        let Some(voices) = self.voices.clone() else {
+            return;
+        };
+        let Some(table) = voices.set(JENNIFER) else {
+            return;
+        };
+        let streams: Vec<(u32, f32)> = jennifer_cues(remark)
+            .iter()
+            .filter_map(|&cue| {
+                let volume = table
+                    .lines
+                    .iter()
+                    .find(|l| l.cue == cue)
+                    .map(|l| l.volume)
+                    .or_else(|| table.groups.iter().find(|g| g.cue == cue).map(|g| g.volume))?;
+                Some((table.streams(cue)?, volume))
+            })
+            .flat_map(|(streams, volume)| streams.into_iter().map(move |s| (s, volume)))
+            .collect();
+        if streams.is_empty() {
+            return;
+        }
+        let pick = ((self.random() * streams.len() as f32) as usize).min(streams.len() - 1);
+        let (stream, volume) = streams[pick];
+        let seconds = voices
+            .index
+            .streams
+            .get(stream as usize)
+            .map_or(0.0, |s| s.seconds());
+        self.quiet_until = now + Duration::from_secs_f32(seconds + REMARK_GAP);
+        self.speak(voices, stream, None, Falloff::default(), volume);
+    }
+
+    /// Decodes voice stream `stream` on a thread and plays it at `at`.
+    fn speak(
+        &mut self,
+        voices: Arc<Voices>,
+        stream: u32,
+        at: Option<Vec3>,
+        falloff: Falloff,
+        volume: f32,
+    ) {
+        let Some(seconds) = voices
+            .index
+            .streams
+            .get(stream as usize)
+            .map(|s| s.seconds())
+        else {
+            return;
+        };
         self.speaking
-            .push(now + std::time::Duration::from_secs_f32(seconds + 0.3));
+            .push(Instant::now() + Duration::from_secs_f32(seconds + 0.3));
         let tx = self.said.0.clone();
-        std::thread::spawn(move || match voices.decode(line.stream as usize) {
-            Ok(b) => {
-                let falloff = Falloff {
-                    near: line.min_distance.max(1.0),
-                    far: line.max_distance.max(line.min_distance + 1.0),
-                };
-                let _ = tx.send((b, at, falloff, line.volume.clamp(0.0, 2.0)));
-            }
-            Err(e) => eprintln!("voice line {}: {e}", line.stream),
+        std::thread::spawn(move || match voices.decode(stream as usize) {
+            Ok(b) => drop(tx.send((b, at, falloff, volume.clamp(0.0, 2.0)))),
+            Err(e) => eprintln!("voice line {stream}: {e}"),
         });
     }
 
