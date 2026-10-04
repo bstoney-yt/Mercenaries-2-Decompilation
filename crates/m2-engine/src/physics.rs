@@ -831,11 +831,30 @@ impl Physics {
 
     /// The first static surface along a ray: (distance, normal).
     pub fn cast_ray(&self, origin: Vec3, direction: Vec3, max: f32) -> Option<(f32, Vec3)> {
+        self.cast_ray_keyed(origin, direction, max)
+            .map(|(d, n, _)| (d, n))
+    }
+
+    /// [`cast_ray`](Self::cast_ray), with the key of the static hit (`None`
+    /// for anything else solid, such as a vehicle), to find what an
+    /// unseen obstacle is.
+    pub fn cast_ray_keyed(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+    ) -> Option<(f32, Vec3, Option<StaticKey>)> {
         let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
-        self.world
+        let (handle, hit) = self
+            .world
             .query_pipeline_with_filter(solid())
-            .cast_ray_and_get_normal(&ray, max, true)
-            .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
+            .cast_ray_and_get_normal(&ray, max, true)?;
+        let key = self
+            .statics
+            .iter()
+            .find(|(_, h)| **h == handle)
+            .map(|(k, _)| *k);
+        Some((hit.time_of_impact, vec3(hit.normal), key))
     }
 
     /// Moves `character` for `dt` seconds: horizontally at `walk` (m/s; its
