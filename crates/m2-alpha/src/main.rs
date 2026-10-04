@@ -419,16 +419,43 @@ fn screenshot(
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
     // The last frames are timed: the frame rate here, for checking.
+    // Where the time goes: the tick, streaming, building the draws, and
+    // submitting the frame.
     let timed = Instant::now();
+    let mut parts = [0.0f32; 4];
     for _ in 0..FRAMES_TIMED {
+        let mut lap = Instant::now();
+        let mut split = |i: usize, lap: &mut Instant| {
+            parts[i] += lap.elapsed().as_secs_f32();
+            *lap = Instant::now();
+        };
         game.step(Intent::default(), tick);
-        render(&mut backend, &mut game, fov, aspect, None)?;
+        split(0, &mut lap);
+        let mut view = game.view(fov, aspect);
+        view.lighting.fog_density = 0.00025;
+        let focus = game.focus();
+        game.scene.update(&mut backend, focus)?;
+        split(1, &mut lap);
+        let mut queue = DrawQueue::new();
+        backend.begin_frame(&view)?;
+        game.scene
+            .draw(&mut backend, &mut queue, view.eye(), &game.combat)?;
+        queue.flush(&view, &mut backend)?;
+        split(2, &mut lap);
+        backend.end_frame()?;
+        split(3, &mut lap);
     }
     let each = timed.elapsed().as_secs_f32() / FRAMES_TIMED as f32;
+    let ms = parts.map(|p| p * 1000.0 / FRAMES_TIMED as f32);
     eprintln!(
-        "frames: {:.2} ms each ({:.0} fps) over {FRAMES_TIMED}, with a tick each",
+        "frames: {:.2} ms each ({:.0} fps) over {FRAMES_TIMED}, with a tick each: \
+         tick {:.2}, streaming {:.2}, draws {:.2}, submit {:.2} ms",
         each * 1000.0,
-        1.0 / each.max(1e-6)
+        1.0 / each.max(1e-6),
+        ms[0],
+        ms[1],
+        ms[2],
+        ms[3]
     );
     let people = &game.scene.people;
     eprintln!(

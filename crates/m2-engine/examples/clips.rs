@@ -124,6 +124,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             skeleton.model_matrices(&pose)
         };
         let floor = lowest(&at(0.0));
+        // Hands are measured from the root's spot under the body on the
+        // same frame, so a clip's travel doesn't count as reach.
+        let from_root = |m: &[Mat4], node: usize| {
+            let root = origin(&m[0]);
+            let p = origin(&m[node]);
+            local(Vec3::new(p.x - root.x, p.y, p.z - root.z), hips)
+        };
         let (mut rise, mut end_rise, mut spread) = (0.0f32, 0.0f32, 0.0f32);
         for i in 0..=SAMPLES {
             let m = at(d * i as f32 / SAMPLES as f32);
@@ -145,8 +152,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             block: block.clone(),
             duration: d,
             speed: c.info.speed,
-            right: local(origin(&mid[rh]), hips),
-            left: local(origin(&mid[lh]), hips),
+            right: from_root(&mid, rh),
+            left: from_root(&mid, lh),
             top,
             rise,
             end_rise,
@@ -175,10 +182,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             r.spread
         );
     }
-    let show = |title: &str, mut list: Vec<(&Row, f32)>| {
+    let print = |title: &str, mut list: Vec<(&Row, f32)>, most: usize| {
         list.sort_by(|a, b| b.1.total_cmp(&a.1));
         eprintln!("{title}:");
-        for (r, score) in list.iter().take(20) {
+        for (r, score) in list.iter().take(most) {
             eprintln!(
                 "  {:08x} {:5.2}s {:4.1}m/s  rh {:5.2} {:5.2} {:5.2}  lh {:5.2} {:5.2} {:5.2}  top {:4.2} rise {:4.2}/{:4.2}  score {score:.2}  {}",
                 r.hash,
@@ -197,6 +204,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     };
+    let show = |title: &str, list: Vec<(&Row, f32)>| print(title, list, 20);
+    let show_all = |title: &str, list: Vec<(&Row, f32)>| print(title, list, usize::MAX);
     // A shouldered rifle: standing, the right hand by the cheek (high, a
     // little forward), the left hand further forward along the barrel.
     let aim = |r: &Row| -> f32 {
@@ -226,6 +235,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|r| (r, r.left.y.min(r.right.y) - (r.spread - 0.4).abs()))
             .collect(),
     );
+    // Jennifer's own set, all of it: her weapon clips should be there.
+    let own: Vec<(&Row, f32)> = rows
+        .iter()
+        .filter(|r| r.block.contains("characternameanimgroup_jennifer"))
+        .map(|r| (r, r.speed))
+        .collect();
+    show_all("characternameanimgroup_jennifer, by speed", own);
     show(
         "jumps (the feet leave the ground and come back)",
         rows.iter()
