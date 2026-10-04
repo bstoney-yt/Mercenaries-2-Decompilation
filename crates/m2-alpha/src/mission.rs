@@ -44,6 +44,9 @@ const MESSAGE_TIME: f32 = 6.0;
 /// and at most this many.
 const VEHICLE_REACH: f32 = 300.0;
 const MAX_VEHICLES: usize = 16;
+/// The scripts put vehicles they don't need yet far under the island
+/// (about 40 km down): those below this height aren't placed.
+const HIDDEN_BELOW: f32 = -1000.0;
 /// Steps between looks for the scripts' vehicles near the player.
 const VEHICLE_LOOK: u32 = 10;
 
@@ -379,7 +382,10 @@ impl Fleet {
                 // Placed once the scripts have let go of it (a winch) and
                 // the ground under it has loaded.
                 if v.id.is_none()
-                    && let Some(o) = w.objects.get(&g).filter(|o| o.alive)
+                    && let Some(o) = w
+                        .objects
+                        .get(&g)
+                        .filter(|o| o.alive && o.position[1] > HIDDEN_BELOW)
                     && !w.winch.get(&g).is_some_and(Option::is_some)
                     && place(physics, v, Vec3::from(o.position), o.yaw)
                     && self.reenter == Some(g)
