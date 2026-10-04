@@ -21,6 +21,8 @@ m2-alpha [options]
   --screenshot <out.ppm> render one frame offscreen and exit
   --drive                with --screenshot on the island: get in the
                          nearest parked vehicle and drive it forward first
+  --jump                 with --screenshot on the island: jump just before
+                         the picture
   --fight                with --screenshot on the island: shoot the nearest
                          soldier, rocket a vehicle, throw a grenade first
   --mission              run the game's mission scripts: the first contract

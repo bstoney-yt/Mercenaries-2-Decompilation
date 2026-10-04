@@ -92,6 +92,8 @@ struct Options {
     double_sided: bool,
     fly: bool,
     drive: bool,
+    /// With `--screenshot` on foot: jump just before the picture.
+    jump: bool,
     fight: bool,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
@@ -157,6 +159,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--drive" => o.drive = true,
+            "--jump" => o.jump = true,
             "--fight" => o.fight = true,
             "--mission" => o.mission = true,
             "--mission-driver" => {
@@ -553,7 +556,16 @@ fn screenshot(
         };
         let from = game.scene.player.as_ref().map(|p| p.character.position);
         for i in 0..180 {
-            game.step(intent, tick);
+            // A jump takes the picture on the way up.
+            let jump = options.jump && i == 168;
+            game.step(
+                Intent {
+                    jump,
+                    hold_jump: jump,
+                    ..intent
+                },
+                tick,
+            );
             if i % 30 == 0 {
                 // Keep streaming around her as she goes.
                 render(&mut backend, &mut game, fov, aspect, None)?;
@@ -561,8 +573,17 @@ fn screenshot(
         }
         if let (Some(p), Some(from)) = (&game.scene.player, from) {
             eprintln!(
-                "player: {:?} from {from:.2} to {:.2}, grounded {}",
-                gait, p.character.position, p.character.grounded
+                "player: {:?} from {from:.2} to {:.2}, grounded {}, clip {:?}",
+                gait,
+                p.character.position,
+                p.character.grounded,
+                p.model
+                    .as_ref()
+                    .and_then(|(_, r)| r.animator.current())
+                    .map(|(c, t)| format!(
+                        "{:08x} at {t:.2} s",
+                        p.model.as_ref().map_or(0, |(_, r)| r.clips[c].hash)
+                    ))
             );
         }
     }
