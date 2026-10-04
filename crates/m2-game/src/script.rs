@@ -34,6 +34,9 @@ pub struct ScriptHost {
     stub_meta: Table,
     /// Modules loaded so far, in order, with the script each resolved to.
     modules: Rc<RefCell<Vec<LoadedModule>>>,
+    /// Modules in the order their chunks finished running: a module after
+    /// everything it imports, the order `Init` runs in.
+    finished: Rc<RefCell<Vec<String>>>,
 }
 
 /// A module name as loaded, and the script hash it resolved to.
@@ -149,6 +152,7 @@ impl ScriptHost {
             log,
             stub_meta,
             modules: Rc::default(),
+            finished: Rc::default(),
         })
     }
 
@@ -280,6 +284,7 @@ impl ScriptHost {
     ) -> Result<(), ScriptError> {
         let cache = self.lua.create_table()?;
         let modules = Rc::clone(&self.modules);
+        let finished = Rc::clone(&self.finished);
         let module = safe_function(&self.lua, move |lua, args| {
             let Some(Value::String(name)) = args.front() else {
                 return Err(mlua::Error::runtime("module name must be a string"));
@@ -348,6 +353,7 @@ impl ScriptHost {
                     .set_mode(ChunkMode::Binary)
                     .set_environment(env.clone())
                     .exec()?;
+                finished.borrow_mut().push(name.clone());
             }
             Ok(MultiValue::from_vec(vec![Value::Table(env)]))
         })?;
@@ -452,16 +458,15 @@ impl ScriptHost {
         Ok(run.call::<(usize, Vec<String>)>(())?)
     }
 
-    /// Calls `Init` on every module loaded so far that defines one, in the
-    /// order they loaded, as the game's bootstraps do before play: many
-    /// modules set up their tables there. Returns those that failed.
+    /// Calls `Init` on every module loaded so far that defines one, as the
+    /// game's bootstraps do before play: many modules set up their tables
+    /// there. A module's `Init` runs after those of the modules it
+    /// imports (`MrxPmc.Init` builds widgets with what `MrxGui.Init` set
+    /// up). Returns those that failed.
     pub fn init_modules(&self) -> Result<Vec<String>, ScriptError> {
         let mut failed = Vec::new();
         let globals = self.lua.globals();
-        for (name, hash) in self.modules() {
-            if hash.is_none() {
-                continue;
-            }
+        for name in self.finished.borrow().clone() {
             let Ok(Value::Table(m)) = globals.raw_get::<Value>(name.as_str()) else {
                 continue;
             };
@@ -647,6 +652,40 @@ mod tests {
         assert!(host.init_modules().unwrap().is_empty());
         let ready: bool = host.lua().load("return Util.ready").eval().unwrap();
         assert!(ready);
+    }
+
+    #[test]
+    fn modules_init_after_the_modules_they_import() {
+        let host = ScriptHost::new().unwrap();
+        let library = Rc::new(crate::library::tests::library());
+        host.install_library(library, false).unwrap();
+        // Task imports Util: Task starts loading first, Util finishes
+        // first, and Init follows the finishing order.
+        host.lua()
+            .load(
+                r#"
+                import("Task")
+                order = {}
+                Util.Init = function() order[#order + 1] = "Util" end
+                Task.Init = function() order[#order + 1] = "Task" end
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            host.modules(),
+            [("Task".to_owned(), Some(2)), ("Util".to_owned(), Some(1))]
+        );
+        assert!(host.init_modules().unwrap().is_empty());
+        let order: Vec<String> = host
+            .lua()
+            .load("return order")
+            .eval::<Table>()
+            .unwrap()
+            .sequence_values()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(order, ["Util", "Task"]);
     }
 
     #[test]
