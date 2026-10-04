@@ -553,6 +553,15 @@ impl Physics {
     }
 
     /// Signed forward speed, m/s.
+    /// A vehicle's velocity, m/s.
+    pub fn vehicle_velocity(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+            .map_or(Vec3::ZERO, |b| vec3(b.linvel()))
+    }
+
     pub fn vehicle_speed(&self, id: VehicleId) -> f32 {
         self.vehicles
             .get(id.0)

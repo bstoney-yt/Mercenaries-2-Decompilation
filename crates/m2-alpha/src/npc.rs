@@ -45,6 +45,10 @@ pub const DRAW_DISTANCE: f32 = 200.0;
 const TURN_RATE: f32 = 6.0;
 /// Seconds the dead take to topple when no fall clip fits their model.
 const TOPPLE: f32 = 0.6;
+/// Slowest a vehicle hurts people it meets, m/s.
+const RUN_OVER: f32 = 2.5;
+/// How far ahead (seconds) people see a vehicle coming at them.
+const DODGE_TIME: f32 = 2.0;
 
 /// A person model and the rig that animates it.
 #[derive(Debug)]
@@ -500,6 +504,45 @@ impl People {
         }
     }
 
+    /// Vehicles going through people: `cars` are (model to world,
+    /// velocity, model-space bounds) of each one moving. Anyone a car's
+    /// box meets is knocked flying, dead; civilians in its path dive out
+    /// of the way. The number of soldiers killed.
+    pub fn traffic(&mut self, cars: &[(Mat4, Vec3, (Vec3, Vec3))]) -> usize {
+        let mut killed = 0;
+        for &(at, velocity, (lo, hi)) in cars {
+            let speed = velocity.length();
+            if speed < RUN_OVER {
+                continue;
+            }
+            let to_car = at.inverse();
+            let centre = at.transform_point3((lo + hi) * 0.5);
+            let heading = velocity.with_y(0.0).normalize_or_zero();
+            let width = (hi.x - lo.x).max(hi.z - lo.z) * 0.5;
+            for n in self.npcs.iter_mut().filter(|n| n.alive && n.landed) {
+                let p = n.character.position;
+                let local = to_car.transform_point3(p + Vec3::Y * 0.9);
+                let pad = Vec3::new(0.35, 0.9, 0.35);
+                if local.cmpge(lo - pad).all() && local.cmple(hi + pad).all() {
+                    let push = velocity * 1.1 + Vec3::Y * (2.0 + speed * 0.15);
+                    if n.hurt(1000.0, push) && n.soldier {
+                        killed += 1;
+                    }
+                    continue;
+                }
+                // In its path in the next couple of seconds: off the line
+                // it drives along.
+                let rel = (p - centre).with_y(0.0);
+                let ahead = rel.dot(heading);
+                let side = (rel - heading * ahead).length();
+                if ahead > 0.0 && ahead < speed * DODGE_TIME && side < width + 1.5 {
+                    n.panic(centre + heading * ahead);
+                }
+            }
+        }
+        killed
+    }
+
     /// Who shouts this tick: a soldier the first tick they are on alert,
     /// a civilian the first tick they run (once until they calm down).
     /// Index into `npcs`, what, and where (their head).
@@ -878,6 +921,38 @@ pub(crate) mod tests {
         assert!(civilian.hurt(60.0, Vec3::ZERO));
         assert!(!civilian.alive);
         assert!(!civilian.hurt(60.0, Vec3::ZERO), "only dies once");
+    }
+
+    #[test]
+    fn cars_knock_people_flying_and_the_rest_dive_aside() {
+        let stroll = || Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let mut people = People::default();
+        for z in [1.5, 12.0, -6.0] {
+            let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, z), 0.0, stroll(), None);
+            n.landed = true;
+            people.npcs.push(n);
+        }
+        // A car at the origin doing 10 m/s along +z.
+        let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+        let car = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds);
+        people.traffic(&[car]);
+        let [hit, ahead, behind] = &people.npcs[..] else {
+            unreachable!()
+        };
+        assert!(!hit.alive && hit.fling.is_some_and(|v| v.z > 10.0 && v.y > 2.0));
+        assert!(ahead.alive && ahead.flee.is_some(), "dives aside");
+        assert!(behind.alive && behind.flee.is_none());
+        // Parked, nobody minds.
+        let mut people = People::default();
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, 1.5), 0.0, stroll(), None);
+        n.landed = true;
+        people.npcs.push(n);
+        people.traffic(&[(Mat4::IDENTITY, Vec3::ZERO, bounds)]);
+        assert!(people.npcs[0].alive);
     }
 
     #[test]
