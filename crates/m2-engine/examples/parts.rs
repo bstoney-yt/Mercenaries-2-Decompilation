@@ -107,7 +107,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             model.info.lod_count,
             model.info.flags
         );
+        let hidden = model.states.as_ref().map(|st| {
+            println!(
+                "  switchable {:?}\n  shown in order {:?}",
+                st.switchable, st.shown
+            );
+            [
+                st.hidden(&model.nodes, false),
+                st.hidden(&model.nodes, true),
+            ]
+        });
         for (i, n) in model.nodes.iter().enumerate() {
+            let state =
+                hidden
+                    .as_ref()
+                    .map_or("", |[intact, wrecked]| match (intact[i], wrecked[i]) {
+                        (false, false) => "both ",
+                        (false, true) => "INTACT ",
+                        (true, false) => "WRECK ",
+                        (true, true) => "never ",
+                    });
             let segs: Vec<String> = model
                 .segments
                 .iter()
@@ -127,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             let size = [0, 1, 2].map(|k| n.bounds_max[k] - n.bounds_min[k]);
             println!(
-                "  node {i:3} parent {:>4} {:08x}{} flags {:#06x} unk {:#010x} size {:.1}x{:.1}x{:.1}  {}",
+                "  {state}node {i:3} parent {:>4} {:08x}{} flags {:#06x} unk {:#010x} size {:.1}x{:.1}x{:.1}  {}",
                 n.parent.map_or("-".into(), |p| p.to_string()),
                 n.name_hash,
                 word(n.name_hash).map_or(String::new(), |w| format!(" ({w})")),
