@@ -61,6 +61,17 @@ pub struct Rig {
     pub upper: Option<Arc<[bool]>>,
 }
 
+/// How a rifle is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Carry {
+    /// Low in the right hand, muzzle down and forward.
+    Low,
+    /// Standing at the ready (soldiers at their posts).
+    Ready,
+    /// Shouldered and aimed.
+    Aim,
+}
+
 impl Rig {
     /// Reads model `hash`'s skeleton and every clip that fits it.
     pub fn load(
@@ -91,6 +102,11 @@ impl Rig {
             }
         );
         Ok(rig)
+    }
+
+    /// The clip `gait` plays, if there is one.
+    pub fn gait_clip(&self, gait: Gait) -> Option<usize> {
+        self.locomotion.as_ref()?.clips.get(&gait).copied()
     }
 
     /// Root speed (m/s) of the clip `gait` plays, if there is one.
@@ -172,16 +188,18 @@ impl Rig {
         }
     }
 
-    /// Moves at `gait` with a rifle: standing, the whole body holds it
-    /// shouldered (`aiming`) or at the ready; moving, the legs play the
-    /// gait and the upper body holds it the same way, or up at the ready
-    /// as when running. Falls back to the plain gait without the clips.
-    pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, aiming: bool) {
-        let (whole, upper) = match (gait, aiming) {
-            (Gait::Idle, true) => (clips.aim, None),
-            (Gait::Idle, false) => (clips.ready, None),
-            (_, true) => (None, clips.aim),
-            (_, false) => (None, clips.run),
+    /// Moves at `gait` holding a rifle as `carry` says. Aiming, it is
+    /// shouldered: by the whole body standing, by the upper body over the
+    /// legs' gait when moving. Otherwise the plain gait carries it low in
+    /// the right hand (as the game does), except that a soldier at the
+    /// ready standing holds it across the chest. Falls back to the plain
+    /// gait without the clips.
+    pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, carry: Carry) {
+        let (whole, upper) = match (gait, carry) {
+            (Gait::Idle, Carry::Aim) => (clips.aim, None),
+            (_, Carry::Aim) => (None, clips.aim),
+            (Gait::Idle, Carry::Ready) => (clips.ready, None),
+            _ => (None, None),
         };
         match whole {
             Some(clip) => {

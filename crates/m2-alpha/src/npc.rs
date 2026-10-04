@@ -15,7 +15,7 @@ use m2_engine::world::SpawnPoint;
 use m2_engine::{Character, Gait, GpuModel, Physics};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 
-use crate::scene::Rig;
+use crate::scene::{Carry, Rig};
 
 /// Soldiers come and go within these distances of the player, metres.
 const ACTIVE: f32 = 450.0;
@@ -79,11 +79,8 @@ pub(crate) enum Brain {
 pub struct FightClips {
     /// Standing, rifle shouldered and aimed (resident 0163f2aa).
     pub aim: Option<usize>,
-    /// Standing, rifle held low across the chest (resident 178a5642).
+    /// Standing, rifle held across the chest (resident 178a5642).
     pub ready: Option<usize>,
-    /// Running with the rifle up at the ready (resident 8c8509b3): its
-    /// upper body is laid over the legs' gait.
-    pub run: Option<usize>,
     /// A jump: take-off and the air, ending off the ground (resident
     /// c846e6fd).
     pub jump: Option<usize>,
@@ -94,7 +91,6 @@ pub struct FightClips {
 impl FightClips {
     pub const AIM: u32 = 0x0163_f2aa;
     pub const READY: u32 = 0x178a_5642;
-    pub const RUN: u32 = 0x8c85_09b3;
     pub const JUMP: u32 = 0xc846_e6fd;
     pub const DIE: u32 = 0x479c_4a51;
 
@@ -103,7 +99,6 @@ impl FightClips {
         Self {
             aim: find(Self::AIM),
             ready: find(Self::READY),
-            run: find(Self::RUN),
             jump: find(Self::JUMP),
             die: find(Self::DIE),
         }
@@ -111,7 +106,7 @@ impl FightClips {
 
     /// Every clip, for rebinding.
     pub fn all(&self) -> impl Iterator<Item = usize> {
-        [self.aim, self.ready, self.run, self.jump, self.die]
+        [self.aim, self.ready, self.jump, self.die]
             .into_iter()
             .flatten()
     }
@@ -248,7 +243,7 @@ impl Npc {
         }
         physics.move_character(&mut self.character, Vec3::ZERO, None, dt);
         let off = self.turn_to(to.x.atan2(to.z), dt);
-        self.rig.hold_rifle(Gait::Idle, &clips, true);
+        self.rig.hold_rifle(Gait::Idle, &clips, Carry::Aim);
         self.cooldown -= dt;
         if self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
             self.fires = true;
@@ -403,7 +398,7 @@ impl Npc {
         };
         if self.soldier {
             let clips = self.clips;
-            self.rig.hold_rifle(gait, &clips, false);
+            self.rig.hold_rifle(gait, &clips, Carry::Ready);
         } else {
             self.rig.set_gait(gait);
         }
