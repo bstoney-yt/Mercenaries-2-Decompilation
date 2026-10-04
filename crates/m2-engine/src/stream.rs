@@ -26,7 +26,7 @@ use m2_math::glam::{Mat4, Quat, Vec3, Vec4, Vec4Swizzles};
 use m2_render::{
     BackendError, BlendMode, BufferUsage, DetailMap, DrawCall, DrawQueue, Geometry,
     IndexBufferDesc, IndexBufferHandle, IndexFormat, Layer, MaterialDesc, MaterialId, Primitive,
-    RenderBackend, Topology, VertexBufferDesc, VertexBufferHandle,
+    RenderBackend, TerrainLayer, Topology, VertexBufferDesc, VertexBufferHandle,
 };
 
 use m2_assets::model::ModelInfo;
@@ -38,7 +38,7 @@ use crate::assets::{AssetError, DecodedTexture, Install};
 use crate::model::{CpuModel, GpuModel, MaterialCache, MemberShape};
 use crate::physics::{CollisionShape, Physics, StaticKey};
 use crate::scatter::{self, CellScatter};
-use crate::world::{self, TerrainMesh, WorldIndex};
+use crate::world::{self, TerrainMesh, TerrainSurface, WorldIndex};
 
 /// Something for the loader to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -88,7 +88,7 @@ pub struct TextureLimits {
 impl Default for TextureLimits {
     fn default() -> Self {
         Self {
-            models: 1024,
+            models: 2048,
             terrain: 2048,
             scatter: 256,
         }
@@ -117,14 +117,18 @@ impl Loader {
             .spawn(move || {
                 let mut sent_textures = HashSet::new();
                 let mut building_shapes = HashMap::new();
-                let mut texture = |source: &mut crate::AssetSource<_>, hash: u32, max: u32| {
-                    if sent_textures.insert(hash) {
-                        let t = source.texture(hash, max).ok();
-                        res_tx.send(Loaded::Texture(hash, t)).is_ok()
-                    } else {
-                        true
-                    }
-                };
+                let mut texture =
+                    |source: &mut crate::AssetSource<_>, hash: u32, max: u32, linear: bool| {
+                        if sent_textures.insert(hash) {
+                            let t = source.texture(hash, max).ok().map(|mut t| {
+                                t.linear = linear;
+                                t
+                            });
+                            res_tx.send(Loaded::Texture(hash, t)).is_ok()
+                        } else {
+                            true
+                        }
+                    };
                 for request in req_rx {
                     let loaded = match request {
                         Request::Cell(h) | Request::Tile(h) => {
@@ -139,13 +143,12 @@ impl Loader {
                                 _ => world::low_res_tile(&mut source, h, centre),
                             };
                             if let Ok(m) = &mesh {
-                                let maps = [
-                                    m.colour_map.map(|t| (t, limits.terrain)),
-                                    m.detail_map.map(|t| (t, limits.models)),
-                                ];
-                                for (t, max) in maps.into_iter().flatten() {
-                                    if !texture(&mut source, t, max) {
-                                        return;
+                                for s in &m.surfaces {
+                                    for (t, linear, map) in s.textures() {
+                                        let max = if map { limits.terrain } else { limits.models };
+                                        if !texture(&mut source, t, max, linear) {
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -167,8 +170,8 @@ impl Loader {
                                 Ok(m)
                             });
                             if let Ok(m) = &model {
-                                for t in m.texture_hashes().collect::<Vec<_>>() {
-                                    if !texture(&mut source, t, limits.models) {
+                                for (t, linear) in m.texture_requests() {
+                                    if !texture(&mut source, t, limits.models, linear) {
                                         return;
                                     }
                                 }
@@ -180,7 +183,7 @@ impl Loader {
                             let found = scatter::cell_scatter(&mut source, h, centre);
                             if let Ok(s) = &found {
                                 for t in s.meshes.iter().filter_map(|m| m.texture()) {
-                                    if !texture(&mut source, t, limits.scatter) {
+                                    if !texture(&mut source, t, limits.scatter, false) {
                                         return;
                                     }
                                 }
@@ -324,8 +327,8 @@ impl Default for WorldSettings {
 struct TerrainGpu {
     vertex_buffer: VertexBufferHandle,
     index_buffer: IndexBufferHandle,
-    count: u32,
-    material: MaterialId,
+    /// (first index, index count, material).
+    ranges: Vec<(u32, u32, MaterialId)>,
     origin: Vec3,
 }
 
@@ -385,8 +388,9 @@ pub struct World {
     objects: HashMap<(i32, i32), Vec<usize>>,
     /// Placed objects by model hash.
     by_model: HashMap<u32, Vec<usize>>,
-    /// By colour map and detail map.
-    terrain_materials: HashMap<(Option<u32>, Option<u32>), MaterialId>,
+    /// Ground materials by their textures and layer coordinates
+    /// ([`ground_key`]).
+    terrain_materials: HashMap<Vec<u32>, MaterialId>,
     sea: (VertexBufferHandle, IndexBufferHandle, MaterialId),
     stats: WorldStats,
     /// Placed objects (index into the index's `objects`) blown up: drawn
@@ -741,40 +745,47 @@ impl World {
         materials: &mut MaterialCache,
         mesh: &TerrainMesh,
     ) -> Result<TerrainGpu, BackendError> {
-        let key = (mesh.colour_map, mesh.detail_map);
-        let material = match self.terrain_materials.get(&key) {
-            Some(&m) => m,
-            None => {
-                let texture = mesh.colour_map.and_then(|t| materials.texture(t));
-                let detail = mesh.detail_map.and_then(|t| materials.texture(t));
-                let m = materials.define(
-                    backend,
-                    &MaterialDesc {
-                        texture: texture.map(|t| t.0),
-                        color: if texture.is_some() {
-                            [1.0; 4]
-                        } else {
-                            [0.32, 0.42, 0.22, 1.0]
-                        },
-                        clamp: true,
-                        detail: detail.map(|(texture, _)| DetailMap {
-                            texture,
-                            tile: DETAIL_TILE,
-                        }),
-                        ..MaterialDesc::default()
-                    },
-                )?;
-                self.terrain_materials.insert(key, m);
-                m
-            }
-        };
+        let mut ids = Vec::with_capacity(mesh.surfaces.len());
+        for surface in &mesh.surfaces {
+            ids.push(match surface {
+                TerrainSurface::Surface(m) => materials.overlay_material(backend, m)?,
+                TerrainSurface::Ground {
+                    colour_map,
+                    detail_map,
+                    layers,
+                } => {
+                    let key = ground_key(*colour_map, *detail_map, layers);
+                    match self.terrain_materials.get(&key) {
+                        Some(&m) => m,
+                        None => {
+                            let m = materials.define(
+                                backend,
+                                &ground_material(materials, *colour_map, *detail_map, layers),
+                            )?;
+                            // Kept only once every texture is known.
+                            let known = surface
+                                .textures()
+                                .iter()
+                                .all(|&(t, _, _)| materials.has_texture(t));
+                            if known {
+                                self.terrain_materials.insert(key, m);
+                            }
+                            m
+                        }
+                    }
+                }
+            });
+        }
         Ok(TerrainGpu {
             vertex_buffer: backend
                 .create_vertex_buffer(&mesh.vertex_desc(), Some(&mesh.vertices))?,
             index_buffer: backend
                 .create_index_buffer(&mesh.index_desc(), Some(&mesh.index_bytes()))?,
-            count: mesh.indices.len() as u32,
-            material,
+            ranges: mesh
+                .ranges
+                .iter()
+                .map(|&(first, count, s)| (first, count, ids[s]))
+                .collect(),
             origin: mesh.origin,
         })
     }
@@ -790,26 +801,28 @@ impl World {
         frustum: &Frustum,
     ) -> Result<(), BackendError> {
         let terrain = |t: &TerrainGpu, queue: &mut DrawQueue| {
-            queue.push(Primitive {
-                call: DrawCall {
-                    material: t.material,
-                    topology: Topology::TriangleList,
-                    vertex_buffer: t.vertex_buffer,
-                    geometry: Geometry::Indexed {
-                        buffer: t.index_buffer,
-                        first: 0,
-                        count: t.count,
-                        base_vertex: 0,
+            for &(first, count, material) in &t.ranges {
+                queue.push(Primitive {
+                    call: DrawCall {
+                        material,
+                        topology: Topology::TriangleList,
+                        vertex_buffer: t.vertex_buffer,
+                        geometry: Geometry::Indexed {
+                            buffer: t.index_buffer,
+                            first,
+                            count,
+                            base_vertex: 0,
+                        },
+                        world: Mat4::from_translation(t.origin),
+                        skin: None,
+                        instances: None,
                     },
-                    world: Mat4::from_translation(t.origin),
-                    skin: None,
-                    instances: None,
-                },
-                layer: Layer::WORLD,
-                translucent: false,
-                sort_origin: t.origin,
-                user: 0,
-            });
+                    layer: Layer::WORLD,
+                    translucent: false,
+                    sort_origin: t.origin,
+                    user: 0,
+                });
+            }
         };
         let detailed: Vec<Vec3> = self
             .cells
@@ -969,6 +982,63 @@ fn destroy_clumps(
     Ok(())
 }
 
+/// A ground material's cache key: its textures and the bits of its layer
+/// coordinates.
+fn ground_key(
+    colour_map: Option<u32>,
+    detail_map: Option<u32>,
+    layers: &[(u32, [[f32; 4]; 2])],
+) -> Vec<u32> {
+    let mut key = vec![colour_map.unwrap_or(0), detail_map.unwrap_or(0)];
+    for (t, rows) in layers {
+        key.push(*t);
+        key.extend(rows.iter().flatten().map(|f| f.to_bits()));
+    }
+    key
+}
+
+/// How ground is drawn: the cell's colour map clamped over the cell, the
+/// detail map tiled up close, and the tiled layers. Textures not yet loaded
+/// are left out.
+fn ground_material(
+    materials: &MaterialCache,
+    colour_map: Option<u32>,
+    detail_map: Option<u32>,
+    layers: &[(u32, [[f32; 4]; 2])],
+) -> MaterialDesc {
+    let texture = colour_map.and_then(|t| materials.texture(t));
+    let detail = detail_map.and_then(|t| materials.texture(t));
+    let mut out = [None; 4];
+    // A layer that failed to load would shift the weights onto the wrong
+    // textures, so the layers stop at the first missing one.
+    for (slot, (t, rows)) in out.iter_mut().zip(layers) {
+        match materials.texture(*t) {
+            Some((handle, _)) => {
+                *slot = Some(TerrainLayer {
+                    texture: handle,
+                    uv: *rows,
+                })
+            }
+            None => break,
+        }
+    }
+    MaterialDesc {
+        texture: texture.map(|t| t.0),
+        color: if texture.is_some() {
+            [1.0; 4]
+        } else {
+            [0.32, 0.42, 0.22, 1.0]
+        },
+        clamp: true,
+        detail: detail.map(|(texture, _)| DetailMap {
+            texture,
+            tile: DETAIL_TILE,
+        }),
+        layers: out,
+        ..MaterialDesc::default()
+    }
+}
+
 /// A 20 km square of translucent water at `level`, centred on the origin.
 fn sea_plane(
     backend: &mut dyn RenderBackend,
@@ -983,7 +1053,7 @@ fn sea_plane(
         .collect();
     let vb = backend.create_vertex_buffer(
         &VertexBufferDesc {
-            layout: TerrainMesh::layout(),
+            layout: world::simple_layout(),
             vertex_count: 4,
             usage: BufferUsage::Static,
         },

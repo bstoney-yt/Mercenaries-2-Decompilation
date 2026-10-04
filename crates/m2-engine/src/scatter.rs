@@ -13,9 +13,9 @@ use m2_render::{BufferUsage, IndexBufferDesc, IndexFormat, VertexBufferDesc};
 
 use crate::assets::{AssetError, AssetSource};
 use crate::model::base_texture;
-use crate::world::TerrainMesh;
+use crate::world::{SIMPLE_STRIDE, simple_layout};
 
-/// One clump mesh, in the terrain vertex layout (position, normal, UV).
+/// One clump mesh, in the simple vertex layout (position, normal, UV).
 #[derive(Clone, Debug)]
 pub struct ClumpMesh {
     pub vertices: Vec<u8>,
@@ -31,8 +31,8 @@ pub struct ClumpMesh {
 impl ClumpMesh {
     pub fn vertex_desc(&self) -> VertexBufferDesc {
         VertexBufferDesc {
-            layout: TerrainMesh::layout(),
-            vertex_count: (self.vertices.len() / 32) as u32,
+            layout: simple_layout(),
+            vertex_count: (self.vertices.len() / SIMPLE_STRIDE) as u32,
             usage: BufferUsage::Static,
         }
     }

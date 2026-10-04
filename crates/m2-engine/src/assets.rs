@@ -142,6 +142,9 @@ pub struct DecodedTexture {
     pub mips: Vec<Vec<u8>>,
     /// The stored format has an alpha channel.
     pub alpha: bool,
+    /// Holds data rather than colour (normal and specular maps): upload it
+    /// without sRGB decoding. Set by whoever knows what it is used for.
+    pub linear: bool,
 }
 
 /// The tier (`_Q<n>`) a streamed block belongs to.
@@ -345,6 +348,7 @@ impl<R: Read + Seek> AssetSource<R> {
             height,
             mips,
             alpha,
+            linear: false,
         })
     }
 }

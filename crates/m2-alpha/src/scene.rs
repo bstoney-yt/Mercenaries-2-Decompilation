@@ -855,7 +855,7 @@ impl Scene {
             | Loaded::Weapon(_, cpu, _) => cpu,
         };
         self.materials
-            .load_textures(backend, source, cpu.texture_hashes().collect::<Vec<_>>())?;
+            .load_textures(backend, source, cpu.texture_requests())?;
         let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
         match loaded {
             Loaded::Catalogue(_) => {}

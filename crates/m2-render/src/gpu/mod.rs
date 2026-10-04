@@ -155,6 +155,7 @@ struct PipelineKey {
     strip_index: Option<IndexFormat>,
     blend: BlendKind,
     double_sided: bool,
+    depth_bias: bool,
 }
 
 #[repr(C)]
@@ -174,8 +175,37 @@ struct MaterialUniforms {
     color: [f32; 4],
     params: [f32; 4],
     /// x: detail tiles per metre (0: none), y: distance it fades out by,
-    /// z: soft edge.
+    /// z: soft edge, w: ground layers.
     detail: [f32; 4],
+    /// rgb: highlight colour (0: none), a: exponent.
+    specular: [f32; 4],
+    /// x: specular map, y: normal map, z: normal x in alpha.
+    maps: [f32; 4],
+    /// Per ground layer, the u row then the v row.
+    layer_uv: [[f32; 4]; 8],
+}
+
+/// Texture views a material binds besides its uniforms.
+struct MaterialViews<'a> {
+    base: &'a wgpu::TextureView,
+    detail: &'a wgpu::TextureView,
+    specular: &'a wgpu::TextureView,
+    normal: &'a wgpu::TextureView,
+    layers: [&'a wgpu::TextureView; 4],
+}
+
+/// A 2D float texture binding visible to the fragment stage.
+fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
 }
 
 /// A frame between `begin_frame` and `end_frame`.
@@ -437,38 +467,26 @@ impl WgpuBackend {
             label: Some("material"),
             entries: &[
                 uniform_entry(0, false),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                texture_entry(1),
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                texture_entry(3),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                texture_entry(5),
+                texture_entry(6),
+                texture_entry(7),
+                texture_entry(8),
+                texture_entry(9),
+                texture_entry(10),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -537,7 +555,13 @@ impl WgpuBackend {
                 &device,
                 &material_layout,
                 &samplers,
-                (&white, &white),
+                &MaterialViews {
+                    base: &white,
+                    detail: &white,
+                    specular: &white,
+                    normal: &white,
+                    layers: [&white; 4],
+                },
                 &MaterialDesc::default(),
             ),
             adapter,
@@ -631,13 +655,12 @@ impl WgpuBackend {
             .create_view(&Default::default())
     }
 
-    /// `samplers` are the repeating and clamping ones; `textures` the base
-    /// and detail maps.
+    /// `samplers` are the repeating and clamping ones.
     fn material_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         samplers: &[wgpu::Sampler; 2],
-        (texture, detail): (&wgpu::TextureView, &wgpu::TextureView),
+        views: &MaterialViews<'_>,
         desc: &MaterialDesc,
     ) -> wgpu::BindGroup {
         let cutoff = match desc.blend {
@@ -653,9 +676,34 @@ impl WgpuBackend {
                 flag(desc.vertex_color),
                 flag(desc.fog),
             ],
-            detail: match desc.detail {
-                Some(d) if d.tile > 0.0 => [1.0 / d.tile, DETAIL_FADE, flag(desc.soft_edge), 0.0],
-                _ => [0.0, 0.0, flag(desc.soft_edge), 0.0],
+            detail: [
+                match desc.detail {
+                    Some(d) if d.tile > 0.0 => 1.0 / d.tile,
+                    _ => 0.0,
+                },
+                DETAIL_FADE,
+                flag(desc.soft_edge),
+                desc.layers.iter().take_while(|l| l.is_some()).count() as f32,
+            ],
+            specular: match desc.specular {
+                Some(s) => [s.color[0], s.color[1], s.color[2], s.power],
+                None => [0.0; 4],
+            },
+            maps: [
+                flag(desc.specular.is_some_and(|s| s.map.is_some())),
+                flag(desc.normal_map.is_some()),
+                flag(desc.normal_map.is_some_and(|n| n.alpha_x)),
+                0.0,
+            ],
+            layer_uv: {
+                let mut rows = [[0.0; 4]; 8];
+                for (i, l) in desc.layers.iter().enumerate() {
+                    if let Some(l) = l {
+                        rows[i * 2] = l.uv[0];
+                        rows[i * 2 + 1] = l.uv[1];
+                    }
+                }
+                rows
             },
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -673,7 +721,7 @@ impl WgpuBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(texture),
+                    resource: wgpu::BindingResource::TextureView(views.base),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -681,11 +729,35 @@ impl WgpuBackend {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(detail),
+                    resource: wgpu::BindingResource::TextureView(views.detail),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&samplers[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(views.specular),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(views.normal),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(views.layers[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(views.layers[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(views.layers[2]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(views.layers[3]),
                 },
             ],
         })
@@ -825,6 +897,7 @@ impl WgpuBackend {
                 BlendMode::Translucent => BlendKind::Translucent,
             },
             double_sided: desc.double_sided,
+            depth_bias: desc.depth_bias,
         })
     }
 
@@ -879,7 +952,16 @@ impl WgpuBackend {
                 depth_write_enabled: Some(!translucent),
                 depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),
-                bias: Default::default(),
+                // Depth is reversed, so a positive bias is towards the camera.
+                bias: if key.depth_bias {
+                    wgpu::DepthBiasState {
+                        constant: 8,
+                        slope_scale: 1.0,
+                        clamp: 0.0,
+                    }
+                } else {
+                    Default::default()
+                },
             }),
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
@@ -1210,19 +1292,29 @@ impl RenderBackend for WgpuBackend {
     }
 
     fn set_material(&mut self, id: MaterialId, desc: &MaterialDesc) -> Result<(), BackendError> {
-        let view = match desc.texture {
-            Some(t) => &self.textures.get(t.0)?.view,
-            None => &self.white,
+        let view = |t: Option<TextureHandle>| -> Result<&wgpu::TextureView, BackendError> {
+            match t {
+                Some(t) => Ok(&self.textures.get(t.0)?.view),
+                None => Ok(&self.white),
+            }
         };
-        let detail = match desc.detail {
-            Some(d) => &self.textures.get(d.texture.0)?.view,
-            None => &self.white,
+        let views = MaterialViews {
+            base: view(desc.texture)?,
+            detail: view(desc.detail.map(|d| d.texture))?,
+            specular: view(desc.specular.and_then(|s| s.map))?,
+            normal: view(desc.normal_map.map(|n| n.texture))?,
+            layers: [
+                view(desc.layers[0].map(|l| l.texture))?,
+                view(desc.layers[1].map(|l| l.texture))?,
+                view(desc.layers[2].map(|l| l.texture))?,
+                view(desc.layers[3].map(|l| l.texture))?,
+            ],
         };
         let bind_group = Self::material_group(
             &self.device,
             &self.material_layout,
             &self.samplers,
-            (view, detail),
+            &views,
             desc,
         );
         self.materials.insert(

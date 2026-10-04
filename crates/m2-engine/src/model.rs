@@ -20,19 +20,31 @@ use m2_assets::{Model, Ucfx};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
     BackendError, BlendMode, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
-    Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, SkinHandle, TextureDesc,
-    TextureFormat, TextureHandle, VertexBufferDesc, VertexBufferHandle, generate_mips,
+    Layer, MaterialDesc, MaterialId, NormalMap, Primitive, RenderBackend, SkinHandle, Specular,
+    TextureDesc, TextureFormat, TextureHandle, VertexBufferDesc, VertexBufferHandle, generate_mips,
 };
 
 use crate::assets::{AssetError, AssetSource, DecodedTexture, ModelData};
 use crate::physics::CollisionShape;
+use crate::technique::Technique;
+
+/// An uploaded texture and what its pixels say about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Uploaded {
+    pub handle: TextureHandle,
+    /// Its alpha cuts shapes out.
+    pub alpha: bool,
+    /// As a normal map, x is in alpha rather than red.
+    pub alpha_x: bool,
+}
 
 /// Textures and materials shared between models.
 #[derive(Debug)]
 pub struct MaterialCache {
     /// `None`: the texture could not be read; its materials draw untextured.
-    textures: HashMap<u32, Option<(TextureHandle, bool)>>,
-    materials: HashMap<(u32, Option<u32>), MaterialId>,
+    textures: HashMap<u32, Option<Uploaded>>,
+    /// By name, base texture, technique and depth bias.
+    materials: HashMap<(u32, Option<u32>, u32, bool), MaterialId>,
     defined: Vec<(MaterialId, MaterialDesc)>,
     next_material: u32,
     /// Every material, including ones defined later, draws both faces.
@@ -50,7 +62,7 @@ impl Default for MaterialCache {
             // 0 stays the backend's default material.
             next_material: 1,
             all_double_sided: false,
-            max_texture_width: 1024,
+            max_texture_width: 2048,
         }
     }
 }
@@ -67,6 +79,11 @@ impl MaterialCache {
 
     /// The uploaded texture `hash` and whether it has alpha.
     pub fn texture(&self, hash: u32) -> Option<(TextureHandle, bool)> {
+        self.uploaded(hash).map(|t| (t.handle, t.alpha))
+    }
+
+    /// The uploaded texture `hash`.
+    pub fn uploaded(&self, hash: u32) -> Option<Uploaded> {
         self.textures.get(&hash).copied().flatten()
     }
 
@@ -82,43 +99,106 @@ impl MaterialCache {
             return Ok(());
         }
         let uploaded = match texture {
-            Some(t) if !t.mips.is_empty() => Some(upload_texture(backend, t)?),
+            Some(t) if !t.mips.is_empty() => {
+                let (handle, alpha) = upload_texture(backend, t)?;
+                Some(Uploaded {
+                    handle,
+                    alpha,
+                    alpha_x: alpha_holds_x(t),
+                })
+            }
             _ => None,
         };
         self.textures.insert(hash, uploaded);
         Ok(())
     }
 
-    /// Reads and uploads the textures in `hashes` not yet known.
+    /// Reads and uploads the textures in `requests` not yet known: (hash,
+    /// whether it holds data rather than colour), as
+    /// [`material_textures`] lists them.
     pub fn load_textures<R: Read + Seek>(
         &mut self,
         backend: &mut dyn RenderBackend,
         source: &mut AssetSource<R>,
-        hashes: impl IntoIterator<Item = u32>,
+        requests: impl IntoIterator<Item = (u32, bool)>,
     ) -> Result<(), BackendError> {
-        for hash in hashes {
+        for (hash, linear) in requests {
             if !self.has_texture(hash) {
-                let t = source.texture(hash, self.max_texture_width).ok();
+                let t = source
+                    .texture(hash, self.max_texture_width)
+                    .ok()
+                    .map(|mut t| {
+                        t.linear = linear;
+                        t
+                    });
                 self.add_texture(backend, hash, t.as_ref())?;
             }
         }
         Ok(())
     }
 
-    /// The material for a model material record: its first texture as base
-    /// colour, alpha-tested when that texture has alpha. Add the texture
-    /// first; a texture not yet added draws untextured and is not cached.
+    /// The material for a model material record, shaded as its technique
+    /// says (see [`Technique`]): base colour from slot 0, alpha-tested when
+    /// that texture has alpha, and the specular and normal maps when the
+    /// technique has them. Add the textures first; a texture not yet added
+    /// is left out and the material is not cached.
     pub fn material(
         &mut self,
         backend: &mut dyn RenderBackend,
         material: &Material,
     ) -> Result<MaterialId, BackendError> {
+        self.material_biased(backend, material, false)
+    }
+
+    /// As [`material`](Self::material), for a surface laid over another
+    /// (roads and markings on the ground): it wins the depth test.
+    pub fn overlay_material(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        material: &Material,
+    ) -> Result<MaterialId, BackendError> {
+        self.material_biased(backend, material, true)
+    }
+
+    fn material_biased(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        material: &Material,
+        depth_bias: bool,
+    ) -> Result<MaterialId, BackendError> {
         let texture_hash = base_texture(material);
-        let key = (material.name_hash, texture_hash);
+        let key = (
+            material.name_hash,
+            texture_hash,
+            material.technique,
+            depth_bias,
+        );
         if let Some(&id) = self.materials.get(&key) {
             return Ok(id);
         }
+        let technique = Technique::from_hash(material.technique);
+        let slot = |i: usize| material.textures.get(i).copied().filter(|&t| t != 0);
         let texture = texture_hash.and_then(|t| self.texture(t));
+        let specular = technique.filter(|t| t.specular).map(|_| Specular {
+            color: [
+                material.constants[3],
+                material.constants[4],
+                material.constants[5],
+            ],
+            power: material.constants[13].max(1.0),
+            map: slot(1)
+                .filter(|_| technique.is_some_and(|t| !t.emissive))
+                .and_then(|t| self.uploaded(t))
+                .map(|t| t.handle),
+        });
+        let normal_map = technique
+            .filter(|t| t.normal)
+            .and_then(|_| slot(2))
+            .and_then(|t| self.uploaded(t))
+            .map(|t| NormalMap {
+                texture: t.handle,
+                alpha_x: t.alpha_x,
+            });
         let desc = MaterialDesc {
             texture: texture.map(|t| t.0),
             blend: match texture {
@@ -131,10 +211,17 @@ impl MaterialCache {
             } else {
                 [0.6, 0.6, 0.6, 1.0]
             },
+            vertex_color: technique.is_some_and(|t| t.ambient_occlusion),
+            specular,
+            normal_map,
+            depth_bias,
             ..MaterialDesc::default()
         };
         let id = self.define(backend, &desc)?;
-        if texture_hash.is_none_or(|t| self.has_texture(t)) {
+        if material_textures(material)
+            .iter()
+            .all(|&(t, _)| self.has_texture(t))
+        {
             self.materials.insert(key, id);
         }
         Ok(id)
@@ -193,6 +280,48 @@ pub fn base_texture(material: &Material) -> Option<u32> {
     material.textures.first().copied().filter(|&t| t != 0)
 }
 
+/// The textures a material record draws with, as (hash, holds data rather
+/// than colour): the base colour, and the specular, emissive and normal
+/// maps its technique uses.
+pub fn material_textures(material: &Material) -> Vec<(u32, bool)> {
+    let slot = |i: usize| material.textures.get(i).copied().filter(|&t| t != 0);
+    let mut out: Vec<(u32, bool)> = slot(0).map(|t| (t, false)).into_iter().collect();
+    if let Some(t) = Technique::from_hash(material.technique) {
+        if t.emissive {
+            out.extend(slot(1).map(|h| (h, false)));
+        } else if t.specular {
+            out.extend(slot(1).map(|h| (h, true)));
+        }
+        if t.normal {
+            out.extend(slot(2).map(|h| (h, true)));
+        }
+    }
+    out
+}
+
+/// Whether a normal map keeps x in alpha (the DXT5 swizzle, red left
+/// constant) rather than in red: whichever of the two varies more.
+fn alpha_holds_x(t: &DecodedTexture) -> bool {
+    // A small mip is enough to tell.
+    let Some(m) = t
+        .mips
+        .iter()
+        .find(|m| m.len() <= 64 * 64 * 4)
+        .or(t.mips.last())
+    else {
+        return false;
+    };
+    let spread = |c: usize| {
+        let n = (m.len() / 4).max(1) as f64;
+        let mean = m.chunks_exact(4).map(|p| f64::from(p[c])).sum::<f64>() / n;
+        m.chunks_exact(4)
+            .map(|p| (f64::from(p[c]) - mean).powi(2))
+            .sum::<f64>()
+            / n
+    };
+    spread(3) > spread(0)
+}
+
 /// Uploads a decoded texture, generating any mips its chain lacks.
 pub fn upload_texture(
     backend: &mut dyn RenderBackend,
@@ -201,7 +330,11 @@ pub fn upload_texture(
     let desc = TextureDesc {
         width: t.width,
         height: t.height,
-        format: TextureFormat::Rgba8Srgb,
+        format: if t.linear {
+            TextureFormat::Rgba8Unorm
+        } else {
+            TextureFormat::Rgba8Srgb
+        },
     };
     let generated;
     let mips: Vec<&[u8]> = if t.mips.len() as u32 == desc.full_chain_len() {
@@ -376,9 +509,13 @@ impl CpuModel {
         Ok(cpu)
     }
 
-    /// Base-colour textures the model's materials use.
-    pub fn texture_hashes(&self) -> impl Iterator<Item = u32> + '_ {
-        self.materials.iter().filter_map(base_texture)
+    /// Textures the model's materials use, as [`material_textures`] lists
+    /// them.
+    pub fn texture_requests(&self) -> Vec<(u32, bool)> {
+        let mut out: Vec<(u32, bool)> = self.materials.iter().flat_map(material_textures).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 }
 
@@ -464,7 +601,7 @@ impl GpuModel {
     ) -> Result<Self, crate::AssetError> {
         let data = source.model(hash)?;
         let cpu = CpuModel::build(hash, &data.parse()?, lod);
-        materials.load_textures(backend, source, cpu.texture_hashes().collect::<Vec<_>>())?;
+        materials.load_textures(backend, source, cpu.texture_requests())?;
         Ok(Self::upload(backend, materials, &cpu)?)
     }
 
@@ -623,6 +760,7 @@ mod tests {
             height: 4,
             mips: vec![vec![255; 64]],
             alpha: true,
+            linear: false,
         };
         let (handle, alpha) = upload_texture(&mut backend, &t).unwrap();
         assert!(alpha);
@@ -639,6 +777,7 @@ mod tests {
             height: 1,
             mips: vec![vec![1, 2, 3, 255]],
             alpha: false,
+            linear: false,
         };
         let cutout = DecodedTexture {
             alpha: true,

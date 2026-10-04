@@ -33,8 +33,14 @@ struct Material {
     // x: alpha cutoff, y: lit, z: vertex colour, w: fog
     params: vec4<f32>,
     // x: detail tiles per metre (0: none), y: fade-out distance,
-    // z: soft edge
+    // z: soft edge, w: ground layers
     detail: vec4<f32>,
+    // rgb: highlight colour (0: none), a: exponent
+    specular: vec4<f32>,
+    // x: specular map, y: normal map, z: normal x in alpha
+    maps: vec4<f32>,
+    // Per ground layer, u then v as rows over model-space (x, y, z, 1).
+    layer_uv: array<vec4<f32>, 8>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -45,6 +51,12 @@ struct Material {
 @group(2) @binding(2) var base_sampler: sampler;
 @group(2) @binding(3) var detail_map: texture_2d<f32>;
 @group(2) @binding(4) var detail_sampler: sampler;
+@group(2) @binding(5) var specular_map: texture_2d<f32>;
+@group(2) @binding(6) var normal_map: texture_2d<f32>;
+@group(2) @binding(7) var layer0: texture_2d<f32>;
+@group(2) @binding(8) var layer1: texture_2d<f32>;
+@group(2) @binding(9) var layer2: texture_2d<f32>;
+@group(2) @binding(10) var layer3: texture_2d<f32>;
 
 struct Varyings {
     @builtin(position) clip: vec4<f32>,
@@ -52,20 +64,48 @@ struct Varyings {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec4<f32>,
+    // xyz: world-space tangent (0: none), w: handedness
+    @location(4) tangent: vec4<f32>,
+    // Position before the model transform (ground layer coordinates).
+    @location(5) local_pos: vec3<f32>,
 };
 "#;
 
 const FRAGMENT: &str = r#"
+fn layer_uv(i: u32, p: vec4<f32>) -> vec2<f32> {
+    return vec2<f32>(dot(material.layer_uv[i * 2u], p), dot(material.layer_uv[i * 2u + 1u], p));
+}
+
 @fragment
 fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     var base = textureSample(base_map, base_sampler, v.uv) * material.color;
-    if material.params.z > 0.5 {
+    let layers = material.detail.w;
+    if material.params.z > 0.5 && layers < 0.5 {
         base = base * v.color;
     }
     if base.a < material.params.x {
         discard;
     }
     var rgb = base.rgb;
+    if layers > 0.5 {
+        // Ground: tiled layers weighted by the vertex colour, tinted by the
+        // whole-cell map against its own average.
+        let p = vec4<f32>(v.local_pos, 1.0);
+        let w = v.color;
+        let t0 = textureSample(layer0, detail_sampler, layer_uv(0u, p)).rgb;
+        let t1 = textureSample(layer1, detail_sampler, layer_uv(1u, p)).rgb;
+        let t2 = textureSample(layer2, detail_sampler, layer_uv(2u, p)).rgb;
+        let t3 = textureSample(layer3, detail_sampler, layer_uv(3u, p)).rgb;
+        var weights = vec4<f32>(w.x, select(0.0, w.y, layers > 1.5), select(0.0, w.z, layers > 2.5), select(0.0, w.w, layers > 3.5));
+        let total = weights.x + weights.y + weights.z + weights.w;
+        if total < 0.001 {
+            weights = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+        } else {
+            weights = weights / total;
+        }
+        let tiled = t0 * weights.x + t1 * weights.y + t2 * weights.z + t3 * weights.w;
+        rgb = rgb * tiled * 2.0;
+    }
     if material.detail.x > 0.0 {
         // Each texel against the map's average (its smallest mip), so the
         // base colour keeps its brightness.
@@ -75,13 +115,37 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         let fade = clamp(1.0 - distance(v.world_pos, frame.eye.xyz) / material.detail.y, 0.0, 1.0);
         rgb = rgb * mix(vec3<f32>(1.0), texel / max(mean, vec3<f32>(0.05)), fade);
     }
+    let spec_texel = textureSample(specular_map, base_sampler, v.uv).rgb;
+    let normal_texel = textureSample(normal_map, base_sampler, v.uv);
     if material.params.y > 0.5 {
         var n = normalize(v.normal);
         if !front {
             n = -n;
         }
-        let diffuse = max(dot(n, -normalize(frame.sun_dir.xyz)), 0.0);
-        rgb = rgb * (frame.ambient.rgb + frame.sun_color.rgb * diffuse);
+        if material.maps.y > 0.5 && dot(v.tangent.xyz, v.tangent.xyz) > 1e-6 {
+            let t = normalize(v.tangent.xyz - n * dot(n, v.tangent.xyz));
+            let b = cross(n, t) * select(1.0, sign(v.tangent.w), abs(v.tangent.w) > 0.5);
+            var xy = normal_texel.xy;
+            if material.maps.z > 0.5 {
+                xy = normal_texel.wy;
+            }
+            xy = xy * 2.0 - 1.0;
+            let z = sqrt(max(1.0 - dot(xy, xy), 0.0));
+            n = normalize(t * xy.x + b * xy.y + n * z);
+        }
+        let l = -normalize(frame.sun_dir.xyz);
+        let diffuse = max(dot(n, l), 0.0);
+        var lit = rgb * (frame.ambient.rgb + frame.sun_color.rgb * diffuse);
+        if dot(material.specular.rgb, material.specular.rgb) > 0.0 && diffuse > 0.0 {
+            let view = normalize(frame.eye.xyz - v.world_pos);
+            let h = normalize(l + view);
+            var strength = material.specular.rgb;
+            if material.maps.x > 0.5 {
+                strength = strength * spec_texel;
+            }
+            lit = lit + frame.sun_color.rgb * strength * pow(max(dot(n, h), 0.0), material.specular.a);
+        }
+        rgb = lit;
     }
     if material.params.w > 0.5 && frame.sky.a > 0.0 {
         let dist = distance(v.world_pos, frame.eye.xyz);
@@ -151,6 +215,7 @@ pub fn source(layout: &VertexLayout) -> String {
         .map(|t| format!("{t}.xy"))
         .unwrap_or_else(|| "vec2<f32>(0.0)".into());
     let color = find(VertexSemantic::Color).unwrap_or_else(|| "vec4<f32>(1.0)".into());
+    let tangent = find(VertexSemantic::Tangent).unwrap_or_else(|| "vec4<f32>(0.0)".into());
     // Skinned layouts blend up to four palette matrices, weights normalised
     // by their sum; a zero sum leaves the vertex in its bind pose.
     let indices = layout.elements().iter().position(|e| {
@@ -169,6 +234,7 @@ pub fn source(layout: &VertexLayout) -> String {
                 + palette[b.z] * (w.z / total) + palette[b.w] * (w.w / total);
             local = m * local;
             normal = (m * vec4<f32>(normal, 0.0)).xyz;
+            tangent = vec4<f32>((m * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
         }}
     }}"#
         ),
@@ -181,7 +247,9 @@ pub fn source(layout: &VertexLayout) -> String {
 @vertex
 fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
     var local = vec4<f32>({position}, 1.0);
-    var normal = {normal};{skin}
+    var normal = {normal};
+    var tangent = {tangent};
+    let rest = local.xyz;{skin}
     var model = draw.world;
     if draw.skin.w > 0u {{
         model = model * palette[draw.skin.z + min(instance, draw.skin.w - 1u)];
@@ -193,6 +261,8 @@ fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
     out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
     out.uv = {uv};
     out.color = {color};
+    out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
+    out.local_pos = rest;
     return out;
 }}
 "#
@@ -235,6 +305,23 @@ mod tests {
                 (Position, Float4),
                 (TexCoord(0), Float2),
                 (TexCoord(1), Float1),
+            ],
+            // Terrain: colour as layer weights, tangents for laid-in roads.
+            vec![
+                (Position, Float3),
+                (Normal, Float3),
+                (TexCoord(0), Float2),
+                (Color, UNorm4x8),
+                (Tangent, Float4),
+            ],
+            // Skinned with tangents.
+            vec![
+                (Position, Half4),
+                (TexCoord(0), Half2),
+                (BlendIndices, UInt4x8),
+                (BlendWeight, UNorm4x8),
+                (Normal, Half4),
+                (Tangent, Half4),
             ],
         ];
         for attrs in layouts {
