@@ -916,14 +916,16 @@ impl PartStates {
             return vec![false; nodes.len()];
         }
         let parent = |n: u16| nodes.get(usize::from(n)).and_then(|x| x.parent);
-        // Hidden with an ancestor hidden.
+        // A node goes with the nearest switchable node at or above it: a
+        // hidden turret takes its barrel, but a wheel shown on a wreck
+        // shows though the intact body it hangs from is hidden.
         (0..nodes.len())
             .map(|i| {
                 let mut at = Some(i as u16);
                 let mut steps = 0;
                 while let Some(n) = at {
-                    if off.get(usize::from(n)).copied().unwrap_or(false) {
-                        return true;
+                    if self.switchable.contains(&n) {
+                        return off.get(usize::from(n)).copied().unwrap_or(false);
                     }
                     at = parent(n);
                     steps += 1;
@@ -1652,7 +1654,7 @@ mod tests {
             b"STAM",
             vec![
                 leaf(b"INFO", le(&[5, 15, 7])),
-                leaf(b"SWIT", le(&[101, 102, 103])),
+                leaf(b"SWIT", le(&[101, 102, 103, 105])),
                 leaf(b"NODE", le(&[100, 3])),
                 leaf(b"STAT", le(&[0x0ace_072a])),
                 enter(),
@@ -1664,7 +1666,7 @@ mod tests {
                 leaf(b"CEXE", le(&[1, 101, 2, hide, 3])),
                 leaf(b"STAT", le(&[STATE_WRECKED])),
                 enter(),
-                leaf(b"CEXE", le(&[1, 102, 2, show, 3])),
+                leaf(b"CEXE", le(&[1, 102, 2, show, 1, 105, 2, show, 3])),
             ],
         )]);
         let u = Ucfx::parse(&data).unwrap();
@@ -1687,18 +1689,19 @@ mod tests {
             n(102, Some(0)),
             n(103, Some(1)),
             n(104, Some(1)),
+            n(105, Some(1)),
         ];
         let states = PartStates::parse(&u, stam, &nodes);
-        assert_eq!(states.switchable, vec![1, 2, 3]);
+        assert_eq!(states.switchable, vec![1, 2, 3, 5]);
         assert_eq!(states.machines.len(), 1);
         assert_eq!(states.machines[0].node, Some(0));
         assert_eq!(
             states.hidden(&nodes, false),
-            vec![false, false, true, true, false]
+            vec![false, false, true, true, false, true]
         );
         assert_eq!(
             states.hidden(&nodes, true),
-            vec![false, true, false, true, true]
+            vec![false, true, false, true, true, false]
         );
     }
 
