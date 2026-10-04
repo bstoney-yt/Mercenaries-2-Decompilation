@@ -397,8 +397,10 @@ fn screenshot(
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
     // And for the vehicles and people, and the people to find their feet.
+    // The island's own vehicles get half a minute, as one may fail.
     while game.scene.world.is_some()
-        && game.scene.vehicles_loading()
+        && (game.scene.vehicles_loading()
+            || (game.island_vehicles_loading() && started.elapsed() < Duration::from_secs(30)))
         && started.elapsed() < Duration::from_secs(300)
     {
         game.step(Intent::default(), tick);
