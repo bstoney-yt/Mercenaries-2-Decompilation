@@ -12,6 +12,7 @@
 //! cargo run -p m2-assets --example wad -- anims   <archive.wad>
 //! cargo run -p m2-assets --example wad -- world   <archive.wad>
 //! cargo run -p m2-assets --example wad -- entities <archive.wad>
+//! cargo run -p m2-assets --example wad -- hash    <archive.wad> <name>...
 //! cargo run -p m2-assets --example wad -- types   <archive.wad>
 //! cargo run -p m2-assets --example wad -- scripts <archive.wad>
 //! cargo run -p m2-assets --example wad -- script  <archive.wad> <script hash>
@@ -34,6 +35,7 @@
 //! `entities` lists every layer entity template (`civ_car 0x0012abcd` is
 //! the template `civ_car`), how many entities it has, which components they
 //! carry and which asset types its name's hash finds.
+//! `hash` prints each name's hash and the assets of the archive it keys.
 //! `types` summarises every asset type: how many, their sizes, a few names
 //! and block paths, the section layout of one, any `Lua` bytecode or
 //! script-like text, and the longest readable strings in one sample, to
@@ -199,6 +201,33 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("anims", []) => anims(&mut wad)?,
         ("world", []) => world(&mut wad)?,
         ("entities", []) => entities(&mut wad)?,
+        ("hash", names) => {
+            // The index alone: which assets, of which types, each name finds.
+            for name in names {
+                let hash = m2_assets::name_hash(name);
+                let types: Vec<String> = index
+                    .assets()
+                    .iter()
+                    .filter(|a| a.name_hash == hash)
+                    .map(|a| {
+                        format!(
+                            "type {} ({:08x}) block {}",
+                            a.type_index,
+                            index.type_hash(a),
+                            a.block
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{hash:08x} {name}: {}",
+                    if types.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        types.join("; ")
+                    }
+                );
+            }
+        }
         ("obj", [hash, out, rest @ ..]) => {
             let hash = u32::from_str_radix(hash.trim_start_matches("0x"), 16)?;
             let lod = match rest {
