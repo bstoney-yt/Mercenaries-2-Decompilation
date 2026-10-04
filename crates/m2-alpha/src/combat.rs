@@ -347,6 +347,8 @@ pub struct Combat {
     pub blasts: u32,
     /// Where the last one went off.
     pub last_blast: Option<Vec3>,
+    /// The last rocket: from the launcher, towards what the crosshair was on.
+    pub last_launch: Option<(Vec3, Vec3)>,
     /// Blasts about to go off (something explosive caught): where, and
     /// seconds left.
     fuses: Vec<(Vec3, f32)>,
@@ -370,6 +372,7 @@ impl Default for Combat {
             hits: 0,
             blasts: 0,
             last_blast: None,
+            last_launch: None,
             fuses: Vec::new(),
             seed: 0x2545_f491_4f6c_dd1d,
         }
@@ -701,6 +704,7 @@ impl Combat {
         let goal = cast_shot(f.physics, f.people, eye, dir, ROCKET_RANGE, None)
             .map_or(eye + dir * ROCKET_RANGE, |h| eye + dir * h.0);
         let velocity = (goal - from).normalize_or(dir) * ROCKET_SPEED;
+        self.last_launch = Some((from, goal));
         self.projectiles.push(Projectile::Rocket {
             at: from,
             velocity,

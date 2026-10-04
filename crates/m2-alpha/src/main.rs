@@ -1170,16 +1170,27 @@ fn blast_for_screenshot(
             world.physics.cast_ray(eye, dir, 100.0).map(|h| h.0)
         );
     }
-    let fire = Intent {
+    // Shoulder the launcher first, as a player would.
+    let aim = |fire, select| Intent {
         trigger: Trigger {
-            fire: true,
+            fire,
             aim: true,
-            select: Some(Weapon::Rpg),
+            select,
             ..Trigger::default()
         },
         ..Intent::default()
     };
-    game.step(fire, tick);
+    game.step(aim(false, Some(Weapon::Rpg)), tick);
+    for _ in 0..30 {
+        aim_at(game, at);
+        game.step(aim(false, None), tick);
+    }
+    game.step(aim(true, None), tick);
+    eprintln!(
+        "blast: rocket from {:.1?} towards {:.1?}",
+        game.combat.last_launch.map(|l| l.0),
+        game.combat.last_launch.map(|l| l.1)
+    );
     for _ in 0..120 {
         game.step(Intent::default(), tick);
     }
