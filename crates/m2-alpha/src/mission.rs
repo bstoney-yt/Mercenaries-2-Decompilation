@@ -28,6 +28,9 @@ use crate::game::Game;
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
+/// The water's surface as the layers' boats and docks show it (8 patrol
+/// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
+const WATERLINE: f32 = -36.0;
 /// How close a blast destroys a target the scripts named (a gate), metres.
 const BLAST_REACH: f32 = 10.0;
 /// Seconds an objective message stays up.
@@ -299,7 +302,9 @@ fn go_ashore(game: &mut Game) -> bool {
     let (Some(world), Some(player)) = (&game.scene.world, &mut game.scene.player) else {
         return true;
     };
-    let sea = world.settings.sea_level;
+    // Boats and docks the layers place float at -36 m: dry ground is
+    // above that, whatever height the sea is drawn at.
+    let sea = world.settings.sea_level.max(WATERLINE);
     let from = player.character.position;
     if from.y > sea {
         return true;
