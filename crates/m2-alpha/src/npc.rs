@@ -463,6 +463,15 @@ impl People {
         self.kinds.iter().position(|k| k.role == role)
     }
 
+    /// Whether `npcs[i]` is a woman (her model's role says so,
+    /// `civ_hum_*female`).
+    pub fn is_woman(&self, i: usize) -> bool {
+        self.npcs
+            .get(i)
+            .and_then(|n| self.kinds.get(n.kind))
+            .is_some_and(|k| k.role.contains("female"))
+    }
+
     pub fn add_kind(&mut self, kind: PersonKind) {
         if !kind.soldier {
             // Civilians are dealt out across the kinds in: start them

@@ -1770,11 +1770,12 @@ impl Running {
             self.audio.play_ambient(town, ear);
         }
         for (i, shout, at) in self.game.scene.people.take_shouts() {
-            let set = match shout {
-                npc::Shout::Alert => sound::VZ_SOLDIERS[i % sound::VZ_SOLDIERS.len()],
+            let sets = match shout {
+                npc::Shout::Alert => sound::VZ_SOLDIERS,
+                npc::Shout::Flee if self.game.scene.people.is_woman(i) => sound::CIVILIAN_WOMEN,
                 npc::Shout::Flee => sound::CIVILIANS,
             };
-            self.audio.shout(set, Some(at));
+            self.audio.shout(sets[i % sets.len()], Some(at));
         }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);
