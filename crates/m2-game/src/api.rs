@@ -939,7 +939,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Guids print as their number.
     add(&sys, "StringToGuid", |_, _, a| {
         let g = match a.first() {
-            Some(Value::String(s)) => s.to_string_lossy().trim().parse::<u32>().ok(),
+            Some(Value::String(s)) => {
+                let text = s.to_string_lossy();
+                let text = text.trim();
+                match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => text.parse::<u32>().ok(),
+                }
+            }
             _ => None,
         };
         values([guid_value(g)])
@@ -1013,18 +1020,52 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     .exec()?;
 
     // The menus' widget library, which `MrxGuiBase` builds every screen
-    // with. Nothing is drawn yet: widgets get ids, queries answer zero,
-    // and everything else does nothing, so menus and the end of a
-    // contract run.
+    // with. Nothing is drawn yet: widgets get ids and keep their child
+    // lists (the HUD walks them), other queries answer zero, and
+    // everything else does nothing, so menus and the end of a contract
+    // run.
     lua.load(
         r#"
         local n = 0
-        local G = setmetatable({}, { __index = function(t, k)
+        local children = {}
+        local G = {}
+        function G.GetWidgetChildren(id)
+            local list, copy = children[id] or {}, {}
+            for i, c in ipairs(list) do copy[i] = c end
+            return copy, #copy
+        end
+        function G.AddWidgetChild(parent, child)
+            local list = children[parent]
+            if list then list[#list + 1] = child end
+        end
+        function G.SetWidgetChild(parent, index, child)
+            local list = children[parent]
+            if not list then return end
+            if type(index) == "number" and index >= 1 and index <= #list then
+                list[index] = child
+            else
+                list[#list + 1] = child
+            end
+        end
+        function G.RemoveWidgetChild(parent, child)
+            local list = children[parent]
+            if not list then return end
+            for i = #list, 1, -1 do
+                if list[i] == child then table.remove(list, i) end
+            end
+        end
+        function G.RemoveAllWidgetChildren(parent)
+            if children[parent] then children[parent] = {} end
+        end
+        function G.DeleteWidget(id)
+            children[id] = nil
+        end
+        setmetatable(G, { __index = function(t, k)
             local f
             if type(k) ~= "string" then
                 return nil
             elseif k:sub(1, 6) == "Create" then
-                f = function() n = n + 1; return n end
+                f = function() n = n + 1; children[n] = {}; return n end
             elseif k:sub(1, 3) == "Get" then
                 f = function() return 0, 0, 0, 0 end
             elseif k:sub(1, 2) == "Is" then
@@ -1481,7 +1522,7 @@ mod tests {
     #[test]
     fn menus_build_widgets_and_math_has_the_basics() {
         let (host, _) = setup();
-        let (a, b, w, m): (i64, i64, f64, f64) = host
+        let (a, b, w, m, kids, left, guid): (i64, i64, f64, f64, i64, i64, String) = host
             .lua()
             .load(
                 r#"
@@ -1489,12 +1530,20 @@ mod tests {
                 local b = _GuiInternal.CreateFlashWidget("y")
                 _GuiInternal.SetWidgetVisible(a, true)
                 local w = _GuiInternal.GetWidgetViewport(a)
-                return a, b, w, Math.min(3, 2)
+                _GuiInternal.AddWidgetChild(a, b)
+                _GuiInternal.AddWidgetChild(a, _GuiInternal.CreateWidget("z"))
+                local list, count = _GuiInternal.GetWidgetChildren(a)
+                assert(list[1] == b and #list == count)
+                _GuiInternal.RemoveWidgetChild(a, b)
+                local _, left = _GuiInternal.GetWidgetChildren(a)
+                return a, b, w, Math.min(3, 2), count, left,
+                    Sys.GuidToString(Sys.StringToGuid("0x10"))
                 "#,
             )
             .eval()
             .unwrap();
-        assert_eq!((a, b, w, m), (1, 2, 0.0, 2.0));
+        assert_eq!((a, b, w, m, kids, left), (1, 2, 0.0, 2.0, 2, 1));
+        assert_eq!(guid, "16");
     }
 
     #[test]
