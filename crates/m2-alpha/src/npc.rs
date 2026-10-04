@@ -139,8 +139,10 @@ pub struct Npc {
     brain: Brain,
     /// The aim and fall clips in this person's rig.
     clips: FightClips,
-    /// The hand nodes (right, left), where the rifle is held.
+    /// The right hand's node, where the rifle is held, and its attach
+    /// point.
     pub hand: Option<usize>,
+    pub attach: Option<usize>,
     /// Seconds since they died.
     dead_for: f32,
     /// Their body gone limp, once dead.
@@ -177,6 +179,7 @@ impl Npc {
         Self {
             clips,
             hand,
+            attach: crate::combat::right_attach(&rig.skeleton),
             dead_for: 0.0,
             ragdoll: None,
             fling: None,

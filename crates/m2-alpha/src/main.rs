@@ -113,6 +113,8 @@ struct Options {
     aim: bool,
     /// With `--screenshot` on foot: the weapon she has up.
     weapon: Option<combat::Weapon>,
+    /// Weapons on the hand's attach node as posed (`--grip attach`).
+    attach_grip: bool,
     /// With `--screenshot` on foot: take the picture close up, from her
     /// right and a little ahead, at chest height, to see her hands.
     closeup: bool,
@@ -223,6 +225,13 @@ fn parse_args() -> anyhow::Result<Options> {
                 })
             }
             "--closeup" => o.closeup = true,
+            "--grip" => {
+                o.attach_grip = match value()?.as_str() {
+                    "attach" => true,
+                    "hands" => false,
+                    v => bail!("--grip {v}: expected attach or hands"),
+                }
+            }
             "--probe" => o.probe = true,
             "--fire" => o.fire = true,
             "--mission-look" => {
@@ -271,6 +280,7 @@ fn keep_crash_reports() {
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
     let options = parse_args()?;
+    combat::use_attach_frame(options.attach_grip);
     let config_path = options
         .config_path
         .clone()
@@ -696,6 +706,9 @@ fn screenshot(
         game.on_foot = false;
         game.camera = FlyCamera::looking_at(chest + right * 1.3 + ahead * 0.9, chest);
         eprintln!("closeup: chest {chest:.2}, facing {ahead:.2}");
+        if let Some(line) = describe_hold(&game) {
+            eprintln!("closeup: {line}");
+        }
     }
     if let (Some(reach), Some(link)) = (options.mission_look, &link) {
         look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
@@ -712,6 +725,52 @@ fn screenshot(
     std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))?;
     eprintln!("wrote {}", out.display());
     Ok(())
+}
+
+/// How she holds her weapon, for close-ups: where its barrel and its top
+/// point (ahead, to her right, up; and degrees below level), and where the
+/// grip and muzzle are from her right hand's attach point, in metres
+/// (ahead, right, up).
+fn describe_hold(game: &Game) -> Option<String> {
+    use m2_math::glam::Vec3;
+    let p = game.scene.player.as_ref()?;
+    let (_, rig) = p.model.as_ref()?;
+    let arsenal = &game.scene.arsenal;
+    let w = match game.combat.weapon {
+        combat::Weapon::Rifle => arsenal.rifle.as_ref()?,
+        combat::Weapon::Rpg => arsenal.rpg.as_ref()?,
+    };
+    let (nodes, _) = rig.posed();
+    let body = p.model_matrix();
+    let held = arsenal.in_hand(
+        w,
+        body,
+        &nodes,
+        (arsenal.hand, arsenal.attach),
+        rig.two_handed,
+    )?;
+    let ahead = Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
+    let right = Vec3::new(-ahead.z, 0.0, ahead.x);
+    let local = |v: Vec3| Vec3::new(v.dot(ahead), v.dot(right), v.y);
+    let barrel = held.transform_vector3(w.muzzle).normalize_or_zero();
+    let top = held.transform_vector3(Vec3::Y).normalize_or_zero();
+    let palm = (body * nodes[arsenal.attach?]).w_axis.truncate();
+    let grip = held.w_axis.truncate();
+    let muzzle = held.transform_point3(w.muzzle);
+    Some(format!(
+        "{:?} held {}, barrel {:.2} ({:.0} deg below level), top {:.2}, grip {:.2} and muzzle {:.2} from the palm",
+        game.combat.weapon,
+        if rig.two_handed {
+            "two-handed"
+        } else {
+            "in the right hand"
+        },
+        local(barrel),
+        (-barrel.y).asin().to_degrees(),
+        local(top),
+        local(grip - palm),
+        local(muzzle - palm),
+    ))
 }
 
 /// Puts the camera `reach` metres from the mission marker nearest the
