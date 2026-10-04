@@ -785,26 +785,43 @@ pub struct Geometry<'a> {
 }
 
 /// The parts of a model its state machine (`STAM`) switches: a vehicle
-/// holds its intact and its wrecked parts (body, turret, doors, wheels)
-/// side by side, and shows one or the other.
+/// holds its intact and its wrecked parts (body, turret, hatches) side by
+/// side, and its states show one or the other.
 ///
 /// `STAM` holds `INFO`, then `SWIT` (the name hash of each switchable
-/// node), then `STAT` / `CHDR` / `CEXE` records; a `CEXE` holds commands
-/// as u32 (node name, verb) pairs, the verbs being name hashes such as
-/// `show` and `hide`. Switchable nodes with the same parent are a part's
-/// alternatives, shown in order: the first is the intact part, the next
-/// the wrecked one. A switchable node never shown is a light's glow.
+/// node), then per part a `NODE` record (the part's node, its state count)
+/// followed by its states: `STAT` (the state's name hash), then `CHDR`
+/// (handler kind: on enter or on exit, and length) and `CEXE` (commands)
+/// pairs. A `CEXE` is a token stream: 1 then an operand, 2 then a verb
+/// applying to the operands before it, 3 to end. Nodes are named by name
+/// hash; verbs include `show` and `hide`. Switchable nodes start hidden.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PartStates {
     /// The switchable nodes (`SWIT`).
     pub switchable: Vec<u16>,
-    /// Switchable nodes in the order commands first show them.
-    pub shown: Vec<u16>,
+    /// Each part's state machine.
+    pub machines: Vec<PartMachine>,
 }
+
+/// One part's states: what entering each shows and hides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartMachine {
+    /// The part's node (`NODE`), if named.
+    pub node: Option<u16>,
+    /// (state name hash, on entering it: (node, shown) in order).
+    pub states: Vec<(u32, Vec<(u16, bool)>)>,
+}
+
+/// The state a part is in when intact.
+pub const STATE_INTACT: u32 = 0xacb5_1200;
+/// And when wrecked.
+pub const STATE_WRECKED: u32 = 0x7687_df41;
+/// `CHDR` kind of the commands run on entering a state.
+const ON_ENTER: u32 = 0x9da9_7065;
 
 impl PartStates {
     fn parse(u: &Ucfx<'_>, stam: usize, nodes: &[Node]) -> Self {
-        let show = crate::name_hash("show");
+        let (show, hide) = (crate::name_hash("show"), crate::name_hash("hide"));
         let words = |d: &[u8]| -> Vec<u32> {
             d.chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -821,35 +838,45 @@ impl PartStates {
         let mut states = Self::default();
         let sections = u.sections();
         let last = (stam + sections[stam].descendants as usize).min(sections.len() - 1);
+        let mut entering = false;
         for sec in &sections[stam + 1..=last] {
             let Some(data) = sec.data else { continue };
+            let w = words(data);
             match &sec.fourcc {
-                b"SWIT" => {
-                    states.switchable = words(data).into_iter().flat_map(named).collect();
+                b"SWIT" => states.switchable = w.into_iter().flat_map(named).collect(),
+                b"NODE" => states.machines.push(PartMachine {
+                    node: w.first().and_then(|&h| named(h).next()),
+                    states: Vec::new(),
+                }),
+                b"STAT" => {
+                    if states.machines.is_empty() {
+                        states.machines.push(PartMachine::default());
+                    }
+                    if let (Some(m), Some(&name)) = (states.machines.last_mut(), w.first()) {
+                        m.states.push((name, Vec::new()));
+                    }
                 }
-                b"CEXE" => {
-                    let w = words(data);
-                    for (k, &v) in w.iter().enumerate() {
-                        if v != show {
-                            continue;
-                        }
-                        // The node shown: the word before the verb, or
-                        // after it.
-                        let shown: Vec<u16> = [k.checked_sub(1), Some(k + 1)]
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|i| w.get(i))
-                            .map(|&h| {
-                                named(h)
-                                    .filter(|n| states.switchable.contains(n))
-                                    .collect::<Vec<u16>>()
-                            })
-                            .find(|found| !found.is_empty())
-                            .unwrap_or_default();
-                        for n in shown {
-                            if !states.shown.contains(&n) {
-                                states.shown.push(n);
+                b"CHDR" => entering = w.first() == Some(&ON_ENTER),
+                b"CEXE" if entering => {
+                    let Some((_, commands)) =
+                        states.machines.last_mut().and_then(|m| m.states.last_mut())
+                    else {
+                        continue;
+                    };
+                    let mut operands = Vec::new();
+                    let mut t = w.iter();
+                    while let Some(&token) = t.next() {
+                        match (token, t.next()) {
+                            (1, Some(&x)) => operands.push(x),
+                            (2, Some(&verb)) => {
+                                if verb == show || verb == hide {
+                                    for &h in &operands {
+                                        commands.extend(named(h).map(|n| (n, verb == show)));
+                                    }
+                                }
+                                operands.clear();
                             }
+                            _ => break,
                         }
                     }
                 }
@@ -860,43 +887,35 @@ impl PartStates {
     }
 
     /// Which of `nodes` are hidden (with everything under them) intact,
-    /// or `wrecked`: of each part's alternatives the first shown when
-    /// intact, the next when wrecked; parts with one alternative always;
-    /// glows never.
+    /// or `wrecked`: switchable nodes start hidden, then each part enters
+    /// its intact or wrecked state (intact if it has no wrecked one).
     pub fn hidden(&self, nodes: &[Node], wrecked: bool) -> Vec<bool> {
         let mut off = vec![false; nodes.len()];
-        if self.shown.is_empty() {
-            // Nothing read as shown: draw everything rather than nothing.
-            return off;
-        }
+        let mut any = false;
         for &n in &self.switchable {
             if let Some(o) = off.get_mut(usize::from(n)) {
                 *o = true;
             }
         }
-        let parent = |n: u16| nodes.get(usize::from(n)).and_then(|x| x.parent);
-        let mut done = Vec::new();
-        for &n in &self.shown {
-            let p = parent(n);
-            if done.contains(&p) {
-                continue;
-            }
-            done.push(p);
-            let options: Vec<u16> = self
-                .shown
-                .iter()
-                .copied()
-                .filter(|&m| parent(m) == p)
-                .collect();
-            let pick = if wrecked && options.len() > 1 {
-                options[1]
+        for m in &self.machines {
+            let state = |name: u32| m.states.iter().find(|s| s.0 == name);
+            let entered = if wrecked {
+                state(STATE_WRECKED).or_else(|| state(STATE_INTACT))
             } else {
-                options[0]
+                state(STATE_INTACT)
             };
-            if let Some(o) = off.get_mut(usize::from(pick)) {
-                *o = false;
+            for &(n, shown) in entered.map_or(&[][..], |s| &s.1) {
+                if let Some(o) = off.get_mut(usize::from(n)) {
+                    *o = !shown;
+                    any |= shown;
+                }
             }
         }
+        if !any {
+            // Nothing read as shown: draw everything rather than nothing.
+            return vec![false; nodes.len()];
+        }
+        let parent = |n: u16| nodes.get(usize::from(n)).and_then(|x| x.parent);
         // Hidden with an ancestor hidden.
         (0..nodes.len())
             .map(|i| {
@@ -1627,22 +1646,25 @@ mod tests {
         let (show, hide) = (crate::name_hash("show"), crate::name_hash("hide"));
         // Root 0 holds the intact body 1 and the wrecked body 2; the intact
         // body holds a glow 3 (never shown) and a turret 4.
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        let exit = || leaf(b"CHDR", le(&[0xdb41_017d, 0]));
         let data = ucfx(&[node(
             b"STAM",
             vec![
-                leaf(b"INFO", vec![0; 12]),
+                leaf(b"INFO", le(&[5, 15, 7])),
                 leaf(b"SWIT", le(&[101, 102, 103])),
-                leaf(b"STAT", le(&[0x1234_5678])),
-                leaf(b"CHDR", le(&[2])),
-                leaf(b"CEXE", le(&[101, show, 102, hide, 103, hide])),
-                node(
-                    b"STAS",
-                    vec![
-                        leaf(b"STAT", le(&[0x8765_4321])),
-                        leaf(b"CHDR", le(&[2])),
-                        leaf(b"CEXE", le(&[101, hide, 102, show])),
-                    ],
-                ),
+                leaf(b"NODE", le(&[100, 3])),
+                leaf(b"STAT", le(&[0x0ace_072a])),
+                enter(),
+                leaf(b"CEXE", le(&[1, STATE_INTACT, 1, 100, 2, 0x9b31_491a, 3])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 101, 2, show, 1, 103, 2, hide, 3])),
+                exit(),
+                leaf(b"CEXE", le(&[1, 101, 2, hide, 3])),
+                leaf(b"STAT", le(&[STATE_WRECKED])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 102, 2, show, 3])),
             ],
         )]);
         let u = Ucfx::parse(&data).unwrap();
@@ -1668,7 +1690,8 @@ mod tests {
         ];
         let states = PartStates::parse(&u, stam, &nodes);
         assert_eq!(states.switchable, vec![1, 2, 3]);
-        assert_eq!(states.shown, vec![1, 2]);
+        assert_eq!(states.machines.len(), 1);
+        assert_eq!(states.machines[0].node, Some(0));
         assert_eq!(
             states.hidden(&nodes, false),
             vec![false, false, true, true, false]

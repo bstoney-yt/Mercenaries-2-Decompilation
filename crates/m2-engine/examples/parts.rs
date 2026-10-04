@@ -108,10 +108,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             model.info.flags
         );
         let hidden = model.states.as_ref().map(|st| {
-            println!(
-                "  switchable {:?}\n  shown in order {:?}",
-                st.switchable, st.shown
-            );
+            println!("  switchable {:?}", st.switchable);
+            for m in &st.machines {
+                println!("  part {:?}: {} states", m.node, m.states.len());
+                for (name, commands) in &m.states {
+                    println!("    state {name:08x}: {commands:?}");
+                }
+            }
             [
                 st.hidden(&model.nodes, false),
                 st.hidden(&model.nodes, true),
