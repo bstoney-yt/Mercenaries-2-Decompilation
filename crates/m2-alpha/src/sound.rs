@@ -397,6 +397,7 @@ impl GameAudio {
             .get(stream as usize)
             .map_or(0.0, |s| s.seconds());
         self.quiet_until = now + Duration::from_secs_f32(seconds + REMARK_GAP);
+        eprintln!("voice: Jennifer, {remark:?}, stream {stream}");
         self.speak(voices, stream, None, Falloff::default(), volume);
     }
 
