@@ -396,7 +396,7 @@ fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
 /// missing (or stubs, with `ScriptHost::stub_missing_globals`).
 /// The engine's libraries (the rest of the globals scripts use are their
 /// own modules); see `ScriptHost::complete_libraries`.
-pub const LIBRARIES: [&str; 26] = [
+pub const LIBRARIES: [&str; 27] = [
     "Ai",
     "Airstrike",
     "Camera",
@@ -420,6 +420,7 @@ pub const LIBRARIES: [&str; 26] = [
     "Sound",
     "String",
     "Sys",
+    "Table",
     "Vehicle",
     "VO",
     "Weapon",
@@ -1019,6 +1020,29 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     .set_name("=m2-math")
     .exec()?;
 
+    // The engine's table helpers: `Table.Create(narray, nhash)` makes a
+    // table with room reserved, `Table.InsertI(t, value, i)` stores at
+    // an index (MrxGuiBase's Widget:GetChildren builds its list so).
+    lua.load(
+        r#"
+        local T = rawget(_G, "Table")
+        if type(T) ~= "table" or getmetatable(T) ~= nil then
+            T = {}
+            rawset(_G, "Table", T)
+        end
+        function T.Create() return {} end
+        function T.InsertI(t, value, i)
+            if i == nil then
+                t[#t + 1] = value
+            else
+                t[i] = value
+            end
+        end
+        "#,
+    )
+    .set_name("=m2-table")
+    .exec()?;
+
     // The menus' widget library, which `MrxGuiBase` builds every screen
     // with. Nothing is drawn yet: widgets get ids and keep their child
     // lists (the HUD walks them), other queries answer zero, and
@@ -1534,6 +1558,9 @@ mod tests {
                 _GuiInternal.AddWidgetChild(a, _GuiInternal.CreateWidget("z"))
                 local list, count = _GuiInternal.GetWidgetChildren(a)
                 assert(list[1] == b and #list == count)
+                local t = Table.Create(count, 0)
+                for k, id in ipairs(list) do Table.InsertI(t, id * 10, k) end
+                assert(t[1] == 20 and #t == 2)
                 _GuiInternal.RemoveWidgetChild(a, b)
                 local _, left = _GuiInternal.GetWidgetChildren(a)
                 return a, b, w, Math.min(3, 2), count, left,
