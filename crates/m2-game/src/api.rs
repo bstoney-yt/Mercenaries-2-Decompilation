@@ -14,7 +14,7 @@
 //! Target, Priority, Force, Callback, CallbackData }`.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use mlua::{Function, Lua, MultiValue, Table, Value};
@@ -25,6 +25,8 @@ use crate::script::safe_function;
 /// Guids handed to objects scripts spawn start here, above any layer's
 /// entity ids.
 pub const FIRST_SPAWNED: u32 = 0x4000_0000;
+/// Guids of object templates start here.
+pub const FIRST_TEMPLATE: u32 = 0x3000_0000;
 
 /// One object the scripts can see.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -137,9 +139,13 @@ pub struct ScriptWorld {
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
-    /// What `Pg.GetAllLandingZones(kind)` answers, by kind (the transit
-    /// script asks for kinds 1 and 2 and needs some of each).
-    pub landing_zones: HashMap<i64, Vec<u32>>,
+    /// What `Pg.GetAllLandingZones(kind)` answers, by kind: the zones by
+    /// their number. The transit script reads kinds 1 and 2 (where each
+    /// player lands) as tables keyed alike.
+    pub landing_zones: HashMap<i64, BTreeMap<i64, u32>>,
+    /// Object templates scripts have named (`"Supply Drop (GL)"`), by
+    /// name in lower case.
+    templates: HashMap<String, u32>,
 }
 
 impl ScriptWorld {
@@ -161,6 +167,48 @@ impl ScriptWorld {
     /// Takes the commands issued since the last call.
     pub fn take_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.commands)
+    }
+
+    /// The template `name` names, made on first use: an object scripts
+    /// can copy with `Pg.Spawn`, but not in the world.
+    fn template(&mut self, name: &str) -> u32 {
+        let key = name.to_ascii_lowercase();
+        if let Some(&g) = self.templates.get(&key) {
+            return g;
+        }
+        let g = FIRST_TEMPLATE + self.templates.len() as u32;
+        self.templates.insert(key, g);
+        let mut o = Object::new(name, [0.0; 3]);
+        o.awake = false;
+        self.insert(g, o);
+        g
+    }
+
+    /// Spawns a copy of `what` and tells the game to.
+    fn spawn(&mut self, what: String, position: [f32; 3], yaw: f32) -> u32 {
+        let guid = self.spawn_guid();
+        let mut object = Object::new(&what, position);
+        object.yaw = yaw;
+        self.insert(guid, object);
+        self.commands.push(Command::Spawn {
+            guid,
+            what,
+            position,
+            yaw,
+        });
+        guid
+    }
+
+    /// The point `distance` in front of an object (the player when `None`)
+    /// and `up` above it; the player is where the camera looks from.
+    fn ahead(&self, guid: Option<u32>, distance: f32, up: f32) -> Option<[f32; 3]> {
+        let o = self.objects.get(&guid.or(self.player)?)?;
+        let (s, c) = o.yaw.sin_cos();
+        Some([
+            o.position[0] + s * distance,
+            o.position[1] + up,
+            o.position[2] + c * distance,
+        ])
     }
 
     fn spawn_guid(&mut self) -> u32 {
@@ -255,6 +303,13 @@ fn num(v: Option<&Value>) -> Option<f32> {
     }
 }
 
+/// Whether a name no object has is an object template's: templates are
+/// named in words (`"Supply Drop (GL)"`, `"AMX30"`), layer objects in
+/// snake case (`vza001_gate`). A guess from the names scripts use.
+fn is_template(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase()) && !name.contains('_')
+}
+
 fn guid_value(g: Option<u32>) -> Value {
     g.map_or(Value::Nil, crate::events::guid_value)
 }
@@ -343,10 +398,46 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     let pg = lib("Pg")?;
     add(&pg, "GetGuidByName", |w, _, a| {
         let g = match a.first() {
-            Some(Value::String(s)) => w.by_name(&s.to_string_lossy()),
+            Some(Value::String(s)) => {
+                let name = s.to_string_lossy();
+                w.by_name(&name)
+                    .or_else(|| is_template(&name).then(|| w.template(&name)))
+            }
             _ => None,
         };
         values([guid_value(g)])
+    })?;
+    // A copy of a template (a name or guid) in front of a character, as
+    // supply drops make their cargo: template, distance, then flags.
+    add(&pg, "SpawnFromCamera", |w, _, a| {
+        let what = match a.first() {
+            Some(Value::String(s)) => s.to_string_lossy(),
+            v => match id(v).and_then(|g| w.objects.get(&g)) {
+                Some(o) => o.name.clone(),
+                None => return values([Value::Nil]),
+            },
+        };
+        let by = a.get(4).and_then(|v| id(Some(v)));
+        let Some(at) = w.ahead(by, num(a.get(1)).unwrap_or(10.0), 0.0) else {
+            return values([Value::Nil]);
+        };
+        let yaw = w
+            .objects
+            .get(&by.or(w.player).unwrap_or(0))
+            .map_or(0.0, |o| o.yaw);
+        values([crate::events::guid_value(w.spawn(what, at, yaw))])
+    })?;
+    // The point a distance in front of the camera and a height above it.
+    add(&pg, "FindPointFromCamera", |w, _, a| {
+        let at = w.ahead(
+            None,
+            num(a.first()).unwrap_or(0.0),
+            num(a.get(1)).unwrap_or(0.0),
+        );
+        values(match at {
+            Some(p) => p.map(|c| Value::Number(f64::from(c))).to_vec(),
+            None => vec![Value::Nil],
+        })
     })?;
     add(&pg, "Spawn", |w, _, a| {
         let what = match a.first() {
@@ -364,17 +455,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             num(a.get(3)).unwrap_or(0.0),
         ];
         let yaw = num(a.get(4)).unwrap_or(0.0);
-        let guid = w.spawn_guid();
-        let mut object = Object::new(&what, position);
-        object.yaw = yaw;
-        w.insert(guid, object);
-        w.commands.push(Command::Spawn {
-            guid,
-            what,
-            position,
-            yaw,
-        });
-        values([crate::events::guid_value(guid)])
+        values([crate::events::guid_value(w.spawn(what, position, yaw))])
     })?;
 
     let object = lib("Object")?;
@@ -484,6 +565,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     add(&object, "GetName", |w, lua, a| {
+        let o = id(a.first()).and_then(|g| w.objects.get(&g));
+        values([match o {
+            Some(o) => Value::String(lua.create_string(&o.name)?),
+            None => Value::Nil,
+        }])
+    })?;
+    // No string tables yet: an object's own name.
+    add(&object, "GetLocalizedName", |w, lua, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
         values([match o {
             Some(o) => Value::String(lua.create_string(&o.name)?),
@@ -668,8 +757,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "GetAllLandingZones", |w, lua, a| {
         let kind = num(a.first()).map_or(1, |k| k as i64);
         let t = lua.create_table()?;
-        for &g in w.landing_zones.get(&kind).into_iter().flatten() {
-            t.raw_push(crate::events::guid_value(g))?;
+        for (&n, &g) in w.landing_zones.get(&kind).into_iter().flatten() {
+            t.raw_set(n, crate::events::guid_value(g))?;
         }
         values([Value::Table(t)])
     })?;
@@ -690,6 +779,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     }
     add(&sys, "SetSkipMission", |_, _, _| values([]))?;
     // Guids print as their number.
+    add(&sys, "StringToGuid", |_, _, a| {
+        let g = match a.first() {
+            Some(Value::String(s)) => s.to_string_lossy().trim().parse::<u32>().ok(),
+            _ => None,
+        };
+        values([guid_value(g)])
+    })?;
+    // Scripts also call it bare.
+    globals.raw_set("StringToGuid", sys.get::<Function>("StringToGuid")?)?;
     add(&sys, "GuidToString", |_, lua, a| {
         let text = id(a.first()).map_or_else(|| "nil".to_owned(), |g| g.to_string());
         values([Value::String(lua.create_string(&text)?)])
@@ -747,9 +845,42 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             rawset(_G, "Math", M)
         end
         M.randi, M.randf = randi, randf
+        -- Math is the math library with the additions.
+        for k, v in pairs(math) do
+            if rawget(M, k) == nil then M[k] = v end
+        end
         "#,
     )
     .set_name("=m2-math")
+    .exec()?;
+
+    // The menus' widget library, which `MrxGuiBase` builds every screen
+    // with. Nothing is drawn yet: widgets get ids, queries answer zero,
+    // and everything else does nothing, so menus and the end of a
+    // contract run.
+    lua.load(
+        r#"
+        local n = 0
+        local G = setmetatable({}, { __index = function(t, k)
+            local f
+            if type(k) ~= "string" then
+                return nil
+            elseif k:sub(1, 6) == "Create" then
+                f = function() n = n + 1; return n end
+            elseif k:sub(1, 3) == "Get" then
+                f = function() return 0, 0, 0, 0 end
+            elseif k:sub(1, 2) == "Is" then
+                f = function() return false end
+            else
+                f = function() end
+            end
+            rawset(t, k, f)
+            return f
+        end })
+        rawset(_G, "_GuiInternal", G)
+        "#,
+    )
+    .set_name("=m2-gui")
     .exec()?;
 
     // Object filters: sets of objects scripts build (objects added or
@@ -1079,6 +1210,89 @@ mod tests {
         assert!(events.update_shared(0.1, &world).is_empty());
         let arrived: String = host.lua().globals().get("arrived").unwrap();
         assert_eq!(arrived, "1@70");
+    }
+
+    #[test]
+    fn destroy_targets_each_report_their_death() {
+        let (host, world) = setup();
+        for g in [60, 61] {
+            world
+                .borrow_mut()
+                .insert(g, Object::new(&format!("vza_beachguard_{g}"), [0.0; 3]));
+        }
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                dead = {}
+                local f = ObjectFilter.Create()
+                ObjectFilter.AddObject(f, Pg.GetGuidByName("vza_beachguard_60"))
+                ObjectFilter.AddObject(f, Pg.GetGuidByName("vza_beachguard_61"))
+                Event.CreatePersistent(Event.ObjectDeath, {f}, function(g)
+                    dead[#dead + 1] = Sys.GuidToString(g)
+                end)
+                Object.Kill(StringToGuid("60"))
+                "#,
+            )
+            .exec()
+            .unwrap();
+        events.update_shared(0.1, &world);
+        host.lua()
+            .load("Object.Kill(Sys.StringToGuid('61'))")
+            .exec()
+            .unwrap();
+        events.update_shared(0.1, &world);
+        events.update_shared(0.1, &world);
+        let dead: Vec<String> = host.lua().globals().get("dead").unwrap();
+        assert_eq!(dead, ["60", "61"]);
+    }
+
+    #[test]
+    fn supply_drops_spawn_templates_in_front_of_the_player() {
+        let (host, world) = setup();
+        let (x, y, z, same, name, gate): (f64, f64, f64, bool, String, bool) = host
+            .lua()
+            .load(
+                r#"
+                local crate = Pg.GetGuidByName("Supply Drop (GL)")
+                local cargo = Pg.SpawnFromCamera(crate, 4, 1, true, Player.GetLocalCharacter(), false, true)
+                local x, y, z = Pg.FindPointFromCamera(10, 50, 10)
+                return x, y, z, crate == Pg.GetGuidByName("Supply Drop (GL)"),
+                    Object.GetName(cargo), Pg.GetGuidByName("vza001_gate") == nil
+                "#,
+            )
+            .eval()
+            .unwrap();
+        // The hero faces +z (yaw 0) from (10, 0, 5).
+        assert_eq!((x, y, z), (10.0, 50.0, 15.0));
+        assert!(same && gate);
+        assert_eq!(name, "Supply Drop (GL)");
+        let commands = world.borrow_mut().take_commands();
+        assert!(matches!(
+            &commands[..],
+            [Command::Spawn { what, position, .. }]
+                if what == "Supply Drop (GL)" && *position == [10.0, 0.0, 9.0]
+        ));
+    }
+
+    #[test]
+    fn menus_build_widgets_and_math_has_the_basics() {
+        let (host, _) = setup();
+        let (a, b, w, m): (i64, i64, f64, f64) = host
+            .lua()
+            .load(
+                r#"
+                local a = _GuiInternal.CreateWidget("x")
+                local b = _GuiInternal.CreateFlashWidget("y")
+                _GuiInternal.SetWidgetVisible(a, true)
+                local w = _GuiInternal.GetWidgetViewport(a)
+                return a, b, w, Math.min(3, 2)
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!((a, b, w, m), (1, 2, 0.0, 2.0));
     }
 
     #[test]

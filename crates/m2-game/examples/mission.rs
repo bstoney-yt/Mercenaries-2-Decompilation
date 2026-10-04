@@ -150,6 +150,24 @@ fn entities(layer: &Layer<'_>) -> Entities {
         .collect()
 }
 
+/// A transit landing zone's number and player (1 or 2), from its name:
+/// `06_gua_upperclass_lz_playerone` is zone 6 for player 1 (one is
+/// spelled `_llz_`).
+fn landing_zone(name: &str) -> Option<(i64, usize)> {
+    let lower = name.to_ascii_lowercase();
+    let (rest, player) = if let Some(r) = lower.strip_suffix("z_playerone") {
+        (r, 1)
+    } else {
+        (lower.strip_suffix("z_playertwo")?, 2)
+    };
+    let rest = rest
+        .strip_suffix('l')?
+        .trim_end_matches('l')
+        .strip_suffix('_')?;
+    let n = rest.get(..2)?.parse().ok()?;
+    rest[2..].starts_with('_').then_some((n, player))
+}
+
 /// The turn about the vertical axis of an (x, y, z, w) rotation.
 fn yaw([x, y, z, w]: [f32; 4]) -> f32 {
     (2.0 * (w * y + x * z)).atan2(1.0 - 2.0 * (x * x + y * y))
@@ -211,27 +229,26 @@ fn run(o: &Options) -> Result<()> {
         }
     }
     // Regions get their shapes; landing zones are told apart by name.
-    let (mut regions, mut lzs) = (0, Vec::new());
+    let mut regions = 0;
+    let mut lzs: [BTreeMap<i64, u32>; 2] = Default::default();
     for e in layers.values_mut().flatten() {
         e.region = e.region_hash.and_then(|h| shapes.get(&h)).cloned();
         regions += usize::from(e.region.is_some());
-        let lower = e.name.to_ascii_lowercase();
-        if lower.contains("landingzone") || lower.contains("landing_zone") {
-            lzs.push(e.guid);
+        if let Some((n, player)) = landing_zone(&e.name) {
+            lzs[player - 1].insert(n, e.guid);
         }
     }
     println!(
         "{} region shapes; {regions} region entities; {} landing zones",
         shapes.len(),
-        lzs.len()
+        lzs[0].len()
     );
     {
         let mut w = world.borrow_mut();
         w.layers.known = layers.keys().cloned().collect();
-        // Which landing zones are kind 1 and which kind 2 isn't known: both
-        // get them all.
-        w.landing_zones.insert(1, lzs.clone());
-        w.landing_zones.insert(2, lzs);
+        let [one, two] = lzs;
+        w.landing_zones.insert(1, one);
+        w.landing_zones.insert(2, two);
     }
     // The static layers are always in; `--layers` adds others up front.
     let preload: Vec<String> = layers
