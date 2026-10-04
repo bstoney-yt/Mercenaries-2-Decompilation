@@ -2,8 +2,8 @@
 //! running over a world built from its entity layers, as the headless
 //! `mission` example and m2-alpha both run them.
 //!
-//! [`GameData::read`] collects the scripts, the layers' named entities and
-//! the region shapes from `vz.wad`. [`Mission::new`] loads every module
+//! [`GameData::read`] collects the scripts, the layers' named entities,
+//! the region shapes and the English strings from `vz.wad`. [`Mission::new`] loads every module
 //! and entry script and sets the modules up; [`Mission::start`] then starts
 //! play as the engine does (the bootstrap's `Init`, which starts a new game,
 //! then its "GUI loaded" step), and [`Mission::tick`] advances it. Layer
@@ -19,11 +19,13 @@ use std::rc::Rc;
 use m2_assets::layer::LAYER_TYPE;
 use m2_assets::lua::{Chunk, SCRIPT_TYPE};
 use m2_assets::region::REGION_TYPE;
-use m2_assets::{BlockContents, Layer, Region, WadArchive, WadError};
+use m2_assets::strings::STRINGS_TYPE;
+use m2_assets::{BlockContents, Layer, Region, StringTable, WadArchive, WadError, name_hash};
 use mlua::Function;
 
 use crate::api::{self, Command, Object, ScriptWorld, Shared};
 use crate::events::Events;
+use crate::hud::render;
 use crate::layers::{LayerOp, LayerState, finished, layer_name};
 use crate::library::{KNOWN_MODULES, LOADERS, Library};
 use crate::script::{ScriptError, ScriptHost};
@@ -61,11 +63,17 @@ pub struct GameData {
     pub layers: BTreeMap<String, Vec<Entity>>,
     /// Region shapes read.
     pub shapes: usize,
+    /// The game's English text by id, for the HUD's texts.
+    pub strings: StringTable,
 }
 
+/// The string table the HUD's texts come from.
+pub const LANGUAGE: &str = "english";
+
 impl GameData {
-    /// Reads the scripts, layers and region shapes of an archive
-    /// (`vz.wad`). Blocks that don't parse are skipped.
+    /// Reads the scripts, layers, region shapes and the English string
+    /// table of an archive (`vz.wad`). Blocks that don't parse are
+    /// skipped.
     pub fn read<R: Read + Seek>(wad: &mut WadArchive<R>) -> Result<Self, MissionError> {
         let paths: Vec<String> = wad
             .index()
@@ -77,6 +85,7 @@ impl GameData {
         let mut shapes: HashMap<u32, Region> = HashMap::new();
         // Entities with the shape hash their LineRegion names.
         let mut regions: Vec<(String, usize, u32)> = Vec::new();
+        let language = name_hash(LANGUAGE);
         for (block, path) in paths.iter().enumerate() {
             let decoded = wad.read_block(block)?;
             let Ok(contents) = BlockContents::parse(&decoded) else {
@@ -90,6 +99,10 @@ impl GameData {
                 } else if entry.type_hash == REGION_TYPE {
                     if let Ok(r) = Region::parse(asset) {
                         shapes.insert(entry.name_hash, r);
+                    }
+                } else if entry.type_hash == STRINGS_TYPE && entry.name_hash == language {
+                    if let Ok(t) = StringTable::parse(asset) {
+                        data.strings = t;
                     }
                 } else if entry.type_hash == LAYER_TYPE
                     && let Ok(layer) = Layer::parse(asset)
@@ -165,6 +178,7 @@ pub struct Mission {
     events: Events,
     world: Shared,
     layers: BTreeMap<String, Vec<Entity>>,
+    strings: StringTable,
     /// Modules loaded before play started.
     started: usize,
     /// Game time, seconds.
@@ -186,6 +200,7 @@ impl Mission {
             mut library,
             layers,
             shapes,
+            strings,
         } = data;
         let regions = layers
             .values()
@@ -193,10 +208,11 @@ impl Mission {
             .filter(|e| e.region.is_some())
             .count();
         let mut log = vec![format!(
-            "{} scripts; {} layers; {shapes} region shapes; {regions} regions; {} landing zones",
+            "{} scripts; {} layers; {shapes} region shapes; {regions} regions; {} landing zones; {} strings",
             library.scripts().len(),
             layers.len(),
-            one.len()
+            one.len(),
+            strings.strings.len()
         )];
         {
             let mut w = world.borrow_mut();
@@ -279,6 +295,7 @@ impl Mission {
             events,
             world,
             layers,
+            strings,
             started,
             now: 0.0,
             waiting_since: None,
@@ -428,6 +445,17 @@ impl Mission {
     /// A readable account of the session since the last call.
     pub fn take_log(&mut self) -> Vec<String> {
         std::mem::take(&mut self.log)
+    }
+
+    /// A HUD text with its ids replaced by the game's English strings
+    /// (`[VzaCon001.Objectives.001]` as `Secure the beach`).
+    pub fn text(&self, text: &str) -> String {
+        render(text, &self.strings)
+    }
+
+    /// The game's English strings.
+    pub fn strings(&self) -> &StringTable {
+        &self.strings
     }
 
     /// Modules loaded since play started: name and script.

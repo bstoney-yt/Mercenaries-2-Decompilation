@@ -14,6 +14,12 @@
 //! 32-bit string hashes. A function that is the right one finds hundreds
 //! of names; chance finds a handful at most. Prints, per set, the
 //! combinations that found the most, with a few of the names found.
+//!
+//! The answer, found this way and then by solving sibling names bit by
+//! bit, is [`m2_assets::name_hash`]: FNV-1a of the name with bit 5 set in
+//! every byte and a `*` after it. It is in the battery as "fnv1a *" (the
+//! case then makes no difference), and finds every string key, module and
+//! named asset.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
@@ -110,9 +116,10 @@ fn candidates(names: &BTreeSet<String>) -> Vec<String> {
 
 fn report(what: &str, targets: &HashSet<u32>, candidates: &[String]) {
     type Hash = fn(&[u8]) -> u32;
-    let functions: [(&str, Hash); 19] = [
+    let functions: [(&str, Hash); 20] = [
         ("fnv1", fnv1),
         ("fnv1a", fnv1a),
+        ("fnv1a *", fnv1a_star),
         ("djb2", djb2),
         ("djb2 xor", djb2x),
         ("sdbm", sdbm),
@@ -187,6 +194,12 @@ fn fnv1a(b: &[u8]) -> u32 {
     b.iter().fold(0x811c_9dc5u32, |h, &c| {
         (h ^ u32::from(c)).wrapping_mul(0x0100_0193)
     })
+}
+
+/// The game's own: FNV-1a with bit 5 set in every byte and a `*` appended.
+fn fnv1a_star(b: &[u8]) -> u32 {
+    let cased: Vec<u8> = b.iter().map(|c| c | 0x20).chain(*b"*").collect();
+    fnv1a(&cased)
 }
 
 fn fnv1a64_low(b: &[u8]) -> u32 {
@@ -428,6 +441,7 @@ mod tests {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
         assert_eq!(crc32_msb(b"123456789"), 0xfc89_1918);
         assert_eq!(fnv1a(b"a"), 0xe40c_292c);
+        assert_eq!(fnv1a_star(b"english"), m2_assets::name_hash("english"));
         assert_eq!(fnv1(b"a"), 0x050c_5d7e);
         assert_eq!(murmur3(b"hello"), 0x248b_fa47);
         assert_eq!(lookup3(b"Four score and seven years ago"), 0x1777_0551);

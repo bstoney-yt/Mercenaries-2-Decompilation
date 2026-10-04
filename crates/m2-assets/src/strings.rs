@@ -1,6 +1,6 @@
-//! String tables: the game's text for one language, keyed by a hash of
-//! the text's id (`[VzaCon001.Objectives.001]`). Which hash is not known
-//! yet, so a table can be listed but not yet looked up by id.
+//! String tables: the game's text for one language, keyed by
+//! [`name_hash`] of the text's id (`VzaCon001.Objectives.001`, as the
+//! scripts write it in `[...]`).
 //!
 //! The English table is `blocks\VZ\english_P000_Q3.block` in `vz.wad` (and
 //! the same in `shell.wad`): a `UCFX` container of type `39e5e978` with
@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 
 use crate::bytes::{OutOfBounds, Reader};
+use crate::hash::name_hash;
 use crate::ucfx::{Ucfx, UcfxError};
 
 /// Asset type hash of string tables.
@@ -91,6 +92,11 @@ impl StringTable {
     pub fn get(&self, key: u32) -> Option<&str> {
         self.strings.get(&key).map(String::as_str)
     }
+
+    /// The text with id `id` (`VzaCon001.Objectives.001`, any case).
+    pub fn lookup(&self, id: &str) -> Option<&str> {
+        self.get(name_hash(id))
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +131,20 @@ mod tests {
         assert_eq!(t.get(0x1111_1111), Some("Variant"));
         assert_eq!(t.get(0x2222_2222), Some("Done"));
         assert_eq!(t.get(3), None);
+    }
+
+    #[test]
+    fn ids_are_looked_up_by_their_hash() {
+        let mut t = StringTable::default();
+        t.strings.insert(
+            name_hash("objective.Objectivecompleted"),
+            "Objective completed:".into(),
+        );
+        assert_eq!(
+            t.lookup("Objective.ObjectiveCompleted"),
+            Some("Objective completed:")
+        );
+        assert_eq!(t.lookup("objective.other"), None);
     }
 
     #[test]

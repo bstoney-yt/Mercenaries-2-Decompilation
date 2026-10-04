@@ -82,11 +82,11 @@ only) once item 11 lands.
 
 | Gap | Effect on alpha | Plan |
 |---|---|---|
-| Asset name hash unknown | Can't look up assets by name; town batch models fall back to render-triangle collision; game's parked cars missing | Keep keying by hash. Retry only with new input (see `wad-format` notes). Fallback collision is acceptable for alpha. |
+| Asset lookup by name | Solved: `m2_assets::name_hash` (FNV-1a over the name with bit 5 set in each byte, plus `*`) keys assets, string tables, text ids and script modules. Not yet used for: town batch models (render-triangle collision), the game's parked cars, voice sets | Look the town models, parked vehicles and voice sets up by name, in that order. |
 | Per-building collision | Some walls are triangle soup, not shapes | Same as above; triangle-mesh colliders in the physics library. |
 | Parked cars | Vehicles are placed by us | Keep invented placement near roads (`Road` layer component). |
 | Soldier types, patrol routes | Every soldier looks and acts the same | Inspect the `Ai` layer component during item 10; otherwise invent. |
-| Mission scripts, objectives | First contract only | `--mission` runs the game's own scripts: VzaCon001 plays to completion in the alpha with objectives, markers and the scripts' jeeps and tank. Objective text shows as ids until the string table's key hash is found; the scripts' helicopters, boats and supply crates aren't shown. |
+| Mission scripts, objectives | First contract only | `--mission` runs the game's own scripts: VzaCon001 plays to completion in the alpha with objectives, markers and the scripts' jeeps and tank. Objective text is the game's own English strings; the scripts' helicopters, boats and supply crates aren't shown. |
 | UI / HUD / fonts | Game's Scaleform GFx menus are Flash files | Our own HUD for alpha; GFx is a separate project. |
 | Save format | Game saves are unknown | Our own format; not compatible with the original. |
 | Dialogue triggers | 12,988 voice lines unused | Owned by the voice-work thread; alpha just exposes an audio API for it. |
