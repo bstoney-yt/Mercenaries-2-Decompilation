@@ -587,6 +587,11 @@ impl Animator {
         self.current.map(|c| (c.clip, c.time))
     }
 
+    /// The clip the upper body plays over the rest, if any.
+    pub fn upper(&self) -> Option<usize> {
+        self.upper.as_ref().map(|u| u.clip)
+    }
+
     /// Plays clip `index` looped on the nodes `mask` marks (the upper
     /// body, [`Skeleton::upper_body`]) over whatever plays; `None` stops.
     pub fn set_upper(&mut self, clip: Option<(usize, Arc<[bool]>)>) {
