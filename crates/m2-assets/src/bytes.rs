@@ -43,6 +43,15 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    pub fn u8(&mut self) -> Result<u8, OutOfBounds> {
+        self.array().map(|[b]| b)
+    }
+
+    /// Bytes left after the cursor.
+    pub fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
     pub fn u16(&mut self) -> Result<u16, OutOfBounds> {
         self.array().map(u16::from_le_bytes)
     }

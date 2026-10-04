@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 m2-engine.workspace = true
 m2-math.workspace = true
+m2-assets.workspace = true
+mlua.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

@@ -11,6 +11,10 @@
 //! cargo run -p m2-assets --example wad -- obj     <archive.wad> <model hash> <out.obj> [lod]
 //! cargo run -p m2-assets --example wad -- anims   <archive.wad>
 //! cargo run -p m2-assets --example wad -- world   <archive.wad>
+//! cargo run -p m2-assets --example wad -- types   <archive.wad>
+//! cargo run -p m2-assets --example wad -- scripts <archive.wad>
+//! cargo run -p m2-assets --example wad -- script  <archive.wad> <script hash>
+//! cargo run -p m2-assets --example wad -- calls   <archive.wad> <callee> [first arg] [count]
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -25,6 +29,22 @@
 //! `world` parses every terrain cell, low-resolution tile and entity layer,
 //! checks material references and that the layout layer places each cell
 //! on the 400 m grid, and summarises the components.
+//! `types` summarises every asset type: how many, their sizes, a few names
+//! and block paths, the section layout of one, any `Lua` bytecode or
+//! script-like text, and the longest readable strings in one sample, to
+//! find which types hold what (missions, scripts) without dumping data.
+//! `scripts` reads every compiled Lua script and lists, per script, its
+//! name, block and the globals it defines, then counts across all scripts
+//! the globals they read, the `Global.key` members they use and the method
+//! names they call: the engine functions the scripts expect to exist. It
+//! also counts module loads (`import`, `inherit`, ...) by name and guesses
+//! which script each module is, from the members other scripts use on it
+//! and the globals each script defines. `script` prints one script's
+//! instruction listing. `calls` prints a few places scripts call
+//! `callee` (`Event.Create`), optionally only those whose first argument
+//! is the given global or string (`Event.TimerRelative`), with the
+//! instructions building the call and the start of any callback function
+//! named in it: how the engine function is used.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -65,7 +85,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         [cmd, path, ..] => (cmd.as_str(), path),
         _ => {
             return Err(
-                "usage: wad <list|assets|names|extract|textures|dds|models|obj|anims|world> <archive.wad> [args]".into(),
+                "usage: wad <list|assets|names|extract|textures|dds|models|obj|anims|world|types> <archive.wad> [args]".into(),
             );
         }
     };
@@ -102,6 +122,20 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     alt.join(",")
                 );
             }
+        }
+        ("types", []) => types(&mut wad)?,
+        ("scripts", []) => scripts(&mut wad)?,
+        ("script", [hash]) => script_listing(&mut wad, u32::from_str_radix(hash, 16)?)?,
+        ("calls", [callee, rest @ ..]) => {
+            // `[first arg] [count]`; a lone number is the count, and "-"
+            // is no filter.
+            let (shape, count) = match rest {
+                [n] if n.parse::<usize>().is_ok() => (None, n.parse()?),
+                [f, n, ..] => (Some(f.as_str()).filter(|f| *f != "-"), n.parse()?),
+                [f] => (Some(f.as_str()).filter(|f| *f != "-"), 8),
+                [] => (None, 8),
+            };
+            call_sites(&mut wad, callee, shape, count)?
         }
         ("names", []) => {
             // Decodes every block; use --release for the large archives.
@@ -961,5 +995,411 @@ fn world<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         println!("  {name:24} {count:7} records in {layers} layers");
     }
     eprintln!("{errors} errors");
+    Ok(())
+}
+
+/// Per type: count, bytes, sample names and paths, layout and strings.
+fn types<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[derive(Default)]
+    struct Seen {
+        count: usize,
+        bytes: usize,
+        largest: usize,
+        names: Vec<String>,
+        paths: Vec<String>,
+        lua: usize,
+        layout: String,
+        strings: Vec<String>,
+    }
+    let paths: Vec<String> = wad
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    let mut seen: std::collections::BTreeMap<u32, Seen> = Default::default();
+    for (block, path) in paths.iter().enumerate() {
+        let decoded = match wad.read_block(block) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("block {block}: {e}");
+                continue;
+            }
+        };
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (entry, data) in contents.iter() {
+            let s = seen.entry(entry.type_hash).or_default();
+            s.count += 1;
+            s.bytes += data.len();
+            if data.windows(4).any(|w| w == b"\x1bLua") {
+                s.lua += 1;
+            }
+            let ucfx = Ucfx::parse(data).ok();
+            if let Some(n) = ucfx.as_ref().and_then(|u| u.name())
+                && s.names.len() < 6
+            {
+                s.names.push(n.to_owned());
+            }
+            if s.paths.len() < 3 && !s.paths.contains(path) {
+                s.paths.push(path.clone());
+            }
+            // The largest instance stands for the type.
+            if data.len() > s.largest {
+                s.largest = data.len();
+                s.layout = match &ucfx {
+                    Some(u) => u
+                        .sections()
+                        .iter()
+                        .take(24)
+                        .map(|x| {
+                            format!(
+                                "{}{}{}",
+                                "  ".repeat(x.depth),
+                                String::from_utf8_lossy(&x.fourcc),
+                                x.data.map_or(String::new(), |d| format!(" {}", d.len()))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" |"),
+                    None => format!("not UCFX: {:02x?}", &data[..data.len().min(16)]),
+                };
+                s.strings = readable(data, 6);
+            }
+        }
+    }
+    let known = wad.index().type_hashes().to_vec();
+    for (ty, s) in &seen {
+        println!(
+            "type {ty:08x} (#{}): {} assets, {} bytes (largest {}), lua {}",
+            known
+                .iter()
+                .position(|t| t == ty)
+                .map_or("?".into(), |i| i.to_string()),
+            s.count,
+            s.bytes,
+            s.largest,
+            s.lua
+        );
+        println!("  names: {}", s.names.join(", "));
+        println!("  blocks: {}", s.paths.join(", "));
+        println!("  layout: {}", s.layout);
+        println!("  strings: {}", s.strings.join(" | "));
+    }
+    Ok(())
+}
+
+/// Up to 12 of the longest runs of printable ASCII at least `min` long,
+/// each cut to 60 characters.
+fn readable(data: &[u8], min: usize) -> Vec<String> {
+    let mut runs: Vec<&[u8]> = data
+        .split(|b| !(0x20..0x7f).contains(b))
+        .filter(|r| r.len() >= min)
+        .collect();
+    runs.sort_by_key(|r| std::cmp::Reverse(r.len()));
+    runs.dedup();
+    runs.iter()
+        .take(12)
+        .map(|r| String::from_utf8_lossy(&r[..r.len().min(60)]).into_owned())
+        .collect()
+}
+
+fn scripts<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use m2_assets::lua::{Chunk, NameUse, SCRIPT_TYPE};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let paths: Vec<String> = wad
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    // Per use, per name: (uses, scripts using it).
+    let mut totals: BTreeMap<NameUse, BTreeMap<String, (usize, usize)>> = BTreeMap::new();
+    let mut versions: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut parsed, mut failed) = (0, 0);
+    // Module loads: (callee, name) -> (calls, scripts).
+    let mut loads: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
+    // Name-lookup calls with constant names: callee -> name -> calls.
+    let mut lookups: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    // Every script's name and the globals it defines.
+    let mut defined: Vec<(String, BTreeSet<String>)> = Vec::new();
+    for (block, path) in paths.iter().enumerate() {
+        let decoded = match wad.read_block(block) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("block {block}: {e}");
+                continue;
+            }
+        };
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (entry, data) in contents.iter() {
+            if entry.type_hash != SCRIPT_TYPE {
+                continue;
+            }
+            let name = Ucfx::parse(data)
+                .ok()
+                .and_then(|u| u.name().map(str::to_owned))
+                .unwrap_or_else(|| format!("{:08x}", entry.name_hash));
+            let chunk = match Chunk::from_asset(data) {
+                Ok(c) => c,
+                Err(e) => {
+                    failed += 1;
+                    let at = data.windows(4).position(|w| w == b"\x1bLua");
+                    let head = at.map(|a| &data[a..data.len().min(a + 24)]);
+                    println!(
+                        "FAILED {name} [{path}] {} bytes: {e}; header {head:02x?}",
+                        data.len()
+                    );
+                    continue;
+                }
+            };
+            parsed += 1;
+            *versions
+                .entry(format!(
+                    "{:?} {}",
+                    chunk.version,
+                    if chunk.big_endian {
+                        "big-endian"
+                    } else {
+                        "little-endian"
+                    }
+                ))
+                .or_default() += 1;
+            let names = chunk.main.names(chunk.version);
+            let mut seen: BTreeSet<(NameUse, &str)> = BTreeSet::new();
+            for (u, n) in &names {
+                let t = totals.entry(*u).or_default().entry(n.clone()).or_default();
+                t.0 += 1;
+                if seen.insert((*u, n)) {
+                    t.1 += 1;
+                }
+            }
+            let mut loaded: BTreeSet<(String, String)> = BTreeSet::new();
+            for call in chunk.main.calls() {
+                let Some(arg) = call.first else { continue };
+                if matches!(
+                    call.callee.as_str(),
+                    "import" | "inherit" | "dynamic_import" | "dynamic_remove"
+                ) {
+                    let key = (call.callee, arg);
+                    let t = loads.entry(key.clone()).or_default();
+                    t.0 += 1;
+                    if loaded.insert(key) {
+                        t.1 += 1;
+                    }
+                } else if call.callee.contains('.') {
+                    *lookups
+                        .entry(call.callee)
+                        .or_default()
+                        .entry(arg)
+                        .or_default() += 1;
+                }
+            }
+            defined.push((
+                name.clone(),
+                seen.iter()
+                    .filter(|(u, _)| *u == NameUse::SetGlobal)
+                    .map(|(_, n)| (*n).to_owned())
+                    .collect(),
+            ));
+            let defines: Vec<&str> = seen
+                .iter()
+                .filter(|(u, _)| *u == NameUse::SetGlobal)
+                .map(|(_, n)| *n)
+                .take(12)
+                .collect();
+            println!(
+                "script {name} [{path}] {} bytes, {} functions, {} instructions; defines {}",
+                data.len(),
+                chunk.main.all().len(),
+                chunk.main.all().iter().map(|f| f.code.len()).sum::<usize>(),
+                defines.join(" "),
+            );
+        }
+    }
+    println!();
+    println!("{parsed} scripts read, {failed} failed");
+    for (v, n) in &versions {
+        println!("  {v}: {n}");
+    }
+    for (u, names) in &totals {
+        let mut sorted: Vec<_> = names.iter().collect();
+        sorted.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(b.1.0.cmp(&a.1.0)).then(a.0.cmp(b.0)));
+        println!();
+        println!("{u:?}: {} names (uses, scripts)", sorted.len());
+        for (n, (uses, scripts)) in sorted {
+            println!("  {n} {uses} {scripts}");
+        }
+    }
+
+    // Which script is each module? The one defining most of the members
+    // other scripts use on it.
+    let members = totals.get(&NameUse::Member).cloned().unwrap_or_default();
+    println!();
+    println!(
+        "Module loads: callee name calls scripts -> best script (members it defines / members used)"
+    );
+    for ((callee, module), (calls, scripts)) in &loads {
+        let short = module.rsplit(['/', '\\', '.']).next().unwrap_or(module);
+        let used: Vec<&str> = members
+            .keys()
+            .filter_map(|m| m.strip_prefix(short)?.strip_prefix('.'))
+            .collect();
+        let best = defined
+            .iter()
+            .map(|(n, d)| (used.iter().filter(|u| d.contains(**u)).count(), n))
+            .max();
+        let guess = match best {
+            Some((hits, n)) if hits > 0 => format!("{n} ({hits}/{})", used.len()),
+            _ => format!("? (0/{})", used.len()),
+        };
+        println!("  {callee} {module:?} {calls} {scripts} -> {guess}");
+    }
+
+    println!();
+    println!("Calls with a constant first argument (callee: argument count)");
+    for (callee, args) in &lookups {
+        let total: usize = args.values().sum();
+        if total < 5 {
+            continue;
+        }
+        let mut sorted: Vec<_> = args.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let shown: Vec<String> = sorted
+            .iter()
+            .take(12)
+            .map(|(a, n)| format!("{a:?} {n}"))
+            .collect();
+        println!(
+            "  {callee} ({} names, {total} calls): {}",
+            args.len(),
+            shown.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn script_listing<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+    hash: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use m2_assets::lua::{Chunk, SCRIPT_TYPE};
+    for block in 0..wad.index().blocks().len() {
+        let decoded = wad.read_block(block)?;
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (entry, data) in contents.iter() {
+            if entry.type_hash == SCRIPT_TYPE && entry.name_hash == hash {
+                let chunk = Chunk::from_asset(data)?;
+                println!("{:?}, {} bytes", chunk.version, data.len());
+                print!("{}", chunk.main.listing());
+                return Ok(());
+            }
+        }
+    }
+    Err(format!("no script {hash:08x}").into())
+}
+
+fn call_sites<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+    callee: &str,
+    first: Option<&str>,
+    count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use m2_assets::lua::{Arg, Chunk, Function, SCRIPT_TYPE};
+
+    /// The function a script binds to global `name` at its top level
+    /// (`CLOSURE Rn Fk` then `SETGLOBAL Rn "name"`).
+    fn bound<'f>(main: &'f Function, name: &str) -> Option<&'f Function> {
+        let mut closure = None;
+        for &word in &main.code {
+            let op = word & 0x3f;
+            if op == 36 {
+                closure = Some((word >> 14) as usize);
+            } else if op == 7 {
+                let k = (word >> 14) as usize;
+                if matches!(main.constants.get(k), Some(m2_assets::lua::Constant::String(s)) if s == name)
+                {
+                    return closure.and_then(|c| main.functions.get(c));
+                }
+                closure = None;
+            }
+        }
+        None
+    }
+
+    let mut shown = 0;
+    let mut scripts = std::collections::BTreeSet::new();
+    'blocks: for block in 0..wad.index().blocks().len() {
+        let decoded = wad.read_block(block)?;
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (entry, data) in contents.iter() {
+            if entry.type_hash != SCRIPT_TYPE || scripts.contains(&entry.name_hash) {
+                continue;
+            }
+            let Ok(chunk) = Chunk::from_asset(data) else {
+                continue;
+            };
+            let all = chunk.main.all();
+            for call in chunk.main.calls() {
+                if call.callee != callee {
+                    continue;
+                }
+                let matches_first = match (first, call.args.as_ref().and_then(|a| a.first())) {
+                    (None, _) => true,
+                    (Some(want), Some(Arg::Global(g))) => g == want,
+                    (Some(want), Some(Arg::Str(s))) => s == want,
+                    _ => false,
+                };
+                if !matches_first {
+                    continue;
+                }
+                let (index, start, end) = call.site;
+                let f = all[index];
+                println!(
+                    "== script {:08x}, function {index} (line {}), instructions {start}..={end}",
+                    entry.name_hash, f.line_defined
+                );
+                // A few instructions before the callee load show where
+                // the arguments came from.
+                for pc in start.saturating_sub(4)..=end {
+                    println!("  {}", f.instruction_text(pc));
+                }
+                for a in call.args.iter().flatten() {
+                    if let Arg::Global(name) = a
+                        && let Some(cb) = bound(&chunk.main, name)
+                    {
+                        println!(
+                            "  -- callback {name}: {} params{}",
+                            cb.param_count,
+                            if cb.is_vararg != 0 { ", vararg" } else { "" }
+                        );
+                        for pc in 0..cb.code.len().min(16) {
+                            println!("    {}", cb.instruction_text(pc));
+                        }
+                    }
+                }
+                scripts.insert(entry.name_hash);
+                shown += 1;
+                if shown >= count {
+                    break 'blocks;
+                }
+                // One site per script, for variety.
+                break;
+            }
+        }
+    }
+    println!("{shown} call sites shown");
     Ok(())
 }
