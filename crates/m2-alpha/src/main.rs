@@ -119,6 +119,11 @@ struct Options {
     /// With `--screenshot`: cast rays around where she stands and list
     /// what they hit, to find unseen obstacles.
     probe: bool,
+    /// With `--aim` (or `--drive --look`): fire just before the picture.
+    fire: bool,
+    /// With `--mission --screenshot`: take the picture from this far from
+    /// the nearest marker, looking at it.
+    mission_look: Option<f32>,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
@@ -219,6 +224,10 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--closeup" => o.closeup = true,
             "--probe" => o.probe = true,
+            "--fire" => o.fire = true,
+            "--mission-look" => {
+                o.mission_look = Some(value()?.parse().context("--mission-look expects metres")?)
+            }
             "--fight-wait" => {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
@@ -642,6 +651,8 @@ fn screenshot(
             let jump = options.jump && i == 168;
             let trigger = combat::Trigger {
                 aim: options.aim && i >= 120,
+                // The last shot's flash is still up for the picture.
+                fire: options.fire && i == 177,
                 select: options.weapon.filter(|_| i == 0),
                 ..combat::Trigger::default()
             };
@@ -686,6 +697,9 @@ fn screenshot(
         game.camera = FlyCamera::looking_at(chest + right * 1.3 + ahead * 0.9, chest);
         eprintln!("closeup: chest {chest:.2}, facing {ahead:.2}");
     }
+    if let (Some(reach), Some(link)) = (options.mission_look, &link) {
+        look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
+    }
     // The picture, with the HUD.
     let mut hud = ui::Hud::new();
     let mut settings = config.clone();
@@ -697,6 +711,48 @@ fn screenshot(
     ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
     std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))?;
     eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+/// Puts the camera `reach` metres from the mission marker nearest the
+/// player, on her side of it and a little above, looking at it, and lets
+/// the island stream in around it.
+fn look_at_marker(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    link: &mission::MissionLink,
+    reach: f32,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    use m2_math::glam::Vec3;
+    let here = game.focus();
+    let Some((at, label, _)) = link
+        .view()
+        .markers
+        .into_iter()
+        .min_by(|a, b| a.0.distance(here).total_cmp(&b.0.distance(here)))
+    else {
+        eprintln!("mission look: no markers");
+        return Ok(());
+    };
+    let side = (here - at).with_y(0.0).normalize_or(Vec3::X);
+    let eye = at + side * reach + Vec3::Y * (reach * 0.4);
+    eprintln!("mission look: {label} at {at:.1} from {eye:.1}");
+    game.on_foot = false;
+    game.camera = FlyCamera::looking_at(eye, at);
+    let tick = TICK.as_secs_f32();
+    let started = Instant::now();
+    for i in 0.. {
+        game.step(Intent::default(), tick);
+        if i % 10 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
+        if (i > 120 && pending == 0) || started.elapsed() > Duration::from_secs(60) {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -1007,7 +1063,18 @@ fn drive_for_screenshot(
             } else {
                 m2_math::glam::Vec2::ZERO
             };
-            game.step(Intent { look, ..brake }, tick);
+            let trigger = combat::Trigger {
+                fire: options.fire && i == 87,
+                ..combat::Trigger::default()
+            };
+            game.step(
+                Intent {
+                    look,
+                    trigger,
+                    ..brake
+                },
+                tick,
+            );
             if i % 15 == 14
                 && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
             {
