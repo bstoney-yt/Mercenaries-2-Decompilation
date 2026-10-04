@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 use m2_assets::animation::ANIMATION_TYPE;
 use m2_assets::model::Node;
@@ -104,6 +105,53 @@ impl Skeleton {
 
     pub fn is_empty(&self) -> bool {
         self.parents.is_empty()
+    }
+
+    /// The nodes of the upper body: the spine from just above the pelvis
+    /// and everything on it (arms, head), found from the hands `a` and
+    /// `b`. Walking down from the root towards the hands, the pelvis is the
+    /// first node with two limbs (chains three or more nodes deep) that
+    /// hold neither hand: the legs. Weapon markers and other single nodes
+    /// hanging off the root don't count, nor does the neck off the chest.
+    pub fn upper_body(&self, a: usize, b: usize) -> Option<Arc<[bool]>> {
+        let up = |mut n: usize| {
+            let mut path = vec![n];
+            while let Some(p) = self.parents.get(n).copied().flatten() {
+                path.push(p);
+                n = p;
+            }
+            path
+        };
+        let (pa, pb) = (up(a), up(b));
+        let shared: Vec<usize> = pa.iter().copied().filter(|n| pb.contains(n)).collect();
+        let children = |n: usize| {
+            (0..self.len())
+                .filter(|&c| self.parents[c] == Some(n))
+                .collect::<Vec<_>>()
+        };
+        fn depth(s: &Skeleton, n: usize) -> usize {
+            1 + (0..s.len())
+                .filter(|&c| s.parents[c] == Some(n))
+                .map(|c| depth(s, c))
+                .max()
+                .unwrap_or(0)
+        }
+        let limbs = |n: usize| {
+            children(n)
+                .into_iter()
+                .filter(|&c| !pa.contains(&c) && !pb.contains(&c) && depth(self, c) >= 3)
+                .count()
+        };
+        // Walk down from the root along the hands' shared path to the
+        // pelvis; the spine starts at its child on the path.
+        let path: Vec<usize> = shared.iter().rev().copied().collect();
+        let at = path.iter().position(|&n| limbs(n) >= 2)?;
+        let spine = *path.get(at + 1)?;
+        let mut mask = vec![false; self.len()];
+        for (i, m) in mask.iter_mut().enumerate() {
+            *m = up(i).contains(&spine);
+        }
+        Some(mask.into())
     }
 
     pub fn rest_pose(&self) -> Pose {
@@ -456,13 +504,24 @@ struct Playing {
     once: bool,
 }
 
-/// Plays one clip at a time with crossfades, pinning the root horizontally.
+/// A clip the upper body plays over the rest (a rifle held while the legs
+/// run): which, how far in, and which nodes it moves.
+#[derive(Clone, Debug)]
+struct Upper {
+    clip: usize,
+    time: f32,
+    mask: Arc<[bool]>,
+}
+
+/// Plays one clip at a time with crossfades, pinning the root horizontally,
+/// with optionally another on the upper body.
 #[derive(Clone, Debug)]
 pub struct Animator {
     current: Option<Playing>,
     previous: Option<Playing>,
     fade: f32,
     fade_time: f32,
+    upper: Option<Upper>,
 }
 
 impl Default for Animator {
@@ -472,6 +531,7 @@ impl Default for Animator {
             previous: None,
             fade: 1.0,
             fade_time: 0.25,
+            upper: None,
         }
     }
 }
@@ -512,7 +572,26 @@ impl Animator {
         self.current.map(|c| (c.clip, c.time))
     }
 
+    /// Plays clip `index` looped on the nodes `mask` marks (the upper
+    /// body, [`Skeleton::upper_body`]) over whatever plays; `None` stops.
+    pub fn set_upper(&mut self, clip: Option<(usize, Arc<[bool]>)>) {
+        match clip {
+            Some((c, _)) if self.upper.as_ref().is_some_and(|u| u.clip == c) => {}
+            Some((clip, mask)) => {
+                self.upper = Some(Upper {
+                    clip,
+                    time: 0.0,
+                    mask,
+                })
+            }
+            None => self.upper = None,
+        }
+    }
+
     pub fn advance(&mut self, dt: f32) {
+        if let Some(u) = &mut self.upper {
+            u.time += dt;
+        }
         for c in [&mut self.current, &mut self.previous]
             .into_iter()
             .flatten()
@@ -544,6 +623,16 @@ impl Animator {
         if let Some(mut from) = self.previous.and_then(sample) {
             from.blend(&pose, self.fade);
             pose = from;
+        }
+        if let Some(u) = &self.upper
+            && let Some(c) = clips.get(u.clip)
+        {
+            let over = c.sample_looped(skeleton, u.time);
+            for ((local, mine), on) in pose.0.iter_mut().zip(over.0).zip(u.mask.iter()) {
+                if *on {
+                    *local = mine;
+                }
+            }
         }
         pose
     }
@@ -607,6 +696,51 @@ mod tests {
         assert!(anim.previous.is_none());
         // Without clips the rest pose comes back.
         assert_eq!(anim.pose(&skeleton(), &[]), skeleton().rest_pose());
+    }
+
+    #[test]
+    fn the_upper_body_starts_above_the_pelvis() {
+        // root 0 -> pelvis 1 -> {thigh 2 -> calf 10 -> foot 11, thigh 3 ->
+        // calf 12 -> foot 13, spine 4 -> chest 5 -> {arm 6 -> hand 7,
+        // arm 8 -> hand 9, neck 14 -> head 15}}; markers 16, 17 on the root.
+        let parents = vec![
+            None,
+            Some(0),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(5),
+            Some(8),
+            Some(2),
+            Some(10),
+            Some(3),
+            Some(12),
+            Some(5),
+            Some(14),
+            Some(0),
+            Some(0),
+        ];
+        let n = parents.len();
+        let s = Skeleton {
+            name_hashes: (0..n as u32).collect(),
+            parents,
+            rest: vec![Local::from_matrix(Mat4::IDENTITY); n],
+            inverse_bind: vec![Mat4::IDENTITY; n],
+        };
+        let mask = s.upper_body(7, 9).expect("an upper body");
+        let upper: Vec<usize> = (0..n).filter(|&i| mask[i]).collect();
+        assert_eq!(upper, vec![4, 5, 6, 7, 8, 9, 14, 15]);
+        let mut anim = Animator::default();
+        anim.set_upper(Some((3, mask.clone())));
+        anim.advance(0.5);
+        // Setting the same clip again keeps its place.
+        anim.set_upper(Some((3, mask)));
+        assert_eq!(anim.upper.as_ref().map(|u| u.time), Some(0.5));
+        anim.set_upper(None);
+        assert!(anim.upper.is_none());
     }
 
     #[test]

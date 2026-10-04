@@ -74,6 +74,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node = |h| skeleton.name_hashes.iter().position(|&n| n == h);
     let rh = node(RIGHT_HAND).ok_or("no right hand")?;
     let lh = node(LEFT_HAND).ok_or("no left hand")?;
+    match skeleton.upper_body(rh, lh) {
+        Some(mask) => {
+            let upper: Vec<String> = (0..skeleton.len())
+                .filter(|&i| mask[i])
+                .map(|i| format!("{:08x}", skeleton.name_hashes[i]))
+                .collect();
+            eprintln!(
+                "upper body: {} of {} nodes: {}",
+                upper.len(),
+                skeleton.len(),
+                upper.join(" ")
+            );
+        }
+        None => eprintln!("upper body: not found"),
+    }
 
     let index = source.archive().index();
     let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
