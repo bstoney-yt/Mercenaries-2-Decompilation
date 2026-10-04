@@ -560,6 +560,26 @@ pub struct Call {
     pub callee: String,
     /// The first argument when it is a string constant.
     pub first: Option<String>,
+    /// What each argument is, as far as straight-line reading tells;
+    /// `None` when the count is only known at run time (`f(g())`).
+    pub args: Option<Vec<Arg>>,
+}
+
+/// An argument's kind, from [`Function::calls`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum Arg {
+    Str(String),
+    Number(f64),
+    Bool,
+    Nil,
+    /// A table built in place: `{...}`.
+    Table,
+    /// A function defined in place.
+    Function,
+    /// A global or a global's member: `Event.ObjectDeath`, `OnDeath`.
+    Global(String),
+    /// Anything else: a local, a parameter, a computed value.
+    Other,
 }
 
 impl Function {
@@ -632,7 +652,22 @@ impl Function {
         enum Held<'f> {
             Global(String),
             Str(&'f str),
+            Num(f64),
+            Bool,
+            Nil,
+            Table,
+            Closure,
         }
+        let arg = |h: Option<&Option<Held<'_>>>| match h {
+            Some(Some(Held::Global(g))) => Arg::Global(g.clone()),
+            Some(Some(Held::Str(s))) => Arg::Str((*s).to_owned()),
+            Some(Some(Held::Num(n))) => Arg::Number(*n),
+            Some(Some(Held::Bool)) => Arg::Bool,
+            Some(Some(Held::Nil)) => Arg::Nil,
+            Some(Some(Held::Table)) => Arg::Table,
+            Some(Some(Held::Closure)) => Arg::Function,
+            _ => Arg::Other,
+        };
         let mut out = Vec::new();
         for f in self.all() {
             let mut held: Vec<Option<Held<'_>>> = vec![None; 256];
@@ -645,7 +680,15 @@ impl Function {
                         .constant_name(i.bx as usize)
                         .map(|n| Held::Global(n.to_owned())),
                     // LOADK
-                    1 => f.constant_name(i.bx as usize).map(Held::Str),
+                    1 => match f.constants.get(i.bx as usize) {
+                        Some(Constant::String(s)) => Some(Held::Str(s)),
+                        Some(Constant::Number(n)) => Some(Held::Num(*n)),
+                        _ => None,
+                    },
+                    2 => Some(Held::Bool),
+                    3 => Some(Held::Nil),
+                    10 => Some(Held::Table),
+                    36 => Some(Held::Closure),
                     // GETTABLE on a held global with a constant key.
                     6 => match (held.get(i.b as usize), i.c & 0x100 != 0) {
                         (Some(Some(Held::Global(g))), true) => f
@@ -662,9 +705,14 @@ impl Function {
                                 Some(Some(Held::Str(s))) if i.b != 1 => Some((*s).to_owned()),
                                 _ => None,
                             };
+                            // B is the argument count plus one; 0 means
+                            // up to the top of the stack.
+                            let args = (i.b != 0)
+                                .then(|| (1..i.b as usize).map(|k| arg(held.get(a + k))).collect());
                             out.push(Call {
                                 callee: g.clone(),
                                 first,
+                                args,
                             });
                         }
                         None
@@ -820,10 +868,12 @@ mod tests {
         assert!(calls.contains(&Call {
             callee: "Objective_Add".into(),
             first: Some("Destroy the depot".into()),
+            args: Some(vec![Arg::Str("Destroy the depot".into()), Arg::Number(3.0)]),
         }));
         assert!(calls.contains(&Call {
             callee: "Hud.Show".into(),
             first: Some("timer".into()),
+            args: Some(vec![Arg::Str("timer".into())]),
         }));
         let listing = chunk.main.listing();
         assert!(listing.contains("GETGLOBAL"), "{listing}");

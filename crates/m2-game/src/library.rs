@@ -96,9 +96,11 @@ impl Library {
     ///
     /// Every module is scored against every script that doesn't load it:
     /// one point per member used on the module that the script defines,
-    /// and two more when the script's strings name the module (scripts
-    /// often name themselves in their messages, which settles classes
-    /// whose few used members, such as `Activated`, many scripts define).
+    /// ten more when one of its strings starts with the module's name and
+    /// a colon (scripts prefix their debug messages with their own name,
+    /// `"MrxTaskContract:OnPlayerJoined"`), else two when a string names
+    /// it. The names settle classes whose few used members, such as
+    /// `Activated`, many scripts define.
     /// The best pairs are taken first and a script is one module only.
     pub fn resolve(&self, name: &str) -> Option<(&ScriptInfo, usize, usize)> {
         let key = name.to_ascii_lowercase();
@@ -118,8 +120,21 @@ impl Library {
                 if hits == 0 {
                     continue;
                 }
+                // Messages that start "MrxTaskContract:..." name their own
+                // script; a mention elsewhere in a string is weaker.
+                let own = s.strings.iter().any(|t| {
+                    t.strip_prefix(module.as_str())
+                        .is_some_and(|rest| rest.starts_with(':'))
+                });
                 let named = s.strings.iter().any(|t| mentions(t, module));
-                pairs.push((hits + if named { 2 } else { 0 }, hits, module, i));
+                let bonus = if own {
+                    10
+                } else if named {
+                    2
+                } else {
+                    0
+                };
+                pairs.push((hits + bonus, hits, module, i));
             }
         }
         // Best score; then the script defining least else; then stable.
@@ -176,6 +191,8 @@ pub(crate) mod tests {
             (2, include_bytes!("../tests/data/task.luac")),
             (3, include_bytes!("../tests/data/contract.luac")),
             (4, include_bytes!("../tests/data/user.luac")),
+            // Defines only Activated, which the contract uses on Task.
+            (5, include_bytes!("../tests/data/decoy.luac")),
         ] {
             lib.add(hash, Chunk::parse(bytes).unwrap());
         }
@@ -189,7 +206,8 @@ pub(crate) mod tests {
             lib.resolve("Util").map(|(s, h, n)| (s.hash, h, n)),
             Some((1, 2, 2))
         );
-        // The contract defines Activated too, but it inherits Task.
+        // The contract defines Activated too, but it inherits Task; the
+        // decoy defines less else, but Task names itself.
         assert_eq!(lib.resolve("task").map(|(s, _, _)| s.hash), Some(2));
         assert!(lib.resolve("Nothing").is_none());
         assert!(mentions("mrxtaskjob: started", "mrxtaskjob"));

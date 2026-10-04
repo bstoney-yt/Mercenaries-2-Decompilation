@@ -10,7 +10,9 @@
 //! script runs once as an entry point (its top level only: it defines its
 //! functions and loads its modules). With hashes, only those scripts run,
 //! and the calls they make are listed in order. Without hashes it also
-//! lists which entity components in the archive's layers name a script.
+//! lists which entity components in the archive's layers name a script,
+//! and how the scripts call each engine library function: argument counts
+//! and kinds, the engine API to provide.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -19,7 +21,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 
 use m2_assets::layer::LAYER_TYPE;
-use m2_assets::lua::{Chunk, SCRIPT_TYPE};
+use m2_assets::lua::{Arg, Chunk, SCRIPT_TYPE};
 use m2_assets::{BlockContents, Layer, WadArchive};
 use m2_game::library::Library;
 use m2_game::script::ScriptHost;
@@ -71,6 +73,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("{} scripts", library.scripts().len());
     if only.is_empty() {
         script_references(&library, &paths, &layers);
+        signatures(&library);
     }
     let library = Rc::new(library);
 
@@ -221,5 +224,94 @@ fn script_references(library: &Library, paths: &[String], layers: &[(usize, Vec<
         for e in examples {
             println!("      {e}");
         }
+    }
+}
+
+/// Libraries the engine provides (the rest are the scripts' own modules).
+const ENGINE: [&str; 26] = [
+    "Ai",
+    "Airstrike",
+    "Camera",
+    "Controller",
+    "Debug",
+    "Event",
+    "Graphics",
+    "Gui",
+    "Hud",
+    "Human",
+    "Marker",
+    "Math",
+    "Net",
+    "Object",
+    "ObjectFilter",
+    "ObjectState",
+    "Pda",
+    "Pg",
+    "Player",
+    "Sound",
+    "String",
+    "Sys",
+    "Vehicle",
+    "Weapon",
+    "Munitions",
+    "VO",
+];
+
+/// Every call to an engine library function, by the shape of its
+/// arguments: `Event.Create(Event.ObjectDeath, {}, fn, {}) x 12`.
+fn signatures(library: &Library) {
+    let mut shapes: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for script in library.scripts() {
+        for call in script.chunk.main.calls() {
+            let Some((lib, _)) = call.callee.split_once('.') else {
+                continue;
+            };
+            if !ENGINE.contains(&lib) {
+                continue;
+            }
+            let shape = match &call.args {
+                None => "(...)".to_owned(),
+                Some(args) => {
+                    let parts: Vec<String> = args
+                        .iter()
+                        .map(|a| match a {
+                            Arg::Str(_) => "str".into(),
+                            Arg::Number(_) => "num".into(),
+                            Arg::Bool => "bool".into(),
+                            Arg::Nil => "nil".into(),
+                            Arg::Table => "{}".into(),
+                            Arg::Function => "fn".into(),
+                            Arg::Global(g) if g.contains('.') => g.clone(),
+                            Arg::Global(_) => "global".into(),
+                            Arg::Other => "_".into(),
+                        })
+                        .collect();
+                    format!("({})", parts.join(", "))
+                }
+            };
+            *shapes
+                .entry(call.callee)
+                .or_default()
+                .entry(shape)
+                .or_default() += 1;
+        }
+    }
+    let mut sorted: Vec<_> = shapes.into_iter().collect();
+    sorted.sort_by_key(|(name, s)| (std::cmp::Reverse(s.values().sum::<usize>()), name.clone()));
+    println!();
+    println!(
+        "engine calls by argument shape ({} functions):",
+        sorted.len()
+    );
+    for (name, s) in sorted {
+        let total: usize = s.values().sum();
+        let mut forms: Vec<_> = s.into_iter().collect();
+        forms.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let shown: Vec<String> = forms
+            .iter()
+            .take(3)
+            .map(|(f, n)| format!("{f} x{n}"))
+            .collect();
+        println!("  {name} {total}: {}", shown.join("; "));
     }
 }
