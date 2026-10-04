@@ -26,6 +26,8 @@ struct Spot<'a> {
     yaw: f32,
 }
 
+/// How fast a turret turns after the camera, radians a second (invented).
+const TURRET_RATE: f32 = 1.2;
 /// How near a building the town's sounds play, metres.
 const TOWN_REACH: f32 = 150.0;
 
@@ -260,6 +262,19 @@ impl Game {
                         player.chase_target = None;
                         player.update(physics, intent, dt);
                     }
+                }
+                // A turret turns after the camera, at its own pace.
+                if let Some(v) = player.driving.and_then(|i| scene.vehicles.get_mut(i))
+                    && !v.wrecked
+                    && let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id))
+                {
+                    let f = at.transform_vector3(Vec3::Z);
+                    let mut turn =
+                        (player.yaw - f.x.atan2(f.z) - v.turret).rem_euclid(std::f32::consts::TAU);
+                    if turn > std::f32::consts::PI {
+                        turn -= std::f32::consts::TAU;
+                    }
+                    v.turret += turn.clamp(-TURRET_RATE * dt, TURRET_RATE * dt);
                 }
             } else {
                 physics.step(dt);

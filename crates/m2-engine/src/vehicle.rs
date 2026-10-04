@@ -189,7 +189,14 @@ pub struct VehicleSpec {
     pub node_wheel: Vec<Option<usize>>,
     /// Mass, kg (by kind; invented).
     pub mass: f32,
+    /// The nodes that turn with the turret (its mount, every node under
+    /// it), if it has one.
+    pub turret: Vec<bool>,
 }
+
+/// The node a turret turns about, in every vehicle that has one: both the
+/// intact and the wrecked turret hang from it.
+pub const TURRET_MOUNT: u32 = 0xc851_b695;
 
 impl VehicleSpec {
     /// Reads `model`'s wheels and markers. `None` for a ground vehicle
@@ -262,6 +269,20 @@ impl VehicleSpec {
         let rest = (0..n)
             .map(|i| model.node_to_model(i as u16).unwrap_or(Mat4::IDENTITY))
             .collect();
+        let mount = model.nodes.iter().position(|x| x.name_hash == TURRET_MOUNT);
+        let turret = (0..n)
+            .map(|k| {
+                let mut at = Some(k as u16);
+                for _ in 0..=n {
+                    match at {
+                        Some(c) if Some(usize::from(c)) == mount => return true,
+                        Some(c) => at = model.nodes.get(usize::from(c)).and_then(|x| x.parent),
+                        None => break,
+                    }
+                }
+                false
+            })
+            .collect();
         let marker = |h| vehicle::marker(model, h).map(Vec3::from);
         let mass = match entry.kind.as_str() {
             "car" => 1400.0,
@@ -283,6 +304,7 @@ impl VehicleSpec {
             rest,
             node_wheel,
             mass,
+            turret,
         })
     }
 
@@ -297,8 +319,9 @@ impl VehicleSpec {
     }
 
     /// Node matrices (model space) with each wheel steered by `steer` and
-    /// spun by `spin` radians about its centre.
-    pub fn posed_nodes(&self, wheels: &[(f32, f32)]) -> Vec<Mat4> {
+    /// spun by `spin` radians about its centre, and the turret turned
+    /// `turret` radians (anticlockwise from above) about its mount.
+    pub fn posed_nodes(&self, wheels: &[(f32, f32)], turret: f32) -> Vec<Mat4> {
         let turns: Vec<Mat4> = self
             .wheels
             .iter()
@@ -313,12 +336,29 @@ impl VehicleSpec {
                     * Mat4::from_translation(-w.centre)
             })
             .collect();
+        let mount = self
+            .turret
+            .iter()
+            .zip(&self.rest)
+            .find(|(on, _)| **on)
+            .map(|(_, m)| m.w_axis.truncate());
+        let aim = mount.map_or(Mat4::IDENTITY, |at| {
+            Mat4::from_translation(at) * Mat4::from_rotation_y(turret) * Mat4::from_translation(-at)
+        });
         self.rest
             .iter()
             .zip(&self.node_wheel)
-            .map(|(&m, w)| match w.and_then(|i| turns.get(i)) {
-                Some(&t) => t * m,
-                None => m,
+            .enumerate()
+            .map(|(i, (&m, w))| {
+                let m = match w.and_then(|i| turns.get(i)) {
+                    Some(&t) => t * m,
+                    None => m,
+                };
+                if self.turret.get(i).copied().unwrap_or(false) {
+                    aim * m
+                } else {
+                    m
+                }
             })
             .collect()
     }
@@ -355,13 +395,30 @@ mod tests {
             ],
             node_wheel: vec![None, Some(0)],
             mass: 1400.0,
+            turret: vec![false, false],
         }
+    }
+
+    #[test]
+    fn turrets_turn_about_their_mount() {
+        let mut s = spec();
+        let mount = Vec3::new(0.0, 1.5, -0.5);
+        s.rest.push(Mat4::from_translation(mount));
+        s.rest.push(Mat4::from_translation(mount + Vec3::Z * 2.0));
+        s.node_wheel.extend([None, None]);
+        s.turret = vec![false, false, true, true];
+        let still = [(0.0, 0.0); 4];
+        let posed = s.posed_nodes(&still, std::f32::consts::FRAC_PI_2);
+        assert!(posed[2].w_axis.truncate().abs_diff_eq(mount, 1e-5));
+        let barrel = posed[3].w_axis.truncate();
+        assert!(barrel.abs_diff_eq(mount + Vec3::X * 2.0, 1e-5), "{barrel}");
+        assert_eq!(posed[0], s.rest[0], "the hull stays");
     }
 
     #[test]
     fn wheels_turn_their_nodes_about_their_centres() {
         let s = spec();
-        let posed = s.posed_nodes(&[(0.5, 1.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
+        let posed = s.posed_nodes(&[(0.5, 1.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], 0.0);
         assert_eq!(posed[0], Mat4::IDENTITY);
         // The wheel node sits at the wheel's centre, so turning keeps it
         // there.

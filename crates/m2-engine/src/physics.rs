@@ -964,6 +964,7 @@ mod tests {
             rest: Vec::new(),
             node_wheel: Vec::new(),
             mass: 1400.0,
+            turret: Vec::new(),
         }
     }
 
