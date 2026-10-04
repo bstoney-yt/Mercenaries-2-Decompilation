@@ -252,12 +252,46 @@ impl Character {
     }
 }
 
+/// The collision group of ragdolls' limbs: they land on the world and
+/// vehicles but not on each other, and people, wheels and rays pass
+/// through them.
+const RAGDOLL: r::Group = r::Group::GROUP_2;
+
+/// Queries that see everything but ragdolls.
+fn solid<'a>() -> r::QueryFilter<'a> {
+    r::QueryFilter::default().groups(r::InteractionGroups::new(
+        r::Group::ALL,
+        r::Group::ALL.difference(RAGDOLL),
+        r::InteractionTestMode::And,
+    ))
+}
+
+/// Shortest bone a ragdoll gives a limb, metres (fingers and face bones
+/// are shorter and ride along).
+const RAGDOLL_BONE: (f32, f32) = (0.07, 0.7);
+
+/// A ragdoll in the physics world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RagdollId(usize);
+
+/// A body gone limp: a rigid body per limb, joined where the skeleton's
+/// bones meet; nodes without one keep their place under their parent as
+/// it was when it went limp.
+struct Ragdoll {
+    parents: Vec<Option<usize>>,
+    /// Each node's transform from its parent (world for the roots) when
+    /// it went limp.
+    locals: Vec<Mat4>,
+    bodies: Vec<Option<r::RigidBodyHandle>>,
+}
+
 /// The physics world.
 pub struct Physics {
     world: r::PhysicsWorld,
     statics: HashMap<StaticKey, r::ColliderHandle>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
+    ragdolls: Vec<Option<Ragdoll>>,
 }
 
 impl fmt::Debug for Physics {
@@ -293,6 +327,7 @@ impl Physics {
             statics: HashMap::new(),
             controller,
             vehicles: Vec::new(),
+            ragdolls: Vec::new(),
         }
     }
 
@@ -333,7 +368,7 @@ impl Physics {
         self.world.integration_parameters.dt = dt;
         let w = &mut self.world;
         for v in self.vehicles.iter_mut().flatten() {
-            let filter = r::QueryFilter::default().exclude_rigid_body(v.controller.chassis);
+            let filter = solid().exclude_rigid_body(v.controller.chassis);
             let queries = w.broad_phase.as_query_pipeline_mut(
                 w.narrow_phase.query_dispatcher(),
                 &mut w.bodies,
@@ -554,11 +589,162 @@ impl Physics {
         }
     }
 
+    /// Lets a skeleton go limp: `parents` and `nodes` (world space, as
+    /// posed when it went) give its bones, and every limb starts moving at
+    /// `velocity`. Limbs are capsules along bones from
+    /// [`RAGDOLL_BONE`]`.0` to `.1` long, joined by ball joints at the
+    /// bones' ends; a bone splitting in several (hips, chest) is a ball.
+    pub fn add_ragdoll(
+        &mut self,
+        parents: &[Option<usize>],
+        nodes: &[Mat4],
+        velocity: Vec3,
+    ) -> RagdollId {
+        let n = nodes.len().min(parents.len());
+        let (lo, hi) = RAGDOLL_BONE;
+        let at: Vec<(Vec3, Quat)> = nodes[..n]
+            .iter()
+            .map(|m| {
+                let (_, q, t) = m.to_scale_rotation_translation();
+                (t, q.normalize())
+            })
+            .collect();
+        let bone = |a: usize, b: usize| {
+            let d = at[a].0.distance(at[b].0);
+            (lo..=hi).contains(&d)
+        };
+        let mut kids: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (c, parent) in parents[..n].iter().enumerate() {
+            if let Some(p) = parent.filter(|&p| p < n && bone(p, c)) {
+                kids[p].push(c);
+            }
+        }
+        let groups = r::InteractionGroups::new(
+            RAGDOLL,
+            r::Group::ALL.difference(RAGDOLL),
+            r::InteractionTestMode::And,
+        );
+        let mut bodies: Vec<Option<r::RigidBodyHandle>> = vec![None; n];
+        // Parents come before their children.
+        for i in 0..n {
+            let Some(parent) = parents[i].filter(|&p| p < n) else {
+                continue;
+            };
+            let limb = !kids[i].is_empty() || (bodies[parent].is_some() && bone(parent, i));
+            if !limb {
+                continue;
+            }
+            let (p, q) = at[i];
+            let local = |c: usize| q.inverse() * (at[c].0 - p);
+            let shape = match kids[i].as_slice() {
+                [c] => {
+                    let end = local(*c);
+                    let radius = (0.03 + end.length() * 0.12).min(0.09);
+                    r::ColliderBuilder::capsule_from_endpoints(
+                        vector(end * (radius / end.length())),
+                        vector(end * (1.0 - radius / end.length()).max(0.0)),
+                        radius,
+                    )
+                }
+                [] => r::ColliderBuilder::ball(0.06),
+                many => {
+                    let mid = many.iter().map(|&c| local(c)).sum::<Vec3>() / many.len() as f32;
+                    r::ColliderBuilder::ball(0.11).translation(vector(mid))
+                }
+            };
+            let body = self.world.insert_body(
+                r::RigidBodyBuilder::dynamic()
+                    .pose(pose(p, q))
+                    .linvel(vector(velocity))
+                    .linear_damping(0.2)
+                    .angular_damping(2.0)
+                    .ccd_enabled(true),
+            );
+            self.world.insert_collider(
+                shape.density(1000.0).friction(0.9).collision_groups(groups),
+                Some(body),
+            );
+            bodies[i] = Some(body);
+            // Joined to the nearest ancestor with a limb.
+            let mut up = Some(parent);
+            while let Some(a) = up {
+                if let Some(other) = bodies[a] {
+                    let anchor = at[a].1.inverse() * (p - at[a].0);
+                    self.world.insert_impulse_joint(
+                        other,
+                        body,
+                        r::SphericalJointBuilder::new()
+                            .local_anchor1(vector(anchor))
+                            .local_anchor2(vector(Vec3::ZERO))
+                            .contacts_enabled(false),
+                    );
+                    break;
+                }
+                up = parents[a].filter(|&p| p < n);
+            }
+        }
+        let locals = (0..n)
+            .map(|i| match parents[i].filter(|&p| p < n) {
+                Some(p) => nodes[p].inverse() * nodes[i],
+                None => nodes[i],
+            })
+            .collect();
+        self.ragdolls.push(Some(Ragdoll {
+            parents: parents[..n].to_vec(),
+            locals,
+            bodies,
+        }));
+        RagdollId(self.ragdolls.len() - 1)
+    }
+
+    /// A ragdoll's node matrices, world space; `None` once removed.
+    pub fn ragdoll_nodes(&self, id: RagdollId) -> Option<Vec<Mat4>> {
+        let doll = self.ragdolls.get(id.0)?.as_ref()?;
+        let mut out: Vec<Mat4> = Vec::with_capacity(doll.locals.len());
+        for i in 0..doll.locals.len() {
+            let limb = doll.bodies[i].and_then(|h| self.world.bodies.get(h));
+            let m = match (limb, doll.parents[i]) {
+                (Some(b), _) => {
+                    let p = b.position();
+                    Mat4::from_rotation_translation(
+                        Quat::from_array(p.rotation.to_array()),
+                        vec3(p.translation),
+                    )
+                }
+                (None, Some(p)) if p < i => out[p] * doll.locals[i],
+                _ => doll.locals[i],
+            };
+            out.push(m);
+        }
+        Some(out)
+    }
+
+    /// Shoves every limb of a ragdoll by `velocity` (m/s).
+    pub fn push_ragdoll(&mut self, id: RagdollId, velocity: Vec3) {
+        let Some(doll) = self.ragdolls.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        for h in doll.bodies.iter().flatten() {
+            if let Some(b) = self.world.bodies.get_mut(*h) {
+                b.set_linvel(b.linvel() + vector(velocity), true);
+            }
+        }
+    }
+
+    pub fn remove_ragdoll(&mut self, id: RagdollId) {
+        let Some(doll) = self.ragdolls.get_mut(id.0).and_then(Option::take) else {
+            return;
+        };
+        for h in doll.bodies.into_iter().flatten() {
+            self.world.remove_body(h);
+        }
+    }
+
     /// The first static surface along a ray: (distance, normal).
     pub fn cast_ray(&self, origin: Vec3, direction: Vec3, max: f32) -> Option<(f32, Vec3)> {
         let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
         self.world
-            .query_pipeline()
+            .query_pipeline_with_filter(solid())
             .cast_ray_and_get_normal(&ray, max, true)
             .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
     }
@@ -582,7 +768,7 @@ impl Physics {
         let shape = r::Capsule::new_y(character.half_height(), character.radius);
         let movement = self.controller.move_shape(
             dt,
-            &self.world.query_pipeline(),
+            &self.world.query_pipeline_with_filter(solid()),
             &shape,
             &pose(character.centre(), Quat::IDENTITY),
             vector(desired),
@@ -630,6 +816,37 @@ mod tests {
         for _ in 0..(seconds / DT) as usize {
             physics.move_character(c, velocity, None, DT);
         }
+    }
+
+    #[test]
+    fn ragdolls_fall_to_the_ground_and_rays_pass_them() {
+        let mut p = ready();
+        // Feet, hips, chest, head, and a hand on the chest.
+        let parents = [None, Some(0), Some(1), Some(2), Some(2)];
+        let ys = [2.0, 3.0, 3.45, 3.75, 3.4];
+        let nodes: Vec<Mat4> = ys
+            .iter()
+            .enumerate()
+            .map(|(i, &y)| Mat4::from_translation(Vec3::new(i as f32 * 0.01, y, 0.0)))
+            .collect();
+        let id = p.add_ragdoll(&parents, &nodes, Vec3::new(3.0, 0.0, 0.0));
+        for _ in 0..240 {
+            p.step(DT);
+        }
+        let now = p.ragdoll_nodes(id).unwrap();
+        for m in &now[1..] {
+            let at = m.w_axis.truncate();
+            assert!(at.y > -0.1 && at.y < 0.8, "{at}");
+            assert!(at.x > 0.5, "carried along: {at}");
+        }
+        // Limbs stay joined.
+        assert!(now[1].w_axis.distance(now[2].w_axis) < 0.6);
+        let (d, _) = p
+            .cast_ray(Vec3::new(now[2].w_axis.x, 5.0, 0.0), -Vec3::Y, 10.0)
+            .unwrap();
+        assert!((d - 5.0).abs() < 1e-3, "the ray hits the ground: {d}");
+        p.remove_ragdoll(id);
+        assert!(p.ragdoll_nodes(id).is_none());
     }
 
     fn ready() -> Physics {

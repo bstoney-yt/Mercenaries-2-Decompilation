@@ -905,13 +905,14 @@ fn fight_for_screenshot(
     let c = &game.combat;
     let people = &game.scene.people.npcs;
     eprintln!(
-        "fight: {} hits, {} blasts; player hp {:.0}{}; {} of {} people dead, {} soldiers alert",
+        "fight: {} hits, {} blasts; player hp {:.0}{}; {} of {} people dead ({} limp), {} soldiers alert",
         c.hits,
         c.blasts,
         c.hp,
         if c.down > 0.0 { " (down)" } else { "" },
         people.iter().filter(|n| !n.alive).count(),
         people.len(),
+        people.iter().filter(|n| n.ragdoll.is_some()).count(),
         people.iter().filter(|n| n.alert).count(),
     );
     // The picture: aiming, with soldiers firing back.

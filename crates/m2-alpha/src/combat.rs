@@ -49,6 +49,12 @@ const BOUNCE: f32 = 0.4;
 /// Blasts kill within `KILL` metres and hurt to `REACH`; vehicles within
 /// `WRECK` are wrecked.
 const KILL: f32 = 4.0;
+/// How hard a blast throws people: (out, up) m/s at its heart, on top of
+/// 3 out and 2 up at the edge of its reach. Invented, to look like the
+/// game's flung bodies.
+const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
+/// How hard a rifle round shoves the one it kills, m/s.
+const SHOT_PUSH: f32 = 2.0;
 const REACH: f32 = 9.0;
 const WRECK: f32 = 6.0;
 
@@ -521,7 +527,7 @@ impl Combat {
         self.sounds.push(Sound::Shot(from));
         if let Some((_, Some(i))) = hit {
             let soldier = f.people.npcs[i].soldier;
-            if f.people.npcs[i].hurt(RIFLE_DAMAGE) && soldier {
+            if f.people.npcs[i].hurt(RIFLE_DAMAGE, dir * SHOT_PUSH) && soldier {
                 self.remarks.push(Remark::Kill);
             }
             self.hits += 1;
@@ -715,10 +721,14 @@ impl Combat {
         let mut killed = false;
         for n in &mut f.people.npcs {
             let d = n.chest().distance(at);
+            // Thrown out and up, harder the nearer.
+            let near = (1.0 - d / REACH).max(0.0);
+            let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
+            let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
             if d < KILL {
-                killed |= n.hurt(1000.0) && n.soldier;
+                killed |= n.hurt(1000.0, push) && n.soldier;
             } else if d < REACH {
-                killed |= n.hurt(100.0 * (1.0 - d / REACH)) && n.soldier;
+                killed |= n.hurt(100.0 * near, push) && n.soldier;
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
@@ -913,7 +923,7 @@ mod tests {
             ));
         }
         for _ in 0..3 {
-            people.update(&physics, &[], Vec3::ZERO, None, dt);
+            people.update(&mut physics, &[], Vec3::ZERO, None, dt);
             player.update(&physics, Default::default(), dt);
         }
         assert!(player.landed && people.npcs.iter().all(|n| n.landed));
@@ -991,7 +1001,7 @@ mod tests {
 
     #[test]
     fn the_crosshair_finds_a_soldier_off_to_the_side() {
-        let physics = ground();
+        let mut physics = ground();
         let dt = 1.0 / 60.0;
         let mut player = Player::new(0.0, 0.0, 0.0, None);
         let mut people = People::default();
@@ -1004,7 +1014,7 @@ mod tests {
             Some(1),
         ));
         for _ in 0..30 {
-            people.update(&physics, &[], Vec3::ZERO, None, dt);
+            people.update(&mut physics, &[], Vec3::ZERO, None, dt);
             player.update(&physics, Default::default(), dt);
         }
         let chest = people.npcs[0].chest();
