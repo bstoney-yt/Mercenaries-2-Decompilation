@@ -23,7 +23,7 @@ use std::rc::Rc;
 use m2_assets::layer::LAYER_TYPE;
 use m2_assets::lua::{Arg, Chunk, SCRIPT_TYPE};
 use m2_assets::{BlockContents, Layer, WadArchive};
-use m2_game::library::Library;
+use m2_game::library::{KNOWN_MODULES, Library};
 use m2_game::script::ScriptHost;
 
 fn main() -> ExitCode {
@@ -74,6 +74,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if only.is_empty() {
         script_references(&library, &paths, &layers);
         signatures(&library);
+    }
+    for (name, hash) in KNOWN_MODULES {
+        library.pin(name, hash);
     }
     let library = Rc::new(library);
 

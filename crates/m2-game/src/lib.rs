@@ -2,5 +2,6 @@
 
 pub mod api;
 pub mod events;
+pub mod layers;
 pub mod library;
 pub mod script;

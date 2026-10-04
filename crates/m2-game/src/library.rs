@@ -35,7 +35,23 @@ pub struct Library {
     /// Lower-case module name to (script index, members it defines),
     /// worked out on first use.
     assigned: std::cell::OnceCell<BTreeMap<String, (usize, usize)>>,
+    /// Lower-case module name to the script it is known to be, where the
+    /// member match goes wrong.
+    pinned: BTreeMap<String, u32>,
 }
+
+/// Modules the member match gets wrong, by the script they are, found by
+/// what each script inherits and defines.
+///
+/// The task classes are the trouble: subclasses call so many base-class
+/// members through `MrxTaskMission` and `MrxTaskObjective` that the match
+/// gave those names the base class and contracts.
+pub const KNOWN_MODULES: [(&str, u32); 4] = [
+    ("MrxTask", 0xd302_a66f),
+    ("MrxTaskMission", 0xcfcd_908f),
+    ("MrxTaskObjective", 0x517a_1910),
+    ("MrxTaskRace", 0x2595_ba98),
+];
 
 /// Functions that load a module by name.
 pub const LOADERS: [&str; 3] = ["import", "inherit", "dynamic_import"];
@@ -82,6 +98,12 @@ impl Library {
         });
     }
 
+    /// Makes module `name` script `hash`, whatever the member match says.
+    /// Call before the first [`Library::resolve`].
+    pub fn pin(&mut self, name: &str, hash: u32) {
+        self.pinned.insert(name.to_ascii_lowercase(), hash);
+    }
+
     pub fn scripts(&self) -> &[ScriptInfo] {
         &self.scripts
     }
@@ -102,10 +124,32 @@ impl Library {
     /// it. The names settle classes whose few used members, such as
     /// `Activated`, many scripts define.
     /// The best pairs are taken first and a script is one module only.
+    ///
+    /// A module no script uses members of (a mission module such as
+    /// `VzaCon001`, loaded by a name from data) is the script not already
+    /// some module's that names it most often in its strings.
     pub fn resolve(&self, name: &str) -> Option<(&ScriptInfo, usize, usize)> {
         let key = name.to_ascii_lowercase();
-        let &(index, hits) = self.assigned.get_or_init(|| self.assign()).get(&key)?;
-        Some((&self.scripts[index], hits, self.used.get(&key)?.len()))
+        let assigned = self.assigned.get_or_init(|| self.assign());
+        if let Some(&(index, hits)) = assigned.get(&key) {
+            let used = self.used.get(&key).map_or(0, BTreeSet::len);
+            return Some((&self.scripts[index], hits, used));
+        }
+        if self.used.contains_key(&key) {
+            return None;
+        }
+        let taken: BTreeSet<usize> = assigned.values().map(|&(i, _)| i).collect();
+        self.scripts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !taken.contains(i))
+            .map(|(_, s)| (s.strings.iter().filter(|t| mentions(t, &key)).count(), s))
+            .filter(|&(n, _)| n > 0)
+            .max_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then(b.1.defines.len().cmp(&a.1.defines.len()))
+            })
+            .map(|(_, s)| (s, 0, 0))
     }
 
     fn assign(&self) -> BTreeMap<String, (usize, usize)> {
@@ -151,6 +195,17 @@ impl Library {
         });
         let mut out = BTreeMap::new();
         let mut taken = BTreeSet::new();
+        for (module, &hash) in &self.pinned {
+            if let Some(i) = self.scripts.iter().position(|s| s.hash == hash) {
+                let hits = self.used.get(module).map_or(0, |used| {
+                    used.iter()
+                        .filter(|m| self.scripts[i].defines.contains(*m))
+                        .count()
+                });
+                taken.insert(i);
+                out.insert(module.clone(), (i, hits));
+            }
+        }
         for (_, hits, module, i) in pairs {
             if out.contains_key(module) || taken.contains(&i) {
                 continue;
@@ -216,5 +271,17 @@ pub(crate) mod tests {
             lib.module_names().into_iter().collect::<Vec<_>>(),
             ["task", "util"]
         );
+    }
+
+    #[test]
+    fn pins_win_over_the_match() {
+        let mut lib = library();
+        lib.pin("Task", 5);
+        assert_eq!(
+            lib.resolve("task").map(|(s, h, _)| (s.hash, h)),
+            Some((5, 1))
+        );
+        // The pinned script is no other module's.
+        assert_eq!(lib.resolve("Util").map(|(s, _, _)| s.hash), Some(1));
     }
 }
