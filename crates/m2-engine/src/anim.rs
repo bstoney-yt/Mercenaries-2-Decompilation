@@ -107,12 +107,11 @@ impl Skeleton {
         self.parents.is_empty()
     }
 
-    /// The nodes of the upper body: the spine from just above the pelvis
-    /// and everything on it (arms, head), found from the hands `a` and
-    /// `b`. Walking down from the root towards the hands, the pelvis is the
-    /// first node with two limbs (chains three or more nodes deep) that
-    /// hold neither hand: the legs. Weapon markers and other single nodes
-    /// hanging off the root don't count, nor does the neck off the chest.
+    /// The nodes of the upper body (from the waist up: arms, head and the
+    /// spine they hang on), found from the hands `a` and `b`. Climbing
+    /// from the node both hands hang from (the chest) towards the root,
+    /// the waist is the last node reached before one with a branch going
+    /// down to the feet (a leg), whichever bone the legs hang from.
     pub fn upper_body(&self, a: usize, b: usize) -> Option<Arc<[bool]>> {
         let up = |mut n: usize| {
             let mut path = vec![n];
@@ -123,34 +122,27 @@ impl Skeleton {
             path
         };
         let (pa, pb) = (up(a), up(b));
+        // Chest first, root last.
         let shared: Vec<usize> = pa.iter().copied().filter(|n| pb.contains(n)).collect();
-        let children = |n: usize| {
-            (0..self.len())
-                .filter(|&c| self.parents[c] == Some(n))
-                .collect::<Vec<_>>()
-        };
-        fn depth(s: &Skeleton, n: usize) -> usize {
-            1 + (0..s.len())
-                .filter(|&c| s.parents[c] == Some(n))
-                .map(|c| depth(s, c))
-                .max()
-                .unwrap_or(0)
+        let chest = *shared.first()?;
+        let models = self.model_matrices(&self.rest_pose());
+        let height = |n: usize| models[n].w_axis.y;
+        let floor = (0..self.len()).map(height).fold(f32::INFINITY, f32::min);
+        // Low: within a fifth of the chest's height off the floor.
+        let low = floor + (height(chest) - floor) * 0.2;
+        let reaches_low =
+            |n: usize| (0..self.len()).any(|i| height(i) <= low && up(i).contains(&n));
+        let mut waist = chest;
+        for pair in shared.windows(2) {
+            let (below, node) = (pair[0], pair[1]);
+            let leg = (0..self.len())
+                .any(|c| self.parents[c] == Some(node) && c != below && reaches_low(c));
+            if leg || self.parents[node].is_none() {
+                break;
+            }
+            waist = node;
         }
-        let limbs = |n: usize| {
-            children(n)
-                .into_iter()
-                .filter(|&c| !pa.contains(&c) && !pb.contains(&c) && depth(self, c) >= 3)
-                .count()
-        };
-        // Walk down from the root along the hands' shared path to the
-        // pelvis; the spine starts at its child on the path.
-        let path: Vec<usize> = shared.iter().rev().copied().collect();
-        let at = path.iter().position(|&n| limbs(n) >= 2)?;
-        let spine = *path.get(at + 1)?;
-        let mut mask = vec![false; self.len()];
-        for (i, m) in mask.iter_mut().enumerate() {
-            *m = up(i).contains(&spine);
-        }
+        let mask: Vec<bool> = (0..self.len()).map(|i| up(i).contains(&waist)).collect();
         Some(mask.into())
     }
 
@@ -752,16 +744,40 @@ mod tests {
             Some(0),
             Some(0),
         ];
-        let n = parents.len();
-        let s = Skeleton {
-            name_hashes: (0..n as u32).collect(),
-            parents,
-            rest: vec![Local::from_matrix(Mat4::IDENTITY); n],
-            inverse_bind: vec![Mat4::IDENTITY; n],
+        // Each node's height above its parent.
+        let rise = [
+            0.0, 1.0, -0.1, -0.1, 0.2, 0.3, 0.1, -0.3, 0.1, -0.3, -0.4, -0.4, -0.4, -0.4, 0.2, 0.1,
+            0.0, 0.0,
+        ];
+        let skeleton = |parents: Vec<Option<usize>>, rise: &[f32]| {
+            let n = parents.len();
+            Skeleton {
+                name_hashes: (0..n as u32).collect(),
+                parents,
+                rest: rise
+                    .iter()
+                    .map(|&y| Local::from_matrix(Mat4::from_translation(Vec3::Y * y)))
+                    .collect(),
+                inverse_bind: vec![Mat4::IDENTITY; n],
+            }
         };
-        let mask = s.upper_body(7, 9).expect("an upper body");
-        let upper: Vec<usize> = (0..n).filter(|&i| mask[i]).collect();
-        assert_eq!(upper, vec![4, 5, 6, 7, 8, 9, 14, 15]);
+        let upper = |s: &Skeleton| {
+            let mask = s.upper_body(7, 9).expect("an upper body");
+            (0..s.len()).filter(|&i| mask[i]).collect::<Vec<_>>()
+        };
+        let s = skeleton(parents.clone(), &rise);
+        assert_eq!(upper(&s), vec![4, 5, 6, 7, 8, 9, 14, 15]);
+        // Thighs on the spine instead (as some rigs have them): the upper
+        // body starts at the chest.
+        let mut biped = parents;
+        biped[2] = Some(4);
+        biped[3] = Some(4);
+        let mut low = rise;
+        low[2] = -0.3;
+        low[3] = -0.3;
+        let b = skeleton(biped, &low);
+        assert_eq!(upper(&b), vec![5, 6, 7, 8, 9, 14, 15]);
+        let mask = s.upper_body(7, 9).unwrap();
         let mut anim = Animator::default();
         anim.set_upper(Some((3, mask.clone())));
         anim.advance(0.5);
