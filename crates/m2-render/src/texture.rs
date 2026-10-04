@@ -143,6 +143,48 @@ pub struct MaterialDesc {
     /// Fades alpha towards the silhouette, where the surface turns away
     /// from the camera (smoke and other soft volumes).
     pub soft_edge: bool,
+    /// Specular highlights: colour, strength map and sharpness. `None` is
+    /// a matte surface.
+    pub specular: Option<Specular>,
+    /// Tangent-space normal map, upload [`TextureFormat::Rgba8Unorm`];
+    /// needs vertex tangents (without them the map is ignored).
+    pub normal_map: Option<NormalMap>,
+    /// Tiled ground layers blended by the vertex colour (`r` weights the
+    /// first, `a` the fourth), over the base map as a whole-cell tint.
+    /// While any is set the vertex colour is a weight, not a colour.
+    pub layers: [Option<TerrainLayer>; 4],
+    /// Pulls the surface towards the camera in the depth test, so a
+    /// surface laid on another (roads on the ground) wins.
+    pub depth_bias: bool,
+}
+
+/// Specular highlights (Blinn-Phong).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Specular {
+    /// Linear RGB scale of the highlight.
+    pub color: [f32; 3],
+    /// Exponent: higher is tighter.
+    pub power: f32,
+    /// Per-texel highlight colour, sampled with the base map's coordinates.
+    pub map: Option<TextureHandle>,
+}
+
+/// A tangent-space normal map, sampled with the base map's coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NormalMap {
+    pub texture: TextureHandle,
+    /// Where x and y are stored: `false` in red and green, `true` in alpha
+    /// and green (the DXT5 swizzle).
+    pub alpha_x: bool,
+}
+
+/// One tiled ground layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainLayer {
+    pub texture: TextureHandle,
+    /// `u` and `v` as dot products with the vertex's model-space
+    /// `(x, y, z, 1)`.
+    pub uv: [[f32; 4]; 2],
 }
 
 /// A detail texture: tiled every `tile` metres along world x and z, it
@@ -167,6 +209,10 @@ impl Default for MaterialDesc {
             clamp: false,
             detail: None,
             soft_edge: false,
+            specular: None,
+            normal_map: None,
+            layers: [None; 4],
+            depth_bias: false,
         }
     }
 }

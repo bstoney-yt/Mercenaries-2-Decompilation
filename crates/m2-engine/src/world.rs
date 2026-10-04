@@ -18,8 +18,9 @@ use std::io::{Read, Seek};
 
 use m2_assets::layer::{LAYER_TYPE, TEMPLATE_DB_TYPE};
 use m2_assets::model::MODEL_TYPE;
+use m2_assets::model::Material;
 use m2_assets::path::PATH_TYPE;
-use m2_assets::terrain::{CELL_SIZE, TerrainGroup, colour_map_uv};
+use m2_assets::terrain::{CELL_SIZE, TerrainGroup, TerrainMaterial, colour_map_uv};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{BlockContents, Layer, LowResTile, Path, TerrainCell, name_hash};
 use m2_math::glam::{Quat, Vec3};
@@ -30,6 +31,7 @@ use m2_render::{
 
 use crate::assets::{AssetError, AssetSource};
 use crate::physics::CollisionShape;
+use crate::technique::Technique;
 
 /// Side of the island in metres (20 cells of 400 m).
 pub const ISLAND: f32 = 8000.0;
@@ -530,24 +532,92 @@ pub fn square_distance(centre: Vec3, x: f32, z: f32) -> f32 {
     (dx * dx + dz * dz).sqrt()
 }
 
-/// Terrain geometry in a cell's own space, ready to upload: positions,
-/// normals and colour-map coordinates, as a triangle list.
+/// Bytes per [`TerrainMesh`] vertex.
+pub const TERRAIN_STRIDE: usize = 52;
+/// Bytes per vertex of [`simple_layout`].
+pub const SIMPLE_STRIDE: usize = 32;
+
+/// Position, normal and texture coordinate, as `f32`s: the sea and ground
+/// scatter.
+pub fn simple_layout() -> VertexLayout {
+    VertexLayout::packed(&[
+        (VertexSemantic::Position, VertexFormat::Float3),
+        (VertexSemantic::Normal, VertexFormat::Float3),
+        (VertexSemantic::TexCoord(0), VertexFormat::Float2),
+    ])
+    .expect("valid layout")
+}
+
+/// What one range of a terrain mesh is drawn with.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TerrainSurface {
+    /// Ground: the cell's colour map over the whole cell, the shared detail
+    /// texture, and up to four tiled layers weighted by the vertex colour.
+    Ground {
+        colour_map: Option<u32>,
+        detail_map: Option<u32>,
+        /// Texture and its (u, v) rows over cell-space (x, y, z, 1).
+        layers: Vec<(u32, [[f32; 4]; 2])>,
+    },
+    /// Roads, pavements, markings and other pieces laid into the cell,
+    /// shaded like models with their own texture coordinates.
+    Surface(Material),
+}
+
+impl TerrainSurface {
+    /// Textures to load, as (hash, holds data rather than colour, is the
+    /// cell's colour map).
+    pub fn textures(&self) -> Vec<(u32, bool, bool)> {
+        match self {
+            Self::Ground {
+                colour_map,
+                detail_map,
+                layers,
+            } => colour_map
+                .map(|t| (t, false, true))
+                .into_iter()
+                .chain(detail_map.map(|t| (t, false, false)))
+                .chain(layers.iter().map(|&(t, _)| (t, false, false)))
+                .collect(),
+            Self::Surface(m) => crate::model::material_textures(m)
+                .into_iter()
+                .map(|(t, linear)| (t, linear, false))
+                .collect(),
+        }
+    }
+}
+
+/// Terrain geometry in a cell's own space, ready to upload, as a triangle
+/// list grouped by what each part is drawn with.
 #[derive(Clone, Debug, Default)]
 pub struct TerrainMesh {
     /// Where the mesh's origin sits in the world.
     pub origin: Vec3,
-    /// Position, normal, texture coordinate (32 bytes per vertex).
+    /// Position, normal, texture coordinate, colour and tangent
+    /// ([`TerrainMesh::layout`], [`TERRAIN_STRIDE`] bytes per vertex).
     pub vertices: Vec<u8>,
     pub indices: Vec<u32>,
-    /// The colour map to texture it with.
-    pub colour_map: Option<u32>,
-    /// The shared detail texture tiled over it up close (cells only).
-    pub detail_map: Option<u32>,
+    /// What each range is drawn with.
+    pub surfaces: Vec<TerrainSurface>,
+    /// (first index, index count, index into `surfaces`), one per surface
+    /// used, back to back over `indices`.
+    pub ranges: Vec<(u32, u32, usize)>,
     /// Lowest and highest vertex, relative to `origin`.
     pub bounds: (Vec3, Vec3),
     /// The ground surface (without skirts) for collision, relative to
     /// `origin`; built for full-detail cells only.
     pub collision: Option<CollisionShape>,
+}
+
+/// Where a vertex's texture coordinate comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum UvSource {
+    /// The vertex's own (`TEXCOORD0`).
+    Own,
+    /// The cell's colour map over its whole square.
+    CellMap,
+    /// The island-wide map (low-resolution tiles), around `centre`.
+    Island,
 }
 
 impl TerrainMesh {
@@ -556,18 +626,20 @@ impl TerrainMesh {
             (VertexSemantic::Position, VertexFormat::Float3),
             (VertexSemantic::Normal, VertexFormat::Float3),
             (VertexSemantic::TexCoord(0), VertexFormat::Float2),
+            (VertexSemantic::Color, VertexFormat::UNorm4x8),
+            (VertexSemantic::Tangent, VertexFormat::Float4),
         ])
         .expect("valid layout")
     }
 
     pub fn vertex_count(&self) -> u32 {
-        (self.vertices.len() / 32) as u32
+        (self.vertices.len() / TERRAIN_STRIDE) as u32
     }
 
     /// Vertex positions, relative to `origin`.
     pub fn positions(&self) -> Vec<Vec3> {
         self.vertices
-            .chunks_exact(32)
+            .chunks_exact(TERRAIN_STRIDE)
             .map(|v| {
                 let f = |i: usize| f32::from_le_bytes(v[i..i + 4].try_into().expect("4 bytes"));
                 Vec3::new(f(0), f(4), f(8))
@@ -604,15 +676,26 @@ impl TerrainMesh {
         self.indices.iter().flat_map(|i| i.to_le_bytes()).collect()
     }
 
-    /// Appends `group`, offset by `offset` from the mesh origin, with
-    /// texture coordinates from `uv` of the vertex's mesh-space position.
-    fn add_group(&mut self, group: &TerrainGroup<'_>, offset: Vec3, uv: impl Fn(Vec3) -> [f32; 2]) {
+    /// Appends `group`'s vertices, offset by `offset` from the mesh origin,
+    /// with texture coordinates from `uv`; returns the first one's index.
+    fn add_vertices(
+        &mut self,
+        group: &TerrainGroup<'_>,
+        offset: Vec3,
+        uv: impl Fn(Vec3, [f32; 2]) -> [f32; 2],
+    ) -> u32 {
         let positions = group.positions();
-        let normals = group
-            .decl
-            .find(DeclUsage::Normal, 0)
-            .and_then(|e| group.vertices.read(e))
-            .unwrap_or_default();
+        let read = |usage| {
+            group
+                .decl
+                .find(usage, 0)
+                .and_then(|e| group.vertices.read(e))
+                .unwrap_or_default()
+        };
+        let normals = read(DeclUsage::Normal);
+        let own_uvs = read(DeclUsage::TexCoord);
+        let colours = read(DeclUsage::Color);
+        let tangents = read(DeclUsage::Tangent);
         let first = self.vertex_count();
         for (i, p) in positions.iter().enumerate() {
             let pos = Vec3::from(*p) + offset;
@@ -622,38 +705,107 @@ impl TerrainMesh {
                 .unwrap_or(Vec3::Y);
             self.bounds.0 = self.bounds.0.min(pos);
             self.bounds.1 = self.bounds.1.max(pos);
-            let t = uv(pos);
+            let t = uv(pos, own_uvs.get(i).map_or([0.0; 2], |t| [t[0], t[1]]));
             for f in [pos.x, pos.y, pos.z, n.x, n.y, n.z, t[0], t[1]] {
                 self.vertices.extend(f.to_le_bytes());
             }
+            let c = colours.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+            self.vertices
+                .extend(c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
+            let tangent = tangents.get(i).copied().unwrap_or([0.0; 4]);
+            for f in tangent {
+                self.vertices.extend(f.to_le_bytes());
+            }
         }
-        // Full ranges draw the whole group; fall back to the material ranges.
-        let ranges = if group.full_ranges.is_empty() {
-            &group.material_ranges
+        first
+    }
+
+    /// Adds every triangle of `group`, each with the surface its material
+    /// range names (`surface(material index)`), into `buckets` (per
+    /// surface, its triangles); full ranges draw it all with `fallback`
+    /// when the group has no material ranges.
+    #[allow(clippy::too_many_arguments)]
+    fn add_group(
+        &mut self,
+        group: &TerrainGroup<'_>,
+        offset: Vec3,
+        centre: Vec3,
+        surface: impl Fn(u32) -> Option<(usize, UvSource)>,
+        fallback: (usize, UvSource),
+        buckets: &mut HashMap<usize, Vec<u32>>,
+        seen: &mut HashSet<(usize, [u32; 3])>,
+    ) {
+        let count = group.positions().len();
+        let ranges: Vec<_> = if group.material_ranges.is_empty() {
+            group.full_ranges.iter().map(|r| (r, fallback)).collect()
         } else {
-            &group.full_ranges
+            group
+                .material_ranges
+                .iter()
+                .map(|r| (r, surface(r.material).unwrap_or(fallback)))
+                .collect()
         };
-        let mut seen = HashSet::new();
-        for r in ranges {
+        let mut firsts: HashMap<UvSource, u32> = HashMap::new();
+        for (r, (surface, source)) in ranges {
+            let first = *firsts.entry(source).or_insert_with(|| {
+                self.add_vertices(group, offset, |pos, own| match source {
+                    UvSource::Own => own,
+                    UvSource::CellMap => colour_map_uv(pos.x, pos.z),
+                    UvSource::Island => {
+                        let w = pos + centre;
+                        [(ISLAND / 2.0 - w.x) / ISLAND, (ISLAND / 2.0 - w.z) / ISLAND]
+                    }
+                })
+            });
+            let out = buckets.entry(surface).or_default();
             for tri in group.triangles(r) {
+                if tri.iter().any(|&i| usize::from(i) >= count) {
+                    continue;
+                }
+                let tri = tri.map(|i| first + u32::from(i));
                 let mut key = tri;
                 key.sort_unstable();
-                if tri.iter().all(|&i| usize::from(i) < positions.len()) && seen.insert(key) {
-                    self.indices.extend(tri.map(|i| first + u32::from(i)));
+                if seen.insert((surface, key)) {
+                    out.extend(tri);
                 }
             }
+        }
+    }
+
+    /// Lays `buckets` out as `indices` and `ranges`, by surface.
+    fn finish(&mut self, buckets: HashMap<usize, Vec<u32>>) {
+        let mut order: Vec<_> = buckets.into_iter().filter(|b| !b.1.is_empty()).collect();
+        order.sort_unstable_by_key(|b| b.0);
+        for (surface, tris) in order {
+            let first = self.indices.len() as u32;
+            self.indices.extend(&tris);
+            self.ranges.push((first, tris.len() as u32, surface));
         }
     }
 
     /// Hangs a strip `depth` metres deep below every open edge (an edge of
     /// one triangle only), so cracks where neighbouring cells, patches or
     /// detail levels meet show ground instead of sky. Drawn both ways round,
-    /// as the crack may be seen from either side.
+    /// as the crack may be seen from either side. Only ground ranges get
+    /// skirts; they join the first ground range.
     fn add_skirts(&mut self, depth: f32) {
+        let ground: Vec<usize> = self
+            .ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(self.surfaces[r.2], TerrainSurface::Ground { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let Some(&host) = ground.first() else {
+            return;
+        };
         let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
-        for t in self.indices.chunks_exact(3) {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+        for &g in &ground {
+            let (first, count, _) = self.ranges[g];
+            for t in self.indices[first as usize..(first + count) as usize].chunks_exact(3) {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+                }
             }
         }
         let mut open: Vec<(u32, u32)> = edges
@@ -665,8 +817,8 @@ impl TerrainMesh {
         let mut lowered: HashMap<u32, u32> = HashMap::new();
         let mut lower = |mesh: &mut Self, v: u32| {
             *lowered.entry(v).or_insert_with(|| {
-                let at = v as usize * 32;
-                let mut vertex: [u8; 32] = mesh.vertices[at..at + 32].try_into().expect("32 bytes");
+                let at = v as usize * TERRAIN_STRIDE;
+                let mut vertex = mesh.vertices[at..at + TERRAIN_STRIDE].to_vec();
                 let y = f32::from_le_bytes(vertex[4..8].try_into().expect("4 bytes")) - depth;
                 vertex[4..8].copy_from_slice(&y.to_le_bytes());
                 mesh.bounds.0.y = mesh.bounds.0.y.min(y);
@@ -674,20 +826,58 @@ impl TerrainMesh {
                 mesh.vertex_count() - 1
             })
         };
+        let mut skirt = Vec::new();
         for (a, b) in open {
             let (la, lb) = (lower(self, a), lower(self, b));
-            self.indices
-                .extend([a, b, lb, a, lb, la, a, lb, b, a, la, lb]);
+            skirt.extend([a, b, lb, a, lb, la, a, lb, b, a, la, lb]);
+        }
+        // Insert after the host range and shift the ranges behind it.
+        let (first, count, _) = self.ranges[host];
+        let at = (first + count) as usize;
+        let added = skirt.len() as u32;
+        self.indices.splice(at..at, skirt);
+        self.ranges[host].1 += added;
+        for r in self.ranges.iter_mut().skip(host + 1) {
+            r.0 += added;
         }
     }
 
-    fn empty(origin: Vec3, colour_map: Option<u32>) -> Self {
+    fn empty(origin: Vec3) -> Self {
         Self {
             origin,
-            colour_map,
             bounds: (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
             ..Self::default()
         }
+    }
+}
+
+/// The surface a cell material draws with: ground for the terrain
+/// shaders (or an unknown technique), a model-style surface otherwise.
+fn cell_surface(m: &TerrainMaterial) -> TerrainSurface {
+    let terrain = Technique::from_hash(m.material.technique).map_or(Some(0), |t| t.terrain_layers);
+    match terrain {
+        Some(layers) => {
+            let slot = |i: usize| m.material.textures.get(i).copied().filter(|&t| t != 0);
+            TerrainSurface::Ground {
+                colour_map: slot(0),
+                detail_map: slot(1),
+                layers: (0..usize::from(layers).min(4))
+                    .filter_map(|l| {
+                        let rows = &m.uv[l];
+                        slot(2 + l * 2).map(|t| {
+                            (
+                                t,
+                                [
+                                    [rows[0], rows[1], rows[2], rows[3]],
+                                    [rows[4], rows[5], rows[6], rows[7]],
+                                ],
+                            )
+                        })
+                    })
+                    .collect(),
+            }
+        }
+        None => TerrainSurface::Surface(m.material.clone()),
     }
 }
 
@@ -702,19 +892,44 @@ pub fn terrain_cell<R: Read + Seek>(
         hash,
         message: e.to_string(),
     })?;
-    let mut mesh = TerrainMesh::empty(centre, cell.colour_map());
-    // Texture slot 1 of the cell's material, by the format notes.
-    mesh.detail_map = cell
-        .materials
-        .first()
-        .and_then(|m| m.material.textures.get(1).copied())
-        .filter(|&t| t != 0);
+    let mut mesh = TerrainMesh::empty(centre);
+    mesh.surfaces = cell.materials.iter().map(cell_surface).collect();
+    // Groups drawn without a material range use the cell's plain ground.
+    let fallback = mesh.surfaces.len();
+    mesh.surfaces.push(TerrainSurface::Ground {
+        colour_map: cell.colour_map(),
+        detail_map: cell
+            .materials
+            .first()
+            .and_then(|m| m.material.textures.get(1).copied())
+            .filter(|&t| t != 0),
+        layers: Vec::new(),
+    });
+    let sources: Vec<UvSource> = mesh
+        .surfaces
+        .iter()
+        .map(|s| match s {
+            TerrainSurface::Ground { .. } => UvSource::CellMap,
+            TerrainSurface::Surface(_) => UvSource::Own,
+        })
+        .collect();
+    let mut buckets = HashMap::new();
+    let mut seen = HashSet::new();
     for patch in &cell.patches {
         let offset = Vec3::from(patch.offset);
         for g in &patch.groups {
-            mesh.add_group(g, offset, |p| colour_map_uv(p.x, p.z));
+            mesh.add_group(
+                g,
+                offset,
+                centre,
+                |m| sources.get(m as usize).map(|&s| (m as usize, s)),
+                (fallback, UvSource::CellMap),
+                &mut buckets,
+                &mut seen,
+            );
         }
     }
+    mesh.finish(buckets);
     mesh.build_collision();
     mesh.add_skirts(CELL_SKIRT);
     Ok(mesh)
@@ -737,12 +952,24 @@ pub fn low_res_tile<R: Read + Seek>(
         .first()
         .and_then(|m| m.textures.first().copied())
         .filter(|&t| t != 0);
-    let mut mesh = TerrainMesh::empty(centre, map);
-    // The island map follows the cell maps' axes at island scale.
-    mesh.add_group(&tile.group, Vec3::ZERO, |p| {
-        let w = p + centre;
-        [(ISLAND / 2.0 - w.x) / ISLAND, (ISLAND / 2.0 - w.z) / ISLAND]
+    let mut mesh = TerrainMesh::empty(centre);
+    mesh.surfaces.push(TerrainSurface::Ground {
+        colour_map: map,
+        detail_map: None,
+        layers: Vec::new(),
     });
+    let mut buckets = HashMap::new();
+    // The island map follows the cell maps' axes at island scale.
+    mesh.add_group(
+        &tile.group,
+        Vec3::ZERO,
+        centre,
+        |_| Some((0, UvSource::Island)),
+        (0, UvSource::Island),
+        &mut buckets,
+        &mut HashSet::new(),
+    );
+    mesh.finish(buckets);
     mesh.add_skirts(TILE_SKIRT);
     Ok(mesh)
 }
@@ -762,18 +989,27 @@ mod tests {
 
     #[test]
     fn skirts_hang_below_open_edges_only() {
-        let mut mesh = TerrainMesh::empty(Vec3::ZERO, None);
+        let mut mesh = TerrainMesh::empty(Vec3::ZERO);
+        mesh.surfaces.push(TerrainSurface::Ground {
+            colour_map: None,
+            detail_map: None,
+            layers: Vec::new(),
+        });
         // Two triangles sharing the edge 0-2: four open edges.
         for (x, z) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
             for f in [x, 2.0, z, 0.0, 1.0, 0.0, 0.0, 0.0] {
                 mesh.vertices.extend(f.to_le_bytes());
             }
+            mesh.vertices.extend([255, 0, 0, 0]);
+            mesh.vertices.extend([0u8; 16]);
         }
         mesh.indices = vec![0, 1, 2, 0, 2, 3];
+        mesh.ranges = vec![(0, 6, 0)];
         mesh.bounds = (Vec3::new(0.0, 2.0, 0.0), Vec3::new(1.0, 2.0, 1.0));
         mesh.add_skirts(4.0);
         assert_eq!(mesh.vertex_count(), 8);
         assert_eq!(mesh.indices.len(), 6 + 4 * 12);
+        assert_eq!(mesh.ranges, vec![(0, 6 + 4 * 12, 0)]);
         assert_eq!(mesh.bounds.0.y, -2.0);
         assert!(mesh.indices.iter().all(|&i| i < 8));
     }

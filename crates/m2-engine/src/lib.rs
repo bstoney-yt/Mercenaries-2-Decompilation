@@ -6,6 +6,7 @@
 //! - [`model`]: models and their textures uploaded to a render backend.
 //! - [`world`]: the island's layout and its terrain as meshes.
 //! - [`stream`]: a loader thread and the streamed island around the camera.
+//! - [`technique`]: what each material shader does, by its id.
 //!
 //! The original plan put raw `#[repr(C)]` mirrors of the executable's
 //! classes here for hooking. The engine code is encrypted and can't be
@@ -19,6 +20,7 @@ pub mod model;
 pub mod physics;
 pub mod scatter;
 pub mod stream;
+pub mod technique;
 pub mod vehicle;
 pub mod world;
 
@@ -30,5 +32,6 @@ pub use physics::{
     Character, CollisionShape, Physics, RagdollId, StaticKey, VehicleControls, VehicleId,
 };
 pub use stream::{Frustum, World, WorldSettings, WorldStats};
+pub use technique::Technique;
 pub use vehicle::{Catalogue, CatalogueEntry, PersonModel, VehicleSpec};
 pub use world::{TemplateInfo, TemplatePlacement, Templates, VehicleKind, WorldIndex};
