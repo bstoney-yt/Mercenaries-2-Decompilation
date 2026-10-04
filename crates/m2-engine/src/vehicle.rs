@@ -212,6 +212,10 @@ pub const GUN_MUZZLE: u32 = 0xb148_6ef3;
 /// intact and the wrecked turret hang from it.
 pub const TURRET_MOUNT: u32 = 0xc851_b695;
 
+/// The turret itself, under its mount, with its origin on the turret
+/// ring's middle (the M1A1's, the Stryker's).
+pub const TURRET: u32 = 0x7707_65e4;
+
 impl VehicleSpec {
     /// Reads `model`'s wheels and markers. `None` for a ground vehicle
     /// whose wheels can't be found.
@@ -249,10 +253,19 @@ impl VehicleSpec {
         };
         let mut road_wheels = Vec::new();
         let wheels: Vec<WheelSpec> = if usable && !tracked {
-            let front = found
+            let (back, front) = found
                 .iter()
                 .map(|w| w.centre[2])
-                .fold(f32::NEG_INFINITY, f32::max);
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), z| {
+                    (lo.min(z), hi.max(z))
+                });
+            // The front axle steers; with more than two axles (the
+            // Stryker's four), those ahead of the middle.
+            let steering = if found.len() > 4 {
+                0.5 * (front + back)
+            } else {
+                front - 0.3
+            };
             for (i, w) in found.iter().enumerate() {
                 mark(i, &w.nodes);
             }
@@ -262,7 +275,7 @@ impl VehicleSpec {
                     centre: Vec3::from(w.centre),
                     radius: w.radius,
                     width: w.width,
-                    steers: w.centre[2] >= front - 0.3,
+                    steers: w.centre[2] >= steering,
                 })
                 .collect()
         } else if tracked {
@@ -310,22 +323,33 @@ impl VehicleSpec {
         } else {
             Vec::new()
         };
-        // Some mounts sit away from their turret (the Stryker's, off the
-        // ring): turn about the middle of the turret's biggest part instead.
-        let pivot = mount.and_then(|m| {
-            let at = model.node_to_model(m as u16)?.w_axis.truncate();
-            let b = boxes.iter().filter(|b| on_turret(b.node)).max_by(|a, b| {
-                let area = |b: &vehicle::NodeBox| (b.max[0] - b.min[0]) * (b.max[2] - b.min[2]);
-                area(a).total_cmp(&area(b))
-            })?;
-            let inside =
-                (b.min[0]..=b.max[0]).contains(&at.x) && (b.min[2]..=b.max[2]).contains(&at.z);
-            (!inside).then(|| {
-                Vec3::new(
-                    (b.min[0] + b.max[0]) * 0.5,
-                    at.y,
-                    (b.min[2] + b.max[2]) * 0.5,
-                )
+        // The turret part's own node sits where it turns (the M1A1's and
+        // the Stryker's); some mounts sit away from it (the Stryker's is
+        // at the hull's origin, off the ring). Without that node, a mount
+        // off the turret turns it about the middle of its biggest part.
+        let ring = model
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(i, n)| n.name_hash == TURRET && on_turret(*i as u16))
+            .and_then(|(i, _)| model.node_to_model(i as u16))
+            .map(|m| m.w_axis.truncate());
+        let pivot = ring.or_else(|| {
+            mount.and_then(|m| {
+                let at = model.node_to_model(m as u16)?.w_axis.truncate();
+                let b = boxes.iter().filter(|b| on_turret(b.node)).max_by(|a, b| {
+                    let area = |b: &vehicle::NodeBox| (b.max[0] - b.min[0]) * (b.max[2] - b.min[2]);
+                    area(a).total_cmp(&area(b))
+                })?;
+                let inside =
+                    (b.min[0]..=b.max[0]).contains(&at.x) && (b.min[2]..=b.max[2]).contains(&at.z);
+                (!inside).then(|| {
+                    Vec3::new(
+                        (b.min[0] + b.max[0]) * 0.5,
+                        at.y,
+                        (b.min[2] + b.max[2]) * 0.5,
+                    )
+                })
             })
         });
         let muzzle = model

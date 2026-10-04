@@ -1153,7 +1153,7 @@ fn drive_for_screenshot(
                 m2_math::glam::Vec2::ZERO
             };
             let trigger = combat::Trigger {
-                fire: options.fire && i == 87,
+                fire: options.fire && i == 89,
                 ..combat::Trigger::default()
             };
             game.step(
