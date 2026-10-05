@@ -19,6 +19,7 @@ pub mod model;
 pub mod physics;
 pub mod scatter;
 pub mod stream;
+pub mod tuning;
 pub mod vehicle;
 pub mod world;
 
@@ -30,5 +31,6 @@ pub use physics::{
     Character, CollisionShape, Physics, RagdollId, StaticKey, VehicleControls, VehicleId,
 };
 pub use stream::{Frustum, World, WorldSettings, WorldStats};
+pub use tuning::VehicleTuning;
 pub use vehicle::{Catalogue, CatalogueEntry, PersonModel, Rest, VehicleSpec};
 pub use world::{TemplateInfo, TemplatePlacement, Templates, VehicleKind, WorldIndex};

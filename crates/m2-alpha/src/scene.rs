@@ -934,10 +934,18 @@ impl Scene {
         self.materials
             .load_textures(backend, source, cpu.texture_hashes().collect::<Vec<_>>())?;
         let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
+        // What its template says of its handling and its gun.
+        let tune = |spec: VehicleSpec| {
+            let t = self
+                .world
+                .as_ref()
+                .and_then(|w| w.index.template_db.tuning_for_model(spec.model));
+            spec.tuned(t)
+        };
         match loaded {
             Loaded::Catalogue(_) => {}
             Loaded::Vehicle(spec, _) => self.vehicles.push(ParkedVehicle {
-                spec,
+                spec: tune(spec),
                 model,
                 id: None,
                 wrecked: false,
@@ -950,7 +958,7 @@ impl Scene {
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
                 self.vehicles.push(ParkedVehicle {
-                    spec,
+                    spec: tune(spec),
                     model,
                     id: None,
                     wrecked: false,
@@ -963,7 +971,7 @@ impl Scene {
             }
             Loaded::WorldVehicle(entity, at, yaw, spec, _) => {
                 self.vehicles.push(ParkedVehicle {
-                    spec,
+                    spec: tune(spec),
                     model,
                     id: None,
                     wrecked: false,

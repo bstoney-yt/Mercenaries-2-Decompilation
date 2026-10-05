@@ -47,10 +47,16 @@ const FLASH_TIME: f32 = 0.05;
 const RIFLE_FLASH: f32 = 0.3;
 const RPG_FLASH: f32 = 0.7;
 const MG_FLASH: f32 = 0.45;
-const CANNON_FLASH: f32 = 2.2;
-/// Vehicle guns: a tank's cannon (seconds to reload, shell speed m/s)
-/// and the machine gun on anything else with a turret (seconds between
-/// rounds, damage, range). Invented, like the rest of the rules.
+/// A tank's main gun: a plume and a fireball about as wide as its turret,
+/// burning as long as its template's muzzle flash (0.3 s for the AMX-30's,
+/// as in the Xbox 360 playthrough) or this long.
+const CANNON_FLASH: f32 = 5.0;
+const CANNON_FIREBALL: f32 = 1.6;
+const CANNON_FLASH_TIME: f32 = 0.3;
+/// Vehicle guns: a tank's cannon (seconds to reload, shell speed m/s,
+/// where its template gives no rate of fire or ammunition) and the
+/// machine gun on anything else with a turret (seconds between rounds,
+/// damage, range). Invented, like the rest of the rules.
 const CANNON_RELOAD: f32 = 2.5;
 /// A turret's gun fires at the crosshair when it points within this of
 /// it, radians; else along its barrel.
@@ -898,6 +904,7 @@ impl Combat {
             return;
         };
         let cannon = v.spec.kind == "tank";
+        let gun = v.spec.tuning.gun;
         let (from, barrel) = v
             .spec
             .muzzle_pose(v.turret, v.gun)
@@ -916,10 +923,14 @@ impl Combat {
             barrel
         };
         if cannon {
-            self.reload = CANNON_RELOAD;
+            // Its template's rate of fire (45 a minute for the AMX-30's)
+            // and shell speed (72 m/s).
+            self.reload = gun.map_or(CANNON_RELOAD, |g| 60.0 / g.rate_of_fire.max(1.0));
+            let speed = gun.map_or(SHELL_SPEED, |g| g.velocity.max(1.0));
+            let burn = gun.and_then(|g| g.flash).unwrap_or(CANNON_FLASH_TIME);
             self.projectiles.push(Projectile::Rocket {
                 at: from,
-                velocity: aim * SHELL_SPEED,
+                velocity: aim * speed,
                 flown: 0.0,
                 shell: true,
                 owner: Some(id),
@@ -930,7 +941,14 @@ impl Combat {
                     dir: aim,
                     size: CANNON_FLASH,
                 },
-                FLASH_TIME * 2.0,
+                burn,
+            );
+            self.effect(
+                Effect::Fire {
+                    at: from + aim * 0.8,
+                    size: CANNON_FIREBALL,
+                },
+                burn,
             );
             self.effect(
                 Effect::Smoke {

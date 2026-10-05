@@ -30,6 +30,7 @@ use m2_render::{
 
 use crate::assets::{AssetError, AssetSource};
 use crate::physics::CollisionShape;
+use crate::tuning::VehicleTuning;
 
 /// Side of the island in metres (20 cells of 400 m).
 pub const ISLAND: f32 = 8000.0;
@@ -125,6 +126,8 @@ pub struct Templates {
     /// set): the id an entity's [`parent`](m2_assets::layer::Placement::parent)
     /// gives.
     pub names: HashMap<u32, String>,
+    /// How the templates that say so handle and fight, by id.
+    pub tuning: HashMap<u32, VehicleTuning>,
 }
 
 impl Templates {
@@ -139,6 +142,20 @@ impl Templates {
     pub fn by_id(&self, id: u32) -> Option<(&str, &TemplateInfo)> {
         let name = self.names.get(&id)?;
         Some((name, self.by_name.get(&name.to_ascii_lowercase())?))
+    }
+
+    /// The tuning of the first template of `model` (by name) that has
+    /// any: a model's templates are variants that share it (the AMX-30's
+    /// with and without a driver, for the scripts or the player).
+    pub fn tuning_for_model(&self, model: u32) -> Option<VehicleTuning> {
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        ids.iter().find_map(|(_, id)| self.tuning.get(id).copied())
     }
 
     /// The engine sound bank most templates of `model` use (a model's
@@ -224,6 +241,7 @@ impl Templates {
                 .into_iter()
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
+            tuning: crate::tuning::read(&db),
         }
     }
 }
@@ -999,6 +1017,7 @@ mod tests {
                 ("hmmwv".to_owned(), t(2, None)),
             ]),
             names: HashMap::from([(0x8000_0001, "Valiant (Python)".to_owned())]),
+            tuning: HashMap::new(),
         };
         assert_eq!(
             db.by_id(0x8000_0001).map(|(n, _)| n),
