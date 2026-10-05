@@ -31,6 +31,8 @@ pub struct LayerEntity {
     pub name: String,
     pub position: Vec3,
     pub yaw: f32,
+    /// The layer it is in (`vz_state_alljob002_02_staging`).
+    pub layer: String,
 }
 
 /// What the start-up loaded.
@@ -129,6 +131,7 @@ fn run(data: GameData) -> Result<StartupLayers, m2_game::mission::MissionError> 
             name: member_stem(&e.name).to_owned(),
             position: Vec3::from(e.at),
             yaw: e.yaw,
+            layer: name.clone(),
         }));
     }
     Ok(set)

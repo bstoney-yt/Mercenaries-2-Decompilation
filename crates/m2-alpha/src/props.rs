@@ -78,6 +78,11 @@ pub struct Props {
     pub sturdy: HashSet<u32>,
     /// What of those broken apart is drawn (the gate test's pictures).
     pub parts: Parts,
+    /// One left undrawn (the gate test's picture of what else stands
+    /// where a gate does).
+    pub skip: Option<u32>,
+    /// The layer that put each up, by entity (the gate test's lists).
+    layers: HashMap<u32, Arc<str>>,
 }
 
 /// What [`Props::draw`] draws of a model broken apart.
@@ -190,6 +195,19 @@ impl Props {
             self.loaders = Some(Loaders::start(install));
         }
         added
+    }
+
+    /// Notes that `layer` puts up `entities`.
+    pub fn note_layer(&mut self, entities: impl IntoIterator<Item = u32>, layer: &str) {
+        let layer: Arc<str> = layer.into();
+        for e in entities {
+            self.layers.insert(e, layer.clone());
+        }
+    }
+
+    /// The layer that put `entity` up, if one was noted.
+    pub fn layer(&self, entity: u32) -> Option<&str> {
+        self.layers.get(&entity).map(|l| &**l)
     }
 
     /// Takes down those of `entities` that are shown (their loose pieces
@@ -425,6 +443,69 @@ impl Props {
         Some(local.cmpge(lo - pad).all() && local.cmple(hi + pad).all())
     }
 
+    /// Where `entity` stands and its model's box (model space); `None`
+    /// unless it is shown and its model has loaded.
+    pub fn placed_bounds(&self, entity: u32) -> Option<(Mat4, (Vec3, Vec3))> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        Some((
+            Mat4::from_rotation_translation(p.rotation, p.position),
+            m.gpu.bounds,
+        ))
+    }
+
+    /// The other shown props whose boxes meet `entity`'s (the gate test
+    /// lists what else stands at a gate), biggest first: each one's
+    /// entity, how much of its box is inside `entity`'s (0 to 1), and a
+    /// line on it: its model, the layer that put it up, where it stands,
+    /// its box (world axes), that share, and whether it is wrecked or in
+    /// the way.
+    pub fn others_in_box(&self, physics: &Physics, entity: u32) -> Vec<(u32, f32, String)> {
+        let world_box = |e: u32| {
+            self.placed_bounds(e)
+                .map(|(at, bounds)| box_around(at, bounds))
+        };
+        let Some((lo, hi)) = world_box(entity) else {
+            return Vec::new();
+        };
+        let volume = |v: Vec3| v.x.max(0.01) * v.y.max(0.01) * v.z.max(0.01);
+        let mut out: Vec<(f32, u32, f32, String)> = self
+            .shown
+            .iter()
+            .filter(|&(&e, _)| e != entity)
+            .filter_map(|(&e, p)| {
+                let (a, b) = world_box(e)?;
+                let (c, d) = (a.max(lo), b.min(hi));
+                if !c.cmplt(d).all() {
+                    return None;
+                }
+                let size = b - a;
+                let share = volume(d - c) / volume(size);
+                let line = format!(
+                    "{e:#x} ({:08x}) of {} at {:.1}, {:.1}x{:.1}x{:.1} m, {:.0}% inside{}{}",
+                    p.model,
+                    self.layer(e).unwrap_or("no layer noted"),
+                    p.position,
+                    size.x,
+                    size.y,
+                    size.z,
+                    share * 100.0,
+                    if p.wrecked { ", wrecked" } else { "" },
+                    if physics.has_static(StaticKey::Entity(e)) {
+                        ", in the way"
+                    } else {
+                        ""
+                    }
+                );
+                Some((volume(size), e, share, line))
+            })
+            .collect();
+        out.sort_by(|a, b| b.0.total_cmp(&a.0));
+        out.into_iter()
+            .map(|(_, e, share, line)| (e, share, line))
+            .collect()
+    }
+
     /// The middle of `entity`'s model's box in the world; `None` unless it
     /// is shown and its model has loaded.
     pub fn centre(&self, entity: u32) -> Option<Vec3> {
@@ -592,6 +673,44 @@ impl Props {
             ids.len(),
             each.join("; ")
         ))
+    }
+
+    /// `entity`'s pieces still within `within` metres of where they
+    /// started since it broke apart, each with the statics it touches (the
+    /// gate test asks what holds them): its node, then those.
+    pub fn pieces_held(
+        &self,
+        physics: &Physics,
+        entity: u32,
+        within: f32,
+    ) -> Vec<(i32, Vec<StaticKey>)> {
+        let (Some(p), Some(ids)) = (self.shown.get(&entity), self.broken.get(&entity)) else {
+            return Vec::new();
+        };
+        let Some(breakup) = self
+            .models
+            .get(&p.model)
+            .and_then(Option::as_ref)
+            .and_then(|m| m.breakup.as_deref())
+        else {
+            return Vec::new();
+        };
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let starts = breakup.pieces.starts(placed);
+        breakup
+            .pieces
+            .pieces
+            .iter()
+            .zip(&starts)
+            .zip(ids)
+            .filter_map(|((piece, &start), &id)| {
+                let now = physics.debris_place(id)?;
+                let moved =
+                    box_middle(&corners(now, piece)).distance(box_middle(&corners(start, piece)));
+                (moved < within)
+                    .then(|| (piece.node.map_or(-1, i32::from), physics.debris_statics(id)))
+            })
+            .collect()
     }
 
     /// `entity`'s, if it is shown, and whether its model has loaded.
@@ -798,6 +917,9 @@ impl Props {
             let Some(Some(m)) = self.models.get(&p.model) else {
                 continue;
             };
+            if self.skip == Some(*e) {
+                continue;
+            }
             let moved = match (self.broken.get(e), self.knocked.get(e)) {
                 (Some(pieces), _) => Some((m.breakup.as_deref().map(|b| &b.pieces), pieces)),
                 (None, Some(pieces)) => Some((self.loose(*e), pieces)),
@@ -1027,6 +1149,19 @@ fn corners(at: Mat4, piece: &m2_engine::LoosePiece) -> [Vec3; 8] {
         let pick = |bit: usize| if k & bit == 0 { -1.0 } else { 1.0 };
         at.transform_point3(centre + half * Vec3::new(pick(1), pick(2), pick(4)))
     })
+}
+
+/// The world box round the model box `lo` to `hi` placed at `at`.
+fn box_around(at: Mat4, (lo, hi): (Vec3, Vec3)) -> (Vec3, Vec3) {
+    (0..8)
+        .map(|i| {
+            at.transform_point3(Vec3::new(
+                if i & 1 == 0 { lo.x } else { hi.x },
+                if i & 2 == 0 { lo.y } else { hi.y },
+                if i & 4 == 0 { lo.z } else { hi.z },
+            ))
+        })
+        .fold((Vec3::MAX, Vec3::MIN), |(a, b), c| (a.min(c), b.max(c)))
 }
 
 /// The middle of a box with these `corners`.
