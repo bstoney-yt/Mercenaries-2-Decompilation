@@ -88,6 +88,9 @@
 //!                           whose values name bank sounds or clip cues;
 //!                           templates named like a cue; and how many of
 //!                           each bank's sounds the database names
+//! soundkeys                 every distinct `SoundKey` the templates give
+//!                           (hash, name), with how many templates give it
+//!                           and one of them
 //! strings:<word>[,..]       the scripts' string constants holding a word,
 //!                           by script (hash, name if known, how many
 //!                           strings it has, the globals it sets), each
@@ -683,6 +686,7 @@ fn main() -> Result<(), Error> {
             "banks" => banks(&mut source, &names),
             "sounds" => sounds(&mut source, &names, arg),
             "hashes" => hashes(&mut source, &names, arg),
+            "soundkeys" => soundkeys(&mut source, &names),
             "rig" => rig(&mut source, &names, hex(arg).unwrap_or(DEFAULT_MODEL)),
             "weapons" => weapons(&mut source, &mut lazy, &names),
             "clips" => clips(&mut source, &names, arg),
@@ -1568,6 +1572,54 @@ const SOUND_MATERIALS: [&str; 12] = [
 /// as `bank#index length`; every component whose values name bank sounds
 /// or the clips' sound events; and how many of each bank's sounds the
 /// database names.
+fn soundkeys<R: Read + Seek>(source: &mut AssetSource<R>, names: &Names) -> Result<(), Error> {
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let tnames = db.names();
+    let key = m2_assets::name_hash("SoundKey");
+    // Each value: how many templates give it, and the first by name.
+    let mut found: BTreeMap<u32, (usize, &str)> = BTreeMap::new();
+    for c in db.components.iter().filter(|c| c.name == "SoundKey") {
+        let Some(f) = c.fields.iter().find(|f| f.name_hash == key) else {
+            continue;
+        };
+        let at = usize::from(f.offset);
+        for (id, r) in c.records().unwrap_or_default() {
+            let Some(bytes) = r.get(at..at + 4) else {
+                continue;
+            };
+            let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            if v == 0 {
+                continue;
+            }
+            let name = tnames.get(&id).copied().unwrap_or("?");
+            let e = found.entry(v).or_insert((0, name));
+            e.0 += 1;
+            e.1 = e.1.min(name);
+        }
+    }
+    let mut list: Vec<(&str, u32, usize, &str)> = found
+        .into_iter()
+        .map(|(v, (n, t))| (names.show(v), v, n, t))
+        .collect();
+    list.sort();
+    println!("{} sound keys", list.len());
+    for (name, v, n, t) in list {
+        println!("  {v:08x} {name} {n} ({t})");
+    }
+    Ok(())
+}
+
 fn sounddb<R: Read + Seek>(
     source: &mut AssetSource<R>,
     names: &Names,
