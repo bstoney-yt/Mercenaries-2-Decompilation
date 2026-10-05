@@ -1053,6 +1053,7 @@ fn mission_for_screenshot(
                 "; the contract was not completed"
             }
         );
+        look_at_story_character(game);
     }
     while let Some(world) = &game.scene.world {
         let waiting = game.scene.player.as_ref().is_some_and(|p| !p.landed);
@@ -1083,6 +1084,39 @@ fn mission_for_screenshot(
         eprintln!("mission: {line}");
     }
     Ok(link)
+}
+
+/// Turns the camera onto the nearest story character within 40 m (the
+/// last picture shows them), saying whether anything stands between.
+fn look_at_story_character(game: &mut Game) {
+    let here = game.focus();
+    let people = &game.scene.people;
+    let Some((name, chest)) = people
+        .npcs
+        .iter()
+        .filter(|n| people.kinds.get(n.kind).is_some_and(|k| k.named))
+        .map(|n| (people.kinds[n.kind].role.clone(), n.chest()))
+        .filter(|(_, c)| c.distance(here) < 40.0)
+        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+    else {
+        eprintln!("autoplay: no story character within 40 m");
+        return;
+    };
+    aim_at(game, chest);
+    let (Some(world), Some(p)) = (&game.scene.world, &game.scene.player) else {
+        return;
+    };
+    let eye = p.eye();
+    let to = chest - eye;
+    let between = world
+        .physics
+        .cast_ray_keyed(eye, to, to.length())
+        .map(|(d, _, key)| format!("{} at {d:.1} m", static_name(world, key)));
+    eprintln!(
+        "autoplay: looking at {name} at {chest:.1}, {:.1} m from the camera; in the way: {}",
+        to.length(),
+        between.as_deref().unwrap_or("nothing")
+    );
 }
 
 /// Waits for the parked vehicles, gets in the nearest and drives it

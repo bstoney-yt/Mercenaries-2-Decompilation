@@ -229,6 +229,12 @@ const TRACK_TURN: f32 = 0.9;
 /// and backwards.
 const TOP_SPEED: f32 = 30.0;
 const REVERSE_SPEED: f32 = 8.0;
+/// The steepest hill a vehicle takes about as fast as the flat, radians,
+/// wheeled and tracked: uphill the engine pulls as a lower gear would
+/// (invented; the playthrough's jeep and tank take the hill roads at
+/// speed). Steeper than this, it slows and in the end slides back.
+const CLIMB: f32 = 0.52;
+const CLIMB_TRACKED: f32 = 0.61;
 
 /// A vehicle in the physics world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -582,6 +588,12 @@ impl Physics {
         };
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
+        // How steeply its nose points up (the sine).
+        let nose = self
+            .world
+            .bodies
+            .get(v.controller.chassis)
+            .map_or(0.0, |b| (b.position().rotation * r::Vector::Z).y);
         // A wheel's brake is the most impulse it may take off per step:
         // this many m/s² over the whole vehicle.
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
@@ -595,6 +607,10 @@ impl Physics {
             (v.top * 0.5).min(REVERSE_SPEED)
         };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
+        // Uphill (the way it is driven), the pull that holds it as on the
+        // flat, up to its steepest hill.
+        let most = if v.tracked { CLIMB_TRACKED } else { CLIMB };
+        let uphill = (nose * throttle.signum()).clamp(0.0, most.sin());
         let (force, brake) = if controls.parked {
             let hard = if speed.abs() > PARKED_FAST {
                 HOLD
@@ -607,7 +623,8 @@ impl Physics {
         } else if against {
             (0.0, slowing(SERVICE_BRAKE * throttle.abs()))
         } else if throttle != 0.0 {
-            (throttle * v.mass * 4.0 * headroom / wheels, 0.0)
+            let pull = 4.0 * headroom + GRAVITY * uphill;
+            (throttle * v.mass * pull / wheels, 0.0)
         } else if speed.abs() < 1.0 {
             (0.0, slowing(HOLD))
         } else {
@@ -1317,6 +1334,50 @@ mod tests {
         }
         let up = p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
         assert!(up.y > 0.7, "rolled: {up}");
+    }
+
+    // Up a 20° hill from a standstill, a car gets going about as it does
+    // on the flat (a hill road in the playthrough is taken at speed).
+    #[test]
+    fn cars_climb_a_steep_hill_at_speed() {
+        let mut p = Physics::new();
+        let half = 200.0;
+        let v = [
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(-half, 0.0, half),
+        ];
+        let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        // Rising to +z.
+        let slope = 20f32.to_radians();
+        p.add_static(
+            StaticKey::Cell(1),
+            &shape,
+            Vec3::ZERO,
+            Quat::from_rotation_x(-slope),
+        );
+        p.step(DT);
+        let spec = car();
+        let ground = |at: Vec3| {
+            p.cast_ray(Vec3::new(at.x, 80.0, at.z), Vec3::NEG_Y, 200.0)
+                .map(|(d, _)| 80.0 - d)
+        };
+        let rest = spec.rest_on(Vec3::ZERO, 0.0, ground).unwrap();
+        let id = p.add_vehicle_turned(&spec, rest.position + Vec3::Y * 0.2, rest.rotation);
+        for _ in 0..360 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        // It crawled at 2 m/s before the engine pulled harder uphill.
+        let speed = p.vehicle_speed(id);
+        assert!(speed > 12.0, "{speed} m/s");
     }
 
     #[test]
