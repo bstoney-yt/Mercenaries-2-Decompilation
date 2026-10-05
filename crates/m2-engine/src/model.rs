@@ -343,6 +343,33 @@ impl MaterialCache {
         } else {
             desc
         };
+        // `M2_MATERIAL_DUMP=<hex>,...`: those materials' records and what
+        // they draw with, each time one is built.
+        if std::env::var("M2_MATERIAL_DUMP").is_ok_and(|v| {
+            v.split(',')
+                .any(|h| u32::from_str_radix(h.trim(), 16) == Ok(material.name_hash))
+        }) {
+            eprintln!(
+                "material dump {:08x}: technique {:08x} {:?}, flags {:04x}, textures {:08x?} (have {:?}), constants {:?}{}\n  draws with {:?}",
+                material.name_hash,
+                material.technique,
+                technique,
+                material.flags,
+                material.textures,
+                material
+                    .textures
+                    .iter()
+                    .map(|&t| t != 0 && self.has_texture(t))
+                    .collect::<Vec<_>>(),
+                material.constants,
+                if depth_bias {
+                    " (terrain cell mesh)"
+                } else {
+                    ""
+                },
+                desc
+            );
+        }
         let id = self.define(backend, &desc)?;
         if material_textures(material)
             .iter()
