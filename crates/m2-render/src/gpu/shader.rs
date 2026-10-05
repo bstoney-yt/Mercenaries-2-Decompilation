@@ -22,7 +22,7 @@ struct Frame {
     ambient_cube: array<vec4<f32>, 6>,
     // rgb: rim light colour, a: how far a surface turns away before it shows
     rim: vec4<f32>,
-    // The way the camera looks
+    // xyz: the way the camera looks, w: seconds (animation)
     view_dir: vec4<f32>,
     // World to each sun shadow cascade's clip space
     shadow: array<mat4x4<f32>, 4>,
@@ -64,6 +64,8 @@ struct Material {
     // x: reflection strength (0: none), y: Fresnel reflectance facing the
     // eye (negative: no Fresnel), z: takes the rim light
     reflection: vec4<f32>,
+    // x: open water
+    water: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -148,6 +150,36 @@ fn sunlight(p: vec3<f32>, n: vec3<f32>) -> f32 {
     return mix(1.0, lit / 9.0, fade);
 }
 
+// The sea's waves: direction (radians), wavelength and amplitude (metres).
+// The game's water shader sums eight such waves (two sets of four) whose
+// constants its code sets at run time; these are invented to look calm.
+var<private> WAVES: array<vec3<f32>, 8> = array<vec3<f32>, 8>(
+    vec3<f32>(0.3, 31.0, 0.35),
+    vec3<f32>(0.9, 19.0, 0.2),
+    vec3<f32>(-0.4, 12.0, 0.12),
+    vec3<f32>(1.6, 7.3, 0.07),
+    vec3<f32>(0.1, 4.1, 0.04),
+    vec3<f32>(2.4, 2.6, 0.025),
+    vec3<f32>(-1.1, 1.6, 0.015),
+    vec3<f32>(0.7, 0.9, 0.008),
+);
+
+// The sea's normal at p (world x, z) after t seconds. Waves too short for
+// a pixel `footprint` metres wide fade out, as the game's do.
+fn sea_normal(p: vec2<f32>, t: f32, footprint: f32) -> vec3<f32> {
+    var slope = vec2<f32>(0.0);
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let w = WAVES[i];
+        let dir = vec2<f32>(cos(w.x), sin(w.x));
+        let k = 6.2831853 / w.y;
+        // Deep water: speed follows wavelength.
+        let theta = k * dot(dir, p) - sqrt(9.81 * k) * t;
+        let fade = clamp(2.0 - 4.0 * footprint / w.y, 0.0, 1.0);
+        slope = slope + dir * (w.z * k * fade * cos(theta));
+    }
+    return normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+}
+
 fn layer_uv(i: u32, p: vec4<f32>) -> vec2<f32> {
     return vec2<f32>(dot(material.layer_uv[i * 2u], p), dot(material.layer_uv[i * 2u + 1u], p));
 }
@@ -165,6 +197,9 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     }
     var rgb = base.rgb;
     let dist = distance(v.world_pos, frame.eye.xyz);
+    let footprint = length(fwidth(v.world_pos.xz));
+    let water = material.water.x > 0.5;
+    var water_alpha = 1.0;
     // Sampled outside branches: derivatives need uniform control flow.
     let p = vec4<f32>(v.world_pos, 1.0);
     let t0 = textureSample(layer0, detail_sampler, layer_uv(0u, p)).rgb;
@@ -200,7 +235,20 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     // Highlight and reflection, added after any ambient occlusion.
     var shine = vec3<f32>(0.0);
     var spec_light = vec3<f32>(0.0);
-    if material.params.y > 0.5 {
+    if water {
+        // As the game's water: the body colour lit by sun and sky, the sky
+        // mirrored over it by Schlick's Fresnel (water reflects 2% facing
+        // the eye), and a tight sun glint.
+        let n = sea_normal(v.world_pos.xz, frame.view_dir.w, footprint);
+        let view = normalize(frame.eye.xyz - v.world_pos);
+        let l = -normalize(frame.sun_dir.xyz);
+        let shade = sunlight(v.world_pos, vec3<f32>(0.0, 1.0, 0.0));
+        let body = base.rgb * (frame.sun_color.rgb * max(dot(n, l), 0.0) * shade * 0.3 + ambient_light(n));
+        let f = 0.02 + 0.98 * pow(1.0 - max(dot(n, view), 0.0), 5.0);
+        let glint = frame.sun_color.rgb * pow(max(dot(n, normalize(l + view)), 0.0), 400.0) * 3.0 * shade;
+        rgb = mix(body, environment(reflect(-view, n)), f) + glint;
+        water_alpha = mix(base.a, 1.0, f);
+    } else if material.params.y > 0.5 {
         var n = v.normal;
         if !front {
             n = -n;
@@ -281,6 +329,9 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     }
     // Bright highlights make glass more opaque, as the game's shaders have it.
     var alpha = clamp(max(base.a, dot(spec_light, vec3<f32>(0.299, 0.587, 0.114))), 0.0, 1.0);
+    if water {
+        alpha = water_alpha;
+    }
     if material.detail.z > 0.5 {
         let facing = abs(dot(normalize(v.normal), normalize(frame.eye.xyz - v.world_pos)));
         alpha = alpha * facing * facing;
