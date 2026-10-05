@@ -570,6 +570,7 @@ fn screenshot(
     // submitting the frame.
     let timed = Instant::now();
     let mut parts = [0.0f32; 4];
+    game.scene.streamed = Default::default();
     for _ in 0..FRAMES_TIMED {
         let mut lap = Instant::now();
         let mut split = |i: usize, lap: &mut Instant| {
@@ -594,15 +595,28 @@ fn screenshot(
     }
     let each = timed.elapsed().as_secs_f32() / FRAMES_TIMED as f32;
     let ms = parts.map(|p| p * 1000.0 / FRAMES_TIMED as f32);
+    let streamed = game
+        .scene
+        .streamed
+        .map(|d| d.as_secs_f32() * 1000.0 / FRAMES_TIMED as f32);
     eprintln!(
         "frames: {:.2} ms each ({:.0} fps) over {FRAMES_TIMED}, with a tick each: \
-         tick {:.2}, streaming {:.2}, draws {:.2}, submit {:.2} ms",
+         tick {:.2}, streaming {:.2} (the island {:.2}, vehicles and people {:.2}, \
+         props {:.2}), draws {:.2}, submit {:.2} ms",
         each * 1000.0,
         1.0 / each.max(1e-6),
         ms[0],
         ms[1],
+        streamed[0],
+        streamed[1],
+        streamed[2],
         ms[2],
         ms[3]
+    );
+    let (shown, loaded, loading, waiting, failed) = game.scene.props.counts();
+    eprintln!(
+        "props: {shown} shown; their models: {loaded} loaded, {loading} loading, \
+         {waiting} waiting, {failed} failed"
     );
     let people = &game.scene.people;
     eprintln!(

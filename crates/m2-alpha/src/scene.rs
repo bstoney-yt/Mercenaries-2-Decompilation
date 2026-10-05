@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use m2_engine::anim::load_clips;
@@ -407,6 +408,9 @@ pub struct Scene {
     install: Option<Install>,
     /// Vehicles loaded on request ([`Scene::load_vehicle`]).
     requests: (Sender<Loaded>, Receiver<Loaded>),
+    /// Time spent streaming since this was last cleared: the island's
+    /// streamer, vehicles and people, and the state layers' props.
+    pub streamed: [Duration; 3],
 }
 
 /// A vehicle to drive: what it is, its model, and its body once placed.
@@ -643,6 +647,7 @@ impl Scene {
             catalogue: None,
             install: None,
             requests: channel(),
+            streamed: [Duration::ZERO; 3],
         })
     }
 
@@ -881,9 +886,15 @@ impl Scene {
 
     /// Streams around `eye`.
     pub fn update(&mut self, backend: &mut dyn RenderBackend, eye: Vec3) -> anyhow::Result<()> {
+        let mut lap = Instant::now();
+        let mut split = |i: usize, streamed: &mut [Duration; 3]| {
+            streamed[i] += lap.elapsed();
+            lap = Instant::now();
+        };
         if let Some(world) = &mut self.world {
             world.update(backend, &mut self.materials, eye)?;
         }
+        split(0, &mut self.streamed);
         // At most one model a frame from each: each uploads a model.
         if let Some(rx) = &self.vehicle_loads {
             match rx.try_recv() {
@@ -898,6 +909,7 @@ impl Scene {
         for (model, template) in std::mem::take(&mut self.people.wanted) {
             self.load_character(model, template);
         }
+        split(1, &mut self.streamed);
         if let (Some(world), Some(source)) = (&mut self.world, &mut self.source) {
             // As far as they are drawn, and a little more.
             let reach = world.settings.object_distance + PROP_MARGIN;
@@ -910,6 +922,7 @@ impl Scene {
                 reach,
             )?;
         }
+        split(2, &mut self.streamed);
         Ok(())
     }
 
