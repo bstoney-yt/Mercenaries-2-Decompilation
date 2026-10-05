@@ -800,6 +800,22 @@ impl Scene {
             .as_ref()
             .map(|(_, rig)| npc::FightClips::find(rig))
             .unwrap_or_default();
+        if let Some((_, rig)) = &model {
+            let named = |c: Option<(usize, f32)>| {
+                c.map_or("none".to_owned(), |(i, at)| {
+                    let clip = &rig.clips[i];
+                    format!(
+                        "{:08x} ({:.2} s, the blow at {at:.2} s)",
+                        clip.hash, clip.info.duration
+                    )
+                })
+            };
+            eprintln!(
+                "player bash clips: high {}, low {}",
+                named(clips.bash),
+                named(clips.bash_low)
+            );
+        }
         self.people.clips = clips;
         let mut player = Player::new(x, z, 0.0, model);
         player.clips = clips;

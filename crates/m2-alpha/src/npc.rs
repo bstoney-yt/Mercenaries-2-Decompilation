@@ -86,7 +86,8 @@ pub(crate) enum Brain {
 /// The clips a fight plays, indices into every human rig's clips (they
 /// share one list). Clips are named only by hash; these were picked by
 /// looking at each pose, or by the events they carry (a jump's
-/// `footstep_jumptakeoff`, a throw's `releasegrenade`).
+/// `footstep_jumptakeoff`, a throw's `releasegrenade`, a melee bash's
+/// `meleebash`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FightClips {
     /// Standing, rifle shouldered and aimed (resident 0163f2aa).
@@ -108,6 +109,12 @@ pub struct FightClips {
     pub throw: Option<(usize, f32)>,
     /// Falling down dead (resident 479c4a51).
     pub die: Option<usize>,
+    /// A melee bash with what she holds, and one down low (at a crate on
+    /// the ground), with how far into each (seconds) the blow lands: its
+    /// `meleebash` or `MeleeBashLow` event. Twelve clips carry each (round
+    /// 89); the one starting nearest the rifle held ready.
+    pub bash: Option<(usize, f32)>,
+    pub bash_low: Option<(usize, f32)>,
 }
 
 impl FightClips {
@@ -128,6 +135,9 @@ impl FightClips {
     pub const THROW: [u32; 3] = [0xec6f_fa31, 0xb2e6_acf6, 0x91eb_aa5c];
     /// The event a throw lets go of the grenade at.
     const RELEASE: &str = "releasegrenade";
+    /// The events a melee bash lands at, high and low.
+    const BASH: &str = "meleebash";
+    const BASH_LOW: &str = "MeleeBashLow";
 
     pub fn find(rig: &Rig) -> Self {
         let find = |hash| rig.clips.iter().position(|c| c.hash == hash);
@@ -142,9 +152,29 @@ impl FightClips {
                 .map(|e| e.time)?;
             Some((i, release))
         });
+        let ready = find(Self::READY);
+        // Of the clips carrying `event`, the one starting nearest the rifle
+        // held ready, and when in it the event comes.
+        let by_event = |event: &str| {
+            rig.clips
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    let at = c
+                        .clip
+                        .events
+                        .iter()
+                        .find(|e| e.name.eq_ignore_ascii_case(event))?
+                        .time;
+                    let off = ready.map_or(0.0, |r| c.posture_distance_to(&rig.clips[r]));
+                    Some((i, at, off))
+                })
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .map(|(i, at, _)| (i, at))
+        };
         Self {
             aim: find(Self::AIM),
-            ready: find(Self::READY),
+            ready,
             jump: find(Self::JUMP),
             takeoff: first(&Self::TAKEOFF),
             takeoff_still: first(&Self::TAKEOFF_STILL),
@@ -152,6 +182,8 @@ impl FightClips {
             land_still: first(&Self::LAND_STILL),
             throw,
             die: find(Self::DIE),
+            bash: by_event(Self::BASH),
+            bash_low: by_event(Self::BASH_LOW),
         }
     }
 

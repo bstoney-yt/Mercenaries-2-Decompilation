@@ -365,6 +365,14 @@ impl BoundClip {
         }
     }
 
+    /// How differently its first frame holds the joints from `other`'s (0
+    /// for the same posture): to find, of clips that do the same thing,
+    /// the one that starts as another does (a rifle bash from the rifle
+    /// held ready).
+    pub fn posture_distance_to(&self, other: &BoundClip) -> f32 {
+        posture_distance(&self.first_rotations, &other.first_rotations)
+    }
+
     /// The pose at `time` (clamped); nodes no track drives keep their rest
     /// pose.
     pub fn sample(&self, skeleton: &Skeleton, time: f32) -> Pose {
