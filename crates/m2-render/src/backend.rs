@@ -255,10 +255,11 @@ pub struct Haze {
     /// nothing at the limit, and the light it adds reckoned in display
     /// values; `None` keeps the scale heights and `density` above.
     pub layers: Option<[f32; 4]>,
-    /// With `layers`: what the air keeps of a surface's light is also
-    /// tinted by the sun's colour, as the game's shaders multiply it by
-    /// `E * dirLightColor`; the clouds then take the sun's colour only so.
-    pub sun_tint: bool,
+    /// With `layers`: a display colour what the air keeps of a surface's
+    /// light is also tinted by, as the game's shaders multiply it by
+    /// `E * dirLightColor * ScatteringTermMultiplier.x`; the clouds' sun
+    /// is divided by it, so they keep their colour.
+    pub sun_tint: Option<Vec3>,
 }
 
 impl Default for Haze {
@@ -273,7 +274,7 @@ impl Default for Haze {
             rayleigh_height: 8000.0,
             mie_height: 1200.0,
             layers: None,
-            sun_tint: false,
+            sun_tint: None,
         }
     }
 }

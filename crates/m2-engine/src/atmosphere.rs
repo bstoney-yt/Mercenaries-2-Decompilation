@@ -452,8 +452,18 @@ impl Atmosphere {
                 .haze_layers
                 .filter(|_| !env_is("M2_HAZE", "old"))
                 .map(|[f1, l1, f2, l2]| [f1, recip(l1), f2, recip(l2)]),
-            // `M2_EXT_SUN=on` tints what the air keeps by the sun's colour.
-            sun_tint: env_is("M2_EXT_SUN", "on"),
+            // `M2_EXT_SUN` tints what the air keeps by the sun's colour
+            // (`on`), it over its brightest channel (`norm`) or over its
+            // luminance (`luma`).
+            sun_tint: {
+                let c = self.light_color.max(Vec3::ZERO);
+                match std::env::var("M2_EXT_SUN").as_deref() {
+                    Ok("on") => Some(c),
+                    Ok("norm") => Some(c / c.max_element().max(1e-3)),
+                    Ok("luma") => Some(c / c.dot(Vec3::new(0.2126, 0.7152, 0.0722)).max(1e-3)),
+                    _ => None,
+                }
+            },
             ..Haze::default()
         }
     }

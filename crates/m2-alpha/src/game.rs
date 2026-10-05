@@ -925,10 +925,11 @@ impl Game {
                 Some((r, s)) => {
                     let (region, (_, a)) = (&regions[r], &regions[r].settings[s]);
                     eprintln!(
-                        "atmosphere: region {} record {s} (light time {}, intensity {}, tone {:?}, coverage {}, tone map {:?})",
+                        "atmosphere: region {} record {s} (light time {}, intensity {}, light {:?}, tone {:?}, coverage {}, tone map {:?})",
                         region.name,
                         a.light_time[0],
                         a.light_intensity,
+                        a.light_color,
                         a.tone,
                         a.coverage,
                         a.tone_map
