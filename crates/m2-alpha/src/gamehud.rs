@@ -42,6 +42,7 @@ use mlua::{IntoLuaMulti, Lua, Table, Value};
 use crate::combat::{Combat, Fired, Picked, Rounds, Weapon};
 use crate::config::Config;
 use crate::game::Game;
+use crate::support::{self, SupportHud};
 
 /// The fonts the HUD's text widgets use.
 const FONTS: [&str; 2] = ["english_18", "english_20"];
@@ -118,6 +119,145 @@ local out = {}
 for _, r in pairs(held or {}) do out[#out + 1] = r end
 return out
 "#;
+/// The satellite designator in her hands, for the gun box: a guid of the
+/// scripts' world named as the template is (800052f3 "Satellite
+/// Designator"). That template has no `WeaponUI` (the guns' icon and
+/// reticle); its model is `global_weapon_detonator` and its equipment the
+/// "C4 Detonator", so the gun box shows the detonator's HUD icon. Guessed:
+/// no footage shows the gun box while she holds it.
+const DESIGNATOR_GUID: u32 = 0x6000_0003;
+const DESIGNATOR_ICON: &str = "explosives_c4_detonator";
+/// The first contract's free Satellite Guided Bomb, as the scripts know it
+/// (`MrxSupportData`'s freebie the contract adds).
+const SATELLITE_FREEBIE: &str = "VzaCon01_SatBomb";
+/// Before the scripts run: `Pg.FindPointFromCamera` answers the satellite
+/// view's middle while it is open (`__m2_hud_view`), for the view's rulers
+/// (`MrxGuiSatellite.HandleXUpdate` reads the point under the screen's
+/// middle); otherwise as before.
+const VIEW_POINT: &str = r#"
+local find = Pg.FindPointFromCamera
+Pg.FindPointFromCamera = function(...)
+    local v = __m2_hud_view
+    if v then return v[1], v[2], v[3] end
+    return find(...)
+end
+"#;
+/// A free support item onto the support menu, as the contract gives it
+/// (`MrxSupportData.AddFreebie(key, n, nil, nil, 1)`): the menu's own
+/// `AddItem`, with its icon, name, count and "FREE". First two values the
+/// scripts' world gets wrong: the satellite designator's AA level comes
+/// from the global `bil` (a slip for nil in its script: nil in the game,
+/// a stub here), and the item's faction from a field never set (nil in
+/// the game, "" here); either would deny the item.
+const ADD_FREEBIE: &str = r#"
+local key, n = ...
+local d = MrxSupportData.tFreebieData[key]
+if not d then return end
+if d.oSupport.oDesignator then d.oSupport.oDesignator.sAATestLevel = nil end
+d.oSupport.sFactionId = false
+if d.bActive then
+    MrxPmc.SetFreebieQty(d.sName, n)
+else
+    MrxSupportData.AddFreebie(key, n, nil, nil, 1)
+end
+"#;
+const REMOVE_FREEBIE: &str = r#"
+local d = MrxSupportData.tFreebieData[...]
+if d and d.bActive then MrxSupportData.RemoveFreebie(...) end
+"#;
+/// The support menu opened (true) or closed: its own `Open` and `Close`.
+const SUPPORT_MENU: &str = r#"
+local open = ...
+local menus = MrxGuiInterface._GetWidgetsForPlayers(Sys.StringToGuid("0x1"), "Support Menu")
+for _, w in pairs(menus or {}) do
+    if open then w:Open() else w:Close() end
+end
+"#;
+/// Before the satellite view opens: the timing wheel's wedges (degrees
+/// clockwise from the top) and the cost, as the satellite designator
+/// gives them (`MrxGuiManager.SetSatelliteMinigameData`, `SetSatelliteCost`).
+const SATELLITE_SETUP: &str = r#"
+local sectors, cost = ...
+local p = Sys.StringToGuid("0x1")
+MrxGuiManager.SetSatelliteMinigameData(p, sectors)
+MrxGuiManager.SetSatelliteCost(p, cost)
+"#;
+/// Each frame the view is open, before the scripts step: the time and
+/// cost the view's boxes count up (its `_TimeUpdate` adds the step to
+/// `nTime`; the cost is in dollars) and the help beside it.
+const SATELLITE_FEED: &str = r#"
+local time, cost, help = ...
+local w = MrxGui.GetWidgetByNameAndOwner("Satellite overlay", Sys.StringToGuid("0x1"))
+local m = w and w.CustomData.oMinigame
+if not m then return end
+m.CustomData.nTime = time
+m.CustomData.nCost = cost
+m.CustomData.nCashPerSecond = 0
+if w.CustomData.sHelp ~= help then
+    w.CustomData.sHelp = help
+    w:SetHelpText(help)
+end
+"#;
+/// After the scripts step, while the timing wheel shows: the wheel's own
+/// widgets posed as the play has it (the minigame's own clock and hit
+/// test are the play's): its size (0..=1 of the layout's), the marker's
+/// angle (degrees clockwise from the top), which wedges the marker is in,
+/// and the last press's mark (true a check, false a cross). As the
+/// minigame draws them: a wedge lights while the marker passes through it,
+/// the disc flashes green on a hit and red on a miss, under the check or
+/// cross. With no size the wheel is put away.
+const SATELLITE_WHEEL: &str = r#"
+local size, angle, inside, mark = ...
+local w = MrxGui.GetWidgetByNameAndOwner("Satellite overlay", Sys.StringToGuid("0x1"))
+local m = w and w.CustomData.oMinigame
+if not m then return end
+local c = m.CustomData
+if not size or size <= 0 then
+    m:SetVisible(false)
+    return
+end
+m:SetVisible(true)
+w.CustomData.oReticle:SetVisible(false)
+local r = 128 * size
+local function place(x)
+    x:SetLocation(c.nCenterX - r, c.nCenterY - r, c.nCenterX + r, c.nCenterY + r)
+    x:SetVisible(true)
+end
+place(c.oBg)
+if mark == true then
+    c.oBg:SetColor(0, 255, 0, 255)
+elseif mark == false then
+    c.oBg:SetColor(200, 0, 0, 255)
+else
+    c.oBg:SetColor(MrxGuiSatellite.nBaseBgR, MrxGuiSatellite.nBaseBgG, MrxGuiSatellite.nBaseBgB, 255)
+end
+for i, s in ipairs(c.tSectorWidgets) do
+    if s.CustomData.bInUse then
+        place(s)
+        if inside == i then
+            s:SetColor(255, 255, 255, 255)
+        else
+            s:SetColor(MrxGuiSatellite.nSliceR, MrxGuiSatellite.nSliceG, MrxGuiSatellite.nSliceB, 255)
+        end
+    end
+end
+place(c.oCursor)
+c.oCursor:SetRotation(angle)
+c.oButton:SetVisible(false)
+if mark == nil then
+    c.oFeedback:SetVisible(false)
+else
+    place(c.oFeedback)
+    c.oFeedback:SetTexture(mark and "icon_success" or "icon_fail")
+    c.oFeedback:SetTranslucency(255)
+end
+"#;
+/// The satellite view's help (`Satellite Help`, right of the middle):
+/// the PC's prompt for the timing wheel, as the first contract shows it
+/// (`[pfire]` the fire key); before the wheel, the keys (ours: the game's
+/// PC strings have none for steering the view).
+const WHEEL_HELP: &str = "[SHELL.PCShell.Tutorial_SatMinigame_PC]";
+const VIEW_HELP: &str = "Move view: WASD or mouse[n]Confirm target: fire or E";
 /// Seconds of play the scripts are given at most per frame.
 const MAX_STEP: f64 = 0.25;
 /// Largest texture size decoded, pixels.
@@ -184,6 +324,9 @@ pub struct HudState {
     pub sea_level: Option<f32>,
     /// The regions the mission has on the radar.
     pub radar_regions: Vec<RadarRegion>,
+    /// Her support: the item ready, the menu, the designator, the
+    /// satellite's view and its wheel.
+    pub support: SupportHud,
 }
 
 impl HudState {
@@ -567,12 +710,18 @@ fn run(data: &std::path::Path, rx: Receiver<HudState>, tx: Sender<Output>) {
 #[derive(Default)]
 struct Told {
     hp: Option<(i32, bool)>,
-    weapon: Option<Weapon>,
+    /// The gun in her hands, and whether she holds the designator.
+    weapon: Option<(Weapon, bool)>,
     ammo: Option<[u32; 5]>,
     vehicle: Option<Option<String>>,
     target: Option<Option<(i32, i32)>>,
     reticle: Option<Option<[f32; 2]>>,
     regions: Option<Vec<RadarRegion>>,
+    /// The support item ready (how many, whether free), and the menu.
+    support_item: Option<Option<(u32, bool)>>,
+    menu: Option<bool>,
+    /// The satellite's view is open.
+    satellite: bool,
 }
 
 /// How far (in -1..=1 screen units, across plus up) the aim point moves
@@ -635,6 +784,7 @@ impl Thread {
                 (RIFLE_GUID, RIFLE_NAME),
                 (RPG_GUID, RPG_NAME),
                 (LAUNCHER_GUID, LAUNCHER_NAME),
+                (DESIGNATOR_GUID, support::Kind::SatelliteBomb.designator()),
             ] {
                 world.insert(guid, Object::new(name, [0.0; 3]));
             }
@@ -646,6 +796,9 @@ impl Thread {
                 "MrxGuiManager.CreateGui(Sys.StringToGuid(\"0x1\"))",
                 "create gui",
             )
+            .map_err(|e| e.to_string())?;
+        mission
+            .run(VIEW_POINT, "m2-hud view point")
             .map_err(|e| e.to_string())?;
         Ok(Self {
             mission,
@@ -664,9 +817,15 @@ impl Thread {
             log.push(format!("event: {e}"));
         }
         let dt = state.dt.min(MAX_STEP);
+        if let Err(e) = self.feed_support(state, dt) {
+            log.push(format!("support: {e}"));
+        }
         if dt > 0.0 {
             self.mission.tick(dt);
             gui_runtime::tick(self.mission.lua(), dt);
+        }
+        if let Err(e) = self.pose_wheel(state) {
+            log.push(format!("wheel: {e}"));
         }
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
             return Output::Failed("no GUI runtime".into());
@@ -683,6 +842,13 @@ impl Thread {
             log.push(format!("radar zones: {}", zones.len()));
         }
         self.zones = zones;
+        // Looking through the satellite, only its view shows: the
+        // scripts put the HUD to sleep (`MrxGuiManager.ToggleHud`), which
+        // leaves some of it awake here.
+        let only = state
+            .support
+            .satellite
+            .map(|_| widgets_under(&screen.borrow(), &names, |n| n == "Satellite overlay"));
         // No aim point: the reticle's widgets are left out.
         let hidden = match state.reticle {
             Some(_) => HashSet::new(),
@@ -706,7 +872,11 @@ impl Thread {
         };
         let mut prims = Vec::new();
         let mut want = Vec::new();
-        for item in items.iter().filter(|i| !hidden.contains(&widget_of(i))) {
+        let shown = |i: &&DrawItem| {
+            let w = widget_of(i);
+            !hidden.contains(&w) && only.as_ref().is_none_or(|o| o.contains(&w))
+        };
+        for item in items.iter().filter(shown) {
             self.prims(item, state, &mut prims, &mut want);
         }
         let mut images = Vec::new();
@@ -767,8 +937,15 @@ impl Thread {
             let t = table(lua, [("nX", Value::Integer(0)), ("nY", Value::Integer(0))])?;
             fire(lua, "GuiReticlePositionChange", t)?;
         }
+        // The satellite looks down with north up: its compass reads the
+        // camera's heading as the view opens.
+        let heading = if s.support.satellite.is_some() {
+            0.0
+        } else {
+            s.heading
+        };
         if let Some(screen) = gui_runtime::screen(lua) {
-            screen.borrow_mut().set_camera_heading(s.heading);
+            screen.borrow_mut().set_camera_heading(heading);
         }
         // Where she is for the minimap, each frame as the engine does: its
         // handler hands it on to `MinimapUpdate`, with the heading as the
@@ -795,12 +972,20 @@ impl Thread {
             };
             fire(lua, "GuiVehicleNameUpdate", (name, faction))?;
         }
-        if self.told.weapon != Some(s.weapon) {
-            self.told.weapon = Some(s.weapon);
+        let holding = s.support.designator.is_some();
+        if self.told.weapon != Some((s.weapon, holding)) {
+            self.told.weapon = Some((s.weapon, holding));
             let (icon, guid, reticle) = match s.weapon {
                 Weapon::Rifle => (RIFLE_ICON, RIFLE_GUID, RIFLE_RETICLE),
                 Weapon::Rpg => (RPG_ICON, RPG_GUID, RPG_RETICLE),
                 Weapon::GrenadeLauncher => (LAUNCHER_ICON, LAUNCHER_GUID, LAUNCHER_RETICLE),
+            };
+            // The designator up in her hands: the gun box names it; the
+            // reticle stays the gun's.
+            let (icon, guid) = if holding {
+                (DESIGNATOR_ICON, DESIGNATOR_GUID)
+            } else {
+                (icon, guid)
             };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
@@ -916,6 +1101,118 @@ impl Thread {
         }
         self.told.regions = Some(s.radar_regions.clone());
         Ok(())
+    }
+
+    /// Feeds the support: the item onto the support menu (as the contract
+    /// gives its free bomb), the menu opened and closed, and the
+    /// satellite's view opened, kept in step (time, cost, help, where it
+    /// looks) and closed, as the satellite designator drives it. `step` is
+    /// the time the scripts are about to be given.
+    fn feed_support(&mut self, s: &HudState, step: f64) -> mlua::Result<()> {
+        let lua = self.mission.lua();
+        let sup = &s.support;
+        // Only the Satellite Guided Bomb is called in yet.
+        let item = sup
+            .item
+            .as_ref()
+            .filter(|i| i.0 == support::Kind::SatelliteBomb.name())
+            .map(|i| (i.2, i.3));
+        if self.told.support_item != Some(item) {
+            self.told.support_item = Some(item);
+            match item {
+                Some((n, _)) => lua
+                    .load(ADD_FREEBIE)
+                    .set_name("=m2-hud support")
+                    .call::<()>((SATELLITE_FREEBIE, n))?,
+                None => lua
+                    .load(REMOVE_FREEBIE)
+                    .set_name("=m2-hud support")
+                    .call::<()>(SATELLITE_FREEBIE)?,
+            }
+        }
+        if self.told.menu != Some(sup.menu) {
+            // Closed as it starts: no need to close it.
+            if self.told.menu.is_some() || sup.menu {
+                lua.load(SUPPORT_MENU)
+                    .set_name("=m2-hud support menu")
+                    .call::<()>(sup.menu)?;
+            }
+            self.told.menu = Some(sup.menu);
+        }
+        let open = sup.satellite.is_some();
+        if open && !self.told.satellite {
+            // The wedges as the play has them, degrees clockwise from
+            // the top; free: no cost.
+            let sectors = lua.create_table()?;
+            for mid in support::SECTORS {
+                let (mid, half) = (mid.to_degrees(), support::WEDGE.to_degrees());
+                sectors.push(lua.create_sequence_from([mid - half, mid + half])?)?;
+            }
+            lua.load(SATELLITE_SETUP)
+                .set_name("=m2-hud satellite")
+                .call::<()>((sectors, 0))?;
+        }
+        if open != self.told.satellite {
+            self.told.satellite = open;
+            // As `MrxGuiManager.ToggleSatellite(player, open, "pmc")`
+            // sends it: the minigame on, not the advanced view.
+            let t = table(
+                lua,
+                [
+                    (
+                        "EventType",
+                        Value::String(lua.create_string("SatelliteStateChange")?),
+                    ),
+                    ("uPlayerGuid", guid_value(PLAYER)),
+                    ("bActivate", Value::Boolean(open)),
+                    ("bAdvanced", Value::Boolean(false)),
+                    ("bMinigame", Value::Boolean(true)),
+                ],
+            )?;
+            fire(lua, "SatelliteStateChange", t)?;
+            if !open {
+                lua.globals().raw_set("__m2_hud_view", Value::Nil)?;
+                lua.load(SATELLITE_WHEEL)
+                    .set_name("=m2-hud wheel")
+                    .call::<()>(())?;
+            }
+        }
+        if let Some((middle, seconds, cost)) = sup.satellite {
+            lua.globals().raw_set(
+                "__m2_hud_view",
+                lua.create_sequence_from(middle.to_array())?,
+            )?;
+            let help = if sup.wheel.is_some() {
+                WHEEL_HELP
+            } else {
+                VIEW_HELP
+            };
+            // The view's clock adds the step as the scripts run.
+            lua.load(SATELLITE_FEED)
+                .set_name("=m2-hud satellite")
+                .call::<()>((f64::from(seconds) - step, f64::from(cost) * 1000.0, help))?;
+        }
+        Ok(())
+    }
+
+    /// Poses the timing wheel's widgets as the play has the wheel, after
+    /// the scripts have stepped (see [`SATELLITE_WHEEL`]).
+    fn pose_wheel(&self, s: &HudState) -> mlua::Result<()> {
+        if s.support.satellite.is_none() {
+            return Ok(());
+        }
+        let call = self
+            .mission
+            .lua()
+            .load(SATELLITE_WHEEL)
+            .set_name("=m2-hud wheel");
+        match &s.support.wheel {
+            Some(w) => {
+                let inside = support::sector(w.angle).map(|i| i + 1);
+                call.call::<()>((w.size, w.angle.to_degrees(), inside, w.mark))
+            }
+            None => call.call::<()>(()),
+        }
     }
 
     /// The zones the radar's script holds (`tRegions` of the
@@ -1036,13 +1333,26 @@ fn widget_of(item: &DrawItem) -> u32 {
 /// reticle module's layout names its root "reticle", and the stinger's and
 /// laser's "Stinger Reticle" and "Laser Reticle".
 fn reticle_widgets(screen: &gui_runtime::Screen, names: &BTreeMap<u32, String>) -> HashSet<u32> {
+    widgets_under(screen, names, |n| {
+        n.to_ascii_lowercase().contains("reticle")
+    })
+}
+
+/// The widgets with a name `pick` picks, and everything under them.
+/// `names` are the scripts' names ([`gui_runtime::script_names`]),
+/// before the natives' own.
+fn widgets_under(
+    screen: &gui_runtime::Screen,
+    names: &BTreeMap<u32, String>,
+    pick: impl Fn(&str) -> bool,
+) -> HashSet<u32> {
     let named = |id: u32| {
         let name = names
             .get(&id)
             .map(String::as_str)
             .or_else(|| screen.widget(id).map(|w| w.name.as_str()))
             .unwrap_or_default();
-        name.to_ascii_lowercase().contains("reticle")
+        pick(name)
     };
     screen
         .widgets()

@@ -137,6 +137,7 @@ impl Hud {
         state.messages.extend(game.message(message));
         state.blips = blips(info);
         state.reticle = reticle(info);
+        state.support = info.support.clone();
         state.radar_regions = info
             .mission
             .as_ref()
@@ -157,6 +158,7 @@ impl Hud {
         state.messages.extend(game.message(message));
         state.blips = blips(info);
         state.reticle = reticle(info);
+        state.support = info.support.clone();
         state.radar_regions = info
             .mission
             .as_ref()
@@ -326,7 +328,15 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     }
     let time = ctx.input(|i| i.time);
     if let Some(view) = info.support.satellite {
-        satellite(&painter, screen, info, view, time, &text);
+        // The game's own view (`MrxGuiSatelliteLayout`) once its HUD runs,
+        // with the objective under it; ours until then.
+        match game.filter(|_| info.playing) {
+            Some(game) => {
+                game.paint(&painter);
+                satellite_objective(&painter, screen, info, &text);
+            }
+            None => satellite(&painter, screen, info, view, time, &text),
+        }
         return;
     }
     if time < HINT_TIME && info.playing {
@@ -399,9 +409,10 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
             Color32::from_rgb(240, 90, 80),
         );
     }
-    // Ours with either HUD until the game's support box is fed.
+    // The game's HUD has its own support box; the bomb's countdown and the
+    // PDA are ours with either.
     if info.driving.is_none() {
-        support(screen, &info.support, &text);
+        support(screen, &info.support, game.is_none(), &text);
     }
 }
 
@@ -505,12 +516,14 @@ fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     }
 }
 
-/// The support box above the health bar: the item ready to call (its
-/// name, how many, whether free, how it is called in) and the keys for
-/// the step the call is at; and while a bomb is on its way, how long.
+/// The support box above the health bar (if `boxed`: the game's HUD has
+/// its own): the item ready to call (its name, how many, whether free,
+/// how it is called in) and the keys for the step the call is at; and
+/// while a bomb is on its way, how long.
 fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     screen: egui::Rect,
     s: &SupportHud,
+    boxed: bool,
     text: &T,
 ) {
     let white = Color32::from_gray(235);
@@ -526,7 +539,7 @@ fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     if s.pda {
         pda(screen, s, text);
     }
-    let Some((name, method, count, free)) = &s.item else {
+    let Some((name, method, count, free)) = s.item.as_ref().filter(|_| boxed) else {
         return;
     };
     let at = screen.left_bottom() + vec2(24.0, -78.0);
@@ -631,7 +644,6 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     text: &T,
 ) {
     let white = Color32::from_gray(235);
-    let gold = Color32::from_rgb(255, 200, 0);
     let ink = Color32::from_white_alpha(200);
     // Grey over the colours, and grain.
     painter.rect_filled(
@@ -783,19 +795,7 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     }
 
     // The objective, bottom left; the keys, right of the middle.
-    if let Some(objective) = info.mission.as_ref().and_then(|m| m.objectives.first()) {
-        // A triangle pointing down before it (drawn: not every font has
-        // the glyph).
-        let at = screen.left_bottom() + vec2(24.0, -32.0);
-        tri(at, at + vec2(12.0, 0.0), at + vec2(6.0, 9.0), gold);
-        text(
-            screen.left_bottom() + vec2(42.0, -24.0),
-            Align2::LEFT_BOTTOM,
-            objective,
-            17.0,
-            gold,
-        );
-    }
+    satellite_objective(painter, screen, info, text);
     let keys: &[&str] = if info.support.wheel.is_some() {
         &["T: back"]
     } else {
@@ -830,6 +830,34 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             white,
         );
     }
+}
+
+/// The mission's objective at the bottom left of the satellite's view,
+/// in gold after a triangle pointing down, as the videos show it.
+fn satellite_objective<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    info: &HudInfo,
+    text: &T,
+) {
+    let Some(objective) = info.mission.as_ref().and_then(|m| m.objectives.first()) else {
+        return;
+    };
+    let gold = Color32::from_rgb(255, 200, 0);
+    // The triangle drawn: not every font has the glyph.
+    let at = screen.left_bottom() + vec2(24.0, -32.0);
+    painter.add(Shape::convex_polygon(
+        vec![at, at + vec2(12.0, 0.0), at + vec2(6.0, 9.0)],
+        gold,
+        Stroke::NONE,
+    ));
+    text(
+        screen.left_bottom() + vec2(42.0, -24.0),
+        Align2::LEFT_BOTTOM,
+        objective,
+        17.0,
+        gold,
+    );
 }
 
 /// The timing wheel centred on `c`, `r` across at its full size: a
