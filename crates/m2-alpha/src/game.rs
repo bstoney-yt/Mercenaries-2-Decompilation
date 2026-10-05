@@ -11,7 +11,7 @@ use crate::camera::FlyCamera;
 use crate::combat::{Combat, Field, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
-use crate::mission::template_models;
+use crate::mission::{WATERLINE, template_models};
 use crate::player::{ChaseRig, Intent, Player};
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
@@ -688,6 +688,11 @@ const PARK_GRADE: f32 = 0.15;
 const PARK_ROOF: f32 = 8.0;
 /// The ground under a spot is looked for from this far above her feet.
 const PARK_LOOK: f32 = 60.0;
+/// A spot whose middle is less than this above the sea is in it, metres;
+/// one whose middle is further than this beyond the rise allowed (see
+/// [`PARK_RISE`]) isn't looked at more closely.
+const PARK_SHORE: f32 = 0.5;
+const PARK_SLACK: f32 = 2.0;
 /// Vehicles are let go this far above where they rest, to settle onto
 /// their wheels, metres.
 const DROP: f32 = 0.3;
@@ -727,6 +732,11 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
             ))
         })
         .collect();
+    // The ground under each spot's middle, looked at once a look: a spot
+    // in the sea, or far above or below her, is passed over before the
+    // ground under each vehicle's wheels there is (a look on a coast or a
+    // hillside otherwise casts a ray or two dozen for every spot).
+    let mut middles: Vec<Option<Option<f32>>> = vec![None; spots.len()];
     for v in vehicles.iter_mut().filter(|v| parkable(v)) {
         let (lo, hi) = v.spec.bounds;
         let radius = footprint_radius(&v.spec);
@@ -739,19 +749,23 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
                 .cast_ray(top, -Vec3::Y, PARK_LOOK + PARK_ROOF * 2.0)
                 .map(|(d, _)| top.y - d)
         };
-        let spot = spots.iter().find_map(|&centre| {
+        let spot = spots.iter().zip(&mut middles).find_map(|(&centre, under)| {
             if taken
                 .iter()
                 .any(|&(c, r)| (c - centre).with_y(0.0).length() < r + radius + PARK_GAP)
             {
                 return None;
             }
+            let away = (centre - feet).with_y(0.0).length();
+            let rise = (PARK_RISE + PARK_GRADE * away).min(PARK_ROOF);
+            let h = (*under.get_or_insert_with(|| ground(centre)))?;
+            if h < WATERLINE + PARK_SHORE || (h - feet.y).abs() > rise + PARK_SLACK {
+                return None;
+            }
             // Tilted to the ground under its wheels, clear of what is
             // under its hull.
             let origin = centre - (right * middle.x + forward * middle.z);
             let rest = v.spec.rest_on(origin, player.facing, ground)?;
-            let away = (centre - feet).with_y(0.0).length();
-            let rise = (PARK_RISE + PARK_GRADE * away).min(PARK_ROOF);
             (rest.slope <= steep
                 && rest.bumps <= PARK_BUMPS
                 && (rest.position.y - feet.y).abs() < rise)

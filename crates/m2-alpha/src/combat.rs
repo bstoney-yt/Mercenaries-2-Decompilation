@@ -891,8 +891,8 @@ impl Combat {
     }
 
     /// Fires the gun on the turret of vehicle `i`, which she drives, at
-    /// what the crosshair is on: a tank's cannon fires a shell that bursts
-    /// like a rocket, anything else's a machine gun.
+    /// what the crosshair is on: a cannon (a tank's, the Stryker's) fires
+    /// a shell that bursts like a rocket, anything else's a machine gun.
     fn vehicle_fire(&mut self, f: &mut Field<'_>, i: usize) {
         let Some(v) = f.vehicles.get(i) else {
             return;
@@ -903,7 +903,7 @@ impl Combat {
         let Some(body) = f.physics.vehicle_transform(id) else {
             return;
         };
-        let cannon = v.spec.kind == "tank";
+        let cannon = v.spec.cannon();
         let gun = v.spec.tuning.gun;
         let (from, barrel) = v
             .spec

@@ -53,19 +53,37 @@ pub struct Props {
     loaders: Option<Loaders>,
     /// Models that failed to load.
     failed: HashSet<u32>,
+    /// How near the props wanting each model are, as last worked out.
+    near: Option<Near>,
+    /// Changes to those shown (put up, taken down, moved, gone).
+    changes: u64,
+}
+
+/// For each model not yet loaded, how far (squared) the nearest shown prop
+/// using it stood from `focus` ([`Props::nearness`]), as of change
+/// `changes` to those shown.
+#[derive(Debug)]
+struct Near {
+    focus: Vec3,
+    changes: u64,
+    by_model: HashMap<u32, f32>,
 }
 
 /// How long uploading loaded models may take a frame (at least one is).
 const UPLOAD_BUDGET: Duration = Duration::from_millis(6);
 
 /// Threads decoding models.
-const LOADERS: usize = 3;
+const LOADERS: usize = 4;
 
 /// How many models may be asked of the loaders and not yet uploaded:
 /// few, so that whatever is nearest when one finishes goes next. A start-up
 /// puts up thousands of props, and a mission's gate has to load while the
 /// player walks up to it, not after all of them.
-const IN_FLIGHT: usize = 8;
+const IN_FLIGHT: usize = 16;
+
+/// Which models are nearest is worked out again once the focus has moved
+/// this far (metres), or those shown have changed.
+const RENEAR: f32 = 50.0;
 
 /// A model decoded on a loading thread, or why not.
 type Load = (u32, Result<CpuModel, String>);
@@ -105,6 +123,7 @@ impl Props {
                 },
             );
             added += 1;
+            self.changes += 1;
             if let std::collections::hash_map::Entry::Vacant(slot) = self.models.entry(o.model) {
                 slot.insert(None);
                 self.waiting.insert(o.model);
@@ -121,6 +140,7 @@ impl Props {
         for e in entities {
             if self.shown.remove(&e).is_some() {
                 physics.remove_static(StaticKey::Entity(e));
+                self.changes += 1;
             }
         }
     }
@@ -141,6 +161,7 @@ impl Props {
             p.wrecked = true;
         } else {
             self.shown.remove(&entity);
+            self.changes += 1;
         }
         true
     }
@@ -151,6 +172,7 @@ impl Props {
             return;
         };
         p.position = position;
+        self.changes += 1;
         if let Some(Some(m)) = self.models.get(&p.model)
             && let Some(shape) = &m.collision
             && !p.wrecked
@@ -204,7 +226,9 @@ impl Props {
 
     /// Uploads models that have loaded, nearest `focus` first (as many as
     /// fit in [`UPLOAD_BUDGET`], at least one), gives the props using them
-    /// their collision, and asks the loaders for the nearest still wanted.
+    /// their collision, and asks the loaders for the nearest still wanted
+    /// by a prop within `reach` metres (those further load as she nears
+    /// them).
     pub fn update(
         &mut self,
         backend: &mut dyn RenderBackend,
@@ -212,6 +236,7 @@ impl Props {
         source: &mut AssetSource<BufReader<File>>,
         physics: &mut Physics,
         focus: Vec3,
+        reach: f32,
     ) -> anyhow::Result<()> {
         let Some(loaders) = &self.loaders else {
             return Ok(());
@@ -220,8 +245,15 @@ impl Props {
         if self.decoded.is_empty() && (self.waiting.is_empty() || self.asked.len() >= IN_FLIGHT) {
             return Ok(());
         }
-        let near = self.nearness(focus);
-        let far = |hash: &u32| near.get(hash).copied().unwrap_or(f32::INFINITY);
+        let near = match self.near.take() {
+            Some(n) if n.changes == self.changes && n.focus.distance(focus) <= RENEAR => n,
+            _ => Near {
+                focus,
+                changes: self.changes,
+                by_model: self.nearness(focus),
+            },
+        };
+        let far = |hash: &u32| near.by_model.get(hash).copied().unwrap_or(f32::INFINITY);
         let started = Instant::now();
         while let Some(i) = (0..self.decoded.len())
             .min_by(|&a, &b| far(&self.decoded[a].0).total_cmp(&far(&self.decoded[b].0)))
@@ -239,7 +271,7 @@ impl Props {
             .waiting
             .iter()
             .copied()
-            .filter(|h| !near.contains_key(h))
+            .filter(|h| !near.by_model.contains_key(h))
             .collect();
         for h in unwanted {
             self.waiting.remove(&h);
@@ -247,7 +279,13 @@ impl Props {
         }
         let room = IN_FLIGHT.saturating_sub(self.asked.len());
         if room > 0 && !self.waiting.is_empty() {
-            let mut next: Vec<u32> = self.waiting.iter().copied().collect();
+            let within = reach * reach;
+            let mut next: Vec<u32> = self
+                .waiting
+                .iter()
+                .copied()
+                .filter(|h| far(h) <= within)
+                .collect();
             next.sort_by(|a, b| far(a).total_cmp(&far(b)));
             for hash in next.into_iter().take(room) {
                 self.waiting.remove(&hash);
@@ -261,6 +299,7 @@ impl Props {
                 }
             }
         }
+        self.near = Some(near);
         Ok(())
     }
 

@@ -46,6 +46,7 @@ mod mission;
 mod npc;
 mod player;
 mod props;
+mod route;
 mod save;
 mod scene;
 mod sound;
@@ -549,10 +550,15 @@ fn screenshot(
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
-    // And for the vehicles and people, and the people to find their feet.
-    // The island's own vehicles get half a minute, as one may fail.
+    // And for the vehicles and people, and the people to find their feet,
+    // and for the vehicles to be parked by her (a look for a spot can take
+    // a while: not timed). The island's own vehicles get half a minute, as
+    // one may fail.
     while game.scene.world.is_some()
         && (game.scene.vehicles_loading()
+            || (game.on_foot
+                && game.scene.player.as_ref().is_some_and(|p| p.landed)
+                && !game.parking_done())
             || (game.island_vehicles_loading() && started.elapsed() < Duration::from_secs(30)))
         && started.elapsed() < Duration::from_secs(300)
     {
@@ -1378,7 +1384,7 @@ fn drive_for_screenshot(
                     .player
                     .as_ref()
                     .and_then(|p| p.driving)
-                    .is_some_and(|i| game.scene.vehicles[i].spec.kind == "tank");
+                    .is_some_and(|i| game.scene.vehicles[i].spec.cannon());
                 if tank {
                     sound::log_tank_gun(install);
                 }
