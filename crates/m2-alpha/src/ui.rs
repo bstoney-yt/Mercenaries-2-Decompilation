@@ -131,6 +131,10 @@ impl Hud {
         state.messages.extend(game.message(message));
         state.blips = blips(info);
         state.reticle = reticle(info);
+        state.radar_regions = info
+            .mission
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.radar_regions.clone());
         game.update(&self.ctx, state);
     }
 
@@ -147,6 +151,10 @@ impl Hud {
         state.messages.extend(game.message(message));
         state.blips = blips(info);
         state.reticle = reticle(info);
+        state.radar_regions = info
+            .mission
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.radar_regions.clone());
         let step = 1.0 / 30.0;
         game.update_and_wait(
             &self.ctx,
@@ -678,6 +686,7 @@ mod tests {
                 )],
                 message: Some((false, "VzaCon001 objective 1".into())),
                 game_message: None,
+                radar_regions: Vec::new(),
                 status: None,
                 contract_complete: true,
             }),

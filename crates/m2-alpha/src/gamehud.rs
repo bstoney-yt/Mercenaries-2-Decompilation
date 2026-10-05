@@ -10,9 +10,11 @@
 //!
 //! The minimap is drawn here, as the engine draws its own: the island's
 //! map round her (see [`MAP_TEXTURE`]), turned with the camera, on the
-//! radar's backdrop, with the mission's markers. Not drawn yet: the Flash
-//! pieces (the minimap's zones, pop-ups), animated sprites and clock
-//! wipes. The ammo the counters show is our own count (see
+//! radar's backdrop, with the zones its Flash movie would outline (see
+//! [`Zone`]) and the mission's markers. Not drawn yet: the other Flash
+//! pieces (pop-ups), animated sprites and clock wipes. With no aim point
+//! the reticle's widgets are left out ([`reticle_widgets`], by the names
+//! the layout gives them). The ammo the counters show is our own count (see
 //! [`RIFLE_CLIP`]): the play has no ammo of its own yet.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -23,17 +25,19 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, Mesh, TextureHandle, TextureOptions, pos2};
 use m2_assets::font::FONT_TYPE;
-use m2_assets::{Font, WadArchive, name_hash};
-use m2_engine::world::ISLAND;
-use m2_engine::{AssetSource, Install};
+use m2_assets::minimap::{self, Heights};
+use m2_assets::terrain::LOW_RES_TYPE;
+use m2_assets::{Font, LowResTile, WadArchive, name_hash};
+use m2_engine::world::{ISLAND, WorldIndex};
+use m2_engine::{AssetSource, Install, WorldSettings};
 use m2_game::api::Object;
-use m2_game::events::guid_value;
+use m2_game::events::{as_guid, guid_value};
 use m2_game::gui::Anchor;
 use m2_game::gui_runtime::{self, DrawItem, TextSpan};
 use m2_game::hud::ObjectiveMessage;
 use m2_game::mission::{GameData, Mission};
 use m2_math::glam::Vec3;
-use mlua::{IntoLuaMulti, Lua, Value};
+use mlua::{IntoLuaMulti, Lua, Table, Value};
 
 use crate::combat::{Combat, Fired, Picked, Rounds, Weapon};
 use crate::config::Config;
@@ -87,15 +91,43 @@ local tag = MrxUtil.GetInlineIconNameByIndex(icon) or ""
 return c.sColor .. tag .. " [objective." .. c.sPrefix .. c.sStatus .. "]" .. " " .. text,
     c.nPriority or 1
 "#;
+/// A region onto the radar by its name, as `WifVzBoundary` puts its
+/// boundary there: the scripts' own `Hud.Radar:AddLineRegion` (colour and
+/// alpha 0..=255, nil for the radar's defaults).
+const ADD_REGION: &str = r#"
+local name, r, g, b, a, invert = ...
+local guid = Pg.GetGuidByName(name)
+if guid then
+    Hud.Radar:AddLineRegion({ vPlayer = Sys.StringToGuid("0x1"), uGuid = guid,
+        nRed = r, nGreen = g, nBlue = b, nAlpha = a, bInvert = invert })
+end
+"#;
+const REMOVE_REGION: &str = r#"
+local guid = Pg.GetGuidByName(...)
+if guid then
+    Hud.Radar:RemoveLineRegion({ vPlayer = Sys.StringToGuid("0x1"), uGuid = guid })
+end
+"#;
+/// The regions the radar's script holds for the movie: the
+/// `MinimapFlash` widget object's `CustomData.tRegions` (each `uGuid`,
+/// `sColor` `"0xRRGGBB"`, `nAlpha` 0..=100, `bInvert`).
+const RADAR_ZONES: &str = r#"
+local w = MrxGuiBase.WidgetIdIndex[...]
+local held = w and w.CustomData and w.CustomData.tRegions
+local out = {}
+for _, r in pairs(held or {}) do out[#out + 1] = r end
+return out
+"#;
 /// Seconds of play the scripts are given at most per frame.
 const MAX_STEP: f64 = 0.25;
 /// Largest texture size decoded, pixels.
 const MAX_TEXTURE: u32 = 2048;
 
-/// The minimap's art: the engine draws the HUD's "VZ" map itself; the
-/// island-wide map the distant terrain wears stands in, the island
+/// The minimap's art: the engine draws the HUD's "VZ" map itself; it is
+/// made from the island-wide map the distant terrain wears, the island
 /// (`ISLAND` metres square, centred on the origin) seen from above with
-/// its roads, `+x` and `+z` towards its left and top edges.
+/// its roads, `+x` and `+z` towards its left and top edges, recoloured as
+/// the radar shows it (see [`radar_map`]).
 const MAP_TEXTURE: &str = "vz_lrterrain";
 /// The radar's backdrop (its `sBorderTexture`), with the north pointer on
 /// its rim, `BORDER` virtual units across round a minimap 100 across.
@@ -148,6 +180,10 @@ pub struct HudState {
     /// `Gui.GetReticlePosition` answers. None hides it (down, or in a
     /// vehicle without a gun).
     pub reticle: Option<[f32; 2]>,
+    /// The sea's height, metres: the radar's map is water below it.
+    pub sea_level: Option<f32>,
+    /// The regions the mission has on the radar.
+    pub radar_regions: Vec<RadarRegion>,
 }
 
 impl HudState {
@@ -195,6 +231,7 @@ impl HudState {
             position: at.map(|p| p.to_array()),
             facing: player.map_or(0.0, |p| p.facing.to_degrees()),
             hurts,
+            sea_level: game.scene.world.as_ref().map(|w| w.settings.sea_level),
             ..Self::default()
         }
     }
@@ -535,6 +572,7 @@ struct Told {
     vehicle: Option<Option<String>>,
     target: Option<Option<(i32, i32)>>,
     reticle: Option<Option<[f32; 2]>>,
+    regions: Option<Vec<RadarRegion>>,
 }
 
 /// How far (in -1..=1 screen units, across plus up) the aim point moves
@@ -550,6 +588,8 @@ struct Thread {
     told: Told,
     /// The reticle's widgets were listed in the log.
     reticle_logged: bool,
+    /// The zones the radar's script holds, as last read.
+    zones: Vec<Zone>,
 }
 
 impl Thread {
@@ -614,6 +654,7 @@ impl Thread {
             tried: HashSet::new(),
             told: Told::default(),
             reticle_logged: false,
+            zones: Vec::new(),
         })
     }
 
@@ -636,21 +677,33 @@ impl Thread {
         log.extend(self.mission.take_log());
         // The scripts' own commands (sounds, camera) are not the HUD's.
         let _ = self.mission.take_commands();
+        let names = gui_runtime::script_names(self.mission.lua());
+        let zones = self.zones(&names);
+        if zones.len() != self.zones.len() {
+            log.push(format!("radar zones: {}", zones.len()));
+        }
+        self.zones = zones;
         // No aim point: the reticle's widgets are left out.
         let hidden = match state.reticle {
             Some(_) => HashSet::new(),
-            None => reticle_widgets(&screen.borrow()),
+            None => {
+                let hidden = reticle_widgets(&screen.borrow(), &names);
+                if !self.reticle_logged {
+                    self.reticle_logged = true;
+                    let mut named: Vec<&str> = hidden
+                        .iter()
+                        .filter_map(|id| names.get(id).map(String::as_str))
+                        .collect();
+                    named.sort_unstable();
+                    log.push(format!(
+                        "reticle hidden: {} widgets, named {}",
+                        hidden.len(),
+                        named.join(", ")
+                    ));
+                }
+                hidden
+            }
         };
-        if !hidden.is_empty() && !self.reticle_logged {
-            self.reticle_logged = true;
-            let s = screen.borrow();
-            let mut names: Vec<&str> = hidden
-                .iter()
-                .filter_map(|&id| s.widget(id).map(|w| w.name.as_str()))
-                .collect();
-            names.sort_unstable();
-            log.push(format!("reticle hidden: {}", names.join(", ")));
-        }
         let mut prims = Vec::new();
         let mut want = Vec::new();
         for item in items.iter().filter(|i| !hidden.contains(&widget_of(i))) {
@@ -659,6 +712,29 @@ impl Thread {
         let mut images = Vec::new();
         for hash in want {
             if self.tried.insert(hash) {
+                if hash == name_hash(MAP_TEXTURE) {
+                    let started = Instant::now();
+                    let sea = state
+                        .sea_level
+                        .unwrap_or(WorldSettings::default().sea_level);
+                    let image = match radar_map(&mut self.assets, sea) {
+                        Ok(i) => {
+                            log.push(format!(
+                                "radar map: {}x{}, sea at {sea} m, in {:.0?}",
+                                i.width,
+                                i.height,
+                                started.elapsed()
+                            ));
+                            Some(i)
+                        }
+                        Err(e) => {
+                            log.push(format!("radar map: {e}"));
+                            None
+                        }
+                    };
+                    images.push((hash, image));
+                    continue;
+                }
                 let image = match self.assets.texture(hash, MAX_TEXTURE) {
                     Ok(t) => t.mips.into_iter().next().map(|rgba| Image {
                         width: t.width,
@@ -823,7 +899,66 @@ impl Thread {
             )?;
             fire(lua, "TextBufferAddMessage", t)?;
         }
+        // The mission's radar regions, put on this radar as the mission
+        // put them on its own (`Hud.Radar:AddLineRegion`): the radar's
+        // script keeps them (`tRegions`), and they are drawn from there.
+        let told = self.told.regions.take().unwrap_or_default();
+        for r in told.iter().filter(|r| !s.radar_regions.contains(r)) {
+            lua.load(REMOVE_REGION)
+                .set_name("=m2-hud region")
+                .call::<()>(r.name.as_str())?;
+        }
+        for r in s.radar_regions.iter().filter(|r| !told.contains(r)) {
+            let [red, green, blue, alpha] = r.colour;
+            lua.load(ADD_REGION)
+                .set_name("=m2-hud region")
+                .call::<()>((r.name.as_str(), red, green, blue, alpha, r.invert))?;
+        }
+        self.told.regions = Some(s.radar_regions.clone());
         Ok(())
+    }
+
+    /// The zones the radar's script holds (`tRegions` of the
+    /// `MinimapFlash` widget's object), with their outlines from the
+    /// world's regions.
+    fn zones(&self, names: &BTreeMap<u32, String>) -> Vec<Zone> {
+        let Some((&flash, _)) = names.iter().find(|(_, n)| *n == "MinimapFlash") else {
+            return Vec::new();
+        };
+        let held: Vec<(Value, String, f64, bool)> = self
+            .mission
+            .lua()
+            .load(RADAR_ZONES)
+            .set_name("=m2-hud zones")
+            .call::<Vec<Table>>(flash)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| {
+                Some((
+                    t.get("uGuid").ok()?,
+                    t.get("sColor").ok()?,
+                    t.get("nAlpha").ok()?,
+                    t.get("bInvert").unwrap_or(false),
+                ))
+            })
+            .collect();
+        let world = self.mission.world().borrow();
+        held.into_iter()
+            .filter_map(|(guid, colour, alpha, invert)| {
+                let guid = as_guid(&guid)?;
+                let region = world.regions.get(&guid)?;
+                let at = world.objects.get(&guid)?;
+                let rgb = u32::from_str_radix(colour.trim_start_matches("0x"), 16).ok()?;
+                Some(Zone::new(
+                    region,
+                    at.position,
+                    at.yaw,
+                    rgb,
+                    alpha as f32,
+                    invert,
+                ))
+            })
+            .collect()
     }
 
     /// The quads of one draw item; textures they use go in `want`.
@@ -875,7 +1010,7 @@ impl Thread {
                         heading: *rotation,
                         range: range.unwrap_or(DEFAULT_RANGE),
                     };
-                    minimap(&view, state, out, want);
+                    minimap(&view, state, &self.zones, out, want);
                 }
             }
             // Not drawn yet (see the module docs).
@@ -897,11 +1032,17 @@ fn widget_of(item: &DrawItem) -> u32 {
 }
 
 /// The reticle's widgets: those named for it, and everything under them.
-fn reticle_widgets(screen: &gui_runtime::Screen) -> HashSet<u32> {
+/// `names` are the scripts' names ([`gui_runtime::script_names`]): the
+/// reticle module's layout names its root "reticle", and the stinger's and
+/// laser's "Stinger Reticle" and "Laser Reticle".
+fn reticle_widgets(screen: &gui_runtime::Screen, names: &BTreeMap<u32, String>) -> HashSet<u32> {
     let named = |id: u32| {
-        screen
-            .widget(id)
-            .is_some_and(|w| w.name.to_ascii_lowercase().contains("reticle"))
+        let name = names
+            .get(&id)
+            .map(String::as_str)
+            .or_else(|| screen.widget(id).map(|w| w.name.as_str()))
+            .unwrap_or_default();
+        name.to_ascii_lowercase().contains("reticle")
     };
     screen
         .widgets()
@@ -1042,15 +1183,46 @@ impl MapView {
     }
 }
 
+/// The radar's map: [`MAP_TEXTURE`] recoloured as the game's radar shows
+/// the island (see [`m2_assets::minimap`]), the sea where the
+/// low-resolution terrain lies under `sea_level`.
+fn radar_map(assets: &mut AssetSource<BufReader<File>>, sea_level: f32) -> Result<Image, String> {
+    let texture = assets
+        .texture(name_hash(MAP_TEXTURE), MAX_TEXTURE)
+        .map_err(|e| e.to_string())?;
+    let rgba = texture.mips.first().ok_or("no mips")?;
+    let (width, height) = (texture.width as usize, texture.height as usize);
+    let index = WorldIndex::build(assets).map_err(|e| e.to_string())?;
+    let mut heights = Heights::new(width, ISLAND);
+    for (&hash, centre) in &index.tiles {
+        let data = assets
+            .asset(hash, LOW_RES_TYPE)
+            .map_err(|e| e.to_string())?;
+        let tile = LowResTile::parse(&data).map_err(|e| format!("tile {hash:08x}: {e}"))?;
+        heights.add_tile(&tile, centre.to_array());
+    }
+    Ok(Image {
+        width: texture.width,
+        height: texture.height,
+        rgba: minimap::radar_map(rgba, width, height, &heights, sea_level),
+    })
+}
+
 /// The map texture's coordinates of world `(x, z)`.
 fn map_uv([x, z]: [f32; 2]) -> [f32; 2] {
     [(ISLAND / 2.0 - x) / ISLAND, (ISLAND / 2.0 - z) / ISLAND]
 }
 
 /// The minimap's quads: the radar's backdrop with north on its rim, the
-/// island's map round her in the circle, the objective markers (at the rim
-/// when farther) and her arrow.
-fn minimap(view: &MapView, state: &HudState, out: &mut Vec<Prim>, want: &mut Vec<u32>) {
+/// island's map round her in the circle, the zones of the radar's movie,
+/// the objective markers (at the rim when farther) and her arrow.
+fn minimap(
+    view: &MapView,
+    state: &HudState,
+    zones: &[Zone],
+    out: &mut Vec<Prim>,
+    want: &mut Vec<u32>,
+) {
     let [cx, cy] = view.centre();
     let r = view.radius();
     let white = [1.0; 4];
@@ -1085,6 +1257,18 @@ fn minimap(view: &MapView, state: &HudState, out: &mut Vec<Prim>, want: &mut Vec
             colour: white,
         });
     }
+    // The movie's zones over the map (it is laid over the minimap, the
+    // same size): its lines one of its 256 pixels across.
+    let disc: Vec<[f32; 2]> = (0..SIDES)
+        .map(|i| {
+            let (s, c) = rim(i).to_radians().sin_cos();
+            [cx + s * r, cy - c * r]
+        })
+        .collect();
+    let line = (2.0 * r / MOVIE_SIZE).max(1.0);
+    for zone in zones {
+        zone.draw(view, &disc, line, out);
+    }
     for (at, icon, colour) in &state.blips {
         let ([x, y], inside) = view.screen(at[0], at[2]);
         // Farther ones sit on the rim, towards them.
@@ -1111,6 +1295,261 @@ fn minimap(view: &MapView, state: &HudState, out: &mut Vec<Prim>, want: &mut Vec
         white,
         view.heading - state.facing,
     ));
+}
+
+/// A region on the radar, as the mission's scripts put it there
+/// (`Hud.Radar:AddLineRegion`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RadarRegion {
+    /// The region object's name (`BoundaryIntro`).
+    pub name: String,
+    /// `nRed`, `nGreen`, `nBlue` and `nAlpha` as the scripts gave them
+    /// (0..=255; None takes the radar's default).
+    pub colour: [Option<f64>; 4],
+    /// Shaded outside the outline rather than inside.
+    pub invert: bool,
+}
+
+/// The radar's movie (`minimap.gfx`) is this many pixels square.
+const MOVIE_SIZE: f32 = 256.0;
+
+/// A zone as the radar's movie draws it (`DrawZone`): the outline filled
+/// with `beginFill(sColor, nAlpha)` and stroked with `lineStyle(1, sColor,
+/// nAlpha * 2)` (alphas in percent; the stroke's is opaque past 100). An
+/// inverted zone (`bInvert`, the world's boundary) shades what lies
+/// outside the outline instead.
+#[derive(Clone, Debug, PartialEq)]
+struct Zone {
+    /// Corners, world (x, z).
+    outline: Vec<[f32; 2]>,
+    fill: [f32; 4],
+    line: [f32; 4],
+    invert: bool,
+}
+
+impl Zone {
+    /// Region `region` placed at `position` turned `yaw` radians (as
+    /// [`m2_assets::Region::contains`] places it), in colour `0xRRGGBB`
+    /// at `alpha` percent.
+    fn new(
+        region: &m2_assets::Region,
+        position: [f32; 3],
+        yaw: f32,
+        rgb: u32,
+        alpha: f32,
+        invert: bool,
+    ) -> Self {
+        let (s, c) = yaw.sin_cos();
+        let outline = region
+            .corners
+            .iter()
+            .map(|&[x, z]| [position[0] + x * c + z * s, position[2] - x * s + z * c])
+            .collect();
+        let [_, red, green, blue] = rgb.to_be_bytes().map(|v| f32::from(v) / 255.0);
+        Self {
+            outline,
+            fill: [red, green, blue, (alpha / 100.0).clamp(0.0, 1.0)],
+            line: [red, green, blue, (alpha * 2.0 / 100.0).clamp(0.0, 1.0)],
+            invert,
+        }
+    }
+
+    /// The zone's quads on the minimap `view`, inside `disc` (its rim, a
+    /// convex polygon round the centre), its stroke `line` pixels wide.
+    fn draw(&self, view: &MapView, disc: &[[f32; 2]], line: f32, out: &mut Vec<Prim>) {
+        let outline: Vec<[f32; 2]> = self
+            .outline
+            .iter()
+            .map(|&[x, z]| view.screen(x, z).0)
+            .collect();
+        if outline.len() < 3 {
+            return;
+        }
+        // Even-odd: an inverted zone is the disc (a little larger, so its
+        // own edge is never drawn) less the outline.
+        let [cx, cy] = view.centre();
+        let mut contours = vec![outline.clone()];
+        if self.invert {
+            contours.push(
+                disc.iter()
+                    .map(|&[x, y]| [cx + (x - cx) * 1.01, cy + (y - cy) * 1.01])
+                    .collect(),
+            );
+        }
+        let r = view.radius();
+        for trapezoid in even_odd(&contours, cy - r, cy + r) {
+            fan(&clip_convex(&trapezoid, disc), self.fill, out);
+        }
+        let n = outline.len();
+        for i in 0..n {
+            if let Some((a, b)) = segment_in_circle(outline[i], outline[(i + 1) % n], [cx, cy], r) {
+                out.push(stroke(a, b, line, self.line));
+            }
+        }
+    }
+}
+
+/// The region inside `contours` (by the even-odd rule) between heights
+/// `top` and `bottom`, as trapezoids (corners clockwise on the screen):
+/// slabs between every corner's height (and every crossing of two edges),
+/// each cut where edges cross its middle and filled between every other
+/// pair.
+fn even_odd(contours: &[Vec<[f32; 2]>], top: f32, bottom: f32) -> Vec<[[f32; 2]; 4]> {
+    let edges: Vec<([f32; 2], [f32; 2])> = contours
+        .iter()
+        .flat_map(|c| (0..c.len()).map(move |i| (c[i], c[(i + 1) % c.len()])))
+        .filter(|(a, b)| a[1] != b[1])
+        .collect();
+    let mut ys: Vec<f32> = vec![top, bottom];
+    ys.extend(edges.iter().map(|(a, _)| a[1]));
+    for (i, &(a, b)) in edges.iter().enumerate() {
+        for &(c, d) in &edges[i + 1..] {
+            if let Some(y) = crossing_height(a, b, c, d) {
+                ys.push(y);
+            }
+        }
+    }
+    ys.retain(|y| (top..=bottom).contains(y));
+    ys.sort_by(f32::total_cmp);
+    ys.dedup_by(|a, b| (*a - *b).abs() < 1e-3);
+    let x_at =
+        |(a, b): ([f32; 2], [f32; 2]), y: f32| a[0] + (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]);
+    let mut out = Vec::new();
+    for slab in ys.windows(2) {
+        let (y0, y1) = (slab[0], slab[1]);
+        let mid = (y0 + y1) / 2.0;
+        let mut across: Vec<(f32, f32, f32)> = edges
+            .iter()
+            .filter(|(a, b)| (a[1].min(b[1])..b[1].max(a[1])).contains(&mid))
+            .map(|&e| (x_at(e, mid), x_at(e, y0), x_at(e, y1)))
+            .collect();
+        across.sort_by(|p, q| p.0.total_cmp(&q.0));
+        for pair in across.chunks_exact(2) {
+            let ((_, l0, l1), (_, r0, r1)) = (pair[0], pair[1]);
+            out.push([[l0, y0], [r0, y0], [r1, y1], [l1, y1]]);
+        }
+    }
+    out
+}
+
+/// The height where segments `a b` and `c d` cross, if they do.
+fn crossing_height(a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) -> Option<f32> {
+    let (r, s) = ([b[0] - a[0], b[1] - a[1]], [d[0] - c[0], d[1] - c[1]]);
+    let denom = r[0] * s[1] - r[1] * s[0];
+    if denom.abs() < 1e-9 {
+        return None;
+    }
+    let (qx, qy) = (c[0] - a[0], c[1] - a[1]);
+    let t = (qx * s[1] - qy * s[0]) / denom;
+    let u = (qx * r[1] - qy * r[0]) / denom;
+    ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u)).then(|| a[1] + t * r[1])
+}
+
+/// Convex polygon `poly` cut to convex polygon `clip` (both wound the
+/// same way round; Sutherland-Hodgman).
+fn clip_convex(poly: &[[f32; 2]], clip: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    // The clip's winding: inside is on this side of each edge.
+    let n = clip.len();
+    let area: f32 = (0..n)
+        .map(|i| {
+            let (p, q) = (clip[i], clip[(i + 1) % n]);
+            p[0] * q[1] - q[0] * p[1]
+        })
+        .sum();
+    let side = area.signum();
+    let mut out = poly.to_vec();
+    for i in 0..n {
+        if out.is_empty() {
+            break;
+        }
+        let (p, q) = (clip[i], clip[(i + 1) % n]);
+        let inside = |v: [f32; 2]| {
+            ((q[0] - p[0]) * (v[1] - p[1]) - (q[1] - p[1]) * (v[0] - p[0])) * side >= 0.0
+        };
+        let cut = |a: [f32; 2], b: [f32; 2]| {
+            let (da, db) = (
+                (q[0] - p[0]) * (a[1] - p[1]) - (q[1] - p[1]) * (a[0] - p[0]),
+                (q[0] - p[0]) * (b[1] - p[1]) - (q[1] - p[1]) * (b[0] - p[0]),
+            );
+            let t = da / (da - db);
+            [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+        };
+        let input = std::mem::take(&mut out);
+        for j in 0..input.len() {
+            let (a, b) = (input[j], input[(j + 1) % input.len()]);
+            match (inside(a), inside(b)) {
+                (true, true) => out.push(b),
+                (true, false) => out.push(cut(a, b)),
+                (false, true) => {
+                    out.push(cut(a, b));
+                    out.push(b);
+                }
+                (false, false) => {}
+            }
+        }
+    }
+    out
+}
+
+/// A convex polygon as triangles from its first corner, untextured.
+fn fan(poly: &[[f32; 2]], colour: [f32; 4], out: &mut Vec<Prim>) {
+    for i in 1..poly.len().saturating_sub(1) {
+        let (a, b, c) = (poly[0], poly[i], poly[i + 1]);
+        out.push(Prim {
+            texture: None,
+            corners: [a, b, c, c],
+            uv: [[0.0; 2]; 4],
+            colour,
+        });
+    }
+}
+
+/// The part of segment `a b` inside the circle round `centre`.
+fn segment_in_circle(
+    a: [f32; 2],
+    b: [f32; 2],
+    centre: [f32; 2],
+    r: f32,
+) -> Option<([f32; 2], [f32; 2])> {
+    let (d, f) = (
+        [b[0] - a[0], b[1] - a[1]],
+        [a[0] - centre[0], a[1] - centre[1]],
+    );
+    let qa = d[0] * d[0] + d[1] * d[1];
+    if qa < 1e-9 {
+        return None;
+    }
+    let qb = 2.0 * (f[0] * d[0] + f[1] * d[1]);
+    let qc = f[0] * f[0] + f[1] * f[1] - r * r;
+    let disc = qb * qb - 4.0 * qa * qc;
+    if disc <= 0.0 {
+        return None;
+    }
+    let root = disc.sqrt();
+    let t0 = ((-qb - root) / (2.0 * qa)).max(0.0);
+    let t1 = ((-qb + root) / (2.0 * qa)).min(1.0);
+    (t0 < t1).then(|| {
+        let at = |t: f32| [a[0] + d[0] * t, a[1] + d[1] * t];
+        (at(t0), at(t1))
+    })
+}
+
+/// A line from `a` to `b`, `width` across, untextured.
+fn stroke(a: [f32; 2], b: [f32; 2], width: f32, colour: [f32; 4]) -> Prim {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let k = width / 2.0 / dx.hypot(dy).max(1e-6);
+    let (nx, ny) = (-dy * k, dx * k);
+    Prim {
+        texture: None,
+        corners: [
+            [a[0] + nx, a[1] + ny],
+            [b[0] + nx, b[1] + ny],
+            [b[0] - nx, b[1] - ny],
+            [a[0] - nx, a[1] - ny],
+        ],
+        uv: [[0.0; 2]; 4],
+        colour,
+    }
 }
 
 /// The part of a rectangle's quad in the wedge from its centre between
@@ -1462,5 +1901,89 @@ mod tests {
         assert_eq!(a.hurts.len(), 2);
         assert_eq!(a.messages.len(), 1);
         assert_eq!(a.hp, 85.0);
+    }
+
+    /// The area of the prims drawn in `alpha` (quads; a triangle's last
+    /// corner doubled).
+    fn area(prims: &[Prim], alpha: f32) -> f32 {
+        prims
+            .iter()
+            .filter(|p| p.colour[3] == alpha)
+            .map(|p| {
+                let c = p.corners;
+                (0..4)
+                    .map(|i| c[i][0] * c[(i + 1) % 4][1] - c[(i + 1) % 4][0] * c[i][1])
+                    .sum::<f32>()
+                    .abs()
+                    / 2.0
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_zone_shades_its_inside_or_inverted_the_rest_of_the_disc() {
+        // A minimap 100 pixels across showing 50 m round her: a pixel a
+        // metre. The region is 20 m square round her.
+        let view = MapView {
+            rect: [0.0, 0.0, 100.0, 100.0],
+            player: [0.0; 3],
+            heading: 0.0,
+            range: 50.0,
+        };
+        let disc: Vec<[f32; 2]> = (0..48)
+            .map(|i| {
+                let (s, c) = (i as f32 * 7.5).to_radians().sin_cos();
+                [50.0 + s * 50.0, 50.0 - c * 50.0]
+            })
+            .collect();
+        let disc_area = 24.0 * 2500.0 * 7.5f32.to_radians().sin();
+        let region = m2_assets::Region {
+            flags: 0,
+            unk_0x04: 0,
+            corners: vec![[-10.0, -10.0], [10.0, -10.0], [10.0, 10.0], [-10.0, 10.0]],
+        };
+        // Black at 40%: filled at 0.4, stroked at 0.8.
+        for (invert, want) in [(false, 400.0), (true, disc_area - 400.0)] {
+            let zone = Zone::new(&region, [0.0; 3], 0.3, 0x000000, 40.0, invert);
+            let mut out = Vec::new();
+            zone.draw(&view, &disc, 1.0, &mut out);
+            let filled = area(&out, 0.4);
+            assert!(
+                (filled - want).abs() < 2.0,
+                "invert {invert}: {filled} not {want}"
+            );
+            // The stroke: four sides of 20, a pixel wide.
+            assert!((area(&out, 0.8) - 80.0).abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn a_zone_reaching_past_the_rim_is_cut_to_it() {
+        let view = MapView {
+            rect: [0.0, 0.0, 100.0, 100.0],
+            player: [0.0; 3],
+            heading: 0.0,
+            range: 50.0,
+        };
+        let disc: Vec<[f32; 2]> = (0..48)
+            .map(|i| {
+                let (s, c) = (i as f32 * 7.5).to_radians().sin_cos();
+                [50.0 + s * 50.0, 50.0 - c * 50.0]
+            })
+            .collect();
+        let disc_area = 24.0 * 2500.0 * 7.5f32.to_radians().sin();
+        // Half the island, past her on one side: half the disc.
+        let region = m2_assets::Region {
+            flags: 0,
+            unk_0x04: 0,
+            corners: vec![[0.0, -500.0], [500.0, -500.0], [500.0, 500.0], [0.0, 500.0]],
+        };
+        let zone = Zone::new(&region, [0.0; 3], 0.0, 0x400000, 60.0, false);
+        let mut out = Vec::new();
+        zone.draw(&view, &disc, 1.0, &mut out);
+        let filled = area(&out, 0.6);
+        assert!((filled - disc_area / 2.0).abs() < 2.0, "{filled}");
+        // Only the edge through her is stroked: a diameter.
+        assert!((area(&out, 1.0) - 100.0).abs() < 1.0);
     }
 }

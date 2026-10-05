@@ -40,6 +40,7 @@ use crate::combat::Weapon;
 use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
+use crate::gamehud::RadarRegion;
 use crate::scene::NOT_DRIVABLE;
 
 /// The scripts run ten times a second.
@@ -86,10 +87,40 @@ pub struct MissionView {
     pub game_message: Option<ObjectiveMessage>,
     /// The contract was just completed (for [`BANNER_TIME`] seconds).
     pub contract_complete: bool,
+    /// The regions the scripts have on the radar (see [`RADAR_REGIONS`]).
+    pub radar_regions: Vec<RadarRegion>,
 }
 
 /// Seconds the contract's completion stays up.
 const BANNER_TIME: f32 = 10.0;
+
+/// The regions the scripts put on the radar (`Hud.Radar:AddLineRegion`:
+/// the world's boundary, shaded outside, as `WifVzBoundary` draws it),
+/// kept by the region's name in `__m2_radar_regions` for the game HUD,
+/// which runs the radar in a Lua state of its own. Here the call reaches
+/// no radar (there are no widgets in this state) and goes on as it would.
+const RADAR_REGIONS: &str = r#"
+__m2_radar_regions = {}
+local radar = Hud and Hud.Radar
+if radar then
+    local add, remove = radar.AddLineRegion, radar.RemoveLineRegion
+    radar.AddLineRegion = function(self, t)
+        local name = t and t.uGuid and Object.GetName(t.uGuid)
+        if name then
+            __m2_radar_regions[name] = {
+                nRed = t.nRed, nGreen = t.nGreen, nBlue = t.nBlue,
+                nAlpha = t.nAlpha, bInvert = t.bInvert and true or false,
+            }
+        end
+        if add then return add(self, t) end
+    end
+    radar.RemoveLineRegion = function(self, t)
+        local name = t and t.uGuid and Object.GetName(t.uGuid)
+        if name then __m2_radar_regions[name] = nil end
+        if remove then return remove(self, t) end
+    end
+end
+"#;
 
 /// People this near a marker's target are listed with it, metres; story
 /// characters' spawns this near the player.
@@ -417,6 +448,9 @@ impl MissionLink {
         match Mission::new(data, "Mattias", at) {
             Ok(mut mission) => {
                 mission.fly_deliveries();
+                if let Err(e) = mission.run(RADAR_REGIONS, "radar regions") {
+                    self.write([format!("radar regions: {e}")]);
+                }
                 for (name, code) in std::mem::take(&mut self.drivers) {
                     if let Err(e) = mission.run(&code, &name) {
                         self.write([format!("{name}: {e}")]);
@@ -713,8 +747,31 @@ impl MissionLink {
             message,
             game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
+            radar_regions: radar_regions(mission.lua()),
         }
     }
+}
+
+/// The regions [`RADAR_REGIONS`] keeps, by name.
+fn radar_regions(lua: &mlua::Lua) -> Vec<RadarRegion> {
+    let Ok(Some(regions)) = lua
+        .globals()
+        .get::<Option<mlua::Table>>("__m2_radar_regions")
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<RadarRegion> = regions
+        .pairs::<String, mlua::Table>()
+        .flatten()
+        .map(|(name, t)| RadarRegion {
+            colour: ["nRed", "nGreen", "nBlue", "nAlpha"]
+                .map(|k| t.get::<Option<f64>>(k).ok().flatten()),
+            invert: t.get("bInvert").unwrap_or(false),
+            name,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 impl Fleet {
