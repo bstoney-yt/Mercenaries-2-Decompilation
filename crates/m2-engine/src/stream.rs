@@ -26,7 +26,8 @@ use m2_math::glam::{Mat4, Quat, Vec3, Vec4, Vec4Swizzles};
 use m2_render::{
     BackendError, BlendMode, BufferUsage, DetailMap, DrawCall, DrawQueue, Geometry,
     IndexBufferDesc, IndexBufferHandle, IndexFormat, Layer, MaterialDesc, MaterialId, Primitive,
-    RenderBackend, TerrainLayer, Topology, VertexBufferDesc, VertexBufferHandle,
+    Reflection, RenderBackend, Specular, TerrainLayer, Topology, VertexBufferDesc,
+    VertexBufferHandle,
 };
 
 use m2_assets::model::ModelInfo;
@@ -1332,12 +1333,49 @@ fn log_terrain(hash: u32, mesh: &TerrainMesh, gpu: &TerrainGpu, materials: &Mate
 
 /// A 20 km square of translucent water at `level`, centred on the origin,
 /// with `foam` along its shores.
+/// The sea material's constants the game's water shader takes:
+/// `constant0.x` (reflection strength), `R0` (reflectance facing the eye),
+/// `constant0.z` (glint exponent) and the specular colour (taken grey).
+/// Not yet read from the game's water material: `M2_SEA` sets them as
+/// `reflection,r0,power,glint`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SeaConstants {
+    reflection: f32,
+    r0: f32,
+    power: f32,
+    glint: f32,
+}
+
+impl SeaConstants {
+    fn get() -> Self {
+        let mut c = Self {
+            reflection: 1.0,
+            r0: 0.02,
+            power: 400.0,
+            glint: 3.0,
+        };
+        if let Ok(v) = std::env::var("M2_SEA") {
+            let f: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            if let [reflection, r0, power, glint] = f[..] {
+                c = Self {
+                    reflection,
+                    r0,
+                    power,
+                    glint,
+                };
+            }
+        }
+        c
+    }
+}
+
 fn sea_plane(
     backend: &mut dyn RenderBackend,
     materials: &mut MaterialCache,
     level: f32,
     foam: Option<m2_render::TextureHandle>,
 ) -> Result<(VertexBufferHandle, IndexBufferHandle, MaterialId), BackendError> {
+    let sea = SeaConstants::get();
     let h = 10_000.0f32;
     let vertices: Vec<u8> = [(-h, h), (h, h), (h, -h), (-h, -h)]
         .iter()
@@ -1373,6 +1411,15 @@ fn sea_plane(
             blend: BlendMode::Translucent,
             double_sided: true,
             water: true,
+            specular: Some(Specular {
+                color: [sea.glint; 3],
+                power: sea.power,
+                map: None,
+            }),
+            reflection: Some(Reflection {
+                strength: sea.reflection,
+                fresnel: Some(sea.r0),
+            }),
             ..MaterialDesc::default()
         },
     )?;

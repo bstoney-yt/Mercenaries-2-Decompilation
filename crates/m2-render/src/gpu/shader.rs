@@ -490,20 +490,39 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             through = distance(v.world_pos, bed);
         }
         let lit = frame.sun_color.rgb * max(dot(n, l), 0.0) * shade;
+        // Sun and ambient summed as the game's water shader does (in
+        // display values when surfaces are lit so), each scaled by the
+        // material's diffuse and ambient colours.
+        let light = light_from_display(
+            light_to_display(frame.sun_color.rgb) * (max(dot(n, l), 0.0) * shade) * material.direct.rgb
+                + ambient_display(n) * material.ambient.rgb,
+        );
         let shallow = vec3<f32>(0.09, 0.30, 0.34);
-        var body = mix(shallow, base.rgb, 1.0 - exp(-depth / 5.0)) * (lit * 0.3 + ambient_light(n));
+        var body = mix(shallow, base.rgb, 1.0 - exp(-depth / 5.0)) * light;
         var opacity = 1.0 - exp(-through * 0.2);
         if frame.water_depth.x > 0.5 {
             // The atmosphere's depth colour map, by the water looked
-            // through, lit as the game's: sun and ambient alike.
+            // through.
             let ramp = water_ramp(through);
-            body = ramp.rgb * (lit + ambient_light(n));
+            body = ramp.rgb * light;
             opacity = ramp.a;
         }
-        let f = 0.02 + 0.98 * pow(1.0 - max(dot(n, view), 0.0), 5.0);
-        let glint = frame.sun_color.rgb * pow(max(dot(n, normalize(l + view)), 0.0), 400.0) * 3.0 * shade;
-        rgb = mix(body, environment(reflect(-view, n)), f) + glint;
-        water_alpha = mix(opacity, 1.0, f);
+        // A Blinn-Phong glint in the sun's colour, added to the body
+        // before the reflection, as the game's.
+        let h = normalize(l + view);
+        let glint = select(0.0, 1.0, dot(n, l) > 0.0) * frame.sun_color.rgb * shade
+            * pow(max(dot(n, h), 0.0), material.specular.a) * material.specular.rgb;
+        body = body + glint;
+        // Schlick's Fresnel from the material's reflectance facing the
+        // eye, times its reflection strength, mixes in the sky mirrored.
+        let r0 = max(material.reflection.y, 0.0);
+        let f = r0 + (1.0 - r0) * pow(1.0 - max(dot(n, view), 0.0), 5.0);
+        let k = clamp(f * material.reflection.x, 0.0, 1.0);
+        // The game mixes the body over what is behind by its opacity, then
+        // the reflection over that; blended here, the same sum is the
+        // body and reflection over the reflection's and body's share.
+        water_alpha = mix(opacity, 1.0, k);
+        rgb = (body * opacity * (1.0 - k) + environment(reflect(-view, n)) * k) / max(water_alpha, 1e-4);
         // Foam along the shore, within about 3 m of it as the game's.
         let pattern = base_texel.a * dot(base_texel.rgb, vec3<f32>(0.3333));
         // Past a hundred metres or so surf is too fine to see; drawn there
