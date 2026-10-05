@@ -318,8 +318,16 @@ impl MaterialCache {
         {
             if tinted {
                 eprintln!(
-                    "tinted material {:08x}: technique {:08x}, flags {:04x}, textures {:08x?}",
-                    material.name_hash, material.technique, material.flags, material.textures
+                    "tinted material {:08x}: technique {:08x}, flags {:04x}, textures {:08x?}{}",
+                    material.name_hash,
+                    material.technique,
+                    material.flags,
+                    material.textures,
+                    if depth_bias {
+                        " (terrain cell mesh)"
+                    } else {
+                        ""
+                    }
                 );
             }
             self.materials.insert(key, id);
@@ -406,18 +414,30 @@ pub mod flags {
 
 /// Whether to draw `material` solid magenta, to find a surface on screen:
 /// `M2_TINT_FLAGS=<hex mask>` picks materials with any of those flag bits,
-/// `M2_TINT_UNTEXTURED=1` those drawn without a base texture. Each one is
-/// logged once its textures are in.
+/// `M2_TINT_MATERIAL=<hex name>,...` those named, `M2_TINT_UNTEXTURED=1`
+/// those drawn without a base texture. Each one is logged once its
+/// textures are in.
 fn debug_tint(material: &Material, textured: bool) -> bool {
-    static SETTINGS: OnceLock<(u16, bool)> = OnceLock::new();
-    let &(mask, untextured) = SETTINGS.get_or_init(|| {
-        let mask = std::env::var("M2_TINT_FLAGS")
+    struct Settings {
+        mask: u16,
+        names: HashSet<u32>,
+        untextured: bool,
+    }
+    static SETTINGS: OnceLock<Settings> = OnceLock::new();
+    let hex = |v: &str| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok();
+    let s = SETTINGS.get_or_init(|| Settings {
+        mask: std::env::var("M2_TINT_FLAGS")
             .ok()
-            .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok())
-            .unwrap_or(0);
-        (mask, std::env::var_os("M2_TINT_UNTEXTURED").is_some())
+            .and_then(|v| hex(&v))
+            .map_or(0, |m| m as u16),
+        names: std::env::var("M2_TINT_MATERIAL")
+            .map(|v| v.split(',').filter_map(hex).collect())
+            .unwrap_or_default(),
+        untextured: std::env::var_os("M2_TINT_UNTEXTURED").is_some(),
     });
-    material.flags & mask != 0 || (untextured && !textured)
+    material.flags & s.mask != 0
+        || s.names.contains(&material.name_hash)
+        || (s.untextured && !textured)
 }
 
 /// A material record's base-colour texture (slot 0).
