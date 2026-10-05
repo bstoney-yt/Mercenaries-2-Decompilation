@@ -52,7 +52,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use m2_assets::{Font, StringTable};
+use m2_assets::{Font, StringTable, name_hash};
 use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::gui::{Anchor, Correction, VIRTUAL_SIZE};
@@ -1184,6 +1184,26 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
     player.raw_set(
         "GetCameraXZHeading",
         safe_function(lua, move |lua, _| ret(lua, s.borrow().heading))?,
+    )?;
+    // `String.GetHash(name)`, likewise in `String`: the support scripts
+    // key their recruits by it (`MrxSupportManager.IsRecruitAvailable`;
+    // the support menu greys out an item whose recruit it can't find).
+    // The archive's name hash: what the scripts compare are their own
+    // hashes, so any consistent hash would do.
+    let string = match lua.globals().raw_get::<Value>("String")? {
+        Value::Table(t) if t.metatable().is_none() => t,
+        _ => {
+            let t = lua.create_table()?;
+            lua.globals().raw_set("String", &t)?;
+            t
+        }
+    };
+    string.raw_set(
+        "GetHash",
+        safe_function(lua, |lua, args| match args.front() {
+            Some(Value::String(s)) => ret(lua, name_hash(&s.to_string_lossy())),
+            _ => ret(lua, Value::Nil),
+        })?,
     )?;
     lua.set_app_data(Rc::clone(&screen));
     Ok(screen)

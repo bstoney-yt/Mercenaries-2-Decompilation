@@ -152,8 +152,9 @@ struct Options {
     /// camera looks), to see the HUD's hit arcs.
     hurt: Vec<f32>,
     /// With `--screenshot` on foot: call a Satellite Guided Bomb on the
-    /// spot ahead of her, the picture through the satellite's view, with
-    /// the timing wheel up, or after the bomb lands.
+    /// spot ahead of her, the picture with the support menu open (menu),
+    /// through the satellite's view, with the timing wheel up, or after
+    /// the bomb lands.
     satellite: Option<SatelliteShot>,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
@@ -177,6 +178,8 @@ struct Options {
 /// How far a `--satellite` call goes with the bomb.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SatelliteShot {
+    /// The support menu open, the bomb in it.
+    Menu,
     /// Looking through the satellite, over the spot.
     View,
     /// The timing wheel, after the first press.
@@ -307,10 +310,11 @@ fn parse_args() -> anyhow::Result<Options> {
             "--closeup" => o.closeup = true,
             "--satellite" => {
                 o.satellite = Some(match value()?.as_str() {
+                    "menu" => SatelliteShot::Menu,
                     "view" => SatelliteShot::View,
                     "wheel" => SatelliteShot::Wheel,
                     "bomb" => SatelliteShot::Bomb,
-                    v => bail!("--satellite {v}: expected view, wheel or bomb"),
+                    v => bail!("--satellite {v}: expected menu, view, wheel or bomb"),
                 })
             }
             "--grip" => {
@@ -2295,9 +2299,9 @@ fn fight_for_screenshot(
 /// Calls a Satellite Guided Bomb on the spot [`SATELLITE_AHEAD`] metres
 /// ahead of her as a player would (the support key, the use key, the view
 /// steered over it and confirmed, the wheel pressed in each wedge), for
-/// the picture: looking through the satellite, with the timing wheel's
-/// check after the first press, or `wait` seconds (at least 0.8) after
-/// the bomb lands, from her camera.
+/// the picture: the support menu just opened, looking through the
+/// satellite, with the timing wheel's check after the first press, or
+/// `wait` seconds (at least 0.8) after the bomb lands, from her camera.
 fn satellite_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -2331,6 +2335,9 @@ fn satellite_for_screenshot(
             ..Trigger::default()
         }),
     );
+    if stage == SatelliteShot::Menu {
+        return Ok(());
+    }
     press(
         game,
         Intent {
