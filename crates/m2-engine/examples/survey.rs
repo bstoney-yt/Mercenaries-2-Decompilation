@@ -694,6 +694,17 @@ fn main() -> Result<(), Error> {
                 )
             }
             "collision" => collision(&mut source, &names, arg),
+            "phy2words" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                phy2_words(
+                    &mut source,
+                    world.as_ref().expect("just built"),
+                    &names,
+                    arg,
+                )
+            }
             "phy2census" => {
                 if world.is_none() {
                     world = Some(WorldIndex::build(&mut source)?);
@@ -1719,10 +1730,16 @@ fn collision<R: Read + Seek>(
             .and_then(|u| u.top_level(*b"PHY2"));
         let Some(p) = phy2.map(Phy2::parse) else {
             let cpu = m2_engine::CpuModel::from_data(&data, 0)?;
-            println!(
-                "  no PHY2: visible triangles stand in ({} collision)",
-                if cpu.collision.is_some() { "a" } else { "no" }
-            );
+            match &cpu.collision {
+                Some(c) => {
+                    let (lo, hi) = c.bounds();
+                    println!(
+                        "  no PHY2: {} visible triangles stand in, filling ({:.2} {:.2} {:.2}) to ({:.2} {:.2} {:.2})",
+                        c.triangles, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
+                    );
+                }
+                None => println!("  no PHY2, and nothing solid drawn: no collision"),
+            }
             continue;
         };
         let p = match p {
@@ -1806,6 +1823,282 @@ fn collision<R: Read + Seek>(
             );
         }
     }
+    Ok(())
+}
+
+/// The raw words of `PHY2` records, to find what tells shapes apart
+/// (foliage from rock, a pole that breaks from a wall): for `arg`'s
+/// models, how the alpha knocks each loose, each body's node (shown
+/// intact, wrecked or both), unknown floats and words, and each shape's
+/// nodes and record words (the vertex pool bounds, count and offset, and
+/// the shape's own index left out); then, over every placed model, how
+/// many come loose and how, shapes and bodies by whether their nodes show
+/// intact or wrecked and their bodies move, and the values of each
+/// unknown word with how many shapes or bodies of models named for
+/// plants, rocks, poles... carry them (words with many values just
+/// counted).
+fn phy2_words<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_assets::physics::{Geometry, Physics as Phy2};
+    /// A model's PHY2, with which of its nodes are hidden intact and
+    /// wrecked (none when it switches nothing).
+    fn phy2_of<R: Read + Seek>(
+        source: &mut AssetSource<R>,
+        h: u32,
+    ) -> Option<(Phy2, [Vec<bool>; 2])> {
+        let data = source.model(h).ok()?;
+        let m = data.parse().ok()?;
+        let hidden = m.states.as_ref().map_or_else(Default::default, |s| {
+            [s.hidden(&m.nodes, false), s.hidden(&m.nodes, true)]
+        });
+        let u = m2_assets::Ucfx::parse(&data.base).ok()?;
+        let p = Phy2::parse(u.top_level(*b"PHY2")?).ok()?;
+        Some((p, hidden))
+    }
+    /// Whether node `n` shows intact and wrecked: 0 both, 1 intact only,
+    /// 2 wrecked only, 3 neither.
+    fn shows(hidden: &[Vec<bool>; 2], n: u32) -> u32 {
+        let off = |w: usize| hidden[w].get(n as usize).copied().unwrap_or(false);
+        u32::from(off(0)) * 2 + u32::from(off(1))
+    }
+    const SHOWS: [&str; 4] = ["both", "intact", "wrecked", "neither"];
+    /// How the alpha knocks the model loose: its pieces (node, kg), and
+    /// whether it breaks into them.
+    fn loose_of<R: Read + Seek>(source: &mut AssetSource<R>, h: u32) -> Option<String> {
+        let data = source.model(h).ok()?;
+        let cpu = m2_engine::CpuModel::from_data(&data, 0).ok()?;
+        let loose = cpu.collision?.loose?;
+        let pieces: Vec<String> = loose
+            .pieces
+            .iter()
+            .map(|q| match q.node {
+                Some(n) => format!("node {n} {:.1} kg", q.mass),
+                None => format!("whole {:.1} kg", q.mass),
+            })
+            .collect();
+        Some(format!(
+            "{} ({}), {:.1} kg in all",
+            if loose.breaks {
+                "breaks into its pieces"
+            } else {
+                "goes as one"
+            },
+            pieces.join(", "),
+            loose.mass
+        ))
+    }
+    let kind = |g: &Geometry| match g {
+        Geometry::Box { .. } => "box",
+        Geometry::Sphere => "sphere",
+        Geometry::Capsule { .. } => "capsule",
+        Geometry::Convex { .. } => "convex",
+        Geometry::Mesh { .. } => "mesh",
+    };
+    // Shape record words not yet understood.
+    const SHAPE_WORDS: [usize; 15] = [0, 1, 2, 4, 11, 12, 13, 14, 15, 17, 19, 20, 21, 22, 23];
+    for h in arg.split(',').filter_map(hex) {
+        let Some((p, hidden)) = phy2_of(source, h) else {
+            println!("{h:08x}: no PHY2");
+            continue;
+        };
+        println!(
+            "{h:08x} {}: header {:08x?}, {}",
+            names.show(h),
+            p.unk_0x14,
+            if hidden[0] == hidden[1] {
+                "no wreck"
+            } else {
+                "has a wreck"
+            }
+        );
+        println!(
+            "  knocked loose: {}",
+            loose_of(source, h).unwrap_or_else(|| "never (no body moves)".into())
+        );
+        // The node a body sits on: its part's.
+        let body_node = |b: usize| p.parts.iter().find(|q| q.body == Some(b)).map(|q| q.node);
+        for (i, b) in p.bodies.iter().enumerate() {
+            let node = body_node(i);
+            println!(
+                "  body {i} {} {:.1} kg on node {node:?} (shows {}): centre {:?} unk {:?} words {:08x?}",
+                if b.is_fixed() { "fixed" } else { "moves" },
+                b.mass,
+                node.map_or("?", |n| SHOWS[shows(&hidden, n) as usize]),
+                b.centre_of_mass,
+                b.unk,
+                b.unk_words
+            );
+        }
+        for (k, shape) in p.shapes.iter().enumerate() {
+            let words: Vec<String> = SHAPE_WORDS
+                .iter()
+                .map(|&w| format!("{w}:{:x}", shape.record[w]))
+                .collect();
+            let own = p.parts.get(shape.part).map(|q| q.node);
+            println!(
+                "  shape {k} {} on body {:?}, part node {own:?} (shows {}), body node {:?}: {}",
+                kind(&shape.geometry),
+                p.body_of(k),
+                own.map_or("?", |n| SHOWS[shows(&hidden, n) as usize]),
+                p.shape_node(k),
+                words.join(" ")
+            );
+        }
+        let links: Vec<String> = p
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, part)| part.unk_link != u32::MAX)
+            .map(|(i, part)| format!("{i}:{:x}", part.unk_link))
+            .collect();
+        if !links.is_empty() {
+            println!("  parts' unknown links: {}", links.join(" "));
+        }
+    }
+    // Over every placed model: values of each unknown word, by the kind
+    // of thing its model's name says it is.
+    const KINDS: [&str; 14] = [
+        "plant",
+        "bush",
+        "scrub",
+        "tree",
+        "rock",
+        "pole",
+        "fence",
+        "sign",
+        "lamp",
+        "barrel",
+        "crate",
+        "wall",
+        "sandbag",
+        "barricade",
+    ];
+    let mut models: Vec<u32> = world
+        .objects
+        .iter()
+        .map(|o| o.model)
+        .chain(world.state_objects.values().map(|o| o.model))
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    // word -> value -> (count, per kind (+ other, unnamed)).
+    type Tally = BTreeMap<usize, HashMap<u32, (usize, [usize; 16])>>;
+    let mut shape_tally: Tally = BTreeMap::new();
+    let mut body_tally: Tally = BTreeMap::new();
+    let class = |h: u32| {
+        names.get(h).map_or(15, |n| {
+            KINDS.iter().position(|k| n.contains(k)).unwrap_or(14)
+        })
+    };
+    // Shapes and bodies by whether their node shows intact or wrecked and
+    // their body moves: [shows][moves].
+    let mut shape_shows = [[0usize; 2]; 4];
+    let mut body_shows = [[0usize; 2]; 4];
+    let (mut wrecks, mut moving_wrecks) = (0, 0);
+    // Placed models the alpha knocks loose: as one, into pieces.
+    let (mut as_one, mut to_pieces) = (0, 0);
+    for &h in &models {
+        match loose_of(source, h) {
+            Some(l) if l.starts_with("breaks") => to_pieces += 1,
+            Some(_) => as_one += 1,
+            None => {}
+        }
+        let Some((p, hidden)) = phy2_of(source, h) else {
+            continue;
+        };
+        let c = class(h);
+        let moves = |b: Option<usize>| {
+            b.and_then(|b| p.bodies.get(b))
+                .is_some_and(|b| !b.is_fixed())
+        };
+        if hidden[0] != hidden[1] {
+            wrecks += 1;
+            moving_wrecks += usize::from(p.bodies.iter().any(|b| !b.is_fixed()));
+        }
+        for (k, shape) in p.shapes.iter().enumerate() {
+            let node = p.parts.get(shape.part).map_or(0, |q| q.node);
+            let show = shows(&hidden, node);
+            shape_shows[show as usize][usize::from(moves(p.body_of(k)))] += 1;
+            // Pseudo-word 100: shows (0 both, 1 intact, 2 wrecked, 3
+            // neither) plus 4 when its body moves.
+            let words = SHAPE_WORDS
+                .iter()
+                .map(|&w| (w, shape.record[w]))
+                .chain([(100, show + 4 * u32::from(moves(p.body_of(k))))]);
+            for (w, v) in words {
+                let e = shape_tally.entry(w).or_default().entry(v).or_default();
+                e.0 += 1;
+                e.1[c] += 1;
+            }
+        }
+        for (i, b) in p.bodies.iter().enumerate() {
+            let node = p
+                .parts
+                .iter()
+                .find(|q| q.body == Some(i))
+                .map_or(0, |q| q.node);
+            let show = shows(&hidden, node);
+            body_shows[show as usize][usize::from(!b.is_fixed())] += 1;
+            let words = b
+                .unk
+                .iter()
+                .map(|f| f.to_bits())
+                .chain(b.unk_words.iter().copied())
+                .chain([u32::from(b.is_fixed()), show]);
+            for (w, v) in words.enumerate() {
+                let e = body_tally.entry(w).or_default().entry(v).or_default();
+                e.0 += 1;
+                e.1[c] += 1;
+            }
+        }
+    }
+    let show = |what: &str, tally: &Tally| {
+        for (w, values) in tally {
+            if values.len() > 24 {
+                println!("{what} word {w}: {} values", values.len());
+                continue;
+            }
+            let mut v: Vec<(&u32, &(usize, [usize; 16]))> = values.iter().collect();
+            v.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+            for (value, (n, by)) in v.iter().take(8) {
+                let kinds: Vec<String> = by
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, k)| **k > 0)
+                    .map(|(i, k)| {
+                        let name = match i {
+                            14 => "other",
+                            15 => "unnamed",
+                            _ => KINDS[i],
+                        };
+                        format!("{name} {k}")
+                    })
+                    .collect();
+                println!(
+                    "{what} word {w} = {value:08x} ({:.3}): {n} [{}]",
+                    f32::from_bits(**value),
+                    kinds.join(", ")
+                );
+            }
+        }
+    };
+    println!("over {} placed models' PHY2:", models.len());
+    println!("{wrecks} models with PHY2 have a wreck, {moving_wrecks} of them a body that moves");
+    println!("knocked loose: {as_one} models go as one, {to_pieces} break into their pieces");
+    for (what, counts) in [("shapes", shape_shows), ("bodies", body_shows)] {
+        for (i, [fixed, moving]) in counts.iter().enumerate() {
+            println!(
+                "{what} on nodes shown {}: {fixed} fixed, {moving} moving",
+                SHOWS[i]
+            );
+        }
+    }
+    show("shape", &shape_tally);
+    show("body", &body_tally);
     Ok(())
 }
 

@@ -17,7 +17,11 @@ m2-alpha [options]
   --size <w>x<h>         window size
   --vsync on|off
   --fullscreen
+<<<<<<< HEAD
   --sea <metres>         sea level (default -36, the game's water shader)
+=======
+  --sea <metres>         sea level (default -36, the game's)
+>>>>>>> origin/claude/project-thread-a0j3gw
   --double-sided         start with back-face culling off (as F3)
   --screenshot <out.ppm> render one frame offscreen and exit
   --drive                with --screenshot on the island: get in the
@@ -73,7 +77,13 @@ m2-alpha [options]
                          marked soldiers, rockets the marked gates, takes
                          the vehicles brought, going a way planned round
                          walls, the sea and steep ground), logging how it
-                         goes, until it is done or --mission-seconds are up
+                         goes, until it is done or --mission-seconds are up;
+                         each delivery is pictured beside the screenshot as
+                         its helicopter hovers (<out>-delivery1.ppm, ...)
+                         and once its load is down (-delivery1-down.ppm),
+                         and the start's boat five seconds after she is
+                         seated in it (-boat.ppm) and her three seconds
+                         after she gets out of it (-ashore.ppm)
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.

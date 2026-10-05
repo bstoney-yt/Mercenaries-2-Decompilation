@@ -93,10 +93,10 @@ const KILL: f32 = 4.0;
 /// How hard a blast throws people: (out, up) m/s at its heart, on top of
 /// 3 out and 2 up at the edge of its reach. Invented, to look like the
 /// game's flung bodies.
-const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
+pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 /// How hard a rifle round shoves the one it kills, m/s.
 const SHOT_PUSH: f32 = 2.0;
-const REACH: f32 = 9.0;
+pub(crate) const REACH: f32 = 9.0;
 const WRECK: f32 = 6.0;
 
 /// A hand weapon's model and where its muzzle is, model space.
@@ -346,6 +346,12 @@ pub enum Effect {
     Smoke { at: Vec3, size: f32 },
     /// A fireball, growing.
     Fire { at: Vec3, size: f32 },
+    /// Spray thrown off a boat's hull: a white puff flying `drift` metres
+    /// over its life, growing and then gone.
+    Spray { at: Vec3, drift: Vec3, size: f32 },
+    /// Churned water behind a boat: a flat white patch on the surface,
+    /// `size` across, spreading.
+    Wake { at: Vec3, size: f32 },
 }
 
 /// A sound the fight makes.
@@ -428,6 +434,8 @@ pub struct Combat {
     pub blasts: u32,
     /// Where the last one went off.
     pub last_blast: Option<Vec3>,
+    /// Where blasts went off in the last step.
+    pub went_off: Vec<Vec3>,
     /// The last rocket: from the launcher, towards what the crosshair was on.
     pub last_launch: Option<(Vec3, Vec3)>,
     /// Blasts about to go off (something explosive caught): where, and
@@ -457,6 +465,7 @@ impl Default for Combat {
             hits: 0,
             blasts: 0,
             last_blast: None,
+            went_off: Vec::new(),
             last_launch: None,
             fuses: Vec::new(),
             fires: Vec::new(),
@@ -579,6 +588,12 @@ impl Combat {
         self.effects.push((e, seconds, seconds));
     }
 
+    /// Shows `e` for `seconds`, for what isn't the fight's (a boat's
+    /// spray).
+    pub fn show(&mut self, e: Effect, seconds: f32) {
+        self.effect(e, seconds);
+    }
+
     /// Where she is a target: her chest, or `None` while down, flying or
     /// not yet landed.
     pub fn target(&self, field_player: &Player, playing: bool) -> Option<Vec3> {
@@ -589,6 +604,7 @@ impl Combat {
     /// One fixed tick: her weapons, the soldiers' shots, projectiles,
     /// health and effects.
     pub fn step(&mut self, f: &mut Field<'_>, trigger: Trigger, dt: f32) {
+        self.went_off.clear();
         for e in &mut self.effects {
             e.1 -= dt;
         }
@@ -1107,6 +1123,7 @@ impl Combat {
     pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.blasts += 1;
         self.last_blast = Some(at);
+        self.went_off.push(at);
         self.sounds.push(Sound::Explosion(at));
         self.effect(Effect::Fire { at, size: 4.0 }, 0.6);
         for k in 0..6 {

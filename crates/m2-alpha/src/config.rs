@@ -22,7 +22,7 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorldConfig {
-    /// Height of the sea, metres (an estimate: the game's is not decoded).
+    /// Height of the sea, metres (the game's is -36).
     pub sea_level: f32,
 }
 
