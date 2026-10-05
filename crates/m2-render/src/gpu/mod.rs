@@ -192,6 +192,14 @@ struct FrameUniforms {
     shadow_splits: [f32; 4],
     /// Metres per shadow texel in each cascade.
     shadow_texels: [f32; 4],
+    /// Clip space back to the world.
+    inv_view_proj: [f32; 16],
+    /// Haze: Rayleigh scattering, the Mie phase function's g; Mie
+    /// scattering, in-scattering multiplier; extinction multiplier and the
+    /// two scale heights.
+    rayleigh: [f32; 4],
+    mie: [f32; 4],
+    scatter: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -341,6 +349,7 @@ pub struct WgpuBackend {
     started: std::time::Instant,
     /// Bloom, exposure and grade after the world.
     post: post::Post,
+    sky: wgpu::RenderPipeline,
     /// The cascades the shadow map holds, as last drawn.
     cascades: std::cell::Cell<Option<shadow::Cascades>>,
     vertex_buffers: Slots<VertexBuffer>,
@@ -614,6 +623,47 @@ impl WgpuBackend {
                 ],
                 immediate_size: 0,
             });
+        let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky"),
+            bind_group_layouts: &[Some(&frame_layout)],
+            immediate_size: 0,
+        });
+        let sky_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sky"),
+            source: wgpu::ShaderSource::Wgsl(shader::sky_source().into()),
+        });
+        // Drawn first, behind everything: no depth test or write.
+        let sky = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky"),
+            layout: Some(&sky_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_module,
+                entry_point: Some("vs_sky"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_module,
+                entry_point: Some("fs_sky"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: post::HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let frame_uniforms = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -769,6 +819,7 @@ impl WgpuBackend {
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
             post,
+            sky,
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
@@ -1445,6 +1496,15 @@ impl WgpuBackend {
             }),
             shadow_splits: cascades.map_or([0.0; 4], |c| c.splits),
             shadow_texels: cascades.map_or([0.0; 4], |c| c.texels),
+            inv_view_proj: (view.projection * view.view).inverse().to_cols_array(),
+            rayleigh: l.haze.rayleigh.extend(l.haze.g).to_array(),
+            mie: l.haze.mie.extend(l.haze.inscattering).to_array(),
+            scatter: [
+                l.haze.extinction,
+                l.haze.rayleigh_height,
+                l.haze.mie_height,
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
@@ -1485,6 +1545,8 @@ impl WgpuBackend {
                 multiview_mask: None,
             });
             pass.set_bind_group(0, &self.frame_group, &[]);
+            pass.set_pipeline(&self.sky);
+            pass.draw(0..3, 0..1);
             // State is set only when it changes: the queue has sorted the
             // draws so neighbours share pipelines, materials and buffers,
             // and each command costs time to record and submit.

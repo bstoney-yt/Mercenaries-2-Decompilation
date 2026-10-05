@@ -23,7 +23,7 @@
 use m2_assets::layer::Layer;
 use m2_assets::name_hash;
 use m2_math::glam::Vec3;
-use m2_render::Lighting;
+use m2_render::{Haze, Lighting};
 
 /// Settings read from an `AtmosphereBase` record.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -112,8 +112,36 @@ impl Atmosphere {
         lighting.rim_color = self.rim;
         lighting.rim_threshold = self.rim_threshold;
         lighting.sun_color = Lighting::default().sun_color * self.light_intensity;
+        lighting.haze = self.haze();
+    }
+
+    /// The haze these settings describe: Hoffman and Preetham's standard
+    /// Rayleigh and Mie scattering (Mie for a turbidity of 2), scaled by
+    /// the `Scatter...` multipliers. That the game's multipliers apply to
+    /// these standard coefficients is inferred: its shaders take the
+    /// products from code, and with them the haze thins a few percent per
+    /// kilometre as it does in the game's footage.
+    pub fn haze(&self) -> Haze {
+        if self.inscattering <= 0.0 {
+            return Haze::default();
+        }
+        Haze {
+            rayleigh: RAYLEIGH,
+            mie: MIE * self.mie,
+            g: self.hg_g,
+            inscattering: self.inscattering,
+            extinction: self.extinction,
+            ..Haze::default()
+        }
     }
 }
+
+/// Rayleigh scattering of air per metre at 650, 570 and 475 nm.
+const RAYLEIGH: Vec3 = Vec3::new(6.95e-6, 1.18e-5, 2.44e-5);
+/// Mie scattering per metre at the same wavelengths for a turbidity of 2,
+/// before the game's multiplier: `0.434 c pi (2 pi / lambda)^2 K` with
+/// `c = (0.6544 T - 0.6510) 1e-16`.
+const MIE: Vec3 = Vec3::new(5.75e-3, 7.39e-3, 1.045e-2);
 
 /// A gamma-encoded (sRGB) channel in 0..1 as linear light.
 fn srgb_to_linear(c: f32) -> f32 {

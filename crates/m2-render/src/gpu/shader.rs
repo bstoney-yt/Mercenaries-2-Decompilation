@@ -30,6 +30,16 @@ struct Frame {
     shadow_splits: vec4<f32>,
     // Metres per shadow texel in each cascade
     shadow_texels: vec4<f32>,
+    // Clip space back to the world
+    inv_view_proj: mat4x4<f32>,
+    // Haze: rgb Rayleigh scattering per metre (0: plain fog), a: the Mie
+    // phase function's g
+    rayleigh: vec4<f32>,
+    // rgb: Mie scattering per metre, a: in-scattering multiplier
+    mie: vec4<f32>,
+    // x: extinction multiplier, y: Rayleigh scale height, z: Mie scale
+    // height (metres)
+    scatter: vec4<f32>,
 };
 
 struct Draw {
@@ -106,11 +116,62 @@ fn ambient_light(n: vec3<f32>) -> vec3<f32> {
         + n2.z * select(frame.ambient_cube[5], frame.ambient_cube[4], n.z >= 0.0).rgb;
 }
 
+fn hazy() -> bool {
+    return dot(frame.rayleigh.rgb, vec3<f32>(1.0)) > 0.0;
+}
+
+// Sunlight scattered towards the eye per unit of scattering, for a ray
+// whose angle to the sun has cosine c, weighted by how much of the
+// scattering along it is Rayleigh (tr) and Mie (tm): Hoffman and
+// Preetham's in-scattering, as the game's vertex shaders compute it.
+fn inscatter(c: f32, tr: vec3<f32>, tm: vec3<f32>) -> vec3<f32> {
+    let g = frame.rayleigh.a;
+    let rayleigh = 0.0596831 * (1.0 + c * c);
+    let mie = 0.0795775 * (1.0 - g) * (1.0 - g) / pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5);
+    let t = max(tr + tm, vec3<f32>(1e-9));
+    return (tr * rayleigh + tm * mie) / t * frame.sun_color.rgb * frame.mie.a;
+}
+
+// The sky along the unit ray r: the haze's in-scattering through the air
+// above, the path longer towards the horizon. Without haze settings, the
+// flat sky colour.
+fn sky(r: vec3<f32>) -> vec3<f32> {
+    if !hazy() {
+        return frame.sky.rgb;
+    }
+    // Flat-earth path through each layer, kept finite at the horizon.
+    let mu = max(r.y, 0.0) + 0.035;
+    let tr = frame.rayleigh.rgb * frame.scatter.y / mu;
+    let tm = frame.mie.rgb * frame.scatter.z / mu;
+    let c = dot(r, -normalize(frame.sun_dir.xyz));
+    return inscatter(c, tr, tm) * (1.0 - exp(-(tr + tm)));
+}
+
+// The surface colour rgb at p seen through the air from the eye: the
+// game's extinction and in-scattering, or plain exponential fog.
+fn haze(rgb: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
+    let d = distance(p, frame.eye.xyz);
+    if !hazy() {
+        if frame.sky.a <= 0.0 {
+            return rgb;
+        }
+        return mix(frame.sky.rgb, rgb, exp(-frame.sky.a * d));
+    }
+    let tr = frame.rayleigh.rgb * d;
+    let tm = frame.mie.rgb * d;
+    let e = exp(-(tr + tm) * frame.scatter.x);
+    let c = dot((p - frame.eye.xyz) / max(d, 1e-3), -normalize(frame.sun_dir.xyz));
+    return rgb * e + inscatter(c, tr, tm) * (1.0 - e);
+}
+
 // What a reflection sees along r, standing in for the game's environment
-// cube: sky above, paler towards the horizon, the ground's light below.
+// cube: the sky above, the ground's light below.
 fn environment(r: vec3<f32>) -> vec3<f32> {
-    let horizon = mix(frame.sky.rgb, vec3<f32>(1.0), 0.35);
+    let horizon = select(mix(frame.sky.rgb, vec3<f32>(1.0), 0.35), sky(vec3<f32>(r.x, 0.0, r.z)), hazy());
     if r.y >= 0.0 {
+        if hazy() {
+            return sky(r);
+        }
         return mix(horizon, frame.sky.rgb, sqrt(r.y));
     }
     return mix(horizon * 0.6, frame.ambient_cube[3].rgb, sqrt(-r.y));
@@ -323,9 +384,8 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         glow = glow * spec_texel;
     }
     rgb = rgb + glow;
-    if material.params.w > 0.5 && frame.sky.a > 0.0 {
-        let f = exp(-frame.sky.a * dist);
-        rgb = mix(frame.sky.rgb, rgb, f);
+    if material.params.w > 0.5 {
+        rgb = haze(rgb, v.world_pos);
     }
     // Bright highlights make glass more opaque, as the game's shaders have it.
     var alpha = clamp(max(base.a, dot(spec_light, vec3<f32>(0.299, 0.587, 0.114))), 0.0, 1.0);
@@ -352,6 +412,38 @@ fn fs_shadow(v: Varyings) {
     }
 }
 "#;
+
+/// The sky behind the world: a triangle over the screen at the far plane.
+const SKY: &str = r#"
+struct SkyVaryings {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) ndc: vec2<f32>,
+};
+
+@vertex
+fn vs_sky(@builtin(vertex_index) i: u32) -> SkyVaryings {
+    let ndc = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    var out: SkyVaryings;
+    // Depth 0 is the far plane (reversed depth).
+    out.clip = vec4<f32>(ndc, 0.0, 1.0);
+    out.ndc = ndc;
+    return out;
+}
+
+@fragment
+fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
+    // A point on the near plane, then the ray from the eye through it.
+    let p = frame.inv_view_proj * vec4<f32>(v.ndc, 1.0, 1.0);
+    let r = normalize(p.xyz / p.w - frame.eye.xyz);
+    return vec4<f32>(sky(r), 1.0);
+}
+"#;
+
+/// The sky stage's source: the shared declarations and helpers plus its
+/// own entry points.
+pub fn sky_source() -> String {
+    format!("{COMMON}{FRAGMENT}{SKY}")
+}
 
 fn wgsl_type(format: VertexFormat) -> &'static str {
     match format {
@@ -476,6 +568,11 @@ mod tests {
         )
         .validate(&module)
         .unwrap_or_else(|e| panic!("{e:?}\n{src}"));
+    }
+
+    #[test]
+    fn sky_compiles() {
+        validate(&sky_source());
     }
 
     #[test]
