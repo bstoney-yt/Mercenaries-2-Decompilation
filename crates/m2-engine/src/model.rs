@@ -526,6 +526,27 @@ impl GpuModel {
         }
     }
 
+    /// What [`draw_moved`](Self::draw_moved) draws, `wrecked` or not, with
+    /// the nodes `flying` marks: how many pieces it draws at nodes not
+    /// flying, how many at nodes flying, and how many of those it draws
+    /// are skinned (which stay put, whatever their nodes do).
+    pub fn drawn_moved(&self, wrecked: bool, flying: &[bool]) -> (usize, usize, usize) {
+        let hidden = &self.hidden[usize::from(wrecked)];
+        let at = |p: &Piece, marks: &[bool]| marks.get(usize::from(p.at)).copied().unwrap_or(false);
+        let (mut rest, mut flown, mut skinned) = (0, 0, 0);
+        for p in &self.pieces {
+            if at(p, flying) {
+                flown += 1;
+            } else if !at(p, hidden) {
+                rest += 1;
+            } else {
+                continue;
+            }
+            skinned += usize::from(!p.bones.is_empty() || p.node.is_none());
+        }
+        (rest, flown, skinned)
+    }
+
     /// Whether the model has wrecked parts to show.
     pub fn has_wreck(&self) -> bool {
         self.hidden[0] != self.hidden[1]

@@ -35,16 +35,16 @@ const SPINE: u32 = 0x5ca4_9bd8;
 const NECK: u32 = 0xc187_105b;
 /// A slung weapon hangs down her back, flat against it, as the PC video's
 /// carbine does (round 97: nearly straight down, a little right of her
-/// spine, from her shoulders to her hips): its upper end this far
-/// (metres) above the attach point, this far behind it, and leaning off
-/// straight down by this much (the tangent; its muzzle toward her left
-/// hip). One longer than this (metres: the AK47's 0.9; the RPG is 1.28)
-/// rises by half what it is longer, as far as this. Invented.
-const SLUNG_RISE: f32 = 0.12;
+/// spine, from her shoulders to her hips): along its length, its middle
+/// this far (metres) below the attach point and this far behind it,
+/// leaning off straight down by this much (the tangent; its lower end
+/// toward her left hip). Round 99 hung them along the line from the grip
+/// to the muzzle, which runs well off the RPG's and the launcher's
+/// length: they lay 25 to 30 degrees across her back, down to her shin
+/// and thigh. Invented.
+const SLUNG_DROP: f32 = 0.12;
 const SLUNG_GAP: f32 = 0.07;
 const SLUNG_LEAN: f32 = 0.14;
-const SLUNG_LONG: f32 = 0.9;
-const SLUNG_RISE_MOST: f32 = 0.3;
 
 /// Weapons drawn on the right hand's attach node turned as the node is
 /// posed (the default: the grip sits in her palm, round 78), rather than
@@ -327,11 +327,10 @@ fn node(skeleton: &Skeleton, hash: u32) -> Option<usize> {
 
 /// Weapon to world for a weapon slung at `point` on a back running
 /// `(right, up)` (world space, as posed), on her right (`slot` 0) or left:
-/// its barrel (from its grip at its origin to its `muzzle`) down her
-/// back, leaning as [`SLUNG_LEAN`] has it, flat against her back with
-/// its top to her side, its upper end (the end of its `bounds` furthest
-/// back from the muzzle) [`SLUNG_RISE`] above the point (more for a long
-/// one, [`SLUNG_LONG`]) and the whole [`SLUNG_GAP`] behind it.
+/// along its length (the longest side of its `bounds`, the end its
+/// `muzzle` is at down) down her back, leaning as [`SLUNG_LEAN`] has it,
+/// flat against her back with its top to her side, its middle
+/// [`SLUNG_DROP`] below the point and [`SLUNG_GAP`] behind it.
 fn slung_at(
     muzzle: Vec3,
     bounds: (Vec3, Vec3),
@@ -342,8 +341,17 @@ fn slung_at(
     let right = right.try_normalize()?;
     let up = (up - right * up.dot(right)).try_normalize()?;
     let ahead = up.cross(right);
-    // The weapon's own frame: barrel, top, and the side they leave.
-    let barrel = muzzle.try_normalize()?;
+    // The weapon's own frame: along its length toward the muzzle's end,
+    // its top, and the side they leave.
+    let (lo, hi) = bounds;
+    let (size, middle) = (hi - lo, (lo + hi) * 0.5);
+    let long = (0..3).max_by(|&a, &b| size[a].total_cmp(&size[b]))?;
+    let mut barrel = Vec3::ZERO;
+    barrel[long] = if muzzle[long] < middle[long] {
+        -1.0
+    } else {
+        1.0
+    };
     let top = (Vec3::Y - barrel * barrel.y)
         .try_normalize()
         .unwrap_or(Vec3::Z);
@@ -353,17 +361,7 @@ fn slung_at(
     let side = if slot == 0 { right } else { -right };
     let to_side = (side - down * side.dot(down)).normalize();
     let turn = m2_math::glam::Mat3::from_cols(down, to_side, down.cross(to_side)) * own.transpose();
-    // Its upper end: the furthest back along its barrel.
-    let (lo, hi) = bounds;
-    let rear = (0..3)
-        .map(|i| (lo[i] * barrel[i]).min(hi[i] * barrel[i]))
-        .sum::<f32>();
-    let length = (0..3)
-        .map(|i| (hi[i] - lo[i]) * barrel[i].abs())
-        .sum::<f32>();
-    let rise = (SLUNG_RISE + (length - SLUNG_LONG).max(0.0) * 0.5).min(SLUNG_RISE_MOST);
-    let anchor = point + up * rise - ahead * SLUNG_GAP;
-    let origin = anchor - down * rear;
+    let origin = point - up * SLUNG_DROP - ahead * SLUNG_GAP - turn * middle;
     Some(Mat4::from_cols(
         turn.x_axis.extend(0.0),
         turn.y_axis.extend(0.0),
@@ -582,6 +580,8 @@ pub enum Sound {
     Cannon(Vec3),
     /// The satellite-guided bomb landing.
     Bomb(Vec3),
+    /// A building the bomb brought down coming apart.
+    Collapse(Vec3),
 }
 
 /// A blow or a round that landed on something of the world's rather than
@@ -967,6 +967,11 @@ impl Combat {
     pub fn blaze(&mut self, physics: &Physics, at: Vec3) {
         let at = ground_under(physics, at).map_or(at, |g| g + Vec3::Y * BLAZE_LIFT);
         self.blazes.push((at, BLAZE_TIME, 0.0));
+    }
+
+    /// A building the bomb brought down comes apart at `at`: heard.
+    pub fn collapse(&mut self, at: Vec3) {
+        self.sounds.push(Sound::Collapse(at));
     }
 
     /// Where she is a target: her chest, or `None` while down, flying or
@@ -2283,8 +2288,8 @@ mod tests {
             .collect();
         let top = corners.iter().map(|c| c.y).fold(f32::MIN, f32::max);
         let bottom = corners.iter().map(|c| c.y).fold(f32::MAX, f32::min);
-        assert!(top > 1.45 && top < 1.6, "{top}");
-        assert!(bottom < 0.8, "{bottom}");
+        assert!(top > 1.6 && top < 1.8, "{top}");
+        assert!(bottom > 0.75 && bottom < 0.95, "{bottom}");
         assert!(corners.iter().all(|c| c.z < point.z - 0.02), "{corners:?}");
         // On her left the same way, its top to her left.
         let left = slung_at(muzzle, (lo, hi), point + Vec3::X * 0.2, (right, up), 1).unwrap();
@@ -2326,26 +2331,76 @@ mod tests {
         let slung = slung_at(muzzle, bounds, point, (right, up), 0).unwrap();
         let lower = slung.transform_point3(muzzle);
         assert!(lower.z < -0.15 && lower.y < 3.0, "{lower}");
-        // A long one (the RPG's 1.28 m) rises above the attach point
-        // further, but not past its most.
+        // A long one (the RPG's 1.28 m) reaches further up and down, its
+        // middle where the short one's is.
         let long = (Vec3::new(-0.05, -0.15, -0.5), Vec3::new(0.05, 0.15, 0.78));
-        let top = |m: Mat4, (lo, hi): (Vec3, Vec3)| {
-            (0..8)
-                .map(|k| {
-                    let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
-                    m.transform_point3(Vec3::new(
-                        pick(1, lo.x, hi.x),
-                        pick(2, lo.y, hi.y),
-                        pick(4, lo.z, hi.z),
-                    ))
-                    .y
-                })
-                .fold(f32::MIN, f32::max)
-        };
         let raised = slung_at(muzzle, long, point, (right, up), 0).unwrap();
-        let (short_top, long_top) = (top(slung, bounds), top(raised, long));
-        assert!(long_top > short_top + 0.1, "{short_top} {long_top}");
-        assert!(long_top < point.y + SLUNG_RISE_MOST + 0.1, "{long_top}");
+        let (short, longer) = (heights(slung, bounds), heights(raised, long));
+        assert!(
+            longer.1 > short.1 + 0.1 && longer.0 < short.0 - 0.1,
+            "{short:?} {longer:?}"
+        );
+        let middle = |(a, b): (f32, f32)| (a + b) * 0.5;
+        assert!(
+            (middle(longer) - middle(short)).abs() < 0.05,
+            "{short:?} {longer:?}"
+        );
+        assert!(
+            (middle(short) - (point.y - SLUNG_DROP)).abs() < 0.05,
+            "{short:?}"
+        );
+    }
+
+    /// The lowest and highest a model's box `(lo, hi)` reaches placed by
+    /// `m`.
+    fn heights(m: Mat4, (lo, hi): (Vec3, Vec3)) -> (f32, f32) {
+        box_corners(m, (lo, hi))
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), c| (a.min(c.y), b.max(c.y)))
+    }
+
+    /// A model's box `(lo, hi)`'s corners placed by `m`.
+    fn box_corners(m: Mat4, (lo, hi): (Vec3, Vec3)) -> Vec<Vec3> {
+        (0..8)
+            .map(|k| {
+                let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
+                m.transform_point3(Vec3::new(
+                    pick(1, lo.x, hi.x),
+                    pick(2, lo.y, hi.y),
+                    pick(4, lo.z, hi.z),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_slung_weapon_hangs_along_its_length_whatever_its_muzzle() {
+        // An RPG as round 99 had it: 1.28 m long down its z, its muzzle
+        // marker well above that line (the line from its grip to the
+        // marker runs 20 degrees off its length), on her right.
+        let (right, up) = (Vec3::NEG_X, Vec3::Y);
+        let muzzle = Vec3::new(0.0, 0.22, 0.6);
+        let bounds = (Vec3::new(-0.055, -0.15, -0.5), Vec3::new(0.055, 0.15, 0.78));
+        let point = Vec3::new(-0.084, 1.396, -0.186);
+        let at = slung_at(muzzle, bounds, point, (right, up), 0).unwrap();
+        // Its length straight down her back but for the lean, its muzzle
+        // end down.
+        let along = at.transform_vector3(Vec3::Z);
+        assert!(along.y < -0.98, "{along}");
+        // Across her back no wider than the lean takes it (round 99's
+        // spread 0.9 m from her left to her right), right of her spine.
+        let across: Vec<f32> = box_corners(at, bounds)
+            .iter()
+            .map(|c| c.dot(right))
+            .collect();
+        let (least, most) = across
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        assert!(most - least < 0.55, "{least} {most}");
+        assert!(least + most > 0.0, "{least} {most}");
+        // Up past her shoulder and down to her thighs, not her shins.
+        let (bottom, top) = heights(at, bounds);
+        assert!(bottom > 0.55 && top > 1.8, "{bottom} {top}");
     }
 
     #[test]
