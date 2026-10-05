@@ -4,10 +4,12 @@
 //! unloads, and break when the scripts' object dies: drawn as their wreck
 //! when the model has one, else gone, and no longer in the way.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
+use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 
 use m2_engine::{
     AssetSource, CollisionShape, CpuModel, GpuModel, Install, MaterialCache, Physics, StaticKey,
@@ -40,7 +42,12 @@ pub struct Props {
     /// By hash: `None` while loading, or when it failed.
     models: HashMap<u32, Option<PropModel>>,
     loads: (Sender<Load>, Receiver<Load>),
+    /// Models that failed to load.
+    failed: HashSet<u32>,
 }
+
+/// How long uploading loaded models may take a frame (at least one is).
+const UPLOAD_BUDGET: Duration = Duration::from_millis(6);
 
 /// A model decoded on the loading thread, or why not.
 type Load = (u32, Result<CpuModel, String>);
@@ -51,6 +58,7 @@ impl Default for Props {
             shown: HashMap::new(),
             models: HashMap::new(),
             loads: channel(),
+            failed: HashSet::new(),
         }
     }
 }
@@ -168,8 +176,22 @@ impl Props {
         self.shown.iter().map(|(&e, p)| (e, p))
     }
 
-    /// Uploads models that have loaded (one a call) and gives the props
-    /// using them their collision.
+    /// How many are shown, and of the models they use how many have
+    /// loaded, are loading and failed.
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
+        let loaded = self.models.values().filter(|m| m.is_some()).count();
+        let failed = self.failed.len();
+        (
+            self.shown.len(),
+            loaded,
+            self.models.len() - loaded - failed,
+            failed,
+        )
+    }
+
+    /// Uploads models that have loaded (as many as fit in
+    /// [`UPLOAD_BUDGET`], at least one) and gives the props using them
+    /// their collision.
     pub fn update(
         &mut self,
         backend: &mut dyn RenderBackend,
@@ -177,13 +199,32 @@ impl Props {
         source: &mut AssetSource<BufReader<File>>,
         physics: &mut Physics,
     ) -> anyhow::Result<()> {
-        let Ok((hash, cpu)) = self.loads.1.try_recv() else {
-            return Ok(());
-        };
+        let started = Instant::now();
+        while let Ok((hash, cpu)) = self.loads.1.try_recv() {
+            self.upload(backend, materials, source, physics, hash, cpu)?;
+            if started.elapsed() > UPLOAD_BUDGET {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Uploads model `hash`, loaded (or not), and gives the props using it
+    /// their collision.
+    fn upload(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        materials: &mut MaterialCache,
+        source: &mut AssetSource<BufReader<File>>,
+        physics: &mut Physics,
+        hash: u32,
+        cpu: Result<CpuModel, String>,
+    ) -> anyhow::Result<()> {
         let cpu = match cpu {
             Ok(cpu) => cpu,
             Err(e) => {
                 eprintln!("state layer model {hash:08x}: {e}");
+                self.failed.insert(hash);
                 return Ok(());
             }
         };
@@ -233,10 +274,15 @@ fn load(install: Install, models: Vec<u32>, tx: Sender<Load>) {
             }
         };
         for m in models {
-            let cpu = source
-                .model(m)
-                .and_then(|data| CpuModel::from_data(&data, 0))
-                .map_err(|e| e.to_string());
+            // One model that can't be read (even one that panics) doesn't
+            // hold up the rest.
+            let cpu = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                source
+                    .model(m)
+                    .and_then(|data| CpuModel::from_data(&data, 0))
+                    .map_err(|e| e.to_string())
+            }))
+            .unwrap_or_else(|_| Err("panicked while decoding".to_owned()));
             // The game may have quit meanwhile.
             if tx.send((m, cpu)).is_err() {
                 return;
