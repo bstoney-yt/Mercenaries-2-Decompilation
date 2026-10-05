@@ -49,6 +49,15 @@ fn game_tone_map() -> bool {
     return post.tone.w > 0.5;
 }
 
+// The game lights and tone maps in display (gamma) space, its textures
+// never decoded: for its tone map our linear light is encoded first.
+fn to_game(c: vec3<f32>) -> vec3<f32> {
+    if game_tone_map() {
+        return pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    }
+    return c;
+}
+
 @group(0) @binding(0) var<uniform> post: Post;
 @group(0) @binding(1) var source: texture_2d<f32>;
 @group(0) @binding(2) var glow: texture_2d<f32>;
@@ -120,7 +129,7 @@ fn fs_log_luminance(v: Screen) -> @location(0) vec4<f32> {
     for (var y = -1.0; y <= 1.0; y = y + 2.0) {
         for (var x = -1.0; x <= 1.0; x = x + 2.0) {
             let c = textureSampleLevel(source, linear, v.uv + vec2<f32>(x, y) * post.step.xy, 0.0).rgb;
-            sum = sum + log(max(luminance(c), 1e-4));
+            sum = sum + log(max(luminance(to_game(c)), 1e-4));
         }
     }
     return vec4<f32>(sum * 0.25, 0.0, 0.0, 1.0);
@@ -170,8 +179,10 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
     if game_tone_map() {
         // As the game's: luminance scaled by the target over the adapted,
         // compressed, the colour kept at the new luminance, graded, then
-        // a contrast about a limit; its result is a display value.
+        // a contrast about a limit, all on display values (which the sRGB
+        // frame takes as linear light, so they are decoded at the end).
         let a = textureLoad(adapted, vec2<i32>(0, 0), 0).r;
+        c = to_game(c);
         let y = luminance(c);
         let ls = y * post.adapt.x / (a + 0.001);
         let lout = 0.8 * ls / (0.7 + min(min(ls, pow(ls, 0.7)), 10.0));
