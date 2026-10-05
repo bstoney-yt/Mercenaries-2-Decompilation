@@ -64,9 +64,10 @@ const BOMB_PAD: f32 = crate::combat::BOMB.0;
 const RAM_PAD: f32 = 4.0;
 const RAM_SPEED: f32 = 6.0;
 const SPEED_FADE: f32 = 12.0;
-/// Seconds an objective message stays up, and a tutorial line.
+/// Seconds an objective message stays up. A tutorial line stays until
+/// the scripts take it down or put up another (their tutorial manager
+/// shows one with no time of its own: round 96).
 const MESSAGE_TIME: f32 = 6.0;
-const TUTORIAL_TIME: f32 = 10.0;
 /// The scripts' vehicles are loaded within this far of the player, metres,
 /// and at most this many in play at once (wrecks and those they removed
 /// don't count).
@@ -85,7 +86,7 @@ pub struct MissionView {
     pub status: Option<String>,
     /// The objectives to do, readable.
     pub objectives: Vec<String>,
-    /// The tutorial line up, readable (for [`TUTORIAL_TIME`] seconds).
+    /// The tutorial line up, readable.
     pub tutorial: Option<String>,
     /// Markers over targets: where, what, colour (RGBA).
     pub markers: Vec<(Vec3, String, [u8; 4])>,
@@ -136,8 +137,8 @@ pub struct MissionLink {
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
-    /// The tutorial line up (readable), and its age (seconds).
-    tutorial: Option<(String, f32)>,
+    /// The tutorial line up, readable.
+    tutorial: Option<String>,
     /// Blasts since the scripts last ran, and support strikes' bombs.
     blasts: Vec<Vec3>,
     bombs: Vec<Vec3>,
@@ -361,9 +362,6 @@ impl MissionLink {
             eprintln!("mission: posted {name:?}, {waiting} script events waiting for it");
             mission.post(name);
         }
-        if let Some((_, age)) = &mut self.tutorial {
-            *age += dt;
-        }
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {
@@ -471,7 +469,7 @@ impl MissionLink {
                 }
             }
             if let Some(line) = tutorial(mission, &self.keys) {
-                self.tutorial = line.map(|t| (t, 0.0));
+                self.tutorial = line;
             }
             break_props(game, mission);
             let w = mission.world().borrow();
@@ -795,11 +793,7 @@ impl MissionLink {
             .collect();
         MissionView {
             status: None,
-            tutorial: self
-                .tutorial
-                .as_ref()
-                .filter(|t| t.1 < TUTORIAL_TIME)
-                .map(|t| t.0.clone()),
+            tutorial: self.tutorial.clone(),
             objectives,
             markers,
             message,
