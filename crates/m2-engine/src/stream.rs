@@ -187,6 +187,9 @@ impl Loader {
                         }
                         Request::Scatter(h) => {
                             let centre = index.cells.get(&h).copied().unwrap_or_default();
+                            if logging_foliage() {
+                                log_census(&mut source, &index, h);
+                            }
                             let found = scatter::cell_scatter(&mut source, h, centre);
                             if let Ok(s) = &found {
                                 for t in s.meshes.iter().filter_map(|m| m.texture()) {
@@ -422,6 +425,45 @@ pub struct World {
     /// `M2_HIDE=<model>,<model>...`: placed models by these names aren't
     /// drawn, to find which model a stray shape on screen is.
     hidden: HashSet<u32>,
+}
+
+/// The foliage log's census of terrain cell `cell`'s blocks: each asset
+/// type's count and bytes, and the models stored there that no layer
+/// places.
+fn log_census<R: std::io::Read + std::io::Seek>(
+    source: &mut crate::assets::AssetSource<R>,
+    index: &WorldIndex,
+    cell: u32,
+) {
+    let assets = match source.census(cell) {
+        Ok(a) => a,
+        Err(e) => return eprintln!("foliage census {cell:08x}: {e}"),
+    };
+    let mut types: HashMap<u32, (usize, usize)> = HashMap::new();
+    for &(t, _, len) in &assets {
+        let e = types.entry(t).or_default();
+        e.0 += 1;
+        e.1 += len;
+    }
+    let mut types: Vec<_> = types.into_iter().collect();
+    types.sort_unstable();
+    let placed: HashSet<u32> = index
+        .objects
+        .iter()
+        .chain(index.state_objects.values())
+        .map(|o| o.model)
+        .collect();
+    let unplaced: Vec<u32> = assets
+        .iter()
+        .filter(|&&(t, n, _)| t == MODEL_TYPE && !placed.contains(&n) && n != cell)
+        .map(|&(_, n, _)| n)
+        .collect();
+    eprintln!(
+        "foliage census {cell:08x}: types (type, count, bytes) {:08x?}; {} models stored here that no layer places: {:08x?}",
+        types,
+        unplaced.len(),
+        &unplaced[..unplaced.len().min(40)]
+    );
 }
 
 /// `M2_LOG_FOLIAGE=on`: logs the scatter meshes as they load and, every
