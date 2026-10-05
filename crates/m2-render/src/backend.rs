@@ -239,6 +239,11 @@ pub struct Haze {
     /// the sky's path length.
     pub rayleigh_height: f32,
     pub mie_height: f32,
+    /// The game's haze instead: two layers of air, each `(force,
+    /// 1 / limit)`, density falling linearly from `force` at height 0 to
+    /// nothing at the limit, and the light it adds reckoned in display
+    /// values; `None` keeps the scale heights and `density` above.
+    pub layers: Option<[f32; 4]>,
 }
 
 impl Default for Haze {
@@ -252,6 +257,7 @@ impl Default for Haze {
             density: 1.0,
             rayleigh_height: 8000.0,
             mie_height: 1200.0,
+            layers: None,
         }
     }
 }

@@ -211,6 +211,8 @@ struct FrameUniforms {
     water_depth: [f32; 4],
     /// Scale on the clouds' colour.
     cloud_tone: [f32; 4],
+    /// The game's haze layers, `(force, 1 / limit)` each (all 0: off).
+    haze_layers: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -1762,6 +1764,7 @@ impl WgpuBackend {
                 0.0,
             ],
             cloud_tone: l.clouds.tone.extend(1.0).to_array(),
+            haze_layers: l.haze.layers.unwrap_or([0.0; 4]),
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));

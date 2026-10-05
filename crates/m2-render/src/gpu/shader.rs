@@ -54,6 +54,9 @@ struct Frame {
     water_depth: vec4<f32>,
     // rgb: scale on the clouds' colour
     cloud_tone: vec4<f32>,
+    // The game's haze: x, y the first layer's force and 1 / its limit,
+    // z, w the second's (all 0: the earlier haze)
+    haze_layers: vec4<f32>,
 };
 
 // The game lights surfaces in display values: the sun's colour times
@@ -175,6 +178,78 @@ fn hazy() -> bool {
     return dot(frame.rayleigh.rgb, vec3<f32>(1.0)) > 0.0;
 }
 
+// Whether the haze is the game's two layers (`game_air`).
+fn game_haze() -> bool {
+    return hazy() && (frame.haze_layers.y > 0.0 || frame.haze_layers.w > 0.0);
+}
+
+// The mean density along a path between heights a and b of a layer whose
+// density falls linearly from 1 at height 0 to nothing at 1 / k, as the
+// game's vertex shaders reckon it (exactly, for a straight path).
+fn layer_density(a: f32, b: f32, k: f32) -> f32 {
+    if k <= 0.0 {
+        return 0.0;
+    }
+    let lo = min(min(a, b) * k, 1.0);
+    let hi = min(max(a, b) * k, 1.0);
+    let dh = abs(b - a) * k;
+    if dh < 1e-4 {
+        return 1.0 - lo;
+    }
+    return (hi - lo) / dh * (1.0 - (lo + hi) * 0.5);
+}
+
+// The air between the eye and p as the game's vertex shaders have it: the
+// light it adds (rgb), in display values, and the share of p's light it
+// keeps (a). Both layers scatter with the same coefficients, weighted by
+// their force times mean density over the straight path; the sun's colour
+// lights it, through a Rayleigh phase and a Cornette-Shanks Mie phase
+// whose angle is held at 90 degrees or less from the sun.
+fn game_air(p: vec3<f32>) -> vec4<f32> {
+    let eye = frame.eye.xyz;
+    let d = distance(p, eye);
+    let l = frame.haze_layers;
+    let rho = l.x * layer_density(p.y, eye.y, l.y) + l.z * layer_density(p.y, eye.y, l.w);
+    let beta = max(frame.rayleigh.rgb + frame.mie.rgb, vec3<f32>(1e-12));
+    let e = exp(-rho * beta * d);
+    let v = (eye - p) / max(d, 1e-3);
+    let mu = min(dot(v, -normalize(frame.sun_dir.xyz)), 0.0);
+    let g = frame.rayleigh.a;
+    let phase = frame.rayleigh.rgb * (0.0596831 * (1.0 + mu * mu))
+        + frame.mie.rgb * (0.0795775 * (1.0 - g) * (1.0 - g)
+            / pow(max(1.0 + g * g + 2.0 * g * mu, 1e-4), 1.5));
+    let add = phase / beta * (1.0 - e) * light_to_display(frame.sun_color.rgb) * frame.mie.a;
+    return vec4<f32>(add, dot(e, vec3<f32>(1.0 / 3.0)) * frame.scatter.x);
+}
+
+// How far the sky's haze is reckoned along a ray that never leaves the
+// air (metres). Invented: the game's sky is the haze at its cloud quad's
+// corners, which come from code.
+const SKY_FAR: f32 = 20000.0;
+
+// The game's haze looking along the unit ray r, out to the top of its
+// layers (or SKY_FAR), in display values.
+fn game_sky(r: vec3<f32>) -> vec3<f32> {
+    let l = frame.haze_layers;
+    let top = max(select(0.0, 1.0 / l.y, l.y > 0.0), select(0.0, 1.0 / l.w, l.w > 0.0));
+    let eye = frame.eye.xyz;
+    var d = SKY_FAR;
+    if r.y > 1e-3 {
+        d = min(max(top - eye.y, 0.0) / r.y, SKY_FAR);
+    }
+    let along = normalize(vec3<f32>(r.x, max(r.y, 0.0), r.z));
+    return game_air(eye + along * d).rgb;
+}
+
+// The light at rgb seen through air h (`haze_terms`): with the game's
+// haze, blended in display values as its shaders do.
+fn through_air(rgb: vec3<f32>, h: vec4<f32>) -> vec3<f32> {
+    if game_haze() {
+        return light_from_display(light_to_display(rgb) * h.a + h.rgb);
+    }
+    return rgb * h.a + h.rgb;
+}
+
 // Sunlight scattered towards the eye per unit of scattering, for a ray
 // whose angle to the sun has cosine c, weighted by how much of the
 // scattering along it is Rayleigh (tr) and Mie (tm): Hoffman and
@@ -193,6 +268,9 @@ fn inscatter(c: f32, tr: vec3<f32>, tm: vec3<f32>) -> vec3<f32> {
 fn sky(r: vec3<f32>) -> vec3<f32> {
     if !hazy() {
         return frame.sky.rgb;
+    }
+    if game_haze() {
+        return light_from_display(game_sky(r));
     }
     // Flat-earth path through each layer, kept finite at the horizon.
     let mu = max(r.y, 0.0) + 0.035;
@@ -217,8 +295,7 @@ fn sky_below(r: vec3<f32>, h: f32) -> vec4<f32> {
 // The surface colour rgb at p seen through the air from the eye: the
 // game's extinction and in-scattering, or plain exponential fog.
 fn haze(rgb: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
-    let h = haze_terms(p);
-    return rgb * h.a + h.rgb;
+    return through_air(rgb, haze_terms(p));
 }
 
 // What the air between the eye and p adds (rgb) and keeps (a).
@@ -230,6 +307,9 @@ fn haze_terms(p: vec3<f32>) -> vec4<f32> {
         }
         let f = exp(-frame.sky.a * d);
         return vec4<f32>(frame.sky.rgb * (1.0 - f), f);
+    }
+    if game_haze() {
+        return game_air(p);
     }
     // What the air takes away over d, and what it adds: the light the sky
     // shows along the same line (looking down, the sky at the horizon),
@@ -510,7 +590,7 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         if water {
             rgb = haze(rgb, v.world_pos);
         } else {
-            rgb = rgb * v.haze.a + v.haze.rgb;
+            rgb = through_air(rgb, v.haze);
         }
     }
     // Bright highlights make glass more opaque, as the game's shaders have it.
@@ -612,9 +692,12 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
             cloud = lit + frame.ambient_cube[2].rgb * 0.5;
         }
         cloud = cloud * frame.cloud_tone.rgb;
-        if frame.wind.w >= 0.0 && hazy() {
-            // As the game's, the air below the deck dims the cloud and
-            // adds its own light in front of it.
+        if frame.wind.w >= 0.0 && game_haze() {
+            // As the game's, the air between the eye and the deck dims the
+            // cloud and adds its own light in front of it.
+            let air = game_air(frame.eye.xyz + r * (CLOUD_HEIGHT / up));
+            cloud = through_air(cloud, air);
+        } else if frame.wind.w >= 0.0 && hazy() {
             let air = sky_below(r, CLOUD_HEIGHT);
             cloud = cloud * air.a + air.rgb;
         }
