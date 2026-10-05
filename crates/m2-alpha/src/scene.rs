@@ -1317,7 +1317,7 @@ impl Scene {
                     None => &None,
                 };
                 if let Some(w) = model
-                    && let Some(at) = self.arsenal.on_back(body, &nodes, slot)
+                    && let Some(at) = self.arsenal.on_back(w, body, &nodes, slot)
                 {
                     w.model.draw(queue, at);
                 }

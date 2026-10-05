@@ -1081,7 +1081,8 @@ fn describe_slung(game: &Game) -> Vec<String> {
             combat::Weapon::GrenadeLauncher => arsenal.launcher.as_ref(),
         };
         let side = ["right", "left"][slot];
-        let (Some(w), Some(at)) = (model, arsenal.on_back(body, &nodes, slot)) else {
+        let Some((w, at)) = model.and_then(|w| Some((w, arsenal.on_back(w, body, &nodes, slot)?)))
+        else {
             lines.push(format!(
                 "{weapon:?} on her {side}: no model or attach point"
             ));

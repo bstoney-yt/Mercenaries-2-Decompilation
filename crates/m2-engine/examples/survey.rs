@@ -1094,7 +1094,16 @@ fn hashes<R: Read + Seek>(
     let banks: Vec<&str> = arg.split(',').filter(|b| !b.is_empty()).collect();
     let library = SoundLibrary::load(source, &banks)?;
     for bank in &banks {
-        let sounds = library.bank(bank);
+        let mut sounds = library.bank(bank).to_vec();
+        // A bank in a block of several (the resident foley, `fol_shared`)
+        // is found by its own name instead.
+        if sounds.is_empty() {
+            let hash = m2_assets::name_hash(bank);
+            let resident = SoundLibrary::load_banks(source, &[hash]);
+            sounds = resident
+                .bank_hash(hash)
+                .map_or_else(Vec::new, |(_, s)| s.to_vec());
+        }
         println!("bank {bank}: {} sounds", sounds.len());
         for (i, s) in sounds.iter().enumerate() {
             println!(
