@@ -20,8 +20,8 @@
 //! # Provenance
 //!
 //! The colours and sizes are measured from gameplay footage of the PC
-//! version (the minimap at 854 × 480 and 1920 × 1080; see [`WATER`],
-//! [`ROAD`], [`ROAD_WIDTH`], [`DASH`] and [`PLAYER_SIZE`]); the
+//! version (the minimap at 854 × 480, and the Xbox 360's at 1920 × 1080;
+//! see [`WATER`], [`ROAD`], [`ROAD_WIDTH`], [`DASH`] and [`PLAYER_SIZE`]); the
 //! land's clearness from the radar backdrop `global_gui_hud_radar` (black
 //! at alpha 162 inside the rim) letting through what the footage's land
 //! does (36% of the scene behind). The `Road` component's layout (path
@@ -36,16 +36,18 @@
 /// The sea on the radar (RGBA): the mean of its blue in the footage, over
 /// different scenes alike (so opaque, or nearly).
 pub const WATER: [u8; 4] = [41, 57, 88, 255];
-/// A road on the radar (RGBA): the brightest quarter of its yellow-olive
-/// lines in footage at 1920 × 1080 (lower resolutions blur them darker).
+/// A road on the radar (RGBA): the brightest twentieth of its olive lines
+/// in the PC footage (854 × 480; the Xbox 360's are paler, 194, 166, 75).
 /// The dash texture is white, so this is the dashes' colour too.
-pub const ROAD: [u8; 4] = [194, 166, 75, 255];
+pub const ROAD: [u8; 4] = [134, 124, 37, 255];
 /// The land: clear, for the radar's backdrop to show.
 pub const LAND: [u8; 4] = [0, 0, 0, 0];
-/// A road's stroke across, as a share of the minimap's radius: the
-/// footage's lines are 1.7% of its width across, the dash texture's white
-/// six of its eight rows.
+/// A dirt track's stroke across, as a share of the minimap's radius: the
+/// footage's dashes are 1.7% to 2% of its width across, the dash
+/// texture's white six of its eight rows.
 pub const ROAD_WIDTH: f32 = 0.045;
+/// A paved road's: the PC footage's town streets are 2.8% of its width.
+pub const PAVED_WIDTH: f32 = 0.075;
 /// Metres of road a dash of a dirt track takes, and the gap after it: the
 /// footage's dashes are about 9% of the minimap's width long and their
 /// gaps 6% at a walk (300 m across; driving the AMX-30, 6% and 5%), so
