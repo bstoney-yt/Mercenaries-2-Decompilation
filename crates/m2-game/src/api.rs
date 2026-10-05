@@ -308,7 +308,9 @@ pub type Shared = Rc<RefCell<ScriptWorld>>;
 
 /// Reports that `guid` reached `at` (its AI goal's location): it, its
 /// vehicle and any cargo on that vehicle's winch are there, the cargo is
-/// let go (a delivery), and the goal's callbacks run. Returns any errors.
+/// let go (a delivery) and moved there in play too (a [`Command::Move`]:
+/// the game may have put it down where it was made, before the winch took
+/// it), and the goal's callbacks run. Returns any errors.
 pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
     {
         let mut w = world.borrow_mut();
@@ -336,6 +338,10 @@ pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
         }
         for g in cargo {
             w.winch.insert(g, None);
+            w.commands.push(Command::Move {
+                guid: g,
+                position: at,
+            });
         }
     }
     goal_finished(world, guid)
@@ -1538,6 +1544,12 @@ mod tests {
         ));
         assert!(arrived(&world, 81, [50.0, 0.0, 60.0]).is_empty());
         assert_eq!(world.borrow().objects[&82].position, [50.0, 0.0, 60.0]);
+        // Moved in play too, where the game may have put it down already.
+        let commands = world.borrow_mut().take_commands();
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            Command::Move { guid: 82, position } if *position == [50.0, 0.0, 60.0]
+        )));
         events.update_shared(0.1, &world);
         let dropped: String = host.lua().globals().get("dropped").unwrap();
         assert_eq!(dropped, "82");
