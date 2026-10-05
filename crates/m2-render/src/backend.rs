@@ -121,6 +121,11 @@ pub struct Lighting {
     /// The game's own adaptation and tone map, in place of `exposure`,
     /// `contrast`, `saturation` and `adaptation` (`grade` still applies).
     pub tone_map: Option<ToneMap>,
+    /// With the game's tone map: the frame blended this far (alpha)
+    /// towards a ramp by luminance from black through this colour (rgb,
+    /// a display value, at mid luminance) to white, as the game's post
+    /// pass does.
+    pub monochrome: Option<Vec4>,
 }
 
 /// The game's adaptation and tone map, from its atmosphere's `Bloom*`
@@ -172,6 +177,8 @@ pub struct Clouds {
     pub scales: [f32; 3],
     /// The way the clouds drift (x, z).
     pub wind: [f32; 2],
+    /// Scale on the clouds' colour.
+    pub tone: Vec3,
 }
 
 impl Default for Clouds {
@@ -181,6 +188,7 @@ impl Default for Clouds {
             coverage: 0.0,
             scales: [1.0; 3],
             wind: [1.0, 0.0],
+            tone: Vec3::ONE,
         }
     }
 }
@@ -259,6 +267,7 @@ impl Default for Lighting {
             water_ramp: None,
             adaptation: None,
             tone_map: None,
+            monochrome: None,
         }
     }
 }

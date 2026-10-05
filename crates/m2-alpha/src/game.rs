@@ -821,12 +821,10 @@ impl Game {
 /// brightness, saturation, warmth and shade against sunlight from PC
 /// footage of the jungle, held back where the strongest fit made the
 /// AMX-30 too dark and orange against console footage of it. The game runs
-/// a tone map and grade of its own whose curve isn't known; the
-/// atmosphere's own `Tone_*` grade (neutral in the island's default, blue
-/// in the islands' `night`) goes on top.
+/// a tone map of its own (see [`game_tone_map`]).
 fn finish(lighting: &mut m2_render::Lighting) {
     if game_tone_map() && lighting.tone_map.is_some() {
-        // The game's own: the atmosphere's grade alone, no fitted pass.
+        // The game's own, no fitted pass.
         lighting.exposure = 1.0;
         return;
     }
@@ -846,11 +844,12 @@ fn finish(lighting: &mut m2_render::Lighting) {
     });
 }
 
-/// `M2_TONEMAP=game` finishes frames with the game's own adaptation and
-/// tone map from the atmosphere's settings, in place of the fitted pass.
+/// Frames are finished with the game's own adaptation and tone map from
+/// the atmosphere's settings; `M2_TONEMAP=fit` uses the earlier pass fitted
+/// to footage instead, for comparison.
 fn game_tone_map() -> bool {
     static GAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GAME.get_or_init(|| std::env::var("M2_TONEMAP").is_ok_and(|v| v == "game"))
+    *GAME.get_or_init(|| std::env::var("M2_TONEMAP").map_or(true, |v| v != "fit"))
 }
 
 /// The frame's average luminance (before exposure) that adaptation leaves
