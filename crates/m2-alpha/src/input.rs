@@ -145,8 +145,8 @@ fn key_name(key: KeyCode) -> String {
 /// as the keys bound here, in brackets (`[P] Open PDA`): `[pda]` the PDA's
 /// key, `[support]` the support menu's, `[pfire]` the PC's fire (the left
 /// mouse button), `[confirm]` the consoles' (here the use key), `[move]`
-/// the keys that move. Other tokens, and keys left unbound, stay as they
-/// are.
+/// the keys that move, `[sprint]` sprint's (round 98 met it after the
+/// first gate). Other tokens, and keys left unbound, stay as they are.
 pub fn name_keys(line: &str, keys: &Bindings) -> String {
     use Action::*;
     let name = |a| keys.key_name(a);
@@ -154,6 +154,7 @@ pub fn name_keys(line: &str, keys: &Bindings) -> String {
         "pda" => name(Pda),
         "support" => name(Support),
         "confirm" => name(Use),
+        "sprint" => name(Sprint),
         "pfire" => Some("Left click".to_owned()),
         "move" => {
             let names: Vec<String> = [MoveForward, MoveLeft, MoveBack, MoveRight]
@@ -277,6 +278,7 @@ mod tests {
             name_keys("[support] One\n[pfire] Two [move] [confirm]", &b),
             "[T] One\n[Left click] Two [WASD] [E]"
         );
+        assert_eq!(name_keys("[sprint] Sprint", &b), "[Shift] Sprint");
         assert_eq!(name_keys("[other] stays [", &b), "[other] stays [");
         let mut b = b;
         b.0.insert(Action::MoveForward, vec![KeyCode::ArrowUp]);

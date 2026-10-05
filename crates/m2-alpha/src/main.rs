@@ -1091,10 +1091,39 @@ fn describe_slung(game: &Game) -> Vec<String> {
         let middle = body.transform_point3(Vec3::new(0.0, 1.4, 0.0));
         let barrel = at.transform_vector3(w.muzzle).normalize_or_zero();
         let top = at.transform_vector3(Vec3::Y).normalize_or_zero();
+        // Its box's corners, from her middle (ahead, right, up).
+        let (lo, hi) = w.model.bounds;
+        let corners: Vec<Vec3> = (0..8)
+            .map(|k| {
+                let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
+                let c = Vec3::new(
+                    pick(1, lo.x, hi.x),
+                    pick(2, lo.y, hi.y),
+                    pick(4, lo.z, hi.z),
+                );
+                local(at.transform_point3(c) - middle)
+            })
+            .collect();
+        let span = |i: usize| {
+            corners
+                .iter()
+                .map(|c| c[i])
+                .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v), b.max(v)))
+        };
+        let (ahead_span, right_span, up_span) = (span(0), span(1), span(2));
+        let muzzle_end = if barrel.y < 0.0 { "down" } else { "up" };
         lines.push(format!(
-            "{weapon:?} on her {side}: barrel {:.2} ({:.0} deg above level), top {:.2}, grip {:.2} and muzzle {:.2} from her back's middle",
+            "{weapon:?} on her {side}: barrel {:.2} ({:.0} deg above level, muzzle end {muzzle_end}), \
+             from {:.2} to {:.2} m above her feet, {:.2} to {:.2} m to her right, {:.2} to {:.2} m \
+             ahead of her middle; top {:.2}, grip {:.2} and muzzle {:.2} from her back's middle",
             local(barrel),
             barrel.y.asin().to_degrees(),
+            up_span.0 + 1.4,
+            up_span.1 + 1.4,
+            right_span.0,
+            right_span.1,
+            ahead_span.0,
+            ahead_span.1,
             local(top),
             local(at.w_axis.truncate() - middle),
             local(at.transform_point3(w.muzzle) - middle),
