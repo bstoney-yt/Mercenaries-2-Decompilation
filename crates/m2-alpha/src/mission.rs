@@ -37,7 +37,7 @@ use m2_math::glam::Vec3;
 
 use crate::combat::Weapon;
 use crate::config::Config;
-use crate::flights::{Copter, Load, Pickup};
+use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::scene::NOT_DRIVABLE;
 
@@ -263,37 +263,23 @@ impl MissionLink {
                 mission.arrived(r.pilot, r.to.to_array());
             }
         }
-        // A crate she broke open is destroyed for the scripts too, and
-        // leaves what its template says it held (no script spawns it).
-        for (g, at, yaw) in scene.flights.take_broken() {
-            let name = mission
-                .world()
-                .borrow()
-                .objects
-                .get(&g)
-                .map(|o| o.name.clone());
-            let left = name
-                .as_deref()
-                .zip(scene.world.as_ref())
-                .and_then(|(name, w)| leaves(&w.index.template_db, name, g, at, yaw));
-            match left {
-                Some(p) => {
-                    eprintln!(
-                        "mission: crate {g:#x} broken open at {at:.1}: it leaves {} ({:#x}), model {}, \
-                         giving {}",
-                        scene
-                            .world
-                            .as_ref()
-                            .and_then(|w| w.index.template_db.by_id(p.template))
-                            .map_or("?", |t| t.0),
-                        p.template,
-                        p.model.map_or("none".into(), |m| format!("{m:08x}")),
-                        p.gives.map_or("her nothing".into(), |(w, n)| format!(
-                            "{n} rounds for her {w:?}"
-                        )),
-                    );
-                    scene.flights.leave(p);
-                }
+        // A crate she broke open is destroyed for the scripts too (what
+        // it held, it leaves of itself: no script spawns it).
+        for (g, at) in scene.flights.take_broken() {
+            match scene.flights.pickups().iter().find(|p| p.from == g) {
+                Some(p) => eprintln!(
+                    "mission: crate {g:#x} broken open at {at:.1}: it leaves {} ({:#x}), model {}, giving {}",
+                    scene
+                        .world
+                        .as_ref()
+                        .and_then(|w| w.index.template_db.by_id(p.what.template))
+                        .map_or("?", |t| t.0),
+                    p.what.template,
+                    p.what.model.map_or("none".into(), |m| format!("{m:08x}")),
+                    p.what.gives.map_or("her nothing".into(), |(w, n)| format!(
+                        "{n} rounds for her {w:?}"
+                    )),
+                ),
                 None => {
                     eprintln!("mission: crate {g:#x} broken open at {at:.1}: it leaves nothing")
                 }
@@ -943,6 +929,7 @@ fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
                                 model: (!vehicle)
                                     .then(|| templates.get(name).and_then(|t| t.model))
                                     .flatten(),
+                                leaves: (!vehicle).then(|| leaves(templates, name)).flatten(),
                             })
                         })
                         .collect();
@@ -1208,12 +1195,11 @@ const WEAPON_MODELS: [(&str, Weapon); 2] = [
     ("global_weapon_rpg", Weapon::Rpg),
 ];
 
-/// What the scripts' object `name` (guid `from`, a supply crate) leaves
-/// where it stood (`at`, turned `yaw`) once destroyed: the pickup its
-/// template's `SpawnOnDeath` names, giving the rounds of one of her
-/// weapons when its ammunition is one of theirs (a template with that
-/// weapon's model fires it).
-fn leaves(templates: &Templates, name: &str, from: u32, at: Vec3, yaw: f32) -> Option<Pickup> {
+/// What the scripts' object `name` (a supply crate) leaves once destroyed:
+/// the pickup its template's `SpawnOnDeath` names, giving the rounds of
+/// one of her weapons when its ammunition is one of theirs (a template
+/// with that weapon's model fires it).
+fn leaves(templates: &Templates, name: &str) -> Option<Leaves> {
     let left = *templates.leavings.spawns.get(&templates.id(name)?)?;
     let info = templates.leavings.pickups.get(&left)?;
     let fires = |weapon: &str, ammo: u32| {
@@ -1231,12 +1217,9 @@ fn leaves(templates: &Templates, name: &str, from: u32, at: Vec3, yaw: f32) -> O
             .find(|(m, _)| fires(m, ammo))
             .map(|&(_, w)| (w, info.rounds))
     });
-    Some(Pickup {
-        from,
+    Some(Leaves {
         template: left,
         model: templates.by_id(left).and_then(|(_, t)| t.model),
-        at,
-        yaw,
         reach: info.radius,
         gives,
     })
@@ -1369,22 +1352,22 @@ mod tests {
             },
             ..Templates::default()
         };
-        let at = Vec3::new(-1472.6, -35.2, 2677.0);
-        let left = leaves(&db, "Supply Drop (GL) 0x40000001", 0x4000_0001, at, 0.5)
-            .expect("the crate leaves its pickup");
-        assert_eq!(left.template, rockets);
-        assert_eq!(left.model, Some(0x8e77_a04d));
-        assert_eq!((left.at, left.yaw, left.reach), (at, 0.5, 1.0));
-        assert_eq!(left.gives, Some((Weapon::Rpg, 20)));
+        let left = leaves(&db, "Supply Drop (GL) 0x40000001").expect("the crate leaves its pickup");
+        assert_eq!(
+            left,
+            Leaves {
+                template: rockets,
+                model: Some(0x8e77_a04d),
+                reach: 1.0,
+                gives: Some((Weapon::Rpg, 20)),
+            }
+        );
         // Ammunition for no weapon of hers gives her nothing; a template
         // that leaves nothing, nothing at all.
         let mut db = db;
         db.leavings.ammo.clear();
-        assert_eq!(
-            leaves(&db, "Supply Drop (GL)", 1, at, 0.0).unwrap().gives,
-            None
-        );
-        assert!(leaves(&db, "RPG", 1, at, 0.0).is_none());
+        assert_eq!(leaves(&db, "Supply Drop (GL)").unwrap().gives, None);
+        assert!(leaves(&db, "RPG").is_none());
     }
 
     #[test]
