@@ -857,7 +857,10 @@ fn live(path: &str, rest: &[String]) -> Result<(), Error> {
     }
     // The player-character module's call (module 8d35cf13).
     mission.run(
-        "MrxGuiManager.CreateGui(Player.GetLocalPlayer())",
+        // The game passes the player's guid (userdata: the scripts check
+        // the type and only then own the widgets, which the HUD's events
+        // need); m2's Player.GetLocalPlayer answers a number.
+        "MrxGuiManager.CreateGui(Sys.StringToGuid(\"0x1\"))",
         "create gui",
     )?;
     let step = |mission: &mut Mission, seconds: f64| {
@@ -868,8 +871,6 @@ fn live(path: &str, rest: &[String]) -> Result<(), Error> {
         }
     };
     step(&mut mission, 0.1);
-    let fired = gui_runtime::fire(mission.lua(), "GuiInitialization", ())?;
-    eprintln!("GuiInitialization: {fired} child handlers");
     step(&mut mission, 0.1);
 
     let snap = |assets: &mut Assets<_>, file: &str| -> Result<(), Error> {
@@ -896,23 +897,53 @@ fn live(path: &str, rest: &[String]) -> Result<(), Error> {
                 DrawItem::Fill { colour, rect, .. } => canvas.fill(*rect, *colour),
                 DrawItem::Text {
                     font,
-                    text,
+                    spans,
                     rect,
                     size,
                     colour,
                     justification,
                     ..
                 } => match assets.font(font) {
-                    Some(f) => draw_text(
-                        assets,
-                        &mut canvas,
-                        &f,
-                        text,
-                        *rect,
-                        *size,
-                        *justification,
-                        *colour,
-                    ),
+                    Some(f) => {
+                        // Lines of (text, colour) pieces, each line justified.
+                        let mut lines: Vec<Vec<(String, [f32; 4])>> = vec![Vec::new()];
+                        for s in spans {
+                            let c = s.colour.map_or(*colour, |c| [c[0], c[1], c[2], colour[3]]);
+                            for (i, part) in s.text.split('\n').enumerate() {
+                                if i > 0 {
+                                    lines.push(Vec::new());
+                                }
+                                if let Some(line) = lines.last_mut() {
+                                    line.push((part.to_owned(), c));
+                                }
+                            }
+                        }
+                        for (n, line) in lines.iter().enumerate() {
+                            let whole: String = line.iter().map(|p| p.0.as_str()).collect();
+                            let width = f.text_width(&whole) * size;
+                            let mut x = match justification {
+                                Anchor::Start => rect[0],
+                                Anchor::Centre => (rect[0] + rect[2] - width) / 2.0,
+                                Anchor::End => rect[2] - width,
+                            };
+                            let y = rect[1] + n as f32 * f32::from(f.line_height) * size;
+                            for (text, c) in line {
+                                let w = f.text_width(text) * size;
+                                let r = [x, y, x + w, y + 1.0];
+                                draw_text(
+                                    assets,
+                                    &mut canvas,
+                                    &f,
+                                    text,
+                                    r,
+                                    *size,
+                                    Anchor::Start,
+                                    *c,
+                                );
+                                x += w;
+                            }
+                        }
+                    }
                     None => canvas.outline(*rect, [255, 255, 0, 160]),
                 },
                 DrawItem::Flash { rect, .. } => canvas.outline(*rect, [0, 160, 255, 200]),
@@ -971,6 +1002,8 @@ fn event_args(lua: &mlua::Lua, args: &str) -> Result<Vec<mlua::Value>, Error> {
             "true" => Value::Boolean(true),
             "false" => Value::Boolean(false),
             "nil" => Value::Nil,
+            // `guid:1`: an object id, as the engine passes them (userdata).
+            s if s.starts_with("guid:") => m2_game::events::guid_value(s[5..].parse()?),
             s => match s.parse::<f64>() {
                 Ok(n) => Value::Number(n),
                 Err(_) => Value::String(lua.create_string(s)?),
