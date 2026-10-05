@@ -145,7 +145,8 @@ struct Material {
     // x: reflection strength (0: none), y: Fresnel reflectance facing the
     // eye (negative: no Fresnel), z: takes the rim light
     reflection: vec4<f32>,
-    // x: open water, y: scale on the sky it mirrors, z: on its waves
+    // x: open water, y: scale on the sky it mirrors, z: on its waves,
+    // w: how soon its waves fade with the pixel's size
     water: vec4<f32>,
 };
 
@@ -405,8 +406,9 @@ var<private> WAVES: array<vec3<f32>, 8> = array<vec3<f32>, 8>(
 );
 
 // The sea's normal at p (world x, z) after t seconds. Waves too short for
-// a pixel `footprint` metres wide fade out, as the game's do, well before
-// they would alias into stripes. Each wave's height swells and falls over
+// a pixel `footprint` metres wide fade out as the game's do (its
+// sat(2 - pixel length * OOWavelengthScale), PC round X), the scale taken
+// as material.water.w over the wavelength (inferred). Each wave's height swells and falls over
 // a few hundred metres so the pattern doesn't repeat evenly.
 fn sea_normal(p: vec2<f32>, t: f32, footprint: f32) -> vec3<f32> {
     var slope = vec2<f32>(0.0);
@@ -416,7 +418,7 @@ fn sea_normal(p: vec2<f32>, t: f32, footprint: f32) -> vec3<f32> {
         let k = 6.2831853 / w.y;
         // Deep water: speed follows wavelength.
         let theta = k * dot(dir, p) - sqrt(9.81 * k) * t + f32(i) * 1.7;
-        let fade = clamp(2.0 - 8.0 * footprint / w.y, 0.0, 1.0);
+        let fade = clamp(2.0 - material.water.w * footprint / w.y, 0.0, 1.0);
         let across = vec2<f32>(-dir.y, dir.x);
         let swell = 0.65 + 0.35 * sin(dot(p, across) * (0.021 + 0.004 * f32(i)) + f32(i) * 2.3)
             * sin(dot(p, dir) * 0.013 - t * 0.05 + f32(i));
