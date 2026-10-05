@@ -24,7 +24,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
-use m2_assets::WadArchive;
+use m2_assets::{WadArchive, name_hash};
 use m2_engine::vehicle::DRIVABLE;
 use m2_engine::world::member_stem;
 use m2_engine::{CatalogueEntry, Install, TemplateInfo, Templates, VehicleKind};
@@ -81,6 +81,26 @@ pub struct MissionView {
 
 /// Seconds the contract's completion stays up.
 const BANNER_TIME: f32 = 10.0;
+
+/// People this near a marker's target are listed with it, metres; story
+/// characters' spawns this near the player.
+const MARK_NEAR: f32 = 6.0;
+const STORY_REACH: f32 = 450.0;
+
+/// A marker the scripts put up, over one of their objects.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mark {
+    pub target: u32,
+    /// What to do there: `"destroy"`, `"deliverable"` (get there),
+    /// `"action"`; or `"objective"`, `"radar"` for an objective's target
+    /// on the map or radar without a marker.
+    pub kind: String,
+    /// The object's name (`vza_beachguard_1`, `loc_vza_beach`).
+    pub name: String,
+    pub at: Vec3,
+    /// The object is alive (not yet destroyed).
+    pub alive: bool,
+}
 
 enum State {
     Loading(Receiver<Result<GameData, String>>),
@@ -202,6 +222,10 @@ impl MissionLink {
                 Ok(Err(e)) => self.fail(format!("could not read the scripts: {e}")),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => self.fail("script reader stopped".into()),
+            }
+            // Without the scripts, every state layer's people stand.
+            if matches!(self.state, State::Failed(_)) {
+                game.scene.people.state_layers = None;
             }
         }
         let State::Running(mission) = &mut self.state else {
@@ -387,13 +411,25 @@ impl MissionLink {
             }
             if let Some(n) = game.scene.people.npcs.iter().find(|n| n.spawn == Some(g)) {
                 what.push(format!(
-                    "soldier {} at {:.1}",
+                    "soldier {} at {:.1} ({}, {}, {})",
                     if n.alive { "alive" } else { "dead" },
-                    n.character.position
+                    n.character.position,
+                    game.scene.people.kinds[n.kind].role,
+                    if n.landed { "landed" } else { "not landed" },
+                    n.doing()
                 ));
             }
             if game.scene.people.all_killed().contains(&g) {
                 what.push("killed".into());
+            }
+            if let Some((prop, loaded)) = game.scene.props.get(g) {
+                what.push(format!(
+                    "model {:08x} at {:.1}{}{}",
+                    prop.model,
+                    prop.position,
+                    if loaded { "" } else { " (loading)" },
+                    if prop.wrecked { ", wrecked" } else { "" }
+                ));
             }
             if let Some(v) = game.scene.vehicles.iter().find(|v| v.guid == Some(g)) {
                 what.push(format!(
@@ -405,6 +441,25 @@ impl MissionLink {
                         "not placed"
                     }
                 ));
+            }
+            // Who else stands within a few metres of it.
+            let near: Vec<String> = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.spawn != Some(g) && n.character.position.distance(p) < MARK_NEAR)
+                .map(|n| {
+                    format!(
+                        "{} {:.1} m off{}",
+                        game.scene.people.kinds[n.kind].role,
+                        n.character.position.distance(p),
+                        if n.alive { "" } else { " (dead)" }
+                    )
+                })
+                .collect();
+            if !near.is_empty() {
+                what.push(format!("near it: {}", near.join(", ")));
             }
             out.push(format!(
                 "marker {} on {:?} ({g:#x}) at {p:.1}, {:.0} m away, {}: {}",
@@ -419,7 +474,98 @@ impl MissionLink {
                 }
             ));
         }
+        // Story characters: who stands, and the spawns that should.
+        let people = &game.scene.people;
+        for n in people.npcs.iter().filter(|n| people.kinds[n.kind].named) {
+            out.push(format!(
+                "story character {} at {:.1}, {}, {}, {}",
+                people.kinds[n.kind].role,
+                n.character.position,
+                if n.landed { "landed" } else { "not landed" },
+                if n.alive { "alive" } else { "dead" },
+                n.doing()
+            ));
+        }
+        // A story character's template is one word (Carmona), a soldier's
+        // several; those within reach.
+        let story = |s: &&m2_engine::world::SpawnPoint| {
+            s.model.is_some()
+                && s.template.as_deref().is_some_and(|t| !t.contains(' '))
+                && s.position.distance(at) < STORY_REACH
+        };
+        for s in spawns.iter().filter(story) {
+            if !people.npcs.iter().any(|n| n.spawn == Some(s.entity)) {
+                out.push(format!(
+                    "story spawn {:?} ({:08x}) at {:.1}, {:.0} m away: not standing{}",
+                    s.name,
+                    s.entity,
+                    s.position,
+                    s.position.distance(at),
+                    if people.layer_in(s.layer) {
+                        ""
+                    } else {
+                        " (its layer is out)"
+                    }
+                ));
+            }
+        }
+        let (shown, loaded, loading, waiting, failed) = game.scene.props.counts();
+        out.push(format!(
+            "props: {shown} shown; their models {loaded} loaded, {loading} loading, {waiting} \
+             waiting, {failed} failed"
+        ));
         out
+    }
+
+    /// The markers the scripts have up, with what they are over; then the
+    /// targets of the objectives on the map (`"objective"`) and of the
+    /// radar's blips (`"radar"`) no marker is over.
+    pub fn marks(&self) -> Vec<Mark> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        let w = mission.world().borrow();
+        let mark = |g: u32, kind: &str| {
+            let o = w.objects.get(&g)?;
+            Some(Mark {
+                target: g,
+                kind: kind.to_owned(),
+                name: o.name.clone(),
+                at: Vec3::from(o.position),
+                alive: o.alive,
+            })
+        };
+        let mut out: Vec<Mark> = w
+            .hud
+            .markers
+            .values()
+            .filter_map(|m| mark(m.target?, m.icon.trim_start_matches("HUD_objective_")))
+            .collect();
+        let others = w
+            .hud
+            .objectives
+            .iter()
+            .filter(|(name, _)| !name.ends_with("_PreMission"))
+            .filter_map(|(_, o)| Some((o.target?, "objective")))
+            .chain(
+                w.hud
+                    .radar
+                    .values()
+                    .filter_map(|b| Some((b.target?, "radar"))),
+            );
+        for (g, kind) in others {
+            if !out.iter().any(|m| m.target == g)
+                && let Some(m) = mark(g, kind)
+            {
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    /// The scripts have said the contract is completed.
+    pub fn completed(&self) -> bool {
+        self.completed.is_some()
     }
 
     /// What the HUD shows.
@@ -540,12 +686,12 @@ impl Fleet {
             return;
         };
         let near = player.character.position;
+        let none = Templates::default();
         let templates = game
             .scene
             .world
             .as_ref()
-            .map(|w| w.index.template_db.clone())
-            .unwrap_or_default();
+            .map_or(&none, |w| &w.index.template_db);
         let w = mission.world().borrow();
         let mut wanted: Vec<(f32, u32, Vec<CatalogueEntry>)> = w
             .objects
@@ -556,7 +702,7 @@ impl Fleet {
                 (d <= VEHICLE_REACH).then_some((d, g, o))
             })
             .filter_map(|(d, g, o)| {
-                let models = template_models(&o.name, &templates, &catalogue.vehicles);
+                let models = template_models(&o.name, templates, &catalogue.vehicles);
                 (!models.is_empty()).then_some((d, g, models))
             })
             .collect();
@@ -716,13 +862,20 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
-        // A state layer in or out: its models with it.
+        // A state layer in or out: its models and people with it.
         Command::Layer { op, name } => {
             let entities: Vec<u32> = mission
                 .layer(name)
                 .map(|es| es.iter().map(|e| e.guid).collect())
                 .unwrap_or_default();
             let scene = &mut game.scene;
+            if let Some(set) = &mut scene.people.state_layers {
+                if *op == LayerOp::Unload {
+                    set.remove(&name_hash(name));
+                } else {
+                    set.insert(name_hash(name));
+                }
+            }
             if let Some(world) = &mut scene.world
                 && *op != LayerOp::Load
             {
@@ -776,6 +929,7 @@ pub(crate) fn template_models(
         Some(&TemplateInfo {
             model: Some(model),
             vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank)),
+            ..
         }) => vec![CatalogueEntry {
             model,
             kind: if kind == VehicleKind::Tank {
@@ -893,25 +1047,35 @@ mod tests {
     #[test]
     fn the_template_database_names_the_model_first() {
         let catalogue = [entry(1, "truck", "gr_veh_truck_m151")];
-        let info = |model, vehicle| TemplateInfo { model, vehicle };
-        let db = Templates(HashMap::from([
-            (
-                "m151 softtop (vz)".to_owned(),
-                info(Some(0xabc), Some(VehicleKind::Car)),
-            ),
-            (
-                "amx30 (full)".to_owned(),
-                info(Some(0xdef), Some(VehicleKind::Tank)),
-            ),
-            (
-                "patrol boat (vz)".to_owned(),
-                info(Some(0x123), Some(VehicleKind::Boat)),
-            ),
-            (
-                "m151 softtop (gl)".to_owned(),
-                info(None, Some(VehicleKind::Car)),
-            ),
-        ]));
+        let info = |model, vehicle| TemplateInfo {
+            model,
+            vehicle,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let db = Templates {
+            by_name: HashMap::from([
+                (
+                    "m151 softtop (vz)".to_owned(),
+                    info(Some(0xabc), Some(VehicleKind::Car)),
+                ),
+                (
+                    "amx30 (full)".to_owned(),
+                    info(Some(0xdef), Some(VehicleKind::Tank)),
+                ),
+                (
+                    "patrol boat (vz)".to_owned(),
+                    info(Some(0x123), Some(VehicleKind::Boat)),
+                ),
+                (
+                    "m151 softtop (gl)".to_owned(),
+                    info(None, Some(VehicleKind::Car)),
+                ),
+            ]),
+            names: HashMap::new(),
+            tuning: HashMap::new(),
+        };
         let models = |n: &str| -> Vec<(u32, String)> {
             template_models(n, &db, &catalogue)
                 .into_iter()

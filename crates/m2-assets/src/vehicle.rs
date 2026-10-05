@@ -176,11 +176,13 @@ pub fn wheels_from_boxes(
             continue;
         }
         let c = [0, 1, 2].map(|a| 0.5 * (b.min[a] + b.max[a]));
+        // A wheel turns about a node on its axle: at its middle, or (the
+        // Stryker's) at the hub's inner face.
         let at = |n: u16| {
             origins.get(usize::from(n)).is_some_and(|o| {
-                let dist =
-                    ((o[0] - c[0]).powi(2) + (o[1] - c[1]).powi(2) + (o[2] - c[2]).powi(2)).sqrt();
-                dist <= 0.05 * d + 0.02
+                let slack = 0.05 * d + 0.02;
+                let off_axle = ((o[1] - c[1]).powi(2) + (o[2] - c[2]).powi(2)).sqrt();
+                off_axle <= slack && (o[0] - c[0]).abs() <= 0.5 * s[0] + slack
             })
         };
         // The topmost ancestor (or the node itself) still at the centre.
@@ -221,12 +223,17 @@ pub fn wheels_from_boxes(
         .iter()
         .filter(|r| !roots.iter().any(|o| o.0 != r.0 && ancestor_of(r.0, o.0)))
     {
-        let centre = origins[usize::from(node)];
+        // On its axle, across the tyre's middle.
+        let mut centre = origins[usize::from(node)];
+        centre[0] = 0.5 * (min[0] + max[0]);
         let radius = 0.5 * (max[1] - min[1]).max(max[2] - min[2]);
         let width = max[0] - min[0];
-        // Copies at the same centre are one wheel.
+        // Copies at the same centre are one wheel: on one axle, and
+        // overlapping across it (the Honda CRX's tyre and its copy sit
+        // 5 cm apart).
         let same = wheels.iter_mut().find(|w| {
-            (0..3).all(|a| (w.centre[a] - centre[a]).abs() <= 0.1 * radius.max(w.radius))
+            (1..3).all(|a| (w.centre[a] - centre[a]).abs() <= 0.1 * radius.max(w.radius))
+                && (w.centre[0] - centre[0]).abs() <= 0.5 * width.max(w.width)
         });
         match same {
             Some(w) => {
@@ -372,6 +379,36 @@ mod tests {
     }
 
     #[test]
+    fn finds_wheels_turning_about_the_hubs_inner_face() {
+        // The Stryker's: each tyre's node sits on its axle at the inner
+        // face, 0.19 m in from the tyre's middle.
+        let mut origins = vec![[0.0, 0.0, 0.0]];
+        let mut parents = vec![None];
+        let mut boxes = vec![NodeBox {
+            node: 0,
+            min: [-1.5, 0.45, -3.7],
+            max: [1.5, 2.5, 3.7],
+        }];
+        for z in [2.148, 0.916, -0.593, -1.826] {
+            for side in [-1.0f32, 1.0] {
+                let node = origins.len() as u16;
+                origins.push([0.985 * side, 0.578, z]);
+                parents.push(Some(0));
+                let (a, b) = (0.985 * side, 1.369 * side);
+                boxes.push(NodeBox {
+                    node,
+                    min: [a.min(b), 0.0, z - 0.578],
+                    max: [a.max(b), 1.155, z + 0.578],
+                });
+            }
+        }
+        let w = wheels_from_boxes(&origins, &parents, &boxes, 0.0);
+        assert_eq!(w.len(), 8, "{w:?}");
+        assert!((w[0].centre[0] + 1.177).abs() < 1e-3, "{:?}", w[0].centre);
+        assert!((w[0].radius - 0.5775).abs() < 1e-3 && (w[0].width - 0.384).abs() < 1e-3);
+    }
+
+    #[test]
     fn merges_copies_of_a_wheel() {
         // A pristine and a damaged tyre, each on its own node at one centre.
         let origins = [[0.0, 0.0, 0.0], [0.9, 0.35, 1.4], [0.9, 0.35, 1.4]];
@@ -384,6 +421,41 @@ mod tests {
         let w = wheels_from_boxes(&origins, &parents, &[tyre(1), tyre(2)], 0.0);
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].nodes, [1, 2]);
+    }
+
+    #[test]
+    fn merges_copies_of_a_wheel_a_little_apart_across_the_axle() {
+        // The Honda CRX's: each tyre twice, 5 cm apart along the axle.
+        let origins = [[0.0, 0.0, 0.0], [0.81, 0.29, 1.09], [0.76, 0.29, 1.09]];
+        let parents = [None, Some(0), Some(0)];
+        let tyre = |node, x: f32| NodeBox {
+            node,
+            min: [x - 0.1, 0.0, 0.8],
+            max: [x + 0.1, 0.58, 1.38],
+        };
+        let w = wheels_from_boxes(&origins, &parents, &[tyre(1, 0.81), tyre(2, 0.76)], 0.0);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].nodes, [1, 2]);
+        // A truck's twin tyres, a tyre's width apart, are two wheels.
+        let origins = [[0.0, 0.0, 0.0], [0.8, 0.5, -2.0], [1.1, 0.5, -2.0]];
+        let w = wheels_from_boxes(
+            &origins,
+            &parents,
+            &[
+                NodeBox {
+                    node: 1,
+                    min: [0.66, 0.0, -2.5],
+                    max: [0.94, 1.0, -1.5],
+                },
+                NodeBox {
+                    node: 2,
+                    min: [0.96, 0.0, -2.5],
+                    max: [1.24, 1.0, -1.5],
+                },
+            ],
+            0.0,
+        );
+        assert_eq!(w.len(), 2, "{w:?}");
     }
 
     #[test]

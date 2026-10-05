@@ -2150,11 +2150,22 @@ fn export_world<R: Read + Seek>(wad: &mut WadArchive<R>, o: &WorldOptions) -> An
                         Ok(Some(p)) => {
                             let (mut pos, mut idx) = (Vec::new(), Vec::new());
                             for (k, s) in p.shapes.iter().enumerate() {
-                                // A shape is in its body node's space.
-                                let to_model = p
+                                // A shape sits at its part's place in its
+                                // body node's space.
+                                let node = p
                                     .shape_node(k)
                                     .and_then(|n| model.node_to_model(n as u16))
                                     .unwrap_or(Mat4::IDENTITY);
+                                let place = p.shape_place(k).map_or(Mat4::IDENTITY, |(at, q)| {
+                                    let q = Quat::from_array(q);
+                                    let q = if q.length() > 0.5 {
+                                        q.normalize()
+                                    } else {
+                                        Quat::IDENTITY
+                                    };
+                                    Mat4::from_rotation_translation(q, Vec3::from(at))
+                                });
+                                let to_model = node * place;
                                 let (v, t) = s.geometry.triangles(s.radius);
                                 let first = (pos.len() / 3) as u32;
                                 for x in v {
