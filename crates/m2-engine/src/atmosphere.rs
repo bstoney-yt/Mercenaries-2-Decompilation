@@ -507,7 +507,14 @@ impl Atmosphere {
         }
         Haze {
             rayleigh: RAYLEIGH,
-            mie: MIE * self.mie,
+            // `M2_MIE=<x>` scales the haze's Mie scattering alone, to test
+            // the sunset's glow about the sun (PC round Q: ours has none).
+            mie: MIE
+                * self.mie
+                * std::env::var("M2_MIE")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(1.0),
             g: self.hg_g,
             inscattering: self.inscattering,
             extinction: self.extinction,
