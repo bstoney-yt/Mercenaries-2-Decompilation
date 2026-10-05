@@ -345,6 +345,17 @@ fn shape_box(p: &Phy2, k: usize, to: Mat4) -> Option<(r::Pose, r::SharedShape)> 
 }
 
 impl CollisionShape {
+    /// A box reaching `half` each way from its centre.
+    pub fn cuboid(half: Vec3) -> Self {
+        let half = half.max(Vec3::splat(0.01));
+        Self {
+            shape: r::SharedShape::cuboid(half.x, half.y, half.z),
+            triangles: 12,
+            stand_in: false,
+            loose: None,
+        }
+    }
+
     /// A triangle mesh; `None` if it has no valid triangle.
     pub fn mesh(vertices: &[Vec3], triangles: &[[u32; 3]]) -> Option<Self> {
         let n = vertices.len() as u32;
