@@ -52,6 +52,9 @@ const CANNON_FLASH: f32 = 2.2;
 /// and the machine gun on anything else with a turret (seconds between
 /// rounds, damage, range). Invented, like the rest of the rules.
 const CANNON_RELOAD: f32 = 2.5;
+/// A turret's gun fires at the crosshair when it points within this of
+/// it, radians; else along its barrel.
+const LAID: f32 = 0.06;
 const SHELL_SPEED: f32 = 150.0;
 const MG_GAP: f32 = 0.09;
 const MG_DAMAGE: f32 = 45.0;
@@ -535,6 +538,14 @@ impl Combat {
         })
     }
 
+    /// Tank shells in flight (drawn as streaks, not models).
+    pub fn shells(&self) -> usize {
+        self.projectiles
+            .iter()
+            .filter(|p| matches!(p, Projectile::Rocket { shell: true, .. }))
+            .count()
+    }
+
     /// Where blasts went off since sounds were last taken.
     pub fn explosions(&self) -> impl Iterator<Item = Vec3> + '_ {
         self.sounds.iter().filter_map(|s| match s {
@@ -653,6 +664,20 @@ impl Combat {
         let (eye, dir) = (player.eye(), player.camera_forward());
         let past = (player.character.position - eye).dot(dir).max(0.0);
         (eye + dir * past, dir)
+    }
+
+    /// The point the crosshair is on (or a long way off along it), seen
+    /// past vehicle `own`.
+    pub fn aim_point(
+        physics: &Physics,
+        people: &People,
+        player: &Player,
+        own: Option<VehicleId>,
+    ) -> Vec3 {
+        let (eye, dir) = Self::aim_ray(player);
+        let far =
+            cast_shot(physics, people, eye, dir, MG_RANGE, None, own).map_or(MG_RANGE, |h| h.0);
+        eye + dir * far
     }
 
     /// What a shot fired now would hit: the distance, and the person if
@@ -873,12 +898,23 @@ impl Combat {
             return;
         };
         let cannon = v.spec.kind == "tank";
-        let from =
-            body.transform_point3(v.spec.turret_transform(v.turret).transform_point3(muzzle));
-        let (eye, dir) = Self::aim_ray(f.player);
-        let goal = cast_shot(f.physics, f.people, eye, dir, MG_RANGE, None, Some(id))
-            .map_or(eye + dir * MG_RANGE, |h| eye + dir * h.0);
-        let aim = (goal - from).normalize_or(dir);
+        let (from, barrel) = v
+            .spec
+            .muzzle_pose(v.turret, v.gun)
+            .unwrap_or((muzzle, Vec3::Z));
+        let (from, barrel) = (
+            body.transform_point3(from),
+            body.transform_vector3(barrel).normalize_or(Vec3::Z),
+        );
+        let goal = Self::aim_point(f.physics, f.people, f.player, Some(id));
+        // At the crosshair once the gun is laid on it; until then, where
+        // the barrel points.
+        let to_goal = (goal - from).normalize_or(barrel);
+        let aim = if to_goal.angle_between(barrel) <= LAID {
+            to_goal
+        } else {
+            barrel
+        };
         if cannon {
             self.reload = CANNON_RELOAD;
             self.projectiles.push(Projectile::Rocket {
