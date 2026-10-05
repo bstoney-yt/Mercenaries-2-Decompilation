@@ -70,6 +70,12 @@ pub struct Atmosphere {
     pub extinction: f32,
     pub mie: f32,
     pub hg_g: f32,
+    /// `AtmosphereForce`, `AtmosphereLimit`, `HazeForce` and `HazeLimit`:
+    /// the haze's two layers of air, each as thick as its limit (metres)
+    /// and thinning to nothing there, its force a scale on its density.
+    /// Inferred from the game's haze shaders, which take `(force,
+    /// 1 / limit)` for each layer; `None` where a record lacks them.
+    pub haze_layers: Option<[f32; 4]>,
     /// `Tone_R`, `Tone_G`, `Tone_B`: among the cloud settings (between
     /// `ShadowK` and `LightBlend`), so taken as the clouds' tint.
     pub tone: Vec3,
@@ -177,6 +183,14 @@ impl Atmosphere {
             extinction: float("ScatterExtinctionMultiplier").unwrap_or(0.0),
             mie: float("ScatterBetaMieMultiplier").unwrap_or(0.0),
             hg_g: float("ScatterHgG").unwrap_or(0.0),
+            haze_layers: (|| {
+                Some([
+                    float("AtmosphereForce")?,
+                    float("AtmosphereLimit")?,
+                    float("HazeForce")?,
+                    float("HazeLimit")?,
+                ])
+            })(),
             cloud_darkness: float("DarknessK").unwrap_or(0.0),
             tone: Vec3::new(
                 float("Tone_R").unwrap_or(1.0),
@@ -264,6 +278,10 @@ impl Atmosphere {
             extinction: f(self.extinction, to.extinction),
             mie: f(self.mie, to.mie),
             hg_g: f(self.hg_g, to.hg_g),
+            haze_layers: match (self.haze_layers, to.haze_layers) {
+                (Some(a), Some(b)) => Some(std::array::from_fn(|i| f(a[i], b[i]))),
+                (_, b) => b,
+            },
             tone: v(self.tone, to.tone),
             cloud_darkness: f(self.cloud_darkness, to.cloud_darkness),
             bloom: std::array::from_fn(|i| f(self.bloom[i], to.bloom[i])),
@@ -336,7 +354,14 @@ impl Atmosphere {
         };
         lighting.haze = self.haze();
         lighting.clouds.tone = self.tone;
-        if mode != "li" && mode != "full" {
+        // The game's haze shaders take the sun's colour and nothing of
+        // LightIntensity (PC round R); `M2_HAZE_LI=on` dims it by that in
+        // display values all the same.
+        if lighting.haze.layers.is_some() {
+            if env_is("M2_HAZE_LI", "on") {
+                lighting.haze.inscattering *= self.light_intensity.max(0.0);
+            }
+        } else if mode != "li" && mode != "full" {
             let li = self.light_intensity.max(0.0);
             // `M2_SKY_LI=linear` dims the haze by the intensity itself
             // rather than its decoded value (0.3 rather than 0.07 at
@@ -400,6 +425,12 @@ impl Atmosphere {
             inscattering: self.inscattering,
             extinction: self.extinction,
             density: HAZE_DENSITY,
+            // `M2_HAZE=old` keeps the earlier haze, thinning exponentially
+            // over the scale heights, its density fitted.
+            layers: self
+                .haze_layers
+                .filter(|_| !env_is("M2_HAZE", "old"))
+                .map(|[f1, l1, f2, l2]| [f1, recip(l1), f2, recip(l2)]),
             ..Haze::default()
         }
     }
@@ -688,6 +719,11 @@ fn channels(v: u32, lit: Lit) -> [f32; 4] {
     }
 }
 
+/// `1 / x`, or 0 for none.
+fn recip(x: f32) -> f32 {
+    if x > 0.0 { 1.0 / x } else { 0.0 }
+}
+
 /// A gamma-encoded (sRGB) channel in 0..1 as linear light.
 fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 {
@@ -711,6 +747,7 @@ mod tests {
             extinction: 0.0,
             mie: 0.0,
             hg_g: 0.0,
+            haze_layers: None,
             tone: Vec3::ONE,
             cloud_darkness: 0.0,
             bloom: [0.0; 4],
