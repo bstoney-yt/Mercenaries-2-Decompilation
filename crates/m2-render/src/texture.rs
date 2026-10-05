@@ -181,6 +181,8 @@ pub struct MaterialDesc {
     pub emissive: Option<Emissive>,
     /// Mirror-like reflection of the surroundings (glass, paint, metal).
     pub reflection: Option<Reflection>,
+    /// Takes the view's rim light (see [`Lighting`](crate::Lighting)).
+    pub rim: bool,
 }
 
 /// A reflection of the surroundings, along the view mirrored in the
@@ -262,6 +264,7 @@ impl Default for MaterialDesc {
             ambient: [1.0; 3],
             emissive: None,
             reflection: None,
+            rim: false,
         }
     }
 }
