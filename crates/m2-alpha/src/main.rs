@@ -962,14 +962,17 @@ fn screenshot(
         }
     }
     // The picture, with the HUD (the game's, once its scripts have
-    // started and run half a second).
+    // started and run half a second; two with the support menu or the
+    // satellite's view up, whose boxes take longer than that to open).
     let mut hud = ui::Hud::new();
     hud.game = game_hud(install, mode, options.old_hud);
     let mut settings = config.clone();
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
         info.game = Some(gamehud::HudState::of(&mut game));
-        hud.settle(&info, (w, h), 0.5, Duration::from_secs(120));
+        let opening = info.support.menu || info.support.satellite.is_some();
+        let seconds = if opening { 2.0 } else { 0.5 };
+        hud.settle(&info, (w, h), seconds, Duration::from_secs(120));
         info.game = Some(gamehud::HudState::of(&mut game));
     }
     let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
@@ -2470,13 +2473,17 @@ fn satellite_for_screenshot(
         }),
     );
     // A press as the marker passes through each wedge; the wheel's
-    // picture is of the check after the first.
+    // picture is of the marker in the first, before the press (as the
+    // footage shows the wheel turning).
     for wedge in 0..2 {
         for _ in 0..600 {
             if game.support.wheel_ready() {
                 break;
             }
             game.step(Intent::default(), tick);
+        }
+        if stage == SatelliteShot::Wheel {
+            return Ok(());
         }
         press(
             game,
@@ -2486,10 +2493,6 @@ fn satellite_for_screenshot(
             },
         );
         eprintln!("satellite: wedge {wedge}: {:?}", game.support.phase);
-        if stage == SatelliteShot::Wheel {
-            game.step(Intent::default(), tick);
-            return Ok(());
-        }
     }
     let (hp, alive) = (
         game.combat.hp,

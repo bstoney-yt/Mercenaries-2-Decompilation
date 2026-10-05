@@ -187,19 +187,22 @@ MrxGuiManager.SetSatelliteCost(p, cost)
 "#;
 /// Each frame the view is open, before the scripts step: the time and
 /// cost the view's boxes count up (its `_TimeUpdate` adds the step to
-/// `nTime`; the cost is in dollars) and the help beside it.
+/// `nTime`; the cost is in dollars).
 const SATELLITE_FEED: &str = r#"
-local time, cost, help = ...
+local time, cost = ...
 local w = MrxGui.GetWidgetByNameAndOwner("Satellite overlay", Sys.StringToGuid("0x1"))
 local m = w and w.CustomData.oMinigame
 if not m then return end
 m.CustomData.nTime = time
 m.CustomData.nCost = cost
 m.CustomData.nCashPerSecond = 0
-if w.CustomData.sHelp ~= help then
-    w.CustomData.sHelp = help
-    w:SetHelpText(help)
-end
+"#;
+/// The HUD's tutorial box (`MrxGuiTutorial`: the line typed out under its
+/// header, right of the middle) says this, or is put away (nil).
+const TUTORIAL: &str = r#"
+local text = ...
+local w = MrxGui.GetWidgetByNameAndOwner("tutorial", Sys.StringToGuid("0x1"))
+if w and w.SetText then w:SetText(text) end
 "#;
 /// After the scripts step, while the timing wheel shows: the wheel's own
 /// widgets posed as the play has it (the minigame's own clock and hit
@@ -246,7 +249,19 @@ for i, s in ipairs(c.tSectorWidgets) do
 end
 place(c.oCursor)
 c.oCursor:SetRotation(angle)
-c.oButton:SetVisible(false)
+-- The fire button's picture in the middle of the wedge the marker is in,
+-- 80 of the wheel's 128 out, as the minigame's own update puts it; gone
+-- after a press.
+local d = inside and c.tSectorData and c.tSectorData[inside]
+if d and mark == nil then
+    local a = math.rad((d[1] + d[2]) / 2)
+    local bx, by = c.nCenterX + math.sin(a) * 80 * size, c.nCenterY - math.cos(a) * 80 * size
+    c.oButton:SetLocation(bx - 16 * size, by - 16 * size, bx + 16 * size, by + 16 * size)
+    c.oButton:SetVisible(true)
+    c.oButton:SetTranslucency(255)
+else
+    c.oButton:SetVisible(false)
+end
 if mark == nil then
     c.oFeedback:SetVisible(false)
 else
@@ -255,12 +270,13 @@ else
     c.oFeedback:SetTranslucency(255)
 end
 "#;
-/// The satellite view's help (`Satellite Help`, right of the middle):
-/// the PC's prompt for the timing wheel, as the first contract shows it
-/// (`[pfire]` the fire key); before the wheel, the keys (ours: the game's
-/// PC strings have none for steering the view).
+/// The satellite view's help, in the tutorial box as the PC footage has
+/// it (its own `Satellite Help` text stays blank): steering the view and
+/// confirming the target, by the game's own two lines (`[move] Move view`,
+/// `[confirm] Confirm target`, by their keys' hashes); then the PC's
+/// prompt for the timing wheel (`Press [pfire] at the right time.`).
+const VIEW_HELP: &str = "[0x23fb33d9][n][0x3bfec0b6]";
 const WHEEL_HELP: &str = "[SHELL.PCShell.Tutorial_SatMinigame_PC]";
-const VIEW_HELP: &str = "Move view: WASD or mouse[n]Confirm target: fire or E";
 /// Seconds of play the scripts are given at most per frame.
 const MAX_STEP: f64 = 0.25;
 /// Largest texture size decoded, pixels.
@@ -339,6 +355,9 @@ pub struct HudState {
     /// Her support: the item ready, the menu, the designator, the
     /// satellite's view and its wheel.
     pub support: SupportHud,
+    /// The tutorial line the mission has up (`Net.SetTutorialMessage`), for
+    /// the HUD's own tutorial box.
+    pub tutorial: Option<String>,
 }
 
 impl HudState {
@@ -735,6 +754,8 @@ struct Told {
     menu: Option<bool>,
     /// The satellite's view is open.
     satellite: bool,
+    /// What the tutorial box says (None: never anything).
+    tutorial: Option<Option<String>>,
 }
 
 /// How far (in -1..=1 screen units, across plus up) the aim point moves
@@ -815,6 +836,10 @@ impl Thread {
         mission
             .run(VIEW_POINT, "m2-hud view point")
             .map_err(|e| e.to_string())?;
+        // What the game finishes while it loads, before play: the
+        // movies' load callbacks (the PDA's closes it, `_FinishLoadAndClose`;
+        // left open, the support menu won't open over it).
+        gui_runtime::tick(mission.lua(), 0.0);
         Ok(Self {
             mission,
             assets,
@@ -861,12 +886,16 @@ impl Thread {
         // Looking through the satellite, only its view shows: the
         // scripts put the HUD to sleep (`MrxGuiManager.ToggleHud`), which
         // leaves some of it awake here.
-        let only = state
-            .support
-            .satellite
-            .map(|_| widgets_under(&screen.borrow(), &names, |n| n == "Satellite overlay"));
-        // No aim point: the reticle's widgets are left out.
-        let hidden = match state.reticle {
+        // Its help is in the tutorial box (as the PC footage has it), which
+        // stays awake.
+        let only = state.support.satellite.map(|_| {
+            widgets_under(&screen.borrow(), &names, |n| {
+                n == "Satellite overlay" || n == "tutorial"
+            })
+        });
+        // No aim point: the reticle's widgets are left out (not the
+        // satellite's own, its crosshair).
+        let hidden = match state.reticle.or(state.support.satellite.map(|_| [0.0; 2])) {
             Some(_) => HashSet::new(),
             None => {
                 let hidden = reticle_widgets(&screen.borrow(), &names);
@@ -1201,15 +1230,29 @@ impl Thread {
                 "__m2_hud_view",
                 lua.create_sequence_from(middle.to_array())?,
             )?;
-            let help = if sup.wheel.is_some() {
-                WHEEL_HELP
-            } else {
-                VIEW_HELP
-            };
             // The view's clock adds the step as the scripts run.
             lua.load(SATELLITE_FEED)
                 .set_name("=m2-hud satellite")
-                .call::<()>((f64::from(seconds) - step, f64::from(cost) * 1000.0, help))?;
+                .call::<()>((f64::from(seconds) - step, f64::from(cost) * 1000.0))?;
+            // What is under the crosshair, as the engine tells the view
+            // each frame: nothing yet (no name, no faction), which blanks
+            // the readout and puts the faction's badge away.
+            fire(lua, "SatelliteTargetUpdate", lua.create_table()?)?;
+        }
+        // The tutorial box: the satellite's help while its view is open,
+        // else the mission's line.
+        let tutorial = match (sup.satellite, &sup.wheel) {
+            (Some(_), Some(_)) => Some(WHEEL_HELP.to_owned()),
+            (Some(_), None) => Some(VIEW_HELP.to_owned()),
+            (None, _) => s.tutorial.clone(),
+        };
+        // Never up yet: nothing to put away (putting it away starts its
+        // closing, whose end would fold up the next line's header).
+        if self.told.tutorial.clone().flatten() != tutorial {
+            lua.load(TUTORIAL)
+                .set_name("=m2-hud tutorial")
+                .call::<()>(tutorial.as_deref())?;
+            self.told.tutorial = Some(tutorial);
         }
         Ok(())
     }
