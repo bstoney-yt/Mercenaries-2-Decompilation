@@ -318,8 +318,8 @@ impl Atmosphere {
         // `M2_LIGHTING=linear` sums the light in linear light, with the
         // sun's colour taken as linear, as before, for comparison.
         lighting.gamma_light = gamma_light();
-        // `LightIntensity` dims the sky's light, its haze and clouds, but
-        // not the sun on surfaces: in the sun's colour, at Guanare's 0.3
+        // `LightIntensity` dims the sky's haze, but not the sun on
+        // surfaces or clouds: in the sun's colour, at Guanare's 0.3
         // the town's sunlit road was 1.2 times as bright as its shadow
         // against 1.4 to 2.8 in footage, and without it 1.5; left out of
         // the sky too, the night sky was half as bright again as footage
@@ -344,7 +344,13 @@ impl Atmosphere {
                 li
             };
             lighting.haze.inscattering *= sky;
-            lighting.clouds.tone *= sky;
+            // The clouds take the sun's light as the game's do (from the
+            // same constant as surfaces), but `M2_CLOUD_LI=on` dims them
+            // with the haze: so dimmed, the town's sky overhead was near
+            // black against the footage's pale cream (PC round V).
+            if env_is("M2_CLOUD_LI", "on") {
+                lighting.clouds.tone *= sky;
+            }
         }
         // `BloomAmount` times `BloomMultiplier` above `BloomThreshold`
         // (inferred from the names).
