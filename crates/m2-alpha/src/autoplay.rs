@@ -73,6 +73,10 @@ const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
 const HOP: f32 = 25.0;
+/// A hop lands on the ground found from this far above the way's height
+/// there, down to this far below it, metres; else on the highest there.
+const HOP_ABOVE: f32 = 3.0;
+const HOP_BELOW: f32 = 10.0;
 /// A ride she has had is taken again for places further than this when it
 /// stands within the second distance, metres.
 const RIDE_FOR: f32 = 120.0;
@@ -981,9 +985,22 @@ impl Autoplay {
         let (Some(world), Some(p)) = (&mut game.scene.world, &mut game.scene.player) else {
             return;
         };
-        let top = Vec3::new(to.x, to.y.max(at.y) + 80.0, to.z);
-        if let Some((t, _)) = world.physics.cast_ray(top, Vec3::NEG_Y, 400.0) {
-            to.y = top.y - t;
+        // Onto the ground by the way's height there (the floor under a
+        // roof), else the highest there is.
+        let near = Vec3::new(to.x, at.y + HOP_ABOVE, to.z);
+        let high = Vec3::new(to.x, to.y.max(at.y) + 80.0, to.z);
+        if let Some(y) = world
+            .physics
+            .cast_ray(near, Vec3::NEG_Y, HOP_ABOVE + HOP_BELOW)
+            .map(|(t, _)| near.y - t)
+            .or_else(|| {
+                world
+                    .physics
+                    .cast_ray(high, Vec3::NEG_Y, 400.0)
+                    .map(|(t, _)| high.y - t)
+            })
+        {
+            to.y = y;
         }
         match p.driving {
             Some(i) => {
