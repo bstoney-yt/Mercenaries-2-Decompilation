@@ -277,8 +277,21 @@ impl MaterialCache {
         } else {
             BlendMode::Opaque
         };
-        // The opacity constant scales the texture's alpha.
-        let opacity = material.constants[12].clamp(0.0, 1.0);
+        // A beam of light (a searchlight's cone): blended, glowing with
+        // its own texture.
+        let beam = has(flags::BLENDED) && emissive.is_some() && slot(1) == slot(0);
+        // `M2_BEAM=old` draws beams as before: at the opacity constant and
+        // fading where their sides turn from the eye.
+        let old_beam = std::env::var("M2_BEAM").is_ok_and(|v| v == "old");
+        // The opacity constant scales the texture's alpha, except on
+        // beams: at the searchlights' 0.1 their cores came out a tenth as
+        // bright over the night sky as in footage (PC round D), so for
+        // them it is taken to mean something else (inferred).
+        let opacity = if beam && !old_beam {
+            1.0
+        } else {
+            material.constants[12].clamp(0.0, 1.0)
+        };
         let desc = MaterialDesc {
             texture: texture.map(|t| t.0),
             blend,
@@ -315,12 +328,9 @@ impl MaterialCache {
             reflection,
             rim: technique.is_some_and(|t| t.rim),
             depth_bias,
-            // A beam of light (a searchlight's cone): blended, glowing
-            // with its own texture. It fades where its sides turn away
-            // from the eye, so it reads as a soft shaft rather than a
-            // solid cone, as in footage of the game (the game's own
-            // falloff is not known).
-            soft_edge: has(flags::BLENDED) && emissive.is_some() && slot(1) == slot(0),
+            // The game's beam shader has no fade by how the surface faces
+            // the eye; ours did, under `M2_BEAM=old`.
+            soft_edge: beam && old_beam,
             ..MaterialDesc::default()
         };
         let tinted = debug_tint(material, desc.texture.is_some());
