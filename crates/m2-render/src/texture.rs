@@ -190,6 +190,8 @@ pub struct MaterialDesc {
     /// Water: scale on the sky it mirrors (the game's reflection map may
     /// hold only what stands over the water).
     pub water_sky: f32,
+    /// Water: scale on its waves' heights, so their slopes (1: as drawn).
+    pub water_waves: f32,
 }
 
 /// A reflection of the surroundings, along the view mirrored in the
@@ -274,6 +276,7 @@ impl Default for MaterialDesc {
             rim: false,
             water: false,
             water_sky: 1.0,
+            water_waves: 1.0,
         }
     }
 }
