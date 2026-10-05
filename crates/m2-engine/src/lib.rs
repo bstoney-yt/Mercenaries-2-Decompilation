@@ -30,5 +30,5 @@ pub use physics::{
     Character, CollisionShape, Physics, RagdollId, StaticKey, VehicleControls, VehicleId,
 };
 pub use stream::{Frustum, World, WorldSettings, WorldStats};
-pub use vehicle::{Catalogue, CatalogueEntry, PersonModel, VehicleSpec};
+pub use vehicle::{Catalogue, CatalogueEntry, PersonModel, Rest, VehicleSpec};
 pub use world::{TemplateInfo, TemplatePlacement, Templates, VehicleKind, WorldIndex};

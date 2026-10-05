@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use m2_engine::{Physics, VehicleControls};
-use m2_math::glam::{Vec3, Vec4Swizzles};
+use m2_math::glam::{Quat, Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
@@ -287,6 +287,7 @@ impl Game {
                             // Wheels turned the positive way steer left.
                             steer: -intent.movement.x,
                             brake: intent.hold_jump,
+                            parked: false,
                         },
                     );
                     if intent.right_vehicle {
@@ -333,10 +334,17 @@ impl Game {
             for (i, v) in self.scene.vehicles.iter_mut().enumerate() {
                 let Some(id) = v.id else { continue };
                 v.rolled += world.physics.vehicle_speed(id) * dt;
-                // Nobody at the wheel: it coasts to a stop and stays put (a
-                // wreck drags on its rims, driven by nobody).
+                // Nobody at the wheel: it brakes to a stop and stays put,
+                // on a hill too (a wreck drags on its rims, driven by
+                // nobody).
                 if driven != Some(i) {
-                    world.physics.drive(id, VehicleControls::default());
+                    world.physics.drive(
+                        id,
+                        VehicleControls {
+                            parked: true,
+                            ..VehicleControls::default()
+                        },
+                    );
                 }
             }
         }
@@ -621,11 +629,16 @@ const PARK_SPOTS: i32 = 12;
 /// Looks before parking gives up on the vehicles left (cramped ground: a
 /// ledge, a town).
 const PARK_TRIES: u32 = 40;
-/// A spot is flat enough when the ground under the footprint's corners
-/// varies by less than this fraction of its length (about 10°) plus a
-/// little, near the height of her feet (not a roof).
-const PARK_FLAT: f32 = 0.18;
+/// A spot will do when the ground under the wheels slopes less than this
+/// (radians, about 10°; later looks take up to twice it), nothing under
+/// the hull rises more than this above them (metres: a rock, a ledge),
+/// and it is near the height of her feet (not a roof).
+const PARK_SLOPE: f32 = 0.18;
+const PARK_BUMPS: f32 = 0.3;
 const PARK_ROOF: f32 = 8.0;
+/// Vehicles are let go this far above where they rest, to settle onto
+/// their wheels, metres.
+const DROP: f32 = 0.3;
 /// Room left between parked vehicles, metres.
 const PARK_GAP: f32 = 1.5;
 
@@ -643,7 +656,7 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
     // Spots nearest the one ahead first.
     // Later looks reach further and take steeper ground.
     let reach = PARK_SPOTS + (tries / 2) as i32;
-    let flat = PARK_FLAT * (1.0 + tries as f32 / 8.0).min(3.0);
+    let steep = PARK_SLOPE * (1.0 + tries as f32 / 8.0).min(2.0);
     let mut spots: Vec<Vec3> = (-reach..=reach)
         .flat_map(|i| (-reach..=reach).map(move |j| (i, j)))
         .map(|(i, j)| ahead + right * (i as f32 * PARK_GRID) + forward * (j as f32 * PARK_GRID))
@@ -666,7 +679,6 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
         let (lo, hi) = v.spec.bounds;
         let radius = footprint_radius(&v.spec);
         let middle = Vec3::new((lo.x + hi.x) * 0.5, 0.0, (lo.z + hi.z) * 0.5);
-        let length = (hi.z - lo.z).max(hi.x - lo.x);
         let ground = |p: Vec3| {
             let top = Vec3::new(p.x, feet.y + PARK_ROOF, p.z);
             physics
@@ -680,26 +692,19 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
             {
                 return None;
             }
-            let corner = |x: f32, z: f32| centre + right * x + forward * z;
-            let (hx, hz) = ((hi.x - lo.x) * 0.5, (hi.z - lo.z) * 0.5);
-            let heights = [
-                ground(centre)?,
-                ground(corner(-hx, -hz))?,
-                ground(corner(hx, -hz))?,
-                ground(corner(-hx, hz))?,
-                ground(corner(hx, hz))?,
-            ];
-            let (min, max) = heights
-                .iter()
-                .fold((f32::MAX, f32::MIN), |(a, b), &h| (a.min(h), b.max(h)));
-            (max - min <= length * flat + 0.2 && (max - feet.y).abs() < PARK_ROOF)
-                .then_some((centre, max))
+            // Tilted to the ground under its wheels, clear of what is
+            // under its hull.
+            let origin = centre - (right * middle.x + forward * middle.z);
+            let rest = v.spec.rest_on(origin, player.facing, ground)?;
+            (rest.slope <= steep
+                && rest.bumps <= PARK_BUMPS
+                && (rest.position.y - feet.y).abs() < PARK_ROOF)
+                .then_some((centre, rest))
         });
         // Nowhere yet (the ground may still be loading): try next tick.
-        let Some((centre, top)) = spot else { continue };
-        let origin = centre - (right * middle.x + forward * middle.z);
-        let at = Vec3::new(origin.x, top + v.spec.ride_height() + 0.3, origin.z);
-        v.id = Some(physics.add_vehicle(&v.spec, at, player.facing));
+        let Some((centre, rest)) = spot else { continue };
+        let at = rest.position + Vec3::Y * DROP;
+        v.id = Some(physics.add_vehicle_turned(&v.spec, at, rest.rotation));
         taken.push((centre, radius));
     }
 }
@@ -709,16 +714,35 @@ fn parkable(v: &ParkedVehicle) -> bool {
     v.id.is_none() && v.guid.is_none() && v.spot.is_none()
 }
 
-/// Puts a vehicle on the ground at `at` facing `yaw`; false while the
-/// ground there hasn't loaded.
+/// Puts a vehicle on the ground at `at` facing `yaw`, tilted to the
+/// ground under its wheels; false while the ground there hasn't loaded.
 pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw: f32) -> bool {
-    let top = at + Vec3::Y * 30.0;
-    let Some((d, _)) = physics.cast_ray(top, Vec3::NEG_Y, 80.0) else {
-        return false;
+    // From a little above where the layers put it (so one under a bridge
+    // or a gantry stays under it), else from well above.
+    let ground = |p: Vec3| {
+        [6.0, 30.0].into_iter().find_map(|up| {
+            let top = Vec3::new(p.x, at.y + up, p.z);
+            physics
+                .cast_ray(top, Vec3::NEG_Y, up + 50.0)
+                .map(|(d, _)| top.y - d)
+        })
     };
-    let ground = top.y - d;
-    let at = Vec3::new(at.x, ground + v.spec.ride_height() + 0.3, at.z);
-    v.id = Some(physics.add_vehicle(&v.spec, at, yaw));
+    let rest = v.spec.rest_on(at, yaw, ground);
+    // A wheel over nothing (a quay's edge): level, on the ground under
+    // its origin.
+    let (at, turn) = match rest {
+        Some(r) => (r.position, r.rotation),
+        None => {
+            let Some(h) = ground(at) else {
+                return false;
+            };
+            (
+                Vec3::new(at.x, h + v.spec.ride_height(), at.z),
+                Quat::from_rotation_y(yaw),
+            )
+        }
+    };
+    v.id = Some(physics.add_vehicle_turned(&v.spec, at + Vec3::Y * DROP, turn));
     true
 }
 
