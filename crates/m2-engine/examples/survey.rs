@@ -68,6 +68,13 @@
 //!                           template: name, model, components, and what
 //!                           the alpha's world index makes of it
 //! find:<hash>[,..]          names for hashes
+//! cues[:<name>,..]          which bank sounds the clips' sound events
+//!                           (and the names given) play: each name tried
+//!                           as a sound's, bare, numbered, lettered and
+//!                           with each ground surface (`SoundMaterial`
+//!                           templates' and common ones) before or after;
+//!                           then the cues no sound answers, and how many
+//!                           of each bank's sounds a cue answers
 //! ```
 //!
 //! Names come from every NUL-terminated string in the four archives and
@@ -716,6 +723,7 @@ fn main() -> Result<(), Error> {
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
             "parents" => parents(&mut source, &names, arg),
+            "cues" => cues(&mut source, &names, arg),
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -896,6 +904,245 @@ fn sounds<R: Read + Seek>(
                 loud.join(""),
                 zcr.join("")
             );
+        }
+    }
+    Ok(())
+}
+
+/// Ground surfaces a footstep's sound may be named for, besides those the
+/// template database's `SoundMaterial (..)` templates name.
+const SURFACES: [&str; 44] = [
+    "dirt",
+    "grass",
+    "sand",
+    "concrete",
+    "asphalt",
+    "tarmac",
+    "road",
+    "metal",
+    "solidmetal",
+    "hollowmetal",
+    "metalgrate",
+    "wood",
+    "woodhollow",
+    "water",
+    "shallowwater",
+    "deepwater",
+    "puddle",
+    "mud",
+    "gravel",
+    "rock",
+    "stone",
+    "tile",
+    "carpet",
+    "snow",
+    "leaves",
+    "foliage",
+    "jungle",
+    "default",
+    "generic",
+    "hard",
+    "soft",
+    "glass",
+    "plastic",
+    "rubber",
+    "flesh",
+    "body",
+    "brick",
+    "marble",
+    "straw",
+    "thatch",
+    "earth",
+    "ground",
+    "bush",
+    "pavement",
+];
+
+/// A cue's name with each ending tried: none, numbered (`_01`, `_1`,
+/// `01`, `1`), lettered (`_a`, `a`), looped.
+fn endings() -> Vec<String> {
+    let mut out = vec![String::new(), "_lp".into(), "_loop".into()];
+    for n in 1..=24 {
+        out.push(format!("_{n:02}"));
+        out.push(format!("_{n}"));
+        out.push(format!("{n:02}"));
+        out.push(format!("{n}"));
+    }
+    for c in 'a'..='h' {
+        out.push(format!("_{c}"));
+        out.push(format!("{c}"));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn cues<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let index = source.archive().index();
+    let mut clip_blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == ANIMATION_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    clip_blocks.sort_unstable();
+    clip_blocks.dedup();
+    let mut bank_blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == SOUND_BANK_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    bank_blocks.sort_unstable();
+    bank_blocks.dedup();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash);
+    // The clips' sound events: (category, name) -> clips carrying it.
+    let mut events: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for b in clip_blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != ANIMATION_TYPE {
+                continue;
+            }
+            let Ok(clip) = Clip::parse(data) else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            for ev in &clip.events {
+                let key = (ev.category.clone(), ev.name.clone());
+                if ev.category.to_ascii_lowercase().starts_with("sound") && seen.insert(key.clone())
+                {
+                    *events.entry(key).or_default() += 1;
+                }
+            }
+        }
+    }
+    for w in arg.split(',').filter(|w| !w.is_empty()) {
+        events.entry(("asked".into(), w.to_owned())).or_default();
+    }
+    // Surfaces: the template database's sound materials, and common ones.
+    let mut materials: Vec<String> = Vec::new();
+    if let Some(h) = db_hash {
+        let data = source.asset(h, TEMPLATE_DB_TYPE)?;
+        let db = Layer::parse(&data)?;
+        for n in db.names().values() {
+            if let Some(inner) = n
+                .strip_prefix("SoundMaterial (")
+                .and_then(|r| r.strip_suffix(')'))
+            {
+                materials.push(inner.to_owned());
+            }
+        }
+    }
+    materials.sort();
+    materials.dedup();
+    println!(
+        "{} SoundMaterial templates: {}",
+        materials.len(),
+        materials.join(", ")
+    );
+    let mut surfaces: Vec<String> = materials.clone();
+    surfaces.extend(SURFACES.iter().map(|s| (*s).to_owned()));
+    surfaces.sort();
+    surfaces.dedup();
+    // Every bank's sounds: hash -> (bank, index, seconds).
+    let mut sounds: HashMap<u32, Vec<(u32, usize, f32)>> = HashMap::new();
+    let mut banks: Vec<(u32, usize)> = Vec::new();
+    for b in bank_blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != SOUND_BANK_TYPE {
+                continue;
+            }
+            let Ok(bank) = SoundBank::parse(data) else {
+                continue;
+            };
+            banks.push((e.name_hash, bank.sounds.len()));
+            for (i, s) in bank.sounds.iter().enumerate() {
+                sounds.entry(s.hash).or_default().push((
+                    e.name_hash,
+                    i,
+                    s.frames as f32 / s.rate.max(1) as f32,
+                ));
+            }
+        }
+    }
+    println!(
+        "{} sound events in clips (+ {} asked); {} banks, {} sounds",
+        events.keys().filter(|k| k.0 != "asked").count(),
+        events.keys().filter(|k| k.0 == "asked").count(),
+        banks.len(),
+        sounds.values().map(Vec::len).sum::<usize>()
+    );
+    let ends = endings();
+    let prefixes = ["", "fol_", "sfx_", "ahj_", "sfx_fol_"];
+    let mut answered: HashSet<u32> = HashSet::new();
+    let mut silent: Vec<String> = Vec::new();
+    for ((category, name), clips) in &events {
+        let lower = name.to_ascii_lowercase();
+        // (sound hash, the name that hashed to it)
+        let mut found: BTreeMap<u32, String> = BTreeMap::new();
+        let mut try_name = |parts: &[&str]| {
+            let h = hash_parts(parts);
+            if sounds.contains_key(&h) {
+                found.entry(h).or_insert_with(|| parts.concat());
+            }
+        };
+        for p in prefixes {
+            for e in &ends {
+                try_name(&[p, &lower, e]);
+                if category.contains("surface") || category == "asked" {
+                    for s in &surfaces {
+                        try_name(&[p, &lower, "_", s, e]);
+                        try_name(&[p, s, "_", &lower, e]);
+                        try_name(&[p, &lower, s, e]);
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            silent.push(format!("{category}/{name}"));
+            continue;
+        }
+        answered.extend(found.keys().copied());
+        let shown: Vec<String> = found
+            .iter()
+            .take(8)
+            .flat_map(|(h, n)| {
+                sounds[h].iter().take(1).map(move |(bank, i, secs)| {
+                    format!("{}#{i} {h:08x} {n} {secs:.2}s", names.show(*bank))
+                })
+            })
+            .collect();
+        println!(
+            "  {category}/{name} ({clips} clips): {} sounds: {}{}",
+            found.len(),
+            shown.join("; "),
+            if found.len() > 8 { "; ..." } else { "" }
+        );
+    }
+    println!("{} cues no sound answers:", silent.len());
+    for chunk in silent.chunks(8) {
+        println!("  {}", chunk.join(", "));
+    }
+    println!("sounds a cue answers, per bank (those with any):");
+    let mut per_bank: BTreeMap<u32, usize> = BTreeMap::new();
+    for h in &answered {
+        for (bank, _, _) in &sounds[h] {
+            *per_bank.entry(*bank).or_default() += 1;
+        }
+    }
+    for (bank, total) in &banks {
+        if let Some(n) = per_bank.get(bank) {
+            println!("  {:08x} {}: {n} of {total}", bank, names.show(*bank));
         }
     }
     Ok(())

@@ -30,6 +30,7 @@ use m2_render::{
 
 use crate::assets::{AssetError, AssetSource};
 use crate::physics::CollisionShape;
+use crate::pickup::Leavings;
 use crate::tuning::VehicleTuning;
 
 /// Side of the island in metres (20 cells of 400 m).
@@ -128,6 +129,8 @@ pub struct Templates {
     pub names: HashMap<u32, String>,
     /// How the templates that say so handle and fight, by id.
     pub tuning: HashMap<u32, VehicleTuning>,
+    /// What templates leave when destroyed, and what pickups give.
+    pub leavings: Leavings,
 }
 
 impl Templates {
@@ -135,6 +138,16 @@ impl Templates {
     /// 0x0012abcd`, `AMX30`) names, whatever its case.
     pub fn get(&self, name: &str) -> Option<&TemplateInfo> {
         self.by_name.get(&member_stem(name).to_ascii_lowercase())
+    }
+
+    /// The id of the template an entity or template name names, whatever
+    /// its case.
+    pub fn id(&self, name: &str) -> Option<u32> {
+        let stem = member_stem(name);
+        self.names
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(stem))
+            .map(|(&id, _)| id)
     }
 
     /// The template with id `id` (an entity's parent): its name, and what
@@ -265,6 +278,7 @@ impl Templates {
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
             tuning: crate::tuning::read(&db),
+            leavings: crate::pickup::read(&db),
         }
     }
 }
@@ -1081,7 +1095,7 @@ mod tests {
                 ("hmmwv".to_owned(), t(2, None)),
             ]),
             names: HashMap::from([(0x8000_0001, "Valiant (Python)".to_owned())]),
-            tuning: HashMap::new(),
+            ..Templates::default()
         };
         assert_eq!(
             db.by_id(0x8000_0001).map(|(n, _)| n),

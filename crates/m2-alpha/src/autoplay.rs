@@ -155,6 +155,8 @@ enum Goal {
     /// Break open the supply crate `target` (the scripts' object) with a
     /// bash.
     Open(u32),
+    /// Take what the supply crate `from` left (walking up to it).
+    Take(u32),
 }
 
 impl Goal {
@@ -164,7 +166,7 @@ impl Goal {
             (Goal::Reach { target: a, .. }, Goal::Reach { target: b, .. })
             | (Goal::Blast { target: a, .. }, Goal::Blast { target: b, .. }) => a == b,
             (Goal::Shoot(a), Goal::Shoot(b)) | (Goal::Board(a), Goal::Board(b)) => a == b,
-            (Goal::Open(a), Goal::Open(b)) => a == b,
+            (Goal::Open(a), Goal::Open(b)) | (Goal::Take(a), Goal::Take(b)) => a == b,
             _ => false,
         }
     }
@@ -230,6 +232,10 @@ pub struct Autoplay {
     /// gave up on.
     opening: Option<(u32, f32)>,
     left_shut: Vec<u32>,
+    /// The crate whose pickup she is going for and since when, and those
+    /// whose pickups she gave up on.
+    taking: Option<(u32, f32)>,
+    left_lying: Vec<u32>,
 }
 
 impl Autoplay {
@@ -306,6 +312,7 @@ impl Autoplay {
             Some(Goal::Blast { at, .. }) => self.blast(game, at, dt),
             Some(Goal::Board(i)) => self.board(game, i, dt),
             Some(Goal::Open(target)) => self.open(game, target, dt),
+            Some(Goal::Take(from)) => self.take(game, from, dt),
         }
     }
 
@@ -357,6 +364,23 @@ impl Autoplay {
             return Some((
                 Goal::Open(target),
                 format!("opening the supply crate {target:#x}, {d:.0} m off"),
+            ));
+        }
+        // What a crate she broke open left for her: taken before going on.
+        if driving.is_none()
+            && let Some((from, d)) = game
+                .scene
+                .flights
+                .pickups()
+                .iter()
+                .filter(|p| p.gives.is_some() && !self.left_lying.contains(&p.from))
+                .map(|p| (p.from, p.at.distance(here)))
+                .filter(|&(_, d)| d < OPEN_NEAR)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            return Some((
+                Goal::Take(from),
+                format!("taking what the supply crate {from:#x} left, {d:.1} m off"),
             ));
         }
         // What to destroy, nearest first: soldiers are shot, things blown up.
@@ -569,6 +593,38 @@ impl Autoplay {
             },
             ..Intent::default()
         }
+    }
+
+    /// Taking what supply crate `from` left: walking onto it (the game
+    /// takes it once she is within its reach); left lying if not taken
+    /// after [`OPEN_FOR`] seconds.
+    fn take(&mut self, game: &mut Game, from: u32, dt: f32) -> Intent {
+        let since = match self.taking {
+            Some((g, t)) if g == from => t,
+            _ => {
+                self.taking = Some((from, self.clock));
+                self.clock
+            }
+        };
+        let Some(p) = game
+            .scene
+            .flights
+            .pickups()
+            .iter()
+            .find(|p| p.from == from)
+            .copied()
+        else {
+            return Intent::default();
+        };
+        if self.clock - since > OPEN_FOR {
+            eprintln!(
+                "autoplay {:.1} s: what the supply crate {from:#x} left at {:.1} was not taken: left lying",
+                self.clock, p.at
+            );
+            self.left_lying.push(from);
+            return Intent::default();
+        }
+        self.walk(game, p.at, p.reach * 0.5, dt)
     }
 
     /// Nothing to do: stand, or stop the vehicle.
