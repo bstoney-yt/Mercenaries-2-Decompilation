@@ -78,7 +78,8 @@ pub(crate) enum Brain {
 
 /// The clips a fight plays, indices into every human rig's clips (they
 /// share one list). Clips are named only by hash; these were picked by
-/// looking at each pose.
+/// looking at each pose, or by the events they carry (a jump's
+/// `footstep_jumptakeoff`, a throw's `releasegrenade`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FightClips {
     /// Standing, rifle shouldered and aimed (resident 0163f2aa).
@@ -86,8 +87,18 @@ pub struct FightClips {
     /// Standing, rifle held across the chest (resident 178a5642).
     pub ready: Option<usize>,
     /// A jump: take-off and the air, ending off the ground (resident
-    /// c846e6fd).
+    /// c846e6fd); the stand-in when the take-offs below aren't there.
     pub jump: Option<usize>,
+    /// Taking off on the run, and from standing (Jennifer's own, with
+    /// `footstep_jumptakeoff` 0.1 s in).
+    pub takeoff: Option<usize>,
+    pub takeoff_still: Option<usize>,
+    /// Landing on the run, and standing.
+    pub land: Option<usize>,
+    pub land_still: Option<usize>,
+    /// Throwing a grenade, and how far into it (seconds) the grenade
+    /// leaves the hand: its `releasegrenade` event.
+    pub throw: Option<(usize, f32)>,
     /// Falling down dead (resident 479c4a51).
     pub die: Option<usize>,
 }
@@ -97,13 +108,42 @@ impl FightClips {
     pub const READY: u32 = 0x178a_5642;
     pub const JUMP: u32 = 0xc846_e6fd;
     pub const DIE: u32 = 0x479c_4a51;
+    /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
+    /// resident's; standing (0.37 s).
+    pub const TAKEOFF: [u32; 4] = [0xdaf7_966f, 0x4fdb_3497, 0x0e18_b683, 0x47af_6321];
+    pub const TAKEOFF_STILL: [u32; 1] = [0x3aee_9ae8];
+    /// Jennifer's landings on the run (0.37 s, 6.4 m/s) and standing
+    /// (0.47 s).
+    pub const LAND: [u32; 3] = [0xfe10_b04e, 0xd325_9f36, 0xf57a_8dea];
+    pub const LAND_STILL: [u32; 4] = [0xbe97_1f8f, 0xe4dc_de37, 0x3c17_66b3, 0x4de5_ef60];
+    /// Grenade throws, likeliest first: a whole throw of 0.77 s (release
+    /// 0.30 s in), one of 1.74 s (0.80 s), a short one (0.47 s).
+    pub const THROW: [u32; 3] = [0xec6f_fa31, 0xb2e6_acf6, 0x91eb_aa5c];
+    /// The event a throw lets go of the grenade at.
+    const RELEASE: &str = "releasegrenade";
 
     pub fn find(rig: &Rig) -> Self {
         let find = |hash| rig.clips.iter().position(|c| c.hash == hash);
+        let first = |hashes: &[u32]| hashes.iter().find_map(|&h| find(h));
+        let throw = Self::THROW.iter().find_map(|&h| {
+            let i = find(h)?;
+            let release = rig.clips[i]
+                .clip
+                .events
+                .iter()
+                .find(|e| e.name.eq_ignore_ascii_case(Self::RELEASE))
+                .map(|e| e.time)?;
+            Some((i, release))
+        });
         Self {
             aim: find(Self::AIM),
             ready: find(Self::READY),
             jump: find(Self::JUMP),
+            takeoff: first(&Self::TAKEOFF),
+            takeoff_still: first(&Self::TAKEOFF_STILL),
+            land: first(&Self::LAND),
+            land_still: first(&Self::LAND_STILL),
+            throw,
             die: find(Self::DIE),
         }
     }
