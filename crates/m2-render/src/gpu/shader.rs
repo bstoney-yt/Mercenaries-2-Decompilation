@@ -44,7 +44,8 @@ struct Frame {
     scatter: vec4<f32>,
     // Clouds: xyz each layer's scale, w coverage
     clouds: vec4<f32>,
-    // xy: wind (x, z), z: clouds on, w: how fast they darken with mass
+    // xy: wind (x, z), z: clouds on (2: without fading towards the
+    // horizon), w: how fast they darken with mass
     // (lit as the game's), negative for the earlier lighting
     wind: vec4<f32>,
     // The water's colour (rgb) and opacity (a) through none, a third, two
@@ -52,7 +53,7 @@ struct Frame {
     water_ramp: array<vec4<f32>, 4>,
     // x: the ramp is set, y: metres at its end
     water_depth: vec4<f32>,
-    // rgb: scale on the clouds' colour
+    // rgb: scale on the clouds' colour, a: the thickest cloud's opacity
     cloud_tone: vec4<f32>,
     // The game's haze: x, y the first layer's force and 1 / its limit,
     // z, w the second's (all 0: the earlier haze)
@@ -672,7 +673,9 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         var alpha = smoothstep(cut - 0.1, cut + 0.35, density);
         let mass = alpha;
         // Far deck fades into the haze towards the horizon.
-        alpha = alpha * smoothstep(0.02, 0.35, r.y);
+        if frame.wind.z < 1.5 {
+            alpha = alpha * smoothstep(0.02, 0.35, r.y);
+        }
         let l = -normalize(frame.sun_dir.xyz);
         let c = dot(r, l);
         var cloud: vec3<f32>;
@@ -703,7 +706,7 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         }
         // Thin veils: the game's footage shows a hazy sky with little
         // solid cloud.
-        rgb = mix(rgb, cloud, alpha * 0.6);
+        rgb = mix(rgb, cloud, alpha * frame.cloud_tone.a);
     }
     return vec4<f32>(rgb, 1.0);
 }

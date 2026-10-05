@@ -197,6 +197,11 @@ pub struct Clouds {
     /// through a forward-scattering phase, divided by `1 + mass * this`;
     /// `None` keeps the earlier sun-and-sky lighting.
     pub darkness: Option<f32>,
+    /// Fade the deck out towards the horizon; off, it runs on to it, as
+    /// a large enough quad would.
+    pub horizon_fade: bool,
+    /// How opaque the thickest cloud is.
+    pub opacity: f32,
 }
 
 impl Default for Clouds {
@@ -208,6 +213,8 @@ impl Default for Clouds {
             wind: [1.0, 0.0],
             tone: Vec3::ONE,
             darkness: None,
+            horizon_fade: true,
+            opacity: 0.6,
         }
     }
 }
