@@ -11,7 +11,7 @@
 //! handle after that is an error rather than undefined behaviour, and
 //! [`RenderBackend::live_buffers`] lets tests catch leaks.
 
-use m2_math::glam::{Mat4, Vec3};
+use m2_math::glam::{Mat4, Vec3, Vec4};
 
 use crate::buffer::{
     IndexBufferDesc, IndexBufferHandle, SkinHandle, VertexBufferDesc, VertexBufferHandle,
@@ -110,6 +110,31 @@ pub struct Lighting {
     pub haze: Haze,
     /// Clouds over the sky.
     pub clouds: Clouds,
+    /// The water's colour and opacity by how much of it the eye looks
+    /// through (the game's depth colour map): linear RGB and opacity at
+    /// none, a third, two thirds and all of [`WATER_RAMP_DEPTH`]. `None`
+    /// keeps the water's own colour.
+    pub water_ramp: Option<[Vec4; 4]>,
+    /// The eye's adaptation to how bright the frame is; `None` keeps
+    /// `exposure` as it is.
+    pub adaptation: Option<Adaptation>,
+}
+
+/// Metres of water the eye looks through at the end of the depth colour
+/// map: not in the game's data (its shaders take it from code), fitted.
+pub const WATER_RAMP_DEPTH: f32 = 20.0;
+
+/// The eye adjusting to the light, as the game's post pass does (its
+/// atmospheres carry `BloomTargetLuminance` and `BloomAdaptiveLuminance*`
+/// settings): exposure is scaled by `(key / average)^strength`, the
+/// average luminance of the frame (geometric mean, before exposure)
+/// followed at `speed` per second, within `limits`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Adaptation {
+    pub key: f32,
+    pub strength: f32,
+    pub speed: f32,
+    pub limits: [f32; 2],
 }
 
 /// Clouds drawn over the sky from a tiling noise texture, as the game's
@@ -209,6 +234,8 @@ impl Default for Lighting {
             saturation: 1.0,
             haze: Haze::default(),
             clouds: Clouds::default(),
+            water_ramp: None,
+            adaptation: None,
         }
     }
 }

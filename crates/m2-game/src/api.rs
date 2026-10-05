@@ -129,6 +129,9 @@ pub enum Command {
         region: u32,
         setting: String,
     },
+    /// Atmosphere changes from now on happen at once (true) or ease in
+    /// over their records' time (false).
+    AtmosphereImmediate(bool),
     /// A call the game only needs to hear about: `"Pg.SaveGame"`,
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
@@ -868,6 +871,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    add(&atmosphere, "EnableImmediatelyChangeMode", |w, _, a| {
+        if let Some(Value::Boolean(on)) = a.first() {
+            w.commands.push(Command::AtmosphereImmediate(*on));
+        }
+        values([])
+    })?;
     let gui = lib("Gui")?;
     add(&gui, "GetLanguageName", |_, lua, _| {
         values([Value::String(lua.create_string("english")?)])
@@ -1355,10 +1364,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             world.borrow_mut().take_commands(),
-            [Command::Atmosphere {
-                region: 1,
-                setting: "night".into()
-            }]
+            [
+                Command::AtmosphereImmediate(true),
+                Command::Atmosphere {
+                    region: 1,
+                    setting: "night".into()
+                }
+            ]
         );
     }
 

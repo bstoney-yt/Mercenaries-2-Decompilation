@@ -43,7 +43,7 @@ use std::collections::HashMap;
 
 use m2_assets::layer::{Component, Layer};
 use m2_assets::name_hash;
-use m2_math::glam::{Vec2, Vec3};
+use m2_math::glam::{Vec2, Vec3, Vec4};
 use m2_render::{Haze, Lighting};
 
 /// Settings read from an `AtmosphereBase` record.
@@ -84,13 +84,20 @@ pub struct Atmosphere {
     pub light_color: Vec3,
     /// `InterpolateTime`: seconds the change to these settings takes.
     pub interpolate_time: f32,
+    /// `Water0`..`2_Color1`/`Color2`: the water's colour and opacity by
+    /// how much of it is looked through, as four stops (each band's
+    /// colours, joined end to end; every record's bands tile the map in
+    /// thirds and its colours' alpha bytes run 0 to 255 with them), in
+    /// linear RGB and opacity.
+    pub water_ramp: Option<[Vec4; 4]>,
 }
 
 /// Which way the sun stands at `LightTime` 0 (and 0.1, low in the
-/// evening), over the horizon: ahead and a little right of the start of
-/// `VzaCon001` as its boat heads for the island (`+z`), behind the
-/// island as the footage of that ride has it. Inferred from the footage.
-pub const SUN_SETS: Vec3 = Vec3::new(0.35, 0.0, 0.94);
+/// evening), over the horizon: 60 degrees from `+z` towards `+x`, so
+/// that from the start of `VzaCon001` it stands behind the island 20 to
+/// 25 degrees left of its searchlights, as the footage of the boat ride
+/// has it. Inferred from the footage.
+pub const SUN_SETS: Vec3 = Vec3::new(0.87, 0.0, 0.49);
 
 /// The lowest the sun is drawn, in radians over the horizon, so that low
 /// `LightTime`s still light the ground a little.
@@ -177,6 +184,26 @@ impl Atmosphere {
                 float("LightMultiplier_Z").unwrap_or(1.0),
             ),
             interpolate_time: float("InterpolateTime").unwrap_or(0.0),
+            water_ramp: {
+                let stop = |name: &str| {
+                    let v = field(name)?;
+                    let byte = |shift: u32| ((v >> shift) & 0xff) as f32 / 255.0;
+                    Some(Vec4::new(
+                        srgb_to_linear(byte(16)),
+                        srgb_to_linear(byte(8)),
+                        srgb_to_linear(byte(0)),
+                        byte(24),
+                    ))
+                };
+                (|| {
+                    Some([
+                        stop("Water0_Color1")?,
+                        stop("Water0_Color2")?,
+                        stop("Water1_Color2")?,
+                        stop("Water2_Color2")?,
+                    ])
+                })()
+            },
         }
     }
 
@@ -202,6 +229,10 @@ impl Atmosphere {
             wind: std::array::from_fn(|i| f(self.wind[i], to.wind[i])),
             light_color: v(self.light_color, to.light_color),
             interpolate_time: to.interpolate_time,
+            water_ramp: match (self.water_ramp, to.water_ramp) {
+                (Some(a), Some(b)) => Some(std::array::from_fn(|i| a[i].lerp(b[i], t))),
+                (_, b) => b,
+            },
         }
     }
 
@@ -231,6 +262,7 @@ impl Atmosphere {
         lighting.clouds.coverage = self.coverage;
         lighting.clouds.scales = self.cloud_scales;
         lighting.clouds.wind = self.wind;
+        lighting.water_ramp = self.water_ramp;
     }
 
     /// The haze these settings describe: Hoffman and Preetham's standard
@@ -373,6 +405,9 @@ pub fn read_regions(
 /// over the new record's `InterpolateTime`.
 #[derive(Clone, Debug, Default)]
 pub struct AtmosphereMix {
+    /// Changes happen at once rather than easing in (the scripts'
+    /// `EnableImmediatelyChangeMode`, on while a mission loads).
+    pub immediate: bool,
     /// Records scripts chose, by region entity.
     chosen: HashMap<u32, u32>,
     /// The light eased from.
@@ -432,7 +467,11 @@ impl AtmosphereMix {
             Some((k, _)) if *k == key => None,
             Some(_) => {
                 self.from = Some(self.current(default));
-                self.length = target.interpolate_time.max(0.0);
+                self.length = if self.immediate {
+                    0.0
+                } else {
+                    target.interpolate_time.max(0.0)
+                };
                 self.t = 0.0;
                 self.to = Some((key, target));
                 Some(key)
@@ -500,6 +539,7 @@ mod tests {
             wind: [0.0; 2],
             light_color: Vec3::ONE,
             interpolate_time,
+            water_ramp: None,
         }
     }
 

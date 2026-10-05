@@ -824,13 +824,28 @@ fn finish(lighting: &mut m2_render::Lighting) {
     lighting.contrast = 1.35;
     lighting.saturation = 1.5;
     lighting.grade *= Vec3::new(1.3, 0.95, 0.7);
+    // The eye adapts as the game's does (its atmospheres set a target
+    // luminance and how much of the way to adapt): dusk and shade are
+    // brought up part of the way. Key, strength and speed are fitted.
+    lighting.adaptation = Some(m2_render::Adaptation {
+        key: ADAPT_KEY,
+        strength: 0.7,
+        speed: 1.5,
+        limits: [0.5, 4.0],
+    });
 }
 
+/// The frame's average luminance (before exposure) that adaptation leaves
+/// as it is: about the island's sunlit town by day.
+const ADAPT_KEY: f32 = 0.25;
+
 /// `M2_POST=exposure=0.8,bloom=0.35,threshold=1,contrast=1.3,
-/// saturation=1.6,grade=1.05/1/0.9,haze=1,inscatter=1,density=4` sets
-/// the finishing pass and haze by hand (any subset; `haze` and `inscatter`
-/// scale the scattering and the light it adds, `density` replaces the
-/// air's thickness near the ground), for matching reference frames.
+/// saturation=1.6,grade=1.05/1/0.9,haze=1,inscatter=1,density=4,
+/// key=0.25,adapt=0.7` sets the finishing pass and haze by hand (any
+/// subset; `haze` and `inscatter` scale the scattering and the light it
+/// adds, `density` replaces the air's thickness near the ground, `key`
+/// and `adapt` are the adaptation's key and strength, 0 for none), for
+/// matching reference frames.
 fn post_override(lighting: &mut m2_render::Lighting) {
     static POST: std::sync::OnceLock<Vec<(String, Vec<f32>)>> = std::sync::OnceLock::new();
     let settings = POST.get_or_init(|| {
@@ -859,6 +874,16 @@ fn post_override(lighting: &mut m2_render::Lighting) {
             }
             ("inscatter", [x]) => lighting.haze.inscattering *= *x,
             ("density", [x]) => lighting.haze.density = *x,
+            ("key", [x]) => {
+                if let Some(a) = &mut lighting.adaptation {
+                    a.key = *x;
+                }
+            }
+            ("adapt", [x]) => {
+                if let Some(a) = &mut lighting.adaptation {
+                    a.strength = *x;
+                }
+            }
             _ => {}
         }
     }
