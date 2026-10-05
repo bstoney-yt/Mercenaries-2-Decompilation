@@ -727,11 +727,7 @@ impl Flights {
                 .model
                 .and_then(|m| self.models.get(&m).and_then(Option::as_ref))
             {
-                let lift = Vec3::Y * (-m.gpu.bounds.0.y).max(0.0);
-                m.gpu.draw(
-                    queue,
-                    Mat4::from_rotation_translation(Quat::from_rotation_y(p.yaw), p.at + lift),
-                );
+                m.gpu.draw(queue, lying(m.gpu.bounds, p.yaw, p.at));
             }
         }
         Hanging { cables, hung }
@@ -798,6 +794,38 @@ impl Flights {
 fn wrap(a: f32) -> f32 {
     let tau = std::f32::consts::TAU;
     (a + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI
+}
+
+/// Where a thing left on the ground is drawn, its box (model space)
+/// resting on `at` turned to `yaw`: on its feet, unless it is taller than
+/// it is long and wide (a weapon, modelled barrel up as it is held), when
+/// it lies on its flattest side.
+fn lying(bounds: (Vec3, Vec3), yaw: f32, at: Vec3) -> Mat4 {
+    let size = bounds.1 - bounds.0;
+    let down = if size.y > size.x.max(size.z) {
+        if size.x < size.z {
+            // Over onto its side: x goes up.
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)
+        } else {
+            Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)
+        }
+    } else {
+        Quat::IDENTITY
+    };
+    let low = (0..8)
+        .map(|i| {
+            let corner = Vec3::new(
+                if i & 1 == 0 { bounds.0.x } else { bounds.1.x },
+                if i & 2 == 0 { bounds.0.y } else { bounds.1.y },
+                if i & 4 == 0 { bounds.0.z } else { bounds.1.z },
+            );
+            (down * corner).y
+        })
+        .fold(f32::INFINITY, f32::min);
+    Mat4::from_rotation_translation(
+        Quat::from_rotation_y(yaw) * down,
+        at + Vec3::Y * (-low).max(0.0),
+    )
 }
 
 #[cfg(test)]
@@ -908,6 +936,37 @@ mod tests {
         assert_eq!(broke.iter().map(|b| b.0).collect::<Vec<_>>(), [4]);
         assert_eq!(flights.take_broken().len(), 2);
         assert!(flights.take_broken().is_empty());
+    }
+
+    #[test]
+    fn a_weapon_left_on_the_ground_lies_down() {
+        // Modelled barrel up, as held: 1 m tall, 0.2 wide, 0.4 deep.
+        let gun = (Vec3::new(-0.1, -0.3, -0.2), Vec3::new(0.1, 0.7, 0.2));
+        let m = lying(gun, 0.0, Vec3::new(5.0, 2.0, 0.0));
+        let corners: Vec<Vec3> = (0..8)
+            .map(|i| {
+                m.transform_point3(Vec3::new(
+                    if i & 1 == 0 { gun.0.x } else { gun.1.x },
+                    if i & 2 == 0 { gun.0.y } else { gun.1.y },
+                    if i & 4 == 0 { gun.0.z } else { gun.1.z },
+                ))
+            })
+            .collect();
+        let low = corners.iter().map(|c| c.y).fold(f32::INFINITY, f32::min);
+        let high = corners
+            .iter()
+            .map(|c| c.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        // On its side, resting on the ground: as tall as it was wide.
+        assert!((low - 2.0).abs() < 1e-5, "{low}");
+        assert!((high - 2.2).abs() < 1e-5, "{high}");
+        // A box wider than tall stands as it is, on the ground.
+        let crate_box = (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 0.6, 0.5));
+        let m = lying(crate_box, 0.0, Vec3::ZERO);
+        assert_eq!(
+            m.transform_point3(Vec3::new(0.5, 0.6, 0.5)),
+            Vec3::new(0.5, 0.6, 0.5)
+        );
     }
 
     #[test]

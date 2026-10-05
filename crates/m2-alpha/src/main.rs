@@ -83,6 +83,9 @@ const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
 const MAX_FRAME: Duration = Duration::from_millis(250);
+/// How far off people's clip sounds (foley, footsteps) are heard, metres:
+/// as far as those sounds carry.
+const CUE_REACH: f32 = 35.0;
 
 #[derive(Debug, Default)]
 struct Options {
@@ -1158,6 +1161,9 @@ fn mission_for_screenshot(
     // the crates seen, and the pictures due (tick, crate).
     let mut opened: HashSet<u32> = HashSet::new();
     let mut pickup_shots: Vec<(u32, u32)> = Vec::new();
+    // The clips' sound events met, by category and name: how many hers,
+    // how many others' within earshot.
+    let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match &mut auto {
             Some(a) => {
@@ -1169,6 +1175,14 @@ fn mission_for_screenshot(
         };
         game.step(intent, tick);
         link.tick(game, tick);
+        for c in game.scene.take_cues(game.focus(), CUE_REACH) {
+            let e = heard.entry((c.category, c.name)).or_default();
+            if c.hers {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
         // Lost (round 88 went on 40 minutes at NaN): nothing more to see.
         if auto.is_some() && !game.focus().is_finite() {
             eprintln!(
@@ -1310,6 +1324,23 @@ fn mission_for_screenshot(
             );
             break;
         }
+    }
+    if auto.is_some() {
+        let mut sounds = sound::ClipSounds::load(install);
+        let rows: Vec<String> = heard
+            .iter()
+            .map(|((category, name), (hers, others))| {
+                format!(
+                    "{category}/{name} {hers}+{others} ({} sounds)",
+                    sounds.sounds(name).len()
+                )
+            })
+            .collect();
+        eprintln!(
+            "clip cues met (hers+others'; the sounds they play of {}): {}",
+            sounds.len(),
+            rows.join(", ")
+        );
     }
     if let Some(a) = &auto {
         eprintln!(
@@ -2505,6 +2536,8 @@ impl Running {
         }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);
+        let cues = self.game.scene.take_cues(ear, CUE_REACH);
+        self.audio.play_cues(&cues);
         let engine = self.game.engine();
         self.audio.engine(engine, TICK.as_secs_f32());
         self.audio.rotors(&self.game.scene.flights.sounding());

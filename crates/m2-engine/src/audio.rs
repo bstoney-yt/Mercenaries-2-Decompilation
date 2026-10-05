@@ -494,6 +494,26 @@ impl SoundLibrary {
         })
     }
 
+    /// Reads the banks whose own (asset) name hashes to one of `hashes`,
+    /// wherever they sit (`fol_shared`, one of the resident block's
+    /// several), each under its hash written out (`b796ae64`); banks
+    /// missing or unreadable are left out.
+    pub fn load_banks<R: Read + Seek>(source: &mut AssetSource<R>, hashes: &[u32]) -> Self {
+        let banks = hashes
+            .iter()
+            .filter_map(|&h| {
+                let data = source.asset(h, SOUND_BANK_TYPE).ok()?;
+                let bank = SoundBank::parse(&data).ok()?;
+                Some((
+                    format!("{h:08x}"),
+                    h,
+                    bank.sounds.iter().map(buffer).collect(),
+                ))
+            })
+            .collect();
+        Self { banks }
+    }
+
     /// Reads the banks of the blocks `pick` names (by path), under its name
     /// and hash.
     fn load_blocks<R: Read + Seek>(
@@ -523,16 +543,7 @@ impl SoundLibrary {
                 let Ok(bank) = SoundBank::parse(data) else {
                     continue;
                 };
-                let sounds = bank.sounds.iter().map(|s| SoundBuffer {
-                    hash: s.hash,
-                    channels: s.channels,
-                    rate: s.rate,
-                    samples: s
-                        .pcm
-                        .chunks_exact(2)
-                        .map(|b| i16::from_le_bytes([b[0], b[1]]))
-                        .collect(),
-                });
+                let sounds = bank.sounds.iter().map(buffer);
                 match banks.iter_mut().find(|(n, _, _)| *n == name) {
                     Some((_, _, list)) => list.extend(sounds),
                     None => banks.push((name.clone(), hash, sounds.collect())),
@@ -573,6 +584,20 @@ impl SoundLibrary {
         self.bank(name)
             .iter()
             .max_by(|a, b| a.frames().cmp(&b.frames()))
+    }
+}
+
+/// A bank's sound, decoded.
+fn buffer(s: &m2_assets::sound::Sound) -> SoundBuffer {
+    SoundBuffer {
+        hash: s.hash,
+        channels: s.channels,
+        rate: s.rate,
+        samples: s
+            .pcm
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect(),
     }
 }
 
