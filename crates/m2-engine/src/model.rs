@@ -514,6 +514,18 @@ impl GpuModel {
         }
     }
 
+    /// As [`draw_moved`](Self::draw_moved), only the pieces on nodes
+    /// `flying` marks (a broken prop's, the rest of it gone).
+    pub fn draw_flying(&self, queue: &mut DrawQueue, world: Mat4, nodes: &[Mat4], flying: &[bool]) {
+        let marked = |p: &Piece| flying.get(usize::from(p.at)).copied().unwrap_or(false);
+        for piece in self.pieces.iter().filter(|p| marked(p)) {
+            match piece.node.and_then(|n| nodes.get(usize::from(n))) {
+                Some(&m) if piece.bones.is_empty() => Self::push_at(queue, piece, world * m, None),
+                _ => Self::push(queue, piece, world, None),
+            }
+        }
+    }
+
     /// Whether the model has wrecked parts to show.
     pub fn has_wreck(&self) -> bool {
         self.hidden[0] != self.hidden[1]

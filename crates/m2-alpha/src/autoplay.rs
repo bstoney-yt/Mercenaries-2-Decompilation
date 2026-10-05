@@ -83,6 +83,11 @@ const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
 const HOP: f32 = 25.0;
+/// Coming closer counts towards the hop only once she has also gone this
+/// far (metres) from where she last did: the way's length wobbles by a
+/// few metres as it is planned again while she stands still (round 98's
+/// 1 to 6 m put her hop off by up to a minute twice).
+const HEADWAY_MOVE: f32 = 4.0;
 /// A hop along her way goes at least this far, metres; a way ending
 /// nearer than that is passed over for the place itself.
 const HOP_LEAST: f32 = 8.0;
@@ -214,6 +219,10 @@ pub struct Autoplay {
     what: String,
     /// The closest she has come to the goal (metres), and when.
     best: (f32, f32),
+    /// Where she was when she last came closer having gone
+    /// [`HEADWAY_MOVE`] from the time before, and when: the hop waits on
+    /// this.
+    moved: Option<(Vec3, f32)>,
     /// When she got to the place she is after, if she has.
     arrived: Option<f32>,
     /// The place she waits at (the scripts' object), and since when:
@@ -344,7 +353,7 @@ impl Autoplay {
                 self.what,
                 game.focus()
             );
-            self.best = (f32::INFINITY, self.clock);
+            self.fresh_headway();
             self.arrived = None;
             self.steady = 0.0;
             self.sidestep = None;
@@ -928,7 +937,7 @@ impl Autoplay {
                     self.tried.push(s);
                 }
                 self.blocked = 0.0;
-                self.best = (f32::INFINITY, self.clock);
+                self.fresh_headway();
                 self.vantage = game
                     .scene
                     .world
@@ -1324,6 +1333,17 @@ impl Autoplay {
         )
     }
 
+    /// Measures headway afresh: a new goal, after a hop.
+    fn fresh_headway(&mut self) {
+        self.best = (f32::INFINITY, self.clock);
+        self.moved = None;
+    }
+
+    /// Seconds since she last made headway that counts towards the hop.
+    fn since_moved(&self) -> f32 {
+        self.clock - self.moved.map_or(self.best.1, |(_, at)| at)
+    }
+
     /// The use key, once a [`PRESS_GAP`]: stopped first when driving.
     fn press(&mut self, speed: f32) -> Intent {
         if speed.abs() > 1.0 {
@@ -1358,13 +1378,21 @@ impl Autoplay {
     fn headway(&mut self, game: &mut Game, at: Vec3, d: f32) -> bool {
         if d < self.best.0 - 1.0 {
             self.best = (d, self.clock);
+            let here = game.focus();
+            if self
+                .moved
+                .is_none_or(|(was, _)| was.distance(here) > HEADWAY_MOVE)
+            {
+                self.moved = Some((here, self.clock));
+            }
             return false;
         }
         let stuck = self.clock - self.best.1;
         if self.arrived.is_some() {
             return false;
         }
-        if stuck > HOP_AFTER {
+        let still = self.since_moved();
+        if still > HOP_AFTER {
             // Stuck driving close to the place: on foot from here.
             let driving = game.scene.player.as_ref().and_then(|p| p.driving);
             let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
@@ -1377,11 +1405,11 @@ impl Autoplay {
                     .is_none_or(|w| can_get_out(&w.physics, &game.scene.vehicles[i]))
             {
                 eprintln!(
-                    "autoplay {:.1} s: no headway driving for {stuck:.0} s, {d:.0} m off: getting out",
+                    "autoplay {:.1} s: no headway driving for {still:.0} s, {d:.0} m off: getting out",
                     self.clock
                 );
                 self.leave = true;
-                self.best = (f32::INFINITY, self.clock);
+                self.fresh_headway();
                 return false;
             }
             // Ahead along her way, else (a way that ends where she is:
@@ -1394,7 +1422,7 @@ impl Autoplay {
                 .map(|w| w.route.steer(from, HOP).0)
                 .filter(|to| (*to - from).with_y(0.0).length() >= HOP_LEAST)
                 .unwrap_or(at);
-            self.hop(game, to, stuck);
+            self.hop(game, to, still);
             return true;
         }
         if stuck > STUCK && self.sidestep.is_none() && (stuck % STUCK) < 0.05 {
@@ -1508,7 +1536,7 @@ impl Autoplay {
             self.clock, self.what
         );
         self.hops.push((from, to));
-        self.best = (f32::INFINITY, self.clock);
+        self.fresh_headway();
         self.sidestep = None;
         self.reversing = None;
         self.way = None;
@@ -1573,7 +1601,7 @@ impl Autoplay {
             game.combat.hp,
             self.what,
             self.best.0,
-            self.clock - self.best.1,
+            self.since_moved(),
             self.hops.len()
         );
     }

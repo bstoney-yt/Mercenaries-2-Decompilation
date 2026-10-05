@@ -1035,7 +1035,7 @@ fn break_props(game: &mut Game, mission: &Mission) {
     scene.props.hide(&mut world.physics, gone);
     // What broke apart burns where its break-up says.
     for at in fires {
-        game.combat.blaze(at);
+        game.combat.blaze(&world.physics, at);
     }
 }
 
