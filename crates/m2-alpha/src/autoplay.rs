@@ -125,6 +125,8 @@ pub struct Autoplay {
     ride: Option<usize>,
     /// Seconds since she last pressed to get in or out.
     pressed: f32,
+    /// Getting out of the vehicle she is stuck in, to go on on foot.
+    leave: bool,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
     /// The objectives last logged.
@@ -155,8 +157,9 @@ impl Autoplay {
         if !game.on_foot || !p.landed || game.combat.down > 0.0 {
             return Intent::default();
         }
-        if let Some(i) = p.driving {
-            self.ride = Some(i);
+        match p.driving {
+            Some(i) => self.ride = Some(i),
+            None => self.leave = false,
         }
         self.ground(game);
         let chosen = self.choose(game, marks);
@@ -309,25 +312,42 @@ impl Autoplay {
                 )
             });
         }
-        // Places to get to (not the vehicle she is in).
+        // Places to get to (not the vehicle she is in): those marked, else
+        // the objectives' on the map or radar.
         let riding = driving.and_then(|i| vehicles.get(i)?.guid);
+        let unmarked = |m: &Mark| m.kind == "objective" || m.kind == "radar";
+        let marked = live
+            .iter()
+            .any(|m| !unmarked(m) && Some(m.target) != riding);
         let places: Vec<&Mark> = live
             .iter()
             .copied()
-            .filter(|m| Some(m.target) != riding)
+            .filter(|m| Some(m.target) != riding && (!marked || !unmarked(m)))
             .collect();
         let m = nearest(places, here)?;
         if driving.is_none() {
-            // Far, with her last ride close: take it.
+            // Far, with a ride close (hers from before, or one of the
+            // scripts' vehicles): take it.
+            let near = |i: usize| {
+                vehicles.get(i).is_some_and(|v| !v.wrecked)
+                    && vehicle_at(game, i)
+                        .is_some_and(|t| t.w_axis.truncate().distance(here) < RIDE_NEAR)
+            };
             if m.at.distance(here) > RIDE_FOR
-                && let Some(i) = self.ride
-                && vehicles.get(i).is_some_and(|v| !v.wrecked)
-                && vehicle_at(game, i)
-                    .is_some_and(|t| t.w_axis.truncate().distance(here) < RIDE_NEAR)
+                && let Some(i) = self
+                    .ride
+                    .into_iter()
+                    .chain((0..vehicles.len()).filter(|&i| vehicles[i].guid.is_some()))
+                    .find(|&i| near(i))
             {
                 return Some((
                     Goal::Board(i),
-                    format!("getting back into the {}", vehicles[i].spec.label),
+                    format!(
+                        "taking the {} for {} ({:.0} m off)",
+                        vehicles[i].spec.label,
+                        m.name,
+                        m.at.distance(here)
+                    ),
                 ));
             }
             // There a while and nothing happening: the scripts' vehicle
@@ -440,6 +460,9 @@ impl Autoplay {
         let Some((m, speed)) = vehicle_state(game, i) else {
             return Intent::default();
         };
+        if self.leave {
+            return self.press(speed);
+        }
         let pos = m.w_axis.truncate();
         let d = (at - pos).with_y(0.0).length();
         if self.headway(game, at, d) {
@@ -682,6 +705,21 @@ impl Autoplay {
             return false;
         }
         if stuck > HOP_AFTER {
+            // Stuck driving close to the place: on foot from here.
+            let driving = game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_some());
+            if driving && d < RIDE_FOR {
+                eprintln!(
+                    "autoplay {:.1} s: no headway driving for {stuck:.0} s, {d:.0} m off: getting out",
+                    self.clock
+                );
+                self.leave = true;
+                self.best = (f32::INFINITY, self.clock);
+                return false;
+            }
             self.hop(game, at, stuck);
             return true;
         }

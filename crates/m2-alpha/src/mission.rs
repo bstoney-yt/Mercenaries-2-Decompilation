@@ -87,7 +87,8 @@ const BANNER_TIME: f32 = 10.0;
 pub struct Mark {
     pub target: u32,
     /// What to do there: `"destroy"`, `"deliverable"` (get there),
-    /// `"action"`.
+    /// `"action"`; or `"objective"`, `"radar"` for an objective's target
+    /// on the map or radar without a marker.
     pub kind: String,
     /// The object's name (`vza_beachguard_1`, `loc_vza_beach`).
     pub name: String,
@@ -449,27 +450,50 @@ impl MissionLink {
         out
     }
 
-    /// The markers the scripts have up, with what they are over.
+    /// The markers the scripts have up, with what they are over; then the
+    /// targets of the objectives on the map (`"objective"`) and of the
+    /// radar's blips (`"radar"`) no marker is over.
     pub fn marks(&self) -> Vec<Mark> {
         let State::Running(mission) = &self.state else {
             return Vec::new();
         };
         let w = mission.world().borrow();
-        w.hud
+        let mark = |g: u32, kind: &str| {
+            let o = w.objects.get(&g)?;
+            Some(Mark {
+                target: g,
+                kind: kind.to_owned(),
+                name: o.name.clone(),
+                at: Vec3::from(o.position),
+                alive: o.alive,
+            })
+        };
+        let mut out: Vec<Mark> = w
+            .hud
             .markers
             .values()
-            .filter_map(|m| {
-                let g = m.target?;
-                let o = w.objects.get(&g)?;
-                Some(Mark {
-                    target: g,
-                    kind: m.icon.trim_start_matches("HUD_objective_").to_owned(),
-                    name: o.name.clone(),
-                    at: Vec3::from(o.position),
-                    alive: o.alive,
-                })
-            })
-            .collect()
+            .filter_map(|m| mark(m.target?, m.icon.trim_start_matches("HUD_objective_")))
+            .collect();
+        let others = w
+            .hud
+            .objectives
+            .iter()
+            .filter(|(name, _)| !name.ends_with("_PreMission"))
+            .filter_map(|(_, o)| Some((o.target?, "objective")))
+            .chain(
+                w.hud
+                    .radar
+                    .values()
+                    .filter_map(|b| Some((b.target?, "radar"))),
+            );
+        for (g, kind) in others {
+            if !out.iter().any(|m| m.target == g)
+                && let Some(m) = mark(g, kind)
+            {
+                out.push(m);
+            }
+        }
+        out
     }
 
     /// The scripts have said the contract is completed.
