@@ -384,7 +384,7 @@ impl Game {
                 .filter_map(|v| {
                     let id = v.id?;
                     let at = world.physics.vehicle_transform(id)?;
-                    Some((at, world.physics.vehicle_velocity(id), v.model.bounds))
+                    Some((at, world.physics.vehicle_velocity(id), v.spec.hull))
                 })
                 .collect();
             self.scene.people.traffic(&cars);
@@ -521,6 +521,14 @@ impl Game {
             let speed = self.driving().map_or(0.0, |d| d.1);
             Some((v.spec.label.clone(), speed, v.wrecked))
         });
+        let crosshair = match (&self.scene.world, player) {
+            (Some(w), Some(p)) => p
+                .driving
+                .and_then(|i| self.scene.vehicles.get(i))
+                .filter(|v| v.spec.muzzle.is_some() && !v.wrecked)
+                .map(|v| Combat::aim_point(&w.physics, &self.scene.people, p, v.id)),
+            _ => None,
+        };
         let can_enter = match (&self.scene.world, player) {
             (Some(w), Some(p)) if p.driving.is_none() && p.landed => {
                 nearest(&w.physics, &self.scene.vehicles, p, REACH)
@@ -534,6 +542,7 @@ impl Game {
             down: self.combat.down > 0.0,
             weapon: self.combat.weapon,
             driving,
+            crosshair,
             can_enter,
             loading,
             ..HudInfo::default()

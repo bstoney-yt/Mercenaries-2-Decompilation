@@ -472,9 +472,9 @@ fn hud_info(
     let mut info = game.hud_info();
     if let Some(m) = mission {
         info.mission = Some(m.view());
-        let view = game.view(fov, aspect);
-        info.view_proj = Some(view.projection * view.view);
     }
+    let view = game.view(fov, aspect);
+    info.view_proj = Some(view.projection * view.view);
     info
 }
 
@@ -1354,14 +1354,24 @@ fn drive_for_screenshot(
                 && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
             {
                 let v = &game.scene.vehicles[i];
+                // The hull's heading, for the turret's on the island.
+                let heading =
+                    v.id.zip(game.scene.world.as_ref())
+                        .and_then(|(id, w)| w.physics.vehicle_transform(id))
+                        .map_or(0.0, |at| {
+                            let f = at.transform_vector3(m2_math::glam::Vec3::Z);
+                            f.x.atan2(f.z)
+                        });
+                let island = (heading + v.turret).to_degrees().rem_euclid(360.0);
                 eprintln!(
-                    "drive: turret at {:.0} deg, gun raised {:.1} deg, camera yaw {:.0} deg, pitch {:.0} deg",
+                    "drive: turret at {:.0} deg on the hull ({island:.0} deg on the island, hull {:.0}), gun raised {:.1} deg, camera yaw {:.0} deg, pitch {:.0} deg",
                     v.turret.to_degrees(),
+                    heading.to_degrees().rem_euclid(360.0),
                     v.gun.to_degrees(),
                     game.scene
                         .player
                         .as_ref()
-                        .map_or(0.0, |p| p.yaw.to_degrees()),
+                        .map_or(0.0, |p| p.yaw.to_degrees().rem_euclid(360.0)),
                     game.scene
                         .player
                         .as_ref()

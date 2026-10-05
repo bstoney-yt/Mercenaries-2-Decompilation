@@ -144,9 +144,23 @@ impl Templates {
         Some((name, self.by_name.get(&name.to_ascii_lowercase())?))
     }
 
-    /// The tuning of the first template of `model` (by name) that has
-    /// any: a model's templates are variants that share it (the AMX-30's
-    /// with and without a driver, for the scripts or the player).
+    /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
+    /// else of a template of its `model`
+    /// ([`tuning_for_model`](Self::tuning_for_model)).
+    pub fn tuning_for(&self, name: &str, model: u32) -> Option<VehicleTuning> {
+        let stem = member_stem(name);
+        self.names
+            .iter()
+            .filter(|(_, n)| n.eq_ignore_ascii_case(stem))
+            .find_map(|(id, _)| self.tuning.get(id).copied())
+            .or_else(|| self.tuning_for_model(model))
+    }
+
+    /// The tuning of a template of `model`: a model's templates are
+    /// variants that share it (the AMX-30's with and without a driver,
+    /// for the scripts or the player; an anti-aircraft tank on a tank's
+    /// hull). The first by name with a main turret, else with a turret,
+    /// else with any.
     pub fn tuning_for_model(&self, model: u32) -> Option<VehicleTuning> {
         let mut ids: Vec<(String, u32)> = self
             .names
@@ -155,7 +169,16 @@ impl Templates {
             .map(|(&id, n)| (n.to_ascii_lowercase(), id))
             .collect();
         ids.sort();
-        ids.iter().find_map(|(_, id)| self.tuning.get(id).copied())
+        let tunings: Vec<VehicleTuning> = ids
+            .iter()
+            .filter_map(|(_, id)| self.tuning.get(id).copied())
+            .collect();
+        tunings
+            .iter()
+            .find(|t| t.turret.is_some_and(|t| t.main))
+            .or_else(|| tunings.iter().find(|t| t.turret.is_some()))
+            .or(tunings.first())
+            .copied()
     }
 
     /// The engine sound bank most templates of `model` use (a model's

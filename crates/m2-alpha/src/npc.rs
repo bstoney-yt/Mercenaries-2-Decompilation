@@ -31,6 +31,8 @@ const WANDER: f32 = 30.0;
 const WALK: f32 = 1.4;
 const FLEE: f32 = 5.0;
 const FLEE_TIME: f32 = 6.0;
+/// How far a runner who meets a wall looks along it each way, metres.
+const CLEAR: f32 = 6.0;
 /// A soldier fights within this range of the player, and fires within
 /// `FIRE_RANGE` once facing within `FIRE_ARC` radians of them.
 const FIGHT_RANGE: f32 = 80.0;
@@ -274,15 +276,22 @@ impl Npc {
         !self.alive
     }
 
-    /// Runs from `danger` (civilians).
+    /// Runs from `danger` (civilians). Someone already running, and not
+    /// towards it, keeps going the way they are.
     pub fn panic(&mut self, danger: Vec3) {
         if !self.alive || self.soldier {
             return;
         }
-        let away = (self.character.position - danger)
-            .with_y(0.0)
-            .normalize_or(Vec3::X);
-        self.flee = Some((self.character.position + away * FLEE * FLEE_TIME, FLEE_TIME));
+        let at = self.character.position;
+        let away = (at - danger).with_y(0.0).normalize_or(Vec3::X);
+        if let Some((target, left)) = &mut self.flee {
+            let going = (*target - at).with_y(0.0).normalize_or_zero();
+            if going.dot(away) > -0.2 {
+                *left = left.max(FLEE_TIME * 0.5);
+                return;
+            }
+        }
+        self.flee = Some((at + away * FLEE * FLEE_TIME, FLEE_TIME));
     }
 
     /// Chest height, where shots aim.
@@ -468,10 +477,26 @@ impl Npc {
         // and try again (routes).
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
         if wanted != Vec3::ZERO && moved < 0.2 {
-            match &mut self.brain {
-                Brain::Wander { home, target, .. } => *target = *home + rng.disc(WANDER),
-                Brain::Patrol { wait, .. } => *wait = 1.0,
-                Brain::Post { .. } => {}
+            match (&mut self.flee, &mut self.brain) {
+                // Ran into a wall: along it, the clearer way, or back the
+                // way they came if it is a corner (not stood against it).
+                (Some((target, left)), _) => {
+                    let ahead = (*target - at).with_y(0.0).normalize_or(Vec3::X);
+                    let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+                    let waist = self.character.position + Vec3::Y * 0.9;
+                    let clear =
+                        |d: Vec3| physics.cast_ray(waist, d, CLEAR).map_or(CLEAR, |(t, _)| t);
+                    let (l, r) = (clear(side), clear(-side));
+                    let way = match () {
+                        _ if l.max(r) < 1.0 => -ahead,
+                        _ if l >= r => side,
+                        _ => -side,
+                    };
+                    *target = self.character.position + way * FLEE * *left;
+                }
+                (None, Brain::Wander { home, target, .. }) => *target = *home + rng.disc(WANDER),
+                (None, Brain::Patrol { wait, .. }) => *wait = 1.0,
+                (None, Brain::Post { .. }) => {}
             }
         }
         if wanted.length_squared() > 0.01 {
@@ -619,9 +644,10 @@ impl People {
     }
 
     /// Vehicles going through people: `cars` are (model to world,
-    /// velocity, model-space bounds) of each one moving. Anyone a car's
-    /// box meets is knocked flying, dead; civilians in its path dive out
-    /// of the way. The number of soldiers killed.
+    /// velocity, model-space hull box) of each one moving. Anyone a car's
+    /// box meets is knocked flying, dead; civilians in its path (as wide
+    /// as it is, and a little more) dive out of the way. The number of
+    /// soldiers killed.
     pub fn traffic(&mut self, cars: &[(Mat4, Vec3, (Vec3, Vec3))]) -> usize {
         let mut killed = 0;
         for &(at, velocity, (lo, hi)) in cars {
@@ -632,7 +658,7 @@ impl People {
             let to_car = at.inverse();
             let centre = at.transform_point3((lo + hi) * 0.5);
             let heading = velocity.with_y(0.0).normalize_or_zero();
-            let width = (hi.x - lo.x).max(hi.z - lo.z) * 0.5;
+            let width = (hi.x - lo.x) * 0.5;
             for n in self.npcs.iter_mut().filter(|n| n.alive && n.landed) {
                 let p = n.character.position;
                 let local = to_car.transform_point3(p + Vec3::Y * 0.9);
@@ -1216,6 +1242,39 @@ pub(crate) mod tests {
         people.npcs.push(n);
         people.traffic(&[(Mat4::IDENTITY, Vec3::ZERO, bounds)]);
         assert!(people.npcs[0].alive);
+    }
+
+    // Running from a car into a wall, they run along it, not stand
+    // against it; told to run again, they keep going their way.
+    #[test]
+    fn runners_turn_along_a_wall() {
+        let mut physics = ground();
+        let wall = [
+            Vec3::new(1.2, -1.0, -50.0),
+            Vec3::new(1.2, -1.0, 50.0),
+            Vec3::new(1.2, 6.0, 50.0),
+            Vec3::new(1.2, 6.0, -50.0),
+        ];
+        let shape = CollisionShape::mesh(&wall, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        physics.add_static(StaticKey::Cell(2), &shape, Vec3::ZERO, Quat::IDENTITY);
+        physics.step(1.0 / 60.0);
+        let mut rng = Rng::default();
+        let dt = 1.0 / 60.0;
+        let stroll = Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, stroll, None);
+        n.update(&physics, &mut rng, None, dt);
+        for _ in 0..60 * 2 {
+            // A car along the road at x = -3, level with them.
+            let danger = Vec3::new(-3.0, 0.0, n.character.position.z);
+            n.panic(danger);
+            n.update(&physics, &mut rng, None, dt);
+        }
+        let p = n.character.position;
+        assert!(p.x < 1.0 && p.z.abs() > 6.0, "{p}");
     }
 
     #[test]

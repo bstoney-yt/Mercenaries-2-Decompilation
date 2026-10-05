@@ -664,10 +664,10 @@ impl Combat {
     }
 
     /// Where shots start and the way the crosshair points: along the
-    /// camera's line from where it passes her, so walls and slopes between
-    /// the camera and her don't stop them.
+    /// crosshair's line from where it passes her, so walls and slopes
+    /// between the camera and her don't stop them.
     fn aim_ray(player: &Player) -> (Vec3, Vec3) {
-        let (eye, dir) = (player.eye(), player.camera_forward());
+        let (eye, dir) = (player.eye(), player.aim_forward());
         let past = (player.character.position - eye).dot(dir).max(0.0);
         (eye + dir * past, dir)
     }

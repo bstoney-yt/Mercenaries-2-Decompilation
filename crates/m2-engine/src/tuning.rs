@@ -30,6 +30,9 @@ pub struct VehicleTuning {
 /// A `Turret`: how fast it turns and how far its gun tilts.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TurretTuning {
+    /// It is the template's `main_turret`, which the driver turns (not
+    /// its only turret, taken for want of one so named).
+    pub main: bool,
     /// Fastest turn, radians a second, and how quickly it gets there,
     /// radians a second squared (`maxYawSpeed`, `maxYawAccel`, degrees).
     pub yaw_speed: f32,
@@ -83,6 +86,10 @@ pub struct GunTuning {
 
 /// `PhysicalLink`'s field naming the template it mounts (name unknown).
 const LINK: u32 = 0x5470_4554;
+/// The `Turret` the driver's seat turns (`Vehicle Seat (Tank Default)
+/// (Driver)` names it in its `ControllerTurret`): a tank's gun turret,
+/// not the machine gun on its cupola, which has a `Turret` of its own.
+const MAIN_TURRET: &str = "main_turret";
 /// `SoundEffect`'s field naming a sound bank (see `ENGINE_BANK_FIELD`).
 const BANK: u32 = 0x14a6_7fa6;
 /// `CameraTank`'s height above the turret ring (name unknown).
@@ -152,6 +159,15 @@ impl<'a> Table<'a> {
     fn get(&self, id: u32, name: &str) -> Option<f32> {
         self.float(self.of_template(id).first()?, name_hash(name))
     }
+
+    /// Template `id`'s record whose `Name` is `name`.
+    fn named(&self, id: u32, name: &str) -> Option<&'a [u8]> {
+        let (field, want) = (name_hash("Name"), name_hash(name));
+        self.of_template(id)
+            .iter()
+            .copied()
+            .find(|r| self.word(r, field) == Some(want))
+    }
 }
 
 /// The tuning of every template the database gives any, by template id.
@@ -186,8 +202,15 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
                     .filter(|s| *s > 0.0)
                     .map(|kmh| kmh / 3.6),
                 turret: (|| {
-                    let deg = |name| turret.get(id, name).map(f32::to_radians);
+                    let named = turret.named(id, MAIN_TURRET);
+                    let r = match (named, turret.of_template(id)) {
+                        (Some(r), _) => r,
+                        (None, [only]) => only,
+                        _ => return None,
+                    };
+                    let deg = |name| turret.float(r, name_hash(name)).map(f32::to_radians);
                     Some(TurretTuning {
+                        main: named.is_some(),
                         yaw_speed: deg("maxYawSpeed")?,
                         yaw_accel: deg("maxYawAccel")?,
                         pitch: (deg("MinPitch")?, deg("MaxPitch")?),
@@ -207,11 +230,14 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
                         ),
                     })
                 })(),
+                // Its main gun: of the weapons it mounts, the slowest to
+                // fire (a tank's cannon, not its machine guns).
                 gun: links
                     .of_template(id)
                     .iter()
                     .filter_map(|r| links.word(r, LINK))
-                    .find_map(|weapon| guns.gun(weapon)),
+                    .filter_map(|weapon| guns.gun(weapon))
+                    .min_by(|a, b| a.rate_of_fire.total_cmp(&b.rate_of_fire)),
             };
             (id, t)
         })
@@ -281,6 +307,8 @@ mod tests {
             ("MuzzleFlashTemplate", 0x87ac_b4be),
             ("Velocity", 0x84c8_39c8),
             ("GravityScale", 0x0e57_f8c1),
+            ("Name", 0x1de5_c824),
+            (MAIN_TURRET, 0x801f_2cf7),
         ] {
             assert_eq!(name_hash(name), key, "{name}");
         }
