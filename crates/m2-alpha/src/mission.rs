@@ -924,6 +924,9 @@ fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
                             // A vehicle of theirs is the scene's; anything
                             // else hangs as its template's model.
                             let vehicle = !template_models(name, templates, catalogue).is_empty();
+                            if !vehicle {
+                                log_twins(templates, name);
+                            }
                             Some(Load {
                                 guid: g,
                                 model: (!vehicle)
@@ -1223,6 +1226,34 @@ fn leaves(templates: &Templates, name: &str) -> Option<Leaves> {
         reach: info.radius,
         gives,
     })
+}
+
+/// Says so when several templates share a load's name (the first
+/// contract's `Supply Drop (GL)`), with what each leaves when broken: the
+/// lowest id's is the one dropped ([`Templates::id`]).
+fn log_twins(templates: &Templates, name: &str) {
+    let ids = templates.ids(name);
+    if ids.len() < 2 {
+        return;
+    }
+    let each: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            let left = templates.leavings.spawns.get(id);
+            let left = left.map_or("nothing".to_owned(), |l| {
+                format!(
+                    "{} ({l:#x})",
+                    templates.names.get(l).map_or("?", String::as_str)
+                )
+            });
+            format!("{id:#x} leaves {left}")
+        })
+        .collect();
+    eprintln!(
+        "mission: {} templates are named {name}: {}; the first is dropped",
+        ids.len(),
+        each.join(", ")
+    );
 }
 
 /// The models one of the scripts' objects drives as

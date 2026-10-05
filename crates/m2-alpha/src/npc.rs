@@ -116,7 +116,8 @@ pub struct FightClips {
     /// A melee bash with what she holds, and one down low (at a crate on
     /// the ground), with how far into each (seconds) the blow lands: its
     /// `meleebash` or `MeleeBashLow` event. Twelve clips carry each (round
-    /// 89); the one starting nearest the rifle held ready.
+    /// 89): the high one is [`BASH_CLIPS`](Self::BASH_CLIPS), the low one
+    /// the one starting nearest the rifle held ready.
     pub bash: Option<(usize, f32)>,
     pub bash_low: Option<(usize, f32)>,
 }
@@ -137,6 +138,12 @@ impl FightClips {
     /// Grenade throws, likeliest first: a whole throw of 0.77 s (release
     /// 0.30 s in), one of 1.74 s (0.80 s), a short one (0.47 s).
     pub const THROW: [u32; 3] = [0xec6f_fa31, 0xb2e6_acf6, 0x91eb_aa5c];
+    /// The high bash, likeliest first: of the twelve clips with a
+    /// `meleebash`, these alone bring the rifle's butt down (round 91's
+    /// pictures: a one-handed overhead smash, fe47371e leaning into it;
+    /// the rest jab with the muzzle), and with the launcher they club with
+    /// its back end.
+    pub const BASH_CLIPS: [u32; 4] = [0xfe47_371e, 0xdb08_bd63, 0x0efe_2b64, 0xf997_6b4d];
     /// The event a throw lets go of the grenade at.
     const RELEASE: &str = "releasegrenade";
     /// The events a melee bash lands at, high and low.
@@ -174,7 +181,18 @@ impl FightClips {
             land_still: first(&Self::LAND_STILL),
             throw,
             die: find(Self::DIE),
-            bash: by_event(Self::BASH),
+            bash: Self::BASH_CLIPS
+                .iter()
+                .find_map(|&h| {
+                    let i = find(h)?;
+                    let blow = rig.clips[i]
+                        .clip
+                        .events
+                        .iter()
+                        .find(|e| e.name.eq_ignore_ascii_case(Self::BASH))?;
+                    Some((i, blow.time))
+                })
+                .or_else(|| by_event(Self::BASH)),
             bash_low: by_event(Self::BASH_LOW),
         }
     }
@@ -379,7 +397,7 @@ impl Npc {
             self.fires = true;
             self.cooldown = FIRE_GAP.0 + rng.range(0.0, FIRE_GAP.1);
         }
-        self.rig.animator.advance(dt);
+        self.rig.advance(dt);
         true
     }
 
@@ -447,7 +465,7 @@ impl Npc {
         }
         if !self.alive {
             self.dead_for += dt;
-            self.rig.animator.advance(dt);
+            self.rig.advance(dt);
             return;
         }
         if self.alert {
@@ -575,7 +593,7 @@ impl Npc {
             Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
             _ => 1.0,
         };
-        self.rig.animator.advance(dt * rate);
+        self.rig.advance(dt * rate);
     }
 }
 
@@ -1048,6 +1066,7 @@ pub(crate) mod tests {
             aim: None,
             hands: Default::default(),
             arm: Default::default(),
+            cues: Vec::new(),
         }
     }
 

@@ -141,13 +141,24 @@ impl Templates {
     }
 
     /// The id of the template an entity or template name names, whatever
-    /// its case.
+    /// its case: of several so named (the database has such twins, the
+    /// first contract's `Supply Drop (GL)` among them), the lowest.
     pub fn id(&self, name: &str) -> Option<u32> {
+        self.ids(name).first().copied()
+    }
+
+    /// The ids of every template an entity or template name names,
+    /// lowest first.
+    pub fn ids(&self, name: &str) -> Vec<u32> {
         let stem = member_stem(name);
-        self.names
+        let mut ids: Vec<u32> = self
+            .names
             .iter()
-            .find(|(_, n)| n.eq_ignore_ascii_case(stem))
+            .filter(|(_, n)| n.eq_ignore_ascii_case(stem))
             .map(|(&id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// The template with id `id` (an entity's parent): its name, and what
@@ -161,11 +172,9 @@ impl Templates {
     /// else of a template of its `model`
     /// ([`tuning_for_model`](Self::tuning_for_model)).
     pub fn tuning_for(&self, name: &str, model: u32) -> Option<VehicleTuning> {
-        let stem = member_stem(name);
-        self.names
+        self.ids(name)
             .iter()
-            .filter(|(_, n)| n.eq_ignore_ascii_case(stem))
-            .find_map(|(id, _)| self.tuning.get(id).copied())
+            .find_map(|id| self.tuning.get(id).copied())
             .or_else(|| self.tuning_for_model(model))
     }
 
@@ -255,10 +264,14 @@ impl Templates {
         let humans = carrying(PERSON);
         let minds: HashSet<u32> = PERSON_AI.iter().flat_map(|c| carrying(c)).collect();
         let names = db.names();
+        // Of twins by name, the lowest id's (inserted last) stands, as in
+        // `id`.
+        let mut order: Vec<(u32, &str)> = names.iter().map(|(&id, &n)| (id, n)).collect();
+        order.sort_unstable_by_key(|&(id, _)| std::cmp::Reverse(id));
         Self {
-            by_name: names
+            by_name: order
                 .iter()
-                .map(|(&id, name)| {
+                .map(|&(id, name)| {
                     let vehicle = kinds.get(&id).copied();
                     (
                         name.to_ascii_lowercase(),
