@@ -135,6 +135,20 @@ pub struct LoosePiece {
 }
 
 impl LoosePiece {
+    /// A box of half extents `half` about `centre` (model space), moving
+    /// node `node`, which sits at the model's origin at rest.
+    pub fn block(node: Option<u16>, centre: Vec3, half: Vec3, mass: f32) -> Self {
+        Self {
+            node,
+            shape: r::SharedShape::compound(vec![(
+                pose(centre, Quat::IDENTITY),
+                r::SharedShape::cuboid(half.x, half.y, half.z),
+            )]),
+            mass,
+            from_model: Mat4::IDENTITY,
+        }
+    }
+
     /// The middle of its box, in its node's space.
     pub fn centre(&self) -> Vec3 {
         let b = self.shape.compute_local_aabb();

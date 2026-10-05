@@ -27,6 +27,18 @@ const LEFT_ATTACH: u32 = 0xfa76_1573;
 /// (`Bone_Attach_BackRight`, `Bone_Attach_BackLeft`): where the weapons
 /// she carries but doesn't hold hang.
 const BACK_ATTACH: [u32; 2] = [0x3846_cb35, 0xdf2d_0826];
+/// Her lower spine (`Bone_Spine1`): with the attach points on her back,
+/// which way her back runs as she is posed.
+const SPINE: u32 = 0x5ca4_9bd8;
+/// A slung weapon hangs down her back, flat against it, as the PC video's
+/// carbine does (round 97: nearly straight down, a little right of her
+/// spine, from her shoulders to her hips): its upper end this far
+/// (metres) above the attach point, this far behind it, and leaning off
+/// straight down by this much (the tangent; its muzzle toward her left
+/// hip). Invented.
+const SLUNG_RISE: f32 = 0.12;
+const SLUNG_GAP: f32 = 0.07;
+const SLUNG_LEAN: f32 = 0.14;
 
 /// Weapons drawn on the right hand's attach node turned as the node is
 /// posed (the default: the grip sits in her palm, round 78), rather than
@@ -181,8 +193,10 @@ pub struct Arsenal {
     /// The right hand's node in the human skeleton, and its attach point.
     pub hand: Option<usize>,
     pub attach: Option<usize>,
-    /// The attach points on her back, right and left ([`BACK_ATTACH`]).
+    /// The attach points on her back, right and left ([`BACK_ATTACH`]),
+    /// and her lower spine ([`SPINE`]).
     pub back: [Option<usize>; 2],
+    pub spine: Option<usize>,
 }
 
 impl Arsenal {
@@ -197,6 +211,7 @@ impl Arsenal {
             self.hand = r.rifle_hand();
             self.attach = right_attach(&r.skeleton);
             self.back = BACK_ATTACH.map(|h| node(&r.skeleton, h));
+            self.spine = node(&r.skeleton, SPINE);
         }
         let w = Some(WeaponModel {
             model,
@@ -218,13 +233,28 @@ impl Arsenal {
         }
     }
 
-    /// Weapon to world for one slung on the back of a character drawn at
-    /// `body` with posed node matrices `nodes`, at the attach point of
-    /// `slot` (0 her right, 1 her left): its grip on the point, turned as
-    /// the point is posed.
-    pub fn on_back(&self, body: Mat4, nodes: &[Mat4], slot: usize) -> Option<Mat4> {
-        let n = self.back.get(slot).copied().flatten()?;
-        Some(body * *nodes.get(n)?)
+    /// Weapon to world for `weapon` slung on the back of a character
+    /// drawn at `body` with posed node matrices `nodes`, from the attach
+    /// point of `slot` (0 her right, 1 her left): down her back as it
+    /// runs from her lower spine up to the attach points, whichever way
+    /// she leans ([`slung_at`]).
+    pub fn on_back(
+        &self,
+        weapon: &WeaponModel,
+        body: Mat4,
+        nodes: &[Mat4],
+        slot: usize,
+    ) -> Option<Mat4> {
+        let at = |n: Option<usize>| Some(body.transform_point3(nodes.get(n?)?.w_axis.truncate()));
+        let point = at(self.back.get(slot).copied().flatten())?;
+        let [right_point, left_point] = self.back.map(at);
+        let right = match (right_point, left_point) {
+            (Some(r), Some(l)) if r.distance(l) > 0.02 => r - l,
+            _ => body.transform_vector3(Vec3::NEG_X),
+        };
+        let shoulders = (right_point.unwrap_or(point) + left_point.unwrap_or(point)) * 0.5;
+        let up = at(self.spine).map_or(body.transform_vector3(Vec3::Y), |s| shoulders - s);
+        slung_at(weapon.muzzle, weapon.model.bounds, point, (right, up), slot)
     }
 
     /// Weapon to world for a character drawn at `body` with posed node
@@ -275,6 +305,49 @@ const CARRY_OUT: f32 = 0.17;
 
 fn node(skeleton: &Skeleton, hash: u32) -> Option<usize> {
     skeleton.name_hashes.iter().position(|&h| h == hash)
+}
+
+/// Weapon to world for a weapon slung at `point` on a back running
+/// `(right, up)` (world space, as posed), on her right (`slot` 0) or left:
+/// its barrel (from its grip at its origin to its `muzzle`) down her
+/// back, leaning as [`SLUNG_LEAN`] has it, flat against her back with
+/// its top to her side, its upper end (the end of its `bounds` furthest
+/// back from the muzzle) [`SLUNG_RISE`] above the point and the whole
+/// [`SLUNG_GAP`] behind it.
+fn slung_at(
+    muzzle: Vec3,
+    bounds: (Vec3, Vec3),
+    point: Vec3,
+    (right, up): (Vec3, Vec3),
+    slot: usize,
+) -> Option<Mat4> {
+    let right = right.try_normalize()?;
+    let up = (up - right * up.dot(right)).try_normalize()?;
+    let ahead = up.cross(right);
+    // The weapon's own frame: barrel, top, and the side they leave.
+    let barrel = muzzle.try_normalize()?;
+    let top = (Vec3::Y - barrel * barrel.y)
+        .try_normalize()
+        .unwrap_or(Vec3::Z);
+    let own = m2_math::glam::Mat3::from_cols(barrel, top, barrel.cross(top));
+    // Where they go on her back.
+    let down = (-up - right * SLUNG_LEAN).normalize();
+    let side = if slot == 0 { right } else { -right };
+    let to_side = (side - down * side.dot(down)).normalize();
+    let turn = m2_math::glam::Mat3::from_cols(down, to_side, down.cross(to_side)) * own.transpose();
+    // Its upper end: the furthest back along its barrel.
+    let (lo, hi) = bounds;
+    let rear = (0..3)
+        .map(|i| (lo[i] * barrel[i]).min(hi[i] * barrel[i]))
+        .sum::<f32>();
+    let anchor = point + up * SLUNG_RISE - ahead * SLUNG_GAP;
+    let origin = anchor - down * rear;
+    Some(Mat4::from_cols(
+        turn.x_axis.extend(0.0),
+        turn.y_axis.extend(0.0),
+        turn.z_axis.extend(0.0),
+        origin.extend(1.0),
+    ))
 }
 
 /// The right hand's weapon attach point.
@@ -2151,6 +2224,41 @@ mod tests {
         assert_eq!(on(Vec3::new(1.0, 15.0, 0.5)), Some(0.0));
         assert_eq!(on(Vec3::new(40.0, 6.0, 0.0)), Some(6.0));
         assert_eq!(on(Vec3::new(80.0, 2.0, 0.0)), Some(0.0));
+    }
+
+    #[test]
+    fn a_slung_weapon_hangs_down_her_back() {
+        // Her back as she stands facing +z, her right to -x.
+        let (right, up) = (Vec3::NEG_X, Vec3::Y);
+        // A carbine 0.85 m long, its barrel along +z from its grip, its
+        // stock 0.3 m behind.
+        let muzzle = Vec3::new(0.0, 0.05, 0.5);
+        let (lo, hi) = (Vec3::new(-0.04, -0.15, -0.3), Vec3::new(0.04, 0.08, 0.55));
+        let point = Vec3::new(-0.1, 1.4, -0.14);
+        let at = slung_at(muzzle, (lo, hi), point, (right, up), 0).unwrap();
+        let barrel = (at.transform_point3(muzzle) - at.transform_point3(Vec3::ZERO)).normalize();
+        // Nearly straight down, its muzzle toward her left hip.
+        assert!(barrel.y < -0.95 && barrel.dot(right) < 0.0, "{barrel}");
+        // From her shoulders down past her waist, all of it behind her.
+        let corners: Vec<Vec3> = (0..8)
+            .map(|k| {
+                let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
+                at.transform_point3(Vec3::new(
+                    pick(1, lo.x, hi.x),
+                    pick(2, lo.y, hi.y),
+                    pick(4, lo.z, hi.z),
+                ))
+            })
+            .collect();
+        let top = corners.iter().map(|c| c.y).fold(f32::MIN, f32::max);
+        let bottom = corners.iter().map(|c| c.y).fold(f32::MAX, f32::min);
+        assert!(top > 1.45 && top < 1.6, "{top}");
+        assert!(bottom < 0.8, "{bottom}");
+        assert!(corners.iter().all(|c| c.z < point.z - 0.02), "{corners:?}");
+        // On her left the same way, its top to her left.
+        let left = slung_at(muzzle, (lo, hi), point + Vec3::X * 0.2, (right, up), 1).unwrap();
+        assert!(left.transform_vector3(Vec3::Y).dot(right) < -0.9);
+        assert!(at.transform_vector3(Vec3::Y).dot(right) > 0.9);
     }
 
     #[test]
