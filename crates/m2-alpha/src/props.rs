@@ -15,6 +15,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use m2_assets::model::ModelInfo;
 use m2_engine::model::MODEL_TEXTURE_WIDTH;
 use m2_engine::stream::PROP_SIZES;
 use m2_engine::{
@@ -41,6 +42,9 @@ struct PropModel {
     gpu: GpuModel,
     collision: Option<CollisionShape>,
     breakup: Option<Arc<Breakup>>,
+    /// For a merged batch (a `TINY` model), the entities it is made of: it
+    /// isn't drawn while any of them is shown on its own.
+    members: Vec<u32>,
 }
 
 /// The state layers' models in play.
@@ -82,6 +86,11 @@ pub struct Props {
     pub sturdy: HashSet<u32>,
     /// What of those broken apart is drawn (the gate test's pictures).
     pub parts: Parts,
+    /// One left undrawn (the gate test's picture of what else stands
+    /// where a gate does).
+    pub skip: Option<u32>,
+    /// The layer that put each up, by entity (the gate test's lists).
+    layers: HashMap<u32, Arc<str>>,
 }
 
 /// What [`Props::draw`] draws of a model broken apart.
@@ -146,8 +155,9 @@ const IN_FLIGHT: usize = 8;
 /// this far (metres), or those shown have changed.
 const RENEAR: f32 = 50.0;
 
-/// A model decoded on a loading thread, or why not.
-type Load = (u32, Result<CpuModel, String>);
+/// A model decoded on a loading thread (and, for a merged batch, the
+/// entities it is made of), or why not.
+type Load = (u32, Result<(CpuModel, Vec<u32>), String>);
 
 /// The loading threads: models are asked by hash and come back decoded.
 #[derive(Debug)]
@@ -205,6 +215,19 @@ impl Props {
             self.loaders = Some(Loaders::start(install));
         }
         added
+    }
+
+    /// Notes that `layer` puts up `entities`.
+    pub fn note_layer(&mut self, entities: impl IntoIterator<Item = u32>, layer: &str) {
+        let layer: Arc<str> = layer.into();
+        for e in entities {
+            self.layers.insert(e, layer.clone());
+        }
+    }
+
+    /// The layer that put `entity` up, if one was noted.
+    pub fn layer(&self, entity: u32) -> Option<&str> {
+        self.layers.get(&entity).map(|l| &**l)
     }
 
     /// Takes down those of `entities` that are shown (their loose pieces
@@ -322,9 +345,9 @@ impl Props {
     /// Breaks `entity` if it is shown and whole: its wreck if the model
     /// has one, else it goes. One that breaks apart throws its pieces
     /// away from `blast` (what broke it), if that went off within
-    /// [`THROW_REACH`], as the rest of it sinks into the ground (one found
-    /// broken, as after loading a game, is already under). True if it was
-    /// one.
+    /// [`THROW_REACH`], as the rest of it sinks a little into the ground
+    /// (one found broken, as after loading a game, is already down). True
+    /// if it was one.
     pub fn wreck(&mut self, physics: &mut Physics, entity: u32, blast: Option<Vec3>) -> bool {
         self.wreck_scaled(physics, entity, blast, 1.0)
     }
@@ -440,6 +463,69 @@ impl Props {
         Some(local.cmpge(lo - pad).all() && local.cmple(hi + pad).all())
     }
 
+    /// Where `entity` stands and its model's box (model space); `None`
+    /// unless it is shown and its model has loaded.
+    pub fn placed_bounds(&self, entity: u32) -> Option<(Mat4, (Vec3, Vec3))> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        Some((
+            Mat4::from_rotation_translation(p.rotation, p.position),
+            m.gpu.bounds,
+        ))
+    }
+
+    /// The other shown props whose boxes meet `entity`'s (the gate test
+    /// lists what else stands at a gate), biggest first: each one's
+    /// entity, how much of its box is inside `entity`'s (0 to 1), and a
+    /// line on it: its model, the layer that put it up, where it stands,
+    /// its box (world axes), that share, and whether it is wrecked or in
+    /// the way.
+    pub fn others_in_box(&self, physics: &Physics, entity: u32) -> Vec<(u32, f32, String)> {
+        let world_box = |e: u32| {
+            self.placed_bounds(e)
+                .map(|(at, bounds)| box_around(at, bounds))
+        };
+        let Some((lo, hi)) = world_box(entity) else {
+            return Vec::new();
+        };
+        let volume = |v: Vec3| v.x.max(0.01) * v.y.max(0.01) * v.z.max(0.01);
+        let mut out: Vec<(f32, u32, f32, String)> = self
+            .shown
+            .iter()
+            .filter(|&(&e, _)| e != entity)
+            .filter_map(|(&e, p)| {
+                let (a, b) = world_box(e)?;
+                let (c, d) = (a.max(lo), b.min(hi));
+                if !c.cmplt(d).all() {
+                    return None;
+                }
+                let size = b - a;
+                let share = volume(d - c) / volume(size);
+                let line = format!(
+                    "{e:#x} ({:08x}) of {} at {:.1}, {:.1}x{:.1}x{:.1} m, {:.0}% inside{}{}",
+                    p.model,
+                    self.layer(e).unwrap_or("no layer noted"),
+                    p.position,
+                    size.x,
+                    size.y,
+                    size.z,
+                    share * 100.0,
+                    if p.wrecked { ", wrecked" } else { "" },
+                    if physics.has_static(StaticKey::Entity(e)) {
+                        ", in the way"
+                    } else {
+                        ""
+                    }
+                );
+                Some((volume(size), e, share, line))
+            })
+            .collect();
+        out.sort_by(|a, b| b.0.total_cmp(&a.0));
+        out.into_iter()
+            .map(|(_, e, share, line)| (e, share, line))
+            .collect()
+    }
+
     /// The middle of `entity`'s model's box in the world; `None` unless it
     /// is shown and its model has loaded.
     pub fn centre(&self, entity: u32) -> Option<Vec3> {
@@ -505,17 +591,12 @@ impl Props {
             }
         }
         if let Some(sink) = self.sinking.get(&entity) {
-            let height = (m.gpu.bounds.1.y - m.gpu.bounds.0.y).max(1.0);
-            let depth = 0.5 * SINK_ACCEL * sink.time * sink.time;
-            s += &match sink.place(m.gpu.bounds) {
-                Some(_) => format!(
-                    "; the rest sunk {depth:.1} of {height:.1} m after {:.1} s, leaning {:.1} \
-                     deg",
-                    sink.time,
-                    (sink.lean * (depth / height).min(1.0)).to_degrees()
-                ),
-                None => format!("; the rest gone under after {:.1} s", sink.time),
-            };
+            let depth = sink.depth();
+            s += &format!(
+                "; the rest sunk {depth:.1} m after {:.1} s, leaning {:.1} deg",
+                sink.time,
+                (sink.lean * depth / SINK_MOST).to_degrees()
+            );
         }
         Some(s)
     }
@@ -607,6 +688,44 @@ impl Props {
             ids.len(),
             each.join("; ")
         ))
+    }
+
+    /// `entity`'s pieces still within `within` metres of where they
+    /// started since it broke apart, each with the statics it touches (the
+    /// gate test asks what holds them): its node, then those.
+    pub fn pieces_held(
+        &self,
+        physics: &Physics,
+        entity: u32,
+        within: f32,
+    ) -> Vec<(i32, Vec<StaticKey>)> {
+        let (Some(p), Some(ids)) = (self.shown.get(&entity), self.broken.get(&entity)) else {
+            return Vec::new();
+        };
+        let Some(breakup) = self
+            .models
+            .get(&p.model)
+            .and_then(Option::as_ref)
+            .and_then(|m| m.breakup.as_deref())
+        else {
+            return Vec::new();
+        };
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let starts = breakup.pieces.starts(placed);
+        breakup
+            .pieces
+            .pieces
+            .iter()
+            .zip(&starts)
+            .zip(ids)
+            .filter_map(|((piece, &start), &id)| {
+                let now = physics.debris_place(id)?;
+                let moved =
+                    box_middle(&corners(now, piece)).distance(box_middle(&corners(start, piece)));
+                (moved < within)
+                    .then(|| (piece.node.map_or(-1, i32::from), physics.debris_statics(id)))
+            })
+            .collect()
     }
 
     /// `entity`'s, if it is shown, and whether its model has loaded.
@@ -760,9 +879,9 @@ impl Props {
         source: &mut AssetSource<BufReader<File>>,
         physics: &mut Physics,
         hash: u32,
-        cpu: Result<CpuModel, String>,
+        cpu: Result<(CpuModel, Vec<u32>), String>,
     ) -> anyhow::Result<()> {
-        let cpu = match cpu {
+        let (cpu, members) = match cpu {
             Ok(cpu) => cpu,
             Err(e) => {
                 eprintln!("state layer model {hash:08x}: {e}");
@@ -779,12 +898,32 @@ impl Props {
                 }
             }
         }
+        if !members.is_empty() {
+            let users: Vec<String> = (self.shown.iter())
+                .filter(|(_, p)| p.model == hash)
+                .map(|(e, _)| format!("{e:#x}"))
+                .collect();
+            let alone: Vec<String> = (members.iter())
+                .filter(|m| self.shown.contains_key(m))
+                .map(|m| format!("{m:#x}"))
+                .collect();
+            let all: Vec<String> = members.iter().map(|m| format!("{m:#x}")).collect();
+            eprintln!(
+                "props: {hash:08x} (put up as {}) is a merged batch of {} [{}]; shown on their \
+                 own: [{}]; not drawn while any is",
+                users.join(" "),
+                members.len(),
+                all.join(" "),
+                alone.join(" ")
+            );
+        }
         self.models.insert(
             hash,
             Some(PropModel {
                 gpu,
                 collision: cpu.collision,
                 breakup: cpu.breakup,
+                members,
             }),
         );
         Ok(())
@@ -813,6 +952,14 @@ impl Props {
             let Some(Some(m)) = self.models.get(&p.model) else {
                 continue;
             };
+            if self.skip == Some(*e) {
+                continue;
+            }
+            // A merged batch whose members stand (or lie broken) as props
+            // of their own would draw them whole a second time.
+            if m.members.iter().any(|x| self.shown.contains_key(x)) {
+                continue;
+            }
             let moved = match (self.broken.get(e), self.knocked.get(e)) {
                 (Some(pieces), _) => Some((m.breakup.as_deref().map(|b| &b.pieces), pieces)),
                 (None, Some(pieces)) => Some((self.loose(*e), pieces)),
@@ -835,22 +982,13 @@ impl Props {
                     let mut nodes = loose.posed(placed, &places);
                     let flying = loose.flying();
                     // The rest of a model broken apart goes down as it
-                    // sinks, until it is under.
-                    match self.sinking.get(e).map(|s| s.place(m.gpu.bounds)) {
-                        Some(None) => {
-                            if self.parts != Parts::Rest {
-                                m.gpu.draw_flying(queue, placed, &nodes, flying);
-                            }
-                            continue;
-                        }
-                        Some(Some(sunk)) => {
-                            for (n, at) in nodes.iter_mut().enumerate() {
-                                if !flying.get(n).copied().unwrap_or(false) {
-                                    *at = sunk * *at;
-                                }
+                    // sinks.
+                    if let Some(sunk) = self.sinking.get(e).map(|s| s.place(m.gpu.bounds)) {
+                        for (n, at) in nodes.iter_mut().enumerate() {
+                            if !flying.get(n).copied().unwrap_or(false) {
+                                *at = sunk * *at;
                             }
                         }
-                        None => {}
                     }
                     let wrecked = loose.breaks || p.wrecked;
                     match self.parts {
@@ -859,14 +997,6 @@ impl Props {
                         Parts::Pieces => m.gpu.draw_flying(queue, placed, &nodes, flying),
                     }
                 }
-                continue;
-            }
-            // Gone under the ground.
-            if self
-                .sinking
-                .get(e)
-                .is_some_and(|s| s.place(m.gpu.bounds).is_none())
-            {
                 continue;
             }
             let (lo, hi) = m.gpu.bounds;
@@ -894,13 +1024,15 @@ impl Props {
 /// rest sinks into the ground ever faster (this many metres a second more
 /// each second), leaning over as it goes to between the least and the
 /// most (degrees), away from the blast, until it is this far (metres)
-/// below where its top was. The round 98 pictures had the gates' arches
-/// and doors (their wreck) still standing where the videos have the way
-/// through open.
+/// down, where it stays: the parts' `DestroyedState` shows the wreck
+/// (node 2) again, and the videos keep column stumps and broken wall
+/// either side of the gap. Round 102 found the whole gate seen standing
+/// after the bomb was the layer's merged batch, not the wreck; how far
+/// the wreck goes down is invented.
 const SINK_ACCEL: f32 = 2.5;
 const LEAN_LEAST: f32 = 8.0;
 const LEAN_MOST: f32 = 10.0;
-const SUNK: f32 = 1.0;
+const SINK_MOST: f32 = 1.0;
 
 /// The rest of a model broken apart, going down ([`SINK_ACCEL`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -936,7 +1068,7 @@ impl Sinking {
         }
     }
 
-    /// Already under (one found broken).
+    /// Already down (one found broken).
     fn under() -> Self {
         Self {
             time: f32::INFINITY,
@@ -945,22 +1077,26 @@ impl Sinking {
         }
     }
 
-    /// Where the rest of the model, its box `bounds`, is now, in its own
-    /// space: sunk, and leaning by as much of its lean as of its height it
-    /// has gone down; `None` once all of it is under.
-    fn place(&self, (lo, hi): (Vec3, Vec3)) -> Option<Mat4> {
-        let height = (hi.y - lo.y).max(1.0);
+    /// How far down it is now (metres), at most [`SINK_MOST`].
+    fn depth(&self) -> f32 {
         let depth = 0.5 * SINK_ACCEL * self.time * self.time;
-        if depth.is_nan() || depth > height + SUNK {
-            return None;
+        if depth.is_nan() {
+            SINK_MOST
+        } else {
+            depth.min(SINK_MOST)
         }
+    }
+
+    /// Where the rest of the model, its box `bounds`, is now, in its own
+    /// space: sunk, and leaning by as much of its lean as of
+    /// [`SINK_MOST`] it has gone down.
+    fn place(&self, (lo, hi): (Vec3, Vec3)) -> Mat4 {
+        let depth = self.depth();
         let pivot = Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5);
-        let lean = self.lean * (depth / height).min(1.0);
-        Some(
-            Mat4::from_translation(pivot - Vec3::Y * depth)
-                * Mat4::from_axis_angle(self.axis, lean)
-                * Mat4::from_translation(-pivot),
-        )
+        let lean = self.lean * depth / SINK_MOST;
+        Mat4::from_translation(pivot - Vec3::Y * depth)
+            * Mat4::from_axis_angle(self.axis, lean)
+            * Mat4::from_translation(-pivot)
     }
 }
 
@@ -980,9 +1116,10 @@ impl Sinking {
 /// second) as [`TUMBLE`] times its speed over its size. Round 100's throw
 /// (9 m/s for a metre-wide piece, a third of that for a gate's blocks,
 /// each spun about its middle, its footings left in the ground) left the
-/// arch and the walls standing 8 s on. Invented, to look as the videos
-/// do.
-const THROW_SPEED: f32 = 12.0;
+/// arch and the walls standing 8 s on; round 102's 12 m/s threw pieces
+/// 30-40 m, where the videos land them 10-15 m out. Invented, to look as
+/// the videos do.
+const THROW_SPEED: f32 = 7.5;
 const THROW_SIZE: f32 = 3.0;
 const THROW_BULK: f32 = 0.75;
 const THROW_NEAR: f32 = 6.0;
@@ -1045,6 +1182,19 @@ fn corners(at: Mat4, piece: &m2_engine::LoosePiece) -> [Vec3; 8] {
         let pick = |bit: usize| if k & bit == 0 { -1.0 } else { 1.0 };
         at.transform_point3(centre + half * Vec3::new(pick(1), pick(2), pick(4)))
     })
+}
+
+/// The world box round the model box `lo` to `hi` placed at `at`.
+fn box_around(at: Mat4, (lo, hi): (Vec3, Vec3)) -> (Vec3, Vec3) {
+    (0..8)
+        .map(|i| {
+            at.transform_point3(Vec3::new(
+                if i & 1 == 0 { lo.x } else { hi.x },
+                if i & 2 == 0 { lo.y } else { hi.y },
+                if i & 4 == 0 { lo.z } else { hi.z },
+            ))
+        })
+        .fold((Vec3::MAX, Vec3::MIN), |(a, b), c| (a.min(c), b.max(c)))
 }
 
 /// The middle of a box with these `corners`.
@@ -1163,9 +1313,18 @@ impl Loaders {
                                 .model(m)
                                 .and_then(|data| {
                                     let mut cpu = CpuModel::from_data(&data, 0)?;
-                                    cpu.breakup = Breakup::of(&data.parse()?, 0).map(Arc::new);
+                                    let parsed = data.parse()?;
+                                    cpu.breakup = Breakup::of(&parsed, 0).map(Arc::new);
                                     cpu.decode_textures(source, MODEL_TEXTURE_WIDTH);
-                                    Ok(cpu)
+                                    // A merged batch is in no one's way: its
+                                    // members are, as their own props (the
+                                    // island's batches are the same).
+                                    let mut members = Vec::new();
+                                    if parsed.info.flags & ModelInfo::FLAG_TINY != 0 {
+                                        cpu.collision = None;
+                                        members = parsed.tiny_members();
+                                    }
+                                    Ok((cpu, members))
                                 })
                                 .map_err(|e| e.to_string())
                         }))
@@ -1188,7 +1347,7 @@ mod tests {
     use m2_engine::{CollisionShape, LoosePiece};
 
     #[test]
-    fn a_broken_gates_rest_sinks_leaning_until_it_is_under() {
+    fn a_broken_gates_rest_sinks_a_little_leaning_and_stays() {
         // A gate 64 m along x, 15.7 m high, the way through it along z.
         let bounds = (Vec3::new(-32.0, 0.0, -4.6), Vec3::new(32.0, 15.7, 4.7));
         let placed = Mat4::from_translation(Vec3::new(100.0, -3.0, 50.0));
@@ -1196,23 +1355,25 @@ mod tests {
         let mut s = Sinking::from(7, placed, bounds, Vec3::new(100.0, 12.0, 49.0));
         let lean = s.lean.to_degrees();
         assert!((LEAN_LEAST..=LEAN_MOST).contains(&lean), "{lean}");
-        let top = |s: &Sinking| {
-            s.place(bounds)
-                .map(|m| m.transform_point3(Vec3::new(0.0, 15.7, 0.0)))
-        };
-        assert!(top(&s).unwrap().distance(Vec3::new(0.0, 15.7, 0.0)) < 1e-4);
-        // Two seconds on, 5 m down, leaning away from the blast.
-        s.time = 2.0;
-        let at = top(&s).unwrap();
-        assert!((at.y - 10.7).abs() < 0.1 && at.z > 0.5, "{at}");
-        // Three, more than 11 m down and further over.
-        s.time = 3.0;
-        let later = top(&s).unwrap();
-        assert!(later.y < 4.6 && later.z > at.z, "{later}");
-        // Four: all of it under, so not drawn; nor one found broken.
-        s.time = 4.0;
-        assert_eq!(top(&s), None);
-        assert_eq!(top(&Sinking::under()), None);
+        // The middle of its foot, which it leans about.
+        let foot = Vec3::new(0.0, 0.0, 0.05);
+        let top = |s: &Sinking| s.place(bounds).transform_point3(Vec3::new(0.0, 15.7, 0.0));
+        assert!(top(&s).distance(Vec3::new(0.0, 15.7, 0.0)) < 1e-4);
+        // Half a second on, a little down, leaning away from the blast.
+        s.time = 0.5;
+        let at = top(&s);
+        assert!(at.y < 15.7 && at.y > 14.5 && at.z > 0.1, "{at}");
+        // From a second on it stays: SINK_MOST down, fully over.
+        s.time = 1.0;
+        let down = s.place(bounds).transform_point3(foot);
+        assert!((down.y + SINK_MOST).abs() < 1e-4, "{down}");
+        let still = top(&s);
+        assert!(still.z > at.z && still.y > 13.0, "{still}");
+        s.time = 60.0;
+        assert!(top(&s).distance(still) < 1e-4);
+        // One found broken is down already, standing straight.
+        let under = Sinking::under().place(bounds).transform_point3(foot);
+        assert!((under.y + SINK_MOST).abs() < 1e-4, "{under}");
     }
 
     #[test]

@@ -1297,6 +1297,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     .hide(&mut world.physics, entities.iter().copied());
             }
             if *op != LayerOp::Unload {
+                scene.props.note_layer(entities.iter().copied(), name);
                 let shown = scene.show_props(entities);
                 if shown > 0 {
                     eprintln!("layer {name}: {shown} models put up");

@@ -186,6 +186,9 @@ impl Game {
         };
         self.props_up = true;
         self.scene.people.state_layers = Some(set.hashes.clone());
+        for e in &set.entities {
+            self.scene.props.note_layer([e.entity], &e.layer);
+        }
         let shown = self.scene.show_props(set.entities.iter().map(|e| e.entity));
         eprintln!("start-up state layers: {shown} models put up");
     }

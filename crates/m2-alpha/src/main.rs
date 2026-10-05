@@ -1032,20 +1032,39 @@ const BOMBED_REACH: f32 = 40.0;
 const GATE_MODEL: u32 = 0x1923_143c;
 
 /// How fast the gate test throws a gate's pieces each time it brings it
-/// down, as many times as in play: as in play first (and pictured), then
-/// slower and faster, to see how the look depends on it.
-const GATE_TRIES: [f32; 3] = [1.0, 0.6, 1.6];
+/// down, and whether everything else in its box is taken down first: as
+/// in play first (and pictured), then slower and faster, to see how the
+/// look depends on it, then as in play alone (and pictured).
+const GATE_TRIES: [(f32, bool); 4] = [(1.0, false), (0.6, false), (1.6, false), (1.0, true)];
+
+/// How much of another model's box has to be inside a gate's for the
+/// gate test's last try to take it down.
+const GATE_ALONE_SHARE: f32 = 0.5;
+
+/// How many of the other models in a gate's box the gate test lists.
+const GATE_LISTED: usize = 12;
+
+/// How far (metres) a gate's piece may have gone and still be listed as
+/// held, with what it touches: round 101's gatehouse pieces went 1 to 2 m.
+const GATE_HELD: f32 = 2.5;
 
 /// With `--gates`: brings down each of the mission's gates (the state
 /// layers' [`GATE_MODEL`]s) as the satellite bomb does, its blast on the
 /// middle of the gate's top, once for each of [`GATE_TRIES`], logging how
 /// its pieces set off (`gate N, try T: sets off: ...`) and where they are
-/// 2 s and 8 s on. The first time, pictures from 50 m south of it (as the
-/// mission comes at it) of the rest of it alone and its pieces alone as
-/// it breaks (`<out>-gateN-rest.ppm`, `-gateN-pieces`), and of all of it
-/// 2 s and 8 s on (`-gateN-2s`, `-gateN-8s`): round 100's pictures had
-/// the arch and walls standing 8 s after the bomb, without telling which
-/// of it was the gate's pieces.
+/// 2 s and 8 s on. First it lists what else stands in the gate's box (the
+/// state layers' models, with the layer that put each up, and every
+/// static collider) and pictures the place without the gate
+/// (`<out>-gateN-without.ppm`): round 101's gates still showed whole walls
+/// either side 8 s after the bomb, where the gate has no pieces, and its
+/// gatehouse's pieces were held where they started. The first time,
+/// pictures from 50 m south of it (as the mission comes at it) of the rest
+/// of it alone and its pieces alone as it breaks (`-gateN-rest`,
+/// `-gateN-pieces`), and of all of it 2 s and 8 s on (`-gateN-2s`,
+/// `-gateN-8s`), with the pieces still near where they started and what
+/// they touch at 2 s; the last time, with the other models mostly in its
+/// box taken down and the island's statics in it (its ground aside) gone,
+/// the same at 2 s and 8 s (`-gateN-alone-2s`, `-gateN-alone-8s`).
 fn gates_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -1111,7 +1130,11 @@ fn gates_for_screenshot(
         look(game, position + Vec3::Y * 8.0);
         game.scene.show_props([gate]);
         let started = Instant::now();
+        // The gate, the start-up layers' models round it and the island
+        // there all in.
         while game.scene.props.get(gate).is_none_or(|(_, loaded)| !loaded)
+            || game.startup.as_ref().is_some_and(startup::Startup::loading)
+            || game.scene.props.counts().loading + game.scene.props.counts().waiting_near > 0
             || game
                 .scene
                 .world
@@ -1129,10 +1152,81 @@ fn gates_for_screenshot(
             continue;
         };
         let eye = look(game, centre);
-        eprintln!("gate {n} ({gate:#x}) at {position:.1}, seen from {eye:.1}");
+        let facing = game
+            .scene
+            .props
+            .get(gate)
+            .map_or(Vec3::Z, |(p, _)| p.rotation * Vec3::Z);
+        eprintln!(
+            "gate {n} ({gate:#x}) at {position:.1}, seen from {eye:.1}, its z axis {facing:.2}"
+        );
+        if let Some(world) = &game.scene.world {
+            let props = &game.scene.props;
+            let others = props.others_in_box(&world.physics, gate);
+            eprintln!(
+                "gate {n}: {} other models in its box, biggest first: {}",
+                others.len(),
+                others
+                    .iter()
+                    .take(GATE_LISTED)
+                    .map(|(_, _, line)| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            if let Some((place, bounds)) = props.placed_bounds(gate) {
+                let statics: Vec<String> = world
+                    .physics
+                    .statics_in_box(place, bounds)
+                    .into_iter()
+                    .filter(|&k| k != m2_engine::StaticKey::Entity(gate))
+                    .map(|k| gate_static_name(world, props, k))
+                    .collect();
+                eprintln!(
+                    "gate {n}: {} statics in its box: {}",
+                    statics.len(),
+                    statics.join("; ")
+                );
+            }
+        }
+        game.scene.props.skip = Some(gate);
+        render(backend, game, fov, aspect, None)?;
+        write_ppm(backend, &picture(format!("gate{n}-without")))?;
+        game.scene.props.skip = None;
         // The bomb goes off on its top.
         let blast = top - Vec3::Y * 0.2;
-        for (t, &scale) in GATE_TRIES.iter().enumerate() {
+        for (t, &(scale, alone)) in GATE_TRIES.iter().enumerate() {
+            if alone && let Some(world) = &mut game.scene.world {
+                // Everything else mostly in its box taken down, and the
+                // island's statics in it but its ground.
+                let props = &mut game.scene.props;
+                let others: Vec<u32> = props
+                    .others_in_box(&world.physics, gate)
+                    .into_iter()
+                    .filter(|o| o.1 >= GATE_ALONE_SHARE)
+                    .map(|o| o.0)
+                    .collect();
+                let statics: Vec<m2_engine::StaticKey> = props
+                    .placed_bounds(gate)
+                    .map(|(place, bounds)| world.physics.statics_in_box(place, bounds))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|k| {
+                        matches!(
+                            k,
+                            m2_engine::StaticKey::Object(_) | m2_engine::StaticKey::Member(..)
+                        )
+                    })
+                    .collect();
+                props.hide(&mut world.physics, others.iter().copied());
+                for &k in &statics {
+                    world.physics.remove_static(k);
+                }
+                eprintln!(
+                    "gate {n}, alone: took down {} other models and {} island statics",
+                    others.len(),
+                    statics.len()
+                );
+            }
             // Whole again.
             if let Some(world) = &mut game.scene.world {
                 game.scene.props.hide(&mut world.physics, [gate]);
@@ -1152,13 +1246,16 @@ fn gates_for_screenshot(
             }
             let try_n = t + 1;
             eprintln!(
-                "gate {n}, try {try_n} ({scale} times as fast), blast at {blast:.1}: sets off: {}",
+                "gate {n}, try {try_n} ({scale} times as fast{}), blast at {blast:.1}: sets off: \
+                 {}",
+                if alone { ", alone" } else { "" },
                 game.scene
                     .props
                     .pieces_report(&world.physics, gate)
                     .unwrap_or_else(|| "no pieces".to_owned())
             );
             let first = t == 0;
+            let tag = if alone { "-alone" } else { "" };
             if first {
                 // Burning where its break-up says, as in play.
                 for at in game.scene.props.breakup_points(gate) {
@@ -1187,9 +1284,35 @@ fn gates_for_screenshot(
                     props.pieces_moved(&world.physics, gate).unwrap_or_default(),
                     props.describe(&world.physics, gate).unwrap_or_default()
                 );
-                if first {
+                if (first || alone) && on < 8.0 {
+                    let held: Vec<String> = props
+                        .pieces_held(&world.physics, gate, GATE_HELD)
+                        .into_iter()
+                        .map(|(node, keys)| {
+                            let by: Vec<String> = keys
+                                .into_iter()
+                                .map(|k| gate_static_name(world, props, k))
+                                .collect();
+                            format!(
+                                "n{node} by {}",
+                                if by.is_empty() {
+                                    "nothing static".to_owned()
+                                } else {
+                                    by.join(", ")
+                                }
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "gate {n}, try {try_n}: {on} s on, {} pieces within {GATE_HELD} m of \
+                         where they started: {}",
+                        held.len(),
+                        held.join("; ")
+                    );
+                }
+                if first || alone {
                     render(backend, game, fov, aspect, None)?;
-                    write_ppm(backend, &picture(format!("gate{n}-{name}")))?;
+                    write_ppm(backend, &picture(format!("gate{n}{tag}-{name}")))?;
                 }
             }
         }
@@ -1444,6 +1567,22 @@ fn look_at_marker(
         }
     }
     Ok(())
+}
+
+/// [`static_name`], with the layer that put up a state layer's model
+/// (the gate test's lists).
+fn gate_static_name(
+    world: &m2_engine::World,
+    props: &props::Props,
+    key: m2_engine::StaticKey,
+) -> String {
+    let name = static_name(world, Some(key));
+    match key {
+        m2_engine::StaticKey::Entity(e) => {
+            format!("{name} of {}", props.layer(e).unwrap_or("no layer noted"))
+        }
+        _ => name,
+    }
 }
 
 /// What a static collider is: a placed object and its model, a building
