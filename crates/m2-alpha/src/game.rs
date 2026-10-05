@@ -858,10 +858,11 @@ const ADAPT_KEY: f32 = 0.25;
 
 /// `M2_POST=exposure=0.8,bloom=0.35,threshold=1,contrast=1.3,
 /// saturation=1.6,grade=1.05/1/0.9,haze=1,inscatter=1,density=4,
-/// key=0.25,adapt=0.7` sets the finishing pass and haze by hand (any
+/// key=0.25,adapt=0.7,mono=1` sets the finishing pass and haze by hand (any
 /// subset; `haze` and `inscatter` scale the scattering and the light it
 /// adds, `density` replaces the air's thickness near the ground, `key`
-/// and `adapt` are the adaptation's key and strength, 0 for none), for
+/// and `adapt` are the adaptation's key and strength, 0 for none, `mono`
+/// scales how much the game's monochrome ramp takes), for
 /// matching reference frames.
 fn post_override(lighting: &mut m2_render::Lighting) {
     static POST: std::sync::OnceLock<Vec<(String, Vec<f32>)>> = std::sync::OnceLock::new();
@@ -894,6 +895,11 @@ fn post_override(lighting: &mut m2_render::Lighting) {
             ("key", [x]) => {
                 if let Some(a) = &mut lighting.adaptation {
                     a.key = *x;
+                }
+            }
+            ("mono", [x]) => {
+                if let Some(m) = &mut lighting.monochrome {
+                    m.w *= *x;
                 }
             }
             ("adapt", [x]) => {
