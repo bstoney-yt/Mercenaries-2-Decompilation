@@ -554,23 +554,35 @@ fn screenshot(
     // And for the vehicles and people, and the people to find their feet,
     // and for the vehicles to be parked by her (a look for a spot can take
     // a while: not timed). The island's own vehicles get half a minute, as
-    // one may fail.
+    // one may fail, and the props within reach two minutes: the frames
+    // are timed as play goes, not as the island first loads.
     while game.scene.world.is_some()
         && (game.scene.vehicles_loading()
             || (game.on_foot
                 && game.scene.player.as_ref().is_some_and(|p| p.landed)
                 && !game.parking_done())
-            || (game.island_vehicles_loading() && started.elapsed() < Duration::from_secs(30)))
+            || (game.island_vehicles_loading() && started.elapsed() < Duration::from_secs(30))
+            || (!game.scene.props.settled() && started.elapsed() < Duration::from_secs(120)))
         && started.elapsed() < Duration::from_secs(300)
     {
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
+    eprintln!(
+        "props within reach {} after {:.1} s",
+        if game.scene.props.settled() {
+            "loaded"
+        } else {
+            "still loading"
+        },
+        started.elapsed().as_secs_f32()
+    );
     // The last frames are timed: the frame rate here, for checking.
     // Where the time goes: the tick, streaming, building the draws, and
     // submitting the frame.
     let timed = Instant::now();
     let mut parts = [0.0f32; 4];
+    game.scene.streamed = Default::default();
     for _ in 0..FRAMES_TIMED {
         let mut lap = Instant::now();
         let mut split = |i: usize, lap: &mut Instant| {
@@ -595,23 +607,25 @@ fn screenshot(
     }
     let each = timed.elapsed().as_secs_f32() / FRAMES_TIMED as f32;
     let ms = parts.map(|p| p * 1000.0 / FRAMES_TIMED as f32);
+    let streamed = game
+        .scene
+        .streamed
+        .map(|d| d.as_secs_f32() * 1000.0 / FRAMES_TIMED as f32);
     eprintln!(
         "frames: {:.2} ms each ({:.0} fps) over {FRAMES_TIMED}, with a tick each: \
-         tick {:.2}, streaming {:.2}, draws {:.2}, submit {:.2} ms",
+         tick {:.2}, streaming {:.2} (the island {:.2}, vehicles and people {:.2}, \
+         props {:.2}), draws {:.2}, submit {:.2} ms",
         each * 1000.0,
         1.0 / each.max(1e-6),
         ms[0],
         ms[1],
+        streamed[0],
+        streamed[1],
+        streamed[2],
         ms[2],
         ms[3]
     );
-    // Props still loading take up to their upload budget of a frame's
-    // streaming time.
-    let (shown, loaded, loading, waiting, failed) = game.scene.props.counts();
-    eprintln!(
-        "props: {shown} shown, {loaded} models loaded, {loading} loading, \
-         {waiting} waiting, {failed} failed"
-    );
+    eprintln!("props: {}", game.scene.props.counts());
     let people = &game.scene.people;
     eprintln!(
         "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",
