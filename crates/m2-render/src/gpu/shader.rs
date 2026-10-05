@@ -131,7 +131,7 @@ struct Material {
     // x: reflection strength (0: none), y: Fresnel reflectance facing the
     // eye (negative: no Fresnel), z: takes the rim light
     reflection: vec4<f32>,
-    // x: open water
+    // x: open water, y: scale on the sky it mirrors
     water: vec4<f32>,
 };
 
@@ -522,7 +522,7 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         // the reflection over that; blended here, the same sum is the
         // body and reflection over the reflection's and body's share.
         water_alpha = mix(opacity, 1.0, k);
-        rgb = (body * opacity * (1.0 - k) + environment(reflect(-view, n)) * k) / max(water_alpha, 1e-4);
+        rgb = (body * opacity * (1.0 - k) + environment(reflect(-view, n)) * material.water.y * k) / max(water_alpha, 1e-4);
         // Foam along the shore, within about 3 m of it as the game's.
         let pattern = base_texel.a * dot(base_texel.rgb, vec3<f32>(0.3333));
         // Past a hundred metres or so surf is too fine to see; drawn there
