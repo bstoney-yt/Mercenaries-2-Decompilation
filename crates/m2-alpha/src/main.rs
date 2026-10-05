@@ -268,7 +268,8 @@ fn parse_args() -> anyhow::Result<Options> {
                 o.weapon = Some(match value()?.as_str() {
                     "rifle" => combat::Weapon::Rifle,
                     "rpg" => combat::Weapon::Rpg,
-                    v => bail!("--weapon {v}: expected rifle or rpg"),
+                    "gl" => combat::Weapon::GrenadeLauncher,
+                    v => bail!("--weapon {v}: expected rifle, rpg or gl"),
                 })
             }
             "--closeup" => o.closeup = true,
@@ -750,6 +751,11 @@ fn screenshot(
         let lead = (options.lead.unwrap_or(0.2) * 60.0)
             .round()
             .clamp(1.0, 179.0) as usize;
+        // The crate's grenade launcher, as she takes it up: three clips.
+        if options.weapon == Some(combat::Weapon::GrenadeLauncher) {
+            game.combat
+                .equip(combat::Weapon::GrenadeLauncher, 3 * combat::LAUNCHER_CLIP);
+        }
         for i in 0..180 {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
@@ -821,7 +827,7 @@ fn screenshot(
                 game.combat.grenade_in_hand(),
                 game.combat
                     .projectiles()
-                    .filter(|(rocket, ..)| !rocket)
+                    .filter(|(what, ..)| *what == combat::Flying::Grenade)
                     .count(),
                 p.bashing,
             );
@@ -920,6 +926,7 @@ fn describe_hold(game: &Game) -> Option<String> {
     let w = match game.combat.weapon {
         combat::Weapon::Rifle => arsenal.rifle.as_ref()?,
         combat::Weapon::Rpg => arsenal.rpg.as_ref()?,
+        combat::Weapon::GrenadeLauncher => arsenal.launcher.as_ref()?,
     };
     let (nodes, _) = rig.posed();
     let body = p.model_matrix();
@@ -1160,7 +1167,8 @@ fn mission_for_screenshot(
     // (she takes it within a second or two), from 5 m off (`-pickupN`):
     // the crates seen, and the pictures due (tick, crate).
     let mut opened: HashSet<(u32, u32)> = HashSet::new();
-    let mut pickup_shots: Vec<(u32, (u32, u32))> = Vec::new();
+    // When to picture each, which, and its number.
+    let mut pickup_shots: Vec<(u32, (u32, u32), usize)> = Vec::new();
     // The clips' sound events met, by category and name: how many hers,
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
@@ -1254,15 +1262,15 @@ fn mission_for_screenshot(
             }
             for p in game.scene.flights.pickups() {
                 if opened.insert(p.key()) {
-                    pickup_shots.push((i + 1, p.key()));
+                    pickup_shots.push((i + 1, p.key(), opened.len()));
                 }
             }
-            let due: Vec<(u32, u32)> = pickup_shots
+            let due: Vec<((u32, u32), usize)> = pickup_shots
                 .iter()
                 .filter(|s| s.0 == i)
-                .map(|s| s.1)
+                .map(|s| (s.1, s.2))
                 .collect();
-            for key in due {
+            for (key, n) in due {
                 let lying = game
                     .scene
                     .flights
@@ -1282,7 +1290,6 @@ fn mission_for_screenshot(
                     .try_normalize()
                     .unwrap_or(m2_math::glam::Vec3::X);
                 let eye = p.at + away * 5.0 + m2_math::glam::Vec3::Y * 2.5;
-                let n = opened.len();
                 delivery_picture(
                     backend,
                     game,
@@ -1811,7 +1818,7 @@ fn describe_vehicle_fire(game: &Game) {
             game.combat.shells(),
             game.combat
                 .projectiles()
-                .filter(|(rocket, ..)| *rocket)
+                .filter(|(what, ..)| *what == combat::Flying::Rocket)
                 .count()
         ),
         (Some(m), _, None) => eprintln!("drive: fire: muzzle {m:.2}, but no flash"),

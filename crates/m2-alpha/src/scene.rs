@@ -1273,6 +1273,7 @@ impl Scene {
                 (Some(_), _) => &None,
                 (None, Weapon::Rifle) => &self.arsenal.rifle,
                 (None, Weapon::Rpg) => &self.arsenal.rpg,
+                (None, Weapon::GrenadeLauncher) => &self.arsenal.launcher,
             };
             if !player.down
                 && let Some(w) = weapon
@@ -1318,19 +1319,27 @@ impl Scene {
                 w.model.draw(queue, at);
             }
         }
-        for (rocket, at, velocity) in fight.projectiles() {
-            let model = if rocket {
-                &self.arsenal.rocket
-            } else {
-                &self.arsenal.grenade
+        for (what, at, velocity) in fight.projectiles() {
+            let model = match what {
+                combat::Flying::Rocket => &self.arsenal.rocket,
+                combat::Flying::Grenade => &self.arsenal.grenade,
+                combat::Flying::Round => match &self.arsenal.round {
+                    Some(_) => &self.arsenal.round,
+                    None => &self.arsenal.grenade,
+                },
             };
             if let Some(w) = model {
-                // The rocket's nose (its muzzle marker) along its flight.
+                // A rocket's nose (its muzzle marker) along its flight, and
+                // a launched round's; a thrown grenade tumbles as it was.
                 let turn = Quat::from_rotation_arc(
                     w.muzzle.normalize_or(Vec3::Z),
                     velocity.normalize_or(Vec3::Z),
                 );
-                let spin = if rocket { turn } else { Quat::IDENTITY };
+                let spin = if what == combat::Flying::Grenade {
+                    Quat::IDENTITY
+                } else {
+                    turn
+                };
                 w.model
                     .draw(queue, Mat4::from_rotation_translation(spin, at));
             }

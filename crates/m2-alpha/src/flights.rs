@@ -113,6 +113,8 @@ pub struct Leaves {
     pub model: Option<u32>,
     /// How near she comes to take it, metres (its template's `radius`).
     pub reach: f32,
+    /// The weapon of hers it is, if it is one: taking it takes it up.
+    pub weapon: Option<Weapon>,
     /// The rounds it gives, and for which of her weapons (those of a
     /// weapon she doesn't carry give her nothing).
     pub gives: Option<(Weapon, u32)>,
@@ -189,10 +191,11 @@ struct Crate {
 }
 
 /// One thing a crate broken open left, lying where the crate stood until
-/// she comes within its reach and takes it.
+/// she takes it from within its reach; or a weapon she left for another.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pickup {
-    /// The crate it was in (the scripts' object).
+    /// The crate it was in (the scripts' object); 0 for a weapon she
+    /// left.
     pub from: u32,
     pub what: Leaves,
     /// Where it lies (on the ground) and which way it is turned.
@@ -378,14 +381,36 @@ impl Flights {
         self.models.get(&hash).is_some_and(Option::is_some)
     }
 
-    /// Takes what lies within its reach of `at` (her feet, on foot):
-    /// level with her, within a body's height.
-    pub fn take(&mut self, at: Vec3) -> Vec<Pickup> {
-        let (taken, left) = self.pickups.iter().partition(|p| {
-            (p.at - at).with_y(0.0).length() <= p.what.reach && (p.at.y - at.y).abs() < TAKE_HEIGHT
-        });
-        self.pickups = left;
-        taken
+    /// The nearest of what lies with `at` (her feet, on foot) within its
+    /// reach: level with her, within a body's height.
+    pub fn within(&self, at: Vec3) -> Option<&Pickup> {
+        self.pickups
+            .iter()
+            .map(|p| (p, (p.at - at).with_y(0.0).length()))
+            .filter(|&(p, d)| d <= p.what.reach && (p.at.y - at.y).abs() < TAKE_HEIGHT)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(p, _)| p)
+    }
+
+    /// Takes the nearest of what lies with `at` within its reach
+    /// ([`within`](Self::within)).
+    pub fn take_within(&mut self, at: Vec3) -> Option<Pickup> {
+        let key = self.within(at)?.key();
+        let i = self.pickups.iter().position(|p| p.key() == key)?;
+        Some(self.pickups.remove(i))
+    }
+
+    /// Lays `p` down to be taken (a weapon she left for another), its
+    /// model loaded if it isn't.
+    pub fn leave(&mut self, p: Pickup) {
+        if let Some(m) = p.what.model
+            && let std::collections::hash_map::Entry::Vacant(e) = self.models.entry(m)
+        {
+            e.insert(None);
+            self.wanted.push(m);
+        }
+        self.pickups.retain(|q| q.key() != p.key());
+        self.pickups.push(p);
     }
 
     /// Where crate `guid` stands, down and whole: its box's middle and
@@ -1002,12 +1027,14 @@ mod tests {
             template: 0x8000_6ea4,
             model: Some(97),
             reach: 1.0,
-            gives: None,
+            weapon: Some(Weapon::GrenadeLauncher),
+            gives: Some((Weapon::GrenadeLauncher, 18)),
         };
         let rockets = Leaves {
             template: 0x8000_56dc,
             model: Some(98),
             reach: 1.0,
+            weapon: None,
             gives: Some((Weapon::Rpg, 20)),
         };
         let mut flights = Flights::default();
@@ -1057,14 +1084,33 @@ mod tests {
         // not from 1.5 m off, nor from a roof over them.
         let out = (lying.at - first.at).normalize();
         let at = lying.at;
-        assert!(flights.take(at + out * 1.5).is_empty());
-        assert!(flights.take(at + Vec3::Y * 5.0).is_empty());
-        // From 0.8 m off, standing a step lower: the rockets alone.
-        assert_eq!(flights.take(at + out * 0.8 - Vec3::Y * 0.3), [lying]);
+        assert_eq!(flights.take_within(at + out * 1.5), None);
+        assert_eq!(flights.take_within(at + Vec3::Y * 5.0), None);
+        // From 0.8 m off, standing a step lower: the rockets, the nearer.
+        let near = at + out * 0.3 - Vec3::Y * 0.3;
+        assert_eq!(flights.within(near), Some(&lying));
+        assert_eq!(flights.take_within(near), Some(lying));
         assert_eq!(flights.pickups(), [first]);
         // Where they lay, the launcher is within reach.
-        assert_eq!(flights.take(at), [first]);
+        assert_eq!(flights.take_within(at), Some(first));
         assert!(flights.pickups().is_empty());
+        // What she leaves for it lies to be taken back, its model asked
+        // for.
+        let rpg = Pickup {
+            from: 0,
+            what: Leaves {
+                template: 0x8000_437b,
+                model: Some(96),
+                reach: 1.0,
+                weapon: Some(Weapon::Rpg),
+                gives: Some((Weapon::Rpg, 0)),
+            },
+            at,
+            yaw: 0.0,
+        };
+        flights.leave(rpg);
+        assert_eq!(flights.take_wanted(), [96]);
+        assert_eq!(flights.take_within(at), Some(rpg));
     }
 
     #[test]

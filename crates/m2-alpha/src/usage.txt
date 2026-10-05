@@ -50,7 +50,8 @@ m2-alpha [options]
   --face <degrees>       with --screenshot on foot: face this way first
                          (0 is +z, 90 is +x)
   --aim                  with --screenshot on foot: weapon up for the picture
-  --weapon rifle|rpg     with --screenshot on foot: the weapon she has up
+  --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
+                         (gl: the supply crate's grenade launcher)
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --probe                with --screenshot: list what rays from where she
