@@ -132,12 +132,23 @@ type ModelMaterials = (u32, Vec<(u32, Vec<u32>)>);
 type ClipRow = (u32, usize, f32, f32, Vec<(f32, String, String)>);
 /// Per event (category, name): the clips with it (hash, time, seconds).
 type EventUses = BTreeMap<(String, String), Vec<(u32, f32, f32)>>;
-/// A layer component's name, fields and records by entity.
+/// A layer component's name, fields and records by entity (an entity may
+/// have a component more than once: the first contract's supply crate has
+/// two `SpawnOnDeath`s).
 type ComponentRecords<'a> = (
     &'a str,
     Vec<m2_assets::layer::Field>,
-    HashMap<u32, &'a [u8]>,
+    HashMap<u32, Vec<&'a [u8]>>,
 );
+
+/// A component's records by entity, each entity's in data order.
+fn by_entity<'a>(c: &m2_assets::layer::Component<'a>) -> HashMap<u32, Vec<&'a [u8]>> {
+    let mut out: HashMap<u32, Vec<&'a [u8]>> = HashMap::new();
+    for (id, r) in c.records().unwrap_or_default() {
+        out.entry(id).or_default().push(r);
+    }
+    out
+}
 
 /// FNV-1a over the parts' bytes, each OR 0x20, then `*`: the name hash
 /// of the parts joined, without joining them.
@@ -1434,13 +1445,7 @@ fn sounddb<R: Read + Seek>(
         .components
         .iter()
         .filter(|c| c.name != "Name")
-        .map(|c| {
-            (
-                c.name,
-                c.fields.clone(),
-                c.records().unwrap_or_default().into_iter().collect(),
-            )
-        })
+        .map(|c| (c.name, c.fields.clone(), by_entity(c)))
         .collect();
     let field_name = |f: &m2_assets::layer::Field| -> String {
         names
@@ -1506,21 +1511,20 @@ fn sounddb<R: Read + Seek>(
     let show = |id: u32, name: &str| {
         println!("  {id:08x} {name:?}");
         for (cname, fields, recs) in &records {
-            let Some(rec) = recs.get(&id) else {
-                continue;
-            };
-            let values: Vec<String> = fields
-                .iter()
-                .filter_map(|f| value(f, rec).map(|(_, v)| format!("{}={v}", field_name(f))))
-                .collect();
-            println!(
-                "    {cname}: {}",
-                if values.is_empty() {
-                    "(all zero)".to_owned()
-                } else {
-                    values.join(", ")
-                }
-            );
+            for rec in recs.get(&id).into_iter().flatten() {
+                let values: Vec<String> = fields
+                    .iter()
+                    .filter_map(|f| value(f, rec).map(|(_, v)| format!("{}={v}", field_name(f))))
+                    .collect();
+                println!(
+                    "    {cname}: {}",
+                    if values.is_empty() {
+                        "(all zero)".to_owned()
+                    } else {
+                        values.join(", ")
+                    }
+                );
+            }
         }
     };
     // The sound materials, and the components they have.
@@ -1543,7 +1547,7 @@ fn sounddb<R: Read + Seek>(
         let mine: Vec<&[u8]> = recs
             .iter()
             .filter(|(id, _)| ids.contains(id))
-            .map(|(_, r)| *r)
+            .flat_map(|(_, r)| r.iter().copied())
             .collect();
         if mine.is_empty() {
             continue;
@@ -1609,7 +1613,10 @@ fn sounddb<R: Read + Seek>(
     let mut named_sounds: HashSet<u32> = HashSet::new();
     for (cname, fields, recs) in &records {
         let mut per_field: BTreeMap<String, (usize, usize, String)> = BTreeMap::new();
-        for (id, rec) in recs {
+        for (id, rec) in recs
+            .iter()
+            .flat_map(|(id, r)| r.iter().map(move |r| (id, r)))
+        {
             for f in fields {
                 let Some((v, shown)) = value(f, rec) else {
                     continue;
@@ -3681,13 +3688,7 @@ fn templates<R: Read + Seek>(
         .components
         .iter()
         .filter(|c| c.name != "Name")
-        .map(|c| {
-            (
-                c.name,
-                c.fields.clone(),
-                c.records().unwrap_or_default().into_iter().collect(),
-            )
-        })
+        .map(|c| (c.name, c.fields.clone(), by_entity(c)))
         .collect();
     let texty: Vec<&str> = db
         .components
@@ -3717,32 +3718,31 @@ fn templates<R: Read + Seek>(
     let show = |id: u32, name: &str, named: &mut Vec<u32>| {
         println!("  {id:08x} {name:?}");
         for (cname, fields, recs) in &records {
-            let Some(rec) = recs.get(&id) else {
-                continue;
-            };
-            let values: Vec<String> = fields
-                .iter()
-                .map(|f| {
-                    let shown = field_value(names, f, rec);
-                    let at = usize::from(f.offset);
-                    let other = (f.ty != STRING_FIELD && f.bit_width == 0)
-                        .then(|| rec.get(at..at + 4))
-                        .flatten()
-                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .filter(|v| *v != id)
-                        .and_then(|v| tnames.get(&v).map(|n| (v, n)));
-                    match other {
-                        Some((v, n)) => {
-                            if !named.contains(&v) {
-                                named.push(v);
+            for rec in recs.get(&id).into_iter().flatten() {
+                let values: Vec<String> = fields
+                    .iter()
+                    .map(|f| {
+                        let shown = field_value(names, f, rec);
+                        let at = usize::from(f.offset);
+                        let other = (f.ty != STRING_FIELD && f.bit_width == 0)
+                            .then(|| rec.get(at..at + 4))
+                            .flatten()
+                            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .filter(|v| *v != id)
+                            .and_then(|v| tnames.get(&v).map(|n| (v, n)));
+                        match other {
+                            Some((v, n)) => {
+                                if !named.contains(&v) {
+                                    named.push(v);
+                                }
+                                format!("{shown} -> {n:?}")
                             }
-                            format!("{shown} -> {n:?}")
+                            None => shown,
                         }
-                        None => shown,
-                    }
-                })
-                .collect();
-            println!("    {cname}: {}", values.join(", "));
+                    })
+                    .collect();
+                println!("    {cname}: {}", values.join(", "));
+            }
         }
     };
     let shown: Vec<u32> = picked.iter().take(150).map(|p| p.1).collect();
@@ -4118,13 +4118,7 @@ fn layer_entities<R: Read + Seek>(
                 .components
                 .iter()
                 .filter(|c| !matches!(c.name, "Transform" | "Name"))
-                .map(|c| {
-                    (
-                        c.name,
-                        c.fields.clone(),
-                        c.records().unwrap_or_default().into_iter().collect(),
-                    )
-                })
+                .map(|c| (c.name, c.fields.clone(), by_entity(c)))
                 .collect();
             for (dist, id) in near.into_iter().take(most) {
                 let p = placements[&id];
@@ -4136,12 +4130,11 @@ fn layer_entities<R: Read + Seek>(
                     entity_names.get(&id).copied().unwrap_or("")
                 );
                 for (cname, fields, recs) in &records {
-                    let Some(rec) = recs.get(&id) else {
-                        continue;
-                    };
-                    let values: Vec<String> =
-                        fields.iter().map(|f| field_value(names, f, rec)).collect();
-                    println!("    {cname}: {}", values.join(", "));
+                    for rec in recs.get(&id).into_iter().flatten() {
+                        let values: Vec<String> =
+                            fields.iter().map(|f| field_value(names, f, rec)).collect();
+                        println!("    {cname}: {}", values.join(", "));
+                    }
                 }
             }
         }
