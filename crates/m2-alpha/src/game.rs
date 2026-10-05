@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use m2_engine::{Physics, VehicleControls};
+use m2_engine::{CatalogueEntry, Physics, VehicleControls};
 use m2_math::glam::{Quat, Vec3, Vec4Swizzles};
 use m2_render::View;
 
@@ -534,6 +534,14 @@ impl Game {
         player.driving.is_some()
     }
 
+    /// Loads the first of `models` that drives and parks it near her, as
+    /// the vehicles she starts with are.
+    pub fn park_more(&mut self, models: Vec<CatalogueEntry>) {
+        self.scene.load_parked(models);
+        self.park_tries = 0;
+        self.park_wait = 0.0;
+    }
+
     /// The vehicle being driven: its position and speed (m/s).
     pub fn driving(&self) -> Option<(Vec3, f32)> {
         let world = self.scene.world.as_ref()?;
@@ -632,10 +640,16 @@ const PARK_TRIES: u32 = 40;
 /// A spot will do when the ground under the wheels slopes less than this
 /// (radians, about 10°; later looks take up to twice it), nothing under
 /// the hull rises more than this above them (metres: a rock, a ledge),
-/// and it is near the height of her feet (not a roof).
+/// and it is near the height of her feet (not a roof or a boulder's top):
+/// within [`PARK_RISE`] metres, and [`PARK_GRADE`] more for each metre
+/// away, up to [`PARK_ROOF`].
 const PARK_SLOPE: f32 = 0.18;
 const PARK_BUMPS: f32 = 0.3;
+const PARK_RISE: f32 = 1.5;
+const PARK_GRADE: f32 = 0.15;
 const PARK_ROOF: f32 = 8.0;
+/// The ground under a spot is looked for from this far above her feet.
+const PARK_LOOK: f32 = 60.0;
 /// Vehicles are let go this far above where they rest, to settle onto
 /// their wheels, metres.
 const DROP: f32 = 0.3;
@@ -679,10 +693,12 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
         let (lo, hi) = v.spec.bounds;
         let radius = footprint_radius(&v.spec);
         let middle = Vec3::new((lo.x + hi.x) * 0.5, 0.0, (lo.z + hi.z) * 0.5);
+        // From high above, so a boulder or a cliff taller than her isn't
+        // missed by a ray starting inside it (the spot is then too high).
         let ground = |p: Vec3| {
-            let top = Vec3::new(p.x, feet.y + PARK_ROOF, p.z);
+            let top = Vec3::new(p.x, feet.y + PARK_LOOK, p.z);
             physics
-                .cast_ray(top, -Vec3::Y, PARK_ROOF * 3.0)
+                .cast_ray(top, -Vec3::Y, PARK_LOOK + PARK_ROOF * 2.0)
                 .map(|(d, _)| top.y - d)
         };
         let spot = spots.iter().find_map(|&centre| {
@@ -696,9 +712,11 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
             // under its hull.
             let origin = centre - (right * middle.x + forward * middle.z);
             let rest = v.spec.rest_on(origin, player.facing, ground)?;
+            let away = (centre - feet).with_y(0.0).length();
+            let rise = (PARK_RISE + PARK_GRADE * away).min(PARK_ROOF);
             (rest.slope <= steep
                 && rest.bumps <= PARK_BUMPS
-                && (rest.position.y - feet.y).abs() < PARK_ROOF)
+                && (rest.position.y - feet.y).abs() < rise)
                 .then_some((centre, rest))
         });
         // Nowhere yet (the ground may still be loading): try next tick.

@@ -82,6 +82,20 @@ pub struct MissionView {
 /// Seconds the contract's completion stays up.
 const BANNER_TIME: f32 = 10.0;
 
+/// A marker the scripts put up, over one of their objects.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mark {
+    pub target: u32,
+    /// What to do there: `"destroy"`, `"deliverable"` (get there),
+    /// `"action"`.
+    pub kind: String,
+    /// The object's name (`vza_beachguard_1`, `loc_vza_beach`).
+    pub name: String,
+    pub at: Vec3,
+    /// The object is alive (not yet destroyed).
+    pub alive: bool,
+}
+
 enum State {
     Loading(Receiver<Result<GameData, String>>),
     Running(Box<Mission>),
@@ -433,6 +447,34 @@ impl MissionLink {
             ));
         }
         out
+    }
+
+    /// The markers the scripts have up, with what they are over.
+    pub fn marks(&self) -> Vec<Mark> {
+        let State::Running(mission) = &self.state else {
+            return Vec::new();
+        };
+        let w = mission.world().borrow();
+        w.hud
+            .markers
+            .values()
+            .filter_map(|m| {
+                let g = m.target?;
+                let o = w.objects.get(&g)?;
+                Some(Mark {
+                    target: g,
+                    kind: m.icon.trim_start_matches("HUD_objective_").to_owned(),
+                    name: o.name.clone(),
+                    at: Vec3::from(o.position),
+                    alive: o.alive,
+                })
+            })
+            .collect()
+    }
+
+    /// The scripts have said the contract is completed.
+    pub fn completed(&self) -> bool {
+        self.completed.is_some()
     }
 
     /// What the HUD shows.

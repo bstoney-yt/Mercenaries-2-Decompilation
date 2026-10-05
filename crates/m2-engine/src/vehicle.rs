@@ -200,8 +200,9 @@ pub struct VehicleSpec {
     /// off the turret (else the mount).
     pub pivot: Option<Vec3>,
     /// The turret gun's muzzle, model space, with the turret straight
-    /// ahead: a muzzle marker on the turret, else the front of the turret
-    /// part reaching furthest forward (the barrel).
+    /// ahead: the turret's muzzle marker reaching furthest forward (a
+    /// tank's cannon, not its cupola's machine gun), else the front of the
+    /// turret part reaching furthest forward (the barrel).
     pub muzzle: Option<Vec3>,
 }
 
@@ -365,13 +366,26 @@ impl VehicleSpec {
                 })
             })
         });
+        // Of the turret's muzzles shown intact (not the wreck's), the one
+        // reaching furthest forward: a tank's cannon, not the machine gun
+        // on its commander's cupola.
+        let hidden = model
+            .states
+            .as_ref()
+            .map(|s| s.hidden(&model.nodes, false))
+            .unwrap_or_default();
         let muzzle = model
             .nodes
             .iter()
             .enumerate()
-            .find(|(i, n)| n.name_hash == GUN_MUZZLE && on_turret(*i as u16))
-            .and_then(|(i, _)| model.node_to_model(i as u16))
+            .filter(|(i, n)| {
+                n.name_hash == GUN_MUZZLE
+                    && on_turret(*i as u16)
+                    && !hidden.get(*i).copied().unwrap_or(false)
+            })
+            .filter_map(|(i, _)| model.node_to_model(i as u16))
             .map(|m| m.w_axis.truncate())
+            .max_by(|a, b| a.z.total_cmp(&b.z))
             .or_else(|| {
                 let b = boxes
                     .iter()
