@@ -1336,14 +1336,18 @@ fn log_terrain(hash: u32, mesh: &TerrainMesh, gpu: &TerrainGpu, materials: &Mate
 /// The sea material's constants the game's water shader takes:
 /// `constant0.x` (reflection strength), `R0` (reflectance facing the eye),
 /// `constant0.z` (glint exponent) and the specular colour (taken grey).
-/// Not yet read from the game's water material: `M2_SEA` sets them as
-/// `reflection,r0,power,glint`.
+/// The game's water material is not in its archives (PC round L), so
+/// these are set from code there: `M2_SEA` sets them as
+/// `reflection,r0,power,glint[,body[,sky]]`, `body` scaling the diffuse
+/// and ambient colours and `sky` the sky mirrored.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SeaConstants {
     reflection: f32,
     r0: f32,
     power: f32,
     glint: f32,
+    body: f32,
+    sky: f32,
 }
 
 impl SeaConstants {
@@ -1353,16 +1357,22 @@ impl SeaConstants {
             r0: 0.02,
             power: 400.0,
             glint: 3.0,
+            body: 1.0,
+            sky: 1.0,
         };
         if let Ok(v) = std::env::var("M2_SEA") {
             let f: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-            if let [reflection, r0, power, glint] = f[..] {
-                c = Self {
-                    reflection,
-                    r0,
-                    power,
-                    glint,
-                };
+            if f.len() >= 4 {
+                c.reflection = f[0];
+                c.r0 = f[1];
+                c.power = f[2];
+                c.glint = f[3];
+            }
+            if let Some(&b) = f.get(4) {
+                c.body = b;
+            }
+            if let Some(&s) = f.get(5) {
+                c.sky = s;
             }
         }
         c
@@ -1420,6 +1430,9 @@ fn sea_plane(
                 strength: sea.reflection,
                 fresnel: Some(sea.r0),
             }),
+            direct: [sea.body; 3],
+            ambient: [sea.body; 3],
+            water_sky: sea.sky,
             ..MaterialDesc::default()
         },
     )?;

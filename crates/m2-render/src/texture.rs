@@ -187,6 +187,9 @@ pub struct MaterialDesc {
     /// over `color` (the water's body colour and opacity looking straight
     /// down).
     pub water: bool,
+    /// Water: scale on the sky it mirrors (the game's reflection map may
+    /// hold only what stands over the water).
+    pub water_sky: f32,
 }
 
 /// A reflection of the surroundings, along the view mirrored in the
@@ -270,6 +273,7 @@ impl Default for MaterialDesc {
             reflection: None,
             rim: false,
             water: false,
+            water_sky: 1.0,
         }
     }
 }

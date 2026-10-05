@@ -1056,7 +1056,7 @@ impl WgpuBackend {
                 Some(r) => [r.strength, r.fresnel.unwrap_or(-1.0), flag(desc.rim), 0.0],
                 None => [0.0, -1.0, flag(desc.rim), 0.0],
             },
-            water: [flag(desc.water), 0.0, 0.0, 0.0],
+            water: [flag(desc.water), desc.water_sky, 0.0, 0.0],
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("material uniforms"),
