@@ -1120,7 +1120,9 @@ fn look_at_story_character(game: &mut Game) {
 }
 
 /// Waits for the parked vehicles, gets in the nearest and drives it
-/// forward for four seconds, printing how it went.
+/// forward for four seconds (backing out first if it is parked close
+/// behind something, and steering round what it meets), printing how it
+/// went.
 fn drive_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -1231,11 +1233,33 @@ fn drive_for_screenshot(
         .and_then(|p| p.driving)
         .map(|i| game.scene.vehicles[i].spec.label.clone())
         .unwrap_or_default();
-    let from = game.driving().map(|(at, _)| at);
-    let throttle = Intent {
-        movement: m2_math::glam::Vec2::Y,
-        ..Intent::default()
+    let driven = |game: &Game| {
+        let i = game.scene.player.as_ref()?.driving?;
+        let v = &game.scene.vehicles[i];
+        Some((v.id?, v.spec.hull))
     };
+    // Parked close behind another (the Stryker in the military line):
+    // back out first, as a player would, then drive on round it.
+    if let (Some(world), Some((id, hull))) = (game.scene.world.as_ref(), driven(game))
+        && autoplay::blocked_ahead(&world.physics, id, hull, 2.0)
+    {
+        eprintln!("drive: something within 2 m ahead: backing out for 2 s");
+        let back = Intent {
+            movement: m2_math::glam::Vec2::NEG_Y,
+            ..Intent::default()
+        };
+        for _ in 0..120 {
+            game.step(back, tick);
+        }
+        let brake = Intent {
+            hold_jump: true,
+            ..Intent::default()
+        };
+        for _ in 0..30 {
+            game.step(brake, tick);
+        }
+    }
+    let from = game.driving().map(|(at, _)| at);
     // Who is about, to see they keep moving while she drives.
     let before: Vec<m2_math::glam::Vec3> = game
         .scene
@@ -1245,6 +1269,14 @@ fn drive_for_screenshot(
         .map(|n| n.character.position)
         .collect();
     for i in 0..240 {
+        let steer = match (game.scene.world.as_ref(), driven(game)) {
+            (Some(w), Some((id, hull))) => autoplay::steer_round(&w.physics, id, hull),
+            _ => 0.0,
+        };
+        let throttle = Intent {
+            movement: m2_math::glam::Vec2::new(steer, 1.0),
+            ..Intent::default()
+        };
         game.step(throttle, tick);
         if i % 30 == 0 {
             render(backend, game, fov, aspect, None)?;
@@ -1255,8 +1287,8 @@ fn drive_for_screenshot(
             "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s",
             (to - from).length()
         );
-        // Hardly moved: what holds it.
-        if (to - from).length() < 8.0
+        // Hardly moved, or stopped: what holds it.
+        if ((to - from).length() < 8.0 || speed.abs() < 1.0)
             && let Some(world) = game.scene.world.as_ref()
             && let Some(v) = game
                 .scene
@@ -1378,7 +1410,7 @@ fn drive_for_screenshot(
     if options.wreck {
         wreck_at_speed(game, tick);
     }
-    if options.look != 0.0 {
+    if options.look != 0.0 || options.fire {
         // Stop, then swing the camera and watch the turret follow.
         let brake = Intent {
             hold_jump: true,
@@ -1526,14 +1558,8 @@ fn wreck_at_speed(game: &mut Game, tick: f32) {
 
 /// Turns the player's camera so the crosshair is on `target`.
 fn aim_at(game: &mut Game, target: m2_math::glam::Vec3) {
-    let Some(p) = game.scene.player.as_mut() else {
-        return;
-    };
-    // The eye moves as the camera turns: settle in a few steps.
-    for _ in 0..4 {
-        let to = target - p.eye();
-        p.yaw = to.x.atan2(to.z);
-        p.pitch = (to.y / to.length().max(0.01)).asin();
+    if let Some(p) = game.scene.player.as_mut() {
+        p.aim_crosshair_at(target);
     }
 }
 
@@ -1607,7 +1633,7 @@ fn fight_for_screenshot(
         aim_at(game, game.scene.people.npcs[i].chest());
         if let (Some(world), Some(player)) = (&game.scene.world, &game.scene.player) {
             let n = &game.scene.people.npcs[i];
-            let (eye, dir) = (player.eye(), player.camera_forward());
+            let (eye, dir) = (player.eye(), player.aim_forward());
             let to = n.chest() - eye;
             let miss = (to - dir * to.dot(dir)).length();
             let blocked = world.physics.cast_ray(eye, to, to.length()).map(|h| h.0);
@@ -1866,7 +1892,7 @@ fn blast_for_screenshot(
     }
     aim_at(game, at);
     if let (Some(world), Some(player)) = (&game.scene.world, &game.scene.player) {
-        let (eye, dir) = (player.eye(), player.camera_forward());
+        let (eye, dir) = (player.eye(), player.aim_forward());
         eprintln!(
             "blast: eye {eye:.1}, {:.1} m to it, aim ray hits at {:?}",
             eye.distance(at),
