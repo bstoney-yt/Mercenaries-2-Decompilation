@@ -90,6 +90,9 @@ pub struct MissionView {
     pub objectives: Vec<String>,
     /// The tutorial line up, readable.
     pub tutorial: Option<String>,
+    /// The same line with its key tokens (`[pda]`) as the scripts' text
+    /// has them, for the game's own tutorial box to draw as glyphs.
+    pub game_tutorial: Option<String>,
     /// Markers over targets: where, what, colour (RGBA).
     pub markers: Vec<(Vec3, String, [u8; 4])>,
     /// The newest objective message: completed (or else added), and text.
@@ -173,7 +176,7 @@ pub struct MissionLink {
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
-    /// The tutorial line up, readable.
+    /// The tutorial line up, with its key tokens.
     tutorial: Option<String>,
     /// Blasts since the scripts last ran, and support strikes' bombs.
     blasts: Vec<Vec3>,
@@ -504,7 +507,7 @@ impl MissionLink {
                     self.completed = Some(0.0);
                 }
             }
-            if let Some(line) = tutorial(mission, &self.keys) {
+            if let Some(line) = tutorial(mission) {
                 self.tutorial = line;
             }
             break_props(game, mission);
@@ -830,7 +833,11 @@ impl MissionLink {
             .collect();
         MissionView {
             status: None,
-            tutorial: self.tutorial.clone(),
+            tutorial: self
+                .tutorial
+                .as_ref()
+                .map(|t| crate::input::name_keys(t, &self.keys)),
+            game_tutorial: self.tutorial.clone(),
             objectives,
             markers,
             message,
@@ -1024,16 +1031,15 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
 }
 
 /// The scripts' newest tutorial line since the last call, if they asked
-/// for one: its text, readable, with the keys it names as `keys` has them
-/// (`[P] Open PDA`), or none if they cleared it. Each call is logged with
-/// its arguments.
-fn tutorial(mission: &Mission, keys: &crate::input::Bindings) -> Option<Option<String>> {
+/// for one: its text, its key tokens kept (`[pda] Open PDA`), or none if
+/// they cleared it. Each call is logged with its arguments.
+fn tutorial(mission: &Mission) -> Option<Option<String>> {
     let calls = std::mem::take(&mut mission.world().borrow_mut().hud.tutorials);
     for args in &calls {
         eprintln!("mission: tutorial line {args:?}");
     }
     let args = calls.last()?;
-    Some(m2_game::hud::tutorial_text(args).map(|t| crate::input::name_keys(&mission.text(t), keys)))
+    Some(m2_game::hud::tutorial_text(args).map(|t| mission.text(t)))
 }
 
 /// The scripts' free support items, given her or taken back.

@@ -142,7 +142,7 @@ impl Hud {
             .mission
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
-        state.tutorial = info.mission.as_ref().and_then(|m| m.tutorial.clone());
+        state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         game.update(&self.ctx, state);
     }
 
@@ -164,7 +164,7 @@ impl Hud {
             .mission
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
-        state.tutorial = info.mission.as_ref().and_then(|m| m.tutorial.clone());
+        state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         let step = 1.0 / 30.0;
         game.update_and_wait(
             &self.ctx,
@@ -1182,6 +1182,7 @@ mod tests {
             mission: Some(MissionView {
                 objectives: vec!["VzaCon001 objective 1".into()],
                 tutorial: Some("[P] VzaCon001 tutorial 1\nline 2".into()),
+                game_tutorial: Some("[pda] VzaCon001 tutorial 1\nline 2".into()),
                 markers: vec![(
                     Vec3::new(0.0, 0.0, -10.0),
                     "deliverable".into(),
