@@ -15,6 +15,8 @@ struct Frame {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     sun_dir: vec4<f32>,
+    // rgb: sunlight, a: 1 to sum light in display values
+    // (`light_to_display`)
     sun_color: vec4<f32>,
     // rgb: sky and fog colour, a: fog density per metre
     sky: vec4<f32>,
@@ -52,6 +54,33 @@ struct Frame {
     // rgb: scale on the clouds' colour
     cloud_tone: vec4<f32>,
 };
+
+// The game lights surfaces in display values: the sun's colour times
+// N.L and shadow, plus the ambient light, summed there. With
+// frame.sun_color.a set, light is encoded to display values to be summed
+// and the sum decoded; otherwise both are as they are.
+fn light_to_display(c: vec3<f32>) -> vec3<f32> {
+    if frame.sun_color.a < 0.5 {
+        return c;
+    }
+    return pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
+
+fn light_from_display(c: vec3<f32>) -> vec3<f32> {
+    if frame.sun_color.a < 0.5 {
+        return c;
+    }
+    return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2));
+}
+
+// The ambient cube's light for normal `n`, its faces blended as display
+// values when light is summed in them.
+fn ambient_display(n: vec3<f32>) -> vec3<f32> {
+    let n2 = n * n;
+    return n2.x * light_to_display(select(frame.ambient_cube[1], frame.ambient_cube[0], n.x >= 0.0).rgb)
+        + n2.y * light_to_display(select(frame.ambient_cube[3], frame.ambient_cube[2], n.y >= 0.0).rgb)
+        + n2.z * light_to_display(select(frame.ambient_cube[5], frame.ambient_cube[4], n.z >= 0.0).rgb);
+}
 
 // The depth colour map at `metres` of water looked through.
 fn water_ramp(metres: f32) -> vec4<f32> {
@@ -415,16 +444,17 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         let shade = sunlight(v.world_pos, surface_n);
         var lit: vec3<f32>;
         if ground {
-            lit = rgb * (frame.sun_color.rgb * max(n_dot_l, 0.0) * shade + ambient_light(n));
+            let sun = light_to_display(frame.sun_color.rgb) * max(n_dot_l, 0.0) * shade;
+            lit = rgb * light_from_display(sun + ambient_display(n));
         } else {
-            var sun = frame.sun_color.rgb * max(n_dot_l, 0.0) * shade;
+            var sun = light_to_display(frame.sun_color.rgb) * max(n_dot_l, 0.0) * shade;
             if material.reflection.z > 0.5 {
                 // Rim light where the surface turns away from the eye, on
                 // the side the sun doesn't reach.
-                sun = sun + frame.rim.rgb * max(frame.rim.a - dot(n, view), 0.0) * (1.0 - max(n_dot_l, 0.0));
+                sun = sun + light_to_display(frame.rim.rgb) * max(frame.rim.a - dot(n, view), 0.0) * (1.0 - max(n_dot_l, 0.0));
             }
             let direct = clamp(sun, vec3<f32>(0.0), vec3<f32>(1.0));
-            lit = rgb * (direct * material.direct.rgb + ambient_light(n) * material.ambient.rgb);
+            lit = rgb * light_from_display(direct * material.direct.rgb + ambient_display(n) * material.ambient.rgb);
         }
         var tint = vec3<f32>(1.0);
         if material.maps.x > 0.5 {

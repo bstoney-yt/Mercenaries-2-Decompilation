@@ -35,10 +35,13 @@
 //! read from its name and from the game's pixel shaders (ambient cube
 //! faces in the order +x, -x, +y, -y, +z, -z: the `Default` cube is
 //! brightest in face 2 and darkest in face 3, sky above and ground
-//! below). The colours are taken as gamma-encoded (sRGB) bytes, as
-//! colours picked in an editor are, and decoded to linear light: read as
-//! linear, shade was half as dark against sunlight as the original game's
-//! (measured on PC video frames). That reading is inferred.
+//! below). The light's colours (ambient, rim, sun) are kept as the game
+//! uses them, display values: its shaders light surfaces in display
+//! (gamma) space, never decoding their textures, so sunlight and ambient
+//! light are summed there and the sum decoded (see
+//! [`Lighting::gamma_light`]). A colour alone decoded to linear light
+//! gives the same as the game; summed in linear light, shade came out
+//! too bright against sunlight.
 
 use std::collections::HashMap;
 
@@ -51,11 +54,11 @@ use m2_render::{Haze, Lighting, ToneMap};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Atmosphere {
     /// `AmbientCube0`..`5` times their multipliers: light from +x, -x,
-    /// +y, -y, +z and -z.
+    /// +y, -y, +z and -z, display values.
     pub ambient_cube: [Vec3; 6],
     /// `LightIntensity`: the sunlight's strength.
     pub light_intensity: f32,
-    /// `RimColor` times `RimColorMultiplier`.
+    /// `RimColor` times `RimColorMultiplier`, display values.
     pub rim: Vec3,
     /// `RimColor`'s alpha byte, taken as the rim light's threshold (the
     /// shaders' `rimLightColor.w`): inferred, the other colours' alpha
@@ -153,7 +156,7 @@ impl Atmosphere {
             let v = field(name)?;
             let scale = float(&format!("{name}Multiplier")).unwrap_or(1.0);
             let [r, g, b, _] = channels(v, Lit::Light);
-            Some(Vec3::new(r, g, b).map(srgb_to_linear) * scale)
+            Some(Vec3::new(r, g, b) * scale)
         };
         let mut ambient_cube = [Vec3::splat(0.2); 6];
         for (i, face) in ambient_cube.iter_mut().enumerate() {
@@ -298,11 +301,20 @@ impl Atmosphere {
     /// grade and cloud settings into `lighting` (not the cloud noise
     /// texture, which the world loads).
     pub fn apply(&self, lighting: &mut Lighting) {
-        lighting.ambient_cube = self.ambient_cube;
-        lighting.rim_color = self.rim;
+        let decode = |c: Vec3| c.max(Vec3::ZERO).powf(GAMMA);
+        lighting.ambient_cube = self.ambient_cube.map(decode);
+        lighting.rim_color = decode(self.rim);
         lighting.rim_threshold = self.rim_threshold;
         lighting.sun_direction = self.sun_direction();
-        lighting.sun_color = self.light_color * self.light_intensity;
+        // `M2_LIGHTING=linear` sums the light in linear light, with the
+        // sun's colour taken as linear, as before, for comparison.
+        lighting.gamma_light = gamma_light();
+        let sun = self.light_color * self.light_intensity;
+        lighting.sun_color = if lighting.gamma_light {
+            decode(sun)
+        } else {
+            sun
+        };
         lighting.haze = self.haze();
         // `BloomAmount` times `BloomMultiplier` above `BloomThreshold`
         // (inferred from the names).
@@ -568,17 +580,30 @@ enum Lit {
     Post,
 }
 
-/// A record colour word's red, green, blue and alpha, 0 to 1: stored as
-/// the bytes red, green, blue, alpha (red the low byte). Read the other
-/// way (`0xAARRGGBB`) the islands' night record is all warm (its ambient,
-/// rim, deep water and grade) against its blue cloud tone and footage,
-/// and nearly every daytime grade blue; this way round both agree with
-/// footage. Inferred; `M2_COLOURS=argb` reads them all the other way,
-/// `M2_COLOURS=split` only the light's (ambient and rim), for comparison.
+/// The game's display gamma: its tone map encodes and decodes with it.
+const GAMMA: f32 = 2.2;
+
+/// Whether light is summed in display values, as the game's shaders do
+/// (`M2_LIGHTING=linear` for linear light).
+fn gamma_light() -> bool {
+    static GAMMA_LIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GAMMA_LIGHT.get_or_init(|| std::env::var("M2_LIGHTING").map_or(true, |v| v != "linear"))
+}
+
+/// A record colour word's red, green, blue and alpha, 0 to 1. The light's
+/// colours (ambient and rim) are read as `0xAARRGGBB`, the water's and
+/// post pass's as the bytes red, green, blue, alpha (red the low byte):
+/// read all as `0xAARRGGBB` the islands' night water and grade are warm
+/// against their blue cloud tone and footage and the daytime grades blue;
+/// read all the other way the daytime ambient light is sky blue, the town
+/// pink-grey and the jungle grey against footage. Read this way the town
+/// and jungle are warm and the night blue (PC round F). Inferred;
+/// `M2_COLOURS=argb` and `M2_COLOURS=rgba` read them all one way, for
+/// comparison.
 fn channels(v: u32, lit: Lit) -> [f32; 4] {
     static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let mode = MODE.get_or_init(|| std::env::var("M2_COLOURS").unwrap_or_default());
-    let argb = mode == "argb" || (mode == "split" && lit == Lit::Light);
+    let argb = mode == "argb" || (mode != "rgba" && lit == Lit::Light);
     let byte = |shift: u32| ((v >> shift) & 0xff) as f32 / 255.0;
     if argb {
         [byte(16), byte(8), byte(0), byte(24)]
