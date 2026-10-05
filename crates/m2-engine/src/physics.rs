@@ -670,6 +670,21 @@ impl Physics {
             .unwrap_or_default()
     }
 
+    /// How many of a vehicle's wheels touch the ground, of how many.
+    pub fn vehicle_contacts(&self, id: VehicleId) -> (usize, usize) {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or((0, 0), |v| {
+                let wheels = v.controller.wheels();
+                let down = wheels
+                    .iter()
+                    .filter(|w| w.raycast_info().is_in_contact)
+                    .count();
+                (down, wheels.len())
+            })
+    }
+
     /// A vehicle's velocity, m/s.
     pub fn vehicle_velocity(&self, id: VehicleId) -> Vec3 {
         self.vehicles

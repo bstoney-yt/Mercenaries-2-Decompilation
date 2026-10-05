@@ -521,12 +521,20 @@ impl Game {
             let speed = self.driving().map_or(0.0, |d| d.1);
             Some((v.spec.label.clone(), speed, v.wrecked))
         });
+        // What the crosshair is on: on foot, or in a vehicle with a gun.
         let crosshair = match (&self.scene.world, player) {
-            (Some(w), Some(p)) => p
-                .driving
-                .and_then(|i| self.scene.vehicles.get(i))
-                .filter(|v| v.spec.muzzle.is_some() && !v.wrecked)
-                .map(|v| Combat::aim_point(&w.physics, &self.scene.people, p, v.id)),
+            (Some(w), Some(p)) if self.combat.down <= 0.0 => match p.driving {
+                Some(i) => self
+                    .scene
+                    .vehicles
+                    .get(i)
+                    .filter(|v| v.spec.muzzle.is_some() && !v.wrecked)
+                    .map(|v| Combat::aim_point(&w.physics, &self.scene.people, p, v.id)),
+                None if self.on_foot && p.landed => {
+                    Some(Combat::aim_point(&w.physics, &self.scene.people, p, None))
+                }
+                None => None,
+            },
             _ => None,
         };
         let can_enter = match (&self.scene.world, player) {
