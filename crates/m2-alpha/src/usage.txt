@@ -22,6 +22,8 @@ m2-alpha [options]
   --screenshot <out.ppm> render one frame offscreen and exit
   --drive                with --screenshot on the island: get in the
                          nearest parked vehicle and drive it forward first
+                         (backing out first if it is boxed in, steering
+                         round what it meets)
   --jump                 with --screenshot on the island: jump just before
                          the picture
   --throw                with --screenshot on the island: throw a grenade
@@ -51,7 +53,7 @@ m2-alpha [options]
                          stands hit (unseen walls, steps in the ground)
   --wreck                with --drive: wreck the vehicle at speed at the
                          end and log how it comes to rest
-  --fire                 with --aim, or --drive --look: fire just before the
+  --fire                 with --aim or --drive: fire just before the
                          picture
   --grip attach|hands    draw weapons on the hand's attach node as posed
                          (attach, the default), or held as worked out from
