@@ -1375,7 +1375,10 @@ fn log_terrain(hash: u32, mesh: &TerrainMesh, gpu: &TerrainGpu, materials: &Mate
 /// these are set from code there; fitted to footage of the night start
 /// and a sunset ride (PC round K: the near and far night sea 59 and 13
 /// against 52 and 9, the sunset glare 152 against 120 to 190, a dimmer
-/// mirrored sky darkening the far sea as the game's does). `M2_SEA` sets
+/// mirrored sky darkening the far sea as the game's does). Against the PC
+/// clip's night bay the open sea already matched but the far sea was a
+/// third too dark: the mirrored sky raised it 2.4 per 0.1 (PC round Y,
+/// 21.5 at 0.3, 28.7 at 0.6, against 31.9), so it is 0.7. `M2_SEA` sets
 /// them as
 /// `reflection,r0,power,glint[,body[,sky]]`, `body` scaling the diffuse
 /// and ambient colours and `sky` the sky mirrored.
@@ -1397,7 +1400,7 @@ impl SeaConstants {
             power: 40.0,
             glint: 1.0,
             body: 0.7,
-            sky: 0.3,
+            sky: 0.7,
         };
         if let Ok(v) = std::env::var("M2_SEA") {
             let f: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
