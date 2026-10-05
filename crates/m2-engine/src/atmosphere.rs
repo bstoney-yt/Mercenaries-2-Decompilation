@@ -163,6 +163,50 @@ impl Atmosphere {
                 .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         };
         let float = |name: &str| field(name).map(f32::from_bits);
+        // `M2_ATMO_DUMP=on` logs the record's monochrome ramp words by
+        // name, then every field's raw word by name hash, to find the
+        // ramp's other stops and whatever sets its blend.
+        if env_is("M2_ATMO_DUMP", "on") {
+            let mut found = Vec::new();
+            for g in 0..3 {
+                for s in [
+                    "Color0",
+                    "Color1",
+                    "Color2",
+                    "Color3",
+                    "Color4",
+                    "Blend",
+                    "Amount",
+                    "Intensity",
+                    "Position",
+                    "Enable",
+                    "Enabled",
+                    "Type",
+                    "Mode",
+                ] {
+                    let n = format!("Gradient{g}_{s}");
+                    if let Some(v) = field(&n) {
+                        found.push(format!("{n}={v:08x}"));
+                    }
+                }
+            }
+            let raw: Vec<String> = c
+                .fields
+                .iter()
+                .filter_map(|f| {
+                    let at = usize::from(f.offset);
+                    let b = rec.get(at..at + 4)?;
+                    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    Some(format!("{:08x}:{v:08x}", f.name_hash))
+                })
+                .collect();
+            eprintln!(
+                "atmosphere dump: name {:08x} {} | {}",
+                field("Name").unwrap_or(0),
+                found.join(" "),
+                raw.join(" ")
+            );
+        }
         let colour = |name: &str| {
             let v = field(name)?;
             let scale = float(&format!("{name}Multiplier")).unwrap_or(1.0);
