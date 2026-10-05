@@ -66,9 +66,10 @@ const BOMB_PAD: f32 = crate::combat::BOMB.0;
 const RAM_PAD: f32 = 4.0;
 const RAM_SPEED: f32 = 6.0;
 const SPEED_FADE: f32 = 12.0;
-/// Seconds an objective message stays up, and a tutorial line.
+/// Seconds an objective message stays up. A tutorial line stays until
+/// the scripts take it down or put up another (their tutorial manager
+/// shows one with no time of its own: round 96).
 const MESSAGE_TIME: f32 = 6.0;
-const TUTORIAL_TIME: f32 = 10.0;
 /// The scripts' vehicles are loaded within this far of the player, metres,
 /// and at most this many in play at once (wrecks and those they removed
 /// don't count).
@@ -87,7 +88,7 @@ pub struct MissionView {
     pub status: Option<String>,
     /// The objectives to do, readable.
     pub objectives: Vec<String>,
-    /// The tutorial line up, readable (for [`TUTORIAL_TIME`] seconds).
+    /// The tutorial line up, readable.
     pub tutorial: Option<String>,
     /// Markers over targets: where, what, colour (RGBA).
     pub markers: Vec<(Vec3, String, [u8; 4])>,
@@ -172,8 +173,8 @@ pub struct MissionLink {
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
-    /// The tutorial line up (readable), and its age (seconds).
-    tutorial: Option<(String, f32)>,
+    /// The tutorial line up, readable.
+    tutorial: Option<String>,
     /// Blasts since the scripts last ran, and support strikes' bombs.
     blasts: Vec<Vec3>,
     bombs: Vec<Vec3>,
@@ -182,6 +183,8 @@ pub struct MissionLink {
     completed: Option<f32>,
     /// The speed of the vehicle she drives, held a little (m/s).
     speed: f32,
+    /// The keys tutorial lines name.
+    keys: crate::input::Bindings,
 }
 
 /// The scripts' vehicles in play.
@@ -263,7 +266,13 @@ impl MissionLink {
             vehicles: Fleet::default(),
             completed: None,
             speed: 0.0,
+            keys: Default::default(),
         }
+    }
+
+    /// Tutorial lines name these keys (else the usual ones).
+    pub fn with_keys(self, keys: crate::input::Bindings) -> Self {
+        Self { keys, ..self }
     }
 
     fn write(&mut self, lines: impl IntoIterator<Item = String>) {
@@ -389,9 +398,6 @@ impl MissionLink {
             eprintln!("mission: posted {name:?}, {waiting} script events waiting for it");
             mission.post(name);
         }
-        if let Some((_, age)) = &mut self.tutorial {
-            *age += dt;
-        }
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {
@@ -498,8 +504,8 @@ impl MissionLink {
                     self.completed = Some(0.0);
                 }
             }
-            if let Some(line) = tutorial(mission) {
-                self.tutorial = line.map(|t| (t, 0.0));
+            if let Some(line) = tutorial(mission, &self.keys) {
+                self.tutorial = line;
             }
             break_props(game, mission);
             let w = mission.world().borrow();
@@ -824,11 +830,7 @@ impl MissionLink {
             .collect();
         MissionView {
             status: None,
-            tutorial: self
-                .tutorial
-                .as_ref()
-                .filter(|t| t.1 < TUTORIAL_TIME)
-                .map(|t| t.0.clone()),
+            tutorial: self.tutorial.clone(),
             objectives,
             markers,
             message,
@@ -1021,18 +1023,17 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
     world.index.spawns.iter().any(|s| s.entity == guid)
 }
 
-/// Breaks the state layers' models whose objects the scripts' world has
-/// dead (a gate blown up), and takes down those it no longer has.
 /// The scripts' newest tutorial line since the last call, if they asked
-/// for one: its text, readable, or none if they cleared it. Each call is
-/// logged with its arguments (what each is for isn't known yet).
-fn tutorial(mission: &Mission) -> Option<Option<String>> {
+/// for one: its text, readable, with the keys it names as `keys` has them
+/// (`[P] Open PDA`), or none if they cleared it. Each call is logged with
+/// its arguments.
+fn tutorial(mission: &Mission, keys: &crate::input::Bindings) -> Option<Option<String>> {
     let calls = std::mem::take(&mut mission.world().borrow_mut().hud.tutorials);
     for args in &calls {
         eprintln!("mission: tutorial line {args:?}");
     }
     let args = calls.last()?;
-    Some(m2_game::hud::tutorial_text(args).map(|t| mission.text(t)))
+    Some(m2_game::hud::tutorial_text(args).map(|t| crate::input::name_keys(&mission.text(t), keys)))
 }
 
 /// The scripts' free support items, given her or taken back.
@@ -1065,7 +1066,10 @@ fn support_item(game: &mut Game, c: &Command) {
     }
 }
 
+/// Breaks the state layers' models whose objects the scripts' world has
+/// dead (a gate blown up), and takes down those it no longer has.
 fn break_props(game: &mut Game, mission: &Mission) {
+    let blast = game.combat.last_blast;
     let scene = &mut game.scene;
     let Some(world) = &mut scene.world else {
         return;
@@ -1084,10 +1088,16 @@ fn break_props(game: &mut Game, mission: &Mission) {
         (dead, gone)
     };
     drop(w);
+    let mut fires = Vec::new();
     for e in dead {
-        scene.props.wreck(&mut world.physics, e);
+        scene.props.wreck(&mut world.physics, e, blast);
+        fires.extend(scene.props.breakup_points(e));
     }
     scene.props.hide(&mut world.physics, gone);
+    // What broke apart burns where its break-up says.
+    for at in fires {
+        game.combat.blaze(&world.physics, at);
+    }
 }
 
 /// Starts the helicopter a delivery's pilot flies (an `Ai.Deliver` order)

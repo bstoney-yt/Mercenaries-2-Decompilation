@@ -450,6 +450,7 @@ impl Game {
                 }
             }
             knock_loose(world, &mut self.scene.props, &self.scene.vehicles);
+            self.scene.props.advance(dt);
             self.spray_wait -= dt;
             if self.spray_wait <= 0.0 {
                 self.spray_wait = SPRAY_GAP;

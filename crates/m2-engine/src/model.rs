@@ -257,6 +257,11 @@ pub struct CpuModel {
     /// [`PartStates`](m2_assets::model::PartStates)). Empty when the model
     /// switches nothing.
     pub hidden: [Vec<bool>; 2],
+    /// How it breaks apart when destroyed outright, for those who want
+    /// it ([`Breakup::of`](crate::Breakup::of)): neither
+    /// [`from_data`](Self::from_data) nor [`build`](Self::build) works it
+    /// out (the island's thousands of models have no use for it).
+    pub breakup: Option<std::sync::Arc<crate::Breakup>>,
 }
 
 /// The collision of one building of a merged batch (a `TINY` model).
@@ -362,6 +367,7 @@ impl CpuModel {
             collision: None,
             members: Vec::new(),
             hidden,
+            breakup: None,
         }
     }
 
@@ -501,6 +507,18 @@ impl GpuModel {
             .iter()
             .filter(|p| at(p, flying) || !at(p, hidden))
         {
+            match piece.node.and_then(|n| nodes.get(usize::from(n))) {
+                Some(&m) if piece.bones.is_empty() => Self::push_at(queue, piece, world * m, None),
+                _ => Self::push(queue, piece, world, None),
+            }
+        }
+    }
+
+    /// As [`draw_moved`](Self::draw_moved), only the pieces on nodes
+    /// `flying` marks (a broken prop's, the rest of it gone).
+    pub fn draw_flying(&self, queue: &mut DrawQueue, world: Mat4, nodes: &[Mat4], flying: &[bool]) {
+        let marked = |p: &Piece| flying.get(usize::from(p.at)).copied().unwrap_or(false);
+        for piece in self.pieces.iter().filter(|p| marked(p)) {
             match piece.node.and_then(|n| nodes.get(usize::from(n))) {
                 Some(&m) if piece.bones.is_empty() => Self::push_at(queue, piece, world * m, None),
                 _ => Self::push(queue, piece, world, None),

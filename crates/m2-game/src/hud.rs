@@ -111,7 +111,17 @@ pub fn readable(text: &str) -> String {
     render_with(text, |_| None)
 }
 
+/// Line by line: the scripts join texts with line breaks, and the table's
+/// own texts break with `[n]`. Lines left empty go.
 fn render_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    text.split('\n')
+        .map(|line| render_line(line, &lookup))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_line(text: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find('[') {
@@ -127,7 +137,7 @@ fn render_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
         if let Some(found) = lookup(id) {
             let found = found.trim();
             if !found.is_empty() {
-                out.push(found.to_owned());
+                out.push(found.replace("[n]", "\n"));
             }
             continue;
         }
@@ -383,6 +393,21 @@ mod tests {
             ),
             "Objective completed: VzaCon001 objective 2"
         );
+    }
+
+    #[test]
+    fn line_breaks_stay() {
+        let mut table = StringTable::default();
+        for (id, text) in [("Test.First", "[pda] One[n]two"), ("Test.Second", "Three")] {
+            table
+                .strings
+                .insert(m2_assets::name_hash(id), text.to_owned());
+        }
+        assert_eq!(
+            render("[Test.First]\n[Test.Second]\n", &table),
+            "[pda] One\ntwo\nThree"
+        );
+        assert_eq!(readable("[Test.First]\n[Test.Second]"), "First\nSecond");
     }
 
     #[test]
