@@ -260,6 +260,8 @@ pub struct Haze {
     /// `E * dirLightColor * ScatteringTermMultiplier.x`; the clouds' sun
     /// is divided by it, so they keep their colour.
     pub sun_tint: Option<Vec3>,
+    /// Surfaces take the sun's brightness without its hue.
+    pub grey_sun: bool,
 }
 
 impl Default for Haze {
@@ -275,6 +277,7 @@ impl Default for Haze {
             mie_height: 1200.0,
             layers: None,
             sun_tint: None,
+            grey_sun: false,
         }
     }
 }

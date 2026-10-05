@@ -215,6 +215,8 @@ struct FrameUniforms {
     haze_layers: [f32; 4],
     /// x: the cloud deck's reach for the air in front of it (0: none).
     deck: [f32; 4],
+    /// x: surfaces take the sun's brightness without its hue.
+    surface: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -1771,6 +1773,7 @@ impl WgpuBackend {
                 let tint = l.haze.sun_tint.unwrap_or(Vec3::splat(-1.0));
                 [l.clouds.reach.unwrap_or(0.0), tint.x, tint.y, tint.z]
             },
+            surface: [if l.haze.grey_sun { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
