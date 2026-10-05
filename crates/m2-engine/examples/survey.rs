@@ -1867,7 +1867,7 @@ fn phy2_words<R: Read + Seek>(
     }
     const SHOWS: [&str; 4] = ["both", "intact", "wrecked", "neither"];
     /// How the alpha knocks the model loose: its pieces (node, kg), and
-    /// whether it falls to its wreck.
+    /// whether it breaks into them.
     fn loose_of<R: Read + Seek>(source: &mut AssetSource<R>, h: u32) -> Option<String> {
         let data = source.model(h).ok()?;
         let cpu = m2_engine::CpuModel::from_data(&data, 0).ok()?;
@@ -1882,8 +1882,8 @@ fn phy2_words<R: Read + Seek>(
             .collect();
         Some(format!(
             "{} ({}), {:.1} kg in all",
-            if loose.wrecks {
-                "falls to its wreck's pieces"
+            if loose.breaks {
+                "breaks into its pieces"
             } else {
                 "goes as one"
             },
@@ -1999,11 +1999,11 @@ fn phy2_words<R: Read + Seek>(
     let mut shape_shows = [[0usize; 2]; 4];
     let mut body_shows = [[0usize; 2]; 4];
     let (mut wrecks, mut moving_wrecks) = (0, 0);
-    // Placed models the alpha knocks loose: as one, to wreck pieces.
+    // Placed models the alpha knocks loose: as one, into pieces.
     let (mut as_one, mut to_pieces) = (0, 0);
     for &h in &models {
         match loose_of(source, h) {
-            Some(l) if l.starts_with("falls") => to_pieces += 1,
+            Some(l) if l.starts_with("breaks") => to_pieces += 1,
             Some(_) => as_one += 1,
             None => {}
         }
@@ -2088,7 +2088,7 @@ fn phy2_words<R: Read + Seek>(
     };
     println!("over {} placed models' PHY2:", models.len());
     println!("{wrecks} models with PHY2 have a wreck, {moving_wrecks} of them a body that moves");
-    println!("knocked loose: {as_one} models go as one, {to_pieces} fall to their wreck's pieces");
+    println!("knocked loose: {as_one} models go as one, {to_pieces} break into their pieces");
     for (what, counts) in [("shapes", shape_shows), ("bodies", body_shows)] {
         for (i, [fixed, moving]) in counts.iter().enumerate() {
             println!(
