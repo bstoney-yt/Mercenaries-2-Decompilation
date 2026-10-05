@@ -459,19 +459,25 @@ impl Atmosphere {
             // night island and sea came to footage's brightness and hue
             // (rounds J and I). `M2_EXT_SUN=off` leaves it out, `=norm`
             // takes it over its brightest channel, `=luma` over its
-            // luminance.
+            // luminance, and a number takes it that far from white.
             sun_tint: {
                 let c = self.light_color.max(Vec3::ZERO);
                 match std::env::var("M2_EXT_SUN").as_deref() {
                     Ok("off") => None,
                     Ok("norm") => Some(c / c.max_element().max(1e-3)),
                     Ok("luma") => Some(c / c.dot(Vec3::new(0.2126, 0.7152, 0.0722)).max(1e-3)),
-                    _ => Some(c),
+                    Ok(v) => match v.parse::<f32>() {
+                        Ok(s) => Some(Vec3::ONE.lerp(c, s)),
+                        Err(_) => Some(c),
+                    },
+                    Err(_) => Some(c),
                 }
             },
-            // `M2_SUN_HUE=grey` lights surfaces by the sun's brightness
-            // alone, its hue coming in once, through the tint above.
-            grey_sun: env_is("M2_SUN_HUE", "grey"),
+            // Surfaces are lit by the sun's brightness alone, its hue
+            // coming in once, through the tint above: with the hue twice
+            // the road's sunlit patches came out orange (PC round G, S .53
+            // against .42). `M2_SUN_HUE=colour` lights them by its colour.
+            grey_sun: !env_is("M2_SUN_HUE", "colour"),
             ..Haze::default()
         }
     }
