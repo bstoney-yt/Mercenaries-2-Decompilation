@@ -36,7 +36,7 @@ use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
 use crate::config::Config;
-use crate::flights::Load;
+use crate::flights::{Copter, Load};
 use crate::game::{Game, get_out, place};
 use crate::scene::NOT_DRIVABLE;
 
@@ -844,7 +844,9 @@ fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
                 let w = mission.world().borrow();
                 let copter = w.objects.get(guid).and_then(|o| o.vehicle).unwrap_or(*guid);
                 w.objects.get(&copter).map(|o| {
-                    let model = templates.get(&o.name).and_then(|t| t.model);
+                    let template = templates.get(&o.name);
+                    let model = template.and_then(|t| t.model);
+                    let bank = template.and_then(|t| t.engine);
                     let mut loads: Vec<Load> = w
                         .winch
                         .iter()
@@ -863,21 +865,33 @@ fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
                         })
                         .collect();
                     loads.sort_by_key(|l| l.guid);
-                    (copter, o.name.clone(), Vec3::from(o.position), model, loads)
+                    let copter = Copter {
+                        guid: copter,
+                        pilot: *guid,
+                        model,
+                        bank,
+                    };
+                    (copter, o.name.clone(), Vec3::from(o.position), loads)
                 })
             };
             match flight {
-                Some((copter, name, from, model, loads)) => {
+                Some((copter, name, from, loads)) => {
                     eprintln!(
                         "mission: {name} flies a delivery from {from:.1} to {:.1}, model {}, \
-                         carrying {:?}",
+                         sound bank {}, carrying {:?}",
                         Vec3::from(*to),
-                        model.map_or("unknown".to_owned(), |m| format!("{m:08x}")),
+                        copter
+                            .model
+                            .map_or("unknown".to_owned(), |m| format!("{m:08x}")),
+                        copter.bank.map_or("none".to_owned(), |b| format!(
+                            "{b:08x} {}",
+                            crate::sound::bank_name(b).unwrap_or("?")
+                        )),
                         loads
                     );
                     game.scene
                         .flights
-                        .start(copter, *guid, model, loads, from, Vec3::from(*to));
+                        .start(copter, loads, from, Vec3::from(*to));
                 }
                 None => mission.arrived(*guid, *to),
             }

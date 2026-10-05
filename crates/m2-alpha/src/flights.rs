@@ -95,12 +95,23 @@ enum Phase {
     Leaving,
 }
 
+/// A delivery's helicopter: the scripts' object and its pilot, its model
+/// and the sound bank its template names, if known.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Copter {
+    pub guid: u32,
+    pub pilot: u32,
+    pub model: Option<u32>,
+    pub bank: Option<u32>,
+}
+
 /// A helicopter on a delivery.
 #[derive(Debug)]
 struct Flight {
     copter: u32,
     pilot: u32,
     model: Option<u32>,
+    bank: Option<u32>,
     /// Hanging from its winch; let go at the drop point.
     loads: Vec<Load>,
     /// The drop point: the ground there.
@@ -164,18 +175,15 @@ impl std::fmt::Debug for Flights {
 }
 
 impl Flights {
-    /// Starts helicopter `copter` (model `model`, if known), flown by
-    /// `pilot`, from `from` facing `yaw` to the drop point `to` (on the
-    /// ground) with `loads` on its winch.
-    pub fn start(
-        &mut self,
-        copter: u32,
-        pilot: u32,
-        model: Option<u32>,
-        loads: Vec<Load>,
-        from: Vec3,
-        to: Vec3,
-    ) {
+    /// Starts helicopter `copter` from `from` to the drop point `to` (on
+    /// the ground) with `loads` on its winch.
+    pub fn start(&mut self, copter: Copter, loads: Vec<Load>, from: Vec3, to: Vec3) {
+        let Copter {
+            guid: copter,
+            pilot,
+            model,
+            bank,
+        } = copter;
         for m in model
             .into_iter()
             .chain(loads.iter().filter_map(|l| l.model))
@@ -191,6 +199,7 @@ impl Flights {
             copter,
             pilot,
             model,
+            bank,
             loads,
             to,
             at: from,
@@ -245,10 +254,13 @@ impl Flights {
             .collect()
     }
 
-    /// The helicopters in the air, to be heard: each one's guid and where
-    /// it is.
-    pub fn sounding(&self) -> Vec<(u32, Vec3)> {
-        self.flights.iter().map(|f| (f.copter, f.at)).collect()
+    /// The helicopters in the air, to be heard: each one's guid, where it
+    /// is and its sound bank, if its template names one.
+    pub fn sounding(&self) -> Vec<(u32, Vec3, Option<u32>)> {
+        self.flights
+            .iter()
+            .map(|f| (f.copter, f.at, f.bank))
+            .collect()
     }
 
     /// Where the scripts' objects in flight are: each helicopter and its
@@ -570,6 +582,13 @@ fn wrap(a: f32) -> f32 {
 mod tests {
     use super::*;
 
+    const COPTER: Copter = Copter {
+        guid: 1,
+        pilot: 2,
+        model: None,
+        bank: None,
+    };
+
     #[test]
     fn a_delivery_flies_in_lets_go_over_the_drop_point_and_leaves() {
         let mut physics = Physics::new();
@@ -579,7 +598,7 @@ mod tests {
             guid: 3,
             model: None,
         };
-        flights.start(1, 2, None, vec![load], Vec3::new(0.0, 60.0, 0.0), to);
+        flights.start(COPTER, vec![load], Vec3::new(0.0, 60.0, 0.0), to);
         assert!(flights.flying(2));
         let dt = 1.0 / 60.0;
         let mut released = None;
@@ -647,9 +666,7 @@ mod tests {
             model: None,
         };
         flights.start(
-            1,
-            2,
-            None,
+            COPTER,
             vec![load],
             Vec3::new(0.0, 45.0, 0.0),
             Vec3::new(0.0, 0.0, 200.0),
