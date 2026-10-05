@@ -566,7 +566,7 @@ const REVERSE_SPEED: f32 = 8.0;
 /// speed, radians a second, from what speed, m/s; its top speed backing
 /// up and when its template gives none, m/s; and the most of its weight
 /// a wreck's buoyancy holds up (it sinks). All invented.
-const FLOAT_DEPTH: f32 = 0.35;
+pub const FLOAT_DEPTH: f32 = 0.35;
 const BOAT_PUSH: f32 = 5.0;
 const BOAT_COAST: f32 = 0.3;
 const BOAT_BRAKE: f32 = 1.2;

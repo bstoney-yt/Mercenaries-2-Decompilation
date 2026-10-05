@@ -763,8 +763,10 @@ impl Scene {
         spawn: (f32, f32),
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
-        let world = World::open(install, backend, &mut self.materials, settings)
+        let mut world = World::open(install, backend, &mut self.materials, settings)
             .context("indexing the island")?;
+        // Boats float on the sea.
+        world.physics.set_water(world.settings.sea_level);
         eprintln!(
             "island: {} cells, {} tiles, {} placed objects ({} by name), {} template placements (indexed in {:.1} s)",
             world.index.cells.len(),
