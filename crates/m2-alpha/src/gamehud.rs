@@ -24,6 +24,7 @@ use egui::{Color32, Mesh, TextureHandle, TextureOptions, pos2};
 use m2_assets::font::FONT_TYPE;
 use m2_assets::{Font, WadArchive, name_hash};
 use m2_engine::{AssetSource, Install};
+use m2_game::api::Object;
 use m2_game::events::guid_value;
 use m2_game::gui::Anchor;
 use m2_game::gui_runtime::{self, DrawItem, TextSpan};
@@ -39,19 +40,29 @@ use crate::game::Game;
 const FONTS: [&str; 2] = ["english_18", "english_20"];
 /// The player's guid as the scripts know her (`Sys.StringToGuid("0x1")`).
 const PLAYER: u32 = 1;
-/// Guids standing for her guns (`uNewCurrentGunGuid`): the scripts only
-/// ask their names.
-const RIFLE_GUID: u32 = 0x100;
-const RPG_GUID: u32 = 0x101;
-/// The ammo the counters show. The play never runs out: the rifle's clip
-/// counts down and starts again full; the stores stay as they are.
+/// Guids standing for her guns (`uNewCurrentGunGuid`): objects of the
+/// scripts' world, for the gun box shows `Object.GetLocalizedName` of it.
+/// Past the guids the scripts' world gives out (layer entities, templates,
+/// spawns, markers), so they name no other object.
+const RIFLE_GUID: u32 = 0x6000_0000;
+const RPG_GUID: u32 = 0x6000_0001;
+/// The guns' names, as the game's English strings write them.
+const RIFLE_NAME: &str = "Assault Rifle";
+const RPG_NAME: &str = "RPG";
+/// The ammo the counters show. The play never runs out: the rifle's clip,
+/// the rockets stored and the grenades count down and start again full;
+/// the rifle's store stays as it is.
 const RIFLE_CLIP: u32 = 30;
 const RIFLE_STORED: u32 = 240;
 const RPG_STORED: u32 = 4;
 const GRENADES: u32 = 4;
-/// The weapons' icons in the HUD's atlas (`uNewCurrentGun`).
+/// The weapons' icons (`uNewCurrentGun`): textures of their own, as the
+/// game names them (`weapons_*`).
 const RIFLE_ICON: &str = "weapons_assault_rifle";
-const RPG_ICON: &str = "weapons_rocket_launcher";
+const RPG_ICON: &str = "weapons_rpg";
+/// Their reticles (`uReticleTexture`), `reticle_*` by the kind of round.
+const RIFLE_RETICLE: &str = "reticle_bullets";
+const RPG_RETICLE: &str = "reticle_rockets";
 /// Seconds a message stays in the message buffer.
 const MESSAGE_SECONDS: f64 = 6.0;
 /// Seconds of play the scripts are given at most per frame.
@@ -71,10 +82,13 @@ pub struct HudState {
     pub in_vehicle: bool,
     pub weapon: Weapon,
     pub fired: Fired,
-    /// The vehicle she is in, readable.
+    /// The label of the vehicle she is in.
     pub vehicle: Option<String>,
-    /// Hurts since the last state: damage and the direction it came from
-    /// in degrees clockwise from where the camera looks.
+    /// Which way the camera looks, degrees, growing as it turns left
+    /// (`Player.GetCameraXZHeading`).
+    pub heading: f32,
+    /// Hurts since the last state: damage and the bearing it came from
+    /// (see [`direction`]).
     pub hurts: Vec<(f32, f32)>,
     /// Messages for the message buffer since the last state.
     pub messages: Vec<String>,
@@ -89,12 +103,11 @@ impl HudState {
             .and_then(|p| p.driving)
             .and_then(|i| game.scene.vehicles.get(i));
         let at = player.map(|p| p.character.position);
-        let yaw = game.camera.yaw;
         let hurts = game
             .combat
             .take_hurts()
             .into_iter()
-            .map(|(damage, from)| (damage, direction(at, yaw, from)))
+            .map(|(damage, from)| (damage, direction(at, from)))
             .collect();
         Self {
             hp: match vehicle {
@@ -105,7 +118,8 @@ impl HudState {
             in_vehicle: vehicle.is_some(),
             weapon: game.combat.weapon,
             fired: game.combat.fired,
-            vehicle: vehicle.map(|v| readable_vehicle(&v.spec.label)),
+            vehicle: vehicle.map(|v| v.spec.label.clone()),
+            heading: game.camera.yaw.to_degrees(),
             hurts,
             ..Self::default()
         }
@@ -128,10 +142,14 @@ impl HudState {
     }
 }
 
-/// Degrees clockwise (seen from above) from the camera's heading `yaw`
-/// to `from`, as seen from `at`; 0 ahead, 90 to the right. 0 when either
-/// is unknown.
-fn direction(at: Option<Vec3>, yaw: f32, from: Option<Vec3>) -> f32 {
+/// The bearing of `from` seen from `at`, as `GuiPlayerReceiveDamage`
+/// takes it: degrees that, added to the camera's heading
+/// ([`HudState::heading`]), give how far clockwise on screen from straight
+/// ahead the hit arc points (`MrxGuiHudDamageIndicator` turns the arc to
+/// direction + heading each frame; its art points up unturned). With
+/// headings growing as the camera turns left, the bearing grows the other
+/// way: 0 towards +z, 90 towards -x. 0 when either is unknown.
+fn direction(at: Option<Vec3>, from: Option<Vec3>) -> f32 {
     let (Some(at), Some(from)) = (at, from) else {
         return 0.0;
     };
@@ -139,14 +157,29 @@ fn direction(at: Option<Vec3>, yaw: f32, from: Option<Vec3>) -> f32 {
     if d.x.abs() + d.z.abs() < 1e-3 {
         return 0.0;
     }
-    // Yaw grows turning left (forward is (sin yaw, 0, cos yaw)).
-    let left = d.x.atan2(d.z) - yaw;
-    (-left).to_degrees().rem_euclid(360.0)
+    // Heading grows turning left: forward is (sin h, 0, cos h).
+    (-d.x.atan2(d.z)).to_degrees().rem_euclid(360.0)
 }
 
-/// `"global_veh_hondacrx"` as `"hondacrx"`.
-fn readable_vehicle(label: &str) -> String {
-    label.trim_start_matches("global_veh_").replace('_', " ")
+/// What the vehicle box shows for a vehicle label: its name, and its
+/// faction as the game's guid for it (`SetVehicleName(name, faction)`
+/// picks the faction's icon; none shows the PMC's). Labels start with the
+/// faction (`"vz_veh_truck_m151"` is the VZ's `"truck m151"`).
+fn vehicle_name(label: &str) -> (String, Option<u32>) {
+    let (faction, name) = label.split_once("_veh_").unwrap_or(("", label));
+    // `MrxGuiHudVehicleDisguise.Init`'s faction guids.
+    let guid = match faction {
+        "al" => Some(0xbbc3_4ef4),
+        "ch" => Some(0x4135_9cce),
+        "oc" => Some(0xe947_b797),
+        "gr" => Some(0xb10d_73ce),
+        "pr" => Some(0xc182_15fe),
+        "pmc" => Some(0x30e4_a26f),
+        "civ" => Some(0xdcc8_b14d),
+        "vz" => Some(0xb442_0059),
+        _ => None,
+    };
+    (name.replace('_', " "), guid)
 }
 
 /// A textured (or, without texture, plain) quad in points: corners
@@ -262,12 +295,14 @@ impl GameHud {
         }
         self.last_message = message.cloned();
         let (done, line) = message?;
+        // The game's own words ("Objective added:"), which the text
+        // widget looks up.
         let head = if *done {
-            "Objective complete"
+            "[objective.Objectivecompleted]"
         } else {
-            "New objective"
+            "[objective.Objectiveadded]"
         };
-        Some(format!("{head}: {line}"))
+        Some(format!("{head} {line}"))
     }
 
     /// Sends this frame's state and takes in what the thread has drawn.
@@ -479,6 +514,13 @@ impl Thread {
                 s.set_font(name, f.clone());
             }
         }
+        // Her guns, for the gun box to name.
+        {
+            let mut world = mission.world().borrow_mut();
+            for (guid, name) in [(RIFLE_GUID, RIFLE_NAME), (RPG_GUID, RPG_NAME)] {
+                world.insert(guid, Object::new(name, [0.0; 3]));
+            }
+        }
         // As the player-character module does; her guid is userdata, or
         // the scripts never own the widgets and no event reaches them.
         mission
@@ -554,6 +596,12 @@ impl Thread {
             }
             let t = table(lua, [("nX", Value::Integer(0)), ("nY", Value::Integer(0))])?;
             fire(lua, "GuiReticlePositionChange", t)?;
+            // Nothing under the reticle (target 0, no health): the target
+            // health arc, opaque as laid out, fades away.
+            fire(lua, "GuiReticleUpdate", 0)?;
+        }
+        if let Some(screen) = gui_runtime::screen(lua) {
+            screen.borrow_mut().set_camera_heading(s.heading);
         }
         let hp = (s.hp.round() as i32, s.in_vehicle);
         if self.told.hp != Some(hp) {
@@ -562,23 +610,37 @@ impl Thread {
         }
         if self.told.vehicle.as_ref() != Some(&s.vehicle) {
             self.told.vehicle = Some(s.vehicle.clone());
-            let name = match &s.vehicle {
-                Some(n) => Value::String(lua.create_string(n)?),
-                None => Value::Boolean(false),
+            let (name, faction) = match &s.vehicle {
+                Some(label) => {
+                    let (name, faction) = vehicle_name(label);
+                    (
+                        Value::String(lua.create_string(name)?),
+                        faction.map_or(Value::Nil, guid_value),
+                    )
+                }
+                None => (Value::Boolean(false), Value::Nil),
             };
-            fire(lua, "GuiVehicleNameUpdate", (name, Value::Nil))?;
+            fire(lua, "GuiVehicleNameUpdate", (name, faction))?;
         }
         if self.told.weapon != Some(s.weapon) {
             self.told.weapon = Some(s.weapon);
-            let (icon, guid) = match s.weapon {
-                Weapon::Rifle => (RIFLE_ICON, RIFLE_GUID),
-                Weapon::Rpg => (RPG_ICON, RPG_GUID),
+            let (icon, guid, reticle) = match s.weapon {
+                Weapon::Rifle => (RIFLE_ICON, RIFLE_GUID, RIFLE_RETICLE),
+                Weapon::Rpg => (RPG_ICON, RPG_GUID, RPG_RETICLE),
             };
+            // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
+            // without a type it leaves the reticle as it was. No target
+            // health type: that bar shows only on a target.
             let t = table(
                 lua,
                 [
                     ("uNewCurrentGun", Value::String(lua.create_string(icon)?)),
                     ("uNewCurrentGunGuid", guid_value(guid)),
+                    ("sReticleType", Value::String(lua.create_string("Normal")?)),
+                    (
+                        "uReticleTexture",
+                        Value::String(lua.create_string(reticle)?),
+                    ),
                     ("bReticleCrosshair", Value::Boolean(true)),
                 ],
             )?;
@@ -656,15 +718,16 @@ impl Thread {
 /// Clip, in the clip, stored, grenades, grenades stored: as
 /// `GuiAmmoUpdate` takes them.
 fn ammo(weapon: Weapon, fired: Fired) -> [u32; 5] {
+    let grenades = GRENADES - fired.grenades % GRENADES;
     match weapon {
         Weapon::Rifle => [
             RIFLE_CLIP,
             RIFLE_CLIP - fired.rifle % RIFLE_CLIP,
             RIFLE_STORED,
-            GRENADES,
+            grenades,
             0,
         ],
-        Weapon::Rpg => [1, 1, RPG_STORED, GRENADES, 0],
+        Weapon::Rpg => [1, 1, RPG_STORED - fired.rockets % RPG_STORED, grenades, 0],
     }
 }
 
@@ -765,32 +828,58 @@ fn text(
 mod tests {
     use super::*;
 
-    #[test]
-    fn hurts_come_from_the_side_they_came_from() {
-        let at = Some(Vec3::ZERO);
-        // Looking down +z (yaw 0): +x is to the left (yaw grows turning
-        // left, forward is (sin yaw, 0, cos yaw), right is -x).
-        let ahead = direction(at, 0.0, Some(Vec3::Z));
-        let left = direction(at, 0.0, Some(Vec3::X));
-        let right = direction(at, 0.0, Some(-Vec3::X));
-        let behind = direction(at, 0.0, Some(-Vec3::Z));
-        assert!(ahead.abs() < 0.01 || (ahead - 360.0).abs() < 0.01);
-        assert!((right - 90.0).abs() < 0.01, "{right}");
-        assert!((behind - 180.0).abs() < 0.01, "{behind}");
-        assert!((left - 270.0).abs() < 0.01, "{left}");
-        assert_eq!(direction(None, 0.0, Some(Vec3::X)), 0.0);
+    /// Where on screen the hit arc shows, clockwise from straight ahead:
+    /// `HandleUpdateEvent` turns it by direction + heading, from the top
+    /// where its art points.
+    fn arc(heading: f32, from: Vec3) -> f32 {
+        (direction(Some(Vec3::ZERO), Some(from)) + heading).rem_euclid(360.0)
     }
 
     #[test]
-    fn the_rifle_clip_counts_down_and_refills() {
-        let fired = |rifle| Fired {
-            rifle,
-            ..Fired::default()
+    fn hurts_come_from_the_side_they_came_from() {
+        let near = |a: f32, b: f32| {
+            let d = (a - b).rem_euclid(360.0);
+            !(0.01..=359.99).contains(&d)
         };
-        assert_eq!(ammo(Weapon::Rifle, fired(0))[1], 30);
-        assert_eq!(ammo(Weapon::Rifle, fired(29))[1], 1);
-        assert_eq!(ammo(Weapon::Rifle, fired(30))[1], 30);
-        assert_eq!(ammo(Weapon::Rpg, fired(7))[..3], [1, 1, RPG_STORED]);
+        // Looking down +z (heading 0): +x is to the left (heading grows
+        // turning left, forward is (sin h, 0, cos h), right is -x).
+        assert!(near(arc(0.0, Vec3::Z), 0.0));
+        assert!(near(arc(0.0, -Vec3::X), 90.0), "{}", arc(0.0, -Vec3::X));
+        assert!(near(arc(0.0, -Vec3::Z), 180.0));
+        assert!(near(arc(0.0, Vec3::X), 270.0));
+        // Turned left to look down +x, what was on the left is ahead and
+        // what was ahead is on the right.
+        assert!(near(arc(90.0, Vec3::X), 0.0), "{}", arc(90.0, Vec3::X));
+        assert!(near(arc(90.0, Vec3::Z), 90.0), "{}", arc(90.0, Vec3::Z));
+        assert_eq!(direction(None, Some(Vec3::X)), 0.0);
+    }
+
+    #[test]
+    fn counters_count_down_and_refill() {
+        let fired = |rifle, rockets, grenades| Fired {
+            rifle,
+            rockets,
+            grenades,
+        };
+        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 0))[1], 30);
+        assert_eq!(ammo(Weapon::Rifle, fired(29, 0, 0))[1], 1);
+        assert_eq!(ammo(Weapon::Rifle, fired(30, 0, 0))[1], 30);
+        assert_eq!(ammo(Weapon::Rpg, fired(0, 0, 0))[..3], [1, 1, RPG_STORED]);
+        assert_eq!(ammo(Weapon::Rpg, fired(0, 1, 0))[2], RPG_STORED - 1);
+        assert_eq!(ammo(Weapon::Rpg, fired(0, 4, 0))[2], RPG_STORED);
+        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 1))[3], GRENADES - 1);
+    }
+
+    #[test]
+    fn vehicles_are_named_with_their_faction() {
+        assert_eq!(
+            vehicle_name("vz_veh_truck_m151"),
+            ("truck m151".to_owned(), Some(0xb442_0059))
+        );
+        assert_eq!(
+            vehicle_name("global_veh_68valiant"),
+            ("68valiant".to_owned(), None)
+        );
     }
 
     #[test]
