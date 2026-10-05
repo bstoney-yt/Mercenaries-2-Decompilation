@@ -111,6 +111,9 @@ pub struct Widget {
     pub children: Vec<u32>,
     pub visible: bool,
     pub sleeping: bool,
+    /// Taken off the screen by `ActivateWidget(id, false)` (as
+    /// `WidgetManager.RemoveWidget` does): neither drawn nor updated.
+    pub inactive: bool,
     /// The box as last set on this widget, and its parent's box then:
     /// the widget's box now is this mapped from that to the parent's box
     /// now.
@@ -157,6 +160,7 @@ impl Widget {
             children: Vec::new(),
             visible: true,
             sleeping: false,
+            inactive: false,
             own: [0.0; 4],
             parent_ref: None,
             colour: [255.0; 4],
@@ -197,6 +201,9 @@ pub enum DrawItem {
         colour: [f32; 4],
         rect: [f32; 4],
         rotation: f32,
+        /// Only the wedge from the centre between these angles shows
+        /// (`SetImagePieSliceRender`): degrees clockwise from straight up.
+        pie: Option<[f32; 2]>,
     },
     /// An image widget without a texture: a filled rectangle.
     Fill {
@@ -223,8 +230,20 @@ pub enum DrawItem {
         swf: Option<String>,
         rect: [f32; 4],
     },
-    /// The minimap's place.
-    Minimap { widget: u32, rect: [f32; 4] },
+    /// The minimap: its circle's box, and what the scripts last told it
+    /// (`MinimapUpdate`, `MinimapSetRange`). The map itself is the
+    /// engine's to draw.
+    Minimap {
+        widget: u32,
+        rect: [f32; 4],
+        /// Where the player is (world x, y, z), if told.
+        player: Option<[f32; 3]>,
+        /// The rotation passed on with it, as the host sent it in
+        /// `GuiMinimapUpdate`.
+        rotation: f32,
+        /// Metres from the centre to the rim, if set.
+        range: Option<f32>,
+    },
     /// A video's place.
     Movie {
         widget: u32,
@@ -456,6 +475,7 @@ impl Screen {
         for w in self.widgets.values() {
             if let Some(cb) = w.update
                 && !w.sleeping
+                && !w.inactive
             {
                 due.push((cb, vec![f64::from(dt)]));
             }
@@ -496,7 +516,7 @@ impl Screen {
     pub fn spans(&self, text: &str) -> Vec<TextSpan> {
         let mut out = vec![TextSpan::default()];
         self.expand(text, &mut out, 0);
-        out.retain(|s| !s.text.is_empty());
+        out.retain(|s| !s.text.is_empty() || s.icon.is_some());
         out
     }
 
@@ -521,8 +541,20 @@ impl Screen {
                 push(out, "\n");
             } else if let Some(c) = colour_name(id).filter(|_| parts.len() == 1) {
                 out.push(TextSpan {
-                    text: String::new(),
                     colour: Some(c),
+                    ..TextSpan::default()
+                });
+            } else if let Some(icon) = inline_icon(id).filter(|_| parts.len() == 1) {
+                // In the colour so far, which goes on after it.
+                let colour = out.last().and_then(|s| s.colour);
+                out.push(TextSpan {
+                    colour,
+                    icon: Some(icon.to_owned()),
+                    ..TextSpan::default()
+                });
+                out.push(TextSpan {
+                    colour,
+                    ..TextSpan::default()
                 });
             } else if let Some(template) = self.lookup(id).filter(|_| depth < 8) {
                 let args: Vec<String> = parts[1..]
@@ -619,7 +651,7 @@ impl Screen {
             let Some(w) = self.widgets.get(&id) else {
                 continue;
             };
-            if !w.visible || w.sleeping {
+            if !w.visible || w.sleeping || w.inactive {
                 continue;
             }
             let c = self.correction(id, width, height);
@@ -643,6 +675,7 @@ impl Screen {
                             colour,
                             rect,
                             rotation: w.rotation,
+                            pie: pie(w),
                         });
                     }
                     None => out.push(DrawItem::Fill {
@@ -660,6 +693,7 @@ impl Screen {
                             colour,
                             rect,
                             rotation: w.rotation,
+                            pie: None,
                         });
                     }
                 }
@@ -682,7 +716,23 @@ impl Screen {
                     swf: w.swf.clone(),
                     rect,
                 }),
-                Kind::Minimap => out.push(DrawItem::Minimap { widget: id, rect }),
+                Kind::Minimap => {
+                    let call = |name: &str| {
+                        w.minimap_calls
+                            .get(name)
+                            .map(|v| v.iter().map(|s| s.parse::<f32>().ok()).collect::<Vec<_>>())
+                    };
+                    // (centre x, y, player x, y, z, focus x, y, z, rotation).
+                    let update = call("MinimapUpdate").unwrap_or_default();
+                    let at = |i: usize| update.get(i).copied().flatten();
+                    out.push(DrawItem::Minimap {
+                        widget: id,
+                        rect,
+                        player: at(2).zip(at(3)).zip(at(4)).map(|((x, y), z)| [x, y, z]),
+                        rotation: at(8).unwrap_or(0.0),
+                        range: call("MinimapSetRange").and_then(|r| r.first().copied().flatten()),
+                    });
+                }
                 Kind::Movie => out.push(DrawItem::Movie {
                     widget: id,
                     file: w.movie.clone(),
@@ -705,6 +755,9 @@ pub struct TextSpan {
     pub text: String,
     /// RGB, 0..=1.
     pub colour: Option<[f32; 3]>,
+    /// An inline icon in its place instead of text: the texture, a line
+    /// high and square, tinted by the colour.
+    pub icon: Option<String>,
 }
 
 /// The length of the bracketed token `s` starts with, nested brackets
@@ -782,8 +835,39 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
         "blue" => rgb(64, 144, 255),
         "grey" | "gray" => rgb(160, 160, 160),
         "black" => rgb(0, 0, 0),
+        // Objectives' colours, as `MrxGuiInterface.tObjectiveMessageConfigs`
+        // gives them in hex beside the words (FFC800, 33CC99).
+        "objt" => rgb(0xff, 0xc8, 0x00),
+        "2ndobjt" => rgb(0x33, 0xcc, 0x99),
         _ => return None,
     })
+}
+
+/// The texture an inline icon word stands for (`MrxUtil.tInlineIcons`:
+/// `[objdeliver]`, and `[objdeliver2]` for secondary objectives), by the
+/// objective icon textures' names (`HUD_objective_deliverable`...).
+fn inline_icon(word: &str) -> Option<&'static str> {
+    let w = word.to_ascii_lowercase();
+    Some(match w.strip_suffix('2').unwrap_or(&w) {
+        "objaction" => "HUD_objective_action",
+        "objoutpost" => "HUD_objective_outpost",
+        "objdeliver" => "HUD_objective_deliverable",
+        "objdestroy" => "HUD_objective_destroy",
+        "objdefend" => "HUD_objective_defend",
+        "objverify" => "HUD_objective_verify",
+        _ => return None,
+    })
+}
+
+/// An image's pie slice, as `SetImagePieSliceRender(id, from, to)` gives
+/// it: `MrxGuiHudReticle` cuts the target-health ring to 130..230 (centred
+/// on 180, under the reticle as footage shows it) and shortens it from the
+/// first end as health falls.
+fn pie(w: &Widget) -> Option<[f32; 2]> {
+    match w.pie_slice.as_deref() {
+        Some([from, to, ..]) => Some([*from, *to]),
+        _ => None,
+    }
 }
 
 /// The texture rectangle of a sprite's current frame: frames left to
@@ -1147,7 +1231,14 @@ natives! {
         s.delete(a.id(0));
         Ok(MultiValue::new())
     },
-    "ActivateWidget" => |_, _, _| Ok(MultiValue::new()),
+    "ActivateWidget" => |s, _, a| {
+        // `WidgetManager.AddWidget` activates, `RemoveWidget` deactivates.
+        let active = a.get(1).is_none_or(|v| !matches!(v, Value::Nil | Value::Boolean(false)));
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.inactive = !active;
+        }
+        Ok(MultiValue::new())
+    },
     "SetWidgetVisible" => |s, _, a| {
         s.set_visible(a.id(0), a.truthy(1));
         Ok(MultiValue::new())
@@ -1553,12 +1644,19 @@ natives! {
     "MinimapUpdate" => |s, _, a| record_minimap(s, "MinimapUpdate", a),
     "MinimapAddObjective" => |s, _, a| record_minimap(s, "MinimapAddObjective", a),
     "MinimapRemoveObjective" => |s, _, a| record_minimap(s, "MinimapRemoveObjective", a),
-    "MinimapCreate" => |s, _, a| {
-        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
-            w.kind = Kind::Minimap;
-            w.minimap = Some(a.texts(1));
+    // (x, y, radius, texture, texture width, height, horizontal and
+    // vertical anchor, world x min, max, z min, max): makes the minimap,
+    // its circle centred on (x, y), and answers its id
+    // (`MinimapWidget:SetUpMinimap`).
+    "MinimapCreate" => |s, l, a| {
+        let id = s.create(Kind::Minimap, String::new());
+        let (x, y, r) = (a.f(0).unwrap_or(0.0), a.f(1).unwrap_or(0.0), a.f(2).unwrap_or(0.0));
+        s.set_rect(id, [x - r, y - r, x + r, y + r]);
+        if let Some(w) = s.widgets.get_mut(&id) {
+            w.anchors = (anchor_of(a.get(6)), anchor_of(a.get(7)));
+            w.minimap = Some(a.texts(0));
         }
-        Ok(MultiValue::new())
+        ret(l, id)
     },
 }
 
@@ -1751,6 +1849,67 @@ mod tests {
         assert_eq!(*rect, [1200.0 - 150.0, 75.0, 1200.0 - 15.0, 105.0]);
         assert!((size - 0.5).abs() < 1e-6);
         assert_eq!(*justification, Anchor::End);
+    }
+
+    #[test]
+    fn objective_messages_have_their_colour_and_icon() {
+        let s = Screen::default();
+        let spans = s.spans("[objt][objdeliver] Go");
+        let yellow = Some([1.0, 200.0 / 255.0, 0.0]);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert_eq!(spans[0].icon.as_deref(), Some("HUD_objective_deliverable"));
+        assert_eq!(spans[0].colour, yellow);
+        assert_eq!((spans[1].text.as_str(), spans[1].colour), (" Go", yellow));
+        assert_eq!(s.display_text("[2ndobjt][objverify2] x"), " x");
+    }
+
+    #[test]
+    fn the_minimap_is_made_and_told_where_the_player_is() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            map = G.MinimapCreate(534, 386, 50, "VZ", 2800, 2800, "left", "top",
+                -4096, 4096, -4096, 4096)
+            assert(type(map) == "number")
+            G.MinimapUpdate(map, 534, 386, 10, 2, -30, 10, 2, -30, 45)
+            G.MinimapSetRange(map, 150)
+            "#,
+        );
+        let items = screen.borrow().draw_list(640.0, 480.0);
+        let [
+            DrawItem::Minimap {
+                rect,
+                player,
+                rotation,
+                range,
+                ..
+            },
+        ] = items.as_slice()
+        else {
+            panic!("{items:?}");
+        };
+        assert_eq!(*rect, [484.0, 336.0, 584.0, 436.0]);
+        assert_eq!(*player, Some([10.0, 2.0, -30.0]));
+        assert_eq!((*rotation, *range), (45.0, Some(150.0)));
+    }
+
+    #[test]
+    fn removed_widgets_neither_draw_nor_update() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            img = G.CreateImageWidget()
+            G.SetWidgetLocation(img, 0, 0, 10, 10)
+            G.ActivateWidget(img, false)
+            "#,
+        );
+        assert!(screen.borrow().draw_list(640.0, 480.0).is_empty());
+        run(&host, "_GuiInternal.ActivateWidget(img, true)");
+        assert_eq!(screen.borrow().draw_list(640.0, 480.0).len(), 1);
     }
 
     #[test]

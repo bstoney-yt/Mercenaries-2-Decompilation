@@ -709,6 +709,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // What the player controls: the vehicle she rides, else herself (the
+    // hit arcs size a hit by its maximum health).
+    add(&player, "GetControlledObject", |w, _, a| {
+        let p = id(a.first()).or(w.player);
+        values([guid_value(p.map(|p| w.vehicle_of(p).unwrap_or(p)))])
+    })?;
+    // Whether her vehicle passes for the enemy's: the play has no
+    // disguises, so the vehicle box shows no disguise meter.
+    add(&player, "GetVehicleDisguise", |_, _, _| {
+        values([Value::Boolean(false)])
+    })?;
     // One player slot; the game creates the player itself.
     add(&player, "GetMaximumPlayers", |_, _, _| {
         values([Value::Integer(1)])
