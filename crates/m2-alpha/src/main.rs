@@ -1125,6 +1125,14 @@ fn mission_for_screenshot(
         };
         game.step(intent, tick);
         link.tick(game, tick);
+        // Lost (round 88 went on 40 minutes at NaN): nothing more to see.
+        if auto.is_some() && !game.focus().is_finite() {
+            eprintln!(
+                "autoplay: her position is not a number after {:.1} s of play: stopping",
+                i as f32 * tick
+            );
+            break;
+        }
         if i % every == 0 {
             render(backend, game, fov, aspect, None)?;
         }
