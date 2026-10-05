@@ -2,18 +2,20 @@
 //! the markers the scripts put up, shoots the soldiers and blows up the
 //! things they mark, gets into the vehicles they bring and drives on, all
 //! with a player's moves: an [`Intent`] a tick, as the keyboard and mouse
-//! give. What she does is logged, so a run shows whether the mission can
-//! be played through and where she got stuck. Where she makes no headway
-//! for a while she hops ahead (logged too): the run goes on to the later
-//! objectives, and the hops show where the way is blocked.
+//! give. She goes the way planned round walls, the sea and ground too
+//! steep ([`Route`]). What she does is logged, so a run shows whether the
+//! mission can be played through and where she got stuck. Where she makes
+//! no headway for a while she hops ahead (logged too): the run goes on to
+//! the later objectives, and the hops show where the way is blocked.
 
 use m2_engine::{Physics, VehicleId};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
 use crate::combat::{Combat, Trigger, Weapon};
 use crate::game::{Game, place};
-use crate::mission::Mark;
+use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
+use crate::route::{Mover, Route};
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
@@ -84,6 +86,30 @@ const PRESS_GAP: f32 = 1.5;
 /// Fallen this far under the ground (metres: a hole where the island
 /// hadn't streamed in yet), she is put back on it.
 const UNDER: f32 = 5.0;
+/// From further than this from a place (metres), she goes the way planned
+/// to it ([`Route`]): in cells this size on foot and driving (metres),
+/// over ground up to this steep on foot, on wheels and on tracks; planned
+/// again every this long (seconds: the island streams in as she goes),
+/// when the place moves this far or she strays this far off it (metres).
+/// She heads for a point this far on along it, plus this many seconds at
+/// her speed, at most this (metres); taken to run at this speed (m/s).
+const PLAN_FROM: f32 = 25.0;
+const FOOT_CELL: f32 = 2.0;
+const DRIVE_CELL: f32 = 4.0;
+const ON_FOOT: f32 = 40f32.to_radians();
+const ON_WHEELS: f32 = 22f32.to_radians();
+const ON_TRACKS: f32 = 27f32.to_radians();
+const REPLAN: f32 = 20.0;
+const REPLAN_MOVED: f32 = 5.0;
+const STRAYED: f32 = 15.0;
+const LOOK_AHEAD: f32 = 5.0;
+const LOOK_TIME: f32 = 0.6;
+const LOOK_MOST: f32 = 20.0;
+const RUN: f32 = 6.0;
+/// A way planned this much longer than the straight one is logged, at
+/// most every this long (seconds).
+const ROUNDABOUT: f32 = 1.15;
+const LOG_WAY: f32 = 30.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
 
@@ -110,6 +136,15 @@ impl Goal {
             _ => false,
         }
     }
+}
+
+/// The way she is going ([`Route`]): when it was planned, and whether
+/// for driving.
+#[derive(Debug)]
+struct Way {
+    route: Route,
+    planned: f32,
+    driving: bool,
 }
 
 /// The player playing herself.
@@ -149,6 +184,9 @@ pub struct Autoplay {
     pressed: f32,
     /// Getting out of the vehicle she is stuck in, to go on on foot.
     leave: bool,
+    /// The way she is going, and when a roundabout one was last logged.
+    way: Option<Way>,
+    way_logged: f32,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
     /// The objectives last logged.
@@ -206,6 +244,7 @@ impl Autoplay {
             self.sidestep = None;
             self.reversing = None;
             self.stalled = 0.0;
+            self.way = None;
         }
         self.goal = chosen.map(|c| c.0);
         if let (Some(Goal::Reach { target, .. }), Some(t)) = (&self.goal, self.arrived)
@@ -439,10 +478,10 @@ impl Autoplay {
             return Intent::default();
         };
         let d = (at - here).with_y(0.0).length();
-        if self.headway(game, at, d) {
+        let mut target = self.waypoint(game, None, here, at, RUN);
+        if self.headway(game, at, self.left_to_go(here, at)) {
             return Intent::default();
         }
-        let mut target = at;
         if d < arrive || self.arrived.is_some() {
             let since = *self.arrived.get_or_insert(self.clock);
             if self.clock - since < CIRCLE_AFTER {
@@ -487,7 +526,8 @@ impl Autoplay {
         }
         let pos = m.w_axis.truncate();
         let d = (at - pos).with_y(0.0).length();
-        if self.headway(game, at, d) {
+        let toward = self.waypoint(game, Some(i), pos, at, speed);
+        if self.headway(game, at, self.left_to_go(pos, at)) {
             return Intent::default();
         }
         if d < arrive.max(6.0) {
@@ -497,7 +537,7 @@ impl Autoplay {
                 ..Intent::default()
             };
         }
-        let (angle, _) = heading_to(m, at);
+        let (angle, _) = heading_to(m, toward);
         // Round what stands in the way.
         let angle = match (
             game.scene.world.as_ref(),
@@ -677,8 +717,9 @@ impl Autoplay {
         }
     }
 
-    /// At a target from vehicle `i`: a tank's cannon fires at it from
-    /// within range; from anything else she gets out close to it.
+    /// At a target from vehicle `i`: a cannon (a tank's, the Stryker's)
+    /// fires at it from within range; from anything else she gets out
+    /// close to it.
     fn at_target_driving(&mut self, game: &mut Game, i: usize, target: Vec3, dt: f32) -> Intent {
         let Some((m, speed)) = vehicle_state(game, i) else {
             return Intent::default();
@@ -686,7 +727,7 @@ impl Autoplay {
         let Some(v) = game.scene.vehicles.get(i) else {
             return Intent::default();
         };
-        let cannon = v.spec.kind == "tank" && v.spec.muzzle.is_some();
+        let cannon = v.spec.cannon();
         let d = target.distance(m.w_axis.truncate());
         if !cannon {
             if d < GET_OUT {
@@ -757,6 +798,98 @@ impl Autoplay {
         self.walk(game, door, 1.0, dt)
     }
 
+    /// Where to head for on her way to `at` from `pos` (driving vehicle
+    /// `driving`, or on foot), going `speed` (m/s): along the way planned
+    /// to it ([`Route`]), planned again as said at [`PLAN_FROM`]; straight
+    /// at it from within that.
+    fn waypoint(
+        &mut self,
+        game: &Game,
+        driving: Option<usize>,
+        pos: Vec3,
+        at: Vec3,
+        speed: f32,
+    ) -> Vec3 {
+        let straight = (at - pos).with_y(0.0).length();
+        if straight < PLAN_FROM {
+            self.way = None;
+            return at;
+        }
+        let stale = self.way.as_ref().is_none_or(|w| {
+            w.driving != driving.is_some()
+                || w.route.goal.distance(at) > REPLAN_MOVED
+                || self.clock - w.planned > REPLAN
+        });
+        if stale && let Some(world) = game.scene.world.as_ref() {
+            let mover = match driving.and_then(|i| game.scene.vehicles.get(i)) {
+                Some(v) => Mover {
+                    cell: DRIVE_CELL,
+                    steepest: if v.spec.tracked { ON_TRACKS } else { ON_WHEELS },
+                    wades: false,
+                    skip: v.id,
+                },
+                None => Mover {
+                    cell: FOOT_CELL,
+                    steepest: ON_FOOT,
+                    wades: true,
+                    skip: None,
+                },
+            };
+            let sea = world.settings.sea_level.max(WATERLINE);
+            let route = Route::plan(&world.physics, mover, pos, at, sea);
+            if (!route.reaches || route.length() > straight * ROUNDABOUT)
+                && self.clock - self.way_logged > LOG_WAY
+            {
+                self.way_logged = self.clock;
+                let how = if route.reaches {
+                    format!(
+                        "goes round: {:.0} m, not {straight:.0} m straight",
+                        route.length()
+                    )
+                } else {
+                    format!(
+                        "is not found: as close as {:.0} m",
+                        route.remaining(route.points[route.points.len() - 1])
+                    )
+                };
+                eprintln!(
+                    "autoplay {:.1} s: the way to {} from {pos:.0} {how}, by {} points",
+                    self.clock,
+                    self.what,
+                    route.points.len()
+                );
+            }
+            // Headway is measured along the new way from here on.
+            let left = route.remaining(pos);
+            if left > self.best.0 + 1.0 {
+                self.best.0 = left;
+            }
+            self.way = Some(Way {
+                route,
+                planned: self.clock,
+                driving: driving.is_some(),
+            });
+        }
+        let Some(way) = &mut self.way else {
+            return at;
+        };
+        let ahead = (LOOK_AHEAD + speed.abs() * LOOK_TIME).min(LOOK_MOST);
+        let (toward, off) = way.route.steer(pos, ahead);
+        if off > STRAYED {
+            self.way = None;
+        }
+        toward
+    }
+
+    /// How far she has still to go from `pos` to `at`, metres: along her
+    /// way, else straight.
+    fn left_to_go(&self, pos: Vec3, at: Vec3) -> f32 {
+        self.way.as_ref().map_or_else(
+            || (at - pos).with_y(0.0).length(),
+            |w| w.route.remaining(pos),
+        )
+    }
+
     /// The use key, once a [`PRESS_GAP`]: stopped first when driving.
     fn press(&mut self, speed: f32) -> Intent {
         if speed.abs() > 1.0 {
@@ -776,9 +909,9 @@ impl Autoplay {
         }
     }
 
-    /// Keeps track of how close she has come to `at` (`d` metres off):
-    /// short of headway she sidesteps and jumps, long short of it she
-    /// hops ahead (true then: nothing more this tick).
+    /// Keeps track of how close she has come to `at` (`d` metres off, on
+    /// her way): short of headway she sidesteps and jumps, long short of it
+    /// she hops ahead (true then: nothing more this tick).
     fn headway(&mut self, game: &mut Game, at: Vec3, d: f32) -> bool {
         if d < self.best.0 - 1.0 {
             self.best = (d, self.clock);
@@ -795,7 +928,8 @@ impl Autoplay {
                 .player
                 .as_ref()
                 .is_some_and(|p| p.driving.is_some());
-            if driving && d < RIDE_FOR {
+            let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
+            if driving && near {
                 eprintln!(
                     "autoplay {:.1} s: no headway driving for {stuck:.0} s, {d:.0} m off: getting out",
                     self.clock
@@ -804,7 +938,10 @@ impl Autoplay {
                 self.best = (f32::INFINITY, self.clock);
                 return false;
             }
-            self.hop(game, at, stuck);
+            // Ahead along her way.
+            let from = game.focus();
+            let to = self.way.as_mut().map_or(at, |w| w.route.steer(from, HOP).0);
+            self.hop(game, to, stuck);
             return true;
         }
         if stuck > STUCK && self.sidestep.is_none() && (stuck % STUCK) < 0.05 {
@@ -862,6 +999,7 @@ impl Autoplay {
         self.best = (f32::INFINITY, self.clock);
         self.sidestep = None;
         self.reversing = None;
+        self.way = None;
     }
 
     /// Fallen through a hole in the island (it hadn't streamed in under
@@ -1120,8 +1258,8 @@ fn aim(p: &Player, target: Vec3, dt: f32) -> (Vec2, f32) {
 }
 
 /// Why a vehicle may be stuck: its speed, how it sits (nose up, rolled),
-/// how many wheels touch, what is just ahead of its bumper and how the
-/// ground rises ahead.
+/// how many wheels touch, what is just ahead of its bumper, how the
+/// ground rises ahead and what its body touches (where on the model).
 pub(crate) fn stuck_report(
     world: &m2_engine::World,
     id: m2_engine::VehicleId,
@@ -1167,14 +1305,28 @@ pub(crate) fn stuck_report(
             _ => format!("? at {k} m"),
         })
         .collect();
+    // What its body touches, where on the model.
+    let to_model = m.inverse();
+    let touching: Vec<String> = physics
+        .vehicle_touching(id)
+        .iter()
+        .map(|&(key, at)| {
+            format!(
+                "{} at {:.1}",
+                crate::static_name(world, key),
+                to_model.transform_point3(at)
+            )
+        })
+        .collect();
     format!(
-        "{:.1} m/s{}, nose {:+.0} deg, rolled {:+.0} deg, {down} of {wheels} wheels down; ahead [{}]; ground [{}]",
+        "{:.1} m/s{}, nose {:+.0} deg, rolled {:+.0} deg, {down} of {wheels} wheels down; ahead [{}]; ground [{}]; body touching [{}]",
         physics.vehicle_speed(id),
         if reversing { " backing out" } else { "" },
         forward.y.clamp(-1.0, 1.0).asin().to_degrees(),
         right.y.clamp(-1.0, 1.0).asin().to_degrees(),
         ahead.join("; "),
-        rises.join(", ")
+        rises.join(", "),
+        touching.join("; ")
     )
 }
 

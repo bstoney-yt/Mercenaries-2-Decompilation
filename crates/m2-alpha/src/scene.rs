@@ -454,6 +454,10 @@ pub const NOT_DRIVABLE: [&str; 13] = [
 /// Vehicles parked by the spawn: one of each drivable kind first.
 const PARKED: usize = 8;
 
+/// The state layers' models load for props this much further away than
+/// they are drawn, metres.
+const PROP_MARGIN: f32 = 200.0;
+
 /// Person models loaded: the soldiers the spawn names ask for, then
 /// civilians.
 const ARMY: [&str; 3] = ["vz_hum_soldier", "vz_hum_soldierelite", "vz_hum_deathsquad"];
@@ -900,12 +904,15 @@ impl Scene {
             self.load_character(model, template);
         }
         if let (Some(world), Some(source)) = (&mut self.world, &mut self.source) {
+            // As far as they are drawn, and a little more.
+            let reach = world.settings.object_distance + PROP_MARGIN;
             self.props.update(
                 backend,
                 &mut self.materials,
                 source,
                 &mut world.physics,
                 eye,
+                reach,
             )?;
         }
         Ok(())

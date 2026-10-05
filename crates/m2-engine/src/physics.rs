@@ -702,6 +702,58 @@ impl Physics {
             })
     }
 
+    /// What a vehicle's body is in contact with (its wheels' contacts
+    /// aside): each static's key (`None` for anything else solid, such as
+    /// another vehicle) with the deepest point of contact on the body,
+    /// world space. To find what holds a stuck vehicle.
+    pub fn vehicle_touching(&self, id: VehicleId) -> Vec<(Option<StaticKey>, Vec3)> {
+        let Some(body) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &c in body.colliders() {
+            let Some(own) = self.world.colliders.get(c) else {
+                continue;
+            };
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let first = pair.collider1 == c;
+                let other = if first {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let Some(deepest) = pair
+                    .manifolds()
+                    .iter()
+                    .flat_map(|m| &m.points)
+                    .min_by(|a, b| a.dist.total_cmp(&b.dist))
+                else {
+                    continue;
+                };
+                let local = if first {
+                    deepest.local_p1
+                } else {
+                    deepest.local_p2
+                };
+                let key = self
+                    .statics
+                    .iter()
+                    .find(|(_, h)| **h == other)
+                    .map(|(k, _)| *k);
+                out.push((key, vec3(own.position().transform_point(local))));
+            }
+        }
+        out
+    }
+
     /// A vehicle's velocity, m/s.
     pub fn vehicle_velocity(&self, id: VehicleId) -> Vec3 {
         self.vehicles
