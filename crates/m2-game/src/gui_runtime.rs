@@ -252,6 +252,8 @@ pub struct Screen {
     /// Where the player aims, -1..=1 across the screen and up it
     /// (`Gui.GetReticlePosition`).
     reticle: [f32; 2],
+    /// Which way the camera looks, degrees (`Player.GetCameraXZHeading`).
+    heading: f32,
 }
 
 impl Screen {
@@ -261,6 +263,15 @@ impl Screen {
     /// with `{ nX, nY }` too when it moves.
     pub fn set_reticle(&mut self, x: f32, y: f32) {
         self.reticle = [x, y];
+    }
+
+    /// Sets which way the camera looks, as `Player.GetCameraXZHeading`
+    /// answers: degrees about the vertical, growing as it turns left. The
+    /// hit arcs turn by it each frame (`MrxGuiHudDamageIndicator` draws an
+    /// arc at the damage's direction plus this), so they stay on whoever
+    /// fired as the camera turns; widgets turn clockwise by their rotation.
+    pub fn set_camera_heading(&mut self, degrees: f32) {
+        self.heading = degrees;
     }
 
     /// A widget by id.
@@ -570,7 +581,10 @@ impl Screen {
     }
 
     /// The correction of the widget's nearest corrected ancestor (itself
-    /// included).
+    /// included). A widget never corrected draws in the virtual screen
+    /// centred on the screen: as a centre-anchored one does, so a widget
+    /// the scripts make later and place where a corrected one is (the hit
+    /// arcs over the reticle) lands on it.
     fn correction(&self, id: u32, width: f32, height: f32) -> Correction {
         let scale = height / VIRTUAL_SIZE.1;
         let mut at = Some(id);
@@ -591,7 +605,10 @@ impl Screen {
         }
         Correction {
             scale,
-            offset: [0.0; 2],
+            offset: [
+                (width - VIRTUAL_SIZE.0 * scale) / 2.0,
+                (height - VIRTUAL_SIZE.1 * scale) / 2.0,
+            ],
         }
     }
 
@@ -803,7 +820,21 @@ fn map_rect(r: [f32; 4], from: [f32; 4], to: [f32; 4]) -> [f32; 4] {
 }
 
 /// The anchor a script names (`left`, `center`, `right`, `top`, `bottom`).
+/// An anchor as `Widget:SetAnchoring` passes it (-1 left or top, 0 centre,
+/// 1 right or bottom), or a justification's name.
 fn anchor_of(v: Option<&Value>) -> Anchor {
+    let n = match v {
+        Some(Value::Integer(i)) => Some(*i as f64),
+        Some(Value::Number(n)) => Some(*n),
+        _ => None,
+    };
+    if let Some(n) = n {
+        return match n {
+            n if n < 0.0 => Anchor::Start,
+            n if n > 0.0 => Anchor::End,
+            _ => Anchor::Centre,
+        };
+    }
     let Some(Value::String(s)) = v else {
         return Anchor::Start;
     };
@@ -1023,6 +1054,20 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
             ret(lua, (x, y))
         })?,
     )?;
+    // `Player.GetCameraXZHeading(owner)`, likewise in `Player`.
+    let player = match lua.globals().raw_get::<Value>("Player")? {
+        Value::Table(t) if t.metatable().is_none() => t,
+        _ => {
+            let t = lua.create_table()?;
+            lua.globals().raw_set("Player", &t)?;
+            t
+        }
+    };
+    let s = Rc::clone(&screen);
+    player.raw_set(
+        "GetCameraXZHeading",
+        safe_function(lua, move |lua, _| ret(lua, s.borrow().heading))?,
+    )?;
     lua.set_app_data(Rc::clone(&screen));
     Ok(screen)
 }
@@ -1154,7 +1199,14 @@ natives! {
     },
     "GetWidgetAnchoring" => |s, l, a| {
         let (h, v) = s.widget(a.id(0)).map_or((Anchor::Start, Anchor::Start), |w| w.anchors);
-        ret(l, (anchor_name(h, true), anchor_name(v, false)))
+        // As `SetWidgetAnchoring` takes them: `Widget:SetAnchoring` passes
+        // back what this answers for a side it is not given.
+        let n = |a| match a {
+            Anchor::Start => -1,
+            Anchor::Centre => 0,
+            Anchor::End => 1,
+        };
+        ret(l, (n(h), n(v)))
     },
     "CorrectWidgetForResolution" => |s, _, a| {
         // A widget with a parent moves with it: `MrxGuiBase` corrects every
@@ -1699,5 +1751,40 @@ mod tests {
         assert_eq!(*rect, [1200.0 - 150.0, 75.0, 1200.0 - 15.0, 105.0]);
         assert!((size - 0.5).abs() < 1e-6);
         assert_eq!(*justification, Anchor::End);
+    }
+
+    #[test]
+    fn anchors_come_as_numbers_and_uncorrected_widgets_centre() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            -- As `Widget:SetAnchoring("right", "top")` passes it.
+            right = G.CreateWidget()
+            G.SetWidgetLocation(right, 460, 40, 600, 110)
+            G.SetWidgetAnchoring(right, 1, -1)
+            local h, v = G.GetWidgetAnchoring(right)
+            assert(h == 1 and v == -1)
+            img = G.CreateImageWidget()
+            G.SetWidgetLocation(img, 460, 40, 600, 110)
+            G.AddWidgetChild(right, img)
+            G.CorrectWidgetForResolution(right)
+            -- Made later, never corrected, over the screen's middle.
+            late = G.CreateImageWidget()
+            G.SetWidgetLocation(late, 300, 220, 340, 260)
+            "#,
+        );
+        let s = screen.borrow();
+        let rects: Vec<[f32; 4]> = s
+            .draw_list(1280.0, 720.0)
+            .iter()
+            .map(|i| match i {
+                DrawItem::Fill { rect, .. } => *rect,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(rects[0], [1200.0 - 210.0, 60.0, 1200.0, 165.0]);
+        assert_eq!(rects[1], [640.0 - 30.0, 330.0, 640.0 + 30.0, 390.0]);
     }
 }
