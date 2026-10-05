@@ -48,6 +48,8 @@ const PATCH_SIZE: f32 = 100.0;
 /// One placed model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectPlacement {
+    /// The layer entity placing it.
+    pub entity: u32,
     pub model: u32,
     pub position: Vec3,
     pub rotation: Quat,
@@ -460,6 +462,7 @@ impl WorldIndex {
             for (&entity, model) in &models {
                 if let Some(p) = at(entity) {
                     self.objects.push(ObjectPlacement {
+                        entity,
                         model: *model,
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),
@@ -497,6 +500,7 @@ impl WorldIndex {
                     // Its name is a model.
                     (Some(h), _) if assets.models.contains(&h) => {
                         self.objects.push(ObjectPlacement {
+                            entity,
                             model: h,
                             position,
                             rotation,
@@ -528,6 +532,7 @@ impl WorldIndex {
                             model: Some(model), ..
                         }),
                     ) => self.objects.push(ObjectPlacement {
+                        entity,
                         model,
                         position,
                         rotation,
@@ -589,6 +594,7 @@ impl WorldIndex {
                 self.state_objects.insert(
                     entity,
                     ObjectPlacement {
+                        entity,
                         model,
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),

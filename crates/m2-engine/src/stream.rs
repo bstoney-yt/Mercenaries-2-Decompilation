@@ -395,6 +395,9 @@ pub struct World {
     objects: HashMap<(i32, i32), Vec<usize>>,
     /// Placed objects by model hash.
     by_model: HashMap<u32, Vec<usize>>,
+    /// Placed objects by the entity placing them, for the members of
+    /// merged batches.
+    by_entity: HashMap<u32, usize>,
     /// Ground materials by their textures and layer coordinates
     /// ([`ground_key`]).
     terrain_materials: HashMap<Vec<u32>, MaterialId>,
@@ -424,7 +427,9 @@ impl World {
         let loader = Loader::spawn(install, index.clone(), TextureLimits::default())?;
         let mut objects: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         let mut by_model: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut by_entity: HashMap<u32, usize> = HashMap::new();
         for (i, o) in index.objects.iter().enumerate() {
+            by_entity.insert(o.entity, i);
             objects
                 .entry(bucket(o.position.x, o.position.z))
                 .or_default()
@@ -444,6 +449,7 @@ impl World {
             scatter: HashMap::new(),
             objects,
             by_model,
+            by_entity,
             terrain_materials: HashMap::new(),
             sea,
             stats: WorldStats::default(),
@@ -675,6 +681,19 @@ impl World {
                                     );
                                 }
                             }
+                            if !m.tiny_members.is_empty()
+                                && std::env::var_os("M2_LOG_BATCHES").is_some()
+                            {
+                                let own = m
+                                    .tiny_members
+                                    .iter()
+                                    .filter(|e| self.by_entity.contains_key(e))
+                                    .count();
+                                eprintln!(
+                                    "batch {hash:08x}: {} members, {own} placed by their own models",
+                                    m.tiny_members.len()
+                                );
+                            }
                             Slot::Ready(GpuModel::upload(backend, materials, &m)?)
                         }
                         Ok(_) => Slot::Failed,
@@ -879,6 +898,20 @@ impl World {
                             frustum.sees(centre, (hi - lo).length() * 0.5)
                         }
                     {
+                        let at = Mat4::from_rotation_translation(o.rotation, o.position);
+                        if !m.tiny_members.is_empty() {
+                            // A merged batch stands in for its members
+                            // until their own models draw.
+                            let own = |k: u16| {
+                                m.tiny_members
+                                    .get(usize::from(k))
+                                    .and_then(|e| self.by_entity.get(e))
+                                    .is_some_and(|&j| j != i && self.member_drawn(j, eye))
+                            };
+                            m.draw_batch(queue, at, &own);
+                            drawn += 1;
+                            continue;
+                        }
                         let destroyed = self.destroyed.contains(&i);
                         if destroyed && !m.has_wreck() {
                             continue;
@@ -920,6 +953,24 @@ impl World {
             user: 0,
         });
         Ok(())
+    }
+
+    /// Whether placed object `i` is drawn by its own model from `eye` (in
+    /// range and loaded), whether or not it is in view.
+    fn member_drawn(&self, i: usize, eye: Vec3) -> bool {
+        let o = &self.index.objects[i];
+        let d = o.position.distance(eye);
+        let props = self.settings.prop_distance;
+        match self.models.get(&o.model) {
+            Some(Slot::Ready(m)) if m.tiny_members.is_empty() => {
+                if o.named {
+                    d <= draw_reach(m.bounds, props)
+                } else {
+                    d <= self.settings.object_distance
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Queues each clump mesh once, instanced at its instances in range
