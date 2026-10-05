@@ -5,7 +5,10 @@
 //! Three templates carry an `AtmosphereBase`: `Atmosphere` (its `Name`
 //! field `Default`, outdoors), `Atmosphere (interior)` (`PMC`) and
 //! `Will_atmospheres`. No placed entity names one, so the outdoor one is
-//! taken. Field names are the name hashes of the names below, found by
+//! taken. `Will_atmospheres` holds a record named `Default` too (with
+//! more bloom and the wind due along a diagonal), so the record is the
+//! one of the `Atmosphere` template ([`ATMOSPHERE_TEMPLATE`]) where there
+//! is one. Field names are the name hashes of the names below, found by
 //! hashing candidates; colours are `0xAARRGGBB` words whose alpha is not
 //! used (the `...Multiplier` fields scale them instead).
 //!
@@ -60,9 +63,14 @@ pub struct Atmosphere {
     pub wind: [f32; 2],
 }
 
+/// The template database id of the `Atmosphere` template, whose one
+/// record is the outdoor `Default`.
+pub const ATMOSPHERE_TEMPLATE: u32 = 0x9000_00cf;
+
 impl Atmosphere {
     /// The record whose `Name` field is `name` (`Default` outdoors), from
-    /// the template database `db`.
+    /// the template database `db`: of those, the [`ATMOSPHERE_TEMPLATE`]'s,
+    /// else the first.
     pub fn read(db: &Layer<'_>, name: &str) -> Option<Self> {
         let c = db.component("AtmosphereBase")?;
         let field = |rec: &[u8], field: &str| -> Option<u32> {
@@ -73,9 +81,14 @@ impl Atmosphere {
         };
         let float = |rec: &[u8], name: &str| field(rec, name).map(f32::from_bits);
         let records = c.records()?;
-        let (_, rec) = records
+        let named: Vec<&(u32, &[u8])> = records
             .iter()
-            .find(|(_, r)| field(r, "Name") == Some(name_hash(name)))?;
+            .filter(|(_, r)| field(r, "Name") == Some(name_hash(name)))
+            .collect();
+        let (_, rec) = named
+            .iter()
+            .find(|(id, _)| *id == ATMOSPHERE_TEMPLATE)
+            .or(named.first())?;
         let colour = |name: &str| {
             let v = field(rec, name)?;
             let scale = float(rec, &format!("{name}Multiplier")).unwrap_or(1.0);

@@ -35,7 +35,7 @@ use m2_assets::{Model, Ucfx};
 use m2_assets::model::MODEL_TYPE;
 
 use crate::assets::{AssetError, DecodedTexture, Install};
-use crate::model::{CpuModel, GpuModel, MaterialCache, MemberShape};
+use crate::model::{CpuModel, GpuModel, MaterialCache, MemberShape, flags};
 use crate::physics::{CollisionShape, Physics, StaticKey};
 use crate::scatter::{self, CellScatter};
 use crate::world::{self, TerrainMesh, TerrainSurface, WorldIndex};
@@ -731,6 +731,9 @@ impl World {
                         Ok(s) if !s.meshes.is_empty() => {
                             let mut clumps = Vec::with_capacity(s.meshes.len());
                             for m in s.meshes {
+                                if m.material.flags & flags::HIDDEN != 0 {
+                                    continue;
+                                }
                                 let material = materials.material(backend, &m.material)?;
                                 clumps.push(ClumpGpu {
                                     vertex_buffer: backend.create_vertex_buffer(
@@ -830,9 +833,15 @@ impl World {
                 .create_vertex_buffer(&mesh.vertex_desc(), Some(&mesh.vertices))?,
             index_buffer: backend
                 .create_index_buffer(&mesh.index_desc(), Some(&mesh.index_bytes()))?,
+            // Pieces whose material is never drawn (water masks and the
+            // like, as in models) are left out.
             ranges: mesh
                 .ranges
                 .iter()
+                .filter(|&&(_, _, s)| {
+                    !matches!(&mesh.surfaces[s],
+                        TerrainSurface::Surface(m) if m.flags & flags::HIDDEN != 0)
+                })
                 .map(|&(first, count, s)| (first, count, ids[s], materials.is_translucent(ids[s])))
                 .collect(),
             origin: mesh.origin,
