@@ -55,6 +55,14 @@ m2-alpha [options]
                          ahead) just before the picture, to see the hit arcs
   --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
                          (gl: the supply crate's grenade launcher)
+  --satellite <stage>    with --screenshot on foot: call a Satellite Guided
+                         Bomb on the spot 45 m ahead of her (the support
+                         key, the use key, the view steered over it and
+                         confirmed, the wheel pressed in each wedge); the
+                         picture through the satellite's view (view), with
+                         the timing wheel after the first press (wheel),
+                         or --fight-wait seconds (at least 0.8) after the
+                         bomb lands (bomb)
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --probe                with --screenshot: list what rays from where she
@@ -80,16 +88,20 @@ m2-alpha [options]
                          crosshair) instead of the game's own
   --autoplay             with --mission --screenshot: she plays the contract
                          herself by its markers (runs to places, shoots the
-                         marked soldiers, rockets the marked gates, takes
-                         the vehicles brought, going a way planned round
-                         walls, the sea and steep ground), logging how it
-                         goes, until it is done or --mission-seconds are up;
-                         each delivery is pictured beside the screenshot as
-                         its helicopter hovers (<out>-delivery1.ppm, ...)
-                         and once its load is down (-delivery1-down.ppm),
-                         and the start's boat five seconds after she is
-                         seated in it (-boat.ppm) and her three seconds
-                         after she gets out of it (-ashore.ppm)
+                         marked soldiers, calls a satellite bomb on the
+                         marked gates, takes the vehicles brought, going a
+                         way planned round walls, the sea and steep
+                         ground), logging how it goes, until it is done or
+                         --mission-seconds are up; each delivery is
+                         pictured beside the screenshot as its helicopter
+                         hovers (<out>-delivery1.ppm, ...) and once its
+                         load is down (-delivery1-down.ppm), the start's
+                         boat five seconds after she is seated in it
+                         (-boat.ppm), her three seconds after she gets out
+                         of it (-ashore.ppm), what each crate leaves
+                         (-pickup1.ppm, ...), the satellite's view as each
+                         timing wheel comes up (-satellite1.ppm, ...) and
+                         her view two seconds after each bomb (-bomb1.ppm)
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
@@ -98,6 +110,10 @@ Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
 Fighting (mouse captured): left button or F fires, right button aims,
 1 rifle, 2 rocket launcher, G throws a grenade, B or the middle button
 bashes (a supply crate breaks open).
+Support: T opens the support menu, and E takes up the item's designator
+and looks through the satellite: WASD or the mouse moves its view, fire
+or E confirms, and fire or E as the timing wheel's marker passes through
+each grey wedge sends the bomb. T, 1 or 2 calls it off; so does being hurt.
 V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
 M music on/off, Tab or right mouse captures the mouse, N next gait
 (--model), F11 fullscreen, F3 culling, F5 quick save, F9 quick load,

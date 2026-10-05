@@ -1267,10 +1267,14 @@ impl Scene {
             let body = player.model_matrix();
             model.draw_posed(backend, queue, body, &nodes, &skin)?;
             // Throwing, her weapon is put away and the grenade is in her
-            // hand until it goes.
+            // hand until it goes; calling a support strike, the
+            // designator is. Her rifle is the carbine (soldiers' the
+            // AK47).
             let weapon = match (player.throwing, fight.weapon) {
+                _ if fight.designator => &self.arsenal.designator,
                 (Some(_), _) if fight.grenade_in_hand() => &self.arsenal.grenade,
                 (Some(_), _) => &None,
+                (None, Weapon::Rifle) if self.arsenal.carbine.is_some() => &self.arsenal.carbine,
                 (None, Weapon::Rifle) => &self.arsenal.rifle,
                 (None, Weapon::Rpg) => &self.arsenal.rpg,
                 (None, Weapon::GrenadeLauncher) => &self.arsenal.launcher,
@@ -1282,7 +1286,7 @@ impl Scene {
                     body,
                     &nodes,
                     (self.arsenal.hand, self.arsenal.attach),
-                    rig.two_handed,
+                    rig.two_handed && !fight.designator,
                 )
             {
                 w.model.draw(queue, at);

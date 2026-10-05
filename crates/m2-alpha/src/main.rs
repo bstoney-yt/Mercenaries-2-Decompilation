@@ -53,6 +53,7 @@ mod save;
 mod scene;
 mod sound;
 mod startup;
+mod support;
 mod ui;
 
 use std::collections::HashSet;
@@ -150,6 +151,10 @@ struct Options {
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
     hurt: Vec<f32>,
+    /// With `--screenshot` on foot: call a Satellite Guided Bomb on the
+    /// spot ahead of her, the picture through the satellite's view, with
+    /// the timing wheel up, or after the bomb lands.
+    satellite: Option<SatelliteShot>,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
@@ -168,6 +173,20 @@ struct Options {
     screenshot: Option<PathBuf>,
     write_config: bool,
 }
+
+/// How far a `--satellite` call goes with the bomb.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SatelliteShot {
+    /// Looking through the satellite, over the spot.
+    View,
+    /// The timing wheel, after the first press.
+    Wheel,
+    /// The bomb landed.
+    Bomb,
+}
+
+/// A `--satellite` call's spot lies this far ahead of her, metres.
+const SATELLITE_AHEAD: f32 = 45.0;
 
 fn parse_args() -> anyhow::Result<Options> {
     let mut o = Options::default();
@@ -286,6 +305,14 @@ fn parse_args() -> anyhow::Result<Options> {
                 })
             }
             "--closeup" => o.closeup = true,
+            "--satellite" => {
+                o.satellite = Some(match value()?.as_str() {
+                    "view" => SatelliteShot::View,
+                    "wheel" => SatelliteShot::Wheel,
+                    "bomb" => SatelliteShot::Bomb,
+                    v => bail!("--satellite {v}: expected view, wheel or bomb"),
+                })
+            }
             "--grip" => {
                 o.hands_grip = match value()?.as_str() {
                     "attach" => false,
@@ -751,7 +778,19 @@ fn screenshot(
             out,
         )?);
     }
-    if options.fight && game.on_foot && game.scene.player.is_some() {
+    if let Some(stage) = options
+        .satellite
+        .filter(|_| game.on_foot && game.scene.player.is_some())
+    {
+        satellite_for_screenshot(
+            &mut backend,
+            &mut game,
+            fov,
+            aspect,
+            stage,
+            options.fight_wait,
+        )?;
+    } else if options.fight && game.on_foot && game.scene.player.is_some() {
         fight_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
     } else if options.blast && game.on_foot && game.scene.player.is_some() {
         blast_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
@@ -816,6 +855,7 @@ fn screenshot(
                 throw: options.throw && i == 180 - lead,
                 melee: options.bash && i == 180 - lead,
                 select: options.weapon.filter(|_| i == 0),
+                ..combat::Trigger::default()
             };
             game.step(
                 Intent {
@@ -900,6 +940,25 @@ fn screenshot(
     write_ppm(&backend, out)?;
     eprintln!("wrote {}", out.display());
     Ok(())
+}
+
+/// Draws a frame with the HUD (and the mission's objectives) and writes
+/// it to `out` as a binary PPM.
+fn hud_picture(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    link: &mission::MissionLink,
+    fov: f32,
+    aspect: f32,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    let (w, h) = backend.size();
+    let mut hud = ui::Hud::new();
+    let mut settings = config::Config::default();
+    let info = hud_info(game, Some(link), fov, aspect);
+    let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
+    render(backend, game, fov, aspect, Some(&mut hud))?;
+    write_ppm(backend, out)
 }
 
 /// Writes the frame just rendered offscreen as a binary PPM.
@@ -1210,6 +1269,14 @@ fn mission_for_screenshot(
     let mut opened: HashSet<(u32, u32)> = HashSet::new();
     // When to picture each, which, and its number.
     let mut pickup_shots: Vec<(u32, (u32, u32), usize)> = Vec::new();
+    // And the satellite's view as the timing wheel comes up for each
+    // call (`-satelliteN`), and her own view two seconds after each bomb
+    // lands (`-bombN`), both with the HUD: whether the wheel was up, the
+    // pictures taken and those due (tick, number).
+    let mut wheel_up = false;
+    let mut satellite_shots = 0;
+    let mut bombs = 0;
+    let mut bomb_shots: Vec<(u32, usize)> = Vec::new();
     // The clips' sound events met, by category and name: how many hers,
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
@@ -1350,6 +1417,43 @@ fn mission_for_screenshot(
                         Some(m) => format!("{m:08x} not loaded: not drawn"),
                         None => "none".into(),
                     }
+                );
+            }
+            let timing = matches!(game.support.phase, support::Phase::Timing { .. });
+            if timing && !wheel_up {
+                satellite_shots += 1;
+                let path = picture(format!("satellite{satellite_shots}"));
+                hud_picture(backend, game, &link, fov, aspect, &path)?;
+                eprintln!(
+                    "autoplay: pictured the satellite's view over {:.1} from her at {:.1}: {}",
+                    game.support.looking().unwrap_or_default(),
+                    game.focus(),
+                    path.display()
+                );
+            }
+            wheel_up = timing;
+            if game
+                .support
+                .landed
+                .iter()
+                .any(|l| matches!(l, support::Impact::Bomb(_)))
+            {
+                bombs += 1;
+                bomb_shots.push((i + (2.0 / tick) as u32, bombs));
+            }
+            let due: Vec<usize> = bomb_shots
+                .iter()
+                .filter(|s| s.0 == i)
+                .map(|s| s.1)
+                .collect();
+            for n in due {
+                let path = picture(format!("bomb{n}"));
+                hud_picture(backend, game, &link, fov, aspect, &path)?;
+                eprintln!(
+                    "autoplay: pictured her view 2 s after bomb {n}, from {:.1}, health {:.0}: {}",
+                    game.focus(),
+                    game.combat.hp,
+                    path.display()
                 );
             }
             for (due, name) in [(boat_shot, "boat"), (ashore_shot, "ashore")] {
@@ -2172,6 +2276,153 @@ fn fight_for_screenshot(
         );
     }
     render(backend, game, fov, aspect, None)?;
+    Ok(())
+}
+
+/// Calls a Satellite Guided Bomb on the spot [`SATELLITE_AHEAD`] metres
+/// ahead of her as a player would (the support key, the use key, the view
+/// steered over it and confirmed, the wheel pressed in each wedge), for
+/// the picture: looking through the satellite, with the timing wheel's
+/// check after the first press, or `wait` seconds (at least 0.8) after
+/// the bomb lands, from her camera.
+fn satellite_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    stage: SatelliteShot,
+    wait: f32,
+) -> anyhow::Result<()> {
+    use combat::Trigger;
+    use m2_math::glam::{Vec2, Vec3};
+    let tick = TICK.as_secs_f32();
+    let Some(p) = game.scene.player.as_ref() else {
+        return Ok(());
+    };
+    let her = p.character.position;
+    let spot = her + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * SATELLITE_AHEAD;
+    let goal = Vec2::new(spot.x, spot.z);
+    game.support.offer(support::Kind::SatelliteBomb);
+    let press = |game: &mut Game, intent: Intent| {
+        game.step(intent, tick);
+        game.step(Intent::default(), tick);
+    };
+    let keys = |trigger: Trigger| Intent {
+        trigger,
+        ..Intent::default()
+    };
+    press(
+        game,
+        keys(Trigger {
+            support: true,
+            ..Trigger::default()
+        }),
+    );
+    press(
+        game,
+        Intent {
+            use_pressed: true,
+            ..Intent::default()
+        },
+    );
+    // The designator comes up, and the view opens.
+    for _ in 0..60 {
+        if !game.support.holding() {
+            break;
+        }
+        game.step(Intent::default(), tick);
+    }
+    for i in 0..1200 {
+        let Some(at) = game.support.looking() else {
+            break;
+        };
+        let to = goal - at;
+        if to.length() < 0.3 {
+            break;
+        }
+        // Screen right is the world's -x, looking down.
+        let movement = Vec2::new(-to.x, to.y).clamp_length_max(1.0);
+        game.step(
+            Intent {
+                movement,
+                ..Intent::default()
+            },
+            tick,
+        );
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    eprintln!(
+        "satellite: {:?}, her at {her:.1}, the spot {goal:.1}",
+        game.support.phase
+    );
+    if stage == SatelliteShot::View {
+        return Ok(());
+    }
+    press(
+        game,
+        keys(Trigger {
+            fire: true,
+            ..Trigger::default()
+        }),
+    );
+    // A press as the marker passes through each wedge; the wheel's
+    // picture is of the check after the first.
+    for wedge in 0..2 {
+        for _ in 0..600 {
+            if game.support.wheel_ready() {
+                break;
+            }
+            game.step(Intent::default(), tick);
+        }
+        press(
+            game,
+            Intent {
+                use_pressed: true,
+                ..Intent::default()
+            },
+        );
+        eprintln!("satellite: wedge {wedge}: {:?}", game.support.phase);
+        if stage == SatelliteShot::Wheel {
+            game.step(Intent::default(), tick);
+            return Ok(());
+        }
+    }
+    let (hp, alive) = (
+        game.combat.hp,
+        game.scene.people.npcs.iter().filter(|n| n.alive).count(),
+    );
+    let mut landed = false;
+    for i in 0..1200 {
+        game.step(Intent::default(), tick);
+        landed |= game
+            .support
+            .landed
+            .iter()
+            .any(|l| matches!(l, support::Impact::Bomb(_)));
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        if landed {
+            break;
+        }
+    }
+    for i in 0..(wait.max(0.8) / tick) as usize {
+        game.step(Intent::default(), tick);
+        if i % 10 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    eprintln!(
+        "satellite: the bomb {}; her health {hp:.0} -> {:.0}, people standing {alive} -> {}, \
+         flash {:.2}, shaking {:.2} s",
+        if landed { "landed" } else { "never landed" },
+        game.combat.hp,
+        game.scene.people.npcs.iter().filter(|n| n.alive).count(),
+        game.support.flash,
+        game.support.shake.1
+    );
     Ok(())
 }
 

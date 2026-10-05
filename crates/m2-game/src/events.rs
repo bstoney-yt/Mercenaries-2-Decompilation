@@ -265,6 +265,27 @@ impl Events {
             .collect()
     }
 
+    /// The names pending `ScriptEvent` events wait to be posted.
+    pub fn awaited(&self) -> Vec<String> {
+        self.store
+            .borrow()
+            .pending
+            .iter()
+            .filter(|p| p.kind == "ScriptEvent")
+            .filter_map(|p| p.params.raw_get::<String>(1).ok())
+            .collect()
+    }
+
+    /// Posts `name` with no data, as `Event.Post(name)` does: the engine's
+    /// own posts (the satellite's view, say). It is delivered at the next
+    /// update.
+    pub fn post(&self, name: &str) {
+        self.store
+            .borrow_mut()
+            .posted
+            .push((name.to_owned(), Value::Nil));
+    }
+
     /// Advances game time by `dt` seconds and fires every event whose
     /// condition holds. Callbacks run after the checks, so events they
     /// create wait for the next update. Returns the callbacks that failed.
@@ -754,6 +775,27 @@ mod tests {
             ["awake 3", "dead 7,7", "near 1,2", "posted x,y", "seat 1,99"]
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn the_engine_posts_what_scripts_wait_for() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"Event.Create(Event.ScriptEvent, { "Satellite Targetting Start" },
+                    function() table.insert(log, "started") end)"#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(events.awaited(), ["Satellite Targetting Start"]);
+        let world = TestWorld::default();
+        events.post("Something else");
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty());
+        events.post("Satellite Targetting Start");
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["started"]);
+        assert!(events.awaited().is_empty());
     }
 
     #[test]
