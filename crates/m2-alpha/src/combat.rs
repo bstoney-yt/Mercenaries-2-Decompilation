@@ -55,12 +55,14 @@ const SLUNG_TOP: f32 = 0.16;
 const SLUNG_FLOOR: f32 = 1.0;
 
 /// How a weapon hangs on her back ([`slung_at`]): muzzle down or up, how
-/// far its lower end leans toward her left (the tangent), and how high
-/// its top may reach above the attach point (metres).
+/// far its lower end leans toward her left (the tangent), how far its
+/// middle hangs below the attach point and how high its top may reach
+/// above it (metres).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hang {
     muzzle_up: bool,
     lean: f32,
+    drop: f32,
     top: f32,
 }
 
@@ -69,6 +71,7 @@ pub struct Hang {
 const HANG_DOWN: Hang = Hang {
     muzzle_up: false,
     lean: SLUNG_LEAN,
+    drop: SLUNG_DROP,
     top: SLUNG_TOP,
 };
 /// The grenade launcher's, as the PC video has it (frame pc460): muzzle
@@ -77,11 +80,14 @@ const HANG_DOWN: Hang = Hang {
 /// muzzle down. Round 103 had it as laid out but about 35 degrees off
 /// (her posed back adds some), its muzzle at her ear where the video's
 /// is near the top of her head: so the lean is less than the video's
-/// angle and the top higher. Fitted by eye.
+/// angle and the top higher. Round 105 had the angle right (27 degrees)
+/// but the muzzle still 0.13 m under the top of her head, so it hangs
+/// that much higher. Fitted by eye.
 const HANG_LAUNCHER: Hang = Hang {
     muzzle_up: true,
     lean: 0.4,
-    top: 0.4,
+    drop: SLUNG_DROP - 0.13,
+    top: 0.55,
 };
 
 /// Weapons drawn on the right hand's attach node turned as the node is
@@ -420,10 +426,10 @@ fn slung_at(
     let reach = (0..3)
         .map(|k| (turn.col(k).dot(up) * size[k]).abs() * 0.5)
         .sum::<f32>();
-    let lower = (reach - SLUNG_DROP - hang.top)
-        .min(SLUNG_FLOOR - SLUNG_DROP - reach)
+    let lower = (reach - hang.drop - hang.top)
+        .min(SLUNG_FLOOR - hang.drop - reach)
         .max(0.0);
-    let origin = point - up * (SLUNG_DROP + lower) - ahead * SLUNG_GAP - turn * middle;
+    let origin = point - up * (hang.drop + lower) - ahead * SLUNG_GAP - turn * middle;
     Some(Mat4::from_cols(
         turn.x_axis.extend(0.0),
         turn.y_axis.extend(0.0),
@@ -2387,7 +2393,7 @@ mod tests {
             "{barrel} {off}"
         );
         // Its muzzle above the attach point, and on her right.
-        assert!(tip.y > point.y + 0.2 && tip.y < point.y + 0.45, "{tip}");
+        assert!(tip.y > point.y + 0.35 && tip.y < point.y + 0.6, "{tip}");
         assert!(tip.dot(right) > point.dot(right), "{tip}");
         assert!(
             at.transform_point3(Vec3::new(0.0, 0.0, -0.3)).z < point.z,
