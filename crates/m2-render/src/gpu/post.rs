@@ -34,7 +34,8 @@ struct Post {
     // number, for the grain
     step: vec4<f32>,
     // x: contrast, y: saturation, z: the luminance contrast pivots on,
-    // w: 1 for the game's own tone map (below)
+    // w: 1 for the game's own tone map (below), 2 for it adapting to the
+    // geometric mean luminance
     tone: vec4<f32>,
     // Fitted adaptation: x: key, y: strength (0: none), z: how much of the
     // way to follow this frame. The game's: x: target luminance, y: key
@@ -50,6 +51,14 @@ struct Post {
 
 fn game_tone_map() -> bool {
     return post.tone.w > 0.5;
+}
+
+// The game's post shaders take the luminance (Rec. 709) of display values
+// raised to 0.4 and appear to average it plainly down to one texel (no
+// log and exp pair among them); the fitted pass, and the game's tone map
+// when asked, average log luminance.
+fn log_average() -> bool {
+    return !game_tone_map() || post.tone.w > 1.5;
 }
 
 // The game lights and tone maps in display (gamma) space, its textures
@@ -125,14 +134,18 @@ fn fs_blur(v: Screen) -> @location(0) vec4<f32> {
     return vec4<f32>(c, 1.0);
 }
 
-// The frame's log luminance, from four filtered taps.
+// The frame's luminance (see `log_average`), from four filtered taps.
 @fragment
 fn fs_log_luminance(v: Screen) -> @location(0) vec4<f32> {
     var sum = 0.0;
     for (var y = -1.0; y <= 1.0; y = y + 2.0) {
         for (var x = -1.0; x <= 1.0; x = x + 2.0) {
             let c = textureSampleLevel(source, linear, v.uv + vec2<f32>(x, y) * post.step.xy, 0.0).rgb;
-            sum = sum + log(max(luminance(to_game(c)), 1e-4));
+            if log_average() {
+                sum = sum + log(max(luminance(to_game(c)), 1e-4));
+            } else {
+                sum = sum + luminance(pow(to_game(c), vec3<f32>(0.4)));
+            }
         }
     }
     return vec4<f32>(sum * 0.25, 0.0, 0.0, 1.0);
@@ -161,7 +174,7 @@ fn fs_adapt(v: Screen) -> @location(0) vec4<f32> {
     if game_tone_map() {
         let low = post.limits.x;
         let high = max(post.limits.y, low * 1.001);
-        let l = clamp(exp(now), low, high);
+        let l = clamp(select(now, exp(now), log_average()), low, high);
         let k = mix(post.adapt.y, post.adapt.w, log(l / low) / log(high / low));
         return vec4<f32>(clamp(mix(before, l * k, post.adapt.z), 0.0, 1.0), 0.0, 0.0, 1.0);
     }
@@ -596,7 +609,11 @@ impl Post {
                     lighting.contrast,
                     lighting.saturation,
                     0.18,
-                    if game { 1.0 } else { 0.0 },
+                    match lighting.tone_map {
+                        Some(t) if t.log_average => 2.0,
+                        Some(_) => 1.0,
+                        None => 0.0,
+                    },
                 ],
                 adapt,
                 limits,
