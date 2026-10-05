@@ -557,3 +557,46 @@ fn objects_shadow_what_the_sun_lights_behind_them() {
     let (s, l) = (pixel(&rgba, s.0, s.1)[0], pixel(&rgba, l.0, l.1)[0]);
     assert!(s.abs_diff(l) <= 2, "unshadowed {s}, {l}");
 }
+
+#[test]
+fn exposure_grade_and_bloom_finish_the_frame() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    let mut v = view();
+    v.lighting.sky_color = Vec3::splat(0.25);
+    let mut frame = |v: &View| {
+        b.begin_frame(v).unwrap();
+        b.draw(&draw(vb, ib, 1, Mat4::IDENTITY)).unwrap();
+        b.end_frame().unwrap();
+        b.read_pixels().unwrap()
+    };
+    // Linear 0.25 is 137 in sRGB; twice the exposure is linear 0.5, 188.
+    let plain = frame(&v);
+    assert_eq!(pixel(&plain, 2, 2)[..3], [137, 137, 137]);
+    v.lighting.exposure = 2.0;
+    v.lighting.grade = Vec3::new(1.0, 0.5, 0.0);
+    let graded = pixel(&frame(&v), 2, 2);
+    // Within one step: the world target is half precision.
+    for (got, want) in graded.iter().zip([188u8, 137, 0]) {
+        assert!(got.abs_diff(want) <= 1, "{graded:?}");
+    }
+    // A white quad on black glows past its edges (the quad starts near
+    // x = 14).
+    v.lighting.sky_color = Vec3::ZERO;
+    v.lighting.exposure = 1.0;
+    v.lighting.grade = Vec3::ONE;
+    assert_eq!(pixel(&frame(&v), 8, 32)[..3], [0, 0, 0]);
+    v.lighting.bloom = 1.0;
+    v.lighting.bloom_threshold = 0.5;
+    let glow = frame(&v);
+    assert!(pixel(&glow, 8, 32)[0] > 20, "{:?}", pixel(&glow, 8, 32));
+    assert_eq!(pixel(&glow, 32, 32)[..3], [255, 255, 255]);
+}

@@ -89,6 +89,15 @@ pub struct Lighting {
     pub rim_threshold: f32,
     /// Metres from the camera that sun shadows reach; 0 turns them off.
     pub shadow_distance: f32,
+    /// Scale on the finished world's light before it is clamped to the
+    /// screen.
+    pub exposure: f32,
+    /// How much of the light above `bloom_threshold` (after exposure) glows
+    /// into its surroundings; 0 turns bloom off.
+    pub bloom: f32,
+    pub bloom_threshold: f32,
+    /// Per-channel scale on the finished frame: a colour grade.
+    pub grade: Vec3,
 }
 
 impl Default for Lighting {
@@ -110,6 +119,10 @@ impl Default for Lighting {
             rim_color: Vec3::ZERO,
             rim_threshold: 0.0,
             shadow_distance: 200.0,
+            exposure: 1.0,
+            bloom: 0.0,
+            bloom_threshold: 1.0,
+            grade: Vec3::ONE,
         }
     }
 }

@@ -16,6 +16,7 @@
 //! Clean-room. Written against wgpu's public API and general rendering
 //! practice; nothing here comes from the original executable.
 
+mod post;
 mod shader;
 mod shadow;
 
@@ -338,6 +339,8 @@ pub struct WgpuBackend {
     shadow_pipelines: HashMap<ShadowKey, wgpu::RenderPipeline>,
     /// When the backend started, for animated surfaces.
     started: std::time::Instant,
+    /// Bloom, exposure and grade after the world.
+    post: post::Post,
     /// The cascades the shadow map holds, as last drawn.
     cascades: std::cell::Cell<Option<shadow::Cascades>>,
     vertex_buffers: Slots<VertexBuffer>,
@@ -722,6 +725,11 @@ impl WgpuBackend {
             )
             .create_view(&Default::default());
         let depth = Self::depth_view(&device, width, height);
+        let output = match &target {
+            Target::Window { config, .. } => config.format,
+            Target::Offscreen { format, .. } => *format,
+        };
+        let post = post::Post::new(&device, output, width, height);
         Self {
             default_material: Self::material_group(
                 &device,
@@ -760,6 +768,7 @@ impl WgpuBackend {
             shadow_pipelines: HashMap::new(),
             cascades: std::cell::Cell::new(None),
             started: std::time::Instant::now(),
+            post,
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
@@ -993,6 +1002,7 @@ impl WgpuBackend {
         self.width = width;
         self.height = height;
         self.depth = Self::depth_view(&self.device, width, height);
+        self.post.resize(&self.device, width, height);
         if let Target::Window { surface, config } = &mut self.target {
             config.width = width;
             config.height = height;
@@ -1100,7 +1110,9 @@ impl WgpuBackend {
         if self.pipelines.contains_key(key) {
             return Ok(());
         }
-        let color_format = self.color_format();
+        // The world draws in floating point; the post pass brings it to
+        // the frame.
+        let color_format = post::HDR_FORMAT;
         let attributes = vertex_attributes(&key.layout);
         let module = self.shader_module(&key.layout).clone();
         let module = &module;
@@ -1442,12 +1454,12 @@ impl WgpuBackend {
             self.encode_shadows(&mut encoder, &frame, cascades, refresh, draws)?;
         }
         {
-            // Linear sky colour; the sRGB target encodes it.
+            // Linear sky colour; the post pass writes it to the sRGB frame.
             let sky = l.sky_color;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
+                    view: &self.post.hdr,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1522,6 +1534,7 @@ impl WgpuBackend {
                 }
             }
         }
+        self.post.encode(&self.queue, &mut encoder, l, target);
         Ok(encoder.finish())
     }
 }

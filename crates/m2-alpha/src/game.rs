@@ -585,7 +585,27 @@ impl Game {
         if let Some(a) = self.scene.world.as_ref().and_then(|w| w.index.atmosphere) {
             a.apply(&mut view.lighting);
         }
+        post_override(&mut view.lighting);
         view
+    }
+}
+
+/// `M2_POST=exposure,bloom,threshold[,r,g,b]` sets the finishing pass by
+/// hand, for matching reference frames.
+fn post_override(lighting: &mut m2_render::Lighting) {
+    static POST: std::sync::OnceLock<Option<Vec<f32>>> = std::sync::OnceLock::new();
+    let Some(v) = POST.get_or_init(|| {
+        let s = std::env::var("M2_POST").ok()?;
+        let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (v.len() >= 3).then_some(v)
+    }) else {
+        return;
+    };
+    lighting.exposure = v[0];
+    lighting.bloom = v[1];
+    lighting.bloom_threshold = v[2];
+    if let [r, g, b] = v[3..] {
+        lighting.grade = Vec3::new(r, g, b);
     }
 }
 
