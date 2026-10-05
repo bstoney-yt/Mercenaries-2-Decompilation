@@ -373,7 +373,7 @@ impl Autoplay {
                 .flights
                 .pickups()
                 .iter()
-                .filter(|p| p.gives.is_some() && !self.left_lying.contains(&p.from))
+                .filter(|p| p.what.gives.is_some() && !self.left_lying.contains(&p.from))
                 .map(|p| (p.from, p.at.distance(here)))
                 .filter(|&(_, d)| d < OPEN_NEAR)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -624,7 +624,7 @@ impl Autoplay {
             self.left_lying.push(from);
             return Intent::default();
         }
-        self.walk(game, p.at, p.reach * 0.5, dt)
+        self.walk(game, p.at, p.what.reach * 0.5, dt)
     }
 
     /// Nothing to do: stand, or stop the vehicle.

@@ -95,6 +95,23 @@ pub struct Load {
     /// The model of one that isn't a vehicle (a supply crate); a vehicle
     /// is one of the scene's ([`ParkedVehicle::guid`]).
     pub model: Option<u32>,
+    /// What a crate leaves when broken open.
+    pub leaves: Option<Leaves>,
+}
+
+/// What a crate leaves when broken open (its template's `SpawnOnDeath`, a
+/// pickup).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Leaves {
+    /// The pickup's template, and the model that names, if the archive
+    /// has it.
+    pub template: u32,
+    pub model: Option<u32>,
+    /// How near she comes to take it, metres (its template's `radius`).
+    pub reach: f32,
+    /// The rounds it gives, and for which of her weapons (those of a
+    /// weapon she doesn't carry give her nothing).
+    pub gives: Option<(Weapon, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,26 +181,19 @@ struct Crate {
     /// Broken open: drawn wrecked (if its model has a wreck), no longer
     /// in the way.
     broken: bool,
+    leaves: Option<Leaves>,
 }
 
-/// What a crate broken open leaves (its template's `SpawnOnDeath`, a
-/// pickup), lying where the crate stood until she comes within its reach
-/// and takes it.
+/// What a crate broken open left, lying where the crate stood until she
+/// comes within its reach and takes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pickup {
     /// The crate it was in (the scripts' object).
     pub from: u32,
-    /// Its template, and the model that names, if the archive has it.
-    pub template: u32,
-    pub model: Option<u32>,
+    pub what: Leaves,
     /// Where it lies (on the ground) and which way it is turned.
     pub at: Vec3,
     pub yaw: f32,
-    /// How near she comes to take it, metres (its template's `radius`).
-    pub reach: f32,
-    /// The rounds it gives, and for which of her weapons (those of a
-    /// weapon she doesn't carry give her nothing).
-    pub gives: Option<(Weapon, u32)>,
 }
 
 /// A load let go: the pilot whose delivery it was and where (for the
@@ -205,7 +215,7 @@ pub struct Flights {
     /// Wanted and not yet asked for.
     wanted: Vec<u32>,
     /// Crates broken open since [`take_broken`](Self::take_broken).
-    broken: Vec<(u32, Vec3, f32)>,
+    broken: Vec<(u32, Vec3)>,
     /// What the crates broken open left, not yet taken.
     pickups: Vec<Pickup>,
 }
@@ -231,10 +241,12 @@ impl Flights {
             model,
             bank,
         } = copter;
-        for m in model
-            .into_iter()
-            .chain(loads.iter().filter_map(|l| l.model))
-        {
+        for m in model.into_iter().chain(
+            loads
+                .iter()
+                .flat_map(|l| [l.model, l.leaves.and_then(|w| w.model)])
+                .flatten(),
+        ) {
             if let std::collections::hash_map::Entry::Vacant(e) = self.models.entry(m) {
                 e.insert(None);
                 self.wanted.push(m);
@@ -320,27 +332,24 @@ impl Flights {
                 c.broken = true;
                 physics.remove_static(key);
                 now.push((c.guid, c.at));
-                self.broken.push((c.guid, c.at, c.yaw));
+                self.broken.push((c.guid, c.at));
+                if let Some(what) = c.leaves {
+                    self.pickups.push(Pickup {
+                        from: c.guid,
+                        what,
+                        at: c.at,
+                        yaw: c.yaw,
+                    });
+                }
             }
         }
         now
     }
 
-    /// The crates broken open since the last call: each one's guid, where
-    /// it stood and which way it was turned.
-    pub fn take_broken(&mut self) -> Vec<(u32, Vec3, f32)> {
+    /// The crates broken open since the last call: each one's guid and
+    /// where it stood.
+    pub fn take_broken(&mut self) -> Vec<(u32, Vec3)> {
         std::mem::take(&mut self.broken)
-    }
-
-    /// Leaves `pickup` lying (its model is loaded).
-    pub fn leave(&mut self, pickup: Pickup) {
-        if let Some(m) = pickup.model
-            && let std::collections::hash_map::Entry::Vacant(e) = self.models.entry(m)
-        {
-            e.insert(None);
-            self.wanted.push(m);
-        }
-        self.pickups.push(pickup);
     }
 
     /// What lies to be taken.
@@ -348,11 +357,16 @@ impl Flights {
         &self.pickups
     }
 
+    /// Whether model `hash` (asked for) has loaded.
+    pub fn has_model(&self, hash: u32) -> bool {
+        self.models.get(&hash).is_some_and(Option::is_some)
+    }
+
     /// Takes what lies within its reach of `at` (her feet, on foot):
     /// level with her, within a body's height.
     pub fn take(&mut self, at: Vec3) -> Vec<Pickup> {
         let (taken, left) = self.pickups.iter().partition(|p| {
-            (p.at - at).with_y(0.0).length() <= p.reach && (p.at.y - at.y).abs() < TAKE_HEIGHT
+            (p.at - at).with_y(0.0).length() <= p.what.reach && (p.at.y - at.y).abs() < TAKE_HEIGHT
         });
         self.pickups = left;
         taken
@@ -598,6 +612,7 @@ impl Flights {
                         falling: Some(0.0),
                         hp: CRATE_HP,
                         broken: false,
+                        leaves: l.leaves,
                     }),
                     None => {
                         if let Some(v) = vehicles
@@ -708,6 +723,7 @@ impl Flights {
         // Pickups rest on the ground by their lowest point.
         for p in &self.pickups {
             if let Some(m) = p
+                .what
                 .model
                 .and_then(|m| self.models.get(&m).and_then(Option::as_ref))
             {
@@ -803,6 +819,7 @@ mod tests {
         let load = Load {
             guid: 3,
             model: None,
+            leaves: None,
         };
         flights.start(COPTER, vec![load], Vec3::new(0.0, 60.0, 0.0), to);
         assert!(flights.flying(2));
@@ -860,6 +877,7 @@ mod tests {
         let crates = [3, 4].map(|guid| Load {
             guid,
             model: Some(99),
+            leaves: None,
         });
         flights.start(
             COPTER,
@@ -893,27 +911,65 @@ mod tests {
     }
 
     #[test]
-    fn she_takes_what_a_crate_left_once_within_its_reach() {
-        let mut flights = Flights::default();
-        let rockets = Pickup {
-            from: 3,
+    fn a_crate_broken_open_leaves_what_she_takes_within_its_reach() {
+        let mut physics = Physics::new();
+        let floor = CollisionShape::cuboid(Vec3::new(500.0, 1.0, 500.0));
+        physics.add_static(
+            StaticKey::Cell(1),
+            &floor,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let rockets = Leaves {
             template: 0x8000_56dc,
             model: Some(98),
-            at: Vec3::new(10.0, 1.0, 0.0),
-            yaw: 0.0,
             reach: 1.0,
             gives: Some((Weapon::Rpg, 20)),
         };
-        flights.leave(rockets);
-        assert_eq!(flights.take_wanted(), [98], "its model is loaded");
+        let mut flights = Flights::default();
+        let load = Load {
+            guid: 3,
+            model: Some(99),
+            leaves: Some(rockets),
+        };
+        flights.start(
+            COPTER,
+            vec![load],
+            Vec3::new(0.0, 30.0, 0.0),
+            Vec3::new(0.0, 0.0, 60.0),
+        );
+        // What it holds is loaded with it.
+        let mut wanted = flights.take_wanted();
+        wanted.sort_unstable();
+        assert_eq!(wanted, [98, 99]);
+        for _ in 0..60 * 60 {
+            flights.step(1.0 / 60.0, &mut physics, &mut [], Vec3::ZERO);
+            if flights.crates_standing().count() == 1 {
+                break;
+            }
+        }
+        let (middle, _) = flights.crate_standing(3).expect("down");
+        assert!(flights.pickups().is_empty(), "nothing until it breaks");
+        let blow = Strike {
+            at: middle,
+            damage: 100.0,
+            key: Some(StaticKey::Entity(3)),
+        };
+        flights.strike(&mut physics, &[blow], &[]);
+        let [lying] = flights.pickups() else {
+            panic!("it left one pickup: {:?}", flights.pickups());
+        };
+        let lying = *lying;
+        assert_eq!((lying.from, lying.what), (3, rockets));
+        let at = lying.at;
         // Not from 1.5 m off, nor from a roof over it.
-        assert!(flights.take(Vec3::new(8.5, 1.0, 0.0)).is_empty());
-        assert!(flights.take(Vec3::new(10.0, 6.0, 0.0)).is_empty());
-        assert_eq!(flights.pickups().len(), 1);
+        assert!(flights.take(at + Vec3::X * 1.5).is_empty());
+        assert!(flights.take(at + Vec3::Y * 5.0).is_empty());
         // From 0.8 m off, standing a step lower.
-        assert_eq!(flights.take(Vec3::new(9.2, 0.7, 0.0)), [rockets]);
+        assert_eq!(flights.take(at + Vec3::new(-0.8, -0.3, 0.0)), [lying]);
         assert!(flights.pickups().is_empty());
-        assert!(flights.take(Vec3::new(10.0, 1.0, 0.0)).is_empty());
+        assert!(flights.take(at).is_empty());
     }
 
     #[test]
@@ -941,6 +997,7 @@ mod tests {
         let load = Load {
             guid: 3,
             model: None,
+            leaves: None,
         };
         flights.start(
             COPTER,

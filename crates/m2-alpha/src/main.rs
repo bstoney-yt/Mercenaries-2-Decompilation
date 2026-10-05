@@ -1153,6 +1153,11 @@ fn mission_for_screenshot(
     let mut seated: Option<u32> = None;
     let mut boat_shot: Option<u32> = None;
     let mut ashore_shot: Option<u32> = None;
+    // And what each crate broken open left, a second and a half after
+    // (its model loading), from 5 m off (`-pickupN`): the crates seen,
+    // and the pictures due (tick, crate).
+    let mut opened: HashSet<u32> = HashSet::new();
+    let mut pickup_shots: Vec<(u32, u32)> = Vec::new();
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match &mut auto {
             Some(a) => {
@@ -1232,6 +1237,55 @@ fn mission_for_screenshot(
                 }
             } else if seated.is_some() {
                 ashore_shot.get_or_insert(i + (3.0 / tick) as u32);
+            }
+            for p in game.scene.flights.pickups() {
+                if opened.insert(p.from) {
+                    pickup_shots.push((i + (1.5 / tick) as u32, p.from));
+                }
+            }
+            let due: Vec<u32> = pickup_shots
+                .iter()
+                .filter(|s| s.0 == i)
+                .map(|s| s.1)
+                .collect();
+            for from in due {
+                let lying = game
+                    .scene
+                    .flights
+                    .pickups()
+                    .iter()
+                    .find(|p| p.from == from)
+                    .copied();
+                let Some(p) = lying else {
+                    eprintln!("pickup picture: what the crate {from:#x} left was taken first");
+                    continue;
+                };
+                let away = (p.at - game.focus())
+                    .with_y(0.0)
+                    .try_normalize()
+                    .unwrap_or(m2_math::glam::Vec3::X);
+                let eye = p.at + away * 5.0 + m2_math::glam::Vec3::Y * 2.5;
+                let n = opened.len();
+                delivery_picture(
+                    backend,
+                    game,
+                    fov,
+                    aspect,
+                    p.at,
+                    p.at,
+                    Some(eye),
+                    &picture(format!("pickup{n}")),
+                )?;
+                eprintln!(
+                    "pickup picture: {:#x} lies at {:.1}, its model {}",
+                    p.what.template,
+                    p.at,
+                    match p.what.model {
+                        Some(m) if game.scene.flights.has_model(m) => format!("{m:08x} drawn"),
+                        Some(m) => format!("{m:08x} not loaded: not drawn"),
+                        None => "none".into(),
+                    }
+                );
             }
             for (due, name) in [(boat_shot, "boat"), (ashore_shot, "ashore")] {
                 if due == Some(i) {
