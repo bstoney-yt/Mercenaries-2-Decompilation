@@ -86,8 +86,10 @@ impl Cascades {
                 .iter()
                 .map(|c| c.distance(centre))
                 .fold(0.0, f32::max);
-            // Whole sixteenths of a metre, so the texel size stays put.
-            let radius = (radius * 16.0).ceil() / 16.0;
+            // A little spare for a cascade kept a few frames while the
+            // camera moves, in whole sixteenths of a metre so the texel
+            // size stays put.
+            let radius = (radius * 1.05 * 16.0).ceil() / 16.0;
             let texel = 2.0 * radius / SIZE as f32;
             let c = light.transform_point3(centre);
             let (x, y) = ((c.x / texel).floor() * texel, (c.y / texel).floor() * texel);
@@ -103,6 +105,13 @@ impl Cascades {
         Some(out)
     }
 
+    /// Takes cascade `i` as `old` drew it (its map is not redrawn).
+    pub fn keep(&mut self, old: &Cascades, i: usize) {
+        self.matrices[i] = old.matrices[i];
+        self.boxes[i] = old.boxes[i];
+        self.texels[i] = old.texels[i];
+    }
+
     /// Whether a world-space sphere can cast into cascade `i`.
     pub fn touches(&self, i: usize, centre: Vec3, radius: f32) -> bool {
         let c = self.light.transform_point3(centre);
@@ -113,6 +122,17 @@ impl Cascades {
             && c.y - radius <= b[3]
             && -c.z + radius >= b[4]
             && -c.z - radius <= b[5]
+    }
+}
+
+/// Whether cascade `i` is redrawn on frame `frame`: the near two every
+/// frame, the third every other frame, the last every fourth (never on the
+/// same frame as the third).
+pub fn refreshes(i: usize, frame: u64) -> bool {
+    match i {
+        0 | 1 => true,
+        2 => frame.is_multiple_of(2),
+        _ => frame % 4 == 1,
     }
 }
 
