@@ -163,6 +163,8 @@ struct Options {
     /// through the satellite's view, with the timing wheel up, or after
     /// the bomb lands.
     satellite: Option<SatelliteShot>,
+    /// With `--screenshot`: the picture with her PDA open.
+    pda: bool,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
@@ -315,6 +317,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 })
             }
             "--closeup" => o.closeup = true,
+            "--pda" => o.pda = true,
             "--behind" => o.behind = true,
             "--slung" => {
                 o.slung = Some(match value()?.as_str() {
@@ -960,6 +963,9 @@ fn screenshot(
             game.combat
                 .hurt_from(15.0, at + (ahead * c + right * s) * 10.0);
         }
+    }
+    if options.pda {
+        game.support.pda = true;
     }
     // The picture, with the HUD (the game's, once its scripts have
     // started and run two seconds, for its boxes to have opened and the

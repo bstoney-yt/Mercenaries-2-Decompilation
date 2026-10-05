@@ -51,6 +51,7 @@ pub mod animation;
 pub mod block;
 mod bytes;
 pub mod dxt;
+pub mod flash;
 pub mod font;
 pub mod gfx;
 pub mod hash;

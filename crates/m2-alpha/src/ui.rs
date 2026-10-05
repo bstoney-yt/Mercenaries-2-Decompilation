@@ -538,7 +538,8 @@ fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             Color32::from_rgb(240, 120, 60),
         );
     }
-    if s.pda {
+    // The game's HUD draws its own PDA.
+    if s.pda && boxed {
         pda(screen, s, text);
     }
     let Some((name, method, count, free)) = s.item.as_ref().filter(|_| boxed) else {
