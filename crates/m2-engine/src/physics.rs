@@ -704,9 +704,11 @@ impl Physics {
 
     /// What a vehicle's body is in contact with (its wheels' contacts
     /// aside): each static's key (`None` for anything else solid, such as
-    /// another vehicle) with the deepest point of contact on the body,
-    /// world space. To find what holds a stuck vehicle.
-    pub fn vehicle_touching(&self, id: VehicleId) -> Vec<(Option<StaticKey>, Vec3)> {
+    /// another vehicle) with the deepest point of contact on the body and
+    /// the box the thing touched fills, world space. To find what holds a
+    /// stuck vehicle.
+    #[allow(clippy::type_complexity)]
+    pub fn vehicle_touching(&self, id: VehicleId) -> Vec<(Option<StaticKey>, Vec3, (Vec3, Vec3))> {
         let Some(body) = self
             .vehicles
             .get(id.0)
@@ -748,7 +750,15 @@ impl Physics {
                     .iter()
                     .find(|(_, h)| **h == other)
                     .map(|(k, _)| *k);
-                out.push((key, vec3(own.position().transform_point(local))));
+                let span = self
+                    .world
+                    .colliders
+                    .get(other)
+                    .map_or((Vec3::ZERO, Vec3::ZERO), |o| {
+                        let b = o.compute_aabb();
+                        (vec3(b.mins), vec3(b.maxs))
+                    });
+                out.push((key, vec3(own.position().transform_point(local)), span));
             }
         }
         out

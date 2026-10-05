@@ -1305,16 +1305,19 @@ pub(crate) fn stuck_report(
             _ => format!("? at {k} m"),
         })
         .collect();
-    // What its body touches, where on the model.
+    // What its body touches, where on the model, and the box what it
+    // touches fills.
     let to_model = m.inverse();
     let touching: Vec<String> = physics
         .vehicle_touching(id)
         .iter()
-        .map(|&(key, at)| {
+        .map(|&(key, at, (lo, hi))| {
             format!(
-                "{} at {:.1}",
+                "{} at {:.1}, filling {:.1} to {:.1}",
                 crate::static_name(world, key),
-                to_model.transform_point3(at)
+                to_model.transform_point3(at),
+                lo,
+                hi
             )
         })
         .collect();
