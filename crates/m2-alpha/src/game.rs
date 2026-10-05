@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use m2_engine::{Physics, VehicleControls};
+use m2_engine::{CatalogueEntry, Physics, VehicleControls};
 use m2_math::glam::{Quat, Vec3, Vec4Swizzles};
 use m2_render::View;
 
@@ -12,7 +12,7 @@ use crate::combat::{Combat, Field, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::mission::template_models;
-use crate::player::{Intent, Player};
+use crate::player::{ChaseRig, Intent, Player};
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
 use crate::startup::Startup;
@@ -26,8 +26,10 @@ struct Spot<'a> {
     yaw: f32,
 }
 
-/// How fast a turret turns after the camera, radians a second (invented).
+/// How fast a turret turns after the camera, and its gun tilts to the
+/// crosshair, radians a second, when its template doesn't say (invented).
 const TURRET_RATE: f32 = 1.2;
+const GUN_RATE: f32 = 0.6;
 /// How near a building the town's sounds play, metres.
 const TOWN_REACH: f32 = 150.0;
 
@@ -297,9 +299,8 @@ impl Game {
                 physics.step(dt);
                 match id.and_then(|(id, v)| Some((physics.vehicle_transform(id)?, v, id))) {
                     Some((at, v, id)) => {
-                        let length = v.spec.bounds.1.z - v.spec.bounds.0.z;
                         let speed = physics.vehicle_speed(id);
-                        player.chase(at, length, intent.look, speed, dt);
+                        player.chase(at, ChaseRig::of(&v.spec), intent.look, speed, dt);
                     }
                     None => {
                         player.driving = None;
@@ -307,7 +308,8 @@ impl Game {
                         player.update(physics, intent, dt);
                     }
                 }
-                // A turret turns after the camera, at its own pace.
+                // A turret turns after the camera, at its own pace, and
+                // its gun tilts to what the crosshair is on.
                 if let Some(v) = player.driving.and_then(|i| scene.vehicles.get_mut(i))
                     && !v.wrecked
                     && let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id))
@@ -318,7 +320,22 @@ impl Game {
                     if turn > std::f32::consts::PI {
                         turn -= std::f32::consts::TAU;
                     }
-                    v.turret += turn.clamp(-TURRET_RATE * dt, TURRET_RATE * dt);
+                    let turret = v.spec.tuning.turret;
+                    let rate = turret.map_or(TURRET_RATE, |t| t.yaw_speed);
+                    v.turret += turn.clamp(-rate * dt, rate * dt);
+                    if let Some(pivot) = v.spec.gun_pivot {
+                        let goal = Combat::aim_point(physics, &scene.people, player, v.id);
+                        // The crosshair's point as seen from the gun with
+                        // the turret straight ahead.
+                        let local = (at * v.spec.turret_transform(v.turret))
+                            .inverse()
+                            .transform_point3(goal)
+                            - pivot;
+                        let (down, up) = v.spec.elevation;
+                        let want = local.y.atan2(local.with_y(0.0).length()).clamp(down, up);
+                        let rate = turret.map_or(GUN_RATE, |t| t.pitch_speed);
+                        v.gun += (want - v.gun).clamp(-rate * dt, rate * dt);
+                    }
                 }
             } else {
                 physics.step(dt);
@@ -367,7 +384,7 @@ impl Game {
                 .filter_map(|v| {
                     let id = v.id?;
                     let at = world.physics.vehicle_transform(id)?;
-                    Some((at, world.physics.vehicle_velocity(id), v.model.bounds))
+                    Some((at, world.physics.vehicle_velocity(id), v.spec.hull))
                 })
                 .collect();
             self.scene.people.traffic(&cars);
@@ -504,6 +521,22 @@ impl Game {
             let speed = self.driving().map_or(0.0, |d| d.1);
             Some((v.spec.label.clone(), speed, v.wrecked))
         });
+        // What the crosshair is on: on foot, or in a vehicle with a gun.
+        let crosshair = match (&self.scene.world, player) {
+            (Some(w), Some(p)) if self.combat.down <= 0.0 => match p.driving {
+                Some(i) => self
+                    .scene
+                    .vehicles
+                    .get(i)
+                    .filter(|v| v.spec.muzzle.is_some() && !v.wrecked)
+                    .map(|v| Combat::aim_point(&w.physics, &self.scene.people, p, v.id)),
+                None if self.on_foot && p.landed => {
+                    Some(Combat::aim_point(&w.physics, &self.scene.people, p, None))
+                }
+                None => None,
+            },
+            _ => None,
+        };
         let can_enter = match (&self.scene.world, player) {
             (Some(w), Some(p)) if p.driving.is_none() && p.landed => {
                 nearest(&w.physics, &self.scene.vehicles, p, REACH)
@@ -517,6 +550,7 @@ impl Game {
             down: self.combat.down > 0.0,
             weapon: self.combat.weapon,
             driving,
+            crosshair,
             can_enter,
             loading,
             ..HudInfo::default()
@@ -532,6 +566,14 @@ impl Game {
         player.driving = nearest(&world.physics, &self.scene.vehicles, player, reach);
         player.landed |= player.driving.is_some();
         player.driving.is_some()
+    }
+
+    /// Loads the first of `models` that drives and parks it near her, as
+    /// the vehicles she starts with are.
+    pub fn park_more(&mut self, models: Vec<CatalogueEntry>) {
+        self.scene.load_parked(models);
+        self.park_tries = 0;
+        self.park_wait = 0.0;
     }
 
     /// The vehicle being driven: its position and speed (m/s).
@@ -564,7 +606,11 @@ impl Game {
         Some(crate::sound::EngineInput {
             bank,
             speed,
-            top: if v.spec.tracked { 14.0 } else { 32.0 },
+            top: v
+                .spec
+                .tuning
+                .max_speed
+                .unwrap_or(if v.spec.tracked { 14.0 } else { 32.0 }),
             throttle: self.throttle,
         })
     }
@@ -632,10 +678,16 @@ const PARK_TRIES: u32 = 40;
 /// A spot will do when the ground under the wheels slopes less than this
 /// (radians, about 10°; later looks take up to twice it), nothing under
 /// the hull rises more than this above them (metres: a rock, a ledge),
-/// and it is near the height of her feet (not a roof).
+/// and it is near the height of her feet (not a roof or a boulder's top):
+/// within [`PARK_RISE`] metres, and [`PARK_GRADE`] more for each metre
+/// away, up to [`PARK_ROOF`].
 const PARK_SLOPE: f32 = 0.18;
 const PARK_BUMPS: f32 = 0.3;
+const PARK_RISE: f32 = 1.5;
+const PARK_GRADE: f32 = 0.15;
 const PARK_ROOF: f32 = 8.0;
+/// The ground under a spot is looked for from this far above her feet.
+const PARK_LOOK: f32 = 60.0;
 /// Vehicles are let go this far above where they rest, to settle onto
 /// their wheels, metres.
 const DROP: f32 = 0.3;
@@ -679,10 +731,12 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
         let (lo, hi) = v.spec.bounds;
         let radius = footprint_radius(&v.spec);
         let middle = Vec3::new((lo.x + hi.x) * 0.5, 0.0, (lo.z + hi.z) * 0.5);
+        // From high above, so a boulder or a cliff taller than her isn't
+        // missed by a ray starting inside it (the spot is then too high).
         let ground = |p: Vec3| {
-            let top = Vec3::new(p.x, feet.y + PARK_ROOF, p.z);
+            let top = Vec3::new(p.x, feet.y + PARK_LOOK, p.z);
             physics
-                .cast_ray(top, -Vec3::Y, PARK_ROOF * 3.0)
+                .cast_ray(top, -Vec3::Y, PARK_LOOK + PARK_ROOF * 2.0)
                 .map(|(d, _)| top.y - d)
         };
         let spot = spots.iter().find_map(|&centre| {
@@ -696,9 +750,11 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
             // under its hull.
             let origin = centre - (right * middle.x + forward * middle.z);
             let rest = v.spec.rest_on(origin, player.facing, ground)?;
+            let away = (centre - feet).with_y(0.0).length();
+            let rise = (PARK_RISE + PARK_GRADE * away).min(PARK_ROOF);
             (rest.slope <= steep
                 && rest.bumps <= PARK_BUMPS
-                && (rest.position.y - feet.y).abs() < PARK_ROOF)
+                && (rest.position.y - feet.y).abs() < rise)
                 .then_some((centre, rest))
         });
         // Nowhere yet (the ground may still be loading): try next tick.

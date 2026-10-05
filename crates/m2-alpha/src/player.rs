@@ -1,7 +1,7 @@
 //! The player on foot: Jennifer walking the island under the character
 //! controller, with a third-person camera behind her.
 
-use m2_engine::{Character, Gait, GpuModel, Physics};
+use m2_engine::{Character, Gait, GpuModel, Physics, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
 
@@ -34,6 +34,61 @@ const TURN_RATE: f32 = 10.0;
 const LOOK_HEIGHT: f32 = 1.6;
 const CAMERA_DISTANCE: f32 = 4.0;
 const CAMERA_MIN: f32 = 0.6;
+/// How the chase camera follows a vehicle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChaseRig {
+    /// The point it turns about, model space.
+    pub pivot: Vec3,
+    /// How far behind that point it sits, metres.
+    pub distance: f32,
+    /// Where it looks when the drive starts (radians, up positive), if the
+    /// vehicle says, and how far down and up it may look.
+    pub pitch: Option<f32>,
+    pub pitch_range: (f32, f32),
+    /// It stays where the player aims, as a turret does, rather than
+    /// swinging back behind the vehicle once it moves.
+    pub follows_aim: bool,
+    /// How far above the camera's line the crosshair (and the gun's aim)
+    /// sits, radians.
+    pub aim_lift: f32,
+}
+
+/// How far above the middle of the screen a tank's crosshair sits,
+/// radians: in the Xbox 360 playthrough it is 0.38 of the way down the
+/// screen, 8 degrees above the camera's line with the 60 degree camera,
+/// so with the camera looking a little down at the tank, the gun aims at
+/// the horizon.
+const TANK_AIM_LIFT: f32 = 0.138;
+/// And on foot: 0.37 of the way down in the playthrough.
+const ON_FOOT_AIM_LIFT: f32 = 0.149;
+
+impl ChaseRig {
+    /// `spec`'s: its template's tank camera (above the turret ring, as
+    /// far back as the template says, looking a little down, staying
+    /// where the turret aims), else 2 m above its origin and back by about
+    /// its length, swinging back behind it unless it runs on tracks.
+    pub fn of(spec: &VehicleSpec) -> Self {
+        match spec.tuning.camera {
+            Some(c) => Self {
+                pivot: spec.pivot.unwrap_or(Vec3::ZERO).with_x(0.0) + Vec3::Y * c.height,
+                distance: c.distance,
+                pitch: Some(c.pitch),
+                pitch_range: c.pitch_range,
+                follows_aim: true,
+                aim_lift: TANK_AIM_LIFT,
+            },
+            None => Self {
+                pivot: Vec3::Y * 2.0,
+                distance: (spec.bounds.1.z - spec.bounds.0.z) * 0.9 + 3.0,
+                pitch: None,
+                pitch_range: (-1.2, 0.9),
+                follows_aim: spec.tracked,
+                aim_lift: 0.0,
+            },
+        }
+    }
+}
+
 /// Ticks the world must have been quiet before she lands: a building's
 /// collision can arrive a few frames after the ground under it.
 const SETTLED: u8 = 3;
@@ -124,9 +179,12 @@ pub struct Player {
     camera_distance: f32,
     /// Seconds since the mouse last turned the camera.
     look_still: f32,
-    /// While driving: the point the chase camera looks at, and the
-    /// vehicle's length.
+    /// While driving: the point the chase camera turns about, and how far
+    /// behind it the camera sits ([`ChaseRig`]).
     pub chase_target: Option<(Vec3, f32)>,
+    /// While driving: how far above the camera's line the crosshair sits
+    /// ([`ChaseRig::aim_lift`]).
+    aim_lift: f32,
     /// False until there is ground under the spawn point to land on.
     pub landed: bool,
     /// Set each tick the world around her is still streaming in: she does
@@ -162,6 +220,7 @@ impl Player {
             pitch: -0.2,
             camera_distance: CAMERA_DISTANCE,
             chase_target: None,
+            aim_lift: 0.0,
             look_still: 0.0,
             landed: false,
             streaming: false,
@@ -256,7 +315,7 @@ impl Player {
         }
 
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
-        let look = self.camera_forward();
+        let look = self.aim_forward();
         if let Some(t) = &mut self.throwing {
             *t += dt;
         }
@@ -344,7 +403,7 @@ impl Player {
                 (Some(_), ..) => self.throwing = None,
                 _ => {}
             }
-            // Aimed, the weapon points where the camera looks; the
+            // Aimed, the weapon points where the crosshair does; the
             // launcher at rest points level the way she faces.
             let (sf, cf) = self.facing.sin_cos();
             let rest = (self.launcher && self.throwing.is_none()).then_some(Vec3::new(sf, 0.0, cf));
@@ -365,10 +424,43 @@ impl Player {
         self.character.position + Vec3::Y * LOOK_HEIGHT
     }
 
+    /// The point the camera turns about: above her head on foot, above the
+    /// vehicle she drives. The crosshair's line passes through it, so a
+    /// shot goes at what lies straight along the camera from here.
+    pub fn pivot(&self) -> Vec3 {
+        self.chase_target
+            .map_or_else(|| self.look_at(), |(at, _)| at)
+    }
+
     pub fn camera_forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         Vec3::new(sy * cp, sp, cy * cp)
+    }
+
+    /// Where the crosshair points: a little above the camera's way on
+    /// foot and in a vehicle whose crosshair sits above the middle of the
+    /// screen, as the game's reticle does.
+    pub fn aim_forward(&self) -> Vec3 {
+        let lift = if self.chase_target.is_some() {
+            self.aim_lift
+        } else {
+            ON_FOOT_AIM_LIFT
+        };
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = (self.pitch + lift).sin_cos();
+        Vec3::new(sy * cp, sp, cy * cp)
+    }
+
+    /// Turns the camera so the crosshair is on `target`. The eye moves as
+    /// the camera turns, so it settles in a few steps.
+    pub fn aim_crosshair_at(&mut self, target: Vec3) {
+        for _ in 0..4 {
+            let to = target - self.eye();
+            let lift = self.aim_forward().y.asin() - self.camera_forward().y.asin();
+            self.yaw = to.x.atan2(to.z);
+            self.pitch = (to.y / to.length().max(0.01)).asin() - lift;
+        }
     }
 
     /// Pulls the camera in when something is between it and her.
@@ -380,22 +472,33 @@ impl Player {
         };
     }
 
-    /// Chase camera for a vehicle at `transform` `length` metres long,
-    /// rolling at `speed` m/s: turns `look`, and drifts back behind the
-    /// vehicle's heading only once it is moving and the mouse has been
-    /// still for a moment, so you can look around.
-    pub fn chase(&mut self, transform: Mat4, length: f32, look: Vec2, speed: f32, dt: f32) {
-        self.chase_target = Some((transform.transform_point3(Vec3::Y * 2.0), length));
+    /// Chase camera for a vehicle at `transform` rigged as `rig`, rolling
+    /// at `speed` m/s: turns `look`, and (unless it follows the aim) drifts
+    /// back behind the vehicle's heading once it is moving and the mouse
+    /// has been still for a moment, so you can look around.
+    pub fn chase(&mut self, transform: Mat4, rig: ChaseRig, look: Vec2, speed: f32, dt: f32) {
+        let f = transform.transform_vector3(Vec3::Z);
+        let heading = f.x.atan2(f.z);
+        if self.chase_target.is_none() {
+            if let Some(pitch) = rig.pitch {
+                self.pitch = pitch;
+            }
+            // In a tank she starts looking the way it faces: the camera
+            // won't swing round behind it by itself.
+            if rig.follows_aim {
+                self.yaw = heading;
+            }
+        }
+        self.chase_target = Some((transform.transform_point3(rig.pivot), rig.distance));
+        self.aim_lift = rig.aim_lift;
         self.yaw += look.x;
-        self.pitch = (self.pitch + look.y).clamp(-1.2, 0.9);
+        self.pitch = (self.pitch + look.y).clamp(rig.pitch_range.0, rig.pitch_range.1);
         self.look_still = if look == Vec2::ZERO {
             self.look_still + dt
         } else {
             0.0
         };
-        if self.look_still > CHASE_HOLD && speed.abs() > 2.0 {
-            let f = transform.transform_vector3(Vec3::Z);
-            let heading = f.x.atan2(f.z);
+        if !rig.follows_aim && self.look_still > CHASE_HOLD && speed.abs() > 2.0 {
             let mut turn = (heading - self.yaw).rem_euclid(std::f32::consts::TAU);
             if turn > std::f32::consts::PI {
                 turn -= std::f32::consts::TAU;
@@ -411,7 +514,7 @@ impl Player {
 
     pub fn eye(&self) -> Vec3 {
         match self.chase_target {
-            Some((at, length)) => at - self.camera_forward() * (length * 0.9 + 3.0),
+            Some((at, distance)) => at - self.camera_forward() * distance,
             None => self.look_at() - self.camera_forward() * self.camera_distance,
         }
     }
@@ -443,6 +546,68 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tank_camera_turns_above_the_turret_and_follows_the_aim() {
+        use m2_engine::tuning::TankCamera;
+        let mut spec = VehicleSpec {
+            model: 1,
+            kind: "tank".into(),
+            label: "amx30".into(),
+            wheels: Vec::new(),
+            bounds: (Vec3::new(-1.8, 0.0, -3.3), Vec3::new(2.0, 4.2, 8.1)),
+            seat: None,
+            door: None,
+            tracked: true,
+            road_wheels: Vec::new(),
+            rest: Vec::new(),
+            node_wheel: Vec::new(),
+            mass: 32_000.0,
+            turret: vec![true],
+            pivot: Some(Vec3::new(0.0, 1.53, 0.55)),
+            muzzle: None,
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
+            hull: (Vec3::new(-1.8, 0.0, -3.3), Vec3::new(1.8, 1.5, 3.3)),
+            turret_box: None,
+            tuning: Default::default(),
+        };
+        let plain = ChaseRig::of(&spec);
+        assert_eq!(plain.pivot, Vec3::Y * 2.0);
+        assert!(plain.follows_aim, "a tank's camera stays on the aim");
+        spec.tuning.camera = Some(TankCamera {
+            distance: 11.5,
+            height: 1.4,
+            pitch: -0.15,
+            pitch_range: (-0.4, 0.45),
+        });
+        let rig = ChaseRig::of(&spec);
+        assert!(
+            (rig.pivot - Vec3::new(0.0, 2.93, 0.55)).length() < 1e-5,
+            "{rig:?}"
+        );
+        assert_eq!((rig.distance, rig.pitch), (11.5, Some(-0.15)));
+        assert!(rig.follows_aim && rig.aim_lift > 0.0);
+        // Getting in: she looks the way it faces, a little down, and the
+        // crosshair sits above the camera's line.
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        let turned = Mat4::from_rotation_y(2.0);
+        p.chase(turned, rig, Vec2::ZERO, 0.0, 1.0 / 60.0);
+        assert!((p.yaw - 2.0).abs() < 1e-5, "{}", p.yaw);
+        assert!((p.pitch + 0.15).abs() < 1e-5);
+        assert!(p.aim_forward().y - p.camera_forward().y > 0.1);
+        // The mouse turns it, and it stays turned.
+        for _ in 0..120 {
+            p.chase(turned, rig, Vec2::new(0.005, 0.0), 10.0, 1.0 / 60.0);
+        }
+        assert!((p.yaw - 2.6).abs() < 1e-3, "{}", p.yaw);
+        // On foot again, the crosshair sits a little higher still.
+        p.chase_target = None;
+        let lift = p.aim_forward().y.asin() - p.camera_forward().y.asin();
+        assert!((lift - ON_FOOT_AIM_LIFT).abs() < 1e-4, "{lift}");
+    }
     use m2_engine::{CollisionShape, StaticKey};
     use m2_math::glam::Quat;
 

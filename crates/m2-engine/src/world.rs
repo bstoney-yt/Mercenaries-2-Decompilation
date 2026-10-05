@@ -30,6 +30,7 @@ use m2_render::{
 
 use crate::assets::{AssetError, AssetSource};
 use crate::physics::CollisionShape;
+use crate::tuning::VehicleTuning;
 
 /// Side of the island in metres (20 cells of 400 m).
 pub const ISLAND: f32 = 8000.0;
@@ -102,6 +103,9 @@ pub struct TemplateInfo {
     /// A person (a soldier, a civilian): it has [`PERSON`] physics, or AI
     /// of a person's and no vehicle physics.
     pub person: bool,
+    /// It has [`PERSON`] physics: a body that walks (not a spawner of
+    /// people, which may have AI).
+    pub human: bool,
 }
 
 /// The physics component of people, as `_CarPhysicsV2` is of cars.
@@ -122,6 +126,8 @@ pub struct Templates {
     /// set): the id an entity's [`parent`](m2_assets::layer::Placement::parent)
     /// gives.
     pub names: HashMap<u32, String>,
+    /// How the templates that say so handle and fight, by id.
+    pub tuning: HashMap<u32, VehicleTuning>,
 }
 
 impl Templates {
@@ -136,6 +142,43 @@ impl Templates {
     pub fn by_id(&self, id: u32) -> Option<(&str, &TemplateInfo)> {
         let name = self.names.get(&id)?;
         Some((name, self.by_name.get(&name.to_ascii_lowercase())?))
+    }
+
+    /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
+    /// else of a template of its `model`
+    /// ([`tuning_for_model`](Self::tuning_for_model)).
+    pub fn tuning_for(&self, name: &str, model: u32) -> Option<VehicleTuning> {
+        let stem = member_stem(name);
+        self.names
+            .iter()
+            .filter(|(_, n)| n.eq_ignore_ascii_case(stem))
+            .find_map(|(id, _)| self.tuning.get(id).copied())
+            .or_else(|| self.tuning_for_model(model))
+    }
+
+    /// The tuning of a template of `model`: a model's templates are
+    /// variants that share it (the AMX-30's with and without a driver,
+    /// for the scripts or the player; an anti-aircraft tank on a tank's
+    /// hull). The first by name with a main turret, else with a turret,
+    /// else with any.
+    pub fn tuning_for_model(&self, model: u32) -> Option<VehicleTuning> {
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        let tunings: Vec<VehicleTuning> = ids
+            .iter()
+            .filter_map(|(_, id)| self.tuning.get(id).copied())
+            .collect();
+        tunings
+            .iter()
+            .find(|t| t.turret.is_some_and(|t| t.main))
+            .or_else(|| tunings.iter().find(|t| t.turret.is_some()))
+            .or(tunings.first())
+            .copied()
     }
 
     /// The engine sound bank most templates of `model` use (a model's
@@ -212,6 +255,7 @@ impl Templates {
                             engine: engines.get(&id).copied(),
                             person: humans.contains(&id)
                                 || (minds.contains(&id) && vehicle.is_none()),
+                            human: humans.contains(&id),
                         },
                     )
                 })
@@ -220,6 +264,7 @@ impl Templates {
                 .into_iter()
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
+            tuning: crate::tuning::read(&db),
         }
     }
 }
@@ -297,6 +342,8 @@ pub struct SpawnPoint {
     /// in the game it is there only while that layer is in. `None` for
     /// the static layers.
     pub layer: Option<u32>,
+    /// The model of its template, when that is a person's (`Carmona`'s).
+    pub model: Option<u32>,
 }
 
 /// Where everything on the island is.
@@ -511,14 +558,18 @@ impl WorldIndex {
         }
         let names = layer.names();
         let mut seen: HashSet<u32> = HashSet::new();
-        let spawn = |id: u32, p: &Placement| SpawnPoint {
-            entity: id,
-            name: names.get(&id).copied().unwrap_or("").to_owned(),
-            template: templates.by_id(p.parent).map(|(t, _)| t.to_owned()),
-            position: Vec3::from(p.position),
-            rotation: rotation(p.rotation),
-            route: Vec::new(),
-            layer: (!is_static).then_some(layer_hash),
+        let spawn = |id: u32, p: &Placement| {
+            let template = templates.by_id(p.parent);
+            SpawnPoint {
+                entity: id,
+                name: names.get(&id).copied().unwrap_or("").to_owned(),
+                template: template.map(|(t, _)| t.to_owned()),
+                position: Vec3::from(p.position),
+                rotation: rotation(p.rotation),
+                route: Vec::new(),
+                layer: (!is_static).then_some(layer_hash),
+                model: template.and_then(|(_, t)| t.model.filter(|_| t.human)),
+            }
         };
         for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
             let Some(c) = layer.component(component) else {
@@ -978,6 +1029,7 @@ mod tests {
             vehicle: Some(VehicleKind::Car),
             engine,
             person: false,
+            human: false,
         };
         let db = Templates {
             by_name: HashMap::from([
@@ -988,6 +1040,7 @@ mod tests {
                 ("hmmwv".to_owned(), t(2, None)),
             ]),
             names: HashMap::from([(0x8000_0001, "Valiant (Python)".to_owned())]),
+            tuning: HashMap::new(),
         };
         assert_eq!(
             db.by_id(0x8000_0001).map(|(n, _)| n),

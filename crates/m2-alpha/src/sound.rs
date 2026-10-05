@@ -130,7 +130,7 @@ pub struct GameAudio {
     next_track: usize,
     decoded: (Sender<Decoded>, Receiver<Decoded>),
     /// Rifle shot, rocket launch, explosion.
-    fight: [Option<SoundBuffer>; 3],
+    fight: [Option<SoundBuffer>; 4],
     /// Short sounds of the town (`amb_citymed`) and the jungle
     /// (`amb_jungle`) played now and then around the listener.
     ambient: [Vec<SoundBuffer>; 2],
@@ -231,13 +231,15 @@ const AMBIENT_LONGEST: f32 = 8.0;
 /// Engine banks for vehicles whose template doesn't name one (the
 /// template database's `SoundEffect` does for most), by kind and label
 /// words, first match: the banks the templates give such vehicles.
-const ENGINES: [(&str, &str); 12] = [
+const ENGINES: [(&str, &str); 13] = [
     ("helicopter", "veh_helicoptermedium"),
     ("hmmwv|humvee|valiant", "veh_largegascrappy"),
     ("m151|jeep", "veh_jeep"),
     ("amx", "veh_tankmed"),
+    // The Stryker is the game's LAV III.
+    ("stryker|lav", "veh_largedieselold"),
+    ("m113|apc", "veh_tankdiesel"),
     ("tank", "veh_tankbig"),
-    ("apc|stryker", "veh_tankmed"),
     ("semi", "veh_semi"),
     ("bus", "veh_bus"),
     ("pickup|truck", "veh_8cylindertruck"),
@@ -297,7 +299,8 @@ impl Engine {
     fn mix(sounds: &EngineSounds, rpm: f32) -> Vec<(f32, f32)> {
         let n = sounds.loops.len();
         if n == 1 {
-            return vec![(1.0, 0.8 + 0.7 * rpm)];
+            let (idle, top) = sounds.heard.unwrap_or((0.8, 1.5));
+            return vec![(1.0, idle + (top - idle) * rpm)];
         }
         let at = rpm.clamp(0.0, 1.0) * (n - 1) as f32;
         let k = (at.floor() as usize).min(n - 2);
@@ -333,8 +336,32 @@ impl Engine {
     }
 }
 
+/// A tank's main gun: the loudest of its bank's sounds 0.4 to 4 s long.
+fn tank_gun(library: &SoundLibrary) -> Option<SoundBuffer> {
+    pick(library, "wpn_tankgun", |s| {
+        (0.4..=4.0).contains(&s.seconds())
+    })
+    .inspect(|s| eprintln!("sound: tank gun {:08x} ({:.2} s)", s.hash, s.seconds()))
+}
+
+/// Reads and logs which sound a tank's gun plays (for the drive test,
+/// whose picture has no sound).
+pub fn log_tank_gun(install: &Install) {
+    let library = install
+        .open_world()
+        .and_then(|mut source| SoundLibrary::load(&mut source, &["wpn_tankgun"]));
+    match library {
+        Ok(l) => {
+            if tank_gun(&l).is_none() {
+                eprintln!("sound: no tank gun shot in wpn_tankgun");
+            }
+        }
+        Err(e) => eprintln!("sound: no tank gun ({e})"),
+    }
+}
+
 /// Sounds read from the banks: the fight's and the ambient one-shots.
-type BankSounds = ([Option<SoundBuffer>; 3], [Vec<SoundBuffer>; 2]);
+type BankSounds = ([Option<SoundBuffer>; 4], [Vec<SoundBuffer>; 2]);
 
 /// The fight's sounds and the ambient one-shots.
 fn bank_sounds(install: &Install) -> BankSounds {
@@ -345,6 +372,7 @@ fn bank_sounds(install: &Install) -> BankSounds {
                 "wpn_assaultrifle",
                 "wpn_rpg",
                 "support_artillery",
+                "wpn_tankgun",
                 "amb_citymed",
                 "amb_jungle",
             ],
@@ -368,6 +396,7 @@ fn bank_sounds(install: &Install) -> BankSounds {
                     pick(&l, "support_artillery", |s| {
                         s.channels == 1 && (1.5..=3.0).contains(&s.seconds())
                     }),
+                    tank_gun(&l),
                 ],
                 [short("amb_citymed"), short("amb_jungle")],
             )
@@ -449,6 +478,8 @@ pub fn load_engine(install: &Install, bank: u32) -> Option<EngineSounds> {
         picked.loops.len(),
         if picked.named {
             " by name"
+        } else if picked.heard.is_some() {
+            " as heard in a playthrough"
         } else {
             " measured"
         },
@@ -683,6 +714,7 @@ impl GameAudio {
                 Sound::Shot(at) => (0, at, 0.9),
                 Sound::Launch(at) => (1, at, 1.0),
                 Sound::Explosion(at) => (2, at, 1.4),
+                Sound::Cannon(at) => (3, at, 1.3),
             };
             if let Some(buffer) = self.fight[i].clone() {
                 self.out.with(|m| m.play(Play::at(buffer, at).gain(gain)));
@@ -825,9 +857,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_heard_engine_runs_between_its_heard_pitches() {
+        let mut e = engine(&[Some(125.0)]);
+        e.heard = Some((0.84, 1.0));
+        assert_eq!(Engine::mix(&e, 0.0), vec![(1.0, 0.84)]);
+        assert_eq!(Engine::mix(&e, 1.0), vec![(1.0, 1.0)]);
+    }
+
+    #[test]
     fn engines_go_by_kind_and_name() {
         assert_eq!(engine_bank("tank", "al_veh_tank_m1"), "veh_tankbig");
-        assert_eq!(engine_bank("car", "al_veh_apc_stryker"), "veh_tankmed");
+        assert_eq!(
+            engine_bank("car", "al_veh_apc_stryker"),
+            "veh_largedieselold"
+        );
+        assert_eq!(engine_bank("apc", "vz_veh_apc_m113"), "veh_tankdiesel");
         assert_eq!(engine_bank("truck", "semi_orange"), "veh_semi");
         assert_eq!(
             engine_bank("car", "global_veh_68valiant4door"),
