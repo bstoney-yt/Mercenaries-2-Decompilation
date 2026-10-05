@@ -1557,8 +1557,16 @@ impl Autoplay {
             .driving
             .and_then(|i| game.scene.vehicles.get(i))
             .map(|v| format!("driving the {}", v.spec.label));
+        // What may hold her still (round 97's tank stood 125 s).
+        let mut holding = String::new();
+        if let Some(since) = self.arrived {
+            holding += &format!("; there {:.0} s", self.clock - since);
+        }
+        if game.support.busy() {
+            holding += &format!("; support {:?}", game.support.phase);
+        }
         eprintln!(
-            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, {}; closest {:.0} m, {:.0} s ago; {} hops",
+            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, {}; closest {:.0} m, {:.0} s ago; {} hops{holding}",
             self.clock,
             game.focus(),
             riding.unwrap_or_else(|| "on foot".to_owned()),

@@ -1313,14 +1313,15 @@ fn mission_for_screenshot(
     let mut pickup_shots: Vec<(u32, (u32, u32), usize)> = Vec::new();
     // And the satellite's view as the timing wheel comes up for each
     // call (`-satelliteN`), her PDA as she opens it (`-pdaN`), and her own
-    // view two seconds after each bomb lands (`-bombN`), all with the HUD:
-    // whether the wheel (the PDA) was up, the pictures taken and those due
-    // (tick, number).
+    // view two seconds after each bomb lands (`-bombN`) and eight
+    // (`-bombN-late`, when the videos' gates lie broken: round 96), all
+    // with the HUD: whether the wheel (the PDA) was up, the pictures taken
+    // and those due (tick, number, seconds after).
     let mut wheel_up = false;
     let mut satellite_shots = 0;
     let (mut pda_shots, mut pda_up) = (0, false);
     let mut bombs = 0;
-    let mut bomb_shots: Vec<(u32, usize)> = Vec::new();
+    let mut bomb_shots: Vec<(u32, usize, u32)> = Vec::new();
     // The clips' sound events met, by category and name: how many hers,
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
@@ -1494,18 +1495,21 @@ fn mission_for_screenshot(
                 .any(|l| matches!(l, support::Impact::Bomb(_)))
             {
                 bombs += 1;
-                bomb_shots.push((i + (2.0 / tick) as u32, bombs));
+                for after in [2, 8] {
+                    bomb_shots.push((i + (after as f32 / tick) as u32, bombs, after));
+                }
             }
-            let due: Vec<usize> = bomb_shots
+            let due: Vec<(usize, u32)> = bomb_shots
                 .iter()
                 .filter(|s| s.0 == i)
-                .map(|s| s.1)
+                .map(|s| (s.1, s.2))
                 .collect();
-            for n in due {
-                let path = picture(format!("bomb{n}"));
+            for (n, after) in due {
+                let late = if after > 2 { "-late" } else { "" };
+                let path = picture(format!("bomb{n}{late}"));
                 hud_picture(backend, game, &link, fov, aspect, &path)?;
                 eprintln!(
-                    "autoplay: pictured her view 2 s after bomb {n}, from {:.1}, health {:.0}: {}",
+                    "autoplay: pictured her view {after} s after bomb {n}, from {:.1}, health {:.0}: {}",
                     game.focus(),
                     game.combat.hp,
                     path.display()
