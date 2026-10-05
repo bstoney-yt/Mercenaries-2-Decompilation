@@ -417,15 +417,15 @@ pub struct World {
     /// each tick; colliders added by [`update`](Self::update) join scene
     /// queries on the next step.
     pub physics: Physics,
-    /// Updates so far, for the foliage log.
-    updates: u64,
+    /// When the foliage log last printed.
+    foliage_logged: std::time::Instant,
     /// `M2_HIDE=<model>,<model>...`: placed models by these names aren't
     /// drawn, to find which model a stray shape on screen is.
     hidden: HashSet<u32>,
 }
 
 /// `M2_LOG_FOLIAGE=on`: logs the scatter meshes as they load and, every
-/// 600 updates, the placed objects and unplaced names near the camera.
+/// 5 seconds, the placed objects and unplaced names near the camera.
 fn logging_foliage() -> bool {
     std::env::var("M2_LOG_FOLIAGE").as_deref() == Ok("on")
 }
@@ -494,7 +494,7 @@ impl World {
             loose: HashMap::new(),
             knocked: HashMap::new(),
             physics: Physics::new(),
-            updates: 0,
+            foliage_logged: std::time::Instant::now(),
             hidden: std::env::var("M2_HIDE")
                 .unwrap_or_default()
                 .split(',')
@@ -634,8 +634,8 @@ impl World {
         eye: Vec3,
     ) -> Result<(), BackendError> {
         self.receive(backend, materials)?;
-        self.updates += 1;
-        if self.updates.is_multiple_of(600) && logging_foliage() {
+        if logging_foliage() && self.foliage_logged.elapsed().as_secs_f32() >= 5.0 {
+            self.foliage_logged = std::time::Instant::now();
             self.log_foliage(eye);
         }
 
