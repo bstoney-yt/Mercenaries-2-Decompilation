@@ -35,7 +35,7 @@ use m2_game::mission::{GameData, Mission};
 use m2_math::glam::Vec3;
 use mlua::{IntoLuaMulti, Lua, Value};
 
-use crate::combat::{Combat, Fired, Weapon};
+use crate::combat::{Combat, Fired, Picked, Weapon};
 use crate::config::Config;
 use crate::game::Game;
 
@@ -113,6 +113,8 @@ pub struct HudState {
     pub in_vehicle: bool,
     pub weapon: Weapon,
     pub fired: Fired,
+    /// Rounds picked up (a supply crate's rockets).
+    pub picked: Picked,
     /// The label of the vehicle she is in.
     pub vehicle: Option<String>,
     /// Which way the camera looks, degrees, growing as it turns left
@@ -177,6 +179,7 @@ impl HudState {
             in_vehicle: vehicle.is_some(),
             weapon: game.combat.weapon,
             fired: game.combat.fired,
+            picked: game.combat.picked,
             vehicle: vehicle.map(|v| v.spec.label.clone()),
             heading: game.camera.yaw.to_degrees(),
             target,
@@ -727,7 +730,7 @@ impl Thread {
             )?;
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
         }
-        let ammo = ammo(s.weapon, s.fired);
+        let ammo = ammo(s.weapon, s.fired, s.picked);
         if self.told.ammo != Some(ammo) {
             self.told.ammo = Some(ammo);
             let names = [
@@ -905,18 +908,22 @@ fn reticle_widgets(screen: &gui_runtime::Screen) -> HashSet<u32> {
 }
 
 /// Clip, in the clip, stored, grenades, grenades stored: as
-/// `GuiAmmoUpdate` takes them.
-fn ammo(weapon: Weapon, fired: Fired) -> [u32; 5] {
+/// `GuiAmmoUpdate` takes them. Rounds picked up add to the stores; the
+/// rockets count down from that and, run out, start again full.
+fn ammo(weapon: Weapon, fired: Fired, picked: Picked) -> [u32; 5] {
     let grenades = GRENADES - fired.grenades % GRENADES;
     match weapon {
         Weapon::Rifle => [
             RIFLE_CLIP,
             RIFLE_CLIP - fired.rifle % RIFLE_CLIP,
-            RIFLE_STORED,
+            RIFLE_STORED + picked.rifle,
             grenades,
             0,
         ],
-        Weapon::Rpg => [1, 1, RPG_STORED - fired.rockets % RPG_STORED, grenades, 0],
+        Weapon::Rpg => {
+            let stock = RPG_STORED + picked.rockets;
+            [1, 1, stock - fired.rockets % stock, grenades, 0]
+        }
     }
 }
 
@@ -1266,13 +1273,26 @@ mod tests {
             rockets,
             grenades,
         };
-        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 0))[1], 30);
-        assert_eq!(ammo(Weapon::Rifle, fired(29, 0, 0))[1], 1);
-        assert_eq!(ammo(Weapon::Rifle, fired(30, 0, 0))[1], 30);
-        assert_eq!(ammo(Weapon::Rpg, fired(0, 0, 0))[..3], [1, 1, RPG_STORED]);
-        assert_eq!(ammo(Weapon::Rpg, fired(0, 1, 0))[2], RPG_STORED - 1);
-        assert_eq!(ammo(Weapon::Rpg, fired(0, 4, 0))[2], RPG_STORED);
-        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 1))[3], GRENADES - 1);
+        let none = Picked::default();
+        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 0), none)[1], 30);
+        assert_eq!(ammo(Weapon::Rifle, fired(29, 0, 0), none)[1], 1);
+        assert_eq!(ammo(Weapon::Rifle, fired(30, 0, 0), none)[1], 30);
+        assert_eq!(
+            ammo(Weapon::Rpg, fired(0, 0, 0), none)[..3],
+            [1, 1, RPG_STORED]
+        );
+        assert_eq!(ammo(Weapon::Rpg, fired(0, 1, 0), none)[2], RPG_STORED - 1);
+        assert_eq!(ammo(Weapon::Rpg, fired(0, 4, 0), none)[2], RPG_STORED);
+        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 1), none)[3], GRENADES - 1);
+        // A crate's 20 rockets after three fired: 21 left.
+        let crate_ = Picked {
+            rockets: 20,
+            ..Picked::default()
+        };
+        assert_eq!(
+            ammo(Weapon::Rpg, fired(0, 3, 0), crate_)[2],
+            RPG_STORED + 17
+        );
     }
 
     #[test]
