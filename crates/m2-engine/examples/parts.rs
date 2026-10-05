@@ -85,6 +85,12 @@ const WORDS: &[&str] = &[
     "SetState",
     "SetRootNode",
     "SendMessage",
+    // And in its collapse: the message that starts it, each piece made an
+    // object of its own, the emitters at its locators, the camera's shake.
+    "DestroyMsg",
+    "CreateObject",
+    "StartEmitter",
+    "CameraShake",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

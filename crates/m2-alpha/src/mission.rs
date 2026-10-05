@@ -1027,15 +1027,22 @@ fn break_props(game: &mut Game, mission: &Mission) {
         (dead, gone)
     };
     drop(w);
-    let mut fires = Vec::new();
+    let (mut fires, mut falling) = (Vec::new(), Vec::new());
     for e in dead {
         scene.props.wreck(&mut world.physics, e, blast);
         fires.extend(scene.props.breakup_points(e));
+        if scene.props.broke_apart(e) {
+            falling.extend(scene.props.centre(e));
+        }
     }
     scene.props.hide(&mut world.physics, gone);
-    // What broke apart burns where its break-up says.
+    // What broke apart burns where its break-up says, and is heard
+    // coming down.
     for at in fires {
         game.combat.blaze(&world.physics, at);
+    }
+    for at in falling {
+        game.combat.collapse(at);
     }
 }
 

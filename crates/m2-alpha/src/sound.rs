@@ -131,8 +131,9 @@ pub struct GameAudio {
     music: Option<VoiceId>,
     next_track: usize,
     decoded: (Sender<Decoded>, Receiver<Decoded>),
-    /// Rifle shot, rocket launch, explosion.
-    fight: [Option<SoundBuffer>; 5],
+    /// Rifle shot, rocket launch, explosion, tank gun, grenade launcher,
+    /// a building coming down.
+    fight: [Option<SoundBuffer>; 6],
     /// Short sounds of the town (`amb_citymed`) and the jungle
     /// (`amb_jungle`) played now and then around the listener.
     ambient: [Vec<SoundBuffer>; 2],
@@ -460,7 +461,15 @@ pub fn log_tank_gun(install: &Install) {
 }
 
 /// Sounds read from the banks: the fight's and the ambient one-shots.
-type BankSounds = ([Option<SoundBuffer>; 5], [Vec<SoundBuffer>; 2]);
+type BankSounds = ([Option<SoundBuffer>; 6], [Vec<SoundBuffer>; 2]);
+
+/// A building coming down (a mission's gate the bomb brings down): the
+/// rumble of the building destruction bank (`bulding_destruct`, the
+/// game's spelling), `sfx_dest_dist_rumble_genericd`, found by its name's
+/// hash with its bank's debris sounds (`sfx_debris_distant_hut_mid_03a`
+/// and `_03b`). The gate's own script names its sounds through emitters
+/// not yet read.
+const COLLAPSE_SOUND: u32 = 0x9204_a89a;
 
 /// The fight's sounds and the ambient one-shots.
 fn bank_sounds(install: &Install) -> BankSounds {
@@ -475,6 +484,7 @@ fn bank_sounds(install: &Install) -> BankSounds {
                 "wpn_grenadelauncher",
                 "amb_citymed",
                 "amb_jungle",
+                "bulding_destruct",
             ],
         )
     });
@@ -504,6 +514,9 @@ fn bank_sounds(install: &Install) -> BankSounds {
                             s.hash,
                             s.seconds()
                         )
+                    }),
+                    pick(&l, "bulding_destruct", |s| s.hash == COLLAPSE_SOUND).inspect(|s| {
+                        eprintln!("sound: collapse {:08x} ({:.2} s)", s.hash, s.seconds())
                     }),
                 ],
                 [short("amb_citymed"), short("amb_jungle")],
@@ -878,6 +891,7 @@ impl GameAudio {
                 Sound::Bomb(at) => (2, at, 2.5),
                 Sound::Cannon(at) => (3, at, 1.3),
                 Sound::Lob(at) => (4, at, 1.0),
+                Sound::Collapse(at) => (5, at, 2.0),
             };
             if let Some(buffer) = self.fight[i].clone() {
                 self.out.with(|m| m.play(Play::at(buffer, at).gain(gain)));

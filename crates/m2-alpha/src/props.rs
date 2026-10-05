@@ -335,6 +335,11 @@ impl Props {
         true
     }
 
+    /// Whether `entity` broke apart (its pieces thrown).
+    pub fn broke_apart(&self, entity: u32) -> bool {
+        self.broken.contains_key(&entity)
+    }
+
     /// Where `entity`'s break-up names points (its fires), world space:
     /// none unless it broke apart.
     pub fn breakup_points(&self, entity: u32) -> Vec<Vec3> {
@@ -401,6 +406,67 @@ impl Props {
         let m = self.models.get(&p.model)?.as_ref()?;
         let (lo, hi) = m.gpu.bounds;
         Some(p.position + p.rotation * ((lo + hi) * 0.5))
+    }
+
+    /// How `entity` stands, if it is shown, for the autoplay's pictures of
+    /// a gate the bomb brought down: broken, how many of its pieces fly,
+    /// how far the rest has sunk, and what is drawn of it.
+    pub fn describe(&self, physics: &Physics, entity: u32) -> Option<String> {
+        let p = self.shown.get(&entity)?;
+        let mut s = format!("{entity:#x} ({:08x}) at {:.1}", p.model, p.position);
+        let Some(Some(m)) = self.models.get(&p.model) else {
+            return Some(s + ", its model not loaded");
+        };
+        if p.wrecked {
+            s += ", wrecked";
+        }
+        let loose = match (self.broken.get(&entity), self.knocked.get(&entity)) {
+            (Some(pieces), _) => Some((m.breakup.as_deref().map(|b| &b.pieces), pieces)),
+            (None, Some(pieces)) => Some((self.loose(entity), pieces)),
+            (None, None) => None,
+        };
+        if let Some((loose, pieces)) = loose {
+            let places: Vec<Option<Mat4>> =
+                pieces.iter().map(|&d| physics.debris_place(d)).collect();
+            let placed = places.iter().flatten().count();
+            s += &format!(", {placed} of {} pieces placed", pieces.len());
+            if let Some(loose) = loose {
+                // Those still where they started (a piece that never flew
+                // stands as it did).
+                let at = Mat4::from_rotation_translation(p.rotation, p.position);
+                let still = loose
+                    .starts(at)
+                    .iter()
+                    .zip(&places)
+                    .filter(|(start, now)| {
+                        now.is_some_and(|now| {
+                            now.w_axis.truncate().distance(start.w_axis.truncate()) < 0.5
+                        })
+                    })
+                    .count();
+                s += &format!(" ({still} still where they started)");
+                let (rest, flown, skinned) =
+                    m.gpu.drawn_moved(loose.breaks || p.wrecked, loose.flying());
+                s += &format!(
+                    "; drawn: {rest} parts with the rest, {flown} flying, {skinned} of them \
+                     skinned"
+                );
+            }
+        }
+        if let Some(sink) = self.sinking.get(&entity) {
+            let height = (m.gpu.bounds.1.y - m.gpu.bounds.0.y).max(1.0);
+            let depth = 0.5 * SINK_ACCEL * sink.time * sink.time;
+            s += &match sink.place(m.gpu.bounds) {
+                Some(_) => format!(
+                    "; the rest sunk {depth:.1} of {height:.1} m after {:.1} s, leaning {:.1} \
+                     deg",
+                    sink.time,
+                    (sink.lean * (depth / height).min(1.0)).to_degrees()
+                ),
+                None => format!("; the rest gone under after {:.1} s", sink.time),
+            };
+        }
+        Some(s)
     }
 
     /// `entity`'s, if it is shown, and whether its model has loaded.

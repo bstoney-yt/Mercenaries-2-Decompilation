@@ -934,6 +934,64 @@ fn screenshot(
     Ok(())
 }
 
+/// What stands where a bomb fell (`at`, x and z), as its pictures are
+/// taken: the state layers' models near it and how each stands (a gate
+/// the bomb broke: its pieces, how far the rest has sunk, what is drawn
+/// of it), and the island's own placed models whose boxes cover the spot
+/// (round 99's broken gates still showed an arch and doors at 8 s, when
+/// the gate's own wreck is drawn no more).
+fn describe_bombed(game: &Game, at: m2_math::glam::Vec2, fov: f32, aspect: f32) {
+    let Some(world) = &game.scene.world else {
+        return;
+    };
+    let props = &game.scene.props;
+    let mut near: Vec<(f32, u32)> = props
+        .shown()
+        .map(|(e, p)| {
+            (
+                p.position
+                    .with_y(0.0)
+                    .distance(m2_math::glam::Vec3::new(at.x, 0.0, at.y)),
+                e,
+            )
+        })
+        .filter(|&(d, _)| d < BOMBED_REACH)
+        .collect();
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (d, e) in near.iter().take(4) {
+        if let Some(s) = props.describe(&world.physics, *e) {
+            eprintln!("  prop {d:.1} m from the bomb: {s}");
+        }
+    }
+    let spot = near
+        .first()
+        .and_then(|&(_, e)| props.centre(e))
+        .unwrap_or(m2_math::glam::Vec3::new(at.x, game.focus().y, at.y));
+    let eye = game.view(fov, aspect).eye();
+    let over: Vec<String> = world
+        .covering(spot, eye, 2.0)
+        .into_iter()
+        .map(|(model, place, size)| {
+            format!(
+                "{model:08x} at {place:.1}, {:.1}x{:.1}x{:.1} m",
+                size.x, size.y, size.z
+            )
+        })
+        .collect();
+    eprintln!(
+        "  the island's models drawn over {spot:.1}: {}",
+        if over.is_empty() {
+            "none".to_owned()
+        } else {
+            over.join("; ")
+        }
+    );
+}
+
+/// How far from where a bomb fell [`describe_bombed`] looks for the state
+/// layers' models (metres): a gate's middle, as far as from one end of it.
+const BOMBED_REACH: f32 = 40.0;
+
 /// Draws a frame with the HUD (and the mission's objectives) and writes
 /// it to `out` as a binary PPM.
 fn hud_picture(
@@ -1089,10 +1147,19 @@ fn describe_slung(game: &Game) -> Vec<String> {
             continue;
         };
         let middle = body.transform_point3(Vec3::new(0.0, 1.4, 0.0));
-        let barrel = at.transform_vector3(w.muzzle).normalize_or_zero();
+        // Along its length (its box's longest side), toward its muzzle's end.
+        let (lo, hi) = w.model.bounds;
+        let size = hi - lo;
+        let long = (0..3).fold(0, |a, b| if size[b] > size[a] { b } else { a });
+        let mut length = Vec3::ZERO;
+        length[long] = if w.muzzle[long] < (lo[long] + hi[long]) * 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
+        let barrel = at.transform_vector3(length).normalize_or_zero();
         let top = at.transform_vector3(Vec3::Y).normalize_or_zero();
         // Its box's corners, from her middle (ahead, right, up).
-        let (lo, hi) = w.model.bounds;
         let corners: Vec<Vec3> = (0..8)
             .map(|k| {
                 let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
@@ -1113,7 +1180,7 @@ fn describe_slung(game: &Game) -> Vec<String> {
         let (ahead_span, right_span, up_span) = (span(0), span(1), span(2));
         let muzzle_end = if barrel.y < 0.0 { "down" } else { "up" };
         lines.push(format!(
-            "{weapon:?} on her {side}: barrel {:.2} ({:.0} deg above level, muzzle end {muzzle_end}), \
+            "{weapon:?} on her {side}: length {:.2} ({:.0} deg above level, muzzle end {muzzle_end}), \
              from {:.2} to {:.2} m above her feet, {:.2} to {:.2} m to her right, {:.2} to {:.2} m \
              ahead of her middle; top {:.2}, grip {:.2} and muzzle {:.2} from her back's middle",
             local(barrel),
@@ -1350,7 +1417,10 @@ fn mission_for_screenshot(
     let mut satellite_shots = 0;
     let (mut pda_shots, mut pda_up) = (0, false);
     let mut bombs = 0;
-    let mut bomb_shots: Vec<(u32, usize, u32)> = Vec::new();
+    let mut bomb_shots: Vec<(u32, usize, u32, m2_math::glam::Vec2)> = Vec::new();
+    // The tutorial box's line as last shown, its keys named (round 99's
+    // `[sprint]` showed in no picture).
+    let mut tutorial_shown: Option<String> = None;
     // The clips' sound events met, by category and name: how many hers,
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
@@ -1365,6 +1435,16 @@ fn mission_for_screenshot(
         };
         game.step(intent, tick);
         link.tick(game, tick);
+        if auto.is_some() {
+            let shown = link.view().tutorial;
+            if shown != tutorial_shown {
+                eprintln!(
+                    "autoplay: the tutorial box reads {shown:?} at {:.1} s",
+                    i as f32 * tick
+                );
+                tutorial_shown = shown;
+            }
+        }
         for c in game.scene.take_cues(game.focus(), CUE_REACH) {
             let e = heard.entry((c.category, c.name)).or_default();
             if c.hers {
@@ -1517,23 +1597,21 @@ fn mission_for_screenshot(
                 );
             }
             pda_up = game.support.pda;
-            if game
-                .support
-                .landed
-                .iter()
-                .any(|l| matches!(l, support::Impact::Bomb(_)))
-            {
+            if let Some(at) = game.support.landed.iter().find_map(|l| match l {
+                support::Impact::Bomb(at) => Some(*at),
+                _ => None,
+            }) {
                 bombs += 1;
                 for after in [2, 8] {
-                    bomb_shots.push((i + (after as f32 / tick) as u32, bombs, after));
+                    bomb_shots.push((i + (after as f32 / tick) as u32, bombs, after, at));
                 }
             }
-            let due: Vec<(usize, u32)> = bomb_shots
+            let due: Vec<(usize, u32, m2_math::glam::Vec2)> = bomb_shots
                 .iter()
                 .filter(|s| s.0 == i)
-                .map(|s| (s.1, s.2))
+                .map(|s| (s.1, s.2, s.3))
                 .collect();
-            for (n, after) in due {
+            for (n, after, at) in due {
                 let late = if after > 2 { "-late" } else { "" };
                 let path = picture(format!("bomb{n}{late}"));
                 hud_picture(backend, game, &link, fov, aspect, &path)?;
@@ -1543,6 +1621,7 @@ fn mission_for_screenshot(
                     game.combat.hp,
                     path.display()
                 );
+                describe_bombed(game, at, fov, aspect);
             }
             for (due, name) in [(boat_shot, "boat"), (ashore_shot, "ashore")] {
                 if due == Some(i) {
