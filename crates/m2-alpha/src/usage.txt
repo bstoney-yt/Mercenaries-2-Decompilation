@@ -83,16 +83,20 @@ m2-alpha [options]
                          this far from the nearest marker, looking at it
   --autoplay             with --mission --screenshot: she plays the contract
                          herself by its markers (runs to places, shoots the
-                         marked soldiers, rockets the marked gates, takes
-                         the vehicles brought, going a way planned round
-                         walls, the sea and steep ground), logging how it
-                         goes, until it is done or --mission-seconds are up;
-                         each delivery is pictured beside the screenshot as
-                         its helicopter hovers (<out>-delivery1.ppm, ...)
-                         and once its load is down (-delivery1-down.ppm),
-                         and the start's boat five seconds after she is
-                         seated in it (-boat.ppm) and her three seconds
-                         after she gets out of it (-ashore.ppm)
+                         marked soldiers, calls a satellite bomb on the
+                         marked gates, takes the vehicles brought, going a
+                         way planned round walls, the sea and steep
+                         ground), logging how it goes, until it is done or
+                         --mission-seconds are up; each delivery is
+                         pictured beside the screenshot as its helicopter
+                         hovers (<out>-delivery1.ppm, ...) and once its
+                         load is down (-delivery1-down.ppm), the start's
+                         boat five seconds after she is seated in it
+                         (-boat.ppm), her three seconds after she gets out
+                         of it (-ashore.ppm), what each crate leaves
+                         (-pickup1.ppm, ...), the satellite's view as each
+                         timing wheel comes up (-satellite1.ppm, ...) and
+                         her view two seconds after each bomb (-bomb1.ppm)
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
