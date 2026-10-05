@@ -64,6 +64,9 @@ pub struct DrawCall {
     /// [`RenderBackend::set_skin`]): instance `i` goes to world space by
     /// `world * matrices[i]`. `None` draws it once.
     pub instances: Option<SkinHandle>,
+    /// Added to the texture coordinates: a scrolling texture, such as a
+    /// tank's moving tracks.
+    pub uv_offset: [f32; 2],
 }
 
 /// Light and atmosphere for a frame.

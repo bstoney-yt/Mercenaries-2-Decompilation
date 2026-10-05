@@ -784,6 +784,9 @@ struct Piece {
     topology: Topology,
     /// Per range, its batch member (empty: not a batch).
     members: Vec<u16>,
+    /// Per range, whether its material could be a vehicle's track (cut out
+    /// and two-sided, as tracks' are).
+    track: Vec<bool>,
     centre: Vec3,
     bones: Vec<u16>,
     node: Option<u16>,
@@ -805,7 +808,16 @@ pub struct GpuModel {
     pub wrecked: bool,
     /// For a merged batch, the entity each member is.
     pub tiny_members: Vec<u32>,
+    /// A tracked vehicle: its track materials scroll by
+    /// [`track_travel`](Self::track_travel).
+    pub tracks: bool,
+    /// Metres the tracks have run.
+    pub track_travel: f32,
 }
+
+/// How far a track's texture moves along v per metre the track runs.
+/// Invented: the game scrolls its tracks from code.
+const TRACK_V_PER_METRE: f32 = 0.5;
 
 impl GpuModel {
     /// Uploads `cpu`. Its textures should already be in `materials`.
@@ -836,6 +848,16 @@ impl GpuModel {
                     .collect(),
                 topology: p.topology,
                 members: p.members.clone(),
+                track: p
+                    .ranges
+                    .iter()
+                    .map(|&(_, _, m)| {
+                        cpu.materials.get(m).is_some_and(|m| {
+                            m.flags & (flags::CUT_OUT | flags::TWO_SIDED)
+                                == flags::CUT_OUT | flags::TWO_SIDED
+                        })
+                    })
+                    .collect(),
                 // Kept in geometry space, so any transform places it.
                 centre: p.local.inverse().transform_point3(p.centre),
                 bones: p.bones.clone(),
@@ -851,6 +873,8 @@ impl GpuModel {
             hidden: cpu.hidden.clone(),
             wrecked: false,
             tiny_members: cpu.tiny_members.clone(),
+            tracks: false,
+            track_travel: 0.0,
         })
     }
 
@@ -878,7 +902,7 @@ impl GpuModel {
     /// [`wrecked`](Self::wrecked) says (one model drawn in many places).
     pub fn draw_as(&self, queue: &mut DrawQueue, world: Mat4, wrecked: bool) {
         for piece in self.shown(wrecked) {
-            Self::push(queue, piece, world, None);
+            self.push(queue, piece, world, None);
         }
     }
 
@@ -887,7 +911,7 @@ impl GpuModel {
     /// by their own models.
     pub fn draw_batch(&self, queue: &mut DrawQueue, world: Mat4, hide: &dyn Fn(u16) -> bool) {
         for piece in self.shown(false) {
-            Self::push_ranges(queue, piece, world * piece.local, None, |k| {
+            self.push_ranges(queue, piece, world * piece.local, None, |k| {
                 piece.members.get(k).is_none_or(|&m| !hide(m))
             });
         }
@@ -921,7 +945,7 @@ impl GpuModel {
         for piece in self.shown(self.wrecked) {
             let handle = if piece.bones.is_empty() {
                 if let Some(&m) = piece.node.and_then(|n| nodes.get(usize::from(n))) {
-                    Self::push_at(queue, piece, world * m, None);
+                    self.push_at(queue, piece, world * m, None);
                     continue;
                 }
                 None
@@ -935,7 +959,7 @@ impl GpuModel {
                 );
                 Some(backend.set_skin(&palette)?)
             };
-            Self::push(queue, piece, world, handle);
+            self.push(queue, piece, world, handle);
         }
         Ok(())
     }
@@ -948,17 +972,24 @@ impl GpuModel {
             .filter(|p| !hidden.get(usize::from(p.at)).copied().unwrap_or(false))
     }
 
-    fn push(queue: &mut DrawQueue, piece: &Piece, world: Mat4, skin: Option<SkinHandle>) {
-        Self::push_at(queue, piece, world * piece.local, skin);
+    fn push(&self, queue: &mut DrawQueue, piece: &Piece, world: Mat4, skin: Option<SkinHandle>) {
+        self.push_at(queue, piece, world * piece.local, skin);
     }
 
     /// Queues `piece` with geometry-to-world `transform`.
-    fn push_at(queue: &mut DrawQueue, piece: &Piece, transform: Mat4, skin: Option<SkinHandle>) {
-        Self::push_ranges(queue, piece, transform, skin, |_| true);
+    fn push_at(
+        &self,
+        queue: &mut DrawQueue,
+        piece: &Piece,
+        transform: Mat4,
+        skin: Option<SkinHandle>,
+    ) {
+        self.push_ranges(queue, piece, transform, skin, |_| true);
     }
 
     /// Queues the ranges of `piece` that `keep` picks (by index).
     fn push_ranges(
+        &self,
         queue: &mut DrawQueue,
         piece: &Piece,
         transform: Mat4,
@@ -984,6 +1015,11 @@ impl GpuModel {
                     world: transform,
                     skin,
                     instances: None,
+                    uv_offset: if self.tracks && piece.track.get(k).copied().unwrap_or(false) {
+                        [0.0, (self.track_travel * TRACK_V_PER_METRE).fract()]
+                    } else {
+                        [0.0; 2]
+                    },
                 },
                 layer: Layer::WORLD,
                 translucent,

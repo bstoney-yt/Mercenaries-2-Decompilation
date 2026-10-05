@@ -1071,6 +1071,9 @@ impl Scene {
             for v in &mut self.vehicles {
                 // A wreck shows its wrecked body, turret and wheels.
                 v.model.wrecked = v.wrecked;
+                // Tracks run as far as the road wheels roll.
+                v.model.tracks = v.spec.tracked;
+                v.model.track_travel = v.rolled;
                 let Some(id) = v.id else { continue };
                 let Some(at) = world.physics.vehicle_transform(id) else {
                     continue;
@@ -1192,6 +1195,7 @@ impl Scene {
                 world: Mat4::IDENTITY,
                 skin: None,
                 instances: None,
+                uv_offset: [0.0; 2],
             },
             layer: Layer::WORLD,
             translucent: false,
@@ -1402,6 +1406,7 @@ impl Effects {
                 world,
                 skin: None,
                 instances: None,
+                uv_offset: [0.0; 2],
             },
             layer: Layer::WORLD,
             translucent,

@@ -104,6 +104,7 @@ fn draw(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32, world: Mat
         world,
         skin: None,
         instances: None,
+        uv_offset: [0.0; 2],
     }
 }
 
@@ -160,6 +161,16 @@ fn draws_a_textured_unlit_quad() {
     assert_eq!(pixel(&rgba, 24, 40), [0, 0, 0, 255], "u 1, bottom");
     assert_eq!(pixel(&rgba, 2, 2), [0, 0, 255, 255], "sky outside");
     assert_eq!(b.live_buffers().texture, 1);
+    // Scrolled half way along u, the quadrants swap sides.
+    b.begin_frame(&view()).unwrap();
+    b.draw(&DrawCall {
+        uv_offset: [0.5, 0.0],
+        ..draw(vb, ib, 1, Mat4::IDENTITY)
+    })
+    .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    assert_eq!(pixel(&rgba, 40, 24), [0, 255, 0, 255], "scrolled u 0, top");
 }
 
 #[test]
@@ -368,6 +379,7 @@ fn instanced_draws_repeat_the_geometry() {
         .unwrap();
     b.draw(&DrawCall {
         instances: Some(instances),
+        uv_offset: [0.0; 2],
         ..draw(vb, ib, 1, Mat4::IDENTITY)
     })
     .unwrap();
