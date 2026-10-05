@@ -1326,8 +1326,9 @@ impl WgpuBackend {
                 let Some(caster) = &d.caster else {
                     continue;
                 };
+                // Out of this cascade, or too small in it to show.
                 if let Some((centre, radius)) = caster.sphere
-                    && !cascades.touches(i, centre, radius)
+                    && (radius < cascades.texels[i] * 2.0 || !cascades.touches(i, centre, radius))
                 {
                     continue;
                 }

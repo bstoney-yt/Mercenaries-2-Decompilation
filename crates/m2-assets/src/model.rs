@@ -1312,7 +1312,7 @@ fn parse_nodes(hier: &[u8], count: u32) -> Result<Vec<Node>, ModelError> {
 /// The triangles of the strip `indices[start..start + count]`, skipping
 /// degenerates and alternating winding as strips do. Empty if the range is
 /// outside `indices`.
-pub(crate) fn strip_triangles(indices: &[u16], start: u32, count: u32) -> Vec<[u16; 3]> {
+pub fn strip_triangles(indices: &[u16], start: u32, count: u32) -> Vec<[u16; 3]> {
     let start = start as usize;
     let Some(strip) = indices.get(start..start + count as usize) else {
         return Vec::new();

@@ -15,14 +15,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::sync::OnceLock;
 
-use m2_assets::model::{GeometryKind, Material, TOPOLOGY};
+use m2_assets::model::{GeometryKind, Material, ModelInfo, TOPOLOGY};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{Model, Ucfx};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
     BackendError, BlendMode, DrawCall, DrawQueue, Emissive, Geometry, IndexBufferDesc,
     IndexBufferHandle, Layer, MaterialDesc, MaterialId, NormalMap, Primitive, Reflection,
-    RenderBackend, SkinHandle, Specular, TextureDesc, TextureFormat, TextureHandle,
+    RenderBackend, SkinHandle, Specular, TextureDesc, TextureFormat, TextureHandle, Topology,
     VertexBufferDesc, VertexBufferHandle, generate_mips,
 };
 
@@ -522,6 +522,13 @@ pub struct CpuPiece {
     pub local: Mat4,
     /// (first index, index count, index into the model's materials).
     pub ranges: Vec<(u32, u32, usize)>,
+    /// How `indices` are drawn: the model's strips, or a triangle list
+    /// where ranges were split by member.
+    pub topology: Topology,
+    /// For a merged batch (`TINY` geometry), the member each range draws
+    /// (by position in the batch's [`tiny_members`](CpuModel::tiny_members)),
+    /// so a member drawn by its own model can be left out; else empty.
+    pub members: Vec<u16>,
     /// Model-space centre, for sorting.
     pub centre: Vec3,
     /// For skinned geometry, the node each blend index names; empty for
@@ -559,6 +566,9 @@ pub struct CpuModel {
     /// [`decode_textures`](Self::decode_textures)), for
     /// [`MaterialCache::load_model_textures`] to upload without reading.
     pub textures: Vec<(u32, Option<DecodedTexture>)>,
+    /// For a merged batch, the entity each member is (see
+    /// [`Model::tiny_members`]); empty otherwise.
+    pub tiny_members: Vec<u32>,
 }
 
 /// The collision of one building of a merged batch (a `TINY` model).
@@ -609,7 +619,7 @@ impl CpuModel {
                     skipped_groups += 1;
                     continue;
                 };
-                let ranges = group
+                let ranges: Vec<(u32, u32, usize)> = group
                     .material_ranges
                     .iter()
                     .filter(|r| r.start_index + r.index_count() <= group.indices.len() as u32)
@@ -621,6 +631,12 @@ impl CpuModel {
                     })
                     .map(|r| (r.start_index, r.index_count(), r.material as usize))
                     .collect();
+                let (ranges, indices, topology, members) = if geometry.kind == GeometryKind::Tiny {
+                    let (r, i, m) = split_members(group, &ranges);
+                    (r, i, Topology::TriangleList, m)
+                } else {
+                    (ranges, group.index_bytes(), TOPOLOGY, Vec::new())
+                };
                 let mut centre = Vec3::ZERO;
                 if let Some(pos) = group
                     .decl
@@ -643,10 +659,15 @@ impl CpuModel {
                 pieces.push(CpuPiece {
                     vertex_desc,
                     vertices: vertices.to_vec(),
-                    index_desc: group.index_buffer_desc(),
-                    indices: group.index_bytes(),
+                    index_desc: IndexBufferDesc {
+                        index_count: (indices.len() / 2) as u32,
+                        ..group.index_buffer_desc()
+                    },
+                    indices,
                     local,
                     ranges,
+                    topology,
+                    members,
                     centre,
                     bones: if skinned {
                         group.info.bone_nodes()
@@ -671,6 +692,11 @@ impl CpuModel {
             members: Vec::new(),
             hidden,
             textures: Vec::new(),
+            tiny_members: if model.info.flags & ModelInfo::FLAG_TINY != 0 {
+                model.tiny_members()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -712,6 +738,41 @@ impl CpuModel {
     }
 }
 
+/// (first index, index count, material index) draws, their index bytes
+/// and each draw's member.
+type SplitRanges = (Vec<(u32, u32, usize)>, Vec<u8>, Vec<u16>);
+
+/// Splits a merged batch's strip `ranges` by member (each vertex's
+/// position `w` is the member it belongs to), as triangle lists: the new
+/// ranges, their indices as bytes, and each range's member.
+fn split_members(
+    group: &m2_assets::model::PrimitiveGroup<'_>,
+    ranges: &[(u32, u32, usize)],
+) -> SplitRanges {
+    let member_of: Vec<u16> = group
+        .decl
+        .find(DeclUsage::Position, 0)
+        .and_then(|e| group.vertices.read(e))
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p[3].max(0.0).round() as u16)
+        .collect();
+    let (mut out, mut indices, mut members) = (Vec::new(), Vec::new(), Vec::new());
+    for &(first, count, material) in ranges {
+        let mut by_member: std::collections::BTreeMap<u16, Vec<u16>> = Default::default();
+        for tri in m2_assets::model::strip_triangles(&group.indices, first, count) {
+            let member = member_of.get(usize::from(tri[0])).copied().unwrap_or(0);
+            by_member.entry(member).or_default().extend(tri);
+        }
+        for (member, tris) in by_member {
+            out.push(((indices.len() / 2) as u32, tris.len() as u32, material));
+            indices.extend(tris.iter().flat_map(|i| i.to_le_bytes()));
+            members.push(member);
+        }
+    }
+    (out, indices, members)
+}
+
 /// One primitive group on the GPU.
 #[derive(Debug)]
 struct Piece {
@@ -720,6 +781,9 @@ struct Piece {
     local: Mat4,
     /// First index, index count, material, and whether it blends.
     ranges: Vec<(u32, u32, MaterialId, bool)>,
+    topology: Topology,
+    /// Per range, its batch member (empty: not a batch).
+    members: Vec<u16>,
     centre: Vec3,
     bones: Vec<u16>,
     node: Option<u16>,
@@ -739,6 +803,8 @@ pub struct GpuModel {
     hidden: [Vec<bool>; 2],
     /// Draw the wrecked parts instead of the intact ones.
     pub wrecked: bool,
+    /// For a merged batch, the entity each member is.
+    pub tiny_members: Vec<u32>,
 }
 
 impl GpuModel {
@@ -768,6 +834,8 @@ impl GpuModel {
                         (first, count, id, materials.is_translucent(id))
                     })
                     .collect(),
+                topology: p.topology,
+                members: p.members.clone(),
                 // Kept in geometry space, so any transform places it.
                 centre: p.local.inverse().transform_point3(p.centre),
                 bones: p.bones.clone(),
@@ -782,6 +850,7 @@ impl GpuModel {
             skipped_groups: cpu.skipped_groups,
             hidden: cpu.hidden.clone(),
             wrecked: false,
+            tiny_members: cpu.tiny_members.clone(),
         })
     }
 
@@ -810,6 +879,17 @@ impl GpuModel {
     pub fn draw_as(&self, queue: &mut DrawQueue, world: Mat4, wrecked: bool) {
         for piece in self.shown(wrecked) {
             Self::push(queue, piece, world, None);
+        }
+    }
+
+    /// Queues a merged batch at `world` without the members `hide` picks
+    /// (by position in [`tiny_members`](Self::tiny_members)): those drawn
+    /// by their own models.
+    pub fn draw_batch(&self, queue: &mut DrawQueue, world: Mat4, hide: &dyn Fn(u16) -> bool) {
+        for piece in self.shown(false) {
+            Self::push_ranges(queue, piece, world * piece.local, None, |k| {
+                piece.members.get(k).is_none_or(|&m| !hide(m))
+            });
         }
     }
 
@@ -874,12 +954,26 @@ impl GpuModel {
 
     /// Queues `piece` with geometry-to-world `transform`.
     fn push_at(queue: &mut DrawQueue, piece: &Piece, transform: Mat4, skin: Option<SkinHandle>) {
+        Self::push_ranges(queue, piece, transform, skin, |_| true);
+    }
+
+    /// Queues the ranges of `piece` that `keep` picks (by index).
+    fn push_ranges(
+        queue: &mut DrawQueue,
+        piece: &Piece,
+        transform: Mat4,
+        skin: Option<SkinHandle>,
+        keep: impl Fn(usize) -> bool,
+    ) {
         let origin = transform.transform_point3(piece.centre);
-        for &(first, count, material, translucent) in &piece.ranges {
+        for (k, &(first, count, material, translucent)) in piece.ranges.iter().enumerate() {
+            if !keep(k) {
+                continue;
+            }
             queue.push(Primitive {
                 call: DrawCall {
                     material,
-                    topology: TOPOLOGY,
+                    topology: piece.topology,
                     vertex_buffer: piece.vertex_buffer,
                     geometry: Geometry::Indexed {
                         buffer: piece.index_buffer,
