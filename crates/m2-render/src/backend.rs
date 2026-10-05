@@ -160,7 +160,9 @@ pub struct ToneMap {
     /// of the luminance of display values raised to 0.4.
     pub log_average: bool,
     /// What the plain mean is raised to before it is adapted to: 1 takes
-    /// it as it is, 2.5 undoes the 0.4 each pixel was raised to.
+    /// it as it is, 2.5 undoes the 0.4 each pixel was raised to; 0
+    /// averages each pixel's luminance as the game's HDR codec packs it
+    /// (0.375 of it up to 1) and adapts to that packed mean.
     pub average_power: f32,
 }
 

@@ -135,6 +135,15 @@ fn fs_blur(v: Screen) -> @location(0) vec4<f32> {
     return vec4<f32>(c, 1.0);
 }
 
+// A luminance as the game's HDR codec packs it, the inverse of its
+// decode min(v, .375) * 2.6667 + (clamp(v - .375, 0, .625) * 255)^1.85.
+fn packed(l: f32) -> f32 {
+    if l <= 1.0 {
+        return 0.375 * max(l, 0.0);
+    }
+    return min(0.375 + pow(l - 1.0, 1.0 / 1.85) / 255.0, 1.0);
+}
+
 // The frame's luminance (see `log_average`), from four filtered taps.
 @fragment
 fn fs_log_luminance(v: Screen) -> @location(0) vec4<f32> {
@@ -144,6 +153,8 @@ fn fs_log_luminance(v: Screen) -> @location(0) vec4<f32> {
             let c = textureSampleLevel(source, linear, v.uv + vec2<f32>(x, y) * post.step.xy, 0.0).rgb;
             if log_average() {
                 sum = sum + log(max(luminance(to_game(c)), 1e-4));
+            } else if post.params.w == 0.0 {
+                sum = sum + packed(luminance(pow(to_game(c), vec3<f32>(0.4))));
             } else {
                 sum = sum + luminance(pow(to_game(c), vec3<f32>(0.4)));
             }
@@ -175,7 +186,11 @@ fn fs_adapt(v: Screen) -> @location(0) vec4<f32> {
     if game_tone_map() {
         let low = post.limits.x;
         let high = max(post.limits.y, low * 1.001);
-        let l = clamp(select(pow(max(now, 0.0), post.params.w), exp(now), log_average()), low, high);
+        var mean = pow(max(now, 0.0), post.params.w);
+        if post.params.w == 0.0 {
+            mean = now;
+        }
+        let l = clamp(select(mean, exp(now), log_average()), low, high);
         let k = mix(post.adapt.y, post.adapt.w, log(l / low) / log(high / low));
         return vec4<f32>(clamp(mix(before, l * k, post.adapt.z), 0.0, 1.0), 0.0, 0.0, 1.0);
     }
