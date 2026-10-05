@@ -43,6 +43,13 @@ pub const ISLAND: f32 = 8000.0;
 const CELL_SKIRT: f32 = 4.0;
 const TILE_SKIRT: f32 = 30.0;
 
+/// Whether to hang skirts at all (`M2_SKIRTS=0` leaves them out, to see
+/// what they cover).
+fn skirts_wanted() -> bool {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var("M2_SKIRTS").map_or(true, |v| v != "0"))
+}
+
 /// Side of a cell's patches in metres; skirts follow their borders.
 const PATCH_SIZE: f32 = 100.0;
 
@@ -1126,6 +1133,30 @@ impl TerrainMesh {
             let line = (a / step).round() * step;
             (a - line).abs() < 0.05 && (b - line).abs() < 0.05
         };
+        // With a grid, the squares holding ground: an edge between a
+        // square with ground and an empty one inside the same cell (the
+        // sea off a bank, where the cell has no patch) borders nothing, and
+        // a skirt there would hang as a wall under the bank's lip.
+        let square =
+            |x: f32, z: f32, step: f32| ((x / step).floor() as i32, (z / step).floor() as i32);
+        let filled: HashSet<(i32, i32)> = grid.map_or_else(HashSet::new, |step| {
+            ground
+                .iter()
+                .flat_map(|&g| {
+                    let (first, count, _) = self.ranges[g];
+                    self.indices[first as usize..(first + count) as usize].chunks_exact(3)
+                })
+                .map(|t| {
+                    let (a, b, c) = (at(t[0]), at(t[1]), at(t[2]));
+                    square((a.0 + b.0 + c.0) / 3.0, (a.1 + b.1 + c.1) / 3.0, step)
+                })
+                .collect()
+        });
+        let half = CELL_SIZE / 2.0;
+        let borders_nothing = |(x, z): (i32, i32), step: f32| {
+            let (cx, cz) = ((x as f32 + 0.5) * step, (z as f32 + 0.5) * step);
+            cx.abs() < half && cz.abs() < half && !filled.contains(&(x, z))
+        };
         let mut open: Vec<(u32, u32)> = edges
             .into_iter()
             .filter(|&(_, n)| n == 1)
@@ -1133,9 +1164,22 @@ impl TerrainMesh {
             .filter(|&(a, b)| {
                 grid.is_none_or(|step| {
                     let (pa, pb) = (at(a), at(b));
-                    on_line(pa.0, pb.0, step) || on_line(pa.1, pb.1, step)
+                    let (mx, mz) = ((pa.0 + pb.0) * 0.5, (pa.1 + pb.1) * 0.5);
+                    let sides = if on_line(pa.0, pb.0, step) {
+                        let line = (mx / step).round() as i32;
+                        let row = (mz / step).floor() as i32;
+                        Some([(line - 1, row), (line, row)])
+                    } else if on_line(pa.1, pb.1, step) {
+                        let line = (mz / step).round() as i32;
+                        let column = (mx / step).floor() as i32;
+                        Some([(column, line - 1), (column, line)])
+                    } else {
+                        None
+                    };
+                    sides.is_some_and(|sides| !sides.iter().any(|&q| borders_nothing(q, step)))
                 })
             })
+            .filter(|_| skirts_wanted())
             .collect();
         open.sort_unstable();
         let mut lowered: HashMap<u32, u32> = HashMap::new();
@@ -1351,27 +1395,39 @@ mod tests {
 
     #[test]
     fn skirts_hang_below_open_edges_only() {
-        let mut mesh = TerrainMesh::empty(Vec3::ZERO);
-        mesh.surfaces.push(TerrainSurface::Ground {
-            colour_map: None,
-            detail_map: None,
-            layers: Vec::new(),
-        });
-        // Two triangles sharing the edge 0-2: four open edges.
-        for (x, z) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
-            for f in [x, 2.0, z, 0.0, 1.0, 0.0, 0.0, 0.0] {
-                mesh.vertices.extend(f.to_le_bytes());
+        // A 1 m quad of two triangles sharing the edge 0-2 (four open
+        // edges), its corner at (x0, z0) in cell space.
+        let quad = |x0: f32, z0: f32| {
+            let mut mesh = TerrainMesh::empty(Vec3::ZERO);
+            mesh.surfaces.push(TerrainSurface::Ground {
+                colour_map: None,
+                detail_map: None,
+                layers: Vec::new(),
+            });
+            for (x, z) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                for f in [x0 + x, 2.0, z0 + z, 0.0, 1.0, 0.0, 0.0, 0.0] {
+                    mesh.vertices.extend(f.to_le_bytes());
+                }
+                mesh.vertices.extend([255, 0, 0, 0]);
+                mesh.vertices.extend([0u8; 16]);
             }
-            mesh.vertices.extend([255, 0, 0, 0]);
-            mesh.vertices.extend([0u8; 16]);
-        }
-        mesh.indices = vec![0, 1, 2, 0, 2, 3];
-        mesh.ranges = vec![(0, 6, 0)];
-        mesh.bounds = (Vec3::new(0.0, 2.0, 0.0), Vec3::new(1.0, 2.0, 1.0));
-        // On a 100 m grid only the edges along x = 0 and z = 0 lie on lines.
-        let mut gridded = mesh.clone();
+            mesh.indices = vec![0, 1, 2, 0, 2, 3];
+            mesh.ranges = vec![(0, 6, 0)];
+            mesh.bounds = (Vec3::new(x0, 2.0, z0), Vec3::new(x0 + 1.0, 2.0, z0 + 1.0));
+            mesh
+        };
+        // On a 100 m grid the edges along x = 0 and z = 0 lie on lines, but
+        // the squares beyond them, inside the cell, hold no ground: nothing
+        // to cover there.
+        let mut gridded = quad(0.0, 0.0);
         gridded.add_skirts(4.0, Some(100.0));
-        assert_eq!(gridded.indices.len(), 6 + 2 * 12);
+        assert_eq!(gridded.indices.len(), 6);
+        // At the cell's edge (x = 200) the neighbour is another cell's: that
+        // edge keeps its skirt; z = 0 still borders an empty square.
+        let mut border = quad(199.0, 0.0);
+        border.add_skirts(4.0, Some(100.0));
+        assert_eq!(border.indices.len(), 6 + 12);
+        let mut mesh = quad(0.0, 0.0);
         mesh.add_skirts(4.0, None);
         assert_eq!(mesh.vertex_count(), 8);
         assert_eq!(mesh.indices.len(), 6 + 4 * 12);
