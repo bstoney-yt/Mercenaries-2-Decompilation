@@ -307,7 +307,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
             screen.center_top() + vec2(0.0, 56.0),
             Align2::CENTER_TOP,
             "Click to look around. WASD move, Shift sprint, Space jump, E get in, \
-             left button fire, right button aim, 1/2 weapons, G grenade, Esc menu",
+             left button fire, right button aim, 1/2 weapons, G grenade, B bash, Esc menu",
             15.0,
             white,
         );
