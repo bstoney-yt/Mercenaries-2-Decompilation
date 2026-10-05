@@ -2,7 +2,9 @@
 //! barricades and crates ([`WorldIndex::state_objects`]). They stand once
 //! the scripts load their layer (or the start-up did), go when it
 //! unloads, and break when the scripts' object dies: drawn as their wreck
-//! when the model has one, else gone, and no longer in the way.
+//! when the model has one, else gone, and no longer in the way. Those
+//! whose model comes loose ([`Loose`]) are knocked loose by vehicles and
+//! blasts, as the island's are.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -14,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use m2_engine::stream::PROP_SIZES;
 use m2_engine::{
-    AssetSource, CollisionShape, CpuModel, Frustum, GpuModel, Install, MaterialCache, Physics,
-    StaticKey, WorldIndex,
+    AssetSource, CollisionShape, CpuModel, DebrisId, Frustum, GpuModel, Install, Loose,
+    MaterialCache, Physics, StaticKey, WorldIndex,
 };
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{DrawQueue, RenderBackend};
@@ -60,6 +62,10 @@ pub struct Props {
     changes: u64,
     /// How far from the focus models were last wanted (metres).
     reach: f32,
+    /// Those knocked loose: their pieces, in [`Loose`] order.
+    knocked: HashMap<u32, Vec<DebrisId>>,
+    /// Knocked loose since [`take_knocked`](Self::take_knocked).
+    fresh_knocks: Vec<u32>,
 }
 
 /// How the props stand ([`Props::counts`]): how many are shown, and of
@@ -162,14 +168,89 @@ impl Props {
         added
     }
 
-    /// Takes down those of `entities` that are shown.
+    /// Takes down those of `entities` that are shown (their loose pieces
+    /// too).
     pub fn hide(&mut self, physics: &mut Physics, entities: impl IntoIterator<Item = u32>) {
         for e in entities {
             if self.shown.remove(&e).is_some() {
                 physics.remove_static(StaticKey::Entity(e));
                 self.changes += 1;
             }
+            for d in self.knocked.remove(&e).into_iter().flatten() {
+                physics.remove_debris(d);
+            }
         }
+    }
+
+    /// How `entity`'s model comes loose, if it does.
+    fn loose(&self, entity: u32) -> Option<&Loose> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        m.collision.as_ref()?.loose.as_deref()
+    }
+
+    /// The mass to shift (kg) to knock `entity` loose; `None` unless it
+    /// stands whole and its model comes loose.
+    pub fn loose_mass(&self, physics: &Physics, entity: u32) -> Option<f32> {
+        let p = self.shown.get(&entity)?;
+        if p.wrecked
+            || self.knocked.contains_key(&entity)
+            || !physics.has_static(StaticKey::Entity(entity))
+        {
+            return None;
+        }
+        self.loose(entity).map(|l| l.mass)
+    }
+
+    /// Knocks `entity` loose: its standing collision goes and its pieces
+    /// fly off at `velocity` (m/s), turning at `spin` (radians a second
+    /// about each axis). False unless it came loose.
+    pub fn knock(
+        &mut self,
+        physics: &mut Physics,
+        entity: u32,
+        velocity: Vec3,
+        spin: Vec3,
+    ) -> bool {
+        if self.loose_mass(physics, entity).is_none() {
+            return false;
+        }
+        let (Some(p), Some(loose)) = (self.shown.get(&entity), self.loose(entity)) else {
+            return false;
+        };
+        physics.remove_static(StaticKey::Entity(entity));
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let pieces = loose
+            .pieces
+            .iter()
+            .zip(loose.starts(placed))
+            .map(|(piece, at)| physics.add_debris(piece, at, velocity, spin))
+            .collect();
+        self.knocked.insert(entity, pieces);
+        self.fresh_knocks.push(entity);
+        true
+    }
+
+    /// Those knocked loose since the last call.
+    pub fn take_knocked(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.fresh_knocks)
+    }
+
+    /// Those standing that come loose with any of their model within
+    /// `reach` metres of `at` (as far as its box's middle less half its
+    /// size), with how far.
+    pub fn loose_near(&self, physics: &Physics, at: Vec3, reach: f32) -> Vec<(u32, f32)> {
+        self.shown
+            .iter()
+            .filter(|&(&e, _)| self.loose_mass(physics, e).is_some())
+            .filter_map(|(&e, p)| {
+                let m = self.models.get(&p.model)?.as_ref()?;
+                let (lo, hi) = m.gpu.bounds;
+                let centre = p.position + p.rotation * ((lo + hi) * 0.5);
+                let d = (centre.distance(at) - (hi - lo).length() * 0.5).max(0.0);
+                (d <= reach).then_some((e, d))
+            })
+            .collect()
     }
 
     /// Breaks `entity` if it is shown and whole: its wreck if the model
@@ -186,7 +267,8 @@ impl Props {
             .is_some_and(|m| m.gpu.has_wreck());
         if has_wreck {
             p.wrecked = true;
-        } else {
+        } else if !self.knocked.contains_key(&entity) {
+            // Loose pieces stay where they fell.
             self.shown.remove(&entity);
             self.changes += 1;
         }
@@ -200,6 +282,10 @@ impl Props {
         };
         p.position = position;
         self.changes += 1;
+        // Put up whole again.
+        for d in self.knocked.remove(&entity).into_iter().flatten() {
+            physics.remove_debris(d);
+        }
         if let Some(Some(m)) = self.models.get(&p.model)
             && let Some(shape) = &m.collision
             && !p.wrecked
@@ -392,7 +478,7 @@ impl Props {
         let gpu = GpuModel::upload(backend, materials, &cpu)?;
         if let Some(shape) = &cpu.collision {
             for (&e, p) in self.shown.iter().filter(|(_, p)| p.model == hash) {
-                if !p.wrecked {
+                if !p.wrecked && !self.knocked.contains_key(&e) {
                     physics.add_static(StaticKey::Entity(e), shape, p.position, p.rotation);
                 }
             }
@@ -409,12 +495,43 @@ impl Props {
 
     /// Draws those `frustum` may see within their reach of `eye`, as the
     /// island's props are drawn: each no further than [`PROP_SIZES`] times
-    /// its size, nor than `limit`.
-    pub fn draw(&self, queue: &mut DrawQueue, eye: Vec3, frustum: &Frustum, limit: f32) {
-        for p in self.shown.values() {
+    /// its size, nor than `limit`; those knocked loose with their pieces
+    /// where `physics` has them.
+    pub fn draw(
+        &self,
+        queue: &mut DrawQueue,
+        physics: &Physics,
+        eye: Vec3,
+        frustum: &Frustum,
+        limit: f32,
+    ) {
+        for (e, p) in &self.shown {
             let Some(Some(m)) = self.models.get(&p.model) else {
                 continue;
             };
+            if let Some(pieces) = self.knocked.get(e) {
+                let Some(loose) = self.loose(*e) else {
+                    continue;
+                };
+                let places: Vec<Mat4> = pieces
+                    .iter()
+                    .filter_map(|&d| physics.debris_place(d))
+                    .collect();
+                if places.len() == pieces.len()
+                    && places
+                        .iter()
+                        .any(|at| at.w_axis.truncate().distance(eye) <= limit)
+                {
+                    let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+                    m.gpu.draw_moved(
+                        queue,
+                        placed,
+                        &loose.posed(placed, &places),
+                        loose.wrecks || p.wrecked,
+                    );
+                }
+                continue;
+            }
             let (lo, hi) = m.gpu.bounds;
             let size = (hi - lo).length();
             let reach = (size * PROP_SIZES).min(limit);

@@ -3,16 +3,17 @@
 
 use std::collections::HashSet;
 
-use m2_engine::{CatalogueEntry, Physics, VehicleControls};
+use m2_engine::{CatalogueEntry, Physics, StaticKey, VehicleControls, World};
 use m2_math::glam::{Quat, Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
-use crate::combat::{Combat, Field, Weapon};
+use crate::combat::{self, Combat, Field, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::mission::{WATERLINE, template_models};
 use crate::player::{ChaseRig, Intent, Player};
+use crate::props::Props;
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
 use crate::startup::Startup;
@@ -36,6 +37,28 @@ const TOWN_REACH: f32 = 150.0;
 /// The scripts put vehicles they don't need yet far under the island:
 /// those below this height aren't placed.
 const HIDDEN_BELOW: f32 = -1000.0;
+
+/// A vehicle held where it stands, far from her, is let go once she is
+/// this much nearer than the island's full-detail ground reaches and
+/// ground is found within this far under it, metres.
+const HOLD_SLACK: f32 = 100.0;
+const HOLD_GROUND: f32 = 30.0;
+
+/// A vehicle knocks loose what it hits that comes loose (traffic lights,
+/// plants, barricades, poles: their `PHY2` has bodies that move) at this
+/// speed or more (m/s), pushing with its engine counting as this one, and
+/// when its momentum is at least this many times the mass to shift
+/// (kg m/s per kg). Invented: a car fells a lamp post or a plant, a tank
+/// a parked car.
+const KNOCK_SPEED: f32 = 1.0;
+const PUSH_SPEED: f32 = 1.5;
+const KNOCK_RATIO: f32 = 4.0;
+/// What it knocks loose flies off a little faster than the two go on
+/// together, so it clears the vehicle, this much up (m/s), toppling the
+/// way it was hit at this many radians a second per m/s.
+const FLING: f32 = 1.1;
+const FLING_UP: f32 = 1.0;
+const TOPPLE: f32 = 0.3;
 
 #[derive(Debug)]
 pub struct Game {
@@ -341,6 +364,7 @@ impl Game {
                 physics.step(dt);
             }
         }
+        let focus = self.focus();
         if let Some(world) = &mut self.scene.world {
             let driven = self
                 .scene
@@ -348,8 +372,31 @@ impl Game {
                 .as_ref()
                 .filter(|_| self.on_foot)
                 .and_then(|p| p.driving);
+            let hold = world.settings.detail_radius;
             for (i, v) in self.scene.vehicles.iter_mut().enumerate() {
                 let Some(id) = v.id else { continue };
+                // Far from her, the island's ground streams out from under
+                // a vehicle: it is held where it stands until she comes
+                // back and the ground under it is in again.
+                if driven != Some(i)
+                    && let Some(at) = world
+                        .physics
+                        .vehicle_transform(id)
+                        .map(|m| m.w_axis.truncate())
+                {
+                    let far = at.distance(focus);
+                    if far > hold {
+                        world.physics.hold_vehicle(id, true);
+                    } else if far < hold - HOLD_SLACK
+                        && world.physics.vehicle_held(id)
+                        && world
+                            .physics
+                            .cast_ray_past(at + Vec3::Y, Vec3::NEG_Y, HOLD_GROUND, id)
+                            .is_some()
+                    {
+                        world.physics.hold_vehicle(id, false);
+                    }
+                }
                 v.rolled += world.physics.vehicle_speed(id) * dt;
                 // Nobody at the wheel: it brakes to a stop and stays put,
                 // on a hill too (a wreck drags on its rims, driven by
@@ -364,8 +411,8 @@ impl Game {
                     );
                 }
             }
+            knock_loose(world, &mut self.scene.props, &self.scene.vehicles);
         }
-        let focus = self.focus();
         let threat = self
             .scene
             .player
@@ -405,6 +452,7 @@ impl Game {
             world
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
+            blast_loose(world, &mut scene.props, &self.combat.went_off);
         }
         self.scene.tick(dt);
     }
@@ -776,6 +824,81 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
         let at = rest.position + Vec3::Y * DROP;
         v.id = Some(physics.add_vehicle_turned(&v.spec, at, rest.rotation));
         taken.push((centre, radius));
+    }
+}
+
+/// Vehicles knock loose what they hit that comes loose, with the weight
+/// and speed for it ([`KNOCK_RATIO`]): it flies off ahead, and the vehicle
+/// ploughs on slowed as by the mass it shifted, rather than stopped as by
+/// a wall (the step just taken stopped it).
+fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle]) {
+    for v in vehicles {
+        let Some(id) = v.id else { continue };
+        let before = world.physics.vehicle_velocity_before(id);
+        let mut speed = before.length();
+        if world.physics.vehicle_pulling(id) {
+            speed = speed.max(PUSH_SPEED);
+        }
+        if speed < KNOCK_SPEED {
+            continue;
+        }
+        let mass = v.spec.mass;
+        let mut shifted = 0.0;
+        for key in world.physics.vehicle_statics(id) {
+            let loose = match key {
+                StaticKey::Object(i) => world.loose_mass(i),
+                StaticKey::Entity(e) => props.loose_mass(&world.physics, e),
+                _ => None,
+            };
+            let Some(m) = loose.filter(|&m| mass * speed >= KNOCK_RATIO * m) else {
+                continue;
+            };
+            let ahead = before.with_y(0.0);
+            let fling = before * (mass / (mass + m)) * FLING + Vec3::Y * FLING_UP;
+            let topple = Vec3::Y.cross(ahead.normalize_or_zero()) * (ahead.length() * TOPPLE);
+            let knocked = match key {
+                StaticKey::Object(i) => world.knock(i, fling, topple),
+                StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple),
+                _ => false,
+            };
+            if knocked {
+                shifted += m;
+                eprintln!(
+                    "knocked loose: {key:?} ({m:.0} kg) by the {} at {speed:.1} m/s",
+                    v.spec.label
+                );
+            }
+        }
+        if shifted > 0.0 {
+            world
+                .physics
+                .set_vehicle_velocity(id, before * (mass / (mass + shifted)));
+        }
+    }
+}
+
+/// Blasts knock loose what comes loose within their reach (as far as they
+/// hurt people), thrown out and up as people are, harder the nearer.
+fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3]) {
+    let thrown = |blast: Vec3, at: Vec3, d: f32| {
+        let near = (1.0 - d / combat::REACH).clamp(0.0, 1.0);
+        let away = (at - blast).with_y(0.0).normalize_or(Vec3::X);
+        let (out, up) = combat::BLAST_PUSH;
+        let velocity = away * (out * near + 1.0) + Vec3::Y * (up * near + 1.0);
+        (velocity, Vec3::Y.cross(away) * (TOPPLE * out * near))
+    };
+    for &at in blasts {
+        for (i, d) in world.loose_near(at, combat::REACH) {
+            let (velocity, spin) = thrown(at, world.index.objects[i].position, d);
+            world.knock(i, velocity, spin);
+        }
+        for (e, d) in props.loose_near(&world.physics, at, combat::REACH) {
+            let Some(p) = props.get(e).map(|(p, _)| p.position) else {
+                continue;
+            };
+            let (velocity, spin) = thrown(at, p, d);
+            props.knock(&mut world.physics, e, velocity, spin);
+        }
     }
 }
 

@@ -28,7 +28,8 @@ pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use audio::{Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
 pub use model::{CpuModel, GpuModel, MaterialCache};
 pub use physics::{
-    Character, CollisionShape, Physics, RagdollId, StaticKey, VehicleControls, VehicleId,
+    Character, CollisionShape, DebrisId, Loose, LoosePiece, Physics, RagdollId, StaticKey,
+    VehicleControls, VehicleId,
 };
 pub use stream::{Frustum, World, WorldSettings, WorldStats};
 pub use tuning::VehicleTuning;

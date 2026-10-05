@@ -1311,8 +1311,9 @@ fn drive_for_screenshot(
     }
     if let (Some(from), Some((to, speed))) = (from, game.driving()) {
         eprintln!(
-            "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s",
-            (to - from).length()
+            "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s, {} objects knocked loose",
+            (to - from).length(),
+            game.scene.world.as_ref().map_or(0, |w| w.knocked())
         );
         // Hardly moved, or stopped: what holds it.
         if ((to - from).length() < 8.0 || speed.abs() < 1.0)
