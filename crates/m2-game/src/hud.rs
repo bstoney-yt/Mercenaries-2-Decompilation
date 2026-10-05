@@ -65,9 +65,30 @@ pub struct Hud {
     pub radar: BTreeMap<String, Blip>,
     /// World markers by handle.
     pub markers: BTreeMap<u32, Marker>,
-    /// Messages not yet shown: completed (or else added), and the text id.
-    pub messages: Vec<(bool, String)>,
+    /// Objective messages not yet shown.
+    pub messages: Vec<ObjectiveMessage>,
     next_marker: u32,
+}
+
+/// An objective message as the scripts send it
+/// (`Net.SendEvent_ObjectiveMessage`, for `MrxGuiInterface.
+/// DisplayObjectiveMessage` to show).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectiveMessage {
+    /// Its kind, a key of `MrxGuiInterface.tObjectiveMessageConfigs`:
+    /// `"add"`, `"upd"`, `"cpl"`, `"ccl"`, `"bonus_add"`...
+    pub kind: String,
+    /// Its icon, an index into `MrxUtil.tInlineIcons` (`[objdeliver]`...).
+    pub icon: i64,
+    /// The objective's text id.
+    pub text: String,
+}
+
+impl ObjectiveMessage {
+    /// An objective completed (else added, updated or cancelled).
+    pub fn done(&self) -> bool {
+        self.kind.ends_with("cpl")
+    }
 }
 
 /// Marker handles start here.
@@ -234,9 +255,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         hud.radar.remove(&text(a.first()));
         Ok(MultiValue::new())
     })?;
-    // (icon index, "add" or "cpl", text id, player).
+    // (icon index, kind, text id, player).
     add(&net, "SendEvent_ObjectiveMessage", |hud, _, a| {
-        hud.messages.push((text(a.get(1)) == "cpl", text(a.get(2))));
+        hud.messages.push(ObjectiveMessage {
+            kind: text(a.get(1)),
+            icon: int(a.first()),
+            text: text(a.get(2)),
+        });
         Ok(MultiValue::new())
     })?;
     // The network copies of world markers: the markers are already here.
@@ -361,7 +386,11 @@ mod tests {
             assert_eq!(hud.radar["734801"].colour, [255, 200, 0]);
             assert_eq!(
                 hud.messages,
-                [(false, "[VzaCon001.Objectives.001]".to_owned())]
+                [ObjectiveMessage {
+                    kind: "add".to_owned(),
+                    icon: 5,
+                    text: "[VzaCon001.Objectives.001]".to_owned(),
+                }]
             );
             let m = hud.markers.values().next().unwrap();
             assert_eq!((m.target, m.height, m.far), (Some(734_801), 2.0, 175.0));
