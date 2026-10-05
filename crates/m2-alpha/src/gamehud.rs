@@ -297,6 +297,9 @@ pub struct HudState {
     pub launcher: Option<Rounds>,
     /// The label of the vehicle she is in.
     pub vehicle: Option<String>,
+    /// Its cannon's shells, when they run out: left, and how many it
+    /// carries (the AMX-30's 40, counted down in the gun box).
+    pub cannon: Option<(u32, u32)>,
     /// Which way the camera looks, degrees, growing as it turns left
     /// (`Player.GetCameraXZHeading`).
     pub heading: f32,
@@ -369,6 +372,7 @@ impl HudState {
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             vehicle: vehicle.map(|v| v.spec.label.clone()),
+            cannon: vehicle.and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
             heading: game.camera.yaw.to_degrees(),
             target,
             position: at.map(|p| p.to_array()),
@@ -1005,7 +1009,7 @@ impl Thread {
             )?;
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
         }
-        let ammo = ammo(s.weapon, s.fired, s.picked, s.launcher);
+        let ammo = ammo(s.weapon, s.fired, s.picked, s.launcher, s.cannon);
         if self.told.ammo != Some(ammo) {
             self.told.ammo = Some(ammo);
             let names = [
@@ -1375,9 +1379,20 @@ fn widgets_under(
 /// Clip, in the clip, stored, grenades, grenades stored: as
 /// `GuiAmmoUpdate` takes them. Rounds picked up add to the stores; the
 /// rockets count down from that and, run out, start again full. The
-/// grenade launcher's are its own (`launcher`: in the clip, stored).
-fn ammo(weapon: Weapon, fired: Fired, picked: Picked, launcher: Option<Rounds>) -> [u32; 5] {
+/// grenade launcher's are its own (`launcher`: in the clip, stored). In
+/// a vehicle whose cannon runs out, its shells (`cannon`: left, carried)
+/// count down in one clip with none stored.
+fn ammo(
+    weapon: Weapon,
+    fired: Fired,
+    picked: Picked,
+    launcher: Option<Rounds>,
+    cannon: Option<(u32, u32)>,
+) -> [u32; 5] {
     let grenades = GRENADES - fired.grenades % GRENADES;
+    if let Some((left, carried)) = cannon {
+        return [carried, left, 0, grenades, 0];
+    }
     match weapon {
         Weapon::Rifle => [
             RIFLE_CLIP,
@@ -2048,20 +2063,26 @@ mod tests {
             grenades,
         };
         let none = Picked::default();
-        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 0), none, None)[1], 30);
-        assert_eq!(ammo(Weapon::Rifle, fired(29, 0, 0), none, None)[1], 1);
-        assert_eq!(ammo(Weapon::Rifle, fired(30, 0, 0), none, None)[1], 30);
+        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 0), none, None, None)[1], 30);
+        assert_eq!(ammo(Weapon::Rifle, fired(29, 0, 0), none, None, None)[1], 1);
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 0, 0), none, None)[..3],
+            ammo(Weapon::Rifle, fired(30, 0, 0), none, None, None)[1],
+            30
+        );
+        assert_eq!(
+            ammo(Weapon::Rpg, fired(0, 0, 0), none, None, None)[..3],
             [1, 1, RPG_STORED]
         );
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 1, 0), none, None)[2],
+            ammo(Weapon::Rpg, fired(0, 1, 0), none, None, None)[2],
             RPG_STORED - 1
         );
-        assert_eq!(ammo(Weapon::Rpg, fired(0, 4, 0), none, None)[2], RPG_STORED);
         assert_eq!(
-            ammo(Weapon::Rifle, fired(0, 0, 1), none, None)[3],
+            ammo(Weapon::Rpg, fired(0, 4, 0), none, None, None)[2],
+            RPG_STORED
+        );
+        assert_eq!(
+            ammo(Weapon::Rifle, fired(0, 0, 1), none, None, None)[3],
             GRENADES - 1
         );
         // A crate's 20 rockets after three fired: 21 left.
@@ -2070,7 +2091,7 @@ mod tests {
             ..Picked::default()
         };
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 3, 0), crate_, None)[2],
+            ammo(Weapon::Rpg, fired(0, 3, 0), crate_, None, None)[2],
             RPG_STORED + 17
         );
         // The launcher's own rounds: "6 / 12" as the crate gives it.
@@ -2079,8 +2100,19 @@ mod tests {
             stored: 12,
         });
         assert_eq!(
-            ammo(Weapon::GrenadeLauncher, fired(0, 0, 0), none, launcher)[..3],
+            ammo(
+                Weapon::GrenadeLauncher,
+                fired(0, 0, 0),
+                none,
+                launcher,
+                None
+            )[..3],
             [6, 6, 12]
+        );
+        // The AMX-30's 40 shells, three fired.
+        assert_eq!(
+            ammo(Weapon::Rifle, fired(0, 0, 0), none, None, Some((37, 40)))[..3],
+            [40, 37, 0]
         );
     }
 
