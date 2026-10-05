@@ -589,6 +589,13 @@ const BOAT_TURN_SPEED: f32 = 6.0;
 const BOAT_REVERSE: f32 = 4.0;
 const BOAT_TOP: f32 = 18.0;
 const WRECK_FLOAT: f32 = 0.4;
+/// A boat going fast planes (the playthroughs' speedboat rides high, bow
+/// up): from a standstill to this speed, m/s, its hull rises up to this
+/// far, metres, and its bow this much more than its stern (and the stern
+/// that much less), metres. Invented, from the videos.
+const PLANE_SPEED: f32 = 12.0;
+const PLANE_RISE: f32 = 0.3;
+const PLANE_TRIM: f32 = 0.25;
 /// The steepest hill a vehicle takes about as fast as the flat, radians,
 /// wheeled and tracked: uphill the engine pulls as a lower gear would
 /// (invented; the playthrough's jeep and tank take the hill roads at
@@ -879,10 +886,26 @@ impl Physics {
             // never more than its share of [`WRECK_FLOAT`] of it.
             let most = if v.wrecked { WRECK_FLOAT } else { 3.0 };
             let lift = GRAVITY * v.mass / n * dt;
+            // Planing, it floats as if the water stood higher, the more so
+            // at the bow.
+            let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or_zero();
+            let going = vec3(b.linvel()).dot(ahead);
+            let plane = if v.wrecked {
+                0.0
+            } else {
+                (going / PLANE_SPEED).clamp(0.0, 1.0)
+            };
+            let reach = hull
+                .points
+                .iter()
+                .map(|q| q.z.abs())
+                .fold(0.0f32, f32::max)
+                .max(0.1);
             let mut wet = 0.0;
             for &q in &hull.points {
                 let p = at + turn * q;
-                let depth = water - p.y;
+                let surface = water + plane * (PLANE_RISE + PLANE_TRIM * q.z / reach);
+                let depth = surface - p.y;
                 if depth > 0.0 {
                     wet += 1.0;
                     let up = lift * (depth / FLOAT_DEPTH).min(most);
@@ -899,7 +922,6 @@ impl Physics {
             } else {
                 hull.controls
             };
-            let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or_zero();
             let side = Vec3::new(ahead.z, 0.0, -ahead.x);
             let velocity = vec3(b.linvel());
             let mut along = velocity.dot(ahead);
@@ -2113,7 +2135,14 @@ mod tests {
             "at {}",
             m.w_axis
         );
-        assert!((m.w_axis.y - (water - FLOAT_DEPTH)).abs() < 0.5);
+        // Planing: riding higher than at rest, bow up.
+        assert!(
+            m.w_axis.y > water - FLOAT_DEPTH + 0.1 && m.w_axis.y < water + 0.3,
+            "planes at {}",
+            m.w_axis.y
+        );
+        let bow = m.transform_vector3(Vec3::Z).y;
+        assert!((0.02..0.2).contains(&bow), "bow up {bow}");
         // Steering turns it as steering a tank does: positive steer, a
         // positive turn about up.
         let before = m.transform_vector3(Vec3::Z);

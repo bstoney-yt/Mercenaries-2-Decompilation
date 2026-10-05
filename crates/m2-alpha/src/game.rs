@@ -9,7 +9,7 @@ use m2_math::glam::{Mat4, Quat, Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
-use crate::combat::{self, Combat, Field, Weapon};
+use crate::combat::{self, Combat, Effect, Field, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::mission::{WATERLINE, template_models};
@@ -44,6 +44,16 @@ const HIDDEN_BELOW: f32 = -1000.0;
 /// ground is found within this far under it, metres.
 const HOLD_SLACK: f32 = 100.0;
 const HOLD_GROUND: f32 = 30.0;
+
+/// Boats going faster than this throw spray off their sides and churn a
+/// wake, the most from the second speed (m/s), puffs every this many
+/// seconds, each lasting this long, the wake longer. Invented, from the
+/// playthroughs' speedboat: spray wider than the boat at full speed.
+const SPRAY_SPEED: f32 = 4.0;
+const SPRAY_FULL: f32 = 16.0;
+const SPRAY_GAP: f32 = 0.05;
+const SPRAY_LIFE: f32 = 0.7;
+const WAKE_LIFE: f32 = 1.2;
 
 /// A vehicle knocks loose what it hits that comes loose (traffic lights,
 /// plants, barricades, poles: their `PHY2` has bodies that move) at this
@@ -87,6 +97,8 @@ pub struct Game {
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
     pub throttle: f32,
+    /// Seconds to the next puffs of spray off boats going fast.
+    spray_wait: f32,
 }
 
 impl Game {
@@ -105,6 +117,7 @@ impl Game {
             startup: None,
             props_up: false,
             throttle: 0.0,
+            spray_wait: 0.0,
         }
     }
 
@@ -419,6 +432,11 @@ impl Game {
                 }
             }
             knock_loose(world, &mut self.scene.props, &self.scene.vehicles);
+            self.spray_wait -= dt;
+            if self.spray_wait <= 0.0 {
+                self.spray_wait = SPRAY_GAP;
+                spray(world, &self.scene.vehicles, &mut self.combat);
+            }
         }
         let threat = self
             .scene
@@ -912,6 +930,55 @@ fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3]) {
 /// A vehicle of ours (not the mission's or the island's) still to park.
 fn parkable(v: &ParkedVehicle) -> bool {
     v.id.is_none() && v.guid.is_none() && v.spot.is_none()
+}
+
+/// Spray off both sides of each boat going fast on the water, a third of
+/// the way up from its stern, and churned water behind it.
+fn spray(world: &World, vehicles: &[ParkedVehicle], combat: &mut Combat) {
+    let Some(water) = world.physics.water() else {
+        return;
+    };
+    for v in vehicles.iter().filter(|v| v.spec.is_boat() && !v.wrecked) {
+        let Some(id) = v.id else { continue };
+        let Some(m) = world.physics.vehicle_transform(id) else {
+            continue;
+        };
+        let speed = world.physics.vehicle_speed(id);
+        if speed < SPRAY_SPEED || (m.w_axis.y - water).abs() > 1.5 {
+            continue;
+        }
+        let k = ((speed - SPRAY_SPEED) / (SPRAY_FULL - SPRAY_SPEED)).clamp(0.0, 1.0);
+        let (lo, hi) = v.spec.hull;
+        let back = m
+            .transform_vector3(Vec3::NEG_Z)
+            .with_y(0.0)
+            .normalize_or_zero();
+        for x in [lo.x, hi.x] {
+            let out = m
+                .transform_vector3(Vec3::X * x.signum())
+                .with_y(0.0)
+                .normalize_or_zero();
+            let at = m.transform_point3(Vec3::new(x, 0.0, lo.z + (hi.z - lo.z) * 0.3));
+            combat.show(
+                Effect::Spray {
+                    at: at.with_y(water + 0.2),
+                    drift: out * (2.0 + 4.0 * k)
+                        + back * (1.0 + 2.0 * k)
+                        + Vec3::Y * (1.0 + 2.0 * k),
+                    size: 0.6 + k,
+                },
+                SPRAY_LIFE,
+            );
+        }
+        let stern = m.transform_point3(Vec3::new(0.0, 0.0, lo.z));
+        combat.show(
+            Effect::Wake {
+                at: stern.with_y(water + 0.03),
+                size: (hi.x - lo.x) * (0.6 + 0.6 * k),
+            },
+            WAKE_LIFE,
+        );
+    }
 }
 
 /// Puts a vehicle on the ground at `at` facing `yaw`, tilted to the

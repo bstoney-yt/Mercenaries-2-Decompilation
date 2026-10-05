@@ -346,6 +346,12 @@ pub enum Effect {
     Smoke { at: Vec3, size: f32 },
     /// A fireball, growing.
     Fire { at: Vec3, size: f32 },
+    /// Spray thrown off a boat's hull: a white puff flying `drift` metres
+    /// over its life, growing and then gone.
+    Spray { at: Vec3, drift: Vec3, size: f32 },
+    /// Churned water behind a boat: a flat white patch on the surface,
+    /// `size` across, spreading.
+    Wake { at: Vec3, size: f32 },
 }
 
 /// A sound the fight makes.
@@ -580,6 +586,12 @@ impl Combat {
 
     fn effect(&mut self, e: Effect, seconds: f32) {
         self.effects.push((e, seconds, seconds));
+    }
+
+    /// Shows `e` for `seconds`, for what isn't the fight's (a boat's
+    /// spray).
+    pub fn show(&mut self, e: Effect, seconds: f32) {
+        self.effect(e, seconds);
     }
 
     /// Where she is a target: her chest, or `None` while down, flying or
