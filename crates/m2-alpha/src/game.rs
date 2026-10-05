@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use m2_engine::atmosphere::AtmosphereMix;
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{CatalogueEntry, Physics, StaticKey, VehicleControls, VehicleSpec, World};
 use m2_math::glam::{Mat4, Quat, Vec3, Vec4Swizzles};
@@ -13,6 +14,7 @@ use crate::combat::{self, Combat, Effect, Field, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::mission::{WATERLINE, template_models};
+use crate::moving::MovingProps;
 use crate::player::{ChaseRig, Intent, Player};
 use crate::props::Props;
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
@@ -99,6 +101,10 @@ pub struct Game {
     pub throttle: f32,
     /// Seconds to the next puffs of spray off boats going fast.
     spray_wait: f32,
+    /// The light of the atmosphere region the player is in.
+    pub sky: AtmosphereMix,
+    /// Props that move on their own.
+    moving: MovingProps,
 }
 
 impl Game {
@@ -118,6 +124,8 @@ impl Game {
             props_up: false,
             throttle: 0.0,
             spray_wait: 0.0,
+            sky: AtmosphereMix::default(),
+            moving: MovingProps::default(),
         }
     }
 
@@ -275,6 +283,9 @@ impl Game {
 
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
+        self.update_sky(dt);
+        let focus = self.focus();
+        self.moving.update(&mut self.scene, focus, dt);
         self.startup_props();
         self.fetch_world_vehicles(dt);
         let scene = &mut self.scene;
@@ -728,6 +739,44 @@ impl Game {
         self.scene.player.as_ref().filter(|_| self.on_foot)
     }
 
+    /// Moves the light on to the atmosphere region the player is in.
+    fn update_sky(&mut self, dt: f32) {
+        let focus = self.focus();
+        let Some(world) = &self.scene.world else {
+            return;
+        };
+        let Some(default) = &world.index.atmosphere else {
+            return;
+        };
+        let regions = &world.index.atmosphere_regions;
+        if let Some(now) = self.sky.update(default, regions, focus, dt) {
+            match now {
+                Some((r, s)) => {
+                    let (region, (_, a)) = (&regions[r], &regions[r].settings[s]);
+                    eprintln!(
+                        "atmosphere: region {} record {s} (light time {}, intensity {}, tone {:?}, coverage {})",
+                        region.name, a.light_time[0], a.light_intensity, a.tone, a.coverage
+                    );
+                }
+                None => eprintln!("atmosphere: the island's default"),
+            }
+        }
+    }
+
+    /// Puts atmosphere region `region` (a script's guid for it) on its
+    /// record named `setting`, as `ChangeLineRegionSetting` does.
+    pub fn atmosphere_setting(&mut self, region: u32, setting: &str) {
+        let Some(world) = &self.scene.world else {
+            return;
+        };
+        if !self
+            .sky
+            .choose(&world.index.atmosphere_regions, region, setting)
+        {
+            eprintln!("atmosphere: no region {region:08x} with a record {setting}");
+        }
+    }
+
     /// Where the world streams around.
     pub fn focus(&self) -> Vec3 {
         match self.walking() {
@@ -753,7 +802,7 @@ impl Game {
         // clouds.
         if let Some(world) = &self.scene.world {
             if let Some(a) = world.index.atmosphere {
-                a.apply(&mut view.lighting);
+                self.sky.current(&a).apply(&mut view.lighting);
             }
             view.lighting.clouds.noise = world.cloud_noise;
         }
@@ -767,13 +816,14 @@ impl Game {
 /// brightness, saturation, warmth and shade against sunlight from PC
 /// footage of the jungle, held back where the strongest fit made the
 /// AMX-30 too dark and orange against console footage of it. The game runs
-/// a tone map and grade of its own whose curve isn't known, and its
-/// atmosphere's `Tone_*` grade is neutral.
+/// a tone map and grade of its own whose curve isn't known; the
+/// atmosphere's own `Tone_*` grade (neutral in the island's default, blue
+/// in the islands' `night`) goes on top.
 fn finish(lighting: &mut m2_render::Lighting) {
     lighting.exposure = 0.9;
     lighting.contrast = 1.35;
     lighting.saturation = 1.5;
-    lighting.grade = Vec3::new(1.3, 0.95, 0.7);
+    lighting.grade *= Vec3::new(1.3, 0.95, 0.7);
 }
 
 /// `M2_POST=exposure=0.8,bloom=0.35,threshold=1,contrast=1.3,

@@ -4,13 +4,29 @@
 //!
 //! Three templates carry an `AtmosphereBase`: `Atmosphere` (its `Name`
 //! field `Default`, outdoors), `Atmosphere (interior)` (`PMC`) and
-//! `Will_atmospheres`. No placed entity names one, so the outdoor one is
-//! taken. `Will_atmospheres` holds a record named `Default` too (with
-//! more bloom and the wind due along a diagonal), so the record is the
-//! one of the `Atmosphere` template ([`ATMOSPHERE_TEMPLATE`]) where there
-//! is one. Field names are the name hashes of the names below, found by
-//! hashing candidates; colours are `0xAARRGGBB` words whose alpha is not
-//! used (the `...Multiplier` fields scale them instead).
+//! `Will_atmospheres`. `Will_atmospheres` holds a record named `Default`
+//! too (with more bloom and the wind due along a diagonal), so the
+//! island's default is the record of the `Atmosphere` template
+//! ([`ATMOSPHERE_TEMPLATE`]) where there is one. Field names are the name
+//! hashes of the names below (the game's executable lists them in plain
+//! text); colours are `0xAARRGGBB` words whose alpha is not used (the
+//! `...Multiplier` fields scale them instead).
+//!
+//! Over that default, the layer `vz_atmosphere_regions` places about 50
+//! line regions (`rgn_atmo_carmonaisland`, `rgn_atmo_caracas`, ...), each
+//! with one or more `AtmosphereBase` records of its own, told apart by
+//! `Name` (`Default`, and `night`, `warzone`, ...): the light where the
+//! player is ([`AtmosphereRegion`]). Scripts pick a region's record by
+//! name (`Graphics.Atmosphere.ChangeLineRegionSetting`): `VzaCon001` puts
+//! `rgn_atmo_carmonaislandrain` on `night` for its boat ride.
+//!
+//! The time of day is each record's `LightTime` (`LightTimeSpeed` is 0 in
+//! every record, so the sun stands still): 0.05 to 0.1 in the records of
+//! the islands, whose reference footage is at sunset and dusk, 0.2 in the
+//! default, 0.3 for the scripts' `afternoon`, 0.9 in Cumana's. The sun is
+//! taken to cross the sky on a half circle as `LightTime` goes from 0 to
+//! 1, at the horizon at 0 and 1 and overhead at 0.5 ([`SUN_SETS`] says
+//! which way): inferred from those values and the footage, not confirmed.
 //!
 //! # Provenance
 //!
@@ -23,9 +39,11 @@
 //! linear, shade was half as dark against sunlight as the original game's
 //! (measured on PC video frames). That reading is inferred.
 
-use m2_assets::layer::Layer;
+use std::collections::HashMap;
+
+use m2_assets::layer::{Component, Layer};
 use m2_assets::name_hash;
-use m2_math::glam::Vec3;
+use m2_math::glam::{Vec2, Vec3};
 use m2_render::{Haze, Lighting};
 
 /// Settings read from an `AtmosphereBase` record.
@@ -61,7 +79,22 @@ pub struct Atmosphere {
     pub cloud_scales: [f32; 3],
     /// `WindDirection_X`, `WindDirection_Y`: the way the clouds drift.
     pub wind: [f32; 2],
+    /// `LightMultiplier_X`..`_Z`: the sunlight's colour (1, 0.85, 0.8 in
+    /// the islands' evening records).
+    pub light_color: Vec3,
+    /// `InterpolateTime`: seconds the change to these settings takes.
+    pub interpolate_time: f32,
 }
+
+/// Which way the sun stands at `LightTime` 0 (and 0.1, low in the
+/// evening), over the horizon: ahead and a little right of the start of
+/// `VzaCon001` as its boat heads for the island (`+z`), behind the
+/// island as the footage of that ride has it. Inferred from the footage.
+pub const SUN_SETS: Vec3 = Vec3::new(0.35, 0.0, 0.94);
+
+/// The lowest the sun is drawn, in radians over the horizon, so that low
+/// `LightTime`s still light the ground a little.
+const SUN_LOWEST: f32 = 0.05;
 
 /// The template database id of the `Atmosphere` template, whose one
 /// record is the outdoor `Default`.
@@ -79,7 +112,6 @@ impl Atmosphere {
             rec.get(at..at + 4)
                 .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         };
-        let float = |rec: &[u8], name: &str| field(rec, name).map(f32::from_bits);
         let records = c.records()?;
         let named: Vec<&(u32, &[u8])> = records
             .iter()
@@ -89,29 +121,43 @@ impl Atmosphere {
             .iter()
             .find(|(id, _)| *id == ATMOSPHERE_TEMPLATE)
             .or(named.first())?;
+        Some(Self::from_record(c, rec))
+    }
+
+    /// The settings of one `AtmosphereBase` record `rec` of component `c`.
+    pub fn from_record(c: &Component<'_>, rec: &[u8]) -> Self {
+        let field = |field: &str| -> Option<u32> {
+            let f = c.fields.iter().find(|f| f.name_hash == name_hash(field))?;
+            let at = usize::from(f.offset);
+            rec.get(at..at + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let float = |name: &str| field(name).map(f32::from_bits);
         let colour = |name: &str| {
-            let v = field(rec, name)?;
-            let scale = float(rec, &format!("{name}Multiplier")).unwrap_or(1.0);
+            let v = field(name)?;
+            let scale = float(&format!("{name}Multiplier")).unwrap_or(1.0);
             let byte = |shift: u32| srgb_to_linear(((v >> shift) & 0xff) as f32 / 255.0);
             Some(Vec3::new(byte(16), byte(8), byte(0)) * scale)
         };
-        let mut ambient_cube = [Vec3::ZERO; 6];
+        let mut ambient_cube = [Vec3::splat(0.2); 6];
         for (i, face) in ambient_cube.iter_mut().enumerate() {
-            *face = colour(&format!("AmbientCube{i}"))?;
+            if let Some(c) = colour(&format!("AmbientCube{i}")) {
+                *face = c;
+            }
         }
-        Some(Self {
+        Self {
             ambient_cube,
-            light_intensity: float(rec, "LightIntensity").unwrap_or(1.0),
+            light_intensity: float("LightIntensity").unwrap_or(1.0),
             rim: colour("RimColor").unwrap_or(Vec3::ZERO),
-            rim_threshold: field(rec, "RimColor").map_or(0.0, |v| (v >> 24) as f32 / 255.0),
-            inscattering: float(rec, "ScatterInscatteringMultiplier").unwrap_or(0.0),
-            extinction: float(rec, "ScatterExtinctionMultiplier").unwrap_or(0.0),
-            mie: float(rec, "ScatterBetaMieMultiplier").unwrap_or(0.0),
-            hg_g: float(rec, "ScatterHgG").unwrap_or(0.0),
+            rim_threshold: field("RimColor").map_or(0.0, |v| (v >> 24) as f32 / 255.0),
+            inscattering: float("ScatterInscatteringMultiplier").unwrap_or(0.0),
+            extinction: float("ScatterExtinctionMultiplier").unwrap_or(0.0),
+            mie: float("ScatterBetaMieMultiplier").unwrap_or(0.0),
+            hg_g: float("ScatterHgG").unwrap_or(0.0),
             tone: Vec3::new(
-                float(rec, "Tone_R").unwrap_or(1.0),
-                float(rec, "Tone_G").unwrap_or(1.0),
-                float(rec, "Tone_B").unwrap_or(1.0),
+                float("Tone_R").unwrap_or(1.0),
+                float("Tone_G").unwrap_or(1.0),
+                float("Tone_B").unwrap_or(1.0),
             ),
             bloom: [
                 "BloomAmount",
@@ -119,13 +165,52 @@ impl Atmosphere {
                 "BloomThreshold",
                 "BloomBlurRadius",
             ]
-            .map(|n| float(rec, n).unwrap_or(0.0)),
-            light_time: ["LightTime", "LightTimeSpeed"].map(|n| float(rec, n).unwrap_or(0.0)),
-            coverage: float(rec, "Coverage").unwrap_or(0.0),
+            .map(|n| float(n).unwrap_or(0.0)),
+            light_time: ["LightTime", "LightTimeSpeed"].map(|n| float(n).unwrap_or(0.0)),
+            coverage: float("Coverage").unwrap_or(0.0),
             cloud_scales: ["Layer1_Scale", "Layer2_Scale", "Layer3_Scale"]
-                .map(|n| float(rec, n).unwrap_or(1.0)),
-            wind: ["WindDirection_X", "WindDirection_Y"].map(|n| float(rec, n).unwrap_or(0.0)),
-        })
+                .map(|n| float(n).unwrap_or(1.0)),
+            wind: ["WindDirection_X", "WindDirection_Y"].map(|n| float(n).unwrap_or(0.0)),
+            light_color: Vec3::new(
+                float("LightMultiplier_X").unwrap_or(1.0),
+                float("LightMultiplier_Y").unwrap_or(1.0),
+                float("LightMultiplier_Z").unwrap_or(1.0),
+            ),
+            interpolate_time: float("InterpolateTime").unwrap_or(0.0),
+        }
+    }
+
+    /// Settings `t` of the way from `self` to `to` (0 is `self`).
+    pub fn lerp(&self, to: &Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let f = |a: f32, b: f32| a + (b - a) * t;
+        let v = |a: Vec3, b: Vec3| a.lerp(b, t);
+        Self {
+            ambient_cube: std::array::from_fn(|i| v(self.ambient_cube[i], to.ambient_cube[i])),
+            light_intensity: f(self.light_intensity, to.light_intensity),
+            rim: v(self.rim, to.rim),
+            rim_threshold: f(self.rim_threshold, to.rim_threshold),
+            inscattering: f(self.inscattering, to.inscattering),
+            extinction: f(self.extinction, to.extinction),
+            mie: f(self.mie, to.mie),
+            hg_g: f(self.hg_g, to.hg_g),
+            tone: v(self.tone, to.tone),
+            bloom: std::array::from_fn(|i| f(self.bloom[i], to.bloom[i])),
+            light_time: std::array::from_fn(|i| f(self.light_time[i], to.light_time[i])),
+            coverage: f(self.coverage, to.coverage),
+            cloud_scales: std::array::from_fn(|i| f(self.cloud_scales[i], to.cloud_scales[i])),
+            wind: std::array::from_fn(|i| f(self.wind[i], to.wind[i])),
+            light_color: v(self.light_color, to.light_color),
+            interpolate_time: to.interpolate_time,
+        }
+    }
+
+    /// The way the sunlight travels at this `LightTime`: from a sun on
+    /// a half circle over [`SUN_SETS`] (see the module's notes).
+    pub fn sun_direction(&self) -> Vec3 {
+        let half = std::f32::consts::PI * self.light_time[0].clamp(0.0, 1.0);
+        let up = half.sin().max(SUN_LOWEST.sin());
+        -(SUN_SETS.normalize() * half.cos() + Vec3::Y * up)
     }
 
     /// Puts the ambient cube, sunlight strength, rim light, haze, bloom,
@@ -135,7 +220,8 @@ impl Atmosphere {
         lighting.ambient_cube = self.ambient_cube;
         lighting.rim_color = self.rim;
         lighting.rim_threshold = self.rim_threshold;
-        lighting.sun_color = Lighting::default().sun_color * self.light_intensity;
+        lighting.sun_direction = self.sun_direction();
+        lighting.sun_color = self.light_color * self.light_intensity;
         lighting.haze = self.haze();
         // `BloomAmount` times `BloomMultiplier` above `BloomThreshold`, and
         // `Tone_*` as the grade (inferred from the names).
@@ -169,6 +255,209 @@ impl Atmosphere {
     }
 }
 
+/// A line region with atmospheres of its own (`rgn_atmo_carmonaisland`):
+/// where the player is inside its outline, its chosen record is the light.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AtmosphereRegion {
+    pub entity: u32,
+    pub name: String,
+    /// Corners on the ground, world `(x, z)`.
+    pub outline: Vec<Vec2>,
+    /// Square metres inside the outline: where regions overlap, the
+    /// smallest is taken (inferred: it is the most particular).
+    pub area: f32,
+    /// Its records by `Name` hash; [`default_setting`](Self::default_setting)
+    /// is the one shown until a script picks another.
+    pub settings: Vec<(u32, Atmosphere)>,
+}
+
+impl AtmosphereRegion {
+    /// A region of `settings` whose outline is `outline`.
+    pub fn new(
+        entity: u32,
+        name: String,
+        outline: Vec<Vec2>,
+        settings: Vec<(u32, Atmosphere)>,
+    ) -> Self {
+        let n = outline.len();
+        let area = (0..n)
+            .map(|i| outline[i].perp_dot(outline[(i + 1) % n]))
+            .sum::<f32>()
+            .abs()
+            * 0.5;
+        Self {
+            entity,
+            name,
+            outline,
+            area,
+            settings,
+        }
+    }
+
+    /// Whether the column over `(x, z)` is inside.
+    pub fn contains(&self, x: f32, z: f32) -> bool {
+        let mut inside = false;
+        let n = self.outline.len();
+        for i in 0..n {
+            let (a, b) = (self.outline[i], self.outline[(i + n - 1) % n]);
+            if (a.y > z) != (b.y > z) && x < (b.x - a.x) * (z - a.y) / (b.y - a.y) + a.x {
+                inside = !inside;
+            }
+        }
+        inside
+    }
+
+    /// The record named `Default`, else the first.
+    pub fn default_setting(&self) -> usize {
+        let default = name_hash("Default");
+        self.settings
+            .iter()
+            .position(|(n, _)| *n == default)
+            .unwrap_or(0)
+    }
+}
+
+/// Reads the regions of a layer with `AtmosphereBase` and `LineRegion`
+/// components: each region entity, its records and the shape its
+/// `LineRegion` names (outlines are read by `shape`, from the shape's
+/// hash, in the entity's own space).
+pub fn read_regions(
+    layer: &Layer<'_>,
+    mut shape: impl FnMut(u32) -> Option<Vec<[f32; 2]>>,
+) -> Vec<AtmosphereRegion> {
+    let Some(c) = layer.component("AtmosphereBase") else {
+        return Vec::new();
+    };
+    let Some(records) = c.records() else {
+        return Vec::new();
+    };
+    let name_field = c.fields.iter().find(|f| f.name_hash == name_hash("Name"));
+    let mut settings: HashMap<u32, Vec<(u32, Atmosphere)>> = HashMap::new();
+    for (entity, rec) in records {
+        let name = name_field
+            .and_then(|f| rec.get(usize::from(f.offset)..usize::from(f.offset) + 4))
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        settings
+            .entry(entity)
+            .or_default()
+            .push((name, Atmosphere::from_record(c, rec)));
+    }
+    let lines = layer.hashes("LineRegion");
+    let placements = layer.placements();
+    let names = layer.names();
+    let mut out: Vec<AtmosphereRegion> = settings
+        .into_iter()
+        .filter_map(|(entity, settings)| {
+            let p = placements.get(&entity)?;
+            let corners = shape(*lines.get(&entity)?)?;
+            let at = Vec3::from(p.position);
+            let [x, y, z, w] = p.rotation;
+            let q = m2_math::glam::Quat::from_xyzw(x, y, z, w).normalize();
+            let outline = corners
+                .iter()
+                .map(|&[cx, cz]| {
+                    let v = at + q * Vec3::new(cx, 0.0, cz);
+                    Vec2::new(v.x, v.z)
+                })
+                .collect();
+            let name = names.get(&entity).copied().unwrap_or("").to_owned();
+            Some(AtmosphereRegion::new(entity, name, outline, settings))
+        })
+        .collect();
+    out.sort_unstable_by_key(|r| r.entity);
+    out
+}
+
+/// The light the player is in as it changes: the record of the region
+/// they stand in (the island's default outside them all), eased into
+/// over the new record's `InterpolateTime`.
+#[derive(Clone, Debug, Default)]
+pub struct AtmosphereMix {
+    /// Records scripts chose, by region entity.
+    chosen: HashMap<u32, u32>,
+    /// The light eased from.
+    from: Option<Atmosphere>,
+    /// The light eased towards, and the (region, record) indices it is
+    /// (`None` outside every region).
+    to: Option<(Option<(usize, usize)>, Atmosphere)>,
+    /// Seconds into the change, and its length.
+    t: f32,
+    length: f32,
+}
+
+impl AtmosphereMix {
+    /// Puts region `entity` (by its entity id, else its name) on its record
+    /// named `setting`; false when there is no such region or record.
+    pub fn choose(&mut self, regions: &[AtmosphereRegion], region: u32, setting: &str) -> bool {
+        let wanted = name_hash(setting);
+        match regions.iter().find(|r| r.entity == region) {
+            Some(r) if r.settings.iter().any(|(n, _)| *n == wanted) => {
+                self.chosen.insert(r.entity, wanted);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The region and record over `at`, if any: of the regions holding it,
+    /// the smallest.
+    pub fn over(&self, regions: &[AtmosphereRegion], at: Vec3) -> Option<(usize, usize)> {
+        let (i, r) = regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains(at.x, at.z))
+            .min_by(|a, b| a.1.area.total_cmp(&b.1.area))?;
+        let setting = self
+            .chosen
+            .get(&r.entity)
+            .and_then(|n| r.settings.iter().position(|(s, _)| s == n))
+            .unwrap_or_else(|| r.default_setting());
+        Some((i, setting))
+    }
+
+    /// Moves on by `dt` seconds with the player at `at`: when the region or
+    /// its record changes, eases towards the new one. Returns the new
+    /// region and record when they changed (for the log).
+    pub fn update(
+        &mut self,
+        default: &Atmosphere,
+        regions: &[AtmosphereRegion],
+        at: Vec3,
+        dt: f32,
+    ) -> Option<Option<(usize, usize)>> {
+        let key = self.over(regions, at);
+        let target = key.map_or(*default, |(r, s)| regions[r].settings[s].1);
+        self.t += dt;
+        match &self.to {
+            Some((k, _)) if *k == key => None,
+            Some(_) => {
+                self.from = Some(self.current(default));
+                self.length = target.interpolate_time.max(0.0);
+                self.t = 0.0;
+                self.to = Some((key, target));
+                Some(key)
+            }
+            None => {
+                // The first look: no easing in.
+                self.from = None;
+                self.to = Some((key, target));
+                Some(key)
+            }
+        }
+    }
+
+    /// The light now.
+    pub fn current(&self, default: &Atmosphere) -> Atmosphere {
+        let Some((_, to)) = &self.to else {
+            return *default;
+        };
+        match &self.from {
+            Some(from) if self.t < self.length => from.lerp(to, self.t / self.length),
+            _ => *to,
+        }
+    }
+}
+
 /// Air near the ground against the standard coefficients: fitted so land
 /// 2 km away is about half haze, as in PC footage of the game (the game's
 /// own density comes from code).
@@ -186,5 +475,94 @@ fn srgb_to_linear(c: f32) -> f32 {
         c / 12.92
     } else {
         ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(light_time: f32, interpolate_time: f32) -> Atmosphere {
+        Atmosphere {
+            ambient_cube: [Vec3::splat(0.2); 6],
+            light_intensity: 1.0,
+            rim: Vec3::ZERO,
+            rim_threshold: 0.0,
+            inscattering: 0.0,
+            extinction: 0.0,
+            mie: 0.0,
+            hg_g: 0.0,
+            tone: Vec3::ONE,
+            bloom: [0.0; 4],
+            light_time: [light_time, 0.0],
+            coverage: 0.0,
+            cloud_scales: [1.0; 3],
+            wind: [0.0; 2],
+            light_color: Vec3::ONE,
+            interpolate_time,
+        }
+    }
+
+    fn square(
+        entity: u32,
+        x: f32,
+        z: f32,
+        half: f32,
+        settings: Vec<(u32, Atmosphere)>,
+    ) -> AtmosphereRegion {
+        let outline = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            .map(|(a, b)| Vec2::new(x + a * half, z + b * half))
+            .to_vec();
+        AtmosphereRegion::new(entity, format!("r{entity}"), outline, settings)
+    }
+
+    #[test]
+    fn the_sun_rises_with_light_time() {
+        let low = plain(0.1, 0.0).sun_direction();
+        let high = plain(0.5, 0.0).sun_direction();
+        // Light travels down, from a sun over SUN_SETS when it is low.
+        assert!(low.y < 0.0 && high.y < 0.0);
+        assert!(low.normalize().dot(-SUN_SETS.normalize()) > 0.9);
+        assert!(high.normalize().y < -0.99);
+    }
+
+    #[test]
+    fn the_smallest_region_holding_the_player_lights_them() {
+        let default = plain(0.2, 0.0);
+        let night = name_hash("night");
+        let regions = vec![
+            square(
+                1,
+                0.0,
+                0.0,
+                100.0,
+                vec![(name_hash("Default"), plain(0.9, 0.0))],
+            ),
+            square(
+                2,
+                10.0,
+                10.0,
+                20.0,
+                vec![
+                    (name_hash("Default"), plain(0.1, 0.0)),
+                    (night, plain(0.1, 4.0)),
+                ],
+            ),
+        ];
+        assert_eq!(regions[0].area, 40_000.0);
+        let mut mix = AtmosphereMix::default();
+        mix.update(&default, &regions, Vec3::new(500.0, 0.0, 0.0), 0.1);
+        assert_eq!(mix.current(&default).light_time[0], 0.2);
+        mix.update(&default, &regions, Vec3::new(-50.0, 0.0, 0.0), 0.1);
+        assert_eq!(mix.current(&default).light_time[0], 0.9);
+        mix.update(&default, &regions, Vec3::new(15.0, 0.0, 15.0), 0.1);
+        assert_eq!(mix.current(&default).light_time[0], 0.1);
+        // A script's pick is eased into over its record's time.
+        assert!(mix.choose(&regions, 2, "night"));
+        assert!(!mix.choose(&regions, 2, "warzone"));
+        mix.update(&default, &regions, Vec3::new(15.0, 0.0, 15.0), 0.1);
+        mix.update(&default, &regions, Vec3::new(15.0, 0.0, 15.0), 2.0);
+        assert_eq!(mix.over(&regions, Vec3::new(15.0, 0.0, 15.0)), Some((1, 1)));
+        assert_eq!(mix.current(&default).interpolate_time, 4.0);
     }
 }

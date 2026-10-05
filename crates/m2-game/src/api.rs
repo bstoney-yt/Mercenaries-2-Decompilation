@@ -123,6 +123,12 @@ pub enum Command {
     /// game goes into it, and sets [`ScriptWorld::game_state`] back to
     /// `"Game"` when it is done (the world has streamed in).
     GameState(String),
+    /// Put an atmosphere region (`rgn_atmo_carmonaislandrain`) on its
+    /// record named `setting` (`"night"`).
+    Atmosphere {
+        region: u32,
+        setting: String,
+    },
     /// A call the game only needs to hear about: `"Pg.SaveGame"`,
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
@@ -841,6 +847,26 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // banks (`vo_stream.english.pws`).
     add(&sound, "GetAudioDir", |_, lua, _| {
         values([Value::String(lua.create_string(r"data\Audios")?)])
+    })?;
+    // `Graphics.Atmosphere`: the light of a line region, by the name of
+    // one of its records.
+    let graphics = lib("Graphics")?;
+    let atmosphere = match graphics.raw_get::<Value>("Atmosphere")? {
+        Value::Table(t) if t.metatable().is_none() => t,
+        _ => {
+            let t = lua.create_table()?;
+            graphics.raw_set("Atmosphere", &t)?;
+            t
+        }
+    };
+    add(&atmosphere, "ChangeLineRegionSetting", |w, _, a| {
+        if let (Some(region), Some(Value::String(s))) = (id(a.first()), a.get(1)) {
+            w.commands.push(Command::Atmosphere {
+                region,
+                setting: s.to_string_lossy(),
+            });
+        }
+        values([])
     })?;
     let gui = lib("Gui")?;
     add(&gui, "GetLanguageName", |_, lua, _| {

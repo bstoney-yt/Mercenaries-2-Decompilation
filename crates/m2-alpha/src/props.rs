@@ -67,6 +67,9 @@ pub struct Props {
     knocked: HashMap<u32, Vec<DebrisId>>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
+    /// Node matrices of those that move on their own, by entity
+    /// ([`crate::moving`]).
+    poses: HashMap<u32, Vec<Mat4>>,
 }
 
 /// How the props stand ([`Props::counts`]): how many are shown, and of
@@ -130,6 +133,17 @@ struct Loaders {
 }
 
 impl Props {
+    /// The model of shown prop `entity`, and where it stands.
+    pub fn placed(&self, entity: u32) -> Option<(u32, Vec3)> {
+        self.shown.get(&entity).map(|p| (p.model, p.position))
+    }
+
+    /// Sets the node matrices the props that move on their own are drawn
+    /// with, by entity (those left out stand in their rest pose).
+    pub fn set_poses(&mut self, poses: HashMap<u32, Vec<Mat4>>) {
+        self.poses = poses;
+    }
+
     /// Puts up the models of those of `entities` the state layers place
     /// (others are ignored); their models load nearest first as
     /// [`Props::update`] goes. How many were new.
@@ -542,7 +556,10 @@ impl Props {
                 continue;
             }
             let at = Mat4::from_rotation_translation(p.rotation, p.position);
-            m.gpu.draw_as(queue, at, p.wrecked);
+            match self.poses.get(e).filter(|_| !p.wrecked) {
+                Some(nodes) => m.gpu.draw_moved(queue, at, nodes, false, &[]),
+                None => m.gpu.draw_as(queue, at, p.wrecked),
+            }
         }
     }
 }
