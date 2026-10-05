@@ -423,6 +423,13 @@ impl World {
     ) -> Result<Self, AssetError> {
         let mut source = install.open_world()?;
         let index = Arc::new(WorldIndex::build(&mut source)?);
+        // The sea's shore foam, the one texture the game's water shader
+        // takes.
+        let foam = m2_assets::name_hash("global_seafoam01");
+        match source.texture(foam, 512) {
+            Ok(t) => materials.add_texture(backend, foam, Some(&t))?,
+            Err(e) => eprintln!("sea foam texture {foam:08x}: {e}"),
+        }
         drop(source);
         let loader = Loader::spawn(install, index.clone(), TextureLimits::default())?;
         let mut objects: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -436,7 +443,8 @@ impl World {
                 .push(i);
             by_model.entry(o.model).or_default().push(i);
         }
-        let sea = sea_plane(backend, materials, settings.sea_level)?;
+        let foam = materials.texture(foam).map(|(t, _)| t);
+        let sea = sea_plane(backend, materials, settings.sea_level, foam)?;
         let mut world = Self {
             index,
             settings,
@@ -1100,11 +1108,13 @@ fn ground_material(
     }
 }
 
-/// A 20 km square of translucent water at `level`, centred on the origin.
+/// A 20 km square of translucent water at `level`, centred on the origin,
+/// with `foam` along its shores.
 fn sea_plane(
     backend: &mut dyn RenderBackend,
     materials: &mut MaterialCache,
     level: f32,
+    foam: Option<m2_render::TextureHandle>,
 ) -> Result<(VertexBufferHandle, IndexBufferHandle, MaterialId), BackendError> {
     let h = 10_000.0f32;
     let vertices: Vec<u8> = [(-h, h), (h, h), (h, -h), (-h, -h)]
@@ -1135,9 +1145,9 @@ fn sea_plane(
     let material = materials.define(
         backend,
         &MaterialDesc {
-            // Deep blue-green, opaque enough that the seabed's tile edges
-            // don't show; Fresnel makes it more so at a glance.
-            color: [0.05, 0.22, 0.30, 0.85],
+            // Deep blue-green; shallows are paler and show the bed.
+            color: [0.05, 0.22, 0.30, 1.0],
+            texture: foam,
             blend: BlendMode::Translucent,
             double_sided: true,
             water: true,

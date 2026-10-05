@@ -293,6 +293,15 @@ struct RecordedDraw {
     caster: Option<Caster>,
 }
 
+/// The depth buffer and its copy for water.
+#[derive(Debug)]
+struct DepthTargets {
+    depth: wgpu::Texture,
+    view: wgpu::TextureView,
+    scene: wgpu::Texture,
+    group: wgpu::BindGroup,
+}
+
 /// Where frames go.
 #[derive(Debug)]
 enum Target {
@@ -323,7 +332,8 @@ pub struct WgpuBackend {
     target: Target,
     width: u32,
     height: u32,
-    depth: wgpu::TextureView,
+    depth: DepthTargets,
+    scene_layout: wgpu::BindGroupLayout,
 
     draw_layout: wgpu::BindGroupLayout,
     material_layout: wgpu::BindGroupLayout,
@@ -604,12 +614,28 @@ impl WgpuBackend {
                 texture_entry(10),
             ],
         });
+        // Depth beneath, for water: a copy of the depth buffer made before
+        // the first water draw.
+        let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scene"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("standard"),
             bind_group_layouts: &[
                 Some(&frame_layout),
                 Some(&draw_layout),
                 Some(&material_layout),
+                Some(&scene_layout),
             ],
             immediate_size: 0,
         });
@@ -774,7 +800,7 @@ impl WgpuBackend {
                 &[255; 4],
             )
             .create_view(&Default::default());
-        let depth = Self::depth_view(&device, width, height);
+        let depth = Self::depth_targets(&device, &scene_layout, width, height);
         let output = match &target {
             Target::Window { config, .. } => config.format,
             Target::Offscreen { format, .. } => *format,
@@ -801,6 +827,7 @@ impl WgpuBackend {
             width,
             height,
             depth,
+            scene_layout,
             draw_layout,
             material_layout,
             pipeline_layout,
@@ -873,10 +900,17 @@ impl WgpuBackend {
         })
     }
 
-    fn depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
-        device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("depth"),
+    /// The depth buffer, and the copy of it water reads (what lies
+    /// beneath), with the copy's bind group.
+    fn depth_targets(
+        device: &wgpu::Device,
+        scene_layout: &wgpu::BindGroupLayout,
+        width: u32,
+        height: u32,
+    ) -> DepthTargets {
+        let texture = |label, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
                 size: wgpu::Extent3d {
                     width,
                     height,
@@ -886,10 +920,34 @@ impl WgpuBackend {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage,
                 view_formats: &[],
             })
-            .create_view(&Default::default())
+        };
+        let depth = texture(
+            "depth",
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let scene = texture(
+            "scene depth",
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        );
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene"),
+            layout: scene_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(
+                    &scene.create_view(&Default::default()),
+                ),
+            }],
+        });
+        DepthTargets {
+            view: depth.create_view(&Default::default()),
+            depth,
+            scene,
+            group,
+        }
     }
 
     /// `samplers` are the repeating and clamping ones.
@@ -1052,7 +1110,7 @@ impl WgpuBackend {
         }
         self.width = width;
         self.height = height;
-        self.depth = Self::depth_view(&self.device, width, height);
+        self.depth = Self::depth_targets(&self.device, &self.scene_layout, width, height);
         self.post.resize(&self.device, width, height);
         if let Target::Window { surface, config } = &mut self.target {
             config.width = width;
@@ -1458,6 +1516,117 @@ impl WgpuBackend {
         Ok(())
     }
 
+    /// One world pass over `draws`, the first of which is draw `first` of
+    /// the frame. The first pass clears and draws the sky.
+    fn encode_world(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        sky: Vec3,
+        draws: &[RecordedDraw],
+        first: usize,
+        clear: bool,
+    ) -> Result<(), BackendError> {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("world"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.post.hdr,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // Linear sky colour; the post pass writes it to the sRGB
+                    // frame.
+                    load: if clear {
+                        wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(sky.x),
+                            g: f64::from(sky.y),
+                            b: f64::from(sky.z),
+                            a: 1.0,
+                        })
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: if clear {
+                        wgpu::LoadOp::Clear(0.0)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    // Kept for the copy water reads.
+                    store: if clear {
+                        wgpu::StoreOp::Store
+                    } else {
+                        wgpu::StoreOp::Discard
+                    },
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_bind_group(0, &self.frame_group, &[]);
+        if clear {
+            pass.set_pipeline(&self.sky);
+            pass.draw(0..3, 0..1);
+        }
+        pass.set_bind_group(3, &self.depth.group, &[]);
+        // State is set only when it changes: the queue has sorted the
+        // draws so neighbours share pipelines, materials and buffers, and
+        // each command costs time to record and submit.
+        let mut pipeline_now: Option<&PipelineKey> = None;
+        let mut material_now = None;
+        let mut vertices_now = None;
+        let mut indices_now = None;
+        for (i, d) in draws.iter().enumerate() {
+            if pipeline_now != Some(&d.pipeline) {
+                pass.set_pipeline(&self.pipelines[&d.pipeline]);
+                pipeline_now = Some(&d.pipeline);
+            }
+            let offset = ((first + i) as u64 * DRAW_STRIDE) as u32;
+            pass.set_bind_group(1, &self.draw_group, &[offset]);
+            if material_now != Some(d.material) {
+                let material = self
+                    .materials
+                    .get(&d.material)
+                    .map_or(&self.default_material, |m| &m.bind_group);
+                pass.set_bind_group(2, material, &[]);
+                material_now = Some(d.material);
+            }
+            if vertices_now != Some(d.vertex_buffer.0) {
+                let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
+                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                vertices_now = Some(d.vertex_buffer.0);
+            }
+            match d.geometry {
+                Geometry::Vertices { first, count } => {
+                    pass.draw(first..first + count, 0..d.instances);
+                }
+                Geometry::Indexed {
+                    buffer,
+                    first,
+                    count,
+                    base_vertex,
+                } => {
+                    if indices_now != Some(buffer.0) {
+                        let ib = self.index_buffers.get(buffer.0)?;
+                        pass.set_index_buffer(
+                            ib.buffer.slice(..),
+                            wgpu_index_format(ib.desc.format),
+                        );
+                        indices_now = Some(buffer.0);
+                    }
+                    pass.draw_indexed(first..first + count, base_vertex, 0..d.instances);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn encode(
         &self,
         view: &View,
@@ -1513,88 +1682,25 @@ impl WgpuBackend {
         if let Some(cascades) = &cascades {
             self.encode_shadows(&mut encoder, &frame, cascades, refresh, draws)?;
         }
-        {
-            // Linear sky colour; the post pass writes it to the sRGB frame.
-            let sky = l.sky_color;
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("world"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.post.hdr,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(sky.x),
-                            g: f64::from(sky.y),
-                            b: f64::from(sky.z),
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &self.frame_group, &[]);
-            pass.set_pipeline(&self.sky);
-            pass.draw(0..3, 0..1);
-            // State is set only when it changes: the queue has sorted the
-            // draws so neighbours share pipelines, materials and buffers,
-            // and each command costs time to record and submit.
-            let mut pipeline_now: Option<&PipelineKey> = None;
-            let mut material_now = None;
-            let mut vertices_now = None;
-            let mut indices_now = None;
-            for (i, d) in draws.iter().enumerate() {
-                if pipeline_now != Some(&d.pipeline) {
-                    pass.set_pipeline(&self.pipelines[&d.pipeline]);
-                    pipeline_now = Some(&d.pipeline);
-                }
-                pass.set_bind_group(1, &self.draw_group, &[(i as u64 * DRAW_STRIDE) as u32]);
-                if material_now != Some(d.material) {
-                    let material = self
-                        .materials
-                        .get(&d.material)
-                        .map_or(&self.default_material, |m| &m.bind_group);
-                    pass.set_bind_group(2, material, &[]);
-                    material_now = Some(d.material);
-                }
-                if vertices_now != Some(d.vertex_buffer.0) {
-                    let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
-                    pass.set_vertex_buffer(0, vb.buffer.slice(..));
-                    vertices_now = Some(d.vertex_buffer.0);
-                }
-                match d.geometry {
-                    Geometry::Vertices { first, count } => {
-                        pass.draw(first..first + count, 0..d.instances);
-                    }
-                    Geometry::Indexed {
-                        buffer,
-                        first,
-                        count,
-                        base_vertex,
-                    } => {
-                        if indices_now != Some(buffer.0) {
-                            let ib = self.index_buffers.get(buffer.0)?;
-                            pass.set_index_buffer(
-                                ib.buffer.slice(..),
-                                wgpu_index_format(ib.desc.format),
-                            );
-                            indices_now = Some(buffer.0);
-                        }
-                        pass.draw_indexed(first..first + count, base_vertex, 0..d.instances);
-                    }
-                }
-            }
+        // Water reads the depth of what lies beneath it, so the world is
+        // drawn in two passes split at the first water draw, with the
+        // depth buffer copied between them.
+        let split = draws
+            .iter()
+            .position(|d| {
+                self.materials
+                    .get(&d.material)
+                    .is_some_and(|m| m.desc.water)
+            })
+            .unwrap_or(draws.len());
+        self.encode_world(&mut encoder, l.sky_color, &draws[..split], 0, true)?;
+        if split < draws.len() {
+            encoder.copy_texture_to_texture(
+                self.depth.depth.as_image_copy(),
+                self.depth.scene.as_image_copy(),
+                self.depth.depth.size(),
+            );
+            self.encode_world(&mut encoder, l.sky_color, &draws[split..], split, false)?;
         }
         self.post.encode(&self.queue, &mut encoder, l, target);
         Ok(encoder.finish())

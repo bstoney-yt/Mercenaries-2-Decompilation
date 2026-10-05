@@ -94,6 +94,8 @@ struct Material {
 @group(2) @binding(8) var layer1: texture_2d<f32>;
 @group(2) @binding(9) var layer2: texture_2d<f32>;
 @group(2) @binding(10) var layer3: texture_2d<f32>;
+// Depth of what was drawn before the water (reversed: 0 is nothing).
+@group(3) @binding(0) var scene_depth: texture_depth_2d;
 
 struct Varyings {
     @builtin(position) clip: vec4<f32>,
@@ -254,7 +256,12 @@ fn layer_uv(i: u32, p: vec4<f32>) -> vec2<f32> {
 @fragment
 fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let ground = material.maps.w > 0.5;
-    var base = textureSample(base_map, base_sampler, v.uv) * material.color;
+    let water = material.water.x > 0.5;
+    // Water's map is its foam, drifting over world space.
+    let drift = vec2<f32>(0.021, 0.013) * frame.view_dir.w;
+    let base_uv = select(v.uv, v.world_pos.xz * 0.15 + drift, water);
+    let base_texel = textureSample(base_map, base_sampler, base_uv);
+    var base = select(base_texel, vec4<f32>(1.0), water) * material.color;
     let ao = material.params.z > 0.5 && !ground;
     if ao {
         base.a = base.a * v.color.a;
@@ -265,7 +272,6 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     var rgb = base.rgb;
     let dist = distance(v.world_pos, frame.eye.xyz);
     let footprint = length(fwidth(v.world_pos.xz));
-    let water = material.water.x > 0.5;
     var water_alpha = 1.0;
     // Sampled outside branches: derivatives need uniform control flow.
     let p = vec4<f32>(v.world_pos, 1.0);
@@ -310,11 +316,35 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         let view = normalize(frame.eye.xyz - v.world_pos);
         let l = -normalize(frame.sun_dir.xyz);
         let shade = sunlight(v.world_pos, vec3<f32>(0.0, 1.0, 0.0));
-        let body = base.rgb * (frame.sun_color.rgb * max(dot(n, l), 0.0) * shade * 0.3 + ambient_light(n));
+        // What lies beneath: the seabed's point from the depth drawn
+        // before the water. Its depth below the surface sets the body
+        // colour (the game looks it up in a depth colour map); the length
+        // of water the eye looks through sets how much of the bed shows.
+        var depth = 1000.0;
+        var through = 1000.0;
+        let below = textureLoad(scene_depth, vec2<i32>(v.clip.xy), 0);
+        if below > 0.0 {
+            let size = vec2<f32>(textureDimensions(scene_depth));
+            let ndc = vec2<f32>(v.clip.x / size.x * 2.0 - 1.0, 1.0 - v.clip.y / size.y * 2.0);
+            let q = frame.inv_view_proj * vec4<f32>(ndc, below, 1.0);
+            let bed = q.xyz / q.w;
+            depth = max(v.world_pos.y - bed.y, 0.0);
+            through = distance(v.world_pos, bed);
+        }
+        let shallow = vec3<f32>(0.10, 0.36, 0.34);
+        let tint = mix(shallow, base.rgb, 1.0 - exp(-depth / 5.0));
+        let lit = frame.sun_color.rgb * max(dot(n, l), 0.0) * shade;
+        let body = tint * (lit * 0.3 + ambient_light(n));
         let f = 0.02 + 0.98 * pow(1.0 - max(dot(n, view), 0.0), 5.0);
         let glint = frame.sun_color.rgb * pow(max(dot(n, normalize(l + view)), 0.0), 400.0) * 3.0 * shade;
         rgb = mix(body, environment(reflect(-view, n)), f) + glint;
-        water_alpha = mix(base.a, 1.0, f);
+        let opacity = 1.0 - exp(-through * 0.2);
+        water_alpha = mix(opacity, 1.0, f);
+        // Foam along the shore, within about 3 m of it as the game's.
+        let pattern = base_texel.a * dot(base_texel.rgb, vec3<f32>(0.3333));
+        let foam = (1.0 - smoothstep(0.0, 3.0, depth)) * pattern * clamp(through * 2.0, 0.0, 1.0);
+        rgb = mix(rgb, lit + ambient_light(vec3<f32>(0.0, 1.0, 0.0)), foam);
+        water_alpha = max(water_alpha, foam);
     } else if material.params.y > 0.5 {
         var n = v.normal;
         if !front {
