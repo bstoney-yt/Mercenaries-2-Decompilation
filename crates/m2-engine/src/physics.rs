@@ -59,12 +59,16 @@ fn pose(position: Vec3, rotation: Quat) -> r::Pose {
 pub struct CollisionShape {
     shape: r::SharedShape,
     pub triangles: usize,
+    /// Cut from the model's visible triangles, standing in for collision
+    /// the model doesn't carry (`PHY2`).
+    pub stand_in: bool,
 }
 
 impl fmt::Debug for CollisionShape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CollisionShape")
             .field("triangles", &self.triangles)
+            .field("stand_in", &self.stand_in)
             .finish()
     }
 }
@@ -88,11 +92,13 @@ impl CollisionShape {
         Some(Self {
             shape,
             triangles: count,
+            stand_in: false,
         })
     }
 
     /// A model's collision in model space: its `PHY2` shapes if `phy2` is
-    /// given and parses, else its rigid visible geometry at `lod`.
+    /// given and parses, else its rigid visible geometry at `lod` (a stand
+    /// in).
     pub fn for_model(model: &Model<'_>, phy2: Option<&[u8]>, lod: u32) -> Option<Self> {
         Self::for_model_part(model, phy2, lod, None)
     }
@@ -128,7 +134,8 @@ impl CollisionShape {
                 triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
             }
         }
-        if triangles.is_empty() {
+        let stand_in = triangles.is_empty();
+        if stand_in {
             let lod = (lod..model.info.lod_count.max(lod + 1))
                 .find(|&l| model.has_lod(l))
                 .unwrap_or(lod);
@@ -170,7 +177,7 @@ impl CollisionShape {
                 }
             }
         }
-        Self::mesh(&vertices, &triangles)
+        Self::mesh(&vertices, &triangles).map(|shape| Self { stand_in, ..shape })
     }
 }
 

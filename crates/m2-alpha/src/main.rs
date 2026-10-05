@@ -624,11 +624,7 @@ fn screenshot(
         ms[2],
         ms[3]
     );
-    let (shown, loaded, loading, waiting, failed) = game.scene.props.counts();
-    eprintln!(
-        "props: {shown} shown; their models: {loaded} loaded, {loading} loading, \
-         {waiting} waiting, {failed} failed"
-    );
+    eprintln!("props: {}", game.scene.props.counts());
     let people = &game.scene.people;
     eprintln!(
         "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",

@@ -457,9 +457,10 @@ pub const NOT_DRIVABLE: [&str; 13] = [
 /// Vehicles parked by the spawn: one of each drivable kind first.
 const PARKED: usize = 8;
 
-/// The state layers' models load for props this much further away than
-/// they are drawn, metres.
-const PROP_MARGIN: f32 = 200.0;
+/// The state layers' models load for props within this much further
+/// than the island's props placed by name are drawn, metres (a prop's own
+/// reach goes by its size, which is known once it has loaded).
+const PROP_MARGIN: f32 = 100.0;
 
 /// Person models loaded: the soldiers the spawn names ask for, then
 /// civilians.
@@ -911,8 +912,8 @@ impl Scene {
         }
         split(1, &mut self.streamed);
         if let (Some(world), Some(source)) = (&mut self.world, &mut self.source) {
-            // As far as they are drawn, and a little more.
-            let reach = world.settings.object_distance + PROP_MARGIN;
+            // As far as most are drawn, and a little more.
+            let reach = world.settings.prop_distance + PROP_MARGIN;
             self.props.update(
                 backend,
                 &mut self.materials,
@@ -1079,7 +1080,8 @@ impl Scene {
         if let Some(world) = &mut self.world {
             let frustum = Frustum::from_view_proj(view.projection * view.view);
             world.draw(backend, queue, eye, &frustum)?;
-            self.props.draw(queue, eye, world.settings.object_distance);
+            self.props
+                .draw(queue, eye, &frustum, world.settings.object_distance);
         } else {
             self.draw_ground(queue);
         }

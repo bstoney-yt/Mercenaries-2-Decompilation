@@ -694,6 +694,12 @@ fn main() -> Result<(), Error> {
                 )
             }
             "collision" => collision(&mut source, &names, arg),
+            "phy2census" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                phy2_census(&mut source, world.as_ref().expect("just built"), &names)
+            }
             "phy2rules" => phy2_rules(&mut source),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
@@ -1771,6 +1777,13 @@ fn collision<R: Read + Seek>(
                 shape.part
             );
         }
+        for (i, body) in p.bodies.iter().enumerate() {
+            println!(
+                "  body {i}: {}, mass {:.1} kg",
+                if body.is_fixed() { "fixed" } else { "moves" },
+                body.mass
+            );
+        }
         for (i, part) in p.parts.iter().enumerate() {
             let at = m
                 .node_to_model(part.node as u16)
@@ -1791,6 +1804,145 @@ fn collision<R: Read + Seek>(
                 part.rotation[2],
                 part.rotation[3]
             );
+        }
+    }
+    Ok(())
+}
+
+/// Which placed models have `PHY2` collision and which stand in their
+/// visible triangles (the alpha's fallback): the island's objects placed
+/// by name (rocks, plants, fences), those placed by `ModelName`, and the
+/// state layers' props. How many models and placements each, the
+/// commonest without, those whose bodies move, and a tally by name word.
+fn phy2_census<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+) -> Result<(), Error> {
+    use m2_assets::physics::Physics as Phy2;
+    // Placements per model: by name, by ModelName, by the state layers.
+    let mut placed: HashMap<u32, [usize; 3]> = HashMap::new();
+    for o in &world.objects {
+        placed.entry(o.model).or_default()[if o.named { 0 } else { 1 }] += 1;
+    }
+    for o in world.state_objects.values() {
+        placed.entry(o.model).or_default()[2] += 1;
+    }
+    struct Seen {
+        hash: u32,
+        placed: [usize; 3],
+        /// Bodies, fixed bodies, shapes; `None` without `PHY2`.
+        phy2: Option<(usize, usize, usize)>,
+        /// The moving bodies' mass, kg.
+        mass: f32,
+        size: f32,
+    }
+    let mut seen: Vec<Seen> = Vec::new();
+    let mut unread = 0;
+    for (&hash, &n) in &placed {
+        let Ok(data) = source.model(hash) else {
+            unread += 1;
+            continue;
+        };
+        let Ok(m) = data.parse() else {
+            unread += 1;
+            continue;
+        };
+        let b = &m.info.bounds;
+        let size = (Vec3::from(b.max) - Vec3::from(b.min)).length();
+        let phy2 = m2_assets::Ucfx::parse(&data.base)
+            .ok()
+            .and_then(|u| u.top_level(*b"PHY2"))
+            .and_then(|d| Phy2::parse(d).ok());
+        seen.push(Seen {
+            hash,
+            placed: n,
+            phy2: phy2.as_ref().map(|p| {
+                (
+                    p.bodies.len(),
+                    p.bodies.iter().filter(|b| b.is_fixed()).count(),
+                    p.shapes.len(),
+                )
+            }),
+            mass: phy2.as_ref().map_or(0.0, |p| {
+                p.bodies
+                    .iter()
+                    .filter(|b| !b.is_fixed())
+                    .map(|b| b.mass)
+                    .sum()
+            }),
+            size,
+        });
+    }
+    println!("{} models placed, {} unreadable", placed.len(), unread);
+    const HOW: [&str; 3] = ["by name", "by ModelName", "by the state layers"];
+    for (k, how) in HOW.iter().enumerate() {
+        let tally = |with: bool| {
+            seen.iter()
+                .filter(|s| s.placed[k] > 0 && s.phy2.is_some() == with)
+                .fold((0, 0), |(m, p), s| (m + 1, p + s.placed[k]))
+        };
+        let (with, without) = (tally(true), tally(false));
+        println!(
+            "placed {how}: {} models ({} placements) with PHY2, {} ({}) without",
+            with.0, with.1, without.0, without.1
+        );
+    }
+    for (k, how) in HOW.iter().enumerate() {
+        let mut without: Vec<&Seen> = seen
+            .iter()
+            .filter(|s| s.placed[k] > 0 && s.phy2.is_none())
+            .collect();
+        without.sort_by_key(|s| std::cmp::Reverse(s.placed[k]));
+        println!("commonest without PHY2, placed {how}:");
+        for s in without.iter().take(if k == 0 { 50 } else { 25 }) {
+            println!(
+                "  {:5} x {:08x} {}: {:.1} m",
+                s.placed[k],
+                s.hash,
+                names.show(s.hash),
+                s.size
+            );
+        }
+    }
+    let mut moving: Vec<&Seen> = seen
+        .iter()
+        .filter(|s| s.phy2.is_some_and(|(bodies, fixed, _)| fixed < bodies))
+        .collect();
+    moving.sort_by_key(|s| std::cmp::Reverse(s.placed.iter().sum::<usize>()));
+    println!(
+        "with a body that moves: {} models; commonest:",
+        moving.len()
+    );
+    for s in moving.iter().take(30) {
+        let (bodies, fixed, shapes) = s.phy2.unwrap_or_default();
+        println!(
+            "  {:5} x {:08x} {}: {bodies} bodies ({fixed} fixed), {shapes} shapes, {:.0} kg moving, {:.1} m, placed {:?}",
+            s.placed.iter().sum::<usize>(),
+            s.hash,
+            names.show(s.hash),
+            s.mass,
+            s.size,
+            s.placed
+        );
+    }
+    const WORDS: [&str; 30] = [
+        "plant", "bush", "shrub", "fern", "grass", "reed", "flower", "weed", "vine", "leaf",
+        "hedge", "bamboo", "banana", "palm", "tree", "log", "stump", "rock", "boulder", "fence",
+        "sandbag", "wall", "sign", "pole", "lamp", "crate", "barrel", "debris", "rubble", "cactus",
+    ];
+    println!("by name word (models, placements): with PHY2 / without");
+    for w in WORDS {
+        let tally = |with: bool| {
+            seen.iter()
+                .filter(|s| s.phy2.is_some() == with && names.show(s.hash).contains(w))
+                .fold((0, 0), |(m, p), s| {
+                    (m + 1, p + s.placed.iter().sum::<usize>())
+                })
+        };
+        let (a, b) = (tally(true), tally(false));
+        if a.0 + b.0 > 0 {
+            println!("  {w}: {} ({}) / {} ({})", a.0, a.1, b.0, b.1);
         }
     }
     Ok(())
