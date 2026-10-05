@@ -176,6 +176,20 @@ const REMOVE_FREEBIE: &str = r#"
 local d = MrxSupportData.tFreebieData[...]
 if d and d.bActive then MrxSupportData.RemoveFreebie(...) end
 "#;
+/// Her fuel, as the engine tells the HUD: how much, and of how much (her
+/// capacity, `MrxPmc.GetFuelCapacity`, 300 at the start), which the fuel
+/// box shows after it ("0/300"). What `MrxGuiInterface.SetFuel` does (its
+/// module is not one the HUD's scripts load): each fuel box's value, then
+/// "/" and the most as its appended text; not shown (the box opens with
+/// the support menu, as in the footage).
+const FUEL: &str = r#"
+local fuel = ...
+local cap = MrxPmc and MrxPmc.GetFuelCapacity and MrxPmc.GetFuelCapacity() or 300
+for _, w in pairs(MrxGuiInterface._GetWidgetsForPlayers(nil, "fuel") or {}) do
+    w:SetValue(fuel)
+    w:SetAppendedString("/" .. cap)
+end
+"#;
 /// The support menu opened (true) or closed: its own `Open` and `Close`.
 const SUPPORT_MENU: &str = r#"
 local open = ...
@@ -987,13 +1001,12 @@ impl Thread {
         let lua = self.mission.lua();
         let first = self.told.hp.is_none();
         if first {
-            for event in ["PlayerCashChanged", "PlayerFuelChanged"] {
-                let t = table(
-                    lua,
-                    [("uGuid", guid_value(PLAYER)), ("nValue", Value::Integer(0))],
-                )?;
-                fire(lua, event, t)?;
-            }
+            let t = table(
+                lua,
+                [("uGuid", guid_value(PLAYER)), ("nValue", Value::Integer(0))],
+            )?;
+            fire(lua, "PlayerCashChanged", t)?;
+            lua.load(FUEL).set_name("=m2-hud fuel").call::<()>(0)?;
             let t = table(lua, [("nX", Value::Integer(0)), ("nY", Value::Integer(0))])?;
             fire(lua, "GuiReticlePositionChange", t)?;
         }
