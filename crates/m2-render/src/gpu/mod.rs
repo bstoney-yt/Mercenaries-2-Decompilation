@@ -1767,12 +1767,10 @@ impl WgpuBackend {
             ],
             cloud_tone: l.clouds.tone.extend(l.clouds.opacity).to_array(),
             haze_layers: l.haze.layers.unwrap_or([0.0; 4]),
-            deck: [
-                l.clouds.reach.unwrap_or(0.0),
-                if l.haze.sun_tint { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
-            ],
+            deck: {
+                let tint = l.haze.sun_tint.unwrap_or(Vec3::splat(-1.0));
+                [l.clouds.reach.unwrap_or(0.0), tint.x, tint.y, tint.z]
+            },
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));

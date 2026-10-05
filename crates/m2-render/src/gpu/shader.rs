@@ -59,8 +59,8 @@ struct Frame {
     // z, w the second's (all 0: the earlier haze)
     haze_layers: vec4<f32>,
     // x: the farthest the cloud deck is taken to be for the air in front
-    // of it (0: wherever the ray meets it), y: what the air keeps is
-    // tinted by the sun's colour (`through_air`)
+    // of it (0: wherever the ray meets it), yzw: a display colour what
+    // the air keeps is tinted by (`through_air`; negative: none)
     deck: vec4<f32>,
 };
 
@@ -251,8 +251,8 @@ fn game_sky(r: vec3<f32>) -> vec3<f32> {
 fn through_air(rgb: vec3<f32>, h: vec4<f32>) -> vec3<f32> {
     if game_haze() {
         var keep = vec3<f32>(h.a);
-        if frame.deck.y > 0.5 {
-            keep = keep * light_to_display(frame.sun_color.rgb);
+        if frame.deck.y >= 0.0 {
+            keep = keep * frame.deck.yzw;
         }
         return light_from_display(light_to_display(rgb) * keep + h.rgb);
     }
@@ -716,7 +716,10 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
                 / pow(1.0 + g * g - 2.0 * g * c, 1.5);
             // The sun's colour comes in with the air in front when that
             // is tinted by it.
-            let sun = select(frame.sun_color.rgb, vec3<f32>(1.0), frame.deck.y > 0.5 && game_haze());
+            var sun = frame.sun_color.rgb;
+            if frame.deck.y >= 0.0 && game_haze() {
+                sun = sun / max(light_from_display(frame.deck.yzw), vec3<f32>(1e-3));
+            }
             cloud = sun * (1.0 + phase) / (1.0 + mass * frame.wind.w);
         } else {
             // Lit by the sun, brighter looking towards it; thicker cloud
