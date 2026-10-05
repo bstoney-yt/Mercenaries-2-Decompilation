@@ -243,9 +243,20 @@ pub struct Screen {
     strings: Option<StringTable>,
     /// Errors from callbacks and the scripts' event processing.
     log: Vec<String>,
+    /// Where the player aims, -1..=1 across the screen and up it
+    /// (`Gui.GetReticlePosition`).
+    reticle: [f32; 2],
 }
 
 impl Screen {
+    /// Sets where the player aims: -1..=1 from the left edge to the right
+    /// and from the bottom to the top (0, 0 is the middle), as
+    /// `Gui.GetReticlePosition` answers. Fire `GuiReticlePositionChange`
+    /// with `{ nX, nY }` too when it moves.
+    pub fn set_reticle(&mut self, x: f32, y: f32) {
+        self.reticle = [x, y];
+    }
+
     /// A widget by id.
     pub fn widget(&self, id: u32) -> Option<&Widget> {
         self.widgets.get(&id)
@@ -458,7 +469,15 @@ impl Screen {
     pub fn display_text(&self, text: &str) -> String {
         let id = text.strip_prefix('[').and_then(|t| t.strip_suffix(']'));
         match (id, &self.strings) {
-            (Some(id), Some(s)) => s.lookup(id).unwrap_or(text).to_owned(),
+            // `[0x8c4d842e]`: the key hash itself, as scripts that hash
+            // ids at run time write it.
+            (Some(id), Some(s)) => id
+                .strip_prefix("0x")
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .and_then(|k| s.get(k))
+                .or_else(|| s.lookup(id))
+                .unwrap_or(text)
+                .to_owned(),
             _ => text.to_owned(),
         }
     }
@@ -713,6 +732,18 @@ impl Args {
     }
 }
 
+/// The box `SetWidgetLocation(id, x1, y1, x2, y2)` asks for: without `x2`
+/// and `y2` the widget moves to `x1`, `y1` and keeps its size (the
+/// reticle follows the aim so).
+fn new_location(s: &Screen, a: &Args) -> [f32; 4] {
+    let old = s.rect(a.id(0));
+    let (x1, y1) = (a.f(1).unwrap_or(old[0]), a.f(2).unwrap_or(old[1]));
+    match (a.f(3), a.f(4)) {
+        (Some(x2), Some(y2)) => [x1, y1, x2, y2],
+        _ => [x1, y1, x1 + old[2] - old[0], y1 + old[3] - old[1]],
+    }
+}
+
 fn ret<T: IntoLuaMulti>(lua: &Lua, v: T) -> mlua::Result<MultiValue> {
     v.into_lua_multi(lua)
 }
@@ -814,6 +845,24 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
     meta.raw_set("__index", fallback)?;
     g.set_metatable(Some(meta))?;
     lua.globals().raw_set("_GuiInternal", g)?;
+    // `Gui.GetReticlePosition(owner)`: the aim point, in the plain `Gui`
+    // library table (made here if the host has none yet).
+    let gui = match lua.globals().raw_get::<Value>("Gui")? {
+        Value::Table(t) if t.metatable().is_none() => t,
+        _ => {
+            let t = lua.create_table()?;
+            lua.globals().raw_set("Gui", &t)?;
+            t
+        }
+    };
+    let s = Rc::clone(&screen);
+    gui.raw_set(
+        "GetReticlePosition",
+        safe_function(lua, move |lua, _| {
+            let [x, y] = s.borrow().reticle;
+            ret(lua, (x, y))
+        })?,
+    )?;
     lua.set_app_data(Rc::clone(&screen));
     Ok(screen)
 }
@@ -865,7 +914,8 @@ pub fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<usi
                 r#"
                 local n = 0
                 local list = {}
-                for _, w in pairs(WidgetIdIndex or {}) do list[#list + 1] = w end
+                local index = (MrxGuiBase and MrxGuiBase.WidgetIdIndex) or {}
+                for _, w in pairs(index) do list[#list + 1] = w end
                 table.sort(list, function(a, b) return a.BasicData.uId < b.BasicData.uId end)
                 for _, w in ipairs(list) do
                     local h = w.EventHandlers and w.EventHandlers.GuiInitialization
@@ -932,15 +982,8 @@ natives! {
     },
     "GetWidgetSleep" => |s, l, a| ret(l, s.widget(a.id(0)).is_some_and(|w| w.sleeping)),
     "SetWidgetLocation" => |s, _, a| {
-        let id = a.id(0);
-        let old = s.rect(id);
-        let r = [
-            a.f(1).unwrap_or(old[0]),
-            a.f(2).unwrap_or(old[1]),
-            a.f(3).unwrap_or(old[2]),
-            a.f(4).unwrap_or(old[3]),
-        ];
-        s.set_rect(id, r);
+        let r = new_location(s, a);
+        s.set_rect(a.id(0), r);
         Ok(MultiValue::new())
     },
     "GetWidgetLocation" => |s, l, a| {
@@ -949,15 +992,8 @@ natives! {
     },
     // The corrected box is the box: corrections apply when drawing.
     "SetWidgetCorrectedLocation" => |s, _, a| {
-        let id = a.id(0);
-        let old = s.rect(id);
-        let r = [
-            a.f(1).unwrap_or(old[0]),
-            a.f(2).unwrap_or(old[1]),
-            a.f(3).unwrap_or(old[2]),
-            a.f(4).unwrap_or(old[3]),
-        ];
-        s.set_rect(id, r);
+        let r = new_location(s, a);
+        s.set_rect(a.id(0), r);
         Ok(MultiValue::new())
     },
     "GetWidgetCorrectedLocation" => |s, l, a| {
@@ -984,9 +1020,14 @@ natives! {
         ret(l, (anchor_name(h, true), anchor_name(v, false)))
     },
     "CorrectWidgetForResolution" => |s, _, a| {
+        // A widget with a parent moves with it: `MrxGuiBase` corrects every
+        // widget on a resolution change, and children corrected by their
+        // own anchors would come apart from their frames.
         let id = a.id(0);
         let r = s.rect(id);
-        if let Some(w) = s.widgets.get_mut(&id) {
+        if let Some(w) = s.widgets.get_mut(&id)
+            && w.parent.is_none()
+        {
             let point = |anchor, lo: f32, hi: f32| match anchor {
                 Anchor::Start => lo,
                 Anchor::Centre => (lo + hi) / 2.0,
