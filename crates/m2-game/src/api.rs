@@ -1340,6 +1340,29 @@ mod tests {
     }
 
     #[test]
+    fn atmosphere_calls_reach_the_game_and_the_rest_are_stubs() {
+        let (host, world) = setup();
+        host.complete_libraries(&LIBRARIES).unwrap();
+        host.lua()
+            .load(
+                r#"
+                Graphics.Atmosphere.EnableImmediatelyChangeMode(true)
+                Graphics.Atmosphere.SetSky("afternoon")
+                Graphics.Atmosphere.ChangeLineRegionSetting(Pg.GetGuidByName("Mattias"), "night")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::Atmosphere {
+                region: 1,
+                setting: "night".into()
+            }]
+        );
+    }
+
+    #[test]
     fn game_state_changes_fire_events() {
         let (host, world) = setup();
         let events = crate::events::Events::default();

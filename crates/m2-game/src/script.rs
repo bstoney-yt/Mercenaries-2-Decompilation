@@ -213,32 +213,45 @@ impl ScriptHost {
             let Value::Table(t) = self.lua.globals().raw_get::<Value>(library)? else {
                 continue;
             };
-            if t.metatable().is_some() {
-                continue;
+            // Tables of their own inside a library (`Graphics.Atmosphere`)
+            // stub what they lack too.
+            for pair in t.pairs::<Value, Value>() {
+                if let (Value::String(k), Value::Table(inner)) = pair? {
+                    self.stub_members(&inner, &format!("{library}.{}", k.to_string_lossy()))?;
+                }
             }
-            let meta = self.lua.create_table()?;
-            let log = Rc::clone(&self.log);
-            let library = library.to_owned();
-            meta.set(
-                "__index",
-                safe_function(&self.lua, move |lua, args| {
-                    let (Some(Value::Table(t)), Some(Value::String(k))) =
-                        (args.front(), args.get(1))
-                    else {
-                        return Ok(MultiValue::new());
-                    };
-                    let name = format!("{library}.{}", k.to_string_lossy());
-                    let log = Rc::clone(&log);
-                    let f = safe_function(lua, move |_, _| {
-                        log.borrow_mut().push(name.clone());
-                        Ok(MultiValue::new())
-                    })?;
-                    t.raw_set(k.clone(), &f)?;
-                    Ok(MultiValue::from_vec(vec![Value::Function(f)]))
-                })?,
-            )?;
-            t.set_metatable(Some(meta))?;
+            self.stub_members(&t, library)?;
         }
+        Ok(())
+    }
+
+    /// Gives table `t` (library `library`) a logged no-op for every member
+    /// it lacks, unless it has a metatable already.
+    fn stub_members(&self, t: &Table, library: &str) -> Result<(), ScriptError> {
+        if t.metatable().is_some() {
+            return Ok(());
+        }
+        let meta = self.lua.create_table()?;
+        let log = Rc::clone(&self.log);
+        let library = library.to_owned();
+        meta.set(
+            "__index",
+            safe_function(&self.lua, move |lua, args| {
+                let (Some(Value::Table(t)), Some(Value::String(k))) = (args.front(), args.get(1))
+                else {
+                    return Ok(MultiValue::new());
+                };
+                let name = format!("{library}.{}", k.to_string_lossy());
+                let log = Rc::clone(&log);
+                let f = safe_function(lua, move |_, _| {
+                    log.borrow_mut().push(name.clone());
+                    Ok(MultiValue::new())
+                })?;
+                t.raw_set(k.clone(), &f)?;
+                Ok(MultiValue::from_vec(vec![Value::Function(f)]))
+            })?,
+        )?;
+        t.set_metatable(Some(meta))?;
         Ok(())
     }
 
