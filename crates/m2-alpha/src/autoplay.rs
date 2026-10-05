@@ -624,11 +624,18 @@ impl Autoplay {
             return Intent::default();
         };
         let (look, error) = aim(p, target, dt);
-        // The turret follows the camera at its own pace.
+        // The turret follows the camera at its own pace, and its gun
+        // tilts after it (as far as it goes).
         let f = m.transform_vector3(Vec3::Z);
         let turret = f.x.atan2(f.z) + v.turret;
         let off = wrap(p.yaw + look.x - turret).abs();
-        self.steady = if error < ON_TARGET && off < TURRET_ON {
+        let laid = v.spec.muzzle_pose(v.turret, v.gun).is_none_or(|(at, dir)| {
+            let (at, dir) = (m.transform_point3(at), m.transform_vector3(dir));
+            let (down, up) = v.spec.elevation;
+            let stopped = v.gun <= down + 0.01 || v.gun >= up - 0.01;
+            stopped || (target - at).normalize_or(dir).angle_between(dir) < TURRET_ON
+        });
+        self.steady = if error < ON_TARGET && off < TURRET_ON && laid {
             self.steady + dt
         } else {
             0.0

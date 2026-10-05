@@ -26,8 +26,10 @@ struct Spot<'a> {
     yaw: f32,
 }
 
-/// How fast a turret turns after the camera, radians a second (invented).
+/// How fast a turret turns after the camera, and its gun tilts to the
+/// crosshair, radians a second (invented).
 const TURRET_RATE: f32 = 1.2;
+const GUN_RATE: f32 = 0.6;
 /// How near a building the town's sounds play, metres.
 const TOWN_REACH: f32 = 150.0;
 
@@ -307,7 +309,8 @@ impl Game {
                         player.update(physics, intent, dt);
                     }
                 }
-                // A turret turns after the camera, at its own pace.
+                // A turret turns after the camera, at its own pace, and
+                // its gun tilts to what the crosshair is on.
                 if let Some(v) = player.driving.and_then(|i| scene.vehicles.get_mut(i))
                     && !v.wrecked
                     && let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id))
@@ -319,6 +322,18 @@ impl Game {
                         turn -= std::f32::consts::TAU;
                     }
                     v.turret += turn.clamp(-TURRET_RATE * dt, TURRET_RATE * dt);
+                    if let Some(pivot) = v.spec.gun_pivot {
+                        let goal = Combat::aim_point(physics, &scene.people, player, v.id);
+                        // The crosshair's point as seen from the gun with
+                        // the turret straight ahead.
+                        let local = (at * v.spec.turret_transform(v.turret))
+                            .inverse()
+                            .transform_point3(goal)
+                            - pivot;
+                        let (down, up) = v.spec.elevation;
+                        let want = local.y.atan2(local.with_y(0.0).length()).clamp(down, up);
+                        v.gun += (want - v.gun).clamp(-GUN_RATE * dt, GUN_RATE * dt);
+                    }
                 }
             } else {
                 physics.step(dt);

@@ -1224,12 +1224,15 @@ fn drive_for_screenshot(
         .map(|i| &game.scene.vehicles[i])
     {
         eprintln!(
-            "drive: {} wheels, {} road wheels, tracked {}, wheels rolled {:.1} m, turret pivot {:?}",
+            "drive: {} wheels, {} road wheels, tracked {}, wheels rolled {:.1} m, turret pivot {:?}, gun pivot {:?} ({} nodes, muzzle on it {})",
             v.spec.wheels.len(),
             v.spec.road_wheels.len(),
             v.spec.tracked,
             v.rolled,
-            v.spec.pivot
+            v.spec.pivot,
+            v.spec.gun_pivot,
+            v.spec.gun.iter().filter(|g| **g).count(),
+            v.spec.muzzle_on_gun
         );
         let templated = game
             .scene
@@ -1322,12 +1325,17 @@ fn drive_for_screenshot(
             {
                 let v = &game.scene.vehicles[i];
                 eprintln!(
-                    "drive: turret at {:.0} deg, camera yaw {:.0} deg",
+                    "drive: turret at {:.0} deg, gun raised {:.1} deg, camera yaw {:.0} deg, pitch {:.0} deg",
                     v.turret.to_degrees(),
+                    v.gun.to_degrees(),
                     game.scene
                         .player
                         .as_ref()
-                        .map_or(0.0, |p| p.yaw.to_degrees())
+                        .map_or(0.0, |p| p.yaw.to_degrees()),
+                    game.scene
+                        .player
+                        .as_ref()
+                        .map_or(0.0, |p| p.pitch.to_degrees())
                 );
             }
         }
@@ -1365,9 +1373,11 @@ fn describe_vehicle_fire(game: &Game) {
     match (v.spec.muzzle, body, flash) {
         (None, ..) => eprintln!("drive: fire: no gun (no muzzle on a turret)"),
         (Some(m), Some(body), Some((at, size))) => eprintln!(
-            "drive: fire: muzzle {m:.2} on the model, turret at {:.0} deg; flash {size:.2} m at {:.2} on the model, {at:.2} in the world; {} shells or rockets flying",
+            "drive: fire: muzzle {m:.2} on the model, turret at {:.0} deg, gun raised {:.1} deg; flash {size:.2} m at {:.2} on the model, {at:.2} in the world; {} shells, {} rockets flying",
             v.turret.to_degrees(),
+            v.gun.to_degrees(),
             body.inverse().transform_point3(at),
+            game.combat.shells(),
             game.combat
                 .projectiles()
                 .filter(|(rocket, ..)| *rocket)

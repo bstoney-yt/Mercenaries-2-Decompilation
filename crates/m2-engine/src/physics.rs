@@ -1241,6 +1241,10 @@ mod tests {
             turret: Vec::new(),
             pivot: None,
             muzzle: None,
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
         }
     }
 
