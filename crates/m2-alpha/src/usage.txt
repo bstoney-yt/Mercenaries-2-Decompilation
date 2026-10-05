@@ -66,6 +66,8 @@ m2-alpha [options]
   --mission-seconds <s>  with --screenshot: play this long instead of ten
   --mission-look <m>     with --mission --screenshot: take the picture from
                          this far from the nearest marker, looking at it
+  --old-hud              our own stand-in HUD (health bar, weapon line,
+                         crosshair) instead of the game's own
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.

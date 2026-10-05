@@ -1183,6 +1183,7 @@ dependencies = [
  "m2-game",
  "m2-math",
  "m2-render",
+ "mlua",
  "serde",
  "toml",
  "winit",

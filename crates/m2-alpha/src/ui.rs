@@ -1,8 +1,12 @@
-//! The HUD (health, weapon, crosshair, what the player can do next) and the
-//! pause menu, drawn with egui over the finished frame.
+//! The HUD and the pause menu, drawn with egui over the finished frame.
 //!
-//! The HUD's look is our own, not the game's: the game's interface (Scaleform
-//! movies) is not decoded. egui's bundled fonts are used.
+//! Health, ammo and weapon, the reticle, hit arcs and messages are the
+//! game's own HUD ([`GameHud`]) once its scripts have started; until then,
+//! or without the game's files, a stand-in of our own draws health, weapon
+//! and a crosshair. What the player can do next, the mission's objectives
+//! and markers, and loading lines are ours, in egui's bundled fonts.
+
+use std::time::Duration;
 
 use egui::{Align2, Color32, FontId, RawInput, Stroke, pos2, vec2};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
@@ -13,6 +17,7 @@ use m2_math::glam::{Mat4, Vec3};
 
 use crate::combat::Weapon;
 use crate::config::Config;
+use crate::gamehud::{GameHud, HudState};
 use crate::mission::MissionView;
 
 /// What the HUD shows this frame.
@@ -34,6 +39,8 @@ pub struct HudInfo {
     pub mission: Option<MissionView>,
     /// World to clip, for placing markers.
     pub view_proj: Option<Mat4>,
+    /// What the game's HUD is told, if it runs.
+    pub game: Option<HudState>,
 }
 
 /// What the pause menu asked for.
@@ -59,6 +66,8 @@ pub struct Hud {
     pub menu: bool,
     /// Tessellated and waiting to paint: shapes, texture changes, scale.
     frame: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
+    /// The game's own HUD, if its files are there.
+    pub game: Option<GameHud>,
 }
 
 impl std::fmt::Debug for Hud {
@@ -93,6 +102,54 @@ impl Hud {
             renderer: None,
             menu: false,
             frame: None,
+            game: None,
+        }
+    }
+
+    /// Steps the game's HUD for this frame, if it runs.
+    fn feed(&mut self, input: &RawInput, info: &HudInfo) {
+        let (Some(game), Some(state)) = (&mut self.game, &info.game) else {
+            return;
+        };
+        let mut state = state.clone();
+        state.size = input
+            .screen_rect
+            .map_or([0.0; 2], |r| [r.width(), r.height()]);
+        state.dt = game.frame_time(input.time);
+        let message = info.mission.as_ref().and_then(|m| m.message.as_ref());
+        state.messages.extend(game.message(message));
+        game.update(&self.ctx, state);
+    }
+
+    /// Runs the game's HUD `seconds` on `info`, waiting for each step (and
+    /// up to `timeout` for its scripts to start): for screenshots, which
+    /// draw one frame.
+    pub fn settle(&mut self, info: &HudInfo, size: (u32, u32), seconds: f64, timeout: Duration) {
+        let (Some(game), Some(state)) = (&mut self.game, &info.game) else {
+            return;
+        };
+        let mut state = state.clone();
+        state.size = [size.0 as f32, size.1 as f32];
+        let message = info.mission.as_ref().and_then(|m| m.message.as_ref());
+        state.messages.extend(game.message(message));
+        let step = 1.0 / 30.0;
+        game.update_and_wait(
+            &self.ctx,
+            HudState {
+                dt: 0.0,
+                ..state.clone()
+            },
+            timeout,
+        );
+        // Hurts and messages once; then time passes.
+        state.hurts.clear();
+        state.messages.clear();
+        state.dt = step;
+        for _ in 0..(seconds / step).ceil() as usize {
+            if !game.ready() {
+                break;
+            }
+            game.update_and_wait(&self.ctx, state.clone(), Duration::from_secs(10));
         }
     }
 
@@ -107,8 +164,10 @@ impl Hud {
     ) -> (Option<MenuAction>, egui::PlatformOutput) {
         let mut action = None;
         let menu = self.menu;
+        self.feed(&input, info);
+        let game = self.game.as_ref().filter(|g| g.ready());
         let output = self.ctx.run_ui(input, |ui| {
-            hud(ui, info);
+            hud(ui, info, game);
             if menu {
                 action = pause_menu(ui.ctx(), config);
             }
@@ -184,7 +243,7 @@ pub fn headless_input(width: u32, height: u32, time: f64) -> RawInput {
     }
 }
 
-fn hud(ui: &mut egui::Ui, info: &HudInfo) {
+fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     let ctx = ui.ctx().clone();
     let screen = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
@@ -220,8 +279,14 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
             white,
         );
     }
+    if info.playing
+        && let Some(game) = game
+    {
+        game.paint(&painter);
+    }
     if let Some(m) = &info.mission {
-        mission(&painter, screen, info.view_proj, m, &text);
+        // The game's HUD shows the messages in its message buffer.
+        mission(&painter, screen, info.view_proj, m, game.is_none(), &text);
     }
     if !info.playing {
         text(
@@ -233,7 +298,50 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
         );
         return;
     }
+    if game.is_some() {
+        if let Some((_, _, true)) = &info.driving {
+            text(
+                screen.center() + vec2(0.0, 60.0),
+                Align2::CENTER_TOP,
+                "Wrecked: E to get out",
+                17.0,
+                white,
+            );
+        }
+    } else {
+        stand_in(&painter, screen, info, &text);
+    }
+    if let Some(name) = &info.can_enter
+        && info.driving.is_none()
+    {
+        text(
+            screen.center() + vec2(0.0, 60.0),
+            Align2::CENTER_TOP,
+            &format!("E: get in the {}", name.trim_start_matches("global_veh_")),
+            17.0,
+            white,
+        );
+    }
+    if info.down {
+        text(
+            screen.center(),
+            Align2::CENTER_CENTER,
+            "Down! Back on your feet in a moment.",
+            26.0,
+            Color32::from_rgb(240, 90, 80),
+        );
+    }
+}
 
+/// Our own health bar, weapon line and crosshair, until the game's HUD
+/// runs.
+fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    info: &HudInfo,
+    text: &T,
+) {
+    let white = Color32::from_gray(235);
     // Health, bottom left.
     let bar =
         egui::Rect::from_min_size(screen.left_bottom() + vec2(24.0, -44.0), vec2(220.0, 16.0));
@@ -300,35 +408,16 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
             }
         }
     }
-    if let Some(name) = &info.can_enter
-        && info.driving.is_none()
-    {
-        text(
-            screen.center() + vec2(0.0, 60.0),
-            Align2::CENTER_TOP,
-            &format!("E: get in the {}", name.trim_start_matches("global_veh_")),
-            17.0,
-            white,
-        );
-    }
-    if info.down {
-        text(
-            screen.center(),
-            Align2::CENTER_CENTER,
-            "Down! Back on your feet in a moment.",
-            26.0,
-            Color32::from_rgb(240, 90, 80),
-        );
-    }
 }
 
-/// The mission's objectives (top left), its newest message (top centre)
-/// and markers over its targets.
+/// The mission's objectives (top left), its newest message (top centre,
+/// if `message`) and markers over its targets.
 fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     painter: &egui::Painter,
     screen: egui::Rect,
     view_proj: Option<Mat4>,
     m: &MissionView,
+    message: bool,
     text: &T,
 ) {
     let white = Color32::from_gray(235);
@@ -355,7 +444,7 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             gold,
         );
     }
-    if let Some((done, line)) = &m.message {
+    if let Some((done, line)) = m.message.as_ref().filter(|_| message) {
         let head = if *done {
             "Objective complete"
         } else {
