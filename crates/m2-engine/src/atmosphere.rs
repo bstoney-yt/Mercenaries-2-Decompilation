@@ -452,16 +452,21 @@ impl Atmosphere {
                 .haze_layers
                 .filter(|_| !env_is("M2_HAZE", "old"))
                 .map(|[f1, l1, f2, l2]| [f1, recip(l1), f2, recip(l2)]),
-            // `M2_EXT_SUN` tints what the air keeps by the sun's colour
-            // (`on`), it over its brightest channel (`norm`) or over its
-            // luminance (`luma`).
+            // What the air keeps is tinted by the sun's colour, as the
+            // game's shaders multiply it by `E * dirLightColor` (PC round R;
+            // that `ScatteringTermMultiplier.x` is 1 there is inferred from
+            // `ScatterExtinctionMultiplier`, 1 in every record). With it the
+            // night island and sea came to footage's brightness and hue
+            // (rounds J and I). `M2_EXT_SUN=off` leaves it out, `=norm`
+            // takes it over its brightest channel, `=luma` over its
+            // luminance.
             sun_tint: {
                 let c = self.light_color.max(Vec3::ZERO);
                 match std::env::var("M2_EXT_SUN").as_deref() {
-                    Ok("on") => Some(c),
+                    Ok("off") => None,
                     Ok("norm") => Some(c / c.max_element().max(1e-3)),
                     Ok("luma") => Some(c / c.dot(Vec3::new(0.2126, 0.7152, 0.0722)).max(1e-3)),
-                    _ => None,
+                    _ => Some(c),
                 }
             },
             ..Haze::default()
