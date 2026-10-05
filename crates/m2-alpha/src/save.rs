@@ -33,8 +33,21 @@ pub struct PlayerSave {
     pub yaw: f32,
     pub pitch: f32,
     pub hp: f32,
-    /// "rifle" or "rpg".
+    /// What she has up: "rifle", "rpg" or "grenade launcher".
     pub weapon: String,
+    /// What she carries in the launcher's place: "rpg", "grenade
+    /// launcher" or nothing (""); the RPG in saves from before it could
+    /// be anything else.
+    #[serde(default = "rpg")]
+    pub second: String,
+    /// The grenade launcher's rounds, in its clip and stored, if she
+    /// carries one.
+    #[serde(default)]
+    pub launcher: Option<[u32; 2]>,
+}
+
+fn rpg() -> String {
+    "rpg".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -98,7 +111,9 @@ mod tests {
                 yaw: 1.1,
                 pitch: -0.2,
                 hp: 64.0,
-                weapon: "rpg".into(),
+                weapon: "grenade launcher".into(),
+                second: "grenade launcher".into(),
+                launcher: Some([4, 12]),
             },
             vehicles: vec![VehicleSave {
                 model: 0x0307_555e,
@@ -114,6 +129,25 @@ mod tests {
     fn round_trips_through_toml() {
         let s = save();
         assert_eq!(SaveGame::from_toml(&s.to_toml()).unwrap(), s);
+    }
+
+    #[test]
+    fn saves_from_before_the_grenade_launcher_carry_the_rpg() {
+        let old = r#"
+version = 1
+killed = []
+vehicles = []
+
+[player]
+position = [1.0, 2.0, 3.0]
+facing = 0.0
+yaw = 0.0
+pitch = 0.0
+hp = 100.0
+weapon = "rpg"
+"#;
+        let p = SaveGame::from_toml(old).unwrap().player;
+        assert_eq!((p.second.as_str(), p.launcher), ("rpg", None));
     }
 
     #[test]

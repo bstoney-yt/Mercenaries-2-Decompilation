@@ -418,6 +418,10 @@ impl MissionLink {
                     }
                 }
                 mission.start();
+                // She lands with the carbine alone (the footage: nothing on
+                // her back, only "Carbine" in the weapon box) until the
+                // supply crate's grenade launcher.
+                game.combat.carbine_only();
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
                     if obey(game, &mission, &mut self.vehicles, &c) {
@@ -1203,19 +1207,14 @@ pub(crate) fn template_models(
     }
 }
 
-/// Her weapons by their models (the AK and RPG she carries), for the
-/// pickups that give their ammunition.
-const WEAPON_MODELS: [(&str, Weapon); 2] = [
-    ("global_weapon_ak47", Weapon::Rifle),
-    ("global_weapon_rpg", Weapon::Rpg),
-];
-
 /// What the scripts' object `name` (a supply crate) leaves once destroyed:
 /// the pickups its template's `SpawnOnDeath`s name, in data order (the
-/// first contract's: a grenade launcher, then rockets), each giving the
-/// rounds of one of her weapons when its ammunition is one of theirs (a
-/// template with that weapon's model fires it). What isn't a pickup it
-/// doesn't leave for her.
+/// first contract's: a grenade launcher, then rockets). One with the
+/// model of a weapon of hers is that weapon; each gives the rounds of one
+/// of her weapons when its ammunition is one of theirs (a template with
+/// that weapon's model fires it). A pickup's `rounds` count clips: the
+/// grenade launcher's 3 are the HUD's "6 2" in the footage, 6 loaded and
+/// 2 clips more. What isn't a pickup it doesn't leave for her.
 fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
     let Some(left) = templates
         .id(name)
@@ -1235,16 +1234,21 @@ fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
     left.iter()
         .filter_map(|&left| {
             let info = templates.leavings.pickups.get(&left)?;
+            let model = templates.by_id(left).and_then(|(_, t)| t.model);
+            let weapon = Weapon::ALL
+                .into_iter()
+                .find(|w| model == Some(name_hash(w.model_name())));
             let gives = info.ammo.and_then(|ammo| {
-                WEAPON_MODELS
-                    .iter()
-                    .find(|(m, _)| fires(m, ammo))
-                    .map(|&(_, w)| (w, info.rounds))
+                Weapon::ALL
+                    .into_iter()
+                    .find(|w| fires(w.model_name(), ammo))
+                    .map(|w| (w, info.rounds * w.clip()))
             });
             Some(Leaves {
                 template: left,
-                model: templates.by_id(left).and_then(|(_, t)| t.model),
+                model,
                 reach: info.radius,
+                weapon,
                 gives,
             })
         })
@@ -1342,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_supply_crate_leaves_a_launcher_and_rockets_for_her_rpg() {
+    fn a_broken_supply_crate_leaves_a_grenade_launcher_and_rockets() {
         use m2_engine::pickup::{Leavings, PickupInfo};
         let info = |model| TemplateInfo {
             model,
@@ -1393,7 +1397,7 @@ mod tests {
             },
             ..Templates::default()
         };
-        // The launcher's grenades are for no weapon of hers.
+        // The launcher, loaded with its 3 clips; 20 rockets (one a clip).
         assert_eq!(
             leaves(&db, "Supply Drop (GL) 0x40000001"),
             [
@@ -1401,12 +1405,14 @@ mod tests {
                     template: launcher,
                     model: Some(name_hash("global_weapon_mgl")),
                     reach: 1.0,
-                    gives: None,
+                    weapon: Some(Weapon::GrenadeLauncher),
+                    gives: Some((Weapon::GrenadeLauncher, 18)),
                 },
                 Leaves {
                     template: rockets,
                     model: Some(0x8e77_a04d),
                     reach: 1.0,
+                    weapon: None,
                     gives: Some((Weapon::Rpg, 20)),
                 },
             ]

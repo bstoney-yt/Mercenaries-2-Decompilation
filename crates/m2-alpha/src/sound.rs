@@ -132,7 +132,7 @@ pub struct GameAudio {
     next_track: usize,
     decoded: (Sender<Decoded>, Receiver<Decoded>),
     /// Rifle shot, rocket launch, explosion.
-    fight: [Option<SoundBuffer>; 4],
+    fight: [Option<SoundBuffer>; 5],
     /// Short sounds of the town (`amb_citymed`) and the jungle
     /// (`amb_jungle`) played now and then around the listener.
     ambient: [Vec<SoundBuffer>; 2],
@@ -460,7 +460,7 @@ pub fn log_tank_gun(install: &Install) {
 }
 
 /// Sounds read from the banks: the fight's and the ambient one-shots.
-type BankSounds = ([Option<SoundBuffer>; 4], [Vec<SoundBuffer>; 2]);
+type BankSounds = ([Option<SoundBuffer>; 5], [Vec<SoundBuffer>; 2]);
 
 /// The fight's sounds and the ambient one-shots.
 fn bank_sounds(install: &Install) -> BankSounds {
@@ -472,6 +472,7 @@ fn bank_sounds(install: &Install) -> BankSounds {
                 "wpn_rpg",
                 "support_artillery",
                 "wpn_tankgun",
+                "wpn_grenadelauncher",
                 "amb_citymed",
                 "amb_jungle",
             ],
@@ -496,6 +497,14 @@ fn bank_sounds(install: &Install) -> BankSounds {
                         s.channels == 1 && (1.5..=3.0).contains(&s.seconds())
                     }),
                     tank_gun(&l),
+                    // The launcher's thump: its loudest short sound.
+                    pick(&l, "wpn_grenadelauncher", |s| s.seconds() < 1.2).inspect(|s| {
+                        eprintln!(
+                            "sound: grenade launcher {:08x} ({:.2} s)",
+                            s.hash,
+                            s.seconds()
+                        )
+                    }),
                 ],
                 [short("amb_citymed"), short("amb_jungle")],
             )
@@ -867,6 +876,7 @@ impl GameAudio {
                 Sound::Launch(at) => (1, at, 1.0),
                 Sound::Explosion(at) => (2, at, 1.4),
                 Sound::Cannon(at) => (3, at, 1.3),
+                Sound::Lob(at) => (4, at, 1.0),
             };
             if let Some(buffer) = self.fight[i].clone() {
                 self.out.with(|m| m.play(Play::at(buffer, at).gain(gain)));

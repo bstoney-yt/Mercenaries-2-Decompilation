@@ -122,7 +122,10 @@ const ENGINE_BANK_FIELD: u32 = 0x14a6_7fa6;
 /// case), and the names by template id.
 #[derive(Clone, Debug, Default)]
 pub struct Templates {
+    /// By name, lower case: of several so named, the lowest id's.
     pub by_name: HashMap<String, TemplateInfo>,
+    /// By id, each its own (several templates may share a name).
+    pub infos: HashMap<u32, TemplateInfo>,
     /// Each template's name as the database writes it, by its id (bit 31
     /// set): the id an entity's [`parent`](m2_assets::layer::Placement::parent)
     /// gives.
@@ -165,7 +168,11 @@ impl Templates {
     /// the database says of it.
     pub fn by_id(&self, id: u32) -> Option<(&str, &TemplateInfo)> {
         let name = self.names.get(&id)?;
-        Some((name, self.by_name.get(&name.to_ascii_lowercase())?))
+        let info = match self.infos.get(&id) {
+            Some(info) => info,
+            None => self.by_name.get(&name.to_ascii_lowercase())?,
+        };
+        Some((name, info))
     }
 
     /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
@@ -264,6 +271,22 @@ impl Templates {
         let humans = carrying(PERSON);
         let minds: HashSet<u32> = PERSON_AI.iter().flat_map(|c| carrying(c)).collect();
         let names = db.names();
+        let infos: HashMap<u32, TemplateInfo> = names
+            .keys()
+            .map(|&id| {
+                let vehicle = kinds.get(&id).copied();
+                (
+                    id,
+                    TemplateInfo {
+                        model: model_of.get(&id).copied().filter(|m| models.contains(m)),
+                        vehicle,
+                        engine: engines.get(&id).copied(),
+                        person: humans.contains(&id) || (minds.contains(&id) && vehicle.is_none()),
+                        human: humans.contains(&id),
+                    },
+                )
+            })
+            .collect();
         // Of twins by name, the lowest id's (inserted last) stands, as in
         // `id`.
         let mut order: Vec<(u32, &str)> = names.iter().map(|(&id, &n)| (id, n)).collect();
@@ -271,21 +294,9 @@ impl Templates {
         Self {
             by_name: order
                 .iter()
-                .map(|&(id, name)| {
-                    let vehicle = kinds.get(&id).copied();
-                    (
-                        name.to_ascii_lowercase(),
-                        TemplateInfo {
-                            model: model_of.get(&id).copied().filter(|m| models.contains(m)),
-                            vehicle,
-                            engine: engines.get(&id).copied(),
-                            person: humans.contains(&id)
-                                || (minds.contains(&id) && vehicle.is_none()),
-                            human: humans.contains(&id),
-                        },
-                    )
-                })
+                .map(|&(id, name)| (name.to_ascii_lowercase(), infos[&id]))
                 .collect(),
+            infos,
             names: names
                 .into_iter()
                 .map(|(id, name)| (id, name.to_owned()))
@@ -1118,6 +1129,31 @@ mod tests {
         assert_eq!(db.engine_for_model(1), Some(0xaa));
         assert_eq!(db.engine_for_model(2), None);
         assert_eq!(db.engine_for_model(3), None);
+    }
+
+    // Round 93's crate rockets gave her nothing: found by name, the RPG's
+    // info was another's (likely a second template named "RPG").
+    #[test]
+    fn same_named_templates_keep_their_own_infos() {
+        let t = |model| TemplateInfo {
+            model: Some(model),
+            vehicle: None,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let db = Templates {
+            by_name: HashMap::from([("rpg".to_owned(), t(1))]),
+            infos: HashMap::from([(0x8000_0001, t(1)), (0x8000_0002, t(2))]),
+            names: HashMap::from([
+                (0x8000_0001, "RPG".to_owned()),
+                (0x8000_0002, "RPG".to_owned()),
+            ]),
+            ..Templates::default()
+        };
+        assert_eq!(db.by_id(0x8000_0002).map(|(_, i)| i.model), Some(Some(2)));
+        assert_eq!(db.get("RPG").map(|i| i.model), Some(Some(1)));
+        assert_eq!(db.id("rpg"), Some(0x8000_0001));
     }
 
     #[test]

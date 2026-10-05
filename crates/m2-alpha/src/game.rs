@@ -277,6 +277,8 @@ impl Game {
     pub fn step(&mut self, intent: Intent, dt: f32) {
         self.startup_props();
         self.fetch_world_vehicles(dt);
+        // The use key at what lies within reach: taken with the fight's.
+        let mut taking = false;
         let scene = &mut self.scene;
         if let Some(world) = &mut scene.world {
             let streaming = world.stats().pending > 0;
@@ -303,6 +305,10 @@ impl Game {
                             get_out(physics, &scene.vehicles[i], player)
                         }
                         Some(_) => {}
+                        // What lies within reach before any vehicle.
+                        None if scene.flights.within(player.character.position).is_some() => {
+                            taking = true;
+                        }
                         None => {
                             player.driving = nearest(physics, &scene.vehicles, player, REACH);
                             // Seated: she no longer waits to land (people
@@ -493,21 +499,19 @@ impl Game {
                     1.2,
                 );
             }
-            // What a broken crate left, taken as she walks up to it.
-            if player.driving.is_none() {
-                for p in scene.flights.take(player.character.position) {
-                    if let Some((weapon, rounds)) = p.what.gives {
-                        self.combat.picked.add(weapon, rounds);
-                    }
-                    eprintln!(
-                        "pickup: she takes {:#x} at {:.1}{}",
-                        p.what.template,
-                        p.at,
-                        p.what.gives.map_or(String::new(), |(w, n)| format!(
-                            ": {n} rounds for her {w:?}"
-                        ))
-                    );
-                }
+            // What a broken crate left, taken with the use key from
+            // within its reach.
+            if taking
+                && player.driving.is_none()
+                && let Some(p) = scene.flights.take_within(player.character.position)
+            {
+                take_up(
+                    &mut self.combat,
+                    &mut scene.flights,
+                    &world.index.template_db,
+                    player,
+                    p,
+                );
             }
         }
         self.scene.tick(dt);
@@ -555,8 +559,20 @@ impl Game {
                 weapon: match self.combat.weapon {
                     Weapon::Rifle => "rifle",
                     Weapon::Rpg => "rpg",
+                    Weapon::GrenadeLauncher => "grenade launcher",
                 }
                 .into(),
+                second: match self.combat.second {
+                    Some(Weapon::GrenadeLauncher) => "grenade launcher",
+                    Some(_) => "rpg",
+                    None => "",
+                }
+                .into(),
+                launcher: self
+                    .combat
+                    .launcher_rounds
+                    .filter(|_| self.combat.second == Some(Weapon::GrenadeLauncher))
+                    .map(|r| [r.clip, r.stored]),
             },
             vehicles,
             killed: self.scene.people.all_killed(),
@@ -589,10 +605,17 @@ impl Game {
         player.pitch = p.pitch;
         self.combat = Combat::default();
         self.combat.hp = p.hp.clamp(1.0, 100.0);
-        self.combat.weapon = if p.weapon == "rpg" {
-            Weapon::Rpg
-        } else {
-            Weapon::Rifle
+        match (p.second.as_str(), p.launcher) {
+            ("grenade launcher", Some([clip, stored])) => {
+                self.combat.equip(Weapon::GrenadeLauncher, 0);
+                self.combat.launcher_rounds = Some(combat::Rounds { clip, stored });
+            }
+            ("rpg", _) => {}
+            _ => self.combat.carbine_only(),
+        }
+        self.combat.weapon = match (p.weapon.as_str(), self.combat.second) {
+            ("rpg" | "grenade launcher", Some(w)) => w,
+            _ => Weapon::Rifle,
         };
         self.scene.people.reset(save.killed);
         self.restore = save.vehicles;
@@ -648,11 +671,36 @@ impl Game {
             }
             _ => None,
         };
+        // What the use key takes, as the game words it.
+        let prompt = match (&self.scene.world, player) {
+            (Some(w), Some(p)) if p.driving.is_none() && p.landed && self.on_foot => self
+                .scene
+                .flights
+                .within(p.character.position)
+                .map(|p| match p.what.weapon {
+                    Some(weapon) => format!(
+                        "Equip {}",
+                        w.index
+                            .template_db
+                            .by_id(p.what.template)
+                            .map_or_else(|| format!("{weapon:?}"), |t| t.0.to_owned())
+                    ),
+                    None => "Take Ammo".to_owned(),
+                }),
+            _ => None,
+        };
         HudInfo {
             playing: self.on_foot && player.is_some(),
             hp: self.combat.hp,
             down: self.combat.down > 0.0,
             weapon: self.combat.weapon,
+            second: self.combat.second,
+            rounds: self
+                .combat
+                .launcher_rounds
+                .filter(|_| self.combat.weapon == Weapon::GrenadeLauncher)
+                .map(|r| (r.clip, r.stored)),
+            prompt,
             driving,
             crosshair,
             can_enter,
@@ -770,6 +818,76 @@ impl Game {
 
 /// How close she must be to a vehicle's door (or side) to get in, metres.
 const REACH: f32 = 4.0;
+
+/// A weapon she leaves for another lies this far to her right, metres.
+const LEFT_BESIDE: f32 = 0.6;
+
+/// What she takes from a pickup: a weapon is taken up in the launcher's
+/// place (what she carried there left lying beside her, to be taken
+/// back), ammunition goes with its weapon.
+fn take_up(
+    combat: &mut Combat,
+    flights: &mut crate::flights::Flights,
+    templates: &m2_engine::Templates,
+    player: &Player,
+    p: crate::flights::Pickup,
+) {
+    let rounds = p.what.gives.map_or(0, |(_, n)| n);
+    let Some(weapon) = p.what.weapon else {
+        if let Some((w, n)) = p.what.gives {
+            combat.take_ammo(w, n);
+        }
+        eprintln!(
+            "pickup: she takes {:#x} at {:.1}{}",
+            p.what.template,
+            p.at,
+            p.what.gives.map_or(String::new(), |(w, n)| format!(
+                ": {n} rounds for her {w:?}"
+            ))
+        );
+        return;
+    };
+    let left = combat.equip(weapon, rounds);
+    eprintln!(
+        "pickup: she takes up the {weapon:?} ({:#x}) at {:.1} with {rounds} rounds{}",
+        p.what.template,
+        p.at,
+        match left {
+            Some((w, 0)) => format!(", leaving her {w:?}"),
+            Some((w, n)) => format!(", leaving her {w:?} with {n} rounds"),
+            None => String::new(),
+        }
+    );
+    let Some((left, kept)) = left else {
+        return;
+    };
+    let model = m2_assets::name_hash(left.model_name());
+    // Its template: the pickup with its model (the lowest id of several).
+    let template = templates
+        .leavings
+        .pickups
+        .iter()
+        .filter(|(id, _)| {
+            templates
+                .by_id(**id)
+                .is_some_and(|(_, t)| t.model == Some(model))
+        })
+        .min_by_key(|(id, _)| **id);
+    let (sin, cos) = player.facing.sin_cos();
+    let right = Vec3::new(-cos, 0.0, sin);
+    flights.leave(crate::flights::Pickup {
+        from: 0,
+        what: crate::flights::Leaves {
+            template: template.map_or(0, |(id, _)| *id),
+            model: Some(model),
+            reach: template.map_or(1.0, |(_, info)| info.radius),
+            weapon: Some(left),
+            gives: Some((left, kept)),
+        },
+        at: player.character.position + right * LEFT_BESIDE,
+        yaw: player.facing,
+    });
+}
 
 /// Parking: the first spot looked at is this far ahead of her; spots are
 /// tried on a grid this fine, out to this far.
