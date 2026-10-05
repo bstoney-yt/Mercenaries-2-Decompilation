@@ -235,6 +235,16 @@ impl Flights {
         self.flights.iter().any(|f| f.pilot == pilot)
     }
 
+    /// The helicopters hovering over their drop points: each one's guid,
+    /// where it is and the drop point.
+    pub fn hovering(&self) -> Vec<(u32, Vec3, Vec3)> {
+        self.flights
+            .iter()
+            .filter(|f| f.phase == Phase::Hovering)
+            .map(|f| (f.copter, f.at, f.to))
+            .collect()
+    }
+
     /// The helicopters in the air, to be heard: each one's guid and where
     /// it is.
     pub fn sounding(&self) -> Vec<(u32, Vec3)> {
@@ -380,6 +390,18 @@ impl Flights {
                 })
                 .collect();
             for (l, at, turn, yaw) in hung {
+                eprintln!(
+                    "delivery: {} lets go of {} ({}) at {at:.1}, {:.1} m over the drop point {:.1}",
+                    r.pilot,
+                    l.guid,
+                    if l.model.is_some() {
+                        "a crate"
+                    } else {
+                        "a vehicle"
+                    },
+                    at.y - r.to.y,
+                    r.to
+                );
                 match l.model {
                     Some(model) => self.crates.push(Crate {
                         guid: l.guid,
