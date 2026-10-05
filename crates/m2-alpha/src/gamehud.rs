@@ -1700,9 +1700,13 @@ fn pda_triangles(assets: &mut AssetSource<BufReader<File>>) -> Result<PdaScreens
             .asset(name_hash(name), MOVIE_TYPE)
             .map_err(|e| format!("{name}: {e}"))?;
         let movie = movie_from_asset(&data).map_err(|e| format!("{name}: {e}"))?;
-        let lib = flash::Library::new(&movie);
+        let lib = std::rc::Rc::new(flash::Library::new(&movie));
         size = lib.size;
-        triangles.extend(lib.draw(&flash::Matrix::IDENTITY));
+        flash::Player::new(lib).draw(
+            &flash::Matrix::IDENTITY,
+            &flash::FontBook::default(),
+            &mut triangles,
+        );
     }
     Ok(PdaScreens { size, triangles })
 }
