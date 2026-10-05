@@ -257,6 +257,11 @@ pub const TURRET: u32 = 0x7707_65e4;
 /// gun. The wreck's turret has a barrel of its own.
 pub const GUN: u32 = 0xcc0e_3f83;
 
+/// A turret's gun its template fires slower than this (shots a minute) is
+/// a cannon: the Stryker's 45 a minute, as the AMX-30's, where machine
+/// guns fire hundreds.
+const CANNON_RATE: f32 = 120.0;
+
 /// The four wheels a tracked vehicle drives on: under the corners of its
 /// road wheels, where the tracks meet the ground, else under its hull's.
 fn stand_ins(road: &[(Vec3, f32)], hull: (Vec3, Vec3)) -> Vec<WheelSpec> {
@@ -546,6 +551,18 @@ impl VehicleSpec {
         self
     }
 
+    /// Whether its turret's gun fires shells: a tank's, or one its
+    /// template fires slower than [`CANNON_RATE`] (the Stryker's), not a
+    /// machine gun.
+    pub fn cannon(&self) -> bool {
+        self.muzzle.is_some()
+            && (self.kind == "tank"
+                || self
+                    .tuning
+                    .gun
+                    .is_some_and(|g| g.rate_of_fire < CANNON_RATE))
+    }
+
     /// How the turret's nodes move with the turret turned `turret`
     /// radians (anticlockwise from above): about the pivot, or its mount.
     pub fn turret_transform(&self, turret: f32) -> Mat4 {
@@ -623,8 +640,9 @@ impl VehicleSpec {
         let feet = |points: &[Vec3]| -> Option<Vec<(Vec3, f32)>> {
             points.iter().map(|&p| Some((p, on_ground(p)?))).collect()
         };
-        let (touch, (a, b, c)) = match fit_plane(&feet(&wheels)?) {
-            Some(plane) => (feet(&wheels)?, plane),
+        let under_wheels = feet(&wheels)?;
+        let (touch, (a, b, c)) = match fit_plane(&under_wheels) {
+            Some(plane) => (under_wheels, plane),
             None => {
                 let touch = feet(&corners)?;
                 let plane = fit_plane(&touch)?;

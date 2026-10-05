@@ -41,7 +41,7 @@ use crate::scene::NOT_DRIVABLE;
 const STEP: f32 = 0.1;
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
-const WATERLINE: f32 = -36.0;
+pub(crate) const WATERLINE: f32 = -36.0;
 /// How close a blast destroys a target the scripts named (a gate), metres:
 /// from its model's box, or from its place when it shows no model.
 const BLAST_PAD: f32 = 4.0;
