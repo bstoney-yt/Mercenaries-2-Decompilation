@@ -158,17 +158,10 @@ impl Atmosphere {
             let [r, g, b, _] = channels(v, Lit::Light);
             Some(Vec3::new(r, g, b) * scale)
         };
-        // Every face of every record stores alpha 0x80: taken as a scale
-        // on the face's colour, it brings the sunlit town's sun to shade
-        // from about 1 to 2, as footage has it about 2.5 (PC round C);
-        // inferred, `M2_CUBE_ALPHA=off` leaves the faces unscaled.
-        let cube_alpha = !env_is("M2_CUBE_ALPHA", "off");
         let mut ambient_cube = [Vec3::splat(0.2); 6];
         for (i, face) in ambient_cube.iter_mut().enumerate() {
-            let name = format!("AmbientCube{i}");
-            if let Some(c) = colour(&name) {
-                let alpha = field(&name).map_or(1.0, |v| channels(v, Lit::Light)[3]);
-                *face = if cube_alpha { c * alpha } else { c };
+            if let Some(c) = colour(&format!("AmbientCube{i}")) {
+                *face = c;
             }
         }
         Self {
@@ -319,7 +312,15 @@ impl Atmosphere {
         // `M2_LIGHTING=linear` sums the light in linear light, with the
         // sun's colour taken as linear, as before, for comparison.
         lighting.gamma_light = gamma_light();
-        let sun = self.light_color * self.light_intensity;
+        // `M2_SUN=full` leaves `LightIntensity` out of the sun's colour, to
+        // try that reading: at Guanare's 0.3 the town's sunlit walls are no
+        // brighter than its shaded ones, against about 2.5 times in footage.
+        let intensity = if env_is("M2_SUN", "full") {
+            1.0
+        } else {
+            self.light_intensity
+        };
+        let sun = self.light_color * intensity;
         lighting.sun_color = if lighting.gamma_light {
             decode(sun)
         } else {
