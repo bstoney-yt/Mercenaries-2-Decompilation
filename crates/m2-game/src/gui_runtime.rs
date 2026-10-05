@@ -200,12 +200,14 @@ pub enum DrawItem {
         colour: [f32; 4],
         rect: [f32; 4],
     },
-    /// One line of text in a bitmap font, in the box `rect`, from its top,
-    /// justified; `size` is screen pixels per font pixel.
+    /// Text in a bitmap font, in the box `rect`, from its top, each line
+    /// justified; `size` is screen pixels per font pixel. `text` is the
+    /// whole text (lines split by `\n`), `spans` the same in colours.
     Text {
         widget: u32,
         font: String,
         text: String,
+        spans: Vec<TextSpan>,
         rect: [f32; 4],
         size: f32,
         colour: [f32; 4],
@@ -464,22 +466,74 @@ impl Screen {
         }
     }
 
-    /// The text a text widget shows: an id in brackets looked up in the
-    /// strings given, else as set.
+    /// The text a text widget shows, without colours (see
+    /// [`spans`](Self::spans)); lines are separated by `\n`.
     pub fn display_text(&self, text: &str) -> String {
-        let id = text.strip_prefix('[').and_then(|t| t.strip_suffix(']'));
-        match (id, &self.strings) {
-            // `[0x8c4d842e]`: the key hash itself, as scripts that hash
-            // ids at run time write it.
-            (Some(id), Some(s)) => id
-                .strip_prefix("0x")
-                .and_then(|h| u32::from_str_radix(h, 16).ok())
-                .and_then(|k| s.get(k))
-                .or_else(|| s.lookup(id))
-                .unwrap_or(text)
-                .to_owned(),
-            _ => text.to_owned(),
+        self.spans(text).into_iter().map(|s| s.text).collect()
+    }
+
+    /// A text as the game shows it, in coloured spans. The markup:
+    /// `[n]` a new line; `[green]`, `[white]`... the colour from there on;
+    /// `[Id]` the text with that id (`[0x8c4d842e]` by its key hash);
+    /// `[Id:a:b]` that text with `%d`, `%s`... filled from the arguments
+    /// in order (`[SHELL.Common.Money:125:0:[0xe00c096a]]` is
+    /// `$125.0 K`). Unknown ids stay as written.
+    pub fn spans(&self, text: &str) -> Vec<TextSpan> {
+        let mut out = vec![TextSpan::default()];
+        self.expand(text, &mut out, 0);
+        out.retain(|s| !s.text.is_empty());
+        out
+    }
+
+    fn expand(&self, text: &str, out: &mut Vec<TextSpan>, depth: usize) {
+        let push = |out: &mut Vec<TextSpan>, s: &str| {
+            if let Some(last) = out.last_mut() {
+                last.text.push_str(s);
+            }
+        };
+        let mut rest = text;
+        while let Some(open) = rest.find('[') {
+            push(out, &rest[..open]);
+            let Some(len) = bracket_len(&rest[open..]) else {
+                push(out, &rest[open..]);
+                return;
+            };
+            let inner = &rest[open + 1..open + len - 1];
+            rest = &rest[open + len..];
+            let parts = split_top(inner);
+            let id = parts[0];
+            if id == "n" && parts.len() == 1 {
+                push(out, "\n");
+            } else if let Some(c) = colour_name(id).filter(|_| parts.len() == 1) {
+                out.push(TextSpan {
+                    text: String::new(),
+                    colour: Some(c),
+                });
+            } else if let Some(template) = self.lookup(id).filter(|_| depth < 8) {
+                let args: Vec<String> = parts[1..]
+                    .iter()
+                    .map(|a| {
+                        let mut sub = vec![TextSpan::default()];
+                        self.expand(a, &mut sub, depth + 1);
+                        sub.into_iter().map(|s| s.text).collect()
+                    })
+                    .collect();
+                let filled = fill(&template, &args);
+                self.expand(&filled, out, depth + 1);
+            } else {
+                push(out, &format!("[{inner}]"));
+            }
         }
+        push(out, rest);
+    }
+
+    fn lookup(&self, id: &str) -> Option<String> {
+        let s = self.strings.as_ref()?;
+        id.strip_prefix("0x")
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+            .and_then(|k| s.get(k))
+            .or_else(|| s.lookup(id))
+            .map(str::to_owned)
     }
 
     /// Text width in virtual units, by the font if given one.
@@ -488,10 +542,15 @@ impl Screen {
             return 0.0;
         };
         let text = self.display_text(&w.text);
-        let px = match self.fonts.get(&w.font.to_ascii_lowercase()) {
-            Some(f) => f.text_width(&text),
-            None => text.chars().count() as f32 * 12.0,
-        };
+        let font = self.fonts.get(&w.font.to_ascii_lowercase());
+        // The widest line.
+        let px = text
+            .split('\n')
+            .map(|line| match font {
+                Some(f) => f.text_width(line),
+                None => line.chars().count() as f32 * 12.0,
+            })
+            .fold(0.0, f32::max);
         px * VIRTUAL_SIZE.1 / FONT_LINES * w.scale
     }
 
@@ -589,6 +648,7 @@ impl Screen {
                             widget: id,
                             font: w.font.clone(),
                             text: self.display_text(&w.text),
+                            spans: self.spans(&w.text),
                             rect,
                             size: c.scale * VIRTUAL_SIZE.1 / FONT_LINES * w.scale,
                             colour,
@@ -615,6 +675,94 @@ impl Screen {
     fn log_unknown(&mut self, name: &str) {
         self.unknown.insert(name.to_owned());
     }
+}
+
+/// Part of a text in one colour (`None`: the widget's colour). `text` may
+/// hold `\n`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TextSpan {
+    pub text: String,
+    /// RGB, 0..=1.
+    pub colour: Option<[f32; 3]>,
+}
+
+/// The length of the bracketed token `s` starts with, nested brackets
+/// included; `None` if it never closes.
+fn bracket_len(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Splits a token's inside at the colons outside nested brackets.
+fn split_top(s: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start) = (Vec::new(), 0, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ':' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Fills `%d`, `%s`, `%S`, `%i`, `%f` (any case) from `args` in order;
+/// `%%` is a percent sign.
+fn fill(template: &str, args: &[String]) -> String {
+    let mut out = String::new();
+    let mut args = args.iter();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().map(char::to_ascii_lowercase) {
+            Some('d' | 's' | 'i' | 'f' | 'u') => {
+                chars.next();
+                out.push_str(args.next().map_or("", String::as_str));
+            }
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            _ => out.push('%'),
+        }
+    }
+    out
+}
+
+/// The colour a markup word names (approximate shades).
+fn colour_name(word: &str) -> Option<[f32; 3]> {
+    let rgb = |r: u8, g: u8, b: u8| [r, g, b].map(|v| f32::from(v) / 255.0);
+    Some(match word.to_ascii_lowercase().as_str() {
+        "white" => rgb(255, 255, 255),
+        "green" => rgb(96, 208, 64),
+        "red" => rgb(216, 32, 32),
+        "yellow" => rgb(255, 208, 64),
+        "orange" => rgb(255, 144, 32),
+        "blue" => rgb(64, 144, 255),
+        "grey" | "gray" => rgb(160, 160, 160),
+        "black" => rgb(0, 0, 0),
+        _ => return None,
+    })
 }
 
 /// The texture rectangle of a sprite's current frame: frames left to
@@ -903,33 +1051,10 @@ pub fn tick(lua: &Lua, dt: f64) {
 /// `args` after each handler's own data (`GuiHealthUpdate` with health,
 /// maximum and whether in a vehicle). Returns how many handlers ran.
 ///
-/// `GuiInitialization` is special: the game calls each layout's top-level
-/// widgets' handlers as the layout loads, and the rest through the event;
-/// this calls the handlers of widgets with a parent, in creation order.
+/// Don't fire `GuiInitialization`: the game's own loading initialises
+/// every widget, and handlers run twice record wrong animation points.
 pub fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<usize> {
     let args = args.into_lua_multi(lua)?;
-    if event == "GuiInitialization" {
-        return lua
-            .load(
-                r#"
-                local n = 0
-                local list = {}
-                local index = (MrxGuiBase and MrxGuiBase.WidgetIdIndex) or {}
-                for _, w in pairs(index) do list[#list + 1] = w end
-                table.sort(list, function(a, b) return a.BasicData.uId < b.BasicData.uId end)
-                for _, w in ipairs(list) do
-                    local h = w.EventHandlers and w.EventHandlers.GuiInitialization
-                    if h and w.ParentWidget then
-                        n = n + 1
-                        h(w)
-                    end
-                end
-                return n
-                "#,
-            )
-            .set_name("=m2-gui-init")
-            .eval::<usize>();
-    }
     let event_lib: Option<Table> = lua.globals().get("Event")?;
     let Some(fire) =
         event_lib.and_then(|e| e.raw_get::<Option<Function>>("__m2_fire").ok().flatten())
@@ -1202,6 +1327,77 @@ natives! {
         Ok(MultiValue::new())
     },
     "SetImageTextureTransience" => |_, _, _| Ok(MultiValue::new()),
+    // The text cut into lines that fit the widget's width, at spaces
+    // (`TextWidget:SplitIntoLines` makes a widget of each).
+    "SplitText" => |s, l, a| {
+        let id = a.id(0);
+        let Some(w) = s.widget(id) else {
+            return Ok(MultiValue::new());
+        };
+        let r = s.rect(id);
+        let max = (r[2] - r[0]).max(1.0);
+        let text = s.display_text(&w.text);
+        let font = s.fonts.get(&w.font.to_ascii_lowercase());
+        let width = |t: &str| {
+            let px = font.map_or(t.chars().count() as f32 * 12.0, |f| f.text_width(t));
+            px * VIRTUAL_SIZE.1 / FONT_LINES * w.scale
+        };
+        let mut lines = Vec::new();
+        for para in text.split('\n') {
+            let mut line = String::new();
+            for word in para.split(' ') {
+                let candidate = if line.is_empty() { word.to_owned() } else { format!("{line} {word}") };
+                if !line.is_empty() && width(&candidate) > max {
+                    lines.push(std::mem::replace(&mut line, word.to_owned()));
+                } else {
+                    line = candidate;
+                }
+            }
+            lines.push(line);
+        }
+        let mut out = MultiValue::new();
+        for line in lines {
+            out.push_back(Value::String(l.create_string(&line)?));
+        }
+        Ok(out)
+    },
+    // Recorded as calls only: the text and sprite animations and the clock
+    // wipe draw as their full image or text (see the module docs).
+    "AnimateText" => |s, _, a| {
+        s.log_unknown("AnimateText (drawn whole)");
+        let _ = a;
+        Ok(MultiValue::new())
+    },
+    "HaltTextAnimation" => |_, _, _| Ok(MultiValue::new()),
+    "AnimateSprite" => |s, _, a| {
+        s.log_unknown("AnimateSprite (drawn at its frame)");
+        let _ = a;
+        Ok(MultiValue::new())
+    },
+    "HaltSpriteAnimation" => |_, _, _| Ok(MultiValue::new()),
+    "SetImageClockAnimation" => |s, _, a| {
+        s.log_unknown("SetImageClockAnimation (drawn whole)");
+        let _ = a;
+        Ok(MultiValue::new())
+    },
+    "SetImageClockCallback" => |_, _, _| Ok(MultiValue::new()),
+    "GetImageClockElapsed" => |_, l, _| ret(l, 0),
+    // Settings with nothing to draw differently here.
+    "SetWidgetViewport" => |_, _, _| Ok(MultiValue::new()),
+    "SetWidgetIgnoresPause" => |_, _, _| Ok(MultiValue::new()),
+    "SetWidgetFullscreen" => |_, _, _| Ok(MultiValue::new()),
+    "SetWidgetHighlightable" => |_, _, _| Ok(MultiValue::new()),
+    "SetWidgetUseNewRescale" => |_, _, _| Ok(MultiValue::new()),
+    "SetFlashCallback" => |_, _, _| Ok(MultiValue::new()),
+    "SetFlashTesselationAllowed" => |_, _, _| Ok(MultiValue::new()),
+    "PlayFlash" => |_, _, _| Ok(MultiValue::new()),
+    "PauseFlash" => |_, _, _| Ok(MultiValue::new()),
+    "RestartFlash" => |_, _, _| Ok(MultiValue::new()),
+    "PlayMovie" => |_, _, _| Ok(MultiValue::new()),
+    "PauseMovie" => |_, _, _| Ok(MultiValue::new()),
+    "StopMovie" => |_, _, _| Ok(MultiValue::new()),
+    "SetMinimapBorder" => |_, _, _| Ok(MultiValue::new()),
+    "SetMinimapOwner" => |_, _, _| Ok(MultiValue::new()),
     "SetSpriteTextureSize" => |s, _, a| {
         if let Some(w) = s.widgets.get_mut(&a.id(0)) {
             w.sprite_texture_size = [a.f(1).unwrap_or(0.0), a.f(2).unwrap_or(0.0)];
@@ -1412,6 +1608,30 @@ mod tests {
         assert!((g.get::<f64>("ticks").unwrap() - 1.5).abs() < 1e-9);
         assert_eq!(screen.borrow().rect(1), [100.0, 0.0, 110.0, 10.0]);
         assert!(screen.borrow_mut().take_log().is_empty());
+    }
+
+    #[test]
+    fn text_markup_expands_ids_arguments_lines_and_colours() {
+        let mut s = Screen::default();
+        let mut strings = StringTable::default();
+        strings.strings.insert(
+            m2_assets::name_hash("SHELL.Common.Money"),
+            "$%D.%D %S".to_owned(),
+        );
+        strings.strings.insert(0xe00c_096a, "K".to_owned());
+        strings
+            .strings
+            .insert(m2_assets::name_hash("Generic.Credit"), "Credit".to_owned());
+        s.set_strings(strings);
+        let text =
+            "[green]+[SHELL.Common.Money:25:0:[0xe00c096a]][n][white][Generic.Credit] [nope]";
+        assert_eq!(s.display_text(text), "+$25.0 K\nCredit [nope]");
+        let spans = s.spans(text);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].text, "+$25.0 K\n");
+        assert!(spans[0].colour.is_some_and(|c| c[1] > c[0]));
+        assert_eq!(spans[1].colour, Some([1.0; 3]));
+        assert_eq!(fill("%d%%-%s", &["5".to_owned()]), "5%-");
     }
 
     #[test]
