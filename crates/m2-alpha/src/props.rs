@@ -2,9 +2,10 @@
 //! barricades and crates ([`WorldIndex::state_objects`]). They stand once
 //! the scripts load their layer (or the start-up did), go when it
 //! unloads, and break when the scripts' object dies: drawn as their wreck
-//! when the model has one, else gone, and no longer in the way. Those
-//! whose model comes loose ([`Loose`]) are knocked loose by vehicles and
-//! blasts, as the island's are.
+//! when the model has one, else gone, and no longer in the way; one that
+//! breaks apart ([`Breakup`], a gate) throws its pieces, which lie where
+//! they land. Those whose model comes loose ([`Loose`]) are knocked loose
+//! by vehicles and blasts, as the island's are.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use m2_engine::stream::PROP_SIZES;
 use m2_engine::{
-    AssetSource, CollisionShape, CpuModel, DebrisId, Frustum, GpuModel, Install, Loose,
+    AssetSource, Breakup, CollisionShape, CpuModel, DebrisId, Frustum, GpuModel, Install, Loose,
     MaterialCache, Physics, StaticKey, WorldIndex,
 };
 use m2_math::glam::{Mat4, Quat, Vec3};
@@ -32,11 +33,13 @@ pub struct Prop {
     pub wrecked: bool,
 }
 
-/// A model's GPU copy and collision, once loaded.
+/// A model's GPU copy and collision, once loaded, and how it breaks
+/// apart.
 #[derive(Debug)]
 struct PropModel {
     gpu: GpuModel,
     collision: Option<CollisionShape>,
+    breakup: Option<Arc<Breakup>>,
 }
 
 /// The state layers' models in play.
@@ -64,6 +67,8 @@ pub struct Props {
     reach: f32,
     /// Those knocked loose: their pieces, in [`Loose`] order.
     knocked: HashMap<u32, Vec<DebrisId>>,
+    /// Those broken apart: their pieces, in their [`Breakup`]'s order.
+    broken: HashMap<u32, Vec<DebrisId>>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
     /// Those only a support strike brings down (a mission's gates): no
@@ -179,7 +184,8 @@ impl Props {
                 physics.remove_static(StaticKey::Entity(e));
                 self.changes += 1;
             }
-            for d in self.knocked.remove(&e).into_iter().flatten() {
+            let broken = self.broken.remove(&e).into_iter().flatten();
+            for d in self.knocked.remove(&e).into_iter().flatten().chain(broken) {
                 physics.remove_debris(d);
             }
         }
@@ -282,25 +288,61 @@ impl Props {
     }
 
     /// Breaks `entity` if it is shown and whole: its wreck if the model
-    /// has one, else it goes. True if it was one.
-    pub fn wreck(&mut self, physics: &mut Physics, entity: u32) -> bool {
+    /// has one, else it goes. One that breaks apart throws its pieces
+    /// away from `blast` (what broke it), if that went off within
+    /// [`THROW_REACH`] (one found broken, as after loading a game, lies
+    /// wrecked). True if it was one.
+    pub fn wreck(&mut self, physics: &mut Physics, entity: u32, blast: Option<Vec3>) -> bool {
         let Some(p) = self.shown.get_mut(&entity).filter(|p| !p.wrecked) else {
             return false;
         };
         physics.remove_static(StaticKey::Entity(entity));
-        let has_wreck = self
-            .models
-            .get(&p.model)
-            .and_then(Option::as_ref)
-            .is_some_and(|m| m.gpu.has_wreck());
-        if has_wreck {
+        let model = self.models.get(&p.model).and_then(Option::as_ref);
+        if model.is_some_and(|m| m.gpu.has_wreck()) {
             p.wrecked = true;
+            let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+            if let Some(breakup) = model.and_then(|m| m.breakup.as_deref())
+                && !self.knocked.contains_key(&entity)
+                && let Some(pieces) = throw(physics, breakup, placed, blast)
+            {
+                eprintln!(
+                    "props: {entity:#x} ({:08x}) breaks apart into {} pieces, away from \
+                     {:.1}, burning at {} points",
+                    p.model,
+                    pieces.len(),
+                    blast.unwrap_or_default(),
+                    breakup.points.len()
+                );
+                self.broken.insert(entity, pieces);
+            }
         } else if !self.knocked.contains_key(&entity) {
             // Loose pieces stay where they fell.
             self.shown.remove(&entity);
             self.changes += 1;
         }
         true
+    }
+
+    /// Where `entity`'s break-up names points (its fires), world space:
+    /// none unless it broke apart.
+    pub fn breakup_points(&self, entity: u32) -> Vec<Vec3> {
+        let Some(p) = self
+            .shown
+            .get(&entity)
+            .filter(|_| self.broken.contains_key(&entity))
+        else {
+            return Vec::new();
+        };
+        let Some(Some(m)) = self.models.get(&p.model) else {
+            return Vec::new();
+        };
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        m.breakup.as_ref().map_or_else(Vec::new, |b| {
+            b.points
+                .iter()
+                .map(|&x| placed.transform_point3(x))
+                .collect()
+        })
     }
 
     /// Moves `entity` (the scripts placed it elsewhere).
@@ -311,7 +353,14 @@ impl Props {
         p.position = position;
         self.changes += 1;
         // Put up whole again.
-        for d in self.knocked.remove(&entity).into_iter().flatten() {
+        let broken = self.broken.remove(&entity).into_iter().flatten();
+        for d in self
+            .knocked
+            .remove(&entity)
+            .into_iter()
+            .flatten()
+            .chain(broken)
+        {
             physics.remove_debris(d);
         }
         if let Some(Some(m)) = self.models.get(&p.model)
@@ -516,6 +565,7 @@ impl Props {
             Some(PropModel {
                 gpu,
                 collision: cpu.collision,
+                breakup: cpu.breakup,
             }),
         );
         Ok(())
@@ -523,8 +573,8 @@ impl Props {
 
     /// Draws those `frustum` may see within their reach of `eye`, as the
     /// island's props are drawn: each no further than [`PROP_SIZES`] times
-    /// its size, nor than `limit`; those knocked loose with their pieces
-    /// where `physics` has them.
+    /// its size, nor than `limit`; those knocked loose or broken apart with
+    /// their pieces where `physics` has them.
     pub fn draw(
         &self,
         queue: &mut DrawQueue,
@@ -537,8 +587,13 @@ impl Props {
             let Some(Some(m)) = self.models.get(&p.model) else {
                 continue;
             };
-            if let Some(pieces) = self.knocked.get(e) {
-                let Some(loose) = self.loose(*e) else {
+            let moved = match (self.broken.get(e), self.knocked.get(e)) {
+                (Some(pieces), _) => Some((m.breakup.as_deref().map(|b| &b.pieces), pieces)),
+                (None, Some(pieces)) => Some((self.loose(*e), pieces)),
+                (None, None) => None,
+            };
+            if let Some((loose, pieces)) = moved {
+                let Some(loose) = loose else {
                     continue;
                 };
                 let places: Vec<Mat4> = pieces
@@ -574,6 +629,70 @@ impl Props {
     }
 }
 
+/// A broken-apart model's pieces fly this fast (m/s) for a piece a metre
+/// across at the blast, slower the bigger and the further they are, up to
+/// this far (metres) and at most this fast; and turn this fast (radians a
+/// second) for a piece a metre across. Invented, to look as the videos'
+/// gates do: blocks thrown up and out at once, slabs toppling over two
+/// seconds or so.
+const THROW_SPEED: f32 = 14.0;
+const THROW_REACH: f32 = 45.0;
+const THROW_MOST: f32 = 12.0;
+const THROW_TURN: f32 = 5.0;
+
+/// Throws `breakup`'s pieces, the model placed at `placed`, away from
+/// `blast`, as [`THROW_SPEED`] has it: the biggest tip over away from it,
+/// the smaller tumble too. `None` (nothing thrown) without a blast within
+/// [`THROW_REACH`] of its middle.
+fn throw(
+    physics: &mut Physics,
+    breakup: &Breakup,
+    placed: Mat4,
+    blast: Option<Vec3>,
+) -> Option<Vec<DebrisId>> {
+    let loose = &breakup.pieces;
+    let starts = loose.starts(placed);
+    let centres: Vec<Vec3> = loose
+        .pieces
+        .iter()
+        .zip(&starts)
+        .map(|(q, at)| at.transform_point3(q.centre()))
+        .collect();
+    let middle = centres.iter().sum::<Vec3>() / centres.len().max(1) as f32;
+    let from = blast.filter(|b| b.distance(middle) < THROW_REACH)?;
+    let pieces = loose
+        .pieces
+        .iter()
+        .zip(starts)
+        .zip(centres)
+        .enumerate()
+        .map(|(i, ((piece, at), centre))| {
+            let jitter = |k: u32| scatter(i as u32, k);
+            let away = centre - from;
+            let flat = away.with_y(0.0).normalize_or(Vec3::X);
+            let near = (1.0 - away.length() / THROW_REACH).clamp(0.25, 1.0);
+            let size = piece.size().max(0.5);
+            let speed = (THROW_SPEED / size).min(THROW_MOST) * near;
+            let velocity = flat * (speed * (1.0 + 0.4 * jitter(0)))
+                + Vec3::Y * (speed * (0.7 + 0.5 * jitter(1)) + 1.5);
+            // Tipping its top away from the blast, tumbling as it goes.
+            let turn = (THROW_TURN / size).clamp(0.4, 4.0);
+            let spin = Vec3::Y.cross(flat) * turn
+                + Vec3::new(jitter(2), jitter(3), jitter(4)) * (turn * 0.5);
+            physics.add_rubble(piece, at, velocity, spin)
+        })
+        .collect();
+    Some(pieces)
+}
+
+/// A number from -0.5 to 0.5 for piece `i`, `k`th of its kind: the same
+/// every time, different for each.
+fn scatter(i: u32, k: u32) -> f32 {
+    let x = i.wrapping_mul(0x9e37_79b9) ^ k.wrapping_mul(0x85eb_ca6b);
+    let x = (x ^ (x >> 15)).wrapping_mul(0x2c1b_3c6d);
+    ((x ^ (x >> 12)) & 0xffff) as f32 / 65535.0 - 0.5
+}
+
 impl Loaders {
     /// Starts [`LOADERS`] threads, each reading `install` on its own and
     /// decoding the models (with their collision) asked of it.
@@ -601,7 +720,11 @@ impl Loaders {
                         Ok(source) => std::panic::catch_unwind(AssertUnwindSafe(|| {
                             source
                                 .model(m)
-                                .and_then(|data| CpuModel::from_data(&data, 0))
+                                .and_then(|data| {
+                                    let mut cpu = CpuModel::from_data(&data, 0)?;
+                                    cpu.breakup = Breakup::of(&data.parse()?, 0).map(Arc::new);
+                                    Ok(cpu)
+                                })
                                 .map_err(|e| e.to_string())
                         }))
                         .unwrap_or_else(|_| Err("panicked while decoding".to_owned())),

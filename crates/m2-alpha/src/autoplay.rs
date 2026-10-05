@@ -155,6 +155,10 @@ const AWAIT_FROM: f32 = 15.0;
 /// this long (seconds).
 const PDA_LOOK: f32 = 2.0;
 const PDA_MOST: f32 = 15.0;
+/// She opens it this long after the scripts begin waiting for that
+/// (seconds): they put its prompt up two seconds after taking the last
+/// line down (round 96), and she reads it first.
+const PDA_PROMPT: f32 = 3.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
 
@@ -260,9 +264,11 @@ pub struct Autoplay {
     tapped: bool,
     support_logged: &'static str,
     /// When she opened her PDA, while it is open; seconds since she last
-    /// pressed its key.
+    /// pressed its key; when the scripts began waiting for it to open,
+    /// while they wait.
     pda_since: Option<f32>,
     pda_pressed: f32,
+    pda_asked: Option<f32>,
 }
 
 impl Autoplay {
@@ -303,15 +309,23 @@ impl Autoplay {
         // The scripts wait for her to look at her PDA (the first contract,
         // at the first gate): she opens it, and shuts it again.
         let wants = |name: &str| awaited.iter().any(|a| a == name);
-        if game.support.pda
-            || (wants(PDA_OPEN)
-                && game.support.phase == Phase::Idle
-                && game
-                    .scene
-                    .player
-                    .as_ref()
-                    .is_some_and(|p| p.driving.is_none()))
+        let asked = wants(PDA_OPEN)
+            && game.support.phase == Phase::Idle
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_none());
+        self.pda_asked = asked.then(|| self.pda_asked.unwrap_or(self.clock));
+        if !game.support.pda
+            && self
+                .pda_asked
+                .is_some_and(|since| self.clock - since < PDA_PROMPT)
         {
+            // Its prompt isn't up yet: she waits for it.
+            return Intent::default();
+        }
+        if game.support.pda || asked {
             return self.pda(game.support.pda, wants(PDA_CLOSE));
         }
         let chosen = self.choose(game, marks);
