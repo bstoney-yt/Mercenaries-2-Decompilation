@@ -96,7 +96,8 @@ m2-alpha [options]
                          boat five seconds after she is seated in it
                          (-boat.ppm), her three seconds after she gets out
                          of it (-ashore.ppm), what each crate leaves
-                         (-pickup1.ppm, ...), the satellite's view as each
+                         (-pickup1.ppm, ...), her PDA as she opens it
+                         (-pda1.ppm, ...), the satellite's view as each
                          timing wheel comes up (-satellite1.ppm, ...) and
                          her view two seconds after each bomb (-bomb1.ppm)
   --write-config         print the settings file and exit

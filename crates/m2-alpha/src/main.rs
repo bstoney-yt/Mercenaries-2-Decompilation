@@ -1229,11 +1229,13 @@ fn mission_for_screenshot(
     // When to picture each, which, and its number.
     let mut pickup_shots: Vec<(u32, (u32, u32), usize)> = Vec::new();
     // And the satellite's view as the timing wheel comes up for each
-    // call (`-satelliteN`), and her own view two seconds after each bomb
-    // lands (`-bombN`), both with the HUD: whether the wheel was up, the
-    // pictures taken and those due (tick, number).
+    // call (`-satelliteN`), her PDA as she opens it (`-pdaN`), and her own
+    // view two seconds after each bomb lands (`-bombN`), all with the HUD:
+    // whether the wheel (the PDA) was up, the pictures taken and those due
+    // (tick, number).
     let mut wheel_up = false;
     let mut satellite_shots = 0;
+    let (mut pda_shots, mut pda_up) = (0, false);
     let mut bombs = 0;
     let mut bomb_shots: Vec<(u32, usize)> = Vec::new();
     // The clips' sound events met, by category and name: how many hers,
@@ -1391,6 +1393,17 @@ fn mission_for_screenshot(
                 );
             }
             wheel_up = timing;
+            if game.support.pda && !pda_up {
+                pda_shots += 1;
+                let path = picture(format!("pda{pda_shots}"));
+                hud_picture(backend, game, &link, fov, aspect, &path)?;
+                eprintln!(
+                    "autoplay: pictured her PDA open, the tutorial line {:?}: {}",
+                    link.view().tutorial,
+                    path.display()
+                );
+            }
+            pda_up = game.support.pda;
             if game
                 .support
                 .landed
