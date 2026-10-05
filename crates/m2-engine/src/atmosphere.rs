@@ -152,7 +152,7 @@ impl Atmosphere {
         let colour = |name: &str| {
             let v = field(name)?;
             let scale = float(&format!("{name}Multiplier")).unwrap_or(1.0);
-            let [r, g, b, _] = channels(v);
+            let [r, g, b, _] = channels(v, Lit::Light);
             Some(Vec3::new(r, g, b).map(srgb_to_linear) * scale)
         };
         let mut ambient_cube = [Vec3::splat(0.2); 6];
@@ -165,7 +165,7 @@ impl Atmosphere {
             ambient_cube,
             light_intensity: float("LightIntensity").unwrap_or(1.0),
             rim: colour("RimColor").unwrap_or(Vec3::ZERO),
-            rim_threshold: field("RimColor").map_or(0.0, |v| channels(v)[3]),
+            rim_threshold: field("RimColor").map_or(0.0, |v| channels(v, Lit::Light)[3]),
             inscattering: float("ScatterInscatteringMultiplier").unwrap_or(0.0),
             extinction: float("ScatterExtinctionMultiplier").unwrap_or(0.0),
             mie: float("ScatterBetaMieMultiplier").unwrap_or(0.0),
@@ -193,7 +193,7 @@ impl Atmosphere {
                 float("LightMultiplier_Z").unwrap_or(1.0),
             ),
             interpolate_time: float("InterpolateTime").unwrap_or(0.0),
-            monochrome: field("Gradient0_Color2").map(|v| Vec4::from_array(channels(v))),
+            monochrome: field("Gradient0_Color2").map(|v| Vec4::from_array(channels(v, Lit::Post))),
             tone_map: (|| {
                 let f = |names: &[&str]| names.iter().find_map(|n| float(n));
                 Some(ToneMap {
@@ -220,7 +220,7 @@ impl Atmosphere {
             water_ramp: {
                 let stop = |name: &str| {
                     let v = field(name)?;
-                    let [r, g, b, a] = channels(v);
+                    let [r, g, b, a] = channels(v, Lit::Post);
                     Some(Vec4::new(
                         srgb_to_linear(r),
                         srgb_to_linear(g),
@@ -560,15 +560,25 @@ const RAYLEIGH: Vec3 = Vec3::new(6.95e-6, 1.18e-5, 2.44e-5);
 /// `c = (0.6544 T - 0.6510) 1e-16`.
 const MIE: Vec3 = Vec3::new(5.75e-3, 7.39e-3, 1.045e-2);
 
+/// What a record colour is for: light on surfaces (ambient, rim) or the
+/// water and post pass (depth colour map, monochrome ramp).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lit {
+    Light,
+    Post,
+}
+
 /// A record colour word's red, green, blue and alpha, 0 to 1: stored as
 /// the bytes red, green, blue, alpha (red the low byte). Read the other
 /// way (`0xAARRGGBB`) the islands' night record is all warm (its ambient,
 /// rim, deep water and grade) against its blue cloud tone and footage,
 /// and nearly every daytime grade blue; this way round both agree with
-/// footage. Inferred; `M2_COLOURS=argb` reads them the other way.
-fn channels(v: u32) -> [f32; 4] {
-    static ARGB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let argb = *ARGB.get_or_init(|| std::env::var("M2_COLOURS").is_ok_and(|v| v == "argb"));
+/// footage. Inferred; `M2_COLOURS=argb` reads them all the other way,
+/// `M2_COLOURS=split` only the light's (ambient and rim), for comparison.
+fn channels(v: u32, lit: Lit) -> [f32; 4] {
+    static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let mode = MODE.get_or_init(|| std::env::var("M2_COLOURS").unwrap_or_default());
+    let argb = mode == "argb" || (mode == "split" && lit == Lit::Light);
     let byte = |shift: u32| ((v >> shift) & 0xff) as f32 / 255.0;
     if argb {
         [byte(16), byte(8), byte(0), byte(24)]
