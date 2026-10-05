@@ -29,6 +29,7 @@ use m2_engine::vehicle::DRIVABLE;
 use m2_engine::world::member_stem;
 use m2_engine::{CatalogueEntry, Install, TemplateInfo, Templates, VehicleKind};
 use m2_game::api::Command;
+use m2_game::hud::ObjectiveMessage;
 use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
@@ -75,6 +76,9 @@ pub struct MissionView {
     pub markers: Vec<(Vec3, String, [u8; 4])>,
     /// The newest objective message: completed (or else added), and text.
     pub message: Option<(bool, String)>,
+    /// The same message as the scripts sent it, for the game's own HUD to
+    /// word.
+    pub game_message: Option<ObjectiveMessage>,
     /// The contract was just completed (for [`BANNER_TIME`] seconds).
     pub contract_complete: bool,
 }
@@ -94,7 +98,8 @@ pub struct MissionLink {
     /// Time not yet given to the scripts.
     lag: f32,
     log: Option<BufWriter<File>>,
-    message: Option<(bool, String, f32)>,
+    /// The newest objective message, its text readable, and its age.
+    message: Option<(ObjectiveMessage, String, f32)>,
     drivers: Vec<(String, String)>,
     /// The scripts put the player somewhere the island has no way to hold
     /// her (in the start's boat, at sea): she goes ashore once the ground
@@ -287,8 +292,8 @@ impl MissionLink {
             }
             break_props(game, mission);
             let w = mission.world().borrow();
-            if let Some((done, text)) = w.hud.messages.last() {
-                self.message = Some((*done, mission.text(text), 0.0));
+            if let Some(m) = w.hud.messages.last() {
+                self.message = Some((m.clone(), mission.text(&m.text), 0.0));
             }
             drop(w);
             mission.world().borrow_mut().hud.messages.clear();
@@ -437,11 +442,9 @@ impl MissionLink {
 
     /// What the HUD shows.
     pub fn view(&self) -> MissionView {
-        let message = self
-            .message
-            .as_ref()
-            .filter(|m| m.2 < MESSAGE_TIME)
-            .map(|(done, text, _)| (*done, text.clone()));
+        let recent = self.message.as_ref().filter(|m| m.2 < MESSAGE_TIME);
+        let message = recent.map(|(m, text, _)| (m.done(), text.clone()));
+        let game_message = recent.map(|(m, ..)| m.clone());
         let mission = match &self.state {
             State::Loading(_) => {
                 return MissionView {
@@ -487,6 +490,7 @@ impl MissionLink {
             objectives,
             markers,
             message,
+            game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
         }
     }
