@@ -1306,6 +1306,22 @@ impl Scene {
             {
                 w.model.draw(queue, at);
             }
+            // What she carries but doesn't hold hangs on her back.
+            let holding = !fight.designator && player.throwing.is_none() && !player.down;
+            for (slot, slung) in fight.slung(holding).into_iter().enumerate() {
+                let model = match slung {
+                    Some(Weapon::Rifle) if self.arsenal.carbine.is_some() => &self.arsenal.carbine,
+                    Some(Weapon::Rifle) => &self.arsenal.rifle,
+                    Some(Weapon::Rpg) => &self.arsenal.rpg,
+                    Some(Weapon::GrenadeLauncher) => &self.arsenal.launcher,
+                    None => &None,
+                };
+                if let Some(w) = model
+                    && let Some(at) = self.arsenal.on_back(body, &nodes, slot)
+                {
+                    w.model.draw(queue, at);
+                }
+            }
         }
         for n in &self.people.npcs {
             if !n.landed || n.character.position.distance(eye) > npc::DRAW_DISTANCE {
