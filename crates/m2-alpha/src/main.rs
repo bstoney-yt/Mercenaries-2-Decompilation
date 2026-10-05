@@ -1153,9 +1153,9 @@ fn mission_for_screenshot(
     let mut seated: Option<u32> = None;
     let mut boat_shot: Option<u32> = None;
     let mut ashore_shot: Option<u32> = None;
-    // And what each crate broken open left, a second and a half after
-    // (its model loading), from 5 m off (`-pickupN`): the crates seen,
-    // and the pictures due (tick, crate).
+    // And what each crate broken open left, as soon as it lies there
+    // (she takes it within a second or two), from 5 m off (`-pickupN`):
+    // the crates seen, and the pictures due (tick, crate).
     let mut opened: HashSet<u32> = HashSet::new();
     let mut pickup_shots: Vec<(u32, u32)> = Vec::new();
     for i in 0..(seconds / tick).round() as u32 {
@@ -1240,7 +1240,7 @@ fn mission_for_screenshot(
             }
             for p in game.scene.flights.pickups() {
                 if opened.insert(p.from) {
-                    pickup_shots.push((i + (1.5 / tick) as u32, p.from));
+                    pickup_shots.push((i + 1, p.from));
                 }
             }
             let due: Vec<u32> = pickup_shots
