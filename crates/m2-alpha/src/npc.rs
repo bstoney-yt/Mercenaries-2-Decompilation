@@ -679,7 +679,9 @@ impl People {
 
     /// Whether a state layer's people stand: it is in, or which are in
     /// isn't known.
-    fn layer_in(&self, layer: Option<u32>) -> bool {
+    /// Whether a spawn of state layer `layer` (`None`: a static one) can
+    /// stand now.
+    pub fn layer_in(&self, layer: Option<u32>) -> bool {
         layer.is_none_or(|l| {
             self.state_layers
                 .as_ref()

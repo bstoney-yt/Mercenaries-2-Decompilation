@@ -97,6 +97,10 @@ struct Options {
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
+    /// With `--screenshot` on foot: throw a grenade just before it.
+    throw: bool,
+    /// With `--jump` or `--throw`: seconds before the picture she starts.
+    lead: Option<f32>,
     fight: bool,
     /// With `--screenshot`: rocket the nearest fuel tank or barrel.
     blast: bool,
@@ -207,6 +211,8 @@ fn parse_args() -> anyhow::Result<Options> {
             "--fly" => o.fly = true,
             "--drive" => o.drive = true,
             "--jump" => o.jump = true,
+            "--throw" => o.throw = true,
+            "--lead" => o.lead = Some(value()?.parse().context("--lead expects seconds")?),
             "--fight" => o.fight = true,
             "--blast" => o.blast = true,
             "--wreck" => o.wreck = true,
@@ -620,18 +626,35 @@ fn screenshot(
                 .join(", ")
         );
         for (d, s) in near.iter().take(options.list_spawns) {
+            let kind = s
+                .template
+                .as_deref()
+                .and_then(|t| people.kind_for(t))
+                .or_else(|| people.kind_for(&s.name));
             eprintln!(
-                "  spawn {:08x} {:?} {d:.0} m at {:.0}, {} route points, {}",
+                "  spawn {:08x} {:?} {d:.0} m at {:.0}, template {:?}, layer {} ({}), {} route points, {}{}",
                 s.entity,
                 s.name,
                 s.position,
+                s.template,
+                s.layer.map_or("static".to_owned(), |l| format!("{l:08x}")),
+                if people.layer_in(s.layer) {
+                    "in"
+                } else {
+                    "out"
+                },
                 s.route.len(),
-                if people.kind_for(&s.name).is_some() {
+                if kind.is_some() {
                     "a soldier"
                 } else if people.mission_soldiers.contains(&s.entity) {
                     "a mission soldier"
                 } else {
                     "nobody"
+                },
+                if people.npcs.iter().any(|n| n.spawn == Some(s.entity)) {
+                    ", standing"
+                } else {
+                    ""
                 }
             );
         }
@@ -671,6 +694,10 @@ fn screenshot(
             ..Intent::default()
         };
         let from = game.scene.player.as_ref().map(|p| p.character.position);
+        // A jump or throw starts this many ticks before the picture.
+        let lead = (options.lead.unwrap_or(0.2) * 60.0)
+            .round()
+            .clamp(1.0, 179.0) as usize;
         for i in 0..180 {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
@@ -678,15 +705,16 @@ fn screenshot(
                     p.facing = face;
                 }
             }
-            // A jump takes the picture on the way up; aiming, the weapon
-            // comes up for the last second.
-            let jump = options.jump && i == 168;
+            // A jump takes the picture on the way up (by default), a
+            // throw with the grenade still in her hand; aiming, the
+            // weapon comes up for the last second.
+            let jump = options.jump && i == 180 - lead;
             let trigger = combat::Trigger {
                 aim: options.aim && i >= 120,
                 // The last shot's flash is still up for the picture.
                 fire: options.fire && i == 177,
+                throw: options.throw && i == 180 - lead,
                 select: options.weapon.filter(|_| i == 0),
-                ..combat::Trigger::default()
             };
             game.step(
                 Intent {
@@ -703,18 +731,26 @@ fn screenshot(
             }
         }
         if let (Some(p), Some(from)) = (&game.scene.player, from) {
+            let hash = |c: usize| p.model.as_ref().map_or(0, |(_, r)| r.clips[c].hash);
             eprintln!(
-                "player: {:?} from {from:.2} to {:.2}, grounded {}, clip {:?}",
+                "player: {:?} from {from:.2} to {:.2}, grounded {}, clip {:?}, upper {:?}, throwing {:?}, grenade in hand {}, grenades out {}",
                 gait,
                 p.character.position,
                 p.character.grounded,
                 p.model
                     .as_ref()
                     .and_then(|(_, r)| r.animator.current())
-                    .map(|(c, t)| format!(
-                        "{:08x} at {t:.2} s",
-                        p.model.as_ref().map_or(0, |(_, r)| r.clips[c].hash)
-                    ))
+                    .map(|(c, t)| format!("{:08x} at {t:.2} s", hash(c))),
+                p.model
+                    .as_ref()
+                    .and_then(|(_, r)| r.animator.upper())
+                    .map(|c| format!("{:08x}", hash(c))),
+                p.throwing,
+                game.combat.grenade_in_hand(),
+                game.combat
+                    .projectiles()
+                    .filter(|(rocket, ..)| !rocket)
+                    .count(),
             );
         }
     }
