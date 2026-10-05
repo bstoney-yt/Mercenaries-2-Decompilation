@@ -141,6 +141,9 @@ pub struct Widget {
     pub movie: Option<String>,
     /// `MinimapCreate` arguments as text.
     pub minimap: Option<Vec<String>>,
+    /// The latest arguments of each other `Minimap*` native (range,
+    /// player location, rotation, objectives...), as text.
+    pub minimap_calls: BTreeMap<String, Vec<String>>,
     update: Option<u32>,
     interp: Option<Interp>,
 }
@@ -175,6 +178,7 @@ impl Widget {
             flash_calls: Vec::new(),
             movie: None,
             minimap: None,
+            minimap_calls: BTreeMap::new(),
             update: None,
             interp: None,
         }
@@ -892,6 +896,14 @@ fn new_location(s: &Screen, a: &Args) -> [f32; 4] {
     }
 }
 
+/// Keeps a `Minimap*` call's latest arguments on its widget.
+fn record_minimap(s: &mut Screen, name: &str, a: &Args) -> mlua::Result<MultiValue> {
+    if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+        w.minimap_calls.insert(name.to_owned(), a.texts(1));
+    }
+    Ok(MultiValue::new())
+}
+
 fn ret<T: IntoLuaMulti>(lua: &Lua, v: T) -> mlua::Result<MultiValue> {
     v.into_lua_multi(lua)
 }
@@ -1482,6 +1494,13 @@ natives! {
         }
         Ok(MultiValue::new())
     },
+    "MinimapSetRange" => |s, _, a| record_minimap(s, "MinimapSetRange", a),
+    "MinimapSetPlayerLocation" => |s, _, a| record_minimap(s, "MinimapSetPlayerLocation", a),
+    "MinimapSetRotation" => |s, _, a| record_minimap(s, "MinimapSetRotation", a),
+    "MinimapSetFocusLocation" => |s, _, a| record_minimap(s, "MinimapSetFocusLocation", a),
+    "MinimapUpdate" => |s, _, a| record_minimap(s, "MinimapUpdate", a),
+    "MinimapAddObjective" => |s, _, a| record_minimap(s, "MinimapAddObjective", a),
+    "MinimapRemoveObjective" => |s, _, a| record_minimap(s, "MinimapRemoveObjective", a),
     "MinimapCreate" => |s, _, a| {
         if let Some(w) = s.widgets.get_mut(&a.id(0)) {
             w.kind = Kind::Minimap;
