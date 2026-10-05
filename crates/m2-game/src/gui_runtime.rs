@@ -1071,6 +1071,39 @@ pub fn screen(lua: &Lua) -> Option<ScreenRef> {
     lua.app_data_ref::<ScreenRef>().map(|s| Rc::clone(&s))
 }
 
+/// The names the scripts gave their widgets, by id. The natives are
+/// created without one (`_GuiInternal.CreateImageWidget()`); the layout's
+/// `name` stays on the scripts' side, in the widget object MrxGuiBase's
+/// `WidgetIdIndex[uId]` holds (`BasicData.name`).
+pub fn script_names(lua: &Lua) -> BTreeMap<u32, String> {
+    let mut names = BTreeMap::new();
+    let index = lua
+        .globals()
+        .get::<Option<Table>>("MrxGuiBase")
+        .ok()
+        .flatten()
+        .and_then(|m| m.get::<Option<Table>>("WidgetIdIndex").ok().flatten());
+    let Some(index) = index else {
+        return names;
+    };
+    for (id, widget) in index.pairs::<Value, Table>().flatten() {
+        let id = match id {
+            Value::Integer(i) => i as u32,
+            Value::Number(n) => n as u32,
+            _ => continue,
+        };
+        let name = widget
+            .get::<Option<Table>>("BasicData")
+            .ok()
+            .flatten()
+            .and_then(|b| b.get::<Option<String>>("name").ok().flatten());
+        if let Some(name) = name {
+            names.insert(id, name);
+        }
+    }
+    names
+}
+
 type Native = fn(&mut Screen, &Lua, &Args) -> mlua::Result<MultiValue>;
 
 /// Installs `_GuiInternal` over a new [`Screen`] (kept as the Lua state's
