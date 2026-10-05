@@ -4,7 +4,9 @@
 //! The HUD's look is our own, not the game's: the game's interface (Scaleform
 //! movies) is not decoded. egui's bundled fonts are used.
 
-use egui::{Align2, Color32, FontId, RawInput, Stroke, pos2, vec2};
+use std::f32::consts::TAU;
+
+use egui::{Align2, Color32, FontId, RawInput, Rect, Shape, Stroke, StrokeKind, pos2, vec2};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use m2_render::gpu::OverlayTarget;
 use m2_render::gpu::wgpu;
@@ -14,6 +16,7 @@ use m2_math::glam::{Mat4, Vec3};
 use crate::combat::Weapon;
 use crate::config::Config;
 use crate::mission::MissionView;
+use crate::support::{SupportHud, WheelHud};
 
 /// What the HUD shows this frame.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -23,6 +26,14 @@ pub struct HudInfo {
     pub hp: f32,
     pub down: bool,
     pub weapon: Weapon,
+    /// What she carries in the launcher's place, if anything.
+    pub second: Option<Weapon>,
+    /// The rounds of the weapon up when it runs out (the grenade
+    /// launcher's): in its clip, and stored.
+    pub rounds: Option<(u32, u32)>,
+    /// What the use key takes from within reach, as the game words it
+    /// ("Equip Grenade Launcher", "Take Ammo").
+    pub prompt: Option<String>,
     /// Driving: the vehicle's name and speed (m/s), and whether it is
     /// wrecked.
     pub driving: Option<(String, f32, bool)>,
@@ -37,6 +48,9 @@ pub struct HudInfo {
     pub mission: Option<MissionView>,
     /// World to clip, for placing markers.
     pub view_proj: Option<Mat4>,
+    /// Her support: the item ready, the designator, the satellite's view,
+    /// the timing wheel, the bomb's flash.
+    pub support: SupportHud,
 }
 
 /// What the pause menu asked for.
@@ -203,6 +217,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
         painter.text(at, align, s, FontId::proportional(size), colour);
     };
     let white = Color32::from_gray(235);
+    flash(&ctx, screen, info.support.flash);
     if let Some(loading) = &info.loading {
         text(
             screen.center_top() + vec2(0.0, 24.0),
@@ -213,6 +228,10 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
         );
     }
     let time = ctx.input(|i| i.time);
+    if let Some(view) = info.support.satellite {
+        satellite(&painter, screen, info, view, &text);
+        return;
+    }
     if time < HINT_TIME && info.playing {
         text(
             screen.center_top() + vec2(0.0, 56.0),
@@ -285,14 +304,33 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
             }
         }
         None => {
-            let weapon = match info.weapon {
-                Weapon::Rifle => "AK-47   ·   2 RPG   ·   G grenade",
-                Weapon::Rpg => "RPG   ·   1 rifle   ·   G grenade",
+            let name = |w: Weapon| match w {
+                Weapon::Rifle => "rifle",
+                Weapon::Rpg => "RPG",
+                Weapon::GrenadeLauncher => "grenade launcher",
+            };
+            let up = match (info.weapon, info.rounds) {
+                (Weapon::Rifle, _) => "Carbine".to_owned(),
+                (Weapon::Rpg, _) => "RPG".to_owned(),
+                (Weapon::GrenadeLauncher, Some((clip, stored))) => {
+                    format!("Grenade launcher {clip} | {stored}")
+                }
+                (Weapon::GrenadeLauncher, None) => "Grenade launcher".to_owned(),
+            };
+            let other = match (info.weapon, info.second) {
+                (Weapon::Rifle, Some(w)) => format!("   ·   2 {}", name(w)),
+                (Weapon::Rifle, None) => String::new(),
+                _ => "   ·   1 rifle".to_owned(),
+            };
+            // Holding the designator, it is what is up.
+            let (up, other) = match &info.support.designator {
+                Some(designator) => (designator.clone(), "   ·   1/2 put it away".to_owned()),
+                None => (up, other),
             };
             text(
                 screen.right_bottom() + vec2(-24.0, -28.0),
                 Align2::RIGHT_BOTTOM,
-                weapon,
+                &format!("{up}{other}   ·   G grenade"),
                 18.0,
                 white,
             );
@@ -307,7 +345,15 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
             }
         }
     }
-    if let Some(name) = &info.can_enter
+    if let Some(prompt) = &info.prompt {
+        text(
+            screen.center() + vec2(0.0, 60.0),
+            Align2::CENTER_TOP,
+            &format!("E: {prompt}"),
+            17.0,
+            white,
+        );
+    } else if let Some(name) = &info.can_enter
         && info.driving.is_none()
     {
         text(
@@ -326,6 +372,372 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
             26.0,
             Color32::from_rgb(240, 90, 80),
         );
+    }
+    if info.driving.is_none() {
+        support(screen, &info.support, &text);
+    }
+}
+
+/// The support box above the health bar: the item ready to call (its
+/// name, how many, whether free, how it is called in) and the keys for
+/// the step the call is at; and while a bomb is on its way, how long.
+fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
+    screen: egui::Rect,
+    s: &SupportHud,
+    text: &T,
+) {
+    let white = Color32::from_gray(235);
+    if let Some(left) = s.inbound {
+        text(
+            screen.center_top() + vec2(0.0, 130.0),
+            Align2::CENTER_TOP,
+            &format!("Bomb inbound: {:.0} s", left.ceil()),
+            20.0,
+            Color32::from_rgb(240, 120, 60),
+        );
+    }
+    let Some((name, method, count, free)) = &s.item else {
+        return;
+    };
+    let at = screen.left_bottom() + vec2(24.0, -78.0);
+    let free = if *free { " FREE" } else { "" };
+    text(
+        at,
+        Align2::LEFT_BOTTOM,
+        &format!("{count}{free}   ·   {method}"),
+        14.0,
+        Color32::from_rgb(110, 220, 110),
+    );
+    text(
+        at + vec2(0.0, -18.0),
+        Align2::LEFT_BOTTOM,
+        name,
+        16.0,
+        white,
+    );
+    let keys = if s.menu {
+        "E: use support item   ·   T: close"
+    } else {
+        "T: support menu"
+    };
+    text(
+        at + vec2(0.0, -40.0),
+        Align2::LEFT_BOTTOM,
+        keys,
+        13.0,
+        Color32::from_gray(200),
+    );
+}
+
+/// The bomb's flash over everything, `strength` 1 at its brightest.
+fn flash(ctx: &egui::Context, screen: egui::Rect, strength: f32) {
+    if strength <= 0.0 {
+        return;
+    }
+    let alpha = (255.0 * strength.min(1.0)) as u8;
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("flash"),
+    ))
+    .rect_filled(
+        screen,
+        0.0,
+        Color32::from_rgba_unmultiplied(255, 248, 220, alpha),
+    );
+}
+
+/// Ruler ticks every this many metres, numbered every fifth; the rulers
+/// are this wide (points).
+const TICK: f32 = 10.0;
+const RULER: f32 = 28.0;
+
+/// The satellite's view, as round 93's videos show it (its grey and
+/// grain are the post pass's): rulers along the top (x) and the left (z,
+/// north up) marking where the view's middle is, a crosshair, the operation's time and cost, the
+/// objective, the keys, and once the target is confirmed the timing
+/// wheel. `view` is the view's middle on the ground, seconds since it
+/// opened and the cost ($K).
+fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    info: &HudInfo,
+    (middle, open, cost): (Vec3, f32, f32),
+    text: &T,
+) {
+    let white = Color32::from_gray(235);
+    let gold = Color32::from_rgb(255, 200, 0);
+    let ink = Color32::from_white_alpha(200);
+    // Its grey and grain are the post pass's (`game::satellite_look`).
+
+    // The rulers, and on each the view's middle.
+    let top = Rect::from_min_max(
+        screen.left_top() + vec2(RULER, 0.0),
+        screen.right_top() + vec2(0.0, RULER),
+    );
+    let left = Rect::from_min_max(
+        screen.left_top() + vec2(0.0, RULER),
+        screen.left_bottom() + vec2(RULER, 0.0),
+    );
+    for r in [top, left] {
+        painter.rect_filled(r, 0.0, Color32::from_black_alpha(150));
+    }
+    let centre = screen.center();
+    if let Some(vp) = info.view_proj {
+        let first = |v: f32| (v / TICK).round() as i32;
+        for k in first(middle.x) - 60..=first(middle.x) + 60 {
+            let x = k as f32 * TICK;
+            let Some(p) = project(vp, Vec3::new(x, middle.y, middle.z), screen) else {
+                continue;
+            };
+            if !(top.left()..=top.right()).contains(&p.x) {
+                continue;
+            }
+            let long = if k % 5 == 0 { 12.0 } else { 6.0 };
+            painter.line_segment(
+                [pos2(p.x, top.bottom() - long), pos2(p.x, top.bottom())],
+                Stroke::new(1.0, ink),
+            );
+            if k % 5 == 0 {
+                text(
+                    pos2(p.x + 3.0, top.top() + 1.0),
+                    Align2::LEFT_TOP,
+                    &format!("{x:.0}"),
+                    10.0,
+                    ink,
+                );
+            }
+        }
+        for k in first(middle.z) - 60..=first(middle.z) + 60 {
+            let z = k as f32 * TICK;
+            let Some(p) = project(vp, Vec3::new(middle.x, middle.y, z), screen) else {
+                continue;
+            };
+            if !(left.top()..=left.bottom()).contains(&p.y) {
+                continue;
+            }
+            let long = if k % 5 == 0 { 12.0 } else { 6.0 };
+            painter.line_segment(
+                [pos2(left.right() - long, p.y), pos2(left.right(), p.y)],
+                Stroke::new(1.0, ink),
+            );
+            if k % 5 == 0 {
+                text(
+                    pos2(left.left() + 1.0, p.y - 2.0),
+                    Align2::LEFT_BOTTOM,
+                    &format!("{z:.0}"),
+                    10.0,
+                    ink,
+                );
+            }
+        }
+    }
+    // Triangles on the rulers point at the middle, its coordinates beside
+    // them.
+    let tri = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2, colour: Color32| {
+        painter.add(Shape::convex_polygon(vec![a, b, c], colour, Stroke::NONE));
+    };
+    let x = centre.x;
+    tri(
+        pos2(x, top.bottom() + 1.0),
+        pos2(x - 7.0, top.bottom() + 12.0),
+        pos2(x + 7.0, top.bottom() + 12.0),
+        white,
+    );
+    text(
+        pos2(x, top.bottom() + 14.0),
+        Align2::CENTER_TOP,
+        &format!("{:.2}", middle.x),
+        14.0,
+        white,
+    );
+    let y = centre.y;
+    tri(
+        pos2(left.right() + 1.0, y),
+        pos2(left.right() + 12.0, y - 7.0),
+        pos2(left.right() + 12.0, y + 7.0),
+        white,
+    );
+    text(
+        pos2(left.right() + 15.0, y),
+        Align2::LEFT_CENTER,
+        &format!("{:.2}", middle.z),
+        14.0,
+        white,
+    );
+    // North, up.
+    let corner = screen.left_top() + vec2(RULER / 2.0, 0.0);
+    text(
+        corner + vec2(0.0, 2.0),
+        Align2::CENTER_TOP,
+        "N",
+        13.0,
+        white,
+    );
+    tri(
+        corner + vec2(0.0, 15.0),
+        corner + vec2(-5.0, 24.0),
+        corner + vec2(5.0, 24.0),
+        white,
+    );
+
+    // The crosshair.
+    let stroke = Stroke::new(2.0, Color32::from_white_alpha(230));
+    painter.circle_stroke(centre, 20.0, stroke);
+    for d in [
+        vec2(1.0, 0.0),
+        vec2(-1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, -1.0),
+    ] {
+        painter.line_segment([centre + d * 8.0, centre + d * 34.0], stroke);
+    }
+
+    // The operation's time (minutes, seconds and hundredths, as the
+    // videos count it) and cost, top right.
+    let hundredths = (open.max(0.0) * 100.0) as u32;
+    let readouts = [
+        (
+            "OPERATION TIME",
+            format!(
+                "{:02}:{:02}:{:02}",
+                hundredths / 6000,
+                hundredths / 100 % 60,
+                hundredths % 100
+            ),
+        ),
+        ("OPERATION COST", format!("${cost:.1} K")),
+    ];
+    for (i, (label, value)) in readouts.iter().enumerate() {
+        let r = Rect::from_min_size(
+            pos2(
+                screen.right() - 210.0,
+                top.bottom() + 16.0 + i as f32 * 54.0,
+            ),
+            vec2(190.0, 46.0),
+        );
+        painter.rect_filled(r, 2.0, Color32::from_black_alpha(150));
+        painter.rect_stroke(
+            r,
+            2.0,
+            Stroke::new(1.0, Color32::from_white_alpha(150)),
+            StrokeKind::Inside,
+        );
+        text(
+            r.left_top() + vec2(8.0, 4.0),
+            Align2::LEFT_TOP,
+            label,
+            11.0,
+            ink,
+        );
+        text(
+            r.left_bottom() + vec2(8.0, -4.0),
+            Align2::LEFT_BOTTOM,
+            value,
+            18.0,
+            white,
+        );
+    }
+
+    // The objective, bottom left; the keys, bottom right.
+    if let Some(objective) = info.mission.as_ref().and_then(|m| m.objectives.first()) {
+        text(
+            screen.left_bottom() + vec2(RULER + 16.0, -24.0),
+            Align2::LEFT_BOTTOM,
+            objective,
+            17.0,
+            gold,
+        );
+    }
+    let keys = if info.support.wheel.is_some() {
+        "T: back"
+    } else {
+        "WASD or the mouse: move the view   ·   Fire or E: confirm   ·   T: back"
+    };
+    text(
+        screen.right_bottom() + vec2(-24.0, -24.0),
+        Align2::RIGHT_BOTTOM,
+        keys,
+        14.0,
+        white,
+    );
+
+    if let Some(w) = &info.support.wheel {
+        wheel(
+            painter,
+            centre,
+            screen.height().min(screen.width()) * 0.16,
+            w,
+        );
+        text(
+            centre + vec2(0.0, screen.height() * 0.2),
+            Align2::CENTER_TOP,
+            "Fire as the marker passes through each grey wedge",
+            17.0,
+            white,
+        );
+    }
+}
+
+/// The timing wheel centred on `c`, `r` across at its full size: a
+/// translucent disc with rings and spokes, its grey wedges (green once
+/// pressed in), the marker on the rim, and a check or a cross for the last
+/// press.
+fn wheel(painter: &egui::Painter, c: egui::Pos2, r: f32, w: &WheelHud) {
+    // Clockwise from the top, on the screen (y down).
+    let dir = |a: f32| vec2(a.sin(), -a.cos());
+    let r = r * w.size.clamp(0.0, 1.0);
+    if r < 1.0 {
+        return;
+    }
+    let ring = Stroke::new(1.5, Color32::from_white_alpha(150));
+    let lit = w.mark == Some(true);
+    painter.circle_filled(
+        c,
+        r,
+        if lit {
+            Color32::from_rgba_unmultiplied(90, 210, 90, 70)
+        } else {
+            Color32::from_white_alpha(40)
+        },
+    );
+    for f in [1.0, 0.68, 0.36] {
+        painter.circle_stroke(c, r * f, ring);
+    }
+    for k in 0..12 {
+        let d = dir(k as f32 * TAU / 12.0);
+        painter.line_segment(
+            [c + d * r * 0.36, c + d * r],
+            Stroke::new(1.0, Color32::from_white_alpha(90)),
+        );
+    }
+    for (mid, hit) in w.sectors {
+        let mut points = vec![c];
+        points
+            .extend((0..=12).map(|k| c + dir(mid - w.wedge + 2.0 * w.wedge * k as f32 / 12.0) * r));
+        let fill = if hit {
+            Color32::from_rgba_unmultiplied(60, 150, 60, 170)
+        } else {
+            Color32::from_rgba_unmultiplied(60, 60, 60, 190)
+        };
+        painter.add(Shape::convex_polygon(points, fill, Stroke::NONE));
+    }
+    let m = c + dir(w.angle) * r;
+    painter.circle_filled(m, 12.0, Color32::from_rgb(70, 190, 70));
+    painter.circle_stroke(m, 12.0, Stroke::new(2.0, Color32::WHITE));
+    match w.mark {
+        Some(true) => {
+            let s = r * 0.3;
+            let green = Stroke::new(7.0, Color32::from_rgb(70, 200, 70));
+            painter.line_segment([c + vec2(-0.9, 0.0) * s, c + vec2(-0.3, 0.6) * s], green);
+            painter.line_segment([c + vec2(-0.3, 0.6) * s, c + vec2(0.9, -0.7) * s], green);
+        }
+        Some(false) => {
+            let s = r * 0.25;
+            let red = Stroke::new(7.0, Color32::from_rgb(220, 50, 40));
+            painter.line_segment([c + vec2(-s, -s), c + vec2(s, s)], red);
+            painter.line_segment([c + vec2(-s, s), c + vec2(s, -s)], red);
+        }
+        None => {}
     }
 }
 
@@ -419,6 +831,20 @@ fn to_screen(view_proj: Mat4, world: Vec3, screen: egui::Rect) -> Option<egui::P
     Some(pos2(
         screen.left() + (x + 1.0) * 0.5 * screen.width(),
         screen.top() + (1.0 - y) * 0.5 * screen.height(),
+    ))
+}
+
+/// Where a world point lands on the screen, on it or off, if in front of
+/// the camera.
+fn project(view_proj: Mat4, world: Vec3, screen: egui::Rect) -> Option<egui::Pos2> {
+    let clip = view_proj * world.extend(1.0);
+    if clip.w <= 0.01 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some(pos2(
+        screen.left() + (ndc.x + 1.0) * 0.5 * screen.width(),
+        screen.top() + (1.0 - ndc.y) * 0.5 * screen.height(),
     ))
 }
 
@@ -524,5 +950,63 @@ mod tests {
         // The font atlas arrives on the first frame and is kept until
         // painted.
         assert!(!delta.set.is_empty());
+    }
+
+    #[test]
+    fn the_satellite_view_and_its_wheel_lay_out() {
+        let mut hud = Hud::new();
+        let mut config = Config::default();
+        let middle = Vec3::new(-1472.0, -18.0, 2825.0);
+        let view = crate::support::satellite_view(
+            m2_math::glam::Vec2::new(middle.x, middle.z),
+            middle.y,
+            800.0 / 600.0,
+        );
+        let mut info = HudInfo {
+            playing: true,
+            hp: 80.0,
+            view_proj: Some(view.projection * view.view),
+            support: SupportHud {
+                item: Some(("Satellite Guided Bomb".into(), "Satellite".into(), 1, true)),
+                designator: Some("Satellite Designator".into()),
+                satellite: Some((middle, 13.0, 0.0)),
+                wheel: Some(WheelHud {
+                    angle: 0.2,
+                    sectors: [(0.0, true), (std::f32::consts::PI, false)],
+                    wedge: crate::support::WEDGE,
+                    mark: Some(true),
+                    size: 1.0,
+                }),
+                flash: 0.5,
+                ..SupportHud::default()
+            },
+            ..HudInfo::default()
+        };
+        // The view's middle is in the middle of the screen.
+        let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let p = project(info.view_proj.unwrap(), middle, screen).unwrap();
+        assert!((p.x - 400.0).abs() < 0.5 && (p.y - 300.0).abs() < 0.5);
+        hud.build(headless_input(800, 600, 0.0), &info, &mut config);
+        // Vertices tessellated: egui batches shapes into few meshes.
+        let vertices = |hud: &Hud| -> usize {
+            hud.frame
+                .as_ref()
+                .unwrap()
+                .0
+                .iter()
+                .map(|p| match &p.primitive {
+                    egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                    egui::epaint::Primitive::Callback(_) => 0,
+                })
+                .sum()
+        };
+        let viewing = vertices(&hud);
+        assert!(viewing > 0);
+        info.support.satellite = None;
+        info.support.wheel = None;
+        hud.build(headless_input(800, 600, 0.1), &info, &mut config);
+        // The view's rulers, grain and wheel are many more shapes than the
+        // HUD on foot.
+        assert!(vertices(&hud) * 2 < viewing, "{} {viewing}", vertices(&hud));
     }
 }

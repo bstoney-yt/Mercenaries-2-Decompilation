@@ -30,7 +30,8 @@ struct Post {
     params: vec4<f32>,
     // rgb: colour grade
     grade: vec4<f32>,
-    // xy: sampling step in texture coordinates
+    // xy: sampling step in texture coordinates, z: grain, w: the frame's
+    // number, for the grain
     step: vec4<f32>,
     // x: contrast, y: saturation, z: the luminance contrast pivots on,
     // w: 1 for the game's own tone map (below)
@@ -167,6 +168,24 @@ fn fs_adapt(v: Screen) -> @location(0) vec4<f32> {
     return vec4<f32>(mix(before, now, post.adapt.z), 0.0, 0.0, 1.0);
 }
 
+// A number in 0..1 for a pixel and a seed, from an integer hash.
+fn hash(p: vec2<u32>, seed: u32) -> f32 {
+    var h = p.x * 1664525u + p.y * 1013904223u + seed * 2654435761u;
+    h = (h ^ (h >> 16u)) * 2246822519u;
+    h = (h ^ (h >> 13u)) * 3266489917u;
+    h = h ^ (h >> 16u);
+    return f32(h) / 4294967295.0;
+}
+
+// The frame's grain at a pixel: specks two pixels square, new each frame.
+fn grain(at: vec4<f32>) -> f32 {
+    if post.step.z <= 0.0 {
+        return 0.0;
+    }
+    let speck = vec2<u32>(at.xy * 0.5);
+    return (hash(speck, u32(post.step.w)) - 0.5) * 2.0 * post.step.z;
+}
+
 // A display value (sRGB-encoded) as linear light, for the sRGB frame.
 fn display_to_linear(c: vec3<f32>) -> vec3<f32> {
     let low = c / 12.92;
@@ -198,6 +217,7 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
             m < 0.5,
         );
         d = mix(d, ramp, post.mono.a);
+        d = clamp(d + grain(v.position), vec3<f32>(0.0), vec3<f32>(1.0));
         return vec4<f32>(display_to_linear(d), 1.0);
     }
     // Contrast on luminance about a mid grey, keeping each colour's hue,
@@ -207,7 +227,10 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
     let toned = pivot * pow(max(y, 0.0) / pivot, post.tone.x);
     c = c * (toned / max(y, 1e-5));
     c = max(mix(vec3<f32>(toned), c, post.tone.y), vec3<f32>(0.0));
-    return vec4<f32>(c * post.grade.rgb, 1.0);
+    // Grain on linear values: about as strong as on display values at
+    // mid grey.
+    c = max(c * post.grade.rgb + grain(v.position), vec3<f32>(0.0));
+    return vec4<f32>(c, 1.0);
 }
 "#;
 
@@ -260,6 +283,8 @@ pub struct Post {
     /// Which `adapted` holds the last frame's, and when that was.
     parity: Cell<usize>,
     last: Cell<Option<Instant>>,
+    /// Frames drawn, seeding the grain.
+    frame: Cell<u32>,
 }
 
 /// A floating-point image `width` x `height` to draw into and sample.
@@ -399,6 +424,7 @@ impl Post {
             size: (width, height),
             parity: Cell::new(0),
             last: Cell::new(None),
+            frame: Cell::new(0),
         }
     }
 
@@ -555,6 +581,8 @@ impl Post {
         for level in 1..LUMINANCE.len() {
             steps[LOG_LUMINANCE + level] = [1.0 / LUMINANCE[level - 1] as f32; 2];
         }
+        let frame = self.frame.get() % 65536;
+        self.frame.set(frame + 1);
         for (buffer, step) in self.uniforms.iter().zip(steps) {
             let u = Uniforms {
                 params: if glowing {
@@ -563,7 +591,7 @@ impl Post {
                     [params[0], 0.0, 0.0, 0.0]
                 },
                 grade,
-                step: [step[0], step[1], 0.0, 0.0],
+                step: [step[0], step[1], lighting.grain, frame as f32],
                 tone: [
                     lighting.contrast,
                     lighting.saturation,

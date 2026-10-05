@@ -17,6 +17,7 @@ use crate::game::{Game, can_get_out, get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
+use crate::support::Phase;
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
@@ -38,6 +39,14 @@ const TAKE_NEAR: f32 = 40.0;
 /// from between these.
 const SHOOT_RANGE: f32 = 35.0;
 const BLAST_RANGE: (f32, f32) = (15.0, 45.0);
+/// With the grenade launcher, whose rounds reach about 40 m.
+const LOB_RANGE: (f32, f32) = (12.0, 32.0);
+/// What only a support strike brings down (the first contract's gates)
+/// she calls the bomb on from between these (metres): out of its frag's
+/// reach, and near enough that the satellite's view (5 m/s) is soon over
+/// it; she confirms the view within this of the target (metres).
+const CALL_FROM: (f32, f32) = (crate::combat::BOMB_FRAG.0 + 8.0, 90.0);
+const ON_SPOT: f32 = 0.5;
 /// A tank's cannon reaches this far, metres.
 const CANNON_RANGE: f32 = 90.0;
 /// She fires once aimed this long (seconds) and this close (radians); a
@@ -137,7 +146,7 @@ const LOG_WAY: f32 = 30.0;
 const OPEN_NEAR: f32 = 40.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
-const OPEN_FOR: f32 = 30.0;
+const OPEN_FOR: f32 = 45.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
 
@@ -155,6 +164,9 @@ enum Goal {
     /// Break open the supply crate `target` (the scripts' object) with a
     /// bash.
     Open(u32),
+    /// Take one thing a supply crate left (walking up to it), by its
+    /// [`Pickup::key`](crate::flights::Pickup::key).
+    Take((u32, u32)),
 }
 
 impl Goal {
@@ -165,6 +177,7 @@ impl Goal {
             | (Goal::Blast { target: a, .. }, Goal::Blast { target: b, .. }) => a == b,
             (Goal::Shoot(a), Goal::Shoot(b)) | (Goal::Board(a), Goal::Board(b)) => a == b,
             (Goal::Open(a), Goal::Open(b)) => a == b,
+            (Goal::Take(a), Goal::Take(b)) => a == b,
             _ => false,
         }
     }
@@ -230,6 +243,14 @@ pub struct Autoplay {
     /// gave up on.
     opening: Option<(u32, f32)>,
     left_shut: Vec<u32>,
+    /// The crate whose pickup she is going for and since when, and those
+    /// whose pickups she gave up on.
+    taking: Option<((u32, u32), f32)>,
+    left_lying: Vec<(u32, u32)>,
+    /// Fire as last pressed at the support (it takes presses, not holds),
+    /// and the support's step last logged.
+    tapped: bool,
+    support_logged: &'static str,
 }
 
 impl Autoplay {
@@ -299,13 +320,28 @@ impl Autoplay {
             self.next_report = self.clock + REPORT;
             self.report(game);
         }
+        let sturdy = |target: &u32| game.scene.props.sturdy.contains(target);
+        let striking = matches!(&self.goal, Some(Goal::Blast { target, .. }) if sturdy(target));
+        // A call she is no longer after is put away: the designator goes
+        // with a weapon taken up (twice from the satellite's view).
+        if !striking && (game.support.busy() || game.support.holding()) {
+            return Intent {
+                trigger: Trigger {
+                    select: Some(Weapon::Rifle),
+                    ..Trigger::default()
+                },
+                ..Intent::default()
+            };
+        }
         match self.goal.clone() {
             None => self.idle(game),
             Some(Goal::Reach { at, .. }) => self.travel(game, at, ARRIVE, dt),
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
+            Some(Goal::Blast { at, .. }) if striking => self.strike(game, at, dt),
             Some(Goal::Blast { at, .. }) => self.blast(game, at, dt),
             Some(Goal::Board(i)) => self.board(game, i, dt),
             Some(Goal::Open(target)) => self.open(game, target, dt),
+            Some(Goal::Take(key)) => self.take(game, key, dt),
         }
     }
 
@@ -335,6 +371,49 @@ impl Autoplay {
         fn nearest(ms: Vec<&Mark>, here: Vec3) -> Option<&Mark> {
             ms.into_iter()
                 .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
+        }
+        // A supply crate down near her or marked (or the one she set out
+        // to open): broken open first, for what is inside.
+        if driving.is_none()
+            && let Some((target, d)) = game
+                .scene
+                .flights
+                .crates_standing()
+                .filter(|g| !self.left_shut.contains(g))
+                .filter_map(|g| {
+                    let (at, _) = game.scene.flights.crate_standing(g)?;
+                    let d = at.distance(here);
+                    let wanted = live.iter().any(|m| m.target == g)
+                        || self.opening.is_some_and(|o| o.0 == g)
+                        || d < OPEN_NEAR;
+                    wanted.then_some((g, d))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            return Some((
+                Goal::Open(target),
+                format!("opening the supply crate {target:#x}, {d:.0} m off"),
+            ));
+        }
+        // What a crate she broke open left for her: taken before going on.
+        if driving.is_none()
+            && let Some((from, d)) = game
+                .scene
+                .flights
+                .pickups()
+                .iter()
+                .filter(|p| wanted(&game.combat, p) && !self.left_lying.contains(&p.key()))
+                .map(|p| (p.key(), p.at.distance(here)))
+                .filter(|&(_, d)| d < OPEN_NEAR)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            return Some((
+                Goal::Take(from),
+                format!(
+                    "taking the {:#x} left by {:#x}, {d:.1} m off",
+                    from.1, from.0
+                ),
+            ));
         }
         // What to destroy, nearest first: soldiers are shot, things blown up.
         let destroy: Vec<&Mark> = live
@@ -378,38 +457,22 @@ impl Autoplay {
                 .map(|t| t.transform_point3(Vec3::Y))
                 .or_else(|| game.scene.props.centre(m.target))
                 .unwrap_or(m.at + Vec3::Y);
+            let how = if game.scene.props.sturdy.contains(&m.target) {
+                "calling a satellite bomb on"
+            } else {
+                "blowing up"
+            };
             return Some((
                 Goal::Blast {
                     target: m.target,
                     at,
                 },
                 format!(
-                    "blowing up {} ({:#x}) at {at:.1}, {:.0} m off",
+                    "{how} {} ({:#x}) at {at:.1}, {:.0} m off",
                     m.name,
                     m.target,
                     at.distance(here)
                 ),
-            ));
-        }
-        // A supply crate down near her (or marked): broken open on the
-        // way, for what is inside.
-        if driving.is_none()
-            && let Some((target, d)) = game
-                .scene
-                .flights
-                .crates_standing()
-                .filter(|g| !self.left_shut.contains(g))
-                .filter_map(|g| {
-                    let (at, _) = game.scene.flights.crate_standing(g)?;
-                    let d = at.distance(here);
-                    let marked = live.iter().any(|m| m.target == g);
-                    (marked || d < OPEN_NEAR).then_some((g, d))
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-        {
-            return Some((
-                Goal::Open(target),
-                format!("opening the supply crate {target:#x}, {d:.0} m off"),
             ));
         }
         // The scripts' vehicles they mark: in, or by where it will be.
@@ -554,16 +617,68 @@ impl Autoplay {
         if to.length() > half + OPEN_FROM {
             return self.walk(game, at, half + OPEN_FROM, dt);
         }
+        // Standing, she turns only to aim: so she aims round to it, and
+        // bashes once she faces it.
         let yaw = to.x.atan2(to.z);
         let facing = wrap(yaw - p.facing).abs() < OPEN_FACING;
         Intent {
             look: turn_to(p, yaw, CRUISE_PITCH, dt),
             trigger: Trigger {
+                aim: true,
                 melee: facing,
                 ..Trigger::default()
             },
             ..Intent::default()
         }
+    }
+
+    /// Taking what a supply crate left (`key`, [`Pickup::key`]): walking
+    /// onto it and, within its reach, pressing the use key; left lying if
+    /// not taken after [`OPEN_FOR`] seconds.
+    ///
+    /// [`Pickup::key`]: crate::flights::Pickup::key
+    fn take(&mut self, game: &mut Game, key: (u32, u32), dt: f32) -> Intent {
+        let since = match self.taking {
+            Some((k, t)) if k == key => t,
+            _ => {
+                self.taking = Some((key, self.clock));
+                self.clock
+            }
+        };
+        let Some(p) = game
+            .scene
+            .flights
+            .pickups()
+            .iter()
+            .find(|p| p.key() == key)
+            .copied()
+        else {
+            return Intent::default();
+        };
+        if self.clock - since > OPEN_FOR {
+            eprintln!(
+                "autoplay {:.1} s: the {:#x} the supply crate {:#x} left at {:.1} was not taken: left lying",
+                self.clock, key.1, key.0, p.at
+            );
+            self.left_lying.push(key);
+            return Intent::default();
+        }
+        let here = game
+            .scene
+            .player
+            .as_ref()
+            .map_or(p.at, |pl| pl.character.position);
+        if (p.at - here).with_y(0.0).length() <= p.what.reach * 0.8 {
+            let press = self.pressed > PRESS_GAP;
+            if press {
+                self.pressed = 0.0;
+            }
+            return Intent {
+                use_pressed: press,
+                ..Intent::default()
+            };
+        }
+        self.walk(game, p.at, p.what.reach * 0.5, dt)
     }
 
     /// Nothing to do: stand, or stop the vehicle.
@@ -794,8 +909,9 @@ impl Autoplay {
         }
     }
 
-    /// Blowing up what stands at `at` with rockets: from between
-    /// [`BLAST_RANGE`]; from a tank, with its cannon.
+    /// Blowing up what stands at `at` with what she carries in the
+    /// launcher's place: rockets from between [`BLAST_RANGE`], grenades
+    /// from between [`LOB_RANGE`]; from a tank, with its cannon.
     fn blast(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
         if let Some(v) = game.scene.player.as_ref().and_then(|p| p.driving) {
             return self.at_target_driving(game, v, at, dt);
@@ -805,11 +921,13 @@ impl Autoplay {
         };
         let here = p.character.position;
         let d = at.distance(here);
-        if d > BLAST_RANGE.1 {
-            return self.walk(game, at, BLAST_RANGE.1 - 5.0, dt);
+        let lobbing = game.combat.second == Some(Weapon::GrenadeLauncher);
+        let (near, far) = if lobbing { LOB_RANGE } else { BLAST_RANGE };
+        if d > far {
+            return self.walk(game, at, far - 5.0, dt);
         }
-        if d < BLAST_RANGE.0 {
-            // Too close for a rocket: back off.
+        if d < near {
+            // Too close for a rocket or a round: back off.
             let away = here + (here - at).with_y(0.0).normalize_or(Vec3::X) * 10.0;
             return self.walk(game, away, 1.0, dt);
         }
@@ -835,12 +953,93 @@ impl Autoplay {
             walk: true,
             trigger: Trigger {
                 aim: true,
-                fire: clear && self.steady > STEADY && game.combat.weapon == Weapon::Rpg,
-                select: (game.combat.weapon != Weapon::Rpg).then_some(Weapon::Rpg),
+                fire: clear
+                    && self.steady > STEADY
+                    && Some(game.combat.weapon) == game.combat.second,
+                select: (Some(game.combat.weapon) != game.combat.second).then_some(Weapon::Rpg),
                 ..Trigger::default()
             },
             ..Intent::default()
         }
+    }
+
+    /// Brings down `at`, which only a support strike fells: from between
+    /// [`CALL_FROM`] off she calls the bomb as a player would (the support
+    /// key, the use key, the view steered over it and confirmed, the
+    /// wheel pressed in each wedge), then waits out of its reach.
+    fn strike(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
+        let flat = |a: Vec3| a.with_y(0.0).distance(at.with_y(0.0));
+        if let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) {
+            let speed = vehicle_state(game, i).map_or(0.0, |s| s.1);
+            let d = vehicle_at(game, i).map_or(0.0, |m| flat(m.w_axis.truncate()));
+            if d < CALL_FROM.1 {
+                return self.press(speed);
+            }
+            return self.drive(game, i, at, CALL_FROM.1 - 15.0, dt);
+        }
+        let Some(p) = game.scene.player.as_ref() else {
+            return Intent::default();
+        };
+        let here = p.character.position;
+        let d = flat(here);
+        let support = &game.support;
+        let step = match support.phase {
+            Phase::Idle => "idle",
+            Phase::Menu => "the support menu",
+            Phase::Holding { .. } => "the designator",
+            Phase::Viewing { .. } => "the satellite's view",
+            Phase::Timing { .. } => "the timing wheel",
+            Phase::Confirmed { .. } => "confirmed",
+        };
+        if step != self.support_logged {
+            self.support_logged = step;
+            eprintln!(
+                "autoplay {:.1} s: support: {step}, {d:.0} m from the target{}",
+                self.clock,
+                support
+                    .inbound()
+                    .map_or_else(String::new, |t| format!(", a bomb lands in {t:.1} s"))
+            );
+        }
+        let away = at + (here - at).with_y(0.0).normalize_or(Vec3::X) * (CALL_FROM.0 + 10.0);
+        let waiting = support.phase == Phase::Idle
+            && (support.inbound().is_some() || support.ready().is_none());
+        if waiting || support.phase == Phase::Idle {
+            if d < CALL_FROM.0 {
+                return self.walk(game, away, 2.0, dt);
+            }
+            if waiting {
+                return self.idle(game);
+            }
+            if d > CALL_FROM.1 {
+                return self.walk(game, at, CALL_FROM.1 - 15.0, dt);
+            }
+        }
+        let mut intent = Intent::default();
+        match support.phase {
+            Phase::Idle => intent.trigger.support = true,
+            Phase::Menu => intent.use_pressed = true,
+            // The view opens by itself.
+            Phase::Holding { .. } => {}
+            Phase::Viewing { at: view, .. } => {
+                let to = Vec2::new(at.x, at.z) - view;
+                if to.length() < ON_SPOT {
+                    intent.trigger.fire = self.tap();
+                } else {
+                    // Screen right is the world's -x, looking down.
+                    intent.movement = Vec2::new(-to.x, to.y).clamp_length_max(1.0);
+                }
+            }
+            Phase::Timing { .. } => intent.trigger.fire = support.wheel_ready() && self.tap(),
+            Phase::Confirmed { .. } => {}
+        }
+        intent
+    }
+
+    /// Fire pressed and let go on alternate ticks: presses, not a hold.
+    fn tap(&mut self) -> bool {
+        self.tapped = !self.tapped;
+        self.tapped
     }
 
     /// At a target from vehicle `i`: a cannon (a tank's, the Stryker's)
@@ -1279,6 +1478,18 @@ impl Autoplay {
                 .map(|(a, b)| format!("; {a:.0} to {b:.0}"))
                 .collect::<String>()
         )
+    }
+}
+
+/// Whether she wants what lies at `p`: a weapon she doesn't carry (one
+/// she left herself only once what took its place is spent), or rounds
+/// for one she does.
+fn wanted(combat: &Combat, p: &crate::flights::Pickup) -> bool {
+    match (p.what.weapon, p.what.gives) {
+        (Some(w), _) if p.from == 0 => combat.second != Some(w) && !combat.second_loaded(),
+        (Some(w), _) => combat.second != Some(w),
+        (None, Some((w, _))) => w == Weapon::Rifle || combat.second == Some(w),
+        (None, None) => false,
     }
 }
 

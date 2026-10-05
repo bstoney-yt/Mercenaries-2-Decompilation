@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use m2_engine::atmosphere::AtmosphereMix;
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{CatalogueEntry, Physics, StaticKey, VehicleControls, VehicleSpec, World};
-use m2_math::glam::{Mat4, Quat, Vec3, Vec4Swizzles};
+use m2_math::glam::{Mat4, Quat, Vec2, Vec3, Vec4, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
@@ -20,6 +20,7 @@ use crate::props::Props;
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
 use crate::startup::Startup;
+use crate::support::{self, Call, Impact, Support};
 use crate::ui::HudInfo;
 
 /// Where a vehicle of the layers stands.
@@ -73,6 +74,10 @@ const FLING: f32 = 1.1;
 const FLING_UP: f32 = 1.0;
 const TOPPLE: f32 = 0.3;
 
+/// A bomb lands on what it first meets falling from this far above her
+/// (metres).
+const BOMB_DROP: f32 = 600.0;
+
 #[derive(Debug)]
 pub struct Game {
     pub scene: Scene,
@@ -105,6 +110,10 @@ pub struct Game {
     pub sky: AtmosphereMix,
     /// Props that move on their own.
     moving: MovingProps,
+    /// Her support: the items she holds and the call under way; her
+    /// health when it last stepped (hurt, a call is called off).
+    pub support: Support,
+    support_hp: f32,
 }
 
 impl Game {
@@ -126,6 +135,8 @@ impl Game {
             spray_wait: 0.0,
             sky: AtmosphereMix::default(),
             moving: MovingProps::default(),
+            support: Support::default(),
+            support_hp: 0.0,
         }
     }
 
@@ -288,6 +299,9 @@ impl Game {
         self.moving.update(&mut self.scene, focus, dt);
         self.startup_props();
         self.fetch_world_vehicles(dt);
+        let intent = self.call_support(intent, dt);
+        // The use key at what lies within reach: taken with the fight's.
+        let mut taking = false;
         let scene = &mut self.scene;
         if let Some(world) = &mut scene.world {
             let streaming = world.stats().pending > 0;
@@ -314,6 +328,10 @@ impl Game {
                             get_out(physics, &scene.vehicles[i], player)
                         }
                         Some(_) => {}
+                        // What lies within reach before any vehicle.
+                        None if scene.flights.within(player.character.position).is_some() => {
+                            taking = true;
+                        }
                         None => {
                             player.driving = nearest(physics, &scene.vehicles, player, REACH);
                             // Seated: she no longer waits to land (people
@@ -488,7 +506,13 @@ impl Game {
             world
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
-            blast_loose(world, &mut scene.props, &self.combat.went_off);
+            blast_loose(
+                world,
+                &mut scene.props,
+                &self.combat.went_off,
+                combat::REACH,
+                false,
+            );
             // A supply crate broken open: a puff of dust off its boards.
             let broken = scene.flights.strike(
                 &mut world.physics,
@@ -504,8 +528,107 @@ impl Game {
                     1.2,
                 );
             }
+            // What a broken crate left, taken with the use key from
+            // within its reach.
+            if taking
+                && player.driving.is_none()
+                && let Some(p) = scene.flights.take_within(player.character.position)
+            {
+                take_up(
+                    &mut self.combat,
+                    &mut scene.flights,
+                    &world.index.template_db,
+                    player,
+                    p,
+                );
+            }
         }
+        self.support_impacts();
         self.scene.tick(dt);
+    }
+
+    /// Her support call this tick ([`crate::support`]): on foot, the
+    /// support key, the use key and fire go to it while it is under way,
+    /// and the view's steering; what is left of `intent` is hers.
+    fn call_support(&mut self, mut intent: Intent, dt: f32) -> Intent {
+        let her = self
+            .scene
+            .player
+            .as_ref()
+            .filter(|p| self.on_foot && p.landed && p.driving.is_none() && !p.down);
+        let at = her
+            .map(|p| p.character.position)
+            .unwrap_or(self.camera.position);
+        let hp = self.combat.hp;
+        let call = match her {
+            Some(_) => Call {
+                menu: intent.trigger.support,
+                use_pressed: intent.use_pressed,
+                fire: intent.trigger.fire,
+                steer: intent.movement,
+                look: intent.look,
+                select: intent.trigger.select.is_some(),
+                hurt: hp < self.support_hp,
+            },
+            None => Call::default(),
+        };
+        self.support_hp = hp;
+        let before = self.support.busy();
+        // In a vehicle, down or flying the camera, a call is dropped.
+        if her.is_none() && self.support.phase != support::Phase::Idle {
+            self.support.phase = support::Phase::Idle;
+        }
+        self.support.step(call, at, dt);
+        self.combat.designator = self.support.holding() || self.support.looking().is_some();
+        if before || self.support.busy() {
+            // At the menu, the designator in her hands or looking through
+            // the satellite, she stands, and fire is the satellite's.
+            intent = Intent::default();
+        }
+        intent
+    }
+
+    /// What the support brought down this step: the bomb on what it
+    /// first meets at the spot, its blast through the fight, and what
+    /// comes loose thrown (the sturdy too).
+    fn support_impacts(&mut self) {
+        if self.support.landed.is_empty() {
+            return;
+        }
+        let scene = &mut self.scene;
+        let (Some(world), Some(player)) = (&mut scene.world, &mut scene.player) else {
+            return;
+        };
+        let high = player.character.position.y + BOMB_DROP;
+        for impact in self.support.landed.clone() {
+            let Vec2 { x, y: z } = impact.at();
+            let top = Vec3::new(x, high, z);
+            let at = world
+                .physics
+                .cast_ray(top, Vec3::NEG_Y, BOMB_DROP * 2.0)
+                .map_or(Vec3::new(x, player.character.position.y, z), |(d, _)| {
+                    top - Vec3::Y * d
+                });
+            let mut field = Field {
+                physics: &mut world.physics,
+                player,
+                people: &mut scene.people,
+                vehicles: &mut scene.vehicles,
+                arsenal: &scene.arsenal,
+                explosives: &mut scene.explosives,
+            };
+            match impact {
+                Impact::Bomb(_) => {
+                    eprintln!("support: the bomb lands at {at:.1}");
+                    self.combat.bomb(&mut field, at);
+                    blast_loose(world, &mut scene.props, &[at], combat::BOMB.0, true);
+                }
+                Impact::Final(_) => self.combat.final_strike(&mut field, at),
+            }
+            world
+                .destroyed
+                .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
+        }
     }
 
     /// The game as it stands, to save; `None` without an island or player.
@@ -550,8 +673,20 @@ impl Game {
                 weapon: match self.combat.weapon {
                     Weapon::Rifle => "rifle",
                     Weapon::Rpg => "rpg",
+                    Weapon::GrenadeLauncher => "grenade launcher",
                 }
                 .into(),
+                second: match self.combat.second {
+                    Some(Weapon::GrenadeLauncher) => "grenade launcher",
+                    Some(_) => "rpg",
+                    None => "",
+                }
+                .into(),
+                launcher: self
+                    .combat
+                    .launcher_rounds
+                    .filter(|_| self.combat.second == Some(Weapon::GrenadeLauncher))
+                    .map(|r| [r.clip, r.stored]),
             },
             vehicles,
             killed: self.scene.people.all_killed(),
@@ -584,10 +719,17 @@ impl Game {
         player.pitch = p.pitch;
         self.combat = Combat::default();
         self.combat.hp = p.hp.clamp(1.0, 100.0);
-        self.combat.weapon = if p.weapon == "rpg" {
-            Weapon::Rpg
-        } else {
-            Weapon::Rifle
+        match (p.second.as_str(), p.launcher) {
+            ("grenade launcher", Some([clip, stored])) => {
+                self.combat.equip(Weapon::GrenadeLauncher, 0);
+                self.combat.launcher_rounds = Some(combat::Rounds { clip, stored });
+            }
+            ("rpg", _) => {}
+            _ => self.combat.carbine_only(),
+        }
+        self.combat.weapon = match (p.weapon.as_str(), self.combat.second) {
+            ("rpg" | "grenade launcher", Some(w)) => w,
+            _ => Weapon::Rifle,
         };
         self.scene.people.reset(save.killed);
         self.restore = save.vehicles;
@@ -643,15 +785,44 @@ impl Game {
             }
             _ => None,
         };
+        // What the use key takes, as the game words it.
+        let prompt = match (&self.scene.world, player) {
+            (Some(w), Some(p)) if p.driving.is_none() && p.landed && self.on_foot => self
+                .scene
+                .flights
+                .within(p.character.position)
+                .map(|p| match p.what.weapon {
+                    Some(weapon) => format!(
+                        "Equip {}",
+                        w.index
+                            .template_db
+                            .by_id(p.what.template)
+                            .map_or_else(|| format!("{weapon:?}"), |t| t.0.to_owned())
+                    ),
+                    None => "Take Ammo".to_owned(),
+                }),
+            _ => None,
+        };
         HudInfo {
             playing: self.on_foot && player.is_some(),
             hp: self.combat.hp,
             down: self.combat.down > 0.0,
             weapon: self.combat.weapon,
+            second: self.combat.second,
+            rounds: self
+                .combat
+                .launcher_rounds
+                .filter(|_| self.combat.weapon == Weapon::GrenadeLauncher)
+                .map(|r| (r.clip, r.stored)),
+            // Looking through the satellite, its own overlay is shown.
+            prompt: prompt.filter(|_| !self.support.busy()),
             driving,
-            crosshair,
-            can_enter,
+            crosshair: crosshair.filter(|_| self.support.looking().is_none()),
+            can_enter: can_enter.filter(|_| !self.support.busy()),
             loading,
+            support: self
+                .support
+                .hud(player.map_or(self.camera.position.y, |p| p.character.position.y)),
             ..HudInfo::default()
         }
     }
@@ -798,11 +969,21 @@ impl Game {
         }
     }
 
+    /// Where the frame is seen from: her camera (shaken by a bomb close
+    /// by), the satellite's while she looks through it, or the free one.
     pub fn view(&self, fov: f32, aspect: f32) -> View {
         let mut view = match self.walking() {
-            Some(p) => p.view(fov, aspect),
+            Some(p) => match self.support.looking() {
+                Some(at) => support::satellite_view(at, p.character.position.y, aspect),
+                None => p.view(fov, aspect),
+            },
             None => self.camera.view(fov, aspect),
         };
+        if let Some((a, b)) = self.support.shake_turn()
+            && self.support.looking().is_none()
+        {
+            view.view = Mat4::from_rotation_x(a) * Mat4::from_rotation_y(b) * view.view;
+        }
         // The island's own ambient light, sunlight strength, haze and
         // clouds.
         if let Some(world) = &self.scene.world {
@@ -813,8 +994,22 @@ impl Game {
         }
         finish(&mut view.lighting);
         post_override(&mut view.lighting);
+        if self.support.looking().is_some() {
+            satellite_look(&mut view.lighting);
+        }
         view
     }
+}
+
+/// The satellite's picture, as the first contract's videos show it: grey,
+/// its colours nearly gone, and grainy. Grey and grain are matched by eye
+/// to the videos, not read from the game.
+fn satellite_look(lighting: &mut m2_render::Lighting) {
+    // The game's tone map takes the monochrome ramp, the fitted pass its
+    // saturation.
+    lighting.monochrome = Some(Vec4::new(0.46, 0.46, 0.44, 0.9));
+    lighting.saturation *= 0.1;
+    lighting.grain = 0.07;
 }
 
 /// The finishing pass, fitted to footage of the game: whole-frame
@@ -914,6 +1109,76 @@ fn post_override(lighting: &mut m2_render::Lighting) {
 
 /// How close she must be to a vehicle's door (or side) to get in, metres.
 const REACH: f32 = 4.0;
+
+/// A weapon she leaves for another lies this far to her right, metres.
+const LEFT_BESIDE: f32 = 0.6;
+
+/// What she takes from a pickup: a weapon is taken up in the launcher's
+/// place (what she carried there left lying beside her, to be taken
+/// back), ammunition goes with its weapon.
+fn take_up(
+    combat: &mut Combat,
+    flights: &mut crate::flights::Flights,
+    templates: &m2_engine::Templates,
+    player: &Player,
+    p: crate::flights::Pickup,
+) {
+    let rounds = p.what.gives.map_or(0, |(_, n)| n);
+    let Some(weapon) = p.what.weapon else {
+        if let Some((w, n)) = p.what.gives {
+            combat.take_ammo(w, n);
+        }
+        eprintln!(
+            "pickup: she takes {:#x} at {:.1}{}",
+            p.what.template,
+            p.at,
+            p.what.gives.map_or(String::new(), |(w, n)| format!(
+                ": {n} rounds for her {w:?}"
+            ))
+        );
+        return;
+    };
+    let left = combat.equip(weapon, rounds);
+    eprintln!(
+        "pickup: she takes up the {weapon:?} ({:#x}) at {:.1} with {rounds} rounds{}",
+        p.what.template,
+        p.at,
+        match left {
+            Some((w, 0)) => format!(", leaving her {w:?}"),
+            Some((w, n)) => format!(", leaving her {w:?} with {n} rounds"),
+            None => String::new(),
+        }
+    );
+    let Some((left, kept)) = left else {
+        return;
+    };
+    let model = m2_assets::name_hash(left.model_name());
+    // Its template: the pickup with its model (the lowest id of several).
+    let template = templates
+        .leavings
+        .pickups
+        .iter()
+        .filter(|(id, _)| {
+            templates
+                .by_id(**id)
+                .is_some_and(|(_, t)| t.model == Some(model))
+        })
+        .min_by_key(|(id, _)| **id);
+    let (sin, cos) = player.facing.sin_cos();
+    let right = Vec3::new(-cos, 0.0, sin);
+    flights.leave(crate::flights::Pickup {
+        from: 0,
+        what: crate::flights::Leaves {
+            template: template.map_or(0, |(id, _)| *id),
+            model: Some(model),
+            reach: template.map_or(1.0, |(_, info)| info.radius),
+            weapon: Some(left),
+            gives: Some((left, kept)),
+        },
+        at: player.character.position + right * LEFT_BESIDE,
+        yaw: player.facing,
+    });
+}
 
 /// Parking: the first spot looked at is this far ahead of her; spots are
 /// tried on a grid this fine, out to this far.
@@ -1058,7 +1323,7 @@ fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle])
             let topple = Vec3::Y.cross(ahead.normalize_or_zero()) * (ahead.length() * TOPPLE);
             let knocked = match key {
                 StaticKey::Object(i) => world.knock(i, fling, topple),
-                StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple),
+                StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
                 _ => false,
             };
             if knocked {
@@ -1077,27 +1342,28 @@ fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle])
     }
 }
 
-/// Blasts knock loose what comes loose within their reach (as far as they
-/// hurt people), thrown out and up as people are, harder the nearer.
-fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3]) {
+/// Blasts knock loose what comes loose within `reach` (as far as they
+/// hurt people), thrown out and up as people are, harder the nearer; a
+/// support `strike`'s the sturdy too.
+fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32, strike: bool) {
     let thrown = |blast: Vec3, at: Vec3, d: f32| {
-        let near = (1.0 - d / combat::REACH).clamp(0.0, 1.0);
+        let near = (1.0 - d / reach).clamp(0.0, 1.0);
         let away = (at - blast).with_y(0.0).normalize_or(Vec3::X);
         let (out, up) = combat::BLAST_PUSH;
         let velocity = away * (out * near + 1.0) + Vec3::Y * (up * near + 1.0);
         (velocity, Vec3::Y.cross(away) * (TOPPLE * out * near))
     };
     for &at in blasts {
-        for (i, d) in world.loose_near(at, combat::REACH) {
+        for (i, d) in world.loose_near(at, reach) {
             let (velocity, spin) = thrown(at, world.index.objects[i].position, d);
             world.knock(i, velocity, spin);
         }
-        for (e, d) in props.loose_near(&world.physics, at, combat::REACH) {
+        for (e, d) in props.loose_near(&world.physics, at, reach, strike) {
             let Some(p) = props.get(e).map(|(p, _)| p.position) else {
                 continue;
             };
             let (velocity, spin) = thrown(at, p, d);
-            props.knock(&mut world.physics, e, velocity, spin);
+            props.knock(&mut world.physics, e, velocity, spin, strike);
         }
     }
 }

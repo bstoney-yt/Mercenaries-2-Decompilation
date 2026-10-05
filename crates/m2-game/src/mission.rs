@@ -506,6 +506,17 @@ impl Mission {
         self.events.kinds()
     }
 
+    /// The names the scripts' pending `ScriptEvent` events wait for.
+    pub fn awaited_posts(&self) -> Vec<String> {
+        self.events.awaited()
+    }
+
+    /// Posts a script event as the engine does (`Event.Post(name)`): the
+    /// scripts waiting for it hear of it at the next tick.
+    pub fn post(&mut self, name: &str) {
+        self.events.post(name);
+    }
+
     /// Logs what happened, then carries out layer requests and deliveries
     /// (at once) and logs what their callbacks did, until nothing is left.
     fn settle(&mut self, when: &str) {
