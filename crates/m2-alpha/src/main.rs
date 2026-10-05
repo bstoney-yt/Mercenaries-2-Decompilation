@@ -553,18 +553,29 @@ fn screenshot(
     // And for the vehicles and people, and the people to find their feet,
     // and for the vehicles to be parked by her (a look for a spot can take
     // a while: not timed). The island's own vehicles get half a minute, as
-    // one may fail.
+    // one may fail, and the props within reach two minutes: the frames
+    // are timed as play goes, not as the island first loads.
     while game.scene.world.is_some()
         && (game.scene.vehicles_loading()
             || (game.on_foot
                 && game.scene.player.as_ref().is_some_and(|p| p.landed)
                 && !game.parking_done())
-            || (game.island_vehicles_loading() && started.elapsed() < Duration::from_secs(30)))
+            || (game.island_vehicles_loading() && started.elapsed() < Duration::from_secs(30))
+            || (!game.scene.props.settled() && started.elapsed() < Duration::from_secs(120)))
         && started.elapsed() < Duration::from_secs(300)
     {
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
+    eprintln!(
+        "props within reach {} after {:.1} s",
+        if game.scene.props.settled() {
+            "loaded"
+        } else {
+            "still loading"
+        },
+        started.elapsed().as_secs_f32()
+    );
     // The last frames are timed: the frame rate here, for checking.
     // Where the time goes: the tick, streaming, building the draws, and
     // submitting the frame.

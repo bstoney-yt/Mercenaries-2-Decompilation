@@ -57,6 +57,8 @@ pub struct Props {
     near: Option<Near>,
     /// Changes to those shown (put up, taken down, moved, gone).
     changes: u64,
+    /// How far from the focus models were last wanted (metres).
+    reach: f32,
 }
 
 /// For each model not yet loaded, how far (squared) the nearest shown prop
@@ -211,6 +213,20 @@ impl Props {
         self.shown.iter().map(|(&e, p)| (e, p))
     }
 
+    /// Whether every model wanted within reach (as last asked) has loaded
+    /// or failed: none is being loaded, and none waits within reach.
+    pub fn settled(&self) -> bool {
+        let within = self.reach * self.reach;
+        self.asked.is_empty()
+            && self.decoded.is_empty()
+            && (self.waiting.is_empty()
+                || self.near.as_ref().is_some_and(|n| {
+                    self.waiting
+                        .iter()
+                        .all(|h| n.by_model.get(h).is_none_or(|&d| d > within))
+                }))
+    }
+
     /// How many are shown, and of the models they use how many have
     /// loaded, are loading, wait to be loaded and failed.
     pub fn counts(&self) -> (usize, usize, usize, usize, usize) {
@@ -238,6 +254,7 @@ impl Props {
         focus: Vec3,
         reach: f32,
     ) -> anyhow::Result<()> {
+        self.reach = reach;
         let Some(loaders) = &self.loaders else {
             return Ok(());
         };
