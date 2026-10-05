@@ -1748,7 +1748,7 @@ impl WgpuBackend {
                 l.clouds.wind[0],
                 l.clouds.wind[1],
                 if l.clouds.noise.is_some() && l.clouds.coverage > 0.0 {
-                    1.0
+                    if l.clouds.horizon_fade { 1.0 } else { 2.0 }
                 } else {
                     0.0
                 },
@@ -1763,7 +1763,7 @@ impl WgpuBackend {
                 0.0,
                 0.0,
             ],
-            cloud_tone: l.clouds.tone.extend(1.0).to_array(),
+            cloud_tone: l.clouds.tone.extend(l.clouds.opacity).to_array(),
             haze_layers: l.haze.layers.unwrap_or([0.0; 4]),
         };
         self.queue

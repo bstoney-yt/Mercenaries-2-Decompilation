@@ -395,6 +395,15 @@ impl Atmosphere {
             self.coverage
         };
         lighting.clouds.scales = self.cloud_scales;
+        // `M2_CLOUD_FADE=off` runs the deck on to the horizon.
+        lighting.clouds.horizon_fade = !env_is("M2_CLOUD_FADE", "off");
+        // `M2_CLOUD_OPACITY` overrides how opaque the thickest cloud is.
+        if let Some(o) = std::env::var("M2_CLOUD_OPACITY")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+        {
+            lighting.clouds.opacity = o.clamp(0.0, 1.0);
+        }
         lighting.clouds.wind = self.wind;
         lighting.water_ramp = self.water_ramp;
         lighting.tone_map = self.tone_map;
