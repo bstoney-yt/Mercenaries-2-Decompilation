@@ -40,6 +40,7 @@ mod camera;
 mod combat;
 mod config;
 mod game;
+mod gamehud;
 mod input;
 mod mission;
 mod npc;
@@ -138,6 +139,8 @@ struct Options {
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
+    /// Our stand-in HUD instead of the game's own.
+    old_hud: bool,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -224,6 +227,7 @@ fn parse_args() -> anyhow::Result<Options> {
                     .to_radians()
             }
             "--mission" => o.mission = true,
+            "--old-hud" => o.old_hud = true,
             "--mission-driver" => {
                 let path = value()?;
                 let code =
@@ -378,6 +382,7 @@ fn main() -> anyhow::Result<()> {
         fly: options.fly,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
+        old_hud: options.old_hud,
         state: None,
         error: None,
     };
@@ -458,6 +463,15 @@ fn build_scene(
 
 /// What the HUD shows: the game's, with the mission's objectives and the
 /// view their markers are placed with.
+/// The game's own HUD, on the island with the game's files (unless
+/// `--old-hud`).
+fn game_hud(install: Option<&Install>, mode: &Mode, old: bool) -> Option<gamehud::GameHud> {
+    match (install, mode) {
+        (Some(install), Mode::Island(_)) if !old => Some(gamehud::GameHud::start(install)),
+        _ => None,
+    }
+}
+
 fn hud_info(
     game: &Game,
     mission: Option<&mission::MissionLink>,
@@ -771,10 +785,17 @@ fn screenshot(
     if let (Some(reach), Some(link)) = (options.mission_look, &link) {
         look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
     }
-    // The picture, with the HUD.
+    // The picture, with the HUD (the game's, once its scripts have
+    // started and run half a second).
     let mut hud = ui::Hud::new();
+    hud.game = game_hud(install, mode, options.old_hud);
     let mut settings = config.clone();
-    let info = hud_info(&game, link.as_ref(), fov, aspect);
+    let mut info = hud_info(&game, link.as_ref(), fov, aspect);
+    if hud.game.is_some() {
+        info.game = Some(gamehud::HudState::of(&mut game));
+        hud.settle(&info, (w, h), 0.5, Duration::from_secs(120));
+        info.game = Some(gamehud::HudState::of(&mut game));
+    }
     let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
     let rgba = backend.read_pixels()?;
@@ -1703,6 +1724,8 @@ struct App {
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
     mission_drivers: Vec<(String, String)>,
+    /// Our stand-in HUD instead of the game's own.
+    old_hud: bool,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -1734,7 +1757,8 @@ impl App {
             game.on_foot = false;
         }
         let focused = window.has_focus();
-        let hud = ui::Hud::new();
+        let mut hud = ui::Hud::new();
+        hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud);
         let egui = egui_winit::State::new(
             hud.ctx.clone(),
             egui::ViewportId::ROOT,
@@ -1806,12 +1830,15 @@ impl Running {
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
         let (w, h) = self.backend.size();
-        let info = hud_info(
+        let mut info = hud_info(
             &self.game,
             self.mission.as_ref(),
             config.camera.fov,
             w as f32 / h as f32,
         );
+        if self.hud.game.is_some() {
+            info.game = Some(gamehud::HudState::of(&mut self.game));
+        }
         let (action, output) = self.hud.build(input, &info, config);
         self.egui.handle_platform_output(&self.window, output);
         if config.window.vsync != vsync {
