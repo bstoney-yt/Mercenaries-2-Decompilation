@@ -192,6 +192,9 @@ pub struct MaterialDesc {
     pub water_sky: f32,
     /// Water: scale on its waves' heights, so their slopes (1: as drawn).
     pub water_waves: f32,
+    /// Water: waves fade where a pixel spans more than 2 / this of their
+    /// wavelength (fully at 1 / this).
+    pub water_fade: f32,
 }
 
 /// A reflection of the surroundings, along the view mirrored in the
@@ -277,6 +280,7 @@ impl Default for MaterialDesc {
             water: false,
             water_sky: 1.0,
             water_waves: 1.0,
+            water_fade: 8.0,
         }
     }
 }
