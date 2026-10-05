@@ -15,6 +15,7 @@ use m2_engine::{CollisionShape, GpuModel, Physics, StaticKey};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::DrawQueue;
 
+use crate::combat::Strike;
 use crate::scene::ParkedVehicle;
 
 /// Cruising speed, m/s, and how quickly it speeds up and slows down,
@@ -69,6 +70,11 @@ const LOAD_HEIGHT: f32 = 2.0;
 const GROUND_SLACK: f32 = 15.0;
 /// Downward acceleration of a crate let go, m/s².
 const GRAVITY: f32 = 9.81;
+/// A delivered crate's health (the first contract's supply drop's
+/// template gives it 100): blows and rounds that take it to nothing break
+/// it open, as does a blast this near, metres.
+const CRATE_HP: f32 = 100.0;
+const CRATE_BLAST: f32 = 6.0;
 
 /// A helicopter or crate model, once loaded: drawn with its rotors turning.
 pub struct FlightModel {
@@ -142,7 +148,8 @@ struct Flight {
     released: bool,
 }
 
-/// A crate let go: falling, then lying where it landed.
+/// A crate let go: falling, then lying where it landed, until broken
+/// open.
 #[derive(Debug)]
 struct Crate {
     guid: u32,
@@ -150,6 +157,10 @@ struct Crate {
     at: Vec3,
     yaw: f32,
     falling: Option<f32>,
+    hp: f32,
+    /// Broken open: drawn wrecked (if its model has a wreck), no longer
+    /// in the way.
+    broken: bool,
 }
 
 /// A load let go: the pilot whose delivery it was and where (for the
@@ -170,6 +181,8 @@ pub struct Flights {
     models: HashMap<u32, Option<FlightModel>>,
     /// Wanted and not yet asked for.
     wanted: Vec<u32>,
+    /// Crates broken open since [`take_broken`](Self::take_broken).
+    broken: Vec<(u32, Vec3)>,
 }
 
 impl std::fmt::Debug for Flights {
@@ -253,6 +266,74 @@ impl Flights {
         self.crates.retain(|c| c.guid != guid);
     }
 
+    /// Blows and rounds (`struck`) and blasts reach the crates down: one
+    /// taken to no health or caught in a blast breaks open and no longer
+    /// stands in the way. Returns those broken now (guid, where).
+    pub fn strike(
+        &mut self,
+        physics: &mut Physics,
+        struck: &[Strike],
+        blasts: &[Vec3],
+    ) -> Vec<(u32, Vec3)> {
+        let mut now = Vec::new();
+        for c in self
+            .crates
+            .iter_mut()
+            .filter(|c| c.falling.is_none() && !c.broken)
+        {
+            let key = StaticKey::Entity(c.guid);
+            c.hp -= struck
+                .iter()
+                .filter(|s| s.key == Some(key))
+                .map(|s| s.damage)
+                .sum::<f32>();
+            if blasts.iter().any(|b| b.distance(c.at) < CRATE_BLAST) {
+                c.hp = 0.0;
+            }
+            if c.hp <= 0.0 {
+                c.broken = true;
+                physics.remove_static(key);
+                now.push((c.guid, c.at));
+            }
+        }
+        self.broken.extend(&now);
+        now
+    }
+
+    /// The crates broken open since the last call: each one's guid and
+    /// where it stood.
+    pub fn take_broken(&mut self) -> Vec<(u32, Vec3)> {
+        std::mem::take(&mut self.broken)
+    }
+
+    /// Where crate `guid` stands, down and whole: its box's middle and
+    /// how far its sides are from it across the ground (the larger),
+    /// metres.
+    pub fn crate_standing(&self, guid: u32) -> Option<(Vec3, f32)> {
+        let c = self
+            .crates
+            .iter()
+            .find(|c| c.guid == guid && c.falling.is_none() && !c.broken)?;
+        let (lo, hi) = self
+            .models
+            .get(&c.model)
+            .and_then(Option::as_ref)
+            .map_or((Vec3::new(-0.5, 0.0, -0.5), Vec3::splat(0.5)), |m| {
+                m.gpu.bounds
+            });
+        let turn = Quat::from_rotation_y(c.yaw);
+        let half = (hi - lo) * 0.5;
+        Some((c.at + turn * ((lo + hi) * 0.5), half.x.max(half.z)))
+    }
+
+    /// The crates down and whole: each one's guid.
+    pub fn crates_standing(&self) -> impl Iterator<Item = u32> + '_ {
+        self.crates
+            .iter()
+            .filter(|c| c.falling.is_none() && !c.broken)
+            .map(|c| c.guid)
+    }
+
     /// Whether `pilot` is flying a delivery.
     pub fn flying(&self, pilot: u32) -> bool {
         self.flights.iter().any(|f| f.pilot == pilot)
@@ -272,6 +353,27 @@ impl Flights {
             .iter()
             .filter(|f| f.phase == Phase::Hovering)
             .map(|f| (f.copter, f.at, f.to))
+            .collect()
+    }
+
+    /// What hangs from helicopter `copter`: each load, where it hangs
+    /// (its origin) and, for a vehicle, which of the scene's it is (none
+    /// while its model loads, when only its cable is drawn).
+    pub fn hung_from(
+        &self,
+        copter: u32,
+        vehicles: &[ParkedVehicle],
+    ) -> Vec<(Load, Vec3, Option<usize>)> {
+        self.flights
+            .iter()
+            .filter(|f| f.copter == copter && !f.released)
+            .flat_map(|f| {
+                f.loads.iter().map(move |l| {
+                    let (at, _) = self.hanging(f, l, vehicles);
+                    let found = vehicles.iter().position(|v| v.guid == Some(l.guid));
+                    (*l, at, found)
+                })
+            })
             .collect()
     }
 
@@ -442,6 +544,8 @@ impl Flights {
                         at,
                         yaw,
                         falling: Some(0.0),
+                        hp: CRATE_HP,
+                        broken: false,
                     }),
                     None => {
                         if let Some(v) = vehicles
@@ -539,10 +643,13 @@ impl Flights {
             }
         }
         for c in &self.crates {
-            if let Some(m) = self.models.get(&c.model).and_then(Option::as_ref) {
-                m.gpu.draw(
+            if let Some(m) = self.models.get(&c.model).and_then(Option::as_ref)
+                && (!c.broken || m.gpu.has_wreck())
+            {
+                m.gpu.draw_as(
                     queue,
                     Mat4::from_rotation_translation(Quat::from_rotation_y(c.yaw), c.at),
+                    c.broken,
                 );
             }
         }
@@ -671,6 +778,53 @@ mod tests {
             flights.step(dt, &mut physics, &mut [], Vec3::ZERO);
         }
         assert!(!flights.flying(2));
+    }
+
+    #[test]
+    fn a_crate_down_breaks_open_to_a_blow_or_a_blast() {
+        let mut physics = Physics::new();
+        let floor = CollisionShape::cuboid(Vec3::new(500.0, 1.0, 500.0));
+        physics.add_static(
+            StaticKey::Cell(1),
+            &floor,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let mut flights = Flights::default();
+        let crates = [3, 4].map(|guid| Load {
+            guid,
+            model: Some(99),
+        });
+        flights.start(
+            COPTER,
+            crates.to_vec(),
+            Vec3::new(0.0, 30.0, 0.0),
+            Vec3::new(0.0, 0.0, 60.0),
+        );
+        for _ in 0..60 * 60 {
+            flights.step(1.0 / 60.0, &mut physics, &mut [], Vec3::ZERO);
+            if flights.crates_standing().count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(flights.crates_standing().count(), 2, "both down");
+        let hit = |damage| Strike {
+            at: Vec3::ZERO,
+            damage,
+            key: Some(StaticKey::Entity(3)),
+        };
+        // A round chips it; a bash breaks it open.
+        assert!(flights.strike(&mut physics, &[hit(34.0)], &[]).is_empty());
+        let broke = flights.strike(&mut physics, &[hit(100.0)], &[]);
+        assert_eq!(broke.iter().map(|b| b.0).collect::<Vec<_>>(), [3]);
+        assert!(flights.crate_standing(3).is_none());
+        // A blast beside the other.
+        let (at, _) = flights.crate_standing(4).expect("still whole");
+        let broke = flights.strike(&mut physics, &[], &[at + Vec3::X * 3.0]);
+        assert_eq!(broke.iter().map(|b| b.0).collect::<Vec<_>>(), [4]);
+        assert_eq!(flights.take_broken().len(), 2);
+        assert!(flights.take_broken().is_empty());
     }
 
     #[test]

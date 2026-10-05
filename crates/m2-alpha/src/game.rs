@@ -478,6 +478,21 @@ impl Game {
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
             blast_loose(world, &mut scene.props, &self.combat.went_off);
+            // A supply crate broken open: a puff of dust off its boards.
+            let broken = scene.flights.strike(
+                &mut world.physics,
+                &self.combat.struck,
+                &self.combat.went_off,
+            );
+            for (_, at) in broken {
+                self.combat.show(
+                    Effect::Smoke {
+                        at: at + Vec3::Y * 0.6,
+                        size: 1.4,
+                    },
+                    1.2,
+                );
+            }
         }
         self.scene.tick(dt);
     }

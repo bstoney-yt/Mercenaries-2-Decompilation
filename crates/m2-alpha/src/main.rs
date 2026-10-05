@@ -102,7 +102,10 @@ struct Options {
     jump: bool,
     /// With `--screenshot` on foot: throw a grenade just before it.
     throw: bool,
-    /// With `--jump` or `--throw`: seconds before the picture she starts.
+    /// With `--screenshot` on foot: bash just before it.
+    bash: bool,
+    /// With `--jump`, `--throw` or `--bash`: seconds before the picture she
+    /// starts.
     lead: Option<f32>,
     fight: bool,
     /// With `--screenshot`: rocket the nearest fuel tank or barrel.
@@ -218,6 +221,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--drive" => o.drive = true,
             "--jump" => o.jump = true,
             "--throw" => o.throw = true,
+            "--bash" => o.bash = true,
             "--lead" => o.lead = Some(value()?.parse().context("--lead expects seconds")?),
             "--fight" => o.fight = true,
             "--blast" => o.blast = true,
@@ -728,7 +732,7 @@ fn screenshot(
             ..Intent::default()
         };
         let from = game.scene.player.as_ref().map(|p| p.character.position);
-        // A jump or throw starts this many ticks before the picture.
+        // A jump, throw or bash starts this many ticks before the picture.
         let lead = (options.lead.unwrap_or(0.2) * 60.0)
             .round()
             .clamp(1.0, 179.0) as usize;
@@ -748,6 +752,7 @@ fn screenshot(
                 // The last shot's flash is still up for the picture.
                 fire: options.fire && i == 177,
                 throw: options.throw && i == 180 - lead,
+                melee: options.bash && i == 180 - lead,
                 select: options.weapon.filter(|_| i == 0),
             };
             game.step(
@@ -767,7 +772,7 @@ fn screenshot(
         if let (Some(p), Some(from)) = (&game.scene.player, from) {
             let hash = |c: usize| p.model.as_ref().map_or(0, |(_, r)| r.clips[c].hash);
             eprintln!(
-                "player: {:?} from {from:.2} to {:.2}, grounded {}, clip {:?}, upper {:?}, throwing {:?}, grenade in hand {}, grenades out {}",
+                "player: {:?} from {from:.2} to {:.2}, grounded {}, clip {:?}, upper {:?}, throwing {:?}, grenade in hand {}, grenades out {}, bashing {:?}",
                 gait,
                 p.character.position,
                 p.character.grounded,
@@ -785,6 +790,7 @@ fn screenshot(
                     .projectiles()
                     .filter(|(rocket, ..)| !rocket)
                     .count(),
+                p.bashing,
             );
         }
     }
@@ -1143,6 +1149,29 @@ fn mission_for_screenshot(
                     let look = (at + to) * 0.5;
                     let path = picture(format!("delivery{n}"));
                     let eye = delivery_picture(backend, game, fov, aspect, to, look, None, &path)?;
+                    let vehicles = &game.scene.vehicles;
+                    for (l, hangs, found) in game.scene.flights.hung_from(copter, vehicles) {
+                        match found.map(|i| &vehicles[i]) {
+                            Some(v) => eprintln!(
+                                "delivery picture: {} ({:#x}) hangs at {hangs:.1}, {:.1} m from the eye, \
+                                 its box {:.2}..{:.2}{}",
+                                v.spec.label,
+                                l.guid,
+                                hangs.distance(eye),
+                                v.model.bounds.0,
+                                v.model.bounds.1,
+                                if v.id.is_some() { ", also in play" } else { "" }
+                            ),
+                            None if l.model.is_some() => eprintln!(
+                                "delivery picture: crate {:#x} hangs at {hangs:.1}",
+                                l.guid
+                            ),
+                            None => eprintln!(
+                                "delivery picture: vehicle {:#x} hangs at {hangs:.1} but has not loaded: not drawn",
+                                l.guid
+                            ),
+                        }
+                    }
                     // Hovering, letting go and four seconds' fall and
                     // settling.
                     down.push((i + (6.0 / tick) as u32, n, eye, to));
@@ -2447,7 +2476,7 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Right | winit::event::MouseButton::Left,
                 ..
             } if !state.mouse_look && !state.hud.menu => state.set_mouse_look(true),
-            // With the mouse captured, the buttons fire and aim.
+            // With the mouse captured, the buttons fire, aim and bash.
             WindowEvent::MouseInput {
                 state: pressed,
                 button,
@@ -2456,6 +2485,7 @@ impl ApplicationHandler for App {
                 let action = match button {
                     winit::event::MouseButton::Left => Some(Action::Fire),
                     winit::event::MouseButton::Right => Some(Action::Aim),
+                    winit::event::MouseButton::Middle => Some(Action::Melee),
                     _ => None,
                 };
                 if let Some(a) = action {

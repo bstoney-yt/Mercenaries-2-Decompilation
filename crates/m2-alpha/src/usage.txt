@@ -28,8 +28,10 @@ m2-alpha [options]
                          the picture
   --throw                with --screenshot on the island: throw a grenade
                          just before the picture
-  --lead <s>             with --jump or --throw: seconds before the picture
-                         she starts (default 0.2)
+  --bash                 with --screenshot on the island: a melee bash just
+                         before the picture
+  --lead <s>             with --jump, --throw or --bash: seconds before the
+                         picture she starts (default 0.2)
   --fight                with --screenshot on the island: shoot the nearest
                          soldier, rocket a vehicle, throw a grenade first,
                          then look at the body
@@ -86,7 +88,8 @@ On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
 E gets in or out of a vehicle (a row is parked ahead of where you start).
 Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
 Fighting (mouse captured): left button or F fires, right button aims,
-1 rifle, 2 rocket launcher, G throws a grenade.
+1 rifle, 2 rocket launcher, G throws a grenade, B or the middle button
+bashes (a supply crate breaks open).
 V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
 M music on/off, Tab or right mouse captures the mouse, N next gait
 (--model), F11 fullscreen, F3 culling, F5 quick save, F9 quick load,
