@@ -1337,7 +1337,11 @@ fn log_terrain(hash: u32, mesh: &TerrainMesh, gpu: &TerrainGpu, materials: &Mate
 /// `constant0.x` (reflection strength), `R0` (reflectance facing the eye),
 /// `constant0.z` (glint exponent) and the specular colour (taken grey).
 /// The game's water material is not in its archives (PC round L), so
-/// these are set from code there: `M2_SEA` sets them as
+/// these are set from code there; fitted to footage of the night start
+/// and a sunset ride (PC round K: the near and far night sea 59 and 13
+/// against 52 and 9, the sunset glare 152 against 120 to 190, a dimmer
+/// mirrored sky darkening the far sea as the game's does). `M2_SEA` sets
+/// them as
 /// `reflection,r0,power,glint[,body[,sky]]`, `body` scaling the diffuse
 /// and ambient colours and `sky` the sky mirrored.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1355,10 +1359,10 @@ impl SeaConstants {
         let mut c = Self {
             reflection: 1.0,
             r0: 0.02,
-            power: 400.0,
-            glint: 3.0,
-            body: 1.0,
-            sky: 1.0,
+            power: 40.0,
+            glint: 1.0,
+            body: 0.7,
+            sky: 0.3,
         };
         if let Ok(v) = std::env::var("M2_SEA") {
             let f: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();

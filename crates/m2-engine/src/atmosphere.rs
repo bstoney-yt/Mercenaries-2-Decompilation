@@ -452,6 +452,8 @@ impl Atmosphere {
                 .haze_layers
                 .filter(|_| !env_is("M2_HAZE", "old"))
                 .map(|[f1, l1, f2, l2]| [f1, recip(l1), f2, recip(l2)]),
+            // `M2_EXT_SUN=on` tints what the air keeps by the sun's colour.
+            sun_tint: env_is("M2_EXT_SUN", "on"),
             ..Haze::default()
         }
     }
