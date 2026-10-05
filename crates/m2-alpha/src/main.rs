@@ -1159,8 +1159,8 @@ fn mission_for_screenshot(
     // And what each crate broken open left, as soon as it lies there
     // (she takes it within a second or two), from 5 m off (`-pickupN`):
     // the crates seen, and the pictures due (tick, crate).
-    let mut opened: HashSet<u32> = HashSet::new();
-    let mut pickup_shots: Vec<(u32, u32)> = Vec::new();
+    let mut opened: HashSet<(u32, u32)> = HashSet::new();
+    let mut pickup_shots: Vec<(u32, (u32, u32))> = Vec::new();
     // The clips' sound events met, by category and name: how many hers,
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
@@ -1253,25 +1253,28 @@ fn mission_for_screenshot(
                 ashore_shot.get_or_insert(i + (3.0 / tick) as u32);
             }
             for p in game.scene.flights.pickups() {
-                if opened.insert(p.from) {
-                    pickup_shots.push((i + 1, p.from));
+                if opened.insert(p.key()) {
+                    pickup_shots.push((i + 1, p.key()));
                 }
             }
-            let due: Vec<u32> = pickup_shots
+            let due: Vec<(u32, u32)> = pickup_shots
                 .iter()
                 .filter(|s| s.0 == i)
                 .map(|s| s.1)
                 .collect();
-            for from in due {
+            for key in due {
                 let lying = game
                     .scene
                     .flights
                     .pickups()
                     .iter()
-                    .find(|p| p.from == from)
+                    .find(|p| p.key() == key)
                     .copied();
                 let Some(p) = lying else {
-                    eprintln!("pickup picture: what the crate {from:#x} left was taken first");
+                    eprintln!(
+                        "pickup picture: the {:#x} the crate {:#x} left was taken first",
+                        key.1, key.0
+                    );
                     continue;
                 };
                 let away = (p.at - game.focus())

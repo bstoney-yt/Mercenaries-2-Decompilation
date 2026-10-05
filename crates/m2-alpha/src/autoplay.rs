@@ -155,8 +155,9 @@ enum Goal {
     /// Break open the supply crate `target` (the scripts' object) with a
     /// bash.
     Open(u32),
-    /// Take what the supply crate `from` left (walking up to it).
-    Take(u32),
+    /// Take one thing a supply crate left (walking up to it), by its
+    /// [`Pickup::key`](crate::flights::Pickup::key).
+    Take((u32, u32)),
 }
 
 impl Goal {
@@ -166,7 +167,8 @@ impl Goal {
             (Goal::Reach { target: a, .. }, Goal::Reach { target: b, .. })
             | (Goal::Blast { target: a, .. }, Goal::Blast { target: b, .. }) => a == b,
             (Goal::Shoot(a), Goal::Shoot(b)) | (Goal::Board(a), Goal::Board(b)) => a == b,
-            (Goal::Open(a), Goal::Open(b)) | (Goal::Take(a), Goal::Take(b)) => a == b,
+            (Goal::Open(a), Goal::Open(b)) => a == b,
+            (Goal::Take(a), Goal::Take(b)) => a == b,
             _ => false,
         }
     }
@@ -234,8 +236,8 @@ pub struct Autoplay {
     left_shut: Vec<u32>,
     /// The crate whose pickup she is going for and since when, and those
     /// whose pickups she gave up on.
-    taking: Option<(u32, f32)>,
-    left_lying: Vec<u32>,
+    taking: Option<((u32, u32), f32)>,
+    left_lying: Vec<(u32, u32)>,
 }
 
 impl Autoplay {
@@ -312,7 +314,7 @@ impl Autoplay {
             Some(Goal::Blast { at, .. }) => self.blast(game, at, dt),
             Some(Goal::Board(i)) => self.board(game, i, dt),
             Some(Goal::Open(target)) => self.open(game, target, dt),
-            Some(Goal::Take(from)) => self.take(game, from, dt),
+            Some(Goal::Take(key)) => self.take(game, key, dt),
         }
     }
 
@@ -373,14 +375,17 @@ impl Autoplay {
                 .flights
                 .pickups()
                 .iter()
-                .filter(|p| p.what.gives.is_some() && !self.left_lying.contains(&p.from))
-                .map(|p| (p.from, p.at.distance(here)))
+                .filter(|p| p.what.gives.is_some() && !self.left_lying.contains(&p.key()))
+                .map(|p| (p.key(), p.at.distance(here)))
                 .filter(|&(_, d)| d < OPEN_NEAR)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
         {
             return Some((
                 Goal::Take(from),
-                format!("taking what the supply crate {from:#x} left, {d:.1} m off"),
+                format!(
+                    "taking the {:#x} the supply crate {:#x} left, {d:.1} m off",
+                    from.1, from.0
+                ),
             ));
         }
         // What to destroy, nearest first: soldiers are shot, things blown up.
@@ -595,14 +600,16 @@ impl Autoplay {
         }
     }
 
-    /// Taking what supply crate `from` left: walking onto it (the game
-    /// takes it once she is within its reach); left lying if not taken
-    /// after [`OPEN_FOR`] seconds.
-    fn take(&mut self, game: &mut Game, from: u32, dt: f32) -> Intent {
+    /// Taking what a supply crate left (`key`, [`Pickup::key`]): walking
+    /// onto it (the game takes it once she is within its reach); left
+    /// lying if not taken after [`OPEN_FOR`] seconds.
+    ///
+    /// [`Pickup::key`]: crate::flights::Pickup::key
+    fn take(&mut self, game: &mut Game, key: (u32, u32), dt: f32) -> Intent {
         let since = match self.taking {
-            Some((g, t)) if g == from => t,
+            Some((k, t)) if k == key => t,
             _ => {
-                self.taking = Some((from, self.clock));
+                self.taking = Some((key, self.clock));
                 self.clock
             }
         };
@@ -611,17 +618,17 @@ impl Autoplay {
             .flights
             .pickups()
             .iter()
-            .find(|p| p.from == from)
+            .find(|p| p.key() == key)
             .copied()
         else {
             return Intent::default();
         };
         if self.clock - since > OPEN_FOR {
             eprintln!(
-                "autoplay {:.1} s: what the supply crate {from:#x} left at {:.1} was not taken: left lying",
-                self.clock, p.at
+                "autoplay {:.1} s: the {:#x} the supply crate {:#x} left at {:.1} was not taken: left lying",
+                self.clock, key.1, key.0, p.at
             );
-            self.left_lying.push(from);
+            self.left_lying.push(key);
             return Intent::default();
         }
         self.walk(game, p.at, p.what.reach * 0.5, dt)

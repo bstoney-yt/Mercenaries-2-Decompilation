@@ -141,8 +141,8 @@ impl Templates {
     }
 
     /// The id of the template an entity or template name names, whatever
-    /// its case: of several so named (the database has such twins, the
-    /// first contract's `Supply Drop (GL)` among them), the lowest.
+    /// its case: of several so named, the lowest, so that it is the same
+    /// every run.
     pub fn id(&self, name: &str) -> Option<u32> {
         self.ids(name).first().copied()
     }
