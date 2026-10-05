@@ -7,7 +7,7 @@
 //! rifle bank's loudest short mono sound, the RPG bank's loudest short one,
 //! and the artillery bank's loudest 1.5-3 s mono sound.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -143,6 +143,8 @@ pub struct GameAudio {
     engine: Option<Engine>,
     /// The rotors heard, by helicopter: a voice per loop.
     rotors: HashMap<u32, Vec<VoiceId>>,
+    /// Banks read and found to have no engine sounds.
+    silent: HashSet<u32>,
     /// Seconds to the next one.
     ambient_wait: f32,
     seed: u64,
@@ -538,6 +540,7 @@ impl GameAudio {
             install: install.cloned(),
             engine: None,
             rotors: HashMap::new(),
+            silent: HashSet::new(),
             ambient_wait: 3.0,
             seed: 0x9e37_79b9_7f4a_7c15,
             voices: None,
@@ -803,6 +806,9 @@ impl GameAudio {
     /// or if it has none); the first ask reads them on a thread.
     fn engine_sounds(&mut self, bank: u32) -> Option<Arc<EngineSounds>> {
         while let Ok((bank, sounds)) = self.engine_loads.1.try_recv() {
+            if sounds.is_none() {
+                self.silent.insert(bank);
+            }
             self.engines.insert(bank, sounds.map(Arc::new));
         }
         if let Some(sounds) = self.engines.get(&bank) {
@@ -817,10 +823,12 @@ impl GameAudio {
     }
 
     /// Keeps the rotors of the helicopters in the air (`flying`: each
-    /// one's guid and where it is) heard where they are: their bank's
-    /// lowest steady loop (the blades' beat) with its highest (the
-    /// turbine) under it. One gone from the list falls silent.
-    pub fn rotors(&mut self, flying: &[(u32, Vec3)]) {
+    /// one's guid, where it is and the sound bank its template names)
+    /// heard where they are: the bank's lowest steady loop (the blades'
+    /// beat) with its highest (the turbine) under it, from
+    /// [`ROTOR_BANK`] where it names none (or one without them). One gone
+    /// from the list falls silent.
+    pub fn rotors(&mut self, flying: &[(u32, Vec3, Option<u32>)]) {
         let gone: Vec<u32> = self
             .rotors
             .keys()
@@ -833,18 +841,18 @@ impl GameAudio {
                     .with(|m| voices.into_iter().for_each(|id| m.stop(id)));
             }
         }
-        if flying.is_empty() {
-            return;
-        }
-        let Some(sounds) = self.engine_sounds(m2_assets::name_hash(ROTOR_BANK)) else {
-            return;
-        };
-        for &(guid, at) in flying {
+        for &(guid, at, bank) in flying {
             if let Some(voices) = self.rotors.get(&guid) {
                 self.out
                     .with(|m| voices.iter().for_each(|id| m.set_position(*id, at)));
                 continue;
             }
+            let bank = bank
+                .filter(|b| !self.silent.contains(b))
+                .unwrap_or_else(|| m2_assets::name_hash(ROTOR_BANK));
+            let Some(sounds) = self.engine_sounds(bank) else {
+                continue;
+            };
             let n = sounds.loops.len();
             let voices = self.out.with(|m| {
                 sounds
