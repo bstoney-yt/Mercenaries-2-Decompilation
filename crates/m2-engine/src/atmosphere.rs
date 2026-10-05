@@ -401,6 +401,12 @@ impl Atmosphere {
         // out towards the horizon.
         lighting.clouds.horizon_fade = env_is("M2_CLOUD_FADE", "on");
         lighting.clouds.opacity = 1.0;
+        // `M2_CLOUD_REACH` (metres) caps how far off the deck is taken to
+        // be for the air in front of it.
+        lighting.clouds.reach = std::env::var("M2_CLOUD_REACH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|r| *r > 0.0);
         // `M2_CLOUD_OPACITY` overrides how opaque the thickest cloud is.
         if let Some(o) = std::env::var("M2_CLOUD_OPACITY")
             .ok()
@@ -680,9 +686,10 @@ enum Lit {
 
 /// The game's cloud mass where our clouds are opaque, over `DarknessK`
 /// in the cloud shader's darkening: fitted to the town's cream sky in
-/// footage (PC round P: Guanare's 150 wanted 0.75 to 1.5 there, so the
-/// darkest clouds keep about half their light).
-const CLOUD_MASS: f32 = 110.0;
+/// footage and the night sky overhead at the mission's start (PC round O:
+/// the night's top was 129, 115 and 89 against footage's 80 at 50, 110
+/// and 250, the town's sky 177, 168 and 153 against 140 and over).
+const CLOUD_MASS: f32 = 400.0;
 
 /// [`CLOUD_MASS`], or `M2_CLOUD_MASS` to fit it by hand.
 fn cloud_mass() -> f32 {
