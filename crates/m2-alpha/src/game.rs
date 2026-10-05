@@ -1006,7 +1006,12 @@ pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw:
         v.id = Some(physics.add_vehicle_turned(&v.spec, at, Quat::from_rotation_y(yaw)));
         return true;
     }
-    let rest = v.spec.rest_on(at, yaw, ground);
+    // (Never where it came out NaN: round 88 lost the start boat, and her
+    // with it, to a rest fitted to a boat's no wheels.)
+    let rest = v
+        .spec
+        .rest_on(at, yaw, ground)
+        .filter(|r| r.position.is_finite() && r.rotation.is_finite());
     // A wheel over nothing (a quay's edge): level, on the ground under
     // its origin.
     let (at, turn) = match rest {
@@ -1121,7 +1126,10 @@ const WADE: f32 = 1.4;
 /// Gets her out on the driver's side, beside the hull, to drop to the
 /// ground there.
 pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player) {
-    if let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) {
+    if let Some(at) =
+        v.id.and_then(|id| physics.vehicle_transform(id))
+            .filter(|at| at.is_finite())
+    {
         let out = door_out(at, &v.spec);
         player.character.position = Vec3::new(out.x, 0.0, out.z);
         player.character.velocity = Vec3::ZERO;

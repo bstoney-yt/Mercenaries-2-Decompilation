@@ -8,11 +8,12 @@
 //! no headway for a while she hops ahead (logged too): the run goes on to
 //! the later objectives, and the hops show where the way is blocked.
 
-use m2_engine::{Physics, VehicleId};
+use m2_engine::physics::FLOAT_DEPTH;
+use m2_engine::{Physics, VehicleControls, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
 use crate::combat::{Combat, Trigger, Weapon};
-use crate::game::{Game, can_get_out, place};
+use crate::game::{Game, can_get_out, get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
@@ -116,6 +117,15 @@ const LOOK_AHEAD: f32 = 5.0;
 const LOOK_TIME: f32 = 0.6;
 const LOOK_MOST: f32 = 20.0;
 const RUN: f32 = 6.0;
+/// A boat's way keeps this much water under its keel, metres. Stuck, a
+/// boat is put afloat over water that deep: on its way, back towards it
+/// in steps this long, or this far to either side of it (metres).
+const UNDER_KEEL: f32 = 0.6;
+const AFLOAT_STEP: f32 = 5.0;
+const AFLOAT_SIDES: [f32; 5] = [0.0, -8.0, 8.0, -16.0, 16.0];
+/// Rays looking for open water start this far over the sea, metres (over
+/// rocks standing out of it).
+const OVER_WATER: f32 = 30.0;
 /// A way planned this much longer than the straight one is logged, at
 /// most every this long (seconds).
 const ROUNDABOUT: f32 = 1.15;
@@ -588,8 +598,9 @@ impl Autoplay {
         }
         if self.stalled > STALL {
             self.stalled = 0.0;
-            // A boat run aground: out, into the shallows.
-            if self.can_leave(game, i) {
+            // A boat run aground near the place: out, into the shallows
+            // (further off, it backs off the rocks).
+            if d < RIDE_FOR && self.can_leave(game, i) {
                 eprintln!(
                     "autoplay {:.1} s: the {} is aground {d:.0} m off: getting out",
                     self.clock, game.scene.vehicles[i].spec.label
@@ -846,11 +857,7 @@ impl Autoplay {
         speed: f32,
     ) -> Vec3 {
         let straight = (at - pos).with_y(0.0).length();
-        // A boat goes straight at it, over the sea the way keeps off.
-        let boat = driving
-            .and_then(|i| game.scene.vehicles.get(i))
-            .is_some_and(|v| v.spec.is_boat());
-        if straight < PLAN_FROM || boat {
+        if straight < PLAN_FROM {
             self.way = None;
             return at;
         }
@@ -866,12 +873,14 @@ impl Autoplay {
                     steepest: if v.spec.tracked { ON_TRACKS } else { ON_WHEELS },
                     wades: false,
                     skip: v.id,
+                    afloat: v.spec.is_boat().then(|| keel_depth(&v.spec) + UNDER_KEEL),
                 },
                 None => Mover {
                     cell: FOOT_CELL,
                     steepest: ON_FOOT,
                     wades: true,
                     skip: None,
+                    afloat: None,
                 },
             };
             let sea = world.settings.sea_level.max(WATERLINE);
@@ -1014,7 +1023,8 @@ impl Autoplay {
     }
 
     /// Moves her (and what she drives) up to [`HOP`] metres towards `at`,
-    /// onto the ground there.
+    /// onto the ground there; a boat, onto water deep enough near there
+    /// (else she gets out of it, onto the ground).
     fn hop(&mut self, game: &mut Game, at: Vec3, stuck: f32) {
         let from = game.focus();
         let flat = (at - from).with_y(0.0);
@@ -1039,8 +1049,54 @@ impl Autoplay {
         {
             to.y = y;
         }
-        match p.driving {
-            Some(i) => {
+        let yaw = flat.x.atan2(flat.z);
+        // A boat she drives, and its body.
+        let boat = p
+            .driving
+            .filter(|&i| game.scene.vehicles[i].spec.is_boat())
+            .and_then(|i| game.scene.vehicles[i].id.map(|id| (i, id)));
+        match (p.driving, boat) {
+            // Round 88 hopped the start boat 35 m up onto the rocks it
+            // was stuck on.
+            (_, Some((i, id))) => {
+                let v = &mut game.scene.vehicles[i];
+                eprintln!(
+                    "autoplay {:.1} s: stuck driving the {}: {}",
+                    self.clock,
+                    v.spec.label,
+                    stuck_report(world, id, v.spec.hull, self.reversing.is_some())
+                );
+                match afloat_near(&world.physics, &v.spec, id, from, to, yaw) {
+                    Some(spot) => {
+                        world.physics.remove_vehicle(id);
+                        v.id = None;
+                        if !place(&mut world.physics, v, spot, yaw) {
+                            eprintln!(
+                                "autoplay: no water to put the {} on at {spot:.1}",
+                                v.spec.label
+                            );
+                        }
+                        to = spot;
+                    }
+                    None => {
+                        eprintln!(
+                            "autoplay: no water deep enough for the {} near {to:.1}: out of it",
+                            v.spec.label
+                        );
+                        world.physics.drive(
+                            id,
+                            VehicleControls {
+                                parked: true,
+                                ..VehicleControls::default()
+                            },
+                        );
+                        get_out(&world.physics, v, p);
+                        p.character.position = to + Vec3::Y * 0.1;
+                        p.character.velocity = Vec3::ZERO;
+                    }
+                }
+            }
+            (Some(i), None) => {
                 let v = &mut game.scene.vehicles[i];
                 if let Some(id) = v.id {
                     eprintln!(
@@ -1050,7 +1106,6 @@ impl Autoplay {
                         stuck_report(world, id, v.spec.hull, self.reversing.is_some())
                     );
                 }
-                let yaw = flat.x.atan2(flat.z);
                 if let Some(id) = v.id.take() {
                     world.physics.remove_vehicle(id);
                 }
@@ -1061,7 +1116,7 @@ impl Autoplay {
                     );
                 }
             }
-            None => {
+            (None, _) => {
                 p.character.position = to + Vec3::Y * 0.1;
                 p.character.velocity = Vec3::ZERO;
             }
@@ -1259,6 +1314,57 @@ fn clear_way(
         }
     }
     best.1
+}
+
+/// Where boat `spec` (body `id`), stuck at `from`, can be put afloat
+/// facing `yaw` on its way to `to`: the furthest point along it, or to
+/// either side of it, with water [`UNDER_KEEL`] under its keel all over its
+/// hull's footprint, at the water's height.
+fn afloat_near(
+    physics: &Physics,
+    spec: &VehicleSpec,
+    id: VehicleId,
+    from: Vec3,
+    to: Vec3,
+    yaw: f32,
+) -> Option<Vec3> {
+    let water = physics.water()?;
+    let floor = water - keel_depth(spec) - UNDER_KEEL;
+    let flat = (to - from).with_y(0.0);
+    let length = flat.length();
+    let ahead = flat.normalize_or_zero();
+    let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+    let turn = Quat::from_rotation_y(yaw);
+    let (lo, hi) = spec.hull;
+    let footprint = [
+        Vec3::ZERO,
+        Vec3::new(lo.x, 0.0, lo.z),
+        Vec3::new(hi.x, 0.0, lo.z),
+        Vec3::new(lo.x, 0.0, hi.z),
+        Vec3::new(hi.x, 0.0, hi.z),
+    ];
+    let open = |p: Vec3| {
+        footprint.iter().all(|&q| {
+            let at = p + turn * q;
+            let top = Vec3::new(at.x, water + OVER_WATER, at.z);
+            physics
+                .cast_ray_past(top, Vec3::NEG_Y, top.y - floor, id)
+                .is_none()
+        })
+    };
+    let steps = (length / AFLOAT_STEP).ceil() as usize;
+    (1..=steps)
+        .rev()
+        .flat_map(|k| {
+            let along = from.with_y(water) + ahead * (length * k as f32 / steps as f32);
+            AFLOAT_SIDES.map(|s| along + side * s)
+        })
+        .find(|&p| open(p))
+}
+
+/// How deep a boat's keel floats under the water, metres.
+fn keel_depth(spec: &VehicleSpec) -> f32 {
+    FLOAT_DEPTH - spec.hull.0.y
 }
 
 /// Whether something stands within `within` metres of a vehicle's
