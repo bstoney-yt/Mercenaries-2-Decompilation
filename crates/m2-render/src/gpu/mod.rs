@@ -209,6 +209,8 @@ struct FrameUniforms {
     /// and the metres at its end.
     water_ramp: [[f32; 4]; 4],
     water_depth: [f32; 4],
+    /// Scale on the clouds' colour.
+    cloud_tone: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -1756,6 +1758,7 @@ impl WgpuBackend {
                 0.0,
                 0.0,
             ],
+            cloud_tone: l.clouds.tone.extend(1.0).to_array(),
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));

@@ -43,6 +43,8 @@ struct Post {
     // x, y: the least and most luminance adapted to, z: contrast limit,
     // w: contrast multiplier
     limits: vec4<f32>,
+    // The game's: rgb: the monochrome ramp's middle, a: how much of it
+    mono: vec4<f32>,
 };
 
 fn game_tone_map() -> bool {
@@ -188,6 +190,14 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
         let lout = 0.8 * ls / (0.7 + min(min(ls, pow(ls, 0.7)), 10.0));
         var d = c * (lout / max(y, 1e-5)) * post.grade.rgb;
         d = clamp(mix(vec3<f32>(post.limits.z), d, post.limits.w), vec3<f32>(0.0), vec3<f32>(1.0));
+        // The monochrome ramp: black, its middle and white by luminance.
+        let m = dot(d, vec3<f32>(0.299, 0.587, 0.114));
+        let ramp = select(
+            mix(post.mono.rgb, vec3<f32>(1.0), (m - 0.5) * 2.0),
+            mix(vec3<f32>(0.0), post.mono.rgb, m * 2.0),
+            m < 0.5,
+        );
+        d = mix(d, ramp, post.mono.a);
         return vec4<f32>(display_to_linear(d), 1.0);
     }
     // Contrast on luminance about a mid grey, keeping each colour's hue,
@@ -210,6 +220,7 @@ struct Uniforms {
     tone: [f32; 4],
     adapt: [f32; 4],
     limits: [f32; 4],
+    mono: [f32; 4],
 }
 
 /// The passes, in order: bright, blur across, blur down, composite, then
@@ -561,6 +572,10 @@ impl Post {
                 ],
                 adapt,
                 limits,
+                mono: lighting
+                    .monochrome
+                    .filter(|_| game)
+                    .map_or([0.0; 4], |m| m.to_array()),
             };
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(&u));
         }

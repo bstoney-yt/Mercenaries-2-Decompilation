@@ -49,6 +49,8 @@ struct Frame {
     water_ramp: array<vec4<f32>, 4>,
     // x: the ramp is set, y: metres at its end
     water_depth: vec4<f32>,
+    // rgb: scale on the clouds' colour
+    cloud_tone: vec4<f32>,
 };
 
 // The depth colour map at `metres` of water looked through.
@@ -555,7 +557,7 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         let cloud = lit + frame.ambient_cube[2].rgb * 0.5;
         // Thin veils: the game's footage shows a hazy sky with little
         // solid cloud.
-        rgb = mix(rgb, cloud, alpha * 0.6);
+        rgb = mix(rgb, cloud * frame.cloud_tone.rgb, alpha * 0.6);
     }
     return vec4<f32>(rgb, 1.0);
 }

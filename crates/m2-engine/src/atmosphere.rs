@@ -66,7 +66,8 @@ pub struct Atmosphere {
     pub extinction: f32,
     pub mie: f32,
     pub hg_g: f32,
-    /// `Tone_R`, `Tone_G`, `Tone_B`: a colour grade, probably.
+    /// `Tone_R`, `Tone_G`, `Tone_B`: among the cloud settings (between
+    /// `ShadowK` and `LightBlend`), so taken as the clouds' tint.
     pub tone: Vec3,
     /// `BloomAmount`, `BloomMultiplier`, `BloomThreshold`,
     /// `BloomBlurRadius` (the radius is not used yet).
@@ -93,6 +94,10 @@ pub struct Atmosphere {
     /// `BloomTargetLuminance`, `BloomAdaptiveLuminance*` and
     /// `BloomContast*` (the game's spelling): its adaptation and tone map.
     pub tone_map: Option<ToneMap>,
+    /// `Gradient0_Color2`: the middle of the post pass's monochrome ramp
+    /// (a display colour) and, in its alpha byte, how much of the frame
+    /// the ramp takes.
+    pub monochrome: Option<Vec4>,
 }
 
 /// Which way the sun stands at `LightTime` 0 (and 0.1, low in the
@@ -187,6 +192,10 @@ impl Atmosphere {
                 float("LightMultiplier_Z").unwrap_or(1.0),
             ),
             interpolate_time: float("InterpolateTime").unwrap_or(0.0),
+            monochrome: field("Gradient0_Color2").map(|v| {
+                let byte = |shift: u32| ((v >> shift) & 0xff) as f32 / 255.0;
+                Vec4::new(byte(16), byte(8), byte(0), byte(24))
+            }),
             tone_map: (|| {
                 let f = |names: &[&str]| names.iter().find_map(|n| float(n));
                 Some(ToneMap {
@@ -268,6 +277,10 @@ impl Atmosphere {
                 }),
                 (_, b) => b,
             },
+            monochrome: match (self.monochrome, to.monochrome) {
+                (Some(a), Some(b)) => Some(a.lerp(b, t)),
+                (_, b) => b,
+            },
             water_ramp: match (self.water_ramp, to.water_ramp) {
                 (Some(a), Some(b)) => Some(std::array::from_fn(|i| a[i].lerp(b[i], t))),
                 (_, b) => b,
@@ -293,16 +306,17 @@ impl Atmosphere {
         lighting.sun_direction = self.sun_direction();
         lighting.sun_color = self.light_color * self.light_intensity;
         lighting.haze = self.haze();
-        // `BloomAmount` times `BloomMultiplier` above `BloomThreshold`, and
-        // `Tone_*` as the grade (inferred from the names).
+        // `BloomAmount` times `BloomMultiplier` above `BloomThreshold`
+        // (inferred from the names).
         lighting.bloom = self.bloom[0] * self.bloom[1];
         lighting.bloom_threshold = self.bloom[2];
-        lighting.grade = self.tone;
+        lighting.clouds.tone = self.tone;
         lighting.clouds.coverage = self.coverage;
         lighting.clouds.scales = self.cloud_scales;
         lighting.clouds.wind = self.wind;
         lighting.water_ramp = self.water_ramp;
         lighting.tone_map = self.tone_map;
+        lighting.monochrome = self.monochrome;
     }
 
     /// The haze these settings describe: Hoffman and Preetham's standard
@@ -581,6 +595,7 @@ mod tests {
             interpolate_time,
             water_ramp: None,
             tone_map: None,
+            monochrome: None,
         }
     }
 
