@@ -154,6 +154,10 @@ fn run(args: &[String]) -> Result<(), Error> {
             println!("wrote {out}");
             Ok(())
         }
+        "live" => {
+            drop(wad);
+            live(path, rest)
+        }
         "sbs" => {
             // Two PNGs side by side at the left one's height.
             let [left, right, out] = rest else {
@@ -796,4 +800,193 @@ fn decode_png(bytes: &[u8]) -> Result<Image, Error> {
         height,
         rgba,
     })
+}
+
+/// Boots the game's own GUI scripts headless and draws what they build:
+/// `live <out.png> [--size WxH] [--hero name] [--event Name=args]...
+/// [--tick seconds]... [--snap file.png]... [--background frame.png]`.
+/// Steps run in order; `--snap` draws the screen as it is then.
+fn live(path: &str, rest: &[String]) -> Result<(), Error> {
+    use m2_game::gui_runtime::{self, DrawItem};
+    use m2_game::mission::{GameData, Mission};
+
+    let [out, steps @ ..] = rest else {
+        return Err("usage: live <out.png> [options]".into());
+    };
+    let (mut width, mut height, mut hero, mut background) =
+        (1280u32, 720u32, "Mattias".to_owned(), None);
+    let mut it = steps.iter();
+    let mut plan: Vec<(String, String)> = Vec::new();
+    while let Some(a) = it.next() {
+        let mut value = |what: &str| it.next().cloned().ok_or(format!("{a} needs {what}"));
+        match a.as_str() {
+            "--size" => {
+                let s = value("WxH")?;
+                let (w, h) = s.split_once('x').ok_or("--size needs WxH")?;
+                (width, height) = (w.parse()?, h.parse()?);
+            }
+            "--hero" => hero = value("a name")?,
+            "--background" => background = Some(value("a file")?),
+            "--event" | "--tick" | "--snap" | "--lua" => plan.push((a.clone(), value("a value")?)),
+            other => return Err(format!("unknown option {other}").into()),
+        }
+    }
+
+    let start = std::time::Instant::now();
+    let mut wad = WadArchive::open(BufReader::new(File::open(path)?))?;
+    let data = GameData::read(&mut wad)?;
+    let strings = data.strings.clone();
+    let mut mission = Mission::new(data, &hero, [0.0; 3])?;
+    eprintln!("loaded in {:.1} s", start.elapsed().as_secs_f64());
+    let screen = gui_runtime::screen(mission.lua()).ok_or("no GUI runtime installed")?;
+    let mut assets = Assets {
+        wad: &mut wad,
+        textures: HashMap::new(),
+        fonts: HashMap::new(),
+        strings: Some(Some(strings.clone())),
+        missing: Vec::new(),
+    };
+    {
+        let mut s = screen.borrow_mut();
+        s.set_strings(strings);
+        for f in ["english_18", "english_20"] {
+            if let Some(font) = assets.font(f) {
+                s.set_font(f, font);
+            }
+        }
+    }
+    // The player-character module's call (module 8d35cf13).
+    mission.run(
+        "MrxGuiManager.CreateGui(Player.GetLocalPlayer())",
+        "create gui",
+    )?;
+    let step = |mission: &mut Mission, seconds: f64| {
+        let n = (seconds * 30.0).round().max(1.0) as usize;
+        for _ in 0..n {
+            mission.tick(1.0 / 30.0);
+            gui_runtime::tick(mission.lua(), 1.0 / 30.0);
+        }
+    };
+    step(&mut mission, 0.1);
+    let fired = gui_runtime::fire(mission.lua(), "GuiInitialization", ())?;
+    eprintln!("GuiInitialization: {fired} child handlers");
+    step(&mut mission, 0.1);
+
+    let snap = |assets: &mut Assets<_>, file: &str| -> Result<(), Error> {
+        let mut canvas = match &background {
+            Some(f) => Canvas::from_png(&std::fs::read(f)?, width, height)?,
+            None => Canvas::new(width, height),
+        };
+        let items = screen.borrow().draw_list(width as f32, height as f32);
+        for item in &items {
+            match item {
+                DrawItem::Quad {
+                    texture,
+                    uv,
+                    colour,
+                    rect,
+                    ..
+                } => match assets.texture(name_hash(texture)) {
+                    Some(img) => canvas.blit(img, *rect, *uv, *colour),
+                    None => {
+                        assets.missing.push(texture.clone());
+                        canvas.outline(*rect, [255, 0, 255, 255]);
+                    }
+                },
+                DrawItem::Fill { colour, rect, .. } => canvas.fill(*rect, *colour),
+                DrawItem::Text {
+                    font,
+                    text,
+                    rect,
+                    size,
+                    colour,
+                    justification,
+                    ..
+                } => match assets.font(font) {
+                    Some(f) => draw_text(
+                        assets,
+                        &mut canvas,
+                        &f,
+                        text,
+                        *rect,
+                        *size,
+                        *justification,
+                        *colour,
+                    ),
+                    None => canvas.outline(*rect, [255, 255, 0, 160]),
+                },
+                DrawItem::Flash { rect, .. } => canvas.outline(*rect, [0, 160, 255, 200]),
+                DrawItem::Minimap { rect, .. } => canvas.outline(*rect, [0, 255, 0, 200]),
+                DrawItem::Movie { rect, .. } => canvas.outline(*rect, [255, 128, 0, 200]),
+            }
+        }
+        std::fs::write(file, png(width, height, &canvas.rgba))?;
+        eprintln!("wrote {file} ({} items)", items.len());
+        Ok(())
+    };
+
+    for (kind, value) in &plan {
+        match kind.as_str() {
+            "--tick" => step(&mut mission, value.parse()?),
+            "--snap" => snap(&mut assets, value)?,
+            "--lua" => mission.run(value, "live")?,
+            _ => {
+                let (name, args) = value.split_once('=').unwrap_or((value.as_str(), ""));
+                let lua = mission.lua();
+                let values = event_args(lua, args)?;
+                let n = gui_runtime::fire(lua, name, mlua::MultiValue::from_vec(values))?;
+                eprintln!("{name}: {n} handlers");
+            }
+        }
+    }
+    snap(&mut assets, out)?;
+    let s = screen.borrow();
+    eprintln!(
+        "{} widgets; natives not implemented: {:?}",
+        s.widgets().count(),
+        s.unknown()
+    );
+    drop(s);
+    for l in screen
+        .borrow_mut()
+        .take_log()
+        .iter()
+        .chain(mission.take_log().iter())
+    {
+        eprintln!("  log: {}", l.lines().next().unwrap_or(""));
+    }
+    if !assets.missing.is_empty() {
+        assets.missing.sort();
+        assets.missing.dedup();
+        eprintln!("not found: {}", assets.missing.join(", "));
+    }
+    Ok(())
+}
+
+/// Event arguments: `40,100,false` are three values; `a=1,b=x` one table.
+fn event_args(lua: &mlua::Lua, args: &str) -> Result<Vec<mlua::Value>, Error> {
+    use mlua::Value;
+    let value = |s: &str| -> Result<Value, Error> {
+        Ok(match s {
+            "true" => Value::Boolean(true),
+            "false" => Value::Boolean(false),
+            "nil" => Value::Nil,
+            s => match s.parse::<f64>() {
+                Ok(n) => Value::Number(n),
+                Err(_) => Value::String(lua.create_string(s)?),
+            },
+        })
+    };
+    if args.is_empty() {
+        return Ok(Vec::new());
+    }
+    if args.contains('=') {
+        let t = lua.create_table()?;
+        for pair in args.split(',') {
+            let (k, v) = pair.split_once('=').ok_or("table events need key=value")?;
+            t.set(k, value(v)?)?;
+        }
+        return Ok(vec![Value::Table(t)]);
+    }
+    args.split(',').map(value).collect()
 }
