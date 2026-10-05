@@ -748,8 +748,12 @@ impl VehicleSpec {
 }
 
 /// The plane `h = a + b x + c z` closest (least squares) to `points`'
-/// heights over their x and z; `None` unless they span an area.
+/// heights over their x and z; `None` unless there are three or more of
+/// them spanning an area (none at all: a boat, which has no wheels).
 fn fit_plane(points: &[(Vec3, f32)]) -> Option<(f32, f32, f32)> {
+    if points.len() < 3 {
+        return None;
+    }
     let mut m = Mat3::ZERO;
     let mut r = Vec3::ZERO;
     for &(p, h) in points {
@@ -759,11 +763,12 @@ fn fit_plane(points: &[(Vec3, f32)]) -> Option<(f32, f32, f32)> {
     }
     // About the product of the spreads in x and z (variances, m^2).
     let n = points.len() as f32;
-    if m.determinant() < 1e-3 * n * n * n {
+    let spread = m.determinant();
+    if spread.is_nan() || spread < 1e-3 * n * n * n {
         return None;
     }
     let s = m.inverse() * r;
-    Some((s.x, s.y, s.z))
+    s.is_finite().then_some((s.x, s.y, s.z))
 }
 
 #[cfg(test)]
@@ -985,6 +990,28 @@ mod tests {
         }
         // Nothing loaded under it: nowhere to rest yet.
         assert!(s.rest_on(at, yaw, |_| None).is_none());
+    }
+
+    // Round 88 hopped the start boat onto rocks: with no wheels its rest
+    // came out NaN (a plane fitted to no points), and so did she when she
+    // got out of it.
+    #[test]
+    fn a_boat_without_wheels_rests_on_its_hull() {
+        let mut s = spec();
+        s.kind = BOAT.into();
+        s.wheels.clear();
+        s.node_wheel = vec![None, None];
+        let tan = 10f32.to_radians().tan();
+        let ground = |p: Vec3| Some(-1.0 + p.z * tan);
+        let rest = s.rest_on(Vec3::new(4.0, 0.0, 2.0), 0.3, ground).unwrap();
+        assert!(
+            rest.position.is_finite() && rest.rotation.is_finite(),
+            "{rest:?}"
+        );
+        assert!((rest.slope - 10f32.to_radians()).abs() < 0.02, "{rest:?}");
+        assert!(s.ride_height().is_finite());
+        assert_eq!(fit_plane(&[]), None);
+        assert_eq!(fit_plane(&[(Vec3::X, 1.0), (Vec3::Z, 1.0)]), None);
     }
 
     #[test]

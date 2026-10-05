@@ -430,7 +430,15 @@ fn bank_sounds(install: &Install) -> BankSounds {
 }
 
 /// Every engine bank, to name a template's bank (a name hash) in logs.
-const ENGINE_BANKS: [&str; 22] = [
+const ENGINE_BANKS: [&str; 30] = [
+    "veh_boatbigfishing",
+    "veh_boatoutboard",
+    "veh_boatoutboard2",
+    "veh_boatrib",
+    "veh_boatcruiser",
+    "veh_boatracing",
+    "veh_boatjetski",
+    "veh_boatcrappy",
     "veh_semi",
     "veh_bus",
     "veh_jeep",
@@ -972,6 +980,9 @@ mod tests {
         // The template database's banks, by name hash.
         assert_eq!(bank_name(0x3714_581c), Some("veh_largegascrappy"));
         assert_eq!(bank_name(0x3621_dfe1), Some("veh_jeep"));
+        // Round 88's boat banks, by the hashes in the world archive.
+        assert_eq!(bank_name(0xa3ca_3b95), Some("veh_boatracing"));
+        assert_eq!(bank_name(0xad17_2ebf), Some("veh_boatjetski"));
     }
 
     fn sound(hash: u32) -> SoundBuffer {
