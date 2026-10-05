@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use m2_engine::model::MODEL_TEXTURE_WIDTH;
+use m2_engine::stream::PROP_SIZES;
 use m2_engine::{
-    AssetSource, CollisionShape, CpuModel, GpuModel, Install, MaterialCache, Physics, StaticKey,
-    WorldIndex,
+    AssetSource, CollisionShape, CpuModel, Frustum, GpuModel, Install, MaterialCache, Physics,
+    StaticKey, WorldIndex,
 };
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{DrawQueue, RenderBackend};
@@ -58,6 +59,32 @@ pub struct Props {
     near: Option<Near>,
     /// Changes to those shown (put up, taken down, moved, gone).
     changes: u64,
+    /// How far from the focus models were last wanted (metres).
+    reach: f32,
+}
+
+/// How the props stand ([`Props::counts`]): how many are shown, and of
+/// the models they use how many have loaded, are loading, wait (within
+/// reach, and in all) and failed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PropCounts {
+    pub shown: usize,
+    pub loaded: usize,
+    pub loading: usize,
+    pub waiting_near: usize,
+    pub waiting: usize,
+    pub failed: usize,
+}
+
+impl std::fmt::Display for PropCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} shown; their models: {} loaded, {} loading, {} waiting within reach \
+             ({} in all), {} failed",
+            self.shown, self.loaded, self.loading, self.waiting_near, self.waiting, self.failed
+        )
+    }
 }
 
 /// For each model not yet loaded, how far (squared) the nearest shown prop
@@ -71,16 +98,16 @@ struct Near {
 }
 
 /// How long uploading loaded models may take a frame (at least one is).
-const UPLOAD_BUDGET: Duration = Duration::from_millis(6);
+const UPLOAD_BUDGET: Duration = Duration::from_millis(4);
 
 /// Threads decoding models.
-const LOADERS: usize = 4;
+const LOADERS: usize = 3;
 
 /// How many models may be asked of the loaders and not yet uploaded:
 /// few, so that whatever is nearest when one finishes goes next. A start-up
 /// puts up thousands of props, and a mission's gate has to load while the
 /// player walks up to it, not after all of them.
-const IN_FLIGHT: usize = 16;
+const IN_FLIGHT: usize = 8;
 
 /// Which models are nearest is worked out again once the focus has moved
 /// this far (metres), or those shown have changed.
@@ -212,17 +239,39 @@ impl Props {
         self.shown.iter().map(|(&e, p)| (e, p))
     }
 
+    /// Whether every model wanted within reach (as last asked) has loaded
+    /// or failed: none is being loaded, and none waits within reach.
+    pub fn settled(&self) -> bool {
+        let within = self.reach * self.reach;
+        self.asked.is_empty()
+            && self.decoded.is_empty()
+            && (self.waiting.is_empty()
+                || self.near.as_ref().is_some_and(|n| {
+                    self.waiting
+                        .iter()
+                        .all(|h| n.by_model.get(h).is_none_or(|&d| d > within))
+                }))
+    }
+
     /// How many are shown, and of the models they use how many have
-    /// loaded, are loading, wait to be loaded and failed.
-    pub fn counts(&self) -> (usize, usize, usize, usize, usize) {
-        let loaded = self.models.values().filter(|m| m.is_some()).count();
-        (
-            self.shown.len(),
-            loaded,
-            self.asked.len(),
-            self.waiting.len(),
-            self.failed.len(),
-        )
+    /// loaded, are loading, wait to be loaded (within reach, and further)
+    /// and failed.
+    pub fn counts(&self) -> PropCounts {
+        let within = self.reach * self.reach;
+        let near = self.waiting.iter().filter(|h| {
+            self.near
+                .as_ref()
+                .and_then(|n| n.by_model.get(h))
+                .is_some_and(|&d| d <= within)
+        });
+        PropCounts {
+            shown: self.shown.len(),
+            loaded: self.models.values().filter(|m| m.is_some()).count(),
+            loading: self.asked.len() + self.decoded.len(),
+            waiting_near: near.count(),
+            waiting: self.waiting.len(),
+            failed: self.failed.len(),
+        }
     }
 
     /// Uploads models that have loaded, nearest `focus` first (as many as
@@ -239,6 +288,7 @@ impl Props {
         focus: Vec3,
         reach: f32,
     ) -> anyhow::Result<()> {
+        self.reach = reach;
         let Some(loaders) = &self.loaders else {
             return Ok(());
         };
@@ -358,16 +408,23 @@ impl Props {
         Ok(())
     }
 
-    /// Draws those within `reach` of `eye`.
-    pub fn draw(&self, queue: &mut DrawQueue, eye: Vec3, reach: f32) {
+    /// Draws those `frustum` may see within their reach of `eye`, as the
+    /// island's props are drawn: each no further than [`PROP_SIZES`] times
+    /// its size, nor than `limit`.
+    pub fn draw(&self, queue: &mut DrawQueue, eye: Vec3, frustum: &Frustum, limit: f32) {
         for p in self.shown.values() {
-            if p.position.distance(eye) > reach {
+            let Some(Some(m)) = self.models.get(&p.model) else {
+                continue;
+            };
+            let (lo, hi) = m.gpu.bounds;
+            let size = (hi - lo).length();
+            let reach = (size * PROP_SIZES).min(limit);
+            let centre = p.position + p.rotation * ((lo + hi) * 0.5);
+            if centre.distance_squared(eye) > reach * reach || !frustum.sees(centre, size * 0.5) {
                 continue;
             }
-            if let Some(Some(m)) = self.models.get(&p.model) {
-                let at = Mat4::from_rotation_translation(p.rotation, p.position);
-                m.gpu.draw_as(queue, at, p.wrecked);
-            }
+            let at = Mat4::from_rotation_translation(p.rotation, p.position);
+            m.gpu.draw_as(queue, at, p.wrecked);
         }
     }
 }

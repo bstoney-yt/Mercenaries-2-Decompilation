@@ -77,6 +77,9 @@ const HOP: f32 = 25.0;
 /// stands within the second distance, metres.
 const RIDE_FOR: f32 = 120.0;
 const RIDE_NEAR: f32 = 40.0;
+/// One of the scripts' vehicles she hasn't driven is taken from this far,
+/// metres: they brought it for her.
+const RIDE_FRESH: f32 = 150.0;
 /// Out of a vehicle without a cannon this far from a target, metres.
 const GET_OUT: f32 = 40.0;
 /// Within this far of a vehicle's door she presses to get in, metres;
@@ -178,8 +181,10 @@ pub struct Autoplay {
     reversing: Option<(f32, f32)>,
     /// Seconds a vehicle has been stuck.
     stalled: f32,
-    /// The vehicle she drove last (index into the scene's).
+    /// The vehicle she drove last, and all she has driven (indices into
+    /// the scene's).
     ride: Option<usize>,
+    ridden: Vec<usize>,
     /// Seconds since she last pressed to get in or out.
     pressed: f32,
     /// Getting out of the vehicle she is stuck in, to go on on foot.
@@ -218,7 +223,12 @@ impl Autoplay {
             return Intent::default();
         }
         match p.driving {
-            Some(i) => self.ride = Some(i),
+            Some(i) => {
+                self.ride = Some(i);
+                if !self.ridden.contains(&i) {
+                    self.ridden.push(i);
+                }
+            }
             None => self.leave = false,
         }
         self.ground(game);
@@ -387,19 +397,26 @@ impl Autoplay {
             .collect();
         let m = nearest(places, here)?;
         if driving.is_none() {
-            // Far, with a ride close (hers from before, or one of the
-            // scripts' vehicles): take it.
-            let near = |i: usize| {
+            // Far, with a ride close: the scripts' vehicle they brought
+            // last that she hasn't driven (the tank delivered for the next
+            // leg), else hers from before or another of theirs.
+            let near = |i: usize, within: f32| {
                 vehicles.get(i).is_some_and(|v| !v.wrecked)
                     && vehicle_at(game, i)
-                        .is_some_and(|t| t.w_axis.truncate().distance(here) < RIDE_NEAR)
+                        .is_some_and(|t| t.w_axis.truncate().distance(here) < within)
             };
-            if m.at.distance(here) > RIDE_FOR
-                && let Some(i) = self
-                    .ride
+            let fresh = (0..vehicles.len())
+                .rev()
+                .filter(|&i| vehicles[i].guid.is_some() && !self.ridden.contains(&i))
+                .find(|&i| near(i, RIDE_FRESH));
+            let known = || {
+                self.ride
                     .into_iter()
                     .chain((0..vehicles.len()).filter(|&i| vehicles[i].guid.is_some()))
-                    .find(|&i| near(i))
+                    .find(|&i| near(i, RIDE_NEAR))
+            };
+            if m.at.distance(here) > RIDE_FOR
+                && let Some(i) = fresh.or_else(known)
             {
                 return Some((
                     Goal::Board(i),
@@ -841,15 +858,19 @@ impl Autoplay {
                 && self.clock - self.way_logged > LOG_WAY
             {
                 self.way_logged = self.clock;
+                let end = route.points.last().copied().unwrap_or(pos);
+                let short = (route.goal - end).with_y(0.0).length();
                 let how = if route.reaches {
                     format!(
                         "goes round: {:.0} m, not {straight:.0} m straight",
                         route.length()
                     )
+                } else if short < 0.5 {
+                    "is not found: no step brings her nearer, so straight at it".to_owned()
                 } else {
                     format!(
-                        "is not found: as close as {:.0} m",
-                        route.remaining(route.points[route.points.len() - 1])
+                        "is not found: {:.0} m of way ends {short:.0} m short",
+                        route.length()
                     )
                 };
                 eprintln!(
@@ -1305,16 +1326,19 @@ pub(crate) fn stuck_report(
             _ => format!("? at {k} m"),
         })
         .collect();
-    // What its body touches, where on the model.
+    // What its body touches, where on the model, and the box what it
+    // touches fills.
     let to_model = m.inverse();
     let touching: Vec<String> = physics
         .vehicle_touching(id)
         .iter()
-        .map(|&(key, at)| {
+        .map(|&(key, at, (lo, hi))| {
             format!(
-                "{} at {:.1}",
+                "{} at {:.1}, filling {:.1} to {:.1}",
                 crate::static_name(world, key),
-                to_model.transform_point3(at)
+                to_model.transform_point3(at),
+                lo,
+                hi
             )
         })
         .collect();
