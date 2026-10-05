@@ -238,8 +238,13 @@ impl Atmosphere {
                     ])?,
                     contrast_limit: f(&["BloomContastLimit", "BloomContrastLimit"])?,
                     contrast: f(&["BloomContastMultiplier", "BloomContrastMultiplier"])?,
-                    // `M2_LUMINANCE=log`: the geometric mean, as before.
+                    // `M2_LUMINANCE=log`: the geometric mean, as before;
+                    // a number raises the plain mean to it.
                     log_average: env_is("M2_LUMINANCE", "log"),
+                    average_power: std::env::var("M2_LUMINANCE")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1.0),
                 })
             })(),
             water_ramp: {
@@ -303,6 +308,7 @@ impl Atmosphere {
                     contrast_limit: f(a.contrast_limit, b.contrast_limit),
                     contrast: f(a.contrast, b.contrast),
                     log_average: b.log_average,
+                    average_power: b.average_power,
                 }),
                 (_, b) => b,
             },
@@ -457,20 +463,18 @@ impl Atmosphere {
             // that `ScatteringTermMultiplier.x` is 1 there is inferred from
             // `ScatterExtinctionMultiplier`, 1 in every record). With it the
             // night island and sea came to footage's brightness and hue
-            // (rounds J and I). `M2_EXT_SUN=off` leaves it out, `=norm`
-            // takes it over its brightest channel, `=luma` over its
-            // luminance, and a number takes it that far from white.
+            // (rounds J and I). Half of it (`SUN_TINT`) lands closest on
+            // Carmona by day and on the night sea (round F). `M2_EXT_SUN=off`
+            // leaves it out, `=norm` takes it over its brightest channel,
+            // `=luma` over its luminance, and a number that far from white.
             sun_tint: {
                 let c = self.light_color.max(Vec3::ZERO);
-                match std::env::var("M2_EXT_SUN").as_deref() {
-                    Ok("off") => None,
-                    Ok("norm") => Some(c / c.max_element().max(1e-3)),
-                    Ok("luma") => Some(c / c.dot(Vec3::new(0.2126, 0.7152, 0.0722)).max(1e-3)),
-                    Ok(v) => match v.parse::<f32>() {
-                        Ok(s) => Some(Vec3::ONE.lerp(c, s)),
-                        Err(_) => Some(c),
-                    },
-                    Err(_) => Some(c),
+                let env = std::env::var("M2_EXT_SUN").unwrap_or_default();
+                match env.as_str() {
+                    "off" => None,
+                    "norm" => Some(c / c.max_element().max(1e-3)),
+                    "luma" => Some(c / c.dot(Vec3::new(0.2126, 0.7152, 0.0722)).max(1e-3)),
+                    v => Some(Vec3::ONE.lerp(c, v.parse().unwrap_or(SUN_TINT))),
                 }
             },
             // Surfaces are lit by the sun's brightness alone, its hue
@@ -711,6 +715,11 @@ enum Lit {
     Light,
     Post,
 }
+
+/// How far the air's tint goes from white to the sun's colour (PC round
+/// F: the AMX's hue ratios, the jungle's and town's saturation and the
+/// night sea all land closest at a half).
+const SUN_TINT: f32 = 0.5;
 
 /// The game's cloud mass where our clouds are opaque, over `DarknessK`
 /// in the cloud shader's darkening: fitted to the town's cream sky in

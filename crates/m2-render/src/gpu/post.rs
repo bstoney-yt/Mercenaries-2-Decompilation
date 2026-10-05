@@ -26,7 +26,8 @@ pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 const SHADER: &str = r#"
 struct Post {
-    // x: exposure, y: bloom threshold, z: bloom amount
+    // x: exposure, y: bloom threshold, z: bloom amount, w: the game's tone
+    // map: what the frame's plain mean luminance is raised to
     params: vec4<f32>,
     // rgb: colour grade
     grade: vec4<f32>,
@@ -174,7 +175,7 @@ fn fs_adapt(v: Screen) -> @location(0) vec4<f32> {
     if game_tone_map() {
         let low = post.limits.x;
         let high = max(post.limits.y, low * 1.001);
-        let l = clamp(select(now, exp(now), log_average()), low, high);
+        let l = clamp(select(pow(max(now, 0.0), post.params.w), exp(now), log_average()), low, high);
         let k = mix(post.adapt.y, post.adapt.w, log(l / low) / log(high / low));
         return vec4<f32>(clamp(mix(before, l * k, post.adapt.z), 0.0, 1.0), 0.0, 0.0, 1.0);
     }
@@ -554,7 +555,7 @@ impl Post {
             lighting.exposure,
             lighting.bloom_threshold,
             lighting.bloom,
-            0.0,
+            lighting.tone_map.map_or(1.0, |t| t.average_power),
         ];
         let grade = lighting.grade.extend(1.0).to_array();
         let glowing = lighting.bloom > 0.0;
@@ -601,7 +602,7 @@ impl Post {
                 params: if glowing {
                     params
                 } else {
-                    [params[0], 0.0, 0.0, 0.0]
+                    [params[0], 0.0, 0.0, params[3]]
                 },
                 grade,
                 step: [step[0], step[1], lighting.grain, frame as f32],
