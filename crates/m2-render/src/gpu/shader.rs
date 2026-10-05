@@ -44,7 +44,19 @@ struct Frame {
     clouds: vec4<f32>,
     // xy: wind (x, z), z: clouds on
     wind: vec4<f32>,
+    // The water's colour (rgb) and opacity (a) through none, a third, two
+    // thirds and all of water_depth.y metres of it
+    water_ramp: array<vec4<f32>, 4>,
+    // x: the ramp is set, y: metres at its end
+    water_depth: vec4<f32>,
 };
+
+// The depth colour map at `metres` of water looked through.
+fn water_ramp(metres: f32) -> vec4<f32> {
+    let u = clamp(metres / frame.water_depth.y, 0.0, 1.0) * 3.0;
+    let i = min(u32(u), 2u);
+    return mix(frame.water_ramp[i], frame.water_ramp[i + 1u], u - f32(i));
+}
 
 struct Draw {
     world: mat4x4<f32>,
@@ -349,14 +361,20 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             depth = max(v.world_pos.y - bed.y, 0.0);
             through = distance(v.world_pos, bed);
         }
-        let shallow = vec3<f32>(0.09, 0.30, 0.34);
-        let tint = mix(shallow, base.rgb, 1.0 - exp(-depth / 5.0));
         let lit = frame.sun_color.rgb * max(dot(n, l), 0.0) * shade;
-        let body = tint * (lit * 0.3 + ambient_light(n));
+        let shallow = vec3<f32>(0.09, 0.30, 0.34);
+        var body = mix(shallow, base.rgb, 1.0 - exp(-depth / 5.0)) * (lit * 0.3 + ambient_light(n));
+        var opacity = 1.0 - exp(-through * 0.2);
+        if frame.water_depth.x > 0.5 {
+            // The atmosphere's depth colour map, by the water looked
+            // through, lit as the game's: sun and ambient alike.
+            let ramp = water_ramp(through);
+            body = ramp.rgb * (lit + ambient_light(n));
+            opacity = ramp.a;
+        }
         let f = 0.02 + 0.98 * pow(1.0 - max(dot(n, view), 0.0), 5.0);
         let glint = frame.sun_color.rgb * pow(max(dot(n, normalize(l + view)), 0.0), 400.0) * 3.0 * shade;
         rgb = mix(body, environment(reflect(-view, n)), f) + glint;
-        let opacity = 1.0 - exp(-through * 0.2);
         water_alpha = mix(opacity, 1.0, f);
         // Foam along the shore, within about 3 m of it as the game's.
         let pattern = base_texel.a * dot(base_texel.rgb, vec3<f32>(0.3333));

@@ -205,6 +205,10 @@ struct FrameUniforms {
     /// and whether there are clouds.
     clouds: [f32; 4],
     wind: [f32; 4],
+    /// The water's depth colour map: four stops, and whether it is set
+    /// and the metres at its end.
+    water_ramp: [[f32; 4]; 4],
+    water_depth: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -1741,6 +1745,15 @@ impl WgpuBackend {
                 } else {
                     0.0
                 },
+                0.0,
+            ],
+            water_ramp: l
+                .water_ramp
+                .map_or([[0.0; 4]; 4], |r| r.map(|c| c.to_array())),
+            water_depth: [
+                if l.water_ramp.is_some() { 1.0 } else { 0.0 },
+                crate::WATER_RAMP_DEPTH,
+                0.0,
                 0.0,
             ],
         };
