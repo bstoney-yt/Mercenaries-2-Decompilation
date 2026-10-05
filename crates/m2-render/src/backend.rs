@@ -81,6 +81,12 @@ pub struct Lighting {
     pub sky_color: Vec3,
     /// Exponential fog density per metre; 0 disables fog.
     pub fog_density: f32,
+    /// Linear RGB of the light rim materials catch where they turn away
+    /// from the eye.
+    pub rim_color: Vec3,
+    /// How far the surface must turn away before the rim shows: it is
+    /// `rim_color * max(rim_threshold - N·V, 0) * (1 - N·L)`.
+    pub rim_threshold: f32,
 }
 
 impl Default for Lighting {
@@ -99,6 +105,8 @@ impl Default for Lighting {
             ],
             sky_color: Vec3::new(0.45, 0.62, 0.85),
             fog_density: 0.0,
+            rim_color: Vec3::ZERO,
+            rim_threshold: 0.0,
         }
     }
 }

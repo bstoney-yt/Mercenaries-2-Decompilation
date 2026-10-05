@@ -20,6 +20,8 @@ struct Frame {
     sky: vec4<f32>,
     // Ambient light from +x, -x, +y, -y, +z, -z
     ambient_cube: array<vec4<f32>, 6>,
+    // rgb: rim light colour, a: how far a surface turns away before it shows
+    rim: vec4<f32>,
 };
 
 struct Draw {
@@ -52,7 +54,7 @@ struct Material {
     // rgb: emitted colour (0: none), w: scaled by the specular map's texel
     emissive: vec4<f32>,
     // x: reflection strength (0: none), y: Fresnel reflectance facing the
-    // eye (negative: no Fresnel)
+    // eye (negative: no Fresnel), z: takes the rim light
     reflection: vec4<f32>,
 };
 
@@ -180,7 +182,13 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         if ground {
             lit = rgb * (frame.sun_color.rgb * max(n_dot_l, 0.0) + ambient_light(n));
         } else {
-            let direct = clamp(frame.sun_color.rgb * max(n_dot_l, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
+            var sun = frame.sun_color.rgb * max(n_dot_l, 0.0);
+            if material.reflection.z > 0.5 {
+                // Rim light where the surface turns away from the eye, on
+                // the side the sun doesn't reach.
+                sun = sun + frame.rim.rgb * max(frame.rim.a - dot(n, view), 0.0) * (1.0 - max(n_dot_l, 0.0));
+            }
+            let direct = clamp(sun, vec3<f32>(0.0), vec3<f32>(1.0));
             lit = rgb * (direct * material.direct.rgb + ambient_light(n) * material.ambient.rgb);
         }
         var tint = vec3<f32>(1.0);

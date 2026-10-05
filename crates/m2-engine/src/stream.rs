@@ -120,10 +120,16 @@ impl Loader {
                 let mut texture =
                     |source: &mut crate::AssetSource<_>, hash: u32, max: u32, linear: bool| {
                         if sent_textures.insert(hash) {
-                            let t = source.texture(hash, max).ok().map(|mut t| {
-                                t.linear = linear;
-                                t
-                            });
+                            let t = match source.texture(hash, max) {
+                                Ok(mut t) => {
+                                    t.linear = linear;
+                                    Some(t)
+                                }
+                                Err(e) => {
+                                    eprintln!("texture {hash:08x}: {e}");
+                                    None
+                                }
+                            };
                             res_tx.send(Loaded::Texture(hash, t)).is_ok()
                         } else {
                             true

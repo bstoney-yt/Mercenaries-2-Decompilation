@@ -33,6 +33,10 @@ pub struct Atmosphere {
     pub light_intensity: f32,
     /// `RimColor` times `RimColorMultiplier`.
     pub rim: Vec3,
+    /// `RimColor`'s alpha byte, taken as the rim light's threshold (the
+    /// shaders' `rimLightColor.w`): inferred, the other colours' alpha
+    /// bytes have no use.
+    pub rim_threshold: f32,
     /// `ScatterInscatteringMultiplier`, `ScatterExtinctionMultiplier`,
     /// `ScatterBetaMieMultiplier` and `ScatterHgG`: the haze.
     pub inscattering: f32,
@@ -71,6 +75,7 @@ impl Atmosphere {
             ambient_cube,
             light_intensity: float(rec, "LightIntensity").unwrap_or(1.0),
             rim: colour("RimColor").unwrap_or(Vec3::ZERO),
+            rim_threshold: field(rec, "RimColor").map_or(0.0, |v| (v >> 24) as f32 / 255.0),
             inscattering: float(rec, "ScatterInscatteringMultiplier").unwrap_or(0.0),
             extinction: float(rec, "ScatterExtinctionMultiplier").unwrap_or(0.0),
             mie: float(rec, "ScatterBetaMieMultiplier").unwrap_or(0.0),
@@ -78,9 +83,12 @@ impl Atmosphere {
         })
     }
 
-    /// Puts the ambient cube and sunlight strength into `lighting`.
+    /// Puts the ambient cube, sunlight strength and rim light into
+    /// `lighting`.
     pub fn apply(&self, lighting: &mut Lighting) {
         lighting.ambient_cube = self.ambient_cube;
+        lighting.rim_color = self.rim;
+        lighting.rim_threshold = self.rim_threshold;
         lighting.sun_color = Lighting::default().sun_color * self.light_intensity;
     }
 }

@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
+use std::sync::OnceLock;
 
 use m2_assets::model::{GeometryKind, Material, TOPOLOGY};
 use m2_assets::vertex::DeclUsage;
@@ -296,14 +297,31 @@ impl MaterialCache {
             normal_map,
             emissive,
             reflection,
+            rim: technique.is_some_and(|t| t.rim),
             depth_bias,
             ..MaterialDesc::default()
+        };
+        let tinted = debug_tint(material, desc.texture.is_some());
+        let desc = if tinted {
+            MaterialDesc {
+                texture: None,
+                color: [1.0, 0.0, 1.0, opacity],
+                ..desc
+            }
+        } else {
+            desc
         };
         let id = self.define(backend, &desc)?;
         if material_textures(material)
             .iter()
             .all(|&(t, _)| self.has_texture(t))
         {
+            if tinted {
+                eprintln!(
+                    "tinted material {:08x}: technique {:08x}, flags {:04x}, textures {:08x?}",
+                    material.name_hash, material.technique, material.flags, material.textures
+                );
+            }
             self.materials.insert(key, id);
         }
         Ok(id)
@@ -384,6 +402,22 @@ pub mod flags {
     /// Never drawn: every material carrying it is coloured with the
     /// default normal map.
     pub const HIDDEN: u16 = 0x0800;
+}
+
+/// Whether to draw `material` solid magenta, to find a surface on screen:
+/// `M2_TINT_FLAGS=<hex mask>` picks materials with any of those flag bits,
+/// `M2_TINT_UNTEXTURED=1` those drawn without a base texture. Each one is
+/// logged once its textures are in.
+fn debug_tint(material: &Material, textured: bool) -> bool {
+    static SETTINGS: OnceLock<(u16, bool)> = OnceLock::new();
+    let &(mask, untextured) = SETTINGS.get_or_init(|| {
+        let mask = std::env::var("M2_TINT_FLAGS")
+            .ok()
+            .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        (mask, std::env::var_os("M2_TINT_UNTEXTURED").is_some())
+    });
+    material.flags & mask != 0 || (untextured && !textured)
 }
 
 /// A material record's base-colour texture (slot 0).
