@@ -754,8 +754,13 @@ impl Game {
                 Some((r, s)) => {
                     let (region, (_, a)) = (&regions[r], &regions[r].settings[s]);
                     eprintln!(
-                        "atmosphere: region {} record {s} (light time {}, intensity {}, tone {:?}, coverage {})",
-                        region.name, a.light_time[0], a.light_intensity, a.tone, a.coverage
+                        "atmosphere: region {} record {s} (light time {}, intensity {}, tone {:?}, coverage {}, tone map {:?})",
+                        region.name,
+                        a.light_time[0],
+                        a.light_intensity,
+                        a.tone,
+                        a.coverage,
+                        a.tone_map
                     );
                 }
                 None => eprintln!("atmosphere: the island's default"),
@@ -820,6 +825,12 @@ impl Game {
 /// atmosphere's own `Tone_*` grade (neutral in the island's default, blue
 /// in the islands' `night`) goes on top.
 fn finish(lighting: &mut m2_render::Lighting) {
+    if game_tone_map() && lighting.tone_map.is_some() {
+        // The game's own: the atmosphere's grade alone, no fitted pass.
+        lighting.exposure = 1.0;
+        return;
+    }
+    lighting.tone_map = None;
     lighting.exposure = 0.9;
     lighting.contrast = 1.35;
     lighting.saturation = 1.5;
@@ -829,10 +840,17 @@ fn finish(lighting: &mut m2_render::Lighting) {
     // brought up part of the way. Key, strength and speed are fitted.
     lighting.adaptation = Some(m2_render::Adaptation {
         key: ADAPT_KEY,
-        strength: 0.7,
+        strength: 0.5,
         speed: 1.5,
         limits: [0.5, 4.0],
     });
+}
+
+/// `M2_TONEMAP=game` finishes frames with the game's own adaptation and
+/// tone map from the atmosphere's settings, in place of the fitted pass.
+fn game_tone_map() -> bool {
+    static GAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GAME.get_or_init(|| std::env::var("M2_TONEMAP").is_ok_and(|v| v == "game"))
 }
 
 /// The frame's average luminance (before exposure) that adaptation leaves

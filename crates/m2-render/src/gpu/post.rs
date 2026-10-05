@@ -32,14 +32,22 @@ struct Post {
     grade: vec4<f32>,
     // xy: sampling step in texture coordinates
     step: vec4<f32>,
-    // x: contrast, y: saturation, z: the luminance contrast pivots on
+    // x: contrast, y: saturation, z: the luminance contrast pivots on,
+    // w: 1 for the game's own tone map (below)
     tone: vec4<f32>,
-    // x: key, y: strength (0: no adaptation), z: how much of the way to
-    // follow this frame, w: unused
+    // Fitted adaptation: x: key, y: strength (0: none), z: how much of the
+    // way to follow this frame. The game's: x: target luminance, y: key
+    // scale at the least luminance, z: as before, w: key scale at the most
     adapt: vec4<f32>,
-    // x, y: the least and most exposure is scaled by
+    // Fitted: x, y: the least and most exposure is scaled by. The game's:
+    // x, y: the least and most luminance adapted to, z: contrast limit,
+    // w: contrast multiplier
     limits: vec4<f32>,
 };
+
+fn game_tone_map() -> bool {
+    return post.tone.w > 0.5;
+}
 
 @group(0) @binding(0) var<uniform> post: Post;
 @group(0) @binding(1) var source: texture_2d<f32>;
@@ -50,7 +58,7 @@ struct Post {
 
 // Exposure, scaled for the eye's adaptation.
 fn exposure() -> f32 {
-    if post.adapt.y <= 0.0 {
+    if game_tone_map() || post.adapt.y <= 0.0 {
         return post.params.x;
     }
     let average = exp(textureLoad(adapted, vec2<i32>(0, 0), 0).r);
@@ -130,18 +138,47 @@ fn fs_reduce(v: Screen) -> @location(0) vec4<f32> {
     return vec4<f32>(sum * 0.25, 0.0, 0.0, 1.0);
 }
 
-// The adapted luminance, moved part of the way to this frame's.
+// The adapted luminance, moved part of the way to this frame's. The
+// game's keeps the luminance itself: the frame's, held within its
+// limits, times a key scale running from the least to the most with its
+// logarithm.
 @fragment
 fn fs_adapt(v: Screen) -> @location(0) vec4<f32> {
     let now = textureLoad(source, vec2<i32>(0, 0), 0).r;
     let before = textureLoad(adapted, vec2<i32>(0, 0), 0).r;
+    if game_tone_map() {
+        let low = post.limits.x;
+        let high = max(post.limits.y, low * 1.001);
+        let l = clamp(exp(now), low, high);
+        let k = mix(post.adapt.y, post.adapt.w, log(l / low) / log(high / low));
+        return vec4<f32>(clamp(mix(before, l * k, post.adapt.z), 0.0, 1.0), 0.0, 0.0, 1.0);
+    }
     return vec4<f32>(mix(before, now, post.adapt.z), 0.0, 0.0, 1.0);
+}
+
+// A display value (sRGB-encoded) as linear light, for the sRGB frame.
+fn display_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let low = c / 12.92;
+    let high = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(high, low, c <= vec3<f32>(0.04045));
 }
 
 @fragment
 fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
     var c = textureSampleLevel(source, linear, v.uv, 0.0).rgb * exposure();
     c = c + textureSampleLevel(glow, linear, v.uv, 0.0).rgb * post.params.z;
+    if game_tone_map() {
+        // As the game's: luminance scaled by the target over the adapted,
+        // compressed, the colour kept at the new luminance, graded, then
+        // a contrast about a limit; its result is a display value.
+        let a = textureLoad(adapted, vec2<i32>(0, 0), 0).r;
+        let y = luminance(c);
+        let ls = y * post.adapt.x / (a + 0.001);
+        let lout = 0.8 * ls / (0.7 + min(min(ls, pow(ls, 0.7)), 10.0));
+        var d = c * (lout / max(y, 1e-5)) * post.grade.rgb;
+        d = clamp(mix(vec3<f32>(post.limits.z), d, post.limits.w), vec3<f32>(0.0), vec3<f32>(1.0));
+        return vec4<f32>(display_to_linear(d), 1.0);
+    }
     // Contrast on luminance about a mid grey, keeping each colour's hue,
     // then saturation.
     let y = luminance(c);
@@ -466,8 +503,15 @@ impl Post {
             .last
             .replace(Some(now))
             .map(|t| now.duration_since(t).as_secs_f32().min(1.0));
-        let (adapt, limits) = match lighting.adaptation {
-            Some(a) => (
+        let rate = |retention_per_frame: f32| {
+            dt.map_or(1.0, |dt| 1.0 - retention_per_frame.powf(dt * 30.0))
+        };
+        let (adapt, limits) = match (lighting.tone_map, lighting.adaptation) {
+            (Some(t), _) => (
+                [t.target, t.min_key, rate(t.retention), t.max_key],
+                [t.min, t.max, t.contrast_limit, t.contrast],
+            ),
+            (None, Some(a)) => (
                 [
                     a.key,
                     a.strength,
@@ -476,8 +520,9 @@ impl Post {
                 ],
                 [a.limits[0], a.limits[1], 0.0, 0.0],
             ),
-            None => ([0.0; 4], [1.0, 1.0, 0.0, 0.0]),
+            (None, None) => ([0.0; 4], [1.0, 1.0, 0.0, 0.0]),
         };
+        let game = lighting.tone_map.is_some();
         let mut steps = [[0.0f32; 2]; PASSES];
         steps[BRIGHT] = [1.0 / w, 1.0 / h];
         steps[1] = [1.0 / gw, 0.0];
@@ -497,7 +542,12 @@ impl Post {
                 },
                 grade,
                 step: [step[0], step[1], 0.0, 0.0],
-                tone: [lighting.contrast, lighting.saturation, 0.18, 0.0],
+                tone: [
+                    lighting.contrast,
+                    lighting.saturation,
+                    0.18,
+                    if game { 1.0 } else { 0.0 },
+                ],
                 adapt,
                 limits,
             };
@@ -526,7 +576,7 @@ impl Post {
             pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         };
-        if lighting.adaptation.is_some() {
+        if game || lighting.adaptation.is_some() {
             pass(
                 &self.log_luminance,
                 &groups[LOG_LUMINANCE],

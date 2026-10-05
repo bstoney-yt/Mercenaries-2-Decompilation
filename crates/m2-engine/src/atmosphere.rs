@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use m2_assets::layer::{Component, Layer};
 use m2_assets::name_hash;
 use m2_math::glam::{Vec2, Vec3, Vec4};
-use m2_render::{Haze, Lighting};
+use m2_render::{Haze, Lighting, ToneMap};
 
 /// Settings read from an `AtmosphereBase` record.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,6 +90,9 @@ pub struct Atmosphere {
     /// thirds and its colours' alpha bytes run 0 to 255 with them), in
     /// linear RGB and opacity.
     pub water_ramp: Option<[Vec4; 4]>,
+    /// `BloomTargetLuminance`, `BloomAdaptiveLuminance*` and
+    /// `BloomContast*` (the game's spelling): its adaptation and tone map.
+    pub tone_map: Option<ToneMap>,
 }
 
 /// Which way the sun stands at `LightTime` 0 (and 0.1, low in the
@@ -184,6 +187,29 @@ impl Atmosphere {
                 float("LightMultiplier_Z").unwrap_or(1.0),
             ),
             interpolate_time: float("InterpolateTime").unwrap_or(0.0),
+            tone_map: (|| {
+                let f = |names: &[&str]| names.iter().find_map(|n| float(n));
+                Some(ToneMap {
+                    target: f(&["BloomTargetLuminance"])?,
+                    retention: f(&["BloomAdaptiveLuminancePercent"])?,
+                    min: f(&["BloomAdaptiveLuminanceMin", "AdaptiveLuminanceMin"])?,
+                    max: f(&["BloomAdaptiveLuminanceMax", "AdaptiveLuminanceMax"])?,
+                    min_key: f(&[
+                        "BloomAdaptiveLuminanceMinKeyScale",
+                        "AdaptiveLuminanceMinKeyScale",
+                        "BloomMinKeyScale",
+                        "MinKeyScale",
+                    ])?,
+                    max_key: f(&[
+                        "BloomAdaptiveLuminanceMaxKeyScale",
+                        "AdaptiveLuminanceMaxKeyScale",
+                        "BloomMaxKeyScale",
+                        "MaxKeyScale",
+                    ])?,
+                    contrast_limit: f(&["BloomContastLimit", "BloomContrastLimit"])?,
+                    contrast: f(&["BloomContastMultiplier", "BloomContrastMultiplier"])?,
+                })
+            })(),
             water_ramp: {
                 let stop = |name: &str| {
                     let v = field(name)?;
@@ -229,6 +255,19 @@ impl Atmosphere {
             wind: std::array::from_fn(|i| f(self.wind[i], to.wind[i])),
             light_color: v(self.light_color, to.light_color),
             interpolate_time: to.interpolate_time,
+            tone_map: match (self.tone_map, to.tone_map) {
+                (Some(a), Some(b)) => Some(ToneMap {
+                    target: f(a.target, b.target),
+                    min: f(a.min, b.min),
+                    max: f(a.max, b.max),
+                    min_key: f(a.min_key, b.min_key),
+                    max_key: f(a.max_key, b.max_key),
+                    retention: f(a.retention, b.retention),
+                    contrast_limit: f(a.contrast_limit, b.contrast_limit),
+                    contrast: f(a.contrast, b.contrast),
+                }),
+                (_, b) => b,
+            },
             water_ramp: match (self.water_ramp, to.water_ramp) {
                 (Some(a), Some(b)) => Some(std::array::from_fn(|i| a[i].lerp(b[i], t))),
                 (_, b) => b,
@@ -263,6 +302,7 @@ impl Atmosphere {
         lighting.clouds.scales = self.cloud_scales;
         lighting.clouds.wind = self.wind;
         lighting.water_ramp = self.water_ramp;
+        lighting.tone_map = self.tone_map;
     }
 
     /// The haze these settings describe: Hoffman and Preetham's standard
@@ -540,6 +580,7 @@ mod tests {
             light_color: Vec3::ONE,
             interpolate_time,
             water_ramp: None,
+            tone_map: None,
         }
     }
 

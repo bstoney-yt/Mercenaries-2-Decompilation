@@ -33,7 +33,7 @@ pub mod texture;
 
 pub use backend::{
     Adaptation, BackendError, Clouds, DrawCall, Geometry, Haze, Lighting, LiveBuffers,
-    RenderBackend, Topology, View, WATER_RAMP_DEPTH,
+    RenderBackend, ToneMap, Topology, View, WATER_RAMP_DEPTH,
 };
 pub use buffer::{
     BufferUsage, IndexBufferDesc, IndexBufferHandle, IndexFormat, SkinHandle, TextureHandle,
