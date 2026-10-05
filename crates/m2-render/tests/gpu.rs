@@ -630,6 +630,30 @@ fn hazy_skies_pale_towards_the_horizon() {
     assert!(up[2] > up[0], "blue overhead: {up:?}");
     let sum = |p: [u8; 4]| p[..3].iter().map(|&c| u32::from(c)).sum::<u32>();
     assert!(sum(horizon) > sum(up), "{horizon:?} vs {up:?}");
+    // Dense noise over most of the sky clouds it over, whiter overhead.
+    let noise = b
+        .create_texture(
+            &TextureDesc {
+                width: 4,
+                height: 4,
+                format: TextureFormat::Rgba8Unorm,
+            },
+            &[&[255; 64]],
+        )
+        .unwrap();
+    v.lighting.clouds = Clouds {
+        noise: Some(noise),
+        coverage: 0.8,
+        ..Clouds::default()
+    };
+    b.begin_frame(&v).unwrap();
+    b.end_frame().unwrap();
+    let cloudy = pixel(&b.read_pixels().unwrap(), 32, 1);
+    eprintln!("cloudy {cloudy:?}");
+    assert!(
+        sum(cloudy) > sum(up) + 60 && cloudy[2] - cloudy[0] < up[2] - up[0],
+        "{cloudy:?} vs {up:?}"
+    );
 }
 
 #[test]

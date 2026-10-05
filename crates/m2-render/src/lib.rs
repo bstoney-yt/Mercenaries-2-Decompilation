@@ -32,7 +32,8 @@ pub mod queue;
 pub mod texture;
 
 pub use backend::{
-    BackendError, DrawCall, Geometry, Haze, Lighting, LiveBuffers, RenderBackend, Topology, View,
+    BackendError, Clouds, DrawCall, Geometry, Haze, Lighting, LiveBuffers, RenderBackend, Topology,
+    View,
 };
 pub use buffer::{
     BufferUsage, IndexBufferDesc, IndexBufferHandle, IndexFormat, SkinHandle, TextureHandle,

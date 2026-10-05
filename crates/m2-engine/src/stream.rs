@@ -402,6 +402,8 @@ pub struct World {
     /// ([`ground_key`]).
     terrain_materials: HashMap<Vec<u32>, MaterialId>,
     sea: (VertexBufferHandle, IndexBufferHandle, MaterialId),
+    /// The sky's cloud noise, if it loaded.
+    pub cloud_noise: Option<m2_render::TextureHandle>,
     stats: WorldStats,
     /// Placed objects (index into the index's `objects`) blown up: drawn
     /// as their wrecks, or not at all without one.
@@ -430,6 +432,16 @@ impl World {
             Ok(t) => materials.add_texture(backend, foam, Some(&t))?,
             Err(e) => eprintln!("sea foam texture {foam:08x}: {e}"),
         }
+        // The noise the game's cloud shaders build the sky's clouds from.
+        let noise = m2_assets::name_hash("cloud_noise");
+        match source.texture(noise, 512) {
+            Ok(mut t) => {
+                t.linear = true;
+                materials.add_texture(backend, noise, Some(&t))?;
+            }
+            Err(e) => eprintln!("cloud noise texture {noise:08x}: {e}"),
+        }
+        let cloud_noise = materials.texture(noise).map(|(t, _)| t);
         drop(source);
         let loader = Loader::spawn(install, index.clone(), TextureLimits::default())?;
         let mut objects: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -460,6 +472,7 @@ impl World {
             by_entity,
             terrain_materials: HashMap::new(),
             sea,
+            cloud_noise,
             stats: WorldStats::default(),
             destroyed: HashSet::new(),
             physics: Physics::new(),

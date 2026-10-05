@@ -40,6 +40,10 @@ struct Frame {
     // x: extinction multiplier, y: Rayleigh scale height, z: Mie scale
     // height (metres), w: density of the air near the ground
     scatter: vec4<f32>,
+    // Clouds: xyz each layer's scale, w coverage
+    clouds: vec4<f32>,
+    // xy: wind (x, z), z: clouds on
+    wind: vec4<f32>,
 };
 
 struct Draw {
@@ -487,12 +491,47 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyVaryings {
     return out;
 }
 
+@group(1) @binding(2) var cloud_noise: texture_2d<f32>;
+@group(1) @binding(3) var cloud_sampler: sampler;
+
+// Height of the cloud deck and the span one repeat of the noise covers at
+// scale 1, metres; and the wind's speed, metres per second. Invented: the
+// game's come from code.
+const CLOUD_HEIGHT: f32 = 1500.0;
+const CLOUD_SPAN: f32 = 12000.0;
+const CLOUD_SPEED: f32 = 6.0;
+
 @fragment
 fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
     // A point on the near plane, then the ray from the eye through it.
     let p = frame.inv_view_proj * vec4<f32>(v.ndc, 1.0, 1.0);
     let r = normalize(p.xyz / p.w - frame.eye.xyz);
-    return vec4<f32>(sky(r), 1.0);
+    var rgb = sky(r);
+    // Where the ray meets the cloud deck, the deck moving with the eye so
+    // clouds stay overhead; sampled before any branch for mip selection.
+    let up = max(r.y, 0.03);
+    let deck = frame.eye.xz + r.xz * (CLOUD_HEIGHT / up);
+    let drift = frame.wind.xy * CLOUD_SPEED * frame.view_dir.w;
+    let n1 = textureSample(cloud_noise, cloud_sampler, (deck + drift) * frame.clouds.x / CLOUD_SPAN).r;
+    let n2 = textureSample(cloud_noise, cloud_sampler, (deck + drift * 0.7) * frame.clouds.y / CLOUD_SPAN).g;
+    let n3 = textureSample(cloud_noise, cloud_sampler, (deck + drift * 0.85) * frame.clouds.z / CLOUD_SPAN).b;
+    if frame.wind.z > 0.5 && r.y > 0.0 {
+        // The broad layer shapes, the finer ones break up the edges; the
+        // coverage sets how much of the sum clears the cut-off.
+        let density = n2 * 0.5 + n3 * 0.3 + n1 * 0.2;
+        let cut = 1.0 - frame.clouds.w;
+        var alpha = smoothstep(cut, cut + 0.2, density);
+        // Thin towards the horizon, where the deck is far and hazy.
+        alpha = alpha * smoothstep(0.0, 0.15, r.y);
+        let l = -normalize(frame.sun_dir.xyz);
+        let c = dot(r, l);
+        // Lit by the sun, brighter looking towards it; thicker cloud is
+        // darker underneath.
+        let lit = frame.sun_color.rgb * (0.55 + 0.45 * pow(max(c, 0.0), 4.0)) * mix(1.0, 0.65, alpha);
+        let cloud = lit + frame.ambient_cube[2].rgb * 0.6;
+        rgb = mix(rgb, cloud, alpha * 0.9);
+    }
+    return vec4<f32>(rgb, 1.0);
 }
 "#;
 

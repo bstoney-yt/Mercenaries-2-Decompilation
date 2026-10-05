@@ -200,6 +200,10 @@ struct FrameUniforms {
     rayleigh: [f32; 4],
     mie: [f32; 4],
     scatter: [f32; 4],
+    /// Clouds: the three layers' scales and the coverage; the wind (x, z)
+    /// and whether there are clouds.
+    clouds: [f32; 4],
+    wind: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -360,6 +364,7 @@ pub struct WgpuBackend {
     /// Bloom, exposure and grade after the world.
     post: post::Post,
     sky: wgpu::RenderPipeline,
+    cloud_layout: wgpu::BindGroupLayout,
     /// The cascades the shadow map holds, as last drawn.
     cascades: std::cell::Cell<Option<shadow::Cascades>>,
     vertex_buffers: Slots<VertexBuffer>,
@@ -649,9 +654,32 @@ impl WgpuBackend {
                 ],
                 immediate_size: 0,
             });
+        // The cloud noise and its sampler, at bindings that don't clash with
+        // the draw group's in the shared source.
+        let cloud_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("clouds"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
         let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sky"),
-            bind_group_layouts: &[Some(&frame_layout)],
+            bind_group_layouts: &[Some(&frame_layout), Some(&cloud_layout)],
             immediate_size: 0,
         });
         let sky_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -847,6 +875,7 @@ impl WgpuBackend {
             started: std::time::Instant::now(),
             post,
             sky,
+            cloud_layout,
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
@@ -1516,12 +1545,34 @@ impl WgpuBackend {
         Ok(())
     }
 
+    /// The sky's cloud group for `noise` (white without one).
+    fn cloud_group(&self, noise: Option<TextureHandle>) -> wgpu::BindGroup {
+        let view = noise
+            .and_then(|t| self.textures.get(t.0).ok())
+            .map_or(&self.white, |t| &t.view);
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("clouds"),
+            layout: &self.cloud_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.samplers[0]),
+                },
+            ],
+        })
+    }
+
     /// One world pass over `draws`, the first of which is draw `first` of
     /// the frame. The first pass clears and draws the sky.
     fn encode_world(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         sky: Vec3,
+        clouds: Option<TextureHandle>,
         draws: &[RecordedDraw],
         first: usize,
         clear: bool,
@@ -1572,6 +1623,7 @@ impl WgpuBackend {
         pass.set_bind_group(0, &self.frame_group, &[]);
         if clear {
             pass.set_pipeline(&self.sky);
+            pass.set_bind_group(1, &self.cloud_group(clouds), &[]);
             pass.draw(0..3, 0..1);
         }
         pass.set_bind_group(3, &self.depth.group, &[]);
@@ -1674,6 +1726,22 @@ impl WgpuBackend {
                 l.haze.mie_height,
                 l.haze.density,
             ],
+            clouds: [
+                l.clouds.scales[0],
+                l.clouds.scales[1],
+                l.clouds.scales[2],
+                l.clouds.coverage,
+            ],
+            wind: [
+                l.clouds.wind[0],
+                l.clouds.wind[1],
+                if l.clouds.noise.is_some() && l.clouds.coverage > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                },
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
@@ -1693,14 +1761,28 @@ impl WgpuBackend {
                     .is_some_and(|m| m.desc.water)
             })
             .unwrap_or(draws.len());
-        self.encode_world(&mut encoder, l.sky_color, &draws[..split], 0, true)?;
+        self.encode_world(
+            &mut encoder,
+            l.sky_color,
+            l.clouds.noise,
+            &draws[..split],
+            0,
+            true,
+        )?;
         if split < draws.len() {
             encoder.copy_texture_to_texture(
                 self.depth.depth.as_image_copy(),
                 self.depth.scene.as_image_copy(),
                 self.depth.depth.size(),
             );
-            self.encode_world(&mut encoder, l.sky_color, &draws[split..], split, false)?;
+            self.encode_world(
+                &mut encoder,
+                l.sky_color,
+                None,
+                &draws[split..],
+                split,
+                false,
+            )?;
         }
         self.post.encode(&self.queue, &mut encoder, l, target);
         Ok(encoder.finish())
