@@ -22,7 +22,8 @@ const SPRINT: f32 = 7.2;
 const JUMP: f32 = 4.0;
 /// Seconds after take-off before touching the ground counts as landing.
 const MIN_AIR: f32 = 0.15;
-/// Seconds before a landing clip's end that the gait takes over again.
+/// Seconds before a landing clip's end that the gait takes over again
+/// (and a bash's).
 const LAND_FADE: f32 = 0.1;
 /// Speeds (m/s) above which she takes off and lands on the run.
 const RUNNING_JUMP: f32 = 1.0;
@@ -143,6 +144,7 @@ impl Intent {
                 fire: input.held(Action::Fire),
                 aim: input.held(Action::Aim),
                 throw: input.take_pressed(Action::Throw),
+                melee: input.take_pressed(Action::Melee),
                 select: if input.take_pressed(Action::Rifle) {
                     Some(Weapon::Rifle)
                 } else if input.take_pressed(Action::Launcher) {
@@ -153,6 +155,15 @@ impl Intent {
             },
         }
     }
+}
+
+/// A melee bash she is in: seconds into it, its clip, and whether it is
+/// the low one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bash {
+    pub time: f32,
+    clip: usize,
+    pub low: bool,
 }
 
 /// Where she is in a jump.
@@ -204,6 +215,9 @@ pub struct Player {
     leap: Leap,
     /// Seconds into a grenade throw, while she throws.
     pub throwing: Option<f32>,
+    /// A melee bash, while she bashes: she stands, facing the camera's
+    /// way.
+    pub bashing: Option<Bash>,
     /// The launcher is up (not the rifle): it rides on her shoulder.
     pub launcher: bool,
     /// Down (out of health): she lies where she fell.
@@ -231,6 +245,7 @@ impl Player {
             clips: FightClips::default(),
             leap: Leap::No,
             throwing: None,
+            bashing: None,
             launcher: false,
             down: false,
         }
@@ -247,6 +262,37 @@ impl Player {
         self.model.as_ref()?;
         self.throwing = Some(0.0);
         Some(release)
+    }
+
+    /// Whether she is free to bash: not throwing, bashing or in a jump.
+    pub fn can_bash(&self) -> bool {
+        self.throwing.is_none() && self.bashing.is_none() && self.leap == Leap::No
+    }
+
+    /// Starts a melee bash (`low`: at something on the ground): the
+    /// seconds until the blow lands. `None` without the clip (it lands at
+    /// once).
+    pub fn start_bash(&mut self, low: bool) -> Option<f32> {
+        let (clip, hit) = if low {
+            self.clips.bash_low.or(self.clips.bash)
+        } else {
+            self.clips.bash
+        }?;
+        let (_, rig) = self.model.as_mut()?;
+        rig.animator.set_upper(None);
+        // From its start, even when it was the last thing played.
+        let again = rig.animator.current().is_some_and(|(c, _)| c == clip);
+        rig.animator.play_once(clip);
+        if again {
+            rig.animator.seek(0.0);
+        }
+        rig.two_handed = false;
+        self.bashing = Some(Bash {
+            time: 0.0,
+            clip,
+            low,
+        });
+        Some(hit)
     }
 
     /// One fixed tick of `dt` seconds.
@@ -296,12 +342,18 @@ impl Player {
         } else {
             RUN
         };
-        let wanted = direction * speed;
-        let jump = (intent.jump && self.character.grounded).then_some(JUMP);
+        // Bashing, she stands.
+        let bashing = self.bashing.is_some();
+        let wanted = if bashing {
+            Vec3::ZERO
+        } else {
+            direction * speed
+        };
+        let jump = (intent.jump && self.character.grounded && !bashing).then_some(JUMP);
         physics.move_character(&mut self.character, wanted, jump, dt);
 
-        // Aiming or throwing, she turns the camera's way.
-        let heading = if self.aiming || self.throwing.is_some() {
+        // Aiming, throwing or bashing, she turns the camera's way.
+        let heading = if self.aiming || self.throwing.is_some() || bashing {
             Some(self.yaw)
         } else {
             (direction.length_squared() > 0.01).then(|| direction.x.atan2(direction.z))
@@ -381,7 +433,16 @@ impl Player {
             } else {
                 Carry::Low
             };
-            if leaping {
+            // A bash plays whole, once, then the gait takes over again.
+            if let Some(b) = &mut self.bashing {
+                b.time += dt;
+                if b.time + LAND_FADE >= rig.clips[b.clip].info.duration {
+                    self.bashing = None;
+                }
+            }
+            if self.bashing.is_some() {
+                rig.two_handed = false;
+            } else if leaping {
                 // The legs jump; the arms keep the weapon as they were
                 // (the jump's own arms fly out).
                 let upper = if carry == Carry::Aim {

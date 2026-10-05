@@ -40,6 +40,7 @@ mod cache;
 mod camera;
 mod combat;
 mod config;
+mod flights;
 mod game;
 mod gamehud;
 mod input;
@@ -47,6 +48,7 @@ mod mission;
 mod npc;
 mod player;
 mod props;
+mod route;
 mod save;
 mod scene;
 mod sound;
@@ -59,6 +61,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
+use m2_engine::physics::PLANE_SPEED;
 use m2_engine::{Gait, Install, WorldSettings};
 use m2_render::gpu::WgpuBackend;
 use m2_render::{DrawQueue, RenderBackend};
@@ -101,7 +104,13 @@ struct Options {
     jump: bool,
     /// With `--screenshot` on foot: throw a grenade just before it.
     throw: bool,
-    /// With `--jump` or `--throw`: seconds before the picture she starts.
+    /// With `--screenshot` on foot: bash just before it.
+    bash: bool,
+    /// With `--bash`: the clip (by hash) to bash with, rather than the one
+    /// chosen.
+    bash_clip: Option<u32>,
+    /// With `--jump`, `--throw` or `--bash`: seconds before the picture she
+    /// starts.
     lead: Option<f32>,
     fight: bool,
     /// With `--screenshot`: rocket the nearest fuel tank or barrel.
@@ -223,6 +232,14 @@ fn parse_args() -> anyhow::Result<Options> {
             "--drive" => o.drive = true,
             "--jump" => o.jump = true,
             "--throw" => o.throw = true,
+            "--bash" => o.bash = true,
+            "--bash-clip" => {
+                let v = value()?;
+                o.bash_clip = Some(
+                    u32::from_str_radix(v.trim_start_matches("0x"), 16)
+                        .context("--bash-clip expects a clip's hash (8 hex digits)")?,
+                );
+            }
             "--lead" => o.lead = Some(value()?.parse().context("--lead expects seconds")?),
             "--fight" => o.fight = true,
             "--blast" => o.blast = true,
@@ -572,21 +589,38 @@ fn screenshot(
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
-    // And for the vehicles and people, and the people to find their feet.
-    // The island's own vehicles get half a minute, as one may fail.
+    // And for the vehicles and people, and the people to find their feet,
+    // and for the vehicles to be parked by her (a look for a spot can take
+    // a while: not timed). The island's own vehicles get half a minute, as
+    // one may fail, and the props within reach two minutes: the frames
+    // are timed as play goes, not as the island first loads.
     while game.scene.world.is_some()
         && (game.scene.vehicles_loading()
-            || (game.island_vehicles_loading() && started.elapsed() < Duration::from_secs(30)))
+            || (game.on_foot
+                && game.scene.player.as_ref().is_some_and(|p| p.landed)
+                && !game.parking_done())
+            || (game.island_vehicles_loading() && started.elapsed() < Duration::from_secs(30))
+            || (!game.scene.props.settled() && started.elapsed() < Duration::from_secs(120)))
         && started.elapsed() < Duration::from_secs(300)
     {
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
+    eprintln!(
+        "props within reach {} after {:.1} s",
+        if game.scene.props.settled() {
+            "loaded"
+        } else {
+            "still loading"
+        },
+        started.elapsed().as_secs_f32()
+    );
     // The last frames are timed: the frame rate here, for checking.
     // Where the time goes: the tick, streaming, building the draws, and
     // submitting the frame.
     let timed = Instant::now();
     let mut parts = [0.0f32; 4];
+    game.scene.streamed = Default::default();
     for _ in 0..FRAMES_TIMED {
         let mut lap = Instant::now();
         let mut split = |i: usize, lap: &mut Instant| {
@@ -611,16 +645,25 @@ fn screenshot(
     }
     let each = timed.elapsed().as_secs_f32() / FRAMES_TIMED as f32;
     let ms = parts.map(|p| p * 1000.0 / FRAMES_TIMED as f32);
+    let streamed = game
+        .scene
+        .streamed
+        .map(|d| d.as_secs_f32() * 1000.0 / FRAMES_TIMED as f32);
     eprintln!(
         "frames: {:.2} ms each ({:.0} fps) over {FRAMES_TIMED}, with a tick each: \
-         tick {:.2}, streaming {:.2}, draws {:.2}, submit {:.2} ms",
+         tick {:.2}, streaming {:.2} (the island {:.2}, vehicles and people {:.2}, \
+         props {:.2}), draws {:.2}, submit {:.2} ms",
         each * 1000.0,
         1.0 / each.max(1e-6),
         ms[0],
         ms[1],
+        streamed[0],
+        streamed[1],
+        streamed[2],
         ms[2],
         ms[3]
     );
+    eprintln!("props: {}", game.scene.props.counts());
     let people = &game.scene.people;
     eprintln!(
         "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",
@@ -701,6 +744,7 @@ fn screenshot(
             options,
             fov,
             aspect,
+            out,
         )?);
     }
     if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -722,7 +766,7 @@ fn screenshot(
             ..Intent::default()
         };
         let from = game.scene.player.as_ref().map(|p| p.character.position);
-        // A jump or throw starts this many ticks before the picture.
+        // A jump, throw or bash starts this many ticks before the picture.
         let lead = (options.lead.unwrap_or(0.2) * 60.0)
             .round()
             .clamp(1.0, 179.0) as usize;
@@ -731,6 +775,25 @@ fn screenshot(
                 p.yaw = face;
                 if i == 0 {
                     p.facing = face;
+                }
+            }
+            // The bash clip asked for, with its blow's time.
+            if let (Some(want), Some(p)) = (options.bash_clip, game.scene.player.as_mut())
+                && i == 0
+            {
+                let found = p.model.as_ref().and_then(|(_, rig)| {
+                    let c = rig.clips.iter().position(|c| c.hash == want)?;
+                    let at = rig.clips[c]
+                        .clip
+                        .events
+                        .iter()
+                        .find(|e| e.name.eq_ignore_ascii_case("meleebash"))
+                        .map_or(0.37, |e| e.time);
+                    Some((c, at))
+                });
+                match found {
+                    Some(clip) => p.clips.bash = Some(clip),
+                    None => eprintln!("--bash-clip {want:08x}: she has no such clip"),
                 }
             }
             // A jump takes the picture on the way up (by default), a
@@ -742,6 +805,7 @@ fn screenshot(
                 // The last shot's flash is still up for the picture.
                 fire: options.fire && i == 177,
                 throw: options.throw && i == 180 - lead,
+                melee: options.bash && i == 180 - lead,
                 select: options.weapon.filter(|_| i == 0),
             };
             game.step(
@@ -761,7 +825,7 @@ fn screenshot(
         if let (Some(p), Some(from)) = (&game.scene.player, from) {
             let hash = |c: usize| p.model.as_ref().map_or(0, |(_, r)| r.clips[c].hash);
             eprintln!(
-                "player: {:?} from {from:.2} to {:.2}, grounded {}, clip {:?}, upper {:?}, throwing {:?}, grenade in hand {}, grenades out {}",
+                "player: {:?} from {from:.2} to {:.2}, grounded {}, clip {:?}, upper {:?}, throwing {:?}, grenade in hand {}, grenades out {}, bashing {:?}",
                 gait,
                 p.character.position,
                 p.character.grounded,
@@ -779,6 +843,7 @@ fn screenshot(
                     .projectiles()
                     .filter(|(rocket, ..)| !rocket)
                     .count(),
+                p.bashing,
             );
         }
     }
@@ -823,12 +888,62 @@ fn screenshot(
     }
     let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
+    write_ppm(&backend, out)?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+/// Writes the frame just rendered offscreen as a binary PPM.
+fn write_ppm(backend: &WgpuBackend, out: &std::path::Path) -> anyhow::Result<()> {
+    let (w, h) = backend.size();
     let rgba = backend.read_pixels()?;
     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
     ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
-    std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))?;
-    eprintln!("wrote {}", out.display());
-    Ok(())
+    std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))
+}
+
+/// A picture of a delivery, from 30 m off its drop point `to` on her
+/// side and 6 m up (clear of the ground there), looking at `at`; written
+/// to `out`, the camera going back to her after.
+#[allow(clippy::too_many_arguments)]
+fn delivery_picture(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    to: m2_math::glam::Vec3,
+    at: m2_math::glam::Vec3,
+    eye: Option<m2_math::glam::Vec3>,
+    out: &std::path::Path,
+) -> anyhow::Result<m2_math::glam::Vec3> {
+    use m2_math::glam::Vec3;
+    let eye = eye.unwrap_or_else(|| {
+        let away = (game.focus() - to)
+            .with_y(0.0)
+            .try_normalize()
+            .unwrap_or(Vec3::X);
+        let mut eye = to + away * 30.0 + Vec3::Y * 6.0;
+        if let Some(world) = &game.scene.world {
+            let top = eye + Vec3::Y * 300.0;
+            if let Some((t, _)) = world.physics.cast_ray(top, Vec3::NEG_Y, 600.0) {
+                eye.y = eye.y.max(top.y - t + 2.0);
+            }
+        }
+        eye
+    });
+    let (on_foot, camera) = (game.on_foot, game.camera);
+    game.on_foot = false;
+    game.camera = FlyCamera::looking_at(eye, at);
+    render(backend, game, fov, aspect, None)?;
+    let written = write_ppm(backend, out);
+    game.on_foot = on_foot;
+    game.camera = camera;
+    written?;
+    eprintln!(
+        "delivery picture: wrote {} from {eye:.1} looking at {at:.1}",
+        out.display()
+    );
+    Ok(eye)
 }
 
 /// How she holds her weapon, for close-ups: where its barrel and its top
@@ -1027,6 +1142,7 @@ fn mission_for_screenshot(
     options: &Options,
     fov: f32,
     aspect: f32,
+    out: &std::path::Path,
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone());
@@ -1061,6 +1177,28 @@ fn mission_for_screenshot(
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     let played = Instant::now();
     let every = if auto.is_some() { 10 } else { 30 };
+    // With --autoplay, a picture of each delivery as its helicopter
+    // hovers over the drop point (`<out>-delivery1.ppm`, ...), and one
+    // from the same place once the load has come down (`-down`).
+    let stem = out
+        .file_stem()
+        .map_or("shot".into(), |s| s.to_string_lossy());
+    let picture = |name: String| out.with_file_name(format!("{stem}-{name}.ppm"));
+    let mut pictured: HashSet<u32> = HashSet::new();
+    let mut down: Vec<(u32, usize, m2_math::glam::Vec3, m2_math::glam::Vec3)> = Vec::new();
+    // And the start's boat from the chase camera once it planes (round
+    // 89's, five seconds after she was seated, caught it barely moving),
+    // or twenty seconds after she is seated if it never does (`-boat`),
+    // and her three seconds after she gets out of it (`-ashore`): the
+    // tick she was seated and the tick each picture is due.
+    let mut seated: Option<u32> = None;
+    let mut boat_shot: Option<u32> = None;
+    let mut ashore_shot: Option<u32> = None;
+    // And what each crate broken open left, as soon as it lies there
+    // (she takes it within a second or two), from 5 m off (`-pickupN`):
+    // the crates seen, and the pictures due (tick, crate).
+    let mut opened: HashSet<u32> = HashSet::new();
+    let mut pickup_shots: Vec<(u32, u32)> = Vec::new();
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match &mut auto {
             Some(a) => {
@@ -1072,8 +1210,138 @@ fn mission_for_screenshot(
         };
         game.step(intent, tick);
         link.tick(game, tick);
+        // Lost (round 88 went on 40 minutes at NaN): nothing more to see.
+        if auto.is_some() && !game.focus().is_finite() {
+            eprintln!(
+                "autoplay: her position is not a number after {:.1} s of play: stopping",
+                i as f32 * tick
+            );
+            break;
+        }
         if i % every == 0 {
             render(backend, game, fov, aspect, None)?;
+        }
+        if auto.is_some() {
+            for (copter, at, to) in game.scene.flights.hovering() {
+                if pictured.insert(copter) {
+                    let n = pictured.len();
+                    let look = (at + to) * 0.5;
+                    let path = picture(format!("delivery{n}"));
+                    let eye = delivery_picture(backend, game, fov, aspect, to, look, None, &path)?;
+                    let vehicles = &game.scene.vehicles;
+                    for (l, hangs, found) in game.scene.flights.hung_from(copter, vehicles) {
+                        match found.map(|i| &vehicles[i]) {
+                            Some(v) => eprintln!(
+                                "delivery picture: {} ({:#x}) hangs at {hangs:.1}, {:.1} m from the eye, \
+                                 its box {:.2}..{:.2}{}",
+                                v.spec.label,
+                                l.guid,
+                                hangs.distance(eye),
+                                v.model.bounds.0,
+                                v.model.bounds.1,
+                                if v.id.is_some() { ", also in play" } else { "" }
+                            ),
+                            None if l.model.is_some() => eprintln!(
+                                "delivery picture: crate {:#x} hangs at {hangs:.1}",
+                                l.guid
+                            ),
+                            None => eprintln!(
+                                "delivery picture: vehicle {:#x} hangs at {hangs:.1} but has not loaded: not drawn",
+                                l.guid
+                            ),
+                        }
+                    }
+                    // Hovering, letting go and four seconds' fall and
+                    // settling.
+                    down.push((i + (6.0 / tick) as u32, n, eye, to));
+                }
+            }
+            let due: Vec<_> = down.iter().filter(|d| d.0 <= i).copied().collect();
+            down.retain(|d| d.0 > i);
+            for (_, n, eye, to) in due {
+                let path = picture(format!("delivery{n}-down"));
+                let look = to + m2_math::glam::Vec3::Y;
+                delivery_picture(backend, game, fov, aspect, to, look, Some(eye), &path)?;
+            }
+            let in_boat = game
+                .scene
+                .player
+                .as_ref()
+                .and_then(|p| p.driving)
+                .and_then(|v| game.scene.vehicles.get(v))
+                .is_some_and(|v| v.spec.is_boat());
+            if in_boat {
+                let since = *seated.get_or_insert(i);
+                let planing = game.driving().is_some_and(|(_, s)| s >= PLANE_SPEED);
+                if boat_shot.is_none() && (planing || i >= since + (20.0 / tick) as u32) {
+                    boat_shot = Some(i);
+                }
+            } else if seated.is_some() {
+                ashore_shot.get_or_insert(i + (3.0 / tick) as u32);
+            }
+            for p in game.scene.flights.pickups() {
+                if opened.insert(p.from) {
+                    pickup_shots.push((i + 1, p.from));
+                }
+            }
+            let due: Vec<u32> = pickup_shots
+                .iter()
+                .filter(|s| s.0 == i)
+                .map(|s| s.1)
+                .collect();
+            for from in due {
+                let lying = game
+                    .scene
+                    .flights
+                    .pickups()
+                    .iter()
+                    .find(|p| p.from == from)
+                    .copied();
+                let Some(p) = lying else {
+                    eprintln!("pickup picture: what the crate {from:#x} left was taken first");
+                    continue;
+                };
+                let away = (p.at - game.focus())
+                    .with_y(0.0)
+                    .try_normalize()
+                    .unwrap_or(m2_math::glam::Vec3::X);
+                let eye = p.at + away * 5.0 + m2_math::glam::Vec3::Y * 2.5;
+                let n = opened.len();
+                delivery_picture(
+                    backend,
+                    game,
+                    fov,
+                    aspect,
+                    p.at,
+                    p.at,
+                    Some(eye),
+                    &picture(format!("pickup{n}")),
+                )?;
+                eprintln!(
+                    "pickup picture: {:#x} lies at {:.1}, its model {}",
+                    p.what.template,
+                    p.at,
+                    match p.what.model {
+                        Some(m) if game.scene.flights.has_model(m) => format!("{m:08x} drawn"),
+                        Some(m) => format!("{m:08x} not loaded: not drawn"),
+                        None => "none".into(),
+                    }
+                );
+            }
+            for (due, name) in [(boat_shot, "boat"), (ashore_shot, "ashore")] {
+                if due == Some(i) {
+                    render(backend, game, fov, aspect, None)?;
+                    write_ppm(backend, &picture(name.into()))?;
+                    match game.driving() {
+                        Some((_, speed)) => eprintln!(
+                            "autoplay: pictured {name} at {:.1} going {speed:.1} m/s, {:.1} s after she was seated",
+                            game.focus(),
+                            (i - seated.unwrap_or(i)) as f32 * tick
+                        ),
+                        None => eprintln!("autoplay: pictured {name} at {:.1}", game.focus()),
+                    }
+                }
+            }
         }
         if auto.is_some() && link.completed() {
             eprintln!(
@@ -1325,8 +1593,9 @@ fn drive_for_screenshot(
     }
     if let (Some(from), Some((to, speed))) = (from, game.driving()) {
         eprintln!(
-            "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s",
-            (to - from).length()
+            "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s, {} objects knocked loose",
+            (to - from).length(),
+            game.scene.world.as_ref().map_or(0, |w| w.knocked())
         );
         // Hardly moved, or stopped: what holds it.
         if ((to - from).length() < 8.0 || speed.abs() < 1.0)
@@ -1419,7 +1688,7 @@ fn drive_for_screenshot(
                     .player
                     .as_ref()
                     .and_then(|p| p.driving)
-                    .is_some_and(|i| game.scene.vehicles[i].spec.kind == "tank");
+                    .is_some_and(|i| game.scene.vehicles[i].spec.cannon());
                 if tank {
                     sound::log_tank_gun(install);
                 }
@@ -2285,6 +2554,7 @@ impl Running {
         self.audio.play_fight(&sounds);
         let engine = self.game.engine();
         self.audio.engine(engine, TICK.as_secs_f32());
+        self.audio.rotors(&self.game.scene.flights.sounding());
         let driving = self.game.driving().is_some();
         let mut remarks = self.game.combat.take_remarks();
         if driving && !self.was_driving {
@@ -2351,7 +2621,7 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Right | winit::event::MouseButton::Left,
                 ..
             } if !state.mouse_look && !state.hud.menu => state.set_mouse_look(true),
-            // With the mouse captured, the buttons fire and aim.
+            // With the mouse captured, the buttons fire, aim and bash.
             WindowEvent::MouseInput {
                 state: pressed,
                 button,
@@ -2360,6 +2630,7 @@ impl ApplicationHandler for App {
                 let action = match button {
                     winit::event::MouseButton::Left => Some(Action::Fire),
                     winit::event::MouseButton::Right => Some(Action::Aim),
+                    winit::event::MouseButton::Middle => Some(Action::Melee),
                     _ => None,
                 };
                 if let Some(a) = action {

@@ -39,7 +39,7 @@
 //!       f32x3 centre of mass, f32 mass, f32x4 unknown (0.3), u32x8 ?,
 //!       u32 0xDDDDDDDD
 //! shape, 0x6C bytes: u32 0xEEEEEEEE, then 26 words: 3 kind (2 mesh),
-//!       4 unknown (a material, probably), 5..10 f32x6 vertex pool bounds
+//!       4 collision class (see [`Shape::class`]), 5..10 f32x6 vertex pool bounds
 //!       (meshes), 16 vertex count, 18 vertex pool offset (meshes),
 //!       24 shape index, 25 0xFFFFFFFF
 //! vertex pool: u16x3 per vertex, quantised; a vertex is
@@ -180,6 +180,27 @@ pub struct Shape {
     pub part: usize,
     /// The shape record's words, after the marker.
     pub record: [u32; 26],
+}
+
+/// The collision class of plants' and bushes' leafy hulls
+/// ([`Shape::class`]). Over the 18,031 shapes of the island's 2,471
+/// placed models with `PHY2`, 31 have it (record word 4 `0x28`), 19 of
+/// them on models named as plants or bushes and none on a tree, rock,
+/// wall or sign; 16,253 have class 7 (`0x27`), the rest 0, 3 or 5.
+pub const FOLIAGE: u32 = 8;
+
+impl Shape {
+    /// The low five bits of record word 4: the shape's collision class,
+    /// where Havok's group filter keeps a layer (unconfirmed). Nearly
+    /// every shape is class 7; leaves are [`FOLIAGE`].
+    pub fn class(&self) -> u32 {
+        self.record[4] & 0x1f
+    }
+
+    /// A plant's or bush's leaves ([`FOLIAGE`]).
+    pub fn is_foliage(&self) -> bool {
+        self.class() == FOLIAGE
+    }
 }
 
 /// A parsed `PHY2` section.

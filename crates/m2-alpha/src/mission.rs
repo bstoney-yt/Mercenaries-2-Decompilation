@@ -15,11 +15,13 @@
 //! The models of the state layers they load (a mission's gates) stand
 //! while the layer is in, and break when the scripts' object dies: a gate
 //! to destroy breaks to a blast by it or a vehicle driven into it. Their
-//! helicopters, boats and supply drops are not shown yet.
+//! deliveries come by helicopter ([`crate::flights`]): the crate, the jeep
+//! and the tank hang under it until it lets go over the drop point. Their
+//! boats are not shown yet.
 //!
 //! The scripts' log goes to `m2-alpha-mission.log` beside the settings.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -34,7 +36,9 @@ use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
+use crate::combat::Weapon;
 use crate::config::Config;
+use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::scene::NOT_DRIVABLE;
 
@@ -42,7 +46,7 @@ use crate::scene::NOT_DRIVABLE;
 const STEP: f32 = 0.1;
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
-const WATERLINE: f32 = -36.0;
+pub(crate) const WATERLINE: f32 = -36.0;
 /// How close a blast destroys a target the scripts named (a gate), metres:
 /// from its model's box, or from its place when it shows no model.
 const BLAST_PAD: f32 = 4.0;
@@ -56,9 +60,10 @@ const SPEED_FADE: f32 = 12.0;
 /// Seconds an objective message stays up.
 const MESSAGE_TIME: f32 = 6.0;
 /// The scripts' vehicles are loaded within this far of the player, metres,
-/// and at most this many.
+/// and at most this many in play at once (wrecks and those they removed
+/// don't count).
 const VEHICLE_REACH: f32 = 300.0;
-const MAX_VEHICLES: usize = 16;
+const MAX_VEHICLES: usize = 24;
 /// The scripts put vehicles they don't need yet far under the island
 /// (about 40 km down): those below this height aren't placed.
 const HIDDEN_BELOW: f32 = -1000.0;
@@ -146,6 +151,18 @@ struct Fleet {
     /// The one she was driving when the scripts moved it: she gets back in
     /// once it is placed again.
     reenter: Option<u32>,
+    /// Let go by a delivery's helicopter, falling from where they hung:
+    /// not placed afresh when the scripts move them to the drop point.
+    dropped: HashSet<u32>,
+    /// Those let go, by the scripts' time until which the scripts keep
+    /// them at the drop point as they fall and land.
+    landing: HashMap<u32, f64>,
+    /// Ticks left for the vehicle the scripts seated her in (the start's
+    /// boat) to load and be placed, she waiting where it is ([`reenter`]
+    /// names it); then she goes ashore instead.
+    ///
+    /// [`reenter`]: Self::reenter
+    boarding: u32,
 }
 
 impl std::fmt::Debug for MissionLink {
@@ -236,6 +253,54 @@ impl MissionLink {
         let State::Running(mission) = &mut self.state else {
             return;
         };
+        // Deliveries fly on; the scripts hear of each load let go.
+        let focus = game.focus();
+        let scene = &mut game.scene;
+        if let Some(world) = &mut scene.world {
+            for r in scene
+                .flights
+                .step(dt, &mut world.physics, &mut scene.vehicles, focus)
+            {
+                for &g in &r.dropped {
+                    self.vehicles.landing.insert(g, mission.now() + LANDING);
+                }
+                self.vehicles.dropped.extend(r.dropped);
+                mission.arrived(r.pilot, r.to.to_array());
+            }
+        }
+        // A crate she broke open is destroyed for the scripts too (what
+        // it held, it leaves of itself: no script spawns it).
+        for (g, at) in scene.flights.take_broken() {
+            match scene.flights.pickups().iter().find(|p| p.from == g) {
+                Some(p) => eprintln!(
+                    "mission: crate {g:#x} broken open at {at:.1}: it leaves {} ({:#x}), model {}, giving {}",
+                    scene
+                        .world
+                        .as_ref()
+                        .and_then(|w| w.index.template_db.by_id(p.what.template))
+                        .map_or("?", |t| t.0),
+                    p.what.template,
+                    p.what.model.map_or("none".into(), |m| format!("{m:08x}")),
+                    p.what.gives.map_or("her nothing".into(), |(w, n)| format!(
+                        "{n} rounds for her {w:?}"
+                    )),
+                ),
+                None => {
+                    eprintln!("mission: crate {g:#x} broken open at {at:.1}: it leaves nothing")
+                }
+            }
+            mission.kill(g);
+        }
+        // The vehicle she was seated in never came: ashore instead.
+        if self.vehicles.boarding > 0 {
+            self.vehicles.boarding -= 1;
+            if self.vehicles.boarding == 0
+                && let Some(g) = self.vehicles.reenter.take()
+            {
+                eprintln!("mission: {g:#x} to seat her in did not load: she goes ashore");
+                self.ashore = ASHORE_TRIES;
+            }
+        }
         if self.ashore > 0 && game.scene.player.as_ref().is_some_and(|p| p.landed) {
             self.ashore -= 1;
             // Thousands of rays a look: twice a second is plenty.
@@ -257,6 +322,9 @@ impl MissionLink {
                 && self.vehicles.reenter.is_none()
             {
                 mission.put_player(at.to_array());
+            }
+            for (g, at, yaw) in game.scene.flights.places(&game.scene.vehicles) {
+                mission.place(g, at.to_array(), yaw);
             }
             self.vehicles.sync(game, mission);
             for guid in game.scene.people.all_killed() {
@@ -299,10 +367,18 @@ impl MissionLink {
                     mission.kill(*g);
                 }
             }
+            // A target knocked loose (shoved over by a vehicle, thrown by a
+            // blast) is destroyed too.
+            for e in game.scene.props.take_knocked() {
+                if targets.iter().any(|t| t.0 == e) {
+                    mission.kill(e);
+                }
+            }
             self.blasts.clear();
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
+                fly(game, mission, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
                 }
@@ -329,6 +405,7 @@ impl MissionLink {
             .map_or([0.0; 3], |p| p.character.position.to_array());
         match Mission::new(data, "Mattias", at) {
             Ok(mut mission) => {
+                mission.fly_deliveries();
                 for (name, code) in std::mem::take(&mut self.drivers) {
                     if let Err(e) = mission.run(&code, &name) {
                         self.write([format!("{name}: {e}")]);
@@ -514,11 +591,7 @@ impl MissionLink {
                 ));
             }
         }
-        let (shown, loaded, loading, waiting, failed) = game.scene.props.counts();
-        out.push(format!(
-            "props: {shown} shown; their models {loaded} loaded, {loading} loading, {waiting} \
-             waiting, {failed} failed"
-        ));
+        out.push(format!("props: {}", game.scene.props.counts()));
         out
     }
 
@@ -660,21 +733,35 @@ impl Fleet {
                         .get(&g)
                         .filter(|o| o.alive && o.position[1] > HIDDEN_BELOW)
                     && !w.winch.get(&g).is_some_and(Option::is_some)
+                    && !game.scene.flights.carrying(g)
                     && place(physics, v, Vec3::from(o.position), o.yaw)
                     && self.reenter == Some(g)
                     && let Some(p) = game.scene.player.as_mut()
                 {
                     p.driving = Some(i);
+                    // Seated, she no longer waits to land.
+                    p.landed = true;
                     self.reenter = None;
+                    self.boarding = 0;
+                    eprintln!(
+                        "mission: she is seated in {} ({g:#x}){}",
+                        v.spec.label,
+                        if v.spec.is_boat() { ", afloat" } else { "" }
+                    );
                 }
             }
         }
+        let now = mission.now();
+        self.landing.retain(|_, until| *until > now);
         for v in &game.scene.vehicles {
             let (Some(g), Some(id)) = (v.guid, v.id) else {
                 continue;
             };
             if v.wrecked {
                 mission.kill(g);
+            }
+            if self.landing.contains_key(&g) {
+                continue;
             }
             if let Some(m) = physics.vehicle_transform(id) {
                 let f = m.transform_vector3(Vec3::Z);
@@ -690,12 +777,7 @@ impl Fleet {
             return;
         };
         let near = player.character.position;
-        let none = Templates::default();
-        let templates = game
-            .scene
-            .world
-            .as_ref()
-            .map_or(&none, |w| &w.index.template_db);
+        let island = game.scene.world.as_ref();
         let w = mission.world().borrow();
         let mut wanted: Vec<(f32, u32, Vec<CatalogueEntry>)> = w
             .objects
@@ -706,25 +788,37 @@ impl Fleet {
                 (d <= VEHICLE_REACH).then_some((d, g, o))
             })
             .filter_map(|(d, g, o)| {
-                let models = template_models(&o.name, templates, &catalogue.vehicles);
+                let models = object_models(g, &o.name, island, &catalogue.vehicles);
                 (!models.is_empty()).then_some((d, g, models))
             })
             .collect();
+        // Those the scripts still have in play count against the most.
+        let live = self
+            .requested
+            .iter()
+            .filter(|g| w.objects.get(g).is_some_and(|o| o.alive))
+            .count();
         drop(w);
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (_, g, models) in wanted {
-            if self.requested.len() >= MAX_VEHICLES {
-                break;
-            }
+        for (_, g, models) in wanted.into_iter().take(MAX_VEHICLES.saturating_sub(live)) {
             self.requested.insert(g);
             game.scene.load_vehicle(g, models);
         }
     }
 }
 
+/// Seconds the scripts keep a vehicle a helicopter let go at its drop
+/// point (where they moved it) while it falls the last few metres and
+/// settles, so they see it delivered there.
+const LANDING: f64 = 3.0;
+
 /// Ticks the player gets to go ashore: about ten seconds for the ground
 /// around her to load.
 const ASHORE_TRIES: u32 = 600;
+
+/// Ticks a vehicle the scripts seat her in gets to load and be placed:
+/// about 30 seconds.
+const BOARDING: u32 = 1800;
 
 /// Moves a player standing under the sea to the nearest dry ground within
 /// 1.5 km. True once she stands on dry ground (moved there, or there
@@ -795,6 +889,124 @@ fn break_props(game: &mut Game, mission: &Mission) {
     scene.props.hide(&mut world.physics, gone);
 }
 
+/// Starts the helicopter a delivery's pilot flies (an `Ai.Deliver` order)
+/// with what hangs from its winch, sends it home once it has let go (the
+/// scripts' `MoveTo`), and takes away crates the scripts remove. A
+/// delivery whose helicopter the scripts don't have arrives at once.
+fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
+    match c {
+        Command::Goal {
+            guid,
+            goal,
+            location: Some(to),
+            ..
+        } if goal == "Deliver" => {
+            let none = Templates::default();
+            let templates = game
+                .scene
+                .world
+                .as_ref()
+                .map_or(&none, |w| &w.index.template_db);
+            let catalogue = game
+                .scene
+                .catalogue
+                .as_ref()
+                .map_or(&[][..], |c| c.vehicles.as_slice());
+            let flight = {
+                let w = mission.world().borrow();
+                let copter = w.objects.get(guid).and_then(|o| o.vehicle).unwrap_or(*guid);
+                w.objects.get(&copter).map(|o| {
+                    let template = templates.get(&o.name);
+                    let model = template.and_then(|t| t.model);
+                    let bank = template.and_then(|t| t.engine);
+                    let mut loads: Vec<Load> = w
+                        .winch
+                        .iter()
+                        .filter(|(_, c)| **c == Some(copter))
+                        .filter_map(|(&g, _)| {
+                            let name = &w.objects.get(&g)?.name;
+                            // A vehicle of theirs is the scene's; anything
+                            // else hangs as its template's model.
+                            let vehicle = !template_models(name, templates, catalogue).is_empty();
+                            Some(Load {
+                                guid: g,
+                                model: (!vehicle)
+                                    .then(|| templates.get(name).and_then(|t| t.model))
+                                    .flatten(),
+                                leaves: (!vehicle).then(|| leaves(templates, name)).flatten(),
+                            })
+                        })
+                        .collect();
+                    loads.sort_by_key(|l| l.guid);
+                    let copter = Copter {
+                        guid: copter,
+                        pilot: *guid,
+                        model,
+                        bank,
+                    };
+                    (copter, o.name.clone(), Vec3::from(o.position), loads)
+                })
+            };
+            match flight {
+                Some((copter, name, from, loads)) => {
+                    // A vehicle to carry that is already down (it loaded
+                    // before the scripts hung it on the winch) is taken up,
+                    // with her got out of it first.
+                    for l in loads.iter().filter(|l| l.model.is_none()) {
+                        let (Some(i), Some(world)) = (
+                            game.scene
+                                .vehicles
+                                .iter()
+                                .position(|v| v.guid == Some(l.guid)),
+                            &mut game.scene.world,
+                        ) else {
+                            continue;
+                        };
+                        if let Some(p) = game.scene.player.as_mut().filter(|p| p.driving == Some(i))
+                        {
+                            get_out(&world.physics, &game.scene.vehicles[i], p);
+                        }
+                        if let Some(id) = game.scene.vehicles[i].id.take() {
+                            world.physics.remove_vehicle(id);
+                            eprintln!("mission: {:#x} taken up to be carried", l.guid);
+                        }
+                    }
+                    eprintln!(
+                        "mission: {name} flies a delivery from {from:.1} to {:.1}, model {}, \
+                         sound bank {}, carrying {:?}",
+                        Vec3::from(*to),
+                        copter
+                            .model
+                            .map_or("unknown".to_owned(), |m| format!("{m:08x}")),
+                        copter.bank.map_or("none".to_owned(), |b| format!(
+                            "{b:08x} {}",
+                            crate::sound::bank_name(b).unwrap_or("?")
+                        )),
+                        loads
+                    );
+                    game.scene
+                        .flights
+                        .start(copter, loads, from, Vec3::from(*to));
+                }
+                None => mission.arrived(*guid, *to),
+            }
+        }
+        Command::Goal {
+            guid,
+            goal,
+            location: Some(to),
+            ..
+        } if goal == "MoveTo" && game.scene.flights.flying(*guid) => {
+            game.scene.flights.send_home(*guid, Vec3::from(*to));
+        }
+        Command::Remove(guid) => game
+            .scene
+            .flights
+            .removed(*guid, game.scene.world.as_mut().map(|w| &mut w.physics)),
+        _ => {}
+    }
+}
+
 /// Carries out a script command about the player, the scripts' vehicles
 /// or the layers they stream; true when it seated her in a vehicle the
 /// island doesn't show, so she stands where it is.
@@ -814,6 +1026,32 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 p.driving = Some(i);
                 return false;
             }
+            // One still to load (the start's boat): she waits where it is,
+            // to be seated once it is placed.
+            let w = mission.world().borrow();
+            let catalogue = game
+                .scene
+                .catalogue
+                .as_ref()
+                .map_or(&[][..], |c| c.vehicles.as_slice());
+            if let Some(o) = w.objects.get(vehicle)
+                && !object_models(*vehicle, &o.name, game.scene.world.as_ref(), catalogue)
+                    .is_empty()
+            {
+                let at = Vec3::from(o.position);
+                drop(w);
+                fleet.reenter = Some(*vehicle);
+                fleet.boarding = BOARDING;
+                fleet.look = 0;
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.character.position = at;
+                    p.character.velocity = Vec3::ZERO;
+                    p.driving = None;
+                    p.chase_target = None;
+                }
+                eprintln!("mission: she waits at {at:.1} for {vehicle:#x} to load, to be seated");
+                return false;
+            }
         }
         Command::ExitVehicle(guid) if *guid == PLAYER => {
             fleet.reenter = None;
@@ -825,6 +1063,8 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // A delivery's load let go: falling from where it hung.
+        Command::Move { guid, .. } if fleet.dropped.remove(guid) => return false,
         // Moved by the scripts: a vehicle is placed afresh where they now
         // say, with her back in it if she was driving it; a layer's model
         // just moves.
@@ -921,9 +1161,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
 }
 
 /// The model a vehicle template of the scripts' drives as: the template
-/// database's, when it has the template and it drives on the ground
-/// (boats and helicopters don't drive yet); else the catalogue models
-/// whose name fits the template's words ([`vehicle_models`]).
+/// database's, when it has the template and it drives on the ground or
+/// floats (helicopters don't fly yet); else the catalogue models whose
+/// name fits the template's words ([`vehicle_models`]).
 pub(crate) fn template_models(
     name: &str,
     templates: &Templates,
@@ -932,14 +1172,14 @@ pub(crate) fn template_models(
     match templates.get(name) {
         Some(&TemplateInfo {
             model: Some(model),
-            vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank)),
+            vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank | VehicleKind::Boat)),
             ..
         }) => vec![CatalogueEntry {
             model,
-            kind: if kind == VehicleKind::Tank {
-                "tank"
-            } else {
-                "car"
+            kind: match kind {
+                VehicleKind::Tank => "tank",
+                VehicleKind::Boat => m2_engine::vehicle::BOAT,
+                _ => "car",
             }
             .to_owned(),
             label: member_stem(name).to_owned(),
@@ -949,6 +1189,62 @@ pub(crate) fn template_models(
             ..
         }) => Vec::new(),
         _ => vehicle_models(name, catalogue),
+    }
+}
+
+/// Her weapons by their models (the AK and RPG she carries), for the
+/// pickups that give their ammunition.
+const WEAPON_MODELS: [(&str, Weapon); 2] = [
+    ("global_weapon_ak47", Weapon::Rifle),
+    ("global_weapon_rpg", Weapon::Rpg),
+];
+
+/// What the scripts' object `name` (a supply crate) leaves once destroyed:
+/// the pickup its template's `SpawnOnDeath` names, giving the rounds of
+/// one of her weapons when its ammunition is one of theirs (a template
+/// with that weapon's model fires it).
+fn leaves(templates: &Templates, name: &str) -> Option<Leaves> {
+    let left = *templates.leavings.spawns.get(&templates.id(name)?)?;
+    let info = templates.leavings.pickups.get(&left)?;
+    let fires = |weapon: &str, ammo: u32| {
+        let model = name_hash(weapon);
+        templates.leavings.ammo.iter().any(|(&w, &a)| {
+            a == ammo
+                && templates
+                    .by_id(w)
+                    .is_some_and(|(_, t)| t.model == Some(model))
+        })
+    };
+    let gives = info.ammo.and_then(|ammo| {
+        WEAPON_MODELS
+            .iter()
+            .find(|(m, _)| fires(m, ammo))
+            .map(|&(_, w)| (w, info.rounds))
+    });
+    Some(Leaves {
+        template: left,
+        model: templates.by_id(left).and_then(|(_, t)| t.model),
+        reach: info.radius,
+        gives,
+    })
+}
+
+/// The models one of the scripts' objects drives as
+/// ([`template_models`]): by its name, else (a state layer's renamed
+/// entity, the first contract's `VzaCon001_StartingBoat`) by the template
+/// it is an instance of.
+fn object_models(
+    guid: u32,
+    name: &str,
+    world: Option<&m2_engine::World>,
+    catalogue: &[CatalogueEntry],
+) -> Vec<CatalogueEntry> {
+    let none = Templates::default();
+    let templates = world.map_or(&none, |w| &w.index.template_db);
+    let models = template_models(name, templates, catalogue);
+    match world.and_then(|w| w.index.state_vehicles.get(&guid)) {
+        Some(t) if models.is_empty() => template_models(&t.name, templates, catalogue),
+        _ => models,
     }
 }
 
@@ -1024,6 +1320,61 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_supply_crate_leaves_rockets_for_her_rpg() {
+        use m2_engine::pickup::{Leavings, PickupInfo};
+        let info = |model| TemplateInfo {
+            model,
+            vehicle: None,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let (crate_id, rockets, rpg, missile) =
+            (0x8000_9ae9, 0x8000_56dc, 0x8000_437b, 0x8000_4379);
+        let pickup = PickupInfo {
+            radius: 1.0,
+            ammo: Some(missile),
+            rounds: 20,
+            cue: None,
+            effect: None,
+        };
+        let db = Templates {
+            by_name: HashMap::from([
+                ("supply drop (gl)".to_owned(), info(Some(0x81c7_1c96))),
+                ("ammo pickup (rocket)".to_owned(), info(Some(0x8e77_a04d))),
+                ("rpg".to_owned(), info(Some(name_hash("global_weapon_rpg")))),
+            ]),
+            names: HashMap::from([
+                (crate_id, "Supply Drop (GL)".to_owned()),
+                (rockets, "Ammo Pickup (Rocket)".to_owned()),
+                (rpg, "RPG".to_owned()),
+            ]),
+            leavings: Leavings {
+                spawns: HashMap::from([(crate_id, rockets)]),
+                pickups: HashMap::from([(rockets, pickup)]),
+                ammo: HashMap::from([(rpg, missile)]),
+            },
+            ..Templates::default()
+        };
+        let left = leaves(&db, "Supply Drop (GL) 0x40000001").expect("the crate leaves its pickup");
+        assert_eq!(
+            left,
+            Leaves {
+                template: rockets,
+                model: Some(0x8e77_a04d),
+                reach: 1.0,
+                gives: Some((Weapon::Rpg, 20)),
+            }
+        );
+        // Ammunition for no weapon of hers gives her nothing; a template
+        // that leaves nothing, nothing at all.
+        let mut db = db;
+        db.leavings.ammo.clear();
+        assert_eq!(leaves(&db, "Supply Drop (GL)").unwrap().gives, None);
+        assert!(leaves(&db, "RPG").is_none());
+    }
+
+    #[test]
     fn templates_find_their_vehicles() {
         let catalogue = [
             entry(1, "truck", "gr_veh_truck_m151"),
@@ -1077,8 +1428,7 @@ mod tests {
                     info(None, Some(VehicleKind::Car)),
                 ),
             ]),
-            names: HashMap::new(),
-            tuning: HashMap::new(),
+            ..Templates::default()
         };
         let models = |n: &str| -> Vec<(u32, String)> {
             template_models(n, &db, &catalogue)
@@ -1092,8 +1442,8 @@ mod tests {
             [(0xabc, "car".to_owned())]
         );
         assert_eq!(models("AMX30 (Full)"), [(0xdef, "tank".to_owned())]);
-        // A boat doesn't drive yet.
-        assert!(models("Patrol Boat (VZ)").is_empty());
+        // A boat floats.
+        assert_eq!(models("Patrol Boat (VZ)"), [(0x123, "boat".to_owned())]);
         // Without a model in the database, the words find the catalogue's.
         assert_eq!(models("M151 Softtop (GL)"), [(1, "truck".to_owned())]);
     }

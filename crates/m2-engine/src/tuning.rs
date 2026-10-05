@@ -103,13 +103,13 @@ const CAMERA_HEIGHT: u32 = 0x2afa_6ae4;
 const CAMERA_SEATS: [&str; 2] = ["seat_driver", "seat_gunner"];
 
 /// One component's records by template id, and its fields by name hash.
-struct Table<'a> {
+pub(crate) struct Table<'a> {
     fields: HashMap<u32, (usize, u8, u8)>,
     records: HashMap<u32, Vec<&'a [u8]>>,
 }
 
 impl<'a> Table<'a> {
-    fn new(db: &Layer<'a>, component: &str) -> Self {
+    pub(crate) fn new(db: &Layer<'a>, component: &str) -> Self {
         let Some(c) = db.component(component) else {
             return Self {
                 fields: HashMap::new(),
@@ -139,13 +139,18 @@ impl<'a> Table<'a> {
         }
     }
 
+    /// The templates with a record.
+    pub(crate) fn templates(&self) -> impl Iterator<Item = u32> + '_ {
+        self.records.keys().copied()
+    }
+
     /// Template `id`'s records (a component may be on it more than once).
-    fn of_template(&self, id: u32) -> &[&'a [u8]] {
+    pub(crate) fn of_template(&self, id: u32) -> &[&'a [u8]] {
         self.records.get(&id).map_or(&[], Vec::as_slice)
     }
 
     /// Field `field`'s word in `record`, its bits if it is a bit field.
-    fn word(&self, record: &[u8], field: u32) -> Option<u32> {
+    pub(crate) fn word(&self, record: &[u8], field: u32) -> Option<u32> {
         let &(at, shift, width) = self.fields.get(&field)?;
         let b = record.get(at..at + 4)?;
         let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -156,7 +161,7 @@ impl<'a> Table<'a> {
         })
     }
 
-    fn float(&self, record: &[u8], field: u32) -> Option<f32> {
+    pub(crate) fn float(&self, record: &[u8], field: u32) -> Option<f32> {
         self.word(record, field)
             .map(f32::from_bits)
             .filter(|f| f.is_finite())
@@ -181,6 +186,8 @@ impl<'a> Table<'a> {
 pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
     let tank = Table::new(db, "_TankPhysics");
     let car = Table::new(db, "_CarPhysicsV2");
+    // A boat's, if it names them as the others do.
+    let boat = Table::new(db, "_BoatPhysics");
     let turret = Table::new(db, "Turret");
     let camera = Table::new(db, "CameraTank");
     let links = Table::new(db, "PhysicalLink");
@@ -196,6 +203,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
         .records
         .keys()
         .chain(car.records.keys())
+        .chain(boat.records.keys())
         .chain(turret.records.keys())
         .chain(camera.records.keys())
         .copied()
@@ -205,10 +213,10 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
     ids.into_iter()
         .map(|id| {
             let t = VehicleTuning {
-                mass: [&tank, &car]
+                mass: [&tank, &car, &boat]
                     .iter()
                     .find_map(|t| t.get(id, "Mass").filter(|m| *m > 0.0)),
-                max_speed: [&tank, &car]
+                max_speed: [&tank, &car, &boat]
                     .iter()
                     .find_map(|t| t.get(id, "MaxSpeed").filter(|s| *s > 0.0))
                     .map(|kmh| kmh / 3.6),
