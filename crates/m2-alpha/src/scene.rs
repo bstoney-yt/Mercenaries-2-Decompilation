@@ -465,7 +465,8 @@ pub enum Loaded {
     /// stands (position, yaw), its spec and model.
     WorldVehicle(u32, Vec3, f32, VehicleSpec, CpuModel),
     Catalogue(Catalogue),
-    Person(PersonModel, CpuModel, Skeleton),
+    /// A person's model: a role's, or a story character's (true).
+    Person(PersonModel, CpuModel, Skeleton, bool),
     /// A hand weapon: name, model, muzzle (model space).
     Weapon(&'static str, CpuModel, Vec3),
 }
@@ -522,7 +523,10 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                 let data = source.model(p.model)?;
                 let cpu = CpuModel::from_data(&data, 0)?;
                 let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
-                if tx.send(Loaded::Person(p.clone(), cpu, skeleton)).is_err() {
+                if tx
+                    .send(Loaded::Person(p.clone(), cpu, skeleton, false))
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
@@ -804,6 +808,33 @@ impl Scene {
         });
     }
 
+    /// Loads a story character's model (`Carmona`'s, by their template)
+    /// on a thread; it joins the people's kinds as `template`.
+    fn load_character(&self, model: u32, template: String) {
+        let Some(install) = self.install.clone() else {
+            return;
+        };
+        let tx = self.requests.0.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut source = install.open_world()?;
+                let data = source.model(model)?;
+                let cpu = CpuModel::from_data(&data, 0)?;
+                let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
+                let person = PersonModel {
+                    model,
+                    role: template.clone(),
+                    soldier: false,
+                };
+                let _ = tx.send(Loaded::Person(person, cpu, skeleton, true));
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("{template} ({model:08x}): {e:#}");
+            }
+        });
+    }
+
     /// Decodes the first of `models` that drives on a thread and sends it
     /// as `make` wraps it; `what` names it in errors.
     fn load_vehicle_as(
@@ -852,6 +883,9 @@ impl Scene {
         if let Ok(loaded) = self.requests.1.try_recv() {
             self.take(backend, loaded)?;
         }
+        for (model, template) in std::mem::take(&mut self.people.wanted) {
+            self.load_character(model, template);
+        }
         if let (Some(world), Some(source)) = (&mut self.world, &mut self.source) {
             self.props
                 .update(backend, &mut self.materials, source, &mut world.physics)?;
@@ -881,7 +915,7 @@ impl Scene {
             Loaded::Vehicle(_, cpu)
             | Loaded::MissionVehicle(_, _, cpu)
             | Loaded::WorldVehicle(_, _, _, _, cpu)
-            | Loaded::Person(_, cpu, _)
+            | Loaded::Person(_, cpu, _, _)
             | Loaded::Weapon(_, cpu, _) => cpu,
         };
         self.materials
@@ -932,7 +966,7 @@ impl Scene {
                     .map(|(_, rig)| rig);
                 self.arsenal.add(name, model, muzzle, rig);
             }
-            Loaded::Person(p, _, skeleton) => {
+            Loaded::Person(p, _, skeleton, named) => {
                 // Her clips fit every human skeleton.
                 let template = self
                     .player
@@ -950,6 +984,7 @@ impl Scene {
                         self.people.add_kind(PersonKind {
                             role: p.role,
                             soldier: p.soldier,
+                            named,
                             model,
                             rig,
                         });

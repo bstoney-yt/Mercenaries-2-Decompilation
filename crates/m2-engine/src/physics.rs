@@ -114,12 +114,14 @@ impl CollisionShape {
         let mut triangles = Vec::new();
         if let Some(p) = phy2.and_then(|d| Phy2::parse(d).ok()) {
             for (k, s) in p.shapes.iter().enumerate() {
-                // A shape is in its body node's space.
-                let to_model = p
+                // A shape sits at its part's place in its body node's
+                // space.
+                let node = p
                     .shape_node(k)
                     .and_then(|n| u16::try_from(n).ok())
                     .and_then(|n| model.node_to_model(n))
                     .unwrap_or(Mat4::IDENTITY);
+                let to_model = node * p.shape_place(k).map_or(Mat4::IDENTITY, place);
                 let (v, t) = s.geometry.triangles(s.radius);
                 let first = vertices.len() as u32;
                 vertices.extend(v.iter().map(|&x| to_model.transform_point3(Vec3::from(x))));
@@ -170,6 +172,18 @@ impl CollisionShape {
         }
         Self::mesh(&vertices, &triangles)
     }
+}
+
+/// A `PHY2` part's place (position, rotation x y z w) as a matrix; a
+/// rotation that isn't one counts as none.
+fn place((position, rotation): ([f32; 3], [f32; 4])) -> Mat4 {
+    let q = Quat::from_array(rotation);
+    let q = if q.is_finite() && q.length() > 0.5 {
+        q.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    Mat4::from_rotation_translation(q, Vec3::from(position))
 }
 
 /// What a static collider belongs to, so it can be removed with it.

@@ -53,8 +53,13 @@ const DODGE_TIME: f32 = 2.0;
 /// A person model and the rig that animates it.
 #[derive(Debug)]
 pub struct PersonKind {
+    /// `vz_hum_soldier`, `civ_hum_female`, ...; a story character's
+    /// template (`Carmona`).
     pub role: String,
     pub soldier: bool,
+    /// A story character, in their template's own model: stands only
+    /// where the layers place them, never dealt out as a passer-by.
+    pub named: bool,
     pub model: GpuModel,
     pub rig: Rig,
 }
@@ -488,6 +493,11 @@ pub struct People {
     /// The state layers in, by name hash: a state layer's people stand
     /// only while it is. `None` when that isn't known (all of them stand).
     pub state_layers: Option<HashSet<u32>>,
+    /// Story characters' models to load, by their template: model and
+    /// template name (taken by the scene).
+    pub wanted: Vec<(u32, String)>,
+    /// Models asked for so far.
+    asked: HashSet<u32>,
     active: HashSet<u32>,
     rng: Rng,
 }
@@ -522,8 +532,30 @@ impl People {
             .is_some_and(|k| k.role.contains("female"))
     }
 
+    /// The kind of a story character's spawn, once their model is in: a
+    /// person template named in one word (`Carmona`, not `Allied
+    /// Soldier`) with a model of its own. Asks for the model the first
+    /// time.
+    fn character(&mut self, s: &SpawnPoint) -> Option<usize> {
+        let (template, model) = (s.template.as_deref()?, s.model?);
+        if template.contains(' ') {
+            return None;
+        }
+        if let Some(k) = self
+            .kinds
+            .iter()
+            .position(|k| k.named && k.role == template)
+        {
+            return Some(k);
+        }
+        if self.asked.insert(model) {
+            self.wanted.push((model, template.to_owned()));
+        }
+        None
+    }
+
     pub fn add_kind(&mut self, kind: PersonKind) {
-        if !kind.soldier {
+        if !kind.soldier && !kind.named {
             // Civilians are dealt out across the kinds in: start them
             // again so the new one gets its share.
             self.npcs.retain(|n| n.spawn.is_some());
@@ -677,10 +709,8 @@ impl People {
         }
     }
 
-    /// Whether a state layer's people stand: it is in, or which are in
-    /// isn't known.
     /// Whether a spawn of state layer `layer` (`None`: a static one) can
-    /// stand now.
+    /// stand now: it is in, or which are in isn't known.
     pub fn layer_in(&self, layer: Option<u32>) -> bool {
         layer.is_none_or(|l| {
             self.state_layers
@@ -714,7 +744,7 @@ impl People {
             _ => true,
         });
         let civilian_kinds: Vec<usize> = (0..self.kinds.len())
-            .filter(|&k| !self.kinds[k].soldier)
+            .filter(|&k| !self.kinds[k].soldier && !self.kinds[k].named)
             .collect();
         for n in self.npcs.iter_mut().filter(|n| n.spawn.is_none()) {
             if far(n.character.position, INACTIVE) {
@@ -767,13 +797,14 @@ impl People {
             }
             // Who: the template's name says (a renamed entity's own name
             // doesn't), else the entity's, else a mission's target is a
-            // plain soldier.
+            // plain soldier; or a story character.
             let kind = s
                 .template
                 .as_deref()
                 .and_then(|t| self.kind_for(t))
                 .or_else(|| self.kind_for(&s.name))
-                .or_else(|| target.then(|| self.kind_for("vz soldier")).flatten());
+                .or_else(|| target.then(|| self.kind_for("vz soldier")).flatten())
+                .or_else(|| self.character(s));
             let Some(kind) = kind else {
                 continue;
             };
@@ -800,6 +831,8 @@ impl People {
                 Some(s.entity),
             );
             npc.layer = s.layer;
+            // A story character doesn't fight.
+            npc.soldier = self.kinds[kind].soldier;
             self.npcs.push(npc);
         }
         // Civilians, once their models are in.
@@ -951,6 +984,7 @@ pub(crate) mod tests {
         people.kinds.push(PersonKind {
             role: "vz_hum_soldier".into(),
             soldier: true,
+            named: false,
             model: empty_model(),
             rig: rig(),
         });
@@ -962,6 +996,7 @@ pub(crate) mod tests {
             rotation: Quat::IDENTITY,
             route: Vec::new(),
             layer: None,
+            model: None,
         };
         let spawns = [
             spawn(1, "VZ Soldier 01", 10.0),
@@ -1000,12 +1035,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn story_characters_stand_in_their_own_model() {
+        let mut physics = ground();
+        let mut people = People::default();
+        let spawn = |entity, template: &str, model| SpawnPoint {
+            entity,
+            name: format!("{template}_VzaCon001"),
+            template: Some(template.into()),
+            position: Vec3::new(10.0, 0.0, 0.0),
+            rotation: Quat::IDENTITY,
+            route: Vec::new(),
+            layer: None,
+            model: Some(model),
+        };
+        let spawns = [
+            spawn(7, "Carmona", 0xbf83),
+            spawn(8, "Allied Soldier", 0x45cc),
+        ];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        // Nobody yet: his model is asked for (once), a soldier of another
+        // army's isn't.
+        assert!(people.npcs.is_empty());
+        assert_eq!(people.wanted, [(0xbf83, "Carmona".to_owned())]);
+        people.wanted.clear();
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        assert!(people.wanted.is_empty());
+        people.add_kind(PersonKind {
+            role: "Carmona".into(),
+            soldier: false,
+            named: true,
+            model: empty_model(),
+            rig: rig(),
+        });
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let him: Vec<_> = people.npcs.iter().filter(|n| n.spawn == Some(7)).collect();
+        assert_eq!(him.len(), 1);
+        assert!(!him[0].soldier, "he doesn't fight");
+        // Never dealt out as a passer-by.
+        assert!(people.npcs.iter().all(|n| n.spawn.is_some()));
+    }
+
+    #[test]
     fn a_state_layers_soldiers_stand_while_it_is_in() {
         let mut physics = ground();
         let mut people = People::default();
         people.kinds.push(PersonKind {
             role: "vz_hum_soldier".into(),
             soldier: true,
+            named: false,
             model: empty_model(),
             rig: rig(),
         });
@@ -1018,6 +1095,7 @@ pub(crate) mod tests {
             rotation: Quat::IDENTITY,
             route: Vec::new(),
             layer: Some(0xc0),
+            model: None,
         };
         let spawns = [guard];
         let tick = |people: &mut People, physics: &mut Physics| {

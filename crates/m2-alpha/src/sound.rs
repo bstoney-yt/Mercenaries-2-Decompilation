@@ -231,13 +231,15 @@ const AMBIENT_LONGEST: f32 = 8.0;
 /// Engine banks for vehicles whose template doesn't name one (the
 /// template database's `SoundEffect` does for most), by kind and label
 /// words, first match: the banks the templates give such vehicles.
-const ENGINES: [(&str, &str); 12] = [
+const ENGINES: [(&str, &str); 13] = [
     ("helicopter", "veh_helicoptermedium"),
     ("hmmwv|humvee|valiant", "veh_largegascrappy"),
     ("m151|jeep", "veh_jeep"),
     ("amx", "veh_tankmed"),
+    // The Stryker is the game's LAV III.
+    ("stryker|lav", "veh_largedieselold"),
+    ("m113|apc", "veh_tankdiesel"),
     ("tank", "veh_tankbig"),
-    ("apc|stryker", "veh_tankmed"),
     ("semi", "veh_semi"),
     ("bus", "veh_bus"),
     ("pickup|truck", "veh_8cylindertruck"),
@@ -827,7 +829,11 @@ mod tests {
     #[test]
     fn engines_go_by_kind_and_name() {
         assert_eq!(engine_bank("tank", "al_veh_tank_m1"), "veh_tankbig");
-        assert_eq!(engine_bank("car", "al_veh_apc_stryker"), "veh_tankmed");
+        assert_eq!(
+            engine_bank("car", "al_veh_apc_stryker"),
+            "veh_largedieselold"
+        );
+        assert_eq!(engine_bank("apc", "vz_veh_apc_m113"), "veh_tankdiesel");
         assert_eq!(engine_bank("truck", "semi_orange"), "veh_semi");
         assert_eq!(
             engine_bank("car", "global_veh_68valiant4door"),
