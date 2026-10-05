@@ -137,7 +137,7 @@ const LOG_WAY: f32 = 30.0;
 const OPEN_NEAR: f32 = 40.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
-const OPEN_FOR: f32 = 30.0;
+const OPEN_FOR: f32 = 45.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
 
@@ -336,6 +336,29 @@ impl Autoplay {
             ms.into_iter()
                 .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
         }
+        // A supply crate down near her or marked (or the one she set out
+        // to open): broken open first, for what is inside.
+        if driving.is_none()
+            && let Some((target, d)) = game
+                .scene
+                .flights
+                .crates_standing()
+                .filter(|g| !self.left_shut.contains(g))
+                .filter_map(|g| {
+                    let (at, _) = game.scene.flights.crate_standing(g)?;
+                    let d = at.distance(here);
+                    let wanted = live.iter().any(|m| m.target == g)
+                        || self.opening.is_some_and(|o| o.0 == g)
+                        || d < OPEN_NEAR;
+                    wanted.then_some((g, d))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            return Some((
+                Goal::Open(target),
+                format!("opening the supply crate {target:#x}, {d:.0} m off"),
+            ));
+        }
         // What to destroy, nearest first: soldiers are shot, things blown up.
         let destroy: Vec<&Mark> = live
             .iter()
@@ -389,27 +412,6 @@ impl Autoplay {
                     m.target,
                     at.distance(here)
                 ),
-            ));
-        }
-        // A supply crate down near her (or marked): broken open on the
-        // way, for what is inside.
-        if driving.is_none()
-            && let Some((target, d)) = game
-                .scene
-                .flights
-                .crates_standing()
-                .filter(|g| !self.left_shut.contains(g))
-                .filter_map(|g| {
-                    let (at, _) = game.scene.flights.crate_standing(g)?;
-                    let d = at.distance(here);
-                    let marked = live.iter().any(|m| m.target == g);
-                    (marked || d < OPEN_NEAR).then_some((g, d))
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-        {
-            return Some((
-                Goal::Open(target),
-                format!("opening the supply crate {target:#x}, {d:.0} m off"),
             ));
         }
         // The scripts' vehicles they mark: in, or by where it will be.
@@ -554,11 +556,14 @@ impl Autoplay {
         if to.length() > half + OPEN_FROM {
             return self.walk(game, at, half + OPEN_FROM, dt);
         }
+        // Standing, she turns only to aim: so she aims round to it, and
+        // bashes once she faces it.
         let yaw = to.x.atan2(to.z);
         let facing = wrap(yaw - p.facing).abs() < OPEN_FACING;
         Intent {
             look: turn_to(p, yaw, CRUISE_PITCH, dt),
             trigger: Trigger {
+                aim: true,
                 melee: facing,
                 ..Trigger::default()
             },
