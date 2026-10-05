@@ -87,6 +87,8 @@ pub struct Lighting {
     /// How far the surface must turn away before the rim shows: it is
     /// `rim_color * max(rim_threshold - N·V, 0) * (1 - N·L)`.
     pub rim_threshold: f32,
+    /// Metres from the camera that sun shadows reach; 0 turns them off.
+    pub shadow_distance: f32,
 }
 
 impl Default for Lighting {
@@ -107,6 +109,7 @@ impl Default for Lighting {
             fog_density: 0.0,
             rim_color: Vec3::ZERO,
             rim_threshold: 0.0,
+            shadow_distance: 200.0,
         }
     }
 }

@@ -498,3 +498,62 @@ fn overlays_draw_over_the_finished_world() {
     let sky = &pixels[..4];
     assert!(sky[2] > sky[0], "{sky:?}");
 }
+
+#[test]
+fn objects_shadow_what_the_sun_lights_behind_them() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(MaterialId(1), &MaterialDesc::default())
+        .unwrap();
+    // A cut-out caster runs the shadow fragment stage.
+    b.set_material(
+        MaterialId(2),
+        &MaterialDesc {
+            blend: BlendMode::Masked { cutoff: 0.5 },
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    let mut v = View::perspective(
+        Vec3::new(0.0, 6.0, -6.0),
+        Vec3::new(0.0, -1.0, 1.0),
+        60f32.to_radians(),
+        1.0,
+        0.1,
+        100.0,
+    );
+    // Sunlight slanting down along +x: the slab 2 m up shades the ground
+    // around x = 2, not around x = -2.
+    v.lighting.sun_direction = Vec3::new(1.0, -1.0, 0.0);
+    let up = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let ground = Mat4::from_scale(Vec3::splat(10.0)) * up;
+    let slab = Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0)) * up;
+    let at = |p: Vec3| {
+        let c = (v.projection * v.view).project_point3(p);
+        (
+            ((c.x * 0.5 + 0.5) * SIZE as f32) as u32,
+            ((0.5 - c.y * 0.5) * SIZE as f32) as u32,
+        )
+    };
+    let frame = |b: &mut WgpuBackend, v: &View, slab_material| {
+        b.begin_frame(v).unwrap();
+        b.draw(&draw(vb, ib, 1, ground)).unwrap();
+        b.draw(&draw(vb, ib, slab_material, slab)).unwrap();
+        b.end_frame().unwrap();
+        b.read_pixels().unwrap()
+    };
+    let (s, l) = (at(Vec3::new(2.0, 0.0, 0.0)), at(Vec3::new(-2.0, 0.0, 0.0)));
+    for slab_material in [1, 2] {
+        let rgba = frame(&mut b, &v, slab_material);
+        let (shaded, lit) = (pixel(&rgba, s.0, s.1)[0], pixel(&rgba, l.0, l.1)[0]);
+        assert!(
+            shaded + 40 < lit,
+            "material {slab_material}: shaded {shaded}, lit {lit}"
+        );
+    }
+    // Without shadows both sides match.
+    v.lighting.shadow_distance = 0.0;
+    let rgba = frame(&mut b, &v, 1);
+    let (s, l) = (pixel(&rgba, s.0, s.1)[0], pixel(&rgba, l.0, l.1)[0]);
+    assert!(s.abs_diff(l) <= 2, "unshadowed {s}, {l}");
+}

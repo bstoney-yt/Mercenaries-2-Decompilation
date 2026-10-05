@@ -22,6 +22,14 @@ struct Frame {
     ambient_cube: array<vec4<f32>, 6>,
     // rgb: rim light colour, a: how far a surface turns away before it shows
     rim: vec4<f32>,
+    // The way the camera looks
+    view_dir: vec4<f32>,
+    // World to each sun shadow cascade's clip space
+    shadow: array<mat4x4<f32>, 4>,
+    // View depth where each cascade ends (all 0: no shadows)
+    shadow_splits: vec4<f32>,
+    // Metres per shadow texel in each cascade
+    shadow_texels: vec4<f32>,
 };
 
 struct Draw {
@@ -59,6 +67,8 @@ struct Material {
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
+@group(0) @binding(1) var shadow_map: texture_depth_2d_array;
+@group(0) @binding(2) var shadow_sampler: sampler_comparison;
 @group(1) @binding(0) var<uniform> draw: Draw;
 @group(1) @binding(1) var<storage, read> palette: array<mat4x4<f32>>;
 @group(2) @binding(0) var<uniform> material: Material;
@@ -102,6 +112,40 @@ fn environment(r: vec3<f32>) -> vec3<f32> {
         return mix(horizon, frame.sky.rgb, sqrt(r.y));
     }
     return mix(horizon * 0.6, frame.ambient_cube[3].rgb, sqrt(-r.y));
+}
+
+// How much sunlight reaches p (0 to 1), from the shadow cascade its view
+// depth falls in, sampled 3 x 3 around it and offset along the surface
+// normal n so a surface doesn't shadow itself.
+fn sunlight(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    let last = frame.shadow_splits.w;
+    if last <= 0.0 {
+        return 1.0;
+    }
+    let depth = dot(p - frame.eye.xyz, frame.view_dir.xyz);
+    var i = 0u;
+    while i < 4u && depth >= frame.shadow_splits[i] {
+        i = i + 1u;
+    }
+    if i >= 4u {
+        return 1.0;
+    }
+    let c = frame.shadow[i] * vec4<f32>(p + n * frame.shadow_texels[i] * 1.5, 1.0);
+    let uv = vec2<f32>(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);
+    if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || c.z > 1.0 {
+        return 1.0;
+    }
+    let texel = 1.0 / f32(textureDimensions(shadow_map).x);
+    var lit = 0.0;
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let o = vec2<f32>(f32(dx), f32(dy)) * texel;
+            lit = lit + textureSampleCompareLevel(shadow_map, shadow_sampler, uv + o, i, c.z);
+        }
+    }
+    // Fades out over the last tenth of the distance.
+    let fade = clamp((last - depth) / (last * 0.1), 0.0, 1.0);
+    return mix(1.0, lit / 9.0, fade);
 }
 
 fn layer_uv(i: u32, p: vec4<f32>) -> vec2<f32> {
@@ -178,11 +222,16 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         let l = -normalize(frame.sun_dir.xyz);
         let n_dot_l = dot(n, l);
         let view = normalize(frame.eye.xyz - v.world_pos);
+        var surface_n = normalize(v.normal + vec3<f32>(0.0, 1e-6, 0.0));
+        if !front {
+            surface_n = -surface_n;
+        }
+        let shade = sunlight(v.world_pos, surface_n);
         var lit: vec3<f32>;
         if ground {
-            lit = rgb * (frame.sun_color.rgb * max(n_dot_l, 0.0) + ambient_light(n));
+            lit = rgb * (frame.sun_color.rgb * max(n_dot_l, 0.0) * shade + ambient_light(n));
         } else {
-            var sun = frame.sun_color.rgb * max(n_dot_l, 0.0);
+            var sun = frame.sun_color.rgb * max(n_dot_l, 0.0) * shade;
             if material.reflection.z > 0.5 {
                 // Rim light where the surface turns away from the eye, on
                 // the side the sun doesn't reach.
@@ -200,7 +249,7 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             let h = normalize(l + view);
             let n_dot_h = dot(n, h);
             if n_dot_h > 0.0 {
-                spec_light = frame.sun_color.rgb * material.specular.rgb * tint * pow(n_dot_h, material.specular.a);
+                spec_light = frame.sun_color.rgb * material.specular.rgb * tint * pow(n_dot_h, material.specular.a) * max(shade, 0.25);
             }
         }
         shine = spec_light;
@@ -237,6 +286,19 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         alpha = alpha * facing * facing;
     }
     return vec4<f32>(rgb, alpha);
+}
+
+// Shadow casters with cut-out textures (leaves, fences) cut their shadow
+// out as they cut themselves.
+@fragment
+fn fs_shadow(v: Varyings) {
+    var a = textureSample(base_map, base_sampler, v.uv).a * material.color.a;
+    if material.params.z > 0.5 && material.maps.w < 0.5 {
+        a = a * v.color.a;
+    }
+    if a < material.params.x {
+        discard;
+    }
 }
 "#;
 

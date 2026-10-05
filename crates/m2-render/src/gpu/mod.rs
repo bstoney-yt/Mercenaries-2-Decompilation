@@ -17,11 +17,12 @@
 //! practice; nothing here comes from the original executable.
 
 mod shader;
+mod shadow;
 
 use std::collections::HashMap;
 
 use ::wgpu::util::DeviceExt;
-use m2_math::glam::Mat4;
+use m2_math::glam::{Mat4, Vec3};
 
 use crate::backend::{
     BackendError, DrawCall, Geometry, LiveBuffers, RenderBackend, Topology, View,
@@ -128,6 +129,9 @@ impl<T> Slots<T> {
 struct VertexBuffer {
     desc: VertexBufferDesc,
     buffer: wgpu::Buffer,
+    /// A sphere around its positions (object space), for shadow culling;
+    /// `None` when unknown (casts everywhere).
+    bounds: Option<(Vec3, f32)>,
 }
 
 #[derive(Debug)]
@@ -178,6 +182,32 @@ struct FrameUniforms {
     sky: [f32; 4],
     ambient_cube: [[f32; 4]; 6],
     rim: [f32; 4],
+    /// The way the camera looks.
+    view_dir: [f32; 4],
+    /// World to each shadow cascade's clip space.
+    shadow: [[f32; 16]; shadow::CASCADES],
+    /// View depth where each cascade ends (all 0: no shadows).
+    shadow_splits: [f32; 4],
+    /// Metres per shadow texel in each cascade.
+    shadow_texels: [f32; 4],
+}
+
+/// What a shadow pipeline depends on.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShadowKey {
+    layout: VertexLayout,
+    topology: Topology,
+    strip_index: Option<IndexFormat>,
+    /// Alpha-tested: runs a fragment stage to cut out.
+    masked: bool,
+}
+
+/// How a draw casts sun shadows.
+#[derive(Debug)]
+struct Caster {
+    pipeline: ShadowKey,
+    /// World-space sphere around it; `None` casts into every cascade.
+    sphere: Option<(Vec3, f32)>,
 }
 
 #[repr(C)]
@@ -248,6 +278,7 @@ struct RecordedDraw {
     material: MaterialId,
     /// Instances drawn (1 when not instanced).
     instances: u32,
+    caster: Option<Caster>,
 }
 
 /// Where frames go.
@@ -287,6 +318,10 @@ pub struct WgpuBackend {
     pipeline_layout: wgpu::PipelineLayout,
     frame_buffer: wgpu::Buffer,
     frame_group: wgpu::BindGroup,
+    shadow_pipeline_layout: wgpu::PipelineLayout,
+    /// Per cascade: its layer of the shadow map, and its frame uniforms
+    /// (the cascade's matrix as `view_proj`).
+    shadow_layers: Vec<(wgpu::TextureView, wgpu::Buffer, wgpu::BindGroup)>,
     draw_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
     draw_group: wgpu::BindGroup,
@@ -297,6 +332,7 @@ pub struct WgpuBackend {
 
     shaders: HashMap<VertexLayout, wgpu::ShaderModule>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    shadow_pipelines: HashMap<ShadowKey, wgpu::RenderPipeline>,
     vertex_buffers: Slots<VertexBuffer>,
     index_buffers: Slots<IndexBuffer>,
     textures: Slots<Texture>,
@@ -322,6 +358,20 @@ fn wgpu_vertex_format(f: VertexFormat) -> wgpu::VertexFormat {
         VertexFormat::Half2 => wgpu::VertexFormat::Float16x2,
         VertexFormat::Half4 => wgpu::VertexFormat::Float16x4,
     }
+}
+
+/// `layout`'s elements as shader locations 0, 1, ...
+fn vertex_attributes(layout: &VertexLayout) -> Vec<wgpu::VertexAttribute> {
+    layout
+        .elements()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| wgpu::VertexAttribute {
+            format: wgpu_vertex_format(e.format),
+            offset: u64::from(e.offset),
+            shader_location: i as u32,
+        })
+        .collect()
 }
 
 fn wgpu_index_format(f: IndexFormat) -> wgpu::IndexFormat {
@@ -466,8 +516,33 @@ impl WgpuBackend {
     ) -> Self {
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
-            entries: &[uniform_entry(0, false)],
+            entries: &[
+                uniform_entry(0, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
         });
+        // The shadow passes draw into the map, so their frame group can't
+        // also bind it.
+        let shadow_frame_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow frame"),
+                entries: &[uniform_entry(0, false)],
+            });
         let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("draw"),
             entries: &[
@@ -519,19 +594,88 @@ impl WgpuBackend {
             ],
             immediate_size: 0,
         });
-        let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frame uniforms"),
-            size: size_of::<FrameUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shadow"),
+                bind_group_layouts: &[
+                    Some(&shadow_frame_layout),
+                    Some(&draw_layout),
+                    Some(&material_layout),
+                ],
+                immediate_size: 0,
+            });
+        let frame_uniforms = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size_of::<FrameUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let shadow_map = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow map"),
+            size: wgpu::Extent3d {
+                width: shadow::SIZE,
+                height: shadow::SIZE,
+                depth_or_array_layers: shadow::CASCADES as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: shadow::FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
+        let shadow_layers = (0..shadow::CASCADES as u32)
+            .map(|i| {
+                let buffer = frame_uniforms("shadow frame uniforms");
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shadow frame"),
+                    layout: &shadow_frame_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                });
+                let view = shadow_map.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                });
+                (view, buffer, group)
+            })
+            .collect();
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let frame_buffer = frame_uniforms("frame uniforms");
         let frame_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("frame"),
             layout: &frame_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: frame_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: frame_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&shadow_map.create_view(
+                        &wgpu::TextureViewDescriptor {
+                            dimension: Some(wgpu::TextureViewDimension::D2Array),
+                            ..Default::default()
+                        },
+                    )),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+            ],
         });
         let draw_buffer = Self::draw_uniforms(&device, 1024);
         let palette_buffer = Self::palette(&device, INITIAL_PALETTE);
@@ -597,6 +741,8 @@ impl WgpuBackend {
             pipeline_layout,
             frame_buffer,
             frame_group,
+            shadow_pipeline_layout,
+            shadow_layers,
             draw_buffer,
             palette_buffer,
             draw_group,
@@ -604,6 +750,7 @@ impl WgpuBackend {
             white,
             shaders: HashMap::new(),
             pipelines: HashMap::new(),
+            shadow_pipelines: HashMap::new(),
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
@@ -944,24 +1091,10 @@ impl WgpuBackend {
             return Ok(());
         }
         let color_format = self.color_format();
+        let attributes = vertex_attributes(&key.layout);
+        let module = self.shader_module(&key.layout).clone();
+        let module = &module;
         let device = &self.device;
-        let module = self.shaders.entry(key.layout.clone()).or_insert_with(|| {
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("standard"),
-                source: wgpu::ShaderSource::Wgsl(shader::source(&key.layout).into()),
-            })
-        });
-        let attributes: Vec<wgpu::VertexAttribute> = key
-            .layout
-            .elements()
-            .iter()
-            .enumerate()
-            .map(|(i, e)| wgpu::VertexAttribute {
-                format: wgpu_vertex_format(e.format),
-                offset: u64::from(e.offset),
-                shader_location: i as u32,
-            })
-            .collect();
         let translucent = matches!(key.blend, BlendKind::Translucent | BlendKind::Additive);
         let blend = match key.blend {
             BlendKind::Translucent => Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1035,6 +1168,218 @@ impl WgpuBackend {
         Ok(())
     }
 
+    /// How `call`, drawn with pipeline `key`, casts sun shadows: opaque
+    /// and cut-out lit triangles do.
+    fn caster(
+        &mut self,
+        call: &DrawCall,
+        key: &PipelineKey,
+        instance_first: u32,
+        instances: u32,
+    ) -> Result<Option<Caster>, BackendError> {
+        let lit = self
+            .materials
+            .get(&call.material)
+            .is_some_and(|m| m.desc.lit);
+        let triangles = matches!(
+            key.topology,
+            Topology::TriangleList | Topology::TriangleStrip | Topology::TriangleFan
+        );
+        if !lit || !triangles || !matches!(key.blend, BlendKind::Opaque | BlendKind::Masked) {
+            return Ok(None);
+        }
+        let pipeline = ShadowKey {
+            layout: key.layout.clone(),
+            topology: key.topology,
+            strip_index: key.strip_index,
+            masked: key.blend == BlendKind::Masked,
+        };
+        self.ensure_shadow_pipeline(&pipeline)?;
+        let local = self.vertex_buffers.get(call.vertex_buffer.0)?.bounds;
+        let sphere = local.and_then(|(centre, radius)| {
+            // Skinned vertices stray from their bind pose.
+            let radius = if call.skin.is_some() {
+                radius * 1.5 + 0.5
+            } else {
+                radius
+            };
+            if instances == 0 {
+                return Some(shadow::transformed(call.world, (centre, radius)));
+            }
+            let palette = &self.frame.as_ref()?.palette;
+            let (mut lo, mut hi, mut reach) =
+                (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), 0.0f32);
+            for m in palette.get(instance_first as usize..(instance_first + instances) as usize)? {
+                let (c, r) =
+                    shadow::transformed(call.world * Mat4::from_cols_array(m), (centre, radius));
+                lo = lo.min(c);
+                hi = hi.max(c);
+                reach = reach.max(r);
+            }
+            Some(((lo + hi) * 0.5, (hi - lo).length() * 0.5 + reach))
+        });
+        Ok(Some(Caster { pipeline, sphere }))
+    }
+
+    fn shader_module(&mut self, layout: &VertexLayout) -> &wgpu::ShaderModule {
+        let device = &self.device;
+        self.shaders.entry(layout.clone()).or_insert_with(|| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("standard"),
+                source: wgpu::ShaderSource::Wgsl(shader::source(layout).into()),
+            })
+        })
+    }
+
+    fn ensure_shadow_pipeline(&mut self, key: &ShadowKey) -> Result<(), BackendError> {
+        if self.shadow_pipelines.contains_key(key) {
+            return Ok(());
+        }
+        let topology = wgpu_topology(key.topology)?;
+        let attributes = vertex_attributes(&key.layout);
+        let module = self.shader_module(&key.layout).clone();
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow"),
+                layout: Some(&self.shadow_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: u64::from(key.layout.stride()),
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &attributes,
+                    })],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    strip_index_format: key.strip_index.map(wgpu_index_format),
+                    front_face: wgpu::FrontFace::Ccw,
+                    // Both sides: walls seen edge-on from the sun and open
+                    // meshes still cast.
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: shadow::FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: 2,
+                        slope_scale: 2.0,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: Default::default(),
+                fragment: key.masked.then(|| wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_shadow"),
+                    compilation_options: Default::default(),
+                    targets: &[],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        self.shadow_pipelines.insert(key.clone(), pipeline);
+        Ok(())
+    }
+
+    /// Draws the casters among `draws` into each cascade's map.
+    fn encode_shadows(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FrameUniforms,
+        cascades: &shadow::Cascades,
+        draws: &[RecordedDraw],
+    ) -> Result<(), BackendError> {
+        for (i, (target, buffer, group)) in self.shadow_layers.iter().enumerate() {
+            let uniforms = FrameUniforms {
+                view_proj: cascades.matrices[i].to_cols_array(),
+                ..*frame
+            };
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::bytes_of(&uniforms));
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: target,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, group, &[]);
+            let mut pipeline_now: Option<&ShadowKey> = None;
+            let mut material_now = None;
+            let mut vertices_now = None;
+            let mut indices_now = None;
+            for (k, d) in draws.iter().enumerate() {
+                let Some(caster) = &d.caster else {
+                    continue;
+                };
+                if let Some((centre, radius)) = caster.sphere
+                    && !cascades.touches(i, centre, radius)
+                {
+                    continue;
+                }
+                if pipeline_now != Some(&caster.pipeline) {
+                    pass.set_pipeline(&self.shadow_pipelines[&caster.pipeline]);
+                    pipeline_now = Some(&caster.pipeline);
+                }
+                pass.set_bind_group(1, &self.draw_group, &[(k as u64 * DRAW_STRIDE) as u32]);
+                if caster.pipeline.masked && material_now != Some(d.material) {
+                    let material = self
+                        .materials
+                        .get(&d.material)
+                        .map_or(&self.default_material, |m| &m.bind_group);
+                    pass.set_bind_group(2, material, &[]);
+                    material_now = Some(d.material);
+                } else if material_now.is_none() {
+                    // Opaque casters run no fragment stage, but the layout
+                    // still wants a material group bound.
+                    pass.set_bind_group(2, &self.default_material, &[]);
+                    material_now = Some(MaterialId(u32::MAX));
+                }
+                if vertices_now != Some(d.vertex_buffer.0) {
+                    let vb = self.vertex_buffers.get(d.vertex_buffer.0)?;
+                    pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                    vertices_now = Some(d.vertex_buffer.0);
+                }
+                match d.geometry {
+                    Geometry::Vertices { first, count } => {
+                        pass.draw(first..first + count, 0..d.instances);
+                    }
+                    Geometry::Indexed {
+                        buffer,
+                        first,
+                        count,
+                        base_vertex,
+                    } => {
+                        if indices_now != Some(buffer.0) {
+                            let ib = self.index_buffers.get(buffer.0)?;
+                            pass.set_index_buffer(
+                                ib.buffer.slice(..),
+                                wgpu_index_format(ib.desc.format),
+                            );
+                            indices_now = Some(buffer.0);
+                        }
+                        pass.draw_indexed(first..first + count, base_vertex, 0..d.instances);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn encode(
         &self,
         view: &View,
@@ -1042,6 +1387,7 @@ impl WgpuBackend {
         target: &wgpu::TextureView,
     ) -> Result<wgpu::CommandBuffer, BackendError> {
         let l = &view.lighting;
+        let cascades = shadow::Cascades::new(view, l.sun_direction, l.shadow_distance);
         let frame = FrameUniforms {
             view_proj: (view.projection * view.view).to_cols_array(),
             eye: view.eye().extend(1.0).to_array(),
@@ -1050,11 +1396,23 @@ impl WgpuBackend {
             sky: l.sky_color.extend(l.fog_density).to_array(),
             ambient_cube: l.ambient_cube.map(|c| c.extend(0.0).to_array()),
             rim: l.rim_color.extend(l.rim_threshold).to_array(),
+            view_dir: (-view.view.inverse().z_axis.truncate())
+                .normalize_or_zero()
+                .extend(0.0)
+                .to_array(),
+            shadow: cascades.map_or([[0.0; 16]; shadow::CASCADES], |c| {
+                c.matrices.map(|m| m.to_cols_array())
+            }),
+            shadow_splits: cascades.map_or([0.0; 4], |c| c.splits),
+            shadow_texels: cascades.map_or([0.0; 4], |c| c.texels),
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        if let Some(cascades) = &cascades {
+            self.encode_shadows(&mut encoder, &frame, cascades, draws)?;
+        }
         {
             // Linear sky colour; the sRGB target encodes it.
             let sky = l.sky_color;
@@ -1193,6 +1551,7 @@ impl RenderBackend for WgpuBackend {
             VertexBuffer {
                 desc: desc.clone(),
                 buffer,
+                bounds: initial.and_then(|b| shadow::bounds(&desc.layout, b)),
             },
         )))
     }
@@ -1235,7 +1594,7 @@ impl RenderBackend for WgpuBackend {
         offset: u64,
         data: &[u8],
     ) -> Result<(), BackendError> {
-        let vb = self.vertex_buffers.get(buffer.0)?;
+        let vb = self.vertex_buffers.get_mut(buffer.0)?;
         let size = vb.desc.size_in_bytes();
         let len = data.len() as u64;
         if offset.checked_add(len).is_none_or(|end| end > size) {
@@ -1246,6 +1605,8 @@ impl RenderBackend for WgpuBackend {
                 "vertex writes not aligned to 4 bytes",
             ));
         }
+        // Its positions may have moved anywhere.
+        vb.bounds = None;
         self.queue.write_buffer(&vb.buffer, offset, data);
         Ok(())
     }
@@ -1471,6 +1832,7 @@ impl RenderBackend for WgpuBackend {
         };
         let key = self.pipeline_key(call)?;
         self.ensure_pipeline(&key)?;
+        let caster = self.caster(call, &key, instance_first, instances)?;
         let frame = self.frame.as_mut().expect("checked above");
         let uniforms = &mut frame.uniforms;
         uniforms.extend_from_slice(bytemuck::cast_slice(&call.world.to_cols_array()));
@@ -1487,6 +1849,7 @@ impl RenderBackend for WgpuBackend {
             geometry: call.geometry,
             material: call.material,
             instances: instances.max(1),
+            caster,
         });
         Ok(())
     }
