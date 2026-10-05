@@ -197,6 +197,9 @@ const SERVICE_BRAKE: f32 = 8.0;
 const HANDBRAKE: f32 = 9.0;
 const ROLLING: f32 = 0.6;
 const HOLD: f32 = 3.0;
+/// Left to itself, a vehicle rolling faster than this (m/s) slows at
+/// [`HOLD`], then holds with every wheel as hard as the handbrake.
+const PARKED_FAST: f32 = 3.0;
 /// How far a ragdoll's limb may drift off its joint before it is put
 /// back, metres.
 const RAGDOLL_SLACK: f32 = 0.02;
@@ -219,6 +222,9 @@ pub struct VehicleControls {
     pub throttle: f32,
     pub steer: f32,
     pub brake: bool,
+    /// Nobody at the wheel: it brakes to a stop (gently while it still
+    /// rolls fast) and then holds, even on a hill.
+    pub parked: bool,
 }
 
 struct VehicleBody {
@@ -437,6 +443,17 @@ impl Physics {
     /// at `position` (the model's origin) facing `yaw` (radians clockwise
     /// from `+z`).
     pub fn add_vehicle(&mut self, spec: &VehicleSpec, position: Vec3, yaw: f32) -> VehicleId {
+        self.add_vehicle_turned(spec, position, Quat::from_rotation_y(yaw))
+    }
+
+    /// [`add_vehicle`](Self::add_vehicle) turned by `rotation`: tilted to
+    /// the ground it rests on ([`VehicleSpec::rest_on`]).
+    pub fn add_vehicle_turned(
+        &mut self,
+        spec: &VehicleSpec,
+        position: Vec3,
+        rotation: Quat,
+    ) -> VehicleId {
         let (lo, hi) = spec.bounds;
         // The hull clears the ground by the wheels' lower half.
         let floor = spec
@@ -454,7 +471,7 @@ impl Physics {
         let centre = Vec3::new((lo.x + hi.x) * 0.5, floor + half.y, (lo.z + hi.z) * 0.5);
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
-                .pose(pose(position, Quat::from_rotation_y(yaw)))
+                .pose(pose(position, rotation))
                 .linear_damping(0.1)
                 .angular_damping(0.5)
                 .can_sleep(false),
@@ -543,7 +560,14 @@ impl Physics {
         // Accelerates at about 4 m/s² flat out, slower near top speed.
         let top = if throttle >= 0.0 { 30.0 } else { 8.0 };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
-        let (force, brake) = if controls.brake {
+        let (force, brake) = if controls.parked {
+            let hard = if speed.abs() > PARKED_FAST {
+                HOLD
+            } else {
+                HANDBRAKE
+            };
+            (0.0, slowing(hard))
+        } else if controls.brake {
             (0.0, slowing(ROLLING))
         } else if against {
             (0.0, slowing(SERVICE_BRAKE * throttle.abs()))
@@ -1228,13 +1252,61 @@ mod tests {
                 VehicleControls {
                     throttle: 1.0,
                     steer: -0.3,
-                    brake: false,
+                    ..Default::default()
                 },
             );
             p.step(DT);
         }
         let up = p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
         assert!(up.y > 0.7, "rolled: {up}");
+    }
+
+    #[test]
+    fn parked_on_a_slope_it_rests_on_its_wheels_and_stays() {
+        let mut p = Physics::new();
+        // A 15° slope rising to +x; the car parked facing up it.
+        let half = 100.0;
+        let v = [
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(-half, 0.0, half),
+        ];
+        let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        let slope = 15f32.to_radians();
+        p.add_static(
+            StaticKey::Cell(1),
+            &shape,
+            Vec3::ZERO,
+            Quat::from_rotation_z(slope),
+        );
+        p.step(DT);
+        let spec = car();
+        let yaw = std::f32::consts::FRAC_PI_2;
+        let ground = |at: Vec3| {
+            p.cast_ray(Vec3::new(at.x, 50.0, at.z), Vec3::NEG_Y, 100.0)
+                .map(|(d, _)| 50.0 - d)
+        };
+        let rest = spec.rest_on(Vec3::new(5.0, 0.0, 0.0), yaw, ground).unwrap();
+        assert!((rest.slope - slope).abs() < 0.01, "{rest:?}");
+        let id = p.add_vehicle_turned(&spec, rest.position + Vec3::Y * 0.3, rest.rotation);
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
+        for _ in 0..240 {
+            p.drive(id, parked);
+            p.step(DT);
+        }
+        let at = p.vehicle_transform(id).unwrap();
+        let moved = (at.transform_point3(Vec3::ZERO) - rest.position).length();
+        assert!(moved < 0.6, "slid {moved} m");
+        let up = at.transform_vector3(Vec3::Y);
+        assert!(
+            (up.angle_between(Vec3::Y) - slope).abs() < 0.05,
+            "tilted {} degrees",
+            up.angle_between(Vec3::Y).to_degrees()
+        );
     }
 
     #[test]
@@ -1279,7 +1351,7 @@ mod tests {
                 VehicleControls {
                     throttle: 0.5,
                     steer: 1.0,
-                    brake: false,
+                    ..Default::default()
                 },
             );
             p.step(DT);

@@ -19,7 +19,7 @@ use std::io::{Read, Seek};
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::vehicle::{self, DRIVER_DOOR, DRIVER_SEAT};
 use m2_assets::{BlockContents, Model, Ucfx};
-use m2_math::glam::{Mat4, Vec3};
+use m2_math::glam::{Mat3, Mat4, Quat, Vec3};
 
 use crate::assets::{AssetError, AssetSource, TEXTURE_TYPE};
 
@@ -203,6 +203,19 @@ pub struct VehicleSpec {
     /// ahead: a muzzle marker on the turret, else the front of the turret
     /// part reaching furthest forward (the barrel).
     pub muzzle: Option<Vec3>,
+}
+
+/// How a vehicle sits on uneven ground ([`VehicleSpec::rest_on`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rest {
+    /// The model's origin and turn with its wheels on the ground.
+    pub position: Vec3,
+    pub rotation: Quat,
+    /// How steep the ground under its wheels is, radians.
+    pub slope: f32,
+    /// How far the ground under its footprint rises above the plane its
+    /// wheels rest on (a rock or a kerb under the hull, a ledge), metres.
+    pub bumps: f32,
 }
 
 /// Node name hash of a gun's muzzle marker (the hand weapons have it).
@@ -423,6 +436,67 @@ impl VehicleSpec {
             .max(-self.bounds.0.y)
     }
 
+    /// Where the vehicle rests facing `yaw` (radians, as
+    /// [`Quat::from_rotation_y`] turns it) with its origin over `at`: on
+    /// the plane that best fits the ground under its wheels (its hull's
+    /// corners, without three wheels to stand on), tilted to it, with the
+    /// lowest wheel touching. `ground` gives the ground's height under a
+    /// point; `None` (nothing there, or not loaded yet) under a wheel
+    /// gives `None`.
+    pub fn rest_on(
+        &self,
+        at: Vec3,
+        yaw: f32,
+        ground: impl Fn(Vec3) -> Option<f32>,
+    ) -> Option<Rest> {
+        let turn = Quat::from_rotation_y(yaw);
+        let (lo, hi) = self.bounds;
+        let on_ground = |p: Vec3| ground(at + turn * Vec3::new(p.x, 0.0, p.z));
+        // Where it touches: the wheels' bottoms, else the hull's corners.
+        let wheels: Vec<Vec3> = self
+            .wheels
+            .iter()
+            .map(|w| w.centre - Vec3::Y * w.radius)
+            .collect();
+        let corners = [(lo.x, lo.z), (hi.x, lo.z), (lo.x, hi.z), (hi.x, hi.z)]
+            .map(|(x, z)| Vec3::new(x, lo.y, z));
+        let feet = |points: &[Vec3]| -> Option<Vec<(Vec3, f32)>> {
+            points.iter().map(|&p| Some((p, on_ground(p)?))).collect()
+        };
+        let (touch, (a, b, c)) = match fit_plane(&feet(&wheels)?) {
+            Some(plane) => (feet(&wheels)?, plane),
+            None => {
+                let touch = feet(&corners)?;
+                let plane = fit_plane(&touch)?;
+                (touch, plane)
+            }
+        };
+        // The plane is h = a + b x + c z across the footprint.
+        let normal = Vec3::new(-b, 1.0, -c).normalize();
+        let rotation = turn * Quat::from_rotation_arc(Vec3::Y, normal);
+        let y = touch
+            .iter()
+            .map(|&(p, h)| h - (rotation * p).y)
+            .fold(f32::MIN, f32::max);
+        // The ground under the footprint, on a grid, against the plane.
+        let mut bumps = 0.0f32;
+        for i in 0..=2 {
+            for j in 0..=4 {
+                let x = lo.x + (hi.x - lo.x) * i as f32 / 2.0;
+                let z = lo.z + (hi.z - lo.z) * j as f32 / 4.0;
+                if let Some(h) = on_ground(Vec3::new(x, 0.0, z)) {
+                    bumps = bumps.max(h - (a + b * x + c * z));
+                }
+            }
+        }
+        Some(Rest {
+            position: Vec3::new(at.x, y, at.z),
+            rotation,
+            slope: normal.angle_between(Vec3::Y),
+            bumps,
+        })
+    }
+
     /// Node matrices (model space) with each wheel steered by `steer` and
     /// spun by `spin` radians about its centre (a tracked vehicle's road
     /// wheels rolled `rolled` metres instead), and the turret turned
@@ -466,6 +540,25 @@ impl VehicleSpec {
             })
             .collect()
     }
+}
+
+/// The plane `h = a + b x + c z` closest (least squares) to `points`'
+/// heights over their x and z; `None` unless they span an area.
+fn fit_plane(points: &[(Vec3, f32)]) -> Option<(f32, f32, f32)> {
+    let mut m = Mat3::ZERO;
+    let mut r = Vec3::ZERO;
+    for &(p, h) in points {
+        let v = Vec3::new(1.0, p.x, p.z);
+        m += Mat3::from_cols(v * v.x, v * v.y, v * v.z);
+        r += v * h;
+    }
+    // About the product of the spreads in x and z (variances, m^2).
+    let n = points.len() as f32;
+    if m.determinant() < 1e-3 * n * n * n {
+        return None;
+    }
+    let s = m.inverse() * r;
+    Some((s.x, s.y, s.z))
 }
 
 #[cfg(test)]
@@ -559,5 +652,46 @@ mod tests {
     #[test]
     fn rides_on_its_wheels() {
         assert!(spec().ride_height().abs() < 1e-6);
+    }
+
+    #[test]
+    fn rests_tilted_on_a_slope_with_its_wheels_down() {
+        let s = spec();
+        // Ground rising 20 degrees towards +x, 5 m up at the origin.
+        let tan = 20f32.to_radians().tan();
+        let ground = |p: Vec3| Some(5.0 + p.x * tan);
+        // Facing +x (a quarter turn): nose up the slope.
+        let yaw = std::f32::consts::FRAC_PI_2;
+        let at = Vec3::new(10.0, 0.0, 3.0);
+        let rest = s.rest_on(at, yaw, ground).unwrap();
+        assert!((rest.slope - 20f32.to_radians()).abs() < 1e-3, "{rest:?}");
+        assert!(rest.bumps < 0.05, "{rest:?}");
+        let ahead = rest.rotation * Vec3::Z;
+        assert!(ahead.x > 0.9 && ahead.y > 0.3, "nose up the slope: {ahead}");
+        // Every wheel's bottom on the ground (within a few cm).
+        for w in &s.wheels {
+            let bottom = rest.position + rest.rotation * (w.centre - Vec3::Y * w.radius);
+            let h = ground(bottom).unwrap();
+            assert!((bottom.y - h).abs() < 0.08, "{bottom} vs {h}");
+        }
+        // Nothing loaded under it: nowhere to rest yet.
+        assert!(s.rest_on(at, yaw, |_| None).is_none());
+    }
+
+    #[test]
+    fn a_ledge_under_the_hull_shows_as_bumps() {
+        let s = spec();
+        // Flat, but a step up 1 m under the front half's middle.
+        let ground = |p: Vec3| {
+            Some(if p.z > 0.5 && p.x.abs() < 0.5 {
+                1.0
+            } else {
+                0.0
+            })
+        };
+        let rest = s.rest_on(Vec3::ZERO, 0.0, ground).unwrap();
+        assert!(rest.slope < 1e-3, "{rest:?}");
+        assert!((rest.bumps - 1.0).abs() < 1e-3, "{rest:?}");
+        assert!(rest.position.abs_diff_eq(Vec3::ZERO, 1e-4), "{rest:?}");
     }
 }
