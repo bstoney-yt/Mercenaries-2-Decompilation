@@ -17,7 +17,7 @@ use crate::game::{Game, can_get_out, get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
-use crate::support::Phase;
+use crate::support::{PDA_CLOSE, PDA_OPEN, Phase};
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
@@ -147,6 +147,14 @@ const OPEN_NEAR: f32 = 40.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
 const OPEN_FOR: f32 = 45.0;
+/// A vehicle being brought to a drop point this near (metres) is waited
+/// for this far from it (metres).
+const AWAIT_REACH: f32 = 300.0;
+const AWAIT_FROM: f32 = 15.0;
+/// She looks at her PDA at least this long before shutting it, at most
+/// this long (seconds).
+const PDA_LOOK: f32 = 2.0;
+const PDA_MOST: f32 = 15.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
 
@@ -251,6 +259,10 @@ pub struct Autoplay {
     /// and the support's step last logged.
     tapped: bool,
     support_logged: &'static str,
+    /// When she opened her PDA, while it is open; seconds since she last
+    /// pressed its key.
+    pda_since: Option<f32>,
+    pda_pressed: f32,
 }
 
 impl Autoplay {
@@ -262,10 +274,12 @@ impl Autoplay {
         game: &mut Game,
         marks: &[Mark],
         objectives: &[String],
+        awaited: &[String],
         dt: f32,
     ) -> Intent {
         self.clock += dt;
         self.pressed += dt;
+        self.pda_pressed += dt;
         if objectives != self.objectives.as_slice() {
             eprintln!("autoplay {:.1} s: objectives {objectives:?}", self.clock);
             self.objectives = objectives.to_vec();
@@ -286,6 +300,20 @@ impl Autoplay {
             None => self.leave = false,
         }
         self.ground(game);
+        // The scripts wait for her to look at her PDA (the first contract,
+        // at the first gate): she opens it, and shuts it again.
+        let wants = |name: &str| awaited.iter().any(|a| a == name);
+        if game.support.pda
+            || (wants(PDA_OPEN)
+                && game.support.phase == Phase::Idle
+                && game
+                    .scene
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.driving.is_none()))
+        {
+            return self.pda(game.support.pda, wants(PDA_CLOSE));
+        }
         let chosen = self.choose(game, marks);
         let changed = match (&chosen, &self.goal) {
             (Some((a, _)), Some(b)) => !a.same(b),
@@ -500,6 +528,28 @@ impl Autoplay {
                     format!("waiting by {} for it to come", m.name),
                 )
             });
+        }
+        // A vehicle on its way to her (hanging from a delivery's
+        // helicopter): on foot she waits near where it is to be put down,
+        // out from under it, and takes it once it is (the tank brought for
+        // the last leg; a ride of hers would carry her past it).
+        if driving.is_none()
+            && let Some((load, drop)) = game
+                .scene
+                .flights
+                .bringing()
+                .into_iter()
+                .filter(|(_, to)| to.distance(here) < AWAIT_REACH)
+                .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+        {
+            let at = drop + (here - drop).with_y(0.0).normalize_or(Vec3::X) * AWAIT_FROM;
+            return Some((
+                Goal::Reach { target: load, at },
+                format!(
+                    "waiting for the vehicle {load:#x} being brought to {drop:.0}, {:.0} m off",
+                    drop.distance(here)
+                ),
+            ));
         }
         // Places to get to (not the vehicle she is in): those marked, else
         // the objectives' on the map or radar.
@@ -967,6 +1017,36 @@ impl Autoplay {
     /// [`CALL_FROM`] off she calls the bomb as a player would (the support
     /// key, the use key, the view steered over it and confirmed, the
     /// wheel pressed in each wedge), then waits out of its reach.
+    /// At her PDA: opened, looked at for [`PDA_LOOK`] seconds and shut
+    /// once the scripts wait for that (else after [`PDA_MOST`]).
+    fn pda(&mut self, open: bool, close_awaited: bool) -> Intent {
+        let press = match open {
+            false => true,
+            true => {
+                let looked = self.clock - *self.pda_since.get_or_insert(self.clock);
+                (close_awaited && looked > PDA_LOOK) || looked > PDA_MOST
+            }
+        } && self.pda_pressed > PRESS_GAP;
+        if press {
+            self.pda_pressed = 0.0;
+            if open {
+                self.pda_since = None;
+            }
+            eprintln!(
+                "autoplay {:.1} s: {} her PDA",
+                self.clock,
+                if open { "shutting" } else { "opening" }
+            );
+        }
+        Intent {
+            trigger: Trigger {
+                pda: press,
+                ..Trigger::default()
+            },
+            ..Intent::default()
+        }
+    }
+
     fn strike(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
         let flat = |a: Vec3| a.with_y(0.0).distance(at.with_y(0.0));
         if let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) {
@@ -1009,7 +1089,16 @@ impl Autoplay {
                 return self.walk(game, away, 2.0, dt);
             }
             if waiting {
-                return self.idle(game);
+                // Watching where it is to come down.
+                let look = game
+                    .scene
+                    .player
+                    .as_ref()
+                    .map_or(Vec2::ZERO, |p| aim(p, at, dt).0);
+                return Intent {
+                    look,
+                    ..Intent::default()
+                };
             }
             if d > CALL_FROM.1 {
                 return self.walk(game, at, CALL_FROM.1 - 15.0, dt);

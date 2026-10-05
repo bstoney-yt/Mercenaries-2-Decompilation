@@ -396,6 +396,9 @@ fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             Color32::from_rgb(240, 120, 60),
         );
     }
+    if s.pda {
+        pda(screen, s, text);
+    }
     let Some((name, method, count, free)) = &s.item else {
         return;
     };
@@ -418,13 +421,48 @@ fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     let keys = if s.menu {
         "E: use support item   ·   T: close"
     } else {
-        "T: support menu"
+        "T: support menu   ·   P: PDA"
     };
     text(
         at + vec2(0.0, -40.0),
         Align2::LEFT_BOTTOM,
         keys,
         13.0,
+        Color32::from_gray(200),
+    );
+}
+
+/// The PDA, a stand-in until the game's own screens are drawn: what she
+/// has in her stockpile, and the key to close it.
+fn pda<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
+    screen: egui::Rect,
+    s: &SupportHud,
+    text: &T,
+) {
+    let gold = Color32::from_rgb(255, 200, 0);
+    let white = Color32::from_gray(235);
+    let at = screen.center() + vec2(-200.0, -110.0);
+    text(at, Align2::LEFT_TOP, "PDA", 24.0, gold);
+    text(
+        at + vec2(0.0, 44.0),
+        Align2::LEFT_TOP,
+        "Stockpile",
+        17.0,
+        gold,
+    );
+    let stock = match &s.item {
+        Some((name, method, count, free)) => {
+            let free = if *free { "  FREE" } else { "" };
+            format!("{name}   x{count}{free}   ·   {method}")
+        }
+        None => "Nothing to call in".to_owned(),
+    };
+    text(at + vec2(0.0, 70.0), Align2::LEFT_TOP, &stock, 16.0, white);
+    text(
+        at + vec2(0.0, 200.0),
+        Align2::LEFT_TOP,
+        "P: close the PDA",
+        14.0,
         Color32::from_gray(200),
     );
 }
@@ -446,10 +484,10 @@ fn flash(ctx: &egui::Context, screen: egui::Rect, strength: f32) {
     );
 }
 
-/// Ruler ticks every this many metres, numbered every fifth; the rulers
-/// are this wide (points).
+/// Ruler ticks every this many metres, longer every fifth; the rulers are
+/// this wide (points).
 const TICK: f32 = 10.0;
-const RULER: f32 = 28.0;
+const RULER: f32 = 20.0;
 
 /// The satellite's view, as round 93's videos show it: grey and grainy,
 /// rulers along the top (x) and the left (z, north up) marking where the
@@ -477,13 +515,16 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     grain(painter, screen, time);
 
     // The rulers, and on each the view's middle.
-    let top = Rect::from_min_max(
-        screen.left_top() + vec2(RULER, 0.0),
-        screen.right_top() + vec2(0.0, RULER),
+    // Short, as round 95 saw them in the videos: a third of the width
+    // along the top, 40% of the height a sixth of the way in from the
+    // left, their ticks unnumbered.
+    let top = Rect::from_center_size(
+        pos2(screen.center().x, screen.top() + screen.height() * 0.06),
+        vec2(screen.width() / 3.0, RULER),
     );
-    let left = Rect::from_min_max(
-        screen.left_top() + vec2(0.0, RULER),
-        screen.left_bottom() + vec2(RULER, 0.0),
+    let left = Rect::from_center_size(
+        pos2(screen.left() + screen.width() * 0.17, screen.center().y),
+        vec2(RULER, screen.height() * 0.4),
     );
     for r in [top, left] {
         painter.rect_filled(r, 0.0, Color32::from_black_alpha(150));
@@ -504,15 +545,6 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
                 [pos2(p.x, top.bottom() - long), pos2(p.x, top.bottom())],
                 Stroke::new(1.0, ink),
             );
-            if k % 5 == 0 {
-                text(
-                    pos2(p.x + 3.0, top.top() + 1.0),
-                    Align2::LEFT_TOP,
-                    &format!("{x:.0}"),
-                    10.0,
-                    ink,
-                );
-            }
         }
         for k in first(middle.z) - 60..=first(middle.z) + 60 {
             let z = k as f32 * TICK;
@@ -527,15 +559,6 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
                 [pos2(left.right() - long, p.y), pos2(left.right(), p.y)],
                 Stroke::new(1.0, ink),
             );
-            if k % 5 == 0 {
-                text(
-                    pos2(left.left() + 1.0, p.y - 2.0),
-                    Align2::LEFT_BOTTOM,
-                    &format!("{z:.0}"),
-                    10.0,
-                    ink,
-                );
-            }
         }
     }
     // Triangles on the rulers point at the middle, its coordinates beside
@@ -571,36 +594,29 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
         14.0,
         white,
     );
-    // North, up.
-    let corner = screen.left_top() + vec2(RULER / 2.0, 0.0);
-    text(
-        corner + vec2(0.0, 2.0),
-        Align2::CENTER_TOP,
-        "N",
-        13.0,
-        white,
-    );
+    // North, up, just above the left ruler.
+    let north = pos2(left.center().x, left.top() - 30.0);
+    text(north, Align2::CENTER_TOP, "N", 13.0, white);
     tri(
-        corner + vec2(0.0, 15.0),
-        corner + vec2(-5.0, 24.0),
-        corner + vec2(5.0, 24.0),
+        north + vec2(0.0, 15.0),
+        north + vec2(-5.0, 24.0),
+        north + vec2(5.0, 24.0),
         white,
     );
 
-    // The crosshair.
+    // The crosshair: a small plus, open in the middle.
     let stroke = Stroke::new(2.0, Color32::from_white_alpha(230));
-    painter.circle_stroke(centre, 20.0, stroke);
     for d in [
         vec2(1.0, 0.0),
         vec2(-1.0, 0.0),
         vec2(0.0, 1.0),
         vec2(0.0, -1.0),
     ] {
-        painter.line_segment([centre + d * 8.0, centre + d * 34.0], stroke);
+        painter.line_segment([centre + d * 5.0, centre + d * 16.0], stroke);
     }
 
     // The operation's time (minutes, seconds and hundredths, as the
-    // videos count it) and cost, top right.
+    // videos count it) and cost, in boxes below and right of the middle.
     let hundredths = (open.max(0.0) * 100.0) as u32;
     let readouts = [
         (
@@ -617,10 +633,10 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     for (i, (label, value)) in readouts.iter().enumerate() {
         let r = Rect::from_min_size(
             pos2(
-                screen.right() - 210.0,
-                top.bottom() + 16.0 + i as f32 * 54.0,
+                screen.left() + screen.width() * 0.6,
+                screen.top() + screen.height() * (0.7 + i as f32 * 0.12),
             ),
-            vec2(190.0, 46.0),
+            vec2(screen.width() * 0.15, 34.0),
         );
         painter.rect_filled(r, 2.0, Color32::from_black_alpha(150));
         painter.rect_stroke(
@@ -630,49 +646,53 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             StrokeKind::Inside,
         );
         text(
-            r.left_top() + vec2(8.0, 4.0),
-            Align2::LEFT_TOP,
+            r.left_top() + vec2(0.0, -3.0),
+            Align2::LEFT_BOTTOM,
             label,
             11.0,
             ink,
         );
-        text(
-            r.left_bottom() + vec2(8.0, -4.0),
-            Align2::LEFT_BOTTOM,
-            value,
-            18.0,
-            white,
-        );
+        text(r.center(), Align2::CENTER_CENTER, value, 18.0, white);
     }
 
-    // The objective, bottom left; the keys, bottom right.
+    // The objective, bottom left; the keys, right of the middle.
     if let Some(objective) = info.mission.as_ref().and_then(|m| m.objectives.first()) {
+        // A triangle pointing down before it (drawn: not every font has
+        // the glyph).
+        let at = screen.left_bottom() + vec2(24.0, -32.0);
+        tri(at, at + vec2(12.0, 0.0), at + vec2(6.0, 9.0), gold);
         text(
-            screen.left_bottom() + vec2(RULER + 16.0, -24.0),
+            screen.left_bottom() + vec2(42.0, -24.0),
             Align2::LEFT_BOTTOM,
             objective,
             17.0,
             gold,
         );
     }
-    let keys = if info.support.wheel.is_some() {
-        "T: back"
+    let keys: &[&str] = if info.support.wheel.is_some() {
+        &["T: back"]
     } else {
-        "WASD or the mouse: move the view   ·   Fire or E: confirm   ·   T: back"
+        &[
+            "WASD or the mouse: move view",
+            "Fire or E: confirm target",
+            "T: back",
+        ]
     };
-    text(
-        screen.right_bottom() + vec2(-24.0, -24.0),
-        Align2::RIGHT_BOTTOM,
-        keys,
-        14.0,
-        white,
-    );
+    for (i, k) in keys.iter().enumerate() {
+        text(
+            pos2(screen.right() - 24.0, centre.y - 20.0 + i as f32 * 20.0),
+            Align2::RIGHT_CENTER,
+            k,
+            14.0,
+            white,
+        );
+    }
 
     if let Some(w) = &info.support.wheel {
         wheel(
             painter,
             centre,
-            screen.height().min(screen.width()) * 0.16,
+            screen.height().min(screen.width()) * 0.13,
             w,
         );
         text(
@@ -795,6 +815,9 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             at.y += 20.0;
         }
     }
+    if let Some(line) = &m.tutorial {
+        tutorial(painter, screen, line);
+    }
     if m.contract_complete {
         text(
             screen.center() + vec2(0.0, -60.0),
@@ -833,6 +856,26 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             colour,
         );
     }
+}
+
+/// A tutorial line the scripts put up, in a box on the left, wrapped.
+fn tutorial(painter: &egui::Painter, screen: egui::Rect, line: &str) {
+    let width = (screen.width() * 0.3).clamp(220.0, 380.0);
+    let galley = painter.layout(
+        line.to_owned(),
+        FontId::proportional(15.0),
+        Color32::from_gray(240),
+        width,
+    );
+    let at = screen.left_top() + vec2(20.0, screen.height() * 0.36);
+    let back = Rect::from_min_size(at, galley.size()).expand(10.0);
+    painter.rect_filled(back, 4.0, Color32::from_black_alpha(160));
+    painter.rect_filled(
+        Rect::from_min_size(back.min, vec2(4.0, back.height())),
+        0.0,
+        Color32::from_rgb(255, 200, 0),
+    );
+    painter.galley(at, galley, Color32::from_gray(240));
 }
 
 /// A crosshair centred on `c`.
@@ -958,6 +1001,7 @@ mod tests {
             crosshair: Some(Vec3::new(0.0, 1.0, -40.0)),
             mission: Some(MissionView {
                 objectives: vec!["VzaCon001 objective 1".into()],
+                tutorial: Some("Open your PDA to see the map.".into()),
                 markers: vec![(
                     Vec3::new(0.0, 0.0, -10.0),
                     "deliverable".into(),

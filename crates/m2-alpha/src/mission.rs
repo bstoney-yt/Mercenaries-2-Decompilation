@@ -45,7 +45,7 @@ use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::scene::NOT_DRIVABLE;
-use crate::support::{Impact, Kind, Phase};
+use crate::support::{FALLBACK_AFTER, Impact, Kind};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
@@ -64,8 +64,9 @@ const BOMB_PAD: f32 = crate::combat::BOMB.0;
 const RAM_PAD: f32 = 4.0;
 const RAM_SPEED: f32 = 6.0;
 const SPEED_FADE: f32 = 12.0;
-/// Seconds an objective message stays up.
+/// Seconds an objective message stays up, and a tutorial line.
 const MESSAGE_TIME: f32 = 6.0;
+const TUTORIAL_TIME: f32 = 10.0;
 /// The scripts' vehicles are loaded within this far of the player, metres,
 /// and at most this many in play at once (wrecks and those they removed
 /// don't count).
@@ -84,6 +85,8 @@ pub struct MissionView {
     pub status: Option<String>,
     /// The objectives to do, readable.
     pub objectives: Vec<String>,
+    /// The tutorial line up, readable (for [`TUTORIAL_TIME`] seconds).
+    pub tutorial: Option<String>,
     /// Markers over targets: where, what, colour (RGBA).
     pub markers: Vec<(Vec3, String, [u8; 4])>,
     /// The newest objective message: completed (or else added), and text.
@@ -133,9 +136,8 @@ pub struct MissionLink {
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
-    /// The satellite's step when last told the scripts: none, the view,
-    /// the timing wheel, confirmed.
-    satellite: u8,
+    /// The tutorial line up (readable), and its age (seconds).
+    tutorial: Option<(String, f32)>,
     /// Blasts since the scripts last ran, and support strikes' bombs.
     blasts: Vec<Vec3>,
     bombs: Vec<Vec3>,
@@ -220,7 +222,7 @@ impl MissionLink {
             drivers,
             ashore: 0,
             blasts: Vec::new(),
-            satellite: 0,
+            tutorial: None,
             bombs: Vec::new(),
             vehicles: Fleet::default(),
             completed: None,
@@ -339,23 +341,10 @@ impl MissionLink {
                     Vec3::new(at.x, game.focus().y, at.y)
                 }),
         );
-        // The satellite's steps, posted as its interface posts them, for
-        // the scripts waiting on them (the first contract's).
-        let step = match game.support.phase {
-            Phase::Viewing { .. } => 1,
-            Phase::Timing { .. } => 2,
-            Phase::Confirmed { .. } => 3,
-            _ => 0,
-        };
-        let post = match (self.satellite, step) {
-            (0, 1) => Some("Satellite Targetting Start"),
-            (1, 2) => Some("Satellite Minigame Start"),
-            (2, 3) => Some("Satellite Targetting Success"),
-            (1 | 2, 0) => Some("Satellite Targetting Cancelled"),
-            _ => None,
-        };
-        self.satellite = step;
-        if let Some(name) = post {
+        // The support's steps (the satellite's, the PDA's), posted as the
+        // game's interface posts them, for the scripts waiting on them
+        // (the first contract's).
+        for &name in &game.support.posts {
             let waiting = mission
                 .awaited_posts()
                 .iter()
@@ -363,6 +352,9 @@ impl MissionLink {
                 .count();
             eprintln!("mission: posted {name:?}, {waiting} script events waiting for it");
             mission.post(name);
+        }
+        if let Some((_, age)) = &mut self.tutorial {
+            *age += dt;
         }
         self.lag += dt;
         let mut lines = Vec::new();
@@ -402,14 +394,20 @@ impl MissionLink {
             };
             game.scene.people.mission_soldiers = targets.iter().map(|t| t.0).collect();
             // Those standing as models (the gates) fall only to a support
-            // strike, and one is given her while any stands.
+            // strike, which the scripts give her; should they not, one is
+            // given her anyway after a while.
             let sturdy: HashSet<u32> = targets
                 .iter()
                 .map(|t| t.0)
                 .filter(|&g| game.scene.props.get(g).is_some())
                 .collect();
-            if !sturdy.is_empty() {
-                game.support.offer(Kind::SatelliteBomb);
+            if game
+                .support
+                .fallback(Kind::SatelliteBomb, !sturdy.is_empty(), STEP)
+            {
+                eprintln!(
+                    "mission: no bomb from the scripts in {FALLBACK_AFTER:.0} s with a gate to bring down: one is given her"
+                );
             }
             // A vehicle driven hard into a target (a gate) breaks it too:
             // by its speed of late, as the gate stops it.
@@ -455,6 +453,7 @@ impl MissionLink {
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
+                support_item(game, &c);
                 fly(game, mission, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
@@ -462,6 +461,9 @@ impl MissionLink {
                 if c == Command::Notify("Pg.ContractCompleted".into()) {
                     self.completed = Some(0.0);
                 }
+            }
+            if let Some(line) = tutorial(mission) {
+                self.tutorial = line.map(|t| (t, 0.0));
             }
             break_props(game, mission);
             let w = mission.world().borrow();
@@ -722,6 +724,15 @@ impl MissionLink {
         out
     }
 
+    /// The names of the events the scripts wait for the game to post
+    /// (`"PDA Open"`).
+    pub fn awaited(&self) -> Vec<String> {
+        match &self.state {
+            State::Running(m) => m.awaited_posts(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The scripts have said the contract is completed.
     pub fn completed(&self) -> bool {
         self.completed.is_some()
@@ -776,6 +787,11 @@ impl MissionLink {
             .collect();
         MissionView {
             status: None,
+            tutorial: self
+                .tutorial
+                .as_ref()
+                .filter(|t| t.1 < TUTORIAL_TIME)
+                .map(|t| t.0.clone()),
             objectives,
             markers,
             message,
@@ -946,6 +962,48 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
 
 /// Breaks the state layers' models whose objects the scripts' world has
 /// dead (a gate blown up), and takes down those it no longer has.
+/// The scripts' newest tutorial line since the last call, if they asked
+/// for one: its text, readable, or none if they cleared it. Each call is
+/// logged with its arguments (what each is for isn't known yet).
+fn tutorial(mission: &Mission) -> Option<Option<String>> {
+    let calls = std::mem::take(&mut mission.world().borrow_mut().hud.tutorials);
+    for args in &calls {
+        eprintln!("mission: tutorial line {args:?}");
+    }
+    let args = calls.last()?;
+    Some(m2_game::hud::tutorial_text(args).map(|t| mission.text(t)))
+}
+
+/// The scripts' free support items, given her or taken back.
+fn support_item(game: &mut Game, c: &Command) {
+    match c {
+        Command::Freebie {
+            key,
+            quantity,
+            limit,
+        } => match Kind::from_freebie(key) {
+            Some(kind) => {
+                game.support.grant(kind, *quantity, *limit);
+                eprintln!(
+                    "mission: the scripts give her {quantity} {} free ({key}, at most {limit:?}): she has {}",
+                    kind.name(),
+                    game.support.ready().map_or(0, |i| i.count)
+                );
+            }
+            None => eprintln!(
+                "mission: the scripts give her {quantity} {key:?}, a support item not known here"
+            ),
+        },
+        Command::RemoveFreebie(key) => {
+            if let Some(kind) = Kind::from_freebie(key) {
+                game.support.take_back(kind);
+            }
+            eprintln!("mission: the scripts take back her free {key:?}");
+        }
+        _ => {}
+    }
+}
+
 fn break_props(game: &mut Game, mission: &Mission) {
     let scene = &mut game.scene;
     let Some(world) = &mut scene.world else {

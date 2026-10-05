@@ -1244,7 +1244,7 @@ fn mission_for_screenshot(
             Some(a) => {
                 let marks = link.marks();
                 let objectives = link.view().objectives;
-                a.step(game, &marks, &objectives, tick)
+                a.step(game, &marks, &objectives, &link.awaited(), tick)
             }
             None => Intent::default(),
         };
@@ -2261,7 +2261,7 @@ fn satellite_for_screenshot(
     let her = p.character.position;
     let spot = her + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * SATELLITE_AHEAD;
     let goal = Vec2::new(spot.x, spot.z);
-    game.support.offer(support::Kind::SatelliteBomb);
+    game.support.grant(support::Kind::SatelliteBomb, 1, Some(1));
     let press = |game: &mut Game, intent: Intent| {
         game.step(intent, tick);
         game.step(Intent::default(), tick);
