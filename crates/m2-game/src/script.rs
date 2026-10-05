@@ -616,6 +616,19 @@ mod tests {
     }
 
     #[test]
+    fn unset_globals_are_stubs_unless_read_raw() {
+        let host = ScriptHost::new().unwrap();
+        host.stub_missing_globals().unwrap();
+        // Test drivers read their settings raw (`DRIVE_UNTIL`).
+        let (plain, raw): (String, String) = host
+            .lua()
+            .load("return type(DRIVE_SOMEWHERE), type(rawget(_G, 'DRIVE_UNTIL'))")
+            .eval()
+            .unwrap();
+        assert_eq!((plain.as_str(), raw.as_str()), ("table", "nil"));
+    }
+
+    #[test]
     fn modules_import_and_inherit_each_other() {
         let host = ScriptHost::new().unwrap();
         let library = Rc::new(crate::library::tests::library());

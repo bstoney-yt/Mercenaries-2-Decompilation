@@ -7,12 +7,13 @@
 //! rifle bank's loudest short mono sound, the RPG bank's loudest short one,
 //! and the artillery bank's loudest 1.5-3 s mono sound.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
 
-use m2_engine::audio::{Falloff, Play, SoundLibrary};
+use m2_engine::audio::{EngineSounds, Falloff, Play, SoundLibrary};
 use m2_engine::{Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
 use crate::combat::{Remark, Sound};
@@ -133,10 +134,13 @@ pub struct GameAudio {
     /// Short sounds of the town (`amb_citymed`) and the jungle
     /// (`amb_jungle`) played now and then around the listener.
     ambient: [Vec<SoundBuffer>; 2],
-    /// Each engine bank's loop, by bank name.
-    engines: Vec<(&'static str, SoundBuffer)>,
-    /// The engine running now: its bank and voice.
-    engine: Option<(&'static str, VoiceId)>,
+    /// Engine sounds by bank name hash, once read (`None`: the bank has
+    /// none); banks are read on a thread the first time they're driven.
+    engines: HashMap<u32, Option<Arc<EngineSounds>>>,
+    engine_loads: (Sender<EngineLoad>, Receiver<EngineLoad>),
+    install: Option<Install>,
+    /// The engine running now.
+    engine: Option<Engine>,
     /// Seconds to the next one.
     ambient_wait: f32,
     seed: u64,
@@ -155,12 +159,13 @@ pub struct GameAudio {
 /// player's own), its falloff and volume.
 type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32);
 
-/// Voice sets, by the name hash of their name. The soldiers' and
-/// civilians' sets are named only by hash, and were told apart by their
-/// subtitles: two sets of Venezuelan army soldiers (so not everyone sounds
-/// alike) and civilians complaining.
-pub const VZ_SOLDIERS: [u32; 2] = [0xcf4f_8b9c, 0x6cff_c547];
-pub const CIVILIANS: u32 = 0x910e_b574;
+/// Voice sets, by the name hash of their name: two of Venezuelan army
+/// soldiers, `vo_vzSoldier_01` and `_02` (so not everyone sounds alike),
+/// and two each of civilian men and women, `vo_vzCiv_01`, `_02`,
+/// `vo_vzCiv_female_01` and `_02`.
+pub const VZ_SOLDIERS: [u32; 2] = [0x5078_7bff, 0x467a_aad8];
+pub const CIVILIANS: [u32; 2] = [0x6b0c_3b0b, 0x910e_b574];
+pub const CIVILIAN_WOMEN: [u32; 2] = [0x3a6e_c728, 0xc46b_cecf];
 /// Jennifer's voice set, `vo_jen`.
 pub const JENNIFER: u32 = 0x7f74_6c16;
 /// Her lines for what happens to her, by cue (a line, or a group of
@@ -223,19 +228,26 @@ fn pick(
 /// sounds are loops).
 const AMBIENT_LONGEST: f32 = 8.0;
 
-/// Engine banks, and which vehicles use them (by kind and label words,
-/// first match; as the browser viewer picks them).
-const ENGINES: [(&str, &str); 7] = [
+/// Engine banks for vehicles whose template doesn't name one (the
+/// template database's `SoundEffect` does for most), by kind and label
+/// words, first match: the banks the templates give such vehicles.
+const ENGINES: [(&str, &str); 12] = [
     ("helicopter", "veh_helicoptermedium"),
-    ("hmmwv", "veh_jeep"),
+    ("hmmwv|humvee|valiant", "veh_largegascrappy"),
+    ("m151|jeep", "veh_jeep"),
+    ("amx", "veh_tankmed"),
     ("tank", "veh_tankbig"),
-    ("apc", "veh_tankmed"),
-    ("semi|bus|truck", "veh_semi"),
-    ("global_veh", "veh_8cylinderold"),
+    ("apc|stryker", "veh_tankmed"),
+    ("semi", "veh_semi"),
+    ("bus", "veh_bus"),
+    ("pickup|truck", "veh_8cylindertruck"),
+    ("honda|crx", "veh_4cylinderold"),
+    ("van", "veh_largegasnew"),
     ("", "veh_4cylindernew"),
 ];
 
-/// The engine bank for a vehicle of `kind` named `label`.
+/// The engine bank for a vehicle of `kind` named `label`, when its
+/// template doesn't say.
 pub fn engine_bank(kind: &str, label: &str) -> &'static str {
     let key = format!("{kind} {label}").to_lowercase();
     ENGINES
@@ -244,15 +256,87 @@ pub fn engine_bank(kind: &str, label: &str) -> &'static str {
         .map_or("veh_4cylindernew", |e| e.1)
 }
 
-/// Sounds read from the banks: the fight's, the ambient one-shots and the
-/// engine loops.
-type BankSounds = (
-    [Option<SoundBuffer>; 3],
-    [Vec<SoundBuffer>; 2],
-    Vec<(&'static str, SoundBuffer)>,
-);
+/// The engine of the vehicle being driven, as the game sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EngineInput {
+    /// The name hash of its sound bank (`veh_jeep`).
+    pub bank: u32,
+    /// Speed and top speed, m/s.
+    pub speed: f32,
+    pub top: f32,
+    /// The driver's throttle, -1 (reverse) to 1.
+    pub throttle: f32,
+}
 
-/// The fight's sounds, the ambient one-shots and the engine loops.
+/// A bank's engine sounds, read on a thread.
+type EngineLoad = (u32, Option<EngineSounds>);
+
+/// An engine running: its sounds, a voice per loop, and how hard it runs.
+#[derive(Debug)]
+struct Engine {
+    bank: u32,
+    sounds: Arc<EngineSounds>,
+    voices: Vec<VoiceId>,
+    /// 0 idling to 1 flat out, eased.
+    rpm: f32,
+    /// Seconds since it started.
+    running: f32,
+}
+
+/// How loud the engine is, and how long its loops take to come in (under
+/// the start sound, if it has one).
+const ENGINE_GAIN: f32 = 0.45;
+const ENGINE_FADE_IN: f32 = 0.6;
+/// How quickly the engine's revs follow speed and throttle, per second.
+const ENGINE_EASE: f32 = 3.0;
+/// The most a loop is pitched from as recorded.
+const ENGINE_BEND: (f32, f32) = (0.7, 1.45);
+
+impl Engine {
+    /// Each loop's gain and pitch with the engine at `rpm`.
+    fn mix(sounds: &EngineSounds, rpm: f32) -> Vec<(f32, f32)> {
+        let n = sounds.loops.len();
+        if n == 1 {
+            return vec![(1.0, 0.8 + 0.7 * rpm)];
+        }
+        let at = rpm.clamp(0.0, 1.0) * (n - 1) as f32;
+        let k = (at.floor() as usize).min(n - 2);
+        let t = at - k as f32;
+        // Measured pitches, if every loop has one and they rise sensibly:
+        // the engine's note runs smoothly from the lowest loop's to the
+        // highest's and each loop is pitched to it.
+        let pitches: Option<Vec<f32>> = sounds.loops.iter().map(|l| l.1).collect();
+        let rising = pitches.as_ref().filter(|p| {
+            p.windows(2)
+                .all(|w| (1.05..=3.0).contains(&(w[1] / w[0].max(1.0))))
+        });
+        (0..n)
+            .map(|j| {
+                let gain = if j == k {
+                    (t * std::f32::consts::FRAC_PI_2).cos()
+                } else if j == k + 1 {
+                    (t * std::f32::consts::FRAC_PI_2).sin()
+                } else {
+                    0.0
+                };
+                let pitch = match rising {
+                    Some(p) => {
+                        // The note between the two loops either side.
+                        let (lo, hi) = (p[k], p[k + 1]);
+                        lo * (hi / lo).powf(t) / p[j]
+                    }
+                    None => 1.0 + (at - j as f32) * 0.25,
+                };
+                (gain, pitch.clamp(ENGINE_BEND.0, ENGINE_BEND.1))
+            })
+            .collect()
+    }
+}
+
+/// Sounds read from the banks: the fight's and the ambient one-shots.
+type BankSounds = ([Option<SoundBuffer>; 3], [Vec<SoundBuffer>; 2]);
+
+/// The fight's sounds and the ambient one-shots.
 fn bank_sounds(install: &Install) -> BankSounds {
     let library = install.open_world().and_then(|mut source| {
         SoundLibrary::load(
@@ -263,13 +347,6 @@ fn bank_sounds(install: &Install) -> BankSounds {
                 "support_artillery",
                 "amb_citymed",
                 "amb_jungle",
-                "veh_helicoptermedium",
-                "veh_jeep",
-                "veh_tankbig",
-                "veh_tankmed",
-                "veh_semi",
-                "veh_8cylinderold",
-                "veh_4cylindernew",
             ],
         )
     });
@@ -293,16 +370,6 @@ fn bank_sounds(install: &Install) -> BankSounds {
                     }),
                 ],
                 [short("amb_citymed"), short("amb_jungle")],
-                // Engine loops run 2-8 s; longer ones are rev sweeps.
-                ENGINES
-                    .iter()
-                    .filter_map(|&(_, bank)| {
-                        Some((
-                            bank,
-                            pick(&l, bank, |s| (2.0..=8.0).contains(&s.seconds()))?,
-                        ))
-                    })
-                    .collect(),
             )
         }
         Err(e) => {
@@ -310,6 +377,86 @@ fn bank_sounds(install: &Install) -> BankSounds {
             Default::default()
         }
     }
+}
+
+/// Every engine bank, to name a template's bank (a name hash) in logs.
+const ENGINE_BANKS: [&str; 22] = [
+    "veh_semi",
+    "veh_bus",
+    "veh_jeep",
+    "veh_tankbig",
+    "veh_tankmed",
+    "veh_tanksmall",
+    "veh_tankdiesel",
+    "veh_8cylinderold",
+    "veh_8cylinderold_cobra",
+    "veh_8cylindertruck",
+    "veh_8cylindernew",
+    "veh_8cylinderluxury",
+    "veh_8cylinderjapanese",
+    "veh_4cylindernew",
+    "veh_4cylinderold",
+    "veh_4cylinderracing",
+    "veh_largedieselnew",
+    "veh_largedieselold",
+    "veh_largegasnew",
+    "veh_largegasold",
+    "veh_largegascrappy",
+    "veh_helicoptermedium",
+];
+
+/// The engine bank whose name hashes to `hash`.
+pub fn bank_name(hash: u32) -> Option<&'static str> {
+    ENGINE_BANKS
+        .iter()
+        .copied()
+        .find(|n| m2_assets::name_hash(n) == hash)
+}
+
+/// Reads bank `bank`'s engine sounds (from an install's world archive),
+/// and logs what it picked.
+pub fn load_engine(install: &Install, bank: u32) -> Option<EngineSounds> {
+    let library = install
+        .open_world()
+        .and_then(|mut source| SoundLibrary::load_hashes(&mut source, &[bank]));
+    let library = match library {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("engine: bank {bank:08x}: {e}");
+            return None;
+        }
+    };
+    let Some((name, sounds)) = library.bank_hash(bank) else {
+        eprintln!("engine: no bank {bank:08x}");
+        return None;
+    };
+    let picked = EngineSounds::pick(name, sounds);
+    let loops: Vec<String> = picked
+        .loops
+        .iter()
+        .map(|(s, f)| {
+            format!(
+                "{:08x} {:.2} s {}",
+                s.hash,
+                s.seconds(),
+                f.map_or("no pitch".to_owned(), |f| format!("{f:.0} Hz"))
+            )
+        })
+        .collect();
+    eprintln!(
+        "engine: {name}, {} sounds: {} loops{} [{}], start {}, stop {}",
+        sounds.len(),
+        picked.loops.len(),
+        if picked.named {
+            " by name"
+        } else {
+            " measured"
+        },
+        loops.join(", "),
+        picked.start.is_some(),
+        picked.stop.is_some()
+    );
+    (!picked.loops.is_empty()).then_some(picked)
 }
 
 /// A finished decode: which kind of stream, and its samples.
@@ -331,7 +478,7 @@ impl GameAudio {
                 }
             }
         });
-        let (fight, ambient, engines) = install.map(bank_sounds).unwrap_or_default();
+        let (fight, ambient) = install.map(bank_sounds).unwrap_or_default();
         // The recorded ambience (ambience.pws) isn't played: which of its
         // tracks is which place is not known, and the first is a tank
         // rolling by. The banks' short sounds stand in, as in the viewer.
@@ -343,7 +490,9 @@ impl GameAudio {
             decoded: channel(),
             fight,
             ambient,
-            engines,
+            engines: HashMap::new(),
+            engine_loads: channel(),
+            install: install.cloned(),
             engine: None,
             ambient_wait: 3.0,
             seed: 0x9e37_79b9_7f4a_7c15,
@@ -541,32 +690,85 @@ impl GameAudio {
         }
     }
 
-    /// Runs the engine of the vehicle being driven (`None`: on foot):
-    /// its bank's loop, pitched up with speed (m/s) towards `top`.
-    pub fn engine(&mut self, driving: Option<(&'static str, f32, f32)>) {
-        let want = driving.map(|d| d.0);
-        if let Some((bank, id)) = self.engine
-            && Some(bank) != want
-        {
-            self.out.with(|m| m.stop(id));
-            self.engine = None;
+    /// Runs the engine of the vehicle being driven (`None`: on foot) for
+    /// `dt` seconds: its bank's steady loops crossfaded and pitched as it
+    /// revs with speed and throttle, its start and stop sounds as it is
+    /// got in and out of. A bank is read the first time it's driven.
+    pub fn engine(&mut self, driving: Option<EngineInput>, dt: f32) {
+        while let Ok((bank, sounds)) = self.engine_loads.1.try_recv() {
+            self.engines.insert(bank, sounds.map(Arc::new));
         }
-        let Some((bank, speed, top)) = driving else {
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(|e| Some(e.bank) != driving.map(|d| d.bank))
+            && let Some(e) = self.engine.take()
+        {
+            self.out.with(|m| {
+                for id in &e.voices {
+                    m.stop(*id);
+                }
+                if let Some(stop) = &e.sounds.stop {
+                    m.play(Play::flat(stop.clone()).gain(ENGINE_GAIN));
+                }
+            });
+        }
+        let Some(input) = driving else {
             return;
         };
-        if self.engine.is_none()
-            && let Some((_, buffer)) = self.engines.iter().find(|e| e.0 == bank)
-        {
-            let buffer = buffer.clone();
-            let id = self
-                .out
-                .with(|m| m.play(Play::flat(buffer).looped().gain(0.45)));
-            self.engine = Some((bank, id));
+        if self.engine.is_none() {
+            match self.engines.get(&input.bank) {
+                Some(Some(sounds)) => {
+                    let sounds = sounds.clone();
+                    let voices = self.out.with(|m| {
+                        if let Some(start) = &sounds.start {
+                            m.play(Play::flat(start.clone()).gain(ENGINE_GAIN));
+                        }
+                        sounds
+                            .loops
+                            .iter()
+                            .map(|(buffer, _)| {
+                                m.play(Play::flat(buffer.clone()).looped().gain(0.0))
+                            })
+                            .collect()
+                    });
+                    self.engine = Some(Engine {
+                        bank: input.bank,
+                        sounds,
+                        voices,
+                        rpm: 0.0,
+                        running: 0.0,
+                    });
+                }
+                // Being read, or without engine sounds.
+                Some(None) => return,
+                None => {
+                    self.engines.insert(input.bank, None);
+                    let Some(install) = self.install.clone() else {
+                        return;
+                    };
+                    let (bank, tx) = (input.bank, self.engine_loads.0.clone());
+                    std::thread::spawn(move || drop(tx.send((bank, load_engine(&install, bank)))));
+                    return;
+                }
+            }
         }
-        if let Some((_, id)) = self.engine {
-            let pitch = 0.75 + speed.abs() / top.max(1.0);
-            self.out.with(|m| m.set_pitch(id, pitch));
-        }
+        let Some(e) = &mut self.engine else {
+            return;
+        };
+        e.running += dt;
+        let load = input.throttle.abs().min(1.0);
+        let want = (input.speed.abs() / input.top.max(1.0)).min(1.0) * 0.8 + load * 0.2;
+        e.rpm += (want - e.rpm) * (dt * ENGINE_EASE).min(1.0);
+        let fade = (e.running / ENGINE_FADE_IN).min(1.0);
+        let gain = ENGINE_GAIN * fade * (0.85 + 0.15 * load);
+        let mix = Engine::mix(&e.sounds, e.rpm);
+        self.out.with(|m| {
+            for (id, (g, pitch)) in e.voices.iter().zip(mix) {
+                m.set_gain(*id, gain * g);
+                m.set_pitch(*id, pitch);
+            }
+        });
     }
 
     /// Starts the next music track, or stops the music.
@@ -629,8 +831,69 @@ mod tests {
         assert_eq!(engine_bank("truck", "semi_orange"), "veh_semi");
         assert_eq!(
             engine_bank("car", "global_veh_68valiant4door"),
-            "veh_8cylinderold"
+            "veh_largegascrappy"
         );
-        assert_eq!(engine_bank("car", "m151"), "veh_4cylindernew");
+        assert_eq!(
+            engine_bank("truck", "al_veh_truck_hmmwv"),
+            "veh_largegascrappy"
+        );
+        assert_eq!(
+            engine_bank("car", "global_veh_hondacrx"),
+            "veh_4cylinderold"
+        );
+        assert_eq!(engine_bank("truck", "vz_veh_truck_m151"), "veh_jeep");
+        assert_eq!(engine_bank("car", "civ_veh_car_sedan"), "veh_4cylindernew");
+        // The template database's banks, by name hash.
+        assert_eq!(bank_name(0x3714_581c), Some("veh_largegascrappy"));
+        assert_eq!(bank_name(0x3621_dfe1), Some("veh_jeep"));
+    }
+
+    fn sound(hash: u32) -> SoundBuffer {
+        SoundBuffer {
+            hash,
+            channels: 1,
+            rate: 100,
+            samples: Arc::from(vec![0i16; 300]),
+        }
+    }
+
+    fn engine(pitches: &[Option<f32>]) -> EngineSounds {
+        EngineSounds {
+            loops: pitches
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| (sound(i as u32), p))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_engine_idles_on_its_lowest_loop_and_crossfades_up() {
+        let e = engine(&[Some(40.0), Some(80.0), Some(160.0)]);
+        let idle = Engine::mix(&e, 0.0);
+        assert_eq!(idle[0], (1.0, 1.0));
+        assert!(idle[1].0.abs() < 1e-6 && idle[2].0 == 0.0);
+        // Halfway between the first two loops: both, at one note.
+        let mid = Engine::mix(&e, 0.25);
+        assert!((mid[0].0 - mid[1].0).abs() < 1e-5);
+        assert!((40.0 * mid[0].1 - 80.0 * mid[1].1).abs() < 0.5, "{mid:?}");
+        let top = Engine::mix(&e, 1.0);
+        assert!(top[2].0 > 0.999 && (top[2].1 - 1.0).abs() < 1e-5);
+        // Gains keep their power across the crossfade.
+        for rpm in [0.1, 0.4, 0.6, 0.9] {
+            let p: f32 = Engine::mix(&e, rpm).iter().map(|(g, _)| g * g).sum();
+            assert!((p - 1.0).abs() < 1e-4, "{rpm}: {p}");
+        }
+    }
+
+    #[test]
+    fn unmeasured_loops_bend_a_little_and_one_loop_bends_with_revs() {
+        let e = engine(&[Some(40.0), None]);
+        let mid = Engine::mix(&e, 0.5);
+        assert!((mid[0].1 - 1.125).abs() < 1e-5 && (mid[1].1 - 0.875).abs() < 1e-5);
+        let one = engine(&[None]);
+        assert_eq!(Engine::mix(&one, 0.0), vec![(1.0, 0.8)]);
+        assert_eq!(Engine::mix(&one, 1.0), vec![(1.0, 1.5)]);
     }
 }

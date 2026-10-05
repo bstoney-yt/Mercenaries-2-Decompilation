@@ -148,6 +148,12 @@ impl Props {
         Some(local.cmpge(lo - pad).all() && local.cmple(hi + pad).all())
     }
 
+    /// `entity`'s, if it is shown, and whether its model has loaded.
+    pub fn get(&self, entity: u32) -> Option<(&Prop, bool)> {
+        let p = self.shown.get(&entity)?;
+        Some((p, self.models.get(&p.model).is_some_and(Option::is_some)))
+    }
+
     /// Those shown, by entity.
     pub fn shown(&self) -> impl Iterator<Item = (u32, &Prop)> {
         self.shown.iter().map(|(&e, p)| (e, p))

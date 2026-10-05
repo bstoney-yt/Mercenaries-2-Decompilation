@@ -528,12 +528,14 @@ struct Playing {
 }
 
 /// A clip the upper body plays over the rest (a rifle held while the legs
-/// run): which, how far in, and which nodes it moves.
+/// run): which, how far in, which nodes it moves, and whether it plays
+/// once and holds its last frame (a throw) rather than looping.
 #[derive(Clone, Debug)]
 struct Upper {
     clip: usize,
     time: f32,
     mask: Arc<[bool]>,
+    once: bool,
 }
 
 /// Plays one clip at a time with crossfades, pinning the root horizontally,
@@ -614,16 +616,40 @@ impl Animator {
     /// body, [`Skeleton::upper_body`]) over whatever plays; `None` stops.
     pub fn set_upper(&mut self, clip: Option<(usize, Arc<[bool]>)>) {
         match clip {
-            Some((c, _)) if self.upper.as_ref().is_some_and(|u| u.clip == c) => {}
+            Some((c, _)) if self.upper.as_ref().is_some_and(|u| u.clip == c && !u.once) => {}
             Some((clip, mask)) => {
                 self.upper = Some(Upper {
                     clip,
                     time: 0.0,
                     mask,
+                    once: false,
                 })
             }
             None => self.upper = None,
         }
+    }
+
+    /// Plays clip `clip` on the nodes `mask` marks over whatever plays,
+    /// `time` seconds in, holding its last frame past its end: a throw on
+    /// the run, timed by the one throwing (until the next
+    /// [`set_upper`](Self::set_upper)).
+    pub fn upper_at(&mut self, clip: usize, mask: Arc<[bool]>, time: f32) {
+        self.upper = Some(Upper {
+            clip,
+            time,
+            mask,
+            once: true,
+        });
+    }
+
+    /// Jumps the clip playing to `time` seconds in, done fading (for
+    /// pictures of a moment of a clip).
+    pub fn seek(&mut self, time: f32) {
+        if let Some(c) = &mut self.current {
+            c.time = time;
+        }
+        self.previous = None;
+        self.fade = 1.0;
     }
 
     pub fn advance(&mut self, dt: f32) {
@@ -671,7 +697,11 @@ impl Animator {
         if let Some(u) = &self.upper
             && let Some(c) = clips.get(u.clip)
         {
-            let over = c.sample_looped(skeleton, u.time);
+            let over = if u.once {
+                c.sample(skeleton, u.time.min(c.info.duration))
+            } else {
+                c.sample_looped(skeleton, u.time)
+            };
             for ((local, mine), on) in pose.0.iter_mut().zip(over.0).zip(u.mask.iter()) {
                 if *on {
                     *local = mine;

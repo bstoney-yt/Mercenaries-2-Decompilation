@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 
-use m2_assets::layer::{LAYER_TYPE, TEMPLATE_DB_TYPE};
+use m2_assets::layer::{LAYER_TYPE, Placement, TEMPLATE_DB_TYPE};
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::path::PATH_TYPE;
 use m2_assets::terrain::{CELL_SIZE, TerrainGroup, colour_map_uv};
@@ -96,17 +96,61 @@ pub struct TemplateInfo {
     pub model: Option<u32>,
     /// Its physics component's kind, when it has one.
     pub vehicle: Option<VehicleKind>,
+    /// The name hash of its engine's sound bank (`veh_jeep`), from its
+    /// `SoundEffect`.
+    pub engine: Option<u32>,
+    /// A person (a soldier, a civilian): it has [`PERSON`] physics, or AI
+    /// of a person's and no vehicle physics.
+    pub person: bool,
 }
 
-/// The template database by template name, lower case.
+/// The physics component of people, as `_CarPhysicsV2` is of cars.
+const PERSON: &str = "_HumanPhysics";
+/// AI that only people carry (vehicles have `AiDriving`, `AiHelicopter`).
+const PERSON_AI: [&str; 2] = ["AiBehavior", "Ai"];
+
+/// The `SoundEffect` field naming a vehicle's engine sound bank, by name
+/// hash (`veh_largegascrappy` for the HMMWVs and Valiants).
+const ENGINE_BANK_FIELD: u32 = 0x14a6_7fa6;
+
+/// The template database: what it says of each template by name (lower
+/// case), and the names by template id.
 #[derive(Clone, Debug, Default)]
-pub struct Templates(pub HashMap<String, TemplateInfo>);
+pub struct Templates {
+    pub by_name: HashMap<String, TemplateInfo>,
+    /// Each template's name as the database writes it, by its id (bit 31
+    /// set): the id an entity's [`parent`](m2_assets::layer::Placement::parent)
+    /// gives.
+    pub names: HashMap<u32, String>,
+}
 
 impl Templates {
     /// The template an entity or template name (`M151 Softtop (VZ)
     /// 0x0012abcd`, `AMX30`) names, whatever its case.
     pub fn get(&self, name: &str) -> Option<&TemplateInfo> {
-        self.0.get(&member_stem(name).to_ascii_lowercase())
+        self.by_name.get(&member_stem(name).to_ascii_lowercase())
+    }
+
+    /// The template with id `id` (an entity's parent): its name, and what
+    /// the database says of it.
+    pub fn by_id(&self, id: u32) -> Option<(&str, &TemplateInfo)> {
+        let name = self.names.get(&id)?;
+        Some((name, self.by_name.get(&name.to_ascii_lowercase())?))
+    }
+
+    /// The engine sound bank most templates of `model` use (a model's
+    /// templates are variants: drivers, guns, factions).
+    pub fn engine_for_model(&self, model: u32) -> Option<u32> {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for t in self.by_name.values().filter(|t| t.model == Some(model)) {
+            if let Some(bank) = t.engine {
+                *counts.entry(bank).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(bank, n)| (n, std::cmp::Reverse(bank)))
+            .map(|(bank, _)| bank)
     }
 }
 
@@ -129,6 +173,7 @@ impl Templates {
             return Self::default();
         };
         let model_of = db.hashes("ModelName");
+        let engines = engine_banks(&db);
         let mut kinds: HashMap<u32, VehicleKind> = HashMap::new();
         for (component, kind) in [
             ("_CarPhysicsV2", VehicleKind::Car),
@@ -143,21 +188,65 @@ impl Templates {
                 kinds.insert(id, kind);
             }
         }
-        Self(
-            db.names()
+        let carrying = |component: &str| -> HashSet<u32> {
+            db.component(component)
+                .and_then(|c| c.records())
+                .unwrap_or_default()
                 .into_iter()
-                .map(|(id, name)| {
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let humans = carrying(PERSON);
+        let minds: HashSet<u32> = PERSON_AI.iter().flat_map(|c| carrying(c)).collect();
+        let names = db.names();
+        Self {
+            by_name: names
+                .iter()
+                .map(|(&id, name)| {
+                    let vehicle = kinds.get(&id).copied();
                     (
                         name.to_ascii_lowercase(),
                         TemplateInfo {
                             model: model_of.get(&id).copied().filter(|m| models.contains(m)),
-                            vehicle: kinds.get(&id).copied(),
+                            vehicle,
+                            engine: engines.get(&id).copied(),
+                            person: humans.contains(&id)
+                                || (minds.contains(&id) && vehicle.is_none()),
                         },
                     )
                 })
                 .collect(),
-        )
+            names: names
+                .into_iter()
+                .map(|(id, name)| (id, name.to_owned()))
+                .collect(),
+        }
     }
+}
+
+/// Each template's engine sound bank: the `SoundEffect` field that names
+/// one, where it isn't zero.
+fn engine_banks(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let Some(c) = db.component("SoundEffect") else {
+        return HashMap::new();
+    };
+    let Some(at) = c
+        .fields
+        .iter()
+        .find(|f| f.name_hash == ENGINE_BANK_FIELD)
+        .map(|f| usize::from(f.offset))
+    else {
+        return HashMap::new();
+    };
+    c.records()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, r)| {
+            let b = r.get(at..at + 4)?;
+            let bank = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            (bank != 0).then_some((id, bank))
+        })
+        .collect()
 }
 
 /// Components of people and vehicles, which a state layer's models
@@ -194,14 +283,20 @@ const NOT_TEMPLATES: [&str; 16] = [
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpawnPoint {
     pub entity: u32,
-    /// The entity's name (`VZ Soldier 03`, ...): the only hint of who it
-    /// spawns, as which model a spawner uses is not decoded.
+    /// The entity's name (`VZ Soldier 03`, `vza_beachguard_1`, ...).
     pub name: String,
+    /// The name of the template it is an instance of (`VZ Soldier`), if
+    /// the database has it: what a renamed entity's name no longer says.
+    pub template: Option<String>,
     pub position: Vec3,
     pub rotation: Quat,
     /// The patrol route its `AiPatrol` names, world space; empty for a
     /// post.
     pub route: Vec<Vec3>,
+    /// The state layer placing it, by name hash (`vz_state_vzacon001_cp02`):
+    /// in the game it is there only while that layer is in. `None` for
+    /// the static layers.
+    pub layer: Option<u32>,
 }
 
 /// Where everything on the island is.
@@ -354,7 +449,13 @@ impl WorldIndex {
                     continue;
                 };
                 world.add_layer(&layer, e.name_hash, is_static, &assets);
-                world.add_people(&layer, &mut routes);
+                world.add_people(
+                    &layer,
+                    e.name_hash,
+                    &mut routes,
+                    is_static,
+                    &assets.templates,
+                );
             }
         }
         world.template_db = assets.templates;
@@ -381,7 +482,17 @@ impl WorldIndex {
         Ok(world)
     }
 
-    fn add_people(&mut self, layer: &Layer<'_>, routes: &mut Routes) {
+    /// The people a layer places: entities with AI or a spawner of their
+    /// own, and in a state layer (a mission's), every instance of a person
+    /// template (`vza_villageguard_2` carries no components at all).
+    fn add_people(
+        &mut self,
+        layer: &Layer<'_>,
+        layer_hash: u32,
+        routes: &mut Routes,
+        is_static: bool,
+        templates: &Templates,
+    ) {
         let placements = layer.placements();
         routes.placed.extend(
             placements
@@ -400,6 +511,15 @@ impl WorldIndex {
         }
         let names = layer.names();
         let mut seen: HashSet<u32> = HashSet::new();
+        let spawn = |id: u32, p: &Placement| SpawnPoint {
+            entity: id,
+            name: names.get(&id).copied().unwrap_or("").to_owned(),
+            template: templates.by_id(p.parent).map(|(t, _)| t.to_owned()),
+            position: Vec3::from(p.position),
+            rotation: rotation(p.rotation),
+            route: Vec::new(),
+            layer: (!is_static).then_some(layer_hash),
+        };
         for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
             let Some(c) = layer.component(component) else {
                 continue;
@@ -411,15 +531,24 @@ impl WorldIndex {
                 if !seen.insert(id) {
                     continue;
                 }
-                self.spawns.push(SpawnPoint {
-                    entity: id,
-                    name: names.get(&id).copied().unwrap_or("").to_owned(),
-                    position: Vec3::from(p.position),
-                    rotation: rotation(p.rotation),
-                    route: Vec::new(),
-                });
+                self.spawns.push(spawn(id, p));
             }
         }
+        if is_static {
+            return;
+        }
+        let mut people: Vec<(u32, &Placement)> = placements
+            .iter()
+            .filter(|(id, p)| {
+                !seen.contains(*id)
+                    && p.position[1] > HIDDEN_BELOW
+                    && templates.by_id(p.parent).is_some_and(|(_, t)| t.person)
+            })
+            .map(|(&id, p)| (id, p))
+            .collect();
+        people.sort_unstable_by_key(|&(id, _)| id);
+        self.spawns
+            .extend(people.into_iter().map(|(id, p)| spawn(id, p)));
     }
 
     fn add_layer(&mut self, layer: &Layer<'_>, layer_hash: u32, is_static: bool, assets: &Assets) {
@@ -491,6 +620,7 @@ impl WorldIndex {
                         Some(&TemplateInfo {
                             model,
                             vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank)),
+                            ..
                         }),
                     ) => self.templates.push(TemplatePlacement {
                         entity,
@@ -554,17 +684,27 @@ impl WorldIndex {
                 continue;
             }
             let stem = names.get(&entity).map_or("", |n| member_stem(n));
+            // A prop's template: one with a model, that neither drives
+            // nor walks.
+            let prop = |t: &TemplateInfo| match t {
+                &TemplateInfo {
+                    model: Some(m),
+                    vehicle: None,
+                    person: false,
+                    ..
+                } => Some(m),
+                _ => None,
+            };
             let model = models.get(&entity).copied().or_else(|| {
-                let h = (!stem.is_empty()).then(|| name_hash(stem))?;
-                if assets.models.contains(&h) {
+                let h = (!stem.is_empty()).then(|| name_hash(stem));
+                if let Some(h) = h.filter(|h| assets.models.contains(h)) {
                     return Some(h);
                 }
+                // The template its name says, else the one it is an
+                // instance of (a renamed entity: `vza001_gate`).
                 match assets.templates.get(stem) {
-                    Some(&TemplateInfo {
-                        model: Some(m),
-                        vehicle: None,
-                    }) => Some(m),
-                    _ => None,
+                    Some(t) => prop(t),
+                    None => assets.templates.by_id(p.parent).and_then(|(_, t)| prop(t)),
                 }
             });
             if let Some(model) = model {
@@ -830,6 +970,34 @@ pub fn low_res_tile<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_models_engine_is_the_one_most_of_its_templates_use() {
+        let t = |model, engine| TemplateInfo {
+            model: Some(model),
+            vehicle: Some(VehicleKind::Car),
+            engine,
+            person: false,
+        };
+        let db = Templates {
+            by_name: HashMap::from([
+                ("valiant".to_owned(), t(1, Some(0xaa))),
+                ("valiant (driver)".to_owned(), t(1, Some(0xaa))),
+                ("valiant (python)".to_owned(), t(1, Some(0xbb))),
+                ("valiant (base)".to_owned(), t(1, None)),
+                ("hmmwv".to_owned(), t(2, None)),
+            ]),
+            names: HashMap::from([(0x8000_0001, "Valiant (Python)".to_owned())]),
+        };
+        assert_eq!(
+            db.by_id(0x8000_0001).map(|(n, _)| n),
+            Some("Valiant (Python)")
+        );
+        assert_eq!(db.by_id(0x8000_0002), None);
+        assert_eq!(db.engine_for_model(1), Some(0xaa));
+        assert_eq!(db.engine_for_model(2), None);
+        assert_eq!(db.engine_for_model(3), None);
+    }
 
     #[test]
     fn distance_to_a_cell_square() {

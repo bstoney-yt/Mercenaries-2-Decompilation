@@ -78,7 +78,8 @@ pub(crate) enum Brain {
 
 /// The clips a fight plays, indices into every human rig's clips (they
 /// share one list). Clips are named only by hash; these were picked by
-/// looking at each pose.
+/// looking at each pose, or by the events they carry (a jump's
+/// `footstep_jumptakeoff`, a throw's `releasegrenade`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FightClips {
     /// Standing, rifle shouldered and aimed (resident 0163f2aa).
@@ -86,8 +87,18 @@ pub struct FightClips {
     /// Standing, rifle held across the chest (resident 178a5642).
     pub ready: Option<usize>,
     /// A jump: take-off and the air, ending off the ground (resident
-    /// c846e6fd).
+    /// c846e6fd); the stand-in when the take-offs below aren't there.
     pub jump: Option<usize>,
+    /// Taking off on the run, and from standing (Jennifer's own, with
+    /// `footstep_jumptakeoff` 0.1 s in).
+    pub takeoff: Option<usize>,
+    pub takeoff_still: Option<usize>,
+    /// Landing on the run, and standing.
+    pub land: Option<usize>,
+    pub land_still: Option<usize>,
+    /// Throwing a grenade, and how far into it (seconds) the grenade
+    /// leaves the hand: its `releasegrenade` event.
+    pub throw: Option<(usize, f32)>,
     /// Falling down dead (resident 479c4a51).
     pub die: Option<usize>,
 }
@@ -97,13 +108,42 @@ impl FightClips {
     pub const READY: u32 = 0x178a_5642;
     pub const JUMP: u32 = 0xc846_e6fd;
     pub const DIE: u32 = 0x479c_4a51;
+    /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
+    /// resident's; standing (0.37 s).
+    pub const TAKEOFF: [u32; 4] = [0xdaf7_966f, 0x4fdb_3497, 0x0e18_b683, 0x47af_6321];
+    pub const TAKEOFF_STILL: [u32; 1] = [0x3aee_9ae8];
+    /// Jennifer's landings on the run (0.37 s, 6.4 m/s) and standing
+    /// (0.47 s).
+    pub const LAND: [u32; 3] = [0xfe10_b04e, 0xd325_9f36, 0xf57a_8dea];
+    pub const LAND_STILL: [u32; 4] = [0xbe97_1f8f, 0xe4dc_de37, 0x3c17_66b3, 0x4de5_ef60];
+    /// Grenade throws, likeliest first: a whole throw of 0.77 s (release
+    /// 0.30 s in), one of 1.74 s (0.80 s), a short one (0.47 s).
+    pub const THROW: [u32; 3] = [0xec6f_fa31, 0xb2e6_acf6, 0x91eb_aa5c];
+    /// The event a throw lets go of the grenade at.
+    const RELEASE: &str = "releasegrenade";
 
     pub fn find(rig: &Rig) -> Self {
         let find = |hash| rig.clips.iter().position(|c| c.hash == hash);
+        let first = |hashes: &[u32]| hashes.iter().find_map(|&h| find(h));
+        let throw = Self::THROW.iter().find_map(|&h| {
+            let i = find(h)?;
+            let release = rig.clips[i]
+                .clip
+                .events
+                .iter()
+                .find(|e| e.name.eq_ignore_ascii_case(Self::RELEASE))
+                .map(|e| e.time)?;
+            Some((i, release))
+        });
         Self {
             aim: find(Self::AIM),
             ready: find(Self::READY),
             jump: find(Self::JUMP),
+            takeoff: first(&Self::TAKEOFF),
+            takeoff_still: first(&Self::TAKEOFF_STILL),
+            land: first(&Self::LAND),
+            land_still: first(&Self::LAND_STILL),
+            throw,
             die: find(Self::DIE),
         }
     }
@@ -127,6 +167,9 @@ pub struct Npc {
     pub landed: bool,
     /// The layer entity that placed them (soldiers).
     pub spawn: Option<u32>,
+    /// The state layer that placed them, if not a static one: they go
+    /// when it does.
+    pub layer: Option<u32>,
     pub hp: f32,
     pub alive: bool,
     /// A soldier turned on the player.
@@ -139,8 +182,10 @@ pub struct Npc {
     brain: Brain,
     /// The aim and fall clips in this person's rig.
     clips: FightClips,
-    /// The hand nodes (right, left), where the rifle is held.
+    /// The right hand's node, where the rifle is held, and its attach
+    /// point.
     pub hand: Option<usize>,
+    pub attach: Option<usize>,
     /// Seconds since they died.
     dead_for: f32,
     /// Their body gone limp, once dead.
@@ -177,6 +222,7 @@ impl Npc {
         Self {
             clips,
             hand,
+            attach: crate::combat::right_attach(&rig.skeleton),
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
@@ -188,6 +234,7 @@ impl Npc {
             rig,
             landed: false,
             spawn,
+            layer: None,
             hp: 100.0,
             alive: true,
             alert: false,
@@ -438,6 +485,9 @@ pub struct People {
     /// Spawns a mission wants soldiers at though their names don't say
     /// so (`vza_beachguard_1`): plain VZ soldiers.
     pub mission_soldiers: HashSet<u32>,
+    /// The state layers in, by name hash: a state layer's people stand
+    /// only while it is. `None` when that isn't known (all of them stand).
+    pub state_layers: Option<HashSet<u32>>,
     active: HashSet<u32>,
     rng: Rng,
 }
@@ -461,6 +511,15 @@ impl People {
             "vz_hum_soldier"
         };
         self.kinds.iter().position(|k| k.role == role)
+    }
+
+    /// Whether `npcs[i]` is a woman (her model's role says so,
+    /// `civ_hum_*female`).
+    pub fn is_woman(&self, i: usize) -> bool {
+        self.npcs
+            .get(i)
+            .and_then(|n| self.kinds.get(n.kind))
+            .is_some_and(|k| k.role.contains("female"))
     }
 
     pub fn add_kind(&mut self, kind: PersonKind) {
@@ -618,13 +677,31 @@ impl People {
         }
     }
 
+    /// Whether a state layer's people stand: it is in, or which are in
+    /// isn't known.
+    /// Whether a spawn of state layer `layer` (`None`: a static one) can
+    /// stand now.
+    pub fn layer_in(&self, layer: Option<u32>) -> bool {
+        layer.is_none_or(|l| {
+            self.state_layers
+                .as_ref()
+                .is_none_or(|set| set.contains(&l))
+        })
+    }
+
     fn populate(&mut self, physics: &mut Physics, spawns: &[SpawnPoint], focus: Vec3) {
         let far = |p: Vec3, d: f32| Vec2::new(p.x - focus.x, p.z - focus.z).length() > d;
-        // Soldiers out of range go; civilians left behind come back round
-        // the player.
+        // Soldiers out of range, or whose layer went, go; civilians left
+        // behind come back round the player.
+        let layers = self.state_layers.as_ref();
         let (active, killed) = (&mut self.active, &mut self.killed);
         self.npcs.retain(|n| match n.spawn {
-            Some(id) if far(n.character.position, INACTIVE) => {
+            Some(id)
+                if far(n.character.position, INACTIVE)
+                    || n.layer
+                        .zip(layers)
+                        .is_some_and(|(l, set)| !set.contains(&l)) =>
+            {
                 if let Some(doll) = n.ragdoll {
                     physics.remove_ragdoll(doll);
                 }
@@ -670,6 +747,7 @@ impl People {
                 !self.active.contains(&s.entity)
                     && !self.killed.contains(&s.entity)
                     && !far(s.position, ACTIVE)
+                    && self.layer_in(s.layer)
             })
             .map(|s| (s.position.distance(focus), s))
             .collect();
@@ -687,8 +765,14 @@ impl People {
             if room == 0 && !target {
                 break;
             }
-            let kind = self
-                .kind_for(&s.name)
+            // Who: the template's name says (a renamed entity's own name
+            // doesn't), else the entity's, else a mission's target is a
+            // plain soldier.
+            let kind = s
+                .template
+                .as_deref()
+                .and_then(|t| self.kind_for(t))
+                .or_else(|| self.kind_for(&s.name))
                 .or_else(|| target.then(|| self.kind_for("vz soldier")).flatten());
             let Some(kind) = kind else {
                 continue;
@@ -707,14 +791,16 @@ impl People {
                 Brain::Post { facing }
             };
             self.active.insert(s.entity);
-            self.npcs.push(Npc::new(
+            let mut npc = Npc::new(
                 kind,
                 &self.kinds[kind].rig,
                 s.position,
                 facing,
                 brain,
                 Some(s.entity),
-            ));
+            );
+            npc.layer = s.layer;
+            self.npcs.push(npc);
         }
         // Civilians, once their models are in.
         let civilians = self.npcs.len() - self.npcs.iter().filter(|n| n.spawn.is_some()).count();
@@ -871,9 +957,11 @@ pub(crate) mod tests {
         let spawn = |entity, name: &str, x| SpawnPoint {
             entity,
             name: name.into(),
+            template: None,
             position: Vec3::new(x, 0.0, 0.0),
             rotation: Quat::IDENTITY,
             route: Vec::new(),
+            layer: None,
         };
         let spawns = [
             spawn(1, "VZ Soldier 01", 10.0),
@@ -909,6 +997,46 @@ pub(crate) mod tests {
             1.0 / 60.0,
         );
         assert!(people.npcs.iter().all(|n| n.spawn.is_none()));
+    }
+
+    #[test]
+    fn a_state_layers_soldiers_stand_while_it_is_in() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.kinds.push(PersonKind {
+            role: "vz_hum_soldier".into(),
+            soldier: true,
+            model: empty_model(),
+            rig: rig(),
+        });
+        // A renamed guard: its template says who it is.
+        let guard = SpawnPoint {
+            entity: 5,
+            name: "vza_villageguard_2".into(),
+            template: Some("VZ Soldier".into()),
+            position: Vec3::new(10.0, 0.0, 0.0),
+            rotation: Quat::IDENTITY,
+            route: Vec::new(),
+            layer: Some(0xc0),
+        };
+        let spawns = [guard];
+        let tick = |people: &mut People, physics: &mut Physics| {
+            people.update(physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+            people
+                .npcs
+                .iter()
+                .filter_map(|n| n.spawn)
+                .collect::<Vec<_>>()
+        };
+        people.state_layers = Some(HashSet::new());
+        assert!(tick(&mut people, &mut physics).is_empty());
+        people.state_layers = Some(HashSet::from([0xc0]));
+        assert_eq!(tick(&mut people, &mut physics), [5]);
+        people.state_layers = Some(HashSet::new());
+        assert!(tick(&mut people, &mut physics).is_empty());
+        // Not knowing which layers are in, they stand.
+        people.state_layers = None;
+        assert_eq!(tick(&mut people, &mut physics), [5]);
     }
 
     #[test]

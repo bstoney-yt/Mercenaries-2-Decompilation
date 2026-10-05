@@ -7,6 +7,8 @@
 //! the game's: damage, fire rates, accuracy, blast radius and health are
 //! guesses.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use m2_engine::{GpuModel, Physics, Skeleton, VehicleId};
 use m2_math::glam::{Mat4, Quat, Vec3};
 
@@ -17,6 +19,19 @@ use crate::scene::{ParkedVehicle, Rig};
 /// Skeleton nodes the rifle is held between.
 const RIGHT_HAND: u32 = 0xd34f_7713;
 const LEFT_HAND: u32 = 0xeb6f_1b2d;
+/// The weapon attach points under the hands, in the palms
+/// (`Bone_Attach_RHand`, `bone_attach_lhand`): where a weapon's grip goes.
+const RIGHT_ATTACH: u32 = 0xf450_ed0d;
+const LEFT_ATTACH: u32 = 0xfa76_1573;
+
+/// Weapons drawn on the right hand's attach node turned as the node is
+/// posed (the default: the grip sits in her palm, round 78), rather than
+/// the hold worked out from the hands (`--grip hands`).
+static ATTACH_FRAME: AtomicBool = AtomicBool::new(true);
+
+pub fn use_attach_frame(on: bool) {
+    ATTACH_FRAME.store(on, Ordering::Relaxed);
+}
 /// Muzzle marker node of the weapon models.
 pub const MUZZLE: u32 = 0xb148_6ef3;
 
@@ -57,10 +72,12 @@ const DOWN_TIME: f32 = 2.5;
 const ROCKET_SPEED: f32 = 60.0;
 const RPG_RELOAD: f32 = 1.2;
 const ROCKET_RANGE: f32 = 400.0;
-/// Grenade: throw speed (m/s), fuse (s), bounce.
+/// Grenade: throw speed (m/s), fuse (s), bounce, and seconds before she
+/// can throw (or fire) again after starting a throw.
 const THROW: f32 = 12.0;
 const FUSE: f32 = 2.5;
 const BOUNCE: f32 = 0.4;
+const THROW_GAP: f32 = RPG_RELOAD * 0.5;
 /// Blasts kill within `KILL` metres and hurt to `REACH`; vehicles within
 /// `WRECK` are wrecked.
 const KILL: f32 = 4.0;
@@ -98,8 +115,9 @@ pub struct Arsenal {
     pub rpg: Option<WeaponModel>,
     pub rocket: Option<WeaponModel>,
     pub grenade: Option<WeaponModel>,
-    /// The right hand's node in the human skeleton.
+    /// The right hand's node in the human skeleton, and its attach point.
     pub hand: Option<usize>,
+    pub attach: Option<usize>,
 }
 
 impl Arsenal {
@@ -112,6 +130,7 @@ impl Arsenal {
         let carry = rig.and_then(|r| carry(r, muzzle));
         if let Some(r) = rig {
             self.hand = r.rifle_hand();
+            self.attach = right_attach(&r.skeleton);
         }
         let w = Some(WeaponModel {
             model,
@@ -130,17 +149,22 @@ impl Arsenal {
     }
 
     /// Weapon to world for a character drawn at `body` with posed node
-    /// matrices `nodes` and its right hand at node `hand`: held in both
-    /// hands (`two_handed`: a pose made for it, aiming or at the ready),
-    /// else carried in the right.
+    /// matrices `nodes`, its right hand at node `hand` and the hand's
+    /// attach point at `attach`: held in both hands (`two_handed`: a pose
+    /// made for it, aiming or at the ready), else carried in the right.
     pub fn in_hand(
         &self,
         weapon: &WeaponModel,
         body: Mat4,
         nodes: &[Mat4],
-        hand: Option<usize>,
+        (hand, attach): (Option<usize>, Option<usize>),
         two_handed: bool,
     ) -> Option<Mat4> {
+        if ATTACH_FRAME.load(Ordering::Relaxed)
+            && let Some(a) = attach.and_then(|a| nodes.get(a))
+        {
+            return Some(body * *a);
+        }
         let right = nodes.get(hand?)?;
         match weapon.carry {
             Some((at, turn)) if !two_handed => {
@@ -174,6 +198,29 @@ fn node(skeleton: &Skeleton, hash: u32) -> Option<usize> {
     skeleton.name_hashes.iter().position(|&h| h == hash)
 }
 
+/// The right hand's weapon attach point.
+pub fn right_attach(skeleton: &Skeleton) -> Option<usize> {
+    node(skeleton, RIGHT_ATTACH)
+}
+
+/// Where in `nodes` (model space) a weapon's grip sits in `hand`: its
+/// attach point in the palm, or for a skeleton without one, most of the
+/// way from the wrist to the hand's first child.
+fn palm(skeleton: &Skeleton, nodes: &[Mat4], hand: usize) -> Vec3 {
+    let at = |n: usize| nodes[n].w_axis.truncate();
+    let attach = [RIGHT_ATTACH, LEFT_ATTACH]
+        .into_iter()
+        .filter_map(|h| node(skeleton, h))
+        .find(|&a| skeleton.parents.get(a) == Some(&Some(hand)));
+    if let Some(a) = attach {
+        return at(a);
+    }
+    match skeleton.parents.iter().position(|&p| p == Some(hand)) {
+        Some(f) => at(hand).lerp(at(f), 0.6),
+        None => at(hand),
+    }
+}
+
 /// Where a weapon with its muzzle at `muzzle` sits in the aim clip's
 /// pose: grip in the rear hand, barrel towards the front one, upright
 /// about the barrel; and the rear hand's node.
@@ -186,11 +233,12 @@ fn grip(rig: &Rig, muzzle: Vec3) -> Option<(Mat4, usize)> {
         .find(|c| c.hash == crate::npc::FightClips::AIM)?;
     let pose = aim.sample(skeleton, aim.info.duration * 0.5);
     let nodes = skeleton.model_matrices(&pose);
-    let fingers = skeleton.parents.iter().position(|&p| p == Some(rear));
     let pr = nodes[rear].transform_point3(Vec3::ZERO);
     let pl = nodes[front].transform_point3(Vec3::ZERO);
-    let pf = fingers.map_or(pr, |f| nodes[f].transform_point3(Vec3::ZERO));
-    Some((place(nodes[rear], pr.lerp(pf, 0.6), muzzle, pl - pr)?, rear))
+    Some((
+        place(nodes[rear], palm(skeleton, &nodes, rear), muzzle, pl - pr)?,
+        rear,
+    ))
 }
 
 /// Of a human skeleton's hands, (rear, front) in the aim clip: the
@@ -232,10 +280,10 @@ fn carry(rig: &Rig, muzzle: Vec3) -> Option<(Vec3, Quat)> {
     let pose = clip.sample(skeleton, clip.info.duration * 0.5);
     let nodes = skeleton.model_matrices(&pose);
     let rh = rig.rifle_hand()?;
-    let fingers = skeleton.parents.iter().position(|&p| p == Some(rh));
     let pr = nodes[rh].transform_point3(Vec3::ZERO);
-    let pf = fingers.map_or(pr, |f| nodes[f].transform_point3(Vec3::ZERO));
-    let at = nodes[rh].inverse().transform_point3(pr.lerp(pf, 0.6));
+    let at = nodes[rh]
+        .inverse()
+        .transform_point3(palm(skeleton, &nodes, rh));
     let ahead = Vec3::new(forward.x, 0.0, forward.y).normalize_or(Vec3::Z);
     // Turned a little out to the hand's side of the body, clear of the leg.
     let centre = skeleton
@@ -353,6 +401,8 @@ pub struct Combat {
     quiet: f32,
     reload: f32,
     aim_left: f32,
+    /// Seconds until the grenade she is throwing leaves her hand.
+    throw_in: Option<f32>,
     projectiles: Vec<Projectile>,
     /// Effects with their seconds left and lifetime.
     pub effects: Vec<(Effect, f32, f32)>,
@@ -387,6 +437,7 @@ impl Default for Combat {
             quiet: 0.0,
             reload: 0.0,
             aim_left: 0.0,
+            throw_in: None,
             projectiles: Vec::new(),
             effects: Vec::new(),
             sounds: Vec::new(),
@@ -542,7 +593,21 @@ impl Combat {
         if let Some(w) = trigger.select {
             self.weapon = w;
         }
-        if on_foot {
+        f.player.launcher = self.weapon == Weapon::Rpg;
+        // A grenade leaves her hand at its moment in the throw; knocked
+        // down or in a vehicle by then, she never let go.
+        if let Some(t) = &mut self.throw_in {
+            *t -= dt;
+            if *t <= 0.0 {
+                self.throw_in = None;
+                if on_foot {
+                    let hand = Self::right_hand(f);
+                    self.throw(f, hand);
+                }
+            }
+        }
+        let throwing = self.throw_in.is_some() || f.player.throwing.is_some();
+        if on_foot && !throwing {
             if trigger.fire && self.reload <= 0.0 {
                 match self.weapon {
                     Weapon::Rifle => self.player_shoot(f),
@@ -550,7 +615,12 @@ impl Combat {
                 }
             }
             if trigger.throw && self.reload <= 0.0 {
-                self.throw(f);
+                self.reload = THROW_GAP;
+                // Without her throw clip, it goes at once.
+                match f.player.start_throw() {
+                    Some(release) => self.throw_in = Some(release),
+                    None => self.throw(f, None),
+                }
             }
         }
         if let Some(i) = f.player.driving
@@ -606,7 +676,7 @@ impl Combat {
                 w,
                 f.player.model_matrix(),
                 &nodes,
-                f.arsenal.hand,
+                (f.arsenal.hand, f.arsenal.attach),
                 rig.two_handed,
             )
             .map_or(chest, |m| m.transform_point3(w.muzzle))
@@ -649,7 +719,13 @@ impl Combat {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
                 f.arsenal
-                    .in_hand(w, n.model_matrix(), &nodes, n.hand, n.rig.two_handed)
+                    .in_hand(
+                        w,
+                        n.model_matrix(),
+                        &nodes,
+                        (n.hand, n.attach),
+                        n.rig.two_handed,
+                    )
                     .map_or(n.chest(), |m| m.transform_point3(w.muzzle))
             }
             _ => n.chest(),
@@ -869,10 +945,32 @@ impl Combat {
         }
     }
 
-    fn throw(&mut self, f: &mut Field<'_>) {
-        self.reload = RPG_RELOAD * 0.5;
+    /// Her right hand's grip in the world as she is posed now (the hand's
+    /// attach point in the palm), if she has a model.
+    fn right_hand(f: &Field<'_>) -> Option<Vec3> {
+        let (_, rig) = f.player.model.as_ref()?;
+        let node = f
+            .arsenal
+            .attach
+            .or_else(|| right_attach(&rig.skeleton))
+            .or_else(|| rig.rifle_hand())?;
+        let (nodes, _) = rig.posed();
+        let at = nodes.get(node)?.w_axis.truncate();
+        Some(f.player.model_matrix().transform_point3(at))
+    }
+
+    /// Whether a grenade is in her hand: she is throwing and hasn't let
+    /// go yet.
+    pub fn grenade_in_hand(&self) -> bool {
+        self.throw_in.is_some()
+    }
+
+    /// A grenade thrown towards the crosshair, from `hand` (else from
+    /// in front of her head).
+    fn throw(&mut self, f: &mut Field<'_>, hand: Option<Vec3>) {
         let (_, dir) = Self::aim_ray(f.player);
-        let from = f.player.character.position + Vec3::Y * 1.6 + dir.with_y(0.0) * 0.4;
+        let from = hand
+            .unwrap_or_else(|| f.player.character.position + Vec3::Y * 1.6 + dir.with_y(0.0) * 0.4);
         let velocity = (dir + Vec3::Y * 0.35).normalize_or(Vec3::Y) * THROW;
         self.projectiles.push(Projectile::Grenade {
             at: from,
