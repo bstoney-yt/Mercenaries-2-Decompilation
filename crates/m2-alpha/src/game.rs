@@ -604,8 +604,8 @@ impl Game {
 fn finish(lighting: &mut m2_render::Lighting) {
     lighting.exposure = 0.9;
     lighting.contrast = 1.35;
-    lighting.saturation = 1.35;
-    lighting.grade = Vec3::new(1.25, 0.96, 0.74);
+    lighting.saturation = 1.5;
+    lighting.grade = Vec3::new(1.3, 0.95, 0.7);
 }
 
 /// `M2_POST=exposure=0.8,bloom=0.35,threshold=1,contrast=1.3,

@@ -1405,7 +1405,7 @@ impl WgpuBackend {
                 layout: Some(&self.shadow_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &module,
-                    entry_point: Some("vs_main"),
+                    entry_point: Some("vs_shadow"),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: u64::from(key.layout.stride()),

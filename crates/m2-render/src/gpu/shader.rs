@@ -494,11 +494,12 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyVaryings {
 @group(1) @binding(2) var cloud_noise: texture_2d<f32>;
 @group(1) @binding(3) var cloud_sampler: sampler;
 
-// Height of the cloud deck and the span one repeat of the noise covers at
-// scale 1, metres; and the wind's speed, metres per second. Invented: the
-// game's come from code.
+// Height of the cloud deck, the span one repeat of the noise covers at
+// layer scale 1, and the wind's speed (metres, m/s). Invented: the game's
+// come from code. A layer's scale stretches its noise, so the scale-8
+// layer gives the broad masses and the others break them up.
 const CLOUD_HEIGHT: f32 = 1500.0;
-const CLOUD_SPAN: f32 = 12000.0;
+const CLOUD_SPAN: f32 = 6000.0;
 const CLOUD_SPEED: f32 = 6.0;
 
 @fragment
@@ -512,24 +513,25 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
     let up = max(r.y, 0.03);
     let deck = frame.eye.xz + r.xz * (CLOUD_HEIGHT / up);
     let drift = frame.wind.xy * CLOUD_SPEED * frame.view_dir.w;
-    let n1 = textureSample(cloud_noise, cloud_sampler, (deck + drift) * frame.clouds.x / CLOUD_SPAN).r;
-    let n2 = textureSample(cloud_noise, cloud_sampler, (deck + drift * 0.7) * frame.clouds.y / CLOUD_SPAN).g;
-    let n3 = textureSample(cloud_noise, cloud_sampler, (deck + drift * 0.85) * frame.clouds.z / CLOUD_SPAN).b;
+    let scale = max(frame.clouds.xyz, vec3<f32>(0.01)) * CLOUD_SPAN;
+    let n1 = textureSample(cloud_noise, cloud_sampler, (deck + drift) / scale.x).r;
+    let n2 = textureSample(cloud_noise, cloud_sampler, (deck + drift * 1.3) / scale.y).g;
+    let n3 = textureSample(cloud_noise, cloud_sampler, (deck + drift * 1.15) / scale.z).b;
     if frame.wind.z > 0.5 && r.y > 0.0 {
-        // The broad layer shapes, the finer ones break up the edges; the
-        // coverage sets how much of the sum clears the cut-off.
-        let density = n2 * 0.5 + n3 * 0.3 + n1 * 0.2;
+        // The broad layer shapes, the finer ones erode the edges; the
+        // coverage sets how much of the sum clears a soft cut-off.
+        let density = n1 * 0.6 + n3 * 0.25 + n2 * 0.15;
         let cut = 1.0 - frame.clouds.w;
-        var alpha = smoothstep(cut, cut + 0.2, density);
-        // Thin towards the horizon, where the deck is far and hazy.
-        alpha = alpha * smoothstep(0.0, 0.15, r.y);
+        var alpha = smoothstep(cut - 0.1, cut + 0.35, density);
+        // Far deck fades into the haze towards the horizon.
+        alpha = alpha * smoothstep(0.02, 0.35, r.y);
         let l = -normalize(frame.sun_dir.xyz);
         let c = dot(r, l);
         // Lit by the sun, brighter looking towards it; thicker cloud is
         // darker underneath.
-        let lit = frame.sun_color.rgb * (0.55 + 0.45 * pow(max(c, 0.0), 4.0)) * mix(1.0, 0.65, alpha);
-        let cloud = lit + frame.ambient_cube[2].rgb * 0.6;
-        rgb = mix(rgb, cloud, alpha * 0.9);
+        let lit = frame.sun_color.rgb * (0.5 + 0.5 * pow(max(c, 0.0), 4.0)) * mix(1.0, 0.7, alpha);
+        let cloud = lit + frame.ambient_cube[2].rgb * 0.5;
+        rgb = mix(rgb, cloud, alpha * 0.75);
     }
     return vec4<f32>(rgb, 1.0);
 }
@@ -624,8 +626,7 @@ pub fn source(layout: &VertexLayout) -> String {
     let _ = write!(
         s,
         r#"
-@vertex
-fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
+fn place(v: VertexIn, instance: u32) -> Varyings {{
     var local = vec4<f32>({position}, 1.0);
     var normal = {normal};
     var tangent = {tangent};{skin}
@@ -641,8 +642,21 @@ fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
     out.uv = {uv};
     out.color = {color};
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
-    out.haze = haze_terms(world.xyz);
+    out.haze = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     return out;
+}}
+
+@vertex
+fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
+    var out = place(v, instance);
+    out.haze = haze_terms(out.world_pos);
+    return out;
+}}
+
+// Shadow casters need no haze.
+@vertex
+fn vs_shadow(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
+    return place(v, instance);
 }}
 "#
     );
