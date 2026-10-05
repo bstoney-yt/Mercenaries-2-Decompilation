@@ -23,6 +23,10 @@ const LEFT_HAND: u32 = 0xeb6f_1b2d;
 /// (`Bone_Attach_RHand`, `bone_attach_lhand`): where a weapon's grip goes.
 const RIGHT_ATTACH: u32 = 0xf450_ed0d;
 const LEFT_ATTACH: u32 = 0xfa76_1573;
+/// The attach points high on her back, right and left
+/// (`Bone_Attach_BackRight`, `Bone_Attach_BackLeft`): where the weapons
+/// she carries but doesn't hold hang.
+const BACK_ATTACH: [u32; 2] = [0x3846_cb35, 0xdf2d_0826];
 
 /// Weapons drawn on the right hand's attach node turned as the node is
 /// posed (the default: the grip sits in her palm, round 78), rather than
@@ -177,6 +181,8 @@ pub struct Arsenal {
     /// The right hand's node in the human skeleton, and its attach point.
     pub hand: Option<usize>,
     pub attach: Option<usize>,
+    /// The attach points on her back, right and left ([`BACK_ATTACH`]).
+    pub back: [Option<usize>; 2],
 }
 
 impl Arsenal {
@@ -190,6 +196,7 @@ impl Arsenal {
         if let Some(r) = rig {
             self.hand = r.rifle_hand();
             self.attach = right_attach(&r.skeleton);
+            self.back = BACK_ATTACH.map(|h| node(&r.skeleton, h));
         }
         let w = Some(WeaponModel {
             model,
@@ -209,6 +216,15 @@ impl Arsenal {
             "detonator" => self.designator = w,
             _ => {}
         }
+    }
+
+    /// Weapon to world for one slung on the back of a character drawn at
+    /// `body` with posed node matrices `nodes`, at the attach point of
+    /// `slot` (0 her right, 1 her left): its grip on the point, turned as
+    /// the point is posed.
+    pub fn on_back(&self, body: Mat4, nodes: &[Mat4], slot: usize) -> Option<Mat4> {
+        let n = self.back.get(slot).copied().flatten()?;
+        Some(body * *nodes.get(n)?)
     }
 
     /// Weapon to world for a character drawn at `body` with posed node
@@ -767,6 +783,19 @@ impl Combat {
             (Weapon::GrenadeLauncher, None) => {}
             _ => self.picked.add(weapon, rounds),
         }
+    }
+
+    /// The weapons she carries but doesn't hold, which hang on her back:
+    /// the rifle on her right unless it is up in her hands, and what she
+    /// carries in the launcher's place on her left unless that is (with
+    /// `in_hand` false, her hands hold something else: a grenade, the
+    /// designator).
+    pub fn slung(&self, in_hand: bool) -> [Option<Weapon>; 2] {
+        let up = |w: Weapon| in_hand && self.weapon == w;
+        [
+            Some(Weapon::Rifle).filter(|&w| !up(w)),
+            self.second.filter(|&w| !up(w)),
+        ]
     }
 
     /// Whether the weapon in the launcher's place can fire: the RPG
@@ -2047,6 +2076,25 @@ mod tests {
         let s = combat.struck.first().copied().expect("struck");
         assert_eq!(s.key, Some(StaticKey::Entity(7)));
         assert!(s.at.y < 0.8 && s.damage >= 100.0, "{s:?}");
+    }
+
+    #[test]
+    fn the_weapons_she_carries_but_doesnt_hold_hang_on_her_back() {
+        let mut combat = Combat::default();
+        // The first contract's start: the carbine alone, up.
+        combat.carbine_only();
+        assert_eq!(combat.slung(true), [None, None]);
+        // The crate's grenade launcher, up: the carbine on her back.
+        combat.equip(Weapon::GrenadeLauncher, 18);
+        assert_eq!(combat.slung(true), [Some(Weapon::Rifle), None]);
+        // The carbine up again: the launcher on her back.
+        combat.weapon = Weapon::Rifle;
+        assert_eq!(combat.slung(true), [None, Some(Weapon::GrenadeLauncher)]);
+        // The designator in her hands: both.
+        assert_eq!(
+            combat.slung(false),
+            [Some(Weapon::Rifle), Some(Weapon::GrenadeLauncher)]
+        );
     }
 
     #[test]

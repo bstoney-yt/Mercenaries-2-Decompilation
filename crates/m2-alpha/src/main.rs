@@ -141,6 +141,13 @@ struct Options {
     /// With `--screenshot` on foot: take the picture close up, from her
     /// right and a little ahead, at chest height, to see her hands.
     closeup: bool,
+    /// With `--screenshot` on foot: take the picture close up from behind
+    /// her, to see what hangs on her back.
+    behind: bool,
+    /// With `--screenshot` on foot: give her this weapon in the
+    /// launcher's place without taking it up (`--slung gl`: the crate's
+    /// grenade launcher on her back while the carbine is up).
+    slung: Option<combat::Weapon>,
     /// With `--screenshot`: cast rays around where she stands and list
     /// what they hit, to find unseen obstacles.
     probe: bool,
@@ -292,6 +299,14 @@ fn parse_args() -> anyhow::Result<Options> {
                 })
             }
             "--closeup" => o.closeup = true,
+            "--behind" => o.behind = true,
+            "--slung" => {
+                o.slung = Some(match value()?.as_str() {
+                    "rpg" => combat::Weapon::Rpg,
+                    "gl" => combat::Weapon::GrenadeLauncher,
+                    v => bail!("--slung {v}: expected rpg or gl"),
+                })
+            }
             "--satellite" => {
                 o.satellite = Some(match value()?.as_str() {
                     "view" => SatelliteShot::View,
@@ -795,6 +810,11 @@ fn screenshot(
             game.combat
                 .equip(combat::Weapon::GrenadeLauncher, 3 * combat::LAUNCHER_CLIP);
         }
+        // A launcher on her back, the rifle up.
+        if let Some(w) = options.slung {
+            game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
+            game.combat.weapon = options.weapon.unwrap_or(combat::Weapon::Rifle);
+        }
         for i in 0..180 {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
@@ -885,6 +905,19 @@ fn screenshot(
         eprintln!("closeup: chest {chest:.2}, facing {ahead:.2}");
         if let Some(line) = describe_hold(&game) {
             eprintln!("closeup: {line}");
+        }
+    }
+    if options.behind
+        && let Some(p) = &game.scene.player
+    {
+        // From behind her and a little to her right, at shoulder height.
+        let shoulders = p.character.position + m2_math::glam::Vec3::Y * 1.4;
+        let ahead = m2_math::glam::Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
+        let right = m2_math::glam::Vec3::new(-ahead.z, 0.0, ahead.x);
+        game.on_foot = false;
+        game.camera = FlyCamera::looking_at(shoulders - ahead * 1.6 + right * 0.5, shoulders);
+        for line in describe_slung(&game) {
+            eprintln!("behind: {line}");
         }
     }
     if let (Some(reach), Some(link)) = (options.mission_look, &link) {
@@ -1018,6 +1051,55 @@ fn describe_hold(game: &Game) -> Option<String> {
         local(grip - palm),
         local(muzzle - palm),
     ))
+}
+
+/// How the weapons on her back hang: for each, which side, which way its
+/// barrel and its top point (ahead, right, up of her), and where its grip
+/// and muzzle are from the middle of her back at the attach points'
+/// height.
+fn describe_slung(game: &Game) -> Vec<String> {
+    use m2_math::glam::Vec3;
+    let Some(p) = game.scene.player.as_ref() else {
+        return Vec::new();
+    };
+    let Some((_, rig)) = p.model.as_ref() else {
+        return Vec::new();
+    };
+    let arsenal = &game.scene.arsenal;
+    let (nodes, _) = rig.posed();
+    let body = p.model_matrix();
+    let ahead = Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
+    let right = Vec3::new(-ahead.z, 0.0, ahead.x);
+    let local = |v: Vec3| Vec3::new(v.dot(ahead), v.dot(right), v.y);
+    let holding = !game.combat.designator && p.throwing.is_none() && !p.down;
+    let mut lines = Vec::new();
+    for (slot, slung) in game.combat.slung(holding).into_iter().enumerate() {
+        let Some(weapon) = slung else { continue };
+        let model = match weapon {
+            combat::Weapon::Rifle => arsenal.carbine.as_ref().or(arsenal.rifle.as_ref()),
+            combat::Weapon::Rpg => arsenal.rpg.as_ref(),
+            combat::Weapon::GrenadeLauncher => arsenal.launcher.as_ref(),
+        };
+        let side = ["right", "left"][slot];
+        let (Some(w), Some(at)) = (model, arsenal.on_back(body, &nodes, slot)) else {
+            lines.push(format!(
+                "{weapon:?} on her {side}: no model or attach point"
+            ));
+            continue;
+        };
+        let middle = body.transform_point3(Vec3::new(0.0, 1.4, 0.0));
+        let barrel = at.transform_vector3(w.muzzle).normalize_or_zero();
+        let top = at.transform_vector3(Vec3::Y).normalize_or_zero();
+        lines.push(format!(
+            "{weapon:?} on her {side}: barrel {:.2} ({:.0} deg above level), top {:.2}, grip {:.2} and muzzle {:.2} from her back's middle",
+            local(barrel),
+            barrel.y.asin().to_degrees(),
+            local(top),
+            local(at.w_axis.truncate() - middle),
+            local(at.transform_point3(w.muzzle) - middle),
+        ));
+    }
+    lines
 }
 
 /// Puts the camera `reach` metres from the mission marker nearest the

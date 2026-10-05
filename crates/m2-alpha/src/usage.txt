@@ -62,6 +62,10 @@ m2-alpha [options]
                          bomb lands (bomb)
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
+  --behind               with --screenshot on foot: the picture from close
+                         behind her, to see the weapons on her back
+  --slung rpg|gl         with --screenshot on foot: give her this weapon in
+                         the launcher's place, on her back with the rifle up
   --probe                with --screenshot: list what rays from where she
                          stands hit (unseen walls, steps in the ground)
   --wreck                with --drive: wreck the vehicle at speed at the
