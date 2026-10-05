@@ -125,6 +125,22 @@ pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
 const WRECK: f32 = 6.0;
+/// The satellite-guided bomb's blasts, from the template database's
+/// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
+/// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
+/// 2 s on): reach (metres) and damage at the heart, falling off to
+/// nothing at the edge (the falloff is invented). The frag is stopped by
+/// what stands between: the radio's word is to get behind cover.
+pub const BOMB: (f32, f32) = (20.0, 100.0);
+pub const BOMB_FRAG: (f32, f32) = (50.0, 300.0);
+const BOMB_FINAL: (f32, f32) = (2.0, 500.0);
+/// A vehicle a blast hits this hard is wrecked.
+const WRECKING: f32 = 60.0;
+/// What the bomb leaves burning: this many fires within this far
+/// (metres), each for between these (seconds; the videos: 4 to 6 s).
+const BOMB_FIRES: usize = 5;
+const BOMB_FIRE_SPREAD: f32 = 9.0;
+const BOMB_FIRE_TIME: (f32, f32) = (4.0, 6.0);
 
 /// A hand weapon's model and where its muzzle is, model space.
 #[derive(Debug)]
@@ -154,6 +170,10 @@ pub struct Arsenal {
     /// The grenade launcher and its 40 mm round.
     pub launcher: Option<WeaponModel>,
     pub round: Option<WeaponModel>,
+    /// Her own rifle, the carbine (soldiers carry the AK47), and the
+    /// satellite designator.
+    pub carbine: Option<WeaponModel>,
+    pub designator: Option<WeaponModel>,
     /// The right hand's node in the human skeleton, and its attach point.
     pub hand: Option<usize>,
     pub attach: Option<usize>,
@@ -185,6 +205,8 @@ impl Arsenal {
             "grenade" => self.grenade = w,
             "mgl" => self.launcher = w,
             "40mm" => self.round = w,
+            "m4" => self.carbine = w,
+            "detonator" => self.designator = w,
             _ => {}
         }
     }
@@ -445,6 +467,8 @@ pub enum Sound {
     Explosion(Vec3),
     /// A tank's main gun.
     Cannon(Vec3),
+    /// The satellite-guided bomb landing.
+    Bomb(Vec3),
 }
 
 /// A blow or a round that landed on something of the world's rather than
@@ -534,6 +558,9 @@ pub struct Trigger {
     /// A melee bash.
     pub melee: bool,
     pub select: Option<Weapon>,
+    /// The support key: the support menu opens or closes
+    /// ([`crate::support`]).
+    pub support: bool,
 }
 
 /// The fight's state.
@@ -578,6 +605,9 @@ pub struct Combat {
     pub second: Option<Weapon>,
     /// The grenade launcher's rounds, while she carries one.
     pub launcher_rounds: Option<Rounds>,
+    /// She holds the satellite designator instead of her weapon
+    /// ([`crate::support`]).
+    pub designator: bool,
     /// The last rocket: from the launcher, towards what the crosshair was on.
     pub last_launch: Option<(Vec3, Vec3)>,
     /// Blasts about to go off (something explosive caught): where, and
@@ -613,6 +643,7 @@ impl Default for Combat {
             picked: Picked::default(),
             second: Some(Weapon::Rpg),
             launcher_rounds: None,
+            designator: false,
             last_launch: None,
             fuses: Vec::new(),
             fires: Vec::new(),
@@ -956,7 +987,8 @@ impl Combat {
         let (eye, dir) = Self::aim_ray(f.player);
         let hit = cast_shot(f.physics, f.people, eye, dir, RIFLE_RANGE, None, None);
         let to = hit.map_or(eye + dir * RIFLE_RANGE, |h| eye + dir * h.0);
-        let from = Self::muzzle(f, f.arsenal.rifle.as_ref());
+        let rifle = f.arsenal.carbine.as_ref().or(f.arsenal.rifle.as_ref());
+        let from = Self::muzzle(f, rifle);
         self.effect(Effect::Tracer { from, to }, 0.07);
         self.effect(
             Effect::Flash {
@@ -1535,6 +1567,148 @@ impl Combat {
             self.remarks.push(Remark::Kill);
         }
         alarm(f.people, at);
+    }
+
+    /// The satellite-guided bomb landing at `at` ([`BOMB`]): a great
+    /// fireball and a column of smoke, fires left burning about it.
+    pub fn bomb(&mut self, f: &mut Field<'_>, at: Vec3) {
+        self.blasts += 1;
+        self.last_blast = Some(at);
+        self.went_off.push(at);
+        self.sounds.push(Sound::Bomb(at));
+        self.harm(f, at, BOMB, false);
+        self.harm(f, at + Vec3::Y, BOMB_FRAG, true);
+        self.effect(
+            Effect::Fire {
+                at: at + Vec3::Y * 3.0,
+                size: 16.0,
+            },
+            1.4,
+        );
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::TAU / 8.0;
+            let ring = Vec3::new(a.sin(), 0.3, a.cos());
+            self.effect(
+                Effect::Fire {
+                    at: at + ring * 8.0,
+                    size: 8.0,
+                },
+                1.0,
+            );
+            self.effect(
+                Effect::Smoke {
+                    at: at + ring * 7.0 + Vec3::Y * 2.0,
+                    size: 8.0,
+                },
+                6.0,
+            );
+        }
+        for k in 1..=5 {
+            let k = k as f32;
+            self.effect(
+                Effect::Smoke {
+                    at: at + Vec3::Y * (6.0 * k),
+                    size: 10.0 + k,
+                },
+                7.0 + k,
+            );
+        }
+        for k in 0..BOMB_FIRES {
+            let a = k as f32 * std::f32::consts::TAU / BOMB_FIRES as f32 + self.random();
+            let r = BOMB_FIRE_SPREAD * (0.7 + 0.6 * self.random());
+            let (shortest, longest) = BOMB_FIRE_TIME;
+            let burn = shortest + (longest - shortest) * (self.random() + 0.5);
+            let spot = at + Vec3::new(a.sin() * r, 1.2, a.cos() * r);
+            self.fires.push((spot, 2.5, burn, 0.0));
+        }
+        alarm(f.people, at);
+    }
+
+    /// The bomb's final strike at `at`, after it lands.
+    pub fn final_strike(&mut self, f: &mut Field<'_>, at: Vec3) {
+        self.went_off.push(at);
+        self.sounds.push(Sound::Explosion(at));
+        self.harm(f, at, BOMB_FINAL, false);
+        self.effect(
+            Effect::Fire {
+                at: at + Vec3::Y,
+                size: 6.0,
+            },
+            0.7,
+        );
+    }
+
+    /// Harm from a blast at `at` out to `radius` metres: `damage` at its
+    /// heart, falling off to nothing at the edge; with `cover`, what
+    /// stands between (the ground, walls, props) stops it. People are
+    /// thrown and those near run, vehicles hit hard enough are wrecked
+    /// and thrown, explosives within it go off.
+    fn harm(&mut self, f: &mut Field<'_>, at: Vec3, (radius, damage): (f32, f32), cover: bool) {
+        let physics: &Physics = f.physics;
+        let shielded = |to: Vec3| {
+            let way = to - at;
+            let d = way.length();
+            cover && d > 1.0 && physics.cast_ray(at, way / d, d - 0.5).is_some()
+        };
+        let mut killed = false;
+        for n in f.people.npcs.iter_mut() {
+            let chest = n.chest();
+            let d = chest.distance(at);
+            if d < radius * 2.0 {
+                n.panic(at);
+            }
+            if d >= radius || shielded(chest) {
+                continue;
+            }
+            let near = 1.0 - d / radius;
+            let away = (chest - at).with_y(0.0).normalize_or(Vec3::X);
+            let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
+            killed |= n.hurt(damage * near, push) && n.soldier;
+        }
+        let her = (f.player.driving.is_none() && f.player.landed)
+            .then(|| f.player.character.position + Vec3::Y)
+            .filter(|&p| p.distance(at) < radius && !shielded(p))
+            .map(|p| damage * (1.0 - p.distance(at) / radius));
+        let mut wrecking = Vec::new();
+        for (i, v) in f.vehicles.iter().enumerate() {
+            let Some(body) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
+                continue;
+            };
+            let (lo, hi) = v.spec.bounds;
+            let centre = body.transform_point3((lo + hi) * 0.5);
+            let d = centre.distance(at);
+            let near = 1.0 - d / radius;
+            if d < radius && damage * near >= WRECKING && !shielded(centre) {
+                wrecking.push((i, centre, near));
+            }
+        }
+        for (i, centre, near) in wrecking {
+            let v = &mut f.vehicles[i];
+            let Some(id) = v.id else { continue };
+            let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
+            let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3);
+            f.physics
+                .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
+            if !v.wrecked {
+                v.wrecked = true;
+                f.physics.wreck_vehicle(id);
+                self.wrecks.push((i, 0.0));
+                self.remarks.push(Remark::Wreck);
+            }
+        }
+        for e in f.explosives.iter_mut() {
+            if !e.gone && e.at.distance(at) < e.size + radius {
+                e.gone = true;
+                self.fuses.push((e.at, CHAIN_DELAY));
+                self.fires.push((e.at, e.size, BURN, 0.0));
+            }
+        }
+        if let Some(d) = her {
+            self.hurt_player(f, d);
+        }
+        if killed {
+            self.remarks.push(Remark::Kill);
+        }
     }
 
     fn smoke_wrecks(&mut self, f: &mut Field<'_>, dt: f32) {

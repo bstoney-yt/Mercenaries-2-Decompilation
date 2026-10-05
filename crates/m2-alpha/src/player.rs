@@ -152,6 +152,7 @@ impl Intent {
                 } else {
                     None
                 },
+                support: input.take_pressed(Action::Support),
             },
         }
     }

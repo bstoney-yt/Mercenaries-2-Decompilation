@@ -13,8 +13,13 @@
 //! template is (`"M151 Softtop (VZ)"`) comes from the template database,
 //! or is guessed from the models' texture names (`vz_veh_truck_m151`).
 //! The models of the state layers they load (a mission's gates) stand
-//! while the layer is in, and break when the scripts' object dies: a gate
-//! to destroy breaks to a blast by it or a vehicle driven into it. Their
+//! while the layer is in, and break when the scripts' object dies. A
+//! target to destroy that is such a model (the first contract's gates)
+//! falls only to a support strike: the videos' gates stood through
+//! grenade-launcher hits and fell to the Satellite Guided Bomb, one of
+//! which is given her free while such a target is marked
+//! ([`crate::support`]); others to a blast by them or a vehicle driven
+//! into them. Their
 //! deliveries come by helicopter ([`crate::flights`]): the crate, the jeep
 //! and the tank hang under it until it lets go over the drop point. Their
 //! boats are not shown yet.
@@ -40,16 +45,19 @@ use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::scene::NOT_DRIVABLE;
+use crate::support::{Impact, Kind, Phase};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
-/// How close a blast destroys a target the scripts named (a gate), metres:
-/// from its model's box, or from its place when it shows no model.
+/// How close a blast destroys a target the scripts named, metres: from
+/// its model's box, or from its place when it shows no model; a support
+/// strike's bomb, its blast's reach.
 const BLAST_PAD: f32 = 4.0;
 const BLAST_REACH: f32 = 10.0;
+const BOMB_PAD: f32 = crate::combat::BOMB.0;
 /// A target is rammed by driving into its box (padded this much, metres,
 /// for the vehicle's front to its middle) at this speed or more (m/s), as
 /// fast as it went in the last half second or so.
@@ -125,8 +133,12 @@ pub struct MissionLink {
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
-    /// Blasts since the scripts last ran.
+    /// The satellite's step when last told the scripts: none, the view,
+    /// the timing wheel, confirmed.
+    satellite: u8,
+    /// Blasts since the scripts last ran, and support strikes' bombs.
     blasts: Vec<Vec3>,
+    bombs: Vec<Vec3>,
     vehicles: Fleet,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
@@ -208,6 +220,8 @@ impl MissionLink {
             drivers,
             ashore: 0,
             blasts: Vec::new(),
+            satellite: 0,
+            bombs: Vec::new(),
             vehicles: Fleet::default(),
             completed: None,
             speed: 0.0,
@@ -315,6 +329,41 @@ impl MissionLink {
             }
         }
         self.blasts.extend(game.combat.explosions());
+        self.bombs.extend(
+            game.support
+                .landed
+                .iter()
+                .filter(|l| matches!(l, Impact::Bomb(_)))
+                .map(|l| {
+                    let at = l.at();
+                    Vec3::new(at.x, game.focus().y, at.y)
+                }),
+        );
+        // The satellite's steps, posted as its interface posts them, for
+        // the scripts waiting on them (the first contract's).
+        let step = match game.support.phase {
+            Phase::Viewing { .. } => 1,
+            Phase::Timing { .. } => 2,
+            Phase::Confirmed { .. } => 3,
+            _ => 0,
+        };
+        let post = match (self.satellite, step) {
+            (0, 1) => Some("Satellite Targetting Start"),
+            (1, 2) => Some("Satellite Minigame Start"),
+            (2, 3) => Some("Satellite Targetting Success"),
+            (1 | 2, 0) => Some("Satellite Targetting Cancelled"),
+            _ => None,
+        };
+        self.satellite = step;
+        if let Some(name) = post {
+            let waiting = mission
+                .awaited_posts()
+                .iter()
+                .filter(|n| n.as_str() == name)
+                .count();
+            eprintln!("mission: posted {name:?}, {waiting} script events waiting for it");
+            mission.post(name);
+        }
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {
@@ -352,6 +401,16 @@ impl MissionLink {
                     .collect()
             };
             game.scene.people.mission_soldiers = targets.iter().map(|t| t.0).collect();
+            // Those standing as models (the gates) fall only to a support
+            // strike, and one is given her while any stands.
+            let sturdy: HashSet<u32> = targets
+                .iter()
+                .map(|t| t.0)
+                .filter(|&g| game.scene.props.get(g).is_some())
+                .collect();
+            if !sturdy.is_empty() {
+                game.support.offer(Kind::SatelliteBomb);
+            }
             // A vehicle driven hard into a target (a gate) breaks it too:
             // by its speed of late, as the gate stops it.
             let driving = game.driving();
@@ -362,17 +421,28 @@ impl MissionLink {
                 .map(|(at, _)| at);
             for (g, at) in &targets {
                 let props = &game.scene.props;
+                // A bomb's spot is on the ground under where it was
+                // called: measured flat.
+                let bombed = self.bombs.iter().any(|b| {
+                    let c = props.centre(*g).unwrap_or(*at);
+                    b.with_y(0.0).distance(c.with_y(0.0)) <= BOMB_PAD
+                });
                 let hit = |p: Vec3, pad: f32| {
                     props
                         .touches(*g, p, pad)
                         .unwrap_or_else(|| p.distance(*at) <= BLAST_REACH)
                 };
-                if self.blasts.iter().any(|&b| hit(b, BLAST_PAD))
-                    || ram.is_some_and(|r| props.touches(*g, r, RAM_PAD) == Some(true))
-                {
+                let blasted = !sturdy.contains(g)
+                    && (self.blasts.iter().any(|&b| hit(b, BLAST_PAD))
+                        || ram.is_some_and(|r| props.touches(*g, r, RAM_PAD) == Some(true)));
+                if bombed || blasted {
+                    if bombed {
+                        eprintln!("mission: {g:#x} falls to the bomb");
+                    }
                     mission.kill(*g);
                 }
             }
+            game.scene.props.sturdy = sturdy;
             // A target knocked loose (shoved over by a vehicle, thrown by a
             // blast) is destroyed too.
             for e in game.scene.props.take_knocked() {
@@ -381,6 +451,7 @@ impl MissionLink {
                 }
             }
             self.blasts.clear();
+            self.bombs.clear();
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -1210,11 +1281,11 @@ pub(crate) fn template_models(
 /// What the scripts' object `name` (a supply crate) leaves once destroyed:
 /// the pickups its template's `SpawnOnDeath`s name, in data order (the
 /// first contract's: a grenade launcher, then rockets). One with the
-/// model of a weapon of hers is that weapon; each gives the rounds of one
-/// of her weapons when its ammunition is one of theirs (a template with
-/// that weapon's model fires it). A pickup's `rounds` count clips: the
-/// grenade launcher's 3 are the HUD's "6 2" in the footage, 6 loaded and
-/// 2 clips more. What isn't a pickup it doesn't leave for her.
+/// model of a weapon of hers is that weapon, loaded; any other gives the
+/// rounds of one of her weapons when its ammunition is one of theirs (a
+/// template with that weapon's model fires it). A pickup's `rounds` count
+/// clips: the grenade launcher's 3 are the HUD's "6 2" in the footage, 6
+/// loaded and 2 clips more. What isn't a pickup it doesn't leave for her.
 fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
     let Some(left) = templates
         .id(name)
@@ -1238,12 +1309,18 @@ fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
             let weapon = Weapon::ALL
                 .into_iter()
                 .find(|w| model == Some(name_hash(w.model_name())));
-            let gives = info.ammo.and_then(|ammo| {
-                Weapon::ALL
-                    .into_iter()
-                    .find(|w| fires(w.model_name(), ammo))
-                    .map(|w| (w, info.rounds * w.clip()))
-            });
+            let gives = match weapon {
+                // Its own rounds, whatever its record names: the
+                // launcher's names "Grenade Launcher Projectile", not the
+                // "GL Projectile" it fires (round 94: taken up empty).
+                Some(w) => Some((w, info.rounds.max(1) * w.clip())),
+                None => info.ammo.and_then(|ammo| {
+                    Weapon::ALL
+                        .into_iter()
+                        .find(|w| fires(w.model_name(), ammo))
+                        .map(|w| (w, info.rounds * w.clip()))
+                }),
+            };
             Some(Leaves {
                 template: left,
                 model,
@@ -1417,15 +1494,14 @@ mod tests {
                 },
             ]
         );
-        // Ammunition for no weapon of hers gives her nothing; a template
-        // that leaves nothing, nothing at all.
+        // Ammunition for no weapon of hers gives her nothing, but a weapon
+        // comes loaded whatever its record names; a template that leaves
+        // nothing, nothing at all.
         let mut db = db;
         db.leavings.ammo.clear();
-        assert!(
-            leaves(&db, "Supply Drop (GL)")
-                .iter()
-                .all(|l| l.gives.is_none())
-        );
+        let left = leaves(&db, "Supply Drop (GL)");
+        assert_eq!(left[0].gives, Some((Weapon::GrenadeLauncher, 18)));
+        assert_eq!(left[1].gives, None);
         assert!(leaves(&db, "RPG").is_empty());
     }
 
