@@ -134,6 +134,39 @@ pub struct LoosePiece {
     from_model: Mat4,
 }
 
+impl LoosePiece {
+    /// A box of half extents `half` about `centre` (model space), moving
+    /// node `node`, which sits at the model's origin at rest.
+    pub fn block(node: Option<u16>, centre: Vec3, half: Vec3, mass: f32) -> Self {
+        Self {
+            node,
+            shape: r::SharedShape::compound(vec![(
+                pose(centre, Quat::IDENTITY),
+                r::SharedShape::cuboid(half.x, half.y, half.z),
+            )]),
+            mass,
+            from_model: Mat4::IDENTITY,
+        }
+    }
+
+    /// The middle of its box, in its node's space.
+    pub fn centre(&self) -> Vec3 {
+        let b = self.shape.compute_local_aabb();
+        (vec3(b.mins) + vec3(b.maxs)) * 0.5
+    }
+
+    /// How big it is: its box's diagonal, metres.
+    pub fn size(&self) -> f32 {
+        self.extent().length()
+    }
+
+    /// Its box's sides along its node's axes, metres.
+    pub fn extent(&self) -> Vec3 {
+        let b = self.shape.compute_local_aabb();
+        vec3(b.maxs) - vec3(b.mins)
+    }
+}
+
 impl fmt::Debug for LoosePiece {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoosePiece")
@@ -239,6 +272,18 @@ impl Loose {
                 });
             }
         }
+        Self::with_pieces(model, pieces, breaks, rest)
+    }
+
+    /// A model coming loose as `pieces` (breaking into them with
+    /// `breaks`), its nodes at rest where `rest` has them; `None` without
+    /// any.
+    fn with_pieces(
+        model: &Model<'_>,
+        pieces: Vec<LoosePiece>,
+        breaks: bool,
+        rest: Vec<Mat4>,
+    ) -> Option<Self> {
         if pieces.is_empty() {
             return None;
         }
@@ -302,6 +347,118 @@ impl Loose {
                 }
             })
             .collect()
+    }
+}
+
+/// How a model breaks apart when it is destroyed outright (a mission's
+/// gate a support strike brings down), from its part states: into the
+/// pieces they show only as it breaks
+/// ([`PartStates::chunks`](m2_assets::model::PartStates::chunks)), each
+/// flying as a box round its geometry, the rest drawn wrecked; and the
+/// points its breaking names besides, empty ones (where the videos show
+/// fires burning and smoke rising).
+#[derive(Debug)]
+pub struct Breakup {
+    pub pieces: Loose,
+    /// Model space.
+    pub points: Vec<Vec3>,
+}
+
+/// How heavy a broken-off piece is for the room its box takes, kg/m³
+/// (stone; its boxes are loose fits, so less than stone's 2,500).
+const CHUNK_DENSITY: f32 = 1200.0;
+
+impl Breakup {
+    /// How `model` breaks apart, its pieces' boxes round their geometry at
+    /// `lod` (or the next level present); `None` unless it has pieces.
+    pub fn of(model: &Model<'_>, lod: u32) -> Option<Self> {
+        let states = model.states.as_ref()?;
+        let chunks = states.chunks(&model.nodes);
+        if chunks.is_empty() {
+            return None;
+        }
+        let lod = (lod..model.info.lod_count.max(lod + 1))
+            .find(|&l| model.has_lod(l))
+            .unwrap_or(lod);
+        let rest: Vec<Mat4> = (0..model.nodes.len())
+            .map(|n| model.node_to_model(n as u16).unwrap_or(Mat4::IDENTITY))
+            .collect();
+        // The chunk a node goes with: itself, or the nearest above it.
+        let chunk_of = |n: u16| {
+            let mut at = Some(n);
+            for _ in 0..=model.nodes.len() {
+                let here = at?;
+                if chunks.contains(&here) {
+                    return Some(here);
+                }
+                at = model.nodes.get(usize::from(here))?.parent;
+            }
+            None
+        };
+        // Each chunk's geometry, in its own node's space.
+        let mut bounds: HashMap<u16, (Vec3, Vec3)> = HashMap::new();
+        for (segment, geometry) in model.lod(lod) {
+            if geometry.kind == GeometryKind::Skin {
+                continue;
+            }
+            let Some(chunk) = chunk_of(segment.node) else {
+                continue;
+            };
+            let to_chunk = rest[usize::from(chunk)].inverse() * rest[usize::from(segment.node)];
+            for group in &geometry.groups {
+                let Some(pos) = group
+                    .decl
+                    .find(DeclUsage::Position, 0)
+                    .and_then(|e| group.vertices.read(e))
+                else {
+                    continue;
+                };
+                let b = bounds
+                    .entry(chunk)
+                    .or_insert((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)));
+                for p in pos {
+                    let v = to_chunk.transform_point3(Vec3::new(p[0], p[1], p[2]));
+                    *b = (b.0.min(v), b.1.max(v));
+                }
+            }
+        }
+        let mut pieces = Vec::new();
+        for &n in &chunks {
+            let Some(&(lo, hi)) = bounds.get(&n) else {
+                continue;
+            };
+            let from_model = rest[usize::from(n)].inverse();
+            if !from_model.is_finite() || !lo.cmple(hi).all() || !(hi - lo).is_finite() {
+                continue;
+            }
+            let half = ((hi - lo) * 0.5).max(Vec3::splat(LOOSE_HALF));
+            let shape = r::SharedShape::cuboid(half.x, half.y, half.z);
+            pieces.push(LoosePiece {
+                node: Some(n),
+                shape: r::SharedShape::compound(vec![(
+                    pose((lo + hi) * 0.5, Quat::IDENTITY),
+                    shape,
+                )]),
+                mass: loose_mass(8.0 * half.x * half.y * half.z * CHUNK_DENSITY),
+                from_model,
+            });
+        }
+        // Points with nothing drawn on or under them: locators.
+        let empty = |n: u16| {
+            !model.segments.iter().any(|s| s.node == n)
+                && !model.nodes.iter().any(|x| x.parent == Some(n))
+        };
+        let points = states
+            .breaking_points(&chunks)
+            .into_iter()
+            .filter(|&n| empty(n))
+            .filter_map(|n| rest.get(usize::from(n)))
+            .map(|m| m.w_axis.truncate())
+            .collect();
+        Some(Self {
+            pieces: Loose::with_pieces(model, pieces, true, rest)?,
+            points,
+        })
     }
 }
 
@@ -694,21 +851,30 @@ const DEBRIS: r::Group = r::Group::GROUP_3;
 /// The collision group of vehicles' hulls and turrets.
 const VEHICLE: r::Group = r::Group::GROUP_4;
 
-/// Queries that see everything but ragdolls.
+/// The collision group of what a building broke into
+/// ([`Physics::add_rubble`]): it lands on the world, and nothing else
+/// meets it (people walk and vehicles drive through it, as she goes
+/// through a gate's rubble in the videos; shots pass).
+const RUBBLE: r::Group = r::Group::GROUP_5;
+
+/// Queries that see everything but ragdolls and rubble.
 fn solid<'a>() -> r::QueryFilter<'a> {
     r::QueryFilter::default().groups(r::InteractionGroups::new(
         r::Group::ALL,
-        r::Group::ALL.difference(RAGDOLL),
+        r::Group::ALL.difference(RAGDOLL).difference(RUBBLE),
         r::InteractionTestMode::And,
     ))
 }
 
-/// Queries that see what a wheel stands on: everything but ragdolls and
-/// loose pieces.
+/// Queries that see what a wheel stands on: everything but ragdolls,
+/// loose pieces and rubble.
 fn ground<'a>() -> r::QueryFilter<'a> {
     r::QueryFilter::default().groups(r::InteractionGroups::new(
         r::Group::ALL,
-        r::Group::ALL.difference(RAGDOLL).difference(DEBRIS),
+        r::Group::ALL
+            .difference(RAGDOLL)
+            .difference(DEBRIS)
+            .difference(RUBBLE),
         r::InteractionTestMode::And,
     ))
 }
@@ -1004,6 +1170,53 @@ impl Physics {
         velocity: Vec3,
         spin: Vec3,
     ) -> DebrisId {
+        self.add_piece(
+            piece,
+            at,
+            velocity,
+            spin,
+            r::InteractionGroups::new(
+                DEBRIS,
+                r::Group::ALL.difference(DEBRIS).difference(VEHICLE),
+                r::InteractionTestMode::And,
+            ),
+        )
+    }
+
+    /// As [`add_debris`](Self::add_debris), a piece a building broke
+    /// into: [`RUBBLE`], which lands on the world and nothing else.
+    pub fn add_rubble(
+        &mut self,
+        piece: &LoosePiece,
+        at: Mat4,
+        velocity: Vec3,
+        spin: Vec3,
+    ) -> DebrisId {
+        self.add_piece(
+            piece,
+            at,
+            velocity,
+            spin,
+            r::InteractionGroups::new(
+                RUBBLE,
+                r::Group::ALL
+                    .difference(RUBBLE)
+                    .difference(DEBRIS)
+                    .difference(VEHICLE)
+                    .difference(RAGDOLL),
+                r::InteractionTestMode::And,
+            ),
+        )
+    }
+
+    fn add_piece(
+        &mut self,
+        piece: &LoosePiece,
+        at: Mat4,
+        velocity: Vec3,
+        spin: Vec3,
+        groups: r::InteractionGroups,
+    ) -> DebrisId {
         let (_, rotation, translation) = at.to_scale_rotation_translation();
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
@@ -1017,11 +1230,7 @@ impl Physics {
         let collider = r::ColliderBuilder::new(piece.shape.clone())
             .mass(piece.mass)
             .friction(DEBRIS_FRICTION)
-            .collision_groups(r::InteractionGroups::new(
-                DEBRIS,
-                r::Group::ALL.difference(DEBRIS).difference(VEHICLE),
-                r::InteractionTestMode::And,
-            ));
+            .collision_groups(groups);
         self.world.insert_collider(collider, Some(body));
         self.debris.push(Some(body));
         DebrisId(self.debris.len() - 1)
@@ -1035,6 +1244,14 @@ impl Physics {
             Quat::from_array(p.rotation.to_array()),
             vec3(p.translation),
         ))
+    }
+
+    /// How a loose piece is moving now: its velocity (m/s) and its spin
+    /// (radians a second about each world axis).
+    pub fn debris_velocity(&self, id: DebrisId) -> Option<(Vec3, Vec3)> {
+        let h = (*self.debris.get(id.0)?)?;
+        let b = self.world.bodies.get(h)?;
+        Some((vec3(b.linvel()), vec3(b.angvel())))
     }
 
     pub fn remove_debris(&mut self, id: DebrisId) {
@@ -1810,6 +2027,43 @@ impl Physics {
             .cast_ray_and_get_normal(&ray, max, true)?;
         let key = self.keys.get(&handle).copied();
         Some((hit.time_of_impact, vec3(hit.normal), key))
+    }
+
+    /// [`cast_ray`](Self::cast_ray) that passes through the statics whose
+    /// keys `skip` picks: the ground under a building that is coming down.
+    pub fn cast_ray_skipping(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+        skip: impl Fn(StaticKey) -> bool,
+    ) -> Option<(f32, Vec3)> {
+        let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
+        let keep = |handle: r::ColliderHandle, _: &r::Collider| {
+            self.keys.get(&handle).is_none_or(|&key| !skip(key))
+        };
+        self.world
+            .query_pipeline_with_filter(solid().predicate(&keep))
+            .cast_ray_and_get_normal(&ray, max, true)
+            .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
+    }
+
+    /// The height of the island's own ground straight down from `from`
+    /// within `max` metres: its terrain and placed models (roads, rocks,
+    /// buildings), passing through the state layers' models and anything
+    /// not static.
+    pub fn island_below(&self, from: Vec3, max: f32) -> Option<f32> {
+        let ray = r::Ray::new(vector(from), vector(Vec3::NEG_Y));
+        let keep = |handle: r::ColliderHandle, _: &r::Collider| {
+            matches!(
+                self.keys.get(&handle),
+                Some(StaticKey::Cell(_) | StaticKey::Object(_) | StaticKey::Member(..))
+            )
+        };
+        self.world
+            .query_pipeline_with_filter(solid().predicate(&keep))
+            .cast_ray_and_get_normal(&ray, max, true)
+            .map(|(_, hit)| from.y - hit.time_of_impact)
     }
 
     /// Moves `character` for `dt` seconds: horizontally at `walk` (m/s; its
@@ -2718,6 +2972,42 @@ mod tests {
         );
         p.remove_debris(d);
         assert!(p.debris_place(d).is_none());
+    }
+
+    #[test]
+    fn rubble_lands_and_she_walks_through_it() {
+        let mut p = ready();
+        p.step(DT);
+        // A slab 4 m long, 2 m high and 1 m thick, thrown up across her
+        // way.
+        let slab = LoosePiece {
+            node: Some(3),
+            shape: r::SharedShape::compound(vec![(
+                pose(Vec3::Y, Quat::IDENTITY),
+                r::SharedShape::cuboid(2.0, 1.0, 0.5),
+            )]),
+            mass: 9600.0,
+            from_model: Mat4::IDENTITY,
+        };
+        assert_eq!(slab.centre(), Vec3::Y);
+        assert!((slab.size() - 21.0f32.sqrt()).abs() < 1e-4);
+        let d = p.add_rubble(
+            &slab,
+            Mat4::from_translation(Vec3::new(0.0, 2.0, 5.0)),
+            Vec3::Y * 3.0,
+            Vec3::X * 0.5,
+        );
+        for _ in 0..240 {
+            p.step(DT);
+        }
+        let lies = p.debris_place(d).unwrap().transform_point3(Vec3::Y);
+        assert!(lies.y > 0.3 && lies.y < 1.6, "on the ground: {lies}");
+        // Rays and she pass it.
+        let down = p.cast_ray(lies + Vec3::Y * 5.0, Vec3::NEG_Y, 20.0).unwrap();
+        assert!((down.0 - (lies.y + 5.0)).abs() < 0.05, "{down:?}");
+        let mut c = Character::new(Vec3::ZERO);
+        walk(&p, &mut c, Vec3::new(0.0, 0.0, 4.0), 3.0);
+        assert!(c.position.z > 10.0, "stopped at {}", c.position);
     }
 
     #[test]

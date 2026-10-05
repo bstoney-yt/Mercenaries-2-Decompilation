@@ -1050,6 +1050,7 @@ pub(crate) mod tests {
             hidden: Default::default(),
             textures: Vec::new(),
             tiny_members: Vec::new(),
+            breakup: None,
         };
         let mut backend = m2_render::NullBackend::default();
         let mut materials = m2_engine::MaterialCache::new();

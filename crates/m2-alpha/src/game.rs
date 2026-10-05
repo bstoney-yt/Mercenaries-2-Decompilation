@@ -461,6 +461,7 @@ impl Game {
                 }
             }
             knock_loose(world, &mut self.scene.props, &self.scene.vehicles);
+            self.scene.props.advance(dt);
             self.spray_wait -= dt;
             if self.spray_wait <= 0.0 {
                 self.spray_wait = SPRAY_GAP;
@@ -569,14 +570,20 @@ impl Game {
                 look: intent.look,
                 select: intent.trigger.select.is_some(),
                 hurt: hp < self.support_hp,
+                pda: intent.trigger.pda,
             },
             None => Call::default(),
         };
         self.support_hp = hp;
         let before = self.support.busy();
-        // In a vehicle, down or flying the camera, a call is dropped.
-        if her.is_none() && self.support.phase != support::Phase::Idle {
+        // In a vehicle, down or flying the camera, a call is dropped (and
+        // the PDA shut).
+        if her.is_none() && self.support.busy() {
             self.support.phase = support::Phase::Idle;
+            if self.support.pda {
+                self.support.pda = false;
+                self.support.posts.push(support::PDA_CLOSE);
+            }
         }
         self.support.step(call, at, dt);
         self.combat.designator = self.support.holding() || self.support.looking().is_some();

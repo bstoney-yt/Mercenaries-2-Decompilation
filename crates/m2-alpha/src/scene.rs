@@ -468,6 +468,18 @@ pub struct ParkedVehicle {
     /// How far it has rolled, metres (backwards less), for turning a
     /// tracked vehicle's road wheels.
     pub rolled: f32,
+    /// Shells its cannon has fired.
+    pub fired: u32,
+}
+
+impl ParkedVehicle {
+    /// The shells left in its cannon, which carries as many as its
+    /// template's `iClipSize` (the AMX-30's 40, which the HUD counts down
+    /// from in the videos); `None` for a gun that doesn't run out.
+    pub fn rounds(&self) -> Option<u32> {
+        let gun = self.spec.tuning.gun.filter(|_| self.spec.cannon())?;
+        Some(gun.rounds.saturating_sub(self.fired))
+    }
 }
 
 /// Kinds that don't drive on wheels (or aren't vehicles to sit in).
@@ -1079,6 +1091,7 @@ impl Scene {
                 turret: 0.0,
                 gun: 0.0,
                 rolled: 0.0,
+                fired: 0,
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
@@ -1092,6 +1105,7 @@ impl Scene {
                     turret: 0.0,
                     gun: 0.0,
                     rolled: 0.0,
+                    fired: 0,
                 });
             }
             Loaded::WorldVehicle(entity, at, yaw, spec, _) => {
@@ -1105,6 +1119,7 @@ impl Scene {
                     turret: 0.0,
                     gun: 0.0,
                     rolled: 0.0,
+                    fired: 0,
                 });
             }
             Loaded::Flight(hash, _, rest, rotors) => {
@@ -1298,6 +1313,22 @@ impl Scene {
             {
                 w.model.draw(queue, at);
             }
+            // What she carries but doesn't hold hangs on her back.
+            let holding = !fight.designator && player.throwing.is_none() && !player.down;
+            for (slot, slung) in fight.slung(holding).into_iter().enumerate() {
+                let model = match slung {
+                    Some(Weapon::Rifle) if self.arsenal.carbine.is_some() => &self.arsenal.carbine,
+                    Some(Weapon::Rifle) => &self.arsenal.rifle,
+                    Some(Weapon::Rpg) => &self.arsenal.rpg,
+                    Some(Weapon::GrenadeLauncher) => &self.arsenal.launcher,
+                    None => &None,
+                };
+                if let Some(w) = model
+                    && let Some(at) = self.arsenal.on_back(w, body, &nodes, slot)
+                {
+                    w.model.draw(queue, at);
+                }
+            }
         }
         for n in &self.people.npcs {
             if !n.landed || n.character.position.distance(eye) > npc::DRAW_DISTANCE {
@@ -1440,11 +1471,12 @@ struct Effects {
     mesh: (VertexBufferHandle, IndexBufferHandle),
     /// Indices in the mesh.
     count: u32,
-    /// Tracer, muzzle flash, fire, smoke.
+    /// Tracer, muzzle flash, fire, smoke, black smoke.
     light: MaterialId,
     flash: MaterialId,
     fire: MaterialId,
     smoke: MaterialId,
+    soot: MaterialId,
     /// A boat's spray and wake.
     spray: MaterialId,
     wake: MaterialId,
@@ -1505,6 +1537,7 @@ impl Effects {
             flash: define([1.0, 0.6, 0.18, 0.8], false, BlendMode::Translucent)?,
             fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
             smoke: define([0.35, 0.35, 0.35, 0.4], true, BlendMode::Translucent)?,
+            soot: define([0.05, 0.05, 0.05, 0.6], true, BlendMode::Translucent)?,
             spray: define([0.93, 0.95, 0.97, 0.45], true, BlendMode::Translucent)?,
             wake: define([0.9, 0.93, 0.95, 0.35], true, BlendMode::Translucent)?,
             cable: define([0.06, 0.06, 0.06, 1.0], true, BlendMode::Opaque)?,
@@ -1587,6 +1620,15 @@ impl Effects {
                 self.smoke,
                 true,
             ),
+            Effect::Soot { at, size } => (
+                Mat4::from_scale_rotation_translation(
+                    Vec3::splat(size * (0.6 + 1.4 * age)),
+                    Quat::IDENTITY,
+                    at + Vec3::Y * (age * size * 4.0),
+                ),
+                self.soot,
+                true,
+            ),
             // Out and up, falling back as it goes, gone at the end.
             Effect::Spray { at, drift, size } => (
                 Mat4::from_scale_rotation_translation(
@@ -1608,7 +1650,7 @@ impl Effects {
             ),
         };
         // Smoke as nested shells, fainter outwards, for a softer edge.
-        let shells: &[f32] = if material == self.smoke {
+        let shells: &[f32] = if material == self.smoke || material == self.soot {
             &[0.55, 0.8, 1.0]
         } else if material == self.spray {
             &[0.6, 1.0]

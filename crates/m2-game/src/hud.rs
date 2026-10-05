@@ -59,6 +59,10 @@ pub struct Marker {
 pub struct Hud {
     /// The current mission's objective list: text id and icon tag.
     pub mission: Vec<(String, String)>,
+    /// Tutorial lines asked for and not yet shown
+    /// (`Net.SetTutorialMessage`): each call's arguments as text, in
+    /// order (see [`tutorial_text`]).
+    pub tutorials: Vec<Vec<String>>,
     /// Objectives on the map, by the scripts' name for them (the target's
     /// guid as text, or `<mission>_PreMission`).
     pub objectives: BTreeMap<String, Objective>,
@@ -86,7 +90,17 @@ pub fn readable(text: &str) -> String {
     render_with(text, |_| None)
 }
 
+/// Line by line: the scripts join texts with line breaks, and the table's
+/// own texts break with `[n]`. Lines left empty go.
 fn render_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    text.split('\n')
+        .map(|line| render_line(line, &lookup))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_line(text: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find('[') {
@@ -102,7 +116,7 @@ fn render_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
         if let Some(found) = lookup(id) {
             let found = found.trim();
             if !found.is_empty() {
-                out.push(found.to_owned());
+                out.push(found.replace("[n]", "\n"));
             }
             continue;
         }
@@ -135,6 +149,28 @@ fn text(v: Option<&Value>) -> String {
         Some(Value::Number(n)) => n.to_string(),
         _ => String::new(),
     }
+}
+
+/// A script value as text, for a call whose arguments aren't known yet:
+/// strings and numbers as they are, others by their type.
+fn shown(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.to_string_lossy(),
+        Value::Integer(i) => i.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Nil => "nil".to_owned(),
+        other => other.type_name().to_owned(),
+    }
+}
+
+/// The text id of a tutorial line, from its call's arguments
+/// ([`Hud::tutorials`]): the first in brackets (`[Tutorial.OpenPDA]`),
+/// none when the call clears the line.
+pub fn tutorial_text(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(|a| a.trim())
+        .find(|a| a.starts_with('[') && a.contains(']'))
 }
 
 fn number(v: Option<&Value>) -> Option<f64> {
@@ -186,6 +222,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     let none = || Ok(MultiValue::new());
 
     let net = lib("Net")?;
+    // A tutorial line: the call's arguments are kept as they come (what
+    // each is for isn't known yet; the text id is the one in brackets).
+    add(&net, "SetTutorialMessage", |hud, _, a| {
+        hud.tutorials.push(a.iter().map(shown).collect());
+        Ok(MultiValue::new())
+    })?;
     // (mission index, {{text id, icon tag}, ...}, repeatable): the whole
     // list, sent again whenever it changes.
     add(&net, "SendEvent_AddPDAMission", |hud, _, a| {
@@ -329,6 +371,21 @@ mod tests {
     }
 
     #[test]
+    fn line_breaks_stay() {
+        let mut table = StringTable::default();
+        for (id, text) in [("Test.First", "[pda] One[n]two"), ("Test.Second", "Three")] {
+            table
+                .strings
+                .insert(m2_assets::name_hash(id), text.to_owned());
+        }
+        assert_eq!(
+            render("[Test.First]\n[Test.Second]\n", &table),
+            "[pda] One\ntwo\nThree"
+        );
+        assert_eq!(readable("[Test.First]\n[Test.Second]"), "First\nSecond");
+    }
+
+    #[test]
     fn objectives_and_markers_come_and_go() {
         let host = ScriptHost::new().unwrap();
         let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
@@ -378,5 +435,26 @@ mod tests {
             .unwrap();
         let w = world.borrow();
         assert!(w.hud.objectives.is_empty() && w.hud.radar.is_empty() && w.hud.markers.is_empty());
+    }
+
+    #[test]
+    fn tutorial_lines_keep_their_arguments() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        host.lua()
+            .load(
+                r#"
+                Net.SetTutorialMessage(nil, "[Tutorial.OpenPDA]", 8, true)
+                Net.SetTutorialMessage(nil, "")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        let t = &w.hud.tutorials;
+        assert_eq!(t[0], ["nil", "[Tutorial.OpenPDA]", "8", "true"]);
+        assert_eq!(tutorial_text(&t[0]), Some("[Tutorial.OpenPDA]"));
+        assert_eq!(tutorial_text(&t[1]), None);
     }
 }
