@@ -88,8 +88,10 @@ m2-alpha [options]
                          crosshair) instead of the game's own
   --autoplay             with --mission --screenshot: she plays the contract
                          herself by its markers (runs to places, shoots the
-                         marked soldiers, calls a satellite bomb on the
-                         marked gates, takes the vehicles brought, going a
+                         marked soldiers, opens and shuts her PDA when the
+                         scripts wait for it, calls a satellite bomb on the
+                         marked gates, waits for the vehicles brought and
+                         takes them, going a
                          way planned round walls, the sea and steep
                          ground), logging how it goes, until it is done or
                          --mission-seconds are up; each delivery is
@@ -99,7 +101,8 @@ m2-alpha [options]
                          boat five seconds after she is seated in it
                          (-boat.ppm), her three seconds after she gets out
                          of it (-ashore.ppm), what each crate leaves
-                         (-pickup1.ppm, ...), the satellite's view as each
+                         (-pickup1.ppm, ...), her PDA as she opens it
+                         (-pda1.ppm, ...), the satellite's view as each
                          timing wheel comes up (-satellite1.ppm, ...) and
                          her view two seconds after each bomb (-bomb1.ppm)
   --write-config         print the settings file and exit
@@ -112,8 +115,11 @@ Fighting (mouse captured): left button or F fires, right button aims,
 bashes (a supply crate breaks open).
 Support: T opens the support menu, and E takes up the item's designator
 and looks through the satellite: WASD or the mouse moves its view, fire
-or E confirms, and fire or E as the timing wheel's marker passes through
-each grey wedge sends the bomb. T, 1 or 2 calls it off; so does being hurt.
+or E confirms, and fire or E as the timing wheel's needle passes through
+each grey wedge sends the bomb (a press outside them undoes the presses
+made; moving the view away puts the wheel away). T, 1 or 2 calls it off;
+so does being hurt. P opens and shuts the PDA (the first contract's
+scripts give the bomb once she has looked at it).
 V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
 M music on/off, Tab or right mouse captures the mouse, N next gait
 (--model), F11 fullscreen, F3 culling, F5 quick save, F9 quick load,
