@@ -34,6 +34,9 @@ pub enum Action {
     Aim,
     /// Throw a grenade.
     Throw,
+    /// A melee bash with what she holds (also the middle mouse button,
+    /// once the mouse is captured): opens a supply crate.
+    Melee,
     /// Take up the rifle, or the rocket launcher.
     Rifle,
     Launcher,
@@ -76,6 +79,7 @@ impl Default for Bindings {
             (Fire, vec![KeyF]),
             (Aim, vec![]),
             (Throw, vec![KeyG]),
+            (Melee, vec![KeyB]),
             (Rifle, vec![Digit1]),
             (Launcher, vec![Digit2]),
             (ToggleMouse, vec![Tab]),

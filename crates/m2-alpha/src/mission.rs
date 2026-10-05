@@ -262,6 +262,11 @@ impl MissionLink {
                 mission.arrived(r.pilot, r.to.to_array());
             }
         }
+        // A crate she broke open is destroyed for the scripts too.
+        for (g, at) in scene.flights.take_broken() {
+            eprintln!("mission: crate {g:#x} broken open at {at:.1}");
+            mission.kill(g);
+        }
         // The vehicle she was seated in never came: ashore instead.
         if self.vehicles.boarding > 0 {
             self.vehicles.boarding -= 1;
