@@ -910,7 +910,9 @@ impl World {
                 let covered = detailed
                     .iter()
                     .any(|c| (c.x - t.origin.x).abs() < 1.0 && (c.z - t.origin.z).abs() < 1.0);
-                if !covered {
+                // `M2_TILES_UNDER=1` draws them under full-detail cells too,
+                // to see what a cell leaves open.
+                if !covered || tiles_under() {
                     terrain(t, queue);
                 }
             }
@@ -1142,6 +1144,11 @@ fn ground_material(
         ground: true,
         ..MaterialDesc::default()
     }
+}
+
+fn tiles_under() -> bool {
+    static UNDER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNDER.get_or_init(|| std::env::var_os("M2_TILES_UNDER").is_some())
 }
 
 /// With `M2_LOG_TERRAIN=<hex hash>,...`, prints what a cell or tile

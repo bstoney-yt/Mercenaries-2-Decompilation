@@ -51,6 +51,82 @@ fn skirts_wanted() -> bool {
     *WANTED.get_or_init(|| std::env::var("M2_SKIRTS").map_or(true, |v| v != "0"))
 }
 
+/// With `M2_TERRAIN_NEAR=x,z,r`, prints every triangle of every level of
+/// detail whose middle lies within `r` metres of world (x, z): its level,
+/// range, material, corners, the y of its face normal (Direct3D winding)
+/// and of its vertices' normals.
+fn log_near(group: &TerrainGroup<'_>, origin: Vec3) {
+    static NEAR: std::sync::OnceLock<Option<(f32, f32, f32)>> = std::sync::OnceLock::new();
+    let near = NEAR.get_or_init(|| {
+        let v = std::env::var("M2_TERRAIN_NEAR").ok()?;
+        let n: Vec<f32> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        (n.len() == 3).then(|| (n[0], n[1], n[2]))
+    });
+    let Some((x, z, r)) = *near else {
+        return;
+    };
+    let positions = group.positions();
+    let normals = group
+        .decl
+        .find(DeclUsage::Normal, 0)
+        .and_then(|e| group.vertices.read(e))
+        .unwrap_or_default();
+    let mut levels: Vec<(String, &m2_assets::terrain::TerrainRange)> = Vec::new();
+    for lod in 0..3 {
+        for (i, range) in group.lod_ranges(lod).iter().enumerate() {
+            levels.push((
+                format!("lod {lod} range {i} material {}", range.material),
+                range,
+            ));
+        }
+    }
+    for (i, range) in group.full_ranges.iter().enumerate() {
+        levels.push((format!("full range {i}"), range));
+    }
+    for (what, range) in levels {
+        for t in group.triangles(range) {
+            let Some(c) = t
+                .iter()
+                .map(|&i| {
+                    positions
+                        .get(usize::from(i))
+                        .map(|p| Vec3::from(*p) + origin)
+                })
+                .collect::<Option<Vec<Vec3>>>()
+            else {
+                continue;
+            };
+            let mid = (c[0] + c[1] + c[2]) / 3.0;
+            if (mid.x - x).hypot(mid.z - z) > r {
+                continue;
+            }
+            let face = (c[1] - c[0]).cross(c[2] - c[0]).normalize_or_zero();
+            let ny: Vec<String> = t
+                .iter()
+                .map(|&i| {
+                    normals
+                        .get(usize::from(i))
+                        .map_or("-".into(), |n| format!("{:.2}", n[1]))
+                })
+                .collect();
+            eprintln!(
+                "near: {what}: [{:.1} {:.1} {:.1}] [{:.1} {:.1} {:.1}] [{:.1} {:.1} {:.1}] face y {:.2}, normals y {}",
+                c[0].x,
+                c[0].y,
+                c[0].z,
+                c[1].x,
+                c[1].y,
+                c[1].z,
+                c[2].x,
+                c[2].y,
+                c[2].z,
+                face.y,
+                ny.join("/")
+            );
+        }
+    }
+}
+
 /// One placed model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectPlacement {
@@ -1037,6 +1113,7 @@ impl TerrainMesh {
         buckets: &mut HashMap<usize, Vec<u32>>,
         seen: &mut HashSet<(usize, [u32; 3])>,
     ) {
+        log_near(group, offset + centre);
         let count = group.positions().len();
         let ranges: Vec<_> = if group.material_ranges.is_empty() {
             group
