@@ -95,6 +95,14 @@ enum Phase {
     Leaving,
 }
 
+/// What hangs from the helicopters this frame: the cables (hook to load)
+/// and the vehicles (index in the scene's, model-to-world).
+#[derive(Debug, Default)]
+pub struct Hanging {
+    pub cables: Vec<(Vec3, Vec3)>,
+    pub hung: Vec<(usize, Mat4)>,
+}
+
 /// A delivery's helicopter: the scripts' object and its pilot, its model
 /// and the sound bank its template names, if known.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -242,6 +250,13 @@ impl Flights {
     /// Whether `pilot` is flying a delivery.
     pub fn flying(&self, pilot: u32) -> bool {
         self.flights.iter().any(|f| f.pilot == pilot)
+    }
+
+    /// Whether `guid` hangs from a helicopter, not yet let go.
+    pub fn carrying(&self, guid: u32) -> bool {
+        self.flights
+            .iter()
+            .any(|f| !f.released && f.loads.iter().any(|l| l.guid == guid))
     }
 
     /// The helicopters hovering over their drop points: each one's guid,
@@ -455,10 +470,12 @@ impl Flights {
         releases
     }
 
-    /// Queues the helicopters, what hangs from them and the crates let go;
-    /// returns the cables to draw (hook to load).
-    pub fn draw(&self, queue: &mut DrawQueue, vehicles: &[ParkedVehicle]) -> Vec<(Vec3, Vec3)> {
+    /// Queues the helicopters, the crates hanging from them and the crates
+    /// let go; returns the cables to draw and the vehicles hanging, for the
+    /// scene to draw posed.
+    pub fn draw(&self, queue: &mut DrawQueue, vehicles: &[ParkedVehicle]) -> Hanging {
         let mut cables = Vec::new();
+        let mut hung = Vec::new();
         for f in &self.flights {
             let body = self.body(f);
             if let Some(m) = f.model.and_then(|m| self.models.get(&m)?.as_ref()) {
@@ -494,11 +511,11 @@ impl Flights {
                         m.gpu.bounds.1.y
                     }
                     None => {
-                        let Some(v) = vehicles.iter().find(|v| v.guid == Some(l.guid)) else {
+                        let Some(i) = vehicles.iter().position(|v| v.guid == Some(l.guid)) else {
                             continue;
                         };
-                        v.model.draw(queue, place);
-                        v.model.bounds.1.y
+                        hung.push((i, place));
+                        vehicles[i].model.bounds.1.y
                     }
                 };
                 cables.push((hook, at + Vec3::Y * top));
@@ -512,7 +529,7 @@ impl Flights {
                 );
             }
         }
-        cables
+        Hanging { cables, hung }
     }
 
     /// The helicopter's model-to-world transform: placed, turned to its

@@ -21,7 +21,7 @@
 //!
 //! The scripts' log goes to `m2-alpha-mission.log` beside the settings.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -147,6 +147,9 @@ struct Fleet {
     /// Let go by a delivery's helicopter, falling from where they hung:
     /// not placed afresh when the scripts move them to the drop point.
     dropped: HashSet<u32>,
+    /// Those let go, by the scripts' time until which the scripts keep
+    /// them at the drop point as they fall and land.
+    landing: HashMap<u32, f64>,
 }
 
 impl std::fmt::Debug for MissionLink {
@@ -245,6 +248,9 @@ impl MissionLink {
                 .flights
                 .step(dt, &mut world.physics, &mut scene.vehicles, focus)
             {
+                for &g in &r.dropped {
+                    self.vehicles.landing.insert(g, mission.now() + LANDING);
+                }
                 self.vehicles.dropped.extend(r.dropped);
                 mission.arrived(r.pilot, r.to.to_array());
             }
@@ -682,6 +688,7 @@ impl Fleet {
                         .get(&g)
                         .filter(|o| o.alive && o.position[1] > HIDDEN_BELOW)
                     && !w.winch.get(&g).is_some_and(Option::is_some)
+                    && !game.scene.flights.carrying(g)
                     && place(physics, v, Vec3::from(o.position), o.yaw)
                     && self.reenter == Some(g)
                     && let Some(p) = game.scene.player.as_mut()
@@ -691,12 +698,17 @@ impl Fleet {
                 }
             }
         }
+        let now = mission.now();
+        self.landing.retain(|_, until| *until > now);
         for v in &game.scene.vehicles {
             let (Some(g), Some(id)) = (v.guid, v.id) else {
                 continue;
             };
             if v.wrecked {
                 mission.kill(g);
+            }
+            if self.landing.contains_key(&g) {
+                continue;
             }
             if let Some(m) = physics.vehicle_transform(id) {
                 let f = m.transform_vector3(Vec3::Z);
@@ -743,6 +755,11 @@ impl Fleet {
         }
     }
 }
+
+/// Seconds the scripts keep a vehicle a helicopter let go at its drop
+/// point (where they moved it) while it falls the last few metres and
+/// settles, so they see it delivered there.
+const LANDING: f64 = 3.0;
 
 /// Ticks the player gets to go ashore: about ten seconds for the ground
 /// around her to load.
@@ -876,6 +893,28 @@ fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
             };
             match flight {
                 Some((copter, name, from, loads)) => {
+                    // A vehicle to carry that is already down (it loaded
+                    // before the scripts hung it on the winch) is taken up,
+                    // with her got out of it first.
+                    for l in loads.iter().filter(|l| l.model.is_none()) {
+                        let (Some(i), Some(world)) = (
+                            game.scene
+                                .vehicles
+                                .iter()
+                                .position(|v| v.guid == Some(l.guid)),
+                            &mut game.scene.world,
+                        ) else {
+                            continue;
+                        };
+                        if let Some(p) = game.scene.player.as_mut().filter(|p| p.driving == Some(i))
+                        {
+                            get_out(&world.physics, &game.scene.vehicles[i], p);
+                        }
+                        if let Some(id) = game.scene.vehicles[i].id.take() {
+                            world.physics.remove_vehicle(id);
+                            eprintln!("mission: {:#x} taken up to be carried", l.guid);
+                        }
+                    }
                     eprintln!(
                         "mission: {name} flies a delivery from {from:.1} to {:.1}, model {}, \
                          sound bank {}, carrying {:?}",

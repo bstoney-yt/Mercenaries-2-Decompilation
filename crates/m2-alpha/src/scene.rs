@@ -1154,8 +1154,14 @@ impl Scene {
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
             }
         }
-        for (hook, load) in self.flights.draw(queue, &self.vehicles) {
+        let hanging = self.flights.draw(queue, &self.vehicles);
+        for (hook, load) in hanging.cables {
             self.effects.cable(queue, hook, load);
+        }
+        for (i, at) in hanging.hung {
+            let v = &self.vehicles[i];
+            let nodes = v.spec.posed_nodes(&[], v.rolled, v.turret, v.gun);
+            v.model.draw_posed(backend, queue, at, &nodes, &[])?;
         }
         if let Some(player) = &self.player
             && player.landed
