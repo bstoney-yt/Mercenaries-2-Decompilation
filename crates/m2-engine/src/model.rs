@@ -315,6 +315,12 @@ impl MaterialCache {
             reflection,
             rim: technique.is_some_and(|t| t.rim),
             depth_bias,
+            // A beam of light (a searchlight's cone): blended, glowing
+            // with its own texture. It fades where its sides turn away
+            // from the eye, so it reads as a soft shaft rather than a
+            // solid cone, as in footage of the game (the game's own
+            // falloff is not known).
+            soft_edge: has(flags::BLENDED) && emissive.is_some() && slot(1) == slot(0),
             ..MaterialDesc::default()
         };
         let tinted = debug_tint(material, desc.texture.is_some());
