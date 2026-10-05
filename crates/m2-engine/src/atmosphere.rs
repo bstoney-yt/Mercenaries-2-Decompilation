@@ -56,10 +56,6 @@ pub struct Atmosphere {
     /// `AmbientCube0`..`5` times their multipliers: light from +x, -x,
     /// +y, -y, +z and -z, display values.
     pub ambient_cube: [Vec3; 6],
-    /// `AmbientColor` times its multiplier, display values: what it does
-    /// is unknown. `M2_AMBIENT=color` scales the ambient cube by it, to
-    /// try that reading.
-    pub ambient_color: Vec3,
     /// `LightIntensity`: the sunlight's strength.
     pub light_intensity: f32,
     /// `RimColor` times `RimColorMultiplier`, display values.
@@ -170,7 +166,6 @@ impl Atmosphere {
         }
         Self {
             ambient_cube,
-            ambient_color: colour("AmbientColor").unwrap_or(Vec3::ONE),
             light_intensity: float("LightIntensity").unwrap_or(1.0),
             rim: colour("RimColor").unwrap_or(Vec3::ZERO),
             rim_threshold: field("RimColor").map_or(0.0, |v| channels(v, Lit::Light)[3]),
@@ -257,7 +252,6 @@ impl Atmosphere {
         let v = |a: Vec3, b: Vec3| a.lerp(b, t);
         Self {
             ambient_cube: std::array::from_fn(|i| v(self.ambient_cube[i], to.ambient_cube[i])),
-            ambient_color: v(self.ambient_color, to.ambient_color),
             light_intensity: f(self.light_intensity, to.light_intensity),
             rim: v(self.rim, to.rim),
             rim_threshold: f(self.rim_threshold, to.rim_threshold),
@@ -311,12 +305,7 @@ impl Atmosphere {
     /// texture, which the world loads).
     pub fn apply(&self, lighting: &mut Lighting) {
         let decode = |c: Vec3| c.max(Vec3::ZERO).powf(GAMMA);
-        let ambient = if env_is("M2_AMBIENT", "color") {
-            self.ambient_color
-        } else {
-            Vec3::ONE
-        };
-        lighting.ambient_cube = self.ambient_cube.map(|c| decode(c * ambient));
+        lighting.ambient_cube = self.ambient_cube.map(decode);
         lighting.rim_color = decode(self.rim);
         lighting.rim_threshold = self.rim_threshold;
         lighting.sun_direction = self.sun_direction();
@@ -654,7 +643,6 @@ mod tests {
     fn plain(light_time: f32, interpolate_time: f32) -> Atmosphere {
         Atmosphere {
             ambient_cube: [Vec3::splat(0.2); 6],
-            ambient_color: Vec3::ONE,
             light_intensity: 1.0,
             rim: Vec3::ZERO,
             rim_threshold: 0.0,
