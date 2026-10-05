@@ -417,6 +417,14 @@ pub struct World {
     /// each tick; colliders added by [`update`](Self::update) join scene
     /// queries on the next step.
     pub physics: Physics,
+    /// Updates so far, for the foliage log.
+    updates: u64,
+}
+
+/// `M2_LOG_FOLIAGE=on`: logs the scatter meshes as they load and, every
+/// 600 updates, the placed objects and unplaced names near the camera.
+fn logging_foliage() -> bool {
+    std::env::var("M2_LOG_FOLIAGE").as_deref() == Ok("on")
 }
 
 impl World {
@@ -483,6 +491,7 @@ impl World {
             loose: HashMap::new(),
             knocked: HashMap::new(),
             physics: Physics::new(),
+            updates: 0,
         };
         // Every tile, so the whole island shows from the start.
         let mut tiles: Vec<u32> = world.index.tiles.keys().copied().collect();
@@ -616,6 +625,10 @@ impl World {
         eye: Vec3,
     ) -> Result<(), BackendError> {
         self.receive(backend, materials)?;
+        self.updates += 1;
+        if self.updates.is_multiple_of(600) && logging_foliage() {
+            self.log_foliage(eye);
+        }
 
         // Cells: nearest first, a few at a time.
         let wanted = self
@@ -862,6 +875,29 @@ impl World {
                         Ok(s) if !s.meshes.is_empty() => {
                             let mut clumps = Vec::with_capacity(s.meshes.len());
                             for m in s.meshes {
+                                if logging_foliage() {
+                                    let ys = m
+                                        .vertices
+                                        .chunks_exact(32)
+                                        .map(|v| f32::from_le_bytes([v[4], v[5], v[6], v[7]]));
+                                    let (lo, hi) = ys.fold((f32::MAX, f32::MIN), |(lo, hi), y| {
+                                        (lo.min(y), hi.max(y))
+                                    });
+                                    let scale = m
+                                        .instances
+                                        .first()
+                                        .map_or(1.0, |w| w.x_axis.truncate().length());
+                                    eprintln!(
+                                        "foliage scatter {cell:08x}: texture {:08x?} flags {:04x} fade {:?} instances {} height {:.1}..{:.1} m scale {scale:.2} triangles {}",
+                                        m.texture(),
+                                        m.material.flags,
+                                        m.fade,
+                                        m.instances.len(),
+                                        lo,
+                                        hi,
+                                        m.indices.len() / 3
+                                    );
+                                }
                                 if m.material.flags & flags::HIDDEN != 0 {
                                     continue;
                                 }
@@ -1151,6 +1187,88 @@ impl World {
             user: 0,
         });
         Ok(())
+    }
+
+    /// The foliage log ([`logging_foliage`]): within 300 m of `eye`, the
+    /// placed objects by name stem (how many, loaded, failed, drawn by
+    /// range, nearest), then the named entities that place nothing.
+    fn log_foliage(&self, eye: Vec3) {
+        const NEAR: f32 = 300.0;
+        let names = &self.index.names;
+        let stem = |e: u32| {
+            names.get(&e).map_or("?".to_owned(), |(n, _, _)| {
+                crate::world::member_stem(n).to_lowercase()
+            })
+        };
+        // stem -> count, ready, failed, in reach, nearest, size
+        let mut placed: HashMap<String, (usize, usize, usize, usize, f32, f32)> = HashMap::new();
+        for o in &self.index.objects {
+            let d = o.position.distance(eye);
+            if d > NEAR {
+                continue;
+            }
+            let e = placed
+                .entry(stem(o.entity))
+                .or_insert((0, 0, 0, 0, f32::MAX, 0.0));
+            e.0 += 1;
+            e.4 = e.4.min(d);
+            match self.models.get(&o.model) {
+                Some(Slot::Ready(m)) => {
+                    e.1 += 1;
+                    e.5 = (m.bounds.1 - m.bounds.0).length();
+                    let reach = if o.named {
+                        draw_reach(m.bounds, self.settings.prop_distance)
+                    } else {
+                        self.settings.object_distance
+                    };
+                    if d <= reach {
+                        e.3 += 1;
+                    }
+                }
+                Some(Slot::Failed) => e.2 += 1,
+                _ => {}
+            }
+        }
+        let mut placed: Vec<_> = placed.into_iter().collect();
+        placed.sort_by_key(|p| std::cmp::Reverse(p.1.0));
+        eprintln!(
+            "foliage at {:.0},{:.0},{:.0}: {} stems placed within {NEAR} m",
+            eye.x,
+            eye.y,
+            eye.z,
+            placed.len()
+        );
+        for (s, (n, ready, failed, reach, near, size)) in placed.iter().take(60) {
+            eprintln!(
+                "foliage placed {s}: {n} (ready {ready}, failed {failed}, in reach {reach}) nearest {near:.0} m size {size:.1} m"
+            );
+        }
+        // stem, how -> count, nearest, asset type
+        let mut unplaced: HashMap<(String, char), (usize, f32, u32)> = HashMap::new();
+        for (e, (n, how, kind)) in names {
+            if matches!(how, 'm' | 'p') {
+                continue;
+            }
+            let Some(m) = self.index.members.get(e) else {
+                continue;
+            };
+            let d = m.position.distance(eye);
+            if d > NEAR {
+                continue;
+            }
+            let u = unplaced
+                .entry((crate::world::member_stem(n).to_lowercase(), *how))
+                .or_insert((0, f32::MAX, *kind));
+            u.0 += 1;
+            u.1 = u.1.min(d);
+        }
+        let mut unplaced: Vec<_> = unplaced.into_iter().collect();
+        unplaced.sort_by_key(|p| std::cmp::Reverse(p.1.0));
+        for ((s, how), (n, near, kind)) in unplaced.iter().take(60) {
+            eprintln!(
+                "foliage unplaced {s} [{how}]: {n} nearest {near:.0} m asset type {kind:08x}"
+            );
+        }
     }
 
     /// Whether placed object `i` is drawn by its own model from `eye` (in
