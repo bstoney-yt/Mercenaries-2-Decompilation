@@ -333,6 +333,8 @@ pub struct WgpuBackend {
     shaders: HashMap<VertexLayout, wgpu::ShaderModule>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     shadow_pipelines: HashMap<ShadowKey, wgpu::RenderPipeline>,
+    /// The cascades the shadow map holds, as last drawn.
+    cascades: std::cell::Cell<Option<shadow::Cascades>>,
     vertex_buffers: Slots<VertexBuffer>,
     index_buffers: Slots<IndexBuffer>,
     textures: Slots<Texture>,
@@ -751,6 +753,7 @@ impl WgpuBackend {
             shaders: HashMap::new(),
             pipelines: HashMap::new(),
             shadow_pipelines: HashMap::new(),
+            cascades: std::cell::Cell::new(None),
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
@@ -1293,9 +1296,13 @@ impl WgpuBackend {
         encoder: &mut wgpu::CommandEncoder,
         frame: &FrameUniforms,
         cascades: &shadow::Cascades,
+        refresh: [bool; shadow::CASCADES],
         draws: &[RecordedDraw],
     ) -> Result<(), BackendError> {
         for (i, (target, buffer, group)) in self.shadow_layers.iter().enumerate() {
+            if !refresh[i] {
+                continue;
+            }
             let uniforms = FrameUniforms {
                 view_proj: cascades.matrices[i].to_cols_array(),
                 ..*frame
@@ -1388,7 +1395,20 @@ impl WgpuBackend {
         target: &wgpu::TextureView,
     ) -> Result<wgpu::CommandBuffer, BackendError> {
         let l = &view.lighting;
-        let cascades = shadow::Cascades::new(view, l.sun_direction, l.shadow_distance);
+        let mut cascades = shadow::Cascades::new(view, l.sun_direction, l.shadow_distance);
+        // Far cascades are redrawn every few frames only, each keeping the
+        // matrix it was drawn with meanwhile: they cost as much as the near
+        // ones and change little.
+        let mut refresh = [true; shadow::CASCADES];
+        if let (Some(c), Some(old)) = (&mut cascades, self.cascades.get()) {
+            for (i, fresh) in refresh.iter_mut().enumerate() {
+                if !shadow::refreshes(i, self.frames) {
+                    c.keep(&old, i);
+                    *fresh = false;
+                }
+            }
+        }
+        self.cascades.set(cascades);
         let frame = FrameUniforms {
             view_proj: (view.projection * view.view).to_cols_array(),
             eye: view.eye().extend(1.0).to_array(),
@@ -1412,7 +1432,7 @@ impl WgpuBackend {
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         if let Some(cascades) = &cascades {
-            self.encode_shadows(&mut encoder, &frame, cascades, draws)?;
+            self.encode_shadows(&mut encoder, &frame, cascades, refresh, draws)?;
         }
         {
             // Linear sky colour; the sRGB target encodes it.
