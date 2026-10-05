@@ -801,6 +801,11 @@ pub struct PartStates {
     pub switchable: Vec<u16>,
     /// Each part's state machine.
     pub machines: Vec<PartMachine>,
+    /// Nodes named on entering a state other than by `show` and `hide`
+    /// (a `SetState`'s part, the points a gate's break-up does something
+    /// at: its fires perhaps): (state name hash, node), each once a state,
+    /// in order.
+    pub points: Vec<(u32, u16)>,
 }
 
 /// One part's states: what entering each shows and hides.
@@ -858,20 +863,23 @@ impl PartStates {
                 }
                 b"CHDR" => entering = w.first() == Some(&ON_ENTER),
                 b"CEXE" if entering => {
-                    let Some((_, commands)) =
+                    let Some((state, commands)) =
                         states.machines.last_mut().and_then(|m| m.states.last_mut())
                     else {
                         continue;
                     };
+                    let state = *state;
+                    // The words a show or hide applies to, by position.
+                    let mut switched = vec![false; w.len()];
                     let mut operands = Vec::new();
-                    let mut t = w.iter();
-                    while let Some(&token) = t.next() {
-                        match (token, t.next()) {
-                            (1, Some(&x)) => operands.push(x),
-                            (2, Some(&verb)) => {
+                    for (k, pair) in w.chunks_exact(2).enumerate() {
+                        match (pair[0], pair[1]) {
+                            (1, _) => operands.push(2 * k + 1),
+                            (2, verb) => {
                                 if verb == show || verb == hide {
-                                    for &h in &operands {
-                                        commands.extend(named(h).map(|n| (n, verb == show)));
+                                    for &at in &operands {
+                                        commands.extend(named(w[at]).map(|n| (n, verb == show)));
+                                        switched[at] = true;
                                     }
                                 }
                                 operands.clear();
@@ -879,11 +887,75 @@ impl PartStates {
                             _ => break,
                         }
                     }
+                    // Every other word naming a node, whatever names it: a
+                    // `SetState`, an effect at a locator, or a token this
+                    // reader doesn't know (a gate's break-up names its
+                    // locators after such, round 97).
+                    for (at, &x) in w.iter().enumerate() {
+                        for n in named(x) {
+                            if !switched[at] && !states.points.contains(&(state, n)) {
+                                states.points.push((state, n));
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
         }
         states
+    }
+
+    /// The pieces the model breaks into as it is destroyed: nodes a state
+    /// shows (a gate's as the bomb falls on it) that it hides both intact
+    /// and wrecked, each once.
+    pub fn chunks(&self, nodes: &[Node]) -> Vec<u16> {
+        let (intact, wrecked) = (self.hidden(nodes, false), self.hidden(nodes, true));
+        let off = |n: u16| {
+            let n = usize::from(n);
+            intact.get(n).copied().unwrap_or(false) && wrecked.get(n).copied().unwrap_or(false)
+        };
+        let mut chunks: Vec<u16> = self
+            .machines
+            .iter()
+            .flat_map(|m| &m.states)
+            .flat_map(|(_, commands)| commands)
+            .filter(|&&(n, shown)| shown && off(n))
+            .map(|&(n, _)| n)
+            .collect();
+        chunks.sort_unstable();
+        chunks.dedup();
+        chunks
+    }
+
+    /// The [`points`](Self::points) named by the states that show or name
+    /// any of `chunks` (as the model breaks up: a gate's destroy state
+    /// shows them, or puts each in the state that shows it), but for the
+    /// chunks themselves: each once, in order.
+    pub fn breaking_points(&self, chunks: &[u16]) -> Vec<u16> {
+        let mut breaking: Vec<u32> = self
+            .machines
+            .iter()
+            .flat_map(|m| &m.states)
+            .filter(|(_, commands)| {
+                commands
+                    .iter()
+                    .any(|&(n, shown)| shown && chunks.contains(&n))
+            })
+            .map(|&(name, _)| name)
+            .collect();
+        breaking.extend(
+            self.points
+                .iter()
+                .filter(|(_, n)| chunks.contains(n))
+                .map(|&(state, _)| state),
+        );
+        let mut points = Vec::new();
+        for &(state, n) in &self.points {
+            if breaking.contains(&state) && !chunks.contains(&n) && !points.contains(&n) {
+                points.push(n);
+            }
+        }
+        points
     }
 
     /// Which of `nodes` are hidden (with everything under them) intact,
@@ -1695,6 +1767,9 @@ mod tests {
         assert_eq!(states.switchable, vec![1, 2, 3, 5]);
         assert_eq!(states.machines.len(), 1);
         assert_eq!(states.machines[0].node, Some(0));
+        // The first state's other verb names the part's node.
+        assert_eq!(states.points, vec![(0x0ace_072a, 0)]);
+        assert!(states.chunks(&nodes).is_empty());
         assert_eq!(
             states.hidden(&nodes, false),
             vec![false, false, true, true, false, true]
@@ -1703,6 +1778,150 @@ mod tests {
             states.hidden(&nodes, true),
             vec![false, true, false, true, true, false]
         );
+    }
+
+    #[test]
+    fn a_break_up_shows_chunks_and_names_points() {
+        let (show, hide) = (crate::name_hash("show"), crate::name_hash("hide"));
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        // Root 0 holds the intact wall 1 (with a locator 4) and the wreck
+        // 2, which holds a chunk 3: breaking, the wall shows the wreck and
+        // the chunk, and does something (`flare`) at the locator; the
+        // chunk's own state shows it after another verb (`loose`).
+        let flare = crate::name_hash("flare");
+        let loose = crate::name_hash("loose");
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", le(&[5, 15, 7])),
+                leaf(b"SWIT", le(&[101, 102, 103])),
+                leaf(b"NODE", le(&[101, 3])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 101, 2, show, 3])),
+                leaf(b"STAT", le(&[0x6946_83eb])),
+                enter(),
+                leaf(
+                    b"CEXE",
+                    le(&[
+                        1, 101, 2, hide, 1, 102, 1, 103, 2, show, 1, 104, 2, flare, 3,
+                    ]),
+                ),
+                leaf(b"STAT", le(&[STATE_WRECKED])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 102, 2, show, 1, 101, 2, hide, 3])),
+                leaf(b"NODE", le(&[103, 2])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                leaf(b"STAT", le(&[0x37a6_05ff])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 103, 2, loose, 1, 103, 2, show, 3])),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [
+            n(100, None),
+            n(101, Some(0)),
+            n(102, Some(0)),
+            n(103, Some(2)),
+            n(104, Some(1)),
+        ];
+        let states = PartStates::parse(&u, stam, &nodes);
+        assert_eq!(
+            states.hidden(&nodes, false),
+            vec![false, false, true, true, false]
+        );
+        assert_eq!(
+            states.hidden(&nodes, true),
+            vec![false, true, false, true, true]
+        );
+        assert_eq!(states.points, vec![(0x6946_83eb, 4), (0x37a6_05ff, 3)]);
+        let chunks = states.chunks(&nodes);
+        assert_eq!(chunks, vec![3]);
+        assert_eq!(states.breaking_points(&chunks), vec![4]);
+    }
+
+    #[test]
+    fn a_break_up_that_sets_its_chunks_states_names_its_points() {
+        let show = crate::name_hash("show");
+        let set_state = 0x9b31_491a;
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        // As the gate's (round 97): breaking, the wall shows the wreck 2,
+        // puts its chunk 3 in the state that shows it, and names its
+        // locators 4 and 5 twice each after a token this reader doesn't
+        // know.
+        let breaking = [
+            [1, 102, 2, show],
+            [1, 0x37a6_05ff, 1, 103],
+            [2, set_state, 7, 104],
+            [7, 105, 7, 104],
+            [7, 105, 3, 0],
+        ]
+        .concat();
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", le(&[5, 15, 7])),
+                leaf(b"SWIT", le(&[101, 102, 103])),
+                leaf(b"NODE", le(&[101, 3])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 101, 2, show, 3])),
+                leaf(b"STAT", le(&[0x6946_83eb])),
+                enter(),
+                leaf(b"CEXE", le(&breaking)),
+                leaf(b"STAT", le(&[STATE_WRECKED])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 102, 2, show, 3])),
+                leaf(b"NODE", le(&[103, 2])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                leaf(b"STAT", le(&[0x37a6_05ff])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 103, 2, show, 3])),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [
+            n(100, None),
+            n(101, Some(0)),
+            n(102, Some(0)),
+            n(103, Some(2)),
+            n(104, Some(1)),
+            n(105, Some(1)),
+        ];
+        let states = PartStates::parse(&u, stam, &nodes);
+        assert_eq!(
+            states.points,
+            vec![(0x6946_83eb, 3), (0x6946_83eb, 4), (0x6946_83eb, 5)]
+        );
+        let chunks = states.chunks(&nodes);
+        assert_eq!(chunks, vec![3]);
+        assert_eq!(states.breaking_points(&chunks), vec![4, 5]);
     }
 
     #[test]

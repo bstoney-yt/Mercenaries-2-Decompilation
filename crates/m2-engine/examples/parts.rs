@@ -74,6 +74,17 @@ const WORDS: &[&str] = &[
     "lod2",
     "shadow",
     "collision",
+    // The part states and verbs a gate's machine was found to use (round
+    // 99's names, by hash).
+    "InitState",
+    "PristineState",
+    "CollapseState",
+    "DebrisState",
+    "DestroyedState",
+    "InitDestroyedState",
+    "SetState",
+    "SetRootNode",
+    "SendMessage",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -115,6 +126,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("    state {name:08x}: {commands:?}");
                 }
             }
+            let chunks = st.chunks(&model.nodes);
+            println!(
+                "  other verbs' points {:?}; breaks into {:?}, naming {:?} as it does",
+                st.points,
+                chunks,
+                st.breaking_points(&chunks)
+            );
             [
                 st.hidden(&model.nodes, false),
                 st.hidden(&model.nodes, true),
@@ -198,6 +216,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             })
                             .collect();
                         println!("{indent}{tag} [{}]", all.join(" "));
+                    } else if tag == "CEXE" {
+                        // Commands in full, as (kind, word) pairs: 1 an
+                        // operand, 2 a verb, 3 the end, others as they are.
+                        let pairs: Vec<String> = d
+                            .chunks_exact(8)
+                            .map(|p| {
+                                let k = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                                let v = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+                                let what = match model.nodes.iter().position(|n| n.name_hash == v) {
+                                    Some(n) => format!("n{n}"),
+                                    None => word(v).map_or_else(
+                                        || {
+                                            let f = f32::from_bits(v);
+                                            if v != 0
+                                                && f.is_finite()
+                                                && f.abs() > 1e-3
+                                                && f.abs() < 1e5
+                                            {
+                                                format!("{v:#x}({f})")
+                                            } else {
+                                                format!("{v:#x}")
+                                            }
+                                        },
+                                        str::to_owned,
+                                    ),
+                                };
+                                format!("{k}:{what}")
+                            })
+                            .collect();
+                        println!("{indent}{tag} {} bytes: {}", d.len(), pairs.join(" "));
                     } else {
                         println!("{indent}{tag} {} bytes  {}", d.len(), notes.join(" "));
                     }
