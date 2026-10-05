@@ -111,7 +111,8 @@ pub struct Atmosphere {
     pub tone_map: Option<ToneMap>,
     /// `Gradient0_Color2`: the middle of the post pass's monochrome ramp
     /// (a display colour) and, in its alpha byte, how much of the frame
-    /// the ramp takes.
+    /// the ramp takes (black at 0, this at 0x80, white at 0xff, by the
+    /// ramp's stops); read for the night record only.
     pub monochrome: Option<Vec4>,
 }
 
@@ -260,7 +261,20 @@ impl Atmosphere {
                 float("LightMultiplier_Z").unwrap_or(1.0),
             ),
             interpolate_time: float("InterpolateTime").unwrap_or(0.0),
-            monochrome: field("Gradient0_Color2").map(|v| Vec4::from_array(channels(v, Lit::Post))),
+            // Only the night's ramp is taken: its blue at 0.36 brought the
+            // night island from 34,39,36 to 28,35,44 and the near sea's
+            // brightness onto footage (PC round C), where by day Guanare's
+            // red ramp at 0.5 reddened and darkened the town and the AMX
+            // spot's pulled the tank's saturation away from footage. So
+            // something in code likely sets the blend by day; inferred.
+            // `M2_MONO=on` takes every record's ramp, `=off` none.
+            monochrome: field("Gradient0_Color2")
+                .filter(|_| match std::env::var("M2_MONO").as_deref() {
+                    Ok("on") => true,
+                    Ok("off") => false,
+                    _ => field("Name") == Some(name_hash("night")),
+                })
+                .map(|v| Vec4::from_array(channels(v, Lit::Post))),
             tone_map: (|| {
                 let f = |names: &[&str]| names.iter().find_map(|n| float(n));
                 Some(ToneMap {
@@ -356,9 +370,12 @@ impl Atmosphere {
                 }),
                 (_, b) => b,
             },
+            // A ramp fades in or out by its weight alone.
             monochrome: match (self.monochrome, to.monochrome) {
                 (Some(a), Some(b)) => Some(a.lerp(b, t)),
-                (_, b) => b,
+                (Some(a), None) => Some(a.lerp(a.truncate().extend(0.0), t)),
+                (None, Some(b)) => Some(b.truncate().extend(0.0).lerp(b, t)),
+                (None, None) => None,
             },
             water_ramp: match (self.water_ramp, to.water_ramp) {
                 (Some(a), Some(b)) => Some(std::array::from_fn(|i| a[i].lerp(b[i], t))),
@@ -469,14 +486,9 @@ impl Atmosphere {
         lighting.clouds.wind = self.wind;
         lighting.water_ramp = self.water_ramp;
         lighting.tone_map = self.tone_map;
-        // The atmospheres' monochrome ramps are not applied: the post
-        // shader blends towards one, but at their own colours' alpha
-        // (a quarter to a half) they turned the day red (read as red,
-        // green, blue, alpha bytes) or blue (the other way) against footage
-        // on PC round E, where without them the AMX-30's red to green and
-        // the jungle's hue matched. The blend is likely set by code, for
-        // effects; inferred. `M2_MONO=on` applies them.
-        lighting.monochrome = self.monochrome.filter(|_| env_is("M2_MONO", "on"));
+        // The post shader blends towards the monochrome ramp (only the
+        // night's is read; see `from_record`).
+        lighting.monochrome = self.monochrome;
     }
 
     /// The haze these settings describe: Hoffman and Preetham's standard
