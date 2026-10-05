@@ -73,7 +73,10 @@ m2-alpha [options]
                          marked soldiers, rockets the marked gates, takes
                          the vehicles brought, going a way planned round
                          walls, the sea and steep ground), logging how it
-                         goes, until it is done or --mission-seconds are up
+                         goes, until it is done or --mission-seconds are up;
+                         each delivery is pictured beside the screenshot as
+                         its helicopter hovers (<out>-delivery1.ppm, ...)
+                         and once its load is down (-delivery1-down.ppm)
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.

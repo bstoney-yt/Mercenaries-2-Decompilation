@@ -706,6 +706,7 @@ fn screenshot(
             options,
             fov,
             aspect,
+            out,
         )?);
     }
     if options.fight && game.on_foot && game.scene.player.is_some() {
@@ -810,12 +811,62 @@ fn screenshot(
     let info = hud_info(&game, link.as_ref(), fov, aspect);
     let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
+    write_ppm(&backend, out)?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+/// Writes the frame just rendered offscreen as a binary PPM.
+fn write_ppm(backend: &WgpuBackend, out: &std::path::Path) -> anyhow::Result<()> {
+    let (w, h) = backend.size();
     let rgba = backend.read_pixels()?;
     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
     ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
-    std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))?;
-    eprintln!("wrote {}", out.display());
-    Ok(())
+    std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))
+}
+
+/// A picture of a delivery, from 30 m off its drop point `to` on her
+/// side and 6 m up (clear of the ground there), looking at `at`; written
+/// to `out`, the camera going back to her after.
+#[allow(clippy::too_many_arguments)]
+fn delivery_picture(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    to: m2_math::glam::Vec3,
+    at: m2_math::glam::Vec3,
+    eye: Option<m2_math::glam::Vec3>,
+    out: &std::path::Path,
+) -> anyhow::Result<m2_math::glam::Vec3> {
+    use m2_math::glam::Vec3;
+    let eye = eye.unwrap_or_else(|| {
+        let away = (game.focus() - to)
+            .with_y(0.0)
+            .try_normalize()
+            .unwrap_or(Vec3::X);
+        let mut eye = to + away * 30.0 + Vec3::Y * 6.0;
+        if let Some(world) = &game.scene.world {
+            let top = eye + Vec3::Y * 300.0;
+            if let Some((t, _)) = world.physics.cast_ray(top, Vec3::NEG_Y, 600.0) {
+                eye.y = eye.y.max(top.y - t + 2.0);
+            }
+        }
+        eye
+    });
+    let (on_foot, camera) = (game.on_foot, game.camera);
+    game.on_foot = false;
+    game.camera = FlyCamera::looking_at(eye, at);
+    render(backend, game, fov, aspect, None)?;
+    let written = write_ppm(backend, out);
+    game.on_foot = on_foot;
+    game.camera = camera;
+    written?;
+    eprintln!(
+        "delivery picture: wrote {} from {eye:.1} looking at {at:.1}",
+        out.display()
+    );
+    Ok(eye)
 }
 
 /// How she holds her weapon, for close-ups: where its barrel and its top
@@ -1014,6 +1065,7 @@ fn mission_for_screenshot(
     options: &Options,
     fov: f32,
     aspect: f32,
+    out: &std::path::Path,
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone());
@@ -1048,6 +1100,15 @@ fn mission_for_screenshot(
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     let played = Instant::now();
     let every = if auto.is_some() { 10 } else { 30 };
+    // With --autoplay, a picture of each delivery as its helicopter
+    // hovers over the drop point (`<out>-delivery1.ppm`, ...), and one
+    // from the same place once the load has come down (`-down`).
+    let stem = out
+        .file_stem()
+        .map_or("shot".into(), |s| s.to_string_lossy());
+    let picture = |name: String| out.with_file_name(format!("{stem}-{name}.ppm"));
+    let mut pictured: HashSet<u32> = HashSet::new();
+    let mut down: Vec<(u32, usize, m2_math::glam::Vec3, m2_math::glam::Vec3)> = Vec::new();
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match &mut auto {
             Some(a) => {
@@ -1061,6 +1122,26 @@ fn mission_for_screenshot(
         link.tick(game, tick);
         if i % every == 0 {
             render(backend, game, fov, aspect, None)?;
+        }
+        if auto.is_some() {
+            for (copter, at, to) in game.scene.flights.hovering() {
+                if pictured.insert(copter) {
+                    let n = pictured.len();
+                    let look = (at + to) * 0.5;
+                    let path = picture(format!("delivery{n}"));
+                    let eye = delivery_picture(backend, game, fov, aspect, to, look, None, &path)?;
+                    // Hovering, letting go and four seconds' fall and
+                    // settling.
+                    down.push((i + (6.0 / tick) as u32, n, eye, to));
+                }
+            }
+            let due: Vec<_> = down.iter().filter(|d| d.0 <= i).copied().collect();
+            down.retain(|d| d.0 > i);
+            for (_, n, eye, to) in due {
+                let path = picture(format!("delivery{n}-down"));
+                let look = to + m2_math::glam::Vec3::Y;
+                delivery_picture(backend, game, fov, aspect, to, look, Some(eye), &path)?;
+            }
         }
         if auto.is_some() && link.completed() {
             eprintln!(
