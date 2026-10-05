@@ -158,10 +158,17 @@ impl Atmosphere {
             let [r, g, b, _] = channels(v, Lit::Light);
             Some(Vec3::new(r, g, b) * scale)
         };
+        // Every face of every record stores alpha 0x80: taken as a scale
+        // on the face's colour, it brings the sunlit town's sun to shade
+        // from about 1 to 2, as footage has it about 2.5 (PC round C);
+        // inferred, `M2_CUBE_ALPHA=off` leaves the faces unscaled.
+        let cube_alpha = !env_is("M2_CUBE_ALPHA", "off");
         let mut ambient_cube = [Vec3::splat(0.2); 6];
         for (i, face) in ambient_cube.iter_mut().enumerate() {
-            if let Some(c) = colour(&format!("AmbientCube{i}")) {
-                *face = c;
+            let name = format!("AmbientCube{i}");
+            if let Some(c) = colour(&name) {
+                let alpha = field(&name).map_or(1.0, |v| channels(v, Lit::Light)[3]);
+                *face = if cube_alpha { c * alpha } else { c };
             }
         }
         Self {
