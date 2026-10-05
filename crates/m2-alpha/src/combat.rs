@@ -1226,6 +1226,10 @@ impl Combat {
         let (Some(id), Some(muzzle), false) = (v.id, v.spec.muzzle, v.wrecked) else {
             return;
         };
+        // A cannon with no shells left is silent.
+        if v.rounds() == Some(0) {
+            return;
+        }
         let Some(body) = f.physics.vehicle_transform(id) else {
             return;
         };
@@ -1261,6 +1265,9 @@ impl Combat {
                 shell: true,
                 owner: Some(id),
             });
+            if let Some(v) = f.vehicles.get_mut(i) {
+                v.fired += 1;
+            }
             self.effect(
                 Effect::Flash {
                     at: from,
@@ -2040,6 +2047,113 @@ mod tests {
         let s = combat.struck.first().copied().expect("struck");
         assert_eq!(s.key, Some(StaticKey::Entity(7)));
         assert!(s.at.y < 0.8 && s.damage >= 100.0, "{s:?}");
+    }
+
+    #[test]
+    fn a_tank_fires_no_more_shells_than_its_cannon_carries() {
+        use m2_engine::VehicleSpec;
+        use m2_engine::tuning::{GunTuning, VehicleTuning};
+        use m2_engine::vehicle::WheelSpec;
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let wheel = |x: f32, z: f32| WheelSpec {
+            centre: Vec3::new(x, 0.4, z),
+            radius: 0.4,
+            width: 0.4,
+            steers: false,
+        };
+        let hull = (Vec3::new(-1.5, 0.0, -3.0), Vec3::new(1.5, 2.0, 3.0));
+        // Its cannon carries two shells and could fire ten a second.
+        let gun = GunTuning {
+            weapon: 1,
+            rate_of_fire: 600.0,
+            rounds: 2,
+            velocity: 72.0,
+            max_velocity: 72.0,
+            gravity_scale: 1.0,
+            flash: None,
+            sound_bank: None,
+        };
+        let spec = VehicleSpec {
+            model: 1,
+            kind: "tank".into(),
+            label: "test".into(),
+            wheels: vec![
+                wheel(-1.3, 2.0),
+                wheel(1.3, 2.0),
+                wheel(-1.3, -2.0),
+                wheel(1.3, -2.0),
+            ],
+            bounds: hull,
+            seat: None,
+            door: None,
+            tracked: true,
+            road_wheels: Vec::new(),
+            rest: Vec::new(),
+            node_wheel: Vec::new(),
+            mass: 32_000.0,
+            turret: Vec::new(),
+            pivot: None,
+            muzzle: Some(Vec3::new(0.0, 2.2, 5.0)),
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
+            hull,
+            turret_box: None,
+            tuning: VehicleTuning {
+                gun: Some(gun),
+                ..VehicleTuning::default()
+            },
+        };
+        let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        physics.step(dt);
+        let mut vehicles = vec![ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: None,
+            spot: None,
+            turret: 0.0,
+            gun: 0.0,
+            rolled: 0.0,
+            fired: 0,
+        }];
+        assert_eq!(vehicles[0].rounds(), Some(2));
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        player.driving = Some(0);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut combat = Combat::default();
+        let fire = Trigger {
+            fire: true,
+            ..Trigger::default()
+        };
+        // Two seconds of holding the trigger: two shells, then none.
+        let mut shots = 0;
+        for _ in 0..120 {
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            combat.step(&mut field, fire, dt);
+            let sounds = combat.take_sounds();
+            shots += sounds
+                .iter()
+                .filter(|s| matches!(s, Sound::Cannon(_)))
+                .count();
+        }
+        assert_eq!(shots, 2);
+        assert_eq!(vehicles[0].rounds(), Some(0));
+        // A car's gun (none here) doesn't count.
+        vehicles[0].spec.kind = "car".into();
+        vehicles[0].spec.tuning.gun = None;
+        assert_eq!(vehicles[0].rounds(), None);
     }
 
     #[test]
