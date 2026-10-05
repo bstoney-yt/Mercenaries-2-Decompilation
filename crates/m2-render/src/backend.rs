@@ -98,6 +98,47 @@ pub struct Lighting {
     pub bloom_threshold: f32,
     /// Per-channel scale on the finished frame: a colour grade.
     pub grade: Vec3,
+    /// The air between the eye and what it sees, and the sky.
+    pub haze: Haze,
+}
+
+/// Light scattering in the air, as Hoffman and Preetham model it and the
+/// game's shaders compute it: what lies at distance `d` keeps
+/// `E = exp(-(rayleigh + mie) * d * extinction)` of its colour and gains
+/// `(1 - E)` of the sunlight the air scatters towards the eye. The sky is
+/// that scattered light through the whole air above. Zero `rayleigh`
+/// means no haze: plain fog (`Lighting::fog_density`) and a flat sky.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Haze {
+    /// Rayleigh scattering per metre, per channel.
+    pub rayleigh: Vec3,
+    /// Mie scattering per metre, per channel.
+    pub mie: Vec3,
+    /// Henyey-Greenstein g of the Mie phase function: how strongly haze
+    /// glows around the sun.
+    pub g: f32,
+    /// Scales the scattered light.
+    pub inscattering: f32,
+    /// Scales the light lost.
+    pub extinction: f32,
+    /// Metres over which each kind of air thins out above the ground, for
+    /// the sky's path length.
+    pub rayleigh_height: f32,
+    pub mie_height: f32,
+}
+
+impl Default for Haze {
+    fn default() -> Self {
+        Self {
+            rayleigh: Vec3::ZERO,
+            mie: Vec3::ZERO,
+            g: 0.0,
+            inscattering: 1.0,
+            extinction: 1.0,
+            rayleigh_height: 8000.0,
+            mie_height: 1200.0,
+        }
+    }
 }
 
 impl Default for Lighting {
@@ -123,6 +164,7 @@ impl Default for Lighting {
             bloom: 0.0,
             bloom_threshold: 1.0,
             grade: Vec3::ONE,
+            haze: Haze::default(),
         }
     }
 }

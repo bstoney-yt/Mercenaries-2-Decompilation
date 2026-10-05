@@ -600,3 +600,34 @@ fn exposure_grade_and_bloom_finish_the_frame() {
     assert!(pixel(&glow, 8, 32)[0] > 20, "{:?}", pixel(&glow, 8, 32));
     assert_eq!(pixel(&glow, 32, 32)[..3], [255, 255, 255]);
 }
+
+#[test]
+fn hazy_skies_pale_towards_the_horizon() {
+    let Some(mut b) = backend() else { return };
+    let mut v = View::perspective(
+        Vec3::ZERO,
+        Vec3::new(0.0, 1.0, 1.0),
+        90f32.to_radians(),
+        1.0,
+        0.1,
+        100.0,
+    );
+    // The outdoor atmosphere's multipliers on standard air.
+    v.lighting.sun_direction = Vec3::new(0.0, -0.5, 1.0);
+    v.lighting.haze = Haze {
+        rayleigh: Vec3::new(6.95e-6, 1.18e-5, 2.44e-5),
+        mie: Vec3::new(5.75e-5, 7.39e-5, 1.045e-4),
+        g: 0.805,
+        inscattering: 15.0,
+        ..Haze::default()
+    };
+    b.begin_frame(&v).unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    // Top row looks straight up, the bottom row along the horizon.
+    let (up, horizon) = (pixel(&rgba, 32, 1), pixel(&rgba, 32, SIZE - 2));
+    eprintln!("up {up:?}, horizon {horizon:?}");
+    assert!(up[2] > up[0], "blue overhead: {up:?}");
+    let sum = |p: [u8; 4]| p[..3].iter().map(|&c| u32::from(c)).sum::<u32>();
+    assert!(sum(horizon) > sum(up), "{horizon:?} vs {up:?}");
+}
