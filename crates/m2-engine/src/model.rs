@@ -226,15 +226,20 @@ impl MaterialCache {
         });
         // Refl and Metal techniques mirror the surroundings, scaled by
         // constant 14 (the shaders' constant0.x) and the specular map.
-        // Metal also weights it by Fresnel, from a reflectance whose
-        // constant is not yet known, so it is left out.
+        // Metal also weights it by Schlick's Fresnel. Its reflectance facing
+        // the eye is taken from constant 15 read as an index of refraction
+        // (only Metal materials set it, 1 to 3.34, mostly 2.705: about 0.21
+        // facing); that reading is inferred, not confirmed.
         let reflection = technique
             .filter(|t| t.reflection || t.metal)
             .map(|_| material.constants[14])
             .filter(|&s| s > 0.0)
             .map(|strength| Reflection {
                 strength,
-                fresnel: None,
+                fresnel: technique.filter(|t| t.metal).map(|_| {
+                    let n = material.constants[15].max(1.0);
+                    ((n - 1.0) / (n + 1.0)).powi(2)
+                }),
             });
         let normal_map = technique
             .filter(|t| t.normal)
@@ -962,14 +967,18 @@ mod tests {
         let glow = backend.material(m).emissive.unwrap();
         assert_eq!(glow.color, [4.0, 4.0, 2.5]);
         assert!(glow.map.is_some());
-        // Paint: PgDiffSpecMetalNormFP mirrors by constant 14.
+        // Paint: PgDiffSpecMetalNormFP mirrors by constant 14, weighted by
+        // Fresnel from constant 15.
         let mut paint = Material {
             technique: 0xb68e_1be7,
             ..material(7, 10)
         };
         paint.constants[14] = 0.25;
+        paint.constants[15] = 3.0;
         let m = cache.material(&mut backend, &paint).unwrap();
-        assert_eq!(backend.material(m).reflection.unwrap().strength, 0.25);
+        let shine = backend.material(m).reflection.unwrap();
+        assert_eq!(shine.strength, 0.25);
+        assert_eq!(shine.fresnel, Some(0.25));
 
         let m = cache.material(&mut backend, &material(3, 12)).unwrap();
         assert!(backend.material(m).texture.is_none());
