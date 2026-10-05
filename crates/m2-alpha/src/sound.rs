@@ -235,7 +235,14 @@ const AMBIENT_LONGEST: f32 = 8.0;
 /// Engine banks for vehicles whose template doesn't name one (the
 /// template database's `SoundEffect` does for most), by kind and label
 /// words, first match: the banks the templates give such vehicles.
-const ENGINES: [(&str, &str); 13] = [
+const ENGINES: [(&str, &str); 18] = [
+    // Boats first: their labels may hold other kinds' words. The
+    // playthroughs' start boat is a racing speedboat.
+    ("jetski", "veh_boatjetski"),
+    ("fishing|trawler", "veh_boatbigfishing"),
+    ("cruiser|yacht", "veh_boatcruiser"),
+    ("outboard|skiff", "veh_boatoutboard"),
+    ("boat", "veh_boatracing"),
     ("helicopter", "veh_helicoptermedium"),
     ("hmmwv|humvee|valiant", "veh_largegascrappy"),
     ("m151|jeep", "veh_jeep"),
@@ -959,6 +966,8 @@ mod tests {
             "veh_4cylinderold"
         );
         assert_eq!(engine_bank("truck", "vz_veh_truck_m151"), "veh_jeep");
+        assert_eq!(engine_bank("boat", "Speedboat"), "veh_boatracing");
+        assert_eq!(engine_bank("boat", "Jetski (CIV)"), "veh_boatjetski");
         assert_eq!(engine_bank("car", "civ_veh_car_sedan"), "veh_4cylindernew");
         // The template database's banks, by name hash.
         assert_eq!(bank_name(0x3714_581c), Some("veh_largegascrappy"));

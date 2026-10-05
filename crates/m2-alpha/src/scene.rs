@@ -1331,6 +1331,9 @@ struct Effects {
     flash: MaterialId,
     fire: MaterialId,
     smoke: MaterialId,
+    /// A boat's spray and wake.
+    spray: MaterialId,
+    wake: MaterialId,
     /// A helicopter's winch cable.
     cable: MaterialId,
 }
@@ -1388,6 +1391,8 @@ impl Effects {
             flash: define([1.0, 0.6, 0.18, 0.8], false, BlendMode::Translucent)?,
             fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
             smoke: define([0.35, 0.35, 0.35, 0.4], true, BlendMode::Translucent)?,
+            spray: define([0.93, 0.95, 0.97, 0.45], true, BlendMode::Translucent)?,
+            wake: define([0.9, 0.93, 0.95, 0.35], true, BlendMode::Translucent)?,
             cable: define([0.06, 0.06, 0.06, 1.0], true, BlendMode::Opaque)?,
         })
     }
@@ -1468,10 +1473,31 @@ impl Effects {
                 self.smoke,
                 true,
             ),
+            // Out and up, falling back as it goes, gone at the end.
+            Effect::Spray { at, drift, size } => (
+                Mat4::from_scale_rotation_translation(
+                    Vec3::new(1.0, 0.6, 1.0) * (size * (0.4 + age) * (1.0 - age * age)),
+                    Quat::IDENTITY,
+                    at + drift * age - Vec3::Y * (2.0 * age * age),
+                ),
+                self.spray,
+                true,
+            ),
+            Effect::Wake { at, size } => (
+                Mat4::from_scale_rotation_translation(
+                    Vec3::new(1.0, 0.04, 1.0) * (size * (0.5 + age) * (1.0 - age.powi(3))),
+                    Quat::IDENTITY,
+                    at,
+                ),
+                self.wake,
+                true,
+            ),
         };
         // Smoke as nested shells, fainter outwards, for a softer edge.
         let shells: &[f32] = if material == self.smoke {
             &[0.55, 0.8, 1.0]
+        } else if material == self.spray {
+            &[0.6, 1.0]
         } else {
             &[1.0]
         };
