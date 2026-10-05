@@ -58,6 +58,7 @@ pub mod havok;
 pub mod layer;
 pub mod lua;
 pub mod material_animation;
+pub mod minimap;
 pub mod model;
 pub mod path;
 pub mod physics;
