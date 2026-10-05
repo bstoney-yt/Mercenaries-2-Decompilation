@@ -736,7 +736,7 @@ impl Thread {
             // Worded as `MrxGuiInterface.DisplayObjectiveMessage` words it,
             // from the scripts' own tables: colour, icon, "[objective.
             // Objectiveadded]" and the objective's text id.
-            let (text, priority): (Option<String>, Option<i32>) = lua
+            let (text, priority): (Option<String>, Option<mlua::Integer>) = lua
                 .load(WORD_MESSAGE)
                 .set_name("=m2-hud message")
                 .call((m.kind.as_str(), m.icon, m.text.as_str()))?;
