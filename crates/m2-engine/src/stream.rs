@@ -645,7 +645,12 @@ impl World {
                         Ok(m) if !m.pieces.is_empty() => {
                             for &i in self.by_model.get(&hash).map_or(&[][..], Vec::as_slice) {
                                 let o = &self.index.objects[i];
-                                if let Some(shape) = &m.collision {
+                                // A prop placed by name with no collision
+                                // of its own (a bush, a plant) has none:
+                                // vehicles and people go through it.
+                                if let Some(shape) =
+                                    m.collision.as_ref().filter(|s| !(o.named && s.stand_in))
+                                {
                                     self.physics.add_static(
                                         StaticKey::Object(i),
                                         shape,
