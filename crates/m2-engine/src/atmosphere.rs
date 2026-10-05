@@ -143,9 +143,9 @@ impl Atmosphere {
 }
 
 /// Air near the ground against the standard coefficients: fitted so land
-/// 2 km away is about 40% haze, as in PC footage of the game (the game's
+/// 2 km away is about half haze, as in PC footage of the game (the game's
 /// own density comes from code).
-const HAZE_DENSITY: f32 = 3.0;
+const HAZE_DENSITY: f32 = 4.0;
 /// Rayleigh scattering of air per metre at 650, 570 and 475 nm.
 const RAYLEIGH: Vec3 = Vec3::new(6.95e-6, 1.18e-5, 2.44e-5);
 /// Mie scattering per metre at the same wavelengths for a turbidity of 2,
