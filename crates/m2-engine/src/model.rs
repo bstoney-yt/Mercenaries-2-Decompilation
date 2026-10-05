@@ -40,13 +40,27 @@ pub struct Uploaded {
     pub alpha_x: bool,
 }
 
+/// What a model material is cached by.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MaterialKey {
+    name: u32,
+    textures: Vec<u32>,
+    technique: u32,
+    flags: u16,
+    constants: [u32; m2_assets::model::MATERIAL_CONSTANTS],
+    depth_bias: bool,
+}
+
 /// Textures and materials shared between models.
 #[derive(Debug)]
 pub struct MaterialCache {
     /// `None`: the texture could not be read; its materials draw untextured.
     textures: HashMap<u32, Option<Uploaded>>,
-    /// By name, base texture, technique and depth bias.
-    materials: HashMap<(u32, Option<u32>, u32, bool), MaterialId>,
+    /// By everything in the record that shapes the material, and depth
+    /// bias: records sharing a name can differ in flags, constants and
+    /// maps (the AMX-30's tracks are two-sided, the M1A1's of the same
+    /// name not).
+    materials: HashMap<MaterialKey, MaterialId>,
     defined: Vec<(MaterialId, MaterialDesc)>,
     /// Materials that blend over what is behind them.
     translucent: HashSet<MaterialId>,
@@ -188,12 +202,14 @@ impl MaterialCache {
         depth_bias: bool,
     ) -> Result<MaterialId, BackendError> {
         let texture_hash = base_texture(material);
-        let key = (
-            material.name_hash,
-            texture_hash,
-            material.technique,
+        let key = MaterialKey {
+            name: material.name_hash,
+            textures: material.textures.clone(),
+            technique: material.technique,
+            flags: material.flags,
+            constants: material.constants.map(f32::to_bits),
             depth_bias,
-        );
+        };
         if let Some(&id) = self.materials.get(&key) {
             return Ok(id);
         }
@@ -831,6 +847,23 @@ impl GpuModel {
         let mut ids = Vec::with_capacity(cpu.materials.len());
         for m in &cpu.materials {
             ids.push(materials.material(backend, m)?);
+        }
+        // Which model draws a tinted material, as its textures may never
+        // all load to log it by.
+        let mut tinted: Vec<usize> = cpu
+            .pieces
+            .iter()
+            .flat_map(|p| p.ranges.iter().map(|r| r.2))
+            .filter(|&m| cpu.materials.get(m).is_some_and(|m| debug_tint(m, true)))
+            .collect();
+        tinted.sort_unstable();
+        tinted.dedup();
+        for m in tinted {
+            let m = &cpu.materials[m];
+            eprintln!(
+                "model {:08x} draws tinted material {:08x} (flags {:04x}, textures {:08x?})",
+                cpu.hash, m.name_hash, m.flags, m.textures
+            );
         }
         let mut pieces = Vec::with_capacity(cpu.pieces.len());
         for p in &cpu.pieces {
