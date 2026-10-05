@@ -12,7 +12,7 @@ use m2_engine::{Physics, VehicleId};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
 use crate::combat::{Combat, Trigger, Weapon};
-use crate::game::{Game, place};
+use crate::game::{Game, can_get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
@@ -408,7 +408,9 @@ impl Autoplay {
             // last that she hasn't driven (the tank delivered for the next
             // leg), else hers from before or another of theirs.
             let near = |i: usize, within: f32| {
-                vehicles.get(i).is_some_and(|v| !v.wrecked)
+                vehicles
+                    .get(i)
+                    .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
                     && vehicle_at(game, i)
                         .is_some_and(|t| t.w_axis.truncate().distance(here) < within)
             };
@@ -442,7 +444,7 @@ impl Autoplay {
                 && let Some(i) = vehicles
                     .iter()
                     .enumerate()
-                    .filter(|(_, v)| v.guid.is_some() && !v.wrecked)
+                    .filter(|(_, v)| v.guid.is_some() && !v.wrecked && !v.spec.is_boat())
                     .filter_map(|(i, _)| {
                         let d = vehicle_at(game, i)?.w_axis.truncate().distance(m.at);
                         (d < TAKE_NEAR).then_some((i, d))
@@ -586,6 +588,15 @@ impl Autoplay {
         }
         if self.stalled > STALL {
             self.stalled = 0.0;
+            // A boat run aground: out, into the shallows.
+            if self.can_leave(game, i) {
+                eprintln!(
+                    "autoplay {:.1} s: the {} is aground {d:.0} m off: getting out",
+                    self.clock, game.scene.vehicles[i].spec.label
+                );
+                self.leave = true;
+                return self.press(speed);
+            }
             self.reversing = Some((-angle.signum(), REVERSE));
         }
         if let Some((s, left)) = &mut self.reversing {
@@ -835,7 +846,11 @@ impl Autoplay {
         speed: f32,
     ) -> Vec3 {
         let straight = (at - pos).with_y(0.0).length();
-        if straight < PLAN_FROM {
+        // A boat goes straight at it, over the sea the way keeps off.
+        let boat = driving
+            .and_then(|i| game.scene.vehicles.get(i))
+            .is_some_and(|v| v.spec.is_boat());
+        if straight < PLAN_FROM || boat {
             self.way = None;
             return at;
         }
@@ -937,6 +952,15 @@ impl Autoplay {
         }
     }
 
+    /// Whether vehicle `i` is a boat she can get out of where it is (not
+    /// over deep water).
+    fn can_leave(&self, game: &Game, i: usize) -> bool {
+        let (Some(world), Some(v)) = (&game.scene.world, game.scene.vehicles.get(i)) else {
+            return false;
+        };
+        v.spec.is_boat() && can_get_out(&world.physics, v)
+    }
+
     /// Keeps track of how close she has come to `at` (`d` metres off, on
     /// her way): short of headway she sidesteps and jumps, long short of it
     /// she hops ahead (true then: nothing more this tick).
@@ -951,13 +975,16 @@ impl Autoplay {
         }
         if stuck > HOP_AFTER {
             // Stuck driving close to the place: on foot from here.
-            let driving = game
-                .scene
-                .player
-                .as_ref()
-                .is_some_and(|p| p.driving.is_some());
+            let driving = game.scene.player.as_ref().and_then(|p| p.driving);
             let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
-            if driving && near {
+            if let Some(i) = driving
+                && near
+                && game
+                    .scene
+                    .world
+                    .as_ref()
+                    .is_none_or(|w| can_get_out(&w.physics, &game.scene.vehicles[i]))
+            {
                 eprintln!(
                     "autoplay {:.1} s: no headway driving for {stuck:.0} s, {d:.0} m off: getting out",
                     self.clock

@@ -3,8 +3,9 @@
 
 use std::collections::HashSet;
 
-use m2_engine::{CatalogueEntry, Physics, StaticKey, VehicleControls, World};
-use m2_math::glam::{Quat, Vec3, Vec4Swizzles};
+use m2_engine::physics::FLOAT_DEPTH;
+use m2_engine::{CatalogueEntry, Physics, StaticKey, VehicleControls, VehicleSpec, World};
+use m2_math::glam::{Mat4, Quat, Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
@@ -284,7 +285,11 @@ impl Game {
                 }
                 if intent.use_pressed {
                     match player.driving {
-                        Some(i) => get_out(physics, &scene.vehicles[i], player),
+                        // Not out of a boat into deep water.
+                        Some(i) if can_get_out(physics, &scene.vehicles[i]) => {
+                            get_out(physics, &scene.vehicles[i], player)
+                        }
+                        Some(_) => {}
                         None => {
                             player.driving = nearest(physics, &scene.vehicles, player, REACH);
                             // Seated: she no longer waits to land (people
@@ -389,10 +394,12 @@ impl Game {
                         world.physics.hold_vehicle(id, true);
                     } else if far < hold - HOLD_SLACK
                         && world.physics.vehicle_held(id)
-                        && world
-                            .physics
-                            .cast_ray_past(at + Vec3::Y, Vec3::NEG_Y, HOLD_GROUND, id)
-                            .is_some()
+                        // A boat floats on the sea, whatever is under it.
+                        && ((v.spec.is_boat() && world.physics.water().is_some())
+                            || world
+                                .physics
+                                .cast_ray_past(at + Vec3::Y, Vec3::NEG_Y, HOLD_GROUND, id)
+                                .is_some())
                     {
                         world.physics.hold_vehicle(id, false);
                     }
@@ -909,6 +916,7 @@ fn parkable(v: &ParkedVehicle) -> bool {
 
 /// Puts a vehicle on the ground at `at` facing `yaw`, tilted to the
 /// ground under its wheels; false while the ground there hasn't loaded.
+/// A boat on the sea floats on it.
 pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw: f32) -> bool {
     // From a little above where the layers put it (so one under a bridge
     // or a gantry stays under it), else from well above.
@@ -920,6 +928,17 @@ pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw:
                 .map(|(d, _)| top.y - d)
         })
     };
+    // Level, as deep as it floats, where the seabed is under its keel (or
+    // hasn't loaded).
+    let float = physics.water().filter(|&water| {
+        let keel = water - FLOAT_DEPTH + v.spec.hull.0.y;
+        v.spec.is_boat() && ground(at).is_none_or(|h| h < keel)
+    });
+    if let Some(water) = float {
+        let at = Vec3::new(at.x, water - FLOAT_DEPTH, at.z);
+        v.id = Some(physics.add_vehicle_turned(&v.spec, at, Quat::from_rotation_y(yaw)));
+        return true;
+    }
     let rest = v.spec.rest_on(at, yaw, ground);
     // A wheel over nothing (a quay's edge): level, on the ground under
     // its origin.
@@ -998,21 +1017,45 @@ fn nearest(
         .map(|(i, _)| i)
 }
 
+/// Where she steps out of a vehicle standing at `at`: on the driver's
+/// side, beside the hull.
+fn door_out(at: Mat4, spec: &VehicleSpec) -> Vec3 {
+    let (lo, hi) = spec.bounds;
+    let door = spec
+        .door
+        .unwrap_or(Vec3::new(lo.x, 0.0, (lo.z + hi.z) * 0.5));
+    let x = if door.x < (lo.x + hi.x) * 0.5 {
+        lo.x - 0.8
+    } else {
+        hi.x + 0.8
+    };
+    at.transform_point3(Vec3::new(x, 0.0, door.z))
+}
+
+/// Whether she can get out of `v` where it is: not from a boat over water
+/// deeper than she can stand in ([`WADE`]).
+pub(crate) fn can_get_out(physics: &Physics, v: &ParkedVehicle) -> bool {
+    let (Some(water), Some(id)) = (physics.water(), v.id.filter(|_| v.spec.is_boat())) else {
+        return true;
+    };
+    let Some(at) = physics.vehicle_transform(id) else {
+        return true;
+    };
+    let out = door_out(at, &v.spec);
+    let top = Vec3::new(out.x, water + 2.0, out.z);
+    physics
+        .cast_ray_past(top, Vec3::NEG_Y, 2.0 + WADE, id)
+        .is_some()
+}
+
+/// The deepest water she gets out of a boat into, metres: chest deep.
+const WADE: f32 = 1.4;
+
 /// Gets her out on the driver's side, beside the hull, to drop to the
 /// ground there.
 pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player) {
     if let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) {
-        let (lo, hi) = v.spec.bounds;
-        let door = v
-            .spec
-            .door
-            .unwrap_or(Vec3::new(lo.x, 0.0, (lo.z + hi.z) * 0.5));
-        let x = if door.x < (lo.x + hi.x) * 0.5 {
-            lo.x - 0.8
-        } else {
-            hi.x + 0.8
-        };
-        let out = at.transform_point3(Vec3::new(x, 0.0, door.z));
+        let out = door_out(at, &v.spec);
         player.character.position = Vec3::new(out.x, 0.0, out.z);
         player.character.velocity = Vec3::ZERO;
         let f = at.transform_vector3(Vec3::Z);

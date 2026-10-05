@@ -58,9 +58,10 @@ const SPEED_FADE: f32 = 12.0;
 /// Seconds an objective message stays up.
 const MESSAGE_TIME: f32 = 6.0;
 /// The scripts' vehicles are loaded within this far of the player, metres,
-/// and at most this many.
+/// and at most this many in play at once (wrecks and those they removed
+/// don't count).
 const VEHICLE_REACH: f32 = 300.0;
-const MAX_VEHICLES: usize = 16;
+const MAX_VEHICLES: usize = 24;
 /// The scripts put vehicles they don't need yet far under the island
 /// (about 40 km down): those below this height aren't placed.
 const HIDDEN_BELOW: f32 = -1000.0;
@@ -150,6 +151,12 @@ struct Fleet {
     /// Those let go, by the scripts' time until which the scripts keep
     /// them at the drop point as they fall and land.
     landing: HashMap<u32, f64>,
+    /// Ticks left for the vehicle the scripts seated her in (the start's
+    /// boat) to load and be placed, she waiting where it is ([`reenter`]
+    /// names it); then she goes ashore instead.
+    ///
+    /// [`reenter`]: Self::reenter
+    boarding: u32,
 }
 
 impl std::fmt::Debug for MissionLink {
@@ -253,6 +260,16 @@ impl MissionLink {
                 }
                 self.vehicles.dropped.extend(r.dropped);
                 mission.arrived(r.pilot, r.to.to_array());
+            }
+        }
+        // The vehicle she was seated in never came: ashore instead.
+        if self.vehicles.boarding > 0 {
+            self.vehicles.boarding -= 1;
+            if self.vehicles.boarding == 0
+                && let Some(g) = self.vehicles.reenter.take()
+            {
+                eprintln!("mission: {g:#x} to seat her in did not load: she goes ashore");
+                self.ashore = ASHORE_TRIES;
             }
         }
         if self.ashore > 0 && game.scene.player.as_ref().is_some_and(|p| p.landed) {
@@ -694,7 +711,15 @@ impl Fleet {
                     && let Some(p) = game.scene.player.as_mut()
                 {
                     p.driving = Some(i);
+                    // Seated, she no longer waits to land.
+                    p.landed = true;
                     self.reenter = None;
+                    self.boarding = 0;
+                    eprintln!(
+                        "mission: she is seated in {} ({g:#x}){}",
+                        v.spec.label,
+                        if v.spec.is_boat() { ", afloat" } else { "" }
+                    );
                 }
             }
         }
@@ -724,12 +749,7 @@ impl Fleet {
             return;
         };
         let near = player.character.position;
-        let none = Templates::default();
-        let templates = game
-            .scene
-            .world
-            .as_ref()
-            .map_or(&none, |w| &w.index.template_db);
+        let island = game.scene.world.as_ref();
         let w = mission.world().borrow();
         let mut wanted: Vec<(f32, u32, Vec<CatalogueEntry>)> = w
             .objects
@@ -740,16 +760,19 @@ impl Fleet {
                 (d <= VEHICLE_REACH).then_some((d, g, o))
             })
             .filter_map(|(d, g, o)| {
-                let models = template_models(&o.name, templates, &catalogue.vehicles);
+                let models = object_models(g, &o.name, island, &catalogue.vehicles);
                 (!models.is_empty()).then_some((d, g, models))
             })
             .collect();
+        // Those the scripts still have in play count against the most.
+        let live = self
+            .requested
+            .iter()
+            .filter(|g| w.objects.get(g).is_some_and(|o| o.alive))
+            .count();
         drop(w);
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (_, g, models) in wanted {
-            if self.requested.len() >= MAX_VEHICLES {
-                break;
-            }
+        for (_, g, models) in wanted.into_iter().take(MAX_VEHICLES.saturating_sub(live)) {
             self.requested.insert(g);
             game.scene.load_vehicle(g, models);
         }
@@ -764,6 +787,10 @@ const LANDING: f64 = 3.0;
 /// Ticks the player gets to go ashore: about ten seconds for the ground
 /// around her to load.
 const ASHORE_TRIES: u32 = 600;
+
+/// Ticks a vehicle the scripts seat her in gets to load and be placed:
+/// about 30 seconds.
+const BOARDING: u32 = 1800;
 
 /// Moves a player standing under the sea to the nearest dry ground within
 /// 1.5 km. True once she stands on dry ground (moved there, or there
@@ -967,6 +994,32 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 p.driving = Some(i);
                 return false;
             }
+            // One still to load (the start's boat): she waits where it is,
+            // to be seated once it is placed.
+            let w = mission.world().borrow();
+            let catalogue = game
+                .scene
+                .catalogue
+                .as_ref()
+                .map_or(&[][..], |c| c.vehicles.as_slice());
+            if let Some(o) = w.objects.get(vehicle)
+                && !object_models(*vehicle, &o.name, game.scene.world.as_ref(), catalogue)
+                    .is_empty()
+            {
+                let at = Vec3::from(o.position);
+                drop(w);
+                fleet.reenter = Some(*vehicle);
+                fleet.boarding = BOARDING;
+                fleet.look = 0;
+                if let Some(p) = game.scene.player.as_mut() {
+                    p.character.position = at;
+                    p.character.velocity = Vec3::ZERO;
+                    p.driving = None;
+                    p.chase_target = None;
+                }
+                eprintln!("mission: she waits at {at:.1} for {vehicle:#x} to load, to be seated");
+                return false;
+            }
         }
         Command::ExitVehicle(guid) if *guid == PLAYER => {
             fleet.reenter = None;
@@ -1076,9 +1129,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
 }
 
 /// The model a vehicle template of the scripts' drives as: the template
-/// database's, when it has the template and it drives on the ground
-/// (boats and helicopters don't drive yet); else the catalogue models
-/// whose name fits the template's words ([`vehicle_models`]).
+/// database's, when it has the template and it drives on the ground or
+/// floats (helicopters don't fly yet); else the catalogue models whose
+/// name fits the template's words ([`vehicle_models`]).
 pub(crate) fn template_models(
     name: &str,
     templates: &Templates,
@@ -1087,14 +1140,14 @@ pub(crate) fn template_models(
     match templates.get(name) {
         Some(&TemplateInfo {
             model: Some(model),
-            vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank)),
+            vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank | VehicleKind::Boat)),
             ..
         }) => vec![CatalogueEntry {
             model,
-            kind: if kind == VehicleKind::Tank {
-                "tank"
-            } else {
-                "car"
+            kind: match kind {
+                VehicleKind::Tank => "tank",
+                VehicleKind::Boat => m2_engine::vehicle::BOAT,
+                _ => "car",
             }
             .to_owned(),
             label: member_stem(name).to_owned(),
@@ -1104,6 +1157,25 @@ pub(crate) fn template_models(
             ..
         }) => Vec::new(),
         _ => vehicle_models(name, catalogue),
+    }
+}
+
+/// The models one of the scripts' objects drives as
+/// ([`template_models`]): by its name, else (a state layer's renamed
+/// entity, the first contract's `VzaCon001_StartingBoat`) by the template
+/// it is an instance of.
+fn object_models(
+    guid: u32,
+    name: &str,
+    world: Option<&m2_engine::World>,
+    catalogue: &[CatalogueEntry],
+) -> Vec<CatalogueEntry> {
+    let none = Templates::default();
+    let templates = world.map_or(&none, |w| &w.index.template_db);
+    let models = template_models(name, templates, catalogue);
+    match world.and_then(|w| w.index.state_vehicles.get(&guid)) {
+        Some(t) if models.is_empty() => template_models(&t.name, templates, catalogue),
+        _ => models,
     }
 }
 
@@ -1247,8 +1319,8 @@ mod tests {
             [(0xabc, "car".to_owned())]
         );
         assert_eq!(models("AMX30 (Full)"), [(0xdef, "tank".to_owned())]);
-        // A boat doesn't drive yet.
-        assert!(models("Patrol Boat (VZ)").is_empty());
+        // A boat floats.
+        assert_eq!(models("Patrol Boat (VZ)"), [(0x123, "boat".to_owned())]);
         // Without a model in the database, the words find the catalogue's.
         assert_eq!(models("M151 Softtop (GL)"), [(1, "truck".to_owned())]);
     }

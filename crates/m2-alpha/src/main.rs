@@ -1109,6 +1109,11 @@ fn mission_for_screenshot(
     let picture = |name: String| out.with_file_name(format!("{stem}-{name}.ppm"));
     let mut pictured: HashSet<u32> = HashSet::new();
     let mut down: Vec<(u32, usize, m2_math::glam::Vec3, m2_math::glam::Vec3)> = Vec::new();
+    // And the start's boat from the chase camera five seconds after she
+    // is seated in it (`-boat`), and her three seconds after she gets out
+    // of it (`-ashore`): the tick each is due.
+    let mut boat_shot: Option<u32> = None;
+    let mut ashore_shot: Option<u32> = None;
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match &mut auto {
             Some(a) => {
@@ -1141,6 +1146,25 @@ fn mission_for_screenshot(
                 let path = picture(format!("delivery{n}-down"));
                 let look = to + m2_math::glam::Vec3::Y;
                 delivery_picture(backend, game, fov, aspect, to, look, Some(eye), &path)?;
+            }
+            let in_boat = game
+                .scene
+                .player
+                .as_ref()
+                .and_then(|p| p.driving)
+                .and_then(|v| game.scene.vehicles.get(v))
+                .is_some_and(|v| v.spec.is_boat());
+            if in_boat {
+                boat_shot.get_or_insert(i + (5.0 / tick) as u32);
+            } else if boat_shot.is_some() {
+                ashore_shot.get_or_insert(i + (3.0 / tick) as u32);
+            }
+            for (due, name) in [(boat_shot, "boat"), (ashore_shot, "ashore")] {
+                if due == Some(i) {
+                    render(backend, game, fov, aspect, None)?;
+                    write_ppm(backend, &picture(name.into()))?;
+                    eprintln!("autoplay: pictured {name} at {:.1}", game.focus());
+                }
             }
         }
         if auto.is_some() && link.completed() {
