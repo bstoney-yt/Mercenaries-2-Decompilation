@@ -631,3 +631,71 @@ fn hazy_skies_pale_towards_the_horizon() {
     let sum = |p: [u8; 4]| p[..3].iter().map(|&c| u32::from(c)).sum::<u32>();
     assert!(sum(horizon) > sum(up), "{horizon:?} vs {up:?}");
 }
+
+#[test]
+fn shallow_water_shows_the_bed_beneath() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            color: [1.0, 0.0, 0.0, 1.0],
+            lit: false,
+            double_sided: true,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    b.set_material(
+        MaterialId(2),
+        &MaterialDesc {
+            color: [0.05, 0.22, 0.30, 0.85],
+            blend: BlendMode::Translucent,
+            double_sided: true,
+            water: true,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    let v = View::perspective(
+        Vec3::new(0.0, 10.0, 0.0),
+        Vec3::new(0.0, -1.0, 0.001),
+        90f32.to_radians(),
+        1.0,
+        0.1,
+        100.0,
+    );
+    let up = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let at = |p: Vec3| {
+        let c = (v.projection * v.view).project_point3(p);
+        (
+            ((c.x * 0.5 + 0.5) * SIZE as f32) as u32,
+            ((0.5 - c.y * 0.5) * SIZE as f32) as u32,
+        )
+    };
+    // Deeper than the shore's foam.
+    let (shallow, deep) = (Vec3::new(4.0, -3.5, 0.0), Vec3::new(-4.0, -30.0, 0.0));
+    b.begin_frame(&v).unwrap();
+    b.draw(&draw(
+        vb,
+        ib,
+        1,
+        Mat4::from_translation(shallow) * Mat4::from_scale(Vec3::splat(3.0)) * up,
+    ))
+    .unwrap();
+    b.draw(&draw(
+        vb,
+        ib,
+        1,
+        Mat4::from_translation(deep) * Mat4::from_scale(Vec3::splat(20.0)) * up,
+    ))
+    .unwrap();
+    b.draw(&draw(vb, ib, 2, Mat4::from_scale(Vec3::splat(50.0)) * up))
+        .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    let (s, d) = (at(Vec3::new(4.0, 0.0, 0.0)), at(Vec3::new(-4.0, 0.0, 0.0)));
+    let (s, d) = (pixel(&rgba, s.0, s.1), pixel(&rgba, d.0, d.1));
+    eprintln!("shallow {s:?}, deep {d:?}");
+    assert!(s[0] > s[1] && s[0] > d[0] + 40, "shallow {s:?}, deep {d:?}");
+}
