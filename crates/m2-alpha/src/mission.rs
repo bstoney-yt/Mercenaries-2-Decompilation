@@ -970,7 +970,10 @@ fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
         } if goal == "MoveTo" && game.scene.flights.flying(*guid) => {
             game.scene.flights.send_home(*guid, Vec3::from(*to));
         }
-        Command::Remove(guid) => game.scene.flights.removed(*guid),
+        Command::Remove(guid) => game
+            .scene
+            .flights
+            .removed(*guid, game.scene.world.as_mut().map(|w| &mut w.physics)),
         _ => {}
     }
 }

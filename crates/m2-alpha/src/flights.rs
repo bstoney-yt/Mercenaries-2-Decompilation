@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use m2_assets::vehicle::Rotor;
-use m2_engine::{GpuModel, Physics};
+use m2_engine::{CollisionShape, GpuModel, Physics, StaticKey};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::DrawQueue;
 
@@ -241,9 +241,15 @@ impl Flights {
         }
     }
 
-    /// The scripts no longer have `guid`: a crate of theirs goes (a
-    /// helicopter flies off out of sight first).
-    pub fn removed(&mut self, guid: u32) {
+    /// The scripts no longer have `guid`: a crate of theirs goes, and what
+    /// stood in the way with it (a helicopter flies off out of sight
+    /// first).
+    pub fn removed(&mut self, guid: u32, physics: Option<&mut Physics>) {
+        if self.crates.iter().any(|c| c.guid == guid)
+            && let Some(physics) = physics
+        {
+            physics.remove_static(StaticKey::Entity(guid));
+        }
         self.crates.retain(|c| c.guid != guid);
     }
 
@@ -461,6 +467,17 @@ impl Flights {
             {
                 c.at.y = g;
                 c.falling = None;
+                // Down, it stands in the way: a box round its model.
+                if let Some(m) = self.models.get(&c.model).and_then(Option::as_ref) {
+                    let (lo, hi) = m.gpu.bounds;
+                    let turn = Quat::from_rotation_y(c.yaw);
+                    physics.add_static(
+                        StaticKey::Entity(c.guid),
+                        &CollisionShape::cuboid((hi - lo) * 0.5),
+                        c.at + turn * ((lo + hi) * 0.5),
+                        turn,
+                    );
+                }
             }
         }
         self.flights.retain(|f| {
