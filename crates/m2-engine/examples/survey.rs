@@ -85,6 +85,13 @@
 //!                           whose values name bank sounds or clip cues;
 //!                           templates named like a cue; and how many of
 //!                           each bank's sounds the database names
+//! strings:<word>[,..]       the scripts' string constants holding a word,
+//!                           by script (hash, name if known, how many
+//!                           strings it has, the globals it sets), each
+//!                           cut at 100 characters
+//! text:<word>[,..]          the English string table's entries holding a
+//!                           word: key, its name if known, the text (cut
+//!                           at 100 characters); 200 at most
 //! soundnames[:<bank>,..]    names for banks' sounds (default fol_shared,
 //!                           collision_shared, destruction_shared and the
 //!                           resident stream 7871f925) built of a prefix,
@@ -105,13 +112,16 @@ use std::path::Path;
 
 use m2_assets::animation::ANIMATION_TYPE;
 use m2_assets::layer::{LAYER_TYPE, STRING_FIELD, TEMPLATE_DB_TYPE};
+use m2_assets::lua::{Chunk, SCRIPT_TYPE};
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::scatter::SCATTER_TYPE;
 use m2_assets::sound::SOUND_BANK_TYPE;
+use m2_assets::strings::STRINGS_TYPE;
 use m2_assets::terrain::{LOW_RES_TYPE, TERRAIN_TYPE};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{
-    BlockContents, Clip, Layer, Model, Scatter, SoundBank, StreamIndex, TerrainCell, Texture,
+    BlockContents, Clip, Layer, Model, Scatter, SoundBank, StreamIndex, StringTable, TerrainCell,
+    Texture,
 };
 use m2_engine::anim::{BoundClip, Skeleton};
 use m2_engine::assets::TEXTURE_TYPE;
@@ -755,6 +765,8 @@ fn main() -> Result<(), Error> {
             "cues" => cues(&mut source, &names, arg),
             "sounddb" => sounddb(&mut source, &names, arg),
             "soundnames" => soundnames(&mut source, &names, arg),
+            "strings" => script_strings(&mut source, &names, arg),
+            "text" => texts(&mut source, &names, arg),
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -769,6 +781,132 @@ fn main() -> Result<(), Error> {
         if let Err(e) = result {
             println!("{section}: {e}");
         }
+    }
+    Ok(())
+}
+
+/// The words of a section's argument, lower case.
+fn words_of(arg: &str) -> Vec<String> {
+    arg.split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// `s` cut at `n` characters.
+fn cut(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}..", &s[..i]),
+        None => s.to_owned(),
+    }
+}
+
+/// The scripts' string constants holding a word, by script.
+fn script_strings<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words = words_of(arg);
+    let index = source.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == SCRIPT_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let (mut seen, mut found) = (HashSet::new(), 0);
+    for b in blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != SCRIPT_TYPE || !seen.insert(e.name_hash) {
+                continue;
+            }
+            let Ok(chunk) = Chunk::from_asset(data) else {
+                continue;
+            };
+            let strings = chunk.main.strings();
+            let hits: Vec<String> = strings
+                .iter()
+                .filter(|s| {
+                    let l = s.to_ascii_lowercase();
+                    words.iter().any(|w| l.contains(w))
+                })
+                .map(|s| cut(s, 100))
+                .collect();
+            if hits.is_empty() {
+                continue;
+            }
+            found += 1;
+            let mut sets: Vec<String> = chunk
+                .main
+                .names(chunk.version)
+                .into_iter()
+                .filter(|(u, _)| *u == m2_assets::lua::NameUse::SetGlobal)
+                .map(|(_, n)| n)
+                .collect();
+            sets.sort();
+            sets.dedup();
+            let more = sets.len().saturating_sub(12);
+            sets.truncate(12);
+            println!(
+                "  script {:08x} {} ({} strings; sets {}{}):",
+                e.name_hash,
+                names.show(e.name_hash),
+                strings.len(),
+                sets.join(" "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            );
+            for h in hits {
+                println!("    {h}");
+            }
+        }
+    }
+    println!("scripts holding a word: {found} of {}", seen.len());
+    Ok(())
+}
+
+/// The English string table's entries holding a word.
+fn texts<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words = words_of(arg);
+    let english = m2_assets::name_hash("english");
+    let index = source.archive().index();
+    if !index
+        .assets()
+        .iter()
+        .any(|a| index.type_hash(a) == STRINGS_TYPE && a.name_hash == english)
+    {
+        println!("no english string table");
+        return Ok(());
+    }
+    let table = StringTable::parse(&source.asset(english, STRINGS_TYPE)?)?;
+    let mut hits: Vec<(u32, &str)> = table
+        .strings
+        .iter()
+        .filter(|(_, t)| {
+            let l = t.to_lowercase();
+            words.iter().any(|w| l.contains(w))
+        })
+        .map(|(&k, t)| (k, t.as_str()))
+        .collect();
+    hits.sort_unstable();
+    println!(
+        "entries holding a word: {} of {}",
+        hits.len(),
+        table.strings.len()
+    );
+    for (k, t) in hits.iter().take(200) {
+        println!("  {k:08x} {} {}", names.show(*k), cut(t, 100));
     }
     Ok(())
 }

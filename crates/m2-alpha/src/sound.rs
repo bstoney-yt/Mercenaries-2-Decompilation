@@ -875,6 +875,7 @@ impl GameAudio {
                 Sound::Shot(at) => (0, at, 0.9),
                 Sound::Launch(at) => (1, at, 1.0),
                 Sound::Explosion(at) => (2, at, 1.4),
+                Sound::Bomb(at) => (2, at, 2.5),
                 Sound::Cannon(at) => (3, at, 1.3),
                 Sound::Lob(at) => (4, at, 1.0),
             };

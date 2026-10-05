@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{CatalogueEntry, Physics, StaticKey, VehicleControls, VehicleSpec, World};
-use m2_math::glam::{Mat4, Quat, Vec3, Vec4Swizzles};
+use m2_math::glam::{Mat4, Quat, Vec2, Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
@@ -18,6 +18,7 @@ use crate::props::Props;
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
 use crate::startup::Startup;
+use crate::support::{self, Call, Impact, Support};
 use crate::ui::HudInfo;
 
 /// Where a vehicle of the layers stands.
@@ -71,6 +72,10 @@ const FLING: f32 = 1.1;
 const FLING_UP: f32 = 1.0;
 const TOPPLE: f32 = 0.3;
 
+/// A bomb lands on what it first meets falling from this far above her
+/// (metres).
+const BOMB_DROP: f32 = 600.0;
+
 #[derive(Debug)]
 pub struct Game {
     pub scene: Scene,
@@ -99,6 +104,10 @@ pub struct Game {
     pub throttle: f32,
     /// Seconds to the next puffs of spray off boats going fast.
     spray_wait: f32,
+    /// Her support: the items she holds and the call under way; her
+    /// health when it last stepped (hurt, a call is called off).
+    pub support: Support,
+    support_hp: f32,
 }
 
 impl Game {
@@ -118,6 +127,8 @@ impl Game {
             props_up: false,
             throttle: 0.0,
             spray_wait: 0.0,
+            support: Support::default(),
+            support_hp: 0.0,
         }
     }
 
@@ -277,6 +288,7 @@ impl Game {
     pub fn step(&mut self, intent: Intent, dt: f32) {
         self.startup_props();
         self.fetch_world_vehicles(dt);
+        let intent = self.call_support(intent, dt);
         // The use key at what lies within reach: taken with the fight's.
         let mut taking = false;
         let scene = &mut self.scene;
@@ -483,7 +495,13 @@ impl Game {
             world
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
-            blast_loose(world, &mut scene.props, &self.combat.went_off);
+            blast_loose(
+                world,
+                &mut scene.props,
+                &self.combat.went_off,
+                combat::REACH,
+                false,
+            );
             // A supply crate broken open: a puff of dust off its boards.
             let broken = scene.flights.strike(
                 &mut world.physics,
@@ -514,7 +532,92 @@ impl Game {
                 );
             }
         }
+        self.support_impacts();
         self.scene.tick(dt);
+    }
+
+    /// Her support call this tick ([`crate::support`]): on foot, the
+    /// support key, the use key and fire go to it while it is under way,
+    /// and the view's steering; what is left of `intent` is hers.
+    fn call_support(&mut self, mut intent: Intent, dt: f32) -> Intent {
+        let her = self
+            .scene
+            .player
+            .as_ref()
+            .filter(|p| self.on_foot && p.landed && p.driving.is_none() && !p.down);
+        let at = her
+            .map(|p| p.character.position)
+            .unwrap_or(self.camera.position);
+        let hp = self.combat.hp;
+        let call = match her {
+            Some(_) => Call {
+                menu: intent.trigger.support,
+                use_pressed: intent.use_pressed,
+                fire: intent.trigger.fire,
+                steer: intent.movement,
+                look: intent.look,
+                select: intent.trigger.select.is_some(),
+                hurt: hp < self.support_hp,
+            },
+            None => Call::default(),
+        };
+        self.support_hp = hp;
+        let before = self.support.busy();
+        // In a vehicle, down or flying the camera, a call is dropped.
+        if her.is_none() && self.support.phase != support::Phase::Idle {
+            self.support.phase = support::Phase::Idle;
+        }
+        self.support.step(call, at, dt);
+        self.combat.designator = self.support.holding() || self.support.looking().is_some();
+        if before || self.support.busy() {
+            // At the menu, the designator in her hands or looking through
+            // the satellite, she stands, and fire is the satellite's.
+            intent = Intent::default();
+        }
+        intent
+    }
+
+    /// What the support brought down this step: the bomb on what it
+    /// first meets at the spot, its blast through the fight, and what
+    /// comes loose thrown (the sturdy too).
+    fn support_impacts(&mut self) {
+        if self.support.landed.is_empty() {
+            return;
+        }
+        let scene = &mut self.scene;
+        let (Some(world), Some(player)) = (&mut scene.world, &mut scene.player) else {
+            return;
+        };
+        let high = player.character.position.y + BOMB_DROP;
+        for impact in self.support.landed.clone() {
+            let Vec2 { x, y: z } = impact.at();
+            let top = Vec3::new(x, high, z);
+            let at = world
+                .physics
+                .cast_ray(top, Vec3::NEG_Y, BOMB_DROP * 2.0)
+                .map_or(Vec3::new(x, player.character.position.y, z), |(d, _)| {
+                    top - Vec3::Y * d
+                });
+            let mut field = Field {
+                physics: &mut world.physics,
+                player,
+                people: &mut scene.people,
+                vehicles: &mut scene.vehicles,
+                arsenal: &scene.arsenal,
+                explosives: &mut scene.explosives,
+            };
+            match impact {
+                Impact::Bomb(_) => {
+                    eprintln!("support: the bomb lands at {at:.1}");
+                    self.combat.bomb(&mut field, at);
+                    blast_loose(world, &mut scene.props, &[at], combat::BOMB.0, true);
+                }
+                Impact::Final(_) => self.combat.final_strike(&mut field, at),
+            }
+            world
+                .destroyed
+                .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
+        }
     }
 
     /// The game as it stands, to save; `None` without an island or player.
@@ -700,11 +803,15 @@ impl Game {
                 .launcher_rounds
                 .filter(|_| self.combat.weapon == Weapon::GrenadeLauncher)
                 .map(|r| (r.clip, r.stored)),
-            prompt,
+            // Looking through the satellite, its own overlay is shown.
+            prompt: prompt.filter(|_| !self.support.busy()),
             driving,
-            crosshair,
-            can_enter,
+            crosshair: crosshair.filter(|_| self.support.looking().is_none()),
+            can_enter: can_enter.filter(|_| !self.support.busy()),
             loading,
+            support: self
+                .support
+                .hud(player.map_or(self.camera.position.y, |p| p.character.position.y)),
             ..HudInfo::default()
         }
     }
@@ -808,11 +915,22 @@ impl Game {
         }
     }
 
+    /// Where the frame is seen from: her camera (shaken by a bomb close
+    /// by), the satellite's while she looks through it, or the free one.
     pub fn view(&self, fov: f32, aspect: f32) -> View {
-        match self.walking() {
-            Some(p) => p.view(fov, aspect),
+        let mut view = match self.walking() {
+            Some(p) => match self.support.looking() {
+                Some(at) => support::satellite_view(at, p.character.position.y, aspect),
+                None => p.view(fov, aspect),
+            },
             None => self.camera.view(fov, aspect),
+        };
+        if let Some((a, b)) = self.support.shake_turn()
+            && self.support.looking().is_none()
+        {
+            view.view = Mat4::from_rotation_x(a) * Mat4::from_rotation_y(b) * view.view;
         }
+        view
     }
 }
 
@@ -1032,7 +1150,7 @@ fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle])
             let topple = Vec3::Y.cross(ahead.normalize_or_zero()) * (ahead.length() * TOPPLE);
             let knocked = match key {
                 StaticKey::Object(i) => world.knock(i, fling, topple),
-                StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple),
+                StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
                 _ => false,
             };
             if knocked {
@@ -1051,27 +1169,28 @@ fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle])
     }
 }
 
-/// Blasts knock loose what comes loose within their reach (as far as they
-/// hurt people), thrown out and up as people are, harder the nearer.
-fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3]) {
+/// Blasts knock loose what comes loose within `reach` (as far as they
+/// hurt people), thrown out and up as people are, harder the nearer; a
+/// support `strike`'s the sturdy too.
+fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32, strike: bool) {
     let thrown = |blast: Vec3, at: Vec3, d: f32| {
-        let near = (1.0 - d / combat::REACH).clamp(0.0, 1.0);
+        let near = (1.0 - d / reach).clamp(0.0, 1.0);
         let away = (at - blast).with_y(0.0).normalize_or(Vec3::X);
         let (out, up) = combat::BLAST_PUSH;
         let velocity = away * (out * near + 1.0) + Vec3::Y * (up * near + 1.0);
         (velocity, Vec3::Y.cross(away) * (TOPPLE * out * near))
     };
     for &at in blasts {
-        for (i, d) in world.loose_near(at, combat::REACH) {
+        for (i, d) in world.loose_near(at, reach) {
             let (velocity, spin) = thrown(at, world.index.objects[i].position, d);
             world.knock(i, velocity, spin);
         }
-        for (e, d) in props.loose_near(&world.physics, at, combat::REACH) {
+        for (e, d) in props.loose_near(&world.physics, at, reach, strike) {
             let Some(p) = props.get(e).map(|(p, _)| p.position) else {
                 continue;
             };
             let (velocity, spin) = thrown(at, p, d);
-            props.knock(&mut world.physics, e, velocity, spin);
+            props.knock(&mut world.physics, e, velocity, spin, strike);
         }
     }
 }
