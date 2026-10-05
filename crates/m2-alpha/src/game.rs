@@ -591,19 +591,21 @@ impl Game {
     }
 }
 
-/// The finishing pass, fitted to PC footage of the game's jungle (whole
-/// frame brightness, saturation, warmth and shade against sunlight
-/// measured on both): the game runs a tone map and grade of its own whose
-/// curve isn't known, and its atmosphere's `Tone_*` grade is neutral.
+/// The finishing pass, fitted to footage of the game: whole-frame
+/// brightness, saturation, warmth and shade against sunlight from PC
+/// footage of the jungle, held back where the strongest fit made the
+/// AMX-30 too dark and orange against console footage of it. The game runs
+/// a tone map and grade of its own whose curve isn't known, and its
+/// atmosphere's `Tone_*` grade is neutral.
 fn finish(lighting: &mut m2_render::Lighting) {
-    lighting.exposure = 0.8;
-    lighting.contrast = 1.5;
-    lighting.saturation = 1.6;
-    lighting.grade = Vec3::new(1.4, 0.92, 0.6);
+    lighting.exposure = 0.9;
+    lighting.contrast = 1.35;
+    lighting.saturation = 1.35;
+    lighting.grade = Vec3::new(1.25, 0.96, 0.74);
 }
 
 /// `M2_POST=exposure=0.8,bloom=0.35,threshold=1,contrast=1.3,
-/// saturation=1.6,grade=1.05/1/0.9,haze=1,inscatter=1,density=3` sets
+/// saturation=1.6,grade=1.05/1/0.9,haze=1,inscatter=1,density=4` sets
 /// the finishing pass and haze by hand (any subset; `haze` and `inscatter`
 /// scale the scattering and the light it adds, `density` replaces the
 /// air's thickness near the ground), for matching reference frames.

@@ -105,6 +105,9 @@ struct Varyings {
     @location(3) color: vec4<f32>,
     // xyz: world-space tangent (0: none), w: handedness
     @location(4) tangent: vec4<f32>,
+    // The air between eye and vertex, as the game computes it per vertex:
+    // rgb light it adds, a: fraction of the surface's light it keeps
+    @location(5) haze: vec4<f32>,
 };
 "#;
 
@@ -152,19 +155,27 @@ fn sky(r: vec3<f32>) -> vec3<f32> {
 // The surface colour rgb at p seen through the air from the eye: the
 // game's extinction and in-scattering, or plain exponential fog.
 fn haze(rgb: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
+    let h = haze_terms(p);
+    return rgb * h.a + h.rgb;
+}
+
+// What the air between the eye and p adds (rgb) and keeps (a).
+fn haze_terms(p: vec3<f32>) -> vec4<f32> {
     let d = distance(p, frame.eye.xyz);
     if !hazy() {
         if frame.sky.a <= 0.0 {
-            return rgb;
+            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
-        return mix(frame.sky.rgb, rgb, exp(-frame.sky.a * d));
+        let f = exp(-frame.sky.a * d);
+        return vec4<f32>(frame.sky.rgb * (1.0 - f), f);
     }
     // What the air takes away over d, and what it adds: the light the sky
     // shows along the same line (looking down, the sky at the horizon),
     // so distant land fades into the sky behind it.
     let e = exp(-(frame.rayleigh.rgb + frame.mie.rgb) * d * frame.scatter.x * frame.scatter.w);
     let r = (p - frame.eye.xyz) / max(d, 1e-3);
-    return rgb * e + sky(normalize(vec3<f32>(r.x, max(r.y, 0.0), r.z))) * (1.0 - e);
+    let keep = dot(e, vec3<f32>(0.3333));
+    return vec4<f32>(sky(normalize(vec3<f32>(r.x, max(r.y, 0.0), r.z))) * (1.0 - e), keep);
 }
 
 // What a reflection sees along r, standing in for the game's environment
@@ -343,7 +354,10 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         water_alpha = mix(opacity, 1.0, f);
         // Foam along the shore, within about 3 m of it as the game's.
         let pattern = base_texel.a * dot(base_texel.rgb, vec3<f32>(0.3333));
-        let foam = (1.0 - smoothstep(0.0, 3.0, depth)) * pattern * clamp(through * 2.0, 0.0, 1.0);
+        // Past a hundred metres or so surf is too fine to see; drawn there
+        // it would outline every shore.
+        let near = 1.0 - smoothstep(40.0, 150.0, dist);
+        let foam = (1.0 - smoothstep(0.0, 3.0, depth)) * pattern * clamp(through * 2.0, 0.0, 1.0) * near;
         rgb = mix(rgb, lit + ambient_light(vec3<f32>(0.0, 1.0, 0.0)), foam);
         water_alpha = max(water_alpha, foam);
     } else if material.params.y > 0.5 {
@@ -422,7 +436,13 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     }
     rgb = rgb + glow;
     if material.params.w > 0.5 {
-        rgb = haze(rgb, v.world_pos);
+        // Per vertex as the game's, except over the sea's few huge
+        // triangles.
+        if water {
+            rgb = haze(rgb, v.world_pos);
+        } else {
+            rgb = rgb * v.haze.a + v.haze.rgb;
+        }
     }
     // Bright highlights make glass more opaque, as the game's shaders have it.
     var alpha = clamp(max(base.a, dot(spec_light, vec3<f32>(0.299, 0.587, 0.114))), 0.0, 1.0);
@@ -582,6 +602,7 @@ fn vs_main(v: VertexIn, @builtin(instance_index) instance: u32) -> Varyings {{
     out.uv = {uv};
     out.color = {color};
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
+    out.haze = haze_terms(world.xyz);
     return out;
 }}
 "#
