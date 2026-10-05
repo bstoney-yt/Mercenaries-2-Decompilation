@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use m2_engine::{
@@ -36,12 +37,20 @@ struct PropModel {
 }
 
 /// The state layers' models in play.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Props {
     shown: HashMap<u32, Prop>,
-    /// By hash: `None` while loading, or when it failed.
+    /// By hash, once some shown prop wants it: `None` until it has loaded
+    /// (and when it failed).
     models: HashMap<u32, Option<PropModel>>,
-    loads: (Sender<Load>, Receiver<Load>),
+    /// Wanted, not yet asked of the loaders.
+    waiting: HashSet<u32>,
+    /// Asked of the loaders, not yet uploaded.
+    asked: HashSet<u32>,
+    /// Decoded, not yet uploaded.
+    decoded: Vec<Load>,
+    /// Started with the first model wanted.
+    loaders: Option<Loaders>,
     /// Models that failed to load.
     failed: HashSet<u32>,
 }
@@ -49,31 +58,35 @@ pub struct Props {
 /// How long uploading loaded models may take a frame (at least one is).
 const UPLOAD_BUDGET: Duration = Duration::from_millis(6);
 
-/// A model decoded on the loading thread, or why not.
+/// Threads decoding models.
+const LOADERS: usize = 3;
+
+/// How many models may be asked of the loaders and not yet uploaded:
+/// few, so that whatever is nearest when one finishes goes next. A start-up
+/// puts up thousands of props, and a mission's gate has to load while the
+/// player walks up to it, not after all of them.
+const IN_FLIGHT: usize = 8;
+
+/// A model decoded on a loading thread, or why not.
 type Load = (u32, Result<CpuModel, String>);
 
-impl Default for Props {
-    fn default() -> Self {
-        Self {
-            shown: HashMap::new(),
-            models: HashMap::new(),
-            loads: channel(),
-            failed: HashSet::new(),
-        }
-    }
+/// The loading threads: models are asked by hash and come back decoded.
+#[derive(Debug)]
+struct Loaders {
+    ask: Sender<u32>,
+    done: Receiver<Load>,
 }
 
 impl Props {
     /// Puts up the models of those of `entities` the state layers place
-    /// (others are ignored), loading their models on a thread. How many
-    /// were new.
+    /// (others are ignored); their models load nearest first as
+    /// [`Props::update`] goes. How many were new.
     pub fn show(
         &mut self,
         install: &Install,
         index: &WorldIndex,
         entities: impl IntoIterator<Item = u32>,
     ) -> usize {
-        let mut wanted = Vec::new();
         let mut added = 0;
         for e in entities {
             let Some(o) = index.state_objects.get(&e) else {
@@ -94,11 +107,11 @@ impl Props {
             added += 1;
             if let std::collections::hash_map::Entry::Vacant(slot) = self.models.entry(o.model) {
                 slot.insert(None);
-                wanted.push(o.model);
+                self.waiting.insert(o.model);
             }
         }
-        if !wanted.is_empty() {
-            load(install.clone(), wanted, self.loads.0.clone());
+        if !self.waiting.is_empty() && self.loaders.is_none() {
+            self.loaders = Some(Loaders::start(install));
         }
         added
     }
@@ -177,36 +190,94 @@ impl Props {
     }
 
     /// How many are shown, and of the models they use how many have
-    /// loaded, are loading and failed.
-    pub fn counts(&self) -> (usize, usize, usize, usize) {
+    /// loaded, are loading, wait to be loaded and failed.
+    pub fn counts(&self) -> (usize, usize, usize, usize, usize) {
         let loaded = self.models.values().filter(|m| m.is_some()).count();
-        let failed = self.failed.len();
         (
             self.shown.len(),
             loaded,
-            self.models.len() - loaded - failed,
-            failed,
+            self.asked.len(),
+            self.waiting.len(),
+            self.failed.len(),
         )
     }
 
-    /// Uploads models that have loaded (as many as fit in
-    /// [`UPLOAD_BUDGET`], at least one) and gives the props using them
-    /// their collision.
+    /// Uploads models that have loaded, nearest `focus` first (as many as
+    /// fit in [`UPLOAD_BUDGET`], at least one), gives the props using them
+    /// their collision, and asks the loaders for the nearest still wanted.
     pub fn update(
         &mut self,
         backend: &mut dyn RenderBackend,
         materials: &mut MaterialCache,
         source: &mut AssetSource<BufReader<File>>,
         physics: &mut Physics,
+        focus: Vec3,
     ) -> anyhow::Result<()> {
+        let Some(loaders) = &self.loaders else {
+            return Ok(());
+        };
+        self.decoded.extend(loaders.done.try_iter());
+        if self.decoded.is_empty() && (self.waiting.is_empty() || self.asked.len() >= IN_FLIGHT) {
+            return Ok(());
+        }
+        let near = self.nearness(focus);
+        let far = |hash: &u32| near.get(hash).copied().unwrap_or(f32::INFINITY);
         let started = Instant::now();
-        while let Ok((hash, cpu)) = self.loads.1.try_recv() {
+        while let Some(i) = (0..self.decoded.len())
+            .min_by(|&a, &b| far(&self.decoded[a].0).total_cmp(&far(&self.decoded[b].0)))
+        {
+            let (hash, cpu) = self.decoded.swap_remove(i);
+            self.asked.remove(&hash);
             self.upload(backend, materials, source, physics, hash, cpu)?;
             if started.elapsed() > UPLOAD_BUDGET {
                 break;
             }
         }
+        // A model no shown prop uses any more isn't wanted; showing one
+        // again wants it again.
+        let unwanted: Vec<u32> = self
+            .waiting
+            .iter()
+            .copied()
+            .filter(|h| !near.contains_key(h))
+            .collect();
+        for h in unwanted {
+            self.waiting.remove(&h);
+            self.models.remove(&h);
+        }
+        let room = IN_FLIGHT.saturating_sub(self.asked.len());
+        if room > 0 && !self.waiting.is_empty() {
+            let mut next: Vec<u32> = self.waiting.iter().copied().collect();
+            next.sort_by(|a, b| far(a).total_cmp(&far(b)));
+            for hash in next.into_iter().take(room) {
+                self.waiting.remove(&hash);
+                self.asked.insert(hash);
+                if let Some(loaders) = &self.loaders
+                    && loaders.ask.send(hash).is_err()
+                {
+                    // The loaders are gone: nothing more will load.
+                    self.asked.remove(&hash);
+                    self.failed.insert(hash);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// For each model not yet loaded, how far (squared) its nearest shown
+    /// prop is from `focus`.
+    fn nearness(&self, focus: Vec3) -> HashMap<u32, f32> {
+        let mut near = HashMap::new();
+        for p in self.shown.values() {
+            if !matches!(self.models.get(&p.model), Some(None)) {
+                continue;
+            }
+            let d = p.position.distance_squared(focus);
+            near.entry(p.model)
+                .and_modify(|n: &mut f32| *n = n.min(d))
+                .or_insert(d);
+        }
+        near
     }
 
     /// Uploads model `hash`, loaded (or not), and gives the props using it
@@ -261,32 +332,45 @@ impl Props {
     }
 }
 
-/// Decodes `models` (with their collision) on a thread, sending each.
-fn load(install: Install, models: Vec<u32>, tx: Sender<Load>) {
-    std::thread::spawn(move || {
-        let mut source = match install.open_world() {
-            Ok(s) => s,
-            Err(e) => {
-                for m in models {
-                    let _ = tx.send((m, Err(e.to_string())));
+impl Loaders {
+    /// Starts [`LOADERS`] threads, each reading `install` on its own and
+    /// decoding the models (with their collision) asked of it.
+    fn start(install: &Install) -> Self {
+        let (ask, asked) = channel::<u32>();
+        let asked = Arc::new(Mutex::new(asked));
+        let (tx, done) = channel();
+        for _ in 0..LOADERS {
+            let (install, asked, tx) = (install.clone(), asked.clone(), tx.clone());
+            std::thread::spawn(move || {
+                let mut source = install.open_world().map_err(|e| e.to_string());
+                loop {
+                    // Held only while waiting for the next ask.
+                    let next = match asked.lock() {
+                        Ok(asked) => asked.recv(),
+                        Err(_) => return,
+                    };
+                    // The game has quit.
+                    let Ok(m) = next else {
+                        return;
+                    };
+                    // One model that can't be read (even one that panics)
+                    // doesn't hold up the rest.
+                    let cpu = match &mut source {
+                        Ok(source) => std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            source
+                                .model(m)
+                                .and_then(|data| CpuModel::from_data(&data, 0))
+                                .map_err(|e| e.to_string())
+                        }))
+                        .unwrap_or_else(|_| Err("panicked while decoding".to_owned())),
+                        Err(e) => Err(e.clone()),
+                    };
+                    if tx.send((m, cpu)).is_err() {
+                        return;
+                    }
                 }
-                return;
-            }
-        };
-        for m in models {
-            // One model that can't be read (even one that panics) doesn't
-            // hold up the rest.
-            let cpu = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                source
-                    .model(m)
-                    .and_then(|data| CpuModel::from_data(&data, 0))
-                    .map_err(|e| e.to_string())
-            }))
-            .unwrap_or_else(|_| Err("panicked while decoding".to_owned()));
-            // The game may have quit meanwhile.
-            if tx.send((m, cpu)).is_err() {
-                return;
-            }
+            });
         }
-    });
+        Self { ask, done }
+    }
 }

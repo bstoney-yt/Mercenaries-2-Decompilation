@@ -509,9 +509,10 @@ impl MissionLink {
                 ));
             }
         }
-        let (shown, loaded, loading, failed) = game.scene.props.counts();
+        let (shown, loaded, loading, waiting, failed) = game.scene.props.counts();
         out.push(format!(
-            "props: {shown} shown; their models {loaded} loaded, {loading} loading, {failed} failed"
+            "props: {shown} shown; their models {loaded} loaded, {loading} loading, {waiting} \
+             waiting, {failed} failed"
         ));
         out
     }

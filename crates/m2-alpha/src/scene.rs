@@ -895,8 +895,13 @@ impl Scene {
             self.load_character(model, template);
         }
         if let (Some(world), Some(source)) = (&mut self.world, &mut self.source) {
-            self.props
-                .update(backend, &mut self.materials, source, &mut world.physics)?;
+            self.props.update(
+                backend,
+                &mut self.materials,
+                source,
+                &mut world.physics,
+                eye,
+            )?;
         }
         Ok(())
     }
