@@ -40,6 +40,7 @@ mod cache;
 mod camera;
 mod combat;
 mod config;
+mod flights;
 mod game;
 mod input;
 mod mission;
@@ -2266,6 +2267,7 @@ impl Running {
         self.audio.play_fight(&sounds);
         let engine = self.game.engine();
         self.audio.engine(engine, TICK.as_secs_f32());
+        self.audio.rotors(&self.game.scene.flights.sounding());
         let driving = self.game.driving().is_some();
         let mut remarks = self.game.combat.take_remarks();
         if driving && !self.was_driving {

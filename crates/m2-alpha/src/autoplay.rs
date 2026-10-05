@@ -73,6 +73,9 @@ const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
 const HOP: f32 = 25.0;
+/// A hop along her way goes at least this far, metres; a way ending
+/// nearer than that is passed over for the place itself.
+const HOP_LEAST: f32 = 8.0;
 /// A hop lands on the ground found from this far above the way's height
 /// there, down to this far below it, metres; else on the highest there.
 const HOP_ABOVE: f32 = 3.0;
@@ -963,9 +966,16 @@ impl Autoplay {
                 self.best = (f32::INFINITY, self.clock);
                 return false;
             }
-            // Ahead along her way.
+            // Ahead along her way, else (a way that ends where she is:
+            // round 86 hopped her 2 m twice by gate 1, to the floor she
+            // was on) straight at the place.
             let from = game.focus();
-            let to = self.way.as_mut().map_or(at, |w| w.route.steer(from, HOP).0);
+            let to = self
+                .way
+                .as_mut()
+                .map(|w| w.route.steer(from, HOP).0)
+                .filter(|to| (*to - from).with_y(0.0).length() >= HOP_LEAST)
+                .unwrap_or(at);
             self.hop(game, to, stuck);
             return true;
         }

@@ -15,7 +15,9 @@
 //! The models of the state layers they load (a mission's gates) stand
 //! while the layer is in, and break when the scripts' object dies: a gate
 //! to destroy breaks to a blast by it or a vehicle driven into it. Their
-//! helicopters, boats and supply drops are not shown yet.
+//! deliveries come by helicopter ([`crate::flights`]): the crate, the jeep
+//! and the tank hang under it until it lets go over the drop point. Their
+//! boats are not shown yet.
 //!
 //! The scripts' log goes to `m2-alpha-mission.log` beside the settings.
 
@@ -34,6 +36,7 @@ use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
 use crate::config::Config;
+use crate::flights::Load;
 use crate::game::{Game, get_out, place};
 use crate::scene::NOT_DRIVABLE;
 
@@ -141,6 +144,9 @@ struct Fleet {
     /// The one she was driving when the scripts moved it: she gets back in
     /// once it is placed again.
     reenter: Option<u32>,
+    /// Let go by a delivery's helicopter, falling from where they hung:
+    /// not placed afresh when the scripts move them to the drop point.
+    dropped: HashSet<u32>,
 }
 
 impl std::fmt::Debug for MissionLink {
@@ -231,6 +237,18 @@ impl MissionLink {
         let State::Running(mission) = &mut self.state else {
             return;
         };
+        // Deliveries fly on; the scripts hear of each load let go.
+        let focus = game.focus();
+        let scene = &mut game.scene;
+        if let Some(world) = &mut scene.world {
+            for r in scene
+                .flights
+                .step(dt, &mut world.physics, &mut scene.vehicles, focus)
+            {
+                self.vehicles.dropped.extend(r.dropped);
+                mission.arrived(r.pilot, r.to.to_array());
+            }
+        }
         if self.ashore > 0 && game.scene.player.as_ref().is_some_and(|p| p.landed) {
             self.ashore -= 1;
             // Thousands of rays a look: twice a second is plenty.
@@ -252,6 +270,9 @@ impl MissionLink {
                 && self.vehicles.reenter.is_none()
             {
                 mission.put_player(at.to_array());
+            }
+            for (g, at, yaw) in game.scene.flights.places(&game.scene.vehicles) {
+                mission.place(g, at.to_array(), yaw);
             }
             self.vehicles.sync(game, mission);
             for guid in game.scene.people.all_killed() {
@@ -305,6 +326,7 @@ impl MissionLink {
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
+                fly(game, mission, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
                 }
@@ -331,6 +353,7 @@ impl MissionLink {
             .map_or([0.0; 3], |p| p.character.position.to_array());
         match Mission::new(data, "Mattias", at) {
             Ok(mut mission) => {
+                mission.fly_deliveries();
                 for (name, code) in std::mem::take(&mut self.drivers) {
                     if let Err(e) = mission.run(&code, &name) {
                         self.write([format!("{name}: {e}")]);
@@ -794,6 +817,84 @@ fn break_props(game: &mut Game, mission: &Mission) {
     scene.props.hide(&mut world.physics, gone);
 }
 
+/// Starts the helicopter a delivery's pilot flies (an `Ai.Deliver` order)
+/// with what hangs from its winch, sends it home once it has let go (the
+/// scripts' `MoveTo`), and takes away crates the scripts remove. A
+/// delivery whose helicopter the scripts don't have arrives at once.
+fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
+    match c {
+        Command::Goal {
+            guid,
+            goal,
+            location: Some(to),
+            ..
+        } if goal == "Deliver" => {
+            let none = Templates::default();
+            let templates = game
+                .scene
+                .world
+                .as_ref()
+                .map_or(&none, |w| &w.index.template_db);
+            let catalogue = game
+                .scene
+                .catalogue
+                .as_ref()
+                .map_or(&[][..], |c| c.vehicles.as_slice());
+            let flight = {
+                let w = mission.world().borrow();
+                let copter = w.objects.get(guid).and_then(|o| o.vehicle).unwrap_or(*guid);
+                w.objects.get(&copter).map(|o| {
+                    let model = templates.get(&o.name).and_then(|t| t.model);
+                    let mut loads: Vec<Load> = w
+                        .winch
+                        .iter()
+                        .filter(|(_, c)| **c == Some(copter))
+                        .filter_map(|(&g, _)| {
+                            let name = &w.objects.get(&g)?.name;
+                            // A vehicle of theirs is the scene's; anything
+                            // else hangs as its template's model.
+                            let vehicle = !template_models(name, templates, catalogue).is_empty();
+                            Some(Load {
+                                guid: g,
+                                model: (!vehicle)
+                                    .then(|| templates.get(name).and_then(|t| t.model))
+                                    .flatten(),
+                            })
+                        })
+                        .collect();
+                    loads.sort_by_key(|l| l.guid);
+                    (copter, o.name.clone(), Vec3::from(o.position), model, loads)
+                })
+            };
+            match flight {
+                Some((copter, name, from, model, loads)) => {
+                    eprintln!(
+                        "mission: {name} flies a delivery from {from:.1} to {:.1}, model {}, \
+                         carrying {:?}",
+                        Vec3::from(*to),
+                        model.map_or("unknown".to_owned(), |m| format!("{m:08x}")),
+                        loads
+                    );
+                    game.scene
+                        .flights
+                        .start(copter, *guid, model, loads, from, Vec3::from(*to));
+                }
+                None => mission.arrived(*guid, *to),
+            }
+        }
+        Command::Goal {
+            guid,
+            goal,
+            location: Some(to),
+            ..
+        } if goal == "MoveTo" && game.scene.flights.flying(*guid) => {
+            game.scene.flights.send_home(*guid, Vec3::from(*to));
+        }
+        Command::Remove(guid) => game.scene.flights.removed(*guid),
+        _ => {}
+    }
+}
+
 /// Carries out a script command about the player, the scripts' vehicles
 /// or the layers they stream; true when it seated her in a vehicle the
 /// island doesn't show, so she stands where it is.
@@ -824,6 +925,8 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // A delivery's load let go: falling from where it hung.
+        Command::Move { guid, .. } if fleet.dropped.remove(guid) => return false,
         // Moved by the scripts: a vehicle is placed afresh where they now
         // say, with her back in it if she was driving it; a layer's model
         // just moves.
