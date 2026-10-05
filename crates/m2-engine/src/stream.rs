@@ -1378,7 +1378,12 @@ fn log_terrain(hash: u32, mesh: &TerrainMesh, gpu: &TerrainGpu, materials: &Mate
 /// mirrored sky darkening the far sea as the game's does). Against the PC
 /// clip's night bay the open sea already matched but the far sea was a
 /// third too dark: the mirrored sky raised it 2.4 per 0.1 (PC round Y,
-/// 21.5 at 0.3, 28.7 at 0.6, against 31.9), so it is 0.7. `M2_SEA` sets
+/// 21.5 at 0.3, 28.7 at 0.6, against 31.9), so it is 0.7.
+/// The glint is tighter and stronger (power 150, strength 2.5) than the
+/// earlier 40 and 1, which drew one smooth band: so it breaks into the
+/// hard-edged glitter of the clip's moonlit and sunset sea (PC round V:
+/// spread 59 and 76 against 64 and 80, its share of bright patches .23
+/// against .21). `M2_SEA` sets
 /// them as
 /// `reflection,r0,power,glint[,body[,sky[,waves[,fade]]]]`, `body`
 /// scaling the diffuse and ambient colours, `sky` the sky mirrored,
@@ -1402,8 +1407,8 @@ impl SeaConstants {
         let mut c = Self {
             reflection: 1.0,
             r0: 0.02,
-            power: 40.0,
-            glint: 1.0,
+            power: 150.0,
+            glint: 2.5,
             body: 0.7,
             sky: 0.7,
             waves: 1.0,
