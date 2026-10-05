@@ -1719,10 +1719,16 @@ fn collision<R: Read + Seek>(
             .and_then(|u| u.top_level(*b"PHY2"));
         let Some(p) = phy2.map(Phy2::parse) else {
             let cpu = m2_engine::CpuModel::from_data(&data, 0)?;
-            println!(
-                "  no PHY2: visible triangles stand in ({} collision)",
-                if cpu.collision.is_some() { "a" } else { "no" }
-            );
+            match &cpu.collision {
+                Some(c) => {
+                    let (lo, hi) = c.bounds();
+                    println!(
+                        "  no PHY2: {} visible triangles stand in, filling ({:.2} {:.2} {:.2}) to ({:.2} {:.2} {:.2})",
+                        c.triangles, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
+                    );
+                }
+                None => println!("  no PHY2, and nothing solid drawn: no collision"),
+            }
             continue;
         };
         let p = match p {
