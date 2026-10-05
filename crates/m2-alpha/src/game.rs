@@ -585,15 +585,28 @@ impl Game {
         if let Some(a) = self.scene.world.as_ref().and_then(|w| w.index.atmosphere) {
             a.apply(&mut view.lighting);
         }
+        finish(&mut view.lighting);
         post_override(&mut view.lighting);
         view
     }
 }
 
+/// The finishing pass, fitted to PC footage of the game's jungle (whole
+/// frame brightness, saturation, warmth and shade against sunlight
+/// measured on both): the game runs a tone map and grade of its own whose
+/// curve isn't known, and its atmosphere's `Tone_*` grade is neutral.
+fn finish(lighting: &mut m2_render::Lighting) {
+    lighting.exposure = 0.8;
+    lighting.contrast = 1.5;
+    lighting.saturation = 1.6;
+    lighting.grade = Vec3::new(1.4, 0.92, 0.6);
+}
+
 /// `M2_POST=exposure=0.8,bloom=0.35,threshold=1,contrast=1.3,
-/// saturation=1.6,grade=1.05/1/0.9,haze=1` sets the finishing pass and
-/// haze by hand (any subset, `haze` scaling the scattering), for matching
-/// reference frames.
+/// saturation=1.6,grade=1.05/1/0.9,haze=1,inscatter=1,density=3` sets
+/// the finishing pass and haze by hand (any subset; `haze` and `inscatter`
+/// scale the scattering and the light it adds, `density` replaces the
+/// air's thickness near the ground), for matching reference frames.
 fn post_override(lighting: &mut m2_render::Lighting) {
     static POST: std::sync::OnceLock<Vec<(String, Vec<f32>)>> = std::sync::OnceLock::new();
     let settings = POST.get_or_init(|| {
@@ -620,7 +633,8 @@ fn post_override(lighting: &mut m2_render::Lighting) {
                 lighting.haze.rayleigh *= *x;
                 lighting.haze.mie *= *x;
             }
-            ("inscatter", [x]) => lighting.haze.inscattering = *x,
+            ("inscatter", [x]) => lighting.haze.inscattering *= *x,
+            ("density", [x]) => lighting.haze.density = *x,
             _ => {}
         }
     }

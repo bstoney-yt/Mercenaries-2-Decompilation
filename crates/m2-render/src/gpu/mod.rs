@@ -1672,7 +1672,7 @@ impl WgpuBackend {
                 l.haze.extinction,
                 l.haze.rayleigh_height,
                 l.haze.mie_height,
-                0.0,
+                l.haze.density,
             ],
         };
         self.queue
