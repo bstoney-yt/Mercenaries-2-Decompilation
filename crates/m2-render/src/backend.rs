@@ -155,6 +155,10 @@ pub struct ToneMap {
     pub retention: f32,
     pub contrast_limit: f32,
     pub contrast: f32,
+    /// Adapt to the frame's geometric mean luminance (of display values)
+    /// rather than, as the game's post shaders appear to, the plain mean
+    /// of the luminance of display values raised to 0.4.
+    pub log_average: bool,
 }
 
 /// Metres of water the eye looks through at the end of the depth colour
