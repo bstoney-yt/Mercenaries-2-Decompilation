@@ -126,6 +126,17 @@ pub enum Command {
     /// A call the game only needs to hear about: `"Pg.SaveGame"`,
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
+    /// The scripts gave the player a support item free
+    /// (`MrxSupportData.AddFreebie`): its key (`"VzaCon01_SatBomb"`), how
+    /// many, and the most she may hold, if they said.
+    Freebie {
+        key: String,
+        quantity: u32,
+        limit: Option<u32>,
+    },
+    /// The scripts took a free support item back
+    /// (`MrxSupportData.RemoveFreebie`), by its key.
+    RemoveFreebie(String),
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -397,6 +408,10 @@ fn guid_value(g: Option<u32>) -> Value {
 fn values<I: IntoIterator<Item = Value>>(v: I) -> mlua::Result<MultiValue> {
     Ok(MultiValue::from_iter(v))
 }
+
+/// The table of the game's own functions that hear the scripts' free
+/// support items (`AddFreebie`, `RemoveFreebie`).
+pub const SUPPORT_EARS: &str = "__m2_support";
 
 /// Installs the libraries over `world`. Functions not written here stay
 /// missing (or stubs, with `ScriptHost::stub_missing_globals`).
@@ -942,6 +957,29 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&pg, "LoadGame", |w, _, _| {
         w.commands.push(Command::Notify("Pg.LoadGame".into()));
         values([Value::Boolean(false)])
+    })?;
+
+    // The game's ears on the scripts' support items: `MrxSupportData`'s
+    // freebie calls are wrapped to call these as well
+    // (`Mission::start`), as (key, quantity, player, flag, limit) and
+    // (key).
+    let support = lib(SUPPORT_EARS)?;
+    add(&support, "AddFreebie", |w, _, a| {
+        if let Some(Value::String(key)) = a.first() {
+            w.commands.push(Command::Freebie {
+                key: key.to_string_lossy(),
+                quantity: num(a.get(1)).map_or(1, |q| q.max(0.0) as u32),
+                limit: num(a.get(4)).map(|l| l.max(0.0) as u32),
+            });
+        }
+        values([])
+    })?;
+    add(&support, "RemoveFreebie", |w, _, a| {
+        if let Some(Value::String(key)) = a.first() {
+            w.commands
+                .push(Command::RemoveFreebie(key.to_string_lossy()));
+        }
+        values([])
     })?;
 
     // Developer switches (skip to a mission, force a briefing): all off.

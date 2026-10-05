@@ -561,6 +561,8 @@ pub struct Trigger {
     /// The support key: the support menu opens or closes
     /// ([`crate::support`]).
     pub support: bool,
+    /// The PDA key: the PDA opens or closes.
+    pub pda: bool,
 }
 
 /// The fight's state.

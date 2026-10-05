@@ -44,6 +44,9 @@ pub enum Action {
     /// Open or close the support menu (her support items: the first
     /// contract's Satellite Guided Bomb).
     Support,
+    /// Open or close the PDA (the first contract has her look at it before
+    /// it gives her the bomb).
+    Pda,
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
@@ -87,6 +90,7 @@ impl Default for Bindings {
             (Rifle, vec![Digit1]),
             (Launcher, vec![Digit2]),
             (Support, vec![KeyT]),
+            (Pda, vec![KeyP]),
             (ToggleMouse, vec![Tab]),
             (Fullscreen, vec![F11]),
             (NextGait, vec![KeyN]),

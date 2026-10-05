@@ -33,6 +33,27 @@ use crate::script::{ScriptError, ScriptHost};
 /// The script that starts the game (`Init`, then `LoadGame`).
 pub const BOOTSTRAP: u32 = 0xb442_0059;
 
+/// The scripts' free support items (`MrxSupportData.AddFreebie`, as the
+/// first contract gives its Satellite Guided Bomb) reach the game too:
+/// each call goes on as it would, and the game hears of it
+/// ([`Command::Freebie`], [`Command::RemoveFreebie`]).
+const FOLLOW_FREEBIES: &str = r#"
+local data, ears = MrxSupportData, __m2_support
+if type(data) ~= "table" or type(data.AddFreebie) ~= "function" then
+    return false
+end
+local add, remove = data.AddFreebie, data.RemoveFreebie
+data.AddFreebie = function(...)
+    ears.AddFreebie(...)
+    return add(...)
+end
+data.RemoveFreebie = function(...)
+    ears.RemoveFreebie(...)
+    if type(remove) == "function" then return remove(...) end
+end
+return true
+"#;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MissionError {
     #[error("archive: {0}")]
@@ -365,6 +386,7 @@ impl Mission {
     /// then the step the engine runs once the GUI has loaded. The first
     /// contract's mission is then waiting at its start.
     pub fn start(&mut self) {
+        self.follow_freebies();
         let steps = [
             (
                 "skip mode",
@@ -380,6 +402,22 @@ impl Mission {
                     .push(format!("  {name}: {}", first_lines(&e.to_string())));
             }
         }
+    }
+
+    /// Has the scripts' free support items reach the game
+    /// ([`FOLLOW_FREEBIES`]); logs whether they can.
+    pub fn follow_freebies(&mut self) {
+        let followed = self
+            .host
+            .lua()
+            .load(FOLLOW_FREEBIES)
+            .set_name("=follow freebies")
+            .eval::<bool>();
+        self.log.push(match followed {
+            Ok(true) => "free support items: followed (MrxSupportData.AddFreebie)".to_owned(),
+            Ok(false) => "free support items: no MrxSupportData.AddFreebie to follow".to_owned(),
+            Err(e) => format!("free support items: {}", first_lines(&e.to_string())),
+        });
     }
 
     /// Advances game time by `dt` seconds: fires the events that are due
@@ -680,6 +718,58 @@ mod tests {
         assert_eq!(landing_zone("03_mar_airport_llz_playerone"), Some((3, 1)));
         assert_eq!(landing_zone("lz_helipad_playerone"), None);
         assert_eq!(landing_zone("06_gua_upperclass_playerone"), None);
+    }
+
+    #[test]
+    fn the_scripts_free_support_items_reach_the_game() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.follow_freebies();
+        assert!(m.take_log().iter().any(|l| l.contains("no MrxSupportData")));
+        m.run(
+            r#"
+            MrxSupportData = { tGiven = {} }
+            function MrxSupportData.AddFreebie(sKey, nQty, uPlayer, bFlag, nLimit)
+                local t = MrxSupportData.tGiven
+                t[sKey] = math.min((t[sKey] or 0) + nQty, nLimit or 99)
+            end
+            function MrxSupportData.RemoveFreebie(sKey)
+                MrxSupportData.tGiven[sKey] = nil
+            end
+            "#,
+            "support data",
+        )
+        .unwrap();
+        m.follow_freebies();
+        m.run(
+            r#"
+            MrxSupportData.AddFreebie("VzaCon01_SatBomb", 1, nil, nil, 1)
+            MrxSupportData.AddFreebie("VzaCon01_SatBomb", 1, nil, nil, 1)
+            assert(MrxSupportData.tGiven.VzaCon01_SatBomb == 1)
+            MrxSupportData.RemoveFreebie("VzaCon01_SatBomb")
+            assert(MrxSupportData.tGiven.VzaCon01_SatBomb == nil)
+            MrxSupportData.AddFreebie("Flare", 2)
+            "#,
+            "give",
+        )
+        .unwrap();
+        let bomb = || Command::Freebie {
+            key: "VzaCon01_SatBomb".into(),
+            quantity: 1,
+            limit: Some(1),
+        };
+        assert_eq!(
+            m.take_commands(),
+            [
+                bomb(),
+                bomb(),
+                Command::RemoveFreebie("VzaCon01_SatBomb".into()),
+                Command::Freebie {
+                    key: "Flare".into(),
+                    quantity: 2,
+                    limit: None
+                }
+            ]
+        );
     }
 
     #[test]
