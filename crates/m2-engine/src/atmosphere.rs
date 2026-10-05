@@ -297,12 +297,16 @@ impl Atmosphere {
                     contrast_limit: f(&["BloomContastLimit", "BloomContrastLimit"])?,
                     contrast: f(&["BloomContastMultiplier", "BloomContrastMultiplier"])?,
                     // `M2_LUMINANCE=log`: the geometric mean, as before;
-                    // a number raises the plain mean to it.
+                    // a number raises the plain mean to it; `=packed`
+                    // adapts to the mean of the codec's packed values,
+                    // which the game's shaders appear to read undecoded
+                    // (PC round E).
                     log_average: env_is("M2_LUMINANCE", "log"),
-                    average_power: std::env::var("M2_LUMINANCE")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1.0),
+                    average_power: match std::env::var("M2_LUMINANCE").as_deref() {
+                        Ok("packed") => 0.0,
+                        Ok(v) => v.parse().unwrap_or(1.0),
+                        Err(_) => 1.0,
+                    },
                 })
             })(),
             water_ramp: {
