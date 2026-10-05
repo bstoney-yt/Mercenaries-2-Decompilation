@@ -1049,8 +1049,12 @@ mod tests {
         info.support.satellite = None;
         info.support.wheel = None;
         hud.build(headless_input(800, 600, 0.1), &info, &mut config);
-        // The view's rulers, grain and wheel are many more shapes than the
-        // HUD on foot.
-        assert!(vertices(&hud) * 2 < viewing, "{} {viewing}", vertices(&hud));
+        // The view's rulers and wheel are more shapes than the HUD on foot
+        // (its grain is the post pass's).
+        assert!(
+            vertices(&hud) * 3 < viewing * 2,
+            "{} {viewing}",
+            vertices(&hud)
+        );
     }
 }
