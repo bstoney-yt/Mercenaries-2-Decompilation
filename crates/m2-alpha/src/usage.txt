@@ -24,6 +24,10 @@ m2-alpha [options]
                          nearest parked vehicle and drive it forward first
   --jump                 with --screenshot on the island: jump just before
                          the picture
+  --throw                with --screenshot on the island: throw a grenade
+                         just before the picture
+  --lead <s>             with --jump or --throw: seconds before the picture
+                         she starts (default 0.2)
   --fight                with --screenshot on the island: shoot the nearest
                          soldier, rocket a vehicle, throw a grenade first,
                          then look at the body
