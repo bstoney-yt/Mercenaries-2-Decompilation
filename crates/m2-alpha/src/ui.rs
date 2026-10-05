@@ -28,6 +28,14 @@ pub struct HudInfo {
     pub hp: f32,
     pub down: bool,
     pub weapon: Weapon,
+    /// What she carries in the launcher's place, if anything.
+    pub second: Option<Weapon>,
+    /// The rounds of the weapon up when it runs out (the grenade
+    /// launcher's): in its clip, and stored.
+    pub rounds: Option<(u32, u32)>,
+    /// What the use key takes from within reach, as the game words it
+    /// ("Equip Grenade Launcher", "Take Ammo").
+    pub prompt: Option<String>,
     /// Driving: the vehicle's name and speed (m/s), and whether it is
     /// wrecked.
     pub driving: Option<(String, f32, bool)>,
@@ -344,7 +352,15 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     } else {
         stand_in(&painter, screen, info, &text);
     }
-    if let Some(name) = &info.can_enter
+    if let Some(prompt) = &info.prompt {
+        text(
+            screen.center() + vec2(0.0, 60.0),
+            Align2::CENTER_TOP,
+            &format!("E: {prompt}"),
+            17.0,
+            white,
+        );
+    } else if let Some(name) = &info.can_enter
         && info.driving.is_none()
     {
         text(
@@ -423,14 +439,28 @@ fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             }
         }
         None => {
-            let weapon = match info.weapon {
-                Weapon::Rifle => "AK-47   ·   2 RPG   ·   G grenade",
-                Weapon::Rpg => "RPG   ·   1 rifle   ·   G grenade",
+            let name = |w: Weapon| match w {
+                Weapon::Rifle => "rifle",
+                Weapon::Rpg => "RPG",
+                Weapon::GrenadeLauncher => "grenade launcher",
+            };
+            let up = match (info.weapon, info.rounds) {
+                (Weapon::Rifle, _) => "Carbine".to_owned(),
+                (Weapon::Rpg, _) => "RPG".to_owned(),
+                (Weapon::GrenadeLauncher, Some((clip, stored))) => {
+                    format!("Grenade launcher {clip} | {stored}")
+                }
+                (Weapon::GrenadeLauncher, None) => "Grenade launcher".to_owned(),
+            };
+            let other = match (info.weapon, info.second) {
+                (Weapon::Rifle, Some(w)) => format!("   ·   2 {}", name(w)),
+                (Weapon::Rifle, None) => String::new(),
+                _ => "   ·   1 rifle".to_owned(),
             };
             text(
                 screen.right_bottom() + vec2(-24.0, -28.0),
                 Align2::RIGHT_BOTTOM,
-                weapon,
+                &format!("{up}{other}   ·   G grenade"),
                 18.0,
                 white,
             );

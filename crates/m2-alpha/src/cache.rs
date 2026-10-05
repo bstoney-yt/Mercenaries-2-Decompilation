@@ -9,13 +9,13 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use m2_engine::vehicle::WEAPONS;
+use m2_engine::vehicle::{NAMED_WEAPONS, WEAPONS};
 use m2_engine::{Catalogue, CatalogueEntry, PersonModel};
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `catalogue()` changes what it finds, so old caches are
 /// searched afresh.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const FILE_NAME: &str = "m2-alpha-catalogue.toml";
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -65,7 +65,10 @@ pub fn read(path: &Path, stamp: (u64, u64)) -> Option<Catalogue> {
         .into_iter()
         .map(|(name, model)| {
             // Names are kept 'static by matching the known weapons.
-            let &(known, _) = WEAPONS.iter().find(|(n, _)| *n == name)?;
+            let &(known, _) = WEAPONS
+                .iter()
+                .chain(&NAMED_WEAPONS)
+                .find(|(n, _)| *n == name)?;
             Some((known, model))
         })
         .collect::<Option<_>>()?;

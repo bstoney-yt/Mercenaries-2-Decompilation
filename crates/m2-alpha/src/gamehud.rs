@@ -35,7 +35,7 @@ use m2_game::mission::{GameData, Mission};
 use m2_math::glam::Vec3;
 use mlua::{IntoLuaMulti, Lua, Value};
 
-use crate::combat::{Combat, Fired, Picked, Weapon};
+use crate::combat::{Combat, Fired, Picked, Rounds, Weapon};
 use crate::config::Config;
 use crate::game::Game;
 
@@ -49,9 +49,13 @@ const PLAYER: u32 = 1;
 /// spawns, markers), so they name no other object.
 const RIFLE_GUID: u32 = 0x6000_0000;
 const RPG_GUID: u32 = 0x6000_0001;
-/// The guns' names, as the game's English strings write them.
-const RIFLE_NAME: &str = "Assault Rifle";
+const LAUNCHER_GUID: u32 = 0x6000_0002;
+/// The guns' names, as the game's English strings write them. Her rifle
+/// is the first contract's carbine (template 80007212), as the footage's
+/// gun box reads.
+const RIFLE_NAME: &str = "Carbine";
 const RPG_NAME: &str = "RPG";
+const LAUNCHER_NAME: &str = "Grenade Launcher";
 /// The ammo the counters show. The play never runs out: the rifle's clip,
 /// the rockets stored and the grenades count down and start again full;
 /// the rifle's store stays as it is.
@@ -61,11 +65,13 @@ const RPG_STORED: u32 = 4;
 const GRENADES: u32 = 4;
 /// The weapons' icons (`uNewCurrentGun`): textures of their own, as the
 /// game names them (`weapons_*`).
-const RIFLE_ICON: &str = "weapons_assault_rifle";
+const RIFLE_ICON: &str = "weapons_m4";
 const RPG_ICON: &str = "weapons_rpg";
+const LAUNCHER_ICON: &str = "weapons_grenade_launcher_2";
 /// Their reticles (`uReticleTexture`), `reticle_*` by the kind of round.
 const RIFLE_RETICLE: &str = "reticle_bullets";
 const RPG_RETICLE: &str = "reticle_rockets";
+const LAUNCHER_RETICLE: &str = "reticle_grenade";
 /// Seconds an objective message stays in the message buffer, as
 /// `DisplayObjectiveMessage` asks.
 const MESSAGE_SECONDS: f64 = 5.0;
@@ -115,6 +121,8 @@ pub struct HudState {
     pub fired: Fired,
     /// Rounds picked up (a supply crate's rockets).
     pub picked: Picked,
+    /// The grenade launcher's rounds, while she carries one.
+    pub launcher: Option<Rounds>,
     /// The label of the vehicle she is in.
     pub vehicle: Option<String>,
     /// Which way the camera looks, degrees, growing as it turns left
@@ -180,6 +188,7 @@ impl HudState {
             weapon: game.combat.weapon,
             fired: game.combat.fired,
             picked: game.combat.picked,
+            launcher: game.combat.launcher_rounds,
             vehicle: vehicle.map(|v| v.spec.label.clone()),
             heading: game.camera.yaw.to_degrees(),
             target,
@@ -582,7 +591,11 @@ impl Thread {
         // Her guns, for the gun box to name.
         {
             let mut world = mission.world().borrow_mut();
-            for (guid, name) in [(RIFLE_GUID, RIFLE_NAME), (RPG_GUID, RPG_NAME)] {
+            for (guid, name) in [
+                (RIFLE_GUID, RIFLE_NAME),
+                (RPG_GUID, RPG_NAME),
+                (LAUNCHER_GUID, LAUNCHER_NAME),
+            ] {
                 world.insert(guid, Object::new(name, [0.0; 3]));
             }
         }
@@ -711,6 +724,7 @@ impl Thread {
             let (icon, guid, reticle) = match s.weapon {
                 Weapon::Rifle => (RIFLE_ICON, RIFLE_GUID, RIFLE_RETICLE),
                 Weapon::Rpg => (RPG_ICON, RPG_GUID, RPG_RETICLE),
+                Weapon::GrenadeLauncher => (LAUNCHER_ICON, LAUNCHER_GUID, LAUNCHER_RETICLE),
             };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
@@ -730,7 +744,7 @@ impl Thread {
             )?;
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
         }
-        let ammo = ammo(s.weapon, s.fired, s.picked);
+        let ammo = ammo(s.weapon, s.fired, s.picked, s.launcher);
         if self.told.ammo != Some(ammo) {
             self.told.ammo = Some(ammo);
             let names = [
@@ -909,8 +923,9 @@ fn reticle_widgets(screen: &gui_runtime::Screen) -> HashSet<u32> {
 
 /// Clip, in the clip, stored, grenades, grenades stored: as
 /// `GuiAmmoUpdate` takes them. Rounds picked up add to the stores; the
-/// rockets count down from that and, run out, start again full.
-fn ammo(weapon: Weapon, fired: Fired, picked: Picked) -> [u32; 5] {
+/// rockets count down from that and, run out, start again full. The
+/// grenade launcher's are its own (`launcher`: in the clip, stored).
+fn ammo(weapon: Weapon, fired: Fired, picked: Picked, launcher: Option<Rounds>) -> [u32; 5] {
     let grenades = GRENADES - fired.grenades % GRENADES;
     match weapon {
         Weapon::Rifle => [
@@ -923,6 +938,16 @@ fn ammo(weapon: Weapon, fired: Fired, picked: Picked) -> [u32; 5] {
         Weapon::Rpg => {
             let stock = RPG_STORED + picked.rockets;
             [1, 1, stock - fired.rockets % stock, grenades, 0]
+        }
+        Weapon::GrenadeLauncher => {
+            let r = launcher.unwrap_or_default();
+            [
+                Weapon::GrenadeLauncher.clip(),
+                r.clip,
+                r.stored,
+                grenades,
+                0,
+            ]
         }
     }
 }
@@ -1274,24 +1299,39 @@ mod tests {
             grenades,
         };
         let none = Picked::default();
-        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 0), none)[1], 30);
-        assert_eq!(ammo(Weapon::Rifle, fired(29, 0, 0), none)[1], 1);
-        assert_eq!(ammo(Weapon::Rifle, fired(30, 0, 0), none)[1], 30);
+        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 0), none, None)[1], 30);
+        assert_eq!(ammo(Weapon::Rifle, fired(29, 0, 0), none, None)[1], 1);
+        assert_eq!(ammo(Weapon::Rifle, fired(30, 0, 0), none, None)[1], 30);
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 0, 0), none)[..3],
+            ammo(Weapon::Rpg, fired(0, 0, 0), none, None)[..3],
             [1, 1, RPG_STORED]
         );
-        assert_eq!(ammo(Weapon::Rpg, fired(0, 1, 0), none)[2], RPG_STORED - 1);
-        assert_eq!(ammo(Weapon::Rpg, fired(0, 4, 0), none)[2], RPG_STORED);
-        assert_eq!(ammo(Weapon::Rifle, fired(0, 0, 1), none)[3], GRENADES - 1);
+        assert_eq!(
+            ammo(Weapon::Rpg, fired(0, 1, 0), none, None)[2],
+            RPG_STORED - 1
+        );
+        assert_eq!(ammo(Weapon::Rpg, fired(0, 4, 0), none, None)[2], RPG_STORED);
+        assert_eq!(
+            ammo(Weapon::Rifle, fired(0, 0, 1), none, None)[3],
+            GRENADES - 1
+        );
         // A crate's 20 rockets after three fired: 21 left.
         let crate_ = Picked {
             rockets: 20,
             ..Picked::default()
         };
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 3, 0), crate_)[2],
+            ammo(Weapon::Rpg, fired(0, 3, 0), crate_, None)[2],
             RPG_STORED + 17
+        );
+        // The launcher's own rounds: "6 / 12" as the crate gives it.
+        let launcher = Some(Rounds {
+            clip: 6,
+            stored: 12,
+        });
+        assert_eq!(
+            ammo(Weapon::GrenadeLauncher, fired(0, 0, 0), none, launcher)[..3],
+            [6, 6, 12]
         );
     }
 

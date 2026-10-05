@@ -17,6 +17,8 @@ use m2_engine::audio::{EngineSounds, Falloff, Play, SoundLibrary};
 use m2_engine::{Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
 use crate::combat::{Remark, Sound};
+use crate::scene::Cue;
+use m2_assets::name_hash;
 use m2_math::glam::Vec3;
 
 /// The mixer, and the device stream playing it (none where there is no
@@ -130,7 +132,7 @@ pub struct GameAudio {
     next_track: usize,
     decoded: (Sender<Decoded>, Receiver<Decoded>),
     /// Rifle shot, rocket launch, explosion.
-    fight: [Option<SoundBuffer>; 4],
+    fight: [Option<SoundBuffer>; 5],
     /// Short sounds of the town (`amb_citymed`) and the jungle
     /// (`amb_jungle`) played now and then around the listener.
     ambient: [Vec<SoundBuffer>; 2],
@@ -157,6 +159,82 @@ pub struct GameAudio {
     speaking: Vec<Instant>,
     /// When Jennifer may speak again.
     quiet_until: Instant,
+    /// The sounds the clips' events play, once read (on a thread).
+    clip_sounds: Option<ClipSounds>,
+    clip_sounds_loading: Option<Receiver<ClipSounds>>,
+}
+
+/// Banks the clips' sound events are found in, by name: the resident
+/// foley (`fol_rustle_human_02`, `fol_grenade_sidethrow_01`, ...).
+const CUE_BANKS: [&str; 1] = ["fol_shared"];
+/// Endings a cue's sounds carry besides none: its variants (round 91's
+/// survey found `_01` to `_04`).
+const CUE_VARIANTS: usize = 12;
+/// How loud the clips' sounds play, and how far they carry.
+const CUE_GAIN: f32 = 0.55;
+const CUE_FALLOFF: Falloff = Falloff {
+    near: 2.0,
+    far: 35.0,
+};
+/// Most clip sounds started in one tick.
+const CUES_AT_ONCE: usize = 6;
+
+/// The sounds the clips' sound events play: an event's name, bare or with
+/// a variant's ending (`fol_rustle_human_02`), among [`CUE_BANKS`]'
+/// sounds.
+#[derive(Debug, Default)]
+pub struct ClipSounds {
+    by_hash: HashMap<u32, SoundBuffer>,
+    /// Each name's sounds, by its hash, once looked for.
+    found: HashMap<u32, Vec<SoundBuffer>>,
+}
+
+impl ClipSounds {
+    /// Reads [`CUE_BANKS`] from the install's world archive.
+    pub fn load(install: &Install) -> Self {
+        let hashes: Vec<u32> = CUE_BANKS.iter().map(|b| name_hash(b)).collect();
+        let library = install
+            .open_world()
+            .map(|mut source| SoundLibrary::load_banks(&mut source, &hashes))
+            .unwrap_or_default();
+        let by_hash = hashes
+            .iter()
+            .filter_map(|&h| library.bank_hash(h))
+            .flat_map(|(_, sounds)| sounds.iter().map(|s| (s.hash, s.clone())))
+            .collect();
+        Self::new(by_hash)
+    }
+
+    fn new(by_hash: HashMap<u32, SoundBuffer>) -> Self {
+        Self {
+            by_hash,
+            found: HashMap::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+
+    /// The sounds event `name` plays: itself and its variants (`_01`,
+    /// `_1`, `01`, ...) that the banks hold. Empty when none.
+    pub fn sounds(&mut self, name: &str) -> &[SoundBuffer] {
+        let by_hash = &self.by_hash;
+        self.found.entry(name_hash(name)).or_insert_with(|| {
+            let mut names = vec![name.to_owned()];
+            for n in 1..=CUE_VARIANTS {
+                names.push(format!("{name}_{n:02}"));
+                names.push(format!("{name}_{n}"));
+                names.push(format!("{name}{n:02}"));
+            }
+            let mut out: Vec<SoundBuffer> = names
+                .iter()
+                .filter_map(|n| by_hash.get(&name_hash(n)).cloned())
+                .collect();
+            out.dedup_by_key(|s| s.hash);
+            out
+        })
+    }
 }
 
 /// A decoded voice line: the sound, where it is said (`None` flat: the
@@ -382,7 +460,7 @@ pub fn log_tank_gun(install: &Install) {
 }
 
 /// Sounds read from the banks: the fight's and the ambient one-shots.
-type BankSounds = ([Option<SoundBuffer>; 4], [Vec<SoundBuffer>; 2]);
+type BankSounds = ([Option<SoundBuffer>; 5], [Vec<SoundBuffer>; 2]);
 
 /// The fight's sounds and the ambient one-shots.
 fn bank_sounds(install: &Install) -> BankSounds {
@@ -394,6 +472,7 @@ fn bank_sounds(install: &Install) -> BankSounds {
                 "wpn_rpg",
                 "support_artillery",
                 "wpn_tankgun",
+                "wpn_grenadelauncher",
                 "amb_citymed",
                 "amb_jungle",
             ],
@@ -418,6 +497,14 @@ fn bank_sounds(install: &Install) -> BankSounds {
                         s.channels == 1 && (1.5..=3.0).contains(&s.seconds())
                     }),
                     tank_gun(&l),
+                    // The launcher's thump: its loudest short sound.
+                    pick(&l, "wpn_grenadelauncher", |s| s.seconds() < 1.2).inspect(|s| {
+                        eprintln!(
+                            "sound: grenade launcher {:08x} ({:.2} s)",
+                            s.hash,
+                            s.seconds()
+                        )
+                    }),
                 ],
                 [short("amb_citymed"), short("amb_jungle")],
             )
@@ -578,6 +665,49 @@ impl GameAudio {
             said: channel(),
             speaking: Vec::new(),
             quiet_until: Instant::now(),
+            clip_sounds: None,
+            clip_sounds_loading: install.map(|install| {
+                let install = install.clone();
+                let (tx, rx) = channel();
+                std::thread::spawn(move || {
+                    let sounds = ClipSounds::load(&install);
+                    eprintln!("clip sounds: {} foley sounds", sounds.len());
+                    let _ = tx.send(sounds);
+                });
+                rx
+            }),
+        }
+    }
+
+    /// Plays what the clips' sound events ask for, where they happen (a
+    /// few a tick at most); events no sound answers stay silent.
+    pub fn play_cues(&mut self, cues: &[Cue]) {
+        if let Some(rx) = &self.clip_sounds_loading
+            && let Ok(c) = rx.try_recv()
+        {
+            self.clip_sounds = Some(c);
+            self.clip_sounds_loading = None;
+        }
+        let mut started = 0;
+        for cue in cues {
+            if started >= CUES_AT_ONCE {
+                break;
+            }
+            let pick = self.random();
+            let Some(sounds) = self.clip_sounds.as_mut() else {
+                return;
+            };
+            let list = sounds.sounds(&cue.name);
+            if list.is_empty() {
+                continue;
+            }
+            let buffer = list[((pick * list.len() as f32) as usize).min(list.len() - 1)].clone();
+            let play = Play {
+                falloff: CUE_FALLOFF,
+                ..Play::at(buffer, cue.at)
+            };
+            self.out.with(|m| m.play(play.gain(CUE_GAIN)));
+            started += 1;
         }
     }
 
@@ -746,6 +876,7 @@ impl GameAudio {
                 Sound::Launch(at) => (1, at, 1.0),
                 Sound::Explosion(at) => (2, at, 1.4),
                 Sound::Cannon(at) => (3, at, 1.3),
+                Sound::Lob(at) => (4, at, 1.0),
             };
             if let Some(buffer) = self.fight[i].clone() {
                 self.out.with(|m| m.play(Play::at(buffer, at).gain(gain)));
@@ -983,6 +1114,24 @@ mod tests {
         // Round 88's boat banks, by the hashes in the world archive.
         assert_eq!(bank_name(0xa3ca_3b95), Some("veh_boatracing"));
         assert_eq!(bank_name(0xad17_2ebf), Some("veh_boatjetski"));
+    }
+
+    #[test]
+    fn a_cue_plays_its_variants() {
+        let mut c = ClipSounds::new(
+            [
+                "fol_rustle_human_02",
+                "fol_grenade_sidethrow_01",
+                "fol_typing_01",
+                "fol_typing_02",
+            ]
+            .map(|n| (name_hash(n), sound(name_hash(n))))
+            .into(),
+        );
+        assert_eq!(c.sounds("fol_rustle_human").len(), 1);
+        assert_eq!(c.sounds("FOL_Typing").len(), 2);
+        assert!(c.sounds("footstep_walk").is_empty());
+        assert_eq!(c.found.len(), 3);
     }
 
     fn sound(hash: u32) -> SoundBuffer {

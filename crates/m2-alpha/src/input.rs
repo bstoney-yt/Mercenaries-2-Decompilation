@@ -37,7 +37,8 @@ pub enum Action {
     /// A melee bash with what she holds (also the middle mouse button,
     /// once the mouse is captured): opens a supply crate.
     Melee,
-    /// Take up the rifle, or the rocket launcher.
+    /// Take up the rifle, or what she carries in the launcher's place
+    /// (the RPG, or the grenade launcher once she has taken one up).
     Rifle,
     Launcher,
     /// Capture or release the mouse for looking around.

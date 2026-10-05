@@ -84,6 +84,9 @@ const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
 const MAX_FRAME: Duration = Duration::from_millis(250);
+/// How far off people's clip sounds (foley, footsteps) are heard, metres:
+/// as far as those sounds carry.
+const CUE_REACH: f32 = 35.0;
 
 #[derive(Debug, Default)]
 struct Options {
@@ -278,7 +281,8 @@ fn parse_args() -> anyhow::Result<Options> {
                 o.weapon = Some(match value()?.as_str() {
                     "rifle" => combat::Weapon::Rifle,
                     "rpg" => combat::Weapon::Rpg,
-                    v => bail!("--weapon {v}: expected rifle or rpg"),
+                    "gl" => combat::Weapon::GrenadeLauncher,
+                    v => bail!("--weapon {v}: expected rifle, rpg or gl"),
                 })
             }
             "--closeup" => o.closeup = true,
@@ -770,6 +774,11 @@ fn screenshot(
         let lead = (options.lead.unwrap_or(0.2) * 60.0)
             .round()
             .clamp(1.0, 179.0) as usize;
+        // The crate's grenade launcher, as she takes it up: three clips.
+        if options.weapon == Some(combat::Weapon::GrenadeLauncher) {
+            game.combat
+                .equip(combat::Weapon::GrenadeLauncher, 3 * combat::LAUNCHER_CLIP);
+        }
         for i in 0..180 {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
@@ -841,7 +850,7 @@ fn screenshot(
                 game.combat.grenade_in_hand(),
                 game.combat
                     .projectiles()
-                    .filter(|(rocket, ..)| !rocket)
+                    .filter(|(what, ..)| *what == combat::Flying::Grenade)
                     .count(),
                 p.bashing,
             );
@@ -958,6 +967,7 @@ fn describe_hold(game: &Game) -> Option<String> {
     let w = match game.combat.weapon {
         combat::Weapon::Rifle => arsenal.rifle.as_ref()?,
         combat::Weapon::Rpg => arsenal.rpg.as_ref()?,
+        combat::Weapon::GrenadeLauncher => arsenal.launcher.as_ref()?,
     };
     let (nodes, _) = rig.posed();
     let body = p.model_matrix();
@@ -1197,8 +1207,12 @@ fn mission_for_screenshot(
     // And what each crate broken open left, as soon as it lies there
     // (she takes it within a second or two), from 5 m off (`-pickupN`):
     // the crates seen, and the pictures due (tick, crate).
-    let mut opened: HashSet<u32> = HashSet::new();
-    let mut pickup_shots: Vec<(u32, u32)> = Vec::new();
+    let mut opened: HashSet<(u32, u32)> = HashSet::new();
+    // When to picture each, which, and its number.
+    let mut pickup_shots: Vec<(u32, (u32, u32), usize)> = Vec::new();
+    // The clips' sound events met, by category and name: how many hers,
+    // how many others' within earshot.
+    let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match &mut auto {
             Some(a) => {
@@ -1210,6 +1224,14 @@ fn mission_for_screenshot(
         };
         game.step(intent, tick);
         link.tick(game, tick);
+        for c in game.scene.take_cues(game.focus(), CUE_REACH) {
+            let e = heard.entry((c.category, c.name)).or_default();
+            if c.hers {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
         // Lost (round 88 went on 40 minutes at NaN): nothing more to see.
         if auto.is_some() && !game.focus().is_finite() {
             eprintln!(
@@ -1280,25 +1302,28 @@ fn mission_for_screenshot(
                 ashore_shot.get_or_insert(i + (3.0 / tick) as u32);
             }
             for p in game.scene.flights.pickups() {
-                if opened.insert(p.from) {
-                    pickup_shots.push((i + 1, p.from));
+                if opened.insert(p.key()) {
+                    pickup_shots.push((i + 1, p.key(), opened.len()));
                 }
             }
-            let due: Vec<u32> = pickup_shots
+            let due: Vec<((u32, u32), usize)> = pickup_shots
                 .iter()
                 .filter(|s| s.0 == i)
-                .map(|s| s.1)
+                .map(|s| (s.1, s.2))
                 .collect();
-            for from in due {
+            for (key, n) in due {
                 let lying = game
                     .scene
                     .flights
                     .pickups()
                     .iter()
-                    .find(|p| p.from == from)
+                    .find(|p| p.key() == key)
                     .copied();
                 let Some(p) = lying else {
-                    eprintln!("pickup picture: what the crate {from:#x} left was taken first");
+                    eprintln!(
+                        "pickup picture: the {:#x} the crate {:#x} left was taken first",
+                        key.1, key.0
+                    );
                     continue;
                 };
                 let away = (p.at - game.focus())
@@ -1306,7 +1331,6 @@ fn mission_for_screenshot(
                     .try_normalize()
                     .unwrap_or(m2_math::glam::Vec3::X);
                 let eye = p.at + away * 5.0 + m2_math::glam::Vec3::Y * 2.5;
-                let n = opened.len();
                 delivery_picture(
                     backend,
                     game,
@@ -1351,6 +1375,23 @@ fn mission_for_screenshot(
             );
             break;
         }
+    }
+    if auto.is_some() {
+        let mut sounds = sound::ClipSounds::load(install);
+        let rows: Vec<String> = heard
+            .iter()
+            .map(|((category, name), (hers, others))| {
+                format!(
+                    "{category}/{name} {hers}+{others} ({} sounds)",
+                    sounds.sounds(name).len()
+                )
+            })
+            .collect();
+        eprintln!(
+            "clip cues met (hers+others'; the sounds they play of {}): {}",
+            sounds.len(),
+            rows.join(", ")
+        );
     }
     if let Some(a) = &auto {
         eprintln!(
@@ -1818,7 +1859,7 @@ fn describe_vehicle_fire(game: &Game) {
             game.combat.shells(),
             game.combat
                 .projectiles()
-                .filter(|(rocket, ..)| *rocket)
+                .filter(|(what, ..)| *what == combat::Flying::Rocket)
                 .count()
         ),
         (Some(m), _, None) => eprintln!("drive: fire: muzzle {m:.2}, but no flash"),
@@ -2552,6 +2593,8 @@ impl Running {
         }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);
+        let cues = self.game.scene.take_cues(ear, CUE_REACH);
+        self.audio.play_cues(&cues);
         let engine = self.game.engine();
         self.audio.engine(engine, TICK.as_secs_f32());
         self.audio.rotors(&self.game.scene.flights.sounding());
