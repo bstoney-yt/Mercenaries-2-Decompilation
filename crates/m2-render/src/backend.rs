@@ -118,6 +118,28 @@ pub struct Lighting {
     /// The eye's adaptation to how bright the frame is; `None` keeps
     /// `exposure` as it is.
     pub adaptation: Option<Adaptation>,
+    /// The game's own adaptation and tone map, in place of `exposure`,
+    /// `contrast`, `saturation` and `adaptation` (`grade` still applies).
+    pub tone_map: Option<ToneMap>,
+}
+
+/// The game's adaptation and tone map, from its atmosphere's `Bloom*`
+/// settings and its post shaders: the frame's luminance `L`, held within
+/// `min..max`, is adapted to as `L * k` (`k` running from `min_key` to
+/// `max_key` with `ln L`), keeping `retention` of the last value each
+/// thirtieth of a second; luminance is scaled by `target` over that,
+/// compressed (`0.8 L / (0.7 + L)`), and the display value stretched as
+/// `limit + (v - limit) * contrast`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToneMap {
+    pub target: f32,
+    pub min: f32,
+    pub max: f32,
+    pub min_key: f32,
+    pub max_key: f32,
+    pub retention: f32,
+    pub contrast_limit: f32,
+    pub contrast: f32,
 }
 
 /// Metres of water the eye looks through at the end of the depth colour
@@ -236,6 +258,7 @@ impl Default for Lighting {
             clouds: Clouds::default(),
             water_ramp: None,
             adaptation: None,
+            tone_map: None,
         }
     }
 }
