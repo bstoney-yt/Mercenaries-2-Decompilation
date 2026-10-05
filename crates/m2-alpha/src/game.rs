@@ -996,7 +996,32 @@ impl Game {
         // clouds.
         if let Some(world) = &self.scene.world {
             if let Some(a) = world.index.atmosphere {
-                self.sky.current(&a).apply(&mut view.lighting);
+                let now = self.sky.current(&a);
+                now.apply(&mut view.lighting);
+                // `M2_ATMO_TRACE=on` logs the light about every half
+                // second, to follow a change between records.
+                if std::env::var("M2_ATMO_TRACE").is_ok_and(|v| v == "on") {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+                    let since = self.sky.since_change();
+                    let tick = (since * 2.0) as u32;
+                    if LAST.swap(tick, Ordering::Relaxed) != tick {
+                        eprintln!(
+                            "atmosphere trace {:.1} s into the change: light {:?} li {:.3} tone {:?} darkness {:.1} coverage {:.3} time {:.3} inscatter {:.2} mono {:?} sun {:?} eye {:?}",
+                            since,
+                            now.light_color,
+                            now.light_intensity,
+                            now.tone,
+                            now.cloud_darkness,
+                            now.coverage,
+                            now.light_time[0],
+                            now.inscattering,
+                            now.monochrome,
+                            now.sun_direction(),
+                            view.view.inverse().z_axis.truncate(),
+                        );
+                    }
+                }
             }
             view.lighting.clouds.noise = world.cloud_noise;
         }
