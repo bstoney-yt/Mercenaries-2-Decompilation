@@ -401,12 +401,14 @@ impl Atmosphere {
         // out towards the horizon.
         lighting.clouds.horizon_fade = env_is("M2_CLOUD_FADE", "on");
         lighting.clouds.opacity = 1.0;
-        // `M2_CLOUD_REACH` (metres) caps how far off the deck is taken to
-        // be for the air in front of it.
-        lighting.clouds.reach = std::env::var("M2_CLOUD_REACH")
+        // The air in front of the deck is reckoned no more than
+        // [`CLOUD_REACH`] deep, or `M2_CLOUD_REACH` metres (0: wherever the
+        // ray meets the deck).
+        let reach = std::env::var("M2_CLOUD_REACH")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .filter(|r| *r > 0.0);
+            .unwrap_or(CLOUD_REACH);
+        lighting.clouds.reach = (reach > 0.0).then_some(reach);
         // `M2_CLOUD_OPACITY` overrides how opaque the thickest cloud is.
         if let Some(o) = std::env::var("M2_CLOUD_OPACITY")
             .ok()
@@ -690,6 +692,14 @@ enum Lit {
 /// the night's top was 129, 115 and 89 against footage's 80 at 50, 110
 /// and 250, the town's sky 177, 168 and 153 against 140 and over).
 const CLOUD_MASS: f32 = 400.0;
+
+/// How deep the air in front of the cloud deck is reckoned (metres): the
+/// game's deck is a quad of some size, so near the horizon it is not the
+/// tens of kilometres away a plane would be. Fitted: at 4 km the night
+/// sky darkens only gently towards the horizon and far hills fade into
+/// it, as in footage of the mission's start (PC round N; unlimited, the
+/// horizon away from the moon was near black).
+const CLOUD_REACH: f32 = 4000.0;
 
 /// [`CLOUD_MASS`], or `M2_CLOUD_MASS` to fit it by hand.
 fn cloud_mass() -> f32 {
