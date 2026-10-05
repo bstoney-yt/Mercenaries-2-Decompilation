@@ -906,6 +906,8 @@ pub struct TerrainMesh {
     /// The ground surface (without skirts) for collision, relative to
     /// `origin`; built for full-detail cells only.
     pub collision: Option<CollisionShape>,
+    /// Triangles turned round to face the way their vertices' normals do.
+    pub flipped: usize,
 }
 
 /// Where a vertex's texture coordinate comes from.
@@ -1077,14 +1079,63 @@ impl TerrainMesh {
         }
     }
 
-    /// Lays `buckets` out as `indices` and `ranges`, by surface.
-    fn finish(&mut self, buckets: HashMap<usize, Vec<u32>>) {
+    /// Lays `buckets` out as `indices` and `ranges`, by surface, each
+    /// triangle wound to face the way its vertices' normals do.
+    fn finish(&mut self, mut buckets: HashMap<usize, Vec<u32>>) {
+        self.orient(&mut buckets);
         let mut order: Vec<_> = buckets.into_iter().filter(|b| !b.1.is_empty()).collect();
         order.sort_unstable_by_key(|b| b.0);
         for (surface, tris) in order {
             let first = self.indices.len() as u32;
             self.indices.extend(&tris);
             self.ranges.push((first, tris.len() as u32, surface));
+        }
+    }
+
+    /// Turns round the triangles wound against the rest: most of a mesh's
+    /// triangles face (by their winding) the way their vertices' normals
+    /// point, but some of the strips' triangles come out the other way
+    /// round, and culled as back faces they left holes in the ground (the
+    /// bank under sea2's lip) that collision, being two-sided, didn't have.
+    /// A triangle whose face is nearly edge-on to its normals is left be.
+    fn orient(&mut self, buckets: &mut HashMap<usize, Vec<u32>>) {
+        let vertex = |v: u32, at: usize| {
+            let o = v as usize * TERRAIN_STRIDE + at;
+            let f = |i: usize| {
+                f32::from_le_bytes(self.vertices[o + i..o + i + 4].try_into().expect("4 bytes"))
+            };
+            Vec3::new(f(0), f(4), f(8))
+        };
+        // Cosine between a triangle's face and its mean vertex normal.
+        let facing = |t: &[u32]| {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|v| vertex(v, 0));
+            let face = (b - a).cross(c - a).normalize_or_zero();
+            let normal =
+                (vertex(t[0], 12) + vertex(t[1], 12) + vertex(t[2], 12)).normalize_or_zero();
+            face.dot(normal)
+        };
+        let mut keys: Vec<usize> = buckets.keys().copied().collect();
+        keys.sort_unstable();
+        let way: f32 = keys
+            .iter()
+            .flat_map(|k| buckets[k].chunks_exact(3))
+            .map(|t| facing(t).signum())
+            .sum::<f32>()
+            .signum();
+        let mut flips = Vec::new();
+        for &k in &keys {
+            for (i, t) in buckets[&k].chunks_exact(3).enumerate() {
+                if facing(t) * way < -0.2 {
+                    flips.push((k, i));
+                }
+            }
+        }
+        self.flipped += flips.len();
+        for (k, i) in flips {
+            buckets
+                .get_mut(&k)
+                .expect("bucket")
+                .swap(i * 3 + 1, i * 3 + 2);
         }
     }
 
@@ -1330,6 +1381,23 @@ mod tests {
         assert_eq!(square_distance(c, 199.0, -150.0), 0.0);
         assert_eq!(square_distance(c, 300.0, 0.0), 100.0);
         assert!((square_distance(c, 230.0, 240.0) - 50.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn triangles_wound_against_the_rest_are_turned_round() {
+        let mut mesh = TerrainMesh::empty(Vec3::ZERO);
+        for (x, z) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+            for f in [x, 0.0, z, 0.0, 1.0, 0.0, 0.0, 0.0] {
+                mesh.vertices.extend(f.to_le_bytes());
+            }
+            mesh.vertices.extend([255, 0, 0, 0]);
+            mesh.vertices.extend([0u8; 16]);
+        }
+        // Two triangles one way round, the third the other.
+        let buckets = HashMap::from([(0, vec![0, 1, 2, 0, 2, 3, 0, 3, 2])]);
+        mesh.finish(buckets);
+        assert_eq!(mesh.flipped, 1);
+        assert_eq!(mesh.indices, vec![0, 1, 2, 0, 2, 3, 0, 2, 3]);
     }
 
     #[test]
