@@ -73,6 +73,10 @@ pub struct Atmosphere {
     /// `Tone_R`, `Tone_G`, `Tone_B`: among the cloud settings (between
     /// `ShadowK` and `LightBlend`), so taken as the clouds' tint.
     pub tone: Vec3,
+    /// `DarknessK`: how fast the clouds darken with their thickness, as
+    /// the game's cloud shader divides their light by `1 + mass * k`
+    /// (which constant feeds it is inferred from its values).
+    pub cloud_darkness: f32,
     /// `BloomAmount`, `BloomMultiplier`, `BloomThreshold`,
     /// `BloomBlurRadius` (the radius is not used yet).
     pub bloom: [f32; 4],
@@ -173,6 +177,7 @@ impl Atmosphere {
             extinction: float("ScatterExtinctionMultiplier").unwrap_or(0.0),
             mie: float("ScatterBetaMieMultiplier").unwrap_or(0.0),
             hg_g: float("ScatterHgG").unwrap_or(0.0),
+            cloud_darkness: float("DarknessK").unwrap_or(0.0),
             tone: Vec3::new(
                 float("Tone_R").unwrap_or(1.0),
                 float("Tone_G").unwrap_or(1.0),
@@ -260,6 +265,7 @@ impl Atmosphere {
             mie: f(self.mie, to.mie),
             hg_g: f(self.hg_g, to.hg_g),
             tone: v(self.tone, to.tone),
+            cloud_darkness: f(self.cloud_darkness, to.cloud_darkness),
             bloom: std::array::from_fn(|i| f(self.bloom[i], to.bloom[i])),
             light_time: std::array::from_fn(|i| f(self.light_time[i], to.light_time[i])),
             coverage: f(self.coverage, to.coverage),
@@ -332,6 +338,8 @@ impl Atmosphere {
         lighting.bloom = self.bloom[0] * self.bloom[1];
         lighting.bloom_threshold = self.bloom[2];
         lighting.clouds.tone = self.tone;
+        // `M2_CLOUDS=game` lights the clouds by the game's formula.
+        lighting.clouds.darkness = env_is("M2_CLOUDS", "game").then_some(self.cloud_darkness);
         lighting.clouds.coverage = self.coverage;
         lighting.clouds.scales = self.cloud_scales;
         lighting.clouds.wind = self.wind;
@@ -659,6 +667,7 @@ mod tests {
             mie: 0.0,
             hg_g: 0.0,
             tone: Vec3::ONE,
+            cloud_darkness: 0.0,
             bloom: [0.0; 4],
             light_time: [light_time, 0.0],
             coverage: 0.0,

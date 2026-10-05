@@ -44,7 +44,8 @@ struct Frame {
     scatter: vec4<f32>,
     // Clouds: xyz each layer's scale, w coverage
     clouds: vec4<f32>,
-    // xy: wind (x, z), z: clouds on
+    // xy: wind (x, z), z: clouds on, w: how fast they darken with mass
+    // (lit as the game's), negative for the earlier lighting
     wind: vec4<f32>,
     // The water's colour (rgb) and opacity (a) through none, a third, two
     // thirds and all of water_depth.y metres of it
@@ -577,14 +578,27 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         let density = n1 * 0.6 + n3 * 0.25 + n2 * 0.15;
         let cut = 1.0 - frame.clouds.w;
         var alpha = smoothstep(cut - 0.1, cut + 0.35, density);
+        let mass = alpha;
         // Far deck fades into the haze towards the horizon.
         alpha = alpha * smoothstep(0.02, 0.35, r.y);
         let l = -normalize(frame.sun_dir.xyz);
         let c = dot(r, l);
-        // Lit by the sun, brighter looking towards it; thicker cloud is
-        // darker underneath.
-        let lit = frame.sun_color.rgb * (0.5 + 0.5 * pow(max(c, 0.0), 4.0)) * mix(1.0, 0.7, alpha);
-        let cloud = lit + frame.ambient_cube[2].rgb * 0.5;
+        var cloud: vec3<f32>;
+        if frame.wind.w >= 0.0 {
+            // As the game's: sunlight alone, through a Cornette-Shanks
+            // phase (its g taken from the haze's; the cloud's own is not
+            // known), divided by 1 + mass * darkness, the mass here the
+            // cloud's opacity before it fades towards the horizon.
+            let g = frame.rayleigh.a;
+            let phase = 1.5 * (1.0 - g * g) / (2.0 + g * g) * (1.0 + c * c)
+                / pow(1.0 + g * g - 2.0 * g * c, 1.5);
+            cloud = frame.sun_color.rgb * (1.0 + phase) / (1.0 + mass * frame.wind.w);
+        } else {
+            // Lit by the sun, brighter looking towards it; thicker cloud
+            // is darker underneath.
+            let lit = frame.sun_color.rgb * (0.5 + 0.5 * pow(max(c, 0.0), 4.0)) * mix(1.0, 0.7, alpha);
+            cloud = lit + frame.ambient_cube[2].rgb * 0.5;
+        }
         // Thin veils: the game's footage shows a hazy sky with little
         // solid cloud.
         rgb = mix(rgb, cloud * frame.cloud_tone.rgb, alpha * 0.6);

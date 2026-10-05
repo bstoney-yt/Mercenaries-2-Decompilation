@@ -1750,7 +1750,7 @@ impl WgpuBackend {
                 } else {
                     0.0
                 },
-                0.0,
+                l.clouds.darkness.unwrap_or(-1.0),
             ],
             water_ramp: l
                 .water_ramp
