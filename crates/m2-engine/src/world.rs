@@ -30,7 +30,8 @@ use m2_render::{
 };
 
 use crate::assets::{AssetError, AssetSource};
-use crate::atmosphere::Atmosphere;
+use crate::atmosphere::{Atmosphere, AtmosphereRegion};
+use crate::motion::PropMotion;
 use crate::physics::CollisionShape;
 use crate::technique::Technique;
 use crate::tuning::VehicleTuning;
@@ -217,6 +218,8 @@ pub struct Templates {
     pub names: HashMap<u32, String>,
     /// How the templates that say so handle and fight, by id.
     pub tuning: HashMap<u32, VehicleTuning>,
+    /// The templates whose props move on their own, by id.
+    pub motions: HashMap<u32, PropMotion>,
 }
 
 impl Templates {
@@ -224,6 +227,22 @@ impl Templates {
     /// 0x0012abcd`, `AMX30`) names, whatever its case.
     pub fn get(&self, name: &str) -> Option<&TemplateInfo> {
         self.by_name.get(&member_stem(name).to_ascii_lowercase())
+    }
+
+    /// How an entity named `name` (its template's name and an id), an
+    /// instance of template `parent`, moves on its own: its name's
+    /// template's motion, else its parent's.
+    pub fn motion(&self, name: &str, parent: u32) -> Option<&PropMotion> {
+        let stem = member_stem(name);
+        self.motions
+            .iter()
+            .find(|(id, _)| {
+                self.names
+                    .get(id)
+                    .is_some_and(|n| n.eq_ignore_ascii_case(stem))
+            })
+            .map(|(_, m)| m)
+            .or_else(|| self.motions.get(&parent))
     }
 
     /// The template with id `id` (an entity's parent): its name, and what
@@ -359,6 +378,7 @@ impl Templates {
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
             tuning: crate::tuning::read(&db),
+            motions: crate::motion::read_templates(&db),
         };
         (templates, atmosphere)
     }
@@ -465,6 +485,11 @@ pub struct WorldIndex {
     pub template_db: Templates,
     /// The outdoor light and air (ambient cube, sunlight, haze).
     pub atmosphere: Option<Atmosphere>,
+    /// The regions whose light differs from it (`vz_atmosphere_regions`).
+    pub atmosphere_regions: Vec<AtmosphereRegion>,
+    /// How the placed props that move on their own move, by entity (state
+    /// layers' and static layers' alike).
+    pub motions: HashMap<u32, PropMotion>,
     /// Models the state layers place (blocks of their own, which the
     /// mission scripts load and unload: `vz_state_vzacon001`), by entity:
     /// what stands while the layer is in, such as a mission's gates.
@@ -601,6 +626,14 @@ impl WorldIndex {
                     continue;
                 };
                 world.add_layer(&layer, e.name_hash, is_static, &assets);
+                if layer.component("AtmosphereBase").is_some() {
+                    world
+                        .atmosphere_regions
+                        .extend(crate::atmosphere::read_regions(&layer, |h| {
+                            let data = source.asset(h, m2_assets::region::REGION_TYPE).ok()?;
+                            Some(m2_assets::Region::parse(&data).ok()?.corners)
+                        }));
+                }
                 world.add_people(
                     &layer,
                     e.name_hash,
@@ -632,6 +665,33 @@ impl WorldIndex {
             spawn.route = points.iter().map(|&p| at + q * p).collect();
         }
         Ok(world)
+    }
+
+    /// The motions of a layer's entities whose template moves on its own,
+    /// with the angles their own `Door` records give.
+    fn add_motions(
+        &mut self,
+        layer: &Layer<'_>,
+        placements: &HashMap<u32, Placement>,
+        templates: &Templates,
+    ) {
+        if templates.motions.is_empty() {
+            return;
+        }
+        let names = layer.names();
+        let hinges = crate::motion::hinges(layer);
+        for (&entity, p) in placements {
+            let name = names.get(&entity).copied().unwrap_or("");
+            let Some(motion) = templates.motion(name, p.parent) else {
+                continue;
+            };
+            let mut motion = motion.clone();
+            if let Some(&(node, angle)) = hinges.get(&entity) {
+                motion.hinges.retain(|&(n, _)| n != node);
+                motion.hinges.push((node, angle));
+            }
+            self.motions.insert(entity, motion);
+        }
     }
 
     /// The people a layer places: entities with AI or a spawner of their
@@ -709,6 +769,7 @@ impl WorldIndex {
 
     fn add_layer(&mut self, layer: &Layer<'_>, layer_hash: u32, is_static: bool, assets: &Assets) {
         let placements = layer.placements();
+        self.add_motions(layer, &placements, &assets.templates);
         let at = |entity| placements.get(&entity);
         for (entity, asset) in layer.hashes("TerrainObject") {
             if let Some(p) = at(entity) {
@@ -1481,6 +1542,7 @@ mod tests {
             ]),
             names: HashMap::from([(0x8000_0001, "Valiant (Python)".to_owned())]),
             tuning: HashMap::new(),
+            motions: HashMap::new(),
         };
         assert_eq!(
             db.by_id(0x8000_0001).map(|(n, _)| n),
