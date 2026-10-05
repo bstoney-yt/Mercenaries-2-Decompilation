@@ -80,17 +80,24 @@ impl fmt::Debug for CollisionShape {
 
 /// How a prop comes loose when a vehicle or a blast knocks it (its `PHY2`
 /// has bodies that move: traffic lights, plants, barricades, poles): its
-/// standing collision goes and its pieces fly. A model with a wreck whose
-/// moving bodies show only wrecked falls to those pieces, drawn wrecked;
-/// any other goes as one, drawn whole.
+/// standing collision goes and its pieces fly.
+///
+/// Most such models are broken up beforehand: a fixed body holds the
+/// parts shown intact, and the pieces it breaks into sit on moving
+/// bodies whose nodes the model shows in neither state (10,356 of the
+/// 10,647 moving bodies of the island's placed models). Those break: the
+/// model is drawn wrecked (the stump or base left standing) and the
+/// pieces fly, drawn where they land. A model whose moving bodies it
+/// shows intact (a barricade) goes as one, drawn whole.
 ///
 /// The `PHY2` constraints that would hold pieces together (a door on its
-/// hinge) are not read: each piece goes its own way.
+/// hinge) are not read: each piece goes its own way. Nothing of a broken
+/// prop stands in the way afterwards (its base included).
 #[derive(Clone)]
 pub struct Loose {
     pub pieces: Vec<LoosePiece>,
-    /// Falls to its wreck's pieces, drawn wrecked.
-    pub wrecks: bool,
+    /// Breaks into its pieces, the rest of it drawn wrecked.
+    pub breaks: bool,
     /// The moving bodies' mass, kg: what a vehicle has to shift.
     pub mass: f32,
     /// Each node's place in the model at rest.
@@ -98,13 +105,16 @@ pub struct Loose {
     /// For each node, the piece it goes with: the nearest at or above it
     /// (`None`: it stays put).
     owner: Vec<Option<usize>>,
+    /// For each node, whether it is drawn with its piece whatever the
+    /// model's state shows (a broken prop's pieces).
+    flying: Vec<bool>,
 }
 
 impl fmt::Debug for Loose {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Loose")
             .field("pieces", &self.pieces.len())
-            .field("wrecks", &self.wrecks)
+            .field("breaks", &self.breaks)
             .field("mass", &self.mass)
             .finish()
     }
@@ -170,10 +180,7 @@ impl Loose {
             .as_ref()
             .map(|s| [s.hidden(&model.nodes, false), s.hidden(&model.nodes, true)])
             .unwrap_or_default();
-        let off =
-            |wrecked: usize, n: u32| hidden[wrecked].get(n as usize).copied().unwrap_or(false);
-        // A shape shows as its own part's node does.
-        let node_of = |k: usize| p.parts.get(p.shapes[k].part).map_or(0, |q| q.node);
+        let off = |wrecked: usize, n: usize| hidden[wrecked].get(n).copied().unwrap_or(false);
         let shapes_of = |b: usize| (0..p.shapes.len()).filter(move |&k| p.body_of(k) == Some(b));
         let body_node = |b: usize| {
             p.parts
@@ -185,21 +192,17 @@ impl Loose {
         let rest: Vec<Mat4> = (0..model.nodes.len())
             .map(|n| model.node_to_model(n as u16).unwrap_or(Mat4::IDENTITY))
             .collect();
-        // The wreck's pieces: moving bodies whose shapes all show only
-        // wrecked.
-        let wreck: Vec<usize> = moving
+        // The pieces it breaks into: moving bodies on nodes it doesn't
+        // show intact.
+        let broken: Vec<(usize, u16)> = moving
             .iter()
-            .copied()
-            .filter(|&b| {
-                let mut shapes = shapes_of(b).peekable();
-                shapes.peek().is_some() && shapes.all(|k| off(0, node_of(k)) && !off(1, node_of(k)))
-            })
+            .filter_map(|&b| Some((b, body_node(b)?)))
+            .filter(|&(_, n)| off(0, usize::from(n)))
             .collect();
+        let breaks = !broken.is_empty();
         let mut pieces = Vec::new();
-        let wrecks = hidden[0] != hidden[1] && !wreck.is_empty();
-        if wrecks {
-            for b in wreck {
-                let Some(node) = body_node(b) else { continue };
+        if breaks {
+            for (b, node) in broken {
                 let from_model = rest[usize::from(node)].inverse();
                 let boxes: Vec<_> = shapes_of(b)
                     .filter_map(|k| shape_box(p, k, Mat4::IDENTITY))
@@ -215,9 +218,9 @@ impl Loose {
                 });
             }
         } else {
-            // As one: the shapes that show intact, in model space.
+            // As one: what stands in the way intact, in model space.
             let boxes: Vec<_> = (0..p.shapes.len())
-                .filter(|&k| !off(0, node_of(k)))
+                .filter(|&k| standing(p, k, &hidden[0]))
                 .filter_map(|k| {
                     let node = p
                         .shape_node(k)
@@ -240,7 +243,7 @@ impl Loose {
             return None;
         }
         // Each node goes with the nearest piece at or above it.
-        let owner = (0..model.nodes.len())
+        let owner: Vec<Option<usize>> = (0..model.nodes.len())
             .map(|n| {
                 let mut at = Some(n as u16);
                 for _ in 0..=model.nodes.len() {
@@ -256,13 +259,22 @@ impl Loose {
                 None
             })
             .collect();
+        let flying = owner.iter().map(|o| breaks && o.is_some()).collect();
         Some(Self {
             mass: pieces.iter().map(|q| q.mass).sum(),
             pieces,
-            wrecks,
+            breaks,
             rest,
             owner,
+            flying,
         })
+    }
+
+    /// For each node, whether it is drawn with its piece whatever the
+    /// model's state shows (as
+    /// [`GpuModel::draw_moved`](crate::GpuModel::draw_moved) takes).
+    pub fn flying(&self) -> &[bool] {
+        &self.flying
     }
 
     /// Where each piece starts, world space, with the model placed at
@@ -291,6 +303,19 @@ impl Loose {
             })
             .collect()
     }
+}
+
+/// Whether `PHY2` shape `k` stands in the way of the model as it stands
+/// intact (`hidden` as [`PartStates::hidden`](m2_assets::model::PartStates::hidden)
+/// has it): not leaves ([`FOLIAGE`](m2_assets::physics::FOLIAGE)), which
+/// vehicles and people go through, nor a shape on a part the model
+/// doesn't show intact (its wreck's, the pieces it breaks into).
+fn standing(p: &Phy2, k: usize, hidden: &[bool]) -> bool {
+    let Some(s) = p.shapes.get(k) else {
+        return false;
+    };
+    let node = p.parts.get(s.part).map_or(0, |q| q.node as usize);
+    !s.is_foliage() && !hidden.get(node).copied().unwrap_or(false)
 }
 
 /// A box round `PHY2` shape `k` (its convex radius included), placed by
@@ -372,11 +397,23 @@ impl CollisionShape {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
         let mut loose = None;
+        // Shapes of its own, whether or not any stands in the way: no
+        // stand-in then.
+        let mut shaped = false;
         if let Some(p) = phy2.and_then(|d| Phy2::parse(d).ok()) {
             if sub_object.is_none() {
                 loose = Loose::of(model, &p).map(Arc::new);
             }
+            shaped = !p.shapes.is_empty();
+            let hidden = model
+                .states
+                .as_ref()
+                .map(|s| s.hidden(&model.nodes, false))
+                .unwrap_or_default();
             for (k, s) in p.shapes.iter().enumerate() {
+                if !standing(&p, k, &hidden) {
+                    continue;
+                }
                 // A shape sits at its part's place in its body node's
                 // space.
                 let node = p
@@ -391,7 +428,7 @@ impl CollisionShape {
                 triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
             }
         }
-        let stand_in = triangles.is_empty();
+        let stand_in = !shaped && triangles.is_empty();
         if stand_in {
             let lod = (lod..model.info.lod_count.max(lod + 1))
                 .find(|&l| model.has_lod(l))
@@ -598,6 +635,11 @@ impl Character {
 /// through them.
 const RAGDOLL: r::Group = r::Group::GROUP_2;
 
+/// The collision group of loose pieces: they land on the world, vehicles
+/// and people but not on each other (a broken prop's pieces start
+/// touching: boxes round them overlap).
+const DEBRIS: r::Group = r::Group::GROUP_3;
+
 /// Queries that see everything but ragdolls.
 fn solid<'a>() -> r::QueryFilter<'a> {
     r::QueryFilter::default().groups(r::InteractionGroups::new(
@@ -797,7 +839,12 @@ impl Physics {
         );
         let collider = r::ColliderBuilder::new(piece.shape.clone())
             .mass(piece.mass)
-            .friction(DEBRIS_FRICTION);
+            .friction(DEBRIS_FRICTION)
+            .collision_groups(r::InteractionGroups::new(
+                DEBRIS,
+                r::Group::ALL.difference(DEBRIS),
+                r::InteractionTestMode::And,
+            ));
         self.world.insert_collider(collider, Some(body));
         self.debris.push(Some(body));
         DebrisId(self.debris.len() - 1)
@@ -2111,6 +2158,62 @@ mod tests {
     }
 
     #[test]
+    fn leaves_and_hidden_parts_dont_stand_in_the_way() {
+        use m2_assets::physics::{Body, Geometry, Part, Shape};
+        let part = |node: u32, body: Option<usize>, shape: Option<usize>| Part {
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            node_hash: 0,
+            node,
+            body,
+            shape,
+            unk_link: 0,
+            parent: None,
+            first_child: None,
+            next_sibling: None,
+        };
+        let shape = |part: usize, class: u32| {
+            let mut record = [0; 26];
+            record[4] = class;
+            Shape {
+                radius: 0.0,
+                geometry: Geometry::Box {
+                    half_extents: [1.0; 3],
+                },
+                part,
+                record,
+            }
+        };
+        let p = Phy2 {
+            version: 0x39,
+            model: 0,
+            unk_0x14: [0; 3],
+            // A trunk and its leaves on node 1, a piece it breaks into on
+            // node 2 (hidden intact).
+            parts: vec![
+                part(1, Some(0), None),
+                part(1, None, Some(0)),
+                part(1, None, Some(1)),
+                part(2, None, Some(2)),
+            ],
+            bodies: vec![Body {
+                inertia: [f32::MAX; 9],
+                centre_of_mass: [0.0; 3],
+                mass: 0.0,
+                unk: [0.3; 4],
+                unk_words: [0; 8],
+            }],
+            shapes: vec![shape(1, 0x27), shape(2, 0x28), shape(3, 0x27)],
+        };
+        let hidden = [false, false, true];
+        let stands: Vec<bool> = (0..3).map(|k| standing(&p, k, &hidden)).collect();
+        assert_eq!(stands, [true, false, false]);
+        // A model that shows everything: only the leaves go through.
+        assert!(standing(&p, 2, &[]));
+        assert!(!standing(&p, 1, &[]));
+    }
+
+    #[test]
     fn a_loose_piece_carries_the_nodes_under_it() {
         // A base, an arm 2 m up on it, and a lamp 1 m along the arm.
         let rest = vec![
@@ -2125,10 +2228,11 @@ mod tests {
                 mass: 10.0,
                 from_model: rest[1].inverse(),
             }],
-            wrecks: true,
+            breaks: true,
             mass: 10.0,
             rest: rest.clone(),
             owner: vec![None, Some(0), Some(0)],
+            flying: vec![false, true, true],
         };
         let placed = Mat4::from_translation(Vec3::new(100.0, 0.0, 0.0));
         let starts = loose.starts(placed);

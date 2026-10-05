@@ -988,7 +988,8 @@ impl World {
                 queue,
                 placed,
                 &loose.posed(placed, &places),
-                loose.wrecks || destroyed,
+                loose.breaks || destroyed,
+                loose.flying(),
             );
             drawn += 1;
         }

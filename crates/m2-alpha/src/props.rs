@@ -527,7 +527,8 @@ impl Props {
                         queue,
                         placed,
                         &loose.posed(placed, &places),
-                        loose.wrecks || p.wrecked,
+                        loose.breaks || p.wrecked,
+                        loose.flying(),
                     );
                 }
                 continue;
