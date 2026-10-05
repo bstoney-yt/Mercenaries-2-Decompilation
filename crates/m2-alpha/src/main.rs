@@ -511,6 +511,7 @@ fn screenshot(
             .is_some_and(|p| game.on_foot && !p.landed);
         if (stats.pending == 0 && !waiting) || started.elapsed() > Duration::from_secs(180) {
             eprintln!("{stats:?} after {:.1} s", started.elapsed().as_secs_f32());
+            eprintln!("atmosphere: {:?}", world.index.atmosphere);
             break;
         }
         game.step(Intent::default(), tick);

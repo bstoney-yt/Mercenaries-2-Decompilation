@@ -30,6 +30,7 @@ use m2_render::{
 };
 
 use crate::assets::{AssetError, AssetSource};
+use crate::atmosphere::Atmosphere;
 use crate::physics::CollisionShape;
 use crate::technique::Technique;
 
@@ -116,8 +117,12 @@ impl Templates {
 }
 
 impl Templates {
-    /// Reads the one template database asset, if the archive has it.
-    fn read<R: Read + Seek>(source: &mut AssetSource<R>, models: &HashSet<u32>) -> Self {
+    /// Reads the one template database asset, if the archive has it, and
+    /// the outdoor atmosphere it holds.
+    fn read<R: Read + Seek>(
+        source: &mut AssetSource<R>,
+        models: &HashSet<u32>,
+    ) -> (Self, Option<Atmosphere>) {
         let index = source.archive().index();
         let Some(hash) = index
             .assets()
@@ -125,14 +130,15 @@ impl Templates {
             .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
             .map(|a| a.name_hash)
         else {
-            return Self::default();
+            return Default::default();
         };
         let Ok(data) = source.asset(hash, TEMPLATE_DB_TYPE) else {
-            return Self::default();
+            return Default::default();
         };
         let Ok(db) = Layer::parse(&data) else {
-            return Self::default();
+            return Default::default();
         };
+        let atmosphere = Atmosphere::read(&db, "Default");
         let model_of = db.hashes("ModelName");
         let mut kinds: HashMap<u32, VehicleKind> = HashMap::new();
         for (component, kind) in [
@@ -148,7 +154,7 @@ impl Templates {
                 kinds.insert(id, kind);
             }
         }
-        Self(
+        let templates = Self(
             db.names()
                 .into_iter()
                 .map(|(id, name)| {
@@ -161,7 +167,8 @@ impl Templates {
                     )
                 })
                 .collect(),
-        )
+        );
+        (templates, atmosphere)
     }
 }
 
@@ -231,6 +238,8 @@ pub struct WorldIndex {
     /// The template database, for names the scripts and mission layers
     /// use.
     pub template_db: Templates,
+    /// The outdoor light and air (ambient cube, sunlight, haze).
+    pub atmosphere: Option<Atmosphere>,
     /// Models the state layers place (blocks of their own, which the
     /// mission scripts load and unload: `vz_state_vzacon001`), by entity:
     /// what stands while the layer is in, such as a mission's gates.
@@ -345,9 +354,13 @@ impl WorldIndex {
             any: index.assets().iter().map(|a| a.name_hash).collect(),
             templates: Templates::default(),
         };
-        assets.templates = Templates::read(source, &assets.models);
+        let (templates, atmosphere) = Templates::read(source, &assets.models);
+        assets.templates = templates;
 
-        let mut world = Self::default();
+        let mut world = Self {
+            atmosphere,
+            ..Self::default()
+        };
         let mut routes = Routes::default();
         for (block, is_static) in blocks {
             let decoded = source.block(block)?;

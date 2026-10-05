@@ -577,10 +577,15 @@ impl Game {
     }
 
     pub fn view(&self, fov: f32, aspect: f32) -> View {
-        match self.walking() {
+        let mut view = match self.walking() {
             Some(p) => p.view(fov, aspect),
             None => self.camera.view(fov, aspect),
+        };
+        // The island's own ambient light and sunlight strength.
+        if let Some(a) = self.scene.world.as_ref().and_then(|w| w.index.atmosphere) {
+            a.apply(&mut view.lighting);
         }
+        view
     }
 }
 

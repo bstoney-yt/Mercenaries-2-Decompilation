@@ -15,6 +15,7 @@
 
 pub mod anim;
 pub mod assets;
+pub mod atmosphere;
 pub mod audio;
 pub mod model;
 pub mod physics;
@@ -26,6 +27,7 @@ pub mod world;
 
 pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
+pub use atmosphere::Atmosphere;
 pub use audio::{Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
 pub use model::{CpuModel, GpuModel, MaterialCache};
 pub use physics::{
