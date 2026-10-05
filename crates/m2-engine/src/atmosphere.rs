@@ -745,6 +745,11 @@ impl AtmosphereMix {
         }
     }
 
+    /// Seconds into the latest change of region or record.
+    pub fn since_change(&self) -> f32 {
+        self.t
+    }
+
     /// The light now.
     pub fn current(&self, default: &Atmosphere) -> Atmosphere {
         let Some((_, to)) = &self.to else {
