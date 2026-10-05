@@ -635,7 +635,8 @@ const NAMED_AFTER: &[(&str, &str)] = &[
 /// of up to seven letters was tried before every ending, and in each bank
 /// these hashes agree on one beginning (a few endings more were found
 /// after it). `veh_largegasold` plays the pickup's `slow_loop_02`, which it
-/// holds too.
+/// holds too. The Cobra's bank names its idle and slow loops after the
+/// Cobra but its middling and fast ones (`_med`, `_fast`) after another.
 const HASHED_PARTS: &[(u32, Part)] = &[
     // veh_4cylindernew
     (0x806e_54cf, Part::Loop(0)),
@@ -648,6 +649,9 @@ const HASHED_PARTS: &[(u32, Part)] = &[
     (0x9c68_99c2, Part::Loop(3)),
     (0x7025_6f71, Part::Start),
     (0xa5e4_b543, Part::Stop),
+    // veh_8cylinderold (the Cobra's middling and fast loops)
+    (0x2194_c12c, Part::Loop(2)),
+    (0xec9d_e3e4, Part::Loop(3)),
     // veh_8cylinderjapanese
     (0x1a26_2d1e, Part::Loop(0)),
     (0xc32a_00a0, Part::Loop(1)),
@@ -1161,6 +1165,20 @@ mod tests {
         assert_eq!(order, [0x0de2_278b, 0xff10_6b9c, 0x9640_0153, 0x0487_aa57]);
         assert_eq!(e.start.map(|s| s.hash), Some(0x49e3_4594));
         assert_eq!(e.heard, None);
+        // The Cobra's: idle and slow by its name, middling and fast by hash.
+        let h = |s: &str| name_hash(&format!("veh_cobra_{s}"));
+        let bank = [
+            engine(0xec9d_e3e4, 150.0, 3.4, 0.0, 0.0),
+            engine(0x2194_c12c, 110.0, 2.7, 0.0, 0.0),
+            engine(h("idle_loop"), 40.0, 4.9, 0.0, 0.0),
+            engine(h("slow_loop"), 80.0, 3.9, 0.0, 0.0),
+        ];
+        let e = EngineSounds::pick("veh_8cylinderold", &bank);
+        let order: Vec<u32> = e.loops.iter().map(|l| l.0.hash).collect();
+        assert_eq!(
+            order,
+            [h("idle_loop"), h("slow_loop"), 0x2194_c12c, 0xec9d_e3e4]
+        );
         // A lone named loop is pitched up from its own note.
         let e = EngineSounds::pick(
             "veh_tankdiesel",
