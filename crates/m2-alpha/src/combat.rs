@@ -345,6 +345,8 @@ pub enum Sound {
     Shot(Vec3),
     Launch(Vec3),
     Explosion(Vec3),
+    /// A tank's main gun.
+    Cannon(Vec3),
 }
 
 /// Something that happened to her worth a word from her.
@@ -901,7 +903,7 @@ impl Combat {
                 },
                 1.5,
             );
-            self.sounds.push(Sound::Launch(from));
+            self.sounds.push(Sound::Cannon(from));
         } else {
             self.reload = MG_GAP;
             let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));

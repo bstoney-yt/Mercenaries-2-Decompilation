@@ -55,8 +55,11 @@
 //!                           alpha makes of them (wheels, tracked, turret),
 //!                           and every node with its geometry box and how
 //!                           it fares in the wheel tests
-//! templates:<word>[,..]     templates whose name holds a word, with their
-//!                           components' fields (text fields not read)
+//! templates:<word|id>[,..]  templates whose name holds a word (or whose
+//!                           id is given, 8 hex digits), with their
+//!                           components' fields (text fields not read), a
+//!                           field naming another template followed by its
+//!                           name; then the templates they name, likewise
 //! parents[:<word>,..]       how entities' Transform `Parent` matches the
 //!                           template database (counts, and whether named
 //!                           entities' parents carry their name), then
@@ -2158,24 +2161,65 @@ fn templates<R: Read + Seek>(
         .map(|c| c.name)
         .collect();
     println!("components with text (not read): {}", texty.join(", "));
+    let ids: Vec<u32> = words
+        .iter()
+        .filter(|w| w.len() == 8)
+        .filter_map(|w| hex(w))
+        .collect();
     let mut picked: Vec<(&str, u32)> = tnames
         .iter()
-        .filter(|(_, n)| {
+        .filter(|(id, n)| {
             let n = n.to_ascii_lowercase();
-            words.iter().any(|w| n.contains(w.as_str()))
+            ids.contains(id) || words.iter().any(|w| n.contains(w.as_str()))
         })
         .map(|(&id, &n)| (n, id))
         .collect();
     picked.sort_unstable();
     println!("{} templates match", picked.len());
-    for (name, id) in picked.into_iter().take(150) {
+    // Each template's fields; a field naming another template gets its
+    // name, and is gathered to show after.
+    let mut named: Vec<u32> = Vec::new();
+    let show = |id: u32, name: &str, named: &mut Vec<u32>| {
         println!("  {id:08x} {name:?}");
         for (cname, fields, recs) in &records {
             let Some(rec) = recs.get(&id) else {
                 continue;
             };
-            let values: Vec<String> = fields.iter().map(|f| field_value(names, f, rec)).collect();
+            let values: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    let shown = field_value(names, f, rec);
+                    let at = usize::from(f.offset);
+                    let other = (f.ty != STRING_FIELD && f.bit_width == 0)
+                        .then(|| rec.get(at..at + 4))
+                        .flatten()
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .filter(|v| *v != id)
+                        .and_then(|v| tnames.get(&v).map(|n| (v, n)));
+                    match other {
+                        Some((v, n)) => {
+                            if !named.contains(&v) {
+                                named.push(v);
+                            }
+                            format!("{shown} -> {n:?}")
+                        }
+                        None => shown,
+                    }
+                })
+                .collect();
             println!("    {cname}: {}", values.join(", "));
+        }
+    };
+    let shown: Vec<u32> = picked.iter().take(150).map(|p| p.1).collect();
+    for &(name, id) in picked.iter().take(150) {
+        show(id, name, &mut named);
+    }
+    named.retain(|v| !shown.contains(v));
+    if !named.is_empty() {
+        println!("{} templates they name", named.len());
+        let mut more = Vec::new();
+        for id in named.into_iter().take(60) {
+            show(id, tnames[&id], &mut more);
         }
     }
     Ok(())
