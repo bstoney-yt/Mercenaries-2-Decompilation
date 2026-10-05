@@ -35,6 +35,7 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+mod autoplay;
 mod cache;
 mod camera;
 mod combat;
@@ -138,6 +139,9 @@ struct Options {
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
+    /// With `--mission --screenshot`: she plays the mission herself, by
+    /// its markers, until it is done or the seconds are up.
+    autoplay: bool,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -263,6 +267,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--fight-wait" => {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
+            "--autoplay" => o.autoplay = true,
             "--mission-seconds" => {
                 o.mission_seconds = value()?
                     .parse()
@@ -999,18 +1004,49 @@ fn mission_for_screenshot(
         },
         started.elapsed().as_secs_f32()
     );
-    // Ten seconds of play (or as asked), streaming as it goes.
+    // Ten seconds of play (or as asked), streaming as it goes; with
+    // --autoplay she plays it herself, until the contract is done.
     let seconds = if options.mission_seconds > 0.0 {
         options.mission_seconds
     } else {
         10.0
     };
+    let mut auto = options.autoplay.then(autoplay::Autoplay::default);
+    let played = Instant::now();
+    let every = if auto.is_some() { 10 } else { 30 };
     for i in 0..(seconds / tick).round() as u32 {
-        game.step(Intent::default(), tick);
+        let intent = match &mut auto {
+            Some(a) => {
+                let marks = link.marks();
+                let objectives = link.view().objectives;
+                a.step(game, &marks, &objectives, tick)
+            }
+            None => Intent::default(),
+        };
+        game.step(intent, tick);
         link.tick(game, tick);
-        if i % 30 == 0 {
+        if i % every == 0 {
             render(backend, game, fov, aspect, None)?;
         }
+        if auto.is_some() && link.completed() {
+            eprintln!(
+                "autoplay: contract completed after {:.1} s of play ({:.0} s here)",
+                i as f32 * tick,
+                played.elapsed().as_secs_f32()
+            );
+            break;
+        }
+    }
+    if let Some(a) = &auto {
+        eprintln!(
+            "autoplay: {}{}",
+            a.summary(),
+            if link.completed() {
+                ""
+            } else {
+                "; the contract was not completed"
+            }
+        );
     }
     while let Some(world) = &game.scene.world {
         let waiting = game.scene.player.as_ref().is_some_and(|p| !p.landed);
@@ -1076,6 +1112,47 @@ fn drive_for_screenshot(
     // Let them settle on their suspension.
     for _ in 0..90 {
         game.step(Intent::default(), tick);
+    }
+    // A vehicle asked for that isn't parked here: one is parked.
+    if let Some(want) = &options.vehicle {
+        let have = |game: &Game| {
+            game.scene.vehicles.iter().any(|v| {
+                v.id.is_some() && v.spec.label.to_ascii_lowercase().contains(want.as_str())
+            })
+        };
+        if !have(game) {
+            let models: Vec<m2_engine::CatalogueEntry> = game
+                .scene
+                .catalogue
+                .as_ref()
+                .map(|c| {
+                    c.vehicles
+                        .iter()
+                        .filter(|e| e.label.to_ascii_lowercase().contains(want.as_str()))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "drive: no {want} parked; parking one of [{}]",
+                models
+                    .iter()
+                    .map(|e| format!("{} ({}, model {:08x})", e.label, e.kind, e.model))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if !models.is_empty() {
+                game.park_more(models);
+                let waited = Instant::now();
+                while !have(game) && waited.elapsed() < Duration::from_secs(90) {
+                    game.step(Intent::default(), tick);
+                    render(backend, game, fov, aspect, None)?;
+                }
+                for _ in 0..90 {
+                    game.step(Intent::default(), tick);
+                }
+            }
+        }
     }
     let entered = match &options.vehicle {
         Some(want) => {
@@ -1184,9 +1261,21 @@ fn drive_for_screenshot(
         .zip(&before)
         .filter(|(n, b)| n.alive && n.character.position.distance(**b) > 0.5)
         .count();
+    // What those who stayed put are doing.
+    let mut still = std::collections::BTreeMap::<&str, usize>::new();
+    for (n, b) in npcs.iter().zip(&before) {
+        if !(n.alive && n.character.position.distance(*b) > 0.5) {
+            *still.entry(n.doing()).or_default() += 1;
+        }
+    }
     eprintln!(
-        "drive: {moved} of {} people moved more than 0.5 m during the drive",
-        npcs.len().min(before.len())
+        "drive: {moved} of {} people moved more than 0.5 m during the drive; the rest: {}",
+        npcs.len().min(before.len()),
+        still
+            .iter()
+            .map(|(what, k)| format!("{k} {what}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     if options.wreck {
         wreck_at_speed(game, tick);
@@ -1233,8 +1322,51 @@ fn drive_for_screenshot(
                 );
             }
         }
+        if options.fire {
+            describe_vehicle_fire(game);
+        }
     }
     Ok(())
+}
+
+/// Where the gun of the vehicle she drives fired from: its muzzle on the
+/// model, and where its flash is, on the model and in the world.
+fn describe_vehicle_fire(game: &Game) {
+    let Some(v) = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|p| p.driving)
+        .map(|i| &game.scene.vehicles[i])
+    else {
+        return;
+    };
+    let body =
+        v.id.zip(game.scene.world.as_ref())
+            .and_then(|(id, w)| w.physics.vehicle_transform(id));
+    let flash = game
+        .combat
+        .effects
+        .iter()
+        .rev()
+        .find_map(|(e, ..)| match e {
+            combat::Effect::Flash { at, size, .. } => Some((*at, *size)),
+            _ => None,
+        });
+    match (v.spec.muzzle, body, flash) {
+        (None, ..) => eprintln!("drive: fire: no gun (no muzzle on a turret)"),
+        (Some(m), Some(body), Some((at, size))) => eprintln!(
+            "drive: fire: muzzle {m:.2} on the model, turret at {:.0} deg; flash {size:.2} m at {:.2} on the model, {at:.2} in the world; {} shells or rockets flying",
+            v.turret.to_degrees(),
+            body.inverse().transform_point3(at),
+            game.combat
+                .projectiles()
+                .filter(|(rocket, ..)| *rocket)
+                .count()
+        ),
+        (Some(m), _, None) => eprintln!("drive: fire: muzzle {m:.2}, but no flash"),
+        (Some(m), None, _) => eprintln!("drive: fire: muzzle {m:.2}, vehicle not placed"),
+    }
 }
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to

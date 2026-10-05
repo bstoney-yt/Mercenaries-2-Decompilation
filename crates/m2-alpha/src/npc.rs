@@ -325,6 +325,29 @@ impl Npc {
         matches!(self.brain, Brain::Patrol { .. })
     }
 
+    /// What they are doing, in a word or two (for checking).
+    pub fn doing(&self) -> &'static str {
+        if !self.alive {
+            return "dead";
+        }
+        if !self.landed {
+            return "landing";
+        }
+        if self.alert {
+            return "fighting";
+        }
+        if self.flee.is_some() {
+            return "fleeing";
+        }
+        match &self.brain {
+            Brain::Post { .. } => "at a post",
+            Brain::Patrol { wait, .. } if *wait > 0.0 => "pausing on a route",
+            Brain::Patrol { .. } => "patrolling",
+            Brain::Wander { wait, .. } if *wait > 0.0 => "pausing",
+            Brain::Wander { .. } => "strolling",
+        }
+    }
+
     /// Model to world, turned so the model faces `facing`. The dead
     /// whose model has no fall clip that fits topple over backwards about
     /// their feet instead.

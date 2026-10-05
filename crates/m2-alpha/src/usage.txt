@@ -66,6 +66,11 @@ m2-alpha [options]
   --mission-seconds <s>  with --screenshot: play this long instead of ten
   --mission-look <m>     with --mission --screenshot: take the picture from
                          this far from the nearest marker, looking at it
+  --autoplay             with --mission --screenshot: she plays the contract
+                         herself by its markers (runs to places, shoots the
+                         marked soldiers, rockets the marked gates, takes
+                         the vehicles brought), logging how it goes, until
+                         it is done or --mission-seconds are up
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.

@@ -530,25 +530,25 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                     return Ok(());
                 }
             }
+            let mut weapons = Vec::new();
             for &(name, hash) in &found.weapons {
                 let data = source.model(hash)?;
                 let model = data.parse()?;
                 let muzzle = m2_assets::vehicle::marker(&model, combat::MUZZLE)
                     .map_or(Vec3::new(0.0, 0.0, model.info.bounds.max[2]), Vec3::from);
+                let (lo, hi) = (model.info.bounds.min, model.info.bounds.max);
+                weapons.push(format!(
+                    "{name} {hash:08x} ({:.2} x {:.2} x {:.2} m)",
+                    hi[0] - lo[0],
+                    hi[1] - lo[1],
+                    hi[2] - lo[2]
+                ));
                 let cpu = CpuModel::build(hash, &model, 0);
                 if tx.send(Loaded::Weapon(name, cpu, muzzle)).is_err() {
                     return Ok(());
                 }
             }
-            eprintln!(
-                "weapons: {}",
-                found
-                    .weapons
-                    .iter()
-                    .map(|(n, h)| format!("{n} {h:08x}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            eprintln!("weapons: {}", weapons.join(", "));
             let all = &found.vehicles;
             let drivable: Vec<&CatalogueEntry> = all
                 .iter()
@@ -797,6 +797,12 @@ impl Scene {
             format!("mission vehicle {guid:#x}"),
             move |spec, cpu| Loaded::MissionVehicle(guid, spec, cpu),
         );
+    }
+
+    /// Loads the first of `models` that drives, to be parked near the
+    /// player as the vehicles she starts with are.
+    pub fn load_parked(&self, models: Vec<CatalogueEntry>) {
+        self.load_vehicle_as(models, "parked vehicle".into(), Loaded::Vehicle);
     }
 
     /// Loads one of the game's own parked vehicles, layer entity `entity`

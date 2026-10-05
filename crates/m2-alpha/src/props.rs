@@ -148,6 +148,15 @@ impl Props {
         Some(local.cmpge(lo - pad).all() && local.cmple(hi + pad).all())
     }
 
+    /// The middle of `entity`'s model's box in the world; `None` unless it
+    /// is shown and its model has loaded.
+    pub fn centre(&self, entity: u32) -> Option<Vec3> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        let (lo, hi) = m.gpu.bounds;
+        Some(p.position + p.rotation * ((lo + hi) * 0.5))
+    }
+
     /// `entity`'s, if it is shown, and whether its model has loaded.
     pub fn get(&self, entity: u32) -> Option<(&Prop, bool)> {
         let p = self.shown.get(&entity)?;

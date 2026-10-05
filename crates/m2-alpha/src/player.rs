@@ -365,6 +365,14 @@ impl Player {
         self.character.position + Vec3::Y * LOOK_HEIGHT
     }
 
+    /// The point the camera turns about: above her head on foot, above the
+    /// vehicle she drives. The crosshair's line passes through it, so a
+    /// shot goes at what lies straight along the camera from here.
+    pub fn pivot(&self) -> Vec3 {
+        self.chase_target
+            .map_or_else(|| self.look_at(), |(at, _)| at)
+    }
+
     pub fn camera_forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
