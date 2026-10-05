@@ -1711,7 +1711,10 @@ impl WgpuBackend {
             view_proj: (view.projection * view.view).to_cols_array(),
             eye: view.eye().extend(1.0).to_array(),
             sun_dir: l.sun_direction.extend(0.0).to_array(),
-            sun_color: l.sun_color.extend(0.0).to_array(),
+            sun_color: l
+                .sun_color
+                .extend(if l.gamma_light { 1.0 } else { 0.0 })
+                .to_array(),
             sky: l.sky_color.extend(l.fog_density).to_array(),
             ambient_cube: l.ambient_cube.map(|c| c.extend(0.0).to_array()),
             rim: l.rim_color.extend(l.rim_threshold).to_array(),

@@ -75,7 +75,7 @@ pub struct Lighting {
     /// Direction the sunlight travels (from the sun towards the ground),
     /// world space. Need not be normalised.
     pub sun_direction: Vec3,
-    /// Linear RGB.
+    /// Linear RGB (see [`gamma_light`](Self::gamma_light)).
     pub sun_color: Vec3,
     /// Linear RGB light reaching surfaces from every side, by the way they
     /// face: +x, -x, +y, -y, +z, -z (the game's ambient cube).
@@ -130,6 +130,12 @@ pub struct Lighting {
     /// pixels square, new each frame) moves a display value either way;
     /// 0 for none.
     pub grain: f32,
+    /// Light surfaces as the game's shaders do: the sun's and ambient
+    /// light (each given here decoded, as linear light) are encoded to
+    /// display values, summed there and the sum decoded, so a surface in
+    /// sun and shade at once is lit as in the game. Off: summed as linear
+    /// light.
+    pub gamma_light: bool,
 }
 
 /// The game's adaptation and tone map, from its atmosphere's `Bloom*`
@@ -273,6 +279,7 @@ impl Default for Lighting {
             tone_map: None,
             monochrome: None,
             grain: 0.0,
+            gamma_light: false,
         }
     }
 }
