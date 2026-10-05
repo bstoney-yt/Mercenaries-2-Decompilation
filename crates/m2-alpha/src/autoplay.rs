@@ -2,18 +2,21 @@
 //! the markers the scripts put up, shoots the soldiers and blows up the
 //! things they mark, gets into the vehicles they bring and drives on, all
 //! with a player's moves: an [`Intent`] a tick, as the keyboard and mouse
-//! give. What she does is logged, so a run shows whether the mission can
-//! be played through and where she got stuck. Where she makes no headway
-//! for a while she hops ahead (logged too): the run goes on to the later
-//! objectives, and the hops show where the way is blocked.
+//! give. She goes the way planned round walls, the sea and ground too
+//! steep ([`Route`]). What she does is logged, so a run shows whether the
+//! mission can be played through and where she got stuck. Where she makes
+//! no headway for a while she hops ahead (logged too): the run goes on to
+//! the later objectives, and the hops show where the way is blocked.
 
-use m2_engine::{Physics, VehicleId};
+use m2_engine::physics::FLOAT_DEPTH;
+use m2_engine::{Physics, VehicleControls, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
 use crate::combat::{Combat, Trigger, Weapon};
-use crate::game::{Game, place};
-use crate::mission::Mark;
+use crate::game::{Game, can_get_out, get_out, place};
+use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
+use crate::route::{Mover, Route};
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
@@ -71,10 +74,20 @@ const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
 const HOP: f32 = 25.0;
+/// A hop along her way goes at least this far, metres; a way ending
+/// nearer than that is passed over for the place itself.
+const HOP_LEAST: f32 = 8.0;
+/// A hop lands on the ground found from this far above the way's height
+/// there, down to this far below it, metres; else on the highest there.
+const HOP_ABOVE: f32 = 3.0;
+const HOP_BELOW: f32 = 10.0;
 /// A ride she has had is taken again for places further than this when it
 /// stands within the second distance, metres.
 const RIDE_FOR: f32 = 120.0;
 const RIDE_NEAR: f32 = 40.0;
+/// One of the scripts' vehicles she hasn't driven is taken from this far,
+/// metres: they brought it for her.
+const RIDE_FRESH: f32 = 150.0;
 /// Out of a vehicle without a cannon this far from a target, metres.
 const GET_OUT: f32 = 40.0;
 /// Within this far of a vehicle's door she presses to get in, metres;
@@ -84,6 +97,47 @@ const PRESS_GAP: f32 = 1.5;
 /// Fallen this far under the ground (metres: a hole where the island
 /// hadn't streamed in yet), she is put back on it.
 const UNDER: f32 = 5.0;
+/// From further than this from a place (metres), she goes the way planned
+/// to it ([`Route`]): in cells this size on foot and driving (metres),
+/// over ground up to this steep on foot, on wheels and on tracks; planned
+/// again every this long (seconds: the island streams in as she goes),
+/// when the place moves this far or she strays this far off it (metres).
+/// She heads for a point this far on along it, plus this many seconds at
+/// her speed, at most this (metres); taken to run at this speed (m/s).
+const PLAN_FROM: f32 = 25.0;
+const FOOT_CELL: f32 = 2.0;
+const DRIVE_CELL: f32 = 4.0;
+const ON_FOOT: f32 = 40f32.to_radians();
+const ON_WHEELS: f32 = 22f32.to_radians();
+const ON_TRACKS: f32 = 27f32.to_radians();
+const REPLAN: f32 = 20.0;
+const REPLAN_MOVED: f32 = 5.0;
+const STRAYED: f32 = 15.0;
+const LOOK_AHEAD: f32 = 5.0;
+const LOOK_TIME: f32 = 0.6;
+const LOOK_MOST: f32 = 20.0;
+const RUN: f32 = 6.0;
+/// A boat's way keeps this much water under its keel, metres. Stuck, a
+/// boat is put afloat over water that deep: on its way, back towards it
+/// in steps this long, or this far to either side of it (metres).
+const UNDER_KEEL: f32 = 0.6;
+const AFLOAT_STEP: f32 = 5.0;
+const AFLOAT_SIDES: [f32; 5] = [0.0, -8.0, 8.0, -16.0, 16.0];
+/// Rays looking for open water start this far over the sea, metres (over
+/// rocks standing out of it).
+const OVER_WATER: f32 = 30.0;
+/// A way planned this much longer than the straight one is logged, at
+/// most every this long (seconds).
+const ROUNDABOUT: f32 = 1.15;
+const LOG_WAY: f32 = 30.0;
+/// A supply crate down within this far (metres) is opened on the way,
+/// standing this far from its side (with a bash's 1.8 m reach), turned to
+/// it within this much (radians); one not open after this many seconds is
+/// left.
+const OPEN_NEAR: f32 = 40.0;
+const OPEN_FROM: f32 = 0.9;
+const OPEN_FACING: f32 = 0.2;
+const OPEN_FOR: f32 = 45.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
 
@@ -98,6 +152,11 @@ enum Goal {
     Blast { target: u32, at: Vec3 },
     /// Get into vehicle `vehicles[i]`.
     Board(usize),
+    /// Break open the supply crate `target` (the scripts' object) with a
+    /// bash.
+    Open(u32),
+    /// Take what the supply crate `from` left (walking up to it).
+    Take(u32),
 }
 
 impl Goal {
@@ -107,9 +166,19 @@ impl Goal {
             (Goal::Reach { target: a, .. }, Goal::Reach { target: b, .. })
             | (Goal::Blast { target: a, .. }, Goal::Blast { target: b, .. }) => a == b,
             (Goal::Shoot(a), Goal::Shoot(b)) | (Goal::Board(a), Goal::Board(b)) => a == b,
+            (Goal::Open(a), Goal::Open(b)) | (Goal::Take(a), Goal::Take(b)) => a == b,
             _ => false,
         }
     }
+}
+
+/// The way she is going ([`Route`]): when it was planned, and whether
+/// for driving.
+#[derive(Debug)]
+struct Way {
+    route: Route,
+    planned: f32,
+    driving: bool,
 }
 
 /// The player playing herself.
@@ -143,17 +212,30 @@ pub struct Autoplay {
     reversing: Option<(f32, f32)>,
     /// Seconds a vehicle has been stuck.
     stalled: f32,
-    /// The vehicle she drove last (index into the scene's).
+    /// The vehicle she drove last, and all she has driven (indices into
+    /// the scene's).
     ride: Option<usize>,
+    ridden: Vec<usize>,
     /// Seconds since she last pressed to get in or out.
     pressed: f32,
     /// Getting out of the vehicle she is stuck in, to go on on foot.
     leave: bool,
+    /// The way she is going, and when a roundabout one was last logged.
+    way: Option<Way>,
+    way_logged: f32,
     /// Hops: from, to.
     pub hops: Vec<(Vec3, Vec3)>,
     /// The objectives last logged.
     objectives: Vec<String>,
     next_report: f32,
+    /// The supply crate she is opening and since when, and those she
+    /// gave up on.
+    opening: Option<(u32, f32)>,
+    left_shut: Vec<u32>,
+    /// The crate whose pickup she is going for and since when, and those
+    /// whose pickups she gave up on.
+    taking: Option<(u32, f32)>,
+    left_lying: Vec<u32>,
 }
 
 impl Autoplay {
@@ -180,7 +262,12 @@ impl Autoplay {
             return Intent::default();
         }
         match p.driving {
-            Some(i) => self.ride = Some(i),
+            Some(i) => {
+                self.ride = Some(i);
+                if !self.ridden.contains(&i) {
+                    self.ridden.push(i);
+                }
+            }
             None => self.leave = false,
         }
         self.ground(game);
@@ -206,6 +293,7 @@ impl Autoplay {
             self.sidestep = None;
             self.reversing = None;
             self.stalled = 0.0;
+            self.way = None;
         }
         self.goal = chosen.map(|c| c.0);
         if let (Some(Goal::Reach { target, .. }), Some(t)) = (&self.goal, self.arrived)
@@ -223,6 +311,8 @@ impl Autoplay {
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
             Some(Goal::Blast { at, .. }) => self.blast(game, at, dt),
             Some(Goal::Board(i)) => self.board(game, i, dt),
+            Some(Goal::Open(target)) => self.open(game, target, dt),
+            Some(Goal::Take(from)) => self.take(game, from, dt),
         }
     }
 
@@ -252,6 +342,46 @@ impl Autoplay {
         fn nearest(ms: Vec<&Mark>, here: Vec3) -> Option<&Mark> {
             ms.into_iter()
                 .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
+        }
+        // A supply crate down near her or marked (or the one she set out
+        // to open): broken open first, for what is inside.
+        if driving.is_none()
+            && let Some((target, d)) = game
+                .scene
+                .flights
+                .crates_standing()
+                .filter(|g| !self.left_shut.contains(g))
+                .filter_map(|g| {
+                    let (at, _) = game.scene.flights.crate_standing(g)?;
+                    let d = at.distance(here);
+                    let wanted = live.iter().any(|m| m.target == g)
+                        || self.opening.is_some_and(|o| o.0 == g)
+                        || d < OPEN_NEAR;
+                    wanted.then_some((g, d))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            return Some((
+                Goal::Open(target),
+                format!("opening the supply crate {target:#x}, {d:.0} m off"),
+            ));
+        }
+        // What a crate she broke open left for her: taken before going on.
+        if driving.is_none()
+            && let Some((from, d)) = game
+                .scene
+                .flights
+                .pickups()
+                .iter()
+                .filter(|p| p.what.gives.is_some() && !self.left_lying.contains(&p.from))
+                .map(|p| (p.from, p.at.distance(here)))
+                .filter(|&(_, d)| d < OPEN_NEAR)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            return Some((
+                Goal::Take(from),
+                format!("taking what the supply crate {from:#x} left, {d:.1} m off"),
+            ));
         }
         // What to destroy, nearest first: soldiers are shot, things blown up.
         let destroy: Vec<&Mark> = live
@@ -348,19 +478,28 @@ impl Autoplay {
             .collect();
         let m = nearest(places, here)?;
         if driving.is_none() {
-            // Far, with a ride close (hers from before, or one of the
-            // scripts' vehicles): take it.
-            let near = |i: usize| {
-                vehicles.get(i).is_some_and(|v| !v.wrecked)
+            // Far, with a ride close: the scripts' vehicle they brought
+            // last that she hasn't driven (the tank delivered for the next
+            // leg), else hers from before or another of theirs.
+            let near = |i: usize, within: f32| {
+                vehicles
+                    .get(i)
+                    .is_some_and(|v| !v.wrecked && !v.spec.is_boat())
                     && vehicle_at(game, i)
-                        .is_some_and(|t| t.w_axis.truncate().distance(here) < RIDE_NEAR)
+                        .is_some_and(|t| t.w_axis.truncate().distance(here) < within)
             };
-            if m.at.distance(here) > RIDE_FOR
-                && let Some(i) = self
-                    .ride
+            let fresh = (0..vehicles.len())
+                .rev()
+                .filter(|&i| vehicles[i].guid.is_some() && !self.ridden.contains(&i))
+                .find(|&i| near(i, RIDE_FRESH));
+            let known = || {
+                self.ride
                     .into_iter()
                     .chain((0..vehicles.len()).filter(|&i| vehicles[i].guid.is_some()))
-                    .find(|&i| near(i))
+                    .find(|&i| near(i, RIDE_NEAR))
+            };
+            if m.at.distance(here) > RIDE_FOR
+                && let Some(i) = fresh.or_else(known)
             {
                 return Some((
                     Goal::Board(i),
@@ -379,7 +518,7 @@ impl Autoplay {
                 && let Some(i) = vehicles
                     .iter()
                     .enumerate()
-                    .filter(|(_, v)| v.guid.is_some() && !v.wrecked)
+                    .filter(|(_, v)| v.guid.is_some() && !v.wrecked && !v.spec.is_boat())
                     .filter_map(|(i, _)| {
                         let d = vehicle_at(game, i)?.w_axis.truncate().distance(m.at);
                         (d < TAKE_NEAR).then_some((i, d))
@@ -411,6 +550,83 @@ impl Autoplay {
         ))
     }
 
+    /// Opening supply crate `target`: to its side, turned to it, and a
+    /// bash (low, at a crate on the ground); left shut if not open after
+    /// [`OPEN_FOR`] seconds.
+    fn open(&mut self, game: &mut Game, target: u32, dt: f32) -> Intent {
+        let since = match self.opening {
+            Some((g, t)) if g == target => t,
+            _ => {
+                self.opening = Some((target, self.clock));
+                self.clock
+            }
+        };
+        let (Some(p), Some((at, half))) = (
+            game.scene.player.as_ref(),
+            game.scene.flights.crate_standing(target),
+        ) else {
+            return Intent::default();
+        };
+        if self.clock - since > OPEN_FOR {
+            eprintln!(
+                "autoplay {:.1} s: the supply crate {target:#x} at {at:.1} would not open: left shut",
+                self.clock
+            );
+            self.left_shut.push(target);
+            return Intent::default();
+        }
+        let here = p.character.position;
+        let to = (at - here).with_y(0.0);
+        if to.length() > half + OPEN_FROM {
+            return self.walk(game, at, half + OPEN_FROM, dt);
+        }
+        // Standing, she turns only to aim: so she aims round to it, and
+        // bashes once she faces it.
+        let yaw = to.x.atan2(to.z);
+        let facing = wrap(yaw - p.facing).abs() < OPEN_FACING;
+        Intent {
+            look: turn_to(p, yaw, CRUISE_PITCH, dt),
+            trigger: Trigger {
+                aim: true,
+                melee: facing,
+                ..Trigger::default()
+            },
+            ..Intent::default()
+        }
+    }
+
+    /// Taking what supply crate `from` left: walking onto it (the game
+    /// takes it once she is within its reach); left lying if not taken
+    /// after [`OPEN_FOR`] seconds.
+    fn take(&mut self, game: &mut Game, from: u32, dt: f32) -> Intent {
+        let since = match self.taking {
+            Some((g, t)) if g == from => t,
+            _ => {
+                self.taking = Some((from, self.clock));
+                self.clock
+            }
+        };
+        let Some(p) = game
+            .scene
+            .flights
+            .pickups()
+            .iter()
+            .find(|p| p.from == from)
+            .copied()
+        else {
+            return Intent::default();
+        };
+        if self.clock - since > OPEN_FOR {
+            eprintln!(
+                "autoplay {:.1} s: what the supply crate {from:#x} left at {:.1} was not taken: left lying",
+                self.clock, p.at
+            );
+            self.left_lying.push(from);
+            return Intent::default();
+        }
+        self.walk(game, p.at, p.what.reach * 0.5, dt)
+    }
+
     /// Nothing to do: stand, or stop the vehicle.
     fn idle(&mut self, game: &Game) -> Intent {
         let driving = game
@@ -439,10 +655,10 @@ impl Autoplay {
             return Intent::default();
         };
         let d = (at - here).with_y(0.0).length();
-        if self.headway(game, at, d) {
+        let mut target = self.waypoint(game, None, here, at, RUN);
+        if self.headway(game, at, self.left_to_go(here, at)) {
             return Intent::default();
         }
-        let mut target = at;
         if d < arrive || self.arrived.is_some() {
             let since = *self.arrived.get_or_insert(self.clock);
             if self.clock - since < CIRCLE_AFTER {
@@ -487,7 +703,8 @@ impl Autoplay {
         }
         let pos = m.w_axis.truncate();
         let d = (at - pos).with_y(0.0).length();
-        if self.headway(game, at, d) {
+        let toward = self.waypoint(game, Some(i), pos, at, speed);
+        if self.headway(game, at, self.left_to_go(pos, at)) {
             return Intent::default();
         }
         if d < arrive.max(6.0) {
@@ -497,7 +714,7 @@ impl Autoplay {
                 ..Intent::default()
             };
         }
-        let (angle, _) = heading_to(m, at);
+        let (angle, _) = heading_to(m, toward);
         // Round what stands in the way.
         let angle = match (
             game.scene.world.as_ref(),
@@ -522,6 +739,16 @@ impl Autoplay {
         }
         if self.stalled > STALL {
             self.stalled = 0.0;
+            // A boat run aground near the place: out, into the shallows
+            // (further off, it backs off the rocks).
+            if d < RIDE_FOR && self.can_leave(game, i) {
+                eprintln!(
+                    "autoplay {:.1} s: the {} is aground {d:.0} m off: getting out",
+                    self.clock, game.scene.vehicles[i].spec.label
+                );
+                self.leave = true;
+                return self.press(speed);
+            }
             self.reversing = Some((-angle.signum(), REVERSE));
         }
         if let Some((s, left)) = &mut self.reversing {
@@ -677,8 +904,9 @@ impl Autoplay {
         }
     }
 
-    /// At a target from vehicle `i`: a tank's cannon fires at it from
-    /// within range; from anything else she gets out close to it.
+    /// At a target from vehicle `i`: a cannon (a tank's, the Stryker's)
+    /// fires at it from within range; from anything else she gets out
+    /// close to it.
     fn at_target_driving(&mut self, game: &mut Game, i: usize, target: Vec3, dt: f32) -> Intent {
         let Some((m, speed)) = vehicle_state(game, i) else {
             return Intent::default();
@@ -686,7 +914,7 @@ impl Autoplay {
         let Some(v) = game.scene.vehicles.get(i) else {
             return Intent::default();
         };
-        let cannon = v.spec.kind == "tank" && v.spec.muzzle.is_some();
+        let cannon = v.spec.cannon();
         let d = target.distance(m.w_axis.truncate());
         if !cannon {
             if d < GET_OUT {
@@ -757,6 +985,104 @@ impl Autoplay {
         self.walk(game, door, 1.0, dt)
     }
 
+    /// Where to head for on her way to `at` from `pos` (driving vehicle
+    /// `driving`, or on foot), going `speed` (m/s): along the way planned
+    /// to it ([`Route`]), planned again as said at [`PLAN_FROM`]; straight
+    /// at it from within that.
+    fn waypoint(
+        &mut self,
+        game: &Game,
+        driving: Option<usize>,
+        pos: Vec3,
+        at: Vec3,
+        speed: f32,
+    ) -> Vec3 {
+        let straight = (at - pos).with_y(0.0).length();
+        if straight < PLAN_FROM {
+            self.way = None;
+            return at;
+        }
+        let stale = self.way.as_ref().is_none_or(|w| {
+            w.driving != driving.is_some()
+                || w.route.goal.distance(at) > REPLAN_MOVED
+                || self.clock - w.planned > REPLAN
+        });
+        if stale && let Some(world) = game.scene.world.as_ref() {
+            let mover = match driving.and_then(|i| game.scene.vehicles.get(i)) {
+                Some(v) => Mover {
+                    cell: DRIVE_CELL,
+                    steepest: if v.spec.tracked { ON_TRACKS } else { ON_WHEELS },
+                    wades: false,
+                    skip: v.id,
+                    afloat: v.spec.is_boat().then(|| keel_depth(&v.spec) + UNDER_KEEL),
+                },
+                None => Mover {
+                    cell: FOOT_CELL,
+                    steepest: ON_FOOT,
+                    wades: true,
+                    skip: None,
+                    afloat: None,
+                },
+            };
+            let sea = world.settings.sea_level.max(WATERLINE);
+            let route = Route::plan(&world.physics, mover, pos, at, sea);
+            if (!route.reaches || route.length() > straight * ROUNDABOUT)
+                && self.clock - self.way_logged > LOG_WAY
+            {
+                self.way_logged = self.clock;
+                let end = route.points.last().copied().unwrap_or(pos);
+                let short = (route.goal - end).with_y(0.0).length();
+                let how = if route.reaches {
+                    format!(
+                        "goes round: {:.0} m, not {straight:.0} m straight",
+                        route.length()
+                    )
+                } else if short < 0.5 {
+                    "is not found: no step brings her nearer, so straight at it".to_owned()
+                } else {
+                    format!(
+                        "is not found: {:.0} m of way ends {short:.0} m short",
+                        route.length()
+                    )
+                };
+                eprintln!(
+                    "autoplay {:.1} s: the way to {} from {pos:.0} {how}, by {} points",
+                    self.clock,
+                    self.what,
+                    route.points.len()
+                );
+            }
+            // Headway is measured along the new way from here on.
+            let left = route.remaining(pos);
+            if left > self.best.0 + 1.0 {
+                self.best.0 = left;
+            }
+            self.way = Some(Way {
+                route,
+                planned: self.clock,
+                driving: driving.is_some(),
+            });
+        }
+        let Some(way) = &mut self.way else {
+            return at;
+        };
+        let ahead = (LOOK_AHEAD + speed.abs() * LOOK_TIME).min(LOOK_MOST);
+        let (toward, off) = way.route.steer(pos, ahead);
+        if off > STRAYED {
+            self.way = None;
+        }
+        toward
+    }
+
+    /// How far she has still to go from `pos` to `at`, metres: along her
+    /// way, else straight.
+    fn left_to_go(&self, pos: Vec3, at: Vec3) -> f32 {
+        self.way.as_ref().map_or_else(
+            || (at - pos).with_y(0.0).length(),
+            |w| w.route.remaining(pos),
+        )
+    }
+
     /// The use key, once a [`PRESS_GAP`]: stopped first when driving.
     fn press(&mut self, speed: f32) -> Intent {
         if speed.abs() > 1.0 {
@@ -776,9 +1102,18 @@ impl Autoplay {
         }
     }
 
-    /// Keeps track of how close she has come to `at` (`d` metres off):
-    /// short of headway she sidesteps and jumps, long short of it she
-    /// hops ahead (true then: nothing more this tick).
+    /// Whether vehicle `i` is a boat she can get out of where it is (not
+    /// over deep water).
+    fn can_leave(&self, game: &Game, i: usize) -> bool {
+        let (Some(world), Some(v)) = (&game.scene.world, game.scene.vehicles.get(i)) else {
+            return false;
+        };
+        v.spec.is_boat() && can_get_out(&world.physics, v)
+    }
+
+    /// Keeps track of how close she has come to `at` (`d` metres off, on
+    /// her way): short of headway she sidesteps and jumps, long short of it
+    /// she hops ahead (true then: nothing more this tick).
     fn headway(&mut self, game: &mut Game, at: Vec3, d: f32) -> bool {
         if d < self.best.0 - 1.0 {
             self.best = (d, self.clock);
@@ -790,12 +1125,16 @@ impl Autoplay {
         }
         if stuck > HOP_AFTER {
             // Stuck driving close to the place: on foot from here.
-            let driving = game
-                .scene
-                .player
-                .as_ref()
-                .is_some_and(|p| p.driving.is_some());
-            if driving && d < RIDE_FOR {
+            let driving = game.scene.player.as_ref().and_then(|p| p.driving);
+            let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
+            if let Some(i) = driving
+                && near
+                && game
+                    .scene
+                    .world
+                    .as_ref()
+                    .is_none_or(|w| can_get_out(&w.physics, &game.scene.vehicles[i]))
+            {
                 eprintln!(
                     "autoplay {:.1} s: no headway driving for {stuck:.0} s, {d:.0} m off: getting out",
                     self.clock
@@ -804,7 +1143,17 @@ impl Autoplay {
                 self.best = (f32::INFINITY, self.clock);
                 return false;
             }
-            self.hop(game, at, stuck);
+            // Ahead along her way, else (a way that ends where she is:
+            // round 86 hopped her 2 m twice by gate 1, to the floor she
+            // was on) straight at the place.
+            let from = game.focus();
+            let to = self
+                .way
+                .as_mut()
+                .map(|w| w.route.steer(from, HOP).0)
+                .filter(|to| (*to - from).with_y(0.0).length() >= HOP_LEAST)
+                .unwrap_or(at);
+            self.hop(game, to, stuck);
             return true;
         }
         if stuck > STUCK && self.sidestep.is_none() && (stuck % STUCK) < 0.05 {
@@ -815,7 +1164,8 @@ impl Autoplay {
     }
 
     /// Moves her (and what she drives) up to [`HOP`] metres towards `at`,
-    /// onto the ground there.
+    /// onto the ground there; a boat, onto water deep enough near there
+    /// (else she gets out of it, onto the ground).
     fn hop(&mut self, game: &mut Game, at: Vec3, stuck: f32) {
         let from = game.focus();
         let flat = (at - from).with_y(0.0);
@@ -823,12 +1173,71 @@ impl Autoplay {
         let (Some(world), Some(p)) = (&mut game.scene.world, &mut game.scene.player) else {
             return;
         };
-        let top = Vec3::new(to.x, to.y.max(at.y) + 80.0, to.z);
-        if let Some((t, _)) = world.physics.cast_ray(top, Vec3::NEG_Y, 400.0) {
-            to.y = top.y - t;
+        // Onto the ground by the way's height there (the floor under a
+        // roof), else the highest there is.
+        let near = Vec3::new(to.x, at.y + HOP_ABOVE, to.z);
+        let high = Vec3::new(to.x, to.y.max(at.y) + 80.0, to.z);
+        if let Some(y) = world
+            .physics
+            .cast_ray(near, Vec3::NEG_Y, HOP_ABOVE + HOP_BELOW)
+            .map(|(t, _)| near.y - t)
+            .or_else(|| {
+                world
+                    .physics
+                    .cast_ray(high, Vec3::NEG_Y, 400.0)
+                    .map(|(t, _)| high.y - t)
+            })
+        {
+            to.y = y;
         }
-        match p.driving {
-            Some(i) => {
+        let yaw = flat.x.atan2(flat.z);
+        // A boat she drives, and its body.
+        let boat = p
+            .driving
+            .filter(|&i| game.scene.vehicles[i].spec.is_boat())
+            .and_then(|i| game.scene.vehicles[i].id.map(|id| (i, id)));
+        match (p.driving, boat) {
+            // Round 88 hopped the start boat 35 m up onto the rocks it
+            // was stuck on.
+            (_, Some((i, id))) => {
+                let v = &mut game.scene.vehicles[i];
+                eprintln!(
+                    "autoplay {:.1} s: stuck driving the {}: {}",
+                    self.clock,
+                    v.spec.label,
+                    stuck_report(world, id, v.spec.hull, self.reversing.is_some())
+                );
+                match afloat_near(&world.physics, &v.spec, id, from, to, yaw) {
+                    Some(spot) => {
+                        world.physics.remove_vehicle(id);
+                        v.id = None;
+                        if !place(&mut world.physics, v, spot, yaw) {
+                            eprintln!(
+                                "autoplay: no water to put the {} on at {spot:.1}",
+                                v.spec.label
+                            );
+                        }
+                        to = spot;
+                    }
+                    None => {
+                        eprintln!(
+                            "autoplay: no water deep enough for the {} near {to:.1}: out of it",
+                            v.spec.label
+                        );
+                        world.physics.drive(
+                            id,
+                            VehicleControls {
+                                parked: true,
+                                ..VehicleControls::default()
+                            },
+                        );
+                        get_out(&world.physics, v, p);
+                        p.character.position = to + Vec3::Y * 0.1;
+                        p.character.velocity = Vec3::ZERO;
+                    }
+                }
+            }
+            (Some(i), None) => {
                 let v = &mut game.scene.vehicles[i];
                 if let Some(id) = v.id {
                     eprintln!(
@@ -838,7 +1247,6 @@ impl Autoplay {
                         stuck_report(world, id, v.spec.hull, self.reversing.is_some())
                     );
                 }
-                let yaw = flat.x.atan2(flat.z);
                 if let Some(id) = v.id.take() {
                     world.physics.remove_vehicle(id);
                 }
@@ -849,7 +1257,7 @@ impl Autoplay {
                     );
                 }
             }
-            None => {
+            (None, _) => {
                 p.character.position = to + Vec3::Y * 0.1;
                 p.character.velocity = Vec3::ZERO;
             }
@@ -862,6 +1270,7 @@ impl Autoplay {
         self.best = (f32::INFINITY, self.clock);
         self.sidestep = None;
         self.reversing = None;
+        self.way = None;
     }
 
     /// Fallen through a hole in the island (it hadn't streamed in under
@@ -1048,6 +1457,57 @@ fn clear_way(
     best.1
 }
 
+/// Where boat `spec` (body `id`), stuck at `from`, can be put afloat
+/// facing `yaw` on its way to `to`: the furthest point along it, or to
+/// either side of it, with water [`UNDER_KEEL`] under its keel all over its
+/// hull's footprint, at the water's height.
+fn afloat_near(
+    physics: &Physics,
+    spec: &VehicleSpec,
+    id: VehicleId,
+    from: Vec3,
+    to: Vec3,
+    yaw: f32,
+) -> Option<Vec3> {
+    let water = physics.water()?;
+    let floor = water - keel_depth(spec) - UNDER_KEEL;
+    let flat = (to - from).with_y(0.0);
+    let length = flat.length();
+    let ahead = flat.normalize_or_zero();
+    let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+    let turn = Quat::from_rotation_y(yaw);
+    let (lo, hi) = spec.hull;
+    let footprint = [
+        Vec3::ZERO,
+        Vec3::new(lo.x, 0.0, lo.z),
+        Vec3::new(hi.x, 0.0, lo.z),
+        Vec3::new(lo.x, 0.0, hi.z),
+        Vec3::new(hi.x, 0.0, hi.z),
+    ];
+    let open = |p: Vec3| {
+        footprint.iter().all(|&q| {
+            let at = p + turn * q;
+            let top = Vec3::new(at.x, water + OVER_WATER, at.z);
+            physics
+                .cast_ray_past(top, Vec3::NEG_Y, top.y - floor, id)
+                .is_none()
+        })
+    };
+    let steps = (length / AFLOAT_STEP).ceil() as usize;
+    (1..=steps)
+        .rev()
+        .flat_map(|k| {
+            let along = from.with_y(water) + ahead * (length * k as f32 / steps as f32);
+            AFLOAT_SIDES.map(|s| along + side * s)
+        })
+        .find(|&p| open(p))
+}
+
+/// How deep a boat's keel floats under the water, metres.
+fn keel_depth(spec: &VehicleSpec) -> f32 {
+    FLOAT_DEPTH - spec.hull.0.y
+}
+
 /// Whether something stands within `within` metres of a vehicle's
 /// bumper at its height (another parked close ahead, a wall): rays from
 /// both front corners and the middle, a little inside the bumper.
@@ -1120,8 +1580,8 @@ fn aim(p: &Player, target: Vec3, dt: f32) -> (Vec2, f32) {
 }
 
 /// Why a vehicle may be stuck: its speed, how it sits (nose up, rolled),
-/// how many wheels touch, what is just ahead of its bumper and how the
-/// ground rises ahead.
+/// how many wheels touch, what is just ahead of its bumper, how the
+/// ground rises ahead and what its body touches (where on the model).
 pub(crate) fn stuck_report(
     world: &m2_engine::World,
     id: m2_engine::VehicleId,
@@ -1167,14 +1627,31 @@ pub(crate) fn stuck_report(
             _ => format!("? at {k} m"),
         })
         .collect();
+    // What its body touches, where on the model, and the box what it
+    // touches fills.
+    let to_model = m.inverse();
+    let touching: Vec<String> = physics
+        .vehicle_touching(id)
+        .iter()
+        .map(|&(key, at, (lo, hi))| {
+            format!(
+                "{} at {:.1}, filling {:.1} to {:.1}",
+                crate::static_name(world, key),
+                to_model.transform_point3(at),
+                lo,
+                hi
+            )
+        })
+        .collect();
     format!(
-        "{:.1} m/s{}, nose {:+.0} deg, rolled {:+.0} deg, {down} of {wheels} wheels down; ahead [{}]; ground [{}]",
+        "{:.1} m/s{}, nose {:+.0} deg, rolled {:+.0} deg, {down} of {wheels} wheels down; ahead [{}]; ground [{}]; body touching [{}]",
         physics.vehicle_speed(id),
         if reversing { " backing out" } else { "" },
         forward.y.clamp(-1.0, 1.0).asin().to_degrees(),
         right.y.clamp(-1.0, 1.0).asin().to_degrees(),
         ahead.join("; "),
-        rises.join(", ")
+        rises.join(", "),
+        touching.join("; ")
     )
 }
 

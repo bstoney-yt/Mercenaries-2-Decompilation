@@ -7,7 +7,7 @@
 //! rifle bank's loudest short mono sound, the RPG bank's loudest short one,
 //! and the artillery bank's loudest 1.5-3 s mono sound.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -141,6 +141,10 @@ pub struct GameAudio {
     install: Option<Install>,
     /// The engine running now.
     engine: Option<Engine>,
+    /// The rotors heard, by helicopter: a voice per loop.
+    rotors: HashMap<u32, Vec<VoiceId>>,
+    /// Banks read and found to have no engine sounds.
+    silent: HashSet<u32>,
     /// Seconds to the next one.
     ambient_wait: f32,
     seed: u64,
@@ -231,7 +235,14 @@ const AMBIENT_LONGEST: f32 = 8.0;
 /// Engine banks for vehicles whose template doesn't name one (the
 /// template database's `SoundEffect` does for most), by kind and label
 /// words, first match: the banks the templates give such vehicles.
-const ENGINES: [(&str, &str); 13] = [
+const ENGINES: [(&str, &str); 18] = [
+    // Boats first: their labels may hold other kinds' words. The
+    // playthroughs' start boat is a racing speedboat.
+    ("jetski", "veh_boatjetski"),
+    ("fishing|trawler", "veh_boatbigfishing"),
+    ("cruiser|yacht", "veh_boatcruiser"),
+    ("outboard|skiff", "veh_boatoutboard"),
+    ("boat", "veh_boatracing"),
     ("helicopter", "veh_helicoptermedium"),
     ("hmmwv|humvee|valiant", "veh_largegascrappy"),
     ("m151|jeep", "veh_jeep"),
@@ -336,6 +347,16 @@ impl Engine {
     }
 }
 
+/// The bank a helicopter's rotors are heard from, how loud its blades
+/// and its turbine are, and how far off they carry.
+const ROTOR_BANK: &str = "veh_helicoptermedium";
+const ROTOR_GAIN: f32 = 0.8;
+const ROTOR_WHINE: f32 = 0.3;
+const ROTOR_FALLOFF: Falloff = Falloff {
+    near: 20.0,
+    far: 800.0,
+};
+
 /// A tank's main gun: the loudest of its bank's sounds 0.4 to 4 s long.
 fn tank_gun(library: &SoundLibrary) -> Option<SoundBuffer> {
     pick(library, "wpn_tankgun", |s| {
@@ -409,7 +430,15 @@ fn bank_sounds(install: &Install) -> BankSounds {
 }
 
 /// Every engine bank, to name a template's bank (a name hash) in logs.
-const ENGINE_BANKS: [&str; 22] = [
+const ENGINE_BANKS: [&str; 30] = [
+    "veh_boatbigfishing",
+    "veh_boatoutboard",
+    "veh_boatoutboard2",
+    "veh_boatrib",
+    "veh_boatcruiser",
+    "veh_boatracing",
+    "veh_boatjetski",
+    "veh_boatcrappy",
     "veh_semi",
     "veh_bus",
     "veh_jeep",
@@ -525,6 +554,8 @@ impl GameAudio {
             engine_loads: channel(),
             install: install.cloned(),
             engine: None,
+            rotors: HashMap::new(),
+            silent: HashSet::new(),
             ambient_wait: 3.0,
             seed: 0x9e37_79b9_7f4a_7c15,
             voices: None,
@@ -727,9 +758,6 @@ impl GameAudio {
     /// revs with speed and throttle, its start and stop sounds as it is
     /// got in and out of. A bank is read the first time it's driven.
     pub fn engine(&mut self, driving: Option<EngineInput>, dt: f32) {
-        while let Ok((bank, sounds)) = self.engine_loads.1.try_recv() {
-            self.engines.insert(bank, sounds.map(Arc::new));
-        }
         if self
             .engine
             .as_ref()
@@ -749,41 +777,27 @@ impl GameAudio {
             return;
         };
         if self.engine.is_none() {
-            match self.engines.get(&input.bank) {
-                Some(Some(sounds)) => {
-                    let sounds = sounds.clone();
-                    let voices = self.out.with(|m| {
-                        if let Some(start) = &sounds.start {
-                            m.play(Play::flat(start.clone()).gain(ENGINE_GAIN));
-                        }
-                        sounds
-                            .loops
-                            .iter()
-                            .map(|(buffer, _)| {
-                                m.play(Play::flat(buffer.clone()).looped().gain(0.0))
-                            })
-                            .collect()
-                    });
-                    self.engine = Some(Engine {
-                        bank: input.bank,
-                        sounds,
-                        voices,
-                        rpm: 0.0,
-                        running: 0.0,
-                    });
+            // Being read, or without engine sounds.
+            let Some(sounds) = self.engine_sounds(input.bank) else {
+                return;
+            };
+            let voices = self.out.with(|m| {
+                if let Some(start) = &sounds.start {
+                    m.play(Play::flat(start.clone()).gain(ENGINE_GAIN));
                 }
-                // Being read, or without engine sounds.
-                Some(None) => return,
-                None => {
-                    self.engines.insert(input.bank, None);
-                    let Some(install) = self.install.clone() else {
-                        return;
-                    };
-                    let (bank, tx) = (input.bank, self.engine_loads.0.clone());
-                    std::thread::spawn(move || drop(tx.send((bank, load_engine(&install, bank)))));
-                    return;
-                }
-            }
+                sounds
+                    .loops
+                    .iter()
+                    .map(|(buffer, _)| m.play(Play::flat(buffer.clone()).looped().gain(0.0)))
+                    .collect()
+            });
+            self.engine = Some(Engine {
+                bank: input.bank,
+                sounds,
+                voices,
+                rpm: 0.0,
+                running: 0.0,
+            });
         }
         let Some(e) = &mut self.engine else {
             return;
@@ -801,6 +815,80 @@ impl GameAudio {
                 m.set_pitch(*id, pitch);
             }
         });
+    }
+
+    /// Bank `bank`'s engine sounds, once read (`None` while they're read,
+    /// or if it has none); the first ask reads them on a thread.
+    fn engine_sounds(&mut self, bank: u32) -> Option<Arc<EngineSounds>> {
+        while let Ok((bank, sounds)) = self.engine_loads.1.try_recv() {
+            if sounds.is_none() {
+                self.silent.insert(bank);
+            }
+            self.engines.insert(bank, sounds.map(Arc::new));
+        }
+        if let Some(sounds) = self.engines.get(&bank) {
+            return sounds.clone();
+        }
+        self.engines.insert(bank, None);
+        if let Some(install) = self.install.clone() {
+            let tx = self.engine_loads.0.clone();
+            std::thread::spawn(move || drop(tx.send((bank, load_engine(&install, bank)))));
+        }
+        None
+    }
+
+    /// Keeps the rotors of the helicopters in the air (`flying`: each
+    /// one's guid, where it is and the sound bank its template names)
+    /// heard where they are: the bank's lowest steady loop (the blades'
+    /// beat) with its highest (the turbine) under it, from
+    /// [`ROTOR_BANK`] where it names none (or one without them). One gone
+    /// from the list falls silent.
+    pub fn rotors(&mut self, flying: &[(u32, Vec3, Option<u32>)]) {
+        let gone: Vec<u32> = self
+            .rotors
+            .keys()
+            .filter(|g| !flying.iter().any(|f| f.0 == **g))
+            .copied()
+            .collect();
+        for guid in gone {
+            if let Some(voices) = self.rotors.remove(&guid) {
+                self.out
+                    .with(|m| voices.into_iter().for_each(|id| m.stop(id)));
+            }
+        }
+        for &(guid, at, bank) in flying {
+            if let Some(voices) = self.rotors.get(&guid) {
+                self.out
+                    .with(|m| voices.iter().for_each(|id| m.set_position(*id, at)));
+                continue;
+            }
+            let bank = bank
+                .filter(|b| !self.silent.contains(b))
+                .unwrap_or_else(|| m2_assets::name_hash(ROTOR_BANK));
+            let Some(sounds) = self.engine_sounds(bank) else {
+                continue;
+            };
+            let n = sounds.loops.len();
+            let voices = self.out.with(|m| {
+                sounds
+                    .loops
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k == 0 || *k + 1 == n)
+                    .map(|(k, (buffer, _))| {
+                        let play = Play {
+                            falloff: ROTOR_FALLOFF,
+                            ..Play::at(buffer.clone(), at)
+                        };
+                        m.play(
+                            play.looped()
+                                .gain(if k == 0 { ROTOR_GAIN } else { ROTOR_WHINE }),
+                        )
+                    })
+                    .collect()
+            });
+            self.rotors.insert(guid, voices);
+        }
     }
 
     /// Starts the next music track, or stops the music.
@@ -886,10 +974,15 @@ mod tests {
             "veh_4cylinderold"
         );
         assert_eq!(engine_bank("truck", "vz_veh_truck_m151"), "veh_jeep");
+        assert_eq!(engine_bank("boat", "Speedboat"), "veh_boatracing");
+        assert_eq!(engine_bank("boat", "Jetski (CIV)"), "veh_boatjetski");
         assert_eq!(engine_bank("car", "civ_veh_car_sedan"), "veh_4cylindernew");
         // The template database's banks, by name hash.
         assert_eq!(bank_name(0x3714_581c), Some("veh_largegascrappy"));
         assert_eq!(bank_name(0x3621_dfe1), Some("veh_jeep"));
+        // Round 88's boat banks, by the hashes in the world archive.
+        assert_eq!(bank_name(0xa3ca_3b95), Some("veh_boatracing"));
+        assert_eq!(bank_name(0xad17_2ebf), Some("veh_boatjetski"));
     }
 
     fn sound(hash: u32) -> SoundBuffer {

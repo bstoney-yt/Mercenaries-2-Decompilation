@@ -17,17 +17,23 @@ m2-alpha [options]
   --size <w>x<h>         window size
   --vsync on|off
   --fullscreen
-  --sea <metres>         sea level (default -45, fitted by eye)
+  --sea <metres>         sea level (default -36, the game's)
   --double-sided         start with back-face culling off (as F3)
   --screenshot <out.ppm> render one frame offscreen and exit
   --drive                with --screenshot on the island: get in the
                          nearest parked vehicle and drive it forward first
+                         (backing out first if it is boxed in, steering
+                         round what it meets)
   --jump                 with --screenshot on the island: jump just before
                          the picture
   --throw                with --screenshot on the island: throw a grenade
                          just before the picture
-  --lead <s>             with --jump or --throw: seconds before the picture
-                         she starts (default 0.2)
+  --bash                 with --screenshot on the island: a melee bash just
+                         before the picture
+  --bash-clip <hash>     with --bash: bash with this clip (one of those the
+                         "player meleebash clips:" line lists)
+  --lead <s>             with --jump, --throw or --bash: seconds before the
+                         picture she starts (default 0.2)
   --fight                with --screenshot on the island: shoot the nearest
                          soldier, rocket a vehicle, throw a grenade first,
                          then look at the body
@@ -54,7 +60,7 @@ m2-alpha [options]
                          stands hit (unseen walls, steps in the ground)
   --wreck                with --drive: wreck the vehicle at speed at the
                          end and log how it comes to rest
-  --fire                 with --aim, or --drive --look: fire just before the
+  --fire                 with --aim or --drive: fire just before the
                          picture
   --grip attach|hands    draw weapons on the hand's attach node as posed
                          (attach, the default), or held as worked out from
@@ -74,15 +80,23 @@ m2-alpha [options]
   --autoplay             with --mission --screenshot: she plays the contract
                          herself by its markers (runs to places, shoots the
                          marked soldiers, rockets the marked gates, takes
-                         the vehicles brought), logging how it goes, until
-                         it is done or --mission-seconds are up
+                         the vehicles brought, going a way planned round
+                         walls, the sea and steep ground), logging how it
+                         goes, until it is done or --mission-seconds are up;
+                         each delivery is pictured beside the screenshot as
+                         its helicopter hovers (<out>-delivery1.ppm, ...)
+                         and once its load is down (-delivery1-down.ppm),
+                         and the start's boat five seconds after she is
+                         seated in it (-boat.ppm) and her three seconds
+                         after she gets out of it (-ashore.ppm)
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
 E gets in or out of a vehicle (a row is parked ahead of where you start).
 Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
 Fighting (mouse captured): left button or F fires, right button aims,
-1 rifle, 2 rocket launcher, G throws a grenade.
+1 rifle, 2 rocket launcher, G throws a grenade, B or the middle button
+bashes (a supply crate breaks open).
 V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
 M music on/off, Tab or right mouse captures the mouse, N next gait
 (--model), F11 fullscreen, F3 culling, F5 quick save, F9 quick load,

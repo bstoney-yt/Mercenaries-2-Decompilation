@@ -30,6 +30,7 @@ use m2_render::{
 
 use crate::assets::{AssetError, AssetSource};
 use crate::physics::CollisionShape;
+use crate::pickup::Leavings;
 use crate::tuning::VehicleTuning;
 
 /// Side of the island in metres (20 cells of 400 m).
@@ -128,6 +129,8 @@ pub struct Templates {
     pub names: HashMap<u32, String>,
     /// How the templates that say so handle and fight, by id.
     pub tuning: HashMap<u32, VehicleTuning>,
+    /// What templates leave when destroyed, and what pickups give.
+    pub leavings: Leavings,
 }
 
 impl Templates {
@@ -135,6 +138,16 @@ impl Templates {
     /// 0x0012abcd`, `AMX30`) names, whatever its case.
     pub fn get(&self, name: &str) -> Option<&TemplateInfo> {
         self.by_name.get(&member_stem(name).to_ascii_lowercase())
+    }
+
+    /// The id of the template an entity or template name names, whatever
+    /// its case.
+    pub fn id(&self, name: &str) -> Option<u32> {
+        let stem = member_stem(name);
+        self.names
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(stem))
+            .map(|(&id, _)| id)
     }
 
     /// The template with id `id` (an entity's parent): its name, and what
@@ -265,6 +278,7 @@ impl Templates {
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
             tuning: crate::tuning::read(&db),
+            leavings: crate::pickup::read(&db),
         }
     }
 }
@@ -373,6 +387,10 @@ pub struct WorldIndex {
     /// what stands while the layer is in, such as a mission's gates.
     /// Vehicles and people are left out (the alpha places those itself).
     pub state_objects: HashMap<u32, ObjectPlacement>,
+    /// Vehicles the state layers place, by entity, with the template each
+    /// is an instance of: what a renamed entity's name
+    /// (`VzaCon001_StartingBoat`) no longer says.
+    pub state_vehicles: HashMap<u32, TemplatePlacement>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -617,6 +635,7 @@ impl WorldIndex {
         }
         if !is_static {
             self.add_state_objects(layer, assets);
+            self.add_state_vehicles(layer, layer_hash, assets);
         } else {
             let models = layer.hashes("ModelName");
             for (&entity, model) in &models {
@@ -769,6 +788,42 @@ impl WorldIndex {
                     },
                 );
             }
+        }
+    }
+
+    /// A state layer's vehicles: entities whose template, by their name or
+    /// else by the one they are an instance of, has vehicle physics.
+    fn add_state_vehicles(&mut self, layer: &Layer<'_>, layer_hash: u32, assets: &Assets) {
+        let names = layer.names();
+        for (&entity, p) in &layer.placements() {
+            let stem = names.get(&entity).map_or("", |n| member_stem(n));
+            let template = match assets.templates.get(stem) {
+                Some(t) => Some((stem, t)),
+                None => assets.templates.by_id(p.parent),
+            };
+            let Some((
+                name,
+                &TemplateInfo {
+                    model,
+                    vehicle: Some(kind),
+                    ..
+                },
+            )) = template
+            else {
+                continue;
+            };
+            self.state_vehicles.insert(
+                entity,
+                TemplatePlacement {
+                    entity,
+                    name: name.to_owned(),
+                    position: Vec3::from(p.position),
+                    rotation: rotation(p.rotation),
+                    model,
+                    kind,
+                    layer: layer_hash,
+                },
+            );
         }
     }
 
@@ -1040,7 +1095,7 @@ mod tests {
                 ("hmmwv".to_owned(), t(2, None)),
             ]),
             names: HashMap::from([(0x8000_0001, "Valiant (Python)".to_owned())]),
-            tuning: HashMap::new(),
+            ..Templates::default()
         };
         assert_eq!(
             db.by_id(0x8000_0001).map(|(n, _)| n),

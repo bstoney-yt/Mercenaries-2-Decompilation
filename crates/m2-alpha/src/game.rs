@@ -3,16 +3,18 @@
 
 use std::collections::HashSet;
 
-use m2_engine::{CatalogueEntry, Physics, VehicleControls};
-use m2_math::glam::{Quat, Vec3, Vec4Swizzles};
+use m2_engine::physics::FLOAT_DEPTH;
+use m2_engine::{CatalogueEntry, Physics, StaticKey, VehicleControls, VehicleSpec, World};
+use m2_math::glam::{Mat4, Quat, Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
-use crate::combat::{Combat, Field, Weapon};
+use crate::combat::{self, Combat, Effect, Field, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
-use crate::mission::template_models;
+use crate::mission::{WATERLINE, template_models};
 use crate::player::{ChaseRig, Intent, Player};
+use crate::props::Props;
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
 use crate::startup::Startup;
@@ -36,6 +38,38 @@ const TOWN_REACH: f32 = 150.0;
 /// The scripts put vehicles they don't need yet far under the island:
 /// those below this height aren't placed.
 const HIDDEN_BELOW: f32 = -1000.0;
+
+/// A vehicle held where it stands, far from her, is let go once she is
+/// this much nearer than the island's full-detail ground reaches and
+/// ground is found within this far under it, metres.
+const HOLD_SLACK: f32 = 100.0;
+const HOLD_GROUND: f32 = 30.0;
+
+/// Boats going faster than this throw spray off their sides and churn a
+/// wake, the most from the second speed (m/s), puffs every this many
+/// seconds, each lasting this long, the wake longer. Invented, from the
+/// playthroughs' speedboat: spray wider than the boat at full speed.
+const SPRAY_SPEED: f32 = 4.0;
+const SPRAY_FULL: f32 = 16.0;
+const SPRAY_GAP: f32 = 0.05;
+const SPRAY_LIFE: f32 = 0.7;
+const WAKE_LIFE: f32 = 1.2;
+
+/// A vehicle knocks loose what it hits that comes loose (traffic lights,
+/// plants, barricades, poles: their `PHY2` has bodies that move) at this
+/// speed or more (m/s), pushing with its engine counting as this one, and
+/// when its momentum is at least this many times the mass to shift
+/// (kg m/s per kg). Invented: a car fells a lamp post or a plant, a tank
+/// a parked car.
+const KNOCK_SPEED: f32 = 1.0;
+const PUSH_SPEED: f32 = 1.5;
+const KNOCK_RATIO: f32 = 4.0;
+/// What it knocks loose flies off a little faster than the two go on
+/// together, so it clears the vehicle, this much up (m/s), toppling the
+/// way it was hit at this many radians a second per m/s.
+const FLING: f32 = 1.1;
+const FLING_UP: f32 = 1.0;
+const TOPPLE: f32 = 0.3;
 
 #[derive(Debug)]
 pub struct Game {
@@ -63,6 +97,8 @@ pub struct Game {
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
     pub throttle: f32,
+    /// Seconds to the next puffs of spray off boats going fast.
+    spray_wait: f32,
 }
 
 impl Game {
@@ -81,6 +117,7 @@ impl Game {
             startup: None,
             props_up: false,
             throttle: 0.0,
+            spray_wait: 0.0,
         }
     }
 
@@ -261,7 +298,11 @@ impl Game {
                 }
                 if intent.use_pressed {
                     match player.driving {
-                        Some(i) => get_out(physics, &scene.vehicles[i], player),
+                        // Not out of a boat into deep water.
+                        Some(i) if can_get_out(physics, &scene.vehicles[i]) => {
+                            get_out(physics, &scene.vehicles[i], player)
+                        }
+                        Some(_) => {}
                         None => {
                             player.driving = nearest(physics, &scene.vehicles, player, REACH);
                             // Seated: she no longer waits to land (people
@@ -341,6 +382,7 @@ impl Game {
                 physics.step(dt);
             }
         }
+        let focus = self.focus();
         if let Some(world) = &mut self.scene.world {
             let driven = self
                 .scene
@@ -348,8 +390,33 @@ impl Game {
                 .as_ref()
                 .filter(|_| self.on_foot)
                 .and_then(|p| p.driving);
+            let hold = world.settings.detail_radius;
             for (i, v) in self.scene.vehicles.iter_mut().enumerate() {
                 let Some(id) = v.id else { continue };
+                // Far from her, the island's ground streams out from under
+                // a vehicle: it is held where it stands until she comes
+                // back and the ground under it is in again.
+                if driven != Some(i)
+                    && let Some(at) = world
+                        .physics
+                        .vehicle_transform(id)
+                        .map(|m| m.w_axis.truncate())
+                {
+                    let far = at.distance(focus);
+                    if far > hold {
+                        world.physics.hold_vehicle(id, true);
+                    } else if far < hold - HOLD_SLACK
+                        && world.physics.vehicle_held(id)
+                        // A boat floats on the sea, whatever is under it.
+                        && ((v.spec.is_boat() && world.physics.water().is_some())
+                            || world
+                                .physics
+                                .cast_ray_past(at + Vec3::Y, Vec3::NEG_Y, HOLD_GROUND, id)
+                                .is_some())
+                    {
+                        world.physics.hold_vehicle(id, false);
+                    }
+                }
                 v.rolled += world.physics.vehicle_speed(id) * dt;
                 // Nobody at the wheel: it brakes to a stop and stays put,
                 // on a hill too (a wreck drags on its rims, driven by
@@ -364,8 +431,13 @@ impl Game {
                     );
                 }
             }
+            knock_loose(world, &mut self.scene.props, &self.scene.vehicles);
+            self.spray_wait -= dt;
+            if self.spray_wait <= 0.0 {
+                self.spray_wait = SPRAY_GAP;
+                spray(world, &self.scene.vehicles, &mut self.combat);
+            }
         }
-        let focus = self.focus();
         let threat = self
             .scene
             .player
@@ -405,6 +477,38 @@ impl Game {
             world
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
+            blast_loose(world, &mut scene.props, &self.combat.went_off);
+            // A supply crate broken open: a puff of dust off its boards.
+            let broken = scene.flights.strike(
+                &mut world.physics,
+                &self.combat.struck,
+                &self.combat.went_off,
+            );
+            for (_, at) in broken {
+                self.combat.show(
+                    Effect::Smoke {
+                        at: at + Vec3::Y * 0.6,
+                        size: 1.4,
+                    },
+                    1.2,
+                );
+            }
+            // What a broken crate left, taken as she walks up to it.
+            if player.driving.is_none() {
+                for p in scene.flights.take(player.character.position) {
+                    if let Some((weapon, rounds)) = p.what.gives {
+                        self.combat.picked.add(weapon, rounds);
+                    }
+                    eprintln!(
+                        "pickup: she takes {:#x} at {:.1}{}",
+                        p.what.template,
+                        p.at,
+                        p.what.gives.map_or(String::new(), |(w, n)| format!(
+                            ": {n} rounds for her {w:?}"
+                        ))
+                    );
+                }
+            }
         }
         self.scene.tick(dt);
     }
@@ -688,6 +792,11 @@ const PARK_GRADE: f32 = 0.15;
 const PARK_ROOF: f32 = 8.0;
 /// The ground under a spot is looked for from this far above her feet.
 const PARK_LOOK: f32 = 60.0;
+/// A spot whose middle is less than this above the sea is in it, metres;
+/// one whose middle is further than this beyond the rise allowed (see
+/// [`PARK_RISE`]) isn't looked at more closely.
+const PARK_SHORE: f32 = 0.5;
+const PARK_SLACK: f32 = 2.0;
 /// Vehicles are let go this far above where they rest, to settle onto
 /// their wheels, metres.
 const DROP: f32 = 0.3;
@@ -727,6 +836,11 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
             ))
         })
         .collect();
+    // The ground under each spot's middle, looked at once a look: a spot
+    // in the sea, or far above or below her, is passed over before the
+    // ground under each vehicle's wheels there is (a look on a coast or a
+    // hillside otherwise casts a ray or two dozen for every spot).
+    let mut middles: Vec<Option<Option<f32>>> = vec![None; spots.len()];
     for v in vehicles.iter_mut().filter(|v| parkable(v)) {
         let (lo, hi) = v.spec.bounds;
         let radius = footprint_radius(&v.spec);
@@ -739,19 +853,23 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
                 .cast_ray(top, -Vec3::Y, PARK_LOOK + PARK_ROOF * 2.0)
                 .map(|(d, _)| top.y - d)
         };
-        let spot = spots.iter().find_map(|&centre| {
+        let spot = spots.iter().zip(&mut middles).find_map(|(&centre, under)| {
             if taken
                 .iter()
                 .any(|&(c, r)| (c - centre).with_y(0.0).length() < r + radius + PARK_GAP)
             {
                 return None;
             }
+            let away = (centre - feet).with_y(0.0).length();
+            let rise = (PARK_RISE + PARK_GRADE * away).min(PARK_ROOF);
+            let h = (*under.get_or_insert_with(|| ground(centre)))?;
+            if h < WATERLINE + PARK_SHORE || (h - feet.y).abs() > rise + PARK_SLACK {
+                return None;
+            }
             // Tilted to the ground under its wheels, clear of what is
             // under its hull.
             let origin = centre - (right * middle.x + forward * middle.z);
             let rest = v.spec.rest_on(origin, player.facing, ground)?;
-            let away = (centre - feet).with_y(0.0).length();
-            let rise = (PARK_RISE + PARK_GRADE * away).min(PARK_ROOF);
             (rest.slope <= steep
                 && rest.bumps <= PARK_BUMPS
                 && (rest.position.y - feet.y).abs() < rise)
@@ -765,13 +883,138 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
     }
 }
 
+/// Vehicles knock loose what they hit that comes loose, with the weight
+/// and speed for it ([`KNOCK_RATIO`]): it flies off ahead, and the vehicle
+/// ploughs on slowed as by the mass it shifted, rather than stopped as by
+/// a wall (the step just taken stopped it).
+fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle]) {
+    for v in vehicles {
+        let Some(id) = v.id else { continue };
+        let before = world.physics.vehicle_velocity_before(id);
+        let mut speed = before.length();
+        if world.physics.vehicle_pulling(id) {
+            speed = speed.max(PUSH_SPEED);
+        }
+        if speed < KNOCK_SPEED {
+            continue;
+        }
+        let mass = v.spec.mass;
+        let mut shifted = 0.0;
+        for key in world.physics.vehicle_statics(id) {
+            let loose = match key {
+                StaticKey::Object(i) => world.loose_mass(i),
+                StaticKey::Entity(e) => props.loose_mass(&world.physics, e),
+                _ => None,
+            };
+            let Some(m) = loose.filter(|&m| mass * speed >= KNOCK_RATIO * m) else {
+                continue;
+            };
+            let ahead = before.with_y(0.0);
+            let fling = before * (mass / (mass + m)) * FLING + Vec3::Y * FLING_UP;
+            let topple = Vec3::Y.cross(ahead.normalize_or_zero()) * (ahead.length() * TOPPLE);
+            let knocked = match key {
+                StaticKey::Object(i) => world.knock(i, fling, topple),
+                StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple),
+                _ => false,
+            };
+            if knocked {
+                shifted += m;
+                eprintln!(
+                    "knocked loose: {key:?} ({m:.0} kg) by the {} at {speed:.1} m/s",
+                    v.spec.label
+                );
+            }
+        }
+        if shifted > 0.0 {
+            world
+                .physics
+                .set_vehicle_velocity(id, before * (mass / (mass + shifted)));
+        }
+    }
+}
+
+/// Blasts knock loose what comes loose within their reach (as far as they
+/// hurt people), thrown out and up as people are, harder the nearer.
+fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3]) {
+    let thrown = |blast: Vec3, at: Vec3, d: f32| {
+        let near = (1.0 - d / combat::REACH).clamp(0.0, 1.0);
+        let away = (at - blast).with_y(0.0).normalize_or(Vec3::X);
+        let (out, up) = combat::BLAST_PUSH;
+        let velocity = away * (out * near + 1.0) + Vec3::Y * (up * near + 1.0);
+        (velocity, Vec3::Y.cross(away) * (TOPPLE * out * near))
+    };
+    for &at in blasts {
+        for (i, d) in world.loose_near(at, combat::REACH) {
+            let (velocity, spin) = thrown(at, world.index.objects[i].position, d);
+            world.knock(i, velocity, spin);
+        }
+        for (e, d) in props.loose_near(&world.physics, at, combat::REACH) {
+            let Some(p) = props.get(e).map(|(p, _)| p.position) else {
+                continue;
+            };
+            let (velocity, spin) = thrown(at, p, d);
+            props.knock(&mut world.physics, e, velocity, spin);
+        }
+    }
+}
+
 /// A vehicle of ours (not the mission's or the island's) still to park.
 fn parkable(v: &ParkedVehicle) -> bool {
     v.id.is_none() && v.guid.is_none() && v.spot.is_none()
 }
 
+/// Spray off both sides of each boat going fast on the water, a third of
+/// the way up from its stern, and churned water behind it.
+fn spray(world: &World, vehicles: &[ParkedVehicle], combat: &mut Combat) {
+    let Some(water) = world.physics.water() else {
+        return;
+    };
+    for v in vehicles.iter().filter(|v| v.spec.is_boat() && !v.wrecked) {
+        let Some(id) = v.id else { continue };
+        let Some(m) = world.physics.vehicle_transform(id) else {
+            continue;
+        };
+        let speed = world.physics.vehicle_speed(id);
+        if speed < SPRAY_SPEED || (m.w_axis.y - water).abs() > 1.5 {
+            continue;
+        }
+        let k = ((speed - SPRAY_SPEED) / (SPRAY_FULL - SPRAY_SPEED)).clamp(0.0, 1.0);
+        let (lo, hi) = v.spec.hull;
+        let back = m
+            .transform_vector3(Vec3::NEG_Z)
+            .with_y(0.0)
+            .normalize_or_zero();
+        for x in [lo.x, hi.x] {
+            let out = m
+                .transform_vector3(Vec3::X * x.signum())
+                .with_y(0.0)
+                .normalize_or_zero();
+            let at = m.transform_point3(Vec3::new(x, 0.0, lo.z + (hi.z - lo.z) * 0.3));
+            combat.show(
+                Effect::Spray {
+                    at: at.with_y(water + 0.2),
+                    drift: out * (2.0 + 4.0 * k)
+                        + back * (1.0 + 2.0 * k)
+                        + Vec3::Y * (1.0 + 2.0 * k),
+                    size: 0.6 + k,
+                },
+                SPRAY_LIFE,
+            );
+        }
+        let stern = m.transform_point3(Vec3::new(0.0, 0.0, lo.z));
+        combat.show(
+            Effect::Wake {
+                at: stern.with_y(water + 0.03),
+                size: (hi.x - lo.x) * (0.6 + 0.6 * k),
+            },
+            WAKE_LIFE,
+        );
+    }
+}
+
 /// Puts a vehicle on the ground at `at` facing `yaw`, tilted to the
 /// ground under its wheels; false while the ground there hasn't loaded.
+/// A boat on the sea floats on it.
 pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw: f32) -> bool {
     // From a little above where the layers put it (so one under a bridge
     // or a gantry stays under it), else from well above.
@@ -783,7 +1026,23 @@ pub(crate) fn place(physics: &mut Physics, v: &mut ParkedVehicle, at: Vec3, yaw:
                 .map(|(d, _)| top.y - d)
         })
     };
-    let rest = v.spec.rest_on(at, yaw, ground);
+    // Level, as deep as it floats, where the seabed is under its keel (or
+    // hasn't loaded).
+    let float = physics.water().filter(|&water| {
+        let keel = water - FLOAT_DEPTH + v.spec.hull.0.y;
+        v.spec.is_boat() && ground(at).is_none_or(|h| h < keel)
+    });
+    if let Some(water) = float {
+        let at = Vec3::new(at.x, water - FLOAT_DEPTH, at.z);
+        v.id = Some(physics.add_vehicle_turned(&v.spec, at, Quat::from_rotation_y(yaw)));
+        return true;
+    }
+    // (Never where it came out NaN: round 88 lost the start boat, and her
+    // with it, to a rest fitted to a boat's no wheels.)
+    let rest = v
+        .spec
+        .rest_on(at, yaw, ground)
+        .filter(|r| r.position.is_finite() && r.rotation.is_finite());
     // A wheel over nothing (a quay's edge): level, on the ground under
     // its origin.
     let (at, turn) = match rest {
@@ -861,21 +1120,48 @@ fn nearest(
         .map(|(i, _)| i)
 }
 
+/// Where she steps out of a vehicle standing at `at`: on the driver's
+/// side, beside the hull.
+fn door_out(at: Mat4, spec: &VehicleSpec) -> Vec3 {
+    let (lo, hi) = spec.bounds;
+    let door = spec
+        .door
+        .unwrap_or(Vec3::new(lo.x, 0.0, (lo.z + hi.z) * 0.5));
+    let x = if door.x < (lo.x + hi.x) * 0.5 {
+        lo.x - 0.8
+    } else {
+        hi.x + 0.8
+    };
+    at.transform_point3(Vec3::new(x, 0.0, door.z))
+}
+
+/// Whether she can get out of `v` where it is: not from a boat over water
+/// deeper than she can stand in ([`WADE`]).
+pub(crate) fn can_get_out(physics: &Physics, v: &ParkedVehicle) -> bool {
+    let (Some(water), Some(id)) = (physics.water(), v.id.filter(|_| v.spec.is_boat())) else {
+        return true;
+    };
+    let Some(at) = physics.vehicle_transform(id) else {
+        return true;
+    };
+    let out = door_out(at, &v.spec);
+    let top = Vec3::new(out.x, water + 2.0, out.z);
+    physics
+        .cast_ray_past(top, Vec3::NEG_Y, 2.0 + WADE, id)
+        .is_some()
+}
+
+/// The deepest water she gets out of a boat into, metres: chest deep.
+const WADE: f32 = 1.4;
+
 /// Gets her out on the driver's side, beside the hull, to drop to the
 /// ground there.
 pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player) {
-    if let Some(at) = v.id.and_then(|id| physics.vehicle_transform(id)) {
-        let (lo, hi) = v.spec.bounds;
-        let door = v
-            .spec
-            .door
-            .unwrap_or(Vec3::new(lo.x, 0.0, (lo.z + hi.z) * 0.5));
-        let x = if door.x < (lo.x + hi.x) * 0.5 {
-            lo.x - 0.8
-        } else {
-            hi.x + 0.8
-        };
-        let out = at.transform_point3(Vec3::new(x, 0.0, door.z));
+    if let Some(at) =
+        v.id.and_then(|id| physics.vehicle_transform(id))
+            .filter(|at| at.is_finite())
+    {
+        let out = door_out(at, &v.spec);
         player.character.position = Vec3::new(out.x, 0.0, out.z);
         player.character.velocity = Vec3::ZERO;
         let f = at.transform_vector3(Vec3::Z);

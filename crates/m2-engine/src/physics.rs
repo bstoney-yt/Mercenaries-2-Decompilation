@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use m2_assets::Model;
 use m2_assets::model::GeometryKind;
@@ -59,17 +60,302 @@ fn pose(position: Vec3, rotation: Quat) -> r::Pose {
 pub struct CollisionShape {
     shape: r::SharedShape,
     pub triangles: usize,
+    /// Cut from the model's visible triangles, standing in for collision
+    /// the model doesn't carry (`PHY2`).
+    pub stand_in: bool,
+    /// How the model comes loose when knocked, if its `PHY2` has bodies
+    /// that move.
+    pub loose: Option<Arc<Loose>>,
 }
 
 impl fmt::Debug for CollisionShape {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CollisionShape")
             .field("triangles", &self.triangles)
+            .field("stand_in", &self.stand_in)
+            .field("loose", &self.loose)
             .finish()
     }
 }
 
+/// How a prop comes loose when a vehicle or a blast knocks it (its `PHY2`
+/// has bodies that move: traffic lights, plants, barricades, poles): its
+/// standing collision goes and its pieces fly.
+///
+/// Most such models are broken up beforehand: a fixed body holds the
+/// parts shown intact, and the pieces it breaks into sit on moving
+/// bodies whose nodes the model shows in neither state (10,356 of the
+/// 10,647 moving bodies of the island's placed models). Those break: the
+/// model is drawn wrecked (the stump or base left standing) and the
+/// pieces fly, drawn where they land. A model whose moving bodies it
+/// shows intact (a barricade) goes as one, drawn whole.
+///
+/// The `PHY2` constraints that would hold pieces together (a door on its
+/// hinge) are not read: each piece goes its own way. Nothing of a broken
+/// prop stands in the way afterwards (its base included).
+#[derive(Clone)]
+pub struct Loose {
+    pub pieces: Vec<LoosePiece>,
+    /// Breaks into its pieces, the rest of it drawn wrecked.
+    pub breaks: bool,
+    /// The moving bodies' mass, kg: what a vehicle has to shift.
+    pub mass: f32,
+    /// Each node's place in the model at rest.
+    rest: Vec<Mat4>,
+    /// For each node, the piece it goes with: the nearest at or above it
+    /// (`None`: it stays put).
+    owner: Vec<Option<usize>>,
+    /// For each node, whether it is drawn with its piece whatever the
+    /// model's state shows (a broken prop's pieces).
+    flying: Vec<bool>,
+}
+
+impl fmt::Debug for Loose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Loose")
+            .field("pieces", &self.pieces.len())
+            .field("breaks", &self.breaks)
+            .field("mass", &self.mass)
+            .finish()
+    }
+}
+
+/// One piece of a [`Loose`] prop: boxes round its `PHY2` shapes, in the
+/// space of the node it moves.
+#[derive(Clone)]
+pub struct LoosePiece {
+    /// The node it moves, with those under it; `None` for the whole
+    /// model, in model space.
+    pub node: Option<u16>,
+    shape: r::SharedShape,
+    /// Kilograms.
+    pub mass: f32,
+    /// Model space to the node's space, at rest.
+    from_model: Mat4,
+}
+
+impl fmt::Debug for LoosePiece {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoosePiece")
+            .field("node", &self.node)
+            .field("mass", &self.mass)
+            .finish()
+    }
+}
+
+/// The lightest and heaviest a loose piece is, kg (a `PHY2` body may say
+/// 0).
+const LOOSE_MASS: f32 = 2.0;
+const LOOSE_MOST: f32 = 100_000.0;
+
+/// A `PHY2` body's mass as a loose piece's.
+fn loose_mass(mass: f32) -> f32 {
+    if mass.is_finite() {
+        mass.clamp(LOOSE_MASS, LOOSE_MOST)
+    } else {
+        LOOSE_MASS
+    }
+}
+/// The thinnest a loose piece's box is, half metres.
+const LOOSE_HALF: f32 = 0.02;
+/// Models larger than this (their box's diagonal, metres) never come
+/// loose: a building with a door that swings, or one that falls to pieces
+/// when blown up, stands when a vehicle runs into it.
+const LOOSE_SIZE: f32 = 14.0;
+
+impl Loose {
+    /// How `model` comes loose by its `PHY2` `p`; `None` unless a body of
+    /// it moves.
+    fn of(model: &Model<'_>, p: &Phy2) -> Option<Self> {
+        let moving: Vec<usize> = (0..p.bodies.len())
+            .filter(|&b| !p.bodies[b].is_fixed())
+            .collect();
+        let b = &model.info.bounds;
+        let size = (Vec3::from(b.max) - Vec3::from(b.min)).length();
+        if moving.is_empty() || size.is_nan() || size > LOOSE_SIZE {
+            return None;
+        }
+        let hidden = model
+            .states
+            .as_ref()
+            .map(|s| [s.hidden(&model.nodes, false), s.hidden(&model.nodes, true)])
+            .unwrap_or_default();
+        let off = |wrecked: usize, n: usize| hidden[wrecked].get(n).copied().unwrap_or(false);
+        let shapes_of = |b: usize| (0..p.shapes.len()).filter(move |&k| p.body_of(k) == Some(b));
+        let body_node = |b: usize| {
+            p.parts
+                .iter()
+                .find(|q| q.body == Some(b))
+                .and_then(|q| u16::try_from(q.node).ok())
+                .filter(|&n| usize::from(n) < model.nodes.len())
+        };
+        let rest: Vec<Mat4> = (0..model.nodes.len())
+            .map(|n| model.node_to_model(n as u16).unwrap_or(Mat4::IDENTITY))
+            .collect();
+        // The pieces it breaks into: moving bodies on nodes it doesn't
+        // show intact.
+        let broken: Vec<(usize, u16)> = moving
+            .iter()
+            .filter_map(|&b| Some((b, body_node(b)?)))
+            .filter(|&(_, n)| off(0, usize::from(n)))
+            .collect();
+        let breaks = !broken.is_empty();
+        let mut pieces = Vec::new();
+        if breaks {
+            for (b, node) in broken {
+                let from_model = rest[usize::from(node)].inverse();
+                let boxes: Vec<_> = shapes_of(b)
+                    .filter_map(|k| shape_box(p, k, Mat4::IDENTITY))
+                    .collect();
+                if boxes.is_empty() || !from_model.is_finite() {
+                    continue;
+                }
+                pieces.push(LoosePiece {
+                    node: Some(node),
+                    shape: r::SharedShape::compound(boxes),
+                    mass: loose_mass(p.bodies[b].mass),
+                    from_model,
+                });
+            }
+        } else {
+            // As one: what stands in the way intact, in model space.
+            let boxes: Vec<_> = (0..p.shapes.len())
+                .filter(|&k| standing(p, k, &hidden[0]))
+                .filter_map(|k| {
+                    let node = p
+                        .shape_node(k)
+                        .and_then(|n| u16::try_from(n).ok())
+                        .and_then(|n| model.node_to_model(n))
+                        .unwrap_or(Mat4::IDENTITY);
+                    shape_box(p, k, node)
+                })
+                .collect();
+            if !boxes.is_empty() {
+                pieces.push(LoosePiece {
+                    node: None,
+                    shape: r::SharedShape::compound(boxes),
+                    mass: loose_mass(moving.iter().map(|&b| loose_mass(p.bodies[b].mass)).sum()),
+                    from_model: Mat4::IDENTITY,
+                });
+            }
+        }
+        if pieces.is_empty() {
+            return None;
+        }
+        // Each node goes with the nearest piece at or above it.
+        let owner: Vec<Option<usize>> = (0..model.nodes.len())
+            .map(|n| {
+                let mut at = Some(n as u16);
+                for _ in 0..=model.nodes.len() {
+                    let here = at?;
+                    if let Some(i) = pieces.iter().position(|q| match q.node {
+                        Some(m) => m == here,
+                        None => true,
+                    }) {
+                        return Some(i);
+                    }
+                    at = model.nodes.get(usize::from(here))?.parent;
+                }
+                None
+            })
+            .collect();
+        let flying = owner.iter().map(|o| breaks && o.is_some()).collect();
+        Some(Self {
+            mass: pieces.iter().map(|q| q.mass).sum(),
+            pieces,
+            breaks,
+            rest,
+            owner,
+            flying,
+        })
+    }
+
+    /// For each node, whether it is drawn with its piece whatever the
+    /// model's state shows (as
+    /// [`GpuModel::draw_moved`](crate::GpuModel::draw_moved) takes).
+    pub fn flying(&self) -> &[bool] {
+        &self.flying
+    }
+
+    /// Where each piece starts, world space, with the model placed at
+    /// `placed`.
+    pub fn starts(&self, placed: Mat4) -> Vec<Mat4> {
+        self.pieces
+            .iter()
+            .map(|q| placed * q.from_model.inverse())
+            .collect()
+    }
+
+    /// Each node's place in the model (as
+    /// [`GpuModel::draw_moved`](crate::GpuModel::draw_moved) takes), with
+    /// the model placed at `placed` and each piece where `places` (world
+    /// space, piece order) has it.
+    pub fn posed(&self, placed: Mat4, places: &[Mat4]) -> Vec<Mat4> {
+        let back = placed.inverse();
+        self.rest
+            .iter()
+            .zip(&self.owner)
+            .map(|(&rest, owner)| {
+                match owner.and_then(|i| Some((self.pieces.get(i)?, places.get(i)?))) {
+                    Some((piece, &now)) => back * now * piece.from_model * rest,
+                    None => rest,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Whether `PHY2` shape `k` stands in the way of the model as it stands
+/// intact (`hidden` as [`PartStates::hidden`](m2_assets::model::PartStates::hidden)
+/// has it): not leaves ([`FOLIAGE`](m2_assets::physics::FOLIAGE)), which
+/// vehicles and people go through, nor a shape on a part the model
+/// doesn't show intact (its wreck's, the pieces it breaks into).
+fn standing(p: &Phy2, k: usize, hidden: &[bool]) -> bool {
+    let Some(s) = p.shapes.get(k) else {
+        return false;
+    };
+    let node = p.parts.get(s.part).map_or(0, |q| q.node as usize);
+    !s.is_foliage() && !hidden.get(node).copied().unwrap_or(false)
+}
+
+/// A box round `PHY2` shape `k` (its convex radius included), placed by
+/// `to` from its body node's space.
+fn shape_box(p: &Phy2, k: usize, to: Mat4) -> Option<(r::Pose, r::SharedShape)> {
+    let s = p.shapes.get(k)?;
+    let (v, _) = s.geometry.triangles(s.radius);
+    let (lo, hi) = v.iter().fold(
+        (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+        |(lo, hi), &x| (lo.min(Vec3::from(x)), hi.max(Vec3::from(x))),
+    );
+    if lo.x > hi.x {
+        return None;
+    }
+    let at = to
+        * p.shape_place(k).map_or(Mat4::IDENTITY, place)
+        * Mat4::from_translation((lo + hi) * 0.5);
+    let (scale, rotation, translation) = at.to_scale_rotation_translation();
+    let half = ((hi - lo) * 0.5 * scale.abs() + Vec3::splat(s.radius.max(0.0)))
+        .max(Vec3::splat(LOOSE_HALF));
+    (half.is_finite() && translation.is_finite() && rotation.is_finite()).then(|| {
+        (
+            pose(translation, rotation.normalize()),
+            r::SharedShape::cuboid(half.x, half.y, half.z),
+        )
+    })
+}
+
 impl CollisionShape {
+    /// A box reaching `half` each way from its centre.
+    pub fn cuboid(half: Vec3) -> Self {
+        let half = half.max(Vec3::splat(0.01));
+        Self {
+            shape: r::SharedShape::cuboid(half.x, half.y, half.z),
+            triangles: 12,
+            stand_in: false,
+            loose: None,
+        }
+    }
+
     /// A triangle mesh; `None` if it has no valid triangle.
     pub fn mesh(vertices: &[Vec3], triangles: &[[u32; 3]]) -> Option<Self> {
         let n = vertices.len() as u32;
@@ -88,11 +374,20 @@ impl CollisionShape {
         Some(Self {
             shape,
             triangles: count,
+            stand_in: false,
+            loose: None,
         })
     }
 
+    /// The box the shape fills, in its own space.
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        let b = self.shape.compute_local_aabb();
+        (vec3(b.mins), vec3(b.maxs))
+    }
+
     /// A model's collision in model space: its `PHY2` shapes if `phy2` is
-    /// given and parses, else its rigid visible geometry at `lod`.
+    /// given and parses, else its rigid visible geometry at `lod` (a stand
+    /// in).
     pub fn for_model(model: &Model<'_>, phy2: Option<&[u8]>, lod: u32) -> Option<Self> {
         Self::for_model_part(model, phy2, lod, None)
     }
@@ -112,8 +407,24 @@ impl CollisionShape {
     ) -> Option<Self> {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
+        let mut loose = None;
+        // Shapes of its own, whether or not any stands in the way: no
+        // stand-in then.
+        let mut shaped = false;
         if let Some(p) = phy2.and_then(|d| Phy2::parse(d).ok()) {
+            if sub_object.is_none() {
+                loose = Loose::of(model, &p).map(Arc::new);
+            }
+            shaped = !p.shapes.is_empty();
+            let hidden = model
+                .states
+                .as_ref()
+                .map(|s| s.hidden(&model.nodes, false))
+                .unwrap_or_default();
             for (k, s) in p.shapes.iter().enumerate() {
+                if !standing(&p, k, &hidden) {
+                    continue;
+                }
                 // A shape sits at its part's place in its body node's
                 // space.
                 let node = p
@@ -128,12 +439,32 @@ impl CollisionShape {
                 triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
             }
         }
-        if triangles.is_empty() {
+        let stand_in = !shaped && triangles.is_empty();
+        if stand_in {
             let lod = (lod..model.info.lod_count.max(lod + 1))
                 .find(|&l| model.has_lod(l))
                 .unwrap_or(lod);
+            // Only what stands drawn and solid: not the wrecked parts an
+            // intact model hides, nor its leaves, light glows or unseen
+            // surfaces.
+            let hidden = model
+                .states
+                .as_ref()
+                .map(|s| s.hidden(&model.nodes, false))
+                .unwrap_or_default();
+            let solid = |material: u32| {
+                model
+                    .materials
+                    .get(material as usize)
+                    .is_none_or(|m| m.flags & NOT_SOLID == 0)
+            };
             for (segment, geometry) in model.lod(lod) {
-                if geometry.kind == GeometryKind::Skin {
+                if geometry.kind == GeometryKind::Skin
+                    || hidden
+                        .get(usize::from(segment.node))
+                        .copied()
+                        .unwrap_or(false)
+                {
                     continue;
                 }
                 let local = model.node_to_model(segment.node).unwrap_or(Mat4::IDENTITY);
@@ -158,7 +489,7 @@ impl CollisionShape {
                                 .is_some_and(|p| (p[3] - index as f32).abs() < 0.5)
                         })
                     };
-                    for range in &group.material_ranges {
+                    for range in group.material_ranges.iter().filter(|r| solid(r.material)) {
                         triangles.extend(
                             group
                                 .triangles(range)
@@ -170,9 +501,18 @@ impl CollisionShape {
                 }
             }
         }
-        Self::mesh(&vertices, &triangles)
+        Self::mesh(&vertices, &triangles).map(|shape| Self {
+            stand_in,
+            loose,
+            ..shape
+        })
     }
 }
+
+/// Material flags of surfaces nothing stands on or bumps into: additive
+/// glows (lights, trails), tree leaves (swaying in the wind), and surfaces
+/// never drawn (as the renderer reads them; not confirmed in the game).
+const NOT_SOLID: u16 = 0x0002 | 0x0400 | 0x0800;
 
 /// A `PHY2` part's place (position, rotation x y z w) as a matrix; a
 /// rotation that isn't one counts as none.
@@ -229,6 +569,33 @@ const TRACK_TURN: f32 = 0.9;
 /// and backwards.
 const TOP_SPEED: f32 = 30.0;
 const REVERSE_SPEED: f32 = 8.0;
+/// Boats ([`Physics::set_water`]): how deep a boat's origin floats,
+/// metres (the layers put the start's boat 0.35 m under the -36 m sea,
+/// patrol boats at it); how hard it pushes on flat out, m/s²; how its
+/// speed falls off coasting and braking, sideways (its keel) and up and
+/// down, and how its rocking dies down, per second; how fast it turns at
+/// speed, radians a second, from what speed, m/s; its top speed backing
+/// up and when its template gives none, m/s; and the most of its weight
+/// a wreck's buoyancy holds up (it sinks). All invented.
+pub const FLOAT_DEPTH: f32 = 0.35;
+const BOAT_PUSH: f32 = 5.0;
+const BOAT_COAST: f32 = 0.3;
+const BOAT_BRAKE: f32 = 1.2;
+const BOAT_KEEL: f32 = 2.5;
+const BOAT_HEAVE: f32 = 3.0;
+const BOAT_ROCK: f32 = 2.5;
+const BOAT_TURN: f32 = 0.9;
+const BOAT_TURN_SPEED: f32 = 6.0;
+const BOAT_REVERSE: f32 = 4.0;
+const BOAT_TOP: f32 = 18.0;
+const WRECK_FLOAT: f32 = 0.4;
+/// A boat going fast planes (the playthroughs' speedboat rides high, bow
+/// up): from a standstill to this speed, m/s, its hull rises up to this
+/// far, metres, and its bow this much more than its stern (and the stern
+/// that much less), metres. Invented, from the videos.
+pub const PLANE_SPEED: f32 = 12.0;
+const PLANE_RISE: f32 = 0.3;
+const PLANE_TRIM: f32 = 0.25;
 /// The steepest hill a vehicle takes about as fast as the flat, radians,
 /// wheeled and tracked: uphill the engine pulls as a lower gear would
 /// (invented; the playthrough's jeep and tank take the hill roads at
@@ -262,6 +629,21 @@ struct VehicleBody {
     top: f32,
     /// Wrecked: nothing drives it any more.
     wrecked: bool,
+    /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
+    held: bool,
+    /// Its velocity before the last step, m/s: what it hit things with.
+    before: Vec3,
+    /// A boat's: it floats instead of rolling on wheels.
+    hull: Option<Hull>,
+}
+
+/// A boat's hull in the water: the points on its waterline that float it,
+/// and what its driver asks of it.
+struct Hull {
+    /// Model space, at its origin's height: over its hull's footprint,
+    /// its corners, the middles of its sides and its middle.
+    points: Vec<Vec3>,
+    controls: VehicleControls,
 }
 
 /// A character's capsule and motion.
@@ -302,11 +684,31 @@ impl Character {
 /// through them.
 const RAGDOLL: r::Group = r::Group::GROUP_2;
 
+/// The collision group of loose pieces: they land on the world and people
+/// but not on each other (a broken prop's pieces start touching: boxes
+/// round them overlap), and vehicles drive through them (round 90's tank
+/// sat lifted on three pieces of what it had knocked down, two tracks off
+/// the ground).
+const DEBRIS: r::Group = r::Group::GROUP_3;
+
+/// The collision group of vehicles' hulls and turrets.
+const VEHICLE: r::Group = r::Group::GROUP_4;
+
 /// Queries that see everything but ragdolls.
 fn solid<'a>() -> r::QueryFilter<'a> {
     r::QueryFilter::default().groups(r::InteractionGroups::new(
         r::Group::ALL,
         r::Group::ALL.difference(RAGDOLL),
+        r::InteractionTestMode::And,
+    ))
+}
+
+/// Queries that see what a wheel stands on: everything but ragdolls and
+/// loose pieces.
+fn ground<'a>() -> r::QueryFilter<'a> {
+    r::QueryFilter::default().groups(r::InteractionGroups::new(
+        r::Group::ALL,
+        r::Group::ALL.difference(RAGDOLL).difference(DEBRIS),
         r::InteractionTestMode::And,
     ))
 }
@@ -339,10 +741,30 @@ struct Ragdoll {
 pub struct Physics {
     world: r::PhysicsWorld,
     statics: HashMap<StaticKey, r::ColliderHandle>,
+    /// What each static collider belongs to.
+    keys: HashMap<r::ColliderHandle, StaticKey>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
+    /// Loose props' pieces, oldest first.
+    debris: Vec<Option<r::RigidBodyHandle>>,
+    /// The water's surface boats float on, if there is any.
+    water: Option<f32>,
 }
+
+/// A loose prop's piece in the physics world ([`Physics::add_debris`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DebrisId(usize);
+
+/// Loose pieces tumbling at once at most: past this many the oldest are
+/// held where they lie.
+const MAX_DEBRIS: usize = 160;
+/// A loose piece this far down has fallen through the island (its ground
+/// streamed out) and is held.
+const DEBRIS_FLOOR: f32 = -500.0;
+/// How a loose piece slows in the air and slides, invented.
+const DEBRIS_DAMPING: f32 = 0.2;
+const DEBRIS_FRICTION: f32 = 0.8;
 
 impl fmt::Debug for Physics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -375,10 +797,23 @@ impl Physics {
         Self {
             world: r::PhysicsWorld::default(),
             statics: HashMap::new(),
+            keys: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
+            debris: Vec::new(),
+            water: None,
         }
+    }
+
+    /// Sets the height of the water boats float on (the sea).
+    pub fn set_water(&mut self, level: f32) {
+        self.water = Some(level);
+    }
+
+    /// The height of the water boats float on, if there is any.
+    pub fn water(&self) -> Option<f32> {
+        self.water
     }
 
     /// Adds `shape` at `position` and `rotation` under `key`, replacing
@@ -396,10 +831,12 @@ impl Physics {
             .build();
         let handle = self.world.insert_collider(collider, None);
         self.statics.insert(key, handle);
+        self.keys.insert(handle, key);
     }
 
     pub fn remove_static(&mut self, key: StaticKey) {
         if let Some(h) = self.statics.remove(&key) {
+            self.keys.remove(&h);
             self.world.remove_collider(h);
         }
     }
@@ -418,7 +855,14 @@ impl Physics {
         self.world.integration_parameters.dt = dt;
         let w = &mut self.world;
         for v in self.vehicles.iter_mut().flatten() {
-            let filter = solid().exclude_rigid_body(v.controller.chassis);
+            v.before = w
+                .bodies
+                .get(v.controller.chassis)
+                .map_or(Vec3::ZERO, |b| vec3(b.linvel()));
+            if v.held {
+                continue;
+            }
+            let filter = ground().exclude_rigid_body(v.controller.chassis);
             let queries = w.broad_phase.as_query_pipeline_mut(
                 w.narrow_phase.query_dispatcher(),
                 &mut w.bodies,
@@ -427,8 +871,176 @@ impl Physics {
             );
             v.controller.update_vehicle(dt, queries);
         }
+        self.float_boats(dt);
         self.world.step();
         self.hold_ragdolls_together();
+        self.settle_debris();
+    }
+
+    /// Floats boats on the water ([`set_water`](Self::set_water)) and
+    /// drives them as asked: each point of a hull's waterline under the
+    /// surface lifts it as deep as it is (the hull's whole weight with its
+    /// origin [`FLOAT_DEPTH`] under), and in the water a boat is pushed and
+    /// steered, slowed, kept from sliding sideways and stopped rocking.
+    fn float_boats(&mut self, dt: f32) {
+        let Some(water) = self.water else {
+            return;
+        };
+        for v in self.vehicles.iter().flatten() {
+            let Some(hull) = v.hull.as_ref().filter(|_| !v.held) else {
+                continue;
+            };
+            let Some(b) = self.world.bodies.get_mut(v.controller.chassis) else {
+                continue;
+            };
+            let place = *b.position();
+            let turn = Quat::from_array(place.rotation.to_array());
+            let at = vec3(place.translation);
+            let n = hull.points.len().max(1) as f32;
+            // Deep under, three times its share of the weight; a wreck's
+            // never more than its share of [`WRECK_FLOAT`] of it.
+            let most = if v.wrecked { WRECK_FLOAT } else { 3.0 };
+            let lift = GRAVITY * v.mass / n * dt;
+            // Planing, it floats as if the water stood higher, the more so
+            // at the bow.
+            let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or_zero();
+            let going = vec3(b.linvel()).dot(ahead);
+            let plane = if v.wrecked {
+                0.0
+            } else {
+                (going / PLANE_SPEED).clamp(0.0, 1.0)
+            };
+            let reach = hull
+                .points
+                .iter()
+                .map(|q| q.z.abs())
+                .fold(0.0f32, f32::max)
+                .max(0.1);
+            let mut wet = 0.0;
+            for &q in &hull.points {
+                let p = at + turn * q;
+                let surface = water + plane * (PLANE_RISE + PLANE_TRIM * q.z / reach);
+                let depth = surface - p.y;
+                if depth > 0.0 {
+                    wet += 1.0;
+                    let up = lift * (depth / FLOAT_DEPTH).min(most);
+                    b.apply_impulse_at_point(vector(Vec3::Y * up), vector(p), true);
+                }
+            }
+            if wet == 0.0 {
+                continue;
+            }
+            let wet = wet / n;
+            let ease = |rate: f32| 1.0 - (rate * dt * wet).min(1.0);
+            let c = if v.wrecked {
+                VehicleControls::default()
+            } else {
+                hull.controls
+            };
+            let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+            let velocity = vec3(b.linvel());
+            let mut along = velocity.dot(ahead);
+            let throttle = c.throttle.clamp(-1.0, 1.0);
+            let against = throttle * along < -0.5;
+            let top = if throttle >= 0.0 { v.top } else { BOAT_REVERSE };
+            if throttle != 0.0 && !against && !c.brake && !c.parked {
+                let headroom = (1.0 - along.abs() / top).clamp(0.0, 1.0);
+                along += throttle * BOAT_PUSH * headroom * dt * wet;
+            }
+            let slowing = if c.brake || c.parked || against {
+                BOAT_BRAKE
+            } else if throttle == 0.0 {
+                BOAT_COAST
+            } else {
+                0.0
+            };
+            along *= ease(slowing);
+            let across = velocity.dot(side) * ease(BOAT_KEEL);
+            let rise = velocity.y * ease(BOAT_HEAVE);
+            b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
+            // The rudder bites as the water goes by (the other way round
+            // backing up), a little with the throttle open at a standstill;
+            // it turns as tracks do for the same steering.
+            let spin = vec3(b.angvel());
+            let up = turn * Vec3::Y;
+            let bite = if along.abs() < 0.9 {
+                0.15 * throttle
+            } else {
+                (along / BOAT_TURN_SPEED).clamp(-1.0, 1.0)
+            };
+            let want = c.steer.clamp(-1.0, 1.0) * BOAT_TURN * bite;
+            let yaw = spin.dot(up);
+            let yaw = yaw + (want - yaw) * (3.0 * dt * wet).min(1.0);
+            let rock = (spin - up * spin.dot(up)) * ease(BOAT_ROCK);
+            b.set_angvel(vector(rock + up * yaw), true);
+        }
+    }
+
+    /// Holds loose pieces fallen through the island, and the oldest past
+    /// [`MAX_DEBRIS`] still tumbling.
+    fn settle_debris(&mut self) {
+        let mut tumbling = 0;
+        for h in self.debris.iter().rev().flatten() {
+            let Some(b) = self.world.bodies.get_mut(*h) else {
+                continue;
+            };
+            if !b.is_dynamic() {
+                continue;
+            }
+            tumbling += 1;
+            if tumbling > MAX_DEBRIS || b.translation().y < DEBRIS_FLOOR {
+                b.set_body_type(r::RigidBodyType::Fixed, false);
+            }
+        }
+    }
+
+    /// Adds a loose piece where `at` (world space; scale ignored) puts it,
+    /// flying at `velocity` (m/s) and turning at `spin` (radians a second
+    /// about each axis).
+    pub fn add_debris(
+        &mut self,
+        piece: &LoosePiece,
+        at: Mat4,
+        velocity: Vec3,
+        spin: Vec3,
+    ) -> DebrisId {
+        let (_, rotation, translation) = at.to_scale_rotation_translation();
+        let body = self.world.insert_body(
+            r::RigidBodyBuilder::dynamic()
+                .pose(pose(translation, rotation.normalize()))
+                .linvel(vector(velocity))
+                .angvel(vector(spin))
+                .linear_damping(DEBRIS_DAMPING)
+                .angular_damping(DEBRIS_DAMPING)
+                .ccd_enabled(true),
+        );
+        let collider = r::ColliderBuilder::new(piece.shape.clone())
+            .mass(piece.mass)
+            .friction(DEBRIS_FRICTION)
+            .collision_groups(r::InteractionGroups::new(
+                DEBRIS,
+                r::Group::ALL.difference(DEBRIS).difference(VEHICLE),
+                r::InteractionTestMode::And,
+            ));
+        self.world.insert_collider(collider, Some(body));
+        self.debris.push(Some(body));
+        DebrisId(self.debris.len() - 1)
+    }
+
+    /// Where a loose piece is now (its node's place, world space).
+    pub fn debris_place(&self, id: DebrisId) -> Option<Mat4> {
+        let h = (*self.debris.get(id.0)?)?;
+        let p = self.world.bodies.get(h)?.position();
+        Some(Mat4::from_rotation_translation(
+            Quat::from_array(p.rotation.to_array()),
+            vec3(p.translation),
+        ))
+    }
+
+    pub fn remove_debris(&mut self, id: DebrisId) {
+        if let Some(h) = self.debris.get_mut(id.0).and_then(Option::take) {
+            self.world.remove_body_with_colliders(h, true);
+        }
     }
 
     /// Puts each limb back on its joint where the solver let it drift (a
@@ -512,6 +1124,7 @@ impl Physics {
             size.x * size.x + size.z * size.z,
             size.x * size.x + size.y * size.y,
         ) * (m / 12.0 * 1.5);
+        let hull = r::InteractionGroups::new(VEHICLE, r::Group::ALL, r::InteractionTestMode::And);
         let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
             .translation(vector(centre))
             .mass_properties(r::MassProperties::new(
@@ -519,7 +1132,8 @@ impl Physics {
                 m,
                 vector(inertia),
             ))
-            .friction(0.6);
+            .friction(0.6)
+            .collision_groups(hull);
         self.world.insert_collider(collider, Some(body));
         // The turret on top, adding nothing to the mass the hull carries.
         if let Some((lo, hi)) = spec.turret_box {
@@ -527,7 +1141,8 @@ impl Physics {
             let turret = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
                 .translation(vector((lo + hi) * 0.5))
                 .density(0.0)
-                .friction(0.6);
+                .friction(0.6)
+                .collision_groups(hull);
             self.world.insert_collider(turret, Some(body));
         }
 
@@ -554,14 +1169,33 @@ impl Physics {
                 &tuning,
             );
         }
+        // A boat floats on its waterline (its origin's height), over the
+        // footprint of its hull a little in from the edges.
+        let boat = spec.is_boat();
+        let hull = boat.then(|| {
+            let (lo, hi) = spec.hull;
+            let at = |a: f32, b: f32, k: f32| a + (b - a) * (0.1 + 0.4 * k);
+            let points = (0..3)
+                .flat_map(|i| (0..3).map(move |j| (i as f32, j as f32)))
+                .map(|(i, j)| Vec3::new(at(lo.x, hi.x, i), 0.0, at(lo.z, hi.z, j)))
+                .collect();
+            Hull {
+                points,
+                controls: VehicleControls::default(),
+            }
+        });
+        let top = if boat { BOAT_TOP } else { TOP_SPEED };
         let id = VehicleId(self.vehicles.len());
         self.vehicles.push(Some(VehicleBody {
             controller,
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tracked: spec.tracked,
-            top: spec.tuning.max_speed.unwrap_or(TOP_SPEED),
+            top: spec.tuning.max_speed.unwrap_or(top),
             wrecked: false,
+            held: false,
+            before: Vec3::ZERO,
+            hull,
         }));
         id
     }
@@ -586,6 +1220,11 @@ impl Physics {
         else {
             return;
         };
+        // A boat is driven as it floats (`float_boats`).
+        if let Some(hull) = &mut v.hull {
+            hull.controls = controls;
+            return;
+        }
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
         // How steeply its nose points up (the sine).
@@ -702,6 +1341,104 @@ impl Physics {
             })
     }
 
+    /// What a vehicle's body is in contact with (its wheels' contacts
+    /// aside): each static's key (`None` for anything else solid, such as
+    /// another vehicle) with the deepest point of contact on the body and
+    /// the box the thing touched fills, world space. To find what holds a
+    /// stuck vehicle.
+    #[allow(clippy::type_complexity)]
+    pub fn vehicle_touching(&self, id: VehicleId) -> Vec<(Option<StaticKey>, Vec3, (Vec3, Vec3))> {
+        let Some(body) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &c in body.colliders() {
+            let Some(own) = self.world.colliders.get(c) else {
+                continue;
+            };
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let first = pair.collider1 == c;
+                let other = if first {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let Some(deepest) = pair
+                    .manifolds()
+                    .iter()
+                    .flat_map(|m| &m.points)
+                    .min_by(|a, b| a.dist.total_cmp(&b.dist))
+                else {
+                    continue;
+                };
+                let local = if first {
+                    deepest.local_p1
+                } else {
+                    deepest.local_p2
+                };
+                let key = self.keys.get(&other).copied();
+                let span = self
+                    .world
+                    .colliders
+                    .get(other)
+                    .map_or((Vec3::ZERO, Vec3::ZERO), |o| {
+                        let b = o.compute_aabb();
+                        (vec3(b.mins), vec3(b.maxs))
+                    });
+                out.push((key, vec3(own.position().transform_point(local)), span));
+            }
+        }
+        out
+    }
+
+    /// The statics a vehicle's body is in contact with (its wheels'
+    /// contacts aside), each once: what it ran into.
+    pub fn vehicle_statics(&self, id: VehicleId) -> Vec<StaticKey> {
+        let Some(body) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &c in body.colliders() {
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let other = if pair.collider1 == c {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                if let Some(&key) = self.keys.get(&other)
+                    && !out.contains(&key)
+                {
+                    out.push(key);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a vehicle's engine is pulling (or backing) it.
+    pub fn vehicle_pulling(&self, id: VehicleId) -> bool {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|v| v.controller.wheels().iter().any(|w| w.engine_force != 0.0))
+    }
+
     /// A vehicle's velocity, m/s.
     pub fn vehicle_velocity(&self, id: VehicleId) -> Vec3 {
         self.vehicles
@@ -763,6 +1500,59 @@ impl Physics {
             c.set_shape(r::SharedShape::cuboid(cube.x, half, cube.z));
             c.set_translation_wrt_parent(vector(Vec3::new(at.x, bottom + half, at.z)));
             c.set_friction(WRECK_FRICTION);
+        }
+    }
+
+    /// Holds a vehicle where it is, its body fixed (the ground under it
+    /// has streamed out, far from the player, and it would fall through
+    /// the island), or lets it go again, at rest.
+    pub fn hold_vehicle(&mut self, id: VehicleId, held: bool) {
+        let Some(v) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .filter(|v| v.held != held)
+        else {
+            return;
+        };
+        v.held = held;
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            let kind = if held {
+                r::RigidBodyType::Fixed
+            } else {
+                r::RigidBodyType::Dynamic
+            };
+            body.set_body_type(kind, true);
+            body.set_linvel(r::Vector::ZERO, true);
+            body.set_angvel(r::Vector::ZERO, true);
+        }
+    }
+
+    /// Whether a vehicle is held where it is.
+    pub fn vehicle_held(&self, id: VehicleId) -> bool {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|v| v.held)
+    }
+
+    /// A vehicle's velocity before the last step, m/s: what it hit things
+    /// with (a crash stops it within the step).
+    pub fn vehicle_velocity_before(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(Vec3::ZERO, |v| v.before)
+    }
+
+    /// Sets a vehicle's velocity, m/s (as it was before something it hit
+    /// gave way).
+    pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_linvel(vector(velocity), true);
         }
     }
 
@@ -1018,11 +1808,7 @@ impl Physics {
             .world
             .query_pipeline_with_filter(solid())
             .cast_ray_and_get_normal(&ray, max, true)?;
-        let key = self
-            .statics
-            .iter()
-            .find(|(_, h)| **h == handle)
-            .map(|(k, _)| *k);
+        let key = self.keys.get(&handle).copied();
         Some((hit.time_of_impact, vec3(hit.normal), key))
     }
 
@@ -1305,6 +2091,141 @@ mod tests {
         }
     }
 
+    fn boat() -> VehicleSpec {
+        let hull = (Vec3::new(-1.2, -0.7, -3.0), Vec3::new(1.2, 1.0, 3.0));
+        VehicleSpec {
+            kind: crate::vehicle::BOAT.into(),
+            wheels: Vec::new(),
+            bounds: hull,
+            hull,
+            mass: 2000.0,
+            ..car()
+        }
+    }
+
+    #[test]
+    fn a_boat_floats_level_drives_turns_and_beaches() {
+        let mut p = Physics::new();
+        let water = -36.0;
+        p.set_water(water);
+        // The seabed, and a beach rising out of the sea 120 m ahead.
+        let bed = CollisionShape::mesh(
+            &[
+                Vec3::new(-300.0, -60.0, -300.0),
+                Vec3::new(300.0, -60.0, -300.0),
+                Vec3::new(300.0, -60.0, 100.0),
+                Vec3::new(-300.0, -60.0, 100.0),
+                Vec3::new(300.0, -26.0, 300.0),
+                Vec3::new(-300.0, -26.0, 300.0),
+            ],
+            &[[0, 2, 1], [0, 3, 2], [3, 4, 2], [3, 5, 4]],
+        )
+        .unwrap();
+        p.add_static(StaticKey::Cell(1), &bed, Vec3::ZERO, Quat::IDENTITY);
+        p.step(DT);
+        let id = p.add_vehicle(&boat(), Vec3::new(0.0, water + 1.5, -200.0), 0.0);
+        let place = |p: &Physics| p.vehicle_transform(id).unwrap();
+        for _ in 0..600 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        // Afloat, level, its origin about as deep as the layers put boats.
+        let m = place(&p);
+        let y = m.w_axis.y;
+        assert!((y - (water - FLOAT_DEPTH)).abs() < 0.15, "floats at {y}");
+        assert!(m.transform_vector3(Vec3::Y).y > 0.99, "level");
+        // Flat out ahead.
+        for _ in 0..360 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let speed = p.vehicle_speed(id);
+        assert!((10.0..=BOAT_TOP + 0.5).contains(&speed), "{speed} m/s");
+        let m = place(&p);
+        assert!(
+            m.w_axis.z > -170.0 && m.w_axis.x.abs() < 1.0,
+            "at {}",
+            m.w_axis
+        );
+        // Planing: riding higher than at rest, bow up.
+        assert!(
+            m.w_axis.y > water - FLOAT_DEPTH + 0.1 && m.w_axis.y < water + 0.3,
+            "planes at {}",
+            m.w_axis.y
+        );
+        let bow = m.transform_vector3(Vec3::Z).y;
+        assert!((0.02..0.2).contains(&bow), "bow up {bow}");
+        // Steering turns it as steering a tank does: positive steer, a
+        // positive turn about up.
+        let before = m.transform_vector3(Vec3::Z);
+        for _ in 0..120 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    steer: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let after = place(&p).transform_vector3(Vec3::Z);
+        let turned = after.x.atan2(after.z) - before.x.atan2(before.z);
+        assert!(turned > 0.8, "turned {turned}");
+        // Straight on at the beach: it runs aground and stops there,
+        // still upright.
+        for _ in 0..120 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    steer: -1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        for _ in 0..60 * 40 {
+            let m = place(&p);
+            let f = m.transform_vector3(Vec3::Z);
+            // Heading for +z.
+            let steer = (-f.x.atan2(f.z) * 2.0).clamp(-1.0, 1.0);
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    steer,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        // The beach comes out of the water at z 241.
+        let m = place(&p);
+        assert!(p.vehicle_speed(id).abs() < 2.0, "{}", p.vehicle_speed(id));
+        assert!(
+            (215.0..250.0).contains(&m.w_axis.z),
+            "aground at {}",
+            m.w_axis
+        );
+        assert!(m.transform_vector3(Vec3::Y).y > 0.8, "upright");
+        // A wreck sinks.
+        p.wreck_vehicle(id);
+        let id2 = p.add_vehicle(&boat(), Vec3::new(50.0, water, -200.0), 0.0);
+        p.wreck_vehicle(id2);
+        for _ in 0..60 * 20 {
+            p.step(DT);
+        }
+        let y = p.vehicle_transform(id2).unwrap().w_axis.y;
+        assert!(y < water - 5.0, "wreck at {y}");
+    }
+
     #[test]
     fn cars_cross_a_steep_side_slope_upright() {
         let mut p = Physics::new();
@@ -1571,6 +2492,261 @@ mod tests {
         assert!(at.x.hypot(at.z) < 0.5, "moved to {at}");
         let wheels = p.vehicle_wheels(id);
         assert!(wheels.iter().all(|w| w.0 == 0.0), "{wheels:?}");
+    }
+
+    #[test]
+    fn leaves_and_hidden_parts_dont_stand_in_the_way() {
+        use m2_assets::physics::{Body, Geometry, Part, Shape};
+        let part = |node: u32, body: Option<usize>, shape: Option<usize>| Part {
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            node_hash: 0,
+            node,
+            body,
+            shape,
+            unk_link: 0,
+            parent: None,
+            first_child: None,
+            next_sibling: None,
+        };
+        let shape = |part: usize, class: u32| {
+            let mut record = [0; 26];
+            record[4] = class;
+            Shape {
+                radius: 0.0,
+                geometry: Geometry::Box {
+                    half_extents: [1.0; 3],
+                },
+                part,
+                record,
+            }
+        };
+        let p = Phy2 {
+            version: 0x39,
+            model: 0,
+            unk_0x14: [0; 3],
+            // A trunk and its leaves on node 1, a piece it breaks into on
+            // node 2 (hidden intact).
+            parts: vec![
+                part(1, Some(0), None),
+                part(1, None, Some(0)),
+                part(1, None, Some(1)),
+                part(2, None, Some(2)),
+            ],
+            bodies: vec![Body {
+                inertia: [f32::MAX; 9],
+                centre_of_mass: [0.0; 3],
+                mass: 0.0,
+                unk: [0.3; 4],
+                unk_words: [0; 8],
+            }],
+            shapes: vec![shape(1, 0x27), shape(2, 0x28), shape(3, 0x27)],
+        };
+        let hidden = [false, false, true];
+        let stands: Vec<bool> = (0..3).map(|k| standing(&p, k, &hidden)).collect();
+        assert_eq!(stands, [true, false, false]);
+        // A model that shows everything: only the leaves go through.
+        assert!(standing(&p, 2, &[]));
+        assert!(!standing(&p, 1, &[]));
+    }
+
+    #[test]
+    fn a_loose_piece_carries_the_nodes_under_it() {
+        // A base, an arm 2 m up on it, and a lamp 1 m along the arm.
+        let rest = vec![
+            Mat4::IDENTITY,
+            Mat4::from_translation(Vec3::Y * 2.0),
+            Mat4::from_translation(Vec3::new(1.0, 2.0, 0.0)),
+        ];
+        let loose = Loose {
+            pieces: vec![LoosePiece {
+                node: Some(1),
+                shape: r::SharedShape::cuboid(0.5, 0.1, 0.1),
+                mass: 10.0,
+                from_model: rest[1].inverse(),
+            }],
+            breaks: true,
+            mass: 10.0,
+            rest: rest.clone(),
+            owner: vec![None, Some(0), Some(0)],
+            flying: vec![false, true, true],
+        };
+        let placed = Mat4::from_translation(Vec3::new(100.0, 0.0, 0.0));
+        let starts = loose.starts(placed);
+        assert!(
+            starts[0]
+                .w_axis
+                .truncate()
+                .distance(Vec3::new(100.0, 2.0, 0.0))
+                < 1e-4
+        );
+        for (a, b) in loose.posed(placed, &starts).iter().zip(&rest) {
+            assert!(a.abs_diff_eq(*b, 1e-4), "{a} {b}");
+        }
+        // The arm down by the base, turned a quarter about z: the lamp
+        // goes with it, the base stays.
+        let fallen = Mat4::from_translation(Vec3::new(101.0, 0.1, 0.0))
+            * Mat4::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let posed = loose.posed(placed, &[fallen]);
+        assert!(posed[0].abs_diff_eq(rest[0], 1e-4));
+        let lamp = (placed * posed[2]).w_axis.truncate();
+        assert!(lamp.distance(Vec3::new(101.0, 1.1, 0.0)) < 1e-4, "{lamp}");
+    }
+
+    #[test]
+    fn vehicles_drive_through_loose_pieces() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        // A heavy beam lying across the way 10 m ahead, settled.
+        let beam = LoosePiece {
+            node: None,
+            shape: r::SharedShape::cuboid(2.0, 0.3, 0.3),
+            mass: 400.0,
+            from_model: Mat4::IDENTITY,
+        };
+        let d = p.add_debris(
+            &beam,
+            Mat4::from_translation(Vec3::new(0.0, 0.3, 10.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let rest = p.vehicle_transform(id).unwrap().w_axis.y;
+        let mut highest = rest;
+        for _ in 0..240 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            highest = highest.max(p.vehicle_transform(id).unwrap().w_axis.y);
+        }
+        let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        assert!(at.z > 16.0, "drove past the beam to {at}");
+        assert!(highest < rest + 0.1, "rode up from {rest} to {highest}");
+        // And the beam lies where it was.
+        let beam_at = p.debris_place(d).unwrap().w_axis.truncate();
+        assert!(
+            beam_at.distance(Vec3::new(0.0, 0.3, 10.0)) < 0.2,
+            "{beam_at}"
+        );
+    }
+
+    #[test]
+    fn a_car_knocks_a_loose_pole_over_and_ploughs_on() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        // A 6 m pole, 150 kg, standing 12 m ahead of the car.
+        let piece = LoosePiece {
+            node: None,
+            shape: r::SharedShape::compound(vec![(
+                pose(Vec3::Y * 3.0, Quat::IDENTITY),
+                r::SharedShape::cuboid(0.1, 3.0, 0.1),
+            )]),
+            mass: 150.0,
+            from_model: Mat4::IDENTITY,
+        };
+        let pole = CollisionShape {
+            shape: r::SharedShape::compound(vec![(
+                pose(Vec3::Y * 3.0, Quat::IDENTITY),
+                r::SharedShape::cuboid(0.1, 3.0, 0.1),
+            )]),
+            triangles: 12,
+            stand_in: false,
+            loose: None,
+        };
+        let base = Vec3::new(0.0, 0.0, 12.0);
+        p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        let mut hit = None;
+        for _ in 0..360 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            if p.vehicle_statics(id).contains(&StaticKey::Object(7)) {
+                hit = Some(p.vehicle_velocity_before(id));
+                break;
+            }
+        }
+        let before = hit.expect("ran into the pole");
+        assert!(before.z > 4.0, "hit it at {before}");
+        assert!(p.vehicle_pulling(id));
+        // Knocked loose: it goes, its piece flies, the car goes on.
+        p.remove_static(StaticKey::Object(7));
+        let share = 1400.0 / (1400.0 + piece.mass);
+        let d = p.add_debris(
+            &piece,
+            Mat4::from_translation(base),
+            before * share * 1.1 + Vec3::Y,
+            Vec3::X * before.z * 0.3,
+        );
+        p.set_vehicle_velocity(id, before * share);
+        for _ in 0..180 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let car_at = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        assert!(car_at.z > base.z + 5.0, "the car ploughed on to {car_at}");
+        let fallen = p.debris_place(d).unwrap();
+        let up = fallen.transform_vector3(Vec3::Y);
+        assert!(up.y < 0.5, "the pole fell over: up {up}");
+        let middle = fallen.transform_point3(Vec3::Y * 3.0);
+        assert!(
+            middle.y < 1.0 && middle.y > -0.2,
+            "lies on the ground: {middle}"
+        );
+        p.remove_debris(d);
+        assert!(p.debris_place(d).is_none());
+    }
+
+    #[test]
+    fn held_vehicles_stay_put_without_ground() {
+        let mut p = ready();
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let rest = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        p.hold_vehicle(id, true);
+        assert!(p.vehicle_held(id));
+        // The ground streams out from under it.
+        p.remove_static(StaticKey::Cell(1));
+        for _ in 0..120 {
+            p.step(DT);
+        }
+        let held = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        assert!(held.distance(rest) < 1e-3, "{rest} -> {held}");
+        // Back, and let go: it rests on it again.
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 50.0);
+        p.step(DT);
+        p.hold_vehicle(id, false);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let now = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        assert!(now.distance(rest) < 0.1, "{rest} -> {now}");
     }
 
     #[test]

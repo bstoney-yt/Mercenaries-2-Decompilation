@@ -241,6 +241,9 @@ pub struct Rest {
     pub bumps: f32,
 }
 
+/// The [`CatalogueEntry::kind`] of boats (a template with `_BoatPhysics`).
+pub const BOAT: &str = "boat";
+
 /// Node name hash of a gun's muzzle marker (the hand weapons have it).
 pub const GUN_MUZZLE: u32 = 0xb148_6ef3;
 
@@ -256,6 +259,11 @@ pub const TURRET: u32 = 0x7707_65e4;
 /// a tank's mantlet and barrel (the M1A1's, the AMX-30's), the Stryker's
 /// gun. The wreck's turret has a barrel of its own.
 pub const GUN: u32 = 0xcc0e_3f83;
+
+/// A turret's gun its template fires slower than this (shots a minute) is
+/// a cannon: the Stryker's 45 a minute, as the AMX-30's, where machine
+/// guns fire hundreds.
+const CANNON_RATE: f32 = 120.0;
 
 /// The four wheels a tracked vehicle drives on: under the corners of its
 /// road wheels, where the tracks meet the ground, else under its hull's.
@@ -300,6 +308,7 @@ impl VehicleSpec {
         let found = vehicle::find_wheels(model);
         let usable = (4..=10).contains(&found.len())
             && found.iter().all(|w| (0.15..=1.3).contains(&w.radius));
+        let boat = entry.kind == BOAT;
         // A wheeled APC (the Stryker) drives on its wheels.
         let tracked = entry.kind == "tank" || (entry.kind == "apc" && !usable);
         let n = model.nodes.len();
@@ -324,7 +333,9 @@ impl VehicleSpec {
             }
         };
         let mut road_wheels = Vec::new();
-        let mut wheels: Vec<WheelSpec> = if usable && !tracked {
+        let mut wheels: Vec<WheelSpec> = if boat {
+            Vec::new()
+        } else if usable && !tracked {
             let (back, front) = found
                 .iter()
                 .map(|w| w.centre[2])
@@ -546,6 +557,26 @@ impl VehicleSpec {
         self
     }
 
+    /// Whether it is a boat: it floats ([`Physics::set_water`]) and has
+    /// no wheels.
+    ///
+    /// [`Physics::set_water`]: crate::Physics::set_water
+    pub fn is_boat(&self) -> bool {
+        self.kind == BOAT
+    }
+
+    /// Whether its turret's gun fires shells: a tank's, or one its
+    /// template fires slower than [`CANNON_RATE`] (the Stryker's), not a
+    /// machine gun.
+    pub fn cannon(&self) -> bool {
+        self.muzzle.is_some()
+            && (self.kind == "tank"
+                || self
+                    .tuning
+                    .gun
+                    .is_some_and(|g| g.rate_of_fire < CANNON_RATE))
+    }
+
     /// How the turret's nodes move with the turret turned `turret`
     /// radians (anticlockwise from above): about the pivot, or its mount.
     pub fn turret_transform(&self, turret: f32) -> Mat4 {
@@ -623,8 +654,9 @@ impl VehicleSpec {
         let feet = |points: &[Vec3]| -> Option<Vec<(Vec3, f32)>> {
             points.iter().map(|&p| Some((p, on_ground(p)?))).collect()
         };
-        let (touch, (a, b, c)) = match fit_plane(&feet(&wheels)?) {
-            Some(plane) => (feet(&wheels)?, plane),
+        let under_wheels = feet(&wheels)?;
+        let (touch, (a, b, c)) = match fit_plane(&under_wheels) {
+            Some(plane) => (under_wheels, plane),
             None => {
                 let touch = feet(&corners)?;
                 let plane = fit_plane(&touch)?;
@@ -716,8 +748,12 @@ impl VehicleSpec {
 }
 
 /// The plane `h = a + b x + c z` closest (least squares) to `points`'
-/// heights over their x and z; `None` unless they span an area.
+/// heights over their x and z; `None` unless there are three or more of
+/// them spanning an area (none at all: a boat, which has no wheels).
 fn fit_plane(points: &[(Vec3, f32)]) -> Option<(f32, f32, f32)> {
+    if points.len() < 3 {
+        return None;
+    }
     let mut m = Mat3::ZERO;
     let mut r = Vec3::ZERO;
     for &(p, h) in points {
@@ -727,11 +763,12 @@ fn fit_plane(points: &[(Vec3, f32)]) -> Option<(f32, f32, f32)> {
     }
     // About the product of the spreads in x and z (variances, m^2).
     let n = points.len() as f32;
-    if m.determinant() < 1e-3 * n * n * n {
+    let spread = m.determinant();
+    if spread.is_nan() || spread < 1e-3 * n * n * n {
         return None;
     }
     let s = m.inverse() * r;
-    Some((s.x, s.y, s.z))
+    s.is_finite().then_some((s.x, s.y, s.z))
 }
 
 #[cfg(test)]
@@ -953,6 +990,28 @@ mod tests {
         }
         // Nothing loaded under it: nowhere to rest yet.
         assert!(s.rest_on(at, yaw, |_| None).is_none());
+    }
+
+    // Round 88 hopped the start boat onto rocks: with no wheels its rest
+    // came out NaN (a plane fitted to no points), and so did she when she
+    // got out of it.
+    #[test]
+    fn a_boat_without_wheels_rests_on_its_hull() {
+        let mut s = spec();
+        s.kind = BOAT.into();
+        s.wheels.clear();
+        s.node_wheel = vec![None, None];
+        let tan = 10f32.to_radians().tan();
+        let ground = |p: Vec3| Some(-1.0 + p.z * tan);
+        let rest = s.rest_on(Vec3::new(4.0, 0.0, 2.0), 0.3, ground).unwrap();
+        assert!(
+            rest.position.is_finite() && rest.rotation.is_finite(),
+            "{rest:?}"
+        );
+        assert!((rest.slope - 10f32.to_radians()).abs() < 0.02, "{rest:?}");
+        assert!(s.ride_height().is_finite());
+        assert_eq!(fit_plane(&[]), None);
+        assert_eq!(fit_plane(&[(Vec3::X, 1.0), (Vec3::Z, 1.0)]), None);
     }
 
     #[test]

@@ -308,7 +308,9 @@ pub type Shared = Rc<RefCell<ScriptWorld>>;
 
 /// Reports that `guid` reached `at` (its AI goal's location): it, its
 /// vehicle and any cargo on that vehicle's winch are there, the cargo is
-/// let go (a delivery), and the goal's callbacks run. Returns any errors.
+/// let go (a delivery) and moved there in play too (a [`Command::Move`]:
+/// the game may have put it down where it was made, before the winch took
+/// it), and the goal's callbacks run. Returns any errors.
 pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
     {
         let mut w = world.borrow_mut();
@@ -336,6 +338,10 @@ pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
         }
         for g in cargo {
             w.winch.insert(g, None);
+            w.commands.push(Command::Move {
+                guid: g,
+                position: at,
+            });
         }
     }
     goal_finished(world, guid)
@@ -668,6 +674,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             });
         }
         values([])
+    })?;
+    // Hanging from a winch, not yet let go: a delivery's objective waits
+    // for its cargo to be put down, not merely brought over the place.
+    add(&object, "IsWinched", |w, _, a| {
+        values([Value::Boolean(
+            id(a.first()).is_some_and(|g| w.winch.get(&g).is_some_and(Option::is_some)),
+        )])
     })?;
     // How far the winch is let out: the game's to animate.
     add(&object, "SetWinchState", |_, _, _| values([]))?;
@@ -1549,8 +1562,23 @@ mod tests {
             commands.last(),
             Some(Command::Goal { guid: 81, location: Some(at), .. }) if *at == [50.0, 0.0, 60.0]
         ));
+        let winched = |host: &ScriptHost| -> bool {
+            host.lua()
+                .load(r#"return Object.IsWinched(Sys.StringToGuid("82"))"#)
+                .eval()
+                .unwrap()
+        };
+        // Hanging until it is let go over the place.
+        assert!(winched(&host));
         assert!(arrived(&world, 81, [50.0, 0.0, 60.0]).is_empty());
+        assert!(!winched(&host));
         assert_eq!(world.borrow().objects[&82].position, [50.0, 0.0, 60.0]);
+        // Moved in play too, where the game may have put it down already.
+        let commands = world.borrow_mut().take_commands();
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            Command::Move { guid: 82, position } if *position == [50.0, 0.0, 60.0]
+        )));
         events.update_shared(0.1, &world);
         let dropped: String = host.lua().globals().get("dropped").unwrap();
         assert_eq!(dropped, "82");

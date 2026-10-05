@@ -9,7 +9,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use m2_engine::{GpuModel, Physics, Skeleton, VehicleId};
+use m2_engine::{GpuModel, Physics, Skeleton, StaticKey, VehicleId};
 use m2_math::glam::{Mat4, Quat, Vec3};
 
 use crate::npc::People;
@@ -87,16 +87,31 @@ const THROW: f32 = 12.0;
 const FUSE: f32 = 2.5;
 const BOUNCE: f32 = 0.4;
 const THROW_GAP: f32 = RPG_RELOAD * 0.5;
+/// A melee bash: how far ahead of her it reaches (from her chest, or her
+/// knees for a low one at something on the ground), how wide (the cosine
+/// of its half-angle), how much it hurts a person and what of the world's
+/// it meets (a supply crate's 100 health: one blow opens it), how hard it
+/// shoves (out, up; m/s), and seconds before she can bash or fire again.
+/// Invented, from the playthroughs.
+const BASH_REACH: f32 = 1.8;
+const BASH_ARC: f32 = 0.5;
+const BASH_DAMAGE: f32 = 60.0;
+const BASH_BREAK: f32 = 100.0;
+const BASH_PUSH: (f32, f32) = (3.0, 1.0);
+const BASH_GAP: f32 = 0.8;
+/// Heights of a blow over her feet, high and low, metres.
+const BASH_HIGH: f32 = 1.2;
+const BASH_LOW: f32 = 0.45;
 /// Blasts kill within `KILL` metres and hurt to `REACH`; vehicles within
 /// `WRECK` are wrecked.
 const KILL: f32 = 4.0;
 /// How hard a blast throws people: (out, up) m/s at its heart, on top of
 /// 3 out and 2 up at the edge of its reach. Invented, to look like the
 /// game's flung bodies.
-const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
+pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 /// How hard a rifle round shoves the one it kills, m/s.
 const SHOT_PUSH: f32 = 2.0;
-const REACH: f32 = 9.0;
+pub(crate) const REACH: f32 = 9.0;
 const WRECK: f32 = 6.0;
 
 /// A hand weapon's model and where its muzzle is, model space.
@@ -346,6 +361,12 @@ pub enum Effect {
     Smoke { at: Vec3, size: f32 },
     /// A fireball, growing.
     Fire { at: Vec3, size: f32 },
+    /// Spray thrown off a boat's hull: a white puff flying `drift` metres
+    /// over its life, growing and then gone.
+    Spray { at: Vec3, drift: Vec3, size: f32 },
+    /// Churned water behind a boat: a flat white patch on the surface,
+    /// `size` across, spreading.
+    Wake { at: Vec3, size: f32 },
 }
 
 /// A sound the fight makes.
@@ -356,6 +377,33 @@ pub enum Sound {
     Explosion(Vec3),
     /// A tank's main gun.
     Cannon(Vec3),
+}
+
+/// A blow or a round that landed on something of the world's rather than
+/// a person: where, how hard, and the static it hit if one of the
+/// scene's (a supply crate's box), which takes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Strike {
+    pub at: Vec3,
+    pub damage: f32,
+    pub key: Option<StaticKey>,
+}
+
+/// Rounds she has picked up for her weapons: the play keeps no ammunition
+/// of its own yet, so these only add to what the HUD counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Picked {
+    pub rifle: u32,
+    pub rockets: u32,
+}
+
+impl Picked {
+    pub fn add(&mut self, weapon: Weapon, rounds: u32) {
+        match weapon {
+            Weapon::Rifle => self.rifle += rounds,
+            Weapon::Rpg => self.rockets += rounds,
+        }
+    }
 }
 
 /// Something that happened to her worth a word from her.
@@ -399,6 +447,8 @@ pub struct Trigger {
     /// Aim held.
     pub aim: bool,
     pub throw: bool,
+    /// A melee bash.
+    pub melee: bool,
     pub select: Option<Weapon>,
 }
 
@@ -414,6 +464,8 @@ pub struct Combat {
     aim_left: f32,
     /// Seconds until the grenade she is throwing leaves her hand.
     throw_in: Option<f32>,
+    /// Seconds until the blow she is bashing with lands, and whether low.
+    bash_in: Option<(f32, bool)>,
     projectiles: Vec<Projectile>,
     /// Effects with their seconds left and lifetime.
     pub effects: Vec<(Effect, f32, f32)>,
@@ -428,6 +480,12 @@ pub struct Combat {
     pub blasts: u32,
     /// Where the last one went off.
     pub last_blast: Option<Vec3>,
+    /// Where blasts went off in the last step.
+    pub went_off: Vec<Vec3>,
+    /// Blows and rounds that struck the world in the last step.
+    pub struck: Vec<Strike>,
+    /// Rounds she has picked up, for the HUD's counters.
+    pub picked: Picked,
     /// The last rocket: from the launcher, towards what the crosshair was on.
     pub last_launch: Option<(Vec3, Vec3)>,
     /// Blasts about to go off (something explosive caught): where, and
@@ -465,6 +523,7 @@ impl Default for Combat {
             reload: 0.0,
             aim_left: 0.0,
             throw_in: None,
+            bash_in: None,
             projectiles: Vec::new(),
             effects: Vec::new(),
             sounds: Vec::new(),
@@ -473,6 +532,9 @@ impl Default for Combat {
             hits: 0,
             blasts: 0,
             last_blast: None,
+            went_off: Vec::new(),
+            struck: Vec::new(),
+            picked: Picked::default(),
             last_launch: None,
             fuses: Vec::new(),
             fires: Vec::new(),
@@ -612,6 +674,12 @@ impl Combat {
         self.effects.push((e, seconds, seconds));
     }
 
+    /// Shows `e` for `seconds`, for what isn't the fight's (a boat's
+    /// spray).
+    pub fn show(&mut self, e: Effect, seconds: f32) {
+        self.effect(e, seconds);
+    }
+
     /// Where she is a target: her chest, or `None` while down, flying or
     /// not yet landed.
     pub fn target(&self, field_player: &Player, playing: bool) -> Option<Vec3> {
@@ -622,6 +690,8 @@ impl Combat {
     /// One fixed tick: her weapons, the soldiers' shots, projectiles,
     /// health and effects.
     pub fn step(&mut self, f: &mut Field<'_>, trigger: Trigger, dt: f32) {
+        self.went_off.clear();
+        self.struck.clear();
         for e in &mut self.effects {
             e.1 -= dt;
         }
@@ -658,8 +728,20 @@ impl Combat {
                 }
             }
         }
+        // A bash's blow lands at its moment in the clip.
+        if let Some((t, low)) = &mut self.bash_in {
+            *t -= dt;
+            if *t <= 0.0 {
+                let low = *low;
+                self.bash_in = None;
+                if on_foot {
+                    self.bash(f, low);
+                }
+            }
+        }
         let throwing = self.throw_in.is_some() || f.player.throwing.is_some();
-        if on_foot && !throwing {
+        let bashing = self.bash_in.is_some() || f.player.bashing.is_some();
+        if on_foot && !throwing && !bashing {
             if trigger.fire && self.reload <= 0.0 {
                 match self.weapon {
                     Weapon::Rifle => self.player_shoot(f),
@@ -672,6 +754,15 @@ impl Combat {
                 match f.player.start_throw() {
                     Some(release) => self.throw_in = Some(release),
                     None => self.throw(f, None),
+                }
+            }
+            if trigger.melee && self.reload <= 0.0 && f.player.can_bash() {
+                self.reload = BASH_GAP;
+                let low = Self::low_blow(f);
+                // Without her bash clip, it lands at once.
+                match f.player.start_bash(low) {
+                    Some(hit) => self.bash_in = Some((hit, low)),
+                    None => self.bash(f, low),
                 }
             }
         }
@@ -768,6 +859,16 @@ impl Combat {
         self.sounds.push(Sound::Shot(from));
         if let Some((t, None)) = hit {
             self.hit_explosives_in(f.explosives, eye + dir * t, RIFLE_DAMAGE);
+            // What it hit, if the scene's (a crate takes the round).
+            let key = f
+                .physics
+                .cast_ray_keyed(eye, dir, t + 0.05)
+                .and_then(|(_, _, key)| key);
+            self.struck.push(Strike {
+                at: eye + dir * t,
+                damage: RIFLE_DAMAGE,
+                key,
+            });
         }
         if let Some((_, Some(i))) = hit {
             let soldier = f.people.npcs[i].soldier;
@@ -931,8 +1032,8 @@ impl Combat {
     }
 
     /// Fires the gun on the turret of vehicle `i`, which she drives, at
-    /// what the crosshair is on: a tank's cannon fires a shell that bursts
-    /// like a rocket, anything else's a machine gun.
+    /// what the crosshair is on: a cannon (a tank's, the Stryker's) fires
+    /// a shell that bursts like a rocket, anything else's a machine gun.
     fn vehicle_fire(&mut self, f: &mut Field<'_>, i: usize) {
         let Some(v) = f.vehicles.get(i) else {
             return;
@@ -943,7 +1044,7 @@ impl Combat {
         let Some(body) = f.physics.vehicle_transform(id) else {
             return;
         };
-        let cannon = v.spec.kind == "tank";
+        let cannon = v.spec.cannon();
         let gun = v.spec.tuning.gun;
         let (from, barrel) = v
             .spec
@@ -1055,6 +1156,51 @@ impl Combat {
         Some(f.player.model_matrix().transform_point3(at))
     }
 
+    /// Whether her blow goes low: something stands within reach ahead of
+    /// her knees but nothing ahead of her chest (a crate on the ground).
+    fn low_blow(f: &Field<'_>) -> bool {
+        let feet = f.player.character.position;
+        let ahead = Vec3::new(f.player.facing.sin(), 0.0, f.player.facing.cos());
+        let meets = |h: f32| {
+            f.physics
+                .cast_ray(feet + Vec3::Y * h, ahead, BASH_REACH)
+                .is_some()
+        };
+        meets(BASH_LOW) && !meets(BASH_HIGH)
+    }
+
+    /// Her blow, high or low, the way she faces: it hurts and shoves those
+    /// within reach ahead of her and strikes what of the world's it meets
+    /// (a supply crate breaks open).
+    fn bash(&mut self, f: &mut Field<'_>, low: bool) {
+        let feet = f.player.character.position;
+        let ahead = Vec3::new(f.player.facing.sin(), 0.0, f.player.facing.cos());
+        let from = feet + Vec3::Y * if low { BASH_LOW } else { BASH_HIGH };
+        let push = ahead * BASH_PUSH.0 + Vec3::Y * BASH_PUSH.1;
+        for n in f.people.npcs.iter_mut().filter(|n| n.alive) {
+            let to = n.character.position - feet;
+            let flat = to.with_y(0.0);
+            if to.y.abs() > 1.5
+                || flat.length() > BASH_REACH + BODY_RADIUS
+                || flat.normalize_or_zero().dot(ahead) < BASH_ARC
+            {
+                continue;
+            }
+            let soldier = n.soldier;
+            if n.hurt(BASH_DAMAGE, push) && soldier {
+                self.remarks.push(Remark::Kill);
+            }
+            self.hits += 1;
+        }
+        if let Some((t, _, key)) = f.physics.cast_ray_keyed(from, ahead, BASH_REACH) {
+            self.struck.push(Strike {
+                at: from + ahead * t,
+                damage: BASH_BREAK,
+                key,
+            });
+        }
+    }
+
     /// Whether a grenade is in her hand: she is throwing and hasn't let
     /// go yet.
     pub fn grenade_in_hand(&self) -> bool {
@@ -1148,6 +1294,7 @@ impl Combat {
     pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.blasts += 1;
         self.last_blast = Some(at);
+        self.went_off.push(at);
         self.sounds.push(Sound::Explosion(at));
         self.effect(Effect::Fire { at, size: 4.0 }, 0.6);
         for k in 0..6 {
@@ -1441,6 +1588,86 @@ mod tests {
                 .iter()
                 .all(|s| matches!(s, Sound::Shot(_)))
         );
+    }
+
+    #[test]
+    fn a_bash_drops_the_soldier_ahead_and_goes_low_at_a_crate() {
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        let mut people = People::default();
+        // One just ahead of her, one just behind.
+        for z in [1.2, -1.2] {
+            people.npcs.push(Npc::new(
+                0,
+                &rig(),
+                Vec3::new(0.0, 1.0, z),
+                std::f32::consts::PI,
+                Brain::Post { facing: 0.0 },
+                Some(1),
+            ));
+        }
+        for _ in 0..3 {
+            people.update(&mut physics, &[], Vec3::ZERO, None, dt);
+            player.update(&physics, Default::default(), dt);
+        }
+        assert!(player.landed);
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut combat = Combat::default();
+        let mut step = |combat: &mut Combat,
+                        physics: &mut Physics,
+                        player: &mut Player,
+                        people: &mut People,
+                        melee: bool| {
+            let mut field = Field {
+                physics,
+                player,
+                people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            combat.step(
+                &mut field,
+                Trigger {
+                    melee,
+                    ..Trigger::default()
+                },
+                dt,
+            );
+        };
+        // Two blows a second apart (with no clip, each lands at once).
+        for k in 0..60 {
+            step(
+                &mut combat,
+                &mut physics,
+                &mut player,
+                &mut people,
+                k % 60 == 0,
+            );
+        }
+        assert!(people.npcs[0].alive, "one blow hurts");
+        for k in 0..60 {
+            step(&mut combat, &mut physics, &mut player, &mut people, k == 0);
+        }
+        assert!(!people.npcs[0].alive, "two drop him");
+        assert!(people.npcs[1].alive && people.npcs[1].hp >= 100.0);
+        assert_eq!(combat.hits, 2);
+        // A crate on the ground ahead of her knees, below her chest: the
+        // blow goes low and strikes it.
+        people.npcs.clear();
+        physics.add_static(
+            StaticKey::Entity(7),
+            &m2_engine::CollisionShape::cuboid(Vec3::new(0.5, 0.4, 0.5)),
+            player.character.position.with_y(0.4) + Vec3::Z * 1.4,
+            Quat::IDENTITY,
+        );
+        physics.step(dt);
+        step(&mut combat, &mut physics, &mut player, &mut people, true);
+        let s = combat.struck.first().copied().expect("struck");
+        assert_eq!(s.key, Some(StaticKey::Entity(7)));
+        assert!(s.at.y < 0.8 && s.damage >= 100.0, "{s:?}");
     }
 
     #[test]

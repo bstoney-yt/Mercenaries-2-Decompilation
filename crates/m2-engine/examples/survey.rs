@@ -68,6 +68,13 @@
 //!                           template: name, model, components, and what
 //!                           the alpha's world index makes of it
 //! find:<hash>[,..]          names for hashes
+//! cues[:<name>,..]          which bank sounds the clips' sound events
+//!                           (and the names given) play: each name tried
+//!                           as a sound's, bare, numbered, lettered and
+//!                           with each ground surface (`SoundMaterial`
+//!                           templates' and common ones) before or after;
+//!                           then the cues no sound answers, and how many
+//!                           of each bank's sounds a cue answers
 //! ```
 //!
 //! Names come from every NUL-terminated string in the four archives and
@@ -694,11 +701,29 @@ fn main() -> Result<(), Error> {
                 )
             }
             "collision" => collision(&mut source, &names, arg),
+            "phy2words" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                phy2_words(
+                    &mut source,
+                    world.as_ref().expect("just built"),
+                    &names,
+                    arg,
+                )
+            }
+            "phy2census" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                phy2_census(&mut source, world.as_ref().expect("just built"), &names)
+            }
             "phy2rules" => phy2_rules(&mut source),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
             "parents" => parents(&mut source, &names, arg),
+            "cues" => cues(&mut source, &names, arg),
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -879,6 +904,245 @@ fn sounds<R: Read + Seek>(
                 loud.join(""),
                 zcr.join("")
             );
+        }
+    }
+    Ok(())
+}
+
+/// Ground surfaces a footstep's sound may be named for, besides those the
+/// template database's `SoundMaterial (..)` templates name.
+const SURFACES: [&str; 44] = [
+    "dirt",
+    "grass",
+    "sand",
+    "concrete",
+    "asphalt",
+    "tarmac",
+    "road",
+    "metal",
+    "solidmetal",
+    "hollowmetal",
+    "metalgrate",
+    "wood",
+    "woodhollow",
+    "water",
+    "shallowwater",
+    "deepwater",
+    "puddle",
+    "mud",
+    "gravel",
+    "rock",
+    "stone",
+    "tile",
+    "carpet",
+    "snow",
+    "leaves",
+    "foliage",
+    "jungle",
+    "default",
+    "generic",
+    "hard",
+    "soft",
+    "glass",
+    "plastic",
+    "rubber",
+    "flesh",
+    "body",
+    "brick",
+    "marble",
+    "straw",
+    "thatch",
+    "earth",
+    "ground",
+    "bush",
+    "pavement",
+];
+
+/// A cue's name with each ending tried: none, numbered (`_01`, `_1`,
+/// `01`, `1`), lettered (`_a`, `a`), looped.
+fn endings() -> Vec<String> {
+    let mut out = vec![String::new(), "_lp".into(), "_loop".into()];
+    for n in 1..=24 {
+        out.push(format!("_{n:02}"));
+        out.push(format!("_{n}"));
+        out.push(format!("{n:02}"));
+        out.push(format!("{n}"));
+    }
+    for c in 'a'..='h' {
+        out.push(format!("_{c}"));
+        out.push(format!("{c}"));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn cues<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let index = source.archive().index();
+    let mut clip_blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == ANIMATION_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    clip_blocks.sort_unstable();
+    clip_blocks.dedup();
+    let mut bank_blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == SOUND_BANK_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    bank_blocks.sort_unstable();
+    bank_blocks.dedup();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash);
+    // The clips' sound events: (category, name) -> clips carrying it.
+    let mut events: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for b in clip_blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != ANIMATION_TYPE {
+                continue;
+            }
+            let Ok(clip) = Clip::parse(data) else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            for ev in &clip.events {
+                let key = (ev.category.clone(), ev.name.clone());
+                if ev.category.to_ascii_lowercase().starts_with("sound") && seen.insert(key.clone())
+                {
+                    *events.entry(key).or_default() += 1;
+                }
+            }
+        }
+    }
+    for w in arg.split(',').filter(|w| !w.is_empty()) {
+        events.entry(("asked".into(), w.to_owned())).or_default();
+    }
+    // Surfaces: the template database's sound materials, and common ones.
+    let mut materials: Vec<String> = Vec::new();
+    if let Some(h) = db_hash {
+        let data = source.asset(h, TEMPLATE_DB_TYPE)?;
+        let db = Layer::parse(&data)?;
+        for n in db.names().values() {
+            if let Some(inner) = n
+                .strip_prefix("SoundMaterial (")
+                .and_then(|r| r.strip_suffix(')'))
+            {
+                materials.push(inner.to_owned());
+            }
+        }
+    }
+    materials.sort();
+    materials.dedup();
+    println!(
+        "{} SoundMaterial templates: {}",
+        materials.len(),
+        materials.join(", ")
+    );
+    let mut surfaces: Vec<String> = materials.clone();
+    surfaces.extend(SURFACES.iter().map(|s| (*s).to_owned()));
+    surfaces.sort();
+    surfaces.dedup();
+    // Every bank's sounds: hash -> (bank, index, seconds).
+    let mut sounds: HashMap<u32, Vec<(u32, usize, f32)>> = HashMap::new();
+    let mut banks: Vec<(u32, usize)> = Vec::new();
+    for b in bank_blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != SOUND_BANK_TYPE {
+                continue;
+            }
+            let Ok(bank) = SoundBank::parse(data) else {
+                continue;
+            };
+            banks.push((e.name_hash, bank.sounds.len()));
+            for (i, s) in bank.sounds.iter().enumerate() {
+                sounds.entry(s.hash).or_default().push((
+                    e.name_hash,
+                    i,
+                    s.frames as f32 / s.rate.max(1) as f32,
+                ));
+            }
+        }
+    }
+    println!(
+        "{} sound events in clips (+ {} asked); {} banks, {} sounds",
+        events.keys().filter(|k| k.0 != "asked").count(),
+        events.keys().filter(|k| k.0 == "asked").count(),
+        banks.len(),
+        sounds.values().map(Vec::len).sum::<usize>()
+    );
+    let ends = endings();
+    let prefixes = ["", "fol_", "sfx_", "ahj_", "sfx_fol_"];
+    let mut answered: HashSet<u32> = HashSet::new();
+    let mut silent: Vec<String> = Vec::new();
+    for ((category, name), clips) in &events {
+        let lower = name.to_ascii_lowercase();
+        // (sound hash, the name that hashed to it)
+        let mut found: BTreeMap<u32, String> = BTreeMap::new();
+        let mut try_name = |parts: &[&str]| {
+            let h = hash_parts(parts);
+            if sounds.contains_key(&h) {
+                found.entry(h).or_insert_with(|| parts.concat());
+            }
+        };
+        for p in prefixes {
+            for e in &ends {
+                try_name(&[p, &lower, e]);
+                if category.contains("surface") || category == "asked" {
+                    for s in &surfaces {
+                        try_name(&[p, &lower, "_", s, e]);
+                        try_name(&[p, s, "_", &lower, e]);
+                        try_name(&[p, &lower, s, e]);
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            silent.push(format!("{category}/{name}"));
+            continue;
+        }
+        answered.extend(found.keys().copied());
+        let shown: Vec<String> = found
+            .iter()
+            .take(8)
+            .flat_map(|(h, n)| {
+                sounds[h].iter().take(1).map(move |(bank, i, secs)| {
+                    format!("{}#{i} {h:08x} {n} {secs:.2}s", names.show(*bank))
+                })
+            })
+            .collect();
+        println!(
+            "  {category}/{name} ({clips} clips): {} sounds: {}{}",
+            found.len(),
+            shown.join("; "),
+            if found.len() > 8 { "; ..." } else { "" }
+        );
+    }
+    println!("{} cues no sound answers:", silent.len());
+    for chunk in silent.chunks(8) {
+        println!("  {}", chunk.join(", "));
+    }
+    println!("sounds a cue answers, per bank (those with any):");
+    let mut per_bank: BTreeMap<u32, usize> = BTreeMap::new();
+    for h in &answered {
+        for (bank, _, _) in &sounds[h] {
+            *per_bank.entry(*bank).or_default() += 1;
+        }
+    }
+    for (bank, total) in &banks {
+        if let Some(n) = per_bank.get(bank) {
+            println!("  {:08x} {}: {n} of {total}", bank, names.show(*bank));
         }
     }
     Ok(())
@@ -1713,10 +1977,16 @@ fn collision<R: Read + Seek>(
             .and_then(|u| u.top_level(*b"PHY2"));
         let Some(p) = phy2.map(Phy2::parse) else {
             let cpu = m2_engine::CpuModel::from_data(&data, 0)?;
-            println!(
-                "  no PHY2: visible triangles stand in ({} collision)",
-                if cpu.collision.is_some() { "a" } else { "no" }
-            );
+            match &cpu.collision {
+                Some(c) => {
+                    let (lo, hi) = c.bounds();
+                    println!(
+                        "  no PHY2: {} visible triangles stand in, filling ({:.2} {:.2} {:.2}) to ({:.2} {:.2} {:.2})",
+                        c.triangles, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
+                    );
+                }
+                None => println!("  no PHY2, and nothing solid drawn: no collision"),
+            }
             continue;
         };
         let p = match p {
@@ -1771,6 +2041,13 @@ fn collision<R: Read + Seek>(
                 shape.part
             );
         }
+        for (i, body) in p.bodies.iter().enumerate() {
+            println!(
+                "  body {i}: {}, mass {:.1} kg",
+                if body.is_fixed() { "fixed" } else { "moves" },
+                body.mass
+            );
+        }
         for (i, part) in p.parts.iter().enumerate() {
             let at = m
                 .node_to_model(part.node as u16)
@@ -1791,6 +2068,421 @@ fn collision<R: Read + Seek>(
                 part.rotation[2],
                 part.rotation[3]
             );
+        }
+    }
+    Ok(())
+}
+
+/// The raw words of `PHY2` records, to find what tells shapes apart
+/// (foliage from rock, a pole that breaks from a wall): for `arg`'s
+/// models, how the alpha knocks each loose, each body's node (shown
+/// intact, wrecked or both), unknown floats and words, and each shape's
+/// nodes and record words (the vertex pool bounds, count and offset, and
+/// the shape's own index left out); then, over every placed model, how
+/// many come loose and how, shapes and bodies by whether their nodes show
+/// intact or wrecked and their bodies move, and the values of each
+/// unknown word with how many shapes or bodies of models named for
+/// plants, rocks, poles... carry them (words with many values just
+/// counted).
+fn phy2_words<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_assets::physics::{Geometry, Physics as Phy2};
+    /// A model's PHY2, with which of its nodes are hidden intact and
+    /// wrecked (none when it switches nothing).
+    fn phy2_of<R: Read + Seek>(
+        source: &mut AssetSource<R>,
+        h: u32,
+    ) -> Option<(Phy2, [Vec<bool>; 2])> {
+        let data = source.model(h).ok()?;
+        let m = data.parse().ok()?;
+        let hidden = m.states.as_ref().map_or_else(Default::default, |s| {
+            [s.hidden(&m.nodes, false), s.hidden(&m.nodes, true)]
+        });
+        let u = m2_assets::Ucfx::parse(&data.base).ok()?;
+        let p = Phy2::parse(u.top_level(*b"PHY2")?).ok()?;
+        Some((p, hidden))
+    }
+    /// Whether node `n` shows intact and wrecked: 0 both, 1 intact only,
+    /// 2 wrecked only, 3 neither.
+    fn shows(hidden: &[Vec<bool>; 2], n: u32) -> u32 {
+        let off = |w: usize| hidden[w].get(n as usize).copied().unwrap_or(false);
+        u32::from(off(0)) * 2 + u32::from(off(1))
+    }
+    const SHOWS: [&str; 4] = ["both", "intact", "wrecked", "neither"];
+    /// How the alpha knocks the model loose: its pieces (node, kg), and
+    /// whether it breaks into them.
+    fn loose_of<R: Read + Seek>(source: &mut AssetSource<R>, h: u32) -> Option<String> {
+        let data = source.model(h).ok()?;
+        let cpu = m2_engine::CpuModel::from_data(&data, 0).ok()?;
+        let loose = cpu.collision?.loose?;
+        let pieces: Vec<String> = loose
+            .pieces
+            .iter()
+            .map(|q| match q.node {
+                Some(n) => format!("node {n} {:.1} kg", q.mass),
+                None => format!("whole {:.1} kg", q.mass),
+            })
+            .collect();
+        Some(format!(
+            "{} ({}), {:.1} kg in all",
+            if loose.breaks {
+                "breaks into its pieces"
+            } else {
+                "goes as one"
+            },
+            pieces.join(", "),
+            loose.mass
+        ))
+    }
+    let kind = |g: &Geometry| match g {
+        Geometry::Box { .. } => "box",
+        Geometry::Sphere => "sphere",
+        Geometry::Capsule { .. } => "capsule",
+        Geometry::Convex { .. } => "convex",
+        Geometry::Mesh { .. } => "mesh",
+    };
+    // Shape record words not yet understood.
+    const SHAPE_WORDS: [usize; 15] = [0, 1, 2, 4, 11, 12, 13, 14, 15, 17, 19, 20, 21, 22, 23];
+    for h in arg.split(',').filter_map(hex) {
+        let Some((p, hidden)) = phy2_of(source, h) else {
+            println!("{h:08x}: no PHY2");
+            continue;
+        };
+        println!(
+            "{h:08x} {}: header {:08x?}, {}",
+            names.show(h),
+            p.unk_0x14,
+            if hidden[0] == hidden[1] {
+                "no wreck"
+            } else {
+                "has a wreck"
+            }
+        );
+        println!(
+            "  knocked loose: {}",
+            loose_of(source, h).unwrap_or_else(|| "never (no body moves)".into())
+        );
+        // The node a body sits on: its part's.
+        let body_node = |b: usize| p.parts.iter().find(|q| q.body == Some(b)).map(|q| q.node);
+        for (i, b) in p.bodies.iter().enumerate() {
+            let node = body_node(i);
+            println!(
+                "  body {i} {} {:.1} kg on node {node:?} (shows {}): centre {:?} unk {:?} words {:08x?}",
+                if b.is_fixed() { "fixed" } else { "moves" },
+                b.mass,
+                node.map_or("?", |n| SHOWS[shows(&hidden, n) as usize]),
+                b.centre_of_mass,
+                b.unk,
+                b.unk_words
+            );
+        }
+        for (k, shape) in p.shapes.iter().enumerate() {
+            let words: Vec<String> = SHAPE_WORDS
+                .iter()
+                .map(|&w| format!("{w}:{:x}", shape.record[w]))
+                .collect();
+            let own = p.parts.get(shape.part).map(|q| q.node);
+            println!(
+                "  shape {k} {} on body {:?}, part node {own:?} (shows {}), body node {:?}: {}",
+                kind(&shape.geometry),
+                p.body_of(k),
+                own.map_or("?", |n| SHOWS[shows(&hidden, n) as usize]),
+                p.shape_node(k),
+                words.join(" ")
+            );
+        }
+        let links: Vec<String> = p
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, part)| part.unk_link != u32::MAX)
+            .map(|(i, part)| format!("{i}:{:x}", part.unk_link))
+            .collect();
+        if !links.is_empty() {
+            println!("  parts' unknown links: {}", links.join(" "));
+        }
+    }
+    // Over every placed model: values of each unknown word, by the kind
+    // of thing its model's name says it is.
+    const KINDS: [&str; 14] = [
+        "plant",
+        "bush",
+        "scrub",
+        "tree",
+        "rock",
+        "pole",
+        "fence",
+        "sign",
+        "lamp",
+        "barrel",
+        "crate",
+        "wall",
+        "sandbag",
+        "barricade",
+    ];
+    let mut models: Vec<u32> = world
+        .objects
+        .iter()
+        .map(|o| o.model)
+        .chain(world.state_objects.values().map(|o| o.model))
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    // word -> value -> (count, per kind (+ other, unnamed)).
+    type Tally = BTreeMap<usize, HashMap<u32, (usize, [usize; 16])>>;
+    let mut shape_tally: Tally = BTreeMap::new();
+    let mut body_tally: Tally = BTreeMap::new();
+    let class = |h: u32| {
+        names.get(h).map_or(15, |n| {
+            KINDS.iter().position(|k| n.contains(k)).unwrap_or(14)
+        })
+    };
+    // Shapes and bodies by whether their node shows intact or wrecked and
+    // their body moves: [shows][moves].
+    let mut shape_shows = [[0usize; 2]; 4];
+    let mut body_shows = [[0usize; 2]; 4];
+    let (mut wrecks, mut moving_wrecks) = (0, 0);
+    // Placed models the alpha knocks loose: as one, into pieces.
+    let (mut as_one, mut to_pieces) = (0, 0);
+    for &h in &models {
+        match loose_of(source, h) {
+            Some(l) if l.starts_with("breaks") => to_pieces += 1,
+            Some(_) => as_one += 1,
+            None => {}
+        }
+        let Some((p, hidden)) = phy2_of(source, h) else {
+            continue;
+        };
+        let c = class(h);
+        let moves = |b: Option<usize>| {
+            b.and_then(|b| p.bodies.get(b))
+                .is_some_and(|b| !b.is_fixed())
+        };
+        if hidden[0] != hidden[1] {
+            wrecks += 1;
+            moving_wrecks += usize::from(p.bodies.iter().any(|b| !b.is_fixed()));
+        }
+        for (k, shape) in p.shapes.iter().enumerate() {
+            let node = p.parts.get(shape.part).map_or(0, |q| q.node);
+            let show = shows(&hidden, node);
+            shape_shows[show as usize][usize::from(moves(p.body_of(k)))] += 1;
+            // Pseudo-word 100: shows (0 both, 1 intact, 2 wrecked, 3
+            // neither) plus 4 when its body moves.
+            let words = SHAPE_WORDS
+                .iter()
+                .map(|&w| (w, shape.record[w]))
+                .chain([(100, show + 4 * u32::from(moves(p.body_of(k))))]);
+            for (w, v) in words {
+                let e = shape_tally.entry(w).or_default().entry(v).or_default();
+                e.0 += 1;
+                e.1[c] += 1;
+            }
+        }
+        for (i, b) in p.bodies.iter().enumerate() {
+            let node = p
+                .parts
+                .iter()
+                .find(|q| q.body == Some(i))
+                .map_or(0, |q| q.node);
+            let show = shows(&hidden, node);
+            body_shows[show as usize][usize::from(!b.is_fixed())] += 1;
+            let words = b
+                .unk
+                .iter()
+                .map(|f| f.to_bits())
+                .chain(b.unk_words.iter().copied())
+                .chain([u32::from(b.is_fixed()), show]);
+            for (w, v) in words.enumerate() {
+                let e = body_tally.entry(w).or_default().entry(v).or_default();
+                e.0 += 1;
+                e.1[c] += 1;
+            }
+        }
+    }
+    let show = |what: &str, tally: &Tally| {
+        for (w, values) in tally {
+            if values.len() > 24 {
+                println!("{what} word {w}: {} values", values.len());
+                continue;
+            }
+            let mut v: Vec<(&u32, &(usize, [usize; 16]))> = values.iter().collect();
+            v.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+            for (value, (n, by)) in v.iter().take(8) {
+                let kinds: Vec<String> = by
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, k)| **k > 0)
+                    .map(|(i, k)| {
+                        let name = match i {
+                            14 => "other",
+                            15 => "unnamed",
+                            _ => KINDS[i],
+                        };
+                        format!("{name} {k}")
+                    })
+                    .collect();
+                println!(
+                    "{what} word {w} = {value:08x} ({:.3}): {n} [{}]",
+                    f32::from_bits(**value),
+                    kinds.join(", ")
+                );
+            }
+        }
+    };
+    println!("over {} placed models' PHY2:", models.len());
+    println!("{wrecks} models with PHY2 have a wreck, {moving_wrecks} of them a body that moves");
+    println!("knocked loose: {as_one} models go as one, {to_pieces} break into their pieces");
+    for (what, counts) in [("shapes", shape_shows), ("bodies", body_shows)] {
+        for (i, [fixed, moving]) in counts.iter().enumerate() {
+            println!(
+                "{what} on nodes shown {}: {fixed} fixed, {moving} moving",
+                SHOWS[i]
+            );
+        }
+    }
+    show("shape", &shape_tally);
+    show("body", &body_tally);
+    Ok(())
+}
+
+/// Which placed models have `PHY2` collision and which stand in their
+/// visible triangles (the alpha's fallback): the island's objects placed
+/// by name (rocks, plants, fences), those placed by `ModelName`, and the
+/// state layers' props. How many models and placements each, the
+/// commonest without, those whose bodies move, and a tally by name word.
+fn phy2_census<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+) -> Result<(), Error> {
+    use m2_assets::physics::Physics as Phy2;
+    // Placements per model: by name, by ModelName, by the state layers.
+    let mut placed: HashMap<u32, [usize; 3]> = HashMap::new();
+    for o in &world.objects {
+        placed.entry(o.model).or_default()[if o.named { 0 } else { 1 }] += 1;
+    }
+    for o in world.state_objects.values() {
+        placed.entry(o.model).or_default()[2] += 1;
+    }
+    struct Seen {
+        hash: u32,
+        placed: [usize; 3],
+        /// Bodies, fixed bodies, shapes; `None` without `PHY2`.
+        phy2: Option<(usize, usize, usize)>,
+        /// The moving bodies' mass, kg.
+        mass: f32,
+        size: f32,
+    }
+    let mut seen: Vec<Seen> = Vec::new();
+    let mut unread = 0;
+    for (&hash, &n) in &placed {
+        let Ok(data) = source.model(hash) else {
+            unread += 1;
+            continue;
+        };
+        let Ok(m) = data.parse() else {
+            unread += 1;
+            continue;
+        };
+        let b = &m.info.bounds;
+        let size = (Vec3::from(b.max) - Vec3::from(b.min)).length();
+        let phy2 = m2_assets::Ucfx::parse(&data.base)
+            .ok()
+            .and_then(|u| u.top_level(*b"PHY2"))
+            .and_then(|d| Phy2::parse(d).ok());
+        seen.push(Seen {
+            hash,
+            placed: n,
+            phy2: phy2.as_ref().map(|p| {
+                (
+                    p.bodies.len(),
+                    p.bodies.iter().filter(|b| b.is_fixed()).count(),
+                    p.shapes.len(),
+                )
+            }),
+            mass: phy2.as_ref().map_or(0.0, |p| {
+                p.bodies
+                    .iter()
+                    .filter(|b| !b.is_fixed())
+                    .map(|b| b.mass)
+                    .sum()
+            }),
+            size,
+        });
+    }
+    println!("{} models placed, {} unreadable", placed.len(), unread);
+    const HOW: [&str; 3] = ["by name", "by ModelName", "by the state layers"];
+    for (k, how) in HOW.iter().enumerate() {
+        let tally = |with: bool| {
+            seen.iter()
+                .filter(|s| s.placed[k] > 0 && s.phy2.is_some() == with)
+                .fold((0, 0), |(m, p), s| (m + 1, p + s.placed[k]))
+        };
+        let (with, without) = (tally(true), tally(false));
+        println!(
+            "placed {how}: {} models ({} placements) with PHY2, {} ({}) without",
+            with.0, with.1, without.0, without.1
+        );
+    }
+    for (k, how) in HOW.iter().enumerate() {
+        let mut without: Vec<&Seen> = seen
+            .iter()
+            .filter(|s| s.placed[k] > 0 && s.phy2.is_none())
+            .collect();
+        without.sort_by_key(|s| std::cmp::Reverse(s.placed[k]));
+        println!("commonest without PHY2, placed {how}:");
+        for s in without.iter().take(if k == 0 { 50 } else { 25 }) {
+            println!(
+                "  {:5} x {:08x} {}: {:.1} m",
+                s.placed[k],
+                s.hash,
+                names.show(s.hash),
+                s.size
+            );
+        }
+    }
+    let mut moving: Vec<&Seen> = seen
+        .iter()
+        .filter(|s| s.phy2.is_some_and(|(bodies, fixed, _)| fixed < bodies))
+        .collect();
+    moving.sort_by_key(|s| std::cmp::Reverse(s.placed.iter().sum::<usize>()));
+    println!(
+        "with a body that moves: {} models; commonest:",
+        moving.len()
+    );
+    for s in moving.iter().take(30) {
+        let (bodies, fixed, shapes) = s.phy2.unwrap_or_default();
+        println!(
+            "  {:5} x {:08x} {}: {bodies} bodies ({fixed} fixed), {shapes} shapes, {:.0} kg moving, {:.1} m, placed {:?}",
+            s.placed.iter().sum::<usize>(),
+            s.hash,
+            names.show(s.hash),
+            s.mass,
+            s.size,
+            s.placed
+        );
+    }
+    const WORDS: [&str; 30] = [
+        "plant", "bush", "shrub", "fern", "grass", "reed", "flower", "weed", "vine", "leaf",
+        "hedge", "bamboo", "banana", "palm", "tree", "log", "stump", "rock", "boulder", "fence",
+        "sandbag", "wall", "sign", "pole", "lamp", "crate", "barrel", "debris", "rubble", "cactus",
+    ];
+    println!("by name word (models, placements): with PHY2 / without");
+    for w in WORDS {
+        let tally = |with: bool| {
+            seen.iter()
+                .filter(|s| s.phy2.is_some() == with && names.show(s.hash).contains(w))
+                .fold((0, 0), |(m, p), s| {
+                    (m + 1, p + s.placed.iter().sum::<usize>())
+                })
+        };
+        let (a, b) = (tally(true), tally(false));
+        if a.0 + b.0 > 0 {
+            println!("  {w}: {} ({}) / {} ({})", a.0, a.1, b.0, b.1);
         }
     }
     Ok(())

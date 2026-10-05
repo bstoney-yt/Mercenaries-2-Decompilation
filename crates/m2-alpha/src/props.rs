@@ -2,7 +2,9 @@
 //! barricades and crates ([`WorldIndex::state_objects`]). They stand once
 //! the scripts load their layer (or the start-up did), go when it
 //! unloads, and break when the scripts' object dies: drawn as their wreck
-//! when the model has one, else gone, and no longer in the way.
+//! when the model has one, else gone, and no longer in the way. Those
+//! whose model comes loose ([`Loose`]) are knocked loose by vehicles and
+//! blasts, as the island's are.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -12,9 +14,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use m2_engine::stream::PROP_SIZES;
 use m2_engine::{
-    AssetSource, CollisionShape, CpuModel, GpuModel, Install, MaterialCache, Physics, StaticKey,
-    WorldIndex,
+    AssetSource, CollisionShape, CpuModel, DebrisId, Frustum, GpuModel, Install, Loose,
+    MaterialCache, Physics, StaticKey, WorldIndex,
 };
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{DrawQueue, RenderBackend};
@@ -53,10 +56,54 @@ pub struct Props {
     loaders: Option<Loaders>,
     /// Models that failed to load.
     failed: HashSet<u32>,
+    /// How near the props wanting each model are, as last worked out.
+    near: Option<Near>,
+    /// Changes to those shown (put up, taken down, moved, gone).
+    changes: u64,
+    /// How far from the focus models were last wanted (metres).
+    reach: f32,
+    /// Those knocked loose: their pieces, in [`Loose`] order.
+    knocked: HashMap<u32, Vec<DebrisId>>,
+    /// Knocked loose since [`take_knocked`](Self::take_knocked).
+    fresh_knocks: Vec<u32>,
+}
+
+/// How the props stand ([`Props::counts`]): how many are shown, and of
+/// the models they use how many have loaded, are loading, wait (within
+/// reach, and in all) and failed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PropCounts {
+    pub shown: usize,
+    pub loaded: usize,
+    pub loading: usize,
+    pub waiting_near: usize,
+    pub waiting: usize,
+    pub failed: usize,
+}
+
+impl std::fmt::Display for PropCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} shown; their models: {} loaded, {} loading, {} waiting within reach \
+             ({} in all), {} failed",
+            self.shown, self.loaded, self.loading, self.waiting_near, self.waiting, self.failed
+        )
+    }
+}
+
+/// For each model not yet loaded, how far (squared) the nearest shown prop
+/// using it stood from `focus` ([`Props::nearness`]), as of change
+/// `changes` to those shown.
+#[derive(Debug)]
+struct Near {
+    focus: Vec3,
+    changes: u64,
+    by_model: HashMap<u32, f32>,
 }
 
 /// How long uploading loaded models may take a frame (at least one is).
-const UPLOAD_BUDGET: Duration = Duration::from_millis(6);
+const UPLOAD_BUDGET: Duration = Duration::from_millis(4);
 
 /// Threads decoding models.
 const LOADERS: usize = 3;
@@ -66,6 +113,10 @@ const LOADERS: usize = 3;
 /// puts up thousands of props, and a mission's gate has to load while the
 /// player walks up to it, not after all of them.
 const IN_FLIGHT: usize = 8;
+
+/// Which models are nearest is worked out again once the focus has moved
+/// this far (metres), or those shown have changed.
+const RENEAR: f32 = 50.0;
 
 /// A model decoded on a loading thread, or why not.
 type Load = (u32, Result<CpuModel, String>);
@@ -105,6 +156,7 @@ impl Props {
                 },
             );
             added += 1;
+            self.changes += 1;
             if let std::collections::hash_map::Entry::Vacant(slot) = self.models.entry(o.model) {
                 slot.insert(None);
                 self.waiting.insert(o.model);
@@ -116,13 +168,89 @@ impl Props {
         added
     }
 
-    /// Takes down those of `entities` that are shown.
+    /// Takes down those of `entities` that are shown (their loose pieces
+    /// too).
     pub fn hide(&mut self, physics: &mut Physics, entities: impl IntoIterator<Item = u32>) {
         for e in entities {
             if self.shown.remove(&e).is_some() {
                 physics.remove_static(StaticKey::Entity(e));
+                self.changes += 1;
+            }
+            for d in self.knocked.remove(&e).into_iter().flatten() {
+                physics.remove_debris(d);
             }
         }
+    }
+
+    /// How `entity`'s model comes loose, if it does.
+    fn loose(&self, entity: u32) -> Option<&Loose> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        m.collision.as_ref()?.loose.as_deref()
+    }
+
+    /// The mass to shift (kg) to knock `entity` loose; `None` unless it
+    /// stands whole and its model comes loose.
+    pub fn loose_mass(&self, physics: &Physics, entity: u32) -> Option<f32> {
+        let p = self.shown.get(&entity)?;
+        if p.wrecked
+            || self.knocked.contains_key(&entity)
+            || !physics.has_static(StaticKey::Entity(entity))
+        {
+            return None;
+        }
+        self.loose(entity).map(|l| l.mass)
+    }
+
+    /// Knocks `entity` loose: its standing collision goes and its pieces
+    /// fly off at `velocity` (m/s), turning at `spin` (radians a second
+    /// about each axis). False unless it came loose.
+    pub fn knock(
+        &mut self,
+        physics: &mut Physics,
+        entity: u32,
+        velocity: Vec3,
+        spin: Vec3,
+    ) -> bool {
+        if self.loose_mass(physics, entity).is_none() {
+            return false;
+        }
+        let (Some(p), Some(loose)) = (self.shown.get(&entity), self.loose(entity)) else {
+            return false;
+        };
+        physics.remove_static(StaticKey::Entity(entity));
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let pieces = loose
+            .pieces
+            .iter()
+            .zip(loose.starts(placed))
+            .map(|(piece, at)| physics.add_debris(piece, at, velocity, spin))
+            .collect();
+        self.knocked.insert(entity, pieces);
+        self.fresh_knocks.push(entity);
+        true
+    }
+
+    /// Those knocked loose since the last call.
+    pub fn take_knocked(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.fresh_knocks)
+    }
+
+    /// Those standing that come loose with any of their model within
+    /// `reach` metres of `at` (as far as its box's middle less half its
+    /// size), with how far.
+    pub fn loose_near(&self, physics: &Physics, at: Vec3, reach: f32) -> Vec<(u32, f32)> {
+        self.shown
+            .iter()
+            .filter(|&(&e, _)| self.loose_mass(physics, e).is_some())
+            .filter_map(|(&e, p)| {
+                let m = self.models.get(&p.model)?.as_ref()?;
+                let (lo, hi) = m.gpu.bounds;
+                let centre = p.position + p.rotation * ((lo + hi) * 0.5);
+                let d = (centre.distance(at) - (hi - lo).length() * 0.5).max(0.0);
+                (d <= reach).then_some((e, d))
+            })
+            .collect()
     }
 
     /// Breaks `entity` if it is shown and whole: its wreck if the model
@@ -139,8 +267,10 @@ impl Props {
             .is_some_and(|m| m.gpu.has_wreck());
         if has_wreck {
             p.wrecked = true;
-        } else {
+        } else if !self.knocked.contains_key(&entity) {
+            // Loose pieces stay where they fell.
             self.shown.remove(&entity);
+            self.changes += 1;
         }
         true
     }
@@ -151,6 +281,11 @@ impl Props {
             return;
         };
         p.position = position;
+        self.changes += 1;
+        // Put up whole again.
+        for d in self.knocked.remove(&entity).into_iter().flatten() {
+            physics.remove_debris(d);
+        }
         if let Some(Some(m)) = self.models.get(&p.model)
             && let Some(shape) = &m.collision
             && !p.wrecked
@@ -189,22 +324,46 @@ impl Props {
         self.shown.iter().map(|(&e, p)| (e, p))
     }
 
+    /// Whether every model wanted within reach (as last asked) has loaded
+    /// or failed: none is being loaded, and none waits within reach.
+    pub fn settled(&self) -> bool {
+        let within = self.reach * self.reach;
+        self.asked.is_empty()
+            && self.decoded.is_empty()
+            && (self.waiting.is_empty()
+                || self.near.as_ref().is_some_and(|n| {
+                    self.waiting
+                        .iter()
+                        .all(|h| n.by_model.get(h).is_none_or(|&d| d > within))
+                }))
+    }
+
     /// How many are shown, and of the models they use how many have
-    /// loaded, are loading, wait to be loaded and failed.
-    pub fn counts(&self) -> (usize, usize, usize, usize, usize) {
-        let loaded = self.models.values().filter(|m| m.is_some()).count();
-        (
-            self.shown.len(),
-            loaded,
-            self.asked.len(),
-            self.waiting.len(),
-            self.failed.len(),
-        )
+    /// loaded, are loading, wait to be loaded (within reach, and further)
+    /// and failed.
+    pub fn counts(&self) -> PropCounts {
+        let within = self.reach * self.reach;
+        let near = self.waiting.iter().filter(|h| {
+            self.near
+                .as_ref()
+                .and_then(|n| n.by_model.get(h))
+                .is_some_and(|&d| d <= within)
+        });
+        PropCounts {
+            shown: self.shown.len(),
+            loaded: self.models.values().filter(|m| m.is_some()).count(),
+            loading: self.asked.len() + self.decoded.len(),
+            waiting_near: near.count(),
+            waiting: self.waiting.len(),
+            failed: self.failed.len(),
+        }
     }
 
     /// Uploads models that have loaded, nearest `focus` first (as many as
     /// fit in [`UPLOAD_BUDGET`], at least one), gives the props using them
-    /// their collision, and asks the loaders for the nearest still wanted.
+    /// their collision, and asks the loaders for the nearest still wanted
+    /// by a prop within `reach` metres (those further load as she nears
+    /// them).
     pub fn update(
         &mut self,
         backend: &mut dyn RenderBackend,
@@ -212,7 +371,9 @@ impl Props {
         source: &mut AssetSource<BufReader<File>>,
         physics: &mut Physics,
         focus: Vec3,
+        reach: f32,
     ) -> anyhow::Result<()> {
+        self.reach = reach;
         let Some(loaders) = &self.loaders else {
             return Ok(());
         };
@@ -220,8 +381,15 @@ impl Props {
         if self.decoded.is_empty() && (self.waiting.is_empty() || self.asked.len() >= IN_FLIGHT) {
             return Ok(());
         }
-        let near = self.nearness(focus);
-        let far = |hash: &u32| near.get(hash).copied().unwrap_or(f32::INFINITY);
+        let near = match self.near.take() {
+            Some(n) if n.changes == self.changes && n.focus.distance(focus) <= RENEAR => n,
+            _ => Near {
+                focus,
+                changes: self.changes,
+                by_model: self.nearness(focus),
+            },
+        };
+        let far = |hash: &u32| near.by_model.get(hash).copied().unwrap_or(f32::INFINITY);
         let started = Instant::now();
         while let Some(i) = (0..self.decoded.len())
             .min_by(|&a, &b| far(&self.decoded[a].0).total_cmp(&far(&self.decoded[b].0)))
@@ -239,7 +407,7 @@ impl Props {
             .waiting
             .iter()
             .copied()
-            .filter(|h| !near.contains_key(h))
+            .filter(|h| !near.by_model.contains_key(h))
             .collect();
         for h in unwanted {
             self.waiting.remove(&h);
@@ -247,7 +415,13 @@ impl Props {
         }
         let room = IN_FLIGHT.saturating_sub(self.asked.len());
         if room > 0 && !self.waiting.is_empty() {
-            let mut next: Vec<u32> = self.waiting.iter().copied().collect();
+            let within = reach * reach;
+            let mut next: Vec<u32> = self
+                .waiting
+                .iter()
+                .copied()
+                .filter(|h| far(h) <= within)
+                .collect();
             next.sort_by(|a, b| far(a).total_cmp(&far(b)));
             for hash in next.into_iter().take(room) {
                 self.waiting.remove(&hash);
@@ -261,6 +435,7 @@ impl Props {
                 }
             }
         }
+        self.near = Some(near);
         Ok(())
     }
 
@@ -303,7 +478,7 @@ impl Props {
         let gpu = GpuModel::upload(backend, materials, &cpu)?;
         if let Some(shape) = &cpu.collision {
             for (&e, p) in self.shown.iter().filter(|(_, p)| p.model == hash) {
-                if !p.wrecked {
+                if !p.wrecked && !self.knocked.contains_key(&e) {
                     physics.add_static(StaticKey::Entity(e), shape, p.position, p.rotation);
                 }
             }
@@ -318,16 +493,55 @@ impl Props {
         Ok(())
     }
 
-    /// Draws those within `reach` of `eye`.
-    pub fn draw(&self, queue: &mut DrawQueue, eye: Vec3, reach: f32) {
-        for p in self.shown.values() {
-            if p.position.distance(eye) > reach {
+    /// Draws those `frustum` may see within their reach of `eye`, as the
+    /// island's props are drawn: each no further than [`PROP_SIZES`] times
+    /// its size, nor than `limit`; those knocked loose with their pieces
+    /// where `physics` has them.
+    pub fn draw(
+        &self,
+        queue: &mut DrawQueue,
+        physics: &Physics,
+        eye: Vec3,
+        frustum: &Frustum,
+        limit: f32,
+    ) {
+        for (e, p) in &self.shown {
+            let Some(Some(m)) = self.models.get(&p.model) else {
+                continue;
+            };
+            if let Some(pieces) = self.knocked.get(e) {
+                let Some(loose) = self.loose(*e) else {
+                    continue;
+                };
+                let places: Vec<Mat4> = pieces
+                    .iter()
+                    .filter_map(|&d| physics.debris_place(d))
+                    .collect();
+                if places.len() == pieces.len()
+                    && places
+                        .iter()
+                        .any(|at| at.w_axis.truncate().distance(eye) <= limit)
+                {
+                    let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+                    m.gpu.draw_moved(
+                        queue,
+                        placed,
+                        &loose.posed(placed, &places),
+                        loose.breaks || p.wrecked,
+                        loose.flying(),
+                    );
+                }
                 continue;
             }
-            if let Some(Some(m)) = self.models.get(&p.model) {
-                let at = Mat4::from_rotation_translation(p.rotation, p.position);
-                m.gpu.draw_as(queue, at, p.wrecked);
+            let (lo, hi) = m.gpu.bounds;
+            let size = (hi - lo).length();
+            let reach = (size * PROP_SIZES).min(limit);
+            let centre = p.position + p.rotation * ((lo + hi) * 0.5);
+            if centre.distance_squared(eye) > reach * reach || !frustum.sees(centre, size * 0.5) {
+                continue;
             }
+            let at = Mat4::from_rotation_translation(p.rotation, p.position);
+            m.gpu.draw_as(queue, at, p.wrecked);
         }
     }
 }

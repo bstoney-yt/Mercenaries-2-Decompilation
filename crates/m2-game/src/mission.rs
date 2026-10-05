@@ -187,6 +187,8 @@ pub struct Mission {
     waiting_since: Option<f64>,
     log: Vec<String>,
     outbox: Vec<Command>,
+    /// The game flies deliveries ([`fly_deliveries`](Self::fly_deliveries)).
+    flown: bool,
 }
 
 impl Mission {
@@ -301,6 +303,7 @@ impl Mission {
             waiting_since: None,
             log,
             outbox: Vec::new(),
+            flown: false,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -441,6 +444,29 @@ impl Mission {
         }
     }
 
+    /// Leaves deliveries to the game: an `Ai.Deliver` order stays a
+    /// [`Command::Goal`] (`"Deliver"`) for it to fly, and it reports the
+    /// arrival with [`arrived`](Self::arrived). Without this a delivery
+    /// arrives as soon as it is ordered.
+    pub fn fly_deliveries(&mut self) {
+        self.flown = true;
+    }
+
+    /// Reports that `guid` (a delivery's pilot) reached `at`: its cargo is
+    /// let go there and the scripts hear of it ([`api::arrived`]); what
+    /// they do about it is carried out at once.
+    pub fn arrived(&mut self, guid: u32, at: [f32; 3]) {
+        self.log.push(format!(
+            "t={:.1} delivery by {guid} arrived at {at:?}",
+            self.now
+        ));
+        for e in api::arrived(&self.world, guid, at) {
+            self.log
+                .push(format!("  goal callback: {}", first_lines(&e.to_string())));
+        }
+        self.settle(&format!("t={:.1}, delivered", self.now));
+    }
+
     /// Reports that an object died in play (a soldier the player shot).
     pub fn kill(&mut self, guid: u32) {
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
@@ -511,6 +537,7 @@ impl Mission {
                     ..
                 } = c
                     && goal == "Deliver"
+                    && !self.flown
                 {
                     self.log
                         .push(format!("  delivery by {guid} arrived at {at:?}"));
@@ -655,6 +682,48 @@ mod tests {
             (p.vehicle, p.position, p.yaw),
             (Some(77), [1.0, 2.0, 3.0], 0.5)
         );
+    }
+
+    #[test]
+    fn flown_deliveries_wait_for_the_game_to_say_they_arrived() {
+        for flown in [false, true] {
+            let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+            if flown {
+                m.fly_deliveries();
+            }
+            {
+                let mut w = m.world().borrow_mut();
+                w.insert(80, Object::new("copter", [0.0, 100.0, 0.0]));
+                let mut pilot = Object::new("pilot", [0.0, 100.0, 0.0]);
+                pilot.vehicle = Some(80);
+                w.insert(81, pilot);
+                w.insert(82, Object::new("crate", [0.0, 95.0, 0.0]));
+            }
+            m.run(
+                r#"
+                local copter, crate = Sys.StringToGuid("80"), Sys.StringToGuid("82")
+                Object.AttachCargoToWinch(crate, copter)
+                Ai.Deliver(Sys.StringToGuid("81"), 50, 0, 60, 0.5)
+                "#,
+                "deliver",
+            )
+            .unwrap();
+            let at = [50.0, 0.0, 60.0];
+            let moved = |m: &mut Mission| {
+                m.take_commands()
+                    .iter()
+                    .any(|c| matches!(c, Command::Move { guid: 82, position } if *position == at))
+            };
+            let there = |m: &Mission| m.world().borrow().objects[&82].position == at;
+            // At once, unless the game flies it.
+            assert_eq!(moved(&mut m), !flown);
+            assert_eq!(there(&m), !flown);
+            if flown {
+                m.arrived(81, at);
+                assert!(moved(&mut m));
+                assert!(there(&m));
+            }
+        }
     }
 
     #[test]
