@@ -130,6 +130,14 @@ return out
 /// no footage shows the gun box while she holds it.
 const DESIGNATOR_GUID: u32 = 0x6000_0003;
 const DESIGNATOR_ICON: &str = "explosives_c4_detonator";
+/// A tank's cannon, while she drives one whose shells run out: the gun
+/// template's own `WeaponUI` (80005fb5 "Mounted Tank Gun (Default)", the
+/// AMX-30's): its icon `support_artillery` (the footage's gun box shows a
+/// cannon there) and reticle `reticle_tank`, without the crosshair. The
+/// template has no localized name, so the gun box names none.
+const CANNON_GUID: u32 = 0x6000_0004;
+const CANNON_ICON: &str = "support_artillery";
+const CANNON_RETICLE: &str = "reticle_tank";
 /// The first contract's free Satellite Guided Bomb, as the scripts know it
 /// (`MrxSupportData`'s freebie the contract adds).
 const SATELLITE_FREEBIE: &str = "VzaCon01_SatBomb";
@@ -742,9 +750,10 @@ fn run(data: &std::path::Path, rx: Receiver<HudState>, tx: Sender<Output>) {
 #[derive(Default)]
 struct Told {
     hp: Option<(i32, bool)>,
-    /// The gun in her hands, and whether she holds the designator.
-    weapon: Option<(Weapon, bool)>,
-    ammo: Option<[u32; 5]>,
+    /// The gun in her hands, whether she holds the designator, and whether
+    /// she drives a vehicle with a cannon.
+    weapon: Option<(Weapon, bool, bool)>,
+    ammo: Option<[i64; 5]>,
     vehicle: Option<Option<String>>,
     target: Option<Option<(i32, i32)>>,
     reticle: Option<Option<[f32; 2]>>,
@@ -821,6 +830,7 @@ impl Thread {
                 (RPG_GUID, RPG_NAME),
                 (LAUNCHER_GUID, LAUNCHER_NAME),
                 (DESIGNATOR_GUID, support::Kind::SatelliteBomb.designator()),
+                (CANNON_GUID, ""),
             ] {
                 world.insert(guid, Object::new(name, [0.0; 3]));
             }
@@ -1021,19 +1031,22 @@ impl Thread {
             fire(lua, "GuiVehicleNameUpdate", (name, faction))?;
         }
         let holding = s.support.designator.is_some();
-        if self.told.weapon != Some((s.weapon, holding)) {
-            self.told.weapon = Some((s.weapon, holding));
+        let cannon = s.in_vehicle && s.cannon.is_some();
+        if self.told.weapon != Some((s.weapon, holding, cannon)) {
+            self.told.weapon = Some((s.weapon, holding, cannon));
             let (icon, guid, reticle) = match s.weapon {
                 Weapon::Rifle => (RIFLE_ICON, RIFLE_GUID, RIFLE_RETICLE),
                 Weapon::Rpg => (RPG_ICON, RPG_GUID, RPG_RETICLE),
                 Weapon::GrenadeLauncher => (LAUNCHER_ICON, LAUNCHER_GUID, LAUNCHER_RETICLE),
             };
             // The designator up in her hands: the gun box names it; the
-            // reticle stays the gun's.
-            let (icon, guid) = if holding {
-                (DESIGNATOR_ICON, DESIGNATOR_GUID)
+            // reticle stays the gun's. In a tank, its cannon.
+            let (icon, guid, reticle) = if cannon {
+                (CANNON_ICON, CANNON_GUID, CANNON_RETICLE)
+            } else if holding {
+                (DESIGNATOR_ICON, DESIGNATOR_GUID, reticle)
             } else {
-                (icon, guid)
+                (icon, guid, reticle)
             };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
@@ -1048,7 +1061,7 @@ impl Thread {
                         "uReticleTexture",
                         Value::String(lua.create_string(reticle)?),
                     ),
-                    ("bReticleCrosshair", Value::Boolean(true)),
+                    ("bReticleCrosshair", Value::Boolean(!cannon)),
                 ],
             )?;
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
@@ -1439,19 +1452,21 @@ fn widgets_under(
 /// rockets count down from that and, run out, start again full. The
 /// grenade launcher's are its own (`launcher`: in the clip, stored). In
 /// a vehicle whose cannon runs out, its shells (`cannon`: left, carried)
-/// count down in one clip with none stored.
+/// count down alone: no clip (0) and no store (-1), as the engine sends a
+/// gun without either, for which the gun box shows the one number (its
+/// `Unreloadable Ammo`, as the footage's "40").
 fn ammo(
     weapon: Weapon,
     fired: Fired,
     picked: Picked,
     launcher: Option<Rounds>,
     cannon: Option<(u32, u32)>,
-) -> [u32; 5] {
+) -> [i64; 5] {
     let grenades = GRENADES - fired.grenades % GRENADES;
-    if let Some((left, carried)) = cannon {
-        return [carried, left, 0, grenades, 0];
+    if let Some((left, _)) = cannon {
+        return [0, i64::from(left), -1, i64::from(grenades), 0];
     }
-    match weapon {
+    let ammo = match weapon {
         Weapon::Rifle => [
             RIFLE_CLIP,
             RIFLE_CLIP - fired.rifle % RIFLE_CLIP,
@@ -1473,7 +1488,8 @@ fn ammo(
                 0,
             ]
         }
-    }
+    };
+    ammo.map(i64::from)
 }
 
 fn fire(lua: &Lua, event: &str, args: impl IntoLuaMulti) -> mlua::Result<()> {
@@ -2327,19 +2343,19 @@ mod tests {
         );
         assert_eq!(
             ammo(Weapon::Rpg, fired(0, 0, 0), none, None, None)[..3],
-            [1, 1, RPG_STORED]
+            [1, 1, i64::from(RPG_STORED)]
         );
         assert_eq!(
             ammo(Weapon::Rpg, fired(0, 1, 0), none, None, None)[2],
-            RPG_STORED - 1
+            i64::from(RPG_STORED) - 1
         );
         assert_eq!(
             ammo(Weapon::Rpg, fired(0, 4, 0), none, None, None)[2],
-            RPG_STORED
+            i64::from(RPG_STORED)
         );
         assert_eq!(
             ammo(Weapon::Rifle, fired(0, 0, 1), none, None, None)[3],
-            GRENADES - 1
+            i64::from(GRENADES) - 1
         );
         // A crate's 20 rockets after three fired: 21 left.
         let crate_ = Picked {
@@ -2348,7 +2364,7 @@ mod tests {
         };
         assert_eq!(
             ammo(Weapon::Rpg, fired(0, 3, 0), crate_, None, None)[2],
-            RPG_STORED + 17
+            i64::from(RPG_STORED) + 17
         );
         // The launcher's own rounds: "6 / 12" as the crate gives it.
         let launcher = Some(Rounds {
@@ -2365,10 +2381,10 @@ mod tests {
             )[..3],
             [6, 6, 12]
         );
-        // The AMX-30's 40 shells, three fired.
+        // The AMX-30's 40 shells, three fired: alone in the gun box.
         assert_eq!(
             ammo(Weapon::Rifle, fired(0, 0, 0), none, None, Some((37, 40)))[..3],
-            [40, 37, 0]
+            [0, 37, -1]
         );
     }
 

@@ -962,16 +962,15 @@ fn screenshot(
         }
     }
     // The picture, with the HUD (the game's, once its scripts have
-    // started and run half a second; two with the support menu or the
-    // satellite's view up, whose boxes take longer than that to open).
+    // started and run two seconds, for its boxes to have opened and the
+    // gun box to have switched; half of one for hits, whose arcs fade).
     let mut hud = ui::Hud::new();
     hud.game = game_hud(install, mode, options.old_hud);
     let mut settings = config.clone();
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
         info.game = Some(gamehud::HudState::of(&mut game));
-        let opening = info.support.menu || info.support.satellite.is_some();
-        let seconds = if opening { 2.0 } else { 0.5 };
+        let seconds = if options.hurt.is_empty() { 2.0 } else { 0.5 };
         hud.settle(&info, (w, h), seconds, Duration::from_secs(120));
         info.game = Some(gamehud::HudState::of(&mut game));
     }
