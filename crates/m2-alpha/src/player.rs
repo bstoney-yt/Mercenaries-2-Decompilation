@@ -20,6 +20,13 @@ const RUN: f32 = 5.0;
 const SPRINT: f32 = 7.2;
 /// Take-off speed of a jump, m/s (about 0.8 m high).
 const JUMP: f32 = 4.0;
+/// Seconds after take-off before touching the ground counts as landing.
+const MIN_AIR: f32 = 0.15;
+/// Seconds before a landing clip's end that the gait takes over again.
+const LAND_FADE: f32 = 0.1;
+/// Speeds (m/s) above which she takes off and lands on the run.
+const RUNNING_JUMP: f32 = 1.0;
+const RUNNING_LAND: f32 = 1.5;
 /// How fast she turns to face where she is going, radians per second.
 const TURN_RATE: f32 = 10.0;
 /// Camera: eye height looked at, distance behind, and closest it gets
@@ -93,6 +100,17 @@ impl Intent {
     }
 }
 
+/// Where she is in a jump.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Leap {
+    /// On the ground.
+    No,
+    /// In the air, this many seconds after taking off.
+    Air(f32),
+    /// Landed this many seconds ago, playing the landing clip.
+    Land(f32, usize),
+}
+
 /// The player character.
 #[derive(Debug)]
 pub struct Player {
@@ -122,10 +140,14 @@ pub struct Player {
     pub driving: Option<usize>,
     /// Aiming: she faces the camera's way with the rifle shouldered.
     pub aiming: bool,
-    /// Her rifle, jump and fall clips.
+    /// Her rifle, jump, throw and fall clips.
     pub clips: FightClips,
-    /// In a jump, until she lands.
-    jumping: bool,
+    /// In a jump, until she has landed.
+    leap: Leap,
+    /// Seconds into a grenade throw, while she throws.
+    pub throwing: Option<f32>,
+    /// The launcher is up (not the rifle): it rides on her shoulder.
+    pub launcher: bool,
     /// Down (out of health): she lies where she fell.
     pub down: bool,
 }
@@ -148,9 +170,24 @@ impl Player {
             driving: None,
             aiming: false,
             clips: FightClips::default(),
-            jumping: false,
+            leap: Leap::No,
+            throwing: None,
+            launcher: false,
             down: false,
         }
+    }
+
+    /// Starts throwing a grenade, if she has a throw to play and isn't
+    /// throwing already: the seconds until it leaves her hand. `None`
+    /// without the clip (the grenade goes at once).
+    pub fn start_throw(&mut self) -> Option<f32> {
+        if self.throwing.is_some() {
+            return None;
+        }
+        let (_, release) = self.clips.throw?;
+        self.model.as_ref()?;
+        self.throwing = Some(0.0);
+        Some(release)
     }
 
     /// One fixed tick of `dt` seconds.
@@ -204,7 +241,8 @@ impl Player {
         let jump = (intent.jump && self.character.grounded).then_some(JUMP);
         physics.move_character(&mut self.character, wanted, jump, dt);
 
-        let heading = if self.aiming {
+        // Aiming or throwing, she turns the camera's way.
+        let heading = if self.aiming || self.throwing.is_some() {
             Some(self.yaw)
         } else {
             (direction.length_squared() > 0.01).then(|| direction.x.atan2(direction.z))
@@ -219,6 +257,9 @@ impl Player {
 
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
         let look = self.camera_forward();
+        if let Some(t) = &mut self.throwing {
+            *t += dt;
+        }
         if let Some((_, rig)) = &mut self.model {
             let gait = if moved < 0.3 {
                 Gait::Idle
@@ -229,9 +270,17 @@ impl Player {
             } else {
                 Gait::Run
             };
+            let clips = &self.clips;
+            // The jump: a take-off (on the run or standing), the air,
+            // and a landing.
             if jump.is_some() {
-                self.jumping = true;
-                if let Some(clip) = self.clips.jump {
+                let takeoff = if moved > RUNNING_JUMP {
+                    clips.takeoff.or(clips.takeoff_still)
+                } else {
+                    clips.takeoff_still.or(clips.takeoff)
+                };
+                self.leap = Leap::Air(0.0);
+                if let Some(clip) = takeoff.or(clips.jump) {
                     // At the height she stands at, so the take-off's
                     // crouch doesn't sink her.
                     let hips = rig
@@ -239,28 +288,71 @@ impl Player {
                         .map_or(1.0, |i| rig.clips[i].info.hips);
                     rig.animator.play_leveled(clip, hips);
                 }
-            } else if self.jumping && self.character.grounded {
-                self.jumping = false;
+            } else {
+                self.leap = match self.leap {
+                    Leap::Air(t) if t > MIN_AIR && self.character.grounded => {
+                        let land = if moved > RUNNING_LAND {
+                            clips.land.or(clips.land_still)
+                        } else {
+                            clips.land_still.or(clips.land)
+                        };
+                        match land {
+                            Some(clip) => {
+                                rig.animator.play_once(clip);
+                                Leap::Land(0.0, clip)
+                            }
+                            None => Leap::No,
+                        }
+                    }
+                    Leap::Air(t) => Leap::Air(t + dt),
+                    // A standing landing gives way when she sets off.
+                    Leap::Land(t, clip)
+                        if t + LAND_FADE < rig.clips[clip].info.duration
+                            && !(Some(clip) == clips.land_still && moved > RUNNING_JUMP) =>
+                    {
+                        Leap::Land(t + dt, clip)
+                    }
+                    Leap::Land(..) | Leap::No => Leap::No,
+                };
             }
-            let carry = if self.aiming { Carry::Aim } else { Carry::Low };
-            if self.jumping && self.clips.jump.is_some() {
-                // The legs jump; the arms keep the rifle as they were (the
-                // jump's own arms fly out).
-                let upper = if self.aiming {
-                    self.clips.aim
+            let leaping = self.leap != Leap::No;
+            // The launcher rides on her shoulder, as when she aims it.
+            let carry = if self.aiming || self.launcher {
+                Carry::Aim
+            } else {
+                Carry::Low
+            };
+            if leaping {
+                // The legs jump; the arms keep the weapon as they were
+                // (the jump's own arms fly out).
+                let upper = if carry == Carry::Aim {
+                    clips.aim
                 } else {
                     rig.gait_clip(Gait::Idle)
                 };
-                rig.two_handed = self.aiming && upper.is_some();
+                rig.two_handed = carry == Carry::Aim && upper.is_some();
                 rig.animator.set_upper(upper.zip(rig.upper.clone()));
             } else {
-                rig.hold_rifle(gait, &self.clips, carry);
+                rig.hold_rifle(gait, clips, carry);
             }
-            rig.aim_along(self.facing, self.aiming.then_some(look));
+            // A throw plays over the upper body, whatever the legs do.
+            match (self.throwing, clips.throw, rig.upper.clone()) {
+                (Some(t), Some((clip, _)), Some(mask)) if t < rig.clips[clip].info.duration => {
+                    rig.animator.upper_at(clip, mask, t);
+                    rig.two_handed = false;
+                }
+                (Some(_), ..) => self.throwing = None,
+                _ => {}
+            }
+            // Aimed, the weapon points where the camera looks; the
+            // launcher at rest points level the way she faces.
+            let (sf, cf) = self.facing.sin_cos();
+            let rest = (self.launcher && self.throwing.is_none()).then_some(Vec3::new(sf, 0.0, cf));
+            rig.aim_along(self.facing, self.aiming.then_some(look).or(rest));
             // Play the clip at the speed she actually moves, so feet don't
             // slide (within reason: against a wall the legs keep going).
             let rate = match rig.gait_speed(gait) {
-                _ if self.jumping => 1.0,
+                _ if leaping => 1.0,
                 Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
                 _ => 1.0,
             };

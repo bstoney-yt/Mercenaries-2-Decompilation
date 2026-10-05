@@ -47,6 +47,8 @@ pub struct Placed {
     pub world: Mat4,
     /// Skinned models play the game's locomotion clips in place.
     pub rig: Option<Rig>,
+    /// Holding a moment of a clip (`--clip HASH@SECONDS`): not advanced.
+    pub held: bool,
 }
 
 /// A skinned model's skeleton, the clips that fit it, and what it plays.
@@ -655,6 +657,7 @@ impl Scene {
         let mut widest = 2.0f32;
         let mut rigs: HashMap<u32, Rig> = HashMap::new();
         for (i, &hash) in show.models.iter().enumerate() {
+            let mut held = false;
             let gpu = GpuModel::load(backend, source, &mut self.materials, hash, 0)?;
             let rig = if gpu.is_skinned() {
                 let mut rig = match rigs.get(&hash) {
@@ -665,13 +668,22 @@ impl Scene {
                         r
                     }
                 };
-                if let Some(&clip) = show.clips.get(i) {
-                    match rig.clips.iter().position(|c| c.hash == clip) {
-                        Some(k) => {
+                if let Some(&(clip, at)) = show.clips.get(i) {
+                    match (rig.clips.iter().position(|c| c.hash == clip), at) {
+                        (Some(k), Some(t)) => {
+                            let length = rig.clips[k].info.duration;
+                            eprintln!(
+                                "model {i}: clip {clip:08x} held {t:.2} s in (of {length:.2})"
+                            );
+                            rig.animator.play_once(k);
+                            rig.animator.seek(t);
+                            held = true;
+                        }
+                        (Some(k), None) => {
                             eprintln!("model {i}: clip {clip:08x}");
                             rig.animator.play(k);
                         }
-                        None => eprintln!("model {i}: no clip {clip:08x} fits"),
+                        (None, _) => eprintln!("model {i}: no clip {clip:08x} fits"),
                     }
                 }
                 Some(rig)
@@ -705,6 +717,7 @@ impl Scene {
                     * Mat4::from_rotation_y(show.turn.to_radians())
                     * Mat4::from_translation(offset - centre),
                 rig,
+                held,
             });
             x += size.x.max(1.0) + 3.0;
         }
@@ -958,8 +971,10 @@ impl Scene {
 
     /// Advances animation by `dt` seconds.
     pub fn tick(&mut self, dt: f32) {
-        for rig in self.models.iter_mut().filter_map(|p| p.rig.as_mut()) {
-            rig.animator.advance(dt);
+        for p in self.models.iter_mut().filter(|p| !p.held) {
+            if let Some(rig) = &mut p.rig {
+                rig.animator.advance(dt);
+            }
         }
     }
 
@@ -1010,15 +1025,23 @@ impl Scene {
             let (nodes, skin) = rig.posed();
             let body = player.model_matrix();
             model.draw_posed(backend, queue, body, &nodes, &skin)?;
-            let weapon = match fight.weapon {
-                Weapon::Rifle => &self.arsenal.rifle,
-                Weapon::Rpg => &self.arsenal.rpg,
+            // Throwing, her weapon is put away and the grenade is in her
+            // hand until it goes.
+            let weapon = match (player.throwing, fight.weapon) {
+                (Some(_), _) if fight.grenade_in_hand() => &self.arsenal.grenade,
+                (Some(_), _) => &None,
+                (None, Weapon::Rifle) => &self.arsenal.rifle,
+                (None, Weapon::Rpg) => &self.arsenal.rpg,
             };
             if !player.down
                 && let Some(w) = weapon
-                && let Some(at) =
-                    self.arsenal
-                        .in_hand(w, body, &nodes, self.arsenal.hand, rig.two_handed)
+                && let Some(at) = self.arsenal.in_hand(
+                    w,
+                    body,
+                    &nodes,
+                    (self.arsenal.hand, self.arsenal.attach),
+                    rig.two_handed,
+                )
             {
                 w.model.draw(queue, at);
             }
@@ -1047,9 +1070,9 @@ impl Scene {
             if n.soldier
                 && n.alive
                 && let Some(w) = &self.arsenal.rifle
-                && let Some(at) = self
-                    .arsenal
-                    .in_hand(w, body, &nodes, n.hand, n.rig.two_handed)
+                && let Some(at) =
+                    self.arsenal
+                        .in_hand(w, body, &nodes, (n.hand, n.attach), n.rig.two_handed)
             {
                 w.model.draw(queue, at);
             }
@@ -1212,7 +1235,7 @@ impl Effects {
             mesh: (vb, ib),
             count: faces.len() as u32 * 3,
             light: define([1.0, 0.85, 0.45, 1.0], false, BlendMode::Opaque)?,
-            flash: define([1.0, 0.78, 0.32, 0.9], false, BlendMode::Translucent)?,
+            flash: define([1.0, 0.6, 0.18, 0.8], false, BlendMode::Translucent)?,
             fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
             smoke: define([0.35, 0.35, 0.35, 0.4], true, BlendMode::Translucent)?,
         })

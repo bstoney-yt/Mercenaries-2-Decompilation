@@ -105,12 +105,15 @@ local function act(nm, a)
 end
 
 local stopped = false
+-- Read raw: a global nobody set answers a stub table, not nil.
+local untilName = rawget(_G, 'DRIVE_UNTIL')
+if type(untilName) ~= 'string' then untilName = nil end
 
 -- Every second, act on each active objective every fourth try, ten times.
 Event.CreatePersistent(Event.TimerRelative, { 1 }, function()
-  if not stopped and DRIVE_UNTIL then
+  if not stopped and untilName then
     for nm, st in pairs(state) do
-      if st == 'active' and nm:find(DRIVE_UNTIL, 1, true) then
+      if st == 'active' and nm:find(untilName, 1, true) then
         Debug.Printf('>>> drive: stopped at ' .. nm)
         stopped = true
       end

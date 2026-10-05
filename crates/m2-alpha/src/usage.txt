@@ -6,8 +6,9 @@ m2-alpha [options]
   --spawn <x>,<z>        where on the island to start (default 450,-1950)
   --fly                  start with the free camera instead of on foot
   --model <hash>         a model to show (hex name hash; repeatable)
-  --clip <hash>          with --model: a clip for each model to hold (hex
-                         hash; repeatable, in model order)
+  --clip <hash>[@<s>]    with --model: a clip for each model to play (hex
+                         hash; repeatable, in model order); with @seconds,
+                         held still that far in
   --turn <degrees>       with --model: turn the models (90 shows a side)
   --gait <gait>          idle, walk, run or sprint: what characters shown
                          with --model play first; with --screenshot on the
@@ -23,6 +24,10 @@ m2-alpha [options]
                          nearest parked vehicle and drive it forward first
   --jump                 with --screenshot on the island: jump just before
                          the picture
+  --throw                with --screenshot on the island: throw a grenade
+                         just before the picture
+  --lead <s>             with --jump or --throw: seconds before the picture
+                         she starts (default 0.2)
   --fight                with --screenshot on the island: shoot the nearest
                          soldier, rocket a vehicle, throw a grenade first,
                          then look at the body
@@ -44,8 +49,13 @@ m2-alpha [options]
                          her right side, to see her hands
   --probe                with --screenshot: list what rays from where she
                          stands hit (unseen walls, steps in the ground)
+  --wreck                with --drive: wreck the vehicle at speed at the
+                         end and log how it comes to rest
   --fire                 with --aim, or --drive --look: fire just before the
                          picture
+  --grip attach|hands    draw weapons on the hand's attach node as posed
+                         (attach, the default), or held as worked out from
+                         the hands (hands)
   --mission              run the game's mission scripts: the first contract
                          starts as in the game, with its objectives and
                          markers on screen (log: m2-alpha-mission.log);

@@ -197,11 +197,18 @@ const SERVICE_BRAKE: f32 = 8.0;
 const HANDBRAKE: f32 = 9.0;
 const ROLLING: f32 = 0.6;
 const HOLD: f32 = 3.0;
+/// Left to itself, a vehicle rolling faster than this (m/s) slows at
+/// [`HOLD`], then holds with every wheel as hard as the handbrake.
+const PARKED_FAST: f32 = 3.0;
 /// How far a ragdoll's limb may drift off its joint before it is put
 /// back, metres.
 const RAGDOLL_SLACK: f32 = 0.02;
-/// How quickly a wreck stops sliding and spinning (invented).
+/// How quickly a wreck stops sliding and spinning, how hard its hull
+/// drags on the ground, and how far down its wheels' rims reach (of the
+/// radius from the centre): invented.
 const WRECK_DAMPING: f32 = 1.5;
+const WRECK_FRICTION: f32 = 0.9;
+const WRECK_RIM: f32 = 0.7;
 /// How fast tracks turn a hull standing still, radians per second.
 const TRACK_TURN: f32 = 0.9;
 
@@ -215,6 +222,9 @@ pub struct VehicleControls {
     pub throttle: f32,
     pub steer: f32,
     pub brake: bool,
+    /// Nobody at the wheel: it brakes to a stop (gently while it still
+    /// rolls fast) and then holds, even on a hill.
+    pub parked: bool,
 }
 
 struct VehicleBody {
@@ -224,6 +234,8 @@ struct VehicleBody {
     steers: Vec<bool>,
     /// On tracks: turns on the spot instead of steering wheels.
     tracked: bool,
+    /// Wrecked: nothing drives it any more.
+    wrecked: bool,
 }
 
 /// A character's capsule and motion.
@@ -431,6 +443,17 @@ impl Physics {
     /// at `position` (the model's origin) facing `yaw` (radians clockwise
     /// from `+z`).
     pub fn add_vehicle(&mut self, spec: &VehicleSpec, position: Vec3, yaw: f32) -> VehicleId {
+        self.add_vehicle_turned(spec, position, Quat::from_rotation_y(yaw))
+    }
+
+    /// [`add_vehicle`](Self::add_vehicle) turned by `rotation`: tilted to
+    /// the ground it rests on ([`VehicleSpec::rest_on`]).
+    pub fn add_vehicle_turned(
+        &mut self,
+        spec: &VehicleSpec,
+        position: Vec3,
+        rotation: Quat,
+    ) -> VehicleId {
         let (lo, hi) = spec.bounds;
         // The hull clears the ground by the wheels' lower half.
         let floor = spec
@@ -448,7 +471,7 @@ impl Physics {
         let centre = Vec3::new((lo.x + hi.x) * 0.5, floor + half.y, (lo.z + hi.z) * 0.5);
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
-                .pose(pose(position, Quat::from_rotation_y(yaw)))
+                .pose(pose(position, rotation))
                 .linear_damping(0.1)
                 .angular_damping(0.5)
                 .can_sleep(false),
@@ -502,6 +525,7 @@ impl Physics {
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tracked: spec.tracked,
+            wrecked: false,
         }));
         id
     }
@@ -518,7 +542,12 @@ impl Physics {
     /// vehicle rolls brakes it; with no throttle it rolls to a stop.
     pub fn drive(&mut self, id: VehicleId, controls: VehicleControls) {
         let dt = self.world.integration_parameters.dt.max(1e-3);
-        let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
+        let Some(v) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .filter(|v| !v.wrecked)
+        else {
             return;
         };
         let speed = v.controller.current_vehicle_speed;
@@ -531,7 +560,14 @@ impl Physics {
         // Accelerates at about 4 m/s² flat out, slower near top speed.
         let top = if throttle >= 0.0 { 30.0 } else { 8.0 };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
-        let (force, brake) = if controls.brake {
+        let (force, brake) = if controls.parked {
+            let hard = if speed.abs() > PARKED_FAST {
+                HOLD
+            } else {
+                HANDBRAKE
+            };
+            (0.0, slowing(hard))
+        } else if controls.brake {
             (0.0, slowing(ROLLING))
         } else if against {
             (0.0, slowing(SERVICE_BRAKE * throttle.abs()))
@@ -616,18 +652,49 @@ impl Physics {
             .map_or(0.0, |v| v.controller.current_vehicle_speed)
     }
 
-    /// Makes a vehicle a wreck: its wheels no longer roll freely and it
-    /// soon stops sliding (burst tyres, bent axles).
+    /// Makes a vehicle a wreck: burst tyres and bent axles no longer carry
+    /// it, so it drops onto its rims and belly and scrapes to a stop
+    /// instead of rolling on.
     pub fn wreck_vehicle(&mut self, id: VehicleId) {
         let Some(v) = self.vehicles.get_mut(id.0).and_then(Option::as_mut) else {
             return;
         };
+        v.wrecked = true;
+        // How low the rims reach, chassis space.
+        let mut rims = f32::INFINITY;
         for w in v.controller.wheels_mut() {
-            w.friction_slip *= 0.5;
+            let centre = w.chassis_connection_point_cs.y - w.suspension_rest_length;
+            rims = rims.min(centre - w.radius * WRECK_RIM);
+            w.max_suspension_force = 0.0;
+            w.friction_slip = 0.0;
+            w.engine_force = 0.0;
+            w.brake = 0.0;
         }
-        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
-            body.set_linear_damping(WRECK_DAMPING);
-            body.set_angular_damping(WRECK_DAMPING);
+        let Some(body) = self.world.bodies.get_mut(v.controller.chassis) else {
+            return;
+        };
+        body.set_linear_damping(WRECK_DAMPING);
+        body.set_angular_damping(WRECK_DAMPING);
+        // The hull, which stopped at the wheels' centres, reaches down to
+        // the rims and drags on the ground.
+        for &h in body.colliders() {
+            let Some(c) = self.world.colliders.get_mut(h) else {
+                continue;
+            };
+            let (Some(cube), Some(at)) = (
+                c.shape().as_cuboid().map(|b| vec3(b.half_extents)),
+                c.position_wrt_parent().map(|p| vec3(p.translation)),
+            ) else {
+                continue;
+            };
+            let (top, bottom) = (at.y + cube.y, (at.y - cube.y).min(rims));
+            if !bottom.is_finite() {
+                continue;
+            }
+            let half = (top - bottom) * 0.5;
+            c.set_shape(r::SharedShape::cuboid(cube.x, half, cube.z));
+            c.set_translation_wrt_parent(vector(Vec3::new(at.x, bottom + half, at.z)));
+            c.set_friction(WRECK_FRICTION);
         }
     }
 
@@ -737,23 +804,35 @@ impl Physics {
                 Some(body),
             );
             bodies[i] = Some(body);
-            // Joined to the nearest ancestor with a limb.
+            // Joined to the nearest ancestor with a limb; or, when none
+            // has one, to the nearest limb made so far. (The spine and
+            // the hips both hang from a root bone without a limb: joined
+            // only to ancestors, the upper body flew off on its own.)
             let mut up = Some(parent);
+            let mut on = None;
             while let Some(a) = up {
-                if let Some(other) = bodies[a] {
-                    let anchor = at[a].1.inverse() * (p - at[a].0);
-                    joints.push((i, a, anchor));
-                    self.world.insert_impulse_joint(
-                        other,
-                        body,
-                        r::SphericalJointBuilder::new()
-                            .local_anchor1(vector(anchor))
-                            .local_anchor2(vector(Vec3::ZERO))
-                            .contacts_enabled(false),
-                    );
+                if bodies[a].is_some() {
+                    on = Some(a);
                     break;
                 }
                 up = parents[a].filter(|&p| p < n);
+            }
+            let on = on.or_else(|| {
+                (0..i)
+                    .filter(|&k| bodies[k].is_some())
+                    .min_by(|&a, &b| at[a].0.distance(p).total_cmp(&at[b].0.distance(p)))
+            });
+            if let Some((a, other)) = on.and_then(|a| Some((a, bodies[a]?))) {
+                let anchor = at[a].1.inverse() * (p - at[a].0);
+                joints.push((i, a, anchor));
+                self.world.insert_impulse_joint(
+                    other,
+                    body,
+                    r::SphericalJointBuilder::new()
+                        .local_anchor1(vector(anchor))
+                        .local_anchor2(vector(Vec3::ZERO))
+                        .contacts_enabled(false),
+                );
             }
         }
         let locals = (0..n)
@@ -994,6 +1073,50 @@ mod tests {
         assert!(p.ragdoll_nodes(id).is_none());
     }
 
+    #[test]
+    fn a_ragdoll_stays_in_one_piece_when_spine_and_hips_share_a_root() {
+        let mut p = ready();
+        // As the game's skeletons are: the hips and the spine both hang
+        // from a root bone at the hips (which gets no limb), under a root
+        // at the feet.
+        let (parents, at): (Vec<Option<usize>>, Vec<Vec3>) = [
+            (None, [0.0, 0.0, 0.0]),
+            (Some(0), [0.0, 1.0, 0.0]),
+            (Some(1), [0.0, 1.0, 0.0]),
+            (Some(2), [0.1, 0.95, 0.0]),
+            (Some(3), [0.15, 0.5, 0.0]),
+            (Some(4), [0.18, 0.1, 0.0]),
+            (Some(2), [-0.1, 0.95, 0.0]),
+            (Some(6), [-0.15, 0.5, 0.0]),
+            (Some(7), [-0.18, 0.1, 0.0]),
+            (Some(1), [0.0, 1.0, 0.0]),
+            (Some(9), [0.0, 1.2, 0.0]),
+            (Some(10), [0.0, 1.4, 0.0]),
+            (Some(11), [0.0, 1.55, 0.0]),
+            (Some(12), [0.0, 1.7, 0.0]),
+        ]
+        .into_iter()
+        .map(|(parent, a)| (parent, Vec3::from(a) + Vec3::Y * 2.0))
+        .unzip();
+        let nodes: Vec<Mat4> = at.iter().map(|&a| Mat4::from_translation(a)).collect();
+        let id = p.add_ragdoll(&parents, &nodes, Vec3::new(0.0, 0.0, 6.0));
+        {
+            let doll = p.ragdolls[id.0].as_ref().unwrap();
+            let limbs = doll.bodies.iter().flatten().count();
+            assert_eq!(doll.joints.len(), limbs - 1, "every limb but one joined");
+        }
+        for k in 0..240 {
+            if k == 60 {
+                p.push_ragdoll(id, Vec3::new(4.0, 10.0, -8.0));
+            }
+            p.step(DT);
+        }
+        let now = p.ragdoll_nodes(id).unwrap();
+        let (hips, spine, head) = (now[2].w_axis, now[9].w_axis, now[13].w_axis);
+        assert!(hips.distance(spine) < 0.2, "{hips} {spine}");
+        assert!(hips.distance(head) < 0.9, "{hips} {head}");
+    }
+
     fn ready() -> Physics {
         let mut p = Physics::new();
         floor(&mut p, 1, 0.0, 0.0, 0.0, 50.0);
@@ -1129,13 +1252,61 @@ mod tests {
                 VehicleControls {
                     throttle: 1.0,
                     steer: -0.3,
-                    brake: false,
+                    ..Default::default()
                 },
             );
             p.step(DT);
         }
         let up = p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
         assert!(up.y > 0.7, "rolled: {up}");
+    }
+
+    #[test]
+    fn parked_on_a_slope_it_rests_on_its_wheels_and_stays() {
+        let mut p = Physics::new();
+        // A 15° slope rising to +x; the car parked facing up it.
+        let half = 100.0;
+        let v = [
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(-half, 0.0, half),
+        ];
+        let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        let slope = 15f32.to_radians();
+        p.add_static(
+            StaticKey::Cell(1),
+            &shape,
+            Vec3::ZERO,
+            Quat::from_rotation_z(slope),
+        );
+        p.step(DT);
+        let spec = car();
+        let yaw = std::f32::consts::FRAC_PI_2;
+        let ground = |at: Vec3| {
+            p.cast_ray(Vec3::new(at.x, 50.0, at.z), Vec3::NEG_Y, 100.0)
+                .map(|(d, _)| 50.0 - d)
+        };
+        let rest = spec.rest_on(Vec3::new(5.0, 0.0, 0.0), yaw, ground).unwrap();
+        assert!((rest.slope - slope).abs() < 0.01, "{rest:?}");
+        let id = p.add_vehicle_turned(&spec, rest.position + Vec3::Y * 0.3, rest.rotation);
+        let parked = VehicleControls {
+            parked: true,
+            ..Default::default()
+        };
+        for _ in 0..240 {
+            p.drive(id, parked);
+            p.step(DT);
+        }
+        let at = p.vehicle_transform(id).unwrap();
+        let moved = (at.transform_point3(Vec3::ZERO) - rest.position).length();
+        assert!(moved < 0.6, "slid {moved} m");
+        let up = at.transform_vector3(Vec3::Y);
+        assert!(
+            (up.angle_between(Vec3::Y) - slope).abs() < 0.05,
+            "tilted {} degrees",
+            up.angle_between(Vec3::Y).to_degrees()
+        );
     }
 
     #[test]
@@ -1180,7 +1351,7 @@ mod tests {
                 VehicleControls {
                     throttle: 0.5,
                     steer: 1.0,
-                    brake: false,
+                    ..Default::default()
                 },
             );
             p.step(DT);
@@ -1207,6 +1378,47 @@ mod tests {
         assert!(p.vehicle_speed(id).abs() < 0.5, "{}", p.vehicle_speed(id));
         p.remove_vehicle(id);
         assert!(p.vehicle_transform(id).is_none());
+    }
+
+    #[test]
+    fn wrecks_drop_onto_their_rims_and_scrape_to_a_stop() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..180 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let fast = p.vehicle_speed(id);
+        assert!(fast > 5.0, "{fast}");
+        p.wreck_vehicle(id);
+        // Nobody can drive it now, nor does the throttle it had push it.
+        for _ in 0..120 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let v = p.vehicle_velocity(id);
+        assert!(v.length() < 0.3, "still sliding at {v}");
+        // On its rims: the wheels' centres (0.35 m up the model) are
+        // their rims' reach above the ground, the tyres' bottoms below it.
+        let rims = 0.35 - 0.35 * WRECK_RIM;
+        let y = p.vehicle_transform(id).unwrap().w_axis.y;
+        assert!((y + rims).abs() < 0.05, "origin at {y}, not {}", -rims);
+        let up = p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
+        assert!(up.y > 0.9, "tipped: {up}");
     }
 
     #[test]
