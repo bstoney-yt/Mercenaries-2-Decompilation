@@ -79,9 +79,10 @@ pub struct Atmosphere {
     /// `Tone_R`, `Tone_G`, `Tone_B`: among the cloud settings (between
     /// `ShadowK` and `LightBlend`), so taken as the clouds' tint.
     pub tone: Vec3,
-    /// `DarknessK`: how fast the clouds darken with their thickness, as
-    /// the game's cloud shader divides their light by `1 + mass * k`
-    /// (which constant feeds it is inferred from its values).
+    /// `DarknessK`: how thick the clouds may grow before they darken: the
+    /// game's cloud shader divides their light by `1 + mass * c`, `c`
+    /// taken as [`CLOUD_MASS`] over this (inferred: the night's 30 must
+    /// darken its clouds more than Guanare's 150 does the town's).
     pub cloud_darkness: f32,
     /// `BloomAmount`, `BloomMultiplier`, `BloomThreshold`,
     /// `BloomBlurRadius` (the radius is not used yet).
@@ -387,7 +388,7 @@ impl Atmosphere {
         // Clouds are lit by the game's formula; `M2_CLOUDS=old` lights
         // them as before.
         lighting.clouds.darkness =
-            (!env_is("M2_CLOUDS", "old")).then_some(self.cloud_darkness * cloud_mass());
+            (!env_is("M2_CLOUDS", "old")).then_some(cloud_mass() / self.cloud_darkness.max(1.0));
         // `M2_CLOUDS=off` leaves the sky to the haze alone.
         lighting.clouds.coverage = if env_is("M2_CLOUDS", "off") {
             0.0
@@ -395,8 +396,11 @@ impl Atmosphere {
             self.coverage
         };
         lighting.clouds.scales = self.cloud_scales;
-        // `M2_CLOUD_FADE=off` runs the deck on to the horizon.
-        lighting.clouds.horizon_fade = !env_is("M2_CLOUD_FADE", "off");
+        // The deck runs on to the horizon, fully opaque where thickest, as
+        // in the town's footage (PC round P); `M2_CLOUD_FADE=on` fades it
+        // out towards the horizon.
+        lighting.clouds.horizon_fade = env_is("M2_CLOUD_FADE", "on");
+        lighting.clouds.opacity = 1.0;
         // `M2_CLOUD_OPACITY` overrides how opaque the thickest cloud is.
         if let Some(o) = std::env::var("M2_CLOUD_OPACITY")
             .ok()
@@ -674,11 +678,11 @@ enum Lit {
     Post,
 }
 
-/// What the clouds' opacity is taken to be of the game's cloud mass, by
-/// which it multiplies `DarknessK`: fitted to the night sky overhead in
-/// footage of the mission's start (PC rounds W to U: at 1 it was half as
-/// bright as footage, at 0.1 half as bright again).
-const CLOUD_MASS: f32 = 0.3;
+/// The game's cloud mass where our clouds are opaque, over `DarknessK`
+/// in the cloud shader's darkening: fitted to the town's cream sky in
+/// footage (PC round P: Guanare's 150 wanted 0.75 to 1.5 there, so the
+/// darkest clouds keep about half their light).
+const CLOUD_MASS: f32 = 110.0;
 
 /// [`CLOUD_MASS`], or `M2_CLOUD_MASS` to fit it by hand.
 fn cloud_mass() -> f32 {
