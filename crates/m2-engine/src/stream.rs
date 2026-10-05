@@ -639,7 +639,13 @@ impl World {
                         .and_then(|m| m.collision.clone().map(|c| (c, m.origin)));
                     let slot = match mesh {
                         Ok(m) if !m.indices.is_empty() => {
-                            Slot::Ready(self.upload_terrain(backend, materials, &m)?)
+                            let (Request::Cell(h)
+                            | Request::Tile(h)
+                            | Request::Model(h)
+                            | Request::Scatter(h)) = request;
+                            let gpu = self.upload_terrain(backend, materials, &m)?;
+                            log_terrain(h, &m, &gpu, materials);
+                            Slot::Ready(gpu)
                         }
                         Ok(_) => Slot::Failed,
                         Err(e) => {
@@ -1130,6 +1136,67 @@ fn ground_material(
         layers: out,
         ground: true,
         ..MaterialDesc::default()
+    }
+}
+
+/// With `M2_LOG_TERRAIN=<hex hash>,...`, prints what a cell or tile
+/// draws: each range's surface, material, whether it blends, triangles and
+/// height span.
+fn log_terrain(hash: u32, mesh: &TerrainMesh, gpu: &TerrainGpu, materials: &MaterialCache) {
+    static WANTED: std::sync::OnceLock<HashSet<u32>> = std::sync::OnceLock::new();
+    let wanted = WANTED.get_or_init(|| {
+        std::env::var("M2_LOG_TERRAIN")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|h| u32::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if !wanted.contains(&hash) {
+        return;
+    }
+    let y = |v: u32| {
+        let at = v as usize * world::TERRAIN_STRIDE + 4;
+        f32::from_le_bytes(mesh.vertices[at..at + 4].try_into().expect("4 bytes"))
+    };
+    eprintln!(
+        "terrain {hash:08x} at {:?}: {} ranges drawn of {}",
+        mesh.origin,
+        gpu.ranges.len(),
+        mesh.ranges.len()
+    );
+    for &(first, count, s) in &mesh.ranges {
+        let tris = &mesh.indices[first as usize..(first + count) as usize];
+        let (lo, hi) = tris
+            .iter()
+            .map(|&v| y(v) + mesh.origin.y)
+            .fold((f32::MAX, f32::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
+        let drawn = gpu.ranges.iter().find(|r| r.0 == first);
+        let what = match &mesh.surfaces[s] {
+            TerrainSurface::Ground {
+                colour_map, layers, ..
+            } => format!(
+                "ground (colour map {colour_map:08x?}, {} layers{})",
+                layers.len(),
+                colour_map
+                    .filter(|&t| !materials.has_texture(t))
+                    .map_or("", |_| ", colour map not loaded")
+            ),
+            TerrainSurface::Surface(m) => format!(
+                "surface {:08x} flags {:04x} textures {:08x?}",
+                m.name_hash, m.flags, m.textures
+            ),
+        };
+        eprintln!(
+            "  {} triangles, y {lo:.1}..{hi:.1}: {what}: {}",
+            count / 3,
+            drawn.map_or("not drawn".to_string(), |r| format!(
+                "material {:?}{}",
+                r.2,
+                if r.3 { ", blends" } else { "" }
+            ))
+        );
     }
 }
 
