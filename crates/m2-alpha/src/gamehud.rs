@@ -9,9 +9,10 @@
 //! need for the first time decoded. Drawing lags play by a frame.
 //!
 //! The minimap is drawn here, as the engine draws its own: the island's
-//! map round her (see [`MAP_TEXTURE`]), turned with the camera, on the
-//! radar's backdrop, with the zones its Flash movie would outline (see
-//! [`Zone`]) and the mission's markers. Not drawn yet: the other Flash
+//! sea round her (see [`MAP_TEXTURE`]), turned with the camera, on the
+//! radar's backdrop, with the island's roads over it ([`road_strokes`]),
+//! the zones its Flash movie would outline (see [`Zone`]), the mission's
+//! markers and her white square. Not drawn yet: the other Flash
 //! pieces (pop-ups), animated sprites and clock wipes. With no aim point
 //! the reticle's widgets are left out ([`reticle_widgets`], by the names
 //! the layout gives them). The ammo the counters show is our own count (see
@@ -25,9 +26,11 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, Mesh, TextureHandle, TextureOptions, pos2};
 use m2_assets::font::FONT_TYPE;
-use m2_assets::minimap::{self, Heights};
+use m2_assets::layer::LAYER_TYPE;
+use m2_assets::minimap::{self, Heights, Road, RoadRecord};
+use m2_assets::path::PATH_TYPE;
 use m2_assets::terrain::LOW_RES_TYPE;
-use m2_assets::{Font, LowResTile, WadArchive, name_hash};
+use m2_assets::{BlockContents, Font, Layer, LowResTile, Path, Placement, WadArchive, name_hash};
 use m2_engine::world::{ISLAND, WorldIndex};
 use m2_engine::{AssetSource, Install, WorldSettings};
 use m2_game::api::Object;
@@ -264,17 +267,23 @@ const MAX_STEP: f64 = 0.25;
 const MAX_TEXTURE: u32 = 2048;
 
 /// The minimap's art: the engine draws the HUD's "VZ" map itself; it is
-/// made from the island-wide map the distant terrain wears, the island
-/// (`ISLAND` metres square, centred on the origin) seen from above with
-/// its roads, `+x` and `+z` towards its left and top edges, recoloured as
-/// the radar shows it (see [`radar_map`]).
+/// made the size of the island-wide map the distant terrain wears, the
+/// island (`ISLAND` metres square, centred on the origin) seen from above,
+/// `+x` and `+z` towards its left and top edges: its sea (see
+/// [`radar_map`]), and the grey of its paved roads tells them from tracks.
 const MAP_TEXTURE: &str = "vz_lrterrain";
 /// The radar's backdrop (its `sBorderTexture`), with the north pointer on
 /// its rim, `BORDER` virtual units across round a minimap 100 across.
 const BORDER_TEXTURE: &str = "global_gui_hud_radar";
 const BORDER: f32 = 154.0 / 100.0;
-/// Her marker in the middle of the minimap.
-const ARROW_TEXTURE: &str = "hud_objective_arrows";
+/// What the radar strokes its dashed roads with: two dashes, white in a
+/// black rim, along 32 × 8 pixels.
+const PATH_TEXTURE: &str = "global_radar_path";
+/// The texture's across (u) through the middle of a dash: a paved road is
+/// stroked with that column alone, solid with the dashes' rim.
+const PATH_SOLID_U: f32 = 3.5 / 32.0;
+/// The texture's across (u) of its first dash, rim to rim.
+const PATH_DASH_U: f32 = 8.0 / 32.0;
 /// Metres from the minimap's centre to its rim when the scripts set none
 /// (`MinimapDataUpdateHandler` sets 150 at a walk, up to 400 at speed).
 const DEFAULT_RANGE: f32 = 150.0;
@@ -743,6 +752,8 @@ struct Thread {
     reticle_logged: bool,
     /// The zones the radar's script holds, as last read.
     zones: Vec<Zone>,
+    /// The island's roads, read with the radar's map.
+    roads: Vec<Road>,
 }
 
 impl Thread {
@@ -812,6 +823,7 @@ impl Thread {
             told: Told::default(),
             reticle_logged: false,
             zones: Vec::new(),
+            roads: Vec::new(),
         })
     }
 
@@ -892,13 +904,16 @@ impl Thread {
                         .sea_level
                         .unwrap_or(WorldSettings::default().sea_level);
                     let image = match radar_map(&mut self.assets, sea) {
-                        Ok(i) => {
+                        Ok((i, roads)) => {
+                            let paved = roads.iter().filter(|r| r.paved).count();
                             log.push(format!(
-                                "radar map: {}x{}, sea at {sea} m, in {:.0?}",
+                                "radar map: {}x{}, sea at {sea} m, {} roads ({paved} paved), in {:.0?}",
                                 i.width,
                                 i.height,
+                                roads.len(),
                                 started.elapsed()
                             ));
+                            self.roads = roads;
                             Some(i)
                         }
                         Err(e) => {
@@ -1311,7 +1326,7 @@ impl Thread {
                         heading: *rotation,
                         range: range.unwrap_or(DEFAULT_RANGE),
                     };
-                    minimap(&view, state, &self.zones, out, want);
+                    minimap(&view, state, &self.zones, &self.roads, out, want);
                 }
             }
             // Not drawn yet (see the module docs).
@@ -1508,10 +1523,14 @@ impl MapView {
     }
 }
 
-/// The radar's map: [`MAP_TEXTURE`] recoloured as the game's radar shows
-/// the island (see [`m2_assets::minimap`]), the sea where the
-/// low-resolution terrain lies under `sea_level`.
-fn radar_map(assets: &mut AssetSource<BufReader<File>>, sea_level: f32) -> Result<Image, String> {
+/// The radar's map, island-wide as [`MAP_TEXTURE`] is laid (and as many
+/// pixels across): the sea where the low-resolution terrain lies under
+/// `sea_level`, the land clear (see [`m2_assets::minimap`]). With it the
+/// island's roads, those [`MAP_TEXTURE`] shows grey paved.
+fn radar_map(
+    assets: &mut AssetSource<BufReader<File>>,
+    sea_level: f32,
+) -> Result<(Image, Vec<Road>), String> {
     let texture = assets
         .texture(name_hash(MAP_TEXTURE), MAX_TEXTURE)
         .map_err(|e| e.to_string())?;
@@ -1526,11 +1545,98 @@ fn radar_map(assets: &mut AssetSource<BufReader<File>>, sea_level: f32) -> Resul
         let tile = LowResTile::parse(&data).map_err(|e| format!("tile {hash:08x}: {e}"))?;
         heights.add_tile(&tile, centre.to_array());
     }
-    Ok(Image {
-        width: texture.width,
-        height: texture.height,
-        rgba: minimap::radar_map(rgba, width, height, &heights, sea_level),
-    })
+    let pixel = |p: [f32; 2]| {
+        let [u, v] = map_uv(p);
+        let (x, y) = ((u * width as f32).floor(), (v * height as f32).floor());
+        (x >= 0.0 && y >= 0.0 && (x as usize) < width && (y as usize) < height).then(|| {
+            let i = (y as usize * width + x as usize) * 4;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        })
+    };
+    let roads = road_network(assets)?
+        .into_iter()
+        .map(|points| {
+            let paved = minimap::paved_share(&points, pixel) >= minimap::PAVED_SHARE;
+            Road::new(points, paved)
+        })
+        .collect();
+    Ok((
+        Image {
+            width: texture.width,
+            height: width as u32,
+            rgba: minimap::radar_map(&heights, sea_level),
+        },
+        roads,
+    ))
+}
+
+/// The island's roads: each `Road` entity's centreline (see
+/// [`minimap::centreline`]), from every layer but the hidden ones and the
+/// missions' (`vz_hidden`, `vz_state_...`).
+fn road_network(assets: &mut AssetSource<BufReader<File>>) -> Result<Vec<Vec<[f32; 2]>>, String> {
+    let index = assets.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .filter(|&b| {
+            let path = &index.blocks()[b].path;
+            !path.contains("vz_hidden") && !path.contains("vz_state_")
+        })
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    // Roads name the intersections at their ends, which may be placed in
+    // another layer: gather every layer's first.
+    let mut placed: HashMap<u32, Placement> = HashMap::new();
+    let mut records: Vec<(RoadRecord, Placement)> = Vec::new();
+    for b in blocks {
+        let decoded = assets.block(b).map_err(|e| e.to_string())?;
+        let contents = BlockContents::parse(&decoded).map_err(|e| e.to_string())?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            let places = layer.placements();
+            if let Some(c) = layer.component("Road") {
+                for (id, rec) in c.records().unwrap_or_default() {
+                    if let (Some(r), Some(p)) = (RoadRecord::parse(rec), places.get(&id)) {
+                        records.push((r, *p));
+                    }
+                }
+            }
+            placed.extend(places);
+        }
+    }
+    let mut paths: HashMap<u32, Option<Path>> = HashMap::new();
+    let mut roads = Vec::with_capacity(records.len());
+    for (r, p) in records {
+        let path = paths
+            .entry(r.path)
+            .or_insert_with(|| {
+                assets
+                    .asset(r.path, PATH_TYPE)
+                    .ok()
+                    .and_then(|d| Path::parse(&d).ok())
+            })
+            .as_ref();
+        let Some(path) = path.filter(|p| !p.points.is_empty()) else {
+            continue;
+        };
+        let ends = r.ends.map(|id| {
+            (id != 0)
+                .then(|| placed.get(&id))
+                .flatten()
+                .map(|q| [q.position[0], q.position[2]])
+        });
+        let line = minimap::centreline(&path.points, p.position, p.rotation, ends);
+        roads.push(line);
+    }
+    Ok(roads)
 }
 
 /// The map texture's coordinates of world `(x, z)`.
@@ -1540,11 +1646,13 @@ fn map_uv([x, z]: [f32; 2]) -> [f32; 2] {
 
 /// The minimap's quads: the radar's backdrop with north on its rim, the
 /// island's map round her in the circle, the zones of the radar's movie,
-/// the objective markers (at the rim when farther) and her arrow.
+/// the roads over it, the objective markers (at the rim when farther) and
+/// her marker.
 fn minimap(
     view: &MapView,
     state: &HudState,
     zones: &[Zone],
+    roads: &[Road],
     out: &mut Vec<Prim>,
     want: &mut Vec<u32>,
 ) {
@@ -1582,6 +1690,7 @@ fn minimap(
             colour: white,
         });
     }
+    road_strokes(view, roads, out, want);
     // The movie's zones over the map (it is laid over the minimap, the
     // same size): its lines one of its 256 pixels across.
     let disc: Vec<[f32; 2]> = (0..SIDES)
@@ -1610,16 +1719,114 @@ fn minimap(
         let c = colour.map(|v| f32::from(v) / 255.0);
         out.push(quad(Some(hash), [x - s, y - s, x + s, y + s], full, c, 0.0));
     }
-    let arrow = name_hash(ARROW_TEXTURE);
-    want.push(arrow);
-    let (w, h) = (r * 0.09, r * 0.18);
+    // Her: a white square, upright whichever way she faces (the map turns
+    // with the camera, not with her).
+    let s = r * minimap::PLAYER_SIZE / 2.0;
     out.push(quad(
-        Some(arrow),
-        [cx - w, cy - h, cx + w, cy + h],
+        None,
+        [cx - s, cy - s, cx + s, cy + s],
         full,
         white,
-        view.heading - state.facing,
+        0.0,
     ));
+}
+
+/// The roads on the minimap, inside its rim: strokes [`ROAD_WIDTH`] of its
+/// radius across, the paved solid and the tracks dashed, a [`DASH`] of
+/// road and a [`DASH_GAP`] by turns, counted along each road from its
+/// start.
+///
+/// [`ROAD_WIDTH`]: minimap::ROAD_WIDTH
+/// [`DASH`]: minimap::DASH
+/// [`DASH_GAP`]: minimap::DASH_GAP
+fn road_strokes(view: &MapView, roads: &[Road], out: &mut Vec<Prim>, want: &mut Vec<u32>) {
+    let centre = view.centre();
+    let r = view.radius();
+    let half = r * minimap::ROAD_WIDTH / 2.0;
+    let colour = minimap::ROAD.map(|v| f32::from(v) / 255.0);
+    let texture = name_hash(PATH_TEXTURE);
+    want.push(texture);
+    let period = minimap::DASH + minimap::DASH_GAP;
+    let at = [view.player[0], view.player[2]];
+    for road in roads.iter().filter(|road| road.near(at, view.range)) {
+        // Metres along the road, for its dashes to run on unbroken.
+        let mut along = 0.0;
+        for pair in road.points.windows(2) {
+            let ([ax, az], [bx, bz]) = (pair[0], pair[1]);
+            let metres = (bx - ax).hypot(bz - az);
+            let start = along;
+            along += metres;
+            let (a, _) = view.screen(ax, az);
+            let (b, _) = view.screen(bx, bz);
+            let Some((t0, t1)) = clip_to_disc(a, b, centre, r) else {
+                continue;
+            };
+            let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+            if length < 1e-3 || metres < 1e-3 {
+                continue;
+            }
+            let (nx, ny) = (
+                -(b[1] - a[1]) / length * half,
+                (b[0] - a[0]) / length * half,
+            );
+            // A stroke from `t` to `t'` of the way along, the texture
+            // across from `u` to `u'`.
+            let mut stroke = |(t, u): (f32, f32), (t2, u2): (f32, f32)| {
+                let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+                let q = [a[0] + (b[0] - a[0]) * t2, a[1] + (b[1] - a[1]) * t2];
+                out.push(Prim {
+                    texture: Some(texture),
+                    corners: [
+                        [p[0] + nx, p[1] + ny],
+                        [q[0] + nx, q[1] + ny],
+                        [q[0] - nx, q[1] - ny],
+                        [p[0] - nx, p[1] - ny],
+                    ],
+                    uv: [[u, 0.0], [u2, 0.0], [u2, 1.0], [u, 1.0]],
+                    colour,
+                });
+            };
+            if road.paved {
+                stroke((t0, PATH_SOLID_U), (t1, PATH_SOLID_U));
+                continue;
+            }
+            // Each dash takes the texture's first, rounded end to end.
+            let (s0, s1) = (start + metres * t0, start + metres * t1);
+            let mut k = (s0 / period).floor();
+            while k * period < s1 {
+                let (d0, d1) = (k * period, k * period + minimap::DASH);
+                let (from, to) = (d0.max(s0), d1.min(s1));
+                if from < to {
+                    let t = |s: f32| (s - start) / metres;
+                    let u = |s: f32| (s - d0) / minimap::DASH * PATH_DASH_U;
+                    stroke((t(from), u(from)), (t(to), u(to)));
+                }
+                k += 1.0;
+            }
+        }
+    }
+}
+
+/// The part of segment `a b` inside the disc round `centre` of radius
+/// `r`: from and to (0..=1 along it), or None if it misses.
+fn clip_to_disc(a: [f32; 2], b: [f32; 2], centre: [f32; 2], r: f32) -> Option<(f32, f32)> {
+    // |a + t (b - a) - centre|² = r², solved for t.
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let (fx, fy) = (a[0] - centre[0], a[1] - centre[1]);
+    let qa = dx * dx + dy * dy;
+    let qb = 2.0 * (fx * dx + fy * dy);
+    let qc = fx * fx + fy * fy - r * r;
+    if qa < 1e-12 {
+        return (qc <= 0.0).then_some((0.0, 1.0));
+    }
+    let disc = qb * qb - 4.0 * qa * qc;
+    if disc < 0.0 {
+        return None;
+    }
+    let root = disc.sqrt();
+    let t0 = ((-qb - root) / (2.0 * qa)).max(0.0);
+    let t1 = ((-qb + root) / (2.0 * qa)).min(1.0);
+    (t0 < t1).then_some((t0, t1))
 }
 
 /// A region on the radar, as the mission's scripts put it there
@@ -2158,6 +2365,22 @@ mod tests {
         );
         // The map's corners: +x and +z at its left and top.
         assert_eq!(map_uv([ISLAND / 2.0, ISLAND / 2.0]), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn roads_are_cut_at_the_minimap_rim() {
+        // Across the middle of a disc of radius 10 from well outside it.
+        let (t0, t1) = clip_to_disc([-20.0, 0.0], [20.0, 0.0], [0.0, 0.0], 10.0).unwrap();
+        assert!((t0 - 0.25).abs() < 1e-5 && (t1 - 0.75).abs() < 1e-5);
+        // Wholly inside, and wholly outside.
+        assert_eq!(
+            clip_to_disc([-1.0, 0.0], [1.0, 0.0], [0.0, 0.0], 10.0),
+            Some((0.0, 1.0))
+        );
+        assert_eq!(
+            clip_to_disc([-20.0, 15.0], [20.0, 15.0], [0.0, 0.0], 10.0),
+            None
+        );
     }
 
     #[test]
