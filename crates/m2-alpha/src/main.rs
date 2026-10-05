@@ -60,6 +60,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
+use m2_engine::physics::PLANE_SPEED;
 use m2_engine::{Gait, Install, WorldSettings};
 use m2_render::gpu::WgpuBackend;
 use m2_render::{DrawQueue, RenderBackend};
@@ -104,6 +105,9 @@ struct Options {
     throw: bool,
     /// With `--screenshot` on foot: bash just before it.
     bash: bool,
+    /// With `--bash`: the clip (by hash) to bash with, rather than the one
+    /// chosen.
+    bash_clip: Option<u32>,
     /// With `--jump`, `--throw` or `--bash`: seconds before the picture she
     /// starts.
     lead: Option<f32>,
@@ -222,6 +226,13 @@ fn parse_args() -> anyhow::Result<Options> {
             "--jump" => o.jump = true,
             "--throw" => o.throw = true,
             "--bash" => o.bash = true,
+            "--bash-clip" => {
+                let v = value()?;
+                o.bash_clip = Some(
+                    u32::from_str_radix(v.trim_start_matches("0x"), 16)
+                        .context("--bash-clip expects a clip's hash (8 hex digits)")?,
+                );
+            }
             "--lead" => o.lead = Some(value()?.parse().context("--lead expects seconds")?),
             "--fight" => o.fight = true,
             "--blast" => o.blast = true,
@@ -743,6 +754,25 @@ fn screenshot(
                     p.facing = face;
                 }
             }
+            // The bash clip asked for, with its blow's time.
+            if let (Some(want), Some(p)) = (options.bash_clip, game.scene.player.as_mut())
+                && i == 0
+            {
+                let found = p.model.as_ref().and_then(|(_, rig)| {
+                    let c = rig.clips.iter().position(|c| c.hash == want)?;
+                    let at = rig.clips[c]
+                        .clip
+                        .events
+                        .iter()
+                        .find(|e| e.name.eq_ignore_ascii_case("meleebash"))
+                        .map_or(0.37, |e| e.time);
+                    Some((c, at))
+                });
+                match found {
+                    Some(clip) => p.clips.bash = Some(clip),
+                    None => eprintln!("--bash-clip {want:08x}: she has no such clip"),
+                }
+            }
             // A jump takes the picture on the way up (by default), a
             // throw with the grenade still in her hand; aiming, the
             // weapon comes up for the last second.
@@ -1115,9 +1145,12 @@ fn mission_for_screenshot(
     let picture = |name: String| out.with_file_name(format!("{stem}-{name}.ppm"));
     let mut pictured: HashSet<u32> = HashSet::new();
     let mut down: Vec<(u32, usize, m2_math::glam::Vec3, m2_math::glam::Vec3)> = Vec::new();
-    // And the start's boat from the chase camera five seconds after she
-    // is seated in it (`-boat`), and her three seconds after she gets out
-    // of it (`-ashore`): the tick each is due.
+    // And the start's boat from the chase camera once it planes (round
+    // 89's, five seconds after she was seated, caught it barely moving),
+    // or twenty seconds after she is seated if it never does (`-boat`),
+    // and her three seconds after she gets out of it (`-ashore`): the
+    // tick she was seated and the tick each picture is due.
+    let mut seated: Option<u32> = None;
     let mut boat_shot: Option<u32> = None;
     let mut ashore_shot: Option<u32> = None;
     for i in 0..(seconds / tick).round() as u32 {
@@ -1192,15 +1225,26 @@ fn mission_for_screenshot(
                 .and_then(|v| game.scene.vehicles.get(v))
                 .is_some_and(|v| v.spec.is_boat());
             if in_boat {
-                boat_shot.get_or_insert(i + (5.0 / tick) as u32);
-            } else if boat_shot.is_some() {
+                let since = *seated.get_or_insert(i);
+                let planing = game.driving().is_some_and(|(_, s)| s >= PLANE_SPEED);
+                if boat_shot.is_none() && (planing || i >= since + (20.0 / tick) as u32) {
+                    boat_shot = Some(i);
+                }
+            } else if seated.is_some() {
                 ashore_shot.get_or_insert(i + (3.0 / tick) as u32);
             }
             for (due, name) in [(boat_shot, "boat"), (ashore_shot, "ashore")] {
                 if due == Some(i) {
                     render(backend, game, fov, aspect, None)?;
                     write_ppm(backend, &picture(name.into()))?;
-                    eprintln!("autoplay: pictured {name} at {:.1}", game.focus());
+                    match game.driving() {
+                        Some((_, speed)) => eprintln!(
+                            "autoplay: pictured {name} at {:.1} going {speed:.1} m/s, {:.1} s after she was seated",
+                            game.focus(),
+                            (i - seated.unwrap_or(i)) as f32 * tick
+                        ),
+                        None => eprintln!("autoplay: pictured {name} at {:.1}", game.focus()),
+                    }
                 }
             }
         }

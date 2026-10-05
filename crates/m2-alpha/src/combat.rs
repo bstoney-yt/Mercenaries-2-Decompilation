@@ -389,6 +389,23 @@ pub struct Strike {
     pub key: Option<StaticKey>,
 }
 
+/// Rounds she has picked up for her weapons: the play keeps no ammunition
+/// of its own yet, so these only add to what the HUD counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Picked {
+    pub rifle: u32,
+    pub rockets: u32,
+}
+
+impl Picked {
+    pub fn add(&mut self, weapon: Weapon, rounds: u32) {
+        match weapon {
+            Weapon::Rifle => self.rifle += rounds,
+            Weapon::Rpg => self.rockets += rounds,
+        }
+    }
+}
+
 /// Something that happened to her worth a word from her.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Remark {
@@ -467,6 +484,8 @@ pub struct Combat {
     pub went_off: Vec<Vec3>,
     /// Blows and rounds that struck the world in the last step.
     pub struck: Vec<Strike>,
+    /// Rounds she has picked up, for the HUD's counters.
+    pub picked: Picked,
     /// The last rocket: from the launcher, towards what the crosshair was on.
     pub last_launch: Option<(Vec3, Vec3)>,
     /// Blasts about to go off (something explosive caught): where, and
@@ -499,6 +518,7 @@ impl Default for Combat {
             last_blast: None,
             went_off: Vec::new(),
             struck: Vec::new(),
+            picked: Picked::default(),
             last_launch: None,
             fuses: Vec::new(),
             fires: Vec::new(),

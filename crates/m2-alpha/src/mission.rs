@@ -35,8 +35,9 @@ use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
+use crate::combat::Weapon;
 use crate::config::Config;
-use crate::flights::{Copter, Load};
+use crate::flights::{Copter, Load, Pickup};
 use crate::game::{Game, get_out, place};
 use crate::scene::NOT_DRIVABLE;
 
@@ -262,9 +263,41 @@ impl MissionLink {
                 mission.arrived(r.pilot, r.to.to_array());
             }
         }
-        // A crate she broke open is destroyed for the scripts too.
-        for (g, at) in scene.flights.take_broken() {
-            eprintln!("mission: crate {g:#x} broken open at {at:.1}");
+        // A crate she broke open is destroyed for the scripts too, and
+        // leaves what its template says it held (no script spawns it).
+        for (g, at, yaw) in scene.flights.take_broken() {
+            let name = mission
+                .world()
+                .borrow()
+                .objects
+                .get(&g)
+                .map(|o| o.name.clone());
+            let left = name
+                .as_deref()
+                .zip(scene.world.as_ref())
+                .and_then(|(name, w)| leaves(&w.index.template_db, name, g, at, yaw));
+            match left {
+                Some(p) => {
+                    eprintln!(
+                        "mission: crate {g:#x} broken open at {at:.1}: it leaves {} ({:#x}), model {}, \
+                         giving {}",
+                        scene
+                            .world
+                            .as_ref()
+                            .and_then(|w| w.index.template_db.by_id(p.template))
+                            .map_or("?", |t| t.0),
+                        p.template,
+                        p.model.map_or("none".into(), |m| format!("{m:08x}")),
+                        p.gives.map_or("her nothing".into(), |(w, n)| format!(
+                            "{n} rounds for her {w:?}"
+                        )),
+                    );
+                    scene.flights.leave(p);
+                }
+                None => {
+                    eprintln!("mission: crate {g:#x} broken open at {at:.1}: it leaves nothing")
+                }
+            }
             mission.kill(g);
         }
         // The vehicle she was seated in never came: ashore instead.
@@ -1168,6 +1201,47 @@ pub(crate) fn template_models(
     }
 }
 
+/// Her weapons by their models (the AK and RPG she carries), for the
+/// pickups that give their ammunition.
+const WEAPON_MODELS: [(&str, Weapon); 2] = [
+    ("global_weapon_ak47", Weapon::Rifle),
+    ("global_weapon_rpg", Weapon::Rpg),
+];
+
+/// What the scripts' object `name` (guid `from`, a supply crate) leaves
+/// where it stood (`at`, turned `yaw`) once destroyed: the pickup its
+/// template's `SpawnOnDeath` names, giving the rounds of one of her
+/// weapons when its ammunition is one of theirs (a template with that
+/// weapon's model fires it).
+fn leaves(templates: &Templates, name: &str, from: u32, at: Vec3, yaw: f32) -> Option<Pickup> {
+    let left = *templates.leavings.spawns.get(&templates.id(name)?)?;
+    let info = templates.leavings.pickups.get(&left)?;
+    let fires = |weapon: &str, ammo: u32| {
+        let model = name_hash(weapon);
+        templates.leavings.ammo.iter().any(|(&w, &a)| {
+            a == ammo
+                && templates
+                    .by_id(w)
+                    .is_some_and(|(_, t)| t.model == Some(model))
+        })
+    };
+    let gives = info.ammo.and_then(|ammo| {
+        WEAPON_MODELS
+            .iter()
+            .find(|(m, _)| fires(m, ammo))
+            .map(|&(_, w)| (w, info.rounds))
+    });
+    Some(Pickup {
+        from,
+        template: left,
+        model: templates.by_id(left).and_then(|(_, t)| t.model),
+        at,
+        yaw,
+        reach: info.radius,
+        gives,
+    })
+}
+
 /// The models one of the scripts' objects drives as
 /// ([`template_models`]): by its name, else (a state layer's renamed
 /// entity, the first contract's `VzaCon001_StartingBoat`) by the template
@@ -1259,6 +1333,61 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_supply_crate_leaves_rockets_for_her_rpg() {
+        use m2_engine::pickup::{Leavings, PickupInfo};
+        let info = |model| TemplateInfo {
+            model,
+            vehicle: None,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let (crate_id, rockets, rpg, missile) =
+            (0x8000_9ae9, 0x8000_56dc, 0x8000_437b, 0x8000_4379);
+        let pickup = PickupInfo {
+            radius: 1.0,
+            ammo: Some(missile),
+            rounds: 20,
+            cue: None,
+            effect: None,
+        };
+        let db = Templates {
+            by_name: HashMap::from([
+                ("supply drop (gl)".to_owned(), info(Some(0x81c7_1c96))),
+                ("ammo pickup (rocket)".to_owned(), info(Some(0x8e77_a04d))),
+                ("rpg".to_owned(), info(Some(name_hash("global_weapon_rpg")))),
+            ]),
+            names: HashMap::from([
+                (crate_id, "Supply Drop (GL)".to_owned()),
+                (rockets, "Ammo Pickup (Rocket)".to_owned()),
+                (rpg, "RPG".to_owned()),
+            ]),
+            leavings: Leavings {
+                spawns: HashMap::from([(crate_id, rockets)]),
+                pickups: HashMap::from([(rockets, pickup)]),
+                ammo: HashMap::from([(rpg, missile)]),
+            },
+            ..Templates::default()
+        };
+        let at = Vec3::new(-1472.6, -35.2, 2677.0);
+        let left = leaves(&db, "Supply Drop (GL) 0x40000001", 0x4000_0001, at, 0.5)
+            .expect("the crate leaves its pickup");
+        assert_eq!(left.template, rockets);
+        assert_eq!(left.model, Some(0x8e77_a04d));
+        assert_eq!((left.at, left.yaw, left.reach), (at, 0.5, 1.0));
+        assert_eq!(left.gives, Some((Weapon::Rpg, 20)));
+        // Ammunition for no weapon of hers gives her nothing; a template
+        // that leaves nothing, nothing at all.
+        let mut db = db;
+        db.leavings.ammo.clear();
+        assert_eq!(
+            leaves(&db, "Supply Drop (GL)", 1, at, 0.0).unwrap().gives,
+            None
+        );
+        assert!(leaves(&db, "RPG", 1, at, 0.0).is_none());
+    }
+
+    #[test]
     fn templates_find_their_vehicles() {
         let catalogue = [
             entry(1, "truck", "gr_veh_truck_m151"),
@@ -1312,8 +1441,7 @@ mod tests {
                     info(None, Some(VehicleKind::Car)),
                 ),
             ]),
-            names: HashMap::new(),
-            tuning: HashMap::new(),
+            ..Templates::default()
         };
         let models = |n: &str| -> Vec<(u32, String)> {
             template_models(n, &db, &catalogue)

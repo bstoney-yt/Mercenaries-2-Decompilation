@@ -30,6 +30,8 @@ m2-alpha [options]
                          just before the picture
   --bash                 with --screenshot on the island: a melee bash just
                          before the picture
+  --bash-clip <hash>     with --bash: bash with this clip (one of those the
+                         "player meleebash clips:" line lists)
   --lead <s>             with --jump, --throw or --bash: seconds before the
                          picture she starts (default 0.2)
   --fight                with --screenshot on the island: shoot the nearest

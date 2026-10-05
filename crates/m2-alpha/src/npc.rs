@@ -83,6 +83,10 @@ pub(crate) enum Brain {
     Wander { home: Vec3, target: Vec3, wait: f32 },
 }
 
+/// A clip carrying an event: its index, when in it the event comes, and
+/// how far its first pose is from the rifle held ready.
+pub type Carrying = (usize, f32, f32);
+
 /// The clips a fight plays, indices into every human rig's clips (they
 /// share one list). Clips are named only by hash; these were picked by
 /// looking at each pose, or by the events they carry (a jump's
@@ -156,21 +160,9 @@ impl FightClips {
         // Of the clips carrying `event`, the one starting nearest the rifle
         // held ready, and when in it the event comes.
         let by_event = |event: &str| {
-            rig.clips
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| {
-                    let at = c
-                        .clip
-                        .events
-                        .iter()
-                        .find(|e| e.name.eq_ignore_ascii_case(event))?
-                        .time;
-                    let off = ready.map_or(0.0, |r| c.posture_distance_to(&rig.clips[r]));
-                    Some((i, at, off))
-                })
-                .min_by(|a, b| a.2.total_cmp(&b.2))
-                .map(|(i, at, _)| (i, at))
+            Self::carrying(rig, event, ready)
+                .first()
+                .map(|&(i, at, _)| (i, at))
         };
         Self {
             aim: find(Self::AIM),
@@ -185,6 +177,35 @@ impl FightClips {
             bash: by_event(Self::BASH),
             bash_low: by_event(Self::BASH_LOW),
         }
+    }
+
+    /// The clips carrying `event`: each one's index, when in it the event
+    /// comes, and how far its first pose is from the rifle held ready
+    /// (clip `ready`), nearest first.
+    fn carrying(rig: &Rig, event: &str, ready: Option<usize>) -> Vec<Carrying> {
+        let mut list: Vec<Carrying> = rig
+            .clips
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let at = c
+                    .clip
+                    .events
+                    .iter()
+                    .find(|e| e.name.eq_ignore_ascii_case(event))?
+                    .time;
+                let off = ready.map_or(0.0, |r| c.posture_distance_to(&rig.clips[r]));
+                Some((i, at, off))
+            })
+            .collect();
+        list.sort_by(|a, b| a.2.total_cmp(&b.2));
+        list
+    }
+
+    /// The clips carrying a bash's events, high and low ([`carrying`](Self::carrying)).
+    pub fn by_posture(rig: &Rig) -> [(&'static str, Vec<Carrying>); 2] {
+        let ready = rig.clips.iter().position(|c| c.hash == Self::READY);
+        [Self::BASH, Self::BASH_LOW].map(|e| (e, Self::carrying(rig, e, ready)))
     }
 
     /// Every clip, for rebinding.

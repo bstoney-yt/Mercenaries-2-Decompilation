@@ -815,6 +815,21 @@ impl Scene {
                 named(clips.bash),
                 named(clips.bash_low)
             );
+            // Every clip with a blow, by how near its start is to the
+            // rifle held ready (for `--bash-clip`).
+            for (event, list) in npc::FightClips::by_posture(rig) {
+                let shown: Vec<String> = list
+                    .iter()
+                    .map(|&(i, at, off)| {
+                        let c = &rig.clips[i];
+                        format!(
+                            "{:08x} ({:.2} s, {at:.2}, off {off:.2})",
+                            c.hash, c.info.duration
+                        )
+                    })
+                    .collect();
+                eprintln!("player {event} clips: {}", shown.join(", "));
+            }
         }
         self.people.clips = clips;
         let mut player = Player::new(x, z, 0.0, model);

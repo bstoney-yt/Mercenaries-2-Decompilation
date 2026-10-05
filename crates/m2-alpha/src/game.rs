@@ -493,6 +493,22 @@ impl Game {
                     1.2,
                 );
             }
+            // What a broken crate left, taken as she walks up to it.
+            if player.driving.is_none() {
+                for p in scene.flights.take(player.character.position) {
+                    if let Some((weapon, rounds)) = p.gives {
+                        self.combat.picked.add(weapon, rounds);
+                    }
+                    eprintln!(
+                        "pickup: she takes {:#x} at {:.1}{}",
+                        p.template,
+                        p.at,
+                        p.gives.map_or(String::new(), |(w, n)| format!(
+                            ": {n} rounds for her {w:?}"
+                        ))
+                    );
+                }
+            }
         }
         self.scene.tick(dt);
     }
