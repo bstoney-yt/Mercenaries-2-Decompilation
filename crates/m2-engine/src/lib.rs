@@ -22,6 +22,7 @@ pub mod physics;
 pub mod scatter;
 pub mod stream;
 pub mod technique;
+pub mod tuning;
 pub mod vehicle;
 pub mod world;
 
@@ -35,5 +36,6 @@ pub use physics::{
 };
 pub use stream::{Frustum, World, WorldSettings, WorldStats};
 pub use technique::Technique;
-pub use vehicle::{Catalogue, CatalogueEntry, PersonModel, VehicleSpec};
+pub use tuning::VehicleTuning;
+pub use vehicle::{Catalogue, CatalogueEntry, PersonModel, Rest, VehicleSpec};
 pub use world::{TemplateInfo, TemplatePlacement, Templates, VehicleKind, WorldIndex};
