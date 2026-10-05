@@ -318,14 +318,15 @@ impl Atmosphere {
         // `M2_LIGHTING=linear` sums the light in linear light, with the
         // sun's colour taken as linear, as before, for comparison.
         lighting.gamma_light = gamma_light();
-        // `M2_SUN=full` leaves `LightIntensity` out of the sun's colour, to
-        // try that reading: at Guanare's 0.3 the town's sunlit walls are no
-        // brighter than its shaded ones, against about 2.5 times in footage.
-        // `M2_SUN=surface` does so for surfaces only, the sky's haze and
-        // clouds lit as before (with it left out the night sky was half as
-        // bright again as footage).
+        // `LightIntensity` dims the sky's light, its haze and clouds, but
+        // not the sun on surfaces: in the sun's colour, at Guanare's 0.3
+        // the town's sunlit road was 1.2 times as bright as its shadow
+        // against 1.4 to 2.8 in footage, and without it 1.5; left out of
+        // the sky too, the night sky was half as bright again as footage
+        // (PC rounds A and W). Inferred. `M2_SUN=li` puts it in the sun's
+        // colour throughout, `M2_SUN=full` nowhere.
         let mode = std::env::var("M2_SUN").unwrap_or_default();
-        let full = mode == "full" || mode == "surface";
+        let full = mode != "li";
         let intensity = if full { 1.0 } else { self.light_intensity };
         let sun = self.light_color * intensity;
         lighting.sun_color = if lighting.gamma_light {
@@ -335,7 +336,7 @@ impl Atmosphere {
         };
         lighting.haze = self.haze();
         lighting.clouds.tone = self.tone;
-        if mode == "surface" {
+        if mode != "li" && mode != "full" {
             let li = self.light_intensity.max(0.0);
             let sky = if lighting.gamma_light {
                 li.powf(GAMMA)
@@ -349,8 +350,10 @@ impl Atmosphere {
         // (inferred from the names).
         lighting.bloom = self.bloom[0] * self.bloom[1];
         lighting.bloom_threshold = self.bloom[2];
-        // `M2_CLOUDS=game` lights the clouds by the game's formula.
-        lighting.clouds.darkness = env_is("M2_CLOUDS", "game").then_some(self.cloud_darkness);
+        // Clouds are lit by the game's formula; `M2_CLOUDS=old` lights
+        // them as before.
+        lighting.clouds.darkness =
+            (!env_is("M2_CLOUDS", "old")).then_some(self.cloud_darkness * cloud_mass());
         lighting.clouds.coverage = self.coverage;
         lighting.clouds.scales = self.cloud_scales;
         lighting.clouds.wind = self.wind;
@@ -615,6 +618,23 @@ const MIE: Vec3 = Vec3::new(5.75e-3, 7.39e-3, 1.045e-2);
 enum Lit {
     Light,
     Post,
+}
+
+/// What the clouds' opacity is taken to be of the game's cloud mass, by
+/// which it multiplies `DarknessK`: fitted, as the night sky overhead
+/// came out less than half as bright as footage taking them as equal
+/// (PC round W), and the town's sky near black.
+const CLOUD_MASS: f32 = 0.1;
+
+/// [`CLOUD_MASS`], or `M2_CLOUD_MASS` to fit it by hand.
+fn cloud_mass() -> f32 {
+    static MASS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *MASS.get_or_init(|| {
+        std::env::var("M2_CLOUD_MASS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(CLOUD_MASS)
+    })
 }
 
 /// Whether environment variable `name` is set to `value`.
