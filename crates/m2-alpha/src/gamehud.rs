@@ -279,11 +279,13 @@ else
 end
 "#;
 /// The satellite view's help, in the tutorial box as the PC footage has
-/// it (its own `Satellite Help` text stays blank): steering the view and
-/// confirming the target, by the game's own two lines (`[move] Move view`,
-/// `[confirm] Confirm target`, by their keys' hashes); then the PC's
-/// prompt for the timing wheel (`Press [pfire] at the right time.`).
-const VIEW_HELP: &str = "[0x23fb33d9][n][0x3bfec0b6]";
+/// it (its own `Satellite Help` text stays blank): what the first
+/// contract's own tutorial lines say there (`Net.SetTutorialMessage`):
+/// steering the view and confirming the target (`[move] Move view`,
+/// `[pfire] Confirm target`), then the PC's prompt for the timing wheel
+/// (`Press [pfire] at the right time.`). For a view opened without the
+/// mission's scripts; with them, their line.
+const VIEW_HELP: &str = "[Tutorial.MoveCamera][n][SHELL.PCShell.Tutorial_ConfirmTarget_PC]";
 const WHEEL_HELP: &str = "[SHELL.PCShell.Tutorial_SatMinigame_PC]";
 /// Seconds of play the scripts are given at most per frame.
 const MAX_STEP: f64 = 0.25;
@@ -1252,12 +1254,13 @@ impl Thread {
             // the readout and puts the faction's badge away.
             fire(lua, "SatelliteTargetUpdate", lua.create_table()?)?;
         }
-        // The tutorial box: the satellite's help while its view is open,
-        // else the mission's line.
-        let tutorial = match (sup.satellite, &sup.wheel) {
-            (Some(_), Some(_)) => Some(WHEEL_HELP.to_owned()),
-            (Some(_), None) => Some(VIEW_HELP.to_owned()),
-            (None, _) => s.tutorial.clone(),
+        // The tutorial box: the mission's line; with none, the satellite's
+        // help while its view is open.
+        let tutorial = match (&s.tutorial, sup.satellite, &sup.wheel) {
+            (Some(line), _, _) => Some(line.clone()),
+            (None, Some(_), Some(_)) => Some(WHEEL_HELP.to_owned()),
+            (None, Some(_), None) => Some(VIEW_HELP.to_owned()),
+            (None, None, _) => None,
         };
         // Never up yet: nothing to put away (putting it away starts its
         // closing, whose end would fold up the next line's header).
