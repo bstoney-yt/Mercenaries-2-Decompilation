@@ -887,6 +887,20 @@ impl GpuModel {
                 cpu.hash, m.name_hash, m.flags, m.textures
             );
         }
+        // `M2_LOG_FOLIAGE=on`: which models draw plain grey for want of
+        // their base texture.
+        if std::env::var("M2_LOG_FOLIAGE").as_deref() == Ok("on") {
+            for m in &cpu.materials {
+                if m.flags & flags::HIDDEN == 0
+                    && base_texture(m).is_none_or(|t| materials.texture(t).is_none())
+                {
+                    eprintln!(
+                        "foliage untextured: model {:08x} material {:08x} (flags {:04x}, textures {:08x?}), bounds {:.1?}",
+                        cpu.hash, m.name_hash, m.flags, m.textures, cpu.bounds
+                    );
+                }
+            }
+        }
         let mut pieces = Vec::with_capacity(cpu.pieces.len());
         for p in &cpu.pieces {
             let vertex_buffer = backend.create_vertex_buffer(&p.vertex_desc, Some(&p.vertices))?;

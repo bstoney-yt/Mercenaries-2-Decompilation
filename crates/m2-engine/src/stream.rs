@@ -419,6 +419,9 @@ pub struct World {
     pub physics: Physics,
     /// Updates so far, for the foliage log.
     updates: u64,
+    /// `M2_HIDE=<model>,<model>...`: placed models by these names aren't
+    /// drawn, to find which model a stray shape on screen is.
+    hidden: HashSet<u32>,
 }
 
 /// `M2_LOG_FOLIAGE=on`: logs the scatter meshes as they load and, every
@@ -492,6 +495,12 @@ impl World {
             knocked: HashMap::new(),
             physics: Physics::new(),
             updates: 0,
+            hidden: std::env::var("M2_HIDE")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|n| !n.is_empty())
+                .map(m2_assets::name_hash)
+                .collect(),
         };
         // Every tile, so the whole island shows from the start.
         let mut tiles: Vec<u32> = world.index.tiles.keys().copied().collect();
@@ -1086,7 +1095,10 @@ impl World {
                 for &i in self.objects.get(&(bx, bz)).map_or(&[][..], Vec::as_slice) {
                     let o = &self.index.objects[i];
                     let d = o.position.distance(eye);
-                    if d > if o.named { props } else { reach } || self.knocked.contains_key(&i) {
+                    if d > if o.named { props } else { reach }
+                        || self.knocked.contains_key(&i)
+                        || self.hidden.contains(&o.model)
+                    {
                         continue;
                     }
                     if let Some(Slot::Ready(m)) = self.models.get(&o.model)
@@ -1193,7 +1205,10 @@ impl World {
     /// placed objects by name stem (how many, loaded, failed, drawn by
     /// range, nearest), then the named entities that place nothing.
     fn log_foliage(&self, eye: Vec3) {
-        const NEAR: f32 = 300.0;
+        let near_env = std::env::var("M2_LOG_FOLIAGE_NEAR")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let radius: f32 = near_env.unwrap_or(300.0);
         let names = &self.index.names;
         let stem = |e: u32| {
             names.get(&e).map_or("?".to_owned(), |(n, _, _)| {
@@ -1202,10 +1217,14 @@ impl World {
         };
         // stem -> count, ready, failed, in reach, nearest, size
         let mut placed: HashMap<String, (usize, usize, usize, usize, f32, f32)> = HashMap::new();
+        let mut shapes: HashMap<String, (u32, (Vec3, Vec3))> = HashMap::new();
         for o in &self.index.objects {
             let d = o.position.distance(eye);
-            if d > NEAR {
+            if d > radius {
                 continue;
+            }
+            if let Some(Slot::Ready(m)) = self.models.get(&o.model) {
+                shapes.insert(stem(o.entity), (o.model, m.bounds));
             }
             let e = placed
                 .entry(stem(o.entity))
@@ -1232,15 +1251,16 @@ impl World {
         let mut placed: Vec<_> = placed.into_iter().collect();
         placed.sort_by_key(|p| std::cmp::Reverse(p.1.0));
         eprintln!(
-            "foliage at {:.0},{:.0},{:.0}: {} stems placed within {NEAR} m",
+            "foliage at {:.0},{:.0},{:.0}: {} stems placed within {radius} m",
             eye.x,
             eye.y,
             eye.z,
             placed.len()
         );
         for (s, (n, ready, failed, reach, near, size)) in placed.iter().take(60) {
+            let (model, bounds) = shapes.get(s).copied().unwrap_or_default();
             eprintln!(
-                "foliage placed {s}: {n} (ready {ready}, failed {failed}, in reach {reach}) nearest {near:.0} m size {size:.1} m"
+                "foliage placed {s}: {n} (ready {ready}, failed {failed}, in reach {reach}) nearest {near:.0} m size {size:.1} m model {model:08x} bounds {bounds:.1?}"
             );
         }
         // stem, how -> count, nearest, asset type
@@ -1253,7 +1273,7 @@ impl World {
                 continue;
             };
             let d = m.position.distance(eye);
-            if d > NEAR {
+            if d > radius {
                 continue;
             }
             let u = unplaced
