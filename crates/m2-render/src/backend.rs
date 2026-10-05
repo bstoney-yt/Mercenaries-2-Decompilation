@@ -193,6 +193,10 @@ pub struct Clouds {
     pub wind: [f32; 2],
     /// Scale on the clouds' colour.
     pub tone: Vec3,
+    /// Light the clouds as the game's cloud shader does, by the sun alone
+    /// through a forward-scattering phase, divided by `1 + mass * this`;
+    /// `None` keeps the earlier sun-and-sky lighting.
+    pub darkness: Option<f32>,
 }
 
 impl Default for Clouds {
@@ -203,6 +207,7 @@ impl Default for Clouds {
             scales: [1.0; 3],
             wind: [1.0, 0.0],
             tone: Vec3::ONE,
+            darkness: None,
         }
     }
 }
