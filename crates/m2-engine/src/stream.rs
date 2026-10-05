@@ -1166,10 +1166,11 @@ fn log_terrain(hash: u32, mesh: &TerrainMesh, gpu: &TerrainGpu, materials: &Mate
         f32::from_le_bytes(mesh.vertices[at..at + 4].try_into().expect("4 bytes"))
     };
     eprintln!(
-        "terrain {hash:08x} at {:?}: {} ranges drawn of {}",
+        "terrain {hash:08x} at {:?}: {} ranges drawn of {}, {} triangles turned round",
         mesh.origin,
         gpu.ranges.len(),
-        mesh.ranges.len()
+        mesh.ranges.len(),
+        mesh.flipped
     );
     for &(first, count, s) in &mesh.ranges {
         let tris = &mesh.indices[first as usize..(first + count) as usize];
