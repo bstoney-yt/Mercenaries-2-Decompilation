@@ -784,8 +784,10 @@ struct Piece {
     topology: Topology,
     /// Per range, its batch member (empty: not a batch).
     members: Vec<u16>,
-    /// Per range, whether its material could be a vehicle's track (cut out
-    /// and two-sided, as tracks' are).
+    /// Per range, whether its material could be a vehicle's track: cut
+    /// out, as tracks' are (the AMX-30's are two-sided as well, the
+    /// M1A1's not). A model's coarser levels of detail aren't uploaded, so
+    /// a cut-out LOD material isn't drawn with them.
     track: Vec<bool>,
     centre: Vec3,
     bones: Vec<u16>,
@@ -852,10 +854,9 @@ impl GpuModel {
                     .ranges
                     .iter()
                     .map(|&(_, _, m)| {
-                        cpu.materials.get(m).is_some_and(|m| {
-                            m.flags & (flags::CUT_OUT | flags::TWO_SIDED)
-                                == flags::CUT_OUT | flags::TWO_SIDED
-                        })
+                        cpu.materials
+                            .get(m)
+                            .is_some_and(|m| m.flags & flags::CUT_OUT != 0)
                     })
                     .collect(),
                 // Kept in geometry space, so any transform places it.

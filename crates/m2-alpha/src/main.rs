@@ -599,6 +599,13 @@ fn screenshot(
         ms[2],
         ms[3]
     );
+    // Props still loading take up to their upload budget of a frame's
+    // streaming time.
+    let (shown, loaded, loading, waiting, failed) = game.scene.props.counts();
+    eprintln!(
+        "props: {shown} shown, {loaded} models loaded, {loading} loading, \
+         {waiting} waiting, {failed} failed"
+    );
     let people = &game.scene.people;
     eprintln!(
         "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",
