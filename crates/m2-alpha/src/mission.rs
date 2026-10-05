@@ -919,6 +919,7 @@ mod tests {
             vehicle,
             engine: None,
             person: false,
+            human: false,
         };
         let db = Templates {
             by_name: HashMap::from([
