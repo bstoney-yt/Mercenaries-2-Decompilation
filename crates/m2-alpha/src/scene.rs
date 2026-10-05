@@ -426,6 +426,8 @@ pub struct ParkedVehicle {
     /// How far its turret is turned from straight ahead, radians
     /// (anticlockwise from above).
     pub turret: f32,
+    /// How far its gun is raised, radians (down is negative).
+    pub gun: f32,
     /// How far it has rolled, metres (backwards less), for turning a
     /// tracked vehicle's road wheels.
     pub rolled: f32,
@@ -465,7 +467,8 @@ pub enum Loaded {
     /// stands (position, yaw), its spec and model.
     WorldVehicle(u32, Vec3, f32, VehicleSpec, CpuModel),
     Catalogue(Catalogue),
-    Person(PersonModel, CpuModel, Skeleton),
+    /// A person's model: a role's, or a story character's (true).
+    Person(PersonModel, CpuModel, Skeleton, bool),
     /// A hand weapon: name, model, muzzle (model space).
     Weapon(&'static str, CpuModel, Vec3),
 }
@@ -522,29 +525,32 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                 let data = source.model(p.model)?;
                 let cpu = CpuModel::from_data(&data, 0)?;
                 let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
-                if tx.send(Loaded::Person(p.clone(), cpu, skeleton)).is_err() {
+                if tx
+                    .send(Loaded::Person(p.clone(), cpu, skeleton, false))
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
+            let mut weapons = Vec::new();
             for &(name, hash) in &found.weapons {
                 let data = source.model(hash)?;
                 let model = data.parse()?;
                 let muzzle = m2_assets::vehicle::marker(&model, combat::MUZZLE)
                     .map_or(Vec3::new(0.0, 0.0, model.info.bounds.max[2]), Vec3::from);
+                let (lo, hi) = (model.info.bounds.min, model.info.bounds.max);
+                weapons.push(format!(
+                    "{name} {hash:08x} ({:.2} x {:.2} x {:.2} m)",
+                    hi[0] - lo[0],
+                    hi[1] - lo[1],
+                    hi[2] - lo[2]
+                ));
                 let cpu = CpuModel::build(hash, &model, 0);
                 if tx.send(Loaded::Weapon(name, cpu, muzzle)).is_err() {
                     return Ok(());
                 }
             }
-            eprintln!(
-                "weapons: {}",
-                found
-                    .weapons
-                    .iter()
-                    .map(|(n, h)| format!("{n} {h:08x}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            eprintln!("weapons: {}", weapons.join(", "));
             let all = &found.vehicles;
             let drivable: Vec<&CatalogueEntry> = all
                 .iter()
@@ -795,12 +801,45 @@ impl Scene {
         );
     }
 
+    /// Loads the first of `models` that drives, to be parked near the
+    /// player as the vehicles she starts with are.
+    pub fn load_parked(&self, models: Vec<CatalogueEntry>) {
+        self.load_vehicle_as(models, "parked vehicle".into(), Loaded::Vehicle);
+    }
+
     /// Loads one of the game's own parked vehicles, layer entity `entity`
     /// standing at `at` facing `yaw`, from the first of `models` that
     /// drives.
     pub fn load_world_vehicle(&self, entity: u32, at: Vec3, yaw: f32, models: Vec<CatalogueEntry>) {
         self.load_vehicle_as(models, format!("vehicle {entity:#x}"), move |spec, cpu| {
             Loaded::WorldVehicle(entity, at, yaw, spec, cpu)
+        });
+    }
+
+    /// Loads a story character's model (`Carmona`'s, by their template)
+    /// on a thread; it joins the people's kinds as `template`.
+    fn load_character(&self, model: u32, template: String) {
+        let Some(install) = self.install.clone() else {
+            return;
+        };
+        let tx = self.requests.0.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut source = install.open_world()?;
+                let data = source.model(model)?;
+                let cpu = CpuModel::from_data(&data, 0)?;
+                let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
+                let person = PersonModel {
+                    model,
+                    role: template.clone(),
+                    soldier: false,
+                };
+                let _ = tx.send(Loaded::Person(person, cpu, skeleton, true));
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("{template} ({model:08x}): {e:#}");
+            }
         });
     }
 
@@ -852,9 +891,17 @@ impl Scene {
         if let Ok(loaded) = self.requests.1.try_recv() {
             self.take(backend, loaded)?;
         }
+        for (model, template) in std::mem::take(&mut self.people.wanted) {
+            self.load_character(model, template);
+        }
         if let (Some(world), Some(source)) = (&mut self.world, &mut self.source) {
-            self.props
-                .update(backend, &mut self.materials, source, &mut world.physics)?;
+            self.props.update(
+                backend,
+                &mut self.materials,
+                source,
+                &mut world.physics,
+                eye,
+            )?;
         }
         Ok(())
     }
@@ -881,46 +928,58 @@ impl Scene {
             Loaded::Vehicle(_, cpu)
             | Loaded::MissionVehicle(_, _, cpu)
             | Loaded::WorldVehicle(_, _, _, _, cpu)
-            | Loaded::Person(_, cpu, _)
+            | Loaded::Person(_, cpu, _, _)
             | Loaded::Weapon(_, cpu, _) => cpu,
         };
         self.materials
             .load_textures(backend, source, cpu.texture_hashes().collect::<Vec<_>>())?;
         let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
+        // What its template says of its handling and its gun: its own
+        // (the mission's `AMX30 (Full)`), else its model's.
+        let tune = |spec: VehicleSpec| {
+            let t = self
+                .world
+                .as_ref()
+                .and_then(|w| w.index.template_db.tuning_for(&spec.label, spec.model));
+            spec.tuned(t)
+        };
         match loaded {
             Loaded::Catalogue(_) => {}
             Loaded::Vehicle(spec, _) => self.vehicles.push(ParkedVehicle {
-                spec,
+                spec: tune(spec),
                 model,
                 id: None,
                 wrecked: false,
                 guid: None,
                 spot: None,
                 turret: 0.0,
+                gun: 0.0,
                 rolled: 0.0,
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
                 self.vehicles.push(ParkedVehicle {
-                    spec,
+                    spec: tune(spec),
                     model,
                     id: None,
                     wrecked: false,
                     guid: Some(guid),
                     spot: None,
                     turret: 0.0,
+                    gun: 0.0,
                     rolled: 0.0,
                 });
             }
             Loaded::WorldVehicle(entity, at, yaw, spec, _) => {
                 self.vehicles.push(ParkedVehicle {
-                    spec,
+                    spec: tune(spec),
                     model,
                     id: None,
                     wrecked: false,
                     guid: None,
                     spot: Some((entity, at, yaw)),
                     turret: 0.0,
+                    gun: 0.0,
                     rolled: 0.0,
                 });
             }
@@ -932,7 +991,7 @@ impl Scene {
                     .map(|(_, rig)| rig);
                 self.arsenal.add(name, model, muzzle, rig);
             }
-            Loaded::Person(p, _, skeleton) => {
+            Loaded::Person(p, _, skeleton, named) => {
                 // Her clips fit every human skeleton.
                 let template = self
                     .player
@@ -950,6 +1009,7 @@ impl Scene {
                         self.people.add_kind(PersonKind {
                             role: p.role,
                             soldier: p.soldier,
+                            named,
                             model,
                             rig,
                         });
@@ -1011,9 +1071,12 @@ impl Scene {
                 let Some(at) = world.physics.vehicle_transform(id) else {
                     continue;
                 };
-                let nodes =
-                    v.spec
-                        .posed_nodes(&world.physics.vehicle_wheels(id), v.rolled, v.turret);
+                let nodes = v.spec.posed_nodes(
+                    &world.physics.vehicle_wheels(id),
+                    v.rolled,
+                    v.turret,
+                    v.gun,
+                );
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
             }
         }

@@ -47,11 +47,20 @@ const FLASH_TIME: f32 = 0.05;
 const RIFLE_FLASH: f32 = 0.3;
 const RPG_FLASH: f32 = 0.7;
 const MG_FLASH: f32 = 0.45;
-const CANNON_FLASH: f32 = 2.2;
-/// Vehicle guns: a tank's cannon (seconds to reload, shell speed m/s)
-/// and the machine gun on anything else with a turret (seconds between
-/// rounds, damage, range). Invented, like the rest of the rules.
+/// A tank's main gun: a plume and a fireball about as wide as its turret,
+/// burning as long as its template's muzzle flash (0.3 s for the AMX-30's,
+/// as in the Xbox 360 playthrough) or this long.
+const CANNON_FLASH: f32 = 5.0;
+const CANNON_FIREBALL: f32 = 1.6;
+const CANNON_FLASH_TIME: f32 = 0.3;
+/// Vehicle guns: a tank's cannon (seconds to reload, shell speed m/s,
+/// where its template gives no rate of fire or ammunition) and the
+/// machine gun on anything else with a turret (seconds between rounds,
+/// damage, range). Invented, like the rest of the rules.
 const CANNON_RELOAD: f32 = 2.5;
+/// A turret's gun fires at the crosshair when it points within this of
+/// it, radians; else along its barrel.
+const LAID: f32 = 0.06;
 const SHELL_SPEED: f32 = 150.0;
 const MG_GAP: f32 = 0.09;
 const MG_DAMAGE: f32 = 45.0;
@@ -345,6 +354,8 @@ pub enum Sound {
     Shot(Vec3),
     Launch(Vec3),
     Explosion(Vec3),
+    /// A tank's main gun.
+    Cannon(Vec3),
 }
 
 /// Something that happened to her worth a word from her.
@@ -551,6 +562,14 @@ impl Combat {
         })
     }
 
+    /// Tank shells in flight (drawn as streaks, not models).
+    pub fn shells(&self) -> usize {
+        self.projectiles
+            .iter()
+            .filter(|p| matches!(p, Projectile::Rocket { shell: true, .. }))
+            .count()
+    }
+
     /// Where blasts went off since sounds were last taken.
     pub fn explosions(&self) -> impl Iterator<Item = Vec3> + '_ {
         self.sounds.iter().filter_map(|s| match s {
@@ -678,12 +697,26 @@ impl Combat {
     }
 
     /// Where shots start and the way the crosshair points: along the
-    /// camera's line from where it passes her, so walls and slopes between
-    /// the camera and her don't stop them.
+    /// crosshair's line from where it passes her, so walls and slopes
+    /// between the camera and her don't stop them.
     fn aim_ray(player: &Player) -> (Vec3, Vec3) {
-        let (eye, dir) = (player.eye(), player.camera_forward());
+        let (eye, dir) = (player.eye(), player.aim_forward());
         let past = (player.character.position - eye).dot(dir).max(0.0);
         (eye + dir * past, dir)
+    }
+
+    /// The point the crosshair is on (or a long way off along it), seen
+    /// past vehicle `own`.
+    pub fn aim_point(
+        physics: &Physics,
+        people: &People,
+        player: &Player,
+        own: Option<VehicleId>,
+    ) -> Vec3 {
+        let (eye, dir) = Self::aim_ray(player);
+        let far =
+            cast_shot(physics, people, eye, dir, MG_RANGE, None, own).map_or(MG_RANGE, |h| h.0);
+        eye + dir * far
     }
 
     /// What a shot fired now would hit: the distance, and the person if
@@ -911,17 +944,33 @@ impl Combat {
             return;
         };
         let cannon = v.spec.kind == "tank";
-        let from =
-            body.transform_point3(v.spec.turret_transform(v.turret).transform_point3(muzzle));
-        let (eye, dir) = Self::aim_ray(f.player);
-        let goal = cast_shot(f.physics, f.people, eye, dir, MG_RANGE, None, Some(id))
-            .map_or(eye + dir * MG_RANGE, |h| eye + dir * h.0);
-        let aim = (goal - from).normalize_or(dir);
+        let gun = v.spec.tuning.gun;
+        let (from, barrel) = v
+            .spec
+            .muzzle_pose(v.turret, v.gun)
+            .unwrap_or((muzzle, Vec3::Z));
+        let (from, barrel) = (
+            body.transform_point3(from),
+            body.transform_vector3(barrel).normalize_or(Vec3::Z),
+        );
+        let goal = Self::aim_point(f.physics, f.people, f.player, Some(id));
+        // At the crosshair once the gun is laid on it; until then, where
+        // the barrel points.
+        let to_goal = (goal - from).normalize_or(barrel);
+        let aim = if to_goal.angle_between(barrel) <= LAID {
+            to_goal
+        } else {
+            barrel
+        };
         if cannon {
-            self.reload = CANNON_RELOAD;
+            // Its template's rate of fire (45 a minute for the AMX-30's)
+            // and shell speed (72 m/s).
+            self.reload = gun.map_or(CANNON_RELOAD, |g| 60.0 / g.rate_of_fire.max(1.0));
+            let speed = gun.map_or(SHELL_SPEED, |g| g.velocity.max(1.0));
+            let burn = gun.and_then(|g| g.flash).unwrap_or(CANNON_FLASH_TIME);
             self.projectiles.push(Projectile::Rocket {
                 at: from,
-                velocity: aim * SHELL_SPEED,
+                velocity: aim * speed,
                 flown: 0.0,
                 shell: true,
                 owner: Some(id),
@@ -932,7 +981,14 @@ impl Combat {
                     dir: aim,
                     size: CANNON_FLASH,
                 },
-                FLASH_TIME * 2.0,
+                burn,
+            );
+            self.effect(
+                Effect::Fire {
+                    at: from + aim * 0.8,
+                    size: CANNON_FIREBALL,
+                },
+                burn,
             );
             self.effect(
                 Effect::Smoke {
@@ -941,7 +997,7 @@ impl Combat {
                 },
                 1.5,
             );
-            self.sounds.push(Sound::Launch(from));
+            self.sounds.push(Sound::Cannon(from));
         } else {
             self.reload = MG_GAP;
             let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
@@ -1357,11 +1413,7 @@ mod tests {
         assert!(player.landed && people.npcs.iter().all(|n| n.landed));
         // Crosshair on the near soldier's chest.
         let chest = people.npcs[0].chest();
-        for _ in 0..4 {
-            let to = chest - player.eye();
-            player.yaw = to.x.atan2(to.z);
-            player.pitch = (to.y / to.length()).asin();
-        }
+        player.aim_crosshair_at(chest);
         let arsenal = Arsenal::default();
         let mut vehicles = Vec::new();
         let mut combat = Combat::default();
@@ -1484,11 +1536,7 @@ mod tests {
             player.update(&physics, Default::default(), dt);
         }
         let chest = people.npcs[0].chest();
-        for _ in 0..4 {
-            let to = chest - player.eye();
-            player.yaw = to.x.atan2(to.z);
-            player.pitch = (to.y / to.length()).asin();
-        }
+        player.aim_crosshair_at(chest);
         let hit = Combat::aim_probe(&physics, &people, &player);
         assert!(
             matches!(hit, Some((_, Some(0)))),

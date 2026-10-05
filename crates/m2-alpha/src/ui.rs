@@ -31,6 +31,9 @@ pub struct HudInfo {
     /// Driving: the vehicle's name and speed (m/s), and whether it is
     /// wrecked.
     pub driving: Option<(String, f32, bool)>,
+    /// The point the crosshair is on: on foot, or driving a vehicle with
+    /// a gun.
+    pub crosshair: Option<Vec3>,
     /// A vehicle in reach to get into.
     pub can_enter: Option<String>,
     /// Shown while the island or its people are still loading.
@@ -119,6 +122,7 @@ impl Hud {
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
+        state.reticle = reticle(info);
         game.update(&self.ctx, state);
     }
 
@@ -134,6 +138,7 @@ impl Hud {
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
+        state.reticle = reticle(info);
         let step = 1.0 / 30.0;
         game.update_and_wait(
             &self.ctx,
@@ -243,6 +248,22 @@ pub fn headless_input(width: u32, height: u32, time: f64) -> RawInput {
         time: Some(time),
         ..RawInput::default()
     }
+}
+
+/// Where the reticle goes: the crosshair's point on the screen, -1..=1
+/// across and up it. None while she is down, aims at nothing (in a
+/// vehicle without a gun) or the point is behind the camera.
+fn reticle(info: &HudInfo) -> Option<[f32; 2]> {
+    if info.down {
+        return None;
+    }
+    let (at, vp) = info.crosshair.zip(info.view_proj)?;
+    let clip = vp * at.extend(1.0);
+    if clip.w <= 0.01 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some([ndc.x.clamp(-1.0, 1.0), ndc.y.clamp(-1.0, 1.0)])
 }
 
 /// The mission's markers, for the game HUD's minimap.
@@ -392,6 +413,14 @@ fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
                 18.0,
                 white,
             );
+            // Its gun's crosshair, where the gun aims.
+            if let Some(at) = info
+                .crosshair
+                .zip(info.view_proj)
+                .and_then(|(p, vp)| to_screen(vp, p, screen))
+            {
+                crosshair(painter, at);
+            }
         }
         None => {
             let weapon = match info.weapon {
@@ -405,18 +434,14 @@ fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
                 18.0,
                 white,
             );
+            // Where she aims, a little above the middle.
             if !info.down {
-                // Crosshair.
-                let c = screen.center();
-                let stroke = Stroke::new(2.0, Color32::from_white_alpha(220));
-                for (a, b) in [
-                    (vec2(-12.0, 0.0), vec2(-4.0, 0.0)),
-                    (vec2(4.0, 0.0), vec2(12.0, 0.0)),
-                    (vec2(0.0, -12.0), vec2(0.0, -4.0)),
-                    (vec2(0.0, 4.0), vec2(0.0, 12.0)),
-                ] {
-                    painter.line_segment([c + a, c + b], stroke);
-                }
+                let at = info
+                    .crosshair
+                    .zip(info.view_proj)
+                    .and_then(|(p, vp)| to_screen(vp, p, screen))
+                    .unwrap_or(screen.center());
+                crosshair(painter, at);
             }
         }
     }
@@ -484,6 +509,19 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             14.0,
             colour,
         );
+    }
+}
+
+/// A crosshair centred on `c`.
+fn crosshair(painter: &egui::Painter, c: egui::Pos2) {
+    let stroke = Stroke::new(2.0, Color32::from_white_alpha(220));
+    for (a, b) in [
+        (vec2(-12.0, 0.0), vec2(-4.0, 0.0)),
+        (vec2(4.0, 0.0), vec2(12.0, 0.0)),
+        (vec2(0.0, -12.0), vec2(0.0, -4.0)),
+        (vec2(0.0, 4.0), vec2(0.0, 12.0)),
+    ] {
+        painter.line_segment([c + a, c + b], stroke);
     }
 }
 
@@ -573,6 +611,26 @@ mod tests {
     }
 
     #[test]
+    fn the_reticle_goes_where_she_aims() {
+        let vp = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 100.0);
+        let mut info = HudInfo {
+            crosshair: Some(Vec3::new(0.0, 0.0, -10.0)),
+            view_proj: Some(vp),
+            ..HudInfo::default()
+        };
+        let [x, y] = reticle(&info).unwrap();
+        assert!(x.abs() < 1e-5 && y.abs() < 1e-5);
+        // Above the camera's line: up the screen.
+        info.crosshair = Some(Vec3::new(0.0, 2.0, -10.0));
+        assert!(reticle(&info).unwrap()[1] > 0.1);
+        info.down = true;
+        assert_eq!(reticle(&info), None);
+        info.down = false;
+        info.crosshair = None;
+        assert_eq!(reticle(&info), None);
+    }
+
+    #[test]
     fn hud_and_menu_lay_out() {
         let mut hud = Hud::new();
         let mut config = Config::default();
@@ -580,6 +638,7 @@ mod tests {
             playing: true,
             hp: 40.0,
             driving: Some(("global_veh_hondacrx".into(), 12.0, false)),
+            crosshair: Some(Vec3::new(0.0, 1.0, -40.0)),
             mission: Some(MissionView {
                 objectives: vec!["VzaCon001 objective 1".into()],
                 markers: vec![(

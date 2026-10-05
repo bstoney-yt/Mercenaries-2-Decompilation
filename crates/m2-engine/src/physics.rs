@@ -114,12 +114,14 @@ impl CollisionShape {
         let mut triangles = Vec::new();
         if let Some(p) = phy2.and_then(|d| Phy2::parse(d).ok()) {
             for (k, s) in p.shapes.iter().enumerate() {
-                // A shape is in its body node's space.
-                let to_model = p
+                // A shape sits at its part's place in its body node's
+                // space.
+                let node = p
                     .shape_node(k)
                     .and_then(|n| u16::try_from(n).ok())
                     .and_then(|n| model.node_to_model(n))
                     .unwrap_or(Mat4::IDENTITY);
+                let to_model = node * p.shape_place(k).map_or(Mat4::IDENTITY, place);
                 let (v, t) = s.geometry.triangles(s.radius);
                 let first = vertices.len() as u32;
                 vertices.extend(v.iter().map(|&x| to_model.transform_point3(Vec3::from(x))));
@@ -172,6 +174,18 @@ impl CollisionShape {
     }
 }
 
+/// A `PHY2` part's place (position, rotation x y z w) as a matrix; a
+/// rotation that isn't one counts as none.
+fn place((position, rotation): ([f32; 3], [f32; 4])) -> Mat4 {
+    let q = Quat::from_array(rotation);
+    let q = if q.is_finite() && q.length() > 0.5 {
+        q.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    Mat4::from_rotation_translation(q, Vec3::from(position))
+}
+
 /// What a static collider belongs to, so it can be removed with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StaticKey {
@@ -211,6 +225,16 @@ const WRECK_FRICTION: f32 = 0.9;
 const WRECK_RIM: f32 = 0.7;
 /// How fast tracks turn a hull standing still, radians per second.
 const TRACK_TURN: f32 = 0.9;
+/// Top speeds, m/s, forwards (for a vehicle whose template gives none)
+/// and backwards.
+const TOP_SPEED: f32 = 30.0;
+const REVERSE_SPEED: f32 = 8.0;
+/// The steepest hill a vehicle takes about as fast as the flat, radians,
+/// wheeled and tracked: uphill the engine pulls as a lower gear would
+/// (invented; the playthrough's jeep and tank take the hill roads at
+/// speed). Steeper than this, it slows and in the end slides back.
+const CLIMB: f32 = 0.52;
+const CLIMB_TRACKED: f32 = 0.61;
 
 /// A vehicle in the physics world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -234,6 +258,8 @@ struct VehicleBody {
     steers: Vec<bool>,
     /// On tracks: turns on the spot instead of steering wheels.
     tracked: bool,
+    /// Top speed forwards, m/s.
+    top: f32,
     /// Wrecked: nothing drives it any more.
     wrecked: bool,
 }
@@ -454,7 +480,7 @@ impl Physics {
         position: Vec3,
         rotation: Quat,
     ) -> VehicleId {
-        let (lo, hi) = spec.bounds;
+        let (lo, hi) = spec.hull;
         // The hull clears the ground by the wheels' lower half.
         let floor = spec
             .wheels
@@ -495,6 +521,15 @@ impl Physics {
             ))
             .friction(0.6);
         self.world.insert_collider(collider, Some(body));
+        // The turret on top, adding nothing to the mass the hull carries.
+        if let Some((lo, hi)) = spec.turret_box {
+            let half = ((hi - lo) * 0.5).max(Vec3::splat(0.1));
+            let turret = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
+                .translation(vector((lo + hi) * 0.5))
+                .density(0.0)
+                .friction(0.6);
+            self.world.insert_collider(turret, Some(body));
+        }
 
         let mut controller = DynamicRayCastVehicleController::new(body);
         controller.index_up_axis = 1;
@@ -525,6 +560,7 @@ impl Physics {
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tracked: spec.tracked,
+            top: spec.tuning.max_speed.unwrap_or(TOP_SPEED),
             wrecked: false,
         }));
         id
@@ -552,14 +588,29 @@ impl Physics {
         };
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
+        // How steeply its nose points up (the sine).
+        let nose = self
+            .world
+            .bodies
+            .get(v.controller.chassis)
+            .map_or(0.0, |b| (b.position().rotation * r::Vector::Z).y);
         // A wheel's brake is the most impulse it may take off per step:
         // this many m/s² over the whole vehicle.
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
         let throttle = controls.throttle.clamp(-1.0, 1.0);
         let against = speed.abs() > 0.5 && throttle * speed < 0.0;
-        // Accelerates at about 4 m/s² flat out, slower near top speed.
-        let top = if throttle >= 0.0 { 30.0 } else { 8.0 };
+        // Accelerates at about 4 m/s² flat out, slower near top speed;
+        // backs up at half its top speed, at most 8 m/s.
+        let top = if throttle >= 0.0 {
+            v.top
+        } else {
+            (v.top * 0.5).min(REVERSE_SPEED)
+        };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
+        // Uphill (the way it is driven), the pull that holds it as on the
+        // flat, up to its steepest hill.
+        let most = if v.tracked { CLIMB_TRACKED } else { CLIMB };
+        let uphill = (nose * throttle.signum()).clamp(0.0, most.sin());
         let (force, brake) = if controls.parked {
             let hard = if speed.abs() > PARKED_FAST {
                 HOLD
@@ -572,7 +623,8 @@ impl Physics {
         } else if against {
             (0.0, slowing(SERVICE_BRAKE * throttle.abs()))
         } else if throttle != 0.0 {
-            (throttle * v.mass * 4.0 * headroom / wheels, 0.0)
+            let pull = 4.0 * headroom + GRAVITY * uphill;
+            (throttle * v.mass * pull / wheels, 0.0)
         } else if speed.abs() < 1.0 {
             (0.0, slowing(HOLD))
         } else {
@@ -635,6 +687,21 @@ impl Physics {
             .unwrap_or_default()
     }
 
+    /// How many of a vehicle's wheels touch the ground, of how many.
+    pub fn vehicle_contacts(&self, id: VehicleId) -> (usize, usize) {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or((0, 0), |v| {
+                let wheels = v.controller.wheels();
+                let down = wheels
+                    .iter()
+                    .filter(|w| w.raycast_info().is_in_contact)
+                    .count();
+                (down, wheels.len())
+            })
+    }
+
     /// A vehicle's velocity, m/s.
     pub fn vehicle_velocity(&self, id: VehicleId) -> Vec3 {
         self.vehicles
@@ -675,9 +742,10 @@ impl Physics {
         };
         body.set_linear_damping(WRECK_DAMPING);
         body.set_angular_damping(WRECK_DAMPING);
-        // The hull, which stopped at the wheels' centres, reaches down to
-        // the rims and drags on the ground.
-        for &h in body.colliders() {
+        // The hull (the first collider; a turret's comes after), which
+        // stopped at the wheels' centres, reaches down to the rims and
+        // drags on the ground.
+        for &h in body.colliders().iter().take(1) {
             let Some(c) = self.world.colliders.get_mut(h) else {
                 continue;
             };
@@ -1227,6 +1295,13 @@ mod tests {
             turret: Vec::new(),
             pivot: None,
             muzzle: None,
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
+            hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
+            turret_box: None,
+            tuning: crate::VehicleTuning::default(),
         }
     }
 
@@ -1259,6 +1334,50 @@ mod tests {
         }
         let up = p.vehicle_transform(id).unwrap().transform_vector3(Vec3::Y);
         assert!(up.y > 0.7, "rolled: {up}");
+    }
+
+    // Up a 20° hill from a standstill, a car gets going about as it does
+    // on the flat (a hill road in the playthrough is taken at speed).
+    #[test]
+    fn cars_climb_a_steep_hill_at_speed() {
+        let mut p = Physics::new();
+        let half = 200.0;
+        let v = [
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(-half, 0.0, half),
+        ];
+        let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        // Rising to +z.
+        let slope = 20f32.to_radians();
+        p.add_static(
+            StaticKey::Cell(1),
+            &shape,
+            Vec3::ZERO,
+            Quat::from_rotation_x(-slope),
+        );
+        p.step(DT);
+        let spec = car();
+        let ground = |at: Vec3| {
+            p.cast_ray(Vec3::new(at.x, 80.0, at.z), Vec3::NEG_Y, 200.0)
+                .map(|(d, _)| 80.0 - d)
+        };
+        let rest = spec.rest_on(Vec3::ZERO, 0.0, ground).unwrap();
+        let id = p.add_vehicle_turned(&spec, rest.position + Vec3::Y * 0.2, rest.rotation);
+        for _ in 0..360 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        // It crawled at 2 m/s before the engine pulled harder uphill.
+        let speed = p.vehicle_speed(id);
+        assert!(speed > 12.0, "{speed} m/s");
     }
 
     #[test]

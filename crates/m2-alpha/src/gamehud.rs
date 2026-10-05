@@ -133,6 +133,11 @@ pub struct HudState {
     /// Objective markers for the minimap: where, icon (`deliverable`...),
     /// colour (RGBA).
     pub blips: Vec<([f32; 3], String, [u8; 4])>,
+    /// Where the reticle goes: the screen point her weapon (or her
+    /// vehicle's gun) aims at, -1..=1 across and up the screen as
+    /// `Gui.GetReticlePosition` answers. None hides it (down, or in a
+    /// vehicle without a gun).
+    pub reticle: Option<[f32; 2]>,
 }
 
 impl HudState {
@@ -517,7 +522,12 @@ struct Told {
     ammo: Option<[u32; 5]>,
     vehicle: Option<Option<String>>,
     target: Option<Option<(i32, i32)>>,
+    reticle: Option<Option<[f32; 2]>>,
 }
+
+/// How far (in -1..=1 screen units, across plus up) the aim point moves
+/// before the reticle is moved.
+const RETICLE_STEP: f32 = 0.002;
 
 struct Thread {
     mission: Mission,
@@ -526,6 +536,8 @@ struct Thread {
     /// Textures tried (sent, or found missing).
     tried: HashSet<u32>,
     told: Told,
+    /// The reticle's widgets were listed in the log.
+    reticle_logged: bool,
 }
 
 impl Thread {
@@ -585,6 +597,7 @@ impl Thread {
             fonts,
             tried: HashSet::new(),
             told: Told::default(),
+            reticle_logged: false,
         })
     }
 
@@ -607,9 +620,24 @@ impl Thread {
         log.extend(self.mission.take_log());
         // The scripts' own commands (sounds, camera) are not the HUD's.
         let _ = self.mission.take_commands();
+        // No aim point: the reticle's widgets are left out.
+        let hidden = match state.reticle {
+            Some(_) => HashSet::new(),
+            None => reticle_widgets(&screen.borrow()),
+        };
+        if !hidden.is_empty() && !self.reticle_logged {
+            self.reticle_logged = true;
+            let s = screen.borrow();
+            let mut names: Vec<&str> = hidden
+                .iter()
+                .filter_map(|&id| s.widget(id).map(|w| w.name.as_str()))
+                .collect();
+            names.sort_unstable();
+            log.push(format!("reticle hidden: {}", names.join(", ")));
+        }
         let mut prims = Vec::new();
         let mut want = Vec::new();
-        for item in &items {
+        for item in items.iter().filter(|i| !hidden.contains(&widget_of(i))) {
             self.prims(item, state, &mut prims, &mut want);
         }
         let mut images = Vec::new();
@@ -715,6 +743,28 @@ impl Thread {
             }
             fire(lua, "GuiAmmoUpdate", t)?;
         }
+        // The reticle sits where she aims, as the game's camera tells it.
+        let moved = match (self.told.reticle, s.reticle) {
+            (Some(Some(a)), Some(b)) => (a[0] - b[0]).abs() + (a[1] - b[1]).abs() > RETICLE_STEP,
+            (Some(a), b) => a.is_some() != b.is_some(),
+            (None, _) => true,
+        };
+        if moved {
+            self.told.reticle = Some(s.reticle);
+            if let Some([x, y]) = s.reticle {
+                if let Some(screen) = gui_runtime::screen(lua) {
+                    screen.borrow_mut().set_reticle(x, y);
+                }
+                let t = table(
+                    lua,
+                    [
+                        ("nX", Value::Number(x.into())),
+                        ("nY", Value::Number(y.into())),
+                    ],
+                )?;
+                fire(lua, "GuiReticlePositionChange", t)?;
+            }
+        }
         if self.told.target != Some(s.target) {
             self.told.target = Some(s.target);
             // (target, centre x, y, spread x, y, health, maximum): no
@@ -815,6 +865,43 @@ impl Thread {
             DrawItem::Flash { .. } | DrawItem::Movie { .. } => {}
         }
     }
+}
+
+/// The widget a draw item belongs to.
+fn widget_of(item: &DrawItem) -> u32 {
+    match item {
+        DrawItem::Quad { widget, .. }
+        | DrawItem::Fill { widget, .. }
+        | DrawItem::Text { widget, .. }
+        | DrawItem::Flash { widget, .. }
+        | DrawItem::Minimap { widget, .. }
+        | DrawItem::Movie { widget, .. } => *widget,
+    }
+}
+
+/// The reticle's widgets: those named for it, and everything under them.
+fn reticle_widgets(screen: &gui_runtime::Screen) -> HashSet<u32> {
+    let named = |id: u32| {
+        screen
+            .widget(id)
+            .is_some_and(|w| w.name.to_ascii_lowercase().contains("reticle"))
+    };
+    screen
+        .widgets()
+        .map(|(id, _)| id)
+        .filter(|&id| {
+            let mut at = Some(id);
+            // Up the parents (bounded, should a parent point back down).
+            for _ in 0..64 {
+                match at {
+                    Some(a) if named(a) => return true,
+                    Some(a) => at = screen.widget(a).and_then(|w| w.parent),
+                    None => return false,
+                }
+            }
+            false
+        })
+        .collect()
 }
 
 /// Clip, in the clip, stored, grenades, grenades stored: as

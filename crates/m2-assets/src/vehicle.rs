@@ -228,9 +228,12 @@ pub fn wheels_from_boxes(
         centre[0] = 0.5 * (min[0] + max[0]);
         let radius = 0.5 * (max[1] - min[1]).max(max[2] - min[2]);
         let width = max[0] - min[0];
-        // Copies at the same centre are one wheel.
+        // Copies at the same centre are one wheel: on one axle, and
+        // overlapping across it (the Honda CRX's tyre and its copy sit
+        // 5 cm apart).
         let same = wheels.iter_mut().find(|w| {
-            (0..3).all(|a| (w.centre[a] - centre[a]).abs() <= 0.1 * radius.max(w.radius))
+            (1..3).all(|a| (w.centre[a] - centre[a]).abs() <= 0.1 * radius.max(w.radius))
+                && (w.centre[0] - centre[0]).abs() <= 0.5 * width.max(w.width)
         });
         match same {
             Some(w) => {
@@ -418,6 +421,41 @@ mod tests {
         let w = wheels_from_boxes(&origins, &parents, &[tyre(1), tyre(2)], 0.0);
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].nodes, [1, 2]);
+    }
+
+    #[test]
+    fn merges_copies_of_a_wheel_a_little_apart_across_the_axle() {
+        // The Honda CRX's: each tyre twice, 5 cm apart along the axle.
+        let origins = [[0.0, 0.0, 0.0], [0.81, 0.29, 1.09], [0.76, 0.29, 1.09]];
+        let parents = [None, Some(0), Some(0)];
+        let tyre = |node, x: f32| NodeBox {
+            node,
+            min: [x - 0.1, 0.0, 0.8],
+            max: [x + 0.1, 0.58, 1.38],
+        };
+        let w = wheels_from_boxes(&origins, &parents, &[tyre(1, 0.81), tyre(2, 0.76)], 0.0);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].nodes, [1, 2]);
+        // A truck's twin tyres, a tyre's width apart, are two wheels.
+        let origins = [[0.0, 0.0, 0.0], [0.8, 0.5, -2.0], [1.1, 0.5, -2.0]];
+        let w = wheels_from_boxes(
+            &origins,
+            &parents,
+            &[
+                NodeBox {
+                    node: 1,
+                    min: [0.66, 0.0, -2.5],
+                    max: [0.94, 1.0, -1.5],
+                },
+                NodeBox {
+                    node: 2,
+                    min: [0.96, 0.0, -2.5],
+                    max: [1.24, 1.0, -1.5],
+                },
+            ],
+            0.0,
+        );
+        assert_eq!(w.len(), 2, "{w:?}");
     }
 
     #[test]

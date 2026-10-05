@@ -31,6 +31,8 @@ const WANDER: f32 = 30.0;
 const WALK: f32 = 1.4;
 const FLEE: f32 = 5.0;
 const FLEE_TIME: f32 = 6.0;
+/// How far a runner who meets a wall looks along it each way, metres.
+const CLEAR: f32 = 6.0;
 /// A soldier fights within this range of the player, and fires within
 /// `FIRE_RANGE` once facing within `FIRE_ARC` radians of them.
 const FIGHT_RANGE: f32 = 80.0;
@@ -53,8 +55,13 @@ const DODGE_TIME: f32 = 2.0;
 /// A person model and the rig that animates it.
 #[derive(Debug)]
 pub struct PersonKind {
+    /// `vz_hum_soldier`, `civ_hum_female`, ...; a story character's
+    /// template (`Carmona`).
     pub role: String,
     pub soldier: bool,
+    /// A story character, in their template's own model: stands only
+    /// where the layers place them, never dealt out as a passer-by.
+    pub named: bool,
     pub model: GpuModel,
     pub rig: Rig,
 }
@@ -269,15 +276,22 @@ impl Npc {
         !self.alive
     }
 
-    /// Runs from `danger` (civilians).
+    /// Runs from `danger` (civilians). Someone already running, and not
+    /// towards it, keeps going the way they are.
     pub fn panic(&mut self, danger: Vec3) {
         if !self.alive || self.soldier {
             return;
         }
-        let away = (self.character.position - danger)
-            .with_y(0.0)
-            .normalize_or(Vec3::X);
-        self.flee = Some((self.character.position + away * FLEE * FLEE_TIME, FLEE_TIME));
+        let at = self.character.position;
+        let away = (at - danger).with_y(0.0).normalize_or(Vec3::X);
+        if let Some((target, left)) = &mut self.flee {
+            let going = (*target - at).with_y(0.0).normalize_or_zero();
+            if going.dot(away) > -0.2 {
+                *left = left.max(FLEE_TIME * 0.5);
+                return;
+            }
+        }
+        self.flee = Some((at + away * FLEE * FLEE_TIME, FLEE_TIME));
     }
 
     /// Chest height, where shots aim.
@@ -318,6 +332,29 @@ impl Npc {
 
     pub fn patrolling(&self) -> bool {
         matches!(self.brain, Brain::Patrol { .. })
+    }
+
+    /// What they are doing, in a word or two (for checking).
+    pub fn doing(&self) -> &'static str {
+        if !self.alive {
+            return "dead";
+        }
+        if !self.landed {
+            return "landing";
+        }
+        if self.alert {
+            return "fighting";
+        }
+        if self.flee.is_some() {
+            return "fleeing";
+        }
+        match &self.brain {
+            Brain::Post { .. } => "at a post",
+            Brain::Patrol { wait, .. } if *wait > 0.0 => "pausing on a route",
+            Brain::Patrol { .. } => "patrolling",
+            Brain::Wander { wait, .. } if *wait > 0.0 => "pausing",
+            Brain::Wander { .. } => "strolling",
+        }
     }
 
     /// Model to world, turned so the model faces `facing`. The dead
@@ -440,10 +477,26 @@ impl Npc {
         // and try again (routes).
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
         if wanted != Vec3::ZERO && moved < 0.2 {
-            match &mut self.brain {
-                Brain::Wander { home, target, .. } => *target = *home + rng.disc(WANDER),
-                Brain::Patrol { wait, .. } => *wait = 1.0,
-                Brain::Post { .. } => {}
+            match (&mut self.flee, &mut self.brain) {
+                // Ran into a wall: along it, the clearer way, or back the
+                // way they came if it is a corner (not stood against it).
+                (Some((target, left)), _) => {
+                    let ahead = (*target - at).with_y(0.0).normalize_or(Vec3::X);
+                    let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+                    let waist = self.character.position + Vec3::Y * 0.9;
+                    let clear =
+                        |d: Vec3| physics.cast_ray(waist, d, CLEAR).map_or(CLEAR, |(t, _)| t);
+                    let (l, r) = (clear(side), clear(-side));
+                    let way = match () {
+                        _ if l.max(r) < 1.0 => -ahead,
+                        _ if l >= r => side,
+                        _ => -side,
+                    };
+                    *target = self.character.position + way * FLEE * *left;
+                }
+                (None, Brain::Wander { home, target, .. }) => *target = *home + rng.disc(WANDER),
+                (None, Brain::Patrol { wait, .. }) => *wait = 1.0,
+                (None, Brain::Post { .. }) => {}
             }
         }
         if wanted.length_squared() > 0.01 {
@@ -488,6 +541,11 @@ pub struct People {
     /// The state layers in, by name hash: a state layer's people stand
     /// only while it is. `None` when that isn't known (all of them stand).
     pub state_layers: Option<HashSet<u32>>,
+    /// Story characters' models to load, by their template: model and
+    /// template name (taken by the scene).
+    pub wanted: Vec<(u32, String)>,
+    /// Models asked for so far.
+    asked: HashSet<u32>,
     active: HashSet<u32>,
     rng: Rng,
 }
@@ -522,8 +580,30 @@ impl People {
             .is_some_and(|k| k.role.contains("female"))
     }
 
+    /// The kind of a story character's spawn, once their model is in: a
+    /// person template named in one word (`Carmona`, not `Allied
+    /// Soldier`) with a model of its own. Asks for the model the first
+    /// time.
+    fn character(&mut self, s: &SpawnPoint) -> Option<usize> {
+        let (template, model) = (s.template.as_deref()?, s.model?);
+        if template.contains(' ') {
+            return None;
+        }
+        if let Some(k) = self
+            .kinds
+            .iter()
+            .position(|k| k.named && k.role == template)
+        {
+            return Some(k);
+        }
+        if self.asked.insert(model) {
+            self.wanted.push((model, template.to_owned()));
+        }
+        None
+    }
+
     pub fn add_kind(&mut self, kind: PersonKind) {
-        if !kind.soldier {
+        if !kind.soldier && !kind.named {
             // Civilians are dealt out across the kinds in: start them
             // again so the new one gets its share.
             self.npcs.retain(|n| n.spawn.is_some());
@@ -564,9 +644,10 @@ impl People {
     }
 
     /// Vehicles going through people: `cars` are (model to world,
-    /// velocity, model-space bounds) of each one moving. Anyone a car's
-    /// box meets is knocked flying, dead; civilians in its path dive out
-    /// of the way. The number of soldiers killed.
+    /// velocity, model-space hull box) of each one moving. Anyone a car's
+    /// box meets is knocked flying, dead; civilians in its path (as wide
+    /// as it is, and a little more) dive out of the way. The number of
+    /// soldiers killed.
     pub fn traffic(&mut self, cars: &[(Mat4, Vec3, (Vec3, Vec3))]) -> usize {
         let mut killed = 0;
         for &(at, velocity, (lo, hi)) in cars {
@@ -577,7 +658,7 @@ impl People {
             let to_car = at.inverse();
             let centre = at.transform_point3((lo + hi) * 0.5);
             let heading = velocity.with_y(0.0).normalize_or_zero();
-            let width = (hi.x - lo.x).max(hi.z - lo.z) * 0.5;
+            let width = (hi.x - lo.x) * 0.5;
             for n in self.npcs.iter_mut().filter(|n| n.alive && n.landed) {
                 let p = n.character.position;
                 let local = to_car.transform_point3(p + Vec3::Y * 0.9);
@@ -677,10 +758,8 @@ impl People {
         }
     }
 
-    /// Whether a state layer's people stand: it is in, or which are in
-    /// isn't known.
     /// Whether a spawn of state layer `layer` (`None`: a static one) can
-    /// stand now.
+    /// stand now: it is in, or which are in isn't known.
     pub fn layer_in(&self, layer: Option<u32>) -> bool {
         layer.is_none_or(|l| {
             self.state_layers
@@ -714,7 +793,7 @@ impl People {
             _ => true,
         });
         let civilian_kinds: Vec<usize> = (0..self.kinds.len())
-            .filter(|&k| !self.kinds[k].soldier)
+            .filter(|&k| !self.kinds[k].soldier && !self.kinds[k].named)
             .collect();
         for n in self.npcs.iter_mut().filter(|n| n.spawn.is_none()) {
             if far(n.character.position, INACTIVE) {
@@ -767,13 +846,14 @@ impl People {
             }
             // Who: the template's name says (a renamed entity's own name
             // doesn't), else the entity's, else a mission's target is a
-            // plain soldier.
+            // plain soldier; or a story character.
             let kind = s
                 .template
                 .as_deref()
                 .and_then(|t| self.kind_for(t))
                 .or_else(|| self.kind_for(&s.name))
-                .or_else(|| target.then(|| self.kind_for("vz soldier")).flatten());
+                .or_else(|| target.then(|| self.kind_for("vz soldier")).flatten())
+                .or_else(|| self.character(s));
             let Some(kind) = kind else {
                 continue;
             };
@@ -800,6 +880,8 @@ impl People {
                 Some(s.entity),
             );
             npc.layer = s.layer;
+            // A story character doesn't fight.
+            npc.soldier = self.kinds[kind].soldier;
             self.npcs.push(npc);
         }
         // Civilians, once their models are in.
@@ -951,6 +1033,7 @@ pub(crate) mod tests {
         people.kinds.push(PersonKind {
             role: "vz_hum_soldier".into(),
             soldier: true,
+            named: false,
             model: empty_model(),
             rig: rig(),
         });
@@ -962,6 +1045,7 @@ pub(crate) mod tests {
             rotation: Quat::IDENTITY,
             route: Vec::new(),
             layer: None,
+            model: None,
         };
         let spawns = [
             spawn(1, "VZ Soldier 01", 10.0),
@@ -1000,12 +1084,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn story_characters_stand_in_their_own_model() {
+        let mut physics = ground();
+        let mut people = People::default();
+        let spawn = |entity, template: &str, model| SpawnPoint {
+            entity,
+            name: format!("{template}_VzaCon001"),
+            template: Some(template.into()),
+            position: Vec3::new(10.0, 0.0, 0.0),
+            rotation: Quat::IDENTITY,
+            route: Vec::new(),
+            layer: None,
+            model: Some(model),
+        };
+        let spawns = [
+            spawn(7, "Carmona", 0xbf83),
+            spawn(8, "Allied Soldier", 0x45cc),
+        ];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        // Nobody yet: his model is asked for (once), a soldier of another
+        // army's isn't.
+        assert!(people.npcs.is_empty());
+        assert_eq!(people.wanted, [(0xbf83, "Carmona".to_owned())]);
+        people.wanted.clear();
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        assert!(people.wanted.is_empty());
+        people.add_kind(PersonKind {
+            role: "Carmona".into(),
+            soldier: false,
+            named: true,
+            model: empty_model(),
+            rig: rig(),
+        });
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let him: Vec<_> = people.npcs.iter().filter(|n| n.spawn == Some(7)).collect();
+        assert_eq!(him.len(), 1);
+        assert!(!him[0].soldier, "he doesn't fight");
+        // Never dealt out as a passer-by.
+        assert!(people.npcs.iter().all(|n| n.spawn.is_some()));
+    }
+
+    #[test]
     fn a_state_layers_soldiers_stand_while_it_is_in() {
         let mut physics = ground();
         let mut people = People::default();
         people.kinds.push(PersonKind {
             role: "vz_hum_soldier".into(),
             soldier: true,
+            named: false,
             model: empty_model(),
             rig: rig(),
         });
@@ -1018,6 +1144,7 @@ pub(crate) mod tests {
             rotation: Quat::IDENTITY,
             route: Vec::new(),
             layer: Some(0xc0),
+            model: None,
         };
         let spawns = [guard];
         let tick = |people: &mut People, physics: &mut Physics| {
@@ -1115,6 +1242,39 @@ pub(crate) mod tests {
         people.npcs.push(n);
         people.traffic(&[(Mat4::IDENTITY, Vec3::ZERO, bounds)]);
         assert!(people.npcs[0].alive);
+    }
+
+    // Running from a car into a wall, they run along it, not stand
+    // against it; told to run again, they keep going their way.
+    #[test]
+    fn runners_turn_along_a_wall() {
+        let mut physics = ground();
+        let wall = [
+            Vec3::new(1.2, -1.0, -50.0),
+            Vec3::new(1.2, -1.0, 50.0),
+            Vec3::new(1.2, 6.0, 50.0),
+            Vec3::new(1.2, 6.0, -50.0),
+        ];
+        let shape = CollisionShape::mesh(&wall, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        physics.add_static(StaticKey::Cell(2), &shape, Vec3::ZERO, Quat::IDENTITY);
+        physics.step(1.0 / 60.0);
+        let mut rng = Rng::default();
+        let dt = 1.0 / 60.0;
+        let stroll = Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, stroll, None);
+        n.update(&physics, &mut rng, None, dt);
+        for _ in 0..60 * 2 {
+            // A car along the road at x = -3, level with them.
+            let danger = Vec3::new(-3.0, 0.0, n.character.position.z);
+            n.panic(danger);
+            n.update(&physics, &mut rng, None, dt);
+        }
+        let p = n.character.position;
+        assert!(p.x < 1.0 && p.z.abs() > 6.0, "{p}");
     }
 
     #[test]
