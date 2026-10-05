@@ -537,6 +537,12 @@ pub struct WorldIndex {
     /// is an instance of: what a renamed entity's name
     /// (`VzaCon001_StartingBoat`) no longer says.
     pub state_vehicles: HashMap<u32, TemplatePlacement>,
+    /// With `M2_LOG_FOLIAGE=on` only: each named entity of the static
+    /// layers, its name and how it was placed (`m` by `ModelName`, `p` by
+    /// its name or template, `v` a vehicle or unknown template, `c` left
+    /// out for a component, `a` named for an asset that isn't a model,
+    /// `t` a test entity, `-` nothing).
+    pub names: HashMap<u32, (String, char, u32)>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -598,6 +604,8 @@ struct Assets {
     models: HashSet<u32>,
     /// Name hashes of every asset of every type.
     any: HashSet<u32>,
+    /// With `M2_LOG_FOLIAGE=on` only: each asset's type, by name hash.
+    types: HashMap<u32, u32>,
     /// The template database.
     templates: Templates,
 }
@@ -644,6 +652,15 @@ impl WorldIndex {
                 .map(|a| a.name_hash)
                 .collect(),
             any: index.assets().iter().map(|a| a.name_hash).collect(),
+            types: if std::env::var("M2_LOG_FOLIAGE").as_deref() == Ok("on") {
+                index
+                    .assets()
+                    .iter()
+                    .map(|a| (a.name_hash, index.type_hash(a)))
+                    .collect()
+            } else {
+                HashMap::new()
+            },
             templates: Templates::default(),
         };
         let (templates, atmosphere) = Templates::read(source, &assets.models);
@@ -841,6 +858,7 @@ impl WorldIndex {
                 .flat_map(|c| c.records().unwrap_or_default())
                 .map(|(entity, _)| entity)
                 .collect();
+            let logging = std::env::var("M2_LOG_FOLIAGE").as_deref() == Ok("on");
             for (entity, name) in layer.names() {
                 let Some(p) = at(entity) else { continue };
                 let (position, rotation) = (Vec3::from(p.position), rotation(p.rotation));
@@ -858,9 +876,35 @@ impl WorldIndex {
                     },
                 );
                 if models.contains_key(&entity) || not_templates.contains(&entity) {
+                    if logging {
+                        let how = if models.contains_key(&entity) {
+                            'm'
+                        } else {
+                            'c'
+                        };
+                        self.names.insert(entity, (name.to_owned(), how, 0));
+                    }
                     continue;
                 }
                 let template = assets.templates.get(stem);
+                if logging {
+                    let how = match (stem_hash, template) {
+                        (Some(h), _) if assets.models.contains(&h) => 'p',
+                        (_, Some(t))
+                            if matches!(t.vehicle, Some(VehicleKind::Car | VehicleKind::Tank)) =>
+                        {
+                            'v'
+                        }
+                        (_, Some(t)) if t.model.is_some() => 'p',
+                        (Some(h), None) if assets.any.contains(&h) => 'a',
+                        (Some(_), None) if is_test(stem) => 't',
+                        (Some(_), None) => 'v',
+                        _ => '-',
+                    };
+                    let kind = stem_hash.and_then(|h| assets.types.get(&h)).copied();
+                    self.names
+                        .insert(entity, (name.to_owned(), how, kind.unwrap_or(0)));
+                }
                 match (stem_hash, template) {
                     // Its name is a model.
                     (Some(h), _) if assets.models.contains(&h) => {
