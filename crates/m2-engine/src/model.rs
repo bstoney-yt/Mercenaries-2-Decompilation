@@ -257,6 +257,11 @@ pub struct CpuModel {
     /// [`PartStates`](m2_assets::model::PartStates)). Empty when the model
     /// switches nothing.
     pub hidden: [Vec<bool>; 2],
+    /// How it breaks apart when destroyed outright, for those who want
+    /// it ([`Breakup::of`](crate::Breakup::of)): neither
+    /// [`from_data`](Self::from_data) nor [`build`](Self::build) works it
+    /// out (the island's thousands of models have no use for it).
+    pub breakup: Option<std::sync::Arc<crate::Breakup>>,
 }
 
 /// The collision of one building of a merged batch (a `TINY` model).
@@ -362,6 +367,7 @@ impl CpuModel {
             collision: None,
             members: Vec::new(),
             hidden,
+            breakup: None,
         }
     }
 

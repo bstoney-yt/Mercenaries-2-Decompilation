@@ -1001,7 +1001,7 @@ mod tests {
             crosshair: Some(Vec3::new(0.0, 1.0, -40.0)),
             mission: Some(MissionView {
                 objectives: vec!["VzaCon001 objective 1".into()],
-                tutorial: Some("Open your PDA to see the map.".into()),
+                tutorial: Some("[P] VzaCon001 tutorial 1\nline 2".into()),
                 markers: vec![(
                     Vec3::new(0.0, 0.0, -10.0),
                     "deliverable".into(),

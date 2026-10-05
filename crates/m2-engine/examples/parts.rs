@@ -115,6 +115,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("    state {name:08x}: {commands:?}");
                 }
             }
+            let chunks = st.chunks(&model.nodes);
+            println!(
+                "  other verbs' points {:?}; breaks into {:?}, naming {:?} as it does",
+                st.points,
+                chunks,
+                st.breaking_points(&chunks)
+            );
             [
                 st.hidden(&model.nodes, false),
                 st.hidden(&model.nodes, true),

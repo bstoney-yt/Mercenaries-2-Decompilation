@@ -465,6 +465,8 @@ pub enum Effect {
     Smoke { at: Vec3, size: f32 },
     /// A fireball, growing.
     Fire { at: Vec3, size: f32 },
+    /// Thick black smoke, growing and rising further than [`Smoke`](Self::Smoke).
+    Soot { at: Vec3, size: f32 },
     /// Spray thrown off a boat's hull: a white puff flying `drift` metres
     /// over its life, growing and then gone.
     Spray { at: Vec3, drift: Vec3, size: f32 },
@@ -631,6 +633,9 @@ pub struct Combat {
     /// Blasts about to go off (something explosive caught): where, and
     /// seconds left.
     fuses: Vec<(Vec3, f32)>,
+    /// What a building's break-up left burning: where, seconds left,
+    /// seconds to the next flame.
+    blazes: Vec<(Vec3, f32, f32)>,
     /// Spent explosives burning: where, how big, seconds left, seconds to
     /// the next flame.
     fires: Vec<(Vec3, f32, f32, f32)>,
@@ -664,6 +669,7 @@ impl Default for Combat {
             designator: false,
             last_launch: None,
             fuses: Vec::new(),
+            blazes: Vec::new(),
             fires: Vec::new(),
             seed: 0x2545_f491_4f6c_dd1d,
         }
@@ -715,6 +721,9 @@ const CHAIN_DELAY: f32 = 0.3;
 /// How long what is left of one burns, seconds (wrecks burn 20 s and
 /// more in the Xbox 360 game).
 const BURN: f32 = 25.0;
+/// How long a building's break-up burns, seconds (invented: the videos'
+/// fires burn on past the 25 s they show).
+const BLAZE_TIME: f32 = 40.0;
 
 /// The island's explosives.
 pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
@@ -847,6 +856,13 @@ impl Combat {
     /// spray).
     pub fn show(&mut self, e: Effect, seconds: f32) {
         self.effect(e, seconds);
+    }
+
+    /// A fire burning at `at` for [`BLAZE_TIME`] with thick black smoke,
+    /// where a building broke apart (a gate a bomb brought down: the
+    /// videos' fires either side, smoke for many seconds).
+    pub fn blaze(&mut self, at: Vec3) {
+        self.blazes.push((at, BLAZE_TIME, 0.0));
     }
 
     /// Where she is a target: her chest, or `None` while down, flying or
@@ -1777,6 +1793,26 @@ impl Combat {
             }
             *left > 0.0
         });
+        let mut blazing = Vec::new();
+        self.blazes.retain_mut(|(at, left, next)| {
+            *left -= dt;
+            *next -= dt;
+            if *next <= 0.0 {
+                *next = 0.35;
+                blazing.push(*at);
+            }
+            *left > 0.0
+        });
+        for at in blazing {
+            self.effect(Effect::Fire { at, size: 3.0 }, 0.7);
+            self.effect(
+                Effect::Soot {
+                    at: at + Vec3::Y * 3.0,
+                    size: 3.5,
+                },
+                6.0,
+            );
+        }
         for (at, size) in flames {
             let low = at.with_y(at.y - size.min(1.2) + 0.5);
             self.effect(

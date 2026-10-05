@@ -2693,7 +2693,8 @@ impl App {
             hud,
             mission: match (&self.install, &self.mode) {
                 (Some(install), Mode::Island(_)) if self.mission => Some(
-                    mission::MissionLink::start(install, self.mission_drivers.clone()),
+                    mission::MissionLink::start(install, self.mission_drivers.clone())
+                        .with_keys(self.config.keys.clone()),
                 ),
                 _ => None,
             },

@@ -69,8 +69,8 @@ const FIRST_LAP: f32 = 1.0;
 const LAP_GROWTH: f32 = 1.2;
 const LAST_LAP: f32 = 7.0;
 const LATE_PRESS: f32 = 0.1;
-/// The view moved this far from where the wheel came up (metres) puts the
-/// wheel away.
+/// The view moved this far from where it was as the needle started
+/// (metres) puts the wheel away.
 const WHEEL_MOVE: f32 = 5.0;
 /// The wedges' middles, radians clockwise from the top (the bomb's script:
 /// from 135 to 225 degrees, and from -45 to 45), each reaching this far
@@ -175,8 +175,9 @@ pub enum Phase {
     /// Looking down through the satellite: the view's middle (x, z) and
     /// seconds since it opened.
     Viewing { at: Vec2, open: f32 },
-    /// The timing wheel turns over the confirmed spot (`from`; the view
-    /// may still move a little, to `at`): seconds since it came up, which
+    /// The timing wheel turns over the confirmed spot (`from`, where the
+    /// view was as its needle started; the view may still move a little,
+    /// to `at`): seconds since it came up, which
     /// wedges were pressed in, and the last press while its mark shows: in
     /// a wedge or not, seconds since.
     Timing {
@@ -510,6 +511,10 @@ impl Support {
             } => {
                 let open = open + dt;
                 let at = steer(at);
+                // The spot she mustn't move off is where the view is as the
+                // needle starts, half a second after the press (round 96:
+                // the satellite interface takes it then).
+                let from = if needle(turned).is_none() { at } else { from };
                 let mut mark = mark.map(|(h, t)| (h, t + dt)).filter(|m| m.1 < MARK_SHOWS);
                 // A press counts once the needle goes: in a wedge not yet
                 // pressed in, or out of them, which undoes those made.

@@ -146,6 +146,8 @@ pub struct MissionLink {
     completed: Option<f32>,
     /// The speed of the vehicle she drives, held a little (m/s).
     speed: f32,
+    /// The keys tutorial lines name.
+    keys: crate::input::Bindings,
 }
 
 /// The scripts' vehicles in play.
@@ -227,7 +229,13 @@ impl MissionLink {
             vehicles: Fleet::default(),
             completed: None,
             speed: 0.0,
+            keys: Default::default(),
         }
+    }
+
+    /// Tutorial lines name these keys (else the usual ones).
+    pub fn with_keys(self, keys: crate::input::Bindings) -> Self {
+        Self { keys, ..self }
     }
 
     fn write(&mut self, lines: impl IntoIterator<Item = String>) {
@@ -462,7 +470,7 @@ impl MissionLink {
                     self.completed = Some(0.0);
                 }
             }
-            if let Some(line) = tutorial(mission) {
+            if let Some(line) = tutorial(mission, &self.keys) {
                 self.tutorial = line.map(|t| (t, 0.0));
             }
             break_props(game, mission);
@@ -960,18 +968,17 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
     world.index.spawns.iter().any(|s| s.entity == guid)
 }
 
-/// Breaks the state layers' models whose objects the scripts' world has
-/// dead (a gate blown up), and takes down those it no longer has.
 /// The scripts' newest tutorial line since the last call, if they asked
-/// for one: its text, readable, or none if they cleared it. Each call is
-/// logged with its arguments (what each is for isn't known yet).
-fn tutorial(mission: &Mission) -> Option<Option<String>> {
+/// for one: its text, readable, with the keys it names as `keys` has them
+/// (`[P] Open PDA`), or none if they cleared it. Each call is logged with
+/// its arguments.
+fn tutorial(mission: &Mission, keys: &crate::input::Bindings) -> Option<Option<String>> {
     let calls = std::mem::take(&mut mission.world().borrow_mut().hud.tutorials);
     for args in &calls {
         eprintln!("mission: tutorial line {args:?}");
     }
     let args = calls.last()?;
-    Some(m2_game::hud::tutorial_text(args).map(|t| mission.text(t)))
+    Some(m2_game::hud::tutorial_text(args).map(|t| crate::input::name_keys(&mission.text(t), keys)))
 }
 
 /// The scripts' free support items, given her or taken back.
@@ -1004,7 +1011,10 @@ fn support_item(game: &mut Game, c: &Command) {
     }
 }
 
+/// Breaks the state layers' models whose objects the scripts' world has
+/// dead (a gate blown up), and takes down those it no longer has.
 fn break_props(game: &mut Game, mission: &Mission) {
+    let blast = game.combat.last_blast;
     let scene = &mut game.scene;
     let Some(world) = &mut scene.world else {
         return;
@@ -1023,10 +1033,16 @@ fn break_props(game: &mut Game, mission: &Mission) {
         (dead, gone)
     };
     drop(w);
+    let mut fires = Vec::new();
     for e in dead {
-        scene.props.wreck(&mut world.physics, e);
+        scene.props.wreck(&mut world.physics, e, blast);
+        fires.extend(scene.props.breakup_points(e));
     }
     scene.props.hide(&mut world.physics, gone);
+    // What broke apart burns where its break-up says.
+    for at in fires {
+        game.combat.blaze(at);
+    }
 }
 
 /// Starts the helicopter a delivery's pilot flies (an `Ai.Deliver` order)
