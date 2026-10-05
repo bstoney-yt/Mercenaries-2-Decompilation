@@ -85,8 +85,9 @@ struct Options {
     config_path: Option<PathBuf>,
     install: Option<PathBuf>,
     models: Vec<u32>,
-    /// With `--model`: a clip for each model to hold instead of a gait.
-    clips: Vec<u32>,
+    /// With `--model`: a clip for each model to play instead of a gait,
+    /// or to hold still this many seconds in.
+    clips: Vec<(u32, Option<f32>)>,
     /// With `--model`: degrees to turn the models (90 shows their side).
     turn: f32,
     spawn: Option<(f32, f32)>,
@@ -116,8 +117,9 @@ struct Options {
     aim: bool,
     /// With `--screenshot` on foot: the weapon she has up.
     weapon: Option<combat::Weapon>,
-    /// Weapons on the hand's attach node as posed (`--grip attach`).
-    attach_grip: bool,
+    /// Weapons held as worked out from the hands (`--grip hands`), not
+    /// on the hand's attach node as posed.
+    hands_grip: bool,
     /// With `--screenshot` on foot: take the picture close up, from her
     /// right and a little ahead, at chest height, to see her hands.
     closeup: bool,
@@ -157,10 +159,21 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--clip" => {
                 let v = value()?;
-                o.clips.push(
-                    u32::from_str_radix(v.trim_start_matches("0x"), 16)
+                let (hash, at) = match v.split_once('@') {
+                    Some((h, t)) => (
+                        h,
+                        Some(
+                            t.parse()
+                                .with_context(|| format!("--clip {v}: expected seconds after @"))?,
+                        ),
+                    ),
+                    None => (v.as_str(), None),
+                };
+                o.clips.push((
+                    u32::from_str_radix(hash.trim_start_matches("0x"), 16)
                         .with_context(|| format!("--clip {v}: expected a hex hash"))?,
-                );
+                    at,
+                ));
             }
             "--turn" => o.turn = value()?.parse().context("--turn expects degrees")?,
             "--spawn" => {
@@ -230,9 +243,9 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--closeup" => o.closeup = true,
             "--grip" => {
-                o.attach_grip = match value()?.as_str() {
-                    "attach" => true,
-                    "hands" => false,
+                o.hands_grip = match value()?.as_str() {
+                    "attach" => false,
+                    "hands" => true,
                     v => bail!("--grip {v}: expected attach or hands"),
                 }
             }
@@ -284,7 +297,7 @@ fn keep_crash_reports() {
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
     let options = parse_args()?;
-    combat::use_attach_frame(options.attach_grip);
+    combat::use_attach_frame(!options.hands_grip);
     let config_path = options
         .config_path
         .clone()
@@ -383,8 +396,9 @@ enum Mode {
 pub struct Showcase {
     pub models: Vec<u32>,
     pub gait: Gait,
-    /// A clip per model (by hash) held instead of the gait.
-    pub clips: Vec<u32>,
+    /// A clip per model (by hash) played instead of the gait, or held
+    /// still this many seconds in.
+    pub clips: Vec<(u32, Option<f32>)>,
     /// Degrees each model is turned about the vertical.
     pub turn: f32,
 }
