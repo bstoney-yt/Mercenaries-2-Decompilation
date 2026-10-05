@@ -82,6 +82,11 @@ pub struct MissionView {
 /// Seconds the contract's completion stays up.
 const BANNER_TIME: f32 = 10.0;
 
+/// People this near a marker's target are listed with it, metres; story
+/// characters' spawns this near the player.
+const MARK_NEAR: f32 = 6.0;
+const STORY_REACH: f32 = 450.0;
+
 /// A marker the scripts put up, over one of their objects.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mark {
@@ -406,9 +411,12 @@ impl MissionLink {
             }
             if let Some(n) = game.scene.people.npcs.iter().find(|n| n.spawn == Some(g)) {
                 what.push(format!(
-                    "soldier {} at {:.1}",
+                    "soldier {} at {:.1} ({}, {}, {})",
                     if n.alive { "alive" } else { "dead" },
-                    n.character.position
+                    n.character.position,
+                    game.scene.people.kinds[n.kind].role,
+                    if n.landed { "landed" } else { "not landed" },
+                    n.doing()
                 ));
             }
             if game.scene.people.all_killed().contains(&g) {
@@ -434,6 +442,25 @@ impl MissionLink {
                     }
                 ));
             }
+            // Who else stands within a few metres of it.
+            let near: Vec<String> = game
+                .scene
+                .people
+                .npcs
+                .iter()
+                .filter(|n| n.spawn != Some(g) && n.character.position.distance(p) < MARK_NEAR)
+                .map(|n| {
+                    format!(
+                        "{} {:.1} m off{}",
+                        game.scene.people.kinds[n.kind].role,
+                        n.character.position.distance(p),
+                        if n.alive { "" } else { " (dead)" }
+                    )
+                })
+                .collect();
+            if !near.is_empty() {
+                what.push(format!("near it: {}", near.join(", ")));
+            }
             out.push(format!(
                 "marker {} on {:?} ({g:#x}) at {p:.1}, {:.0} m away, {}: {}",
                 m.icon.trim_start_matches("HUD_objective_"),
@@ -447,6 +474,45 @@ impl MissionLink {
                 }
             ));
         }
+        // Story characters: who stands, and the spawns that should.
+        let people = &game.scene.people;
+        for n in people.npcs.iter().filter(|n| people.kinds[n.kind].named) {
+            out.push(format!(
+                "story character {} at {:.1}, {}, {}, {}",
+                people.kinds[n.kind].role,
+                n.character.position,
+                if n.landed { "landed" } else { "not landed" },
+                if n.alive { "alive" } else { "dead" },
+                n.doing()
+            ));
+        }
+        // A story character's template is one word (Carmona), a soldier's
+        // several; those within reach.
+        let story = |s: &&m2_engine::world::SpawnPoint| {
+            s.model.is_some()
+                && s.template.as_deref().is_some_and(|t| !t.contains(' '))
+                && s.position.distance(at) < STORY_REACH
+        };
+        for s in spawns.iter().filter(story) {
+            if !people.npcs.iter().any(|n| n.spawn == Some(s.entity)) {
+                out.push(format!(
+                    "story spawn {:?} ({:08x}) at {:.1}, {:.0} m away: not standing{}",
+                    s.name,
+                    s.entity,
+                    s.position,
+                    s.position.distance(at),
+                    if people.layer_in(s.layer) {
+                        ""
+                    } else {
+                        " (its layer is out)"
+                    }
+                ));
+            }
+        }
+        let (shown, loaded, loading, failed) = game.scene.props.counts();
+        out.push(format!(
+            "props: {shown} shown; their models {loaded} loaded, {loading} loading, {failed} failed"
+        ));
         out
     }
 
