@@ -467,6 +467,18 @@ pub struct ParkedVehicle {
     /// How far it has rolled, metres (backwards less), for turning a
     /// tracked vehicle's road wheels.
     pub rolled: f32,
+    /// Shells its cannon has fired.
+    pub fired: u32,
+}
+
+impl ParkedVehicle {
+    /// The shells left in its cannon, which carries as many as its
+    /// template's `iClipSize` (the AMX-30's 40, which the HUD counts down
+    /// from in the videos); `None` for a gun that doesn't run out.
+    pub fn rounds(&self) -> Option<u32> {
+        let gun = self.spec.tuning.gun.filter(|_| self.spec.cannon())?;
+        Some(gun.rounds.saturating_sub(self.fired))
+    }
 }
 
 /// Kinds that don't drive on wheels (or aren't vehicles to sit in).
@@ -1075,6 +1087,7 @@ impl Scene {
                 turret: 0.0,
                 gun: 0.0,
                 rolled: 0.0,
+                fired: 0,
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
@@ -1088,6 +1101,7 @@ impl Scene {
                     turret: 0.0,
                     gun: 0.0,
                     rolled: 0.0,
+                    fired: 0,
                 });
             }
             Loaded::WorldVehicle(entity, at, yaw, spec, _) => {
@@ -1101,6 +1115,7 @@ impl Scene {
                     turret: 0.0,
                     gun: 0.0,
                     rolled: 0.0,
+                    fired: 0,
                 });
             }
             Loaded::Flight(hash, _, rest, rotors) => {
