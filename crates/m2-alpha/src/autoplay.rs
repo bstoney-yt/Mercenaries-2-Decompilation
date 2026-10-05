@@ -130,6 +130,14 @@ const OVER_WATER: f32 = 30.0;
 /// most every this long (seconds).
 const ROUNDABOUT: f32 = 1.15;
 const LOG_WAY: f32 = 30.0;
+/// A supply crate down within this far (metres) is opened on the way,
+/// standing this far from its side (with a bash's 1.8 m reach), turned to
+/// it within this much (radians); one not open after this many seconds is
+/// left.
+const OPEN_NEAR: f32 = 40.0;
+const OPEN_FROM: f32 = 0.9;
+const OPEN_FACING: f32 = 0.2;
+const OPEN_FOR: f32 = 30.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
 
@@ -144,6 +152,9 @@ enum Goal {
     Blast { target: u32, at: Vec3 },
     /// Get into vehicle `vehicles[i]`.
     Board(usize),
+    /// Break open the supply crate `target` (the scripts' object) with a
+    /// bash.
+    Open(u32),
 }
 
 impl Goal {
@@ -153,6 +164,7 @@ impl Goal {
             (Goal::Reach { target: a, .. }, Goal::Reach { target: b, .. })
             | (Goal::Blast { target: a, .. }, Goal::Blast { target: b, .. }) => a == b,
             (Goal::Shoot(a), Goal::Shoot(b)) | (Goal::Board(a), Goal::Board(b)) => a == b,
+            (Goal::Open(a), Goal::Open(b)) => a == b,
             _ => false,
         }
     }
@@ -214,6 +226,10 @@ pub struct Autoplay {
     /// The objectives last logged.
     objectives: Vec<String>,
     next_report: f32,
+    /// The supply crate she is opening and since when, and those she
+    /// gave up on.
+    opening: Option<(u32, f32)>,
+    left_shut: Vec<u32>,
 }
 
 impl Autoplay {
@@ -289,6 +305,7 @@ impl Autoplay {
             Some(Goal::Shoot(i)) => self.shoot(game, i, dt),
             Some(Goal::Blast { at, .. }) => self.blast(game, at, dt),
             Some(Goal::Board(i)) => self.board(game, i, dt),
+            Some(Goal::Open(target)) => self.open(game, target, dt),
         }
     }
 
@@ -372,6 +389,27 @@ impl Autoplay {
                     m.target,
                     at.distance(here)
                 ),
+            ));
+        }
+        // A supply crate down near her (or marked): broken open on the
+        // way, for what is inside.
+        if driving.is_none()
+            && let Some((target, d)) = game
+                .scene
+                .flights
+                .crates_standing()
+                .filter(|g| !self.left_shut.contains(g))
+                .filter_map(|g| {
+                    let (at, _) = game.scene.flights.crate_standing(g)?;
+                    let d = at.distance(here);
+                    let marked = live.iter().any(|m| m.target == g);
+                    (marked || d < OPEN_NEAR).then_some((g, d))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            return Some((
+                Goal::Open(target),
+                format!("opening the supply crate {target:#x}, {d:.0} m off"),
             ));
         }
         // The scripts' vehicles they mark: in, or by where it will be.
@@ -484,6 +522,48 @@ impl Autoplay {
                 m.at.distance(here)
             ),
         ))
+    }
+
+    /// Opening supply crate `target`: to its side, turned to it, and a
+    /// bash (low, at a crate on the ground); left shut if not open after
+    /// [`OPEN_FOR`] seconds.
+    fn open(&mut self, game: &mut Game, target: u32, dt: f32) -> Intent {
+        let since = match self.opening {
+            Some((g, t)) if g == target => t,
+            _ => {
+                self.opening = Some((target, self.clock));
+                self.clock
+            }
+        };
+        let (Some(p), Some((at, half))) = (
+            game.scene.player.as_ref(),
+            game.scene.flights.crate_standing(target),
+        ) else {
+            return Intent::default();
+        };
+        if self.clock - since > OPEN_FOR {
+            eprintln!(
+                "autoplay {:.1} s: the supply crate {target:#x} at {at:.1} would not open: left shut",
+                self.clock
+            );
+            self.left_shut.push(target);
+            return Intent::default();
+        }
+        let here = p.character.position;
+        let to = (at - here).with_y(0.0);
+        if to.length() > half + OPEN_FROM {
+            return self.walk(game, at, half + OPEN_FROM, dt);
+        }
+        let yaw = to.x.atan2(to.z);
+        let facing = wrap(yaw - p.facing).abs() < OPEN_FACING;
+        Intent {
+            look: turn_to(p, yaw, CRUISE_PITCH, dt),
+            trigger: Trigger {
+                melee: facing,
+                ..Trigger::default()
+            },
+            ..Intent::default()
+        }
     }
 
     /// Nothing to do: stand, or stop the vehicle.
