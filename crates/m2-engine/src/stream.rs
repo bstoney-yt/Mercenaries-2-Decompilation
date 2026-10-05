@@ -1380,8 +1380,9 @@ fn log_terrain(hash: u32, mesh: &TerrainMesh, gpu: &TerrainGpu, materials: &Mate
 /// third too dark: the mirrored sky raised it 2.4 per 0.1 (PC round Y,
 /// 21.5 at 0.3, 28.7 at 0.6, against 31.9), so it is 0.7. `M2_SEA` sets
 /// them as
-/// `reflection,r0,power,glint[,body[,sky]]`, `body` scaling the diffuse
-/// and ambient colours and `sky` the sky mirrored.
+/// `reflection,r0,power,glint[,body[,sky[,waves]]]`, `body` scaling the
+/// diffuse and ambient colours, `sky` the sky mirrored and `waves` the
+/// waves' heights (the game's are set from code too).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SeaConstants {
     reflection: f32,
@@ -1390,6 +1391,7 @@ struct SeaConstants {
     glint: f32,
     body: f32,
     sky: f32,
+    waves: f32,
 }
 
 impl SeaConstants {
@@ -1401,6 +1403,7 @@ impl SeaConstants {
             glint: 1.0,
             body: 0.7,
             sky: 0.7,
+            waves: 1.0,
         };
         if let Ok(v) = std::env::var("M2_SEA") {
             let f: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
@@ -1415,6 +1418,9 @@ impl SeaConstants {
             }
             if let Some(&s) = f.get(5) {
                 c.sky = s;
+            }
+            if let Some(&w) = f.get(6) {
+                c.waves = w;
             }
         }
         c
@@ -1475,6 +1481,7 @@ fn sea_plane(
             direct: [sea.body; 3],
             ambient: [sea.body; 3],
             water_sky: sea.sky,
+            water_waves: sea.waves,
             ..MaterialDesc::default()
         },
     )?;

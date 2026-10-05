@@ -145,7 +145,7 @@ struct Material {
     // x: reflection strength (0: none), y: Fresnel reflectance facing the
     // eye (negative: no Fresnel), z: takes the rim light
     reflection: vec4<f32>,
-    // x: open water, y: scale on the sky it mirrors
+    // x: open water, y: scale on the sky it mirrors, z: on its waves
     water: vec4<f32>,
 };
 
@@ -420,7 +420,7 @@ fn sea_normal(p: vec2<f32>, t: f32, footprint: f32) -> vec3<f32> {
         let across = vec2<f32>(-dir.y, dir.x);
         let swell = 0.65 + 0.35 * sin(dot(p, across) * (0.021 + 0.004 * f32(i)) + f32(i) * 2.3)
             * sin(dot(p, dir) * 0.013 - t * 0.05 + f32(i));
-        slope = slope + dir * (w.z * k * fade * swell * cos(theta));
+        slope = slope + dir * (w.z * material.water.z * k * fade * swell * cos(theta));
     }
     return normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
 }
