@@ -13,7 +13,7 @@
 //! radar's backdrop, with the island's roads over it ([`road_strokes`]),
 //! the zones its Flash movie would outline (see [`Zone`]), the mission's
 //! markers and her white square. Not drawn yet: the other Flash
-//! pieces (pop-ups), animated sprites and clock wipes. With no aim point
+//! pieces (pop-ups, the PDA) and clock wipes. With no aim point
 //! the reticle's widgets are left out ([`reticle_widgets`], by the names
 //! the layout gives them). The ammo the counters show is our own count (see
 //! [`RIFLE_CLIP`]): the play has no ammo of its own yet.

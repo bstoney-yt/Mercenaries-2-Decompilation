@@ -132,6 +132,8 @@ pub struct Widget {
     pub sprite_texture_size: [f32; 2],
     pub sprite_frame_size: [f32; 2],
     pub sprite_frame: u32,
+    /// A sprite run (`AnimateSprite`) under way.
+    pub sprite_run: Option<SpriteRun>,
     /// `SetImagePieSliceRender` arguments, as given.
     pub pie_slice: Option<Vec<f32>>,
     pub text: String,
@@ -173,6 +175,7 @@ impl Widget {
             sprite_texture_size: [0.0; 2],
             sprite_frame_size: [0.0; 2],
             sprite_frame: 0,
+            sprite_run: None,
             pie_slice: None,
             text: String::new(),
             font: String::new(),
@@ -452,6 +455,16 @@ impl Screen {
     /// (completed animations, then the update callbacks with `dt`).
     fn advance(&mut self, dt: f32) -> Vec<(u32, Vec<f64>)> {
         let mut due = std::mem::take(&mut self.due);
+        for w in self.widgets.values_mut() {
+            if let Some(run) = &mut w.sprite_run {
+                run.elapsed += dt;
+                let (frame, done) = run.frame();
+                w.sprite_frame = frame;
+                if done {
+                    w.sprite_run = None;
+                }
+            }
+        }
         let ids: Vec<u32> = self.widgets.keys().copied().collect();
         for id in ids {
             let Some(mut it) = self.widgets.get_mut(&id).and_then(|w| w.interp.take()) else {
@@ -899,6 +912,44 @@ fn pie(w: &Widget) -> Option<[f32; 2]> {
     match w.pie_slice.as_deref() {
         Some([from, to, ..]) => Some([*from, *to]),
         _ => None,
+    }
+}
+
+/// A sprite run (`AnimateSprite(id, from, to, seconds, loop)`, a sprite
+/// widget's `PlayAnimation`): frames `from` to `to` (either way) in
+/// `seconds` all told, again and again if `looping`, else stopping at
+/// `to`. That `seconds` is the whole run's, not each frame's, is read off
+/// the scripts' calls: three frames of sparks in 0.25 s, the laser
+/// reticle's 31-frame circle in its lock time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpriteRun {
+    pub from: u32,
+    pub to: u32,
+    pub seconds: f32,
+    pub looping: bool,
+    pub elapsed: f32,
+}
+
+impl SpriteRun {
+    /// The frame now, and whether the run is over.
+    fn frame(&self) -> (u32, bool) {
+        let count = self.from.abs_diff(self.to) + 1;
+        let step = if self.seconds > 0.0 {
+            (self.elapsed / self.seconds * count as f32).floor() as u32
+        } else {
+            count
+        };
+        let (step, done) = if self.looping {
+            (step % count, false)
+        } else {
+            (step.min(count - 1), step >= count)
+        };
+        let frame = if self.to >= self.from {
+            self.from + step
+        } else {
+            self.from - step
+        };
+        (frame, done)
     }
 }
 
@@ -1610,11 +1661,25 @@ natives! {
     },
     "HaltTextAnimation" => |_, _, _| Ok(MultiValue::new()),
     "AnimateSprite" => |s, _, a| {
-        s.log_unknown("AnimateSprite (drawn at its frame)");
-        let _ = a;
+        let run = SpriteRun {
+            from: a.num(1).map_or(0, |f| f.max(0.0) as u32),
+            to: a.num(2).map_or(0, |f| f.max(0.0) as u32),
+            seconds: a.f(3).unwrap_or(0.0),
+            looping: a.truthy(4),
+            elapsed: 0.0,
+        };
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.sprite_frame = run.from;
+            w.sprite_run = Some(run);
+        }
         Ok(MultiValue::new())
     },
-    "HaltSpriteAnimation" => |_, _, _| Ok(MultiValue::new()),
+    "HaltSpriteAnimation" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.sprite_run = None;
+        }
+        Ok(MultiValue::new())
+    },
     "SetImageClockAnimation" => |s, _, a| {
         s.log_unknown("SetImageClockAnimation (drawn whole)");
         let _ = a;
@@ -1758,6 +1823,38 @@ mod tests {
 
     fn run(host: &ScriptHost, code: &str) {
         host.lua().load(code).exec().unwrap();
+    }
+
+    #[test]
+    fn sprite_runs_step_through_their_frames() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            spark = G.CreateSpriteWidget()
+            arrow = G.CreateSpriteWidget()
+            G.AnimateSprite(spark, 0, 2, 0.3, true)
+            G.AnimateSprite(arrow, 0, 3, 0.4, false)
+            "#,
+        );
+        let id = |name: &str| host.lua().globals().get::<u32>(name).unwrap();
+        let (spark, arrow) = (id("spark"), id("arrow"));
+        let frame = |w: u32| screen.borrow().widget(w).unwrap().sprite_frame;
+        tick(host.lua(), 0.15);
+        // Halfway through the three frames, and through the four.
+        assert_eq!((frame(spark), frame(arrow)), (1, 1));
+        tick(host.lua(), 0.2);
+        // The spark loops round to its first frame; the arrow stops at its
+        // last and stays.
+        assert_eq!((frame(spark), frame(arrow)), (0, 3));
+        tick(host.lua(), 1.0);
+        assert_eq!(frame(arrow), 3);
+        assert!(screen.borrow().widget(arrow).unwrap().sprite_run.is_none());
+        run(&host, "_GuiInternal.HaltSpriteAnimation(spark)");
+        let halted = frame(spark);
+        tick(host.lua(), 0.1);
+        assert_eq!(frame(spark), halted);
     }
 
     #[test]
