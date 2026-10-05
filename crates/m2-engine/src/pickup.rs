@@ -1,7 +1,8 @@
 //! What the template database says is left when something is destroyed,
 //! and what a pickup gives: a supply crate (`Supply Drop (GL)`) breaks
-//! open to leave its `SpawnOnDeath`, the `Ammo Pickup (Rocket)` that gives
-//! 20 rounds of the RPG's ammunition to whoever comes within a metre.
+//! open to leave each of its `SpawnOnDeath`s, a `Grenade Launcher` and the
+//! `Ammo Pickup (Rocket)` that gives 20 rounds of the RPG's ammunition to
+//! whoever comes within a metre.
 //!
 //! Field keys without a known name are used as they are; the names in
 //! the comments say what each holds, read off the crates' and pickups'
@@ -41,8 +42,9 @@ pub struct PickupInfo {
 /// What the database says of leaving and picking up, by template id.
 #[derive(Clone, Debug, Default)]
 pub struct Leavings {
-    /// The template each leaves when destroyed.
-    pub spawns: HashMap<u32, u32>,
+    /// The templates each leaves when destroyed, in data order (a
+    /// template may have `SpawnOnDeath` more than once).
+    pub spawns: HashMap<u32, Vec<u32>>,
     pub pickups: HashMap<u32, PickupInfo>,
     /// The ammunition each weapon fires.
     pub ammo: HashMap<u32, u32>,
@@ -57,8 +59,12 @@ pub fn read(db: &Layer<'_>) -> Leavings {
         spawns: spawn
             .templates()
             .filter_map(|id| {
-                let r = spawn.of_template(id).first()?;
-                Some((id, nonzero(spawn.word(r, SPAWNS))?))
+                let left: Vec<u32> = spawn
+                    .of_template(id)
+                    .iter()
+                    .filter_map(|r| nonzero(spawn.word(r, SPAWNS)))
+                    .collect();
+                (!left.is_empty()).then_some((id, left))
             })
             .collect(),
         pickups: pickup

@@ -660,6 +660,30 @@ impl Animator {
         self.fade = 1.0;
     }
 
+    /// The events met in the next `dt` seconds of play, as (clip, event)
+    /// indices (ask before [`advance`](Self::advance) with the same `dt`):
+    /// the playing clip's, each time round for a looped one, and those of
+    /// a clip played once over the upper body (a throw). A clip faded
+    /// from is no longer heard.
+    pub fn events_ahead(&self, dt: f32, clips: &[BoundClip], out: &mut Vec<(usize, usize)>) {
+        let mut take = |clip: usize, time: f32, looped: bool| {
+            let Some(c) = clips.get(clip) else {
+                return;
+            };
+            for (i, e) in c.clip.events.iter().enumerate() {
+                if passes(e.time, c.info.duration, time, dt, looped) {
+                    out.push((clip, i));
+                }
+            }
+        };
+        if let Some(c) = self.current {
+            take(c.clip, c.time, !c.once);
+        }
+        if let Some(u) = self.upper.as_ref().filter(|u| u.once) {
+            take(u.clip, u.time, false);
+        }
+    }
+
     pub fn advance(&mut self, dt: f32) {
         if let Some(u) = &mut self.upper {
             u.time += dt;
@@ -720,9 +744,47 @@ impl Animator {
     }
 }
 
+/// Whether an event `at` seconds into a clip `duration` long falls in the
+/// `dt` seconds of play from `from`: in any round of a looped clip.
+fn passes(at: f32, duration: f32, from: f32, dt: f32, looped: bool) -> bool {
+    if dt <= 0.0 {
+        return false;
+    }
+    if !looped || duration <= 1e-3 {
+        return from <= at && at < from + dt;
+    }
+    let at = at.rem_euclid(duration);
+    // The first time it comes round at or after `from`.
+    let next = at + ((from - at) / duration).ceil() * duration;
+    next < from + dt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_are_met_once_each_time_round() {
+        // A 1 s clip with an event at 0 and one at 0.5, played in ticks
+        // (time adding up as the animator's does).
+        let ticks = |looped: bool, at: f32| {
+            let (mut t, mut met) = (0.0f32, 0);
+            for _ in 0..260 {
+                met += usize::from(passes(at, 1.0, t, 0.01, looped));
+                t += 0.01;
+            }
+            met
+        };
+        // 2.6 s: round three times looped, once played once.
+        assert_eq!(ticks(true, 0.0), 3);
+        assert_eq!(ticks(true, 0.5), 3);
+        assert_eq!(ticks(false, 0.5), 1);
+        // A tick longer than the clip still meets it, once.
+        assert!(passes(0.5, 1.0, 0.7, 1.5, true));
+        assert!(!passes(0.5, 1.0, 0.0, 0.0, true));
+        // An event just past the end comes at the start of the next round.
+        assert!(passes(1.02, 1.0, 1.01, 0.02, true));
+    }
 
     fn skeleton() -> Skeleton {
         // root -> hips (1 m up) -> spine (0.5 m up)

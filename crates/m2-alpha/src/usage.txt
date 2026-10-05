@@ -53,7 +53,8 @@ m2-alpha [options]
   --hurt <deg>[,<deg>..] with --screenshot on foot: hits from these directions
                          (degrees clockwise from where the camera looks, 0
                          ahead) just before the picture, to see the hit arcs
-  --weapon rifle|rpg     with --screenshot on foot: the weapon she has up
+  --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
+                         (gl: the supply crate's grenade launcher)
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --probe                with --screenshot: list what rays from where she

@@ -324,7 +324,7 @@ impl Player {
         if self.down {
             physics.move_character(&mut self.character, Vec3::ZERO, None, dt);
             if let Some((_, rig)) = &mut self.model {
-                rig.animator.advance(dt);
+                rig.advance(dt);
             }
             self.camera(physics);
             return;
@@ -476,7 +476,7 @@ impl Player {
                 Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
                 _ => 1.0,
             };
-            rig.animator.advance(dt * rate);
+            rig.advance(dt * rate);
         }
         self.camera(physics);
     }
