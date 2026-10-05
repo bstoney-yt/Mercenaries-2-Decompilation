@@ -321,11 +321,12 @@ impl Atmosphere {
         // `M2_SUN=full` leaves `LightIntensity` out of the sun's colour, to
         // try that reading: at Guanare's 0.3 the town's sunlit walls are no
         // brighter than its shaded ones, against about 2.5 times in footage.
-        let intensity = if env_is("M2_SUN", "full") {
-            1.0
-        } else {
-            self.light_intensity
-        };
+        // `M2_SUN=surface` does so for surfaces only, the sky's haze and
+        // clouds lit as before (with it left out the night sky was half as
+        // bright again as footage).
+        let mode = std::env::var("M2_SUN").unwrap_or_default();
+        let full = mode == "full" || mode == "surface";
+        let intensity = if full { 1.0 } else { self.light_intensity };
         let sun = self.light_color * intensity;
         lighting.sun_color = if lighting.gamma_light {
             decode(sun)
@@ -333,11 +334,21 @@ impl Atmosphere {
             sun
         };
         lighting.haze = self.haze();
+        lighting.clouds.tone = self.tone;
+        if mode == "surface" {
+            let li = self.light_intensity.max(0.0);
+            let sky = if lighting.gamma_light {
+                li.powf(GAMMA)
+            } else {
+                li
+            };
+            lighting.haze.inscattering *= sky;
+            lighting.clouds.tone *= sky;
+        }
         // `BloomAmount` times `BloomMultiplier` above `BloomThreshold`
         // (inferred from the names).
         lighting.bloom = self.bloom[0] * self.bloom[1];
         lighting.bloom_threshold = self.bloom[2];
-        lighting.clouds.tone = self.tone;
         // `M2_CLOUDS=game` lights the clouds by the game's formula.
         lighting.clouds.darkness = env_is("M2_CLOUDS", "game").then_some(self.cloud_darkness);
         lighting.clouds.coverage = self.coverage;
