@@ -2002,6 +2002,25 @@ impl Physics {
         Some((hit.time_of_impact, vec3(hit.normal), key))
     }
 
+    /// [`cast_ray`](Self::cast_ray) that passes through the statics whose
+    /// keys `skip` picks: the ground under a building that is coming down.
+    pub fn cast_ray_skipping(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+        skip: impl Fn(StaticKey) -> bool,
+    ) -> Option<(f32, Vec3)> {
+        let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
+        let keep = |handle: r::ColliderHandle, _: &r::Collider| {
+            self.keys.get(&handle).is_none_or(|&key| !skip(key))
+        };
+        self.world
+            .query_pipeline_with_filter(solid().predicate(&keep))
+            .cast_ray_and_get_normal(&ray, max, true)
+            .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
+    }
+
     /// Moves `character` for `dt` seconds: horizontally at `walk` (m/s; its
     /// y is ignored), jumping at `jump` m/s if given while grounded, falling
     /// under gravity otherwise.
