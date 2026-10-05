@@ -544,6 +544,8 @@ impl Screen {
                     colour: Some(c),
                     ..TextSpan::default()
                 });
+            } else if let Some(glyph) = button_glyph(id).filter(|_| parts.len() == 1) {
+                push(out, glyph.encode_utf8(&mut [0; 4]));
             } else if let Some(icon) = inline_icon(id).filter(|_| parts.len() == 1) {
                 // In the colour so far, which goes on after it.
                 let colour = out.last().and_then(|s| s.colour);
@@ -839,6 +841,36 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
         // gives them in hex beside the words (FFC800, 33CC99).
         "objt" => rgb(0xff, 0xc8, 0x00),
         "2ndobjt" => rgb(0x33, 0xcc, 0x99),
+        _ => return None,
+    })
+}
+
+/// The glyph a control word stands for on the PC (`[pfire] Shoot`): the
+/// HUD fonts keep the PC's button pictures on a page of their own
+/// (`english_18`'s second, `pc\common_18_buttons`), at private-use
+/// characters U+E000 on. The engine's list of the words (`[move]`,
+/// `[left stick]`, `[aim]`... `[dpad down]`, 33 of them) does not follow
+/// the glyphs' order, so they are matched by picture: the PC footage's
+/// satellite help shows `[move]` as the four arrows and `[confirm]` as the
+/// pistol (the fire button confirms), and the rest are the pictures that
+/// say what the words do. Words not matched yet stay as written.
+fn button_glyph(word: &str) -> Option<char> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "crouch" => '\u{e004}',
+        // Fire, and what the fire button does.
+        "pfire" | "confirm" => '\u{e005}',
+        "sfire" => '\u{e006}',
+        "pswitch" => '\u{e007}',
+        "move" => '\u{e008}',
+        "aim" => '\u{e009}',
+        "sprint" => '\u{e00a}',
+        "zoom" => '\u{e00b}',
+        "pda" => '\u{e00d}',
+        "pause" => '\u{e00e}',
+        "dpad left" => '\u{e010}',
+        "dpad right" => '\u{e011}',
+        "dpad up" => '\u{e012}',
+        "dpad down" => '\u{e013}',
         _ => return None,
     })
 }
@@ -1914,6 +1946,17 @@ mod tests {
         assert_eq!(spans[0].colour, yellow);
         assert_eq!((spans[1].text.as_str(), spans[1].colour), (" Go", yellow));
         assert_eq!(s.display_text("[2ndobjt][objverify2] x"), " x");
+    }
+
+    #[test]
+    fn control_words_are_the_fonts_button_glyphs() {
+        let s = Screen::default();
+        assert_eq!(
+            s.display_text("Press [pfire] at[n][move] Move view"),
+            "Press \u{e005} at\n\u{e008} Move view"
+        );
+        // Not matched to a picture yet: as written.
+        assert_eq!(s.display_text("[honk] Honk"), "[honk] Honk");
     }
 
     #[test]

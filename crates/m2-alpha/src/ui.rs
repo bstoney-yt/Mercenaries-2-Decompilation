@@ -142,6 +142,7 @@ impl Hud {
             .mission
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
+        state.tutorial = info.mission.as_ref().and_then(|m| m.tutorial.clone());
         game.update(&self.ctx, state);
     }
 
@@ -163,6 +164,7 @@ impl Hud {
             .mission
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
+        state.tutorial = info.mission.as_ref().and_then(|m| m.tutorial.clone());
         let step = 1.0 / 30.0;
         game.update_and_wait(
             &self.ctx,
@@ -946,8 +948,9 @@ fn grain(painter: &egui::Painter, screen: egui::Rect, time: f64) {
     }
 }
 
-/// The mission's objectives (top left), its newest message (top centre,
-/// if `message`) and markers over its targets.
+/// The mission's objectives (top left), its newest message (top centre)
+/// and tutorial line (left) if `message` (no game HUD to show them), and
+/// markers over its targets.
 fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     painter: &egui::Painter,
     screen: egui::Rect,
@@ -971,7 +974,8 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             at.y += 20.0;
         }
     }
-    if let Some(line) = &m.tutorial {
+    // The game's HUD has its own tutorial box.
+    if let Some(line) = m.tutorial.as_ref().filter(|_| message) {
         tutorial(painter, screen, line);
     }
     if m.contract_complete {
