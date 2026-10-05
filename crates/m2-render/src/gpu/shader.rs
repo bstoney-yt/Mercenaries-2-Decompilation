@@ -38,7 +38,7 @@ struct Frame {
     // rgb: Mie scattering per metre, a: in-scattering multiplier
     mie: vec4<f32>,
     // x: extinction multiplier, y: Rayleigh scale height, z: Mie scale
-    // height (metres)
+    // height (metres), w: density of the air near the ground
     scatter: vec4<f32>,
 };
 
@@ -159,11 +159,12 @@ fn haze(rgb: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
         }
         return mix(frame.sky.rgb, rgb, exp(-frame.sky.a * d));
     }
-    let tr = frame.rayleigh.rgb * d;
-    let tm = frame.mie.rgb * d;
-    let e = exp(-(tr + tm) * frame.scatter.x);
-    let c = dot((p - frame.eye.xyz) / max(d, 1e-3), -normalize(frame.sun_dir.xyz));
-    return rgb * e + inscatter(c, tr, tm) * (1.0 - e);
+    // What the air takes away over d, and what it adds: the light the sky
+    // shows along the same line (looking down, the sky at the horizon),
+    // so distant land fades into the sky behind it.
+    let e = exp(-(frame.rayleigh.rgb + frame.mie.rgb) * d * frame.scatter.x * frame.scatter.w);
+    let r = (p - frame.eye.xyz) / max(d, 1e-3);
+    return rgb * e + sky(normalize(vec3<f32>(r.x, max(r.y, 0.0), r.z))) * (1.0 - e);
 }
 
 // What a reflection sees along r, standing in for the game's environment

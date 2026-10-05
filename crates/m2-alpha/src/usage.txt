@@ -72,5 +72,5 @@ M music on/off, Tab or right mouse captures the mouse, N next gait
 Escape opens the menu (settings, save and load, quit).
 
 M2_POST=exposure=..,bloom=..,threshold=..,contrast=..,saturation=..,
-grade=r/g/b,haze=..,inscatter=.. overrides the finishing pass and haze
-(any subset) for matching reference footage.
+grade=r/g/b,haze=..,inscatter=..,density=.. overrides the finishing pass
+and haze (any subset; haze and inscatter multiply) for matching footage.

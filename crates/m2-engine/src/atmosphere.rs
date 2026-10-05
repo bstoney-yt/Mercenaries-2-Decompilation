@@ -124,8 +124,8 @@ impl Atmosphere {
     /// Rayleigh and Mie scattering (Mie for a turbidity of 2), scaled by
     /// the `Scatter...` multipliers. That the game's multipliers apply to
     /// these standard coefficients is inferred: its shaders take the
-    /// products from code, and with them the haze thins a few percent per
-    /// kilometre as it does in the game's footage.
+    /// products from code. On their own they haze land a few percent per
+    /// kilometre; [`HAZE_DENSITY`] thickens that to match footage.
     pub fn haze(&self) -> Haze {
         if self.inscattering <= 0.0 {
             return Haze::default();
@@ -136,11 +136,16 @@ impl Atmosphere {
             g: self.hg_g,
             inscattering: self.inscattering,
             extinction: self.extinction,
+            density: HAZE_DENSITY,
             ..Haze::default()
         }
     }
 }
 
+/// Air near the ground against the standard coefficients: fitted so land
+/// 2 km away is about 40% haze, as in PC footage of the game (the game's
+/// own density comes from code).
+const HAZE_DENSITY: f32 = 3.0;
 /// Rayleigh scattering of air per metre at 650, 570 and 475 nm.
 const RAYLEIGH: Vec3 = Vec3::new(6.95e-6, 1.18e-5, 2.44e-5);
 /// Mie scattering per metre at the same wavelengths for a turbidity of 2,

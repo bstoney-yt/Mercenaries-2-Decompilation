@@ -107,12 +107,13 @@ pub struct Lighting {
     pub haze: Haze,
 }
 
-/// Light scattering in the air, as Hoffman and Preetham model it and the
-/// game's shaders compute it: what lies at distance `d` keeps
-/// `E = exp(-(rayleigh + mie) * d * extinction)` of its colour and gains
-/// `(1 - E)` of the sunlight the air scatters towards the eye. The sky is
-/// that scattered light through the whole air above. Zero `rayleigh`
-/// means no haze: plain fog (`Lighting::fog_density`) and a flat sky.
+/// Light scattering in the air, after Hoffman and Preetham as the game's
+/// shaders compute it. The sky is the sunlight the air scatters towards
+/// the eye along the whole path up through it. What lies at distance `d`
+/// keeps `E = exp(-(rayleigh + mie) * d * extinction * density)` of its
+/// colour and takes `(1 - E)` of the sky seen the same way, so far land
+/// fades into the sky behind it. Zero `rayleigh` means no haze: plain fog
+/// (`Lighting::fog_density`) and a flat sky.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Haze {
     /// Rayleigh scattering per metre, per channel.
@@ -126,6 +127,9 @@ pub struct Haze {
     pub inscattering: f32,
     /// Scales the light lost.
     pub extinction: f32,
+    /// How much thicker the air near the ground is than the standard
+    /// coefficients (the game sets its density from code).
+    pub density: f32,
     /// Metres over which each kind of air thins out above the ground, for
     /// the sky's path length.
     pub rayleigh_height: f32,
@@ -140,6 +144,7 @@ impl Default for Haze {
             g: 0.0,
             inscattering: 1.0,
             extinction: 1.0,
+            density: 1.0,
             rayleigh_height: 8000.0,
             mie_height: 1200.0,
         }
