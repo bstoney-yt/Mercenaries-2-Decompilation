@@ -469,6 +469,9 @@ impl Atmosphere {
                     _ => Some(c),
                 }
             },
+            // `M2_SUN_HUE=grey` lights surfaces by the sun's brightness
+            // alone, its hue coming in once, through the tint above.
+            grey_sun: env_is("M2_SUN_HUE", "grey"),
             ..Haze::default()
         }
     }

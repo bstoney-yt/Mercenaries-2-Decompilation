@@ -62,6 +62,9 @@ struct Frame {
     // of it (0: wherever the ray meets it), yzw: a display colour what
     // the air keeps is tinted by (`through_air`; negative: none)
     deck: vec4<f32>,
+    // x: surfaces take the sun's brightness without its hue
+    // (`surface_sun`)
+    surface: vec4<f32>,
 };
 
 // The game lights surfaces in display values: the sun's colour times
@@ -73,6 +76,16 @@ fn light_to_display(c: vec3<f32>) -> vec3<f32> {
         return c;
     }
     return pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
+
+// The sun's light on surfaces: its colour, or with frame.surface.x set
+// its luminance alone, grey.
+fn surface_sun() -> vec3<f32> {
+    let c = frame.sun_color.rgb;
+    if frame.surface.x > 0.5 {
+        return vec3<f32>(dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)));
+    }
+    return c;
 }
 
 fn light_from_display(c: vec3<f32>) -> vec3<f32> {
@@ -494,12 +507,12 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             depth = max(v.world_pos.y - bed.y, 0.0);
             through = distance(v.world_pos, bed);
         }
-        let lit = frame.sun_color.rgb * max(dot(n, l), 0.0) * shade;
+        let lit = surface_sun() * max(dot(n, l), 0.0) * shade;
         // Sun and ambient summed as the game's water shader does (in
         // display values when surfaces are lit so), each scaled by the
         // material's diffuse and ambient colours.
         let light = light_from_display(
-            light_to_display(frame.sun_color.rgb) * (max(dot(n, l), 0.0) * shade) * material.direct.rgb
+            light_to_display(surface_sun()) * (max(dot(n, l), 0.0) * shade) * material.direct.rgb
                 + ambient_display(n) * material.ambient.rgb,
         );
         let shallow = vec3<f32>(0.09, 0.30, 0.34);
@@ -515,7 +528,7 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         // A Blinn-Phong glint in the sun's colour, added to the body
         // before the reflection, as the game's.
         let h = normalize(l + view);
-        let glint = select(0.0, 1.0, dot(n, l) > 0.0) * frame.sun_color.rgb * shade
+        let glint = select(0.0, 1.0, dot(n, l) > 0.0) * surface_sun() * shade
             * pow(max(dot(n, h), 0.0), material.specular.a) * material.specular.rgb;
         body = body + glint;
         // Schlick's Fresnel from the material's reflectance facing the
@@ -565,10 +578,10 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         let shade = sunlight(v.world_pos, surface_n);
         var lit: vec3<f32>;
         if ground {
-            let sun = light_to_display(frame.sun_color.rgb) * max(n_dot_l, 0.0) * shade;
+            let sun = light_to_display(surface_sun()) * max(n_dot_l, 0.0) * shade;
             lit = rgb * light_from_display(sun + ambient_display(n));
         } else {
-            var sun = light_to_display(frame.sun_color.rgb) * max(n_dot_l, 0.0) * shade;
+            var sun = light_to_display(surface_sun()) * max(n_dot_l, 0.0) * shade;
             if material.reflection.z > 0.5 {
                 // Rim light where the surface turns away from the eye, on
                 // the side the sun doesn't reach.
@@ -586,7 +599,7 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             let h = normalize(l + view);
             let n_dot_h = dot(n, h);
             if n_dot_h > 0.0 {
-                spec_light = frame.sun_color.rgb * material.specular.rgb * tint * pow(n_dot_h, material.specular.a) * max(shade, 0.25);
+                spec_light = surface_sun() * material.specular.rgb * tint * pow(n_dot_h, material.specular.a) * max(shade, 0.25);
             }
         }
         shine = spec_light;
