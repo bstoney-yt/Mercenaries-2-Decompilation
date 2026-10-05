@@ -291,9 +291,9 @@ pub struct WorldSettings {
     pub upload_budget: usize,
     /// Requests the loader works on at once; fewer keeps priorities fresh.
     pub in_flight: usize,
-    /// Sea surface height. Fitted by eye (device test, 2026-10-03): at
-    /// -45 m the waterline follows the beaches; where the game stores it is
-    /// not known yet.
+    /// Sea surface height. The game's water vertex shaders place the sea
+    /// at -36 m (a constant in every one of them), where the layers' water
+    /// mines and boats float too.
     pub sea_level: f32,
     /// Grass and other ground scatter within this many metres (each clump
     /// mesh also stops at its own fade distance).
@@ -322,7 +322,7 @@ impl Default for WorldSettings {
             object_distance: 2000.0,
             upload_budget: 24 << 20,
             in_flight: 6,
-            sea_level: -45.0,
+            sea_level: -36.0,
             scatter_distance: 150.0,
             prop_distance: 800.0,
         }
@@ -1135,10 +1135,12 @@ fn sea_plane(
     let material = materials.define(
         backend,
         &MaterialDesc {
-            // Opaque enough that the seabed's tile edges don't show.
-            color: [0.10, 0.30, 0.42, 0.9],
+            // Deep blue-green, opaque enough that the seabed's tile edges
+            // don't show; Fresnel makes it more so at a glance.
+            color: [0.05, 0.22, 0.30, 0.85],
             blend: BlendMode::Translucent,
             double_sided: true,
+            water: true,
             ..MaterialDesc::default()
         },
     )?;

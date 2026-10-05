@@ -182,7 +182,8 @@ struct FrameUniforms {
     sky: [f32; 4],
     ambient_cube: [[f32; 4]; 6],
     rim: [f32; 4],
-    /// The way the camera looks.
+    /// xyz: the way the camera looks, w: seconds since the backend
+    /// started (waves).
     view_dir: [f32; 4],
     /// World to each shadow cascade's clip space.
     shadow: [[f32; 16]; shadow::CASCADES],
@@ -234,6 +235,8 @@ struct MaterialUniforms {
     /// x: reflection strength (0: none), y: Fresnel reflectance facing
     /// the eye (negative: none), z: takes the rim light.
     reflection: [f32; 4],
+    /// x: open water.
+    water: [f32; 4],
 }
 
 /// Texture views a material binds besides its uniforms.
@@ -333,6 +336,8 @@ pub struct WgpuBackend {
     shaders: HashMap<VertexLayout, wgpu::ShaderModule>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     shadow_pipelines: HashMap<ShadowKey, wgpu::RenderPipeline>,
+    /// When the backend started, for animated surfaces.
+    started: std::time::Instant,
     /// The cascades the shadow map holds, as last drawn.
     cascades: std::cell::Cell<Option<shadow::Cascades>>,
     vertex_buffers: Slots<VertexBuffer>,
@@ -754,6 +759,7 @@ impl WgpuBackend {
             pipelines: HashMap::new(),
             shadow_pipelines: HashMap::new(),
             cascades: std::cell::Cell::new(None),
+            started: std::time::Instant::now(),
             vertex_buffers: Slots::default(),
             index_buffers: Slots::default(),
             textures: Slots::default(),
@@ -892,6 +898,7 @@ impl WgpuBackend {
                 Some(r) => [r.strength, r.fresnel.unwrap_or(-1.0), flag(desc.rim), 0.0],
                 None => [0.0, -1.0, flag(desc.rim), 0.0],
             },
+            water: [flag(desc.water), 0.0, 0.0, 0.0],
         };
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("material uniforms"),
@@ -1419,7 +1426,7 @@ impl WgpuBackend {
             rim: l.rim_color.extend(l.rim_threshold).to_array(),
             view_dir: (-view.view.inverse().z_axis.truncate())
                 .normalize_or_zero()
-                .extend(0.0)
+                .extend(self.started.elapsed().as_secs_f32())
                 .to_array(),
             shadow: cascades.map_or([[0.0; 16]; shadow::CASCADES], |c| {
                 c.matrices.map(|m| m.to_cols_array())

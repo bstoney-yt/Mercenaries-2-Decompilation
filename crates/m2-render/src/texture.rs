@@ -183,6 +183,10 @@ pub struct MaterialDesc {
     pub reflection: Option<Reflection>,
     /// Takes the view's rim light (see [`Lighting`](crate::Lighting)).
     pub rim: bool,
+    /// Shade as open water: moving waves, reflecting the sky by Fresnel
+    /// over `color` (the water's body colour and opacity looking straight
+    /// down).
+    pub water: bool,
 }
 
 /// A reflection of the surroundings, along the view mirrored in the
@@ -265,6 +269,7 @@ impl Default for MaterialDesc {
             emissive: None,
             reflection: None,
             rim: false,
+            water: false,
         }
     }
 }

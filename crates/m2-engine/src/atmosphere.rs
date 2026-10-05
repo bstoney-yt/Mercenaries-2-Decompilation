@@ -15,8 +15,10 @@
 //! read from its name and from the game's pixel shaders (ambient cube
 //! faces in the order +x, -x, +y, -y, +z, -z: the `Default` cube is
 //! brightest in face 2 and darkest in face 3, sky above and ground
-//! below). Whether the colours are stored gamma-encoded is not known;
-//! they are taken as linear.
+//! below). The colours are taken as gamma-encoded (sRGB) bytes, as
+//! colours picked in an editor are, and decoded to linear light: read as
+//! linear, shade was half as dark against sunlight as the original game's
+//! (measured on PC video frames). That reading is inferred.
 
 use m2_assets::layer::Layer;
 use m2_assets::name_hash;
@@ -43,6 +45,13 @@ pub struct Atmosphere {
     pub extinction: f32,
     pub mie: f32,
     pub hg_g: f32,
+    /// `Tone_R`, `Tone_G`, `Tone_B`: a colour grade, probably (not used yet).
+    pub tone: Vec3,
+    /// `BloomAmount`, `BloomMultiplier`, `BloomThreshold`,
+    /// `BloomBlurRadius` (not used yet).
+    pub bloom: [f32; 4],
+    /// `LightTime` and `LightTimeSpeed`: the time of day, probably.
+    pub light_time: [f32; 2],
 }
 
 impl Atmosphere {
@@ -64,7 +73,7 @@ impl Atmosphere {
         let colour = |name: &str| {
             let v = field(rec, name)?;
             let scale = float(rec, &format!("{name}Multiplier")).unwrap_or(1.0);
-            let byte = |shift: u32| ((v >> shift) & 0xff) as f32 / 255.0;
+            let byte = |shift: u32| srgb_to_linear(((v >> shift) & 0xff) as f32 / 255.0);
             Some(Vec3::new(byte(16), byte(8), byte(0)) * scale)
         };
         let mut ambient_cube = [Vec3::ZERO; 6];
@@ -80,6 +89,19 @@ impl Atmosphere {
             extinction: float(rec, "ScatterExtinctionMultiplier").unwrap_or(0.0),
             mie: float(rec, "ScatterBetaMieMultiplier").unwrap_or(0.0),
             hg_g: float(rec, "ScatterHgG").unwrap_or(0.0),
+            tone: Vec3::new(
+                float(rec, "Tone_R").unwrap_or(1.0),
+                float(rec, "Tone_G").unwrap_or(1.0),
+                float(rec, "Tone_B").unwrap_or(1.0),
+            ),
+            bloom: [
+                "BloomAmount",
+                "BloomMultiplier",
+                "BloomThreshold",
+                "BloomBlurRadius",
+            ]
+            .map(|n| float(rec, n).unwrap_or(0.0)),
+            light_time: ["LightTime", "LightTimeSpeed"].map(|n| float(rec, n).unwrap_or(0.0)),
         })
     }
 
@@ -90,5 +112,14 @@ impl Atmosphere {
         lighting.rim_color = self.rim;
         lighting.rim_threshold = self.rim_threshold;
         lighting.sun_color = Lighting::default().sun_color * self.light_intensity;
+    }
+}
+
+/// A gamma-encoded (sRGB) channel in 0..1 as linear light.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
     }
 }
