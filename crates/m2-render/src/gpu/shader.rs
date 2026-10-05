@@ -58,6 +58,9 @@ struct Frame {
     // The game's haze: x, y the first layer's force and 1 / its limit,
     // z, w the second's (all 0: the earlier haze)
     haze_layers: vec4<f32>,
+    // x: the farthest the cloud deck is taken to be for the air in front
+    // of it (0: wherever the ray meets it)
+    deck: vec4<f32>,
 };
 
 // The game lights surfaces in display values: the sun's colour times
@@ -698,7 +701,11 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         if frame.wind.w >= 0.0 && game_haze() {
             // As the game's, the air between the eye and the deck dims the
             // cloud and adds its own light in front of it.
-            let air = game_air(frame.eye.xyz + r * (CLOUD_HEIGHT / up));
+            var reach = CLOUD_HEIGHT / up;
+            if frame.deck.x > 0.0 {
+                reach = min(reach, frame.deck.x);
+            }
+            let air = game_air(frame.eye.xyz + r * reach);
             cloud = through_air(cloud, air);
         } else if frame.wind.w >= 0.0 && hazy() {
             let air = sky_below(r, CLOUD_HEIGHT);

@@ -213,6 +213,8 @@ struct FrameUniforms {
     cloud_tone: [f32; 4],
     /// The game's haze layers, `(force, 1 / limit)` each (all 0: off).
     haze_layers: [f32; 4],
+    /// x: the cloud deck's reach for the air in front of it (0: none).
+    deck: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -1765,6 +1767,7 @@ impl WgpuBackend {
             ],
             cloud_tone: l.clouds.tone.extend(l.clouds.opacity).to_array(),
             haze_layers: l.haze.layers.unwrap_or([0.0; 4]),
+            deck: [l.clouds.reach.unwrap_or(0.0), 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));

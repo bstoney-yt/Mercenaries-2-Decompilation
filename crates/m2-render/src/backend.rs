@@ -202,6 +202,9 @@ pub struct Clouds {
     pub horizon_fade: bool,
     /// How opaque the thickest cloud is.
     pub opacity: f32,
+    /// The farthest the deck is taken to be (metres) when reckoning the
+    /// air in front of it; `None`, wherever the ray meets it.
+    pub reach: Option<f32>,
 }
 
 impl Default for Clouds {
@@ -215,6 +218,7 @@ impl Default for Clouds {
             darkness: None,
             horizon_fade: true,
             opacity: 0.6,
+            reach: None,
         }
     }
 }
