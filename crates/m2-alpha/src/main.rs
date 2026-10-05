@@ -166,6 +166,9 @@ struct Options {
     /// With `--mission --screenshot`: she plays the mission herself, by
     /// its markers, until it is done or the seconds are up.
     autoplay: bool,
+    /// With `--screenshot`: bring down the mission's gates as the bomb
+    /// does, logging where their pieces go ([`gates_for_screenshot`]).
+    gates: bool,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -331,6 +334,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
             "--autoplay" => o.autoplay = true,
+            "--gates" => o.gates = true,
             "--mission-seconds" => {
                 o.mission_seconds = value()?
                     .parse()
@@ -770,6 +774,15 @@ fn screenshot(
             out,
         )?);
     }
+    if options.gates {
+        if let Some(install) = install {
+            eprintln!(
+                "sound: {} of the fight's 6 sounds found",
+                sound::fight_sounds_found(install)
+            );
+        }
+        gates_for_screenshot(&mut backend, &mut game, fov, aspect, out)?;
+    }
     if let Some(stage) = options
         .satellite
         .filter(|_| game.on_foot && game.scene.player.is_some())
@@ -991,6 +1004,176 @@ fn describe_bombed(game: &Game, at: m2_math::glam::Vec2, fov: f32, aspect: f32) 
 /// How far from where a bomb fell [`describe_bombed`] looks for the state
 /// layers' models (metres): a gate's middle, as far as from one end of it.
 const BOMBED_REACH: f32 = 40.0;
+
+/// The mission's gates' model (`_jungle_wallgate`'s), which the gate test
+/// brings down wherever a state layer places it.
+const GATE_MODEL: u32 = 0x1923_143c;
+
+/// How fast the gate test throws a gate's pieces each time it brings it
+/// down, as many times as in play: as in play first (and pictured), then
+/// slower and faster, to see how the look depends on it.
+const GATE_TRIES: [f32; 3] = [1.0, 0.6, 1.6];
+
+/// With `--gates`: brings down each of the mission's gates (the state
+/// layers' [`GATE_MODEL`]s) as the satellite bomb does, its blast on the
+/// middle of the gate's top, once for each of [`GATE_TRIES`], logging how
+/// its pieces set off (`gate N, try T: sets off: ...`) and where they are
+/// 2 s and 8 s on. The first time, pictures from 50 m south of it (as the
+/// mission comes at it) of the rest of it alone and its pieces alone as
+/// it breaks (`<out>-gateN-rest.ppm`, `-gateN-pieces`), and of all of it
+/// 2 s and 8 s on (`-gateN-2s`, `-gateN-8s`): round 100's pictures had
+/// the arch and walls standing 8 s after the bomb, without telling which
+/// of it was the gate's pieces.
+fn gates_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    use m2_math::glam::Vec3;
+    let tick = TICK.as_secs_f32();
+    let stem = out
+        .file_stem()
+        .map_or("shot".into(), |s| s.to_string_lossy());
+    let picture = |name: String| out.with_file_name(format!("{stem}-{name}.ppm"));
+    let Some(world) = &game.scene.world else {
+        return Ok(());
+    };
+    let mut gates: Vec<(u32, Vec3)> = world
+        .index
+        .state_objects
+        .iter()
+        .filter(|(_, o)| o.model == GATE_MODEL)
+        .map(|(&e, o)| (e, o.position))
+        .collect();
+    gates.sort_by_key(|g| g.0);
+    eprintln!(
+        "gates: {} placed: {}",
+        gates.len(),
+        gates
+            .iter()
+            .map(|(e, at)| format!("{e:#x} at {at:.1}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    game.on_foot = false;
+    // Steps the game `seconds` on, drawing every tenth tick so the island
+    // streams around the camera.
+    let run = |backend: &mut WgpuBackend, game: &mut Game, seconds: f32| {
+        for i in 0..(seconds / tick).round() as u32 {
+            game.step(Intent::default(), tick);
+            if i % 10 == 0 {
+                render(backend, game, fov, aspect, None)?;
+            }
+        }
+        anyhow::Ok(())
+    };
+    for (k, &(gate, position)) in gates.iter().enumerate() {
+        let n = k + 1;
+        // From the south, 50 m off and above the ground there, as the
+        // mission comes at it.
+        let look = |game: &mut Game, at: Vec3| {
+            let mut eye = at + Vec3::new(0.0, 6.0, -50.0);
+            if let Some(ground) = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| w.physics.island_below(eye.with_y(eye.y + 200.0), 400.0))
+            {
+                eye.y = eye.y.max(ground + 2.0);
+            }
+            game.camera = FlyCamera::looking_at(eye, at);
+            eye
+        };
+        look(game, position + Vec3::Y * 8.0);
+        game.scene.show_props([gate]);
+        let started = Instant::now();
+        while game.scene.props.get(gate).is_none_or(|(_, loaded)| !loaded)
+            || game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|w| w.stats().pending > 0)
+        {
+            if started.elapsed() > Duration::from_secs(120) {
+                break;
+            }
+            run(backend, game, 0.5)?;
+        }
+        let (Some(centre), Some(top)) = (game.scene.props.centre(gate), game.scene.props.top(gate))
+        else {
+            eprintln!("gate {n} ({gate:#x}): its model never loaded");
+            continue;
+        };
+        let eye = look(game, centre);
+        eprintln!("gate {n} ({gate:#x}) at {position:.1}, seen from {eye:.1}");
+        // The bomb goes off on its top.
+        let blast = top - Vec3::Y * 0.2;
+        for (t, &scale) in GATE_TRIES.iter().enumerate() {
+            // Whole again.
+            if let Some(world) = &mut game.scene.world {
+                game.scene.props.hide(&mut world.physics, [gate]);
+            }
+            game.scene.show_props([gate]);
+            run(backend, game, 0.1)?;
+            let Some(world) = &mut game.scene.world else {
+                break;
+            };
+            if !game
+                .scene
+                .props
+                .wreck_scaled(&mut world.physics, gate, Some(blast), scale)
+            {
+                eprintln!("gate {n}: it would not break");
+                break;
+            }
+            let try_n = t + 1;
+            eprintln!(
+                "gate {n}, try {try_n} ({scale} times as fast), blast at {blast:.1}: sets off: {}",
+                game.scene
+                    .props
+                    .pieces_report(&world.physics, gate)
+                    .unwrap_or_else(|| "no pieces".to_owned())
+            );
+            let first = t == 0;
+            if first {
+                // Burning where its break-up says, as in play.
+                for at in game.scene.props.breakup_points(gate) {
+                    game.combat.blaze(&world.physics, at);
+                }
+                for (parts, name) in [
+                    (props::Parts::Rest, "rest"),
+                    (props::Parts::Pieces, "pieces"),
+                ] {
+                    game.scene.props.parts = parts;
+                    render(backend, game, fov, aspect, None)?;
+                    write_ppm(backend, &picture(format!("gate{n}-{name}")))?;
+                }
+                game.scene.props.parts = props::Parts::All;
+            }
+            let mut gone = 0.0;
+            for (on, name) in [(2.0, "2s"), (8.0, "8s")] {
+                run(backend, game, on - gone)?;
+                gone = on;
+                let Some(world) = &game.scene.world else {
+                    break;
+                };
+                let props = &game.scene.props;
+                eprintln!(
+                    "gate {n}, try {try_n}: {on} s on: {}; {}",
+                    props.pieces_moved(&world.physics, gate).unwrap_or_default(),
+                    props.describe(&world.physics, gate).unwrap_or_default()
+                );
+                if first {
+                    render(backend, game, fov, aspect, None)?;
+                    write_ppm(backend, &picture(format!("gate{n}-{name}")))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Draws a frame with the HUD (and the mission's objectives) and writes
 /// it to `out` as a binary PPM.

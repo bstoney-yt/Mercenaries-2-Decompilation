@@ -45,6 +45,14 @@ const NECK: u32 = 0xc187_105b;
 const SLUNG_DROP: f32 = 0.12;
 const SLUNG_GAP: f32 = 0.07;
 const SLUNG_LEAN: f32 = 0.14;
+/// And its top no higher than this far above the attach point (about the
+/// base of her neck), lowered as far as that takes, unless that would
+/// take its bottom lower than this far below the point (just past her
+/// knees): round 100 had the RPG's top 0.3 m over her head and the
+/// launcher's stock in her hair, where the PC video has them end about
+/// her shoulders.
+const SLUNG_TOP: f32 = 0.16;
+const SLUNG_FLOOR: f32 = 1.0;
 
 /// Weapons drawn on the right hand's attach node turned as the node is
 /// posed (the default: the grip sits in her palm, round 78), rather than
@@ -330,7 +338,8 @@ fn node(skeleton: &Skeleton, hash: u32) -> Option<usize> {
 /// along its length (the longest side of its `bounds`, the end its
 /// `muzzle` is at down) down her back, leaning as [`SLUNG_LEAN`] has it,
 /// flat against her back with its top to her side, its middle
-/// [`SLUNG_DROP`] below the point and [`SLUNG_GAP`] behind it.
+/// [`SLUNG_DROP`] below the point and [`SLUNG_GAP`] behind it, or lower to
+/// keep its top down ([`SLUNG_TOP`]).
 fn slung_at(
     muzzle: Vec3,
     bounds: (Vec3, Vec3),
@@ -361,7 +370,14 @@ fn slung_at(
     let side = if slot == 0 { right } else { -right };
     let to_side = (side - down * side.dot(down)).normalize();
     let turn = m2_math::glam::Mat3::from_cols(down, to_side, down.cross(to_side)) * own.transpose();
-    let origin = point - up * SLUNG_DROP - ahead * SLUNG_GAP - turn * middle;
+    // How far it reaches up and down her back from its middle.
+    let reach = (0..3)
+        .map(|k| (turn.col(k).dot(up) * size[k]).abs() * 0.5)
+        .sum::<f32>();
+    let lower = (reach - SLUNG_DROP - SLUNG_TOP)
+        .min(SLUNG_FLOOR - SLUNG_DROP - reach)
+        .max(0.0);
+    let origin = point - up * (SLUNG_DROP + lower) - ahead * SLUNG_GAP - turn * middle;
     Some(Mat4::from_cols(
         turn.x_axis.extend(0.0),
         turn.y_axis.extend(0.0),
@@ -2275,7 +2291,8 @@ mod tests {
         let barrel = (at.transform_point3(muzzle) - at.transform_point3(Vec3::ZERO)).normalize();
         // Nearly straight down, its muzzle toward her left hip.
         assert!(barrel.y < -0.95 && barrel.dot(right) < 0.0, "{barrel}");
-        // From her shoulders down past her waist, all of it behind her.
+        // From the base of her neck down past her hips, all of it behind
+        // her.
         let corners: Vec<Vec3> = (0..8)
             .map(|k| {
                 let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
@@ -2288,8 +2305,8 @@ mod tests {
             .collect();
         let top = corners.iter().map(|c| c.y).fold(f32::MIN, f32::max);
         let bottom = corners.iter().map(|c| c.y).fold(f32::MAX, f32::min);
-        assert!(top > 1.6 && top < 1.8, "{top}");
-        assert!(bottom > 0.75 && bottom < 0.95, "{bottom}");
+        assert!(top > 1.5 && top < 1.6, "{top}");
+        assert!(bottom > 0.6 && bottom < 0.8, "{bottom}");
         assert!(corners.iter().all(|c| c.z < point.z - 0.02), "{corners:?}");
         // On her left the same way, its top to her left.
         let left = slung_at(muzzle, (lo, hi), point + Vec3::X * 0.2, (right, up), 1).unwrap();
@@ -2331,23 +2348,23 @@ mod tests {
         let slung = slung_at(muzzle, bounds, point, (right, up), 0).unwrap();
         let lower = slung.transform_point3(muzzle);
         assert!(lower.z < -0.15 && lower.y < 3.0, "{lower}");
-        // A long one (the RPG's 1.28 m) reaches further up and down, its
-        // middle where the short one's is.
+        // The short one's top at the base of her neck; a long one (the
+        // RPG's 1.28 m) reaches further down, and up no higher than her
+        // head.
         let long = (Vec3::new(-0.05, -0.15, -0.5), Vec3::new(0.05, 0.15, 0.78));
         let raised = slung_at(muzzle, long, point, (right, up), 0).unwrap();
         let (short, longer) = (heights(slung, bounds), heights(raised, long));
         assert!(
-            longer.1 > short.1 + 0.1 && longer.0 < short.0 - 0.1,
-            "{short:?} {longer:?}"
-        );
-        let middle = |(a, b): (f32, f32)| (a + b) * 0.5;
-        assert!(
-            (middle(longer) - middle(short)).abs() < 0.05,
-            "{short:?} {longer:?}"
+            (short.1 - (point.y + SLUNG_TOP)).abs() < 0.02,
+            "{short:?} {point}"
         );
         assert!(
-            (middle(short) - (point.y - SLUNG_DROP)).abs() < 0.05,
-            "{short:?}"
+            longer.0 < short.0 - 0.1 && longer.1 < short.1 + 0.2,
+            "{short:?} {longer:?}"
+        );
+        assert!(
+            (longer.0 - (point.y - SLUNG_FLOOR)).abs() < 0.02,
+            "{longer:?} {point}"
         );
     }
 
@@ -2398,9 +2415,10 @@ mod tests {
             .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
         assert!(most - least < 0.55, "{least} {most}");
         assert!(least + most > 0.0, "{least} {most}");
-        // Up past her shoulder and down to her thighs, not her shins.
+        // Up to about the top of her head, no higher (round 100's stood
+        // 0.3 m over it), and down to just past her knee, not her shin.
         let (bottom, top) = heights(at, bounds);
-        assert!(bottom > 0.55 && top > 1.8, "{bottom} {top}");
+        assert!(bottom > 0.35 && top > 1.6 && top < 1.75, "{bottom} {top}");
     }
 
     #[test]

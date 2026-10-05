@@ -471,6 +471,13 @@ type BankSounds = ([Option<SoundBuffer>; 6], [Vec<SoundBuffer>; 2]);
 /// not yet read.
 const COLLAPSE_SOUND: u32 = 0x9204_a89a;
 
+/// How many of the fight's sounds the banks have, read as play reads
+/// them (each logs what it picked, the collapse's rumble among them): a
+/// check for headless runs, which play no sound.
+pub fn fight_sounds_found(install: &Install) -> usize {
+    bank_sounds(install).0.iter().flatten().count()
+}
+
 /// The fight's sounds and the ambient one-shots.
 fn bank_sounds(install: &Install) -> BankSounds {
     let library = install.open_world().and_then(|mut source| {

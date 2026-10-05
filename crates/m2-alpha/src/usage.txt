@@ -60,6 +60,17 @@ m2-alpha [options]
                          the timing wheel after the first press (wheel),
                          or --fight-wait seconds (at least 0.8) after the
                          bomb lands (bomb)
+  --gates                with --screenshot: bring down each of the mission's
+                         gates as the satellite bomb does, three times
+                         (its pieces thrown as fast as in play, 0.6 and
+                         1.6 times as fast), logging how its pieces set
+                         off and where they are 2 s and 8 s on; pictures
+                         from 50 m south of each, the first time, of the
+                         rest of it alone and its pieces alone as it
+                         breaks (-gate1-rest.ppm, -gate1-pieces.ppm), and
+                         2 s and 8 s on (-gate1-2s.ppm, -gate1-8s.ppm);
+                         first it reads the fight's sounds as play does
+                         and logs which it found
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --behind               with --screenshot on foot: the picture from close

@@ -76,6 +76,20 @@ pub struct Props {
     /// Those only a support strike brings down (a mission's gates): no
     /// vehicle or common blast knocks them loose.
     pub sturdy: HashSet<u32>,
+    /// What of those broken apart is drawn (the gate test's pictures).
+    pub parts: Parts,
+}
+
+/// What [`Props::draw`] draws of a model broken apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Parts {
+    /// The rest of it and its pieces.
+    #[default]
+    All,
+    /// The rest of it alone.
+    Rest,
+    /// Its pieces alone.
+    Pieces,
 }
 
 /// How the props stand ([`Props::counts`]): how many are shown, and of
@@ -297,6 +311,18 @@ impl Props {
     /// broken, as after loading a game, is already under). True if it was
     /// one.
     pub fn wreck(&mut self, physics: &mut Physics, entity: u32, blast: Option<Vec3>) -> bool {
+        self.wreck_scaled(physics, entity, blast, 1.0)
+    }
+
+    /// [`wreck`](Self::wreck), what breaks apart thrown `scale` times as
+    /// fast (the gate test's tries).
+    pub fn wreck_scaled(
+        &mut self,
+        physics: &mut Physics,
+        entity: u32,
+        blast: Option<Vec3>,
+        scale: f32,
+    ) -> bool {
         let Some(p) = self.shown.get_mut(&entity).filter(|p| !p.wrecked) else {
             return false;
         };
@@ -308,7 +334,7 @@ impl Props {
             if let Some(breakup) = m.breakup.as_deref()
                 && !self.knocked.contains_key(&entity)
             {
-                let pieces = throw(physics, breakup, placed, blast);
+                let pieces = throw(physics, breakup, placed, blast, scale);
                 let sinking = match (&pieces, blast) {
                     (Some(_), Some(from)) => Sinking::from(entity, placed, m.gpu.bounds, from),
                     _ => Sinking::under(),
@@ -408,6 +434,16 @@ impl Props {
         Some(p.position + p.rotation * ((lo + hi) * 0.5))
     }
 
+    /// The middle of the top of `entity`'s model's box in the world (where
+    /// the satellite bomb lands on a gate); `None` unless it is shown and
+    /// its model has loaded.
+    pub fn top(&self, entity: u32) -> Option<Vec3> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        let (lo, hi) = m.gpu.bounds;
+        Some(p.position + p.rotation * Vec3::new((lo.x + hi.x) * 0.5, hi.y, (lo.z + hi.z) * 0.5))
+    }
+
     /// How `entity` stands, if it is shown, for the autoplay's pictures of
     /// a gate the bomb brought down: broken, how many of its pieces fly,
     /// how far the rest has sunk, and what is drawn of it.
@@ -467,6 +503,95 @@ impl Props {
             };
         }
         Some(s)
+    }
+
+    /// How `entity`'s pieces set off as it broke apart (the gate test asks
+    /// as it breaks): each one's node, its box's sides along the model's
+    /// own axes and its middle in the model (metres from its origin), how
+    /// far it was lifted out of the ground, and how fast it goes (and
+    /// upward) and spins.
+    pub fn pieces_report(&self, physics: &Physics, entity: u32) -> Option<String> {
+        let p = self.shown.get(&entity)?;
+        let breakup = self.models.get(&p.model)?.as_ref()?.breakup.as_deref()?;
+        let ids = self.broken.get(&entity)?;
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let back = placed.inverse();
+        let starts = breakup.pieces.starts(placed);
+        let each: Vec<String> = breakup
+            .pieces
+            .pieces
+            .iter()
+            .zip(&starts)
+            .zip(ids)
+            .map(|((piece, &start), &id)| {
+                let (lo, hi) = corners(start, piece)
+                    .iter()
+                    .map(|&c| back.transform_point3(c))
+                    .fold((Vec3::MAX, Vec3::MIN), |(a, b), c| (a.min(c), b.max(c)));
+                let (size, middle) = (hi - lo, (lo + hi) * 0.5);
+                let lift = physics
+                    .debris_place(id)
+                    .map_or(0.0, |now| now.w_axis.y - start.w_axis.y);
+                let (v, w) = physics.debris_velocity(id).unwrap_or_default();
+                format!(
+                    "n{} {:.1}x{:.1}x{:.1} at {:.1},{:.1},{:.1} lift {lift:.1} v {:.1} up {:.1} \
+                     spin {:.1}",
+                    piece.node.map_or(-1, i32::from),
+                    size.x,
+                    size.y,
+                    size.z,
+                    middle.x,
+                    middle.y,
+                    middle.z,
+                    v.length(),
+                    v.y,
+                    w.length()
+                )
+            })
+            .collect();
+        Some(each.join("; "))
+    }
+
+    /// Where `entity`'s pieces have gone since it broke apart (the gate
+    /// test): how many are within a metre of where they started, how many
+    /// have turned less than 15 degrees, and how many have their tops more
+    /// than 4 m above the model's base; then each one's node, how far its
+    /// middle has moved (metres), how far it has turned (degrees) and how
+    /// high its top is above the model's base.
+    pub fn pieces_moved(&self, physics: &Physics, entity: u32) -> Option<String> {
+        let p = self.shown.get(&entity)?;
+        let m = self.models.get(&p.model)?.as_ref()?;
+        let breakup = m.breakup.as_deref()?;
+        let ids = self.broken.get(&entity)?;
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let base = placed.transform_point3(Vec3::Y * m.gpu.bounds.0.y).y;
+        let starts = breakup.pieces.starts(placed);
+        let (mut near, mut level, mut high) = (0, 0, 0);
+        let mut each = Vec::new();
+        for ((piece, &start), &id) in breakup.pieces.pieces.iter().zip(&starts).zip(ids) {
+            let Some(now) = physics.debris_place(id) else {
+                continue;
+            };
+            let is = corners(now, piece);
+            let moved = box_middle(&is).distance(box_middle(&corners(start, piece)));
+            let turned = Quat::from_mat4(&now)
+                .angle_between(Quat::from_mat4(&start))
+                .to_degrees();
+            let top = is.iter().map(|c| c.y).fold(f32::MIN, f32::max) - base;
+            near += usize::from(moved < 1.0);
+            level += usize::from(turned < 15.0);
+            high += usize::from(top > 4.0);
+            each.push(format!(
+                "n{} {moved:.1} m {turned:.0} deg top {top:.1}",
+                piece.node.map_or(-1, i32::from)
+            ));
+        }
+        Some(format!(
+            "{near} of {} within 1 m of where they started, {level} turned under 15 deg, \
+             {high} with their tops over 4 m up: {}",
+            ids.len(),
+            each.join("; ")
+        ))
     }
 
     /// `entity`'s, if it is shown, and whether its model has loaded.
@@ -698,7 +823,9 @@ impl Props {
                     // sinks, until it is under.
                     match self.sinking.get(e).map(|s| s.place(m.gpu.bounds)) {
                         Some(None) => {
-                            m.gpu.draw_flying(queue, placed, &nodes, flying);
+                            if self.parts != Parts::Rest {
+                                m.gpu.draw_flying(queue, placed, &nodes, flying);
+                            }
                             continue;
                         }
                         Some(Some(sunk)) => {
@@ -710,8 +837,12 @@ impl Props {
                         }
                         None => {}
                     }
-                    m.gpu
-                        .draw_moved(queue, placed, &nodes, loose.breaks || p.wrecked, flying);
+                    let wrecked = loose.breaks || p.wrecked;
+                    match self.parts {
+                        Parts::All => m.gpu.draw_moved(queue, placed, &nodes, wrecked, flying),
+                        Parts::Rest => m.gpu.draw_moved(queue, placed, &nodes, wrecked, &[]),
+                        Parts::Pieces => m.gpu.draw_flying(queue, placed, &nodes, flying),
+                    }
                 }
                 continue;
             }
@@ -815,39 +946,62 @@ impl Sinking {
     }
 }
 
-/// A broken-apart model's pieces fly this fast (m/s) for a piece a metre
-/// across at the blast, slower the bigger (as the square root of its
-/// size) and the further they are, up to this far (metres) and at most
-/// this fast; and turn this fast (radians a second) for a piece a metre
-/// across, the biggest at least this fast. Invented, to look as the
-/// videos' gates do (round 96): blocks thrown up and out at once, slabs
-/// toppling over in two seconds or so to lie across the way through.
-const THROW_SPEED: f32 = 9.0;
+/// How a broken-apart model's pieces go from a blast on top of it (the
+/// satellite bomb lands on a gate's roof), as the videos have the gates
+/// (round 96): the gatehouse blown apart at the flash, its blocks thrown
+/// up and out, the big ones least far; the slabs near it tipping over to
+/// lie across the way through; broken wall left standing further off. A
+/// piece within [`THROW_NEAR`] of the blast flies at [`THROW_SPEED`] (m/s)
+/// if it is no more than [`THROW_SIZE`] across, slower the bigger (as the
+/// [`THROW_BULK`] power of its size) and the further off (as the
+/// [`THROW_FALL`] power of how much further), at most [`THROW_MOST`]; none
+/// fly beyond [`THROW_REACH`]. Each also tips over outward, across the
+/// way through, on its outer lower edge: within [`THROW_NEAR`], spinning
+/// [`TOPPLE`] times as fast as takes it past its balance, less the further
+/// off, not at all from [`TOPPLE_REACH`]; and tumbles as fast (radians a
+/// second) as [`TUMBLE`] times its speed over its size. Round 100's throw
+/// (9 m/s for a metre-wide piece, a third of that for a gate's blocks,
+/// each spun about its middle, its footings left in the ground) left the
+/// arch and the walls standing 8 s on. Invented, to look as the videos
+/// do.
+const THROW_SPEED: f32 = 12.0;
+const THROW_SIZE: f32 = 3.0;
+const THROW_BULK: f32 = 0.75;
+const THROW_NEAR: f32 = 6.0;
+const THROW_FALL: f32 = 1.5;
+const THROW_MOST: f32 = 20.0;
 const THROW_REACH: f32 = 45.0;
-const THROW_MOST: f32 = 10.0;
-const THROW_TURN: f32 = 6.0;
-const THROW_TURN_LEAST: f32 = 0.9;
+const TOPPLE: f32 = 1.3;
+const TOPPLE_REACH: f32 = 25.0;
+const TUMBLE: f32 = 0.3;
+
+/// A piece that starts in the ground (a gate's footings) is lifted out
+/// of it as it breaks, under the flash, by at most this much (metres):
+/// one left in it sticks there.
+const UNBURY_MOST: f32 = 4.0;
 
 /// Throws `breakup`'s pieces, the model placed at `placed`, away from
-/// `blast`, as [`THROW_SPEED`] has it: out of its line (a gate's pieces
-/// fall on the way through it, each to its own side, as in the videos),
-/// the biggest tipping over as they go, the smaller tumbling. `None`
-/// (nothing thrown) without a blast within [`THROW_REACH`] of its middle.
+/// `blast`, `scale` times as fast as [`THROW_SPEED`] has it: out of its
+/// line (a gate's pieces fall on the way through it, each to its own
+/// side, as in the videos), each lifted out of the ground it starts in.
+/// `None` (nothing thrown) without a blast within [`THROW_REACH`] of its
+/// middle.
 fn throw(
     physics: &mut Physics,
     breakup: &Breakup,
     placed: Mat4,
     blast: Option<Vec3>,
+    scale: f32,
 ) -> Option<Vec<DebrisId>> {
     let loose = &breakup.pieces;
     let starts = loose.starts(placed);
-    let centres: Vec<Vec3> = loose
+    let boxes: Vec<[Vec3; 8]> = loose
         .pieces
         .iter()
         .zip(&starts)
-        .map(|(q, at)| at.transform_point3(q.centre()))
+        .map(|(q, &at)| corners(at, q))
         .collect();
-    let middle = centres.iter().sum::<Vec3>() / centres.len().max(1) as f32;
+    let middle = boxes.iter().map(box_middle).sum::<Vec3>() / boxes.len().max(1) as f32;
     let from = blast.filter(|b| b.distance(middle) < THROW_REACH)?;
     // Across its line: the way through a gate.
     let across = placed.z_axis.truncate().with_y(0.0).normalize_or(Vec3::Z);
@@ -855,27 +1009,65 @@ fn throw(
         .pieces
         .iter()
         .zip(starts)
-        .zip(centres)
+        .zip(&boxes)
         .enumerate()
-        .map(|(i, ((piece, at), centre))| {
-            let (velocity, spin) = launch(i, centre, piece.size(), (middle, across), from);
-            physics.add_rubble(piece, at, velocity, spin)
+        .map(|(i, ((piece, at), corners))| {
+            let lift = Mat4::from_translation(Vec3::Y * buried(physics, corners));
+            let (velocity, spin) = launch(i, corners, (middle, across), from, scale);
+            physics.add_rubble(piece, lift * at, velocity, spin)
         })
         .collect();
     Some(pieces)
 }
 
-/// How piece `i` of a model broken apart flies from a blast at `from`:
-/// its velocity and spin, its middle at `centre` and `size` across, the
-/// model's middle and the way across its line `(middle, across)`.
+/// The corners of `piece`'s box, its node placed at `at`.
+fn corners(at: Mat4, piece: &m2_engine::LoosePiece) -> [Vec3; 8] {
+    let (centre, half) = (piece.centre(), piece.extent() * 0.5);
+    std::array::from_fn(|k| {
+        let pick = |bit: usize| if k & bit == 0 { -1.0 } else { 1.0 };
+        at.transform_point3(centre + half * Vec3::new(pick(1), pick(2), pick(4)))
+    })
+}
+
+/// The middle of a box with these `corners`.
+fn box_middle(corners: &[Vec3; 8]) -> Vec3 {
+    corners.iter().sum::<Vec3>() / 8.0
+}
+
+/// How far (metres) a box with these `corners` starts in the island's
+/// ground: its lowest corner's depth under the highest ground beneath its
+/// four lowest corners and its middle, at most [`UNBURY_MOST`].
+fn buried(physics: &Physics, corners: &[Vec3; 8]) -> f32 {
+    let (bottom, top) = corners
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(a, b), c| (a.min(c.y), b.max(c.y)));
+    let mut low = *corners;
+    low.sort_by(|a, b| a.y.total_cmp(&b.y));
+    let reach = top - bottom + UNBURY_MOST + 2.0;
+    low[..4]
+        .iter()
+        .copied()
+        .chain([box_middle(corners)])
+        .filter_map(|c| physics.island_below(c.with_y(top + 1.0), reach))
+        .map(|ground| ground - bottom)
+        .fold(0.0, f32::max)
+        .min(UNBURY_MOST)
+}
+
+/// How piece `i` of a model broken apart goes from a blast at `from`,
+/// `scale` times as fast as [`THROW_SPEED`] has it: its velocity and spin,
+/// its box's `corners` as it starts, the model's middle and the way across
+/// its line `(middle, across)`.
 fn launch(
     i: usize,
-    centre: Vec3,
-    size: f32,
+    corners: &[Vec3; 8],
     (middle, across): (Vec3, Vec3),
     from: Vec3,
+    scale: f32,
 ) -> (Vec3, Vec3) {
     let jitter = |k: u32| scatter(i as u32, k);
+    let centre = box_middle(corners);
+    let size = corners[0].distance(corners[7]).max(0.5);
     let away = centre - from;
     let flat = away.with_y(0.0).normalize_or(Vec3::X);
     // Out on its own side of the line (either, on it).
@@ -887,17 +1079,33 @@ fn launch(
     } else {
         1.0
     };
-    let out = (across * side + flat * 0.6).normalize_or(across * side);
-    let near = (1.0 - away.length() / THROW_REACH).clamp(0.25, 1.0);
-    let size = size.max(0.5);
-    let speed = (THROW_SPEED / size.sqrt()).min(THROW_MOST) * near;
-    let velocity =
-        out * (speed * (1.0 + 0.4 * jitter(0))) + Vec3::Y * (speed * (0.6 + 0.4 * jitter(1)) + 1.0);
-    // Tipping its top out, tumbling as it goes.
-    let turn = (THROW_TURN / size).clamp(THROW_TURN_LEAST, 4.0);
-    let spin =
-        Vec3::Y.cross(out) * turn + Vec3::new(jitter(2), jitter(3), jitter(4)) * (turn * 0.4);
-    (velocity, spin)
+    let out = (across * side + flat * 0.5).normalize_or(across * side);
+    let far = away.length();
+    let fall = (THROW_NEAR / far.max(THROW_NEAR)).powf(THROW_FALL);
+    let bulk = (THROW_SIZE / size.max(THROW_SIZE)).powf(THROW_BULK);
+    let speed = (THROW_SPEED * bulk * fall * scale).min(THROW_MOST);
+    let thrown =
+        out * (speed * (1.0 + 0.3 * jitter(0))) + Vec3::Y * (speed * (0.7 + 0.3 * jitter(1)));
+    // Tipping its top out: how tall it stands and how deep it is along
+    // `out`, and the least spin that takes it over its outer lower edge
+    // (its middle rising by `rise` as it goes over).
+    let span = |axis: Vec3| {
+        let (lo, hi) = corners
+            .iter()
+            .map(|c| c.dot(axis))
+            .fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(x), b.max(x)));
+        (hi - lo).max(0.05)
+    };
+    let (height, depth) = (span(Vec3::Y), span(out));
+    let rise = (height * 0.5).hypot(depth * 0.5) - height * 0.5;
+    let least =
+        (6.0 * m2_engine::physics::GRAVITY * rise / (height * height + depth * depth)).sqrt();
+    let near = ((TOPPLE_REACH - far) / (TOPPLE_REACH - THROW_NEAR)).clamp(0.0, 1.0);
+    let tip = Vec3::Y.cross(out) * (least * TOPPLE * near);
+    // Its middle swings out and up about that edge.
+    let swing = tip.cross(Vec3::Y * (height * 0.5) - out * (depth * 0.5));
+    let tumble = Vec3::new(jitter(2), jitter(3), jitter(4)) * (TUMBLE * speed / size);
+    (thrown + swing, tip + tumble)
 }
 
 /// A number from -0.5 to 0.5 for piece `i`, `k`th of its kind: the same
@@ -1016,7 +1224,8 @@ mod tests {
             .enumerate()
             .map(|(i, &(centre, half))| {
                 let piece = LoosePiece::block(None, centre, half, 1000.0);
-                let (velocity, spin) = launch(i, centre, piece.size(), (middle, Vec3::Z), from);
+                let box_at = corners(Mat4::IDENTITY, &piece);
+                let (velocity, spin) = launch(i, &box_at, (middle, Vec3::Z), from, 1.0);
                 physics.add_rubble(&piece, Mat4::IDENTITY, velocity, spin)
             })
             .collect();
@@ -1040,5 +1249,59 @@ mod tests {
                 assert!(at.z.abs() > 2.0 && at.length() < 30.0, "block at {at}");
             }
         }
+    }
+
+    #[test]
+    fn a_gates_footings_come_out_of_the_ground_and_its_far_walls_stand() {
+        let mut physics = Physics::new();
+        let half = 100.0;
+        let v = [
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(-half, 0.0, half),
+        ];
+        let ground = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        physics.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+        physics.step(1.0 / 60.0);
+        // A gate along x, the bomb on its top. Wall slabs 5 m wide, 6 m
+        // high and 1.5 m thick, their footings a metre in the ground: one
+        // by the gatehouse, one 30 m along the wall.
+        let middle = Vec3::new(0.0, 2.0, 0.0);
+        let from = Vec3::new(0.0, 9.0, 0.0);
+        let parts = [
+            (Vec3::new(4.0, 2.0, 0.76), Vec3::new(2.5, 3.0, 0.75)),
+            (Vec3::new(30.0, 2.0, 0.76), Vec3::new(2.5, 3.0, 0.75)),
+        ];
+        let thrown: Vec<_> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, &(centre, half))| {
+                let piece = LoosePiece::block(None, centre, half, 1000.0);
+                let box_at = corners(Mat4::IDENTITY, &piece);
+                let lift = buried(&physics, &box_at);
+                assert!((lift - 1.0).abs() < 0.05, "slab {i} lifted {lift}");
+                let (velocity, spin) = launch(i, &box_at, (middle, Vec3::Z), from, 1.0);
+                let at = Mat4::from_translation(Vec3::Y * lift);
+                physics.add_rubble(&piece, at, velocity, spin)
+            })
+            .collect();
+        for _ in 0..240 {
+            physics.step(1.0 / 60.0);
+        }
+        let place = |k: usize| physics.debris_place(thrown[k]).unwrap();
+        // The one by the gatehouse lies across the way through.
+        let near = place(0);
+        assert!(near.transform_vector3(Vec3::Y).y.abs() < 0.5, "{near}");
+        assert!(near.transform_point3(parts[0].0).z > 2.0, "{near}");
+        // The far one stands where it stood, out of the ground.
+        let far = place(1);
+        let up = far.transform_vector3(Vec3::Y);
+        let at = far.transform_point3(parts[1].0);
+        assert!(up.y > 0.9, "{up}");
+        assert!(
+            at.with_y(0.0).distance(parts[1].0.with_y(0.0)) < 1.5 && (at.y - 3.0).abs() < 0.3,
+            "{at}"
+        );
     }
 }

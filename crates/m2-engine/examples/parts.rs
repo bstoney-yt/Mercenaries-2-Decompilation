@@ -172,8 +172,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
             let size = [0, 1, 2].map(|k| n.bounds_max[k] - n.bounds_min[k]);
+            let mid = [0, 1, 2].map(|k| (n.bounds_max[k] + n.bounds_min[k]) * 0.5);
             println!(
-                "  {state}node {i:3} parent {:>4} {:08x}{} flags {:#06x} unk {:#010x} size {:.1}x{:.1}x{:.1}  {}",
+                "  {state}node {i:3} parent {:>4} {:08x}{} flags {:#06x} unk {:#010x} size {:.1}x{:.1}x{:.1} at {:.1},{:.1},{:.1}  {}",
                 n.parent.map_or("-".into(), |p| p.to_string()),
                 n.name_hash,
                 word(n.name_hash).map_or(String::new(), |w| format!(" ({w})")),
@@ -182,6 +183,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 size[0],
                 size[1],
                 size[2],
+                mid[0],
+                mid[1],
+                mid[2],
                 segs.join("; ")
             );
         }
