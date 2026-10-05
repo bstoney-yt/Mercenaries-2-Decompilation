@@ -98,6 +98,11 @@ pub struct Lighting {
     pub bloom_threshold: f32,
     /// Per-channel scale on the finished frame: a colour grade.
     pub grade: Vec3,
+    /// Power on the frame's luminance about mid grey (0.18): above 1
+    /// darkens shade and brightens highlights.
+    pub contrast: f32,
+    /// 1 keeps colours, 0 is grey, above 1 more vivid.
+    pub saturation: f32,
     /// The air between the eye and what it sees, and the sky.
     pub haze: Haze,
 }
@@ -164,6 +169,8 @@ impl Default for Lighting {
             bloom: 0.0,
             bloom_threshold: 1.0,
             grade: Vec3::ONE,
+            contrast: 1.0,
+            saturation: 1.0,
             haze: Haze::default(),
         }
     }

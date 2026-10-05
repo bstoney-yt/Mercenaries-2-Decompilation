@@ -590,22 +590,39 @@ impl Game {
     }
 }
 
-/// `M2_POST=exposure,bloom,threshold[,r,g,b]` sets the finishing pass by
-/// hand, for matching reference frames.
+/// `M2_POST=exposure=0.8,bloom=0.35,threshold=1,contrast=1.3,
+/// saturation=1.6,grade=1.05/1/0.9,haze=1` sets the finishing pass and
+/// haze by hand (any subset, `haze` scaling the scattering), for matching
+/// reference frames.
 fn post_override(lighting: &mut m2_render::Lighting) {
-    static POST: std::sync::OnceLock<Option<Vec<f32>>> = std::sync::OnceLock::new();
-    let Some(v) = POST.get_or_init(|| {
-        let s = std::env::var("M2_POST").ok()?;
-        let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        (v.len() >= 3).then_some(v)
-    }) else {
-        return;
-    };
-    lighting.exposure = v[0];
-    lighting.bloom = v[1];
-    lighting.bloom_threshold = v[2];
-    if let [r, g, b] = v[3..] {
-        lighting.grade = Vec3::new(r, g, b);
+    static POST: std::sync::OnceLock<Vec<(String, Vec<f32>)>> = std::sync::OnceLock::new();
+    let settings = POST.get_or_init(|| {
+        let Ok(s) = std::env::var("M2_POST") else {
+            return Vec::new();
+        };
+        s.split(',')
+            .filter_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                let v: Vec<f32> = v.split('/').filter_map(|x| x.trim().parse().ok()).collect();
+                Some((k.trim().to_owned(), v))
+            })
+            .collect()
+    });
+    for (k, v) in settings {
+        match (k.as_str(), v.as_slice()) {
+            ("exposure", [x]) => lighting.exposure = *x,
+            ("bloom", [x]) => lighting.bloom = *x,
+            ("threshold", [x]) => lighting.bloom_threshold = *x,
+            ("contrast", [x]) => lighting.contrast = *x,
+            ("saturation", [x]) => lighting.saturation = *x,
+            ("grade", [r, g, b]) => lighting.grade = Vec3::new(*r, *g, *b),
+            ("haze", [x]) => {
+                lighting.haze.rayleigh *= *x;
+                lighting.haze.mie *= *x;
+            }
+            ("inscatter", [x]) => lighting.haze.inscattering = *x,
+            _ => {}
+        }
     }
 }
 
