@@ -37,9 +37,13 @@ pub enum Action {
     /// A melee bash with what she holds (also the middle mouse button,
     /// once the mouse is captured): opens a supply crate.
     Melee,
-    /// Take up the rifle, or the rocket launcher.
+    /// Take up the rifle, or what she carries in the launcher's place
+    /// (the RPG, or the grenade launcher once she has taken one up).
     Rifle,
     Launcher,
+    /// Open or close the support menu (her support items: the first
+    /// contract's Satellite Guided Bomb).
+    Support,
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
@@ -82,6 +86,7 @@ impl Default for Bindings {
             (Melee, vec![KeyB]),
             (Rifle, vec![Digit1]),
             (Launcher, vec![Digit2]),
+            (Support, vec![KeyT]),
             (ToggleMouse, vec![Tab]),
             (Fullscreen, vec![F11]),
             (NextGait, vec![KeyN]),

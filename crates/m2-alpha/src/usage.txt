@@ -17,11 +17,7 @@ m2-alpha [options]
   --size <w>x<h>         window size
   --vsync on|off
   --fullscreen
-<<<<<<< HEAD
   --sea <metres>         sea level (default -36, the game's water shader)
-=======
-  --sea <metres>         sea level (default -36, the game's)
->>>>>>> origin/claude/project-thread-a0j3gw
   --double-sided         start with back-face culling off (as F3)
   --screenshot <out.ppm> render one frame offscreen and exit
   --drive                with --screenshot on the island: get in the
@@ -34,6 +30,8 @@ m2-alpha [options]
                          just before the picture
   --bash                 with --screenshot on the island: a melee bash just
                          before the picture
+  --bash-clip <hash>     with --bash: bash with this clip (one of those the
+                         "player meleebash clips:" line lists)
   --lead <s>             with --jump, --throw or --bash: seconds before the
                          picture she starts (default 0.2)
   --fight                with --screenshot on the island: shoot the nearest
@@ -52,7 +50,16 @@ m2-alpha [options]
   --face <degrees>       with --screenshot on foot: face this way first
                          (0 is +z, 90 is +x)
   --aim                  with --screenshot on foot: weapon up for the picture
-  --weapon rifle|rpg     with --screenshot on foot: the weapon she has up
+  --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
+                         (gl: the supply crate's grenade launcher)
+  --satellite <stage>    with --screenshot on foot: call a Satellite Guided
+                         Bomb on the spot 45 m ahead of her (the support
+                         key, the use key, the view steered over it and
+                         confirmed, the wheel pressed in each wedge); the
+                         picture through the satellite's view (view), with
+                         the timing wheel after the first press (wheel),
+                         or --fight-wait seconds (at least 0.8) after the
+                         bomb lands (bomb)
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --probe                with --screenshot: list what rays from where she
@@ -94,6 +101,10 @@ Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
 Fighting (mouse captured): left button or F fires, right button aims,
 1 rifle, 2 rocket launcher, G throws a grenade, B or the middle button
 bashes (a supply crate breaks open).
+Support: T opens the support menu, and E takes up the item's designator
+and looks through the satellite: WASD or the mouse moves its view, fire
+or E confirms, and fire or E as the timing wheel's marker passes through
+each grey wedge sends the bomb. T, 1 or 2 calls it off; so does being hurt.
 V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
 M music on/off, Tab or right mouse captures the mouse, N next gait
 (--model), F11 fullscreen, F3 culling, F5 quick save, F9 quick load,

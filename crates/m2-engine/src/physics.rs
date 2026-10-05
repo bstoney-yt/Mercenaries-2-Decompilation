@@ -593,7 +593,7 @@ const WRECK_FLOAT: f32 = 0.4;
 /// up): from a standstill to this speed, m/s, its hull rises up to this
 /// far, metres, and its bow this much more than its stern (and the stern
 /// that much less), metres. Invented, from the videos.
-const PLANE_SPEED: f32 = 12.0;
+pub const PLANE_SPEED: f32 = 12.0;
 const PLANE_RISE: f32 = 0.3;
 const PLANE_TRIM: f32 = 0.25;
 /// The steepest hill a vehicle takes about as fast as the flat, radians,
@@ -684,16 +684,31 @@ impl Character {
 /// through them.
 const RAGDOLL: r::Group = r::Group::GROUP_2;
 
-/// The collision group of loose pieces: they land on the world, vehicles
-/// and people but not on each other (a broken prop's pieces start
-/// touching: boxes round them overlap).
+/// The collision group of loose pieces: they land on the world and people
+/// but not on each other (a broken prop's pieces start touching: boxes
+/// round them overlap), and vehicles drive through them (round 90's tank
+/// sat lifted on three pieces of what it had knocked down, two tracks off
+/// the ground).
 const DEBRIS: r::Group = r::Group::GROUP_3;
+
+/// The collision group of vehicles' hulls and turrets.
+const VEHICLE: r::Group = r::Group::GROUP_4;
 
 /// Queries that see everything but ragdolls.
 fn solid<'a>() -> r::QueryFilter<'a> {
     r::QueryFilter::default().groups(r::InteractionGroups::new(
         r::Group::ALL,
         r::Group::ALL.difference(RAGDOLL),
+        r::InteractionTestMode::And,
+    ))
+}
+
+/// Queries that see what a wheel stands on: everything but ragdolls and
+/// loose pieces.
+fn ground<'a>() -> r::QueryFilter<'a> {
+    r::QueryFilter::default().groups(r::InteractionGroups::new(
+        r::Group::ALL,
+        r::Group::ALL.difference(RAGDOLL).difference(DEBRIS),
         r::InteractionTestMode::And,
     ))
 }
@@ -847,7 +862,7 @@ impl Physics {
             if v.held {
                 continue;
             }
-            let filter = solid().exclude_rigid_body(v.controller.chassis);
+            let filter = ground().exclude_rigid_body(v.controller.chassis);
             let queries = w.broad_phase.as_query_pipeline_mut(
                 w.narrow_phase.query_dispatcher(),
                 &mut w.bodies,
@@ -1004,7 +1019,7 @@ impl Physics {
             .friction(DEBRIS_FRICTION)
             .collision_groups(r::InteractionGroups::new(
                 DEBRIS,
-                r::Group::ALL.difference(DEBRIS),
+                r::Group::ALL.difference(DEBRIS).difference(VEHICLE),
                 r::InteractionTestMode::And,
             ));
         self.world.insert_collider(collider, Some(body));
@@ -1109,6 +1124,7 @@ impl Physics {
             size.x * size.x + size.z * size.z,
             size.x * size.x + size.y * size.y,
         ) * (m / 12.0 * 1.5);
+        let hull = r::InteractionGroups::new(VEHICLE, r::Group::ALL, r::InteractionTestMode::And);
         let collider = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
             .translation(vector(centre))
             .mass_properties(r::MassProperties::new(
@@ -1116,7 +1132,8 @@ impl Physics {
                 m,
                 vector(inertia),
             ))
-            .friction(0.6);
+            .friction(0.6)
+            .collision_groups(hull);
         self.world.insert_collider(collider, Some(body));
         // The turret on top, adding nothing to the mass the hull carries.
         if let Some((lo, hi)) = spec.turret_box {
@@ -1124,7 +1141,8 @@ impl Physics {
             let turret = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
                 .translation(vector((lo + hi) * 0.5))
                 .density(0.0)
-                .friction(0.6);
+                .friction(0.6)
+                .collision_groups(hull);
             self.world.insert_collider(turret, Some(body));
         }
 
@@ -2573,6 +2591,54 @@ mod tests {
         assert!(posed[0].abs_diff_eq(rest[0], 1e-4));
         let lamp = (placed * posed[2]).w_axis.truncate();
         assert!(lamp.distance(Vec3::new(101.0, 1.1, 0.0)) < 1e-4, "{lamp}");
+    }
+
+    #[test]
+    fn vehicles_drive_through_loose_pieces() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        // A heavy beam lying across the way 10 m ahead, settled.
+        let beam = LoosePiece {
+            node: None,
+            shape: r::SharedShape::cuboid(2.0, 0.3, 0.3),
+            mass: 400.0,
+            from_model: Mat4::IDENTITY,
+        };
+        let d = p.add_debris(
+            &beam,
+            Mat4::from_translation(Vec3::new(0.0, 0.3, 10.0)),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        );
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let rest = p.vehicle_transform(id).unwrap().w_axis.y;
+        let mut highest = rest;
+        for _ in 0..240 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            highest = highest.max(p.vehicle_transform(id).unwrap().w_axis.y);
+        }
+        let at = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        assert!(at.z > 16.0, "drove past the beam to {at}");
+        assert!(highest < rest + 0.1, "rode up from {rest} to {highest}");
+        // And the beam lies where it was.
+        let beam_at = p.debris_place(d).unwrap().w_axis.truncate();
+        assert!(
+            beam_at.distance(Vec3::new(0.0, 0.3, 10.0)) < 0.2,
+            "{beam_at}"
+        );
     }
 
     #[test]

@@ -35,6 +35,18 @@ pub fn use_attach_frame(on: bool) {
 /// Muzzle marker node of the weapon models.
 pub const MUZZLE: u32 = 0xb148_6ef3;
 
+/// The grenade launcher (its template, `Grenade Launcher`): 75 rounds a
+/// minute from a clip of 6; its round (`GL Projectile`) flies at 20 m/s
+/// under the whole of gravity and bursts where it lands (`SpawnOnDeath`
+/// an `Explosion (Grenade)`). A clip takes this long to load, seconds
+/// (invented), and a round that never lands bursts this far out, metres.
+pub const LAUNCHER_CLIP: u32 = 6;
+const LOB_GAP: f32 = 60.0 / 75.0;
+const LOB_SPEED: f32 = 20.0;
+const LAUNCHER_RELOAD: f32 = 2.5;
+const LOB_RANGE: f32 = 250.0;
+const LOB_FLASH: f32 = 0.45;
+
 /// Rifle: seconds between shots, range, and damage per hit (three kill).
 const RIFLE_GAP: f32 = 0.11;
 const RIFLE_RANGE: f32 = 400.0;
@@ -113,6 +125,22 @@ pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
 const WRECK: f32 = 6.0;
+/// The satellite-guided bomb's blasts, from the template database's
+/// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
+/// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
+/// 2 s on): reach (metres) and damage at the heart, falling off to
+/// nothing at the edge (the falloff is invented). The frag is stopped by
+/// what stands between: the radio's word is to get behind cover.
+pub const BOMB: (f32, f32) = (20.0, 100.0);
+pub const BOMB_FRAG: (f32, f32) = (50.0, 300.0);
+const BOMB_FINAL: (f32, f32) = (2.0, 500.0);
+/// A vehicle a blast hits this hard is wrecked.
+const WRECKING: f32 = 60.0;
+/// What the bomb leaves burning: this many fires within this far
+/// (metres), each for between these (seconds; the videos: 4 to 6 s).
+const BOMB_FIRES: usize = 5;
+const BOMB_FIRE_SPREAD: f32 = 9.0;
+const BOMB_FIRE_TIME: (f32, f32) = (4.0, 6.0);
 
 /// A hand weapon's model and where its muzzle is, model space.
 #[derive(Debug)]
@@ -139,6 +167,13 @@ pub struct Arsenal {
     pub rpg: Option<WeaponModel>,
     pub rocket: Option<WeaponModel>,
     pub grenade: Option<WeaponModel>,
+    /// The grenade launcher and its 40 mm round.
+    pub launcher: Option<WeaponModel>,
+    pub round: Option<WeaponModel>,
+    /// Her own rifle, the carbine (soldiers carry the AK47), and the
+    /// satellite designator.
+    pub carbine: Option<WeaponModel>,
+    pub designator: Option<WeaponModel>,
     /// The right hand's node in the human skeleton, and its attach point.
     pub hand: Option<usize>,
     pub attach: Option<usize>,
@@ -168,6 +203,10 @@ impl Arsenal {
             "rpg" => self.rpg = w,
             "rocket" => self.rocket = w,
             "grenade" => self.grenade = w,
+            "mgl" => self.launcher = w,
+            "40mm" => self.round = w,
+            "m4" => self.carbine = w,
+            "detonator" => self.designator = w,
             _ => {}
         }
     }
@@ -347,6 +386,55 @@ pub enum Weapon {
     #[default]
     Rifle,
     Rpg,
+    /// The first contract's supply crate's: taken up in the RPG's place.
+    GrenadeLauncher,
+}
+
+impl Weapon {
+    /// Rounds a clip holds: the HUD's 30 for the rifle, one rocket, and
+    /// the grenade launcher's template's 6.
+    pub fn clip(self) -> u32 {
+        match self {
+            Weapon::Rifle => 30,
+            Weapon::Rpg => 1,
+            Weapon::GrenadeLauncher => LAUNCHER_CLIP,
+        }
+    }
+
+    /// Its model's asset name (its template's `ModelName`).
+    pub fn model_name(self) -> &'static str {
+        match self {
+            Weapon::Rifle => "global_weapon_ak47",
+            Weapon::Rpg => "global_weapon_rpg",
+            Weapon::GrenadeLauncher => "global_weapon_mgl",
+        }
+    }
+
+    /// The weapons of hers whose models are known by name.
+    pub const ALL: [Weapon; 3] = [Weapon::Rifle, Weapon::Rpg, Weapon::GrenadeLauncher];
+}
+
+/// The rounds of a weapon that runs out: in its clip, and stored.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rounds {
+    pub clip: u32,
+    pub stored: u32,
+}
+
+impl Rounds {
+    /// `n` rounds: as many as a clip of `size` holds loaded, the rest
+    /// stored.
+    pub fn of(n: u32, size: u32) -> Self {
+        let clip = n.min(size);
+        Self {
+            clip,
+            stored: n - clip,
+        }
+    }
+
+    pub fn total(self) -> u32 {
+        self.clip + self.stored
+    }
 }
 
 /// Something brief to draw.
@@ -374,9 +462,13 @@ pub enum Effect {
 pub enum Sound {
     Shot(Vec3),
     Launch(Vec3),
+    /// The grenade launcher's.
+    Lob(Vec3),
     Explosion(Vec3),
     /// A tank's main gun.
     Cannon(Vec3),
+    /// The satellite-guided bomb landing.
+    Bomb(Vec3),
 }
 
 /// A blow or a round that landed on something of the world's rather than
@@ -387,6 +479,33 @@ pub struct Strike {
     pub at: Vec3,
     pub damage: f32,
     pub key: Option<StaticKey>,
+}
+
+/// Rounds she has picked up for her rifle and RPG: the play keeps no
+/// ammunition of their own, so these only add to what the HUD counts (the
+/// grenade launcher's are kept, in [`Combat::launcher_rounds`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Picked {
+    pub rifle: u32,
+    pub rockets: u32,
+}
+
+impl Picked {
+    pub fn add(&mut self, weapon: Weapon, rounds: u32) {
+        match weapon {
+            Weapon::Rifle => self.rifle += rounds,
+            Weapon::Rpg => self.rockets += rounds,
+            Weapon::GrenadeLauncher => {}
+        }
+    }
+}
+
+/// What flies, to draw: a rocket, a thrown grenade or a launched round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flying {
+    Rocket,
+    Grenade,
+    Round,
 }
 
 /// Something that happened to her worth a word from her.
@@ -420,6 +539,12 @@ enum Projectile {
         velocity: Vec3,
         fuse: f32,
     },
+    /// A grenade launcher's round: bursts where it lands.
+    Round {
+        at: Vec3,
+        velocity: Vec3,
+        flown: f32,
+    },
 }
 
 /// What she asks of her weapons this tick.
@@ -433,6 +558,9 @@ pub struct Trigger {
     /// A melee bash.
     pub melee: bool,
     pub select: Option<Weapon>,
+    /// The support key: the support menu opens or closes
+    /// ([`crate::support`]).
+    pub support: bool,
 }
 
 /// The fight's state.
@@ -467,6 +595,19 @@ pub struct Combat {
     pub went_off: Vec<Vec3>,
     /// Blows and rounds that struck the world in the last step.
     pub struck: Vec<Strike>,
+    /// Rounds she has picked up, for the HUD's counters.
+    pub picked: Picked,
+    /// What she carries in the launcher's place, which the launcher key
+    /// takes up: the RPG in free play; nothing at the first contract's
+    /// start, where she lands with the carbine alone (the footage: nothing
+    /// on her back, only "Carbine" in the weapon box) until the supply
+    /// crate's grenade launcher.
+    pub second: Option<Weapon>,
+    /// The grenade launcher's rounds, while she carries one.
+    pub launcher_rounds: Option<Rounds>,
+    /// She holds the satellite designator instead of her weapon
+    /// ([`crate::support`]).
+    pub designator: bool,
     /// The last rocket: from the launcher, towards what the crosshair was on.
     pub last_launch: Option<(Vec3, Vec3)>,
     /// Blasts about to go off (something explosive caught): where, and
@@ -499,6 +640,10 @@ impl Default for Combat {
             last_blast: None,
             went_off: Vec::new(),
             struck: Vec::new(),
+            picked: Picked::default(),
+            second: Some(Weapon::Rpg),
+            launcher_rounds: None,
+            designator: false,
             last_launch: None,
             fuses: Vec::new(),
             fires: Vec::new(),
@@ -577,13 +722,59 @@ pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
 }
 
 impl Combat {
-    /// Rockets and grenades in flight: (is a rocket, where, velocity).
-    pub fn projectiles(&self) -> impl Iterator<Item = (bool, Vec3, Vec3)> + '_ {
+    /// Rockets, grenades and rounds in flight: what, where, velocity.
+    pub fn projectiles(&self) -> impl Iterator<Item = (Flying, Vec3, Vec3)> + '_ {
         self.projectiles.iter().filter_map(|p| match *p {
             Projectile::Rocket { shell: true, .. } => None,
-            Projectile::Rocket { at, velocity, .. } => Some((true, at, velocity)),
-            Projectile::Grenade { at, velocity, .. } => Some((false, at, velocity)),
+            Projectile::Rocket { at, velocity, .. } => Some((Flying::Rocket, at, velocity)),
+            Projectile::Grenade { at, velocity, .. } => Some((Flying::Grenade, at, velocity)),
+            Projectile::Round { at, velocity, .. } => Some((Flying::Round, at, velocity)),
         })
+    }
+
+    /// Takes up `weapon` (a launcher: the RPG or a grenade launcher) in
+    /// the launcher's place, `rounds` with it, and has it up: what she
+    /// carried there, if anything, she leaves, with its rounds (the
+    /// RPG's are endless: none).
+    pub fn equip(&mut self, weapon: Weapon, rounds: u32) -> Option<(Weapon, u32)> {
+        let left = self.second.map(|w| match w {
+            Weapon::GrenadeLauncher => (w, self.launcher_rounds.take().map_or(0, Rounds::total)),
+            w => (w, 0),
+        });
+        if weapon == Weapon::GrenadeLauncher {
+            self.launcher_rounds = Some(Rounds::of(rounds, LAUNCHER_CLIP));
+        }
+        self.second = Some(weapon);
+        self.weapon = weapon;
+        left
+    }
+
+    /// Lands her with the carbine alone, as the first contract starts.
+    pub fn carbine_only(&mut self) {
+        self.second = None;
+        self.launcher_rounds = None;
+        self.weapon = Weapon::Rifle;
+    }
+
+    /// Rounds taken from a pickup for `weapon`: the grenade launcher's go
+    /// with the one she carries (none, they are lost); the rest only add
+    /// to what the HUD counts.
+    pub fn take_ammo(&mut self, weapon: Weapon, rounds: u32) {
+        match (weapon, &mut self.launcher_rounds) {
+            (Weapon::GrenadeLauncher, Some(r)) => r.stored += rounds,
+            (Weapon::GrenadeLauncher, None) => {}
+            _ => self.picked.add(weapon, rounds),
+        }
+    }
+
+    /// Whether the weapon in the launcher's place can fire: the RPG
+    /// always, a grenade launcher with rounds left.
+    pub fn second_loaded(&self) -> bool {
+        match self.second {
+            Some(Weapon::GrenadeLauncher) => self.launcher_rounds.is_some_and(|r| r.total() > 0),
+            Some(_) => true,
+            None => false,
+        }
     }
 
     /// Tank shells in flight (drawn as streaks, not models).
@@ -659,8 +850,11 @@ impl Combat {
         }
 
         let on_foot = f.player.landed && f.player.driving.is_none() && self.down <= 0.0;
-        if let Some(w) = trigger.select {
-            self.weapon = w;
+        // Asked for a launcher: whichever she carries in its place.
+        match (trigger.select, self.second) {
+            (Some(Weapon::Rifle), _) => self.weapon = Weapon::Rifle,
+            (Some(_), Some(w)) => self.weapon = w,
+            _ => {}
         }
         f.player.launcher = self.weapon == Weapon::Rpg;
         // A grenade leaves her hand at its moment in the throw; knocked
@@ -693,6 +887,7 @@ impl Combat {
                 match self.weapon {
                     Weapon::Rifle => self.player_shoot(f),
                     Weapon::Rpg => self.launch(f),
+                    Weapon::GrenadeLauncher => self.lob(f),
                 }
             }
             if trigger.throw && self.reload <= 0.0 {
@@ -792,7 +987,8 @@ impl Combat {
         let (eye, dir) = Self::aim_ray(f.player);
         let hit = cast_shot(f.physics, f.people, eye, dir, RIFLE_RANGE, None, None);
         let to = hit.map_or(eye + dir * RIFLE_RANGE, |h| eye + dir * h.0);
-        let from = Self::muzzle(f, f.arsenal.rifle.as_ref());
+        let rifle = f.arsenal.carbine.as_ref().or(f.arsenal.rifle.as_ref());
+        let from = Self::muzzle(f, rifle);
         self.effect(Effect::Tracer { from, to }, 0.07);
         self.effect(
             Effect::Flash {
@@ -968,6 +1164,53 @@ impl Combat {
             1.2,
         );
         self.sounds.push(Sound::Launch(from));
+        alarm(f.people, f.player.character.position);
+    }
+
+    /// Fires the grenade launcher at what the crosshair is on: the round
+    /// is lobbed to come down there when it can reach (the lower arc),
+    /// else as far as it goes that way. The template gives the round's
+    /// speed and fall, not how the game aims it. An empty clip loads from
+    /// the stored rounds; with none, nothing fires.
+    fn lob(&mut self, f: &mut Field<'_>) {
+        let Some(rounds) = self.launcher_rounds.as_mut() else {
+            return;
+        };
+        if rounds.clip == 0 {
+            if rounds.stored > 0 {
+                *rounds = Rounds::of(rounds.stored, LAUNCHER_CLIP);
+                self.reload = LAUNCHER_RELOAD;
+            }
+            return;
+        }
+        rounds.clip -= 1;
+        self.reload = LOB_GAP;
+        if rounds.clip == 0 && rounds.stored > 0 {
+            *rounds = Rounds::of(rounds.stored, LAUNCHER_CLIP);
+            self.reload = LAUNCHER_RELOAD;
+        }
+        self.aim_left = AIM_AFTER_SHOT * 2.0;
+        let (eye, dir) = Self::aim_ray(f.player);
+        let from = Self::muzzle(f, f.arsenal.launcher.as_ref().or(f.arsenal.rifle.as_ref()));
+        let goal = cast_shot(f.physics, f.people, eye, dir, ROCKET_RANGE, None, None)
+            .map_or(eye + dir * ROCKET_RANGE, |h| eye + dir * h.0);
+        let gravity = m2_engine::physics::GRAVITY;
+        let velocity = lob_velocity(from, goal, LOB_SPEED, gravity)
+            .unwrap_or_else(|| farthest(goal - from, LOB_SPEED));
+        self.projectiles.push(Projectile::Round {
+            at: from,
+            velocity,
+            flown: 0.0,
+        });
+        self.effect(
+            Effect::Flash {
+                at: from,
+                dir: velocity.normalize_or(dir),
+                size: LOB_FLASH,
+            },
+            FLASH_TIME * 1.4,
+        );
+        self.sounds.push(Sound::Lob(from));
         alarm(f.people, f.player.character.position);
     }
 
@@ -1200,6 +1443,27 @@ impl Combat {
                 }
                 true
             }
+            Projectile::Round {
+                at,
+                velocity,
+                flown,
+            } => {
+                velocity.y -= m2_engine::physics::GRAVITY * dt;
+                let step = *velocity * dt;
+                let len = step.length();
+                if let Some((d, _)) = cast_shot(f.physics, f.people, *at, step, len, None, None) {
+                    blasts.push(*at + step.normalize_or_zero() * d);
+                    return false;
+                }
+                *at += step;
+                *flown += len;
+                // Into the sea, or never landing: it bursts there.
+                if f.physics.water().is_some_and(|w| at.y < w) || *flown > LOB_RANGE {
+                    blasts.push(*at);
+                    return false;
+                }
+                true
+            }
             Projectile::Grenade { at, velocity, fuse } => {
                 velocity.y -= m2_engine::physics::GRAVITY * dt;
                 let step = *velocity * dt;
@@ -1305,6 +1569,148 @@ impl Combat {
         alarm(f.people, at);
     }
 
+    /// The satellite-guided bomb landing at `at` ([`BOMB`]): a great
+    /// fireball and a column of smoke, fires left burning about it.
+    pub fn bomb(&mut self, f: &mut Field<'_>, at: Vec3) {
+        self.blasts += 1;
+        self.last_blast = Some(at);
+        self.went_off.push(at);
+        self.sounds.push(Sound::Bomb(at));
+        self.harm(f, at, BOMB, false);
+        self.harm(f, at + Vec3::Y, BOMB_FRAG, true);
+        self.effect(
+            Effect::Fire {
+                at: at + Vec3::Y * 3.0,
+                size: 16.0,
+            },
+            1.4,
+        );
+        for k in 0..8 {
+            let a = k as f32 * std::f32::consts::TAU / 8.0;
+            let ring = Vec3::new(a.sin(), 0.3, a.cos());
+            self.effect(
+                Effect::Fire {
+                    at: at + ring * 8.0,
+                    size: 8.0,
+                },
+                1.0,
+            );
+            self.effect(
+                Effect::Smoke {
+                    at: at + ring * 7.0 + Vec3::Y * 2.0,
+                    size: 8.0,
+                },
+                6.0,
+            );
+        }
+        for k in 1..=5 {
+            let k = k as f32;
+            self.effect(
+                Effect::Smoke {
+                    at: at + Vec3::Y * (6.0 * k),
+                    size: 10.0 + k,
+                },
+                7.0 + k,
+            );
+        }
+        for k in 0..BOMB_FIRES {
+            let a = k as f32 * std::f32::consts::TAU / BOMB_FIRES as f32 + self.random();
+            let r = BOMB_FIRE_SPREAD * (0.7 + 0.6 * self.random());
+            let (shortest, longest) = BOMB_FIRE_TIME;
+            let burn = shortest + (longest - shortest) * (self.random() + 0.5);
+            let spot = at + Vec3::new(a.sin() * r, 1.2, a.cos() * r);
+            self.fires.push((spot, 2.5, burn, 0.0));
+        }
+        alarm(f.people, at);
+    }
+
+    /// The bomb's final strike at `at`, after it lands.
+    pub fn final_strike(&mut self, f: &mut Field<'_>, at: Vec3) {
+        self.went_off.push(at);
+        self.sounds.push(Sound::Explosion(at));
+        self.harm(f, at, BOMB_FINAL, false);
+        self.effect(
+            Effect::Fire {
+                at: at + Vec3::Y,
+                size: 6.0,
+            },
+            0.7,
+        );
+    }
+
+    /// Harm from a blast at `at` out to `radius` metres: `damage` at its
+    /// heart, falling off to nothing at the edge; with `cover`, what
+    /// stands between (the ground, walls, props) stops it. People are
+    /// thrown and those near run, vehicles hit hard enough are wrecked
+    /// and thrown, explosives within it go off.
+    fn harm(&mut self, f: &mut Field<'_>, at: Vec3, (radius, damage): (f32, f32), cover: bool) {
+        let physics: &Physics = f.physics;
+        let shielded = |to: Vec3| {
+            let way = to - at;
+            let d = way.length();
+            cover && d > 1.0 && physics.cast_ray(at, way / d, d - 0.5).is_some()
+        };
+        let mut killed = false;
+        for n in f.people.npcs.iter_mut() {
+            let chest = n.chest();
+            let d = chest.distance(at);
+            if d < radius * 2.0 {
+                n.panic(at);
+            }
+            if d >= radius || shielded(chest) {
+                continue;
+            }
+            let near = 1.0 - d / radius;
+            let away = (chest - at).with_y(0.0).normalize_or(Vec3::X);
+            let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
+            killed |= n.hurt(damage * near, push) && n.soldier;
+        }
+        let her = (f.player.driving.is_none() && f.player.landed)
+            .then(|| f.player.character.position + Vec3::Y)
+            .filter(|&p| p.distance(at) < radius && !shielded(p))
+            .map(|p| damage * (1.0 - p.distance(at) / radius));
+        let mut wrecking = Vec::new();
+        for (i, v) in f.vehicles.iter().enumerate() {
+            let Some(body) = v.id.and_then(|id| physics.vehicle_transform(id)) else {
+                continue;
+            };
+            let (lo, hi) = v.spec.bounds;
+            let centre = body.transform_point3((lo + hi) * 0.5);
+            let d = centre.distance(at);
+            let near = 1.0 - d / radius;
+            if d < radius && damage * near >= WRECKING && !shielded(centre) {
+                wrecking.push((i, centre, near));
+            }
+        }
+        for (i, centre, near) in wrecking {
+            let v = &mut f.vehicles[i];
+            let Some(id) = v.id else { continue };
+            let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
+            let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3);
+            f.physics
+                .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
+            if !v.wrecked {
+                v.wrecked = true;
+                f.physics.wreck_vehicle(id);
+                self.wrecks.push((i, 0.0));
+                self.remarks.push(Remark::Wreck);
+            }
+        }
+        for e in f.explosives.iter_mut() {
+            if !e.gone && e.at.distance(at) < e.size + radius {
+                e.gone = true;
+                self.fuses.push((e.at, CHAIN_DELAY));
+                self.fires.push((e.at, e.size, BURN, 0.0));
+            }
+        }
+        if let Some(d) = her {
+            self.hurt_player(f, d);
+        }
+        if killed {
+            self.remarks.push(Remark::Kill);
+        }
+    }
+
     fn smoke_wrecks(&mut self, f: &mut Field<'_>, dt: f32) {
         let mut puffs = Vec::new();
         for (i, next) in &mut self.wrecks {
@@ -1351,6 +1757,31 @@ impl Combat {
             );
         }
     }
+}
+
+/// The velocity at `speed` that lobs a round from `from` down onto `to`
+/// under `gravity`: the lower of its two arcs, if it reaches.
+fn lob_velocity(from: Vec3, to: Vec3, speed: f32, gravity: f32) -> Option<Vec3> {
+    let d = to - from;
+    let flat = d.with_y(0.0);
+    let x = flat.length();
+    if x < 1e-3 {
+        return Some(d.normalize_or(Vec3::NEG_Y) * speed);
+    }
+    let v2 = speed * speed;
+    let room = v2 * v2 - gravity * (gravity * x * x + 2.0 * d.y * v2);
+    if room < 0.0 {
+        return None;
+    }
+    let (sin, cos) = ((v2 - room.sqrt()) / (gravity * x)).atan().sin_cos();
+    Some(flat / x * (speed * cos) + Vec3::Y * (speed * sin))
+}
+
+/// The velocity at `speed` that lobs a round furthest along `way`: 45
+/// degrees up.
+fn farthest(way: Vec3, speed: f32) -> Vec3 {
+    let flat = way.with_y(0.0).normalize_or(Vec3::Z);
+    (flat + Vec3::Y).normalize() * speed
 }
 
 /// Gunfire or a blast at `at`: soldiers close by turn on the player,
@@ -1709,6 +2140,138 @@ mod tests {
             "{hit:?} eye {} chest {chest}",
             player.eye()
         );
+    }
+
+    #[test]
+    fn a_lobbed_round_comes_down_where_it_is_aimed() {
+        let g = m2_engine::physics::GRAVITY;
+        let from = Vec3::new(0.0, 1.5, 0.0);
+        for to in [
+            Vec3::new(0.0, 0.0, 25.0),
+            Vec3::new(10.0, 4.0, 10.0),
+            Vec3::new(0.0, -6.0, 3.0),
+        ] {
+            let v = lob_velocity(from, to, LOB_SPEED, g).expect("in reach");
+            assert!((v.length() - LOB_SPEED).abs() < 1e-3);
+            // Flown in small steps, it passes within a hand of the mark.
+            let (mut at, mut vel, mut closest) = (from, v, f32::MAX);
+            for _ in 0..4000 {
+                vel.y -= g * 0.001;
+                at += vel * 0.001;
+                closest = closest.min(at.distance(to));
+            }
+            assert!(closest < 0.1, "{to}: {closest}");
+            // The lower arc: no higher than it need be.
+            assert!(v.y < LOB_SPEED * 0.75, "{to}: {v}");
+        }
+        // Beyond its reach (about 40 m on the level): nothing; then it is
+        // lobbed as far as it goes.
+        assert!(lob_velocity(from, Vec3::new(0.0, 0.0, 60.0), LOB_SPEED, g).is_none());
+        let far = farthest(Vec3::Z * 60.0, LOB_SPEED);
+        assert!((far.y - far.z).abs() < 1e-4 && far.x == 0.0);
+    }
+
+    #[test]
+    fn the_grenade_launcher_takes_the_rpgs_place_and_runs_out() {
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        for _ in 0..3 {
+            player.update(&physics, Default::default(), dt);
+        }
+        assert!(player.landed);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut vehicles = Vec::new();
+        let mut combat = Combat::default();
+        // Taken from the crate with 3 clips: the RPG is left behind.
+        assert_eq!(
+            combat.equip(Weapon::GrenadeLauncher, 18),
+            Some((Weapon::Rpg, 0))
+        );
+        assert_eq!(combat.weapon, Weapon::GrenadeLauncher);
+        assert_eq!(
+            combat.launcher_rounds,
+            Some(Rounds {
+                clip: 6,
+                stored: 12
+            })
+        );
+        // The launcher key takes up what is in the launcher's place.
+        let mut step = |combat: &mut Combat, player: &mut Player, trigger: Trigger| {
+            let mut field = Field {
+                physics: &mut physics,
+                player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            combat.step(&mut field, trigger, dt);
+        };
+        for select in [Weapon::Rifle, Weapon::Rpg] {
+            let trigger = Trigger {
+                select: Some(select),
+                ..Trigger::default()
+            };
+            step(&mut combat, &mut player, trigger);
+        }
+        assert_eq!(combat.weapon, Weapon::GrenadeLauncher);
+        // At the ground 20 m ahead: the rounds come down there, a clip at
+        // a time, until all 18 are gone.
+        let mark = Vec3::new(0.0, 0.0, 20.0);
+        player.aim_crosshair_at(mark);
+        let fire = Trigger {
+            fire: true,
+            ..Trigger::default()
+        };
+        for _ in 0..(60.0 * 30.0) as usize {
+            step(&mut combat, &mut player, fire);
+        }
+        assert_eq!(combat.launcher_rounds, Some(Rounds::default()));
+        assert_eq!(combat.blasts, 18);
+        let last = combat.last_blast.unwrap();
+        assert!(last.with_y(0.0).distance(mark) < 1.0, "{last}");
+        let lobs = combat
+            .take_sounds()
+            .iter()
+            .filter(|s| matches!(s, Sound::Lob(_)))
+            .count();
+        assert_eq!(lobs, 18);
+        assert!(!combat.second_loaded());
+        // More rounds go with it; the RPG taken back leaves it, with them.
+        combat.take_ammo(Weapon::GrenadeLauncher, 6);
+        assert!(combat.second_loaded());
+        assert_eq!(
+            combat.equip(Weapon::Rpg, 0),
+            Some((Weapon::GrenadeLauncher, 6))
+        );
+        assert_eq!(
+            (combat.second, combat.launcher_rounds),
+            (Some(Weapon::Rpg), None)
+        );
+        // Landed with the carbine alone: the launcher key does nothing, and
+        // the crate's launcher leaves nothing behind.
+        combat.carbine_only();
+        let mut step = |combat: &mut Combat, trigger: Trigger| {
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            combat.step(&mut field, trigger, dt);
+        };
+        let two = Trigger {
+            select: Some(Weapon::Rpg),
+            ..Trigger::default()
+        };
+        step(&mut combat, two);
+        assert_eq!(combat.weapon, Weapon::Rifle);
+        assert_eq!(combat.equip(Weapon::GrenadeLauncher, 18), None);
+        assert_eq!(combat.second, Some(Weapon::GrenadeLauncher));
     }
 
     #[test]

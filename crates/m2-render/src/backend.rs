@@ -126,6 +126,10 @@ pub struct Lighting {
     /// a display value, at mid luminance) to white, as the game's post
     /// pass does.
     pub monochrome: Option<Vec4>,
+    /// Film grain over the finished frame: how far each speck (two
+    /// pixels square, new each frame) moves a display value either way;
+    /// 0 for none.
+    pub grain: f32,
 }
 
 /// The game's adaptation and tone map, from its atmosphere's `Bloom*`
@@ -268,6 +272,7 @@ impl Default for Lighting {
             adaptation: None,
             tone_map: None,
             monochrome: None,
+            grain: 0.0,
         }
     }
 }

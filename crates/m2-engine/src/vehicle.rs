@@ -66,6 +66,18 @@ pub const WEAPONS: [(&str, &str); 4] = [
     ("grenade", "global_weapon_fraggrenade"),
 ];
 
+/// Hand weapons found by their models' own names (the names their
+/// templates' `ModelName` hash): the first contract's supply crate's
+/// grenade launcher and its 40 mm round, her carbine (the template
+/// "Carbine") and the satellite designator (the template "Satellite
+/// Designator").
+pub const NAMED_WEAPONS: [(&str, &str); 4] = [
+    ("mgl", "global_weapon_mgl"),
+    ("40mm", "global_weapon_40mmgrenade"),
+    ("m4", "global_weapon_m4"),
+    ("detonator", "global_weapon_detonator"),
+];
+
 /// Root node of every human skeleton.
 const HUMAN_ROOT: u32 = 0xcbc1_eb51;
 /// Model flag of skinned models.
@@ -127,6 +139,12 @@ pub fn catalogue<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<Catalogu
             .max_by_key(|&(_, nodes)| nodes);
         if let Some((m, _)) = found {
             out.weapons.push((name, m.0));
+        }
+    }
+    for (name, asset) in NAMED_WEAPONS {
+        let hash = m2_assets::name_hash(asset);
+        if model_textures.iter().any(|m| m.0 == hash) {
+            out.weapons.push((name, hash));
         }
     }
     for (model, textures, human, _) in model_textures {

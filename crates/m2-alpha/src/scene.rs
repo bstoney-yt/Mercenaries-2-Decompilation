@@ -74,7 +74,13 @@ pub struct Rig {
     pub(crate) hands: std::sync::OnceLock<Option<(usize, usize)>>,
     /// The arm that carries the rifle low, found once.
     pub(crate) arm: std::sync::OnceLock<Option<Arc<[bool]>>>,
+    /// The clips' events met and not yet taken: (clip, event).
+    pub cues: Vec<(usize, usize)>,
 }
+
+/// Most clip events a rig keeps for the taking (older ones are dropped:
+/// nobody took them).
+const CUES_KEPT: usize = 16;
 
 /// How a rifle is held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +146,7 @@ impl Rig {
             return Some(Self {
                 skeleton: Arc::new(skeleton),
                 animator: Animator::default(),
+                cues: Vec::new(),
                 ..self.clone()
             });
         }
@@ -183,6 +190,7 @@ impl Rig {
             }),
             animator: Animator::default(),
             gait: Gait::Idle,
+            cues: Vec::new(),
         })
     }
 
@@ -199,9 +207,19 @@ impl Rig {
             locomotion,
             animator: Animator::default(),
             gait,
+            cues: Vec::new(),
         };
         rig.set_gait(gait);
         rig
+    }
+
+    /// Plays on `dt` seconds, keeping the clips' events met for the
+    /// taking ([`CUES_KEPT`] at most).
+    pub fn advance(&mut self, dt: f32) {
+        self.animator.events_ahead(dt, &self.clips, &mut self.cues);
+        let over = self.cues.len().saturating_sub(CUES_KEPT);
+        self.cues.drain(..over);
+        self.animator.advance(dt);
     }
 
     pub fn set_gait(&mut self, gait: Gait) {
@@ -373,6 +391,17 @@ impl Rig {
             .collect();
         (nodes, skin)
     }
+}
+
+/// A sound one of the clips' events asks for (`fol_grenade_sidethrow`):
+/// its name and category (`sound`, `sound_surface`, `sound_weapon`),
+/// where, and whether it is the player's own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cue {
+    pub name: String,
+    pub category: String,
+    pub at: Vec3,
+    pub hers: bool,
 }
 
 /// The most an aiming upper body twists at the waist from the legs,
@@ -819,6 +848,21 @@ impl Scene {
                 named(clips.bash),
                 named(clips.bash_low)
             );
+            // Every clip with a blow, by how near its start is to the
+            // rifle held ready (for `--bash-clip`).
+            for (event, list) in npc::FightClips::by_posture(rig) {
+                let shown: Vec<String> = list
+                    .iter()
+                    .map(|&(i, at, off)| {
+                        let c = &rig.clips[i];
+                        format!(
+                            "{:08x} ({:.2} s, {at:.2}, off {off:.2})",
+                            c.hash, c.info.duration
+                        )
+                    })
+                    .collect();
+                eprintln!("player {event} clips: {}", shown.join(", "));
+            }
         }
         self.people.clips = clips;
         let mut player = Player::new(x, z, 0.0, model);
@@ -1128,6 +1172,39 @@ impl Scene {
         }
     }
 
+    /// The sound events the clips have met since last asked: the
+    /// player's, and those of the living within `reach` of `listener`;
+    /// the others' are dropped.
+    pub fn take_cues(&mut self, listener: Vec3, reach: f32) -> Vec<Cue> {
+        let mut out = Vec::new();
+        let mut take = |rig: &mut Rig, at: Vec3, hers: bool, heard: bool| {
+            for (c, e) in rig.cues.drain(..) {
+                let Some(ev) = rig.clips.get(c).and_then(|c| c.clip.events.get(e)) else {
+                    continue;
+                };
+                if heard && ev.category.to_ascii_lowercase().starts_with("sound") {
+                    out.push(Cue {
+                        name: ev.name.clone(),
+                        category: ev.category.clone(),
+                        at,
+                        hers,
+                    });
+                }
+            }
+        };
+        if let Some(p) = &mut self.player
+            && let Some((_, rig)) = &mut p.model
+        {
+            take(rig, p.character.position + Vec3::Y, true, true);
+        }
+        for n in &mut self.people.npcs {
+            let at = n.character.position + Vec3::Y;
+            let heard = n.alive && at.distance(listener) <= reach;
+            take(&mut n.rig, at, false, heard);
+        }
+        out
+    }
+
     /// Steps every rig to its next gait.
     pub fn cycle_gaits(&mut self) {
         for rig in self.models.iter_mut().filter_map(|p| p.rig.as_mut()) {
@@ -1197,12 +1274,17 @@ impl Scene {
             let body = player.model_matrix();
             model.draw_posed(backend, queue, body, &nodes, &skin)?;
             // Throwing, her weapon is put away and the grenade is in her
-            // hand until it goes.
+            // hand until it goes; calling a support strike, the
+            // designator is. Her rifle is the carbine (soldiers' the
+            // AK47).
             let weapon = match (player.throwing, fight.weapon) {
+                _ if fight.designator => &self.arsenal.designator,
                 (Some(_), _) if fight.grenade_in_hand() => &self.arsenal.grenade,
                 (Some(_), _) => &None,
+                (None, Weapon::Rifle) if self.arsenal.carbine.is_some() => &self.arsenal.carbine,
                 (None, Weapon::Rifle) => &self.arsenal.rifle,
                 (None, Weapon::Rpg) => &self.arsenal.rpg,
+                (None, Weapon::GrenadeLauncher) => &self.arsenal.launcher,
             };
             if !player.down
                 && let Some(w) = weapon
@@ -1211,7 +1293,7 @@ impl Scene {
                     body,
                     &nodes,
                     (self.arsenal.hand, self.arsenal.attach),
-                    rig.two_handed,
+                    rig.two_handed && !fight.designator,
                 )
             {
                 w.model.draw(queue, at);
@@ -1248,19 +1330,27 @@ impl Scene {
                 w.model.draw(queue, at);
             }
         }
-        for (rocket, at, velocity) in fight.projectiles() {
-            let model = if rocket {
-                &self.arsenal.rocket
-            } else {
-                &self.arsenal.grenade
+        for (what, at, velocity) in fight.projectiles() {
+            let model = match what {
+                combat::Flying::Rocket => &self.arsenal.rocket,
+                combat::Flying::Grenade => &self.arsenal.grenade,
+                combat::Flying::Round => match &self.arsenal.round {
+                    Some(_) => &self.arsenal.round,
+                    None => &self.arsenal.grenade,
+                },
             };
             if let Some(w) = model {
-                // The rocket's nose (its muzzle marker) along its flight.
+                // A rocket's nose (its muzzle marker) along its flight, and
+                // a launched round's; a thrown grenade tumbles as it was.
                 let turn = Quat::from_rotation_arc(
                     w.muzzle.normalize_or(Vec3::Z),
                     velocity.normalize_or(Vec3::Z),
                 );
-                let spin = if rocket { turn } else { Quat::IDENTITY };
+                let spin = if what == combat::Flying::Grenade {
+                    Quat::IDENTITY
+                } else {
+                    turn
+                };
                 w.model
                     .draw(queue, Mat4::from_rotation_translation(spin, at));
             }

@@ -33,6 +33,7 @@ use crate::assets::{AssetError, AssetSource};
 use crate::atmosphere::{Atmosphere, AtmosphereRegion};
 use crate::motion::PropMotion;
 use crate::physics::CollisionShape;
+use crate::pickup::Leavings;
 use crate::technique::Technique;
 use crate::tuning::VehicleTuning;
 
@@ -211,7 +212,10 @@ const ENGINE_BANK_FIELD: u32 = 0x14a6_7fa6;
 /// case), and the names by template id.
 #[derive(Clone, Debug, Default)]
 pub struct Templates {
+    /// By name, lower case: of several so named, the lowest id's.
     pub by_name: HashMap<String, TemplateInfo>,
+    /// By id, each its own (several templates may share a name).
+    pub infos: HashMap<u32, TemplateInfo>,
     /// Each template's name as the database writes it, by its id (bit 31
     /// set): the id an entity's [`parent`](m2_assets::layer::Placement::parent)
     /// gives.
@@ -220,6 +224,8 @@ pub struct Templates {
     pub tuning: HashMap<u32, VehicleTuning>,
     /// The templates whose props move on their own, by id.
     pub motions: HashMap<u32, PropMotion>,
+    /// What templates leave when destroyed, and what pickups give.
+    pub leavings: Leavings,
 }
 
 impl Templates {
@@ -245,22 +251,45 @@ impl Templates {
             .or_else(|| self.motions.get(&parent))
     }
 
+    /// The id of the template an entity or template name names, whatever
+    /// its case: of several so named, the lowest, so that it is the same
+    /// every run.
+    pub fn id(&self, name: &str) -> Option<u32> {
+        self.ids(name).first().copied()
+    }
+
+    /// The ids of every template an entity or template name names,
+    /// lowest first.
+    pub fn ids(&self, name: &str) -> Vec<u32> {
+        let stem = member_stem(name);
+        let mut ids: Vec<u32> = self
+            .names
+            .iter()
+            .filter(|(_, n)| n.eq_ignore_ascii_case(stem))
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// The template with id `id` (an entity's parent): its name, and what
     /// the database says of it.
     pub fn by_id(&self, id: u32) -> Option<(&str, &TemplateInfo)> {
         let name = self.names.get(&id)?;
-        Some((name, self.by_name.get(&name.to_ascii_lowercase())?))
+        let info = match self.infos.get(&id) {
+            Some(info) => info,
+            None => self.by_name.get(&name.to_ascii_lowercase())?,
+        };
+        Some((name, info))
     }
 
     /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
     /// else of a template of its `model`
     /// ([`tuning_for_model`](Self::tuning_for_model)).
     pub fn tuning_for(&self, name: &str, model: u32) -> Option<VehicleTuning> {
-        let stem = member_stem(name);
-        self.names
+        self.ids(name)
             .iter()
-            .filter(|(_, n)| n.eq_ignore_ascii_case(stem))
-            .find_map(|(id, _)| self.tuning.get(id).copied())
+            .find_map(|id| self.tuning.get(id).copied())
             .or_else(|| self.tuning_for_model(model))
     }
 
@@ -355,29 +384,38 @@ impl Templates {
         let humans = carrying(PERSON);
         let minds: HashSet<u32> = PERSON_AI.iter().flat_map(|c| carrying(c)).collect();
         let names = db.names();
+        let infos: HashMap<u32, TemplateInfo> = names
+            .keys()
+            .map(|&id| {
+                let vehicle = kinds.get(&id).copied();
+                (
+                    id,
+                    TemplateInfo {
+                        model: model_of.get(&id).copied().filter(|m| models.contains(m)),
+                        vehicle,
+                        engine: engines.get(&id).copied(),
+                        person: humans.contains(&id) || (minds.contains(&id) && vehicle.is_none()),
+                        human: humans.contains(&id),
+                    },
+                )
+            })
+            .collect();
+        // Of twins by name, the lowest id's (inserted last) stands, as in
+        // `id`.
+        let mut order: Vec<(u32, &str)> = names.iter().map(|(&id, &n)| (id, n)).collect();
+        order.sort_unstable_by_key(|&(id, _)| std::cmp::Reverse(id));
         let templates = Self {
-            by_name: names
+            by_name: order
                 .iter()
-                .map(|(&id, name)| {
-                    let vehicle = kinds.get(&id).copied();
-                    (
-                        name.to_ascii_lowercase(),
-                        TemplateInfo {
-                            model: model_of.get(&id).copied().filter(|m| models.contains(m)),
-                            vehicle,
-                            engine: engines.get(&id).copied(),
-                            person: humans.contains(&id)
-                                || (minds.contains(&id) && vehicle.is_none()),
-                            human: humans.contains(&id),
-                        },
-                    )
-                })
+                .map(|&(id, name)| (name.to_ascii_lowercase(), infos[&id]))
                 .collect(),
+            infos,
             names: names
                 .into_iter()
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
             tuning: crate::tuning::read(&db),
+            leavings: crate::pickup::read(&db),
             motions: crate::motion::read_templates(&db),
         };
         (templates, atmosphere)
@@ -1541,8 +1579,7 @@ mod tests {
                 ("hmmwv".to_owned(), t(2, None)),
             ]),
             names: HashMap::from([(0x8000_0001, "Valiant (Python)".to_owned())]),
-            tuning: HashMap::new(),
-            motions: HashMap::new(),
+            ..Templates::default()
         };
         assert_eq!(
             db.by_id(0x8000_0001).map(|(n, _)| n),
@@ -1552,6 +1589,31 @@ mod tests {
         assert_eq!(db.engine_for_model(1), Some(0xaa));
         assert_eq!(db.engine_for_model(2), None);
         assert_eq!(db.engine_for_model(3), None);
+    }
+
+    // Round 93's crate rockets gave her nothing: found by name, the RPG's
+    // info was another's (likely a second template named "RPG").
+    #[test]
+    fn same_named_templates_keep_their_own_infos() {
+        let t = |model| TemplateInfo {
+            model: Some(model),
+            vehicle: None,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let db = Templates {
+            by_name: HashMap::from([("rpg".to_owned(), t(1))]),
+            infos: HashMap::from([(0x8000_0001, t(1)), (0x8000_0002, t(2))]),
+            names: HashMap::from([
+                (0x8000_0001, "RPG".to_owned()),
+                (0x8000_0002, "RPG".to_owned()),
+            ]),
+            ..Templates::default()
+        };
+        assert_eq!(db.by_id(0x8000_0002).map(|(_, i)| i.model), Some(Some(2)));
+        assert_eq!(db.get("RPG").map(|i| i.model), Some(Some(1)));
+        assert_eq!(db.id("rpg"), Some(0x8000_0001));
     }
 
     #[test]

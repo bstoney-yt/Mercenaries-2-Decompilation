@@ -68,6 +68,36 @@
 //!                           template: name, model, components, and what
 //!                           the alpha's world index makes of it
 //! find:<hash>[,..]          names for hashes
+//! cues[:<name>,..]          which bank sounds the clips' sound events
+//!                           (and the names given) play: each name tried
+//!                           as a sound's, bare, numbered, lettered and
+//!                           with each ground surface (`SoundMaterial`
+//!                           templates' and common ones) before or after;
+//!                           then the cues no sound answers, and how many
+//!                           of each bank's sounds a cue answers
+//! sounddb[:<word>,..]       the template database's sound side: the
+//!                           components the sound materials have, each
+//!                           field's values (how many set, distinct, bank
+//!                           sounds); some materials in full (default the
+//!                           ground's and people's; or every template
+//!                           whose name holds a word), a bank sound shown
+//!                           as bank#index and length; every component
+//!                           whose values name bank sounds or clip cues;
+//!                           templates named like a cue; and how many of
+//!                           each bank's sounds the database names
+//! strings:<word>[,..]       the scripts' string constants holding a word,
+//!                           by script (hash, name if known, how many
+//!                           strings it has, the globals it sets), each
+//!                           cut at 100 characters
+//! text:<word>[,..]          the English string table's entries holding a
+//!                           word: key, its name if known, the text (cut
+//!                           at 100 characters); 200 at most
+//! soundnames[:<bank>,..]    names for banks' sounds (default fol_shared,
+//!                           collision_shared, destruction_shared and the
+//!                           resident stream 7871f925) built of a prefix,
+//!                           one or two words (the sound materials', the
+//!                           clips' sound events' and their parts, and
+//!                           common ones) and an ending
 //! ```
 //!
 //! Names come from every NUL-terminated string in the four archives and
@@ -82,12 +112,17 @@ use std::path::Path;
 
 use m2_assets::animation::ANIMATION_TYPE;
 use m2_assets::layer::{LAYER_TYPE, STRING_FIELD, TEMPLATE_DB_TYPE};
+use m2_assets::lua::{Chunk, SCRIPT_TYPE};
 use m2_assets::model::MODEL_TYPE;
 use m2_assets::scatter::SCATTER_TYPE;
 use m2_assets::sound::SOUND_BANK_TYPE;
+use m2_assets::strings::STRINGS_TYPE;
 use m2_assets::terrain::{LOW_RES_TYPE, TERRAIN_TYPE};
 use m2_assets::vertex::DeclUsage;
-use m2_assets::{BlockContents, Clip, Layer, Model, Scatter, SoundBank, TerrainCell, Texture};
+use m2_assets::{
+    BlockContents, Clip, Layer, Model, Scatter, SoundBank, StreamIndex, StringTable, TerrainCell,
+    Texture,
+};
 use m2_engine::anim::{BoundClip, Skeleton};
 use m2_engine::assets::TEXTURE_TYPE;
 use m2_engine::audio::SoundLibrary;
@@ -107,12 +142,23 @@ type ModelMaterials = (u32, Vec<(u32, Vec<u32>)>);
 type ClipRow = (u32, usize, f32, f32, Vec<(f32, String, String)>);
 /// Per event (category, name): the clips with it (hash, time, seconds).
 type EventUses = BTreeMap<(String, String), Vec<(u32, f32, f32)>>;
-/// A layer component's name, fields and records by entity.
+/// A layer component's name, fields and records by entity (an entity may
+/// have a component more than once: the first contract's supply crate has
+/// two `SpawnOnDeath`s).
 type ComponentRecords<'a> = (
     &'a str,
     Vec<m2_assets::layer::Field>,
-    HashMap<u32, &'a [u8]>,
+    HashMap<u32, Vec<&'a [u8]>>,
 );
+
+/// A component's records by entity, each entity's in data order.
+fn by_entity<'a>(c: &m2_assets::layer::Component<'a>) -> HashMap<u32, Vec<&'a [u8]>> {
+    let mut out: HashMap<u32, Vec<&'a [u8]>> = HashMap::new();
+    for (id, r) in c.records().unwrap_or_default() {
+        out.entry(id).or_default().push(r);
+    }
+    out
+}
 
 /// FNV-1a over the parts' bytes, each OR 0x20, then `*`: the name hash
 /// of the parts joined, without joining them.
@@ -716,6 +762,11 @@ fn main() -> Result<(), Error> {
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
             "parents" => parents(&mut source, &names, arg),
+            "cues" => cues(&mut source, &names, arg),
+            "sounddb" => sounddb(&mut source, &names, arg),
+            "soundnames" => soundnames(&mut source, &names, arg),
+            "strings" => script_strings(&mut source, &names, arg),
+            "text" => texts(&mut source, &names, arg),
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -730,6 +781,132 @@ fn main() -> Result<(), Error> {
         if let Err(e) = result {
             println!("{section}: {e}");
         }
+    }
+    Ok(())
+}
+
+/// The words of a section's argument, lower case.
+fn words_of(arg: &str) -> Vec<String> {
+    arg.split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// `s` cut at `n` characters.
+fn cut(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}..", &s[..i]),
+        None => s.to_owned(),
+    }
+}
+
+/// The scripts' string constants holding a word, by script.
+fn script_strings<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words = words_of(arg);
+    let index = source.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == SCRIPT_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let (mut seen, mut found) = (HashSet::new(), 0);
+    for b in blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != SCRIPT_TYPE || !seen.insert(e.name_hash) {
+                continue;
+            }
+            let Ok(chunk) = Chunk::from_asset(data) else {
+                continue;
+            };
+            let strings = chunk.main.strings();
+            let hits: Vec<String> = strings
+                .iter()
+                .filter(|s| {
+                    let l = s.to_ascii_lowercase();
+                    words.iter().any(|w| l.contains(w))
+                })
+                .map(|s| cut(s, 100))
+                .collect();
+            if hits.is_empty() {
+                continue;
+            }
+            found += 1;
+            let mut sets: Vec<String> = chunk
+                .main
+                .names(chunk.version)
+                .into_iter()
+                .filter(|(u, _)| *u == m2_assets::lua::NameUse::SetGlobal)
+                .map(|(_, n)| n)
+                .collect();
+            sets.sort();
+            sets.dedup();
+            let more = sets.len().saturating_sub(12);
+            sets.truncate(12);
+            println!(
+                "  script {:08x} {} ({} strings; sets {}{}):",
+                e.name_hash,
+                names.show(e.name_hash),
+                strings.len(),
+                sets.join(" "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            );
+            for h in hits {
+                println!("    {h}");
+            }
+        }
+    }
+    println!("scripts holding a word: {found} of {}", seen.len());
+    Ok(())
+}
+
+/// The English string table's entries holding a word.
+fn texts<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words = words_of(arg);
+    let english = m2_assets::name_hash("english");
+    let index = source.archive().index();
+    if !index
+        .assets()
+        .iter()
+        .any(|a| index.type_hash(a) == STRINGS_TYPE && a.name_hash == english)
+    {
+        println!("no english string table");
+        return Ok(());
+    }
+    let table = StringTable::parse(&source.asset(english, STRINGS_TYPE)?)?;
+    let mut hits: Vec<(u32, &str)> = table
+        .strings
+        .iter()
+        .filter(|(_, t)| {
+            let l = t.to_lowercase();
+            words.iter().any(|w| l.contains(w))
+        })
+        .map(|(&k, t)| (k, t.as_str()))
+        .collect();
+    hits.sort_unstable();
+    println!(
+        "entries holding a word: {} of {}",
+        hits.len(),
+        table.strings.len()
+    );
+    for (k, t) in hits.iter().take(200) {
+        println!("  {k:08x} {} {}", names.show(*k), cut(t, 100));
     }
     Ok(())
 }
@@ -896,6 +1073,1005 @@ fn sounds<R: Read + Seek>(
                 loud.join(""),
                 zcr.join("")
             );
+        }
+    }
+    Ok(())
+}
+
+/// Ground surfaces a footstep's sound may be named for, besides those the
+/// template database's `SoundMaterial (..)` templates name.
+const SURFACES: [&str; 44] = [
+    "dirt",
+    "grass",
+    "sand",
+    "concrete",
+    "asphalt",
+    "tarmac",
+    "road",
+    "metal",
+    "solidmetal",
+    "hollowmetal",
+    "metalgrate",
+    "wood",
+    "woodhollow",
+    "water",
+    "shallowwater",
+    "deepwater",
+    "puddle",
+    "mud",
+    "gravel",
+    "rock",
+    "stone",
+    "tile",
+    "carpet",
+    "snow",
+    "leaves",
+    "foliage",
+    "jungle",
+    "default",
+    "generic",
+    "hard",
+    "soft",
+    "glass",
+    "plastic",
+    "rubber",
+    "flesh",
+    "body",
+    "brick",
+    "marble",
+    "straw",
+    "thatch",
+    "earth",
+    "ground",
+    "bush",
+    "pavement",
+];
+
+/// A cue's name with each ending tried: none, numbered (`_01`, `_1`,
+/// `01`, `1`), lettered (`_a`, `a`), looped.
+fn endings() -> Vec<String> {
+    let mut out = vec![String::new(), "_lp".into(), "_loop".into()];
+    for n in 1..=24 {
+        out.push(format!("_{n:02}"));
+        out.push(format!("_{n}"));
+        out.push(format!("{n:02}"));
+        out.push(format!("{n}"));
+    }
+    for c in 'a'..='h' {
+        out.push(format!("_{c}"));
+        out.push(format!("{c}"));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The clips' sound events: (category, name) -> how many clips carry it.
+fn sound_events<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+) -> Result<BTreeMap<(String, String), usize>, Error> {
+    let index = source.archive().index();
+    let mut clip_blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == ANIMATION_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    clip_blocks.sort_unstable();
+    clip_blocks.dedup();
+    let mut events: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for b in clip_blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != ANIMATION_TYPE {
+                continue;
+            }
+            let Ok(clip) = Clip::parse(data) else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            for ev in &clip.events {
+                let key = (ev.category.clone(), ev.name.clone());
+                if ev.category.to_ascii_lowercase().starts_with("sound") && seen.insert(key.clone())
+                {
+                    *events.entry(key).or_default() += 1;
+                }
+            }
+        }
+    }
+    Ok(events)
+}
+
+/// Every bank's sounds, streamed banks' too.
+#[derive(Default)]
+struct BankSounds {
+    /// Sound hash -> (bank, index, seconds) for each bank holding it.
+    sounds: HashMap<u32, Vec<(u32, usize, f32)>>,
+    /// Every bank with its number of sounds.
+    banks: Vec<(u32, usize)>,
+    /// A streamed bank's file (`ambience.pws`), by bank.
+    streamed: HashMap<u32, String>,
+}
+
+impl BankSounds {
+    /// A bank's name, or its stream file's.
+    fn label(&self, names: &Names, bank: u32) -> String {
+        names
+            .get(bank)
+            .map(str::to_owned)
+            .or_else(|| self.streamed.get(&bank).cloned())
+            .unwrap_or_else(|| "?".to_owned())
+    }
+}
+
+fn bank_sounds<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<BankSounds, Error> {
+    let index = source.archive().index();
+    let mut bank_blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == SOUND_BANK_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    bank_blocks.sort_unstable();
+    bank_blocks.dedup();
+    let mut out = BankSounds::default();
+    for b in bank_blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != SOUND_BANK_TYPE {
+                continue;
+            }
+            let sounds: Vec<(u32, f32)> = if let Ok(bank) = SoundBank::parse(data) {
+                bank.sounds
+                    .iter()
+                    .map(|s| (s.hash, s.frames as f32 / s.rate.max(1) as f32))
+                    .collect()
+            } else if let Ok(index) = StreamIndex::parse(data) {
+                out.streamed.insert(e.name_hash, index.file.clone());
+                index
+                    .streams
+                    .iter()
+                    .map(|s| (s.hash, s.seconds()))
+                    .collect()
+            } else {
+                continue;
+            };
+            out.banks.push((e.name_hash, sounds.len()));
+            for (i, (hash, secs)) in sounds.into_iter().enumerate() {
+                out.sounds
+                    .entry(hash)
+                    .or_default()
+                    .push((e.name_hash, i, secs));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn cues<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let index = source.archive().index();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash);
+    let mut events = sound_events(source)?;
+    for w in arg.split(',').filter(|w| !w.is_empty()) {
+        events.entry(("asked".into(), w.to_owned())).or_default();
+    }
+    // Surfaces: the template database's sound materials, and common ones.
+    let mut materials: Vec<String> = Vec::new();
+    if let Some(h) = db_hash {
+        let data = source.asset(h, TEMPLATE_DB_TYPE)?;
+        let db = Layer::parse(&data)?;
+        for n in db.names().values() {
+            if let Some(inner) = n
+                .strip_prefix("SoundMaterial (")
+                .and_then(|r| r.strip_suffix(')'))
+            {
+                materials.push(inner.to_owned());
+            }
+        }
+    }
+    materials.sort();
+    materials.dedup();
+    println!(
+        "{} SoundMaterial templates: {}",
+        materials.len(),
+        materials.join(", ")
+    );
+    let mut surfaces: Vec<String> = materials.clone();
+    surfaces.extend(SURFACES.iter().map(|s| (*s).to_owned()));
+    surfaces.sort();
+    surfaces.dedup();
+    let library = bank_sounds(source)?;
+    let (sounds, banks) = (&library.sounds, &library.banks);
+    println!(
+        "{} sound events in clips (+ {} asked); {} banks, {} sounds",
+        events.keys().filter(|k| k.0 != "asked").count(),
+        events.keys().filter(|k| k.0 == "asked").count(),
+        banks.len(),
+        sounds.values().map(Vec::len).sum::<usize>()
+    );
+    let ends = endings();
+    let prefixes = ["", "fol_", "sfx_", "ahj_", "sfx_fol_"];
+    let mut answered: HashSet<u32> = HashSet::new();
+    let mut silent: Vec<String> = Vec::new();
+    for ((category, name), clips) in &events {
+        let lower = name.to_ascii_lowercase();
+        // (sound hash, the name that hashed to it)
+        let mut found: BTreeMap<u32, String> = BTreeMap::new();
+        let mut try_name = |parts: &[&str]| {
+            let h = hash_parts(parts);
+            if sounds.contains_key(&h) {
+                found.entry(h).or_insert_with(|| parts.concat());
+            }
+        };
+        for p in prefixes {
+            for e in &ends {
+                try_name(&[p, &lower, e]);
+                if category.contains("surface") || category == "asked" {
+                    for s in &surfaces {
+                        try_name(&[p, &lower, "_", s, e]);
+                        try_name(&[p, s, "_", &lower, e]);
+                        try_name(&[p, &lower, s, e]);
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            silent.push(format!("{category}/{name}"));
+            continue;
+        }
+        answered.extend(found.keys().copied());
+        let library = &library;
+        let shown: Vec<String> = found
+            .iter()
+            .take(8)
+            .flat_map(|(h, n)| {
+                sounds[h].iter().take(1).map(move |(bank, i, secs)| {
+                    format!("{}#{i} {h:08x} {n} {secs:.2}s", library.label(names, *bank))
+                })
+            })
+            .collect();
+        println!(
+            "  {category}/{name} ({clips} clips): {} sounds: {}{}",
+            found.len(),
+            shown.join("; "),
+            if found.len() > 8 { "; ..." } else { "" }
+        );
+    }
+    println!("{} cues no sound answers:", silent.len());
+    for chunk in silent.chunks(8) {
+        println!("  {}", chunk.join(", "));
+    }
+    println!("sounds a cue answers, per bank (those with any):");
+    let mut per_bank: BTreeMap<u32, usize> = BTreeMap::new();
+    for h in &answered {
+        for (bank, _, _) in &sounds[h] {
+            *per_bank.entry(*bank).or_default() += 1;
+        }
+    }
+    for (bank, total) in banks {
+        if let Some(n) = per_bank.get(bank) {
+            println!(
+                "  {:08x} {}: {n} of {total}",
+                bank,
+                library.label(names, *bank)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Words the sound side's field names are guessed from: alone and in
+/// pairs (`FootstepWalk`), bare or with a type prefix (`fVolume`).
+const SOUND_WORDS: [&str; 120] = [
+    "Sound",
+    "Sounds",
+    "Set",
+    "Material",
+    "Surface",
+    "Footstep",
+    "Footsteps",
+    "Foot",
+    "Step",
+    "Walk",
+    "Run",
+    "Sprint",
+    "Land",
+    "Jump",
+    "Takeoff",
+    "Scuff",
+    "Slide",
+    "Impact",
+    "Impacts",
+    "Hit",
+    "Bullet",
+    "Melee",
+    "Body",
+    "Fall",
+    "Bounce",
+    "Roll",
+    "Scrape",
+    "Break",
+    "Destroy",
+    "Destroyed",
+    "Debris",
+    "Collision",
+    "Collide",
+    "Crash",
+    "Light",
+    "Lite",
+    "Medium",
+    "Med",
+    "Heavy",
+    "Soft",
+    "Hard",
+    "Small",
+    "Sml",
+    "Large",
+    "Lrg",
+    "Min",
+    "Max",
+    "Velocity",
+    "Speed",
+    "Mass",
+    "Volume",
+    "Pitch",
+    "Gain",
+    "Bank",
+    "Cue",
+    "Name",
+    "Type",
+    "Parent",
+    "Effect",
+    "Particle",
+    "Decal",
+    "Explosion",
+    "Fire",
+    "Water",
+    "Splash",
+    "Wade",
+    "Swim",
+    "Vehicle",
+    "Human",
+    "Prop",
+    "Terrain",
+    "Weapon",
+    "Projectile",
+    "Threshold",
+    "Delay",
+    "Random",
+    "Variation",
+    "Count",
+    "Index",
+    "Id",
+    "Group",
+    "Priority",
+    "Range",
+    "Radius",
+    "Falloff",
+    "Distance",
+    "Near",
+    "Far",
+    "Time",
+    "Rate",
+    "Low",
+    "High",
+    "Mid",
+    "Default",
+    "Base",
+    "Loop",
+    "Start",
+    "Stop",
+    "Idle",
+    "Tire",
+    "Skid",
+    "Gravel",
+    "Dirt",
+    "Grass",
+    "Sand",
+    "Asphalt",
+    "Metal",
+    "Wood",
+    "Stone",
+    "Glass",
+    "Fabric",
+    "Foliage",
+    "Rubber",
+    "Flesh",
+    "Gear",
+    "Rustle",
+    "Whoosh",
+    "Punch",
+    "Kick",
+    "Shell",
+];
+
+/// Names for the sound side's fields: [`SOUND_WORDS`] alone and in
+/// pairs, bare or with a type prefix, and the clips' sound events.
+fn sound_field_names(events: &BTreeMap<(String, String), usize>) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    let mut add = |parts: &[&str]| {
+        out.entry(hash_parts(parts))
+            .or_insert_with(|| parts.concat());
+    };
+    for p in ["", "f", "i", "b", "m_", "s", "n", "e", "u"] {
+        for a in SOUND_WORDS {
+            add(&[p, a]);
+            for b in SOUND_WORDS {
+                add(&[p, a, b]);
+                add(&[p, a, "_", b]);
+            }
+        }
+    }
+    for (_, n) in events.keys() {
+        add(&[n]);
+    }
+    out
+}
+
+/// The sound materials dumped when no word is given: the ground's, the
+/// people's and a crate's.
+const SOUND_MATERIALS: [&str; 12] = [
+    "terrain",
+    "terrain_dirt",
+    "terrain_grass",
+    "terrain_sand",
+    "terrain_asphalt",
+    "water_shallow",
+    "hum_hero_jen",
+    "hum_soldier",
+    "Human",
+    "prop_wood_crate",
+    "bldg_stone",
+    "prop_metal",
+];
+
+/// The template database's sound side: the components the sound
+/// materials (`SoundMaterial (..)`) have and how each field's values
+/// fall; some materials in full, each value that is a bank's sound shown
+/// as `bank#index length`; every component whose values name bank sounds
+/// or the clips' sound events; and how many of each bank's sounds the
+/// database names.
+fn sounddb<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let events = sound_events(source)?;
+    let library = bank_sounds(source)?;
+    let (sounds, banks) = (&library.sounds, &library.banks);
+    let guessed = sound_field_names(&events);
+    let cue_names: HashMap<u32, &str> = events
+        .keys()
+        .map(|(_, n)| (hash_parts(&[n]), n.as_str()))
+        .collect();
+    let index = source.archive().index();
+    let blocks: HashMap<u32, String> = index
+        .blocks()
+        .iter()
+        .map(|b| {
+            let n = m2_engine::world::layer_name(&b.path);
+            (m2_assets::name_hash(&n), n)
+        })
+        .collect();
+    let bank_set: HashSet<u32> = banks.iter().map(|b| b.0).collect();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let tnames = db.names();
+    let records: Vec<ComponentRecords<'_>> = db
+        .components
+        .iter()
+        .filter(|c| c.name != "Name")
+        .map(|c| (c.name, c.fields.clone(), by_entity(c)))
+        .collect();
+    let field_name = |f: &m2_assets::layer::Field| -> String {
+        names
+            .get(f.name_hash)
+            .map(str::to_owned)
+            .or_else(|| guessed.get(&f.name_hash).cloned())
+            .unwrap_or_else(|| format!("{:08x}", f.name_hash))
+    };
+    // What a word is, when it names something.
+    let what = |v: u32| -> Option<String> {
+        if let Some(list) = sounds.get(&v) {
+            let (bank, i, secs) = list[0];
+            return Some(format!(
+                "{v:08x} sound {}#{i} {secs:.2}s{}",
+                library.label(names, bank),
+                if list.len() > 1 { " (+more banks)" } else { "" }
+            ));
+        }
+        if let Some(n) = tnames.get(&v) {
+            return Some(format!("{v:08x} template {n:?}"));
+        }
+        if bank_set.contains(&v) {
+            return Some(format!("{v:08x} bank {}", library.label(names, v)));
+        }
+        if let Some(n) = blocks.get(&v) {
+            return Some(format!("{v:08x} block {n}"));
+        }
+        if let Some(n) = cue_names.get(&v) {
+            return Some(format!("{v:08x} cue {n}"));
+        }
+        names
+            .get(v)
+            .filter(|_| v > 0xffff)
+            .map(|n| format!("{v:08x} {n}"))
+    };
+    // A field's value: `None` when zero.
+    let value = |f: &m2_assets::layer::Field, rec: &[u8]| -> Option<(u32, String)> {
+        let at = usize::from(f.offset);
+        let bytes = rec.get(at..at + 4).or_else(|| rec.get(at..))?;
+        let mut word = [0u8; 4];
+        word[..bytes.len().min(4)].copy_from_slice(&bytes[..bytes.len().min(4)]);
+        let v = u32::from_le_bytes(word);
+        if f.bit_width > 0 && f.bit_width < 32 {
+            let bits = (v >> f.bit_shift) & ((1u32 << f.bit_width) - 1);
+            return (bits != 0).then(|| (bits, bits.to_string()));
+        }
+        if v == 0 {
+            return None;
+        }
+        if let Some(w) = what(v) {
+            return Some((v, w));
+        }
+        let float = f32::from_le_bytes(word);
+        Some((
+            v,
+            if float.is_finite() && (1e-4..1e7).contains(&float.abs()) {
+                format!("{float:.3}")
+            } else {
+                format!("{v:#x}")
+            },
+        ))
+    };
+    let show = |id: u32, name: &str| {
+        println!("  {id:08x} {name:?}");
+        for (cname, fields, recs) in &records {
+            for rec in recs.get(&id).into_iter().flatten() {
+                let values: Vec<String> = fields
+                    .iter()
+                    .filter_map(|f| value(f, rec).map(|(_, v)| format!("{}={v}", field_name(f))))
+                    .collect();
+                println!(
+                    "    {cname}: {}",
+                    if values.is_empty() {
+                        "(all zero)".to_owned()
+                    } else {
+                        values.join(", ")
+                    }
+                );
+            }
+        }
+    };
+    // The sound materials, and the components they have.
+    let mut materials: Vec<(&str, u32)> = tnames
+        .iter()
+        .filter(|(_, n)| n.starts_with("SoundMaterial ("))
+        .map(|(&id, &n)| (n, id))
+        .collect();
+    materials.sort_unstable();
+    println!(
+        "{} sound materials; {} sound events in clips; {} banks, {} sounds",
+        materials.len(),
+        events.len(),
+        banks.len(),
+        sounds.len()
+    );
+    let ids: HashSet<u32> = materials.iter().map(|m| m.1).collect();
+    println!("components the sound materials have:");
+    for (cname, fields, recs) in &records {
+        let mine: Vec<&[u8]> = recs
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .flat_map(|(_, r)| r.iter().copied())
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        println!(
+            "  {cname}: {} of them ({} templates in all), {} fields",
+            mine.len(),
+            recs.len(),
+            fields.len()
+        );
+        for f in fields {
+            let vals: Vec<(u32, String)> = mine.iter().filter_map(|r| value(f, r)).collect();
+            let distinct: HashSet<u32> = vals.iter().map(|v| v.0).collect();
+            let sounding = vals.iter().filter(|v| sounds.contains_key(&v.0)).count();
+            let templ = vals.iter().filter(|v| tnames.contains_key(&v.0)).count();
+            let sample: Vec<&str> = vals.iter().take(3).map(|v| v.1.as_str()).collect();
+            println!(
+                "    {} (t{} @{}{}): {} set, {} distinct, {sounding} sounds, {templ} templates; e.g. {}",
+                field_name(f),
+                f.ty,
+                f.offset,
+                if f.bit_width > 0 {
+                    format!(" bits {}+{}", f.bit_shift, f.bit_width)
+                } else {
+                    String::new()
+                },
+                vals.len(),
+                distinct.len(),
+                sample.join(" | ")
+            );
+        }
+    }
+    // Some in full: those holding a word, or the ground's and people's.
+    let picked: Vec<(&str, u32)> = if words.is_empty() {
+        SOUND_MATERIALS
+            .iter()
+            .filter_map(|m| {
+                let want = format!("SoundMaterial ({m})");
+                materials
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(&want))
+                    .copied()
+            })
+            .collect()
+    } else {
+        let mut p: Vec<(&str, u32)> = tnames
+            .iter()
+            .filter(|(_, n)| {
+                let n = n.to_ascii_lowercase();
+                words.iter().any(|w| n.contains(w.as_str()))
+            })
+            .map(|(&id, &n)| (n, id))
+            .collect();
+        p.sort_unstable();
+        p
+    };
+    println!("{} templates in full:", picked.len());
+    for &(name, id) in picked.iter().take(60) {
+        show(id, name);
+    }
+    // Where the database names bank sounds or clip cues.
+    println!("components whose values name bank sounds or clip cues:");
+    let mut named_sounds: HashSet<u32> = HashSet::new();
+    for (cname, fields, recs) in &records {
+        let mut per_field: BTreeMap<String, (usize, usize, String)> = BTreeMap::new();
+        for (id, rec) in recs
+            .iter()
+            .flat_map(|(id, r)| r.iter().map(move |r| (id, r)))
+        {
+            for f in fields {
+                let Some((v, shown)) = value(f, rec) else {
+                    continue;
+                };
+                let sound = sounds.contains_key(&v);
+                let cue = cue_names.contains_key(&v);
+                if !(sound || cue) {
+                    continue;
+                }
+                if sound {
+                    named_sounds.insert(v);
+                }
+                let e = per_field.entry(field_name(f)).or_insert_with(|| {
+                    (
+                        0,
+                        0,
+                        format!("{} {shown}", tnames.get(id).copied().unwrap_or("?")),
+                    )
+                });
+                if sound {
+                    e.0 += 1;
+                } else {
+                    e.1 += 1;
+                }
+            }
+        }
+        if per_field.is_empty() {
+            continue;
+        }
+        println!("  {cname} ({} templates):", recs.len());
+        for (f, (s, c, eg)) in &per_field {
+            println!("    {f}: {s} sounds, {c} cues; e.g. {eg}");
+        }
+    }
+    // Templates named like a clip's sound event.
+    // Named exactly so first, then holding a (long) event name.
+    let mut cued: Vec<(bool, &str, u32)> = tnames
+        .iter()
+        .filter_map(|(&id, &n)| {
+            let lower = n.to_ascii_lowercase();
+            let exact = events.keys().any(|(_, e)| e.eq_ignore_ascii_case(n));
+            let holds = events
+                .keys()
+                .any(|(_, e)| e.len() >= 8 && lower.contains(&e.to_ascii_lowercase()));
+            (exact || holds).then_some((!exact, n, id))
+        })
+        .collect();
+    cued.sort_unstable();
+    println!("{} templates named like a clip's sound event:", cued.len());
+    for &(_, name, id) in cued.iter().take(20) {
+        show(id, name);
+    }
+    println!("bank sounds the database names, per bank:");
+    let mut per_bank: BTreeMap<u32, usize> = BTreeMap::new();
+    for h in &named_sounds {
+        for (bank, _, _) in &sounds[h] {
+            *per_bank.entry(*bank).or_default() += 1;
+        }
+    }
+    for (bank, total) in banks {
+        if let Some(n) = per_bank.get(bank) {
+            println!(
+                "  {bank:08x} {}: {n} of {total}",
+                library.label(names, *bank)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// FNV-1a of `s` (each byte OR 0x20) continued from `h`: [`hash_parts`]
+/// a part at a time.
+fn fnv_on(mut h: u32, s: &str) -> u32 {
+    for b in s.bytes() {
+        h ^= u32::from(b | 0x20);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// The name hash of what [`fnv_on`] has taken in.
+fn fnv_end(h: u32) -> u32 {
+    (h ^ u32::from(b'*')).wrapping_mul(0x0100_0193)
+}
+
+const FNV_START: u32 = 0x811c_9dc5;
+
+/// More words sound names may be built of.
+const SOUND_NAME_WORDS: [&str; 64] = [
+    "fs",
+    "ft",
+    "ftstp",
+    "footstep",
+    "footsteps",
+    "foot",
+    "step",
+    "steps",
+    "walk",
+    "run",
+    "sprint",
+    "land",
+    "jump",
+    "jumpland",
+    "takeoff",
+    "scuff",
+    "slide",
+    "jen",
+    "hero",
+    "soldier",
+    "boot",
+    "boots",
+    "shoe",
+    "bare",
+    "heel",
+    "toe",
+    "conc",
+    "concrete",
+    "mud",
+    "tile",
+    "rock",
+    "leaves",
+    "bush",
+    "hollow",
+    "solid",
+    "generic",
+    "default",
+    "impact",
+    "imp",
+    "hit",
+    "body",
+    "bodyfall",
+    "fall",
+    "melee",
+    "whoosh",
+    "swish",
+    "swoosh",
+    "punch",
+    "kick",
+    "butt",
+    "rifle",
+    "gun",
+    "knife",
+    "bash",
+    "lt",
+    "hvy",
+    "hv",
+    "lite",
+    "soft",
+    "hard",
+    "short",
+    "long",
+    "human",
+    "hum",
+];
+
+/// Names for bank sounds built of words: a prefix, a word, optionally
+/// `_` and another word, and an ending; the words are the sound
+/// materials' names and their parts, the clips' sound events and their
+/// parts, and [`SOUND_WORDS`] and [`SOUND_NAME_WORDS`].
+fn soundnames<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let wanted: Vec<String> = if arg.is_empty() {
+        vec![
+            "fol_shared".into(),
+            "collision_shared".into(),
+            "destruction_shared".into(),
+            "7871f925".into(),
+        ]
+    } else {
+        arg.split(',')
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let events = sound_events(source)?;
+    let library = bank_sounds(source)?;
+    let index = source.archive().index();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash);
+    let mut vocab: Vec<String> = Vec::new();
+    let mut take = |w: &str| {
+        let w = w.to_ascii_lowercase();
+        if !w.is_empty() {
+            for part in w.split('_').filter(|p| p.len() >= 2) {
+                vocab.push(part.to_owned());
+            }
+            vocab.push(w);
+        }
+    };
+    if let Some(h) = db_hash {
+        let data = source.asset(h, TEMPLATE_DB_TYPE)?;
+        let db = Layer::parse(&data)?;
+        for n in db.names().values() {
+            if let Some(inner) = n
+                .strip_prefix("SoundMaterial (")
+                .and_then(|r| r.strip_suffix(')'))
+            {
+                take(inner);
+            }
+        }
+    }
+    for (_, n) in events.keys() {
+        take(n);
+    }
+    for w in SOUND_WORDS.iter().chain(SOUND_NAME_WORDS.iter()) {
+        take(w);
+    }
+    vocab.sort();
+    vocab.dedup();
+    let prefixes = [
+        "",
+        "fol_",
+        "sfx_",
+        "sfx_fol_",
+        "col_",
+        "sfx_col_",
+        "imp_",
+        "sfx_imp_",
+        "fs_",
+        "ftstp_",
+        "footstep_",
+        "hum_",
+        "sfx_hum_",
+        "jen_",
+        "melee_",
+        "sfx_melee_",
+        "ahj_",
+        "sfx_ahj_",
+        "foley_",
+        "phys_",
+    ];
+    let long_ends = endings();
+    let short_ends: Vec<String> = [
+        "", "_01", "_02", "_03", "_04", "_05", "_06", "01", "02", "_1", "_2", "_a", "_b", "a", "b",
+    ]
+    .iter()
+    .map(|e| (*e).to_owned())
+    .collect();
+    // The banks asked for: by name, or by hash (a streamed bank).
+    let banks: Vec<u32> = library
+        .banks
+        .iter()
+        .map(|b| b.0)
+        .filter(|&b| {
+            wanted
+                .iter()
+                .any(|w| hex(w) == Some(b) || library.label(names, b).eq_ignore_ascii_case(w))
+        })
+        .collect();
+    let targets: HashSet<u32> = library
+        .sounds
+        .iter()
+        .filter(|(_, list)| list.iter().any(|(b, _, _)| banks.contains(b)))
+        .map(|(&h, _)| h)
+        .collect();
+    let mut found: HashMap<u32, String> = HashMap::new();
+    for &t in &targets {
+        if let Some(n) = names.get(t) {
+            found.insert(t, n.to_owned());
+        }
+    }
+    for p in prefixes {
+        let hp = fnv_on(FNV_START, p);
+        for a in &vocab {
+            let ha = fnv_on(hp, a);
+            for e in &long_ends {
+                let h = fnv_end(fnv_on(ha, e));
+                if targets.contains(&h) {
+                    found.entry(h).or_insert_with(|| format!("{p}{a}{e}"));
+                }
+            }
+            let hs = fnv_on(ha, "_");
+            for b in &vocab {
+                let hb = fnv_on(hs, b);
+                for e in &short_ends {
+                    let h = fnv_end(fnv_on(hb, e));
+                    if targets.contains(&h) {
+                        found.entry(h).or_insert_with(|| format!("{p}{a}_{b}{e}"));
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "{} words, {} prefixes: {} of {} sounds named",
+        vocab.len(),
+        prefixes.len(),
+        found.len(),
+        targets.len()
+    );
+    for &bank in &banks {
+        let mut rows: Vec<(usize, u32, f32)> = library
+            .sounds
+            .iter()
+            .flat_map(|(&h, list)| {
+                list.iter()
+                    .filter(move |(b, _, _)| *b == bank)
+                    .map(move |&(_, i, secs)| (i, h, secs))
+            })
+            .collect();
+        rows.sort_unstable_by_key(|r| r.0);
+        let named = rows.iter().filter(|r| found.contains_key(&r.1)).count();
+        println!(
+            "bank {bank:08x} {}: {named} of {} named",
+            library.label(names, bank),
+            rows.len()
+        );
+        for (i, h, secs) in &rows {
+            if let Some(n) = found.get(h) {
+                println!("  #{i} {h:08x} {secs:.2}s {n}");
+            }
         }
     }
     Ok(())
@@ -2650,13 +3826,7 @@ fn templates<R: Read + Seek>(
         .components
         .iter()
         .filter(|c| c.name != "Name")
-        .map(|c| {
-            (
-                c.name,
-                c.fields.clone(),
-                c.records().unwrap_or_default().into_iter().collect(),
-            )
-        })
+        .map(|c| (c.name, c.fields.clone(), by_entity(c)))
         .collect();
     let texty: Vec<&str> = db
         .components
@@ -2686,32 +3856,31 @@ fn templates<R: Read + Seek>(
     let show = |id: u32, name: &str, named: &mut Vec<u32>| {
         println!("  {id:08x} {name:?}");
         for (cname, fields, recs) in &records {
-            let Some(rec) = recs.get(&id) else {
-                continue;
-            };
-            let values: Vec<String> = fields
-                .iter()
-                .map(|f| {
-                    let shown = field_value(names, f, rec);
-                    let at = usize::from(f.offset);
-                    let other = (f.ty != STRING_FIELD && f.bit_width == 0)
-                        .then(|| rec.get(at..at + 4))
-                        .flatten()
-                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .filter(|v| *v != id)
-                        .and_then(|v| tnames.get(&v).map(|n| (v, n)));
-                    match other {
-                        Some((v, n)) => {
-                            if !named.contains(&v) {
-                                named.push(v);
+            for rec in recs.get(&id).into_iter().flatten() {
+                let values: Vec<String> = fields
+                    .iter()
+                    .map(|f| {
+                        let shown = field_value(names, f, rec);
+                        let at = usize::from(f.offset);
+                        let other = (f.ty != STRING_FIELD && f.bit_width == 0)
+                            .then(|| rec.get(at..at + 4))
+                            .flatten()
+                            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .filter(|v| *v != id)
+                            .and_then(|v| tnames.get(&v).map(|n| (v, n)));
+                        match other {
+                            Some((v, n)) => {
+                                if !named.contains(&v) {
+                                    named.push(v);
+                                }
+                                format!("{shown} -> {n:?}")
                             }
-                            format!("{shown} -> {n:?}")
+                            None => shown,
                         }
-                        None => shown,
-                    }
-                })
-                .collect();
-            println!("    {cname}: {}", values.join(", "));
+                    })
+                    .collect();
+                println!("    {cname}: {}", values.join(", "));
+            }
         }
     };
     let shown: Vec<u32> = picked.iter().take(150).map(|p| p.1).collect();
@@ -3087,13 +4256,7 @@ fn layer_entities<R: Read + Seek>(
                 .components
                 .iter()
                 .filter(|c| !matches!(c.name, "Transform" | "Name"))
-                .map(|c| {
-                    (
-                        c.name,
-                        c.fields.clone(),
-                        c.records().unwrap_or_default().into_iter().collect(),
-                    )
-                })
+                .map(|c| (c.name, c.fields.clone(), by_entity(c)))
                 .collect();
             for (dist, id) in near.into_iter().take(most) {
                 let p = placements[&id];
@@ -3105,12 +4268,11 @@ fn layer_entities<R: Read + Seek>(
                     entity_names.get(&id).copied().unwrap_or("")
                 );
                 for (cname, fields, recs) in &records {
-                    let Some(rec) = recs.get(&id) else {
-                        continue;
-                    };
-                    let values: Vec<String> =
-                        fields.iter().map(|f| field_value(names, f, rec)).collect();
-                    println!("    {cname}: {}", values.join(", "));
+                    for rec in recs.get(&id).into_iter().flatten() {
+                        let values: Vec<String> =
+                            fields.iter().map(|f| field_value(names, f, rec)).collect();
+                        println!("    {cname}: {}", values.join(", "));
+                    }
                 }
             }
         }

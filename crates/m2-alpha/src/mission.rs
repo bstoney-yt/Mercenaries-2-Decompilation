@@ -13,8 +13,13 @@
 //! template is (`"M151 Softtop (VZ)"`) comes from the template database,
 //! or is guessed from the models' texture names (`vz_veh_truck_m151`).
 //! The models of the state layers they load (a mission's gates) stand
-//! while the layer is in, and break when the scripts' object dies: a gate
-//! to destroy breaks to a blast by it or a vehicle driven into it. Their
+//! while the layer is in, and break when the scripts' object dies. A
+//! target to destroy that is such a model (the first contract's gates)
+//! falls only to a support strike: the videos' gates stood through
+//! grenade-launcher hits and fell to the Satellite Guided Bomb, one of
+//! which is given her free while such a target is marked
+//! ([`crate::support`]); others to a blast by them or a vehicle driven
+//! into them. Their
 //! deliveries come by helicopter ([`crate::flights`]): the crate, the jeep
 //! and the tank hang under it until it lets go over the drop point. Their
 //! boats are not shown yet.
@@ -35,20 +40,24 @@ use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
+use crate::combat::Weapon;
 use crate::config::Config;
-use crate::flights::{Copter, Load};
+use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::scene::NOT_DRIVABLE;
+use crate::support::{Impact, Kind, Phase};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
-/// How close a blast destroys a target the scripts named (a gate), metres:
-/// from its model's box, or from its place when it shows no model.
+/// How close a blast destroys a target the scripts named, metres: from
+/// its model's box, or from its place when it shows no model; a support
+/// strike's bomb, its blast's reach.
 const BLAST_PAD: f32 = 4.0;
 const BLAST_REACH: f32 = 10.0;
+const BOMB_PAD: f32 = crate::combat::BOMB.0;
 /// A target is rammed by driving into its box (padded this much, metres,
 /// for the vehicle's front to its middle) at this speed or more (m/s), as
 /// fast as it went in the last half second or so.
@@ -124,8 +133,12 @@ pub struct MissionLink {
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
-    /// Blasts since the scripts last ran.
+    /// The satellite's step when last told the scripts: none, the view,
+    /// the timing wheel, confirmed.
+    satellite: u8,
+    /// Blasts since the scripts last ran, and support strikes' bombs.
     blasts: Vec<Vec3>,
+    bombs: Vec<Vec3>,
     vehicles: Fleet,
     /// Seconds since the scripts said the contract was completed.
     completed: Option<f32>,
@@ -207,6 +220,8 @@ impl MissionLink {
             drivers,
             ashore: 0,
             blasts: Vec::new(),
+            satellite: 0,
+            bombs: Vec::new(),
             vehicles: Fleet::default(),
             completed: None,
             speed: 0.0,
@@ -262,9 +277,38 @@ impl MissionLink {
                 mission.arrived(r.pilot, r.to.to_array());
             }
         }
-        // A crate she broke open is destroyed for the scripts too.
+        // A crate she broke open is destroyed for the scripts too (what
+        // it held, it leaves of itself: no script spawns it).
         for (g, at) in scene.flights.take_broken() {
-            eprintln!("mission: crate {g:#x} broken open at {at:.1}");
+            let left: Vec<String> = scene
+                .flights
+                .pickups()
+                .iter()
+                .filter(|p| p.from == g)
+                .map(|p| {
+                    format!(
+                        "{} ({:#x}), model {}, giving {}",
+                        scene
+                            .world
+                            .as_ref()
+                            .and_then(|w| w.index.template_db.by_id(p.what.template))
+                            .map_or("?", |t| t.0),
+                        p.what.template,
+                        p.what.model.map_or("none".into(), |m| format!("{m:08x}")),
+                        p.what.gives.map_or("her nothing".into(), |(w, n)| format!(
+                            "{n} rounds for her {w:?}"
+                        )),
+                    )
+                })
+                .collect();
+            eprintln!(
+                "mission: crate {g:#x} broken open at {at:.1}: it leaves {}",
+                if left.is_empty() {
+                    "nothing".to_owned()
+                } else {
+                    left.join("; ")
+                }
+            );
             mission.kill(g);
         }
         // The vehicle she was seated in never came: ashore instead.
@@ -285,6 +329,41 @@ impl MissionLink {
             }
         }
         self.blasts.extend(game.combat.explosions());
+        self.bombs.extend(
+            game.support
+                .landed
+                .iter()
+                .filter(|l| matches!(l, Impact::Bomb(_)))
+                .map(|l| {
+                    let at = l.at();
+                    Vec3::new(at.x, game.focus().y, at.y)
+                }),
+        );
+        // The satellite's steps, posted as its interface posts them, for
+        // the scripts waiting on them (the first contract's).
+        let step = match game.support.phase {
+            Phase::Viewing { .. } => 1,
+            Phase::Timing { .. } => 2,
+            Phase::Confirmed { .. } => 3,
+            _ => 0,
+        };
+        let post = match (self.satellite, step) {
+            (0, 1) => Some("Satellite Targetting Start"),
+            (1, 2) => Some("Satellite Minigame Start"),
+            (2, 3) => Some("Satellite Targetting Success"),
+            (1 | 2, 0) => Some("Satellite Targetting Cancelled"),
+            _ => None,
+        };
+        self.satellite = step;
+        if let Some(name) = post {
+            let waiting = mission
+                .awaited_posts()
+                .iter()
+                .filter(|n| n.as_str() == name)
+                .count();
+            eprintln!("mission: posted {name:?}, {waiting} script events waiting for it");
+            mission.post(name);
+        }
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {
@@ -322,6 +401,16 @@ impl MissionLink {
                     .collect()
             };
             game.scene.people.mission_soldiers = targets.iter().map(|t| t.0).collect();
+            // Those standing as models (the gates) fall only to a support
+            // strike, and one is given her while any stands.
+            let sturdy: HashSet<u32> = targets
+                .iter()
+                .map(|t| t.0)
+                .filter(|&g| game.scene.props.get(g).is_some())
+                .collect();
+            if !sturdy.is_empty() {
+                game.support.offer(Kind::SatelliteBomb);
+            }
             // A vehicle driven hard into a target (a gate) breaks it too:
             // by its speed of late, as the gate stops it.
             let driving = game.driving();
@@ -332,17 +421,28 @@ impl MissionLink {
                 .map(|(at, _)| at);
             for (g, at) in &targets {
                 let props = &game.scene.props;
+                // A bomb's spot is on the ground under where it was
+                // called: measured flat.
+                let bombed = self.bombs.iter().any(|b| {
+                    let c = props.centre(*g).unwrap_or(*at);
+                    b.with_y(0.0).distance(c.with_y(0.0)) <= BOMB_PAD
+                });
                 let hit = |p: Vec3, pad: f32| {
                     props
                         .touches(*g, p, pad)
                         .unwrap_or_else(|| p.distance(*at) <= BLAST_REACH)
                 };
-                if self.blasts.iter().any(|&b| hit(b, BLAST_PAD))
-                    || ram.is_some_and(|r| props.touches(*g, r, RAM_PAD) == Some(true))
-                {
+                let blasted = !sturdy.contains(g)
+                    && (self.blasts.iter().any(|&b| hit(b, BLAST_PAD))
+                        || ram.is_some_and(|r| props.touches(*g, r, RAM_PAD) == Some(true)));
+                if bombed || blasted {
+                    if bombed {
+                        eprintln!("mission: {g:#x} falls to the bomb");
+                    }
                     mission.kill(*g);
                 }
             }
+            game.scene.props.sturdy = sturdy;
             // A target knocked loose (shoved over by a vehicle, thrown by a
             // blast) is destroyed too.
             for e in game.scene.props.take_knocked() {
@@ -351,6 +451,7 @@ impl MissionLink {
                 }
             }
             self.blasts.clear();
+            self.bombs.clear();
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -388,6 +489,10 @@ impl MissionLink {
                     }
                 }
                 mission.start();
+                // She lands with the carbine alone (the footage: nothing on
+                // her back, only "Carbine" in the weapon box) until the
+                // supply crate's grenade launcher.
+                game.combat.carbine_only();
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
                     if obey(game, &mission, &mut self.vehicles, &c) {
@@ -910,6 +1015,11 @@ fn fly(game: &mut Game, mission: &mut Mission, c: &Command) {
                                 model: (!vehicle)
                                     .then(|| templates.get(name).and_then(|t| t.model))
                                     .flatten(),
+                                leaves: if vehicle {
+                                    Vec::new()
+                                } else {
+                                    leaves(templates, name)
+                                },
                             })
                         })
                         .collect();
@@ -1176,6 +1286,60 @@ pub(crate) fn template_models(
     }
 }
 
+/// What the scripts' object `name` (a supply crate) leaves once destroyed:
+/// the pickups its template's `SpawnOnDeath`s name, in data order (the
+/// first contract's: a grenade launcher, then rockets). One with the
+/// model of a weapon of hers is that weapon, loaded; any other gives the
+/// rounds of one of her weapons when its ammunition is one of theirs (a
+/// template with that weapon's model fires it). A pickup's `rounds` count
+/// clips: the grenade launcher's 3 are the HUD's "6 2" in the footage, 6
+/// loaded and 2 clips more. What isn't a pickup it doesn't leave for her.
+fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
+    let Some(left) = templates
+        .id(name)
+        .and_then(|id| templates.leavings.spawns.get(&id))
+    else {
+        return Vec::new();
+    };
+    let fires = |weapon: &str, ammo: u32| {
+        let model = name_hash(weapon);
+        templates.leavings.ammo.iter().any(|(&w, &a)| {
+            a == ammo
+                && templates
+                    .by_id(w)
+                    .is_some_and(|(_, t)| t.model == Some(model))
+        })
+    };
+    left.iter()
+        .filter_map(|&left| {
+            let info = templates.leavings.pickups.get(&left)?;
+            let model = templates.by_id(left).and_then(|(_, t)| t.model);
+            let weapon = Weapon::ALL
+                .into_iter()
+                .find(|w| model == Some(name_hash(w.model_name())));
+            let gives = match weapon {
+                // Its own rounds, whatever its record names: the
+                // launcher's names "Grenade Launcher Projectile", not the
+                // "GL Projectile" it fires (round 94: taken up empty).
+                Some(w) => Some((w, info.rounds.max(1) * w.clip())),
+                None => info.ammo.and_then(|ammo| {
+                    Weapon::ALL
+                        .into_iter()
+                        .find(|w| fires(w.model_name(), ammo))
+                        .map(|w| (w, info.rounds * w.clip()))
+                }),
+            };
+            Some(Leaves {
+                template: left,
+                model,
+                reach: info.radius,
+                weapon,
+                gives,
+            })
+        })
+        .collect()
+}
+
 /// The models one of the scripts' objects drives as
 /// ([`template_models`]): by its name, else (a state layer's renamed
 /// entity, the first contract's `VzaCon001_StartingBoat`) by the template
@@ -1267,6 +1431,89 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_supply_crate_leaves_a_grenade_launcher_and_rockets() {
+        use m2_engine::pickup::{Leavings, PickupInfo};
+        let info = |model| TemplateInfo {
+            model,
+            vehicle: None,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let (crate_id, launcher, grenade, rockets, rpg, missile) = (
+            0x8000_9ae9,
+            0x8000_6ea4,
+            0x8000_6ea6,
+            0x8000_56dc,
+            0x8000_437b,
+            0x8000_4379,
+        );
+        let pickup = |ammo, rounds| PickupInfo {
+            radius: 1.0,
+            ammo: Some(ammo),
+            rounds,
+            cue: None,
+            effect: None,
+        };
+        let db = Templates {
+            by_name: HashMap::from([
+                ("supply drop (gl)".to_owned(), info(Some(0x81c7_1c96))),
+                ("ammo pickup (rocket)".to_owned(), info(Some(0x8e77_a04d))),
+                ("rpg".to_owned(), info(Some(name_hash("global_weapon_rpg")))),
+                (
+                    "grenade launcher".to_owned(),
+                    info(Some(name_hash("global_weapon_mgl"))),
+                ),
+            ]),
+            names: HashMap::from([
+                (crate_id, "Supply Drop (GL)".to_owned()),
+                (rockets, "Ammo Pickup (Rocket)".to_owned()),
+                (rpg, "RPG".to_owned()),
+                (launcher, "Grenade Launcher".to_owned()),
+            ]),
+            leavings: Leavings {
+                // Not a pickup, so not left for her.
+                spawns: HashMap::from([(crate_id, vec![launcher, rockets, 0x8000_0001])]),
+                pickups: HashMap::from([
+                    (launcher, pickup(grenade, 3)),
+                    (rockets, pickup(missile, 20)),
+                ]),
+                ammo: HashMap::from([(rpg, missile), (launcher, grenade)]),
+            },
+            ..Templates::default()
+        };
+        // The launcher, loaded with its 3 clips; 20 rockets (one a clip).
+        assert_eq!(
+            leaves(&db, "Supply Drop (GL) 0x40000001"),
+            [
+                Leaves {
+                    template: launcher,
+                    model: Some(name_hash("global_weapon_mgl")),
+                    reach: 1.0,
+                    weapon: Some(Weapon::GrenadeLauncher),
+                    gives: Some((Weapon::GrenadeLauncher, 18)),
+                },
+                Leaves {
+                    template: rockets,
+                    model: Some(0x8e77_a04d),
+                    reach: 1.0,
+                    weapon: None,
+                    gives: Some((Weapon::Rpg, 20)),
+                },
+            ]
+        );
+        // Ammunition for no weapon of hers gives her nothing, but a weapon
+        // comes loaded whatever its record names; a template that leaves
+        // nothing, nothing at all.
+        let mut db = db;
+        db.leavings.ammo.clear();
+        let left = leaves(&db, "Supply Drop (GL)");
+        assert_eq!(left[0].gives, Some((Weapon::GrenadeLauncher, 18)));
+        assert_eq!(left[1].gives, None);
+        assert!(leaves(&db, "RPG").is_empty());
+    }
+
+    #[test]
     fn templates_find_their_vehicles() {
         let catalogue = [
             entry(1, "truck", "gr_veh_truck_m151"),
@@ -1320,9 +1567,7 @@ mod tests {
                     info(None, Some(VehicleKind::Car)),
                 ),
             ]),
-            names: HashMap::new(),
-            tuning: HashMap::new(),
-            motions: HashMap::new(),
+            ..Templates::default()
         };
         let models = |n: &str| -> Vec<(u32, String)> {
             template_models(n, &db, &catalogue)
