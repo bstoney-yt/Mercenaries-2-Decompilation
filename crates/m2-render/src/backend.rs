@@ -159,6 +159,9 @@ pub struct ToneMap {
     /// rather than, as the game's post shaders appear to, the plain mean
     /// of the luminance of display values raised to 0.4.
     pub log_average: bool,
+    /// What the plain mean is raised to before it is adapted to: 1 takes
+    /// it as it is, 2.5 undoes the 0.4 each pixel was raised to.
+    pub average_power: f32,
 }
 
 /// Metres of water the eye looks through at the end of the depth colour
