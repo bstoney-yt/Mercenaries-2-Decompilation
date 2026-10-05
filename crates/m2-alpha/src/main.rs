@@ -878,6 +878,29 @@ fn look_at_marker(
     Ok(())
 }
 
+/// What a static collider is: a placed object and its model, a building
+/// of a batch, a terrain cell or a state layer's model (`None`: something
+/// not static, such as a vehicle).
+pub(crate) fn static_name(world: &m2_engine::World, key: Option<m2_engine::StaticKey>) -> String {
+    use m2_engine::StaticKey;
+    match key {
+        Some(StaticKey::Object(i)) => world.index.objects.get(i).map_or_else(
+            || format!("object {i}"),
+            |o| format!("object {i}, model {:08x} at {:.1}", o.model, o.position),
+        ),
+        Some(StaticKey::Member(i, k)) => world.index.objects.get(i).map_or_else(
+            || format!("building {k} of object {i}"),
+            |o| format!("building {k} of object {i} (batch {:08x})", o.model),
+        ),
+        Some(StaticKey::Cell(h)) => format!("terrain cell {h:08x}"),
+        Some(StaticKey::Entity(e)) => world.index.state_objects.get(&e).map_or_else(
+            || format!("state layer entity {e:08x}"),
+            |o| format!("state layer entity {e:08x}, model {:08x}", o.model),
+        ),
+        None => "something not static".to_owned(),
+    }
+}
+
 /// Looks for what stops vehicles where she stands: rays out to 25 m in
 /// 16 directions at four heights over the ground, and the ground's height
 /// every metre along lines through the spot, printing what each hits.
@@ -888,24 +911,7 @@ fn probe_for_screenshot(game: &Game) {
         return;
     };
     let here = player.character.position;
-    let what = |key: Option<StaticKey>| -> String {
-        match key {
-            Some(StaticKey::Object(i)) => world.index.objects.get(i).map_or_else(
-                || format!("object {i}"),
-                |o| format!("object {i}, model {:08x} at {:.1}", o.model, o.position),
-            ),
-            Some(StaticKey::Member(i, k)) => world.index.objects.get(i).map_or_else(
-                || format!("building {k} of object {i}"),
-                |o| format!("building {k} of object {i} (batch {:08x})", o.model),
-            ),
-            Some(StaticKey::Cell(h)) => format!("terrain cell {h:08x}"),
-            Some(StaticKey::Entity(e)) => world.index.state_objects.get(&e).map_or_else(
-                || format!("state layer entity {e:08x}"),
-                |o| format!("state layer entity {e:08x}, model {:08x}", o.model),
-            ),
-            None => "something not static".to_owned(),
-        }
-    };
+    let what = |key: Option<StaticKey>| static_name(world, key);
     let down = |x: f32, z: f32| {
         let top = here.y + 60.0;
         world
@@ -1215,6 +1221,22 @@ fn drive_for_screenshot(
             "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s",
             (to - from).length()
         );
+        // Hardly moved: what holds it.
+        if (to - from).length() < 8.0
+            && let Some(world) = game.scene.world.as_ref()
+            && let Some(v) = game
+                .scene
+                .player
+                .as_ref()
+                .and_then(|p| p.driving)
+                .map(|i| &game.scene.vehicles[i])
+            && let Some(id) = v.id
+        {
+            eprintln!(
+                "drive: held: {}",
+                autoplay::stuck_report(world, id, v.spec.hull, false)
+            );
+        }
     }
     if let Some(v) = game
         .scene

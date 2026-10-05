@@ -810,6 +810,14 @@ impl Autoplay {
         match p.driving {
             Some(i) => {
                 let v = &mut game.scene.vehicles[i];
+                if let Some(id) = v.id {
+                    eprintln!(
+                        "autoplay {:.1} s: stuck driving the {}: {}",
+                        self.clock,
+                        v.spec.label,
+                        stuck_report(world, id, v.spec.hull, self.reversing.is_some())
+                    );
+                }
                 let yaw = flat.x.atan2(flat.z);
                 if let Some(id) = v.id.take() {
                     world.physics.remove_vehicle(id);
@@ -1006,6 +1014,65 @@ fn aim(p: &Player, target: Vec3, dt: f32) -> (Vec2, f32) {
             dt,
         ),
         error,
+    )
+}
+
+/// Why a vehicle may be stuck: its speed, how it sits (nose up, rolled),
+/// how many wheels touch, what is just ahead of its bumper and how the
+/// ground rises ahead.
+pub(crate) fn stuck_report(
+    world: &m2_engine::World,
+    id: m2_engine::VehicleId,
+    hull: (Vec3, Vec3),
+    reversing: bool,
+) -> String {
+    let physics = &world.physics;
+    let Some(m) = physics.vehicle_transform(id) else {
+        return "not placed".to_owned();
+    };
+    let (lo, hi) = hull;
+    let forward = m.transform_vector3(Vec3::Z);
+    let right = m.transform_vector3(Vec3::X);
+    let (down, wheels) = physics.vehicle_contacts(id);
+    // Rays from the bumper at three heights, 6 m on.
+    let ahead: Vec<String> = [0.3, 0.8, 1.5]
+        .iter()
+        .map(|&h| {
+            let from = m.transform_point3(Vec3::new(0.0, lo.y + h, hi.z + 0.1));
+            match physics.cast_ray_keyed(from, forward, 6.0) {
+                Some((d, n, key)) => format!(
+                    "{h} m up: {d:.1} m to {} (face {:.0} deg from flat)",
+                    crate::static_name(world, key),
+                    n.y.clamp(-1.0, 1.0).acos().to_degrees()
+                ),
+                None => format!("{h} m up: clear"),
+            }
+        })
+        .collect();
+    // The ground under the middle and 3, 6 and 10 m ahead.
+    let ground = |p: Vec3| {
+        let top = p + Vec3::Y * 30.0;
+        physics
+            .cast_ray(top, Vec3::NEG_Y, 80.0)
+            .map(|(d, _)| top.y - d)
+    };
+    let centre = m.transform_point3((lo + hi) * 0.5);
+    let flat = forward.with_y(0.0).normalize_or_zero();
+    let rises: Vec<String> = [3.0, 6.0, 10.0]
+        .iter()
+        .map(|&k| match (ground(centre), ground(centre + flat * k)) {
+            (Some(a), Some(b)) => format!("{:+.1} m at {k} m", b - a),
+            _ => format!("? at {k} m"),
+        })
+        .collect();
+    format!(
+        "{:.1} m/s{}, nose {:+.0} deg, rolled {:+.0} deg, {down} of {wheels} wheels down; ahead [{}]; ground [{}]",
+        physics.vehicle_speed(id),
+        if reversing { " backing out" } else { "" },
+        forward.y.clamp(-1.0, 1.0).asin().to_degrees(),
+        right.y.clamp(-1.0, 1.0).asin().to_degrees(),
+        ahead.join("; "),
+        rises.join(", ")
     )
 }
 
