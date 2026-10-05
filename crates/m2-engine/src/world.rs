@@ -50,6 +50,10 @@ fn skirts_wanted() -> bool {
     *WANTED.get_or_init(|| std::env::var("M2_SKIRTS").map_or(true, |v| v != "0"))
 }
 
+/// Ground vertices on grid lines, by line (along z or x, and which):
+/// (position along the line, height, vertex).
+type LineVertices = HashMap<(bool, i32), Vec<(f32, f32, u32)>>;
+
 /// Side of a cell's patches in metres; skirts follow their borders.
 const PATCH_SIZE: f32 = 100.0;
 
@@ -1157,6 +1161,60 @@ impl TerrainMesh {
             let (cx, cz) = ((x as f32 + 0.5) * step, (z as f32 + 0.5) * step);
             cx.abs() < half && cz.abs() < half && !filled.contains(&(x, z))
         };
+        let height = |v: u32| {
+            let at = v as usize * TERRAIN_STRIDE + 4;
+            f32::from_le_bytes(self.vertices[at..at + 4].try_into().expect("4 bytes"))
+        };
+        let mut lines: LineVertices = HashMap::new();
+        if let Some(step) = grid {
+            let mut seen = HashSet::new();
+            for &g in &ground {
+                let (first, count, _) = self.ranges[g];
+                for &v in &self.indices[first as usize..(first + count) as usize] {
+                    if !seen.insert(v) {
+                        continue;
+                    }
+                    let (x, z) = at(v);
+                    for (along_z, across, along) in [(true, x, z), (false, z, x)] {
+                        let line = (across / step).round();
+                        if (across - line * step).abs() < 0.05 {
+                            lines.entry((along_z, line as i32)).or_default().push((
+                                along,
+                                height(v),
+                                v,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // A neighbour's ground along the edge more than the skirt's depth
+        // below it: a step down to the seabed off a bank, which a skirt
+        // can't close and only hangs in front of as a wall.
+        let steps_down = |a: u32, b: u32, step: f32| {
+            let (pa, pb) = (at(a), at(b));
+            let (key, ta, tb) = if on_line(pa.0, pb.0, step) {
+                ((true, (pa.0 / step).round() as i32), pa.1, pb.1)
+            } else {
+                ((false, (pa.1 / step).round() as i32), pa.0, pb.0)
+            };
+            let (ha, hb) = (height(a), height(b));
+            let (lo, hi) = (ta.min(tb), ta.max(tb));
+            let margin = (hi - lo) * 0.5;
+            lines.get(&key).is_some_and(|on| {
+                on.iter().any(|&(t, y, v)| {
+                    if v == a || v == b || t < lo - margin || t > hi + margin {
+                        return false;
+                    }
+                    let f = if (tb - ta).abs() > 1e-4 {
+                        ((t - ta) / (tb - ta)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    ha + (hb - ha) * f - y > depth
+                })
+            })
+        };
         let mut open: Vec<(u32, u32)> = edges
             .into_iter()
             .filter(|&(_, n)| n == 1)
@@ -1177,6 +1235,7 @@ impl TerrainMesh {
                         None
                     };
                     sides.is_some_and(|sides| !sides.iter().any(|&q| borders_nothing(q, step)))
+                        && !steps_down(a, b, step)
                 })
             })
             .filter(|_| skirts_wanted())
@@ -1404,18 +1463,25 @@ mod tests {
                 detail_map: None,
                 layers: Vec::new(),
             });
+            add_quad(&mut mesh, x0, z0, 2.0);
+            mesh
+        };
+        fn add_quad(mesh: &mut TerrainMesh, x0: f32, z0: f32, y: f32) {
+            let base = mesh.vertex_count();
             for (x, z) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
-                for f in [x0 + x, 2.0, z0 + z, 0.0, 1.0, 0.0, 0.0, 0.0] {
+                for f in [x0 + x, y, z0 + z, 0.0, 1.0, 0.0, 0.0, 0.0] {
                     mesh.vertices.extend(f.to_le_bytes());
                 }
                 mesh.vertices.extend([255, 0, 0, 0]);
                 mesh.vertices.extend([0u8; 16]);
             }
-            mesh.indices = vec![0, 1, 2, 0, 2, 3];
-            mesh.ranges = vec![(0, 6, 0)];
-            mesh.bounds = (Vec3::new(x0, 2.0, z0), Vec3::new(x0 + 1.0, 2.0, z0 + 1.0));
-            mesh
-        };
+            mesh.indices.extend([0, 1, 2, 0, 2, 3].map(|i| base + i));
+            mesh.ranges = vec![(0, mesh.indices.len() as u32, 0)];
+            mesh.bounds = (
+                mesh.bounds.0.min(Vec3::new(x0, y, z0)),
+                mesh.bounds.1.max(Vec3::new(x0 + 1.0, y, z0 + 1.0)),
+            );
+        }
         // On a 100 m grid the edges along x = 0 and z = 0 lie on lines, but
         // the squares beyond them, inside the cell, hold no ground: nothing
         // to cover there.
@@ -1427,6 +1493,13 @@ mod tests {
         let mut border = quad(199.0, 0.0);
         border.add_skirts(4.0, Some(100.0));
         assert_eq!(border.indices.len(), 6 + 12);
+        // A bank's edge on x = 100 over seabed 12 m down across the line:
+        // no skirt from the bank; the seabed's own edge keeps one.
+        let mut bank = quad(99.0, 0.0);
+        add_quad(&mut bank, 100.0, 0.0, -10.0);
+        bank.add_skirts(4.0, Some(100.0));
+        assert_eq!(bank.indices.len(), 12 + 12);
+        assert!(bank.indices[12..].contains(&4));
         let mut mesh = quad(0.0, 0.0);
         mesh.add_skirts(4.0, None);
         assert_eq!(mesh.vertex_count(), 8);
