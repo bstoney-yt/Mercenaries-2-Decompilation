@@ -1672,8 +1672,11 @@ impl Combat {
             let r = BOMB_FIRE_SPREAD * (0.7 + 0.6 * self.random());
             let (shortest, longest) = BOMB_FIRE_TIME;
             let burn = shortest + (longest - shortest) * (self.random() + 0.5);
-            let spot = at + Vec3::new(a.sin() * r, 1.2, a.cos() * r);
-            self.fires.push((spot, 2.5, burn, 0.0));
+            let spot = at + Vec3::new(a.sin() * r, 0.0, a.cos() * r);
+            // On the ground: a bomb that hit a gate's top (which it brings
+            // down) leaves its fires below.
+            let ground = ground_under(f.physics, spot).unwrap_or(spot);
+            self.fires.push((ground + Vec3::Y * 1.2, 2.5, burn, 0.0));
         }
         alarm(f.people, at);
     }
@@ -1831,6 +1834,18 @@ impl Combat {
             );
         }
     }
+}
+
+/// The ground under `at` (from 6 m above it, so a spot up a slope is
+/// found too, down to 60 m), seen through the state layers' models (a gate
+/// a bomb brings down).
+fn ground_under(physics: &Physics, at: Vec3) -> Option<Vec3> {
+    let from = at + Vec3::Y * 6.0;
+    physics
+        .cast_ray_skipping(from, Vec3::NEG_Y, 60.0, |key| {
+            matches!(key, StaticKey::Entity(_))
+        })
+        .map(|(d, _)| from - Vec3::Y * d)
 }
 
 /// The velocity at `speed` that lobs a round from `from` down onto `to`
@@ -2112,6 +2127,30 @@ mod tests {
         let s = combat.struck.first().copied().expect("struck");
         assert_eq!(s.key, Some(StaticKey::Entity(7)));
         assert!(s.at.y < 0.8 && s.damage >= 100.0, "{s:?}");
+    }
+
+    #[test]
+    fn a_bombs_fires_burn_on_the_ground_under_a_gate() {
+        let mut physics = ground();
+        // A gate 15 m high (a state layer's) and a house 6 m high.
+        let wall = |half: Vec3| m2_engine::CollisionShape::cuboid(half);
+        physics.add_static(
+            StaticKey::Entity(7),
+            &wall(Vec3::new(10.0, 7.5, 2.0)),
+            Vec3::new(0.0, 7.5, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.add_static(
+            StaticKey::Object(3),
+            &wall(Vec3::new(4.0, 3.0, 4.0)),
+            Vec3::new(40.0, 3.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let on = |at: Vec3| ground_under(&physics, at).map(|g| (g.y * 10.0).round() / 10.0);
+        assert_eq!(on(Vec3::new(1.0, 15.0, 0.5)), Some(0.0));
+        assert_eq!(on(Vec3::new(40.0, 6.0, 0.0)), Some(6.0));
+        assert_eq!(on(Vec3::new(80.0, 2.0, 0.0)), Some(0.0));
     }
 
     #[test]
