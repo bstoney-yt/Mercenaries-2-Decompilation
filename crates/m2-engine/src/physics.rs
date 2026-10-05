@@ -558,6 +558,26 @@ const TRACK_TURN: f32 = 0.9;
 /// and backwards.
 const TOP_SPEED: f32 = 30.0;
 const REVERSE_SPEED: f32 = 8.0;
+/// Boats ([`Physics::set_water`]): how deep a boat's origin floats,
+/// metres (the layers put the start's boat 0.35 m under the -36 m sea,
+/// patrol boats at it); how hard it pushes on flat out, m/s²; how its
+/// speed falls off coasting and braking, sideways (its keel) and up and
+/// down, and how its rocking dies down, per second; how fast it turns at
+/// speed, radians a second, from what speed, m/s; its top speed backing
+/// up and when its template gives none, m/s; and the most of its weight
+/// a wreck's buoyancy holds up (it sinks). All invented.
+const FLOAT_DEPTH: f32 = 0.35;
+const BOAT_PUSH: f32 = 5.0;
+const BOAT_COAST: f32 = 0.3;
+const BOAT_BRAKE: f32 = 1.2;
+const BOAT_KEEL: f32 = 2.5;
+const BOAT_HEAVE: f32 = 3.0;
+const BOAT_ROCK: f32 = 2.5;
+const BOAT_TURN: f32 = 0.9;
+const BOAT_TURN_SPEED: f32 = 6.0;
+const BOAT_REVERSE: f32 = 4.0;
+const BOAT_TOP: f32 = 18.0;
+const WRECK_FLOAT: f32 = 0.4;
 /// The steepest hill a vehicle takes about as fast as the flat, radians,
 /// wheeled and tracked: uphill the engine pulls as a lower gear would
 /// (invented; the playthrough's jeep and tank take the hill roads at
@@ -595,6 +615,17 @@ struct VehicleBody {
     held: bool,
     /// Its velocity before the last step, m/s: what it hit things with.
     before: Vec3,
+    /// A boat's: it floats instead of rolling on wheels.
+    hull: Option<Hull>,
+}
+
+/// A boat's hull in the water: the points on its waterline that float it,
+/// and what its driver asks of it.
+struct Hull {
+    /// Model space, at its origin's height: over its hull's footprint,
+    /// its corners, the middles of its sides and its middle.
+    points: Vec<Vec3>,
+    controls: VehicleControls,
 }
 
 /// A character's capsule and motion.
@@ -684,6 +715,8 @@ pub struct Physics {
     ragdolls: Vec<Option<Ragdoll>>,
     /// Loose props' pieces, oldest first.
     debris: Vec<Option<r::RigidBodyHandle>>,
+    /// The water's surface boats float on, if there is any.
+    water: Option<f32>,
 }
 
 /// A loose prop's piece in the physics world ([`Physics::add_debris`]).
@@ -736,7 +769,18 @@ impl Physics {
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
             debris: Vec::new(),
+            water: None,
         }
+    }
+
+    /// Sets the height of the water boats float on (the sea).
+    pub fn set_water(&mut self, level: f32) {
+        self.water = Some(level);
+    }
+
+    /// The height of the water boats float on, if there is any.
+    pub fn water(&self) -> Option<f32> {
+        self.water
     }
 
     /// Adds `shape` at `position` and `rotation` under `key`, replacing
@@ -794,9 +838,94 @@ impl Physics {
             );
             v.controller.update_vehicle(dt, queries);
         }
+        self.float_boats(dt);
         self.world.step();
         self.hold_ragdolls_together();
         self.settle_debris();
+    }
+
+    /// Floats boats on the water ([`set_water`](Self::set_water)) and
+    /// drives them as asked: each point of a hull's waterline under the
+    /// surface lifts it as deep as it is (the hull's whole weight with its
+    /// origin [`FLOAT_DEPTH`] under), and in the water a boat is pushed and
+    /// steered, slowed, kept from sliding sideways and stopped rocking.
+    fn float_boats(&mut self, dt: f32) {
+        let Some(water) = self.water else {
+            return;
+        };
+        for v in self.vehicles.iter().flatten() {
+            let Some(hull) = v.hull.as_ref().filter(|_| !v.held) else {
+                continue;
+            };
+            let Some(b) = self.world.bodies.get_mut(v.controller.chassis) else {
+                continue;
+            };
+            let place = *b.position();
+            let turn = Quat::from_array(place.rotation.to_array());
+            let at = vec3(place.translation);
+            let n = hull.points.len().max(1) as f32;
+            // Deep under, three times its share of the weight; a wreck's
+            // never more than its share of [`WRECK_FLOAT`] of it.
+            let most = if v.wrecked { WRECK_FLOAT } else { 3.0 };
+            let lift = GRAVITY * v.mass / n * dt;
+            let mut wet = 0.0;
+            for &q in &hull.points {
+                let p = at + turn * q;
+                let depth = water - p.y;
+                if depth > 0.0 {
+                    wet += 1.0;
+                    let up = lift * (depth / FLOAT_DEPTH).min(most);
+                    b.apply_impulse_at_point(vector(Vec3::Y * up), vector(p), true);
+                }
+            }
+            if wet == 0.0 {
+                continue;
+            }
+            let wet = wet / n;
+            let ease = |rate: f32| 1.0 - (rate * dt * wet).min(1.0);
+            let c = if v.wrecked {
+                VehicleControls::default()
+            } else {
+                hull.controls
+            };
+            let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or_zero();
+            let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+            let velocity = vec3(b.linvel());
+            let mut along = velocity.dot(ahead);
+            let throttle = c.throttle.clamp(-1.0, 1.0);
+            let against = throttle * along < -0.5;
+            let top = if throttle >= 0.0 { v.top } else { BOAT_REVERSE };
+            if throttle != 0.0 && !against && !c.brake && !c.parked {
+                let headroom = (1.0 - along.abs() / top).clamp(0.0, 1.0);
+                along += throttle * BOAT_PUSH * headroom * dt * wet;
+            }
+            let slowing = if c.brake || c.parked || against {
+                BOAT_BRAKE
+            } else if throttle == 0.0 {
+                BOAT_COAST
+            } else {
+                0.0
+            };
+            along *= ease(slowing);
+            let across = velocity.dot(side) * ease(BOAT_KEEL);
+            let rise = velocity.y * ease(BOAT_HEAVE);
+            b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
+            // The rudder bites as the water goes by (the other way round
+            // backing up), a little with the throttle open at a standstill;
+            // it turns as tracks do for the same steering.
+            let spin = vec3(b.angvel());
+            let up = turn * Vec3::Y;
+            let bite = if along.abs() < 0.9 {
+                0.15 * throttle
+            } else {
+                (along / BOAT_TURN_SPEED).clamp(-1.0, 1.0)
+            };
+            let want = c.steer.clamp(-1.0, 1.0) * BOAT_TURN * bite;
+            let yaw = spin.dot(up);
+            let yaw = yaw + (want - yaw) * (3.0 * dt * wet).min(1.0);
+            let rock = (spin - up * spin.dot(up)) * ease(BOAT_ROCK);
+            b.set_angvel(vector(rock + up * yaw), true);
+        }
     }
 
     /// Holds loose pieces fallen through the island, and the oldest past
@@ -989,16 +1118,33 @@ impl Physics {
                 &tuning,
             );
         }
+        // A boat floats on its waterline (its origin's height), over the
+        // footprint of its hull a little in from the edges.
+        let boat = spec.is_boat();
+        let hull = boat.then(|| {
+            let (lo, hi) = spec.hull;
+            let at = |a: f32, b: f32, k: f32| a + (b - a) * (0.1 + 0.4 * k);
+            let points = (0..3)
+                .flat_map(|i| (0..3).map(move |j| (i as f32, j as f32)))
+                .map(|(i, j)| Vec3::new(at(lo.x, hi.x, i), 0.0, at(lo.z, hi.z, j)))
+                .collect();
+            Hull {
+                points,
+                controls: VehicleControls::default(),
+            }
+        });
+        let top = if boat { BOAT_TOP } else { TOP_SPEED };
         let id = VehicleId(self.vehicles.len());
         self.vehicles.push(Some(VehicleBody {
             controller,
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tracked: spec.tracked,
-            top: spec.tuning.max_speed.unwrap_or(TOP_SPEED),
+            top: spec.tuning.max_speed.unwrap_or(top),
             wrecked: false,
             held: false,
             before: Vec3::ZERO,
+            hull,
         }));
         id
     }
@@ -1023,6 +1169,11 @@ impl Physics {
         else {
             return;
         };
+        // A boat is driven as it floats (`float_boats`).
+        if let Some(hull) = &mut v.hull {
+            hull.controls = controls;
+            return;
+        }
         let speed = v.controller.current_vehicle_speed;
         let wheels = v.controller.wheels().len().max(1) as f32;
         // How steeply its nose points up (the sine).
@@ -1887,6 +2038,134 @@ mod tests {
             turret_box: None,
             tuning: crate::VehicleTuning::default(),
         }
+    }
+
+    fn boat() -> VehicleSpec {
+        let hull = (Vec3::new(-1.2, -0.7, -3.0), Vec3::new(1.2, 1.0, 3.0));
+        VehicleSpec {
+            kind: crate::vehicle::BOAT.into(),
+            wheels: Vec::new(),
+            bounds: hull,
+            hull,
+            mass: 2000.0,
+            ..car()
+        }
+    }
+
+    #[test]
+    fn a_boat_floats_level_drives_turns_and_beaches() {
+        let mut p = Physics::new();
+        let water = -36.0;
+        p.set_water(water);
+        // The seabed, and a beach rising out of the sea 120 m ahead.
+        let bed = CollisionShape::mesh(
+            &[
+                Vec3::new(-300.0, -60.0, -300.0),
+                Vec3::new(300.0, -60.0, -300.0),
+                Vec3::new(300.0, -60.0, 100.0),
+                Vec3::new(-300.0, -60.0, 100.0),
+                Vec3::new(300.0, -26.0, 300.0),
+                Vec3::new(-300.0, -26.0, 300.0),
+            ],
+            &[[0, 2, 1], [0, 3, 2], [3, 4, 2], [3, 5, 4]],
+        )
+        .unwrap();
+        p.add_static(StaticKey::Cell(1), &bed, Vec3::ZERO, Quat::IDENTITY);
+        p.step(DT);
+        let id = p.add_vehicle(&boat(), Vec3::new(0.0, water + 1.5, -200.0), 0.0);
+        let place = |p: &Physics| p.vehicle_transform(id).unwrap();
+        for _ in 0..600 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        // Afloat, level, its origin about as deep as the layers put boats.
+        let m = place(&p);
+        let y = m.w_axis.y;
+        assert!((y - (water - FLOAT_DEPTH)).abs() < 0.15, "floats at {y}");
+        assert!(m.transform_vector3(Vec3::Y).y > 0.99, "level");
+        // Flat out ahead.
+        for _ in 0..360 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let speed = p.vehicle_speed(id);
+        assert!((10.0..=BOAT_TOP + 0.5).contains(&speed), "{speed} m/s");
+        let m = place(&p);
+        assert!(
+            m.w_axis.z > -170.0 && m.w_axis.x.abs() < 1.0,
+            "at {}",
+            m.w_axis
+        );
+        assert!((m.w_axis.y - (water - FLOAT_DEPTH)).abs() < 0.5);
+        // Steering turns it as steering a tank does: positive steer, a
+        // positive turn about up.
+        let before = m.transform_vector3(Vec3::Z);
+        for _ in 0..120 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    steer: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let after = place(&p).transform_vector3(Vec3::Z);
+        let turned = after.x.atan2(after.z) - before.x.atan2(before.z);
+        assert!(turned > 0.8, "turned {turned}");
+        // Straight on at the beach: it runs aground and stops there,
+        // still upright.
+        for _ in 0..120 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    steer: -1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        for _ in 0..60 * 40 {
+            let m = place(&p);
+            let f = m.transform_vector3(Vec3::Z);
+            // Heading for +z.
+            let steer = (-f.x.atan2(f.z) * 2.0).clamp(-1.0, 1.0);
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    steer,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        // The beach comes out of the water at z 241.
+        let m = place(&p);
+        assert!(p.vehicle_speed(id).abs() < 2.0, "{}", p.vehicle_speed(id));
+        assert!(
+            (215.0..250.0).contains(&m.w_axis.z),
+            "aground at {}",
+            m.w_axis
+        );
+        assert!(m.transform_vector3(Vec3::Y).y > 0.8, "upright");
+        // A wreck sinks.
+        p.wreck_vehicle(id);
+        let id2 = p.add_vehicle(&boat(), Vec3::new(50.0, water, -200.0), 0.0);
+        p.wreck_vehicle(id2);
+        for _ in 0..60 * 20 {
+            p.step(DT);
+        }
+        let y = p.vehicle_transform(id2).unwrap().w_axis.y;
+        assert!(y < water - 5.0, "wreck at {y}");
     }
 
     #[test]

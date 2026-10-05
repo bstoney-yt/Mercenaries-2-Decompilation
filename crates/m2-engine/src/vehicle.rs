@@ -241,6 +241,9 @@ pub struct Rest {
     pub bumps: f32,
 }
 
+/// The [`CatalogueEntry::kind`] of boats (a template with `_BoatPhysics`).
+pub const BOAT: &str = "boat";
+
 /// Node name hash of a gun's muzzle marker (the hand weapons have it).
 pub const GUN_MUZZLE: u32 = 0xb148_6ef3;
 
@@ -305,6 +308,7 @@ impl VehicleSpec {
         let found = vehicle::find_wheels(model);
         let usable = (4..=10).contains(&found.len())
             && found.iter().all(|w| (0.15..=1.3).contains(&w.radius));
+        let boat = entry.kind == BOAT;
         // A wheeled APC (the Stryker) drives on its wheels.
         let tracked = entry.kind == "tank" || (entry.kind == "apc" && !usable);
         let n = model.nodes.len();
@@ -329,7 +333,9 @@ impl VehicleSpec {
             }
         };
         let mut road_wheels = Vec::new();
-        let mut wheels: Vec<WheelSpec> = if usable && !tracked {
+        let mut wheels: Vec<WheelSpec> = if boat {
+            Vec::new()
+        } else if usable && !tracked {
             let (back, front) = found
                 .iter()
                 .map(|w| w.centre[2])
@@ -549,6 +555,14 @@ impl VehicleSpec {
             self.elevation = turret.pitch;
         }
         self
+    }
+
+    /// Whether it is a boat: it floats ([`Physics::set_water`]) and has
+    /// no wheels.
+    ///
+    /// [`Physics::set_water`]: crate::Physics::set_water
+    pub fn is_boat(&self) -> bool {
+        self.kind == BOAT
     }
 
     /// Whether its turret's gun fires shells: a tank's, or one its
