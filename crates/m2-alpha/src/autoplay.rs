@@ -995,9 +995,16 @@ fn turn_to(p: &Player, yaw: f32, pitch: f32, dt: f32) -> Vec2 {
 /// is now (radians).
 fn aim(p: &Player, target: Vec3, dt: f32) -> (Vec2, f32) {
     let dir = (target - p.pivot()).normalize_or(Vec3::Z);
-    let error = p.camera_forward().angle_between(dir);
+    let error = p.aim_forward().angle_between(dir);
+    // A tank's crosshair sits above the camera's line.
+    let lift = p.aim_forward().y.asin() - p.camera_forward().y.asin();
     (
-        turn_to(p, dir.x.atan2(dir.z), dir.y.clamp(-1.0, 1.0).asin(), dt),
+        turn_to(
+            p,
+            dir.x.atan2(dir.z),
+            dir.y.clamp(-1.0, 1.0).asin() - lift,
+            dt,
+        ),
         error,
     )
 }

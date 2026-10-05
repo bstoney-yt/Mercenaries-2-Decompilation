@@ -785,6 +785,7 @@ mod tests {
         let t = VehicleTuning {
             mass: Some(32_000.0),
             turret: Some(TurretTuning {
+                main: true,
                 yaw_speed: 1.0,
                 yaw_accel: 20.0,
                 pitch: (-0.14, 0.44),
