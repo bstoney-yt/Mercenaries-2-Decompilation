@@ -130,7 +130,7 @@ pub struct GameAudio {
     next_track: usize,
     decoded: (Sender<Decoded>, Receiver<Decoded>),
     /// Rifle shot, rocket launch, explosion.
-    fight: [Option<SoundBuffer>; 3],
+    fight: [Option<SoundBuffer>; 4],
     /// Short sounds of the town (`amb_citymed`) and the jungle
     /// (`amb_jungle`) played now and then around the listener.
     ambient: [Vec<SoundBuffer>; 2],
@@ -335,8 +335,32 @@ impl Engine {
     }
 }
 
+/// A tank's main gun: the loudest of its bank's sounds 0.4 to 4 s long.
+fn tank_gun(library: &SoundLibrary) -> Option<SoundBuffer> {
+    pick(library, "wpn_tankgun", |s| {
+        (0.4..=4.0).contains(&s.seconds())
+    })
+    .inspect(|s| eprintln!("sound: tank gun {:08x} ({:.2} s)", s.hash, s.seconds()))
+}
+
+/// Reads and logs which sound a tank's gun plays (for the drive test,
+/// whose picture has no sound).
+pub fn log_tank_gun(install: &Install) {
+    let library = install
+        .open_world()
+        .and_then(|mut source| SoundLibrary::load(&mut source, &["wpn_tankgun"]));
+    match library {
+        Ok(l) => {
+            if tank_gun(&l).is_none() {
+                eprintln!("sound: no tank gun shot in wpn_tankgun");
+            }
+        }
+        Err(e) => eprintln!("sound: no tank gun ({e})"),
+    }
+}
+
 /// Sounds read from the banks: the fight's and the ambient one-shots.
-type BankSounds = ([Option<SoundBuffer>; 3], [Vec<SoundBuffer>; 2]);
+type BankSounds = ([Option<SoundBuffer>; 4], [Vec<SoundBuffer>; 2]);
 
 /// The fight's sounds and the ambient one-shots.
 fn bank_sounds(install: &Install) -> BankSounds {
@@ -347,6 +371,7 @@ fn bank_sounds(install: &Install) -> BankSounds {
                 "wpn_assaultrifle",
                 "wpn_rpg",
                 "support_artillery",
+                "wpn_tankgun",
                 "amb_citymed",
                 "amb_jungle",
             ],
@@ -370,6 +395,7 @@ fn bank_sounds(install: &Install) -> BankSounds {
                     pick(&l, "support_artillery", |s| {
                         s.channels == 1 && (1.5..=3.0).contains(&s.seconds())
                     }),
+                    tank_gun(&l),
                 ],
                 [short("amb_citymed"), short("amb_jungle")],
             )
@@ -685,6 +711,7 @@ impl GameAudio {
                 Sound::Shot(at) => (0, at, 0.9),
                 Sound::Launch(at) => (1, at, 1.0),
                 Sound::Explosion(at) => (2, at, 1.4),
+                Sound::Cannon(at) => (3, at, 1.3),
             };
             if let Some(buffer) = self.fight[i].clone() {
                 self.out.with(|m| m.play(Play::at(buffer, at).gain(gain)));

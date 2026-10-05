@@ -1252,6 +1252,15 @@ fn drive_for_screenshot(
             // What it plays (read here: the picture has no sound).
             if let Some(install) = install {
                 sound::load_engine(install, e.bank);
+                let tank = game
+                    .scene
+                    .player
+                    .as_ref()
+                    .and_then(|p| p.driving)
+                    .is_some_and(|i| game.scene.vehicles[i].spec.kind == "tank");
+                if tank {
+                    sound::log_tank_gun(install);
+                }
             }
         }
     }
