@@ -7,8 +7,8 @@
 //! for a while she hops ahead (logged too): the run goes on to the later
 //! objectives, and the hops show where the way is blocked.
 
-use m2_engine::Physics;
-use m2_math::glam::{Mat4, Vec2, Vec3};
+use m2_engine::{Physics, VehicleId};
+use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
 use crate::combat::{Combat, Trigger, Weapon};
 use crate::game::{Game, place};
@@ -52,6 +52,15 @@ const VANTAGE_RINGS: [f32; 5] = [6.0, 10.0, 15.0, 20.0, 26.0];
 const VANTAGE_CLIMB: f32 = 3.0;
 /// Driving: she eases off within this far of a place (metres) above this
 /// speed (m/s); stuck this long (seconds), she backs out for this long.
+/// How far ahead a driver looks for a clear way: this much, plus this
+/// many seconds at its speed, at most this (metres); how far either side
+/// of the heading it looks (radians); and how flat a surface must be
+/// (its normal's height) not to be a wall.
+const WAY_AHEAD: f32 = 6.0;
+const WAY_TIME: f32 = 1.5;
+const WAY_MOST: f32 = 25.0;
+const WAY_FAN: f32 = 1.4;
+const WALL: f32 = 0.8;
 const SLOW_NEAR: f32 = 30.0;
 const SLOW: f32 = 7.0;
 const STALL: f32 = 2.5;
@@ -489,6 +498,17 @@ impl Autoplay {
             };
         }
         let (angle, _) = heading_to(m, at);
+        // Round what stands in the way.
+        let angle = match (
+            game.scene.world.as_ref(),
+            game.scene
+                .vehicles
+                .get(i)
+                .and_then(|v| v.id.zip(Some(v.spec.hull))),
+        ) {
+            (Some(w), Some((id, hull))) => clear_way(&w.physics, id, m, hull, angle, speed),
+            _ => angle,
+        };
         let mut steer = (angle * 2.0).clamp(-1.0, 1.0);
         let mut throttle = 1.0;
         if (d < SLOW_NEAR && speed > SLOW) || (angle.abs() > 0.8 && speed > SLOW) {
@@ -980,6 +1000,54 @@ fn heading_to(m: Mat4, at: Vec3) -> (f32, f32) {
     (dir.dot(right).atan2(dir.dot(f)), d)
 }
 
+/// The way to steer (radians off the heading, positive to the right)
+/// nearest `want` that is clear for a little way, further the faster it
+/// goes: rays from both front corners at bumper height, fanned out from
+/// `want`. Walls, other vehicles and slopes too steep to drive up are in
+/// the way; ground it can drive up isn't.
+fn clear_way(
+    physics: &Physics,
+    id: VehicleId,
+    m: Mat4,
+    hull: (Vec3, Vec3),
+    want: f32,
+    speed: f32,
+) -> f32 {
+    let (lo, hi) = hull;
+    let reach = (WAY_AHEAD + speed.abs() * WAY_TIME).min(WAY_MOST);
+    let up = m.transform_vector3(Vec3::Y);
+    let forward = m.transform_vector3(Vec3::Z);
+    let clearance = |a: f32| {
+        // Positive is to the right: clockwise from above.
+        let dir = Quat::from_axis_angle(up, -a) * forward;
+        [lo.x + 0.1, hi.x - 0.1]
+            .iter()
+            .map(|&x| {
+                let from = m.transform_point3(Vec3::new(x, lo.y + 0.8, hi.z));
+                match physics.cast_ray_past(from, dir, reach, id) {
+                    Some((d, n)) if n.y < WALL => d,
+                    _ => reach,
+                }
+            })
+            .fold(reach, f32::min)
+    };
+    let want = want.clamp(-WAY_FAN, WAY_FAN);
+    if clearance(want) >= reach {
+        return want;
+    }
+    let mut best = (f32::NEG_INFINITY, want);
+    for k in 1..=10 {
+        for side in [-1.0, 1.0] {
+            let a = (want + side * k as f32 * 0.15).clamp(-WAY_FAN, WAY_FAN);
+            let score = clearance(a) - (a - want).abs() * 4.0;
+            if score > best.0 {
+                best = (score, a);
+            }
+        }
+    }
+    best.1
+}
+
 /// An angle wrapped to -π..π.
 fn wrap(a: f32) -> f32 {
     let mut a = a.rem_euclid(std::f32::consts::TAU);
@@ -1111,6 +1179,84 @@ mod tests {
         // Not the same spot twice.
         let next = vantage(&p, target, Vec3::ZERO, &[spot]).expect("another");
         assert!(next.distance(spot) >= 4.0, "{next} is {spot} again");
+    }
+
+    // A wall across the way with a gap to its left: the driver steers
+    // for the gap, and straight on once the way is clear.
+    #[test]
+    fn drivers_steer_round_a_wall() {
+        use m2_engine::vehicle::WheelSpec;
+        use m2_engine::{CollisionShape, StaticKey, VehicleSpec};
+        let mut p = Physics::new();
+        let quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            CollisionShape::mesh(&[a, b, c, d], &[[0, 1, 2], [0, 2, 3]]).unwrap()
+        };
+        let ground = quad(
+            Vec3::new(-50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, 50.0),
+            Vec3::new(-50.0, 0.0, 50.0),
+        );
+        // Facing +z, left is +x: the wall ends 4 m to the left.
+        let wall = quad(
+            Vec3::new(-30.0, 0.0, 10.0),
+            Vec3::new(4.0, 0.0, 10.0),
+            Vec3::new(4.0, 3.0, 10.0),
+            Vec3::new(-30.0, 3.0, 10.0),
+        );
+        p.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+        p.add_static(StaticKey::Cell(2), &wall, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let wheel = |x: f32, z: f32| WheelSpec {
+            centre: Vec3::new(x, 0.35, z),
+            radius: 0.35,
+            width: 0.25,
+            steers: z > 0.0,
+        };
+        let hull = (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2));
+        let spec = VehicleSpec {
+            model: 1,
+            kind: "car".into(),
+            label: "test".into(),
+            wheels: vec![
+                wheel(-0.9, 1.4),
+                wheel(0.9, 1.4),
+                wheel(-0.9, -1.3),
+                wheel(0.9, -1.3),
+            ],
+            bounds: hull,
+            seat: None,
+            door: None,
+            tracked: false,
+            road_wheels: Vec::new(),
+            rest: Vec::new(),
+            node_wheel: Vec::new(),
+            mass: 1400.0,
+            turret: Vec::new(),
+            pivot: None,
+            muzzle: None,
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
+            hull,
+            turret_box: None,
+            tuning: Default::default(),
+        };
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        p.step(1.0 / 60.0);
+        let m = p.vehicle_transform(id).unwrap();
+        let target = Vec3::new(0.0, 0.0, 40.0);
+        let (want, _) = heading_to(m, target);
+        let way = clear_way(&p, id, m, hull, want, 5.0);
+        assert!(way < -0.2, "steers {way} (left is negative)");
+        // Past the wall's end: straight on.
+        let m = Mat4::from_translation(Vec3::new(8.0, 0.0, 0.0));
+        p.remove_vehicle(id);
+        let id = p.add_vehicle(&spec, Vec3::new(8.0, 0.1, 0.0), 0.0);
+        p.step(1.0 / 60.0);
+        let (want, _) = heading_to(m, Vec3::new(8.0, 0.0, 40.0));
+        assert_eq!(clear_way(&p, id, m, hull, want, 5.0), want);
     }
 
     #[test]
