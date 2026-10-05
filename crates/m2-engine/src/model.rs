@@ -481,6 +481,18 @@ impl GpuModel {
         }
     }
 
+    /// As [`draw_as`](Self::draw_as), with each rigid piece at its node's
+    /// place in the model as `nodes` has it (a loose prop's pieces flying,
+    /// [`Loose::posed`](crate::Loose::posed)); skinned pieces stay put.
+    pub fn draw_moved(&self, queue: &mut DrawQueue, world: Mat4, nodes: &[Mat4], wrecked: bool) {
+        for piece in self.shown(wrecked) {
+            match piece.node.and_then(|n| nodes.get(usize::from(n))) {
+                Some(&m) if piece.bones.is_empty() => Self::push_at(queue, piece, world * m, None),
+                _ => Self::push(queue, piece, world, None),
+            }
+        }
+    }
+
     /// Whether the model has wrecked parts to show.
     pub fn has_wreck(&self) -> bool {
         self.hidden[0] != self.hidden[1]

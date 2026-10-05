@@ -1080,8 +1080,13 @@ impl Scene {
         if let Some(world) = &mut self.world {
             let frustum = Frustum::from_view_proj(view.projection * view.view);
             world.draw(backend, queue, eye, &frustum)?;
-            self.props
-                .draw(queue, eye, &frustum, world.settings.object_distance);
+            self.props.draw(
+                queue,
+                &world.physics,
+                eye,
+                &frustum,
+                world.settings.object_distance,
+            );
         } else {
             self.draw_ground(queue);
         }

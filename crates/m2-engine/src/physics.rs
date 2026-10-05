@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use m2_assets::Model;
 use m2_assets::model::GeometryKind;
@@ -62,6 +63,9 @@ pub struct CollisionShape {
     /// Cut from the model's visible triangles, standing in for collision
     /// the model doesn't carry (`PHY2`).
     pub stand_in: bool,
+    /// How the model comes loose when knocked, if its `PHY2` has bodies
+    /// that move.
+    pub loose: Option<Arc<Loose>>,
 }
 
 impl fmt::Debug for CollisionShape {
@@ -69,8 +73,250 @@ impl fmt::Debug for CollisionShape {
         f.debug_struct("CollisionShape")
             .field("triangles", &self.triangles)
             .field("stand_in", &self.stand_in)
+            .field("loose", &self.loose)
             .finish()
     }
+}
+
+/// How a prop comes loose when a vehicle or a blast knocks it (its `PHY2`
+/// has bodies that move: traffic lights, plants, barricades, poles): its
+/// standing collision goes and its pieces fly. A model with a wreck whose
+/// moving bodies show only wrecked falls to those pieces, drawn wrecked;
+/// any other goes as one, drawn whole.
+///
+/// The `PHY2` constraints that would hold pieces together (a door on its
+/// hinge) are not read: each piece goes its own way.
+#[derive(Clone)]
+pub struct Loose {
+    pub pieces: Vec<LoosePiece>,
+    /// Falls to its wreck's pieces, drawn wrecked.
+    pub wrecks: bool,
+    /// The moving bodies' mass, kg: what a vehicle has to shift.
+    pub mass: f32,
+    /// Each node's place in the model at rest.
+    rest: Vec<Mat4>,
+    /// For each node, the piece it goes with: the nearest at or above it
+    /// (`None`: it stays put).
+    owner: Vec<Option<usize>>,
+}
+
+impl fmt::Debug for Loose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Loose")
+            .field("pieces", &self.pieces.len())
+            .field("wrecks", &self.wrecks)
+            .field("mass", &self.mass)
+            .finish()
+    }
+}
+
+/// One piece of a [`Loose`] prop: boxes round its `PHY2` shapes, in the
+/// space of the node it moves.
+#[derive(Clone)]
+pub struct LoosePiece {
+    /// The node it moves, with those under it; `None` for the whole
+    /// model, in model space.
+    pub node: Option<u16>,
+    shape: r::SharedShape,
+    /// Kilograms.
+    pub mass: f32,
+    /// Model space to the node's space, at rest.
+    from_model: Mat4,
+}
+
+impl fmt::Debug for LoosePiece {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoosePiece")
+            .field("node", &self.node)
+            .field("mass", &self.mass)
+            .finish()
+    }
+}
+
+/// The lightest and heaviest a loose piece is, kg (a `PHY2` body may say
+/// 0).
+const LOOSE_MASS: f32 = 2.0;
+const LOOSE_MOST: f32 = 100_000.0;
+
+/// A `PHY2` body's mass as a loose piece's.
+fn loose_mass(mass: f32) -> f32 {
+    if mass.is_finite() {
+        mass.clamp(LOOSE_MASS, LOOSE_MOST)
+    } else {
+        LOOSE_MASS
+    }
+}
+/// The thinnest a loose piece's box is, half metres.
+const LOOSE_HALF: f32 = 0.02;
+/// Models larger than this (their box's diagonal, metres) never come
+/// loose: a building with a door that swings, or one that falls to pieces
+/// when blown up, stands when a vehicle runs into it.
+const LOOSE_SIZE: f32 = 14.0;
+
+impl Loose {
+    /// How `model` comes loose by its `PHY2` `p`; `None` unless a body of
+    /// it moves.
+    fn of(model: &Model<'_>, p: &Phy2) -> Option<Self> {
+        let moving: Vec<usize> = (0..p.bodies.len())
+            .filter(|&b| !p.bodies[b].is_fixed())
+            .collect();
+        let b = &model.info.bounds;
+        let size = (Vec3::from(b.max) - Vec3::from(b.min)).length();
+        if moving.is_empty() || size.is_nan() || size > LOOSE_SIZE {
+            return None;
+        }
+        let hidden = model
+            .states
+            .as_ref()
+            .map(|s| [s.hidden(&model.nodes, false), s.hidden(&model.nodes, true)])
+            .unwrap_or_default();
+        let off =
+            |wrecked: usize, n: u32| hidden[wrecked].get(n as usize).copied().unwrap_or(false);
+        // A shape shows as its own part's node does.
+        let node_of = |k: usize| p.parts.get(p.shapes[k].part).map_or(0, |q| q.node);
+        let shapes_of = |b: usize| (0..p.shapes.len()).filter(move |&k| p.body_of(k) == Some(b));
+        let body_node = |b: usize| {
+            p.parts
+                .iter()
+                .find(|q| q.body == Some(b))
+                .and_then(|q| u16::try_from(q.node).ok())
+                .filter(|&n| usize::from(n) < model.nodes.len())
+        };
+        let rest: Vec<Mat4> = (0..model.nodes.len())
+            .map(|n| model.node_to_model(n as u16).unwrap_or(Mat4::IDENTITY))
+            .collect();
+        // The wreck's pieces: moving bodies whose shapes all show only
+        // wrecked.
+        let wreck: Vec<usize> = moving
+            .iter()
+            .copied()
+            .filter(|&b| {
+                let mut shapes = shapes_of(b).peekable();
+                shapes.peek().is_some() && shapes.all(|k| off(0, node_of(k)) && !off(1, node_of(k)))
+            })
+            .collect();
+        let mut pieces = Vec::new();
+        let wrecks = hidden[0] != hidden[1] && !wreck.is_empty();
+        if wrecks {
+            for b in wreck {
+                let Some(node) = body_node(b) else { continue };
+                let from_model = rest[usize::from(node)].inverse();
+                let boxes: Vec<_> = shapes_of(b)
+                    .filter_map(|k| shape_box(p, k, Mat4::IDENTITY))
+                    .collect();
+                if boxes.is_empty() || !from_model.is_finite() {
+                    continue;
+                }
+                pieces.push(LoosePiece {
+                    node: Some(node),
+                    shape: r::SharedShape::compound(boxes),
+                    mass: loose_mass(p.bodies[b].mass),
+                    from_model,
+                });
+            }
+        } else {
+            // As one: the shapes that show intact, in model space.
+            let boxes: Vec<_> = (0..p.shapes.len())
+                .filter(|&k| !off(0, node_of(k)))
+                .filter_map(|k| {
+                    let node = p
+                        .shape_node(k)
+                        .and_then(|n| u16::try_from(n).ok())
+                        .and_then(|n| model.node_to_model(n))
+                        .unwrap_or(Mat4::IDENTITY);
+                    shape_box(p, k, node)
+                })
+                .collect();
+            if !boxes.is_empty() {
+                pieces.push(LoosePiece {
+                    node: None,
+                    shape: r::SharedShape::compound(boxes),
+                    mass: loose_mass(moving.iter().map(|&b| loose_mass(p.bodies[b].mass)).sum()),
+                    from_model: Mat4::IDENTITY,
+                });
+            }
+        }
+        if pieces.is_empty() {
+            return None;
+        }
+        // Each node goes with the nearest piece at or above it.
+        let owner = (0..model.nodes.len())
+            .map(|n| {
+                let mut at = Some(n as u16);
+                for _ in 0..=model.nodes.len() {
+                    let here = at?;
+                    if let Some(i) = pieces.iter().position(|q| match q.node {
+                        Some(m) => m == here,
+                        None => true,
+                    }) {
+                        return Some(i);
+                    }
+                    at = model.nodes.get(usize::from(here))?.parent;
+                }
+                None
+            })
+            .collect();
+        Some(Self {
+            mass: pieces.iter().map(|q| q.mass).sum(),
+            pieces,
+            wrecks,
+            rest,
+            owner,
+        })
+    }
+
+    /// Where each piece starts, world space, with the model placed at
+    /// `placed`.
+    pub fn starts(&self, placed: Mat4) -> Vec<Mat4> {
+        self.pieces
+            .iter()
+            .map(|q| placed * q.from_model.inverse())
+            .collect()
+    }
+
+    /// Each node's place in the model (as
+    /// [`GpuModel::draw_moved`](crate::GpuModel::draw_moved) takes), with
+    /// the model placed at `placed` and each piece where `places` (world
+    /// space, piece order) has it.
+    pub fn posed(&self, placed: Mat4, places: &[Mat4]) -> Vec<Mat4> {
+        let back = placed.inverse();
+        self.rest
+            .iter()
+            .zip(&self.owner)
+            .map(|(&rest, owner)| {
+                match owner.and_then(|i| Some((self.pieces.get(i)?, places.get(i)?))) {
+                    Some((piece, &now)) => back * now * piece.from_model * rest,
+                    None => rest,
+                }
+            })
+            .collect()
+    }
+}
+
+/// A box round `PHY2` shape `k` (its convex radius included), placed by
+/// `to` from its body node's space.
+fn shape_box(p: &Phy2, k: usize, to: Mat4) -> Option<(r::Pose, r::SharedShape)> {
+    let s = p.shapes.get(k)?;
+    let (v, _) = s.geometry.triangles(s.radius);
+    let (lo, hi) = v.iter().fold(
+        (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+        |(lo, hi), &x| (lo.min(Vec3::from(x)), hi.max(Vec3::from(x))),
+    );
+    if lo.x > hi.x {
+        return None;
+    }
+    let at = to
+        * p.shape_place(k).map_or(Mat4::IDENTITY, place)
+        * Mat4::from_translation((lo + hi) * 0.5);
+    let (scale, rotation, translation) = at.to_scale_rotation_translation();
+    let half = ((hi - lo) * 0.5 * scale.abs() + Vec3::splat(s.radius.max(0.0)))
+        .max(Vec3::splat(LOOSE_HALF));
+    (half.is_finite() && translation.is_finite() && rotation.is_finite()).then(|| {
+        (
+            pose(translation, rotation.normalize()),
+            r::SharedShape::cuboid(half.x, half.y, half.z),
+        )
+    })
 }
 
 impl CollisionShape {
@@ -93,6 +339,7 @@ impl CollisionShape {
             shape,
             triangles: count,
             stand_in: false,
+            loose: None,
         })
     }
 
@@ -124,7 +371,11 @@ impl CollisionShape {
     ) -> Option<Self> {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
+        let mut loose = None;
         if let Some(p) = phy2.and_then(|d| Phy2::parse(d).ok()) {
+            if sub_object.is_none() {
+                loose = Loose::of(model, &p).map(Arc::new);
+            }
             for (k, s) in p.shapes.iter().enumerate() {
                 // A shape sits at its part's place in its body node's
                 // space.
@@ -202,7 +453,11 @@ impl CollisionShape {
                 }
             }
         }
-        Self::mesh(&vertices, &triangles).map(|shape| Self { stand_in, ..shape })
+        Self::mesh(&vertices, &triangles).map(|shape| Self {
+            stand_in,
+            loose,
+            ..shape
+        })
     }
 }
 
@@ -299,6 +554,10 @@ struct VehicleBody {
     top: f32,
     /// Wrecked: nothing drives it any more.
     wrecked: bool,
+    /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
+    held: bool,
+    /// Its velocity before the last step, m/s: what it hit things with.
+    before: Vec3,
 }
 
 /// A character's capsule and motion.
@@ -376,10 +635,28 @@ struct Ragdoll {
 pub struct Physics {
     world: r::PhysicsWorld,
     statics: HashMap<StaticKey, r::ColliderHandle>,
+    /// What each static collider belongs to.
+    keys: HashMap<r::ColliderHandle, StaticKey>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
+    /// Loose props' pieces, oldest first.
+    debris: Vec<Option<r::RigidBodyHandle>>,
 }
+
+/// A loose prop's piece in the physics world ([`Physics::add_debris`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DebrisId(usize);
+
+/// Loose pieces tumbling at once at most: past this many the oldest are
+/// held where they lie.
+const MAX_DEBRIS: usize = 160;
+/// A loose piece this far down has fallen through the island (its ground
+/// streamed out) and is held.
+const DEBRIS_FLOOR: f32 = -500.0;
+/// How a loose piece slows in the air and slides, invented.
+const DEBRIS_DAMPING: f32 = 0.2;
+const DEBRIS_FRICTION: f32 = 0.8;
 
 impl fmt::Debug for Physics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -412,9 +689,11 @@ impl Physics {
         Self {
             world: r::PhysicsWorld::default(),
             statics: HashMap::new(),
+            keys: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
+            debris: Vec::new(),
         }
     }
 
@@ -433,10 +712,12 @@ impl Physics {
             .build();
         let handle = self.world.insert_collider(collider, None);
         self.statics.insert(key, handle);
+        self.keys.insert(handle, key);
     }
 
     pub fn remove_static(&mut self, key: StaticKey) {
         if let Some(h) = self.statics.remove(&key) {
+            self.keys.remove(&h);
             self.world.remove_collider(h);
         }
     }
@@ -455,6 +736,13 @@ impl Physics {
         self.world.integration_parameters.dt = dt;
         let w = &mut self.world;
         for v in self.vehicles.iter_mut().flatten() {
+            v.before = w
+                .bodies
+                .get(v.controller.chassis)
+                .map_or(Vec3::ZERO, |b| vec3(b.linvel()));
+            if v.held {
+                continue;
+            }
             let filter = solid().exclude_rigid_body(v.controller.chassis);
             let queries = w.broad_phase.as_query_pipeline_mut(
                 w.narrow_phase.query_dispatcher(),
@@ -466,6 +754,69 @@ impl Physics {
         }
         self.world.step();
         self.hold_ragdolls_together();
+        self.settle_debris();
+    }
+
+    /// Holds loose pieces fallen through the island, and the oldest past
+    /// [`MAX_DEBRIS`] still tumbling.
+    fn settle_debris(&mut self) {
+        let mut tumbling = 0;
+        for h in self.debris.iter().rev().flatten() {
+            let Some(b) = self.world.bodies.get_mut(*h) else {
+                continue;
+            };
+            if !b.is_dynamic() {
+                continue;
+            }
+            tumbling += 1;
+            if tumbling > MAX_DEBRIS || b.translation().y < DEBRIS_FLOOR {
+                b.set_body_type(r::RigidBodyType::Fixed, false);
+            }
+        }
+    }
+
+    /// Adds a loose piece where `at` (world space; scale ignored) puts it,
+    /// flying at `velocity` (m/s) and turning at `spin` (radians a second
+    /// about each axis).
+    pub fn add_debris(
+        &mut self,
+        piece: &LoosePiece,
+        at: Mat4,
+        velocity: Vec3,
+        spin: Vec3,
+    ) -> DebrisId {
+        let (_, rotation, translation) = at.to_scale_rotation_translation();
+        let body = self.world.insert_body(
+            r::RigidBodyBuilder::dynamic()
+                .pose(pose(translation, rotation.normalize()))
+                .linvel(vector(velocity))
+                .angvel(vector(spin))
+                .linear_damping(DEBRIS_DAMPING)
+                .angular_damping(DEBRIS_DAMPING)
+                .ccd_enabled(true),
+        );
+        let collider = r::ColliderBuilder::new(piece.shape.clone())
+            .mass(piece.mass)
+            .friction(DEBRIS_FRICTION);
+        self.world.insert_collider(collider, Some(body));
+        self.debris.push(Some(body));
+        DebrisId(self.debris.len() - 1)
+    }
+
+    /// Where a loose piece is now (its node's place, world space).
+    pub fn debris_place(&self, id: DebrisId) -> Option<Mat4> {
+        let h = (*self.debris.get(id.0)?)?;
+        let p = self.world.bodies.get(h)?.position();
+        Some(Mat4::from_rotation_translation(
+            Quat::from_array(p.rotation.to_array()),
+            vec3(p.translation),
+        ))
+    }
+
+    pub fn remove_debris(&mut self, id: DebrisId) {
+        if let Some(h) = self.debris.get_mut(id.0).and_then(Option::take) {
+            self.world.remove_body_with_colliders(h, true);
+        }
     }
 
     /// Puts each limb back on its joint where the solver let it drift (a
@@ -599,6 +950,8 @@ impl Physics {
             tracked: spec.tracked,
             top: spec.tuning.max_speed.unwrap_or(TOP_SPEED),
             wrecked: false,
+            held: false,
+            before: Vec3::ZERO,
         }));
         id
     }
@@ -782,11 +1135,7 @@ impl Physics {
                 } else {
                     deepest.local_p2
                 };
-                let key = self
-                    .statics
-                    .iter()
-                    .find(|(_, h)| **h == other)
-                    .map(|(k, _)| *k);
+                let key = self.keys.get(&other).copied();
                 let span = self
                     .world
                     .colliders
@@ -799,6 +1148,46 @@ impl Physics {
             }
         }
         out
+    }
+
+    /// The statics a vehicle's body is in contact with (its wheels'
+    /// contacts aside), each once: what it ran into.
+    pub fn vehicle_statics(&self, id: VehicleId) -> Vec<StaticKey> {
+        let Some(body) = self
+            .vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .and_then(|v| self.world.bodies.get(v.controller.chassis))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &c in body.colliders() {
+            for pair in self.world.narrow_phase.contact_pairs_with(c) {
+                if !pair.has_any_active_contact() {
+                    continue;
+                }
+                let other = if pair.collider1 == c {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                if let Some(&key) = self.keys.get(&other)
+                    && !out.contains(&key)
+                {
+                    out.push(key);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a vehicle's engine is pulling (or backing) it.
+    pub fn vehicle_pulling(&self, id: VehicleId) -> bool {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|v| v.controller.wheels().iter().any(|w| w.engine_force != 0.0))
     }
 
     /// A vehicle's velocity, m/s.
@@ -862,6 +1251,59 @@ impl Physics {
             c.set_shape(r::SharedShape::cuboid(cube.x, half, cube.z));
             c.set_translation_wrt_parent(vector(Vec3::new(at.x, bottom + half, at.z)));
             c.set_friction(WRECK_FRICTION);
+        }
+    }
+
+    /// Holds a vehicle where it is, its body fixed (the ground under it
+    /// has streamed out, far from the player, and it would fall through
+    /// the island), or lets it go again, at rest.
+    pub fn hold_vehicle(&mut self, id: VehicleId, held: bool) {
+        let Some(v) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .filter(|v| v.held != held)
+        else {
+            return;
+        };
+        v.held = held;
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            let kind = if held {
+                r::RigidBodyType::Fixed
+            } else {
+                r::RigidBodyType::Dynamic
+            };
+            body.set_body_type(kind, true);
+            body.set_linvel(r::Vector::ZERO, true);
+            body.set_angvel(r::Vector::ZERO, true);
+        }
+    }
+
+    /// Whether a vehicle is held where it is.
+    pub fn vehicle_held(&self, id: VehicleId) -> bool {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|v| v.held)
+    }
+
+    /// A vehicle's velocity before the last step, m/s: what it hit things
+    /// with (a crash stops it within the step).
+    pub fn vehicle_velocity_before(&self, id: VehicleId) -> Vec3 {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map_or(Vec3::ZERO, |v| v.before)
+    }
+
+    /// Sets a vehicle's velocity, m/s (as it was before something it hit
+    /// gave way).
+    pub fn set_vehicle_velocity(&mut self, id: VehicleId, velocity: Vec3) {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return;
+        };
+        if let Some(body) = self.world.bodies.get_mut(v.controller.chassis) {
+            body.set_linvel(vector(velocity), true);
         }
     }
 
@@ -1117,11 +1559,7 @@ impl Physics {
             .world
             .query_pipeline_with_filter(solid())
             .cast_ray_and_get_normal(&ray, max, true)?;
-        let key = self
-            .statics
-            .iter()
-            .find(|(_, h)| **h == handle)
-            .map(|(k, _)| *k);
+        let key = self.keys.get(&handle).copied();
         Some((hit.time_of_impact, vec3(hit.normal), key))
     }
 
@@ -1670,6 +2108,156 @@ mod tests {
         assert!(at.x.hypot(at.z) < 0.5, "moved to {at}");
         let wheels = p.vehicle_wheels(id);
         assert!(wheels.iter().all(|w| w.0 == 0.0), "{wheels:?}");
+    }
+
+    #[test]
+    fn a_loose_piece_carries_the_nodes_under_it() {
+        // A base, an arm 2 m up on it, and a lamp 1 m along the arm.
+        let rest = vec![
+            Mat4::IDENTITY,
+            Mat4::from_translation(Vec3::Y * 2.0),
+            Mat4::from_translation(Vec3::new(1.0, 2.0, 0.0)),
+        ];
+        let loose = Loose {
+            pieces: vec![LoosePiece {
+                node: Some(1),
+                shape: r::SharedShape::cuboid(0.5, 0.1, 0.1),
+                mass: 10.0,
+                from_model: rest[1].inverse(),
+            }],
+            wrecks: true,
+            mass: 10.0,
+            rest: rest.clone(),
+            owner: vec![None, Some(0), Some(0)],
+        };
+        let placed = Mat4::from_translation(Vec3::new(100.0, 0.0, 0.0));
+        let starts = loose.starts(placed);
+        assert!(
+            starts[0]
+                .w_axis
+                .truncate()
+                .distance(Vec3::new(100.0, 2.0, 0.0))
+                < 1e-4
+        );
+        for (a, b) in loose.posed(placed, &starts).iter().zip(&rest) {
+            assert!(a.abs_diff_eq(*b, 1e-4), "{a} {b}");
+        }
+        // The arm down by the base, turned a quarter about z: the lamp
+        // goes with it, the base stays.
+        let fallen = Mat4::from_translation(Vec3::new(101.0, 0.1, 0.0))
+            * Mat4::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let posed = loose.posed(placed, &[fallen]);
+        assert!(posed[0].abs_diff_eq(rest[0], 1e-4));
+        let lamp = (placed * posed[2]).w_axis.truncate();
+        assert!(lamp.distance(Vec3::new(101.0, 1.1, 0.0)) < 1e-4, "{lamp}");
+    }
+
+    #[test]
+    fn a_car_knocks_a_loose_pole_over_and_ploughs_on() {
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 200.0);
+        // A 6 m pole, 150 kg, standing 12 m ahead of the car.
+        let piece = LoosePiece {
+            node: None,
+            shape: r::SharedShape::compound(vec![(
+                pose(Vec3::Y * 3.0, Quat::IDENTITY),
+                r::SharedShape::cuboid(0.1, 3.0, 0.1),
+            )]),
+            mass: 150.0,
+            from_model: Mat4::IDENTITY,
+        };
+        let pole = CollisionShape {
+            shape: r::SharedShape::compound(vec![(
+                pose(Vec3::Y * 3.0, Quat::IDENTITY),
+                r::SharedShape::cuboid(0.1, 3.0, 0.1),
+            )]),
+            triangles: 12,
+            stand_in: false,
+            loose: None,
+        };
+        let base = Vec3::new(0.0, 0.0, 12.0);
+        p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        let mut hit = None;
+        for _ in 0..360 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            if p.vehicle_statics(id).contains(&StaticKey::Object(7)) {
+                hit = Some(p.vehicle_velocity_before(id));
+                break;
+            }
+        }
+        let before = hit.expect("ran into the pole");
+        assert!(before.z > 4.0, "hit it at {before}");
+        assert!(p.vehicle_pulling(id));
+        // Knocked loose: it goes, its piece flies, the car goes on.
+        p.remove_static(StaticKey::Object(7));
+        let share = 1400.0 / (1400.0 + piece.mass);
+        let d = p.add_debris(
+            &piece,
+            Mat4::from_translation(base),
+            before * share * 1.1 + Vec3::Y,
+            Vec3::X * before.z * 0.3,
+        );
+        p.set_vehicle_velocity(id, before * share);
+        for _ in 0..180 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let car_at = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        assert!(car_at.z > base.z + 5.0, "the car ploughed on to {car_at}");
+        let fallen = p.debris_place(d).unwrap();
+        let up = fallen.transform_vector3(Vec3::Y);
+        assert!(up.y < 0.5, "the pole fell over: up {up}");
+        let middle = fallen.transform_point3(Vec3::Y * 3.0);
+        assert!(
+            middle.y < 1.0 && middle.y > -0.2,
+            "lies on the ground: {middle}"
+        );
+        p.remove_debris(d);
+        assert!(p.debris_place(d).is_none());
+    }
+
+    #[test]
+    fn held_vehicles_stay_put_without_ground() {
+        let mut p = ready();
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let rest = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        p.hold_vehicle(id, true);
+        assert!(p.vehicle_held(id));
+        // The ground streams out from under it.
+        p.remove_static(StaticKey::Cell(1));
+        for _ in 0..120 {
+            p.step(DT);
+        }
+        let held = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        assert!(held.distance(rest) < 1e-3, "{rest} -> {held}");
+        // Back, and let go: it rests on it again.
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 50.0);
+        p.step(DT);
+        p.hold_vehicle(id, false);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let now = p.vehicle_transform(id).unwrap().w_axis.truncate();
+        assert!(now.distance(rest) < 0.1, "{rest} -> {now}");
     }
 
     #[test]

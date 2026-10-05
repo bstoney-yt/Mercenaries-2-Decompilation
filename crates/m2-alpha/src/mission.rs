@@ -294,6 +294,13 @@ impl MissionLink {
                     mission.kill(*g);
                 }
             }
+            // A target knocked loose (shoved over by a vehicle, thrown by a
+            // blast) is destroyed too.
+            for e in game.scene.props.take_knocked() {
+                if targets.iter().any(|t| t.0 == e) {
+                    mission.kill(e);
+                }
+            }
             self.blasts.clear();
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
