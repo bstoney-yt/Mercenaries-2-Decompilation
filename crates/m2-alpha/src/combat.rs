@@ -563,6 +563,16 @@ impl Combat {
         std::mem::take(&mut self.sounds)
     }
 
+    /// Hurts her as a hit from `from` does, without the hit (for
+    /// screenshots of the HUD's hit arcs). Leaves her on her feet.
+    pub fn hurt_from(&mut self, damage: f32, from: Vec3) {
+        if self.hurts.len() >= MAX_HURTS {
+            self.hurts.remove(0);
+        }
+        self.hurts.push((damage, Some(from)));
+        self.hp = (self.hp - damage).max(1.0);
+    }
+
     /// Hurts since the last call: damage and where from.
     pub fn take_hurts(&mut self) -> Vec<(f32, Option<Vec3>)> {
         std::mem::take(&mut self.hurts)

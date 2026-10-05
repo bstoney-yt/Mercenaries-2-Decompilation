@@ -133,6 +133,10 @@ struct Options {
     probe: bool,
     /// With `--aim` (or `--drive --look`): fire just before the picture.
     fire: bool,
+    /// With `--screenshot` on foot: hits she takes just before the
+    /// picture, from these directions (degrees clockwise from where the
+    /// camera looks), to see the HUD's hit arcs.
+    hurt: Vec<f32>,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
@@ -244,6 +248,11 @@ fn parse_args() -> anyhow::Result<Options> {
                 )
             }
             "--aim" => o.aim = true,
+            "--hurt" => {
+                for d in value()?.split(',') {
+                    o.hurt.push(d.parse().context("--hurt expects degrees")?);
+                }
+            }
             "--weapon" => {
                 o.weapon = Some(match value()?.as_str() {
                     "rifle" => combat::Weapon::Rifle,
@@ -784,6 +793,17 @@ fn screenshot(
     }
     if let (Some(reach), Some(link)) = (options.mission_look, &link) {
         look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
+    }
+    if let Some(p) = game.scene.player.as_ref().filter(|_| game.on_foot) {
+        // Hits from around her, as the camera sees it: 0 ahead, 90 right.
+        let at = p.character.position + m2_math::glam::Vec3::Y;
+        let ahead = game.camera.forward().with_y(0.0).normalize_or_zero();
+        let right = game.camera.right();
+        for d in &options.hurt {
+            let (s, c) = d.to_radians().sin_cos();
+            game.combat
+                .hurt_from(15.0, at + (ahead * c + right * s) * 10.0);
+        }
     }
     // The picture, with the HUD (the game's, once its scripts have
     // started and run half a second).
