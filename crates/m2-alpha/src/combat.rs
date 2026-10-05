@@ -1372,11 +1372,7 @@ mod tests {
         assert!(player.landed && people.npcs.iter().all(|n| n.landed));
         // Crosshair on the near soldier's chest.
         let chest = people.npcs[0].chest();
-        for _ in 0..4 {
-            let to = chest - player.eye();
-            player.yaw = to.x.atan2(to.z);
-            player.pitch = (to.y / to.length()).asin();
-        }
+        player.aim_crosshair_at(chest);
         let arsenal = Arsenal::default();
         let mut vehicles = Vec::new();
         let mut combat = Combat::default();
@@ -1499,11 +1495,7 @@ mod tests {
             player.update(&physics, Default::default(), dt);
         }
         let chest = people.npcs[0].chest();
-        for _ in 0..4 {
-            let to = chest - player.eye();
-            player.yaw = to.x.atan2(to.z);
-            player.pitch = (to.y / to.length()).asin();
-        }
+        player.aim_crosshair_at(chest);
         let hit = Combat::aim_probe(&physics, &people, &player);
         assert!(
             matches!(hit, Some((_, Some(0)))),

@@ -16,11 +16,13 @@ use m2_assets::{Layer, name_hash};
 /// What a template's components say of its handling and its main gun.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct VehicleTuning {
-    /// Mass, kg (`Mass` of its `_TankPhysics`).
+    /// Mass, kg (`Mass` of its `_TankPhysics`, or a wheeled vehicle's
+    /// `_CarPhysicsV2`: the LAV III's 20 t).
     pub mass: Option<f32>,
     /// Top speed, m/s (`MaxSpeed`, which the database gives in km/h: the
     /// AMX-30's 45 is the 10-12 m/s its tank covers on a dirt track in
-    /// the Xbox 360 playthrough).
+    /// the Xbox 360 playthrough, the LAV III's 85 the real one's road
+    /// speed, near enough).
     pub max_speed: Option<f32>,
     pub turret: Option<TurretTuning>,
     pub camera: Option<TankCamera>,
@@ -44,8 +46,9 @@ pub struct TurretTuning {
     pub pitch_accel: f32,
 }
 
-/// A `CameraTank`: the driver's camera, which turns about a point above
-/// the turret and keeps behind wherever the turret aims.
+/// A `CameraTank`: the camera of the seat that turns the turret, which
+/// turns about a point above the turret and keeps behind wherever the
+/// turret aims.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TankCamera {
     /// How far behind the point it turns about, metres (`CameraOffset`).
@@ -94,6 +97,10 @@ const MAIN_TURRET: &str = "main_turret";
 const BANK: u32 = 0x14a6_7fa6;
 /// `CameraTank`'s height above the turret ring (name unknown).
 const CAMERA_HEIGHT: u32 = 0x2afa_6ae4;
+/// The seats whose camera the player gets, best first: driving, or
+/// firing the main gun (the LAV III's gunner; its template also has a
+/// camera for the rear passenger's hatch, `seat_passenger_rr`).
+const CAMERA_SEATS: [&str; 2] = ["seat_driver", "seat_gunner"];
 
 /// One component's records by template id, and its fields by name hash.
 struct Table<'a> {
@@ -173,6 +180,7 @@ impl<'a> Table<'a> {
 /// The tuning of every template the database gives any, by template id.
 pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
     let tank = Table::new(db, "_TankPhysics");
+    let car = Table::new(db, "_CarPhysicsV2");
     let turret = Table::new(db, "Turret");
     let camera = Table::new(db, "CameraTank");
     let links = Table::new(db, "PhysicalLink");
@@ -187,6 +195,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
     let mut ids: Vec<u32> = tank
         .records
         .keys()
+        .chain(car.records.keys())
         .chain(turret.records.keys())
         .chain(camera.records.keys())
         .copied()
@@ -196,10 +205,12 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
     ids.into_iter()
         .map(|id| {
             let t = VehicleTuning {
-                mass: tank.get(id, "Mass").filter(|m| *m > 0.0),
-                max_speed: tank
-                    .get(id, "MaxSpeed")
-                    .filter(|s| *s > 0.0)
+                mass: [&tank, &car]
+                    .iter()
+                    .find_map(|t| t.get(id, "Mass").filter(|m| *m > 0.0)),
+                max_speed: [&tank, &car]
+                    .iter()
+                    .find_map(|t| t.get(id, "MaxSpeed").filter(|s| *s > 0.0))
                     .map(|kmh| kmh / 3.6),
                 turret: (|| {
                     let named = turret.named(id, MAIN_TURRET);
@@ -219,7 +230,17 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
                     })
                 })(),
                 camera: (|| {
-                    let r = *camera.of_template(id).first()?;
+                    let records = camera.of_template(id);
+                    let seat = name_hash("SeatName");
+                    let r = CAMERA_SEATS
+                        .iter()
+                        .find_map(|&s| {
+                            records
+                                .iter()
+                                .find(|r| camera.word(r, seat) == Some(name_hash(s)))
+                        })
+                        .or(records.first())
+                        .copied()?;
                     Some(TankCamera {
                         distance: camera.float(r, name_hash("CameraOffset"))?,
                         height: camera.float(r, CAMERA_HEIGHT)?,
@@ -309,6 +330,9 @@ mod tests {
             ("GravityScale", 0x0e57_f8c1),
             ("Name", 0x1de5_c824),
             (MAIN_TURRET, 0x801f_2cf7),
+            ("SeatName", 0xbdd7_64f3),
+            ("seat_gunner", 0xb7b9_67d0),
+            ("seat_passenger_rr", 0x300a_f37e),
         ] {
             assert_eq!(name_hash(name), key, "{name}");
         }

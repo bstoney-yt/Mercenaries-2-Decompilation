@@ -1048,6 +1048,39 @@ fn clear_way(
     best.1
 }
 
+/// Whether something stands within `within` metres of a vehicle's
+/// bumper at its height (another parked close ahead, a wall): rays from
+/// both front corners and the middle, a little inside the bumper.
+pub(crate) fn blocked_ahead(
+    physics: &Physics,
+    id: VehicleId,
+    hull: (Vec3, Vec3),
+    within: f32,
+) -> bool {
+    let Some(m) = physics.vehicle_transform(id) else {
+        return false;
+    };
+    let (lo, hi) = hull;
+    let forward = m.transform_vector3(Vec3::Z);
+    [lo.x + 0.1, 0.0, hi.x - 0.1].iter().any(|&x| {
+        [0.8, 1.5].iter().any(|&h| {
+            let from = m.transform_point3(Vec3::new(x, lo.y + h, hi.z - 0.2));
+            physics
+                .cast_ray_past(from, forward, within + 0.2, id)
+                .is_some_and(|(_, n)| n.y < WALL)
+        })
+    })
+}
+
+/// How to steer a vehicle (-1 left to 1 right) to keep on its way round
+/// what stands ahead ([`clear_way`]).
+pub(crate) fn steer_round(physics: &Physics, id: VehicleId, hull: (Vec3, Vec3)) -> f32 {
+    physics.vehicle_transform(id).map_or(0.0, |m| {
+        let way = clear_way(physics, id, m, hull, 0.0, physics.vehicle_speed(id));
+        (way * 2.0).clamp(-1.0, 1.0)
+    })
+}
+
 /// An angle wrapped to -π..π.
 fn wrap(a: f32) -> f32 {
     let mut a = a.rem_euclid(std::f32::consts::TAU);
@@ -1070,9 +1103,10 @@ fn turn_to(p: &Player, yaw: f32, pitch: f32, dt: f32) -> Vec2 {
 /// The camera turn putting the crosshair on `target`, and how far off it
 /// is now (radians).
 fn aim(p: &Player, target: Vec3, dt: f32) -> (Vec2, f32) {
-    let dir = (target - p.pivot()).normalize_or(Vec3::Z);
+    // Shots follow the crosshair's line from the camera.
+    let dir = (target - p.eye()).normalize_or(Vec3::Z);
     let error = p.aim_forward().angle_between(dir);
-    // A tank's crosshair sits above the camera's line.
+    // The crosshair sits above the camera's line.
     let lift = p.aim_forward().y.asin() - p.camera_forward().y.asin();
     (
         turn_to(

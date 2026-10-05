@@ -934,12 +934,13 @@ impl Scene {
         self.materials
             .load_textures(backend, source, cpu.texture_hashes().collect::<Vec<_>>())?;
         let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
-        // What its template says of its handling and its gun.
+        // What its template says of its handling and its gun: its own
+        // (the mission's `AMX30 (Full)`), else its model's.
         let tune = |spec: VehicleSpec| {
             let t = self
                 .world
                 .as_ref()
-                .and_then(|w| w.index.template_db.tuning_for_model(spec.model));
+                .and_then(|w| w.index.template_db.tuning_for(&spec.label, spec.model));
             spec.tuned(t)
         };
         match loaded {

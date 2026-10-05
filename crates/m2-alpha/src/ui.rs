@@ -26,7 +26,8 @@ pub struct HudInfo {
     /// Driving: the vehicle's name and speed (m/s), and whether it is
     /// wrecked.
     pub driving: Option<(String, f32, bool)>,
-    /// Driving a vehicle with a gun: the point its crosshair is on.
+    /// The point the crosshair is on: on foot, or driving a vehicle with
+    /// a gun.
     pub crosshair: Option<Vec3>,
     /// A vehicle in reach to get into.
     pub can_enter: Option<String>,
@@ -295,8 +296,14 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
                 18.0,
                 white,
             );
+            // Where she aims, a little above the middle.
             if !info.down {
-                crosshair(&painter, screen.center());
+                let at = info
+                    .crosshair
+                    .zip(info.view_proj)
+                    .and_then(|(p, vp)| to_screen(vp, p, screen))
+                    .unwrap_or(screen.center());
+                crosshair(&painter, at);
             }
         }
     }

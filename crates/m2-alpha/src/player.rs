@@ -55,9 +55,12 @@ pub struct ChaseRig {
 
 /// How far above the middle of the screen a tank's crosshair sits,
 /// radians: in the Xbox 360 playthrough it is 0.38 of the way down the
-/// screen, about 7 degrees above the camera's line, so with the camera
-/// looking a little down at the tank, the gun aims at the horizon.
-const TANK_AIM_LIFT: f32 = 0.125;
+/// screen, 8 degrees above the camera's line with the 60 degree camera,
+/// so with the camera looking a little down at the tank, the gun aims at
+/// the horizon.
+const TANK_AIM_LIFT: f32 = 0.138;
+/// And on foot: 0.37 of the way down in the playthrough.
+const ON_FOOT_AIM_LIFT: f32 = 0.149;
 
 impl ChaseRig {
     /// `spec`'s: its template's tank camera (above the turret ring, as
@@ -312,7 +315,7 @@ impl Player {
         }
 
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
-        let look = self.camera_forward();
+        let look = self.aim_forward();
         if let Some(t) = &mut self.throwing {
             *t += dt;
         }
@@ -400,7 +403,7 @@ impl Player {
                 (Some(_), ..) => self.throwing = None,
                 _ => {}
             }
-            // Aimed, the weapon points where the camera looks; the
+            // Aimed, the weapon points where the crosshair does; the
             // launcher at rest points level the way she faces.
             let (sf, cf) = self.facing.sin_cos();
             let rest = (self.launcher && self.throwing.is_none()).then_some(Vec3::new(sf, 0.0, cf));
@@ -435,17 +438,29 @@ impl Player {
         Vec3::new(sy * cp, sp, cy * cp)
     }
 
-    /// Where the crosshair points: the camera's way, or a little above it
-    /// in a vehicle whose crosshair sits above the middle of the screen.
+    /// Where the crosshair points: a little above the camera's way on
+    /// foot and in a vehicle whose crosshair sits above the middle of the
+    /// screen, as the game's reticle does.
     pub fn aim_forward(&self) -> Vec3 {
         let lift = if self.chase_target.is_some() {
             self.aim_lift
         } else {
-            0.0
+            ON_FOOT_AIM_LIFT
         };
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = (self.pitch + lift).sin_cos();
         Vec3::new(sy * cp, sp, cy * cp)
+    }
+
+    /// Turns the camera so the crosshair is on `target`. The eye moves as
+    /// the camera turns, so it settles in a few steps.
+    pub fn aim_crosshair_at(&mut self, target: Vec3) {
+        for _ in 0..4 {
+            let to = target - self.eye();
+            let lift = self.aim_forward().y.asin() - self.camera_forward().y.asin();
+            self.yaw = to.x.atan2(to.z);
+            self.pitch = (to.y / to.length().max(0.01)).asin() - lift;
+        }
     }
 
     /// Pulls the camera in when something is between it and her.
@@ -588,9 +603,10 @@ mod tests {
             p.chase(turned, rig, Vec2::new(0.005, 0.0), 10.0, 1.0 / 60.0);
         }
         assert!((p.yaw - 2.6).abs() < 1e-3, "{}", p.yaw);
-        // On foot again, the crosshair is in the middle.
+        // On foot again, the crosshair sits a little higher still.
         p.chase_target = None;
-        assert_eq!(p.aim_forward(), p.camera_forward());
+        let lift = p.aim_forward().y.asin() - p.camera_forward().y.asin();
+        assert!((lift - ON_FOOT_AIM_LIFT).abs() < 1e-4, "{lift}");
     }
     use m2_engine::{CollisionShape, StaticKey};
     use m2_math::glam::Quat;
