@@ -51,6 +51,8 @@ struct Draw {
     // x: first palette matrix, y: palette length (0: not skinned),
     // z: first instance matrix, w: instance count (0: not instanced)
     skin: vec4<u32>,
+    // xy: added to the texture coordinates (scrolling textures)
+    uv: vec4<f32>,
 };
 
 struct Material {
@@ -347,7 +349,7 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             depth = max(v.world_pos.y - bed.y, 0.0);
             through = distance(v.world_pos, bed);
         }
-        let shallow = vec3<f32>(0.10, 0.36, 0.34);
+        let shallow = vec3<f32>(0.09, 0.30, 0.34);
         let tint = mix(shallow, base.rgb, 1.0 - exp(-depth / 5.0));
         let lit = frame.sun_color.rgb * max(dot(n, l), 0.0) * shade;
         let body = tint * (lit * 0.3 + ambient_light(n));
@@ -514,7 +516,9 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
     let deck = frame.eye.xz + r.xz * (CLOUD_HEIGHT / up);
     let drift = frame.wind.xy * CLOUD_SPEED * frame.view_dir.w;
     let scale = max(frame.clouds.xyz, vec3<f32>(0.01)) * CLOUD_SPAN;
-    let n1 = textureSample(cloud_noise, cloud_sampler, (deck + drift) / scale.x).r;
+    // The texture holds four octaves of noise, coarsest in alpha, then
+    // red, green and blue; the broad layer takes the coarsest.
+    let n1 = textureSample(cloud_noise, cloud_sampler, (deck + drift) / scale.x).a;
     let n2 = textureSample(cloud_noise, cloud_sampler, (deck + drift * 1.3) / scale.y).g;
     let n3 = textureSample(cloud_noise, cloud_sampler, (deck + drift * 1.15) / scale.z).b;
     if frame.wind.z > 0.5 && r.y > 0.0 {
@@ -531,7 +535,9 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         // darker underneath.
         let lit = frame.sun_color.rgb * (0.5 + 0.5 * pow(max(c, 0.0), 4.0)) * mix(1.0, 0.7, alpha);
         let cloud = lit + frame.ambient_cube[2].rgb * 0.5;
-        rgb = mix(rgb, cloud, alpha * 0.75);
+        // Thin veils: the game's footage shows a hazy sky with little
+        // solid cloud.
+        rgb = mix(rgb, cloud, alpha * 0.6);
     }
     return vec4<f32>(rgb, 1.0);
 }
@@ -639,7 +645,7 @@ fn place(v: VertexIn, instance: u32) -> Varyings {{
     out.clip = frame.view_proj * world;
     out.world_pos = world.xyz;
     out.normal = (model * vec4<f32>(normal, 0.0)).xyz;
-    out.uv = {uv};
+    out.uv = {uv} + draw.uv.xy;
     out.color = {color};
     out.tangent = vec4<f32>((model * vec4<f32>(tangent.xyz, 0.0)).xyz, tangent.w);
     out.haze = vec4<f32>(0.0, 0.0, 0.0, 1.0);

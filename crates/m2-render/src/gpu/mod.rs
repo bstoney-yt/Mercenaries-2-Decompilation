@@ -38,8 +38,9 @@ use crate::texture::{BlendMode, MaterialDesc, TextureDesc, TextureFormat, Textur
 pub use ::wgpu;
 
 /// Bytes of a draw's uniforms: its world matrix, then the first palette
-/// matrix and the palette length, then the same for its instances.
-const DRAW_UNIFORM_SIZE: u64 = 80;
+/// matrix and the palette length, then the same for its instances, then
+/// its texture coordinate offset.
+const DRAW_UNIFORM_SIZE: u64 = 96;
 /// Bone matrices the palette buffer starts with.
 const INITIAL_PALETTE: u64 = 1024;
 /// Metres from the camera by which a detail map has faded out.
@@ -2132,6 +2133,12 @@ impl RenderBackend for WgpuBackend {
             count,
             instance_first,
             instances,
+        ]));
+        uniforms.extend_from_slice(bytemuck::cast_slice(&[
+            call.uv_offset[0],
+            call.uv_offset[1],
+            0.0,
+            0.0,
         ]));
         uniforms.resize(uniforms.len().next_multiple_of(DRAW_STRIDE as usize), 0);
         frame.draws.push(RecordedDraw {

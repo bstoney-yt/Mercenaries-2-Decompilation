@@ -865,6 +865,7 @@ impl World {
                         world: Mat4::from_translation(t.origin),
                         skin: None,
                         instances: None,
+                        uv_offset: [0.0; 2],
                     },
                     layer: Layer::WORLD,
                     translucent,
@@ -967,6 +968,7 @@ impl World {
                 world: Mat4::from_translation(Vec3::new(eye.x, 0.0, eye.z)),
                 skin: None,
                 instances: None,
+                uv_offset: [0.0; 2],
             },
             layer: Layer::WORLD,
             translucent: true,
@@ -1036,6 +1038,7 @@ impl World {
                         world: Mat4::IDENTITY,
                         skin: None,
                         instances: Some(instances),
+                        uv_offset: [0.0; 2],
                     },
                     layer: Layer::WORLD,
                     translucent: c.translucent,
@@ -1159,7 +1162,7 @@ fn sea_plane(
         backend,
         &MaterialDesc {
             // Deep blue-green; shallows are paler and show the bed.
-            color: [0.05, 0.22, 0.30, 1.0],
+            color: [0.05, 0.20, 0.30, 1.0],
             texture: foam,
             blend: BlendMode::Translucent,
             double_sided: true,
