@@ -22,6 +22,7 @@ use m2_assets::{BlockContents, Model, Ucfx};
 use m2_math::glam::{Mat3, Mat4, Quat, Vec3};
 
 use crate::assets::{AssetError, AssetSource, TEXTURE_TYPE};
+use crate::tuning::VehicleTuning;
 
 /// A vehicle model the archive holds: (model hash, kind, name), the kind
 /// as the texture names give it (`car`, `truck`, `apc`, `tank`, ...).
@@ -212,8 +213,19 @@ pub struct VehicleSpec {
     pub gun_pivot: Option<Vec3>,
     /// Whether the muzzle is on the gun (it tilts with it).
     pub muzzle_on_gun: bool,
-    /// How far the gun tilts down and up, radians (invented, by kind).
+    /// How far the gun tilts down and up, radians (its template's, else
+    /// invented by kind).
     pub elevation: (f32, f32),
+    /// The hull's box, model space: the intact parts off the turret, so
+    /// not a tank's gun reaching past its bow or its aerials (the model's
+    /// [`bounds`](Self::bounds) when it has no turret).
+    pub hull: (Vec3, Vec3),
+    /// The turret's box with the turret straight ahead, model space,
+    /// without its gun and aerials.
+    pub turret_box: Option<(Vec3, Vec3)>,
+    /// What its template says of how it handles and fights
+    /// ([`VehicleSpec::tuned`]).
+    pub tuning: VehicleTuning,
 }
 
 /// How a vehicle sits on uneven ground ([`VehicleSpec::rest_on`]).
@@ -244,6 +256,37 @@ pub const TURRET: u32 = 0x7707_65e4;
 /// a tank's mantlet and barrel (the M1A1's, the AMX-30's), the Stryker's
 /// gun. The wreck's turret has a barrel of its own.
 pub const GUN: u32 = 0xcc0e_3f83;
+
+/// The four wheels a tracked vehicle drives on: under the corners of its
+/// road wheels, where the tracks meet the ground, else under its hull's.
+fn stand_ins(road: &[(Vec3, f32)], hull: (Vec3, Vec3)) -> Vec<WheelSpec> {
+    let r = 0.45;
+    let (lo, hi) = hull;
+    let (mut x0, mut x1, mut z0, mut z1) = road.iter().fold(
+        (
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ),
+        |(a, b, c, d), (p, _)| (a.min(p.x), b.max(p.x), c.min(p.z), d.max(p.z)),
+    );
+    // Both tracks' wheels, front and back.
+    if road.len() < 4 || x1 - x0 < 1.0 || z1 - z0 < 1.0 {
+        let c = (lo + hi) * 0.5;
+        let (x, z) = ((hi.x - lo.x) * 0.4, (hi.z - lo.z) * 0.35);
+        (x0, x1, z0, z1) = (c.x - x, c.x + x, c.z - z, c.z + z);
+    }
+    [(x0, z1), (x1, z1), (x0, z0), (x1, z0)]
+        .into_iter()
+        .map(|(x, z)| WheelSpec {
+            centre: Vec3::new(x, lo.y + r, z),
+            radius: r,
+            width: 0.5,
+            steers: z == z1,
+        })
+        .collect()
+}
 
 impl VehicleSpec {
     /// Reads `model`'s wheels and markers. `None` for a ground vehicle
@@ -281,7 +324,7 @@ impl VehicleSpec {
             }
         };
         let mut road_wheels = Vec::new();
-        let wheels: Vec<WheelSpec> = if usable && !tracked {
+        let mut wheels: Vec<WheelSpec> = if usable && !tracked {
             let (back, front) = found
                 .iter()
                 .map(|w| w.centre[2])
@@ -312,20 +355,8 @@ impl VehicleSpec {
                 mark(road_wheels.len(), &w.nodes);
                 road_wheels.push((Vec3::from(w.centre), w.radius));
             }
-            // Four stand-in wheels under the hull's corners.
-            let (lo, hi) = bounds;
-            let r = 0.45;
-            let (x, z) = ((hi.x - lo.x) * 0.4, (hi.z - lo.z) * 0.35);
-            let c = (lo + hi) * 0.5;
-            [(-x, z), (x, z), (-x, -z), (x, -z)]
-                .iter()
-                .map(|&(dx, dz)| WheelSpec {
-                    centre: Vec3::new(c.x + dx, lo.y + r, c.z + dz),
-                    radius: r,
-                    width: 0.5,
-                    steers: dz > 0.0,
-                })
-                .collect()
+            // Stand-ins, once the hull is known.
+            Vec::new()
         } else {
             return None;
         };
@@ -422,6 +453,33 @@ impl VehicleSpec {
             .and_then(|g| model.node_to_model(g as u16))
             .map(|m| m.w_axis.truncate());
         let muzzle_on_gun = muzzle.is_some_and(|(i, _)| gun.get(i).copied().unwrap_or(false));
+        // The hull: the intact parts off the turret. The turret's box:
+        // its intact parts but the gun and anything as thin as an aerial.
+        let intact = |node: u16| !hidden.get(usize::from(node)).copied().unwrap_or(false);
+        let thin = |b: &vehicle::NodeBox| (b.max[0] - b.min[0]).max(b.max[2] - b.min[2]) < 0.2;
+        let union = |boxes: &mut dyn Iterator<Item = &vehicle::NodeBox>| {
+            boxes.fold(None, |acc: Option<(Vec3, Vec3)>, b| {
+                let (lo, hi) = (Vec3::from(b.min), Vec3::from(b.max));
+                Some(acc.map_or((lo, hi), |(a, z)| (a.min(lo), z.max(hi))))
+            })
+        };
+        let hull = union(
+            &mut boxes
+                .iter()
+                .filter(|b| !on_turret(b.node) && intact(b.node)),
+        )
+        .filter(|(lo, hi)| lo.is_finite() && hi.is_finite() && (*hi - *lo).min_element() > 0.3)
+        .unwrap_or(bounds);
+        let turret_box = union(&mut boxes.iter().filter(|b| {
+            on_turret(b.node)
+                && intact(b.node)
+                && !gun.get(usize::from(b.node)).copied().unwrap_or(false)
+                && !thin(b)
+        }))
+        .filter(|(lo, hi)| (*hi - *lo).min_element() > 0.2);
+        if tracked {
+            wheels = stand_ins(&road_wheels, hull);
+        }
         let muzzle = muzzle.map(|(_, at)| at).or_else(|| {
             let b = boxes
                 .iter()
@@ -467,7 +525,25 @@ impl VehicleSpec {
             gun_pivot,
             muzzle_on_gun,
             elevation,
+            hull,
+            turret_box,
+            tuning: VehicleTuning::default(),
         })
+    }
+
+    /// With its template's tuning: its mass and how far its gun tilts.
+    pub fn tuned(mut self, tuning: Option<VehicleTuning>) -> Self {
+        let Some(t) = tuning else {
+            return self;
+        };
+        self.tuning = t;
+        if let Some(m) = t.mass {
+            self.mass = m;
+        }
+        if let Some(turret) = t.turret {
+            self.elevation = turret.pitch;
+        }
+        self
     }
 
     /// How the turret's nodes move with the turret turned `turret`
@@ -662,6 +738,67 @@ fn fit_plane(points: &[(Vec3, f32)]) -> Option<(f32, f32, f32)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_tank_stands_on_its_tracks_not_under_its_gun() {
+        // The AMX-30's road wheels: five a side; its gun reaches 3 m past
+        // the bow, which the model's bounds include and its hull doesn't.
+        let road: Vec<(Vec3, f32)> = [2.233, 1.198, 0.164, -0.870, -1.905]
+            .iter()
+            .flat_map(|&z| {
+                [
+                    (Vec3::new(-1.371, 0.423, z), 0.352),
+                    (Vec3::new(1.371, 0.423, z), 0.352),
+                ]
+            })
+            .collect();
+        let hull = (Vec3::new(-1.8, 0.0, -3.3), Vec3::new(1.8, 1.5, 3.3));
+        let w = stand_ins(&road, hull);
+        assert_eq!(w.len(), 4);
+        for (k, (x, z, steers)) in [
+            (-1.371, 2.233, true),
+            (1.371, 2.233, true),
+            (-1.371, -1.905, false),
+            (1.371, -1.905, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                (w[k].centre.x - x).abs() < 1e-4 && (w[k].centre.z - z).abs() < 1e-4,
+                "{:?}",
+                w[k]
+            );
+            assert!((w[k].centre.y - (w[k].radius)).abs() < 1e-4, "{:?}", w[k]);
+            assert_eq!(w[k].steers, steers);
+        }
+        // Without road wheels: under the hull's corners.
+        let w = stand_ins(&[], hull);
+        assert!(
+            w.iter()
+                .all(|w| w.centre.z.abs() < 3.3 && w.centre.x.abs() < 1.8)
+        );
+    }
+
+    #[test]
+    fn a_template_sets_the_mass_and_how_far_the_gun_tilts() {
+        use crate::tuning::TurretTuning;
+        let t = VehicleTuning {
+            mass: Some(32_000.0),
+            turret: Some(TurretTuning {
+                yaw_speed: 1.0,
+                yaw_accel: 20.0,
+                pitch: (-0.14, 0.44),
+                pitch_speed: 1.0,
+                pitch_accel: 20.0,
+            }),
+            ..VehicleTuning::default()
+        };
+        let s = spec().tuned(Some(t));
+        assert_eq!(s.mass, 32_000.0);
+        assert_eq!(s.elevation, (-0.14, 0.44));
+        assert_eq!(spec().tuned(None), spec());
+    }
+
     fn spec() -> VehicleSpec {
         let wheel = |x: f32, z: f32| WheelSpec {
             centre: Vec3::new(x, 0.35, z),
@@ -697,6 +834,9 @@ mod tests {
             gun_pivot: None,
             muzzle_on_gun: false,
             elevation: (0.0, 0.0),
+            hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
+            turret_box: None,
+            tuning: VehicleTuning::default(),
         }
     }
 

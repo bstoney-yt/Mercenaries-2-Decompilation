@@ -256,10 +256,69 @@ fn open(path: &Path) -> Result<AssetSource<BufReader<File>>, Error> {
     Ok(s)
 }
 
+/// Template fields whose names appear in no file: guessed, each hashing
+/// to a field of the vehicle, weapon and camera components (the AMX-30's
+/// values read sensibly under them).
+const FIELD_NAMES: [&str; 50] = [
+    "MaxSpeed",
+    "Mass",
+    "Brake",
+    "SteerSpeed",
+    "SteerInertia",
+    "SpringStrength",
+    "SpringDamp",
+    "SideFriction",
+    "GravityFactor",
+    "EngineTorque",
+    "EngineInertia",
+    "EngineOffsetY",
+    "MinYaw",
+    "MaxYaw",
+    "maxYawSpeed",
+    "maxYawAccel",
+    "MinPitch",
+    "MaxPitch",
+    "maxPitchSpeed",
+    "maxPitchAccel",
+    "BoneYaw",
+    "BonePitch",
+    "YawThreshold",
+    "PitchThreshold",
+    "CameraOffset",
+    "FocusOffset",
+    "DefaultPitch",
+    "YawSpeed",
+    "PitchSpeed",
+    "YawMin",
+    "YawMax",
+    "PitchMin",
+    "PitchMax",
+    "FarRange",
+    "CameraBlendTime",
+    "TurretName",
+    "DefaultFOV",
+    "MaxFOV",
+    "FOVMaxSpeed",
+    "RateOfFire",
+    "iClipSize",
+    "iRoundsPerReload",
+    "iBulletsPerShot",
+    "MaxAmmoReserve",
+    "FireType",
+    "AmmoTemplate",
+    "MuzzleFlashTemplate",
+    "MuzzleFlashHardpoint",
+    "Velocity",
+    "GravityScale",
+];
+
 /// Every name in the archives and data files; with `gather`, what the
 /// slots, materials and fx sections need from `vz.wad` too.
 fn harvest(install: &Install, gather: bool) -> Result<(Names, Gathered), Error> {
     let mut names = Names::default();
+    for n in FIELD_NAMES {
+        names.add(n);
+    }
     let mut got = Gathered::default();
     let started = std::time::Instant::now();
     for wad in ["vz.wad", "English.wad", "shell.wad", "Loading.wad"] {

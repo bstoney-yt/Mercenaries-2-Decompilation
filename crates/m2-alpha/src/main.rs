@@ -1234,6 +1234,36 @@ fn drive_for_screenshot(
             v.spec.gun.iter().filter(|g| **g).count(),
             v.spec.muzzle_on_gun
         );
+        let (lo, hi) = v.spec.hull;
+        let stand = |w: &m2_engine::vehicle::WheelSpec| format!("{:.2}", w.centre);
+        eprintln!(
+            "drive: hull {lo:.2} to {hi:.2}, turret box {:.2?}, mass {:.0} kg, wheels at [{}]",
+            v.spec.turret_box,
+            v.spec.mass,
+            v.spec
+                .wheels
+                .iter()
+                .map(stand)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let t = &v.spec.tuning;
+        eprintln!(
+            "drive: template tuning: top speed {:?} m/s, turret {:?}, camera {:?}, gun {:?}",
+            t.max_speed,
+            t.turret.map(|t| format!(
+                "{:.0} deg/s, gun {:.0}..{:.0} deg at {:.0} deg/s",
+                t.yaw_speed.to_degrees(),
+                t.pitch.0.to_degrees(),
+                t.pitch.1.to_degrees(),
+                t.pitch_speed.to_degrees()
+            )),
+            t.camera,
+            t.gun.map(|g| format!(
+                "{:08x}: {:.0} a minute, {} rounds, {:.0} m/s (most {:.0}), gravity x{:.1}, flash {:?} s, bank {:08x?}",
+                g.weapon, g.rate_of_fire, g.rounds, g.velocity, g.max_velocity, g.gravity_scale, g.flash, g.sound_bank
+            ))
+        );
         let templated = game
             .scene
             .world

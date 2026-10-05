@@ -12,7 +12,7 @@ use crate::combat::{Combat, Field, Weapon};
 use crate::config::CameraConfig;
 use crate::input::{Action, Input};
 use crate::mission::template_models;
-use crate::player::{Intent, Player};
+use crate::player::{ChaseRig, Intent, Player};
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
 use crate::scene::{ParkedVehicle, Scene};
 use crate::startup::Startup;
@@ -27,7 +27,7 @@ struct Spot<'a> {
 }
 
 /// How fast a turret turns after the camera, and its gun tilts to the
-/// crosshair, radians a second (invented).
+/// crosshair, radians a second, when its template doesn't say (invented).
 const TURRET_RATE: f32 = 1.2;
 const GUN_RATE: f32 = 0.6;
 /// How near a building the town's sounds play, metres.
@@ -299,9 +299,8 @@ impl Game {
                 physics.step(dt);
                 match id.and_then(|(id, v)| Some((physics.vehicle_transform(id)?, v, id))) {
                     Some((at, v, id)) => {
-                        let length = v.spec.bounds.1.z - v.spec.bounds.0.z;
                         let speed = physics.vehicle_speed(id);
-                        player.chase(at, length, intent.look, speed, dt);
+                        player.chase(at, ChaseRig::of(&v.spec), intent.look, speed, dt);
                     }
                     None => {
                         player.driving = None;
@@ -321,7 +320,9 @@ impl Game {
                     if turn > std::f32::consts::PI {
                         turn -= std::f32::consts::TAU;
                     }
-                    v.turret += turn.clamp(-TURRET_RATE * dt, TURRET_RATE * dt);
+                    let turret = v.spec.tuning.turret;
+                    let rate = turret.map_or(TURRET_RATE, |t| t.yaw_speed);
+                    v.turret += turn.clamp(-rate * dt, rate * dt);
                     if let Some(pivot) = v.spec.gun_pivot {
                         let goal = Combat::aim_point(physics, &scene.people, player, v.id);
                         // The crosshair's point as seen from the gun with
@@ -332,7 +333,8 @@ impl Game {
                             - pivot;
                         let (down, up) = v.spec.elevation;
                         let want = local.y.atan2(local.with_y(0.0).length()).clamp(down, up);
-                        v.gun += (want - v.gun).clamp(-GUN_RATE * dt, GUN_RATE * dt);
+                        let rate = turret.map_or(GUN_RATE, |t| t.pitch_speed);
+                        v.gun += (want - v.gun).clamp(-rate * dt, rate * dt);
                     }
                 }
             } else {
@@ -587,7 +589,11 @@ impl Game {
         Some(crate::sound::EngineInput {
             bank,
             speed,
-            top: if v.spec.tracked { 14.0 } else { 32.0 },
+            top: v
+                .spec
+                .tuning
+                .max_speed
+                .unwrap_or(if v.spec.tracked { 14.0 } else { 32.0 }),
             throttle: self.throttle,
         })
     }

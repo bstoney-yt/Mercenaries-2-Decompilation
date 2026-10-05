@@ -1074,6 +1074,7 @@ mod tests {
                 ),
             ]),
             names: HashMap::new(),
+            tuning: HashMap::new(),
         };
         let models = |n: &str| -> Vec<(u32, String)> {
             template_models(n, &db, &catalogue)

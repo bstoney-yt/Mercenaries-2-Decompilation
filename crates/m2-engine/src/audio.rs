@@ -587,6 +587,13 @@ const STEADY_TENTHS: f32 = 3.5;
 const STEADY_WINDOWS: f32 = 6.0;
 /// Most loops an engine crossfades between.
 const ENGINE_LOOPS: usize = 4;
+/// Engines heard in a playthrough, for banks that name no loops: the bank,
+/// the loop that plays, and how far it is pitched idling and flat out. The
+/// Xbox 360 playthrough's AMX-30 runs on `veh_tankmed`'s 13515df7 at 0.84
+/// to 0.97 of its own pitch, from idle to 10 m/s (the other steady sounds
+/// of that bank, measured as loops, are its tracks' and others' it
+/// shares with the other tank banks).
+const HEARD: [(&str, u32, (f32, f32)); 1] = [("veh_tankmed", 0x1351_5df7, (0.84, 1.0))];
 
 /// A vehicle engine's sounds from its bank: steady loops from idle up,
 /// and the one-shots of starting and stopping it.
@@ -599,6 +606,9 @@ pub struct EngineSounds {
     pub stop: Option<SoundBuffer>,
     /// Picked by name (`veh_semi_idle_loop`, ...), rather than measured.
     pub named: bool,
+    /// A single loop heard in a playthrough ([`HEARD`]): how far it is
+    /// pitched idling and flat out.
+    pub heard: Option<(f32, f32)>,
 }
 
 impl EngineSounds {
@@ -632,6 +642,21 @@ impl EngineSounds {
                 start: named("start").cloned(),
                 stop: named("stop").cloned(),
                 named: true,
+                heard: None,
+            };
+        }
+        if let Some((s, pitch)) = HEARD.iter().find_map(|&(b, hash, pitch)| {
+            let s = sounds
+                .iter()
+                .find(|s| b == bank && s.hash == hash && s.frames() > 0)?;
+            Some((s, pitch))
+        }) {
+            return Self {
+                loops: vec![(s.clone(), s.fundamental())],
+                start: None,
+                stop: None,
+                named: false,
+                heard: Some(pitch),
             };
         }
         let mut steady: Vec<(&SoundBuffer, Option<f32>)> = sounds
@@ -663,6 +688,7 @@ impl EngineSounds {
             start: None,
             stop: None,
             named: false,
+            heard: None,
         }
     }
 }

@@ -7,6 +7,7 @@
 //! for a while she hops ahead (logged too): the run goes on to the later
 //! objectives, and the hops show where the way is blocked.
 
+use m2_engine::Physics;
 use m2_math::glam::{Mat4, Vec2, Vec3};
 
 use crate::combat::{Combat, Trigger, Weapon};
@@ -43,6 +44,12 @@ const ON_TARGET: f32 = 0.03;
 const TURRET_ON: f32 = 0.05;
 /// Soldiers fighting her within this far are dealt with first, metres.
 const DEFEND: f32 = 30.0;
+/// Aimed this long (seconds) with something in the way, she goes where she
+/// can see her target from: on rings this far out (metres), no higher or
+/// lower than she stands by more than this if she can (metres).
+const BLOCKED: f32 = 4.0;
+const VANTAGE_RINGS: [f32; 5] = [6.0, 10.0, 15.0, 20.0, 26.0];
+const VANTAGE_CLIMB: f32 = 3.0;
 /// Driving: she eases off within this far of a place (metres) above this
 /// speed (m/s); stuck this long (seconds), she backs out for this long.
 const SLOW_NEAR: f32 = 30.0;
@@ -113,6 +120,12 @@ pub struct Autoplay {
     waiting: Option<(u32, f32)>,
     /// Seconds she has been aiming steadily.
     steady: f32,
+    /// Seconds she has been aimed with something in the way.
+    blocked: f32,
+    /// Where she goes to see the person she is shooting (`npcs[i]`, the
+    /// spot), and the spots that turned out no better.
+    vantage: Option<(usize, Vec3)>,
+    tried: Vec<Vec3>,
     /// Sidestepping (-1 left, 1 right), seconds left.
     sidestep: Option<(f32, f32)>,
     /// Which way the next sidestep goes.
@@ -531,8 +544,52 @@ impl Autoplay {
         } else {
             0.0
         };
+        if clear {
+            self.blocked = 0.0;
+            self.vantage = None;
+            self.tried.clear();
+        } else if error < ON_TARGET {
+            self.blocked += dt;
+        }
+        // Aimed a while with a wall in the way: from where she can see
+        // the target; another spot if that one was no better.
+        let here = p.character.position;
+        if self.blocked > BLOCKED {
+            let at_spot = self
+                .vantage
+                .is_some_and(|(t, s)| t == i && s.with_y(0.0).distance(here.with_y(0.0)) < ARRIVE);
+            if self.vantage.is_none_or(|(t, _)| t != i) || at_spot {
+                if let Some((_, s)) = self.vantage {
+                    self.tried.push(s);
+                }
+                self.blocked = 0.0;
+                self.best = (f32::INFINITY, self.clock);
+                self.vantage = game
+                    .scene
+                    .world
+                    .as_ref()
+                    .and_then(|w| vantage(&w.physics, target, here, &self.tried))
+                    .map(|s| (i, s));
+                eprintln!(
+                    "autoplay {:.1} s: no clear shot at {} from {here:.1}: {}",
+                    self.clock,
+                    self.what,
+                    self.vantage
+                        .map_or("nowhere better to see it from".to_owned(), |(_, s)| {
+                            format!("going to {s:.1}")
+                        })
+                );
+            }
+        }
+        if let Some((t, spot)) = self.vantage
+            && t == i
+            && spot.with_y(0.0).distance(here.with_y(0.0)) >= ARRIVE
+        {
+            self.arrived = None;
+            return self.walk(game, spot, 1.0, dt);
+        }
         // Aimed, but something is in the way: closer.
-        let movement = if !clear && self.steady > 1.0 {
+        let movement = if !clear && self.steady > 1.0 && self.vantage.is_none() {
             Vec2::Y
         } else {
             Vec2::ZERO
@@ -850,6 +907,44 @@ impl Autoplay {
 }
 
 /// Vehicle `vehicles[i]`'s model to world, if placed.
+/// A spot she can stand on and see `target` from: on rings round it, with
+/// ground under it and nothing between eye height there and the target,
+/// not within a few metres of one already `tried`; of the nearest ring
+/// with any, the one closest to `from`, preferring ground about as high
+/// as hers.
+fn vantage(physics: &Physics, target: Vec3, from: Vec3, tried: &[Vec3]) -> Option<Vec3> {
+    let mut best: Option<(f32, Vec3)> = None;
+    for r in VANTAGE_RINGS {
+        for k in 0..24 {
+            let a = k as f32 * std::f32::consts::TAU / 24.0;
+            let (x, z) = (target.x + r * a.sin(), target.z + r * a.cos());
+            let top = Vec3::new(x, target.y.max(from.y) + 30.0, z);
+            let Some((d, n)) = physics.cast_ray(top, Vec3::NEG_Y, 120.0) else {
+                continue;
+            };
+            let spot = Vec3::new(x, top.y - d, z);
+            if n.y < 0.7 || tried.iter().any(|t| t.distance(spot) < 4.0) {
+                continue;
+            }
+            let eye = spot + Vec3::Y * 1.6;
+            let (dir, len) = ((target - eye).normalize_or_zero(), target.distance(eye));
+            // Short of the target's own body.
+            if physics.cast_ray(eye, dir, (len - 1.0).max(0.0)).is_some() {
+                continue;
+            }
+            let climb = (spot.y - from.y).abs();
+            let cost = from.distance(spot) + if climb > VANTAGE_CLIMB { 100.0 } else { 0.0 };
+            if best.is_none_or(|(c, _)| cost < c) {
+                best = Some((cost, spot));
+            }
+        }
+        if best.is_some_and(|(c, _)| c < 100.0) {
+            break;
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
 fn vehicle_at(game: &Game, i: usize) -> Option<Mat4> {
     let id = game.scene.vehicles.get(i)?.id?;
     game.scene.world.as_ref()?.physics.vehicle_transform(id)
@@ -910,6 +1005,39 @@ fn aim(p: &Player, target: Vec3, dt: f32) -> (Vec2, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_behind_a_wall_is_seen_from_round_it() {
+        use m2_engine::{CollisionShape, StaticKey};
+        use m2_math::glam::Quat;
+        let mut p = Physics::new();
+        let quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            CollisionShape::mesh(&[a, b, c, d], &[[0, 1, 2], [0, 2, 3]]).unwrap()
+        };
+        let ground = quad(
+            Vec3::new(-50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, -50.0),
+            Vec3::new(50.0, 0.0, 50.0),
+            Vec3::new(-50.0, 0.0, 50.0),
+        );
+        // A wall 3 m high across her way, 2 m ahead.
+        let wall = quad(
+            Vec3::new(-10.0, 0.0, 2.0),
+            Vec3::new(10.0, 0.0, 2.0),
+            Vec3::new(10.0, 3.0, 2.0),
+            Vec3::new(-10.0, 3.0, 2.0),
+        );
+        p.add_static(StaticKey::Cell(1), &ground, Vec3::ZERO, Quat::IDENTITY);
+        p.add_static(StaticKey::Cell(2), &wall, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let target = Vec3::new(0.0, 1.3, 4.0);
+        let spot = vantage(&p, target, Vec3::ZERO, &[]).expect("somewhere to see it from");
+        assert!(spot.z > 2.0, "still behind the wall at {spot}");
+        assert!(spot.y.abs() < 0.1, "not on the ground: {spot}");
+        // Not the same spot twice.
+        let next = vantage(&p, target, Vec3::ZERO, &[spot]).expect("another");
+        assert!(next.distance(spot) >= 4.0, "{next} is {spot} again");
+    }
 
     #[test]
     fn a_place_to_the_right_steers_right() {

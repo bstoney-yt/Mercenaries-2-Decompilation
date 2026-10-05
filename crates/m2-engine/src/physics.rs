@@ -225,6 +225,10 @@ const WRECK_FRICTION: f32 = 0.9;
 const WRECK_RIM: f32 = 0.7;
 /// How fast tracks turn a hull standing still, radians per second.
 const TRACK_TURN: f32 = 0.9;
+/// Top speeds, m/s, forwards (for a vehicle whose template gives none)
+/// and backwards.
+const TOP_SPEED: f32 = 30.0;
+const REVERSE_SPEED: f32 = 8.0;
 
 /// A vehicle in the physics world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -248,6 +252,8 @@ struct VehicleBody {
     steers: Vec<bool>,
     /// On tracks: turns on the spot instead of steering wheels.
     tracked: bool,
+    /// Top speed forwards, m/s.
+    top: f32,
     /// Wrecked: nothing drives it any more.
     wrecked: bool,
 }
@@ -468,7 +474,7 @@ impl Physics {
         position: Vec3,
         rotation: Quat,
     ) -> VehicleId {
-        let (lo, hi) = spec.bounds;
+        let (lo, hi) = spec.hull;
         // The hull clears the ground by the wheels' lower half.
         let floor = spec
             .wheels
@@ -509,6 +515,15 @@ impl Physics {
             ))
             .friction(0.6);
         self.world.insert_collider(collider, Some(body));
+        // The turret on top, adding nothing to the mass the hull carries.
+        if let Some((lo, hi)) = spec.turret_box {
+            let half = ((hi - lo) * 0.5).max(Vec3::splat(0.1));
+            let turret = r::ColliderBuilder::cuboid(half.x, half.y, half.z)
+                .translation(vector((lo + hi) * 0.5))
+                .density(0.0)
+                .friction(0.6);
+            self.world.insert_collider(turret, Some(body));
+        }
 
         let mut controller = DynamicRayCastVehicleController::new(body);
         controller.index_up_axis = 1;
@@ -539,6 +554,7 @@ impl Physics {
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tracked: spec.tracked,
+            top: spec.tuning.max_speed.unwrap_or(TOP_SPEED),
             wrecked: false,
         }));
         id
@@ -571,8 +587,13 @@ impl Physics {
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
         let throttle = controls.throttle.clamp(-1.0, 1.0);
         let against = speed.abs() > 0.5 && throttle * speed < 0.0;
-        // Accelerates at about 4 m/s² flat out, slower near top speed.
-        let top = if throttle >= 0.0 { 30.0 } else { 8.0 };
+        // Accelerates at about 4 m/s² flat out, slower near top speed;
+        // backs up at half its top speed, at most 8 m/s.
+        let top = if throttle >= 0.0 {
+            v.top
+        } else {
+            (v.top * 0.5).min(REVERSE_SPEED)
+        };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
         let (force, brake) = if controls.parked {
             let hard = if speed.abs() > PARKED_FAST {
@@ -689,9 +710,10 @@ impl Physics {
         };
         body.set_linear_damping(WRECK_DAMPING);
         body.set_angular_damping(WRECK_DAMPING);
-        // The hull, which stopped at the wheels' centres, reaches down to
-        // the rims and drags on the ground.
-        for &h in body.colliders() {
+        // The hull (the first collider; a turret's comes after), which
+        // stopped at the wheels' centres, reaches down to the rims and
+        // drags on the ground.
+        for &h in body.colliders().iter().take(1) {
             let Some(c) = self.world.colliders.get_mut(h) else {
                 continue;
             };
@@ -1245,6 +1267,9 @@ mod tests {
             gun_pivot: None,
             muzzle_on_gun: false,
             elevation: (0.0, 0.0),
+            hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
+            turret_box: None,
+            tuning: crate::VehicleTuning::default(),
         }
     }
 

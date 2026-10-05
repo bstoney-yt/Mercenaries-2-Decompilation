@@ -299,7 +299,8 @@ impl Engine {
     fn mix(sounds: &EngineSounds, rpm: f32) -> Vec<(f32, f32)> {
         let n = sounds.loops.len();
         if n == 1 {
-            return vec![(1.0, 0.8 + 0.7 * rpm)];
+            let (idle, top) = sounds.heard.unwrap_or((0.8, 1.5));
+            return vec![(1.0, idle + (top - idle) * rpm)];
         }
         let at = rpm.clamp(0.0, 1.0) * (n - 1) as f32;
         let k = (at.floor() as usize).min(n - 2);
@@ -477,6 +478,8 @@ pub fn load_engine(install: &Install, bank: u32) -> Option<EngineSounds> {
         picked.loops.len(),
         if picked.named {
             " by name"
+        } else if picked.heard.is_some() {
+            " as heard in a playthrough"
         } else {
             " measured"
         },
@@ -852,6 +855,14 @@ impl GameAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_heard_engine_runs_between_its_heard_pitches() {
+        let mut e = engine(&[Some(125.0)]);
+        e.heard = Some((0.84, 1.0));
+        assert_eq!(Engine::mix(&e, 0.0), vec![(1.0, 0.84)]);
+        assert_eq!(Engine::mix(&e, 1.0), vec![(1.0, 1.0)]);
+    }
 
     #[test]
     fn engines_go_by_kind_and_name() {
