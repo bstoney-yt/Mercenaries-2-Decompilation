@@ -117,12 +117,11 @@ pub struct Atmosphere {
 }
 
 /// Which way the sun stands at `LightTime` 0 (and 0.1, low in the
-/// evening), over the horizon: 20 degrees from `+z` towards `+x`, so that
-/// on `VzaCon001`'s boat ride, heading for the island and its
-/// searchlights, it stands 20 to 30 degrees right of the bow with its
-/// glare path running to it, as in the PC clip's sunset (PC round P; the
-/// earlier 60 degrees put it 16 degrees left). Inferred from the footage.
-pub const SUN_SETS: Vec3 = Vec3::new(0.35, 0.0, 0.94);
+/// evening), over the horizon: 60 degrees from `+z` towards `+x`, so
+/// that from the start of `VzaCon001` it stands behind the island 20 to
+/// 25 degrees left of its searchlights, as the footage of the boat ride
+/// has it. Inferred from the footage.
+pub const SUN_SETS: Vec3 = Vec3::new(0.87, 0.0, 0.49);
 
 /// The lowest the sun is drawn, in radians over the horizon, so that low
 /// `LightTime`s still light the ground a little.
