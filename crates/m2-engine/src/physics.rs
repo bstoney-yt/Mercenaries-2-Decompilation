@@ -96,6 +96,12 @@ impl CollisionShape {
         })
     }
 
+    /// The box the shape fills, in its own space.
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        let b = self.shape.compute_local_aabb();
+        (vec3(b.mins), vec3(b.maxs))
+    }
+
     /// A model's collision in model space: its `PHY2` shapes if `phy2` is
     /// given and parses, else its rigid visible geometry at `lod` (a stand
     /// in).
@@ -139,8 +145,27 @@ impl CollisionShape {
             let lod = (lod..model.info.lod_count.max(lod + 1))
                 .find(|&l| model.has_lod(l))
                 .unwrap_or(lod);
+            // Only what stands drawn and solid: not the wrecked parts an
+            // intact model hides, nor its leaves, light glows or unseen
+            // surfaces.
+            let hidden = model
+                .states
+                .as_ref()
+                .map(|s| s.hidden(&model.nodes, false))
+                .unwrap_or_default();
+            let solid = |material: u32| {
+                model
+                    .materials
+                    .get(material as usize)
+                    .is_none_or(|m| m.flags & NOT_SOLID == 0)
+            };
             for (segment, geometry) in model.lod(lod) {
-                if geometry.kind == GeometryKind::Skin {
+                if geometry.kind == GeometryKind::Skin
+                    || hidden
+                        .get(usize::from(segment.node))
+                        .copied()
+                        .unwrap_or(false)
+                {
                     continue;
                 }
                 let local = model.node_to_model(segment.node).unwrap_or(Mat4::IDENTITY);
@@ -165,7 +190,7 @@ impl CollisionShape {
                                 .is_some_and(|p| (p[3] - index as f32).abs() < 0.5)
                         })
                     };
-                    for range in &group.material_ranges {
+                    for range in group.material_ranges.iter().filter(|r| solid(r.material)) {
                         triangles.extend(
                             group
                                 .triangles(range)
@@ -180,6 +205,11 @@ impl CollisionShape {
         Self::mesh(&vertices, &triangles).map(|shape| Self { stand_in, ..shape })
     }
 }
+
+/// Material flags of surfaces nothing stands on or bumps into: additive
+/// glows (lights, trails), tree leaves (swaying in the wind), and surfaces
+/// never drawn (as the renderer reads them; not confirmed in the game).
+const NOT_SOLID: u16 = 0x0002 | 0x0400 | 0x0800;
 
 /// A `PHY2` part's place (position, rotation x y z w) as a matrix; a
 /// rotation that isn't one counts as none.
