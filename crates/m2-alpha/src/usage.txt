@@ -65,6 +65,7 @@ m2-alpha [options]
                          bomb lands (bomb)
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
+  --pda                  with --screenshot: the picture with her PDA open
   --behind               with --screenshot on foot: the picture from close
                          behind her, to see the weapons on her back
   --slung rpg|gl         with --screenshot on foot: give her this weapon in

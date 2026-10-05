@@ -25,7 +25,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Mesh, TextureHandle, TextureOptions, pos2};
+use m2_assets::flash;
 use m2_assets::font::FONT_TYPE;
+use m2_assets::gfx::{MOVIE_TYPE, movie_from_asset};
 use m2_assets::layer::LAYER_TYPE;
 use m2_assets::minimap::{self, Heights, Road, RoadRecord};
 use m2_assets::path::PATH_TYPE;
@@ -800,6 +802,9 @@ struct Thread {
     zones: Vec<Zone>,
     /// The island's roads, read with the radar's map.
     roads: Vec<Road>,
+    /// The PDA's screens as triangles (see [`pda_triangles`]): not read yet,
+    /// or read (None if they could not be).
+    pda: Option<Option<PdaScreens>>,
 }
 
 impl Thread {
@@ -875,6 +880,7 @@ impl Thread {
             reticle_logged: false,
             zones: Vec::new(),
             roads: Vec::new(),
+            pda: None,
         })
     }
 
@@ -914,11 +920,16 @@ impl Thread {
         // leaves some of it awake here.
         // Its help is in the tutorial box (as the PC footage has it), which
         // stays awake.
-        let only = state.support.satellite.map(|_| {
-            widgets_under(&screen.borrow(), &names, |n| {
-                n == "Satellite overlay" || n == "tutorial"
+        // With the PDA open, only it (drawn below) and the tutorial box.
+        let only = if state.support.pda {
+            Some(widgets_under(&screen.borrow(), &names, |n| n == "tutorial"))
+        } else {
+            state.support.satellite.map(|_| {
+                widgets_under(&screen.borrow(), &names, |n| {
+                    n == "Satellite overlay" || n == "tutorial"
+                })
             })
-        });
+        };
         // No aim point: the reticle's widgets are left out (not the
         // satellite's own, its crosshair).
         let hidden = match state.reticle.or(state.support.satellite.map(|_| [0.0; 2])) {
@@ -947,6 +958,25 @@ impl Thread {
             let w = widget_of(i);
             !hidden.contains(&w) && only.as_ref().is_none_or(|o| o.contains(&w))
         };
+        if state.support.pda {
+            if self.pda.is_none() {
+                let started = Instant::now();
+                let screens = pda_triangles(&mut self.assets);
+                log.push(match &screens {
+                    Ok(s) => format!(
+                        "PDA screens: {} triangles, {:?} px, in {:.0?}",
+                        s.triangles.len(),
+                        s.size,
+                        started.elapsed()
+                    ),
+                    Err(e) => format!("PDA screens: {e}"),
+                });
+                self.pda = Some(screens.ok());
+            }
+            if let Some(Some(screens)) = &self.pda {
+                pda_prims(screens, state.size, &mut prims, &mut want);
+            }
+        }
         for item in items.iter().filter(shown) {
             self.prims(item, state, &mut prims, &mut want);
         }
@@ -1643,6 +1673,79 @@ fn radar_map(
         },
         roads,
     ))
+}
+
+/// How dark the scene goes behind the PDA (the black's alpha): the
+/// footage's scene shows at about a quarter of its brightness round it.
+const PDA_DIM: f32 = 0.85;
+/// The PDA's Flash movies, in the order drawn: its frame and tabs
+/// (`topbar.gfx`), then its map screen (`map.gfx`), the first screen it
+/// opens on.
+const PDA_MOVIES: [&str; 2] = ["topbar", "map"];
+
+/// The PDA's screens as triangles in the movies' pixels (all of them
+/// `size`), first frames only: nothing runs their ActionScript yet, so the
+/// map shows as laid out (unzoomed, no blips) and the tabs unlit.
+struct PdaScreens {
+    size: [f32; 2],
+    triangles: Vec<flash::Triangle>,
+}
+
+/// Reads [`PDA_MOVIES`] and lays out their first frames ([`flash`]).
+fn pda_triangles(assets: &mut AssetSource<BufReader<File>>) -> Result<PdaScreens, String> {
+    let mut size = [0.0; 2];
+    let mut triangles = Vec::new();
+    for name in PDA_MOVIES {
+        let data = assets
+            .asset(name_hash(name), MOVIE_TYPE)
+            .map_err(|e| format!("{name}: {e}"))?;
+        let movie = movie_from_asset(&data).map_err(|e| format!("{name}: {e}"))?;
+        let lib = flash::Library::new(&movie);
+        size = lib.size;
+        triangles.extend(lib.draw(&flash::Matrix::IDENTITY));
+    }
+    Ok(PdaScreens { size, triangles })
+}
+
+/// The PDA on a `screen` (points): its movies stretched over the 4:3
+/// virtual screen at the screen's height, centred, as Scaleform fits a
+/// movie to its widget (the PDA's covers the virtual screen, 640 x 480);
+/// each triangle a quad with its last corner doubled.
+fn pda_prims(screens: &PdaScreens, screen: [f32; 2], out: &mut Vec<Prim>, want: &mut Vec<u32>) {
+    let [mw, mh] = screens.size;
+    if mw <= 0.0 || mh <= 0.0 {
+        return;
+    }
+    let h = screen[1];
+    let w = h * 4.0 / 3.0;
+    let left = (screen[0] - w) / 2.0;
+    // The scene behind darkened, as the footage has it with the PDA up.
+    out.push(quad(
+        None,
+        [0.0, 0.0, screen[0], screen[1]],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0, PDA_DIM],
+        0.0,
+    ));
+    let at = |[x, y]: [f32; 2]| [left + x * w / mw, y * h / mh];
+    let mut textures: HashMap<&str, u32> = HashMap::new();
+    for t in &screens.triangles {
+        let texture = t.texture.as_deref().map(|name| {
+            *textures.entry(name).or_insert_with(|| {
+                let hash = name_hash(name);
+                want.push(hash);
+                hash
+            })
+        });
+        let [a, b, c] = t.corners.map(at);
+        let [ua, ub, uc] = t.uv;
+        out.push(Prim {
+            texture,
+            corners: [a, b, c, c],
+            uv: [ua, ub, uc, uc],
+            colour: t.colour,
+        });
+    }
 }
 
 /// The island's roads: each `Road` entity's centreline (see
