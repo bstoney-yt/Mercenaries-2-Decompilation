@@ -627,10 +627,10 @@ enum Lit {
 }
 
 /// What the clouds' opacity is taken to be of the game's cloud mass, by
-/// which it multiplies `DarknessK`: fitted, as the night sky overhead
-/// came out less than half as bright as footage taking them as equal
-/// (PC round W), and the town's sky near black.
-const CLOUD_MASS: f32 = 0.1;
+/// which it multiplies `DarknessK`: fitted to the night sky overhead in
+/// footage of the mission's start (PC rounds W to U: at 1 it was half as
+/// bright as footage, at 0.1 half as bright again).
+const CLOUD_MASS: f32 = 0.3;
 
 /// [`CLOUD_MASS`], or `M2_CLOUD_MASS` to fit it by hand.
 fn cloud_mass() -> f32 {

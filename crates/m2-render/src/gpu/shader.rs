@@ -202,6 +202,18 @@ fn sky(r: vec3<f32>) -> vec3<f32> {
     return inscatter(c, tr, tm) * (1.0 - exp(-(tr + tm)));
 }
 
+// The air between the eye and a height `h` metres above it along r: the
+// light it adds (rgb) and the share it keeps of what lies there (a), as
+// `sky` but only through the layers below h.
+fn sky_below(r: vec3<f32>, h: f32) -> vec4<f32> {
+    let mu = max(r.y, 0.0) + 0.035;
+    let tr = frame.rayleigh.rgb * frame.scatter.y * (1.0 - exp(-h / frame.scatter.y)) / mu;
+    let tm = frame.mie.rgb * frame.scatter.z * (1.0 - exp(-h / frame.scatter.z)) / mu;
+    let c = dot(r, -normalize(frame.sun_dir.xyz));
+    let keep = exp(-(tr + tm));
+    return vec4<f32>(inscatter(c, tr, tm) * (1.0 - keep), dot(keep, vec3<f32>(1.0 / 3.0)));
+}
+
 // The surface colour rgb at p seen through the air from the eye: the
 // game's extinction and in-scattering, or plain exponential fog.
 fn haze(rgb: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
@@ -599,9 +611,16 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
             let lit = frame.sun_color.rgb * (0.5 + 0.5 * pow(max(c, 0.0), 4.0)) * mix(1.0, 0.7, alpha);
             cloud = lit + frame.ambient_cube[2].rgb * 0.5;
         }
+        cloud = cloud * frame.cloud_tone.rgb;
+        if frame.wind.w >= 0.0 && hazy() {
+            // As the game's, the air below the deck dims the cloud and
+            // adds its own light in front of it.
+            let air = sky_below(r, CLOUD_HEIGHT);
+            cloud = cloud * air.a + air.rgb;
+        }
         // Thin veils: the game's footage shows a hazy sky with little
         // solid cloud.
-        rgb = mix(rgb, cloud * frame.cloud_tone.rgb, alpha * 0.6);
+        rgb = mix(rgb, cloud, alpha * 0.6);
     }
     return vec4<f32>(rgb, 1.0);
 }
