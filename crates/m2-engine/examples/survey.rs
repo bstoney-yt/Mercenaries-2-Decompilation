@@ -694,6 +694,17 @@ fn main() -> Result<(), Error> {
                 )
             }
             "collision" => collision(&mut source, &names, arg),
+            "phy2words" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                phy2_words(
+                    &mut source,
+                    world.as_ref().expect("just built"),
+                    &names,
+                    arg,
+                )
+            }
             "phy2census" => {
                 if world.is_none() {
                     world = Some(WorldIndex::build(&mut source)?);
@@ -1812,6 +1823,174 @@ fn collision<R: Read + Seek>(
             );
         }
     }
+    Ok(())
+}
+
+/// The raw words of `PHY2` records, to find what tells shapes apart
+/// (foliage from rock, a pole that breaks from a wall): for `arg`'s
+/// models, each body's unknown floats and words and each shape's record
+/// words (the vertex pool bounds, count and offset, and the shape's own
+/// index left out); then, over every placed model's shapes and bodies,
+/// the values of each unknown word with how many shapes or bodies of
+/// models named for plants, rocks, poles... carry them (words with many
+/// values just counted).
+fn phy2_words<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_assets::physics::{Geometry, Physics as Phy2};
+    fn phy2_of<R: Read + Seek>(source: &mut AssetSource<R>, h: u32) -> Option<Phy2> {
+        let data = source.model(h).ok()?;
+        let u = m2_assets::Ucfx::parse(&data.base).ok()?;
+        Phy2::parse(u.top_level(*b"PHY2")?).ok()
+    }
+    let kind = |g: &Geometry| match g {
+        Geometry::Box { .. } => "box",
+        Geometry::Sphere => "sphere",
+        Geometry::Capsule { .. } => "capsule",
+        Geometry::Convex { .. } => "convex",
+        Geometry::Mesh { .. } => "mesh",
+    };
+    // Shape record words not yet understood.
+    const SHAPE_WORDS: [usize; 15] = [0, 1, 2, 4, 11, 12, 13, 14, 15, 17, 19, 20, 21, 22, 23];
+    for h in arg.split(',').filter_map(hex) {
+        let Some(p) = phy2_of(source, h) else {
+            println!("{h:08x}: no PHY2");
+            continue;
+        };
+        println!("{h:08x} {}: header {:08x?}", names.show(h), p.unk_0x14);
+        for (i, b) in p.bodies.iter().enumerate() {
+            println!(
+                "  body {i} {} {:.1} kg: unk {:?} words {:08x?}",
+                if b.is_fixed() { "fixed" } else { "moves" },
+                b.mass,
+                b.unk,
+                b.unk_words
+            );
+        }
+        for (k, shape) in p.shapes.iter().enumerate() {
+            let words: Vec<String> = SHAPE_WORDS
+                .iter()
+                .map(|&w| format!("{w}:{:x}", shape.record[w]))
+                .collect();
+            println!(
+                "  shape {k} {} on body {:?}: {}",
+                kind(&shape.geometry),
+                p.body_of(k),
+                words.join(" ")
+            );
+        }
+        let links: Vec<String> = p
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, part)| part.unk_link != u32::MAX)
+            .map(|(i, part)| format!("{i}:{:x}", part.unk_link))
+            .collect();
+        if !links.is_empty() {
+            println!("  parts' unknown links: {}", links.join(" "));
+        }
+    }
+    // Over every placed model: values of each unknown word, by the kind
+    // of thing its model's name says it is.
+    const KINDS: [&str; 14] = [
+        "plant",
+        "bush",
+        "scrub",
+        "tree",
+        "rock",
+        "pole",
+        "fence",
+        "sign",
+        "lamp",
+        "barrel",
+        "crate",
+        "wall",
+        "sandbag",
+        "barricade",
+    ];
+    let mut models: Vec<u32> = world
+        .objects
+        .iter()
+        .map(|o| o.model)
+        .chain(world.state_objects.values().map(|o| o.model))
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    // word -> value -> (count, per kind (+ other, unnamed)).
+    type Tally = BTreeMap<usize, HashMap<u32, (usize, [usize; 16])>>;
+    let mut shape_tally: Tally = BTreeMap::new();
+    let mut body_tally: Tally = BTreeMap::new();
+    let class = |h: u32| {
+        names.get(h).map_or(15, |n| {
+            KINDS.iter().position(|k| n.contains(k)).unwrap_or(14)
+        })
+    };
+    for &h in &models {
+        let Some(p) = phy2_of(source, h) else {
+            continue;
+        };
+        let c = class(h);
+        for shape in &p.shapes {
+            for &w in &SHAPE_WORDS {
+                let e = shape_tally
+                    .entry(w)
+                    .or_default()
+                    .entry(shape.record[w])
+                    .or_default();
+                e.0 += 1;
+                e.1[c] += 1;
+            }
+        }
+        for b in &p.bodies {
+            let words = b
+                .unk
+                .iter()
+                .map(|f| f.to_bits())
+                .chain(b.unk_words.iter().copied())
+                .chain([u32::from(b.is_fixed())]);
+            for (w, v) in words.enumerate() {
+                let e = body_tally.entry(w).or_default().entry(v).or_default();
+                e.0 += 1;
+                e.1[c] += 1;
+            }
+        }
+    }
+    let show = |what: &str, tally: &Tally| {
+        for (w, values) in tally {
+            if values.len() > 24 {
+                println!("{what} word {w}: {} values", values.len());
+                continue;
+            }
+            let mut v: Vec<(&u32, &(usize, [usize; 16]))> = values.iter().collect();
+            v.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+            for (value, (n, by)) in v.iter().take(8) {
+                let kinds: Vec<String> = by
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, k)| **k > 0)
+                    .map(|(i, k)| {
+                        let name = match i {
+                            14 => "other",
+                            15 => "unnamed",
+                            _ => KINDS[i],
+                        };
+                        format!("{name} {k}")
+                    })
+                    .collect();
+                println!(
+                    "{what} word {w} = {value:08x} ({:.3}): {n} [{}]",
+                    f32::from_bits(**value),
+                    kinds.join(", ")
+                );
+            }
+        }
+    };
+    println!("over {} placed models' PHY2:", models.len());
+    show("shape", &shape_tally);
+    show("body", &body_tally);
     Ok(())
 }
 
