@@ -1627,8 +1627,49 @@ impl Physics {
         else {
             return Vec::new();
         };
+        self.statics_touching(body.colliders())
+    }
+
+    /// The statics a loose piece is in contact with, each once: what holds
+    /// one that hardly moved (the gate test asks).
+    pub fn debris_statics(&self, id: DebrisId) -> Vec<StaticKey> {
+        let Some(body) = self
+            .debris
+            .get(id.0)
+            .copied()
+            .flatten()
+            .and_then(|h| self.world.bodies.get(h))
+        else {
+            return Vec::new();
+        };
+        self.statics_touching(body.colliders())
+    }
+
+    /// The statics meeting a box (`lo` to `hi` in its own space, placed at
+    /// `place`), each once: what stands where a building does.
+    pub fn statics_in_box(&self, place: Mat4, (lo, hi): (Vec3, Vec3)) -> Vec<StaticKey> {
+        let (_, rotation, translation) = place.to_scale_rotation_translation();
+        let rotation = rotation.normalize();
+        let middle = translation + rotation * ((lo + hi) * 0.5);
+        let shape = r::Cuboid::new(vector((hi - lo).max(Vec3::splat(0.02)) * 0.5));
         let mut out = Vec::new();
-        for &c in body.colliders() {
+        for (handle, _) in
+            self.world
+                .intersect_shape(pose(middle, rotation), &shape, r::QueryFilter::default())
+        {
+            if let Some(&key) = self.keys.get(&handle)
+                && !out.contains(&key)
+            {
+                out.push(key);
+            }
+        }
+        out
+    }
+
+    /// The statics any of `colliders` is in contact with, each once.
+    fn statics_touching(&self, colliders: &[r::ColliderHandle]) -> Vec<StaticKey> {
+        let mut out = Vec::new();
+        for &c in colliders {
             for pair in self.world.narrow_phase.contact_pairs_with(c) {
                 if !pair.has_any_active_contact() {
                     continue;
@@ -3002,6 +3043,13 @@ mod tests {
         }
         let lies = p.debris_place(d).unwrap().transform_point3(Vec3::Y);
         assert!(lies.y > 0.3 && lies.y < 1.6, "on the ground: {lies}");
+        // What holds it, and what stands where it lies.
+        assert_eq!(p.debris_statics(d), [StaticKey::Cell(1)]);
+        let around = (Vec3::splat(-3.0), Vec3::splat(3.0));
+        let place = Mat4::from_translation(lies);
+        assert_eq!(p.statics_in_box(place, around), [StaticKey::Cell(1)]);
+        let above = Mat4::from_translation(lies + Vec3::Y * 10.0);
+        assert!(p.statics_in_box(above, around).is_empty());
         // Rays and she pass it.
         let down = p.cast_ray(lies + Vec3::Y * 5.0, Vec3::NEG_Y, 20.0).unwrap();
         assert!((down.0 - (lies.y + 5.0)).abs() < 0.05, "{down:?}");
