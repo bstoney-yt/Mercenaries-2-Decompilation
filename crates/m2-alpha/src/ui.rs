@@ -116,8 +116,9 @@ impl Hud {
             .screen_rect
             .map_or([0.0; 2], |r| [r.width(), r.height()]);
         state.dt = game.frame_time(input.time);
-        let message = info.mission.as_ref().and_then(|m| m.message.as_ref());
+        let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
+        state.blips = blips(info);
         game.update(&self.ctx, state);
     }
 
@@ -130,8 +131,9 @@ impl Hud {
         };
         let mut state = state.clone();
         state.size = [size.0 as f32, size.1 as f32];
-        let message = info.mission.as_ref().and_then(|m| m.message.as_ref());
+        let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
+        state.blips = blips(info);
         let step = 1.0 / 30.0;
         game.update_and_wait(
             &self.ctx,
@@ -241,6 +243,16 @@ pub fn headless_input(width: u32, height: u32, time: f64) -> RawInput {
         time: Some(time),
         ..RawInput::default()
     }
+}
+
+/// The mission's markers, for the game HUD's minimap.
+fn blips(info: &HudInfo) -> Vec<([f32; 3], String, [u8; 4])> {
+    info.mission.as_ref().map_or_else(Vec::new, |m| {
+        m.markers
+            .iter()
+            .map(|(at, label, colour)| (at.to_array(), label.clone(), *colour))
+            .collect()
+    })
 }
 
 fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
@@ -576,6 +588,7 @@ mod tests {
                     [255, 200, 0, 255],
                 )],
                 message: Some((false, "VzaCon001 objective 1".into())),
+                game_message: None,
                 status: None,
                 contract_complete: true,
             }),
