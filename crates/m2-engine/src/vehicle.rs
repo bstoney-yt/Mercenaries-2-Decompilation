@@ -68,10 +68,14 @@ pub const WEAPONS: [(&str, &str); 4] = [
 
 /// Hand weapons found by their models' own names (the names their
 /// templates' `ModelName` hash): the first contract's supply crate's
-/// grenade launcher and its 40 mm round.
-pub const NAMED_WEAPONS: [(&str, &str); 2] = [
+/// grenade launcher and its 40 mm round, her carbine (the template
+/// "Carbine") and the satellite designator (the template "Satellite
+/// Designator").
+pub const NAMED_WEAPONS: [(&str, &str); 4] = [
     ("mgl", "global_weapon_mgl"),
     ("40mm", "global_weapon_40mmgrenade"),
+    ("m4", "global_weapon_m4"),
+    ("detonator", "global_weapon_detonator"),
 ];
 
 /// Root node of every human skeleton.

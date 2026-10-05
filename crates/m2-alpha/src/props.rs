@@ -66,6 +66,9 @@ pub struct Props {
     knocked: HashMap<u32, Vec<DebrisId>>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
+    /// Those only a support strike brings down (a mission's gates): no
+    /// vehicle or common blast knocks them loose.
+    pub sturdy: HashSet<u32>,
 }
 
 /// How the props stand ([`Props::counts`]): how many are shown, and of
@@ -190,8 +193,17 @@ impl Props {
     }
 
     /// The mass to shift (kg) to knock `entity` loose; `None` unless it
-    /// stands whole and its model comes loose.
+    /// stands whole, its model comes loose, and it isn't
+    /// [`sturdy`](Self::sturdy).
     pub fn loose_mass(&self, physics: &Physics, entity: u32) -> Option<f32> {
+        if self.sturdy.contains(&entity) {
+            return None;
+        }
+        self.any_loose_mass(physics, entity)
+    }
+
+    /// [`loose_mass`](Self::loose_mass), sturdy or not.
+    fn any_loose_mass(&self, physics: &Physics, entity: u32) -> Option<f32> {
         let p = self.shown.get(&entity)?;
         if p.wrecked
             || self.knocked.contains_key(&entity)
@@ -204,15 +216,21 @@ impl Props {
 
     /// Knocks `entity` loose: its standing collision goes and its pieces
     /// fly off at `velocity` (m/s), turning at `spin` (radians a second
-    /// about each axis). False unless it came loose.
+    /// about each axis). False unless it came loose; one that is
+    /// [`sturdy`](Self::sturdy) only does with `strike` (a support strike).
     pub fn knock(
         &mut self,
         physics: &mut Physics,
         entity: u32,
         velocity: Vec3,
         spin: Vec3,
+        strike: bool,
     ) -> bool {
-        if self.loose_mass(physics, entity).is_none() {
+        let mass = match strike {
+            true => self.any_loose_mass(physics, entity),
+            false => self.loose_mass(physics, entity),
+        };
+        if mass.is_none() {
             return false;
         }
         let (Some(p), Some(loose)) = (self.shown.get(&entity), self.loose(entity)) else {
@@ -238,11 +256,21 @@ impl Props {
 
     /// Those standing that come loose with any of their model within
     /// `reach` metres of `at` (as far as its box's middle less half its
-    /// size), with how far.
-    pub fn loose_near(&self, physics: &Physics, at: Vec3, reach: f32) -> Vec<(u32, f32)> {
+    /// size), with how far; the [`sturdy`](Self::sturdy) too with
+    /// `strike` (a support strike).
+    pub fn loose_near(
+        &self,
+        physics: &Physics,
+        at: Vec3,
+        reach: f32,
+        strike: bool,
+    ) -> Vec<(u32, f32)> {
         self.shown
             .iter()
-            .filter(|&(&e, _)| self.loose_mass(physics, e).is_some())
+            .filter(|&(&e, _)| match strike {
+                true => self.any_loose_mass(physics, e).is_some(),
+                false => self.loose_mass(physics, e).is_some(),
+            })
             .filter_map(|(&e, p)| {
                 let m = self.models.get(&p.model)?.as_ref()?;
                 let (lo, hi) = m.gpu.bounds;
