@@ -74,11 +74,14 @@ const HANG_DOWN: Hang = Hang {
 /// The grenade launcher's, as the PC video has it (frame pc460): muzzle
 /// up behind her right shoulder, 0.15-0.2 m above it, across her back to
 /// its stock at her left hip, 25-30 degrees off straight up; ours hung
-/// muzzle down. The top's height is invented, to be checked.
+/// muzzle down. Round 103 had it as laid out but about 35 degrees off
+/// (her posed back adds some), its muzzle at her ear where the video's
+/// is near the top of her head: so the lean is less than the video's
+/// angle and the top higher. Fitted by eye.
 const HANG_LAUNCHER: Hang = Hang {
     muzzle_up: true,
-    lean: 0.52,
-    top: 0.3,
+    lean: 0.4,
+    top: 0.4,
 };
 
 /// Weapons drawn on the right hand's attach node turned as the node is
@@ -2376,15 +2379,15 @@ mod tests {
         let at = slung_at(muzzle, (lo, hi), point, (right, up), 0, HANG_LAUNCHER).unwrap();
         let tip = at.transform_point3(muzzle);
         let barrel = at.transform_vector3(Vec3::Z).normalize();
-        // Muzzle up toward her right shoulder, 25-30 degrees off straight
-        // up.
+        // Muzzle up toward her right shoulder, about 22 degrees off
+        // straight up on a back standing straight.
         let off = barrel.y.clamp(-1.0, 1.0).acos().to_degrees();
         assert!(
-            barrel.dot(right) > 0.0 && (25.0..30.0).contains(&off),
+            barrel.dot(right) > 0.0 && (20.0..25.0).contains(&off),
             "{barrel} {off}"
         );
         // Its muzzle above the attach point, and on her right.
-        assert!(tip.y > point.y + 0.1 && tip.y < point.y + 0.35, "{tip}");
+        assert!(tip.y > point.y + 0.2 && tip.y < point.y + 0.45, "{tip}");
         assert!(tip.dot(right) > point.dot(right), "{tip}");
         assert!(
             at.transform_point3(Vec3::new(0.0, 0.0, -0.3)).z < point.z,
