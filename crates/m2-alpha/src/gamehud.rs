@@ -1731,24 +1731,30 @@ fn minimap(
     ));
 }
 
-/// The roads on the minimap, inside its rim: strokes [`ROAD_WIDTH`] of its
-/// radius across, the paved solid and the tracks dashed, a [`DASH`] of
+/// The roads on the minimap, inside its rim: the paved solid strokes
+/// [`PAVED_WIDTH`] of its radius across, the tracks [`ROAD_WIDTH`] and dashed, a [`DASH`] of
 /// road and a [`DASH_GAP`] by turns, counted along each road from its
 /// start.
 ///
+/// [`PAVED_WIDTH`]: minimap::PAVED_WIDTH
 /// [`ROAD_WIDTH`]: minimap::ROAD_WIDTH
 /// [`DASH`]: minimap::DASH
 /// [`DASH_GAP`]: minimap::DASH_GAP
 fn road_strokes(view: &MapView, roads: &[Road], out: &mut Vec<Prim>, want: &mut Vec<u32>) {
     let centre = view.centre();
     let r = view.radius();
-    let half = r * minimap::ROAD_WIDTH / 2.0;
     let colour = minimap::ROAD.map(|v| f32::from(v) / 255.0);
     let texture = name_hash(PATH_TEXTURE);
     want.push(texture);
     let period = minimap::DASH + minimap::DASH_GAP;
     let at = [view.player[0], view.player[2]];
     for road in roads.iter().filter(|road| road.near(at, view.range)) {
+        let width = if road.paved {
+            minimap::PAVED_WIDTH
+        } else {
+            minimap::ROAD_WIDTH
+        };
+        let half = r * width / 2.0;
         // Metres along the road, for its dashes to run on unbroken.
         let mut along = 0.0;
         for pair in road.points.windows(2) {
