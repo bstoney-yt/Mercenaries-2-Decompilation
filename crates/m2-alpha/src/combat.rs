@@ -23,6 +23,36 @@ const LEFT_HAND: u32 = 0xeb6f_1b2d;
 /// (`Bone_Attach_RHand`, `bone_attach_lhand`): where a weapon's grip goes.
 const RIGHT_ATTACH: u32 = 0xf450_ed0d;
 const LEFT_ATTACH: u32 = 0xfa76_1573;
+/// The attach points high on her back, right and left
+/// (`Bone_Attach_BackRight`, `Bone_Attach_BackLeft`): where the weapons
+/// she carries but doesn't hold hang.
+const BACK_ATTACH: [u32; 2] = [0x3846_cb35, 0xdf2d_0826];
+/// Her lower spine and her neck (`Bone_Spine1`, `Bone_Neck`): which way
+/// her back runs as she is posed. (The attach points, behind her spine,
+/// made a back leaning back 26 degrees, round 98: the weapons hung down
+/// and forward, by her side.)
+const SPINE: u32 = 0x5ca4_9bd8;
+const NECK: u32 = 0xc187_105b;
+/// A slung weapon hangs down her back, flat against it, as the PC video's
+/// carbine does (round 97: nearly straight down, a little right of her
+/// spine, from her shoulders to her hips): along its length, its middle
+/// this far (metres) below the attach point and this far behind it,
+/// leaning off straight down by this much (the tangent; its lower end
+/// toward her left hip). Round 99 hung them along the line from the grip
+/// to the muzzle, which runs well off the RPG's and the launcher's
+/// length: they lay 25 to 30 degrees across her back, down to her shin
+/// and thigh. Invented.
+const SLUNG_DROP: f32 = 0.12;
+const SLUNG_GAP: f32 = 0.07;
+const SLUNG_LEAN: f32 = 0.14;
+/// And its top no higher than this far above the attach point (about the
+/// base of her neck), lowered as far as that takes, unless that would
+/// take its bottom lower than this far below the point (just past her
+/// knees): round 100 had the RPG's top 0.3 m over her head and the
+/// launcher's stock in her hair, where the PC video has them end about
+/// her shoulders.
+const SLUNG_TOP: f32 = 0.16;
+const SLUNG_FLOOR: f32 = 1.0;
 
 /// Weapons drawn on the right hand's attach node turned as the node is
 /// posed (the default: the grip sits in her palm, round 78), rather than
@@ -177,6 +207,11 @@ pub struct Arsenal {
     /// The right hand's node in the human skeleton, and its attach point.
     pub hand: Option<usize>,
     pub attach: Option<usize>,
+    /// The attach points on her back, right and left ([`BACK_ATTACH`]),
+    /// and her lower spine and neck ([`SPINE`], [`NECK`]).
+    pub back: [Option<usize>; 2],
+    pub spine: Option<usize>,
+    pub neck: Option<usize>,
 }
 
 impl Arsenal {
@@ -190,6 +225,9 @@ impl Arsenal {
         if let Some(r) = rig {
             self.hand = r.rifle_hand();
             self.attach = right_attach(&r.skeleton);
+            self.back = BACK_ATTACH.map(|h| node(&r.skeleton, h));
+            self.spine = node(&r.skeleton, SPINE);
+            self.neck = node(&r.skeleton, NECK);
         }
         let w = Some(WeaponModel {
             model,
@@ -209,6 +247,40 @@ impl Arsenal {
             "detonator" => self.designator = w,
             _ => {}
         }
+    }
+
+    /// Weapon to world for `weapon` slung on the back of a character
+    /// drawn at `body` with posed node matrices `nodes`, from the attach
+    /// point of `slot` (0 her right, 1 her left): down her back as her
+    /// spine runs from its lower end up to her neck, whichever way she
+    /// leans ([`slung_at`]).
+    pub fn on_back(
+        &self,
+        weapon: &WeaponModel,
+        body: Mat4,
+        nodes: &[Mat4],
+        slot: usize,
+    ) -> Option<Mat4> {
+        let (point, back) = self.back_at(body, nodes, slot)?;
+        slung_at(weapon.muzzle, weapon.model.bounds, point, back, slot)
+    }
+
+    /// The attach point of `slot` on the back of a character drawn at
+    /// `body` with posed node matrices `nodes`, and which way her back
+    /// runs there, `(right, up)` (world space, not unit).
+    fn back_at(&self, body: Mat4, nodes: &[Mat4], slot: usize) -> Option<(Vec3, (Vec3, Vec3))> {
+        let at = |n: Option<usize>| Some(body.transform_point3(nodes.get(n?)?.w_axis.truncate()));
+        let point = at(self.back.get(slot).copied().flatten())?;
+        let [right_point, left_point] = self.back.map(at);
+        let right = match (right_point, left_point) {
+            (Some(r), Some(l)) if r.distance(l) > 0.02 => r - l,
+            _ => body.transform_vector3(Vec3::NEG_X),
+        };
+        let up = match (at(self.spine), at(self.neck)) {
+            (Some(s), Some(n)) if s.distance(n) > 0.05 => n - s,
+            _ => body.transform_vector3(Vec3::Y),
+        };
+        Some((point, (right, up)))
     }
 
     /// Weapon to world for a character drawn at `body` with posed node
@@ -259,6 +331,59 @@ const CARRY_OUT: f32 = 0.17;
 
 fn node(skeleton: &Skeleton, hash: u32) -> Option<usize> {
     skeleton.name_hashes.iter().position(|&h| h == hash)
+}
+
+/// Weapon to world for a weapon slung at `point` on a back running
+/// `(right, up)` (world space, as posed), on her right (`slot` 0) or left:
+/// along its length (the longest side of its `bounds`, the end its
+/// `muzzle` is at down) down her back, leaning as [`SLUNG_LEAN`] has it,
+/// flat against her back with its top to her side, its middle
+/// [`SLUNG_DROP`] below the point and [`SLUNG_GAP`] behind it, or lower to
+/// keep its top down ([`SLUNG_TOP`]).
+fn slung_at(
+    muzzle: Vec3,
+    bounds: (Vec3, Vec3),
+    point: Vec3,
+    (right, up): (Vec3, Vec3),
+    slot: usize,
+) -> Option<Mat4> {
+    let right = right.try_normalize()?;
+    let up = (up - right * up.dot(right)).try_normalize()?;
+    let ahead = up.cross(right);
+    // The weapon's own frame: along its length toward the muzzle's end,
+    // its top, and the side they leave.
+    let (lo, hi) = bounds;
+    let (size, middle) = (hi - lo, (lo + hi) * 0.5);
+    let long = (0..3).max_by(|&a, &b| size[a].total_cmp(&size[b]))?;
+    let mut barrel = Vec3::ZERO;
+    barrel[long] = if muzzle[long] < middle[long] {
+        -1.0
+    } else {
+        1.0
+    };
+    let top = (Vec3::Y - barrel * barrel.y)
+        .try_normalize()
+        .unwrap_or(Vec3::Z);
+    let own = m2_math::glam::Mat3::from_cols(barrel, top, barrel.cross(top));
+    // Where they go on her back.
+    let down = (-up - right * SLUNG_LEAN).normalize();
+    let side = if slot == 0 { right } else { -right };
+    let to_side = (side - down * side.dot(down)).normalize();
+    let turn = m2_math::glam::Mat3::from_cols(down, to_side, down.cross(to_side)) * own.transpose();
+    // How far it reaches up and down her back from its middle.
+    let reach = (0..3)
+        .map(|k| (turn.col(k).dot(up) * size[k]).abs() * 0.5)
+        .sum::<f32>();
+    let lower = (reach - SLUNG_DROP - SLUNG_TOP)
+        .min(SLUNG_FLOOR - SLUNG_DROP - reach)
+        .max(0.0);
+    let origin = point - up * (SLUNG_DROP + lower) - ahead * SLUNG_GAP - turn * middle;
+    Some(Mat4::from_cols(
+        turn.x_axis.extend(0.0),
+        turn.y_axis.extend(0.0),
+        turn.z_axis.extend(0.0),
+        origin.extend(1.0),
+    ))
 }
 
 /// The right hand's weapon attach point.
@@ -449,6 +574,8 @@ pub enum Effect {
     Smoke { at: Vec3, size: f32 },
     /// A fireball, growing.
     Fire { at: Vec3, size: f32 },
+    /// Thick black smoke, growing and rising further than [`Smoke`](Self::Smoke).
+    Soot { at: Vec3, size: f32 },
     /// Spray thrown off a boat's hull: a white puff flying `drift` metres
     /// over its life, growing and then gone.
     Spray { at: Vec3, drift: Vec3, size: f32 },
@@ -469,6 +596,8 @@ pub enum Sound {
     Cannon(Vec3),
     /// The satellite-guided bomb landing.
     Bomb(Vec3),
+    /// A building the bomb brought down coming apart.
+    Collapse(Vec3),
 }
 
 /// A blow or a round that landed on something of the world's rather than
@@ -561,6 +690,8 @@ pub struct Trigger {
     /// The support key: the support menu opens or closes
     /// ([`crate::support`]).
     pub support: bool,
+    /// The PDA key: the PDA opens or closes.
+    pub pda: bool,
 }
 
 /// The fight's state.
@@ -613,6 +744,9 @@ pub struct Combat {
     /// Blasts about to go off (something explosive caught): where, and
     /// seconds left.
     fuses: Vec<(Vec3, f32)>,
+    /// What a building's break-up left burning: where, seconds left,
+    /// seconds to the next flame.
+    blazes: Vec<(Vec3, f32, f32)>,
     /// Spent explosives burning: where, how big, seconds left, seconds to
     /// the next flame.
     fires: Vec<(Vec3, f32, f32, f32)>,
@@ -646,6 +780,7 @@ impl Default for Combat {
             designator: false,
             last_launch: None,
             fuses: Vec::new(),
+            blazes: Vec::new(),
             fires: Vec::new(),
             seed: 0x2545_f491_4f6c_dd1d,
         }
@@ -697,6 +832,11 @@ const CHAIN_DELAY: f32 = 0.3;
 /// How long what is left of one burns, seconds (wrecks burn 20 s and
 /// more in the Xbox 360 game).
 const BURN: f32 = 25.0;
+/// How long a building's break-up burns, seconds (invented: the videos'
+/// fires burn on past the 25 s they show).
+const BLAZE_TIME: f32 = 40.0;
+/// How far above the ground its flames' middle is, metres.
+const BLAZE_LIFT: f32 = 1.2;
 
 /// The island's explosives.
 pub fn explosives(index: &m2_engine::WorldIndex) -> Vec<Explosive> {
@@ -767,6 +907,23 @@ impl Combat {
         }
     }
 
+    /// The weapons she carries but doesn't hold, which hang on her back:
+    /// the rifle on her right unless it is up in her hands, and what she
+    /// carries in the launcher's place on her left unless that is (with
+    /// `in_hand` false, her hands hold something else: a grenade, the
+    /// designator); the one alone on her right, a little right of her
+    /// spine, as the PC video's hangs (round 98).
+    pub fn slung(&self, in_hand: bool) -> [Option<Weapon>; 2] {
+        let up = |w: Weapon| in_hand && self.weapon == w;
+        match [
+            Some(Weapon::Rifle).filter(|&w| !up(w)),
+            self.second.filter(|&w| !up(w)),
+        ] {
+            [None, alone] => [alone, None],
+            both => both,
+        }
+    }
+
     /// Whether the weapon in the launcher's place can fire: the RPG
     /// always, a grenade launcher with rounds left.
     pub fn second_loaded(&self) -> bool {
@@ -816,6 +973,21 @@ impl Combat {
     /// spray).
     pub fn show(&mut self, e: Effect, seconds: f32) {
         self.effect(e, seconds);
+    }
+
+    /// A fire burning on the ground under `at` for [`BLAZE_TIME`] with
+    /// thick black smoke, where a building broke apart (a gate a bomb
+    /// brought down: the videos' fires either side, smoke for many
+    /// seconds; its points are high on it, and it goes down into the
+    /// ground as it breaks).
+    pub fn blaze(&mut self, physics: &Physics, at: Vec3) {
+        let at = ground_under(physics, at).map_or(at, |g| g + Vec3::Y * BLAZE_LIFT);
+        self.blazes.push((at, BLAZE_TIME, 0.0));
+    }
+
+    /// A building the bomb brought down comes apart at `at`: heard.
+    pub fn collapse(&mut self, at: Vec3) {
+        self.sounds.push(Sound::Collapse(at));
     }
 
     /// Where she is a target: her chest, or `None` while down, flying or
@@ -1224,6 +1396,10 @@ impl Combat {
         let (Some(id), Some(muzzle), false) = (v.id, v.spec.muzzle, v.wrecked) else {
             return;
         };
+        // A cannon with no shells left is silent.
+        if v.rounds() == Some(0) {
+            return;
+        }
         let Some(body) = f.physics.vehicle_transform(id) else {
             return;
         };
@@ -1259,6 +1435,9 @@ impl Combat {
                 shell: true,
                 owner: Some(id),
             });
+            if let Some(v) = f.vehicles.get_mut(i) {
+                v.fired += 1;
+            }
             self.effect(
                 Effect::Flash {
                     at: from,
@@ -1618,8 +1797,11 @@ impl Combat {
             let r = BOMB_FIRE_SPREAD * (0.7 + 0.6 * self.random());
             let (shortest, longest) = BOMB_FIRE_TIME;
             let burn = shortest + (longest - shortest) * (self.random() + 0.5);
-            let spot = at + Vec3::new(a.sin() * r, 1.2, a.cos() * r);
-            self.fires.push((spot, 2.5, burn, 0.0));
+            let spot = at + Vec3::new(a.sin() * r, 0.0, a.cos() * r);
+            // On the ground: a bomb that hit a gate's top (which it brings
+            // down) leaves its fires below.
+            let ground = ground_under(f.physics, spot).unwrap_or(spot);
+            self.fires.push((ground + Vec3::Y * 1.2, 2.5, burn, 0.0));
         }
         alarm(f.people, at);
     }
@@ -1739,6 +1921,26 @@ impl Combat {
             }
             *left > 0.0
         });
+        let mut blazing = Vec::new();
+        self.blazes.retain_mut(|(at, left, next)| {
+            *left -= dt;
+            *next -= dt;
+            if *next <= 0.0 {
+                *next = 0.35;
+                blazing.push(*at);
+            }
+            *left > 0.0
+        });
+        for at in blazing {
+            self.effect(Effect::Fire { at, size: 3.0 }, 0.7);
+            self.effect(
+                Effect::Soot {
+                    at: at + Vec3::Y * 3.0,
+                    size: 3.5,
+                },
+                6.0,
+            );
+        }
         for (at, size) in flames {
             let low = at.with_y(at.y - size.min(1.2) + 0.5);
             self.effect(
@@ -1757,6 +1959,18 @@ impl Combat {
             );
         }
     }
+}
+
+/// The ground under `at` (from 6 m above it, so a spot up a slope is
+/// found too, down to 60 m), seen through the state layers' models (a gate
+/// a bomb brings down).
+fn ground_under(physics: &Physics, at: Vec3) -> Option<Vec3> {
+    let from = at + Vec3::Y * 6.0;
+    physics
+        .cast_ray_skipping(from, Vec3::NEG_Y, 60.0, |key| {
+            matches!(key, StaticKey::Entity(_))
+        })
+        .map(|(d, _)| from - Vec3::Y * d)
 }
 
 /// The velocity at `speed` that lobs a round from `from` down onto `to`
@@ -2038,6 +2252,300 @@ mod tests {
         let s = combat.struck.first().copied().expect("struck");
         assert_eq!(s.key, Some(StaticKey::Entity(7)));
         assert!(s.at.y < 0.8 && s.damage >= 100.0, "{s:?}");
+    }
+
+    #[test]
+    fn a_bombs_fires_burn_on_the_ground_under_a_gate() {
+        let mut physics = ground();
+        // A gate 15 m high (a state layer's) and a house 6 m high.
+        let wall = |half: Vec3| m2_engine::CollisionShape::cuboid(half);
+        physics.add_static(
+            StaticKey::Entity(7),
+            &wall(Vec3::new(10.0, 7.5, 2.0)),
+            Vec3::new(0.0, 7.5, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.add_static(
+            StaticKey::Object(3),
+            &wall(Vec3::new(4.0, 3.0, 4.0)),
+            Vec3::new(40.0, 3.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let on = |at: Vec3| ground_under(&physics, at).map(|g| (g.y * 10.0).round() / 10.0);
+        assert_eq!(on(Vec3::new(1.0, 15.0, 0.5)), Some(0.0));
+        assert_eq!(on(Vec3::new(40.0, 6.0, 0.0)), Some(6.0));
+        assert_eq!(on(Vec3::new(80.0, 2.0, 0.0)), Some(0.0));
+    }
+
+    #[test]
+    fn a_slung_weapon_hangs_down_her_back() {
+        // Her back as she stands facing +z, her right to -x.
+        let (right, up) = (Vec3::NEG_X, Vec3::Y);
+        // A carbine 0.85 m long, its barrel along +z from its grip, its
+        // stock 0.3 m behind.
+        let muzzle = Vec3::new(0.0, 0.05, 0.5);
+        let (lo, hi) = (Vec3::new(-0.04, -0.15, -0.3), Vec3::new(0.04, 0.08, 0.55));
+        let point = Vec3::new(-0.1, 1.4, -0.14);
+        let at = slung_at(muzzle, (lo, hi), point, (right, up), 0).unwrap();
+        let barrel = (at.transform_point3(muzzle) - at.transform_point3(Vec3::ZERO)).normalize();
+        // Nearly straight down, its muzzle toward her left hip.
+        assert!(barrel.y < -0.95 && barrel.dot(right) < 0.0, "{barrel}");
+        // From the base of her neck down past her hips, all of it behind
+        // her.
+        let corners: Vec<Vec3> = (0..8)
+            .map(|k| {
+                let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
+                at.transform_point3(Vec3::new(
+                    pick(1, lo.x, hi.x),
+                    pick(2, lo.y, hi.y),
+                    pick(4, lo.z, hi.z),
+                ))
+            })
+            .collect();
+        let top = corners.iter().map(|c| c.y).fold(f32::MIN, f32::max);
+        let bottom = corners.iter().map(|c| c.y).fold(f32::MAX, f32::min);
+        assert!(top > 1.5 && top < 1.6, "{top}");
+        assert!(bottom > 0.6 && bottom < 0.8, "{bottom}");
+        assert!(corners.iter().all(|c| c.z < point.z - 0.02), "{corners:?}");
+        // On her left the same way, its top to her left.
+        let left = slung_at(muzzle, (lo, hi), point + Vec3::X * 0.2, (right, up), 1).unwrap();
+        assert!(left.transform_vector3(Vec3::Y).dot(right) < -0.9);
+        assert!(at.transform_vector3(Vec3::Y).dot(right) > 0.9);
+    }
+
+    #[test]
+    fn her_back_runs_up_her_spine() {
+        // Her bind pose (the rig round 98 listed), facing +z: the attach
+        // points high behind her spine, which runs up to her neck.
+        let arsenal = Arsenal {
+            back: [Some(0), Some(1)],
+            spine: Some(2),
+            neck: Some(3),
+            ..Arsenal::default()
+        };
+        let at = |x: f32, y: f32, z: f32| Mat4::from_translation(Vec3::new(x, y, z));
+        let nodes = [
+            at(-0.084, 1.396, -0.186),
+            at(0.084, 1.396, -0.186),
+            at(0.0, 1.065, -0.025),
+            at(0.0, 1.547, -0.053),
+        ];
+        let body = Mat4::from_translation(Vec3::new(5.0, 2.0, 0.0));
+        let (point, (right, up)) = arsenal.back_at(body, &nodes, 0).unwrap();
+        assert!(
+            point.distance(Vec3::new(4.916, 3.396, -0.186)) < 1e-4,
+            "{point}"
+        );
+        assert!(right.normalize().dot(Vec3::NEG_X) > 0.999, "{right}");
+        // Up, leaning back no more than her spine does (not the 26
+        // degrees from her lower spine to the attach points).
+        let up = up.normalize();
+        assert!(up.y > 0.99 && up.z < 0.0, "{up}");
+        // A weapon slung there hangs behind her, not by her side.
+        let muzzle = Vec3::new(0.0, 0.05, 0.5);
+        let bounds = (Vec3::new(-0.04, -0.15, -0.3), Vec3::new(0.04, 0.08, 0.55));
+        let slung = slung_at(muzzle, bounds, point, (right, up), 0).unwrap();
+        let lower = slung.transform_point3(muzzle);
+        assert!(lower.z < -0.15 && lower.y < 3.0, "{lower}");
+        // The short one's top at the base of her neck; a long one (the
+        // RPG's 1.28 m) reaches further down, and up no higher than her
+        // head.
+        let long = (Vec3::new(-0.05, -0.15, -0.5), Vec3::new(0.05, 0.15, 0.78));
+        let raised = slung_at(muzzle, long, point, (right, up), 0).unwrap();
+        let (short, longer) = (heights(slung, bounds), heights(raised, long));
+        assert!(
+            (short.1 - (point.y + SLUNG_TOP)).abs() < 0.02,
+            "{short:?} {point}"
+        );
+        assert!(
+            longer.0 < short.0 - 0.1 && longer.1 < short.1 + 0.2,
+            "{short:?} {longer:?}"
+        );
+        assert!(
+            (longer.0 - (point.y - SLUNG_FLOOR)).abs() < 0.02,
+            "{longer:?} {point}"
+        );
+    }
+
+    /// The lowest and highest a model's box `(lo, hi)` reaches placed by
+    /// `m`.
+    fn heights(m: Mat4, (lo, hi): (Vec3, Vec3)) -> (f32, f32) {
+        box_corners(m, (lo, hi))
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), c| (a.min(c.y), b.max(c.y)))
+    }
+
+    /// A model's box `(lo, hi)`'s corners placed by `m`.
+    fn box_corners(m: Mat4, (lo, hi): (Vec3, Vec3)) -> Vec<Vec3> {
+        (0..8)
+            .map(|k| {
+                let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
+                m.transform_point3(Vec3::new(
+                    pick(1, lo.x, hi.x),
+                    pick(2, lo.y, hi.y),
+                    pick(4, lo.z, hi.z),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_slung_weapon_hangs_along_its_length_whatever_its_muzzle() {
+        // An RPG as round 99 had it: 1.28 m long down its z, its muzzle
+        // marker well above that line (the line from its grip to the
+        // marker runs 20 degrees off its length), on her right.
+        let (right, up) = (Vec3::NEG_X, Vec3::Y);
+        let muzzle = Vec3::new(0.0, 0.22, 0.6);
+        let bounds = (Vec3::new(-0.055, -0.15, -0.5), Vec3::new(0.055, 0.15, 0.78));
+        let point = Vec3::new(-0.084, 1.396, -0.186);
+        let at = slung_at(muzzle, bounds, point, (right, up), 0).unwrap();
+        // Its length straight down her back but for the lean, its muzzle
+        // end down.
+        let along = at.transform_vector3(Vec3::Z);
+        assert!(along.y < -0.98, "{along}");
+        // Across her back no wider than the lean takes it (round 99's
+        // spread 0.9 m from her left to her right), right of her spine.
+        let across: Vec<f32> = box_corners(at, bounds)
+            .iter()
+            .map(|c| c.dot(right))
+            .collect();
+        let (least, most) = across
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        assert!(most - least < 0.55, "{least} {most}");
+        assert!(least + most > 0.0, "{least} {most}");
+        // Up to about the top of her head, no higher (round 100's stood
+        // 0.3 m over it), and down to just past her knee, not her shin.
+        let (bottom, top) = heights(at, bounds);
+        assert!(bottom > 0.35 && top > 1.6 && top < 1.75, "{bottom} {top}");
+    }
+
+    #[test]
+    fn the_weapons_she_carries_but_doesnt_hold_hang_on_her_back() {
+        let mut combat = Combat::default();
+        // The first contract's start: the carbine alone, up.
+        combat.carbine_only();
+        assert_eq!(combat.slung(true), [None, None]);
+        // The crate's grenade launcher, up: the carbine on her back.
+        combat.equip(Weapon::GrenadeLauncher, 18);
+        assert_eq!(combat.slung(true), [Some(Weapon::Rifle), None]);
+        // The carbine up again: the launcher on her back, on her right as
+        // the carbine was.
+        combat.weapon = Weapon::Rifle;
+        assert_eq!(combat.slung(true), [Some(Weapon::GrenadeLauncher), None]);
+        // The designator in her hands: both.
+        assert_eq!(
+            combat.slung(false),
+            [Some(Weapon::Rifle), Some(Weapon::GrenadeLauncher)]
+        );
+    }
+
+    #[test]
+    fn a_tank_fires_no_more_shells_than_its_cannon_carries() {
+        use m2_engine::VehicleSpec;
+        use m2_engine::tuning::{GunTuning, VehicleTuning};
+        use m2_engine::vehicle::WheelSpec;
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let wheel = |x: f32, z: f32| WheelSpec {
+            centre: Vec3::new(x, 0.4, z),
+            radius: 0.4,
+            width: 0.4,
+            steers: false,
+        };
+        let hull = (Vec3::new(-1.5, 0.0, -3.0), Vec3::new(1.5, 2.0, 3.0));
+        // Its cannon carries two shells and could fire ten a second.
+        let gun = GunTuning {
+            weapon: 1,
+            rate_of_fire: 600.0,
+            rounds: 2,
+            velocity: 72.0,
+            max_velocity: 72.0,
+            gravity_scale: 1.0,
+            flash: None,
+            sound_bank: None,
+        };
+        let spec = VehicleSpec {
+            model: 1,
+            kind: "tank".into(),
+            label: "test".into(),
+            wheels: vec![
+                wheel(-1.3, 2.0),
+                wheel(1.3, 2.0),
+                wheel(-1.3, -2.0),
+                wheel(1.3, -2.0),
+            ],
+            bounds: hull,
+            seat: None,
+            door: None,
+            tracked: true,
+            road_wheels: Vec::new(),
+            rest: Vec::new(),
+            node_wheel: Vec::new(),
+            mass: 32_000.0,
+            turret: Vec::new(),
+            pivot: None,
+            muzzle: Some(Vec3::new(0.0, 2.2, 5.0)),
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
+            hull,
+            turret_box: None,
+            tuning: VehicleTuning {
+                gun: Some(gun),
+                ..VehicleTuning::default()
+            },
+        };
+        let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        physics.step(dt);
+        let mut vehicles = vec![ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: None,
+            spot: None,
+            turret: 0.0,
+            gun: 0.0,
+            rolled: 0.0,
+            fired: 0,
+        }];
+        assert_eq!(vehicles[0].rounds(), Some(2));
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        player.driving = Some(0);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut combat = Combat::default();
+        let fire = Trigger {
+            fire: true,
+            ..Trigger::default()
+        };
+        // Two seconds of holding the trigger: two shells, then none.
+        let mut shots = 0;
+        for _ in 0..120 {
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            combat.step(&mut field, fire, dt);
+            let sounds = combat.take_sounds();
+            shots += sounds
+                .iter()
+                .filter(|s| matches!(s, Sound::Cannon(_)))
+                .count();
+        }
+        assert_eq!(shots, 2);
+        assert_eq!(vehicles[0].rounds(), Some(0));
+        // A car's gun (none here) doesn't count.
+        vehicles[0].spec.kind = "car".into();
+        vehicles[0].spec.tuning.gun = None;
+        assert_eq!(vehicles[0].rounds(), None);
     }
 
     #[test]

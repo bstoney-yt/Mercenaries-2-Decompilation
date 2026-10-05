@@ -17,7 +17,7 @@ use crate::game::{Game, can_get_out, get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
-use crate::support::Phase;
+use crate::support::{PDA_CLOSE, PDA_OPEN, Phase};
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
@@ -83,6 +83,11 @@ const STUCK: f32 = 3.0;
 const SIDESTEP: f32 = 1.2;
 const HOP_AFTER: f32 = 25.0;
 const HOP: f32 = 25.0;
+/// Coming closer counts towards the hop only once she has also gone this
+/// far (metres) from where she last did: the way's length wobbles by a
+/// few metres as it is planned again while she stands still (round 98's
+/// 1 to 6 m put her hop off by up to a minute twice).
+const HEADWAY_MOVE: f32 = 4.0;
 /// A hop along her way goes at least this far, metres; a way ending
 /// nearer than that is passed over for the place itself.
 const HOP_LEAST: f32 = 8.0;
@@ -147,6 +152,18 @@ const OPEN_NEAR: f32 = 40.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
 const OPEN_FOR: f32 = 45.0;
+/// A vehicle being brought to a drop point this near (metres) is waited
+/// for this far from it (metres).
+const AWAIT_REACH: f32 = 300.0;
+const AWAIT_FROM: f32 = 15.0;
+/// She looks at her PDA at least this long before shutting it, at most
+/// this long (seconds).
+const PDA_LOOK: f32 = 2.0;
+const PDA_MOST: f32 = 15.0;
+/// She opens it this long after the scripts begin waiting for that
+/// (seconds): they put its prompt up two seconds after taking the last
+/// line down (round 96), and she reads it first.
+const PDA_PROMPT: f32 = 3.0;
 /// Seconds between lines saying how she is getting on.
 const REPORT: f32 = 15.0;
 
@@ -202,6 +219,10 @@ pub struct Autoplay {
     what: String,
     /// The closest she has come to the goal (metres), and when.
     best: (f32, f32),
+    /// Where she was when she last came closer having gone
+    /// [`HEADWAY_MOVE`] from the time before, and when: the hop waits on
+    /// this.
+    moved: Option<(Vec3, f32)>,
     /// When she got to the place she is after, if she has.
     arrived: Option<f32>,
     /// The place she waits at (the scripts' object), and since when:
@@ -251,6 +272,12 @@ pub struct Autoplay {
     /// and the support's step last logged.
     tapped: bool,
     support_logged: &'static str,
+    /// When she opened her PDA, while it is open; seconds since she last
+    /// pressed its key; when the scripts began waiting for it to open,
+    /// while they wait.
+    pda_since: Option<f32>,
+    pda_pressed: f32,
+    pda_asked: Option<f32>,
 }
 
 impl Autoplay {
@@ -262,10 +289,12 @@ impl Autoplay {
         game: &mut Game,
         marks: &[Mark],
         objectives: &[String],
+        awaited: &[String],
         dt: f32,
     ) -> Intent {
         self.clock += dt;
         self.pressed += dt;
+        self.pda_pressed += dt;
         if objectives != self.objectives.as_slice() {
             eprintln!("autoplay {:.1} s: objectives {objectives:?}", self.clock);
             self.objectives = objectives.to_vec();
@@ -286,6 +315,28 @@ impl Autoplay {
             None => self.leave = false,
         }
         self.ground(game);
+        // The scripts wait for her to look at her PDA (the first contract,
+        // at the first gate): she opens it, and shuts it again.
+        let wants = |name: &str| awaited.iter().any(|a| a == name);
+        let asked = wants(PDA_OPEN)
+            && game.support.phase == Phase::Idle
+            && game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_none());
+        self.pda_asked = asked.then(|| self.pda_asked.unwrap_or(self.clock));
+        if !game.support.pda
+            && self
+                .pda_asked
+                .is_some_and(|since| self.clock - since < PDA_PROMPT)
+        {
+            // Its prompt isn't up yet: she waits for it.
+            return Intent::default();
+        }
+        if game.support.pda || asked {
+            return self.pda(game.support.pda, wants(PDA_CLOSE));
+        }
         let chosen = self.choose(game, marks);
         let changed = match (&chosen, &self.goal) {
             (Some((a, _)), Some(b)) => !a.same(b),
@@ -302,7 +353,7 @@ impl Autoplay {
                 self.what,
                 game.focus()
             );
-            self.best = (f32::INFINITY, self.clock);
+            self.fresh_headway();
             self.arrived = None;
             self.steady = 0.0;
             self.sidestep = None;
@@ -500,6 +551,28 @@ impl Autoplay {
                     format!("waiting by {} for it to come", m.name),
                 )
             });
+        }
+        // A vehicle on its way to her (hanging from a delivery's
+        // helicopter): on foot she waits near where it is to be put down,
+        // out from under it, and takes it once it is (the tank brought for
+        // the last leg; a ride of hers would carry her past it).
+        if driving.is_none()
+            && let Some((load, drop)) = game
+                .scene
+                .flights
+                .bringing()
+                .into_iter()
+                .filter(|(_, to)| to.distance(here) < AWAIT_REACH)
+                .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+        {
+            let at = drop + (here - drop).with_y(0.0).normalize_or(Vec3::X) * AWAIT_FROM;
+            return Some((
+                Goal::Reach { target: load, at },
+                format!(
+                    "waiting for the vehicle {load:#x} being brought to {drop:.0}, {:.0} m off",
+                    drop.distance(here)
+                ),
+            ));
         }
         // Places to get to (not the vehicle she is in): those marked, else
         // the objectives' on the map or radar.
@@ -864,7 +937,7 @@ impl Autoplay {
                     self.tried.push(s);
                 }
                 self.blocked = 0.0;
-                self.best = (f32::INFINITY, self.clock);
+                self.fresh_headway();
                 self.vantage = game
                     .scene
                     .world
@@ -967,6 +1040,36 @@ impl Autoplay {
     /// [`CALL_FROM`] off she calls the bomb as a player would (the support
     /// key, the use key, the view steered over it and confirmed, the
     /// wheel pressed in each wedge), then waits out of its reach.
+    /// At her PDA: opened, looked at for [`PDA_LOOK`] seconds and shut
+    /// once the scripts wait for that (else after [`PDA_MOST`]).
+    fn pda(&mut self, open: bool, close_awaited: bool) -> Intent {
+        let press = match open {
+            false => true,
+            true => {
+                let looked = self.clock - *self.pda_since.get_or_insert(self.clock);
+                (close_awaited && looked > PDA_LOOK) || looked > PDA_MOST
+            }
+        } && self.pda_pressed > PRESS_GAP;
+        if press {
+            self.pda_pressed = 0.0;
+            if open {
+                self.pda_since = None;
+            }
+            eprintln!(
+                "autoplay {:.1} s: {} her PDA",
+                self.clock,
+                if open { "shutting" } else { "opening" }
+            );
+        }
+        Intent {
+            trigger: Trigger {
+                pda: press,
+                ..Trigger::default()
+            },
+            ..Intent::default()
+        }
+    }
+
     fn strike(&mut self, game: &mut Game, at: Vec3, dt: f32) -> Intent {
         let flat = |a: Vec3| a.with_y(0.0).distance(at.with_y(0.0));
         if let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) {
@@ -1009,7 +1112,16 @@ impl Autoplay {
                 return self.walk(game, away, 2.0, dt);
             }
             if waiting {
-                return self.idle(game);
+                // Watching where it is to come down.
+                let look = game
+                    .scene
+                    .player
+                    .as_ref()
+                    .map_or(Vec2::ZERO, |p| aim(p, at, dt).0);
+                return Intent {
+                    look,
+                    ..Intent::default()
+                };
             }
             if d > CALL_FROM.1 {
                 return self.walk(game, at, CALL_FROM.1 - 15.0, dt);
@@ -1221,6 +1333,17 @@ impl Autoplay {
         )
     }
 
+    /// Measures headway afresh: a new goal, after a hop.
+    fn fresh_headway(&mut self) {
+        self.best = (f32::INFINITY, self.clock);
+        self.moved = None;
+    }
+
+    /// Seconds since she last made headway that counts towards the hop.
+    fn since_moved(&self) -> f32 {
+        self.clock - self.moved.map_or(self.best.1, |(_, at)| at)
+    }
+
     /// The use key, once a [`PRESS_GAP`]: stopped first when driving.
     fn press(&mut self, speed: f32) -> Intent {
         if speed.abs() > 1.0 {
@@ -1255,13 +1378,21 @@ impl Autoplay {
     fn headway(&mut self, game: &mut Game, at: Vec3, d: f32) -> bool {
         if d < self.best.0 - 1.0 {
             self.best = (d, self.clock);
+            let here = game.focus();
+            if self
+                .moved
+                .is_none_or(|(was, _)| was.distance(here) > HEADWAY_MOVE)
+            {
+                self.moved = Some((here, self.clock));
+            }
             return false;
         }
         let stuck = self.clock - self.best.1;
         if self.arrived.is_some() {
             return false;
         }
-        if stuck > HOP_AFTER {
+        let still = self.since_moved();
+        if still > HOP_AFTER {
             // Stuck driving close to the place: on foot from here.
             let driving = game.scene.player.as_ref().and_then(|p| p.driving);
             let near = (at - game.focus()).with_y(0.0).length() < RIDE_FOR;
@@ -1274,11 +1405,11 @@ impl Autoplay {
                     .is_none_or(|w| can_get_out(&w.physics, &game.scene.vehicles[i]))
             {
                 eprintln!(
-                    "autoplay {:.1} s: no headway driving for {stuck:.0} s, {d:.0} m off: getting out",
+                    "autoplay {:.1} s: no headway driving for {still:.0} s, {d:.0} m off: getting out",
                     self.clock
                 );
                 self.leave = true;
-                self.best = (f32::INFINITY, self.clock);
+                self.fresh_headway();
                 return false;
             }
             // Ahead along her way, else (a way that ends where she is:
@@ -1291,7 +1422,7 @@ impl Autoplay {
                 .map(|w| w.route.steer(from, HOP).0)
                 .filter(|to| (*to - from).with_y(0.0).length() >= HOP_LEAST)
                 .unwrap_or(at);
-            self.hop(game, to, stuck);
+            self.hop(game, to, still);
             return true;
         }
         if stuck > STUCK && self.sidestep.is_none() && (stuck % STUCK) < 0.05 {
@@ -1405,7 +1536,7 @@ impl Autoplay {
             self.clock, self.what
         );
         self.hops.push((from, to));
-        self.best = (f32::INFINITY, self.clock);
+        self.fresh_headway();
         self.sidestep = None;
         self.reversing = None;
         self.way = None;
@@ -1454,15 +1585,23 @@ impl Autoplay {
             .driving
             .and_then(|i| game.scene.vehicles.get(i))
             .map(|v| format!("driving the {}", v.spec.label));
+        // What may hold her still (round 97's tank stood 125 s).
+        let mut holding = String::new();
+        if let Some(since) = self.arrived {
+            holding += &format!("; there {:.0} s", self.clock - since);
+        }
+        if game.support.busy() {
+            holding += &format!("; support {:?}", game.support.phase);
+        }
         eprintln!(
-            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, {}; closest {:.0} m, {:.0} s ago; {} hops",
+            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, {}; closest {:.0} m, {:.0} s ago; {} hops{holding}",
             self.clock,
             game.focus(),
             riding.unwrap_or_else(|| "on foot".to_owned()),
             game.combat.hp,
             self.what,
             self.best.0,
-            self.clock - self.best.1,
+            self.since_moved(),
             self.hops.len()
         );
     }

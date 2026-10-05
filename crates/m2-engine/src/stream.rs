@@ -572,6 +572,41 @@ impl World {
         self.knocked.len()
     }
 
+    /// The placed objects drawn from `eye` (in range, loaded, as they
+    /// stand) whose model's box covers `spot` from above, give or take
+    /// `pad` metres: each one's model, place and box size. What stands at
+    /// a mission's gate besides the gate (round 99's broken gates still
+    /// showed an arch and doors).
+    pub fn covering(&self, spot: Vec3, eye: Vec3, pad: f32) -> Vec<(u32, Vec3, Vec3)> {
+        let (reach, props) = (self.settings.object_distance, self.settings.prop_distance);
+        let mut out = Vec::new();
+        for (i, o) in self.index.objects.iter().enumerate() {
+            let d = o.position.distance(eye);
+            let Some(Slot::Ready(m)) = self.models.get(&o.model) else {
+                continue;
+            };
+            if d > if o.named {
+                draw_reach(m.bounds, props)
+            } else {
+                reach
+            } || self.knocked.contains_key(&i)
+                || (self.destroyed.contains(&i) && !m.has_wreck())
+            {
+                continue;
+            }
+            let local = o.rotation.inverse() * (spot - o.position);
+            let (lo, hi) = m.bounds;
+            if local.x >= lo.x - pad
+                && local.x <= hi.x + pad
+                && local.z >= lo.z - pad
+                && local.z <= hi.z + pad
+            {
+                out.push((o.model, o.position, hi - lo));
+            }
+        }
+        out
+    }
+
     /// Requests what `eye` needs, drops what it no longer does, and uploads
     /// finished loads.
     pub fn update(

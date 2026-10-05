@@ -601,6 +601,11 @@ pub struct CpuModel {
     /// For a merged batch, the entity each member is (see
     /// [`Model::tiny_members`]); empty otherwise.
     pub tiny_members: Vec<u32>,
+    /// How it breaks apart when destroyed outright, for those who want
+    /// it ([`Breakup::of`](crate::Breakup::of)): neither
+    /// [`from_data`](Self::from_data) nor [`build`](Self::build) works it
+    /// out (the island's thousands of models have no use for it).
+    pub breakup: Option<std::sync::Arc<crate::Breakup>>,
 }
 
 /// The collision of one building of a merged batch (a `TINY` model).
@@ -729,6 +734,7 @@ impl CpuModel {
             } else {
                 Vec::new()
             },
+            breakup: None,
         }
     }
 
@@ -992,6 +998,39 @@ impl GpuModel {
                 _ => self.push(queue, piece, world, None),
             }
         }
+    }
+
+    /// As [`draw_moved`](Self::draw_moved), only the pieces on nodes
+    /// `flying` marks (a broken prop's, the rest of it gone).
+    pub fn draw_flying(&self, queue: &mut DrawQueue, world: Mat4, nodes: &[Mat4], flying: &[bool]) {
+        let marked = |p: &Piece| flying.get(usize::from(p.at)).copied().unwrap_or(false);
+        for piece in self.pieces.iter().filter(|p| marked(p)) {
+            match piece.node.and_then(|n| nodes.get(usize::from(n))) {
+                Some(&m) if piece.bones.is_empty() => self.push_at(queue, piece, world * m, None),
+                _ => self.push(queue, piece, world, None),
+            }
+        }
+    }
+
+    /// What [`draw_moved`](Self::draw_moved) draws, `wrecked` or not, with
+    /// the nodes `flying` marks: how many pieces it draws at nodes not
+    /// flying, how many at nodes flying, and how many of those it draws
+    /// are skinned (which stay put, whatever their nodes do).
+    pub fn drawn_moved(&self, wrecked: bool, flying: &[bool]) -> (usize, usize, usize) {
+        let hidden = &self.hidden[usize::from(wrecked)];
+        let at = |p: &Piece, marks: &[bool]| marks.get(usize::from(p.at)).copied().unwrap_or(false);
+        let (mut rest, mut flown, mut skinned) = (0, 0, 0);
+        for p in &self.pieces {
+            if at(p, flying) {
+                flown += 1;
+            } else if !at(p, hidden) {
+                rest += 1;
+            } else {
+                continue;
+            }
+            skinned += usize::from(!p.bones.is_empty() || p.node.is_none());
+        }
+        (rest, flown, skinned)
     }
 
     /// Whether the model has wrecked parts to show.

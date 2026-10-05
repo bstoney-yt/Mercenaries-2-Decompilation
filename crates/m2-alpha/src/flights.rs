@@ -446,6 +446,22 @@ impl Flights {
         self.flights.iter().any(|f| f.pilot == pilot)
     }
 
+    /// The vehicles the deliveries in flight are bringing (loads that
+    /// leave nothing behind, unlike a supply crate), not yet let go: each
+    /// one's guid and where it is to be put down.
+    pub fn bringing(&self) -> Vec<(u32, Vec3)> {
+        self.flights
+            .iter()
+            .filter(|f| !f.released)
+            .flat_map(|f| {
+                f.loads
+                    .iter()
+                    .filter(|l| l.leaves.is_empty())
+                    .map(move |l| (l.guid, f.to))
+            })
+            .collect()
+    }
+
     /// Whether `guid` hangs from a helicopter, not yet let go.
     pub fn carrying(&self, guid: u32) -> bool {
         self.flights
