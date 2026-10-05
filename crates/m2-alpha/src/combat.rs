@@ -23,6 +23,10 @@ const LEFT_HAND: u32 = 0xeb6f_1b2d;
 /// (`Bone_Attach_RHand`, `bone_attach_lhand`): where a weapon's grip goes.
 const RIGHT_ATTACH: u32 = 0xf450_ed0d;
 const LEFT_ATTACH: u32 = 0xfa76_1573;
+/// The attach points high on her back, right and left
+/// (`Bone_Attach_BackRight`, `Bone_Attach_BackLeft`): where the weapons
+/// she carries but doesn't hold hang.
+const BACK_ATTACH: [u32; 2] = [0x3846_cb35, 0xdf2d_0826];
 
 /// Weapons drawn on the right hand's attach node turned as the node is
 /// posed (the default: the grip sits in her palm, round 78), rather than
@@ -177,6 +181,8 @@ pub struct Arsenal {
     /// The right hand's node in the human skeleton, and its attach point.
     pub hand: Option<usize>,
     pub attach: Option<usize>,
+    /// The attach points on her back, right and left ([`BACK_ATTACH`]).
+    pub back: [Option<usize>; 2],
 }
 
 impl Arsenal {
@@ -190,6 +196,7 @@ impl Arsenal {
         if let Some(r) = rig {
             self.hand = r.rifle_hand();
             self.attach = right_attach(&r.skeleton);
+            self.back = BACK_ATTACH.map(|h| node(&r.skeleton, h));
         }
         let w = Some(WeaponModel {
             model,
@@ -209,6 +216,15 @@ impl Arsenal {
             "detonator" => self.designator = w,
             _ => {}
         }
+    }
+
+    /// Weapon to world for one slung on the back of a character drawn at
+    /// `body` with posed node matrices `nodes`, at the attach point of
+    /// `slot` (0 her right, 1 her left): its grip on the point, turned as
+    /// the point is posed.
+    pub fn on_back(&self, body: Mat4, nodes: &[Mat4], slot: usize) -> Option<Mat4> {
+        let n = self.back.get(slot).copied().flatten()?;
+        Some(body * *nodes.get(n)?)
     }
 
     /// Weapon to world for a character drawn at `body` with posed node
@@ -787,6 +803,19 @@ impl Combat {
         }
     }
 
+    /// The weapons she carries but doesn't hold, which hang on her back:
+    /// the rifle on her right unless it is up in her hands, and what she
+    /// carries in the launcher's place on her left unless that is (with
+    /// `in_hand` false, her hands hold something else: a grenade, the
+    /// designator).
+    pub fn slung(&self, in_hand: bool) -> [Option<Weapon>; 2] {
+        let up = |w: Weapon| in_hand && self.weapon == w;
+        [
+            Some(Weapon::Rifle).filter(|&w| !up(w)),
+            self.second.filter(|&w| !up(w)),
+        ]
+    }
+
     /// Whether the weapon in the launcher's place can fire: the RPG
     /// always, a grenade launcher with rounds left.
     pub fn second_loaded(&self) -> bool {
@@ -1266,6 +1295,10 @@ impl Combat {
         let (Some(id), Some(muzzle), false) = (v.id, v.spec.muzzle, v.wrecked) else {
             return;
         };
+        // A cannon with no shells left is silent.
+        if v.rounds() == Some(0) {
+            return;
+        }
         let Some(body) = f.physics.vehicle_transform(id) else {
             return;
         };
@@ -1301,6 +1334,9 @@ impl Combat {
                 shell: true,
                 owner: Some(id),
             });
+            if let Some(v) = f.vehicles.get_mut(i) {
+                v.fired += 1;
+            }
             self.effect(
                 Effect::Flash {
                     at: from,
@@ -2081,6 +2117,132 @@ mod tests {
         let s = combat.struck.first().copied().expect("struck");
         assert_eq!(s.key, Some(StaticKey::Entity(7)));
         assert!(s.at.y < 0.8 && s.damage >= 100.0, "{s:?}");
+    }
+
+    #[test]
+    fn the_weapons_she_carries_but_doesnt_hold_hang_on_her_back() {
+        let mut combat = Combat::default();
+        // The first contract's start: the carbine alone, up.
+        combat.carbine_only();
+        assert_eq!(combat.slung(true), [None, None]);
+        // The crate's grenade launcher, up: the carbine on her back.
+        combat.equip(Weapon::GrenadeLauncher, 18);
+        assert_eq!(combat.slung(true), [Some(Weapon::Rifle), None]);
+        // The carbine up again: the launcher on her back.
+        combat.weapon = Weapon::Rifle;
+        assert_eq!(combat.slung(true), [None, Some(Weapon::GrenadeLauncher)]);
+        // The designator in her hands: both.
+        assert_eq!(
+            combat.slung(false),
+            [Some(Weapon::Rifle), Some(Weapon::GrenadeLauncher)]
+        );
+    }
+
+    #[test]
+    fn a_tank_fires_no_more_shells_than_its_cannon_carries() {
+        use m2_engine::VehicleSpec;
+        use m2_engine::tuning::{GunTuning, VehicleTuning};
+        use m2_engine::vehicle::WheelSpec;
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let wheel = |x: f32, z: f32| WheelSpec {
+            centre: Vec3::new(x, 0.4, z),
+            radius: 0.4,
+            width: 0.4,
+            steers: false,
+        };
+        let hull = (Vec3::new(-1.5, 0.0, -3.0), Vec3::new(1.5, 2.0, 3.0));
+        // Its cannon carries two shells and could fire ten a second.
+        let gun = GunTuning {
+            weapon: 1,
+            rate_of_fire: 600.0,
+            rounds: 2,
+            velocity: 72.0,
+            max_velocity: 72.0,
+            gravity_scale: 1.0,
+            flash: None,
+            sound_bank: None,
+        };
+        let spec = VehicleSpec {
+            model: 1,
+            kind: "tank".into(),
+            label: "test".into(),
+            wheels: vec![
+                wheel(-1.3, 2.0),
+                wheel(1.3, 2.0),
+                wheel(-1.3, -2.0),
+                wheel(1.3, -2.0),
+            ],
+            bounds: hull,
+            seat: None,
+            door: None,
+            tracked: true,
+            road_wheels: Vec::new(),
+            rest: Vec::new(),
+            node_wheel: Vec::new(),
+            mass: 32_000.0,
+            turret: Vec::new(),
+            pivot: None,
+            muzzle: Some(Vec3::new(0.0, 2.2, 5.0)),
+            gun: Vec::new(),
+            gun_pivot: None,
+            muzzle_on_gun: false,
+            elevation: (0.0, 0.0),
+            hull,
+            turret_box: None,
+            tuning: VehicleTuning {
+                gun: Some(gun),
+                ..VehicleTuning::default()
+            },
+        };
+        let id = physics.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
+        physics.step(dt);
+        let mut vehicles = vec![ParkedVehicle {
+            spec,
+            model: crate::npc::tests::empty_model(),
+            id: Some(id),
+            wrecked: false,
+            guid: None,
+            spot: None,
+            turret: 0.0,
+            gun: 0.0,
+            rolled: 0.0,
+            fired: 0,
+        }];
+        assert_eq!(vehicles[0].rounds(), Some(2));
+        let mut player = Player::new(0.0, 0.0, 0.0, None);
+        player.driving = Some(0);
+        let mut people = People::default();
+        let arsenal = Arsenal::default();
+        let mut combat = Combat::default();
+        let fire = Trigger {
+            fire: true,
+            ..Trigger::default()
+        };
+        // Two seconds of holding the trigger: two shells, then none.
+        let mut shots = 0;
+        for _ in 0..120 {
+            let mut field = Field {
+                physics: &mut physics,
+                player: &mut player,
+                people: &mut people,
+                vehicles: &mut vehicles,
+                arsenal: &arsenal,
+                explosives: &mut [],
+            };
+            combat.step(&mut field, fire, dt);
+            let sounds = combat.take_sounds();
+            shots += sounds
+                .iter()
+                .filter(|s| matches!(s, Sound::Cannon(_)))
+                .count();
+        }
+        assert_eq!(shots, 2);
+        assert_eq!(vehicles[0].rounds(), Some(0));
+        // A car's gun (none here) doesn't count.
+        vehicles[0].spec.kind = "car".into();
+        vehicles[0].spec.tuning.gun = None;
+        assert_eq!(vehicles[0].rounds(), None);
     }
 
     #[test]
