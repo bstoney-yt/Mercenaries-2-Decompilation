@@ -2,11 +2,12 @@
 //!
 //! The world draws into a floating-point target; this pass takes its bright
 //! parts down to a quarter-size image, blurs them, and adds them back over
-//! the scene, scaled by exposure and grade, into the frame. The game runs
-//! a post chain of this kind (a luminance tone map, bloom and depth of
-//! field, with `Bloom*` and `Tone_*` settings in its atmosphere); its
-//! exact curve is not known, so this one is plain: light above a
-//! threshold glows, everything is scaled, and the frame clamps at white.
+//! the scene, scaled by exposure, contrast, saturation and grade, into the
+//! frame. The game runs a post chain of this kind (a luminance tone map,
+//! bloom and depth of field, with `Bloom*` and `Tone_*` settings in its
+//! atmosphere); its exact curve is not known, so this one is plain: light
+//! above a threshold glows, everything is scaled, and the frame clamps at
+//! white. Contrast and saturation are set to match footage of the game.
 //!
 //! # Provenance
 //!
@@ -26,6 +27,8 @@ struct Post {
     grade: vec4<f32>,
     // xy: sampling step in texture coordinates
     step: vec4<f32>,
+    // x: contrast, y: saturation, z: the luminance contrast pivots on
+    tone: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> post: Post;
@@ -84,6 +87,13 @@ fn fs_blur(v: Screen) -> @location(0) vec4<f32> {
 fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
     var c = textureSampleLevel(source, linear, v.uv, 0.0).rgb * post.params.x;
     c = c + textureSampleLevel(glow, linear, v.uv, 0.0).rgb * post.params.z;
+    // Contrast on luminance about a mid grey, keeping each colour's hue,
+    // then saturation.
+    let y = luminance(c);
+    let pivot = post.tone.z;
+    let toned = pivot * pow(max(y, 0.0) / pivot, post.tone.x);
+    c = c * (toned / max(y, 1e-5));
+    c = max(mix(vec3<f32>(toned), c, post.tone.y), vec3<f32>(0.0));
     return vec4<f32>(c * post.grade.rgb, 1.0);
 }
 "#;
@@ -94,6 +104,7 @@ struct Uniforms {
     params: [f32; 4],
     grade: [f32; 4],
     step: [f32; 4],
+    tone: [f32; 4],
 }
 
 /// The passes, in order: bright, blur across, blur down, composite.
@@ -347,6 +358,7 @@ impl Post {
                 },
                 grade,
                 step: [step[0], step[1], 0.0, 0.0],
+                tone: [lighting.contrast, lighting.saturation, 0.18, 0.0],
             };
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(&u));
         }

@@ -45,10 +45,10 @@ pub struct Atmosphere {
     pub extinction: f32,
     pub mie: f32,
     pub hg_g: f32,
-    /// `Tone_R`, `Tone_G`, `Tone_B`: a colour grade, probably (not used yet).
+    /// `Tone_R`, `Tone_G`, `Tone_B`: a colour grade, probably.
     pub tone: Vec3,
     /// `BloomAmount`, `BloomMultiplier`, `BloomThreshold`,
-    /// `BloomBlurRadius` (not used yet).
+    /// `BloomBlurRadius` (the radius is not used yet).
     pub bloom: [f32; 4],
     /// `LightTime` and `LightTimeSpeed`: the time of day, probably.
     pub light_time: [f32; 2],
@@ -105,14 +105,19 @@ impl Atmosphere {
         })
     }
 
-    /// Puts the ambient cube, sunlight strength and rim light into
-    /// `lighting`.
+    /// Puts the ambient cube, sunlight strength, rim light, haze, bloom
+    /// and grade into `lighting`.
     pub fn apply(&self, lighting: &mut Lighting) {
         lighting.ambient_cube = self.ambient_cube;
         lighting.rim_color = self.rim;
         lighting.rim_threshold = self.rim_threshold;
         lighting.sun_color = Lighting::default().sun_color * self.light_intensity;
         lighting.haze = self.haze();
+        // `BloomAmount` times `BloomMultiplier` above `BloomThreshold`, and
+        // `Tone_*` as the grade (inferred from the names).
+        lighting.bloom = self.bloom[0] * self.bloom[1];
+        lighting.bloom_threshold = self.bloom[2];
+        lighting.grade = self.tone;
     }
 
     /// The haze these settings describe: Hoffman and Preetham's standard

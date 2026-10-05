@@ -213,20 +213,23 @@ fn sunlight(p: vec3<f32>, n: vec3<f32>) -> f32 {
 
 // The sea's waves: direction (radians), wavelength and amplitude (metres).
 // The game's water shader sums eight such waves (two sets of four) whose
-// constants its code sets at run time; these are invented to look calm.
+// constants its code sets at run time; these are invented to look calm,
+// spread around a wind from one side so no crest runs straight for long.
 var<private> WAVES: array<vec3<f32>, 8> = array<vec3<f32>, 8>(
-    vec3<f32>(0.3, 31.0, 0.35),
-    vec3<f32>(0.9, 19.0, 0.2),
-    vec3<f32>(-0.4, 12.0, 0.12),
-    vec3<f32>(1.6, 7.3, 0.07),
-    vec3<f32>(0.1, 4.1, 0.04),
-    vec3<f32>(2.4, 2.6, 0.025),
-    vec3<f32>(-1.1, 1.6, 0.015),
-    vec3<f32>(0.7, 0.9, 0.008),
+    vec3<f32>(0.3, 31.0, 0.3),
+    vec3<f32>(1.15, 23.0, 0.2),
+    vec3<f32>(-0.55, 13.0, 0.11),
+    vec3<f32>(0.75, 8.7, 0.06),
+    vec3<f32>(-0.15, 5.3, 0.035),
+    vec3<f32>(1.7, 3.1, 0.022),
+    vec3<f32>(-1.2, 1.9, 0.013),
+    vec3<f32>(0.45, 1.1, 0.007),
 );
 
 // The sea's normal at p (world x, z) after t seconds. Waves too short for
-// a pixel `footprint` metres wide fade out, as the game's do.
+// a pixel `footprint` metres wide fade out, as the game's do, well before
+// they would alias into stripes. Each wave's height swells and falls over
+// a few hundred metres so the pattern doesn't repeat evenly.
 fn sea_normal(p: vec2<f32>, t: f32, footprint: f32) -> vec3<f32> {
     var slope = vec2<f32>(0.0);
     for (var i = 0u; i < 8u; i = i + 1u) {
@@ -234,9 +237,12 @@ fn sea_normal(p: vec2<f32>, t: f32, footprint: f32) -> vec3<f32> {
         let dir = vec2<f32>(cos(w.x), sin(w.x));
         let k = 6.2831853 / w.y;
         // Deep water: speed follows wavelength.
-        let theta = k * dot(dir, p) - sqrt(9.81 * k) * t;
-        let fade = clamp(2.0 - 4.0 * footprint / w.y, 0.0, 1.0);
-        slope = slope + dir * (w.z * k * fade * cos(theta));
+        let theta = k * dot(dir, p) - sqrt(9.81 * k) * t + f32(i) * 1.7;
+        let fade = clamp(2.0 - 8.0 * footprint / w.y, 0.0, 1.0);
+        let across = vec2<f32>(-dir.y, dir.x);
+        let swell = 0.65 + 0.35 * sin(dot(p, across) * (0.021 + 0.004 * f32(i)) + f32(i) * 2.3)
+            * sin(dot(p, dir) * 0.013 - t * 0.05 + f32(i));
+        slope = slope + dir * (w.z * k * fade * swell * cos(theta));
     }
     return normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
 }
