@@ -105,6 +105,34 @@ pub struct Lighting {
     pub saturation: f32,
     /// The air between the eye and what it sees, and the sky.
     pub haze: Haze,
+    /// Clouds over the sky.
+    pub clouds: Clouds,
+}
+
+/// Clouds drawn over the sky from a tiling noise texture, as the game's
+/// cloud shaders build them: three layers of noise at different scales
+/// drifting with the wind, summed and cut off by `coverage`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Clouds {
+    /// Four channels of tiling noise; `None` draws no clouds.
+    pub noise: Option<crate::TextureHandle>,
+    /// How much of the sky is cloud, 0 to 1.
+    pub coverage: f32,
+    /// How many times each layer repeats the noise over the same span.
+    pub scales: [f32; 3],
+    /// The way the clouds drift (x, z).
+    pub wind: [f32; 2],
+}
+
+impl Default for Clouds {
+    fn default() -> Self {
+        Self {
+            noise: None,
+            coverage: 0.0,
+            scales: [1.0; 3],
+            wind: [1.0, 0.0],
+        }
+    }
 }
 
 /// Light scattering in the air, after Hoffman and Preetham as the game's
@@ -177,6 +205,7 @@ impl Default for Lighting {
             contrast: 1.0,
             saturation: 1.0,
             haze: Haze::default(),
+            clouds: Clouds::default(),
         }
     }
 }

@@ -581,9 +581,13 @@ impl Game {
             Some(p) => p.view(fov, aspect),
             None => self.camera.view(fov, aspect),
         };
-        // The island's own ambient light and sunlight strength.
-        if let Some(a) = self.scene.world.as_ref().and_then(|w| w.index.atmosphere) {
-            a.apply(&mut view.lighting);
+        // The island's own ambient light, sunlight strength, haze and
+        // clouds.
+        if let Some(world) = &self.scene.world {
+            if let Some(a) = world.index.atmosphere {
+                a.apply(&mut view.lighting);
+            }
+            view.lighting.clouds.noise = world.cloud_noise;
         }
         finish(&mut view.lighting);
         post_override(&mut view.lighting);

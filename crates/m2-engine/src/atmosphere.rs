@@ -52,6 +52,12 @@ pub struct Atmosphere {
     pub bloom: [f32; 4],
     /// `LightTime` and `LightTimeSpeed`: the time of day, probably.
     pub light_time: [f32; 2],
+    /// `Coverage`: how much of the sky is cloud.
+    pub coverage: f32,
+    /// `Layer1_Scale`..`Layer3_Scale`: the cloud noise layers' scales.
+    pub cloud_scales: [f32; 3],
+    /// `WindDirection_X`, `WindDirection_Y`: the way the clouds drift.
+    pub wind: [f32; 2],
 }
 
 impl Atmosphere {
@@ -102,11 +108,16 @@ impl Atmosphere {
             ]
             .map(|n| float(rec, n).unwrap_or(0.0)),
             light_time: ["LightTime", "LightTimeSpeed"].map(|n| float(rec, n).unwrap_or(0.0)),
+            coverage: float(rec, "Coverage").unwrap_or(0.0),
+            cloud_scales: ["Layer1_Scale", "Layer2_Scale", "Layer3_Scale"]
+                .map(|n| float(rec, n).unwrap_or(1.0)),
+            wind: ["WindDirection_X", "WindDirection_Y"].map(|n| float(rec, n).unwrap_or(0.0)),
         })
     }
 
-    /// Puts the ambient cube, sunlight strength, rim light, haze, bloom
-    /// and grade into `lighting`.
+    /// Puts the ambient cube, sunlight strength, rim light, haze, bloom,
+    /// grade and cloud settings into `lighting` (not the cloud noise
+    /// texture, which the world loads).
     pub fn apply(&self, lighting: &mut Lighting) {
         lighting.ambient_cube = self.ambient_cube;
         lighting.rim_color = self.rim;
@@ -118,6 +129,9 @@ impl Atmosphere {
         lighting.bloom = self.bloom[0] * self.bloom[1];
         lighting.bloom_threshold = self.bloom[2];
         lighting.grade = self.tone;
+        lighting.clouds.coverage = self.coverage;
+        lighting.clouds.scales = self.cloud_scales;
+        lighting.clouds.wind = self.wind;
     }
 
     /// The haze these settings describe: Hoffman and Preetham's standard
