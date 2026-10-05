@@ -19,6 +19,9 @@
 //! sounds:<bank>[,<bank>..]  each sound: length, and loudness (dB) and
 //!                           zero crossings (a pitch guide, per second)
 //!                           over its tenths; its name if found
+//! hashes:<bank>[,<bank>..]  each sound in a line: index, name hash,
+//!                           length; its name if found (for searching
+//!                           names away from the install)
 //! rig[:<model>]             a skeleton's nodes (default Jennifer): name,
 //!                           parent, rest place; what hangs off the hands
 //! weapons                   the hand weapons' nodes and bounds
@@ -679,6 +682,7 @@ fn main() -> Result<(), Error> {
             }),
             "banks" => banks(&mut source, &names),
             "sounds" => sounds(&mut source, &names, arg),
+            "hashes" => hashes(&mut source, &names, arg),
             "rig" => rig(&mut source, &names, hex(arg).unwrap_or(DEFAULT_MODEL)),
             "weapons" => weapons(&mut source, &mut lazy, &names),
             "clips" => clips(&mut source, &names, arg),
@@ -1072,6 +1076,31 @@ fn sounds<R: Read + Seek>(
                 s.seconds(),
                 loud.join(""),
                 zcr.join("")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn hashes<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let banks: Vec<&str> = arg.split(',').filter(|b| !b.is_empty()).collect();
+    let library = SoundLibrary::load(source, &banks)?;
+    for bank in &banks {
+        let sounds = library.bank(bank);
+        println!("bank {bank}: {} sounds", sounds.len());
+        for (i, s) in sounds.iter().enumerate() {
+            println!(
+                "  #{i} {:08x} {:.2}{}",
+                s.hash,
+                s.seconds(),
+                names
+                    .get(s.hash)
+                    .map(|n| format!(" {n}"))
+                    .unwrap_or_default()
             );
         }
     }
