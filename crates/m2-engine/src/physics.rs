@@ -157,8 +157,13 @@ impl LoosePiece {
 
     /// How big it is: its box's diagonal, metres.
     pub fn size(&self) -> f32 {
+        self.extent().length()
+    }
+
+    /// Its box's sides along its node's axes, metres.
+    pub fn extent(&self) -> Vec3 {
         let b = self.shape.compute_local_aabb();
-        (vec3(b.maxs) - vec3(b.mins)).length()
+        vec3(b.maxs) - vec3(b.mins)
     }
 }
 
@@ -1241,6 +1246,14 @@ impl Physics {
         ))
     }
 
+    /// How a loose piece is moving now: its velocity (m/s) and its spin
+    /// (radians a second about each world axis).
+    pub fn debris_velocity(&self, id: DebrisId) -> Option<(Vec3, Vec3)> {
+        let h = (*self.debris.get(id.0)?)?;
+        let b = self.world.bodies.get(h)?;
+        Some((vec3(b.linvel()), vec3(b.angvel())))
+    }
+
     pub fn remove_debris(&mut self, id: DebrisId) {
         if let Some(h) = self.debris.get_mut(id.0).and_then(Option::take) {
             self.world.remove_body_with_colliders(h, true);
@@ -2033,6 +2046,24 @@ impl Physics {
             .query_pipeline_with_filter(solid().predicate(&keep))
             .cast_ray_and_get_normal(&ray, max, true)
             .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
+    }
+
+    /// The height of the island's own ground straight down from `from`
+    /// within `max` metres: its terrain and placed models (roads, rocks,
+    /// buildings), passing through the state layers' models and anything
+    /// not static.
+    pub fn island_below(&self, from: Vec3, max: f32) -> Option<f32> {
+        let ray = r::Ray::new(vector(from), vector(Vec3::NEG_Y));
+        let keep = |handle: r::ColliderHandle, _: &r::Collider| {
+            matches!(
+                self.keys.get(&handle),
+                Some(StaticKey::Cell(_) | StaticKey::Object(_) | StaticKey::Member(..))
+            )
+        };
+        self.world
+            .query_pipeline_with_filter(solid().predicate(&keep))
+            .cast_ray_and_get_normal(&ray, max, true)
+            .map(|(_, hit)| from.y - hit.time_of_impact)
     }
 
     /// Moves `character` for `dt` seconds: horizontally at `walk` (m/s; its
