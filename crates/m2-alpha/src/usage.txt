@@ -71,8 +71,9 @@ m2-alpha [options]
   --autoplay             with --mission --screenshot: she plays the contract
                          herself by its markers (runs to places, shoots the
                          marked soldiers, rockets the marked gates, takes
-                         the vehicles brought), logging how it goes, until
-                         it is done or --mission-seconds are up
+                         the vehicles brought, going a way planned round
+                         walls, the sea and steep ground), logging how it
+                         goes, until it is done or --mission-seconds are up
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
