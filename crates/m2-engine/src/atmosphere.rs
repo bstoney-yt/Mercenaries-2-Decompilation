@@ -338,7 +338,10 @@ impl Atmosphere {
         lighting.clouds.tone = self.tone;
         if mode != "li" && mode != "full" {
             let li = self.light_intensity.max(0.0);
-            let sky = if lighting.gamma_light {
+            // `M2_SKY_LI=linear` dims the haze by the intensity itself
+            // rather than its decoded value (0.3 rather than 0.07 at
+            // Guanare), to test the town's dark sky.
+            let sky = if lighting.gamma_light && !env_is("M2_SKY_LI", "linear") {
                 li.powf(GAMMA)
             } else {
                 li
@@ -360,7 +363,12 @@ impl Atmosphere {
         // them as before.
         lighting.clouds.darkness =
             (!env_is("M2_CLOUDS", "old")).then_some(self.cloud_darkness * cloud_mass());
-        lighting.clouds.coverage = self.coverage;
+        // `M2_CLOUDS=off` leaves the sky to the haze alone.
+        lighting.clouds.coverage = if env_is("M2_CLOUDS", "off") {
+            0.0
+        } else {
+            self.coverage
+        };
         lighting.clouds.scales = self.cloud_scales;
         lighting.clouds.wind = self.wind;
         lighting.water_ramp = self.water_ramp;
