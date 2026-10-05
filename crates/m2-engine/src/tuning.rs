@@ -181,6 +181,8 @@ impl<'a> Table<'a> {
 pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
     let tank = Table::new(db, "_TankPhysics");
     let car = Table::new(db, "_CarPhysicsV2");
+    // A boat's, if it names them as the others do.
+    let boat = Table::new(db, "_BoatPhysics");
     let turret = Table::new(db, "Turret");
     let camera = Table::new(db, "CameraTank");
     let links = Table::new(db, "PhysicalLink");
@@ -196,6 +198,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
         .records
         .keys()
         .chain(car.records.keys())
+        .chain(boat.records.keys())
         .chain(turret.records.keys())
         .chain(camera.records.keys())
         .copied()
@@ -205,10 +208,10 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
     ids.into_iter()
         .map(|id| {
             let t = VehicleTuning {
-                mass: [&tank, &car]
+                mass: [&tank, &car, &boat]
                     .iter()
                     .find_map(|t| t.get(id, "Mass").filter(|m| *m > 0.0)),
-                max_speed: [&tank, &car]
+                max_speed: [&tank, &car, &boat]
                     .iter()
                     .find_map(|t| t.get(id, "MaxSpeed").filter(|s| *s > 0.0))
                     .map(|kmh| kmh / 3.6),

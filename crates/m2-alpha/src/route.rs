@@ -1,12 +1,17 @@
 //! Ways over the island, for a vehicle or on foot: a search over a grid of
 //! cells laid on the ground between two places, each looked at with a ray
-//! from above as the search reaches it, and the way from each to the next
-//! with a ray across, knee high. Walls (a building's side, a fence, a
+//! down from a step above the ground the search comes from (so under
+//! roofs, bridges and trees, not onto them) as the search reaches it, and
+//! the way from each to the next with a ray across, knee high. Walls (a building's side, a fence, a
 //! barricade, a cliff: something across that ray, or a jump in height from
 //! one cell to the next) are never crossed, nor is the sea by a vehicle;
 //! ground steeper than it takes, and the sea on foot, only where there is
 //! no other way; of the rest, gentle ground is preferred. The way found is
 //! then straightened where a straight drive keeps to ground as good.
+//!
+//! A boat's way is over the sea instead: round rocks and the shore (rays
+//! across at the waterline), keeping off them where it can, into the
+//! shallows and up a beach only to get to a place there.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -23,10 +28,15 @@ const MOST_CELLS: usize = 320;
 /// The search stops after this many cells, taking the way to the one
 /// closest to the goal.
 const MOST_SEARCHED: usize = 40_000;
-/// Rays down onto the cells start this high and reach this far, metres
-/// (the island's ground lies between).
+/// Where nothing lies within a step of the ground the search comes from
+/// (a drop, a rise too high, or nothing streamed in), rays down onto the
+/// cells start this high and reach this far, metres (the island's ground
+/// lies between).
 const TOP: f32 = 600.0;
 const DEPTH: f32 = 1200.0;
+/// A step reaches this much past the steepest rise from one cell to the
+/// next that isn't a wall, metres.
+const STEP_SLACK: f32 = 0.5;
 /// Ground less than this above the sea is under it, metres.
 const SHORE: f32 = 0.5;
 /// A rise steeper than this from one cell to the next (rise over run) is
@@ -41,6 +51,17 @@ const UPRIGHT: f32 = 0.7;
 const STEEP: f32 = 20.0;
 /// A straightened stretch of the way is at most this long, metres.
 const STRETCH: f32 = 80.0;
+/// A boat's rays down start this far over the sea (over rocks standing
+/// out of it) and reach this far under it, metres.
+const OVER_SEA: f32 = 30.0;
+const UNDER_SEA: f32 = 300.0;
+/// A boat goes up a beach at most this far over the sea, metres (the
+/// first contract's landing place is 1 m up), and its rays from cell to
+/// cell run this high over the sea.
+const BEACH: f32 = 1.5;
+const BOW: f32 = 0.5;
+/// A boat's way costs this many times as much next to the shallows.
+const OFF_SHORE: f32 = 3.0;
 /// The eight cells round a cell.
 const AROUND: [(isize, isize); 8] = [
     (1, 0),
@@ -64,6 +85,9 @@ pub struct Mover {
     pub wades: bool,
     /// The body its rays pass through (a vehicle's own).
     pub skip: Option<VehicleId>,
+    /// A boat: the least depth of water it keeps to, metres (its keel's
+    /// depth, and some under it).
+    pub afloat: Option<f32>,
 }
 
 /// A way to go: the points to go through in turn, from where it starts.
@@ -126,9 +150,12 @@ impl Route {
             grade: mover.steepest.tan(),
             flat: mover.steepest.cos(),
             wades: mover.wades,
+            afloat: mover.afloat,
             sea,
+            level: from.y,
         };
         let (start, goal) = (grid.cell_at(a), grid.cell_at(b));
+        grid.ground(start, from.y);
         let (cells, reaches) = grid.search(start, goal, b);
         if cells.len() < 2 {
             // Nowhere it can go gets any closer: straight at it.
@@ -161,7 +188,11 @@ impl Route {
             .iter()
             .map(|&c| {
                 let p = grid.at(c);
-                Vec3::new(p.x, grid.height(c).unwrap_or(from.y), p.y)
+                let y = match mover.afloat {
+                    Some(_) => sea,
+                    None => grid.height(c).unwrap_or(from.y),
+                };
+                Vec3::new(p.x, y, p.y)
             })
             .collect();
         points[0] = from;
@@ -273,12 +304,16 @@ struct Grid<'a> {
     looked: Vec<u8>,
     walled: Vec<u8>,
     /// The steepest slope it takes (rise over run), the least height of a
-    /// normal of ground it takes, whether it goes into the sea, and the
-    /// sea's height.
+    /// normal of ground it takes, whether it goes into the sea, the least
+    /// depth of water a boat keeps to, and the sea's height.
     grade: f32,
     flat: f32,
     wades: bool,
+    afloat: Option<f32>,
     sea: f32,
+    /// The height it starts from, metres: the level of a cell with no
+    /// ground found.
+    level: f32,
 }
 
 impl Grid<'_> {
@@ -306,18 +341,39 @@ impl Grid<'_> {
         }
     }
 
-    fn ground(&mut self, c: [usize; 2]) -> Ground {
+    /// The ground of cell `c`, reached from ground at height `level`: the
+    /// first thing a ray down from a step above that level meets within a
+    /// step below it (the floor under a roof, the road under a bridge);
+    /// failing that, the first thing a ray from high above meets. Looked
+    /// at once: the first way to reach a cell sets its level. For a boat,
+    /// the first thing under [`OVER_SEA`] over the sea: the seabed, or a
+    /// rock standing out of it.
+    fn ground(&mut self, c: [usize; 2], level: f32) -> Ground {
         let i = self.index(c);
         if self.ground[i] == Ground::Unknown {
             let p = self.at(c);
-            let hit = self.cast(Vec3::new(p.x, TOP, p.y), Vec3::NEG_Y, DEPTH);
-            self.ground[i] = hit.map_or(Ground::Missing, |(t, n)| Ground::At(TOP - t, n.y));
+            let step = self.cell * WALL + STEP_SLACK;
+            let top = level + step;
+            let hit = if self.afloat.is_some() {
+                let top = self.sea + OVER_SEA;
+                self.cast(Vec3::new(p.x, top, p.y), Vec3::NEG_Y, OVER_SEA + UNDER_SEA)
+                    .map(|(t, n)| (top - t, n))
+            } else {
+                self.cast(Vec3::new(p.x, top, p.y), Vec3::NEG_Y, 2.0 * step)
+                    .map(|(t, n)| (top - t, n))
+                    .or_else(|| {
+                        self.cast(Vec3::new(p.x, TOP, p.y), Vec3::NEG_Y, DEPTH)
+                            .map(|(t, n)| (TOP - t, n))
+                    })
+            };
+            self.ground[i] = hit.map_or(Ground::Missing, |(y, n)| Ground::At(y, n.y));
         }
         self.ground[i]
     }
 
-    fn height(&mut self, c: [usize; 2]) -> Option<f32> {
-        match self.ground(c) {
+    /// The height of cell `c`'s ground, once looked at.
+    fn height(&self, c: [usize; 2]) -> Option<f32> {
+        match self.ground[self.index(c)] {
             Ground::At(y, _) => Some(y),
             _ => None,
         }
@@ -328,8 +384,12 @@ impl Grid<'_> {
     /// the sea). None where it can't go: up or down a wall, across one, or
     /// into the sea when it doesn't wade.
     fn step(&mut self, a: [usize; 2], b: [usize; 2]) -> Option<(f32, bool)> {
+        if let Some(depth) = self.afloat {
+            return self.sail(a, b, depth);
+        }
         let run = self.at(a).distance(self.at(b));
-        let (ga, gb) = (self.ground(a), self.ground(b));
+        let level = self.height(a).unwrap_or(self.level);
+        let (ga, gb) = (self.ground(a, level), self.ground(b, level));
         let wet = matches!(gb, Ground::At(y, _) if y < self.sea + SHORE);
         if wet && !self.wades {
             return None;
@@ -348,11 +408,53 @@ impl Grid<'_> {
         Some((cost, steep))
     }
 
+    /// [`step`](Self::step) for a boat: over water `depth` deep or more
+    /// (or with nothing under it: the open sea), dearer next to shallower;
+    /// into the shallows and up a beach as if steep; never onto land, nor
+    /// across rocks standing out of the sea.
+    fn sail(&mut self, a: [usize; 2], b: [usize; 2], depth: f32) -> Option<(f32, bool)> {
+        let run = self.at(a).distance(self.at(b));
+        let shallow = match self.ground(b, self.sea) {
+            Ground::At(y, _) if y > self.sea + BEACH => return None,
+            Ground::At(y, _) => y > self.sea - depth,
+            _ => false,
+        };
+        if self.walled(a, b) {
+            return None;
+        }
+        let shore = !shallow && AROUND.iter().any(|&(dx, dz)| {
+            let (Some(x), Some(z)) = (b[0].checked_add_signed(dx), b[1].checked_add_signed(dz))
+            else {
+                return false;
+            };
+            x < self.size[0]
+                && z < self.size[1]
+                && matches!(self.ground([x, z], self.sea), Ground::At(y, _) if y > self.sea - depth)
+        });
+        let k = if shallow {
+            STEEP
+        } else if shore {
+            OFF_SHORE
+        } else {
+            1.0
+        };
+        Some((run * k, shallow))
+    }
+
     /// Whether something stands between cells `a` and `b`, next to each
-    /// other: a ray from one to the other, [`KNEE`] high over the ground,
-    /// hits a face too steep to be ground.
+    /// other: a ray from one to the other, [`KNEE`] high over the ground
+    /// ([`BOW`] over the sea, for a boat), hits a face too steep to be
+    /// ground.
     fn walled(&mut self, a: [usize; 2], b: [usize; 2]) -> bool {
-        let (Some(ya), Some(yb)) = (self.height(a), self.height(b)) else {
+        // The ray's height at each end.
+        let heights = match self.afloat {
+            Some(_) => Some((self.sea + BOW, self.sea + BOW)),
+            None => self
+                .height(a)
+                .zip(self.height(b))
+                .map(|(ya, yb)| (ya + KNEE, yb + KNEE)),
+        };
+        let Some((ya, yb)) = heights else {
             return false;
         };
         let way = (b[0] as isize - a[0] as isize, b[1] as isize - a[1] as isize);
@@ -362,8 +464,8 @@ impl Grid<'_> {
         let (i, bit) = (self.index(a), 1u8 << k);
         if self.looked[i] & bit == 0 {
             let (pa, pb) = (self.at(a), self.at(b));
-            let from = Vec3::new(pa.x, ya + KNEE, pa.y);
-            let to = Vec3::new(pb.x, yb + KNEE, pb.y);
+            let from = Vec3::new(pa.x, ya, pa.y);
+            let to = Vec3::new(pb.x, yb, pb.y);
             let hit = self
                 .cast(from, to - from, from.distance(to))
                 .is_some_and(|(_, n)| n.y.abs() < UPRIGHT);
@@ -557,6 +659,7 @@ mod tests {
             steepest: steepest.to_radians(),
             wades: false,
             skip: None,
+            afloat: None,
         }
     }
 
@@ -620,17 +723,11 @@ mod tests {
         let route = Route::plan(&p, car(22.0), Vec3::ZERO, to, -36.0);
         assert!(route.reaches);
         assert!(route.points.iter().any(|q| q.x > 28.0), "{route:?}");
-        let walker = Mover {
-            cell: 2.0,
-            steepest: 40f32.to_radians(),
-            wades: true,
-            skip: None,
-        };
-        let walk = Route::plan(&p, walker, Vec3::ZERO, to, -36.0);
+        let walk = Route::plan(&p, walker(), Vec3::ZERO, to, -36.0);
         assert!(walk.points.iter().any(|q| q.x > 28.0), "{walk:?}");
         // Starting in it, she wades out.
         let from = Vec3::new(-50.0, -40.0, 30.0);
-        let out = Route::plan(&p, walker, from, to, -36.0);
+        let out = Route::plan(&p, walker(), from, to, -36.0);
         assert!(out.reaches, "{out:?}");
     }
 
@@ -657,13 +754,7 @@ mod tests {
             );
         }
         p.step(1.0 / 60.0);
-        let walker = Mover {
-            cell: 2.0,
-            steepest: 40f32.to_radians(),
-            wades: true,
-            skip: None,
-        };
-        let route = Route::plan(&p, walker, Vec3::ZERO, Vec3::new(0.0, 0.0, 60.0), -36.0);
+        let route = Route::plan(&p, walker(), Vec3::ZERO, Vec3::new(0.0, 0.0, 60.0), -36.0);
         assert!(route.reaches, "{route:?}");
         // Where it crosses the wall's line, it is in the gate.
         let crossing = route
@@ -673,6 +764,125 @@ mod tests {
             .map(|w| w[0].lerp(w[1], (31.0 - w[0].z) / (w[1].z - w[0].z)))
             .expect("crosses the wall's line");
         assert!((30.0..=36.0).contains(&crossing.x), "{crossing}: {route:?}");
+    }
+
+    fn walker() -> Mover {
+        Mover {
+            cell: 2.0,
+            steepest: 40f32.to_radians(),
+            wades: true,
+            skip: None,
+            afloat: None,
+        }
+    }
+
+    fn boat() -> Mover {
+        Mover {
+            cell: 4.0,
+            steepest: 0.0,
+            wades: false,
+            skip: None,
+            afloat: Some(1.0),
+        }
+    }
+
+    // Round 88's start boat ran onto rocks standing out of the sea on its
+    // straight run to the beach. The sea 10 m deep, with a reef across the
+    // way standing 3 m out of it but for a channel to the side, and a
+    // beach rising out of the sea beyond: the way goes through the
+    // channel and up to the place on the beach; a shallow bank is gone
+    // round, not over.
+    #[test]
+    fn a_boat_goes_between_the_rocks_to_the_beach() {
+        let sea = -2.0;
+        let mut p = island(|x, z| {
+            if z > 70.0 {
+                // The beach: up out of the sea from z 70.
+                -12.0 + (z - 70.0) * 0.5
+            } else if (20.0..26.0).contains(&z) && !(30.0..42.0).contains(&x) {
+                1.0
+            } else if (-20.0..20.0).contains(&x) && (40.0..50.0).contains(&z) {
+                // A bank 0.5 m under: too shallow.
+                sea - 0.5
+            } else {
+                -12.0
+            }
+        });
+        let from = Vec3::new(0.0, sea, -20.0);
+        let to = Vec3::new(0.0, sea + 1.0, 90.0);
+        let route = Route::plan(&p, boat(), from, to, sea);
+        assert!(route.reaches, "{route:?}");
+        let crossing = route
+            .points
+            .windows(2)
+            .find(|w| w[0].z < 23.0 && w[1].z >= 23.0)
+            .map(|w| w[0].lerp(w[1], (23.0 - w[0].z) / (w[1].z - w[0].z)))
+            .expect("crosses the reef's line");
+        assert!((30.0..=42.0).contains(&crossing.x), "{crossing}: {route:?}");
+        // Not over the bank.
+        for w in route.points.windows(2) {
+            for k in 0..=20 {
+                let at = w[0].lerp(w[1], k as f32 / 20.0);
+                let over = (-18.0..18.0).contains(&at.x) && (42.0..48.0).contains(&at.z);
+                assert!(!over, "over the bank at {at}: {route:?}");
+            }
+        }
+        assert!(route.points.iter().all(|q| q.y == sea || *q == to));
+        // A place on land past the beach (the land going on beyond the
+        // island's edge): as far as the beach.
+        let land = deck(5.0, (-400.0, 400.0), (100.0, 400.0));
+        p.add_static(StaticKey::Cell(2), &land, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let inland = Route::plan(&p, boat(), from, Vec3::new(0.0, 5.0, 120.0), sea);
+        let end = inland.points.last().copied().unwrap();
+        assert!(!inland.reaches, "{inland:?}");
+        assert!((80.0..96.0).contains(&end.z), "{inland:?}");
+    }
+
+    /// A flat quad at height `y` over x `x0..x1`, z `z0..z1`.
+    fn deck(y: f32, (x0, x1): (f32, f32), (z0, z1): (f32, f32)) -> CollisionShape {
+        CollisionShape::mesh(
+            &[
+                Vec3::new(x0, y, z0),
+                Vec3::new(x1, y, z0),
+                Vec3::new(x1, y, z1),
+                Vec3::new(x0, y, z1),
+            ],
+            &[[0, 2, 1], [0, 3, 2]],
+        )
+        .unwrap()
+    }
+
+    // A bridge 6 m up across the whole way (rays from high above meet its
+    // deck first): the way goes under it on the ground, not round it.
+    #[test]
+    fn a_way_goes_under_a_bridge() {
+        let mut p = island(|_, _| 0.0);
+        let bridge = deck(6.0, (-100.0, 100.0), (30.0, 40.0));
+        p.add_static(StaticKey::Cell(2), &bridge, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let (from, to) = (Vec3::ZERO, Vec3::new(0.0, 0.0, 70.0));
+        for mover in [car(22.0), walker()] {
+            let route = Route::plan(&p, mover, from, to, -36.0);
+            assert!(route.reaches, "{route:?}");
+            assert!(route.length() < 72.0, "round the bridge: {route:?}");
+            assert!(route.points.iter().all(|q| q.y < 1.0), "onto it: {route:?}");
+        }
+    }
+
+    // A place under a roof 4 m up: the way stays on the floor under it.
+    #[test]
+    fn a_way_to_a_place_under_a_roof_keeps_to_the_floor() {
+        let mut p = island(|_, _| 0.0);
+        let roof = deck(4.0, (-30.0, 30.0), (40.0, 90.0));
+        p.add_static(StaticKey::Cell(2), &roof, Vec3::ZERO, Quat::IDENTITY);
+        p.step(1.0 / 60.0);
+        let to = Vec3::new(10.0, 0.0, 80.0);
+        let route = Route::plan(&p, walker(), Vec3::ZERO, to, -36.0);
+        assert!(route.reaches, "{route:?}");
+        assert!(route.points.iter().all(|q| q.y < 1.0), "onto it: {route:?}");
+        let straight = flat(to).length();
+        assert!(route.length() < straight * 1.05, "{route:?}");
     }
 
     #[test]

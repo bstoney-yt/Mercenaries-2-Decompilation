@@ -27,6 +27,7 @@ use m2_render::{
 
 use crate::cache;
 use crate::combat::{self, Arsenal, Effect, Weapon};
+use crate::flights::{FlightModel, Flights};
 use crate::npc::{self, People, PersonKind};
 use crate::player::Player;
 use crate::props::Props;
@@ -401,6 +402,8 @@ pub struct Scene {
     pub explosives: Vec<crate::combat::Explosive>,
     /// What the loaded state layers place (a mission's gates).
     pub props: Props,
+    /// The mission scripts' deliveries by helicopter.
+    pub flights: Flights,
     /// Mesh and materials for shots, flashes, fire and smoke.
     effects: Effects,
     vehicle_loads: Option<Receiver<Loaded>>,
@@ -481,6 +484,9 @@ pub enum Loaded {
     Person(PersonModel, CpuModel, Skeleton, bool),
     /// A hand weapon: name, model, muzzle (model space).
     Weapon(&'static str, CpuModel, Vec3),
+    /// A model for the helicopters' deliveries (a helicopter's, a supply
+    /// crate's): its hash, each node's place at rest, and its rotors.
+    Flight(u32, CpuModel, Vec<Mat4>, Vec<m2_assets::vehicle::Rotor>),
 }
 
 /// Finds the island's vehicle and person models and decodes the soldiers,
@@ -647,6 +653,7 @@ impl Scene {
             arsenal: Arsenal::default(),
             explosives: Vec::new(),
             props: Props::default(),
+            flights: Flights::default(),
             effects,
             vehicle_loads: None,
             catalogue: None,
@@ -760,8 +767,10 @@ impl Scene {
         spawn: (f32, f32),
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
-        let world = World::open(install, backend, &mut self.materials, settings)
+        let mut world = World::open(install, backend, &mut self.materials, settings)
             .context("indexing the island")?;
+        // Boats float on the sea.
+        world.physics.set_water(world.settings.sea_level);
         eprintln!(
             "island: {} cells, {} tiles, {} placed objects ({} by name), {} template placements (indexed in {:.1} s)",
             world.index.cells.len(),
@@ -827,6 +836,32 @@ impl Scene {
     pub fn load_world_vehicle(&self, entity: u32, at: Vec3, yaw: f32, models: Vec<CatalogueEntry>) {
         self.load_vehicle_as(models, format!("vehicle {entity:#x}"), move |spec, cpu| {
             Loaded::WorldVehicle(entity, at, yaw, spec, cpu)
+        });
+    }
+
+    /// Loads model `hash` for the helicopters' deliveries on a thread
+    /// ([`Flights::loaded`] takes it).
+    fn load_flight_model(&self, hash: u32) {
+        let Some(install) = self.install.clone() else {
+            return;
+        };
+        let tx = self.requests.0.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut source = install.open_world()?;
+                let data = source.model(hash)?;
+                let model = data.parse()?;
+                let rest = (0..model.nodes.len())
+                    .map(|n| model.node_to_model(n as u16).unwrap_or(Mat4::IDENTITY))
+                    .collect();
+                let rotors = m2_assets::vehicle::rotors(&model);
+                let cpu = CpuModel::build(hash, &model, 0);
+                let _ = tx.send(Loaded::Flight(hash, cpu, rest, rotors));
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("delivery model {hash:08x}: {e:#}");
+            }
         });
     }
 
@@ -915,6 +950,9 @@ impl Scene {
         for (model, template) in std::mem::take(&mut self.people.wanted) {
             self.load_character(model, template);
         }
+        for hash in self.flights.take_wanted() {
+            self.load_flight_model(hash);
+        }
         split(1, &mut self.streamed);
         if let (Some(world), Some(source)) = (&mut self.world, &mut self.source) {
             // As far as most are drawn, and a little more.
@@ -955,7 +993,8 @@ impl Scene {
             | Loaded::MissionVehicle(_, _, cpu)
             | Loaded::WorldVehicle(_, _, _, _, cpu)
             | Loaded::Person(_, cpu, _, _)
-            | Loaded::Weapon(_, cpu, _) => cpu,
+            | Loaded::Weapon(_, cpu, _)
+            | Loaded::Flight(_, cpu, _, _) => cpu,
         };
         self.materials.load_model_textures(backend, source, cpu)?;
         let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
@@ -1007,6 +1046,16 @@ impl Scene {
                     gun: 0.0,
                     rolled: 0.0,
                 });
+            }
+            Loaded::Flight(hash, _, rest, rotors) => {
+                self.flights.loaded(
+                    hash,
+                    FlightModel {
+                        gpu: model,
+                        rest,
+                        rotors,
+                    },
+                );
             }
             Loaded::Weapon(name, _, muzzle) => {
                 let rig = self
@@ -1084,8 +1133,13 @@ impl Scene {
         if let Some(world) = &mut self.world {
             let frustum = Frustum::from_view_proj(view.projection * view.view);
             world.draw(backend, queue, eye, &frustum)?;
-            self.props
-                .draw(queue, eye, &frustum, world.settings.object_distance);
+            self.props.draw(
+                queue,
+                &world.physics,
+                eye,
+                &frustum,
+                world.settings.object_distance,
+            );
         } else {
             self.draw_ground(queue);
         }
@@ -1108,6 +1162,15 @@ impl Scene {
                 );
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
             }
+        }
+        let hanging = self.flights.draw(queue, &self.vehicles);
+        for (hook, load) in hanging.cables {
+            self.effects.cable(queue, hook, load);
+        }
+        for (i, at) in hanging.hung {
+            let v = &self.vehicles[i];
+            let nodes = v.spec.posed_nodes(&[], v.rolled, v.turret, v.gun);
+            v.model.draw_posed(backend, queue, at, &nodes, &[])?;
         }
         if let Some(player) = &self.player
             && player.landed
@@ -1276,6 +1339,11 @@ struct Effects {
     flash: MaterialId,
     fire: MaterialId,
     smoke: MaterialId,
+    /// A boat's spray and wake.
+    spray: MaterialId,
+    wake: MaterialId,
+    /// A helicopter's winch cable.
+    cable: MaterialId,
 }
 
 impl Effects {
@@ -1331,7 +1399,26 @@ impl Effects {
             flash: define([1.0, 0.6, 0.18, 0.8], false, BlendMode::Translucent)?,
             fire: define([1.0, 0.5, 0.1, 0.85], false, BlendMode::Translucent)?,
             smoke: define([0.35, 0.35, 0.35, 0.4], true, BlendMode::Translucent)?,
+            spray: define([0.93, 0.95, 0.97, 0.45], true, BlendMode::Translucent)?,
+            wake: define([0.9, 0.93, 0.95, 0.35], true, BlendMode::Translucent)?,
+            cable: define([0.06, 0.06, 0.06, 1.0], true, BlendMode::Opaque)?,
         })
+    }
+
+    /// Queues a winch cable from `from` to `to`.
+    fn cable(&self, queue: &mut DrawQueue, from: Vec3, to: Vec3) {
+        let along = to - from;
+        let len = along.length();
+        if len < 0.01 {
+            return;
+        }
+        let turn = Quat::from_rotation_arc(Vec3::Z, along / len);
+        let world = Mat4::from_scale_rotation_translation(
+            Vec3::new(0.03, 0.03, len * 0.5),
+            turn,
+            (from + to) * 0.5,
+        );
+        self.push(queue, world, self.cable, false);
     }
 
     /// Queues `effect`, `age` of the way (0 to 1) through its life.
@@ -1394,10 +1481,31 @@ impl Effects {
                 self.smoke,
                 true,
             ),
+            // Out and up, falling back as it goes, gone at the end.
+            Effect::Spray { at, drift, size } => (
+                Mat4::from_scale_rotation_translation(
+                    Vec3::new(1.0, 0.6, 1.0) * (size * (0.4 + age) * (1.0 - age * age)),
+                    Quat::IDENTITY,
+                    at + drift * age - Vec3::Y * (2.0 * age * age),
+                ),
+                self.spray,
+                true,
+            ),
+            Effect::Wake { at, size } => (
+                Mat4::from_scale_rotation_translation(
+                    Vec3::new(1.0, 0.04, 1.0) * (size * (0.5 + age) * (1.0 - age.powi(3))),
+                    Quat::IDENTITY,
+                    at,
+                ),
+                self.wake,
+                true,
+            ),
         };
         // Smoke as nested shells, fainter outwards, for a softer edge.
         let shells: &[f32] = if material == self.smoke {
             &[0.55, 0.8, 1.0]
+        } else if material == self.spray {
+            &[0.6, 1.0]
         } else {
             &[1.0]
         };

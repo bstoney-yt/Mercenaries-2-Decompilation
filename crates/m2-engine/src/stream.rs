@@ -36,7 +36,7 @@ use m2_assets::model::MODEL_TYPE;
 
 use crate::assets::{AssetError, DecodedTexture, Install};
 use crate::model::{CpuModel, GpuModel, MaterialCache, MemberShape, flags};
-use crate::physics::{CollisionShape, Physics, StaticKey};
+use crate::physics::{CollisionShape, DebrisId, Loose, Physics, StaticKey};
 use crate::scatter::{self, CellScatter};
 use crate::world::{self, TerrainMesh, TerrainSurface, WorldIndex};
 
@@ -408,6 +408,10 @@ pub struct World {
     /// Placed objects (index into the index's `objects`) blown up: drawn
     /// as their wrecks, or not at all without one.
     pub destroyed: HashSet<usize>,
+    /// The models of placed objects that come loose when knocked, by hash.
+    loose: HashMap<u32, Arc<Loose>>,
+    /// Placed objects knocked loose: their pieces, in [`Loose`] order.
+    knocked: HashMap<usize, Vec<DebrisId>>,
     /// Full-detail cells and placed models as static colliders. Step it
     /// each tick; colliders added by [`update`](Self::update) join scene
     /// queries on the next step.
@@ -475,6 +479,8 @@ impl World {
             cloud_noise,
             stats: WorldStats::default(),
             destroyed: HashSet::new(),
+            loose: HashMap::new(),
+            knocked: HashMap::new(),
             physics: Physics::new(),
         };
         // Every tile, so the whole island shows from the start.
@@ -489,6 +495,80 @@ impl World {
 
     pub fn stats(&self) -> WorldStats {
         self.stats
+    }
+
+    /// The mass to shift (kg) to knock placed object `i` loose; `None`
+    /// unless its model comes loose ([`Loose`]) and it stands.
+    pub fn loose_mass(&self, i: usize) -> Option<f32> {
+        if self.knocked.contains_key(&i)
+            || self.destroyed.contains(&i)
+            || !self.physics.has_static(StaticKey::Object(i))
+        {
+            return None;
+        }
+        self.loose
+            .get(&self.index.objects.get(i)?.model)
+            .map(|l| l.mass)
+    }
+
+    /// Knocks placed object `i` loose: its standing collision goes and its
+    /// pieces fly off at `velocity` (m/s), turning at `spin` (radians a
+    /// second about each axis). False unless it came loose.
+    pub fn knock(&mut self, i: usize, velocity: Vec3, spin: Vec3) -> bool {
+        if self.loose_mass(i).is_none() {
+            return false;
+        }
+        let o = &self.index.objects[i];
+        let Some(loose) = self.loose.get(&o.model).cloned() else {
+            return false;
+        };
+        self.physics.remove_static(StaticKey::Object(i));
+        let placed = Mat4::from_rotation_translation(o.rotation, o.position);
+        let pieces = loose
+            .pieces
+            .iter()
+            .zip(loose.starts(placed))
+            .map(|(piece, at)| self.physics.add_debris(piece, at, velocity, spin))
+            .collect();
+        self.knocked.insert(i, pieces);
+        true
+    }
+
+    /// Placed objects standing that come loose with any of their model
+    /// within `reach` metres of `at` (as far as its box's middle less
+    /// half its size), with how far.
+    pub fn loose_near(&self, at: Vec3, reach: f32) -> Vec<(usize, f32)> {
+        let far = reach + BUCKET;
+        let (b0, b1) = (
+            bucket(at.x - far, at.z - far),
+            bucket(at.x + far, at.z + far),
+        );
+        let mut out = Vec::new();
+        for bx in b0.0..=b1.0 {
+            for bz in b0.1..=b1.1 {
+                for &i in self.objects.get(&(bx, bz)).map_or(&[][..], Vec::as_slice) {
+                    let o = &self.index.objects[i];
+                    let Some(Slot::Ready(m)) = self.models.get(&o.model) else {
+                        continue;
+                    };
+                    if self.loose_mass(i).is_none() {
+                        continue;
+                    }
+                    let (lo, hi) = m.bounds;
+                    let centre = o.position + o.rotation * ((lo + hi) * 0.5);
+                    let d = (centre.distance(at) - (hi - lo).length() * 0.5).max(0.0);
+                    if d <= reach {
+                        out.push((i, d));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// How many placed objects have been knocked loose.
+    pub fn knocked(&self) -> usize {
+        self.knocked.len()
     }
 
     /// Requests what `eye` needs, drops what it no longer does, and uploads
@@ -687,6 +767,10 @@ impl World {
                     self.in_flight.remove(&Request::Model(hash));
                     let slot = match model {
                         Ok(m) if !m.pieces.is_empty() => {
+                            if let Some(loose) = m.collision.as_ref().and_then(|c| c.loose.clone())
+                            {
+                                self.loose.insert(hash, loose);
+                            }
                             for &i in self.by_model.get(&hash).map_or(&[][..], Vec::as_slice) {
                                 let o = &self.index.objects[i];
                                 // A prop placed by name with no collision
@@ -930,7 +1014,7 @@ impl World {
                 for &i in self.objects.get(&(bx, bz)).map_or(&[][..], Vec::as_slice) {
                     let o = &self.index.objects[i];
                     let d = o.position.distance(eye);
-                    if d > if o.named { props } else { reach } {
+                    if d > if o.named { props } else { reach } || self.knocked.contains_key(&i) {
                         continue;
                     }
                     if let Some(Slot::Ready(m)) = self.models.get(&o.model)
@@ -969,6 +1053,39 @@ impl World {
                     }
                 }
             }
+        }
+        // Those knocked loose, their pieces where they flew.
+        for (&i, pieces) in &self.knocked {
+            let o = &self.index.objects[i];
+            let (Some(Slot::Ready(m)), Some(loose)) =
+                (self.models.get(&o.model), self.loose.get(&o.model))
+            else {
+                continue;
+            };
+            let destroyed = self.destroyed.contains(&i);
+            if destroyed && !m.has_wreck() {
+                continue;
+            }
+            let places: Vec<Mat4> = pieces
+                .iter()
+                .filter_map(|&d| self.physics.debris_place(d))
+                .collect();
+            if places.len() != pieces.len()
+                || places
+                    .iter()
+                    .all(|p| p.w_axis.truncate().distance(eye) > props)
+            {
+                continue;
+            }
+            let placed = Mat4::from_rotation_translation(o.rotation, o.position);
+            m.draw_moved(
+                queue,
+                placed,
+                &loose.posed(placed, &places),
+                loose.breaks || destroyed,
+                loose.flying(),
+            );
+            drawn += 1;
         }
         self.stats.objects_drawn = drawn;
         self.stats.scatter_drawn = self.draw_scatter(backend, queue, eye, frustum)?;

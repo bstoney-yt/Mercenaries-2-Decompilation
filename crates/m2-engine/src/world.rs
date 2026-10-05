@@ -470,6 +470,10 @@ pub struct WorldIndex {
     /// what stands while the layer is in, such as a mission's gates.
     /// Vehicles and people are left out (the alpha places those itself).
     pub state_objects: HashMap<u32, ObjectPlacement>,
+    /// Vehicles the state layers place, by entity, with the template each
+    /// is an instance of: what a renamed entity's name
+    /// (`VzaCon001_StartingBoat`) no longer says.
+    pub state_vehicles: HashMap<u32, TemplatePlacement>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -718,6 +722,7 @@ impl WorldIndex {
         }
         if !is_static {
             self.add_state_objects(layer, assets);
+            self.add_state_vehicles(layer, layer_hash, assets);
         } else {
             let models = layer.hashes("ModelName");
             for (&entity, model) in &models {
@@ -874,6 +879,42 @@ impl WorldIndex {
                     },
                 );
             }
+        }
+    }
+
+    /// A state layer's vehicles: entities whose template, by their name or
+    /// else by the one they are an instance of, has vehicle physics.
+    fn add_state_vehicles(&mut self, layer: &Layer<'_>, layer_hash: u32, assets: &Assets) {
+        let names = layer.names();
+        for (&entity, p) in &layer.placements() {
+            let stem = names.get(&entity).map_or("", |n| member_stem(n));
+            let template = match assets.templates.get(stem) {
+                Some(t) => Some((stem, t)),
+                None => assets.templates.by_id(p.parent),
+            };
+            let Some((
+                name,
+                &TemplateInfo {
+                    model,
+                    vehicle: Some(kind),
+                    ..
+                },
+            )) = template
+            else {
+                continue;
+            };
+            self.state_vehicles.insert(
+                entity,
+                TemplatePlacement {
+                    entity,
+                    name: name.to_owned(),
+                    position: Vec3::from(p.position),
+                    rotation: rotation(p.rotation),
+                    model,
+                    kind,
+                    layer: layer_hash,
+                },
+            );
         }
     }
 
