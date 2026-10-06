@@ -163,6 +163,9 @@ struct Options {
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
+    /// With `--mission --screenshot`: her health drops to this eight
+    /// seconds in, to see the scripts' healing and survival rescue.
+    hurt: Option<f32>,
     /// With `--mission --screenshot`: she plays the mission herself, by
     /// its markers, until it is done or the seconds are up.
     autoplay: bool,
@@ -334,6 +337,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
             "--autoplay" => o.autoplay = true,
+            "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
             "--gates" => o.gates = true,
             "--mission-seconds" => {
                 o.mission_seconds = value()?
@@ -371,6 +375,10 @@ fn keep_crash_reports() {
         }
     }));
 }
+
+/// When `--hurt` takes her health: after the start's fade, which keeps her
+/// from harm.
+const HURT_AT: f32 = 8.0;
 
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
@@ -1755,6 +1763,12 @@ fn mission_for_screenshot(
             }
             None => Intent::default(),
         };
+        if let Some(hp) = options.hurt
+            && i == (HURT_AT / tick).round() as u32
+        {
+            eprintln!("hurt: her health {:.1} -> {hp:.1}", game.combat.hp);
+            game.combat.hp = hp;
+        }
         game.step(intent, tick);
         link.tick(game, tick);
         if auto.is_some() {
