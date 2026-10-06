@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run -p m2-game --example support -- <vz.wad> [table...] [--calls]
-//!     [--items] [--call <key>]
+//!     [--items] [--call <key>] [--listing <module>]
 //! ```
 //!
 //! Each `table` is a Lua expression read after start-up (default
@@ -17,7 +17,8 @@
 //! game would, standing in for the player and the world: she throws her
 //! designator 15 m ahead, it lies its 4 s, aircraft arrive at once and
 //! ordnance goes off where it set off; every command and log line is
-//! printed. Nothing is written but stdout.
+//! printed. `--listing <module>` prints a script's Lua 5.1 listing, to read
+//! its control flow locally. Nothing is written but stdout.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -81,9 +82,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .position(|a| a == "--call")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let listing = args
+        .iter()
+        .position(|a| a == "--listing")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let mut tables: Vec<&str> = args[1..]
         .iter()
-        .filter(|a| !a.starts_with("--") && Some(*a) != call.as_ref())
+        .filter(|a| {
+            !a.starts_with("--") && Some(*a) != call.as_ref() && Some(*a) != listing.as_ref()
+        })
         .map(String::as_str)
         .collect();
     if tables.is_empty() && !list_items && call.is_none() {
@@ -93,6 +101,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let data = GameData::read(&mut wad)?;
     if calls {
         list_calls(&data);
+    }
+    if let Some(m) = &listing {
+        match data.library.by_hash(name_hash(m)) {
+            Some(s) => print!("{}", s.chunk.main.listing()),
+            None => println!("no script {m}"),
+        }
+        return Ok(());
     }
     let mut mission = Mission::new(data, "Mattias", [0.0; 3])?;
     mission.start();
