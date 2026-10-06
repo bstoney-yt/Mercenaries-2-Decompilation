@@ -424,6 +424,9 @@ pub struct SpawnPoint {
     pub layer: Option<u32>,
     /// The model of its template, when that is a person's (`Carmona`'s).
     pub model: Option<u32>,
+    /// For a spawner of people (`PathSpawner_GurHQ_Peds`): whom its list
+    /// spawns, by template name, with each one's model and weight.
+    pub list: Vec<(String, u32, f32)>,
 }
 
 /// Where everything on the island is.
@@ -635,9 +638,13 @@ impl WorldIndex {
             point.route = path_points(asset).iter().map(|&p| at + q * p).collect();
         }
         for spawn in &mut world.spawns {
-            let Some(&target) = routes.patrol_of.get(&spawn.entity) else {
-                continue;
-            };
+            // Its patrol's path entity, else its own path (a path
+            // spawner's).
+            let target = routes
+                .patrol_of
+                .get(&spawn.entity)
+                .copied()
+                .unwrap_or(spawn.entity);
             let (Some(&(at, q)), Some(&asset)) =
                 (routes.placed.get(&target), routes.path_of.get(&target))
             else {
@@ -677,6 +684,33 @@ impl WorldIndex {
         }
         let names = layer.names();
         let mut seen: HashSet<u32> = HashSet::new();
+        let own_spawners = layer
+            .component("PopulationSimpleSpawner")
+            .map(crate::population::spawners)
+            .unwrap_or_default();
+        let people_of = |id: u32, p: &Placement| -> Vec<(String, u32, f32)> {
+            let population = &templates.population;
+            let Some(spawner) = own_spawners
+                .get(&id)
+                .or_else(|| population.spawners.get(&p.parent))
+            else {
+                return Vec::new();
+            };
+            population
+                .lists
+                .get(&spawner.list)
+                .or_else(|| population.lists.get(&(spawner.list | TEMPLATE_BIT)))
+                .into_iter()
+                .flatten()
+                .filter_map(|&(t, w)| {
+                    let (name, info) = templates
+                        .by_id(t)
+                        .or_else(|| templates.by_id(t | TEMPLATE_BIT))?;
+                    let model = info.model.filter(|_| info.human)?;
+                    Some((name.to_owned(), model, w))
+                })
+                .collect()
+        };
         let spawn = |id: u32, p: &Placement| {
             let template = templates.by_id(p.parent);
             SpawnPoint {
@@ -688,6 +722,7 @@ impl WorldIndex {
                 route: Vec::new(),
                 layer: (!is_static).then_some(layer_hash),
                 model: template.and_then(|(_, t)| t.model.filter(|_| t.human)),
+                list: people_of(id, p),
             }
         };
         for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
@@ -702,6 +737,23 @@ impl WorldIndex {
                     continue;
                 }
                 self.spawns.push(spawn(id, p));
+            }
+        }
+        // Entities spawning people by their template's spawner alone (the
+        // path spawners).
+        let mut spawners: Vec<(u32, &Placement)> = placements
+            .iter()
+            .filter(|(id, p)| {
+                !seen.contains(*id) && templates.population.spawners.contains_key(&p.parent)
+            })
+            .map(|(&id, p)| (id, p))
+            .collect();
+        spawners.sort_unstable_by_key(|&(id, _)| id);
+        for (id, p) in spawners {
+            let s = spawn(id, p);
+            if !s.list.is_empty() {
+                seen.insert(id);
+                self.spawns.push(s);
             }
         }
         if is_static {

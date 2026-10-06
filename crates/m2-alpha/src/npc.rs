@@ -677,6 +677,35 @@ impl People {
         None
     }
 
+    /// Who a spawner of people sends out: one of its list by weight (a
+    /// Venezuelan soldier as the island's own, anyone else in their
+    /// template's model, asked for once). The factions' attitudes aren't
+    /// in yet, so only the Venezuelans fight.
+    fn listed(&mut self, s: &SpawnPoint) -> Option<usize> {
+        let weights: Vec<(u32, f32)> = s
+            .list
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, w))| (i as u32, *w))
+            .collect();
+        let roll = self.rng.range(0.0, 1.0);
+        let (template, model, _) = &s.list[m2_engine::population::pick(&weights, roll)? as usize];
+        if let Some(k) = self.kind_for(template) {
+            return Some(k);
+        }
+        if let Some(k) = self
+            .kinds
+            .iter()
+            .position(|k| k.named && k.role == *template)
+        {
+            return Some(k);
+        }
+        if self.asked.insert(*model) {
+            self.wanted.push((*model, template.clone()));
+        }
+        None
+    }
+
     pub fn add_kind(&mut self, kind: PersonKind) {
         if !kind.soldier && !kind.named {
             // Civilians are dealt out across the kinds in: start them
@@ -940,7 +969,8 @@ impl People {
                 .and_then(|t| self.kind_for(t))
                 .or_else(|| self.kind_for(&s.name))
                 .or_else(|| target.then(|| self.kind_for("vz soldier")).flatten())
-                .or_else(|| self.character(s));
+                .or_else(|| self.character(s))
+                .or_else(|| self.listed(s));
             let Some(kind) = kind else {
                 continue;
             };
@@ -1135,6 +1165,7 @@ pub(crate) mod tests {
             route: Vec::new(),
             layer: None,
             model: None,
+            list: Vec::new(),
         };
         let spawns = [
             spawn(1, "VZ Soldier 01", 10.0),
@@ -1173,6 +1204,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn spawners_send_out_whom_their_list_names() {
+        let mut physics = ground();
+        let mut people = People::default();
+        let spawner = SpawnPoint {
+            entity: 9,
+            name: "PathSpawner_GurHQ_Peds".into(),
+            template: Some("PathSpawner_GurHQ_Peds".into()),
+            position: Vec3::new(10.0, 0.0, 0.0),
+            rotation: Quat::IDENTITY,
+            route: Vec::new(),
+            layer: None,
+            model: None,
+            list: vec![("Guerilla Soldier".into(), 0x6a11, 1.0)],
+        };
+        let spawns = [spawner];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        assert_eq!(people.wanted, [(0x6a11, "Guerilla Soldier".to_owned())]);
+        people.add_kind(PersonKind {
+            role: "Guerilla Soldier".into(),
+            soldier: false,
+            named: true,
+            model: empty_model(),
+            rig: rig(),
+        });
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        assert_eq!(people.npcs.iter().filter(|n| n.spawn == Some(9)).count(), 1);
+    }
+
+    #[test]
     fn story_characters_stand_in_their_own_model() {
         let mut physics = ground();
         let mut people = People::default();
@@ -1185,6 +1245,7 @@ pub(crate) mod tests {
             route: Vec::new(),
             layer: None,
             model: Some(model),
+            list: Vec::new(),
         };
         let spawns = [
             spawn(7, "Carmona", 0xbf83),
@@ -1234,6 +1295,7 @@ pub(crate) mod tests {
             route: Vec::new(),
             layer: Some(0xc0),
             model: None,
+            list: Vec::new(),
         };
         let spawns = [guard];
         let tick = |people: &mut People, physics: &mut Physics| {
