@@ -18,6 +18,15 @@
 //!   --teleport t,x,y,z move the player at time t (repeatable)
 //!   --seconds n        how long to run (default 60)
 //!   --step s           tick length (default 0.5)
+//!   --hijack h,v,c     after the drivers, spawn vehicle template v
+//!                      crewed by template c beside the player and
+//!                      play hijack script h (its name hash, hex) on it
+//!   --pad good|bad|none  how the player answers the hijack's prompts
+//!                      (default good: the right button at once; bad:
+//!                      the wrong one; none: never)
+//!   --action-seconds n how long each character action lasts before the
+//!                      game reports it done (default 2; the clips'
+//!                      real lengths are the game's)
 //! ```
 //!
 //! Every module some script loads is imported first, then every other
@@ -32,6 +41,8 @@ use std::io::BufReader;
 use std::process::ExitCode;
 
 use m2_assets::WadArchive;
+use m2_game::api::Command;
+use m2_game::hijack::HijackCommand;
 use m2_game::mission::{GameData, Mission};
 
 #[derive(Default)]
@@ -46,6 +57,9 @@ struct Options {
     teleports: Vec<(f64, [f32; 3])>,
     seconds: f64,
     step: f64,
+    hijack: Option<(u32, String, String)>,
+    pad: String,
+    action_seconds: f64,
 }
 
 fn main() -> ExitCode {
@@ -76,6 +90,8 @@ fn options() -> Result<Options> {
         step: 0.5,
         hero: "Mattias".into(),
         start: true,
+        pad: "good".into(),
+        action_seconds: 2.0,
         ..Options::default()
     };
     let mut args = std::env::args().skip(1);
@@ -110,6 +126,17 @@ fn options() -> Result<Options> {
             }
             "--seconds" => o.seconds = value()?.parse()?,
             "--step" => o.step = value()?.parse()?,
+            "--hijack" => {
+                let v = value()?;
+                let parts: Vec<&str> = v.splitn(3, ',').collect();
+                let [h, vehicle, crew] = parts[..] else {
+                    return Err("--hijack takes script,vehicle,crewman".into());
+                };
+                let h = u32::from_str_radix(h.trim_start_matches("0x"), 16)?;
+                o.hijack = Some((h, vehicle.to_owned(), crew.to_owned()));
+            }
+            "--pad" => o.pad = value()?,
+            "--action-seconds" => o.action_seconds = value()?.parse()?,
             _ if o.wad.is_empty() && !a.starts_with("--") => o.wad = a,
             _ => return Err(format!("unknown argument {a}").into()),
         }
@@ -154,6 +181,11 @@ fn run(o: &Options) -> Result<()> {
         print(&mut mission);
     }
 
+    let mut hijack = match &o.hijack {
+        Some((script, vehicle, crew)) => Some(Hijack::start(&mut mission, *script, vehicle, crew)?),
+        None => None,
+    };
+
     let mut teleports = o.teleports.clone();
     teleports.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut teleports = teleports.into_iter().peekable();
@@ -165,8 +197,14 @@ fn run(o: &Options) -> Result<()> {
             println!();
             println!("t={now:.1} player moved to {at:?}");
         }
+        if let Some(h) = &mut hijack {
+            h.pad(&mut mission, &o.pad, now);
+        }
         mission.tick(o.step);
-        print(&mut mission);
+        match &mut hijack {
+            Some(h) => h.follow(&mut mission, o.action_seconds, now),
+            None => print(&mut mission),
+        }
     }
     println!();
     println!("modules loaded while running (name -> script):");
@@ -180,4 +218,123 @@ fn run(o: &Options) -> Result<()> {
     let pending = mission.pending_events();
     println!("{} events pending at the end: {pending:?}", pending.len());
     Ok(())
+}
+
+/// A hijack played headless: the game's side, as far as the script needs
+/// it (actions end after a set time; the pad answers each prompt).
+struct Hijack {
+    /// Characters' actions and when they end.
+    actions: Vec<(u32, f64)>,
+    /// Prompts already answered, by when they showed (seconds left).
+    answered: Vec<(String, u32)>,
+    /// The button last tapped (alternating).
+    last: Option<u32>,
+}
+
+impl Hijack {
+    fn start(mission: &mut Mission, script: u32, vehicle: &str, crew: &str) -> Result<Self> {
+        let hero = mission.world().borrow().player.ok_or("no player")?;
+        let at = mission.world().borrow().objects[&hero].position;
+        let spawn = |m: &mut Mission, what: &str| -> Result<u32> {
+            let v: mlua::Value = m
+                .lua()
+                .load(format!(
+                    "return Pg.Spawn({what:?}, {}, {}, {}, 0)",
+                    at[0] + 3.0,
+                    at[1],
+                    at[2]
+                ))
+                .eval()?;
+            m2_game::events::as_guid(&v).ok_or_else(|| format!("no template {what}").into())
+        };
+        let vehicle = spawn(mission, vehicle)?;
+        let crewman = spawn(mission, crew)?;
+        let started = mission.start_hijack(hero, crewman, vehicle, script);
+        println!();
+        println!(
+            "hijack {script:08x}: hero {hero:#x} crewman {crewman:#x} vehicle {vehicle:#x}: started {started}"
+        );
+        let mut h = Self {
+            actions: Vec::new(),
+            answered: Vec::new(),
+            last: None,
+        };
+        h.follow(mission, 2.0, 0.0);
+        Ok(h)
+    }
+
+    fn pad(&mut self, mission: &mut Mission, pad: &str, now: f64) {
+        for g in mission.minigames() {
+            let key = (g.mode.clone(), g.buttons.first().copied().unwrap_or(0));
+            let fresh = !self.answered.contains(&key);
+            if fresh {
+                println!(
+                    "t={now:.1} prompt {} {:?} {:.2}s left",
+                    g.mode, g.buttons, g.left
+                );
+            }
+            if pad == "none" {
+                self.answered.push(key);
+                continue;
+            }
+            let right = g.buttons.first().copied().unwrap_or(0);
+            let wrong = if right == 6 { 5 } else { 6 };
+            match g.mode.as_str() {
+                "press" if fresh => {
+                    mission.press(if pad == "good" { right } else { wrong });
+                }
+                "hold" if fresh => mission.hold(right, pad == "good"),
+                "tap" if pad == "good" => mission.press(right),
+                "alternate" if pad == "good" => {
+                    let b = match (self.last, g.buttons.as_slice()) {
+                        (Some(l), [a, b]) if l == *a => *b,
+                        (_, [a, ..]) => *a,
+                        _ => right,
+                    };
+                    self.last = Some(b);
+                    mission.press(b);
+                }
+                _ => {}
+            }
+            if fresh {
+                self.answered.push(key);
+            }
+        }
+        // A prompt that is gone may come again (a section replayed).
+        let open: Vec<(String, u32)> = mission
+            .minigames()
+            .iter()
+            .map(|g| (g.mode.clone(), g.buttons.first().copied().unwrap_or(0)))
+            .collect();
+        self.answered.retain(|k| open.contains(k));
+    }
+
+    /// Prints the log and the hijack's commands; ends actions due.
+    fn follow(&mut self, mission: &mut Mission, seconds: f64, now: f64) {
+        for line in mission.take_log() {
+            println!("{line}");
+        }
+        for c in mission.take_commands() {
+            match c {
+                Command::Hijack(h) => {
+                    if let HijackCommand::State { guid, action, .. } = &h {
+                        self.actions.retain(|a| a.0 != *guid);
+                        if !action.eq_ignore_ascii_case("Idle") {
+                            self.actions.push((*guid, now + seconds));
+                        }
+                    }
+                    println!("t={now:.1} hijack {h:?}");
+                }
+                Command::Remove(g) | Command::Kill(g) | Command::ExitVehicle(g) => {
+                    println!("t={now:.1} {c:?} ({g:#x})");
+                }
+                _ => {}
+            }
+        }
+        let (done, left): (Vec<_>, Vec<_>) = self.actions.iter().partition(|a| a.1 <= now);
+        self.actions = left;
+        for (g, _) in done {
+            mission.action_finished(g);
+        }
+    }
 }

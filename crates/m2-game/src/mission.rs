@@ -341,6 +341,7 @@ impl Mission {
         host.complete_libraries(&api::LIBRARIES)?;
         let events = Events::default();
         events.install(host.lua())?;
+        crate::hijack::install(&host, &world)?;
         host.install_library(Rc::clone(&library), true)?;
 
         // Every module, by the name scripts spell it with, so code run
@@ -583,6 +584,68 @@ impl Mission {
     /// lasts `seconds`.
     pub fn line_length(&mut self, id: u32, seconds: f64) {
         self.world.borrow_mut().vo.set_length(id, seconds);
+    }
+
+    /// Starts a hijack as the engine does when the player takes a
+    /// vehicle at its hijack entrance: script `script` (`hijack_m1a2`'s
+    /// name hash; see `m2_engine::hijack`) loads its clips (`Init`) and
+    /// plays `StartHijack(hijacker, crewman, "d", vehicle)`. False if the
+    /// script refused or failed (the failure is logged).
+    pub fn start_hijack(&mut self, hijacker: u32, crewman: u32, vehicle: u32, script: u32) -> bool {
+        use crate::events::guid_value;
+        let run = || -> mlua::Result<bool> {
+            let scripts: mlua::Table = self.host.lua().globals().get("Scripts")?;
+            let Some(s) = scripts.get::<Option<mlua::Table>>(format!("{script:08x}"))? else {
+                return Ok(false);
+            };
+            let Some(start) = s.get::<Option<mlua::Function>>("StartHijack")? else {
+                return Ok(false);
+            };
+            if let Some(init) = s.get::<Option<mlua::Function>>("Init")? {
+                init.call::<()>(())?;
+            }
+            let started: mlua::Value = start.call((
+                guid_value(hijacker),
+                guid_value(crewman),
+                "d",
+                guid_value(vehicle),
+            ))?;
+            Ok(matches!(started, mlua::Value::Boolean(true)))
+        };
+        let started = run();
+        self.settle("hijack");
+        match started {
+            Ok(b) => b,
+            Err(e) => {
+                self.log.push(format!(
+                    "  hijack {script:08x}: {}",
+                    first_lines(&e.to_string())
+                ));
+                false
+            }
+        }
+    }
+
+    /// The minigames waiting on the player's pad (a hijack's prompts).
+    pub fn minigames(&self) -> Vec<crate::hijack::Minigame> {
+        self.events.minigames()
+    }
+
+    /// The player pressed a pad button, or started or stopped holding it
+    /// (`crate::hijack::BUTTONS` numbers).
+    pub fn press(&mut self, button: u32) {
+        self.world.borrow_mut().hijack.press(button);
+    }
+
+    pub fn hold(&mut self, button: u32, down: bool) {
+        let at = down.then_some(self.now);
+        self.world.borrow_mut().hijack.hold(button, at);
+    }
+
+    /// A character's action (a [`crate::hijack::HijackCommand::State`]
+    /// key) played to its end.
+    pub fn action_finished(&mut self, guid: u32) {
+        self.world.borrow_mut().hijack.action_finished(guid);
     }
 
     /// Game time so far.

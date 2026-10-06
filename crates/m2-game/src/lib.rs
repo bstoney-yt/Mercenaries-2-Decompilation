@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod events;
+pub mod hijack;
 pub mod hud;
 pub mod inventory;
 pub mod layers;

@@ -93,6 +93,8 @@ impl Object {
 /// Something a script asked the game to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
+    /// A hijack's own requests (`crate::hijack`).
+    Hijack(crate::hijack::HijackCommand),
     /// Create `what` (an object template's name, such as `"Veyron"` or
     /// `"Explosion (Grenade)"`) as `guid`.
     Spawn {
@@ -298,6 +300,8 @@ pub struct ScriptWorld {
     pub survival_mode: bool,
     /// The weapons people carry.
     pub inventory: crate::inventory::Inventory,
+    /// Actions playing and the pad, for hijacks.
+    pub hijack: crate::hijack::HijackWorld,
 }
 
 impl ScriptWorld {
@@ -349,7 +353,7 @@ impl ScriptWorld {
     /// Spawns a copy of `what` and tells the game to. A crewed vehicle
     /// (`"Mi26 (VZA Intro) (Driver)"`) comes with its pilot in the
     /// driver's seat, as scripts expect of `Vehicle.GetDriver`.
-    fn spawn(&mut self, what: String, position: [f32; 3], yaw: f32) -> u32 {
+    pub(crate) fn spawn(&mut self, what: String, position: [f32; 3], yaw: f32) -> u32 {
         let crewed = what.to_ascii_lowercase().ends_with("(driver)");
         let guid = self.spawn_guid();
         let mut object = Object::new(&what, position);
@@ -531,6 +535,18 @@ impl World for ScriptWorld {
 
     fn named(&self, name: &str) -> Option<u32> {
         self.by_name(name)
+    }
+
+    fn action_done(&self, guid: u32) -> bool {
+        self.hijack.action_done(guid)
+    }
+
+    fn hijack_presses(&self) -> &[u32] {
+        self.hijack.presses()
+    }
+
+    fn hijack_held_since(&self, button: u32) -> Option<f64> {
+        self.hijack.held_since(button)
     }
 }
 
