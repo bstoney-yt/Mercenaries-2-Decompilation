@@ -849,7 +849,7 @@ impl GameAudio {
                     buffer.seconds(),
                     if looped { ", looped" } else { "" }
                 );
-                let mut play = Play::flat(buffer).gain(volume.clamp(0.0, 2.0));
+                let mut play = Play::flat(buffer).gain(volume.clamp(0.0, 2.0)).ui();
                 if looped {
                     play = play.looped();
                 }
@@ -862,6 +862,13 @@ impl GameAudio {
             }
             None => eprintln!("ui sound: {cue} not found"),
         }
+    }
+
+    /// Ducks (or restores) everything but the interface and the radio's
+    /// voices, over `seconds` (`Sound.FadeCategoryDown`/`Up`).
+    pub fn fade_world(&mut self, level: f32, seconds: f32) {
+        eprintln!("world sounds fade to {level:.2} over {seconds:.2} s");
+        self.out.with(|m| m.fade_world(level, seconds));
     }
 
     /// Stops interface sound `cue` if it plays (`Sound.StopSound`).
@@ -1316,7 +1323,7 @@ impl GameAudio {
                     falloff,
                     ..Play::at(buffer, at)
                 },
-                None => Play::flat(buffer),
+                None => Play::flat(buffer).ui(),
             };
             let voice = self.out.with(|m| m.play(play.gain(gain)));
             if let Some(l) = line {
