@@ -137,6 +137,17 @@ pub enum Command {
     /// The scripts took a free support item back
     /// (`MrxSupportData.RemoveFreebie`), by its key.
     RemoveFreebie(String),
+    /// A scripted voice line (`VO.Cue`): `cue` names it
+    /// (`"Fiona-In-Mission-Contract-Vz01-146"`), `speaker` says it
+    /// (`None`: over the radio). Report its length with
+    /// [`crate::mission::Mission::line_length`].
+    Say {
+        id: u32,
+        speaker: Option<u32>,
+        cue: String,
+    },
+    /// Stop line `id` (`VO.Cancel`).
+    Hush(u32),
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -172,6 +183,8 @@ pub struct ScriptWorld {
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
     /// name in lower case.
     templates: HashMap<String, u32>,
+    /// Scripted voice lines playing.
+    pub vo: crate::vo::Lines,
 }
 
 impl ScriptWorld {
@@ -981,6 +994,38 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+
+    // Scripted voice lines, as (speaker, cue, callback, values, priority,
+    // send over the network); speaker 0 is the radio. The sequences that
+    // cue them (`MrxVoSequence`) do their own ordering by priority, so
+    // `AddSequence`/`RemoveSequence` need do nothing here.
+    let vo = lib("VO")?;
+    add(&vo, "Cue", |w, _, a| {
+        let Some(Value::String(cue)) = a.get(1) else {
+            return values([Value::Boolean(false)]);
+        };
+        let speaker = id(a.first()).filter(|&g| g != 0);
+        let callback = match a.get(2) {
+            Some(Value::Function(f)) => Some(f.clone()),
+            _ => None,
+        };
+        let say = w.vo.cue(speaker, cue.to_string_lossy(), callback);
+        w.commands.push(say);
+        values([Value::Boolean(true)])
+    })?;
+    add(&vo, "Cancel", |w, _, a| {
+        let speaker = id(a.first()).filter(|&g| g != 0);
+        let cue = match a.get(1) {
+            Some(Value::String(s)) => Some(s.to_string_lossy()),
+            _ => None,
+        };
+        let hush = w.vo.cancel(speaker, cue.as_deref());
+        w.commands.extend(hush);
+        values([])
+    })?;
+    for name in ["AddSequence", "RemoveSequence"] {
+        add(&vo, name, |_, _, _| values([]))?;
+    }
 
     // Developer switches (skip to a mission, force a briefing): all off.
     let sys = lib("Sys")?;
