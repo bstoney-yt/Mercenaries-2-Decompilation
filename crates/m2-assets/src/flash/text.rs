@@ -226,8 +226,14 @@ impl Font {
                 usize::from(b.u16())
             }
         };
-        for _ in 0..n {
-            offset(&mut b);
+        // Scaleform strips a texture font's glyph shapes: its offset table
+        // is then a single 0, then the code table's offset (which a real
+        // table's first offset, past the table itself, never is).
+        let first = if n > 0 { offset(&mut b) } else { 1 };
+        if first != 0 {
+            for _ in 1..n {
+                offset(&mut b);
+            }
         }
         let code_table = if n > 0 || flags & 0x80 != 0 {
             offset(&mut b)

@@ -158,6 +158,11 @@ pub struct Widget {
     /// How many times `RestartFlash` (or a new `SetFlashSwfFile`) asked
     /// for the movie from its start.
     pub flash_restarts: u32,
+    /// The PDA map's blips as last sent to the movie, by name: the movie's
+    /// `UpdateBlip` finds a blip by a name it overwrites on the first
+    /// update (`pointsArray[j].splice(0, ..., internalName, ...)`), so it
+    /// is sent only what changed, as the engine's per-frame updates must.
+    pda_blips: BTreeMap<String, Vec<FlashArg>>,
     pub movie: Option<String>,
     /// `SetWidgetFullscreen`: drawn over the whole screen, whatever its box.
     pub fullscreen: bool,
@@ -204,6 +209,7 @@ impl Widget {
             flash_handlers: BTreeMap::new(),
             flash_paused: false,
             flash_restarts: 0,
+            pda_blips: BTreeMap::new(),
             movie: None,
             fullscreen: false,
             minimap: None,
@@ -1829,6 +1835,7 @@ natives! {
         if let Some(w) = s.widgets.get_mut(&a.id(0)) {
             w.flash_restarts += 1;
             w.flash_calls.clear();
+            w.pda_blips.clear();
         }
         Ok(MultiValue::new())
     },
@@ -1867,11 +1874,14 @@ natives! {
         if let (Some(Value::Table(list)), Some(w)) = (a.get(1), s.widgets.get_mut(&a.id(0))) {
             for entry in list.clone().sequence_values::<Value>().flatten() {
                 if let Value::Table(entry) = entry {
-                    let args = entry
+                    let args: Vec<FlashArg> = entry
                         .sequence_values::<Value>()
                         .flatten()
                         .map(|v| FlashArg::of(&v))
                         .collect();
+                    if let Some(FlashArg::Text(name)) = args.first() {
+                        w.pda_blips.insert(name.clone(), args.clone());
+                    }
                     w.flash_calls.push(("AddBlip".to_owned(), args));
                 }
             }
@@ -1882,19 +1892,29 @@ natives! {
     // `AddPdaMapBlips`; the movie's `UpdateBlip` takes the same arguments.
     "UpdatePdaBlip" => |s, _, a| {
         if let (Some(Value::Table(entry)), Some(w)) = (a.get(1), s.widgets.get_mut(&a.id(0))) {
-            let args = entry
+            let args: Vec<FlashArg> = entry
                 .clone()
                 .sequence_values::<Value>()
                 .flatten()
                 .map(|v| FlashArg::of(&v))
                 .collect();
-            w.flash_calls.push(("UpdateBlip".to_owned(), args));
+            let name = match args.first() {
+                Some(FlashArg::Text(n)) => n.clone(),
+                _ => String::new(),
+            };
+            if w.pda_blips.get(&name) != Some(&args) {
+                w.pda_blips.insert(name, args.clone());
+                w.flash_calls.push(("UpdateBlip".to_owned(), args));
+            }
         }
         Ok(MultiValue::new())
     },
     // (widget, name).
     "RemovePdaBlip" => |s, _, a| {
         if let (Some(v), Some(w)) = (a.get(1), s.widgets.get_mut(&a.id(0))) {
+            if let FlashArg::Text(name) = FlashArg::of(v) {
+                w.pda_blips.remove(&name);
+            }
             w.flash_calls
                 .push(("RemoveBlip".to_owned(), vec![FlashArg::of(v)]));
         }
@@ -1973,6 +1993,7 @@ natives! {
             w.swf = a.text(1);
             w.flash_restarts += 1;
             w.flash_calls.clear();
+            w.pda_blips.clear();
         }
         // Loaded at once: the callback runs at the next tick.
         if let Some(cb) = keep_callback(s, l, a.get(2), a.get(3))? {
@@ -2324,6 +2345,7 @@ mod tests {
             local G = _GuiInternal
             pda = G.CreateFlashWidget()
             G.SetFlashSwfFile(pda, "topbar")
+            G.UpdatePdaBlip(pda, { "player1_mc", "player1_mc", 35, 40 })
             G.UpdatePdaBlip(pda, { "player1_mc", "player1_mc", 35, 40 })
             G.RemovePdaBlip(pda, "target1_mc")
             "#,
