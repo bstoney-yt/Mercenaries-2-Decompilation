@@ -167,6 +167,45 @@ pub struct GameAudio {
     /// The sounds the clips' events play, once read (on a thread).
     clip_sounds: Option<ClipSounds>,
     clip_sounds_loading: Option<Receiver<ClipSounds>>,
+    /// The interface's sounds (`ui_hud`), once read (on a thread).
+    ui: Option<UiSounds>,
+    ui_loading: Option<Receiver<UiSounds>>,
+}
+
+/// The interface's sound bank, `ui_hud`: its cue table (cue name hash to
+/// record, record to the bank's sound) and its sounds.
+#[derive(Debug, Default)]
+pub struct UiSounds {
+    cues: Option<m2_assets::CueTable>,
+    sounds: Vec<SoundBuffer>,
+}
+
+impl UiSounds {
+    fn load(install: &Install) -> Self {
+        let bank = m2_assets::name_hash("ui_hud");
+        let Ok(mut source) = install.open_world() else {
+            return Self::default();
+        };
+        let cues = source
+            .asset(bank, m2_assets::voice::CUE_TABLE_TYPE)
+            .ok()
+            .and_then(|d| m2_assets::CueTable::parse(&d).ok());
+        let library = SoundLibrary::load_banks(&mut source, &[bank]);
+        let sounds = library
+            .bank_hash(bank)
+            .map(|(_, s)| s.to_vec())
+            .unwrap_or_default();
+        Self { cues, sounds }
+    }
+
+    /// The sound cue `cue` plays and its volume (the first of its
+    /// record's variants that is this bank's).
+    fn find(&self, cue: &str) -> Option<(SoundBuffer, f32)> {
+        let table = self.cues.as_ref()?;
+        let record = table.cue_record(m2_assets::name_hash(cue))?;
+        let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
+        Some((self.sounds.get(index as usize)?.clone(), record.volume))
+    }
 }
 
 /// Banks the clips' sound events are found in, by name: the resident
@@ -702,6 +741,40 @@ impl GameAudio {
                 });
                 rx
             }),
+            ui: None,
+            ui_loading: install.map(|install| {
+                let install = install.clone();
+                let (tx, rx) = channel();
+                std::thread::spawn(move || {
+                    let ui = UiSounds::load(&install);
+                    eprintln!(
+                        "ui sounds: {} cues, {} sounds",
+                        ui.cues.as_ref().map_or(0, |c| c.cues.len()),
+                        ui.sounds.len()
+                    );
+                    let _ = tx.send(ui);
+                });
+                rx
+            }),
+        }
+    }
+
+    /// Plays the interface's sound cue `cue` (`ui_HUD_Objective_New`),
+    /// flat.
+    pub fn ui_sound(&mut self, cue: &str) {
+        if let Some(rx) = &self.ui_loading
+            && let Ok(u) = rx.try_recv()
+        {
+            self.ui = Some(u);
+            self.ui_loading = None;
+        }
+        match self.ui.as_ref().and_then(|u| u.find(cue)) {
+            Some((buffer, volume)) => {
+                eprintln!("ui sound: {cue} ({:.2} s)", buffer.seconds());
+                self.out
+                    .with(|m| m.play(Play::flat(buffer).gain(volume.clamp(0.0, 2.0))));
+            }
+            None => eprintln!("ui sound: {cue} not found"),
         }
     }
 

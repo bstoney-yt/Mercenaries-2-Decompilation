@@ -3320,6 +3320,9 @@ impl Running {
             for id in hushed {
                 self.audio.hush(id);
             }
+            for cue in m.take_sounds() {
+                self.audio.ui_sound(&cue);
+            }
         }
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
