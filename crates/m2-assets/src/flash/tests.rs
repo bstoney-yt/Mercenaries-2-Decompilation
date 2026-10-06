@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use super::avm1::{Runtime, Value};
+use super::avm1::{ObjKind, Object, Runtime, Value};
 use super::player::{Control, Library, Place, Player, TIMELINE_DEPTH, Timeline};
 use super::text::{EditText, Font, FontBook, plain};
 use super::*;
@@ -824,4 +824,42 @@ fn a_texture_font_without_glyph_shapes_keeps_its_codes() {
     assert_eq!(font.codes.len(), 3);
     assert_eq!(font.codes[&'B'], 1);
     assert_eq!(font.advances.len(), 3);
+}
+
+#[test]
+fn key_listeners_hear_key_presses() {
+    // A listener whose onKeyDown keeps Key.getCode() in `got`.
+    let lib = Library {
+        root: Rc::new(Timeline {
+            frames: vec![Vec::new()],
+            ..Timeline::default()
+        }),
+        ..Library::default()
+    };
+    let mut rt = Runtime::new(Player::new(Rc::new(lib)));
+    let listener = Value::Object(rt.avm.object());
+    let on_down = Object::new(
+        ObjKind::Native(|avm, _, _, _| {
+            let code = Value::Number(f64::from(avm.key_code));
+            avm.global.borrow_mut().set("got", code);
+            Value::Undefined
+        }),
+        None,
+    );
+    if let Value::Object(o) = &listener {
+        o.borrow_mut().set("onKeyDown", Value::Object(on_down));
+    }
+    let key = Value::Object(rt.avm.global.clone());
+    let key = rt.avm.get(&mut rt.player, &key, "Key");
+    let add = rt.avm.get(&mut rt.player, &key, "addListener");
+    rt.avm
+        .call_value(&mut rt.player, &add, &key, std::slice::from_ref(&listener));
+    rt.avm.call_value(&mut rt.player, &add, &key, &[listener]);
+    rt.key_down(36);
+    let global = Value::Object(rt.avm.global.clone());
+    assert_eq!(number(&rt.avm.get(&mut rt.player, &global, "got")), 36.0);
+    assert_eq!(rt.avm.key_listeners.len(), 1);
+    assert_eq!(rt.avm.keys_down, vec![36]);
+    rt.key_up(36);
+    assert!(rt.avm.keys_down.is_empty());
 }

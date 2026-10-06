@@ -20,6 +20,10 @@ fn def(avm: &Avm, obj: &Obj, name: &str, f: Native) {
     obj.borrow_mut().set(name, native(avm, f));
 }
 
+fn same_object(a: &Value, b: &Value) -> bool {
+    matches!((a, b), (Value::Object(x), Value::Object(y)) if Rc::ptr_eq(x, y))
+}
+
 fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or_default()
 }
@@ -315,12 +319,28 @@ pub fn install(avm: &mut Avm) {
     ] {
         key.borrow_mut().set(n, Value::Number(f64::from(v)));
     }
-    def(avm, &key, "isDown", |_, _, _, _| Value::Bool(false));
+    def(avm, &key, "isDown", |avm, p, _, a| {
+        let code = num(avm, p, a, 0) as i32;
+        Value::Bool(avm.keys_down.contains(&code))
+    });
     def(avm, &key, "isToggled", |_, _, _, _| Value::Bool(false));
-    def(avm, &key, "getCode", |_, _, _, _| Value::Number(0.0));
+    def(avm, &key, "getCode", |avm, _, _, _| {
+        Value::Number(f64::from(avm.key_code))
+    });
     def(avm, &key, "getAscii", |_, _, _, _| Value::Number(0.0));
-    def(avm, &key, "addListener", |_, _, _, _| Value::Undefined);
-    def(avm, &key, "removeListener", |_, _, _, _| Value::Bool(true));
+    def(avm, &key, "addListener", |avm, _, _, a| {
+        let l = arg(a, 0);
+        if matches!(l, Value::Object(_)) && !avm.key_listeners.iter().any(|k| same_object(k, &l)) {
+            avm.key_listeners.push(l);
+        }
+        Value::Undefined
+    });
+    def(avm, &key, "removeListener", |avm, _, _, a| {
+        let l = arg(a, 0);
+        let before = avm.key_listeners.len();
+        avm.key_listeners.retain(|k| !same_object(k, &l));
+        Value::Bool(avm.key_listeners.len() != before)
+    });
     g.borrow_mut().set("Key", Value::Object(key));
     let mouse = avm.object();
     for n in ["hide", "show", "addListener", "removeListener"] {

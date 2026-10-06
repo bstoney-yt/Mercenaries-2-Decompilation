@@ -258,6 +258,12 @@ pub struct Avm {
     /// Logs each function call, goto, `_visible` change and undefined
     /// variable or member read, for finding what a movie does.
     pub trace: bool,
+    /// `Key.addListener`'s objects, told of key presses
+    /// ([`Runtime::key_down`]).
+    pub key_listeners: Vec<Value>,
+    /// The key last pressed (`Key.getCode`) and those held (`Key.isDown`).
+    pub key_code: i32,
+    pub keys_down: Vec<i32>,
 }
 
 #[derive(Default)]
@@ -308,6 +314,9 @@ impl Avm {
             pens: HashMap::new(),
             stage: [0.0; 2],
             trace: false,
+            key_listeners: Vec::new(),
+            key_code: 0,
+            keys_down: Vec::new(),
         };
         library::install(&mut avm);
         avm
@@ -2221,6 +2230,34 @@ impl Runtime {
         let r = self.avm.call_value(&mut self.player, &f, &owner, args);
         self.run_due();
         r
+    }
+
+    /// A key goes down (a Flash key code, as `Key.getCode` gives it): each
+    /// `Key` listener's `onKeyDown` runs.
+    pub fn key_down(&mut self, code: i32) {
+        self.avm.key_code = code;
+        if !self.avm.keys_down.contains(&code) {
+            self.avm.keys_down.push(code);
+        }
+        self.key_event("onKeyDown");
+    }
+
+    /// A key comes up: each `Key` listener's `onKeyUp` runs.
+    pub fn key_up(&mut self, code: i32) {
+        self.avm.key_code = code;
+        self.avm.keys_down.retain(|&k| k != code);
+        self.key_event("onKeyUp");
+    }
+
+    fn key_event(&mut self, name: &str) {
+        for listener in self.avm.key_listeners.clone() {
+            let f = self.avm.get(&mut self.player, &listener, name);
+            if !matches!(f, Value::Undefined) {
+                self.avm.budget = 0;
+                self.avm.call_value(&mut self.player, &f, &listener, &[]);
+            }
+        }
+        self.run_due();
     }
 
     /// What the scripts asked of the host since the last call:

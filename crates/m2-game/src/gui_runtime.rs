@@ -374,6 +374,16 @@ impl Screen {
         calls
     }
 
+    /// Sends a widget's PDA blips again (`UpdateBlip` each), for a map
+    /// movie loaded after they were sent.
+    pub fn resend_pda_blips(&mut self, id: u32) {
+        if let Some(w) = self.widgets.get_mut(&id) {
+            for args in w.pda_blips.values() {
+                w.flash_calls.push(("UpdateBlip".to_owned(), args.clone()));
+            }
+        }
+    }
+
     /// Errors since the last call.
     pub fn take_log(&mut self) -> Vec<String> {
         std::mem::take(&mut self.log)
