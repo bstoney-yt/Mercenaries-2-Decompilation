@@ -777,6 +777,10 @@ fn frame_arg(avm: &mut Avm, player: &mut Player, id: ClipId, v: &Value) -> Optio
 fn goto(avm: &mut Avm, player: &mut Player, this: &Value, args: &[Value], play: bool) -> Value {
     if let Some(id) = this_clip(this) {
         let f = arg(args, 0);
+        if avm.trace {
+            let name = player.clip(id).map_or("", |c| c.name.as_str());
+            avm.log.push(format!("{name}.goto {f:?}"));
+        }
         if let Some(n) = frame_arg(avm, player, id, &f) {
             player.goto(id, n);
         }
