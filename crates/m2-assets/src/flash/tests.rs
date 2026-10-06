@@ -752,3 +752,19 @@ fn text_fields_lay_out_in_texture_glyphs() {
         ("Marga".to_owned(), Some([1.0, 0.0, 0.0, 1.0]))
     );
 }
+
+#[test]
+fn a_movie_on_another_level_has_its_own_root() {
+    // _root.n = 1, in the movie loaded on _level1.
+    let mut a = Asm::default();
+    a.str("_root").op(0x1C).str("n").int(1).op(0x4F);
+    let level1 = library(vec![vec![Control::Script(a.bytes())]], sprite_frames());
+    let mut rt = run(&Asm::default(), Vec::new());
+    rt.run_due();
+    let id = rt.player.load_level(1, level1);
+    rt.run_due();
+    assert_eq!(rt.player.root_of(id), id);
+    let root1 = Value::Object(rt.avm.clip_object(id));
+    assert_eq!(number(&rt.avm.get(&mut rt.player, &root1, "n")), 1.0);
+    assert!(matches!(var(&mut rt, "n"), Value::Undefined));
+}
