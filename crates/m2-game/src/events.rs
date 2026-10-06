@@ -60,6 +60,10 @@ pub trait World {
     fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
         None
     }
+    /// An object's labels (`"Boat"`, `"Tank"`), for class expressions.
+    fn labels(&self, _guid: u32) -> Vec<String> {
+        Vec::new()
+    }
     /// An object's health, if the world tracks it.
     fn health(&self, _guid: u32) -> Option<f32> {
         None
@@ -337,6 +341,34 @@ impl Events {
                         p.held = holds;
                         rising.then_some(vec![extra])
                     }
+                    // `held_by` keeps who was seated at the last check
+                    // (none before the first), `held` that one was made.
+                    Check::Seats(riders) => {
+                        let mode = seat_mode(&p);
+                        let any = mode.contains('a');
+                        let mut fire = Vec::new();
+                        let mut seated = BTreeSet::new();
+                        for (r, inside, extra) in riders {
+                            let was = p.held_by.contains(&r);
+                            if inside {
+                                seated.insert(r);
+                            }
+                            let got_in = inside && !was;
+                            let got_out = !inside && was;
+                            if (got_in && (any || mode.contains('e') || mode.contains('i')))
+                                || (got_out && (any || mode.contains('x') || mode.contains('o')))
+                                || (!inside && !p.held && mode.contains('o'))
+                            {
+                                fire.push(extra);
+                            }
+                        }
+                        p.held_by = seated;
+                        p.held = true;
+                        if !p.persistent {
+                            fire.truncate(1);
+                        }
+                        (!fire.is_empty()).then_some(fire)
+                    }
                     // Fires for each object as the condition starts to
                     // hold for it; once only, unless persistent.
                     Check::Each(members) => {
@@ -427,12 +459,38 @@ fn guid(t: &Table, i: i64) -> Option<u32> {
     as_id(&t.raw_get::<Value>(i).ok()?)
 }
 
+/// Whether an object with `labels` is of class `expr`: labels joined by
+/// `&&`, each maybe negated with `!` (`"Tank && !APC"`), in any case.
+fn class_matches(expr: &str, labels: &[String]) -> bool {
+    let has = |l: &str| labels.iter().any(|x| x.eq_ignore_ascii_case(l));
+    expr.split("&&").all(|term| {
+        let term = term.trim();
+        match term.strip_prefix('!') {
+            Some(not) => !has(not.trim()),
+            None => has(term),
+        }
+    })
+}
+
+/// How a seat event's mode letters (`"E"`, `"xo"`, ...) read; the old
+/// words `"enter"` and `"exit"` as `"ei"` and `"xo"`.
+fn seat_mode(p: &Pending) -> String {
+    match text(&p.params, 4).as_deref() {
+        Some("enter") | None => "ei".to_owned(),
+        Some("exit") => "xo".to_owned(),
+        Some(m) => m.to_owned(),
+    }
+}
+
 enum Check {
     /// Fire now with these values after the callback's data.
     Fire(Vec<Value>),
     /// A condition: whether it holds, and the values to pass when it
     /// starts to.
     Holds(bool, Vec<Value>),
+    /// Riders and whether each is in a wanted seat, with the values to
+    /// pass: fired by the event's mode as they get in or out.
+    Seats(Vec<(u32, bool, Vec<Value>)>),
     /// A condition on each of several objects (an object filter's): per
     /// object, whether it holds and the values to pass.
     Each(Vec<(u32, bool, Vec<Value>)>),
@@ -539,25 +597,34 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             }
             no
         }
-        // { rider, vehicle, seat, "enter" or "exit" }: rider is a guid,
-        // "hero" or a label, vehicle a guid (or anything for any), seat a
-        // seat type ("Gunner", "Any"; not told apart yet). Passes the
-        // rider and vehicle.
+        // { rider, vehicle, seat, mode }: rider is a guid, "hero" or a
+        // label; vehicle a guid (0: any), a vehicle's name or a class
+        // expression of labels ("Boat", "Tank && !APC"); seat a seat code
+        // ("D" the driver's; not told apart yet); mode letters: e as she
+        // gets in, x as she gets out, i while in, o while out ("ei",
+        // "xo"; "a" either way). Passes the rider and vehicle.
         "ObjectInSeat" => {
-            // The vehicle may be named rather than a guid.
-            let vehicle =
-                guid(&p.params, 2).or_else(|| objects(&p.params, 2, world).first().copied());
-            let exit = text(&p.params, 4).as_deref() == Some("exit");
-            for r in objects(&p.params, 1, world) {
-                let seated = world
-                    .vehicle_of(r)
-                    .filter(|v| vehicle.is_none_or(|want| want == *v));
-                if seated.is_some() != exit {
-                    let v = seated.or(vehicle).unwrap_or(0);
-                    return Check::Holds(true, vec![id(r), id(v)]);
+            let wanted = |v: u32| match p.params.raw_get::<Value>(2) {
+                Ok(Value::String(s)) => {
+                    let named = objects(&p.params, 2, world);
+                    if named.is_empty() {
+                        class_matches(&s.to_string_lossy(), &world.labels(v))
+                    } else {
+                        named.contains(&v)
+                    }
                 }
-            }
-            no
+                Ok(other) => as_id(&other).is_none_or(|want| want == 0 || want == v),
+                Err(_) => true,
+            };
+            Check::Seats(
+                objects(&p.params, 1, world)
+                    .into_iter()
+                    .map(|r| {
+                        let seated = world.vehicle_of(r).filter(|&v| wanted(v));
+                        (r, seated.is_some(), vec![id(r), id(seated.unwrap_or(0))])
+                    })
+                    .collect(),
+            )
         }
         // { state, "enter" or "exit" }: as the game enters or leaves a
         // state; passes both.

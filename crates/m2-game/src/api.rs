@@ -332,6 +332,12 @@ impl World for ScriptWorld {
     fn is_awake(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.awake)
     }
+    fn labels(&self, guid: u32) -> Vec<String> {
+        self.objects
+            .get(&guid)
+            .map(|o| o.labels.clone())
+            .unwrap_or_default()
+    }
     fn health(&self, guid: u32) -> Option<f32> {
         self.objects.get(&guid).map(|o| o.health)
     }
@@ -1228,6 +1234,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     // Developer switches (skip to a mission, force a briefing): all off.
     let sys = lib("Sys")?;
+    // The game shows its tutorial tips.
+    add(&sys, "TutorialsEnabled", |_, _, _| {
+        values([Value::Boolean(true)])
+    })?;
     for name in ["GetSkipMission", "GetINIBriefing", "GetForceNewGame"] {
         add(&sys, name, |_, _, _| values([Value::Nil]))?;
     }
@@ -1652,6 +1662,41 @@ mod tests {
         assert!(events.update_shared(0.1, &world).is_empty());
         let seated: String = host.lua().globals().get("seated").unwrap();
         assert_eq!(seated, "in:1/50");
+    }
+
+    #[test]
+    fn seat_events_read_mode_letters_and_classes() {
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .objects
+            .get_mut(&50)
+            .unwrap()
+            .labels
+            .push("Car".into());
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                log = ""
+                assert(Vehicle.Enter(50, 1, "d", true))
+                local function note(t) return function() log = log .. t end end
+                Event.Create(Event.ObjectInSeat, {1, "Car", "D", "E"}, note("car "))
+                Event.Create(Event.ObjectInSeat, {1, "Boat", "D", "E"}, note("boat "))
+                Event.Create(Event.ObjectInSeat, {1, "Car && !APC", "D", "X"}, note("out "))
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert!(events.update_shared(0.1, &world).is_empty());
+        assert!(events.update_shared(0.1, &world).is_empty());
+        let log: String = host.lua().globals().get("log").unwrap();
+        assert_eq!(log, "car ");
+        host.lua().load("Vehicle.Exit(1)").exec().unwrap();
+        assert!(events.update_shared(0.1, &world).is_empty());
+        let log: String = host.lua().globals().get("log").unwrap();
+        assert_eq!(log, "car out ");
     }
 
     #[test]
