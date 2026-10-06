@@ -1018,6 +1018,17 @@ fn screenshot(
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
     write_ppm(&backend, out)?;
     eprintln!("wrote {}", out.display());
+    // The same frame without the HUD's fades, to compare (`M2_PAINT_AB`).
+    if std::env::var_os("M2_PAINT_AB").is_some()
+        && let Some(g) = hud.game.as_mut()
+    {
+        g.skip_covers = true;
+        let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
+        render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
+        let plain = out.with_extension("nocover.ppm");
+        write_ppm(&backend, &plain)?;
+        eprintln!("wrote {}", plain.display());
+    }
     Ok(())
 }
 
