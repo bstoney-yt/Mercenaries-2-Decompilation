@@ -225,6 +225,10 @@ fn display_to_linear(c: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
     var c = textureSampleLevel(source, linear, v.uv, 0.0).rgb * exposure();
+    // `M2_POST_RAW=1`: the world as drawn, nothing finished (a check).
+    if post.grade.a < 0.5 {
+        return vec4<f32>(textureSampleLevel(source, linear, v.uv, 0.0).rgb, 1.0);
+    }
     c = c + textureSampleLevel(glow, linear, v.uv, 0.0).rgb * post.params.z;
     if game_tone_map() {
         // As the game's: luminance scaled by the target over the adapted,
@@ -572,7 +576,11 @@ impl Post {
             lighting.bloom,
             lighting.tone_map.map_or(1.0, |t| t.average_power),
         ];
-        let grade = lighting.grade.extend(1.0).to_array();
+        let raw = std::env::var("M2_POST_RAW").is_ok_and(|v| v == "1");
+        let grade = lighting
+            .grade
+            .extend(if raw { 0.0 } else { 1.0 })
+            .to_array();
         let glowing = lighting.bloom > 0.0;
         // How far to follow this frame's luminance: all the way at first.
         let now = Instant::now();
