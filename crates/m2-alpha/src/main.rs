@@ -157,7 +157,7 @@ struct Options {
     /// With `--screenshot` on foot: hits she takes just before the
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
-    hurt: Vec<f32>,
+    hit_from: Vec<f32>,
     /// With `--screenshot` on foot: call a Satellite Guided Bomb on the
     /// spot ahead of her, the picture with the support menu open (menu),
     /// through the satellite's view, with the timing wheel up, or after
@@ -173,9 +173,15 @@ struct Options {
     mission_seconds: f32,
     /// Our stand-in HUD instead of the game's own.
     old_hud: bool,
+    /// With `--mission --screenshot`: her health drops to this eight
+    /// seconds in, to see the scripts' healing and survival rescue.
+    hurt: Option<f32>,
     /// With `--mission --screenshot`: she plays the mission herself, by
     /// its markers, until it is done or the seconds are up.
     autoplay: bool,
+    /// With `--screenshot`: bring down the mission's gates as the bomb
+    /// does, logging where their pieces go ([`gates_for_screenshot`]).
+    gates: bool,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -303,9 +309,9 @@ fn parse_args() -> anyhow::Result<Options> {
                 )
             }
             "--aim" => o.aim = true,
-            "--hurt" => {
+            "--hit-from" => {
                 for d in value()?.split(',') {
-                    o.hurt.push(d.parse().context("--hurt expects degrees")?);
+                    o.hit_from.push(d.parse().context("--hit-from expects degrees")?);
                 }
             }
             "--weapon" => {
@@ -351,6 +357,8 @@ fn parse_args() -> anyhow::Result<Options> {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
             "--autoplay" => o.autoplay = true,
+            "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--gates" => o.gates = true,
             "--mission-seconds" => {
                 o.mission_seconds = value()?
                     .parse()
@@ -387,6 +395,10 @@ fn keep_crash_reports() {
         }
     }));
 }
+
+/// When `--hurt` takes her health: after the start's fade, which keeps her
+/// from harm.
+const HURT_AT: f32 = 8.0;
 
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
@@ -800,6 +812,15 @@ fn screenshot(
             out,
         )?);
     }
+    if options.gates {
+        if let Some(install) = install {
+            eprintln!(
+                "sound: {} of the fight's 6 sounds found",
+                sound::fight_sounds_found(install)
+            );
+        }
+        gates_for_screenshot(&mut backend, &mut game, fov, aspect, out)?;
+    }
     if let Some(stage) = options
         .satellite
         .filter(|_| game.on_foot && game.scene.player.is_some())
@@ -958,7 +979,7 @@ fn screenshot(
         let at = p.character.position + m2_math::glam::Vec3::Y;
         let ahead = game.camera.forward().with_y(0.0).normalize_or_zero();
         let right = game.camera.right();
-        for d in &options.hurt {
+        for d in &options.hit_from {
             let (s, c) = d.to_radians().sin_cos();
             game.combat
                 .hurt_from(15.0, at + (ahead * c + right * s) * 10.0);
@@ -976,7 +997,7 @@ fn screenshot(
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
         info.game = Some(gamehud::HudState::of(&mut game));
-        let seconds = if options.hurt.is_empty() { 2.0 } else { 0.5 };
+        let seconds = if options.hit_from.is_empty() { 2.0 } else { 0.5 };
         hud.settle(&info, (w, h), seconds, Duration::from_secs(120));
         info.game = Some(gamehud::HudState::of(&mut game));
     }
@@ -984,6 +1005,357 @@ fn screenshot(
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
     write_ppm(&backend, out)?;
     eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+/// What stands where a bomb fell (`at`, x and z), as its pictures are
+/// taken: the state layers' models near it and how each stands (a gate
+/// the bomb broke: its pieces, how far the rest has sunk, what is drawn
+/// of it), and the island's own placed models whose boxes cover the spot
+/// (round 99's broken gates still showed an arch and doors at 8 s, when
+/// the gate's own wreck is drawn no more).
+fn describe_bombed(game: &Game, at: m2_math::glam::Vec2, fov: f32, aspect: f32) {
+    let Some(world) = &game.scene.world else {
+        return;
+    };
+    let props = &game.scene.props;
+    let mut near: Vec<(f32, u32)> = props
+        .shown()
+        .map(|(e, p)| {
+            (
+                p.position
+                    .with_y(0.0)
+                    .distance(m2_math::glam::Vec3::new(at.x, 0.0, at.y)),
+                e,
+            )
+        })
+        .filter(|&(d, _)| d < BOMBED_REACH)
+        .collect();
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (d, e) in near.iter().take(4) {
+        if let Some(s) = props.describe(&world.physics, *e) {
+            eprintln!("  prop {d:.1} m from the bomb: {s}");
+        }
+    }
+    let spot = near
+        .first()
+        .and_then(|&(_, e)| props.centre(e))
+        .unwrap_or(m2_math::glam::Vec3::new(at.x, game.focus().y, at.y));
+    let eye = game.view(fov, aspect).eye();
+    let over: Vec<String> = world
+        .covering(spot, eye, 2.0)
+        .into_iter()
+        .map(|(model, place, size)| {
+            format!(
+                "{model:08x} at {place:.1}, {:.1}x{:.1}x{:.1} m",
+                size.x, size.y, size.z
+            )
+        })
+        .collect();
+    eprintln!(
+        "  the island's models drawn over {spot:.1}: {}",
+        if over.is_empty() {
+            "none".to_owned()
+        } else {
+            over.join("; ")
+        }
+    );
+}
+
+/// How far from where a bomb fell [`describe_bombed`] looks for the state
+/// layers' models (metres): a gate's middle, as far as from one end of it.
+const BOMBED_REACH: f32 = 40.0;
+
+/// The mission's gates' model (`_jungle_wallgate`'s), which the gate test
+/// brings down wherever a state layer places it.
+const GATE_MODEL: u32 = 0x1923_143c;
+
+/// How fast the gate test throws a gate's pieces each time it brings it
+/// down, and whether everything else in its box is taken down first: as
+/// in play first (and pictured), then slower and faster, to see how the
+/// look depends on it, then as in play alone (and pictured).
+const GATE_TRIES: [(f32, bool); 4] = [(1.0, false), (0.6, false), (1.6, false), (1.0, true)];
+
+/// How much of another model's box has to be inside a gate's for the
+/// gate test's last try to take it down.
+const GATE_ALONE_SHARE: f32 = 0.5;
+
+/// How many of the other models in a gate's box the gate test lists.
+const GATE_LISTED: usize = 12;
+
+/// How far (metres) a gate's piece may have gone and still be listed as
+/// held, with what it touches: round 101's gatehouse pieces went 1 to 2 m.
+const GATE_HELD: f32 = 2.5;
+
+/// With `--gates`: brings down each of the mission's gates (the state
+/// layers' [`GATE_MODEL`]s) as the satellite bomb does, its blast on the
+/// middle of the gate's top, once for each of [`GATE_TRIES`], logging how
+/// its pieces set off (`gate N, try T: sets off: ...`) and where they are
+/// 2 s and 8 s on. First it lists what else stands in the gate's box (the
+/// state layers' models, with the layer that put each up, and every
+/// static collider) and pictures the place without the gate
+/// (`<out>-gateN-without.ppm`): round 101's gates still showed whole walls
+/// either side 8 s after the bomb, where the gate has no pieces, and its
+/// gatehouse's pieces were held where they started. The first time,
+/// pictures from 50 m south of it (as the mission comes at it) of the rest
+/// of it alone and its pieces alone as it breaks (`-gateN-rest`,
+/// `-gateN-pieces`), and of all of it 2 s and 8 s on (`-gateN-2s`,
+/// `-gateN-8s`), with the pieces still near where they started and what
+/// they touch at 2 s; the last time, with the other models mostly in its
+/// box taken down and the island's statics in it (its ground aside) gone,
+/// the same at 2 s and 8 s (`-gateN-alone-2s`, `-gateN-alone-8s`).
+fn gates_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    use m2_math::glam::Vec3;
+    let tick = TICK.as_secs_f32();
+    let stem = out
+        .file_stem()
+        .map_or("shot".into(), |s| s.to_string_lossy());
+    let picture = |name: String| out.with_file_name(format!("{stem}-{name}.ppm"));
+    let Some(world) = &game.scene.world else {
+        return Ok(());
+    };
+    let mut gates: Vec<(u32, Vec3)> = world
+        .index
+        .state_objects
+        .iter()
+        .filter(|(_, o)| o.model == GATE_MODEL)
+        .map(|(&e, o)| (e, o.position))
+        .collect();
+    gates.sort_by_key(|g| g.0);
+    eprintln!(
+        "gates: {} placed: {}",
+        gates.len(),
+        gates
+            .iter()
+            .map(|(e, at)| format!("{e:#x} at {at:.1}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    game.on_foot = false;
+    // Steps the game `seconds` on, drawing every tenth tick so the island
+    // streams around the camera.
+    let run = |backend: &mut WgpuBackend, game: &mut Game, seconds: f32| {
+        for i in 0..(seconds / tick).round() as u32 {
+            game.step(Intent::default(), tick);
+            if i % 10 == 0 {
+                render(backend, game, fov, aspect, None)?;
+            }
+        }
+        anyhow::Ok(())
+    };
+    for (k, &(gate, position)) in gates.iter().enumerate() {
+        let n = k + 1;
+        // From the south, 50 m off and above the ground there, as the
+        // mission comes at it.
+        let look = |game: &mut Game, at: Vec3| {
+            let mut eye = at + Vec3::new(0.0, 6.0, -50.0);
+            if let Some(ground) = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| w.physics.island_below(eye.with_y(eye.y + 200.0), 400.0))
+            {
+                eye.y = eye.y.max(ground + 2.0);
+            }
+            game.camera = FlyCamera::looking_at(eye, at);
+            eye
+        };
+        look(game, position + Vec3::Y * 8.0);
+        game.scene.show_props([gate]);
+        let started = Instant::now();
+        // The gate, the start-up layers' models round it and the island
+        // there all in.
+        while game.scene.props.get(gate).is_none_or(|(_, loaded)| !loaded)
+            || game.startup.as_ref().is_some_and(startup::Startup::loading)
+            || game.scene.props.counts().loading + game.scene.props.counts().waiting_near > 0
+            || game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|w| w.stats().pending > 0)
+        {
+            if started.elapsed() > Duration::from_secs(120) {
+                break;
+            }
+            run(backend, game, 0.5)?;
+        }
+        let (Some(centre), Some(top)) = (game.scene.props.centre(gate), game.scene.props.top(gate))
+        else {
+            eprintln!("gate {n} ({gate:#x}): its model never loaded");
+            continue;
+        };
+        let eye = look(game, centre);
+        let facing = game
+            .scene
+            .props
+            .get(gate)
+            .map_or(Vec3::Z, |(p, _)| p.rotation * Vec3::Z);
+        eprintln!(
+            "gate {n} ({gate:#x}) at {position:.1}, seen from {eye:.1}, its z axis {facing:.2}"
+        );
+        if let Some(world) = &game.scene.world {
+            let props = &game.scene.props;
+            let others = props.others_in_box(&world.physics, gate);
+            eprintln!(
+                "gate {n}: {} other models in its box, biggest first: {}",
+                others.len(),
+                others
+                    .iter()
+                    .take(GATE_LISTED)
+                    .map(|(_, _, line)| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            if let Some((place, bounds)) = props.placed_bounds(gate) {
+                let statics: Vec<String> = world
+                    .physics
+                    .statics_in_box(place, bounds)
+                    .into_iter()
+                    .filter(|&k| k != m2_engine::StaticKey::Entity(gate))
+                    .map(|k| gate_static_name(world, props, k))
+                    .collect();
+                eprintln!(
+                    "gate {n}: {} statics in its box: {}",
+                    statics.len(),
+                    statics.join("; ")
+                );
+            }
+        }
+        game.scene.props.skip = Some(gate);
+        render(backend, game, fov, aspect, None)?;
+        write_ppm(backend, &picture(format!("gate{n}-without")))?;
+        game.scene.props.skip = None;
+        // The bomb goes off on its top.
+        let blast = top - Vec3::Y * 0.2;
+        for (t, &(scale, alone)) in GATE_TRIES.iter().enumerate() {
+            if alone && let Some(world) = &mut game.scene.world {
+                // Everything else mostly in its box taken down, and the
+                // island's statics in it but its ground.
+                let props = &mut game.scene.props;
+                let others: Vec<u32> = props
+                    .others_in_box(&world.physics, gate)
+                    .into_iter()
+                    .filter(|o| o.1 >= GATE_ALONE_SHARE)
+                    .map(|o| o.0)
+                    .collect();
+                let statics: Vec<m2_engine::StaticKey> = props
+                    .placed_bounds(gate)
+                    .map(|(place, bounds)| world.physics.statics_in_box(place, bounds))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|k| {
+                        matches!(
+                            k,
+                            m2_engine::StaticKey::Object(_) | m2_engine::StaticKey::Member(..)
+                        )
+                    })
+                    .collect();
+                props.hide(&mut world.physics, others.iter().copied());
+                for &k in &statics {
+                    world.physics.remove_static(k);
+                }
+                eprintln!(
+                    "gate {n}, alone: took down {} other models and {} island statics",
+                    others.len(),
+                    statics.len()
+                );
+            }
+            // Whole again.
+            if let Some(world) = &mut game.scene.world {
+                game.scene.props.hide(&mut world.physics, [gate]);
+            }
+            game.scene.show_props([gate]);
+            run(backend, game, 0.1)?;
+            let Some(world) = &mut game.scene.world else {
+                break;
+            };
+            if !game
+                .scene
+                .props
+                .wreck_scaled(&mut world.physics, gate, Some(blast), scale)
+            {
+                eprintln!("gate {n}: it would not break");
+                break;
+            }
+            let try_n = t + 1;
+            eprintln!(
+                "gate {n}, try {try_n} ({scale} times as fast{}), blast at {blast:.1}: sets off: \
+                 {}",
+                if alone { ", alone" } else { "" },
+                game.scene
+                    .props
+                    .pieces_report(&world.physics, gate)
+                    .unwrap_or_else(|| "no pieces".to_owned())
+            );
+            let first = t == 0;
+            let tag = if alone { "-alone" } else { "" };
+            if first {
+                // Burning where its break-up says, as in play.
+                for at in game.scene.props.breakup_points(gate) {
+                    game.combat.blaze(&world.physics, at);
+                }
+                for (parts, name) in [
+                    (props::Parts::Rest, "rest"),
+                    (props::Parts::Pieces, "pieces"),
+                ] {
+                    game.scene.props.parts = parts;
+                    render(backend, game, fov, aspect, None)?;
+                    write_ppm(backend, &picture(format!("gate{n}-{name}")))?;
+                }
+                game.scene.props.parts = props::Parts::All;
+            }
+            let mut gone = 0.0;
+            for (on, name) in [(2.0, "2s"), (8.0, "8s")] {
+                run(backend, game, on - gone)?;
+                gone = on;
+                let Some(world) = &game.scene.world else {
+                    break;
+                };
+                let props = &game.scene.props;
+                eprintln!(
+                    "gate {n}, try {try_n}: {on} s on: {}; {}",
+                    props.pieces_moved(&world.physics, gate).unwrap_or_default(),
+                    props.describe(&world.physics, gate).unwrap_or_default()
+                );
+                if (first || alone) && on < 8.0 {
+                    let held: Vec<String> = props
+                        .pieces_held(&world.physics, gate, GATE_HELD)
+                        .into_iter()
+                        .map(|(node, keys)| {
+                            let by: Vec<String> = keys
+                                .into_iter()
+                                .map(|k| gate_static_name(world, props, k))
+                                .collect();
+                            format!(
+                                "n{node} by {}",
+                                if by.is_empty() {
+                                    "nothing static".to_owned()
+                                } else {
+                                    by.join(", ")
+                                }
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "gate {n}, try {try_n}: {on} s on, {} pieces within {GATE_HELD} m of \
+                         where they started: {}",
+                        held.len(),
+                        held.join("; ")
+                    );
+                }
+                if first || alone {
+                    render(backend, game, fov, aspect, None)?;
+                    write_ppm(backend, &picture(format!("gate{n}{tag}-{name}")))?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1142,10 +1514,19 @@ fn describe_slung(game: &Game) -> Vec<String> {
             continue;
         };
         let middle = body.transform_point3(Vec3::new(0.0, 1.4, 0.0));
-        let barrel = at.transform_vector3(w.muzzle).normalize_or_zero();
+        // Along its length (its box's longest side), toward its muzzle's end.
+        let (lo, hi) = w.model.bounds;
+        let size = hi - lo;
+        let long = (0..3).fold(0, |a, b| if size[b] > size[a] { b } else { a });
+        let mut length = Vec3::ZERO;
+        length[long] = if w.muzzle[long] < (lo[long] + hi[long]) * 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
+        let barrel = at.transform_vector3(length).normalize_or_zero();
         let top = at.transform_vector3(Vec3::Y).normalize_or_zero();
         // Its box's corners, from her middle (ahead, right, up).
-        let (lo, hi) = w.model.bounds;
         let corners: Vec<Vec3> = (0..8)
             .map(|k| {
                 let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
@@ -1166,7 +1547,7 @@ fn describe_slung(game: &Game) -> Vec<String> {
         let (ahead_span, right_span, up_span) = (span(0), span(1), span(2));
         let muzzle_end = if barrel.y < 0.0 { "down" } else { "up" };
         lines.push(format!(
-            "{weapon:?} on her {side}: barrel {:.2} ({:.0} deg above level, muzzle end {muzzle_end}), \
+            "{weapon:?} on her {side}: length {:.2} ({:.0} deg above level, muzzle end {muzzle_end}), \
              from {:.2} to {:.2} m above her feet, {:.2} to {:.2} m to her right, {:.2} to {:.2} m \
              ahead of her middle; top {:.2}, grip {:.2} and muzzle {:.2} from her back's middle",
             local(barrel),
@@ -1225,6 +1606,22 @@ fn look_at_marker(
         }
     }
     Ok(())
+}
+
+/// [`static_name`], with the layer that put up a state layer's model
+/// (the gate test's lists).
+fn gate_static_name(
+    world: &m2_engine::World,
+    props: &props::Props,
+    key: m2_engine::StaticKey,
+) -> String {
+    let name = static_name(world, Some(key));
+    match key {
+        m2_engine::StaticKey::Entity(e) => {
+            format!("{name} of {}", props.layer(e).unwrap_or("no layer noted"))
+        }
+        _ => name,
+    }
 }
 
 /// What a static collider is: a placed object and its model, a building
@@ -1403,7 +1800,10 @@ fn mission_for_screenshot(
     let mut satellite_shots = 0;
     let (mut pda_shots, mut pda_up) = (0, false);
     let mut bombs = 0;
-    let mut bomb_shots: Vec<(u32, usize, u32)> = Vec::new();
+    let mut bomb_shots: Vec<(u32, usize, u32, m2_math::glam::Vec2)> = Vec::new();
+    // The tutorial box's line as last shown, its keys named (round 99's
+    // `[sprint]` showed in no picture).
+    let mut tutorial_shown: Option<String> = None;
     // The clips' sound events met, by category and name: how many hers,
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
@@ -1416,8 +1816,24 @@ fn mission_for_screenshot(
             }
             None => Intent::default(),
         };
+        if let Some(hp) = options.hurt
+            && i == (HURT_AT / tick).round() as u32
+        {
+            eprintln!("hurt: her health {:.1} -> {hp:.1}", game.combat.hp);
+            game.combat.hp = hp;
+        }
         game.step(intent, tick);
         link.tick(game, tick);
+        if auto.is_some() {
+            let shown = link.view().tutorial;
+            if shown != tutorial_shown {
+                eprintln!(
+                    "autoplay: the tutorial box reads {shown:?} at {:.1} s",
+                    i as f32 * tick
+                );
+                tutorial_shown = shown;
+            }
+        }
         for c in game.scene.take_cues(game.focus(), CUE_REACH) {
             let e = heard.entry((c.category, c.name)).or_default();
             if c.hers {
@@ -1570,23 +1986,21 @@ fn mission_for_screenshot(
                 );
             }
             pda_up = game.support.pda;
-            if game
-                .support
-                .landed
-                .iter()
-                .any(|l| matches!(l, support::Impact::Bomb(_)))
-            {
+            if let Some(at) = game.support.landed.iter().find_map(|l| match l {
+                support::Impact::Bomb(at) => Some(*at),
+                _ => None,
+            }) {
                 bombs += 1;
                 for after in [2, 8] {
-                    bomb_shots.push((i + (after as f32 / tick) as u32, bombs, after));
+                    bomb_shots.push((i + (after as f32 / tick) as u32, bombs, after, at));
                 }
             }
-            let due: Vec<(usize, u32)> = bomb_shots
+            let due: Vec<(usize, u32, m2_math::glam::Vec2)> = bomb_shots
                 .iter()
                 .filter(|s| s.0 == i)
-                .map(|s| (s.1, s.2))
+                .map(|s| (s.1, s.2, s.3))
                 .collect();
-            for (n, after) in due {
+            for (n, after, at) in due {
                 let late = if after > 2 { "-late" } else { "" };
                 let path = picture(format!("bomb{n}{late}"));
                 hud_picture(backend, game, &link, fov, aspect, &path)?;
@@ -1596,6 +2010,7 @@ fn mission_for_screenshot(
                     game.combat.hp,
                     path.display()
                 );
+                describe_bombed(game, at, fov, aspect);
             }
             for (due, name) in [(boat_shot, "boat"), (ashore_shot, "ashore")] {
                 if due == Some(i) {
@@ -2972,6 +3387,25 @@ impl Running {
         );
         if let Some(m) = &mut self.mission {
             m.tick(&mut self.game, TICK.as_secs_f32());
+            let (lines, hushed) = m.take_lines();
+            for (id, cue, at) in lines {
+                if let Some(seconds) = self.audio.say(id, &cue, at) {
+                    m.line_length(id, seconds);
+                }
+            }
+            for id in hushed {
+                self.audio.hush(id);
+            }
+            for (cue, stop) in m.take_sounds() {
+                if stop {
+                    self.audio.stop_ui_sound(&cue);
+                } else {
+                    self.audio.ui_sound(&cue);
+                }
+            }
+            if let Some(cue) = m.take_music() {
+                self.audio.music_cue(cue.as_deref());
+            }
         }
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);

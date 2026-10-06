@@ -104,6 +104,20 @@
 //!                           one or two words (the sound materials', the
 //!                           clips' sound events' and their parts, and
 //!                           common ones) and an ending
+//! steps[:<head>,..]         footstep sounds by name over every bank: a
+//!                           head (`sfx_footstep`; more given), one or two
+//!                           words (gaits, surfaces, the sound materials,
+//!                           who steps) and an ending numbered and
+//!                           lettered (`_01a`); each name found with two
+//!                           endings or more, its bank and endings
+//! vo:<line>[,..]            where scripted voice lines live (`VO.Cue`'s
+//!                           `Fiona-In-Mission-Contract-Vz01-146`): every
+//!                           cue table in English.wad holding the line's
+//!                           name hash (block, table, category, volume,
+//!                           distances, stream), and that block's sound
+//!                           banks with the stream's sound length; then
+//!                           the cue tables of blocks whose path holds
+//!                           "vz01"/"vzacon" with their first cues
 //! ```
 //!
 //! Names come from every NUL-terminated string in the four archives and
@@ -766,6 +780,7 @@ fn main() -> Result<(), Error> {
                 phy2_census(&mut source, world.as_ref().expect("just built"), &names)
             }
             "phy2rules" => phy2_rules(&mut source),
+            "vo" => vo_lines(&install, arg),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
@@ -773,6 +788,7 @@ fn main() -> Result<(), Error> {
             "cues" => cues(&mut source, &names, arg),
             "sounddb" => sounddb(&mut source, &names, arg),
             "soundnames" => soundnames(&mut source, &names, arg),
+            "steps" => steps(&mut source, &names, arg),
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
             "find" => {
@@ -963,6 +979,120 @@ fn voices(install: &Install, names: &Names) -> Result<(), Error> {
             if targets.contains(&h) { " *" } else { "" }
         );
     }
+    Ok(())
+}
+
+/// Finds scripted voice lines (`VO.Cue`'s line names) in the cue tables of
+/// `English.wad`, resident and per mission.
+fn vo_lines(install: &Install, arg: &str) -> Result<(), Error> {
+    let lines: Vec<(&str, u32)> = arg
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| (s, m2_assets::name_hash(s)))
+        .collect();
+    for (s, h) in &lines {
+        println!("  {h:08x} {s}");
+    }
+    let wad = install.data.join("English.wad");
+    let mut source = AssetSource::new(BufReader::new(File::open(&wad)?))?;
+    let paths: Vec<String> = source
+        .archive()
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    let mut tables = 0;
+    for (b, path) in paths.iter().enumerate() {
+        let Ok(decoded) = source.block(b) else {
+            continue;
+        };
+        let contents = BlockContents::parse(&decoded)?;
+        let mut found = Vec::new();
+        let mut banks = Vec::new();
+        let mission = {
+            let p = path.to_ascii_lowercase();
+            p.contains("vz01") || p.contains("vzacon")
+        };
+        for (e, data) in contents.iter() {
+            match e.type_hash {
+                m2_assets::voice::CUE_TABLE_TYPE => {
+                    let Ok(t) = m2_assets::CueTable::parse(data) else {
+                        continue;
+                    };
+                    tables += 1;
+                    if mission {
+                        let first: Vec<String> = t
+                            .lines
+                            .iter()
+                            .take(6)
+                            .map(|l| format!("{:08x}", l.cue))
+                            .collect();
+                        println!(
+                            "  table {:08x} in {path}: {} lines {} groups; first {}",
+                            t.hash,
+                            t.lines.len(),
+                            t.groups.len(),
+                            first.join(" ")
+                        );
+                    }
+                    for (s, h) in &lines {
+                        for l in t.lines.iter().filter(|l| l.cue == *h) {
+                            found.push(format!(
+                                "{s}: table {:08x} line, category {:08x}, volume {:.2}, \
+                                 {:.0}-{:.0} m, stream {}",
+                                t.hash,
+                                l.category,
+                                l.volume,
+                                l.min_distance,
+                                l.max_distance,
+                                l.stream
+                            ));
+                        }
+                        for g in t.groups.iter().filter(|g| g.cue == *h) {
+                            found.push(format!(
+                                "{s}: table {:08x} group, category {:08x}, streams {:?}",
+                                t.hash, g.category, g.streams
+                            ));
+                        }
+                    }
+                }
+                SOUND_BANK_TYPE => {
+                    if let Ok(bank) = SoundBank::parse(data) {
+                        let secs: Vec<f32> = bank
+                            .sounds
+                            .iter()
+                            .map(|s| s.frames as f32 / s.rate.max(1) as f32)
+                            .collect();
+                        banks.push((e.name_hash, secs));
+                    } else if let Ok(i) = StreamIndex::parse(data) {
+                        banks.push((e.name_hash, vec![-(i.streams.len() as f32)]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if found.is_empty() {
+            continue;
+        }
+        println!("  block {b} {path}");
+        for f in found {
+            println!("    {f}");
+        }
+        for (h, secs) in banks {
+            if secs.first().is_some_and(|s| *s < 0.0) {
+                println!("    stream index {h:08x}: {} streams", -secs[0]);
+            } else {
+                let shown: Vec<String> = secs.iter().map(|s| format!("{s:.1}")).collect();
+                println!(
+                    "    bank {h:08x}: {} sounds, s: {}",
+                    secs.len(),
+                    shown.join(" ")
+                );
+            }
+        }
+    }
+    println!("  cue tables read: {tables}");
     Ok(())
 }
 
@@ -1406,6 +1536,224 @@ fn cues<R: Read + Seek>(
                 library.label(names, *bank)
             );
         }
+    }
+    Ok(())
+}
+
+/// Heads a footstep sound's name may start with ([`steps`]).
+const STEP_HEADS: [&str; 26] = [
+    "sfx_footstep",
+    "sfx_footsteps",
+    "footstep",
+    "footsteps",
+    "sfx_fs",
+    "fs",
+    "sfx_step",
+    "step",
+    "sfx_ftstp",
+    "ftstp",
+    "sfx_fol_step",
+    "fol_step",
+    "sfx_fol_footstep",
+    "fol_footstep",
+    "sfx_foot",
+    "foot",
+    "sfx_fol",
+    "fol",
+    "sfx_hum_footstep",
+    "hum_footstep",
+    "sfx_hum",
+    "hum",
+    "sfx_fol_ftstp",
+    "fol_ftstp",
+    "sfx_fol_fs",
+    "fol_fs",
+];
+
+/// Words a footstep sound's name may be built of besides the surfaces
+/// ([`steps`]): gaits, who steps, sizes.
+const STEP_WORDS: [&str; 58] = [
+    "run",
+    "walk",
+    "sprint",
+    "jog",
+    "jumpland",
+    "land",
+    "landing",
+    "jumptakeoff",
+    "takeoff",
+    "jump",
+    "crouch",
+    "scuff",
+    "stop",
+    "shuffle",
+    "heavy",
+    "light",
+    "slow",
+    "fast",
+    "step",
+    "steps",
+    "footstep",
+    "foot",
+    "left",
+    "right",
+    "l",
+    "r",
+    "player",
+    "plr",
+    "jen",
+    "jennifer",
+    "mattias",
+    "chris",
+    "human",
+    "hum",
+    "npc",
+    "ai",
+    "male",
+    "female",
+    "boot",
+    "boots",
+    "shoe",
+    "shoes",
+    "barefoot",
+    "soldier",
+    "civ",
+    "civilian",
+    "hero",
+    "char",
+    "sml",
+    "mid",
+    "lrg",
+    "small",
+    "med",
+    "large",
+    "near",
+    "close",
+    "dist",
+    "distant",
+];
+
+/// Footstep sounds by name over every bank (round 99: the clips' cues are
+/// `footstep_run`, `_walk`, `_jumpland` and `_jumptakeoff`, of the
+/// `sound_surface` kind; `fol_shared` holds
+/// `sfx_footstep_jumpland_metal_01a`, and no ending [`cues`] tries is
+/// like `_01a`): a head ([`STEP_HEADS`], and those `arg` gives), one or
+/// two words ([`STEP_WORDS`], [`SURFACES`], the template database's sound
+/// materials and their parts), and an ending numbered and lettered. A
+/// name shows once two of its endings are found: one alone is as likely
+/// chance, over thousands of sounds.
+fn steps<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let index = source.archive().index();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash);
+    let mut words: Vec<String> = STEP_WORDS
+        .iter()
+        .chain(SURFACES.iter())
+        .map(|w| (*w).to_owned())
+        .collect();
+    if let Some(h) = db_hash {
+        let data = source.asset(h, TEMPLATE_DB_TYPE)?;
+        let db = Layer::parse(&data)?;
+        for n in db.names().values() {
+            if let Some(inner) = n
+                .strip_prefix("SoundMaterial (")
+                .and_then(|r| r.strip_suffix(')'))
+            {
+                let lower = inner.to_ascii_lowercase();
+                words.extend(
+                    lower
+                        .split(['_', ' '])
+                        .filter(|p| p.len() >= 2)
+                        .map(str::to_owned),
+                );
+                words.push(lower);
+            }
+        }
+    }
+    words.sort();
+    words.dedup();
+    let heads: Vec<String> = STEP_HEADS
+        .iter()
+        .map(|h| (*h).to_owned())
+        .chain(arg.split(',').filter(|h| !h.is_empty()).map(str::to_owned))
+        .collect();
+    let mut ends = vec![String::new()];
+    for n in 1..=12 {
+        ends.push(format!("_{n:02}"));
+        ends.push(format!("{n:02}"));
+        ends.push(format!("_{n}"));
+        for c in 'a'..='f' {
+            ends.push(format!("_{n:02}{c}"));
+            ends.push(format!("{n:02}{c}"));
+        }
+    }
+    for c in 'a'..='f' {
+        ends.push(format!("_{c}"));
+        ends.push(format!("{c}"));
+    }
+    let library = bank_sounds(source)?;
+    let sounds = &library.sounds;
+    // Each name (its head and words) found, with the endings it was found
+    // with and their sounds.
+    let mut found: BTreeMap<String, Vec<(usize, u32)>> = BTreeMap::new();
+    let mut stem = |h: u32, name: &dyn Fn() -> String| {
+        for (k, e) in ends.iter().enumerate() {
+            let x = fnv_end(fnv_on(h, e));
+            if sounds.contains_key(&x) {
+                found.entry(name()).or_default().push((k, x));
+            }
+        }
+    };
+    for head in &heads {
+        let hh = fnv_on(fnv_on(FNV_START, head), "_");
+        for a in &words {
+            let ha = fnv_on(hh, a);
+            stem(ha, &|| format!("{head}_{a}"));
+            let hs = fnv_on(ha, "_");
+            for b in words.iter().filter(|b| *b != a) {
+                stem(fnv_on(hs, b), &|| format!("{head}_{a}_{b}"));
+            }
+        }
+    }
+    let alone = found.values().filter(|f| f.len() < 2).count();
+    println!(
+        "{} heads, {} words, {} endings over {} sounds in {} banks: {} names found with two \
+         endings or more, {alone} with one (as likely chance)",
+        heads.len(),
+        words.len(),
+        ends.len(),
+        sounds.len(),
+        library.banks.len(),
+        found.len() - alone
+    );
+    for (name, hits) in found.iter().filter(|(_, f)| f.len() >= 2) {
+        let mut banks: Vec<String> = hits
+            .iter()
+            .flat_map(|(_, h)| sounds[h].iter().map(|(b, _, _)| *b))
+            .collect::<std::collections::BTreeSet<u32>>()
+            .into_iter()
+            .map(|b| format!("{b:08x} {}", library.label(names, b)))
+            .collect();
+        banks.truncate(3);
+        let endings: Vec<&str> = hits
+            .iter()
+            .take(16)
+            .map(|(k, _)| ends[*k].as_str())
+            .collect();
+        println!(
+            "  {name}: {} ({}{}) in {}",
+            hits.len(),
+            endings.join(" "),
+            if hits.len() > 16 { " ..." } else { "" },
+            banks.join(", ")
+        );
     }
     Ok(())
 }

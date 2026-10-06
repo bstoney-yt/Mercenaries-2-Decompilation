@@ -41,8 +41,13 @@ pub struct Object {
     pub max_health: f32,
     pub alive: bool,
     pub labels: Vec<String>,
+    /// Labels from the data (its template's and its own), as name hashes.
+    pub label_hashes: Vec<u32>,
     /// The vehicle it rides in.
     pub vehicle: Option<u32>,
+    /// It got in (or out) at once, put there by a script, rather than
+    /// climbing in itself: seat events tell the two apart.
+    pub seated_instantly: bool,
     pub player_controlled: bool,
     /// Simulated near the player rather than hibernating.
     pub awake: bool,
@@ -52,6 +57,25 @@ pub struct Object {
 }
 
 impl Object {
+    /// Whether it has every label of `terms` that isn't negated and none
+    /// that is ([`crate::events::class_terms`]).
+    pub fn is_of(&self, terms: &[(u32, bool)]) -> bool {
+        terms.iter().all(|&(h, not)| {
+            let has = self.label_hashes.contains(&h)
+                || self.labels.iter().any(|l| m2_assets::name_hash(l) == h);
+            has != not
+        })
+    }
+
+    /// Its labels as name hashes: those scripts gave it and the data's.
+    pub fn all_labels(&self) -> Vec<u32> {
+        self.labels
+            .iter()
+            .map(|l| m2_assets::name_hash(l))
+            .chain(self.label_hashes.iter().copied())
+            .collect()
+    }
+
     pub fn new(name: &str, position: [f32; 3]) -> Self {
         Self {
             fuel: 100.0,
@@ -137,6 +161,43 @@ pub enum Command {
     /// The scripts took a free support item back
     /// (`MrxSupportData.RemoveFreebie`), by its key.
     RemoveFreebie(String),
+    /// A scripted voice line (`VO.Cue`): `cue` names it
+    /// (`"Fiona-In-Mission-Contract-Vz01-146"`), `speaker` says it
+    /// (`None`: over the radio). Report its length with
+    /// [`crate::mission::Mission::line_length`].
+    Say {
+        id: u32,
+        speaker: Option<u32>,
+        cue: String,
+    },
+    /// Stop line `id` (`VO.Cancel`).
+    Hush(u32),
+    /// `guid` can (no longer) be hurt: on while the scripts hold any
+    /// reason for it (`"MrxState"` while the screen fades, `"Fanfare"`).
+    Invincible {
+        guid: u32,
+        on: bool,
+    },
+    /// Play a music cue (`mu_fac_pmc_explore_01`), looped unless it is a
+    /// one-shot, in place of what plays; `None` stops the music.
+    Music(Option<String>),
+    /// Play a sound cue by name (`Sound.CueSound`):
+    /// `"ui_HUD_Objective_New"`; `at` the object it sounds from (`None`:
+    /// flat, as the interface's sounds).
+    CueSound {
+        at: Option<u32>,
+        cue: String,
+    },
+    /// Stop a sound cue started with [`Command::CueSound`]
+    /// (`Sound.StopSound`): the scripts name it by where it sounds from
+    /// and its cue, never by a handle.
+    StopSound {
+        at: Option<u32>,
+        cue: String,
+    },
+    /// The player can't be killed while on (`Player.SetHealthClamp`): her
+    /// health stops short of nothing, for the survival system to step in.
+    HealthClamp(bool),
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -172,6 +233,28 @@ pub struct ScriptWorld {
     /// Object templates scripts have named (`"Supply Drop (GL)"`), by
     /// name in lower case.
     templates: HashMap<String, u32>,
+    /// Scripted voice lines playing.
+    pub vo: crate::vo::Lines,
+    /// The score.
+    pub music: crate::music::Music,
+    /// Why each object is invincible (`Object.SetInvincible` reasons).
+    pub invincible: HashMap<u32, std::collections::BTreeSet<String>>,
+    /// The play area's boundaries (`Player.AddBoundary`: story-stage
+    /// regions such as `BoundaryIntro`), the callback told when the player
+    /// leaves or comes back, and whether the player is out.
+    pub boundaries: Vec<u32>,
+    pub boundary_callback: Option<Function>,
+    pub outside: bool,
+    /// Templates' labels (name hashes) by name in lower case, for spawns.
+    pub template_labels: HashMap<String, Vec<u32>>,
+    /// Every layer entity's place, and its guid by name in lower case,
+    /// loaded or not: `Pg.GetGuidByName` finds markers (landing zones) of
+    /// layers that aren't in, and scripts measure to them.
+    pub entities: HashMap<u32, [f32; 3]>,
+    pub entity_names: HashMap<String, u32>,
+    /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
+    pub health_clamp: bool,
+    pub survival_mode: bool,
 }
 
 impl ScriptWorld {
@@ -188,6 +271,14 @@ impl ScriptWorld {
             .filter(|(_, o)| o.name.eq_ignore_ascii_case(name))
             .map(|(&g, _)| g)
             .min()
+    }
+
+    /// Where an object is: in play, else where its layer places it.
+    fn place_of(&self, guid: u32) -> Option<[f32; 3]> {
+        self.objects
+            .get(&guid)
+            .map(|o| o.position)
+            .or_else(|| self.entities.get(&guid).copied())
     }
 
     /// Takes the commands issued since the last call.
@@ -218,6 +309,9 @@ impl ScriptWorld {
         let guid = self.spawn_guid();
         let mut object = Object::new(&what, position);
         object.yaw = yaw;
+        if let Some(l) = self.template_labels.get(&what.to_ascii_lowercase()) {
+            object.label_hashes.clone_from(l);
+        }
         self.insert(guid, object);
         self.commands.push(Command::Spawn {
             guid,
@@ -229,6 +323,7 @@ impl ScriptWorld {
             let pilot = self.spawn_guid();
             let mut o = Object::new(PILOT, position);
             o.vehicle = Some(guid);
+            o.seated_instantly = true;
             self.insert(pilot, o);
             self.commands.push(Command::Spawn {
                 guid: pilot,
@@ -280,6 +375,17 @@ impl World for ScriptWorld {
     fn is_awake(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.awake)
     }
+    fn seated_instantly(&self, guid: u32) -> bool {
+        self.objects.get(&guid).is_some_and(|o| o.seated_instantly)
+    }
+    fn labels(&self, guid: u32) -> Vec<u32> {
+        self.objects
+            .get(&guid)
+            .map_or_else(Vec::new, Object::all_labels)
+    }
+    fn health(&self, guid: u32) -> Option<f32> {
+        self.objects.get(&guid).map(|o| o.health)
+    }
     fn inside(&self, guid: u32, boundary: u32) -> Option<bool> {
         let region = self.regions.get(&boundary)?;
         let at = self.objects.get(&boundary)?;
@@ -295,10 +401,11 @@ impl World for ScriptWorld {
         self.winch.get(&cargo).copied()
     }
     fn labelled(&self, label: &str) -> Vec<u32> {
+        let terms = crate::events::class_terms(label);
         let mut out: Vec<u32> = self
             .objects
             .iter()
-            .filter(|(_, o)| o.labels.iter().any(|l| l == label))
+            .filter(|(_, o)| o.is_of(&terms))
             .map(|(&g, _)| g)
             .collect();
         out.sort_unstable();
@@ -497,6 +604,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             Some(Value::String(s)) => {
                 let name = s.to_string_lossy();
                 w.by_name(&name)
+                    .or_else(|| w.entity_names.get(&name.to_ascii_lowercase()).copied())
                     .or_else(|| is_template(&name).then(|| w.template(&name)))
             }
             _ => None,
@@ -609,6 +717,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    add(&object, "SetInvincible", |w, _, a| {
+        let Some(guid) = id(a.first()) else {
+            return values([]);
+        };
+        let on = matches!(a.get(1), Some(Value::Boolean(true)));
+        let reason = match a.get(2) {
+            Some(Value::String(r)) => r.to_string_lossy(),
+            _ => String::new(),
+        };
+        let reasons = w.invincible.entry(guid).or_default();
+        let was = !reasons.is_empty();
+        if on {
+            reasons.insert(reason);
+        } else {
+            reasons.remove(&reason);
+        }
+        let now = !reasons.is_empty();
+        if now != was {
+            w.commands.push(Command::Invincible { guid, on: now });
+        }
+        values([])
+    })?;
     add(&object, "Kill", |w, _, a| {
         if let Some(guid) = id(a.first()) {
             if let Some(o) = w.objects.get_mut(&guid) {
@@ -626,16 +756,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // The number of the player controlling it (scripts pass it on to
+    // `Player.IsLocal` and key tables by it), else nil.
+    // Metres between two objects (or markers of layers not loaded).
+    add(&object, "GetDistanceFrom", |w, _, a| {
+        let (Some(p), Some(q)) = (
+            id(a.first()).and_then(|g| w.place_of(g)),
+            id(a.get(1)).and_then(|g| w.place_of(g)),
+        ) else {
+            return values([Value::Nil]);
+        };
+        let d: f32 = (0..3).map(|i| (p[i] - q[i]).powi(2)).sum::<f32>().sqrt();
+        values([Value::Number(f64::from(d))])
+    })?;
     add(&object, "IsPlayerControlled", |w, _, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
-        values([Value::Boolean(o.is_some_and(|o| o.player_controlled))])
+        values([if o.is_some_and(|o| o.player_controlled) {
+            Value::Integer(1)
+        } else {
+            Value::Nil
+        }])
     })?;
     add(&object, "HasLabel", |w, _, a| {
         let has = match (id(a.first()).and_then(|g| w.objects.get(&g)), a.get(1)) {
-            (Some(o), Some(Value::String(l))) => {
-                let l = l.to_string_lossy();
-                o.labels.contains(&l)
-            }
+            (Some(o), Some(Value::String(l))) => o
+                .all_labels()
+                .contains(&m2_assets::name_hash(&l.to_string_lossy())),
             _ => false,
         };
         values([Value::Boolean(has)])
@@ -657,6 +803,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         {
             let l = l.to_string_lossy();
             o.labels.retain(|x| *x != l);
+            let h = m2_assets::name_hash(&l);
+            o.label_hashes.retain(|&x| x != h);
         }
         values([])
     })?;
@@ -714,6 +862,35 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let player = lib("Player")?;
+    add(&player, "AddBoundary", |w, _, a| {
+        if let Some(b) = id(a.get(1))
+            && !w.boundaries.contains(&b)
+        {
+            w.boundaries.push(b);
+        }
+        values([])
+    })?;
+    // (player number, on): the hero's survival script turns the clamp on
+    // at set-up and off once its one rescue has cooled down.
+    add(&player, "SetHealthClamp", |w, _, a| {
+        let on = matches!(a.get(1), Some(Value::Boolean(true)));
+        if on != w.health_clamp {
+            w.health_clamp = on;
+            w.commands.push(Command::HealthClamp(on));
+        }
+        values([])
+    })?;
+    add(&player, "SetSurvivalMode", |w, _, a| {
+        w.survival_mode = matches!(a.get(1), Some(Value::Boolean(true)));
+        values([])
+    })?;
+    add(&player, "SetBoundaryCallback", |w, _, a| {
+        w.boundary_callback = match a.get(1) {
+            Some(Value::Function(f)) => Some(f.clone()),
+            _ => None,
+        };
+        values([])
+    })?;
     // A new game starts at the usual marker.
     add(&player, "GetPlayerStart", |_, lua, _| {
         values([Value::String(lua.create_string("PlayerLocation_Start")?)])
@@ -829,6 +1006,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if let Some(guid) = id(a.first()) {
             if let Some(o) = w.objects.get_mut(&guid) {
                 o.vehicle = None;
+                o.seated_instantly = false;
             }
             w.commands.push(Command::ExitVehicle(guid));
         }
@@ -846,6 +1024,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let instant = matches!(a.get(3), Some(Value::Boolean(true)));
         if let Some(o) = w.objects.get_mut(&guid) {
             o.vehicle = Some(vehicle);
+            o.seated_instantly = instant;
         }
         w.commands.push(Command::EnterVehicle {
             guid,
@@ -993,8 +1172,144 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
 
+    let sound = lib("Sound")?;
+    add(&sound, "CueSound", |w, _, a| {
+        if let Some(Value::String(cue)) = a.get(1) {
+            w.commands.push(Command::CueSound {
+                at: id(a.first()).filter(|&g| g != 0),
+                cue: cue.to_string_lossy(),
+            });
+        }
+        values([])
+    })?;
+
+    add(&sound, "StopSound", |w, _, a| {
+        if let Some(Value::String(cue)) = a.get(1) {
+            w.commands.push(Command::StopSound {
+                at: id(a.first()).filter(|&g| g != 0),
+                cue: cue.to_string_lossy(),
+            });
+        }
+        values([])
+    })?;
+
+    // The score (see `music`): factions, bindings and states.
+    add(&sound, "SetFactionMusic", |w, _, a| {
+        if let Some(Value::String(f)) = a.first() {
+            w.music.set_faction(&f.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "SetRootFactionRegionMusic", |w, _, a| {
+        if let Some(Value::String(f)) = a.first() {
+            w.music.set_root(&f.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "ActivateFactionRegionMusic", |w, _, _| {
+        w.music.activate_region();
+        values([])
+    })?;
+    add(&sound, "BindMusicCue", |w, _, a| {
+        if let (Some(Value::String(cue)), Some(Value::String(state))) = (a.first(), a.get(1)) {
+            w.music
+                .bind(&cue.to_string_lossy(), &state.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "ClearMusicCues", |w, _, a| {
+        if let Some(Value::String(state)) = a.first() {
+            w.music.clear(&state.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "TransitionMusic", |w, _, a| {
+        if let Some(Value::String(state)) = a.first()
+            && let Some(c) = w.music.transition(&state.to_string_lossy())
+        {
+            w.commands.push(c);
+        }
+        values([])
+    })?;
+    add(&sound, "LockFactionMusic", |w, _, a| {
+        w.music.locked = matches!(a.first(), Some(Value::Boolean(true)));
+        values([])
+    })?;
+    add(&sound, "IsFactionLockedMusic", |w, _, _| {
+        values([Value::Boolean(w.music.locked)])
+    })?;
+    add(&sound, "SetDynamicMusic", |w, _, a| {
+        w.music.dynamic = matches!(a.first(), Some(Value::Boolean(true)));
+        values([])
+    })?;
+    add(&sound, "IsDynamicMusic", |w, _, _| {
+        values([Value::Boolean(w.music.dynamic)])
+    })?;
+    // Set-up and the action level the score is not driven by yet.
+    for name in [
+        "AddFactionMusic",
+        "AddMusicState",
+        "AddMusicTransition",
+        "SetActionThresholdsMusic",
+        "SetActionLevelsMusic",
+        "LockActionLevelMusic",
+    ] {
+        add(&sound, name, |_, _, _| values([]))?;
+    }
+
+    // Scripted voice lines, as (speaker, cue, callback, values, priority,
+    // send over the network); speaker 0 is the radio. The sequences that
+    // cue them (`MrxVoSequence`) do their own ordering by priority, so
+    // `AddSequence`/`RemoveSequence` need do nothing here.
+    let vo = lib("VO")?;
+    add(&vo, "Cue", |w, _, a| {
+        let Some(Value::String(cue)) = a.get(1) else {
+            return values([Value::Boolean(false)]);
+        };
+        let speaker = id(a.first()).filter(|&g| g != 0);
+        let callback = match a.get(2) {
+            Some(Value::Function(f)) => Some(f.clone()),
+            _ => None,
+        };
+        let say = w.vo.cue(speaker, cue.to_string_lossy(), callback);
+        w.commands.push(say);
+        values([Value::Boolean(true)])
+    })?;
+    add(&vo, "Cancel", |w, _, a| {
+        let speaker = id(a.first()).filter(|&g| g != 0);
+        let cue = match a.get(1) {
+            Some(Value::String(s)) => Some(s.to_string_lossy()),
+            _ => None,
+        };
+        let hush = w.vo.cancel(speaker, cue.as_deref());
+        w.commands.extend(hush);
+        values([])
+    })?;
+    for name in ["AddSequence", "RemoveSequence"] {
+        add(&vo, name, |_, _, _| values([]))?;
+    }
+    // Priorities the sequences copy at load and compare: a new sequence
+    // whose number is no higher than the running one's cuts it off, so the
+    // most important is lowest. Only the order is known, not the values.
+    for (i, name) in [
+        "PRIORITY_CINEMATIC",
+        "PRIORITY_BRIEFING",
+        "PRIORITY_SCRIPTED_CONTRACT",
+        "PRIORITY_SCRIPTED_BOUNTIES",
+        "PRIORITY_SCRIPTED_FREEPLAY",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        vo.set(name, i as i64)?;
+    }
+
     // Developer switches (skip to a mission, force a briefing): all off.
     let sys = lib("Sys")?;
+    // The game shows its tutorial tips.
+    add(&sys, "TutorialsEnabled", |_, _, _| {
+        values([Value::Boolean(true)])
+    })?;
     for name in ["GetSkipMission", "GetINIBriefing", "GetForceNewGame"] {
         add(&sys, name, |_, _, _| values([Value::Nil]))?;
     }
@@ -1421,6 +1736,42 @@ mod tests {
         assert!(events.update_shared(0.1, &world).is_empty());
         let seated: String = host.lua().globals().get("seated").unwrap();
         assert_eq!(seated, "in:1/50");
+    }
+
+    #[test]
+    fn seat_events_read_mode_letters_and_classes() {
+        let (host, world) = setup();
+        world
+            .borrow_mut()
+            .objects
+            .get_mut(&50)
+            .unwrap()
+            .labels
+            .push("Car".into());
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                log = ""
+                assert(Vehicle.Enter(50, 1, "d", false))
+                local function note(t) return function() log = log .. t end end
+                Event.Create(Event.ObjectInSeat, {1, "Car", "D", "E"}, note("car "))
+                Event.Create(Event.ObjectInSeat, {1, "Car", "D", "I"}, note("put in "))
+                Event.Create(Event.ObjectInSeat, {1, "Boat", "D", "E"}, note("boat "))
+                Event.Create(Event.ObjectInSeat, {1, "Car && !APC", "D", "X"}, note("out "))
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert!(events.update_shared(0.1, &world).is_empty());
+        assert!(events.update_shared(0.1, &world).is_empty());
+        let log: String = host.lua().globals().get("log").unwrap();
+        assert_eq!(log, "car ");
+        host.lua().load("Vehicle.Exit(1)").exec().unwrap();
+        assert!(events.update_shared(0.1, &world).is_empty());
+        let log: String = host.lua().globals().get("log").unwrap();
+        assert_eq!(log, "car out ");
     }
 
     #[test]
