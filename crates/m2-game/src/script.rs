@@ -47,6 +47,11 @@ thread_local! {
     static STUB_ARGS: bool = std::env::var_os("M2_STUB_ARGS").is_some();
 }
 
+/// Whether stub calls are logged with their arguments (`M2_STUB_ARGS`).
+pub fn stub_args() -> bool {
+    STUB_ARGS.with(|on| *on)
+}
+
 /// A stub call's argument as the log shows it: numbers, short strings,
 /// stubs by name, other tables as `{}`.
 fn show_arg(v: &Value) -> String {

@@ -667,13 +667,19 @@ impl Mission {
                 _ => runs.push((c.as_str(), 1)),
             }
         }
-        for (c, n) in runs.iter().take(120) {
+        // With arguments shown every call differs: keep them all.
+        let cap = if crate::script::stub_args() {
+            usize::MAX
+        } else {
+            120
+        };
+        for (c, n) in runs.iter().take(cap) {
             log.push(match n {
                 1 => format!("  stub {c}"),
                 _ => format!("  stub {c} x{n}"),
             });
         }
-        if runs.len() > 120 {
+        if runs.len() > cap {
             log.push(format!("  ... {} stub calls in all", calls.len()));
         }
         commands
