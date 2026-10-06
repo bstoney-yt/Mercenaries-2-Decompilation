@@ -130,8 +130,9 @@ const BEAMS_FULL_RAMP: f32 = 0.3;
 /// How much of a beam's alpha shows at night: at full opacity the cores
 /// came out at L222-247 and at 0.55 at L195-223 against footage's L153-164
 /// as the boat lands (PC rounds D and C), which on screen is about this
-/// alpha (inferred).
-const BEAM_NIGHT_ALPHA: f32 = 0.28;
+/// alpha (inferred); with the day contrast gone (round V) the landing cores
+/// fell to L119-122 at 0.28, so it is raised to 0.5.
+const BEAM_NIGHT_ALPHA: f32 = 0.5;
 
 /// The lowest the sun is drawn, in radians over the horizon, so that low
 /// `LightTime`s still light the ground a little.
