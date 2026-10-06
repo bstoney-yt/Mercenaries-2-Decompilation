@@ -278,6 +278,26 @@ impl Hud {
     }
 }
 
+/// Test squares (`M2_PAINT_TEST` set), 100 px each along the top from
+/// x 20: opaque magenta, opaque black, black at alpha 0.75, mid grey;
+/// to see whether solid fills reach the picture at all.
+fn paint_test(painter: &egui::Painter) {
+    let colours = [
+        Color32::from_rgb(255, 0, 255),
+        Color32::BLACK,
+        Color32::from_rgba_unmultiplied(0, 0, 0, 192),
+        Color32::from_gray(128),
+    ];
+    for (i, c) in colours.into_iter().enumerate() {
+        let x = 20.0 + 120.0 * i as f32;
+        painter.rect_filled(
+            egui::Rect::from_min_size(pos2(x, 120.0), vec2(100.0, 100.0)),
+            0.0,
+            c,
+        );
+    }
+}
+
 /// What goes to the GPU (`M2_PAINT_LOG` set): each mesh's texture, its
 /// vertices, bounds, clip and colours, to find HUD fills lost on the way.
 fn log_primitives(
@@ -413,6 +433,9 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
         && let Some(game) = game
     {
         game.paint(&painter);
+        if std::env::var_os("M2_PAINT_TEST").is_some() {
+            paint_test(&painter);
+        }
     }
     if let Some(m) = &info.mission {
         // The game's HUD shows the messages in its message buffer.
