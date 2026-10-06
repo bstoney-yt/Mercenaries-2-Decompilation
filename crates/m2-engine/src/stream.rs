@@ -1753,7 +1753,11 @@ fn ground_material(
         clamp: true,
         detail: detail.map(|(texture, _)| DetailMap {
             texture,
-            tile: DETAIL_TILE,
+            // `M2_DETAIL_TILE=<metres>` tries another repeat.
+            tile: std::env::var("M2_DETAIL_TILE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DETAIL_TILE),
         }),
         layers: out,
         ground: true,
