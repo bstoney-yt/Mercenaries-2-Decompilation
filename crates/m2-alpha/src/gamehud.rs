@@ -1169,7 +1169,36 @@ impl Thread {
         {
             self.since_toggle = 0;
             log.push(format!("PDA state: {}", pda_probe(self.mission.lua())));
-            match gui_runtime::fire(self.mission.lua(), "TogglePDA", ()) {
+            // Which Lua functions the event runs, for the log.
+            let lua = self.mission.lua();
+            let _ = lua
+                .load(
+                    r#"__m2_calls = {}
+                    if debug and debug.sethook then
+                        debug.sethook(function()
+                            local n = #__m2_calls
+                            if n >= 40 then return end
+                            local i = debug.getinfo(2, "nS")
+                            if i and i.what ~= "C" then
+                                __m2_calls[n + 1] = tostring(i.name) .. "@" .. tostring(i.short_src)
+                                    .. ":" .. tostring(i.linedefined)
+                            end
+                        end, "c")
+                    else
+                        __m2_calls[1] = "no debug.sethook"
+                    end"#,
+                )
+                .exec();
+            let fired = gui_runtime::fire(lua, "TogglePDA", ());
+            let calls: String = lua
+                .load(
+                    r#"if debug and debug.sethook then debug.sethook() end
+                    return table.concat(__m2_calls or {}, " ")"#,
+                )
+                .eval()
+                .unwrap_or_default();
+            log.push(format!("TogglePDA ran: {calls}"));
+            match fired {
                 Ok(n) => log.push(format!(
                     "TogglePDA (want {}): {n} handlers",
                     state.support.pda
