@@ -587,7 +587,27 @@ impl Post {
             (Some(t), _) => ([t.target, t.min_key, rate(t.retention), t.max_key], {
                 // `M2_TONE_CONTRAST=limit/multiplier` replaces the
                 // record's contrast limit and multiplier, to test.
-                let mut l = [t.min, t.max, t.contrast_limit, t.contrast];
+                // The records' contrast (multiplier 1.85-1.95) comes in with
+                // the night's monochrome ramp only: by day it crushed the
+                // ground's blue and doubled its saturation and speckle
+                // against PC footage (S .75 and SD 12 against .45 and 4-6;
+                // with it off all three land in range) while the night sea,
+                // which keeps it, matches (PC rounds Y and W; inferred, like
+                // the ramp's own night-only gate). `M2_CONTRAST=always`
+                // applies it as the records have it.
+                let night = if std::env::var("M2_CONTRAST").is_ok_and(|v| v == "always") {
+                    1.0
+                } else {
+                    lighting
+                        .monochrome
+                        .map_or(0.0, |m| (m.w / 0.3).clamp(0.0, 1.0))
+                };
+                let mut l = [
+                    t.min,
+                    t.max,
+                    t.contrast_limit,
+                    1.0 + (t.contrast - 1.0) * night,
+                ];
                 if let Ok(v) = std::env::var("M2_TONE_CONTRAST") {
                     for (slot, x) in l[2..].iter_mut().zip(v.split('/')) {
                         if let Ok(x) = x.trim().parse::<f32>() {
