@@ -107,6 +107,8 @@ struct Store {
     pending: Vec<Pending>,
     /// `Event.Post` calls not yet delivered: name and data.
     posted: Vec<(String, Value)>,
+    /// With `M2_STUB_ARGS`: events made and deleted, for diagnostics.
+    trace: Vec<String>,
     /// Game time, seconds.
     now: f64,
 }
@@ -163,6 +165,16 @@ impl Events {
                     s.next_id += 1;
                     let id = s.next_id;
                     let now = s.now;
+                    if crate::script::stub_args() && !kind.starts_with("Gui") {
+                        let shown: Vec<String> = params
+                            .clone()
+                            .sequence_values::<Value>()
+                            .filter_map(Result::ok)
+                            .map(|v| crate::script::show_arg(&v))
+                            .collect();
+                        s.trace
+                            .push(format!("{name} {id} {kind}{{{}}}", shown.join(", ")));
+                    }
                     s.pending.push(Pending {
                         id,
                         kind,
@@ -183,7 +195,19 @@ impl Events {
             "Delete",
             safe_function(lua, move |_, args| {
                 if let Some(id) = args.front().and_then(as_id) {
-                    store.borrow_mut().pending.retain(|p| p.id != id);
+                    let mut s = store.borrow_mut();
+                    if crate::script::stub_args() {
+                        let gone = s
+                            .pending
+                            .iter()
+                            .find(|p| p.id == id)
+                            .map(|p| p.kind.clone());
+                        s.trace.push(format!(
+                            "Delete {id} ({})",
+                            gone.as_deref().unwrap_or("none")
+                        ));
+                    }
+                    s.pending.retain(|p| p.id != id);
                 }
                 Ok(MultiValue::new())
             })?,
@@ -213,6 +237,11 @@ impl Events {
         event.set_metatable(Some(meta))?;
         lua.globals().set("Event", event)?;
         Ok(())
+    }
+
+    /// Events made and deleted since the last call (with `M2_STUB_ARGS`).
+    pub fn take_trace(&self) -> Vec<String> {
+        std::mem::take(&mut self.store.borrow_mut().trace)
     }
 
     /// How many events are pending.
