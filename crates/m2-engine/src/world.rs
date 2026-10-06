@@ -52,6 +52,9 @@ pub struct ObjectPlacement {
     /// the island's rocks, plants, fences and sandbags, kept within
     /// [`WorldSettings::prop_distance`](crate::WorldSettings::prop_distance).
     pub named: bool,
+    /// The template its entity is an instance of (its `Transform`'s
+    /// parent), 0 for none.
+    pub template: u32,
 }
 
 /// An entity of the static layers whose name is a vehicle template
@@ -134,6 +137,10 @@ pub struct Templates {
     pub tuning: HashMap<u32, VehicleTuning>,
     /// What templates leave when destroyed, and what pickups give.
     pub leavings: Leavings,
+    /// How much those with `Health` take, by id.
+    pub durability: HashMap<u32, crate::durability::Durability>,
+    /// The blasts of those with `Explosive`, by id.
+    pub explosions: HashMap<u32, crate::durability::Explosion>,
 }
 
 impl Templates {
@@ -303,6 +310,8 @@ impl Templates {
                 .collect(),
             tuning: crate::tuning::read(&db),
             leavings: crate::pickup::read(&db),
+            durability: crate::durability::read(&db),
+            explosions: crate::durability::explosions(&db),
         }
     }
 }
@@ -669,6 +678,7 @@ impl WorldIndex {
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),
                         named: false,
+                        template: p.parent,
                     });
                 }
             }
@@ -706,6 +716,7 @@ impl WorldIndex {
                             position,
                             rotation,
                             named: true,
+                            template: p.parent,
                         })
                     }
                     // A vehicle template that drives: the alpha places it.
@@ -738,6 +749,7 @@ impl WorldIndex {
                         position,
                         rotation,
                         named: true,
+                        template: p.parent,
                     }),
                     // A name no asset or template defines: the words may
                     // (not the designers' test entities).
@@ -809,6 +821,7 @@ impl WorldIndex {
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),
                         named: !models.contains_key(&entity),
+                        template: p.parent,
                     },
                 );
             }

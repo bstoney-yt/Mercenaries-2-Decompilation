@@ -5401,10 +5401,7 @@ fn destruct<R: Read + Seek>(
         let of: Vec<&Row> = rows.iter().filter(|r| r.stem.contains(cat)).collect();
         let models: HashSet<u32> = of.iter().map(|r| r.model).collect();
         let count = |f: &dyn Fn(&Seen) -> bool| {
-            models
-                .iter()
-                .filter(|h| seen.get(h).is_some_and(f))
-                .count()
+            models.iter().filter(|h| seen.get(h).is_some_and(f)).count()
         };
         println!(
             "  {cat}: {} placed, {} models; {} / {} / {} / {}; {} / {}",
