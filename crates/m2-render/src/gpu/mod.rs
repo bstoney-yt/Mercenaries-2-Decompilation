@@ -2234,6 +2234,11 @@ impl RenderBackend for WgpuBackend {
             None => (0, 0),
         };
         let key = self.pipeline_key(call)?;
+        // `M2_SKIP_DRAWS=opaque,masked,translucent,additive` leaves those
+        // kinds of draw out (to see what covers the sky).
+        if skipped(key.blend) {
+            return Ok(());
+        }
         self.ensure_pipeline(&key)?;
         let caster = self.caster(call, &key, instance_first, instances)?;
         let frame = self.frame.as_mut().expect("checked above");
@@ -2380,4 +2385,17 @@ impl WgpuBackend {
         }
         Ok(())
     }
+}
+
+/// Whether `M2_SKIP_DRAWS` names this kind of draw.
+fn skipped(blend: BlendKind) -> bool {
+    static SKIP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| std::env::var("M2_SKIP_DRAWS").unwrap_or_default());
+    let name = match blend {
+        BlendKind::Opaque => "opaque",
+        BlendKind::Masked => "masked",
+        BlendKind::Translucent => "translucent",
+        BlendKind::Additive => "additive",
+    };
+    skip.split(',').any(|s| s.trim() == name)
 }
