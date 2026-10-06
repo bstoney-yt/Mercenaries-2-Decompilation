@@ -156,6 +156,9 @@ pub struct Library {
     pub shapes: HashMap<u16, (Shape, Vec<ShapeTriangle>)>,
     pub sprites: HashMap<u16, Rc<Timeline>>,
     pub images: HashMap<u16, Image>,
+    /// Images it defines that aren't drawn: bitmaps embedded in the movie,
+    /// and parts of images it doesn't name.
+    pub missing_images: Vec<u16>,
     pub texts: HashMap<u16, EditText>,
     /// Fonts by character id: defined here, or imported (by name).
     pub fonts: HashMap<u16, Font>,
@@ -182,7 +185,7 @@ impl Library {
             ..Library::default()
         };
         let summary = movie.summary();
-        for (id, c) in summary.characters {
+        for (id, c) in &summary.characters {
             if let Character::ExternalImage(e) = c {
                 let stem = e
                     .file_name
@@ -194,15 +197,43 @@ impl Library {
                     stem.to_owned()
                 };
                 lib.images.insert(
-                    id,
+                    *id,
                     Image {
                         texture,
                         width: f32::from(e.width),
                         height: f32::from(e.height),
+                        part: [0.0, 0.0, 1.0, 1.0],
                     },
                 );
             }
         }
+        // Parts of those images (left, top, right, bottom in its pixels).
+        for (id, c) in &summary.characters {
+            if let Character::SubImage { image, rect } = c
+                && let Some(whole) = lib.images.get(image).cloned()
+            {
+                let [l, t, r, b] = rect.map(f32::from);
+                let (w, h) = (whole.width.max(1.0), whole.height.max(1.0));
+                lib.images.insert(
+                    *id,
+                    Image {
+                        texture: whole.texture,
+                        width: (r - l).max(1.0),
+                        height: (b - t).max(1.0),
+                        part: [l / w, t / h, r / w, b / h],
+                    },
+                );
+            }
+        }
+        lib.missing_images = summary
+            .characters
+            .iter()
+            .filter(|(id, c)| {
+                matches!(c, Character::Bitmap { .. } | Character::SubImage { .. })
+                    && !lib.images.contains_key(id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
         for (id, name) in summary.exports {
             lib.exports.insert(name.to_ascii_lowercase(), id);
         }

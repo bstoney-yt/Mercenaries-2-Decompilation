@@ -1187,14 +1187,17 @@ impl Thread {
                 // Not asked again until the scripts set it again.
                 continue;
             };
-            let mut rt = avm1::Runtime::new(flash::Player::new(lib));
+            let mut rt = avm1::Runtime::new(flash::Player::new(Rc::clone(&lib)));
             let movies = Rc::clone(&self.movies);
             rt.set_loader(Box::new(move |name: &str| {
                 movies.borrow_mut().library(&movie_name(name))
             }));
             log.push(format!(
-                "flash: widget {id} ({}) plays {swf}",
-                names.get(&id).map_or("", String::as_str)
+                "flash: widget {id} ({}) plays {swf}, {} images, {} not drawn {:?}",
+                names.get(&id).map_or("", String::as_str),
+                lib.images.len(),
+                lib.missing_images.len(),
+                lib.missing_images,
             ));
             self.flash.insert(
                 id,
