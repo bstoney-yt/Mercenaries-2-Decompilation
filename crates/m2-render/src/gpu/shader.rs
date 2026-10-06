@@ -66,7 +66,10 @@ struct Frame {
     // (`surface_sun`), y: scale on searchlight beams' alpha, z: ground
     // is summed in linear light, w: scale on the air in front of clouds
     surface: vec4<f32>,
-    // x: the least cloud cover anywhere in the sky
+    // x: the least cloud cover anywhere in the sky, y: a sky stage to
+    // paint alone (1: the cloud before the air, 2: the cloud tone / 2,
+    // 3: the sun's colour / 2, 4: the deck tint / 2, 5: the cloud after
+    // the air, 6: cover as grey)
     sky_fit: vec4<f32>,
 };
 
@@ -758,6 +761,18 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
             cloud = lit + frame.ambient_cube[2].rgb * 0.5;
         }
         cloud = cloud * frame.cloud_tone.rgb;
+        let stage = u32(frame.sky_fit.y + 0.5);
+        if stage == 1u {
+            return vec4<f32>(cloud, 1.0);
+        } else if stage == 2u {
+            return vec4<f32>(frame.cloud_tone.rgb * 0.5, 1.0);
+        } else if stage == 3u {
+            return vec4<f32>(frame.sun_color.rgb * 0.5, 1.0);
+        } else if stage == 4u {
+            return vec4<f32>(light_from_display(max(frame.deck.yzw, vec3<f32>(0.0))) * 0.5, 1.0);
+        } else if stage == 6u {
+            return vec4<f32>(vec3<f32>(alpha * frame.cloud_tone.a), 1.0);
+        }
         if frame.wind.w >= 0.0 && game_haze() {
             // As the game's, the air between the eye and the deck dims the
             // cloud and adds its own light in front of it.
@@ -774,6 +789,9 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         }
         // Thin veils: the game's footage shows a hazy sky with little
         // solid cloud.
+        if stage == 5u {
+            return vec4<f32>(cloud, 1.0);
+        }
         rgb = mix(rgb, cloud, alpha * frame.cloud_tone.a);
     }
     return vec4<f32>(rgb, 1.0);
