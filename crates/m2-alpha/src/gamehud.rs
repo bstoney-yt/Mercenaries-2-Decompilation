@@ -923,6 +923,8 @@ fn pda_probe(lua: &Lua) -> String {
             local ok, v = pcall(st.IsLocked)
             out[#out + 1] = "MrxState.IsLocked=" .. tostring(ok and v)
         end
+        local dlg = rawget(_G, "MrxGuiDialogBox")
+        out[#out + 1] = "system dialog=" .. tostring(type(dlg) == "table" and rawget(dlg, "oSystemDialogBoxFlash"))
         local base = rawget(_G, "MrxGuiBase")
         if type(base) == "table" then
             for _, f in ipairs({"GetCurrentControlHolder", "GetControlHolder"}) do
@@ -1103,13 +1105,16 @@ impl Thread {
         // The HUD's own scripts look her up as the local player too
         // (`CommenceFanfare` hides the HUD through `GetHudState` and
         // `ToggleHud` of `Player.GetLocalPlayer()`), so here that answers
-        // the same userdata, not m2's number.
+        // the same userdata, not m2's number. The game has the dialog box
+        // module loaded at boot; unloaded, its `oSystemDialogBoxFlash` is a
+        // stub, and `MrxGuiPda.Open` takes that for a system dialog up.
         mission
             .run(
                 "local me = Sys.StringToGuid(\"0x1\")
                  for _, f in ipairs({\"GetLocalPlayer\", \"GetPrimaryPlayer\"}) do
                      rawset(Player, f, function() return me end)
                  end
+                 import(\"MrxGuiDialogBox\")
                  MrxGuiManager.CreateGui(me)",
                 "create gui",
             )
