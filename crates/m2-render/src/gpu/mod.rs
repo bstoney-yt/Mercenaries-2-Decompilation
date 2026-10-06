@@ -244,7 +244,8 @@ struct FrameUniforms {
     surface: [f32; 4],
     /// x: the least cloud cover anywhere in the sky (`M2_CLOUD_FILL`),
     /// y: a sky stage to paint alone (`M2_SKY_DEBUG`), z: the sea mirrors
-    /// the cloud deck too (`M2_SEA_SKY=deck`).
+    /// the cloud deck too (`M2_SEA_SKY=deck`), w: the sea's glint keeps
+    /// the sun's hue (`M2_GLINT_HUE=on`).
     sky_fit: [f32; 4],
     /// Trial scales on the sea's sun glint: x on its strength
     /// (`M2_GLINT_GAIN`), y its power in place of the material's
@@ -1864,7 +1865,13 @@ impl WgpuBackend {
                 } else {
                     0.0
                 },
-                0.0,
+                // `M2_GLINT_HUE=on`: the sea's glint takes the sun's hue
+                // even where surfaces take its brightness alone.
+                if std::env::var("M2_GLINT_HUE").is_ok_and(|v| v == "on") {
+                    1.0
+                } else {
+                    0.0
+                },
             ],
             glint_fit: [
                 env_f32("M2_GLINT_GAIN").unwrap_or(1.0),
