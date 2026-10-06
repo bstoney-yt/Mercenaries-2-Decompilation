@@ -859,6 +859,21 @@ impl GameHud {
     }
 }
 
+/// The contract under way in the PDA, once its widget is up: its details
+/// as `MrxMissionFlow.AddPdaMissionDetails` gives them (what the
+/// contract's `RefreshPdaDisplay` calls), then selected as the contract's
+/// task does when it starts (script 2f0b1589, `Activated`).
+const CONTRACT_IN_PDA: &str = r#"
+local flow = rawget(_G, "MrxMissionFlow")
+if type(flow) == "table" and type(flow.AddPdaMissionDetails) == "function" then
+    flow.AddPdaMissionDetails("VzaCon001")
+end
+local pda = rawget(_G, "Pda")
+if type(pda) == "table" and type(pda.Map) == "table" then
+    pda.Map:SetSelectedMission({ sName = "VzaCon001" })
+end
+"#;
+
 /// What `MrxGuiPda.Open` checks, for the log: the PDA module's plain
 /// values (and those of its tables one level down), MrxState's lock and
 /// the control holder.
@@ -1033,6 +1048,7 @@ struct Thread {
     /// Whether its script showed it, as last logged.
     pda_scripted: Option<bool>,
     pda_hid_logged: bool,
+    contract_in_pda: bool,
     /// The zones the radar's script holds, as last read.
     zones: Vec<Zone>,
     /// The island's roads, read with the radar's map.
@@ -1114,9 +1130,6 @@ impl Thread {
         // the same userdata, not m2's number. The game has the dialog box
         // module loaded at boot; unloaded, its `oSystemDialogBoxFlash` is a
         // stub, and `MrxGuiPda.Open` takes that for a system dialog up.
-        // The story's first step unlocks the first contract
-        // (`UnlockMission("VzaCon001")`, script ce4166ed), which puts it
-        // in the PDA's missions.
         // Her cash is 0, as `PlayerCashChanged` tells the HUD (the PDA's
         // stats page formats `Player.GetCash()`).
         mission
@@ -1127,14 +1140,7 @@ impl Thread {
                  end
                  rawset(Player, \"GetCash\", function() return 0 end)
                  import(\"MrxGuiDialogBox\")
-                 MrxGuiManager.CreateGui(me)
-                 local flow = rawget(_G, \"MrxMissionFlow\")
-                 if type(flow) == \"table\" and type(flow.UnlockMission) == \"function\" then
-                     local ok, e = pcall(flow.UnlockMission, \"VzaCon001\")
-                     if not ok then print(\"UnlockMission: \" .. tostring(e)) end
-                 else
-                     print(\"UnlockMission: no MrxMissionFlow\")
-                 end",
+                 MrxGuiManager.CreateGui(me)",
                 "create gui",
             )
             .map_err(|e| e.to_string())?;
@@ -1160,6 +1166,7 @@ impl Thread {
             since_toggle: u32::MAX,
             pda_scripted: None,
             pda_hid_logged: false,
+            contract_in_pda: false,
             zones: Vec::new(),
             roads: Vec::new(),
             pda: None,
@@ -1193,6 +1200,18 @@ impl Thread {
             && self.since_toggle >= PDA_SETTLE
         {
             self.since_toggle = 0;
+            if !self.contract_in_pda {
+                self.contract_in_pda = true;
+                if let Err(e) = self
+                    .mission
+                    .lua()
+                    .load(CONTRACT_IN_PDA)
+                    .set_name("=m2-hud contract")
+                    .exec()
+                {
+                    log.push(format!("contract in the PDA: {e}"));
+                }
+            }
             log.push(format!("PDA state: {}", pda_probe(self.mission.lua())));
             // Which Lua functions the event runs, for the log.
             let lua = self.mission.lua();
