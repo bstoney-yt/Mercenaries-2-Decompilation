@@ -1104,6 +1104,7 @@ impl Thread {
         for item in items.iter().filter(shown) {
             self.prims(item, state, &mut prims, &mut want);
         }
+        self.log_flash_shown(&items, &shown, &mut log);
         let mut images = Vec::new();
         for hash in want {
             if self.tried.insert(hash) {
@@ -1201,6 +1202,7 @@ impl Thread {
                     swf: swf.clone(),
                     restarts: *restarts,
                     rt,
+                    seen: None,
                 },
             );
         }
@@ -1221,6 +1223,7 @@ impl Thread {
                     FlashArg::Text(t) => avm1::Value::Str(t.into()),
                 })
                 .collect();
+            log.push(format!("flash {}: {name}({} args)", m.swf, args.len()));
             m.rt.call(&name, &args);
         }
         let mut commands = Vec::new();
@@ -1241,6 +1244,44 @@ impl Thread {
                     "flash: widget {id}: fscommand {command}({arg}) unheard"
                 )),
                 Err(e) => log.push(format!("flash: widget {id}: {command}: {e}")),
+            }
+        }
+    }
+
+    /// Logs when a movie comes on screen, leaves it, moves, or starts or
+    /// stops drawing anything.
+    fn log_flash_shown(
+        &mut self,
+        items: &[DrawItem],
+        shown: &impl Fn(&&DrawItem) -> bool,
+        log: &mut Vec<String>,
+    ) {
+        let mut rects: HashMap<u32, [f32; 4]> = HashMap::new();
+        for item in items.iter().filter(shown) {
+            if let DrawItem::Flash { widget, rect, .. } = item {
+                rects.insert(*widget, *rect);
+            }
+        }
+        let movies = self.movies.borrow();
+        for (id, m) in &mut self.flash {
+            let rect = rects.get(id).copied();
+            let triangles = match rect {
+                Some(r) => {
+                    let mut out = Vec::new();
+                    let mut want = Vec::new();
+                    flash_prims(m, &movies, r, &mut out, &mut want);
+                    out.len()
+                }
+                None => 0,
+            };
+            let seen = (rect.map(|r| r.map(|v| v.round() as i32)), triangles > 0);
+            if m.seen.as_ref() != Some(&seen) {
+                log.push(format!(
+                    "flash {} (widget {id}): {}, {triangles} triangles",
+                    m.swf,
+                    rect.map_or("not drawn".to_owned(), |r| format!("at {r:.0?}"))
+                ));
+                m.seen = Some(seen);
             }
         }
     }
@@ -1980,6 +2021,9 @@ struct FlashMovie {
     /// The widget's restart count when started.
     restarts: u32,
     rt: avm1::Runtime,
+    /// What was last logged of it on screen: its box (None: not drawn)
+    /// and whether it drew anything.
+    seen: Option<(Option<[i32; 4]>, bool)>,
 }
 
 /// A movie's name as the archive knows it: a file name or path
