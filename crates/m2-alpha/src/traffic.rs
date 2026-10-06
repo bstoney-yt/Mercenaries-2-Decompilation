@@ -16,9 +16,12 @@ use m2_math::glam::{Vec2, Vec3};
 
 use crate::scene::{ParkedVehicle, Scene};
 
-/// Traffic vehicles out at once, at most (the alpha's limit, for the
-/// frame rate; the game's own isn't known).
+/// Traffic vehicles out at once, at most, of those that drive a path and
+/// of those that stand (the alpha's limits, for the frame rate; the
+/// game's own aren't known). Apart, so a place full of standing vehicles
+/// (the guerrilla HQ) doesn't keep its driving traffic in.
 const MOST_OUT: usize = 8;
+const MOST_STANDING: usize = 8;
 /// A waypoint is reached this near, metres.
 const ARRIVE: f32 = 7.0;
 /// A path whose ends are this near is driven round and round.
@@ -113,8 +116,15 @@ impl Traffic {
                 }
             }
         }
-        let mut room = MOST_OUT.saturating_sub(out.len() + self.loading.len());
-        if room == 0 {
+        let moves = |e: &u32| self.points[e].route.len() >= 2;
+        let busy = out.iter().chain(&self.loading);
+        let moving = busy.clone().filter(|e| moves(e)).count();
+        let standing = busy.count() - moving;
+        let mut room = [
+            MOST_STANDING.saturating_sub(standing),
+            MOST_OUT.saturating_sub(moving),
+        ];
+        if room == [0, 0] {
             return;
         }
         let mut due: Vec<(f32, u32)> = self
@@ -133,8 +143,12 @@ impl Traffic {
             .collect();
         due.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (_, entity) in due {
-            if room == 0 {
+            if room == [0, 0] {
                 break;
+            }
+            let share = usize::from(self.points[&entity].route.len() >= 2);
+            if room[share] == 0 {
+                continue;
             }
             let roll = self.roll();
             let t = &self.points[&entity];
@@ -154,7 +168,7 @@ impl Traffic {
             self.loading.insert(entity);
             self.wait.remove(&entity);
             self.next.remove(&entity);
-            room -= 1;
+            room[share] -= 1;
         }
     }
 
