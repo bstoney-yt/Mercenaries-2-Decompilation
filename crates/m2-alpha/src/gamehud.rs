@@ -3383,3 +3383,53 @@ mod tests {
         assert!((area(&out, 1.0) - 100.0).abs() < 1.0);
     }
 }
+
+#[cfg(test)]
+mod paint_tests {
+    use super::*;
+
+    /// A fade (a black, three-quarters solid quad over the screen) leaves
+    /// egui as a mesh over the screen.
+    #[test]
+    fn solid_quads_reach_the_tessellated_output() {
+        let (tx, _rx) = channel();
+        let (_tx, rx) = channel();
+        let mut hud = GameHud {
+            tx,
+            rx,
+            status: Status::Ready,
+            prims: vec![quad(
+                None,
+                [0.0, 0.0, 800.0, 600.0],
+                [0.0; 4],
+                [0.0, 0.0, 0.0, 0.75],
+                0.0,
+            )],
+            pending: Vec::new(),
+            textures: HashMap::new(),
+            white: None,
+            last_message: None,
+            last_call: 0,
+            last_time: None,
+            log: None,
+        };
+        let ctx = egui::Context::default();
+        hud.upload(&ctx);
+        let out = ctx.run_ui(crate::ui::headless_input(800, 600, 0.0), |ui| {
+            let ctx = ui.ctx();
+            hud.paint(&ctx.layer_painter(egui::LayerId::background()));
+        });
+        let mut delta = out.textures_delta;
+        delta.clear();
+        let meshes = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let verts: Vec<_> = meshes
+            .iter()
+            .filter_map(|m| match &m.primitive {
+                egui::epaint::Primitive::Mesh(m) => Some(m.vertices.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(verts.iter().any(|v| v.color.a() > 150 && v.pos.x > 700.0));
+    }
+}

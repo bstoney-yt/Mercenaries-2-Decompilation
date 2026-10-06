@@ -239,6 +239,9 @@ impl Hud {
                 renderer.update_texture(t.device, t.queue, *id, image);
             }
         }
+        if std::env::var_os("M2_PAINT_LOG").is_some() {
+            log_primitives(&shapes, &delta, t.format, t.size);
+        }
         let screen = ScreenDescriptor {
             size_in_pixels: [t.size.0, t.size.1],
             pixels_per_point: ppp,
@@ -267,6 +270,43 @@ impl Hud {
             renderer.free_texture(id);
         }
         delta.clear();
+    }
+}
+
+/// What goes to the GPU (`M2_PAINT_LOG` set): each mesh's texture, its
+/// vertices, bounds, clip and colours, to find HUD fills lost on the way.
+fn log_primitives(
+    shapes: &[egui::ClippedPrimitive],
+    delta: &egui::TexturesDelta,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+) {
+    let set: Vec<_> = delta.set.keys().copied().collect();
+    eprintln!(
+        "paint: {} primitives to {format:?} {size:?}; textures set {set:?}",
+        shapes.len()
+    );
+    for p in shapes {
+        if let egui::epaint::Primitive::Mesh(m) = &p.primitive {
+            let b = m.calc_bounds();
+            let alpha = m.vertices.iter().map(|v| v.color.a());
+            let (lo, hi) = alpha.fold((255, 0), |(lo, hi), a| (lo.min(a), hi.max(a)));
+            let dark = m
+                .vertices
+                .iter()
+                .filter(|v| v.color.r() < 16 && v.color.a() > 64)
+                .count();
+            eprintln!(
+                "paint: {:?} {} verts {} indices, bounds {:.0?}..{:.0?}, clip {:.0?}..{:.0?}, alpha {lo}..{hi}, {dark} dark",
+                m.texture_id,
+                m.vertices.len(),
+                m.indices.len(),
+                b.min,
+                b.max,
+                p.clip_rect.min,
+                p.clip_rect.max,
+            );
+        }
     }
 }
 
