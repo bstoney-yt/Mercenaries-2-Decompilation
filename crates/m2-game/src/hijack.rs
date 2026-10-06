@@ -47,6 +47,9 @@ pub const BUTTONS: [(&str, u32); 8] = [
     ("LStick_Down", 12),
 ];
 
+/// What `Player.GetCamera` answers: the one camera, as a handle.
+pub const PLAYER_CAMERA: u32 = 0x2fff_ff01;
+
 /// What a hijack asks of the game, beyond the commands every script uses.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HijackCommand {
@@ -189,8 +192,11 @@ impl Minigame {
 pub struct HijackWorld {
     /// Each character's last keyed action and whether it has ended.
     actions: HashMap<u32, (String, bool)>,
-    /// Every button pressed, in order; minigames keep their place in it.
-    presses: Vec<u32>,
+    /// Every button pressed, in order, with when (game seconds); minigames
+    /// keep their place in it.
+    presses: Vec<(f64, u32)>,
+    /// Hardpoints' places the game knows, by object and name (lower case).
+    hardpoints: HashMap<(u32, String), [f32; 3]>,
     /// Buttons held down, and since when (game seconds).
     held: HashMap<u32, f64>,
     /// The hijack under way: hero, driver, vehicle.
@@ -213,9 +219,16 @@ impl HijackWorld {
             .map(|a| a.0.as_str())
     }
 
-    /// The player pressed `button` (a [`BUTTONS`] number).
-    pub fn press(&mut self, button: u32) {
-        self.presses.push(button);
+    /// The player pressed `button` (a [`BUTTONS`] number) at `at` (game
+    /// seconds).
+    pub fn press(&mut self, button: u32, at: f64) {
+        self.presses.push((at, button));
+    }
+
+    /// Where `guid`'s hardpoint `name` (`hp_seat_lt`) is in the world.
+    pub fn set_hardpoint(&mut self, guid: u32, name: &str, at: [f32; 3]) {
+        self.hardpoints
+            .insert((guid, name.to_ascii_lowercase()), at);
     }
 
     /// The player is holding `button` down since `at` (game seconds), or
@@ -235,7 +248,7 @@ impl HijackWorld {
         self.actions.get(&guid).is_some_and(|a| a.1)
     }
 
-    pub(crate) fn presses(&self) -> &[u32] {
+    pub(crate) fn presses(&self) -> &[(f64, u32)] {
         &self.presses
     }
 
@@ -255,7 +268,8 @@ pub(crate) struct MinigameCheck {
 }
 
 /// Checks a `Minigame` event: `{player, seconds, mode, button[, ...]}`,
-/// made at `made`, having read `read` presses so far.
+/// made at `made`, having read `read` presses so far (`None`: none yet;
+/// it reads those made since it was).
 ///
 /// - `"press"`: `"success"` on the button; another button is
 ///   `"failed"` (inferred: the scripts handle a failure they can't get
@@ -272,7 +286,7 @@ pub(crate) fn check_minigame(
     params: &Table,
     made: f64,
     now: f64,
-    read: usize,
+    read: Option<usize>,
     last: Option<u32>,
     world: &dyn World,
 ) -> MinigameCheck {
@@ -289,7 +303,13 @@ pub(crate) fn check_minigame(
     };
     let button = num(4).map(|b| b as u32);
     let presses = world.hijack_presses();
-    let new = presses.get(read..).unwrap_or(&[]);
+    let read = read.unwrap_or_else(|| presses.partition_point(|p| p.0 < made));
+    let new: Vec<u32> = presses
+        .get(read..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|p| p.1)
+        .collect();
     let mut out = MinigameCheck {
         fires: Vec::new(),
         done: false,
@@ -319,7 +339,7 @@ pub(crate) fn check_minigame(
             }
         }
         "tap" => {
-            for &b in new {
+            for &b in &new {
                 if Some(b) == button {
                     out.fires.push(status("update", Some(0.0)));
                 }
@@ -327,7 +347,7 @@ pub(crate) fn check_minigame(
         }
         "alternate" => {
             let pair = [num(4).map(|b| b as u32), num(5).map(|b| b as u32)];
-            for &b in new {
+            for &b in &new {
                 if pair.contains(&Some(b)) && out.last != Some(b) {
                     out.last = Some(b);
                     out.fires.push(status("update", Some(0.0)));
@@ -523,6 +543,32 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         Ok(MultiValue::new())
     })?;
 
+    // (object, name): a hardpoint's place, as the game last gave it; else
+    // the object's own place (inferred stand-in: the explosions it places
+    // then go off at the vehicle's origin, a metre or two from the hatch).
+    add(&object, "GetHardpointPosition", |w, _, a| {
+        let (Some(guid), Some(name)) = (id(a.first()), text(a.get(1))) else {
+            return Ok(MultiValue::new());
+        };
+        let at = w
+            .hijack
+            .hardpoints
+            .get(&(guid, name.to_ascii_lowercase()))
+            .copied()
+            .or_else(|| w.objects.get(&guid).map(|o| o.position));
+        Ok(MultiValue::from_vec(match at {
+            Some(p) => p.map(|c| Value::Number(f64::from(c))).to_vec(),
+            None => Vec::new(),
+        }))
+    })?;
+
+    // The player's camera, for the camera calls that take one (shakes,
+    // the failure's look at her chest).
+    let player = lib("Player")?;
+    add(&player, "GetCamera", |_, _, _| {
+        Ok(MultiValue::from_vec(vec![guid_value(PLAYER_CAMERA)]))
+    })?;
+
     let ai = lib("Ai")?;
     add(&ai, "Enable", |w, _, a| {
         if let Some(guid) = id(a.first()) {
@@ -667,7 +713,7 @@ mod tests {
         fn labelled(&self, _: &str) -> Vec<u32> {
             Vec::new()
         }
-        fn hijack_presses(&self) -> &[u32] {
+        fn hijack_presses(&self) -> &[(f64, u32)] {
             self.0.presses()
         }
         fn hijack_held_since(&self, b: u32) -> Option<f64> {
@@ -691,22 +737,35 @@ mod tests {
         let lua = Lua::new();
         let p = game(&lua, "return {1, 0.75, 'press', 5}");
         let mut pad = Pad::default();
-        let c = check_minigame(&p, 0.0, 0.1, 0, None, &pad);
+        let c = check_minigame(&p, 0.0, 0.1, Some(0), None, &pad);
         assert!(c.fires.is_empty() && !c.done);
-        pad.0.press(5);
-        let c = check_minigame(&p, 0.0, 0.2, 0, None, &pad);
+        pad.0.press(5, 0.0);
+        let c = check_minigame(&p, 0.0, 0.2, Some(0), None, &pad);
         assert_eq!(statuses(&c), ["success"]);
         assert!(c.done);
-        pad.0.press(6);
-        let c = check_minigame(&p, 0.0, 0.3, 1, None, &pad);
+        pad.0.press(6, 0.0);
+        let c = check_minigame(&p, 0.0, 0.3, Some(1), None, &pad);
         assert_eq!(statuses(&c), ["failed"]);
+    }
+
+    #[test]
+    fn a_press_made_as_the_prompt_shows_counts_but_not_one_before() {
+        let lua = Lua::new();
+        let p = game(&lua, "return {1, 1, 'press', 9}");
+        let mut pad = Pad::default();
+        pad.0.press(9, 1.9);
+        pad.0.press(9, 2.0);
+        let c = check_minigame(&p, 2.0, 2.05, None, None, &pad);
+        assert_eq!(statuses(&c), ["success"]);
+        let c = check_minigame(&p, 2.01, 2.05, None, None, &pad);
+        assert!(c.fires.is_empty());
     }
 
     #[test]
     fn a_press_times_out() {
         let lua = Lua::new();
         let p = game(&lua, "return {1, 0.75, 'press', 5}");
-        let c = check_minigame(&p, 1.0, 1.8, 0, None, &Pad::default());
+        let c = check_minigame(&p, 1.0, 1.8, None, None, &Pad::default());
         assert_eq!(statuses(&c), ["timeout"]);
     }
 
@@ -716,14 +775,14 @@ mod tests {
         let p = game(&lua, "return {1, 35, 'tap', 8}");
         let mut pad = Pad::default();
         for b in [8, 7, 8] {
-            pad.0.press(b);
+            pad.0.press(b, 0.0);
         }
-        let c = check_minigame(&p, 0.0, 1.0, 0, None, &pad);
+        let c = check_minigame(&p, 0.0, 1.0, None, None, &pad);
         assert_eq!(statuses(&c), ["update", "update"]);
         assert!(!c.done);
         assert_eq!(c.read, 3);
         assert_eq!(c.fires[0].1, Some(0.0));
-        let c = check_minigame(&p, 0.0, 35.0, 3, None, &pad);
+        let c = check_minigame(&p, 0.0, 35.0, Some(3), None, &pad);
         assert_eq!(statuses(&c), ["timeout"]);
     }
 
@@ -733,9 +792,9 @@ mod tests {
         let p = game(&lua, "return {1, 10, 'alternate', 9, 10}");
         let mut pad = Pad::default();
         for b in [9, 9, 10, 9] {
-            pad.0.press(b);
+            pad.0.press(b, 0.0);
         }
-        let c = check_minigame(&p, 0.0, 1.0, 0, None, &pad);
+        let c = check_minigame(&p, 0.0, 1.0, None, None, &pad);
         assert_eq!(c.fires.len(), 3);
         assert_eq!(c.last, Some(9));
     }
@@ -746,8 +805,12 @@ mod tests {
         let p = game(&lua, "return {1, 5, 'hold', 6, 1.5}");
         let mut pad = Pad::default();
         pad.0.hold(6, Some(1.0));
-        assert!(check_minigame(&p, 0.0, 2.0, 0, None, &pad).fires.is_empty());
-        let c = check_minigame(&p, 0.0, 2.6, 0, None, &pad);
+        assert!(
+            check_minigame(&p, 0.0, 2.0, None, None, &pad)
+                .fires
+                .is_empty()
+        );
+        let c = check_minigame(&p, 0.0, 2.6, None, None, &pad);
         assert_eq!(statuses(&c), ["success"]);
     }
 
@@ -767,8 +830,8 @@ mod tests {
         .unwrap();
         let mut pad = Pad::default();
         events.update(0.1, &pad);
-        pad.0.press(8);
-        pad.0.press(8);
+        pad.0.press(8, 0.0);
+        pad.0.press(8, 0.0);
         events.update(0.1, &pad);
         pad.0
             .actions

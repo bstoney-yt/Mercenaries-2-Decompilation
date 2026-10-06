@@ -634,7 +634,14 @@ impl Mission {
     /// The player pressed a pad button, or started or stopped holding it
     /// (`crate::hijack::BUTTONS` numbers).
     pub fn press(&mut self, button: u32) {
-        self.world.borrow_mut().hijack.press(button);
+        let now = self.now;
+        self.world.borrow_mut().hijack.press(button, now);
+    }
+
+    /// Where `guid`'s hardpoint `name` (`hp_seat_lt`, a node of its model)
+    /// is in the world now; hijacks set off their explosions there.
+    pub fn set_hardpoint(&mut self, guid: u32, name: &str, at: [f32; 3]) {
+        self.world.borrow_mut().hijack.set_hardpoint(guid, name, at);
     }
 
     pub fn hold(&mut self, button: u32, down: bool) {

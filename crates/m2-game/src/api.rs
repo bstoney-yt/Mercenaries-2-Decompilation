@@ -541,7 +541,7 @@ impl World for ScriptWorld {
         self.hijack.action_done(guid)
     }
 
-    fn hijack_presses(&self) -> &[u32] {
+    fn hijack_presses(&self) -> &[(f64, u32)] {
         self.hijack.presses()
     }
 
