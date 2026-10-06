@@ -5,14 +5,25 @@
 //! from its entity name (`VZ Soldier ..`, `VZ Heavy ..`, `VZ Deathsquad ..`),
 //! as in the browser viewer. The behaviour (standing at posts, walking
 //! routes there and back with pauses, civilians strolling about) is
-//! invented: the game's AI is not decoded. So is how they fight (see
-//! [`combat`](crate::combat)): a soldier who hears gunfire close by or is
-//! hit turns on the player and fires, civilians run.
+//! invented: the game's AI code is not decoded.
+//!
+//! How a soldier fights comes from their template's AI data
+//! ([`AiProfile`]): their health, the cone they see in (`VisionFOV`, 180
+//! degrees for people) and how far (`Vision`, `Hearing` multiples), how
+//! fast they chase and move about in a fight (`PursueSpeed`,
+//! `CombatSpeed`, fractions of a sprint), how well they shoot
+//! (`Accuracy`, see [`combat`](crate::combat)), how often they push in
+//! rather than step aside (`Offensive`), and `Pacifist`. The distances
+//! those multiply and the timings are the alpha's own (inferred, marked
+//! so). A soldier who sees the player, hears gunfire close by or is hit
+//! turns on her: fires while he sees her and she is in range, chases to
+//! where he last saw her when not, steps about between shots, and gives
+//! up after a while without sight of her. Civilians run.
 
 use std::collections::HashSet;
 
 use m2_engine::world::SpawnPoint;
-use m2_engine::{Character, Gait, GpuModel, Physics, RagdollId};
+use m2_engine::{AiProfile, Character, Gait, GpuModel, Physics, RagdollId};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 
 use crate::scene::{Carry, Rig};
@@ -38,6 +49,24 @@ const CLEAR: f32 = 6.0;
 const FIGHT_RANGE: f32 = 80.0;
 const FIRE_RANGE: f32 = 70.0;
 const FIRE_ARC: f32 = 0.3;
+/// How far a soldier with `Vision` 1 sees, metres (inferred: the range
+/// they fight in), from how high (his head), and how often he looks,
+/// seconds.
+const SIGHT: f32 = FIGHT_RANGE;
+const EYE: f32 = 1.6;
+const LOOK_EVERY: f32 = 0.2;
+/// A soldier's full sprint, m/s, that `PursueSpeed` and `CombatSpeed`
+/// are fractions of (inferred: the player's sprint).
+const SPRINT: f32 = 7.2;
+/// Seconds a soldier hunts without sight of her before calming down, and
+/// how close to where he last saw her he goes (inferred).
+const GIVE_UP: f32 = 20.0;
+const CLOSE_ENOUGH: f32 = 2.0;
+/// Between steps about in a fight: seconds (at least, plus up to), how
+/// far a step goes, metres, and how close he pushes in to her (inferred).
+const STEP_GAP: (f32, f32) = (2.0, 3.0);
+const STEP: (f32, f32) = (3.0, 6.0);
+const PUSH_TO: f32 = 15.0;
 /// Seconds between a soldier's shots: at least this, plus up to as much
 /// again at random.
 const FIRE_GAP: (f32, f32) = (0.9, 0.8);
@@ -255,6 +284,17 @@ pub struct Npc {
     /// Set by a tick when a soldier fires; the fight takes the shot.
     pub fires: bool,
     cooldown: f32,
+    /// How their template fights (a plain VZ soldier's when unknown).
+    pub ai: AiProfile,
+    /// In a fight: where they last saw her, and for how long they haven't.
+    last_seen: Option<Vec3>,
+    unseen: f32,
+    /// Seconds to the next look about.
+    look: f32,
+    /// A step about in a fight: where to and for how much longer; and the
+    /// seconds to the next.
+    step: Option<(Vec3, f32)>,
+    step_wait: f32,
     /// Running from gunfire: where to, and for how much longer.
     flee: Option<(Vec3, f32)>,
     brain: Brain,
@@ -321,6 +361,12 @@ impl Npc {
             alert: false,
             fires: false,
             cooldown: 0.0,
+            ai: AiProfile::default(),
+            last_seen: None,
+            unseen: 0.0,
+            look: 0.0,
+            step: None,
+            step_wait: 0.0,
             flee: None,
             brain,
         }
@@ -383,26 +429,133 @@ impl Npc {
         turn.abs()
     }
 
-    /// A soldier's tick in a fight with the player at `threat`: stand, turn
-    /// to them, aim and fire. False when out of range (the fight is off).
-    fn fight(&mut self, physics: &Physics, threat: Vec3, rng: &mut Rng, dt: f32) -> bool {
-        let clips = self.clips;
-        let to = threat - self.character.position;
-        let distance = to.with_y(0.0).length();
-        if distance > FIGHT_RANGE {
+    /// Whether he sees `target` from his head: within `SIGHT` times his
+    /// `Vision`, inside his `VisionFOV` (unless `any_way`, as in a fight,
+    /// where he keeps turning to her), and nothing static between (a
+    /// little short of her, so the car she sits in doesn't hide her).
+    pub fn sees(&self, physics: &Physics, target: Vec3, any_way: bool) -> bool {
+        let eye = self.character.position + Vec3::Y * EYE;
+        let to = target - eye;
+        let distance = to.length();
+        if distance > SIGHT * self.ai.vision || distance < 1e-3 {
             return false;
         }
-        physics.move_character(&mut self.character, Vec3::ZERO, None, dt);
-        let off = self.turn_to(to.x.atan2(to.z), dt);
-        self.rig.hold_rifle(Gait::Idle, &clips, Carry::Aim);
-        self.rig.aim_along(self.facing, Some(threat - self.chest()));
+        if !any_way {
+            let ahead = Vec2::new(self.facing.sin(), self.facing.cos());
+            let flat = Vec2::new(to.x, to.z).normalize_or_zero();
+            let half = (self.ai.vision_fov * 0.5).to_radians();
+            if ahead.dot(flat) < half.cos() {
+                return false;
+            }
+        }
+        let clear = (distance - 2.5).max(0.5);
+        physics.cast_ray(eye, to / distance, clear).is_none()
+    }
+
+    /// A soldier's tick in a fight with the player at `threat`. While he
+    /// sees her within `FIRE_RANGE` he turns to her, aims and fires, and
+    /// every few seconds steps aside or (as `Offensive` has it) closer;
+    /// otherwise he runs to where he last saw her (`PursueSpeed`). False
+    /// when the fight is off: she is out of his sight's reach, or he has
+    /// hunted too long without seeing her, or he is a `Pacifist`.
+    fn fight(&mut self, physics: &Physics, threat: Vec3, rng: &mut Rng, dt: f32) -> bool {
+        let clips = self.clips;
+        let at = self.character.position;
+        let to = threat - at;
+        let distance = to.with_y(0.0).length();
+        if self.ai.flags.pacifist || distance > SIGHT * self.ai.vision * 1.25 {
+            return false;
+        }
+        self.look -= dt;
+        if self.look <= 0.0 || self.last_seen.is_none() {
+            self.look = LOOK_EVERY;
+            if self.sees(physics, threat, true) {
+                self.last_seen = Some(threat);
+                self.unseen = 0.0;
+            }
+        }
+        let seen = self.unseen < LOOK_EVERY * 1.5 && self.last_seen.is_some();
+        self.unseen += dt;
+        // Heard or hit without seeing her: he goes to the noise.
+        let goal = self.last_seen.unwrap_or(threat);
+        if self.unseen > GIVE_UP {
+            return false;
+        }
+        let mut wanted = Vec3::ZERO;
+        if !seen || distance > FIRE_RANGE {
+            self.step = None;
+            let flat = (goal - at).with_y(0.0);
+            if flat.length() > CLOSE_ENOUGH {
+                wanted = flat.normalize() * SPRINT * self.ai.pursue_speed;
+            }
+        } else {
+            self.step_wait -= dt;
+            if self.step.is_none() && self.step_wait <= 0.0 {
+                self.step_wait = STEP_GAP.0 + rng.range(0.0, STEP_GAP.1);
+                let toward = to.with_y(0.0).normalize_or(Vec3::Z);
+                let side = Vec3::new(toward.z, 0.0, -toward.x) * rng.range(-1.0, 1.0).signum();
+                let push = distance > PUSH_TO && rng.range(0.0, 1.0) < self.ai.offensive;
+                let way = if push { toward } else { side };
+                let length = rng.range(STEP.0, STEP.1);
+                self.step = Some((at + way * length, length / (SPRINT * self.ai.combat_speed)));
+            }
+            if let Some((target, left)) = &mut self.step {
+                *left -= dt;
+                let flat = (*target - at).with_y(0.0);
+                if *left <= 0.0 || flat.length() < 0.5 {
+                    self.step = None;
+                } else {
+                    wanted = flat.normalize() * SPRINT * self.ai.combat_speed;
+                }
+            }
+        }
+        physics.move_character(&mut self.character, wanted, None, dt);
+        let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
+        if wanted != Vec3::ZERO && moved < 0.2 {
+            // Walked into something: stop stepping; a chase gives up on
+            // that spot and stands looking.
+            self.step = None;
+            if !seen {
+                self.last_seen = Some(at);
+            }
+        }
+        let face = if seen || wanted == Vec3::ZERO {
+            to.x.atan2(to.z)
+        } else {
+            wanted.x.atan2(wanted.z)
+        };
+        let off = self.turn_to(face, dt);
+        let gait = if moved < 0.3 {
+            Gait::Idle
+        } else if moved > 2.5 {
+            Gait::Run
+        } else {
+            Gait::Walk
+        };
+        let carry = if seen { Carry::Aim } else { Carry::Ready };
+        self.rig.hold_rifle(gait, &clips, carry);
+        if seen {
+            self.rig.aim_along(self.facing, Some(threat - self.chest()));
+        }
         self.cooldown -= dt;
-        if self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
+        if seen && self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
             self.fires = true;
             self.cooldown = FIRE_GAP.0 + rng.range(0.0, FIRE_GAP.1);
         }
-        self.rig.advance(dt);
+        let rate = match self.rig.gait_speed(gait) {
+            Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
+            _ => 1.0,
+        };
+        self.rig.advance(dt * rate);
         true
+    }
+
+    /// Calm again: forgets the fight.
+    fn calm(&mut self) {
+        self.alert = false;
+        self.last_seen = None;
+        self.unseen = 0.0;
+        self.step = None;
     }
 
     pub fn patrolling(&self) -> bool {
@@ -472,10 +625,23 @@ impl Npc {
             self.rig.advance(dt);
             return;
         }
+        // A soldier on watch who catches sight of her turns on her.
+        if self.soldier && !self.alert && !self.ai.flags.pacifist {
+            self.look -= dt;
+            if self.look <= 0.0 {
+                self.look = LOOK_EVERY;
+                if let Some(t) = threat
+                    && self.sees(physics, t, false)
+                {
+                    self.alert = true;
+                    self.last_seen = Some(t);
+                }
+            }
+        }
         if self.alert {
             match threat {
                 Some(t) if self.fight(physics, t, rng, dt) => return,
-                _ => self.alert = false,
+                _ => self.calm(),
             }
         }
         let at = self.character.position;
@@ -967,6 +1133,10 @@ impl People {
                 Some(s.entity),
             );
             npc.layer = s.layer;
+            if let Some(ai) = s.ai {
+                npc.ai = ai;
+                npc.hp = ai.health;
+            }
             // A story character doesn't fight.
             npc.soldier = self.kinds[kind].soldier;
             self.npcs.push(npc);
@@ -1135,6 +1305,7 @@ pub(crate) mod tests {
             route: Vec::new(),
             layer: None,
             model: None,
+            ai: None,
         };
         let spawns = [
             spawn(1, "VZ Soldier 01", 10.0),
@@ -1185,6 +1356,7 @@ pub(crate) mod tests {
             route: Vec::new(),
             layer: None,
             model: Some(model),
+            ai: None,
         };
         let spawns = [
             spawn(7, "Carmona", 0xbf83),
@@ -1234,6 +1406,7 @@ pub(crate) mod tests {
             route: Vec::new(),
             layer: Some(0xc0),
             model: None,
+            ai: None,
         };
         let spawns = [guard];
         let tick = |people: &mut People, physics: &mut Physics| {
@@ -1299,6 +1472,51 @@ pub(crate) mod tests {
         assert!(civilian.hurt(60.0, Vec3::ZERO));
         assert!(!civilian.alive);
         assert!(!civilian.hurt(60.0, Vec3::ZERO), "only dies once");
+    }
+
+    #[test]
+    fn soldiers_see_her_in_front_and_chase_where_she_was() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let dt = 1.0 / 60.0;
+        let post = || Brain::Post { facing: 0.0 };
+        let mut soldier = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post(), Some(1));
+        soldier.update(&physics, &mut rng, None, dt);
+        // Behind him (he faces +z, 180 degrees of view): unseen.
+        for _ in 0..60 {
+            soldier.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, -20.0)), dt);
+        }
+        assert!(!soldier.alert, "out of his view");
+        // In front, 40 m off: seen at his next look, and he turns on her.
+        for _ in 0..15 {
+            soldier.update(&physics, &mut rng, Some(Vec3::new(5.0, 1.2, 40.0)), dt);
+        }
+        assert!(soldier.alert, "seen in front");
+        // A pacifist never does.
+        let mut calm = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post(), Some(2));
+        calm.ai.flags.pacifist = true;
+        calm.update(&physics, &mut rng, None, dt);
+        for _ in 0..30 {
+            calm.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 10.0)), dt);
+        }
+        assert!(!calm.alert);
+        // Gone past his sight: he runs (at his PursueSpeed) to where he
+        // last saw her, and doesn't fire.
+        let far = Some(Vec3::new(0.0, 1.2, 90.0));
+        soldier.fires = false;
+        let start = soldier.character.position;
+        let mut shots = 0;
+        for _ in 0..60 {
+            soldier.update(&physics, &mut rng, far, dt);
+            shots += usize::from(std::mem::take(&mut soldier.fires));
+        }
+        let gone = soldier.character.position.z - start.z;
+        let pursue = SPRINT * soldier.ai.pursue_speed;
+        assert!(
+            gone > pursue * 0.6 && gone < pursue * 1.1,
+            "{gone} vs {pursue}"
+        );
+        assert_eq!(shots, 0, "out of firing range");
     }
 
     #[test]

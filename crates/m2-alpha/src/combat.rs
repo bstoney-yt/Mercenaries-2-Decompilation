@@ -154,6 +154,8 @@ const PANIC_RANGE: f32 = 40.0;
 /// (the VZ soldiers' rifle). Her template's health is 100 (Mattias 120);
 /// the Hero damage modifier and any falloff with range are not decoded.
 const NPC_DAMAGE: f32 = 9.0;
+/// A VZ soldier's `Accuracy`, which the shot spread above was tuned for.
+const VZ_ACCURACY: f32 = 0.4;
 /// People are hit within this distance of the line from shins to head.
 const BODY_RADIUS: f32 = 0.3;
 /// Health comes back after this many quiet seconds, at this rate a second.
@@ -1331,8 +1333,11 @@ impl Combat {
             _ => n.chest(),
         };
         let distance = from.distance(aim);
-        // Spread grows with range: about a third hit at 20 m.
-        let spread = 0.02 + distance * 0.004;
+        // Spread grows with range: about a third hit at 20 m for a VZ
+        // soldier (`Accuracy` 0.4); the more accurate miss by less
+        // (inferred: by what they lack of a perfect 1).
+        let spread = (0.02 + distance * 0.004)
+            * ((1.0 - n.ai.accuracy) / (1.0 - VZ_ACCURACY)).clamp(0.2, 2.0);
         let dir = ((aim - from).normalize_or_zero()
             + Vec3::new(
                 self.random() * spread * 2.0,
@@ -2125,7 +2130,7 @@ fn alarm(people: &mut People, at: Vec3) {
             continue;
         }
         let d = n.character.position.distance(at);
-        if n.soldier && d < ALERT_RANGE {
+        if n.soldier && !n.ai.flags.pacifist && d < ALERT_RANGE * n.ai.hearing {
             n.alert = true;
         }
         if !n.soldier && d < PANIC_RANGE {

@@ -12,6 +12,7 @@
 //! read, so this crate instead hosts the clean-room runtime that reads the
 //! game's data directly (see `docs/alpha-roadmap.md`).
 
+pub mod ai;
 pub mod anim;
 pub mod assets;
 pub mod audio;
@@ -24,6 +25,7 @@ pub mod tuning;
 pub mod vehicle;
 pub mod world;
 
+pub use ai::{AiFlags, AiProfile};
 pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use audio::{Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
