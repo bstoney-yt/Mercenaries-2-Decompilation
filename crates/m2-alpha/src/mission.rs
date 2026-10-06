@@ -161,6 +161,8 @@ pub struct MissionLink {
     hushed: Vec<u32>,
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`).
     sounds: Vec<String>,
+    /// The music cue the scripts last switched to (`Some(None)`: none).
+    music: Option<Option<String>>,
 }
 
 /// The scripts' vehicles in play.
@@ -246,6 +248,7 @@ impl MissionLink {
             lines: Vec::new(),
             hushed: Vec::new(),
             sounds: Vec::new(),
+            music: None,
         }
     }
 
@@ -485,6 +488,7 @@ impl MissionLink {
                     }
                     Command::Hush(id) => self.hushed.push(*id),
                     Command::CueSound { at: None, cue } => self.sounds.push(cue.clone()),
+                    Command::Music(cue) => self.music = Some(cue.clone()),
                     _ => {}
                 }
                 support_item(game, &c);
@@ -560,6 +564,11 @@ impl MissionLink {
     /// Interface sounds the scripts cued since the last call.
     pub fn take_sounds(&mut self) -> Vec<String> {
         std::mem::take(&mut self.sounds)
+    }
+
+    /// The music cue to switch to, if the scripts changed it.
+    pub fn take_music(&mut self) -> Option<Option<String>> {
+        self.music.take()
     }
 
     /// Scripted line `id` lasts `seconds`.

@@ -148,6 +148,9 @@ pub enum Command {
     },
     /// Stop line `id` (`VO.Cancel`).
     Hush(u32),
+    /// Play a music cue (`mu_fac_pmc_explore_01`), looped unless it is a
+    /// one-shot, in place of what plays; `None` stops the music.
+    Music(Option<String>),
     /// Play a sound cue by name (`Sound.CueSound`):
     /// `"ui_HUD_Objective_New"`; `at` the object it sounds from (`None`:
     /// flat, as the interface's sounds).
@@ -192,6 +195,8 @@ pub struct ScriptWorld {
     templates: HashMap<String, u32>,
     /// Scripted voice lines playing.
     pub vo: crate::vo::Lines,
+    /// The score.
+    pub music: crate::music::Music,
 }
 
 impl ScriptWorld {
@@ -1012,6 +1017,70 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+
+    // The score (see `music`): factions, bindings and states.
+    add(&sound, "SetFactionMusic", |w, _, a| {
+        if let Some(Value::String(f)) = a.first() {
+            w.music.set_faction(&f.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "SetRootFactionRegionMusic", |w, _, a| {
+        if let Some(Value::String(f)) = a.first() {
+            w.music.set_root(&f.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "ActivateFactionRegionMusic", |w, _, _| {
+        w.music.activate_region();
+        values([])
+    })?;
+    add(&sound, "BindMusicCue", |w, _, a| {
+        if let (Some(Value::String(cue)), Some(Value::String(state))) = (a.first(), a.get(1)) {
+            w.music
+                .bind(&cue.to_string_lossy(), &state.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "ClearMusicCues", |w, _, a| {
+        if let Some(Value::String(state)) = a.first() {
+            w.music.clear(&state.to_string_lossy());
+        }
+        values([])
+    })?;
+    add(&sound, "TransitionMusic", |w, _, a| {
+        if let Some(Value::String(state)) = a.first()
+            && let Some(c) = w.music.transition(&state.to_string_lossy())
+        {
+            w.commands.push(c);
+        }
+        values([])
+    })?;
+    add(&sound, "LockFactionMusic", |w, _, a| {
+        w.music.locked = matches!(a.first(), Some(Value::Boolean(true)));
+        values([])
+    })?;
+    add(&sound, "IsFactionLockedMusic", |w, _, _| {
+        values([Value::Boolean(w.music.locked)])
+    })?;
+    add(&sound, "SetDynamicMusic", |w, _, a| {
+        w.music.dynamic = matches!(a.first(), Some(Value::Boolean(true)));
+        values([])
+    })?;
+    add(&sound, "IsDynamicMusic", |w, _, _| {
+        values([Value::Boolean(w.music.dynamic)])
+    })?;
+    // Set-up and the action level the score is not driven by yet.
+    for name in [
+        "AddFactionMusic",
+        "AddMusicState",
+        "AddMusicTransition",
+        "SetActionThresholdsMusic",
+        "SetActionLevelsMusic",
+        "LockActionLevelMusic",
+    ] {
+        add(&sound, name, |_, _, _| values([]))?;
+    }
 
     // Scripted voice lines, as (speaker, cue, callback, values, priority,
     // send over the network); speaker 0 is the radio. The sequences that
