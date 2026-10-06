@@ -45,6 +45,9 @@ pub struct Object {
     pub label_hashes: Vec<u32>,
     /// The vehicle it rides in.
     pub vehicle: Option<u32>,
+    /// It got in (or out) at once, put there by a script, rather than
+    /// climbing in itself: seat events tell the two apart.
+    pub seated_instantly: bool,
     pub player_controlled: bool,
     /// Simulated near the player rather than hibernating.
     pub awake: bool,
@@ -288,6 +291,7 @@ impl ScriptWorld {
             let pilot = self.spawn_guid();
             let mut o = Object::new(PILOT, position);
             o.vehicle = Some(guid);
+            o.seated_instantly = true;
             self.insert(pilot, o);
             self.commands.push(Command::Spawn {
                 guid: pilot,
@@ -338,6 +342,9 @@ impl World for ScriptWorld {
     }
     fn is_awake(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.awake)
+    }
+    fn seated_instantly(&self, guid: u32) -> bool {
+        self.objects.get(&guid).is_some_and(|o| o.seated_instantly)
     }
     fn labels(&self, guid: u32) -> Vec<u32> {
         self.objects.get(&guid).map_or_else(Vec::new, |o| {
@@ -946,6 +953,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if let Some(guid) = id(a.first()) {
             if let Some(o) = w.objects.get_mut(&guid) {
                 o.vehicle = None;
+                o.seated_instantly = false;
             }
             w.commands.push(Command::ExitVehicle(guid));
         }
@@ -963,6 +971,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let instant = matches!(a.get(3), Some(Value::Boolean(true)));
         if let Some(o) = w.objects.get_mut(&guid) {
             o.vehicle = Some(vehicle);
+            o.seated_instantly = instant;
         }
         w.commands.push(Command::EnterVehicle {
             guid,
@@ -1690,9 +1699,10 @@ mod tests {
             .load(
                 r#"
                 log = ""
-                assert(Vehicle.Enter(50, 1, "d", true))
+                assert(Vehicle.Enter(50, 1, "d", false))
                 local function note(t) return function() log = log .. t end end
                 Event.Create(Event.ObjectInSeat, {1, "Car", "D", "E"}, note("car "))
+                Event.Create(Event.ObjectInSeat, {1, "Car", "D", "I"}, note("put in "))
                 Event.Create(Event.ObjectInSeat, {1, "Boat", "D", "E"}, note("boat "))
                 Event.Create(Event.ObjectInSeat, {1, "Car && !APC", "D", "X"}, note("out "))
                 "#,

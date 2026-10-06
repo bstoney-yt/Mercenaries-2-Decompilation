@@ -60,6 +60,11 @@ pub trait World {
     fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
         None
     }
+    /// Whether it got into (or out of) its seat at once, put there by a
+    /// script.
+    fn seated_instantly(&self, _guid: u32) -> bool {
+        false
+    }
     /// An object's labels (`"Boat"`, `"Tank"`) as name hashes, for class
     /// expressions.
     fn labels(&self, _guid: u32) -> Vec<u32> {
@@ -343,28 +348,27 @@ impl Events {
                         rising.then_some(vec![extra])
                     }
                     // `held_by` keeps who was seated at the last check
-                    // (none before the first), `held` that one was made.
+                    // (none before the first).
                     Check::Seats(riders) => {
                         let mode = seat_mode(&p);
                         let any = mode.contains('a');
                         let mut fire = Vec::new();
                         let mut seated = BTreeSet::new();
-                        for (r, inside, extra) in riders {
+                        for (r, (inside, instantly), extra) in riders {
                             let was = p.held_by.contains(&r);
                             if inside {
                                 seated.insert(r);
                             }
+                            let (inn, out) = if instantly { ('i', 'o') } else { ('e', 'x') };
                             let got_in = inside && !was;
                             let got_out = !inside && was;
-                            if (got_in && (any || mode.contains('e') || mode.contains('i')))
-                                || (got_out && (any || mode.contains('x') || mode.contains('o')))
-                                || (!inside && !p.held && mode.contains('o'))
+                            if (got_in && (any || mode.contains(inn)))
+                                || (got_out && (any || mode.contains(out)))
                             {
                                 fire.push(extra);
                             }
                         }
                         p.held_by = seated;
-                        p.held = true;
                         if !p.persistent {
                             fire.truncate(1);
                         }
@@ -491,7 +495,7 @@ enum Check {
     Holds(bool, Vec<Value>),
     /// Riders and whether each is in a wanted seat, with the values to
     /// pass: fired by the event's mode as they get in or out.
-    Seats(Vec<(u32, bool, Vec<Value>)>),
+    Seats(Vec<(u32, (bool, bool), Vec<Value>)>),
     /// A condition on each of several objects (an object filter's): per
     /// object, whether it holds and the values to pass.
     Each(Vec<(u32, bool, Vec<Value>)>),
@@ -601,9 +605,12 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
         // { rider, vehicle, seat, mode }: rider is a guid, "hero" or a
         // label; vehicle a guid (0: any), a vehicle's name or a class
         // expression of labels ("Boat", "Tank && !APC"); seat a seat code
-        // ("D" the driver's; not told apart yet); mode letters: e as she
-        // gets in, x as she gets out, i while in, o while out ("ei",
-        // "xo"; "a" either way). Passes the rider and vehicle.
+        // ("D" the driver's; not told apart yet); mode letters, each a
+        // way of getting in or out: e climbing in, i put in at once, x
+        // climbing out, o put out ("ei" and "xo" either; "a" any). A
+        // vehicle script waits for "E" and "I" alike and leaves the other
+        // pending, so the two never fire for the same move. Passes the
+        // rider and vehicle.
         "ObjectInSeat" => {
             let wanted = |v: u32| match p.params.raw_get::<Value>(2) {
                 Ok(Value::String(s)) => {
@@ -622,7 +629,11 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
                     .into_iter()
                     .map(|r| {
                         let seated = world.vehicle_of(r).filter(|&v| wanted(v));
-                        (r, seated.is_some(), vec![id(r), id(seated.unwrap_or(0))])
+                        (
+                            r,
+                            (seated.is_some(), world.seated_instantly(r)),
+                            vec![id(r), id(seated.unwrap_or(0))],
+                        )
                     })
                     .collect(),
             )

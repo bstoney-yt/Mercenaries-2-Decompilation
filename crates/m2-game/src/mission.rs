@@ -589,8 +589,11 @@ impl Mission {
     /// Puts the player in a vehicle (or out of one, with `None`): seat
     /// events fire on the next tick.
     pub fn ride(&mut self, vehicle: Option<u32>) {
-        if let Some(o) = self.world.borrow_mut().objects.get_mut(&PLAYER) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&PLAYER)
+            && o.vehicle != vehicle
+        {
             o.vehicle = vehicle;
+            o.seated_instantly = false;
         }
     }
 
