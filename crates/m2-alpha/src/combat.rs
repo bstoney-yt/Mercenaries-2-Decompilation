@@ -1322,6 +1322,7 @@ impl Combat {
     fn npc_throw(&mut self, f: &mut Field<'_>, i: usize, at: Vec3) {
         let n = &f.people.npcs[i];
         let from = n.character.position + Vec3::Y * 1.8;
+        eprintln!("grenade: a soldier throws from {from:.1} at {at:.1}");
         let gravity = m2_engine::physics::GRAVITY;
         let velocity =
             lob_velocity(from, at, THROW, gravity).unwrap_or_else(|| farthest(at - from, THROW));
@@ -2028,6 +2029,8 @@ impl Combat {
             }
         }
         if let Some(d) = her {
+            // For checking what hurts her (autoplay logs).
+            eprintln!("blast: at {at:.1}, she takes {d:.0}");
             self.hurt_player(f, d);
         }
         if killed {
