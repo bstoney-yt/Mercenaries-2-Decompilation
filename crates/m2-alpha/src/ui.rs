@@ -28,11 +28,13 @@ pub struct HudInfo {
     pub weapon: Weapon,
     /// What she carries in the launcher's place, if anything.
     pub second: Option<Weapon>,
+    /// Grenades she has.
+    pub grenades: u32,
     /// The rounds of the weapon up when it runs out (the grenade
     /// launcher's): in its clip, and stored.
     pub rounds: Option<(u32, u32)>,
     /// What the use key takes from within reach, as the game words it
-    /// ("Equip Grenade Launcher", "Take Ammo").
+    /// ("Equip Grenade Launcher").
     pub prompt: Option<String>,
     /// Driving: the vehicle's name and speed (m/s), and whether it is
     /// wrecked.
@@ -330,7 +332,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
             text(
                 screen.right_bottom() + vec2(-24.0, -28.0),
                 Align2::RIGHT_BOTTOM,
-                &format!("{up}{other}   ·   G grenade"),
+                &format!("{up}{other}   ·   G grenade ({})", info.grenades),
                 18.0,
                 white,
             );
