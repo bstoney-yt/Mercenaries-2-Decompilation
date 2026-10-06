@@ -31,6 +31,8 @@ pub struct LayerEntity {
     pub name: String,
     pub position: Vec3,
     pub yaw: f32,
+    /// The layer it is in (`vz_state_alljob002_02_staging`).
+    pub layer: String,
 }
 
 /// What the start-up loaded.
@@ -103,7 +105,7 @@ impl Startup {
 
 /// Runs the start-up scripts and keeps the layers they loaded.
 fn run(data: GameData) -> Result<StartupLayers, m2_game::mission::MissionError> {
-    let mut mission = Mission::new(data, "Mattias", [0.0; 3])?;
+    let mut mission = Mission::new(data, crate::mission::HERO, [0.0; 3])?;
     mission.start();
     let mut t = 0.0;
     while t < SETTLE {
@@ -129,6 +131,7 @@ fn run(data: GameData) -> Result<StartupLayers, m2_game::mission::MissionError> 
             name: member_stem(&e.name).to_owned(),
             position: Vec3::from(e.at),
             yaw: e.yaw,
+            layer: name.clone(),
         }));
     }
     Ok(set)

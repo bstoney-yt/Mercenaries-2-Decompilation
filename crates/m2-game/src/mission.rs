@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
-use m2_assets::layer::LAYER_TYPE;
+use m2_assets::layer::{Component, LAYER_TYPE, TEMPLATE_DB_TYPE};
 use m2_assets::lua::{Chunk, SCRIPT_TYPE};
 use m2_assets::region::REGION_TYPE;
 use m2_assets::strings::STRINGS_TYPE;
@@ -32,6 +32,10 @@ use crate::script::{ScriptError, ScriptHost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
 pub const BOOTSTRAP: u32 = 0xb442_0059;
+/// Activates the player's character as the engine does its object
+/// scripts: the hero module's `OnActivate` (healing, the survival
+/// system's one rescue, her inventory), which goes on once she is awake.
+const HERO_ACTIVATE: &str = "Hero.OnActivate(Player.GetCharacter(1))";
 
 /// The scripts' free support items (`MrxSupportData.AddFreebie`, as the
 /// first contract gives its Satellite Guided Bomb) reach the game too:
@@ -74,6 +78,8 @@ pub struct Entity {
     pub yaw: f32,
     /// The outline of a region entity (`LineRegion`).
     pub region: Option<Region>,
+    /// Its labels' name hashes: its template's and its own (`Label`).
+    pub labels: Vec<u32>,
 }
 
 /// What a mission session needs from the archives.
@@ -86,6 +92,33 @@ pub struct GameData {
     pub shapes: usize,
     /// The game's English text by id, for the HUD's texts.
     pub strings: StringTable,
+    /// Templates' labels (name hashes) by the template's name in lower
+    /// case, for objects the scripts spawn.
+    pub template_labels: HashMap<String, Vec<u32>>,
+}
+
+/// `Label`'s field: the label's name hash.
+const LABEL_FIELD: u32 = 0xfd08_4cce;
+
+/// Every `Label` record's name hash, by entity (or template).
+fn labels_of(c: Option<&Component<'_>>) -> HashMap<u32, Vec<u32>> {
+    let mut out: HashMap<u32, Vec<u32>> = HashMap::new();
+    let Some(c) = c else {
+        return out;
+    };
+    let at = c
+        .fields
+        .iter()
+        .find(|f| f.name_hash == LABEL_FIELD)
+        .map_or(0, |f| usize::from(f.offset));
+    for (id, r) in c.records().unwrap_or_default() {
+        if let Some(b) = r.get(at..at + 4) {
+            out.entry(id)
+                .or_default()
+                .push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+    }
+    out
 }
 
 /// The string table the HUD's texts come from.
@@ -106,6 +139,9 @@ impl GameData {
         let mut shapes: HashMap<u32, Region> = HashMap::new();
         // Entities with the shape hash their LineRegion names.
         let mut regions: Vec<(String, usize, u32)> = Vec::new();
+        // Entities' templates, to give them their templates' labels.
+        let mut templated: Vec<(String, usize, u32)> = Vec::new();
+        let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
         let language = name_hash(LANGUAGE);
         for (block, path) in paths.iter().enumerate() {
             let decoded = wad.read_block(block)?;
@@ -125,6 +161,16 @@ impl GameData {
                     if let Ok(t) = StringTable::parse(asset) {
                         data.strings = t;
                     }
+                } else if entry.type_hash == TEMPLATE_DB_TYPE
+                    && let Ok(db) = Layer::parse(asset)
+                {
+                    template_labels = labels_of(db.component("Label"));
+                    for (id, name) in db.names() {
+                        if let Some(l) = template_labels.get(&id) {
+                            data.template_labels
+                                .insert(name.to_ascii_lowercase(), l.clone());
+                        }
+                    }
                 } else if entry.type_hash == LAYER_TYPE
                     && let Ok(layer) = Layer::parse(asset)
                 {
@@ -132,10 +178,14 @@ impl GameData {
                     let list = data.layers.entry(name.clone()).or_default();
                     let lines = layer.hashes("LineRegion");
                     let placements = layer.placements();
+                    let mut own = labels_of(layer.component("Label"));
                     for (guid, entity) in layer.names() {
                         let p = placements.get(&guid);
                         if let Some(&h) = lines.get(&guid) {
                             regions.push((name.clone(), list.len(), h));
+                        }
+                        if let Some(p) = p {
+                            templated.push((name.clone(), list.len(), p.parent));
                         }
                         list.push(Entity {
                             guid,
@@ -143,9 +193,16 @@ impl GameData {
                             at: p.map_or([0.0; 3], |p| p.position),
                             yaw: p.map_or(0.0, |p| yaw(p.rotation)),
                             region: None,
+                            labels: own.remove(&guid).unwrap_or_default(),
                         });
                     }
                 }
+            }
+        }
+        for (layer, i, template) in templated {
+            if let Some(l) = template_labels.get(&template) {
+                let e = &mut data.layers.get_mut(&layer).expect("indexed above")[i];
+                e.labels.extend(l.iter().copied());
             }
         }
         for (layer, i, hash) in regions {
@@ -224,6 +281,7 @@ impl Mission {
             layers,
             shapes,
             strings,
+            template_labels,
         } = data;
         let regions = layers
             .values()
@@ -240,6 +298,13 @@ impl Mission {
         {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
+            w.template_labels = template_labels;
+            for e in layers.values().flatten() {
+                w.entities.insert(e.guid, e.at);
+                w.entity_names
+                    .entry(e.name.to_ascii_lowercase())
+                    .or_insert(e.guid);
+            }
             w.landing_zones.insert(1, one);
             w.landing_zones.insert(2, two);
             let mut player = Object::new(hero, at);
@@ -395,6 +460,7 @@ impl Mission {
             ("bootstrap", format!("Scripts[\"{BOOTSTRAP:08x}\"].Init()")),
             // The callback MrxGuiBootstrap.SetOnGuiLoadedFunc registers.
             ("gui loaded", "MrxBootstrap._GuiLoaded()".to_owned()),
+            ("hero activated", HERO_ACTIVATE.to_owned()),
         ];
         for (name, code) in steps {
             if let Err(e) = self.run(&code, name) {
@@ -439,6 +505,9 @@ impl Mission {
                 }
             }
         }
+        for t in self.events.take_trace() {
+            self.log.push(format!("  t={:.1} event {t}", self.now));
+        }
         for e in self.events.update_shared(dt, &self.world) {
             self.log.push(format!(
                 "  t={now:.1} {} callback: {}",
@@ -446,7 +515,65 @@ impl Mission {
                 first_lines(&e.error.to_string())
             ));
         }
+        self.check_boundary(now);
+        let ended = crate::vo::update(&self.world, self.host.lua(), now);
+        for (cue, error) in ended {
+            self.log.push(match error {
+                None => format!("  t={now:.1} line {cue} ended"),
+                Some(e) => format!(
+                    "  t={now:.1} line {cue} ended; callback: {}",
+                    first_lines(&e.to_string())
+                ),
+            });
+        }
         self.settle(&format!("t={now:.1}"));
+    }
+
+    /// Tells the boundary callback when the player leaves the play area
+    /// (zone `"out"`, `"enter"`) or comes back (`"exit"`). The player is
+    /// out when inside none of the boundaries the game can place.
+    fn check_boundary(&mut self, now: f64) {
+        let call = {
+            let mut w = self.world.borrow_mut();
+            let Some(f) = w.boundary_callback.clone() else {
+                return;
+            };
+            // While a state change holds her (the black screen as a
+            // contract loads, `MrxState`), she is still at the last spot
+            // and about to be placed: not a real exit.
+            if w.invincible
+                .get(&PLAYER)
+                .is_some_and(|r| r.contains("MrxState"))
+            {
+                return;
+            }
+            let found: Vec<bool> = w
+                .boundaries
+                .iter()
+                .filter_map(|&b| crate::events::World::inside(&*w, PLAYER, b))
+                .collect();
+            let out = !found.is_empty() && !found.contains(&true);
+            if out == w.outside {
+                return;
+            }
+            w.outside = out;
+            (f, if out { "enter" } else { "exit" })
+        };
+        let (f, event) = call;
+        self.log
+            .push(format!("  t={now:.1} play area: out {event}"));
+        if let Err(e) = f.call::<()>((mlua::Value::Nil, "out", event)) {
+            self.log.push(format!(
+                "  t={now:.1} boundary callback: {}",
+                first_lines(&e.to_string())
+            ));
+        }
+    }
+
+    /// The game is playing scripted line `id` (a [`Command::Say`]), which
+    /// lasts `seconds`.
+    pub fn line_length(&mut self, id: u32, seconds: f64) {
+        self.world.borrow_mut().vo.set_length(id, seconds);
     }
 
     /// Game time so far.
@@ -468,8 +595,11 @@ impl Mission {
     /// Puts the player in a vehicle (or out of one, with `None`): seat
     /// events fire on the next tick.
     pub fn ride(&mut self, vehicle: Option<u32>) {
-        if let Some(o) = self.world.borrow_mut().objects.get_mut(&PLAYER) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&PLAYER)
+            && o.vehicle != vehicle
+        {
             o.vehicle = vehicle;
+            o.seated_instantly = false;
         }
     }
 
@@ -506,6 +636,37 @@ impl Mission {
     }
 
     /// Reports that an object died in play (a soldier the player shot).
+    /// The game's reading of an object's health (the player's, as she is
+    /// hurt and healed).
+    pub fn set_health(&mut self, guid: u32, health: f32) {
+        let was = self
+            .world
+            .borrow_mut()
+            .objects
+            .get_mut(&guid)
+            .map(|o| std::mem::replace(&mut o.health, health));
+        // A drop the game made (not the scripts' own healing): what the
+        // scripts are watching for, while the health system is checked.
+        if guid == PLAYER && was.is_some_and(|w| health < w - 5.0) && crate::script::stub_args() {
+            self.log.push(format!(
+                "  t={:.1} her health {:.1} -> {health:.1}; pending: {}",
+                self.now,
+                was.unwrap_or(0.0),
+                self.events.describe().join(" ")
+            ));
+        }
+    }
+
+    /// The player died and is back on her feet: the hero module's
+    /// `OnDeath` sets its survival system up again once she is healthy.
+    pub fn player_died(&mut self) {
+        self.log.push(format!("  t={:.1} player died", self.now));
+        if let Err(e) = self.run("Hero.OnDeath(Player.GetCharacter(1))", "hero died") {
+            self.log
+                .push(format!("  hero died: {}", first_lines(&e.to_string())));
+        }
+    }
+
     pub fn kill(&mut self, guid: u32) {
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
             o.alive = false;
@@ -667,13 +828,19 @@ impl Mission {
                 _ => runs.push((c.as_str(), 1)),
             }
         }
-        for (c, n) in runs.iter().take(120) {
+        // With arguments shown every call differs: keep them all.
+        let cap = if crate::script::stub_args() {
+            usize::MAX
+        } else {
+            120
+        };
+        for (c, n) in runs.iter().take(cap) {
             log.push(match n {
                 1 => format!("  stub {c}"),
                 _ => format!("  stub {c} x{n}"),
             });
         }
-        if runs.len() > 120 {
+        if runs.len() > cap {
             log.push(format!("  ... {} stub calls in all", calls.len()));
         }
         commands
@@ -691,6 +858,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
         if load {
             let mut o = Object::new(&e.name, e.at);
             o.yaw = e.yaw;
+            o.label_hashes.clone_from(&e.labels);
             w.insert(e.guid, o);
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
@@ -770,6 +938,95 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn a_conversation_moves_on_as_each_line_ends() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            local function second(state) VO.Cue(0, "B", function() heard = state end) end
+            VO.Cue(0, "A", second, {}, 1, true)
+            VO.Cue(0, "C", function() cancelled = true end)
+            VO.Cancel(0, "C", true)
+            ordered = VO.PRIORITY_CINEMATIC < VO.PRIORITY_SCRIPTED_CONTRACT
+            "#,
+            "test",
+        )
+        .unwrap();
+        let say = |id, cue: &str| Command::Say {
+            id,
+            speaker: None,
+            cue: cue.into(),
+        };
+        assert_eq!(
+            m.take_commands(),
+            [say(1, "A"), say(2, "C"), Command::Hush(2)]
+        );
+        m.tick(0.1);
+        m.line_length(1, 1.0);
+        m.tick(0.5);
+        assert!(m.take_commands().is_empty());
+        m.tick(0.6);
+        assert_eq!(m.take_commands(), [say(3, "B")]);
+        for _ in 0..50 {
+            m.tick(0.1);
+        }
+        let g = m.host.lua().globals();
+        assert_eq!(g.raw_get::<String>("heard").unwrap(), "complete");
+        assert_eq!(g.raw_get::<Option<bool>>("cancelled").unwrap(), None);
+        assert!(g.raw_get::<bool>("ordered").unwrap());
+    }
+
+    #[test]
+    fn invincible_while_any_reason_holds() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            local hero = Player.GetCharacter(1)
+            Object.SetInvincible(hero, true, "MrxState")
+            Object.SetInvincible(hero, true, "Fanfare")
+            Object.SetInvincible(hero, false, "MrxState")
+            Object.SetInvincible(hero, false, "Fanfare")
+            "#,
+            "test",
+        )
+        .unwrap();
+        let on = |on| Command::Invincible { guid: PLAYER, on };
+        assert_eq!(m.take_commands(), [on(true), on(false)]);
+    }
+
+    #[test]
+    fn health_watches_fire_as_she_is_hurt() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            dropped = 0
+            local hero = Player.GetCharacter(1)
+            Player.SetHealthClamp(1, true)
+            Event.Create(Event.ObjectHealth, { hero, "<", Object.GetHealth(hero) },
+                function() dropped = dropped + 1 end)
+            Sound.StopSound(0, "sfx_survival_lp")
+            "#,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            m.take_commands(),
+            [
+                Command::HealthClamp(true),
+                Command::StopSound {
+                    at: None,
+                    cue: "sfx_survival_lp".into()
+                }
+            ]
+        );
+        m.tick(0.1);
+        m.set_health(PLAYER, 60.0);
+        m.tick(0.1);
+        m.tick(0.1);
+        let dropped: i64 = m.lua().globals().raw_get("dropped").unwrap();
+        assert_eq!(dropped, 1);
     }
 
     #[test]

@@ -157,8 +157,13 @@ impl LoosePiece {
 
     /// How big it is: its box's diagonal, metres.
     pub fn size(&self) -> f32 {
+        self.extent().length()
+    }
+
+    /// Its box's sides along its node's axes, metres.
+    pub fn extent(&self) -> Vec3 {
         let b = self.shape.compute_local_aabb();
-        (vec3(b.maxs) - vec3(b.mins)).length()
+        vec3(b.maxs) - vec3(b.mins)
     }
 }
 
@@ -1241,6 +1246,14 @@ impl Physics {
         ))
     }
 
+    /// How a loose piece is moving now: its velocity (m/s) and its spin
+    /// (radians a second about each world axis).
+    pub fn debris_velocity(&self, id: DebrisId) -> Option<(Vec3, Vec3)> {
+        let h = (*self.debris.get(id.0)?)?;
+        let b = self.world.bodies.get(h)?;
+        Some((vec3(b.linvel()), vec3(b.angvel())))
+    }
+
     pub fn remove_debris(&mut self, id: DebrisId) {
         if let Some(h) = self.debris.get_mut(id.0).and_then(Option::take) {
             self.world.remove_body_with_colliders(h, true);
@@ -1614,8 +1627,49 @@ impl Physics {
         else {
             return Vec::new();
         };
+        self.statics_touching(body.colliders())
+    }
+
+    /// The statics a loose piece is in contact with, each once: what holds
+    /// one that hardly moved (the gate test asks).
+    pub fn debris_statics(&self, id: DebrisId) -> Vec<StaticKey> {
+        let Some(body) = self
+            .debris
+            .get(id.0)
+            .copied()
+            .flatten()
+            .and_then(|h| self.world.bodies.get(h))
+        else {
+            return Vec::new();
+        };
+        self.statics_touching(body.colliders())
+    }
+
+    /// The statics meeting a box (`lo` to `hi` in its own space, placed at
+    /// `place`), each once: what stands where a building does.
+    pub fn statics_in_box(&self, place: Mat4, (lo, hi): (Vec3, Vec3)) -> Vec<StaticKey> {
+        let (_, rotation, translation) = place.to_scale_rotation_translation();
+        let rotation = rotation.normalize();
+        let middle = translation + rotation * ((lo + hi) * 0.5);
+        let shape = r::Cuboid::new(vector((hi - lo).max(Vec3::splat(0.02)) * 0.5));
         let mut out = Vec::new();
-        for &c in body.colliders() {
+        for (handle, _) in
+            self.world
+                .intersect_shape(pose(middle, rotation), &shape, r::QueryFilter::default())
+        {
+            if let Some(&key) = self.keys.get(&handle)
+                && !out.contains(&key)
+            {
+                out.push(key);
+            }
+        }
+        out
+    }
+
+    /// The statics any of `colliders` is in contact with, each once.
+    fn statics_touching(&self, colliders: &[r::ColliderHandle]) -> Vec<StaticKey> {
+        let mut out = Vec::new();
+        for &c in colliders {
             for pair in self.world.narrow_phase.contact_pairs_with(c) {
                 if !pair.has_any_active_contact() {
                     continue;
@@ -2033,6 +2087,24 @@ impl Physics {
             .query_pipeline_with_filter(solid().predicate(&keep))
             .cast_ray_and_get_normal(&ray, max, true)
             .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
+    }
+
+    /// The height of the island's own ground straight down from `from`
+    /// within `max` metres: its terrain and placed models (roads, rocks,
+    /// buildings), passing through the state layers' models and anything
+    /// not static.
+    pub fn island_below(&self, from: Vec3, max: f32) -> Option<f32> {
+        let ray = r::Ray::new(vector(from), vector(Vec3::NEG_Y));
+        let keep = |handle: r::ColliderHandle, _: &r::Collider| {
+            matches!(
+                self.keys.get(&handle),
+                Some(StaticKey::Cell(_) | StaticKey::Object(_) | StaticKey::Member(..))
+            )
+        };
+        self.world
+            .query_pipeline_with_filter(solid().predicate(&keep))
+            .cast_ray_and_get_normal(&ray, max, true)
+            .map(|(_, hit)| from.y - hit.time_of_impact)
     }
 
     /// Moves `character` for `dt` seconds: horizontally at `walk` (m/s; its
@@ -2971,6 +3043,13 @@ mod tests {
         }
         let lies = p.debris_place(d).unwrap().transform_point3(Vec3::Y);
         assert!(lies.y > 0.3 && lies.y < 1.6, "on the ground: {lies}");
+        // What holds it, and what stands where it lies.
+        assert_eq!(p.debris_statics(d), [StaticKey::Cell(1)]);
+        let around = (Vec3::splat(-3.0), Vec3::splat(3.0));
+        let place = Mat4::from_translation(lies);
+        assert_eq!(p.statics_in_box(place, around), [StaticKey::Cell(1)]);
+        let above = Mat4::from_translation(lies + Vec3::Y * 10.0);
+        assert!(p.statics_in_box(above, around).is_empty());
         // Rays and she pass it.
         let down = p.cast_ray(lies + Vec3::Y * 5.0, Vec3::NEG_Y, 20.0).unwrap();
         assert!((down.0 - (lies.y + 5.0)).abs() < 0.05, "{down:?}");

@@ -129,10 +129,14 @@ pub struct GameAudio {
     pub out: AudioOut,
     streams: Option<Arc<Streams>>,
     music: Option<VoiceId>,
+    /// The music stream asked for (by hash) and whether it loops: a
+    /// decoded stream that is not it was overtaken and is dropped.
+    music_wanted: Option<(u32, bool)>,
     next_track: usize,
     decoded: (Sender<Decoded>, Receiver<Decoded>),
-    /// Rifle shot, rocket launch, explosion.
-    fight: [Option<SoundBuffer>; 5],
+    /// Rifle shot, rocket launch, explosion, tank gun, grenade launcher,
+    /// a building coming down.
+    fight: [Option<SoundBuffer>; 6],
     /// Short sounds of the town (`amb_citymed`) and the jungle
     /// (`amb_jungle`) played now and then around the listener.
     ambient: [Vec<SoundBuffer>; 2],
@@ -159,10 +163,87 @@ pub struct GameAudio {
     speaking: Vec<Instant>,
     /// When Jennifer may speak again.
     quiet_until: Instant,
+    /// Scripted lines playing, by the mission's id for them.
+    lines: HashMap<u32, VoiceId>,
+    /// Interface sounds started, by cue in lower case.
+    ui_playing: HashMap<String, VoiceId>,
+    /// Scripted lines stopped before they were decoded.
+    hushed: HashSet<u32>,
     /// The sounds the clips' events play, once read (on a thread).
     clip_sounds: Option<ClipSounds>,
     clip_sounds_loading: Option<Receiver<ClipSounds>>,
+    /// The interface's sounds (`ui_hud`), once read (on a thread).
+    ui: Option<UiSounds>,
+    ui_loading: Option<Receiver<UiSounds>>,
 }
+
+/// The interface's sound bank, `ui_hud`: its cue table (cue name hash to
+/// record, record to the bank's sound) and its sounds; and the music's cue
+/// table (records name streams of `music.pws`).
+#[derive(Debug, Default)]
+pub struct UiSounds {
+    cues: Option<m2_assets::CueTable>,
+    sounds: Vec<SoundBuffer>,
+    music: Option<m2_assets::CueTable>,
+}
+
+impl UiSounds {
+    fn load(install: &Install) -> Self {
+        let bank = m2_assets::name_hash("ui_hud");
+        let Ok(mut source) = install.open_world() else {
+            return Self::default();
+        };
+        let cues = source
+            .asset(bank, m2_assets::voice::CUE_TABLE_TYPE)
+            .ok()
+            .and_then(|d| m2_assets::CueTable::parse(&d).ok());
+        let music = source
+            .asset(
+                m2_assets::name_hash("music"),
+                m2_assets::voice::CUE_TABLE_TYPE,
+            )
+            .ok()
+            .and_then(|d| m2_assets::CueTable::parse(&d).ok());
+        let library = SoundLibrary::load_banks(&mut source, &[bank]);
+        let sounds = library
+            .bank_hash(bank)
+            .map(|(_, s)| s.to_vec())
+            .unwrap_or_default();
+        Self {
+            cues,
+            sounds,
+            music,
+        }
+    }
+
+    /// The music stream cue `cue` plays, and whether it loops.
+    fn music(&self, cue: &str) -> Option<(usize, bool)> {
+        let table = self.music.as_ref()?;
+        let plain = table.plain_cue(m2_assets::name_hash(cue))?;
+        let record = table.records.get(plain.record as usize)?;
+        let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
+        Some((index as usize, plain.seconds < 0.0))
+    }
+
+    /// The sound cue `cue` plays and its volume (the first of its
+    /// record's variants that is this bank's).
+    /// and whether it loops.
+    fn find(&self, cue: &str) -> Option<(SoundBuffer, f32, bool)> {
+        let table = self.cues.as_ref()?;
+        let hash = m2_assets::name_hash(cue);
+        let record = table.cue_record(hash)?;
+        let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
+        let looped = table.plain_cue(hash).is_some_and(|c| c.seconds < 0.0);
+        Some((
+            self.sounds.get(index as usize)?.clone(),
+            record.volume,
+            looped,
+        ))
+    }
+}
+
+/// How loud the music plays.
+const MUSIC_GAIN: f32 = 0.6;
 
 /// Banks the clips' sound events are found in, by name: the resident
 /// foley (`fol_rustle_human_02`, `fol_grenade_sidethrow_01`, ...).
@@ -238,8 +319,8 @@ impl ClipSounds {
 }
 
 /// A decoded voice line: the sound, where it is said (`None` flat: the
-/// player's own), its falloff and volume.
-type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32);
+/// player's own), its falloff and volume, and the scripted line it is.
+type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32, Option<u32>);
 
 /// Voice sets, by the name hash of their name: two of Venezuelan army
 /// soldiers, `vo_vzSoldier_01` and `_02` (so not everyone sounds alike),
@@ -460,7 +541,22 @@ pub fn log_tank_gun(install: &Install) {
 }
 
 /// Sounds read from the banks: the fight's and the ambient one-shots.
-type BankSounds = ([Option<SoundBuffer>; 5], [Vec<SoundBuffer>; 2]);
+type BankSounds = ([Option<SoundBuffer>; 6], [Vec<SoundBuffer>; 2]);
+
+/// A building coming down (a mission's gate the bomb brings down): the
+/// rumble of the building destruction bank (`bulding_destruct`, the
+/// game's spelling), `sfx_dest_dist_rumble_genericd`, found by its name's
+/// hash with its bank's debris sounds (`sfx_debris_distant_hut_mid_03a`
+/// and `_03b`). The gate's own script names its sounds through emitters
+/// not yet read.
+const COLLAPSE_SOUND: u32 = 0x9204_a89a;
+
+/// How many of the fight's sounds the banks have, read as play reads
+/// them (each logs what it picked, the collapse's rumble among them): a
+/// check for headless runs, which play no sound.
+pub fn fight_sounds_found(install: &Install) -> usize {
+    bank_sounds(install).0.iter().flatten().count()
+}
 
 /// The fight's sounds and the ambient one-shots.
 fn bank_sounds(install: &Install) -> BankSounds {
@@ -475,6 +571,7 @@ fn bank_sounds(install: &Install) -> BankSounds {
                 "wpn_grenadelauncher",
                 "amb_citymed",
                 "amb_jungle",
+                "bulding_destruct",
             ],
         )
     });
@@ -504,6 +601,9 @@ fn bank_sounds(install: &Install) -> BankSounds {
                             s.hash,
                             s.seconds()
                         )
+                    }),
+                    pick(&l, "bulding_destruct", |s| s.hash == COLLAPSE_SOUND).inspect(|s| {
+                        eprintln!("sound: collapse {:08x} ({:.2} s)", s.hash, s.seconds())
                     }),
                 ],
                 [short("amb_citymed"), short("amb_jungle")],
@@ -633,6 +733,7 @@ impl GameAudio {
             out,
             streams,
             music: None,
+            music_wanted: None,
             next_track: 0,
             decoded: channel(),
             fight,
@@ -663,6 +764,9 @@ impl GameAudio {
                 rx
             }),
             said: channel(),
+            lines: HashMap::new(),
+            ui_playing: HashMap::new(),
+            hushed: HashSet::new(),
             speaking: Vec::new(),
             quiet_until: Instant::now(),
             clip_sounds: None,
@@ -676,6 +780,95 @@ impl GameAudio {
                 });
                 rx
             }),
+            ui: None,
+            ui_loading: install.map(|install| {
+                let install = install.clone();
+                let (tx, rx) = channel();
+                std::thread::spawn(move || {
+                    let ui = UiSounds::load(&install);
+                    eprintln!(
+                        "ui sounds: {} cues, {} sounds; music: {} cues",
+                        ui.cues.as_ref().map_or(0, |c| c.cues.len()),
+                        ui.sounds.len(),
+                        ui.music.as_ref().map_or(0, |c| c.cues.len())
+                    );
+                    let _ = tx.send(ui);
+                });
+                rx
+            }),
+        }
+    }
+
+    fn ui_loaded(&mut self) {
+        if let Some(rx) = &self.ui_loading
+            && let Ok(u) = rx.try_recv()
+        {
+            self.ui = Some(u);
+            self.ui_loading = None;
+        }
+    }
+
+    /// Plays the scripts' music cue `cue` (`mu_fac_pmc_explore_01`) in
+    /// place of what plays, looped unless it is a one-shot (a fanfare);
+    /// `None` stops the music.
+    pub fn music_cue(&mut self, cue: Option<&str>) {
+        self.ui_loaded();
+        if let Some(id) = self.music.take() {
+            self.out.with(|m| m.stop(id));
+        }
+        self.music_wanted = None;
+        let Some(cue) = cue else {
+            eprintln!("music: stopped");
+            return;
+        };
+        let Some((stream, looped)) = self.ui.as_ref().and_then(|u| u.music(cue)) else {
+            eprintln!("music: {cue} not found");
+            return;
+        };
+        let hash = self
+            .streams
+            .as_ref()
+            .and_then(|s| s.music.streams.get(stream))
+            .map(|s| s.hash);
+        eprintln!(
+            "music: {cue}, stream {stream}{}",
+            if looped { ", looped" } else { "" }
+        );
+        self.music_wanted = hash.map(|h| (h, looped));
+        self.decode("music", stream);
+    }
+
+    /// Plays the interface's sound cue `cue` (`ui_HUD_Objective_New`),
+    /// flat.
+    pub fn ui_sound(&mut self, cue: &str) {
+        self.ui_loaded();
+        match self.ui.as_ref().and_then(|u| u.find(cue)) {
+            Some((buffer, volume, looped)) => {
+                eprintln!(
+                    "ui sound: {cue} ({:.2} s{})",
+                    buffer.seconds(),
+                    if looped { ", looped" } else { "" }
+                );
+                let mut play = Play::flat(buffer).gain(volume.clamp(0.0, 2.0));
+                if looped {
+                    play = play.looped();
+                }
+                let voice = self.out.with(|m| m.play(play));
+                // Started again: the one before stops, as a cue plays once
+                // per emitter.
+                if let Some(old) = self.ui_playing.insert(cue.to_ascii_lowercase(), voice) {
+                    self.out.with(|m| m.stop(old));
+                }
+            }
+            None => eprintln!("ui sound: {cue} not found"),
+        }
+    }
+
+    /// Stops interface sound `cue` if it plays (`Sound.StopSound`).
+    pub fn stop_ui_sound(&mut self, cue: &str) {
+        if let Some(voice) = self.ui_playing.remove(&cue.to_ascii_lowercase()) {
+            eprintln!("ui sound: {cue} stopped");
+            self.out.with(|m| m.stop(voice));
         }
     }
 
@@ -747,7 +940,7 @@ impl GameAudio {
             near: line.min_distance.max(1.0),
             far: line.max_distance.max(line.min_distance + 1.0),
         };
-        self.speak(voices, line.stream, at, falloff, line.volume);
+        self.speak(voices, line.stream, at, falloff, line.volume, None);
     }
 
     /// Jennifer says something about `remark`, now and then: a cue from
@@ -791,7 +984,65 @@ impl GameAudio {
             .map_or(0.0, |s| s.seconds());
         self.quiet_until = now + Duration::from_secs_f32(seconds + REMARK_GAP);
         eprintln!("voice: Jennifer, {remark:?}, stream {stream}");
-        self.speak(voices, stream, None, Falloff::default(), volume);
+        self.speak(voices, stream, None, Falloff::default(), volume, None);
+    }
+
+    /// Plays the scripts' line `cue` (`Fiona-In-Mission-Contract-Vz01-146`,
+    /// found by its name hash in any voice set) as line `id`: flat, or
+    /// where `at` is if the line is heard from where it is said. Returns
+    /// how long it lasts, or `None` if it cannot be played.
+    pub fn say(&mut self, id: u32, cue: &str, at: Option<Vec3>) -> Option<f32> {
+        let voices = self.voices.clone()?;
+        let hash = m2_assets::name_hash(cue);
+        let (streams, volume, near, far, positional) = voices.sets.iter().find_map(|t| {
+            let (volume, near, far, positional) = t
+                .lines
+                .iter()
+                .find(|l| l.cue == hash)
+                .map(|l| (l.volume, l.min_distance, l.max_distance, l.is_positional()))
+                .or_else(|| {
+                    t.groups
+                        .iter()
+                        .find(|g| g.cue == hash)
+                        .map(|g| (g.volume, g.min_distance, g.max_distance, g.is_positional()))
+                })?;
+            Some((t.streams(hash)?, volume, near, far, positional))
+        })?;
+        if streams.is_empty() {
+            return None;
+        }
+        let pick = ((self.random() * streams.len() as f32) as usize).min(streams.len() - 1);
+        let stream = streams[pick];
+        let seconds = voices.index.streams.get(stream as usize)?.seconds();
+        let falloff = Falloff {
+            near: near.max(1.0),
+            far: far.max(near + 1.0),
+        };
+        // Jennifer keeps quiet while she is spoken to.
+        let now = Instant::now();
+        self.quiet_until = self
+            .quiet_until
+            .max(now + Duration::from_secs_f32(seconds + REMARK_GAP));
+        eprintln!("voice: line {cue}, stream {stream}, {seconds:.1} s");
+        self.speak(
+            voices,
+            stream,
+            at.filter(|_| positional),
+            falloff,
+            volume,
+            Some(id),
+        );
+        Some(seconds)
+    }
+
+    /// Stops scripted line `id`.
+    pub fn hush(&mut self, id: u32) {
+        match self.lines.remove(&id) {
+            Some(voice) => self.out.with(|m| m.stop(voice)),
+            None => {
+                self.hushed.insert(id);
+            }
+        }
     }
 
     /// Decodes voice stream `stream` on a thread and plays it at `at`.
@@ -802,6 +1053,7 @@ impl GameAudio {
         at: Option<Vec3>,
         falloff: Falloff,
         volume: f32,
+        line: Option<u32>,
     ) {
         let Some(seconds) = voices
             .index
@@ -815,7 +1067,7 @@ impl GameAudio {
             .push(Instant::now() + Duration::from_secs_f32(seconds + 0.3));
         let tx = self.said.0.clone();
         std::thread::spawn(move || match voices.decode(stream as usize) {
-            Ok(b) => drop(tx.send((b, at, falloff, volume.clamp(0.0, 2.0)))),
+            Ok(b) => drop(tx.send((b, at, falloff, volume.clamp(0.0, 2.0), line))),
             Err(e) => eprintln!("voice line {stream}: {e}"),
         });
     }
@@ -878,6 +1130,7 @@ impl GameAudio {
                 Sound::Bomb(at) => (2, at, 2.5),
                 Sound::Cannon(at) => (3, at, 1.3),
                 Sound::Lob(at) => (4, at, 1.0),
+                Sound::Collapse(at) => (5, at, 2.0),
             };
             if let Some(buffer) = self.fight[i].clone() {
                 self.out.with(|m| m.play(Play::at(buffer, at).gain(gain)));
@@ -1037,6 +1290,11 @@ impl GameAudio {
         }
         let track = self.next_track % count;
         self.next_track += 1;
+        self.music_wanted = self
+            .streams
+            .as_ref()
+            .and_then(|s| s.music.streams.get(track))
+            .map(|s| (s.hash, false));
         eprintln!("music: track {track} of {count}");
         self.decode("music", track);
     }
@@ -1049,7 +1307,10 @@ impl GameAudio {
             self.voices = Some(Arc::new(v));
             self.voices_loading = None;
         }
-        while let Ok((buffer, at, falloff, gain)) = self.said.1.try_recv() {
+        while let Ok((buffer, at, falloff, gain, line)) = self.said.1.try_recv() {
+            if line.is_some_and(|l| self.hushed.remove(&l)) {
+                continue;
+            }
             let play = match at {
                 Some(at) => Play {
                     falloff,
@@ -1057,16 +1318,32 @@ impl GameAudio {
                 },
                 None => Play::flat(buffer),
             };
-            self.out.with(|m| m.play(play.gain(gain)));
-        }
-        while let Ok((which, buffer)) = self.decoded.1.try_recv() {
-            let id = self.out.with(|m| match which {
-                "music" => m.play(Play::flat(buffer).gain(0.6)),
-                _ => m.play(Play::flat(buffer).looped().gain(0.5)),
-            });
-            if which == "music" {
-                self.music = Some(id);
+            let voice = self.out.with(|m| m.play(play.gain(gain)));
+            if let Some(l) = line {
+                self.lines.insert(l, voice);
             }
+        }
+        self.lines
+            .retain(|_, v| self.out.with(|m| m.is_playing(*v)));
+        while let Ok((which, buffer)) = self.decoded.1.try_recv() {
+            if which == "music" {
+                let Some((hash, looped)) = self.music_wanted else {
+                    continue;
+                };
+                if buffer.hash != hash {
+                    continue;
+                }
+                self.music_wanted = None;
+                let play = Play::flat(buffer).gain(MUSIC_GAIN);
+                let play = if looped { play.looped() } else { play };
+                if let Some(old) = self.music.take() {
+                    self.out.with(|m| m.stop(old));
+                }
+                self.music = Some(self.out.with(|m| m.play(play)));
+                continue;
+            }
+            self.out
+                .with(|m| m.play(Play::flat(buffer).looped().gain(0.5)));
         }
         self.out.with(|m| m.set_listener(listener, forward));
     }

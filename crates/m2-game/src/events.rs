@@ -60,6 +60,20 @@ pub trait World {
     fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
         None
     }
+    /// Whether it got into (or out of) its seat at once, put there by a
+    /// script.
+    fn seated_instantly(&self, _guid: u32) -> bool {
+        false
+    }
+    /// An object's labels (`"Boat"`, `"Tank"`) as name hashes, for class
+    /// expressions.
+    fn labels(&self, _guid: u32) -> Vec<u32> {
+        Vec::new()
+    }
+    /// An object's health, if the world tracks it.
+    fn health(&self, _guid: u32) -> Option<f32> {
+        None
+    }
 }
 
 /// The kinds the scripts use, by how often.
@@ -103,6 +117,8 @@ struct Store {
     pending: Vec<Pending>,
     /// `Event.Post` calls not yet delivered: name and data.
     posted: Vec<(String, Value)>,
+    /// With `M2_STUB_ARGS`: events made and deleted, for diagnostics.
+    trace: Vec<String>,
     /// Game time, seconds.
     now: f64,
 }
@@ -159,6 +175,16 @@ impl Events {
                     s.next_id += 1;
                     let id = s.next_id;
                     let now = s.now;
+                    if crate::script::stub_args() && !kind.starts_with("Gui") {
+                        let shown: Vec<String> = params
+                            .clone()
+                            .sequence_values::<Value>()
+                            .filter_map(Result::ok)
+                            .map(|v| crate::script::show_arg(&v))
+                            .collect();
+                        s.trace
+                            .push(format!("{name} {id} {kind}{{{}}}", shown.join(", ")));
+                    }
                     s.pending.push(Pending {
                         id,
                         kind,
@@ -179,7 +205,19 @@ impl Events {
             "Delete",
             safe_function(lua, move |_, args| {
                 if let Some(id) = args.front().and_then(as_id) {
-                    store.borrow_mut().pending.retain(|p| p.id != id);
+                    let mut s = store.borrow_mut();
+                    if crate::script::stub_args() {
+                        let gone = s
+                            .pending
+                            .iter()
+                            .find(|p| p.id == id)
+                            .map(|p| p.kind.clone());
+                        s.trace.push(format!(
+                            "Delete {id} ({})",
+                            gone.as_deref().unwrap_or("none")
+                        ));
+                    }
+                    s.pending.retain(|p| p.id != id);
                 }
                 Ok(MultiValue::new())
             })?,
@@ -246,6 +284,11 @@ impl Events {
         Ok(())
     }
 
+    /// Events made and deleted since the last call (with `M2_STUB_ARGS`).
+    pub fn take_trace(&self) -> Vec<String> {
+        std::mem::take(&mut self.store.borrow_mut().trace)
+    }
+
     /// How many events are pending.
     pub fn len(&self) -> usize {
         self.store.borrow().pending.len()
@@ -262,6 +305,26 @@ impl Events {
             .pending
             .iter()
             .map(|p| p.kind.clone())
+            .collect()
+    }
+
+    /// Pending events with their parameters, for diagnostics:
+    /// `ObjectHealth{1, "<", 100}`.
+    pub fn describe(&self) -> Vec<String> {
+        self.store
+            .borrow()
+            .pending
+            .iter()
+            .map(|p| {
+                let params: Vec<String> = p
+                    .params
+                    .clone()
+                    .sequence_values::<Value>()
+                    .filter_map(Result::ok)
+                    .map(|v| crate::script::show_arg(&v))
+                    .collect();
+                format!("{}{{{}}}", p.kind, params.join(", "))
+            })
             .collect()
     }
 
@@ -318,6 +381,33 @@ impl Events {
                         let rising = holds && !p.held;
                         p.held = holds;
                         rising.then_some(vec![extra])
+                    }
+                    // `held_by` keeps who was seated at the last check
+                    // (none before the first).
+                    Check::Seats(riders) => {
+                        let mode = seat_mode(&p);
+                        let any = mode.contains('a');
+                        let mut fire = Vec::new();
+                        let mut seated = BTreeSet::new();
+                        for (r, (inside, instantly), extra) in riders {
+                            let was = p.held_by.contains(&r);
+                            if inside {
+                                seated.insert(r);
+                            }
+                            let (inn, out) = if instantly { ('i', 'o') } else { ('e', 'x') };
+                            let got_in = inside && !was;
+                            let got_out = !inside && was;
+                            if (got_in && (any || mode.contains(inn)))
+                                || (got_out && (any || mode.contains(out)))
+                            {
+                                fire.push(extra);
+                            }
+                        }
+                        p.held_by = seated;
+                        if !p.persistent {
+                            fire.truncate(1);
+                        }
+                        (!fire.is_empty()).then_some(fire)
                     }
                     // Fires for each object as the condition starts to
                     // hold for it; once only, unless persistent.
@@ -409,12 +499,47 @@ fn guid(t: &Table, i: i64) -> Option<u32> {
     as_id(&t.raw_get::<Value>(i).ok()?)
 }
 
+/// Whether an object with `labels` is of class `expr`: labels joined by
+/// `&&`, each maybe negated with `!` (`"Tank && !APC"`), in any case.
+pub(crate) fn class_matches(expr: &str, labels: &[u32]) -> bool {
+    class_terms(expr)
+        .iter()
+        .all(|&(h, not)| labels.contains(&h) != not)
+}
+
+/// A class expression's labels as name hashes, each with whether it is
+/// negated.
+pub(crate) fn class_terms(expr: &str) -> Vec<(u32, bool)> {
+    expr.split("&&")
+        .map(|term| {
+            let term = term.trim();
+            match term.strip_prefix('!') {
+                Some(not) => (m2_assets::name_hash(not.trim()), true),
+                None => (m2_assets::name_hash(term), false),
+            }
+        })
+        .collect()
+}
+
+/// How a seat event's mode letters (`"E"`, `"xo"`, ...) read; the old
+/// words `"enter"` and `"exit"` as `"ei"` and `"xo"`.
+fn seat_mode(p: &Pending) -> String {
+    match text(&p.params, 4).as_deref() {
+        Some("enter") | None => "ei".to_owned(),
+        Some("exit") => "xo".to_owned(),
+        Some(m) => m.to_owned(),
+    }
+}
+
 enum Check {
     /// Fire now with these values after the callback's data.
     Fire(Vec<Value>),
     /// A condition: whether it holds, and the values to pass when it
     /// starts to.
     Holds(bool, Vec<Value>),
+    /// Riders and whether each is in a wanted seat, with the values to
+    /// pass: fired by the event's mode as they get in or out.
+    Seats(Vec<(u32, (bool, bool), Vec<Value>)>),
     /// A condition on each of several objects (an object filter's): per
     /// object, whether it holds and the values to pass.
     Each(Vec<(u32, bool, Vec<Value>)>),
@@ -521,25 +646,41 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             }
             no
         }
-        // { rider, vehicle, seat, "enter" or "exit" }: rider is a guid,
-        // "hero" or a label, vehicle a guid (or anything for any), seat a
-        // seat type ("Gunner", "Any"; not told apart yet). Passes the
+        // { rider, vehicle, seat, mode }: rider is a guid, "hero" or a
+        // label; vehicle a guid (0: any), a vehicle's name or a class
+        // expression of labels ("Boat", "Tank && !APC"); seat a seat code
+        // ("D" the driver's; not told apart yet); mode letters, each a
+        // way of getting in or out: e climbing in, i put in at once, x
+        // climbing out, o put out ("ei" and "xo" either; "a" any). A
+        // vehicle script waits for "E" and "I" alike and leaves the other
+        // pending, so the two never fire for the same move. Passes the
         // rider and vehicle.
         "ObjectInSeat" => {
-            // The vehicle may be named rather than a guid.
-            let vehicle =
-                guid(&p.params, 2).or_else(|| objects(&p.params, 2, world).first().copied());
-            let exit = text(&p.params, 4).as_deref() == Some("exit");
-            for r in objects(&p.params, 1, world) {
-                let seated = world
-                    .vehicle_of(r)
-                    .filter(|v| vehicle.is_none_or(|want| want == *v));
-                if seated.is_some() != exit {
-                    let v = seated.or(vehicle).unwrap_or(0);
-                    return Check::Holds(true, vec![id(r), id(v)]);
+            let wanted = |v: u32| match p.params.raw_get::<Value>(2) {
+                Ok(Value::String(s)) => {
+                    let named = objects(&p.params, 2, world);
+                    if named.is_empty() {
+                        class_matches(&s.to_string_lossy(), &world.labels(v))
+                    } else {
+                        named.contains(&v)
+                    }
                 }
-            }
-            no
+                Ok(other) => as_id(&other).is_none_or(|want| want == 0 || want == v),
+                Err(_) => true,
+            };
+            Check::Seats(
+                objects(&p.params, 1, world)
+                    .into_iter()
+                    .map(|r| {
+                        let seated = world.vehicle_of(r).filter(|&v| wanted(v));
+                        (
+                            r,
+                            (seated.is_some(), world.seated_instantly(r)),
+                            vec![id(r), id(seated.unwrap_or(0))],
+                        )
+                    })
+                    .collect(),
+            )
         }
         // { state, "enter" or "exit" }: as the game enters or leaves a
         // state; passes both.
@@ -593,6 +734,24 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             let mut extra = vec![id(cargo)];
             extra.extend(carrier.map(id));
             Check::Holds(holds, extra)
+        }
+        // { object, "<" or ">", health }: while its health is below (or
+        // above) the figure; passes the object. The hero's survival
+        // script watches for drops below her current health this way.
+        "ObjectHealth" => {
+            let Some(figure) = number(&p.params, 3) else {
+                return no;
+            };
+            let above = text(&p.params, 2).as_deref() == Some(">");
+            for o in objects(&p.params, 1, world) {
+                if let Some(h) = world.health(o)
+                    && (f64::from(h) > figure) == above
+                    && f64::from(h) != figure
+                {
+                    return Check::Holds(true, vec![id(o)]);
+                }
+            }
+            no
         }
         // { object, "awake" or "hibernate" }.
         "ObjectHibernation" => match guid(&p.params, 1) {

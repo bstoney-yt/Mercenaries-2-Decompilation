@@ -50,7 +50,7 @@ m2-alpha [options]
   --face <degrees>       with --screenshot on foot: face this way first
                          (0 is +z, 90 is +x)
   --aim                  with --screenshot on foot: weapon up for the picture
-  --hurt <deg>[,<deg>..] with --screenshot on foot: hits from these directions
+  --hit-from <deg>[,..]  with --screenshot on foot: hits from these directions
                          (degrees clockwise from where the camera looks, 0
                          ahead) just before the picture, to see the hit arcs
   --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
@@ -63,6 +63,25 @@ m2-alpha [options]
                          the timing wheel after the first press (wheel),
                          or --fight-wait seconds (at least 0.8) after the
                          bomb lands (bomb)
+  --gates                with --screenshot: bring down each of the mission's
+                         gates as the satellite bomb does, four times
+                         (its pieces thrown as fast as in play, 0.6 and
+                         1.6 times as fast, then as in play with the other
+                         models mostly in its box and the island's statics
+                         in it taken down), logging how its pieces set
+                         off and where they are 2 s and 8 s on; first it
+                         lists the other models and the statics in each
+                         gate's box and pictures the place without it
+                         (-gate1-without.ppm); pictures from 50 m south of
+                         each, the first time, of the rest of it alone and
+                         its pieces alone as it breaks (-gate1-rest.ppm,
+                         -gate1-pieces.ppm), and 2 s and 8 s on
+                         (-gate1-2s.ppm, -gate1-8s.ppm), with the pieces
+                         that hardly moved and what they touch at 2 s; the
+                         last time the same at 2 s and 8 s
+                         (-gate1-alone-2s.ppm, -gate1-alone-8s.ppm);
+                         before all that it reads the fight's sounds as
+                         play does and logs which it found
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --pda                  with --screenshot: the picture with her PDA open

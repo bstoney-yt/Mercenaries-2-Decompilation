@@ -51,6 +51,13 @@ use crate::support::{FALLBACK_AFTER, Impact, Kind};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
+/// A scripted voice line to play: the mission's id for it, its cue, and
+/// where it is said (`None`: flat).
+pub type ScriptLine = (u32, String, Option<Vec3>);
+
+/// Who the scripts take the player for: Jennifer, whose model and voice
+/// the alpha plays (the scripts pick her replies on the radio by this).
+pub const HERO: &str = "Jennifer";
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -188,6 +195,14 @@ pub struct MissionLink {
     speed: f32,
     /// The keys tutorial lines name.
     keys: crate::input::Bindings,
+    /// Scripted voice lines to play, and lines to stop.
+    lines: Vec<ScriptLine>,
+    hushed: Vec<u32>,
+    /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
+    /// whether each is to stop instead.
+    sounds: Vec<(String, bool)>,
+    /// The music cue the scripts last switched to (`Some(None)`: none).
+    music: Option<Option<String>>,
 }
 
 /// The scripts' vehicles in play.
@@ -270,6 +285,10 @@ impl MissionLink {
             completed: None,
             speed: 0.0,
             keys: Default::default(),
+            lines: Vec::new(),
+            hushed: Vec::new(),
+            sounds: Vec::new(),
+            music: None,
         }
     }
 
@@ -495,9 +514,44 @@ impl MissionLink {
             }
             self.blasts.clear();
             self.bombs.clear();
+            // The scripts heal her and watch her health.
+            game.combat.scripted_health = true;
+            if std::mem::take(&mut game.combat.revived) {
+                mission.player_died();
+            }
+            mission.set_health(PLAYER, game.combat.hp);
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
+                match &c {
+                    Command::Say { id, speaker, cue } => {
+                        // The player's own lines (and the radio) are flat.
+                        let at = speaker.filter(|&g| g != PLAYER).and_then(|g| {
+                            let w = mission.world().borrow();
+                            w.objects.get(&g).map(|o| Vec3::from_array(o.position))
+                        });
+                        self.lines.push((*id, cue.clone(), at));
+                    }
+                    Command::Hush(id) => self.hushed.push(*id),
+                    Command::CueSound { at: None, cue } => self.sounds.push((cue.clone(), false)),
+                    Command::StopSound { at: None, cue } => self.sounds.push((cue.clone(), true)),
+                    Command::HealthClamp(on) => {
+                        eprintln!("mission: health clamp {on}");
+                        game.combat.health_clamp = *on;
+                    }
+                    Command::SetHealth { guid, health } if *guid == PLAYER => {
+                        eprintln!(
+                            "mission: scripts set her health {:.1} -> {health:.1}",
+                            game.combat.hp
+                        );
+                        game.combat.hp = health.clamp(0.0, 100.0);
+                    }
+                    Command::Music(cue) => self.music = Some(cue.clone()),
+                    Command::Invincible { guid, on } if *guid == PLAYER => {
+                        game.combat.invincible = *on;
+                    }
+                    _ => {}
+                }
                 support_item(game, &c);
                 fly(game, mission, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
@@ -527,7 +581,7 @@ impl MissionLink {
             .player
             .as_ref()
             .map_or([0.0; 3], |p| p.character.position.to_array());
-        match Mission::new(data, "Mattias", at) {
+        match Mission::new(data, HERO, at) {
             Ok(mut mission) => {
                 mission.fly_deliveries();
                 if let Err(e) = mission.run(RADAR_REGIONS, "radar regions") {
@@ -560,6 +614,32 @@ impl MissionLink {
         eprintln!("mission: {why}");
         self.write([why.clone()]);
         self.state = State::Failed(why);
+    }
+
+    /// Scripted voice lines to play (id, cue, where said) and to stop,
+    /// since the last call.
+    pub fn take_lines(&mut self) -> (Vec<ScriptLine>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.lines),
+            std::mem::take(&mut self.hushed),
+        )
+    }
+
+    /// Interface sounds the scripts cued since the last call.
+    pub fn take_sounds(&mut self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.sounds)
+    }
+
+    /// The music cue to switch to, if the scripts changed it.
+    pub fn take_music(&mut self) -> Option<Option<String>> {
+        self.music.take()
+    }
+
+    /// Scripted line `id` lasts `seconds`.
+    pub fn line_length(&mut self, id: u32, seconds: f32) {
+        if let State::Running(m) = &mut self.state {
+            m.line_length(id, f64::from(seconds));
+        }
     }
 
     /// The scripts are running (not still loading, not failed).
@@ -1094,15 +1174,22 @@ fn break_props(game: &mut Game, mission: &Mission) {
         (dead, gone)
     };
     drop(w);
-    let mut fires = Vec::new();
+    let (mut fires, mut falling) = (Vec::new(), Vec::new());
     for e in dead {
         scene.props.wreck(&mut world.physics, e, blast);
         fires.extend(scene.props.breakup_points(e));
+        if scene.props.broke_apart(e) {
+            falling.extend(scene.props.centre(e));
+        }
     }
     scene.props.hide(&mut world.physics, gone);
-    // What broke apart burns where its break-up says.
+    // What broke apart burns where its break-up says, and is heard
+    // coming down.
     for at in fires {
         game.combat.blaze(&world.physics, at);
+    }
+    for at in falling {
+        game.combat.collapse(at);
     }
 }
 
@@ -1349,6 +1436,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     .hide(&mut world.physics, entities.iter().copied());
             }
             if *op != LayerOp::Unload {
+                scene.props.note_layer(entities.iter().copied(), name);
                 let shown = scene.show_props(entities);
                 if shown > 0 {
                     eprintln!("layer {name}: {shown} models put up");

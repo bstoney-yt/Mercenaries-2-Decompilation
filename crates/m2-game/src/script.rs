@@ -42,6 +42,38 @@ pub struct ScriptHost {
 /// A module name as loaded, and the script hash it resolved to.
 pub type LoadedModule = (String, Option<u32>);
 
+thread_local! {
+    /// Whether stub calls are logged with their arguments.
+    static STUB_ARGS: bool = std::env::var_os("M2_STUB_ARGS").is_some();
+}
+
+/// Whether stub calls are logged with their arguments (`M2_STUB_ARGS`).
+pub fn stub_args() -> bool {
+    STUB_ARGS.with(|on| *on)
+}
+
+/// A stub call's argument as the log shows it: numbers, short strings,
+/// stubs by name, other tables as `{}`.
+pub(crate) fn show_arg(v: &Value) -> String {
+    match v {
+        Value::Nil => "nil".to_owned(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Number(n) => format!("{n:.2}"),
+        Value::String(s) => {
+            let s = s.to_string_lossy();
+            let cut: String = s.chars().take(40).collect();
+            format!("{cut:?}")
+        }
+        Value::Table(t) => t
+            .raw_get::<Option<String>>(STUB_NAME)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "{}".to_owned()),
+        other => other.type_name().to_owned(),
+    }
+}
+
 /// Key in a stub table holding its name.
 const STUB_NAME: &str = "__m2_stub";
 
@@ -98,16 +130,26 @@ impl ScriptHost {
                 let name: String = callee.raw_get(STUB_NAME)?;
                 // A method call passes a stub as self: `m:SetTimer` rather
                 // than `m.SetTimer`.
-                let receiver = args.next().and_then(|a| match a {
+                let first = args.next();
+                let receiver = first.as_ref().and_then(|a| match a {
                     Value::Table(t) => t.raw_get::<Option<String>>(STUB_NAME).ok().flatten(),
                     _ => None,
                 });
-                let shown = match receiver {
-                    Some(r) if name.strip_prefix(&r).is_some_and(|k| k.starts_with('.')) => {
-                        format!("{r}:{}", &name[r.len() + 1..])
-                    }
+                let method = receiver.as_ref().is_some_and(|r| {
+                    name.strip_prefix(r.as_str())
+                        .is_some_and(|k| k.starts_with('.'))
+                });
+                let mut shown = match &receiver {
+                    Some(r) if method => format!("{r}:{}", &name[r.len() + 1..]),
                     _ => name.clone(),
                 };
+                // With `M2_STUB_ARGS` set, the arguments too (to learn what
+                // the scripts ask of a call before it is written).
+                if STUB_ARGS.with(|on| *on) {
+                    let rest = (!method).then_some(first).flatten().into_iter().chain(args);
+                    let shown_args: Vec<String> = rest.map(|v| show_arg(&v)).collect();
+                    shown = format!("{shown}({})", shown_args.join(", "));
+                }
                 call_log.borrow_mut().push(shown);
                 Ok(MultiValue::from_vec(vec![Value::Table(stub(
                     lua,
@@ -229,8 +271,13 @@ impl ScriptHost {
                     };
                     let name = format!("{library}.{}", k.to_string_lossy());
                     let log = Rc::clone(&log);
-                    let f = safe_function(lua, move |_, _| {
-                        log.borrow_mut().push(name.clone());
+                    let f = safe_function(lua, move |_, args| {
+                        let mut shown = name.clone();
+                        if STUB_ARGS.with(|on| *on) {
+                            let args: Vec<String> = args.iter().map(show_arg).collect();
+                            shown = format!("{shown}({})", args.join(", "));
+                        }
+                        log.borrow_mut().push(shown);
                         Ok(MultiValue::new())
                     })?;
                     t.raw_set(k.clone(), &f)?;
