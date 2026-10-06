@@ -39,7 +39,7 @@ use crate::assets::{AssetError, DecodedTexture, Install};
 use crate::model::{CpuModel, GpuModel, MaterialCache, MemberShape, flags};
 use crate::physics::{CollisionShape, DebrisId, Loose, Physics, StaticKey};
 use crate::scatter::{self, CellScatter};
-use crate::world::{self, TerrainMesh, TerrainSurface, WorldIndex};
+use crate::world::{self, ObjectPlacement, TerrainMesh, TerrainSurface, WorldIndex};
 
 /// Something for the loader to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -315,6 +315,30 @@ pub const PROP_SIZES: f32 = 80.0;
 /// How far a prop with `bounds` is drawn, at most `limit`.
 fn draw_reach(bounds: (Vec3, Vec3), limit: f32) -> f32 {
     ((bounds.1 - bounds.0).length() * PROP_SIZES).min(limit)
+}
+
+impl WorldSettings {
+    /// How far placed object `o` may be drawn, before its model's size is
+    /// known.
+    fn reach_limit(&self, o: &ObjectPlacement) -> f32 {
+        match (o.fade, o.named) {
+            (Some(fade), _) => fade,
+            (None, true) => self.prop_distance,
+            (None, false) => self.object_distance,
+        }
+    }
+
+    /// How far placed object `o` is drawn, its model's box being `bounds`.
+    /// A tree stops at its species' fade distance (200 m for most), not by
+    /// its size: the game draws a far tree as its crown card, which isn't
+    /// drawn yet, so until it is no tree draws past the fade.
+    fn reach(&self, o: &ObjectPlacement, bounds: (Vec3, Vec3)) -> f32 {
+        match (o.fade, o.named) {
+            (Some(fade), _) => fade,
+            (None, true) => draw_reach(bounds, self.prop_distance),
+            (None, false) => self.object_distance,
+        }
+    }
 }
 
 impl Default for WorldSettings {
@@ -638,18 +662,14 @@ impl World {
     /// a mission's gate besides the gate (round 99's broken gates still
     /// showed an arch and doors).
     pub fn covering(&self, spot: Vec3, eye: Vec3, pad: f32) -> Vec<(u32, Vec3, Vec3)> {
-        let (reach, props) = (self.settings.object_distance, self.settings.prop_distance);
         let mut out = Vec::new();
         for (i, o) in self.index.objects.iter().enumerate() {
             let d = o.position.distance(eye);
             let Some(Slot::Ready(m)) = self.models.get(&o.model) else {
                 continue;
             };
-            if d > if o.named {
-                draw_reach(m.bounds, props)
-            } else {
-                reach
-            } || self.knocked.contains_key(&i)
+            if d > self.settings.reach(o, m.bounds)
+                || self.knocked.contains_key(&i)
                 || (self.destroyed.contains(&i) && !m.has_wreck())
             {
                 continue;
@@ -744,7 +764,6 @@ impl World {
 
         // Models of placed objects in range.
         let reach = self.settings.object_distance;
-        let props = self.settings.prop_distance;
         let (b0, b1) = (
             bucket(eye.x - reach, eye.z - reach),
             bucket(eye.x + reach, eye.z + reach),
@@ -757,8 +776,7 @@ impl World {
                         continue;
                     }
                     let d = o.position.distance(eye);
-                    let reach = if o.named { props } else { reach };
-                    if d <= reach {
+                    if d <= self.settings.reach_limit(o) {
                         requests.push((d, Request::Model(o.model)));
                     }
                 }
@@ -1126,7 +1144,6 @@ impl World {
         }
 
         let reach = self.settings.object_distance;
-        let props = self.settings.prop_distance;
         let (b0, b1) = (
             bucket(eye.x - reach, eye.z - reach),
             bucket(eye.x + reach, eye.z + reach),
@@ -1137,14 +1154,14 @@ impl World {
                 for &i in self.objects.get(&(bx, bz)).map_or(&[][..], Vec::as_slice) {
                     let o = &self.index.objects[i];
                     let d = o.position.distance(eye);
-                    if d > if o.named { props } else { reach }
+                    if d > self.settings.reach_limit(o)
                         || self.knocked.contains_key(&i)
                         || self.hidden.contains(&o.model)
                     {
                         continue;
                     }
                     if let Some(Slot::Ready(m)) = self.models.get(&o.model)
-                        && (!o.named || d <= draw_reach(m.bounds, props))
+                        && d <= self.settings.reach(o, m.bounds)
                         && {
                             // Out of view: not drawn.
                             let (lo, hi) = m.bounds;
@@ -1199,7 +1216,7 @@ impl World {
             if places.len() != pieces.len()
                 || places
                     .iter()
-                    .all(|p| p.w_axis.truncate().distance(eye) > props)
+                    .all(|p| p.w_axis.truncate().distance(eye) > self.settings.prop_distance)
             {
                 continue;
             }
@@ -1252,8 +1269,12 @@ impl World {
             .and_then(|v| v.parse().ok());
         let radius: f32 = near_env.unwrap_or(300.0);
         let names = &self.index.names;
-        let stem = |e: u32| {
-            names.get(&e).map_or("?".to_owned(), |(n, _, _)| {
+        // A tree by its model, an entity by its name.
+        let stem = |o: &ObjectPlacement| {
+            if o.entity & world::TREE_ENTITIES == world::TREE_ENTITIES {
+                return format!("tree {:08x}", o.model);
+            }
+            names.get(&o.entity).map_or("?".to_owned(), |(n, _, _)| {
                 crate::world::member_stem(n).to_lowercase()
             })
         };
@@ -1266,29 +1287,56 @@ impl World {
                 continue;
             }
             if let Some(Slot::Ready(m)) = self.models.get(&o.model) {
-                shapes.insert(stem(o.entity), (o.model, m.bounds));
+                shapes.insert(stem(o), (o.model, m.bounds));
             }
-            let e = placed
-                .entry(stem(o.entity))
-                .or_insert((0, 0, 0, 0, f32::MAX, 0.0));
+            let e = placed.entry(stem(o)).or_insert((0, 0, 0, 0, f32::MAX, 0.0));
             e.0 += 1;
             e.4 = e.4.min(d);
             match self.models.get(&o.model) {
                 Some(Slot::Ready(m)) => {
                     e.1 += 1;
                     e.5 = (m.bounds.1 - m.bounds.0).length();
-                    let reach = if o.named {
-                        draw_reach(m.bounds, self.settings.prop_distance)
-                    } else {
-                        self.settings.object_distance
-                    };
-                    if d <= reach {
+                    if d <= self.settings.reach(o, m.bounds) {
                         e.3 += 1;
                     }
                 }
                 Some(Slot::Failed) => e.2 += 1,
                 _ => {}
             }
+        }
+        // The trees' heights over the terrain cells under them (only cells
+        // loaded with collision answer).
+        let mut rise: Vec<f32> = self
+            .index
+            .objects
+            .iter()
+            .filter(|o| {
+                o.entity & world::TREE_ENTITIES == world::TREE_ENTITIES
+                    && o.position.distance(eye) <= radius
+            })
+            .filter_map(|o| {
+                let from = o.position + Vec3::Y * 100.0;
+                let cell = |k| !matches!(k, crate::physics::StaticKey::Cell(_));
+                let (t, _) = self
+                    .physics
+                    .cast_ray_skipping(from, Vec3::NEG_Y, 300.0, cell)?;
+                Some(o.position.y - (from.y - t))
+            })
+            .collect();
+        rise.sort_by(f32::total_cmp);
+        if !rise.is_empty() {
+            let n = rise.len();
+            let mut abs: Vec<f32> = rise.iter().map(|r| r.abs()).collect();
+            abs.sort_by(f32::total_cmp);
+            eprintln!(
+                "foliage trees over the ground: {n} measured, |rise| median {:.1} p90 {:.1} m; above 1 m {}, below -1 m {}; lowest {:.1}, highest {:.1}",
+                abs[n / 2],
+                abs[n * 9 / 10],
+                rise.iter().filter(|&&r| r > 1.0).count(),
+                rise.iter().filter(|&&r| r < -1.0).count(),
+                rise[0],
+                rise[n - 1]
+            );
         }
         let mut placed: Vec<_> = placed.into_iter().collect();
         placed.sort_by_key(|p| std::cmp::Reverse(p.1.0));
@@ -1338,14 +1386,9 @@ impl World {
     fn member_drawn(&self, i: usize, eye: Vec3) -> bool {
         let o = &self.index.objects[i];
         let d = o.position.distance(eye);
-        let props = self.settings.prop_distance;
         match self.models.get(&o.model) {
             Some(Slot::Ready(m)) if m.tiny_members.is_empty() => {
-                if o.named {
-                    d <= draw_reach(m.bounds, props)
-                } else {
-                    d <= self.settings.object_distance
-                }
+                d <= self.settings.reach(o, m.bounds)
             }
             _ => false,
         }
