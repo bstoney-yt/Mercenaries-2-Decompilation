@@ -874,13 +874,33 @@ fn pda_probe(lua: &Lua) -> String {
             end
         end
         local pda = rawget(_G, "MrxGuiPda")
-        if type(pda) == "table" then
-            scalars("", pda)
-            for k, v in pairs(pda) do
-                if type(v) == "table" and k ~= "__index" then scalars(tostring(k) .. ".", v) end
-            end
-        else
+        if type(pda) ~= "table" then
             out[#out + 1] = "no MrxGuiPda"
+        elseif not rawget(pda, "__m2_wrapped") then
+            -- Open and Close are looked up on the PDA widget's class when
+            -- called (self:Close()): wrapped, they print the widget's
+            -- CustomData, where Open's checks live.
+            rawset(pda, "__m2_wrapped", true)
+            for _, name in ipairs({"Open", "Close"}) do
+                local f = rawget(pda, name)
+                if type(f) == "function" then
+                    rawset(pda, name, function(self, ...)
+                        local d = {}
+                        local cd = type(self) == "table" and self.CustomData
+                        if type(cd) == "table" then
+                            for k, v in pairs(cd) do
+                                local ty = type(v)
+                                if ty == "boolean" or ty == "number" then
+                                    d[#d + 1] = tostring(k) .. "=" .. tostring(v)
+                                end
+                            end
+                            table.sort(d)
+                        end
+                        print("PDA " .. name .. ": " .. table.concat(d, " "))
+                        return f(self, ...)
+                    end)
+                end
+            end
         end
         local st = rawget(_G, "MrxState")
         if type(st) == "table" and type(st.IsLocked) == "function" then
