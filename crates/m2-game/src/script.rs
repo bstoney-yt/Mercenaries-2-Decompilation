@@ -266,8 +266,13 @@ impl ScriptHost {
                     };
                     let name = format!("{library}.{}", k.to_string_lossy());
                     let log = Rc::clone(&log);
-                    let f = safe_function(lua, move |_, _| {
-                        log.borrow_mut().push(name.clone());
+                    let f = safe_function(lua, move |_, args| {
+                        let mut shown = name.clone();
+                        if STUB_ARGS.with(|on| *on) {
+                            let args: Vec<String> = args.iter().map(show_arg).collect();
+                            shown = format!("{shown}({})", args.join(", "));
+                        }
+                        log.borrow_mut().push(shown);
                         Ok(MultiValue::new())
                     })?;
                     t.raw_set(k.clone(), &f)?;
