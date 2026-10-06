@@ -21,6 +21,7 @@ use m2_assets::model::MODEL_TYPE;
 use m2_assets::model::Material;
 use m2_assets::path::PATH_TYPE;
 use m2_assets::terrain::{CELL_SIZE, TerrainGroup, TerrainMaterial, colour_map_uv};
+use m2_assets::tree::{TREE_TYPE, TreeTable};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{BlockContents, Layer, LowResTile, Path, TerrainCell, name_hash};
 use m2_math::glam::{Quat, Vec3};
@@ -142,7 +143,15 @@ pub struct ObjectPlacement {
     /// the island's rocks, plants, fences and sandbags, kept within
     /// [`WorldSettings::prop_distance`](crate::WorldSettings::prop_distance).
     pub named: bool,
+    /// Drawn within this many metres, whatever its size: a tree, within
+    /// its species' fade distance from the tree table.
+    pub fade: Option<f32>,
 }
+
+/// Entity ids of the trees: [`TREE_ENTITIES`] | species << 16 | tree. The
+/// layers' entity ids stay below `0x2000_0000` (the highest is `0x10001f5b`),
+/// so these never meet them.
+pub const TREE_ENTITIES: u32 = 0xf000_0000;
 
 /// An entity of the static layers whose name is a vehicle template
 /// (`M151 Softtop (VZ)`, `HMMWV (Softtop)`, `Small Fishing Boat`), or a
@@ -698,6 +707,7 @@ impl WorldIndex {
                 );
             }
         }
+        world.add_trees(source, &assets.templates);
         world.template_db = assets.templates;
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
         for spawn in &mut world.spawns {
@@ -720,6 +730,63 @@ impl WorldIndex {
             spawn.route = points.iter().map(|&p| at + q * p).collect();
         }
         Ok(world)
+    }
+
+    /// The island's trees, which no layer places: the tree table
+    /// ([`m2_assets::tree`]) gives each species' template and the decoded
+    /// position of each of its trees. Each tree stands as its template's
+    /// `ModelName`, drawn within its species' fade distance. Inferred, not
+    /// decoded: that the model stands upright at the position (no rotation)
+    /// and at its own size; each tree's 4-bit tail (a yaw or a scale step,
+    /// perhaps) and the species' scale range are not applied yet.
+    fn add_trees<R: Read + Seek>(&mut self, source: &mut AssetSource<R>, templates: &Templates) {
+        let index = source.archive().index();
+        let Some(hash) = index
+            .assets()
+            .iter()
+            .find(|a| index.type_hash(a) == TREE_TYPE)
+            .map(|a| a.name_hash)
+        else {
+            return;
+        };
+        let table = match source.asset(hash, TREE_TYPE).map(|d| TreeTable::parse(&d)) {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return eprintln!("trees {hash:08x}: {e}"),
+            Err(e) => return eprintln!("trees {hash:08x}: {e}"),
+        };
+        let first = self.objects.len();
+        let highest = self
+            .members
+            .keys()
+            .chain(self.objects.iter().map(|o| &o.entity))
+            .max()
+            .copied();
+        let mut no_model: Vec<(u32, usize)> = Vec::new();
+        for (species, s) in table.species.iter().enumerate() {
+            let model = templates.by_id(s.template).and_then(|(_, t)| t.model);
+            let Some(model) = model.filter(|_| species < 1 << 12 && s.trees.len() <= 1 << 16)
+            else {
+                no_model.push((s.template, s.trees.len()));
+                continue;
+            };
+            self.objects
+                .extend(s.trees.iter().enumerate().map(|(i, t)| ObjectPlacement {
+                    entity: TREE_ENTITIES | (species as u32) << 16 | i as u32,
+                    model,
+                    position: Vec3::from(t.position),
+                    rotation: Quat::IDENTITY,
+                    named: true,
+                    fade: Some(s.fade),
+                }));
+        }
+        eprintln!(
+            "trees: {} of {} species placed, {} trees (layer entity ids up to {:#x}); left out for want of a model (template, trees): {:08x?}",
+            table.species.len() - no_model.len(),
+            table.species.len(),
+            self.objects.len() - first,
+            highest.unwrap_or(0),
+            no_model
+        );
     }
 
     /// The motions of a layer's entities whose template moves on its own,
@@ -849,6 +916,7 @@ impl WorldIndex {
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),
                         named: false,
+                        fade: None,
                     });
                 }
             }
@@ -914,6 +982,7 @@ impl WorldIndex {
                             position,
                             rotation,
                             named: true,
+                            fade: None,
                         })
                     }
                     // A vehicle template that drives: the alpha places it.
@@ -947,6 +1016,7 @@ impl WorldIndex {
                         position,
                         rotation,
                         named: true,
+                        fade: None,
                     }),
                     // A name no asset or template defines: the words may
                     // (not the designers' test entities).
@@ -1019,6 +1089,7 @@ impl WorldIndex {
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),
                         named: !models.contains_key(&entity),
+                        fade: None,
                     },
                 );
             }
