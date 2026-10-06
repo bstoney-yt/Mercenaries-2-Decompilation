@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
-use m2_assets::layer::LAYER_TYPE;
+use m2_assets::layer::{Component, LAYER_TYPE, TEMPLATE_DB_TYPE};
 use m2_assets::lua::{Chunk, SCRIPT_TYPE};
 use m2_assets::region::REGION_TYPE;
 use m2_assets::strings::STRINGS_TYPE;
@@ -78,6 +78,8 @@ pub struct Entity {
     pub yaw: f32,
     /// The outline of a region entity (`LineRegion`).
     pub region: Option<Region>,
+    /// Its labels' name hashes: its template's and its own (`Label`).
+    pub labels: Vec<u32>,
 }
 
 /// What a mission session needs from the archives.
@@ -90,6 +92,33 @@ pub struct GameData {
     pub shapes: usize,
     /// The game's English text by id, for the HUD's texts.
     pub strings: StringTable,
+    /// Templates' labels (name hashes) by the template's name in lower
+    /// case, for objects the scripts spawn.
+    pub template_labels: HashMap<String, Vec<u32>>,
+}
+
+/// `Label`'s field: the label's name hash.
+const LABEL_FIELD: u32 = 0xfd08_4cce;
+
+/// Every `Label` record's name hash, by entity (or template).
+fn labels_of(c: Option<&Component<'_>>) -> HashMap<u32, Vec<u32>> {
+    let mut out: HashMap<u32, Vec<u32>> = HashMap::new();
+    let Some(c) = c else {
+        return out;
+    };
+    let at = c
+        .fields
+        .iter()
+        .find(|f| f.name_hash == LABEL_FIELD)
+        .map_or(0, |f| usize::from(f.offset));
+    for (id, r) in c.records().unwrap_or_default() {
+        if let Some(b) = r.get(at..at + 4) {
+            out.entry(id)
+                .or_default()
+                .push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+    }
+    out
 }
 
 /// The string table the HUD's texts come from.
@@ -110,6 +139,9 @@ impl GameData {
         let mut shapes: HashMap<u32, Region> = HashMap::new();
         // Entities with the shape hash their LineRegion names.
         let mut regions: Vec<(String, usize, u32)> = Vec::new();
+        // Entities' templates, to give them their templates' labels.
+        let mut templated: Vec<(String, usize, u32)> = Vec::new();
+        let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
         let language = name_hash(LANGUAGE);
         for (block, path) in paths.iter().enumerate() {
             let decoded = wad.read_block(block)?;
@@ -129,6 +161,16 @@ impl GameData {
                     if let Ok(t) = StringTable::parse(asset) {
                         data.strings = t;
                     }
+                } else if entry.type_hash == TEMPLATE_DB_TYPE
+                    && let Ok(db) = Layer::parse(asset)
+                {
+                    template_labels = labels_of(db.component("Label"));
+                    for (id, name) in db.names() {
+                        if let Some(l) = template_labels.get(&id) {
+                            data.template_labels
+                                .insert(name.to_ascii_lowercase(), l.clone());
+                        }
+                    }
                 } else if entry.type_hash == LAYER_TYPE
                     && let Ok(layer) = Layer::parse(asset)
                 {
@@ -136,10 +178,14 @@ impl GameData {
                     let list = data.layers.entry(name.clone()).or_default();
                     let lines = layer.hashes("LineRegion");
                     let placements = layer.placements();
+                    let mut own = labels_of(layer.component("Label"));
                     for (guid, entity) in layer.names() {
                         let p = placements.get(&guid);
                         if let Some(&h) = lines.get(&guid) {
                             regions.push((name.clone(), list.len(), h));
+                        }
+                        if let Some(p) = p {
+                            templated.push((name.clone(), list.len(), p.parent));
                         }
                         list.push(Entity {
                             guid,
@@ -147,9 +193,16 @@ impl GameData {
                             at: p.map_or([0.0; 3], |p| p.position),
                             yaw: p.map_or(0.0, |p| yaw(p.rotation)),
                             region: None,
+                            labels: own.remove(&guid).unwrap_or_default(),
                         });
                     }
                 }
+            }
+        }
+        for (layer, i, template) in templated {
+            if let Some(l) = template_labels.get(&template) {
+                let e = &mut data.layers.get_mut(&layer).expect("indexed above")[i];
+                e.labels.extend(l.iter().copied());
             }
         }
         for (layer, i, hash) in regions {
@@ -228,6 +281,7 @@ impl Mission {
             layers,
             shapes,
             strings,
+            template_labels,
         } = data;
         let regions = layers
             .values()
@@ -244,6 +298,7 @@ impl Mission {
         {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
+            w.template_labels = template_labels;
             w.landing_zones.insert(1, one);
             w.landing_zones.insert(2, two);
             let mut player = Object::new(hero, at);
@@ -794,6 +849,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
         if load {
             let mut o = Object::new(&e.name, e.at);
             o.yaw = e.yaw;
+            o.label_hashes.clone_from(&e.labels);
             w.insert(e.guid, o);
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());

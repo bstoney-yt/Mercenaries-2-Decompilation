@@ -60,8 +60,9 @@ pub trait World {
     fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
         None
     }
-    /// An object's labels (`"Boat"`, `"Tank"`), for class expressions.
-    fn labels(&self, _guid: u32) -> Vec<String> {
+    /// An object's labels (`"Boat"`, `"Tank"`) as name hashes, for class
+    /// expressions.
+    fn labels(&self, _guid: u32) -> Vec<u32> {
         Vec::new()
     }
     /// An object's health, if the world tracks it.
@@ -461,8 +462,8 @@ fn guid(t: &Table, i: i64) -> Option<u32> {
 
 /// Whether an object with `labels` is of class `expr`: labels joined by
 /// `&&`, each maybe negated with `!` (`"Tank && !APC"`), in any case.
-fn class_matches(expr: &str, labels: &[String]) -> bool {
-    let has = |l: &str| labels.iter().any(|x| x.eq_ignore_ascii_case(l));
+fn class_matches(expr: &str, labels: &[u32]) -> bool {
+    let has = |l: &str| labels.contains(&m2_assets::name_hash(l));
     expr.split("&&").all(|term| {
         let term = term.trim();
         match term.strip_prefix('!') {
