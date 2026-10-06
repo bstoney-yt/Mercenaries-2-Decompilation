@@ -682,6 +682,9 @@ fn category(v: Option<&Value>) -> Option<String> {
     }
 }
 
+/// [`Object.GetHibernationDistance`]'s answer, metres.
+const HIBERNATION_DISTANCE: f64 = 155.0;
+
 fn num(v: Option<&Value>) -> Option<f32> {
     match v? {
         Value::Integer(i) => Some(*i as f32),
@@ -892,6 +895,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // designator the game reports thrown has left them.
     add(&object, "IsAttached", |_, _, _| {
         values([Value::Boolean(false)])
+    })?;
+    // How far off an object goes to sleep (metres). The deliveries place
+    // a helicopter's cargo by it, with 155 as their own fallback: that,
+    // until the templates' hibernation data is read.
+    add(&object, "GetHibernationDistance", |_, _, _| {
+        values([Value::Number(HIBERNATION_DISTANCE)])
     })?;
     add(&object, "SetYaw", |w, _, a| {
         if let (Some(guid), Some(yaw)) = (id(a.first()), num(a.get(1))) {
