@@ -95,6 +95,10 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Weapon templates' `MaxAmmoReserve` and which are thrown, by name in
+    /// lower case ([`crate::inventory::read`]).
+    pub max_reserve: HashMap<String, u32>,
+    pub thrown: std::collections::HashSet<String>,
 }
 
 /// `Label`'s field: the label's name hash.
@@ -165,6 +169,7 @@ impl GameData {
                     && let Ok(db) = Layer::parse(asset)
                 {
                     template_labels = labels_of(db.component("Label"));
+                    (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     for (id, name) in db.names() {
                         if let Some(l) = template_labels.get(&id) {
                             data.template_labels
@@ -282,6 +287,8 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            max_reserve,
+            thrown,
         } = data;
         let regions = layers
             .values()
@@ -299,6 +306,8 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.inventory.max_reserve = max_reserve;
+            w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
                 w.entities.insert(e.guid, e.at);
                 w.entity_names
@@ -671,6 +680,16 @@ impl Mission {
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
             o.alive = false;
             o.health = 0.0;
+        }
+    }
+
+    /// The game spent or picked up ammunition: the player's weapon of
+    /// template `weapon` now has `rounds` in reserve, as scripts read it
+    /// (`Weapon.GetReserveAmmo`).
+    pub fn set_player_reserve(&mut self, weapon: &str, rounds: u32) {
+        let mut w = self.world.borrow_mut();
+        if let Some(who) = w.player {
+            w.set_reserve(who, weapon, rounds);
         }
     }
 

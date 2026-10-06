@@ -40,7 +40,7 @@ use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
-use crate::combat::Weapon;
+use crate::combat::{self, Weapon};
 use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
@@ -56,6 +56,8 @@ pub type ScriptLine = (u32, String, Option<Vec3>);
 /// Who the scripts take the player for: Jennifer, whose model and voice
 /// the alpha plays (the scripts pick her replies on the radio by this).
 pub const HERO: &str = "Jennifer";
+/// The grenades' weapon template.
+const GRENADE: &str = "Grenade";
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -162,8 +164,8 @@ pub struct MissionLink {
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
     /// whether each is to stop instead.
     sounds: Vec<(String, bool)>,
-    /// World sound fades the scripts asked for: level, seconds.
-    fades: Vec<(f32, f32)>,
+    /// Sound category fades and pitches the scripts asked for.
+    fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
     music: Option<Option<String>>,
 }
@@ -484,6 +486,7 @@ impl MissionLink {
                 mission.player_died();
             }
             mission.set_health(PLAYER, game.combat.hp);
+            mission.set_player_reserve(GRENADE, game.combat.grenades);
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -499,9 +502,30 @@ impl MissionLink {
                     Command::Hush(id) => self.hushed.push(*id),
                     Command::CueSound { at: None, cue } => self.sounds.push((cue.clone(), false)),
                     Command::StopSound { at: None, cue } => self.sounds.push((cue.clone(), true)),
-                    Command::FadeWorldSound { level, seconds } => {
-                        self.fades.push((*level, *seconds))
-                    }
+                    Command::FadeSound {
+                        category,
+                        level,
+                        seconds,
+                    } => match m2_engine::Category::named(category) {
+                        Some(category) => self.fades.push(crate::sound::CategoryChange::Fade {
+                            category,
+                            level: *level,
+                            seconds: *seconds,
+                        }),
+                        None => eprintln!("mission: no sounds of category {category} to fade"),
+                    },
+                    Command::PitchSound {
+                        category,
+                        pitch,
+                        seconds,
+                    } => match m2_engine::Category::named(category) {
+                        Some(category) => self.fades.push(crate::sound::CategoryChange::Pitch {
+                            category,
+                            pitch: *pitch,
+                            seconds: *seconds,
+                        }),
+                        None => eprintln!("mission: no sounds of category {category} to pitch"),
+                    },
                     Command::InputEnabled(on) => {
                         eprintln!("mission: controls {}", if *on { "on" } else { "off" });
                         game.input_locked = !on;
@@ -520,6 +544,25 @@ impl MissionLink {
                     Command::Music(cue) => self.music = Some(cue.clone()),
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
+                    }
+                    // Her weapons, as the contract's scripts hand them out:
+                    // fresh ones come with nothing in reserve.
+                    Command::Loadout { who, weapons } if *who == PLAYER => {
+                        eprintln!("mission: her loadout is now {weapons:?}");
+                        game.combat.carbine_only();
+                    }
+                    Command::Reserve {
+                        who,
+                        weapon,
+                        rounds,
+                    } if *who == PLAYER => {
+                        eprintln!("mission: scripts give her {weapon} {rounds} in reserve");
+                        if weapon.eq_ignore_ascii_case(GRENADE) {
+                            game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
+                        }
+                    }
+                    Command::DropWeapon { who, weapon } => {
+                        eprintln!("mission: {who:#x} lets go of their {weapon}");
                     }
                     _ => {}
                 }
@@ -561,10 +604,6 @@ impl MissionLink {
                     }
                 }
                 mission.start();
-                // She lands with the carbine alone (the footage: nothing on
-                // her back, only "Carbine" in the weapon box) until the
-                // supply crate's grenade launcher.
-                game.combat.carbine_only();
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
                     if obey(game, &mission, &mut self.vehicles, &c) {
@@ -593,9 +632,9 @@ impl MissionLink {
         )
     }
 
-    /// World sound fades (level, seconds) the scripts asked for since the
+    /// Sound category fades and pitches the scripts asked for since the
     /// last call.
-    pub fn take_fades(&mut self) -> Vec<(f32, f32)> {
+    pub fn take_fades(&mut self) -> Vec<crate::sound::CategoryChange> {
         std::mem::take(&mut self.fades)
     }
 

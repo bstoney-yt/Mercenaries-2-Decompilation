@@ -195,11 +195,21 @@ pub enum Command {
         at: Option<u32>,
         cue: String,
     },
-    /// Fade every sound but the interface's to `level` over `seconds`
-    /// (`Sound.FadeCategoryDown`/`Up` on `non_ui`: the world ducks under a
-    /// radio conversation).
-    FadeWorldSound {
+    /// Fade sound category `category` (`non_ui`, `chatter`, `music`,
+    /// `vo`) to `level` over `seconds` (`Sound.FadeCategoryDown`/`Up`:
+    /// the world ducks under a radio conversation, and more in the
+    /// survival rescue).
+    FadeSound {
+        category: String,
         level: f32,
+        seconds: f32,
+    },
+    /// Play sound category `category` at `pitch` times its own, gliding
+    /// over `seconds` (`Sound.PitchCategoryActivate`/`Deactivate`: the
+    /// survival rescue slows the world).
+    PitchSound {
+        category: String,
+        pitch: f32,
         seconds: f32,
     },
     /// The player can't be killed while on (`Player.SetHealthClamp`): her
@@ -209,6 +219,26 @@ pub enum Command {
     /// state system turns them off on entering a loading fade and back on
     /// once the screen has faded in.
     InputEnabled(bool),
+    /// `who` now carries weapons of these templates, in order, each with
+    /// nothing in reserve (`Human.Inventory.SetAllWeapons`: VzaCon001
+    /// hands her a carbine, grenades and C4).
+    Loadout {
+        who: u32,
+        weapons: Vec<String>,
+    },
+    /// A script set the reserve of `who`'s weapon of template `weapon`
+    /// (`Weapon.SetReserveAmmo`).
+    Reserve {
+        who: u32,
+        weapon: String,
+        rounds: u32,
+    },
+    /// `who` let go of their weapon of template `weapon`
+    /// (`Human.Inventory.DropWeapon`: Carmona, seated, is disarmed).
+    DropWeapon {
+        who: u32,
+        weapon: String,
+    },
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -266,6 +296,8 @@ pub struct ScriptWorld {
     /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
     pub health_clamp: bool,
     pub survival_mode: bool,
+    /// The weapons people carry.
+    pub inventory: crate::inventory::Inventory,
 }
 
 impl ScriptWorld {
@@ -279,7 +311,9 @@ impl ScriptWorld {
     pub fn by_name(&self, name: &str) -> Option<u32> {
         self.objects
             .iter()
-            .filter(|(_, o)| o.name.eq_ignore_ascii_case(name))
+            .filter(|(g, o)| {
+                o.name.eq_ignore_ascii_case(name) && !self.inventory.carried.contains_key(g)
+            })
             .map(|(&g, _)| g)
             .min()
     }
@@ -362,6 +396,74 @@ impl ScriptWorld {
             o.position[1] + up,
             o.position[2] + c * distance,
         ])
+    }
+
+    /// Gives `who` a weapon of each of `templates` (guids) in place of
+    /// what they carried, each with nothing in reserve.
+    fn arm(&mut self, who: u32, templates: &[u32]) {
+        for w in self.inventory.weapons.remove(&who).unwrap_or_default() {
+            self.inventory.carried.remove(&w);
+            self.objects.remove(&w);
+        }
+        let at = self.objects.get(&who).map_or([0.0; 3], |o| o.position);
+        let (mut list, mut names) = (Vec::new(), Vec::new());
+        for &template in templates {
+            let Some(name) = self.objects.get(&template).map(|o| o.name.clone()) else {
+                continue;
+            };
+            let guid = self.spawn_guid();
+            let mut o = Object::new(&name, at);
+            if let Some(l) = self.template_labels.get(&name.to_ascii_lowercase()) {
+                o.label_hashes.clone_from(l);
+            }
+            self.insert(guid, o);
+            self.inventory.carried.insert(
+                guid,
+                crate::inventory::Carried {
+                    owner: who,
+                    template,
+                    reserve: 0,
+                },
+            );
+            list.push(guid);
+            names.push(name);
+        }
+        self.inventory.weapons.insert(who, list);
+        self.commands.push(Command::Loadout {
+            who,
+            weapons: names,
+        });
+    }
+
+    /// The name of weapon `weapon`'s template.
+    fn weapon_name(&self, weapon: u32) -> Option<String> {
+        let c = self.inventory.carried.get(&weapon)?;
+        self.objects.get(&c.template).map(|o| o.name.clone())
+    }
+
+    /// `who`'s first (or second) weapon that isn't thrown.
+    fn held(&self, who: u32, nth: usize) -> Option<u32> {
+        self.inventory
+            .of(who)
+            .iter()
+            .copied()
+            .filter(|&w| {
+                self.weapon_name(w)
+                    .is_some_and(|n| !self.inventory.thrown.contains(&n.to_ascii_lowercase()))
+            })
+            .nth(nth)
+    }
+
+    /// Sets `who`'s weapon of template `name` to `rounds` in reserve, as
+    /// the game spends or picks up its ammunition.
+    pub fn set_reserve(&mut self, who: u32, name: &str, rounds: u32) {
+        let found = self.inventory.of(who).iter().copied().find(|&w| {
+            self.weapon_name(w)
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        });
+        if let Some(c) = found.and_then(|w| self.inventory.carried.get_mut(&w)) {
+            c.reserve = rounds;
+        }
     }
 
     fn spawn_guid(&mut self) -> u32 {
@@ -504,10 +606,12 @@ fn id(v: Option<&Value>) -> Option<u32> {
     crate::events::as_guid(v?)
 }
 
-/// Whether a sound category argument names `non_ui`, everything but the
-/// interface.
-fn is_non_ui(v: Option<&Value>) -> bool {
-    matches!(v, Some(Value::String(s)) if s.to_string_lossy().eq_ignore_ascii_case("non_ui"))
+/// A sound category argument (`non_ui`), as named.
+fn category(v: Option<&Value>) -> Option<String> {
+    match v? {
+        Value::String(s) => Some(s.to_string_lossy()),
+        _ => None,
+    }
 }
 
 fn num(v: Option<&Value>) -> Option<f32> {
@@ -769,7 +873,113 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "Remove", |w, _, a| {
         if let Some(guid) = id(a.first()) {
             w.objects.remove(&guid);
+            w.inventory.drop(guid);
             w.commands.push(Command::Remove(guid));
+        }
+        values([])
+    })?;
+    // What an object is a copy of: a weapon's template (saves keep it and
+    // hand it back to `SetAllWeapons`), a spawned object's.
+    add(&object, "GetParent", |w, _, a| {
+        let Some(g) = id(a.first()) else {
+            return values([Value::Nil]);
+        };
+        if let Some(c) = w.inventory.carried.get(&g) {
+            return values([guid_value(Some(c.template))]);
+        }
+        let name = match w.objects.get(&g) {
+            Some(o) if is_template(&o.name) && !w.templates.values().any(|&t| t == g) => {
+                o.name.clone()
+            }
+            _ => return values([Value::Nil]),
+        };
+        values([guid_value(Some(w.template(&name)))])
+    })?;
+
+    // Weapons as objects: a loadout of templates, each weapon with its own
+    // reserve of ammunition.
+    let human = lib("Human")?;
+    let inventory = match human.raw_get::<Value>("Inventory")? {
+        Value::Table(t) => t,
+        _ => {
+            let t = lua.create_table()?;
+            human.raw_set("Inventory", &t)?;
+            t
+        }
+    };
+    add(&inventory, "GetAllWeapons", |w, lua, a| {
+        let list = id(a.first()).map_or(&[][..], |who| w.inventory.of(who));
+        let t = lua.create_sequence_from(list.iter().map(|&g| crate::events::guid_value(g)))?;
+        values([Value::Table(t)])
+    })?;
+    add(&inventory, "GetPrimaryWeapon", |w, _, a| {
+        values([guid_value(id(a.first()).and_then(|who| w.held(who, 0)))])
+    })?;
+    add(&inventory, "GetSecondaryWeapon", |w, _, a| {
+        values([guid_value(id(a.first()).and_then(|who| w.held(who, 1)))])
+    })?;
+    add(&inventory, "SetAllWeapons", |w, _, a| {
+        let (Some(who), Some(Value::Table(list))) = (id(a.first()), a.get(1)) else {
+            return values([]);
+        };
+        let mut templates = Vec::new();
+        for v in list.clone().sequence_values::<Value>() {
+            match v? {
+                Value::String(s) => templates.push(w.template(&s.to_string_lossy())),
+                v => templates.extend(id(Some(&v))),
+            }
+        }
+        w.arm(who, &templates);
+        values([])
+    })?;
+    // (character, weapon): the weapon leaves whoever carries it.
+    add(&inventory, "DropWeapon", |w, _, a| {
+        let Some(weapon) = id(a.get(1)) else {
+            return values([]);
+        };
+        let name = w.weapon_name(weapon);
+        if let (Some(c), Some(weapon)) = (w.inventory.drop(weapon), name) {
+            w.commands.push(Command::DropWeapon {
+                who: c.owner,
+                weapon,
+            });
+        }
+        values([])
+    })?;
+    // Clips are the game's (`ReloadAll`), and so is which is in hand.
+    for name in ["ReloadAll", "EquipWeapon"] {
+        add(&inventory, name, |_, _, _| values([]))?;
+    }
+    let weapon = lib("Weapon")?;
+    add(&weapon, "GetMaxReserveAmmo", |w, _, a| {
+        let max = id(a.first()).and_then(|g| w.weapon_name(g)).and_then(|n| {
+            w.inventory
+                .max_reserve
+                .get(&n.to_ascii_lowercase())
+                .copied()
+        });
+        values([max.map_or(Value::Nil, |m| Value::Integer(i64::from(m)))])
+    })?;
+    add(&weapon, "GetReserveAmmo", |w, _, a| {
+        let n = id(a.first())
+            .and_then(|g| w.inventory.carried.get(&g))
+            .map(|c| c.reserve);
+        values([n.map_or(Value::Nil, |n| Value::Integer(i64::from(n)))])
+    })?;
+    add(&weapon, "SetReserveAmmo", |w, _, a| {
+        let (Some(g), Some(rounds)) = (id(a.first()), num(a.get(1))) else {
+            return values([]);
+        };
+        let rounds = rounds.max(0.0) as u32;
+        let name = w.weapon_name(g);
+        if let (Some(c), Some(weapon)) = (w.inventory.carried.get_mut(&g), name) {
+            c.reserve = rounds;
+            let who = c.owner;
+            w.commands.push(Command::Reserve {
+                who,
+                weapon,
+                rounds,
+            });
         }
         values([])
     })?;
@@ -1204,11 +1414,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
 
-    // The scripts duck the world's sounds under conversations: Down takes
-    // (category, level, seconds), Up (category, seconds) and brings it back.
+    // The scripts' sound sets (`MrxSoundCategories`) duck categories under
+    // conversations and slow them in the survival rescue: Down and
+    // Activate take (category, level or pitch, seconds), Up and Deactivate
+    // (category, seconds) and bring it back.
     add(&sound, "FadeCategoryDown", |w, _, a| {
-        if is_non_ui(a.first()) {
-            w.commands.push(Command::FadeWorldSound {
+        if let Some(category) = category(a.first()) {
+            w.commands.push(Command::FadeSound {
+                category,
                 level: num(a.get(1)).unwrap_or(0.3),
                 seconds: num(a.get(2)).unwrap_or(0.5),
             });
@@ -1216,9 +1429,30 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     add(&sound, "FadeCategoryUp", |w, _, a| {
-        if is_non_ui(a.first()) {
-            w.commands.push(Command::FadeWorldSound {
+        if let Some(category) = category(a.first()) {
+            w.commands.push(Command::FadeSound {
+                category,
                 level: 1.0,
+                seconds: num(a.get(1)).unwrap_or(0.5),
+            });
+        }
+        values([])
+    })?;
+    add(&sound, "PitchCategoryActivate", |w, _, a| {
+        if let Some(category) = category(a.first()) {
+            w.commands.push(Command::PitchSound {
+                category,
+                pitch: num(a.get(1)).unwrap_or(1.0),
+                seconds: num(a.get(2)).unwrap_or(0.5),
+            });
+        }
+        values([])
+    })?;
+    add(&sound, "PitchCategoryDeactivate", |w, _, a| {
+        if let Some(category) = category(a.first()) {
+            w.commands.push(Command::PitchSound {
+                category,
+                pitch: 1.0,
                 seconds: num(a.get(1)).unwrap_or(0.5),
             });
         }
@@ -1658,6 +1892,59 @@ mod tests {
             }]
         );
         assert_eq!(w.printed, ["jeep moved"]);
+    }
+
+    #[test]
+    fn a_loadout_of_templates_becomes_weapons_with_reserves() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            w.inventory.max_reserve.insert("carbine".into(), 9);
+            w.inventory.max_reserve.insert("grenade".into(), 9);
+            w.inventory.thrown.insert("grenade".into());
+            w.template_labels
+                .insert("grenade".into(), vec![m2_assets::name_hash("Grenade")]);
+        }
+        let (primary, grenades, max, same, thrown, count): (String, i64, i64, bool, bool, i64) =
+            host.lua()
+                .load(
+                    r#"
+                    local hero = Player.GetLocalCharacter()
+                    Human.Inventory.SetAllWeapons(hero, {
+                        Pg.GetGuidByName("Carbine"), Pg.GetGuidByName("Grenade") })
+                    local gun = Human.Inventory.GetPrimaryWeapon(hero)
+                    Weapon.SetReserveAmmo(gun, Weapon.GetMaxReserveAmmo(gun))
+                    local all = Human.Inventory.GetAllWeapons(hero)
+                    return Object.GetName(gun), Weapon.GetReserveAmmo(all[2]),
+                        Weapon.GetReserveAmmo(gun),
+                        Object.GetParent(all[1]) == Pg.GetGuidByName("Carbine"),
+                        Object.HasLabel(all[2], "Grenade"), #all
+                    "#,
+                )
+                .eval()
+                .unwrap();
+        assert_eq!(
+            (primary.as_str(), grenades, max, same, thrown, count),
+            ("Carbine", 0, 9, true, true, 2)
+        );
+        let mut w = world.borrow_mut();
+        assert_eq!(
+            w.take_commands(),
+            [
+                Command::Loadout {
+                    who: 1,
+                    weapons: vec!["Carbine".into(), "Grenade".into()]
+                },
+                Command::Reserve {
+                    who: 1,
+                    weapon: "Carbine".into(),
+                    rounds: 9
+                }
+            ]
+        );
+        w.set_reserve(1, "grenade", 4);
+        let all = w.inventory.of(1).to_vec();
+        assert_eq!(w.inventory.carried[&all[1]].reserve, 4);
     }
 
     #[test]
