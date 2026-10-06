@@ -16,6 +16,7 @@ pub mod anim;
 pub mod assets;
 pub mod audio;
 pub mod model;
+pub mod ordnance;
 pub mod physics;
 pub mod pickup;
 pub mod scatter;

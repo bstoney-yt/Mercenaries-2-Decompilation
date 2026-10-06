@@ -239,6 +239,49 @@ pub enum Command {
         who: u32,
         weapon: String,
     },
+    /// An aircraft of template `what` flies in level from `from` to `to`
+    /// at `speed` m/s (`Airstrike.Flyby`); report it there with
+    /// [`crate::mission::Mission::flyby_arrived`].
+    Flyby {
+        guid: u32,
+        what: String,
+        from: [f32; 3],
+        to: [f32; 3],
+        speed: f32,
+    },
+    /// Ordnance of template `what` (`"Cluster Bomb Projectile"`) sets off
+    /// from `at`, aimed at `target` (an object, else the point) if it
+    /// homes; report it going off with
+    /// [`crate::mission::Mission::ordnance_burst`].
+    Ordnance {
+        guid: u32,
+        what: String,
+        at: [f32; 3],
+        launch: crate::airstrike::Launch,
+        fuse: crate::airstrike::Fuse,
+        target: Option<(Option<u32>, [f32; 3])>,
+        owner: Option<u32>,
+    },
+    /// An effect (`global_particle_airstrike_fuelairbomb`) at `at`,
+    /// facing `direction` (`Airstrike.SpawnDirectedObject`).
+    DirectedEffect {
+        guid: u32,
+        what: String,
+        at: [f32; 3],
+        direction: [f32; 3],
+    },
+    /// `who` takes up a designator (`Airstrike.EquipDesignator`: `kind`
+    /// is its template, `"Smoke Designator"`), as weapon `weapon`; when
+    /// she throws it, tell [`crate::mission::Mission::designator_thrown`].
+    EquipDesignator {
+        who: u32,
+        weapon: u32,
+        kind: String,
+    },
+    /// `who` puts the designator away (`Airstrike.RemoveDesignator`).
+    RemoveDesignator {
+        who: u32,
+    },
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -298,6 +341,8 @@ pub struct ScriptWorld {
     pub survival_mode: bool,
     /// The weapons people carry.
     pub inventory: crate::inventory::Inventory,
+    /// Strikes and designators under way.
+    pub strikes: crate::airstrike::Strikes,
 }
 
 impl ScriptWorld {
@@ -333,7 +378,7 @@ impl ScriptWorld {
 
     /// The template `name` names, made on first use: an object scripts
     /// can copy with `Pg.Spawn`, but not in the world.
-    fn template(&mut self, name: &str) -> u32 {
+    pub(crate) fn template(&mut self, name: &str) -> u32 {
         let key = name.to_ascii_lowercase();
         if let Some(&g) = self.templates.get(&key) {
             return g;
@@ -466,7 +511,7 @@ impl ScriptWorld {
         }
     }
 
-    fn spawn_guid(&mut self) -> u32 {
+    pub(crate) fn spawn_guid(&mut self) -> u32 {
         self.next_spawn += 1;
         FIRST_SPAWNED + self.next_spawn
     }
@@ -702,6 +747,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         )
     };
 
+    crate::airstrike::install(&lib("Airstrike")?, &add)?;
+
     let debug = lib("Debug")?;
     add(&debug, "Printf", |w, _, a| {
         let text: Vec<String> = a
@@ -805,6 +852,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "GetYaw", |w, _, a| {
         let yaw = id(a.first()).and_then(|g| w.objects.get(&g)).map(|o| o.yaw);
         values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y)))])
+    })?;
+    // (holder, object): whether `object` is still in `holder`'s hands. A
+    // designator the game reports thrown has left them.
+    add(&object, "IsAttached", |_, _, _| {
+        values([Value::Boolean(false)])
     })?;
     add(&object, "SetYaw", |w, _, a| {
         if let (Some(guid), Some(yaw)) = (id(a.first()), num(a.get(1))) {
@@ -1096,6 +1148,21 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.boundaries.push(b);
         }
         values([])
+    })?;
+    // A character's camera: the game's one camera looks over the player,
+    // so it is named by her guid, and its yaw is hers (`Camera.GetYaw`:
+    // the carpet bomb's heading).
+    add(&player, "GetCamera", |w, _, a| {
+        let who = id(a.first()).or(w.player);
+        values([guid_value(who)])
+    })?;
+    let camera = lib("Camera")?;
+    add(&camera, "GetYaw", |w, _, a| {
+        let yaw = id(a.first())
+            .or(w.player)
+            .and_then(|g| w.objects.get(&g))
+            .map(|o| o.yaw);
+        values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y)))])
     })?;
     // (player number, on): the hero's survival script turns the clamp on
     // at set-up and off once its one rescue has cooled down.
