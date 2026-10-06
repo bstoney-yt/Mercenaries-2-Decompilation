@@ -3,6 +3,7 @@
 pub mod api;
 pub mod events;
 pub mod hud;
+pub mod inventory;
 pub mod layers;
 pub mod library;
 pub mod mission;

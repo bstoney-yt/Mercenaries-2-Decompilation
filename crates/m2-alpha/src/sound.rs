@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use m2_engine::audio::{EngineSounds, Falloff, Play, SoundLibrary};
-use m2_engine::{Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
+use m2_engine::{Category, Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
 use crate::combat::{Remark, Sound};
 use crate::scene::Cue;
@@ -121,6 +121,21 @@ fn open_device() -> anyhow::Result<(Arc<Mutex<Mixer>>, cpal::Stream)> {
     };
     stream.play()?;
     Ok((mixer, stream))
+}
+
+/// A script's change to a category of sounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CategoryChange {
+    Fade {
+        category: Category,
+        level: f32,
+        seconds: f32,
+    },
+    Pitch {
+        category: Category,
+        pitch: f32,
+        seconds: f32,
+    },
 }
 
 /// Ambience and music.
@@ -864,11 +879,28 @@ impl GameAudio {
         }
     }
 
-    /// Ducks (or restores) everything but the interface and the radio's
-    /// voices, over `seconds` (`Sound.FadeCategoryDown`/`Up`).
-    pub fn fade_world(&mut self, level: f32, seconds: f32) {
-        eprintln!("world sounds fade to {level:.2} over {seconds:.2} s");
-        self.out.with(|m| m.fade_world(level, seconds));
+    /// Fades or pitches a category of sounds as the scripts' sound sets
+    /// ask (the world ducks under conversations and slows in the survival
+    /// rescue).
+    pub fn change_category(&mut self, change: CategoryChange) {
+        match change {
+            CategoryChange::Fade {
+                category,
+                level,
+                seconds,
+            } => {
+                eprintln!("{category:?} sounds fade to {level:.2} over {seconds:.2} s");
+                self.out.with(|m| m.fade(category, level, seconds));
+            }
+            CategoryChange::Pitch {
+                category,
+                pitch,
+                seconds,
+            } => {
+                eprintln!("{category:?} sounds pitch to {pitch:.2} over {seconds:.2} s");
+                self.out.with(|m| m.pitch(category, pitch, seconds));
+            }
+        }
     }
 
     /// Stops interface sound `cue` if it plays (`Sound.StopSound`).
@@ -1318,13 +1350,21 @@ impl GameAudio {
             if line.is_some_and(|l| self.hushed.remove(&l)) {
                 continue;
             }
+            // Scripted lines (the radio's too) are dialogue; the rest,
+            // hers included, are people's barks.
+            let category = if line.is_some() {
+                Category::Vo
+            } else {
+                Category::Chatter
+            };
             let play = match at {
                 Some(at) => Play {
                     falloff,
                     ..Play::at(buffer, at)
                 },
-                None => Play::flat(buffer).ui(),
-            };
+                None => Play::flat(buffer),
+            }
+            .category(category);
             let voice = self.out.with(|m| m.play(play.gain(gain)));
             if let Some(l) = line {
                 self.lines.insert(l, voice);
@@ -1341,7 +1381,9 @@ impl GameAudio {
                     continue;
                 }
                 self.music_wanted = None;
-                let play = Play::flat(buffer).gain(MUSIC_GAIN);
+                let play = Play::flat(buffer)
+                    .gain(MUSIC_GAIN)
+                    .category(Category::Music);
                 let play = if looped { play.looped() } else { play };
                 if let Some(old) = self.music.take() {
                     self.out.with(|m| m.stop(old));

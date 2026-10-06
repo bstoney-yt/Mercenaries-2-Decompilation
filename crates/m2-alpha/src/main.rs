@@ -3408,8 +3408,8 @@ impl Running {
             for id in hushed {
                 self.audio.hush(id);
             }
-            for (level, seconds) in m.take_fades() {
-                self.audio.fade_world(level, seconds);
+            for change in m.take_fades() {
+                self.audio.change_category(change);
             }
             for (cue, stop) in m.take_sounds() {
                 if stop {
