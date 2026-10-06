@@ -24,11 +24,12 @@
 //!   --pad good|bad|none  how the player answers the hijack's prompts
 //!                      (default good: the right button at once; bad:
 //!                      the wrong one; none: never)
-//!   --action-seconds n how long a character's action lasts when the
-//!                      vehicle plays no hijack clip alongside it (default
-//!                      2); with one, the action lasts as long as that
-//!                      clip (read from the hijack blocks; inferred: the
-//!                      people's clips are cut to the vehicle's)
+//!   --action-seconds n how long a character's action lasts when its clip
+//!                      is unknown (default 2). An action lasts as long
+//!                      as the clip the animation tables give the
+//!                      character for it in that vehicle; failing that,
+//!                      as long as the hijack clip the vehicle starts
+//!                      with it
 //!   --flying           the hijacked vehicle is in the air (helicopters
 //!                      are hijacked only in flight)
 //!   --tap-rate n       presses a second when the prompt is to tap or
@@ -48,6 +49,7 @@ use std::io::BufReader;
 use std::process::ExitCode;
 
 use m2_assets::WadArchive;
+use m2_assets::animation_table::{self, ANIMATION_TABLE_TYPE, AnimationTable};
 use m2_game::api::Command;
 use m2_game::hijack::HijackCommand;
 use m2_game::mission::{GameData, Mission};
@@ -174,9 +176,9 @@ fn run(o: &Options) -> Result<()> {
     let mut wad = WadArchive::open(BufReader::new(File::open(&o.wad)?))?;
     let data = GameData::read(&mut wad)?;
     let clips = if o.hijack.is_some() {
-        hijack_clips(&mut wad)?
+        HijackData::read(&mut wad)?
     } else {
-        HashMap::new()
+        HijackData::default()
     };
     let mut mission = Mission::new(data, &o.hero, o.at)?;
     for part in &o.layers {
@@ -249,8 +251,9 @@ fn run(o: &Options) -> Result<()> {
 struct Hijack {
     /// Characters' actions and when they end.
     actions: Vec<(u32, f64)>,
-    /// The hijack blocks' clips' lengths, seconds, by name hash.
-    clips: HashMap<u32, f64>,
+    clips: HijackData,
+    /// The vehicle's `VehicleAnimationSet` class and name.
+    set: Option<(u32, u32)>,
     pad: String,
     action_seconds: f64,
     tap_rate: f64,
@@ -268,7 +271,7 @@ impl Hijack {
         script: u32,
         vehicle: &str,
         crew: &str,
-        clips: HashMap<u32, f64>,
+        clips: HijackData,
         o: &Options,
     ) -> Result<Self> {
         let hero = mission.world().borrow().player.ok_or("no player")?;
@@ -285,6 +288,7 @@ impl Hijack {
                 .eval()?;
             m2_game::events::as_guid(&v).ok_or_else(|| format!("no template {what}").into())
         };
+        let vehicle_name = vehicle;
         let vehicle = spawn(mission, vehicle)?;
         let crewman = spawn(mission, crew)?;
         mission.set_flying(vehicle, o.flying);
@@ -293,10 +297,16 @@ impl Hijack {
         println!(
             "hijack {script:08x}: hero {hero:#x} crewman {crewman:#x} vehicle {vehicle:#x}: started {started}"
         );
-        println!("hijack clips known: {}", clips.len());
+        let set = clips.sets.get(&vehicle_name.to_ascii_lowercase()).copied();
+        println!(
+            "hijack clips known: {}; tables {}; vehicle animation set {set:08x?}",
+            clips.lengths.len(),
+            clips.tables.is_some()
+        );
         let mut h = Self {
             actions: Vec::new(),
             clips,
+            set,
             pad: o.pad.clone(),
             action_seconds: o.action_seconds,
             tap_rate: o.tap_rate,
@@ -362,7 +372,9 @@ impl Hijack {
     }
 
     /// Prints the log and the hijack's commands; ends actions due. An
-    /// action lasts as long as the hijack clip the vehicle starts with it.
+    /// action lasts as long as the character's clip for it (see
+    /// [`HijackData::clip`]), else the hijack clip the vehicle starts with
+    /// it.
     fn follow(&mut self, mission: &mut Mission, now: f64) {
         for line in mission.take_log() {
             println!("{line}");
@@ -374,7 +386,7 @@ impl Hijack {
                 Command::Hijack(HijackCommand::PlayAnimation { clip, channel, .. })
                     if channel == "hijack" =>
                 {
-                    self.clips.get(&m2_assets::name_hash(clip)).copied()
+                    self.clips.lengths.get(&m2_assets::name_hash(clip)).copied()
                 }
                 _ => None,
             })
@@ -382,9 +394,19 @@ impl Hijack {
         for c in commands {
             match c {
                 Command::Hijack(h) => {
-                    if let HijackCommand::State { guid, action, .. } = &h {
+                    if let HijackCommand::State {
+                        guid,
+                        state,
+                        action,
+                    } = &h
+                    {
                         self.actions.retain(|a| a.0 != *guid);
+                        let own = self.set.and_then(|set| self.clips.clip(state, action, set));
+                        if let Some((clip, length)) = own {
+                            println!("t={now:.1} clip {clip:08x} {length:.2?}s for {action}");
+                        }
                         if !action.eq_ignore_ascii_case("Idle") {
+                            let seconds = own.and_then(|o| o.1).unwrap_or(seconds);
                             self.actions.push((*guid, now + seconds));
                         }
                     }
@@ -404,31 +426,80 @@ impl Hijack {
     }
 }
 
-/// The lengths of the clips in the hijack blocks (`hijack_m1a2_...`), by
-/// name hash: the vehicles' parts of each hijack section.
-fn hijack_clips<R: std::io::Read + std::io::Seek>(
-    wad: &mut WadArchive<R>,
-) -> Result<HashMap<u32, f64>> {
-    use m2_assets::BlockContents;
-    use m2_assets::animation::{ANIMATION_TYPE, Clip};
-    let blocks: Vec<usize> = wad
-        .index()
-        .blocks()
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| b.path.to_ascii_lowercase().contains("hijack_"))
-        .map(|(i, _)| i)
-        .collect();
-    let mut out = HashMap::new();
-    for b in blocks {
-        let data = wad.read_block(b)?;
-        for (e, asset) in BlockContents::parse(&data)?.iter() {
-            if e.type_hash == ANIMATION_TYPE
-                && let Ok(clip) = Clip::parse(asset)
-            {
-                out.insert(e.name_hash, f64::from(clip.header.duration));
+/// What the harness times hijack actions by.
+#[derive(Default)]
+struct HijackData {
+    /// Clip lengths, seconds, by name hash: the vehicles' clips in the
+    /// hijack blocks (`hijack_m1a2_...`) and the people's in the vehicle
+    /// animation groups (`vehiclenameanimgroup_m1a2`, ...).
+    lengths: HashMap<u32, f64>,
+    /// The stance/action table and the vehicle handle table.
+    tables: Option<(AnimationTable, AnimationTable)>,
+    /// `VehicleAnimationSet` class and name by template name, lower case.
+    sets: HashMap<String, (u32, u32)>,
+}
+
+impl HijackData {
+    fn read<R: std::io::Read + std::io::Seek>(wad: &mut WadArchive<R>) -> Result<Self> {
+        use m2_assets::animation::{ANIMATION_TYPE, Clip};
+        use m2_assets::layer::TEMPLATE_DB_TYPE;
+        use m2_assets::{BlockContents, Layer};
+        let paths: Vec<String> = wad
+            .index()
+            .blocks()
+            .iter()
+            .map(|b| b.path.to_ascii_lowercase())
+            .collect();
+        let mut out = Self::default();
+        let (mut actions, mut vehicles) = (None, None);
+        for (b, path) in paths.iter().enumerate() {
+            let clips = ["hijack_", "vehiclenameanimgroup_", "vehicleclassanimgroup_"]
+                .iter()
+                .any(|p| path.contains(p));
+            let data = wad.read_block(b)?;
+            let Ok(contents) = BlockContents::parse(&data) else {
+                continue;
+            };
+            for (e, asset) in contents.iter() {
+                if clips
+                    && e.type_hash == ANIMATION_TYPE
+                    && let Ok(clip) = Clip::parse(asset)
+                {
+                    out.lengths
+                        .insert(e.name_hash, f64::from(clip.header.duration));
+                } else if e.type_hash == ANIMATION_TABLE_TYPE {
+                    if e.name_hash == animation_table::ACTIONS {
+                        actions = AnimationTable::parse(asset).ok();
+                    } else if e.name_hash == animation_table::VEHICLE_ANIMATIONS {
+                        vehicles = AnimationTable::parse(asset).ok();
+                    }
+                } else if e.type_hash == TEMPLATE_DB_TYPE
+                    && let Ok(db) = Layer::parse(asset)
+                {
+                    let sets = m2_engine::hijack::animation_sets(&db);
+                    for (id, name) in db.names() {
+                        if let Some(&s) = sets.get(&id) {
+                            out.sets.insert(name.to_ascii_lowercase(), s);
+                        }
+                    }
+                }
             }
         }
+        out.tables = actions.zip(vehicles);
+        Ok(out)
     }
-    Ok(out)
+
+    /// The clip the animation tables give a character in a vehicle of
+    /// this animation set for a state and action, and its length when
+    /// the clip was read.
+    fn clip(
+        &self,
+        state: &str,
+        action: &str,
+        (class, name): (u32, u32),
+    ) -> Option<(u32, Option<f64>)> {
+        let (a, b) = self.tables.as_ref()?;
+        let clip = animation_table::vehicle_clip(a, b, state, action, class, name)?;
+        Some((clip, self.lengths.get(&clip).copied()))
+    }
 }

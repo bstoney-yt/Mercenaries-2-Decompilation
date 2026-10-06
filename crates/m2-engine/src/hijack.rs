@@ -82,6 +82,23 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, Vec<HijackEntrance>> {
     out
 }
 
+/// Every template's `VehicleAnimationSet`: the class and name (`Tank`,
+/// `M1A2`, as name hashes) the animation tables pick a vehicle's
+/// characters' clips by ([`m2_assets::animation_table::vehicle_clip`]).
+pub fn animation_sets(db: &Layer<'_>) -> HashMap<u32, (u32, u32)> {
+    let sets = Table::new(db, "VehicleAnimationSet");
+    let (class, name) = (name_hash("VehicleClass"), name_hash("VehicleName"));
+    let mut out = HashMap::new();
+    for t in sets.templates() {
+        if let Some(r) = sets.of_template(t).first()
+            && let (Some(c), Some(n)) = (sets.word(r, class), sets.word(r, name))
+        {
+            out.insert(t, (c, n));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
