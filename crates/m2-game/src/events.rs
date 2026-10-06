@@ -60,6 +60,10 @@ pub trait World {
     fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
         None
     }
+    /// An object's health, if the world tracks it.
+    fn health(&self, _guid: u32) -> Option<f32> {
+        None
+    }
 }
 
 /// The kinds the scripts use, by how often.
@@ -558,6 +562,24 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             let mut extra = vec![id(cargo)];
             extra.extend(carrier.map(id));
             Check::Holds(holds, extra)
+        }
+        // { object, "<" or ">", health }: while its health is below (or
+        // above) the figure; passes the object. The hero's survival
+        // script watches for drops below her current health this way.
+        "ObjectHealth" => {
+            let Some(figure) = number(&p.params, 3) else {
+                return no;
+            };
+            let above = text(&p.params, 2).as_deref() == Some(">");
+            for o in objects(&p.params, 1, world) {
+                if let Some(h) = world.health(o)
+                    && (f64::from(h) > figure) == above
+                    && f64::from(h) != figure
+                {
+                    return Check::Holds(true, vec![id(o)]);
+                }
+            }
+            no
         }
         // { object, "awake" or "hibernate" }.
         "ObjectHibernation" => match guid(&p.params, 1) {

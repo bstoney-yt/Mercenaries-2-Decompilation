@@ -165,6 +165,8 @@ pub struct GameAudio {
     quiet_until: Instant,
     /// Scripted lines playing, by the mission's id for them.
     lines: HashMap<u32, VoiceId>,
+    /// Interface sounds started, by cue in lower case.
+    ui_playing: HashMap<String, VoiceId>,
     /// Scripted lines stopped before they were decoded.
     hushed: HashSet<u32>,
     /// The sounds the clips' events play, once read (on a thread).
@@ -225,11 +227,18 @@ impl UiSounds {
 
     /// The sound cue `cue` plays and its volume (the first of its
     /// record's variants that is this bank's).
-    fn find(&self, cue: &str) -> Option<(SoundBuffer, f32)> {
+    /// and whether it loops.
+    fn find(&self, cue: &str) -> Option<(SoundBuffer, f32, bool)> {
         let table = self.cues.as_ref()?;
-        let record = table.cue_record(m2_assets::name_hash(cue))?;
+        let hash = m2_assets::name_hash(cue);
+        let record = table.cue_record(hash)?;
         let &(_, index, _) = record.variants.iter().find(|v| v.0 == table.hash)?;
-        Some((self.sounds.get(index as usize)?.clone(), record.volume))
+        let looped = table.plain_cue(hash).is_some_and(|c| c.seconds < 0.0);
+        Some((
+            self.sounds.get(index as usize)?.clone(),
+            record.volume,
+            looped,
+        ))
     }
 }
 
@@ -756,6 +765,7 @@ impl GameAudio {
             }),
             said: channel(),
             lines: HashMap::new(),
+            ui_playing: HashMap::new(),
             hushed: HashSet::new(),
             speaking: Vec::new(),
             quiet_until: Instant::now(),
@@ -833,12 +843,32 @@ impl GameAudio {
     pub fn ui_sound(&mut self, cue: &str) {
         self.ui_loaded();
         match self.ui.as_ref().and_then(|u| u.find(cue)) {
-            Some((buffer, volume)) => {
-                eprintln!("ui sound: {cue} ({:.2} s)", buffer.seconds());
-                self.out
-                    .with(|m| m.play(Play::flat(buffer).gain(volume.clamp(0.0, 2.0))));
+            Some((buffer, volume, looped)) => {
+                eprintln!(
+                    "ui sound: {cue} ({:.2} s{})",
+                    buffer.seconds(),
+                    if looped { ", looped" } else { "" }
+                );
+                let mut play = Play::flat(buffer).gain(volume.clamp(0.0, 2.0));
+                if looped {
+                    play = play.looped();
+                }
+                let voice = self.out.with(|m| m.play(play));
+                // Started again: the one before stops, as a cue plays once
+                // per emitter.
+                if let Some(old) = self.ui_playing.insert(cue.to_ascii_lowercase(), voice) {
+                    self.out.with(|m| m.stop(old));
+                }
             }
             None => eprintln!("ui sound: {cue} not found"),
+        }
+    }
+
+    /// Stops interface sound `cue` if it plays (`Sound.StopSound`).
+    pub fn stop_ui_sound(&mut self, cue: &str) {
+        if let Some(voice) = self.ui_playing.remove(&cue.to_ascii_lowercase()) {
+            eprintln!("ui sound: {cue} stopped");
+            self.out.with(|m| m.stop(voice));
         }
     }
 

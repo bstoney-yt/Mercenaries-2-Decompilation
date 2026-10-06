@@ -32,6 +32,8 @@ use crate::script::{ScriptError, ScriptHost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
 pub const BOOTSTRAP: u32 = 0xb442_0059;
+/// The heroes' own script: healing and the survival system's one rescue.
+pub const HERO_SCRIPT: u32 = 0x5172_8909;
 
 /// The scripts' free support items (`MrxSupportData.AddFreebie`, as the
 /// first contract gives its Satellite Guided Bomb) reach the game too:
@@ -564,6 +566,27 @@ impl Mission {
     }
 
     /// Reports that an object died in play (a soldier the player shot).
+    /// The game's reading of an object's health (the player's, as she is
+    /// hurt and healed).
+    pub fn set_health(&mut self, guid: u32, health: f32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            o.health = health;
+        }
+    }
+
+    /// The player died and is back on her feet: the hero script's
+    /// `OnDeath` sets its survival system up again once she is healthy.
+    pub fn player_died(&mut self) {
+        let code = format!(
+            "local s = Scripts[\"{HERO_SCRIPT:08x}\"] if s and type(s.OnDeath) == \"function\" then s.OnDeath(Player.GetCharacter(1)) end"
+        );
+        self.log.push(format!("  t={:.1} player died", self.now));
+        if let Err(e) = self.run(&code, "hero died") {
+            self.log
+                .push(format!("  hero died: {}", first_lines(&e.to_string())));
+        }
+    }
+
     pub fn kill(&mut self, guid: u32) {
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
             o.alive = false;
@@ -890,6 +913,39 @@ mod tests {
         .unwrap();
         let on = |on| Command::Invincible { guid: PLAYER, on };
         assert_eq!(m.take_commands(), [on(true), on(false)]);
+    }
+
+    #[test]
+    fn health_watches_fire_as_she_is_hurt() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            dropped = 0
+            local hero = Player.GetCharacter(1)
+            Player.SetHealthClamp(1, true)
+            Event.Create(Event.ObjectHealth, { hero, "<", Object.GetHealth(hero) },
+                function() dropped = dropped + 1 end)
+            Sound.StopSound(0, "sfx_survival_lp")
+            "#,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            m.take_commands(),
+            [
+                Command::HealthClamp(true),
+                Command::StopSound {
+                    at: None,
+                    cue: "sfx_survival_lp".into()
+                }
+            ]
+        );
+        m.tick(0.1);
+        m.set_health(PLAYER, 60.0);
+        m.tick(0.1);
+        m.tick(0.1);
+        let dropped: i64 = m.lua().globals().raw_get("dropped").unwrap();
+        assert_eq!(dropped, 1);
     }
 
     #[test]

@@ -153,6 +153,9 @@ const BODY_RADIUS: f32 = 0.3;
 /// Health comes back after this many quiet seconds, at this rate a second.
 const REGEN_AFTER: f32 = 4.0;
 const REGEN_RATE: f32 = 25.0;
+/// Where the health clamp stops her health: the hero script's healing
+/// keeps at least this much too (inferred; no script sets the floor).
+const CLAMP_FLOOR: f32 = 1.0;
 /// Seconds she stays down at no health.
 const DOWN_TIME: f32 = 2.5;
 /// RPG: rocket speed (m/s), reload (s) and how far it flies.
@@ -756,6 +759,13 @@ pub struct Combat {
     /// The scripts made her invincible (while the screen fades, at the
     /// fanfare): nothing hurts her.
     pub invincible: bool,
+    /// The scripts keep her from dying (`Player.SetHealthClamp`): her
+    /// health stops at [`CLAMP_FLOOR`] for their survival system.
+    pub health_clamp: bool,
+    /// The scripts heal her (the hero script's timers), not the fight.
+    pub scripted_health: bool,
+    /// She just got back up after going down (taken by the mission).
+    pub revived: bool,
     quiet: f32,
     reload: f32,
     aim_left: f32,
@@ -815,6 +825,9 @@ impl Default for Combat {
             weapon: Weapon::Rifle,
             down: 0.0,
             invincible: false,
+            health_clamp: false,
+            scripted_health: false,
+            revived: false,
             quiet: 0.0,
             reload: 0.0,
             aim_left: 0.0,
@@ -1070,10 +1083,11 @@ impl Combat {
             self.down -= dt;
             if self.down <= 0.0 {
                 self.hp = 100.0;
+                self.revived = true;
                 f.player.down = false;
                 f.player.aiming = false;
             }
-        } else if self.quiet > REGEN_AFTER {
+        } else if !self.scripted_health && self.quiet > REGEN_AFTER {
             self.hp = (self.hp + REGEN_RATE * dt).min(100.0);
         }
 
@@ -1340,7 +1354,8 @@ impl Combat {
             return;
         }
         self.quiet = 0.0;
-        self.hp = (self.hp - damage).max(0.0);
+        let floor = if self.health_clamp { CLAMP_FLOOR } else { 0.0 };
+        self.hp = (self.hp - damage).max(floor.min(self.hp));
         if self.hp <= 0.0 {
             self.remarks.push(Remark::Down);
             self.down = DOWN_TIME;
