@@ -1203,6 +1203,7 @@ impl Thread {
                     restarts: *restarts,
                     rt,
                     seen: None,
+                    since_status: f64::INFINITY,
                 },
             );
         }
@@ -1227,15 +1228,30 @@ impl Thread {
             m.rt.call(&name, &args);
         }
         let mut commands = Vec::new();
+        let mut status = Vec::new();
         for (&id, m) in &mut self.flash {
-            if !wanted.get(&id).is_some_and(|w| w.2) {
+            let paused = wanted.get(&id).is_some_and(|w| w.2);
+            if !paused {
                 m.rt.step(dt as f32);
+            }
+            m.since_status += dt;
+            if m.since_status >= 1.0 {
+                m.since_status = 0.0;
+                status.push((id, paused));
             }
             m.rt.sync_text();
             for line in m.rt.avm.log.drain(..) {
                 log.push(format!("flash {}: {line}", m.swf));
             }
             commands.extend(m.rt.take_commands().into_iter().map(|c| (id, c)));
+        }
+        {
+            let movies = self.movies.borrow();
+            for (id, paused) in status {
+                if let Some(m) = self.flash.get(&id) {
+                    log.push(flash_status(m, paused, movies.fonts.as_ref()));
+                }
+            }
         }
         for (id, (command, arg)) in commands {
             match gui_runtime::flash_command(lua, id, &command, &arg) {
@@ -2036,6 +2052,55 @@ struct FlashMovie {
     /// What was last logged of it on screen: its box (None: not drawn)
     /// and whether it drew anything.
     seen: Option<(Option<[i32; 4]>, bool)>,
+    /// Seconds since its state was last logged ([`flash_status`]).
+    since_status: f64,
+}
+
+/// A movie's state, once a second while it plays: its root's frame,
+/// whether the scripts paused it, and what it draws on its stage (bounds
+/// and the most opaque alpha).
+fn flash_status(m: &FlashMovie, paused: bool, fonts: Option<&flash::FontBook>) -> String {
+    let player = &m.rt.player;
+    let (frame, frames) = player
+        .clip(player.root)
+        .map_or((0, 0), |c| (c.frame + 1, c.frame_count()));
+    let empty = flash::FontBook::default();
+    let mut triangles = Vec::new();
+    player.draw(
+        &flash::Matrix::IDENTITY,
+        fonts.unwrap_or(&empty),
+        &mut triangles,
+    );
+    let mut bounds = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    let mut alpha = 0.0f32;
+    for t in &triangles {
+        alpha = alpha.max(t.colour[3]);
+        for [x, y] in t.corners {
+            bounds = [
+                bounds[0].min(x),
+                bounds[1].min(y),
+                bounds[2].max(x),
+                bounds[3].max(y),
+            ];
+        }
+    }
+    let [w, h] = player.lib.size;
+    format!(
+        "flash {}: frame {frame}/{frames}{}, stage {w:.0}x{h:.0}, {} triangles in {}, alpha up to {alpha:.2}",
+        m.swf,
+        if paused { " paused" } else { "" },
+        triangles.len(),
+        if triangles.is_empty() {
+            "nothing".to_owned()
+        } else {
+            format!("{bounds:.0?}")
+        },
+    )
 }
 
 /// A movie's name as the archive knows it: a file name or path
