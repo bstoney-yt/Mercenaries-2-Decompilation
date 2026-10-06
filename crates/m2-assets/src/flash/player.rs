@@ -641,6 +641,19 @@ impl Player {
         id
     }
 
+    /// The root of the level `id` is in: its `_root`.
+    pub fn root_of(&self, id: ClipId) -> ClipId {
+        let mut at = id;
+        while let Some(p) = self.clip(at).and_then(|c| c.parent) {
+            at = p;
+        }
+        if self.levels.values().any(|&l| l == at) {
+            at
+        } else {
+            self.root
+        }
+    }
+
     /// The child of `parent` named `name` (any case).
     pub fn child(&self, parent: ClipId, name: &str) -> Option<ClipId> {
         let p = self.clip(parent)?;

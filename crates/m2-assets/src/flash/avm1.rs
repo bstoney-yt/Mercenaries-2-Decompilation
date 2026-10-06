@@ -572,7 +572,11 @@ impl Avm {
                 return Some(self.clip_value(player, p));
             }
             "_root" | "_level0" => {
-                let r = player.root;
+                let r = if lower == "_root" {
+                    player.root_of(id)
+                } else {
+                    player.levels.get(&0).copied().unwrap_or(player.root)
+                };
                 return Some(Value::Object(self.clip_object(r)));
             }
             "_xmouse" | "_ymouse" => Value::Number(0.0),
@@ -755,7 +759,7 @@ impl Avm {
                         r += 1;
                     }
                 };
-                let root = Value::Object(self.clip_object(player.root));
+                let root = Value::Object(self.clip_object(player.root_of(func.target)));
                 let parent = player
                     .clip(func.target)
                     .and_then(|c| c.parent)
@@ -842,7 +846,10 @@ impl Avm {
         }
         match name.to_ascii_lowercase().as_str() {
             "this" => return frame.this.clone(),
-            "_root" => return Value::Object(self.clip_object(player.root)),
+            "_root" => {
+                let root = player.root_of(frame.target);
+                return Value::Object(self.clip_object(root));
+            }
             "_global" => return Value::Object(Rc::clone(&self.global)),
             n if n.starts_with("_level") => {
                 let level = n[6..]
@@ -912,7 +919,7 @@ impl Avm {
             None => (path, None),
         };
         let mut at = if path.starts_with('/') {
-            Value::Object(self.clip_object(player.root))
+            Value::Object(self.clip_object(player.root_of(frame.target)))
         } else {
             Value::Object(self.clip_object(frame.target))
         };
@@ -2311,13 +2318,13 @@ impl Runtime {
 /// The clip `path` names from `from` (`_root.a.b`, `_parent`, `a/b`).
 fn resolve_clip(player: &Player, from: ClipId, path: &str) -> Option<ClipId> {
     let mut at = if path.starts_with('/') {
-        player.root
+        player.root_of(from)
     } else {
         from
     };
     for part in path.split(['.', '/']).filter(|p| !p.is_empty()) {
         at = match part.to_ascii_lowercase().as_str() {
-            "_root" => player.root,
+            "_root" => player.root_of(at),
             "this" => at,
             "_parent" | ".." => player.clip(at)?.parent?,
             other => player.child(at, other)?,
