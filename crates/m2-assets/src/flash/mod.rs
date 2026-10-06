@@ -647,8 +647,12 @@ pub fn tags(data: &[u8]) -> Vec<(u16, &[u8])> {
 pub struct Image {
     /// The texture's name: the file's name without its extension.
     pub texture: String,
+    /// Its size in pixels.
     pub width: f32,
     pub height: f32,
+    /// Where it lies in the texture (x0, y0, x1, y1, 0..=1): all of it,
+    /// or a part for Scaleform's `DefineSubImage`.
+    pub part: [f32; 4],
 }
 
 /// A triangle to draw, in the movie's pixels: its corners, their texture
@@ -695,7 +699,11 @@ pub fn draw_shape(
         let uv = t.corners.map(|p| match image {
             Some((img, inv)) => {
                 let [u, v] = inv.apply(p);
-                [u / img.width.max(1.0), v / img.height.max(1.0)]
+                let [x0, y0, x1, y1] = img.part;
+                [
+                    x0 + u / img.width.max(1.0) * (x1 - x0),
+                    y0 + v / img.height.max(1.0) * (y1 - y0),
+                ]
             }
             None => [0.0, 0.0],
         });
