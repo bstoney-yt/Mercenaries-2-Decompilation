@@ -273,6 +273,8 @@ pub struct Npc {
     fling: Option<Vec3>,
     /// Has shouted since they were last calm.
     shouted: bool,
+    /// Killed since [`People::take_deaths`] last looked.
+    died: bool,
 }
 
 /// What a person shouts.
@@ -305,6 +307,7 @@ impl Npc {
             ragdoll: None,
             fling: None,
             shouted: false,
+            died: false,
             kind,
             soldier: spawn.is_some(),
             character: Character::new(at),
@@ -335,6 +338,7 @@ impl Npc {
         self.alert = self.soldier;
         if self.hp <= 0.0 {
             self.alive = false;
+            self.died = true;
             self.alert = false;
             self.flee = None;
             self.rig.animator.set_upper(None);
@@ -820,6 +824,18 @@ impl People {
         self.npcs.clear();
         self.active.clear();
         self.killed = killed.into_iter().collect();
+    }
+
+    /// Soldiers killed since the last call: where each fell and the
+    /// layer entity that placed them.
+    pub fn take_deaths(&mut self) -> Vec<(Vec3, Option<u32>)> {
+        self.npcs
+            .iter_mut()
+            .filter_map(|n| {
+                (std::mem::take(&mut n.died) && n.soldier)
+                    .then_some((n.character.position, n.spawn))
+            })
+            .collect()
     }
 
     /// Calls off every fight (the player went down).

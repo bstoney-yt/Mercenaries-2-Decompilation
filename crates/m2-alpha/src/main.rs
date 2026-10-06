@@ -40,6 +40,7 @@ mod cache;
 mod camera;
 mod combat;
 mod config;
+mod drops;
 mod flights;
 mod game;
 mod input;

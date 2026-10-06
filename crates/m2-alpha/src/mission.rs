@@ -1461,6 +1461,15 @@ fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
     else {
         return Vec::new();
     };
+    left.iter()
+        .filter_map(|&left| pickup(templates, left))
+        .collect()
+}
+
+/// What pickup template `id` gives her, as [`leaves`] reads it; besides,
+/// the grenades of its `Grenade Projectile` record and a health pickup's
+/// health (`Health Pickup`: 50, points of her 100).
+pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     let fires = |weapon: &str, ammo: u32| {
         let model = name_hash(weapon);
         templates.leavings.ammo.iter().any(|(&w, &a)| {
@@ -1470,34 +1479,43 @@ fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
                     .is_some_and(|(_, t)| t.model == Some(model))
         })
     };
-    left.iter()
-        .filter_map(|&left| {
-            let info = templates.leavings.pickups.get(&left)?;
-            let model = templates.by_id(left).and_then(|(_, t)| t.model);
-            let weapon = Weapon::ALL
+    let info = templates.leavings.pickups.get(&id)?;
+    let model = templates.by_id(id).and_then(|(_, t)| t.model);
+    let weapon = Weapon::ALL
+        .into_iter()
+        .find(|w| model == Some(name_hash(w.model_name())));
+    let gives = match weapon {
+        // Its own rounds, whatever its record names: the launcher's names
+        // "Grenade Launcher Projectile", not the "GL Projectile" it fires
+        // (round 94: taken up empty).
+        Some(w) => Some((w, info.rounds.max(1) * w.clip())),
+        None => info.ammo.and_then(|ammo| {
+            Weapon::ALL
                 .into_iter()
-                .find(|w| model == Some(name_hash(w.model_name())));
-            let gives = match weapon {
-                // Its own rounds, whatever its record names: the
-                // launcher's names "Grenade Launcher Projectile", not the
-                // "GL Projectile" it fires (round 94: taken up empty).
-                Some(w) => Some((w, info.rounds.max(1) * w.clip())),
-                None => info.ammo.and_then(|ammo| {
-                    Weapon::ALL
-                        .into_iter()
-                        .find(|w| fires(w.model_name(), ammo))
-                        .map(|w| (w, info.rounds * w.clip()))
-                }),
-            };
-            Some(Leaves {
-                template: left,
-                model,
-                reach: info.radius,
-                weapon,
-                gives,
-            })
-        })
-        .collect()
+                .find(|w| fires(w.model_name(), ammo))
+                .map(|w| (w, info.rounds * w.clip()))
+        }),
+    };
+    let grenade = templates.id("Grenade Projectile");
+    let grenades = info
+        .gives
+        .iter()
+        .filter(|(ammo, _)| Some(*ammo) == grenade)
+        .map(|(_, n)| n)
+        .sum();
+    Some(Leaves {
+        template: id,
+        model,
+        reach: info.radius,
+        weapon,
+        gives,
+        grenades,
+        health: if info.kind == m2_engine::pickup::HEALTH {
+            info.rounds as f32
+        } else {
+            0.0
+        },
+    })
 }
 
 /// The models one of the scripts' objects drives as
@@ -1609,9 +1627,11 @@ mod tests {
             0x8000_4379,
         );
         let pickup = |ammo, rounds| PickupInfo {
+            kind: 1,
             radius: 1.0,
             ammo: Some(ammo),
             rounds,
+            gives: vec![(ammo, rounds)],
             cue: None,
             effect: None,
         };
@@ -1639,6 +1659,7 @@ mod tests {
                     (rockets, pickup(missile, 20)),
                 ]),
                 ammo: HashMap::from([(rpg, missile), (launcher, grenade)]),
+                labels: HashMap::new(),
             },
             ..Templates::default()
         };
@@ -1652,6 +1673,7 @@ mod tests {
                     reach: 1.0,
                     weapon: Some(Weapon::GrenadeLauncher),
                     gives: Some((Weapon::GrenadeLauncher, 18)),
+                    ..Leaves::default()
                 },
                 Leaves {
                     template: rockets,
@@ -1659,6 +1681,7 @@ mod tests {
                     reach: 1.0,
                     weapon: None,
                     gives: Some((Weapon::Rpg, 20)),
+                    ..Leaves::default()
                 },
             ]
         );

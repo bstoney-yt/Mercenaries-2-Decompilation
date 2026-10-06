@@ -170,6 +170,10 @@ const THROW: f32 = 12.0;
 const FUSE: f32 = 2.5;
 const BOUNCE: f32 = 0.4;
 const THROW_GAP: f32 = RPG_RELOAD * 0.5;
+/// Grenades she can carry (the `Grenade` template's `MaxAmmoReserve`);
+/// her hero template starts her with them, and the hero script fills
+/// every weapon she holds to its most.
+pub const MAX_GRENADES: u32 = 9;
 /// A melee bash: how far ahead of her it reaches (from her chest, or her
 /// knees for a low one at something on the ground), how wide (the cosine
 /// of its half-angle), how much it hurts a person and what of the world's
@@ -803,6 +807,8 @@ pub struct Combat {
     pub second: Option<Weapon>,
     /// The grenade launcher's rounds, while she carries one.
     pub launcher_rounds: Option<Rounds>,
+    /// Grenades she has to throw.
+    pub grenades: u32,
     /// She holds the satellite designator instead of her weapon
     /// ([`crate::support`]).
     pub designator: bool,
@@ -848,6 +854,7 @@ impl Default for Combat {
             picked: Picked::default(),
             second: Some(Weapon::Rpg),
             launcher_rounds: None,
+            grenades: MAX_GRENADES,
             designator: false,
             last_launch: None,
             fuses: Vec::new(),
@@ -960,10 +967,14 @@ impl Combat {
         left
     }
 
-    /// Lands her with the carbine alone, as the first contract starts.
+    /// Lands her with the carbine alone, as the first contract starts:
+    /// its scripts give her a carbine, grenades and C4 afresh and fill
+    /// only the carbine, so she has no grenades (none in the footage until
+    /// a pickup).
     pub fn carbine_only(&mut self) {
         self.second = None;
         self.launcher_rounds = None;
+        self.grenades = 0;
         self.weapon = Weapon::Rifle;
     }
 
@@ -976,6 +987,26 @@ impl Combat {
             (Weapon::GrenadeLauncher, None) => {}
             _ => self.picked.add(weapon, rounds),
         }
+    }
+
+    /// Grenades and health from a pickup: as many grenades as she has
+    /// room for, health up to full.
+    pub fn take_supplies(&mut self, grenades: u32, health: f32) {
+        self.grenades = (self.grenades + grenades).min(MAX_GRENADES);
+        self.hp = (self.hp + health).min(100.0);
+    }
+
+    /// Whether ammunition or health lying there gives her anything: what
+    /// she walks over she takes only then.
+    pub fn can_use(&self, what: &crate::flights::Leaves) -> bool {
+        let rounds = match what.gives {
+            Some((Weapon::GrenadeLauncher, n)) => n > 0 && self.launcher_rounds.is_some(),
+            Some((w, n)) => n > 0 && self.second == Some(w),
+            None => false,
+        };
+        rounds
+            || (what.grenades > 0 && self.grenades < MAX_GRENADES)
+            || (what.health > 0.0 && self.hp < 100.0)
     }
 
     /// The weapons she carries but doesn't hold, which hang on her back:
@@ -1134,7 +1165,8 @@ impl Combat {
                     Weapon::GrenadeLauncher => self.lob(f),
                 }
             }
-            if trigger.throw && self.reload <= 0.0 {
+            if trigger.throw && self.reload <= 0.0 && self.grenades > 0 {
+                self.grenades -= 1;
                 self.reload = THROW_GAP;
                 // Without her throw clip, it goes at once.
                 match f.player.start_throw() {
