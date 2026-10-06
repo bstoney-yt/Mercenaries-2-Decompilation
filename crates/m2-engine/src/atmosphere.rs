@@ -123,6 +123,10 @@ pub struct Atmosphere {
 /// has it. Inferred from the footage.
 pub const SUN_SETS: Vec3 = Vec3::new(0.87, 0.0, 0.49);
 
+/// How much of the night's monochrome ramp (its weight, 0.36 there) shows
+/// the searchlights' beams in full; below it they fade out (inferred).
+const BEAMS_FULL_RAMP: f32 = 0.3;
+
 /// The lowest the sun is drawn, in radians over the horizon, so that low
 /// `LightTime`s still light the ground a little.
 const SUN_LOWEST: f32 = 0.05;
@@ -493,6 +497,13 @@ impl Atmosphere {
         // The post shader blends towards the monochrome ramp (only the
         // night's is read; see `from_record`).
         lighting.monochrome = self.monochrome;
+        // The searchlights shine in the night record's air only: PC footage
+        // shows their beams from dusk through the night and none by day, so
+        // they follow how far the night's ramp has come in (inferred; the
+        // game's own switch is probably the mission's lights).
+        lighting.beam_gain = self
+            .monochrome
+            .map_or(0.0, |m| (m.w / BEAMS_FULL_RAMP).clamp(0.0, 1.0));
     }
 
     /// The haze these settings describe: Hoffman and Preetham's standard
@@ -961,5 +972,21 @@ mod tests {
         mix.update(&default, &regions, Vec3::new(15.0, 0.0, 15.0), 2.0);
         assert_eq!(mix.over(&regions, Vec3::new(15.0, 0.0, 15.0)), Some((1, 1)));
         assert_eq!(mix.current(&default).interpolate_time, 4.0);
+    }
+
+    #[test]
+    fn searchlight_beams_shine_only_as_the_night_ramp_comes_in() {
+        let mut lighting = Lighting::default();
+        let day = plain(0.2, 0.0);
+        day.apply(&mut lighting);
+        assert_eq!(lighting.beam_gain, 0.0);
+        let night = Atmosphere {
+            monochrome: Some(Vec4::new(0.2, 0.2, 0.3, 0.36)),
+            ..plain(0.0, 0.0)
+        };
+        night.apply(&mut lighting);
+        assert_eq!(lighting.beam_gain, 1.0);
+        day.lerp(&night, 0.5).apply(&mut lighting);
+        assert!(lighting.beam_gain > 0.0 && lighting.beam_gain < 1.0);
     }
 }
