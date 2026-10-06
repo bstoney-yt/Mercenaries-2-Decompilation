@@ -116,6 +116,9 @@ pub struct Widget {
     /// still runs: the PDA's close (`MrxGuiPda.Close`) removes it and then
     /// counts its reopening cooldown down in its `GuiUpdate`.
     pub inactive: bool,
+    /// `SetMovieEndCallback`: what runs when its movie ends (`PlayMovie`
+    /// plays none here, so it ends at once).
+    pub movie_end: Option<u32>,
     /// The box as last set on this widget, and its parent's box then:
     /// the widget's box now is this mapped from that to the parent's box
     /// now.
@@ -177,6 +180,7 @@ impl Widget {
             visible: true,
             sleeping: false,
             inactive: false,
+            movie_end: None,
             own: [0.0; 4],
             parent_ref: None,
             colour: [255.0; 4],
@@ -1828,7 +1832,26 @@ natives! {
         }
         Ok(MultiValue::new())
     },
-    "PlayMovie" => |_, _, _| Ok(MultiValue::new()),
+    // The movie ends at once: its end callback runs at the next tick
+    // (the cinematics' scripts wait on it, as 02_AOB_M does).
+    "PlayMovie" => |s, _, a| {
+        if let Some(cb) = s.widgets.get_mut(&a.id(0)).and_then(|w| w.movie_end.take()) {
+            s.due.push((cb, Vec::new()));
+        }
+        Ok(MultiValue::new())
+    },
+    // (widget, function, data).
+    "SetMovieEndCallback" => |s, l, a| {
+        let cb = keep_callback(s, l, a.get(1), a.get(2))?;
+        let old = match s.widgets.get_mut(&a.id(0)) {
+            Some(w) => std::mem::replace(&mut w.movie_end, cb),
+            None => cb,
+        };
+        if let Some(old) = old {
+            forget_callback(l, old)?;
+        }
+        Ok(MultiValue::new())
+    },
     "PauseMovie" => |_, _, _| Ok(MultiValue::new()),
     "StopMovie" => |_, _, _| Ok(MultiValue::new()),
     "SetMinimapBorder" => |_, _, _| Ok(MultiValue::new()),
@@ -2210,6 +2233,26 @@ mod tests {
         );
         // Not matched to a picture yet: as written.
         assert_eq!(s.display_text("[honk] Honk"), "[honk] Honk");
+    }
+
+    #[test]
+    fn a_played_movie_ends_at_the_next_tick() {
+        let (host, _screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            movie = G.CreateImageWidget()
+            ended = 0
+            G.SetMovieEndCallback(movie, function(n) ended = ended + n end, { 2 })
+            "#,
+        );
+        tick(host.lua(), 0.1);
+        run(&host, "_GuiInternal.PlayMovie(movie)");
+        assert_eq!(host.lua().globals().get::<i64>("ended").unwrap(), 0);
+        tick(host.lua(), 0.1);
+        tick(host.lua(), 0.1);
+        assert_eq!(host.lua().globals().get::<i64>("ended").unwrap(), 2);
     }
 
     #[test]
