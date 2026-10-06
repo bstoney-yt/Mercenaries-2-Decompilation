@@ -17,7 +17,7 @@
 //! (see `wad -- calls`); the readings are noted per kind below.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::rc::Rc;
 
 use mlua::{Function, Lua, MultiValue, Table, Value};
@@ -318,7 +318,8 @@ impl Events {
     /// condition holds. Callbacks run after the checks, so events they
     /// create wait for the next update. Returns the callbacks that failed.
     pub fn update(&self, dt: f64, world: &dyn World) -> Vec<EventError> {
-        let fired = self.due(dt, world);
+        let accepted = self.filter_posts();
+        let fired = self.due(dt, world, &accepted);
         fire(fired)
     }
 
@@ -326,11 +327,47 @@ impl Events {
     /// borrowed only while the conditions are checked, so callbacks can
     /// move, spawn and kill.
     pub fn update_shared<W: World>(&self, dt: f64, world: &RefCell<W>) -> Vec<EventError> {
-        let fired = self.due(dt, &*world.borrow());
+        let accepted = self.filter_posts();
+        let fired = self.due(dt, &*world.borrow(), &accepted);
         fire(fired)
     }
 
-    fn due(&self, dt: f64, world: &dyn World) -> Vec<Fired> {
+    /// Asks each waiting `ScriptEvent`'s filter about each post, before
+    /// anything is borrowed: filters are script functions and may call
+    /// the game (`Debug.Printf`). The (filter, post) pairs it says yes to.
+    fn filter_posts(&self) -> Accepted {
+        let (posted, filters) = {
+            let s = self.store.borrow();
+            let filters: Vec<(String, Function)> = s
+                .pending
+                .iter()
+                .filter(|p| p.kind == "ScriptEvent")
+                .filter_map(|p| {
+                    let name = p.params.raw_get::<String>(1).ok()?;
+                    let f = p.params.raw_get::<Option<Function>>(2).ok().flatten()?;
+                    Some((name, f))
+                })
+                .collect();
+            if filters.is_empty() {
+                return Accepted::new();
+            }
+            (s.posted.clone(), filters)
+        };
+        let mut accepted = Accepted::new();
+        for (name, f) in &filters {
+            for (i, (n, data)) in posted.iter().enumerate() {
+                let yes = n == name
+                    && f.call::<Value>(data.clone())
+                        .is_ok_and(|v| !matches!(v, Value::Nil | Value::Boolean(false)));
+                if yes {
+                    accepted.insert((f.to_pointer() as usize, i));
+                }
+            }
+        }
+        accepted
+    }
+
+    fn due(&self, dt: f64, world: &dyn World, accepted: &Accepted) -> Vec<Fired> {
         {
             let mut s = self.store.borrow_mut();
             s.now += dt;
@@ -339,7 +376,7 @@ impl Events {
             let mut fired = Vec::new();
             let mut keep = Vec::with_capacity(s.pending.len());
             for mut p in std::mem::take(&mut s.pending) {
-                let extra = match check(&p, now, &posted, world) {
+                let extra = match check(&p, now, &posted, accepted, world) {
                     Check::Fire(extra) => Some(vec![extra]),
                     // Fires as the condition starts to hold.
                     Check::Holds(holds, extra) => {
@@ -571,7 +608,17 @@ fn text(t: &Table, i: i64) -> Option<String> {
 
 /// Checks `p` against the world. Readings of each kind's parameters come
 /// from the game's call sites.
-fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -> Check {
+/// The (filter function's address, post's index) pairs a `ScriptEvent`'s
+/// filter said yes to.
+type Accepted = HashSet<(usize, usize)>;
+
+fn check(
+    p: &Pending,
+    now: f64,
+    posted: &[(String, Value)],
+    accepted: &Accepted,
+    world: &dyn World,
+) -> Check {
     let no = Check::Holds(false, Vec::new());
     let id = guid_value;
     match p.kind.as_str() {
@@ -734,15 +781,19 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             let Ok(name) = p.params.raw_get::<String>(1) else {
                 return no;
             };
+            // Filters ran before the checks ([`Events::filter_posts`]).
             let filter = p.params.raw_get::<Option<Function>>(2).ok().flatten();
-            let wanted = |data: &Value| {
-                filter.as_ref().is_none_or(|f| {
-                    f.call::<Value>(data.clone())
-                        .is_ok_and(|v| !matches!(v, Value::Nil | Value::Boolean(false)))
-                })
+            let wanted = |i: usize| {
+                filter
+                    .as_ref()
+                    .is_none_or(|f| accepted.contains(&(f.to_pointer() as usize, i)))
             };
-            match posted.iter().find(|(n, data)| *n == name && wanted(data)) {
-                Some((_, data)) => Check::Fire(vec![data.clone()]),
+            match posted
+                .iter()
+                .enumerate()
+                .find(|(i, (n, _))| *n == name && wanted(*i))
+            {
+                Some((_, (_, data))) => Check::Fire(vec![data.clone()]),
                 None => no,
             }
         }
@@ -916,7 +967,11 @@ mod tests {
         host.lua()
             .load(
                 r#"
-                local function hostile(d) return d[2] == "Pmc" and d[4] == "Hostile" end
+                -- Filters may call the game (VzaCon001's print first).
+                local function hostile(d)
+                    Event.Post("Checked")
+                    return d[2] == "Pmc" and d[4] == "Hostile"
+                end
                 Event.CreatePersistent(Event.ScriptEvent, { "Attitude", hostile },
                     function(d) table.insert(log, "angry " .. d[1]) end)
                 Event.Post("Attitude", { "Gur", "Pmc", "Neutral", "Friendly" })
