@@ -644,6 +644,143 @@ impl Mission {
         self.settle(&format!("t={:.1}, delivered", self.now));
     }
 
+    /// The support catalogue as the scripts hold it now, with her stock
+    /// of each item ([`crate::support`]).
+    pub fn support_items(&self) -> Vec<crate::support::SupportItem> {
+        crate::support::items(self.host.lua()).unwrap_or_default()
+    }
+
+    /// Adds `count` of support item `key` to her stockpile, and cash and
+    /// fuel, as a purchase or a find would (`MrxPmc.AddSupportQty`,
+    /// `AddCashQty`, `AddFuelQty`).
+    pub fn stock_support(&mut self, key: &str, count: i32, cash: f64, fuel: f64) {
+        let code = format!(
+            "MrxPmc.AddSupportQty({key:?}, {count}) MrxPmc.AddCashQty({cash}) MrxPmc.AddFuelQty({fuel})"
+        );
+        if let Err(e) = self.run(&code, "stock support") {
+            self.log
+                .push(format!("  stock support: {}", first_lines(&e.to_string())));
+        }
+    }
+
+    /// Calls support item `key` in for the player, as the PDA and the
+    /// support menu do ([`crate::support::CALL_IN`]): her designator for
+    /// it comes as [`Command::EquipDesignator`]. Whether the scripts took
+    /// the call.
+    pub fn use_support(&mut self, key: &str) -> bool {
+        let lua = self.host.lua();
+        let owner = self.world.borrow().player.map(crate::events::guid_value);
+        let set = lua.globals().set("__m2_key", key).and_then(|()| {
+            lua.globals()
+                .set("__m2_owner", owner.unwrap_or(mlua::Value::Nil))
+        });
+        let took = set.and_then(|()| {
+            lua.load(crate::support::CALL_IN)
+                .set_name("=call in support")
+                .eval::<bool>()
+        });
+        let took = match took {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .push(format!("  call in {key}: {}", first_lines(&e.to_string())));
+                false
+            }
+        };
+        self.log
+            .push(format!("t={:.1} support {key} called in: {took}", self.now));
+        self.settle(&format!("t={:.1}, support {key}", self.now));
+        took
+    }
+
+    /// `owner` threw her designator, now at `at`: it becomes an object of
+    /// `what` (`"Smoke Grenade Projectile"`) whose script, the support
+    /// manager, takes up the call waiting for her
+    /// (`MrxSupportManager.OnActivate`). Its guid; tell
+    /// [`Mission::designator_settled`] when its timer runs out where it
+    /// lies.
+    pub fn designator_thrown(&mut self, owner: u32, what: &str, at: [f32; 3]) -> u32 {
+        let guid = {
+            let mut w = self.world.borrow_mut();
+            let g = w.spawn_guid();
+            w.insert(g, api::Object::new(what, at));
+            w.strikes.designators.insert(g, owner);
+            g
+        };
+        self.call_manager("OnActivate", guid, owner);
+        guid
+    }
+
+    /// The designator `guid` has lain at `at` its template's time
+    /// (`TriggerOnTimer`: 4 s for the smoke grenade): the support manager
+    /// marks the spot there (`OnTimer`), and the support's own script
+    /// takes over.
+    pub fn designator_settled(&mut self, guid: u32, at: [f32; 3]) {
+        let owner = {
+            let mut w = self.world.borrow_mut();
+            if let Some(o) = w.objects.get_mut(&guid) {
+                o.position = at;
+            }
+            w.strikes.designators.get(&guid).copied()
+        };
+        if let Some(owner) = owner {
+            self.call_manager("OnTimer", guid, owner);
+        }
+    }
+
+    fn call_manager(&mut self, what: &str, guid: u32, owner: u32) {
+        let lua = self.host.lua();
+        let call = lua
+            .globals()
+            .get::<mlua::Table>("MrxSupportManager")
+            .and_then(|m| m.get::<Function>(what))
+            .and_then(|f| {
+                f.call::<()>((
+                    crate::events::guid_value(guid),
+                    crate::events::guid_value(owner),
+                ))
+            });
+        if let Err(e) = call {
+            self.log.push(format!(
+                "  support manager {what}: {}",
+                first_lines(&e.to_string())
+            ));
+        }
+        self.settle(&format!("t={:.1}, designator {what}", self.now));
+    }
+
+    /// Aircraft `guid` (an [`Command::Flyby`]) has reached the end of its
+    /// run at `at`: its script lets its ordnance go.
+    pub fn flyby_arrived(&mut self, guid: u32, at: [f32; 3]) {
+        self.strike_callbacks(guid, at, true, "flyby arrived");
+    }
+
+    /// Ordnance `guid` (an [`Command::Ordnance`]) went off at `at`.
+    pub fn ordnance_burst(&mut self, guid: u32, at: [f32; 3]) {
+        self.strike_callbacks(guid, at, false, "ordnance burst");
+    }
+
+    fn strike_callbacks(&mut self, guid: u32, at: [f32; 3], arrival: bool, what: &str) {
+        let callbacks = {
+            let mut w = self.world.borrow_mut();
+            if let Some(o) = w.objects.get_mut(&guid) {
+                o.position = at;
+            }
+            w.strikes.take(guid, arrival)
+        };
+        for (f, data) in callbacks {
+            let args: Vec<mlua::Value> = match data {
+                Some(t) => t.sequence_values().filter_map(Result::ok).collect(),
+                None => Vec::new(),
+            };
+            if let Err(e) = f.call::<()>(mlua::MultiValue::from_vec(args)) {
+                self.log
+                    .push(format!("  {what}: {}", first_lines(&e.to_string())));
+            }
+        }
+        self.settle(&format!("t={:.1}, {what}", self.now));
+    }
+
     /// Reports that an object died in play (a soldier the player shot).
     /// The game's reading of an object's health (the player's, as she is
     /// hurt and healed).

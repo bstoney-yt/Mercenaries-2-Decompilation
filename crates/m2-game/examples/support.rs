@@ -5,13 +5,19 @@
 //!
 //! ```text
 //! cargo run -p m2-game --example support -- <vz.wad> [table...] [--calls]
+//!     [--items] [--call <key>]
 //! ```
 //!
 //! Each `table` is a Lua expression read after start-up (default
 //! `MrxSupportData.tSupportData`); its keys and fields are printed, nested
 //! tables to a few levels. With `--calls`, every module the support data
 //! script imports is listed with the engine calls it makes (callee and
-//! argument count), most used first. Nothing is written but stdout.
+//! argument count), most used first. `--items` lists the catalogue as the
+//! game reads it. `--call <key>` stocks the item and calls it in as the
+//! game would, standing in for the player and the world: she throws her
+//! designator 15 m ahead, it lies its 4 s, aircraft arrive at once and
+//! ordnance goes off where it set off; every command and log line is
+//! printed. Nothing is written but stdout.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -69,12 +75,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: support <vz.wad> [table...] [--calls]".into());
     };
     let calls = args.iter().any(|a| a == "--calls");
+    let list_items = args.iter().any(|a| a == "--items");
+    let call = args
+        .iter()
+        .position(|a| a == "--call")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let mut tables: Vec<&str> = args[1..]
         .iter()
-        .filter(|a| !a.starts_with("--"))
+        .filter(|a| !a.starts_with("--") && Some(*a) != call.as_ref())
         .map(String::as_str)
         .collect();
-    if tables.is_empty() {
+    if tables.is_empty() && !list_items && call.is_none() {
         tables.push("MrxSupportData.tSupportData");
     }
     let mut wad = WadArchive::open(BufReader::new(File::open(path)?))?;
@@ -87,6 +99,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..10 {
         mission.tick(0.5);
     }
+    for line in mission.take_log() {
+        println!("log {line}");
+    }
+    mission.take_commands();
+    if list_items {
+        for i in mission.support_items() {
+            println!(
+                "item {} {} {} cash {} fuel {} {} {} via {} brings {:?} stock {} free {}",
+                i.key,
+                i.kind,
+                i.module,
+                i.cash,
+                i.fuel,
+                i.designator,
+                i.icon,
+                i.vehicle,
+                i.cargo,
+                i.stock,
+                i.free
+            );
+        }
+    }
+    if let Some(key) = &call {
+        call_in(&mut mission, key);
+    }
     mission.lua().load(DUMP).set_name("=dump").exec()?;
     for t in tables {
         println!("== {t}");
@@ -96,6 +133,71 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Calls `key` in and plays the world's part, printing what happens.
+fn call_in(mission: &mut Mission, key: &str) {
+    use m2_game::airstrike::Launch;
+    use m2_game::api::Command;
+    mission.stock_support(key, 1, 1.0e6, 1000.0);
+    let took = mission.use_support(key);
+    println!("call {key}: {took}");
+    let mut pending: Vec<Command> = Vec::new();
+    for round in 0..40 {
+        for line in mission.take_log() {
+            println!("log {line}");
+        }
+        pending.extend(mission.take_commands());
+        if pending.is_empty() {
+            mission.tick(0.5);
+            if round > 30 {
+                break;
+            }
+            continue;
+        }
+        for c in std::mem::take(&mut pending) {
+            println!("cmd {c:?}");
+            match c {
+                Command::EquipDesignator { who, kind, .. } => {
+                    let at = mission
+                        .world()
+                        .borrow()
+                        .objects
+                        .get(&who)
+                        .map_or([0.0; 3], |o| {
+                            let (s, c) = o.yaw.sin_cos();
+                            [
+                                o.position[0] + s * 15.0,
+                                o.position[1],
+                                o.position[2] + c * 15.0,
+                            ]
+                        });
+                    let thrown = if kind.contains("Smoke") {
+                        "Smoke Grenade Projectile"
+                    } else {
+                        "Designator"
+                    };
+                    let g = mission.designator_thrown(who, thrown, at);
+                    println!("world: {kind} thrown as {g} to {at:?}");
+                    for _ in 0..8 {
+                        mission.tick(0.5);
+                    }
+                    mission.designator_settled(g, at);
+                }
+                Command::Flyby { guid, to, .. } => mission.flyby_arrived(guid, to),
+                Command::Ordnance {
+                    guid, at, launch, ..
+                } => {
+                    let v = match launch {
+                        Launch::Velocity(v) | Launch::Along(v) => v,
+                    };
+                    println!("world: ordnance {guid} heading {v:?}");
+                    mission.ordnance_burst(guid, at);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// The support data script's imports, each with its engine calls.

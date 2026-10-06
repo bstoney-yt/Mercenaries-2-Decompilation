@@ -134,6 +134,8 @@ pub struct Templates {
     pub tuning: HashMap<u32, VehicleTuning>,
     /// What templates leave when destroyed, and what pickups give.
     pub leavings: Leavings,
+    /// How air strikes' ordnance flies and what its blasts do.
+    pub ordnance: crate::ordnance::Ordnance,
 }
 
 impl Templates {
@@ -303,6 +305,7 @@ impl Templates {
                 .collect(),
             tuning: crate::tuning::read(&db),
             leavings: crate::pickup::read(&db),
+            ordnance: crate::ordnance::read(&db),
         }
     }
 }
