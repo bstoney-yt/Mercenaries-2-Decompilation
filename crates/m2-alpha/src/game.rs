@@ -113,6 +113,8 @@ pub struct Game {
     /// leave ([`crate::drops`]), and how many have.
     drops: Drops,
     dropped: u32,
+    /// The scripts have turned her controls off (a loading fade).
+    pub input_locked: bool,
 }
 
 /// A soldier's pickup is told from the others by its "crate": this, plus
@@ -139,6 +141,7 @@ impl Game {
             support: Support::default(),
             drops: Drops::default(),
             dropped: 0,
+            input_locked: false,
             support_hp: 0.0,
         }
     }
@@ -302,6 +305,11 @@ impl Game {
     pub fn step(&mut self, intent: Intent, dt: f32) {
         self.startup_props();
         self.fetch_world_vehicles(dt);
+        let intent = if self.input_locked {
+            Intent::default()
+        } else {
+            intent
+        };
         let intent = self.call_support(intent, dt);
         // The use key at what lies within reach: taken with the fight's.
         let mut taking = false;

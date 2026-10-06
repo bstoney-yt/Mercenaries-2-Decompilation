@@ -205,6 +205,10 @@ pub enum Command {
     /// The player can't be killed while on (`Player.SetHealthClamp`): her
     /// health stops short of nothing, for the survival system to step in.
     HealthClamp(bool),
+    /// The player's controls on or off (`Player.SetInputEnabled`): the
+    /// state system turns them off on entering a loading fade and back on
+    /// once the screen has faded in.
+    InputEnabled(bool),
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -891,6 +895,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.health_clamp = on;
             w.commands.push(Command::HealthClamp(on));
         }
+        values([])
+    })?;
+    add(&player, "SetInputEnabled", |w, _, a| {
+        let on = !matches!(a.get(1), Some(Value::Boolean(false)));
+        w.commands.push(Command::InputEnabled(on));
         values([])
     })?;
     add(&player, "SetSurvivalMode", |w, _, a| {

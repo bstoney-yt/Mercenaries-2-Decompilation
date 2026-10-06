@@ -502,6 +502,10 @@ impl MissionLink {
                     Command::FadeWorldSound { level, seconds } => {
                         self.fades.push((*level, *seconds))
                     }
+                    Command::InputEnabled(on) => {
+                        eprintln!("mission: controls {}", if *on { "on" } else { "off" });
+                        game.input_locked = !on;
+                    }
                     Command::HealthClamp(on) => {
                         eprintln!("mission: health clamp {on}");
                         game.combat.health_clamp = *on;

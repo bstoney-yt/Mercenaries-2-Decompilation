@@ -994,10 +994,36 @@ fn look_at_pickup(game: &mut Game, reach: f32) {
         }
     );
     let at = p.at + m2_math::glam::Vec3::Y * 0.2;
+    // Who lies or stands by it (the soldier who left it).
+    if let Some(n) = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .filter(|n| n.character.position.distance(p.at) < 3.0)
+        .min_by(|a, b| {
+            a.character
+                .position
+                .distance(p.at)
+                .total_cmp(&b.character.position.distance(p.at))
+        })
+    {
+        eprintln!(
+            "look-pickup: a person {:.1} m away, {}, {}",
+            n.character.position.distance(p.at),
+            if n.alive { "alive" } else { "dead" },
+            if n.ragdoll.is_some() {
+                "limp"
+            } else {
+                "not limp"
+            }
+        );
+    }
+    // From above, so that a body by it doesn't hide it.
     let back = (her - at).with_y(0.0).normalize_or(m2_math::glam::Vec3::Z);
     game.on_foot = false;
     game.camera =
-        FlyCamera::looking_at(at + back * reach + m2_math::glam::Vec3::Y * reach * 0.6, at);
+        FlyCamera::looking_at(at + back * reach * 0.5 + m2_math::glam::Vec3::Y * reach, at);
 }
 
 /// What stands where a bomb fell (`at`, x and z), as its pictures are
