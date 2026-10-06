@@ -579,6 +579,9 @@ fn default_for(lua: &Lua, name: &str) -> mlua::Result<Option<Value>> {
         ('s', _) => Some(Value::String(lua.create_string("")?)),
         ('b', _) => Some(Value::Boolean(false)),
         ('t', _) => Some(Value::Table(lua.create_table()?)),
+        // A handle (`uPlayer`) no script has set is nil: VzaCon001's PDA
+        // Close watch fires only while the global `uPlayer` is unset.
+        ('u', _) => Some(Value::Nil),
         _ => None,
     })
 }
@@ -843,7 +846,10 @@ mod tests {
         // A script's own state reads nil until set, and after it is unset.
         let unset: bool = host
             .lua()
-            .load("_bDone = true; _bDone = nil; return _bDone == nil and _tList == nil")
+            .load(
+                "_bDone = true; _bDone = nil; \
+                 return _bDone == nil and _tList == nil and uPlayer == nil",
+            )
             .eval()
             .unwrap();
         assert!(unset);
