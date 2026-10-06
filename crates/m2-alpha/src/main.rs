@@ -168,6 +168,9 @@ struct Options {
     satellite: Option<SatelliteShot>,
     /// With `--screenshot`: the picture with her PDA open.
     pda: bool,
+    /// With `--pda`: keys pressed (Flash key codes, 36 the map's current
+    /// contract) half way through the HUD's run.
+    pda_keys: Vec<i32>,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
@@ -331,6 +334,11 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--closeup" => o.closeup = true,
             "--pda" => o.pda = true,
+            "--pda-key" => o.pda_keys.push(
+                value()?
+                    .parse()
+                    .context("--pda-key expects a Flash key code")?,
+            ),
             "--behind" => o.behind = true,
             "--slung" => {
                 o.slung = Some(match value()?.as_str() {
@@ -1011,7 +1019,13 @@ fn screenshot(
             } else {
                 0.5
             });
-        hud.settle(&info, (w, h), seconds, Duration::from_secs(120));
+        hud.settle(
+            &info,
+            (w, h),
+            seconds,
+            &options.pda_keys,
+            Duration::from_secs(120),
+        );
         info.game = Some(gamehud::HudState::of(&mut game));
     }
     let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);

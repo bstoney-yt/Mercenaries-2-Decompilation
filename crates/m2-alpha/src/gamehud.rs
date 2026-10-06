@@ -406,6 +406,40 @@ pub struct HudState {
     /// The mission's calls to the HUD's interface (`Hud.Fanfare:Create`...)
     /// not yet passed on.
     pub hud_calls: Vec<HudCall>,
+    /// Keys going down (true) or up while the PDA is open, as Flash's key
+    /// codes ([`flash_key`]): the PDA's movies' own `Key` listeners take
+    /// them (the map's Home shows the current contract).
+    pub keys: Vec<(i32, bool)>,
+}
+
+/// Flash's key code (the PC's virtual-key code) of `key`, for the keys
+/// the PDA's movies listen for and their neighbours.
+pub fn flash_key(key: egui::Key) -> Option<i32> {
+    use egui::Key::*;
+    let name = key.name();
+    if name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric() {
+        return Some(i32::from(name.as_bytes()[0].to_ascii_uppercase()));
+    }
+    Some(match key {
+        Backspace => 8,
+        Tab => 9,
+        Enter => 13,
+        Escape => 27,
+        Space => 32,
+        PageUp => 33,
+        PageDown => 34,
+        End => 35,
+        Home => 36,
+        ArrowLeft => 37,
+        ArrowUp => 38,
+        ArrowRight => 39,
+        ArrowDown => 40,
+        Insert => 45,
+        Delete => 46,
+        OpenBracket => 219,
+        CloseBracket => 221,
+        _ => return None,
+    })
 }
 
 /// A value passed between the mission's scripts and the HUD's, which run
@@ -536,6 +570,8 @@ impl HudState {
         let mut hurts = std::mem::take(&mut self.hurts);
         let mut messages = std::mem::take(&mut self.messages);
         let mut hud_calls = std::mem::take(&mut self.hud_calls);
+        let mut keys = std::mem::take(&mut self.keys);
+        keys.extend(later.keys.iter().copied());
         hurts.extend(later.hurts.iter().copied());
         messages.extend(later.messages.iter().cloned());
         hud_calls.extend(later.hud_calls.iter().cloned());
@@ -544,6 +580,7 @@ impl HudState {
             hurts,
             messages,
             hud_calls,
+            keys,
             ..later
         };
     }
@@ -1044,6 +1081,8 @@ struct Thread {
     reticle_logged: bool,
     /// Whether its script showed the PDA last frame (its movie drawn).
     pda_shown: bool,
+    /// Keys for the movies' `Key` listeners ([`HudState::keys`]).
+    keys: Vec<(i32, bool)>,
     /// HUD updates since the PDA's movie loaded (`None`: not yet), and
     /// since `TogglePDA` was last sent.
     pda_ready: Option<u32>,
@@ -1167,6 +1206,7 @@ impl Thread {
             covers_seen: String::new(),
             reticle_logged: false,
             pda_shown: false,
+            keys: Vec::new(),
             pda_ready: None,
             since_toggle: u32::MAX,
             pda_scripted: None,
@@ -1280,6 +1320,9 @@ impl Thread {
         }
         if let Err(e) = self.pose_wheel(state) {
             log.push(format!("wheel: {e}"));
+        }
+        if self.pda_shown {
+            self.keys.extend(state.keys.iter().copied());
         }
         self.play_flash(dt, &mut log);
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
@@ -1581,6 +1624,7 @@ impl Thread {
                     rt,
                     seen: None,
                     since_status: f64::INFINITY,
+                    levels: Vec::new(),
                 },
             );
         }
@@ -1611,6 +1655,19 @@ impl Thread {
             log.push(format!("flash {}: {name}({} args)", m.swf, args.len()));
             m.rt.call(&name, &args);
         }
+        for (code, down) in std::mem::take(&mut self.keys) {
+            log.push(format!(
+                "flash: key {code} {}",
+                if down { "down" } else { "up" }
+            ));
+            for m in self.flash.values_mut() {
+                if down {
+                    m.rt.key_down(code);
+                } else {
+                    m.rt.key_up(code);
+                }
+            }
+        }
         let mut commands = Vec::new();
         let mut status = Vec::new();
         for (&id, m) in &mut self.flash {
@@ -1628,6 +1685,21 @@ impl Thread {
                 log.push(format!("flash {}: {line}", m.swf));
             }
             commands.extend(m.rt.take_commands().into_iter().map(|c| (id, c)));
+            let levels: Vec<_> =
+                m.rt.player
+                    .levels
+                    .iter()
+                    .filter(|(l, _)| **l != 0)
+                    .map(|(&l, &r)| (l, r))
+                    .collect();
+            if levels != m.levels {
+                // topbar's `UpdateBlip` places icons on `_level1`'s map,
+                // so blips sent before it loaded go again.
+                if levels.iter().any(|l| !m.levels.contains(l)) {
+                    screen.borrow_mut().resend_pda_blips(id);
+                }
+                m.levels = levels;
+            }
         }
         {
             let movies = self.movies.borrow();
@@ -2458,6 +2530,9 @@ struct FlashMovie {
     seen: Option<(Option<[i32; 4]>, bool)>,
     /// Seconds since its state was last logged ([`flash_status`]).
     since_status: f64,
+    /// The movies on other levels, by their roots, as last seen: one
+    /// loaded (topbar's map) needs the PDA's blips again.
+    levels: Vec<(i32, flash::ClipId)>,
 }
 
 /// A movie's state, once a second while it plays: its root's frame,

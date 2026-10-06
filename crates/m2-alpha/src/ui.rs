@@ -19,7 +19,7 @@ use m2_math::glam::{Mat4, Vec3};
 
 use crate::combat::Weapon;
 use crate::config::Config;
-use crate::gamehud::{GameHud, HudState};
+use crate::gamehud::{GameHud, HudState, flash_key};
 use crate::mission::MissionView;
 use crate::support::{SupportHud, WheelHud};
 
@@ -149,13 +149,35 @@ impl Hud {
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
         }
+        if info.support.pda {
+            state.keys = input
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed,
+                        repeat: false,
+                        ..
+                    } => Some((flash_key(*key)?, *pressed)),
+                    _ => None,
+                })
+                .collect();
+        }
         game.update(&self.ctx, state);
     }
 
     /// Runs the game's HUD `seconds` on `info`, waiting for each step (and
     /// up to `timeout` for its scripts to start): for screenshots, which
-    /// draw one frame.
-    pub fn settle(&mut self, info: &HudInfo, size: (u32, u32), seconds: f64, timeout: Duration) {
+    /// draw one frame. `keys` (Flash key codes) are pressed half way.
+    pub fn settle(
+        &mut self,
+        info: &HudInfo,
+        size: (u32, u32),
+        seconds: f64,
+        keys: &[i32],
+        timeout: Duration,
+    ) {
         let (Some(game), Some(state)) = (&mut self.game, &info.game) else {
             return;
         };
@@ -188,10 +210,16 @@ impl Hud {
         state.messages.clear();
         state.hud_calls.clear();
         state.dt = step;
-        for _ in 0..(seconds / step).ceil() as usize {
+        let steps = (seconds / step).ceil() as usize;
+        for i in 0..steps {
             if !game.ready() {
                 break;
             }
+            state.keys = match i.checked_sub(steps / 2) {
+                Some(0) => keys.iter().map(|&k| (k, true)).collect(),
+                Some(1) => keys.iter().map(|&k| (k, false)).collect(),
+                _ => Vec::new(),
+            };
             game.update_and_wait(&self.ctx, state.clone(), Duration::from_secs(10));
         }
     }
