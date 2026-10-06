@@ -899,6 +899,11 @@ fn pda_probe(lua: &Lua) -> String {
                 end
             end
             table.sort(d)
+            local n = 0
+            if type(w.CustomData.tMissions) == "table" then
+                for _ in pairs(w.CustomData.tMissions) do n = n + 1 end
+            end
+            d[#d + 1] = "tMissions=" .. n .. " sSelectedMission=" .. tostring(w.CustomData.sSelectedMission)
             local bd = rawget(w, "BasicData")
             if type(bd) == "table" then
                 d[#d + 1] = "enabled=" .. tostring(bd.bEnabled) .. " owner=" .. tostring(bd.uOwnerGuid)
@@ -1310,21 +1315,25 @@ impl Thread {
         // Opened by its script: its movie and what hangs under it. The
         // scripts put the HUD to sleep (`ToggleHud`) as for the satellite,
         // which leaves some of it awake here.
-        let pda_names: HashSet<String> = items
+        // By id: the natives are made nameless, and the movie's widget
+        // has no layout name either. With the fade, which dims the world.
+        let pda_movies: HashSet<u32> = items
             .iter()
             .filter_map(|i| match i {
                 DrawItem::Flash {
                     widget,
                     swf: Some(f),
                     ..
-                } if f.contains("topbar") => names.get(widget).cloned(),
+                } if f.contains("topbar") => Some(*widget),
                 _ => None,
             })
             .collect();
         let only = if state.support.pda && !scripted {
             Some(widgets_under(&screen.borrow(), &names, |n| n == "tutorial"))
         } else if scripted {
-            let keep = widgets_under(&screen.borrow(), &names, |n| pda_names.contains(n));
+            let screen = screen.borrow();
+            let mut keep = widgets_below(&screen, |id| pda_movies.contains(&id));
+            keep.extend(widgets_under(&screen, &names, |n| n == "FlashFade"));
             if !self.pda_hid_logged {
                 self.pda_hid_logged = true;
                 let mut hid: Vec<&str> = items
@@ -1336,8 +1345,8 @@ impl Thread {
                 hid.sort_unstable();
                 hid.dedup();
                 log.push(format!(
-                    "PDA keeps {:?}; hides awake {}",
-                    pda_names,
+                    "PDA keeps {} widgets; hides awake {}",
+                    keep.len(),
                     hid.join(", ")
                 ));
             }
@@ -2113,6 +2122,11 @@ fn widgets_under(
             .unwrap_or_default();
         pick(name)
     };
+    widgets_below(screen, named)
+}
+
+/// The widgets `pick` picks by id, and everything under them.
+fn widgets_below(screen: &gui_runtime::Screen, named: impl Fn(u32) -> bool) -> HashSet<u32> {
     screen
         .widgets()
         .map(|(id, _)| id)
