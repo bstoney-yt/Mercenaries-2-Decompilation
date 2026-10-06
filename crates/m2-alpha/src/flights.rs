@@ -301,6 +301,22 @@ impl Flights {
         std::mem::take(&mut self.wanted)
     }
 
+    /// Asks for model `hash` (an air strike's aircraft or bomb), unless
+    /// it is loaded or asked for.
+    pub fn want(&mut self, hash: u32) {
+        if !self.models.contains_key(&hash) && !self.wanted.contains(&hash) {
+            self.models.insert(hash, None);
+            self.wanted.push(hash);
+        }
+    }
+
+    /// Draws model `hash` at `place`, once it has loaded.
+    pub fn draw_model(&self, queue: &mut DrawQueue, hash: u32, place: Mat4) {
+        if let Some(m) = self.models.get(&hash).and_then(Option::as_ref) {
+            m.gpu.draw(queue, place);
+        }
+    }
+
     /// A model asked for has loaded.
     pub fn loaded(&mut self, hash: u32, model: FlightModel) {
         self.models.insert(hash, Some(model));

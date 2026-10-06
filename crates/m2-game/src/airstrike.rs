@@ -192,10 +192,13 @@ fn flyby(w: &mut ScriptWorld, _: &Lua, a: &[Value]) -> mlua::Result<MultiValue> 
     values([guid_value(Some(guid))])
 }
 
+/// A strike call's callback and the data it is called with.
+type Callback = (Function, Option<Table>);
+
 /// Reads the arguments after where and how fast: the fuse (the first
 /// string) and its value (a number after it), the owner (the first guid
 /// after the fuse), the callback and its data.
-fn after_launch(rest: &[Value]) -> (Fuse, Option<u32>, Option<(Function, Option<Table>)>) {
+fn after_launch(rest: &[Value]) -> (Fuse, Option<u32>, Option<Callback>) {
     let fuse_at = rest.iter().position(|v| matches!(v, Value::String(_)));
     let (name, value) = match fuse_at {
         Some(i) => (
@@ -235,7 +238,7 @@ fn launch(
     fuse: Fuse,
     target: Option<(Option<u32>, [f32; 3])>,
     owner: Option<u32>,
-    callback: Option<(Function, Option<Table>)>,
+    callback: Option<Callback>,
 ) -> u32 {
     let guid = w.spawn_guid();
     w.insert(guid, Object::new(&what, at));

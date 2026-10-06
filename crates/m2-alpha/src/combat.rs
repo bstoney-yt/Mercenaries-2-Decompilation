@@ -759,6 +759,11 @@ pub struct Trigger {
     pub pda: bool,
 }
 
+/// A thrown marker smokes from this long after it leaves her hand until
+/// this long, seconds, a puff every [`MARKER_PUFF`].
+const MARKER_SMOKE: (f32, f32) = (1.0, 30.0);
+const MARKER_PUFF: f32 = 0.3;
+
 /// A designator she threw: thrown as a grenade is, it bounces and comes
 /// to rest, and never goes off.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -767,6 +772,8 @@ pub struct Thrown {
     pub at: Vec3,
     velocity: Vec3,
     pub age: f32,
+    /// The scripts have been told it lies still.
+    pub settled: bool,
 }
 
 /// The fight's state.
@@ -1728,6 +1735,7 @@ impl Combat {
                 at: from,
                 velocity,
                 age: 0.0,
+                settled: false,
             });
             return;
         }
@@ -1747,8 +1755,13 @@ impl Combat {
             }
             *left > 0.0
         });
+        let mut marks = Vec::new();
         for t in &mut self.thrown {
+            let puffed = (t.age / MARKER_PUFF).floor();
             t.age += dt;
+            if t.age >= MARKER_SMOKE.0 && (t.age / MARKER_PUFF).floor() > puffed {
+                marks.push(t.at);
+            }
             t.velocity.y -= m2_engine::physics::GRAVITY * dt;
             let step = t.velocity * dt;
             if let Some((d, normal)) = f.physics.cast_ray(t.at, step, step.length()) {
@@ -1761,6 +1774,17 @@ impl Combat {
             } else {
                 t.at += step;
             }
+        }
+        // A marker smokes from a moment after it lands, a while.
+        self.thrown.retain(|t| t.age < MARKER_SMOKE.1);
+        for at in marks {
+            self.effect(
+                Effect::Smoke {
+                    at: at + Vec3::Y * 0.5,
+                    size: 1.5,
+                },
+                3.0,
+            );
         }
         let mut puffs = Vec::new();
         let mut streaks = Vec::new();
@@ -2010,6 +2034,12 @@ impl Combat {
             );
         }
         alarm(f.people, at);
+    }
+
+    /// Harm a blast's frag does around `at`, without fire or sound of its
+    /// own.
+    pub fn harm_at(&mut self, f: &mut Field<'_>, at: Vec3, radius: f32, damage: f32) {
+        self.harm(f, at, (radius, damage), false);
     }
 
     /// The bomb's final strike at `at`, after it lands.

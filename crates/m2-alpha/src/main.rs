@@ -53,6 +53,7 @@ mod save;
 mod scene;
 mod sound;
 mod startup;
+mod strikes;
 mod support;
 mod ui;
 
@@ -166,6 +167,9 @@ struct Options {
     look_pickup: Option<f32>,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
+    /// `--support`: support items to stock and call in once the scripts
+    /// run, as if bought, for testing.
+    support: Vec<String>,
     mission_seconds: f32,
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
@@ -290,6 +294,7 @@ fn parse_args() -> anyhow::Result<Options> {
                     std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
                 o.mission_drivers.push((path, code));
             }
+            "--support" => o.support.push(value()?),
             "--spawns" => o.list_spawns = value()?.parse().context("--spawns expects a count")?,
             "--face" => {
                 o.face = Some(
@@ -465,6 +470,7 @@ fn main() -> anyhow::Result<()> {
         fly: options.fly,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
+        support: options.support.clone(),
         state: None,
         error: None,
     };
@@ -1753,7 +1759,8 @@ fn mission_for_screenshot(
     out: &std::path::Path,
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
-    let mut link = mission::MissionLink::start(install, options.mission_drivers.clone());
+    let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
+        .with_support(options.support.clone());
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -3155,6 +3162,8 @@ struct App {
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
     mission_drivers: Vec<(String, String)>,
+    /// Support items to call in (`--support`).
+    support: Vec<String>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -3217,7 +3226,8 @@ impl App {
             mission: match (&self.install, &self.mode) {
                 (Some(install), Mode::Island(_)) if self.mission => Some(
                     mission::MissionLink::start(install, self.mission_drivers.clone())
-                        .with_keys(self.config.keys.clone()),
+                        .with_keys(self.config.keys.clone())
+                        .with_support(self.support.clone()),
                 ),
                 _ => None,
             },

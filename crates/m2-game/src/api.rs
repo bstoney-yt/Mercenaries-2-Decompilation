@@ -755,6 +755,18 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     crate::airstrike::install(&lib("Airstrike")?, &add)?;
 
+    // A string's hash, as the scripts key tables by name (their recruits'
+    // states). The archive's name hash: the scripts only compare hashes
+    // with each other, so any one hash they all share serves.
+    add(&lib("String")?, "GetHash", |_, _, a| {
+        values(a.first().and_then(|v| match v {
+            Value::String(s) => Some(Value::Integer(i64::from(m2_assets::name_hash(
+                &s.to_string_lossy(),
+            )))),
+            _ => None,
+        }))
+    })?;
+
     let debug = lib("Debug")?;
     add(&debug, "Printf", |w, _, a| {
         let text: Vec<String> = a
