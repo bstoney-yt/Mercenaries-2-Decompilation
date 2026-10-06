@@ -675,10 +675,13 @@ impl WorldIndex {
         routes.path_of.extend(layer.hashes("Path"));
         if let Some(c) = layer.component("AiPatrol") {
             for (id, rec) in c.records().unwrap_or_default() {
-                if let Some(b) = rec.get(8..12) {
-                    routes
-                        .patrol_of
-                        .insert(id, u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                // A patrol naming no path (0: the guerrilla HQ's path
+                // spawners) leaves its entity's own path to it.
+                if let Some(b) = rec.get(8..12)
+                    && let path = u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    && path != 0
+                {
+                    routes.patrol_of.insert(id, path);
                 }
             }
         }
