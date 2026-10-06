@@ -634,9 +634,6 @@ pub struct GameHud {
     pending: Vec<(u32, Option<Image>)>,
     /// Textures by asset hash (`None`: missing in the archive).
     textures: HashMap<u32, Option<TextureHandle>>,
-    /// One white pixel, for the solid quads (fills, fades). egui's own
-    /// white texel (`WHITE_UV`) left them undrawn in pictures.
-    white: Option<TextureHandle>,
     /// The last objective message seen, to tell new ones.
     last_message: Option<ObjectiveMessage>,
     /// The last of the mission's HUD calls passed on.
@@ -674,7 +671,6 @@ impl GameHud {
             prims: Vec::new(),
             pending: Vec::new(),
             textures: HashMap::new(),
-            white: None,
             last_message: None,
             last_call: 0,
             last_time: None,
@@ -801,13 +797,6 @@ impl GameHud {
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
-        if self.white.is_none() {
-            self.white = Some(ctx.load_texture(
-                "hud white",
-                egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255; 4]),
-                TextureOptions::NEAREST,
-            ));
-        }
         for (hash, image) in self.pending.drain(..) {
             let handle = image.map(|i| {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -825,36 +814,48 @@ impl GameHud {
         }
     }
 
-    /// Paints the HUD as last drawn.
+    /// Paints the HUD as last drawn. Solid prims (fills, fades) go
+    /// through egui's own shapes: as meshes of ours they left pictures
+    /// untouched (rounds 23-28), while egui's filled rects show.
     pub fn paint(&self, painter: &egui::Painter) {
         let mut mesh = Mesh::default();
         for p in &self.prims {
-            let texture = match p.texture {
-                Some(hash) => match self.textures.get(&hash) {
-                    Some(Some(t)) => t.id(),
-                    // Missing, or not uploaded yet.
-                    _ => continue,
-                },
-                None => match &self.white {
-                    Some(t) => t.id(),
-                    None => continue,
-                },
+            let [r, g, b, a] = p.colour.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+            let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
+            let Some(hash) = p.texture else {
+                if !mesh.is_empty() {
+                    painter.add(std::mem::take(&mut mesh));
+                }
+                let mut points: Vec<egui::Pos2> = Vec::with_capacity(4);
+                for c in p.corners {
+                    let at = pos2(c[0], c[1]);
+                    if points.last() != Some(&at) && points.first() != Some(&at) {
+                        points.push(at);
+                    }
+                }
+                if points.len() >= 3 {
+                    painter.add(egui::Shape::convex_polygon(
+                        points,
+                        colour,
+                        egui::Stroke::NONE,
+                    ));
+                }
+                continue;
+            };
+            let texture = match self.textures.get(&hash) {
+                Some(Some(t)) => t.id(),
+                // Missing, or not uploaded yet.
+                _ => continue,
             };
             if mesh.texture_id != texture && !mesh.is_empty() {
                 painter.add(std::mem::take(&mut mesh));
             }
             mesh.texture_id = texture;
-            let [r, g, b, a] = p.colour.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
-            let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
             let base = mesh.vertices.len() as u32;
             for (c, uv) in p.corners.iter().zip(&p.uv) {
-                let uv = match p.texture {
-                    Some(_) => pos2(uv[0], uv[1]),
-                    None => pos2(0.5, 0.5),
-                };
                 mesh.vertices.push(egui::epaint::Vertex {
                     pos: pos2(c[0], c[1]),
-                    uv,
+                    uv: pos2(uv[0], uv[1]),
                     color: colour,
                 });
             }
@@ -3407,7 +3408,6 @@ mod paint_tests {
             )],
             pending: Vec::new(),
             textures: HashMap::new(),
-            white: None,
             last_message: None,
             last_call: 0,
             last_time: None,
