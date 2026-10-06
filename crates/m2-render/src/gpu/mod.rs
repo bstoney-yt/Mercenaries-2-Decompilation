@@ -1786,7 +1786,11 @@ impl WgpuBackend {
             surface: [
                 if l.haze.grey_sun { 1.0 } else { 0.0 },
                 l.beam_gain,
-                0.0,
+                if std::env::var("M2_GROUND_SPACE").is_ok_and(|v| v == "linear") {
+                    1.0
+                } else {
+                    0.0
+                },
                 0.0,
             ],
         };

@@ -127,6 +127,11 @@ pub const SUN_SETS: Vec3 = Vec3::new(0.87, 0.0, 0.49);
 /// the searchlights' beams in full; below it they fade out (inferred).
 const BEAMS_FULL_RAMP: f32 = 0.3;
 
+/// How much of a beam's alpha shows at night: with the beams at full
+/// opacity their cores came out at L222-247 against footage's L130-137 (PC
+/// round D), which at the cone's brightness is about this alpha (inferred).
+const BEAM_NIGHT_ALPHA: f32 = 0.55;
+
 /// The lowest the sun is drawn, in radians over the horizon, so that low
 /// `LightTime`s still light the ground a little.
 const SUN_LOWEST: f32 = 0.05;
@@ -501,9 +506,9 @@ impl Atmosphere {
         // shows their beams from dusk through the night and none by day, so
         // they follow how far the night's ramp has come in (inferred; the
         // game's own switch is probably the mission's lights).
-        lighting.beam_gain = self
-            .monochrome
-            .map_or(0.0, |m| (m.w / BEAMS_FULL_RAMP).clamp(0.0, 1.0));
+        lighting.beam_gain = self.monochrome.map_or(0.0, |m| {
+            (m.w / BEAMS_FULL_RAMP).clamp(0.0, 1.0) * BEAM_NIGHT_ALPHA
+        });
     }
 
     /// The haze these settings describe: Hoffman and Preetham's standard
@@ -985,7 +990,7 @@ mod tests {
             ..plain(0.0, 0.0)
         };
         night.apply(&mut lighting);
-        assert_eq!(lighting.beam_gain, 1.0);
+        assert_eq!(lighting.beam_gain, BEAM_NIGHT_ALPHA);
         day.lerp(&night, 0.5).apply(&mut lighting);
         assert!(lighting.beam_gain > 0.0 && lighting.beam_gain < 1.0);
     }
