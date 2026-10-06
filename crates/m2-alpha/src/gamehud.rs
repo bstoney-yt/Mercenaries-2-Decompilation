@@ -1027,6 +1027,7 @@ struct Thread {
     since_toggle: u32,
     /// Whether its script showed it, as last logged.
     pda_scripted: Option<bool>,
+    pda_hid_logged: bool,
     /// The zones the radar's script holds, as last read.
     zones: Vec<Zone>,
     /// The island's roads, read with the radar's map.
@@ -1108,12 +1109,15 @@ impl Thread {
         // the same userdata, not m2's number. The game has the dialog box
         // module loaded at boot; unloaded, its `oSystemDialogBoxFlash` is a
         // stub, and `MrxGuiPda.Open` takes that for a system dialog up.
+        // Her cash is 0, as `PlayerCashChanged` tells the HUD (the PDA's
+        // stats page formats `Player.GetCash()`).
         mission
             .run(
                 "local me = Sys.StringToGuid(\"0x1\")
                  for _, f in ipairs({\"GetLocalPlayer\", \"GetPrimaryPlayer\"}) do
                      rawset(Player, f, function() return me end)
                  end
+                 rawset(Player, \"GetCash\", function() return 0 end)
                  import(\"MrxGuiDialogBox\")
                  MrxGuiManager.CreateGui(me)",
                 "create gui",
@@ -1140,6 +1144,7 @@ impl Thread {
             pda_ready: None,
             since_toggle: u32::MAX,
             pda_scripted: None,
+            pda_hid_logged: false,
             zones: Vec::new(),
             roads: Vec::new(),
             pda: None,
@@ -1302,8 +1307,41 @@ impl Thread {
         }
         // Not opened by its script: only the PDA drawn here and the
         // tutorial box.
+        // Opened by its script: its movie and what hangs under it. The
+        // scripts put the HUD to sleep (`ToggleHud`) as for the satellite,
+        // which leaves some of it awake here.
+        let pda_names: HashSet<String> = items
+            .iter()
+            .filter_map(|i| match i {
+                DrawItem::Flash {
+                    widget,
+                    swf: Some(f),
+                    ..
+                } if f.contains("topbar") => names.get(widget).cloned(),
+                _ => None,
+            })
+            .collect();
         let only = if state.support.pda && !scripted {
             Some(widgets_under(&screen.borrow(), &names, |n| n == "tutorial"))
+        } else if scripted {
+            let keep = widgets_under(&screen.borrow(), &names, |n| pda_names.contains(n));
+            if !self.pda_hid_logged {
+                self.pda_hid_logged = true;
+                let mut hid: Vec<&str> = items
+                    .iter()
+                    .map(widget_of)
+                    .filter(|w| !keep.contains(w))
+                    .filter_map(|w| names.get(&w).map(String::as_str))
+                    .collect();
+                hid.sort_unstable();
+                hid.dedup();
+                log.push(format!(
+                    "PDA keeps {:?}; hides awake {}",
+                    pda_names,
+                    hid.join(", ")
+                ));
+            }
+            Some(keep)
         } else {
             state.support.satellite.map(|_| {
                 widgets_under(&screen.borrow(), &names, |n| {
