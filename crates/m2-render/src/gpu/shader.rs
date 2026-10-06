@@ -66,6 +66,8 @@ struct Frame {
     // (`surface_sun`), y: scale on searchlight beams' alpha, z: ground
     // is summed in linear light, w: scale on the air in front of clouds
     surface: vec4<f32>,
+    // x: the least cloud cover anywhere in the sky
+    sky_fit: vec4<f32>,
 };
 
 // The game lights surfaces in display values: the sun's colour times
@@ -725,7 +727,7 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         // coverage sets how much of the sum clears a soft cut-off.
         let density = n1 * 0.6 + n3 * 0.25 + n2 * 0.15;
         let cut = 1.0 - frame.clouds.w;
-        var alpha = smoothstep(cut - 0.1, cut + 0.35, density);
+        var alpha = max(smoothstep(cut - 0.1, cut + 0.35, density), frame.sky_fit.x);
         let mass = alpha;
         // Far deck fades into the haze towards the horizon.
         if frame.wind.z < 1.5 {

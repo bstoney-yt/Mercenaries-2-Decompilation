@@ -242,6 +242,8 @@ struct FrameUniforms {
     /// x: surfaces take the sun's brightness without its hue, w: scale on
     /// the air in front of the clouds.
     surface: [f32; 4],
+    /// x: the least cloud cover anywhere in the sky (`M2_CLOUD_FILL`).
+    sky_fit: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -1833,6 +1835,18 @@ impl WgpuBackend {
                     .ok()
                     .and_then(|v| v.parse::<f32>().ok())
                     .unwrap_or(1.0),
+            ],
+            // `M2_CLOUD_FILL=<x>` covers at least that share of every part
+            // of the sky with the cloud deck's colour (1: all of it), to
+            // see whether the game's sky is all deck.
+            sky_fit: [
+                std::env::var("M2_CLOUD_FILL")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0),
+                0.0,
+                0.0,
+                0.0,
             ],
         };
         self.queue
