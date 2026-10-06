@@ -831,7 +831,14 @@ impl WgpuBackend {
         let draw_buffer = Self::draw_uniforms(&device, 1024);
         let palette_buffer = Self::palette(&device, INITIAL_PALETTE);
         let draw_group = Self::draw_group(&device, &draw_layout, &draw_buffer, &palette_buffer);
-        let samplers = [wgpu::AddressMode::Repeat, wgpu::AddressMode::ClampToEdge].map(|mode| {
+        // `M2_WRAP=mirror` flips every second repeat (to see whether model
+        // texture seams, not the data, make the cliff bands).
+        let repeat = if std::env::var("M2_WRAP").is_ok_and(|v| v == "mirror") {
+            wgpu::AddressMode::MirrorRepeat
+        } else {
+            wgpu::AddressMode::Repeat
+        };
+        let samplers = [repeat, wgpu::AddressMode::ClampToEdge].map(|mode| {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("base"),
                 address_mode_u: mode,
