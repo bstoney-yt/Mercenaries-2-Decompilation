@@ -1496,6 +1496,17 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
                 .map(|w| (w, info.rounds * w.clip()))
         }),
     };
+    // The launcher's rounds of an ammunition pickup: clips, as the
+    // launcher's own 3 are.
+    let launcher = match weapon {
+        Some(_) => 0,
+        None => info
+            .gives
+            .iter()
+            .filter(|&&(ammo, _)| fires(Weapon::GrenadeLauncher.model_name(), ammo))
+            .map(|(_, n)| n * Weapon::GrenadeLauncher.clip())
+            .sum(),
+    };
     let grenade = templates.id("Grenade Projectile");
     let grenades = info
         .gives
@@ -1509,6 +1520,7 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
         reach: info.radius,
         weapon,
         gives,
+        launcher,
         grenades,
         health: if info.kind == m2_engine::pickup::HEALTH {
             info.rounds as f32
