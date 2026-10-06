@@ -54,7 +54,7 @@ pub fn stub_args() -> bool {
 
 /// A stub call's argument as the log shows it: numbers, short strings,
 /// stubs by name, other tables as `{}`.
-fn show_arg(v: &Value) -> String {
+pub(crate) fn show_arg(v: &Value) -> String {
     match v {
         Value::Nil => "nil".to_owned(),
         Value::Boolean(b) => b.to_string(),

@@ -234,6 +234,26 @@ impl Events {
             .collect()
     }
 
+    /// Pending events with their parameters, for diagnostics:
+    /// `ObjectHealth{1, "<", 100}`.
+    pub fn describe(&self) -> Vec<String> {
+        self.store
+            .borrow()
+            .pending
+            .iter()
+            .map(|p| {
+                let params: Vec<String> = p
+                    .params
+                    .clone()
+                    .sequence_values::<Value>()
+                    .filter_map(Result::ok)
+                    .map(|v| crate::script::show_arg(&v))
+                    .collect();
+                format!("{}{{{}}}", p.kind, params.join(", "))
+            })
+            .collect()
+    }
+
     /// The names pending `ScriptEvent` events wait to be posted.
     pub fn awaited(&self) -> Vec<String> {
         self.store
