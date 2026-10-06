@@ -735,6 +735,21 @@ impl Mission {
         self.events.post(name);
     }
 
+    /// Posts a script event about the local player as the resident
+    /// script's network-event callback does for the PDA's opening and
+    /// shutting (`"PDA Open"` with `{ uPlayer = 1 }`): watches filter on
+    /// whose PDA it was.
+    pub fn post_for_player(&mut self, name: &str) {
+        let data = self.host.lua().create_table().and_then(|t| {
+            t.set("uPlayer", 1)?;
+            Ok(t)
+        });
+        match data {
+            Ok(t) => self.events.post_data(name, mlua::Value::Table(t)),
+            Err(_) => self.events.post(name),
+        }
+    }
+
     /// Logs what happened, then carries out layer requests and deliveries
     /// (at once) and logs what their callbacks did, until nothing is left.
     fn settle(&mut self, when: &str) {
