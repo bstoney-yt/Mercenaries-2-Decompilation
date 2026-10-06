@@ -69,6 +69,9 @@ const MARKER_TIMER: f32 = 4.0;
 const SUPPORT_AFTER: f64 = 2.0;
 const SUPPORT_CASH: f64 = 1.0e7;
 const SUPPORT_FUEL: f64 = 1000.0;
+/// She is ashore this far above the water (metres): not seated in the
+/// start's boat, which the scripts don't count as driving.
+const ASHORE_HEIGHT: f32 = 2.0;
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -509,11 +512,13 @@ impl MissionLink {
             mission.set_player_reserve(GRENADE, game.combat.grenades);
             // Called on foot, on land, as the support menu is.
             let on_land = game.on_foot
-                && game
-                    .scene
-                    .player
-                    .as_ref()
-                    .is_some_and(|p| p.landed && p.driving.is_none() && !p.down);
+                && game.scene.player.as_ref().is_some_and(|p| {
+                    p.landed
+                        && p.driving.is_none()
+                        && !p.down
+                        && p.character.position.y > WATERLINE + ASHORE_HEIGHT
+                })
+                && self.vehicles.riding.is_none();
             if mission.now() >= SUPPORT_AFTER && on_land {
                 for key in std::mem::take(&mut self.support) {
                     mission.stock_support(&key, 1, SUPPORT_CASH, SUPPORT_FUEL);
