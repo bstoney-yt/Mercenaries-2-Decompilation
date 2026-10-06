@@ -1134,7 +1134,8 @@ impl Thread {
         // module loaded at boot; unloaded, its `oSystemDialogBoxFlash` is a
         // stub, and `MrxGuiPda.Open` takes that for a system dialog up.
         // Her cash is 0, as `PlayerCashChanged` tells the HUD (the PDA's
-        // stats page formats `Player.GetCash()`).
+        // stats page formats `Player.GetCash()`). She is the only player
+        // (`UpdateAllPlayerMarkers` puts each on the PDA's map).
         mission
             .run(
                 "local me = Sys.StringToGuid(\"0x1\")
@@ -1142,6 +1143,7 @@ impl Thread {
                      rawset(Player, f, function() return me end)
                  end
                  rawset(Player, \"GetCash\", function() return 0 end)
+                 rawset(Player, \"GetAllPlayers\", function() return { me } end)
                  import(\"MrxGuiDialogBox\")
                  MrxGuiManager.CreateGui(me)",
                 "create gui",
