@@ -102,11 +102,16 @@ return c.sColor .. tag .. " [objective." .. c.sPrefix .. c.sStatus .. "]" .. " "
 /// A mission's call to the HUD's interface, as the engine hands it on:
 /// `HudInterface.<group>.<method>(HudInterface.<group>, data)`. Answers
 /// whether the HUD has that method.
+///
+/// `HudInterface` is a global of `MrxGuiInterface`'s script, which runs in
+/// its own environment like every module: its globals are the module's
+/// members.
 const HUD_CALL: &str = r#"
 local group, method, data = ...
-local hud = HudInterface or Hud
-local g = hud and rawget(hud, group)
-local f = type(g) == "table" and rawget(g, method)
+local module = rawget(_G, "MrxGuiInterface")
+local hud = type(module) == "table" and module.HudInterface
+local g = type(hud) == "table" and hud[group]
+local f = type(g) == "table" and g[method]
 if type(f) ~= "function" then return false end
 f(g, data)
 return true
