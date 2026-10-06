@@ -2514,9 +2514,28 @@ fn flash_status(m: &FlashMovie, paused: bool, fonts: Option<&flash::FontBook>) -
         .iter()
         .map(|(name, (n, uv, lo, hi))| format!("{name} x{n} uv {uv:.2?} colour {lo:.2?}..{hi:.2?}"))
         .collect();
+    // Movies loaded on other levels (the PDA's map on `_level1`).
+    let mut levels = String::new();
+    for (&level, &root) in player.levels.iter().filter(|(l, _)| **l != 0) {
+        let mut own = Vec::new();
+        player.draw_from(
+            root,
+            &flash::Matrix::IDENTITY,
+            fonts.unwrap_or(&empty),
+            &mut own,
+        );
+        let c = player.clip(root);
+        levels.push_str(&format!(
+            "; _level{level}: {} children, visible {}, colour {:?}, {} triangles",
+            c.map_or(0, |c| c.children.len()),
+            c.is_some_and(|c| c.visible),
+            c.map(|c| c.colour),
+            own.len(),
+        ));
+    }
     let [w, h] = player.lib.size;
     format!(
-        "flash {}: frame {frame}/{frames}{}, stage {w:.0}x{h:.0}, {} triangles in {}, alpha up to {alpha:.2}; {}",
+        "flash {}: frame {frame}/{frames}{}, stage {w:.0}x{h:.0}, {} triangles in {}, alpha up to {alpha:.2}; {}{levels}",
         m.swf,
         if paused { " paused" } else { "" },
         triangles.len(),
