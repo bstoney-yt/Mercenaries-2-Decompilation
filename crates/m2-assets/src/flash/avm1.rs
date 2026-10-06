@@ -255,8 +255,8 @@ pub struct Avm {
     pens: HashMap<ClipId, Pen>,
     /// The stage's size, for `Stage.width` and `Stage.height`.
     pub stage: [f32; 2],
-    /// Logs each function call, goto and `_visible` change, for finding
-    /// what a movie does.
+    /// Logs each function call, goto, `_visible` change and undefined
+    /// variable or member read, for finding what a movie does.
     pub trace: bool,
 }
 
@@ -1093,6 +1093,9 @@ impl Avm {
                     let name = pop(&mut stack);
                     let name = self.to_str(player, &name);
                     let v = self.get_variable(player, frame, &name);
+                    if self.trace && matches!(v, Value::Undefined) {
+                        self.log.push(format!("{name} is undefined"));
+                    }
                     stack.push(v);
                 }
                 0x1D => {
@@ -1396,6 +1399,9 @@ impl Avm {
                     let (name, obj) = (pop(&mut stack), pop(&mut stack));
                     let name = self.to_str(player, &name);
                     let v = self.get(player, &obj, &name);
+                    if self.trace && matches!(v, Value::Undefined) {
+                        self.log.push(format!("{obj:?}.{name} is undefined"));
+                    }
                     stack.push(v);
                 }
                 0x4F => {
