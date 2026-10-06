@@ -161,6 +161,9 @@ struct Options {
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
+    /// With `--screenshot`: take the picture from this far from the
+    /// pickup lying nearest her, looking down at it.
+    look_pickup: Option<f32>,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
@@ -331,6 +334,9 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--probe" => o.probe = true,
             "--fire" => o.fire = true,
+            "--look-pickup" => {
+                o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
+            }
             "--mission-look" => {
                 o.mission_look = Some(value()?.parse().context("--mission-look expects metres")?)
             }
@@ -945,6 +951,9 @@ fn screenshot(
     if let (Some(reach), Some(link)) = (options.mission_look, &link) {
         look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
     }
+    if let Some(reach) = options.look_pickup {
+        look_at_pickup(&mut game, reach);
+    }
     // The picture, with the HUD.
     let mut hud = ui::Hud::new();
     let mut settings = config.clone();
@@ -954,6 +963,41 @@ fn screenshot(
     write_ppm(&backend, out)?;
     eprintln!("wrote {}", out.display());
     Ok(())
+}
+
+/// Puts the camera `reach` metres off the pickup lying nearest her, a
+/// little above it and looking at it, and says which it is and whether
+/// its model has loaded.
+fn look_at_pickup(game: &mut Game, reach: f32) {
+    let Some(her) = game.scene.player.as_ref().map(|p| p.character.position) else {
+        return;
+    };
+    let flights = &game.scene.flights;
+    let Some(p) = flights
+        .pickups()
+        .iter()
+        .min_by(|a, b| a.at.distance(her).total_cmp(&b.at.distance(her)))
+    else {
+        eprintln!("look-pickup: nothing lies to be taken");
+        return;
+    };
+    eprintln!(
+        "look-pickup: {:#x} at {:.1}, {:.1} m from her, model {:?} {}",
+        p.what.template,
+        p.at,
+        p.at.distance(her),
+        p.what.model,
+        if p.what.model.is_some_and(|m| flights.has_model(m)) {
+            "loaded"
+        } else {
+            "not loaded"
+        }
+    );
+    let at = p.at + m2_math::glam::Vec3::Y * 0.2;
+    let back = (her - at).with_y(0.0).normalize_or(m2_math::glam::Vec3::Z);
+    game.on_foot = false;
+    game.camera =
+        FlyCamera::looking_at(at + back * reach + m2_math::glam::Vec3::Y * reach * 0.6, at);
 }
 
 /// What stands where a bomb fell (`at`, x and z), as its pictures are
