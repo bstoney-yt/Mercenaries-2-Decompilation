@@ -63,8 +63,9 @@ const GRENADE: &str = "Grenade";
 /// runs out (`TriggerOnTimer`; 4 s if the template can't be read).
 const MARKER: &str = "Smoke Grenade Projectile";
 const MARKER_TIMER: f32 = 4.0;
-/// `--support` calls come this long into the scripts' run (seconds), with
-/// this much cash and fuel: enough for any item.
+/// `--support` calls come this long into the scripts' run (seconds), once
+/// she is on foot on land, with this much cash and fuel: enough for any
+/// item.
 const SUPPORT_AFTER: f64 = 2.0;
 const SUPPORT_CASH: f64 = 1.0e7;
 const SUPPORT_FUEL: f64 = 1000.0;
@@ -506,7 +507,14 @@ impl MissionLink {
             }
             mission.set_health(PLAYER, game.combat.hp);
             mission.set_player_reserve(GRENADE, game.combat.grenades);
-            if mission.now() >= SUPPORT_AFTER {
+            // Called on foot, on land, as the support menu is.
+            let on_land = game.on_foot
+                && game
+                    .scene
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.landed && p.driving.is_none() && !p.down);
+            if mission.now() >= SUPPORT_AFTER && on_land {
                 for key in std::mem::take(&mut self.support) {
                     mission.stock_support(&key, 1, SUPPORT_CASH, SUPPORT_FUEL);
                     let took = mission.use_support(&key);
