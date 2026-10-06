@@ -871,6 +871,9 @@ end
 local pda = rawget(_G, "Pda")
 if type(pda) == "table" and type(pda.Map) == "table" then
     pda.Map:SetSelectedMission({ sName = "VzaCon001" })
+    -- On a contract the PDA's tracking is fixed: `MrxPlayState.Set`
+    -- (script bef35c31) tells it so for any state but free play.
+    pda.Map:SetMissionChangeAllowed({ bAllow = false })
 end
 "#;
 
@@ -1584,12 +1587,18 @@ impl Thread {
             let Some(m) = self.flash.get_mut(&id) else {
                 continue;
             };
+            // The engine hands the movies their text looked up
+            // (`"[VzaCon001.Title]"` as its words), as it does for text
+            // widgets.
             let args: Vec<avm1::Value> = args
                 .into_iter()
                 .map(|a| match a {
                     FlashArg::Nil => avm1::Value::Undefined,
                     FlashArg::Bool(b) => avm1::Value::Bool(b),
                     FlashArg::Number(n) => avm1::Value::Number(n),
+                    FlashArg::Text(t) if t.contains('[') => {
+                        avm1::Value::Str(screen.borrow().display_text(&t).into())
+                    }
                     FlashArg::Text(t) => avm1::Value::Str(t.into()),
                 })
                 .collect();
