@@ -1114,6 +1114,9 @@ impl Thread {
         // the same userdata, not m2's number. The game has the dialog box
         // module loaded at boot; unloaded, its `oSystemDialogBoxFlash` is a
         // stub, and `MrxGuiPda.Open` takes that for a system dialog up.
+        // The story's first step unlocks the first contract
+        // (`UnlockMission("VzaCon001")`, script ce4166ed), which puts it
+        // in the PDA's missions.
         // Her cash is 0, as `PlayerCashChanged` tells the HUD (the PDA's
         // stats page formats `Player.GetCash()`).
         mission
@@ -1124,7 +1127,14 @@ impl Thread {
                  end
                  rawset(Player, \"GetCash\", function() return 0 end)
                  import(\"MrxGuiDialogBox\")
-                 MrxGuiManager.CreateGui(me)",
+                 MrxGuiManager.CreateGui(me)
+                 local flow = rawget(_G, \"MrxMissionFlow\")
+                 if type(flow) == \"table\" and type(flow.UnlockMission) == \"function\" then
+                     local ok, e = pcall(flow.UnlockMission, \"VzaCon001\")
+                     if not ok then print(\"UnlockMission: \" .. tostring(e)) end
+                 else
+                     print(\"UnlockMission: no MrxMissionFlow\")
+                 end",
                 "create gui",
             )
             .map_err(|e| e.to_string())?;
@@ -1332,7 +1342,13 @@ impl Thread {
             Some(widgets_under(&screen.borrow(), &names, |n| n == "tutorial"))
         } else if scripted {
             let screen = screen.borrow();
-            let mut keep = widgets_below(&screen, |id| pda_movies.contains(&id));
+            // The PDA widget holds the movie and, first, its backdrop
+            // (`_Initialize`: a fullscreen image coloured 0,0,0,192).
+            let roots: HashSet<u32> = pda_movies
+                .iter()
+                .map(|&id| screen.widget(id).and_then(|w| w.parent).unwrap_or(id))
+                .collect();
+            let mut keep = widgets_below(&screen, |id| roots.contains(&id));
             keep.extend(widgets_under(&screen, &names, |n| n == "FlashFade"));
             if !self.pda_hid_logged {
                 self.pda_hid_logged = true;
