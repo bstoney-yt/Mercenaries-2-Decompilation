@@ -903,6 +903,9 @@ const RETICLE_STEP: f32 = 0.002;
 struct Thread {
     mission: Mission,
     assets: AssetSource<BufReader<File>>,
+    /// The language archive: the HUD's localised textures (the fanfares'
+    /// titles and borders are only there, as `<name>_english`).
+    language: Option<AssetSource<BufReader<File>>>,
     fonts: BTreeMap<String, Font>,
     /// Textures tried (sent, or found missing).
     tried: HashSet<u32>,
@@ -922,6 +925,9 @@ struct Thread {
     flash: BTreeMap<u32, FlashMovie>,
 }
 
+/// The language archive beside `vz.wad` (English only for now).
+const LANGUAGE_WAD: &str = "English.wad";
+
 impl Thread {
     fn start(data: &std::path::Path) -> Result<Self, String> {
         let wad = data.join("vz.wad");
@@ -934,6 +940,9 @@ impl Thread {
             .map_err(|e| e.to_string())
             .and_then(|mut w| GameData::read(&mut w).map_err(|e| e.to_string()))?;
         let mut assets = AssetSource::new(open()?).map_err(|e| e.to_string())?;
+        let language = File::open(data.join(LANGUAGE_WAD))
+            .ok()
+            .and_then(|f| AssetSource::new(BufReader::new(f)).ok());
         let movies = Movies {
             assets: AssetSource::new(open()?).map_err(|e| e.to_string())?,
             libraries: HashMap::new(),
@@ -994,6 +1003,7 @@ impl Thread {
         Ok(Self {
             mission,
             assets,
+            language,
             fonts,
             tried: HashSet::new(),
             told: Told::default(),
@@ -1134,7 +1144,13 @@ impl Thread {
                     images.push((hash, image));
                     continue;
                 }
-                let image = match self.assets.texture(hash, MAX_TEXTURE) {
+                let found = self.assets.texture(hash, MAX_TEXTURE).or_else(|e| {
+                    self.language
+                        .as_mut()
+                        .and_then(|l| l.texture(hash, MAX_TEXTURE).ok())
+                        .ok_or(e)
+                });
+                let image = match found {
                     Ok(t) => t.mips.into_iter().next().map(|rgba| Image {
                         width: t.width,
                         height: t.height,
