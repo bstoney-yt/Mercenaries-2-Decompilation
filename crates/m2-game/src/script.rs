@@ -579,6 +579,10 @@ fn default_for(lua: &Lua, name: &str) -> mlua::Result<Option<Value>> {
         ('s', _) => Some(Value::String(lua.create_string("")?)),
         ('b', _) => Some(Value::Boolean(false)),
         ('t', _) => Some(Value::Table(lua.create_table()?)),
+        // An object a script keeps (`oSystemDialogBoxFlash`): nil until
+        // made, as scripts test it (`if MrxGuiDialogBox.oSystemDialogBoxFlash
+        // then`, read through the module to here).
+        ('o', _) => Some(Value::Nil),
         _ => None,
     })
 }
@@ -837,6 +841,8 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((h, n, s.as_str(), b), (450.0, 1.0, "x", false));
+        let no_object: bool = host.lua().load("return oFlash == nil").eval().unwrap();
+        assert!(no_object);
         let is_stub: bool = host
             .lua()
             .load("return getmetatable(Event) ~= nil and tList[1] == 2")
