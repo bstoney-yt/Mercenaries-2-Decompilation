@@ -30,7 +30,26 @@ pub struct Spawner {
     /// `SpawnerType`: 2 at the roadblocks' point traffic, 0 on the path
     /// spawners (meaning not known yet).
     pub kind: u32,
+    /// The field named only by its hash d192b18a: 1500 on the path
+    /// spawners, whose `ActiveRadius` is 0. Taken as how near the player
+    /// must be for those (unverified).
+    pub far: Option<f32>,
 }
+
+impl Spawner {
+    /// How near the player must be for it to spawn: its `ActiveRadius`,
+    /// or where that is 0, the d192b18a field.
+    pub fn reach(&self) -> f32 {
+        if self.active_radius > 0.0 {
+            self.active_radius
+        } else {
+            self.far.unwrap_or(0.0)
+        }
+    }
+}
+
+/// The field after `ActiveRadius` whose name isn't known, by its hash.
+const FAR_HASH: u32 = 0xd192_b18a;
 
 /// What the template database says of spawning.
 #[derive(Clone, Debug, Default)]
@@ -83,6 +102,11 @@ pub fn spawners(c: &Component<'_>) -> HashMap<u32, Spawner> {
         at("ActiveRadius", RADIUS_AT),
         at("SpawnerType", KIND_AT),
     );
+    let far = c
+        .fields
+        .iter()
+        .find(|f| f.name_hash == FAR_HASH)
+        .map(|f| usize::from(f.offset));
     c.records()
         .unwrap_or_default()
         .into_iter()
@@ -94,6 +118,7 @@ pub fn spawners(c: &Component<'_>) -> HashMap<u32, Spawner> {
                     seconds_per_cycle: float(r, cycle)?,
                     active_radius: float(r, radius)?,
                     kind: word(r, kind)?,
+                    far: far.and_then(|at| float(r, at)),
                 },
             ))
         })
@@ -166,6 +191,20 @@ mod tests {
     fn weights_read_as_integers_or_floats() {
         assert_eq!(weight_of(&100u32.to_le_bytes()), 100.0);
         assert_eq!(weight_of(&17.5f32.to_bits().to_le_bytes()), 17.5);
+    }
+
+    #[test]
+    fn a_spawner_without_a_radius_reaches_as_far_as_its_other_field() {
+        let mut s = Spawner {
+            list: 1,
+            seconds_per_cycle: 10.0,
+            active_radius: 250.0,
+            kind: 2,
+            far: Some(1500.0),
+        };
+        assert_eq!(s.reach(), 250.0);
+        s.active_radius = 0.0;
+        assert_eq!(s.reach(), 1500.0);
     }
 
     #[test]
