@@ -1301,7 +1301,7 @@ fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle])
 /// a grenade's or a shell's (combat doesn't yet tell them apart, so the
 /// first of these found), and the satellite bomb's and its frag's.
 const ROCKET_BLASTS: [&str; 4] = [
-    "Explosion (Rocket)",
+    "Explosion (Handheld RPG)",
     "Explosion (RPG)",
     "Explosion (AT Rocket)",
     "Explosion (AT Missile)",
