@@ -64,7 +64,7 @@ struct Frame {
     deck: vec4<f32>,
     // x: surfaces take the sun's brightness without its hue
     // (`surface_sun`), y: scale on searchlight beams' alpha, z: ground
-    // is summed in linear light
+    // is summed in linear light, w: scale on the air in front of clouds
     surface: vec4<f32>,
 };
 
@@ -763,7 +763,8 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
             if frame.deck.x > 0.0 {
                 reach = min(reach, frame.deck.x);
             }
-            let air = game_air(frame.eye.xyz + r * reach);
+            var air = game_air(frame.eye.xyz + r * reach);
+            air = vec4<f32>(air.rgb * frame.surface.w, 1.0 - frame.surface.w * (1.0 - air.a));
             cloud = through_air(cloud, air);
         } else if frame.wind.w >= 0.0 && hazy() {
             let air = sky_below(r, CLOUD_HEIGHT);

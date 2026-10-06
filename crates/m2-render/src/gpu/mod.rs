@@ -239,7 +239,8 @@ struct FrameUniforms {
     haze_layers: [f32; 4],
     /// x: the cloud deck's reach for the air in front of it (0: none).
     deck: [f32; 4],
-    /// x: surfaces take the sun's brightness without its hue.
+    /// x: surfaces take the sun's brightness without its hue, w: scale on
+    /// the air in front of the clouds.
     surface: [f32; 4],
 }
 
@@ -1825,7 +1826,13 @@ impl WgpuBackend {
                 } else {
                     0.0
                 },
-                0.0,
+                // `M2_CLOUD_AIR=<x>` scales the air between the eye and the
+                // cloud deck (what it adds and what it takes): 0 leaves it
+                // out (to see whether it neutralises the dusk's gold).
+                std::env::var("M2_CLOUD_AIR")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(1.0),
             ],
         };
         self.queue
