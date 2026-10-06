@@ -244,8 +244,13 @@ struct FrameUniforms {
     surface: [f32; 4],
     /// x: the least cloud cover anywhere in the sky (`M2_CLOUD_FILL`),
     /// y: a sky stage to paint alone (`M2_SKY_DEBUG`), z: the sea mirrors
-    /// the haze alone (`M2_SEA_SKY=haze`).
+    /// the cloud deck too (`M2_SEA_SKY=deck`).
     sky_fit: [f32; 4],
+    /// Trial scales on the sea's sun glint: x on its strength
+    /// (`M2_GLINT_GAIN`), y its power in place of the material's
+    /// (`M2_GLINT_POWER`, 0: the material's), z the least share of each
+    /// wave kept however far (`M2_WAVE_KEEP`).
+    glint_fit: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -1852,13 +1857,19 @@ impl WgpuBackend {
                     .ok()
                     .and_then(|v| v.parse::<f32>().ok())
                     .unwrap_or(0.0),
-                // `M2_SEA_SKY=haze`: the sea mirrors the haze without the
-                // cloud deck, as before.
-                if std::env::var("M2_SEA_SKY").is_ok_and(|v| v == "haze") {
+                // `M2_SEA_SKY=deck`: the sea mirrors the cloud deck over
+                // the haze (round DP: night sea 3-5x too bright, so off).
+                if std::env::var("M2_SEA_SKY").is_ok_and(|v| v == "deck") {
                     1.0
                 } else {
                     0.0
                 },
+                0.0,
+            ],
+            glint_fit: [
+                env_f32("M2_GLINT_GAIN").unwrap_or(1.0),
+                env_f32("M2_GLINT_POWER").unwrap_or(0.0),
+                env_f32("M2_WAVE_KEEP").unwrap_or(0.0),
                 0.0,
             ],
         };
@@ -2414,4 +2425,9 @@ fn skipped(blend: BlendKind) -> bool {
         BlendKind::Additive => "additive",
     };
     skip.split(',').any(|s| s.trim() == name)
+}
+
+/// The number an environment switch holds, if set.
+fn env_f32(name: &str) -> Option<f32> {
+    std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok())
 }
