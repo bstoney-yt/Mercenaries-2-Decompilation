@@ -85,6 +85,9 @@ const PAUSE: (f32, f32) = (2.0, 6.0);
 const GRENADE_AFTER: f32 = 4.0;
 const GRENADE_REACH: (f32, f32) = (8.0, 25.0);
 const GRENADE_GAP: f32 = 15.0;
+/// She counts as hiding where he last saw her while within this of it,
+/// metres: no grenades after her once she has driven or run off.
+const HIDING: f32 = 6.0;
 
 /// The enhanced, smarter soldiers: not the original game's. Off by
 /// default; every number is the alpha's own.
@@ -577,6 +580,8 @@ impl Npc {
             && self.last_seen.is_some()
             && self.unseen > after
             && self.grenade_wait <= 0.0
+            // Hiding there, not driving off.
+            && threat.distance(goal) < HIDING
             && (GRENADE_REACH.0..GRENADE_REACH.1).contains(&reach)
         {
             self.throws = Some(goal);
@@ -1779,9 +1784,23 @@ pub(crate) mod tests {
             soldier.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
         }
         assert!(soldier.alert);
+        // Hidden where he saw her (he can't see through the wall there).
+        let mut wall = ground();
+        let shape = CollisionShape::mesh(
+            &[
+                Vec3::new(-5.0, 0.0, 12.0),
+                Vec3::new(5.0, 0.0, 12.0),
+                Vec3::new(5.0, 4.0, 12.0),
+                Vec3::new(-5.0, 4.0, 12.0),
+            ],
+            &[[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]],
+        )
+        .unwrap();
+        wall.add_static(StaticKey::Cell(2), &shape, Vec3::ZERO, Quat::IDENTITY);
+        wall.step(dt);
         let mut thrown = Vec::new();
         for _ in 0..60 * 6 {
-            soldier.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 95.0)), dt);
+            soldier.update(&wall, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
             thrown.extend(soldier.throws.take());
         }
         assert_eq!(thrown.len(), 1, "one, then he waits");
@@ -1796,8 +1815,20 @@ pub(crate) mod tests {
             held.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
         }
         for _ in 0..60 * 6 {
-            held.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 95.0)), dt);
+            held.update(&wall, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
             assert!(held.throws.take().is_none());
+        }
+        // Gone off (driven away): none either.
+        let post = Brain::Post { facing: 0.0 };
+        let mut left = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(3));
+        left.ai.pursue_speed = 0.0;
+        left.update(&physics, &mut rng, None, dt);
+        for _ in 0..30 {
+            left.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
+        }
+        for _ in 0..60 * 6 {
+            left.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 95.0)), dt);
+            assert!(left.throws.take().is_none());
         }
     }
 
