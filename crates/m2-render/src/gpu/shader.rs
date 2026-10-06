@@ -63,7 +63,8 @@ struct Frame {
     // the air keeps is tinted by (`through_air`; negative: none)
     deck: vec4<f32>,
     // x: surfaces take the sun's brightness without its hue
-    // (`surface_sun`), y: scale on searchlight beams' alpha
+    // (`surface_sun`), y: scale on searchlight beams' alpha, z: ground
+    // is summed in linear light
     surface: vec4<f32>,
 };
 
@@ -469,11 +470,20 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         let s = select(0.0, c.x + c.y + c.z + c.w, layers > 0.5);
         let w_global = clamp(max((dist - material.ground.x) * material.ground.y, 1.0 - s), 0.0, 1.0);
         let w = c * clamp((1.0 - w_global) / (s + 1e-5), 0.0, 1.0);
-        rgb = base.rgb * w_global + t0 * w.x + t1 * w.y + t2 * w.z + t3 * w.w;
+        // The game sums these as sampled, display values; ours are
+        // decoded to linear light, so the sum is made in display values
+        // too, where the grain's size is the game's (the grain added to
+        // linear colours came out twice as strong on dark ground).
+        // `M2_GROUND_SPACE=linear` sums in linear light as before.
+        let display = frame.surface.z < 0.5;
+        let e = select(vec3<f32>(1.0), vec3<f32>(1.0 / 2.2), display);
+        rgb = pow(max(base.rgb, vec3<f32>(0.0)), e) * w_global
+            + pow(t0, e) * w.x + pow(t1, e) * w.y + pow(t2, e) * w.z + pow(t3, e) * w.w;
         if material.detail.x > 0.0 {
             let w_detail = clamp(1.0 - (dist - material.ground.z) * material.ground.w, 0.0, 1.0);
             rgb = max(rgb + 2.0 * (detail_texel - 0.5) * w_detail, vec3<f32>(0.0));
         }
+        rgb = pow(rgb, 1.0 / e);
     } else if material.detail.x > 0.0 {
         // Each texel against the map's average (its smallest mip), so the
         // base colour keeps its brightness.
