@@ -1256,20 +1256,27 @@ impl Thread {
         shown: &impl Fn(&&DrawItem) -> bool,
         log: &mut Vec<String>,
     ) {
-        let mut rects: HashMap<u32, [f32; 4]> = HashMap::new();
+        let mut rects: HashMap<u32, ([f32; 4], bool)> = HashMap::new();
         for item in items.iter().filter(shown) {
-            if let DrawItem::Flash { widget, rect, .. } = item {
-                rects.insert(*widget, *rect);
+            if let DrawItem::Flash {
+                widget,
+                rect,
+                fullscreen,
+                ..
+            } = item
+            {
+                rects.insert(*widget, (*rect, *fullscreen));
             }
         }
         let movies = self.movies.borrow();
         for (id, m) in &mut self.flash {
-            let rect = rects.get(id).copied();
-            let triangles = match rect {
-                Some(r) => {
+            let at = rects.get(id).copied();
+            let rect = at.map(|(r, _)| r);
+            let triangles = match at {
+                Some((r, fit)) => {
                     let mut out = Vec::new();
                     let mut want = Vec::new();
-                    flash_prims(m, &movies, r, &mut out, &mut want);
+                    flash_prims(m, &movies, r, fit, &mut out, &mut want);
                     out.len()
                 }
                 None => 0,
@@ -1711,9 +1718,14 @@ impl Thread {
                     minimap(&view, state, &self.zones, &self.roads, out, want);
                 }
             }
-            DrawItem::Flash { widget, rect, .. } => {
+            DrawItem::Flash {
+                widget,
+                rect,
+                fullscreen,
+                ..
+            } => {
                 if let Some(m) = self.flash.get(widget) {
-                    flash_prims(m, &self.movies.borrow(), *rect, out, want);
+                    flash_prims(m, &self.movies.borrow(), *rect, *fullscreen, out, want);
                 }
             }
             // Not drawn yet (see the module docs).
@@ -2035,11 +2047,14 @@ fn movie_name(file: &str) -> String {
 
 /// A movie's triangles stretched over the widget's box `rect` (screen
 /// points), as Scaleform fits a movie to its widget; each a quad with its
-/// last corner doubled.
+/// last corner doubled. A `fit` movie (a fullscreen widget's, `rect` the
+/// whole screen) keeps its stage's shape, centred, as Scaleform's default
+/// "show all" scale mode does.
 fn flash_prims(
     m: &FlashMovie,
     movies: &Movies,
     rect: [f32; 4],
+    fit: bool,
     out: &mut Vec<Prim>,
     want: &mut Vec<u32>,
 ) {
@@ -2047,6 +2062,7 @@ fn flash_prims(
     if mw <= 0.0 || mh <= 0.0 {
         return;
     }
+    let rect = if fit { show_all(rect, [mw, mh]) } else { rect };
     let matrix = flash::Matrix {
         a: (rect[2] - rect[0]) / mw,
         b: 0.0,
@@ -2060,6 +2076,16 @@ fn flash_prims(
     let mut triangles = Vec::new();
     m.rt.player.draw(&matrix, fonts, &mut triangles);
     triangle_prims(&triangles, out, want);
+}
+
+/// The largest box of the stage's shape `size` centred in `rect`.
+fn show_all(rect: [f32; 4], size: [f32; 2]) -> [f32; 4] {
+    let (w, h) = (rect[2] - rect[0], rect[3] - rect[1]);
+    let scale = (w / size[0]).min(h / size[1]);
+    let (sw, sh) = (size[0] * scale, size[1] * scale);
+    let x = rect[0] + (w - sw) / 2.0;
+    let y = rect[1] + (h - sh) / 2.0;
+    [x, y, x + sw, y + sh]
 }
 
 /// Triangles as prims (quads with the last corner doubled), asking for
@@ -2846,6 +2872,18 @@ mod tests {
         assert_eq!(t.get::<f64>("nValue").unwrap(), 2.5);
         let inner: Table = t.get("t").unwrap();
         assert!(inner.get::<bool>(1).unwrap());
+    }
+
+    #[test]
+    fn a_fullscreen_movie_keeps_its_shape() {
+        assert_eq!(
+            show_all([0.0, 0.0, 1280.0, 720.0], [640.0, 480.0]),
+            [160.0, 0.0, 1120.0, 720.0]
+        );
+        assert_eq!(
+            show_all([0.0, 0.0, 1280.0, 720.0], [1280.0, 720.0]),
+            [0.0, 0.0, 1280.0, 720.0]
+        );
     }
 
     #[test]
