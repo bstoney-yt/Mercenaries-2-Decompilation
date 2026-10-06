@@ -525,6 +525,12 @@ impl Mission {
             ));
         }
         self.check_boundary(now);
+        for e in crate::api::answer_drop_tests(&self.world) {
+            self.log.push(format!(
+                "  t={now:.1} drop zone callback: {}",
+                first_lines(&e.to_string())
+            ));
+        }
         let ended = crate::vo::update(&self.world, self.host.lua(), now);
         for (cue, error) in ended {
             self.log.push(match error {
