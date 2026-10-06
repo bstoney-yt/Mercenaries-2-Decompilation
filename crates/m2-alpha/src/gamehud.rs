@@ -2092,9 +2092,39 @@ fn flash_status(m: &FlashMovie, paused: bool, fonts: Option<&flash::FontBook>) -
             ];
         }
     }
+    // By texture (none: solid): triangles, their uv box and colours.
+    type Fill = (usize, [f32; 4], [f32; 4], [f32; 4]);
+    let mut fills: BTreeMap<&str, Fill> = BTreeMap::new();
+    for t in &triangles {
+        let e = fills
+            .entry(t.texture.as_deref().unwrap_or("solid"))
+            .or_insert((
+                0,
+                [
+                    f32::INFINITY,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                ],
+                [f32::INFINITY; 4],
+                [f32::NEG_INFINITY; 4],
+            ));
+        e.0 += 1;
+        for [u, v] in t.uv {
+            e.1 = [e.1[0].min(u), e.1[1].min(v), e.1[2].max(u), e.1[3].max(v)];
+        }
+        for i in 0..4 {
+            e.2[i] = e.2[i].min(t.colour[i]);
+            e.3[i] = e.3[i].max(t.colour[i]);
+        }
+    }
+    let fills: Vec<String> = fills
+        .iter()
+        .map(|(name, (n, uv, lo, hi))| format!("{name} x{n} uv {uv:.2?} colour {lo:.2?}..{hi:.2?}"))
+        .collect();
     let [w, h] = player.lib.size;
     format!(
-        "flash {}: frame {frame}/{frames}{}, stage {w:.0}x{h:.0}, {} triangles in {}, alpha up to {alpha:.2}",
+        "flash {}: frame {frame}/{frames}{}, stage {w:.0}x{h:.0}, {} triangles in {}, alpha up to {alpha:.2}; {}",
         m.swf,
         if paused { " paused" } else { "" },
         triangles.len(),
@@ -2103,6 +2133,7 @@ fn flash_status(m: &FlashMovie, paused: bool, fonts: Option<&flash::FontBook>) -
         } else {
             format!("{bounds:.0?}")
         },
+        fills.join("; "),
     )
 }
 
