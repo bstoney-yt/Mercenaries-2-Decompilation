@@ -128,6 +128,10 @@
 //!                           states and verbs, by name word (bld, sign,
 //!                           fence, tree...); with words, the models so
 //!                           named, each with its states and verbs
+//! stam:<hash>[,<hash>..]     each model's state machine in full: per part
+//!                           and state, the handler kind and its commands
+//!                           (operands by name, node with its height, or
+//!                           number), and every node's height and box
 //! ```
 //!
 //! Names come from every NUL-terminated string in the four archives and
@@ -810,6 +814,7 @@ fn main() -> Result<(), Error> {
                     arg,
                 )
             }
+            "stam" => stam(&mut source, &names, arg),
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
             "find" => {
@@ -4928,12 +4933,8 @@ const DESTRUCT_WORDS: &[&str] = &[
 ];
 
 /// How the data describes what breaks; see the module docs.
-fn destruct<R: Read + Seek>(
-    source: &mut AssetSource<R>,
-    world: &WorldIndex,
-    names: &Names,
-    arg: &str,
-) -> Result<(), Error> {
+/// The names known plus those the data's destruction words make.
+fn destruct_names(names: &Names) -> Names {
     let mut names = Names {
         map: names.map.clone(),
     };
@@ -4950,7 +4951,173 @@ fn destruct<R: Read + Seek>(
             names.add(&format!("Init{a}{b}State"));
         }
     }
-    let names = &names;
+    for w in [
+        "show",
+        "hide",
+        "SetState",
+        "StartEmitter",
+        "StopEmitter",
+        "CreateObject",
+        "SendMessage",
+        "SendDamage",
+        "CameraShake",
+        "StartAnim",
+        "StopAnim",
+        "Kill",
+        "Delay",
+        "Wait",
+        "Timer",
+        "SetRootNode",
+        "Sink",
+        "SinkState",
+        "Fade",
+        "FadeOut",
+        "Remove",
+        "Translate",
+        "Move",
+        "PlaySound",
+        "StartSound",
+        "Collapse",
+        "DestroyMsg",
+        "OnEnter",
+        "OnExit",
+        "OnMessage",
+        "OnTimer",
+        "Time",
+        "Duration",
+    ] {
+        names.add(w);
+    }
+    names
+}
+
+/// `stam:<hash>,..`: each model's state machine written out in full.
+fn stam<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let names = destruct_names(names);
+    let name = |h: u32| names.map.get(&h).cloned();
+    for word in arg.split(',').filter(|w| !w.is_empty()) {
+        let Ok(h) = u32::from_str_radix(word.trim_start_matches("0x"), 16) else {
+            println!("{word}: not a hex hash");
+            continue;
+        };
+        let Ok(data) = source.model(h) else {
+            println!("{h:08x}: no such model");
+            continue;
+        };
+        let Ok(m) = data.parse() else {
+            println!("{h:08x}: doesn't parse");
+            continue;
+        };
+        let height = |n: &m2_assets::model::Node| n.bounds_max[1] - n.bounds_min[1];
+        println!(
+            "model {h:08x} {}: {} nodes",
+            name(h).unwrap_or_default(),
+            m.nodes.len()
+        );
+        for (i, n) in m.nodes.iter().enumerate() {
+            println!(
+                "  node {i} {:08x} {} parent {:?} box {:.1?}..{:.1?} height {:.1}",
+                n.name_hash,
+                name(n.name_hash).unwrap_or_default(),
+                n.parent,
+                &n.bounds_min[..3],
+                &n.bounds_max[..3],
+                height(n)
+            );
+        }
+        let node_of = |w: u32| m.nodes.iter().position(|n| n.name_hash == w);
+        let operand = |w: u32| -> String {
+            if let Some(i) = node_of(w) {
+                return format!("node{i}({:.1} m)", height(&m.nodes[i]));
+            }
+            if let Some(n) = name(w) {
+                return n;
+            }
+            let f = f32::from_bits(w);
+            if w < 0x1_0000 {
+                format!("{w}")
+            } else if f.is_finite() && (1e-3..1e5).contains(&f.abs()) {
+                format!("{f}f")
+            } else {
+                format!("{w:08x}")
+            }
+        };
+        let Ok(u) = m2_assets::Ucfx::parse(&data.base) else {
+            continue;
+        };
+        let secs = u.sections();
+        let Some(at) = u.children(None).find(|&i| &secs[i].fourcc == b"STAM") else {
+            println!("  no STAM");
+            continue;
+        };
+        let last = (at + secs[at].descendants as usize).min(secs.len() - 1);
+        for sec in &secs[at + 1..=last] {
+            let tag = String::from_utf8_lossy(&sec.fourcc).into_owned();
+            let Some(d) = sec.data else {
+                println!("  {tag}");
+                continue;
+            };
+            let w: Vec<u32> = d
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            match tag.as_str() {
+                "CEXE" => {
+                    let mut line = Vec::new();
+                    let mut ops = Vec::new();
+                    for pair in w.chunks_exact(2) {
+                        match pair[0] {
+                            1 => ops.push(operand(pair[1])),
+                            2 => {
+                                let verb = name(pair[1]).unwrap_or(format!("{:08x}", pair[1]));
+                                line.push(format!("{verb}({})", ops.join(", ")));
+                                ops.clear();
+                            }
+                            k => {
+                                if !ops.is_empty() {
+                                    line.push(format!("[{}]", ops.join(", ")));
+                                    ops.clear();
+                                }
+                                line.push(format!("<{k}:{}>", operand(pair[1])));
+                            }
+                        }
+                    }
+                    if !ops.is_empty() {
+                        line.push(format!("[{}]", ops.join(", ")));
+                    }
+                    if w.len() % 2 == 1 {
+                        line.push(format!("+{}", operand(w[w.len() - 1])));
+                    }
+                    println!("      {}", line.join(" "));
+                }
+                _ => {
+                    let ws: Vec<String> = w.iter().map(|&x| operand(x)).collect();
+                    let indent = if tag == "STAT" {
+                        "    "
+                    } else if tag == "CHDR" {
+                        "     "
+                    } else {
+                        "  "
+                    };
+                    println!("{indent}{tag} {}", ws.join(" "));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn destruct<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let names = &destruct_names(names);
     let words: Vec<String> = arg
         .split(',')
         .filter(|w| !w.is_empty())
