@@ -325,7 +325,7 @@ fn open(path: &Path) -> Result<AssetSource<BufReader<File>>, Error> {
 /// Template fields whose names appear in no file: guessed, each hashing
 /// to a field of the vehicle, weapon and camera components (the AMX-30's
 /// values read sensibly under them).
-const FIELD_NAMES: [&str; 50] = [
+const FIELD_NAMES: [&str; 77] = [
     "MaxSpeed",
     "Mass",
     "Brake",
@@ -376,6 +376,33 @@ const FIELD_NAMES: [&str; 50] = [
     "MuzzleFlashHardpoint",
     "Velocity",
     "GravityScale",
+    "Damage",
+    "Radius",
+    "MinDamage",
+    "MaxDamage",
+    "MaxForce",
+    "MinForceFalloff",
+    "InnerRadius",
+    "OuterRadius",
+    "DamageRadius",
+    "ExplosionTemplate",
+    "Explosion",
+    "ImpactTemplate",
+    "SpawnOnDeath",
+    "Lifetime",
+    "Fuse",
+    "FuseTime",
+    "CameraShake",
+    "ShakeAmplitude",
+    "ShakeDuration",
+    "Template",
+    "Speed",
+    "Acceleration",
+    "TurnRate",
+    "HomingTemplate",
+    "EffectTemplate",
+    "ParticleTemplate",
+    "SoundKey",
 ];
 
 /// Every name in the archives and data files; with `gather`, what the
