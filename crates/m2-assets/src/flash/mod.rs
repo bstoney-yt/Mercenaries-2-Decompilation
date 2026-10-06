@@ -41,7 +41,7 @@ pub mod avm1;
 pub mod player;
 pub mod text;
 
-pub use player::{ClipId, Library, Player};
+pub use player::{ClipId, Library, Player, Translator};
 pub use text::FontBook;
 
 /// Twips (1/20 pixel) to pixels.

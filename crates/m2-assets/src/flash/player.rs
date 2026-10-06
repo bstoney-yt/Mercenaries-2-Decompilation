@@ -387,6 +387,19 @@ pub struct Player {
     clock: f32,
     /// Scripts due, in order: the instance they run on, and the bytes.
     scripts: Vec<(ClipId, Rc<[u8]>)>,
+    /// Looks up the text ids in what text fields show (`[0x129ee2f1]`), as
+    /// the game's translator does when they draw; the scripts keep the ids.
+    pub translate: Option<Translator>,
+}
+
+/// Text as drawn from text as set ([`Player::translate`]).
+#[derive(Clone)]
+pub struct Translator(pub Rc<dyn Fn(&str) -> String>);
+
+impl std::fmt::Debug for Translator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Translator")
+    }
 }
 
 impl Player {
@@ -401,6 +414,7 @@ impl Player {
             levels: BTreeMap::from([(0, 0)]),
             clock: 0.0,
             scripts: Vec::new(),
+            translate: None,
         };
         p.goto(0, 0);
         p
@@ -807,7 +821,12 @@ impl Player {
                 if let Some(t) = c.lib.texts.get(def)
                     && let Some(font) = t.font.and_then(|f| Self::font_for(&c.lib, f, fonts))
                 {
-                    layout(t, s, font, &m, &col, clip, out);
+                    match &self.translate {
+                        Some(tr) if s.contains('[') => {
+                            layout(t, &(tr.0)(s), font, &m, &col, clip, out);
+                        }
+                        _ => layout(t, s, font, &m, &col, clip, out),
+                    }
                 }
             }
             Kind::Sprite | Kind::Other => {}
