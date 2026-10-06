@@ -131,9 +131,20 @@ pub struct CueTable {
     /// Every record by its index: volume, and what it may play (bank hash,
     /// sound or stream index, weight).
     pub records: Vec<Record>,
-    /// The cue list's plain cues: a cue's name hash and the record it
-    /// plays. (Cues that mix several records, flagged 0x100, are not read.)
-    pub cues: Vec<(u32, u32)>,
+    /// The cue list's plain cues. (Cues that mix several records, flagged
+    /// 0x100, are not read.)
+    pub cues: Vec<PlainCue>,
+}
+
+/// A plain cue: its name hash, the record it plays, and how long it
+/// lasts (seconds; negative: it loops, as the music's states do).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlainCue {
+    pub cue: u32,
+    pub record: u32,
+    /// A value not yet known (0.5 on most cues).
+    pub a: f32,
+    pub seconds: f32,
 }
 
 /// A record as the cue list points at it.
@@ -151,8 +162,13 @@ impl CueTable {
     /// The record cue `cue` (a name hash, `ui_HUD_Objective_New`) plays
     /// through the cue list.
     pub fn cue_record(&self, cue: u32) -> Option<&Record> {
-        let (_, record) = self.cues.iter().find(|c| c.0 == cue)?;
-        self.records.get(*record as usize)
+        let c = self.plain_cue(cue)?;
+        self.records.get(c.record as usize)
+    }
+
+    /// The plain cue keyed by `cue`.
+    pub fn plain_cue(&self, cue: u32) -> Option<&PlainCue> {
+        self.cues.iter().find(|c| c.cue == cue)
     }
 
     /// The cue keyed by `cue` (a line, or a group's streams), as the
@@ -288,7 +304,12 @@ impl CueTable {
                     && word(at + 16) == hash
                     && (record as usize) < count
                 {
-                    cues.push((word(at), record));
+                    cues.push(PlainCue {
+                        cue: word(at),
+                        record,
+                        a: f32::from_bits(word(at + 8)),
+                        seconds: f32::from_bits(word(at + 12)),
+                    });
                     at += PLAIN_CUE;
                 } else {
                     at += 4;
@@ -414,7 +435,15 @@ mod tests {
         d[0x18..0x1c].copy_from_slice(&list.to_le_bytes());
         d[0x1c..0x20].copy_from_slice(&end.to_le_bytes());
         let t = CueTable::parse_data(&d).unwrap();
-        assert_eq!(t.cues, [(0x55, 1)]);
+        assert_eq!(
+            t.cues,
+            [PlainCue {
+                cue: 0x55,
+                record: 1,
+                a: 0.5,
+                seconds: 0.125
+            }]
+        );
         let r = t.cue_record(0x55).unwrap();
         assert_eq!(
             (r.volume, r.variants.as_slice()),

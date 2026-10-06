@@ -3323,6 +3323,9 @@ impl Running {
             for cue in m.take_sounds() {
                 self.audio.ui_sound(&cue);
             }
+            if let Some(cue) = m.take_music() {
+                self.audio.music_cue(cue.as_deref());
+            }
         }
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);

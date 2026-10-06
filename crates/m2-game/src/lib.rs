@@ -6,5 +6,6 @@ pub mod hud;
 pub mod layers;
 pub mod library;
 pub mod mission;
+pub mod music;
 pub mod script;
 pub mod vo;
