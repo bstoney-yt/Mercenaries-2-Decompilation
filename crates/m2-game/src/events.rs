@@ -466,7 +466,7 @@ fn guid(t: &Table, i: i64) -> Option<u32> {
 
 /// Whether an object with `labels` is of class `expr`: labels joined by
 /// `&&`, each maybe negated with `!` (`"Tank && !APC"`), in any case.
-fn class_matches(expr: &str, labels: &[u32]) -> bool {
+pub(crate) fn class_matches(expr: &str, labels: &[u32]) -> bool {
     let has = |l: &str| labels.contains(&m2_assets::name_hash(l));
     expr.split("&&").all(|term| {
         let term = term.trim();

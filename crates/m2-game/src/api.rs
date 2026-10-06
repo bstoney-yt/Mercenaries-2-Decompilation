@@ -57,6 +57,15 @@ pub struct Object {
 }
 
 impl Object {
+    /// Its labels as name hashes: those scripts gave it and the data's.
+    pub fn all_labels(&self) -> Vec<u32> {
+        self.labels
+            .iter()
+            .map(|l| m2_assets::name_hash(l))
+            .chain(self.label_hashes.iter().copied())
+            .collect()
+    }
+
     pub fn new(name: &str, position: [f32; 3]) -> Self {
         Self {
             fuel: 100.0,
@@ -347,13 +356,9 @@ impl World for ScriptWorld {
         self.objects.get(&guid).is_some_and(|o| o.seated_instantly)
     }
     fn labels(&self, guid: u32) -> Vec<u32> {
-        self.objects.get(&guid).map_or_else(Vec::new, |o| {
-            o.labels
-                .iter()
-                .map(|l| m2_assets::name_hash(l))
-                .chain(o.label_hashes.iter().copied())
-                .collect()
-        })
+        self.objects
+            .get(&guid)
+            .map_or_else(Vec::new, Object::all_labels)
     }
     fn health(&self, guid: u32) -> Option<f32> {
         self.objects.get(&guid).map(|o| o.health)
@@ -376,7 +381,7 @@ impl World for ScriptWorld {
         let mut out: Vec<u32> = self
             .objects
             .iter()
-            .filter(|(_, o)| o.labels.iter().any(|l| l == label))
+            .filter(|(_, o)| crate::events::class_matches(label, &o.all_labels()))
             .map(|(&g, _)| g)
             .collect();
         out.sort_unstable();
@@ -738,10 +743,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     add(&object, "HasLabel", |w, _, a| {
         let has = match (id(a.first()).and_then(|g| w.objects.get(&g)), a.get(1)) {
-            (Some(o), Some(Value::String(l))) => {
-                let l = l.to_string_lossy();
-                o.labels.contains(&l)
-            }
+            (Some(o), Some(Value::String(l))) => o
+                .all_labels()
+                .contains(&m2_assets::name_hash(&l.to_string_lossy())),
             _ => false,
         };
         values([Value::Boolean(has)])
@@ -763,6 +767,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         {
             let l = l.to_string_lossy();
             o.labels.retain(|x| *x != l);
+            let h = m2_assets::name_hash(&l);
+            o.label_hashes.retain(|&x| x != h);
         }
         values([])
     })?;
