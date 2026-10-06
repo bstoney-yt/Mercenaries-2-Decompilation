@@ -141,8 +141,18 @@ pub struct Widget {
     pub scale: f32,
     pub justification: Anchor,
     pub swf: Option<String>,
-    /// `CallFlashScriptFunction` calls: name and arguments as text.
-    pub flash_calls: Vec<(String, Vec<String>)>,
+    /// `CallFlashScriptFunction` calls not yet taken by the host
+    /// ([`Screen::take_flash_calls`]): the movie's function and its
+    /// arguments.
+    pub flash_calls: Vec<(String, Vec<FlashArg>)>,
+    /// `SetFlashCallback`: the movie's `fscommand` names and the callbacks
+    /// they call ([`flash_command`]).
+    flash_handlers: BTreeMap<String, u32>,
+    /// `PauseFlash` stops the movie's timeline, `PlayFlash` starts it.
+    pub flash_paused: bool,
+    /// How many times `RestartFlash` (or a new `SetFlashSwfFile`) asked
+    /// for the movie from its start.
+    pub flash_restarts: u32,
     pub movie: Option<String>,
     /// `MinimapCreate` arguments as text.
     pub minimap: Option<Vec<String>>,
@@ -183,11 +193,36 @@ impl Widget {
             justification: Anchor::Start,
             swf: None,
             flash_calls: Vec::new(),
+            flash_handlers: BTreeMap::new(),
+            flash_paused: false,
+            flash_restarts: 0,
             movie: None,
             minimap: None,
             minimap_calls: BTreeMap::new(),
             update: None,
             interp: None,
+        }
+    }
+}
+
+/// An argument the scripts pass to a Flash movie's function
+/// (`FlashWidget:CallActionScriptCallback(name, { ... })`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FlashArg {
+    Nil,
+    Bool(bool),
+    Number(f64),
+    Text(String),
+}
+
+impl FlashArg {
+    fn of(v: &Value) -> Self {
+        match v {
+            Value::Boolean(b) => FlashArg::Bool(*b),
+            Value::Integer(n) => FlashArg::Number(*n as f64),
+            Value::Number(n) => FlashArg::Number(*n),
+            Value::String(s) => FlashArg::Text(s.to_string_lossy()),
+            _ => FlashArg::Nil,
         }
     }
 }
@@ -308,6 +343,18 @@ impl Screen {
     /// Natives the scripts called that this does not implement.
     pub fn unknown(&self) -> &BTreeSet<String> {
         &self.unknown
+    }
+
+    /// The Flash calls the scripts made since the last call, by widget, in
+    /// the order made.
+    pub fn take_flash_calls(&mut self) -> Vec<(u32, String, Vec<FlashArg>)> {
+        let mut calls = Vec::new();
+        for (&id, w) in &mut self.widgets {
+            for (name, args) in w.flash_calls.drain(..) {
+                calls.push((id, name, args));
+            }
+        }
+        calls
     }
 
     /// Errors since the last call.
@@ -1131,6 +1178,12 @@ fn keep_callback(
 
 /// Calls a kept callback with its data then `extra`.
 fn call_back(lua: &Lua, handle: u32, extra: &[f64]) -> mlua::Result<()> {
+    let extra: Vec<Value> = extra.iter().map(|v| Value::Number(*v)).collect();
+    call_back_with(lua, handle, extra)
+}
+
+/// Calls a kept callback with its data then `extra`.
+fn call_back_with(lua: &Lua, handle: u32, extra: Vec<Value>) -> mlua::Result<()> {
     let table: Table = lua.named_registry_value(CALLBACKS)?;
     let Some(entry) = table.raw_get::<Option<Table>>(handle)? else {
         return Ok(());
@@ -1140,7 +1193,7 @@ fn call_back(lua: &Lua, handle: u32, extra: &[f64]) -> mlua::Result<()> {
         Some(d) => d.sequence_values::<Value>().collect::<mlua::Result<_>>()?,
         None => Vec::new(),
     };
-    args.extend(extra.iter().map(|v| Value::Number(*v)));
+    args.extend(extra);
     f.call::<()>(MultiValue::from_vec(args))
 }
 
@@ -1322,6 +1375,32 @@ pub fn tick(lua: &Lua, dt: f64) {
         errors.push(format!("MrxGuiBase.Run: {e}"));
     }
     screen.borrow_mut().log.extend(errors);
+}
+
+/// Delivers a Flash movie's `fscommand(command, argument)` from widget
+/// `widget` to the callback the scripts set for `command`
+/// (`FlashWidget:SetFlashEventHandler(command, handler, data)` sets
+/// `_FlashCallback` with `{ widget, handler, data }`, which calls
+/// `handler(widget, argument, unpack(data))`). Returns whether one was
+/// set.
+pub fn flash_command(lua: &Lua, widget: u32, command: &str, argument: &str) -> mlua::Result<bool> {
+    let Some(screen) = screen(lua) else {
+        return Ok(false);
+    };
+    let handle = screen
+        .borrow()
+        .widgets
+        .get(&widget)
+        .and_then(|w| w.flash_handlers.get(command).copied());
+    let Some(handle) = handle else {
+        return Ok(false);
+    };
+    call_back_with(
+        lua,
+        handle,
+        vec![Value::String(lua.create_string(argument)?)],
+    )?;
+    Ok(true)
 }
 
 /// Delivers an engine event to the handlers registered for it, with
@@ -1693,11 +1772,46 @@ natives! {
     "SetWidgetFullscreen" => |_, _, _| Ok(MultiValue::new()),
     "SetWidgetHighlightable" => |_, _, _| Ok(MultiValue::new()),
     "SetWidgetUseNewRescale" => |_, _, _| Ok(MultiValue::new()),
-    "SetFlashCallback" => |_, _, _| Ok(MultiValue::new()),
+    // (widget, command, function, data): `fscommand(command, arg)` from
+    // the movie calls `function(unpack(data), arg)`.
+    "SetFlashCallback" => |s, l, a| {
+        let id = a.id(0);
+        let Some(command) = a.text(1) else {
+            return Ok(MultiValue::new());
+        };
+        let handle = keep_callback(s, l, a.get(2), a.get(3))?;
+        let old = match s.widgets.get_mut(&id) {
+            Some(w) => match handle {
+                Some(h) => w.flash_handlers.insert(command, h),
+                None => w.flash_handlers.remove(&command),
+            },
+            None => handle,
+        };
+        if let Some(old) = old {
+            forget_callback(l, old)?;
+        }
+        Ok(MultiValue::new())
+    },
     "SetFlashTesselationAllowed" => |_, _, _| Ok(MultiValue::new()),
-    "PlayFlash" => |_, _, _| Ok(MultiValue::new()),
-    "PauseFlash" => |_, _, _| Ok(MultiValue::new()),
-    "RestartFlash" => |_, _, _| Ok(MultiValue::new()),
+    "PlayFlash" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.flash_paused = false;
+        }
+        Ok(MultiValue::new())
+    },
+    "PauseFlash" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.flash_paused = true;
+        }
+        Ok(MultiValue::new())
+    },
+    "RestartFlash" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.flash_restarts += 1;
+            w.flash_calls.clear();
+        }
+        Ok(MultiValue::new())
+    },
     "PlayMovie" => |_, _, _| Ok(MultiValue::new()),
     "PauseMovie" => |_, _, _| Ok(MultiValue::new()),
     "StopMovie" => |_, _, _| Ok(MultiValue::new()),
@@ -1758,6 +1872,8 @@ natives! {
         let id = a.id(0);
         if let Some(w) = s.widgets.get_mut(&id) {
             w.swf = a.text(1);
+            w.flash_restarts += 1;
+            w.flash_calls.clear();
         }
         // Loaded at once: the callback runs at the next tick.
         if let Some(cb) = keep_callback(s, l, a.get(2), a.get(3))? {
@@ -1765,16 +1881,18 @@ natives! {
         }
         Ok(MultiValue::new())
     },
+    // (widget, function, arguments...), as `CallActionScriptCallback`
+    // unpacks them; a table in their place is taken as the arguments.
     "CallFlashScriptFunction" => |s, _, a| {
         let id = a.id(0);
         let name = a.text(1).unwrap_or_default();
         let rest = match a.get(2) {
-            Some(Value::Table(t)) => t
+            Some(Value::Table(t)) if a.0.len() == 3 => t
                 .sequence_values::<Value>()
                 .filter_map(Result::ok)
-                .map(|v| Args(vec![v]).texts(0).concat())
+                .map(|v| FlashArg::of(&v))
                 .collect(),
-            _ => a.texts(2),
+            _ => a.0.iter().skip(2).map(FlashArg::of).collect(),
         };
         if let Some(w) = s.widgets.get_mut(&id) {
             w.flash_calls.push((name, rest));
@@ -2054,6 +2172,58 @@ mod tests {
         );
         // Not matched to a picture yet: as written.
         assert_eq!(s.display_text("[honk] Honk"), "[honk] Honk");
+    }
+
+    #[test]
+    fn flash_calls_reach_the_host_and_fscommands_reach_the_scripts() {
+        let (host, screen) = host();
+        // As `FlashWidget:CallActionScriptCallback` and
+        // `SetFlashEventHandler` call the natives, with `_FlashCallback`
+        // doing what the game's does.
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            function _FlashCallback(widget, handler, data, arg)
+                local args = {}
+                if type(data) == "table" then
+                    for i, v in ipairs(data) do args[i] = v end
+                end
+                if type(handler) == "function" then
+                    table.insert(args, 1, arg)
+                    table.insert(args, 1, widget)
+                    handler(unpack(args))
+                end
+            end
+            fan = G.CreateFlashWidget()
+            G.SetFlashSwfFile(fan, "fanfare_contract")
+            G.CallFlashScriptFunction(fan, "setText", "Contract", 3, true)
+            got = nil
+            G.SetFlashCallback(fan, "done", _FlashCallback,
+                { "me", function(w, arg, extra) got = w .. arg .. extra end, { "!" } })
+            "#,
+        );
+        let fan = host.lua().globals().get::<u32>("fan").unwrap();
+        let calls = screen.borrow_mut().take_flash_calls();
+        assert_eq!(
+            calls,
+            vec![(
+                fan,
+                "setText".to_owned(),
+                vec![
+                    FlashArg::Text("Contract".into()),
+                    FlashArg::Number(3.0),
+                    FlashArg::Bool(true)
+                ]
+            )]
+        );
+        assert!(screen.borrow_mut().take_flash_calls().is_empty());
+        assert!(flash_command(host.lua(), fan, "done", "1").unwrap());
+        assert!(!flash_command(host.lua(), fan, "other", "1").unwrap());
+        let got: String = host.lua().globals().get("got").unwrap();
+        assert_eq!(got, "me1!");
+        run(&host, "_GuiInternal.PauseFlash(fan)");
+        assert!(screen.borrow().widget(fan).unwrap().flash_paused);
     }
 
     #[test]

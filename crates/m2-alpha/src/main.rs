@@ -311,7 +311,8 @@ fn parse_args() -> anyhow::Result<Options> {
             "--aim" => o.aim = true,
             "--hit-from" => {
                 for d in value()?.split(',') {
-                    o.hit_from.push(d.parse().context("--hit-from expects degrees")?);
+                    o.hit_from
+                        .push(d.parse().context("--hit-from expects degrees")?);
                 }
             }
             "--weapon" => {
@@ -997,7 +998,11 @@ fn screenshot(
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
         info.game = Some(gamehud::HudState::of(&mut game));
-        let seconds = if options.hit_from.is_empty() { 2.0 } else { 0.5 };
+        let seconds = if options.hit_from.is_empty() {
+            2.0
+        } else {
+            0.5
+        };
         hud.settle(&info, (w, h), seconds, Duration::from_secs(120));
         info.game = Some(gamehud::HudState::of(&mut game));
     }
