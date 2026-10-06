@@ -44,9 +44,18 @@
 //!   at depth L + 1's bits, the low half's first.
 //!
 //! A field of `k` bits holding `q` is `lo + q / (2^k - 1) * (hi - lo)`.
+//! The tail is such a field over a full turn: the tree's yaw (see
+//! [`TreePlacement::yaw`]). Its values are those of a yaw drawn from 20
+//! (in two species 18) even steps of a turn, rounded to fifteenths: every
+//! third value is twice as common (every fifth for 18 steps), and 15, a
+//! whole turn, is rare except in one species whose yaws are not stepped.
+//! As a yaw about +y, the three palms whose crowns lean (`palmtreebend01`,
+//! `02`, `03`) lean downhill: their lean's mean resultant against the
+//! slope is 0.46, 0.17, 0.14 over 94, 824, 830 trees (0.10, 0.03, 0.03
+//! by chance), and within 20 degrees of straight down it. The tail is
+//! unrelated to a tree's spacing from its neighbours or its height.
 //!
-//! Open: what the tail means (values 0-14 near-uniform, 15 rare: a yaw or a
-//! scale step, unconfirmed). And how the game tells a one-tree leaf from a
+//! Open: how the game tells a one-tree leaf from a
 //! two-tree leaf whose split starts with the bits `0010`: in two species
 //! some do. [`TreeTable::parse`] resolves those by search: every leaf read
 //! as one tree must start with code 2, and the parse must use exactly `a`
@@ -59,8 +68,12 @@
 //! the leaf; in every one, the stream's bit count is
 //! `c + a (g + 1) + b (2g + w)` and the decode ends on it exactly; the
 //! species' counts sum to 36,993 trees, whose heights lie a median 2.7 m
-//! from the low-resolution ground (layer-placed objects: 1.3 m). No bytes
-//! from the archives are committed.
+//! from the low-resolution ground (layer-placed objects: 1.3 m). On the
+//! full-detail ground within 1.5 km of the Carmona gate, town species
+//! stand on it (median 0.00 m), palms on the lowest ground within about
+//! 2 m of the trunk, and the jungle species 1-2.6 m below it, spread
+//! from 0 to 6 m; the height's quantum is 0.01-0.04 m, so it is not
+//! rounding. No bytes from the archives are committed.
 
 use std::collections::HashSet;
 
@@ -103,8 +116,20 @@ impl From<OutOfBounds> for TreeError {
 pub struct TreePlacement {
     /// World space.
     pub position: [f32; 3],
-    /// The 4-bit tail, raw (meaning unknown: yaw or scale).
+    /// The 4-bit tail, raw: the tree's yaw in fifteenths of a turn
+    /// ([`yaw`](Self::yaw)).
     pub tail: u8,
+    /// Each coordinate's quantum: its leaf box's side over its field's
+    /// steps.
+    pub step: [f32; 3],
+}
+
+impl TreePlacement {
+    /// Yaw about +y, radians: the tail as a 4-bit field over a full turn
+    /// (`tail / 15` of it, so 15 is 0 again).
+    pub fn yaw(&self) -> f32 {
+        f32::from(self.tail) / 15.0 * std::f32::consts::TAU
+    }
 }
 
 /// One crown card vertex.
@@ -490,12 +515,17 @@ impl Decoder<'_> {
 
     fn tree(&mut self, prec: [u32; 3], lo: [f32; 3], hi: [f32; 3]) -> Option<()> {
         self.read(4)?;
-        let mut position = [0.0; 3];
-        for (k, p) in position.iter_mut().enumerate() {
-            *p = quantum(self.read(prec[k])?, prec[k], lo[k], hi[k]);
+        let (mut position, mut step) = ([0.0; 3], [0.0; 3]);
+        for k in 0..3 {
+            position[k] = quantum(self.read(prec[k])?, prec[k], lo[k], hi[k]);
+            step[k] = quantum(1, prec[k], 0.0, hi[k] - lo[k]);
         }
         let tail = self.read(4)? as u8;
-        self.out.push(TreePlacement { position, tail });
+        self.out.push(TreePlacement {
+            position,
+            tail,
+            step,
+        });
         Some(())
     }
 
@@ -658,6 +688,10 @@ mod tests {
         assert!((tr[1].position[0] - 256.0).abs() < 1e-3);
         assert_eq!((tr[1].tail, tr[2].tail), (14, 0));
         assert_eq!(tr[2].position[2], 256.0);
+        // x at depth 1 has 7 bits over the low half's 128/255 * 256.
+        assert!((tr[0].step[0] - 128.0 / 255.0 * 256.0 / 127.0).abs() < 1e-4);
+        assert_eq!(tr[2].yaw(), 0.0);
+        assert!((tr[0].yaw() - std::f32::consts::TAU / 3.0).abs() < 1e-6);
     }
 
     #[test]

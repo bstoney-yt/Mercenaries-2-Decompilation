@@ -9,7 +9,8 @@
 //!
 //! What is drawn: the low-resolution tiles everywhere (the whole island is
 //! always visible), full-detail cells near the camera in place of their
-//! tiles, placed models within the object distance, and a sea plane.
+//! tiles, placed models within the object distance, the trees' far
+//! stand-ins past their fade distance, and a sea plane.
 //!
 //! A town is drawn as merged batches (`TINY` models), but collides
 //! building by building: each batch names the layer entity of each of its
@@ -329,9 +330,9 @@ impl WorldSettings {
     }
 
     /// How far placed object `o` is drawn, its model's box being `bounds`.
-    /// A tree stops at its species' fade distance (200 m for most), not by
-    /// its size: the game draws a far tree as its crown card, which isn't
-    /// drawn yet, so until it is no tree draws past the fade.
+    /// A tree stops at its species' fade distance (150-250 m), not by its
+    /// size; beyond it, out to the prop distance, its species' far
+    /// stand-in draws instead ([FarTreeGpu]).
     fn reach(&self, o: &ObjectPlacement, bounds: (Vec3, Vec3)) -> f32 {
         match (o.fade, o.named) {
             (Some(fade), _) => fade,
@@ -376,6 +377,141 @@ struct ClumpGpu {
     instances: Vec<Mat4>,
 }
 
+/// A species' far stand-in on the GPU ([`world::FarTree`]): its parts,
+/// then its cap, in one buffer.
+#[derive(Debug)]
+struct FarTreeGpu {
+    vertex_buffer: VertexBufferHandle,
+    index_buffer: IndexBufferHandle,
+    /// First index, index count, material, whether it blends: the parts,
+    /// then the cap if it has one.
+    ranges: Vec<(u32, u32, MaterialId, bool)>,
+    /// Height of the parts' middle, and the radius that holds them, for
+    /// culling.
+    middle: f32,
+    radius: f32,
+}
+
+impl FarTreeGpu {
+    /// Uploads `tree`, reading its materials' textures from `source`.
+    fn upload<R: std::io::Read + std::io::Seek>(
+        backend: &mut dyn RenderBackend,
+        materials: &mut MaterialCache,
+        source: &mut crate::AssetSource<R>,
+        tree: &world::FarTree,
+    ) -> Result<Option<Self>, BackendError> {
+        let cap = tree.cap.as_ref().filter(|c| !c.1.is_empty());
+        for m in std::iter::once(&tree.material).chain(cap.map(|c| &c.2)) {
+            for (t, linear) in crate::model::material_textures(m) {
+                if materials.has_texture(t) {
+                    continue;
+                }
+                let texture = match source.texture(t, TextureLimits::default().models) {
+                    Ok(mut t) => {
+                        t.linear = linear;
+                        Some(t)
+                    }
+                    Err(e) => {
+                        eprintln!("texture {t:08x}: {e}");
+                        None
+                    }
+                };
+                materials.add_texture(backend, t, texture.as_ref())?;
+            }
+        }
+        let mut vertices: Vec<u8> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let vertex = |vertices: &mut Vec<u8>, p: [f32; 3], n: [f32; 3], uv: [f32; 2]| {
+            for f in p.into_iter().chain(n).chain(uv) {
+                vertices.extend(f.to_le_bytes());
+            }
+        };
+        // Both windings: a part always faces the eye, and the cap is seen
+        // from above and below.
+        let both = |indices: &mut Vec<u32>, t: [u32; 3]| {
+            indices.extend(t);
+            indices.extend([t[0], t[2], t[1]]);
+        };
+        // Parts: upright in x, y, facing +z, which turns to the eye.
+        let (mut lo, mut hi, mut reach) = (f32::MAX, f32::MIN, 0.0f32);
+        for (k, &([x0, y0, x1, y1], [u0, v0, u1, v1])) in tree.parts.iter().enumerate() {
+            if !(x0 < x1 && y0 < y1) {
+                continue;
+            }
+            let z = [0.0, 0.0, 1.0];
+            vertex(&mut vertices, [x0, y0, 0.0], z, [u0, v0]);
+            vertex(&mut vertices, [x1, y0, 0.0], z, [u1, v0]);
+            vertex(&mut vertices, [x1, y1, 0.0], z, [u1, v1]);
+            vertex(&mut vertices, [x0, y1, 0.0], z, [u0, v1]);
+            let b = 4 * k as u32;
+            both(&mut indices, [b, b + 1, b + 2]);
+            both(&mut indices, [b, b + 2, b + 3]);
+            (lo, hi) = (lo.min(y0), hi.max(y1));
+            reach = reach.max(x0.abs()).max(x1.abs());
+        }
+        if indices.is_empty() {
+            return Ok(None);
+        }
+        let material = materials.material(backend, &tree.material)?;
+        let mut ranges = vec![(
+            0,
+            indices.len() as u32,
+            material,
+            materials.is_translucent(material),
+        )];
+        if let Some((cap_vertices, cap_indices, cap_material)) = cap {
+            let first = (vertices.len() / world::SIMPLE_STRIDE) as u32;
+            let n = cap_vertices.len() as u32;
+            let start = indices.len() as u32;
+            for v in cap_vertices {
+                vertex(&mut vertices, v.position, [0.0, 1.0, 0.0], v.uv);
+                (lo, hi) = (lo.min(v.position[1]), hi.max(v.position[1]));
+                reach = reach.max(v.position[0].hypot(v.position[2]));
+            }
+            for t in cap_indices.chunks_exact(3) {
+                if t.iter().all(|&i| u32::from(i) < n) {
+                    both(&mut indices, [0, 1, 2].map(|k| first + u32::from(t[k])));
+                }
+            }
+            let material = materials.material(backend, cap_material)?;
+            ranges.push((
+                start,
+                indices.len() as u32 - start,
+                material,
+                materials.is_translucent(material),
+            ));
+        }
+        let vertex_buffer = backend.create_vertex_buffer(
+            &VertexBufferDesc {
+                layout: world::simple_layout(),
+                vertex_count: (vertices.len() / world::SIMPLE_STRIDE) as u32,
+                usage: BufferUsage::Static,
+            },
+            Some(&vertices),
+        )?;
+        let index_buffer = backend.create_index_buffer(
+            &IndexBufferDesc {
+                format: IndexFormat::U32,
+                index_count: indices.len() as u32,
+                usage: BufferUsage::Static,
+            },
+            Some(
+                &indices
+                    .iter()
+                    .flat_map(|i| i.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            ),
+        )?;
+        Ok(Some(Self {
+            vertex_buffer,
+            index_buffer,
+            ranges,
+            middle: (lo + hi) / 2.0,
+            radius: reach.hypot((hi - lo) / 2.0),
+        }))
+    }
+}
+
 #[derive(Debug)]
 enum Slot<T> {
     Loading,
@@ -404,6 +540,8 @@ pub struct WorldStats {
     /// Scatter instances loaded, and drawn last frame.
     pub scatter_loaded: usize,
     pub scatter_drawn: usize,
+    /// Trees drawn as their far stand-ins last frame.
+    pub far_trees_drawn: usize,
     pub pending: usize,
     pub failed: usize,
 }
@@ -420,6 +558,8 @@ pub struct World {
     cells: HashMap<u32, Slot<TerrainGpu>>,
     models: HashMap<u32, Slot<GpuModel>>,
     scatter: HashMap<u32, Slot<Vec<ClumpGpu>>>,
+    /// Each tree species' far stand-in, by species.
+    far_trees: Vec<Option<FarTreeGpu>>,
     objects: HashMap<(i32, i32), Vec<usize>>,
     /// Placed objects by model hash.
     by_model: HashMap<u32, Vec<usize>>,
@@ -524,6 +664,14 @@ impl World {
             Err(e) => eprintln!("cloud noise texture {noise:08x}: {e}"),
         }
         let cloud_noise = materials.texture(noise).map(|(t, _)| t);
+        // The trees' far stand-ins, ready from the start: few, and small.
+        let mut far_trees = Vec::with_capacity(index.far_trees.len());
+        for tree in &index.far_trees {
+            far_trees.push(match tree {
+                Some(t) => FarTreeGpu::upload(backend, materials, &mut source, t)?,
+                None => None,
+            });
+        }
         drop(source);
         let loader = Loader::spawn(install, index.clone(), TextureLimits::default())?;
         let mut objects: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -549,6 +697,7 @@ impl World {
             cells: HashMap::new(),
             models: HashMap::new(),
             scatter: HashMap::new(),
+            far_trees,
             objects,
             by_model,
             by_entity,
@@ -1149,11 +1298,25 @@ impl World {
             bucket(eye.x + reach, eye.z + reach),
         );
         let mut drawn = 0;
+        // Trees past their fade (or whose model hasn't loaded) within the
+        // prop distance, by species.
+        let mut far: Vec<Vec<usize>> = vec![Vec::new(); self.far_trees.len()];
         for bx in b0.0..=b1.0 {
             for bz in b0.1..=b1.1 {
                 for &i in self.objects.get(&(bx, bz)).map_or(&[][..], Vec::as_slice) {
                     let o = &self.index.objects[i];
                     let d = o.position.distance(eye);
+                    if let Some(species) = world::tree_species(o.entity)
+                        && d <= self.settings.prop_distance
+                        && (d > self.settings.reach_limit(o)
+                            || !matches!(self.models.get(&o.model), Some(Slot::Ready(_))))
+                        && !self.hidden.contains(&o.model)
+                    {
+                        if let Some(list) = far.get_mut(species) {
+                            list.push(i);
+                        }
+                        continue;
+                    }
                     if d > self.settings.reach_limit(o)
                         || self.knocked.contains_key(&i)
                         || self.hidden.contains(&o.model)
@@ -1231,6 +1394,7 @@ impl World {
             drawn += 1;
         }
         self.stats.objects_drawn = drawn;
+        self.stats.far_trees_drawn = self.draw_far_trees(backend, queue, eye, frustum, &far)?;
         self.stats.scatter_drawn = self.draw_scatter(backend, queue, eye, frustum)?;
 
         let (vb, ib, material) = self.sea;
@@ -1441,6 +1605,70 @@ impl World {
                     layer: Layer::WORLD,
                     translucent: c.translucent,
                     sort_origin: near[0].w_axis.truncate(),
+                    user: 0,
+                });
+            }
+        }
+        Ok(drawn)
+    }
+}
+
+impl World {
+    /// Queues each species' far stand-in once per range, instanced at its
+    /// trees in `far` (object indices by species) that are in view: the
+    /// parts turned about the vertical to face `eye`, the cap turned with
+    /// its tree. Returns the trees drawn.
+    fn draw_far_trees(
+        &self,
+        backend: &mut dyn RenderBackend,
+        queue: &mut DrawQueue,
+        eye: Vec3,
+        frustum: &Frustum,
+        far: &[Vec<usize>],
+    ) -> Result<usize, BackendError> {
+        let mut drawn = 0;
+        let mut facing: Vec<Mat4> = Vec::new();
+        let mut placed: Vec<Mat4> = Vec::new();
+        for (trees, gpu) in far.iter().zip(&self.far_trees) {
+            let Some(gpu) = gpu else { continue };
+            facing.clear();
+            placed.clear();
+            for &i in trees {
+                let o = &self.index.objects[i];
+                if !frustum.sees(o.position + Vec3::Y * gpu.middle, gpu.radius) {
+                    continue;
+                }
+                let to_eye = eye - o.position;
+                let turn = Quat::from_rotation_y(to_eye.x.atan2(to_eye.z));
+                facing.push(Mat4::from_rotation_translation(turn, o.position));
+                placed.push(Mat4::from_rotation_translation(o.rotation, o.position));
+            }
+            if facing.is_empty() {
+                continue;
+            }
+            drawn += facing.len();
+            for (k, &(first, count, material, translucent)) in gpu.ranges.iter().enumerate() {
+                let at = if k == 0 { &facing } else { &placed };
+                let instances = backend.set_skin(at)?;
+                queue.push(Primitive {
+                    call: DrawCall {
+                        material,
+                        topology: Topology::TriangleList,
+                        vertex_buffer: gpu.vertex_buffer,
+                        geometry: Geometry::Indexed {
+                            buffer: gpu.index_buffer,
+                            first,
+                            count,
+                            base_vertex: 0,
+                        },
+                        world: Mat4::IDENTITY,
+                        skin: None,
+                        instances: Some(instances),
+                        uv_offset: [0.0; 2],
+                    },
+                    layer: Layer::WORLD,
+                    translucent,
+                    sort_origin: at[0].w_axis.truncate(),
                     user: 0,
                 });
             }
