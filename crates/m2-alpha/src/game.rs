@@ -3,14 +3,18 @@
 
 use std::collections::HashSet;
 
+use m2_engine::durability::Explosion;
 use m2_engine::physics::FLOAT_DEPTH;
-use m2_engine::{CatalogueEntry, Physics, StaticKey, VehicleControls, VehicleSpec, World};
+use m2_engine::{
+    CatalogueEntry, Physics, StaticKey, Templates, VehicleControls, VehicleSpec, World,
+};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
 use crate::combat::{self, Combat, Effect, Field, Weapon};
 use crate::config::CameraConfig;
+use crate::destruct::{Blast, Destruction};
 use crate::drops::{Drops, Soldier};
 use crate::input::{Action, Input};
 use crate::mission::{WATERLINE, template_models};
@@ -91,6 +95,8 @@ pub struct Game {
     /// Vehicles from a loaded save, placed as their models load.
     restore: Vec<VehicleSave>,
     pub combat: Combat,
+    /// The island's placed objects worn down and brought down by blasts.
+    pub destruction: Destruction,
     /// Layer entities of the island's vehicles asked for so far.
     fetched: HashSet<u32>,
     /// Seconds to the next look for the island's vehicles near the player.
@@ -132,6 +138,7 @@ impl Game {
             park_tries: 0,
             restore: Vec::new(),
             combat: Combat::default(),
+            destruction: Destruction::default(),
             fetched: HashSet::new(),
             vehicle_wait: 0.0,
             startup: None,
@@ -525,6 +532,21 @@ impl Game {
                 combat::REACH,
                 false,
             );
+            if let Some(install) = &scene.install {
+                let (radius, damage, least) = blast_strength(&world.index.template_db);
+                for &at in &self.combat.went_off {
+                    let blast = Blast {
+                        at,
+                        radius,
+                        damage,
+                        least,
+                    };
+                    self.destruction
+                        .blast(world, &mut scene.props, install, blast);
+                }
+            }
+            self.destruction
+                .update(world, &mut scene.props, &mut self.combat);
             // A supply crate broken open: a puff of dust off its boards.
             let broken = scene.flights.strike(
                 &mut world.physics,
@@ -693,6 +715,21 @@ impl Game {
                     eprintln!("support: the bomb lands at {at:.1}");
                     self.combat.bomb(&mut field, at);
                     blast_loose(world, &mut scene.props, &[at], combat::BOMB.0, true);
+                    if let Some(install) = &scene.install {
+                        for (name, (radius, damage)) in
+                            [(BOMB_BLAST, combat::BOMB), (BOMB_FRAG, combat::BOMB_FRAG)]
+                        {
+                            let e = explosion(&world.index.template_db, &[name]);
+                            let blast = Blast {
+                                at,
+                                radius: e.map_or(radius, |e| e.radius),
+                                damage: e.map_or(damage, |e| e.damage),
+                                least: e.map_or(0.0, |e| e.least),
+                            };
+                            self.destruction
+                                .blast(world, &mut scene.props, install, blast);
+                        }
+                    }
                 }
                 Impact::Final(_) => self.combat.final_strike(&mut field, at),
             }
@@ -1260,6 +1297,33 @@ fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle])
 /// Blasts knock loose what comes loose within `reach` (as far as they
 /// hurt people), thrown out and up as people are, harder the nearer; a
 /// support `strike`'s the sturdy too.
+/// The template database's blasts the alpha's own stand for: a rocket's,
+/// a grenade's or a shell's (combat doesn't yet tell them apart, so the
+/// first of these found), and the satellite bomb's and its frag's.
+const ROCKET_BLASTS: [&str; 4] = [
+    "Explosion (Rocket)",
+    "Explosion (RPG)",
+    "Explosion (AT Rocket)",
+    "Explosion (AT Missile)",
+];
+const BOMB_BLAST: &str = "Explosion (Airstike Bomb)";
+const BOMB_FRAG: &str = "Explosion (Airstrike Frag)";
+
+/// The first of `names` the template database gives a blast.
+fn explosion(db: &Templates, names: &[&str]) -> Option<Explosion> {
+    names
+        .iter()
+        .find_map(|n| db.explosions.get(&db.id(n)?).copied())
+}
+
+/// An ordinary blast's reach and damage, heart to edge: a rocket's from
+/// the template database, else combat's own reach and 100 to nothing.
+fn blast_strength(db: &Templates) -> (f32, f32, f32) {
+    explosion(db, &ROCKET_BLASTS).map_or((combat::REACH, 100.0, 0.0), |e| {
+        (e.radius, e.damage, e.least)
+    })
+}
+
 fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32, strike: bool) {
     let thrown = |blast: Vec3, at: Vec3, d: f32| {
         let near = (1.0 - d / reach).clamp(0.0, 1.0);

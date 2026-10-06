@@ -437,7 +437,7 @@ pub struct Scene {
     vehicle_loads: Option<Receiver<Loaded>>,
     /// The archive's vehicle, person and weapon models, once found.
     pub catalogue: Option<Catalogue>,
-    install: Option<Install>,
+    pub install: Option<Install>,
     /// Vehicles loaded on request ([`Scene::load_vehicle`]).
     requests: (Sender<Loaded>, Receiver<Loaded>),
     /// Time spent streaming since this was last cleared: the island's

@@ -15,6 +15,7 @@
 pub mod anim;
 pub mod assets;
 pub mod audio;
+pub mod durability;
 pub mod model;
 pub mod physics;
 pub mod pickup;

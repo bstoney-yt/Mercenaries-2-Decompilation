@@ -202,6 +202,39 @@ impl Props {
         added
     }
 
+    /// Puts up one of the island's placed objects as a prop under `key`
+    /// (not an entity of the state layers), to bring it down as they are
+    /// brought down: its model loads as [`Props::update`] goes
+    /// ([`get`](Self::get) says when). False if `key` is already shown.
+    pub fn adopt(
+        &mut self,
+        install: &Install,
+        key: u32,
+        o: &m2_engine::world::ObjectPlacement,
+    ) -> bool {
+        if self.shown.contains_key(&key) {
+            return false;
+        }
+        self.shown.insert(
+            key,
+            Prop {
+                model: o.model,
+                position: o.position,
+                rotation: o.rotation,
+                wrecked: false,
+            },
+        );
+        self.changes += 1;
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.models.entry(o.model) {
+            slot.insert(None);
+            self.waiting.insert(o.model);
+        }
+        if self.loaders.is_none() {
+            self.loaders = Some(Loaders::start(install));
+        }
+        true
+    }
+
     /// Notes that `layer` puts up `entities`.
     pub fn note_layer(&mut self, entities: impl IntoIterator<Item = u32>, layer: &str) {
         let layer: Arc<str> = layer.into();

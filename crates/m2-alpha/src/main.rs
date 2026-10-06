@@ -40,6 +40,7 @@ mod cache;
 mod camera;
 mod combat;
 mod config;
+mod destruct;
 mod drops;
 mod flights;
 mod game;
@@ -119,6 +120,9 @@ struct Options {
     fight: bool,
     /// With `--screenshot`: rocket the nearest fuel tank or barrel.
     blast: bool,
+    /// With `--screenshot`: rocket the nearest building until it comes
+    /// down, at most this many rockets.
+    demolish: Option<u32>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
     /// With `--drive`: a vehicle whose name holds this.
@@ -275,6 +279,13 @@ fn parse_args() -> anyhow::Result<Options> {
             "--lead" => o.lead = Some(value()?.parse().context("--lead expects seconds")?),
             "--fight" => o.fight = true,
             "--blast" => o.blast = true,
+            "--demolish" => {
+                o.demolish = Some(
+                    value()?
+                        .parse()
+                        .context("--demolish expects a rocket count")?,
+                )
+            }
             "--wreck" => o.wreck = true,
             "--vehicle" => o.vehicle = Some(value()?.to_ascii_lowercase()),
             "--look" => {
@@ -812,6 +823,11 @@ fn screenshot(
         )?;
     } else if options.fight && game.on_foot && game.scene.player.is_some() {
         fight_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
+    } else if let Some(rockets) = options
+        .demolish
+        .filter(|_| game.on_foot && game.scene.player.is_some())
+    {
+        demolish_for_screenshot(&mut backend, &mut game, fov, aspect, rockets, out)?;
     } else if options.blast && game.on_foot && game.scene.player.is_some() {
         blast_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
     } else if options.drive && game.on_foot && game.scene.player.is_some() {
@@ -3119,6 +3135,177 @@ fn blast_for_screenshot(
     aim_at(game, at);
     game.step(Intent::default(), tick);
     render(backend, game, fov, aspect, None)?;
+    Ok(())
+}
+
+/// Rockets the nearest of the island's buildings (an object whose
+/// template has health and a collapse, its model a wreck) until it comes
+/// down, at most `rockets`, printing the damage it takes; pictures before,
+/// and 1 s and 6 s after it comes down, beside `out`.
+fn demolish_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    rockets: u32,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    use combat::{Trigger, Weapon};
+    use m2_math::glam::Vec3;
+    let tick = TICK.as_secs_f32();
+    let stem = out
+        .file_stem()
+        .map_or("shot".into(), |s| s.to_string_lossy());
+    let picture = |name: &str| out.with_file_name(format!("{stem}-{name}.ppm"));
+    // The island round her in first.
+    for i in 0..600 {
+        game.step(Intent::default(), tick);
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        if i > 120
+            && game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|w| w.stats().pending == 0)
+        {
+            break;
+        }
+    }
+    let here = game.focus();
+    let Some(world) = &game.scene.world else {
+        return Ok(());
+    };
+    let db = &world.index.template_db;
+    let mut blasts: Vec<String> = db
+        .explosions
+        .iter()
+        .filter_map(|(id, e)| {
+            let n = db.names.get(id)?;
+            Some(format!(
+                "{n:?} {:.0} m {:.0}..{:.0}",
+                e.radius, e.damage, e.least
+            ))
+        })
+        .collect();
+    blasts.sort();
+    eprintln!("demolish: blasts: {}", blasts.join("; "));
+    let target = world
+        .near(here, 150.0)
+        .into_iter()
+        .filter(|&(i, _)| {
+            let o = &world.index.objects[i];
+            world.loose_mass(i).is_none()
+                && world.object_model(i).is_some_and(|m| m.has_wreck())
+                && db
+                    .durability
+                    .get(&o.template)
+                    .is_some_and(|d| !d.invincible && d.health > 0.0 && d.collapse.is_some())
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    let Some((i, _)) = target else {
+        eprintln!("demolish: no building within 150 m of {here:.1}");
+        return Ok(());
+    };
+    let o = world.index.objects[i];
+    let (lo, hi) = world
+        .object_model(i)
+        .map_or((Vec3::ZERO, Vec3::ZERO), |m| m.bounds);
+    let at = o.position + o.rotation * ((lo + hi) * 0.5);
+    eprintln!(
+        "demolish: object {i} model {:08x} template {:08x} {:?} at {:.1}, {:.1?} m, {:?}",
+        o.model,
+        o.template,
+        db.names.get(&o.template),
+        o.position,
+        hi - lo,
+        db.durability.get(&o.template)
+    );
+    // Stand 35 m off with a clear line to it, trying round from where she
+    // starts.
+    let toward = (here - at).with_y(0.0);
+    let start = toward.z.atan2(toward.x);
+    let far = 35.0 + (hi - lo).with_y(0.0).length() * 0.5;
+    let stand = (0..16)
+        .map(|k| {
+            let a = start + k as f32 * std::f32::consts::TAU / 16.0;
+            at.with_y(o.position.y) + Vec3::new(a.cos(), 0.0, a.sin()) * far
+        })
+        .find(|&p| {
+            let eye = p + Vec3::Y * 1.5;
+            let to = at - eye;
+            world
+                .physics
+                .cast_ray(eye, to, to.length())
+                .is_none_or(|h| h.0 > to.length() - (hi - lo).length() * 0.5)
+        });
+    eprintln!("demolish: standing at {stand:.1?}");
+    if let Some(p) = game.scene.player.as_mut() {
+        let toward = toward.try_normalize().unwrap_or(Vec3::X);
+        p.character.position = stand.unwrap_or(at + toward * far) + Vec3::Y * 2.0;
+        p.character.velocity = Vec3::ZERO;
+        p.landed = false;
+    }
+    for k in 0..120 {
+        game.step(Intent::default(), tick);
+        if k % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    let aim = |fire, select| Intent {
+        trigger: Trigger {
+            fire,
+            aim: true,
+            select,
+            ..Trigger::default()
+        },
+        ..Intent::default()
+    };
+    aim_at(game, at);
+    game.step(aim(false, Some(Weapon::Rpg)), tick);
+    render(backend, game, fov, aspect, None)?;
+    write_ppm(backend, &picture("before"))?;
+    let mut fired = 0;
+    while fired < rockets && !game.destruction.destroyed.contains(&i) {
+        for _ in 0..30 {
+            aim_at(game, at);
+            game.step(aim(false, None), tick);
+        }
+        game.step(aim(true, None), tick);
+        fired += 1;
+        for _ in 0..120 {
+            aim_at(game, at);
+            game.step(aim(false, None), tick);
+        }
+        eprintln!(
+            "demolish: rocket {fired} from {:.1?}, {} blasts, the last at {:.1?}; damage {:.0}",
+            game.combat.last_launch.map(|l| l.0),
+            game.combat.blasts,
+            game.combat.last_blast,
+            game.destruction.damage(i)
+        );
+    }
+    if !game.destruction.destroyed.contains(&i) {
+        eprintln!("demolish: still standing after {fired} rockets");
+        return Ok(());
+    }
+    for (name, wait) in [("1s", 1.0), ("6s", 5.0)] {
+        for k in 0..(wait / tick) as usize {
+            aim_at(game, at);
+            game.step(Intent::default(), tick);
+            if k % 30 == 0 {
+                render(backend, game, fov, aspect, None)?;
+            }
+        }
+        render(backend, game, fov, aspect, None)?;
+        write_ppm(backend, &picture(name))?;
+        eprintln!(
+            "demolish: {name}: taken {}, {}",
+            game.scene.world.as_ref().is_some_and(|w| w.is_taken(i)),
+            game.scene.props.counts()
+        );
+    }
     Ok(())
 }
 

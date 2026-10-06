@@ -396,6 +396,9 @@ pub struct World {
     loose: HashMap<u32, Arc<Loose>>,
     /// Placed objects knocked loose: their pieces, in [`Loose`] order.
     knocked: HashMap<usize, Vec<DebrisId>>,
+    /// Placed objects taken off the island ([`take`](Self::take)): what is
+    /// left of them is drawn elsewhere (a building that came down).
+    taken: HashSet<usize>,
     /// Full-detail cells and placed models as static colliders. Step it
     /// each tick; colliders added by [`update`](Self::update) join scene
     /// queries on the next step.
@@ -443,6 +446,7 @@ impl World {
             destroyed: HashSet::new(),
             loose: HashMap::new(),
             knocked: HashMap::new(),
+            taken: HashSet::new(),
             physics: Physics::new(),
         };
         // Every tile, so the whole island shows from the start.
@@ -463,6 +467,7 @@ impl World {
     /// unless its model comes loose ([`Loose`]) and it stands.
     pub fn loose_mass(&self, i: usize) -> Option<f32> {
         if self.knocked.contains_key(&i)
+            || self.taken.contains(&i)
             || self.destroyed.contains(&i)
             || !self.physics.has_static(StaticKey::Object(i))
         {
@@ -500,6 +505,37 @@ impl World {
     /// within `reach` metres of `at` (as far as its box's middle less
     /// half its size), with how far.
     pub fn loose_near(&self, at: Vec3, reach: f32) -> Vec<(usize, f32)> {
+        self.near(at, reach)
+            .into_iter()
+            .filter(|&(i, _)| self.loose_mass(i).is_some())
+            .collect()
+    }
+
+    /// Takes placed object `i` off the island: no longer drawn, in the
+    /// way or knocked loose (what is left of it is drawn elsewhere).
+    pub fn take(&mut self, i: usize) {
+        if self.taken.insert(i) {
+            self.physics.remove_static(StaticKey::Object(i));
+        }
+    }
+
+    /// Whether placed object `i` was [taken](Self::take).
+    pub fn is_taken(&self, i: usize) -> bool {
+        self.taken.contains(&i)
+    }
+
+    /// Placed object `i`'s model, once loaded.
+    pub fn object_model(&self, i: usize) -> Option<&GpuModel> {
+        match self.models.get(&self.index.objects.get(i)?.model) {
+            Some(Slot::Ready(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Placed objects loaded and standing (not knocked loose or taken)
+    /// with any of their model within `reach` metres of `at` (as far as
+    /// its box's middle less half its size), with how far.
+    pub fn near(&self, at: Vec3, reach: f32) -> Vec<(usize, f32)> {
         let far = reach + BUCKET;
         let (b0, b1) = (
             bucket(at.x - far, at.z - far),
@@ -513,7 +549,7 @@ impl World {
                     let Some(Slot::Ready(m)) = self.models.get(&o.model) else {
                         continue;
                     };
-                    if self.loose_mass(i).is_none() {
+                    if self.knocked.contains_key(&i) || self.taken.contains(&i) {
                         continue;
                     }
                     let (lo, hi) = m.bounds;
@@ -551,6 +587,7 @@ impl World {
             } else {
                 reach
             } || self.knocked.contains_key(&i)
+                || self.taken.contains(&i)
                 || (self.destroyed.contains(&i) && !m.has_wreck())
             {
                 continue;
@@ -767,9 +804,9 @@ impl World {
                                 // A prop placed by name with no collision
                                 // of its own (a bush, a plant) has none:
                                 // vehicles and people go through it.
-                                if let Some(shape) =
-                                    m.collision.as_ref().filter(|s| !(o.named && s.stand_in))
-                                {
+                                if let Some(shape) = m.collision.as_ref().filter(|s| {
+                                    !(o.named && s.stand_in) && !self.taken.contains(&i)
+                                }) {
                                     self.physics.add_static(
                                         StaticKey::Object(i),
                                         shape,
@@ -969,7 +1006,10 @@ impl World {
                 for &i in self.objects.get(&(bx, bz)).map_or(&[][..], Vec::as_slice) {
                     let o = &self.index.objects[i];
                     let d = o.position.distance(eye);
-                    if d > if o.named { props } else { reach } || self.knocked.contains_key(&i) {
+                    if d > if o.named { props } else { reach }
+                        || self.knocked.contains_key(&i)
+                        || self.taken.contains(&i)
+                    {
                         continue;
                     }
                     if let Some(Slot::Ready(m)) = self.models.get(&o.model)
