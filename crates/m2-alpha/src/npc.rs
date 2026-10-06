@@ -18,13 +18,21 @@
 //! so). A soldier who sees the player, hears gunfire close by or is hit
 //! turns on her: fires while he sees her and she is in range, chases to
 //! where he last saw her when not, steps about between shots, and gives
-//! up after a while without sight of her. Civilians run.
+//! up after a while without sight of her, and lob a grenade (if their
+//! template gives them one and `NoGrenades` doesn't stop them) at where
+//! she hides. Civilians run.
+//!
+//! [`SmarterAi`] (the settings' `[enhanced.smarter_ai]`, off unless
+//! switched on) is not the original game: soldiers call out where she is
+//! to those near, spread around her rather than stepping at random, run
+//! for cover when hit, throw grenades sooner, and aim better.
 
 use std::collections::HashSet;
 
 use m2_engine::world::SpawnPoint;
 use m2_engine::{AiProfile, Character, Gait, GpuModel, Physics, RagdollId};
-use m2_math::glam::{Mat4, Vec2, Vec3};
+use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
+use serde::{Deserialize, Serialize};
 
 use crate::scene::{Carry, Rig};
 
@@ -71,6 +79,57 @@ const PUSH_TO: f32 = 15.0;
 /// again at random.
 const FIRE_GAP: (f32, f32) = (0.9, 0.8);
 const PAUSE: (f32, f32) = (2.0, 6.0);
+/// A soldier lobs a grenade at where she hides once she has been out of
+/// his sight this long, seconds, within this reach, metres, and no
+/// sooner than this after his last (inferred).
+const GRENADE_AFTER: f32 = 4.0;
+const GRENADE_REACH: (f32, f32) = (8.0, 25.0);
+const GRENADE_GAP: f32 = 15.0;
+
+/// The enhanced, smarter soldiers: not the original game's. Off by
+/// default; every number is the alpha's own.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SmarterAi {
+    pub enabled: bool,
+    /// A soldier who sees her tells those within this, metres, where she
+    /// is: they join the fight knowing.
+    pub callout_range: f32,
+    /// Soldiers spread around her, each to his own side, this far from
+    /// her (metres), rather than stepping aside at random.
+    pub flank: bool,
+    pub flank_distance: f32,
+    /// A soldier hit runs to the nearest spot within `cover_search`
+    /// metres that she can't see, and stays down there this long,
+    /// seconds, before coming out again.
+    pub cover: bool,
+    pub cover_search: f32,
+    pub cover_time: f32,
+    /// Grenades at her hiding place after this long out of sight, and
+    /// again after this, seconds.
+    pub grenade_after: f32,
+    pub grenade_gap: f32,
+    /// How much less they miss by: 1 is the original's spread.
+    pub accuracy_scale: f32,
+}
+
+impl Default for SmarterAi {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            callout_range: 40.0,
+            flank: true,
+            flank_distance: 25.0,
+            cover: true,
+            cover_search: 10.0,
+            cover_time: 2.5,
+            grenade_after: 2.0,
+            grenade_gap: 8.0,
+            accuracy_scale: 1.5,
+        }
+    }
+}
+
 /// People are drawn this close to the camera, metres.
 pub const DRAW_DISTANCE: f32 = 200.0;
 const TURN_RATE: f32 = 6.0;
@@ -295,6 +354,19 @@ pub struct Npc {
     /// seconds to the next.
     step: Option<(Vec3, f32)>,
     step_wait: f32,
+    /// Set by a tick when a soldier throws a grenade, at where; the
+    /// fight lobs it.
+    pub throws: Option<Vec3>,
+    grenade_wait: f32,
+    /// The smarter soldiers' settings (off: the original's).
+    pub smart: SmarterAi,
+    /// Saw her this tick for the first time in the fight (smarter: he
+    /// calls it out).
+    spotted: bool,
+    /// Smarter: running to cover, or down in it, for how much longer;
+    /// and the seconds since he was last hit.
+    cover: Option<(Vec3, f32)>,
+    hit: bool,
     /// Running from gunfire: where to, and for how much longer.
     flee: Option<(Vec3, f32)>,
     brain: Brain,
@@ -367,6 +439,12 @@ impl Npc {
             look: 0.0,
             step: None,
             step_wait: 0.0,
+            throws: None,
+            grenade_wait: 0.0,
+            smart: SmarterAi::default(),
+            spotted: false,
+            cover: None,
+            hit: false,
             flee: None,
             brain,
         }
@@ -382,6 +460,7 @@ impl Npc {
         }
         self.hp -= damage;
         self.alert = self.soldier;
+        self.hit = true;
         if self.hp <= 0.0 {
             self.alive = false;
             self.died = true;
@@ -470,6 +549,7 @@ impl Npc {
         if self.look <= 0.0 || self.last_seen.is_none() {
             self.look = LOOK_EVERY;
             if self.sees(physics, threat, true) {
+                self.spotted |= self.unseen > LOOK_EVERY * 1.5 || self.last_seen.is_none();
                 self.last_seen = Some(threat);
                 self.unseen = 0.0;
             }
@@ -481,8 +561,49 @@ impl Npc {
         if self.unseen > GIVE_UP {
             return false;
         }
+        let smart = self.smart;
         let mut wanted = Vec3::ZERO;
-        if !seen || distance > FIRE_RANGE {
+        // Grenades at her hiding place: she has been out of his sight a
+        // while, near enough.
+        self.grenade_wait -= dt;
+        let (after, gap) = if smart.enabled {
+            (smart.grenade_after, smart.grenade_gap)
+        } else {
+            (GRENADE_AFTER, GRENADE_GAP)
+        };
+        let reach = (goal - at).with_y(0.0).length();
+        if self.ai.grenades
+            && !self.ai.flags.no_grenades
+            && self.last_seen.is_some()
+            && self.unseen > after
+            && self.grenade_wait <= 0.0
+            && (GRENADE_REACH.0..GRENADE_REACH.1).contains(&reach)
+        {
+            self.throws = Some(goal);
+            self.grenade_wait = gap;
+        }
+        // Smarter: hit, he runs for cover and stays down a while.
+        if smart.enabled && smart.cover && std::mem::take(&mut self.hit) && self.cover.is_none() {
+            self.cover = self
+                .find_cover(physics, threat)
+                .map(|spot| (spot, smart.cover_time));
+        }
+        let mut hiding = false;
+        if let Some((spot, left)) = &mut self.cover {
+            let flat = (*spot - at).with_y(0.0);
+            if flat.length() > 0.6 {
+                wanted = flat.normalize() * SPRINT * self.ai.sprint_speed;
+            } else {
+                *left -= dt;
+            }
+            hiding = true;
+            if *left <= 0.0 {
+                self.cover = None;
+            }
+        }
+        if hiding {
+            self.step = None;
+        } else if !seen || distance > FIRE_RANGE {
             self.step = None;
             let flat = (goal - at).with_y(0.0);
             if flat.length() > CLOSE_ENOUGH {
@@ -496,8 +617,22 @@ impl Npc {
                 let side = Vec3::new(toward.z, 0.0, -toward.x) * rng.range(-1.0, 1.0).signum();
                 let push = distance > PUSH_TO && rng.range(0.0, 1.0) < self.ai.offensive;
                 let way = if push { toward } else { side };
-                let length = rng.range(STEP.0, STEP.1);
-                self.step = Some((at + way * length, length / (SPRINT * self.ai.combat_speed)));
+                let mut length = rng.range(STEP.0, STEP.1);
+                let mut target = at + way * length;
+                if smart.enabled && smart.flank {
+                    // His own side of her, by his spawn: five ways round
+                    // from where he stands, 0 and +-40, +-80 degrees.
+                    let lane = self.spawn.unwrap_or(0).wrapping_mul(2_654_435_761) % 5;
+                    let angle = (lane as f32 - 2.0) * 40f32.to_radians();
+                    let from_her = Quat::from_rotation_y(angle) * -toward;
+                    let post = threat.with_y(at.y) + from_her * smart.flank_distance;
+                    let flat = (post - at).with_y(0.0);
+                    if flat.length() > 1.0 {
+                        length = flat.length().min(STEP.1 * 1.5);
+                        target = at + flat.normalize() * length;
+                    }
+                }
+                self.step = Some((target, length / (SPRINT * self.ai.combat_speed)));
             }
             if let Some((target, left)) = &mut self.step {
                 *left -= dt;
@@ -519,6 +654,7 @@ impl Npc {
                 self.last_seen = Some(at);
             }
         }
+        let seen = seen && !hiding;
         let face = if seen || wanted == Vec3::ZERO {
             to.x.atan2(to.z)
         } else {
@@ -550,12 +686,86 @@ impl Npc {
         true
     }
 
+    /// His `Accuracy`, as the smarter soldiers have it when on.
+    pub fn accuracy(&self) -> f32 {
+        if self.smart.enabled {
+            1.0 - (1.0 - self.ai.accuracy) / self.smart.accuracy_scale.max(0.1)
+        } else {
+            self.ai.accuracy
+        }
+    }
+
+    /// In a fight, what he is at (for checking): shooting, chasing,
+    /// stepping about, taking cover.
+    pub fn fight_state(&self) -> Option<&'static str> {
+        if !self.alive || !self.alert {
+            return None;
+        }
+        Some(if self.cover.is_some() {
+            "in cover"
+        } else if self.unseen > LOOK_EVERY * 1.5 {
+            "chasing"
+        } else if self.step.is_some() {
+            "stepping"
+        } else {
+            "shooting"
+        })
+    }
+
+    /// Smarter: the nearest spot within `cover_search` that `threat`
+    /// can't see (from her chest to his head), tried round him.
+    fn find_cover(&self, physics: &Physics, threat: Vec3) -> Option<Vec3> {
+        let at = self.character.position;
+        let away = (at - threat).with_y(0.0).normalize_or(Vec3::Z);
+        let mut best: Option<(f32, Vec3)> = None;
+        for ring in [0.4, 0.7, 1.0] {
+            for k in 0..12 {
+                let turn = Quat::from_rotation_y(k as f32 * std::f32::consts::TAU / 12.0);
+                let spot = at + turn * away * self.smart.cover_search * ring;
+                // Onto the ground there.
+                let top = Vec3::new(spot.x, at.y + 4.0, spot.z);
+                let Some((down, _)) = physics.cast_ray(top, -Vec3::Y, 10.0) else {
+                    continue;
+                };
+                let ground = top - Vec3::Y * down;
+                let head = ground + Vec3::Y * EYE;
+                let to = head - threat;
+                let d = to.length();
+                if d < 3.0 || physics.cast_ray(threat, to / d, d - 0.3).is_none() {
+                    continue;
+                }
+                let cost = ground.distance(at);
+                if best.is_none_or(|(c, _)| cost < c) {
+                    best = Some((cost, ground));
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
     /// Calm again: forgets the fight.
     fn calm(&mut self) {
         self.alert = false;
         self.last_seen = None;
         self.unseen = 0.0;
         self.step = None;
+        self.cover = None;
+        self.hit = false;
+    }
+
+    /// Told (smarter) where she is by a soldier who sees her.
+    fn told(&mut self, threat: Vec3) {
+        if !self.alive || !self.soldier || self.ai.flags.pacifist {
+            return;
+        }
+        self.alert = true;
+        if self.last_seen.is_none() || self.unseen > LOOK_EVERY * 1.5 {
+            self.last_seen = Some(threat);
+            self.unseen = LOOK_EVERY * 2.0;
+        }
     }
 
     pub fn patrolling(&self) -> bool {
@@ -634,6 +844,7 @@ impl Npc {
                     && self.sees(physics, t, false)
                 {
                     self.alert = true;
+                    self.spotted = true;
                     self.last_seen = Some(t);
                 }
             }
@@ -789,6 +1000,8 @@ pub struct People {
     asked: HashSet<u32>,
     active: HashSet<u32>,
     rng: Rng,
+    /// The enhanced, smarter soldiers' settings (off: the original's).
+    pub smarter: SmarterAi,
 }
 
 impl People {
@@ -864,8 +1077,13 @@ impl People {
         dt: f32,
     ) {
         self.populate(physics, spawns, focus);
+        let mut callouts = Vec::new();
         for npc in &mut self.npcs {
+            npc.smart = self.smarter;
             npc.update(physics, &mut self.rng, threat, dt);
+            if std::mem::take(&mut npc.spotted) && npc.alive && self.smarter.enabled {
+                callouts.push(npc.character.position);
+            }
             // The dead go limp from where they stood, shoved as they were
             // hit.
             let Some(push) = npc.fling.take() else {
@@ -882,6 +1100,33 @@ impl People {
                 }
             }
         }
+        // Smarter: those near a soldier who spots her are told where she is.
+        if let Some(t) = threat {
+            let range = self.smarter.callout_range;
+            for from in callouts {
+                for npc in &mut self.npcs {
+                    if npc.character.position.distance(from) < range {
+                        npc.told(t);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The soldiers fighting by what they are at, in a line (for checking).
+    pub fn fight_summary(&self) -> String {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for state in self.npcs.iter().filter_map(Npc::fight_state) {
+            match counts.iter_mut().find(|c| c.0 == state) {
+                Some(c) => c.1 += 1,
+                None => counts.push((state, 1)),
+            }
+        }
+        if counts.is_empty() {
+            return "no soldier fighting".to_owned();
+        }
+        let parts: Vec<String> = counts.iter().map(|(s, n)| format!("{n} {s}")).collect();
+        format!("soldiers {}", parts.join(", "))
     }
 
     /// Vehicles going through people: `cars` are (model to world,
@@ -1517,6 +1762,77 @@ pub(crate) mod tests {
             "{gone} vs {pursue}"
         );
         assert_eq!(shots, 0, "out of firing range");
+    }
+
+    #[test]
+    fn a_soldier_lobs_a_grenade_where_she_hides() {
+        let physics = ground();
+        let mut rng = Rng::default();
+        let dt = 1.0 / 60.0;
+        let post = Brain::Post { facing: 0.0 };
+        let mut soldier = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
+        soldier.ai.pursue_speed = 0.0;
+        soldier.ai.combat_speed = 0.0;
+        soldier.update(&physics, &mut rng, None, dt);
+        // Seen 15 m off, then gone out of his sight.
+        for _ in 0..30 {
+            soldier.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
+        }
+        assert!(soldier.alert);
+        let mut thrown = Vec::new();
+        for _ in 0..60 * 6 {
+            soldier.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 95.0)), dt);
+            thrown.extend(soldier.throws.take());
+        }
+        assert_eq!(thrown.len(), 1, "one, then he waits");
+        assert!(thrown[0].distance(Vec3::new(0.0, 1.2, 15.0)) < 0.1);
+        // NoGrenades: none.
+        let post = Brain::Post { facing: 0.0 };
+        let mut held = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(2));
+        held.ai.pursue_speed = 0.0;
+        held.ai.flags.no_grenades = true;
+        held.update(&physics, &mut rng, None, dt);
+        for _ in 0..30 {
+            held.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 15.0)), dt);
+        }
+        for _ in 0..60 * 6 {
+            held.update(&physics, &mut rng, Some(Vec3::new(0.0, 1.2, 95.0)), dt);
+            assert!(held.throws.take().is_none());
+        }
+    }
+
+    #[test]
+    fn smarter_soldiers_call_her_out_to_those_near() {
+        let mut physics = ground();
+        let dt = 1.0 / 60.0;
+        let run = |smart: bool| {
+            let mut people = People::default();
+            people.smarter.enabled = smart;
+            let mut add = |facing: f32, at: Vec3, id| {
+                let post = Brain::Post { facing };
+                let mut n = Npc::new(0, &rig(), at, facing, post, Some(id));
+                n.landed = true;
+                people.npcs.push(n);
+            };
+            // One facing her, one 20 m off facing away.
+            add(0.0, Vec3::new(0.0, 0.0, 0.0), 1);
+            add(std::f32::consts::PI, Vec3::new(20.0, 0.0, 0.0), 2);
+            people
+        };
+        for smart in [false, true] {
+            let mut people = run(smart);
+            for _ in 0..20 {
+                people.update(
+                    &mut physics,
+                    &[],
+                    Vec3::ZERO,
+                    Some(Vec3::new(0.0, 1.2, 30.0)),
+                    dt,
+                );
+            }
+            assert!(people.npcs[0].alert, "he sees her");
+            assert_eq!(people.npcs[1].alert, smart, "told only when smarter");
+        }
     }
 
     #[test]

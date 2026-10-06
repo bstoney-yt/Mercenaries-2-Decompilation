@@ -1594,7 +1594,7 @@ impl Autoplay {
             holding += &format!("; support {:?}", game.support.phase);
         }
         eprintln!(
-            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, {}; closest {:.0} m, {:.0} s ago; {} hops{holding}",
+            "autoplay {:.1} s: at {:.1}, {}, health {:.0}, {}; closest {:.0} m, {:.0} s ago; {} hops{holding}; {}",
             self.clock,
             game.focus(),
             riding.unwrap_or_else(|| "on foot".to_owned()),
@@ -1602,7 +1602,8 @@ impl Autoplay {
             self.what,
             self.best.0,
             self.since_moved(),
-            self.hops.len()
+            self.hops.len(),
+            game.scene.people.fight_summary()
         );
     }
 

@@ -173,6 +173,9 @@ struct Options {
     /// With `--mission --screenshot`: she plays the mission herself, by
     /// its markers, until it is done or the seconds are up.
     autoplay: bool,
+    /// Switch the smarter enemy soldiers on (the settings'
+    /// `[enhanced.smarter_ai] enabled`).
+    smarter_ai: bool,
     /// With `--screenshot`: bring down the mission's gates as the bomb
     /// does, logging where their pieces go ([`gates_for_screenshot`]).
     gates: bool,
@@ -344,6 +347,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
             "--autoplay" => o.autoplay = true,
+            "--smarter-ai" => o.smarter_ai = true,
             "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
             "--gates" => o.gates = true,
             "--mission-seconds" => {
@@ -410,6 +414,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(sea) = options.sea {
         config.world.sea_level = sea;
     }
+    config.enhanced.smarter_ai.enabled |= options.smarter_ai;
     if options.write_config {
         print!("{}", config.to_toml());
         return Ok(());
@@ -606,6 +611,7 @@ fn screenshot(
         config.world.sea_level,
         options.mission,
     )?;
+    game.scene.people.smarter = config.enhanced.smarter_ai;
     if options.fly {
         game.on_foot = false;
     }
@@ -3182,6 +3188,7 @@ impl App {
             self.config.world.sea_level,
             self.mission,
         )?;
+        game.scene.people.smarter = self.config.enhanced.smarter_ai;
         if self.fly {
             game.on_foot = false;
         }

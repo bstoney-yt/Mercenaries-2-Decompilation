@@ -78,6 +78,9 @@ pub struct AiProfile {
     pub hearing: f32,
     pub vision_fov: f32,
     pub flags: AiFlags,
+    /// Carries grenades: an `EquipmentLink` names a grenade template
+    /// (`Grenade (AI)`, as VZ soldiers have).
+    pub grenades: bool,
 }
 
 impl Default for AiProfile {
@@ -97,6 +100,7 @@ impl Default for AiProfile {
             hearing: 1.0,
             vision_fov: 180.0,
             flags: AiFlags::default(),
+            grenades: true,
         }
     }
 }
@@ -119,6 +123,17 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, AiProfile> {
     let skill = Table::new(db, "AiSkill");
     let perception = Table::new(db, "Perception");
     let health = Table::new(db, "Health");
+    let equipment = Table::new(db, "EquipmentLink");
+    let names = db.names();
+    // `EquipmentLink`'s template field is unnamed (54704554).
+    let carries_grenades = |id: u32| {
+        equipment.of_template(id).iter().any(|r| {
+            equipment
+                .word(r, 0x5470_4554)
+                .and_then(|t| names.get(&t))
+                .is_some_and(|n| n.to_ascii_lowercase().contains("grenade"))
+        })
+    };
     let first = |t: &Table<'_>, id: u32, name: &str| {
         t.of_template(id)
             .first()
@@ -155,6 +170,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, AiProfile> {
                     .of_template(id)
                     .first()
                     .map_or_else(AiFlags::default, |r| flags(&behaviour, r)),
+                grenades: carries_grenades(id),
             };
             (id, profile)
         })

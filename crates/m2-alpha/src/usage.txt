@@ -106,6 +106,8 @@ m2-alpha [options]
                          off the pickup lying nearest her, looking at it
   --mission-look <m>     with --mission --screenshot: take the picture from
                          this far from the nearest marker, looking at it
+  --smarter-ai           the enhanced, smarter enemy soldiers (not the
+                         original game's; settings [enhanced.smarter_ai])
   --autoplay             with --mission --screenshot: she plays the contract
                          herself by its markers (runs to places, shoots the
                          marked soldiers, opens and shuts her PDA when the

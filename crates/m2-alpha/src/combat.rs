@@ -1210,11 +1210,14 @@ impl Combat {
         let holding = on_foot && (trigger.aim || self.aim_left > 0.0);
         f.player.aiming = holding;
 
-        // Soldiers' shots.
+        // Soldiers' shots and grenades.
         let target = self.target(f.player, true);
         for i in 0..f.people.npcs.len() {
             if std::mem::take(&mut f.people.npcs[i].fires) {
                 self.npc_shoot(f, i, target);
+            }
+            if let Some(at) = f.people.npcs[i].throws.take() {
+                self.npc_throw(f, i, at);
             }
         }
         self.fly(f, dt);
@@ -1314,6 +1317,21 @@ impl Combat {
         alarm(f.people, f.player.character.position);
     }
 
+    /// A soldier's grenade lobbed from over his head down onto `at` (as
+    /// hard as she throws), or as far as it goes that way.
+    fn npc_throw(&mut self, f: &mut Field<'_>, i: usize, at: Vec3) {
+        let n = &f.people.npcs[i];
+        let from = n.character.position + Vec3::Y * 1.8;
+        let gravity = m2_engine::physics::GRAVITY;
+        let velocity =
+            lob_velocity(from, at, THROW, gravity).unwrap_or_else(|| farthest(at - from, THROW));
+        self.projectiles.push(Projectile::Grenade {
+            at: from,
+            velocity,
+            fuse: FUSE,
+        });
+    }
+
     fn npc_shoot(&mut self, f: &mut Field<'_>, i: usize, target: Option<Vec3>) {
         let Some(aim) = target else { return };
         let n = &f.people.npcs[i];
@@ -1337,7 +1355,7 @@ impl Combat {
         // soldier (`Accuracy` 0.4); the more accurate miss by less
         // (inferred: by what they lack of a perfect 1).
         let spread = (0.02 + distance * 0.004)
-            * ((1.0 - n.ai.accuracy) / (1.0 - VZ_ACCURACY)).clamp(0.2, 2.0);
+            * ((1.0 - n.accuracy()) / (1.0 - VZ_ACCURACY)).clamp(0.2, 2.0);
         let dir = ((aim - from).normalize_or_zero()
             + Vec3::new(
                 self.random() * spread * 2.0,
