@@ -118,6 +118,16 @@
 //!                           banks with the stream's sound length; then
 //!                           the cue tables of blocks whose path holds
 //!                           "vz01"/"vzacon" with their first cues
+//! destruct[:<word>,..]      how the data describes what breaks: the
+//!                           template database's components (records,
+//!                           and placed entities whose template has
+//!                           each), how placed entities name a template,
+//!                           the fields of components named for damage
+//!                           (health, debris, collapse...), and over
+//!                           every placed model the state machines'
+//!                           states and verbs, by name word (bld, sign,
+//!                           fence, tree...); with words, the models so
+//!                           named, each with its states and verbs
 //! ```
 //!
 //! Names come from every NUL-terminated string in the four archives and
@@ -789,6 +799,17 @@ fn main() -> Result<(), Error> {
             "sounddb" => sounddb(&mut source, &names, arg),
             "soundnames" => soundnames(&mut source, &names, arg),
             "steps" => steps(&mut source, &names, arg),
+            "destruct" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                destruct(
+                    &mut source,
+                    world.as_ref().expect("just built"),
+                    &names,
+                    arg,
+                )
+            }
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
             "find" => {
@@ -4747,4 +4768,694 @@ fn field_value(names: &Names, f: &m2_assets::layer::Field, rec: &[u8]) -> String
         format!("{v:#x}")
     };
     format!("{fname}(t{})={shown}", f.ty)
+}
+
+/// Words the fields, states and verbs of breaking things may be named
+/// of, alone, in pairs and with `Init…State`: the names are only matched
+/// against hashes the data holds.
+const DESTRUCT_WORDS: &[&str] = &[
+    "Health",
+    "Max",
+    "Hit",
+    "Points",
+    "Damage",
+    "Threshold",
+    "Armor",
+    "Armour",
+    "Destroy",
+    "Destroyed",
+    "Destruction",
+    "Debris",
+    "Template",
+    "Collapse",
+    "Anim",
+    "Sink",
+    "Speed",
+    "Accel",
+    "Lean",
+    "Angle",
+    "Time",
+    "Delay",
+    "Radius",
+    "Force",
+    "Mass",
+    "Effect",
+    "Sound",
+    "Key",
+    "Explosion",
+    "Fire",
+    "Smoke",
+    "Emitter",
+    "Spawn",
+    "State",
+    "Msg",
+    "Init",
+    "Pristine",
+    "Intact",
+    "Damaged",
+    "Wreck",
+    "Wrecked",
+    "Broken",
+    "Break",
+    "Chunk",
+    "Piece",
+    "Pieces",
+    "Count",
+    "Min",
+    "Scale",
+    "Shake",
+    "Camera",
+    "Object",
+    "Create",
+    "Root",
+    "Node",
+    "Start",
+    "Stop",
+    "Set",
+    "Show",
+    "Hide",
+    "Play",
+    "Fall",
+    "Fallen",
+    "Topple",
+    "Crumble",
+    "Burn",
+    "Burning",
+    "Dead",
+    "Death",
+    "Level",
+    "Stage",
+    "Type",
+    "Class",
+    "Material",
+    "Resist",
+    "Resistance",
+    "Multiplier",
+    "Vehicle",
+    "Bullet",
+    "Explosive",
+    "Impact",
+    "Building",
+    "Prop",
+    "Light",
+    "Heavy",
+    "Small",
+    "Large",
+    "Value",
+    "Reward",
+    "Cash",
+    "Bounty",
+    "Faction",
+    "Physics",
+    "Physical",
+    "Enable",
+    "Disable",
+    "Model",
+    "Name",
+    "Partial",
+    "Half",
+    "Full",
+    "Ruin",
+    "Ruined",
+    "Rubble",
+    "Dust",
+    "Decal",
+    "Height",
+    "Offset",
+    "Ground",
+    "Under",
+    "Lifetime",
+    "Life",
+    "Fade",
+    "Out",
+    "Respawn",
+    "Regen",
+    "Invulnerable",
+    "Indestructible",
+    "Destructible",
+    "Breakable",
+    "Flags",
+    "Ratio",
+    "Percent",
+    "Total",
+    "Collapsed",
+    "Destroying",
+    "Collapsing",
+    "Sinking",
+    "Falling",
+    "Dying",
+    "Alive",
+    "Normal",
+    "Default",
+    "Idle",
+    "On",
+    "Off",
+    "Enter",
+    "Exit",
+    "Send",
+    "Post",
+    "Event",
+    "Message",
+    "Attach",
+    "Detach",
+    "Apply",
+    "Kill",
+    "Explode",
+    "Hp",
+    "Strength",
+    "Tough",
+    "Weak",
+];
+
+/// How the data describes what breaks; see the module docs.
+fn destruct<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let mut names = Names {
+        map: names.map.clone(),
+    };
+    for &a in DESTRUCT_WORDS {
+        names.add(a);
+        for p in ["f", "i", "b", "max", "min", "m_", "s", "n"] {
+            names.add(&format!("{p}{a}"));
+        }
+        names.add(&format!("Init{a}State"));
+        for &b in DESTRUCT_WORDS {
+            for p in ["", "f", "i", "b", "max", "min"] {
+                names.add(&format!("{p}{a}{b}"));
+            }
+            names.add(&format!("Init{a}{b}State"));
+        }
+    }
+    let names = &names;
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    const KEYS: [&str; 30] = [
+        "destr", "health", "damage", "debris", "collapse", "break", "wreck", "death", "dead",
+        "die", "explo", "hit", "armo", "frag", "shatter", "sink", "burn", "fire", "smash", "crush",
+        "topple", "build", "prop", "state", "effect", "emit", "smoke", "spawn", "kill", "rubble",
+    ];
+    let keyed = |n: &str| {
+        let n = n.to_ascii_lowercase();
+        KEYS.iter().any(|k| n.contains(k))
+    };
+
+    // The template database: each template's components.
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let model_hashes: HashSet<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames: HashMap<u32, String> = db
+        .names()
+        .into_iter()
+        .map(|(id, n)| (id, n.to_owned()))
+        .collect();
+    let mut by_lower: HashMap<String, u32> = HashMap::new();
+    for (&id, n) in &tnames {
+        let e = by_lower.entry(n.to_ascii_lowercase()).or_insert(id);
+        *e = (*e).min(id);
+    }
+    let mut comps: HashMap<u32, Vec<&str>> = HashMap::new();
+    for c in &db.components {
+        for (id, _) in c.records().unwrap_or_default() {
+            let v = comps.entry(id).or_default();
+            if !v.contains(&c.name) {
+                v.push(c.name);
+            }
+        }
+    }
+    let tmodels = db.hashes("ModelName");
+    let skip = |id: u32| {
+        comps.get(&id).is_some_and(|c| {
+            c.iter().any(|n| {
+                matches!(
+                    *n,
+                    "_CarPhysicsV2"
+                        | "_TankPhysics"
+                        | "_BoatPhysics"
+                        | "_HelicopterPhysics"
+                        | "_HumanPhysics"
+                        | "Ai"
+                        | "AiBehavior"
+                )
+            })
+        })
+    };
+
+    // Every placed entity with a model.
+    struct Row {
+        is_static: bool,
+        model: u32,
+        stem: String,
+        /// Its template and how it was found: 0 parent, 1 by name, 2 by
+        /// model.
+        template: Option<(u32, u8)>,
+        own: Vec<String>,
+    }
+    let mut by_model: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&t, &m) in &tmodels {
+        by_model.entry(m).or_default().push(t);
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let mut own_tally: BTreeMap<String, usize> = BTreeMap::new();
+    let mut own_fields: HashMap<String, (Vec<m2_assets::layer::Field>, Vec<Vec<u8>>)> =
+        HashMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        let is_static = paths[b].contains("layers_static");
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            let entity_names = layer.names();
+            let model_names = layer.hashes("ModelName");
+            let mut own: HashMap<u32, Vec<String>> = HashMap::new();
+            for c in &layer.components {
+                if matches!(c.name, "Transform" | "Name") {
+                    continue;
+                }
+                for (id, r) in c.records().unwrap_or_default() {
+                    own.entry(id).or_default().push(c.name.to_owned());
+                    *own_tally.entry(c.name.to_owned()).or_default() += 1;
+                    if keyed(c.name) {
+                        let slot = own_fields
+                            .entry(c.name.to_owned())
+                            .or_insert_with(|| (c.fields.clone(), Vec::new()));
+                        if slot.1.len() < 4000 {
+                            slot.1.push(r.to_vec());
+                        }
+                    }
+                }
+            }
+            for (id, p) in layer.placements() {
+                let name = entity_names.get(&id).copied().unwrap_or("");
+                let stem = m2_engine::world::member_stem(name).to_ascii_lowercase();
+                let template = if tnames.contains_key(&p.parent) {
+                    Some((p.parent, 0))
+                } else {
+                    by_lower
+                        .get(&stem)
+                        .or_else(|| by_lower.get(&format!("_{stem}")))
+                        .map(|&t| (t, 1))
+                };
+                let model = model_names
+                    .get(&id)
+                    .copied()
+                    .or_else(|| {
+                        let h = m2_assets::name_hash(&stem);
+                        model_hashes.contains(&h).then_some(h)
+                    })
+                    .or_else(|| template.and_then(|(t, _)| tmodels.get(&t).copied()));
+                let Some(model) = model else { continue };
+                let template = template.or_else(|| {
+                    by_model
+                        .get(&model)
+                        .and_then(|t| t.iter().min())
+                        .map(|&t| (t, 2))
+                });
+                if template.is_some_and(|(t, _)| skip(t)) {
+                    continue;
+                }
+                rows.push(Row {
+                    is_static,
+                    model,
+                    stem,
+                    template,
+                    own: own.remove(&id).unwrap_or_default(),
+                });
+            }
+        }
+    }
+    let how = |k: u8| {
+        rows.iter()
+            .filter(|r| r.template.map(|t| t.1) == Some(k))
+            .count()
+    };
+    println!(
+        "placed entities with a model (no vehicles, people): {} ({} static), template by parent {}, by name {}, by model {}, none {}",
+        rows.len(),
+        rows.iter().filter(|r| r.is_static).count(),
+        how(0),
+        how(1),
+        how(2),
+        rows.iter().filter(|r| r.template.is_none()).count()
+    );
+
+    // Components: of templates, and placed entities whose template has it.
+    println!(
+        "template database: {} templates, {} components; per component: records, templates, placed entities (distinct templates), * = named for damage",
+        tnames.len(),
+        db.components.len()
+    );
+    let mut placed_by: HashMap<&str, (usize, HashSet<u32>)> = HashMap::new();
+    for r in &rows {
+        if let Some((t, _)) = r.template {
+            for c in comps.get(&t).into_iter().flatten() {
+                let e = placed_by.entry(c).or_default();
+                e.0 += 1;
+                e.1.insert(t);
+            }
+        }
+    }
+    let mut line = Vec::new();
+    for c in &db.components {
+        let recs = c.records().unwrap_or_default();
+        let templates: HashSet<u32> = recs.iter().map(|r| r.0).collect();
+        let (n, ts) = placed_by.get(c.name).map_or((0, 0), |e| (e.0, e.1.len()));
+        line.push(format!(
+            "{}{} {}/{}/{}({})",
+            if keyed(c.name) { "*" } else { "" },
+            c.name,
+            recs.len(),
+            templates.len(),
+            n,
+            ts
+        ));
+        if line.len() == 4 {
+            println!("  {}", line.join("; "));
+            line.clear();
+        }
+    }
+    if !line.is_empty() {
+        println!("  {}", line.join("; "));
+    }
+    println!("layer entity components (all layers), count:");
+    let own_line: Vec<String> = own_tally
+        .iter()
+        .map(|(n, k)| format!("{}{n} {k}", if keyed(n) { "*" } else { "" }))
+        .collect();
+    for chunk in own_line.chunks(6) {
+        println!("  {}", chunk.join("; "));
+    }
+
+    // The damage-named components' fields, each with its commonest values.
+    let summarise = |fields: &[m2_assets::layer::Field], recs: &[&[u8]]| {
+        for f in fields {
+            let mut seen: HashMap<String, usize> = HashMap::new();
+            for rec in recs {
+                let v = field_value(names, f, rec);
+                let v = v.split_once('=').map_or(v.clone(), |(_, v)| v.to_owned());
+                *seen.entry(v).or_default() += 1;
+            }
+            let mut top: Vec<(usize, String)> = seen.into_iter().map(|(v, n)| (n, v)).collect();
+            top.sort_unstable_by(|a, b| b.cmp(a));
+            let fname = names
+                .get(f.name_hash)
+                .map_or(format!("{:08x}", f.name_hash), str::to_owned);
+            let shown: Vec<String> = top
+                .iter()
+                .take(5)
+                .map(|(n, v)| format!("{v} x{n}"))
+                .collect();
+            println!(
+                "      {fname} (t{}{}) {} values: {}",
+                f.ty,
+                if f.bit_width > 0 {
+                    format!(" bits {}+{}", f.bit_shift, f.bit_width)
+                } else {
+                    String::new()
+                },
+                top.len(),
+                shown.join(", ")
+            );
+        }
+    };
+    println!("template components named for damage, fields:");
+    for c in db.components.iter().filter(|c| keyed(c.name)) {
+        let recs = c.records().unwrap_or_default();
+        let mut sample: Vec<&str> = recs
+            .iter()
+            .filter_map(|r| tnames.get(&r.0).map(String::as_str))
+            .collect();
+        sample.sort_unstable();
+        sample.dedup();
+        println!(
+            "  {} ({} records) e.g. {:?}",
+            c.name,
+            recs.len(),
+            &sample[..sample.len().min(6)]
+        );
+        let raw: Vec<&[u8]> = recs.iter().map(|r| r.1).collect();
+        summarise(&c.fields, &raw);
+    }
+    println!("layer components named for damage, fields:");
+    let mut own_keys: Vec<&String> = own_fields.keys().collect();
+    own_keys.sort_unstable();
+    for k in own_keys {
+        let (fields, recs) = &own_fields[k];
+        println!("  {k} ({} records read)", recs.len());
+        let raw: Vec<&[u8]> = recs.iter().map(Vec::as_slice).collect();
+        summarise(fields, &raw);
+    }
+
+    // The models: their state machines' states and verbs.
+    #[derive(Default)]
+    struct Seen {
+        states: Vec<u32>,
+        verbs: Vec<u32>,
+        wrecked: bool,
+        chunks: usize,
+        loose: Option<bool>,
+    }
+    let stam_of = |data: &m2_engine::assets::ModelData| -> Option<(Vec<u32>, Vec<u32>)> {
+        let u = m2_assets::Ucfx::parse(&data.base).ok()?;
+        let secs = u.sections();
+        let at = u.children(None).find(|&i| &secs[i].fourcc == b"STAM")?;
+        let last = (at + secs[at].descendants as usize).min(secs.len() - 1);
+        let (mut states, mut verbs) = (Vec::new(), Vec::new());
+        for sec in &secs[at + 1..=last] {
+            let Some(d) = sec.data else { continue };
+            let w: Vec<u32> = d
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            match &sec.fourcc {
+                b"STAT" => {
+                    if let Some(&s) = w.first()
+                        && !states.contains(&s)
+                    {
+                        states.push(s);
+                    }
+                }
+                b"CEXE" => {
+                    for pair in w.chunks_exact(2) {
+                        if pair[0] == 2 && !verbs.contains(&pair[1]) {
+                            verbs.push(pair[1]);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some((states, verbs))
+    };
+    let mut placements: HashMap<u32, usize> = HashMap::new();
+    for r in &rows {
+        *placements.entry(r.model).or_default() += 1;
+    }
+    for o in &world.objects {
+        placements.entry(o.model).or_default();
+    }
+    let mut seen: HashMap<u32, Seen> = HashMap::new();
+    for &h in placements.keys() {
+        let Ok(data) = source.model(h) else { continue };
+        let mut s = Seen::default();
+        if let Some((states, verbs)) = stam_of(&data) {
+            s.states = states;
+            s.verbs = verbs;
+        }
+        if let Ok(m) = data.parse()
+            && let Some(st) = &m.states
+        {
+            s.wrecked = st.machines.iter().any(|mm| {
+                mm.states
+                    .iter()
+                    .any(|x| x.0 == m2_assets::model::STATE_WRECKED)
+            });
+            s.chunks = st.chunks(&m.nodes).len();
+        }
+        s.loose = m2_engine::CpuModel::from_data(&data, 0)
+            .ok()
+            .and_then(|c| c.collision)
+            .and_then(|c| c.loose)
+            .map(|l| l.breaks);
+        seen.insert(h, s);
+    }
+    println!(
+        "{} placed models read of {}; with STAM {}, a wrecked state {}, chunks {}, loose {} (breaking {})",
+        seen.len(),
+        placements.len(),
+        seen.values().filter(|s| !s.states.is_empty()).count(),
+        seen.values().filter(|s| s.wrecked).count(),
+        seen.values().filter(|s| s.chunks > 0).count(),
+        seen.values().filter(|s| s.loose.is_some()).count(),
+        seen.values().filter(|s| s.loose == Some(true)).count()
+    );
+    let tally = |pick: &dyn Fn(&Seen) -> &Vec<u32>, what: &str| {
+        let mut t: HashMap<u32, (usize, usize)> = HashMap::new();
+        for (h, s) in &seen {
+            for &x in pick(s) {
+                let e = t.entry(x).or_default();
+                e.0 += 1;
+                e.1 += placements.get(h).copied().unwrap_or(0);
+            }
+        }
+        let mut t: Vec<(usize, usize, u32)> = t.into_iter().map(|(x, (m, p))| (m, p, x)).collect();
+        t.sort_unstable_by(|a, b| b.cmp(a));
+        println!("{what}: {} distinct (models, placements)", t.len());
+        for chunk in t.chunks(4).take(20) {
+            let shown: Vec<String> = chunk
+                .iter()
+                .map(|(m, p, x)| format!("{x:08x} {} {m}/{p}", names.show(*x)))
+                .collect();
+            println!("  {}", shown.join("; "));
+        }
+    };
+    tally(&|s| &s.states, "states");
+    tally(&|s| &s.verbs, "verbs");
+
+    // By name word.
+    const CATS: [&str; 40] = [
+        "bld",
+        "house",
+        "shack",
+        "hut",
+        "church",
+        "tower",
+        "sign",
+        "billboard",
+        "fence",
+        "wall",
+        "gate",
+        "tree",
+        "palm",
+        "plant",
+        "bush",
+        "lamp",
+        "pole",
+        "light",
+        "tank",
+        "barrel",
+        "crate",
+        "bridge",
+        "antenna",
+        "rock",
+        "pier",
+        "dock",
+        "tent",
+        "statue",
+        "shop",
+        "station",
+        "gas",
+        "hangar",
+        "bunker",
+        "sandbag",
+        "container",
+        "car",
+        "debris",
+        "ruin",
+        "silo",
+        "radio",
+    ];
+    let mut model_stem: HashMap<u32, &str> = HashMap::new();
+    for r in &rows {
+        model_stem.entry(r.model).or_insert(r.stem.as_str());
+    }
+    let damage_template = |t: u32| comps.get(&t).is_some_and(|c| c.iter().any(|n| keyed(n)));
+    println!(
+        "by name word: placements, models; models with STAM / wrecked state / chunks / loose; placements whose template has a damage component, or own one"
+    );
+    for cat in CATS {
+        let of: Vec<&Row> = rows.iter().filter(|r| r.stem.contains(cat)).collect();
+        let models: HashSet<u32> = of.iter().map(|r| r.model).collect();
+        let count = |f: &dyn Fn(&Seen) -> bool| {
+            models
+                .iter()
+                .filter(|h| seen.get(h).is_some_and(f))
+                .count()
+        };
+        println!(
+            "  {cat}: {} placed, {} models; {} / {} / {} / {}; {} / {}",
+            of.len(),
+            models.len(),
+            count(&|s| !s.states.is_empty()),
+            count(&|s| s.wrecked),
+            count(&|s| s.chunks > 0),
+            count(&|s| s.loose.is_some()),
+            of.iter()
+                .filter(|r| r.template.is_some_and(|(t, _)| damage_template(t)))
+                .count(),
+            of.iter().filter(|r| r.own.iter().any(|n| keyed(n))).count()
+        );
+    }
+
+    // The models the words name, in full.
+    if !words.is_empty() {
+        let mut picked: Vec<(&str, u32)> = model_stem
+            .iter()
+            .filter(|(_, s)| words.iter().any(|w| s.contains(w.as_str())))
+            .map(|(&h, &s)| (s, h))
+            .collect();
+        picked.sort_unstable();
+        println!("{} models match", picked.len());
+        for (stem, h) in picked.into_iter().take(60) {
+            let Some(s) = seen.get(&h) else { continue };
+            let r = rows.iter().find(|r| r.model == h);
+            let template = r.and_then(|r| r.template);
+            let show = |v: &[u32]| {
+                v.iter()
+                    .map(|x| format!("{x:08x} {}", names.show(*x)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!(
+                "  {h:08x} {stem} x{}: wrecked {}, chunks {}, loose {:?}; template {}",
+                placements.get(&h).copied().unwrap_or(0),
+                s.wrecked,
+                s.chunks,
+                s.loose,
+                template.map_or("none".to_owned(), |(t, k)| format!(
+                    "{t:08x} {:?} (by {}) [{}]",
+                    tnames.get(&t).map_or("", String::as_str),
+                    ["parent", "name", "model"][usize::from(k)],
+                    comps.get(&t).map_or(String::new(), |c| c.join(" "))
+                ))
+            );
+            println!("    states: {}", show(&s.states));
+            println!("    verbs: {}", show(&s.verbs));
+        }
+    }
+    Ok(())
 }
