@@ -910,6 +910,8 @@ struct Thread {
     /// Textures tried (sent, or found missing).
     tried: HashSet<u32>,
     told: Told,
+    /// The fullscreen widgets last logged.
+    fullscreen_seen: String,
     /// The reticle's widgets were listed in the log.
     reticle_logged: bool,
     /// The zones the radar's script holds, as last read.
@@ -1007,6 +1009,7 @@ impl Thread {
             fonts,
             tried: HashSet::new(),
             told: Told::default(),
+            fullscreen_seen: String::new(),
             reticle_logged: false,
             zones: Vec::new(),
             roads: Vec::new(),
@@ -1039,6 +1042,32 @@ impl Thread {
         };
         let [w, h] = state.size;
         let items = screen.borrow().draw_list(w, h);
+        // The fullscreen widgets drawn (a fanfare and its fade), where in
+        // the order and how opaque, when that changes.
+        let fullscreen: Vec<String> = {
+            let s = screen.borrow();
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| {
+                    let id = widget_of(item);
+                    let w = s.widgets().find(|(wid, _)| *wid == id)?.1;
+                    w.fullscreen.then(|| {
+                        format!(
+                            "{id} {:?} at {i}/{} alpha {:.0}",
+                            w.kind,
+                            items.len(),
+                            w.colour[3]
+                        )
+                    })
+                })
+                .collect()
+        };
+        let fullscreen = fullscreen.join(", ");
+        if fullscreen != self.fullscreen_seen {
+            log.push(format!("fullscreen widgets: [{fullscreen}]"));
+            self.fullscreen_seen = fullscreen;
+        }
         log.extend(screen.borrow_mut().take_log());
         log.extend(self.mission.take_log());
         // The scripts' own commands (sounds, camera) are not the HUD's.
