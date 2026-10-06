@@ -873,45 +873,50 @@ fn pda_probe(lua: &Lua) -> String {
                 end
             end
         end
-        -- The PDA widget object: the one whose CustomData has bHaveFlash
-        -- (Open's checks live there), found from the globals.
-        local seen, found = {}, nil
+        -- The PDA widget objects: those whose CustomData has bHaveFlash
+        -- (Open's checks live there), found from the globals; each one's
+        -- values, and its Open/Close print when called.
+        local seen, found = {}, {}
         local function find(t, depth)
-            if found or depth > 5 or seen[t] then return end
+            if depth > 6 or seen[t] then return end
             seen[t] = true
             local cd = rawget(t, "CustomData")
             if type(cd) == "table" and rawget(cd, "bHaveFlash") ~= nil then
-                found = t
-                return
+                found[#found + 1] = t
             end
             for _, v in pairs(t) do
                 if type(v) == "table" then find(v, depth + 1) end
             end
         end
         find(_G, 0)
-        if found then
+        out[#out + 1] = #found .. " PDA widgets"
+        for i, w in ipairs(found) do
             local d = {}
-            for k, v in pairs(found.CustomData) do
+            for k, v in pairs(w.CustomData) do
                 local ty = type(v)
                 if ty == "boolean" or ty == "number" then
-                    d[#d + 1] = "CustomData." .. tostring(k) .. "=" .. tostring(v)
+                    d[#d + 1] = tostring(k) .. "=" .. tostring(v)
                 end
             end
-            for _, x in ipairs(d) do out[#out + 1] = x end
-            if not rawget(found, "__m2_wrapped") then
-                rawset(found, "__m2_wrapped", true)
+            table.sort(d)
+            local bd = rawget(w, "BasicData")
+            if type(bd) == "table" then
+                d[#d + 1] = "enabled=" .. tostring(bd.bEnabled) .. " owner=" .. tostring(bd.uOwnerGuid)
+            end
+            out[#out + 1] = "[" .. i .. " " .. tostring(w) .. ": " .. table.concat(d, " ") .. "]"
+            if not rawget(w, "__m2_wrapped") then
+                rawset(w, "__m2_wrapped", true)
+                local tag = tostring(w)
                 for _, name in ipairs({"Open", "Close"}) do
-                    local f = found[name]
+                    local f = w[name]
                     if type(f) == "function" then
-                        found[name] = function(self, ...)
-                            print("PDA " .. name .. " called")
+                        w[name] = function(self, ...)
+                            print("PDA " .. name .. " called on " .. tag)
                             return f(self, ...)
                         end
                     end
                 end
             end
-        else
-            out[#out + 1] = "no PDA widget found"
         end
         local st = rawget(_G, "MrxState")
         if type(st) == "table" and type(st.IsLocked) == "function" then
@@ -927,7 +932,6 @@ fn pda_probe(lua: &Lua) -> String {
                 end
             end
         end
-        table.sort(out)
         return table.concat(out, " ")
     "#;
     lua.load(PROBE)
