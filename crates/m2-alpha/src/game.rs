@@ -1033,7 +1033,7 @@ fn take_up(
         if let Some((w, n)) = p.what.gives {
             combat.take_ammo(w, n);
         }
-        combat.take_supplies(p.what.grenades, p.what.health);
+        combat.take_supplies(p.what.launcher, p.what.grenades, p.what.health);
         eprintln!(
             "pickup: she takes {:#x} at {:.1}{}",
             p.what.template,

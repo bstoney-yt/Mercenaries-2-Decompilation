@@ -107,6 +107,10 @@ pub const MUZZLE: u32 = 0xb148_6ef3;
 /// an `Explosion (Grenade)`). A clip takes this long to load, seconds
 /// (invented), and a round that never lands bursts this far out, metres.
 pub const LAUNCHER_CLIP: u32 = 6;
+/// Rounds the grenade launcher keeps beyond its clip: its reserve is
+/// "very limited" (the wiki), and taken up it comes with 3 clips, the
+/// footage's "6 2", which a heavy ammunition pickup tops up to.
+pub const LAUNCHER_SPARE: u32 = 2 * LAUNCHER_CLIP;
 const LOB_GAP: f32 = 60.0 / 75.0;
 const LOB_SPEED: f32 = 20.0;
 const LAUNCHER_RELOAD: f32 = 2.5;
@@ -983,15 +987,20 @@ impl Combat {
     /// to what the HUD counts.
     pub fn take_ammo(&mut self, weapon: Weapon, rounds: u32) {
         match (weapon, &mut self.launcher_rounds) {
-            (Weapon::GrenadeLauncher, Some(r)) => r.stored += rounds,
+            (Weapon::GrenadeLauncher, Some(r)) => {
+                r.stored = (r.stored + rounds).min(LAUNCHER_SPARE)
+            }
             (Weapon::GrenadeLauncher, None) => {}
             _ => self.picked.add(weapon, rounds),
         }
     }
 
-    /// Grenades and health from a pickup: as many grenades as she has
-    /// room for, health up to full.
-    pub fn take_supplies(&mut self, grenades: u32, health: f32) {
+    /// Launcher rounds, grenades and health from a pickup: as many as she
+    /// has room for, health up to full.
+    pub fn take_supplies(&mut self, launcher: u32, grenades: u32, health: f32) {
+        if launcher > 0 {
+            self.take_ammo(Weapon::GrenadeLauncher, launcher);
+        }
         self.grenades = (self.grenades + grenades).min(MAX_GRENADES);
         self.hp = (self.hp + health).min(100.0);
     }
@@ -1004,7 +1013,12 @@ impl Combat {
             Some((w, n)) => n > 0 && self.second == Some(w),
             None => false,
         };
+        let launcher = what.launcher > 0
+            && self
+                .launcher_rounds
+                .is_some_and(|r| r.stored < LAUNCHER_SPARE);
         rounds
+            || launcher
             || (what.grenades > 0 && self.grenades < MAX_GRENADES)
             || (what.health > 0.0 && self.hp < 100.0)
     }
@@ -2887,7 +2901,18 @@ mod tests {
             .count();
         assert_eq!(lobs, 18);
         assert!(!combat.second_loaded());
-        // More rounds go with it; the RPG taken back leaves it, with them.
+        // More rounds go with it, two clips beyond the one at most (a
+        // rocket pickup's 20 clips); the RPG taken back leaves it, with
+        // them.
+        let rockets = crate::flights::Leaves {
+            launcher: 120,
+            ..crate::flights::Leaves::default()
+        };
+        assert!(combat.can_use(&rockets));
+        combat.take_supplies(rockets.launcher, 0, 0.0);
+        assert_eq!(combat.launcher_rounds.map(Rounds::total), Some(12));
+        assert!(!combat.can_use(&rockets));
+        combat.launcher_rounds = Some(Rounds::default());
         combat.take_ammo(Weapon::GrenadeLauncher, 6);
         assert!(combat.second_loaded());
         assert_eq!(

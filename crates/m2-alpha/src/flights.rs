@@ -118,7 +118,10 @@ pub struct Leaves {
     /// The rounds it gives, and for which of her weapons (those of a
     /// weapon she doesn't carry give her nothing).
     pub gives: Option<(Weapon, u32)>,
-    /// Grenades it gives (`Grenade Projectile`), and health.
+    /// Grenade launcher rounds an ammunition pickup gives besides (`Ammo
+    /// Pickup (Rocket)`'s `Grenade Launcher Projectile` record), grenades
+    /// (`Grenade Projectile`), and health.
+    pub launcher: u32,
     pub grenades: u32,
     pub health: f32,
 }
