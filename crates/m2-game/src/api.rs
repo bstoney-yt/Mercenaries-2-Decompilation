@@ -195,6 +195,13 @@ pub enum Command {
         at: Option<u32>,
         cue: String,
     },
+    /// Fade every sound but the interface's to `level` over `seconds`
+    /// (`Sound.FadeCategoryDown`/`Up` on `non_ui`: the world ducks under a
+    /// radio conversation).
+    FadeWorldSound {
+        level: f32,
+        seconds: f32,
+    },
     /// The player can't be killed while on (`Player.SetHealthClamp`): her
     /// health stops short of nothing, for the survival system to step in.
     HealthClamp(bool),
@@ -491,6 +498,12 @@ pub fn goal_finished(world: &Shared, guid: u32) -> Vec<mlua::Error> {
 
 fn id(v: Option<&Value>) -> Option<u32> {
     crate::events::as_guid(v?)
+}
+
+/// Whether a sound category argument names `non_ui`, everything but the
+/// interface.
+fn is_non_ui(v: Option<&Value>) -> bool {
+    matches!(v, Some(Value::String(s)) if s.to_string_lossy().eq_ignore_ascii_case("non_ui"))
 }
 
 fn num(v: Option<&Value>) -> Option<f32> {
@@ -1177,6 +1190,27 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.commands.push(Command::StopSound {
                 at: id(a.first()).filter(|&g| g != 0),
                 cue: cue.to_string_lossy(),
+            });
+        }
+        values([])
+    })?;
+
+    // The scripts duck the world's sounds under conversations: Down takes
+    // (category, level, seconds), Up (category, seconds) and brings it back.
+    add(&sound, "FadeCategoryDown", |w, _, a| {
+        if is_non_ui(a.first()) {
+            w.commands.push(Command::FadeWorldSound {
+                level: num(a.get(1)).unwrap_or(0.3),
+                seconds: num(a.get(2)).unwrap_or(0.5),
+            });
+        }
+        values([])
+    })?;
+    add(&sound, "FadeCategoryUp", |w, _, a| {
+        if is_non_ui(a.first()) {
+            w.commands.push(Command::FadeWorldSound {
+                level: 1.0,
+                seconds: num(a.get(1)).unwrap_or(0.5),
             });
         }
         values([])

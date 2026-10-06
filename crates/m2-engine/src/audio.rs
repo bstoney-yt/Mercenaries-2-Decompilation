@@ -225,6 +225,8 @@ pub struct Play {
     /// Where it is in the world; `None` plays it flat.
     pub position: Option<Vec3>,
     pub falloff: Falloff,
+    /// An interface sound: the world fade ([`Mixer::fade_world`]) leaves it.
+    pub ui: bool,
 }
 
 impl Play {
@@ -236,6 +238,7 @@ impl Play {
             looping: false,
             position: None,
             falloff: Falloff::default(),
+            ui: false,
         }
     }
 
@@ -255,6 +258,11 @@ impl Play {
 
     pub fn gain(self, gain: f32) -> Self {
         Self { gain, ..self }
+    }
+
+    /// Marks it an interface sound, which the world fade doesn't touch.
+    pub fn ui(self) -> Self {
+        Self { ui: true, ..self }
     }
 }
 
@@ -285,6 +293,12 @@ pub struct Mixer {
     /// The listener's right, horizontal.
     right: Vec3,
     pub master: f32,
+    /// Level every non-interface sound plays at, glided by `fade_world`
+    /// (the scripts duck the world under a radio conversation).
+    world: f32,
+    world_goal: f32,
+    /// Level change per second towards the goal.
+    world_rate: f32,
     /// Most voices played at once; the quietest are dropped past it.
     pub max_voices: usize,
 }
@@ -299,12 +313,31 @@ impl Mixer {
             listener: Vec3::ZERO,
             right: Vec3::X,
             master: 0.8,
+            world: 1.0,
+            world_goal: 1.0,
+            world_rate: f32::MAX,
             max_voices: 64,
         }
     }
 
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// Glides every sound that isn't an interface one to `level` over
+    /// `seconds` (`Sound.FadeCategoryDown`/`Up`, category `non_ui`).
+    pub fn fade_world(&mut self, level: f32, seconds: f32) {
+        self.world_goal = level.clamp(0.0, 1.0);
+        self.world_rate = if seconds > 1e-3 {
+            (self.world_goal - self.world).abs() / seconds
+        } else {
+            f32::MAX
+        };
+    }
+
+    /// The level the world's sounds play at now.
+    pub fn world_level(&self) -> f32 {
+        self.world
     }
 
     pub fn play(&mut self, play: Play) -> VoiceId {
@@ -374,7 +407,7 @@ impl Mixer {
 
     /// Left and right gain for `play` from the listener.
     fn gains(&self, play: &Play) -> (f32, f32) {
-        let g = play.gain * self.master;
+        let g = play.gain * self.master * if play.ui { 1.0 } else { self.world };
         let Some(at) = play.position else {
             return (g, g);
         };
@@ -408,6 +441,8 @@ impl Mixer {
         if frames == 0 {
             return;
         }
+        let step = self.world_rate * frames as f32 / self.rate as f32;
+        self.world += (self.world_goal - self.world).clamp(-step, step);
         let gains: Vec<(f32, f32)> = self.voices.iter().map(|v| self.gains(&v.play)).collect();
         for (v, target) in self.voices.iter_mut().zip(gains) {
             let len = v.play.buffer.frames();
@@ -1033,6 +1068,26 @@ mod tests {
         assert_eq!(out[2 * 80], out[2 * 80 + 1]);
         assert_eq!(out[2 * 150], 0.0, "finished");
         assert!(!m.is_playing(id));
+    }
+
+    #[test]
+    fn the_world_fade_ducks_everything_but_the_interface() {
+        let mut m = Mixer::new(100);
+        m.master = 1.0;
+        m.fade_world(0.25, 1.0);
+        m.play(Play::flat(tone(100, 1000)).looped());
+        let mut out = vec![0.0; 2 * 50];
+        // Half a second in the world is at 0.625; a second in, at 0.25.
+        m.mix(&mut out);
+        m.mix(&mut out);
+        assert!((out[2 * 49] - 0.5 * 0.25).abs() < 1e-3, "{}", out[98]);
+        let mut m = Mixer::new(100);
+        m.master = 1.0;
+        m.fade_world(0.25, 0.0);
+        m.play(Play::flat(tone(100, 1000)).looped().ui());
+        m.mix(&mut out);
+        m.mix(&mut out);
+        assert!((out[2 * 49] - 0.5).abs() < 1e-3, "{}", out[98]);
     }
 
     #[test]

@@ -3334,6 +3334,9 @@ impl Running {
             for id in hushed {
                 self.audio.hush(id);
             }
+            for (level, seconds) in m.take_fades() {
+                self.audio.fade_world(level, seconds);
+            }
             for (cue, stop) in m.take_sounds() {
                 if stop {
                     self.audio.stop_ui_sound(&cue);

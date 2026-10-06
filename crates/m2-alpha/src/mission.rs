@@ -162,6 +162,8 @@ pub struct MissionLink {
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
     /// whether each is to stop instead.
     sounds: Vec<(String, bool)>,
+    /// World sound fades the scripts asked for: level, seconds.
+    fades: Vec<(f32, f32)>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
     music: Option<Option<String>>,
 }
@@ -249,6 +251,7 @@ impl MissionLink {
             lines: Vec::new(),
             hushed: Vec::new(),
             sounds: Vec::new(),
+            fades: Vec::new(),
             music: None,
         }
     }
@@ -496,6 +499,9 @@ impl MissionLink {
                     Command::Hush(id) => self.hushed.push(*id),
                     Command::CueSound { at: None, cue } => self.sounds.push((cue.clone(), false)),
                     Command::StopSound { at: None, cue } => self.sounds.push((cue.clone(), true)),
+                    Command::FadeWorldSound { level, seconds } => {
+                        self.fades.push((*level, *seconds))
+                    }
                     Command::HealthClamp(on) => {
                         eprintln!("mission: health clamp {on}");
                         game.combat.health_clamp = *on;
@@ -581,6 +587,12 @@ impl MissionLink {
             std::mem::take(&mut self.lines),
             std::mem::take(&mut self.hushed),
         )
+    }
+
+    /// World sound fades (level, seconds) the scripts asked for since the
+    /// last call.
+    pub fn take_fades(&mut self) -> Vec<(f32, f32)> {
+        std::mem::take(&mut self.fades)
     }
 
     /// Interface sounds the scripts cued since the last call.
