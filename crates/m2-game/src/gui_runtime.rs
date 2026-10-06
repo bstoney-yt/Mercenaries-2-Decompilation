@@ -154,6 +154,8 @@ pub struct Widget {
     /// for the movie from its start.
     pub flash_restarts: u32,
     pub movie: Option<String>,
+    /// `SetWidgetFullscreen`: drawn over the whole screen, whatever its box.
+    pub fullscreen: bool,
     /// `MinimapCreate` arguments as text.
     pub minimap: Option<Vec<String>>,
     /// The latest arguments of each other `Minimap*` native (range,
@@ -197,6 +199,7 @@ impl Widget {
             flash_paused: false,
             flash_restarts: 0,
             movie: None,
+            fullscreen: false,
             minimap: None,
             minimap_calls: BTreeMap::new(),
             update: None,
@@ -262,11 +265,13 @@ pub enum DrawItem {
         colour: [f32; 4],
         justification: Anchor,
     },
-    /// A Flash movie's place (`swf` once set).
+    /// A Flash movie's place (`swf` once set). A `fullscreen` movie's
+    /// rect is the whole screen.
     Flash {
         widget: u32,
         swf: Option<String>,
         rect: [f32; 4],
+        fullscreen: bool,
     },
     /// The minimap: its circle's box, and what the scripts last told it
     /// (`MinimapUpdate`, `MinimapSetRange`). The map itself is the
@@ -717,7 +722,11 @@ impl Screen {
                 continue;
             }
             let c = self.correction(id, width, height);
-            let rect = c.apply(self.rect(id));
+            let rect = if w.fullscreen {
+                [0.0, 0.0, width, height]
+            } else {
+                c.apply(self.rect(id))
+            };
             let colour = w.colour.map(|v| (v / 255.0).clamp(0.0, 1.0));
             match w.kind {
                 Kind::Widget => {}
@@ -777,6 +786,7 @@ impl Screen {
                     widget: id,
                     swf: w.swf.clone(),
                     rect,
+                    fullscreen: w.fullscreen,
                 }),
                 Kind::Minimap => {
                     let call = |name: &str| {
@@ -1769,7 +1779,12 @@ natives! {
     // Settings with nothing to draw differently here.
     "SetWidgetViewport" => |_, _, _| Ok(MultiValue::new()),
     "SetWidgetIgnoresPause" => |_, _, _| Ok(MultiValue::new()),
-    "SetWidgetFullscreen" => |_, _, _| Ok(MultiValue::new()),
+    "SetWidgetFullscreen" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.fullscreen = a.truthy(1);
+        }
+        Ok(MultiValue::new())
+    },
     "SetWidgetHighlightable" => |_, _, _| Ok(MultiValue::new()),
     "SetWidgetUseNewRescale" => |_, _, _| Ok(MultiValue::new()),
     // (widget, command, function, data): `fscommand(command, arg)` from
@@ -2101,6 +2116,28 @@ mod tests {
         assert!(spans[0].colour.is_some_and(|c| c[1] > c[0]));
         assert_eq!(spans[1].colour, Some([1.0; 3]));
         assert_eq!(fill("%d%%-%s", &["5".to_owned()]), "5%-");
+    }
+
+    #[test]
+    fn fullscreen_widgets_cover_the_screen() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            f = G.CreateFlashWidget()
+            G.SetWidgetFullscreen(f, true)
+            "#,
+        );
+        let items = screen.borrow().draw_list(1280.0, 720.0);
+        let Some(DrawItem::Flash {
+            rect, fullscreen, ..
+        }) = items.first()
+        else {
+            panic!("{items:?}");
+        };
+        assert!(*fullscreen);
+        assert_eq!(*rect, [0.0, 0.0, 1280.0, 720.0]);
     }
 
     #[test]
