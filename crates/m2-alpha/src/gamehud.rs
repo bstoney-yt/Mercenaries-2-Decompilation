@@ -1605,6 +1605,14 @@ impl Thread {
             // `M2_AVM1_TRACE=topbar` logs what the movies named so run.
             rt.avm.trace = std::env::var("M2_AVM1_TRACE")
                 .is_ok_and(|t| !t.is_empty() && swf.contains(t.as_str()));
+            // Text ids the movies set themselves (`[0x129ee2f1]`) show
+            // their text, as the engine's translator has them.
+            let strings = Rc::clone(&screen);
+            rt.player.translate = Some(flash::Translator(Rc::new(move |t: &str| {
+                strings
+                    .try_borrow()
+                    .map_or_else(|_| t.to_owned(), |s| s.display_text(t))
+            })));
             let movies = Rc::clone(&self.movies);
             rt.set_loader(Box::new(move |name: &str| {
                 movies.borrow_mut().library(&movie_name(name))
