@@ -119,7 +119,7 @@ impl<'a> Table<'a> {
         Self::of(c)
     }
 
-    fn of(c: &Component<'a>) -> Self {
+    pub(crate) fn of(c: &Component<'a>) -> Self {
         let mut records: HashMap<u32, Vec<&'a [u8]>> = HashMap::new();
         for (id, r) in c.records().unwrap_or_default() {
             records.entry(id).or_default().push(r);
