@@ -299,6 +299,12 @@ pub struct ScriptWorld {
     pub asset_request_max: u32,
     /// The game state (`Sys.RequestGameState`), `"Game"` while playing.
     pub game_state: String,
+    /// The player's cash (`Player.GetCash`, `Player.SetCash`); the
+    /// scripts' `MrxPmc.AddCashQty` reads it, adds and clamps.
+    pub cash: f64,
+    /// What the scripts set her fuel tanks to hold
+    /// (`Player.SetFuelCapacity`), if they have.
+    pub fuel_capacity: Option<f32>,
     /// Layers the archives hold and which are loaded.
     pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
@@ -1195,8 +1201,25 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::String(lua.create_string("PlayerLocation_Start")?)])
     })?;
     // The PMC's fuel tank: invented, the game's figure is not decoded.
-    add(&player, "GetFuelCapacity", |_, _, _| {
-        values([Value::Number(100.0)])
+    add(&player, "GetCash", |w, _, _| {
+        values([Value::Number(w.cash)])
+    })?;
+    add(&player, "SetCash", |w, _, a| {
+        if let Some(c) = num(a.first()) {
+            w.cash = f64::from(c);
+        }
+        values([])
+    })?;
+    // 100 until the scripts set it: invented, the game's figure is not
+    // decoded.
+    add(&player, "GetFuelCapacity", |w, _, _| {
+        values([Value::Number(f64::from(w.fuel_capacity.unwrap_or(100.0)))])
+    })?;
+    add(&player, "SetFuelCapacity", |w, _, a| {
+        if let Some(c) = num(a.first()) {
+            w.fuel_capacity = Some(c);
+        }
+        values([])
     })?;
     add(&player, "GetFuel", |w, _, _| {
         let fuel = w
