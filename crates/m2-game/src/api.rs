@@ -41,6 +41,8 @@ pub struct Object {
     pub max_health: f32,
     pub alive: bool,
     pub labels: Vec<String>,
+    /// Labels from the data (its template's and its own), as name hashes.
+    pub label_hashes: Vec<u32>,
     /// The vehicle it rides in.
     pub vehicle: Option<u32>,
     pub player_controlled: bool,
@@ -221,6 +223,8 @@ pub struct ScriptWorld {
     pub boundaries: Vec<u32>,
     pub boundary_callback: Option<Function>,
     pub outside: bool,
+    /// Templates' labels (name hashes) by name in lower case, for spawns.
+    pub template_labels: HashMap<String, Vec<u32>>,
     /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
     pub health_clamp: bool,
     pub survival_mode: bool,
@@ -270,6 +274,9 @@ impl ScriptWorld {
         let guid = self.spawn_guid();
         let mut object = Object::new(&what, position);
         object.yaw = yaw;
+        if let Some(l) = self.template_labels.get(&what.to_ascii_lowercase()) {
+            object.label_hashes.clone_from(l);
+        }
         self.insert(guid, object);
         self.commands.push(Command::Spawn {
             guid,
@@ -332,11 +339,14 @@ impl World for ScriptWorld {
     fn is_awake(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.awake)
     }
-    fn labels(&self, guid: u32) -> Vec<String> {
-        self.objects
-            .get(&guid)
-            .map(|o| o.labels.clone())
-            .unwrap_or_default()
+    fn labels(&self, guid: u32) -> Vec<u32> {
+        self.objects.get(&guid).map_or_else(Vec::new, |o| {
+            o.labels
+                .iter()
+                .map(|l| m2_assets::name_hash(l))
+                .chain(o.label_hashes.iter().copied())
+                .collect()
+        })
     }
     fn health(&self, guid: u32) -> Option<f32> {
         self.objects.get(&guid).map(|o| o.health)
