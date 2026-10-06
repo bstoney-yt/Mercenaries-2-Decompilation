@@ -1716,8 +1716,19 @@ fn ground_material(
     detail_map: Option<u32>,
     layers: &[(u32, [[f32; 4]; 2])],
 ) -> MaterialDesc {
+    // `M2_GROUND=map` draws the colour map alone, `=nodetail` leaves the
+    // detail grain out, `=nolayers` leaves the tiled layers out (to see
+    // which of them speckles the ground).
+    let mode = std::env::var("M2_GROUND").unwrap_or_default();
     let texture = colour_map.and_then(|t| materials.texture(t));
-    let detail = detail_map.and_then(|t| materials.texture(t));
+    let detail = detail_map
+        .filter(|_| mode != "map" && mode != "nodetail")
+        .and_then(|t| materials.texture(t));
+    let layers = if mode == "map" || mode == "nolayers" {
+        &layers[..0]
+    } else {
+        layers
+    };
     let mut out = [None; 4];
     // A layer that failed to load would shift the weights onto the wrong
     // textures, so the layers stop at the first missing one.
