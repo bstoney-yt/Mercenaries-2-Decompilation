@@ -432,6 +432,8 @@ pub struct Scene {
     pub props: Props,
     /// The mission scripts' deliveries by helicopter.
     pub flights: Flights,
+    /// Air strikes' aircraft and ordnance in flight.
+    pub strikes: crate::strikes::Strikes,
     /// Mesh and materials for shots, flashes, fire and smoke.
     effects: Effects,
     vehicle_loads: Option<Receiver<Loaded>>,
@@ -691,6 +693,7 @@ impl Scene {
             explosives: Vec::new(),
             props: Props::default(),
             flights: Flights::default(),
+            strikes: crate::strikes::Strikes::default(),
             effects,
             vehicle_loads: None,
             catalogue: None,
@@ -1017,6 +1020,7 @@ impl Scene {
         for (model, template) in std::mem::take(&mut self.people.wanted) {
             self.load_character(model, template);
         }
+        self.strikes.want_models(&mut self.flights);
         for hash in self.flights.take_wanted() {
             self.load_flight_model(hash);
         }
@@ -1265,6 +1269,7 @@ impl Scene {
             }
         }
         let hanging = self.flights.draw(queue, &self.vehicles);
+        self.strikes.draw(queue, &self.flights);
         for (hook, load) in hanging.cables {
             self.effects.cable(queue, hook, load);
         }
