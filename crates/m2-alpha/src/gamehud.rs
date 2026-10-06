@@ -1023,9 +1023,17 @@ impl Thread {
         }
         // As the player-character module does; her guid is userdata, or
         // the scripts never own the widgets and no event reaches them.
+        // The HUD's own scripts look her up as the local player too
+        // (`CommenceFanfare` hides the HUD through `GetHudState` and
+        // `ToggleHud` of `Player.GetLocalPlayer()`), so here that answers
+        // the same userdata, not m2's number.
         mission
             .run(
-                "MrxGuiManager.CreateGui(Sys.StringToGuid(\"0x1\"))",
+                "local me = Sys.StringToGuid(\"0x1\")
+                 for _, f in ipairs({\"GetLocalPlayer\", \"GetPrimaryPlayer\"}) do
+                     rawset(Player, f, function() return me end)
+                 end
+                 MrxGuiManager.CreateGui(me)",
                 "create gui",
             )
             .map_err(|e| e.to_string())?;
