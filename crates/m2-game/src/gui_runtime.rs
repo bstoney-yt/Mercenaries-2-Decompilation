@@ -1878,6 +1878,28 @@ natives! {
         }
         Ok(MultiValue::new())
     },
+    // (widget, entry): one blip moved or changed, its entry as in
+    // `AddPdaMapBlips`; the movie's `UpdateBlip` takes the same arguments.
+    "UpdatePdaBlip" => |s, _, a| {
+        if let (Some(Value::Table(entry)), Some(w)) = (a.get(1), s.widgets.get_mut(&a.id(0))) {
+            let args = entry
+                .clone()
+                .sequence_values::<Value>()
+                .flatten()
+                .map(|v| FlashArg::of(&v))
+                .collect();
+            w.flash_calls.push(("UpdateBlip".to_owned(), args));
+        }
+        Ok(MultiValue::new())
+    },
+    // (widget, name).
+    "RemovePdaBlip" => |s, _, a| {
+        if let (Some(v), Some(w)) = (a.get(1), s.widgets.get_mut(&a.id(0))) {
+            w.flash_calls
+                .push(("RemoveBlip".to_owned(), vec![FlashArg::of(v)]));
+        }
+        Ok(MultiValue::new())
+    },
     // (widget, function, data).
     "SetMovieEndCallback" => |s, l, a| {
         let cb = keep_callback(s, l, a.get(1), a.get(2))?;
@@ -2291,6 +2313,43 @@ mod tests {
         tick(host.lua(), 0.1);
         tick(host.lua(), 0.1);
         assert_eq!(host.lua().globals().get::<i64>("ended").unwrap(), 2);
+    }
+
+    #[test]
+    fn pda_blip_updates_reach_the_map_movie() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            pda = G.CreateFlashWidget()
+            G.SetFlashSwfFile(pda, "topbar")
+            G.UpdatePdaBlip(pda, { "player1_mc", "player1_mc", 35, 40 })
+            G.RemovePdaBlip(pda, "target1_mc")
+            "#,
+        );
+        let pda = host.lua().globals().get::<u32>("pda").unwrap();
+        let calls = screen.borrow_mut().take_flash_calls();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    pda,
+                    "UpdateBlip".to_owned(),
+                    vec![
+                        FlashArg::Text("player1_mc".into()),
+                        FlashArg::Text("player1_mc".into()),
+                        FlashArg::Number(35.0),
+                        FlashArg::Number(40.0),
+                    ]
+                ),
+                (
+                    pda,
+                    "RemoveBlip".to_owned(),
+                    vec![FlashArg::Text("target1_mc".into())]
+                ),
+            ]
+        );
     }
 
     #[test]
