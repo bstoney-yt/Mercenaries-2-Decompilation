@@ -1738,7 +1738,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     // The engine's additions to the math library: random integers in
-    // [a, b] (or [1, a]) and random reals in [a, b].
+    // [a, b] (or [1, a]), random reals in [a, b] and normalising.
     lua.load(
         r#"
         local function randi(a, b)
@@ -1756,6 +1756,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             rawset(_G, "Math", M)
         end
         M.randi, M.randf = randi, randf
+        -- A vector scaled to length 1 (the strikes aim their bombs so);
+        -- the zero vector stays as it is.
+        function M.Normalize(x, y, z)
+            local l = math.sqrt(x * x + y * y + z * z)
+            if l == 0 then return x, y, z end
+            return x / l, y / l, z / l
+        end
         -- Math is the math library with the additions.
         for k, v in pairs(math) do
             if rawget(M, k) == nil then M[k] = v end
