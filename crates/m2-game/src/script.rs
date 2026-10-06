@@ -270,15 +270,22 @@ impl ScriptHost {
                         return Ok(MultiValue::new());
                     };
                     let name = format!("{library}.{}", k.to_string_lossy());
+                    // `Player.GetAllTargetMarkerPos()`: a list, which
+                    // scripts walk with `ipairs` straight away; empty.
+                    let list = k.to_string_lossy().starts_with("GetAll");
                     let log = Rc::clone(&log);
-                    let f = safe_function(lua, move |_, args| {
+                    let f = safe_function(lua, move |lua, args| {
                         let mut shown = name.clone();
                         if STUB_ARGS.with(|on| *on) {
                             let args: Vec<String> = args.iter().map(show_arg).collect();
                             shown = format!("{shown}({})", args.join(", "));
                         }
                         log.borrow_mut().push(shown);
-                        Ok(MultiValue::new())
+                        Ok(if list {
+                            MultiValue::from_vec(vec![Value::Table(lua.create_table()?)])
+                        } else {
+                            MultiValue::new()
+                        })
                     })?;
                     t.raw_set(k.clone(), &f)?;
                     Ok(MultiValue::from_vec(vec![Value::Function(f)]))
@@ -879,6 +886,12 @@ mod tests {
             .unwrap();
         assert_eq!((known, missing), (1, None));
         assert_eq!(host.take_calls(), ["Pg.LoadSomething"]);
+        let empty: bool = host
+            .lua()
+            .load("return #Pg.GetAllMarkers() == 0")
+            .eval()
+            .unwrap();
+        assert!(empty);
     }
 
     #[test]
