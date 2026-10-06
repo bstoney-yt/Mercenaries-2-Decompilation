@@ -726,13 +726,22 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             }
             None => no,
         },
-        // { name, ... }: when something posts that name; passes the
-        // posted data.
+        // { name, filter }: when something posts that name, and the
+        // filter, if any, says yes to the posted data (the faction
+        // manager's attitude watches compare it with what they want);
+        // passes the posted data.
         "ScriptEvent" => {
             let Ok(name) = p.params.raw_get::<String>(1) else {
                 return no;
             };
-            match posted.iter().find(|(n, _)| *n == name) {
+            let filter = p.params.raw_get::<Option<Function>>(2).ok().flatten();
+            let wanted = |data: &Value| {
+                filter.as_ref().is_none_or(|f| {
+                    f.call::<Value>(data.clone())
+                        .is_ok_and(|v| !matches!(v, Value::Nil | Value::Boolean(false)))
+                })
+            };
+            match posted.iter().find(|(n, data)| *n == name && wanted(data)) {
                 Some((_, data)) => Check::Fire(vec![data.clone()]),
                 None => no,
             }
@@ -899,6 +908,31 @@ mod tests {
             ["awake 3", "dead 7,7", "near 1,2", "posted x,y", "seat 1,99"]
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_filter_picks_which_posts_fire() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"
+                local function hostile(d) return d[2] == "Pmc" and d[4] == "Hostile" end
+                Event.CreatePersistent(Event.ScriptEvent, { "Attitude", hostile },
+                    function(d) table.insert(log, "angry " .. d[1]) end)
+                Event.Post("Attitude", { "Gur", "Pmc", "Neutral", "Friendly" })
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let world = TestWorld::default();
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty());
+        host.lua()
+            .load(r#"Event.Post("Attitude", { "Gur", "Pmc", "Neutral", "Hostile" })"#)
+            .exec()
+            .unwrap();
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["angry Gur"]);
     }
 
     #[test]

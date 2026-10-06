@@ -298,6 +298,9 @@ pub struct ScriptWorld {
     pub survival_mode: bool,
     /// The weapons people carry.
     pub inventory: crate::inventory::Inventory,
+    /// Faction relations (`Ai.SetRelation`), -100 to 100, by (faction,
+    /// faction) in lower case.
+    pub relations: HashMap<(String, String), f32>,
 }
 
 impl ScriptWorld {
@@ -604,6 +607,15 @@ pub fn goal_finished(world: &Shared, guid: u32) -> Vec<mlua::Error> {
 
 fn id(v: Option<&Value>) -> Option<u32> {
     crate::events::as_guid(v?)
+}
+
+/// A faction argument (`"Pmc"`), in lower case.
+fn faction(v: Option<&Value>) -> Option<String> {
+    match v? {
+        Value::String(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
+        Value::Integer(i) => Some(i.to_string()),
+        _ => None,
+    }
 }
 
 /// A sound category argument (`non_ui`), as named.
@@ -1274,9 +1286,31 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let ai = lib("Ai")?;
-    // Faction relations are not modelled yet: everyone is neutral (0 on
-    // the scale the faction manager converts to attitude levels).
-    add(&ai, "GetRelation", |_, _, _| values([Value::Number(0.0)]))?;
+    // How one faction's AI regards another, -100 (hostile) to 100
+    // (friendly), as the faction manager sets it (`Ai.SetRelation(a, b,
+    // value)`); the faction manager reads attitudes back from it. Pairs
+    // never set are neutral, 0; one set only the other way round answers
+    // for both (inferred).
+    add(&ai, "SetRelation", |w, _, a| {
+        if let (Some(from), Some(to), Some(value)) =
+            (faction(a.first()), faction(a.get(1)), num(a.get(2)))
+        {
+            w.relations.insert((from, to), value);
+        }
+        values([])
+    })?;
+    add(&ai, "GetRelation", |w, _, a| {
+        let value = match (faction(a.first()), faction(a.get(1))) {
+            (Some(from), Some(to)) => w
+                .relations
+                .get(&(from.clone(), to.clone()))
+                .or_else(|| w.relations.get(&(to, from)))
+                .copied()
+                .unwrap_or(0.0),
+            _ => 0.0,
+        };
+        values([Value::Number(f64::from(value))])
+    })?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
