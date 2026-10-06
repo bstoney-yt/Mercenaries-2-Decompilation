@@ -16,7 +16,8 @@
 //!
 //! Right now this opens a window on the island, streamed from the install
 //! around the player: Jennifer on foot with a third-person camera
-//! (`--spawn` picks where to start; the default is the first town). WASD
+//! (`--spawn` picks where to start; the default is the PMC's headquarters,
+//! where free roam begins after the first contract). WASD
 //! runs, Shift sprints, Q held walks, Space jumps. E gets in and out of
 //! the vehicles parked ahead of the spawn (WASD drive, Space brakes, R
 //! rights an overturned one). V switches to a
@@ -435,7 +436,13 @@ fn main() -> anyhow::Result<()> {
             turn: options.turn,
         })
     } else if install.is_some() {
-        Mode::Island(options.spawn.unwrap_or(scene::DEFAULT_SPAWN))
+        // Free roam starts at the PMC's headquarters (found in the layers);
+        // a mission's scripts move her from the first town.
+        Mode::Island(
+            options
+                .spawn
+                .or(options.mission.then_some(scene::DEFAULT_SPAWN)),
+        )
     } else {
         Mode::Models(Showcase {
             models: vec![scene::DEFAULT_MODEL],
@@ -472,8 +479,9 @@ fn main() -> anyhow::Result<()> {
 /// What to show.
 #[derive(Clone, Debug)]
 enum Mode {
-    /// The streamed island, starting above (x, z).
-    Island((f32, f32)),
+    /// The streamed island, starting above (x, z), or at the PMC's
+    /// headquarters.
+    Island(Option<(f32, f32)>),
     /// These models on a ground grid, characters in this gait.
     Models(Showcase),
 }

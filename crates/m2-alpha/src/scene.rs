@@ -37,6 +37,9 @@ pub const DEFAULT_MODEL: u32 = 0x15d8_9832;
 
 /// Where the island opens: the first town, as in the viewer's examples.
 pub const DEFAULT_SPAWN: (f32, f32) = (450.0, -1950.0);
+/// Where free roam starts without `--spawn`: the PMC's headquarters, as
+/// after the first contract (the static layers' start point there).
+pub const FREE_ROAM_START: &str = "Starter_Pmc_Start1";
 
 /// Half the ground's width in metres.
 const GROUND_HALF: f32 = 1000.0;
@@ -801,7 +804,7 @@ impl Scene {
         backend: &mut dyn RenderBackend,
         install: &Install,
         settings: WorldSettings,
-        spawn: (f32, f32),
+        spawn: Option<(f32, f32)>,
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         let mut world = World::open(install, backend, &mut self.materials, settings)
@@ -819,7 +822,27 @@ impl Scene {
         );
         self.explosives = crate::combat::explosives(&world.index);
         eprintln!("explosives: {}", self.explosives.len());
-        let (x, z) = spawn;
+        // Without a place asked for, the PMC's headquarters, facing the
+        // way its start point does.
+        let start = spawn
+            .is_none()
+            .then(|| world.index.start(FREE_ROAM_START))
+            .flatten();
+        let ((x, z), facing) = match (spawn, start) {
+            (Some(at), _) => (at, 0.0),
+            (None, Some(s)) => {
+                let f = s.rotation * Vec3::Z;
+                eprintln!(
+                    "start: {} at {:.1}, {:.1}, {:.1}",
+                    s.name, s.position.x, s.position.y, s.position.z
+                );
+                ((s.position.x, s.position.z), f.x.atan2(f.z))
+            }
+            (None, None) => {
+                eprintln!("start: no {FREE_ROAM_START} in the layers; the first town instead");
+                (DEFAULT_SPAWN, 0.0)
+            }
+        };
         let y = world.index.rough_height(x, z) + 40.0;
         self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));
         self.world = Some(world);
@@ -873,7 +896,7 @@ impl Scene {
             }
         }
         self.people.clips = clips;
-        let mut player = Player::new(x, z, 0.0, model);
+        let mut player = Player::new(x, z, facing, model);
         player.clips = clips;
         self.player = Some(player);
         self.vehicle_loads = Some(load_cast(install.clone()));

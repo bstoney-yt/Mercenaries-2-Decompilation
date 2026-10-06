@@ -361,6 +361,17 @@ const NOT_TEMPLATES: [&str; 16] = [
     "LandingZone",
 ];
 
+/// A place the game starts or restarts the player: the static layers'
+/// `Starter_<hq>_Start<n>` entities (`Starter_Pmc_Start1` at the PMC's
+/// headquarters, where free roam begins after the first contract).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StartPoint {
+    /// The entity's name without its id (`Starter_Pmc_Start1`).
+    pub name: String,
+    pub position: Vec3,
+    pub rotation: Quat,
+}
+
 /// A person a layer places: a soldier at a post or on a patrol route,
 /// from the `PopulationSimpleSpawner`, `Ai` and `AiPatrol` components.
 #[derive(Clone, Debug, PartialEq)]
@@ -415,6 +426,8 @@ pub struct WorldIndex {
     /// is an instance of: what a renamed entity's name
     /// (`VzaCon001_StartingBoat`) no longer says.
     pub state_vehicles: HashMap<u32, TemplatePlacement>,
+    /// Where the static layers start the player, by name.
+    pub starts: Vec<StartPoint>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -683,6 +696,13 @@ impl WorldIndex {
                 let (position, rotation) = (Vec3::from(p.position), rotation(p.rotation));
                 let mut candidates: Vec<u32> = models.get(&entity).copied().into_iter().collect();
                 let stem = member_stem(name);
+                if stem.to_ascii_lowercase().starts_with("starter_") {
+                    self.starts.push(StartPoint {
+                        name: stem.to_owned(),
+                        position,
+                        rotation,
+                    });
+                }
                 let stem_hash = (!stem.is_empty()).then(|| name_hash(stem));
                 candidates.extend(stem_hash);
                 candidates.dedup();
@@ -852,6 +872,13 @@ impl WorldIndex {
     }
 
     /// Cells whose square comes within `radius` of `(x, z)`, nearest first.
+    /// The start point named `name` (any case).
+    pub fn start(&self, name: &str) -> Option<&StartPoint> {
+        self.starts
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+    }
+
     pub fn cells_near(&self, x: f32, z: f32, radius: f32) -> Vec<(u32, Vec3)> {
         let mut out: Vec<(f32, u32, Vec3)> = self
             .cells
