@@ -79,6 +79,8 @@ const HINT_TIME: f64 = 12.0;
 pub struct Hud {
     pub ctx: egui::Context,
     renderer: Option<Renderer>,
+    /// Textures handed to the renderer and not freed (for `M2_PAINT_LOG`).
+    uploaded: std::collections::HashSet<egui::TextureId>,
     /// The pause menu is open.
     pub menu: bool,
     /// Tessellated and waiting to paint: shapes, texture changes, scale.
@@ -117,6 +119,7 @@ impl Hud {
         Self {
             ctx,
             renderer: None,
+            uploaded: Default::default(),
             menu: false,
             frame: None,
             game: None,
@@ -238,9 +241,10 @@ impl Hud {
             for image in images {
                 renderer.update_texture(t.device, t.queue, *id, image);
             }
+            self.uploaded.insert(*id);
         }
         if std::env::var_os("M2_PAINT_LOG").is_some() {
-            log_primitives(&shapes, &delta, t.format, t.size);
+            log_primitives(&shapes, &delta, &self.uploaded, t.format, t.size);
         }
         let screen = ScreenDescriptor {
             size_in_pixels: [t.size.0, t.size.1],
@@ -267,6 +271,7 @@ impl Hud {
             renderer.render(&mut pass.forget_lifetime(), &shapes, &screen);
         }
         for id in &delta.free {
+            self.uploaded.remove(id);
             renderer.free_texture(id);
         }
         delta.clear();
@@ -278,6 +283,7 @@ impl Hud {
 fn log_primitives(
     shapes: &[egui::ClippedPrimitive],
     delta: &egui::TexturesDelta,
+    uploaded: &std::collections::HashSet<egui::TextureId>,
     format: wgpu::TextureFormat,
     size: (u32, u32),
 ) {
@@ -297,8 +303,13 @@ fn log_primitives(
                 .filter(|v| v.color.r() < 16 && v.color.a() > 64)
                 .count();
             eprintln!(
-                "paint: {:?} {} verts {} indices, bounds {:.0?}..{:.0?}, clip {:.0?}..{:.0?}, alpha {lo}..{hi}, {dark} dark",
+                "paint: {:?}{} {} verts {} indices, bounds {:.0?}..{:.0?}, clip {:.0?}..{:.0?}, alpha {lo}..{hi}, {dark} dark",
                 m.texture_id,
+                if uploaded.contains(&m.texture_id) {
+                    ""
+                } else {
+                    " (NOT UPLOADED)"
+                },
                 m.vertices.len(),
                 m.indices.len(),
                 b.min,
