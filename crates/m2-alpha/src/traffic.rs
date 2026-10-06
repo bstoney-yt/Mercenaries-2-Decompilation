@@ -33,6 +33,8 @@ const DEFAULT_TOP: f32 = 20.0;
 /// Haste when the patrol gives none (the install's spawners give 0.175 to
 /// 0.35).
 const DEFAULT_HASTE: f32 = 0.3;
+/// A vehicle not loaded after this many seconds never will be.
+const GIVE_UP: f32 = 30.0;
 
 #[derive(Debug, Default)]
 pub struct Traffic {
@@ -41,8 +43,10 @@ pub struct Traffic {
     indexed: bool,
     /// Per spawner: seconds before it may spawn again.
     wait: HashMap<u32, f32>,
-    /// Spawners whose vehicle is loading.
-    loading: HashSet<u32>,
+    /// Spawners whose vehicle is loading, with the seconds it has taken.
+    loading: HashMap<u32, f32>,
+    /// Spawners whose vehicle never loaded: they are left be.
+    failed: HashSet<u32>,
     /// Per spawner: the waypoint its vehicle drives to, and whether it
     /// has finished an open path.
     next: HashMap<u32, (usize, bool)>,
@@ -103,6 +107,21 @@ impl Traffic {
         for w in self.wait.values_mut() {
             *w -= dt;
         }
+        // A load that never comes (no drivable model) gives its place up.
+        for t in self.loading.values_mut() {
+            *t += dt;
+        }
+        let stuck: Vec<u32> = self
+            .loading
+            .iter()
+            .filter(|&(_, &t)| t > GIVE_UP)
+            .map(|(&e, _)| e)
+            .collect();
+        for e in stuck {
+            self.loading.remove(&e);
+            self.failed.insert(e);
+            eprintln!("traffic {e:#x}: its vehicle never loaded; left be");
+        }
         // A vehicle that loaded is out; a wreck frees its spawner.
         let mut out: HashSet<u32> = HashSet::new();
         for v in &scene.vehicles {
@@ -119,7 +138,7 @@ impl Traffic {
             }
         }
         let moves = |e: &u32| self.points[e].route.len() >= 2;
-        let busy = out.iter().chain(&self.loading);
+        let busy = out.iter().chain(self.loading.keys());
         let moving = busy.clone().filter(|e| moves(e)).count();
         let standing = busy.count() - moving;
         let mut room = [
@@ -135,7 +154,8 @@ impl Traffic {
             let d = flat(t.position - focus).length();
             if d > t.spawner.reach()
                 || out.contains(&t.entity)
-                || self.loading.contains(&t.entity)
+                || self.loading.contains_key(&t.entity)
+                || self.failed.contains(&t.entity)
                 || self.wait.get(&t.entity).is_some_and(|&w| w > 0.0)
             {
                 continue;
@@ -153,6 +173,7 @@ impl Traffic {
             }
             let share = usize::from(self.points[&entity].route.len() >= 2);
             if room[share] == 0 {
+                skip.push((entity, "no room"));
                 continue;
             }
             let roll = self.roll();
@@ -172,7 +193,8 @@ impl Traffic {
                 t.name, models[0].label, t.position.x, t.position.y, t.position.z
             );
             scene.load_world_vehicle(entity, t.position, forward.x.atan2(forward.z), models);
-            self.loading.insert(entity);
+            self.loading.insert(entity, 0.0);
+            self.skipped.remove(&entity);
             self.wait.remove(&entity);
             self.next.remove(&entity);
             room[share] -= 1;
