@@ -309,6 +309,9 @@ pub struct ScriptWorld {
     pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
     goal_callbacks: Vec<(u32, Function, Option<Table>)>,
+    /// Drop and landing zone tests asked for (`Ai.TestDropZone`): the
+    /// callback to answer and the spot tested.
+    drop_tests: Vec<(Function, [f32; 3])>,
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
@@ -627,6 +630,20 @@ pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
         }
     }
     goal_finished(world, guid)
+}
+
+/// Answers the drop zone tests asked for since the last call: each spot
+/// will do, as tested (`callback(true, x, y, z)`; the engine's own test of
+/// the ground there isn't modelled). Returns any errors.
+pub fn answer_drop_tests(world: &Shared) -> Vec<mlua::Error> {
+    let tests = std::mem::take(&mut world.borrow_mut().drop_tests);
+    let mut errors = Vec::new();
+    for (f, [x, y, z]) in tests {
+        if let Err(e) = f.call::<()>((true, x, y, z)) {
+            errors.push(e);
+        }
+    }
+    errors
 }
 
 /// Calls the goal callbacks of `guid`'s finished AI goals, with their data
@@ -1379,6 +1396,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Faction relations are not modelled yet: everyone is neutral (0 on
     // the scale the faction manager converts to attitude levels).
     add(&ai, "GetRelation", |_, _, _| values([Value::Number(0.0)]))?;
+    // Whether a helicopter can set a load down near `Location` (a supply
+    // drop, a vehicle): answered later through `Callback`
+    // ([`answer_drop_tests`]); true now, the test under way.
+    add(&ai, "TestDropZone", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        let at = match t.raw_get::<Value>("Location")? {
+            Value::Table(l) => {
+                let c = |i| num(l.raw_get::<Value>(i).ok().as_ref());
+                c(1).zip(c(2)).zip(c(3)).map(|((x, y), z)| [x, y, z])
+            }
+            _ => None,
+        };
+        match (t.raw_get::<Value>("Callback")?, at) {
+            (Value::Function(f), Some(at)) => {
+                w.drop_tests.push((f, at));
+                values([Value::Boolean(true)])
+            }
+            _ => values([Value::Boolean(false)]),
+        }
+    })?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
