@@ -330,6 +330,24 @@ impl FontBook {
     pub fn get(&self, name: &str) -> Option<&Font> {
         self.fonts.get(&name.to_ascii_lowercase())
     }
+
+    /// Its fonts by name, each with its own name, glyph count and texture.
+    pub fn summary(&self) -> String {
+        let mut names: Vec<String> = self
+            .fonts
+            .iter()
+            .map(|(n, f)| {
+                format!(
+                    "{n} ({}, {} glyphs, {})",
+                    f.name,
+                    f.codes.len(),
+                    f.texture.as_ref().map_or("no texture", |t| t.0.as_str())
+                )
+            })
+            .collect();
+        names.sort();
+        names.join("; ")
+    }
 }
 
 /// `text` with its HTML tags taken out and entities read, and the colour
