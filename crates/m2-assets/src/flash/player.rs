@@ -691,6 +691,19 @@ impl Player {
         }
     }
 
+    /// What instance `id` and its children draw, through `matrix`.
+    pub fn draw_from(
+        &self,
+        id: ClipId,
+        matrix: &Matrix,
+        fonts: &FontBook,
+        out: &mut Vec<Triangle>,
+    ) {
+        let parent = self.clip(id).and_then(|c| c.parent);
+        let m = parent.map_or(*matrix, |p| matrix.then(&self.world_matrix(p)));
+        self.draw_clip(id, &m, &ColourTransform::IDENTITY, None, fonts, out, 0);
+    }
+
     /// Loads `lib` into `level` (`loadMovieNum`), replacing what was there.
     pub fn load_level(&mut self, level: i32, lib: Rc<Library>) -> ClipId {
         if let Some(old) = self.levels.remove(&level) {
