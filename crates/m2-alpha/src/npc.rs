@@ -688,22 +688,25 @@ impl People {
             .enumerate()
             .map(|(i, (_, _, w))| (i as u32, *w))
             .collect();
+        // The whole list's models are asked for at once, so a spawner
+        // isn't held up model by model.
+        for (template, model, _) in &s.list {
+            if self.list_kind(template).is_none() && self.asked.insert(*model) {
+                self.wanted.push((*model, template.clone()));
+            }
+        }
         let roll = self.rng.range(0.0, 1.0);
-        let (template, model, _) = &s.list[m2_engine::population::pick(&weights, roll)? as usize];
-        if let Some(k) = self.kind_for(template) {
-            return Some(k);
-        }
-        if let Some(k) = self
-            .kinds
-            .iter()
-            .position(|k| k.named && k.role == *template)
-        {
-            return Some(k);
-        }
-        if self.asked.insert(*model) {
-            self.wanted.push((*model, template.clone()));
-        }
-        None
+        let (template, _, _) = &s.list[m2_engine::population::pick(&weights, roll)? as usize];
+        self.list_kind(template)
+    }
+
+    /// The kind a spawner's list entry is, once its model is in.
+    fn list_kind(&self, template: &str) -> Option<usize> {
+        self.kind_for(template).or_else(|| {
+            self.kinds
+                .iter()
+                .position(|k| k.named && k.role == template)
+        })
     }
 
     pub fn add_kind(&mut self, kind: PersonKind) {
@@ -972,6 +975,11 @@ impl People {
                 .or_else(|| self.character(s))
                 .or_else(|| self.listed(s));
             let Some(kind) = kind else {
+                // A spawner whose list is still loading keeps its place,
+                // so spawns further off don't take it meanwhile.
+                if !s.list.is_empty() {
+                    room = room.saturating_sub(1);
+                }
                 continue;
             };
             room = room.saturating_sub(1);
@@ -1216,18 +1224,30 @@ pub(crate) mod tests {
             route: Vec::new(),
             layer: None,
             model: None,
-            list: vec![("Guerilla Soldier".into(), 0x6a11, 1.0)],
+            list: vec![
+                ("Guerilla Soldier".into(), 0x6a11, 1.0),
+                ("Guerilla Officer".into(), 0x6a12, 1.0),
+            ],
         };
         let spawns = [spawner];
         people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
-        assert_eq!(people.wanted, [(0x6a11, "Guerilla Soldier".to_owned())]);
-        people.add_kind(PersonKind {
-            role: "Guerilla Soldier".into(),
-            soldier: false,
-            named: true,
-            model: empty_model(),
-            rig: rig(),
-        });
+        // Every model on the list is asked for at once.
+        assert_eq!(
+            people.wanted,
+            [
+                (0x6a11, "Guerilla Soldier".to_owned()),
+                (0x6a12, "Guerilla Officer".to_owned())
+            ]
+        );
+        for role in ["Guerilla Soldier", "Guerilla Officer"] {
+            people.add_kind(PersonKind {
+                role: role.into(),
+                soldier: false,
+                named: true,
+                model: empty_model(),
+                rig: rig(),
+            });
+        }
         people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
         assert_eq!(people.npcs.iter().filter(|n| n.spawn == Some(9)).count(), 1);
     }
