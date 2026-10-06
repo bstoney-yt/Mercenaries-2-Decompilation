@@ -139,7 +139,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn call_in(mission: &mut Mission, key: &str) {
     use m2_game::airstrike::Launch;
     use m2_game::api::Command;
+    // Her recruits (the pilot and the helicopter pilot) join over the
+    // story; here they are all with her, and the shop's requirements
+    // waived.
+    let recruit = "MrxSupportData.SetHeliPilotRecruited(true) \
+        MrxSupportData.SetJetPilotRecruited(true) \
+        MrxSupportData.SetMechanicRecruited(true) \
+        MrxSupportData.SetIgnoreRequirements(true)";
+    if let Err(e) = mission.run(recruit, "recruit") {
+        println!("recruit: {e}");
+    }
     mission.stock_support(key, 1, 1.0e6, 1000.0);
+    let pmc = "print('cash', MrxPmc.GetCashQty(), 'fuel', MrxPmc.GetFuelQty(), \
+        'capacity', MrxPmc.GetFuelCapacity(), 'stock', MrxPmc.GetSupportQty(__m2_probe), \
+        'pilot', MrxSupportManager.IsRecruitAvailable('Pilot'), \
+        'copter', MrxSupportManager.IsRecruitAvailable('Copter'), \
+        'fiona', MrxSupportManager.IsRecruitAvailable('Fiona'))";
+    let _ = mission.lua().globals().set("__m2_probe", key);
+    if let Err(e) = mission.run(pmc, "pmc") {
+        println!("pmc: {e}");
+    }
     let took = mission.use_support(key);
     println!("call {key}: {took}");
     let mut pending: Vec<Command> = Vec::new();
