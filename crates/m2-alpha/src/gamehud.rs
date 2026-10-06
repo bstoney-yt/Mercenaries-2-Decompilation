@@ -1564,17 +1564,6 @@ impl Thread {
             rt.set_loader(Box::new(move |name: &str| {
                 movies.borrow_mut().library(&movie_name(name))
             }));
-            // The PDA's topbar forwards its map calls (`placeNewIcon`,
-            // `checkCurrentContract`, `jobBrowserDetail`) to `_level1`, and
-            // nothing in it or the scripts loads that level: the engine puts
-            // the map screen there beside it, before the scripts' calls
-            // (loaded later, it would wipe the icons they place).
-            if swf.contains(PDA_MOVIES[0]) {
-                rt.avm
-                    .loads
-                    .push((PDA_MOVIES[1].to_owned(), "_level1".to_owned(), 0));
-                rt.run_due();
-            }
             log.push(format!(
                 "flash: widget {id} ({}) plays {swf}, {} images, {} not drawn {:?}",
                 names.get(&id).map_or("", String::as_str),
