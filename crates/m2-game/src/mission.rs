@@ -441,6 +441,9 @@ impl Mission {
                 }
             }
         }
+        for t in self.events.take_trace() {
+            self.log.push(format!("  t={:.1} event {t}", self.now));
+        }
         for e in self.events.update_shared(dt, &self.world) {
             self.log.push(format!(
                 "  t={now:.1} {} callback: {}",
