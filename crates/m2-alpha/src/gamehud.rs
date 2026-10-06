@@ -873,34 +873,45 @@ fn pda_probe(lua: &Lua) -> String {
                 end
             end
         end
-        local pda = rawget(_G, "MrxGuiPda")
-        if type(pda) ~= "table" then
-            out[#out + 1] = "no MrxGuiPda"
-        elseif not rawget(pda, "__m2_wrapped") then
-            -- Open and Close are looked up on the PDA widget's class when
-            -- called (self:Close()): wrapped, they print the widget's
-            -- CustomData, where Open's checks live.
-            rawset(pda, "__m2_wrapped", true)
-            for _, name in ipairs({"Open", "Close"}) do
-                local f = rawget(pda, name)
-                if type(f) == "function" then
-                    rawset(pda, name, function(self, ...)
-                        local d = {}
-                        local cd = type(self) == "table" and self.CustomData
-                        if type(cd) == "table" then
-                            for k, v in pairs(cd) do
-                                local ty = type(v)
-                                if ty == "boolean" or ty == "number" then
-                                    d[#d + 1] = tostring(k) .. "=" .. tostring(v)
-                                end
-                            end
-                            table.sort(d)
-                        end
-                        print("PDA " .. name .. ": " .. table.concat(d, " "))
-                        return f(self, ...)
-                    end)
+        -- The PDA widget object: the one whose CustomData has bHaveFlash
+        -- (Open's checks live there), found from the globals.
+        local seen, found = {}, nil
+        local function find(t, depth)
+            if found or depth > 5 or seen[t] then return end
+            seen[t] = true
+            local cd = rawget(t, "CustomData")
+            if type(cd) == "table" and rawget(cd, "bHaveFlash") ~= nil then
+                found = t
+                return
+            end
+            for _, v in pairs(t) do
+                if type(v) == "table" then find(v, depth + 1) end
+            end
+        end
+        find(_G, 0)
+        if found then
+            local d = {}
+            for k, v in pairs(found.CustomData) do
+                local ty = type(v)
+                if ty == "boolean" or ty == "number" then
+                    d[#d + 1] = "CustomData." .. tostring(k) .. "=" .. tostring(v)
                 end
             end
+            for _, x in ipairs(d) do out[#out + 1] = x end
+            if not rawget(found, "__m2_wrapped") then
+                rawset(found, "__m2_wrapped", true)
+                for _, name in ipairs({"Open", "Close"}) do
+                    local f = found[name]
+                    if type(f) == "function" then
+                        found[name] = function(self, ...)
+                            print("PDA " .. name .. " called")
+                            return f(self, ...)
+                        end
+                    end
+                end
+            end
+        else
+            out[#out + 1] = "no PDA widget found"
         end
         local st = rawget(_G, "MrxState")
         if type(st) == "table" and type(st.IsLocked) == "function" then
