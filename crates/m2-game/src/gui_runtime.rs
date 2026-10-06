@@ -1841,7 +1841,7 @@ natives! {
         Ok(MultiValue::new())
     },
     // (widget, list): the PDA map's blips, which the engine hands its
-    // movie. Logged for now: what each entry holds.
+    // movie one `AddBlip` each; logged too.
     "AddPdaMapBlips" => |s, _, a| {
         let mut shown = Vec::new();
         if let Some(Value::Table(list)) = a.get(1) {
@@ -1862,6 +1862,20 @@ natives! {
             shown.len(),
             shown.join(" ")
         ));
+        // Each entry is `AddBlip`'s arguments in order (internal name,
+        // texture, x, y, rotation, label, description, faction...).
+        if let (Some(Value::Table(list)), Some(w)) = (a.get(1), s.widgets.get_mut(&a.id(0))) {
+            for entry in list.clone().sequence_values::<Value>().flatten() {
+                if let Value::Table(entry) = entry {
+                    let args = entry
+                        .sequence_values::<Value>()
+                        .flatten()
+                        .map(|v| FlashArg::of(&v))
+                        .collect();
+                    w.flash_calls.push(("AddBlip".to_owned(), args));
+                }
+            }
+        }
         Ok(MultiValue::new())
     },
     // (widget, function, data).
