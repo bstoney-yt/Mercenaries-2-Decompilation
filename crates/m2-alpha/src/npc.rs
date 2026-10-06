@@ -619,8 +619,10 @@ pub struct People {
     /// Story characters' models to load, by their template: model and
     /// template name (taken by the scene).
     pub wanted: Vec<(u32, String)>,
-    /// Models asked for so far.
-    asked: HashSet<u32>,
+    /// Models asked for so far, each by the template it is for: several
+    /// templates share a model (the guerrillas' men and the GR
+    /// Defenders), and each becomes a kind of its own.
+    asked: HashSet<(u32, String)>,
     active: HashSet<u32>,
     rng: Rng,
 }
@@ -671,7 +673,7 @@ impl People {
         {
             return Some(k);
         }
-        if self.asked.insert(model) {
+        if self.asked.insert((model, template.to_owned())) {
             self.wanted.push((model, template.to_owned()));
         }
         None
@@ -691,7 +693,7 @@ impl People {
         // The whole list's models are asked for at once, so a spawner
         // isn't held up model by model.
         for (template, model, _) in &s.list {
-            if self.list_kind(template).is_none() && self.asked.insert(*model) {
+            if self.list_kind(template).is_none() && self.asked.insert((*model, template.clone())) {
                 self.wanted.push((*model, template.clone()));
             }
         }
@@ -1227,6 +1229,8 @@ pub(crate) mod tests {
             list: vec![
                 ("Guerilla Soldier".into(), 0x6a11, 1.0),
                 ("Guerilla Officer".into(), 0x6a12, 1.0),
+                // Another template in the same model is a kind of its own.
+                ("GR Defender (rifle)".into(), 0x6a11, 1.0),
             ],
         };
         let spawns = [spawner];
@@ -1236,10 +1240,15 @@ pub(crate) mod tests {
             people.wanted,
             [
                 (0x6a11, "Guerilla Soldier".to_owned()),
-                (0x6a12, "Guerilla Officer".to_owned())
+                (0x6a12, "Guerilla Officer".to_owned()),
+                (0x6a11, "GR Defender (rifle)".to_owned())
             ]
         );
-        for role in ["Guerilla Soldier", "Guerilla Officer"] {
+        for role in [
+            "Guerilla Soldier",
+            "Guerilla Officer",
+            "GR Defender (rifle)",
+        ] {
             people.add_kind(PersonKind {
                 role: role.into(),
                 soldier: false,
