@@ -638,6 +638,11 @@ impl Mission {
         self.world.borrow_mut().hijack.press(button, now);
     }
 
+    /// Whether aircraft `guid` is in the air (`Vehicle.IsFlying`).
+    pub fn set_flying(&mut self, guid: u32, flying: bool) {
+        self.world.borrow_mut().hijack.set_flying(guid, flying);
+    }
+
     /// Where `guid`'s hardpoint `name` (`hp_seat_lt`, a node of its model)
     /// is in the world now; hijacks set off their explosions there.
     pub fn set_hardpoint(&mut self, guid: u32, name: &str, at: [f32; 3]) {

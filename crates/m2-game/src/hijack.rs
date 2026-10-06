@@ -197,6 +197,8 @@ pub struct HijackWorld {
     presses: Vec<(f64, u32)>,
     /// Hardpoints' places the game knows, by object and name (lower case).
     hardpoints: HashMap<(u32, String), [f32; 3]>,
+    /// Aircraft in the air (helicopters are hijacked only in flight).
+    flying: std::collections::BTreeSet<u32>,
     /// Buttons held down, and since when (game seconds).
     held: HashMap<u32, f64>,
     /// The hijack under way: hero, driver, vehicle.
@@ -223,6 +225,15 @@ impl HijackWorld {
     /// seconds).
     pub fn press(&mut self, button: u32, at: f64) {
         self.presses.push((at, button));
+    }
+
+    /// Whether aircraft `guid` is in the air.
+    pub fn set_flying(&mut self, guid: u32, flying: bool) {
+        if flying {
+            self.flying.insert(guid);
+        } else {
+            self.flying.remove(&guid);
+        }
     }
 
     /// Where `guid`'s hardpoint `name` (`hp_seat_lt`) is in the world.
@@ -631,6 +642,11 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
                 .push(Command::Hijack(HijackCommand::AbortDone { hero }));
         }
         Ok(MultiValue::new())
+    })?;
+    // A helicopter is hijacked only in the air (its script checks first).
+    add(&vehicle, "IsFlying", |w, _, a| {
+        let flying = id(a.first()).is_some_and(|g| w.hijack.flying.contains(&g));
+        Ok(MultiValue::from_vec(vec![Value::Boolean(flying)]))
     })?;
     // Played here, never on another machine.
     add(&vehicle, "IsHijackRemote", |_, _, _| {

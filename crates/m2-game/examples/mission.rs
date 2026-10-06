@@ -29,6 +29,8 @@
 //!                      2); with one, the action lasts as long as that
 //!                      clip (read from the hijack blocks; inferred: the
 //!                      people's clips are cut to the vehicle's)
+//!   --flying           the hijacked vehicle is in the air (helicopters
+//!                      are hijacked only in flight)
 //!   --tap-rate n       presses a second when the prompt is to tap or
 //!                      alternate (default 9)
 //! ```
@@ -66,6 +68,7 @@ struct Options {
     pad: String,
     action_seconds: f64,
     tap_rate: f64,
+    flying: bool,
 }
 
 fn main() -> ExitCode {
@@ -145,6 +148,7 @@ fn options() -> Result<Options> {
             "--pad" => o.pad = value()?,
             "--action-seconds" => o.action_seconds = value()?.parse()?,
             "--tap-rate" => o.tap_rate = value()?.parse()?,
+            "--flying" => o.flying = true,
             _ if o.wad.is_empty() && !a.starts_with("--") => o.wad = a,
             _ => return Err(format!("unknown argument {a}").into()),
         }
@@ -283,6 +287,7 @@ impl Hijack {
         };
         let vehicle = spawn(mission, vehicle)?;
         let crewman = spawn(mission, crew)?;
+        mission.set_flying(vehicle, o.flying);
         let started = mission.start_hijack(hero, crewman, vehicle, script);
         println!();
         println!(
