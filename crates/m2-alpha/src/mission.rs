@@ -1149,9 +1149,15 @@ fn strike(game: &mut Game, c: &Command) {
         .map_or(&none, |w| &w.index.template_db);
     game.scene.strikes.start(c, templates);
     match c {
+        // A smoke grenade, flare or beacon is thrown; the satellite and
+        // laser designators are aimed, which this game doesn't do for the
+        // scripts' strikes yet.
         Command::EquipDesignator { who, kind, .. } if *who == PLAYER => {
-            eprintln!("mission: the scripts hand her a {kind} to throw");
-            game.combat.to_throw = true;
+            let thrown = ["Smoke", "Flare", "Beacon"]
+                .iter()
+                .any(|k| kind.contains(k));
+            eprintln!("mission: the scripts hand her a {kind} (thrown: {thrown})");
+            game.combat.to_throw = thrown;
         }
         Command::RemoveDesignator { who } if *who == PLAYER => game.combat.to_throw = false,
         Command::DirectedEffect { what, at, .. } => {
