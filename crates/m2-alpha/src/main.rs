@@ -158,6 +158,9 @@ struct Options {
     /// picture, from these directions (degrees clockwise from where the
     /// camera looks), to see the HUD's hit arcs.
     hit_from: Vec<f32>,
+    /// With `--screenshot`: seconds the game's HUD runs before the
+    /// picture (2, or 0.5 with `--hit-from`).
+    hud_seconds: Option<f64>,
     /// With `--screenshot` on foot: call a Satellite Guided Bomb on the
     /// spot ahead of her, the picture with the support menu open (menu),
     /// through the satellite's view, with the timing wheel up, or after
@@ -314,6 +317,9 @@ fn parse_args() -> anyhow::Result<Options> {
                     o.hit_from
                         .push(d.parse().context("--hit-from expects degrees")?);
                 }
+            }
+            "--hud-seconds" => {
+                o.hud_seconds = Some(value()?.parse().context("--hud-seconds expects seconds")?)
             }
             "--weapon" => {
                 o.weapon = Some(match value()?.as_str() {
@@ -998,11 +1004,13 @@ fn screenshot(
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
         info.game = Some(gamehud::HudState::of(&mut game));
-        let seconds = if options.hit_from.is_empty() {
-            2.0
-        } else {
-            0.5
-        };
+        let seconds = options
+            .hud_seconds
+            .unwrap_or(if options.hit_from.is_empty() {
+                2.0
+            } else {
+                0.5
+            });
         hud.settle(&info, (w, h), seconds, Duration::from_secs(120));
         info.game = Some(gamehud::HudState::of(&mut game));
     }
