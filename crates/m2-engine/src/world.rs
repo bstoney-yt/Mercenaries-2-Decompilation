@@ -21,7 +21,7 @@ use m2_assets::model::MODEL_TYPE;
 use m2_assets::model::Material;
 use m2_assets::path::PATH_TYPE;
 use m2_assets::terrain::{CELL_SIZE, TerrainGroup, TerrainMaterial, colour_map_uv};
-use m2_assets::tree::{TREE_TYPE, TreeTable};
+use m2_assets::tree::{CardVertex, TREE_TYPE, TreeTable};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{BlockContents, Layer, LowResTile, Path, TerrainCell, name_hash};
 use m2_math::glam::{Quat, Vec3};
@@ -152,6 +152,27 @@ pub struct ObjectPlacement {
 /// layers' entity ids stay below `0x2000_0000` (the highest is `0x10001f5b`),
 /// so these never meet them.
 pub const TREE_ENTITIES: u32 = 0xf000_0000;
+
+/// The species of a tree's entity id, `None` for anything else.
+pub fn tree_species(entity: u32) -> Option<usize> {
+    (entity & TREE_ENTITIES == TREE_ENTITIES).then_some((entity >> 16 & 0xfff) as usize)
+}
+
+/// What stands for a species' tree beyond its fade distance, from the tree
+/// table: upright parts turned to face the eye (the trunk and crown, cut
+/// from one picture of the tree), and a cap over the crown, seen from
+/// above. Inferred, not decoded: that the parts turn about the vertical to
+/// face the eye and the cap turns with the tree.
+#[derive(Clone, Debug)]
+pub struct FarTree {
+    pub fade: f32,
+    /// Each part's rect (x0, y0, x1, y1, metres, the tree's base at 0) and
+    /// its UV rect in the parts' material.
+    pub parts: Vec<([f32; 4], [f32; 4])>,
+    pub material: Material,
+    /// The cap: vertices (tree space), triangle list, material.
+    pub cap: Option<(Vec<CardVertex>, Vec<u16>, Material)>,
+}
 
 /// An entity of the static layers whose name is a vehicle template
 /// (`M151 Softtop (VZ)`, `HMMWV (Softtop)`, `Small Fishing Boat`), or a
@@ -530,6 +551,9 @@ pub struct WorldIndex {
     /// The template database, for names the scripts and mission layers
     /// use.
     pub template_db: Templates,
+    /// Each tree species' far stand-in, by species (the tree table's
+    /// order; `None` for a species not placed).
+    pub far_trees: Vec<Option<FarTree>>,
     /// The outdoor light and air (ambient cube, sunlight, haze).
     pub atmosphere: Option<Atmosphere>,
     /// The regions whose light differs from it (`vz_atmosphere_regions`).
@@ -734,11 +758,11 @@ impl WorldIndex {
 
     /// The island's trees, which no layer places: the tree table
     /// ([`m2_assets::tree`]) gives each species' template and the decoded
-    /// position of each of its trees. Each tree stands as its template's
-    /// `ModelName`, drawn within its species' fade distance. Inferred, not
-    /// decoded: that the model stands upright at the position (no rotation)
-    /// and at its own size; each tree's 4-bit tail (a yaw or a scale step,
-    /// perhaps) and the species' scale range are not applied yet.
+    /// position and yaw of each of its trees. Each tree stands as its
+    /// template's `ModelName`, drawn within its species' fade distance, and
+    /// as its species' [`FarTree`] beyond. Inferred, not decoded: that the
+    /// model stands upright at the position and at its own size (the
+    /// species' scale range has no per-tree value to pick from).
     fn add_trees<R: Read + Seek>(&mut self, source: &mut AssetSource<R>, templates: &Templates) {
         let index = source.archive().index();
         let Some(hash) = index
@@ -767,6 +791,7 @@ impl WorldIndex {
             let Some(model) = model.filter(|_| species < 1 << 12 && s.trees.len() <= 1 << 16)
             else {
                 no_model.push((s.template, s.trees.len()));
+                self.far_trees.push(None);
                 continue;
             };
             self.objects
@@ -774,10 +799,24 @@ impl WorldIndex {
                     entity: TREE_ENTITIES | (species as u32) << 16 | i as u32,
                     model,
                     position: Vec3::from(t.position),
-                    rotation: Quat::IDENTITY,
+                    rotation: Quat::from_rotation_y(t.yaw()),
                     named: true,
                     fade: Some(s.fade),
                 }));
+            let parts = s.part_count.min(3) as usize;
+            self.far_trees.push(Some(FarTree {
+                fade: s.fade,
+                parts: s.parts[..parts]
+                    .iter()
+                    .copied()
+                    .zip(s.part_uvs[..parts].iter().copied())
+                    .collect(),
+                material: s.material.clone(),
+                cap: s
+                    .card_material
+                    .clone()
+                    .map(|m| (s.card_vertices.clone(), s.card_indices.clone(), m)),
+            }));
         }
         eprintln!(
             "trees: {} of {} species placed, {} trees (layer entity ids up to {:#x}); left out for want of a model (template, trees): {:08x?}",
