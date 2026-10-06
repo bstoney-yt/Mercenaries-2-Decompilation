@@ -93,6 +93,8 @@ pub struct Game {
     pub combat: Combat,
     /// Layer entities of the island's vehicles asked for so far.
     fetched: HashSet<u32>,
+    /// The island's traffic spawners and what they have out.
+    pub traffic: crate::traffic::Traffic,
     /// Seconds to the next look for the island's vehicles near the player.
     vehicle_wait: f32,
     /// The layers the game starts with, which the island's vehicles come
@@ -131,6 +133,7 @@ impl Game {
             restore: Vec::new(),
             combat: Combat::default(),
             fetched: HashSet::new(),
+            traffic: crate::traffic::Traffic::default(),
             vehicle_wait: 0.0,
             startup: None,
             props_up: false,
@@ -261,7 +264,13 @@ impl Game {
             })
             .collect();
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut placed = scene.vehicles.iter().filter(|v| v.spot.is_some()).count();
+        // Traffic has its own limit.
+        let traffic = &self.traffic;
+        let mut placed = scene
+            .vehicles
+            .iter()
+            .filter(|v| v.spot.is_some_and(|(e, _, _)| !traffic.owns(e)))
+            .count();
         let mut loads = Vec::new();
         for (_, t) in wanted {
             if placed >= WORLD_VEHICLES {
@@ -302,6 +311,14 @@ impl Game {
     pub fn step(&mut self, intent: Intent, dt: f32) {
         self.startup_props();
         self.fetch_world_vehicles(dt);
+        if self.on_foot
+            && let Some(p) = self.scene.player.as_ref().filter(|p| p.landed)
+        {
+            let focus = p.character.position;
+            let people = &self.scene.people;
+            self.traffic
+                .spawn(&self.scene, focus, |l| people.layer_in(l), dt);
+        }
         let intent = self.call_support(intent, dt);
         // The use key at what lies within reach: taken with the fight's.
         let mut taking = false;
@@ -463,6 +480,8 @@ impl Game {
                     );
                 }
             }
+            self.traffic
+                .drive(&mut world.physics, &self.scene.vehicles, driven);
             knock_loose(world, &mut self.scene.props, &self.scene.vehicles);
             self.scene.props.advance(dt);
             self.spray_wait -= dt;

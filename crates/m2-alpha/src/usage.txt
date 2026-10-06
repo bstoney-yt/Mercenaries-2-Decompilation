@@ -39,6 +39,11 @@ m2-alpha [options]
   --fight                with --screenshot on the island: shoot the nearest
                          soldier, rocket a vehicle, throw a grenade first,
                          then look at the body
+  --traffic <s>          with --screenshot on the island: play this many
+                         seconds before the picture, logging the traffic
+                         spawned from the layers' spawners every 5 s (each
+                         vehicle's place, speed and waypoint) and the five
+                         spawners nearest her
   --fight-wait <s>       with --fight or --blast: wait this long before
                          the picture
   --blast                with --screenshot on the island: fire a rocket at
