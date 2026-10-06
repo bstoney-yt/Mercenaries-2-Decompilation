@@ -187,12 +187,12 @@ impl Traffic {
                 skip.push((entity, "no model for what it picked"));
                 continue;
             }
-            let forward = t.rotation * Vec3::Z;
+            let (at, forward) = start_of(t);
             eprintln!(
                 "traffic {entity:#x} ({}): {name} as {} at ({:.0}, {:.0}, {:.0})",
-                t.name, models[0].label, t.position.x, t.position.y, t.position.z
+                t.name, models[0].label, at.x, at.y, at.z
             );
-            scene.load_world_vehicle(entity, t.position, forward.x.atan2(forward.z), models);
+            scene.load_world_vehicle(entity, at, forward.x.atan2(forward.z), models);
             self.loading.insert(entity, 0.0);
             self.skipped.remove(&entity);
             self.wait.remove(&entity);
@@ -365,6 +365,32 @@ fn flat(v: Vec3) -> Vec2 {
     Vec2::new(v.x, v.z)
 }
 
+/// Where a spawner's vehicle starts, and facing which way: on its route
+/// where it has one (the guerrilla HQ's path spawners stand 40 m off
+/// their path, up a 36 degree slope), at the route point nearest the
+/// spawner, facing along it; else at the spawner, as it faces. Where the
+/// game puts them isn't known.
+fn start_of(t: &TrafficPoint) -> (Vec3, Vec3) {
+    let route = &t.route;
+    if route.len() < 2 {
+        return (t.position, t.rotation * Vec3::Z);
+    }
+    let i = (0..route.len())
+        .min_by(|&a, &b| {
+            (route[a] - t.position)
+                .length()
+                .total_cmp(&(route[b] - t.position).length())
+        })
+        .unwrap_or(0);
+    let (from, to) = if i + 1 < route.len() {
+        (route[i], route[i + 1])
+    } else {
+        (route[i - 1], route[i])
+    };
+    let along = Vec3::new(to.x - from.x, 0.0, to.z - from.z).normalize_or(Vec3::Z);
+    (route[i], along)
+}
+
 /// The waypoint to head for first: the nearest, or the one after it when
 /// that is behind on the way.
 fn nearest_ahead(route: &[Vec3], here: Vec3) -> usize {
@@ -404,6 +430,38 @@ fn models(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_traffic_starts_on_its_path() {
+        let mut t = TrafficPoint {
+            entity: 1,
+            name: String::new(),
+            position: Vec3::new(40.0, 20.0, 0.0),
+            rotation: m2_math::glam::Quat::IDENTITY,
+            layer: None,
+            spawner: m2_engine::population::Spawner {
+                list: 0,
+                seconds_per_cycle: 10.0,
+                active_radius: 0.0,
+                kind: 0,
+                far: None,
+            },
+            vehicles: Vec::new(),
+            route: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 50.0),
+                Vec3::new(50.0, 0.0, 50.0),
+            ],
+            haste: None,
+        };
+        let (at, forward) = start_of(&t);
+        assert_eq!(at, Vec3::new(0.0, 0.0, 0.0));
+        assert_eq!(forward, Vec3::Z);
+        t.position = Vec3::new(60.0, 5.0, 60.0);
+        assert_eq!(start_of(&t), (Vec3::new(50.0, 0.0, 50.0), Vec3::X));
+        t.route.clear();
+        assert_eq!(start_of(&t).0, t.position);
+    }
 
     #[test]
     fn heads_for_the_waypoint_ahead() {
