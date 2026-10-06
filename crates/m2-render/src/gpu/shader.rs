@@ -69,8 +69,11 @@ struct Frame {
     // x: the least cloud cover anywhere in the sky, y: a sky stage to
     // paint alone (1: the cloud before the air, 2: the cloud tone / 2,
     // 3: the sun's colour / 2, 4: the deck tint / 2, 5: the cloud after
-    // the air, 6: cover as grey), z: the sea mirrors the haze alone
+    // the air, 6: cover as grey), z: the sea mirrors the cloud deck too
     sky_fit: vec4<f32>,
+    // Trial scales on the sea's glint: x strength, y power (0: the
+    // material's), z least share of each wave kept however far
+    glint_fit: vec4<f32>,
 };
 
 // The game lights surfaces in display values: the sun's colour times
@@ -424,11 +427,12 @@ fn deck_through_air(cloud_in: vec3<f32>, r: vec3<f32>) -> vec3<f32> {
 // The sky along r as the sea mirrors it: the haze, and over it the cloud
 // deck at its mean cover (the coverage), its noise left out since ripples
 // blur the mirror. The game's water mirrors a render of the sky, deck
-// included, so the dusk's gold shows on the sea; that the mean cover
-// stands in for the blurred deck is inferred.
+// included; that the mean cover stands in for the blurred deck is
+// inferred, and it made the night sea 3-5x too bright, so the deck is
+// mirrored only with `M2_SEA_SKY=deck`.
 fn mirrored_sky(r: vec3<f32>) -> vec3<f32> {
     var rgb = sky(r);
-    if frame.wind.z > 0.5 && r.y > 0.0 && frame.sky_fit.z < 0.5 {
+    if frame.wind.z > 0.5 && r.y > 0.0 && frame.sky_fit.z > 0.5 {
         let cover = clamp(frame.clouds.w, 0.0, 1.0);
         let cloud = deck_through_air(deck_light(r, cover), r);
         rgb = mix(rgb, cloud, cover * frame.cloud_tone.a);
@@ -498,7 +502,7 @@ fn sea_normal(p: vec2<f32>, t: f32, footprint: f32) -> vec3<f32> {
         let k = 6.2831853 / w.y;
         // Deep water: speed follows wavelength.
         let theta = k * dot(dir, p) - sqrt(9.81 * k) * t + f32(i) * 1.7;
-        let fade = clamp(2.0 - material.water.w * footprint / w.y, 0.0, 1.0);
+        let fade = max(clamp(2.0 - material.water.w * footprint / w.y, 0.0, 1.0), frame.glint_fit.z);
         let across = vec2<f32>(-dir.y, dir.x);
         let swell = 0.65 + 0.35 * sin(dot(p, across) * (0.021 + 0.004 * f32(i)) + f32(i) * 2.3)
             * sin(dot(p, dir) * 0.013 - t * 0.05 + f32(i));
@@ -619,8 +623,9 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         // A Blinn-Phong glint in the sun's colour, added to the body
         // before the reflection, as the game's.
         let h = normalize(l + view);
+        let power = select(material.specular.a, frame.glint_fit.y, frame.glint_fit.y > 0.0);
         let glint = select(0.0, 1.0, dot(n, l) > 0.0) * surface_sun() * shade
-            * pow(max(dot(n, h), 0.0), material.specular.a) * material.specular.rgb;
+            * pow(max(dot(n, h), 0.0), power) * material.specular.rgb * frame.glint_fit.x;
         body = body + glint;
         // Schlick's Fresnel from the material's reflectance facing the
         // eye, times its reflection strength, mixes in the sky mirrored.
