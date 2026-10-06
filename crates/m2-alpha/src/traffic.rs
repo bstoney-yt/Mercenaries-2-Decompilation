@@ -301,11 +301,12 @@ impl Traffic {
             let Some(point) = self.points.get(&e) else {
                 continue;
             };
-            let at = physics
-                .vehicle_transform(id)
-                .map_or(Vec3::NAN, |m| m.w_axis.truncate());
+            let m = physics.vehicle_transform(id);
+            let at = m.map_or(Vec3::NAN, |m| m.w_axis.truncate());
+            // How upright (1 level, 0 on its side, below 0 upside down).
+            let up = m.map_or(f32::NAN, |m| m.transform_vector3(Vec3::Y).normalize().y);
             lines.push(format!(
-                "  {} from {e:#x} {}: at ({:.0}, {:.0}, {:.0}), {:.1} m/s, waypoint {:?} of {}{}{}",
+                "  {} from {e:#x} {}: at ({:.0}, {:.0}, {:.0}), up {up:.2}, {:.1} m/s, waypoint {:?} of {}{}{}",
                 v.spec.label,
                 point.name,
                 at.x,
