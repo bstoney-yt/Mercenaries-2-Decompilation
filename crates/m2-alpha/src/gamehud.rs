@@ -912,6 +912,8 @@ struct Thread {
     told: Told,
     /// The fullscreen widgets last logged.
     fullscreen_seen: String,
+    /// The solid quads over the screen last logged.
+    covers_seen: String,
     /// The reticle's widgets were listed in the log.
     reticle_logged: bool,
     /// The zones the radar's script holds, as last read.
@@ -1010,6 +1012,7 @@ impl Thread {
             tried: HashSet::new(),
             told: Told::default(),
             fullscreen_seen: String::new(),
+            covers_seen: String::new(),
             reticle_logged: false,
             zones: Vec::new(),
             roads: Vec::new(),
@@ -1144,6 +1147,27 @@ impl Thread {
             self.prims(item, state, &mut prims, &mut want);
         }
         self.log_flash_shown(&items, &shown, &mut log);
+        // Solid quads over most of the screen (a fade), when they change.
+        let [sw, sh] = state.size;
+        let covers: Vec<String> = prims
+            .iter()
+            .filter(|p| p.texture.is_none())
+            .filter(|p| {
+                let xs = p.corners.map(|c| c[0]);
+                let ys = p.corners.map(|c| c[1]);
+                let w = xs.iter().cloned().fold(f32::MIN, f32::max)
+                    - xs.iter().cloned().fold(f32::MAX, f32::min);
+                let h = ys.iter().cloned().fold(f32::MIN, f32::max)
+                    - ys.iter().cloned().fold(f32::MAX, f32::min);
+                w * h > sw * sh / 2.0
+            })
+            .map(|p| format!("{:.2?}", p.colour))
+            .collect();
+        let covers = format!("{covers:?}");
+        if covers != self.covers_seen {
+            log.push(format!("screen covers: {covers} of {} prims", prims.len()));
+            self.covers_seen = covers;
+        }
         let mut images = Vec::new();
         for hash in want {
             if self.tried.insert(hash) {
