@@ -634,6 +634,9 @@ pub struct GameHud {
     pending: Vec<(u32, Option<Image>)>,
     /// Textures by asset hash (`None`: missing in the archive).
     textures: HashMap<u32, Option<TextureHandle>>,
+    /// Leave out solid prims over most of the screen (fades): for
+    /// pictures with and without them (`M2_PAINT_AB`).
+    pub skip_covers: bool,
     /// The last objective message seen, to tell new ones.
     last_message: Option<ObjectiveMessage>,
     /// The last of the mission's HUD calls passed on.
@@ -671,6 +674,7 @@ impl GameHud {
             prims: Vec::new(),
             pending: Vec::new(),
             textures: HashMap::new(),
+            skip_covers: false,
             last_message: None,
             last_call: 0,
             last_time: None,
@@ -823,6 +827,9 @@ impl GameHud {
             let [r, g, b, a] = p.colour.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
             let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
             let Some(hash) = p.texture else {
+                if self.skip_covers && covers(p, painter.clip_rect()) {
+                    continue;
+                }
                 if !mesh.is_empty() {
                     painter.add(std::mem::take(&mut mesh));
                 }
@@ -865,6 +872,17 @@ impl GameHud {
             painter.add(mesh);
         }
     }
+}
+
+/// Whether a prim covers over half of `screen`.
+fn covers(p: &Prim, screen: egui::Rect) -> bool {
+    let xs = p.corners.map(|c| c[0]);
+    let ys = p.corners.map(|c| c[1]);
+    let w =
+        xs.iter().cloned().fold(f32::MIN, f32::max) - xs.iter().cloned().fold(f32::MAX, f32::min);
+    let h =
+        ys.iter().cloned().fold(f32::MIN, f32::max) - ys.iter().cloned().fold(f32::MAX, f32::min);
+    w * h > screen.area() / 2.0
 }
 
 /// The thread: reads the scripts, fonts and strings, starts the HUD, then
@@ -3408,6 +3426,7 @@ mod paint_tests {
             )],
             pending: Vec::new(),
             textures: HashMap::new(),
+            skip_covers: false,
             last_message: None,
             last_call: 0,
             last_time: None,
