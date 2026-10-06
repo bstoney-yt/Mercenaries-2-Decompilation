@@ -112,7 +112,9 @@ pub struct Widget {
     pub visible: bool,
     pub sleeping: bool,
     /// Taken off the screen by `ActivateWidget(id, false)` (as
-    /// `WidgetManager.RemoveWidget` does): neither drawn nor updated.
+    /// `WidgetManager.RemoveWidget` does): not drawn. Its update callback
+    /// still runs: the PDA's close (`MrxGuiPda.Close`) removes it and then
+    /// counts its reopening cooldown down in its `GuiUpdate`.
     pub inactive: bool,
     /// The box as last set on this widget, and its parent's box then:
     /// the widget's box now is this mapped from that to the parent's box
@@ -540,7 +542,6 @@ impl Screen {
         for w in self.widgets.values() {
             if let Some(cb) = w.update
                 && !w.sleeping
-                && !w.inactive
             {
                 due.push((cb, vec![f64::from(dt)]));
             }
@@ -2296,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_widgets_neither_draw_nor_update() {
+    fn removed_widgets_do_not_draw() {
         let (host, screen) = host();
         run(
             &host,
