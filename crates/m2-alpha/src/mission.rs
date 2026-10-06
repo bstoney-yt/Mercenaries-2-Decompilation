@@ -72,6 +72,9 @@ const SUPPORT_FUEL: f64 = 1000.0;
 /// She is ashore this far above the water (metres): not seated in the
 /// start's boat, which the scripts don't count as driving.
 const ASHORE_HEIGHT: f32 = 2.0;
+/// ... for this long without a break (seconds): she stands ashore a moment
+/// at the start, before the scripts seat her in the boat.
+const SUPPORT_ASHORE: f32 = 10.0;
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -185,6 +188,8 @@ pub struct MissionLink {
     /// Support items to stock and call in once the scripts run
     /// (`--support`).
     support: Vec<String>,
+    /// Seconds she has been on foot ashore without a break.
+    ashore_for: f32,
 }
 
 /// The scripts' vehicles in play.
@@ -273,6 +278,7 @@ impl MissionLink {
             fades: Vec::new(),
             music: None,
             support: Vec::new(),
+            ashore_for: 0.0,
         }
     }
 
@@ -519,7 +525,8 @@ impl MissionLink {
                         && p.character.position.y > WATERLINE + ASHORE_HEIGHT
                 })
                 && self.vehicles.riding.is_none();
-            if mission.now() >= SUPPORT_AFTER && on_land {
+            self.ashore_for = if on_land { self.ashore_for + STEP } else { 0.0 };
+            if mission.now() >= SUPPORT_AFTER && self.ashore_for >= SUPPORT_ASHORE {
                 for key in std::mem::take(&mut self.support) {
                     mission.stock_support(&key, 1, SUPPORT_CASH, SUPPORT_FUEL);
                     let took = mission.use_support(&key);
