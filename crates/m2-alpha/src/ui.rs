@@ -419,6 +419,15 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
         }
         return;
     }
+    // The PDA over the world: only the game's HUD (its movie) shows, as
+    // the wiki's picture of it has it.
+    if info.support.pda
+        && info.playing
+        && let Some(game) = game
+    {
+        game.paint(&painter);
+        return;
+    }
     if time < HINT_TIME && info.playing {
         text(
             screen.center_top() + vec2(0.0, 56.0),
