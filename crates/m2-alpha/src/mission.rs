@@ -159,8 +159,9 @@ pub struct MissionLink {
     /// Scripted voice lines to play, and lines to stop.
     lines: Vec<ScriptLine>,
     hushed: Vec<u32>,
-    /// Interface sounds the scripts cued (`ui_HUD_Objective_New`).
-    sounds: Vec<String>,
+    /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
+    /// whether each is to stop instead.
+    sounds: Vec<(String, bool)>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
     music: Option<Option<String>>,
 }
@@ -474,6 +475,12 @@ impl MissionLink {
             }
             self.blasts.clear();
             self.bombs.clear();
+            // The scripts heal her and watch her health.
+            game.combat.scripted_health = true;
+            if std::mem::take(&mut game.combat.revived) {
+                mission.player_died();
+            }
+            mission.set_health(PLAYER, game.combat.hp);
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -487,7 +494,19 @@ impl MissionLink {
                         self.lines.push((*id, cue.clone(), at));
                     }
                     Command::Hush(id) => self.hushed.push(*id),
-                    Command::CueSound { at: None, cue } => self.sounds.push(cue.clone()),
+                    Command::CueSound { at: None, cue } => self.sounds.push((cue.clone(), false)),
+                    Command::StopSound { at: None, cue } => self.sounds.push((cue.clone(), true)),
+                    Command::HealthClamp(on) => {
+                        eprintln!("mission: health clamp {on}");
+                        game.combat.health_clamp = *on;
+                    }
+                    Command::SetHealth { guid, health } if *guid == PLAYER => {
+                        eprintln!(
+                            "mission: scripts set her health {:.1} -> {health:.1}",
+                            game.combat.hp
+                        );
+                        game.combat.hp = health.clamp(0.0, 100.0);
+                    }
                     Command::Music(cue) => self.music = Some(cue.clone()),
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
@@ -565,7 +584,7 @@ impl MissionLink {
     }
 
     /// Interface sounds the scripts cued since the last call.
-    pub fn take_sounds(&mut self) -> Vec<String> {
+    pub fn take_sounds(&mut self) -> Vec<(String, bool)> {
         std::mem::take(&mut self.sounds)
     }
 

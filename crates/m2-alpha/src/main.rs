@@ -3320,8 +3320,12 @@ impl Running {
             for id in hushed {
                 self.audio.hush(id);
             }
-            for cue in m.take_sounds() {
-                self.audio.ui_sound(&cue);
+            for (cue, stop) in m.take_sounds() {
+                if stop {
+                    self.audio.stop_ui_sound(&cue);
+                } else {
+                    self.audio.ui_sound(&cue);
+                }
             }
             if let Some(cue) = m.take_music() {
                 self.audio.music_cue(cue.as_deref());

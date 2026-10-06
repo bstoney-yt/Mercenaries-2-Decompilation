@@ -164,6 +164,16 @@ pub enum Command {
         at: Option<u32>,
         cue: String,
     },
+    /// Stop a sound cue started with [`Command::CueSound`]
+    /// (`Sound.StopSound`): the scripts name it by where it sounds from
+    /// and its cue, never by a handle.
+    StopSound {
+        at: Option<u32>,
+        cue: String,
+    },
+    /// The player can't be killed while on (`Player.SetHealthClamp`): her
+    /// health stops short of nothing, for the survival system to step in.
+    HealthClamp(bool),
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -211,6 +221,9 @@ pub struct ScriptWorld {
     pub boundaries: Vec<u32>,
     pub boundary_callback: Option<Function>,
     pub outside: bool,
+    /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
+    pub health_clamp: bool,
+    pub survival_mode: bool,
 }
 
 impl ScriptWorld {
@@ -318,6 +331,9 @@ impl World for ScriptWorld {
     }
     fn is_awake(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.awake)
+    }
+    fn health(&self, guid: u32) -> Option<f32> {
+        self.objects.get(&guid).map(|o| o.health)
     }
     fn inside(&self, guid: u32, boundary: u32) -> Option<bool> {
         let region = self.regions.get(&boundary)?;
@@ -783,6 +799,20 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // (player number, on): the hero's survival script turns the clamp on
+    // at set-up and off once its one rescue has cooled down.
+    add(&player, "SetHealthClamp", |w, _, a| {
+        let on = matches!(a.get(1), Some(Value::Boolean(true)));
+        if on != w.health_clamp {
+            w.health_clamp = on;
+            w.commands.push(Command::HealthClamp(on));
+        }
+        values([])
+    })?;
+    add(&player, "SetSurvivalMode", |w, _, a| {
+        w.survival_mode = matches!(a.get(1), Some(Value::Boolean(true)));
+        values([])
+    })?;
     add(&player, "SetBoundaryCallback", |w, _, a| {
         w.boundary_callback = match a.get(1) {
             Some(Value::Function(f)) => Some(f.clone()),
@@ -1062,6 +1092,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&sound, "CueSound", |w, _, a| {
         if let Some(Value::String(cue)) = a.get(1) {
             w.commands.push(Command::CueSound {
+                at: id(a.first()).filter(|&g| g != 0),
+                cue: cue.to_string_lossy(),
+            });
+        }
+        values([])
+    })?;
+
+    add(&sound, "StopSound", |w, _, a| {
+        if let Some(Value::String(cue)) = a.get(1) {
+            w.commands.push(Command::StopSound {
                 at: id(a.first()).filter(|&g| g != 0),
                 cue: cue.to_string_lossy(),
             });
