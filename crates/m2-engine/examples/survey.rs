@@ -110,6 +110,14 @@
 //!                           who steps) and an ending numbered and
 //!                           lettered (`_01a`); each name found with two
 //!                           endings or more, its bank and endings
+//! vo:<line>[,..]            where scripted voice lines live (`VO.Cue`'s
+//!                           `Fiona-In-Mission-Contract-Vz01-146`): every
+//!                           cue table in English.wad holding the line's
+//!                           name hash (block, table, category, volume,
+//!                           distances, stream), and that block's sound
+//!                           banks with the stream's sound length; then
+//!                           the cue tables of blocks whose path holds
+//!                           "vz01"/"vzacon" with their first cues
 //! ```
 //!
 //! Names come from every NUL-terminated string in the four archives and
@@ -772,6 +780,7 @@ fn main() -> Result<(), Error> {
                 phy2_census(&mut source, world.as_ref().expect("just built"), &names)
             }
             "phy2rules" => phy2_rules(&mut source),
+            "vo" => vo_lines(&install, arg),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
@@ -970,6 +979,120 @@ fn voices(install: &Install, names: &Names) -> Result<(), Error> {
             if targets.contains(&h) { " *" } else { "" }
         );
     }
+    Ok(())
+}
+
+/// Finds scripted voice lines (`VO.Cue`'s line names) in the cue tables of
+/// `English.wad`, resident and per mission.
+fn vo_lines(install: &Install, arg: &str) -> Result<(), Error> {
+    let lines: Vec<(&str, u32)> = arg
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| (s, m2_assets::name_hash(s)))
+        .collect();
+    for (s, h) in &lines {
+        println!("  {h:08x} {s}");
+    }
+    let wad = install.data.join("English.wad");
+    let mut source = AssetSource::new(BufReader::new(File::open(&wad)?))?;
+    let paths: Vec<String> = source
+        .archive()
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    let mut tables = 0;
+    for (b, path) in paths.iter().enumerate() {
+        let Ok(decoded) = source.block(b) else {
+            continue;
+        };
+        let contents = BlockContents::parse(&decoded)?;
+        let mut found = Vec::new();
+        let mut banks = Vec::new();
+        let mission = {
+            let p = path.to_ascii_lowercase();
+            p.contains("vz01") || p.contains("vzacon")
+        };
+        for (e, data) in contents.iter() {
+            match e.type_hash {
+                m2_assets::voice::CUE_TABLE_TYPE => {
+                    let Ok(t) = m2_assets::CueTable::parse(data) else {
+                        continue;
+                    };
+                    tables += 1;
+                    if mission {
+                        let first: Vec<String> = t
+                            .lines
+                            .iter()
+                            .take(6)
+                            .map(|l| format!("{:08x}", l.cue))
+                            .collect();
+                        println!(
+                            "  table {:08x} in {path}: {} lines {} groups; first {}",
+                            t.hash,
+                            t.lines.len(),
+                            t.groups.len(),
+                            first.join(" ")
+                        );
+                    }
+                    for (s, h) in &lines {
+                        for l in t.lines.iter().filter(|l| l.cue == *h) {
+                            found.push(format!(
+                                "{s}: table {:08x} line, category {:08x}, volume {:.2}, \
+                                 {:.0}-{:.0} m, stream {}",
+                                t.hash,
+                                l.category,
+                                l.volume,
+                                l.min_distance,
+                                l.max_distance,
+                                l.stream
+                            ));
+                        }
+                        for g in t.groups.iter().filter(|g| g.cue == *h) {
+                            found.push(format!(
+                                "{s}: table {:08x} group, category {:08x}, streams {:?}",
+                                t.hash, g.category, g.streams
+                            ));
+                        }
+                    }
+                }
+                SOUND_BANK_TYPE => {
+                    if let Ok(bank) = SoundBank::parse(data) {
+                        let secs: Vec<f32> = bank
+                            .sounds
+                            .iter()
+                            .map(|s| s.frames as f32 / s.rate.max(1) as f32)
+                            .collect();
+                        banks.push((e.name_hash, secs));
+                    } else if let Ok(i) = StreamIndex::parse(data) {
+                        banks.push((e.name_hash, vec![-(i.streams.len() as f32)]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if found.is_empty() {
+            continue;
+        }
+        println!("  block {b} {path}");
+        for f in found {
+            println!("    {f}");
+        }
+        for (h, secs) in banks {
+            if secs.first().is_some_and(|s| *s < 0.0) {
+                println!("    stream index {h:08x}: {} streams", -secs[0]);
+            } else {
+                let shown: Vec<String> = secs.iter().map(|s| format!("{s:.1}")).collect();
+                println!(
+                    "    bank {h:08x}: {} sounds, s: {}",
+                    secs.len(),
+                    shown.join(" ")
+                );
+            }
+        }
+    }
+    println!("  cue tables read: {tables}");
     Ok(())
 }
 
