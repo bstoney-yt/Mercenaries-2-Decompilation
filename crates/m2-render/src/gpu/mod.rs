@@ -54,6 +54,30 @@ const GROUND_MAP_LENGTH: f32 = 170.0;
 /// (also a guess).
 const GROUND_DETAIL_START: f32 = 15.0;
 const GROUND_DETAIL_LENGTH: f32 = 35.0;
+/// Where ground's colour map takes over and its detail fades, and the
+/// detail's strength: `[map start, map length, detail start, detail
+/// length, detail gain]`. `M2_GROUND_FIT=a/b/c/d/e` replaces them to test
+/// against footage (any prefix).
+fn ground_fit() -> [f32; 5] {
+    static FIT: std::sync::OnceLock<[f32; 5]> = std::sync::OnceLock::new();
+    *FIT.get_or_init(|| {
+        let mut fit = [
+            GROUND_MAP_START,
+            GROUND_MAP_LENGTH,
+            GROUND_DETAIL_START,
+            GROUND_DETAIL_LENGTH,
+            1.0,
+        ];
+        if let Ok(v) = std::env::var("M2_GROUND_FIT") {
+            for (slot, x) in fit.iter_mut().zip(v.split('/')) {
+                if let Ok(x) = x.trim().parse::<f32>() {
+                    *slot = x;
+                }
+            }
+        }
+        fit
+    })
+}
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Per-draw uniforms are packed at this stride (wgpu's minimum dynamic
 /// offset alignment on every backend).
@@ -1038,13 +1062,16 @@ impl WgpuBackend {
                 desc.direct[2],
                 flag(desc.beam),
             ],
-            ambient: [desc.ambient[0], desc.ambient[1], desc.ambient[2], 0.0],
-            ground: [
-                GROUND_MAP_START,
-                1.0 / GROUND_MAP_LENGTH,
-                GROUND_DETAIL_START,
-                1.0 / GROUND_DETAIL_LENGTH,
+            ambient: [
+                desc.ambient[0],
+                desc.ambient[1],
+                desc.ambient[2],
+                ground_fit()[4],
             ],
+            ground: {
+                let fit = ground_fit();
+                [fit[0], 1.0 / fit[1], fit[2], 1.0 / fit[3]]
+            },
             layer_uv: {
                 let mut rows = [[0.0; 4]; 8];
                 for (i, l) in desc.layers.iter().enumerate() {

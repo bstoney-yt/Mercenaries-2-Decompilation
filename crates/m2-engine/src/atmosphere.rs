@@ -127,10 +127,11 @@ pub const SUN_SETS: Vec3 = Vec3::new(0.87, 0.0, 0.49);
 /// the searchlights' beams in full; below it they fade out (inferred).
 const BEAMS_FULL_RAMP: f32 = 0.3;
 
-/// How much of a beam's alpha shows at night: with the beams at full
-/// opacity their cores came out at L222-247 against footage's L130-137 (PC
-/// round D), which at the cone's brightness is about this alpha (inferred).
-const BEAM_NIGHT_ALPHA: f32 = 0.55;
+/// How much of a beam's alpha shows at night: at full opacity the cores
+/// came out at L222-247 and at 0.55 at L195-223 against footage's L153-164
+/// as the boat lands (PC rounds D and C), which on screen is about this
+/// alpha (inferred).
+const BEAM_NIGHT_ALPHA: f32 = 0.28;
 
 /// The lowest the sun is drawn, in radians over the horizon, so that low
 /// `LightTime`s still light the ground a little.

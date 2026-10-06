@@ -134,7 +134,7 @@ struct Material {
     maps: vec4<f32>,
     // rgb: direct light tint, w: a searchlight beam
     direct: vec4<f32>,
-    // rgb: ambient light tint, w: unused
+    // rgb: ambient light tint, w: ground detail strength
     ambient: vec4<f32>,
     // Ground: x, y: distance the colour map starts taking over and 1 / the
     // distance it takes; z, w: the same for the detail map fading out.
@@ -481,7 +481,7 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             + pow(t0, e) * w.x + pow(t1, e) * w.y + pow(t2, e) * w.z + pow(t3, e) * w.w;
         if material.detail.x > 0.0 {
             let w_detail = clamp(1.0 - (dist - material.ground.z) * material.ground.w, 0.0, 1.0);
-            rgb = max(rgb + 2.0 * (detail_texel - 0.5) * w_detail, vec3<f32>(0.0));
+            rgb = max(rgb + 2.0 * material.ambient.w * (detail_texel - 0.5) * w_detail, vec3<f32>(0.0));
         }
         rgb = pow(rgb, 1.0 / e);
     } else if material.detail.x > 0.0 {
