@@ -143,6 +143,9 @@ impl Hud {
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
+        if let Some(m) = &info.mission {
+            state.hud_calls = game.hud_calls(&m.hud_calls);
+        }
         game.update(&self.ctx, state);
     }
 
@@ -165,6 +168,9 @@ impl Hud {
             .as_ref()
             .map_or_else(Vec::new, |m| m.radar_regions.clone());
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
+        if let Some(m) = &info.mission {
+            state.hud_calls = game.hud_calls(&m.hud_calls);
+        }
         let step = 1.0 / 30.0;
         game.update_and_wait(
             &self.ctx,
@@ -177,6 +183,7 @@ impl Hud {
         // Hurts and messages once; then time passes.
         state.hurts.clear();
         state.messages.clear();
+        state.hud_calls.clear();
         state.dt = step;
         for _ in 0..(seconds / step).ceil() as usize {
             if !game.ready() {
@@ -979,7 +986,8 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     if let Some(line) = m.tutorial.as_ref().filter(|_| message) {
         tutorial(painter, screen, line);
     }
-    if m.contract_complete {
+    // The game's HUD has its own fanfare (`Hud.Fanfare`).
+    if m.contract_complete && message {
         text(
             screen.center() + vec2(0.0, -60.0),
             Align2::CENTER_CENTER,
@@ -1192,6 +1200,7 @@ mod tests {
                 message: Some((false, "VzaCon001 objective 1".into())),
                 game_message: None,
                 radar_regions: Vec::new(),
+                hud_calls: Vec::new(),
                 status: None,
                 contract_complete: true,
             }),

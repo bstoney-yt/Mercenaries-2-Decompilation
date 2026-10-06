@@ -99,6 +99,18 @@ local tag = MrxUtil.GetInlineIconNameByIndex(icon) or ""
 return c.sColor .. tag .. " [objective." .. c.sPrefix .. c.sStatus .. "]" .. " " .. text,
     c.nPriority or 1
 "#;
+/// A mission's call to the HUD's interface, as the engine hands it on:
+/// `HudInterface.<group>.<method>(HudInterface.<group>, data)`. Answers
+/// whether the HUD has that method.
+const HUD_CALL: &str = r#"
+local group, method, data = ...
+local hud = HudInterface or Hud
+local g = hud and rawget(hud, group)
+local f = type(g) == "table" and rawget(g, method)
+if type(f) ~= "function" then return false end
+f(g, data)
+return true
+"#;
 /// A region onto the radar by its name, as `WifVzBoundary` puts its
 /// boundary there: the scripts' own `Hud.Radar:AddLineRegion` (colour and
 /// alpha 0..=255, nil for the radar's defaults).
@@ -386,6 +398,79 @@ pub struct HudState {
     /// The tutorial line the mission has up (`Net.SetTutorialMessage`), for
     /// the HUD's own tutorial box.
     pub tutorial: Option<String>,
+    /// The mission's calls to the HUD's interface (`Hud.Fanfare:Create`...)
+    /// not yet passed on.
+    pub hud_calls: Vec<HudCall>,
+}
+
+/// A value passed between the mission's scripts and the HUD's, which run
+/// in Lua states of their own: what a table of plain values holds
+/// (functions and userdata are left out).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Plain {
+    Nil,
+    Bool(bool),
+    Number(f64),
+    Text(String),
+    Table(Vec<(Plain, Plain)>),
+}
+
+impl Plain {
+    /// Tables this deep are copied; deeper ones are left out.
+    const DEPTH: usize = 4;
+
+    pub fn of(v: &Value) -> Self {
+        Self::at(v, 0)
+    }
+
+    fn at(v: &Value, depth: usize) -> Self {
+        match v {
+            Value::Boolean(b) => Plain::Bool(*b),
+            Value::Integer(n) => Plain::Number(*n as f64),
+            Value::Number(n) => Plain::Number(*n),
+            Value::String(s) => Plain::Text(s.to_string_lossy()),
+            Value::Table(t) if depth < Self::DEPTH => Plain::Table(
+                t.pairs::<Value, Value>()
+                    .flatten()
+                    .map(|(k, v)| (Self::at(&k, depth + 1), Self::at(&v, depth + 1)))
+                    .filter(|(k, v)| *k != Plain::Nil && *v != Plain::Nil)
+                    .collect(),
+            ),
+            _ => Plain::Nil,
+        }
+    }
+
+    pub fn to_lua(&self, lua: &Lua) -> mlua::Result<Value> {
+        Ok(match self {
+            Plain::Nil => Value::Nil,
+            Plain::Bool(b) => Value::Boolean(*b),
+            // Whole numbers as integers, as the scripts wrote them.
+            Plain::Number(n) if n.fract() == 0.0 && n.abs() < f64::from(i32::MAX) => {
+                Value::Integer(*n as mlua::Integer)
+            }
+            Plain::Number(n) => Value::Number(*n),
+            Plain::Text(t) => Value::String(lua.create_string(t)?),
+            Plain::Table(pairs) => {
+                let t = lua.create_table()?;
+                for (k, v) in pairs {
+                    t.raw_set(k.to_lua(lua)?, v.to_lua(lua)?)?;
+                }
+                Value::Table(t)
+            }
+        })
+    }
+}
+
+/// A call the mission's scripts made to the HUD through the engine's `Hud`
+/// library (`Hud.Fanfare:Create({ sType = "contract", ... })`), which the
+/// engine hands to the HUD's `HudInterface.<group>.<method>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HudCall {
+    /// Counts the calls from the mission's start, to pass each on once.
+    pub seq: u64,
+    pub group: String,
+    pub method: String,
+    pub data: Plain,
 }
 
 impl HudState {
@@ -445,12 +530,15 @@ impl HudState {
         let dt = self.dt + later.dt;
         let mut hurts = std::mem::take(&mut self.hurts);
         let mut messages = std::mem::take(&mut self.messages);
+        let mut hud_calls = std::mem::take(&mut self.hud_calls);
         hurts.extend(later.hurts.iter().copied());
         messages.extend(later.messages.iter().cloned());
+        hud_calls.extend(later.hud_calls.iter().cloned());
         *self = Self {
             dt,
             hurts,
             messages,
+            hud_calls,
             ..later
         };
     }
@@ -543,6 +631,8 @@ pub struct GameHud {
     textures: HashMap<u32, Option<TextureHandle>>,
     /// The last objective message seen, to tell new ones.
     last_message: Option<ObjectiveMessage>,
+    /// The last of the mission's HUD calls passed on.
+    last_call: u64,
     /// The time of the last frame (egui's input time).
     last_time: Option<f64>,
     log: Option<BufWriter<File>>,
@@ -577,6 +667,7 @@ impl GameHud {
             pending: Vec::new(),
             textures: HashMap::new(),
             last_message: None,
+            last_call: 0,
             last_time: None,
             log,
         }
@@ -609,6 +700,19 @@ impl GameHud {
         }
         self.last_message = message.cloned();
         message.cloned()
+    }
+
+    /// The mission's HUD calls in `calls` not passed on yet.
+    pub fn hud_calls(&mut self, calls: &[HudCall]) -> Vec<HudCall> {
+        let new: Vec<HudCall> = calls
+            .iter()
+            .filter(|c| c.seq > self.last_call)
+            .cloned()
+            .collect();
+        if let Some(last) = new.iter().map(|c| c.seq).max() {
+            self.last_call = last;
+        }
+        new
     }
 
     /// Sends this frame's state and takes in what the thread has drawn.
@@ -902,6 +1006,7 @@ impl Thread {
         if let Err(e) = self.feed(state) {
             log.push(format!("event: {e}"));
         }
+        self.pass_calls(state, &mut log);
         let dt = state.dt.min(MAX_STEP);
         if let Err(e) = self.feed_support(state, dt) {
             log.push(format!("support: {e}"));
@@ -1132,6 +1237,26 @@ impl Thread {
                 )),
                 Err(e) => log.push(format!("flash: widget {id}: {command}: {e}")),
             }
+        }
+    }
+
+    /// Hands the mission's HUD calls to the HUD's interface ([`HUD_CALL`]).
+    fn pass_calls(&mut self, s: &HudState, log: &mut Vec<String>) {
+        let lua = self.mission.lua();
+        for c in &s.hud_calls {
+            let name = format!("{}.{}", c.group, c.method);
+            let done = c.data.to_lua(lua).and_then(|data| {
+                lua.load(HUD_CALL).set_name("=m2-hud call").call::<bool>((
+                    c.group.as_str(),
+                    c.method.as_str(),
+                    data,
+                ))
+            });
+            log.push(match done {
+                Ok(true) => format!("hud call {name}"),
+                Ok(false) => format!("hud call {name}: the HUD has no such method"),
+                Err(e) => format!("hud call {name}: {e}"),
+            });
         }
     }
 
@@ -2648,6 +2773,30 @@ mod tests {
     /// where its art points.
     fn arc(heading: f32, from: Vec3) -> f32 {
         (direction(Some(Vec3::ZERO), Some(from)) + heading).rem_euclid(360.0)
+    }
+
+    #[test]
+    fn plain_values_cross_between_lua_states() {
+        let lua = Lua::new();
+        let v: Value = lua
+            .load(r#"return { sType = "contract", nPlayer = 1, nValue = 2.5, t = { true } }"#)
+            .eval()
+            .unwrap();
+        let plain = Plain::of(&v);
+        let other = Lua::new();
+        other
+            .globals()
+            .set("t", plain.to_lua(&other).unwrap())
+            .unwrap();
+        let t: Table = other.globals().get("t").unwrap();
+        assert_eq!(t.get::<String>("sType").unwrap(), "contract");
+        assert!(matches!(
+            t.get::<Value>("nPlayer").unwrap(),
+            Value::Integer(1)
+        ));
+        assert_eq!(t.get::<f64>("nValue").unwrap(), 2.5);
+        let inner: Table = t.get("t").unwrap();
+        assert!(inner.get::<bool>(1).unwrap());
     }
 
     #[test]
