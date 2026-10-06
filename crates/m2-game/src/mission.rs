@@ -569,8 +569,21 @@ impl Mission {
     /// The game's reading of an object's health (the player's, as she is
     /// hurt and healed).
     pub fn set_health(&mut self, guid: u32, health: f32) {
-        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
-            o.health = health;
+        let was = self
+            .world
+            .borrow_mut()
+            .objects
+            .get_mut(&guid)
+            .map(|o| std::mem::replace(&mut o.health, health));
+        // A drop the game made (not the scripts' own healing): what the
+        // scripts are watching for, while the health system is checked.
+        if guid == PLAYER && was.is_some_and(|w| health < w - 5.0) && crate::script::stub_args() {
+            self.log.push(format!(
+                "  t={:.1} her health {:.1} -> {health:.1}; pending: {}",
+                self.now,
+                was.unwrap_or(0.0),
+                self.events.describe().join(" ")
+            ));
         }
     }
 
