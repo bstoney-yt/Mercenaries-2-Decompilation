@@ -56,7 +56,7 @@ use m2_assets::{Font, StringTable, name_hash};
 use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table, Value};
 
 use crate::gui::{Anchor, Correction, VIRTUAL_SIZE};
-use crate::script::safe_function;
+use crate::script::{safe_function, show_arg};
 
 /// The screen, shared by the natives and the host.
 pub type ScreenRef = Rc<RefCell<Screen>>;
@@ -1838,6 +1838,30 @@ natives! {
         if let Some(cb) = s.widgets.get_mut(&a.id(0)).and_then(|w| w.movie_end.take()) {
             s.due.push((cb, Vec::new()));
         }
+        Ok(MultiValue::new())
+    },
+    // (widget, list): the PDA map's blips, which the engine hands its
+    // movie. Logged for now: what each entry holds.
+    "AddPdaMapBlips" => |s, _, a| {
+        let mut shown = Vec::new();
+        if let Some(Value::Table(list)) = a.get(1) {
+            for entry in list.clone().sequence_values::<Value>().flatten() {
+                let Value::Table(entry) = entry else { continue };
+                let mut fields: Vec<String> = entry
+                    .pairs::<Value, Value>()
+                    .flatten()
+                    .map(|(k, v)| format!("{}={}", show_arg(&k), show_arg(&v)))
+                    .collect();
+                fields.sort();
+                shown.push(format!("{{{}}}", fields.join(" ")));
+            }
+        }
+        s.log.push(format!(
+            "AddPdaMapBlips({}): {} blips {}",
+            a.id(0),
+            shown.len(),
+            shown.join(" ")
+        ));
         Ok(MultiValue::new())
     },
     // (widget, function, data).
