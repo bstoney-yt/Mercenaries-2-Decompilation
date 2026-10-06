@@ -248,8 +248,8 @@ struct FrameUniforms {
     sky_fit: [f32; 4],
     /// Trial scales on the sea's sun glint: x on its strength
     /// (`M2_GLINT_GAIN`), y its power in place of the material's
-    /// (`M2_GLINT_POWER`, 0: the material's), z the least share of each
-    /// wave kept however far (`M2_WAVE_KEEP`).
+    /// (`M2_GLINT_POWER`, 0: the dusk power), z the least share of each
+    /// wave kept however far (`M2_WAVE_KEEP`), w the night ramp's alpha.
     glint_fit: [f32; 4],
 }
 
@@ -1870,7 +1870,7 @@ impl WgpuBackend {
                 env_f32("M2_GLINT_GAIN").unwrap_or(1.0),
                 env_f32("M2_GLINT_POWER").unwrap_or(0.0),
                 env_f32("M2_WAVE_KEEP").unwrap_or(0.0),
-                0.0,
+                l.monochrome.map_or(0.0, |m| m.w),
             ],
         };
         self.queue
