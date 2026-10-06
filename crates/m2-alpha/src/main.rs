@@ -1931,7 +1931,9 @@ fn mission_for_screenshot(
             }
             for p in game.scene.flights.pickups() {
                 if opened.insert(p.key()) {
-                    pickup_shots.push((i + 1, p.key(), opened.len()));
+                    // Two seconds on, when the soldier who left it has
+                    // fallen.
+                    pickup_shots.push((i + (2.0 / tick) as u32, p.key(), opened.len()));
                 }
             }
             let due: Vec<((u32, u32), usize)> = pickup_shots
@@ -1958,7 +1960,8 @@ fn mission_for_screenshot(
                     .with_y(0.0)
                     .try_normalize()
                     .unwrap_or(m2_math::glam::Vec3::X);
-                let eye = p.at + away * 5.0 + m2_math::glam::Vec3::Y * 2.5;
+                // Steeply from above, so that a body by it doesn't hide it.
+                let eye = p.at + away * 1.5 + m2_math::glam::Vec3::Y * 3.5;
                 delivery_picture(
                     backend,
                     game,
