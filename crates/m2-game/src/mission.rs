@@ -299,6 +299,12 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            for e in layers.values().flatten() {
+                w.entities.insert(e.guid, e.at);
+                w.entity_names
+                    .entry(e.name.to_ascii_lowercase())
+                    .or_insert(e.guid);
+            }
             w.landing_zones.insert(1, one);
             w.landing_zones.insert(2, two);
             let mut player = Object::new(hero, at);

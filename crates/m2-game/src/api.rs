@@ -57,6 +57,16 @@ pub struct Object {
 }
 
 impl Object {
+    /// Whether it has every label of `terms` that isn't negated and none
+    /// that is ([`crate::events::class_terms`]).
+    pub fn is_of(&self, terms: &[(u32, bool)]) -> bool {
+        terms.iter().all(|&(h, not)| {
+            let has = self.label_hashes.contains(&h)
+                || self.labels.iter().any(|l| m2_assets::name_hash(l) == h);
+            has != not
+        })
+    }
+
     /// Its labels as name hashes: those scripts gave it and the data's.
     pub fn all_labels(&self) -> Vec<u32> {
         self.labels
@@ -237,6 +247,11 @@ pub struct ScriptWorld {
     pub outside: bool,
     /// Templates' labels (name hashes) by name in lower case, for spawns.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Every layer entity's place, and its guid by name in lower case,
+    /// loaded or not: `Pg.GetGuidByName` finds markers (landing zones) of
+    /// layers that aren't in, and scripts measure to them.
+    pub entities: HashMap<u32, [f32; 3]>,
+    pub entity_names: HashMap<String, u32>,
     /// `Player.SetHealthClamp` and `Player.SetSurvivalMode`, as last set.
     pub health_clamp: bool,
     pub survival_mode: bool,
@@ -256,6 +271,14 @@ impl ScriptWorld {
             .filter(|(_, o)| o.name.eq_ignore_ascii_case(name))
             .map(|(&g, _)| g)
             .min()
+    }
+
+    /// Where an object is: in play, else where its layer places it.
+    fn place_of(&self, guid: u32) -> Option<[f32; 3]> {
+        self.objects
+            .get(&guid)
+            .map(|o| o.position)
+            .or_else(|| self.entities.get(&guid).copied())
     }
 
     /// Takes the commands issued since the last call.
@@ -378,10 +401,11 @@ impl World for ScriptWorld {
         self.winch.get(&cargo).copied()
     }
     fn labelled(&self, label: &str) -> Vec<u32> {
+        let terms = crate::events::class_terms(label);
         let mut out: Vec<u32> = self
             .objects
             .iter()
-            .filter(|(_, o)| crate::events::class_matches(label, &o.all_labels()))
+            .filter(|(_, o)| o.is_of(&terms))
             .map(|(&g, _)| g)
             .collect();
         out.sort_unstable();
@@ -580,6 +604,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             Some(Value::String(s)) => {
                 let name = s.to_string_lossy();
                 w.by_name(&name)
+                    .or_else(|| w.entity_names.get(&name.to_ascii_lowercase()).copied())
                     .or_else(|| is_template(&name).then(|| w.template(&name)))
             }
             _ => None,
@@ -733,6 +758,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
     // The number of the player controlling it (scripts pass it on to
     // `Player.IsLocal` and key tables by it), else nil.
+    // Metres between two objects (or markers of layers not loaded).
+    add(&object, "GetDistanceFrom", |w, _, a| {
+        let (Some(p), Some(q)) = (
+            id(a.first()).and_then(|g| w.place_of(g)),
+            id(a.get(1)).and_then(|g| w.place_of(g)),
+        ) else {
+            return values([Value::Nil]);
+        };
+        let d: f32 = (0..3).map(|i| (p[i] - q[i]).powi(2)).sum::<f32>().sqrt();
+        values([Value::Number(f64::from(d))])
+    })?;
     add(&object, "IsPlayerControlled", |w, _, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
         values([if o.is_some_and(|o| o.player_controlled) {
