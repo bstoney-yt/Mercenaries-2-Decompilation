@@ -948,6 +948,10 @@ struct Thread {
     covers_seen: String,
     /// The reticle's widgets were listed in the log.
     reticle_logged: bool,
+    /// The PDA as last told to its script (`TogglePDA`).
+    pda_open: bool,
+    /// Whether its script showed it, as last logged.
+    pda_scripted: Option<bool>,
     /// The zones the radar's script holds, as last read.
     zones: Vec<Zone>,
     /// The island's roads, read with the radar's map.
@@ -1054,6 +1058,8 @@ impl Thread {
             fullscreen_seen: String::new(),
             covers_seen: String::new(),
             reticle_logged: false,
+            pda_open: false,
+            pda_scripted: None,
             zones: Vec::new(),
             roads: Vec::new(),
             pda: None,
@@ -1068,6 +1074,15 @@ impl Thread {
             log.push(format!("event: {e}"));
         }
         self.pass_calls(state, &mut log);
+        // The PDA button: the engine's `TogglePDA` GUI event, which the PDA
+        // layout's widget hands to `MrxGuiPda` (it opens the "topbar"
+        // movie over a black backdrop and puts the HUD to sleep).
+        if state.support.pda != self.pda_open {
+            self.pda_open = state.support.pda;
+            if let Err(e) = fire(self.mission.lua(), "TogglePDA", ()) {
+                log.push(format!("TogglePDA: {e}"));
+            }
+        }
         let dt = state.dt.min(MAX_STEP);
         if let Err(e) = self.feed_support(state, dt) {
             log.push(format!("support: {e}"));
@@ -1126,8 +1141,22 @@ impl Thread {
         // leaves some of it awake here.
         // Its help is in the tutorial box (as the PC footage has it), which
         // stays awake.
-        // With the PDA open, only it (drawn below) and the tutorial box.
-        let only = if state.support.pda {
+        // Shown by its script: its movie is up.
+        let scripted = state.support.pda
+            && items
+                .iter()
+                .any(|i| matches!(i, DrawItem::Flash { swf: Some(f), .. } if f.contains("topbar")));
+        if state.support.pda && self.pda_scripted != Some(scripted) {
+            self.pda_scripted = Some(scripted);
+            log.push(if scripted {
+                "PDA: opened by its script".into()
+            } else {
+                "PDA: its script did not open it; drawn directly".into()
+            });
+        }
+        // Not opened by its script: only the PDA drawn here and the
+        // tutorial box.
+        let only = if state.support.pda && !scripted {
             Some(widgets_under(&screen.borrow(), &names, |n| n == "tutorial"))
         } else {
             state.support.satellite.map(|_| {
@@ -1164,7 +1193,7 @@ impl Thread {
             let w = widget_of(i);
             !hidden.contains(&w) && only.as_ref().is_none_or(|o| o.contains(&w))
         };
-        if state.support.pda {
+        if state.support.pda && !scripted {
             if self.pda.is_none() {
                 let started = Instant::now();
                 let screens = pda_triangles(&mut self.assets);
