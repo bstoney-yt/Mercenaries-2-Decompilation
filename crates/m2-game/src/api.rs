@@ -148,6 +148,12 @@ pub enum Command {
     },
     /// Stop line `id` (`VO.Cancel`).
     Hush(u32),
+    /// `guid` can (no longer) be hurt: on while the scripts hold any
+    /// reason for it (`"MrxState"` while the screen fades, `"Fanfare"`).
+    Invincible {
+        guid: u32,
+        on: bool,
+    },
     /// Play a music cue (`mu_fac_pmc_explore_01`), looped unless it is a
     /// one-shot, in place of what plays; `None` stops the music.
     Music(Option<String>),
@@ -197,6 +203,14 @@ pub struct ScriptWorld {
     pub vo: crate::vo::Lines,
     /// The score.
     pub music: crate::music::Music,
+    /// Why each object is invincible (`Object.SetInvincible` reasons).
+    pub invincible: HashMap<u32, std::collections::BTreeSet<String>>,
+    /// The play area's boundaries (`Player.AddBoundary`: story-stage
+    /// regions such as `BoundaryIntro`), the callback told when the player
+    /// leaves or comes back, and whether the player is out.
+    pub boundaries: Vec<u32>,
+    pub boundary_callback: Option<Function>,
+    pub outside: bool,
 }
 
 impl ScriptWorld {
@@ -634,6 +648,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    add(&object, "SetInvincible", |w, _, a| {
+        let Some(guid) = id(a.first()) else {
+            return values([]);
+        };
+        let on = matches!(a.get(1), Some(Value::Boolean(true)));
+        let reason = match a.get(2) {
+            Some(Value::String(r)) => r.to_string_lossy(),
+            _ => String::new(),
+        };
+        let reasons = w.invincible.entry(guid).or_default();
+        let was = !reasons.is_empty();
+        if on {
+            reasons.insert(reason);
+        } else {
+            reasons.remove(&reason);
+        }
+        let now = !reasons.is_empty();
+        if now != was {
+            w.commands.push(Command::Invincible { guid, on: now });
+        }
+        values([])
+    })?;
     add(&object, "Kill", |w, _, a| {
         if let Some(guid) = id(a.first()) {
             if let Some(o) = w.objects.get_mut(&guid) {
@@ -739,6 +775,21 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let player = lib("Player")?;
+    add(&player, "AddBoundary", |w, _, a| {
+        if let Some(b) = id(a.get(1))
+            && !w.boundaries.contains(&b)
+        {
+            w.boundaries.push(b);
+        }
+        values([])
+    })?;
+    add(&player, "SetBoundaryCallback", |w, _, a| {
+        w.boundary_callback = match a.get(1) {
+            Some(Value::Function(f)) => Some(f.clone()),
+            _ => None,
+        };
+        values([])
+    })?;
     // A new game starts at the usual marker.
     add(&player, "GetPlayerStart", |_, lua, _| {
         values([Value::String(lua.create_string("PlayerLocation_Start")?)])

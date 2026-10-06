@@ -753,6 +753,9 @@ pub struct Combat {
     pub weapon: Weapon,
     /// Seconds she stays down.
     pub down: f32,
+    /// The scripts made her invincible (while the screen fades, at the
+    /// fanfare): nothing hurts her.
+    pub invincible: bool,
     quiet: f32,
     reload: f32,
     aim_left: f32,
@@ -811,6 +814,7 @@ impl Default for Combat {
             hp: 100.0,
             weapon: Weapon::Rifle,
             down: 0.0,
+            invincible: false,
             quiet: 0.0,
             reload: 0.0,
             aim_left: 0.0,
@@ -1332,7 +1336,7 @@ impl Combat {
     }
 
     fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32) {
-        if self.down > 0.0 {
+        if self.down > 0.0 || self.invincible {
             return;
         }
         self.quiet = 0.0;
