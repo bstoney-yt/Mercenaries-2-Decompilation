@@ -469,6 +469,15 @@ impl Mission {
             let Some(f) = w.boundary_callback.clone() else {
                 return;
             };
+            // While a state change holds her (the black screen as a
+            // contract loads, `MrxState`), she is still at the last spot
+            // and about to be placed: not a real exit.
+            if w.invincible
+                .get(&PLAYER)
+                .is_some_and(|r| r.contains("MrxState"))
+            {
+                return;
+            }
             let found: Vec<bool> = w
                 .boundaries
                 .iter()
