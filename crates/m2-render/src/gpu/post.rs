@@ -584,10 +584,19 @@ impl Post {
             dt.map_or(1.0, |dt| 1.0 - retention_per_frame.powf(dt * 30.0))
         };
         let (adapt, limits) = match (lighting.tone_map, lighting.adaptation) {
-            (Some(t), _) => (
-                [t.target, t.min_key, rate(t.retention), t.max_key],
-                [t.min, t.max, t.contrast_limit, t.contrast],
-            ),
+            (Some(t), _) => ([t.target, t.min_key, rate(t.retention), t.max_key], {
+                // `M2_TONE_CONTRAST=limit/multiplier` replaces the
+                // record's contrast limit and multiplier, to test.
+                let mut l = [t.min, t.max, t.contrast_limit, t.contrast];
+                if let Ok(v) = std::env::var("M2_TONE_CONTRAST") {
+                    for (slot, x) in l[2..].iter_mut().zip(v.split('/')) {
+                        if let Ok(x) = x.trim().parse::<f32>() {
+                            *slot = x;
+                        }
+                    }
+                }
+                l
+            }),
             (None, Some(a)) => (
                 [
                     a.key,

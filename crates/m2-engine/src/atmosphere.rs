@@ -507,6 +507,21 @@ impl Atmosphere {
         // shows their beams from dusk through the night and none by day, so
         // they follow how far the night's ramp has come in (inferred; the
         // game's own switch is probably the mission's lights).
+        // `M2_ATMO_DUMP=on` also logs the tone map's and light's numbers
+        // each time they change.
+        if env_is("M2_ATMO_DUMP", "on") {
+            static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+            let line = format!(
+                "atmosphere light {:?} li {:.3} tone {:?} cube {:?} tone_map {:?}",
+                self.light_color, self.light_intensity, self.tone, self.ambient_cube, self.tone_map
+            );
+            if let Ok(mut last) = LAST.lock()
+                && *last != line
+            {
+                eprintln!("{line}");
+                *last = line;
+            }
+        }
         lighting.beam_gain = self.monochrome.map_or(0.0, |m| {
             (m.w / BEAMS_FULL_RAMP).clamp(0.0, 1.0) * BEAM_NIGHT_ALPHA
         });
