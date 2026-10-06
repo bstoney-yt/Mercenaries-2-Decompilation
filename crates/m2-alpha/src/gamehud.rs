@@ -1180,15 +1180,19 @@ impl Thread {
                 .load(
                     r#"__m2_calls = {}
                     if debug and debug.sethook then
-                        debug.sethook(function()
+                        debug.sethook(function(kind, line)
                             local n = #__m2_calls
-                            if n >= 40 then return end
+                            if n >= 80 then return end
                             local i = debug.getinfo(2, "nS")
-                            if i and i.what ~= "C" then
+                            if kind == "line" then
+                                if i and i.short_src == "MrxGuiPda" then
+                                    __m2_calls[n + 1] = "L" .. tostring(line)
+                                end
+                            elseif i and i.what ~= "C" then
                                 __m2_calls[n + 1] = tostring(i.name) .. "@" .. tostring(i.short_src)
                                     .. ":" .. tostring(i.linedefined)
                             end
-                        end, "c")
+                        end, "cl")
                     else
                         __m2_calls[1] = "no debug.sethook"
                     end"#,
@@ -1198,6 +1202,17 @@ impl Thread {
             let calls: String = lua
                 .load(
                     r#"if debug and debug.sethook then debug.sethook() end
+                    local pda = rawget(_G, "MrxGuiPda")
+                    local env = type(pda) == "table" and type(pda.Open) == "function"
+                        and getfenv(pda.Open)
+                    if type(env) == "table" then
+                        local d = rawget(env, "MrxGuiDialogBox")
+                        __m2_calls[#__m2_calls + 1] = "| env dialog raw=" .. tostring(d)
+                            .. " read=" .. tostring(env.MrxGuiDialogBox)
+                            .. " global=" .. tostring(rawget(_G, "MrxGuiDialogBox"))
+                            .. " flash=" .. tostring(env.MrxGuiDialogBox
+                                and env.MrxGuiDialogBox.oSystemDialogBoxFlash)
+                    end
                     return table.concat(__m2_calls or {}, " ")"#,
                 )
                 .eval()
