@@ -243,7 +243,8 @@ struct FrameUniforms {
     /// the air in front of the clouds.
     surface: [f32; 4],
     /// x: the least cloud cover anywhere in the sky (`M2_CLOUD_FILL`),
-    /// y: a sky stage to paint alone (`M2_SKY_DEBUG`).
+    /// y: a sky stage to paint alone (`M2_SKY_DEBUG`), z: the sea mirrors
+    /// the haze alone (`M2_SEA_SKY=haze`).
     sky_fit: [f32; 4],
 }
 
@@ -1851,7 +1852,13 @@ impl WgpuBackend {
                     .ok()
                     .and_then(|v| v.parse::<f32>().ok())
                     .unwrap_or(0.0),
-                0.0,
+                // `M2_SEA_SKY=haze`: the sea mirrors the haze without the
+                // cloud deck, as before.
+                if std::env::var("M2_SEA_SKY").is_ok_and(|v| v == "haze") {
+                    1.0
+                } else {
+                    0.0
+                },
                 0.0,
             ],
         };

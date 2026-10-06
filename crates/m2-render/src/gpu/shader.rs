@@ -69,7 +69,7 @@ struct Frame {
     // x: the least cloud cover anywhere in the sky, y: a sky stage to
     // paint alone (1: the cloud before the air, 2: the cloud tone / 2,
     // 3: the sun's colour / 2, 4: the deck tint / 2, 5: the cloud after
-    // the air, 6: cover as grey)
+    // the air, 6: cover as grey), z: the sea mirrors the haze alone
     sky_fit: vec4<f32>,
 };
 
@@ -355,11 +355,85 @@ fn environment(r: vec3<f32>) -> vec3<f32> {
     let horizon = select(mix(frame.sky.rgb, vec3<f32>(1.0), 0.35), sky(vec3<f32>(r.x, 0.0, r.z)), hazy());
     if r.y >= 0.0 {
         if hazy() {
-            return sky(r);
+            return mirrored_sky(r);
         }
         return mix(horizon, frame.sky.rgb, sqrt(r.y));
     }
     return mix(horizon * 0.6, frame.ambient_cube[3].rgb, sqrt(-r.y));
+}
+
+// Height of the cloud deck (metres). Invented: the game's comes from
+// code.
+const CLOUD_HEIGHT: f32 = 1500.0;
+
+// The cloud deck's own light along the unit ray r where the cloud there
+// has mass `mass` (0 to 1): sunlight through the game's phase, darkened by
+// the mass, in the record's cloud tone.
+fn deck_light(r: vec3<f32>, mass: f32) -> vec3<f32> {
+    let l = -normalize(frame.sun_dir.xyz);
+    let c = dot(r, l);
+    var cloud: vec3<f32>;
+    if frame.wind.w >= 0.0 {
+        // As the game's: sunlight alone, through a Cornette-Shanks
+        // phase (its g taken from the haze's; the cloud's own is not
+        // known), divided by 1 + mass * darkness, the mass here the
+        // cloud's opacity before it fades towards the horizon.
+        let g = frame.rayleigh.a;
+        let phase = 1.5 * (1.0 - g * g) / (2.0 + g * g) * (1.0 + c * c)
+            / pow(1.0 + g * g - 2.0 * g * c, 1.5);
+        // The sun's colour comes in with the air in front when that
+        // is tinted by it.
+        var sun = frame.sun_color.rgb;
+        if frame.deck.y >= 0.0 && game_haze() {
+            sun = sun / max(light_from_display(frame.deck.yzw), vec3<f32>(1e-3));
+        }
+        cloud = sun * (1.0 + phase) / (1.0 + mass * frame.wind.w);
+    } else {
+        // Lit by the sun, brighter looking towards it; thicker cloud
+        // is darker underneath.
+        let lit = frame.sun_color.rgb * (0.5 + 0.5 * pow(max(c, 0.0), 4.0)) * mix(1.0, 0.7, mass);
+        cloud = lit + frame.ambient_cube[2].rgb * 0.5;
+    }
+    cloud = cloud * frame.cloud_tone.rgb;
+    return cloud;
+}
+
+// The deck's light `cloud` along r as seen through the air in front of it.
+fn deck_through_air(cloud_in: vec3<f32>, r: vec3<f32>) -> vec3<f32> {
+    var cloud = cloud_in;
+    let up = max(r.y, 0.03);
+    if frame.wind.w >= 0.0 && game_haze() {
+        // As the game's, the air between the eye and the deck dims the
+        // cloud and adds its own light in front of it.
+        var reach = CLOUD_HEIGHT / up;
+        if frame.deck.x > 0.0 {
+            reach = min(reach, frame.deck.x);
+        }
+        var air = game_air(frame.eye.xyz + r * reach);
+        air = vec4<f32>(air.rgb * frame.surface.w, 1.0 - frame.surface.w * (1.0 - air.a));
+        cloud = through_air(cloud, air);
+    } else if frame.wind.w >= 0.0 && hazy() {
+        let air = sky_below(r, CLOUD_HEIGHT);
+        cloud = cloud * air.a + air.rgb;
+    }
+    // Thin veils: the game's footage shows a hazy sky with little
+    // solid cloud.
+    return cloud;
+}
+
+// The sky along r as the sea mirrors it: the haze, and over it the cloud
+// deck at its mean cover (the coverage), its noise left out since ripples
+// blur the mirror. The game's water mirrors a render of the sky, deck
+// included, so the dusk's gold shows on the sea; that the mean cover
+// stands in for the blurred deck is inferred.
+fn mirrored_sky(r: vec3<f32>) -> vec3<f32> {
+    var rgb = sky(r);
+    if frame.wind.z > 0.5 && r.y > 0.0 && frame.sky_fit.z < 0.5 {
+        let cover = clamp(frame.clouds.w, 0.0, 1.0);
+        let cloud = deck_through_air(deck_light(r, cover), r);
+        rgb = mix(rgb, cloud, cover * frame.cloud_tone.a);
+    }
+    return rgb;
 }
 
 // How much sunlight reaches p (0 to 1), from the shadow cascade its view
@@ -700,11 +774,9 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyVaryings {
 @group(1) @binding(2) var cloud_noise: texture_2d<f32>;
 @group(1) @binding(3) var cloud_sampler: sampler;
 
-// Height of the cloud deck, the span one repeat of the noise covers at
-// layer scale 1, and the wind's speed (metres, m/s). Invented: the game's
-// come from code. A layer's scale stretches its noise, so the scale-8
+// The span one repeat of the noise covers at layer scale 1 and the
+// wind's speed (metres, m/s). Invented: the game's come from code. A layer's scale stretches its noise, so the scale-8
 // layer gives the broad masses and the others break them up.
-const CLOUD_HEIGHT: f32 = 1500.0;
 const CLOUD_SPAN: f32 = 6000.0;
 const CLOUD_SPEED: f32 = 6.0;
 
@@ -736,31 +808,7 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         if frame.wind.z < 1.5 {
             alpha = alpha * smoothstep(0.02, 0.35, r.y);
         }
-        let l = -normalize(frame.sun_dir.xyz);
-        let c = dot(r, l);
-        var cloud: vec3<f32>;
-        if frame.wind.w >= 0.0 {
-            // As the game's: sunlight alone, through a Cornette-Shanks
-            // phase (its g taken from the haze's; the cloud's own is not
-            // known), divided by 1 + mass * darkness, the mass here the
-            // cloud's opacity before it fades towards the horizon.
-            let g = frame.rayleigh.a;
-            let phase = 1.5 * (1.0 - g * g) / (2.0 + g * g) * (1.0 + c * c)
-                / pow(1.0 + g * g - 2.0 * g * c, 1.5);
-            // The sun's colour comes in with the air in front when that
-            // is tinted by it.
-            var sun = frame.sun_color.rgb;
-            if frame.deck.y >= 0.0 && game_haze() {
-                sun = sun / max(light_from_display(frame.deck.yzw), vec3<f32>(1e-3));
-            }
-            cloud = sun * (1.0 + phase) / (1.0 + mass * frame.wind.w);
-        } else {
-            // Lit by the sun, brighter looking towards it; thicker cloud
-            // is darker underneath.
-            let lit = frame.sun_color.rgb * (0.5 + 0.5 * pow(max(c, 0.0), 4.0)) * mix(1.0, 0.7, alpha);
-            cloud = lit + frame.ambient_cube[2].rgb * 0.5;
-        }
-        cloud = cloud * frame.cloud_tone.rgb;
+        var cloud = deck_light(r, mass);
         let stage = u32(frame.sky_fit.y + 0.5);
         if stage == 1u {
             return vec4<f32>(cloud, 1.0);
@@ -773,22 +821,7 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         } else if stage == 6u {
             return vec4<f32>(vec3<f32>(alpha * frame.cloud_tone.a), 1.0);
         }
-        if frame.wind.w >= 0.0 && game_haze() {
-            // As the game's, the air between the eye and the deck dims the
-            // cloud and adds its own light in front of it.
-            var reach = CLOUD_HEIGHT / up;
-            if frame.deck.x > 0.0 {
-                reach = min(reach, frame.deck.x);
-            }
-            var air = game_air(frame.eye.xyz + r * reach);
-            air = vec4<f32>(air.rgb * frame.surface.w, 1.0 - frame.surface.w * (1.0 - air.a));
-            cloud = through_air(cloud, air);
-        } else if frame.wind.w >= 0.0 && hazy() {
-            let air = sky_below(r, CLOUD_HEIGHT);
-            cloud = cloud * air.a + air.rgb;
-        }
-        // Thin veils: the game's footage shows a hazy sky with little
-        // solid cloud.
+        cloud = deck_through_air(cloud, r);
         if stage == 5u {
             return vec4<f32>(cloud, 1.0);
         }
