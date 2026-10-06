@@ -489,6 +489,9 @@ impl MissionLink {
                     Command::Hush(id) => self.hushed.push(*id),
                     Command::CueSound { at: None, cue } => self.sounds.push(cue.clone()),
                     Command::Music(cue) => self.music = Some(cue.clone()),
+                    Command::Invincible { guid, on } if *guid == PLAYER => {
+                        game.combat.invincible = *on;
+                    }
                     _ => {}
                 }
                 support_item(game, &c);

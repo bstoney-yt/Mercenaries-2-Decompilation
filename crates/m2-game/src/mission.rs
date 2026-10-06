@@ -446,6 +446,7 @@ impl Mission {
                 first_lines(&e.error.to_string())
             ));
         }
+        self.check_boundary(now);
         let ended = crate::vo::update(&self.world, self.host.lua(), now);
         for (cue, error) in ended {
             self.log.push(match error {
@@ -457,6 +458,38 @@ impl Mission {
             });
         }
         self.settle(&format!("t={now:.1}"));
+    }
+
+    /// Tells the boundary callback when the player leaves the play area
+    /// (zone `"out"`, `"enter"`) or comes back (`"exit"`). The player is
+    /// out when inside none of the boundaries the game can place.
+    fn check_boundary(&mut self, now: f64) {
+        let call = {
+            let mut w = self.world.borrow_mut();
+            let Some(f) = w.boundary_callback.clone() else {
+                return;
+            };
+            let found: Vec<bool> = w
+                .boundaries
+                .iter()
+                .filter_map(|&b| crate::events::World::inside(&*w, PLAYER, b))
+                .collect();
+            let out = !found.is_empty() && !found.contains(&true);
+            if out == w.outside {
+                return;
+            }
+            w.outside = out;
+            (f, if out { "enter" } else { "exit" })
+        };
+        let (f, event) = call;
+        self.log
+            .push(format!("  t={now:.1} play area: out {event}"));
+        if let Err(e) = f.call::<()>((mlua::Value::Nil, "out", event)) {
+            self.log.push(format!(
+                "  t={now:.1} boundary callback: {}",
+                first_lines(&e.to_string())
+            ));
+        }
     }
 
     /// The game is playing scripted line `id` (a [`Command::Say`]), which
@@ -830,6 +863,24 @@ mod tests {
         assert_eq!(g.raw_get::<String>("heard").unwrap(), "complete");
         assert_eq!(g.raw_get::<Option<bool>>("cancelled").unwrap(), None);
         assert!(g.raw_get::<bool>("ordered").unwrap());
+    }
+
+    #[test]
+    fn invincible_while_any_reason_holds() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            local hero = Player.GetCharacter(1)
+            Object.SetInvincible(hero, true, "MrxState")
+            Object.SetInvincible(hero, true, "Fanfare")
+            Object.SetInvincible(hero, false, "MrxState")
+            Object.SetInvincible(hero, false, "Fanfare")
+            "#,
+            "test",
+        )
+        .unwrap();
+        let on = |on| Command::Invincible { guid: PLAYER, on };
+        assert_eq!(m.take_commands(), [on(true), on(false)]);
     }
 
     #[test]
