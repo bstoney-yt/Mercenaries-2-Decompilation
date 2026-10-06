@@ -1828,6 +1828,9 @@ impl Avm {
             self.commands.push((cmd.to_owned(), target.to_owned()));
         } else if !url.is_empty() {
             // loadMovieNum (a level) or loadMovie (a clip, by its path).
+            if self.trace {
+                self.log.push(format!("getURL {url:?} into {target:?} from #{from}"));
+            }
             self.loads.push((url.to_owned(), target.to_owned(), from));
         }
     }
