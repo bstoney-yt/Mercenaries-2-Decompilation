@@ -308,34 +308,39 @@ impl Events {
     /// own posts (the satellite's view, say). It is delivered at the next
     /// update.
     pub fn post(&self, name: &str) {
-        self.store
-            .borrow_mut()
-            .posted
-            .push((name.to_owned(), Value::Nil));
+        self.post_data(name, Value::Nil);
+    }
+
+    /// Posts `name` with `data`, as `Event.Post(name, data)` does.
+    pub fn post_data(&self, name: &str, data: Value) {
+        self.store.borrow_mut().posted.push((name.to_owned(), data));
     }
 
     /// Advances game time by `dt` seconds and fires every event whose
     /// condition holds. Callbacks run after the checks, so events they
     /// create wait for the next update. Returns the callbacks that failed.
     pub fn update(&self, dt: f64, world: &dyn World) -> Vec<EventError> {
-        let accepted = self.filter_posts();
+        let (accepted, mut errors) = self.filter_posts();
         let fired = self.due(dt, world, &accepted);
-        fire(fired)
+        errors.extend(fire(fired));
+        errors
     }
 
     /// [`Events::update`] for a world the scripts also change: it is
     /// borrowed only while the conditions are checked, so callbacks can
     /// move, spawn and kill.
     pub fn update_shared<W: World>(&self, dt: f64, world: &RefCell<W>) -> Vec<EventError> {
-        let accepted = self.filter_posts();
+        let (accepted, mut errors) = self.filter_posts();
         let fired = self.due(dt, &*world.borrow(), &accepted);
-        fire(fired)
+        errors.extend(fire(fired));
+        errors
     }
 
     /// Asks each waiting `ScriptEvent`'s filter about each post, before
     /// anything is borrowed: filters are script functions and may call
-    /// the game (`Debug.Printf`). The (filter, post) pairs it says yes to.
-    fn filter_posts(&self) -> Accepted {
+    /// the game (`Debug.Printf`). The (filter, post) pairs it says yes to,
+    /// and the filters that failed.
+    fn filter_posts(&self) -> (Accepted, Vec<EventError>) {
         let (posted, filters) = {
             let s = self.store.borrow();
             let filters: Vec<(String, Function)> = s
@@ -349,22 +354,26 @@ impl Events {
                 })
                 .collect();
             if filters.is_empty() {
-                return Accepted::new();
+                return (Accepted::new(), Vec::new());
             }
             (s.posted.clone(), filters)
         };
-        let mut accepted = Accepted::new();
+        let (mut accepted, mut errors) = (Accepted::new(), Vec::new());
         for (name, f) in &filters {
-            for (i, (n, data)) in posted.iter().enumerate() {
-                let yes = n == name
-                    && f.call::<Value>(data.clone())
-                        .is_ok_and(|v| !matches!(v, Value::Nil | Value::Boolean(false)));
-                if yes {
-                    accepted.insert((f.to_pointer() as usize, i));
+            for (i, (n, data)) in posted.iter().enumerate().filter(|(_, (n, _))| n == name) {
+                match f.call::<Value>(data.clone()) {
+                    Ok(Value::Nil | Value::Boolean(false)) => {}
+                    Ok(_) => {
+                        accepted.insert((f.to_pointer() as usize, i));
+                    }
+                    Err(error) => errors.push(EventError {
+                        kind: format!("ScriptEvent {n} filter"),
+                        error,
+                    }),
                 }
             }
         }
-        accepted
+        (accepted, errors)
     }
 
     fn due(&self, dt: f64, world: &dyn World, accepted: &Accepted) -> Vec<Fired> {

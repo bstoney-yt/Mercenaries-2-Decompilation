@@ -45,7 +45,7 @@ use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::scene::NOT_DRIVABLE;
-use crate::support::{FALLBACK_AFTER, Impact, Kind};
+use crate::support::{self, FALLBACK_AFTER, Impact, Kind};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
@@ -384,7 +384,11 @@ impl MissionLink {
                 .filter(|n| n.as_str() == name)
                 .count();
             eprintln!("mission: posted {name:?}, {waiting} script events waiting for it");
-            mission.post(name);
+            if [support::PDA_OPEN, support::PDA_CLOSE].contains(&name) {
+                mission.post_for_player(name);
+            } else {
+                mission.post(name);
+            }
         }
         self.lag += dt;
         let mut lines = Vec::new();
