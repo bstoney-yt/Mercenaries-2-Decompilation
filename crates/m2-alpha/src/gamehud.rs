@@ -859,6 +859,51 @@ impl GameHud {
     }
 }
 
+/// What `MrxGuiPda.Open` checks, for the log: the PDA module's plain
+/// values (and those of its tables one level down), MrxState's lock and
+/// the control holder.
+fn pda_probe(lua: &Lua) -> String {
+    const PROBE: &str = r#"
+        local out = {}
+        local function scalars(prefix, t)
+            for k, v in pairs(t) do
+                local ty = type(v)
+                if ty == "boolean" or ty == "number" or ty == "string" then
+                    out[#out + 1] = prefix .. tostring(k) .. "=" .. tostring(v)
+                end
+            end
+        end
+        local pda = rawget(_G, "MrxGuiPda")
+        if type(pda) == "table" then
+            scalars("", pda)
+            for k, v in pairs(pda) do
+                if type(v) == "table" and k ~= "__index" then scalars(tostring(k) .. ".", v) end
+            end
+        else
+            out[#out + 1] = "no MrxGuiPda"
+        end
+        local st = rawget(_G, "MrxState")
+        if type(st) == "table" and type(st.IsLocked) == "function" then
+            local ok, v = pcall(st.IsLocked)
+            out[#out + 1] = "MrxState.IsLocked=" .. tostring(ok and v)
+        end
+        local base = rawget(_G, "MrxGuiBase")
+        if type(base) == "table" then
+            for _, f in ipairs({"GetCurrentControlHolder", "GetControlHolder"}) do
+                if type(base[f]) == "function" then
+                    local ok, v = pcall(base[f])
+                    out[#out + 1] = f .. "=" .. tostring(ok and v)
+                end
+            end
+        end
+        table.sort(out)
+        return table.concat(out, " ")
+    "#;
+    lua.load(PROBE)
+        .eval::<String>()
+        .unwrap_or_else(|e| format!("probe failed: {e}"))
+}
+
 /// HUD updates the PDA's script needs between its movie's load (and
 /// each toggle) and the next toggle: its close's cooldown is 20.
 const PDA_SETTLE: u32 = 30;
@@ -1088,6 +1133,7 @@ impl Thread {
             && self.since_toggle >= PDA_SETTLE
         {
             self.since_toggle = 0;
+            log.push(format!("PDA state: {}", pda_probe(self.mission.lua())));
             match gui_runtime::fire(self.mission.lua(), "TogglePDA", ()) {
                 Ok(n) => log.push(format!(
                     "TogglePDA (want {}): {n} handlers",
