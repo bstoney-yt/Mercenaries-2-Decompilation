@@ -67,6 +67,9 @@ pub struct Strikes {
     pub arrived: Vec<(u32, Vec3)>,
     /// Ordnance gone off since the last take (guid, template, where).
     pub burst: Vec<(u32, Option<u32>, Vec3)>,
+    /// Ordnance gone off in all, and where the first went off.
+    pub went_off: u32,
+    pub first: Option<Vec3>,
     /// Models to load (taken into [`Flights`]).
     wanted: Vec<u32>,
 }
@@ -185,6 +188,10 @@ impl Strikes {
             }
             s.age < LIFETIME
         });
+        self.went_off += burst.len() as u32;
+        if self.first.is_none() {
+            self.first = burst.first().map(|b| b.2);
+        }
         self.burst.extend(burst);
     }
 
