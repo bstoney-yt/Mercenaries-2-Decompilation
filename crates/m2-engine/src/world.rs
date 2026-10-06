@@ -134,6 +134,8 @@ pub struct Templates {
     pub tuning: HashMap<u32, VehicleTuning>,
     /// What templates leave when destroyed, and what pickups give.
     pub leavings: Leavings,
+    /// How the templates that can be hijacked are, by id.
+    pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
 }
 
 impl Templates {
@@ -303,6 +305,7 @@ impl Templates {
                 .collect(),
             tuning: crate::tuning::read(&db),
             leavings: crate::pickup::read(&db),
+            hijack: crate::hijack::read(&db),
         }
     }
 }
