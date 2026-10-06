@@ -69,7 +69,8 @@ struct Frame {
     // x: the least cloud cover anywhere in the sky, y: a sky stage to
     // paint alone (1: the cloud before the air, 2: the cloud tone / 2,
     // 3: the sun's colour / 2, 4: the deck tint / 2, 5: the cloud after
-    // the air, 6: cover as grey), z: the sea mirrors the cloud deck too
+    // the air, 6: cover as grey), z: the sea mirrors the cloud deck too,
+    // w: the sea's glint keeps the sun's hue
     sky_fit: vec4<f32>,
     // Trial scales on the sea's glint: x strength, y power (0: the dusk
     // power), z least share of each wave kept however far, w the night
@@ -636,7 +637,8 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             power = frame.glint_fit.y;
         }
         let h = normalize(l + view);
-        let glint = select(0.0, 1.0, dot(n, l) > 0.0) * surface_sun() * shade
+        let sun = select(surface_sun(), frame.sun_color.rgb, frame.sky_fit.w > 0.5);
+        let glint = select(0.0, 1.0, dot(n, l) > 0.0) * sun * shade
             * pow(max(dot(n, h), 0.0), power) * material.specular.rgb * frame.glint_fit.x;
         body = body + glint;
         // Schlick's Fresnel from the material's reflectance facing the
