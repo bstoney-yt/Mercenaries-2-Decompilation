@@ -735,13 +735,15 @@ impl Mission {
         self.events.post(name);
     }
 
-    /// Posts a script event about the local player as the resident
-    /// script's network-event callback does for the PDA's opening and
-    /// shutting (`"PDA Open"` with `{ uPlayer = 1 }`): watches filter on
-    /// whose PDA it was.
-    pub fn post_for_player(&mut self, name: &str) {
+    /// Posts a script event as the resident script's network-event
+    /// callback does for the PDA: `"PDA Open"` with `{ uPlayer = 1 }` (the
+    /// watch filters on whose PDA it was), `"PDA Close"` with an empty
+    /// table (`for_player` false).
+    pub fn post_net_event(&mut self, name: &str, for_player: bool) {
         let data = self.host.lua().create_table().and_then(|t| {
-            t.set("uPlayer", 1)?;
+            if for_player {
+                t.set("uPlayer", 1)?;
+            }
             Ok(t)
         });
         match data {

@@ -384,10 +384,10 @@ impl MissionLink {
                 .filter(|n| n.as_str() == name)
                 .count();
             eprintln!("mission: posted {name:?}, {waiting} script events waiting for it");
-            if [support::PDA_OPEN, support::PDA_CLOSE].contains(&name) {
-                mission.post_for_player(name);
-            } else {
-                mission.post(name);
+            match name {
+                support::PDA_OPEN => mission.post_net_event(name, true),
+                support::PDA_CLOSE => mission.post_net_event(name, false),
+                _ => mission.post(name),
             }
         }
         self.lag += dt;
