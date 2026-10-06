@@ -18,14 +18,16 @@
 //! the layout gives them). The ammo the counters show is our own count (see
 //! [`RIFLE_CLIP`]): the play has no ammo of its own yet.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Mesh, TextureHandle, TextureOptions, pos2};
-use m2_assets::flash;
+use m2_assets::flash::{self, avm1};
 use m2_assets::font::FONT_TYPE;
 use m2_assets::gfx::{MOVIE_TYPE, movie_from_asset};
 use m2_assets::layer::LAYER_TYPE;
@@ -38,7 +40,7 @@ use m2_engine::{AssetSource, Install, WorldSettings};
 use m2_game::api::Object;
 use m2_game::events::{as_guid, guid_value};
 use m2_game::gui::Anchor;
-use m2_game::gui_runtime::{self, DrawItem, TextSpan};
+use m2_game::gui_runtime::{self, DrawItem, FlashArg, TextSpan};
 use m2_game::hud::ObjectiveMessage;
 use m2_game::mission::{GameData, Mission};
 use m2_math::glam::Vec3;
@@ -805,6 +807,10 @@ struct Thread {
     /// The PDA's screens as triangles (see [`pda_triangles`]): not read yet,
     /// or read (None if they could not be).
     pda: Option<Option<PdaScreens>>,
+    /// The archive's Flash movies and their fonts.
+    movies: Rc<RefCell<Movies>>,
+    /// The movies playing in the Flash widgets, by widget.
+    flash: BTreeMap<u32, FlashMovie>,
 }
 
 impl Thread {
@@ -819,6 +825,11 @@ impl Thread {
             .map_err(|e| e.to_string())
             .and_then(|mut w| GameData::read(&mut w).map_err(|e| e.to_string()))?;
         let mut assets = AssetSource::new(open()?).map_err(|e| e.to_string())?;
+        let movies = Movies {
+            assets: AssetSource::new(open()?).map_err(|e| e.to_string())?,
+            libraries: HashMap::new(),
+            fonts: None,
+        };
         let mut fonts = BTreeMap::new();
         for name in FONTS {
             match assets
@@ -881,6 +892,8 @@ impl Thread {
             zones: Vec::new(),
             roads: Vec::new(),
             pda: None,
+            movies: Rc::new(RefCell::new(movies)),
+            flash: BTreeMap::new(),
         })
     }
 
@@ -900,6 +913,7 @@ impl Thread {
         if let Err(e) = self.pose_wheel(state) {
             log.push(format!("wheel: {e}"));
         }
+        self.play_flash(dt, &mut log);
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
             return Output::Failed("no GUI runtime".into());
         };
@@ -1024,6 +1038,101 @@ impl Thread {
             }
         }
         Output::Frame { prims, images, log }
+    }
+
+    /// Plays the Flash widgets' movies `dt` seconds: starts the movies the
+    /// scripts set (`SetFlashSwfFile`, again on `RestartFlash`), hands
+    /// them the scripts' calls (`CallActionScriptCallback`), steps those
+    /// not paused, and hands their `fscommand`s back to the scripts.
+    fn play_flash(&mut self, dt: f64, log: &mut Vec<String>) {
+        let lua = self.mission.lua();
+        let Some(screen) = gui_runtime::screen(lua) else {
+            return;
+        };
+        let names = gui_runtime::script_names(lua);
+        let wanted: BTreeMap<u32, (String, u32, bool)> = screen
+            .borrow()
+            .widgets()
+            .filter(|(_, w)| w.kind == gui_runtime::Kind::Flash)
+            .filter_map(|(id, w)| {
+                let swf = movie_name(w.swf.as_deref()?);
+                // The radar's zones are drawn natively (see `Zone`).
+                (!NATIVE_MOVIES.contains(&swf.as_str()))
+                    .then_some((id, (swf, w.flash_restarts, w.flash_paused)))
+            })
+            .collect();
+        self.flash.retain(|id, m| {
+            wanted
+                .get(id)
+                .is_some_and(|(swf, restarts, _)| *swf == m.swf && *restarts == m.restarts)
+        });
+        for (&id, (swf, restarts, _)) in &wanted {
+            if self.flash.contains_key(&id) {
+                continue;
+            }
+            let lib = self.movies.borrow_mut().library(swf);
+            let Some(lib) = lib else {
+                log.push(format!("flash: widget {id}: no movie {swf}"));
+                // Not asked again until the scripts set it again.
+                continue;
+            };
+            let mut rt = avm1::Runtime::new(flash::Player::new(lib));
+            let movies = Rc::clone(&self.movies);
+            rt.set_loader(Box::new(move |name: &str| {
+                movies.borrow_mut().library(&movie_name(name))
+            }));
+            log.push(format!(
+                "flash: widget {id} ({}) plays {swf}",
+                names.get(&id).map_or("", String::as_str)
+            ));
+            self.flash.insert(
+                id,
+                FlashMovie {
+                    swf: swf.clone(),
+                    restarts: *restarts,
+                    rt,
+                },
+            );
+        }
+        if !self.flash.is_empty() {
+            self.movies.borrow_mut().fonts();
+        }
+        let calls = screen.borrow_mut().take_flash_calls();
+        for (id, name, args) in calls {
+            let Some(m) = self.flash.get_mut(&id) else {
+                continue;
+            };
+            let args: Vec<avm1::Value> = args
+                .into_iter()
+                .map(|a| match a {
+                    FlashArg::Nil => avm1::Value::Undefined,
+                    FlashArg::Bool(b) => avm1::Value::Bool(b),
+                    FlashArg::Number(n) => avm1::Value::Number(n),
+                    FlashArg::Text(t) => avm1::Value::Str(t.into()),
+                })
+                .collect();
+            m.rt.call(&name, &args);
+        }
+        let mut commands = Vec::new();
+        for (&id, m) in &mut self.flash {
+            if !wanted.get(&id).is_some_and(|w| w.2) {
+                m.rt.step(dt as f32);
+            }
+            m.rt.sync_text();
+            for line in m.rt.avm.log.drain(..) {
+                log.push(format!("flash {}: {line}", m.swf));
+            }
+            commands.extend(m.rt.take_commands().into_iter().map(|c| (id, c)));
+        }
+        for (id, (command, arg)) in commands {
+            match gui_runtime::flash_command(lua, id, &command, &arg) {
+                Ok(true) => {}
+                Ok(false) => log.push(format!(
+                    "flash: widget {id}: fscommand {command}({arg}) unheard"
+                )),
+                Err(e) => log.push(format!("flash: widget {id}: {command}: {e}")),
+            }
+        }
     }
 
     /// Fires the GUI events for what changed since the last state.
@@ -1431,8 +1540,13 @@ impl Thread {
                     minimap(&view, state, &self.zones, &self.roads, out, want);
                 }
             }
+            DrawItem::Flash { widget, rect, .. } => {
+                if let Some(m) = self.flash.get(widget) {
+                    flash_prims(m, &self.movies.borrow(), *rect, out, want);
+                }
+            }
             // Not drawn yet (see the module docs).
-            DrawItem::Flash { .. } | DrawItem::Movie { .. } => {}
+            DrawItem::Movie { .. } => {}
         }
     }
 }
@@ -1683,6 +1797,120 @@ const PDA_DIM: f32 = 0.85;
 /// opens on.
 const PDA_MOVIES: [&str; 2] = ["topbar", "map"];
 
+/// Flash movies the HUD draws natively instead.
+const NATIVE_MOVIES: [&str; 1] = ["minimap"];
+
+/// The movie of Scaleform's font library, which the movies' text fields
+/// take their fonts from.
+const FONT_LIBRARY: &str = "gfxfontlib";
+
+/// The archive's Flash movies, read once each.
+struct Movies {
+    assets: AssetSource<BufReader<File>>,
+    /// By name (see [`movie_name`]); None if missing or unreadable.
+    libraries: HashMap<String, Option<Rc<flash::Library>>>,
+    /// The font library's fonts, once read.
+    fonts: Option<flash::FontBook>,
+}
+
+impl Movies {
+    /// The movie called `name` (as [`movie_name`] gives it).
+    fn library(&mut self, name: &str) -> Option<Rc<flash::Library>> {
+        if let Some(l) = self.libraries.get(name) {
+            return l.clone();
+        }
+        let lib = self
+            .movie(name)
+            .map(|movie| Rc::new(flash::Library::new(&movie)));
+        self.libraries.insert(name.to_owned(), lib.clone());
+        lib
+    }
+
+    fn movie(&mut self, name: &str) -> Option<m2_assets::gfx::Movie> {
+        let data = self.assets.asset(name_hash(name), MOVIE_TYPE).ok()?;
+        movie_from_asset(&data).ok()
+    }
+
+    /// The font library's fonts, read the first time.
+    fn fonts(&mut self) -> &flash::FontBook {
+        if self.fonts.is_none() {
+            let mut book = flash::FontBook::default();
+            if let Some(movie) = self.movie(FONT_LIBRARY) {
+                book.add_movie(&movie);
+            }
+            self.fonts = Some(book);
+        }
+        self.fonts.get_or_insert_with(flash::FontBook::default)
+    }
+}
+
+/// A movie a Flash widget plays.
+struct FlashMovie {
+    swf: String,
+    /// The widget's restart count when started.
+    restarts: u32,
+    rt: avm1::Runtime,
+}
+
+/// A movie's name as the archive knows it: a file name or path
+/// (`ui/fanfare_contract.swf`) without folders and extension, lower case.
+fn movie_name(file: &str) -> String {
+    let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    base.split('.').next().unwrap_or(base).to_ascii_lowercase()
+}
+
+/// A movie's triangles stretched over the widget's box `rect` (screen
+/// points), as Scaleform fits a movie to its widget; each a quad with its
+/// last corner doubled.
+fn flash_prims(
+    m: &FlashMovie,
+    movies: &Movies,
+    rect: [f32; 4],
+    out: &mut Vec<Prim>,
+    want: &mut Vec<u32>,
+) {
+    let [mw, mh] = m.rt.player.lib.size;
+    if mw <= 0.0 || mh <= 0.0 {
+        return;
+    }
+    let matrix = flash::Matrix {
+        a: (rect[2] - rect[0]) / mw,
+        b: 0.0,
+        c: 0.0,
+        d: (rect[3] - rect[1]) / mh,
+        tx: rect[0],
+        ty: rect[1],
+    };
+    let empty = flash::FontBook::default();
+    let fonts = movies.fonts.as_ref().unwrap_or(&empty);
+    let mut triangles = Vec::new();
+    m.rt.player.draw(&matrix, fonts, &mut triangles);
+    triangle_prims(&triangles, out, want);
+}
+
+/// Triangles as prims (quads with the last corner doubled), asking for
+/// their textures.
+fn triangle_prims(triangles: &[flash::Triangle], out: &mut Vec<Prim>, want: &mut Vec<u32>) {
+    let mut textures: HashMap<&str, u32> = HashMap::new();
+    for t in triangles {
+        let texture = t.texture.as_deref().map(|name| {
+            *textures.entry(name).or_insert_with(|| {
+                let hash = name_hash(name);
+                want.push(hash);
+                hash
+            })
+        });
+        let [a, b, c] = t.corners;
+        let [ua, ub, uc] = t.uv;
+        out.push(Prim {
+            texture,
+            corners: [a, b, c, c],
+            uv: [ua, ub, uc, uc],
+            colour: t.colour,
+        });
+    }
+}
+
 /// The PDA's screens as triangles in the movies' pixels (all of them
 /// `size`), first frames only: nothing runs their ActionScript yet, so the
 /// map shows as laid out (unzoomed, no blips) and the tabs unlit.
@@ -1732,24 +1960,15 @@ fn pda_prims(screens: &PdaScreens, screen: [f32; 2], out: &mut Vec<Prim>, want: 
         0.0,
     ));
     let at = |[x, y]: [f32; 2]| [left + x * w / mw, y * h / mh];
-    let mut textures: HashMap<&str, u32> = HashMap::new();
-    for t in &screens.triangles {
-        let texture = t.texture.as_deref().map(|name| {
-            *textures.entry(name).or_insert_with(|| {
-                let hash = name_hash(name);
-                want.push(hash);
-                hash
-            })
-        });
-        let [a, b, c] = t.corners.map(at);
-        let [ua, ub, uc] = t.uv;
-        out.push(Prim {
-            texture,
-            corners: [a, b, c, c],
-            uv: [ua, ub, uc, uc],
-            colour: t.colour,
-        });
-    }
+    let placed: Vec<flash::Triangle> = screens
+        .triangles
+        .iter()
+        .map(|t| flash::Triangle {
+            corners: t.corners.map(at),
+            ..t.clone()
+        })
+        .collect();
+    triangle_prims(&placed, out, want);
 }
 
 /// The island's roads: each `Road` entity's centreline (see
@@ -2429,6 +2648,13 @@ mod tests {
     /// where its art points.
     fn arc(heading: f32, from: Vec3) -> f32 {
         (direction(Some(Vec3::ZERO), Some(from)) + heading).rem_euclid(360.0)
+    }
+
+    #[test]
+    fn movies_are_named_without_folders_or_extensions() {
+        assert_eq!(movie_name("fanfare_contract"), "fanfare_contract");
+        assert_eq!(movie_name("UI/Fanfare_Mission.swf"), "fanfare_mission");
+        assert_eq!(movie_name("ui\\map.gfx"), "map");
     }
 
     #[test]
