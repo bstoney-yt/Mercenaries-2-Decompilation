@@ -138,7 +138,7 @@ impl Traffic {
             })
             .filter_map(|t| {
                 let d = flat(t.position - focus).length();
-                (d <= t.spawner.active_radius).then_some((d, t.entity))
+                (d <= t.spawner.reach()).then_some((d, t.entity))
             })
             .collect();
         due.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -300,7 +300,7 @@ impl Traffic {
                 t.position.y,
                 t.position.z,
                 t.layer.map_or("static".to_owned(), |l| format!("{l:08x}")),
-                t.spawner.active_radius,
+                t.spawner.reach(),
                 t.spawner.seconds_per_cycle,
                 t.route.len(),
                 t.haste,
