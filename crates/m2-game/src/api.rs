@@ -148,6 +148,13 @@ pub enum Command {
     },
     /// Stop line `id` (`VO.Cancel`).
     Hush(u32),
+    /// Play a sound cue by name (`Sound.CueSound`):
+    /// `"ui_HUD_Objective_New"`; `at` the object it sounds from (`None`:
+    /// flat, as the interface's sounds).
+    CueSound {
+        at: Option<u32>,
+        cue: String,
+    },
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -991,6 +998,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         if let Some(Value::String(key)) = a.first() {
             w.commands
                 .push(Command::RemoveFreebie(key.to_string_lossy()));
+        }
+        values([])
+    })?;
+
+    let sound = lib("Sound")?;
+    add(&sound, "CueSound", |w, _, a| {
+        if let Some(Value::String(cue)) = a.get(1) {
+            w.commands.push(Command::CueSound {
+                at: id(a.first()).filter(|&g| g != 0),
+                cue: cue.to_string_lossy(),
+            });
         }
         values([])
     })?;
