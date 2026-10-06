@@ -71,8 +71,9 @@ struct Frame {
     // 3: the sun's colour / 2, 4: the deck tint / 2, 5: the cloud after
     // the air, 6: cover as grey), z: the sea mirrors the cloud deck too
     sky_fit: vec4<f32>,
-    // Trial scales on the sea's glint: x strength, y power (0: the
-    // material's), z least share of each wave kept however far
+    // Trial scales on the sea's glint: x strength, y power (0: the dusk
+    // power), z least share of each wave kept however far, w the night
+    // ramp's alpha
     glint_fit: vec4<f32>,
 };
 
@@ -369,6 +370,9 @@ fn environment(r: vec3<f32>) -> vec3<f32> {
 // code.
 const CLOUD_HEIGHT: f32 = 1500.0;
 
+// The sea glint's power before night falls (see `fs_main`): fitted.
+const DUSK_GLINT_POWER: f32 = 20.0;
+
 // The cloud deck's own light along the unit ray r where the cloud there
 // has mass `mass` (0 to 1): sunlight through the game's phase, darkened by
 // the mass, in the record's cloud tone.
@@ -621,9 +625,17 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
             opacity = ramp.a;
         }
         // A Blinn-Phong glint in the sun's colour, added to the body
-        // before the reflection, as the game's.
+        // before the reflection, as the game's. Before night falls it
+        // spreads into a field of glitter: the PC clip's dusk sea glares
+        // over a broad band (round DQ: power 20 matched its share of
+        // bright pixels, L159 against 144), while at night the material's
+        // power keeps the near sea dark. The dusk power and the fade by
+        // the night ramp (full at 0.3, as the beams) are inferred.
+        var power = mix(DUSK_GLINT_POWER, material.specular.a, clamp(frame.glint_fit.w / 0.3, 0.0, 1.0));
+        if frame.glint_fit.y > 0.0 {
+            power = frame.glint_fit.y;
+        }
         let h = normalize(l + view);
-        let power = select(material.specular.a, frame.glint_fit.y, frame.glint_fit.y > 0.0);
         let glint = select(0.0, 1.0, dot(n, l) > 0.0) * surface_sun() * shade
             * pow(max(dot(n, h), 0.0), power) * material.specular.rgb * frame.glint_fit.x;
         body = body + glint;
