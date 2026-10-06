@@ -1026,6 +1026,21 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     for name in ["AddSequence", "RemoveSequence"] {
         add(&vo, name, |_, _, _| values([]))?;
     }
+    // Priorities the sequences copy at load and compare: a new sequence
+    // whose number is no higher than the running one's cuts it off, so the
+    // most important is lowest. Only the order is known, not the values.
+    for (i, name) in [
+        "PRIORITY_CINEMATIC",
+        "PRIORITY_BRIEFING",
+        "PRIORITY_SCRIPTED_CONTRACT",
+        "PRIORITY_SCRIPTED_BOUNTIES",
+        "PRIORITY_SCRIPTED_FREEPLAY",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        vo.set(name, i as i64)?;
+    }
 
     // Developer switches (skip to a mission, force a briefing): all off.
     let sys = lib("Sys")?;

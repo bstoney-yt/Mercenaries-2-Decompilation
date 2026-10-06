@@ -803,6 +803,7 @@ mod tests {
             VO.Cue(0, "A", second, {}, 1, true)
             VO.Cue(0, "C", function() cancelled = true end)
             VO.Cancel(0, "C", true)
+            ordered = VO.PRIORITY_CINEMATIC < VO.PRIORITY_SCRIPTED_CONTRACT
             "#,
             "test",
         )
@@ -828,6 +829,7 @@ mod tests {
         let g = m.host.lua().globals();
         assert_eq!(g.raw_get::<String>("heard").unwrap(), "complete");
         assert_eq!(g.raw_get::<Option<bool>>("cancelled").unwrap(), None);
+        assert!(g.raw_get::<bool>("ordered").unwrap());
     }
 
     #[test]
