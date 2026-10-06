@@ -446,7 +446,23 @@ impl Mission {
                 first_lines(&e.error.to_string())
             ));
         }
+        let ended = crate::vo::update(&self.world, self.host.lua(), now);
+        for (cue, error) in ended {
+            self.log.push(match error {
+                None => format!("  t={now:.1} line {cue} ended"),
+                Some(e) => format!(
+                    "  t={now:.1} line {cue} ended; callback: {}",
+                    first_lines(&e.to_string())
+                ),
+            });
+        }
         self.settle(&format!("t={now:.1}"));
+    }
+
+    /// The game is playing scripted line `id` (a [`Command::Say`]), which
+    /// lasts `seconds`.
+    pub fn line_length(&mut self, id: u32, seconds: f64) {
+        self.world.borrow_mut().vo.set_length(id, seconds);
     }
 
     /// Game time so far.
@@ -776,6 +792,42 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn a_conversation_moves_on_as_each_line_ends() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            local function second(state) VO.Cue(0, "B", function() heard = state end) end
+            VO.Cue(0, "A", second, {}, 1, true)
+            VO.Cue(0, "C", function() cancelled = true end)
+            VO.Cancel(0, "C", true)
+            "#,
+            "test",
+        )
+        .unwrap();
+        let say = |id, cue: &str| Command::Say {
+            id,
+            speaker: None,
+            cue: cue.into(),
+        };
+        assert_eq!(
+            m.take_commands(),
+            [say(1, "A"), say(2, "C"), Command::Hush(2)]
+        );
+        m.tick(0.1);
+        m.line_length(1, 1.0);
+        m.tick(0.5);
+        assert!(m.take_commands().is_empty());
+        m.tick(0.6);
+        assert_eq!(m.take_commands(), [say(3, "B")]);
+        for _ in 0..50 {
+            m.tick(0.1);
+        }
+        let g = m.host.lua().globals();
+        assert_eq!(g.raw_get::<String>("heard").unwrap(), "complete");
+        assert_eq!(g.raw_get::<Option<bool>>("cancelled").unwrap(), None);
     }
 
     #[test]

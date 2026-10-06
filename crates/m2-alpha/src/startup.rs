@@ -105,7 +105,7 @@ impl Startup {
 
 /// Runs the start-up scripts and keeps the layers they loaded.
 fn run(data: GameData) -> Result<StartupLayers, m2_game::mission::MissionError> {
-    let mut mission = Mission::new(data, "Mattias", [0.0; 3])?;
+    let mut mission = Mission::new(data, crate::mission::HERO, [0.0; 3])?;
     mission.start();
     let mut t = 0.0;
     while t < SETTLE {

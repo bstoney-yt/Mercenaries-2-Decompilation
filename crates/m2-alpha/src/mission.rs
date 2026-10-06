@@ -49,6 +49,13 @@ use crate::support::{FALLBACK_AFTER, Impact, Kind};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
+/// A scripted voice line to play: the mission's id for it, its cue, and
+/// where it is said (`None`: flat).
+pub type ScriptLine = (u32, String, Option<Vec3>);
+
+/// Who the scripts take the player for: Jennifer, whose model and voice
+/// the alpha plays (the scripts pick her replies on the radio by this).
+pub const HERO: &str = "Jennifer";
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -149,6 +156,9 @@ pub struct MissionLink {
     speed: f32,
     /// The keys tutorial lines name.
     keys: crate::input::Bindings,
+    /// Scripted voice lines to play, and lines to stop.
+    lines: Vec<ScriptLine>,
+    hushed: Vec<u32>,
 }
 
 /// The scripts' vehicles in play.
@@ -231,6 +241,8 @@ impl MissionLink {
             completed: None,
             speed: 0.0,
             keys: Default::default(),
+            lines: Vec::new(),
+            hushed: Vec::new(),
         }
     }
 
@@ -459,6 +471,18 @@ impl MissionLink {
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
+                match &c {
+                    Command::Say { id, speaker, cue } => {
+                        // The player's own lines (and the radio) are flat.
+                        let at = speaker.filter(|&g| g != PLAYER).and_then(|g| {
+                            let w = mission.world().borrow();
+                            w.objects.get(&g).map(|o| Vec3::from_array(o.position))
+                        });
+                        self.lines.push((*id, cue.clone(), at));
+                    }
+                    Command::Hush(id) => self.hushed.push(*id),
+                    _ => {}
+                }
                 support_item(game, &c);
                 fly(game, mission, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
@@ -488,7 +512,7 @@ impl MissionLink {
             .player
             .as_ref()
             .map_or([0.0; 3], |p| p.character.position.to_array());
-        match Mission::new(data, "Mattias", at) {
+        match Mission::new(data, HERO, at) {
             Ok(mut mission) => {
                 mission.fly_deliveries();
                 for (name, code) in std::mem::take(&mut self.drivers) {
@@ -518,6 +542,22 @@ impl MissionLink {
         eprintln!("mission: {why}");
         self.write([why.clone()]);
         self.state = State::Failed(why);
+    }
+
+    /// Scripted voice lines to play (id, cue, where said) and to stop,
+    /// since the last call.
+    pub fn take_lines(&mut self) -> (Vec<ScriptLine>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.lines),
+            std::mem::take(&mut self.hushed),
+        )
+    }
+
+    /// Scripted line `id` lasts `seconds`.
+    pub fn line_length(&mut self, id: u32, seconds: f32) {
+        if let State::Running(m) = &mut self.state {
+            m.line_length(id, f64::from(seconds));
+        }
     }
 
     /// The scripts are running (not still loading, not failed).

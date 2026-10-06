@@ -7,3 +7,4 @@ pub mod layers;
 pub mod library;
 pub mod mission;
 pub mod script;
+pub mod vo;

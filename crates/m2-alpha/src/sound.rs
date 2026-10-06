@@ -160,6 +160,10 @@ pub struct GameAudio {
     speaking: Vec<Instant>,
     /// When Jennifer may speak again.
     quiet_until: Instant,
+    /// Scripted lines playing, by the mission's id for them.
+    lines: HashMap<u32, VoiceId>,
+    /// Scripted lines stopped before they were decoded.
+    hushed: HashSet<u32>,
     /// The sounds the clips' events play, once read (on a thread).
     clip_sounds: Option<ClipSounds>,
     clip_sounds_loading: Option<Receiver<ClipSounds>>,
@@ -239,8 +243,8 @@ impl ClipSounds {
 }
 
 /// A decoded voice line: the sound, where it is said (`None` flat: the
-/// player's own), its falloff and volume.
-type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32);
+/// player's own), its falloff and volume, and the scripted line it is.
+type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32, Option<u32>);
 
 /// Voice sets, by the name hash of their name: two of Venezuelan army
 /// soldiers, `vo_vzSoldier_01` and `_02` (so not everyone sounds alike),
@@ -683,6 +687,8 @@ impl GameAudio {
                 rx
             }),
             said: channel(),
+            lines: HashMap::new(),
+            hushed: HashSet::new(),
             speaking: Vec::new(),
             quiet_until: Instant::now(),
             clip_sounds: None,
@@ -767,7 +773,7 @@ impl GameAudio {
             near: line.min_distance.max(1.0),
             far: line.max_distance.max(line.min_distance + 1.0),
         };
-        self.speak(voices, line.stream, at, falloff, line.volume);
+        self.speak(voices, line.stream, at, falloff, line.volume, None);
     }
 
     /// Jennifer says something about `remark`, now and then: a cue from
@@ -811,7 +817,65 @@ impl GameAudio {
             .map_or(0.0, |s| s.seconds());
         self.quiet_until = now + Duration::from_secs_f32(seconds + REMARK_GAP);
         eprintln!("voice: Jennifer, {remark:?}, stream {stream}");
-        self.speak(voices, stream, None, Falloff::default(), volume);
+        self.speak(voices, stream, None, Falloff::default(), volume, None);
+    }
+
+    /// Plays the scripts' line `cue` (`Fiona-In-Mission-Contract-Vz01-146`,
+    /// found by its name hash in any voice set) as line `id`: flat, or
+    /// where `at` is if the line is heard from where it is said. Returns
+    /// how long it lasts, or `None` if it cannot be played.
+    pub fn say(&mut self, id: u32, cue: &str, at: Option<Vec3>) -> Option<f32> {
+        let voices = self.voices.clone()?;
+        let hash = m2_assets::name_hash(cue);
+        let (streams, volume, near, far, positional) = voices.sets.iter().find_map(|t| {
+            let (volume, near, far, positional) = t
+                .lines
+                .iter()
+                .find(|l| l.cue == hash)
+                .map(|l| (l.volume, l.min_distance, l.max_distance, l.is_positional()))
+                .or_else(|| {
+                    t.groups
+                        .iter()
+                        .find(|g| g.cue == hash)
+                        .map(|g| (g.volume, g.min_distance, g.max_distance, g.is_positional()))
+                })?;
+            Some((t.streams(hash)?, volume, near, far, positional))
+        })?;
+        if streams.is_empty() {
+            return None;
+        }
+        let pick = ((self.random() * streams.len() as f32) as usize).min(streams.len() - 1);
+        let stream = streams[pick];
+        let seconds = voices.index.streams.get(stream as usize)?.seconds();
+        let falloff = Falloff {
+            near: near.max(1.0),
+            far: far.max(near + 1.0),
+        };
+        // Jennifer keeps quiet while she is spoken to.
+        let now = Instant::now();
+        self.quiet_until = self
+            .quiet_until
+            .max(now + Duration::from_secs_f32(seconds + REMARK_GAP));
+        eprintln!("voice: line {cue}, stream {stream}, {seconds:.1} s");
+        self.speak(
+            voices,
+            stream,
+            at.filter(|_| positional),
+            falloff,
+            volume,
+            Some(id),
+        );
+        Some(seconds)
+    }
+
+    /// Stops scripted line `id`.
+    pub fn hush(&mut self, id: u32) {
+        match self.lines.remove(&id) {
+            Some(voice) => self.out.with(|m| m.stop(voice)),
+            None => {
+                self.hushed.insert(id);
+            }
+        }
     }
 
     /// Decodes voice stream `stream` on a thread and plays it at `at`.
@@ -822,6 +886,7 @@ impl GameAudio {
         at: Option<Vec3>,
         falloff: Falloff,
         volume: f32,
+        line: Option<u32>,
     ) {
         let Some(seconds) = voices
             .index
@@ -835,7 +900,7 @@ impl GameAudio {
             .push(Instant::now() + Duration::from_secs_f32(seconds + 0.3));
         let tx = self.said.0.clone();
         std::thread::spawn(move || match voices.decode(stream as usize) {
-            Ok(b) => drop(tx.send((b, at, falloff, volume.clamp(0.0, 2.0)))),
+            Ok(b) => drop(tx.send((b, at, falloff, volume.clamp(0.0, 2.0), line))),
             Err(e) => eprintln!("voice line {stream}: {e}"),
         });
     }
@@ -1070,7 +1135,10 @@ impl GameAudio {
             self.voices = Some(Arc::new(v));
             self.voices_loading = None;
         }
-        while let Ok((buffer, at, falloff, gain)) = self.said.1.try_recv() {
+        while let Ok((buffer, at, falloff, gain, line)) = self.said.1.try_recv() {
+            if line.is_some_and(|l| self.hushed.remove(&l)) {
+                continue;
+            }
             let play = match at {
                 Some(at) => Play {
                     falloff,
@@ -1078,8 +1146,13 @@ impl GameAudio {
                 },
                 None => Play::flat(buffer),
             };
-            self.out.with(|m| m.play(play.gain(gain)));
+            let voice = self.out.with(|m| m.play(play.gain(gain)));
+            if let Some(l) = line {
+                self.lines.insert(l, voice);
+            }
         }
+        self.lines
+            .retain(|_, v| self.out.with(|m| m.is_playing(*v)));
         while let Ok((which, buffer)) = self.decoded.1.try_recv() {
             let id = self.out.with(|m| match which {
                 "music" => m.play(Play::flat(buffer).gain(0.6)),

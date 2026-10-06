@@ -3311,6 +3311,15 @@ impl Running {
         );
         if let Some(m) = &mut self.mission {
             m.tick(&mut self.game, TICK.as_secs_f32());
+            let (lines, hushed) = m.take_lines();
+            for (id, cue, at) in lines {
+                if let Some(seconds) = self.audio.say(id, &cue, at) {
+                    m.line_length(id, seconds);
+                }
+            }
+            for id in hushed {
+                self.audio.hush(id);
+            }
         }
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
