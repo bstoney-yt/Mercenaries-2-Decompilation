@@ -48,6 +48,8 @@ pub struct Traffic {
     next: HashMap<u32, (usize, bool)>,
     /// Spawners whose vehicle the player has driven: it is hers now.
     taken: HashSet<u32>,
+    /// Why a spawner in reach sent nothing out, said once each.
+    skipped: HashMap<u32, &'static str>,
     rng: u32,
 }
 
@@ -127,20 +129,23 @@ impl Traffic {
         if room == [0, 0] {
             return;
         }
-        let mut due: Vec<(f32, u32)> = self
-            .points
-            .values()
-            .filter(|t| {
-                !out.contains(&t.entity)
-                    && !self.loading.contains(&t.entity)
-                    && self.wait.get(&t.entity).is_none_or(|&w| w <= 0.0)
-                    && layer_in(t.layer)
-            })
-            .filter_map(|t| {
-                let d = flat(t.position - focus).length();
-                (d <= t.spawner.reach()).then_some((d, t.entity))
-            })
-            .collect();
+        let mut due: Vec<(f32, u32)> = Vec::new();
+        let mut skip: Vec<(u32, &'static str)> = Vec::new();
+        for t in self.points.values() {
+            let d = flat(t.position - focus).length();
+            if d > t.spawner.reach()
+                || out.contains(&t.entity)
+                || self.loading.contains(&t.entity)
+                || self.wait.get(&t.entity).is_some_and(|&w| w > 0.0)
+            {
+                continue;
+            }
+            if layer_in(t.layer) {
+                due.push((d, t.entity));
+            } else {
+                skip.push((t.entity, "its layer isn't in"));
+            }
+        }
         due.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (_, entity) in due {
             if room == [0, 0] {
@@ -153,10 +158,12 @@ impl Traffic {
             let roll = self.roll();
             let t = &self.points[&entity];
             let Some(name) = pick(&t.vehicles, roll) else {
+                skip.push((entity, "nothing on its list"));
                 continue;
             };
             let models = models(name, world, catalogue);
             if models.is_empty() {
+                skip.push((entity, "no model for what it picked"));
                 continue;
             }
             let forward = t.rotation * Vec3::Z;
@@ -169,6 +176,15 @@ impl Traffic {
             self.wait.remove(&entity);
             self.next.remove(&entity);
             room[share] -= 1;
+        }
+        for (entity, why) in skip {
+            if self.skipped.insert(entity, why) != Some(why) {
+                let t = &self.points[&entity];
+                eprintln!(
+                    "traffic {entity:#x} ({}) in reach but not out: {why}; list {:?}",
+                    t.name, t.vehicles
+                );
+            }
         }
     }
 
@@ -290,7 +306,15 @@ impl Traffic {
                 .length()
                 .total_cmp(&flat(b.position - focus).length())
         });
-        for t in near.into_iter().take(5) {
+        // The five nearest, and the five nearest with a path.
+        let pathed = near.iter().filter(|t| t.route.len() >= 2).take(5);
+        let mut shown: Vec<&TrafficPoint> = near.iter().take(5).copied().collect();
+        for t in pathed {
+            if !shown.iter().any(|s| s.entity == t.entity) {
+                shown.push(t);
+            }
+        }
+        for t in shown {
             lines.push(format!(
                 "  spawner {:#x} {} {:.0} m away at ({:.0}, {:.0}, {:.0}), layer {}, radius {:.0}, every {:.0} s, {} route points, haste {:?}, {:?}",
                 t.entity,
@@ -306,6 +330,9 @@ impl Traffic {
                 t.haste,
                 t.vehicles,
             ));
+            if let Some(why) = self.skipped.get(&t.entity) {
+                lines.push(format!("    not out: {why}"));
+            }
         }
         lines
     }
