@@ -21,6 +21,11 @@ use crate::props::Props;
 /// state layers stay well below.
 const ADOPTED: u32 = 0xa000_0000;
 
+/// The key placed object `i` is put up under as a prop.
+pub fn key(i: usize) -> u32 {
+    ADOPTED | i as u32
+}
+
 /// Whether a prop's key is one of the island's placed objects put up to
 /// come down, rather than a state layer's entity.
 pub fn adopted(key: u32) -> bool {
@@ -101,7 +106,7 @@ impl Destruction {
                  health, last {hit:.0} at {d:.1} m",
                 o.model, o.template, o.position, taken, durability.health
             );
-            if props.adopt(install, ADOPTED | i as u32, &o) {
+            if props.adopt(install, key(i), &o) {
                 self.falling.push((i, blast.at));
             } else {
                 world.destroyed.insert(i);
@@ -114,7 +119,7 @@ impl Destruction {
     /// down, dust rising where its break-up names points.
     pub fn update(&mut self, world: &mut World, props: &mut Props, combat: &mut Combat) {
         self.falling.retain(|&(i, blast)| {
-            let key = ADOPTED | i as u32;
+            let key = key(i);
             match props.get(key) {
                 Some((_, true)) => {}
                 Some((_, false)) => return true,

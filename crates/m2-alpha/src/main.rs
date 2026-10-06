@@ -3240,10 +3240,15 @@ fn demolish_for_screenshot(
                 .cast_ray(eye, to, to.length())
                 .is_none_or(|h| h.0 > to.length() - (hi - lo).length() * 0.5)
         });
-    eprintln!("demolish: standing at {stand:.1?}");
+    // On the ground there, which needn't be as high as the building's foot.
+    let stand = stand.unwrap_or(at.with_y(o.position.y) + toward.normalize_or(Vec3::X) * far);
+    let stand = world
+        .physics
+        .island_below(stand.with_y(stand.y + 200.0), 400.0)
+        .map_or(stand, |g| stand.with_y(g));
+    eprintln!("demolish: standing at {stand:.1}");
     if let Some(p) = game.scene.player.as_mut() {
-        let toward = toward.try_normalize().unwrap_or(Vec3::X);
-        p.character.position = stand.unwrap_or(at + toward * far) + Vec3::Y * 2.0;
+        p.character.position = stand + Vec3::Y * 2.0;
         p.character.velocity = Vec3::ZERO;
         p.landed = false;
     }
@@ -3266,6 +3271,13 @@ fn demolish_for_screenshot(
     game.step(aim(false, Some(Weapon::Rpg)), tick);
     render(backend, game, fov, aspect, None)?;
     write_ppm(backend, &picture("before"))?;
+    eprintln!(
+        "demolish: player at {:.1?}, landed {:?}, on foot {}, weapon {:?}",
+        game.scene.player.as_ref().map(|p| p.character.position),
+        game.scene.player.as_ref().map(|p| p.landed),
+        game.on_foot,
+        game.combat.weapon
+    );
     let mut fired = 0;
     while fired < rockets && !game.destruction.destroyed.contains(&i) {
         for _ in 0..30 {
@@ -3301,10 +3313,19 @@ fn demolish_for_screenshot(
         render(backend, game, fov, aspect, None)?;
         write_ppm(backend, &picture(name))?;
         eprintln!(
-            "demolish: {name}: taken {}, {}",
+            "demolish: {name}: taken {}, {}; player at {:.1?}",
             game.scene.world.as_ref().is_some_and(|w| w.is_taken(i)),
-            game.scene.props.counts()
+            game.scene.props.counts(),
+            game.scene.player.as_ref().map(|p| p.character.position)
         );
+        if let Some(world) = &game.scene.world
+            && let Some(report) = game
+                .scene
+                .props
+                .pieces_report(&world.physics, destruct::key(i))
+        {
+            eprintln!("demolish: {name}: pieces {report}");
+        }
     }
     Ok(())
 }
