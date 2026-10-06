@@ -634,6 +634,9 @@ pub struct GameHud {
     pending: Vec<(u32, Option<Image>)>,
     /// Textures by asset hash (`None`: missing in the archive).
     textures: HashMap<u32, Option<TextureHandle>>,
+    /// One white pixel, for the solid quads (fills, fades). egui's own
+    /// white texel (`WHITE_UV`) left them undrawn in pictures.
+    white: Option<TextureHandle>,
     /// The last objective message seen, to tell new ones.
     last_message: Option<ObjectiveMessage>,
     /// The last of the mission's HUD calls passed on.
@@ -671,6 +674,7 @@ impl GameHud {
             prims: Vec::new(),
             pending: Vec::new(),
             textures: HashMap::new(),
+            white: None,
             last_message: None,
             last_call: 0,
             last_time: None,
@@ -797,6 +801,13 @@ impl GameHud {
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
+        if self.white.is_none() {
+            self.white = Some(ctx.load_texture(
+                "hud white",
+                egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255; 4]),
+                TextureOptions::NEAREST,
+            ));
+        }
         for (hash, image) in self.pending.drain(..) {
             let handle = image.map(|i| {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -824,7 +835,10 @@ impl GameHud {
                     // Missing, or not uploaded yet.
                     _ => continue,
                 },
-                None => egui::TextureId::default(),
+                None => match &self.white {
+                    Some(t) => t.id(),
+                    None => continue,
+                },
             };
             if mesh.texture_id != texture && !mesh.is_empty() {
                 painter.add(std::mem::take(&mut mesh));
@@ -836,8 +850,7 @@ impl GameHud {
             for (c, uv) in p.corners.iter().zip(&p.uv) {
                 let uv = match p.texture {
                     Some(_) => pos2(uv[0], uv[1]),
-                    // The font atlas's white texel.
-                    None => egui::epaint::WHITE_UV,
+                    None => pos2(0.5, 0.5),
                 };
                 mesh.vertices.push(egui::epaint::Vertex {
                     pos: pos2(c[0], c[1]),
