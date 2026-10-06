@@ -17,6 +17,15 @@ pub struct Config {
     pub camera: CameraConfig,
     pub world: WorldConfig,
     pub keys: Bindings,
+    /// Changes from the original game, each off unless switched on.
+    pub enhanced: EnhancedConfig,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnhancedConfig {
+    /// Smarter enemy soldiers (`enabled = true` to switch on).
+    pub smarter_ai: crate::npc::SmarterAi,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -157,6 +166,23 @@ mod tests {
         assert!(!config.window.vsync);
         assert_eq!(config.window.width, 1600);
         assert_eq!(config.keys, Bindings::default());
+    }
+
+    #[test]
+    fn the_smarter_soldiers_are_off_unless_switched_on() {
+        assert!(!Config::default().enhanced.smarter_ai.enabled);
+        let config: Config = toml::from_str(
+            r#"
+            [enhanced.smarter_ai]
+            enabled = true
+            callout_range = 60.0
+            "#,
+        )
+        .unwrap();
+        let smart = config.enhanced.smarter_ai;
+        assert!(smart.enabled);
+        assert_eq!(smart.callout_range, 60.0);
+        assert!(smart.flank, "the rest keep their defaults");
     }
 
     #[test]
