@@ -24,9 +24,13 @@
 //!   --pad good|bad|none  how the player answers the hijack's prompts
 //!                      (default good: the right button at once; bad:
 //!                      the wrong one; none: never)
-//!   --action-seconds n how long each character action lasts before the
-//!                      game reports it done (default 2; the clips'
-//!                      real lengths are the game's)
+//!   --action-seconds n how long a character's action lasts when the
+//!                      vehicle plays no hijack clip alongside it (default
+//!                      2); with one, the action lasts as long as that
+//!                      clip (read from the hijack blocks; inferred: the
+//!                      people's clips are cut to the vehicle's)
+//!   --tap-rate n       presses a second when the prompt is to tap or
+//!                      alternate (default 9)
 //! ```
 //!
 //! Every module some script loads is imported first, then every other
@@ -36,6 +40,7 @@
 //! script's environment. The player has the label of its name in lower
 //! case (`mattias`), which is how scripts tell the heroes apart.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::process::ExitCode;
@@ -60,6 +65,7 @@ struct Options {
     hijack: Option<(u32, String, String)>,
     pad: String,
     action_seconds: f64,
+    tap_rate: f64,
 }
 
 fn main() -> ExitCode {
@@ -92,6 +98,7 @@ fn options() -> Result<Options> {
         start: true,
         pad: "good".into(),
         action_seconds: 2.0,
+        tap_rate: 9.0,
         ..Options::default()
     };
     let mut args = std::env::args().skip(1);
@@ -137,6 +144,7 @@ fn options() -> Result<Options> {
             }
             "--pad" => o.pad = value()?,
             "--action-seconds" => o.action_seconds = value()?.parse()?,
+            "--tap-rate" => o.tap_rate = value()?.parse()?,
             _ if o.wad.is_empty() && !a.starts_with("--") => o.wad = a,
             _ => return Err(format!("unknown argument {a}").into()),
         }
@@ -161,6 +169,11 @@ fn print(mission: &mut Mission) {
 fn run(o: &Options) -> Result<()> {
     let mut wad = WadArchive::open(BufReader::new(File::open(&o.wad)?))?;
     let data = GameData::read(&mut wad)?;
+    let clips = if o.hijack.is_some() {
+        hijack_clips(&mut wad)?
+    } else {
+        HashMap::new()
+    };
     let mut mission = Mission::new(data, &o.hero, o.at)?;
     for part in &o.layers {
         println!("preloaded {}", mission.preload(part).join(", "));
@@ -182,7 +195,14 @@ fn run(o: &Options) -> Result<()> {
     }
 
     let mut hijack = match &o.hijack {
-        Some((script, vehicle, crew)) => Some(Hijack::start(&mut mission, *script, vehicle, crew)?),
+        Some((script, vehicle, crew)) => Some(Hijack::start(
+            &mut mission,
+            *script,
+            vehicle,
+            crew,
+            clips,
+            o,
+        )?),
         None => None,
     };
 
@@ -198,11 +218,11 @@ fn run(o: &Options) -> Result<()> {
             println!("t={now:.1} player moved to {at:?}");
         }
         if let Some(h) = &mut hijack {
-            h.pad(&mut mission, &o.pad, now);
+            h.pad(&mut mission, now);
         }
         mission.tick(o.step);
         match &mut hijack {
-            Some(h) => h.follow(&mut mission, o.action_seconds, now),
+            Some(h) => h.follow(&mut mission, now),
             None => print(&mut mission),
         }
     }
@@ -225,6 +245,13 @@ fn run(o: &Options) -> Result<()> {
 struct Hijack {
     /// Characters' actions and when they end.
     actions: Vec<(u32, f64)>,
+    /// The hijack blocks' clips' lengths, seconds, by name hash.
+    clips: HashMap<u32, f64>,
+    pad: String,
+    action_seconds: f64,
+    tap_rate: f64,
+    /// When the pad last tapped.
+    tapped: f64,
     /// Prompts already answered, by when they showed (seconds left).
     answered: Vec<(String, u32)>,
     /// The button last tapped (alternating).
@@ -232,7 +259,14 @@ struct Hijack {
 }
 
 impl Hijack {
-    fn start(mission: &mut Mission, script: u32, vehicle: &str, crew: &str) -> Result<Self> {
+    fn start(
+        mission: &mut Mission,
+        script: u32,
+        vehicle: &str,
+        crew: &str,
+        clips: HashMap<u32, f64>,
+        o: &Options,
+    ) -> Result<Self> {
         let hero = mission.world().borrow().player.ok_or("no player")?;
         let at = mission.world().borrow().objects[&hero].position;
         let spawn = |m: &mut Mission, what: &str| -> Result<u32> {
@@ -254,16 +288,25 @@ impl Hijack {
         println!(
             "hijack {script:08x}: hero {hero:#x} crewman {crewman:#x} vehicle {vehicle:#x}: started {started}"
         );
+        println!("hijack clips known: {}", clips.len());
         let mut h = Self {
             actions: Vec::new(),
+            clips,
+            pad: o.pad.clone(),
+            action_seconds: o.action_seconds,
+            tap_rate: o.tap_rate,
+            tapped: f64::NEG_INFINITY,
             answered: Vec::new(),
             last: None,
         };
-        h.follow(mission, 2.0, 0.0);
+        h.follow(mission, 0.0);
         Ok(h)
     }
 
-    fn pad(&mut self, mission: &mut Mission, pad: &str, now: f64) {
+    fn pad(&mut self, mission: &mut Mission, now: f64) {
+        let pad = self.pad.clone();
+        let pad = pad.as_str();
+        let tap = now - self.tapped >= 1.0 / self.tap_rate;
         for g in mission.minigames() {
             let key = (g.mode.clone(), g.buttons.first().copied().unwrap_or(0));
             let fresh = !self.answered.contains(&key);
@@ -284,8 +327,12 @@ impl Hijack {
                     mission.press(if pad == "good" { right } else { wrong });
                 }
                 "hold" if fresh => mission.hold(right, pad == "good"),
-                "tap" if pad == "good" => mission.press(right),
-                "alternate" if pad == "good" => {
+                "tap" if pad == "good" && tap => {
+                    self.tapped = now;
+                    mission.press(right);
+                }
+                "alternate" if pad == "good" && tap => {
+                    self.tapped = now;
                     let b = match (self.last, g.buttons.as_slice()) {
                         (Some(l), [a, b]) if l == *a => *b,
                         (_, [a, ..]) => *a,
@@ -309,12 +356,25 @@ impl Hijack {
         self.answered.retain(|k| open.contains(k));
     }
 
-    /// Prints the log and the hijack's commands; ends actions due.
-    fn follow(&mut self, mission: &mut Mission, seconds: f64, now: f64) {
+    /// Prints the log and the hijack's commands; ends actions due. An
+    /// action lasts as long as the hijack clip the vehicle starts with it.
+    fn follow(&mut self, mission: &mut Mission, now: f64) {
         for line in mission.take_log() {
             println!("{line}");
         }
-        for c in mission.take_commands() {
+        let commands = mission.take_commands();
+        let seconds = commands
+            .iter()
+            .find_map(|c| match c {
+                Command::Hijack(HijackCommand::PlayAnimation { clip, channel, .. })
+                    if channel == "hijack" =>
+                {
+                    self.clips.get(&m2_assets::name_hash(clip)).copied()
+                }
+                _ => None,
+            })
+            .unwrap_or(self.action_seconds);
+        for c in commands {
             match c {
                 Command::Hijack(h) => {
                     if let HijackCommand::State { guid, action, .. } = &h {
@@ -337,4 +397,33 @@ impl Hijack {
             mission.action_finished(g);
         }
     }
+}
+
+/// The lengths of the clips in the hijack blocks (`hijack_m1a2_...`), by
+/// name hash: the vehicles' parts of each hijack section.
+fn hijack_clips<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+) -> Result<HashMap<u32, f64>> {
+    use m2_assets::BlockContents;
+    use m2_assets::animation::{ANIMATION_TYPE, Clip};
+    let blocks: Vec<usize> = wad
+        .index()
+        .blocks()
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.path.to_ascii_lowercase().contains("hijack_"))
+        .map(|(i, _)| i)
+        .collect();
+    let mut out = HashMap::new();
+    for b in blocks {
+        let data = wad.read_block(b)?;
+        for (e, asset) in BlockContents::parse(&data)?.iter() {
+            if e.type_hash == ANIMATION_TYPE
+                && let Ok(clip) = Clip::parse(asset)
+            {
+                out.insert(e.name_hash, f64::from(clip.header.duration));
+            }
+        }
+    }
+    Ok(out)
 }

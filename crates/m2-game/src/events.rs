@@ -81,7 +81,7 @@ pub trait World {
     }
     /// Every pad button the player pressed, in order, for minigames
     /// ([`crate::hijack`]).
-    fn hijack_presses(&self) -> &[u32] {
+    fn hijack_presses(&self) -> &[(f64, u32)] {
         &[]
     }
     /// Since when (game seconds) the player holds a pad button down.
@@ -126,7 +126,7 @@ struct Pending {
     /// When it was made.
     made: f64,
     /// For minigames: how many of the player's presses it has read (none
-    /// before its first check: it reads only presses after that), and
+    /// before its first check: it reads those made since it was), and
     /// the button it counted last.
     read: Option<usize>,
     memo: Option<u32>,
@@ -794,12 +794,9 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             None => no,
         },
         // { player, seconds, mode, button, ... }: see `crate::hijack`.
-        "Minigame" => {
-            let read = p.read.unwrap_or(world.hijack_presses().len());
-            Check::Minigame(crate::hijack::check_minigame(
-                &p.params, p.made, now, read, p.memo, world,
-            ))
-        }
+        "Minigame" => Check::Minigame(crate::hijack::check_minigame(
+            &p.params, p.made, now, p.read, p.memo, world,
+        )),
         "ObjectHibernation" => match guid(&p.params, 1) {
             Some(g) => {
                 let want_awake = text(&p.params, 2).as_deref() != Some("hibernate");
