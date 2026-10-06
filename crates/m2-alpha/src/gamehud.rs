@@ -859,6 +859,10 @@ impl GameHud {
     }
 }
 
+/// HUD updates the PDA's script needs between its movie's load (and
+/// each toggle) and the next toggle: its close's cooldown is 20.
+const PDA_SETTLE: u32 = 30;
+
 /// Whether a prim covers over half of `screen`.
 fn covers(p: &Prim, screen: egui::Rect) -> bool {
     let xs = p.corners.map(|c| c[0]);
@@ -933,8 +937,12 @@ struct Thread {
     covers_seen: String,
     /// The reticle's widgets were listed in the log.
     reticle_logged: bool,
-    /// The PDA as last told to its script (`TogglePDA`).
-    pda_open: bool,
+    /// Whether its script showed the PDA last frame (its movie drawn).
+    pda_shown: bool,
+    /// HUD updates since the PDA's movie loaded (`None`: not yet), and
+    /// since `TogglePDA` was last sent.
+    pda_ready: Option<u32>,
+    since_toggle: u32,
     /// Whether its script showed it, as last logged.
     pda_scripted: Option<bool>,
     /// The zones the radar's script holds, as last read.
@@ -1043,7 +1051,9 @@ impl Thread {
             fullscreen_seen: String::new(),
             covers_seen: String::new(),
             reticle_logged: false,
-            pda_open: false,
+            pda_shown: false,
+            pda_ready: None,
+            since_toggle: u32::MAX,
             pda_scripted: None,
             zones: Vec::new(),
             roads: Vec::new(),
@@ -1061,11 +1071,28 @@ impl Thread {
         self.pass_calls(state, &mut log);
         // The PDA button: the engine's `TogglePDA` GUI event, which the PDA
         // layout's widget hands to `MrxGuiPda` (it opens the "topbar"
-        // movie over a black backdrop and puts the HUD to sleep).
-        if state.support.pda != self.pda_open {
-            self.pda_open = state.support.pda;
+        // movie over a black backdrop and puts the HUD to sleep). Only
+        // once its movie has loaded and the cooldown of the close that
+        // follows (20 updates) has passed: before, a toggle closes it.
+        if self.pda_ready.is_none() && self.flash.values().any(|m| m.swf.contains("topbar")) {
+            self.pda_ready = Some(0);
+        }
+        if state.dt > 0.0 {
+            if let Some(n) = &mut self.pda_ready {
+                *n = n.saturating_add(1);
+            }
+            self.since_toggle = self.since_toggle.saturating_add(1);
+        }
+        if state.support.pda != self.pda_shown
+            && self.pda_ready.is_some_and(|n| n >= PDA_SETTLE)
+            && self.since_toggle >= PDA_SETTLE
+        {
+            self.since_toggle = 0;
             match gui_runtime::fire(self.mission.lua(), "TogglePDA", ()) {
-                Ok(n) => log.push(format!("TogglePDA ({}): {n} handlers", self.pda_open)),
+                Ok(n) => log.push(format!(
+                    "TogglePDA (want {}): {n} handlers",
+                    state.support.pda
+                )),
                 Err(e) => log.push(format!("TogglePDA: {e}")),
             }
         }
@@ -1132,6 +1159,9 @@ impl Thread {
             && items
                 .iter()
                 .any(|i| matches!(i, DrawItem::Flash { swf: Some(f), .. } if f.contains("topbar")));
+        self.pda_shown = items
+            .iter()
+            .any(|i| matches!(i, DrawItem::Flash { swf: Some(f), .. } if f.contains("topbar")));
         if state.support.pda && self.pda_scripted != Some(scripted) {
             self.pda_scripted = Some(scripted);
             log.push(if scripted {
