@@ -768,3 +768,40 @@ fn a_movie_on_another_level_has_its_own_root() {
     assert_eq!(number(&rt.avm.get(&mut rt.player, &root1, "n")), 1.0);
     assert!(matches!(var(&mut rt, "n"), Value::Undefined));
 }
+
+#[test]
+fn load_bitmap_gives_an_exported_image() {
+    // b = flash.display.BitmapData.loadBitmap("Pic")
+    let mut a = Asm::default();
+    a.set("b", |a| {
+        a.str("Pic")
+            .int(1)
+            .str("flash")
+            .op(0x1C)
+            .str("display")
+            .op(0x4E)
+            .str("BitmapData")
+            .op(0x4E)
+            .str("loadBitmap")
+            .op(0x52);
+    });
+    let mut lib = Library::default();
+    lib.images.insert(
+        7,
+        super::Image {
+            texture: "pic_tex".into(),
+            width: 16.0,
+            height: 8.0,
+            part: [0.0, 0.0, 1.0, 1.0],
+        },
+    );
+    lib.exports.insert("pic".into(), 7);
+    lib.root = Rc::new(Timeline {
+        frames: vec![vec![Control::Script(a.bytes())]],
+        ..Timeline::default()
+    });
+    let mut rt = Runtime::new(Player::new(Rc::new(lib)));
+    rt.run_due();
+    let b = var(&mut rt, "b");
+    assert_eq!(number(&rt.avm.get(&mut rt.player, &b, "width")), 16.0);
+}

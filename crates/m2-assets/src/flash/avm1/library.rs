@@ -269,6 +269,36 @@ pub fn install(avm: &mut Avm) {
     def(avm, &math, "random", |_, _, _, _| Value::Number(random()));
     g.borrow_mut().set("Math", Value::Object(math));
 
+    // Scaleform's `flash.display.BitmapData.loadBitmap(name)`: an image the
+    // movie exports by name, for `TextField.setImageSubstitutions`.
+    let bitmap_data = avm.object();
+    def(avm, &bitmap_data, "loadBitmap", |avm, player, _, args| {
+        let name = arg(args, 0);
+        let name = text(avm, player, &name).to_ascii_lowercase();
+        let image = player.levels.values().find_map(|&root| {
+            let lib = &player.clip(root)?.lib;
+            lib.images.get(lib.exports.get(&name)?).cloned()
+        });
+        let Some(image) = image else {
+            return Value::Undefined;
+        };
+        let o = avm.object();
+        {
+            let mut b = o.borrow_mut();
+            b.set("width", Value::Number(f64::from(image.width)));
+            b.set("height", Value::Number(f64::from(image.height)));
+            b.set("texture", Value::Str(image.texture.as_str().into()));
+        }
+        Value::Object(o)
+    });
+    let display = avm.object();
+    display
+        .borrow_mut()
+        .set("BitmapData", Value::Object(bitmap_data));
+    let flash = avm.object();
+    flash.borrow_mut().set("display", Value::Object(display));
+    g.borrow_mut().set("flash", Value::Object(flash));
+
     // Key, Mouse, Stage.
     let key = avm.object();
     for (n, v) in [
@@ -1197,6 +1227,9 @@ fn install_clip(avm: &mut Avm) {
         "stopDrag",
         "setTextFormat",
         "setNewTextFormat",
+        // Scaleform's inline images in text (not drawn yet).
+        "setImageSubstitutions",
+        "updateImageSubstitution",
         "unloadMovie",
     ] {
         def(avm, &cp, n, |_, _, _, _| Value::Undefined);
