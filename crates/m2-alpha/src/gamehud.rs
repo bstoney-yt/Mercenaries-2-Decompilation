@@ -818,51 +818,36 @@ impl GameHud {
         }
     }
 
-    /// Paints the HUD as last drawn. Solid prims (fills, fades) go
-    /// through egui's own shapes: as meshes of ours they left pictures
-    /// untouched (rounds 23-28), while egui's filled rects show.
+    /// Paints the HUD as last drawn; solid prims (fills, fades) from
+    /// egui's white texel. (As egui shapes, the PDA's thousands of small
+    /// triangles smeared: their feathering assumes one winding.)
     pub fn paint(&self, painter: &egui::Painter) {
         let mut mesh = Mesh::default();
         for p in &self.prims {
-            let [r, g, b, a] = p.colour.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
-            let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
-            let Some(hash) = p.texture else {
-                if self.skip_covers && covers(p, painter.clip_rect()) {
-                    continue;
-                }
-                if !mesh.is_empty() {
-                    painter.add(std::mem::take(&mut mesh));
-                }
-                let mut points: Vec<egui::Pos2> = Vec::with_capacity(4);
-                for c in p.corners {
-                    let at = pos2(c[0], c[1]);
-                    if points.last() != Some(&at) && points.first() != Some(&at) {
-                        points.push(at);
-                    }
-                }
-                if points.len() >= 3 {
-                    painter.add(egui::Shape::convex_polygon(
-                        points,
-                        colour,
-                        egui::Stroke::NONE,
-                    ));
-                }
-                continue;
-            };
-            let texture = match self.textures.get(&hash) {
-                Some(Some(t)) => t.id(),
-                // Missing, or not uploaded yet.
-                _ => continue,
+            let texture = match p.texture {
+                Some(hash) => match self.textures.get(&hash) {
+                    Some(Some(t)) => t.id(),
+                    // Missing, or not uploaded yet.
+                    _ => continue,
+                },
+                None if self.skip_covers && covers(p, painter.clip_rect()) => continue,
+                None => egui::TextureId::default(),
             };
             if mesh.texture_id != texture && !mesh.is_empty() {
                 painter.add(std::mem::take(&mut mesh));
             }
             mesh.texture_id = texture;
+            let [r, g, b, a] = p.colour.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+            let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
             let base = mesh.vertices.len() as u32;
             for (c, uv) in p.corners.iter().zip(&p.uv) {
+                let uv = match p.texture {
+                    Some(_) => pos2(uv[0], uv[1]),
+                    None => egui::epaint::WHITE_UV,
+                };
                 mesh.vertices.push(egui::epaint::Vertex {
                     pos: pos2(c[0], c[1]),
-                    uv: pos2(uv[0], uv[1]),
+                    uv,
                     color: colour,
                 });
             }
@@ -1079,8 +1064,9 @@ impl Thread {
         // movie over a black backdrop and puts the HUD to sleep).
         if state.support.pda != self.pda_open {
             self.pda_open = state.support.pda;
-            if let Err(e) = fire(self.mission.lua(), "TogglePDA", ()) {
-                log.push(format!("TogglePDA: {e}"));
+            match gui_runtime::fire(self.mission.lua(), "TogglePDA", ()) {
+                Ok(n) => log.push(format!("TogglePDA ({}): {n} handlers", self.pda_open)),
+                Err(e) => log.push(format!("TogglePDA: {e}")),
             }
         }
         let dt = state.dt.min(MAX_STEP);
