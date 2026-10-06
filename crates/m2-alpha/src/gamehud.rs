@@ -1584,8 +1584,9 @@ impl Thread {
                 },
             );
         }
-        if !self.flash.is_empty() {
-            self.movies.borrow_mut().fonts();
+        if !self.flash.is_empty() && self.movies.borrow().fonts.is_none() {
+            let summary = self.movies.borrow_mut().fonts().summary();
+            log.push(format!("fonts: {summary}"));
         }
         let calls = screen.borrow_mut().take_flash_calls();
         for (id, name, args) in calls {
@@ -2391,6 +2392,14 @@ const NATIVE_MOVIES: [&str; 1] = ["minimap"];
 /// take their fonts from.
 const FONT_LIBRARY: &str = "gfxfontlib";
 
+/// The game's font movies (see `m2_assets::flash::text`).
+const FONT_MOVIES: [&str; 4] = [
+    "_normal_font",
+    "_bold_font",
+    "_italic_font",
+    "_bold_italic_font",
+];
+
 /// The archive's Flash movies, read once each.
 struct Movies {
     assets: AssetSource<BufReader<File>>,
@@ -2424,6 +2433,13 @@ impl Movies {
             let mut book = flash::FontBook::default();
             if let Some(movie) = self.movie(FONT_LIBRARY) {
                 book.add_movie(&movie);
+            }
+            // The font movies themselves, over the library's stand-ins
+            // (its `_normal_Font` lacks most glyphs).
+            for name in FONT_MOVIES {
+                if let Some(movie) = self.movie(name) {
+                    book.add_movie(&movie);
+                }
             }
             self.fonts = Some(book);
         }
