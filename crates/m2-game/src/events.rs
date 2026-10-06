@@ -467,14 +467,23 @@ fn guid(t: &Table, i: i64) -> Option<u32> {
 /// Whether an object with `labels` is of class `expr`: labels joined by
 /// `&&`, each maybe negated with `!` (`"Tank && !APC"`), in any case.
 pub(crate) fn class_matches(expr: &str, labels: &[u32]) -> bool {
-    let has = |l: &str| labels.contains(&m2_assets::name_hash(l));
-    expr.split("&&").all(|term| {
-        let term = term.trim();
-        match term.strip_prefix('!') {
-            Some(not) => !has(not.trim()),
-            None => has(term),
-        }
-    })
+    class_terms(expr)
+        .iter()
+        .all(|&(h, not)| labels.contains(&h) != not)
+}
+
+/// A class expression's labels as name hashes, each with whether it is
+/// negated.
+pub(crate) fn class_terms(expr: &str) -> Vec<(u32, bool)> {
+    expr.split("&&")
+        .map(|term| {
+            let term = term.trim();
+            match term.strip_prefix('!') {
+                Some(not) => (m2_assets::name_hash(not.trim()), true),
+                None => (m2_assets::name_hash(term), false),
+            }
+        })
+        .collect()
 }
 
 /// How a seat event's mode letters (`"E"`, `"xo"`, ...) read; the old
