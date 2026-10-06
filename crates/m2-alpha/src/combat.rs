@@ -2013,15 +2013,18 @@ impl Combat {
             Sound::Explosion(at)
         });
         self.harm(f, at, (radius, damage), false);
-        let size = (radius * 0.5).clamp(2.0, 16.0);
+        // Fire and smoke grow with the reach's square: a 20 m bomb's 10 m
+        // across, a 15 m bomblet's under 6, so that forty bomblets
+        // together don't fill the view. (Sizes judged by eye, not read.)
+        let size = (radius * radius / 40.0).clamp(1.5, 12.0);
         self.effect(
             Effect::Fire {
                 at: at + Vec3::Y * size * 0.2,
                 size,
             },
-            0.6 + size * 0.05,
+            0.5 + size * 0.04,
         );
-        let puffs = ((radius / 3.0) as usize).clamp(3, 8);
+        let puffs = ((radius / 6.0) as usize).clamp(1, 6);
         for k in 0..puffs {
             let a = k as f32 * std::f32::consts::TAU / puffs as f32;
             let ring = Vec3::new(a.sin(), 0.4, a.cos()) * size * 0.4;
@@ -2030,7 +2033,7 @@ impl Combat {
                     at: at + ring,
                     size: size * 0.6,
                 },
-                2.5 + size * 0.2,
+                2.0 + size * 0.2,
             );
         }
         alarm(f.people, at);
