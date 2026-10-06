@@ -1032,7 +1032,12 @@ impl WgpuBackend {
                 flag(desc.normal_map.is_some_and(|n| n.alpha_x)),
                 flag(desc.ground),
             ],
-            direct: [desc.direct[0], desc.direct[1], desc.direct[2], 0.0],
+            direct: [
+                desc.direct[0],
+                desc.direct[1],
+                desc.direct[2],
+                flag(desc.beam),
+            ],
             ambient: [desc.ambient[0], desc.ambient[1], desc.ambient[2], 0.0],
             ground: [
                 GROUND_MAP_START,
@@ -1778,7 +1783,12 @@ impl WgpuBackend {
                 let tint = l.haze.sun_tint.unwrap_or(Vec3::splat(-1.0));
                 [l.clouds.reach.unwrap_or(0.0), tint.x, tint.y, tint.z]
             },
-            surface: [if l.haze.grey_sun { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            surface: [
+                if l.haze.grey_sun { 1.0 } else { 0.0 },
+                l.beam_gain,
+                0.0,
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));

@@ -154,6 +154,10 @@ pub struct MaterialDesc {
     /// Fades alpha towards the silhouette, where the surface turns away
     /// from the camera (smoke and other soft volumes).
     pub soft_edge: bool,
+    /// A searchlight's beam: its alpha is scaled by the frame's
+    /// [`beam_gain`](crate::Lighting::beam_gain), so the lit-up night shows
+    /// them and the day does not.
+    pub beam: bool,
     /// Specular highlights: colour, strength map and sharpness. `None` is
     /// a matte surface.
     pub specular: Option<Specular>,
@@ -267,6 +271,7 @@ impl Default for MaterialDesc {
             clamp: false,
             detail: None,
             soft_edge: false,
+            beam: false,
             specular: None,
             normal_map: None,
             layers: [None; 4],

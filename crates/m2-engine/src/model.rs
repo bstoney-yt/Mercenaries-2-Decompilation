@@ -331,6 +331,7 @@ impl MaterialCache {
             // The game's beam shader has no fade by how the surface faces
             // the eye; ours did, under `M2_BEAM=old`.
             soft_edge: beam && old_beam,
+            beam,
             ..MaterialDesc::default()
         };
         let tinted = debug_tint(material, desc.texture.is_some());

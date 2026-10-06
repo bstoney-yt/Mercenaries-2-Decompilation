@@ -63,7 +63,7 @@ struct Frame {
     // the air keeps is tinted by (`through_air`; negative: none)
     deck: vec4<f32>,
     // x: surfaces take the sun's brightness without its hue
-    // (`surface_sun`)
+    // (`surface_sun`), y: scale on searchlight beams' alpha
     surface: vec4<f32>,
 };
 
@@ -131,7 +131,7 @@ struct Material {
     specular: vec4<f32>,
     // x: specular map, y: normal map, z: normal x in alpha, w: ground
     maps: vec4<f32>,
-    // rgb: direct light tint, w: unused
+    // rgb: direct light tint, w: a searchlight beam
     direct: vec4<f32>,
     // rgb: ambient light tint, w: unused
     ambient: vec4<f32>,
@@ -644,6 +644,9 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
     if material.detail.z > 0.5 {
         let facing = abs(dot(normalize(v.normal), normalize(frame.eye.xyz - v.world_pos)));
         alpha = alpha * facing * facing;
+    }
+    if material.direct.w > 0.5 {
+        alpha = alpha * frame.surface.y;
     }
     return vec4<f32>(rgb, alpha);
 }

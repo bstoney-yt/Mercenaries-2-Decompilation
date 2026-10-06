@@ -126,6 +126,9 @@ pub struct Lighting {
     /// a display value, at mid luminance) to white, as the game's post
     /// pass does.
     pub monochrome: Option<Vec4>,
+    /// Scale on the alpha of searchlight beams ([`MaterialDesc::beam`]):
+    /// 0 puts them out, 1 shows them as drawn.
+    pub beam_gain: f32,
     /// Film grain over the finished frame: how far each speck (two
     /// pixels square, new each frame) moves a display value either way;
     /// 0 for none.
@@ -318,6 +321,7 @@ impl Default for Lighting {
             adaptation: None,
             tone_map: None,
             monochrome: None,
+            beam_gain: 1.0,
             grain: 0.0,
             gamma_light: false,
         }
