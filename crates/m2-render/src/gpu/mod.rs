@@ -1830,12 +1830,12 @@ impl WgpuBackend {
                     0.0
                 },
                 // `M2_CLOUD_AIR=<x>` scales the air between the eye and the
-                // cloud deck (what it adds and what it takes): 0 leaves it
-                // out (to see whether it neutralises the dusk's gold).
+                // cloud deck (what it adds and what it takes) from
+                // [`CLOUD_AIR`].
                 std::env::var("M2_CLOUD_AIR")
                     .ok()
                     .and_then(|v| v.parse::<f32>().ok())
-                    .unwrap_or(1.0),
+                    .unwrap_or(CLOUD_AIR),
             ],
             // `M2_CLOUD_FILL=<x>` covers at least that share of every part
             // of the sky with the cloud deck's colour (1: all of it), to
@@ -2386,6 +2386,15 @@ impl WgpuBackend {
         Ok(())
     }
 }
+
+/// How much of the air between the eye and the cloud deck dims and tints
+/// the clouds. The game's cloud quad takes that air from constants its
+/// code sets (the quad's size and height), so this is fitted: at a quarter
+/// the dusk sky over the boat ride turns gold as in PC footage and the
+/// night sky and horizon come closest to footage, of 1, 0.5, 0.25 and 0
+/// (PC round DO: summed error in brightness 226 at 1, 149 here; only the
+/// sky late in the ride, as night comes in, got further off). Inferred.
+const CLOUD_AIR: f32 = 0.25;
 
 /// Whether `M2_SKIP_DRAWS` names this kind of draw.
 fn skipped(blend: BlendKind) -> bool {
