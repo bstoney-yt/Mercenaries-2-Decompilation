@@ -1557,6 +1557,9 @@ impl Thread {
                 continue;
             };
             let mut rt = avm1::Runtime::new(flash::Player::new(Rc::clone(&lib)));
+            // `M2_AVM1_TRACE=topbar` logs what the movies named so run.
+            rt.avm.trace = std::env::var("M2_AVM1_TRACE")
+                .is_ok_and(|t| !t.is_empty() && swf.contains(t.as_str()));
             let movies = Rc::clone(&self.movies);
             rt.set_loader(Box::new(move |name: &str| {
                 movies.borrow_mut().library(&movie_name(name))

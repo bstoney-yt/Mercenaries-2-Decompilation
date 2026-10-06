@@ -255,6 +255,9 @@ pub struct Avm {
     pens: HashMap<ClipId, Pen>,
     /// The stage's size, for `Stage.width` and `Stage.height`.
     pub stage: [f32; 2],
+    /// Logs each function call, goto and `_visible` change, for finding
+    /// what a movie does.
+    pub trace: bool,
 }
 
 #[derive(Default)]
@@ -304,6 +307,7 @@ impl Avm {
             depth: 0,
             pens: HashMap::new(),
             stage: [0.0; 2],
+            trace: false,
         };
         library::install(&mut avm);
         avm
@@ -668,6 +672,10 @@ impl Avm {
             }
             "_visible" => {
                 let v = self.truthy(value);
+                if self.trace {
+                    let name = player.clip(id).map_or("", |c| c.name.as_str());
+                    self.log.push(format!("{name}._visible = {v}"));
+                }
                 if let Some(c) = player.clip_mut(id) {
                     c.visible = v;
                 }
@@ -728,6 +736,9 @@ impl Avm {
             self.log
                 .push(format!("{}: calls nested too deep", func.name));
             return Value::Undefined;
+        }
+        if self.trace {
+            self.log.push(format!("call {}{args:?}", func.name));
         }
         let locals = self.object();
         let arguments = self.array(args.to_vec());
@@ -1488,6 +1499,9 @@ impl Avm {
                 }
                 0x8C => {
                     let label = super::Bits::new(data).cstr();
+                    if self.trace {
+                        self.log.push(format!("goto {label}"));
+                    }
                     goto_label(player, frame.target, &label, false);
                 }
                 0x8E | 0x9B => {
@@ -1599,6 +1613,9 @@ impl Avm {
                                 ),
                                 None => (Some(frame.target), s.to_string()),
                             };
+                            if self.trace {
+                                self.log.push(format!("goto {s}"));
+                            }
                             if let Some(t) = target {
                                 goto_label(player, t, &label, play);
                             }
