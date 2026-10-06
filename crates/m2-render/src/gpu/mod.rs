@@ -242,7 +242,8 @@ struct FrameUniforms {
     /// x: surfaces take the sun's brightness without its hue, w: scale on
     /// the air in front of the clouds.
     surface: [f32; 4],
-    /// x: the least cloud cover anywhere in the sky (`M2_CLOUD_FILL`).
+    /// x: the least cloud cover anywhere in the sky (`M2_CLOUD_FILL`),
+    /// y: a sky stage to paint alone (`M2_SKY_DEBUG`).
     sky_fit: [f32; 4],
 }
 
@@ -1844,7 +1845,12 @@ impl WgpuBackend {
                     .ok()
                     .and_then(|v| v.parse::<f32>().ok())
                     .unwrap_or(0.0),
-                0.0,
+                // `M2_SKY_DEBUG=<n>` paints the sky with one stage of its
+                // sum (see `fs_sky`), to find where colour goes astray.
+                std::env::var("M2_SKY_DEBUG")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(0.0),
                 0.0,
                 0.0,
             ],
