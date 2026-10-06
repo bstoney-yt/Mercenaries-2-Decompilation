@@ -703,9 +703,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // The number of the player controlling it (scripts pass it on to
+    // `Player.IsLocal` and key tables by it), else nil.
     add(&object, "IsPlayerControlled", |w, _, a| {
         let o = id(a.first()).and_then(|g| w.objects.get(&g));
-        values([Value::Boolean(o.is_some_and(|o| o.player_controlled))])
+        values([if o.is_some_and(|o| o.player_controlled) {
+            Value::Integer(1)
+        } else {
+            Value::Nil
+        }])
     })?;
     add(&object, "HasLabel", |w, _, a| {
         let has = match (id(a.first()).and_then(|g| w.objects.get(&g)), a.get(1)) {

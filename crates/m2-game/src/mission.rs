@@ -32,8 +32,10 @@ use crate::script::{ScriptError, ScriptHost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
 pub const BOOTSTRAP: u32 = 0xb442_0059;
-/// The heroes' own script: healing and the survival system's one rescue.
-pub const HERO_SCRIPT: u32 = 0x5172_8909;
+/// Activates the player's character as the engine does its object
+/// scripts: the hero module's `OnActivate` (healing, the survival
+/// system's one rescue, her inventory), which goes on once she is awake.
+const HERO_ACTIVATE: &str = "Hero.OnActivate(Player.GetCharacter(1))";
 
 /// The scripts' free support items (`MrxSupportData.AddFreebie`, as the
 /// first contract gives its Satellite Guided Bomb) reach the game too:
@@ -397,6 +399,7 @@ impl Mission {
             ("bootstrap", format!("Scripts[\"{BOOTSTRAP:08x}\"].Init()")),
             // The callback MrxGuiBootstrap.SetOnGuiLoadedFunc registers.
             ("gui loaded", "MrxBootstrap._GuiLoaded()".to_owned()),
+            ("hero activated", HERO_ACTIVATE.to_owned()),
         ];
         for (name, code) in steps {
             if let Err(e) = self.run(&code, name) {
@@ -590,14 +593,11 @@ impl Mission {
         }
     }
 
-    /// The player died and is back on her feet: the hero script's
+    /// The player died and is back on her feet: the hero module's
     /// `OnDeath` sets its survival system up again once she is healthy.
     pub fn player_died(&mut self) {
-        let code = format!(
-            "local s = Scripts[\"{HERO_SCRIPT:08x}\"] if s and type(s.OnDeath) == \"function\" then s.OnDeath(Player.GetCharacter(1)) end"
-        );
         self.log.push(format!("  t={:.1} player died", self.now));
-        if let Err(e) = self.run(&code, "hero died") {
+        if let Err(e) = self.run("Hero.OnDeath(Player.GetCharacter(1))", "hero died") {
             self.log
                 .push(format!("  hero died: {}", first_lines(&e.to_string())));
         }
