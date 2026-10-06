@@ -108,13 +108,14 @@ pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
 /// Lua that calls item `__m2_key` in for character `__m2_owner`, as the
 /// PDA does (its support page, `MrxGuiPda`): a fresh support object with
 /// the item's name and costs, commenced. Its owner is the character
-/// calling, where the catalogue's object names none. Evaluates to
+/// calling, where the catalogue's object names no game object (the
+/// designator takes only an object's guid, a userdata). Evaluates to
 /// whether `Commence` took it.
 pub const CALL_IN: &str = r#"
 local item = MrxSupportData.tSupportData[__m2_key]
 if not item or not item.oSupport then return false end
 local s = item.oSupport
-if not s.uOwner then s:SetOwner(__m2_owner) end
+if type(s.uOwner) ~= "userdata" then s:SetOwner(__m2_owner) end
 local o = s:Create(s.uOwner)
 o:SetSupportName(s:GetSupportName())
 o:SetFuelCost(s:GetFuelCost())
