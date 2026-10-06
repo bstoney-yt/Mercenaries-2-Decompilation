@@ -109,6 +109,9 @@ pub struct TemplateInfo {
     pub human: bool,
 }
 
+/// The bit every template id has (the database's `UNIQ` ids).
+const TEMPLATE_BIT: u32 = 0x8000_0000;
+
 /// The physics component of people, as `_CarPhysicsV2` is of cars.
 const PERSON: &str = "_HumanPhysics";
 /// AI that only people carry (vehicles have `AiDriving`, `AiHelicopter`).
@@ -134,6 +137,8 @@ pub struct Templates {
     pub tuning: HashMap<u32, VehicleTuning>,
     /// What templates leave when destroyed, and what pickups give.
     pub leavings: Leavings,
+    /// Spawners, the lists they spawn from, and patrols' haste.
+    pub population: crate::population::Population,
 }
 
 impl Templates {
@@ -303,6 +308,7 @@ impl Templates {
                 .collect(),
             tuning: crate::tuning::read(&db),
             leavings: crate::pickup::read(&db),
+            population: crate::population::Population::read(&db),
         }
     }
 }
@@ -374,6 +380,29 @@ pub struct StartPoint {
     pub rotation: Quat,
 }
 
+/// A spawner of vehicles a layer places: a `PointTraffic_*` roadblock
+/// or a `PathSpawner_*`, which spawns from its list every so often while
+/// the player is near; what it spawns drives its patrol path, if it has
+/// one, or stands where it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrafficPoint {
+    pub entity: u32,
+    /// The entity's name without its id (`PointTraffic_MaracaiboVZ`).
+    pub name: String,
+    pub position: Vec3,
+    pub rotation: Quat,
+    /// The state layer it is in, by name hash; `None` for a static one.
+    pub layer: Option<u32>,
+    pub spawner: crate::population::Spawner,
+    /// What it spawns: template names that drive, with their weights.
+    pub vehicles: Vec<(String, f32)>,
+    /// Its patrol path in the world (the path entity its `AiPatrol`
+    /// names, else its own `Path`); empty: it stands.
+    pub route: Vec<Vec3>,
+    /// `AiPatrol`'s `Haste` (0.175 to 0.35 on the install).
+    pub haste: Option<f32>,
+}
+
 /// A person a layer places: a soldier at a post or on a patrol route,
 /// from the `PopulationSimpleSpawner`, `Ai` and `AiPatrol` components.
 #[derive(Clone, Debug, PartialEq)]
@@ -430,6 +459,9 @@ pub struct WorldIndex {
     pub state_vehicles: HashMap<u32, TemplatePlacement>,
     /// Where the static layers start the player, by name.
     pub starts: Vec<StartPoint>,
+    /// Spawners of vehicles the layers place (`PointTraffic_*`,
+    /// `PathSpawner_*`).
+    pub traffic: Vec<TrafficPoint>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -569,10 +601,39 @@ impl WorldIndex {
                     is_static,
                     &assets.templates,
                 );
+                world.add_traffic(&layer, e.name_hash, is_static, &assets.templates);
             }
         }
         world.template_db = assets.templates;
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
+        let mut path_points = |asset: u32| -> Vec<Vec3> {
+            paths
+                .entry(asset)
+                .or_insert_with(|| {
+                    source
+                        .asset(asset, PATH_TYPE)
+                        .ok()
+                        .and_then(|data| Path::parse(&data).ok())
+                        .map(|p| p.points.into_iter().map(Vec3::from).collect())
+                        .unwrap_or_default()
+                })
+                .clone()
+        };
+        // A spawner's route: the path entity its patrol names, else its
+        // own path, each in its entity's space.
+        for point in &mut world.traffic {
+            let owner = routes
+                .patrol_of
+                .get(&point.entity)
+                .copied()
+                .unwrap_or(point.entity);
+            let (Some(&(at, q)), Some(&asset)) =
+                (routes.placed.get(&owner), routes.path_of.get(&owner))
+            else {
+                continue;
+            };
+            point.route = path_points(asset).iter().map(|&p| at + q * p).collect();
+        }
         for spawn in &mut world.spawns {
             let Some(&target) = routes.patrol_of.get(&spawn.entity) else {
                 continue;
@@ -582,15 +643,7 @@ impl WorldIndex {
             else {
                 continue;
             };
-            let points = paths.entry(asset).or_insert_with(|| {
-                source
-                    .asset(asset, PATH_TYPE)
-                    .ok()
-                    .and_then(|data| Path::parse(&data).ok())
-                    .map(|p| p.points.into_iter().map(Vec3::from).collect())
-                    .unwrap_or_default()
-            });
-            spawn.route = points.iter().map(|&p| at + q * p).collect();
+            spawn.route = path_points(asset).iter().map(|&p| at + q * p).collect();
         }
         Ok(world)
     }
@@ -666,6 +719,70 @@ impl WorldIndex {
         people.sort_unstable_by_key(|&(id, _)| id);
         self.spawns
             .extend(people.into_iter().map(|(id, p)| spawn(id, p)));
+    }
+
+    /// The vehicle spawners a layer places: entities with a
+    /// `PopulationSimpleSpawner` of their own or by their template, whose
+    /// list holds vehicles that drive.
+    fn add_traffic(
+        &mut self,
+        layer: &Layer<'_>,
+        layer_hash: u32,
+        is_static: bool,
+        templates: &Templates,
+    ) {
+        let own = layer
+            .component("PopulationSimpleSpawner")
+            .map(crate::population::spawners)
+            .unwrap_or_default();
+        let own_haste = layer
+            .component("AiPatrol")
+            .map(crate::population::haste)
+            .unwrap_or_default();
+        let population = &templates.population;
+        let names = layer.names();
+        for (&entity, p) in &layer.placements() {
+            let Some(&spawner) = own
+                .get(&entity)
+                .or_else(|| population.spawners.get(&p.parent))
+            else {
+                continue;
+            };
+            // Ids as the database's own (bit 31 set), whichever way a
+            // field stores them.
+            let list = population
+                .lists
+                .get(&spawner.list)
+                .or_else(|| population.lists.get(&(spawner.list | TEMPLATE_BIT)));
+            let vehicles: Vec<(String, f32)> = list
+                .into_iter()
+                .flatten()
+                .filter_map(|&(t, w)| {
+                    let (name, info) = templates
+                        .by_id(t)
+                        .or_else(|| templates.by_id(t | TEMPLATE_BIT))?;
+                    matches!(info.vehicle, Some(VehicleKind::Car | VehicleKind::Tank))
+                        .then(|| (name.to_owned(), w))
+                })
+                .collect();
+            if vehicles.is_empty() {
+                continue;
+            }
+            self.traffic.push(TrafficPoint {
+                entity,
+                name: member_stem(names.get(&entity).copied().unwrap_or("")).to_owned(),
+                position: Vec3::from(p.position),
+                rotation: rotation(p.rotation),
+                layer: (!is_static).then_some(layer_hash),
+                spawner,
+                vehicles,
+                route: Vec::new(),
+                haste: own_haste
+                    .get(&entity)
+                    .or_else(|| population.haste.get(&p.parent))
+                    .copied(),
+            });
+        }
     }
 
     fn add_layer(&mut self, layer: &Layer<'_>, layer_hash: u32, is_static: bool, assets: &Assets) {
