@@ -805,3 +805,23 @@ fn load_bitmap_gives_an_exported_image() {
     let b = var(&mut rt, "b");
     assert_eq!(number(&rt.avm.get(&mut rt.player, &b, "width")), 16.0);
 }
+
+#[test]
+fn a_texture_font_without_glyph_shapes_keeps_its_codes() {
+    // DefineFont3 as Scaleform leaves it: font 5, "F", 3 glyphs, the
+    // offset table a single 0 then the code table's offset (4).
+    let mut d = vec![5, 0, 0x80 | 0x04, 0, 1, b'F', 3, 0];
+    d.extend([0, 0, 4, 0]);
+    for c in ['A', 'B', 'C'] {
+        d.extend((c as u16).to_le_bytes());
+    }
+    d.extend([0; 6]);
+    for a in [100i16, 200, 300] {
+        d.extend(a.to_le_bytes());
+    }
+    let (id, font) = super::text::Font::parse(&d).unwrap();
+    assert_eq!(id, 5);
+    assert_eq!(font.codes.len(), 3);
+    assert_eq!(font.codes[&'B'], 1);
+    assert_eq!(font.advances.len(), 3);
+}
