@@ -37,9 +37,10 @@ pub const DEFAULT_MODEL: u32 = 0x15d8_9832;
 
 /// Where the island opens: the first town, as in the viewer's examples.
 pub const DEFAULT_SPAWN: (f32, f32) = (450.0, -1950.0);
-/// Where free roam starts without `--spawn`: the PMC's headquarters, as
-/// after the first contract (the static layers' start point there).
-pub const FREE_ROAM_START: &str = "Starter_Pmc_Start1";
+/// Where free roam starts without `--spawn`: where the scripts put the
+/// player once the first contract is done (VzaCon001's flow binding
+/// teleports her to the next contract's start, by the PMC's offices).
+pub const FREE_ROAM_START: &str = "PmcCon001_Start1";
 
 /// Half the ground's width in metres.
 const GROUND_HALF: f32 = 1000.0;
@@ -822,8 +823,8 @@ impl Scene {
         );
         self.explosives = crate::combat::explosives(&world.index);
         eprintln!("explosives: {}", self.explosives.len());
-        // Without a place asked for, the PMC's headquarters, facing the
-        // way its start point does.
+        // Without a place asked for, where the first contract leaves her,
+        // facing the way that start point does.
         let start = spawn
             .is_none()
             .then(|| world.index.start(FREE_ROAM_START))

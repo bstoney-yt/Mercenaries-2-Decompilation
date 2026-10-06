@@ -361,9 +361,11 @@ const NOT_TEMPLATES: [&str; 16] = [
     "LandingZone",
 ];
 
-/// A place the game starts or restarts the player: the static layers'
-/// `Starter_<hq>_Start<n>` entities (`Starter_Pmc_Start1` at the PMC's
-/// headquarters, where free roam begins after the first contract).
+/// A place the game starts or puts the player: the static layers'
+/// `<name>_Start<n>` entities, such as each headquarters'
+/// `Starter_<hq>_Start1` and each contract's `<contract>_Start1`
+/// (`PmcCon001_Start1`, where the scripts put the player after the first
+/// contract).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StartPoint {
     /// The entity's name without its id (`Starter_Pmc_Start1`).
@@ -476,6 +478,15 @@ fn is_id(token: &str) -> bool {
     token
         .strip_prefix("0x")
         .map_or(digits(token, 10), |hex| digits(hex, 16))
+}
+
+/// `Starter_Pmc_Start1`, `PmcCon001_Start2`: a name ending `_Start<n>`.
+fn is_start(name: &str) -> bool {
+    name.rsplit_once('_').is_some_and(|(_, last)| {
+        last.len() > 5
+            && last[..5].eq_ignore_ascii_case("start")
+            && last[5..].bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 /// A designer's test entity (`68valiant test`, `RIB36 Test`).
@@ -696,7 +707,7 @@ impl WorldIndex {
                 let (position, rotation) = (Vec3::from(p.position), rotation(p.rotation));
                 let mut candidates: Vec<u32> = models.get(&entity).copied().into_iter().collect();
                 let stem = member_stem(name);
-                if stem.to_ascii_lowercase().starts_with("starter_") {
+                if is_start(stem) {
                     self.starts.push(StartPoint {
                         name: stem.to_owned(),
                         position,
@@ -1127,6 +1138,16 @@ pub fn low_res_tile<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_points_end_start_and_a_number() {
+        assert!(is_start("Starter_Pmc_Start1"));
+        assert!(is_start("PmcCon001_Start1"));
+        assert!(is_start("VzaCon001_start12"));
+        assert!(!is_start("VzaCon001_StartingBoat"));
+        assert!(!is_start("loc_pmc"));
+        assert!(!is_start("Start1"));
+    }
 
     #[test]
     fn a_models_engine_is_the_one_most_of_its_templates_use() {
