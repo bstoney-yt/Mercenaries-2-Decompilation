@@ -16,7 +16,8 @@
 //!
 //! Right now this opens a window on the island, streamed from the install
 //! around the player: Jennifer on foot with a third-person camera
-//! (`--spawn` picks where to start; the default is the first town). WASD
+//! (`--spawn` picks where to start; the default is the PMC's headquarters,
+//! where free roam begins after the first contract). WASD
 //! runs, Shift sprints, Q held walks, Space jumps. E gets in and out of
 //! the vehicles parked ahead of the spawn (WASD drive, Space brakes, R
 //! rights an overturned one). V switches to a
@@ -56,6 +57,7 @@ mod scene;
 mod sound;
 mod startup;
 mod support;
+mod traffic;
 mod ui;
 
 use std::collections::HashSet;
@@ -131,6 +133,8 @@ struct Options {
     list_spawns: usize,
     /// With `--fight`: seconds to wait after it before the picture.
     fight_wait: f32,
+    /// With `--screenshot`: seconds of play to watch the traffic for.
+    traffic: Option<f32>,
     /// With `--screenshot` on foot: face this way (radians from +z towards
     /// +x) before the picture.
     face: Option<f32>,
@@ -376,6 +380,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--mission-look" => {
                 o.mission_look = Some(value()?.parse().context("--mission-look expects metres")?)
             }
+            "--traffic" => o.traffic = Some(value()?.parse().context("--traffic expects seconds")?),
             "--fight-wait" => {
                 o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
             }
@@ -477,7 +482,13 @@ fn main() -> anyhow::Result<()> {
             turn: options.turn,
         })
     } else if install.is_some() {
-        Mode::Island(options.spawn.unwrap_or(scene::DEFAULT_SPAWN))
+        // Free roam starts at the PMC's headquarters (found in the layers);
+        // a mission's scripts move her from the first town.
+        Mode::Island(
+            options
+                .spawn
+                .or(options.mission.then_some(scene::DEFAULT_SPAWN)),
+        )
     } else {
         Mode::Models(Showcase {
             models: vec![scene::DEFAULT_MODEL],
@@ -515,8 +526,9 @@ fn main() -> anyhow::Result<()> {
 /// What to show.
 #[derive(Clone, Debug)]
 enum Mode {
-    /// The streamed island, starting above (x, z).
-    Island((f32, f32)),
+    /// The streamed island, starting above (x, z), or at the PMC's
+    /// headquarters.
+    Island(Option<(f32, f32)>),
     /// These models on a ground grid, characters in this gait.
     Models(Showcase),
 }
@@ -634,6 +646,38 @@ fn render(
 /// Renders one frame offscreen and writes it as a binary PPM. On the
 /// island, once it has streamed in, the player lands and (with `gait`
 /// walk, run or sprint) heads forward for three seconds first.
+/// Plays `seconds` on, logging the traffic every five seconds.
+fn traffic_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    seconds: f32,
+) -> anyhow::Result<()> {
+    let tick = TICK.as_secs_f32();
+    let mut t = 0.0;
+    let mut next_log = 0.0;
+    while t <= seconds {
+        if t >= next_log {
+            next_log += 5.0;
+            if let Some(world) = &game.scene.world {
+                let focus = game.focus();
+                eprintln!("traffic at {t:.0} s:");
+                for line in game
+                    .traffic
+                    .report(&world.physics, &game.scene.vehicles, focus)
+                {
+                    eprintln!("{line}");
+                }
+            }
+        }
+        game.step(Intent::default(), tick);
+        render(backend, game, fov, aspect, None)?;
+        t += tick;
+    }
+    Ok(())
+}
+
 fn screenshot(
     config: &Config,
     install: Option<&Install>,
@@ -838,6 +882,9 @@ fn screenshot(
                 }
             );
         }
+    }
+    if let Some(seconds) = options.traffic {
+        traffic_for_screenshot(&mut backend, &mut game, fov, aspect, seconds)?;
     }
     if options.probe {
         probe_for_screenshot(&game);
