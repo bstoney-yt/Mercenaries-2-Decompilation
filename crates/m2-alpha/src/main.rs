@@ -174,6 +174,9 @@ struct Options {
     /// Every hijackable vehicle is crewed by this human template, to test
     /// hijacking ([`hijack`]) before the island's vehicles have crews.
     hijack_crew: Option<String>,
+    /// With `--screenshot --drive`: hijack the vehicle instead of getting
+    /// in, answering every prompt at once.
+    hijack: bool,
     mission_seconds: f32,
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
@@ -293,6 +296,7 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--mission" => o.mission = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
+            "--hijack" => o.hijack = true,
             "--mission-driver" => {
                 let path = value()?;
                 let code =
@@ -2207,6 +2211,72 @@ fn look_at_story_character(game: &mut Game) {
 /// forward for four seconds (backing out first if it is parked close
 /// behind something, and steering round what it meets), printing how it
 /// went.
+/// With `--screenshot --drive --hijack`: puts her beside the nearest
+/// hijackable vehicle (`--vehicle`'s, if given), starts the hijack and
+/// answers its prompts at once ([`hijack::Autopad`]), and leaves her in the
+/// picture where it ends: driving it, or let go beside it.
+fn hijack_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    options: &Options,
+    install: &Install,
+) -> anyhow::Result<()> {
+    let tick = TICK.as_secs_f32();
+    let mut hijacks = hijack::Hijacks::start(install, options.hijack_crew.clone());
+    let mut input = Input::default();
+    let started = Instant::now();
+    while hijacks.loading() && started.elapsed() < Duration::from_secs(120) {
+        hijacks.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+    }
+    eprintln!(
+        "hijack: scripts {} after {:.1} s",
+        if hijacks.loading() {
+            "still loading"
+        } else {
+            "loaded"
+        },
+        started.elapsed().as_secs_f32()
+    );
+    let Some(i) = hijack::beside(game, &mut hijacks, options.vehicle.as_deref()) else {
+        eprintln!("hijack: no hijackable vehicle with a driver parked");
+        return Ok(());
+    };
+    // Let her land.
+    for _ in 0..60 {
+        hijacks.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+    }
+    let Some(view) = hijacks.view() else {
+        eprintln!(
+            "hijack: no prompt beside the {}",
+            game.scene.vehicles[i].spec.label
+        );
+        return Ok(());
+    };
+    eprintln!("hijack: prompt \"Hijack {}\"", view.vehicle);
+    input.button(Action::Use, true);
+    let mut pad = hijack::Autopad::default();
+    let mut t = 0.0;
+    loop {
+        hijacks.tick(game, &mut input, tick);
+        input.button(Action::Use, false);
+        game.step(Intent::default(), tick);
+        t += tick;
+        if !hijacks.running() || t > 60.0 {
+            break;
+        }
+        let prompts = hijacks.view().map(|v| v.prompts).unwrap_or_default();
+        pad.answer(&prompts, &mut input, t);
+    }
+    let driving = game.scene.player.as_ref().and_then(|p| p.driving) == Some(i);
+    eprintln!("hijack: over after {t:.1} s; driving it: {driving}");
+    render(backend, game, fov, aspect, None)?;
+    Ok(())
+}
+
 fn drive_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -2279,6 +2349,12 @@ fn drive_for_screenshot(
                 }
             }
         }
+    }
+    if options.hijack {
+        if let Some(install) = install {
+            hijack_for_screenshot(backend, game, fov, aspect, options, install)?;
+        }
+        return Ok(());
     }
     let entered = match &options.vehicle {
         Some(want) => {
@@ -3276,9 +3352,9 @@ impl App {
                 ),
                 _ => None,
             },
-            hijacks: match (&self.install, &self.mode, &self.hijack_crew) {
-                (Some(install), Mode::Island(_), Some(crew)) => {
-                    Some(hijack::Hijacks::start(install, Some(crew.clone())))
+            hijacks: match (&self.install, &self.mode) {
+                (Some(install), Mode::Island(_)) => {
+                    Some(hijack::Hijacks::start(install, self.hijack_crew.clone()))
                 }
                 _ => None,
             },
