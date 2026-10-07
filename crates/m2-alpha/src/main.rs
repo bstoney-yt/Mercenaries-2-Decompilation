@@ -2142,6 +2142,9 @@ fn mission_for_screenshot(
                 let mut hud = ui::Hud::new();
                 hud.game = game_hud(Some(install), &Mode::Island(None), false);
                 hud.wait = true;
+                if let Some(g) = &mut hud.game {
+                    g.log_to(&out.with_file_name(format!("{stem}-late-hud.log")));
+                }
                 (hud, Config::default())
             });
             let mut info = hud_info(game, Some(&link), fov, aspect);
