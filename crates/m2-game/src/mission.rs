@@ -136,6 +136,9 @@ if s.update then
     m._FadeUpdate(w)
 end
 if rawget(m, "_bCurrentlyFadingIn") then
+    -- A new fade to black takes over from a fade back that hadn't ended
+    -- (the movie restarts its wipe).
+    s.out = nil
     s.t = (s.t or 0) + dt
     if s.t >= wipe then
         s.t = nil
@@ -150,7 +153,7 @@ if s.out then
     s.out = s.out + dt
     if s.out >= wipe then
         s.out = nil
-        m._FinishFadeFromBlack(w)
+        if not rawget(m, "_bCurrentlyFadedIn") then m._FinishFadeFromBlack(w) end
         return 0
     end
     return 1 - s.out / wipe
@@ -1543,6 +1546,86 @@ mod tests {
             (p.vehicle, p.position, p.yaw),
             (Some(77), [1.0, 2.0, 3.0], 0.5)
         );
+    }
+
+    #[test]
+    fn the_scripts_fade_calls_back_once_black_and_clears_after_a_fade_back() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        // MrxGui's fade as its script runs it, cut down: a queued callback
+        // runs on the GUI update after the wipe; a fade back asks the
+        // movie to fade out.
+        m.run(
+            r#"
+            Fade = { _nCount = 0, _tCallbacks = {} }
+            local F = Fade
+            F._oFadeFlash = { CustomData = { bLoaded = false } }
+            function F.GlobalFadeToBlack(f)
+                table.insert(F._tCallbacks, f)
+                F._nCount = F._nCount + 1
+                if not F._oFadeFlash.CustomData.bLoaded then
+                    F._oFadeFlash.CustomData.bLoading = true
+                else
+                    F._bCurrentlyFadingIn = true
+                end
+            end
+            function F._CompleteFadeFlashLoad()
+                F._oFadeFlash.CustomData.bLoaded = true
+                F._oFadeFlash.CustomData.bLoading = false
+                F._bCurrentlyFadingIn = true
+            end
+            function F._FinishFadeToBlack(w)
+                F._bCurrentlyFadingIn = false
+                F._bCurrentlyFadedIn = true
+            end
+            function F._FadeUpdate(w)
+                for _, f in ipairs(F._tCallbacks) do f() end
+                F._tCallbacks = {}
+            end
+            function F.GlobalFadeFromBlack()
+                F._nCount = F._nCount - 1
+                F._bCurrentlyFadedIn = false
+                F._bCurrentlyFadingIn = false
+            end
+            function F._FinishFadeFromBlack(w) F.closed = (F.closed or 0) + 1 end
+            "#,
+            "fade",
+        )
+        .unwrap();
+        let lua = m.host.lua();
+        lua.load("Fade.GlobalFadeToBlack(function() called = true end)")
+            .exec()
+            .unwrap();
+        let mut blacks = Vec::new();
+        for _ in 0..30 {
+            m.tick(0.1);
+            blacks.push(m.black());
+        }
+        let lua = m.host.lua();
+        assert!(lua.globals().get::<bool>("called").unwrap());
+        assert_eq!(m.black(), 1.0);
+        // Back, and at once to black again: the fade back gives way.
+        lua.load("Fade.GlobalFadeFromBlack() Fade.GlobalFadeToBlack(function() end)")
+            .exec()
+            .unwrap();
+        for _ in 0..30 {
+            m.tick(0.1);
+        }
+        assert_eq!(m.black(), 1.0);
+        let lua = m.host.lua();
+        assert_eq!(
+            lua.load("return Fade.closed")
+                .eval::<Option<u32>>()
+                .unwrap(),
+            None
+        );
+        lua.load("Fade.GlobalFadeFromBlack()").exec().unwrap();
+        for _ in 0..30 {
+            m.tick(0.1);
+        }
+        assert_eq!(m.black(), 0.0);
+        let lua = m.host.lua();
+        assert_eq!(lua.load("return Fade.closed").eval::<u32>().unwrap(), 1);
+        assert!(blacks.iter().any(|&b| b > 0.0 && b < 1.0));
     }
 
     #[test]
