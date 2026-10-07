@@ -53,8 +53,9 @@ pub const SLACK: f32 = 2.0;
 /// distance); the on-foot camera would sit inside the hull.
 const CAMERA_DISTANCE: f32 = 6.0;
 const CAMERA_PITCH: f32 = -0.5;
-/// How far above the vehicle's top the camera looks, metres.
-const CAMERA_LIFT: f32 = 0.5;
+/// How far above the vehicle's top (later her feet) the camera looks,
+/// metres.
+const CAMERA_LIFT: f32 = 1.0;
 /// How long an action lasts when its clip is unknown, seconds.
 const UNKNOWN_CLIP: f64 = 2.0;
 /// The pad, as the scripts number its buttons
@@ -392,7 +393,10 @@ impl Hijacks {
             // across the vehicle from its side.
             if let Some(p) = &mut game.scene.player {
                 p.down = true;
-                p.yaw = yaw + std::f32::consts::FRAC_PI_2;
+                // From the entrance's side of the vehicle.
+                let side = at.inverse().transform_point3(c.at).x.signum();
+                let out = at.transform_vector3(Vec3::X * side);
+                p.yaw = (-out.x).atan2(-out.z);
                 p.pitch = CAMERA_PITCH;
             }
         } else {
@@ -518,6 +522,11 @@ impl Hijacks {
             * Vec3::new(root.x - c.info.pin.x, 0.0, root.z - c.info.pin.y);
         p.facing = yaw + model_yaw;
         p.character.position = origin + off;
+        // The camera follows her about the vehicle.
+        p.chase_target = Some((
+            p.character.position + Vec3::Y * CAMERA_LIFT,
+            CAMERA_DISTANCE,
+        ));
         p.character.velocity = Vec3::ZERO;
     }
 
@@ -557,6 +566,22 @@ fn follow(
     });
     let mut over = false;
     for c in commands {
+        // The hijack's blasts (the hatch blown open, a grenade): fire
+        // and smoke only, not a blast that wrecks what is near; a
+        // grenade's size (inferred).
+        if let Command::Spawn { what, position, .. } = &c
+            && what.to_ascii_lowercase().contains("explosion")
+        {
+            eprintln!("hijack: {what}");
+            game.combat.effects.push((
+                crate::combat::Effect::Fire {
+                    at: Vec3::from(*position),
+                    size: 2.0,
+                },
+                0.6,
+                0.6,
+            ));
+        }
         let Command::Hijack(h) = c else {
             continue;
         };
