@@ -37,7 +37,7 @@
 )]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
@@ -264,6 +264,8 @@ pub struct Avm {
     /// The key last pressed (`Key.getCode`) and those held (`Key.isDown`).
     pub key_code: i32,
     pub keys_down: Vec<i32>,
+    /// Instances whose `onLoad` time has come ([`Avm::fire_loads`]).
+    loaded: HashSet<ClipId>,
 }
 
 #[derive(Default)]
@@ -317,6 +319,7 @@ impl Avm {
             key_listeners: Vec::new(),
             key_code: 0,
             keys_down: Vec::new(),
+            loaded: HashSet::new(),
         };
         library::install(&mut avm);
         avm
@@ -1859,6 +1862,28 @@ impl Avm {
         }
     }
 
+    /// Calls `onLoad` on each instance whose first frame has run since
+    /// the last call (each once, as it comes on stage). Whether any ran.
+    fn fire_loads(&mut self, player: &mut Player) -> bool {
+        let mut ran = false;
+        for id in player.order() {
+            if self.loaded.contains(&id) || !player.clip(id).is_some_and(|c| c.entered) {
+                continue;
+            }
+            self.loaded.insert(id);
+            let Some(o) = self.clips.get(&id).cloned() else {
+                continue;
+            };
+            let h = o.borrow().own("onLoad");
+            if let Some(f @ Value::Object(_)) = h {
+                self.budget = 0;
+                self.call_value(player, &f, &Value::Object(o), &[]);
+                ran = true;
+            }
+        }
+        ran
+    }
+
     fn run_intervals(&mut self, player: &mut Player) {
         let due: Vec<usize> = (0..self.intervals.len())
             .filter(|&i| self.intervals[i].due <= self.time)
@@ -2170,7 +2195,11 @@ impl Runtime {
             self.load_movies();
             let due = self.player.take_scripts();
             if due.is_empty() {
-                break;
+                // Then `onLoad`, once each instance's first frame has run.
+                if !self.avm.fire_loads(&mut self.player) {
+                    break;
+                }
+                continue;
             }
             for (id, code) in due {
                 self.avm.run_script(&mut self.player, id, &code);
