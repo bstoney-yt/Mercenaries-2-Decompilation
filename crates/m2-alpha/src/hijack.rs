@@ -145,6 +145,19 @@ pub struct Hijacks {
     points: HashMap<(u32, u32), Option<Vec3>>,
     near: Option<Candidate>,
     active: Option<Active>,
+    /// Each vehicle model's driver's seat, once looked up.
+    seats: HashMap<u32, Option<Seat>>,
+    /// Vehicles (index, model) whose parts are set as their templates say.
+    dressed: std::collections::HashSet<(usize, u32)>,
+}
+
+/// Where and how she sits driving a vehicle.
+#[derive(Clone, Copy, Debug)]
+struct Seat {
+    /// Her `InVehicle` `Idle` clip for the vehicle's animation set.
+    clip: u32,
+    /// The seat, model space: her clip's origin goes there.
+    at: Vec3,
 }
 
 impl Hijacks {
@@ -173,6 +186,8 @@ impl Hijacks {
             by_model: None,
             points: HashMap::new(),
             near: None,
+            seats: HashMap::new(),
+            dressed: Default::default(),
             active: None,
         }
     }
@@ -563,6 +578,56 @@ impl Hijacks {
         p.character.velocity = Vec3::ZERO;
     }
 
+    /// While she drives (and no hijack plays), she sits in the driver's
+    /// seat, playing the clip the tables give that seat. Runs after the
+    /// game's tick, like [`place`](Self::place).
+    pub fn seat(&mut self, game: &mut Game, dt: f32) {
+        let State::Ready(loaded) = &self.state else {
+            return;
+        };
+        dress(game, &mut self.dressed, &loaded.clips);
+        if self.active.is_some() {
+            return;
+        }
+        let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+            if let Some(p) = &mut game.scene.player {
+                p.seated = false;
+            }
+            return;
+        };
+        let Some(v) = game.scene.vehicles.get(i) else {
+            return;
+        };
+        let model = v.spec.model;
+        if !self.seats.contains_key(&model) {
+            let seat = find_seat(game, &mut self.points, &loaded.clips, i);
+            eprintln!("seat: model {model:08x} {seat:?}");
+            self.seats.insert(model, seat);
+        }
+        let seated = self.seats[&model].and_then(|seat| {
+            let index = bind(game, seat.clip)?;
+            let scene = &mut game.scene;
+            let world = scene.world.as_ref()?;
+            let at = world.physics.vehicle_transform(scene.vehicles[i].id?)?;
+            let p = scene.player.as_mut()?;
+            let (_, rig) = p.model.as_mut()?;
+            rig.animator.play(index);
+            rig.animator.advance(dt);
+            let forward = rig
+                .locomotion
+                .as_ref()
+                .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
+            let ahead = at.transform_vector3(Vec3::Z);
+            p.facing = ahead.x.atan2(ahead.z) + forward.x.atan2(forward.y);
+            p.character.position = at.transform_point3(seat.at);
+            p.character.velocity = Vec3::ZERO;
+            Some(())
+        });
+        if let Some(p) = &mut game.scene.player {
+            p.seated = seated.is_some();
+        }
+    }
+
     /// Where she is in the hijacked vehicle's space (x right, y up, z
     /// ahead), and the vehicle's model-space bounds: for checking her
     /// clips' placing.
@@ -823,9 +888,118 @@ fn lift(a: &Active, game: &Game) -> Option<(f32, f32)> {
     Some((*ups.get(ups.len() / 2)?, ups.last()? - ups.first()?))
 }
 
-/// Plays clip `hash` on her (read from the archive the first time); its
+/// Hides the parts each newly seen vehicle's template starts in a state
+/// that shows nothing (its `OSMStateParameter`s): the soft-top jeep's gun
+/// mount, the gun jeeps' canvas top. Vehicles are known by label, which
+/// is their template's name when they have one.
+fn dress(
+    game: &mut Game,
+    dressed: &mut std::collections::HashSet<(usize, u32)>,
+    clips: &ClipTimes,
+) {
+    let scene = &mut game.scene;
+    for (i, v) in scene.vehicles.iter_mut().enumerate() {
+        if !dressed.insert((i, v.spec.model)) {
+            continue;
+        }
+        let Some(parts) = clips.parts.get(&v.spec.label.to_ascii_lowercase()) else {
+            continue;
+        };
+        let Some(source) = scene.source.as_mut() else {
+            return;
+        };
+        let Ok(data) = source.model(v.spec.model) else {
+            continue;
+        };
+        let Ok(m) = data.parse() else { continue };
+        let Some(states) = &m.states else { continue };
+        let mut off = vec![false; m.nodes.len()];
+        for &(part, state) in parts {
+            let Some(machine) = states.machines.iter().find(|x| {
+                x.node
+                    .and_then(|n| m.nodes.get(usize::from(n)))
+                    .is_some_and(|n| n.name_hash == part)
+            }) else {
+                continue;
+            };
+            let shows = machine
+                .states
+                .iter()
+                .find(|x| x.0 == state)
+                .is_some_and(|x| x.1.iter().any(|c| c.1));
+            if shows {
+                continue;
+            }
+            // The part and everything under it.
+            let Some(top) = machine.node else { continue };
+            for (k, o) in off.iter_mut().enumerate() {
+                let mut at = Some(k as u16);
+                while let Some(n) = at {
+                    if n == top {
+                        *o = true;
+                        break;
+                    }
+                    at = m.nodes.get(usize::from(n)).and_then(|x| x.parent);
+                }
+            }
+        }
+        if off.contains(&true) {
+            eprintln!(
+                "parts: the {} hides {} nodes ({parts:x?})",
+                v.spec.label,
+                off.iter().filter(|&&o| o).count()
+            );
+            v.model.hide(&off);
+        }
+    }
+}
+
+/// The driver's seat of vehicle `i`: its template (the first by name of
+/// those with its model and an animation set), that template's
+/// `seat_driver` (else first) `SeatLink` and the hardpoint it names, else
+/// the model's driver's seat marker.
+fn find_seat(
+    game: &mut Game,
+    points: &mut HashMap<(u32, u32), Option<Vec3>>,
+    clips: &ClipTimes,
+    i: usize,
+) -> Option<Seat> {
+    let scene = &mut game.scene;
+    let v = scene.vehicles.get(i)?;
+    let (model, marker) = (v.spec.model, v.spec.seat);
+    let label = v.spec.label.to_ascii_lowercase();
+    let db = &scene.world.as_ref()?.index.template_db;
+    // Its own template when its label names one (`M151 Softtop (GR)`),
+    // else one with seats before one without (`M151 (Base)` has none).
+    let mut names: Vec<String> = db
+        .infos
+        .iter()
+        .filter(|(_, info)| info.model == Some(model))
+        .filter_map(|(id, _)| Some(db.names.get(id)?.to_ascii_lowercase()))
+        .filter(|name| clips.sets.contains_key(name))
+        .collect();
+    names.sort_by_key(|n| (*n != label, !clips.seats.contains_key(n), n.clone()));
+    let name = names.first()?;
+    let set = clips.sets[name];
+    let driver = m2_assets::name_hash("seat_driver");
+    let links = clips.seats.get(name.as_str());
+    let link = links.and_then(|l| l.iter().find(|s| s.0 == driver).or(l.first()));
+    let clip = clips
+        .seated(set, link.map(|l| l.0))
+        .or_else(|| clips.seated(set, None))?;
+    let hardpoint = link
+        .and_then(|l| l.1)
+        .and_then(|h| point(points, scene.source.as_mut(), model, h));
+    eprintln!("seat: {name} link {link:x?} hardpoint {hardpoint:?} marker {marker:?}");
+    Some(Seat {
+        clip,
+        at: hardpoint.or(marker)?,
+    })
+}
+
+/// Clip `hash` on her rig (read from the archive the first time): its
 /// index in her rig's clips.
-fn play(game: &mut Game, hash: u32) -> Option<usize> {
+fn bind(game: &mut Game, hash: u32) -> Option<usize> {
     let index = match game
         .scene
         .player
@@ -847,6 +1021,12 @@ fn play(game: &mut Game, hash: u32) -> Option<usize> {
             clips.len() - 1
         }
     };
+    Some(index)
+}
+
+/// Plays clip `hash` on her once; its index in her rig's clips.
+fn play(game: &mut Game, hash: u32) -> Option<usize> {
+    let index = bind(game, hash)?;
     let (_, rig) = game.scene.player.as_mut()?.model.as_mut()?;
     rig.animator.play_once(index);
     Some(index)

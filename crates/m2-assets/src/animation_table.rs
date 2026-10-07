@@ -242,6 +242,19 @@ pub fn vehicle_clip(
     class: u32,
     name: u32,
 ) -> Option<u32> {
+    seat_clip(actions, vehicles, stance, action, (class, name), None)
+}
+
+/// [`vehicle_clip`] for a character in the seat whose name hashes to
+/// `seat` (`seat_driver`), where the vehicle table gives seats their own.
+pub fn seat_clip(
+    actions: &AnimationTable,
+    vehicles: &AnimationTable,
+    stance: &str,
+    action: &str,
+    (class, name): (u32, u32),
+    seat: Option<u32>,
+) -> Option<u32> {
     let handle = actions.lookup(
         &[
             ("Stance", Some(crate::name_hash(stance))),
@@ -260,7 +273,7 @@ pub fn vehicle_clip(
             ("Handle", Some(handle)),
             ("VehicleClass", Some(class)),
             ("VehicleName", Some(name)),
-            ("SeatName", None),
+            ("SeatName", seat),
             ("MountedEquipmentClass", None),
             ("MountedEquipmentName", None),
         ],
