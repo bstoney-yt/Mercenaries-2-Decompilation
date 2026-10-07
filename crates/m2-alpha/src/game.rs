@@ -124,6 +124,11 @@ const DROPPED: u32 = 0x7000_0000;
 impl Game {
     pub fn new(scene: Scene, camera: FlyCamera) -> Self {
         let on_foot = scene.player.is_some();
+        let mut combat = Combat::default();
+        if let Some(hp) = scene.hero_health() {
+            combat.max_hp = hp;
+            combat.hp = hp;
+        }
         Self {
             scene,
             camera,
@@ -131,7 +136,7 @@ impl Game {
             park_wait: 0.0,
             park_tries: 0,
             restore: Vec::new(),
-            combat: Combat::default(),
+            combat,
             fetched: HashSet::new(),
             vehicle_wait: 0.0,
             startup: None,
@@ -143,6 +148,19 @@ impl Game {
             dropped: 0,
             input_locked: false,
             support_hp: 0.0,
+        }
+    }
+
+    /// Plays as `hero` from now on: their body, clips and health (whole).
+    pub fn set_hero(
+        &mut self,
+        backend: &mut dyn m2_render::RenderBackend,
+        hero: crate::hero::Hero,
+    ) {
+        self.scene.load_hero(backend, hero);
+        if let Some(hp) = self.scene.hero_health() {
+            self.combat.max_hp = hp;
+            self.combat.hp = hp;
         }
     }
 
@@ -794,8 +812,10 @@ impl Game {
         player.facing = p.facing;
         player.yaw = p.yaw;
         player.pitch = p.pitch;
+        let max_hp = self.combat.max_hp;
         self.combat = Combat::default();
-        self.combat.hp = p.hp.clamp(1.0, 100.0);
+        self.combat.max_hp = max_hp;
+        self.combat.hp = p.hp.clamp(1.0, max_hp);
         match (p.second.as_str(), p.launcher) {
             ("grenade launcher", Some([clip, stored])) => {
                 self.combat.equip(Weapon::GrenadeLauncher, 0);
@@ -894,7 +914,7 @@ impl Game {
             hp: player
                 .and_then(|p| p.driving)
                 .and_then(|i| self.scene.vehicles.get(i))
-                .map_or(self.combat.hp, ParkedVehicle::health),
+                .map_or(self.combat.hp_percent(), ParkedVehicle::health),
             down: self.combat.down > 0.0,
             weapon: self.combat.weapon,
             second: self.combat.second,
