@@ -237,6 +237,41 @@ impl Events {
                 Ok(MultiValue::new())
             })?,
         )?;
+        // `Event.__m2_fire(kind, ...)`: the engine's own events (the GUI's
+        // `GuiHealthUpdate` and the like): calls the callbacks of pending
+        // events of that kind with their data then the arguments (one-shot
+        // events are used up). Returns how many ran.
+        let store = Rc::clone(&self.store);
+        event.set(
+            "__m2_fire",
+            safe_function(lua, move |_, args| {
+                let mut args = args.into_iter();
+                let Some(Value::String(kind)) = args.next() else {
+                    return Ok(MultiValue::from_vec(vec![Value::Integer(0)]));
+                };
+                let kind = kind.to_string_lossy();
+                let extra: Vec<Value> = args.collect();
+                let hits: Vec<(Value, Option<Table>)> = {
+                    let mut s = store.borrow_mut();
+                    let hits = s
+                        .pending
+                        .iter()
+                        .filter(|p| p.kind == kind)
+                        .map(|p| (p.callback.clone(), p.data.clone()))
+                        .collect();
+                    s.pending.retain(|p| p.persistent || p.kind != kind);
+                    hits
+                };
+                let mut ran = 0;
+                for (callback, data) in hits {
+                    if let Value::Function(f) = callback {
+                        call(&f, data.as_ref(), extra.clone())?;
+                        ran += 1;
+                    }
+                }
+                Ok(MultiValue::from_vec(vec![Value::Integer(ran)]))
+            })?,
+        )?;
         // Kinds not listed (`Event.Minigame`) read as their own name, so
         // events of them can be made and simply never fire.
         let meta = lua.create_table()?;

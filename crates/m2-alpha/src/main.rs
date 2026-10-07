@@ -43,6 +43,7 @@ mod config;
 mod drops;
 mod flights;
 mod game;
+mod gamehud;
 mod input;
 mod mission;
 mod moving;
@@ -155,10 +156,23 @@ struct Options {
     probe: bool,
     /// With `--aim` (or `--drive --look`): fire just before the picture.
     fire: bool,
+    /// With `--screenshot` on foot: hits she takes just before the
+    /// picture, from these directions (degrees clockwise from where the
+    /// camera looks), to see the HUD's hit arcs.
+    hit_from: Vec<f32>,
+    /// With `--screenshot`: seconds the game's HUD runs before the
+    /// picture (2, or 0.5 with `--hit-from`).
+    hud_seconds: Option<f64>,
     /// With `--screenshot` on foot: call a Satellite Guided Bomb on the
-    /// spot ahead of her, the picture through the satellite's view, with
-    /// the timing wheel up, or after the bomb lands.
+    /// spot ahead of her, the picture with the support menu open (menu),
+    /// through the satellite's view, with the timing wheel up, or after
+    /// the bomb lands.
     satellite: Option<SatelliteShot>,
+    /// With `--screenshot`: the picture with her PDA open.
+    pda: bool,
+    /// With `--pda`: keys pressed (Flash key codes, 36 the map's current
+    /// contract) half way through the HUD's run.
+    pda_keys: Vec<i32>,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
@@ -168,6 +182,8 @@ struct Options {
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
+    /// Our stand-in HUD instead of the game's own.
+    old_hud: bool,
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
@@ -188,6 +204,8 @@ struct Options {
 /// How far a `--satellite` call goes with the bomb.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SatelliteShot {
+    /// The support menu open, the bomb in it.
+    Menu,
     /// Looking through the satellite, over the spot.
     View,
     /// The timing wheel, after the first press.
@@ -285,6 +303,7 @@ fn parse_args() -> anyhow::Result<Options> {
                     .to_radians()
             }
             "--mission" => o.mission = true,
+            "--old-hud" => o.old_hud = true,
             "--mission-driver" => {
                 let path = value()?;
                 let code =
@@ -301,6 +320,15 @@ fn parse_args() -> anyhow::Result<Options> {
                 )
             }
             "--aim" => o.aim = true,
+            "--hit-from" => {
+                for d in value()?.split(',') {
+                    o.hit_from
+                        .push(d.parse().context("--hit-from expects degrees")?);
+                }
+            }
+            "--hud-seconds" => {
+                o.hud_seconds = Some(value()?.parse().context("--hud-seconds expects seconds")?)
+            }
             "--weapon" => {
                 o.weapon = Some(match value()?.as_str() {
                     "rifle" => combat::Weapon::Rifle,
@@ -310,6 +338,12 @@ fn parse_args() -> anyhow::Result<Options> {
                 })
             }
             "--closeup" => o.closeup = true,
+            "--pda" => o.pda = true,
+            "--pda-key" => o.pda_keys.push(
+                value()?
+                    .parse()
+                    .context("--pda-key expects a Flash key code")?,
+            ),
             "--behind" => o.behind = true,
             "--slung" => {
                 o.slung = Some(match value()?.as_str() {
@@ -320,10 +354,11 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--satellite" => {
                 o.satellite = Some(match value()?.as_str() {
+                    "menu" => SatelliteShot::Menu,
                     "view" => SatelliteShot::View,
                     "wheel" => SatelliteShot::Wheel,
                     "bomb" => SatelliteShot::Bomb,
-                    v => bail!("--satellite {v}: expected view, wheel or bomb"),
+                    v => bail!("--satellite {v}: expected menu, view, wheel or bomb"),
                 })
             }
             "--grip" => {
@@ -466,6 +501,7 @@ fn main() -> anyhow::Result<()> {
         fly: options.fly,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
+        old_hud: options.old_hud,
         state: None,
         error: None,
     };
@@ -546,6 +582,15 @@ fn build_scene(
 
 /// What the HUD shows: the game's, with the mission's objectives and the
 /// view their markers are placed with.
+/// The game's own HUD, on the island with the game's files (unless
+/// `--old-hud`).
+fn game_hud(install: Option<&Install>, mode: &Mode, old: bool) -> Option<gamehud::GameHud> {
+    match (install, mode) {
+        (Some(install), Mode::Island(_)) if !old => Some(gamehud::GameHud::start(install)),
+        _ => None,
+    }
+}
+
 fn hud_info(
     game: &Game,
     mission: Option<&mission::MissionLink>,
@@ -976,14 +1021,60 @@ fn screenshot(
     if let Some(reach) = options.look_pickup {
         look_at_pickup(&mut game, reach);
     }
-    // The picture, with the HUD.
+    if let Some(p) = game.scene.player.as_ref().filter(|_| game.on_foot) {
+        // Hits from around her, as the camera sees it: 0 ahead, 90 right.
+        let at = p.character.position + m2_math::glam::Vec3::Y;
+        let ahead = game.camera.forward().with_y(0.0).normalize_or_zero();
+        let right = game.camera.right();
+        for d in &options.hit_from {
+            let (s, c) = d.to_radians().sin_cos();
+            game.combat
+                .hurt_from(15.0, at + (ahead * c + right * s) * 10.0);
+        }
+    }
+    if options.pda {
+        game.support.pda = true;
+    }
+    // The picture, with the HUD (the game's, once its scripts have
+    // started and run two seconds, for its boxes to have opened and the
+    // gun box to have switched; half of one for hits, whose arcs fade).
     let mut hud = ui::Hud::new();
+    hud.game = game_hud(install, mode, options.old_hud);
     let mut settings = config.clone();
-    let info = hud_info(&game, link.as_ref(), fov, aspect);
+    let mut info = hud_info(&game, link.as_ref(), fov, aspect);
+    if hud.game.is_some() {
+        info.game = Some(gamehud::HudState::of(&mut game));
+        let seconds = options
+            .hud_seconds
+            .unwrap_or(if options.hit_from.is_empty() {
+                2.0
+            } else {
+                0.5
+            });
+        hud.settle(
+            &info,
+            (w, h),
+            seconds,
+            &options.pda_keys,
+            Duration::from_secs(120),
+        );
+        info.game = Some(gamehud::HudState::of(&mut game));
+    }
     let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
     write_ppm(&backend, out)?;
     eprintln!("wrote {}", out.display());
+    // The same frame without the HUD's fades, to compare (`M2_PAINT_AB`).
+    if std::env::var_os("M2_PAINT_AB").is_some()
+        && let Some(g) = hud.game.as_mut()
+    {
+        g.skip_covers = true;
+        let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
+        render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
+        let plain = out.with_extension("nocover.ppm");
+        write_ppm(&backend, &plain)?;
+        eprintln!("wrote {}", plain.display());
+    }
     Ok(())
 }
 
@@ -2881,9 +2972,9 @@ fn fight_for_screenshot(
 /// Calls a Satellite Guided Bomb on the spot [`SATELLITE_AHEAD`] metres
 /// ahead of her as a player would (the support key, the use key, the view
 /// steered over it and confirmed, the wheel pressed in each wedge), for
-/// the picture: looking through the satellite, with the timing wheel's
-/// check after the first press, or `wait` seconds (at least 0.8) after
-/// the bomb lands, from her camera.
+/// the picture: the support menu just opened, looking through the
+/// satellite, with the timing wheel's check after the first press, or
+/// `wait` seconds (at least 0.8) after the bomb lands, from her camera.
 fn satellite_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -2917,6 +3008,9 @@ fn satellite_for_screenshot(
             ..Trigger::default()
         }),
     );
+    if stage == SatelliteShot::Menu {
+        return Ok(());
+    }
     press(
         game,
         Intent {
@@ -2967,13 +3061,17 @@ fn satellite_for_screenshot(
         }),
     );
     // A press as the marker passes through each wedge; the wheel's
-    // picture is of the check after the first.
+    // picture is of the marker in the first, before the press (as the
+    // footage shows the wheel turning).
     for wedge in 0..2 {
         for _ in 0..600 {
             if game.support.wheel_ready() {
                 break;
             }
             game.step(Intent::default(), tick);
+        }
+        if stage == SatelliteShot::Wheel {
+            return Ok(());
         }
         press(
             game,
@@ -2983,10 +3081,6 @@ fn satellite_for_screenshot(
             },
         );
         eprintln!("satellite: wedge {wedge}: {:?}", game.support.phase);
-        if stage == SatelliteShot::Wheel {
-            game.step(Intent::default(), tick);
-            return Ok(());
-        }
     }
     let (hp, alive) = (
         game.combat.hp,
@@ -3177,6 +3271,8 @@ struct App {
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
     mission_drivers: Vec<(String, String)>,
+    /// Our stand-in HUD instead of the game's own.
+    old_hud: bool,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -3208,7 +3304,8 @@ impl App {
             game.on_foot = false;
         }
         let focused = window.has_focus();
-        let hud = ui::Hud::new();
+        let mut hud = ui::Hud::new();
+        hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud);
         let egui = egui_winit::State::new(
             hud.ctx.clone(),
             egui::ViewportId::ROOT,
@@ -3281,12 +3378,15 @@ impl Running {
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
         let (w, h) = self.backend.size();
-        let info = hud_info(
+        let mut info = hud_info(
             &self.game,
             self.mission.as_ref(),
             config.camera.fov,
             w as f32 / h as f32,
         );
+        if self.hud.game.is_some() {
+            info.game = Some(gamehud::HudState::of(&mut self.game));
+        }
         let (action, output) = self.hud.build(input, &info, config);
         self.egui.handle_platform_output(&self.window, output);
         if config.window.vsync != vsync {

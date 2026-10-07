@@ -36,6 +36,7 @@ use m2_engine::vehicle::DRIVABLE;
 use m2_engine::world::member_stem;
 use m2_engine::{CatalogueEntry, Install, TemplateInfo, Templates, VehicleKind};
 use m2_game::api::Command;
+use m2_game::hud::ObjectiveMessage;
 use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
@@ -44,6 +45,7 @@ use crate::combat::{self, Weapon};
 use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
+use crate::gamehud::{HudCall, Plain, RadarRegion};
 use crate::scene::NOT_DRIVABLE;
 use crate::support::{self, FALLBACK_AFTER, Impact, Kind};
 
@@ -97,16 +99,101 @@ pub struct MissionView {
     pub objectives: Vec<String>,
     /// The tutorial line up, readable.
     pub tutorial: Option<String>,
+    /// The same line with its key tokens (`[pda]`) as the scripts' text
+    /// has them, for the game's own tutorial box to draw as glyphs.
+    pub game_tutorial: Option<String>,
     /// Markers over targets: where, what, colour (RGBA).
     pub markers: Vec<(Vec3, String, [u8; 4])>,
     /// The newest objective message: completed (or else added), and text.
     pub message: Option<(bool, String)>,
+    /// The same message as the scripts sent it, for the game's own HUD to
+    /// word.
+    pub game_message: Option<ObjectiveMessage>,
     /// The contract was just completed (for [`BANNER_TIME`] seconds).
     pub contract_complete: bool,
+    /// The regions the scripts have on the radar (see [`RADAR_REGIONS`]).
+    pub radar_regions: Vec<RadarRegion>,
+    /// The scripts' latest calls to the HUD's interface (see [`HUD_CALLS`]).
+    pub hud_calls: Vec<HudCall>,
+    /// The contract's objective list for the PDA as the scripts send it
+    /// (`Net.SendEvent_AddPDAMission`): text id and icon tag each.
+    pub pda_objectives: Vec<(String, String)>,
 }
 
 /// Seconds the contract's completion stays up.
 const BANNER_TIME: f32 = 10.0;
+
+/// The regions the scripts put on the radar (`Hud.Radar:AddLineRegion`:
+/// the world's boundary, shaded outside, as `WifVzBoundary` draws it),
+/// kept by the region's name in `__m2_radar_regions` for the game HUD,
+/// which runs the radar in a Lua state of its own. Here the call reaches
+/// no radar (there are no widgets in this state) and goes on as it would.
+const RADAR_REGIONS: &str = r#"
+__m2_radar_regions = {}
+local radar = Hud and Hud.Radar
+if radar then
+    local add, remove = radar.AddLineRegion, radar.RemoveLineRegion
+    radar.AddLineRegion = function(self, t)
+        local name = t and t.uGuid and Object.GetName(t.uGuid)
+        if name then
+            __m2_radar_regions[name] = {
+                nRed = t.nRed, nGreen = t.nGreen, nBlue = t.nBlue,
+                nAlpha = t.nAlpha, bInvert = t.bInvert and true or false,
+            }
+        end
+        if add then return add(self, t) end
+    end
+    radar.RemoveLineRegion = function(self, t)
+        local name = t and t.uGuid and Object.GetName(t.uGuid)
+        if name then __m2_radar_regions[name] = nil end
+        if remove then return remove(self, t) end
+    end
+end
+"#;
+
+/// The scripts' calls to the HUD's interface through the engine's `Hud`
+/// library (`Hud.Fanfare:Create`, `:AddItem`, `:Commence` as a contract
+/// ends...), which the engine hands to the HUD's `HudInterface`: kept,
+/// with their data copied as it was, in `__m2_hud_calls` (the latest 32)
+/// for the game HUD, which runs in a Lua state of its
+/// own. Each call then goes on as it would. The groups and methods are
+/// those `MrxGuiInterface` gives `HudInterface`.
+const HUD_CALLS: &str = r#"
+__m2_hud_calls = {}
+__m2_hud_call_count = 0
+local function copy(v, depth)
+    if type(v) ~= "table" then
+        if type(v) == "function" or type(v) == "userdata" then return nil end
+        return v
+    end
+    if depth > 3 then return nil end
+    local out = {}
+    for k, x in pairs(v) do out[k] = copy(x, depth + 1) end
+    return out
+end
+local methods = {
+    Fanfare = { "Create", "AddItem", "Commence" },
+    SupportFanfare = { "Create", "AddItem", "Commence" },
+    ContactFanfare = { "Commence" },
+    CardFanfare = { "Commence" },
+    JobFanfare = { "Complete", "Failed" },
+}
+for group, names in pairs(methods) do
+    local g = Hud and Hud[group]
+    if g then
+        for _, name in ipairs(names) do
+            local f = g[name]
+            g[name] = function(self, t, ...)
+                __m2_hud_call_count = __m2_hud_call_count + 1
+                table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
+                    group = group, method = name, data = copy(t, 0) })
+                if #__m2_hud_calls > 32 then table.remove(__m2_hud_calls, 1) end
+                if type(f) == "function" then return f(self, t, ...) end
+            end
+        end
+    end
+end
+"#;
 
 /// People this near a marker's target are listed with it, metres; story
 /// characters' spawns this near the player.
@@ -140,13 +227,14 @@ pub struct MissionLink {
     /// Time not yet given to the scripts.
     lag: f32,
     log: Option<BufWriter<File>>,
-    message: Option<(bool, String, f32)>,
+    /// The newest objective message, its text readable, and its age.
+    message: Option<(ObjectiveMessage, String, f32)>,
     drivers: Vec<(String, String)>,
     /// The scripts put the player somewhere the island has no way to hold
     /// her (in the start's boat, at sea): she goes ashore once the ground
     /// there has loaded. Tries left.
     ashore: u32,
-    /// The tutorial line up, readable.
+    /// The tutorial line up, with its key tokens.
     tutorial: Option<String>,
     /// Blasts since the scripts last ran, and support strikes' bombs.
     blasts: Vec<Vec3>,
@@ -579,13 +667,13 @@ impl MissionLink {
                     self.completed = Some(0.0);
                 }
             }
-            if let Some(line) = tutorial(mission, &self.keys) {
+            if let Some(line) = tutorial(mission) {
                 self.tutorial = line;
             }
             break_props(game, mission);
             let w = mission.world().borrow();
-            if let Some((done, text)) = w.hud.messages.last() {
-                self.message = Some((*done, mission.text(text), 0.0));
+            if let Some(m) = w.hud.messages.last() {
+                self.message = Some((m.clone(), mission.text(&m.text), 0.0));
             }
             drop(w);
             mission.world().borrow_mut().hud.messages.clear();
@@ -602,6 +690,12 @@ impl MissionLink {
         match Mission::new(data, HERO, at) {
             Ok(mut mission) => {
                 mission.fly_deliveries();
+                if let Err(e) = mission.run(RADAR_REGIONS, "radar regions") {
+                    self.write([format!("radar regions: {e}")]);
+                }
+                if let Err(e) = mission.run(HUD_CALLS, "hud calls") {
+                    self.write([format!("hud calls: {e}")]);
+                }
                 for (name, code) in std::mem::take(&mut self.drivers) {
                     if let Err(e) = mission.run(&code, &name) {
                         self.write([format!("{name}: {e}")]);
@@ -885,11 +979,9 @@ impl MissionLink {
 
     /// What the HUD shows.
     pub fn view(&self) -> MissionView {
-        let message = self
-            .message
-            .as_ref()
-            .filter(|m| m.2 < MESSAGE_TIME)
-            .map(|(done, text, _)| (*done, text.clone()));
+        let recent = self.message.as_ref().filter(|m| m.2 < MESSAGE_TIME);
+        let message = recent.map(|(m, text, _)| (m.done(), text.clone()));
+        let game_message = recent.map(|(m, ..)| m.clone());
         let mission = match &self.state {
             State::Loading(_) => {
                 return MissionView {
@@ -932,13 +1024,60 @@ impl MissionLink {
             .collect();
         MissionView {
             status: None,
-            tutorial: self.tutorial.clone(),
+            tutorial: self
+                .tutorial
+                .as_ref()
+                .map(|t| crate::input::name_keys(t, &self.keys)),
+            game_tutorial: self.tutorial.clone(),
             objectives,
             markers,
             message,
+            game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
+            radar_regions: radar_regions(mission.lua()),
+            hud_calls: hud_calls(mission.lua()),
+            pda_objectives: hud.mission.clone(),
         }
     }
+}
+
+/// The calls [`HUD_CALLS`] keeps, oldest first.
+fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
+    let Ok(Some(calls)) = lua.globals().get::<Option<mlua::Table>>("__m2_hud_calls") else {
+        return Vec::new();
+    };
+    calls
+        .sequence_values::<mlua::Table>()
+        .flatten()
+        .map(|t| HudCall {
+            seq: t.get("seq").unwrap_or(0),
+            group: t.get("group").unwrap_or_default(),
+            method: t.get("method").unwrap_or_default(),
+            data: Plain::of(&t.get("data").unwrap_or(mlua::Value::Nil)),
+        })
+        .collect()
+}
+
+/// The regions [`RADAR_REGIONS`] keeps, by name.
+fn radar_regions(lua: &mlua::Lua) -> Vec<RadarRegion> {
+    let Ok(Some(regions)) = lua
+        .globals()
+        .get::<Option<mlua::Table>>("__m2_radar_regions")
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<RadarRegion> = regions
+        .pairs::<String, mlua::Table>()
+        .flatten()
+        .map(|(name, t)| RadarRegion {
+            colour: ["nRed", "nGreen", "nBlue", "nAlpha"]
+                .map(|k| t.get::<Option<f64>>(k).ok().flatten()),
+            invert: t.get("bInvert").unwrap_or(false),
+            name,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 impl Fleet {
@@ -1102,16 +1241,15 @@ fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
 }
 
 /// The scripts' newest tutorial line since the last call, if they asked
-/// for one: its text, readable, with the keys it names as `keys` has them
-/// (`[P] Open PDA`), or none if they cleared it. Each call is logged with
-/// its arguments.
-fn tutorial(mission: &Mission, keys: &crate::input::Bindings) -> Option<Option<String>> {
+/// for one: its text, its key tokens kept (`[pda] Open PDA`), or none if
+/// they cleared it. Each call is logged with its arguments.
+fn tutorial(mission: &Mission) -> Option<Option<String>> {
     let calls = std::mem::take(&mut mission.world().borrow_mut().hud.tutorials);
     for args in &calls {
         eprintln!("mission: tutorial line {args:?}");
     }
     let args = calls.last()?;
-    Some(m2_game::hud::tutorial_text(args).map(|t| crate::input::name_keys(&mission.text(t), keys)))
+    Some(m2_game::hud::tutorial_text(args).map(|t| mission.text(t)))
 }
 
 /// The scripts' free support items, given her or taken back.
@@ -1673,6 +1811,48 @@ mod tests {
             kind: kind.into(),
             label: label.into(),
         }
+    }
+
+    #[test]
+    fn the_scripts_hud_calls_are_kept_as_they_were_made() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            Hud = { Fanfare = {} }
+            got = 0
+            function Hud.Fanfare:AddItem(t) got = got + 1 end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(
+            r#"
+            Hud.Fanfare:Create({ sType = "contract", fCallback = function() end })
+            local item = { sDescription = "[Fanfare.Completion.Total]", nValue = 5 }
+            Hud.Fanfare:AddItem(item)
+            item.nValue = 7
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].seq, calls[0].method.as_str()), (1, "Create"));
+        // The callback is left out; the item is as it was when added.
+        assert_eq!(
+            calls[0].data,
+            Plain::Table(vec![(
+                Plain::Text("sType".into()),
+                Plain::Text("contract".into())
+            )])
+        );
+        let Plain::Table(item) = &calls[1].data else {
+            panic!("{:?}", calls[1].data);
+        };
+        assert!(item.contains(&(Plain::Text("nValue".into()), Plain::Number(5.0))));
+        // The call still reaches what was there.
+        assert_eq!(lua.globals().get::<i64>("got").unwrap(), 1);
     }
 
     #[test]

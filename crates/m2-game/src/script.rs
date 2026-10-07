@@ -284,15 +284,22 @@ impl ScriptHost {
                     return Ok(MultiValue::new());
                 };
                 let name = format!("{library}.{}", k.to_string_lossy());
+                // `Player.GetAllTargetMarkerPos()`: a list, which
+                // scripts walk with `ipairs` straight away; empty.
+                let list = k.to_string_lossy().starts_with("GetAll");
                 let log = Rc::clone(&log);
-                let f = safe_function(lua, move |_, args| {
+                let f = safe_function(lua, move |lua, args| {
                     let mut shown = name.clone();
                     if STUB_ARGS.with(|on| *on) {
                         let args: Vec<String> = args.iter().map(show_arg).collect();
                         shown = format!("{shown}({})", args.join(", "));
                     }
                     log.borrow_mut().push(shown);
-                    Ok(MultiValue::new())
+                    Ok(if list {
+                        MultiValue::from_vec(vec![Value::Table(lua.create_table()?)])
+                    } else {
+                        MultiValue::new()
+                    })
                 })?;
                 t.raw_set(k.clone(), &f)?;
                 Ok(MultiValue::from_vec(vec![Value::Function(f)]))
@@ -595,6 +602,10 @@ fn default_for(lua: &Lua, name: &str) -> mlua::Result<Option<Value>> {
         // A handle (`uPlayer`) no script has set is nil: VzaCon001's PDA
         // Close watch fires only while the global `uPlayer` is unset.
         ('u', _) => Some(Value::Nil),
+        // An object a script keeps (`oSystemDialogBoxFlash`): nil until
+        // made, as scripts test it (`if MrxGuiDialogBox.oSystemDialogBoxFlash
+        // then`, read through the module to here).
+        ('o', _) => Some(Value::Nil),
         _ => None,
     })
 }
@@ -633,6 +644,15 @@ where
     })?;
     let wrap: Function = lua.named_registry_value("m2_wrap")?;
     wrap.call(raw)
+}
+
+/// The name of a stub (`"HealthCounter.Update"`), `None` for any other
+/// value.
+pub fn stub_name(value: &Value) -> Option<String> {
+    match value {
+        Value::Table(t) => t.raw_get::<Option<String>>(STUB_NAME).ok().flatten(),
+        _ => None,
+    }
 }
 
 fn stub(lua: &Lua, name: &str) -> mlua::Result<Table> {
@@ -844,6 +864,8 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((h, n, s.as_str(), b), (450.0, 1.0, "x", false));
+        let no_object: bool = host.lua().load("return oFlash == nil").eval().unwrap();
+        assert!(no_object);
         let is_stub: bool = host
             .lua()
             .load("return getmetatable(Event) ~= nil and tList[1] == 2")
@@ -883,6 +905,12 @@ mod tests {
             .unwrap();
         assert_eq!((known, missing), (1, None));
         assert_eq!(host.take_calls(), ["Pg.LoadSomething"]);
+        let empty: bool = host
+            .lua()
+            .load("return #Pg.GetAllMarkers() == 0")
+            .eval()
+            .unwrap();
+        assert!(empty);
     }
 
     #[test]
