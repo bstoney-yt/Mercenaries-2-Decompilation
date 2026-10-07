@@ -258,6 +258,9 @@ pub struct ScriptWorld {
     pub asset_request_max: u32,
     /// The game state (`Sys.RequestGameState`), `"Game"` while playing.
     pub game_state: String,
+    /// The player's cash (`Player.GetCash`, `Player.SetCash`); the
+    /// scripts' `MrxPmc.AddCashQty` reads it, adds and clamps.
+    pub cash: f64,
     /// Layers the archives hold and which are loaded.
     pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
@@ -736,6 +739,26 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let pg = lib("Pg")?;
+    // A region's outline in the world: the corners' x and z as two lists
+    // (the PDA map and radar draw the play area with them).
+    add(&pg, "GetLineRegionPoints", |w, lua, a| {
+        let guid = match a.first() {
+            Some(Value::String(s)) => w.by_name(&s.to_string_lossy()),
+            v => id(v),
+        };
+        let (xs, zs) = (lua.create_table()?, lua.create_table()?);
+        if let Some(g) = guid
+            && let (Some(r), Some(o)) = (w.regions.get(&g), w.objects.get(&g))
+        {
+            // Out of the region's own space, as `Region::contains` goes in.
+            let (s, c) = (-o.yaw).sin_cos();
+            for (i, [px, pz]) in r.corners.iter().enumerate() {
+                xs.raw_set(i + 1, o.position[0] + px * c - pz * s)?;
+                zs.raw_set(i + 1, o.position[2] + px * s + pz * c)?;
+            }
+        }
+        values([Value::Table(xs), Value::Table(zs)])
+    })?;
     add(&pg, "GetGuidByName", |w, _, a| {
         let g = match a.first() {
             Some(Value::String(s)) => {
@@ -1144,6 +1167,15 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::String(lua.create_string("PlayerLocation_Start")?)])
     })?;
     // The PMC's fuel tank: invented, the game's figure is not decoded.
+    add(&player, "GetCash", |w, _, _| {
+        values([Value::Number(w.cash)])
+    })?;
+    add(&player, "SetCash", |w, _, a| {
+        if let Some(c) = num(a.first()) {
+            w.cash = f64::from(c);
+        }
+        values([])
+    })?;
     add(&player, "GetFuelCapacity", |_, _, _| {
         values([Value::Number(100.0)])
     })?;

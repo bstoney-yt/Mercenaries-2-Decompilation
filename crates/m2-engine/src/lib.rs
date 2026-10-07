@@ -19,6 +19,7 @@ pub mod hijack;
 pub mod model;
 pub mod physics;
 pub mod pickup;
+pub mod population;
 pub mod scatter;
 pub mod stream;
 pub mod tuning;
