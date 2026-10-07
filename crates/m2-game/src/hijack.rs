@@ -716,6 +716,9 @@ pub struct ClipTimes {
     /// Seats (name hash, hardpoint name hash) by template name, lower
     /// case ([`m2_engine::hijack::seat_links`]).
     pub seats: HashMap<String, Vec<(u32, Option<u32>)>>,
+    /// Parts' starting states (part node name hash, state) by template
+    /// name, lower case ([`m2_engine::hijack::part_states`]).
+    pub parts: HashMap<String, Vec<(u32, u32)>>,
 }
 
 impl ClipTimes {
@@ -776,12 +779,16 @@ impl ClipTimes {
                 {
                     let sets = m2_engine::hijack::animation_sets(&db);
                     let mut seats = m2_engine::hijack::seat_links(&db);
+                    let mut parts = m2_engine::hijack::part_states(&db);
                     for (id, name) in db.names() {
                         if let Some(&s) = sets.get(&id) {
                             out.sets.insert(name.to_ascii_lowercase(), s);
                         }
                         if let Some(s) = seats.remove(&id) {
                             out.seats.insert(name.to_ascii_lowercase(), s);
+                        }
+                        if let Some(p) = parts.remove(&id) {
+                            out.parts.insert(name.to_ascii_lowercase(), p);
                         }
                     }
                 }

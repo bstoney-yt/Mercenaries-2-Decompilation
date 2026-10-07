@@ -474,6 +474,20 @@ impl GpuModel {
         Ok(Self::upload(backend, materials, &cpu)?)
     }
 
+    /// Hides the pieces on the nodes `off` marks, intact and wrecked alike:
+    /// parts a template puts in a state that shows nothing (the soft-top
+    /// jeep's gun mount, [`crate::hijack::part_states`]).
+    pub fn hide(&mut self, off: &[bool]) {
+        for hidden in &mut self.hidden {
+            if hidden.len() < off.len() {
+                hidden.resize(off.len(), false);
+            }
+            for (h, &o) in hidden.iter_mut().zip(off) {
+                *h |= o;
+            }
+        }
+    }
+
     /// Queues every piece at `world`, skinned geometry in its bind pose.
     pub fn draw(&self, queue: &mut DrawQueue, world: Mat4) {
         self.draw_as(queue, world, self.wrecked);
