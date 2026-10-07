@@ -226,6 +226,9 @@ pub struct Player {
     pub launcher: bool,
     /// Down (out of health): she lies where she fell.
     pub down: bool,
+    /// Sitting in the seat of the vehicle she drives, posed and placed
+    /// there (`hijack::Hijacks::seat`): drawn though driving.
+    pub seated: bool,
 }
 
 impl Player {
@@ -252,6 +255,7 @@ impl Player {
             bashing: None,
             launcher: false,
             down: false,
+            seated: false,
         }
     }
 

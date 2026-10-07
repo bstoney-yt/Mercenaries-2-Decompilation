@@ -713,6 +713,12 @@ pub struct ClipTimes {
     pub tables: Option<(AnimationTable, AnimationTable)>,
     /// `VehicleAnimationSet` class and name by template name, lower case.
     pub sets: HashMap<String, (u32, u32)>,
+    /// Seats (name hash, hardpoint name hash) by template name, lower
+    /// case ([`m2_engine::hijack::seat_links`]).
+    pub seats: HashMap<String, Vec<(u32, Option<u32>)>>,
+    /// Parts' starting states (part node name hash, state) by template
+    /// name, lower case ([`m2_engine::hijack::part_states`]).
+    pub parts: HashMap<String, Vec<(u32, u32)>>,
 }
 
 impl ClipTimes {
@@ -772,9 +778,17 @@ impl ClipTimes {
                     && let Ok(db) = Layer::parse(asset)
                 {
                     let sets = m2_engine::hijack::animation_sets(&db);
+                    let mut seats = m2_engine::hijack::seat_links(&db);
+                    let mut parts = m2_engine::hijack::part_states(&db);
                     for (id, name) in db.names() {
                         if let Some(&s) = sets.get(&id) {
                             out.sets.insert(name.to_ascii_lowercase(), s);
+                        }
+                        if let Some(s) = seats.remove(&id) {
+                            out.seats.insert(name.to_ascii_lowercase(), s);
+                        }
+                        if let Some(p) = parts.remove(&id) {
+                            out.parts.insert(name.to_ascii_lowercase(), p);
                         }
                     }
                 }
@@ -796,6 +810,13 @@ impl ClipTimes {
         let (a, b) = self.tables.as_ref()?;
         let clip = animation_table::vehicle_clip(a, b, state, action, class, name)?;
         Some((clip, self.lengths.get(&clip).copied()))
+    }
+
+    /// The clip a character sits in `seat` (a name hash) of a vehicle of
+    /// this animation set with: the scripts' `InVehicle`, `Idle`.
+    pub fn seated(&self, set: (u32, u32), seat: Option<u32>) -> Option<u32> {
+        let (a, b) = self.tables.as_ref()?;
+        animation_table::seat_clip(a, b, "InVehicle", "Idle", set, seat)
     }
 }
 
