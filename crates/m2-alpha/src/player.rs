@@ -144,6 +144,7 @@ impl Intent {
             look,
             trigger: Trigger {
                 fire: input.held(Action::Fire),
+                reload: input.take_pressed(Action::Reload),
                 aim: input.held(Action::Aim),
                 throw: input.take_pressed(Action::Throw),
                 melee: input.take_pressed(Action::Melee),

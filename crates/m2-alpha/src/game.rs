@@ -885,6 +885,10 @@ impl Game {
                     .filter(|_| self.combat.second == Some(Weapon::GrenadeLauncher))
                     .map(|r| [r.clip, r.stored]),
                 grenades: self.combat.grenades,
+                rifle: Some([
+                    self.combat.rifle_rounds.clip,
+                    self.combat.rifle_rounds.stored,
+                ]),
             },
             vehicles,
             killed: self.scene.people.all_killed(),
@@ -926,6 +930,12 @@ impl Game {
             _ => self.combat.carbine_only(),
         }
         self.combat.grenades = p.grenades.min(combat::MAX_GRENADES);
+        if let Some([clip, stored]) = p.rifle {
+            self.combat.rifle_rounds = combat::Rounds {
+                clip: clip.min(combat::RIFLE_CLIP),
+                stored: stored.min(combat::RIFLE_SPARE),
+            };
+        }
         self.combat.weapon = match (p.weapon.as_str(), self.combat.second) {
             ("rpg" | "grenade launcher", Some(w)) => w,
             _ => Weapon::Rifle,
@@ -1010,11 +1020,12 @@ impl Game {
             weapon: self.combat.weapon,
             second: self.combat.second,
             grenades: self.combat.grenades,
-            rounds: self
-                .combat
-                .launcher_rounds
-                .filter(|_| self.combat.weapon == Weapon::GrenadeLauncher)
-                .map(|r| (r.clip, r.stored)),
+            rounds: match self.combat.weapon {
+                Weapon::Rifle => Some(self.combat.rifle_rounds),
+                Weapon::GrenadeLauncher => self.combat.launcher_rounds,
+                Weapon::Rpg => None,
+            }
+            .map(|r| (r.clip, r.stored)),
             // Looking through the satellite, its own overlay is shown.
             prompt: prompt.filter(|_| !self.support.busy()),
             driving,

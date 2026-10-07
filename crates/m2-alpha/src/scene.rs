@@ -235,15 +235,16 @@ impl Rig {
 
     /// Moves at `gait` holding a rifle as `carry` says. Aiming, it is
     /// shouldered: by the whole body standing, by the upper body over the
-    /// legs' gait when moving. Otherwise the plain gait carries it low in
-    /// the right hand (as the game does), except that a soldier at the
-    /// ready standing holds it across the chest. Falls back to the plain
-    /// gait without the clips.
+    /// legs' gait when moving. Running, it is held low across the body in
+    /// both hands; otherwise the plain gait carries it low in the right
+    /// hand, except that a soldier at the ready standing holds it across
+    /// the chest. Falls back to the plain gait without the clips.
     pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, carry: Carry) {
         let (whole, upper) = match (gait, carry) {
             (Gait::Idle, Carry::Aim) => (clips.aim, None),
             (_, Carry::Aim) => (None, clips.aim),
             (Gait::Idle, Carry::Ready) => (clips.ready, None),
+            (Gait::Run, _) => (clips.run_low, None),
             _ => (None, None),
         };
         match whole {
@@ -260,7 +261,7 @@ impl Rig {
         }
         // Carried low on the move, the rifle arm hangs as it does standing
         // while the rest of her runs (the game's carry).
-        let arm = (carry == Carry::Low && gait != Gait::Idle)
+        let arm = (carry == Carry::Low && gait != Gait::Idle && whole.is_none())
             .then(|| self.gait_clip(Gait::Idle).zip(self.carry_arm()))
             .flatten();
         self.animator.set_upper(upper.or(arm));
