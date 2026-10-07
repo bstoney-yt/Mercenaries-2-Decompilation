@@ -626,6 +626,21 @@ impl Mission {
         }
     }
 
+    /// Spawns a template (`"M1A2"`) into the scripts' world as the
+    /// scripts' `Pg.Spawn` does, facing north; its guid.
+    pub fn spawn(&mut self, template: &str, at: [f32; 3]) -> Option<u32> {
+        let v: mlua::Value = self
+            .host
+            .lua()
+            .load(format!(
+                "return Pg.Spawn({template:?}, {}, {}, {}, 0)",
+                at[0], at[1], at[2]
+            ))
+            .eval()
+            .ok()?;
+        crate::events::as_guid(&v)
+    }
+
     /// The minigames waiting on the player's pad (a hijack's prompts).
     pub fn minigames(&self) -> Vec<crate::hijack::Minigame> {
         self.events.minigames()
@@ -643,9 +658,10 @@ impl Mission {
         self.world.borrow_mut().hijack.set_flying(guid, flying);
     }
 
-    /// Where `guid`'s hardpoint `name` (`hp_seat_lt`, a node of its model)
-    /// is in the world now; hijacks set off their explosions there.
-    pub fn set_hardpoint(&mut self, guid: u32, name: &str, at: [f32; 3]) {
+    /// Where `guid`'s hardpoint (`hp_seat_lt`, a node of its model, by
+    /// name hash) is in the world now; hijacks set off their explosions
+    /// there.
+    pub fn set_hardpoint(&mut self, guid: u32, name: u32, at: [f32; 3]) {
         self.world.borrow_mut().hijack.set_hardpoint(guid, name, at);
     }
 

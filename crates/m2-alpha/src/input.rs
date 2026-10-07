@@ -58,6 +58,13 @@ pub enum Action {
     QuickSave,
     QuickLoad,
     Quit,
+    /// The pad's face buttons Y, A, X and B, which a hijack's prompts ask
+    /// for ([`crate::hijack`]); the left stick's pushes are the movement
+    /// keys.
+    PadY,
+    PadA,
+    PadX,
+    PadB,
 }
 
 /// Which keys trigger each action, as written in the settings file
@@ -98,6 +105,12 @@ impl Default for Bindings {
             (QuickSave, vec![F5]),
             (QuickLoad, vec![F9]),
             (Quit, vec![Escape]),
+            // Laid out as the face buttons are (not the PC game's keys,
+            // which aren't known yet).
+            (PadY, vec![KeyI]),
+            (PadA, vec![KeyK]),
+            (PadX, vec![KeyJ]),
+            (PadB, vec![KeyL]),
         ]))
     }
 }

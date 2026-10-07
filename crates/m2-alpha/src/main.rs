@@ -43,6 +43,7 @@ mod config;
 mod drops;
 mod flights;
 mod game;
+mod hijack;
 mod input;
 mod mission;
 mod npc;
@@ -166,6 +167,9 @@ struct Options {
     look_pickup: Option<f32>,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
+    /// Every hijackable vehicle is crewed by this human template, to test
+    /// hijacking ([`hijack`]) before the island's vehicles have crews.
+    hijack_crew: Option<String>,
     mission_seconds: f32,
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
@@ -284,6 +288,7 @@ fn parse_args() -> anyhow::Result<Options> {
                     .to_radians()
             }
             "--mission" => o.mission = true,
+            "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--mission-driver" => {
                 let path = value()?;
                 let code =
@@ -465,6 +470,7 @@ fn main() -> anyhow::Result<()> {
         fly: options.fly,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
+        hijack_crew: options.hijack_crew.clone(),
         state: None,
         error: None,
     };
@@ -3141,6 +3147,7 @@ struct Running {
     hud: ui::Hud,
     egui: egui_winit::State,
     mission: Option<mission::MissionLink>,
+    hijacks: Option<hijack::Hijacks>,
 }
 
 struct App {
@@ -3155,6 +3162,7 @@ struct App {
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
     mission_drivers: Vec<(String, String)>,
+    hijack_crew: Option<String>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -3221,6 +3229,12 @@ impl App {
                 ),
                 _ => None,
             },
+            hijacks: match (&self.install, &self.mode, &self.hijack_crew) {
+                (Some(install), Mode::Island(_), Some(crew)) => {
+                    Some(hijack::Hijacks::start(install, Some(crew.clone())))
+                }
+                _ => None,
+            },
         })
     }
 
@@ -3259,12 +3273,18 @@ impl Running {
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
         let (w, h) = self.backend.size();
-        let info = hud_info(
+        let mut info = hud_info(
             &self.game,
             self.mission.as_ref(),
             config.camera.fov,
             w as f32 / h as f32,
         );
+        if let Some(v) = self.hijacks.as_ref().and_then(hijack::Hijacks::view) {
+            // The game's own prompt (`Hijack %s`); the buttons it asks
+            // for are the HUD's to draw.
+            info.prompt = (!v.running).then(|| format!("Hijack {}", v.vehicle));
+            info.can_enter = None;
+        }
         let (action, output) = self.hud.build(input, &info, config);
         self.egui.handle_platform_output(&self.window, output);
         if config.window.vsync != vsync {
@@ -3390,6 +3410,9 @@ impl Running {
                 "back-face culling {}",
                 if self.culling { "on" } else { "off" }
             );
+        }
+        if let Some(h) = &mut self.hijacks {
+            h.tick(&mut self.game, &mut self.input, TICK.as_secs_f32());
         }
         self.game.tick(
             &mut self.input,
