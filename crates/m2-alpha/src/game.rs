@@ -7,7 +7,7 @@ use m2_engine::atmosphere::AtmosphereMix;
 use m2_engine::durability::Explosion;
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{
-    CatalogueEntry, Physics, StaticKey, Templates, VehicleControls, VehicleSpec, World,
+    CatalogueEntry, Install, Physics, StaticKey, Templates, VehicleControls, VehicleSpec, World,
 };
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3, Vec4, Vec4Swizzles};
 use m2_render::View;
@@ -15,7 +15,7 @@ use m2_render::View;
 use crate::camera::FlyCamera;
 use crate::combat::{self, Combat, Effect, Field, Weapon};
 use crate::config::CameraConfig;
-use crate::destruct::{Blast, Destruction};
+use crate::destruct::{Blast, Crashed, Crasher, Destruction};
 use crate::drops::{Drops, Soldier};
 use crate::input::{Action, Input};
 use crate::mission::{WATERLINE, template_models};
@@ -509,7 +509,13 @@ impl Game {
             }
             self.traffic
                 .drive(&mut world.physics, &self.scene.vehicles, driven);
-            knock_loose(world, &mut self.scene.props, &self.scene.vehicles);
+            knock_loose(
+                world,
+                &mut self.scene.props,
+                &self.scene.vehicles,
+                &mut self.destruction,
+                self.scene.install.as_ref(),
+            );
             self.scene.props.advance(dt);
             self.spray_wait -= dt;
             if self.spray_wait <= 0.0 {
@@ -1518,8 +1524,16 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
 /// Vehicles knock loose what they hit that comes loose, with the weight
 /// and speed for it ([`KNOCK_RATIO`]): it flies off ahead, and the vehicle
 /// ploughs on slowed as by the mass it shifted, rather than stopped as by
-/// a wall (the step just taken stopped it).
-fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle]) {
+/// a wall (the step just taken stopped it). First they break what they
+/// run into that their weight breaks ([`Destruction::crash`]: plants,
+/// bushes, fences, lampposts), going on through it.
+fn knock_loose(
+    world: &mut World,
+    props: &mut Props,
+    vehicles: &[ParkedVehicle],
+    destruction: &mut Destruction,
+    install: Option<&Install>,
+) {
     for v in vehicles {
         let Some(id) = v.id else { continue };
         let before = world.physics.vehicle_velocity_before(id);
@@ -1532,7 +1546,33 @@ fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle])
         }
         let mass = v.spec.mass;
         let mut shifted = 0.0;
-        for key in world.physics.vehicle_statics(id) {
+        let mut keys = world.physics.vehicle_statics(id);
+        let mut ploughed = false;
+        let mut down = Vec::new();
+        if let (Some(install), Some(place)) = (install, world.physics.vehicle_transform(id)) {
+            let crasher = Crasher {
+                place,
+                bounds: v.model.bounds,
+                velocity: before,
+                mass,
+            };
+            for c in destruction.crash(world, props, install, &crasher) {
+                match c {
+                    Crashed::Down(i) => {
+                        ploughed |= keys.contains(&StaticKey::Object(i));
+                        down.push(StaticKey::Object(i));
+                    }
+                    Crashed::Loose(i) => {
+                        if !keys.contains(&StaticKey::Object(i)) {
+                            keys.push(StaticKey::Object(i));
+                        }
+                    }
+                }
+            }
+        }
+        // What broke is not knocked loose as well.
+        keys.retain(|k| !down.contains(k));
+        for key in keys {
             let loose = match key {
                 StaticKey::Object(i) => world.loose_mass(i),
                 StaticKey::Entity(e) => props.loose_mass(&world.physics, e),
@@ -1557,7 +1597,7 @@ fn knock_loose(world: &mut World, props: &mut Props, vehicles: &[ParkedVehicle])
                 );
             }
         }
-        if shifted > 0.0 {
+        if shifted > 0.0 || ploughed {
             world
                 .physics
                 .set_vehicle_velocity(id, before * (mass / (mass + shifted)));
