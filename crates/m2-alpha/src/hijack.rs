@@ -114,12 +114,11 @@ struct Active {
     pistol_parent: Option<Mat4>,
     /// The vehicle's hijack clip playing alongside hers.
     vehicle_clip: Option<Clip>,
-    /// Her clips' height above the vehicle's origin, from where its clip
-    /// puts the pistol in her hand (the AMX30's clips are cut ~1.5 m
-    /// below its deck, the M1A2's on it): one for the whole hijack, and
-    /// how far the gap strayed in the clip it was taken from.
-    lift: f32,
-    steady: f32,
+    /// Her clips' height above the vehicle's origin (the AMX30's are cut
+    /// ~1.2 m below its deck, the M1A2's on it), one for the whole hijack
+    /// from her first clip, and that clip, played unlifted on the ground.
+    lift: Option<f32>,
+    first: Option<usize>,
 }
 
 /// What the HUD shows of a hijack.
@@ -400,8 +399,8 @@ impl Hijacks {
             self.active = Some(Active {
                 pistol_parent,
                 vehicle_clip: None,
-                lift: 0.0,
-                steady: HELD,
+                lift: None,
+                first: None,
                 vehicle: c.vehicle,
                 hero,
                 set: l.clips.sets.get(&c.template.to_ascii_lowercase()).copied(),
@@ -550,7 +549,12 @@ impl Hijacks {
         let off = m2_math::glam::Quat::from_rotation_y(yaw)
             * Vec3::new(root.x - c.info.pin.x, 0.0, root.z - c.info.pin.y);
         p.facing = yaw + model_yaw;
-        p.character.position = origin + off + Vec3::Y * a.lift;
+        let lift = if a.clip == a.first {
+            0.0
+        } else {
+            a.lift.unwrap_or(0.0)
+        };
+        p.character.position = origin + off + Vec3::Y * lift;
         // The camera follows her about the vehicle.
         p.chase_target = Some((
             p.character.position + Vec3::Y * CAMERA_LIFT,
@@ -710,15 +714,15 @@ fn follow(
             _ => {}
         }
     }
-    if started && let Some((lift, spread)) = lift(a, game) {
-        eprintln!("hijack: hand to pistol {lift:.2} m, spread {spread:.2}");
-        // Only while she holds it does the gap stay put; the steadiest
-        // such clip sets the lift for all of them.
-        if spread < a.steady {
-            a.lift = lift;
-            a.steady = spread;
+    if a.first.is_none() {
+        a.first = a.clip;
+    }
+    if started && let Some((gap, spread)) = lift(a, game) {
+        eprintln!("hijack: hand to pistol {gap:.2} m, spread {spread:.2}");
+        if a.lift.is_none() && a.clip == a.first {
+            a.lift = Some(gap - FIRST_GAP);
+            eprintln!("hijack: her clips {:.2} m up", gap - FIRST_GAP);
         }
-        eprintln!("hijack: her clips {:.2} m up", a.lift);
     }
     let (done, left): (Vec<_>, Vec<_>) = a.actions.iter().partition(|x| x.1 <= now);
     a.actions = left;
@@ -785,9 +789,13 @@ fn load(game: &mut Game, hash: u32) -> Option<Clip> {
     Clip::parse(&bytes).ok()
 }
 
-/// The most the hand-to-pistol gap may stray in a clip for her to be
-/// holding it, metres (inferred from rounds H17 and H18).
-const HELD: f32 = 0.25;
+/// Her right hand's height below the pistol, metres, in her first clip
+/// when that clip plays at the vehicle's origin: the pistol still rests
+/// on the vehicle. Inferred from rounds H18 and H19: on both the M1A2
+/// and the AMX30 the first clip's gap is 1.10-1.17 m more than the gap
+/// while she holds the pistol (when it should be about none), and the
+/// M1A2's clips, which fit its hull unlifted, give 1.08.
+const FIRST_GAP: f32 = 1.1;
 
 /// How high her clip must play for her right hand to be where the
 /// vehicle's clip puts the pistol: the median over the two clips' frames,
