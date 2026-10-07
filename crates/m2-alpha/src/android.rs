@@ -3,17 +3,18 @@
 //! game's folder, and mouse capture.
 //!
 //! The game is read from the `Mercenaries2Alpha` folder at the top of the
-//! phone's storage, where the player drags a folder holding the APK and
+//! phone's storage (or the top of the storage, or the downloads), where the player drags a folder holding the APK and
 //! their install's `data` folder. Reading it needs "all files access",
 //! which the app asks for (by opening its settings page) when it can't read
 //! the game there. The app's own folder (`Android/data/<package>/files`)
-//! works too, without that permission. Settings, saves, the catalogue cache,
-//! the log (`m2-alpha.log`) and crash reports are kept beside the game.
+//! works too, without that permission. Settings, saves, the catalogue cache
+//! and crash reports are kept beside the game; the log (`m2-alpha.log`) goes
+//! to the downloads.
 //! Arguments the desktop takes on its command line can go in
 //! `m2-alpha-args.txt` there. Movies are skipped: they need `ffmpeg`, which
 //! the phone doesn't have.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use jni::objects::{JObject, JValue};
 use jni::{JNIEnv, JavaVM};
@@ -24,37 +25,54 @@ use winit::platform::android::activity::AndroidApp;
 
 const ARGS_FILE: &str = "m2-alpha-args.txt";
 const LOG_FILE: &str = "m2-alpha.log";
-/// The folder the player drags onto the phone.
-const SHARED: &str = "/storage/emulated/0/Mercenaries2Alpha";
+/// The top of the phone's shared storage.
+const STORAGE: &str = "/storage/emulated/0";
+/// The folder the player drags onto the phone (its name), and where else
+/// the game may have landed: the top of the storage, or the downloads.
+const SHARED: [&str; 4] = [
+    "Mercenaries2Alpha",
+    "",
+    "Download/Mercenaries2Alpha",
+    "Download",
+];
 
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
     let own = app
         .external_data_path()
         .or_else(|| app.internal_data_path());
-    let shared = PathBuf::from(SHARED);
-    let found = [Some(shared.clone()), own.clone()]
-        .into_iter()
-        .flatten()
+    // The log goes to the downloads, which the player can open without
+    // all files access (an app may add files there), else beside the game.
+    let downloads = Path::new(STORAGE).join("Download").join(LOG_FILE);
+    let logged = log_to(&downloads);
+    let access = all_files_access();
+    let found = SHARED
+        .iter()
+        .map(|dir| Path::new(STORAGE).join(dir))
+        .chain(own.clone())
         .find(|dir| Install::find(dir).is_ok());
     let home = found.clone().or(own);
     if let Some(home) = &home {
         let _ = std::fs::create_dir_all(home);
         let _ = std::env::set_current_dir(home);
-        log_to(&home.join(LOG_FILE));
+        if !logged {
+            log_to(&home.join(LOG_FILE));
+        }
     }
     super::keep_crash_reports();
-    if let Some(home) = &home {
-        eprintln!("game folder: {}", home.display());
-    }
-    if found.is_none() {
-        eprintln!(
-            "the game is not in {SHARED} (or it can't be read there): copy the install's data folder there"
-        );
-        if !all_files_access() {
-            eprintln!("asking for all files access; open the game again after allowing it");
-            if let Err(e) = with_activity(ask_all_files_access) {
-                eprintln!("all files access: {e}");
+    eprintln!("all files access: {access:?}");
+    match &found {
+        Some(dir) => eprintln!("game found in {}", dir.display()),
+        None => {
+            eprintln!(
+                "the game was not found: put the install's data folder in {STORAGE}/{}",
+                SHARED[0]
+            );
+            if !matches!(access, Ok(true)) {
+                eprintln!("asking for all files access; open the game again after allowing it");
+                if let Err(e) = with_activity(ask_all_files_access) {
+                    eprintln!("could not open the all files access page: {e}");
+                }
             }
         }
     }
@@ -73,14 +91,15 @@ fn android_main(app: AndroidApp) {
 }
 
 /// Sends standard error (where the game reports) to `path`: an app has no
-/// console.
-fn log_to(path: &Path) {
+/// console. False when the file can't be made.
+fn log_to(path: &Path) -> bool {
     use std::os::fd::AsRawFd as _;
-    if let Ok(file) = std::fs::File::create(path) {
-        // SAFETY: both descriptors are open; dup2 leaves `file`'s own to be
-        // closed when it drops.
-        unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
-    }
+    let Ok(file) = std::fs::File::create(path) else {
+        return false;
+    };
+    // SAFETY: both descriptors are open; dup2 leaves `file`'s own to be
+    // closed when it drops.
+    unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) != -1 }
 }
 
 /// Captures the mouse (`on`) or lets it go: while captured it moves no
@@ -112,8 +131,8 @@ fn try_capture(on: bool) -> jni::errors::Result<()> {
 }
 
 /// Whether the app may read any file on the shared storage (Android 11 and
-/// later ask for this; older ones don't have it).
-fn all_files_access() -> bool {
+/// later ask for this).
+fn all_files_access() -> jni::errors::Result<bool> {
     with_activity(|env, _| {
         env.call_static_method(
             "android/os/Environment",
@@ -123,7 +142,6 @@ fn all_files_access() -> bool {
         )?
         .z()
     })
-    .unwrap_or(true)
 }
 
 /// Opens the app's "all files access" settings page.
