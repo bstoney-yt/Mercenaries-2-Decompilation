@@ -123,6 +123,10 @@ struct Options {
     /// With `--screenshot`: rocket the nearest building until it comes
     /// down, at most this many rockets.
     demolish: Option<u32>,
+    /// With `--drive`: park the vehicle facing the nearest thing of this
+    /// kind it breaks or shoves (fence, plant, lamp, box) and drive
+    /// straight through it.
+    plough: Option<String>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
     /// With `--drive`: a vehicle whose name holds this.
@@ -286,6 +290,7 @@ fn parse_args() -> anyhow::Result<Options> {
                         .context("--demolish expects a rocket count")?,
                 )
             }
+            "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
             "--vehicle" => o.vehicle = Some(value()?.to_ascii_lowercase()),
             "--look" => {
@@ -2170,6 +2175,79 @@ fn look_at_story_character(game: &mut Game) {
 /// forward for four seconds (backing out first if it is parked close
 /// behind something, and steering round what it meets), printing how it
 /// went.
+/// Parks the vehicle she drives 12 m short of the nearest placed object
+/// of `kind` (within 150 m) that vehicles break or shove: "fence" (broken
+/// by a heavy enough vehicle), "plant" (flattened), "lamp" (knocked over)
+/// or "box" (loose, no such property), facing it. True if it found one.
+fn plough_at(game: &mut Game, kind: &str) -> bool {
+    use m2_engine::durability::CrashHow;
+    use m2_math::glam::{Quat, Vec3};
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        return false;
+    };
+    let Some(world) = game.scene.world.as_mut() else {
+        return false;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return false;
+    };
+    let Some(here) = world
+        .physics
+        .vehicle_transform(id)
+        .map(|t| t.w_axis.truncate())
+    else {
+        return false;
+    };
+    let wanted = |w: &m2_engine::World, o: usize| {
+        let t = w.index.objects[o].template;
+        let crash = w.index.template_db.crashable.get(&t).map(|c| c.how);
+        match kind {
+            "fence" => crash == Some(CrashHow::Breaks),
+            "plant" => crash == Some(CrashHow::Flattened),
+            "lamp" => crash == Some(CrashHow::KnockedOver),
+            "box" => crash.is_none() && w.loose_mass(o).is_some(),
+            _ => crash.is_some(),
+        }
+    };
+    let Some((o, d)) = world
+        .near(here, 150.0)
+        .into_iter()
+        .filter(|&(o, _)| wanted(world, o))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        eprintln!("plough: no {kind} within 150 m of {here:.1}");
+        return false;
+    };
+    let target = world.index.objects[o];
+    let back = (here - target.position).with_y(0.0).normalize_or(Vec3::X);
+    let spot = target.position + back * 12.0;
+    let ground = world
+        .physics
+        .island_below(spot.with_y(spot.y + 200.0), 400.0)
+        .unwrap_or(spot.y);
+    let ahead = -back;
+    let turn = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
+    world.physics.remove_vehicle(id);
+    let v = &mut game.scene.vehicles[i];
+    v.id = Some(
+        world
+            .physics
+            .add_vehicle_turned(&v.spec, spot.with_y(ground + 1.0), turn),
+    );
+    eprintln!(
+        "plough: {kind}: object {o} (model {:08x}, template {:08x}, crash {:?}, loose {:?}) at \
+         {:.1}, {d:.1} m off; the {} parked 12 m short at {:.1}, facing it",
+        target.model,
+        target.template,
+        world.index.template_db.crashable.get(&target.template),
+        world.loose_mass(o),
+        target.position,
+        v.spec.label,
+        spot.with_y(ground)
+    );
+    true
+}
+
 fn drive_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -2306,6 +2384,10 @@ fn drive_for_screenshot(
             game.step(brake, tick);
         }
     }
+    let ploughing = options
+        .plough
+        .as_deref()
+        .is_some_and(|kind| plough_at(game, kind));
     let from = game.driving().map(|(at, _)| at);
     // Who is about, to see they keep moving while she drives.
     let before: Vec<m2_math::glam::Vec3> = game
@@ -2317,7 +2399,9 @@ fn drive_for_screenshot(
         .collect();
     for i in 0..240 {
         let steer = match (game.scene.world.as_ref(), driven(game)) {
-            (Some(w), Some((id, hull))) => autoplay::steer_round(&w.physics, id, hull),
+            (Some(w), Some((id, hull))) if !ploughing => {
+                autoplay::steer_round(&w.physics, id, hull)
+            }
             _ => 0.0,
         };
         let throttle = Intent {
