@@ -154,6 +154,8 @@ const PANIC_RANGE: f32 = 40.0;
 /// (the VZ soldiers' rifle). Her template's health is 100 (Mattias 120);
 /// the Hero damage modifier and any falloff with range are not decoded.
 const NPC_DAMAGE: f32 = 9.0;
+/// A VZ soldier's `Accuracy`, which the shot spread above was tuned for.
+const VZ_ACCURACY: f32 = 0.4;
 /// People are hit within this distance of the line from shins to head.
 const BODY_RADIUS: f32 = 0.3;
 /// Health comes back after this many quiet seconds, at this rate a second.
@@ -1241,11 +1243,14 @@ impl Combat {
         let holding = on_foot && (trigger.aim || self.aim_left > 0.0);
         f.player.aiming = holding;
 
-        // Soldiers' shots.
+        // Soldiers' shots and grenades.
         let target = self.target(f.player, true);
         for i in 0..f.people.npcs.len() {
             if std::mem::take(&mut f.people.npcs[i].fires) {
                 self.npc_shoot(f, i, target);
+            }
+            if let Some(at) = f.people.npcs[i].throws.take() {
+                self.npc_throw(f, i, at);
             }
         }
         self.fly(f, dt);
@@ -1346,6 +1351,22 @@ impl Combat {
         alarm(f.people, f.player.character.position);
     }
 
+    /// A soldier's grenade lobbed from over his head down onto `at` (as
+    /// hard as she throws), or as far as it goes that way.
+    fn npc_throw(&mut self, f: &mut Field<'_>, i: usize, at: Vec3) {
+        let n = &f.people.npcs[i];
+        let from = n.character.position + Vec3::Y * 1.8;
+        eprintln!("grenade: a soldier throws from {from:.1} at {at:.1}");
+        let gravity = m2_engine::physics::GRAVITY;
+        let velocity =
+            lob_velocity(from, at, THROW, gravity).unwrap_or_else(|| farthest(at - from, THROW));
+        self.projectiles.push(Projectile::Grenade {
+            at: from,
+            velocity,
+            fuse: FUSE,
+        });
+    }
+
     fn npc_shoot(&mut self, f: &mut Field<'_>, i: usize, target: Option<Vec3>) {
         let Some(aim) = target else { return };
         let n = &f.people.npcs[i];
@@ -1365,8 +1386,11 @@ impl Combat {
             _ => n.chest(),
         };
         let distance = from.distance(aim);
-        // Spread grows with range: about a third hit at 20 m.
-        let spread = 0.02 + distance * 0.004;
+        // Spread grows with range: about a third hit at 20 m for a VZ
+        // soldier (`Accuracy` 0.4); the more accurate miss by less
+        // (inferred: by what they lack of a perfect 1).
+        let spread = (0.02 + distance * 0.004)
+            * ((1.0 - n.accuracy()) / (1.0 - VZ_ACCURACY)).clamp(0.2, 2.0);
         let dir = ((aim - from).normalize_or_zero()
             + Vec3::new(
                 self.random() * spread * 2.0,
@@ -2046,7 +2070,9 @@ impl Combat {
             }
         }
         if let Some(d) = her {
-            self.hurt_player(f, d, Some(at));
+            // For checking what hurts her (autoplay logs).
+            eprintln!("blast: at {at:.1}, she takes {d:.0}");
+                        self.hurt_player(f, d, Some(at));
         }
         if killed {
             self.remarks.push(Remark::Kill);
@@ -2166,7 +2192,7 @@ fn alarm(people: &mut People, at: Vec3) {
             continue;
         }
         let d = n.character.position.distance(at);
-        if n.soldier && d < ALERT_RANGE {
+        if n.soldier && !n.ai.flags.pacifist && d < ALERT_RANGE * n.ai.hearing {
             n.alert = true;
         }
         if !n.soldier && d < PANIC_RANGE {

@@ -30,6 +30,7 @@ use m2_render::{
     VertexSemantic,
 };
 
+use crate::ai::AiProfile;
 use crate::assets::{AssetError, AssetSource};
 use crate::atmosphere::{Atmosphere, AtmosphereRegion};
 use crate::motion::PropMotion;
@@ -261,6 +262,8 @@ pub struct Templates {
     pub leavings: Leavings,
     /// Spawners, the lists they spawn from, and patrols' haste.
     pub population: crate::population::Population,
+    /// How the person templates fight and notice things, by id.
+    pub ai: HashMap<u32, AiProfile>,
 }
 
 impl Templates {
@@ -476,6 +479,7 @@ impl Templates {
             leavings: crate::pickup::read(&db),
             motions: crate::motion::read_templates(&db),
             population: crate::population::Population::read(&db),
+            ai: crate::ai::read(&db),
         };
         (templates, atmosphere)
     }
@@ -595,6 +599,9 @@ pub struct SpawnPoint {
     /// For a spawner of people (`PathSpawner_GurHQ_Peds`): whom its list
     /// spawns, by template name, with each one's model and weight.
     pub list: Vec<(String, u32, f32)>,
+    /// How its template fights, with the entity's own `AiBehavior`
+    /// switches when it has them; `None` when the template has no `Ai`.
+    pub ai: Option<AiProfile>,
 }
 
 /// Where everything on the island is.
@@ -1021,8 +1028,19 @@ impl WorldIndex {
                 })
                 .collect()
         };
+        // An entity's own `AiBehavior` stands in for its template's.
+        let behaviour = layer.component("AiBehavior").map(crate::tuning::Table::of);
         let spawn = |id: u32, p: &Placement| {
             let template = templates.by_id(p.parent);
+            let ai = templates.ai.get(&p.parent).map(|a| {
+                let own = behaviour
+                    .as_ref()
+                    .and_then(|t| t.of_template(id).first().map(|r| crate::ai::flags(t, r)));
+                AiProfile {
+                    flags: own.unwrap_or(a.flags),
+                    ..*a
+                }
+            });
             SpawnPoint {
                 entity: id,
                 name: names.get(&id).copied().unwrap_or("").to_owned(),
@@ -1033,6 +1051,7 @@ impl WorldIndex {
                 layer: (!is_static).then_some(layer_hash),
                 model: template.and_then(|(_, t)| t.model.filter(|_| t.human)),
                 list: people_of(id, p),
+                ai,
             }
         };
         for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {

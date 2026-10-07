@@ -63,6 +63,16 @@
 //!                           components' fields (text fields not read), a
 //!                           field naming another template followed by its
 //!                           name; then the templates they name, likewise
+//! ai[:<word>,..]           the AI side of the data: every component of the
+//!                           template database (name, templates); those
+//!                           whose name holds a word (default ai,
+//!                           perception, squad, alarm, target, threat,
+//!                           combat, cover, behav, sense, aware, attack,
+//!                           faction) with their schema (field hash, name,
+//!                           type, offset, bits), each field's most common
+//!                           values, their distinct records (templates
+//!                           sharing it); then the same components across
+//!                           every layer, as field value counts
 //! parents[:<word>,..]       how entities' Transform `Parent` matches the
 //!                           template database (counts, and whether named
 //!                           entities' parents carry their name), then
@@ -784,6 +794,7 @@ fn main() -> Result<(), Error> {
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
+            "ai" => ai_side(&mut source, &names, arg),
             "parents" => parents(&mut source, &names, arg),
             "cues" => cues(&mut source, &names, arg),
             "sounddb" => sounddb(&mut source, &names, arg),
@@ -4332,6 +4343,218 @@ fn templates<R: Read + Seek>(
         for id in named.into_iter().take(60) {
             show(id, tnames[&id], &mut more);
         }
+    }
+    Ok(())
+}
+
+/// Default words for [`ai_side`]: components whose name holds one.
+const AI_WORDS: [&str; 13] = [
+    "ai",
+    "perception",
+    "squad",
+    "alarm",
+    "target",
+    "threat",
+    "combat",
+    "cover",
+    "behav",
+    "sense",
+    "aware",
+    "attack",
+    "faction",
+];
+
+/// A layer component gathered over every layer: its fields, every record
+/// (owned) and how many entities carry it.
+type LayerGathered = (Vec<m2_assets::layer::Field>, Vec<Vec<u8>>, usize);
+
+/// A component's schema, a line a field.
+fn print_schema(names: &Names, fields: &[m2_assets::layer::Field]) {
+    for f in fields {
+        println!(
+            "      field {:08x} {} t{} @{} bits {}<<{}",
+            f.name_hash,
+            names.show(f.name_hash),
+            f.ty,
+            f.offset,
+            f.bit_width,
+            f.bit_shift
+        );
+    }
+}
+
+/// Each field's values over `records`: how many distinct, and the most
+/// common (eight at most) with their counts.
+fn print_value_counts(names: &Names, fields: &[m2_assets::layer::Field], records: &[&[u8]]) {
+    for f in fields.iter().filter(|f| f.ty != STRING_FIELD) {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for rec in records {
+            let v = field_value(names, f, rec);
+            let v = v.split_once('=').map_or(v.clone(), |(_, v)| v.to_owned());
+            *counts.entry(v).or_default() += 1;
+        }
+        let mut counts: Vec<(String, usize)> = counts.into_iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let top: Vec<String> = counts
+            .iter()
+            .take(8)
+            .map(|(v, n)| format!("{v} x{n}"))
+            .collect();
+        println!(
+            "      {:08x} {}: {} distinct: {}",
+            f.name_hash,
+            names.show(f.name_hash),
+            counts.len(),
+            top.join(" | ")
+        );
+    }
+}
+
+/// The printable runs of `data` (4 bytes or more), distinct, at most 40.
+fn print_texts(data: &[u8]) {
+    let mut seen: Vec<String> = Vec::new();
+    for run in data.split(|b| !(0x20..0x7f).contains(b)) {
+        if run.len() >= 4 {
+            let t = String::from_utf8_lossy(run).into_owned();
+            if !seen.contains(&t) {
+                seen.push(t);
+            }
+        }
+    }
+    let more = seen.len().saturating_sub(40);
+    seen.truncate(40);
+    println!(
+        "      texts: {:?}{}",
+        seen,
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    );
+}
+
+/// The AI side of the template database and the layers (see the
+/// `ai` section above).
+fn ai_side<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let mut words = words_of(arg);
+    if words.is_empty() {
+        words = AI_WORDS.iter().map(|w| (*w).to_owned()).collect();
+    }
+    let wanted = |name: &str| {
+        let l = name.to_ascii_lowercase();
+        words.iter().any(|w| l.contains(w.as_str()))
+    };
+    let index = source.archive().index();
+    let Some(hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    let data = source.asset(hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    let tnames = db.names();
+    let all: Vec<String> = db
+        .components
+        .iter()
+        .map(|c| {
+            let n = c.records().map_or(0, |r| r.len());
+            format!("{}({n})", c.name)
+        })
+        .collect();
+    println!("template database components: {}", all.join(" "));
+    for c in db.components.iter().filter(|c| wanted(c.name)) {
+        println!(
+            "  db component {} {:08x}: {} groups, record {} bytes",
+            c.name, c.hash, c.count, c.record_size
+        );
+        print_schema(names, &c.fields);
+        let Some(recs) = c.records() else {
+            println!("      (records not read: text fields)");
+            print_texts(c.data);
+            continue;
+        };
+        let only: Vec<&[u8]> = recs.iter().map(|r| r.1).collect();
+        print_value_counts(names, &c.fields, &only);
+        // Distinct records, with the templates sharing each.
+        let mut distinct: Vec<(&[u8], Vec<u32>)> = Vec::new();
+        for (id, rec) in &recs {
+            match distinct.iter_mut().find(|d| d.0 == *rec) {
+                Some(d) => d.1.push(*id),
+                None => distinct.push((rec, vec![*id])),
+            }
+        }
+        distinct.sort_by_key(|d| std::cmp::Reverse(d.1.len()));
+        println!("      {} distinct records", distinct.len());
+        for (rec, ids) in distinct.iter().take(30) {
+            let who: Vec<String> = ids
+                .iter()
+                .take(4)
+                .map(|id| format!("{id:08x} {:?}", tnames.get(id).copied().unwrap_or("")))
+                .collect();
+            let values: Vec<String> = c
+                .fields
+                .iter()
+                .map(|f| field_value(names, f, rec))
+                .collect();
+            println!(
+                "      x{} [{}]: {}",
+                ids.len(),
+                who.join(", "),
+                values.join(", ")
+            );
+        }
+    }
+    // The same components across every layer.
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut seen = HashSet::new();
+    let mut gathered: BTreeMap<String, LayerGathered> = BTreeMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE || !seen.insert(e.name_hash) {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            for c in layer.components.iter().filter(|c| wanted(c.name)) {
+                let entry = gathered
+                    .entry(c.name.to_owned())
+                    .or_insert_with(|| (c.fields.clone(), Vec::new(), 0));
+                entry.2 += c.count as usize;
+                if entry.0 != c.fields {
+                    continue;
+                }
+                for (_, rec) in c.records().unwrap_or_default() {
+                    entry.1.push(rec.to_vec());
+                }
+            }
+        }
+    }
+    for (name, (fields, recs, count)) in &gathered {
+        println!(
+            "  layer component {name}: {count} entities, {} read",
+            recs.len()
+        );
+        print_schema(names, fields);
+        let only: Vec<&[u8]> = recs.iter().map(Vec::as_slice).collect();
+        print_value_counts(names, fields, &only);
     }
     Ok(())
 }
