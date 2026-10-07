@@ -3,9 +3,10 @@
 
 use std::collections::HashSet;
 
+use m2_engine::atmosphere::AtmosphereMix;
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{CatalogueEntry, Physics, StaticKey, VehicleControls, VehicleSpec, World};
-use m2_math::glam::{Mat4, Quat, Vec2, Vec3, Vec4Swizzles};
+use m2_math::glam::{Mat4, Quat, Vec2, Vec3, Vec4, Vec4Swizzles};
 use m2_render::View;
 
 use crate::camera::FlyCamera;
@@ -14,6 +15,7 @@ use crate::config::CameraConfig;
 use crate::drops::{Drops, Soldier};
 use crate::input::{Action, Input};
 use crate::mission::{WATERLINE, template_models};
+use crate::moving::MovingProps;
 use crate::player::{ChaseRig, Intent, Player};
 use crate::props::Props;
 use crate::save::{self, PlayerSave, SaveGame, VehicleSave};
@@ -105,6 +107,10 @@ pub struct Game {
     pub throttle: f32,
     /// Seconds to the next puffs of spray off boats going fast.
     spray_wait: f32,
+    /// The light of the atmosphere region the player is in.
+    pub sky: AtmosphereMix,
+    /// Props that move on their own.
+    moving: MovingProps,
     /// Her support: the items she holds and the call under way; her
     /// health when it last stepped (hurt, a call is called off).
     pub support: Support,
@@ -138,6 +144,8 @@ impl Game {
             props_up: false,
             throttle: 0.0,
             spray_wait: 0.0,
+            sky: AtmosphereMix::default(),
+            moving: MovingProps::default(),
             support: Support::default(),
             drops: Drops::default(),
             dropped: 0,
@@ -303,6 +311,9 @@ impl Game {
 
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
+        self.update_sky(dt);
+        let focus = self.focus();
+        self.moving.update(&mut self.scene, focus, dt);
         self.startup_props();
         self.fetch_world_vehicles(dt);
         let intent = if self.input_locked {
@@ -985,6 +996,50 @@ impl Game {
         self.scene.player.as_ref().filter(|_| self.on_foot)
     }
 
+    /// Moves the light on to the atmosphere region the player is in.
+    fn update_sky(&mut self, dt: f32) {
+        let focus = self.focus();
+        let Some(world) = &self.scene.world else {
+            return;
+        };
+        let Some(default) = &world.index.atmosphere else {
+            return;
+        };
+        let regions = &world.index.atmosphere_regions;
+        if let Some(now) = self.sky.update(default, regions, focus, dt) {
+            match now {
+                Some((r, s)) => {
+                    let (region, (_, a)) = (&regions[r], &regions[r].settings[s]);
+                    eprintln!(
+                        "atmosphere: region {} record {s} (light time {}, intensity {}, light {:?}, tone {:?}, coverage {}, tone map {:?})",
+                        region.name,
+                        a.light_time[0],
+                        a.light_intensity,
+                        a.light_color,
+                        a.tone,
+                        a.coverage,
+                        a.tone_map
+                    );
+                }
+                None => eprintln!("atmosphere: the island's default"),
+            }
+        }
+    }
+
+    /// Puts atmosphere region `region` (a script's guid for it) on its
+    /// record named `setting`, as `ChangeLineRegionSetting` does.
+    pub fn atmosphere_setting(&mut self, region: u32, setting: &str) {
+        let Some(world) = &self.scene.world else {
+            return;
+        };
+        if !self
+            .sky
+            .choose(&world.index.atmosphere_regions, region, setting)
+        {
+            eprintln!("atmosphere: no region {region:08x} with a record {setting}");
+        }
+    }
+
     /// Where the world streams around.
     pub fn focus(&self) -> Vec3 {
         match self.walking() {
@@ -1016,7 +1071,151 @@ impl Game {
         {
             view.view = Mat4::from_rotation_x(a) * Mat4::from_rotation_y(b) * view.view;
         }
+        // The island's own ambient light, sunlight strength, haze and
+        // clouds.
+        if let Some(world) = &self.scene.world {
+            if let Some(a) = world.index.atmosphere {
+                let now = self.sky.current(&a);
+                now.apply(&mut view.lighting);
+                // `M2_ATMO_TRACE=on` logs the light about every half
+                // second, to follow a change between records.
+                if std::env::var("M2_ATMO_TRACE").is_ok_and(|v| v == "on") {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+                    let since = self.sky.since_change();
+                    let tick = (since * 2.0) as u32;
+                    if LAST.swap(tick, Ordering::Relaxed) != tick {
+                        eprintln!(
+                            "atmosphere trace {:.1} s into the change: light {:?} li {:.3} tone {:?} darkness {:.1} coverage {:.3} time {:.3} inscatter {:.2} mono {:?} sun {:?} eye {:?}",
+                            since,
+                            now.light_color,
+                            now.light_intensity,
+                            now.tone,
+                            now.cloud_darkness,
+                            now.coverage,
+                            now.light_time[0],
+                            now.inscattering,
+                            now.monochrome,
+                            now.sun_direction(),
+                            view.view.inverse().z_axis.truncate(),
+                        );
+                    }
+                }
+            }
+            view.lighting.clouds.noise = world.cloud_noise;
+        }
+        finish(&mut view.lighting);
+        post_override(&mut view.lighting);
+        if self.support.looking().is_some() {
+            satellite_look(&mut view.lighting);
+        }
         view
+    }
+}
+
+/// The satellite's picture, as the first contract's videos show it: grey,
+/// its colours nearly gone, and grainy. Grey and grain are matched by eye
+/// to the videos, not read from the game.
+fn satellite_look(lighting: &mut m2_render::Lighting) {
+    // The game's tone map takes the monochrome ramp, the fitted pass its
+    // saturation.
+    lighting.monochrome = Some(Vec4::new(0.46, 0.46, 0.44, 0.9));
+    lighting.saturation *= 0.1;
+    lighting.grain = 0.07;
+}
+
+/// The finishing pass, fitted to footage of the game: whole-frame
+/// brightness, saturation, warmth and shade against sunlight from PC
+/// footage of the jungle, held back where the strongest fit made the
+/// AMX-30 too dark and orange against console footage of it. The game runs
+/// a tone map of its own (see [`game_tone_map`]).
+fn finish(lighting: &mut m2_render::Lighting) {
+    if game_tone_map() && lighting.tone_map.is_some() {
+        // The game's own, no fitted pass.
+        lighting.exposure = 1.0;
+        return;
+    }
+    lighting.tone_map = None;
+    lighting.exposure = 0.9;
+    lighting.contrast = 1.35;
+    lighting.saturation = 1.5;
+    lighting.grade *= Vec3::new(1.3, 0.95, 0.7);
+    // The eye adapts as the game's does (its atmospheres set a target
+    // luminance and how much of the way to adapt): dusk and shade are
+    // brought up part of the way. Key, strength and speed are fitted.
+    lighting.adaptation = Some(m2_render::Adaptation {
+        key: ADAPT_KEY,
+        strength: 0.5,
+        speed: 1.5,
+        limits: [0.5, 4.0],
+    });
+}
+
+/// Frames are finished with the game's own adaptation and tone map from
+/// the atmosphere's settings; `M2_TONEMAP=fit` uses the earlier pass fitted
+/// to footage instead, for comparison.
+fn game_tone_map() -> bool {
+    static GAME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GAME.get_or_init(|| std::env::var("M2_TONEMAP").map_or(true, |v| v != "fit"))
+}
+
+/// The frame's average luminance (before exposure) that adaptation leaves
+/// as it is: about the island's sunlit town by day.
+const ADAPT_KEY: f32 = 0.25;
+
+/// `M2_POST=exposure=0.8,bloom=0.35,threshold=1,contrast=1.3,
+/// saturation=1.6,grade=1.05/1/0.9,haze=1,inscatter=1,density=4,
+/// key=0.25,adapt=0.7,mono=1` sets the finishing pass and haze by hand (any
+/// subset; `haze` and `inscatter` scale the scattering and the light it
+/// adds, `density` replaces the air's thickness near the ground, `key`
+/// and `adapt` are the adaptation's key and strength, 0 for none, `mono`
+/// scales how much the game's monochrome ramp takes), for
+/// matching reference frames.
+fn post_override(lighting: &mut m2_render::Lighting) {
+    static POST: std::sync::OnceLock<Vec<(String, Vec<f32>)>> = std::sync::OnceLock::new();
+    let settings = POST.get_or_init(|| {
+        let Ok(s) = std::env::var("M2_POST") else {
+            return Vec::new();
+        };
+        s.split(',')
+            .filter_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                let v: Vec<f32> = v.split('/').filter_map(|x| x.trim().parse().ok()).collect();
+                Some((k.trim().to_owned(), v))
+            })
+            .collect()
+    });
+    for (k, v) in settings {
+        match (k.as_str(), v.as_slice()) {
+            ("exposure", [x]) => lighting.exposure = *x,
+            ("bloom", [x]) => lighting.bloom = *x,
+            ("threshold", [x]) => lighting.bloom_threshold = *x,
+            ("contrast", [x]) => lighting.contrast = *x,
+            ("saturation", [x]) => lighting.saturation = *x,
+            ("grade", [r, g, b]) => lighting.grade = Vec3::new(*r, *g, *b),
+            ("haze", [x]) => {
+                lighting.haze.rayleigh *= *x;
+                lighting.haze.mie *= *x;
+            }
+            ("inscatter", [x]) => lighting.haze.inscattering *= *x,
+            ("density", [x]) => lighting.haze.density = *x,
+            ("key", [x]) => {
+                if let Some(a) = &mut lighting.adaptation {
+                    a.key = *x;
+                }
+            }
+            ("mono", [x]) => {
+                if let Some(m) = &mut lighting.monochrome {
+                    m.w *= *x;
+                }
+            }
+            ("adapt", [x]) => {
+                if let Some(a) = &mut lighting.adaptation {
+                    a.strength = *x;
+                }
+            }
+            _ => {}
+        }
     }
 }
 

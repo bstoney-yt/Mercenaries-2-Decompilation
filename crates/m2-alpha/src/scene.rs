@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use m2_engine::anim::load_clips;
+use m2_engine::model::MODEL_TEXTURE_WIDTH;
 use m2_engine::vehicle::{DRIVABLE, catalogue};
 use m2_engine::{
     Animator, AssetSource, BoundClip, Catalogue, CatalogueEntry, CpuModel, Frustum, Gait, GpuModel,
@@ -579,7 +580,8 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
             );
             for p in people {
                 let data = source.model(p.model)?;
-                let cpu = CpuModel::from_data(&data, 0)?;
+                let mut cpu = CpuModel::from_data(&data, 0)?;
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                 let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
                 if tx
                     .send(Loaded::Person(p.clone(), cpu, skeleton, false))
@@ -601,7 +603,8 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                     hi[1] - lo[1],
                     hi[2] - lo[2]
                 ));
-                let cpu = CpuModel::build(hash, &model, 0);
+                let mut cpu = CpuModel::build(hash, &model, 0);
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                 if tx.send(Loaded::Weapon(name, cpu, muzzle)).is_err() {
                     return Ok(());
                 }
@@ -657,7 +660,8 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                     e.kind,
                     spec.wheels.len()
                 );
-                let cpu = CpuModel::build(e.model, &model, 0);
+                let mut cpu = CpuModel::build(e.model, &model, 0);
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                 if tx.send(Loaded::Vehicle(spec, cpu)).is_err() {
                     return Ok(());
                 }
@@ -979,7 +983,8 @@ impl Scene {
                     let data = source.model(e.model)?;
                     let model = data.parse()?;
                     if let Some(spec) = VehicleSpec::from_model(e, &model) {
-                        let cpu = CpuModel::build(e.model, &model, 0);
+                        let mut cpu = CpuModel::build(e.model, &model, 0);
+                        cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                         let _ = tx.send(make(spec, cpu));
                         return Ok(());
                     }
@@ -1063,8 +1068,7 @@ impl Scene {
             | Loaded::Weapon(_, cpu, _)
             | Loaded::Flight(_, cpu, _, _) => cpu,
         };
-        self.materials
-            .load_textures(backend, source, cpu.texture_hashes().collect::<Vec<_>>())?;
+        self.materials.load_model_textures(backend, source, cpu)?;
         let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
         // What its template says of its handling and its gun: its own
         // (the mission's `AMX30 (Full)`), else its model's.
@@ -1251,6 +1255,9 @@ impl Scene {
             for v in &mut self.vehicles {
                 // A wreck shows its wrecked body, turret and wheels.
                 v.model.wrecked = v.wrecked;
+                // Tracks run as far as the road wheels roll.
+                v.model.tracks = v.spec.tracked;
+                v.model.track_travel = v.rolled;
                 let Some(id) = v.id else { continue };
                 let Some(at) = world.physics.vehicle_transform(id) else {
                     continue;
@@ -1410,6 +1417,7 @@ impl Scene {
                 world: Mat4::IDENTITY,
                 skin: None,
                 instances: None,
+                uv_offset: [0.0; 2],
             },
             layer: Layer::WORLD,
             translucent: false,
@@ -1676,6 +1684,7 @@ impl Effects {
                 world,
                 skin: None,
                 instances: None,
+                uv_offset: [0.0; 2],
             },
             layer: Layer::WORLD,
             translucent,

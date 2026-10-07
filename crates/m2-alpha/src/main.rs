@@ -45,6 +45,7 @@ mod flights;
 mod game;
 mod input;
 mod mission;
+mod moving;
 mod npc;
 mod player;
 mod props;
@@ -626,6 +627,27 @@ fn screenshot(
             .is_some_and(|p| game.on_foot && !p.landed);
         if (stats.pending == 0 && !waiting) || started.elapsed() > Duration::from_secs(180) {
             eprintln!("{stats:?} after {:.1} s", started.elapsed().as_secs_f32());
+            eprintln!("atmosphere: {:?}", world.index.atmosphere);
+            for r in &world.index.atmosphere_regions {
+                let names: Vec<String> = r
+                    .settings
+                    .iter()
+                    .map(|(n, a)| {
+                        format!(
+                            "{n:08x} light time {} intensity {}",
+                            a.light_time[0], a.light_intensity
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "atmosphere region {} {:08x}: {} corners, {:.0} m2, {}",
+                    r.name,
+                    r.entity,
+                    r.outline.len(),
+                    r.area,
+                    names.join("; ")
+                );
+            }
             break;
         }
         game.step(Intent::default(), tick);

@@ -373,6 +373,8 @@ impl RenderBackend for NullBackend {
 }
 
 /// One call a [`RecordingBackend`] accepted.
+// Recorded only in tests: a frame's view is kept whole, however large.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     CreateVertexBuffer {

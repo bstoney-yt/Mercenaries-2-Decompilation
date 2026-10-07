@@ -114,6 +114,17 @@ pub enum BlendMode {
     /// Alpha blended over the scene, depth-tested but not depth-written.
     /// Draw these back to front (the [`DrawQueue`](crate::DrawQueue) does).
     Translucent,
+    /// Added to the scene, scaled by alpha (lights, glows, trails);
+    /// depth-tested but not depth-written, drawn with the translucent.
+    Additive,
+}
+
+impl BlendMode {
+    /// Whether it draws over the scene without writing depth, after the
+    /// opaque world.
+    pub fn is_translucent(self) -> bool {
+        matches!(self, Self::Translucent | Self::Additive)
+    }
 }
 
 /// Everything a draw shades with besides its geometry and transform.
@@ -143,6 +154,99 @@ pub struct MaterialDesc {
     /// Fades alpha towards the silhouette, where the surface turns away
     /// from the camera (smoke and other soft volumes).
     pub soft_edge: bool,
+    /// A searchlight's beam: its alpha is scaled by the frame's
+    /// [`beam_gain`](crate::Lighting::beam_gain), so the lit-up night shows
+    /// them and the day does not.
+    pub beam: bool,
+    /// Specular highlights: colour, strength map and sharpness. `None` is
+    /// a matte surface.
+    pub specular: Option<Specular>,
+    /// Tangent-space normal map, upload [`TextureFormat::Rgba8Unorm`];
+    /// needs vertex tangents (without them the map is ignored).
+    pub normal_map: Option<NormalMap>,
+    /// Tiled ground layers blended by the vertex colour (`r` weights the
+    /// first, `a` the fourth); see [`ground`](Self::ground).
+    pub layers: [Option<TerrainLayer>; 4],
+    /// Pulls the surface towards the camera in the depth test, so a
+    /// surface laid on another (roads on the ground) wins.
+    pub depth_bias: bool,
+    /// Shade as the game's ground: `texture` is the cell's colour map,
+    /// `layers` are weighted by the vertex colour and the colour map makes
+    /// up the rest and takes over with distance; `detail` adds signed grain
+    /// (upload it [`TextureFormat::Rgba8Unorm`]). Unclamped sun plus
+    /// ambient light.
+    pub ground: bool,
+    /// Linear RGB scale of the sunlight a lit surface takes.
+    pub direct: [f32; 3],
+    /// Linear RGB scale of the ambient light a lit surface takes.
+    pub ambient: [f32; 3],
+    /// Light the surface gives off itself (lamps, screens), added after
+    /// lighting.
+    pub emissive: Option<Emissive>,
+    /// Mirror-like reflection of the surroundings (glass, paint, metal).
+    pub reflection: Option<Reflection>,
+    /// Takes the view's rim light (see [`Lighting`](crate::Lighting)).
+    pub rim: bool,
+    /// Shade as open water: moving waves, reflecting the sky by Fresnel
+    /// over `color` (the water's body colour and opacity looking straight
+    /// down).
+    pub water: bool,
+    /// Water: scale on the sky it mirrors (the game's reflection map may
+    /// hold only what stands over the water).
+    pub water_sky: f32,
+    /// Water: scale on its waves' heights, so their slopes (1: as drawn).
+    pub water_waves: f32,
+    /// Water: waves fade where a pixel spans more than 2 / this of their
+    /// wavelength (fully at 1 / this).
+    pub water_fade: f32,
+}
+
+/// A reflection of the surroundings, along the view mirrored in the
+/// surface, scaled by the specular map when there is one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reflection {
+    pub strength: f32,
+    /// Schlick's reflectance facing the eye, rising to 1 at grazing
+    /// angles; `None` reflects alike at every angle.
+    pub fresnel: Option<f32>,
+}
+
+/// Light a surface gives off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Emissive {
+    /// Linear RGB scale.
+    pub color: [f32; 3],
+    /// Per-texel colour, sampled with the base map's coordinates; takes
+    /// the specular map's place, so a material has one or the other.
+    pub map: Option<TextureHandle>,
+}
+
+/// Specular highlights (Blinn-Phong).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Specular {
+    /// Linear RGB scale of the highlight.
+    pub color: [f32; 3],
+    /// Exponent: higher is tighter.
+    pub power: f32,
+    /// Per-texel highlight colour, sampled with the base map's coordinates.
+    pub map: Option<TextureHandle>,
+}
+
+/// A tangent-space normal map, sampled with the base map's coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NormalMap {
+    pub texture: TextureHandle,
+    /// Where x and y are stored: `false` in red and green, `true` in alpha
+    /// and green (the DXT5 swizzle).
+    pub alpha_x: bool,
+}
+
+/// One tiled ground layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainLayer {
+    pub texture: TextureHandle,
+    /// `u` and `v` as dot products with the world-space `(x, y, z, 1)`.
+    pub uv: [[f32; 4]; 2],
 }
 
 /// A detail texture: tiled every `tile` metres along world x and z, it
@@ -167,6 +271,21 @@ impl Default for MaterialDesc {
             clamp: false,
             detail: None,
             soft_edge: false,
+            beam: false,
+            specular: None,
+            normal_map: None,
+            layers: [None; 4],
+            depth_bias: false,
+            ground: false,
+            direct: [1.0; 3],
+            ambient: [1.0; 3],
+            emissive: None,
+            reflection: None,
+            rim: false,
+            water: false,
+            water_sky: 1.0,
+            water_waves: 1.0,
+            water_fade: 8.0,
         }
     }
 }

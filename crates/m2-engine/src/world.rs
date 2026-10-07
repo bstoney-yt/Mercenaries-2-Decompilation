@@ -18,8 +18,10 @@ use std::io::{Read, Seek};
 
 use m2_assets::layer::{LAYER_TYPE, Placement, TEMPLATE_DB_TYPE};
 use m2_assets::model::MODEL_TYPE;
+use m2_assets::model::Material;
 use m2_assets::path::PATH_TYPE;
-use m2_assets::terrain::{CELL_SIZE, TerrainGroup, colour_map_uv};
+use m2_assets::terrain::{CELL_SIZE, TerrainGroup, TerrainMaterial, colour_map_uv};
+use m2_assets::tree::{CardVertex, TREE_TYPE, TreeTable};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{BlockContents, Layer, LowResTile, Path, TerrainCell, name_hash};
 use m2_math::glam::{Quat, Vec3};
@@ -29,21 +31,110 @@ use m2_render::{
 };
 
 use crate::assets::{AssetError, AssetSource};
+use crate::atmosphere::{Atmosphere, AtmosphereRegion};
+use crate::motion::PropMotion;
 use crate::physics::CollisionShape;
 use crate::pickup::Leavings;
+use crate::technique::Technique;
 use crate::tuning::VehicleTuning;
 
 /// Side of the island in metres (20 cells of 400 m).
 pub const ISLAND: f32 = 8000.0;
 
-/// Skirt depth under full-detail cells and under low-resolution tiles,
-/// whose coarser edges leave wider gaps.
-const CELL_SKIRT: f32 = 4.0;
+/// Skirt depth under low-resolution tiles. Full-detail cells hang none:
+/// with every skirt left out no crack showed between their patches or
+/// cells, on steep ground or at coasts, while their skirts stood as
+/// smeared walls under banks (sea2) where the seabed drops away.
 const TILE_SKIRT: f32 = 30.0;
+
+/// Whether to hang skirts at all (`M2_SKIRTS=0` leaves them out, to see
+/// what they cover).
+fn skirts_wanted() -> bool {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var("M2_SKIRTS").map_or(true, |v| v != "0"))
+}
+
+/// With `M2_TERRAIN_NEAR=x,z,r`, prints every triangle of every level of
+/// detail whose middle lies within `r` metres of world (x, z): its level,
+/// range, material, corners, the y of its face normal (Direct3D winding)
+/// and of its vertices' normals.
+fn log_near(group: &TerrainGroup<'_>, origin: Vec3) {
+    static NEAR: std::sync::OnceLock<Option<(f32, f32, f32)>> = std::sync::OnceLock::new();
+    let near = NEAR.get_or_init(|| {
+        let v = std::env::var("M2_TERRAIN_NEAR").ok()?;
+        let n: Vec<f32> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        (n.len() == 3).then(|| (n[0], n[1], n[2]))
+    });
+    let Some((x, z, r)) = *near else {
+        return;
+    };
+    let positions = group.positions();
+    let normals = group
+        .decl
+        .find(DeclUsage::Normal, 0)
+        .and_then(|e| group.vertices.read(e))
+        .unwrap_or_default();
+    let mut levels: Vec<(String, &m2_assets::terrain::TerrainRange)> = Vec::new();
+    for lod in 0..3 {
+        for (i, range) in group.lod_ranges(lod).iter().enumerate() {
+            levels.push((
+                format!("lod {lod} range {i} material {}", range.material),
+                range,
+            ));
+        }
+    }
+    for (i, range) in group.full_ranges.iter().enumerate() {
+        levels.push((format!("full range {i}"), range));
+    }
+    for (what, range) in levels {
+        for t in group.triangles(range) {
+            let Some(c) = t
+                .iter()
+                .map(|&i| {
+                    positions
+                        .get(usize::from(i))
+                        .map(|p| Vec3::from(*p) + origin)
+                })
+                .collect::<Option<Vec<Vec3>>>()
+            else {
+                continue;
+            };
+            let mid = (c[0] + c[1] + c[2]) / 3.0;
+            if (mid.x - x).hypot(mid.z - z) > r {
+                continue;
+            }
+            let face = (c[1] - c[0]).cross(c[2] - c[0]).normalize_or_zero();
+            let ny: Vec<String> = t
+                .iter()
+                .map(|&i| {
+                    normals
+                        .get(usize::from(i))
+                        .map_or("-".into(), |n| format!("{:.2}", n[1]))
+                })
+                .collect();
+            eprintln!(
+                "near: {what}: [{:.1} {:.1} {:.1}] [{:.1} {:.1} {:.1}] [{:.1} {:.1} {:.1}] face y {:.2}, normals y {}",
+                c[0].x,
+                c[0].y,
+                c[0].z,
+                c[1].x,
+                c[1].y,
+                c[1].z,
+                c[2].x,
+                c[2].y,
+                c[2].z,
+                face.y,
+                ny.join("/")
+            );
+        }
+    }
+}
 
 /// One placed model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectPlacement {
+    /// The layer entity placing it.
+    pub entity: u32,
     pub model: u32,
     pub position: Vec3,
     pub rotation: Quat,
@@ -52,6 +143,35 @@ pub struct ObjectPlacement {
     /// the island's rocks, plants, fences and sandbags, kept within
     /// [`WorldSettings::prop_distance`](crate::WorldSettings::prop_distance).
     pub named: bool,
+    /// Drawn within this many metres, whatever its size: a tree, within
+    /// its species' fade distance from the tree table.
+    pub fade: Option<f32>,
+}
+
+/// Entity ids of the trees: [`TREE_ENTITIES`] | species << 16 | tree. The
+/// layers' entity ids stay below `0x2000_0000` (the highest is `0x10001f5b`),
+/// so these never meet them.
+pub const TREE_ENTITIES: u32 = 0xf000_0000;
+
+/// The species of a tree's entity id, `None` for anything else.
+pub fn tree_species(entity: u32) -> Option<usize> {
+    (entity & TREE_ENTITIES == TREE_ENTITIES).then_some((entity >> 16 & 0xfff) as usize)
+}
+
+/// What stands for a species' tree beyond its fade distance, from the tree
+/// table: upright parts turned to face the eye (the trunk and crown, cut
+/// from one picture of the tree), and a cap over the crown, seen from
+/// above. Inferred, not decoded: that the parts turn about the vertical to
+/// face the eye and the cap turns with the tree.
+#[derive(Clone, Debug)]
+pub struct FarTree {
+    pub fade: f32,
+    /// Each part's rect (x0, y0, x1, y1, metres, the tree's base at 0) and
+    /// its UV rect in the parts' material.
+    pub parts: Vec<([f32; 4], [f32; 4])>,
+    pub material: Material,
+    /// The cap: vertices (tree space), triangle list, material.
+    pub cap: Option<(Vec<CardVertex>, Vec<u16>, Material)>,
 }
 
 /// An entity of the static layers whose name is a vehicle template
@@ -132,6 +252,8 @@ pub struct Templates {
     pub names: HashMap<u32, String>,
     /// How the templates that say so handle and fight, by id.
     pub tuning: HashMap<u32, VehicleTuning>,
+    /// The templates whose props move on their own, by id.
+    pub motions: HashMap<u32, PropMotion>,
     /// What templates leave when destroyed, and what pickups give.
     pub leavings: Leavings,
 }
@@ -141,6 +263,22 @@ impl Templates {
     /// 0x0012abcd`, `AMX30`) names, whatever its case.
     pub fn get(&self, name: &str) -> Option<&TemplateInfo> {
         self.by_name.get(&member_stem(name).to_ascii_lowercase())
+    }
+
+    /// How an entity named `name` (its template's name and an id), an
+    /// instance of template `parent`, moves on its own: its name's
+    /// template's motion, else its parent's.
+    pub fn motion(&self, name: &str, parent: u32) -> Option<&PropMotion> {
+        let stem = member_stem(name);
+        self.motions
+            .iter()
+            .find(|(id, _)| {
+                self.names
+                    .get(id)
+                    .is_some_and(|n| n.eq_ignore_ascii_case(stem))
+            })
+            .map(|(_, m)| m)
+            .or_else(|| self.motions.get(&parent))
     }
 
     /// The id of the template an entity or template name names, whatever
@@ -227,8 +365,12 @@ impl Templates {
 }
 
 impl Templates {
-    /// Reads the one template database asset, if the archive has it.
-    fn read<R: Read + Seek>(source: &mut AssetSource<R>, models: &HashSet<u32>) -> Self {
+    /// Reads the one template database asset, if the archive has it, and
+    /// the outdoor atmosphere it holds.
+    fn read<R: Read + Seek>(
+        source: &mut AssetSource<R>,
+        models: &HashSet<u32>,
+    ) -> (Self, Option<Atmosphere>) {
         let index = source.archive().index();
         let Some(hash) = index
             .assets()
@@ -236,14 +378,15 @@ impl Templates {
             .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
             .map(|a| a.name_hash)
         else {
-            return Self::default();
+            return Default::default();
         };
         let Ok(data) = source.asset(hash, TEMPLATE_DB_TYPE) else {
-            return Self::default();
+            return Default::default();
         };
         let Ok(db) = Layer::parse(&data) else {
-            return Self::default();
+            return Default::default();
         };
+        let atmosphere = Atmosphere::read(&db, "Default");
         let model_of = db.hashes("ModelName");
         let engines = engine_banks(&db);
         let mut kinds: HashMap<u32, VehicleKind> = HashMap::new();
@@ -291,7 +434,7 @@ impl Templates {
         // `id`.
         let mut order: Vec<(u32, &str)> = names.iter().map(|(&id, &n)| (id, n)).collect();
         order.sort_unstable_by_key(|&(id, _)| std::cmp::Reverse(id));
-        Self {
+        let templates = Self {
             by_name: order
                 .iter()
                 .map(|&(id, name)| (name.to_ascii_lowercase(), infos[&id]))
@@ -303,7 +446,9 @@ impl Templates {
                 .collect(),
             tuning: crate::tuning::read(&db),
             leavings: crate::pickup::read(&db),
-        }
+            motions: crate::motion::read_templates(&db),
+        };
+        (templates, atmosphere)
     }
 }
 
@@ -406,6 +551,16 @@ pub struct WorldIndex {
     /// The template database, for names the scripts and mission layers
     /// use.
     pub template_db: Templates,
+    /// Each tree species' far stand-in, by species (the tree table's
+    /// order; `None` for a species not placed).
+    pub far_trees: Vec<Option<FarTree>>,
+    /// The outdoor light and air (ambient cube, sunlight, haze).
+    pub atmosphere: Option<Atmosphere>,
+    /// The regions whose light differs from it (`vz_atmosphere_regions`).
+    pub atmosphere_regions: Vec<AtmosphereRegion>,
+    /// How the placed props that move on their own move, by entity (state
+    /// layers' and static layers' alike).
+    pub motions: HashMap<u32, PropMotion>,
     /// Models the state layers place (blocks of their own, which the
     /// mission scripts load and unload: `vz_state_vzacon001`), by entity:
     /// what stands while the layer is in, such as a mission's gates.
@@ -415,6 +570,12 @@ pub struct WorldIndex {
     /// is an instance of: what a renamed entity's name
     /// (`VzaCon001_StartingBoat`) no longer says.
     pub state_vehicles: HashMap<u32, TemplatePlacement>,
+    /// With `M2_LOG_FOLIAGE=on` only: each named entity of the static
+    /// layers, its name and how it was placed (`m` by `ModelName`, `p` by
+    /// its name or template, `v` a vehicle or unknown template, `c` left
+    /// out for a component, `a` named for an asset that isn't a model,
+    /// `t` a test entity, `-` nothing).
+    pub names: HashMap<u32, (String, char, u32)>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -476,6 +637,8 @@ struct Assets {
     models: HashSet<u32>,
     /// Name hashes of every asset of every type.
     any: HashSet<u32>,
+    /// With `M2_LOG_FOLIAGE=on` only: each asset's type, by name hash.
+    types: HashMap<u32, u32>,
     /// The template database.
     templates: Templates,
 }
@@ -522,11 +685,24 @@ impl WorldIndex {
                 .map(|a| a.name_hash)
                 .collect(),
             any: index.assets().iter().map(|a| a.name_hash).collect(),
+            types: if std::env::var("M2_LOG_FOLIAGE").as_deref() == Ok("on") {
+                index
+                    .assets()
+                    .iter()
+                    .map(|a| (a.name_hash, index.type_hash(a)))
+                    .collect()
+            } else {
+                HashMap::new()
+            },
             templates: Templates::default(),
         };
-        assets.templates = Templates::read(source, &assets.models);
+        let (templates, atmosphere) = Templates::read(source, &assets.models);
+        assets.templates = templates;
 
-        let mut world = Self::default();
+        let mut world = Self {
+            atmosphere,
+            ..Self::default()
+        };
         let mut routes = Routes::default();
         for (block, is_static) in blocks {
             let decoded = source.block(block)?;
@@ -538,6 +714,14 @@ impl WorldIndex {
                     continue;
                 };
                 world.add_layer(&layer, e.name_hash, is_static, &assets);
+                if layer.component("AtmosphereBase").is_some() {
+                    world
+                        .atmosphere_regions
+                        .extend(crate::atmosphere::read_regions(&layer, |h| {
+                            let data = source.asset(h, m2_assets::region::REGION_TYPE).ok()?;
+                            Some(m2_assets::Region::parse(&data).ok()?.corners)
+                        }));
+                }
                 world.add_people(
                     &layer,
                     e.name_hash,
@@ -547,6 +731,7 @@ impl WorldIndex {
                 );
             }
         }
+        world.add_trees(source, &assets.templates);
         world.template_db = assets.templates;
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
         for spawn in &mut world.spawns {
@@ -569,6 +754,105 @@ impl WorldIndex {
             spawn.route = points.iter().map(|&p| at + q * p).collect();
         }
         Ok(world)
+    }
+
+    /// The island's trees, which no layer places: the tree table
+    /// ([`m2_assets::tree`]) gives each species' template and the decoded
+    /// position and yaw of each of its trees. Each tree stands as its
+    /// template's `ModelName`, drawn within its species' fade distance, and
+    /// as its species' [`FarTree`] beyond. Inferred, not decoded: that the
+    /// model stands upright at the position and at its own size (the
+    /// species' scale range has no per-tree value to pick from).
+    fn add_trees<R: Read + Seek>(&mut self, source: &mut AssetSource<R>, templates: &Templates) {
+        let index = source.archive().index();
+        let Some(hash) = index
+            .assets()
+            .iter()
+            .find(|a| index.type_hash(a) == TREE_TYPE)
+            .map(|a| a.name_hash)
+        else {
+            return;
+        };
+        let table = match source.asset(hash, TREE_TYPE).map(|d| TreeTable::parse(&d)) {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return eprintln!("trees {hash:08x}: {e}"),
+            Err(e) => return eprintln!("trees {hash:08x}: {e}"),
+        };
+        let first = self.objects.len();
+        let highest = self
+            .members
+            .keys()
+            .chain(self.objects.iter().map(|o| &o.entity))
+            .max()
+            .copied();
+        let mut no_model: Vec<(u32, usize)> = Vec::new();
+        for (species, s) in table.species.iter().enumerate() {
+            let model = templates.by_id(s.template).and_then(|(_, t)| t.model);
+            let Some(model) = model.filter(|_| species < 1 << 12 && s.trees.len() <= 1 << 16)
+            else {
+                no_model.push((s.template, s.trees.len()));
+                self.far_trees.push(None);
+                continue;
+            };
+            self.objects
+                .extend(s.trees.iter().enumerate().map(|(i, t)| ObjectPlacement {
+                    entity: TREE_ENTITIES | (species as u32) << 16 | i as u32,
+                    model,
+                    position: Vec3::from(t.position),
+                    rotation: Quat::from_rotation_y(t.yaw()),
+                    named: true,
+                    fade: Some(s.fade),
+                }));
+            let parts = s.part_count.min(3) as usize;
+            self.far_trees.push(Some(FarTree {
+                fade: s.fade,
+                parts: s.parts[..parts]
+                    .iter()
+                    .copied()
+                    .zip(s.part_uvs[..parts].iter().copied())
+                    .collect(),
+                material: s.material.clone(),
+                cap: s
+                    .card_material
+                    .clone()
+                    .map(|m| (s.card_vertices.clone(), s.card_indices.clone(), m)),
+            }));
+        }
+        eprintln!(
+            "trees: {} of {} species placed, {} trees (layer entity ids up to {:#x}); left out for want of a model (template, trees): {:08x?}",
+            table.species.len() - no_model.len(),
+            table.species.len(),
+            self.objects.len() - first,
+            highest.unwrap_or(0),
+            no_model
+        );
+    }
+
+    /// The motions of a layer's entities whose template moves on its own,
+    /// with the angles their own `Door` records give.
+    fn add_motions(
+        &mut self,
+        layer: &Layer<'_>,
+        placements: &HashMap<u32, Placement>,
+        templates: &Templates,
+    ) {
+        if templates.motions.is_empty() {
+            return;
+        }
+        let names = layer.names();
+        let hinges = crate::motion::hinges(layer);
+        for (&entity, p) in placements {
+            let name = names.get(&entity).copied().unwrap_or("");
+            let Some(motion) = templates.motion(name, p.parent) else {
+                continue;
+            };
+            let mut motion = motion.clone();
+            if let Some(&(node, angle)) = hinges.get(&entity) {
+                motion.hinges.retain(|&(n, _)| n != node);
+                motion.hinges.push((node, angle));
+            }
+            self.motions.insert(entity, motion);
+        }
     }
 
     /// The people a layer places: entities with AI or a spawner of their
@@ -646,6 +930,7 @@ impl WorldIndex {
 
     fn add_layer(&mut self, layer: &Layer<'_>, layer_hash: u32, is_static: bool, assets: &Assets) {
         let placements = layer.placements();
+        self.add_motions(layer, &placements, &assets.templates);
         let at = |entity| placements.get(&entity);
         for (entity, asset) in layer.hashes("TerrainObject") {
             if let Some(p) = at(entity) {
@@ -665,10 +950,12 @@ impl WorldIndex {
             for (&entity, model) in &models {
                 if let Some(p) = at(entity) {
                     self.objects.push(ObjectPlacement {
+                        entity,
                         model: *model,
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),
                         named: false,
+                        fade: None,
                     });
                 }
             }
@@ -678,6 +965,7 @@ impl WorldIndex {
                 .flat_map(|c| c.records().unwrap_or_default())
                 .map(|(entity, _)| entity)
                 .collect();
+            let logging = std::env::var("M2_LOG_FOLIAGE").as_deref() == Ok("on");
             for (entity, name) in layer.names() {
                 let Some(p) = at(entity) else { continue };
                 let (position, rotation) = (Vec3::from(p.position), rotation(p.rotation));
@@ -695,17 +983,45 @@ impl WorldIndex {
                     },
                 );
                 if models.contains_key(&entity) || not_templates.contains(&entity) {
+                    if logging {
+                        let how = if models.contains_key(&entity) {
+                            'm'
+                        } else {
+                            'c'
+                        };
+                        self.names.insert(entity, (name.to_owned(), how, 0));
+                    }
                     continue;
                 }
                 let template = assets.templates.get(stem);
+                if logging {
+                    let how = match (stem_hash, template) {
+                        (Some(h), _) if assets.models.contains(&h) => 'p',
+                        (_, Some(t))
+                            if matches!(t.vehicle, Some(VehicleKind::Car | VehicleKind::Tank)) =>
+                        {
+                            'v'
+                        }
+                        (_, Some(t)) if t.model.is_some() => 'p',
+                        (Some(h), None) if assets.any.contains(&h) => 'a',
+                        (Some(_), None) if is_test(stem) => 't',
+                        (Some(_), None) => 'v',
+                        _ => '-',
+                    };
+                    let kind = stem_hash.and_then(|h| assets.types.get(&h)).copied();
+                    self.names
+                        .insert(entity, (name.to_owned(), how, kind.unwrap_or(0)));
+                }
                 match (stem_hash, template) {
                     // Its name is a model.
                     (Some(h), _) if assets.models.contains(&h) => {
                         self.objects.push(ObjectPlacement {
+                            entity,
                             model: h,
                             position,
                             rotation,
                             named: true,
+                            fade: None,
                         })
                     }
                     // A vehicle template that drives: the alpha places it.
@@ -734,10 +1050,12 @@ impl WorldIndex {
                             model: Some(model), ..
                         }),
                     ) => self.objects.push(ObjectPlacement {
+                        entity,
                         model,
                         position,
                         rotation,
                         named: true,
+                        fade: None,
                     }),
                     // A name no asset or template defines: the words may
                     // (not the designers' test entities).
@@ -805,10 +1123,12 @@ impl WorldIndex {
                 self.state_objects.insert(
                     entity,
                     ObjectPlacement {
+                        entity,
                         model,
                         position: Vec3::from(p.position),
                         rotation: rotation(p.rotation),
                         named: !models.contains_key(&entity),
+                        fade: None,
                     },
                 );
             }
@@ -880,24 +1200,95 @@ pub fn square_distance(centre: Vec3, x: f32, z: f32) -> f32 {
     (dx * dx + dz * dz).sqrt()
 }
 
-/// Terrain geometry in a cell's own space, ready to upload: positions,
-/// normals and colour-map coordinates, as a triangle list.
+/// Bytes per [`TerrainMesh`] vertex.
+pub const TERRAIN_STRIDE: usize = 52;
+/// Bytes per vertex of [`simple_layout`].
+pub const SIMPLE_STRIDE: usize = 32;
+
+/// Position, normal and texture coordinate, as `f32`s: the sea and ground
+/// scatter.
+pub fn simple_layout() -> VertexLayout {
+    VertexLayout::packed(&[
+        (VertexSemantic::Position, VertexFormat::Float3),
+        (VertexSemantic::Normal, VertexFormat::Float3),
+        (VertexSemantic::TexCoord(0), VertexFormat::Float2),
+    ])
+    .expect("valid layout")
+}
+
+/// What one range of a terrain mesh is drawn with.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TerrainSurface {
+    /// Ground: the cell's colour map over the whole cell, the shared detail
+    /// texture, and up to four tiled layers weighted by the vertex colour.
+    Ground {
+        colour_map: Option<u32>,
+        detail_map: Option<u32>,
+        /// Texture and its (u, v) rows over world-space (x, y, z, 1).
+        layers: Vec<(u32, [[f32; 4]; 2])>,
+    },
+    /// Roads, pavements, markings and other pieces laid into the cell,
+    /// shaded like models with their own texture coordinates.
+    Surface(Material),
+}
+
+impl TerrainSurface {
+    /// Textures to load, as (hash, holds data rather than colour, is the
+    /// cell's colour map).
+    pub fn textures(&self) -> Vec<(u32, bool, bool)> {
+        match self {
+            Self::Ground {
+                colour_map,
+                detail_map,
+                layers,
+            } => colour_map
+                .map(|t| (t, false, true))
+                .into_iter()
+                // Signed grain around mid-grey: data, not colour.
+                .chain(detail_map.map(|t| (t, true, false)))
+                .chain(layers.iter().map(|&(t, _)| (t, false, false)))
+                .collect(),
+            Self::Surface(m) => crate::model::material_textures(m)
+                .into_iter()
+                .map(|(t, linear)| (t, linear, false))
+                .collect(),
+        }
+    }
+}
+
+/// Terrain geometry in a cell's own space, ready to upload, as a triangle
+/// list grouped by what each part is drawn with.
 #[derive(Clone, Debug, Default)]
 pub struct TerrainMesh {
     /// Where the mesh's origin sits in the world.
     pub origin: Vec3,
-    /// Position, normal, texture coordinate (32 bytes per vertex).
+    /// Position, normal, texture coordinate, colour and tangent
+    /// ([`TerrainMesh::layout`], [`TERRAIN_STRIDE`] bytes per vertex).
     pub vertices: Vec<u8>,
     pub indices: Vec<u32>,
-    /// The colour map to texture it with.
-    pub colour_map: Option<u32>,
-    /// The shared detail texture tiled over it up close (cells only).
-    pub detail_map: Option<u32>,
+    /// What each range is drawn with.
+    pub surfaces: Vec<TerrainSurface>,
+    /// (first index, index count, index into `surfaces`), one per surface
+    /// used, back to back over `indices`.
+    pub ranges: Vec<(u32, u32, usize)>,
     /// Lowest and highest vertex, relative to `origin`.
     pub bounds: (Vec3, Vec3),
     /// The ground surface (without skirts) for collision, relative to
     /// `origin`; built for full-detail cells only.
     pub collision: Option<CollisionShape>,
+    /// Triangles turned round to face the way their vertices' normals do.
+    pub flipped: usize,
+}
+
+/// Where a vertex's texture coordinate comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum UvSource {
+    /// The vertex's own (`TEXCOORD0`).
+    Own,
+    /// The cell's colour map over its whole square.
+    CellMap,
+    /// The island-wide map (low-resolution tiles), around `centre`.
+    Island,
 }
 
 impl TerrainMesh {
@@ -906,18 +1297,20 @@ impl TerrainMesh {
             (VertexSemantic::Position, VertexFormat::Float3),
             (VertexSemantic::Normal, VertexFormat::Float3),
             (VertexSemantic::TexCoord(0), VertexFormat::Float2),
+            (VertexSemantic::Color, VertexFormat::UNorm4x8),
+            (VertexSemantic::Tangent, VertexFormat::Float4),
         ])
         .expect("valid layout")
     }
 
     pub fn vertex_count(&self) -> u32 {
-        (self.vertices.len() / 32) as u32
+        (self.vertices.len() / TERRAIN_STRIDE) as u32
     }
 
     /// Vertex positions, relative to `origin`.
     pub fn positions(&self) -> Vec<Vec3> {
         self.vertices
-            .chunks_exact(32)
+            .chunks_exact(TERRAIN_STRIDE)
             .map(|v| {
                 let f = |i: usize| f32::from_le_bytes(v[i..i + 4].try_into().expect("4 bytes"));
                 Vec3::new(f(0), f(4), f(8))
@@ -954,15 +1347,26 @@ impl TerrainMesh {
         self.indices.iter().flat_map(|i| i.to_le_bytes()).collect()
     }
 
-    /// Appends `group`, offset by `offset` from the mesh origin, with
-    /// texture coordinates from `uv` of the vertex's mesh-space position.
-    fn add_group(&mut self, group: &TerrainGroup<'_>, offset: Vec3, uv: impl Fn(Vec3) -> [f32; 2]) {
+    /// Appends `group`'s vertices, offset by `offset` from the mesh origin,
+    /// with texture coordinates from `uv`; returns the first one's index.
+    fn add_vertices(
+        &mut self,
+        group: &TerrainGroup<'_>,
+        offset: Vec3,
+        uv: impl Fn(Vec3, [f32; 2]) -> [f32; 2],
+    ) -> u32 {
         let positions = group.positions();
-        let normals = group
-            .decl
-            .find(DeclUsage::Normal, 0)
-            .and_then(|e| group.vertices.read(e))
-            .unwrap_or_default();
+        let read = |usage| {
+            group
+                .decl
+                .find(usage, 0)
+                .and_then(|e| group.vertices.read(e))
+                .unwrap_or_default()
+        };
+        let normals = read(DeclUsage::Normal);
+        let own_uvs = read(DeclUsage::TexCoord);
+        let colours = read(DeclUsage::Color);
+        let tangents = read(DeclUsage::Tangent);
         let first = self.vertex_count();
         for (i, p) in positions.iter().enumerate() {
             let pos = Vec3::from(*p) + offset;
@@ -972,38 +1376,166 @@ impl TerrainMesh {
                 .unwrap_or(Vec3::Y);
             self.bounds.0 = self.bounds.0.min(pos);
             self.bounds.1 = self.bounds.1.max(pos);
-            let t = uv(pos);
+            let t = uv(pos, own_uvs.get(i).map_or([0.0; 2], |t| [t[0], t[1]]));
             for f in [pos.x, pos.y, pos.z, n.x, n.y, n.z, t[0], t[1]] {
                 self.vertices.extend(f.to_le_bytes());
             }
+            let c = colours.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+            self.vertices
+                .extend(c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8));
+            let tangent = tangents.get(i).copied().unwrap_or([0.0; 4]);
+            for f in tangent {
+                self.vertices.extend(f.to_le_bytes());
+            }
         }
-        // Full ranges draw the whole group; fall back to the material ranges.
-        let ranges = if group.full_ranges.is_empty() {
-            &group.material_ranges
+        first
+    }
+
+    /// Adds the finest level of detail of `group`, each triangle with the
+    /// surface its material range names (`surface(material index)`), into
+    /// `buckets` (per surface, its triangles); the first full range draws
+    /// it all with `fallback` when the group has no material ranges. The
+    /// coarser levels lie over the same ground and are left out.
+    #[allow(clippy::too_many_arguments)]
+    fn add_group(
+        &mut self,
+        group: &TerrainGroup<'_>,
+        offset: Vec3,
+        centre: Vec3,
+        surface: impl Fn(u32) -> Option<(usize, UvSource)>,
+        fallback: (usize, UvSource),
+        buckets: &mut HashMap<usize, Vec<u32>>,
+        seen: &mut HashSet<(usize, [u32; 3])>,
+    ) {
+        log_near(group, offset + centre);
+        let count = group.positions().len();
+        let ranges: Vec<_> = if group.material_ranges.is_empty() {
+            group
+                .full_ranges
+                .iter()
+                .take(1)
+                .map(|r| (r, fallback))
+                .collect()
         } else {
-            &group.full_ranges
+            group
+                .lod_ranges(0)
+                .iter()
+                .map(|r| (r, surface(r.material).unwrap_or(fallback)))
+                .collect()
         };
-        let mut seen = HashSet::new();
-        for r in ranges {
+        let mut firsts: HashMap<UvSource, u32> = HashMap::new();
+        for (r, (surface, source)) in ranges {
+            let first = *firsts.entry(source).or_insert_with(|| {
+                self.add_vertices(group, offset, |pos, own| match source {
+                    UvSource::Own => own,
+                    UvSource::CellMap => colour_map_uv(pos.x, pos.z),
+                    UvSource::Island => {
+                        let w = pos + centre;
+                        [(ISLAND / 2.0 - w.x) / ISLAND, (ISLAND / 2.0 - w.z) / ISLAND]
+                    }
+                })
+            });
+            let out = buckets.entry(surface).or_default();
             for tri in group.triangles(r) {
+                if tri.iter().any(|&i| usize::from(i) >= count) {
+                    continue;
+                }
+                let tri = tri.map(|i| first + u32::from(i));
                 let mut key = tri;
                 key.sort_unstable();
-                if tri.iter().all(|&i| usize::from(i) < positions.len()) && seen.insert(key) {
-                    self.indices.extend(tri.map(|i| first + u32::from(i)));
+                if seen.insert((surface, key)) {
+                    out.extend(tri);
                 }
             }
         }
     }
 
+    /// Lays `buckets` out as `indices` and `ranges`, by surface, each
+    /// triangle wound to face the way its vertices' normals do.
+    fn finish(&mut self, mut buckets: HashMap<usize, Vec<u32>>) {
+        self.orient(&mut buckets);
+        let mut order: Vec<_> = buckets.into_iter().filter(|b| !b.1.is_empty()).collect();
+        order.sort_unstable_by_key(|b| b.0);
+        for (surface, tris) in order {
+            let first = self.indices.len() as u32;
+            self.indices.extend(&tris);
+            self.ranges.push((first, tris.len() as u32, surface));
+        }
+    }
+
+    /// Turns round the triangles wound against the rest: most of a mesh's
+    /// triangles face (by their winding) the way their vertices' normals
+    /// point, but some of the strips' triangles come out the other way
+    /// round, and culled as back faces they left holes in the ground (the
+    /// bank under sea2's lip) that collision, being two-sided, didn't have.
+    /// A triangle whose face is nearly edge-on to its normals is left be.
+    fn orient(&mut self, buckets: &mut HashMap<usize, Vec<u32>>) {
+        let vertex = |v: u32, at: usize| {
+            let o = v as usize * TERRAIN_STRIDE + at;
+            let f = |i: usize| {
+                f32::from_le_bytes(self.vertices[o + i..o + i + 4].try_into().expect("4 bytes"))
+            };
+            Vec3::new(f(0), f(4), f(8))
+        };
+        // Cosine between a triangle's face and its mean vertex normal.
+        let facing = |t: &[u32]| {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|v| vertex(v, 0));
+            let face = (b - a).cross(c - a).normalize_or_zero();
+            let normal =
+                (vertex(t[0], 12) + vertex(t[1], 12) + vertex(t[2], 12)).normalize_or_zero();
+            face.dot(normal)
+        };
+        let mut keys: Vec<usize> = buckets.keys().copied().collect();
+        keys.sort_unstable();
+        let way: f32 = keys
+            .iter()
+            .flat_map(|k| buckets[k].chunks_exact(3))
+            .map(|t| facing(t).signum())
+            .sum::<f32>()
+            .signum();
+        let mut flips = Vec::new();
+        for &k in &keys {
+            for (i, t) in buckets[&k].chunks_exact(3).enumerate() {
+                if facing(t) * way < -0.2 {
+                    flips.push((k, i));
+                }
+            }
+        }
+        self.flipped += flips.len();
+        for (k, i) in flips {
+            buckets
+                .get_mut(&k)
+                .expect("bucket")
+                .swap(i * 3 + 1, i * 3 + 2);
+        }
+    }
+
     /// Hangs a strip `depth` metres deep below every open edge (an edge of
-    /// one triangle only), so cracks where neighbouring cells, patches or
-    /// detail levels meet show ground instead of sky. Drawn both ways round,
-    /// as the crack may be seen from either side.
+    /// one triangle only), so cracks where a low-resolution tile meets
+    /// another detail level show ground instead of sky. Drawn both ways
+    /// round, as the crack may be seen from either side. Only ground ranges
+    /// get skirts; they join the first ground range.
     fn add_skirts(&mut self, depth: f32) {
+        if !skirts_wanted() {
+            return;
+        }
+        let ground: Vec<usize> = self
+            .ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(self.surfaces[r.2], TerrainSurface::Ground { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let Some(&host) = ground.first() else {
+            return;
+        };
         let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
-        for t in self.indices.chunks_exact(3) {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+        for &g in &ground {
+            let (first, count, _) = self.ranges[g];
+            for t in self.indices[first as usize..(first + count) as usize].chunks_exact(3) {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+                }
             }
         }
         let mut open: Vec<(u32, u32)> = edges
@@ -1015,8 +1547,8 @@ impl TerrainMesh {
         let mut lowered: HashMap<u32, u32> = HashMap::new();
         let mut lower = |mesh: &mut Self, v: u32| {
             *lowered.entry(v).or_insert_with(|| {
-                let at = v as usize * 32;
-                let mut vertex: [u8; 32] = mesh.vertices[at..at + 32].try_into().expect("32 bytes");
+                let at = v as usize * TERRAIN_STRIDE;
+                let mut vertex = mesh.vertices[at..at + TERRAIN_STRIDE].to_vec();
                 let y = f32::from_le_bytes(vertex[4..8].try_into().expect("4 bytes")) - depth;
                 vertex[4..8].copy_from_slice(&y.to_le_bytes());
                 mesh.bounds.0.y = mesh.bounds.0.y.min(y);
@@ -1024,20 +1556,58 @@ impl TerrainMesh {
                 mesh.vertex_count() - 1
             })
         };
+        let mut skirt = Vec::new();
         for (a, b) in open {
             let (la, lb) = (lower(self, a), lower(self, b));
-            self.indices
-                .extend([a, b, lb, a, lb, la, a, lb, b, a, la, lb]);
+            skirt.extend([a, b, lb, a, lb, la, a, lb, b, a, la, lb]);
+        }
+        // Insert after the host range and shift the ranges behind it.
+        let (first, count, _) = self.ranges[host];
+        let at = (first + count) as usize;
+        let added = skirt.len() as u32;
+        self.indices.splice(at..at, skirt);
+        self.ranges[host].1 += added;
+        for r in self.ranges.iter_mut().skip(host + 1) {
+            r.0 += added;
         }
     }
 
-    fn empty(origin: Vec3, colour_map: Option<u32>) -> Self {
+    fn empty(origin: Vec3) -> Self {
         Self {
             origin,
-            colour_map,
             bounds: (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
             ..Self::default()
         }
+    }
+}
+
+/// The surface a cell material draws with: ground for the terrain
+/// shaders (or an unknown technique), a model-style surface otherwise.
+fn cell_surface(m: &TerrainMaterial) -> TerrainSurface {
+    let terrain = Technique::from_hash(m.material.technique).map_or(Some(0), |t| t.terrain_layers);
+    match terrain {
+        Some(layers) => {
+            let slot = |i: usize| m.material.textures.get(i).copied().filter(|&t| t != 0);
+            TerrainSurface::Ground {
+                colour_map: slot(0),
+                detail_map: slot(1),
+                layers: (0..usize::from(layers).min(4))
+                    .filter_map(|l| {
+                        let rows = &m.uv[l];
+                        slot(2 + l * 2).map(|t| {
+                            (
+                                t,
+                                [
+                                    [rows[0], rows[1], rows[2], rows[3]],
+                                    [rows[4], rows[5], rows[6], rows[7]],
+                                ],
+                            )
+                        })
+                    })
+                    .collect(),
+            }
+        }
+        None => TerrainSurface::Surface(m.material.clone()),
     }
 }
 
@@ -1052,21 +1622,53 @@ pub fn terrain_cell<R: Read + Seek>(
         hash,
         message: e.to_string(),
     })?;
-    let mut mesh = TerrainMesh::empty(centre, cell.colour_map());
-    // Texture slot 1 of the cell's material, by the format notes.
-    mesh.detail_map = cell
-        .materials
-        .first()
-        .and_then(|m| m.material.textures.get(1).copied())
-        .filter(|&t| t != 0);
+    let mut mesh = TerrainMesh::empty(centre);
+    mesh.surfaces = cell.materials.iter().map(cell_surface).collect();
+    // Groups drawn without a material range use the cell's plain ground.
+    let fallback = mesh.surfaces.len();
+    mesh.surfaces.push(TerrainSurface::Ground {
+        colour_map: cell.colour_map(),
+        detail_map: cell
+            .materials
+            .first()
+            .and_then(|m| m.material.textures.get(1).copied())
+            .filter(|&t| t != 0),
+        layers: Vec::new(),
+    });
+    let sources: Vec<UvSource> = mesh
+        .surfaces
+        .iter()
+        .map(|s| match s {
+            TerrainSurface::Ground { .. } => UvSource::CellMap,
+            TerrainSurface::Surface(_) => UvSource::Own,
+        })
+        .collect();
+    // Materials that draw alike share one range (cells repeat them).
+    let same: Vec<usize> = (0..mesh.surfaces.len())
+        .map(|i| {
+            (0..i)
+                .find(|&j| mesh.surfaces[j] == mesh.surfaces[i])
+                .unwrap_or(i)
+        })
+        .collect();
+    let mut buckets = HashMap::new();
+    let mut seen = HashSet::new();
     for patch in &cell.patches {
         let offset = Vec3::from(patch.offset);
         for g in &patch.groups {
-            mesh.add_group(g, offset, |p| colour_map_uv(p.x, p.z));
+            mesh.add_group(
+                g,
+                offset,
+                centre,
+                |m| sources.get(m as usize).map(|&s| (same[m as usize], s)),
+                (fallback, UvSource::CellMap),
+                &mut buckets,
+                &mut seen,
+            );
         }
     }
+    mesh.finish(buckets);
     mesh.build_collision();
-    mesh.add_skirts(CELL_SKIRT);
     Ok(mesh)
 }
 
@@ -1087,12 +1689,24 @@ pub fn low_res_tile<R: Read + Seek>(
         .first()
         .and_then(|m| m.textures.first().copied())
         .filter(|&t| t != 0);
-    let mut mesh = TerrainMesh::empty(centre, map);
-    // The island map follows the cell maps' axes at island scale.
-    mesh.add_group(&tile.group, Vec3::ZERO, |p| {
-        let w = p + centre;
-        [(ISLAND / 2.0 - w.x) / ISLAND, (ISLAND / 2.0 - w.z) / ISLAND]
+    let mut mesh = TerrainMesh::empty(centre);
+    mesh.surfaces.push(TerrainSurface::Ground {
+        colour_map: map,
+        detail_map: None,
+        layers: Vec::new(),
     });
+    let mut buckets = HashMap::new();
+    // The island map follows the cell maps' axes at island scale.
+    mesh.add_group(
+        &tile.group,
+        Vec3::ZERO,
+        centre,
+        |_| Some((0, UvSource::Island)),
+        (0, UvSource::Island),
+        &mut buckets,
+        &mut HashSet::new(),
+    );
+    mesh.finish(buckets);
     mesh.add_skirts(TILE_SKIRT);
     Ok(mesh)
 }
@@ -1166,19 +1780,57 @@ mod tests {
     }
 
     #[test]
-    fn skirts_hang_below_open_edges_only() {
-        let mut mesh = TerrainMesh::empty(Vec3::ZERO, None);
-        // Two triangles sharing the edge 0-2: four open edges.
+    fn triangles_wound_against_the_rest_are_turned_round() {
+        let mut mesh = TerrainMesh::empty(Vec3::ZERO);
         for (x, z) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
-            for f in [x, 2.0, z, 0.0, 1.0, 0.0, 0.0, 0.0] {
+            for f in [x, 0.0, z, 0.0, 1.0, 0.0, 0.0, 0.0] {
                 mesh.vertices.extend(f.to_le_bytes());
             }
+            mesh.vertices.extend([255, 0, 0, 0]);
+            mesh.vertices.extend([0u8; 16]);
         }
-        mesh.indices = vec![0, 1, 2, 0, 2, 3];
-        mesh.bounds = (Vec3::new(0.0, 2.0, 0.0), Vec3::new(1.0, 2.0, 1.0));
+        // Two triangles one way round, the third the other.
+        let buckets = HashMap::from([(0, vec![0, 1, 2, 0, 2, 3, 0, 3, 2])]);
+        mesh.finish(buckets);
+        assert_eq!(mesh.flipped, 1);
+        assert_eq!(mesh.indices, vec![0, 1, 2, 0, 2, 3, 0, 2, 3]);
+    }
+
+    #[test]
+    fn skirts_hang_below_open_edges_only() {
+        // A 1 m quad of two triangles sharing the edge 0-2 (four open
+        // edges), its corner at (x0, z0) in cell space.
+        let quad = |x0: f32, z0: f32| {
+            let mut mesh = TerrainMesh::empty(Vec3::ZERO);
+            mesh.surfaces.push(TerrainSurface::Ground {
+                colour_map: None,
+                detail_map: None,
+                layers: Vec::new(),
+            });
+            add_quad(&mut mesh, x0, z0, 2.0);
+            mesh
+        };
+        fn add_quad(mesh: &mut TerrainMesh, x0: f32, z0: f32, y: f32) {
+            let base = mesh.vertex_count();
+            for (x, z) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                for f in [x0 + x, y, z0 + z, 0.0, 1.0, 0.0, 0.0, 0.0] {
+                    mesh.vertices.extend(f.to_le_bytes());
+                }
+                mesh.vertices.extend([255, 0, 0, 0]);
+                mesh.vertices.extend([0u8; 16]);
+            }
+            mesh.indices.extend([0, 1, 2, 0, 2, 3].map(|i| base + i));
+            mesh.ranges = vec![(0, mesh.indices.len() as u32, 0)];
+            mesh.bounds = (
+                mesh.bounds.0.min(Vec3::new(x0, y, z0)),
+                mesh.bounds.1.max(Vec3::new(x0 + 1.0, y, z0 + 1.0)),
+            );
+        }
+        let mut mesh = quad(0.0, 0.0);
         mesh.add_skirts(4.0);
         assert_eq!(mesh.vertex_count(), 8);
         assert_eq!(mesh.indices.len(), 6 + 4 * 12);
+        assert_eq!(mesh.ranges, vec![(0, 6 + 4 * 12, 0)]);
         assert_eq!(mesh.bounds.0.y, -2.0);
         assert!(mesh.indices.iter().all(|&i| i < 8));
     }

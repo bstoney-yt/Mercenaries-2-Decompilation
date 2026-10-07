@@ -35,6 +35,8 @@ const TURN_RATE: f32 = 10.0;
 const LOOK_HEIGHT: f32 = 1.6;
 const CAMERA_DISTANCE: f32 = 4.0;
 const CAMERA_MIN: f32 = 0.6;
+/// How far above the ground under it the chase camera keeps.
+const CAMERA_CLEARANCE: f32 = 0.4;
 /// How the chase camera follows a vehicle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChaseRig {
@@ -526,13 +528,33 @@ impl Player {
         }
     }
 
-    /// Pulls the camera in when something is between it and her.
+    /// Pulls the camera in when something is between it and her, and
+    /// until it is clear of the ground beneath it: a ray from her head
+    /// can graze a slope rising behind her and miss it, which left the eye
+    /// under the bank at sea2, looking up through the ground's back faces.
     fn camera(&mut self, physics: &Physics) {
         let back = -self.camera_forward();
-        self.camera_distance = match physics.cast_ray(self.look_at(), back, CAMERA_DISTANCE) {
+        let head = self.look_at();
+        let mut distance = match physics.cast_ray(head, back, CAMERA_DISTANCE) {
             Some((d, _)) => (d - 0.2).max(CAMERA_MIN),
             None => CAMERA_DISTANCE,
         };
+        // Ground (not a roof or a bridge high over it) from a little above
+        // the eye to a little below.
+        let below = |eye: Vec3| {
+            let top = eye.y + 1.5;
+            physics
+                .cast_ray(
+                    Vec3::new(eye.x, top, eye.z),
+                    -Vec3::Y,
+                    1.5 + CAMERA_CLEARANCE,
+                )
+                .is_some()
+        };
+        while distance > CAMERA_MIN && below(head + back * distance) {
+            distance = (distance - 0.25).max(CAMERA_MIN);
+        }
+        self.camera_distance = distance;
     }
 
     /// Chase camera for a vehicle at `transform` rigged as `rig`, rolling

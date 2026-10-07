@@ -142,6 +142,9 @@ pub struct DecodedTexture {
     pub mips: Vec<Vec<u8>>,
     /// The stored format has an alpha channel.
     pub alpha: bool,
+    /// Holds data rather than colour (normal and specular maps): upload it
+    /// without sRGB decoding. Set by whoever knows what it is used for.
+    pub linear: bool,
 }
 
 /// The tier (`_Q<n>`) a streamed block belongs to.
@@ -249,6 +252,21 @@ impl<R: Read + Seek> AssetSource<R> {
         Ok(out)
     }
 
+    /// Every base asset in the blocks holding `hash`: type, name and
+    /// length, for logs.
+    pub fn census(&mut self, hash: u32) -> Result<Vec<(u32, u32, usize)>, AssetError> {
+        let mut out = Vec::new();
+        for b in self.blocks_of(hash) {
+            let decoded = self.block(b)?;
+            for (e, data) in BlockContents::parse(&decoded)?.iter() {
+                if e.unk_0x08 == 0 {
+                    out.push((e.type_hash, e.name_hash, data.len()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Model `hash` with all its streamed geometry.
     pub fn model(&mut self, hash: u32) -> Result<ModelData, AssetError> {
         let (mut base, mut chunks) = (None, Vec::new());
@@ -345,6 +363,7 @@ impl<R: Read + Seek> AssetSource<R> {
             height,
             mips,
             alpha,
+            linear: false,
         })
     }
 }
