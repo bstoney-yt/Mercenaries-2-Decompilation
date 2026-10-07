@@ -116,8 +116,10 @@ struct Active {
     vehicle_clip: Option<Clip>,
     /// Her clips' height above the vehicle's origin, from where its clip
     /// puts the pistol in her hand (the AMX30's clips are cut ~1.5 m
-    /// below its deck, the M1A2's on it).
+    /// below its deck, the M1A2's on it): one for the whole hijack, and
+    /// how far the gap strayed in the clip it was taken from.
     lift: f32,
+    steady: f32,
 }
 
 /// What the HUD shows of a hijack.
@@ -399,6 +401,7 @@ impl Hijacks {
                 pistol_parent,
                 vehicle_clip: None,
                 lift: 0.0,
+                steady: HELD,
                 vehicle: c.vehicle,
                 hero,
                 set: l.clips.sets.get(&c.template.to_ascii_lowercase()).copied(),
@@ -707,9 +710,15 @@ fn follow(
             _ => {}
         }
     }
-    if started && let Some(lift) = lift(a, game) {
-        eprintln!("hijack: her clips {lift:.2} m up");
-        a.lift = lift;
+    if started && let Some((lift, spread)) = lift(a, game) {
+        eprintln!("hijack: hand to pistol {lift:.2} m, spread {spread:.2}");
+        // Only while she holds it does the gap stay put; the steadiest
+        // such clip sets the lift for all of them.
+        if spread < a.steady {
+            a.lift = lift;
+            a.steady = spread;
+        }
+        eprintln!("hijack: her clips {:.2} m up", a.lift);
     }
     let (done, left): (Vec<_>, Vec<_>) = a.actions.iter().partition(|x| x.1 <= now);
     a.actions = left;
@@ -776,10 +785,15 @@ fn load(game: &mut Game, hash: u32) -> Option<Clip> {
     Clip::parse(&bytes).ok()
 }
 
+/// The most the hand-to-pistol gap may stray in a clip for her to be
+/// holding it, metres (inferred from rounds H17 and H18).
+const HELD: f32 = 0.25;
+
 /// How high her clip must play for her right hand to be where the
 /// vehicle's clip puts the pistol: the median over the two clips' frames,
-/// in height only. None without both clips or the prop.
-fn lift(a: &Active, game: &Game) -> Option<f32> {
+/// in height only, and how far it strays (max - min). None without both
+/// clips or the prop.
+fn lift(a: &Active, game: &Game) -> Option<(f32, f32)> {
     let (vehicle, parent) = (a.vehicle_clip.as_ref()?, a.pistol_parent?);
     let track = vehicle.track_nodes.iter().position(|&n| n == PISTOL)?;
     let (_, rig) = game.scene.player.as_ref()?.model.as_ref()?;
@@ -798,7 +812,7 @@ fn lift(a: &Active, game: &Game) -> Option<f32> {
         t += STEP;
     }
     ups.sort_by(f32::total_cmp);
-    ups.get(ups.len() / 2).copied()
+    Some((*ups.get(ups.len() / 2)?, ups.last()? - ups.first()?))
 }
 
 /// Plays clip `hash` on her (read from the archive the first time); its
