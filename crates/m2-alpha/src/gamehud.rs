@@ -107,7 +107,16 @@ return c.sColor .. tag .. " [objective." .. c.sPrefix .. c.sStatus .. "]" .. " "
 /// its own environment like every module: its globals are the module's
 /// members.
 const HUD_CALL: &str = r#"
-local group, method, data = ...
+local group, method, data, seq = ...
+-- The mission's callback (`fCallback`, kept in the mission's own Lua
+-- state) stands here as a note of the call's number, for the game to
+-- hand back ([`HudCall::callback`]).
+if seq then
+    data.fCallback = function()
+        __m2_hud_done = __m2_hud_done or {}
+        table.insert(__m2_hud_done, seq)
+    end
+end
 local module = rawget(_G, "MrxGuiInterface")
 local hud = type(module) == "table" and module.HudInterface
 local g = type(hud) == "table" and hud[group]
@@ -513,6 +522,10 @@ pub struct HudCall {
     pub group: String,
     pub method: String,
     pub data: Plain,
+    /// The call carried a callback (`fCallback`, as the contract's
+    /// fanfare does, which the flow waits on); the HUD hands its number
+    /// back when it calls it ([`GameHud::take_callbacks`]).
+    pub callback: bool,
 }
 
 impl HudState {
@@ -653,6 +666,8 @@ enum Output {
         prims: Vec<Prim>,
         images: Vec<(u32, Option<Image>)>,
         log: Vec<String>,
+        /// The mission calls whose callbacks the HUD called.
+        callbacks: Vec<u64>,
     },
     Failed(String),
 }
@@ -683,6 +698,8 @@ pub struct GameHud {
     last_call: u64,
     /// The time of the last frame (egui's input time).
     last_time: Option<f64>,
+    /// Mission calls whose callbacks the HUD has called, to hand back.
+    callbacks: Vec<u64>,
     log: Option<BufWriter<File>>,
 }
 
@@ -711,6 +728,7 @@ impl GameHud {
             tx,
             rx,
             status: Status::Loading,
+            callbacks: Vec::new(),
             prims: Vec::new(),
             pending: Vec::new(),
             textures: HashMap::new(),
@@ -749,6 +767,12 @@ impl GameHud {
         }
         self.last_message = message.cloned();
         message.cloned()
+    }
+
+    /// The mission calls ([`HudCall::seq`]) whose callbacks the HUD has
+    /// called since the last time: the mission runs its own.
+    pub fn take_callbacks(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.callbacks)
     }
 
     /// The mission's HUD calls in `calls` not passed on yet.
@@ -815,7 +839,13 @@ impl GameHud {
 
     fn take(&mut self, out: Output) {
         match out {
-            Output::Frame { prims, images, log } => {
+            Output::Frame {
+                prims,
+                images,
+                log,
+                callbacks,
+            } => {
+                self.callbacks.extend(callbacks);
                 self.status = Status::Ready;
                 self.prims = prims;
                 self.pending.extend(images);
@@ -1576,7 +1606,25 @@ impl Thread {
                 images.push((hash, image));
             }
         }
-        Output::Frame { prims, images, log }
+        let callbacks = self
+            .mission
+            .lua()
+            .globals()
+            .raw_get::<Option<mlua::Table>>("__m2_hud_done")
+            .ok()
+            .flatten()
+            .map(|t| {
+                let seqs: Vec<u64> = t.sequence_values::<u64>().flatten().collect();
+                t.clear().ok();
+                seqs
+            })
+            .unwrap_or_default();
+        Output::Frame {
+            prims,
+            images,
+            log,
+            callbacks,
+        }
     }
 
     /// Plays the Flash widgets' movies `dt` seconds: starts the movies the
@@ -1797,6 +1845,7 @@ impl Thread {
                     c.group.as_str(),
                     c.method.as_str(),
                     data,
+                    c.callback.then_some(c.seq),
                 ))
             });
             log.push(match done {
@@ -3833,6 +3882,7 @@ mod paint_tests {
             tx,
             rx,
             status: Status::Ready,
+            callbacks: Vec::new(),
             prims: vec![quad(
                 None,
                 [0.0, 0.0, 800.0, 600.0],
