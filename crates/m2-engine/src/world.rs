@@ -169,6 +169,29 @@ impl Templates {
         ids
     }
 
+    /// Who rides in vehicle template `name` (`M151 (MG) (GR)
+    /// (DriverGunner)`): each seat's name and its rider's template name,
+    /// as the template's `Rider` records say; empty for an empty vehicle.
+    pub fn crew(&self, name: &str) -> Vec<(String, String)> {
+        let Some(riders) = self.ids(name).into_iter().find_map(|id| {
+            self.population
+                .riders
+                .get(&id)
+                .or_else(|| self.population.riders.get(&(id & !TEMPLATE_BIT)))
+        }) else {
+            return Vec::new();
+        };
+        riders
+            .iter()
+            .filter_map(|&(seat, person)| {
+                let (who, _) = self
+                    .by_id(person)
+                    .or_else(|| self.by_id(person | TEMPLATE_BIT))?;
+                Some((crate::population::seat_name(seat), who.to_owned()))
+            })
+            .collect()
+    }
+
     /// The template with id `id` (an entity's parent): its name, and what
     /// the database says of it.
     pub fn by_id(&self, id: u32) -> Option<(&str, &TemplateInfo)> {

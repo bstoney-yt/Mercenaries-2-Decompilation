@@ -286,10 +286,11 @@ impl Game {
                 "island vehicle {:#x}: {} as {}",
                 t.entity, t.name, models[0].label
             );
-            loads.push((t.entity, t.at, t.yaw, models));
+            let crew = world.index.template_db.crew(t.name);
+            loads.push((t.entity, t.at, t.yaw, crew, models));
         }
-        for (entity, at, yaw, models) in loads {
-            scene.load_world_vehicle(entity, at, yaw, models);
+        for (entity, at, yaw, crew, models) in loads {
+            scene.load_world_vehicle(entity, at, yaw, crew, models);
         }
     }
 

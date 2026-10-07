@@ -60,6 +60,9 @@ pub struct Population {
     pub lists: HashMap<u32, Vec<(u32, f32)>>,
     /// `AiPatrol` templates' `Haste`, by id.
     pub haste: HashMap<u32, f32>,
+    /// Who rides in a vehicle template, by id: each `Rider` record's seat
+    /// (its name's hash) and person template id (empty seats left out).
+    pub riders: HashMap<u32, Vec<(u32, u32)>>,
 }
 
 const LIST_AT: usize = 44;
@@ -90,6 +93,7 @@ impl Population {
                 .unwrap_or_default(),
             lists,
             haste: db.component("AiPatrol").map(haste).unwrap_or_default(),
+            riders: db.component("Rider").map(riders).unwrap_or_default(),
         }
     }
 }
@@ -123,6 +127,52 @@ pub fn spawners(c: &Component<'_>) -> HashMap<u32, Spawner> {
             ))
         })
         .collect()
+}
+
+/// Every `Rider` record: one per seat, the seat's name hash and the
+/// person template id riding there (0: nobody). Read off the install
+/// (2026-10-07): seat at 0 (field ee6a83a3), person at 4 (f55054b8); the
+/// crewed templates (`M151 (MG) (GR) (DriverGunner)`, the civilian
+/// `Thunder (white)`) differ from their plain twins by this alone.
+pub fn riders(c: &Component<'_>) -> HashMap<u32, Vec<(u32, u32)>> {
+    let by_hash = |h: u32, fallback: usize| {
+        c.fields
+            .iter()
+            .find(|f| f.name_hash == h)
+            .map_or(fallback, |f| usize::from(f.offset))
+    };
+    let (seat, person) = (by_hash(SEAT_HASH, 0), by_hash(PERSON_HASH, 4));
+    let mut out: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    for (id, r) in c.records().unwrap_or_default() {
+        if let (Some(seat), Some(person)) = (word(r, seat), word(r, person))
+            && person != 0
+        {
+            out.entry(id).or_default().push((seat, person));
+        }
+    }
+    out
+}
+
+const SEAT_HASH: u32 = 0xee6a_83a3;
+const PERSON_HASH: u32 = 0xf550_54b8;
+
+/// The seat names the install's `Rider` records were seen to use, for
+/// naming a seat by its hash.
+pub const SEATS: [&str; 6] = [
+    "seat_driver",
+    "seat_gunner",
+    "seat_gunner_rearcenter",
+    "seat_gunner_rightfront",
+    "seat_front_right",
+    "seat_passenger",
+];
+
+/// A seat's name from its hash: a known one, else the hash in hex.
+pub fn seat_name(hash: u32) -> String {
+    SEATS
+        .iter()
+        .find(|s| name_hash(s) == hash)
+        .map_or_else(|| format!("{hash:08x}"), |s| (*s).to_owned())
 }
 
 /// Every `AiPatrol` record's `Haste`.
@@ -205,6 +255,14 @@ mod tests {
         assert_eq!(s.reach(), 250.0);
         s.active_radius = 0.0;
         assert_eq!(s.reach(), 1500.0);
+    }
+
+    #[test]
+    fn seats_are_named_by_their_hash() {
+        // The install's hashes.
+        assert_eq!(seat_name(0xf8b8_325f), "seat_driver");
+        assert_eq!(seat_name(0x1b21_7b8a), "seat_gunner_rearcenter");
+        assert_eq!(seat_name(0xd055_9110), "d0559110");
     }
 
     #[test]
