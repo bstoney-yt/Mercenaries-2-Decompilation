@@ -147,6 +147,8 @@ pub struct Hijacks {
     active: Option<Active>,
     /// Each vehicle model's driver's seat, once looked up.
     seats: HashMap<u32, Option<Seat>>,
+    /// Vehicles (index, model) whose parts are set as their templates say.
+    dressed: std::collections::HashSet<(usize, u32)>,
 }
 
 /// Where and how she sits driving a vehicle.
@@ -185,6 +187,7 @@ impl Hijacks {
             points: HashMap::new(),
             near: None,
             seats: HashMap::new(),
+            dressed: Default::default(),
             active: None,
         }
     }
@@ -582,6 +585,7 @@ impl Hijacks {
         let State::Ready(loaded) = &self.state else {
             return;
         };
+        dress(game, &mut self.dressed, &loaded.clips);
         if self.active.is_some() {
             return;
         }
@@ -884,6 +888,72 @@ fn lift(a: &Active, game: &Game) -> Option<(f32, f32)> {
     Some((*ups.get(ups.len() / 2)?, ups.last()? - ups.first()?))
 }
 
+/// Hides the parts each newly seen vehicle's template starts in a state
+/// that shows nothing (its `OSMStateParameter`s): the soft-top jeep's gun
+/// mount, the gun jeeps' canvas top. Vehicles are known by label, which
+/// is their template's name when they have one.
+fn dress(
+    game: &mut Game,
+    dressed: &mut std::collections::HashSet<(usize, u32)>,
+    clips: &ClipTimes,
+) {
+    let scene = &mut game.scene;
+    for (i, v) in scene.vehicles.iter_mut().enumerate() {
+        if !dressed.insert((i, v.spec.model)) {
+            continue;
+        }
+        let Some(parts) = clips.parts.get(&v.spec.label.to_ascii_lowercase()) else {
+            continue;
+        };
+        let Some(source) = scene.source.as_mut() else {
+            return;
+        };
+        let Ok(data) = source.model(v.spec.model) else {
+            continue;
+        };
+        let Ok(m) = data.parse() else { continue };
+        let Some(states) = &m.states else { continue };
+        let mut off = vec![false; m.nodes.len()];
+        for &(part, state) in parts {
+            let Some(machine) = states.machines.iter().find(|x| {
+                x.node
+                    .and_then(|n| m.nodes.get(usize::from(n)))
+                    .is_some_and(|n| n.name_hash == part)
+            }) else {
+                continue;
+            };
+            let shows = machine
+                .states
+                .iter()
+                .find(|x| x.0 == state)
+                .is_some_and(|x| x.1.iter().any(|c| c.1));
+            if shows {
+                continue;
+            }
+            // The part and everything under it.
+            let Some(top) = machine.node else { continue };
+            for (k, o) in off.iter_mut().enumerate() {
+                let mut at = Some(k as u16);
+                while let Some(n) = at {
+                    if n == top {
+                        *o = true;
+                        break;
+                    }
+                    at = m.nodes.get(usize::from(n)).and_then(|x| x.parent);
+                }
+            }
+        }
+        if off.contains(&true) {
+            eprintln!(
+                "parts: the {} hides {} nodes ({parts:x?})",
+                v.spec.label,
+                off.iter().filter(|&&o| o).count()
+            );
+            v.model.hide(&off);
+        }
+    }
+}
+
 /// The driver's seat of vehicle `i`: its template (the first by name of
 /// those with its model and an animation set), that template's
 /// `seat_driver` (else first) `SeatLink` and the hardpoint it names, else
@@ -897,7 +967,10 @@ fn find_seat(
     let scene = &mut game.scene;
     let v = scene.vehicles.get(i)?;
     let (model, marker) = (v.spec.model, v.spec.seat);
+    let label = v.spec.label.to_ascii_lowercase();
     let db = &scene.world.as_ref()?.index.template_db;
+    // Its own template when its label names one (`M151 Softtop (GR)`),
+    // else one with seats before one without (`M151 (Base)` has none).
     let mut names: Vec<String> = db
         .infos
         .iter()
@@ -905,7 +978,7 @@ fn find_seat(
         .filter_map(|(id, _)| Some(db.names.get(id)?.to_ascii_lowercase()))
         .filter(|name| clips.sets.contains_key(name))
         .collect();
-    names.sort();
+    names.sort_by_key(|n| (*n != label, !clips.seats.contains_key(n), n.clone()));
     let name = names.first()?;
     let set = clips.sets[name];
     let driver = m2_assets::name_hash("seat_driver");

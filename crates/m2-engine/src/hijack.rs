@@ -99,6 +99,25 @@ pub fn animation_sets(db: &Layer<'_>) -> HashMap<u32, (u32, u32)> {
     out
 }
 
+/// Every template's starting part states, by template id: each
+/// `OSMStateParameter`'s `Name` (the part's node name hash) and the state
+/// it starts in (field `934a57ed`). Round J1 (2026-10-07): the soft-top
+/// M151s put their gun-mount frame (`5164a412`) in state `46f79d30`, which
+/// shows nothing; the gun versions so put their canvas top (`b8ed0265`).
+pub fn part_states(db: &Layer<'_>) -> HashMap<u32, Vec<(u32, u32)>> {
+    let params = Table::new(db, "OSMStateParameter");
+    let (name, state) = (name_hash("Name"), 0x934a_57ed);
+    let mut out: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    for t in params.templates() {
+        for r in params.of_template(t) {
+            if let (Some(n), Some(s)) = (params.word(r, name), params.word(r, state)) {
+                out.entry(t).or_default().push((n, s));
+            }
+        }
+    }
+    out
+}
+
 /// Every template's seats, by template id: each `SeatLink`'s `Name` (the
 /// seat's, `seat_driver`) and `Hardpoint` (the node of the vehicle's
 /// model it is at), as name hashes. Inferred: the same field names as
