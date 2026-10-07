@@ -133,9 +133,11 @@ impl FightClips {
     pub const AIM: u32 = 0x0163_f2aa;
     pub const READY: u32 = 0x178a_5642;
     /// Running with the rifle low across the body, two-handed, likeliest
-    /// first (round 151: resident 5.21 m/s, then Jennifer's 4.65 m/s);
-    /// the run she had, 10912665, is Mattias's.
-    pub const RUN_LOW: [u32; 4] = [0x745e_b940, 0x2105_c540, 0xe340_14c3, 0x94b1_e4ac];
+    /// first (round 152's measures: Jennifer's 4.65 m/s run holds it 34
+    /// degrees across, muzzle a little down; the resident's 5.21 m/s
+    /// ones 11 degrees across, or 42 with the muzzle up and the rifle
+    /// rolled); the run she had, 10912665, is Mattias's.
+    pub const RUN_LOW: [u32; 4] = [0xe340_14c3, 0x2105_c540, 0x94b1_e4ac, 0x745e_b940];
     pub const JUMP: u32 = 0xc846_e6fd;
     pub const DIE: u32 = 0x479c_4a51;
     /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
@@ -240,7 +242,7 @@ impl FightClips {
 
     /// Every clip, for rebinding.
     pub fn all(&self) -> impl Iterator<Item = usize> {
-        [self.aim, self.ready, self.jump, self.die]
+        [self.aim, self.ready, self.run_low, self.jump, self.die]
             .into_iter()
             .flatten()
     }
