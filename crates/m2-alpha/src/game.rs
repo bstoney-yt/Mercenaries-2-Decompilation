@@ -1766,6 +1766,12 @@ fn nearest(
         .iter()
         .enumerate()
         .filter(|(_, v)| !v.wrecked)
+        // One with someone in the driver's seat is hijacked, not got into.
+        .filter(|(_, v)| {
+            !v.crew
+                .iter()
+                .any(|(seat, _)| seat.to_ascii_lowercase().contains("driver"))
+        })
         .filter_map(|(i, v)| {
             let at = physics.vehicle_transform(v.id?)?;
             let local = at.inverse() * p.extend(1.0);
