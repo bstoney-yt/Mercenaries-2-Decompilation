@@ -737,6 +737,16 @@ impl AtmosphereMix {
     /// The region and record over `at`, if any: of the regions holding it,
     /// the smallest.
     pub fn over(&self, regions: &[AtmosphereRegion], at: Vec3) -> Option<(usize, usize)> {
+        // `M2_ATMO_FORCE=<region>:<record>` (`rgn_atmo_carmonaisland:0`)
+        // lights everywhere by that record, to test.
+        if let Ok(v) = std::env::var("M2_ATMO_FORCE")
+            && let Some((name, record)) = v.split_once(':')
+            && let Some(i) = regions.iter().position(|r| r.name == name)
+            && let Ok(s) = record.parse::<usize>()
+            && s < regions[i].settings.len()
+        {
+            return Some((i, s));
+        }
         let (i, r) = regions
             .iter()
             .enumerate()
