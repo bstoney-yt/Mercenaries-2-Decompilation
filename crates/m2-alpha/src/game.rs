@@ -781,6 +781,7 @@ impl Game {
                 world.physics.remove_vehicle(id);
             }
             v.wrecked = false;
+            v.damage = 0.0;
         }
         let p = &save.player;
         player.character.position = Vec3::from(p.position);
@@ -889,7 +890,11 @@ impl Game {
         };
         HudInfo {
             playing: self.on_foot && player.is_some(),
-            hp: self.combat.hp,
+            // In a vehicle, the health box shows the vehicle's.
+            hp: player
+                .and_then(|p| p.driving)
+                .and_then(|i| self.scene.vehicles.get(i))
+                .map_or(self.combat.hp, ParkedVehicle::health),
             down: self.combat.down > 0.0,
             weapon: self.combat.weapon,
             second: self.combat.second,

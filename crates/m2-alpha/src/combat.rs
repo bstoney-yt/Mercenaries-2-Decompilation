@@ -206,8 +206,7 @@ const BASH_GAP: f32 = 0.8;
 /// Heights of a blow over her feet, high and low, metres.
 const BASH_HIGH: f32 = 1.2;
 const BASH_LOW: f32 = 0.45;
-/// Blasts kill within `KILL` metres and hurt to `REACH`; vehicles within
-/// `WRECK` are wrecked.
+/// Blasts kill within `KILL` metres and hurt to `REACH`.
 const KILL: f32 = 4.0;
 /// How hard a blast throws people: (out, up) m/s at its heart, on top of
 /// 3 out and 2 up at the edge of its reach. Invented, to look like the
@@ -216,7 +215,6 @@ pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 /// How hard a rifle round shoves the one it kills, m/s.
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
-const WRECK: f32 = 6.0;
 /// The satellite-guided bomb's blasts, from the template database's
 /// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
 /// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
@@ -226,8 +224,23 @@ const WRECK: f32 = 6.0;
 pub const BOMB: (f32, f32) = (20.0, 100.0);
 pub const BOMB_FRAG: (f32, f32) = (50.0, 300.0);
 const BOMB_FINAL: (f32, f32) = (2.0, 500.0);
-/// A vehicle a blast hits this hard is wrecked.
-const WRECKING: f32 = 60.0;
+/// What a round does to a vehicle it hits: its bullet template's
+/// `Damage` against the vehicle's health (the carbine's "Carbine Bullet"
+/// 6, the soldiers' "Assault Rifle Bullet" 9, the tank's machine guns'
+/// "Heavy MG Bullet" 15), times its weapon's rating (`WeaponHint`, 0 to 3)
+/// against the vehicle's armour class (none, light, medium, heavy), of 3.
+/// Inferred: the ratings may only steer the AI, but rifles doing nothing
+/// to tanks is the game's.
+const CARBINE_ON_VEHICLE: (f32, [u8; 4]) = (6.0, [3, 1, 0, 0]);
+const RIFLE_ON_VEHICLE: (f32, [u8; 4]) = (9.0, [3, 1, 0, 0]);
+const MG_ON_VEHICLE: (f32, [u8; 4]) = (15.0, [3, 2, 1, 0]);
+/// A blast's damage to vehicles (the "Explosion (Tank Shell)" and RPG's:
+/// 200 at its heart down to 50 at 5 m, nothing beyond), times the
+/// vehicle's `ExplosionFudge` (the AMX-30 takes a fifth).
+const BLAST_ON_VEHICLE: (f32, f32, f32) = (200.0, 50.0, 5.0);
+/// Below its `TickDamage` health a vehicle burns down this fast, health a
+/// second (the template's 1 every 0.5 s, read as seconds).
+const BURN_DOWN: f32 = 2.0;
 /// What the bomb leaves burning: this many fires within this far
 /// (metres), each for between these (seconds; the videos: 4 to 6 s).
 const BOMB_FIRES: usize = 5;
@@ -1257,6 +1270,7 @@ impl Combat {
             }
         }
         self.fly(f, dt);
+        self.burn_vehicles(f, dt);
         self.smoke_wrecks(f, dt);
     }
 
@@ -1360,6 +1374,7 @@ impl Combat {
         );
         self.sounds.push(Sound::Shot(from));
         if let Some((t, None)) = hit {
+            self.round_on_vehicle(f, (eye, dir, t), CARBINE_ON_VEHICLE, None);
             self.hit_explosives_in(f.explosives, eye + dir * t, RIFLE_DAMAGE);
             // What it hit, if the scene's (a crate takes the round).
             let key = f
@@ -1434,6 +1449,9 @@ impl Combat {
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
         if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
             self.hurt_player(f, NPC_DAMAGE);
+        }
+        if let Some((t, None)) = hit {
+            self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
         }
     }
 
@@ -1679,10 +1697,79 @@ impl Combat {
                 self.hits += 1;
             }
             if let Some((t, None)) = hit {
+                self.round_on_vehicle(f, (from, aim, t), MG_ON_VEHICLE, Some(id));
                 self.hit_explosives_in(f.explosives, from + aim * t, MG_DAMAGE);
             }
         }
         alarm(f.people, from);
+    }
+
+    /// Vehicles hurt below their `TickDamage` health burn down until they
+    /// are wrecked.
+    fn burn_vehicles(&mut self, f: &mut Field<'_>, dt: f32) {
+        for i in 0..f.vehicles.len() {
+            let v = &mut f.vehicles[i];
+            let Some(below) = v.spec.tuning.burns_below else {
+                continue;
+            };
+            if !v.wrecked && v.damage > 0.0 && v.most_health() - v.damage <= below {
+                self.hurt_vehicle(f.physics, v, i, BURN_DOWN * dt);
+            }
+        }
+    }
+
+    /// Wrecks vehicle `i`, `v`, if it isn't already: it burns and can't be
+    /// driven.
+    fn wreck(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
+        if v.wrecked {
+            return;
+        }
+        v.wrecked = true;
+        if let Some(id) = v.id {
+            physics.wreck_vehicle(id);
+        }
+        self.wrecks.push((i, 0.0));
+        self.remarks.push(Remark::Wreck);
+    }
+
+    /// Vehicle `i`, `v`, takes `damage`: wrecked once it has taken its
+    /// health.
+    fn hurt_vehicle(
+        &mut self,
+        physics: &mut Physics,
+        v: &mut ParkedVehicle,
+        i: usize,
+        damage: f32,
+    ) {
+        if v.wrecked {
+            return;
+        }
+        v.damage += damage;
+        if v.damage >= v.most_health() {
+            self.wreck(physics, v, i);
+        }
+    }
+
+    /// A round from `from` along `dir` that struck something solid `t`
+    /// metres on: a vehicle (not `own`) takes `damage`.
+    fn round_on_vehicle(
+        &mut self,
+        f: &mut Field<'_>,
+        (from, dir, t): (Vec3, Vec3, f32),
+        (damage, rating): (f32, [u8; 4]),
+        own: Option<VehicleId>,
+    ) {
+        let Some((_, Some(id))) = f.physics.cast_ray_vehicle(from, dir, t + 0.05, own) else {
+            return;
+        };
+        if let Some(i) = f.vehicles.iter().position(|v| v.id == Some(id)) {
+            let v = &mut f.vehicles[i];
+            let class = v.spec.tuning.armour.map_or(0, |a| a as usize - 1).min(3);
+            let damage = damage * f32::from(rating[class]) / 3.0;
+            if damage > 0.0 {
+                self.hurt_vehicle(f.physics, v, i, damage);
+            }
+        }
     }
 
     /// A round landing at `at` hurts the explosive it hits, which goes up
@@ -1923,18 +2010,23 @@ impl Combat {
             };
             let (lo, hi) = v.spec.bounds;
             let centre = body.transform_point3((lo + hi) * 0.5);
-            let d = centre.distance(at);
-            if d < WRECK {
-                let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass;
-                // Off-centre, so it tumbles.
-                f.physics
-                    .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
-                if !v.wrecked {
-                    v.wrecked = true;
-                    f.physics.wreck_vehicle(id);
-                    self.wrecks.push((i, 0.0));
-                    self.remarks.push(Remark::Wreck);
+            // Nearest its hull's side, roughly.
+            let d = (centre.distance(at) - (hi - lo).max_element() * 0.25).max(0.0);
+            let (heart, edge, radius) = BLAST_ON_VEHICLE;
+            if d < radius && !v.wrecked {
+                let damage = heart + (edge - heart) * d / radius;
+                self.hurt_vehicle(
+                    f.physics,
+                    v,
+                    i,
+                    damage * v.spec.tuning.blast_scale.unwrap_or(1.0),
+                );
+                // What it wrecks, it throws: off-centre, so it tumbles.
+                if v.wrecked {
+                    let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
+                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass;
+                    f.physics
+                        .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
                 }
             }
         }
@@ -2056,22 +2148,23 @@ impl Combat {
             let centre = body.transform_point3((lo + hi) * 0.5);
             let d = centre.distance(at);
             let near = 1.0 - d / radius;
-            if d < radius && damage * near >= WRECKING && !shielded(centre) {
+            if d < radius && !shielded(centre) {
                 wrecking.push((i, centre, near));
             }
         }
         for (i, centre, near) in wrecking {
             let v = &mut f.vehicles[i];
             let Some(id) = v.id else { continue };
-            let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-            let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3);
-            f.physics
-                .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
-            if !v.wrecked {
-                v.wrecked = true;
-                f.physics.wreck_vehicle(id);
-                self.wrecks.push((i, 0.0));
-                self.remarks.push(Remark::Wreck);
+            if v.wrecked {
+                continue;
+            }
+            let scale = v.spec.tuning.blast_scale.unwrap_or(1.0);
+            self.hurt_vehicle(f.physics, v, i, damage * near * scale);
+            if v.wrecked {
+                let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
+                let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3);
+                f.physics
+                    .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
             }
         }
         for e in f.explosives.iter_mut() {
@@ -2742,6 +2835,7 @@ mod tests {
             gun: 0.0,
             rolled: 0.0,
             fired: 0,
+            damage: 0.0,
         }];
         assert_eq!(vehicles[0].rounds(), Some(2));
         let mut player = Player::new(0.0, 0.0, 0.0, None);
@@ -2773,6 +2867,37 @@ mod tests {
         }
         assert_eq!(shots, 2);
         assert_eq!(vehicles[0].rounds(), Some(0));
+        // A tank's template: 125 health, heavy armour, a fifth of blasts.
+        let t = &mut vehicles[0].spec.tuning;
+        (t.health, t.armour, t.blast_scale, t.burns_below) =
+            (Some(125.0), Some(4), Some(0.2), Some(30.0));
+        assert_eq!(vehicles[0].health(), 100.0);
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut [],
+        };
+        // A rifle round does nothing to it; a blast beside it some.
+        let side = (Vec3::new(5.0, 1.0, 0.0), Vec3::NEG_X, 4.0);
+        combat.round_on_vehicle(&mut field, side, CARBINE_ON_VEHICLE, None);
+        assert_eq!(field.vehicles[0].damage, 0.0);
+        combat.explode(&mut field, Vec3::new(2.0, 1.0, 0.0));
+        let hit = field.vehicles[0].health();
+        assert!((60.0..90.0).contains(&hit), "{hit}");
+        assert!(!field.vehicles[0].wrecked);
+        // Lightly armoured, the rifle tells; burning, it goes in the end.
+        field.vehicles[0].spec.tuning.armour = Some(1);
+        combat.round_on_vehicle(&mut field, side, CARBINE_ON_VEHICLE, None);
+        assert!(field.vehicles[0].health() < hit);
+        field.vehicles[0].damage = 100.0;
+        for _ in 0..60 * 15 {
+            combat.burn_vehicles(&mut field, dt);
+        }
+        assert!(field.vehicles[0].wrecked);
+        assert_eq!(field.vehicles[0].health(), 0.0);
         // A car's gun (none here) doesn't count.
         vehicles[0].spec.kind = "car".into();
         vehicles[0].spec.tuning.gun = None;

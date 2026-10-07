@@ -2384,6 +2384,10 @@ fn drive_for_screenshot(
                 g.weapon, g.rate_of_fire, g.rounds, g.velocity, g.max_velocity, g.gravity_scale, g.flash, g.sound_bank
             ))
         );
+        eprintln!(
+            "drive: health {:?}, armour {:?}, blasts x{:?}, burns below {:?}",
+            t.health, t.armour, t.blast_scale, t.burns_below
+        );
         let templated = game
             .scene
             .world
