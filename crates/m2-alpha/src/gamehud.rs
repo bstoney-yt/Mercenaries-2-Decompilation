@@ -1380,7 +1380,10 @@ impl Thread {
         if let Err(e) = self.pose_wheel(state) {
             log.push(format!("wheel: {e}"));
         }
-        if self.pda_shown {
+        // Keys go to the movie that has the controls: the mission's
+        // fanfare while it is up (its Key listener's Enter continues, as
+        // `_HandleFanfareInput` passes the select button on), else the PDA.
+        if self.pda_shown || self.fanfare_up() {
             self.keys.extend(state.keys.iter().copied());
         }
         self.play_flash(dt, &mut log);
@@ -1646,6 +1649,11 @@ impl Thread {
     /// scripts set (`SetFlashSwfFile`, again on `RestartFlash`), hands
     /// them the scripts' calls (`CallActionScriptCallback`), steps those
     /// not paused, and hands their `fscommand`s back to the scripts.
+    /// A fanfare movie is playing (`fanfare_mission`...).
+    fn fanfare_up(&self) -> bool {
+        self.flash.values().any(|m| m.swf.contains("fanfare"))
+    }
+
     fn play_flash(&mut self, dt: f64, log: &mut Vec<String>) {
         let lua = self.mission.lua();
         let Some(screen) = gui_runtime::screen(lua) else {
@@ -1745,7 +1753,12 @@ impl Thread {
                 "flash: key {code} {}",
                 if down { "down" } else { "up" }
             ));
-            for m in self.flash.values_mut() {
+            let fanfare = self.fanfare_up();
+            for m in self
+                .flash
+                .values_mut()
+                .filter(|m| !fanfare || m.swf.contains("fanfare"))
+            {
                 if down {
                     m.rt.key_down(code);
                 } else {

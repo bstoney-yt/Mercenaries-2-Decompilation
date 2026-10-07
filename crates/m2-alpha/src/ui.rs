@@ -156,7 +156,9 @@ impl Hud {
             state.hud_calls = game.hud_calls(&m.hud_calls);
             state.pda_objectives = m.pda_objectives.clone();
         }
-        if info.support.pda {
+        // The HUD's movies take them while they hold the controls (the
+        // PDA, a fanfare).
+        {
             state.keys = input
                 .events
                 .iter()
