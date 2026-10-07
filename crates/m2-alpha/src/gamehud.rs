@@ -157,6 +157,11 @@ const DESIGNATOR_ICON: &str = "explosives_c4_detonator";
 /// cannon there) and reticle `reticle_tank`, without the crosshair. The
 /// template has no localized name, so the gun box names none.
 const CANNON_GUID: u32 = 0x6000_0004;
+/// The vehicle she drives, as the health box looks it up
+/// (`Vehicle.GetFromRider` of her): it carries its template's labels, of
+/// which `ArmorVehicle`, `ArmorLight`, `ArmorMedium` and `ArmorTank` pick
+/// the badge `HUD_vehicle_armor_1` to `_4` (the AMX-30's "3").
+const VEHICLE_GUID: u32 = 0x6000_0005;
 const CANNON_ICON: &str = "support_artillery";
 const CANNON_RETICLE: &str = "reticle_tank";
 /// The first contract's free Satellite Guided Bomb, as the scripts know it
@@ -367,6 +372,9 @@ pub struct HudState {
     pub launcher: Option<Rounds>,
     /// The label of the vehicle she is in.
     pub vehicle: Option<String>,
+    /// The templates that vehicle may be, its own first: their labels
+    /// pick the health box's armour badge.
+    pub vehicle_templates: Vec<String>,
     /// Its cannon's shells, when they run out: left, and how many it
     /// carries (the AMX-30's 40, counted down in the gun box).
     pub cannon: Option<(u32, u32)>,
@@ -555,6 +563,10 @@ impl HudState {
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             vehicle: vehicle.map(|v| v.spec.label.clone()),
+            vehicle_templates: vehicle
+                .zip(game.scene.world.as_ref())
+                .map(|(v, w)| w.index.template_db.names_for(&v.spec.label, v.spec.model))
+                .unwrap_or_default(),
             cannon: vehicle.and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
             heading: game.camera.yaw.to_degrees(),
             target,
@@ -1065,6 +1077,7 @@ struct Told {
     weapon: Option<(Weapon, bool, bool)>,
     ammo: Option<[i64; 5]>,
     vehicle: Option<Option<String>>,
+    vehicle_templates: Option<Vec<String>>,
     target: Option<Option<(i32, i32)>>,
     reticle: Option<Option<[f32; 2]>>,
     regions: Option<Vec<RadarRegion>>,
@@ -1178,6 +1191,7 @@ impl Thread {
                 (LAUNCHER_GUID, LAUNCHER_NAME),
                 (DESIGNATOR_GUID, support::Kind::SatelliteBomb.designator()),
                 (CANNON_GUID, ""),
+                (VEHICLE_GUID, ""),
             ] {
                 world.insert(guid, Object::new(name, [0.0; 3]));
             }
@@ -1849,6 +1863,25 @@ impl Thread {
         // rotation (the map turns with the camera).
         if let Some([x, y, z]) = s.position {
             fire(lua, "GuiMinimapUpdate", (x, y, z, s.heading))?;
+        }
+        // Into the vehicle before her health is told, as the health box
+        // picks its badge then.
+        if self.told.vehicle_templates.as_ref() != Some(&s.vehicle_templates) {
+            self.told.vehicle_templates = Some(s.vehicle_templates.clone());
+            let mut world = self.mission.world().borrow_mut();
+            let labels = s
+                .vehicle_templates
+                .iter()
+                .find_map(|t| world.template_labels.get(&t.to_ascii_lowercase()))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(v) = world.objects.get_mut(&VEHICLE_GUID) {
+                v.label_hashes = labels;
+            }
+            if let Some(me) = world.objects.get_mut(&m2_game::mission::PLAYER) {
+                me.vehicle = s.in_vehicle.then_some(VEHICLE_GUID);
+            }
+            self.told.hp = None;
         }
         let hp = (s.hp.round() as i32, s.in_vehicle);
         if self.told.hp != Some(hp) {
