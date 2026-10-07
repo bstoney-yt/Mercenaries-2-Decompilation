@@ -21,9 +21,10 @@ use m2_assets::{Model, Ucfx};
 use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
     BackendError, BlendMode, DrawCall, DrawQueue, Emissive, Geometry, IndexBufferDesc,
-    IndexBufferHandle, Layer, MaterialDesc, MaterialId, NormalMap, Primitive, Reflection,
-    RenderBackend, SkinHandle, Specular, TextureDesc, TextureFormat, TextureHandle, Topology,
-    VertexBufferDesc, VertexBufferHandle, generate_mips,
+    IndexBufferHandle, IndexFormat, Layer, MaterialDesc, MaterialId, NormalMap, Primitive,
+    Reflection, RenderBackend, SkinHandle, Specular, TextureDesc, TextureFormat, TextureHandle,
+    Topology, VertexBufferDesc, VertexBufferHandle, VertexElement, VertexFormat, VertexSemantic,
+    generate_mips,
 };
 
 use crate::assets::{AssetError, AssetSource, DecodedTexture, ModelData};
@@ -859,11 +860,12 @@ struct Piece {
     topology: Topology,
     /// Per range, its batch member (empty: not a batch).
     members: Vec<u16>,
-    /// Per range, whether its material could be a vehicle's track: cut
-    /// out, as tracks' are (the AMX-30's are two-sided as well, the
-    /// M1A1's not). A model's coarser levels of detail aren't uploaded, so
-    /// a cut-out LOD material isn't drawn with them.
-    track: Vec<bool>,
+    /// Per range, if its material could be a vehicle's track (cut out,
+    /// as tracks' are: the AMX-30's are two-sided as well, the M1A1's
+    /// not), the texture offset per metre the track runs; else zero. A
+    /// model's coarser levels of detail aren't uploaded, so a cut-out LOD
+    /// material isn't drawn with them.
+    track: Vec<[f32; 2]>,
     centre: Vec3,
     bones: Vec<u16>,
     node: Option<u16>,
@@ -895,9 +897,102 @@ pub struct GpuModel {
     pub track_travel: f32,
 }
 
-/// How far a track's texture moves along v per metre the track runs.
-/// Invented: the game scrolls its tracks from code.
-const TRACK_V_PER_METRE: f32 = 0.5;
+/// How far a track's texture moves per metre the track runs where its
+/// geometry can't say. Invented: the game scrolls its tracks from code.
+const TRACK_UV_PER_METRE: f32 = 0.5;
+
+/// The texture offset per metre a track run by the range `first`, `count`
+/// of `piece` needs: along whichever of u and v runs the length of the
+/// vehicle (z), so the AMX-30's u-wise track doesn't scroll sideways as
+/// a v-wise one would (Brendan's play-test), at the texture's own rate
+/// along the vehicle (units per metre). Its sign is taken from the
+/// lower run, which must move back as the vehicle goes forward (+z,
+/// inferred); without readable positions and texture coordinates, v.
+fn track_scroll(piece: &CpuPiece, first: u32, count: u32) -> [f32; 2] {
+    let fallback = [0.0, TRACK_UV_PER_METRE];
+    let layout = &piece.vertex_desc.layout;
+    let (Some(pos), Some(uv)) = (
+        layout.find(VertexSemantic::Position),
+        layout.find(VertexSemantic::TexCoord(0)),
+    ) else {
+        return fallback;
+    };
+    let stride = layout.stride() as usize;
+    let read = |e: &VertexElement, i: usize, n: usize| -> Option<[f32; 3]> {
+        let at = i * stride + e.offset as usize;
+        let mut out = [0.0; 3];
+        for (c, o) in out.iter_mut().enumerate().take(n) {
+            *o = match e.format {
+                VertexFormat::Float2 | VertexFormat::Float3 | VertexFormat::Float4 => {
+                    let b = piece.vertices.get(at + c * 4..at + c * 4 + 4)?;
+                    f32::from_le_bytes(b.try_into().ok()?)
+                }
+                VertexFormat::Half2 | VertexFormat::Half4 => {
+                    let b = piece.vertices.get(at + c * 2..at + c * 2 + 2)?;
+                    m2_assets::vertex::half_to_f32(u16::from_le_bytes(b.try_into().ok()?))
+                }
+                _ => return None,
+            };
+        }
+        Some(out)
+    };
+    let index = |k: u32| -> Option<usize> {
+        let k = k as usize;
+        match piece.index_desc.format {
+            IndexFormat::U16 => piece
+                .indices
+                .get(k * 2..k * 2 + 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize),
+            IndexFormat::U32 => piece
+                .indices
+                .get(k * 4..k * 4 + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize),
+        }
+    };
+    // Along each edge of consecutive indices: how much u and v change
+    // with z, and on the lower run which way each goes with z.
+    let mut along = [0.0f32; 2];
+    let mut lower = [0.0f32; 2];
+    let mut run = 0.0f32;
+    let mut verts = Vec::new();
+    for k in first..first + count {
+        let Some(i) = index(k) else {
+            return fallback;
+        };
+        let (Some(p), Some(t)) = (read(pos, i, 3), read(uv, i, 2)) else {
+            return fallback;
+        };
+        verts.push((p, t));
+    }
+    let low = verts.iter().map(|(p, _)| p[1]).sum::<f32>() / verts.len().max(1) as f32;
+    for w in verts.windows(2) {
+        let ((p0, t0), (p1, t1)) = (w[0], w[1]);
+        let dz = p1[2] - p0[2];
+        run += dz * dz;
+        for a in 0..2 {
+            let d = t1[a] - t0[a];
+            along[a] += (d * dz).abs();
+            if p0[1] < low && p1[1] < low {
+                lower[a] += d * dz;
+            }
+        }
+    }
+    let a = usize::from(along[1] > along[0]);
+    if along[a] <= 0.0 {
+        return fallback;
+    }
+    // The texture's own rate along the run, so the lower run holds still
+    // on the ground (round DT: the invented 0.5 ran the AMX-30's at half
+    // the ground's speed).
+    let rate = if run > 0.0 {
+        along[a] / run
+    } else {
+        TRACK_UV_PER_METRE
+    };
+    let mut out = [0.0; 2];
+    out[a] = if lower[a] < 0.0 { -rate } else { rate };
+    out
+}
 
 impl GpuModel {
     /// Uploads `cpu`. Its textures should already be in `materials`.
@@ -962,10 +1057,16 @@ impl GpuModel {
                 track: p
                     .ranges
                     .iter()
-                    .map(|&(_, _, m)| {
-                        cpu.materials
+                    .map(|&(first, count, m)| {
+                        if cpu
+                            .materials
                             .get(m)
                             .is_some_and(|m| m.flags & flags::CUT_OUT != 0)
+                        {
+                            track_scroll(p, first, count)
+                        } else {
+                            [0.0; 2]
+                        }
                     })
                     .collect(),
                 // Kept in geometry space, so any transform places it.
@@ -1219,10 +1320,12 @@ impl GpuModel {
                     world: transform,
                     skin,
                     instances: None,
-                    uv_offset: if self.tracks && piece.track.get(k).copied().unwrap_or(false) {
-                        [0.0, (self.track_travel * TRACK_V_PER_METRE).fract()]
-                    } else {
-                        [0.0; 2]
+                    uv_offset: match piece.track.get(k) {
+                        Some(&[u, v]) if self.tracks => [
+                            (self.track_travel * u).fract(),
+                            (self.track_travel * v).fract(),
+                        ],
+                        _ => [0.0; 2],
                     },
                 },
                 layer: Layer::WORLD,
