@@ -24,8 +24,12 @@ if (-not (Test-Path (Join-Path $winit 'Cargo.toml'))) {
     if (-not $src) { throw 'winit-0.30.13 is not in the cargo registry' }
     New-Item -ItemType Directory -Force (Split-Path $winit) | Out-Null
     Copy-Item -Recurse $src $winit
+    # The registry source has LF endings; a checkout with core.autocrlf
+    # gives the patch CRLF ones, which git apply then rejects.
+    $patch = Join-Path (Split-Path $winit) 'winit-mouse.lf.patch'
+    [IO.File]::WriteAllText($patch, ([IO.File]::ReadAllText((Join-Path $here 'winit-0.30.13-mouse.patch')) -replace "`r`n", "`n"))
     Push-Location $winit
-    git apply -p1 (Join-Path $here 'winit-0.30.13-mouse.patch')
+    git apply -p1 $patch
     Pop-Location
     if (-not (Select-String -Quiet -Path (Join-Path $winit 'src\platform_impl\android\mod.rs') -Pattern 'MouseRelative')) {
         Remove-Item -Recurse -Force $winit
