@@ -3332,7 +3332,7 @@ fn demolish_for_screenshot(
         eprintln!("demolish: still standing after {fired} rockets");
         return Ok(());
     }
-    for (name, wait) in [("1s", 1.0), ("6s", 5.0)] {
+    for (name, wait) in [("1s", 1.0), ("2s", 1.0), ("6s", 4.0)] {
         for k in 0..(wait / tick) as usize {
             aim_at(game, at);
             game.step(Intent::default(), tick);
@@ -3355,6 +3355,11 @@ fn demolish_for_screenshot(
                 .pieces_report(&world.physics, destruct::key(i))
         {
             eprintln!("demolish: {name}: pieces {report}");
+        }
+        if let Some(world) = &game.scene.world
+            && let Some(s) = game.scene.props.describe(&world.physics, destruct::key(i))
+        {
+            eprintln!("demolish: {name}: {s}");
         }
     }
     Ok(())

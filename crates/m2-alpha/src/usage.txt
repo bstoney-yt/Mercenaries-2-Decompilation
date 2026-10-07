@@ -44,7 +44,7 @@ m2-alpha [options]
   --demolish <n>         with --screenshot on foot: rocket the nearest
                          building (health and a collapse in its template)
                          until it comes down, at most n rockets, logging
-                         its damage; pictures -before, -1s and -6s
+                         its damage; pictures -before, -1s, -2s and -6s
   --vehicle <name>       with --drive: get in the nearest vehicle whose
                          name holds this (stryker, m1a1, amx30, hmmwv...)
   --look <degrees>       with --drive: stop and swing the camera this far
