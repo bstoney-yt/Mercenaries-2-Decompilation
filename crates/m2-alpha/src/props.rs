@@ -201,7 +201,8 @@ impl Props {
                     model: o.model,
                     position: o.position,
                     rotation: o.rotation,
-                    wrecked: false,
+                    // A ruin stands as its model's wreck from the start.
+                    wrecked: index.ruined.contains(&e),
                 },
             );
             added += 1;
