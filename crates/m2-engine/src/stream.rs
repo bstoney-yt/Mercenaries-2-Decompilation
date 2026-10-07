@@ -736,13 +736,11 @@ impl World {
     }
 
     /// The mass to shift (kg) to knock placed object `i` loose; `None`
-    /// unless its model comes loose ([`Loose`]) and it stands.
+    /// unless its model comes loose ([`Loose`]) and it stands (with
+    /// standing collision or not: a crate whose every shape is on its
+    /// one moving body has none, and vehicles must still shove it).
     pub fn loose_mass(&self, i: usize) -> Option<f32> {
-        if self.knocked.contains_key(&i)
-            || self.taken.contains(&i)
-            || self.destroyed.contains(&i)
-            || !self.physics.has_static(StaticKey::Object(i))
-        {
+        if self.knocked.contains_key(&i) || self.taken.contains(&i) || self.destroyed.contains(&i) {
             return None;
         }
         self.loose
@@ -789,6 +787,12 @@ impl World {
         if self.taken.insert(i) {
             self.physics.remove_static(StaticKey::Object(i));
         }
+    }
+
+    /// Takes placed object `i`'s standing collision away (it was
+    /// destroyed; what is left of it is in nobody's way).
+    pub fn take_static(&mut self, i: usize) {
+        self.physics.remove_static(StaticKey::Object(i));
     }
 
     /// Whether placed object `i` was [taken](Self::take).
