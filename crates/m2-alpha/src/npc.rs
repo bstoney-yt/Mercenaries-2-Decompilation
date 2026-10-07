@@ -41,6 +41,11 @@ const FIRE_ARC: f32 = 0.3;
 /// Seconds between a soldier's shots: at least this, plus up to as much
 /// again at random.
 const FIRE_GAP: (f32, f32) = (0.9, 0.8);
+/// They fire in bursts: at least this many rounds, plus up to this many
+/// more at random, this many seconds apart (the "Assault Rifle"'s rate of
+/// fire; the burst sizes invented until the AI's are read).
+const BURST: (u32, u32) = (3, 2);
+const BURST_GAP: f32 = 0.1;
 const PAUSE: (f32, f32) = (2.0, 6.0);
 /// People are drawn this close to the camera, metres.
 pub const DRAW_DISTANCE: f32 = 200.0;
@@ -255,6 +260,8 @@ pub struct Npc {
     /// Set by a tick when a soldier fires; the fight takes the shot.
     pub fires: bool,
     cooldown: f32,
+    /// Rounds left in the burst he is firing.
+    burst: u32,
     /// Running from gunfire: where to, and for how much longer.
     flee: Option<(Vec3, f32)>,
     brain: Brain,
@@ -321,6 +328,7 @@ impl Npc {
             alert: false,
             fires: false,
             cooldown: 0.0,
+            burst: 0,
             flee: None,
             brain,
         }
@@ -399,7 +407,16 @@ impl Npc {
         self.cooldown -= dt;
         if self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
             self.fires = true;
-            self.cooldown = FIRE_GAP.0 + rng.range(0.0, FIRE_GAP.1);
+            if self.burst == 0 {
+                let more = rng.range(0.0, BURST.1 as f32 + 1.0) as u32;
+                self.burst = BURST.0 + more.min(BURST.1);
+            }
+            self.burst -= 1;
+            self.cooldown = if self.burst > 0 {
+                BURST_GAP
+            } else {
+                FIRE_GAP.0 + rng.range(0.0, FIRE_GAP.1)
+            };
         }
         self.rig.advance(dt);
         true
@@ -1272,7 +1289,8 @@ pub(crate) mod tests {
             shots += usize::from(std::mem::take(&mut soldier.fires));
         }
         assert!((soldier.facing - std::f32::consts::FRAC_PI_2).abs() < 0.05);
-        assert!((2..=6).contains(&shots), "{shots}");
+        // In bursts of three to five.
+        assert!((6..=30).contains(&shots), "{shots}");
         // Out of range: he stands down.
         soldier.update(&physics, &mut rng, Some(Vec3::new(500.0, 0.0, 0.0)), dt);
         assert!(!soldier.alert);

@@ -47,6 +47,10 @@ pub struct PlayerSave {
     /// Grenades she has; saves from before they ran out had her full.
     #[serde(default = "full_grenades")]
     pub grenades: u32,
+    /// The rifle's rounds, in its clip and stored; saves from before it
+    /// ran out had it full.
+    #[serde(default)]
+    pub rifle: Option<[u32; 2]>,
 }
 
 fn full_grenades() -> u32 {
@@ -121,6 +125,7 @@ mod tests {
                 weapon: "grenade launcher".into(),
                 second: "grenade launcher".into(),
                 launcher: Some([4, 12]),
+                rifle: Some([12, 90]),
                 grenades: 3,
             },
             vehicles: vec![VehicleSave {
