@@ -232,6 +232,12 @@ impl ScriptHost {
                     if name.starts_with('_') {
                         return Ok(MultiValue::from_vec(vec![Value::Nil]));
                     }
+                    // A name in lower case alone (`bil`, a slip for `nil`
+                    // in the satellite designator) is no engine library:
+                    // nil, as in plain Lua.
+                    if name.bytes().all(|b| b.is_ascii_lowercase()) {
+                        return Ok(MultiValue::from_vec(vec![Value::Nil]));
+                    }
                     let value = match default_for(lua, &name)? {
                         Some(v) => v,
                         None => Value::Table(stub(lua, &name)?),

@@ -615,6 +615,7 @@ impl Game {
         }
         self.drop_pickups();
         self.support_impacts();
+        self.strike_impacts(dt);
         self.scene.tick(dt);
     }
 
@@ -763,6 +764,57 @@ impl Game {
                     }
                 }
                 Impact::Final(_) => self.combat.final_strike(&mut field, at),
+            }
+            world
+                .destroyed
+                .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
+        }
+    }
+
+    /// Air strikes fly on; each piece of ordnance gone off makes the
+    /// blasts its template leaves, through the fight, throwing what is
+    /// loose. The bursts stay in [`Scene::strikes`] for the scripts.
+    fn strike_impacts(&mut self, dt: f32) {
+        let scene = &mut self.scene;
+        let (Some(world), Some(player)) = (&mut scene.world, &mut scene.player) else {
+            return;
+        };
+        let before = scene.strikes.burst.len();
+        scene.strikes.step(&world.physics, dt);
+        let fresh: Vec<_> = scene.strikes.burst[before..].to_vec();
+        for (_, template, at) in fresh {
+            let ordnance = &world.index.template_db.ordnance;
+            let blasts: Vec<(f32, f32)> = template
+                .map(|t| ordnance.blasts_of(t))
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|b| ordnance.blasts.get(b))
+                .map(|b| (b.radius, b.damage))
+                .collect();
+            let mut field = Field {
+                physics: &mut world.physics,
+                player,
+                people: &mut scene.people,
+                vehicles: &mut scene.vehicles,
+                arsenal: &scene.arsenal,
+                explosives: &mut scene.explosives,
+            };
+            // The first is the blast itself; the rest (its frag) reach
+            // further with the same push.
+            if let Some(&(radius, damage)) = blasts.first() {
+                self.combat.blast(&mut field, at, radius, damage);
+            }
+            for &(radius, damage) in blasts.iter().skip(1) {
+                self.combat.harm_at(&mut field, at, radius, damage);
+            }
+            if let Some(reach) = blasts.iter().map(|b| b.0).reduce(f32::max) {
+                blast_loose(
+                    world,
+                    &mut scene.props,
+                    &[at],
+                    reach,
+                    reach >= combat::BOMB.0,
+                );
             }
             world
                 .destroyed

@@ -1,5 +1,6 @@
 //! Gameplay logic: rules the original game ran, rebuilt for m2-alpha.
 
+pub mod airstrike;
 pub mod api;
 pub mod events;
 pub mod gui;
@@ -12,4 +13,5 @@ pub mod library;
 pub mod mission;
 pub mod music;
 pub mod script;
+pub mod support;
 pub mod vo;

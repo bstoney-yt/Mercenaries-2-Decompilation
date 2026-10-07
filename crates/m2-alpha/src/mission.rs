@@ -60,6 +60,23 @@ pub type ScriptLine = (u32, String, Option<Vec3>);
 pub const HERO: &str = "Jennifer";
 /// The grenades' weapon template.
 const GRENADE: &str = "Grenade";
+/// What she throws to mark a support call: the scripts' support manager
+/// runs on it (its `ObjectScript`), and it marks the spot when its timer
+/// runs out (`TriggerOnTimer`; 4 s if the template can't be read).
+const MARKER: &str = "Smoke Grenade Projectile";
+const MARKER_TIMER: f32 = 4.0;
+/// `--support` calls come this long into the scripts' run (seconds), once
+/// she is on foot on land, with this much cash and fuel: enough for any
+/// item.
+const SUPPORT_AFTER: f64 = 2.0;
+const SUPPORT_CASH: f64 = 1.0e7;
+const SUPPORT_FUEL: f64 = 1000.0;
+/// She is ashore this far above the water (metres): not seated in the
+/// start's boat, which the scripts don't count as driving.
+const ASHORE_HEIGHT: f32 = 2.0;
+/// ... for this long without a break (seconds): she stands ashore a moment
+/// at the start, before the scripts seat her in the boat.
+const SUPPORT_ASHORE: f32 = 10.0;
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -256,6 +273,11 @@ pub struct MissionLink {
     fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
     music: Option<Option<String>>,
+    /// Support items to stock and call in once the scripts run
+    /// (`--support`).
+    support: Vec<String>,
+    /// Seconds she has been on foot ashore without a break.
+    ashore_for: f32,
 }
 
 /// The scripts' vehicles in play.
@@ -343,7 +365,14 @@ impl MissionLink {
             sounds: Vec::new(),
             fades: Vec::new(),
             music: None,
+            support: Vec::new(),
+            ashore_for: 0.0,
         }
+    }
+
+    /// Stocks and calls in these support items once the scripts run.
+    pub fn with_support(self, support: Vec<String>) -> Self {
+        Self { support, ..self }
     }
 
     /// Tutorial lines name these keys (else the usual ones).
@@ -579,6 +608,24 @@ impl MissionLink {
             }
             mission.set_health(PLAYER, game.combat.hp);
             mission.set_player_reserve(GRENADE, game.combat.grenades);
+            // Called on foot, on land, as the support menu is.
+            let on_land = game.on_foot
+                && game.scene.player.as_ref().is_some_and(|p| {
+                    p.landed
+                        && p.driving.is_none()
+                        && !p.down
+                        && p.character.position.y > WATERLINE + ASHORE_HEIGHT
+                })
+                && self.vehicles.riding.is_none();
+            self.ashore_for = if on_land { self.ashore_for + STEP } else { 0.0 };
+            if mission.now() >= SUPPORT_AFTER && self.ashore_for >= SUPPORT_ASHORE {
+                for key in std::mem::take(&mut self.support) {
+                    mission.stock_support(&key, 1, SUPPORT_CASH, SUPPORT_FUEL);
+                    let took = mission.use_support(&key);
+                    eprintln!("mission: support {key} called in: {took}");
+                }
+            }
+            report_strikes(game, mission);
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -659,6 +706,7 @@ impl MissionLink {
                     _ => {}
                 }
                 support_item(game, &c);
+                strike(game, &c);
                 fly(game, mission, &c);
                 if obey(game, mission, &mut self.vehicles, &c) {
                     self.ashore = ASHORE_TRIES;
@@ -1250,6 +1298,72 @@ fn tutorial(mission: &Mission) -> Option<Option<String>> {
     }
     let args = calls.last()?;
     Some(m2_game::hud::tutorial_text(args).map(|t| mission.text(t)))
+}
+
+/// What the scripts' strike modules fly (`Airstrike`): the aircraft and
+/// ordnance, and the designator she is handed to throw.
+fn strike(game: &mut Game, c: &Command) {
+    let none = Templates::default();
+    let templates = game
+        .scene
+        .world
+        .as_ref()
+        .map_or(&none, |w| &w.index.template_db);
+    game.scene.strikes.start(c, templates);
+    match c {
+        // A smoke grenade, flare or beacon is thrown; the satellite and
+        // laser designators are aimed, which this game doesn't do for the
+        // scripts' strikes yet.
+        Command::EquipDesignator { who, kind, .. } if *who == PLAYER => {
+            let thrown = ["Smoke", "Flare", "Beacon"]
+                .iter()
+                .any(|k| kind.contains(k));
+            eprintln!("mission: the scripts hand her a {kind} (thrown: {thrown})");
+            game.combat.to_throw = thrown;
+        }
+        Command::RemoveDesignator { who } if *who == PLAYER => game.combat.to_throw = false,
+        Command::DirectedEffect { what, at, .. } => {
+            eprintln!("mission: effect {what} at {at:?} (not drawn yet)");
+        }
+        _ => {}
+    }
+}
+
+/// Tells the scripts of her designators thrown and come to rest, the
+/// aircraft over their marks and the ordnance gone off.
+fn report_strikes(game: &mut Game, mission: &mut Mission) {
+    let settle = game
+        .scene
+        .world
+        .as_ref()
+        .and_then(|w| {
+            let t = &w.index.template_db;
+            let id = t.id(MARKER)?;
+            t.ordnance.projectiles.get(&id)?.timer.map(|t| t.0)
+        })
+        .unwrap_or(MARKER_TIMER);
+    for t in &mut game.combat.thrown {
+        match t.guid {
+            None => {
+                let g = mission.designator_thrown(PLAYER, MARKER, t.at.to_array());
+                eprintln!("mission: she throws her marker ({g:#x})");
+                t.guid = Some(g);
+            }
+            Some(g) if !t.settled && t.age >= settle => {
+                eprintln!("mission: her marker lies at {:.1}", t.at);
+                mission.designator_settled(g, t.at.to_array());
+                t.settled = true;
+            }
+            _ => {}
+        }
+    }
+    let strikes = &mut game.scene.strikes;
+    for (g, at) in strikes.arrived.drain(..) {
+        mission.flyby_arrived(g, at.to_array());
+    }
+    for (g, _, at) in strikes.burst.drain(..) {
+        mission.ordnance_burst(g, at.to_array());
+    }
 }
 
 /// The scripts' free support items, given her or taken back.
