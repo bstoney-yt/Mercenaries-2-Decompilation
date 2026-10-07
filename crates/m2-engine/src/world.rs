@@ -811,6 +811,8 @@ impl WorldIndex {
             ..Self::default()
         };
         let mut routes = Routes::default();
+        // Each road's placement and path, for clearing trees off it.
+        let mut roads: Vec<(Vec3, Quat, u32)> = Vec::new();
         for (block, is_static) in blocks {
             let decoded = source.block(block)?;
             for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -821,6 +823,19 @@ impl WorldIndex {
                     continue;
                 };
                 world.add_layer(&layer, e.name_hash, is_static, &assets);
+                if let Some(c) = layer.component("Road") {
+                    let placements = layer.placements();
+                    for (entity, rec) in c.records().unwrap_or_default() {
+                        let (Some(p), Some(path)) = (
+                            placements.get(&entity),
+                            rec.get(..4)
+                                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                        ) else {
+                            continue;
+                        };
+                        roads.push((Vec3::from(p.position), rotation(p.rotation), path));
+                    }
+                }
                 if layer.component("AtmosphereBase").is_some() {
                     world
                         .atmosphere_regions
@@ -839,7 +854,8 @@ impl WorldIndex {
                 world.add_traffic(&layer, e.name_hash, is_static, &assets.templates);
             }
         }
-        world.add_trees(source, &assets.templates);
+        let roads = RoadLines::read(source, &roads);
+        world.add_trees(source, &assets.templates, &roads);
         world.template_db = assets.templates;
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
         let mut path_points = |asset: u32| -> Vec<Vec3> {
@@ -895,7 +911,16 @@ impl WorldIndex {
     /// as its species' [`FarTree`] beyond. Inferred, not decoded: that the
     /// model stands upright at the position and at its own size (the
     /// species' scale range has no per-tree value to pick from).
-    fn add_trees<R: Read + Seek>(&mut self, source: &mut AssetSource<R>, templates: &Templates) {
+    ///
+    /// Trees within [`ROAD_CLEAR`] of a road are left out: the table puts
+    /// some there (893 within 3 m island-wide, round DX), which the game's
+    /// footage shows clear, with trees along the edges.
+    fn add_trees<R: Read + Seek>(
+        &mut self,
+        source: &mut AssetSource<R>,
+        templates: &Templates,
+        roads: &RoadLines,
+    ) {
         let index = source.archive().index();
         let Some(hash) = index
             .assets()
@@ -918,6 +943,7 @@ impl WorldIndex {
             .max()
             .copied();
         let mut no_model: Vec<(u32, usize)> = Vec::new();
+        let mut cleared = 0usize;
         for (species, s) in table.species.iter().enumerate() {
             let model = templates.by_id(s.template).and_then(|(_, t)| t.model);
             let Some(model) = model.filter(|_| species < 1 << 12 && s.trees.len() <= 1 << 16)
@@ -926,16 +952,24 @@ impl WorldIndex {
                 self.far_trees.push(None);
                 continue;
             };
-            self.objects
-                .extend(s.trees.iter().enumerate().map(|(i, t)| ObjectPlacement {
-                    entity: TREE_ENTITIES | (species as u32) << 16 | i as u32,
-                    model,
-                    position: Vec3::from(t.position),
-                    rotation: Quat::from_rotation_y(t.yaw()),
-                    named: true,
-                    fade: Some(s.fade),
-                    template: 0,
-                }));
+            // Indexed before clearing, so each tree keeps its entity id.
+            let before = self.objects.len();
+            self.objects.extend(
+                s.trees
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| !roads.near(t.position[0], t.position[2], ROAD_CLEAR))
+                    .map(|(i, t)| ObjectPlacement {
+                        entity: TREE_ENTITIES | (species as u32) << 16 | i as u32,
+                        model,
+                        position: Vec3::from(t.position),
+                        rotation: Quat::from_rotation_y(t.yaw()),
+                        named: true,
+                        fade: Some(s.fade),
+                        template: 0,
+                    }),
+            );
+            cleared += s.trees.len() - (self.objects.len() - before);
             let parts = s.part_count.min(3) as usize;
             self.far_trees.push(Some(FarTree {
                 fade: s.fade,
@@ -952,10 +986,11 @@ impl WorldIndex {
             }));
         }
         eprintln!(
-            "trees: {} of {} species placed, {} trees (layer entity ids up to {:#x}); left out for want of a model (template, trees): {:08x?}",
+            "trees: {} of {} species placed, {} trees ({} cleared off roads; layer entity ids up to {:#x}); left out for want of a model (template, trees): {:08x?}",
             table.species.len() - no_model.len(),
             table.species.len(),
             self.objects.len() - first,
+            cleared,
             highest.unwrap_or(0),
             no_model
         );
@@ -2152,5 +2187,100 @@ mod tests {
             .collect();
         assert_eq!(near, [2, 1]);
         assert_eq!(w.rough_height(1990.0, 0.0), 30.0);
+    }
+}
+
+/// How far from a road's line trees are cleared (metres). Invented: the
+/// road records hold no width; the PC footage shows the mission's dirt
+/// roads clear (round DX found decoded trees up to 3.2 m from the
+/// line of the road to the tank drop).
+const ROAD_CLEAR: f32 = 3.5;
+
+/// The island's road lines on the ground plane, binned for nearness
+/// tests.
+#[derive(Default)]
+struct RoadLines {
+    /// Segments (x0, z0, x1, z1) by bin.
+    bins: HashMap<(i32, i32), Vec<[f32; 4]>>,
+}
+
+/// Side of a [`RoadLines`] bin (metres).
+const ROAD_BIN: f32 = 32.0;
+
+impl RoadLines {
+    /// Each road's path, placed by its entity's transform.
+    fn read<R: Read + Seek>(source: &mut AssetSource<R>, roads: &[(Vec3, Quat, u32)]) -> Self {
+        let mut lines = Self::default();
+        let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
+        for &(at, q, path) in roads {
+            let points = paths.entry(path).or_insert_with(|| {
+                source
+                    .asset(path, PATH_TYPE)
+                    .ok()
+                    .and_then(|data| Path::parse(&data).ok())
+                    .map(|p| p.points.into_iter().map(Vec3::from).collect())
+                    .unwrap_or_default()
+            });
+            for w in points.windows(2) {
+                let (a, b) = (at + q * w[0], at + q * w[1]);
+                lines.add([a.x, a.z, b.x, b.z]);
+            }
+        }
+        lines
+    }
+
+    fn bin(x: f32, z: f32) -> (i32, i32) {
+        ((x / ROAD_BIN).floor() as i32, (z / ROAD_BIN).floor() as i32)
+    }
+
+    /// Files segment `s` in every bin its box, widened by the clearance,
+    /// touches.
+    fn add(&mut self, s: [f32; 4]) {
+        let pad = ROAD_CLEAR;
+        let lo = Self::bin(s[0].min(s[2]) - pad, s[1].min(s[3]) - pad);
+        let hi = Self::bin(s[0].max(s[2]) + pad, s[1].max(s[3]) + pad);
+        // A runaway segment would fill the map; real ones are short.
+        if (hi.0 - lo.0 + 1) * (hi.1 - lo.1 + 1) > 4096 {
+            return;
+        }
+        for bx in lo.0..=hi.0 {
+            for bz in lo.1..=hi.1 {
+                self.bins.entry((bx, bz)).or_default().push(s);
+            }
+        }
+    }
+
+    /// Whether ground point (`x`, `z`) lies within `d` of a road's line.
+    fn near(&self, x: f32, z: f32, d: f32) -> bool {
+        let Some(segments) = self.bins.get(&Self::bin(x, z)) else {
+            return false;
+        };
+        segments.iter().any(|s| {
+            let (ax, az, bx, bz) = (s[0], s[1], s[2], s[3]);
+            let (dx, dz) = (bx - ax, bz - az);
+            let len = dx * dx + dz * dz;
+            let t = if len > 0.0 {
+                (((x - ax) * dx + (z - az) * dz) / len).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (px, pz) = (ax + t * dx - x, az + t * dz - z);
+            px * px + pz * pz < d * d
+        })
+    }
+}
+
+#[cfg(test)]
+mod road_tests {
+    use super::*;
+
+    #[test]
+    fn finds_points_near_a_road() {
+        let mut roads = RoadLines::default();
+        roads.add([0.0, 0.0, 100.0, 0.0]);
+        assert!(roads.near(50.0, 3.0, ROAD_CLEAR));
+        assert!(roads.near(-2.0, 0.0, ROAD_CLEAR));
+        assert!(!roads.near(50.0, 5.0, ROAD_CLEAR));
+        assert!(!roads.near(110.0, 0.0, ROAD_CLEAR));
     }
 }
