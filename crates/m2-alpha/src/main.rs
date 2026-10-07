@@ -2141,6 +2141,7 @@ fn mission_for_screenshot(
             let (hud, settings) = late_hud.get_or_insert_with(|| {
                 let mut hud = ui::Hud::new();
                 hud.game = game_hud(Some(install), &Mode::Island(None), false);
+                hud.wait = true;
                 (hud, Config::default())
             });
             let mut info = hud_info(game, Some(&link), fov, aspect);
