@@ -2270,6 +2270,14 @@ fn hijack_for_screenshot(
         // A picture every two seconds of it, beside the one at the end.
         if t >= 2.0 * (shots + 1) as f32 && options.screenshot.is_some() {
             shots += 1;
+            if let Some((her, (lo, hi))) = hijacks.her_in_vehicle(game) {
+                eprintln!(
+                    "hijack: t={t:.1} her feet in the vehicle's space {:.2?} (its box {:.2?} to {:.2?})",
+                    her.to_array(),
+                    lo.to_array(),
+                    hi.to_array()
+                );
+            }
             render(backend, game, fov, aspect, None)?;
             if let Some(out) = &options.screenshot {
                 let path = out.with_file_name(format!(
