@@ -1318,7 +1318,7 @@ impl Scene {
         }
         if let Some(player) = &self.player
             && player.landed
-            && player.driving.is_none()
+            && (player.driving.is_none() || player.seated)
             && let Some((model, rig)) = &player.model
         {
             let (nodes, skin) = rig.posed();
@@ -1338,6 +1338,7 @@ impl Scene {
                 (None, Weapon::GrenadeLauncher) => &self.arsenal.launcher,
             };
             if !player.down
+                && !player.seated
                 && let Some(w) = weapon
                 && let Some(at) = self.arsenal.in_hand(
                     w,
