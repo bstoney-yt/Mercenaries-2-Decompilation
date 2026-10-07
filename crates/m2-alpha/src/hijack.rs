@@ -541,7 +541,7 @@ impl Hijacks {
     /// Where she is in the hijacked vehicle's space (x right, y up, z
     /// ahead), and the vehicle's model-space bounds: for checking her
     /// clips' placing.
-    pub fn her_in_vehicle(&self, game: &Game) -> Option<(Vec3, (Vec3, Vec3))> {
+    pub fn her_in_vehicle(&self, game: &Game) -> Option<(Vec3, (Vec3, Vec3), String)> {
         let a = self.active.as_ref()?;
         let v = game.scene.vehicles.get(a.vehicle)?;
         let at = game
@@ -551,9 +551,32 @@ impl Hijacks {
             .physics
             .vehicle_transform(v.id?)?;
         let p = game.scene.player.as_ref()?;
+        // Her clip, how far in, its root and her pelvis height as drawn.
+        let mut body = String::new();
+        if let Some((_, rig)) = &p.model
+            && let Some((clip, t)) = rig.animator.current()
+            && let Some(c) = rig.clips.get(clip)
+        {
+            let raw = c.sample(&rig.skeleton, t.min(c.info.duration));
+            let root = raw.0.get(rig.skeleton.root()).map(|l| l.translation);
+            let pelvis = rig.skeleton.pelvis().map(|i| {
+                rig.skeleton
+                    .model_matrices(&rig.animator.pose(&rig.skeleton, &rig.clips))[i]
+                    .w_axis
+                    .y
+            });
+            body = format!(
+                "clip {:08x} t {t:.2}/{:.2} root {:.2?} pin {:.2?} pelvis {pelvis:.2?}",
+                c.hash,
+                c.info.duration,
+                root.map(|r| r.to_array()),
+                c.info.pin.to_array()
+            );
+        }
         Some((
             at.inverse().transform_point3(p.character.position),
             v.spec.bounds,
+            body,
         ))
     }
 
