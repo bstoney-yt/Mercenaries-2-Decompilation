@@ -2562,11 +2562,33 @@ fn hijack_for_screenshot(
     input.button(Action::Use, true);
     let mut pad = hijack::Autopad::default();
     let mut t = 0.0;
+    let mut shots = 0;
     loop {
         hijacks.tick(game, &mut input, tick);
         input.button(Action::Use, false);
         game.step(Intent::default(), tick);
+        hijacks.place(game);
         t += tick;
+        // A picture every two seconds of it, beside the one at the end.
+        if t >= 2.0 * (shots + 1) as f32 && options.screenshot.is_some() {
+            shots += 1;
+            if let Some((her, (lo, hi), body)) = hijacks.her_in_vehicle(game) {
+                eprintln!(
+                    "hijack: t={t:.1} her feet in the vehicle's space {:.2?} (its box {:.2?} to {:.2?}) {body}",
+                    her.to_array(),
+                    lo.to_array(),
+                    hi.to_array()
+                );
+            }
+            render(backend, game, fov, aspect, None)?;
+            if let Some(out) = &options.screenshot {
+                let path = out.with_file_name(format!(
+                    "{}-{shots:02}.ppm",
+                    out.file_stem().and_then(|s| s.to_str()).unwrap_or("hijack")
+                ));
+                write_ppm(backend, &path)?;
+            }
+        }
         if !hijacks.running() || t > 60.0 {
             break;
         }
@@ -4135,6 +4157,9 @@ impl Running {
             self.mouse_look,
             TICK.as_secs_f32(),
         );
+        if let Some(h) = &self.hijacks {
+            h.place(&mut self.game);
+        }
         if let Some(m) = &mut self.mission {
             m.tick(&mut self.game, TICK.as_secs_f32());
             let (lines, hushed) = m.take_lines();

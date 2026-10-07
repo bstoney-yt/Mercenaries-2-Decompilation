@@ -47,6 +47,15 @@ const STEP: f32 = 0.1;
 /// Reach beyond the entrance's radius, metres, measured flat from the
 /// hull.
 pub const SLACK: f32 = 2.0;
+/// The camera during a hijack: this far from the entrance, looking at it
+/// across the vehicle and a little down. Inferred from the scripts'
+/// `Camera.SetFocusParams(cam, 0, 0, 0.1, 4, 6, 1)` (read as a 4-6 m
+/// distance); the on-foot camera would sit inside the hull.
+const CAMERA_DISTANCE: f32 = 6.0;
+const CAMERA_PITCH: f32 = -0.5;
+/// How far above the vehicle's top (later her feet) the camera looks,
+/// metres.
+const CAMERA_LIFT: f32 = 1.0;
 /// How long an action lasts when its clip is unknown, seconds.
 const UNKNOWN_CLIP: f64 = 2.0;
 /// The pad, as the scripts number its buttons
@@ -95,6 +104,10 @@ struct Active {
     actions: Vec<(u32, f64)>,
     /// Pad buttons held, as the scripts were last told.
     held: Vec<u32>,
+    /// Her hijack clip playing (an index into her rig's clips).
+    clip: Option<usize>,
+    /// The entrance, in the world when it started: the camera looks at it.
+    at: Vec3,
 }
 
 /// What the HUD shows of a hijack.
@@ -341,6 +354,7 @@ impl Hijacks {
             return;
         };
         let origin = at.transform_point3(Vec3::ZERO);
+        let v_top = v.spec.bounds.1.y;
         let forward = at.transform_vector3(Vec3::Z);
         let yaw = forward.x.atan2(forward.z);
         let (Some(vehicle), Some(crewman)) = (
@@ -351,6 +365,14 @@ impl Hijacks {
             return;
         };
         m.place(vehicle, origin.to_array(), yaw);
+        // Every node of its model is a hardpoint the scripts may ask
+        // for (the hatch the blast goes off at, `hp_seat_lt`).
+        let model = v.spec.model;
+        if let Some(source) = game.scene.source.as_mut() {
+            for (name, local) in nodes(source, model) {
+                m.set_hardpoint(vehicle, name, at.transform_point3(local).to_array());
+            }
+        }
         if let Some(p) = c.entrance.point {
             m.set_hardpoint(vehicle, p, c.at.to_array());
         }
@@ -364,7 +386,27 @@ impl Hijacks {
                 set: l.clips.sets.get(&c.template.to_ascii_lowercase()).copied(),
                 actions: Vec::new(),
                 held: Vec::new(),
+                clip: None,
+                // Over the entrance at the top of the vehicle, where the
+                // hijack plays out (the M1A2's driver's hatch is low on
+                // the front deck, the fight on the turret).
+                at: Vec3::new(
+                    c.at.x,
+                    at.transform_point3(Vec3::new(0.0, v_top, 0.0)).y + CAMERA_LIFT,
+                    c.at.z,
+                ),
             });
+            // Her clips move her from here on (`down` keeps her own
+            // moves and gaits from playing over them); the camera looks
+            // across the vehicle from its side.
+            if let Some(p) = &mut game.scene.player {
+                p.down = true;
+                // From the entrance's side of the vehicle.
+                let side = at.inverse().transform_point3(c.at).x.signum();
+                let out = at.transform_vector3(Vec3::X * side);
+                p.yaw = (-out.x).atan2(-out.z);
+                p.pitch = CAMERA_PITCH;
+            }
         } else {
             eprintln!("hijack: {}'s script did not start", c.template);
         }
@@ -446,6 +488,98 @@ impl Autopad {
 }
 
 impl Hijacks {
+    /// Runs after the game's tick: while her hijack clip plays, she is
+    /// where it carries her. Inferred: the people's hijack clips are cut
+    /// in the vehicle's space (they start from its origin, facing its
+    /// way), as the vehicle's own are.
+    pub fn place(&self, game: &mut Game) {
+        let Some(a) = &self.active else { return };
+        let scene = &mut game.scene;
+        let (Some(world), Some(p)) = (&scene.world, &mut scene.player) else {
+            return;
+        };
+        p.chase_target = Some((a.at, CAMERA_DISTANCE));
+        let Some(clip) = a.clip else { return };
+        let Some(at) = scene.vehicles[a.vehicle]
+            .id
+            .and_then(|id| world.physics.vehicle_transform(id))
+        else {
+            return;
+        };
+        let Some((_, rig)) = &p.model else { return };
+        let Some(c) = rig.clips.get(clip) else { return };
+        let t = rig
+            .animator
+            .current()
+            .filter(|cur| cur.0 == clip)
+            .map_or(0.0, |cur| cur.1)
+            .min(c.info.duration);
+        let pose = c.sample(&rig.skeleton, t);
+        let Some(root) = pose.0.get(rig.skeleton.root()).map(|l| l.translation) else {
+            return;
+        };
+        let forward = rig
+            .locomotion
+            .as_ref()
+            .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
+        let model_yaw = forward.x.atan2(forward.y);
+        let ahead = at.transform_vector3(Vec3::Z);
+        let yaw = ahead.x.atan2(ahead.z);
+        let origin = at.transform_point3(Vec3::ZERO);
+        let off = m2_math::glam::Quat::from_rotation_y(yaw)
+            * Vec3::new(root.x - c.info.pin.x, 0.0, root.z - c.info.pin.y);
+        p.facing = yaw + model_yaw;
+        p.character.position = origin + off;
+        // The camera follows her about the vehicle.
+        p.chase_target = Some((
+            p.character.position + Vec3::Y * CAMERA_LIFT,
+            CAMERA_DISTANCE,
+        ));
+        p.character.velocity = Vec3::ZERO;
+    }
+
+    /// Where she is in the hijacked vehicle's space (x right, y up, z
+    /// ahead), and the vehicle's model-space bounds: for checking her
+    /// clips' placing.
+    pub fn her_in_vehicle(&self, game: &Game) -> Option<(Vec3, (Vec3, Vec3), String)> {
+        let a = self.active.as_ref()?;
+        let v = game.scene.vehicles.get(a.vehicle)?;
+        let at = game
+            .scene
+            .world
+            .as_ref()?
+            .physics
+            .vehicle_transform(v.id?)?;
+        let p = game.scene.player.as_ref()?;
+        // Her clip, how far in, its root and her pelvis height as drawn.
+        let mut body = String::new();
+        if let Some((_, rig)) = &p.model
+            && let Some((clip, t)) = rig.animator.current()
+            && let Some(c) = rig.clips.get(clip)
+        {
+            let raw = c.sample(&rig.skeleton, t.min(c.info.duration));
+            let root = raw.0.get(rig.skeleton.root()).map(|l| l.translation);
+            let pelvis = rig.skeleton.pelvis().map(|i| {
+                rig.skeleton
+                    .model_matrices(&rig.animator.pose(&rig.skeleton, &rig.clips))[i]
+                    .w_axis
+                    .y
+            });
+            body = format!(
+                "clip {:08x} t {t:.2}/{:.2} root {:.2?} pin {:.2?} pelvis {pelvis:.2?}",
+                c.hash,
+                c.info.duration,
+                root.map(|r| r.to_array()),
+                c.info.pin.to_array()
+            );
+        }
+        Some((
+            at.inverse().transform_point3(p.character.position),
+            v.spec.bounds,
+            body,
+        ))
+    }
+
     /// Whether the scripts have loaded (or failed to).
     pub fn loading(&self) -> bool {
         matches!(self.state, State::Loading(_))
@@ -482,6 +616,22 @@ fn follow(
     });
     let mut over = false;
     for c in commands {
+        // The hijack's blasts (the hatch blown open, a grenade): fire
+        // and smoke only, not a blast that wrecks what is near; a
+        // grenade's size (inferred).
+        if let Command::Spawn { what, position, .. } = &c
+            && what.to_ascii_lowercase().contains("explosion")
+        {
+            eprintln!("hijack: {what}");
+            game.combat.effects.push((
+                crate::combat::Effect::Fire {
+                    at: Vec3::from(*position),
+                    size: 2.0,
+                },
+                0.6,
+                0.6,
+            ));
+        }
         let Command::Hijack(h) = c else {
             continue;
         };
@@ -492,17 +642,23 @@ fn follow(
                 action,
             } => {
                 a.actions.retain(|x| x.0 != guid);
+                let clip = a.set.and_then(|set| clips.clip(&state, &action, set));
+                if guid == a.hero
+                    && let Some((hash, _)) = clip
+                {
+                    a.clip = play(game, hash);
+                }
                 if !action.eq_ignore_ascii_case("Idle") {
-                    let own = a
-                        .set
-                        .and_then(|set| clips.clip(&state, &action, set))
-                        .and_then(|c| c.1);
+                    let own = clip.and_then(|c| c.1);
                     let seconds = own.or(alongside).unwrap_or(UNKNOWN_CLIP);
                     a.actions.push((guid, now + seconds));
                 }
             }
             HijackCommand::Completed { hero } if hero == a.hero => {
                 eprintln!("hijack: done");
+                if let Some(p) = &mut game.scene.player {
+                    p.down = false;
+                }
                 // The driver is out (the scripts remove or kill him).
                 if let Some(v) = game.scene.vehicles.get_mut(a.vehicle) {
                     v.crew
@@ -516,6 +672,10 @@ fn follow(
             }
             HijackCommand::AbortDone { hero } if hero == a.hero => {
                 eprintln!("hijack: failed");
+                if let Some(p) = &mut game.scene.player {
+                    p.down = false;
+                    p.chase_target = None;
+                }
                 over = true;
             }
             _ => {}
@@ -571,6 +731,27 @@ pub fn beside(game: &mut Game, hijacks: &mut Hijacks, want: Option<&str>) -> Opt
     Some(i)
 }
 
+/// Plays clip `hash` on her (read from the archive the first time); its
+/// index in her rig's clips.
+fn play(game: &mut Game, hash: u32) -> Option<usize> {
+    use m2_assets::animation::{ANIMATION_TYPE, Clip};
+    let scene = &mut game.scene;
+    let (_, rig) = scene.player.as_mut()?.model.as_mut()?;
+    let index = match rig.clips.iter().position(|c| c.hash == hash) {
+        Some(i) => i,
+        None => {
+            let bytes = scene.source.as_mut()?.asset(hash, ANIMATION_TYPE).ok()?;
+            let clip = Clip::parse(&bytes).ok()?;
+            let bound = m2_engine::BoundClip::bind(hash, clip, &rig.skeleton)?;
+            let clips = std::sync::Arc::make_mut(&mut rig.clips);
+            clips.push(bound);
+            clips.len() - 1
+        }
+    };
+    rig.animator.play_once(index);
+    Some(index)
+}
+
 /// The template of whoever drives (the rider of the seat named for the
 /// driver, `seat_driver`): the one a hijack throws out.
 fn driver(crew: &[(String, String)]) -> Option<String> {
@@ -622,6 +803,22 @@ fn point(
     });
     cache.insert((model, name), p);
     p
+}
+
+/// Every node of a model, by name hash, with where it is (model space).
+fn nodes(source: &mut m2_engine::AssetSource<BufReader<File>>, model: u32) -> Vec<(u32, Vec3)> {
+    let Ok(data) = source.model(model) else {
+        return Vec::new();
+    };
+    let Ok(m) = data.parse() else {
+        return Vec::new();
+    };
+    (0..m.nodes.len())
+        .filter_map(|i| {
+            let to_model = m.node_to_model(i as u16)?;
+            Some((m.nodes[i].name_hash, to_model.w_axis.truncate()))
+        })
+        .collect()
 }
 
 trait Flat {
