@@ -2692,6 +2692,46 @@ mod tests {
     }
 
     #[test]
+    fn tanks_drive_over_a_hilltop() {
+        let mut p = Physics::new();
+        let (h, rise) = (50.0, 100.0 * 35f32.to_radians().tan());
+        // Up 35 degrees to z 0, then level.
+        let v = [
+            Vec3::new(-h, -rise, -100.0),
+            Vec3::new(h, -rise, -100.0),
+            Vec3::new(h, 0.0, 0.0),
+            Vec3::new(-h, 0.0, 0.0),
+            Vec3::new(-h, 0.0, 100.0),
+            Vec3::new(h, 0.0, 100.0),
+        ];
+        let tris = [[0, 2, 1], [0, 3, 2], [3, 5, 2], [3, 4, 5]];
+        let shape = CollisionShape::mesh(&v, &tris).unwrap();
+        p.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, Quat::IDENTITY);
+        p.step(DT);
+        let spec = tank();
+        let ground = |at: Vec3| {
+            p.cast_ray(Vec3::new(at.x, 50.0, at.z), Vec3::NEG_Y, 400.0)
+                .map(|(d, _)| 50.0 - d)
+        };
+        let rest = spec
+            .rest_on(Vec3::new(0.0, 0.0, -20.0), 0.0, ground)
+            .unwrap();
+        let id = p.add_vehicle_turned(&spec, rest.position + Vec3::Y * 0.2, rest.rotation);
+        for _ in 0..(12.0 / DT) as usize {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let at = p.vehicle_transform(id).unwrap().w_axis;
+        assert!(at.z > 20.0, "stopped at {at}");
+    }
+
+    #[test]
     fn tanks_climb_steep_hills_and_stand_on_them() {
         // Up 45 degrees at about 5 m/s, after the first seconds.
         let up = tank_up(45.0, 1.0, 6.0);
