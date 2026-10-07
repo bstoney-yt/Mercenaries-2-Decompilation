@@ -2021,11 +2021,13 @@ fn inland_water<R: std::io::Read + std::io::Seek>(
 
 /// Water the consoles show that no decoded data places yet: the moat
 /// under the villa's bridge (VzaCon001), which the north waterfall drains
-/// into. Its height is the jetski spawns' (`PointTraffic_PirateHQ_Jetski`,
-/// y 17.5); its bounds are inferred from the channel's banks (round EA).
-/// The water grid reads far below it there. `M2_MOAT=x0,z0,x1,z1,h`
+/// into. Its height is a little under the jetski spawns'
+/// (`PointTraffic_PirateHQ_Jetski`, y 17.5), below the bridge planking's
+/// lowest point (17.2); its bounds are where the banks rise above it, cut
+/// at the lip of the falls to the south (z 3015) (round EA). All inferred;
+/// the water grid reads far below it there. `M2_MOAT=x0,z0,x1,z1,h`
 /// replaces it, `M2_MOAT=off` drops it.
-const MOAT: ([f32; 4], f32) = ([-1530.0, 3040.0, -1465.0, 3135.0], 17.5);
+const MOAT: ([f32; 4], f32) = ([-1530.0, 3015.0, -1465.0, 3105.0], 17.0);
 
 /// The water [`MOAT`] adds, as (x0, z0, x1, z1) bounds and height.
 fn missing_water() -> Vec<([f32; 4], f32)> {
