@@ -365,6 +365,14 @@ impl Hijacks {
             return;
         };
         m.place(vehicle, origin.to_array(), yaw);
+        // Every node of its model is a hardpoint the scripts may ask
+        // for (the hatch the blast goes off at, `hp_seat_lt`).
+        let model = v.spec.model;
+        if let Some(source) = game.scene.source.as_mut() {
+            for (name, local) in nodes(source, model) {
+                m.set_hardpoint(vehicle, name, at.transform_point3(local).to_array());
+            }
+        }
         if let Some(p) = c.entrance.point {
             m.set_hardpoint(vehicle, p, c.at.to_array());
         }
@@ -528,6 +536,25 @@ impl Hijacks {
             CAMERA_DISTANCE,
         ));
         p.character.velocity = Vec3::ZERO;
+    }
+
+    /// Where she is in the hijacked vehicle's space (x right, y up, z
+    /// ahead), and the vehicle's model-space bounds: for checking her
+    /// clips' placing.
+    pub fn her_in_vehicle(&self, game: &Game) -> Option<(Vec3, (Vec3, Vec3))> {
+        let a = self.active.as_ref()?;
+        let v = game.scene.vehicles.get(a.vehicle)?;
+        let at = game
+            .scene
+            .world
+            .as_ref()?
+            .physics
+            .vehicle_transform(v.id?)?;
+        let p = game.scene.player.as_ref()?;
+        Some((
+            at.inverse().transform_point3(p.character.position),
+            v.spec.bounds,
+        ))
     }
 
     /// Whether the scripts have loaded (or failed to).
@@ -753,6 +780,22 @@ fn point(
     });
     cache.insert((model, name), p);
     p
+}
+
+/// Every node of a model, by name hash, with where it is (model space).
+fn nodes(source: &mut m2_engine::AssetSource<BufReader<File>>, model: u32) -> Vec<(u32, Vec3)> {
+    let Ok(data) = source.model(model) else {
+        return Vec::new();
+    };
+    let Ok(m) = data.parse() else {
+        return Vec::new();
+    };
+    (0..m.nodes.len())
+        .filter_map(|i| {
+            let to_model = m.node_to_model(i as u16)?;
+            Some((m.nodes[i].name_hash, to_model.w_axis.truncate()))
+        })
+        .collect()
 }
 
 trait Flat {
