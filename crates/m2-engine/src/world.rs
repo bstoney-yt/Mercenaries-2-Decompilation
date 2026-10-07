@@ -357,6 +357,24 @@ impl Templates {
         Some((name, info))
     }
 
+    /// The templates a vehicle may be, by its own template `name` (the
+    /// mission's `AMX30 (Full)`) and else by its `model`'s templates
+    /// (variants that share it), these lower case and by name.
+    pub fn names_for(&self, name: &str, model: u32) -> Vec<String> {
+        let mut by_model: Vec<String> = self
+            .by_name
+            .iter()
+            .filter(|(_, t)| t.model == Some(model))
+            .map(|(n, _)| n.clone())
+            .collect();
+        by_model.sort();
+        let own = self.ids(name);
+        own.iter()
+            .filter_map(|id| self.names.get(id).cloned())
+            .chain(by_model)
+            .collect()
+    }
+
     /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
     /// else of a template of its `model`
     /// ([`tuning_for_model`](Self::tuning_for_model)).
@@ -2088,6 +2106,32 @@ mod tests {
         assert_eq!(db.by_id(0x8000_0002).map(|(_, i)| i.model), Some(Some(2)));
         assert_eq!(db.get("RPG").map(|i| i.model), Some(Some(1)));
         assert_eq!(db.id("rpg"), Some(0x8000_0001));
+    }
+
+    #[test]
+    fn a_vehicles_templates_are_its_own_then_its_models() {
+        let t = |model| TemplateInfo {
+            model: Some(model),
+            vehicle: Some(VehicleKind::Car),
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let db = Templates {
+            by_name: HashMap::from([
+                ("amx30 (full)".to_owned(), t(1)),
+                ("amx30".to_owned(), t(1)),
+                ("m151".to_owned(), t(2)),
+            ]),
+            names: HashMap::from([(0x8000_0001, "AMX30 (Full)".to_owned())]),
+            ..Templates::default()
+        };
+        assert_eq!(
+            db.names_for("amx30 (full)", 1),
+            ["AMX30 (Full)", "amx30", "amx30 (full)"]
+        );
+        assert_eq!(db.names_for("vz_veh_m151", 2), ["m151"]);
+        assert!(db.names_for("nothing", 3).is_empty());
     }
 
     #[test]
