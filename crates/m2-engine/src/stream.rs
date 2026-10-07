@@ -1982,21 +1982,16 @@ fn inland_water<R: std::io::Read + std::io::Seek>(
             // on, it sat half a cell towards +x and +z).
             let x = water.origin[0] + (column as f32 - 0.5) * water.cell;
             let z = water.origin[1] + (row as f32 - 0.5) * water.cell;
-            let first = (vertices.len() / 8) as u32;
-            for (dx, dz) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
-                vertices.extend([
-                    x + dx * water.cell,
-                    h,
-                    z + dz * water.cell,
-                    0.0,
-                    1.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ]);
-            }
-            indices.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
+            water_square(
+                &mut vertices,
+                &mut indices,
+                [x, z, x + water.cell, z + water.cell],
+                h,
+            );
         }
+    }
+    for (bounds, h) in missing_water() {
+        water_square(&mut vertices, &mut indices, bounds, h);
     }
     if indices.is_empty() {
         return Ok(None);
@@ -2022,6 +2017,43 @@ fn inland_water<R: std::io::Read + std::io::Seek>(
         Some(&bytes),
     )?;
     Ok(Some((vb, ib, count)))
+}
+
+/// Water the consoles show that no decoded data places yet: the moat
+/// under the villa's bridge (VzaCon001), which the north waterfall drains
+/// into. Its height is the jetski spawns' (`PointTraffic_PirateHQ_Jetski`,
+/// y 17.5); its bounds are inferred from the channel's banks (round EA).
+/// The water grid reads far below it there. `M2_MOAT=x0,z0,x1,z1,h`
+/// replaces it, `M2_MOAT=off` drops it.
+const MOAT: ([f32; 4], f32) = ([-1530.0, 3040.0, -1465.0, 3135.0], 17.5);
+
+/// The water [`MOAT`] adds, as (x0, z0, x1, z1) bounds and height.
+fn missing_water() -> Vec<([f32; 4], f32)> {
+    match std::env::var("M2_MOAT").as_deref() {
+        Ok("off") => Vec::new(),
+        Ok(v) => {
+            let f: Vec<f32> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+            match f[..] {
+                [x0, z0, x1, z1, h] => vec![([x0, z0, x1, z1], h)],
+                _ => {
+                    eprintln!("M2_MOAT: expected x0,z0,x1,z1,h");
+                    vec![MOAT]
+                }
+            }
+        }
+        Err(_) => vec![MOAT],
+    }
+}
+
+/// A flat square of water over `bounds` (x0, z0, x1, z1) at height `h`,
+/// in the simple layout (position, normal up, uv 0).
+fn water_square(vertices: &mut Vec<f32>, indices: &mut Vec<u32>, bounds: [f32; 4], h: f32) {
+    let [x0, z0, x1, z1] = bounds;
+    let first = (vertices.len() / 8) as u32;
+    for (x, z) in [(x0, z0), (x1, z0), (x1, z1), (x0, z1)] {
+        vertices.extend([x, h, z, 0.0, 1.0, 0.0, 0.0, 0.0]);
+    }
+    indices.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
 }
 
 fn sea_plane(
