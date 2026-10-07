@@ -1297,6 +1297,8 @@ fn break_props(game: &mut Game, mission: &Mission) {
         for (e, p) in scene.props.shown() {
             match w.objects.get(&e) {
                 Some(o) if !o.alive && !p.wrecked => dead.push(e),
+                // Not the scripts' (one of the island's, brought down).
+                None if crate::destruct::adopted(e) => {}
                 None => gone.push(e),
                 _ => {}
             }

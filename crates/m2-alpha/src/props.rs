@@ -74,7 +74,8 @@ pub struct Props {
     knocked: HashMap<u32, Vec<DebrisId>>,
     /// Those broken apart: their pieces, in their [`Breakup`]'s order.
     broken: HashMap<u32, Vec<DebrisId>>,
-    /// And the rest of them going down into the ground ([`SINK_ACCEL`]).
+    /// Those wrecked by a blast: their intact parts going down into the
+    /// ground ([`SINK_ACCEL`]) as their wreck shows.
     sinking: HashMap<u32, Sinking>,
     /// Knocked loose since [`take_knocked`](Self::take_knocked).
     fresh_knocks: Vec<u32>,
@@ -217,6 +218,39 @@ impl Props {
         added
     }
 
+    /// Puts up one of the island's placed objects as a prop under `key`
+    /// (not an entity of the state layers), to bring it down as they are
+    /// brought down: its model loads as [`Props::update`] goes
+    /// ([`get`](Self::get) says when). False if `key` is already shown.
+    pub fn adopt(
+        &mut self,
+        install: &Install,
+        key: u32,
+        o: &m2_engine::world::ObjectPlacement,
+    ) -> bool {
+        if self.shown.contains_key(&key) {
+            return false;
+        }
+        self.shown.insert(
+            key,
+            Prop {
+                model: o.model,
+                position: o.position,
+                rotation: o.rotation,
+                wrecked: false,
+            },
+        );
+        self.changes += 1;
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.models.entry(o.model) {
+            slot.insert(None);
+            self.waiting.insert(o.model);
+        }
+        if self.loaders.is_none() {
+            self.loaders = Some(Loaders::start(install));
+        }
+        true
+    }
+
     /// Notes that `layer` puts up `entities`.
     pub fn note_layer(&mut self, entities: impl IntoIterator<Item = u32>, layer: &str) {
         let layer: Arc<str> = layer.into();
@@ -345,9 +379,10 @@ impl Props {
     /// Breaks `entity` if it is shown and whole: its wreck if the model
     /// has one, else it goes. One that breaks apart throws its pieces
     /// away from `blast` (what broke it), if that went off within
-    /// [`THROW_REACH`], as the rest of it sinks a little into the ground
-    /// (one found broken, as after loading a game, is already down). True
-    /// if it was one.
+    /// [`THROW_REACH`], and a building whose collapse animation sinks its
+    /// intact walls has them go down into the ground as its wreck shows
+    /// (one found broken, as after loading a game, shows its wreck alone).
+    /// True if it was one.
     pub fn wreck(&mut self, physics: &mut Physics, entity: u32, blast: Option<Vec3>) -> bool {
         self.wreck_scaled(physics, entity, blast, 1.0)
     }
@@ -369,24 +404,28 @@ impl Props {
         if let Some(m) = model.filter(|m| m.gpu.has_wreck()) {
             p.wrecked = true;
             let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+            let sinking = match blast {
+                Some(from) if m.gpu.sinks() => Sinking::from(entity, placed, m.gpu.bounds, from),
+                _ => Sinking::under(),
+            };
+            self.sinking.insert(entity, sinking);
             if let Some(breakup) = m.breakup.as_deref()
                 && !self.knocked.contains_key(&entity)
             {
                 let pieces = throw(physics, breakup, placed, blast, scale);
-                let sinking = match (&pieces, blast) {
-                    (Some(_), Some(from)) => Sinking::from(entity, placed, m.gpu.bounds, from),
-                    _ => Sinking::under(),
-                };
-                self.sinking.insert(entity, sinking);
                 if let Some(pieces) = pieces {
                     eprintln!(
                         "props: {entity:#x} ({:08x}) breaks apart into {} pieces, away from \
-                         {:.1}, burning at {} points, the rest sinking {:.1} deg over",
+                         {:.1}, burning at {} points, intact walls {}",
                         p.model,
                         pieces.len(),
                         blast.unwrap_or_default(),
                         breakup.points.len(),
-                        sinking.lean.to_degrees()
+                        if sinking.done(m.gpu.bounds) {
+                            "gone at once (no collapse animation)".to_owned()
+                        } else {
+                            format!("sinking {:.1} deg over", sinking.lean.to_degrees())
+                        }
                     );
                     self.broken.insert(entity, pieces);
                 }
@@ -590,12 +629,16 @@ impl Props {
                 );
             }
         }
-        if let Some(sink) = self.sinking.get(&entity) {
-            let depth = sink.depth();
+        if let Some(sink) = self.sinking.get(&entity)
+            && let Some(Some(m)) = self.models.get(&p.model)
+        {
+            let bounds = m.gpu.bounds;
             s += &format!(
-                "; the rest sunk {depth:.1} m after {:.1} s, leaning {:.1} deg",
+                "; intact walls sunk {:.1} of {:.1} m after {:.1} s{}",
+                sink.depth(bounds),
+                bounds.1.y - bounds.0.y,
                 sink.time,
-                (sink.lean * depth / SINK_MOST).to_degrees()
+                if sink.done(bounds) { ", under" } else { "" }
             );
         }
         Some(s)
@@ -979,17 +1022,9 @@ impl Props {
                         .any(|at| at.w_axis.truncate().distance(eye) <= limit)
                 {
                     let placed = Mat4::from_rotation_translation(p.rotation, p.position);
-                    let mut nodes = loose.posed(placed, &places);
+                    let nodes = loose.posed(placed, &places);
                     let flying = loose.flying();
-                    // The rest of a model broken apart goes down as it
-                    // sinks.
-                    if let Some(sunk) = self.sinking.get(e).map(|s| s.place(m.gpu.bounds)) {
-                        for (n, at) in nodes.iter_mut().enumerate() {
-                            if !flying.get(n).copied().unwrap_or(false) {
-                                *at = sunk * *at;
-                            }
-                        }
-                    }
+                    self.draw_sinking(queue, *e, m, placed);
                     let wrecked = loose.breaks || p.wrecked;
                     match self.parts {
                         Parts::All => m.gpu.draw_moved(queue, placed, &nodes, wrecked, flying),
@@ -1011,30 +1046,38 @@ impl Props {
                 Some(nodes) => m.gpu.draw_moved(queue, at, nodes, false, &[]),
                 None => m.gpu.draw_as(queue, at, p.wrecked),
             }
+            self.draw_sinking(queue, *e, m, at);
+        }
+    }
+
+    /// Draws `entity`'s intact walls going down, if they are on their way.
+    fn draw_sinking(&self, queue: &mut DrawQueue, entity: u32, m: &PropModel, placed: Mat4) {
+        if let Some(s) = self.sinking.get(&entity)
+            && !s.done(m.gpu.bounds)
+        {
+            m.gpu.draw_sinking(queue, placed, s.place(m.gpu.bounds));
         }
     }
 }
 
-/// How a building a support strike brings down goes as its pieces fly,
-/// as its template's `BuildingCollapseAnim` has it (the gates':
-/// `SinkAccel` 2.5, `SinkSpeedMax` -1, no limit, `LeanAngleMin` 8 and
-/// `LeanAngleMax` 10; their part states call the breaking
-/// `CollapseState`, and each piece's `DebrisState` makes it a root of its
-/// own, `SetRootNode`, so the pieces don't go down with the rest): the
-/// rest sinks into the ground ever faster (this many metres a second more
-/// each second), leaning over as it goes to between the least and the
-/// most (degrees), away from the blast, until it is this far (metres)
-/// down, where it stays: the parts' `DestroyedState` shows the wreck
-/// (node 2) again, and the videos keep column stumps and broken wall
-/// either side of the gap. Round 102 found the whole gate seen standing
-/// after the bomb was the layer's merged batch, not the wreck; how far
-/// the wreck goes down is invented.
+/// How a building's intact walls go down as it collapses, as its
+/// template's `BuildingCollapseAnim` has it (`SinkAccel` 2.5,
+/// `SinkSpeedMax` -1, no limit, `LeanAngleMin` 8 and `LeanAngleMax` 10):
+/// round D6 read the part states of five buildings. A building's
+/// `CollapseState` shows its wreck and starts that animation on its intact
+/// node (`StartAnim` .. `CollapseAnim`), which goes into the ground ever
+/// faster (this many metres a second more each second), leaning over as
+/// it goes to between the least and the most (degrees), away from the
+/// blast; its `DestroyedState` shows the wreck, which nothing hides or
+/// moves after (no timer, no `Kill`), and one loaded destroyed shows the
+/// wreck alone. A gate has no such animation: its wreck simply shows, and
+/// the Xbox 360 video keeps its arch standing after the bomb. How far the
+/// walls lean on the way down, as a share of the way under, is inferred.
 const SINK_ACCEL: f32 = 2.5;
 const LEAN_LEAST: f32 = 8.0;
 const LEAN_MOST: f32 = 10.0;
-const SINK_MOST: f32 = 1.0;
 
-/// The rest of a model broken apart, going down ([`SINK_ACCEL`]).
+/// A building's intact walls going down ([`SINK_ACCEL`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Sinking {
     /// Seconds since it broke.
@@ -1047,8 +1090,8 @@ struct Sinking {
 
 impl Sinking {
     /// Going down from now, the model placed at `placed` with its box
-    /// `bounds`, leaning across its line (as a gate's pieces fall) away
-    /// from a blast at `from` (either way for one on its line).
+    /// `bounds`, leaning across its line away from a blast at `from`
+    /// (either way for one on its line).
     fn from(entity: u32, placed: Mat4, (lo, hi): (Vec3, Vec3), from: Vec3) -> Self {
         let middle = placed.transform_point3((lo + hi) * 0.5);
         let off = (middle - from).dot(placed.z_axis.truncate());
@@ -1068,7 +1111,7 @@ impl Sinking {
         }
     }
 
-    /// Already down (one found broken).
+    /// Already down (one found broken, or one with nothing to sink).
     fn under() -> Self {
         Self {
             time: f32::INFINITY,
@@ -1077,23 +1120,30 @@ impl Sinking {
         }
     }
 
-    /// How far down it is now (metres), at most [`SINK_MOST`].
-    fn depth(&self) -> f32 {
+    /// How far down it is now (metres), at most its height (`bounds`).
+    fn depth(&self, (lo, hi): (Vec3, Vec3)) -> f32 {
+        let height = (hi.y - lo.y).max(0.0);
         let depth = 0.5 * SINK_ACCEL * self.time * self.time;
         if depth.is_nan() {
-            SINK_MOST
+            height
         } else {
-            depth.min(SINK_MOST)
+            depth.min(height)
         }
     }
 
-    /// Where the rest of the model, its box `bounds`, is now, in its own
-    /// space: sunk, and leaning by as much of its lean as of
-    /// [`SINK_MOST`] it has gone down.
+    /// Whether it is all under the ground.
+    fn done(&self, bounds: (Vec3, Vec3)) -> bool {
+        self.depth(bounds) >= (bounds.1.y - bounds.0.y).max(0.0)
+    }
+
+    /// Where the intact walls, their box `bounds`, are now, in the model's
+    /// own space: sunk, and leaning by as much of its lean as of the way
+    /// under they have gone.
     fn place(&self, (lo, hi): (Vec3, Vec3)) -> Mat4 {
-        let depth = self.depth();
+        let depth = self.depth((lo, hi));
+        let height = (hi.y - lo.y).max(1e-3);
         let pivot = Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5);
-        let lean = self.lean * depth / SINK_MOST;
+        let lean = self.lean * depth / height;
         Mat4::from_translation(pivot - Vec3::Y * depth)
             * Mat4::from_axis_angle(self.axis, lean)
             * Mat4::from_translation(-pivot)
@@ -1347,33 +1397,31 @@ mod tests {
     use m2_engine::{CollisionShape, LoosePiece};
 
     #[test]
-    fn a_broken_gates_rest_sinks_a_little_leaning_and_stays() {
-        // A gate 64 m along x, 15.7 m high, the way through it along z.
-        let bounds = (Vec3::new(-32.0, 0.0, -4.6), Vec3::new(32.0, 15.7, 4.7));
+    fn a_buildings_intact_walls_sink_leaning_until_under() {
+        // A shop block 20 m along x, 9.1 m high.
+        let bounds = (Vec3::new(-10.0, 0.0, -6.0), Vec3::new(10.0, 9.1, 6.0));
         let placed = Mat4::from_translation(Vec3::new(100.0, -3.0, 50.0));
-        // The bomb on its top, a little to its -z side.
-        let mut s = Sinking::from(7, placed, bounds, Vec3::new(100.0, 12.0, 49.0));
+        // The blast a little to its -z side.
+        let mut s = Sinking::from(7, placed, bounds, Vec3::new(100.0, 2.0, 40.0));
         let lean = s.lean.to_degrees();
         assert!((LEAN_LEAST..=LEAN_MOST).contains(&lean), "{lean}");
-        // The middle of its foot, which it leans about.
-        let foot = Vec3::new(0.0, 0.0, 0.05);
-        let top = |s: &Sinking| s.place(bounds).transform_point3(Vec3::new(0.0, 15.7, 0.0));
-        assert!(top(&s).distance(Vec3::new(0.0, 15.7, 0.0)) < 1e-4);
-        // Half a second on, a little down, leaning away from the blast.
-        s.time = 0.5;
-        let at = top(&s);
-        assert!(at.y < 15.7 && at.y > 14.5 && at.z > 0.1, "{at}");
-        // From a second on it stays: SINK_MOST down, fully over.
+        let top = |s: &Sinking| s.place(bounds).transform_point3(Vec3::new(0.0, 9.1, 0.0));
+        assert!(top(&s).distance(Vec3::new(0.0, 9.1, 0.0)) < 1e-4);
+        assert!(!s.done(bounds));
+        // A second on, 1.25 m down, leaning away from the blast.
         s.time = 1.0;
-        let down = s.place(bounds).transform_point3(foot);
-        assert!((down.y + SINK_MOST).abs() < 1e-4, "{down}");
-        let still = top(&s);
-        assert!(still.z > at.z && still.y > 13.0, "{still}");
+        let at = top(&s);
+        assert!((s.depth(bounds) - 1.25).abs() < 1e-4);
+        assert!(at.y < 7.9 && at.z > 0.0, "{at}");
+        // Under after sqrt(2 x 9.1 / 2.5) = 2.7 s, and it stays there.
+        s.time = 2.6;
+        assert!(!s.done(bounds));
+        s.time = 2.8;
+        assert!(s.done(bounds));
         s.time = 60.0;
-        assert!(top(&s).distance(still) < 1e-4);
-        // One found broken is down already, standing straight.
-        let under = Sinking::under().place(bounds).transform_point3(foot);
-        assert!((under.y + SINK_MOST).abs() < 1e-4, "{under}");
+        assert!((s.depth(bounds) - 9.1).abs() < 1e-4);
+        // One found broken is under already.
+        assert!(Sinking::under().done(bounds));
     }
 
     #[test]

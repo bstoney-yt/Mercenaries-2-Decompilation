@@ -147,6 +147,9 @@ pub struct ObjectPlacement {
     /// Drawn within this many metres, whatever its size: a tree, within
     /// its species' fade distance from the tree table.
     pub fade: Option<f32>,
+    /// The template its entity is an instance of (its `Transform`'s
+    /// parent), 0 for none.
+    pub template: u32,
 }
 
 /// Entity ids of the trees: [`TREE_ENTITIES`] | species << 16 | tree. The
@@ -264,6 +267,10 @@ pub struct Templates {
     pub population: crate::population::Population,
     /// How the person templates fight and notice things, by id.
     pub ai: HashMap<u32, AiProfile>,
+    /// How much those with `Health` take, by id.
+    pub durability: HashMap<u32, crate::durability::Durability>,
+    /// The blasts of those with `Explosive`, by id.
+    pub explosions: HashMap<u32, crate::durability::Explosion>,
 }
 
 impl Templates {
@@ -480,6 +487,8 @@ impl Templates {
             motions: crate::motion::read_templates(&db),
             population: crate::population::Population::read(&db),
             ai: crate::ai::read(&db),
+            durability: crate::durability::read(&db),
+            explosions: crate::durability::explosions(&db),
         };
         (templates, atmosphere)
     }
@@ -916,6 +925,7 @@ impl WorldIndex {
                     rotation: Quat::from_rotation_y(t.yaw()),
                     named: true,
                     fade: Some(s.fade),
+                    template: 0,
                 }));
             let parts = s.part_count.min(3) as usize;
             self.far_trees.push(Some(FarTree {
@@ -1194,6 +1204,7 @@ impl WorldIndex {
                         rotation: rotation(p.rotation),
                         named: false,
                         fade: None,
+                        template: p.parent,
                     });
                 }
             }
@@ -1267,6 +1278,7 @@ impl WorldIndex {
                             rotation,
                             named: true,
                             fade: None,
+                            template: p.parent,
                         })
                     }
                     // A vehicle template that drives: the alpha places it.
@@ -1301,6 +1313,7 @@ impl WorldIndex {
                         rotation,
                         named: true,
                         fade: None,
+                        template: p.parent,
                     }),
                     // A name no asset or template defines: the words may
                     // (not the designers' test entities).
@@ -1374,6 +1387,7 @@ impl WorldIndex {
                         rotation: rotation(p.rotation),
                         named: !models.contains_key(&entity),
                         fade: None,
+                        template: p.parent,
                     },
                 );
             }
