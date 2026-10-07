@@ -95,6 +95,8 @@ struct Active {
     actions: Vec<(u32, f64)>,
     /// Pad buttons held, as the scripts were last told.
     held: Vec<u32>,
+    /// Her hijack clip playing (an index into her rig's clips).
+    clip: Option<usize>,
 }
 
 /// What the HUD shows of a hijack.
@@ -364,7 +366,13 @@ impl Hijacks {
                 set: l.clips.sets.get(&c.template.to_ascii_lowercase()).copied(),
                 actions: Vec::new(),
                 held: Vec::new(),
+                clip: None,
             });
+            // Her clips move her from here on (`down` keeps her own
+            // moves and gaits from playing over them).
+            if let Some(p) = &mut game.scene.player {
+                p.down = true;
+            }
         } else {
             eprintln!("hijack: {}'s script did not start", c.template);
         }
@@ -446,6 +454,50 @@ impl Autopad {
 }
 
 impl Hijacks {
+    /// Runs after the game's tick: while her hijack clip plays, she is
+    /// where it carries her. Inferred: the people's hijack clips are cut
+    /// in the vehicle's space (they start from its origin, facing its
+    /// way), as the vehicle's own are.
+    pub fn place(&self, game: &mut Game) {
+        let Some(a) = &self.active else { return };
+        let Some(clip) = a.clip else { return };
+        let scene = &mut game.scene;
+        let (Some(world), Some(p)) = (&scene.world, &mut scene.player) else {
+            return;
+        };
+        let Some(at) = scene.vehicles[a.vehicle]
+            .id
+            .and_then(|id| world.physics.vehicle_transform(id))
+        else {
+            return;
+        };
+        let Some((_, rig)) = &p.model else { return };
+        let Some(c) = rig.clips.get(clip) else { return };
+        let t = rig
+            .animator
+            .current()
+            .filter(|cur| cur.0 == clip)
+            .map_or(0.0, |cur| cur.1)
+            .min(c.info.duration);
+        let pose = c.sample(&rig.skeleton, t);
+        let Some(root) = pose.0.get(rig.skeleton.root()).map(|l| l.translation) else {
+            return;
+        };
+        let forward = rig
+            .locomotion
+            .as_ref()
+            .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
+        let model_yaw = forward.x.atan2(forward.y);
+        let ahead = at.transform_vector3(Vec3::Z);
+        let yaw = ahead.x.atan2(ahead.z);
+        let origin = at.transform_point3(Vec3::ZERO);
+        let off = m2_math::glam::Quat::from_rotation_y(yaw)
+            * Vec3::new(root.x - c.info.pin.x, 0.0, root.z - c.info.pin.y);
+        p.facing = yaw + model_yaw;
+        p.character.position = origin + off;
+        p.character.velocity = Vec3::ZERO;
+    }
+
     /// Whether the scripts have loaded (or failed to).
     pub fn loading(&self) -> bool {
         matches!(self.state, State::Loading(_))
@@ -492,17 +544,23 @@ fn follow(
                 action,
             } => {
                 a.actions.retain(|x| x.0 != guid);
+                let clip = a.set.and_then(|set| clips.clip(&state, &action, set));
+                if guid == a.hero
+                    && let Some((hash, _)) = clip
+                {
+                    a.clip = play(game, hash);
+                }
                 if !action.eq_ignore_ascii_case("Idle") {
-                    let own = a
-                        .set
-                        .and_then(|set| clips.clip(&state, &action, set))
-                        .and_then(|c| c.1);
+                    let own = clip.and_then(|c| c.1);
                     let seconds = own.or(alongside).unwrap_or(UNKNOWN_CLIP);
                     a.actions.push((guid, now + seconds));
                 }
             }
             HijackCommand::Completed { hero } if hero == a.hero => {
                 eprintln!("hijack: done");
+                if let Some(p) = &mut game.scene.player {
+                    p.down = false;
+                }
                 // The driver is out (the scripts remove or kill him).
                 if let Some(v) = game.scene.vehicles.get_mut(a.vehicle) {
                     v.crew
@@ -516,6 +574,9 @@ fn follow(
             }
             HijackCommand::AbortDone { hero } if hero == a.hero => {
                 eprintln!("hijack: failed");
+                if let Some(p) = &mut game.scene.player {
+                    p.down = false;
+                }
                 over = true;
             }
             _ => {}
@@ -569,6 +630,27 @@ pub fn beside(game: &mut Game, hijacks: &mut Hijacks, want: Option<&str>) -> Opt
         v.spec.label, by_model[&v.spec.model].0, v.crew
     );
     Some(i)
+}
+
+/// Plays clip `hash` on her (read from the archive the first time); its
+/// index in her rig's clips.
+fn play(game: &mut Game, hash: u32) -> Option<usize> {
+    use m2_assets::animation::{ANIMATION_TYPE, Clip};
+    let scene = &mut game.scene;
+    let (_, rig) = scene.player.as_mut()?.model.as_mut()?;
+    let index = match rig.clips.iter().position(|c| c.hash == hash) {
+        Some(i) => i,
+        None => {
+            let bytes = scene.source.as_mut()?.asset(hash, ANIMATION_TYPE).ok()?;
+            let clip = Clip::parse(&bytes).ok()?;
+            let bound = m2_engine::BoundClip::bind(hash, clip, &rig.skeleton)?;
+            let clips = std::sync::Arc::make_mut(&mut rig.clips);
+            clips.push(bound);
+            clips.len() - 1
+        }
+    };
+    rig.animator.play_once(index);
+    Some(index)
 }
 
 /// The template of whoever drives (the rider of the seat named for the
