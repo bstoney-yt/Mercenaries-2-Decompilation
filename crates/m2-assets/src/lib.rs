@@ -20,6 +20,8 @@
 //! - [`animation`]: skeletal animation clips: interleaved, delta and
 //!   wavelet encoded node tracks, timed events, a pose sampler and model
 //!   posing.
+//! - [`animation_table`]: the tables that turn a character's animation key
+//!   (stance and action) into a clip, per vehicle or character.
 //! - [`havok`]: the binary object packfiles animation clips and collision
 //!   shapes are stored in.
 //! - [`path`]: patrol and vehicle routes (point lists placed by `Path` entities).
@@ -50,6 +52,7 @@
 //! named by offset.
 
 pub mod animation;
+pub mod animation_table;
 pub mod block;
 mod bytes;
 pub mod dxt;
