@@ -79,6 +79,10 @@ fn ground_fit() -> [f32; 5] {
     })
 }
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// How far water looks for the scene it mirrors (metres; inferred: far
+/// enough for the hills across a bay). `M2_SEA_MIRROR_REACH` sets it.
+const SEA_MIRROR_REACH: f32 = 600.0;
 /// Per-draw uniforms are packed at this stride (wgpu's minimum dynamic
 /// offset alignment on every backend).
 const DRAW_STRIDE: u64 = 256;
@@ -256,6 +260,11 @@ struct FrameUniforms {
     /// (`M2_DECK=old`: 0), y: its Tone scales display values
     /// (`M2_DECK=full`: 1).
     deck_fit: [f32; 4],
+    /// Water mirroring the scene drawn before it: x 1 to mirror it
+    /// (`M2_SEA_MIRROR=off`: 0), y scale on what it mirrors
+    /// (`M2_SEA_MIRROR=<x>`, 1 by default), z the farthest it looks
+    /// (metres).
+    mirror: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -349,12 +358,14 @@ struct RecordedDraw {
     caster: Option<Caster>,
 }
 
-/// The depth buffer and its copy for water.
+/// The depth buffer and its copy for water, with a copy of the colour
+/// drawn before water for it to mirror.
 #[derive(Debug)]
 struct DepthTargets {
     depth: wgpu::Texture,
     view: wgpu::TextureView,
     scene: wgpu::Texture,
+    color: wgpu::Texture,
     group: wgpu::BindGroup,
 }
 
@@ -671,20 +682,33 @@ impl WgpuBackend {
                 texture_entry(10),
             ],
         });
-        // Depth beneath, for water: a copy of the depth buffer made before
-        // the first water draw.
+        // Depth beneath and colour to mirror, for water: copies of the
+        // depth buffer and the world's target made before the first water
+        // draw.
         let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("standard"),
@@ -1020,20 +1044,43 @@ impl WgpuBackend {
             "scene depth",
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         );
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene colour"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: post::HDR_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene"),
             layout: scene_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(
-                    &scene.create_view(&Default::default()),
-                ),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &scene.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(
+                        &color.create_view(&Default::default()),
+                    ),
+                },
+            ],
         });
         DepthTargets {
             view: depth.create_view(&Default::default()),
             depth,
             scene,
+            color,
             group,
         }
     }
@@ -1894,6 +1941,15 @@ impl WgpuBackend {
                     0.0,
                 ]
             },
+            mirror: {
+                let mode = std::env::var("M2_SEA_MIRROR").unwrap_or_default();
+                [
+                    if mode == "off" { 0.0 } else { 1.0 },
+                    mode.parse::<f32>().unwrap_or(1.0),
+                    env_f32("M2_SEA_MIRROR_REACH").unwrap_or(SEA_MIRROR_REACH),
+                    0.0,
+                ]
+            },
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
@@ -1926,6 +1982,11 @@ impl WgpuBackend {
                 self.depth.depth.as_image_copy(),
                 self.depth.scene.as_image_copy(),
                 self.depth.depth.size(),
+            );
+            encoder.copy_texture_to_texture(
+                self.post.hdr_texture.as_image_copy(),
+                self.depth.color.as_image_copy(),
+                self.depth.color.size(),
             );
             self.encode_world(
                 &mut encoder,
