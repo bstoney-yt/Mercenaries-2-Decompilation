@@ -241,6 +241,9 @@ enum State {
 /// The mission scripts and what they want shown.
 pub struct MissionLink {
     state: State,
+    /// The flow's movies wait for the game to play them
+    /// ([`Mission::hold_movies`]); otherwise they end at once.
+    movies: bool,
     /// Time not yet given to the scripts.
     lag: f32,
     log: Option<BufWriter<File>>,
@@ -348,6 +351,7 @@ impl MissionLink {
         };
         Self {
             state: State::Loading(rx),
+            movies: false,
             lag: 0.0,
             log,
             message: None,
@@ -373,6 +377,33 @@ impl MissionLink {
     /// Stocks and calls in these support items once the scripts run.
     pub fn with_support(self, support: Vec<String>) -> Self {
         Self { support, ..self }
+    }
+
+    /// Has the scripts' movies (`01_AOA_J`, `02_AOB_J`) wait for the game:
+    /// [`take_movie`](Self::take_movie) hands them out.
+    pub fn with_movies(self, movies: bool) -> Self {
+        Self { movies, ..self }
+    }
+
+    /// The next movie the scripts are waiting on, if any: once it has
+    /// played, [`movie_done`](Self::movie_done).
+    pub fn take_movie(&mut self) -> Option<String> {
+        let State::Running(m) = &mut self.state else {
+            return None;
+        };
+        let name = m.take_movie();
+        let lines = m.take_log();
+        self.write(lines);
+        name
+    }
+
+    /// The movie [`take_movie`](Self::take_movie) gave is over.
+    pub fn movie_done(&mut self) {
+        if let State::Running(m) = &mut self.state {
+            m.movie_done();
+            let lines = m.take_log();
+            self.write(lines);
+        }
     }
 
     /// Tutorial lines name these keys (else the usual ones).
@@ -748,6 +779,9 @@ impl MissionLink {
                     if let Err(e) = mission.run(&code, &name) {
                         self.write([format!("{name}: {e}")]);
                     }
+                }
+                if self.movies {
+                    mission.hold_movies();
                 }
                 mission.start();
                 let lines = mission.take_log();

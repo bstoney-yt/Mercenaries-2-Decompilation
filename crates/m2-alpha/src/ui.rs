@@ -261,6 +261,27 @@ impl Hud {
         (action, output.platform_output)
     }
 
+    /// Lays out a screen of its own in place of the HUD (the movies and
+    /// the front end, [`crate::flow`]), for [`paint`](Self::paint).
+    pub fn build_screen(
+        &mut self,
+        input: RawInput,
+        screen: impl FnMut(&mut egui::Ui),
+    ) -> egui::PlatformOutput {
+        let output = self.ctx.run_ui(input, screen);
+        let ppp = output.pixels_per_point;
+        let shapes = self.ctx.tessellate(output.shapes, ppp);
+        let delta = match self.frame.take() {
+            Some((_, mut old, _)) => {
+                old.append(output.textures_delta);
+                old
+            }
+            None => output.textures_delta,
+        };
+        self.frame = Some((shapes, delta, ppp));
+        output.platform_output
+    }
+
     /// Paints what [`build`](Self::build) laid out.
     pub fn paint(&mut self, t: OverlayTarget<'_>) {
         let Some((shapes, mut delta, ppp)) = self.frame.take() else {
