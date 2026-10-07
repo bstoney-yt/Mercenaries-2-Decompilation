@@ -118,9 +118,12 @@ m2-alpha [options]
   --mission-driver <lua> Lua to run before the scripts start, to test them
                          (crates/m2-game/examples/drivers/vzacon001.lua
                          plays the first contract); repeatable
-  --hijack-crew <name>   every hijackable vehicle is crewed by this human
-                         template, to test hijacking (I/K/J/L are the
-                         pad's Y/A/X/B; the movement keys its stick)
+  --hijack-crew <name>   every hijackable vehicle without a driver is
+                         driven by this human template, to test hijacking
+                         (I/K/J/L are the pad's Y/A/X/B; the movement
+                         keys its stick)
+  --hijack               with --screenshot --drive: hijack the vehicle
+                         (--vehicle's) instead, answering every prompt
   --support <key>        with --mission: stock support item <key> (clusterbomb,
                          Support) and call it in once the scripts run, to
                          test their strikes and drops; repeatable
