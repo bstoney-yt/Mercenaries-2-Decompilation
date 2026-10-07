@@ -76,6 +76,14 @@ struct Frame {
     // power), z least share of each wave kept however far, w the night
     // ramp's alpha
     glint_fit: vec4<f32>,
+    // x: the cloud deck takes the sun's colour twice, as the game's (0:
+    // once, `M2_DECK=old`), y: its Tone scales display values
+    // (`M2_DECK=full`; see `deck_light`)
+    deck_fit: vec4<f32>,
+    // x: water mirrors the scene drawn before it (0: `M2_SEA_MIRROR=off`),
+    // y: scale on what it mirrors, z: how far it looks (metres; see
+    // `scene_mirror`)
+    mirror: vec4<f32>,
 };
 
 // The game lights surfaces in display values: the sun's colour times
@@ -179,6 +187,7 @@ struct Material {
 @group(2) @binding(10) var layer3: texture_2d<f32>;
 // Depth of what was drawn before the water (reversed: 0 is nothing).
 @group(3) @binding(0) var scene_depth: texture_depth_2d;
+@group(3) @binding(1) var scene_color: texture_2d<f32>;
 
 struct Varyings {
     @builtin(position) clip: vec4<f32>,
@@ -389,13 +398,28 @@ fn deck_light(r: vec3<f32>, mass: f32) -> vec3<f32> {
         let g = frame.rayleigh.a;
         let phase = 1.5 * (1.0 - g * g) / (2.0 + g * g) * (1.0 + c * c)
             / pow(1.0 + g * g - 2.0 * g * c, 1.5);
-        // The sun's colour comes in with the air in front when that
-        // is tinted by it.
+        // The game's cloud pixel shader (023) lights a colour constant
+        // and its vertex shader (025) multiplies the result by the air's
+        // E * dirLightColor, so the sun's colour comes in twice: once
+        // here, once in the air's tint (`through_air`). Round ED: dusk
+        // sky B/R .84 -> .78 at the villa (console .69-.77), .90 -> .87
+        // on the boat (PC ~.79); night sky top L80 -> 74 (Xbox 81).
+        // `M2_DECK=old` divides the sun by the air's tint, so it comes in
+        // once. `M2_DECK=full` also takes Tone over display values, as
+        // the game's shaders sum them (inferred: boat .81, but night top
+        // L64, B/R 2.42 against Xbox 1.49).
         var sun = frame.sun_color.rgb;
-        if frame.deck.y >= 0.0 && game_haze() {
-            sun = sun / max(light_from_display(frame.deck.yzw), vec3<f32>(1e-3));
+        var tone = light_from_display(frame.cloud_tone.rgb);
+        if frame.deck_fit.y < 0.5 {
+            tone = frame.cloud_tone.rgb;
         }
-        cloud = sun * (1.0 + phase) / (1.0 + mass * frame.wind.w);
+        if frame.deck_fit.x < 0.5 {
+            if frame.deck.y >= 0.0 && game_haze() {
+                sun = sun / max(light_from_display(frame.deck.yzw), vec3<f32>(1e-3));
+            }
+        }
+        cloud = sun * (1.0 + phase) / (1.0 + mass * frame.wind.w) * tone;
+        return cloud;
     } else {
         // Lit by the sun, brighter looking towards it; thicker cloud
         // is darker underneath.
@@ -443,6 +467,71 @@ fn mirrored_sky(r: vec3<f32>) -> vec3<f32> {
         rgb = mix(rgb, cloud, cover * frame.cloud_tone.a);
     }
     return rgb;
+}
+
+// The scene drawn before the water as mirrored from p along the unit ray
+// r: its colour, and how much of it to take (0 where the ray finds
+// nothing). The game's water mirrors a planar render of the scene, sky
+// and all (its ReflectionMap, sampled in screen space); here the frame's
+// own colour stands in for that render, found by marching the ray
+// through the depth beneath in steps that lengthen with distance. What
+// lies off screen or past `frame.mirror.z` is left to the sky.
+fn scene_mirror(p: vec3<f32>, r: vec3<f32>) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(scene_depth));
+    let reach = frame.mirror.z;
+    var t = 0.5;
+    var last = 0.0;
+    for (var i = 0; i < 48; i = i + 1) {
+        if t > reach {
+            break;
+        }
+        let c = frame.view_proj * vec4<f32>(p + r * t, 1.0);
+        if c.w <= 0.0 {
+            break;
+        }
+        let ndc = c.xyz / c.w;
+        if any(abs(ndc.xy) > vec2<f32>(1.0)) {
+            break;
+        }
+        let px = vec2<i32>(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size);
+        let d = textureLoad(scene_depth, px, 0);
+        // Depth runs from 1 near to 0 far: the scene lies in front of the
+        // ray's point here.
+        if d > ndc.z {
+            let s = frame.inv_view_proj * vec4<f32>(ndc.xy, d, 1.0);
+            let behind = distance(p + r * t, frame.eye.xyz) - distance(s.xyz / s.w, frame.eye.xyz);
+            if behind < (t - last) * 1.5 + 0.3 {
+                // Narrowed down to where the ray meets it.
+                var lo = last;
+                var hi = t;
+                for (var j = 0; j < 5; j = j + 1) {
+                    let mid = 0.5 * (lo + hi);
+                    let m = frame.view_proj * vec4<f32>(p + r * mid, 1.0);
+                    let mn = m.xyz / m.w;
+                    let mp = vec2<i32>(vec2<f32>(mn.x * 0.5 + 0.5, 0.5 - mn.y * 0.5) * size);
+                    if textureLoad(scene_depth, mp, 0) > mn.z {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                let h = frame.view_proj * vec4<f32>(p + r * hi, 1.0);
+                let hn = h.xy / h.w;
+                let hp = clamp(
+                    vec2<i32>(vec2<f32>(hn.x * 0.5 + 0.5, 0.5 - hn.y * 0.5) * size),
+                    vec2<i32>(0),
+                    vec2<i32>(size) - 1,
+                );
+                // Faded towards the screen's edges and the far end.
+                let edge = 1.0 - smoothstep(0.85, 1.0, max(abs(hn.x), abs(hn.y)));
+                let far = 1.0 - smoothstep(0.8 * reach, reach, hi);
+                return vec4<f32>(textureLoad(scene_color, hp, 0).rgb, edge * far);
+            }
+        }
+        last = t;
+        t = t + t * 0.15 + 0.25;
+    }
+    return vec4<f32>(0.0);
 }
 
 // How much sunlight reaches p (0 to 1), from the shadow cascade its view
@@ -650,7 +739,14 @@ fn fs_main(v: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4
         // the reflection over that; blended here, the same sum is the
         // body and reflection over the reflection's and body's share.
         water_alpha = mix(opacity, 1.0, k);
-        rgb = (body * opacity * (1.0 - k) + environment(reflect(-view, n)) * material.water.y * k) / max(water_alpha, 1e-4);
+        let r = reflect(-view, n);
+        var mirror = environment(r) * material.water.y;
+        if frame.mirror.x > 0.5 {
+            // The scene around it, where the ray finds some, over the sky.
+            let seen = scene_mirror(v.world_pos, r);
+            mirror = mix(mirror, seen.rgb * frame.mirror.y, seen.a);
+        }
+        rgb = (body * opacity * (1.0 - k) + mirror * k) / max(water_alpha, 1e-4);
         // Foam along the shore, within about 3 m of it as the game's.
         let pattern = base_texel.a * dot(base_texel.rgb, vec3<f32>(0.3333));
         // Past a hundred metres or so surf is too fine to see; drawn there

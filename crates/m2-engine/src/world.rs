@@ -277,6 +277,11 @@ pub struct Templates {
     pub ordnance: crate::ordnance::Ordnance,
     /// How vehicles break each template's objects running into them.
     pub crashable: HashMap<u32, crate::durability::Crash>,
+    /// The templates that stand already destroyed, by id: those whose
+    /// `Health` is 0. All 201 such are ruins (`_marsh_bridgemid_ruined`,
+    /// `AMX30_RUIN`), each with the model of its intact twin, whose
+    /// `Health` is not 0 (round EC).
+    pub ruined: HashSet<u32>,
 }
 
 impl Templates {
@@ -508,6 +513,7 @@ impl Templates {
                 .collect(),
             tuning: crate::tuning::read(&db),
             leavings: crate::pickup::read(&db),
+            ruined: ruined(&db),
             motions: crate::motion::read_templates(&db),
             population: crate::population::Population::read(&db),
             ai: crate::ai::read(&db),
@@ -519,6 +525,17 @@ impl Templates {
         };
         (templates, atmosphere)
     }
+}
+
+/// The templates whose `Health` is 0 (its first field, an f32).
+fn ruined(db: &Layer<'_>) -> HashSet<u32> {
+    db.component("Health")
+        .and_then(|c| c.records())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, r)| r.get(..4) == Some(&[0; 4][..]))
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// Each template's engine sound bank: the `SoundEffect` field that names
@@ -681,6 +698,9 @@ pub struct WorldIndex {
     /// is an instance of: what a renamed entity's name
     /// (`VzaCon001_StartingBoat`) no longer says.
     pub state_vehicles: HashMap<u32, TemplatePlacement>,
+    /// Those of [`state_objects`](Self::state_objects) whose template
+    /// stands destroyed ([`Templates::ruined`]): drawn as their wrecks.
+    pub ruined: HashSet<u32>,
     /// With `M2_LOG_FOLIAGE=on` only: each named entity of the static
     /// layers, its name and how it was placed (`m` by `ModelName`, `p` by
     /// its name or template, `v` a vehicle or unknown template, `c` left
@@ -1440,6 +1460,15 @@ impl WorldIndex {
                 }
             });
             if let Some(model) = model {
+                let ruined = &assets.templates.ruined;
+                if ruined.contains(&p.parent)
+                    || assets
+                        .templates
+                        .id(stem)
+                        .is_some_and(|t| ruined.contains(&t))
+                {
+                    self.ruined.insert(entity);
+                }
                 self.state_objects.insert(
                     entity,
                     ObjectPlacement {

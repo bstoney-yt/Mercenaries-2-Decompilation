@@ -302,8 +302,10 @@ pub struct Post {
     reduce: wgpu::RenderPipeline,
     adapt: wgpu::RenderPipeline,
     uniforms: [wgpu::Buffer; PASSES],
-    /// The world's floating-point target.
+    /// The world's floating-point target, and its texture (copied for
+    /// water to mirror).
     pub hdr: wgpu::TextureView,
+    pub hdr_texture: wgpu::Texture,
     /// Quarter-size glow images, ping-ponged by the blur.
     glow: [wgpu::TextureView; 2],
     /// The frame's log luminance, down to one texel.
@@ -322,22 +324,35 @@ pub struct Post {
 
 /// A floating-point image `width` x `height` to draw into and sample.
 fn target(device: &wgpu::Device, label: &str, width: u32, height: u32) -> wgpu::TextureView {
-    device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        })
+    target_texture(device, label, width, height, wgpu::TextureUsages::empty())
         .create_view(&Default::default())
+}
+
+/// A floating-point target `width` x `height`, with `usage` besides
+/// drawing into and sampling.
+fn target_texture(
+    device: &wgpu::Device,
+    label: &str,
+    width: u32,
+    height: u32,
+    usage: wgpu::TextureUsages,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: HDR_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | usage,
+        view_formats: &[],
+    })
 }
 
 impl Post {
@@ -436,7 +451,7 @@ impl Post {
             .map(|&side| target(device, "luminance", side, side))
             .collect();
         let adapted = std::array::from_fn(|_| target(device, "adapted", 1, 1));
-        let (hdr, glow, groups) = Self::targets(
+        let (hdr_texture, hdr, glow, groups) = Self::targets(
             device, &layout, &sampler, &uniforms, &luminance, &adapted, width, height,
         );
         Self {
@@ -450,6 +465,7 @@ impl Post {
             sampler,
             uniforms,
             hdr,
+            hdr_texture,
             glow,
             luminance,
             adapted,
@@ -474,11 +490,19 @@ impl Post {
         width: u32,
         height: u32,
     ) -> (
+        wgpu::Texture,
         wgpu::TextureView,
         [wgpu::TextureView; 2],
         [[wgpu::BindGroup; PASSES]; 2],
     ) {
-        let hdr = target(device, "world", width, height);
+        let hdr_texture = target_texture(
+            device,
+            "world",
+            width,
+            height,
+            wgpu::TextureUsages::COPY_SRC,
+        );
+        let hdr = hdr_texture.create_view(&Default::default());
         let glow = [
             target(device, "glow", width / 4, height / 4),
             target(device, "glow", width / 4, height / 4),
@@ -537,14 +561,14 @@ impl Post {
                 }
             })
         });
-        (hdr, glow, groups)
+        (hdr_texture, hdr, glow, groups)
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if (width, height) == self.size {
             return;
         }
-        (self.hdr, self.glow, self.groups) = Self::targets(
+        (self.hdr_texture, self.hdr, self.glow, self.groups) = Self::targets(
             device,
             &self.layout,
             &self.sampler,
