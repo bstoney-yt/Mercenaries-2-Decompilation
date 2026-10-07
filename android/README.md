@@ -20,19 +20,23 @@ Everything else (the mission, HUD, saves, settings) is the PC build's.
 
 ## Copying the game to the phone
 
-1. Install the APK and open it once. It creates its folder and closes or
-   shows only the ground, since the game isn't there yet.
-2. Connect the phone to the PC with a USB cable and allow file transfer.
-3. In Explorer, open the phone's
-   `Internal storage\Android\data\com.bstoney.m2alpha\files` folder.
-4. Copy the `data` folder from your install
-   (`C:\Program Files\EA Games\Mercenaries 2 World in Flames\data`) into it.
-   The `Movies` folder inside it can be left out.
-5. Open the app again.
+Make a folder named `Mercenaries2Alpha` holding the APK and your install's
+`data` folder (`C:\Program Files\EA Games\Mercenaries 2 World in
+Flames\data`; its `Movies` folder can be left out). Then:
 
-Uninstalling the app deletes that folder (and the saves in it).
+1. Connect the phone to the PC by USB, allow file transfer, and drag the
+   `Mercenaries2Alpha` folder onto the phone's `Internal storage`.
+2. On the phone, open it in My Files and tap the APK to install it (allow
+   installs from unknown sources when asked).
+3. Open the app. The first time, it opens the "All files access" page:
+   switch it on (the game reads its files from that folder), then open the
+   app again.
 
-The same folder holds `m2-alpha.log` (what the game reported, the first
+The game also reads from the app's own folder,
+`Internal storage\Android\data\com.bstoney.m2alpha\files`, which needs no
+permission (install and open the app once before copying there).
+
+The game's folder holds `m2-alpha.log` (what the game reported, the first
 place to look when something goes wrong), `m2-alpha-crash.log`, the
 settings file and saves. Arguments the PC build takes on its command line
 (`--no-boot`, `--spawn x,z`, ...) can be written into `m2-alpha-args.txt`

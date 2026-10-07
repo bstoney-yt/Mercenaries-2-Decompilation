@@ -1,47 +1,70 @@
 //! The Android build (`m2-alpha-android`, a phone or tablet with a
 //! keyboard and mouse, as in Samsung DeX): the activity's entry point, the
-//! app's folder, and mouse capture.
+//! game's folder, and mouse capture.
 //!
-//! The game is read from the app's own folder on the phone's storage
-//! (`Android/data/<package>/files`), where the player copies their install's
-//! `data` folder. Settings, saves, the catalogue cache, the log
-//! (`m2-alpha.log`) and crash reports are kept there too. Arguments the
-//! desktop takes on its command line can go in `m2-alpha-args.txt` there.
-//! Movies are skipped: they need `ffmpeg`, which the phone doesn't have.
+//! The game is read from the `Mercenaries2Alpha` folder at the top of the
+//! phone's storage, where the player drags a folder holding the APK and
+//! their install's `data` folder. Reading it needs "all files access",
+//! which the app asks for (by opening its settings page) when it can't read
+//! the game there. The app's own folder (`Android/data/<package>/files`)
+//! works too, without that permission. Settings, saves, the catalogue cache,
+//! the log (`m2-alpha.log`) and crash reports are kept beside the game.
+//! Arguments the desktop takes on its command line can go in
+//! `m2-alpha-args.txt` there. Movies are skipped: they need `ffmpeg`, which
+//! the phone doesn't have.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use jni::JavaVM;
-use jni::objects::JObject;
+use jni::objects::{JObject, JValue};
+use jni::{JNIEnv, JavaVM};
+use m2_engine::Install;
 use winit::event_loop::EventLoop;
 use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::platform::android::activity::AndroidApp;
 
 const ARGS_FILE: &str = "m2-alpha-args.txt";
 const LOG_FILE: &str = "m2-alpha.log";
+/// The folder the player drags onto the phone.
+const SHARED: &str = "/storage/emulated/0/Mercenaries2Alpha";
 
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
-    let home = app
+    let own = app
         .external_data_path()
         .or_else(|| app.internal_data_path());
+    let shared = PathBuf::from(SHARED);
+    let found = [Some(shared.clone()), own.clone()]
+        .into_iter()
+        .flatten()
+        .find(|dir| Install::find(dir).is_ok());
+    let home = found.clone().or(own);
     if let Some(home) = &home {
         let _ = std::fs::create_dir_all(home);
         let _ = std::env::set_current_dir(home);
         log_to(&home.join(LOG_FILE));
     }
     super::keep_crash_reports();
+    if let Some(home) = &home {
+        eprintln!("game folder: {}", home.display());
+    }
+    if found.is_none() {
+        eprintln!(
+            "the game is not in {SHARED} (or it can't be read there): copy the install's data folder there"
+        );
+        if !all_files_access() {
+            eprintln!("asking for all files access; open the game again after allowing it");
+            if let Err(e) = with_activity(ask_all_files_access) {
+                eprintln!("all files access: {e}");
+            }
+        }
+    }
     let mut args: Vec<String> = std::fs::read_to_string(ARGS_FILE)
         .map(|text| text.split_whitespace().map(String::from).collect())
         .unwrap_or_default();
-    if let Some(home) = &home {
-        eprintln!("app folder: {}", home.display());
-        if !args.iter().any(|a| a == "--install") {
-            match m2_engine::Install::find(home) {
-                Ok(_) => args.extend(["--install".into(), home.display().to_string()]),
-                Err(e) => eprintln!("{e}: copy the game's data folder here"),
-            }
-        }
+    if let Some(found) = &found
+        && !args.iter().any(|a| a == "--install")
+    {
+        args.extend(["--install".into(), found.display().to_string()]);
     }
     eprintln!("arguments: {args:?}");
     if let Err(e) = super::run(&args, || EventLoop::builder().with_android_app(app).build()) {
@@ -71,16 +94,9 @@ pub fn capture_pointer(on: bool) {
 }
 
 fn try_capture(on: bool) -> jni::errors::Result<()> {
-    let ctx = ndk_context::android_context();
-    // SAFETY: the context holds the process's JavaVM and the activity, both
-    // alive while the app runs.
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }?;
-    let mut env = vm.attach_current_thread()?;
-    // SAFETY: as above; the activity is a global reference not freed here.
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let result = (|| {
+    with_activity(|env, activity| {
         let window = env
-            .call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])?
+            .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
             .l()?;
         let view = env
             .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
@@ -92,7 +108,67 @@ fn try_capture(on: bool) -> jni::errors::Result<()> {
         };
         env.call_method(&view, method, "()V", &[])?;
         Ok(())
-    })();
+    })
+}
+
+/// Whether the app may read any file on the shared storage (Android 11 and
+/// later ask for this; older ones don't have it).
+fn all_files_access() -> bool {
+    with_activity(|env, _| {
+        env.call_static_method(
+            "android/os/Environment",
+            "isExternalStorageManager",
+            "()Z",
+            &[],
+        )?
+        .z()
+    })
+    .unwrap_or(true)
+}
+
+/// Opens the app's "all files access" settings page.
+fn ask_all_files_access(env: &mut JNIEnv, activity: &JObject) -> jni::errors::Result<()> {
+    let package = env
+        .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
+        .l()?;
+    let package: String = env.get_string(&package.into())?.into();
+    let uri = env.new_string(format!("package:{package}"))?;
+    let uri = env
+        .call_static_method(
+            "android/net/Uri",
+            "parse",
+            "(Ljava/lang/String;)Landroid/net/Uri;",
+            &[JValue::Object(&uri)],
+        )?
+        .l()?;
+    let action = env.new_string("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION")?;
+    let intent = env.new_object(
+        "android/content/Intent",
+        "(Ljava/lang/String;Landroid/net/Uri;)V",
+        &[JValue::Object(&action), JValue::Object(&uri)],
+    )?;
+    env.call_method(
+        activity,
+        "startActivity",
+        "(Landroid/content/Intent;)V",
+        &[JValue::Object(&intent)],
+    )?;
+    Ok(())
+}
+
+/// Runs `f` with the JVM attached to this thread and the activity, clearing
+/// any Java exception it leaves.
+fn with_activity<T>(
+    f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<T>,
+) -> jni::errors::Result<T> {
+    let ctx = ndk_context::android_context();
+    // SAFETY: the context holds the process's JavaVM and the activity, both
+    // alive while the app runs.
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }?;
+    let mut env = vm.attach_current_thread()?;
+    // SAFETY: as above; the activity is a global reference not freed here.
+    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let result = f(&mut env, &activity);
     if env.exception_check().unwrap_or(false) {
         let _ = env.exception_clear();
     }
