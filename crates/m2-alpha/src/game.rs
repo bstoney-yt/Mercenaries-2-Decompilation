@@ -1277,6 +1277,7 @@ fn knock_loose(
         let mut shifted = 0.0;
         let mut keys = world.physics.vehicle_statics(id);
         let mut ploughed = false;
+        let mut down = Vec::new();
         if let (Some(install), Some(place)) = (install, world.physics.vehicle_transform(id)) {
             let crasher = Crasher {
                 place,
@@ -1286,7 +1287,10 @@ fn knock_loose(
             };
             for c in destruction.crash(world, props, install, &crasher) {
                 match c {
-                    Crashed::Down(i) => ploughed |= keys.contains(&StaticKey::Object(i)),
+                    Crashed::Down(i) => {
+                        ploughed |= keys.contains(&StaticKey::Object(i));
+                        down.push(StaticKey::Object(i));
+                    }
                     Crashed::Loose(i) => {
                         if !keys.contains(&StaticKey::Object(i)) {
                             keys.push(StaticKey::Object(i));
@@ -1295,6 +1299,8 @@ fn knock_loose(
                 }
             }
         }
+        // What broke is not knocked loose as well.
+        keys.retain(|k| !down.contains(k));
         for key in keys {
             let loose = match key {
                 StaticKey::Object(i) => world.loose_mass(i),
