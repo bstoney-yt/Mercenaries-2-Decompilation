@@ -81,6 +81,7 @@ pub mod vehicle;
 pub mod vertex;
 pub mod voice;
 pub mod wad;
+pub mod water;
 
 #[cfg(test)]
 mod testutil;
