@@ -4257,8 +4257,10 @@ impl ApplicationHandler for App {
         if to_menu {
             return;
         }
-        if !state.hud.menu && !matches!(event, WindowEvent::KeyboardInput { .. }) {
-            // Keep egui's idea of the window (size, scale) current.
+        if !state.hud.menu {
+            // Keep egui's idea of the window (size, scale) current, and
+            // hand it the keys: the HUD's movies that hold the controls
+            // (the PDA, a fanfare's Enter) take them from its events.
             let _ = state.egui.on_window_event(&state.window, &event);
         }
         match event {
