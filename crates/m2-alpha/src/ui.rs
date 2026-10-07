@@ -89,6 +89,9 @@ pub struct Hud {
     frame: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
     /// The game's own HUD, if its files are there.
     pub game: Option<GameHud>,
+    /// Each frame waits for the game's HUD to draw it (play run offscreen,
+    /// faster than the HUD's scripts would keep up with).
+    pub wait: bool,
 }
 
 impl std::fmt::Debug for Hud {
@@ -125,6 +128,7 @@ impl Hud {
             menu: false,
             frame: None,
             game: None,
+            wait: false,
         }
     }
 
@@ -167,7 +171,11 @@ impl Hud {
                 })
                 .collect();
         }
-        game.update(&self.ctx, state);
+        if self.wait {
+            game.update_and_wait(&self.ctx, state, Duration::from_secs(10));
+        } else {
+            game.update(&self.ctx, state);
+        }
     }
 
     /// Runs the game's HUD `seconds` on `info`, waiting for each step (and
