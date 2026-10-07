@@ -80,6 +80,17 @@
 //!                           (default vzacon001,vza_con001) with its parent
 //!                           template: name, model, components, and what
 //!                           the alpha's world index makes of it
+//! components[:<word>,..]    the template database's components (all, or
+//!                           those whose name holds a word): record count
+//!                           and each field's name (or hash), type, width
+//! scan:<hex>[,..]           every asset of every archive (and every loose
+//!                           file under data) holding all the given words
+//!                           (u32, little-endian): its block, type, name,
+//!                           how often each word appears, and the bytes
+//!                           around the first hit of the first word
+//! dump:<type>[,<name>]      every asset of vz.wad of that type (and name
+//!                           hash): each 4-byte word, 8 a line, as a name,
+//!                           a float or hex
 //! find:<hash>[,..]          names for hashes
 //! hijack                    every template that can be hijacked: its
 //!                           entrances' template, script, point, radius
@@ -355,7 +366,7 @@ fn open(path: &Path) -> Result<AssetSource<BufReader<File>>, Error> {
 /// Template fields whose names appear in no file: guessed, each hashing
 /// to a field of the vehicle, weapon and camera components (the AMX-30's
 /// values read sensibly under them).
-const FIELD_NAMES: [&str; 77] = [
+const FIELD_NAMES: [&str; 91] = [
     "MaxSpeed",
     "Mass",
     "Brake",
@@ -433,6 +444,20 @@ const FIELD_NAMES: [&str; 77] = [
     "EffectTemplate",
     "ParticleTemplate",
     "SoundKey",
+    "Armor",
+    "DamageType",
+    "DamageScale",
+    "DamageMultiplier",
+    "DamageModifier",
+    "BulletDamage",
+    "BulletScale",
+    "ExplosionScale",
+    "Penetration",
+    "ArmorPiercing",
+    "Resistance",
+    "Fudge",
+    "Scale",
+    "Multiplier",
 ];
 
 /// Every name in the archives and data files; with `gather`, what the
@@ -845,10 +870,13 @@ fn main() -> Result<(), Error> {
                 Ok(())
             }
             "vo" => vo_lines(&install, arg),
+            "scan" => scan_words(&install, &names, arg),
+            "dump" => dump_assets(&mut source, &names, arg),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
             "ai" => ai_side(&mut source, &names, arg),
+            "components" => components(&mut source, &names, arg),
             "parents" => parents(&mut source, &names, arg),
             "cues" => cues(&mut source, &names, arg),
             "sounddb" => sounddb(&mut source, &names, arg),
@@ -1149,6 +1177,158 @@ fn voices(install: &Install, names: &Names) -> Result<(), Error> {
 
 /// Finds scripted voice lines (`VO.Cue`'s line names) in the cue tables of
 /// `English.wad`, resident and per mission.
+fn dump_assets<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let mut parts = arg.split(',').filter_map(hex);
+    let Some(ty) = parts.next() else {
+        println!("dump: no type");
+        return Ok(());
+    };
+    let name = parts.next();
+    let index = source.archive().index();
+    let picked: Vec<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == ty && name.is_none_or(|n| n == a.name_hash))
+        .map(|a| a.name_hash)
+        .collect();
+    for h in picked {
+        let data = source.asset(h, ty)?;
+        println!(
+            "asset {ty:08x} {h:08x} {} ({} bytes)",
+            names.show(h),
+            data.len()
+        );
+        for (i, line) in data.chunks(32).enumerate() {
+            let words: Vec<String> = line
+                .chunks(4)
+                .map(|c| {
+                    let mut w = [0u8; 4];
+                    w[..c.len()].copy_from_slice(c);
+                    let v = u32::from_le_bytes(w);
+                    let f = f32::from_le_bytes(w);
+                    match names.get(v).filter(|_| v > 0xffff) {
+                        Some(n) => n.to_owned(),
+                        None if v == 0 => "0".to_owned(),
+                        None if f.is_finite() && (1e-3..1e6).contains(&f.abs()) => format!("{f}"),
+                        None => format!("#{v:x}"),
+                    }
+                })
+                .collect();
+            println!("  +{:04x} {}", i * 32, words.join(" "));
+        }
+    }
+    Ok(())
+}
+
+fn scan_words(install: &Install, names: &Names, arg: &str) -> Result<(), Error> {
+    let words: Vec<u32> = arg.split(',').filter_map(hex).collect();
+    let report = |place: &str, data: &[u8]| {
+        let counts: Vec<usize> = words
+            .iter()
+            .map(|w| {
+                let b = w.to_le_bytes();
+                data.windows(4).filter(|x| *x == b).count()
+            })
+            .collect();
+        if counts.contains(&0) {
+            return;
+        }
+        println!("  {place} ({} bytes): counts {counts:?}", data.len());
+        let b = words[0].to_le_bytes();
+        if let Some(at) = data.windows(4).position(|x| x == b) {
+            let from = at.saturating_sub(64) & !3;
+            let to = (at + 128).min(data.len());
+            for (i, chunk) in data[from..to].chunks(16).enumerate() {
+                let line: Vec<String> = chunk
+                    .chunks(4)
+                    .map(|c| {
+                        let mut w = [0u8; 4];
+                        w[..c.len()].copy_from_slice(c);
+                        let v = u32::from_le_bytes(w);
+                        let f = f32::from_le_bytes(w);
+                        match names.get(v).filter(|_| v > 0xffff) {
+                            Some(n) => format!("{v:08x}({n})"),
+                            None if f.is_finite() && (1e-3..1e6).contains(&f.abs()) => {
+                                format!("{v:08x}({f})")
+                            }
+                            None => format!("{v:08x}"),
+                        }
+                    })
+                    .collect();
+                println!("      +{:06x} {}", from + i * 16, line.join(" "));
+            }
+        }
+    };
+    if words.is_empty() {
+        println!("scan: no words");
+        return Ok(());
+    }
+    let mut wads = Vec::new();
+    let mut loose = Vec::new();
+    let mut stack = vec![install.data.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("wad"))
+            {
+                wads.push(path);
+            } else {
+                loose.push(path);
+            }
+        }
+    }
+    for path in &loose {
+        if let Ok(data) = std::fs::read(path) {
+            report(&path.display().to_string(), &data);
+        }
+    }
+    for path in &wads {
+        let mut source = match open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{}: {e}", path.display());
+                continue;
+            }
+        };
+        let paths: Vec<String> = source
+            .archive()
+            .index()
+            .blocks()
+            .iter()
+            .map(|b| b.path.clone())
+            .collect();
+        for (b, p) in paths.iter().enumerate() {
+            let Ok(decoded) = source.block(b) else {
+                continue;
+            };
+            let Ok(contents) = BlockContents::parse(&decoded) else {
+                report(&format!("{} {p} (whole block)", path.display()), &decoded);
+                continue;
+            };
+            for (e, data) in contents.iter() {
+                let place = format!(
+                    "{} {p} type {:08x} {:08x} {}",
+                    path.file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into()),
+                    e.type_hash,
+                    e.name_hash,
+                    names.show(e.name_hash)
+                );
+                report(&place, data);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn vo_lines(install: &Install, arg: &str) -> Result<(), Error> {
     let lines: Vec<(&str, u32)> = arg
         .split(',')
@@ -4397,6 +4577,49 @@ fn vehicles<R: Read + Seek>(
 /// Templates of the template database whose name holds one of the words,
 /// each with every component it has and that component's fields. Text
 /// fields are not read (a component with one is only listed).
+fn components<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let index = source.archive().index();
+    let Some(hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let data = source.asset(hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    println!("template database: {} components", db.components.len());
+    for c in &db.components {
+        let n = c.name.to_ascii_lowercase();
+        if !words.is_empty() && !words.iter().any(|w| n.contains(w.as_str())) {
+            continue;
+        }
+        let fields: Vec<String> = c
+            .fields
+            .iter()
+            .map(|f| {
+                let name = names
+                    .get(f.name_hash)
+                    .map_or(format!("{:08x}", f.name_hash), str::to_owned);
+                format!("{name}(t{} @{} w{})", f.ty, f.offset, f.bit_width)
+            })
+            .collect();
+        println!("  {} [{}]: {}", c.name, c.count, fields.join(", "));
+    }
+    Ok(())
+}
+
 fn templates<R: Read + Seek>(
     source: &mut AssetSource<R>,
     names: &Names,

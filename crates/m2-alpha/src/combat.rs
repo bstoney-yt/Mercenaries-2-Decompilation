@@ -227,15 +227,22 @@ pub const BOMB: (f32, f32) = (20.0, 100.0);
 pub const BOMB_FRAG: (f32, f32) = (50.0, 300.0);
 const BOMB_FINAL: (f32, f32) = (2.0, 500.0);
 /// What a round does to a vehicle it hits: its bullet template's
-/// `Damage` against the vehicle's health (the carbine's "Carbine Bullet"
-/// 6, the soldiers' "Assault Rifle Bullet" 9, the tank's machine guns'
-/// "Heavy MG Bullet" 15), times its weapon's rating (`WeaponHint`, 0 to 3)
-/// against the vehicle's armour class (none, light, medium, heavy), of 3.
-/// Inferred: the ratings may only steer the AI, but rifles doing nothing
-/// to tanks is the game's.
-const CARBINE_ON_VEHICLE: (f32, [u8; 4]) = (6.0, [3, 1, 0, 0]);
-const RIFLE_ON_VEHICLE: (f32, [u8; 4]) = (9.0, [3, 1, 0, 0]);
-const MG_ON_VEHICLE: (f32, [u8; 4]) = (15.0, [3, 2, 1, 0]);
+/// `Damage` (the carbine's "Carbine Bullet" 6, the soldiers' "Assault
+/// Rifle Bullet" 9, both `DamageKey` `Bullet`; the tank's and jeeps'
+/// machine guns' "Heavy MG Bullet" 15, `BulletLarge`) times what the
+/// game's damage table gives the vehicle's `ModifierKey` for that kind
+/// (a `Car` takes 0.025 of a `Bullet`, 0.1 of a `BulletLarge`; a `Tank`
+/// nothing). A vehicle the table doesn't cover takes nothing.
+const CARBINE_ON_VEHICLE: (f32, Round) = (6.0, Round::Bullet);
+const RIFLE_ON_VEHICLE: (f32, Round) = (9.0, Round::Bullet);
+const MG_ON_VEHICLE: (f32, Round) = (15.0, Round::BulletLarge);
+
+/// A round's `DamageKey`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Round {
+    Bullet,
+    BulletLarge,
+}
 /// A blast's damage to vehicles (the "Explosion (Tank Shell)" and RPG's:
 /// 200 at its heart down to 50 at 5 m, nothing beyond), times the
 /// vehicle's `ExplosionFudge` (the AMX-30 takes a fifth).
@@ -1854,7 +1861,7 @@ impl Combat {
         &mut self,
         f: &mut Field<'_>,
         (from, dir, t): (Vec3, Vec3, f32),
-        (damage, rating): (f32, [u8; 4]),
+        (damage, round): (f32, Round),
         own: Option<VehicleId>,
     ) {
         let Some((_, Some(id))) = f.physics.cast_ray_vehicle(from, dir, t + 0.05, own) else {
@@ -1862,8 +1869,11 @@ impl Combat {
         };
         if let Some(i) = f.vehicles.iter().position(|v| v.id == Some(id)) {
             let v = &mut f.vehicles[i];
-            let class = v.spec.tuning.armour.map_or(0, |a| a as usize - 1).min(3);
-            let damage = damage * f32::from(rating[class]) / 3.0;
+            let scale = v.spec.tuning.rounds.map_or(0.0, |r| match round {
+                Round::Bullet => r.bullet,
+                Round::BulletLarge => r.bullet_large,
+            });
+            let damage = damage * scale;
             if damage > 0.0 {
                 self.hurt_vehicle(f.physics, v, i, damage);
             }
@@ -2955,7 +2965,7 @@ mod tests {
     #[test]
     fn a_tank_fires_no_more_shells_than_its_cannon_carries() {
         use m2_engine::VehicleSpec;
-        use m2_engine::tuning::{GunTuning, VehicleTuning};
+        use m2_engine::tuning::{GunTuning, RoundScale, VehicleTuning};
         use m2_engine::vehicle::WheelSpec;
         let mut physics = ground();
         let dt = 1.0 / 60.0;
@@ -3059,6 +3069,8 @@ mod tests {
         let t = &mut vehicles[0].spec.tuning;
         (t.health, t.armour, t.blast_scale, t.burns_below) =
             (Some(125.0), Some(4), Some(0.2), Some(30.0));
+        // The damage table's `Tank` row: rounds do nothing.
+        t.rounds = Some(RoundScale::default());
         assert_eq!(vehicles[0].health(), 100.0);
         let mut field = Field {
             physics: &mut physics,
@@ -3076,9 +3088,15 @@ mod tests {
         let hit = field.vehicles[0].health();
         assert!((60.0..90.0).contains(&hit), "{hit}");
         assert!(!field.vehicles[0].wrecked);
-        // Lightly armoured, the rifle tells; burning, it goes in the end.
-        field.vehicles[0].spec.tuning.armour = Some(1);
+        // A `Car`, the carbine tells, a fortieth of a round at a time;
+        // burning, it goes in the end.
+        field.vehicles[0].spec.tuning.rounds = Some(RoundScale {
+            bullet: 0.025,
+            bullet_large: 0.1,
+        });
+        let before = field.vehicles[0].damage;
         combat.round_on_vehicle(&mut field, side, CARBINE_ON_VEHICLE, None);
+        assert!((field.vehicles[0].damage - before - 0.15).abs() < 1e-4);
         assert!(field.vehicles[0].health() < hit);
         field.vehicles[0].damage = 100.0;
         for _ in 0..60 * 15 {

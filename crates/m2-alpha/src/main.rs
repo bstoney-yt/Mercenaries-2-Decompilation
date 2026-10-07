@@ -2977,8 +2977,8 @@ fn drive_for_screenshot(
             ))
         );
         eprintln!(
-            "drive: health {:?}, armour {:?}, blasts x{:?}, burns below {:?}",
-            t.health, t.armour, t.blast_scale, t.burns_below
+            "drive: health {:?}, armour {:?}, blasts x{:?}, burns below {:?}, rounds x{:?}",
+            t.health, t.armour, t.blast_scale, t.burns_below, t.rounds
         );
         let templated = game
             .scene
