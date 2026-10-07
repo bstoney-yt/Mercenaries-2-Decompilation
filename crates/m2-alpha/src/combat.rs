@@ -154,6 +154,9 @@ const CANNON_RELOAD: f32 = 2.5;
 const LAID: f32 = 0.06;
 const SHELL_SPEED: f32 = 150.0;
 const MG_GAP: f32 = 0.09;
+/// A tank's machine gun beside its cannon, which the aim button fires: the
+/// AMX-30's linked machine gun fires 450 rounds a minute (its template).
+const TANK_MG_GAP: f32 = 60.0 / 450.0;
 const MG_DAMAGE: f32 = 45.0;
 const MG_RANGE: f32 = 500.0;
 /// Gunfire puts soldiers this close on alert and sends civilians running.
@@ -789,6 +792,8 @@ pub struct Combat {
     pub revived: bool,
     quiet: f32,
     reload: f32,
+    /// Seconds until a tank's machine gun fires again.
+    mg_reload: f32,
     aim_left: f32,
     /// Seconds until the grenade she is throwing leaves her hand.
     throw_in: Option<f32>,
@@ -857,6 +862,7 @@ impl Default for Combat {
             revived: false,
             quiet: 0.0,
             reload: 0.0,
+            mg_reload: 0.0,
             aim_left: 0.0,
             throw_in: None,
             bash_in: None,
@@ -1147,6 +1153,7 @@ impl Combat {
         }
         self.effects.retain(|e| e.1 > 0.0);
         self.reload -= dt;
+        self.mg_reload -= dt;
         self.aim_left -= dt;
         self.quiet += dt;
 
@@ -1228,7 +1235,14 @@ impl Combat {
             && trigger.fire
             && self.reload <= 0.0
         {
-            self.vehicle_fire(f, i);
+            self.vehicle_fire(f, i, false);
+        }
+        if let Some(i) = f.player.driving
+            && self.down <= 0.0
+            && trigger.aim
+            && self.mg_reload <= 0.0
+        {
+            self.vehicle_fire(f, i, true);
         }
         // Changing the clip, she lowers the rifle.
         let holding = on_foot && (trigger.aim || self.aim_left > 0.0) && self.changing.is_none();
@@ -1563,21 +1577,24 @@ impl Combat {
     /// Fires the gun on the turret of vehicle `i`, which she drives, at
     /// what the crosshair is on: a cannon (a tank's, the Stryker's) fires
     /// a shell that bursts like a rocket, anything else's a machine gun.
-    fn vehicle_fire(&mut self, f: &mut Field<'_>, i: usize) {
+    /// Fires the gun of vehicle `i` she drives, or with `coax` the machine
+    /// gun beside a tank's cannon (along it).
+    fn vehicle_fire(&mut self, f: &mut Field<'_>, i: usize, coax: bool) {
         let Some(v) = f.vehicles.get(i) else {
             return;
         };
         let (Some(id), Some(muzzle), false) = (v.id, v.spec.muzzle, v.wrecked) else {
             return;
         };
-        // A cannon with no shells left is silent.
-        if v.rounds() == Some(0) {
+        let cannon = v.spec.cannon();
+        // A cannon with no shells left is silent; only a tank has a
+        // machine gun beside its gun.
+        if (!coax && v.rounds() == Some(0)) || (coax && !cannon) {
             return;
         }
         let Some(body) = f.physics.vehicle_transform(id) else {
             return;
         };
-        let cannon = v.spec.cannon();
         let gun = v.spec.tuning.gun;
         let (from, barrel) = v
             .spec
@@ -1596,7 +1613,7 @@ impl Combat {
         } else {
             barrel
         };
-        if cannon {
+        if cannon && !coax {
             // Its template's rate of fire (45 a minute for the AMX-30's)
             // and shell speed (72 m/s).
             self.reload = gun.map_or(CANNON_RELOAD, |g| 60.0 / g.rate_of_fire.max(1.0));
@@ -1636,7 +1653,11 @@ impl Combat {
             );
             self.sounds.push(Sound::Cannon(from));
         } else {
-            self.reload = MG_GAP;
+            if coax {
+                self.mg_reload = TANK_MG_GAP;
+            } else {
+                self.reload = MG_GAP;
+            }
             let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
             let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
             self.effect(Effect::Tracer { from, to }, 0.07);
