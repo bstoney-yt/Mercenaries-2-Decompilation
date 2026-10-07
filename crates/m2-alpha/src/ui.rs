@@ -231,7 +231,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
     }
     let time = ctx.input(|i| i.time);
     if let Some(view) = info.support.satellite {
-        satellite(&painter, screen, info, view, time, &text);
+        satellite(&painter, screen, info, view, &text);
         return;
     }
     if time < HINT_TIME && info.playing {
@@ -491,9 +491,9 @@ fn flash(ctx: &egui::Context, screen: egui::Rect, strength: f32) {
 const TICK: f32 = 10.0;
 const RULER: f32 = 20.0;
 
-/// The satellite's view, as round 93's videos show it: grey and grainy,
-/// rulers along the top (x) and the left (z, north up) marking where the
-/// view's middle is, a crosshair, the operation's time and cost, the
+/// The satellite's view, as round 93's videos show it (its grey and
+/// grain are the post pass's): rulers along the top (x) and the left (z,
+/// north up) marking where the view's middle is, a crosshair, the operation's time and cost, the
 /// objective, the keys, and once the target is confirmed the timing
 /// wheel. `view` is the view's middle on the ground, seconds since it
 /// opened and the cost ($K).
@@ -502,19 +502,12 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     screen: egui::Rect,
     info: &HudInfo,
     (middle, open, cost): (Vec3, f32, f32),
-    time: f64,
     text: &T,
 ) {
     let white = Color32::from_gray(235);
     let gold = Color32::from_rgb(255, 200, 0);
     let ink = Color32::from_white_alpha(200);
-    // Grey over the colours, and grain.
-    painter.rect_filled(
-        screen,
-        0.0,
-        Color32::from_rgba_unmultiplied(118, 118, 112, 120),
-    );
-    grain(painter, screen, time);
+    // Its grey and grain are the post pass's (`game::satellite_look`).
 
     // The rulers, and on each the view's middle.
     // Short, as round 95 saw them in the videos: a third of the width
@@ -767,29 +760,6 @@ fn wheel(painter: &egui::Painter, c: egui::Pos2, r: f32, w: &WheelHud) {
             painter.line_segment([c + vec2(-s, s), c + vec2(s, -s)], red);
         }
         None => {}
-    }
-}
-
-/// The satellite picture's grain: specks light and dark, new each frame.
-fn grain(painter: &egui::Painter, screen: egui::Rect, time: f64) {
-    // A xorshift from the frame's time.
-    let mut s = ((time * 30.0) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    for _ in 0..700 {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        let x = (s & 0xffff) as f32 / 65535.0;
-        let y = ((s >> 16) & 0xffff) as f32 / 65535.0;
-        let colour = if s >> 63 == 1 {
-            Color32::from_white_alpha(45)
-        } else {
-            Color32::from_black_alpha(55)
-        };
-        let at = pos2(
-            screen.left() + x * screen.width(),
-            screen.top() + y * screen.height(),
-        );
-        painter.rect_filled(Rect::from_min_size(at, vec2(2.0, 2.0)), 0.0, colour);
     }
 }
 
@@ -1081,8 +1051,12 @@ mod tests {
         info.support.satellite = None;
         info.support.wheel = None;
         hud.build(headless_input(800, 600, 0.1), &info, &mut config);
-        // The view's rulers, grain and wheel are many more shapes than the
-        // HUD on foot.
-        assert!(vertices(&hud) * 2 < viewing, "{} {viewing}", vertices(&hud));
+        // The view's rulers and wheel are more shapes than the HUD on foot
+        // (its grain is the post pass's).
+        assert!(
+            vertices(&hud) * 3 < viewing * 2,
+            "{} {viewing}",
+            vertices(&hud)
+        );
     }
 }

@@ -25,6 +25,8 @@
 //! - [`sound`]: sound banks (16-bit PCM sound effects and ambience).
 //! - [`terrain`]: the 400 m terrain cells and low-resolution tiles.
 //! - [`scatter`]: the grass and shrub clumps instanced over each cell.
+//! - [`tree`]: the tree table: each species' template, fade and crown
+//!   card, and the island's trees, bit-packed in a kd-tree per species.
 //! - [`layer`]: entity layers, the component tables that place terrain,
 //!   buildings, props and everything else in the world.
 //! - [`material_animation`]: material animations (keyed material
@@ -63,6 +65,7 @@ pub mod sound;
 pub mod strings;
 pub mod terrain;
 pub mod texture;
+pub mod tree;
 pub mod ucfx;
 pub mod vehicle;
 pub mod vertex;
@@ -91,6 +94,7 @@ pub use voice::{CueTable, Group, VoiceError};
 
 pub use terrain::{LowResTile, TerrainCell, TerrainError};
 pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};
+pub use tree::{TreeError, TreeTable};
 pub use ucfx::{Section, Ucfx, UcfxError};
 pub use vertex::{VertexDecl, VertexError, VertexStream};
 pub use wad::{Asset, Block, Header, WadArchive, WadError, WadIndex};

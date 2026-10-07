@@ -1064,6 +1064,8 @@ pub(crate) mod tests {
             collision: None,
             members: Vec::new(),
             hidden: Default::default(),
+            textures: Vec::new(),
+            tiny_members: Vec::new(),
             breakup: None,
         };
         let mut backend = m2_render::NullBackend::default();

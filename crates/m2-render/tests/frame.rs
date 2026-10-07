@@ -45,6 +45,7 @@ fn call(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32) -> DrawCal
         world: Mat4::IDENTITY,
         skin: None,
         instances: None,
+        uv_offset: [0.0; 2],
     }
 }
 

@@ -9,6 +9,7 @@
 //! cargo run -p m2-assets --example wad -- dds     <archive.wad> <texture name> <out.dds>
 //! cargo run -p m2-assets --example wad -- models  <archive.wad>
 //! cargo run -p m2-assets --example wad -- obj     <archive.wad> <model hash> <out.obj> [lod]
+//! cargo run -p m2-assets --example wad -- material <archive.wad> <material hash>
 //! cargo run -p m2-assets --example wad -- anims   <archive.wad>
 //! cargo run -p m2-assets --example wad -- world   <archive.wad>
 //! cargo run -p m2-assets --example wad -- entities <archive.wad>
@@ -26,6 +27,10 @@
 //! `models` parses every model with its streamed chunks and checks indices,
 //! bounds and bone palettes; `obj` writes one level of detail of one model
 //! (by its name hash in hex) as a Wavefront `.obj` file, in model space.
+//! `material` finds every model drawing with a material (by its name hash
+//! in hex) and describes it: flags, levels of detail, segments, and for
+//! each primitive group using the material its geometry kind, vertex
+//! elements and the range of every element's values (no vertex data).
 //! `anims` decodes every animation clip, finds a model whose nodes cover its
 //! tracks, and checks quaternion lengths, frame rates, the first frame
 //! against the model's bind pose, and that sampled poses are finite; it
@@ -201,6 +206,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {} bytes to {out}", dds.len());
         }
         ("models", []) => models(&mut wad)?,
+        ("material", [hash]) => material_users(&mut wad, u32::from_str_radix(hash, 16)?)?,
         ("anims", []) => anims(&mut wad)?,
         ("world", []) => world(&mut wad)?,
         ("entities", []) => entities(&mut wad)?,
@@ -650,6 +656,131 @@ fn models<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         "{} models, {chunks} streamed chunks, {groups} primitive groups, {errors} errors, {warnings} warnings",
         all.len()
     );
+    Ok(())
+}
+
+/// Describes every model drawing with the material named `material`.
+fn material_users<R: Read + Seek>(wad: &mut WadArchive<R>, material: u32) -> AnyResult<()> {
+    let mut all: HashMap<u32, ModelBytes> = HashMap::new();
+    for block in 0..wad.index().blocks().len() {
+        let _ = collect_models(wad, block, None, &mut all);
+    }
+    let mut hashes: Vec<u32> = all.keys().copied().collect();
+    hashes.sort_unstable();
+    let mut shown = 0;
+    for hash in hashes {
+        let Some(bytes) = all.get_mut(&hash) else {
+            continue;
+        };
+        let path = bytes.path.clone();
+        let Ok(model) = bytes.assemble() else {
+            continue;
+        };
+        let Some(index) = model.materials.iter().position(|m| m.name_hash == material) else {
+            continue;
+        };
+        shown += 1;
+        if shown > 6 {
+            println!("{hash:08x} {path} (more not described)");
+            continue;
+        }
+        let m = &model.materials[index];
+        println!(
+            "\n== model {hash:08x} {path}: flags {:#x}, lods {}, lod distance {}, nodes {}, materials {}, tiny members {}",
+            model.info.flags,
+            model.info.lod_count,
+            model.info.lod_distance,
+            model.nodes.len(),
+            model.materials.len(),
+            model.tiny_members().len(),
+        );
+        println!(
+            "material {index}: technique {:08x}, flags {:04x}, textures {:08x?}, constants {:?}",
+            m.technique, m.flags, m.textures, m.constants
+        );
+        for s in &model.segments {
+            let kind = model.geometry(s.slot).map(|g| format!("{:?}", g.kind));
+            println!(
+                "segment node {} slot {} lod mask {:#04b} {}",
+                s.node,
+                s.slot,
+                s.lod_mask,
+                kind.unwrap_or_else(|| "(not loaded)".into())
+            );
+        }
+        for slot in 0..model.info.slot_count as u8 {
+            let Some(g) = model.geometry(slot) else {
+                continue;
+            };
+            for (gi, group) in g.groups.iter().enumerate() {
+                let uses: Vec<String> = group
+                    .material_ranges
+                    .iter()
+                    .map(|r| format!("{}:{}", r.material, r.index_count()))
+                    .collect();
+                if !group
+                    .material_ranges
+                    .iter()
+                    .any(|r| r.material as usize == index)
+                {
+                    println!(
+                        "slot {slot} group {gi}: {:?}, ranges (material:indices) {}",
+                        g.kind,
+                        uses.join(" ")
+                    );
+                    continue;
+                }
+                println!(
+                    "slot {slot} group {gi}: {:?}, {} vertices, stride {}, ranges (material:indices) {}",
+                    g.kind,
+                    group.vertices.count,
+                    group.vertices.stride,
+                    uses.join(" ")
+                );
+                for e in group.decl.elements() {
+                    let Some(values) = group.vertices.read(e) else {
+                        println!(
+                            "  {:?}{} {:?} at {}: unreadable",
+                            e.usage, e.usage_index, e.ty, e.offset
+                        );
+                        continue;
+                    };
+                    let mut lo = [f32::MAX; 4];
+                    let mut hi = [f32::MIN; 4];
+                    let mut distinct_w = std::collections::BTreeSet::new();
+                    for v in &values {
+                        for c in 0..4 {
+                            lo[c] = lo[c].min(v[c]);
+                            hi[c] = hi[c].max(v[c]);
+                        }
+                        distinct_w.insert(v[3].to_bits());
+                    }
+                    let outside = if e.usage == DeclUsage::TexCoord {
+                        let n = values
+                            .iter()
+                            .filter(|v| {
+                                !(0.0..=1.0).contains(&v[0]) || !(0.0..=1.0).contains(&v[1])
+                            })
+                            .count();
+                        format!(", {n} outside 0..1")
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "  {:?}{} {:?} at {}: min {:.3?} max {:.3?}, {} distinct w{outside}",
+                        e.usage,
+                        e.usage_index,
+                        e.ty,
+                        e.offset,
+                        lo,
+                        hi,
+                        distinct_w.len()
+                    );
+                }
+            }
+        }
+    }
+    println!("\n{shown} models use material {material:08x}");
     Ok(())
 }
 

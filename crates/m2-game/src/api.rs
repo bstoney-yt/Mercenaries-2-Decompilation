@@ -147,6 +147,15 @@ pub enum Command {
     /// game goes into it, and sets [`ScriptWorld::game_state`] back to
     /// `"Game"` when it is done (the world has streamed in).
     GameState(String),
+    /// Put an atmosphere region (`rgn_atmo_carmonaislandrain`) on its
+    /// record named `setting` (`"night"`).
+    Atmosphere {
+        region: u32,
+        setting: String,
+    },
+    /// Atmosphere changes from now on happen at once (true) or ease in
+    /// over their records' time (false).
+    AtmosphereImmediate(bool),
     /// A call the game only needs to hear about: `"Pg.SaveGame"`,
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
@@ -1280,6 +1289,32 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&sound, "GetAudioDir", |_, lua, _| {
         values([Value::String(lua.create_string(r"data\Audios")?)])
     })?;
+    // `Graphics.Atmosphere`: the light of a line region, by the name of
+    // one of its records.
+    let graphics = lib("Graphics")?;
+    let atmosphere = match graphics.raw_get::<Value>("Atmosphere")? {
+        Value::Table(t) if t.metatable().is_none() => t,
+        _ => {
+            let t = lua.create_table()?;
+            graphics.raw_set("Atmosphere", &t)?;
+            t
+        }
+    };
+    add(&atmosphere, "ChangeLineRegionSetting", |w, _, a| {
+        if let (Some(region), Some(Value::String(s))) = (id(a.first()), a.get(1)) {
+            w.commands.push(Command::Atmosphere {
+                region,
+                setting: s.to_string_lossy(),
+            });
+        }
+        values([])
+    })?;
+    add(&atmosphere, "EnableImmediatelyChangeMode", |w, _, a| {
+        if let Some(Value::Boolean(on)) = a.first() {
+            w.commands.push(Command::AtmosphereImmediate(*on));
+        }
+        values([])
+    })?;
     let gui = lib("Gui")?;
     add(&gui, "GetLanguageName", |_, lua, _| {
         values([Value::String(lua.create_string("english")?)])
@@ -2027,6 +2062,32 @@ mod tests {
         assert_eq!(
             w.take_commands(),
             [Command::Notify("Pg.ContractActivated".into())]
+        );
+    }
+
+    #[test]
+    fn atmosphere_calls_reach_the_game_and_the_rest_are_stubs() {
+        let (host, world) = setup();
+        host.complete_libraries(&LIBRARIES).unwrap();
+        host.lua()
+            .load(
+                r#"
+                Graphics.Atmosphere.EnableImmediatelyChangeMode(true)
+                Graphics.Atmosphere.SetSky("afternoon")
+                Graphics.Atmosphere.ChangeLineRegionSetting(Pg.GetGuidByName("Mattias"), "night")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [
+                Command::AtmosphereImmediate(true),
+                Command::Atmosphere {
+                    region: 1,
+                    setting: "night".into()
+                }
+            ]
         );
     }
 

@@ -1406,6 +1406,14 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        Command::Atmosphere { region, setting } => {
+            game.atmosphere_setting(*region, setting);
+            return false;
+        }
+        Command::AtmosphereImmediate(on) => {
+            game.sky.immediate = *on;
+            return false;
+        }
         // A state layer in or out: its models and people with it.
         Command::Layer { op, name } => {
             let entities: Vec<u32> = mission
