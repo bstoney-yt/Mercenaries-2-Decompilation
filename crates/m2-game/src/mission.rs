@@ -1016,6 +1016,15 @@ end
         }
     }
 
+    /// The player pressed the GUI's button `name` (`"selection"`), for
+    /// the scripts' `Button` events.
+    pub fn press_button(&mut self, name: &str) {
+        let mut w = self.world.borrow_mut();
+        w.buttons.push((self.now, name.to_ascii_lowercase()));
+        let extra = w.buttons.len().saturating_sub(16);
+        w.buttons.drain(..extra);
+    }
+
     /// Everything the scripts asked the game to do since the last call.
     pub fn take_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.outbox)
@@ -1448,5 +1457,30 @@ mod tests {
         let half = std::f32::consts::FRAC_PI_4;
         let q = [0.0, half.sin(), 0.0, half.cos()];
         assert!((yaw(q) - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_button_event_fires_on_its_press_after_it_was_made() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.press_button("selection");
+        m.tick(0.1);
+        m.run(
+            r#"
+            skipped = 0
+            Event.Create(Event.Button, { Player.GetLocalPlayer(), "selection", "press", true },
+                function() skipped = skipped + 1 end)
+            "#,
+            "test",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.press_button("cancel");
+        m.tick(0.1);
+        let skipped = |m: &Mission| m.host.lua().globals().get::<i64>("skipped").unwrap();
+        assert_eq!(skipped(&m), 0);
+        m.press_button("Selection");
+        m.tick(0.1);
+        m.tick(0.1);
+        assert_eq!(skipped(&m), 1);
     }
 }
