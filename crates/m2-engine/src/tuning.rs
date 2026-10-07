@@ -37,6 +37,9 @@ pub struct VehicleTuning {
     /// Health below which it burns down by itself (`TickDamage`'s field
     /// 9a6663a4: the AMX-30's 30).
     pub burns_below: Option<f32>,
+    /// What rounds do to it, of their damage, by its `ModifierKey` in the
+    /// game's damage table (an M151's `Car`: a rifle round a fortieth).
+    pub rounds: Option<RoundScale>,
     pub turret: Option<TurretTuning>,
     pub camera: Option<TankCamera>,
     pub gun: Option<GunTuning>,
@@ -57,6 +60,80 @@ pub struct TurretTuning {
     pub pitch: (f32, f32),
     pub pitch_speed: f32,
     pub pitch_accel: f32,
+}
+
+/// The damage table's scale for the two kinds of round: `Bullet` (rifles,
+/// carbines) and `BulletLarge` (heavy machine guns).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RoundScale {
+    pub bullet: f32,
+    pub bullet_large: f32,
+}
+
+/// The game's damage table, asset `ModifierKey` (type de982d61, in the
+/// resident block): what each kind of damage (a round's or blast's
+/// `DamageKey`: `Bullet`, `Rocket`, `MeleeBash`, ...) does to each kind
+/// of target (its `ModifierKey`: `Car`, `Tank`, `Human`, ...), of the
+/// damage. A `Car` takes 0.025 of a `Bullet`, 0.1 of a `BulletLarge`, a
+/// `Tank` nothing of either.
+///
+/// Layout (round 160): rows at +0x48 and columns at +0x4c (u32), from
+/// +0x50 the rows' keys then the columns' (name hashes), then a float a
+/// cell, row by row.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DamageTable {
+    rows: Vec<u32>,
+    columns: Vec<u32>,
+    cells: Vec<f32>,
+}
+
+/// The damage table's asset type.
+pub const DAMAGE_TABLE_TYPE: u32 = 0xde98_2d61;
+/// The damage table's asset name.
+pub const DAMAGE_TABLE: &str = "ModifierKey";
+
+impl DamageTable {
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let word = |at: usize| -> Option<u32> {
+            let b = data.get(at..at + 4)?;
+            Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let (rows, columns) = (word(0x48)? as usize, word(0x4c)? as usize);
+        if rows == 0 || columns == 0 || rows * columns > 1 << 16 {
+            return None;
+        }
+        let keys = 0x50;
+        let cells = keys + 4 * (rows + columns);
+        let words = |from: usize, n: usize| {
+            (0..n)
+                .map(|i| word(from + 4 * i))
+                .collect::<Option<Vec<_>>>()
+        };
+        Some(Self {
+            rows: words(keys, rows)?,
+            columns: words(keys + 4 * rows, columns)?,
+            cells: words(cells, rows * columns)?
+                .into_iter()
+                .map(f32::from_bits)
+                .collect(),
+        })
+    }
+
+    /// What damage of kind `damage` does to a target of kind `target`, of
+    /// the damage (name hashes of the keys).
+    pub fn scale(&self, target: u32, damage: u32) -> Option<f32> {
+        let r = self.rows.iter().position(|&k| k == target)?;
+        let c = self.columns.iter().position(|&k| k == damage)?;
+        self.cells.get(r * self.columns.len() + c).copied()
+    }
+
+    /// The rounds' scales for a target of kind `target`.
+    pub fn rounds(&self, target: u32) -> Option<RoundScale> {
+        Some(RoundScale {
+            bullet: self.scale(target, name_hash("Bullet"))?,
+            bullet_large: self.scale(target, name_hash("BulletLarge"))?,
+        })
+    }
 }
 
 /// A `CameraTank`: the camera of the seat that turns the turret, which
@@ -209,7 +286,8 @@ impl<'a> Table<'a> {
 }
 
 /// The tuning of every template the database gives any, by template id.
-pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
+/// `damage` is the game's damage table, if found.
+pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, VehicleTuning> {
     let tank = Table::new(db, "_TankPhysics");
     let car = Table::new(db, "_CarPhysicsV2");
     // A boat's, if it names them as the others do.
@@ -221,6 +299,7 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
     let hint = Table::new(db, "ObjectHint");
     let fudge = Table::new(db, "ExplosionFudge");
     let tick = Table::new(db, "TickDamage");
+    let modifier = Table::new(db, "ModifierKey");
     let guns = Guns {
         weapon: Table::new(db, "WeaponProjectileBase"),
         effects: Table::new(db, "WeaponEffects"),
@@ -259,6 +338,14 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
                     .filter(|a| (1..=4).contains(a)),
                 blast_scale: fudge.number(id, BLAST_SCALE),
                 burns_below: tick.number(id, BURNS_BELOW),
+                // The whole vehicle's key: its record with no `Name` (the
+                // named ones are parts).
+                rounds: modifier
+                    .of_template(id)
+                    .iter()
+                    .find(|r| modifier.word(r, name_hash("Name")).is_none_or(|n| n == 0))
+                    .and_then(|r| modifier.word(r, name_hash("ModifierKey")))
+                    .and_then(|key| damage?.rounds(key)),
                 turret: (|| {
                     let named = turret.named(id, MAIN_TURRET);
                     let r = match (named, turret.of_template(id)) {
@@ -380,8 +467,45 @@ mod tests {
             ("SeatName", 0xbdd7_64f3),
             ("seat_gunner", 0xb7b9_67d0),
             ("seat_passenger_rr", 0x300a_f37e),
+            ("Bullet", 0x74fd_1ba9),
+            ("BulletLarge", 0x7f01_0e06),
+            ("Car", 0xce27_c791),
+            (DAMAGE_TABLE, 0x99c2_b81f),
         ] {
             assert_eq!(name_hash(name), key, "{name}");
         }
+    }
+
+    // A table laid out as the game's: two targets, three kinds of damage.
+    #[test]
+    fn the_damage_table_reads_a_cell_by_its_keys() {
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(2);
+        put(3);
+        let (car, tank) = (name_hash("Car"), name_hash("Tank"));
+        let (bullet, large, rocket) = (
+            name_hash("Bullet"),
+            name_hash("BulletLarge"),
+            name_hash("Rocket"),
+        );
+        for k in [car, tank, bullet, large, rocket] {
+            put(k);
+        }
+        for v in [0.025f32, 0.1, 1.0, 0.0, 0.0, 0.2] {
+            put(v.to_bits());
+        }
+        let t = DamageTable::parse(&data).expect("parses");
+        assert_eq!(t.scale(car, rocket), Some(1.0));
+        assert_eq!(t.scale(tank, rocket), Some(0.2));
+        assert_eq!(
+            t.rounds(car),
+            Some(RoundScale {
+                bullet: 0.025,
+                bullet_large: 0.1
+            })
+        );
+        assert_eq!(t.scale(name_hash("Human"), bullet), None);
+        assert!(DamageTable::parse(&data[..data.len() - 1]).is_none());
     }
 }
