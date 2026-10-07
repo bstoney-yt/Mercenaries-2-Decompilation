@@ -70,6 +70,9 @@
 //!                           (default vzacon001,vza_con001) with its parent
 //!                           template: name, model, components, and what
 //!                           the alpha's world index makes of it
+//! components[:<word>,..]    the template database's components (all, or
+//!                           those whose name holds a word): record count
+//!                           and each field's name (or hash), type, width
 //! find:<hash>[,..]          names for hashes
 //! cues[:<name>,..]          which bank sounds the clips' sound events
 //!                           (and the names given) play: each name tried
@@ -325,7 +328,7 @@ fn open(path: &Path) -> Result<AssetSource<BufReader<File>>, Error> {
 /// Template fields whose names appear in no file: guessed, each hashing
 /// to a field of the vehicle, weapon and camera components (the AMX-30's
 /// values read sensibly under them).
-const FIELD_NAMES: [&str; 50] = [
+const FIELD_NAMES: [&str; 66] = [
     "MaxSpeed",
     "Mass",
     "Brake",
@@ -376,6 +379,22 @@ const FIELD_NAMES: [&str; 50] = [
     "MuzzleFlashHardpoint",
     "Velocity",
     "GravityScale",
+    "Armor",
+    "Damage",
+    "DamageType",
+    "DamageScale",
+    "DamageMultiplier",
+    "DamageModifier",
+    "BulletDamage",
+    "BulletScale",
+    "ExplosionScale",
+    "Penetration",
+    "ArmorPiercing",
+    "MaxDamage",
+    "Resistance",
+    "Fudge",
+    "Scale",
+    "Multiplier",
 ];
 
 /// Every name in the archives and data files; with `gather`, what the
@@ -784,6 +803,7 @@ fn main() -> Result<(), Error> {
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
+            "components" => components(&mut source, &names, arg),
             "parents" => parents(&mut source, &names, arg),
             "cues" => cues(&mut source, &names, arg),
             "sounddb" => sounddb(&mut source, &names, arg),
@@ -4232,6 +4252,49 @@ fn vehicles<R: Read + Seek>(
 /// Templates of the template database whose name holds one of the words,
 /// each with every component it has and that component's fields. Text
 /// fields are not read (a component with one is only listed).
+fn components<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let index = source.archive().index();
+    let Some(hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let data = source.asset(hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&data)?;
+    println!("template database: {} components", db.components.len());
+    for c in &db.components {
+        let n = c.name.to_ascii_lowercase();
+        if !words.is_empty() && !words.iter().any(|w| n.contains(w.as_str())) {
+            continue;
+        }
+        let fields: Vec<String> = c
+            .fields
+            .iter()
+            .map(|f| {
+                let name = names
+                    .get(f.name_hash)
+                    .map_or(format!("{:08x}", f.name_hash), str::to_owned);
+                format!("{name}(t{} @{} w{})", f.ty, f.offset, f.bit_width)
+            })
+            .collect();
+        println!("  {} [{}]: {}", c.name, c.count, fields.join(", "));
+    }
+    Ok(())
+}
+
 fn templates<R: Read + Seek>(
     source: &mut AssetSource<R>,
     names: &Names,
