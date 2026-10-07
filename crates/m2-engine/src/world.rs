@@ -134,6 +134,11 @@ pub struct Templates {
     pub tuning: HashMap<u32, VehicleTuning>,
     /// What templates leave when destroyed, and what pickups give.
     pub leavings: Leavings,
+    /// Each template's `Health`, by id, where it has one.
+    pub health: HashMap<u32, f32>,
+    /// Each person template's walk, run and sprint speeds, by id
+    /// ([`crate::tuning::human_speeds`]).
+    pub speeds: HashMap<u32, [f32; 3]>,
 }
 
 impl Templates {
@@ -173,6 +178,21 @@ impl Templates {
             None => self.by_name.get(&name.to_ascii_lowercase())?,
         };
         Some((name, info))
+    }
+
+    /// Template `name`'s `Health`, whatever its case: of several so
+    /// named, the first that gives one.
+    pub fn health(&self, name: &str) -> Option<f32> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.health.get(id).copied())
+    }
+
+    /// Template `name`'s walk, run and sprint speeds, whatever its case.
+    pub fn speeds(&self, name: &str) -> Option<[f32; 3]> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.speeds.get(id).copied())
     }
 
     /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
@@ -307,6 +327,8 @@ impl Templates {
                 .collect(),
             tuning: crate::tuning::read(&db, damage.as_ref()),
             leavings: crate::pickup::read(&db),
+            health: crate::tuning::healths(&db),
+            speeds: crate::tuning::human_speeds(&db),
         }
     }
 }

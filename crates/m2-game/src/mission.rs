@@ -644,6 +644,17 @@ impl Mission {
         self.settle(&format!("t={:.1}, delivered", self.now));
     }
 
+    /// Object `guid`'s health when whole (the hero template's `Health`:
+    /// Mattias's 120), and its health with it when it was whole.
+    pub fn set_max_health(&mut self, guid: u32, max: f32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            if o.health >= o.max_health {
+                o.health = max;
+            }
+            o.max_health = max;
+        }
+    }
+
     /// Reports that an object died in play (a soldier the player shot).
     /// The game's reading of an object's health (the player's, as she is
     /// hurt and healed).

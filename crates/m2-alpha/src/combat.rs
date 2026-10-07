@@ -166,8 +166,9 @@ const PANIC_RANGE: f32 = 40.0;
 /// A soldier's hit on her: the "Assault Rifle Bullet" template's Damage
 /// (the VZ soldiers' rifle, 9, `DamageKey` `Bullet`) times the game's
 /// damage table's `Hero` row for a `Bullet` (0.25; see
-/// `m2_engine::tuning::DamageTable`). Her template's health is 100
-/// (Mattias 120); any falloff with range is not decoded.
+/// `m2_engine::tuning::DamageTable`), whoever the hero is (all three
+/// templates' `ModifierKey` is `Hero`). Any falloff with range is not
+/// decoded.
 const NPC_DAMAGE: f32 = 9.0 * 0.25;
 /// People are hit within this distance of the line from shins to head.
 const BODY_RADIUS: f32 = 0.3;
@@ -800,6 +801,9 @@ pub struct Trigger {
 #[derive(Debug)]
 pub struct Combat {
     pub hp: f32,
+    /// Her health when whole: her hero template's `Health` (Mattias
+    /// 120, Jennifer and Chris 100).
+    pub max_hp: f32,
     pub weapon: Weapon,
     /// Seconds she stays down.
     pub down: f32,
@@ -877,6 +881,7 @@ impl Default for Combat {
     fn default() -> Self {
         Self {
             hp: 100.0,
+            max_hp: 100.0,
             weapon: Weapon::Rifle,
             down: 0.0,
             invincible: false,
@@ -1047,6 +1052,11 @@ impl Combat {
         }
     }
 
+    /// Her health as the health box shows it: of 100.
+    pub fn hp_percent(&self) -> f32 {
+        self.hp * 100.0 / self.max_hp.max(1.0)
+    }
+
     /// Launcher rounds, grenades and health from a pickup: as many as she
     /// has room for, health up to full.
     pub fn take_supplies(&mut self, launcher: u32, grenades: u32, health: f32) {
@@ -1054,7 +1064,7 @@ impl Combat {
             self.take_ammo(Weapon::GrenadeLauncher, launcher);
         }
         self.grenades = (self.grenades + grenades).min(MAX_GRENADES);
-        self.hp = (self.hp + health).min(100.0);
+        self.hp = (self.hp + health).min(self.max_hp);
     }
 
     /// Whether ammunition or health lying there gives her anything: what
@@ -1073,7 +1083,7 @@ impl Combat {
         rounds
             || launcher
             || (what.grenades > 0 && self.grenades < MAX_GRENADES)
-            || (what.health > 0.0 && self.hp < 100.0)
+            || (what.health > 0.0 && self.hp < self.max_hp)
     }
 
     /// The weapons she carries but doesn't hold, which hang on her back:
@@ -1183,13 +1193,13 @@ impl Combat {
         if self.down > 0.0 {
             self.down -= dt;
             if self.down <= 0.0 {
-                self.hp = 100.0;
+                self.hp = self.max_hp;
                 self.revived = true;
                 f.player.down = false;
                 f.player.aiming = false;
             }
         } else if !self.scripted_health && self.quiet > REGEN_AFTER {
-            self.hp = (self.hp + REGEN_RATE * dt).min(100.0);
+            self.hp = (self.hp + REGEN_RATE * dt).min(self.max_hp);
         }
 
         let on_foot = f.player.landed && f.player.driving.is_none() && self.down <= 0.0;

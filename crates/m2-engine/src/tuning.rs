@@ -287,6 +287,43 @@ impl<'a> Table<'a> {
 
 /// The tuning of every template the database gives any, by template id.
 /// `damage` is the game's damage table, if found.
+/// `_HumanPhysics` fields that differ between the heroes as their
+/// speeds do (heroes round 02; names unsolved, so read as speeds by
+/// inference): Jennifer 2.0, 5.0 and 7.0, Chris 1.5, 4.5 and 6.25,
+/// Mattias 1.5, 4.5 and 5.5. Her run (5.0) is the alpha's run speed.
+const HUMAN_SPEEDS: [u32; 3] = [0xb535_3104, 0x5cc8_c4d9, 0x6167_d5fc];
+
+/// Every person template's three `_HumanPhysics` speeds (walk, run,
+/// sprint; inferred, see [`HUMAN_SPEEDS`]), by id.
+pub fn human_speeds(db: &Layer<'_>) -> HashMap<u32, [f32; 3]> {
+    let physics = Table::new(db, "_HumanPhysics");
+    physics
+        .records
+        .keys()
+        .filter_map(|&id| {
+            let record = physics.of_template(id).first()?;
+            let mut out = [0.0; 3];
+            for (o, field) in out.iter_mut().zip(HUMAN_SPEEDS) {
+                *o = f32::from_bits(physics.word(record, field)?);
+            }
+            out.iter()
+                .all(|v| v.is_normal() && *v > 0.0)
+                .then_some((id, out))
+        })
+        .collect()
+}
+
+/// Every template's `Health` value, by id: a vehicle's, a person's, a
+/// hero's (the `Mattias` template's 120).
+pub fn healths(db: &Layer<'_>) -> HashMap<u32, f32> {
+    let health = Table::new(db, "Health");
+    health
+        .records
+        .keys()
+        .filter_map(|&id| Some((id, health.number(id, HEALTH)?)))
+        .collect()
+}
+
 pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, VehicleTuning> {
     let tank = Table::new(db, "_TankPhysics");
     let car = Table::new(db, "_CarPhysicsV2");

@@ -64,6 +64,8 @@ pub enum MenuAction {
     /// Save the game, or load the saved game.
     SaveGame,
     LoadGame,
+    /// Play as another mercenary (also kept in the settings).
+    Hero(crate::hero::Hero),
     Quit,
 }
 
@@ -948,6 +950,20 @@ fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
                 }
                 if ui.button("Load game (F9)").clicked() {
                     action = Some(MenuAction::LoadGame);
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Play as");
+                for hero in crate::hero::Hero::ALL {
+                    if ui
+                        .selectable_label(config.hero == hero, hero.name())
+                        .clicked()
+                        && config.hero != hero
+                    {
+                        config.hero = hero;
+                        action = Some(MenuAction::Hero(hero));
+                    }
                 }
             });
             ui.separator();

@@ -43,6 +43,7 @@ mod config;
 mod drops;
 mod flights;
 mod game;
+mod hero;
 mod input;
 mod mission;
 mod npc;
@@ -56,6 +57,7 @@ mod startup;
 mod support;
 mod ui;
 
+use crate::hero::Hero;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -100,6 +102,8 @@ struct Options {
     /// With `--model`: degrees to turn the models (90 shows their side).
     turn: f32,
     spawn: Option<(f32, f32)>,
+    /// Who to play (`--hero`), over the settings'.
+    hero: Option<Hero>,
     gait: Option<Gait>,
     double_sided: bool,
     fly: bool,
@@ -232,6 +236,12 @@ fn parse_args() -> anyhow::Result<Options> {
                 ));
             }
             "--turn" => o.turn = value()?.parse().context("--turn expects degrees")?,
+            "--hero" => {
+                let v = value()?;
+                o.hero = Some(Hero::parse(&v).with_context(|| {
+                    format!("--hero expects mattias, jennifer or chris, not {v}")
+                })?);
+            }
             "--spawn" => {
                 let v = value()?;
                 let (x, z) = v.split_once(',').context("--spawn expects X,Z")?;
@@ -396,6 +406,9 @@ fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(Config::default_path);
     let mut config = Config::load(&config_path)?;
+    if let Some(hero) = options.hero {
+        config.hero = hero;
+    }
     if let Some(install) = &options.install {
         config.install = Some(install.clone());
     }
@@ -507,8 +520,10 @@ fn build_scene(
     double_sided: bool,
     sea_level: f32,
     mission: bool,
+    hero: Hero,
 ) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
+    scene.hero = hero;
     if double_sided {
         scene.materials.set_double_sided(backend, true)?;
     }
@@ -537,7 +552,7 @@ fn build_scene(
         // Free roam: the island's vehicles stand where the game's start-up
         // layers put them (with `--mission` the scripts' own layers do).
         if !mission {
-            game.startup = Some(startup::Startup::start(install));
+            game.startup = Some(startup::Startup::start(install, game.scene.hero));
         }
     }
     Ok(game)
@@ -605,6 +620,7 @@ fn screenshot(
         options.double_sided,
         config.world.sea_level,
         options.mission,
+        config.hero,
     )?;
     if options.fly {
         game.on_foot = false;
@@ -3185,6 +3201,7 @@ impl App {
             self.double_sided,
             self.config.world.sea_level,
             self.mission,
+            self.config.hero,
         )?;
         if self.fly {
             game.on_foot = false;
@@ -3207,7 +3224,11 @@ impl App {
             window,
             backend,
             game,
-            audio: sound::GameAudio::start(self.install.as_ref()),
+            audio: {
+                let mut audio = sound::GameAudio::start(self.install.as_ref());
+                audio.hero = self.config.hero;
+                audio
+            },
             was_driving: false,
             input: Input::default(),
             mouse_look: false,
@@ -3287,6 +3308,13 @@ impl Running {
             Some(ui::MenuAction::LoadGame) => {
                 self.load_game();
                 self.close_menu();
+            }
+            Some(ui::MenuAction::Hero(hero)) => {
+                // The body, clips, health and voice change now; the
+                // scripts take the new name on the next start.
+                eprintln!("hero: playing as {hero}");
+                self.game.set_hero(&mut self.backend, hero);
+                self.audio.hero = hero;
             }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
             None => {}
