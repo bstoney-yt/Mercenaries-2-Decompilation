@@ -101,6 +101,9 @@ m2-alpha [options]
   --mission-driver <lua> Lua to run before the scripts start, to test them
                          (crates/m2-game/examples/drivers/vzacon001.lua
                          plays the first contract); repeatable
+  --hijack-crew <name>   every hijackable vehicle is crewed by this human
+                         template, to test hijacking (I/K/J/L are the
+                         pad's Y/A/X/B; the movement keys its stick)
   --mission-seconds <s>  with --screenshot: play this long instead of ten
   --look-pickup <m>      with --screenshot: take the picture from this far
                          off the pickup lying nearest her, looking at it

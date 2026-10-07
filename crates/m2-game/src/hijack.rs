@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 
+use m2_assets::animation_table::{self, ANIMATION_TABLE_TYPE, AnimationTable};
 use mlua::{Lua, MultiValue, Table, Value};
 
 use crate::api::{Command, Shared};
@@ -195,8 +196,8 @@ pub struct HijackWorld {
     /// Every button pressed, in order, with when (game seconds); minigames
     /// keep their place in it.
     presses: Vec<(f64, u32)>,
-    /// Hardpoints' places the game knows, by object and name (lower case).
-    hardpoints: HashMap<(u32, String), [f32; 3]>,
+    /// Hardpoints' places the game knows, by object and name hash.
+    hardpoints: HashMap<(u32, u32), [f32; 3]>,
     /// Aircraft in the air (helicopters are hijacked only in flight).
     flying: std::collections::BTreeSet<u32>,
     /// Buttons held down, and since when (game seconds).
@@ -236,10 +237,10 @@ impl HijackWorld {
         }
     }
 
-    /// Where `guid`'s hardpoint `name` (`hp_seat_lt`) is in the world.
-    pub fn set_hardpoint(&mut self, guid: u32, name: &str, at: [f32; 3]) {
-        self.hardpoints
-            .insert((guid, name.to_ascii_lowercase()), at);
+    /// Where `guid`'s hardpoint (`hp_seat_lt`, by name hash) is in the
+    /// world.
+    pub fn set_hardpoint(&mut self, guid: u32, name: u32, at: [f32; 3]) {
+        self.hardpoints.insert((guid, name), at);
     }
 
     /// The player is holding `button` down since `at` (game seconds), or
@@ -564,7 +565,7 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         let at = w
             .hijack
             .hardpoints
-            .get(&(guid, name.to_ascii_lowercase()))
+            .get(&(guid, m2_assets::name_hash(&name)))
             .copied()
             .or_else(|| w.objects.get(&guid).map(|o| o.position));
         Ok(MultiValue::from_vec(match at {
@@ -698,6 +699,104 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
         atmosphere.raw_set("IsInterpolating", lua.create_function(|_, ()| Ok(false))?)?;
     }
     Ok(())
+}
+
+/// How long hijack actions last: what the animation tables give each
+/// character for an action in a vehicle, and the clips' lengths.
+#[derive(Clone, Debug, Default)]
+pub struct ClipTimes {
+    /// Clip lengths, seconds, by name hash: the vehicles' clips in the
+    /// hijack blocks (`hijack_m1a2_...`) and the people's in the vehicle
+    /// animation groups (`vehiclenameanimgroup_m1a2`, ...).
+    pub lengths: HashMap<u32, f64>,
+    /// The stance/action table and the vehicle handle table.
+    pub tables: Option<(AnimationTable, AnimationTable)>,
+    /// `VehicleAnimationSet` class and name by template name, lower case.
+    pub sets: HashMap<String, (u32, u32)>,
+}
+
+impl ClipTimes {
+    /// Reads them from an archive (`vz.wad`): the blocks holding clips
+    /// of vehicles' people and hijacks, the tables and the templates.
+    pub fn read<R: std::io::Read + std::io::Seek>(
+        wad: &mut m2_assets::WadArchive<R>,
+    ) -> Result<Self, m2_assets::WadError> {
+        use m2_assets::animation::{ANIMATION_TYPE, Clip};
+        use m2_assets::layer::TEMPLATE_DB_TYPE;
+        use m2_assets::{BlockContents, Layer};
+        let index = wad.index();
+        let paths: Vec<String> = index
+            .blocks()
+            .iter()
+            .map(|b| b.path.to_ascii_lowercase())
+            .collect();
+        // The blocks holding the tables and the template database.
+        let wanted: std::collections::HashSet<usize> = index
+            .assets()
+            .iter()
+            .filter(|a| {
+                let t = index.type_hash(a);
+                t == ANIMATION_TABLE_TYPE || t == TEMPLATE_DB_TYPE
+            })
+            .map(|a| usize::from(a.block))
+            .collect();
+        let mut out = Self::default();
+        let (mut actions, mut vehicles) = (None, None);
+        for (b, path) in paths.iter().enumerate() {
+            let clips = ["hijack_", "vehiclenameanimgroup_", "vehicleclassanimgroup_"]
+                .iter()
+                .any(|p| path.contains(p));
+            if !clips && !wanted.contains(&b) {
+                continue;
+            }
+            let Ok(data) = wad.read_block(b) else {
+                continue;
+            };
+            let Ok(contents) = BlockContents::parse(&data) else {
+                continue;
+            };
+            for (e, asset) in contents.iter() {
+                if clips
+                    && e.type_hash == ANIMATION_TYPE
+                    && let Ok(clip) = Clip::parse(asset)
+                {
+                    out.lengths
+                        .insert(e.name_hash, f64::from(clip.header.duration));
+                } else if e.type_hash == ANIMATION_TABLE_TYPE {
+                    if e.name_hash == animation_table::ACTIONS {
+                        actions = AnimationTable::parse(asset).ok();
+                    } else if e.name_hash == animation_table::VEHICLE_ANIMATIONS {
+                        vehicles = AnimationTable::parse(asset).ok();
+                    }
+                } else if e.type_hash == TEMPLATE_DB_TYPE
+                    && let Ok(db) = Layer::parse(asset)
+                {
+                    let sets = m2_engine::hijack::animation_sets(&db);
+                    for (id, name) in db.names() {
+                        if let Some(&s) = sets.get(&id) {
+                            out.sets.insert(name.to_ascii_lowercase(), s);
+                        }
+                    }
+                }
+            }
+        }
+        out.tables = actions.zip(vehicles);
+        Ok(out)
+    }
+
+    /// The clip the animation tables give a character in a vehicle of
+    /// this animation set for a state and action, and its length when
+    /// the clip was read.
+    pub fn clip(
+        &self,
+        state: &str,
+        action: &str,
+        (class, name): (u32, u32),
+    ) -> Option<(u32, Option<f64>)> {
+        let (a, b) = self.tables.as_ref()?;
+        let clip = animation_table::vehicle_clip(a, b, state, action, class, name)?;
+        Some((clip, self.lengths.get(&clip).copied()))
+    }
 }
 
 #[cfg(test)]
