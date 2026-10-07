@@ -9,7 +9,9 @@
 //!   highest value, then a second, coarser grid's f32 cell size (64) and
 //!   u32 columns and rows (129, 129).
 //! - `+0x24` the fine grid: columns x rows f32 heights, row-major, rows
-//!   along +z, centred on the origin (so -4096..4096 m at 32 m).
+//!   along +z: points 32 m apart from -4096 to 4096 m (257 points span
+//!   256 cells), each taken as the height of the square around it
+//!   (inferred).
 //! - Then data not yet decoded (byte masks for the coarse grid, then u16
 //!   values).
 //!
@@ -42,9 +44,9 @@ pub enum WaterError {
 pub struct WaterHeights {
     pub columns: usize,
     pub rows: usize,
-    /// Metres per cell.
+    /// Metres between points.
     pub cell: f32,
-    /// World x and z of the grid's first corner.
+    /// World x and z of the grid's first point.
     pub origin: [f32; 2],
     /// Row-major heights, `rows` rows of `columns`.
     pub heights: Vec<f32>,
@@ -80,8 +82,7 @@ impl WaterHeights {
                     .map_err(|_| WaterError::Truncated)?,
             );
         }
-        // Centred on the origin: inferred from its span (257 x 32 m reaches
-        // -4096..4096 from the first corner, as round DV placed it).
+        // Centred on the world's origin: inferred from its span.
         let half = (columns - 1) as f32 * cell / 2.0;
         let half_z = (rows - 1) as f32 * cell / 2.0;
         Ok(Self {
@@ -93,7 +94,7 @@ impl WaterHeights {
         })
     }
 
-    /// The height of cell (`column`, `row`), if inside the grid.
+    /// The height at point (`column`, `row`), if inside the grid.
     pub fn get(&self, column: usize, row: usize) -> Option<f32> {
         if column >= self.columns || row >= self.rows {
             return None;
@@ -101,11 +102,11 @@ impl WaterHeights {
         self.heights.get(row * self.columns + column).copied()
     }
 
-    /// The water height of the cell holding world (`x`, `z`), `None` where
-    /// there is none or outside the grid.
+    /// The water height of the point nearest world (`x`, `z`), `None`
+    /// where there is none or outside the grid.
     pub fn at(&self, x: f32, z: f32) -> Option<f32> {
-        let c = ((x - self.origin[0]) / self.cell).floor();
-        let r = ((z - self.origin[1]) / self.cell).floor();
+        let c = ((x - self.origin[0]) / self.cell).round();
+        let r = ((z - self.origin[1]) / self.cell).round();
         if c < 0.0 || r < 0.0 {
             return None;
         }
@@ -150,12 +151,12 @@ mod tests {
         .unwrap();
         assert_eq!((w.columns, w.rows, w.cell), (3, 3, 32.0));
         assert_eq!(w.origin, [-32.0, -32.0]);
-        // Row 1 (z 0..32), columns 0 and 1 (x -32..0, 0..32).
-        assert_eq!(w.at(-10.0, 5.0), Some(-15.8));
-        assert_eq!(w.at(10.0, 5.0), Some(-15.8));
-        assert_eq!(w.at(10.0, -5.0), Some(-36.0));
-        assert_eq!(w.at(-10.0, -5.0), None);
-        assert_eq!(w.at(-40.0, 0.0), None);
+        // Row 1 (z 0), columns 0 and 1 (x -32 and 0).
+        assert_eq!(w.at(-20.0, 5.0), Some(-15.8));
+        assert_eq!(w.at(10.0, -5.0), Some(-15.8));
+        assert_eq!(w.at(5.0, -20.0), Some(-36.0));
+        assert_eq!(w.at(-25.0, -25.0), None);
+        assert_eq!(w.at(-50.0, 0.0), None);
     }
 
     #[test]

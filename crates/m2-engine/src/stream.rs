@@ -1934,7 +1934,7 @@ impl SeaConstants {
     }
 }
 
-/// The water above the sea: a flat square at each cell of the game's
+/// The water above the sea: a flat square at each point of the game's
 /// water heights ([`WaterHeights`]) whose surface lies above the sea,
 /// drawn as the sea is. Rivers, pools and lakes; the ground hides what
 /// lies under it. `None` without the heights.
@@ -1978,8 +1978,10 @@ fn inland_water<R: std::io::Read + std::io::Seek>(
             if h <= sea_level + 0.5 {
                 continue;
             }
-            let x = water.origin[0] + column as f32 * water.cell;
-            let z = water.origin[1] + row as f32 * water.cell;
+            // The square around the point (round DW: drawn from the point
+            // on, it sat half a cell towards +x and +z).
+            let x = water.origin[0] + (column as f32 - 0.5) * water.cell;
+            let z = water.origin[1] + (row as f32 - 0.5) * water.cell;
             let first = (vertices.len() / 8) as u32;
             for (dx, dz) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
                 vertices.extend([
