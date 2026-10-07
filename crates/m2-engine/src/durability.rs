@@ -82,6 +82,56 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, Durability> {
         .collect()
 }
 
+/// `PhysicsPropertyCrashable`'s fields (names unknown, read off the
+/// values, round D8): how a vehicle running into it breaks it (0 on 238
+/// templates, fences among them; 1 on 48, lampposts; 2 on 136, the
+/// plants and bushes), and what it takes to (950 on 84, the fences;
+/// 29,900 on 26, emplaced guns; 15,000, 3,900; 0 on the rest).
+const CRASH_HOW: u32 = 0xaf54_061b;
+const CRASH_TAKES: u32 = 0x6b54_d7a7;
+
+/// How a vehicle running into a template's objects breaks them
+/// (`PhysicsPropertyCrashable`, on 366 templates and 39,327 placed
+/// objects; shacks and other buildings have none and come down only to
+/// damage).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crash {
+    pub how: CrashHow,
+    /// What it takes: read as the vehicle's mass (kg), as the values line
+    /// up with the vehicles' (a jeep's 1,000 and a Humvee's 3,400 pass a
+    /// fence's 950; only a tank's 32,000 passes 29,900). Inferred.
+    pub takes: f32,
+}
+
+/// How [`Crash`] breaks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrashHow {
+    /// Broken by a vehicle heavy enough ([`Crash::takes`]): fences.
+    Breaks,
+    /// Knocked over: lampposts.
+    KnockedOver,
+    /// Flattened by any vehicle: plants and bushes.
+    Flattened,
+}
+
+/// Each template that vehicles break running into, by id.
+pub fn crashable(db: &Layer<'_>) -> HashMap<u32, Crash> {
+    let crash = Table::new(db, "PhysicsPropertyCrashable");
+    crash
+        .templates()
+        .filter_map(|id| {
+            let r = crash.of_template(id).first()?;
+            let how = match crash.word(r, CRASH_HOW).unwrap_or(0) {
+                1 => CrashHow::KnockedOver,
+                2 => CrashHow::Flattened,
+                _ => CrashHow::Breaks,
+            };
+            let takes = crash.float(r, CRASH_TAKES).unwrap_or(0.0).max(0.0);
+            Some((id, Crash { how, takes }))
+        })
+        .collect()
+}
+
 /// A blast's reach and damage (`Explosive`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Explosion {

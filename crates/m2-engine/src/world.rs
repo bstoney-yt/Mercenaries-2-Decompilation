@@ -141,6 +141,8 @@ pub struct Templates {
     pub durability: HashMap<u32, crate::durability::Durability>,
     /// The blasts of those with `Explosive`, by id.
     pub explosions: HashMap<u32, crate::durability::Explosion>,
+    /// How vehicles break each template's objects running into them.
+    pub crashable: HashMap<u32, crate::durability::Crash>,
 }
 
 impl Templates {
@@ -312,6 +314,7 @@ impl Templates {
             leavings: crate::pickup::read(&db),
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
+            crashable: crate::durability::crashable(&db),
         }
     }
 }
