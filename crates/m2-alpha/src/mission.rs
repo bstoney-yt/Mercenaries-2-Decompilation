@@ -79,6 +79,18 @@ const ASHORE_HEIGHT: f32 = 2.0;
 const SUPPORT_ASHORE: f32 = 10.0;
 /// Her rifle's template in the first contract.
 const CARBINE: &str = "Carbine";
+
+/// A state layer that goes in and out with `name` though no script names
+/// it: `vz_state_vza_con001` with VzaCon001's own layer. It holds the
+/// bridge's ruined middle, its planking and the north waterfall that
+/// drains into the moat, which the consoles show in the mission (Brendan's
+/// shot, 2026-10-07); what loads it in the game is not found yet, so this
+/// pairing is inferred. `M2_CON001_LAYER=off` leaves it out.
+fn companion_layer(name: &str) -> Option<&'static str> {
+    (name.eq_ignore_ascii_case("vz_state_vzacon001")
+        && std::env::var("M2_CON001_LAYER").as_deref() != Ok("off"))
+    .then_some("vz_state_vza_con001")
+}
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -1746,10 +1758,12 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         }
         // A state layer in or out: its models and people with it.
         Command::Layer { op, name } => {
-            let entities: Vec<u32> = mission
-                .layer(name)
-                .map(|es| es.iter().map(|e| e.guid).collect())
-                .unwrap_or_default();
+            let entities: Vec<u32> = std::iter::once(name.as_str())
+                .chain(companion_layer(name))
+                .filter_map(|n| mission.layer(n))
+                .flatten()
+                .map(|e| e.guid)
+                .collect();
             let scene = &mut game.scene;
             if let Some(set) = &mut scene.people.state_layers {
                 if *op == LayerOp::Unload {
