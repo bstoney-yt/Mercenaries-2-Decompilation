@@ -93,6 +93,76 @@ end
 return held
 "#;
 
+/// The screen fade `MrxGui` runs through its own Flash widget
+/// (`GlobalFadeToBlack(fCallback, data)`: the `loadingscreen_standalone`
+/// movie wipes to black, its `wipeComplete` command runs
+/// `_FinishFadeToBlack`, and the next GUI update the callbacks queued, as
+/// the teleport after the first contract's closing movie;
+/// `GlobalFadeFromBlack` asks the movie to `fadeOut`, whose `close` command
+/// runs `_FinishFadeFromBlack`). There is no Flash in the mission's state,
+/// so this stands in for the movie: it loads at once and each wipe takes
+/// [`FADE_WIPE`] seconds. Returns how black the screen is, 0 to 1.
+const FADE: &str = r#"
+local dt, wipe = ...
+local m = __m2_fade_module
+if m == nil then
+    for _, t in pairs(_G) do
+        if type(t) == "table" and type(rawget(t, "_CompleteFadeFlashLoad")) == "function"
+            and type(rawget(t, "_FinishFadeToBlack")) == "function" then
+            m = t
+            break
+        end
+    end
+    if m == nil then return 0 end
+    __m2_fade_module = m
+    local from = rawget(m, "GlobalFadeFromBlack")
+    if type(from) == "function" then
+        rawset(m, "GlobalFadeFromBlack", function(...)
+            local was = rawget(m, "_bCurrentlyFadedIn") or rawget(m, "_bCurrentlyFadingIn")
+            local r = from(...)
+            if was and not rawget(m, "_bCurrentlyFadedIn") then __m2_fade.out = 0 end
+            return r
+        end)
+    end
+end
+__m2_fade = __m2_fade or {}
+local s = __m2_fade
+local w = rawget(m, "_oFadeFlash")
+if type(w) ~= "table" or type(w.CustomData) ~= "table" then return 0 end
+local c = w.CustomData
+if c.bLoading and not c.bLoaded then m._CompleteFadeFlashLoad() end
+if s.update then
+    s.update = nil
+    m._FadeUpdate(w)
+end
+if rawget(m, "_bCurrentlyFadingIn") then
+    s.t = (s.t or 0) + dt
+    if s.t >= wipe then
+        s.t = nil
+        m._FinishFadeToBlack(w)
+        s.update = true
+        return 1
+    end
+    return s.t / wipe
+end
+s.t = nil
+if s.out then
+    s.out = s.out + dt
+    if s.out >= wipe then
+        s.out = nil
+        m._FinishFadeFromBlack(w)
+        return 0
+    end
+    return 1 - s.out / wipe
+end
+if rawget(m, "_bCurrentlyFadedIn") then return 1 end
+return 0
+"#;
+
+/// Seconds the fade's wipe takes (inferred: the movie's own length is not
+/// read yet).
+const FADE_WIPE: f64 = 1.0;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MissionError {
     #[error("archive: {0}")]
@@ -309,6 +379,8 @@ pub struct Mission {
     flown: bool,
     /// A held movie was handed to the game and has not ended yet.
     movie_out: bool,
+    /// How black `MrxGui`'s fade has the screen ([`FADE`]), 0 to 1.
+    black: f32,
 }
 
 impl Mission {
@@ -438,6 +510,7 @@ impl Mission {
             outbox: Vec::new(),
             flown: false,
             movie_out: false,
+            black: 0.0,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -580,7 +653,33 @@ impl Mission {
                 ),
             });
         }
+        match self
+            .host
+            .lua()
+            .load(FADE)
+            .set_name("=m2 fade")
+            .call::<f32>((dt, FADE_WIPE))
+        {
+            Ok(b) => {
+                if (b >= 1.0) != (self.black >= 1.0) {
+                    self.log.push(format!(
+                        "  t={now:.1} screen {}",
+                        if b >= 1.0 { "black" } else { "fading in" }
+                    ));
+                }
+                self.black = b;
+            }
+            Err(e) => self.log.push(format!(
+                "  t={now:.1} fade: {}",
+                first_lines(&e.to_string())
+            )),
+        }
         self.settle(&format!("t={now:.1}"));
+    }
+
+    /// How black the scripts' fade has the screen, 0 to 1.
+    pub fn black(&self) -> f32 {
+        self.black
     }
 
     /// Tells the boundary callback when the player leaves the play area

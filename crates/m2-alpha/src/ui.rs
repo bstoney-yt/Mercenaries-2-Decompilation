@@ -458,6 +458,15 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     };
     let white = Color32::from_gray(235);
     flash(&ctx, screen, info.support.flash);
+    // The scripts' fade to black (`MrxGui.GlobalFadeToBlack`), over all.
+    if let Some(black) = info.mission.as_ref().map(|m| m.black).filter(|&b| b > 0.0) {
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, "fade".into()))
+            .rect_filled(
+                screen,
+                0.0,
+                Color32::from_black_alpha((black.min(1.0) * 255.0) as u8),
+            );
+    }
     if let Some(loading) = &info.loading {
         text(
             screen.center_top() + vec2(0.0, 24.0),
@@ -1303,6 +1312,7 @@ mod tests {
             driving: Some(("global_veh_hondacrx".into(), 12.0, false)),
             crosshair: Some(Vec3::new(0.0, 1.0, -40.0)),
             mission: Some(MissionView {
+                black: 0.0,
                 objectives: vec!["VzaCon001 objective 1".into()],
                 tutorial: Some("[P] VzaCon001 tutorial 1\nline 2".into()),
                 game_tutorial: Some("[pda] VzaCon001 tutorial 1\nline 2".into()),
