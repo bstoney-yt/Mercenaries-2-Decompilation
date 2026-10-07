@@ -11,15 +11,20 @@
 //! game's animation tables give it ([`ClipTimes`]). Done, she drives the
 //! vehicle; failed, she is let go beside it.
 //!
-//! Not yet: the hero's, crewman's and vehicle's clips are timed but not
-//! shown, and the island's vehicles have no crews, so only `--hijack-crew`
-//! (a testing aid: every hijackable vehicle is crewed by that template)
-//! lets one be hijacked. The prompts are for the HUD to draw
-//! ([`Hijacks::view`]).
+//! A vehicle's crew is its template's riders ([`ParkedVehicle::crew`]):
+//! the hijack throws out whoever has the driver's seat, and one without a
+//! driver can't be hijacked. `--hijack-crew` (a testing aid) gives every
+//! hijackable vehicle without one a driver of that template.
 //!
-//! Inferred: she must stand within the entrance's radius of its hardpoint
-//! plus [`SLACK`], measured flat (a tank's hatch radius is 1 m, on top of
-//! the hull).
+//! Not yet: the hero's, crewman's and vehicle's clips are timed but not
+//! shown. The prompts are for the HUD to draw ([`Hijacks::view`]).
+//!
+//! [`ParkedVehicle::crew`]: crate::scene::ParkedVehicle::crew
+//!
+//! Inferred: she must stand within the entrance's radius plus [`SLACK`]
+//! of the vehicle's hull, measured flat (a tank's hatch radius is 1 m, and
+//! the hatch is on top of the hull, out of her reach on foot); of several
+//! entrances (a helicopter's two doors), the nearest is taken.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -39,7 +44,8 @@ use crate::input::{Action, Input};
 
 /// The scripts run ten times a second, as the mission's do.
 const STEP: f32 = 0.1;
-/// Reach beyond the entrance's radius, metres, measured flat.
+/// Reach beyond the entrance's radius, metres, measured flat from the
+/// hull.
 pub const SLACK: f32 = 2.0;
 /// How long an action lasts when its clip is unknown, seconds.
 const UNKNOWN_CLIP: f64 = 2.0;
@@ -105,8 +111,8 @@ pub struct HijackView {
 pub struct Hijacks {
     state: State,
     lag: f32,
-    /// A testing aid: every hijackable vehicle is crewed by this human
-    /// template (`--hijack-crew`).
+    /// A testing aid: every hijackable vehicle without a driver is driven
+    /// by this human template (`--hijack-crew`).
     pub crew: Option<String>,
     /// Hijackable templates by model hash: the name and entrances of the
     /// first by name.
@@ -258,7 +264,6 @@ impl Hijacks {
     /// The nearest crewed, hijackable vehicle whose entrance she is in
     /// reach of, on foot.
     fn find(&mut self, game: &mut Game) -> Option<Candidate> {
-        let crew = self.crew.clone()?;
         let by_model = self.by_model.as_ref()?;
         if !game.on_foot {
             return None;
@@ -272,6 +277,9 @@ impl Hijacks {
                 continue;
             }
             let Some((template, entrances)) = by_model.get(&v.spec.model) else {
+                continue;
+            };
+            let Some(crew) = driver(&v.crew).or_else(|| self.crew.clone()) else {
                 continue;
             };
             let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
@@ -291,9 +299,12 @@ impl Hijacks {
                     .or(v.spec.door)
                     .unwrap_or(Vec3::ZERO);
                 let spot = at.transform_point3(local);
-                let flat = (spot - here).truncate_y();
-                let d = flat.length();
-                if d <= e.radius + SLACK && best.as_ref().is_none_or(|b| d < b.0) {
+                // In reach of the hull; of its entrances, the nearest.
+                let mine = at.inverse().transform_point3(here);
+                let (lo, hi) = v.spec.bounds;
+                let hull = (mine.clamp(lo, hi) - mine).truncate_y().length();
+                let d = (spot - here).truncate_y().length();
+                if hull <= e.radius + SLACK && best.as_ref().is_none_or(|b| d < b.0) {
                     best = Some((
                         d,
                         Candidate {
@@ -368,6 +379,84 @@ impl Hijacks {
     }
 }
 
+/// The pad as a player who answers every prompt at once would work it
+/// (`--hijack-crew` with `--screenshot --drive`): presses the button a
+/// press asks for, holds a hold's, taps (or alternates) nine times a
+/// second. For testing.
+#[derive(Default)]
+pub struct Autopad {
+    answered: Vec<(String, u32)>,
+    tapped: f32,
+    last: Option<u32>,
+}
+
+impl Autopad {
+    /// Works `input` for the prompts up, `now` seconds in.
+    pub fn answer(&mut self, prompts: &[Minigame], input: &mut Input, now: f32) {
+        let action = |b: u32| PAD.iter().find(|p| p.1 == b).map(|p| p.0);
+        // Let go of every key but a hold's.
+        for (a, b) in PAD {
+            let holding = prompts
+                .iter()
+                .any(|g| g.mode == "hold" && g.buttons.first() == Some(&b));
+            if input.held(a) && !holding {
+                input.button(a, false);
+            }
+        }
+        let tap = now - self.tapped >= 1.0 / 9.0;
+        for g in prompts {
+            let first = g.buttons.first().copied().unwrap_or(0);
+            let key = (g.mode.clone(), first);
+            let fresh = !self.answered.contains(&key);
+            if fresh {
+                eprintln!(
+                    "hijack: t={now:.1} prompt {} {:?} {:.2}s left",
+                    g.mode, g.buttons, g.left
+                );
+                self.answered.push(key);
+            }
+            let button = match g.mode.as_str() {
+                "press" if fresh => Some(first),
+                "tap" if tap => Some(first),
+                "alternate" if tap => {
+                    let b = match (self.last, g.buttons.as_slice()) {
+                        (Some(l), [a, b]) if l == *a => *b,
+                        (_, [a, ..]) => *a,
+                        _ => first,
+                    };
+                    self.last = Some(b);
+                    Some(b)
+                }
+                "hold" if fresh => Some(first),
+                _ => None,
+            };
+            if let Some(a) = button.and_then(action) {
+                if g.mode != "press" {
+                    self.tapped = now;
+                }
+                input.button(a, true);
+            }
+        }
+        let open: Vec<(String, u32)> = prompts
+            .iter()
+            .map(|g| (g.mode.clone(), g.buttons.first().copied().unwrap_or(0)))
+            .collect();
+        self.answered.retain(|k| open.contains(k));
+    }
+}
+
+impl Hijacks {
+    /// Whether the scripts have loaded (or failed to).
+    pub fn loading(&self) -> bool {
+        matches!(self.state, State::Loading(_))
+    }
+
+    /// A hijack is under way.
+    pub fn running(&self) -> bool {
+        self.active.is_some()
+    }
+}
+
 /// Carries out the scripts' hijack commands and ends the actions due.
 /// False once the hijack is over.
 fn follow(
@@ -414,6 +503,11 @@ fn follow(
             }
             HijackCommand::Completed { hero } if hero == a.hero => {
                 eprintln!("hijack: done");
+                // The driver is out (the scripts remove or kill him).
+                if let Some(v) = game.scene.vehicles.get_mut(a.vehicle) {
+                    v.crew
+                        .retain(|(seat, _)| !seat.to_ascii_lowercase().contains("driver"));
+                }
                 if let Some(p) = &mut game.scene.player {
                     p.driving = Some(a.vehicle);
                     p.landed = true;
@@ -433,6 +527,56 @@ fn follow(
         mission.action_finished(g);
     }
     !over
+}
+
+/// Puts her on foot beside the nearest hijackable vehicle with a driver
+/// whose name holds `want` (any, if `None`), on the side of its entrance;
+/// the vehicle's index. For testing (`--hijack`).
+pub fn beside(game: &mut Game, hijacks: &mut Hijacks, want: Option<&str>) -> Option<usize> {
+    if hijacks.by_model.is_none() {
+        hijacks.by_model = Some(hijackable(&game.scene.world.as_ref()?.index.template_db));
+    }
+    let by_model = hijacks.by_model.as_ref()?;
+    let here = game.focus();
+    let world = game.scene.world.as_ref()?;
+    let (i, at) = game
+        .scene
+        .vehicles
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| !v.wrecked && by_model.contains_key(&v.spec.model))
+        .filter(|(_, v)| driver(&v.crew).is_some() || hijacks.crew.is_some())
+        .filter(|(_, v)| want.is_none_or(|w| v.spec.label.to_ascii_lowercase().contains(w)))
+        .filter_map(|(i, v)| Some((i, world.physics.vehicle_transform(v.id?)?)))
+        .min_by(|a, b| {
+            let d = |m: &m2_math::glam::Mat4| m.transform_point3(Vec3::ZERO).distance(here);
+            d(&a.1).total_cmp(&d(&b.1))
+        })?;
+    let v = &game.scene.vehicles[i];
+    let (lo, hi) = v.spec.bounds;
+    let door = v.spec.door.unwrap_or(Vec3::ZERO);
+    // Out from the hull on the entrance's side, a metre clear.
+    let x = if door.x < 0.0 { lo.x - 1.0 } else { hi.x + 1.0 };
+    let spot = at.transform_point3(Vec3::new(x, hi.y, door.z.clamp(lo.z, hi.z)));
+    let p = game.scene.player.as_mut()?;
+    p.driving = None;
+    p.character.position = spot;
+    p.character.velocity = Vec3::ZERO;
+    p.landed = false;
+    game.on_foot = true;
+    eprintln!(
+        "hijack: beside the {} ({}), crew {:?}",
+        v.spec.label, by_model[&v.spec.model].0, v.crew
+    );
+    Some(i)
+}
+
+/// The template of whoever drives (the rider of the seat named for the
+/// driver, `seat_driver`): the one a hijack throws out.
+fn driver(crew: &[(String, String)]) -> Option<String> {
+    crew.iter()
+        .find(|(seat, _)| seat.to_ascii_lowercase().contains("driver"))
+        .map(|(_, who)| who.clone())
 }
 
 /// Drops pad presses nothing waits on.
