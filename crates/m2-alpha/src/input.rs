@@ -25,8 +25,11 @@ pub enum Action {
     ToggleMusic,
     /// Get in or out of a vehicle.
     Use,
-    /// Turn an overturned vehicle back up.
+    /// Turn an overturned vehicle back up (driving).
     Reset,
+    /// Change the rifle's clip (on foot; the same key as
+    /// [`Reset`](Self::Reset) by default).
+    Reload,
     /// Fire the weapon in hand (also the left mouse button).
     Fire,
     /// Raise the weapon (also the right mouse button, once the mouse is
@@ -83,6 +86,7 @@ impl Default for Bindings {
             (ToggleMusic, vec![KeyM]),
             (Use, vec![KeyE]),
             (Reset, vec![KeyR]),
+            (Reload, vec![KeyR]),
             (Fire, vec![KeyF]),
             (Aim, vec![]),
             (Throw, vec![KeyG]),

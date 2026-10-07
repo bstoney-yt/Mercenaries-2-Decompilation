@@ -107,14 +107,28 @@ pub const MUZZLE: u32 = 0xb148_6ef3;
 /// an `Explosion (Grenade)`). A clip takes this long to load, seconds
 /// (invented), and a round that never lands bursts this far out, metres.
 pub const LAUNCHER_CLIP: u32 = 6;
+/// Rounds the grenade launcher keeps beyond its clip: its reserve is
+/// "very limited" (the wiki), and taken up it comes with 3 clips, the
+/// footage's "6 2", which a heavy ammunition pickup tops up to.
+pub const LAUNCHER_SPARE: u32 = 2 * LAUNCHER_CLIP;
 const LOB_GAP: f32 = 60.0 / 75.0;
 const LOB_SPEED: f32 = 20.0;
 const LAUNCHER_RELOAD: f32 = 2.5;
 const LOB_RANGE: f32 = 250.0;
 const LOB_FLASH: f32 = 0.45;
 
-/// Rifle: seconds between shots, range, and damage per hit (three kill).
-const RIFLE_GAP: f32 = 0.11;
+/// Rifle: seconds between shots (the carbine's 562 a minute), range, and
+/// damage per hit (three kill).
+const RIFLE_GAP: f32 = 60.0 / 562.0;
+/// The carbine's clip (its template's `iClipSize`, the HUD's 30) and the
+/// rounds it keeps beyond it: its template's `MaxAmmoReserve` is 9, which
+/// counts clips (every fired weapon's is 0 to 9, whatever its clip), and
+/// which the first contract's scripts fill it to.
+pub const RIFLE_CLIP: u32 = 30;
+pub const RIFLE_SPARE: u32 = 9 * RIFLE_CLIP;
+/// Seconds a clip takes to change (invented, until her reload clip is
+/// measured).
+const RIFLE_RELOAD: f32 = 2.0;
 const RIFLE_RANGE: f32 = 400.0;
 const RIFLE_DAMAGE: f32 = 34.0;
 /// How long she keeps the rifle up after a shot, seconds.
@@ -141,6 +155,9 @@ const CANNON_RELOAD: f32 = 2.5;
 const LAID: f32 = 0.06;
 const SHELL_SPEED: f32 = 150.0;
 const MG_GAP: f32 = 0.09;
+/// A tank's machine gun beside its cannon, which the aim button fires: the
+/// AMX-30's linked machine gun fires 450 rounds a minute (its template).
+const TANK_MG_GAP: f32 = 60.0 / 450.0;
 const MG_DAMAGE: f32 = 45.0;
 const MG_RANGE: f32 = 500.0;
 /// Gunfire puts soldiers this close on alert and sends civilians running.
@@ -170,6 +187,10 @@ const THROW: f32 = 12.0;
 const FUSE: f32 = 2.5;
 const BOUNCE: f32 = 0.4;
 const THROW_GAP: f32 = RPG_RELOAD * 0.5;
+/// Grenades she can carry (the `Grenade` template's `MaxAmmoReserve`);
+/// her hero template starts her with them, and the hero script fills
+/// every weapon she holds to its most.
+pub const MAX_GRENADES: u32 = 9;
 /// A melee bash: how far ahead of her it reaches (from her chest, or her
 /// knees for a low one at something on the ground), how wide (the cosine
 /// of its half-angle), how much it hurts a person and what of the world's
@@ -185,8 +206,7 @@ const BASH_GAP: f32 = 0.8;
 /// Heights of a blow over her feet, high and low, metres.
 const BASH_HIGH: f32 = 1.2;
 const BASH_LOW: f32 = 0.45;
-/// Blasts kill within `KILL` metres and hurt to `REACH`; vehicles within
-/// `WRECK` are wrecked.
+/// Blasts kill within `KILL` metres and hurt to `REACH`.
 const KILL: f32 = 4.0;
 /// How hard a blast throws people: (out, up) m/s at its heart, on top of
 /// 3 out and 2 up at the edge of its reach. Invented, to look like the
@@ -195,7 +215,6 @@ pub(crate) const BLAST_PUSH: (f32, f32) = (9.0, 6.0);
 /// How hard a rifle round shoves the one it kills, m/s.
 const SHOT_PUSH: f32 = 2.0;
 pub(crate) const REACH: f32 = 9.0;
-const WRECK: f32 = 6.0;
 /// The satellite-guided bomb's blasts, from the template database's
 /// laser-guided bomb ("Explosion (Airstike Bomb)" 80008e3f, its frag
 /// "Explosion (Airstrike Frag)" 8000a3df, and its final strike 8000af7d
@@ -205,8 +224,23 @@ const WRECK: f32 = 6.0;
 pub const BOMB: (f32, f32) = (20.0, 100.0);
 pub const BOMB_FRAG: (f32, f32) = (50.0, 300.0);
 const BOMB_FINAL: (f32, f32) = (2.0, 500.0);
-/// A vehicle a blast hits this hard is wrecked.
-const WRECKING: f32 = 60.0;
+/// What a round does to a vehicle it hits: its bullet template's
+/// `Damage` against the vehicle's health (the carbine's "Carbine Bullet"
+/// 6, the soldiers' "Assault Rifle Bullet" 9, the tank's machine guns'
+/// "Heavy MG Bullet" 15), times its weapon's rating (`WeaponHint`, 0 to 3)
+/// against the vehicle's armour class (none, light, medium, heavy), of 3.
+/// Inferred: the ratings may only steer the AI, but rifles doing nothing
+/// to tanks is the game's.
+const CARBINE_ON_VEHICLE: (f32, [u8; 4]) = (6.0, [3, 1, 0, 0]);
+const RIFLE_ON_VEHICLE: (f32, [u8; 4]) = (9.0, [3, 1, 0, 0]);
+const MG_ON_VEHICLE: (f32, [u8; 4]) = (15.0, [3, 2, 1, 0]);
+/// A blast's damage to vehicles (the "Explosion (Tank Shell)" and RPG's:
+/// 200 at its heart down to 50 at 5 m, nothing beyond), times the
+/// vehicle's `ExplosionFudge` (the AMX-30 takes a fifth).
+const BLAST_ON_VEHICLE: (f32, f32, f32) = (200.0, 50.0, 5.0);
+/// Below its `TickDamage` health a vehicle burns down this fast, health a
+/// second (the template's 1 every 0.5 s, read as seconds).
+const BURN_DOWN: f32 = 2.0;
 /// What the bomb leaves burning: this many fires within this far
 /// (metres), each for between these (seconds; the videos: 4 to 6 s).
 const BOMB_FIRES: usize = 5;
@@ -577,7 +611,7 @@ impl Weapon {
     /// the grenade launcher's template's 6.
     pub fn clip(self) -> u32 {
         match self {
-            Weapon::Rifle => 30,
+            Weapon::Rifle => RIFLE_CLIP,
             Weapon::Rpg => 1,
             Weapon::GrenadeLauncher => LAUNCHER_CLIP,
         }
@@ -738,6 +772,8 @@ enum Projectile {
 pub struct Trigger {
     /// Fire held.
     pub fire: bool,
+    /// Change the rifle's clip.
+    pub reload: bool,
     /// Aim held.
     pub aim: bool,
     pub throw: bool,
@@ -770,6 +806,8 @@ pub struct Combat {
     pub revived: bool,
     quiet: f32,
     reload: f32,
+    /// Seconds until a tank's machine gun fires again.
+    mg_reload: f32,
     aim_left: f32,
     /// Seconds until the grenade she is throwing leaves her hand.
     throw_in: Option<f32>,
@@ -803,6 +841,12 @@ pub struct Combat {
     pub second: Option<Weapon>,
     /// The grenade launcher's rounds, while she carries one.
     pub launcher_rounds: Option<Rounds>,
+    /// The rifle's rounds.
+    pub rifle_rounds: Rounds,
+    /// Seconds until the rifle's new clip is in, while she changes it.
+    changing: Option<f32>,
+    /// Grenades she has to throw.
+    pub grenades: u32,
     /// She holds the satellite designator instead of her weapon
     /// ([`crate::support`]).
     pub designator: bool,
@@ -848,6 +892,7 @@ impl Default for Combat {
             revived: false,
             quiet: 0.0,
             reload: 0.0,
+            mg_reload: 0.0,
             aim_left: 0.0,
             throw_in: None,
             bash_in: None,
@@ -864,6 +909,9 @@ impl Default for Combat {
             picked: Picked::default(),
             second: Some(Weapon::Rpg),
             launcher_rounds: None,
+            rifle_rounds: Rounds::of(RIFLE_CLIP + RIFLE_SPARE, RIFLE_CLIP),
+            changing: None,
+            grenades: MAX_GRENADES,
             designator: false,
             last_launch: None,
             fuses: Vec::new(),
@@ -978,22 +1026,63 @@ impl Combat {
         left
     }
 
-    /// Lands her with the carbine alone, as the first contract starts.
+    /// Lands her with the carbine alone, as the first contract starts:
+    /// its scripts give her a carbine, grenades and C4 afresh and fill
+    /// only the carbine, so she has no grenades (none in the footage until
+    /// a pickup).
     pub fn carbine_only(&mut self) {
+        self.rifle_rounds = Rounds::of(RIFLE_CLIP, RIFLE_CLIP);
+        self.changing = None;
         self.second = None;
         self.launcher_rounds = None;
+        self.grenades = 0;
         self.weapon = Weapon::Rifle;
     }
 
     /// Rounds taken from a pickup for `weapon`: the grenade launcher's go
-    /// with the one she carries (none, they are lost); the rest only add
-    /// to what the HUD counts.
+    /// with the one she carries (none, they are lost), the rifle's to its
+    /// spare clips; the RPG's only add to what the HUD counts.
     pub fn take_ammo(&mut self, weapon: Weapon, rounds: u32) {
         match (weapon, &mut self.launcher_rounds) {
-            (Weapon::GrenadeLauncher, Some(r)) => r.stored += rounds,
+            (Weapon::Rifle, _) => {
+                let r = &mut self.rifle_rounds;
+                r.stored = (r.stored + rounds).min(RIFLE_SPARE);
+            }
+            (Weapon::GrenadeLauncher, Some(r)) => {
+                r.stored = (r.stored + rounds).min(LAUNCHER_SPARE)
+            }
             (Weapon::GrenadeLauncher, None) => {}
             _ => self.picked.add(weapon, rounds),
         }
+    }
+
+    /// Launcher rounds, grenades and health from a pickup: as many as she
+    /// has room for, health up to full.
+    pub fn take_supplies(&mut self, launcher: u32, grenades: u32, health: f32) {
+        if launcher > 0 {
+            self.take_ammo(Weapon::GrenadeLauncher, launcher);
+        }
+        self.grenades = (self.grenades + grenades).min(MAX_GRENADES);
+        self.hp = (self.hp + health).min(100.0);
+    }
+
+    /// Whether ammunition or health lying there gives her anything: what
+    /// she walks over she takes only then.
+    pub fn can_use(&self, what: &crate::flights::Leaves) -> bool {
+        let rounds = match what.gives {
+            Some((Weapon::GrenadeLauncher, n)) => n > 0 && self.launcher_rounds.is_some(),
+            Some((Weapon::Rifle, n)) => n > 0 && self.rifle_rounds.stored < RIFLE_SPARE,
+            Some((w, n)) => n > 0 && self.second == Some(w),
+            None => false,
+        };
+        let launcher = what.launcher > 0
+            && self
+                .launcher_rounds
+                .is_some_and(|r| r.stored < LAUNCHER_SPARE);
+        rounds
+            || launcher
+            || (what.grenades > 0 && self.grenades < MAX_GRENADES)
+            || (what.health > 0.0 && self.hp < 100.0)
     }
 
     /// The weapons she carries but doesn't hold, which hang on her back:
@@ -1111,6 +1200,7 @@ impl Combat {
         }
         self.effects.retain(|e| e.1 > 0.0);
         self.reload -= dt;
+        self.mg_reload -= dt;
         self.aim_left -= dt;
         self.quiet += dt;
 
@@ -1134,6 +1224,7 @@ impl Combat {
             _ => {}
         }
         f.player.launcher = self.weapon == Weapon::Rpg;
+        self.change_clip(trigger, on_foot, dt);
         // A grenade leaves her hand at its moment in the throw; knocked
         // down or in a vehicle by then, she never let go.
         if let Some(t) = &mut self.throw_in {
@@ -1160,14 +1251,15 @@ impl Combat {
         let throwing = self.throw_in.is_some() || f.player.throwing.is_some();
         let bashing = self.bash_in.is_some() || f.player.bashing.is_some();
         if on_foot && !throwing && !bashing {
-            if trigger.fire && self.reload <= 0.0 {
+            if trigger.fire && self.reload <= 0.0 && self.changing.is_none() {
                 match self.weapon {
                     Weapon::Rifle => self.player_shoot(f),
                     Weapon::Rpg => self.launch(f),
                     Weapon::GrenadeLauncher => self.lob(f),
                 }
             }
-            if trigger.throw && self.reload <= 0.0 {
+            if trigger.throw && self.reload <= 0.0 && self.grenades > 0 {
+                self.grenades -= 1;
                 self.reload = THROW_GAP;
                 // Without her throw clip, it goes at once.
                 match f.player.start_throw() {
@@ -1190,9 +1282,17 @@ impl Combat {
             && trigger.fire
             && self.reload <= 0.0
         {
-            self.vehicle_fire(f, i);
+            self.vehicle_fire(f, i, false);
         }
-        let holding = on_foot && (trigger.aim || self.aim_left > 0.0);
+        if let Some(i) = f.player.driving
+            && self.down <= 0.0
+            && trigger.aim
+            && self.mg_reload <= 0.0
+        {
+            self.vehicle_fire(f, i, true);
+        }
+        // Changing the clip, she lowers the rifle.
+        let holding = on_foot && (trigger.aim || self.aim_left > 0.0) && self.changing.is_none();
         f.player.aiming = holding;
 
         // Soldiers' shots.
@@ -1203,6 +1303,7 @@ impl Combat {
             }
         }
         self.fly(f, dt);
+        self.burn_vehicles(f, dt);
         self.smoke_wrecks(f, dt);
     }
 
@@ -1258,7 +1359,36 @@ impl Combat {
             .map_or(chest, |m| m.transform_point3(w.muzzle))
     }
 
+    /// The rifle's clip: changed when she asks or once it is empty (as the
+    /// game does), while she holds it on foot with rounds to spare; put
+    /// away or out of her hands, the change starts over next time.
+    fn change_clip(&mut self, trigger: Trigger, on_foot: bool, dt: f32) {
+        let r = self.rifle_rounds;
+        let holding = on_foot && self.weapon == Weapon::Rifle && !self.designator;
+        if !holding {
+            self.changing = None;
+            return;
+        }
+        match &mut self.changing {
+            Some(t) => {
+                *t -= dt;
+                if *t <= 0.0 {
+                    self.changing = None;
+                    self.rifle_rounds = Rounds::of(r.total(), RIFLE_CLIP);
+                }
+            }
+            None if r.stored > 0 && r.clip < RIFLE_CLIP && (trigger.reload || r.clip == 0) => {
+                self.changing = Some(RIFLE_RELOAD);
+            }
+            None => {}
+        }
+    }
+
     fn player_shoot(&mut self, f: &mut Field<'_>) {
+        if self.rifle_rounds.clip == 0 {
+            return;
+        }
+        self.rifle_rounds.clip -= 1;
         self.fired.rifle += 1;
         self.reload = RIFLE_GAP;
         self.aim_left = AIM_AFTER_SHOT;
@@ -1278,6 +1408,7 @@ impl Combat {
         );
         self.sounds.push(Sound::Shot(from));
         if let Some((t, None)) = hit {
+            self.round_on_vehicle(f, (eye, dir, t), CARBINE_ON_VEHICLE, None);
             self.hit_explosives_in(f.explosives, eye + dir * t, RIFLE_DAMAGE);
             // What it hit, if the scene's (a crate takes the round).
             let key = f
@@ -1352,6 +1483,9 @@ impl Combat {
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
         if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
             self.hurt_player(f, NPC_DAMAGE, Some(from));
+        }
+        if let Some((t, None)) = hit {
+            self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
         }
     }
 
@@ -1502,21 +1636,24 @@ impl Combat {
     /// Fires the gun on the turret of vehicle `i`, which she drives, at
     /// what the crosshair is on: a cannon (a tank's, the Stryker's) fires
     /// a shell that bursts like a rocket, anything else's a machine gun.
-    fn vehicle_fire(&mut self, f: &mut Field<'_>, i: usize) {
+    /// Fires the gun of vehicle `i` she drives, or with `coax` the machine
+    /// gun beside a tank's cannon (along it).
+    fn vehicle_fire(&mut self, f: &mut Field<'_>, i: usize, coax: bool) {
         let Some(v) = f.vehicles.get(i) else {
             return;
         };
         let (Some(id), Some(muzzle), false) = (v.id, v.spec.muzzle, v.wrecked) else {
             return;
         };
-        // A cannon with no shells left is silent.
-        if v.rounds() == Some(0) {
+        let cannon = v.spec.cannon();
+        // A cannon with no shells left is silent; only a tank has a
+        // machine gun beside its gun.
+        if (!coax && v.rounds() == Some(0)) || (coax && !cannon) {
             return;
         }
         let Some(body) = f.physics.vehicle_transform(id) else {
             return;
         };
-        let cannon = v.spec.cannon();
         let gun = v.spec.tuning.gun;
         let (from, barrel) = v
             .spec
@@ -1535,7 +1672,7 @@ impl Combat {
         } else {
             barrel
         };
-        if cannon {
+        if cannon && !coax {
             // Its template's rate of fire (45 a minute for the AMX-30's)
             // and shell speed (72 m/s).
             self.reload = gun.map_or(CANNON_RELOAD, |g| 60.0 / g.rate_of_fire.max(1.0));
@@ -1575,7 +1712,11 @@ impl Combat {
             );
             self.sounds.push(Sound::Cannon(from));
         } else {
-            self.reload = MG_GAP;
+            if coax {
+                self.mg_reload = TANK_MG_GAP;
+            } else {
+                self.reload = MG_GAP;
+            }
             let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
             let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
             self.effect(Effect::Tracer { from, to }, 0.07);
@@ -1596,10 +1737,79 @@ impl Combat {
                 self.hits += 1;
             }
             if let Some((t, None)) = hit {
+                self.round_on_vehicle(f, (from, aim, t), MG_ON_VEHICLE, Some(id));
                 self.hit_explosives_in(f.explosives, from + aim * t, MG_DAMAGE);
             }
         }
         alarm(f.people, from);
+    }
+
+    /// Vehicles hurt below their `TickDamage` health burn down until they
+    /// are wrecked.
+    fn burn_vehicles(&mut self, f: &mut Field<'_>, dt: f32) {
+        for i in 0..f.vehicles.len() {
+            let v = &mut f.vehicles[i];
+            let Some(below) = v.spec.tuning.burns_below else {
+                continue;
+            };
+            if !v.wrecked && v.damage > 0.0 && v.most_health() - v.damage <= below {
+                self.hurt_vehicle(f.physics, v, i, BURN_DOWN * dt);
+            }
+        }
+    }
+
+    /// Wrecks vehicle `i`, `v`, if it isn't already: it burns and can't be
+    /// driven.
+    fn wreck(&mut self, physics: &mut Physics, v: &mut ParkedVehicle, i: usize) {
+        if v.wrecked {
+            return;
+        }
+        v.wrecked = true;
+        if let Some(id) = v.id {
+            physics.wreck_vehicle(id);
+        }
+        self.wrecks.push((i, 0.0));
+        self.remarks.push(Remark::Wreck);
+    }
+
+    /// Vehicle `i`, `v`, takes `damage`: wrecked once it has taken its
+    /// health.
+    fn hurt_vehicle(
+        &mut self,
+        physics: &mut Physics,
+        v: &mut ParkedVehicle,
+        i: usize,
+        damage: f32,
+    ) {
+        if v.wrecked {
+            return;
+        }
+        v.damage += damage;
+        if v.damage >= v.most_health() {
+            self.wreck(physics, v, i);
+        }
+    }
+
+    /// A round from `from` along `dir` that struck something solid `t`
+    /// metres on: a vehicle (not `own`) takes `damage`.
+    fn round_on_vehicle(
+        &mut self,
+        f: &mut Field<'_>,
+        (from, dir, t): (Vec3, Vec3, f32),
+        (damage, rating): (f32, [u8; 4]),
+        own: Option<VehicleId>,
+    ) {
+        let Some((_, Some(id))) = f.physics.cast_ray_vehicle(from, dir, t + 0.05, own) else {
+            return;
+        };
+        if let Some(i) = f.vehicles.iter().position(|v| v.id == Some(id)) {
+            let v = &mut f.vehicles[i];
+            let class = v.spec.tuning.armour.map_or(0, |a| a as usize - 1).min(3);
+            let damage = damage * f32::from(rating[class]) / 3.0;
+            if damage > 0.0 {
+                self.hurt_vehicle(f.physics, v, i, damage);
+            }
+        }
     }
 
     /// A round landing at `at` hurts the explosive it hits, which goes up
@@ -1841,18 +2051,23 @@ impl Combat {
             };
             let (lo, hi) = v.spec.bounds;
             let centre = body.transform_point3((lo + hi) * 0.5);
-            let d = centre.distance(at);
-            if d < WRECK {
-                let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-                let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass;
-                // Off-centre, so it tumbles.
-                f.physics
-                    .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
-                if !v.wrecked {
-                    v.wrecked = true;
-                    f.physics.wreck_vehicle(id);
-                    self.wrecks.push((i, 0.0));
-                    self.remarks.push(Remark::Wreck);
+            // Nearest its hull's side, roughly.
+            let d = (centre.distance(at) - (hi - lo).max_element() * 0.25).max(0.0);
+            let (heart, edge, radius) = BLAST_ON_VEHICLE;
+            if d < radius && !v.wrecked {
+                let damage = heart + (edge - heart) * d / radius;
+                self.hurt_vehicle(
+                    f.physics,
+                    v,
+                    i,
+                    damage * v.spec.tuning.blast_scale.unwrap_or(1.0),
+                );
+                // What it wrecks, it throws: off-centre, so it tumbles.
+                if v.wrecked {
+                    let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
+                    let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass;
+                    f.physics
+                        .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
                 }
             }
         }
@@ -1974,22 +2189,23 @@ impl Combat {
             let centre = body.transform_point3((lo + hi) * 0.5);
             let d = centre.distance(at);
             let near = 1.0 - d / radius;
-            if d < radius && damage * near >= WRECKING && !shielded(centre) {
+            if d < radius && !shielded(centre) {
                 wrecking.push((i, centre, near));
             }
         }
         for (i, centre, near) in wrecking {
             let v = &mut f.vehicles[i];
             let Some(id) = v.id else { continue };
-            let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
-            let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3);
-            f.physics
-                .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
-            if !v.wrecked {
-                v.wrecked = true;
-                f.physics.wreck_vehicle(id);
-                self.wrecks.push((i, 0.0));
-                self.remarks.push(Remark::Wreck);
+            if v.wrecked {
+                continue;
+            }
+            let scale = v.spec.tuning.blast_scale.unwrap_or(1.0);
+            self.hurt_vehicle(f.physics, v, i, damage * near * scale);
+            if v.wrecked {
+                let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
+                let push = (away * 4.0 + Vec3::Y * 6.0) * v.spec.mass * near.max(0.3);
+                f.physics
+                    .push_vehicle(id, push, centre + away * -0.5 + Vec3::Y * 0.3);
             }
         }
         for e in f.explosives.iter_mut() {
@@ -2660,6 +2876,7 @@ mod tests {
             gun: 0.0,
             rolled: 0.0,
             fired: 0,
+            damage: 0.0,
         }];
         assert_eq!(vehicles[0].rounds(), Some(2));
         let mut player = Player::new(0.0, 0.0, 0.0, None);
@@ -2691,6 +2908,37 @@ mod tests {
         }
         assert_eq!(shots, 2);
         assert_eq!(vehicles[0].rounds(), Some(0));
+        // A tank's template: 125 health, heavy armour, a fifth of blasts.
+        let t = &mut vehicles[0].spec.tuning;
+        (t.health, t.armour, t.blast_scale, t.burns_below) =
+            (Some(125.0), Some(4), Some(0.2), Some(30.0));
+        assert_eq!(vehicles[0].health(), 100.0);
+        let mut field = Field {
+            physics: &mut physics,
+            player: &mut player,
+            people: &mut people,
+            vehicles: &mut vehicles,
+            arsenal: &arsenal,
+            explosives: &mut [],
+        };
+        // A rifle round does nothing to it; a blast beside it some.
+        let side = (Vec3::new(5.0, 1.0, 0.0), Vec3::NEG_X, 4.0);
+        combat.round_on_vehicle(&mut field, side, CARBINE_ON_VEHICLE, None);
+        assert_eq!(field.vehicles[0].damage, 0.0);
+        combat.explode(&mut field, Vec3::new(2.0, 1.0, 0.0));
+        let hit = field.vehicles[0].health();
+        assert!((60.0..90.0).contains(&hit), "{hit}");
+        assert!(!field.vehicles[0].wrecked);
+        // Lightly armoured, the rifle tells; burning, it goes in the end.
+        field.vehicles[0].spec.tuning.armour = Some(1);
+        combat.round_on_vehicle(&mut field, side, CARBINE_ON_VEHICLE, None);
+        assert!(field.vehicles[0].health() < hit);
+        field.vehicles[0].damage = 100.0;
+        for _ in 0..60 * 15 {
+            combat.burn_vehicles(&mut field, dt);
+        }
+        assert!(field.vehicles[0].wrecked);
+        assert_eq!(field.vehicles[0].health(), 0.0);
         // A car's gun (none here) doesn't count.
         vehicles[0].spec.kind = "car".into();
         vehicles[0].spec.tuning.gun = None;
@@ -2829,6 +3077,41 @@ mod tests {
     }
 
     #[test]
+    fn the_rifle_changes_clips_when_asked_or_empty() {
+        let mut combat = Combat::default();
+        combat.carbine_only();
+        combat.take_ammo(Weapon::Rifle, 45);
+        combat.rifle_rounds.clip = 10;
+        let ask = Trigger {
+            reload: true,
+            ..Default::default()
+        };
+        // Not while driving.
+        combat.change_clip(ask, false, 0.1);
+        assert!(combat.changing.is_none());
+        combat.change_clip(ask, true, 0.1);
+        assert!(combat.changing.is_some());
+        for _ in 0..30 {
+            combat.change_clip(Trigger::default(), true, 0.1);
+        }
+        assert_eq!(
+            combat.rifle_rounds,
+            Rounds {
+                clip: 30,
+                stored: 25
+            }
+        );
+        // Empty, it changes by itself; with nothing to spare, it can't.
+        combat.rifle_rounds.clip = 0;
+        combat.change_clip(Trigger::default(), true, 0.1);
+        assert!(combat.changing.is_some());
+        combat.changing = None;
+        combat.rifle_rounds = Rounds::default();
+        combat.change_clip(ask, true, 0.1);
+        assert!(combat.changing.is_none());
+    }
+
+    #[test]
     fn the_grenade_launcher_takes_the_rpgs_place_and_runs_out() {
         let mut physics = ground();
         let dt = 1.0 / 60.0;
@@ -2896,7 +3179,18 @@ mod tests {
             .count();
         assert_eq!(lobs, 18);
         assert!(!combat.second_loaded());
-        // More rounds go with it; the RPG taken back leaves it, with them.
+        // More rounds go with it, two clips beyond the one at most (a
+        // rocket pickup's 20 clips); the RPG taken back leaves it, with
+        // them.
+        let rockets = crate::flights::Leaves {
+            launcher: 120,
+            ..crate::flights::Leaves::default()
+        };
+        assert!(combat.can_use(&rockets));
+        combat.take_supplies(rockets.launcher, 0, 0.0);
+        assert_eq!(combat.launcher_rounds.map(Rounds::total), Some(12));
+        assert!(!combat.can_use(&rockets));
+        combat.launcher_rounds = Some(Rounds::default());
         combat.take_ammo(Weapon::GrenadeLauncher, 6);
         assert!(combat.second_loaded());
         assert_eq!(

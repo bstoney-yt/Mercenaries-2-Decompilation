@@ -11,6 +11,7 @@ use m2_render::View;
 use crate::camera::FlyCamera;
 use crate::combat::{self, Combat, Effect, Field, Weapon};
 use crate::config::CameraConfig;
+use crate::drops::{Drops, Soldier};
 use crate::input::{Action, Input};
 use crate::mission::{WATERLINE, template_models};
 use crate::player::{ChaseRig, Intent, Player};
@@ -108,7 +109,17 @@ pub struct Game {
     /// health when it last stepped (hurt, a call is called off).
     pub support: Support,
     support_hp: f32,
+    /// The soldier script's count of deaths and rolls: what the dead
+    /// leave ([`crate::drops`]), and how many have.
+    drops: Drops,
+    dropped: u32,
+    /// The scripts have turned her controls off (a loading fade).
+    pub input_locked: bool,
 }
+
+/// A soldier's pickup is told from the others by its "crate": this, plus
+/// how many were left before it.
+const DROPPED: u32 = 0x7000_0000;
 
 impl Game {
     pub fn new(scene: Scene, camera: FlyCamera) -> Self {
@@ -128,6 +139,9 @@ impl Game {
             throttle: 0.0,
             spray_wait: 0.0,
             support: Support::default(),
+            drops: Drops::default(),
+            dropped: 0,
+            input_locked: false,
             support_hp: 0.0,
         }
     }
@@ -291,6 +305,11 @@ impl Game {
     pub fn step(&mut self, intent: Intent, dt: f32) {
         self.startup_props();
         self.fetch_world_vehicles(dt);
+        let intent = if self.input_locked {
+            Intent::default()
+        } else {
+            intent
+        };
         let intent = self.call_support(intent, dt);
         // The use key at what lies within reach: taken with the fight's.
         let mut taking = false;
@@ -521,10 +540,15 @@ impl Game {
                     1.2,
                 );
             }
-            // What a broken crate left, taken with the use key from
-            // within its reach.
-            if taking
-                && player.driving.is_none()
+            // What lies within her reach: a weapon taken up with the use
+            // key; ammunition and health as she walks over them, if they
+            // give her anything (else with the use key, as before).
+            let near = scene
+                .flights
+                .within(player.character.position)
+                .map(|p| p.what.weapon.is_none() && self.combat.can_use(&p.what));
+            if player.driving.is_none()
+                && (taking || near == Some(true))
                 && let Some(p) = scene.flights.take_within(player.character.position)
             {
                 take_up(
@@ -536,8 +560,56 @@ impl Game {
                 );
             }
         }
+        self.drop_pickups();
         self.support_impacts();
         self.scene.tick(dt);
+    }
+
+    /// The soldiers killed this tick leave what their death script picks,
+    /// where they fell.
+    fn drop_pickups(&mut self) {
+        let deaths = self.scene.people.take_deaths();
+        let Some(world) = &self.scene.world else {
+            return;
+        };
+        let templates = &world.index.template_db;
+        for (at, spawn) in deaths {
+            // Their template's labels (the first contract's AT defenders
+            // are heavy rocket soldiers).
+            let labels = spawn
+                .and_then(|e| world.index.spawns.iter().find(|s| s.entity == e))
+                .and_then(|s| templates.id(s.template.as_deref()?))
+                .and_then(|id| templates.leavings.labels.get(&id))
+                .map_or(&[][..], Vec::as_slice);
+            let is = |label: &str| labels.contains(&m2_assets::name_hash(label));
+            let soldier = Soldier {
+                heavy: is("HeavySoldier"),
+                rocket: is("RocketSoldier"),
+                machine_gun: is("MGSoldier"),
+                seated: false,
+            };
+            let Some(name) =
+                self.drops
+                    .on_death(soldier, Some(self.combat.grenades), self.combat.hp)
+            else {
+                continue;
+            };
+            let Some(what) = templates
+                .id(name)
+                .and_then(|id| crate::mission::pickup(templates, id))
+            else {
+                eprintln!("drop: {name} isn't a pickup");
+                continue;
+            };
+            self.dropped += 1;
+            eprintln!("drop: a soldier leaves {name} at {at:.1}");
+            self.scene.flights.leave(crate::flights::Pickup {
+                from: DROPPED + self.dropped,
+                what,
+                at: at + Vec3::Y * 0.1,
+                yaw: 0.0,
+            });
+        }
     }
 
     /// Her support call this tick ([`crate::support`]): on foot, the
@@ -686,6 +758,11 @@ impl Game {
                     .launcher_rounds
                     .filter(|_| self.combat.second == Some(Weapon::GrenadeLauncher))
                     .map(|r| [r.clip, r.stored]),
+                grenades: self.combat.grenades,
+                rifle: Some([
+                    self.combat.rifle_rounds.clip,
+                    self.combat.rifle_rounds.stored,
+                ]),
             },
             vehicles,
             killed: self.scene.people.all_killed(),
@@ -704,6 +781,7 @@ impl Game {
                 world.physics.remove_vehicle(id);
             }
             v.wrecked = false;
+            v.damage = 0.0;
         }
         let p = &save.player;
         player.character.position = Vec3::from(p.position);
@@ -725,6 +803,13 @@ impl Game {
             }
             ("rpg", _) => {}
             _ => self.combat.carbine_only(),
+        }
+        self.combat.grenades = p.grenades.min(combat::MAX_GRENADES);
+        if let Some([clip, stored]) = p.rifle {
+            self.combat.rifle_rounds = combat::Rounds {
+                clip: clip.min(combat::RIFLE_CLIP),
+                stored: stored.min(combat::RIFLE_SPARE),
+            };
         }
         self.combat.weapon = match (p.weapon.as_str(), self.combat.second) {
             ("rpg" | "grenade launcher", Some(w)) => w,
@@ -790,29 +875,36 @@ impl Game {
                 .scene
                 .flights
                 .within(p.character.position)
-                .map(|p| match p.what.weapon {
-                    Some(weapon) => format!(
+                // Ammunition is walked over, unworded (round 138).
+                .and_then(|p| {
+                    let weapon = p.what.weapon?;
+                    Some(format!(
                         "Equip {}",
                         w.index
                             .template_db
                             .by_id(p.what.template)
                             .map_or_else(|| format!("{weapon:?}"), |t| t.0.to_owned())
-                    ),
-                    None => "Take Ammo".to_owned(),
+                    ))
                 }),
             _ => None,
         };
         HudInfo {
             playing: self.on_foot && player.is_some(),
-            hp: self.combat.hp,
+            // In a vehicle, the health box shows the vehicle's.
+            hp: player
+                .and_then(|p| p.driving)
+                .and_then(|i| self.scene.vehicles.get(i))
+                .map_or(self.combat.hp, ParkedVehicle::health),
             down: self.combat.down > 0.0,
             weapon: self.combat.weapon,
             second: self.combat.second,
-            rounds: self
-                .combat
-                .launcher_rounds
-                .filter(|_| self.combat.weapon == Weapon::GrenadeLauncher)
-                .map(|r| (r.clip, r.stored)),
+            grenades: self.combat.grenades,
+            rounds: match self.combat.weapon {
+                Weapon::Rifle => Some(self.combat.rifle_rounds),
+                Weapon::GrenadeLauncher => self.combat.launcher_rounds,
+                Weapon::Rpg => None,
+            }
+            .map(|r| (r.clip, r.stored)),
             // Looking through the satellite, its own overlay is shown.
             prompt: prompt.filter(|_| !self.support.busy()),
             driving,
@@ -965,6 +1057,7 @@ fn take_up(
         if let Some((w, n)) = p.what.gives {
             combat.take_ammo(w, n);
         }
+        combat.take_supplies(p.what.launcher, p.what.grenades, p.what.health);
         eprintln!(
             "pickup: she takes {:#x} at {:.1}{}",
             p.what.template,
@@ -1011,6 +1104,7 @@ fn take_up(
             reach: template.map_or(1.0, |(_, info)| info.radius),
             weapon: Some(left),
             gives: Some((left, kept)),
+            ..crate::flights::Leaves::default()
         },
         at: player.character.position + right * LEFT_BESIDE,
         yaw: player.facing,

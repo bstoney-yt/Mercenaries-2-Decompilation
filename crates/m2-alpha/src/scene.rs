@@ -230,15 +230,16 @@ impl Rig {
 
     /// Moves at `gait` holding a rifle as `carry` says. Aiming, it is
     /// shouldered: by the whole body standing, by the upper body over the
-    /// legs' gait when moving. Otherwise the plain gait carries it low in
-    /// the right hand (as the game does), except that a soldier at the
-    /// ready standing holds it across the chest. Falls back to the plain
-    /// gait without the clips.
+    /// legs' gait when moving. Running, it is held low across the body in
+    /// both hands; otherwise the plain gait carries it low in the right
+    /// hand, except that a soldier at the ready standing holds it across
+    /// the chest. Falls back to the plain gait without the clips.
     pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, carry: Carry) {
         let (whole, upper) = match (gait, carry) {
             (Gait::Idle, Carry::Aim) => (clips.aim, None),
             (_, Carry::Aim) => (None, clips.aim),
             (Gait::Idle, Carry::Ready) => (clips.ready, None),
+            (Gait::Run, _) => (clips.run_low, None),
             _ => (None, None),
         };
         match whole {
@@ -255,7 +256,7 @@ impl Rig {
         }
         // Carried low on the move, the rifle arm hangs as it does standing
         // while the rest of her runs (the game's carry).
-        let arm = (carry == Carry::Low && gait != Gait::Idle)
+        let arm = (carry == Carry::Low && gait != Gait::Idle && whole.is_none())
             .then(|| self.gait_clip(Gait::Idle).zip(self.carry_arm()))
             .flatten();
         self.animator.set_upper(upper.or(arm));
@@ -469,9 +470,28 @@ pub struct ParkedVehicle {
     pub rolled: f32,
     /// Shells its cannon has fired.
     pub fired: u32,
+    /// Damage it has taken, of its [`most_health`](Self::most_health).
+    pub damage: f32,
 }
 
+/// A vehicle's health where its template gives none.
+const VEHICLE_HEALTH: f32 = 500.0;
+
 impl ParkedVehicle {
+    /// The damage it takes before it is wrecked: its template's health.
+    pub fn most_health(&self) -> f32 {
+        self.spec.tuning.health.unwrap_or(VEHICLE_HEALTH).max(1.0)
+    }
+
+    /// Its health of 100, as the HUD's health box shows it: none once
+    /// wrecked.
+    pub fn health(&self) -> f32 {
+        if self.wrecked {
+            return 0.0;
+        }
+        (100.0 * (1.0 - self.damage / self.most_health())).clamp(0.0, 100.0)
+    }
+
     /// The shells left in its cannon, which carries as many as its
     /// template's `iClipSize` (the AMX-30's 40, which the HUD counts down
     /// from in the videos); `None` for a gun that doesn't run out.
@@ -1088,6 +1108,7 @@ impl Scene {
                 gun: 0.0,
                 rolled: 0.0,
                 fired: 0,
+                damage: 0.0,
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
@@ -1102,6 +1123,7 @@ impl Scene {
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
+                    damage: 0.0,
                 });
             }
             Loaded::WorldVehicle(entity, at, yaw, spec, _) => {
@@ -1116,6 +1138,7 @@ impl Scene {
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
+                    damage: 0.0,
                 });
             }
             Loaded::Flight(hash, _, rest, rotors) => {

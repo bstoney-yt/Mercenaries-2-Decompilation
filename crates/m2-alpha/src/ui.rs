@@ -33,11 +33,13 @@ pub struct HudInfo {
     pub weapon: Weapon,
     /// What she carries in the launcher's place, if anything.
     pub second: Option<Weapon>,
-    /// The rounds of the weapon up when it runs out (the grenade
-    /// launcher's): in its clip, and stored.
+    /// Grenades she has.
+    pub grenades: u32,
+    /// The rounds of the weapon up when it runs out (the rifle's and the
+    /// grenade launcher's): in its clip, and stored.
     pub rounds: Option<(u32, u32)>,
     /// What the use key takes from within reach, as the game words it
-    /// ("Equip Grenade Launcher", "Take Ammo").
+    /// ("Equip Grenade Launcher").
     pub prompt: Option<String>,
     /// Driving: the vehicle's name and speed (m/s), and whether it is
     /// wrecked.
@@ -603,7 +605,8 @@ fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
                 Weapon::GrenadeLauncher => "grenade launcher",
             };
             let up = match (info.weapon, info.rounds) {
-                (Weapon::Rifle, _) => "Carbine".to_owned(),
+                (Weapon::Rifle, Some((clip, stored))) => format!("Carbine {clip} | {stored}"),
+                (Weapon::Rifle, None) => "Carbine".to_owned(),
                 (Weapon::Rpg, _) => "RPG".to_owned(),
                 (Weapon::GrenadeLauncher, Some((clip, stored))) => {
                     format!("Grenade launcher {clip} | {stored}")
@@ -623,7 +626,7 @@ fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             text(
                 screen.right_bottom() + vec2(-24.0, -28.0),
                 Align2::RIGHT_BOTTOM,
-                &format!("{up}{other}   ·   G grenade"),
+                &format!("{up}{other}   ·   G grenade ({})", info.grenades),
                 18.0,
                 white,
             );
