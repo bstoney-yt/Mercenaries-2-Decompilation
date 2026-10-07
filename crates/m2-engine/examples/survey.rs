@@ -78,6 +78,9 @@
 //!                           (u32, little-endian): its block, type, name,
 //!                           how often each word appears, and the bytes
 //!                           around the first hit of the first word
+//! dump:<type>[,<name>]      every asset of vz.wad of that type (and name
+//!                           hash): each 4-byte word, 8 a line, as a name,
+//!                           a float or hex
 //! find:<hash>[,..]          names for hashes
 //! cues[:<name>,..]          which bank sounds the clips' sound events
 //!                           (and the names given) play: each name tried
@@ -806,6 +809,7 @@ fn main() -> Result<(), Error> {
             "phy2rules" => phy2_rules(&mut source),
             "vo" => vo_lines(&install, arg),
             "scan" => scan_words(&install, &names, arg),
+            "dump" => dump_assets(&mut source, &names, arg),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
@@ -1010,6 +1014,53 @@ fn voices(install: &Install, names: &Names) -> Result<(), Error> {
 
 /// Finds scripted voice lines (`VO.Cue`'s line names) in the cue tables of
 /// `English.wad`, resident and per mission.
+fn dump_assets<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let mut parts = arg.split(',').filter_map(hex);
+    let Some(ty) = parts.next() else {
+        println!("dump: no type");
+        return Ok(());
+    };
+    let name = parts.next();
+    let index = source.archive().index();
+    let picked: Vec<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == ty && name.is_none_or(|n| n == a.name_hash))
+        .map(|a| a.name_hash)
+        .collect();
+    for h in picked {
+        let data = source.asset(h, ty)?;
+        println!(
+            "asset {ty:08x} {h:08x} {} ({} bytes)",
+            names.show(h),
+            data.len()
+        );
+        for (i, line) in data.chunks(32).enumerate() {
+            let words: Vec<String> = line
+                .chunks(4)
+                .map(|c| {
+                    let mut w = [0u8; 4];
+                    w[..c.len()].copy_from_slice(c);
+                    let v = u32::from_le_bytes(w);
+                    let f = f32::from_le_bytes(w);
+                    match names.get(v).filter(|_| v > 0xffff) {
+                        Some(n) => n.to_owned(),
+                        None if v == 0 => "0".to_owned(),
+                        None if f.is_finite() && (1e-3..1e6).contains(&f.abs()) => format!("{f}"),
+                        None => format!("#{v:x}"),
+                    }
+                })
+                .collect();
+            println!("  +{:04x} {}", i * 32, words.join(" "));
+        }
+    }
+    Ok(())
+}
+
 fn scan_words(install: &Install, names: &Names, arg: &str) -> Result<(), Error> {
     let words: Vec<u32> = arg.split(',').filter_map(hex).collect();
     let report = |place: &str, data: &[u8]| {
