@@ -38,6 +38,10 @@ pub const DEFAULT_MODEL: u32 = 0x15d8_9832;
 
 /// Where the island opens: the first town, as in the viewer's examples.
 pub const DEFAULT_SPAWN: (f32, f32) = (450.0, -1950.0);
+/// Where free roam starts without `--spawn`: where the scripts put the
+/// player once the first contract is done (VzaCon001's flow binding
+/// teleports her to the next contract's start, by the PMC's offices).
+pub const FREE_ROAM_START: &str = "PmcCon001_Start1";
 
 /// Half the ground's width in metres.
 const GROUND_HALF: f32 = 1000.0;
@@ -460,6 +464,10 @@ pub struct ParkedVehicle {
     /// Where the island's layers park it (position, yaw), if the game's
     /// own: the entity and its spot.
     pub spot: Option<(u32, Vec3, f32)>,
+    /// Who rides in it, as its template's `Rider` records say: each
+    /// seat's name (`seat_driver`) and its rider's template name
+    /// (`Guerilla Soldier`). Not drawn or seated yet.
+    pub crew: Vec<(String, String)>,
     /// How far its turret is turned from straight ahead, radians
     /// (anticlockwise from above).
     pub turret: f32,
@@ -519,7 +527,7 @@ pub enum Loaded {
     MissionVehicle(u32, VehicleSpec, CpuModel),
     /// One of the game's own parked vehicles: its layer entity, where it
     /// stands (position, yaw), its spec and model.
-    WorldVehicle(u32, Vec3, f32, VehicleSpec, CpuModel),
+    WorldVehicle(u32, Vec3, f32, Vec<(String, String)>, VehicleSpec, CpuModel),
     Catalogue(Catalogue),
     /// A person's model: a role's, or a story character's (true).
     Person(PersonModel, CpuModel, Skeleton, bool),
@@ -805,7 +813,7 @@ impl Scene {
         backend: &mut dyn RenderBackend,
         install: &Install,
         settings: WorldSettings,
-        spawn: (f32, f32),
+        spawn: Option<(f32, f32)>,
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         let mut world = World::open(install, backend, &mut self.materials, settings)
@@ -823,7 +831,27 @@ impl Scene {
         );
         self.explosives = crate::combat::explosives(&world.index);
         eprintln!("explosives: {}", self.explosives.len());
-        let (x, z) = spawn;
+        // Without a place asked for, where the first contract leaves her,
+        // facing the way that start point does.
+        let start = spawn
+            .is_none()
+            .then(|| world.index.start(FREE_ROAM_START))
+            .flatten();
+        let ((x, z), facing) = match (spawn, start) {
+            (Some(at), _) => (at, 0.0),
+            (None, Some(s)) => {
+                let f = s.rotation * Vec3::Z;
+                eprintln!(
+                    "start: {} at {:.1}, {:.1}, {:.1}",
+                    s.name, s.position.x, s.position.y, s.position.z
+                );
+                ((s.position.x, s.position.z), f.x.atan2(f.z))
+            }
+            (None, None) => {
+                eprintln!("start: no {FREE_ROAM_START} in the layers; the first town instead");
+                (DEFAULT_SPAWN, 0.0)
+            }
+        };
         let y = world.index.rough_height(x, z) + 40.0;
         self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));
         self.world = Some(world);
@@ -877,7 +905,7 @@ impl Scene {
             }
         }
         self.people.clips = clips;
-        let mut player = Player::new(x, z, 0.0, model);
+        let mut player = Player::new(x, z, facing, model);
         player.clips = clips;
         self.player = Some(player);
         self.vehicle_loads = Some(load_cast(install.clone()));
@@ -905,9 +933,16 @@ impl Scene {
     /// Loads one of the game's own parked vehicles, layer entity `entity`
     /// standing at `at` facing `yaw`, from the first of `models` that
     /// drives.
-    pub fn load_world_vehicle(&self, entity: u32, at: Vec3, yaw: f32, models: Vec<CatalogueEntry>) {
+    pub fn load_world_vehicle(
+        &self,
+        entity: u32,
+        at: Vec3,
+        yaw: f32,
+        crew: Vec<(String, String)>,
+        models: Vec<CatalogueEntry>,
+    ) {
         self.load_vehicle_as(models, format!("vehicle {entity:#x}"), move |spec, cpu| {
-            Loaded::WorldVehicle(entity, at, yaw, spec, cpu)
+            Loaded::WorldVehicle(entity, at, yaw, crew, spec, cpu)
         });
     }
 
@@ -1063,7 +1098,7 @@ impl Scene {
             }
             Loaded::Vehicle(_, cpu)
             | Loaded::MissionVehicle(_, _, cpu)
-            | Loaded::WorldVehicle(_, _, _, _, cpu)
+            | Loaded::WorldVehicle(_, _, _, _, _, cpu)
             | Loaded::Person(_, cpu, _, _)
             | Loaded::Weapon(_, cpu, _)
             | Loaded::Flight(_, cpu, _, _) => cpu,
@@ -1088,6 +1123,7 @@ impl Scene {
                 wrecked: false,
                 guid: None,
                 spot: None,
+                crew: Vec::new(),
                 turret: 0.0,
                 gun: 0.0,
                 rolled: 0.0,
@@ -1095,6 +1131,11 @@ impl Scene {
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
+                let crew = self
+                    .world
+                    .as_ref()
+                    .map(|w| w.index.template_db.crew(&spec.label))
+                    .unwrap_or_default();
                 self.vehicles.push(ParkedVehicle {
                     spec: tune(spec),
                     model,
@@ -1102,13 +1143,14 @@ impl Scene {
                     wrecked: false,
                     guid: Some(guid),
                     spot: None,
+                    crew,
                     turret: 0.0,
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
                 });
             }
-            Loaded::WorldVehicle(entity, at, yaw, spec, _) => {
+            Loaded::WorldVehicle(entity, at, yaw, crew, spec, _) => {
                 self.vehicles.push(ParkedVehicle {
                     spec: tune(spec),
                     model,
@@ -1116,6 +1158,7 @@ impl Scene {
                     wrecked: false,
                     guid: None,
                     spot: Some((entity, at, yaw)),
+                    crew,
                     turret: 0.0,
                     gun: 0.0,
                     rolled: 0.0,

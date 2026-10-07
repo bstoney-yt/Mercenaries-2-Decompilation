@@ -21,6 +21,7 @@ pub mod model;
 pub mod motion;
 pub mod physics;
 pub mod pickup;
+pub mod population;
 pub mod scatter;
 pub mod stream;
 pub mod technique;
