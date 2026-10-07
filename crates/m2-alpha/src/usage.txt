@@ -108,6 +108,8 @@ m2-alpha [options]
                          (crates/m2-game/examples/drivers/vzacon001.lua
                          plays the first contract); repeatable
   --mission-seconds <s>  with --screenshot: play this long instead of ten
+  --look-pickup <m>      with --screenshot: take the picture from this far
+                         off the pickup lying nearest her, looking at it
   --mission-look <m>     with --mission --screenshot: take the picture from
                          this far from the nearest marker, looking at it
   --old-hud              our own stand-in HUD (health bar, weapon line,

@@ -40,6 +40,7 @@ mod cache;
 mod camera;
 mod combat;
 mod config;
+mod drops;
 mod flights;
 mod game;
 mod gamehud;
@@ -174,6 +175,9 @@ struct Options {
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
     mission_look: Option<f32>,
+    /// With `--screenshot`: take the picture from this far from the
+    /// pickup lying nearest her, looking down at it.
+    look_pickup: Option<f32>,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
     mission_seconds: f32,
@@ -365,6 +369,9 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--probe" => o.probe = true,
             "--fire" => o.fire = true,
+            "--look-pickup" => {
+                o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
+            }
             "--mission-look" => {
                 o.mission_look = Some(value()?.parse().context("--mission-look expects metres")?)
             }
@@ -989,6 +996,9 @@ fn screenshot(
     if let (Some(reach), Some(link)) = (options.mission_look, &link) {
         look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
     }
+    if let Some(reach) = options.look_pickup {
+        look_at_pickup(&mut game, reach);
+    }
     if let Some(p) = game.scene.player.as_ref().filter(|_| game.on_foot) {
         // Hits from around her, as the camera sees it: 0 ahead, 90 right.
         let at = p.character.position + m2_math::glam::Vec3::Y;
@@ -1044,6 +1054,67 @@ fn screenshot(
         eprintln!("wrote {}", plain.display());
     }
     Ok(())
+}
+
+/// Puts the camera `reach` metres off the pickup lying nearest her, a
+/// little above it and looking at it, and says which it is and whether
+/// its model has loaded.
+fn look_at_pickup(game: &mut Game, reach: f32) {
+    let Some(her) = game.scene.player.as_ref().map(|p| p.character.position) else {
+        return;
+    };
+    let flights = &game.scene.flights;
+    let Some(p) = flights
+        .pickups()
+        .iter()
+        .min_by(|a, b| a.at.distance(her).total_cmp(&b.at.distance(her)))
+    else {
+        eprintln!("look-pickup: nothing lies to be taken");
+        return;
+    };
+    eprintln!(
+        "look-pickup: {:#x} at {:.1}, {:.1} m from her, model {:?} {}",
+        p.what.template,
+        p.at,
+        p.at.distance(her),
+        p.what.model,
+        if p.what.model.is_some_and(|m| flights.has_model(m)) {
+            "loaded"
+        } else {
+            "not loaded"
+        }
+    );
+    let at = p.at + m2_math::glam::Vec3::Y * 0.2;
+    // Who lies or stands by it (the soldier who left it).
+    if let Some(n) = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .filter(|n| n.character.position.distance(p.at) < 3.0)
+        .min_by(|a, b| {
+            a.character
+                .position
+                .distance(p.at)
+                .total_cmp(&b.character.position.distance(p.at))
+        })
+    {
+        eprintln!(
+            "look-pickup: a person {:.1} m away, {}, {}",
+            n.character.position.distance(p.at),
+            if n.alive { "alive" } else { "dead" },
+            if n.ragdoll.is_some() {
+                "limp"
+            } else {
+                "not limp"
+            }
+        );
+    }
+    // From above, so that a body by it doesn't hide it.
+    let back = (her - at).with_y(0.0).normalize_or(m2_math::glam::Vec3::Z);
+    game.on_foot = false;
+    game.camera =
+        FlyCamera::looking_at(at + back * reach * 0.5 + m2_math::glam::Vec3::Y * reach, at);
 }
 
 /// What stands where a bomb fell (`at`, x and z), as its pictures are
@@ -1951,7 +2022,9 @@ fn mission_for_screenshot(
             }
             for p in game.scene.flights.pickups() {
                 if opened.insert(p.key()) {
-                    pickup_shots.push((i + 1, p.key(), opened.len()));
+                    // Two seconds on, when the soldier who left it has
+                    // fallen.
+                    pickup_shots.push((i + (2.0 / tick) as u32, p.key(), opened.len()));
                 }
             }
             let due: Vec<((u32, u32), usize)> = pickup_shots
@@ -1978,7 +2051,8 @@ fn mission_for_screenshot(
                     .with_y(0.0)
                     .try_normalize()
                     .unwrap_or(m2_math::glam::Vec3::X);
-                let eye = p.at + away * 5.0 + m2_math::glam::Vec3::Y * 2.5;
+                // Steeply from above, so that a body by it doesn't hide it.
+                let eye = p.at + away * 1.5 + m2_math::glam::Vec3::Y * 3.5;
                 delivery_picture(
                     backend,
                     game,
@@ -2400,6 +2474,10 @@ fn drive_for_screenshot(
                 "{:08x}: {:.0} a minute, {} rounds, {:.0} m/s (most {:.0}), gravity x{:.1}, flash {:?} s, bank {:08x?}",
                 g.weapon, g.rate_of_fire, g.rounds, g.velocity, g.max_velocity, g.gravity_scale, g.flash, g.sound_bank
             ))
+        );
+        eprintln!(
+            "drive: health {:?}, armour {:?}, blasts x{:?}, burns below {:?}",
+            t.health, t.armour, t.blast_scale, t.burns_below
         );
         let templated = game
             .scene
@@ -3433,6 +3511,9 @@ impl Running {
             }
             for id in hushed {
                 self.audio.hush(id);
+            }
+            for change in m.take_fades() {
+                self.audio.change_category(change);
             }
             for (cue, stop) in m.take_sounds() {
                 if stop {

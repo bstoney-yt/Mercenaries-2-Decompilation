@@ -41,13 +41,13 @@ use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
 use m2_math::glam::Vec3;
 
-use crate::combat::Weapon;
+use crate::combat::{self, Weapon};
 use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::gamehud::{HudCall, Plain, RadarRegion};
 use crate::scene::NOT_DRIVABLE;
-use crate::support::{FALLBACK_AFTER, Impact, Kind};
+use crate::support::{self, FALLBACK_AFTER, Impact, Kind};
 
 /// The scripts run ten times a second.
 const STEP: f32 = 0.1;
@@ -58,6 +58,10 @@ pub type ScriptLine = (u32, String, Option<Vec3>);
 /// Who the scripts take the player for: Jennifer, whose model and voice
 /// the alpha plays (the scripts pick her replies on the radio by this).
 pub const HERO: &str = "Jennifer";
+/// The grenades' weapon template.
+const GRENADE: &str = "Grenade";
+/// Her rifle's template in the first contract.
+const CARBINE: &str = "Carbine";
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -250,6 +254,8 @@ pub struct MissionLink {
     /// Interface sounds the scripts cued (`ui_HUD_Objective_New`), and
     /// whether each is to stop instead.
     sounds: Vec<(String, bool)>,
+    /// Sound category fades and pitches the scripts asked for.
+    fades: Vec<crate::sound::CategoryChange>,
     /// The music cue the scripts last switched to (`Some(None)`: none).
     music: Option<Option<String>>,
 }
@@ -337,6 +343,7 @@ impl MissionLink {
             lines: Vec::new(),
             hushed: Vec::new(),
             sounds: Vec::new(),
+            fades: Vec::new(),
             music: None,
         }
     }
@@ -467,7 +474,11 @@ impl MissionLink {
                 .filter(|n| n.as_str() == name)
                 .count();
             eprintln!("mission: posted {name:?}, {waiting} script events waiting for it");
-            mission.post(name);
+            match name {
+                support::PDA_OPEN => mission.post_net_event(name, true),
+                support::PDA_CLOSE => mission.post_net_event(name, false),
+                _ => mission.post(name),
+            }
         }
         self.lag += dt;
         let mut lines = Vec::new();
@@ -569,6 +580,9 @@ impl MissionLink {
                 mission.player_died();
             }
             mission.set_health(PLAYER, game.combat.hp);
+            mission.set_player_reserve(GRENADE, game.combat.grenades);
+            let spare = game.combat.rifle_rounds.stored;
+            mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -584,6 +598,34 @@ impl MissionLink {
                     Command::Hush(id) => self.hushed.push(*id),
                     Command::CueSound { at: None, cue } => self.sounds.push((cue.clone(), false)),
                     Command::StopSound { at: None, cue } => self.sounds.push((cue.clone(), true)),
+                    Command::FadeSound {
+                        category,
+                        level,
+                        seconds,
+                    } => match m2_engine::Category::named(category) {
+                        Some(category) => self.fades.push(crate::sound::CategoryChange::Fade {
+                            category,
+                            level: *level,
+                            seconds: *seconds,
+                        }),
+                        None => eprintln!("mission: no sounds of category {category} to fade"),
+                    },
+                    Command::PitchSound {
+                        category,
+                        pitch,
+                        seconds,
+                    } => match m2_engine::Category::named(category) {
+                        Some(category) => self.fades.push(crate::sound::CategoryChange::Pitch {
+                            category,
+                            pitch: *pitch,
+                            seconds: *seconds,
+                        }),
+                        None => eprintln!("mission: no sounds of category {category} to pitch"),
+                    },
+                    Command::InputEnabled(on) => {
+                        eprintln!("mission: controls {}", if *on { "on" } else { "off" });
+                        game.input_locked = !on;
+                    }
                     Command::HealthClamp(on) => {
                         eprintln!("mission: health clamp {on}");
                         game.combat.health_clamp = *on;
@@ -598,6 +640,28 @@ impl MissionLink {
                     Command::Music(cue) => self.music = Some(cue.clone()),
                     Command::Invincible { guid, on } if *guid == PLAYER => {
                         game.combat.invincible = *on;
+                    }
+                    // Her weapons, as the contract's scripts hand them out:
+                    // fresh ones come with nothing in reserve.
+                    Command::Loadout { who, weapons } if *who == PLAYER => {
+                        eprintln!("mission: her loadout is now {weapons:?}");
+                        game.combat.carbine_only();
+                    }
+                    Command::Reserve {
+                        who,
+                        weapon,
+                        rounds,
+                    } if *who == PLAYER => {
+                        eprintln!("mission: scripts give her {weapon} {rounds} in reserve");
+                        if weapon.eq_ignore_ascii_case(GRENADE) {
+                            game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
+                        } else if weapon.eq_ignore_ascii_case(CARBINE) {
+                            game.combat.rifle_rounds.stored =
+                                (*rounds * combat::RIFLE_CLIP).min(combat::RIFLE_SPARE);
+                        }
+                    }
+                    Command::DropWeapon { who, weapon } => {
+                        eprintln!("mission: {who:#x} lets go of their {weapon}");
                     }
                     _ => {}
                 }
@@ -645,10 +709,6 @@ impl MissionLink {
                     }
                 }
                 mission.start();
-                // She lands with the carbine alone (the footage: nothing on
-                // her back, only "Carbine" in the weapon box) until the
-                // supply crate's grenade launcher.
-                game.combat.carbine_only();
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
                     if obey(game, &mission, &mut self.vehicles, &c) {
@@ -675,6 +735,12 @@ impl MissionLink {
             std::mem::take(&mut self.lines),
             std::mem::take(&mut self.hushed),
         )
+    }
+
+    /// Sound category fades and pitches the scripts asked for since the
+    /// last call.
+    pub fn take_fades(&mut self) -> Vec<crate::sound::CategoryChange> {
+        std::mem::take(&mut self.fades)
     }
 
     /// Interface sounds the scripts cued since the last call.
@@ -1587,6 +1653,15 @@ fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
     else {
         return Vec::new();
     };
+    left.iter()
+        .filter_map(|&left| pickup(templates, left))
+        .collect()
+}
+
+/// What pickup template `id` gives her, as [`leaves`] reads it; besides,
+/// the grenades of its `Grenade Projectile` record and a health pickup's
+/// health (`Health Pickup`: 50, points of her 100).
+pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     let fires = |weapon: &str, ammo: u32| {
         let model = name_hash(weapon);
         templates.leavings.ammo.iter().any(|(&w, &a)| {
@@ -1596,34 +1671,55 @@ fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
                     .is_some_and(|(_, t)| t.model == Some(model))
         })
     };
-    left.iter()
-        .filter_map(|&left| {
-            let info = templates.leavings.pickups.get(&left)?;
-            let model = templates.by_id(left).and_then(|(_, t)| t.model);
-            let weapon = Weapon::ALL
+    let info = templates.leavings.pickups.get(&id)?;
+    let model = templates.by_id(id).and_then(|(_, t)| t.model);
+    let weapon = Weapon::ALL
+        .into_iter()
+        .find(|w| model == Some(name_hash(w.model_name())));
+    let gives = match weapon {
+        // Its own rounds, whatever its record names: the launcher's names
+        // "Grenade Launcher Projectile", not the "GL Projectile" it fires
+        // (round 94: taken up empty).
+        Some(w) => Some((w, info.rounds.max(1) * w.clip())),
+        None => info.ammo.and_then(|ammo| {
+            Weapon::ALL
                 .into_iter()
-                .find(|w| model == Some(name_hash(w.model_name())));
-            let gives = match weapon {
-                // Its own rounds, whatever its record names: the
-                // launcher's names "Grenade Launcher Projectile", not the
-                // "GL Projectile" it fires (round 94: taken up empty).
-                Some(w) => Some((w, info.rounds.max(1) * w.clip())),
-                None => info.ammo.and_then(|ammo| {
-                    Weapon::ALL
-                        .into_iter()
-                        .find(|w| fires(w.model_name(), ammo))
-                        .map(|w| (w, info.rounds * w.clip()))
-                }),
-            };
-            Some(Leaves {
-                template: left,
-                model,
-                reach: info.radius,
-                weapon,
-                gives,
-            })
-        })
-        .collect()
+                .find(|w| fires(w.model_name(), ammo))
+                .map(|w| (w, info.rounds * w.clip()))
+        }),
+    };
+    // The launcher's rounds of an ammunition pickup: clips, as the
+    // launcher's own 3 are.
+    let launcher = match weapon {
+        Some(_) => 0,
+        None => info
+            .gives
+            .iter()
+            .filter(|&&(ammo, _)| fires(Weapon::GrenadeLauncher.model_name(), ammo))
+            .map(|(_, n)| n * Weapon::GrenadeLauncher.clip())
+            .sum(),
+    };
+    let grenade = templates.id("Grenade Projectile");
+    let grenades = info
+        .gives
+        .iter()
+        .filter(|(ammo, _)| Some(*ammo) == grenade)
+        .map(|(_, n)| n)
+        .sum();
+    Some(Leaves {
+        template: id,
+        model,
+        reach: info.radius,
+        weapon,
+        gives,
+        launcher,
+        grenades,
+        health: if info.kind == m2_engine::pickup::HEALTH {
+            info.rounds as f32
+        } else {
+            0.0
+        },
+    })
 }
 
 /// The models one of the scripts' objects drives as
@@ -1777,9 +1873,11 @@ mod tests {
             0x8000_4379,
         );
         let pickup = |ammo, rounds| PickupInfo {
+            kind: 1,
             radius: 1.0,
             ammo: Some(ammo),
             rounds,
+            gives: vec![(ammo, rounds)],
             cue: None,
             effect: None,
         };
@@ -1807,6 +1905,7 @@ mod tests {
                     (rockets, pickup(missile, 20)),
                 ]),
                 ammo: HashMap::from([(rpg, missile), (launcher, grenade)]),
+                labels: HashMap::new(),
             },
             ..Templates::default()
         };
@@ -1820,6 +1919,7 @@ mod tests {
                     reach: 1.0,
                     weapon: Some(Weapon::GrenadeLauncher),
                     gives: Some((Weapon::GrenadeLauncher, 18)),
+                    ..Leaves::default()
                 },
                 Leaves {
                     template: rockets,
@@ -1827,6 +1927,7 @@ mod tests {
                     reach: 1.0,
                     weapon: None,
                     gives: Some((Weapon::Rpg, 20)),
+                    ..Leaves::default()
                 },
             ]
         );

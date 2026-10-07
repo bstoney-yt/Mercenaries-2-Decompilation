@@ -214,6 +214,78 @@ impl Falloff {
     }
 }
 
+/// Which of the game's sound categories a sound is in. The scripts fade
+/// and pitch them by name (`MrxSoundCategories` sets): `non_ui` is the
+/// world's own sounds, and dialogue, barks and music go separately (the
+/// fanfare fades `non_ui` and `vo` both, and the survival rescue pitches
+/// barks less than the world; inferred, the engine's tree not decoded).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Category {
+    /// `non_ui`: everything placed in the world, engines, guns, ambience.
+    #[default]
+    World,
+    /// `chatter`: people's barks.
+    Chatter,
+    /// `music`.
+    Music,
+    /// `vo`: scripted dialogue, the radio's included.
+    Vo,
+    /// The interface's sounds, which no script fades.
+    Ui,
+}
+
+impl Category {
+    const ALL: usize = 5;
+
+    /// The category a script names (`non_ui`, `chatter`, ...), if one we
+    /// play.
+    pub fn named(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "non_ui" => Self::World,
+            "chatter" => Self::Chatter,
+            "music" => Self::Music,
+            "vo" => Self::Vo,
+            "ui" => Self::Ui,
+            _ => return None,
+        })
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// A value gliding to a goal at a steady rate.
+#[derive(Clone, Copy, Debug)]
+struct Glide {
+    now: f32,
+    goal: f32,
+    /// Change per second.
+    rate: f32,
+}
+
+impl Glide {
+    const ONE: Self = Self {
+        now: 1.0,
+        goal: 1.0,
+        rate: f32::MAX,
+    };
+
+    fn to(&mut self, goal: f32, seconds: f32) {
+        self.goal = goal;
+        self.rate = if seconds > 1e-3 {
+            (goal - self.now).abs() / seconds
+        } else {
+            f32::MAX
+        };
+    }
+
+    fn step(&mut self, seconds: f32) {
+        let step = self.rate * seconds;
+        self.now += (self.goal - self.now).clamp(-step, step);
+    }
+}
+
 /// How to play a sound.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Play {
@@ -225,6 +297,8 @@ pub struct Play {
     /// Where it is in the world; `None` plays it flat.
     pub position: Option<Vec3>,
     pub falloff: Falloff,
+    /// Its category, which [`Mixer::fade`] and [`Mixer::pitch`] work on.
+    pub category: Category,
 }
 
 impl Play {
@@ -236,6 +310,7 @@ impl Play {
             looping: false,
             position: None,
             falloff: Falloff::default(),
+            category: Category::World,
         }
     }
 
@@ -255,6 +330,15 @@ impl Play {
 
     pub fn gain(self, gain: f32) -> Self {
         Self { gain, ..self }
+    }
+
+    /// Marks it an interface sound, which no script fades.
+    pub fn ui(self) -> Self {
+        self.category(Category::Ui)
+    }
+
+    pub fn category(self, category: Category) -> Self {
+        Self { category, ..self }
     }
 }
 
@@ -285,6 +369,11 @@ pub struct Mixer {
     /// The listener's right, horizontal.
     right: Vec3,
     pub master: f32,
+    /// Each category's level and pitch, glided by [`Self::fade`] and
+    /// [`Self::pitch`] (the scripts duck the world under a radio
+    /// conversation and slow it in the survival rescue).
+    levels: [Glide; Category::ALL],
+    pitches: [Glide; Category::ALL],
     /// Most voices played at once; the quietest are dropped past it.
     pub max_voices: usize,
 }
@@ -299,12 +388,31 @@ impl Mixer {
             listener: Vec3::ZERO,
             right: Vec3::X,
             master: 0.8,
+            levels: [Glide::ONE; Category::ALL],
+            pitches: [Glide::ONE; Category::ALL],
             max_voices: 64,
         }
     }
 
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// Glides `category`'s sounds to `level` over `seconds`
+    /// (`Sound.FadeCategoryDown`/`Up`).
+    pub fn fade(&mut self, category: Category, level: f32, seconds: f32) {
+        self.levels[category.index()].to(level.clamp(0.0, 1.0), seconds);
+    }
+
+    /// Glides `category`'s sounds to `pitch` times their own over
+    /// `seconds` (`Sound.PitchCategoryActivate`/`Deactivate`).
+    pub fn pitch(&mut self, category: Category, pitch: f32, seconds: f32) {
+        self.pitches[category.index()].to(pitch.clamp(0.05, 4.0), seconds);
+    }
+
+    /// The level `category`'s sounds play at now.
+    pub fn level(&self, category: Category) -> f32 {
+        self.levels[category.index()].now
     }
 
     pub fn play(&mut self, play: Play) -> VoiceId {
@@ -374,7 +482,7 @@ impl Mixer {
 
     /// Left and right gain for `play` from the listener.
     fn gains(&self, play: &Play) -> (f32, f32) {
-        let g = play.gain * self.master;
+        let g = play.gain * self.master * self.level(play.category);
         let Some(at) = play.position else {
             return (g, g);
         };
@@ -408,6 +516,11 @@ impl Mixer {
         if frames == 0 {
             return;
         }
+        let seconds = frames as f32 / self.rate as f32;
+        for g in self.levels.iter_mut().chain(&mut self.pitches) {
+            g.step(seconds);
+        }
+        let pitches = self.pitches.map(|g| g.now);
         let gains: Vec<(f32, f32)> = self.voices.iter().map(|v| self.gains(&v.play)).collect();
         for (v, target) in self.voices.iter_mut().zip(gains) {
             let len = v.play.buffer.frames();
@@ -416,7 +529,7 @@ impl Mixer {
                 continue;
             }
             let step = f64::from(v.play.buffer.rate) / f64::from(self.rate)
-                * f64::from(v.play.pitch.max(0.01));
+                * f64::from(v.play.pitch.max(0.01) * pitches[v.play.category.index()]);
             let (mut gl, mut gr) = v.current;
             // Gain changes glide over a few milliseconds instead of clicking.
             let ramp = frames.min(RAMP_FRAMES);
@@ -1033,6 +1146,42 @@ mod tests {
         assert_eq!(out[2 * 80], out[2 * 80 + 1]);
         assert_eq!(out[2 * 150], 0.0, "finished");
         assert!(!m.is_playing(id));
+    }
+
+    #[test]
+    fn a_fade_ducks_its_own_category_alone() {
+        let mut m = Mixer::new(100);
+        m.master = 1.0;
+        m.fade(Category::World, 0.25, 1.0);
+        m.play(Play::flat(tone(100, 1000)).looped());
+        let mut out = vec![0.0; 2 * 50];
+        // Half a second in the world is at 0.625; a second in, at 0.25.
+        m.mix(&mut out);
+        m.mix(&mut out);
+        assert!((out[2 * 49] - 0.5 * 0.25).abs() < 1e-3, "{}", out[98]);
+        let mut m = Mixer::new(100);
+        m.master = 1.0;
+        m.fade(Category::World, 0.25, 0.0);
+        m.play(Play::flat(tone(100, 1000)).looped().ui());
+        m.mix(&mut out);
+        m.mix(&mut out);
+        assert!((out[2 * 49] - 0.5).abs() < 1e-3, "{}", out[98]);
+    }
+
+    #[test]
+    fn a_pitched_category_plays_slower() {
+        // Recorded at the mixer's rate: at half pitch each source frame
+        // lasts two output frames, so a 10-frame sound takes 20.
+        let mut m = Mixer::new(100);
+        m.pitch(Category::World, 0.5, 0.0);
+        let world = m.play(Play::flat(tone(100, 10)));
+        let barks = m.play(Play::flat(tone(100, 10)).category(Category::Chatter));
+        let mut out = vec![0.0; 2 * 15];
+        m.mix(&mut out);
+        assert!(m.is_playing(world));
+        assert!(!m.is_playing(barks));
+        m.mix(&mut out);
+        assert!(!m.is_playing(world));
     }
 
     #[test]

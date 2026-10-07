@@ -104,8 +104,8 @@ pub struct Load {
 }
 
 /// One thing a crate leaves when broken open (one of its template's
-/// `SpawnOnDeath`s, a pickup).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// `SpawnOnDeath`s, a pickup), or a soldier when killed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Leaves {
     /// The pickup's template, and the model that names, if the archive
     /// has it.
@@ -118,6 +118,12 @@ pub struct Leaves {
     /// The rounds it gives, and for which of her weapons (those of a
     /// weapon she doesn't carry give her nothing).
     pub gives: Option<(Weapon, u32)>,
+    /// Grenade launcher rounds an ammunition pickup gives besides (`Ammo
+    /// Pickup (Rocket)`'s `Grenade Launcher Projectile` record), grenades
+    /// (`Grenade Projectile`), and health.
+    pub launcher: u32,
+    pub grenades: u32,
+    pub health: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1045,6 +1051,7 @@ mod tests {
             reach: 1.0,
             weapon: Some(Weapon::GrenadeLauncher),
             gives: Some((Weapon::GrenadeLauncher, 18)),
+            ..Leaves::default()
         };
         let rockets = Leaves {
             template: 0x8000_56dc,
@@ -1052,6 +1059,7 @@ mod tests {
             reach: 1.0,
             weapon: None,
             gives: Some((Weapon::Rpg, 20)),
+            ..Leaves::default()
         };
         let mut flights = Flights::default();
         let load = Load {
@@ -1120,6 +1128,7 @@ mod tests {
                 reach: 1.0,
                 weapon: Some(Weapon::Rpg),
                 gives: Some((Weapon::Rpg, 0)),
+                ..Leaves::default()
             },
             at,
             yaw: 0.0,
