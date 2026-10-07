@@ -32,6 +32,7 @@ use m2_render::{
 };
 
 use m2_assets::model::ModelInfo;
+use m2_assets::water::{WATER_TYPE, WaterHeights};
 use m2_assets::{Model, Ucfx};
 
 use m2_assets::model::MODEL_TYPE;
@@ -570,6 +571,9 @@ pub struct World {
     /// ([`ground_key`]).
     terrain_materials: HashMap<Vec<u32>, MaterialId>,
     sea: (VertexBufferHandle, IndexBufferHandle, MaterialId),
+    /// The rivers, pools and lakes above the sea, from the game's water
+    /// heights ([`inland_water`]), and their index count.
+    inland: Option<(VertexBufferHandle, IndexBufferHandle, u32)>,
     /// The sky's cloud noise, if it loaded.
     pub cloud_noise: Option<m2_render::TextureHandle>,
     stats: WorldStats,
@@ -672,6 +676,7 @@ impl World {
                 None => None,
             });
         }
+        let inland = inland_water(backend, &mut source, settings.sea_level)?;
         drop(source);
         let loader = Loader::spawn(install, index.clone(), TextureLimits::default())?;
         let mut objects: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
@@ -703,6 +708,7 @@ impl World {
             by_entity,
             terrain_materials: HashMap::new(),
             sea,
+            inland,
             cloud_noise,
             stats: WorldStats::default(),
             destroyed: HashSet::new(),
@@ -1421,6 +1427,29 @@ impl World {
             sort_origin: centre,
             user: 0,
         });
+        if let Some((vb, ib, count)) = self.inland {
+            queue.push(Primitive {
+                call: DrawCall {
+                    material,
+                    topology: Topology::TriangleList,
+                    vertex_buffer: vb,
+                    geometry: Geometry::Indexed {
+                        buffer: ib,
+                        first: 0,
+                        count,
+                        base_vertex: 0,
+                    },
+                    world: Mat4::IDENTITY,
+                    skin: None,
+                    instances: None,
+                    uv_offset: [0.0; 2],
+                },
+                layer: Layer::WORLD,
+                translucent: true,
+                sort_origin: eye,
+                user: 0,
+            });
+        }
         Ok(())
     }
 
@@ -1903,6 +1932,94 @@ impl SeaConstants {
         }
         c
     }
+}
+
+/// The water above the sea: a flat square at each cell of the game's
+/// water heights ([`WaterHeights`]) whose surface lies above the sea,
+/// drawn as the sea is. Rivers, pools and lakes; the ground hides what
+/// lies under it. `None` without the heights.
+fn inland_water<R: std::io::Read + std::io::Seek>(
+    backend: &mut dyn RenderBackend,
+    source: &mut crate::assets::AssetSource<R>,
+    sea_level: f32,
+) -> Result<Option<(VertexBufferHandle, IndexBufferHandle, u32)>, BackendError> {
+    let index = source.archive().index();
+    let Some(hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == WATER_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        return Ok(None);
+    };
+    let water = match source
+        .asset(hash, WATER_TYPE)
+        .map(|d| WaterHeights::parse(&d))
+    {
+        Ok(Ok(w)) => w,
+        Ok(Err(e)) => {
+            eprintln!("water heights {hash:08x}: {e}");
+            return Ok(None);
+        }
+        Err(e) => {
+            eprintln!("water heights {hash:08x}: {e}");
+            return Ok(None);
+        }
+    };
+    let mut vertices: Vec<f32> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for row in 0..water.rows {
+        for column in 0..water.columns {
+            let Some(h) = water.get(column, row) else {
+                continue;
+            };
+            // The sea (and the land it lies under) reads the sea level;
+            // cells with no water read far below it.
+            if h <= sea_level + 0.5 {
+                continue;
+            }
+            let x = water.origin[0] + column as f32 * water.cell;
+            let z = water.origin[1] + row as f32 * water.cell;
+            let first = (vertices.len() / 8) as u32;
+            for (dx, dz) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                vertices.extend([
+                    x + dx * water.cell,
+                    h,
+                    z + dz * water.cell,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ]);
+            }
+            indices.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
+        }
+    }
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    let vertex_count = (vertices.len() / 8) as u32;
+    let bytes: Vec<u8> = vertices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let vb = backend.create_vertex_buffer(
+        &VertexBufferDesc {
+            layout: world::simple_layout(),
+            vertex_count,
+            usage: BufferUsage::Static,
+        },
+        Some(&bytes),
+    )?;
+    let count = indices.len() as u32;
+    let bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let ib = backend.create_index_buffer(
+        &IndexBufferDesc {
+            format: IndexFormat::U32,
+            index_count: count,
+            usage: BufferUsage::Static,
+        },
+        Some(&bytes),
+    )?;
+    Ok(Some((vb, ib, count)))
 }
 
 fn sea_plane(
