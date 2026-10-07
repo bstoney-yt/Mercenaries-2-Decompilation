@@ -250,6 +250,49 @@ pub enum Command {
         who: u32,
         weapon: String,
     },
+    /// An aircraft of template `what` flies in level from `from` to `to`
+    /// at `speed` m/s (`Airstrike.Flyby`); report it there with
+    /// [`crate::mission::Mission::flyby_arrived`].
+    Flyby {
+        guid: u32,
+        what: String,
+        from: [f32; 3],
+        to: [f32; 3],
+        speed: f32,
+    },
+    /// Ordnance of template `what` (`"Cluster Bomb Projectile"`) sets off
+    /// from `at`, aimed at `target` (an object, else the point) if it
+    /// homes; report it going off with
+    /// [`crate::mission::Mission::ordnance_burst`].
+    Ordnance {
+        guid: u32,
+        what: String,
+        at: [f32; 3],
+        launch: crate::airstrike::Launch,
+        fuse: crate::airstrike::Fuse,
+        target: Option<(Option<u32>, [f32; 3])>,
+        owner: Option<u32>,
+    },
+    /// An effect (`global_particle_airstrike_fuelairbomb`) at `at`,
+    /// facing `direction` (`Airstrike.SpawnDirectedObject`).
+    DirectedEffect {
+        guid: u32,
+        what: String,
+        at: [f32; 3],
+        direction: [f32; 3],
+    },
+    /// `who` takes up a designator (`Airstrike.EquipDesignator`: `kind`
+    /// is its template, `"Smoke Designator"`), as weapon `weapon`; when
+    /// she throws it, tell [`crate::mission::Mission::designator_thrown`].
+    EquipDesignator {
+        who: u32,
+        weapon: u32,
+        kind: String,
+    },
+    /// `who` puts the designator away (`Airstrike.RemoveDesignator`).
+    RemoveDesignator {
+        who: u32,
+    },
 }
 
 /// The scripts' view of the game, and what they asked of it.
@@ -270,10 +313,16 @@ pub struct ScriptWorld {
     /// The player's cash (`Player.GetCash`, `Player.SetCash`); the
     /// scripts' `MrxPmc.AddCashQty` reads it, adds and clamps.
     pub cash: f64,
+    /// What the scripts set her fuel tanks to hold
+    /// (`Player.SetFuelCapacity`), if they have.
+    pub fuel_capacity: Option<f32>,
     /// Layers the archives hold and which are loaded.
     pub layers: crate::layers::LayerState,
     /// Goal callbacks waiting for the AI to finish: guid, callback, data.
     goal_callbacks: Vec<(u32, Function, Option<Table>)>,
+    /// Drop and landing zone tests asked for (`Ai.TestDropZone`): the
+    /// callback to answer and the spot tested.
+    drop_tests: Vec<(Function, [f32; 3])>,
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
@@ -317,6 +366,8 @@ pub struct ScriptWorld {
     pub relations: HashMap<(String, String), f32>,
     /// Actions playing and the pad, for hijacks.
     pub hijack: crate::hijack::HijackWorld,
+    /// Strikes and designators under way.
+    pub strikes: crate::airstrike::Strikes,
 }
 
 impl ScriptWorld {
@@ -352,7 +403,7 @@ impl ScriptWorld {
 
     /// The template `name` names, made on first use: an object scripts
     /// can copy with `Pg.Spawn`, but not in the world.
-    fn template(&mut self, name: &str) -> u32 {
+    pub(crate) fn template(&mut self, name: &str) -> u32 {
         let key = name.to_ascii_lowercase();
         if let Some(&g) = self.templates.get(&key) {
             return g;
@@ -485,7 +536,7 @@ impl ScriptWorld {
         }
     }
 
-    fn spawn_guid(&mut self) -> u32 {
+    pub(crate) fn spawn_guid(&mut self) -> u32 {
         self.next_spawn += 1;
         FIRST_SPAWNED + self.next_spawn
     }
@@ -609,6 +660,20 @@ pub fn arrived(world: &Shared, guid: u32, at: [f32; 3]) -> Vec<mlua::Error> {
     goal_finished(world, guid)
 }
 
+/// Answers the drop zone tests asked for since the last call: each spot
+/// will do, as tested (`callback(true, x, y, z)`; the engine's own test of
+/// the ground there isn't modelled). Returns any errors.
+pub fn answer_drop_tests(world: &Shared) -> Vec<mlua::Error> {
+    let tests = std::mem::take(&mut world.borrow_mut().drop_tests);
+    let mut errors = Vec::new();
+    for (f, [x, y, z]) in tests {
+        if let Err(e) = f.call::<()>((true, x, y, z)) {
+            errors.push(e);
+        }
+    }
+    errors
+}
+
 /// Calls the goal callbacks of `guid`'s finished AI goals, with their data
 /// unpacked. Returns any errors.
 pub fn goal_finished(world: &Shared, guid: u32) -> Vec<mlua::Error> {
@@ -653,6 +718,9 @@ fn category(v: Option<&Value>) -> Option<String> {
         _ => None,
     }
 }
+
+/// [`Object.GetHibernationDistance`]'s answer, metres.
+const HIBERNATION_DISTANCE: f64 = 155.0;
 
 fn num(v: Option<&Value>) -> Option<f32> {
     match v? {
@@ -741,6 +809,20 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             })?,
         )
     };
+
+    crate::airstrike::install(&lib("Airstrike")?, &add)?;
+
+    // A string's hash, as the scripts key tables by name (their recruits'
+    // states). The archive's name hash: the scripts only compare hashes
+    // with each other, so any one hash they all share serves.
+    add(&lib("String")?, "GetHash", |_, _, a| {
+        values(a.first().and_then(|v| match v {
+            Value::String(s) => Some(Value::Integer(i64::from(m2_assets::name_hash(
+                &s.to_string_lossy(),
+            )))),
+            _ => None,
+        }))
+    })?;
 
     let debug = lib("Debug")?;
     add(&debug, "Printf", |w, _, a| {
@@ -865,6 +947,17 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     add(&object, "GetYaw", |w, _, a| {
         let yaw = id(a.first()).and_then(|g| w.objects.get(&g)).map(|o| o.yaw);
         values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y)))])
+    })?;
+    // (holder, object): whether `object` is still in `holder`'s hands. A
+    // designator the game reports thrown has left them.
+    add(&object, "IsAttached", |_, _, _| {
+        values([Value::Boolean(false)])
+    })?;
+    // How far off an object goes to sleep (metres). The deliveries place
+    // a helicopter's cargo by it, with 155 as their own fallback: that,
+    // until the templates' hibernation data is read.
+    add(&object, "GetHibernationDistance", |_, _, _| {
+        values([Value::Number(HIBERNATION_DISTANCE)])
     })?;
     add(&object, "SetYaw", |w, _, a| {
         if let (Some(guid), Some(yaw)) = (id(a.first()), num(a.get(1))) {
@@ -1157,6 +1250,21 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
+    // A character's camera: the game's one camera looks over the player,
+    // so it is named by her guid, and its yaw is hers (`Camera.GetYaw`:
+    // the carpet bomb's heading).
+    add(&player, "GetCamera", |w, _, a| {
+        let who = id(a.first()).or(w.player);
+        values([guid_value(who)])
+    })?;
+    let camera = lib("Camera")?;
+    add(&camera, "GetYaw", |w, _, a| {
+        let yaw = id(a.first())
+            .or(w.player)
+            .and_then(|g| w.objects.get(&g))
+            .map(|o| o.yaw);
+        values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y)))])
+    })?;
     // (player number, on): the hero's survival script turns the clamp on
     // at set-up and off once its one rescue has cooled down.
     add(&player, "SetHealthClamp", |w, _, a| {
@@ -1197,8 +1305,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         }
         values([])
     })?;
-    add(&player, "GetFuelCapacity", |_, _, _| {
-        values([Value::Number(100.0)])
+    // 100 until the scripts set it: invented, the game's figure is not
+    // decoded.
+    add(&player, "GetFuelCapacity", |w, _, _| {
+        values([Value::Number(f64::from(w.fuel_capacity.unwrap_or(100.0)))])
+    })?;
+    add(&player, "SetFuelCapacity", |w, _, a| {
+        if let Some(c) = num(a.first()) {
+            w.fuel_capacity = Some(c);
+        }
+        values([])
     })?;
     add(&player, "GetFuel", |w, _, _| {
         let fuel = w
@@ -1404,6 +1520,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => 0.0,
         };
         values([Value::Number(f64::from(value))])
+    })?;
+    // Whether a helicopter can set a load down near `Location` (a supply
+    // drop, a vehicle): answered later through `Callback`
+    // ([`answer_drop_tests`]); true now, the test under way.
+    add(&ai, "TestDropZone", |w, _, a| {
+        let Some(Value::Table(t)) = a.first() else {
+            return values([Value::Boolean(false)]);
+        };
+        let at = match t.raw_get::<Value>("Location")? {
+            Value::Table(l) => {
+                let c = |i| num(l.raw_get::<Value>(i).ok().as_ref());
+                c(1).zip(c(2)).zip(c(3)).map(|((x, y), z)| [x, y, z])
+            }
+            _ => None,
+        };
+        match (t.raw_get::<Value>("Callback")?, at) {
+            (Value::Function(f), Some(at)) => {
+                w.drop_tests.push((f, at));
+                values([Value::Boolean(true)])
+            }
+            _ => values([Value::Boolean(false)]),
+        }
     })?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
@@ -1764,7 +1902,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     // The engine's additions to the math library: random integers in
-    // [a, b] (or [1, a]) and random reals in [a, b].
+    // [a, b] (or [1, a]), random reals in [a, b] and normalising.
     lua.load(
         r#"
         local function randi(a, b)
@@ -1782,6 +1920,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             rawset(_G, "Math", M)
         end
         M.randi, M.randf = randi, randf
+        -- A vector scaled to length 1 (the strikes aim their bombs so);
+        -- the zero vector stays as it is.
+        function M.Normalize(x, y, z)
+            local l = math.sqrt(x * x + y * y + z * z)
+            if l == 0 then return x, y, z end
+            return x / l, y / l, z / l
+        end
         -- Math is the math library with the additions.
         for k, v in pairs(math) do
             if rawget(M, k) == nil then M[k] = v end

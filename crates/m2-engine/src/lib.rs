@@ -22,6 +22,7 @@ pub mod durability;
 pub mod hijack;
 pub mod model;
 pub mod motion;
+pub mod ordnance;
 pub mod physics;
 pub mod pickup;
 pub mod population;

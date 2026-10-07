@@ -58,6 +58,7 @@ mod save;
 mod scene;
 mod sound;
 mod startup;
+mod strikes;
 mod support;
 mod traffic;
 mod ui;
@@ -193,6 +194,9 @@ struct Options {
     /// Every hijackable vehicle is crewed by this human template, to test
     /// hijacking ([`hijack`]) before the island's vehicles have crews.
     hijack_crew: Option<String>,
+    /// `--support`: support items to stock and call in once the scripts
+    /// run, as if bought, for testing.
+    support: Vec<String>,
     mission_seconds: f32,
     /// Our stand-in HUD instead of the game's own.
     old_hud: bool,
@@ -333,6 +337,7 @@ fn parse_args() -> anyhow::Result<Options> {
                     std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
                 o.mission_drivers.push((path, code));
             }
+            "--support" => o.support.push(value()?),
             "--spawns" => o.list_spawns = value()?.parse().context("--spawns expects a count")?,
             "--face" => {
                 o.face = Some(
@@ -535,6 +540,7 @@ fn main() -> anyhow::Result<()> {
         mission_drivers: options.mission_drivers.clone(),
         old_hud: options.old_hud,
         hijack_crew: options.hijack_crew.clone(),
+        support: options.support.clone(),
         state: None,
         error: None,
     };
@@ -1941,7 +1947,8 @@ fn mission_for_screenshot(
     out: &std::path::Path,
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
-    let mut link = mission::MissionLink::start(install, options.mission_drivers.clone());
+    let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
+        .with_support(options.support.clone());
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -2013,6 +2020,7 @@ fn mission_for_screenshot(
     // The clips' sound events met, by category and name: how many hers,
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
+    let mut strike_seen: Option<u32> = None;
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match &mut auto {
             Some(a) => {
@@ -2028,8 +2036,38 @@ fn mission_for_screenshot(
             eprintln!("hurt: her health {:.1} -> {hp:.1}", game.combat.hp);
             game.combat.hp = hp;
         }
+        // With --support she throws the marker the scripts hand her.
+        let mut intent = intent;
+        if !options.support.is_empty() && game.combat.to_throw {
+            intent.trigger.throw = true;
+        }
         game.step(intent, tick);
         link.tick(game, tick);
+        // And the strike is pictured 2 s and 6 s after its first ordnance
+        // goes off (`-strike`, `-strike-late`).
+        if !options.support.is_empty() {
+            let strikes = &game.scene.strikes;
+            if strikes.went_off > 0 && strike_seen.is_none() {
+                strike_seen = Some(i);
+                eprintln!(
+                    "support: first ordnance went off at {:.1}, {:.1} s in",
+                    strikes.first.unwrap_or_default(),
+                    i as f32 * tick
+                );
+            }
+            for (after, name) in [(2.0, "strike"), (6.0, "strike-late")] {
+                if strike_seen.is_some_and(|s| i == s + (after / tick) as u32) {
+                    let path = picture(name.into());
+                    hud_picture(backend, game, &link, fov, aspect, &path)?;
+                    eprintln!(
+                        "support: pictured her view {after} s after the first blast ({} gone off), health {:.0}: {}",
+                        game.scene.strikes.went_off,
+                        game.combat.hp,
+                        path.display()
+                    );
+                }
+            }
+        }
         if auto.is_some() {
             let shown = link.view().tutorial;
             if shown != tutorial_shown {
@@ -3577,6 +3615,8 @@ struct App {
     /// Our stand-in HUD instead of the game's own.
     old_hud: bool,
     hijack_crew: Option<String>,
+    /// Support items to call in (`--support`).
+    support: Vec<String>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -3641,7 +3681,8 @@ impl App {
             mission: match (&self.install, &self.mode) {
                 (Some(install), Mode::Island(_)) if self.mission => Some(
                     mission::MissionLink::start(install, self.mission_drivers.clone())
-                        .with_keys(self.config.keys.clone()),
+                        .with_keys(self.config.keys.clone())
+                        .with_support(self.support.clone()),
                 ),
                 _ => None,
             },

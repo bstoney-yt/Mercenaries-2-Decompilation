@@ -761,6 +761,23 @@ pub struct Trigger {
     pub pda: bool,
 }
 
+/// A thrown marker smokes from this long after it leaves her hand until
+/// this long, seconds, a puff every [`MARKER_PUFF`].
+const MARKER_SMOKE: (f32, f32) = (1.0, 30.0);
+const MARKER_PUFF: f32 = 0.3;
+
+/// A designator she threw: thrown as a grenade is, it bounces and comes
+/// to rest, and never goes off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Thrown {
+    pub guid: Option<u32>,
+    pub at: Vec3,
+    velocity: Vec3,
+    pub age: f32,
+    /// The scripts have been told it lies still.
+    pub settled: bool,
+}
+
 /// The fight's state.
 #[derive(Debug)]
 pub struct Combat {
@@ -818,6 +835,15 @@ pub struct Combat {
     /// She holds the satellite designator instead of her weapon
     /// ([`crate::support`]).
     pub designator: bool,
+    /// She holds a designator to throw (a support call's smoke grenade,
+    /// `Airstrike.EquipDesignator`): the throw key throws it in place of
+    /// a grenade.
+    pub to_throw: bool,
+    /// Designators thrown: the scripts' guid once they have it, where it
+    /// is, how it flies and seconds since it left her hand.
+    pub thrown: Vec<Thrown>,
+    /// The next throw is the designator's.
+    throwing_designator: bool,
     /// The last rocket: from the launcher, towards what the crosshair was on.
     pub last_launch: Option<(Vec3, Vec3)>,
     /// Blasts about to go off (something explosive caught): where, and
@@ -878,6 +904,9 @@ impl Default for Combat {
             launcher_rounds: None,
             grenades: MAX_GRENADES,
             designator: false,
+            to_throw: false,
+            thrown: Vec::new(),
+            throwing_designator: false,
             last_launch: None,
             fuses: Vec::new(),
             blazes: Vec::new(),
@@ -1214,8 +1243,13 @@ impl Combat {
                     Weapon::GrenadeLauncher => self.lob(f),
                 }
             }
-            if trigger.throw && self.reload <= 0.0 && self.grenades > 0 {
-                self.grenades -= 1;
+            if trigger.throw && self.reload <= 0.0 && (self.to_throw || self.grenades > 0) {
+                if self.to_throw {
+                    self.to_throw = false;
+                    self.throwing_designator = true;
+                } else {
+                    self.grenades -= 1;
+                }
                 self.reload = THROW_GAP;
                 // Without her throw clip, it goes at once.
                 match f.player.start_throw() {
@@ -1760,6 +1794,16 @@ impl Combat {
         let from = hand
             .unwrap_or_else(|| f.player.character.position + Vec3::Y * 1.6 + dir.with_y(0.0) * 0.4);
         let velocity = (dir + Vec3::Y * 0.35).normalize_or(Vec3::Y) * THROW;
+        if std::mem::take(&mut self.throwing_designator) {
+            self.thrown.push(Thrown {
+                guid: None,
+                at: from,
+                velocity,
+                age: 0.0,
+                settled: false,
+            });
+            return;
+        }
         self.projectiles.push(Projectile::Grenade {
             at: from,
             velocity,
@@ -1776,6 +1820,37 @@ impl Combat {
             }
             *left > 0.0
         });
+        let mut marks = Vec::new();
+        for t in &mut self.thrown {
+            let puffed = (t.age / MARKER_PUFF).floor();
+            t.age += dt;
+            if t.age >= MARKER_SMOKE.0 && (t.age / MARKER_PUFF).floor() > puffed {
+                marks.push(t.at);
+            }
+            t.velocity.y -= m2_engine::physics::GRAVITY * dt;
+            let step = t.velocity * dt;
+            if let Some((d, normal)) = f.physics.cast_ray(t.at, step, step.length()) {
+                t.at += step.normalize_or_zero() * (d - 0.05).max(0.0);
+                t.velocity = (t.velocity - normal * 2.0 * t.velocity.dot(normal)) * BOUNCE;
+                // Rolling to a stop.
+                if t.velocity.length() < 0.5 {
+                    t.velocity = Vec3::ZERO;
+                }
+            } else {
+                t.at += step;
+            }
+        }
+        // A marker smokes from a moment after it lands, a while.
+        self.thrown.retain(|t| t.age < MARKER_SMOKE.1);
+        for at in marks {
+            self.effect(
+                Effect::Smoke {
+                    at: at + Vec3::Y * 0.5,
+                    size: 1.5,
+                },
+                3.0,
+            );
+        }
         let mut puffs = Vec::new();
         let mut streaks = Vec::new();
         self.projectiles.retain_mut(|p| match p {
@@ -1988,6 +2063,51 @@ impl Combat {
             self.fires.push((ground + Vec3::Y * 1.2, 2.5, burn, 0.0));
         }
         alarm(f.people, at);
+    }
+
+    /// An air strike's blast at `at`, as its explosion template has it:
+    /// reaching `radius` metres with `damage` at its heart. Fire and smoke
+    /// in proportion (the template's own effects aren't drawn yet).
+    pub fn blast(&mut self, f: &mut Field<'_>, at: Vec3, radius: f32, damage: f32) {
+        self.blasts += 1;
+        self.last_blast = Some(at);
+        self.went_off.push(at);
+        self.sounds.push(if radius >= BOMB.0 {
+            Sound::Bomb(at)
+        } else {
+            Sound::Explosion(at)
+        });
+        self.harm(f, at, (radius, damage), false);
+        // Fire and smoke grow with the reach's square: a 20 m bomb's 10 m
+        // across, a 15 m bomblet's under 6, so that forty bomblets
+        // together don't fill the view. (Sizes judged by eye, not read.)
+        let size = (radius * radius / 40.0).clamp(1.5, 12.0);
+        self.effect(
+            Effect::Fire {
+                at: at + Vec3::Y * size * 0.2,
+                size,
+            },
+            0.5 + size * 0.04,
+        );
+        let puffs = ((radius / 6.0) as usize).clamp(1, 6);
+        for k in 0..puffs {
+            let a = k as f32 * std::f32::consts::TAU / puffs as f32;
+            let ring = Vec3::new(a.sin(), 0.4, a.cos()) * size * 0.4;
+            self.effect(
+                Effect::Smoke {
+                    at: at + ring,
+                    size: size * 0.6,
+                },
+                2.0 + size * 0.2,
+            );
+        }
+        alarm(f.people, at);
+    }
+
+    /// Harm a blast's frag does around `at`, without fire or sound of its
+    /// own.
+    pub fn harm_at(&mut self, f: &mut Field<'_>, at: Vec3, radius: f32, damage: f32) {
+        self.harm(f, at, (radius, damage), false);
     }
 
     /// The bomb's final strike at `at`, after it lands.

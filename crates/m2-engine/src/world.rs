@@ -273,6 +273,8 @@ pub struct Templates {
     pub explosions: HashMap<u32, crate::durability::Explosion>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
+    /// How air strikes' ordnance flies and what its blasts do.
+    pub ordnance: crate::ordnance::Ordnance,
 }
 
 impl Templates {
@@ -492,6 +494,7 @@ impl Templates {
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
+            ordnance: crate::ordnance::read(&db),
         };
         (templates, atmosphere)
     }
