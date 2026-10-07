@@ -86,6 +86,78 @@ pub fn ffmpeg() -> Option<PathBuf> {
     })
 }
 
+/// The Bink track ids of a movie's sound tracks, as `ffmpeg` lists them
+/// (`Stream #0:4[0x7d1]: Audio: ...`).
+fn audio_tracks(ffmpeg: &Path, file: &Path) -> Vec<u32> {
+    let Ok(out) = quiet(Command::new(ffmpeg).args(["-hide_banner", "-i"]).arg(file))
+        .stderr(Stdio::piped())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.contains(": Audio:"))
+        .filter_map(|l| {
+            let id = l.split("[0x").nth(1)?.split(']').next()?;
+            u32::from_str_radix(id, 16).ok()
+        })
+        .collect()
+}
+
+/// The movies' sound is 5.1 in tracks: front left and right (track 0),
+/// the centre (1), the low frequencies (2) and the rear pair (3). In the
+/// cut-scenes the centre, which carries the dialogue, comes in one track
+/// per language instead, numbered from 2001 (2001 and 2003 to 2006 in
+/// the PC copy): 2001 is taken as English (inferred: the lowest, as in
+/// EA's language numbering with English first; the others are French,
+/// German, Italian and Spanish in some order). Returns the `ffmpeg` filter
+/// that puts the tracks together as 5.1 (downmixed to stereo after),
+/// or None for a movie with a single sound track.
+fn sound_mix(tracks: &[u32]) -> Option<String> {
+    if tracks.len() < 2 {
+        return None;
+    }
+    let centre = if tracks.contains(&DIALOGUE) {
+        Some(DIALOGUE)
+    } else {
+        tracks.contains(&1).then_some(1)
+    };
+    let mut inputs = String::new();
+    let mut channels = Vec::new();
+    let mut at = 0;
+    let mut add = |id: u32, names: &[&str], inputs: &mut String| {
+        inputs.push_str(&format!("[0:a:i:{id}]"));
+        for (k, name) in names.iter().enumerate() {
+            channels.push(format!("{name}=c{}", at + k));
+        }
+        at += names.len();
+    };
+    if tracks.contains(&0) {
+        add(0, &["FL", "FR"], &mut inputs);
+    }
+    if let Some(c) = centre {
+        add(c, &["FC"], &mut inputs);
+    }
+    if tracks.contains(&2) {
+        add(2, &["LFE"], &mut inputs);
+    }
+    if tracks.contains(&3) {
+        add(3, &["BL", "BR"], &mut inputs);
+    }
+    let n = inputs.matches('[').count();
+    if n < 2 {
+        return None;
+    }
+    Some(format!(
+        "{inputs}amerge=inputs={n},pan=5.1|{}[mix]",
+        channels.join("|")
+    ))
+}
+
+/// The cut-scenes' English dialogue track (see [`sound_mix`]).
+const DIALOGUE: u32 = 2001;
+
 fn quiet(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
     {
@@ -157,11 +229,15 @@ impl Movie {
             }
         });
 
+        let mut audio = Command::new(ffmpeg);
+        audio.args(["-v", "error", "-i"]).arg(&file);
+        match sound_mix(&audio_tracks(ffmpeg, &file)) {
+            Some(mix) => audio.args(["-filter_complex", &mix, "-map", "[mix]"]),
+            None => audio.arg("-vn"),
+        };
         let mut audio = quiet(
-            Command::new(ffmpeg)
-                .args(["-v", "error", "-i"])
-                .arg(&file)
-                .args(["-vn", "-f", "s16le", "-ac", "2", "-ar"])
+            audio
+                .args(["-f", "s16le", "-ac", "2", "-ar"])
                 .arg(RATE.to_string())
                 .arg("-")
                 .stdout(Stdio::piped()),
@@ -283,6 +359,25 @@ impl Drop for Movie {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sound_tracks_are_put_together_as_5_1_with_the_english_dialogue() {
+        assert_eq!(
+            sound_mix(&[0, 2, 3, 2001, 2003, 2004, 2005, 2006]).as_deref(),
+            Some(
+                "[0:a:i:0][0:a:i:2001][0:a:i:2][0:a:i:3]amerge=inputs=4,\
+                 pan=5.1|FL=c0|FR=c1|FC=c2|LFE=c3|BL=c4|BR=c5[mix]"
+            )
+        );
+        assert_eq!(
+            sound_mix(&[0, 1, 2, 3]).as_deref(),
+            Some(
+                "[0:a:i:0][0:a:i:1][0:a:i:2][0:a:i:3]amerge=inputs=4,\
+                 pan=5.1|FL=c0|FR=c1|FC=c2|LFE=c3|BL=c4|BR=c5[mix]"
+            )
+        );
+        assert_eq!(sound_mix(&[0]), None);
+    }
 
     #[test]
     fn reads_a_bink_header() {
