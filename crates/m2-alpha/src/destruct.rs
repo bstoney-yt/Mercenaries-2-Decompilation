@@ -159,8 +159,9 @@ impl Destruction {
     /// What `vehicle` runs into, as each one's template's
     /// `PhysicsPropertyCrashable` has it: plants and bushes flatten under
     /// any vehicle, lampposts go over (knocked loose if they come loose),
-    /// fences and the like break under one as heavy as they take (else
-    /// they stand, and come loose by the vehicle's own rule). Those
+    /// fences and the like break apart under one as heavy as they take,
+    /// loose or not (round D10's tank shoved a whole fence section aside
+    /// instead). Those
     /// brought down go at once; those that come loose are handed back,
     /// with every loose prop it runs into that has no such property (a
     /// crate), for the vehicle to knock loose. Only what its box overlaps.
@@ -202,7 +203,7 @@ impl Destruction {
                 Some(c) => match c.how {
                     CrashHow::Flattened => true,
                     CrashHow::KnockedOver => !loose,
-                    CrashHow::Breaks => vehicle.mass >= c.takes && !loose,
+                    CrashHow::Breaks => vehicle.mass >= c.takes,
                 },
                 None => false,
             };
