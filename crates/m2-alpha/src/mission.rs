@@ -113,6 +113,9 @@ pub struct MissionView {
     pub radar_regions: Vec<RadarRegion>,
     /// The scripts' latest calls to the HUD's interface (see [`HUD_CALLS`]).
     pub hud_calls: Vec<HudCall>,
+    /// The contract's objective list for the PDA as the scripts send it
+    /// (`Net.SendEvent_AddPDAMission`): text id and icon tag each.
+    pub pda_objectives: Vec<(String, String)>,
 }
 
 /// Seconds the contract's completion stays up.
@@ -974,6 +977,7 @@ impl MissionLink {
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
             radar_regions: radar_regions(mission.lua()),
             hud_calls: hud_calls(mission.lua()),
+            pda_objectives: hud.mission.clone(),
         }
     }
 }

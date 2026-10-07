@@ -148,6 +148,7 @@ impl Hud {
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.pda_objectives = m.pda_objectives.clone();
         }
         if info.support.pda {
             state.keys = input
@@ -195,6 +196,7 @@ impl Hud {
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.pda_objectives = m.pda_objectives.clone();
         }
         let step = 1.0 / 30.0;
         game.update_and_wait(
@@ -1312,6 +1314,7 @@ mod tests {
                 game_message: None,
                 radar_regions: Vec::new(),
                 hud_calls: Vec::new(),
+                pda_objectives: Vec::new(),
                 status: None,
                 contract_complete: true,
             }),
