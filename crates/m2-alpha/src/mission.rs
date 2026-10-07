@@ -567,6 +567,10 @@ impl MissionLink {
                 _ => mission.post(name),
             }
         }
+        // And the sounds the interface cues with them (the timing wheel's
+        // beeps, its correct and failed presses).
+        self.sounds
+            .extend(game.support.cues.iter().map(|&c| (c.to_owned(), false)));
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {

@@ -111,6 +111,13 @@ pub const SECTOR_HIT: &str = "Satellite Minigame Sector Hit";
 pub const SECTOR_MISS: &str = "Satellite Minigame Sector Miss";
 pub const TARGETTING_SUCCESS: &str = "Satellite Targetting Success";
 pub const TARGETTING_CANCELLED: &str = "Satellite Targetting Cancelled";
+/// The interface sounds the satellite's timing wheel cues
+/// (`mrxguisatellitelayout`): as it pops up, as the needle enters a wedge,
+/// and on a press in a wedge or out of one.
+pub const CUE_POPUP: &str = "ui_SatDes_Circular_PopUp";
+pub const CUE_BEEP: &str = "ui_SatDes_Circular_Beep";
+pub const CUE_CORRECT: &str = "ui_SatDes_Circular_Timing_Correct";
+pub const CUE_FAIL: &str = "ui_SatDes_Circular_Timing_Fail";
 /// The PDA opened and closed, as the scripts hear it.
 pub const PDA_OPEN: &str = "PDA Open";
 pub const PDA_CLOSE: &str = "PDA Close";
@@ -295,6 +302,8 @@ pub struct Support {
     /// The events for the scripts from the last step
     /// ([`TARGETTING_START`]..., [`PDA_OPEN`], [`PDA_CLOSE`]).
     pub posts: Vec<&'static str>,
+    /// The interface sounds to play from the last step ([`CUE_POPUP`]...).
+    pub cues: Vec<&'static str>,
     /// The PDA is open.
     pub pda: bool,
     /// Seconds a strike has been wanted with nothing to call it with
@@ -449,6 +458,7 @@ impl Support {
     pub fn step(&mut self, call: Call, her: Vec3, dt: f32) {
         self.landed.clear();
         self.posts.clear();
+        self.cues.clear();
         self.flash = (self.flash - dt / FLASH_TIME).max(0.0);
         self.shake.1 = (self.shake.1 - dt).max(0.0);
         let fired = call.fire && !self.fire_was;
@@ -489,14 +499,17 @@ impl Support {
                 self.posts.push(TARGETTING_CANCELLED);
                 Phase::Idle
             }
-            Phase::Viewing { at, open } if press => Phase::Timing {
-                at,
-                from: at,
-                open: open + dt,
-                turned: 0.0,
-                hit: [false; 2],
-                mark: None,
-            },
+            Phase::Viewing { at, open } if press => {
+                self.cues.push(CUE_POPUP);
+                Phase::Timing {
+                    at,
+                    from: at,
+                    open: open + dt,
+                    turned: 0.0,
+                    hit: [false; 2],
+                    mark: None,
+                }
+            }
             Phase::Viewing { at, open } => Phase::Viewing {
                 at: steer(at),
                 open: open + dt,
@@ -524,16 +537,25 @@ impl Support {
                             hit[i] = true;
                             mark = Some((true, 0.0));
                             self.posts.push(SECTOR_HIT);
+                            self.cues.push(CUE_CORRECT);
                         }
                         None => {
                             hit = [false; 2];
                             mark = Some((false, 0.0));
                             self.posts.push(SECTOR_MISS);
+                            self.cues.push(CUE_FAIL);
                         }
                     }
                 }
                 if needle(turned).is_none() && needle(turned + dt).is_some() {
                     self.posts.push(MINIGAME_START);
+                }
+                // A beep as the needle comes into a wedge.
+                let wedge = |t: f32| needle(t).and_then(|n| sector(n.1));
+                if let Some(i) = wedge(turned + dt)
+                    && wedge(turned) != Some(i)
+                {
+                    self.cues.push(CUE_BEEP);
                 }
                 if at.distance(from) > WHEEL_MOVE {
                     // Moved off the spot: the wheel goes, the view stays.
@@ -867,6 +889,39 @@ mod tests {
         // Spent: none given while none is wanted.
         assert!(!s.fallback(Kind::SatelliteBomb, false, 100.0));
         assert_eq!(s.ready(), None);
+    }
+
+    #[test]
+    fn the_wheel_sounds_as_the_game_s_does() {
+        let her = Vec3::ZERO;
+        let mut s = Support::default();
+        let mut posts = Vec::new();
+        s.grant(Kind::SatelliteBomb, 1, Some(1));
+        open_view(&mut s, her, &mut posts);
+        let fire = Call {
+            fire: true,
+            ..Call::default()
+        };
+        step(&mut s, fire, her, &mut posts);
+        assert_eq!(s.cues, [CUE_POPUP]);
+        // A beep as the needle comes into a wedge.
+        let mut beeped = false;
+        for _ in 0..400 {
+            if s.wheel_ready() {
+                break;
+            }
+            step(&mut s, Call::default(), her, &mut posts);
+            beeped |= s.cues.contains(&CUE_BEEP);
+        }
+        assert!(s.wheel_ready() && beeped);
+        let press = Call {
+            use_pressed: true,
+            ..Call::default()
+        };
+        step(&mut s, press, her, &mut posts);
+        assert_eq!(s.cues, [CUE_CORRECT]);
+        step(&mut s, press, her, &mut posts);
+        assert_eq!(s.cues, [CUE_FAIL]);
     }
 
     #[test]
