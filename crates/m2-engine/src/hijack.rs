@@ -99,6 +99,25 @@ pub fn animation_sets(db: &Layer<'_>) -> HashMap<u32, (u32, u32)> {
     out
 }
 
+/// Every template's seats, by template id: each `SeatLink`'s `Name` (the
+/// seat's, `seat_driver`) and `Hardpoint` (the node of the vehicle's
+/// model it is at), as name hashes. Inferred: the same field names as
+/// `EntranceLink`'s.
+pub fn seat_links(db: &Layer<'_>) -> HashMap<u32, Vec<(u32, Option<u32>)>> {
+    let links = Table::new(db, "SeatLink");
+    let (name, point) = (name_hash("Name"), name_hash("Hardpoint"));
+    let mut out: HashMap<u32, Vec<(u32, Option<u32>)>> = HashMap::new();
+    for t in links.templates() {
+        for r in links.of_template(t) {
+            if let Some(n) = links.word(r, name).filter(|&n| n != 0) {
+                let p = links.word(r, point).filter(|&p| p != 0);
+                out.entry(t).or_default().push((n, p));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

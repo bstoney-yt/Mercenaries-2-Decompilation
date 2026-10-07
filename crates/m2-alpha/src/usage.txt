@@ -114,6 +114,9 @@ m2-alpha [options]
                          keys its stick)
   --hijack               with --screenshot --drive: hijack the vehicle
                          (--vehicle's) instead, answering every prompt
+  --seated               with --screenshot --drive: load the seats' clips
+                         first and show her sitting in the vehicle
+                         (also <stem>-seated.ppm before it moves)
   --mission-seconds <s>  with --screenshot: play this long instead of ten
   --look-pickup <m>      with --screenshot: take the picture from this far
                          off the pickup lying nearest her, looking at it

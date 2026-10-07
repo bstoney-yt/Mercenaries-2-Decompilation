@@ -177,6 +177,9 @@ struct Options {
     /// With `--screenshot --drive`: hijack the vehicle instead of getting
     /// in, answering every prompt at once.
     hijack: bool,
+    /// With `--screenshot --drive`: load the seats' clips first, so she
+    /// is seen sitting in the vehicle as she drives it.
+    seated: bool,
     mission_seconds: f32,
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
@@ -297,6 +300,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--mission" => o.mission = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
+            "--seated" => o.seated = true,
             "--mission-driver" => {
                 let path = value()?;
                 let code =
@@ -2266,6 +2270,7 @@ fn hijack_for_screenshot(
         input.button(Action::Use, false);
         game.step(Intent::default(), tick);
         hijacks.place(game);
+        hijacks.seat(game, tick);
         t += tick;
         // A picture every two seconds of it, beside the one at the end.
         if t >= 2.0 * (shots + 1) as f32 && options.screenshot.is_some() {
@@ -2415,6 +2420,37 @@ fn drive_for_screenshot(
         .and_then(|p| p.driving)
         .map(|i| game.scene.vehicles[i].spec.label.clone())
         .unwrap_or_default();
+    // Seated: wait for the clips, then a picture of her sitting still.
+    let mut seats = match install {
+        Some(install) if options.seated => {
+            let mut h = hijack::Hijacks::start(install, None);
+            let mut input = Input::default();
+            let waited = Instant::now();
+            while h.loading() && waited.elapsed() < Duration::from_secs(120) {
+                h.tick(game, &mut input, tick);
+                game.step(Intent::default(), tick);
+            }
+            for _ in 0..60 {
+                h.tick(game, &mut input, tick);
+                game.step(Intent::default(), tick);
+                h.seat(game, tick);
+            }
+            if let Some(p) = &game.scene.player {
+                eprintln!(
+                    "seat: in the {label}: seated {} at {:.2?}",
+                    p.seated,
+                    p.character.position.to_array()
+                );
+            }
+            render(backend, game, fov, aspect, None)?;
+            if let Some(out) = &options.screenshot {
+                let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("drive");
+                write_ppm(backend, &out.with_file_name(format!("{stem}-seated.ppm")))?;
+            }
+            Some(h)
+        }
+        _ => None,
+    };
     let driven = |game: &Game| {
         let i = game.scene.player.as_ref()?.driving?;
         let v = &game.scene.vehicles[i];
@@ -2460,6 +2496,9 @@ fn drive_for_screenshot(
             ..Intent::default()
         };
         game.step(throttle, tick);
+        if let Some(h) = &mut seats {
+            h.seat(game, tick);
+        }
         if i % 30 == 0 {
             render(backend, game, fov, aspect, None)?;
         }
@@ -3565,8 +3604,9 @@ impl Running {
             self.mouse_look,
             TICK.as_secs_f32(),
         );
-        if let Some(h) = &self.hijacks {
+        if let Some(h) = &mut self.hijacks {
             h.place(&mut self.game);
+            h.seat(&mut self.game, TICK.as_secs_f32());
         }
         if let Some(m) = &mut self.mission {
             m.tick(&mut self.game, TICK.as_secs_f32());
