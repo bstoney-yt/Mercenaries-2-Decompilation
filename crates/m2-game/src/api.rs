@@ -1201,12 +1201,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([guid_value(who)])
     })?;
     let camera = lib("Camera")?;
+    // The camera looks the way she faces; a camera whose holder this
+    // world doesn't place (the HUD's own world) faces north. Always a
+    // number: the PDA's map turns by it (`math.rad`), and nil broke its
+    // Open half-way, leaving the PDA marked open and the support menu shut.
     add(&camera, "GetYaw", |w, _, a| {
         let yaw = id(a.first())
             .or(w.player)
             .and_then(|g| w.objects.get(&g))
-            .map(|o| o.yaw);
-        values([yaw.map_or(Value::Nil, |y| Value::Number(f64::from(y)))])
+            .map_or(0.0, |o| o.yaw);
+        values([Value::Number(f64::from(yaw))])
     })?;
     // (player number, on): the hero's survival script turns the clamp on
     // at set-up and off once its one rescue has cooled down.
@@ -2510,5 +2514,17 @@ mod tests {
             .eval()
             .unwrap();
         assert!(server && !client && second.is_nil());
+    }
+
+    #[test]
+    fn a_camera_nobody_here_holds_faces_north() {
+        // The HUD's world places no one: the PDA's map still gets a yaw.
+        let (host, _) = setup();
+        let yaw: f64 = host
+            .lua()
+            .load("return Camera.GetYaw(Player.GetCamera(Sys.StringToGuid('0x7fff')))")
+            .eval()
+            .unwrap();
+        assert_eq!(yaw, 0.0);
     }
 }
