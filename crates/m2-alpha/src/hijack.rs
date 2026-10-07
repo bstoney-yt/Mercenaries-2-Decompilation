@@ -52,7 +52,9 @@ pub const SLACK: f32 = 2.0;
 /// `Camera.SetFocusParams(cam, 0, 0, 0.1, 4, 6, 1)` (read as a 4-6 m
 /// distance); the on-foot camera would sit inside the hull.
 const CAMERA_DISTANCE: f32 = 6.0;
-const CAMERA_PITCH: f32 = -0.35;
+const CAMERA_PITCH: f32 = -0.5;
+/// How far above the vehicle's top the camera looks, metres.
+const CAMERA_LIFT: f32 = 0.5;
 /// How long an action lasts when its clip is unknown, seconds.
 const UNKNOWN_CLIP: f64 = 2.0;
 /// The pad, as the scripts number its buttons
@@ -351,6 +353,7 @@ impl Hijacks {
             return;
         };
         let origin = at.transform_point3(Vec3::ZERO);
+        let v_top = v.spec.bounds.1.y;
         let forward = at.transform_vector3(Vec3::Z);
         let yaw = forward.x.atan2(forward.z);
         let (Some(vehicle), Some(crewman)) = (
@@ -375,7 +378,14 @@ impl Hijacks {
                 actions: Vec::new(),
                 held: Vec::new(),
                 clip: None,
-                at: c.at,
+                // Over the entrance at the top of the vehicle, where the
+                // hijack plays out (the M1A2's driver's hatch is low on
+                // the front deck, the fight on the turret).
+                at: Vec3::new(
+                    c.at.x,
+                    at.transform_point3(Vec3::new(0.0, v_top, 0.0)).y + CAMERA_LIFT,
+                    c.at.z,
+                ),
             });
             // Her clips move her from here on (`down` keeps her own
             // moves and gaits from playing over them); the camera looks
