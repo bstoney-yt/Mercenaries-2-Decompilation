@@ -629,6 +629,10 @@ pub struct CpuModel {
     /// For a merged batch, the entity each member is (see
     /// [`Model::tiny_members`]); empty otherwise.
     pub tiny_members: Vec<u32>,
+    /// Per node, whether the collapse animation sinks it
+    /// ([`PartStates::sinking`](m2_assets::model::PartStates::sinking)).
+    /// Empty when nothing sinks.
+    pub sinks: Vec<bool>,
     /// How it breaks apart when destroyed outright, for those who want
     /// it ([`Breakup::of`](crate::Breakup::of)): neither
     /// [`from_data`](Self::from_data) nor [`build`](Self::build) works it
@@ -762,6 +766,11 @@ impl CpuModel {
             } else {
                 Vec::new()
             },
+            sinks: model
+                .states
+                .as_ref()
+                .filter(|s| !s.collapsing.is_empty())
+                .map_or_else(Vec::new, |s| s.sinking(&model.nodes)),
             breakup: None,
         }
     }
@@ -872,6 +881,9 @@ pub struct GpuModel {
     pub skipped_groups: usize,
     /// Per node, hidden intact and wrecked ([`CpuModel::hidden`]).
     hidden: [Vec<bool>; 2],
+    /// Per node, whether the collapse animation sinks it
+    /// ([`CpuModel::sinks`]).
+    sinks: Vec<bool>,
     /// Draw the wrecked parts instead of the intact ones.
     pub wrecked: bool,
     /// For a merged batch, the entity each member is.
@@ -969,6 +981,7 @@ impl GpuModel {
             bounds: cpu.bounds,
             skipped_groups: cpu.skipped_groups,
             hidden: cpu.hidden.clone(),
+            sinks: cpu.sinks.clone(),
             wrecked: false,
             tiny_members: cpu.tiny_members.clone(),
             tracks: false,
@@ -1039,6 +1052,25 @@ impl GpuModel {
                 Some(&m) if piece.bones.is_empty() => self.push_at(queue, piece, world * m, None),
                 _ => self.push(queue, piece, world, None),
             }
+        }
+    }
+
+    /// Whether the model has parts its collapse animation sinks (a
+    /// building's intact walls going down as its wreck shows).
+    pub fn sinks(&self) -> bool {
+        self.sinks.contains(&true)
+    }
+
+    /// Queues the parts the collapse animation sinks, intact, moved by
+    /// `sunk` (model space) on their way down.
+    pub fn draw_sinking(&self, queue: &mut DrawQueue, world: Mat4, sunk: Mat4) {
+        let marked = |p: &Piece| self.sinks.get(usize::from(p.at)).copied().unwrap_or(false);
+        for piece in self
+            .pieces
+            .iter()
+            .filter(|p| marked(p) && p.bones.is_empty())
+        {
+            self.push(queue, piece, world * sunk, None);
         }
     }
 
