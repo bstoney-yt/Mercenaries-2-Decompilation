@@ -970,13 +970,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 .get(&n.to_ascii_lowercase())
                 .copied()
         });
-        values([max.map_or(Value::Nil, |m| Value::Integer(i64::from(m)))])
+        values([max.map_or(Value::Nil, |m| Value::Number(f64::from(m)))])
     })?;
     add(&weapon, "GetReserveAmmo", |w, _, a| {
         let n = id(a.first())
             .and_then(|g| w.inventory.carried.get(&g))
             .map(|c| c.reserve);
-        values([n.map_or(Value::Nil, |n| Value::Integer(i64::from(n)))])
+        values([n.map_or(Value::Nil, |n| Value::Number(f64::from(n)))])
     })?;
     add(&weapon, "SetReserveAmmo", |w, _, a| {
         let (Some(g), Some(rounds)) = (id(a.first()), num(a.get(1))) else {
