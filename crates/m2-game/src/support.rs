@@ -54,13 +54,15 @@ pub fn items(lua: &Lua) -> mlua::Result<Vec<SupportItem>> {
         return Ok(Vec::new());
     };
     let pmc = globals.get::<Value>("MrxPmc")?;
+    // `mlua::Integer` is i32 on 32-bit builds, i64 on 64-bit ones.
+    #[allow(clippy::useless_conversion)]
     let count = |f: &str, key: &str| -> i64 {
         let Value::Table(pmc) = &pmc else { return 0 };
         pmc.get::<mlua::Function>(f)
             .and_then(|f| f.call::<Value>(key))
             .ok()
             .and_then(|v| match v {
-                Value::Integer(i) => Some(i),
+                Value::Integer(i) => Some(i64::from(i)),
                 Value::Number(n) => Some(n as i64),
                 _ => None,
             })
