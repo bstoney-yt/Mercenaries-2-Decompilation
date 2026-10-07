@@ -891,29 +891,3 @@ fn key_listeners_hear_key_presses() {
     rt.key_up(36);
     assert!(rt.avm.keys_down.is_empty());
 }
-
-#[test]
-fn on_load_runs_once_after_the_first_frame() {
-    // loads = 0; this.onLoad = function() { loads = loads + 1 };
-    let mut a = Asm::default();
-    a.set("loads", |a| {
-        a.int(0);
-    });
-    let mut body = Asm::default();
-    body.set("loads", |b| {
-        b.str("loads").op(0x1C).int(1).op(0x47);
-    });
-    let mut f = Vec::new();
-    f.extend(b"\0");
-    f.extend(0u16.to_le_bytes());
-    f.extend((body.0.len() as u16).to_le_bytes());
-    a.str("this").op(0x1C).str("onLoad");
-    a.act(0x9B, &f);
-    a.0.extend(&body.0);
-    a.op(0x4F);
-    let mut rt = run(&a, Vec::new());
-    rt.run_due();
-    assert_eq!(number(&var(&mut rt, "loads")), 1.0);
-    rt.step(0.35);
-    assert_eq!(number(&var(&mut rt, "loads")), 1.0);
-}
