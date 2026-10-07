@@ -135,6 +135,17 @@ struct Pending {
     /// the button it counted last.
     read: Option<usize>,
     memo: Option<u32>,
+    /// The scripts' state, to make tables to pass.
+    lua: LuaHandle,
+}
+
+/// The scripts' state, weakly (the state holds the events).
+struct LuaHandle(mlua::WeakLua);
+
+impl std::fmt::Debug for LuaHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LuaHandle")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -186,7 +197,7 @@ impl Events {
             let store = Rc::clone(&self.store);
             event.set(
                 name,
-                safe_function(lua, move |_, args| {
+                safe_function(lua, move |lua, args| {
                     let mut args = args.into_iter();
                     let kind = match args.next() {
                         Some(Value::String(s)) => s.to_string_lossy(),
@@ -236,6 +247,7 @@ impl Events {
                         made: now,
                         read: None,
                         memo: None,
+                        lua: LuaHandle(lua.weak()),
                     });
                     Ok(MultiValue::from_vec(vec![Value::Number(f64::from(id))]))
                 })?,
@@ -754,26 +766,53 @@ fn check(
                 .map(|g| (g, !world.is_alive(g), vec![id(g)]))
                 .collect(),
         ),
-        // { a, b, "<" or ">", metres, ... }: when some a is within (or
-        // beyond) the distance of some b; a and b are guids, "hero" or
-        // labels. Passes the pair.
+        // { a, b, op, metres, stopped, flat }: when some a is within
+        // ("<", "<=") or beyond (">", ">=") the distance of some b,
+        // checked whenever it is pending (scripts wanting repeats make a
+        // "<" and a ">" in turn); flat measures across the ground only
+        // (`stopped` isn't followed yet). a and b are guids, "hero",
+        // labels or filters. Passes the a's that hold: one guid as a
+        // guid, a label's or filter's as a list (as WifTutorialTankHijack
+        // and the gate scripts read it).
         "ObjectProximity" => {
             let r = number(&p.params, 4).unwrap_or(0.0);
-            let beyond = text(&p.params, 3).as_deref() == Some(">");
+            let beyond = text(&p.params, 3).is_some_and(|op| op.starts_with('>'));
+            let flat = matches!(p.params.raw_get::<Value>(6), Ok(Value::Boolean(true)));
             let (aa, bb) = (objects(&p.params, 1, world), objects(&p.params, 2, world));
-            for &a in &aa {
-                for &b in &bb {
-                    let (Some(pa), Some(pb)) = (world.position(a), world.position(b)) else {
-                        continue;
-                    };
-                    let d2: f32 = (0..3).map(|i| (pa[i] - pb[i]).powi(2)).sum();
-                    let within = f64::from(d2) <= r * r;
-                    if within != beyond {
-                        return Check::Holds(true, vec![id(a), id(b)]);
-                    }
-                }
+            let holds = |a: u32| {
+                let Some(pa) = world.position(a) else {
+                    return false;
+                };
+                bb.iter().filter_map(|&b| world.position(b)).any(|pb| {
+                    let d2: f32 = [0, 1, 2]
+                        .into_iter()
+                        .filter(|&i| !(flat && i == 1))
+                        .map(|i| (pa[i] - pb[i]).powi(2))
+                        .sum();
+                    (f64::from(d2) <= r * r) != beyond
+                })
+            };
+            let near: Vec<u32> = aa.into_iter().filter(|&a| holds(a)).collect();
+            if near.is_empty() {
+                return no;
             }
-            no
+            let one = match p.params.raw_get::<Value>(1) {
+                Ok(Value::String(s)) => s.to_string_lossy().eq_ignore_ascii_case("hero"),
+                Ok(Value::Table(_)) => false,
+                _ => true,
+            };
+            if one {
+                return Check::Holds(true, vec![id(near[0])]);
+            }
+            let list = p
+                .lua
+                .0
+                .try_upgrade()
+                .and_then(|lua| lua.create_sequence_from(near.iter().map(|&g| id(g))).ok());
+            match list {
+                Some(t) => Check::Holds(true, vec![Value::Table(t)]),
+                None => no,
+            }
         }
         // { rider, vehicle, seat, mode }: rider is a guid, "hero" or a
         // label; vehicle a guid (0: any), a vehicle's name or a class
@@ -987,6 +1026,8 @@ mod tests {
         fn labelled(&self, label: &str) -> Vec<u32> {
             if label == "Prisoner" {
                 vec![2]
+            } else if label == "tank" {
+                vec![4, 5]
             } else {
                 Vec::new()
             }
@@ -1096,7 +1137,7 @@ mod tests {
         got.sort();
         assert_eq!(
             got,
-            ["awake 3", "dead 7,7", "near 1,2", "posted x,y", "seat 1,99"]
+            ["awake 3", "dead 7,7", "near 1", "posted x,y", "seat 1,99"]
         );
         assert!(events.is_empty());
     }
@@ -1128,6 +1169,30 @@ mod tests {
             .unwrap();
         events.update(0.1, &world);
         assert_eq!(log(&host), ["angry Gur"]);
+    }
+
+    #[test]
+    fn proximity_to_a_label_passes_the_list_of_those_near() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"
+                Event.Create(Event.ObjectProximity, { "tank", "hero", "<", 12, false, true },
+                    function(tanks)
+                        for _, t in ipairs(tanks) do table.insert(log, "tank " .. gid(t)) end
+                    end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        world.positions.insert(1, [0.0, 0.0, 0.0]);
+        // Above her: near across the ground, not in a straight line.
+        world.positions.insert(4, [10.0, 15.0, 0.0]);
+        world.positions.insert(5, [30.0, 0.0, 0.0]);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["tank 4"]);
+        assert!(events.is_empty());
     }
 
     #[test]
