@@ -78,6 +78,11 @@ const PUSH_TO: f32 = 15.0;
 /// Seconds between a soldier's shots: at least this, plus up to as much
 /// again at random.
 const FIRE_GAP: (f32, f32) = (0.9, 0.8);
+/// They fire in bursts: at least this many rounds, plus up to this many
+/// more at random, this many seconds apart (the "Assault Rifle"'s rate of
+/// fire, 450 a minute; the burst sizes invented, as no field names them).
+const BURST: (u32, u32) = (3, 2);
+const BURST_GAP: f32 = 60.0 / 450.0;
 const PAUSE: (f32, f32) = (2.0, 6.0);
 /// A soldier lobs a grenade at where she hides once she has been out of
 /// his sight this long, seconds, within this reach, metres, and no
@@ -189,6 +194,8 @@ pub struct FightClips {
     pub aim: Option<usize>,
     /// Standing, rifle held across the chest (resident 178a5642).
     pub ready: Option<usize>,
+    /// Running with the rifle held low across the body in both hands.
+    pub run_low: Option<usize>,
     /// A jump: take-off and the air, ending off the ground (resident
     /// c846e6fd); the stand-in when the take-offs below aren't there.
     pub jump: Option<usize>,
@@ -216,6 +223,12 @@ pub struct FightClips {
 impl FightClips {
     pub const AIM: u32 = 0x0163_f2aa;
     pub const READY: u32 = 0x178a_5642;
+    /// Running with the rifle low across the body, two-handed, likeliest
+    /// first (round 152's measures: Jennifer's 4.65 m/s run holds it 34
+    /// degrees across, muzzle a little down; the resident's 5.21 m/s
+    /// ones 11 degrees across, or 42 with the muzzle up and the rifle
+    /// rolled); the run she had, 10912665, is Mattias's.
+    pub const RUN_LOW: [u32; 4] = [0xe340_14c3, 0x2105_c540, 0x94b1_e4ac, 0x745e_b940];
     pub const JUMP: u32 = 0xc846_e6fd;
     pub const DIE: u32 = 0x479c_4a51;
     /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
@@ -265,6 +278,7 @@ impl FightClips {
         Self {
             aim: find(Self::AIM),
             ready,
+            run_low: first(&Self::RUN_LOW),
             jump: find(Self::JUMP),
             takeoff: first(&Self::TAKEOFF),
             takeoff_still: first(&Self::TAKEOFF_STILL),
@@ -319,7 +333,7 @@ impl FightClips {
 
     /// Every clip, for rebinding.
     pub fn all(&self) -> impl Iterator<Item = usize> {
-        [self.aim, self.ready, self.jump, self.die]
+        [self.aim, self.ready, self.run_low, self.jump, self.die]
             .into_iter()
             .flatten()
     }
@@ -370,6 +384,8 @@ pub struct Npc {
     /// and the seconds since he was last hit.
     cover: Option<(Vec3, f32)>,
     hit: bool,
+    /// Rounds left in the burst he is firing.
+    burst: u32,
     /// Running from gunfire: where to, and for how much longer.
     flee: Option<(Vec3, f32)>,
     brain: Brain,
@@ -448,6 +464,7 @@ impl Npc {
             spotted: false,
             cover: None,
             hit: false,
+            burst: 0,
             flee: None,
             brain,
         }
@@ -681,7 +698,16 @@ impl Npc {
         self.cooldown -= dt;
         if seen && self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
             self.fires = true;
-            self.cooldown = FIRE_GAP.0 + rng.range(0.0, FIRE_GAP.1);
+            if self.burst == 0 {
+                let more = rng.range(0.0, BURST.1 as f32 + 1.0) as u32;
+                self.burst = BURST.0 + more.min(BURST.1);
+            }
+            self.burst -= 1;
+            self.cooldown = if self.burst > 0 {
+                BURST_GAP
+            } else {
+                FIRE_GAP.0 + rng.range(0.0, FIRE_GAP.1)
+            };
         }
         let rate = match self.rig.gait_speed(gait) {
             Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
@@ -1790,7 +1816,8 @@ pub(crate) mod tests {
             shots += usize::from(std::mem::take(&mut soldier.fires));
         }
         assert!((soldier.facing - std::f32::consts::FRAC_PI_2).abs() < 0.05);
-        assert!((2..=6).contains(&shots), "{shots}");
+        // In bursts of three to five.
+        assert!((6..=30).contains(&shots), "{shots}");
         // Out of range: he stands down.
         soldier.update(&physics, &mut rng, Some(Vec3::new(500.0, 0.0, 0.0)), dt);
         assert!(!soldier.alert);

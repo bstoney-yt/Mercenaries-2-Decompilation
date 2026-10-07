@@ -77,6 +77,8 @@ const ASHORE_HEIGHT: f32 = 2.0;
 /// ... for this long without a break (seconds): she stands ashore a moment
 /// at the start, before the scripts seat her in the boat.
 const SUPPORT_ASHORE: f32 = 10.0;
+/// Her rifle's template in the first contract.
+const CARBINE: &str = "Carbine";
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -690,6 +692,8 @@ impl MissionLink {
                 }
             }
             report_strikes(game, mission);
+            let spare = game.combat.rifle_rounds.stored;
+            mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -762,6 +766,9 @@ impl MissionLink {
                         eprintln!("mission: scripts give her {weapon} {rounds} in reserve");
                         if weapon.eq_ignore_ascii_case(GRENADE) {
                             game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
+                        } else if weapon.eq_ignore_ascii_case(CARBINE) {
+                            game.combat.rifle_rounds.stored =
+                                (*rounds * combat::RIFLE_CLIP).min(combat::RIFLE_SPARE);
                         }
                     }
                     Command::DropWeapon { who, weapon } => {

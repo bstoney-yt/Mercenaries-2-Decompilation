@@ -753,12 +753,16 @@ const WRECK_FLOAT: f32 = 0.4;
 pub const PLANE_SPEED: f32 = 12.0;
 const PLANE_RISE: f32 = 0.3;
 const PLANE_TRIM: f32 = 0.25;
-/// The steepest hill a vehicle takes about as fast as the flat, radians,
-/// wheeled and tracked: uphill the engine pulls as a lower gear would
+/// The steepest hill a wheeled vehicle takes about as fast as the flat,
+/// radians: uphill the engine pulls as a lower gear would
 /// (invented; the playthrough's jeep and tank take the hill roads at
 /// speed). Steeper than this, it slows and in the end slides back.
 const CLIMB: f32 = 0.52;
-const CLIMB_TRACKED: f32 = 0.61;
+/// Tracks grip: on the ground, a tracked vehicle's weight doesn't pull it
+/// down hills up to this steep, radians, so it climbs, turns and stands on
+/// them as on the flat (Brendan: the game's tank "should be able to climb
+/// almost any hill"; the steepness is invented).
+const CLIMB_TRACKED: f32 = 0.87;
 
 /// A vehicle in the physics world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1464,8 +1468,8 @@ impl Physics {
         };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
         // Uphill (the way it is driven), the pull that holds it as on the
-        // flat, up to its steepest hill.
-        let most = if v.tracked { CLIMB_TRACKED } else { CLIMB };
+        // flat, up to its steepest hill (tracks hold it by their grip).
+        let most = if v.tracked { 0.0 } else { CLIMB };
         let uphill = (nose * throttle.signum()).clamp(0.0, most.sin());
         let (force, brake) = if controls.parked {
             let hard = if speed.abs() > PARKED_FAST {
@@ -1504,11 +1508,29 @@ impl Physics {
                 brake
             };
         }
+        let gripping = v
+            .controller
+            .wheels()
+            .iter()
+            .filter(|w| w.raycast_info().is_in_contact)
+            .count()
+            >= 2;
+        let mass = v.mass;
         // Tracks turn the hull on the spot (one track forward, the other
         // back), so the yaw is set directly; a little slower on the move.
         if let Some((chassis, turn)) = tracked
             && let Some(body) = self.world.bodies.get_mut(chassis)
         {
+            // Their grip holds its weight on the hill (along the ground,
+            // the way its hull lies).
+            if gripping {
+                let up = body.position().rotation * r::Vector::Y;
+                let down = r::Vector::new(0.0, -GRAVITY, 0.0);
+                let along = down - up * down.dot(up);
+                let steep = along.length() / GRAVITY;
+                let held = (CLIMB_TRACKED.sin() / steep.max(1e-3)).min(1.0);
+                body.apply_impulse(-along * held * mass * dt, true);
+            }
             let w = body.angvel();
             let rate = turn * TRACK_TURN / (1.0 + speed.abs() * 0.05);
             let up = body.position().rotation * r::Vector::Y;
@@ -2594,6 +2616,130 @@ mod tests {
         // It crawled at 2 m/s before the engine pulled harder uphill.
         let speed = p.vehicle_speed(id);
         assert!(speed > 12.0, "{speed} m/s");
+    }
+
+    fn tank() -> VehicleSpec {
+        use crate::vehicle::WheelSpec;
+        let wheel = |x: f32, z: f32| WheelSpec {
+            centre: Vec3::new(x, 0.45, z),
+            radius: 0.45,
+            width: 0.5,
+            steers: z > 0.0,
+        };
+        let hull = (Vec3::new(-1.6, 0.0, -3.3), Vec3::new(1.6, 1.6, 3.3));
+        VehicleSpec {
+            kind: "tank".into(),
+            wheels: vec![
+                wheel(-1.2, 2.3),
+                wheel(1.2, 2.3),
+                wheel(-1.2, -2.3),
+                wheel(1.2, -2.3),
+            ],
+            bounds: (hull.0, Vec3::new(1.6, 2.4, 3.3)),
+            hull,
+            tracked: true,
+            mass: 36_000.0,
+            tuning: crate::VehicleTuning {
+                max_speed: Some(12.5),
+                ..Default::default()
+            },
+            ..car()
+        }
+    }
+
+    /// Up a hill of `degrees` from a standstill, `throttle` for `seconds`:
+    /// how far it got up the hill, metres.
+    fn tank_up(degrees: f32, throttle: f32, seconds: f32) -> f32 {
+        let mut p = Physics::new();
+        let half = 300.0;
+        let v = [
+            Vec3::new(-half, 0.0, -half),
+            Vec3::new(half, 0.0, -half),
+            Vec3::new(half, 0.0, half),
+            Vec3::new(-half, 0.0, half),
+        ];
+        let shape = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        p.add_static(
+            StaticKey::Cell(1),
+            &shape,
+            Vec3::ZERO,
+            Quat::from_rotation_x(-degrees.to_radians()),
+        );
+        p.step(DT);
+        let spec = tank();
+        let ground = |at: Vec3| {
+            p.cast_ray(Vec3::new(at.x, 150.0, at.z), Vec3::NEG_Y, 400.0)
+                .map(|(d, _)| 150.0 - d)
+        };
+        let rest = spec.rest_on(Vec3::ZERO, 0.0, ground).unwrap();
+        let id = p.add_vehicle_turned(&spec, rest.position + Vec3::Y * 0.2, rest.rotation);
+        for _ in 0..180 {
+            p.drive(id, VehicleControls::default());
+            p.step(DT);
+        }
+        let start = p.vehicle_transform(id).unwrap().w_axis.y;
+        for _ in 0..(seconds / DT) as usize {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        p.vehicle_transform(id).unwrap().w_axis.y - start
+    }
+
+    #[test]
+    fn tanks_drive_over_a_hilltop() {
+        let mut p = Physics::new();
+        let (h, rise) = (50.0, 100.0 * 35f32.to_radians().tan());
+        // Up 35 degrees to z 0, then level.
+        let v = [
+            Vec3::new(-h, -rise, -100.0),
+            Vec3::new(h, -rise, -100.0),
+            Vec3::new(h, 0.0, 0.0),
+            Vec3::new(-h, 0.0, 0.0),
+            Vec3::new(-h, 0.0, 100.0),
+            Vec3::new(h, 0.0, 100.0),
+        ];
+        let tris = [[0, 2, 1], [0, 3, 2], [3, 5, 2], [3, 4, 5]];
+        let shape = CollisionShape::mesh(&v, &tris).unwrap();
+        p.add_static(StaticKey::Cell(1), &shape, Vec3::ZERO, Quat::IDENTITY);
+        p.step(DT);
+        let spec = tank();
+        let ground = |at: Vec3| {
+            p.cast_ray(Vec3::new(at.x, 50.0, at.z), Vec3::NEG_Y, 400.0)
+                .map(|(d, _)| 50.0 - d)
+        };
+        let rest = spec
+            .rest_on(Vec3::new(0.0, 0.0, -20.0), 0.0, ground)
+            .unwrap();
+        let id = p.add_vehicle_turned(&spec, rest.position + Vec3::Y * 0.2, rest.rotation);
+        for _ in 0..(12.0 / DT) as usize {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let at = p.vehicle_transform(id).unwrap().w_axis;
+        assert!(at.z > 20.0, "stopped at {at}");
+    }
+
+    #[test]
+    fn tanks_climb_steep_hills_and_stand_on_them() {
+        // Up 45 degrees at about 5 m/s, after the first seconds.
+        let up = tank_up(45.0, 1.0, 6.0);
+        assert!(up > 15.0, "{up} m up");
+        let up = tank_up(30.0, 1.0, 6.0);
+        assert!(up > 12.0, "{up} m up");
+        let stays = tank_up(40.0, 0.0, 3.0);
+        assert!(stays.abs() < 0.3, "moved {stays} m");
     }
 
     #[test]
