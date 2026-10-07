@@ -66,19 +66,31 @@ return true
 /// skip path does (`MrxUtil.CallWithOptionalArgs(fCallback,
 /// tCallbackData)`).
 const HOLD_MOVIES: &str = r#"
-local play = _PlayMovie
-if type(play) ~= "function" then
-    return false
-end
 __m2_movies = {}
-_PlayMovie = function(t)
-    if type(t) == "table" and type(t.sMovie) == "string" then
-        table.insert(__m2_movies, t)
-    else
-        return play(t)
+local held = 0
+local function hold(owner)
+    local play = rawget(owner, "_PlayMovie")
+    if type(play) ~= "function" then
+        return
+    end
+    rawset(owner, "_PlayMovie", function(t)
+        if type(t) == "table" and type(t.sMovie) == "string" then
+            table.insert(__m2_movies, t)
+        else
+            return play(t)
+        end
+    end)
+    held = held + 1
+end
+-- A module's `_PlayMovie` lives in its own table (`WifMissionFlow`),
+-- which its functions read it from.
+hold(_G)
+for _, v in pairs(_G) do
+    if type(v) == "table" and v ~= _G then
+        hold(v)
     end
 end
-return true
+return held
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -961,10 +973,10 @@ impl Mission {
             .lua()
             .load(HOLD_MOVIES)
             .set_name("=hold movies")
-            .eval::<bool>();
+            .eval::<u32>();
         self.log.push(match held {
-            Ok(true) => "movies: held for the game (_PlayMovie)".to_owned(),
-            Ok(false) => "movies: no _PlayMovie to hold".to_owned(),
+            Ok(0) => "movies: no _PlayMovie to hold".to_owned(),
+            Ok(n) => format!("movies: held for the game ({n} _PlayMovie)"),
             Err(e) => format!("movies: {}", first_lines(&e.to_string())),
         });
     }
