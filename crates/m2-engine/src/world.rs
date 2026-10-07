@@ -31,7 +31,7 @@ use m2_render::{
 use crate::assets::{AssetError, AssetSource};
 use crate::physics::CollisionShape;
 use crate::pickup::Leavings;
-use crate::tuning::VehicleTuning;
+use crate::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable, VehicleTuning};
 
 /// Side of the island in metres (20 cells of 400 m).
 pub const ISLAND: f32 = 8000.0;
@@ -244,6 +244,10 @@ impl Templates {
         let Ok(db) = Layer::parse(&data) else {
             return Self::default();
         };
+        let damage = source
+            .asset(name_hash(DAMAGE_TABLE), DAMAGE_TABLE_TYPE)
+            .ok()
+            .and_then(|d| DamageTable::parse(&d));
         let model_of = db.hashes("ModelName");
         let engines = engine_banks(&db);
         let mut kinds: HashMap<u32, VehicleKind> = HashMap::new();
@@ -301,7 +305,7 @@ impl Templates {
                 .into_iter()
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
-            tuning: crate::tuning::read(&db),
+            tuning: crate::tuning::read(&db, damage.as_ref()),
             leavings: crate::pickup::read(&db),
         }
     }
