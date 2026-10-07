@@ -32,12 +32,13 @@ use std::io::BufReader;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use m2_assets::WadArchive;
+use m2_assets::animation::{ANIMATION_TYPE, Clip};
 use m2_engine::Install;
 use m2_engine::hijack::HijackEntrance;
 use m2_game::api::Command;
 use m2_game::hijack::{ClipTimes, HijackCommand, Minigame};
 use m2_game::mission::{GameData, Mission};
-use m2_math::glam::Vec3;
+use m2_math::glam::{Mat4, Vec3};
 
 use crate::game::Game;
 use crate::input::{Action, Input};
@@ -108,6 +109,15 @@ struct Active {
     clip: Option<usize>,
     /// The entrance, in the world when it started: the camera looks at it.
     at: Vec3,
+    /// The vehicle's model space from its pistol prop's parent node: the
+    /// vehicle's clips carry the pistol she holds.
+    pistol_parent: Option<Mat4>,
+    /// The vehicle's hijack clip playing alongside hers.
+    vehicle_clip: Option<Clip>,
+    /// Her clips' height above the vehicle's origin, from where its clip
+    /// puts the pistol in her hand (the AMX30's clips are cut ~1.5 m
+    /// below its deck, the M1A2's on it).
+    lift: f32,
 }
 
 /// What the HUD shows of a hijack.
@@ -380,7 +390,15 @@ impl Hijacks {
             eprintln!("hijack: {} started", c.template);
             game.input_locked = true;
             self.lag = 0.0;
+            let pistol_parent = game
+                .scene
+                .source
+                .as_mut()
+                .and_then(|source| parent_to_model(source, model, PISTOL));
             self.active = Some(Active {
+                pistol_parent,
+                vehicle_clip: None,
+                lift: 0.0,
                 vehicle: c.vehicle,
                 hero,
                 set: l.clips.sets.get(&c.template.to_ascii_lowercase()).copied(),
@@ -529,7 +547,7 @@ impl Hijacks {
         let off = m2_math::glam::Quat::from_rotation_y(yaw)
             * Vec3::new(root.x - c.info.pin.x, 0.0, root.z - c.info.pin.y);
         p.facing = yaw + model_yaw;
-        p.character.position = origin + off;
+        p.character.position = origin + off + Vec3::Y * a.lift;
         // The camera follows her about the vehicle.
         p.chase_target = Some((
             p.character.position + Vec3::Y * CAMERA_LIFT,
@@ -615,7 +633,14 @@ fn follow(
         _ => None,
     });
     let mut over = false;
+    let mut started = false;
     for c in commands {
+        if let Command::Hijack(HijackCommand::PlayAnimation { clip, channel, .. }) = &c
+            && channel == "hijack"
+        {
+            a.vehicle_clip = load(game, m2_assets::name_hash(clip));
+            started = true;
+        }
         // The hijack's blasts (the hatch blown open, a grenade): fire
         // and smoke only, not a blast that wrecks what is near; a
         // grenade's size (inferred).
@@ -647,6 +672,7 @@ fn follow(
                     && let Some((hash, _)) = clip
                 {
                     a.clip = play(game, hash);
+                    started = true;
                 }
                 if !action.eq_ignore_ascii_case("Idle") {
                     let own = clip.and_then(|c| c.1);
@@ -680,6 +706,10 @@ fn follow(
             }
             _ => {}
         }
+    }
+    if started && let Some(lift) = lift(a, game) {
+        eprintln!("hijack: her clips {lift:.2} m up");
+        a.lift = lift;
     }
     let (done, left): (Vec<_>, Vec<_>) = a.actions.iter().partition(|x| x.1 <= now);
     a.actions = left;
@@ -731,23 +761,71 @@ pub fn beside(game: &mut Game, hijacks: &mut Hijacks, want: Option<&str>) -> Opt
     Some(i)
 }
 
+/// The vehicles' pistol prop (`bone_pistol`), which their hijack clips
+/// move with her hand.
+const PISTOL: u32 = 0xcea4_a847;
+
+/// Clip `hash` from the archive.
+fn load(game: &mut Game, hash: u32) -> Option<Clip> {
+    let bytes = game
+        .scene
+        .source
+        .as_mut()?
+        .asset(hash, ANIMATION_TYPE)
+        .ok()?;
+    Clip::parse(&bytes).ok()
+}
+
+/// How high her clip must play for her right hand to be where the
+/// vehicle's clip puts the pistol: the median over the two clips' frames,
+/// in height only. None without both clips or the prop.
+fn lift(a: &Active, game: &Game) -> Option<f32> {
+    let (vehicle, parent) = (a.vehicle_clip.as_ref()?, a.pistol_parent?);
+    let track = vehicle.track_nodes.iter().position(|&n| n == PISTOL)?;
+    let (_, rig) = game.scene.player.as_ref()?.model.as_ref()?;
+    let hers = rig.clips.get(a.clip?)?;
+    let (hand, _) = crate::combat::hands(&rig.skeleton)?;
+    let end = hers.info.duration.min(vehicle.header.duration);
+    let mut ups = Vec::new();
+    let mut t = 0.0;
+    while t <= end {
+        let mut pose = hers.sample(&rig.skeleton, t);
+        pose.strip_root_motion(rig.skeleton.root(), hers.info.pin);
+        let hand_y = rig.skeleton.model_matrices(&pose)[hand].w_axis.y;
+        let at = vehicle.sample(t).get(track)?.translation;
+        let pistol = parent.transform_point3(Vec3::new(at.x, at.y, at.z));
+        ups.push(pistol.y - hand_y);
+        t += STEP;
+    }
+    ups.sort_by(f32::total_cmp);
+    ups.get(ups.len() / 2).copied()
+}
+
 /// Plays clip `hash` on her (read from the archive the first time); its
 /// index in her rig's clips.
 fn play(game: &mut Game, hash: u32) -> Option<usize> {
-    use m2_assets::animation::{ANIMATION_TYPE, Clip};
-    let scene = &mut game.scene;
-    let (_, rig) = scene.player.as_mut()?.model.as_mut()?;
-    let index = match rig.clips.iter().position(|c| c.hash == hash) {
+    let index = match game
+        .scene
+        .player
+        .as_ref()?
+        .model
+        .as_ref()?
+        .1
+        .clips
+        .iter()
+        .position(|c| c.hash == hash)
+    {
         Some(i) => i,
         None => {
-            let bytes = scene.source.as_mut()?.asset(hash, ANIMATION_TYPE).ok()?;
-            let clip = Clip::parse(&bytes).ok()?;
+            let clip = load(game, hash)?;
+            let (_, rig) = game.scene.player.as_mut()?.model.as_mut()?;
             let bound = m2_engine::BoundClip::bind(hash, clip, &rig.skeleton)?;
             let clips = std::sync::Arc::make_mut(&mut rig.clips);
             clips.push(bound);
             clips.len() - 1
         }
     };
+    let (_, rig) = game.scene.player.as_mut()?.model.as_mut()?;
     rig.animator.play_once(index);
     Some(index)
 }
@@ -806,6 +884,18 @@ fn point(
 }
 
 /// Every node of a model, by name hash, with where it is (model space).
+/// The model space from the parent of `model`'s node named `node`.
+fn parent_to_model(
+    source: &mut m2_engine::AssetSource<BufReader<File>>,
+    model: u32,
+    node: u32,
+) -> Option<Mat4> {
+    let data = source.model(model).ok()?;
+    let m = data.parse().ok()?;
+    let n = m.nodes.iter().find(|n| n.name_hash == node)?;
+    m.node_to_model(n.parent?)
+}
+
 fn nodes(source: &mut m2_engine::AssetSource<BufReader<File>>, model: u32) -> Vec<(u32, Vec3)> {
     let Ok(data) = source.model(model) else {
         return Vec::new();
