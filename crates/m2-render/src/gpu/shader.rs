@@ -76,6 +76,10 @@ struct Frame {
     // power), z least share of each wave kept however far, w the night
     // ramp's alpha
     glint_fit: vec4<f32>,
+    // x: the cloud deck takes the sun's colour twice, as the game's (0:
+    // once, `M2_DECK=old`), y: its Tone scales display values
+    // (`M2_DECK=full`; see `deck_light`)
+    deck_fit: vec4<f32>,
 };
 
 // The game lights surfaces in display values: the sun's colour times
@@ -389,13 +393,28 @@ fn deck_light(r: vec3<f32>, mass: f32) -> vec3<f32> {
         let g = frame.rayleigh.a;
         let phase = 1.5 * (1.0 - g * g) / (2.0 + g * g) * (1.0 + c * c)
             / pow(1.0 + g * g - 2.0 * g * c, 1.5);
-        // The sun's colour comes in with the air in front when that
-        // is tinted by it.
+        // The game's cloud pixel shader (023) lights a colour constant
+        // and its vertex shader (025) multiplies the result by the air's
+        // E * dirLightColor, so the sun's colour comes in twice: once
+        // here, once in the air's tint (`through_air`). Round ED: dusk
+        // sky B/R .84 -> .78 at the villa (console .69-.77), .90 -> .87
+        // on the boat (PC ~.79); night sky top L80 -> 74 (Xbox 81).
+        // `M2_DECK=old` divides the sun by the air's tint, so it comes in
+        // once. `M2_DECK=full` also takes Tone over display values, as
+        // the game's shaders sum them (inferred: boat .81, but night top
+        // L64, B/R 2.42 against Xbox 1.49).
         var sun = frame.sun_color.rgb;
-        if frame.deck.y >= 0.0 && game_haze() {
-            sun = sun / max(light_from_display(frame.deck.yzw), vec3<f32>(1e-3));
+        var tone = light_from_display(frame.cloud_tone.rgb);
+        if frame.deck_fit.y < 0.5 {
+            tone = frame.cloud_tone.rgb;
         }
-        cloud = sun * (1.0 + phase) / (1.0 + mass * frame.wind.w);
+        if frame.deck_fit.x < 0.5 {
+            if frame.deck.y >= 0.0 && game_haze() {
+                sun = sun / max(light_from_display(frame.deck.yzw), vec3<f32>(1e-3));
+            }
+        }
+        cloud = sun * (1.0 + phase) / (1.0 + mass * frame.wind.w) * tone;
+        return cloud;
     } else {
         // Lit by the sun, brighter looking towards it; thicker cloud
         // is darker underneath.

@@ -252,6 +252,10 @@ struct FrameUniforms {
     /// (`M2_GLINT_POWER`, 0: the dusk power), z the least share of each
     /// wave kept however far (`M2_WAVE_KEEP`), w the night ramp's alpha.
     glint_fit: [f32; 4],
+    /// x: the cloud deck takes the sun's colour twice, as the game's
+    /// (`M2_DECK=old`: 0), y: its Tone scales display values
+    /// (`M2_DECK=full`: 1).
+    deck_fit: [f32; 4],
 }
 
 /// What a shadow pipeline depends on.
@@ -1881,6 +1885,15 @@ impl WgpuBackend {
                 env_f32("M2_WAVE_KEEP").unwrap_or(0.0),
                 l.monochrome.map_or(0.0, |m| m.w),
             ],
+            deck_fit: {
+                let mode = std::env::var("M2_DECK").unwrap_or_default();
+                [
+                    if mode == "old" { 0.0 } else { 1.0 },
+                    if mode == "full" { 1.0 } else { 0.0 },
+                    0.0,
+                    0.0,
+                ]
+            },
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
