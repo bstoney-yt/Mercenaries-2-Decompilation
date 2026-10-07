@@ -798,6 +798,8 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyVaryings {
 // layer gives the broad masses and the others break them up.
 const CLOUD_SPAN: f32 = 6000.0;
 const CLOUD_SPEED: f32 = 6.0;
+// The least height (sine) of a ray met by the cloud deck: invented.
+const HORIZON_UP: f32 = 0.01;
 
 @fragment
 fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
@@ -807,7 +809,11 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
     var rgb = sky(r);
     // Where the ray meets the cloud deck, the deck moving with the eye so
     // clouds stay overhead; sampled before any branch for mip selection.
-    let up = max(r.y, 0.03);
+    // Rays below a floor all met the deck at one far point per column,
+    // which drew a band of vertical streaks along the horizon that
+    // shimmered as the camera turned (Brendan's play-test); the floor is
+    // now low and the deck fades out above it.
+    let up = max(r.y, HORIZON_UP);
     let deck = frame.eye.xz + r.xz * (CLOUD_HEIGHT / up);
     let drift = frame.wind.xy * CLOUD_SPEED * frame.view_dir.w;
     let scale = max(frame.clouds.xyz, vec3<f32>(0.01)) * CLOUD_SPAN;
@@ -823,6 +829,9 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
         let cut = 1.0 - frame.clouds.w;
         var alpha = max(smoothstep(cut - 0.1, cut + 0.35, density), frame.sky_fit.x);
         let mass = alpha;
+        // As the game's quad, which ends a finite way off, the deck is
+        // gone at the horizon whatever the record's fade.
+        alpha = alpha * smoothstep(HORIZON_UP, 4.0 * HORIZON_UP, r.y);
         // Far deck fades into the haze towards the horizon.
         if frame.wind.z < 1.5 {
             alpha = alpha * smoothstep(0.02, 0.35, r.y);
