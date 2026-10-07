@@ -79,7 +79,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use camera::FlyCamera;
@@ -2144,7 +2144,13 @@ fn mission_for_screenshot(
                 (hud, Config::default())
             });
             let mut info = hud_info(game, Some(&link), fov, aspect);
-            info.game = Some(gamehud::HudState::of(game));
+            let mut state = gamehud::HudState::of(game);
+            // She presses Enter every four seconds, as a player would to
+            // close the contract's fanfare.
+            if i % (4.0 / tick).round() as u32 == 0 {
+                state.buttons.push("selection".into());
+            }
+            info.game = Some(state);
             let (w, h) = backend.size();
             let input = ui::headless_input(w, h, f64::from(i) * f64::from(tick));
             let _ = hud.build(input, &info, settings);
@@ -3799,6 +3805,9 @@ struct Running {
     hijacks: Option<hijack::Hijacks>,
     /// The launch's movies and front end (`--alpha`).
     flow: Option<flow::Flow>,
+    /// The GUI's named buttons pressed since the last frame (Enter is
+    /// `"selection"`), for the game HUD's scripts.
+    buttons: Vec<String>,
 }
 
 struct App {
@@ -3904,6 +3913,7 @@ impl App {
                 }
                 _ => None,
             },
+            buttons: Vec::new(),
         })
     }
 
@@ -3967,7 +3977,9 @@ impl Running {
             info.can_enter = None;
         }
         if self.hud.game.is_some() {
-            info.game = Some(gamehud::HudState::of(&mut self.game));
+            let mut state = gamehud::HudState::of(&mut self.game);
+            state.buttons = std::mem::take(&mut self.buttons);
+            info.game = Some(state);
         }
         let (action, output) = self.hud.build(input, &info, config);
         self.egui.handle_platform_output(&self.window, output);
@@ -4232,6 +4244,12 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if state.focused => {
+                if let PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) = event.physical_key
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                {
+                    state.buttons.push("selection".into());
+                }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     state.input.key(
                         &self.config.keys,

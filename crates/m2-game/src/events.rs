@@ -88,6 +88,11 @@ pub trait World {
     fn hijack_held_since(&self, _button: u32) -> Option<f64> {
         None
     }
+    /// The player's presses of the GUI's named buttons (`"selection"`,
+    /// `"cancel"`), each with its game time, for `Button` events.
+    fn button_presses(&self) -> &[(f64, String)] {
+        &[]
+    }
 }
 
 /// The kinds the scripts use, by how often.
@@ -885,6 +890,19 @@ fn check(
             None => no,
         },
         // { player, seconds, mode, button, ... }: see `crate::hijack`.
+        // { player, button, "press", ... }: when the player presses the
+        // named button (`"selection"`: the fanfare's skip), after the
+        // event was made (persistent: after it last fired).
+        "Button" => match text(&p.params, 2) {
+            Some(button) => {
+                let pressed = world
+                    .button_presses()
+                    .iter()
+                    .any(|(t, b)| *b == button && *t >= p.last && (*t > p.last || !p.persistent));
+                if pressed { Check::Fire(Vec::new()) } else { no }
+            }
+            None => no,
+        },
         "Minigame" => Check::Minigame(crate::hijack::check_minigame(
             &p.params, p.made, now, p.read, p.memo, world,
         )),

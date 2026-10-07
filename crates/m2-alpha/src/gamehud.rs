@@ -419,6 +419,9 @@ pub struct HudState {
     /// codes ([`flash_key`]): the PDA's movies' own `Key` listeners take
     /// them (the map's Home shows the current contract).
     pub keys: Vec<(i32, bool)>,
+    /// The GUI's named buttons pressed (`"selection"`: Enter), for the
+    /// scripts' `Button` events (the contract fanfare's skip).
+    pub buttons: Vec<String>,
     /// The contract's objectives for the PDA: text id and icon tag each
     /// (`MissionView::pda_objectives`).
     pub pda_objectives: Vec<(String, String)>,
@@ -588,6 +591,8 @@ impl HudState {
         let mut hud_calls = std::mem::take(&mut self.hud_calls);
         let mut keys = std::mem::take(&mut self.keys);
         keys.extend(later.keys.iter().copied());
+        let mut buttons = std::mem::take(&mut self.buttons);
+        buttons.extend(later.buttons.iter().cloned());
         hurts.extend(later.hurts.iter().copied());
         messages.extend(later.messages.iter().cloned());
         hud_calls.extend(later.hud_calls.iter().cloned());
@@ -597,6 +602,7 @@ impl HudState {
             messages,
             hud_calls,
             keys,
+            buttons,
             ..later
         };
     }
@@ -1274,6 +1280,9 @@ impl Thread {
             log.push(format!("event: {e}"));
         }
         self.pass_calls(state, &mut log);
+        for b in &state.buttons {
+            self.mission.press_button(b);
+        }
         // The PDA button: the engine's `TogglePDA` GUI event, which the PDA
         // layout's widget hands to `MrxGuiPda` (it opens the "topbar"
         // movie over a black backdrop and puts the HUD to sleep). Only

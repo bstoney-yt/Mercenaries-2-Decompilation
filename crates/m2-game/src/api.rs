@@ -366,6 +366,9 @@ pub struct ScriptWorld {
     pub relations: HashMap<(String, String), f32>,
     /// Actions playing and the pad, for hijacks.
     pub hijack: crate::hijack::HijackWorld,
+    /// The player's latest presses of the GUI's named buttons, with
+    /// their game time ([`crate::events::World::button_presses`]).
+    pub buttons: Vec<(f64, String)>,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
 }
@@ -609,6 +612,10 @@ impl World for ScriptWorld {
 
     fn hijack_presses(&self) -> &[(f64, u32)] {
         self.hijack.presses()
+    }
+
+    fn button_presses(&self) -> &[(f64, String)] {
+        &self.buttons
     }
 
     fn hijack_held_since(&self, button: u32) -> Option<f64> {
