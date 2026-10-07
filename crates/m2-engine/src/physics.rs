@@ -2074,6 +2074,39 @@ impl Physics {
             .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
     }
 
+    /// The first solid thing along a ray, passing through vehicle `skip`:
+    /// its distance, and the vehicle it is if one (what a round hits).
+    pub fn cast_ray_vehicle(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+        skip: Option<VehicleId>,
+    ) -> Option<(f32, Option<VehicleId>)> {
+        let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
+        let mut filter = solid();
+        if let Some(v) = skip
+            .and_then(|v| self.vehicles.get(v.0))
+            .and_then(Option::as_ref)
+        {
+            filter = filter.exclude_rigid_body(v.controller.chassis);
+        }
+        let (handle, hit) = self
+            .world
+            .query_pipeline_with_filter(filter)
+            .cast_ray(&ray, max, true)?;
+        let body = self.world.colliders.get(handle).and_then(|c| c.parent());
+        let vehicle = self
+            .vehicles
+            .iter()
+            .position(|v| {
+                v.as_ref()
+                    .is_some_and(|v| Some(v.controller.chassis) == body)
+            })
+            .map(VehicleId);
+        Some((hit, vehicle))
+    }
+
     /// [`cast_ray`](Self::cast_ray), with the key of the static hit (`None`
     /// for anything else solid, such as a vehicle), to find what an
     /// unseen obstacle is.

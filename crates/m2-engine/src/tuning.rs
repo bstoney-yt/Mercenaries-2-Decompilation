@@ -24,6 +24,19 @@ pub struct VehicleTuning {
     /// the Xbox 360 playthrough, the LAV III's 85 the real one's road
     /// speed, near enough).
     pub max_speed: Option<f32>,
+    /// The damage it takes before it is wrecked (its `Health`
+    /// component's value, field d122919d: the AMX-30's 125, an M151's
+    /// 100).
+    pub health: Option<f32>,
+    /// Its armour class (`ObjectHint`'s `Armor`): 1 none (cars, boats),
+    /// 2 light (helicopters), 3 medium (the LAV III), 4 heavy (tanks).
+    pub armour: Option<u32>,
+    /// What blasts do to it, of their damage (`ExplosionFudge`'s field
+    /// 6bcc541e: the AMX-30's 0.2, a truck's 0.4, a boat's 1.1).
+    pub blast_scale: Option<f32>,
+    /// Health below which it burns down by itself (`TickDamage`'s field
+    /// 9a6663a4: the AMX-30's 30).
+    pub burns_below: Option<f32>,
     pub turret: Option<TurretTuning>,
     pub camera: Option<TankCamera>,
     pub gun: Option<GunTuning>,
@@ -101,6 +114,11 @@ const CAMERA_HEIGHT: u32 = 0x2afa_6ae4;
 /// firing the main gun (the LAV III's gunner; its template also has a
 /// camera for the rear passenger's hatch, `seat_passenger_rr`).
 const CAMERA_SEATS: [&str; 2] = ["seat_driver", "seat_gunner"];
+/// Unnamed fields (round 154): `Health`'s value, `ExplosionFudge`'s
+/// scale and `TickDamage`'s threshold.
+const HEALTH: u32 = 0xd122_919d;
+const BLAST_SCALE: u32 = 0x6bcc_541e;
+const BURNS_BELOW: u32 = 0x9a66_63a4;
 
 /// One component's records by template id, and its fields by name hash.
 pub(crate) struct Table<'a> {
@@ -167,6 +185,14 @@ impl<'a> Table<'a> {
             .filter(|f| f.is_finite())
     }
 
+    /// Field `field` of template `id`'s first record as a number, stored
+    /// as a float or a whole number.
+    fn number(&self, id: u32, field: u32) -> Option<f32> {
+        let w = self.word(self.of_template(id).first()?, field)?;
+        let f = f32::from_bits(w);
+        Some(if f.is_normal() { f } else { w as f32 }).filter(|v| (0.0..1e7).contains(v))
+    }
+
     /// Field `name` of template `id`'s first record.
     fn get(&self, id: u32, name: &str) -> Option<f32> {
         self.float(self.of_template(id).first()?, name_hash(name))
@@ -191,6 +217,10 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
     let turret = Table::new(db, "Turret");
     let camera = Table::new(db, "CameraTank");
     let links = Table::new(db, "PhysicalLink");
+    let health = Table::new(db, "Health");
+    let hint = Table::new(db, "ObjectHint");
+    let fudge = Table::new(db, "ExplosionFudge");
+    let tick = Table::new(db, "TickDamage");
     let guns = Guns {
         weapon: Table::new(db, "WeaponProjectileBase"),
         effects: Table::new(db, "WeaponEffects"),
@@ -220,6 +250,15 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, VehicleTuning> {
                     .iter()
                     .find_map(|t| t.get(id, "MaxSpeed").filter(|s| *s > 0.0))
                     .map(|kmh| kmh / 3.6),
+                health: health.number(id, HEALTH),
+                armour: hint
+                    .of_template(id)
+                    .first()
+                    .and_then(|r| hint.word(r, name_hash("Armor")))
+                    .map(|a| a & 0xff)
+                    .filter(|a| (1..=4).contains(a)),
+                blast_scale: fudge.number(id, BLAST_SCALE),
+                burns_below: tick.number(id, BURNS_BELOW),
                 turret: (|| {
                     let named = turret.named(id, MAIN_TURRET);
                     let r = match (named, turret.of_template(id)) {

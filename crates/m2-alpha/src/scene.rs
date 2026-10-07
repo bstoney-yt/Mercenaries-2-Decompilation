@@ -481,9 +481,28 @@ pub struct ParkedVehicle {
     pub rolled: f32,
     /// Shells its cannon has fired.
     pub fired: u32,
+    /// Damage it has taken, of its [`most_health`](Self::most_health).
+    pub damage: f32,
 }
 
+/// A vehicle's health where its template gives none.
+const VEHICLE_HEALTH: f32 = 500.0;
+
 impl ParkedVehicle {
+    /// The damage it takes before it is wrecked: its template's health.
+    pub fn most_health(&self) -> f32 {
+        self.spec.tuning.health.unwrap_or(VEHICLE_HEALTH).max(1.0)
+    }
+
+    /// Its health of 100, as the HUD's health box shows it: none once
+    /// wrecked.
+    pub fn health(&self) -> f32 {
+        if self.wrecked {
+            return 0.0;
+        }
+        (100.0 * (1.0 - self.damage / self.most_health())).clamp(0.0, 100.0)
+    }
+
     /// The shells left in its cannon, which carries as many as its
     /// template's `iClipSize` (the AMX-30's 40, which the HUD counts down
     /// from in the videos); `None` for a gun that doesn't run out.
@@ -1133,6 +1152,7 @@ impl Scene {
                 gun: 0.0,
                 rolled: 0.0,
                 fired: 0,
+                damage: 0.0,
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
@@ -1153,6 +1173,7 @@ impl Scene {
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
+                    damage: 0.0,
                 });
             }
             Loaded::WorldVehicle(entity, at, yaw, crew, spec, _) => {
@@ -1168,6 +1189,7 @@ impl Scene {
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
+                    damage: 0.0,
                 });
             }
             Loaded::Flight(hash, _, rest, rotors) => {
