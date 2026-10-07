@@ -746,6 +746,12 @@ impl GameHud {
         }
     }
 
+    /// Logs to `path` instead of `m2-alpha-hud.log` (a second HUD in one
+    /// run, kept apart from the first's).
+    pub fn log_to(&mut self, path: &std::path::Path) {
+        self.log = File::create(path).ok().map(BufWriter::new);
+    }
+
     /// The scripts are running and have drawn.
     pub fn ready(&self) -> bool {
         matches!(self.status, Status::Ready)
