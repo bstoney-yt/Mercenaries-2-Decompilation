@@ -2,6 +2,8 @@
 
 pub mod api;
 pub mod events;
+pub mod gui;
+pub mod gui_runtime;
 pub mod hud;
 pub mod inventory;
 pub mod layers;

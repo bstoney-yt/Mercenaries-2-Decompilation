@@ -1183,6 +1183,7 @@ dependencies = [
  "m2-game",
  "m2-math",
  "m2-render",
+ "mlua",
  "serde",
  "toml",
  "winit",
@@ -1219,6 +1220,7 @@ dependencies = [
  "m2-assets",
  "m2-engine",
  "m2-math",
+ "miniz_oxide",
  "mlua",
  "thiserror 2.0.21",
 ]

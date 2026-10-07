@@ -1,8 +1,12 @@
-//! The HUD (health, weapon, crosshair, what the player can do next) and the
-//! pause menu, drawn with egui over the finished frame.
+//! The HUD and the pause menu, drawn with egui over the finished frame.
 //!
-//! The HUD's look is our own, not the game's: the game's interface (Scaleform
-//! movies) is not decoded. egui's bundled fonts are used.
+//! Health, ammo and weapon, the reticle, hit arcs and messages are the
+//! game's own HUD ([`GameHud`]) once its scripts have started; until then,
+//! or without the game's files, a stand-in of our own draws health, weapon
+//! and a crosshair. What the player can do next, the mission's objectives
+//! and markers, and loading lines are ours, in egui's bundled fonts.
+
+use std::time::Duration;
 
 use std::f32::consts::TAU;
 
@@ -15,6 +19,7 @@ use m2_math::glam::{Mat4, Vec3};
 
 use crate::combat::Weapon;
 use crate::config::Config;
+use crate::gamehud::{GameHud, HudState, flash_key};
 use crate::mission::MissionView;
 use crate::support::{SupportHud, WheelHud};
 
@@ -50,6 +55,8 @@ pub struct HudInfo {
     pub mission: Option<MissionView>,
     /// World to clip, for placing markers.
     pub view_proj: Option<Mat4>,
+    /// What the game's HUD is told, if it runs.
+    pub game: Option<HudState>,
     /// Her support: the item ready, the designator, the satellite's view,
     /// the timing wheel, the bomb's flash.
     pub support: SupportHud,
@@ -74,10 +81,14 @@ const HINT_TIME: f64 = 12.0;
 pub struct Hud {
     pub ctx: egui::Context,
     renderer: Option<Renderer>,
+    /// Textures handed to the renderer and not freed (for `M2_PAINT_LOG`).
+    uploaded: std::collections::HashSet<egui::TextureId>,
     /// The pause menu is open.
     pub menu: bool,
     /// Tessellated and waiting to paint: shapes, texture changes, scale.
     frame: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
+    /// The game's own HUD, if its files are there.
+    pub game: Option<GameHud>,
 }
 
 impl std::fmt::Debug for Hud {
@@ -110,8 +121,110 @@ impl Hud {
         Self {
             ctx,
             renderer: None,
+            uploaded: Default::default(),
             menu: false,
             frame: None,
+            game: None,
+        }
+    }
+
+    /// Steps the game's HUD for this frame, if it runs.
+    fn feed(&mut self, input: &RawInput, info: &HudInfo) {
+        let (Some(game), Some(state)) = (&mut self.game, &info.game) else {
+            return;
+        };
+        let mut state = state.clone();
+        state.size = input
+            .screen_rect
+            .map_or([0.0; 2], |r| [r.width(), r.height()]);
+        state.dt = game.frame_time(input.time);
+        let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
+        state.messages.extend(game.message(message));
+        state.blips = blips(info);
+        state.reticle = reticle(info);
+        state.support = info.support.clone();
+        state.radar_regions = info
+            .mission
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.radar_regions.clone());
+        state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
+        if let Some(m) = &info.mission {
+            state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.pda_objectives = m.pda_objectives.clone();
+        }
+        if info.support.pda {
+            state.keys = input
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed,
+                        repeat: false,
+                        ..
+                    } => Some((flash_key(*key)?, *pressed)),
+                    _ => None,
+                })
+                .collect();
+        }
+        game.update(&self.ctx, state);
+    }
+
+    /// Runs the game's HUD `seconds` on `info`, waiting for each step (and
+    /// up to `timeout` for its scripts to start): for screenshots, which
+    /// draw one frame. `keys` (Flash key codes) are pressed half way.
+    pub fn settle(
+        &mut self,
+        info: &HudInfo,
+        size: (u32, u32),
+        seconds: f64,
+        keys: &[i32],
+        timeout: Duration,
+    ) {
+        let (Some(game), Some(state)) = (&mut self.game, &info.game) else {
+            return;
+        };
+        let mut state = state.clone();
+        state.size = [size.0 as f32, size.1 as f32];
+        let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
+        state.messages.extend(game.message(message));
+        state.blips = blips(info);
+        state.reticle = reticle(info);
+        state.support = info.support.clone();
+        state.radar_regions = info
+            .mission
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.radar_regions.clone());
+        state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
+        if let Some(m) = &info.mission {
+            state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.pda_objectives = m.pda_objectives.clone();
+        }
+        let step = 1.0 / 30.0;
+        game.update_and_wait(
+            &self.ctx,
+            HudState {
+                dt: 0.0,
+                ..state.clone()
+            },
+            timeout,
+        );
+        // Hurts and messages once; then time passes.
+        state.hurts.clear();
+        state.messages.clear();
+        state.hud_calls.clear();
+        state.dt = step;
+        let steps = (seconds / step).ceil() as usize;
+        for i in 0..steps {
+            if !game.ready() {
+                break;
+            }
+            state.keys = match i.checked_sub(steps / 2) {
+                Some(0) => keys.iter().map(|&k| (k, true)).collect(),
+                Some(1) => keys.iter().map(|&k| (k, false)).collect(),
+                _ => Vec::new(),
+            };
+            game.update_and_wait(&self.ctx, state.clone(), Duration::from_secs(10));
         }
     }
 
@@ -126,8 +239,10 @@ impl Hud {
     ) -> (Option<MenuAction>, egui::PlatformOutput) {
         let mut action = None;
         let menu = self.menu;
+        self.feed(&input, info);
+        let game = self.game.as_ref().filter(|g| g.ready());
         let output = self.ctx.run_ui(input, |ui| {
-            hud(ui, info);
+            hud(ui, info, game);
             if menu {
                 action = pause_menu(ui.ctx(), config);
             }
@@ -158,6 +273,10 @@ impl Hud {
             for image in images {
                 renderer.update_texture(t.device, t.queue, *id, image);
             }
+            self.uploaded.insert(*id);
+        }
+        if std::env::var_os("M2_PAINT_LOG").is_some() {
+            log_primitives(&shapes, &delta, &self.uploaded, t.format, t.size);
         }
         let screen = ScreenDescriptor {
             size_in_pixels: [t.size.0, t.size.1],
@@ -184,9 +303,73 @@ impl Hud {
             renderer.render(&mut pass.forget_lifetime(), &shapes, &screen);
         }
         for id in &delta.free {
+            self.uploaded.remove(id);
             renderer.free_texture(id);
         }
         delta.clear();
+    }
+}
+
+/// Test squares (`M2_PAINT_TEST` set), 100 px each along the top from
+/// x 20: opaque magenta, opaque black, black at alpha 0.75, mid grey;
+/// to see whether solid fills reach the picture at all.
+fn paint_test(painter: &egui::Painter) {
+    let colours = [
+        Color32::from_rgb(255, 0, 255),
+        Color32::BLACK,
+        Color32::from_rgba_unmultiplied(0, 0, 0, 192),
+        Color32::from_gray(128),
+    ];
+    for (i, c) in colours.into_iter().enumerate() {
+        let x = 20.0 + 120.0 * i as f32;
+        painter.rect_filled(
+            egui::Rect::from_min_size(pos2(x, 120.0), vec2(100.0, 100.0)),
+            0.0,
+            c,
+        );
+    }
+}
+
+/// What goes to the GPU (`M2_PAINT_LOG` set): each mesh's texture, its
+/// vertices, bounds, clip and colours, to find HUD fills lost on the way.
+fn log_primitives(
+    shapes: &[egui::ClippedPrimitive],
+    delta: &egui::TexturesDelta,
+    uploaded: &std::collections::HashSet<egui::TextureId>,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+) {
+    let set: Vec<_> = delta.set.keys().copied().collect();
+    eprintln!(
+        "paint: {} primitives to {format:?} {size:?}; textures set {set:?}",
+        shapes.len()
+    );
+    for p in shapes {
+        if let egui::epaint::Primitive::Mesh(m) = &p.primitive {
+            let b = m.calc_bounds();
+            let alpha = m.vertices.iter().map(|v| v.color.a());
+            let (lo, hi) = alpha.fold((255, 0), |(lo, hi), a| (lo.min(a), hi.max(a)));
+            let dark = m
+                .vertices
+                .iter()
+                .filter(|v| v.color.r() < 16 && v.color.a() > 64)
+                .count();
+            eprintln!(
+                "paint: {:?}{} {} verts {} indices, bounds {:.0?}..{:.0?}, clip {:.0?}..{:.0?}, alpha {lo}..{hi}, {dark} dark",
+                m.texture_id,
+                if uploaded.contains(&m.texture_id) {
+                    ""
+                } else {
+                    " (NOT UPLOADED)"
+                },
+                m.vertices.len(),
+                m.indices.len(),
+                b.min,
+                b.max,
+                p.clip_rect.min,
+                p.clip_rect.max,
+            );
+        }
     }
 }
 
@@ -203,7 +386,33 @@ pub fn headless_input(width: u32, height: u32, time: f64) -> RawInput {
     }
 }
 
-fn hud(ui: &mut egui::Ui, info: &HudInfo) {
+/// Where the reticle goes: the crosshair's point on the screen, -1..=1
+/// across and up it. None while she is down, aims at nothing (in a
+/// vehicle without a gun) or the point is behind the camera.
+fn reticle(info: &HudInfo) -> Option<[f32; 2]> {
+    if info.down {
+        return None;
+    }
+    let (at, vp) = info.crosshair.zip(info.view_proj)?;
+    let clip = vp * at.extend(1.0);
+    if clip.w <= 0.01 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some([ndc.x.clamp(-1.0, 1.0), ndc.y.clamp(-1.0, 1.0)])
+}
+
+/// The mission's markers, for the game HUD's minimap.
+fn blips(info: &HudInfo) -> Vec<([f32; 3], String, [u8; 4])> {
+    info.mission.as_ref().map_or_else(Vec::new, |m| {
+        m.markers
+            .iter()
+            .map(|(at, label, colour)| (at.to_array(), label.clone(), *colour))
+            .collect()
+    })
+}
+
+fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     let ctx = ui.ctx().clone();
     let screen = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
@@ -231,7 +440,24 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
     }
     let time = ctx.input(|i| i.time);
     if let Some(view) = info.support.satellite {
-        satellite(&painter, screen, info, view, &text);
+        // The game's own view (`MrxGuiSatelliteLayout`) once its HUD runs,
+        // with the objective under it; ours until then.
+        match game.filter(|_| info.playing) {
+            Some(game) => {
+                game.paint(&painter);
+                satellite_objective(&painter, screen, info, &text);
+            }
+            None => satellite(&painter, screen, info, view, &text),
+        }
+        return;
+    }
+    // The PDA over the world: only the game's HUD (its movie) shows, as
+    // the wiki's picture of it has it.
+    if info.support.pda
+        && info.playing
+        && let Some(game) = game
+    {
+        game.paint(&painter);
         return;
     }
     if time < HINT_TIME && info.playing {
@@ -239,13 +465,22 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
             screen.center_top() + vec2(0.0, 56.0),
             Align2::CENTER_TOP,
             "Click to look around. WASD move, Shift sprint, Space jump, E get in, \
-             left button fire, right button aim, 1/2 weapons, G grenade, Esc menu",
+             left button fire, right button aim, 1/2 weapons, G grenade, B bash, Esc menu",
             15.0,
             white,
         );
     }
+    if info.playing
+        && let Some(game) = game
+    {
+        game.paint(&painter);
+        if std::env::var_os("M2_PAINT_TEST").is_some() {
+            paint_test(&painter);
+        }
+    }
     if let Some(m) = &info.mission {
-        mission(&painter, screen, info.view_proj, m, &text);
+        // The game's HUD shows the messages in its message buffer.
+        mission(&painter, screen, info.view_proj, m, game.is_none(), &text);
     }
     if !info.playing {
         text(
@@ -257,7 +492,63 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
         );
         return;
     }
+    if game.is_some() {
+        if let Some((_, _, true)) = &info.driving {
+            text(
+                screen.center() + vec2(0.0, 60.0),
+                Align2::CENTER_TOP,
+                "Wrecked: E to get out",
+                17.0,
+                white,
+            );
+        }
+    } else {
+        stand_in(&painter, screen, info, &text);
+    }
+    if let Some(prompt) = &info.prompt {
+        text(
+            screen.center() + vec2(0.0, 60.0),
+            Align2::CENTER_TOP,
+            &format!("E: {prompt}"),
+            17.0,
+            white,
+        );
+    } else if let Some(name) = &info.can_enter
+        && info.driving.is_none()
+    {
+        text(
+            screen.center() + vec2(0.0, 60.0),
+            Align2::CENTER_TOP,
+            &format!("E: get in the {}", name.trim_start_matches("global_veh_")),
+            17.0,
+            white,
+        );
+    }
+    if info.down {
+        text(
+            screen.center(),
+            Align2::CENTER_CENTER,
+            "Down! Back on your feet in a moment.",
+            26.0,
+            Color32::from_rgb(240, 90, 80),
+        );
+    }
+    // The game's HUD has its own support box; the bomb's countdown and the
+    // PDA are ours with either.
+    if info.driving.is_none() {
+        support(screen, &info.support, game.is_none(), &text);
+    }
+}
 
+/// Our own health bar, weapon line and crosshair, until the game's HUD
+/// runs.
+fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    info: &HudInfo,
+    text: &T,
+) {
+    let white = Color32::from_gray(235);
     // Health, bottom left.
     let bar =
         egui::Rect::from_min_size(screen.left_bottom() + vec2(24.0, -44.0), vec2(220.0, 16.0));
@@ -302,7 +593,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
                 .zip(info.view_proj)
                 .and_then(|(p, vp)| to_screen(vp, p, screen))
             {
-                crosshair(&painter, at);
+                crosshair(painter, at);
             }
         }
         None => {
@@ -343,49 +634,20 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
                     .zip(info.view_proj)
                     .and_then(|(p, vp)| to_screen(vp, p, screen))
                     .unwrap_or(screen.center());
-                crosshair(&painter, at);
+                crosshair(painter, at);
             }
         }
     }
-    if let Some(prompt) = &info.prompt {
-        text(
-            screen.center() + vec2(0.0, 60.0),
-            Align2::CENTER_TOP,
-            &format!("E: {prompt}"),
-            17.0,
-            white,
-        );
-    } else if let Some(name) = &info.can_enter
-        && info.driving.is_none()
-    {
-        text(
-            screen.center() + vec2(0.0, 60.0),
-            Align2::CENTER_TOP,
-            &format!("E: get in the {}", name.trim_start_matches("global_veh_")),
-            17.0,
-            white,
-        );
-    }
-    if info.down {
-        text(
-            screen.center(),
-            Align2::CENTER_CENTER,
-            "Down! Back on your feet in a moment.",
-            26.0,
-            Color32::from_rgb(240, 90, 80),
-        );
-    }
-    if info.driving.is_none() {
-        support(screen, &info.support, &text);
-    }
 }
 
-/// The support box above the health bar: the item ready to call (its
-/// name, how many, whether free, how it is called in) and the keys for
-/// the step the call is at; and while a bomb is on its way, how long.
+/// The support box above the health bar (if `boxed`: the game's HUD has
+/// its own): the item ready to call (its name, how many, whether free,
+/// how it is called in) and the keys for the step the call is at; and
+/// while a bomb is on its way, how long.
 fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     screen: egui::Rect,
     s: &SupportHud,
+    boxed: bool,
     text: &T,
 ) {
     let white = Color32::from_gray(235);
@@ -398,10 +660,11 @@ fn support<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             Color32::from_rgb(240, 120, 60),
         );
     }
-    if s.pda {
+    // The game's HUD draws its own PDA.
+    if s.pda && boxed {
         pda(screen, s, text);
     }
-    let Some((name, method, count, free)) = &s.item else {
+    let Some((name, method, count, free)) = s.item.as_ref().filter(|_| boxed) else {
         return;
     };
     let at = screen.left_bottom() + vec2(24.0, -78.0);
@@ -505,7 +768,6 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     text: &T,
 ) {
     let white = Color32::from_gray(235);
-    let gold = Color32::from_rgb(255, 200, 0);
     let ink = Color32::from_white_alpha(200);
     // Its grey and grain are the post pass's (`game::satellite_look`).
 
@@ -651,19 +913,7 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     }
 
     // The objective, bottom left; the keys, right of the middle.
-    if let Some(objective) = info.mission.as_ref().and_then(|m| m.objectives.first()) {
-        // A triangle pointing down before it (drawn: not every font has
-        // the glyph).
-        let at = screen.left_bottom() + vec2(24.0, -32.0);
-        tri(at, at + vec2(12.0, 0.0), at + vec2(6.0, 9.0), gold);
-        text(
-            screen.left_bottom() + vec2(42.0, -24.0),
-            Align2::LEFT_BOTTOM,
-            objective,
-            17.0,
-            gold,
-        );
-    }
+    satellite_objective(painter, screen, info, text);
     let keys: &[&str] = if info.support.wheel.is_some() {
         &["T: back"]
     } else {
@@ -698,6 +948,34 @@ fn satellite<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             white,
         );
     }
+}
+
+/// The mission's objective at the bottom left of the satellite's view,
+/// in gold after a triangle pointing down, as the videos show it.
+fn satellite_objective<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    info: &HudInfo,
+    text: &T,
+) {
+    let Some(objective) = info.mission.as_ref().and_then(|m| m.objectives.first()) else {
+        return;
+    };
+    let gold = Color32::from_rgb(255, 200, 0);
+    // The triangle drawn: not every font has the glyph.
+    let at = screen.left_bottom() + vec2(24.0, -32.0);
+    painter.add(Shape::convex_polygon(
+        vec![at, at + vec2(12.0, 0.0), at + vec2(6.0, 9.0)],
+        gold,
+        Stroke::NONE,
+    ));
+    text(
+        screen.left_bottom() + vec2(42.0, -24.0),
+        Align2::LEFT_BOTTOM,
+        objective,
+        17.0,
+        gold,
+    );
 }
 
 /// The timing wheel centred on `c`, `r` across at its full size: a
@@ -764,12 +1042,14 @@ fn wheel(painter: &egui::Painter, c: egui::Pos2, r: f32, w: &WheelHud) {
 }
 
 /// The mission's objectives (top left), its newest message (top centre)
-/// and markers over its targets.
+/// and tutorial line (left) if `message` (no game HUD to show them), and
+/// markers over its targets.
 fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     painter: &egui::Painter,
     screen: egui::Rect,
     view_proj: Option<Mat4>,
     m: &MissionView,
+    message: bool,
     text: &T,
 ) {
     let white = Color32::from_gray(235);
@@ -787,10 +1067,12 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             at.y += 20.0;
         }
     }
-    if let Some(line) = &m.tutorial {
+    // The game's HUD has its own tutorial box.
+    if let Some(line) = m.tutorial.as_ref().filter(|_| message) {
         tutorial(painter, screen, line);
     }
-    if m.contract_complete {
+    // The game's HUD has its own fanfare (`Hud.Fanfare`).
+    if m.contract_complete && message {
         text(
             screen.center() + vec2(0.0, -60.0),
             Align2::CENTER_CENTER,
@@ -799,7 +1081,7 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             gold,
         );
     }
-    if let Some((done, line)) = &m.message {
+    if let Some((done, line)) = m.message.as_ref().filter(|_| message) {
         let head = if *done {
             "Objective complete"
         } else {
@@ -963,6 +1245,26 @@ mod tests {
     }
 
     #[test]
+    fn the_reticle_goes_where_she_aims() {
+        let vp = Mat4::perspective_rh(1.0, 800.0 / 600.0, 0.1, 100.0);
+        let mut info = HudInfo {
+            crosshair: Some(Vec3::new(0.0, 0.0, -10.0)),
+            view_proj: Some(vp),
+            ..HudInfo::default()
+        };
+        let [x, y] = reticle(&info).unwrap();
+        assert!(x.abs() < 1e-5 && y.abs() < 1e-5);
+        // Above the camera's line: up the screen.
+        info.crosshair = Some(Vec3::new(0.0, 2.0, -10.0));
+        assert!(reticle(&info).unwrap()[1] > 0.1);
+        info.down = true;
+        assert_eq!(reticle(&info), None);
+        info.down = false;
+        info.crosshair = None;
+        assert_eq!(reticle(&info), None);
+    }
+
+    #[test]
     fn hud_and_menu_lay_out() {
         let mut hud = Hud::new();
         let mut config = Config::default();
@@ -974,12 +1276,17 @@ mod tests {
             mission: Some(MissionView {
                 objectives: vec!["VzaCon001 objective 1".into()],
                 tutorial: Some("[P] VzaCon001 tutorial 1\nline 2".into()),
+                game_tutorial: Some("[pda] VzaCon001 tutorial 1\nline 2".into()),
                 markers: vec![(
                     Vec3::new(0.0, 0.0, -10.0),
                     "deliverable".into(),
                     [255, 200, 0, 255],
                 )],
                 message: Some((false, "VzaCon001 objective 1".into())),
+                game_message: None,
+                radar_regions: Vec::new(),
+                hud_calls: Vec::new(),
+                pda_objectives: Vec::new(),
                 status: None,
                 contract_complete: true,
             }),

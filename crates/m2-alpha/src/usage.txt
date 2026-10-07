@@ -50,6 +50,11 @@ m2-alpha [options]
   --face <degrees>       with --screenshot on foot: face this way first
                          (0 is +z, 90 is +x)
   --aim                  with --screenshot on foot: weapon up for the picture
+  --hit-from <deg>[,..]  with --screenshot on foot: hits from these directions
+                         (degrees clockwise from where the camera looks, 0
+                         ahead) just before the picture, to see the hit arcs
+  --hud-seconds <s>      with --screenshot: run the game's HUD this long before
+                         the picture (default 2)
   --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
                          (gl: the supply crate's grenade launcher)
   --satellite <stage>    with --screenshot on foot: call a Satellite Guided
@@ -81,6 +86,7 @@ m2-alpha [options]
                          play does and logs which it found
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
+  --pda                  with --screenshot: the picture with her PDA open
   --behind               with --screenshot on foot: the picture from close
                          behind her, to see the weapons on her back
   --slung rpg|gl         with --screenshot on foot: give her this weapon in
@@ -106,6 +112,8 @@ m2-alpha [options]
                          off the pickup lying nearest her, looking at it
   --mission-look <m>     with --mission --screenshot: take the picture from
                          this far from the nearest marker, looking at it
+  --old-hud              our own stand-in HUD (health bar, weapon line,
+                         crosshair) instead of the game's own
   --autoplay             with --mission --screenshot: she plays the contract
                          herself by its markers (runs to places, shoots the
                          marked soldiers, opens and shuts her PDA when the

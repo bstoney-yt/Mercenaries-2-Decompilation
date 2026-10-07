@@ -828,6 +828,22 @@ pub struct Combat {
     /// the next flame.
     fires: Vec<(Vec3, f32, f32, f32)>,
     seed: u64,
+    /// What she has fired, for the HUD's ammo counters.
+    pub fired: Fired,
+    /// Hurts since [`take_hurts`](Self::take_hurts): damage and where
+    /// from, for the HUD.
+    hurts: Vec<(f32, Option<Vec3>)>,
+}
+
+/// Hurts kept for [`Combat::take_hurts`].
+const MAX_HURTS: usize = 16;
+
+/// Rifle shots, rockets and grenades the player has fired.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fired {
+    pub rifle: u32,
+    pub rockets: u32,
+    pub grenades: u32,
 }
 
 impl Default for Combat {
@@ -865,6 +881,8 @@ impl Default for Combat {
             blazes: Vec::new(),
             fires: Vec::new(),
             seed: 0x2545_f491_4f6c_dd1d,
+            fired: Fired::default(),
+            hurts: Vec::new(),
         }
     }
 }
@@ -1070,6 +1088,21 @@ impl Combat {
         std::mem::take(&mut self.sounds)
     }
 
+    /// Hurts her as a hit from `from` does, without the hit (for
+    /// screenshots of the HUD's hit arcs). Leaves her on her feet.
+    pub fn hurt_from(&mut self, damage: f32, from: Vec3) {
+        if self.hurts.len() >= MAX_HURTS {
+            self.hurts.remove(0);
+        }
+        self.hurts.push((damage, Some(from)));
+        self.hp = (self.hp - damage).max(1.0);
+    }
+
+    /// Hurts since the last call: damage and where from.
+    pub fn take_hurts(&mut self) -> Vec<(f32, Option<Vec3>)> {
+        std::mem::take(&mut self.hurts)
+    }
+
     pub fn take_remarks(&mut self) -> Vec<Remark> {
         std::mem::take(&mut self.remarks)
     }
@@ -1272,6 +1305,7 @@ impl Combat {
     }
 
     fn player_shoot(&mut self, f: &mut Field<'_>) {
+        self.fired.rifle += 1;
         self.reload = RIFLE_GAP;
         self.aim_left = AIM_AFTER_SHOT;
         let (eye, dir) = Self::aim_ray(f.player);
@@ -1363,7 +1397,7 @@ impl Combat {
         let closest = from + dir * (aim - from).dot(dir).max(0.0);
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
         if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
-            self.hurt_player(f, NPC_DAMAGE);
+            self.hurt_player(f, NPC_DAMAGE, Some(from));
         }
     }
 
@@ -1397,10 +1431,15 @@ impl Combat {
         self.npc_shoot(&mut f, 0, target);
     }
 
-    fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32) {
+    fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) {
         if self.down > 0.0 || self.invincible {
             return;
         }
+        // Kept for the HUD; only the latest if nothing reads them.
+        if self.hurts.len() >= MAX_HURTS {
+            self.hurts.remove(0);
+        }
+        self.hurts.push((damage, from));
         self.quiet = 0.0;
         let floor = if self.health_clamp { CLAMP_FLOOR } else { 0.0 };
         self.hp = (self.hp - damage).max(floor.min(self.hp));
@@ -1421,6 +1460,7 @@ impl Combat {
     }
 
     fn launch(&mut self, f: &mut Field<'_>) {
+        self.fired.rockets += 1;
         self.reload = RPG_RELOAD;
         self.aim_left = AIM_AFTER_SHOT * 2.0;
         let (eye, dir) = Self::aim_ray(f.player);
@@ -1691,6 +1731,7 @@ impl Combat {
     /// A grenade thrown towards the crosshair, from `hand` (else from
     /// in front of her head).
     fn throw(&mut self, f: &mut Field<'_>, hand: Option<Vec3>) {
+        self.fired.grenades += 1;
         let (_, dir) = Self::aim_ray(f.player);
         let from = hand
             .unwrap_or_else(|| f.player.character.position + Vec3::Y * 1.6 + dir.with_y(0.0) * 0.4);
@@ -1836,7 +1877,7 @@ impl Combat {
         if f.player.driving.is_none() && f.player.landed {
             let d = (f.player.character.position + Vec3::Y).distance(at);
             if d < REACH {
-                self.hurt_player(f, 100.0 * (1.0 - d / REACH).max(0.0));
+                self.hurt_player(f, 100.0 * (1.0 - d / REACH).max(0.0), Some(at));
             }
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
@@ -2005,7 +2046,7 @@ impl Combat {
             }
         }
         if let Some(d) = her {
-            self.hurt_player(f, d);
+            self.hurt_player(f, d, Some(at));
         }
         if killed {
             self.remarks.push(Remark::Kill);
