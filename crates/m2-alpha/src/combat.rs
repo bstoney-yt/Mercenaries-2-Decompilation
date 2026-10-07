@@ -164,9 +164,11 @@ const MG_RANGE: f32 = 500.0;
 const ALERT_RANGE: f32 = 60.0;
 const PANIC_RANGE: f32 = 40.0;
 /// A soldier's hit on her: the "Assault Rifle Bullet" template's Damage
-/// (the VZ soldiers' rifle). Her template's health is 100 (Mattias 120);
-/// the Hero damage modifier and any falloff with range are not decoded.
-const NPC_DAMAGE: f32 = 9.0;
+/// (the VZ soldiers' rifle, 9, `DamageKey` `Bullet`) times the game's
+/// damage table's `Hero` row for a `Bullet` (0.25; see
+/// `m2_engine::tuning::DamageTable`). Her template's health is 100
+/// (Mattias 120); any falloff with range is not decoded.
+const NPC_DAMAGE: f32 = 9.0 * 0.25;
 /// People are hit within this distance of the line from shins to head.
 const BODY_RADIUS: f32 = 0.3;
 /// Health comes back after this many quiet seconds, at this rate a second.
