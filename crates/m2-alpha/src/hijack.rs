@@ -47,6 +47,12 @@ const STEP: f32 = 0.1;
 /// Reach beyond the entrance's radius, metres, measured flat from the
 /// hull.
 pub const SLACK: f32 = 2.0;
+/// The camera during a hijack: this far from the entrance, looking at it
+/// across the vehicle and a little down. Inferred from the scripts'
+/// `Camera.SetFocusParams(cam, 0, 0, 0.1, 4, 6, 1)` (read as a 4-6 m
+/// distance); the on-foot camera would sit inside the hull.
+const CAMERA_DISTANCE: f32 = 6.0;
+const CAMERA_PITCH: f32 = -0.35;
 /// How long an action lasts when its clip is unknown, seconds.
 const UNKNOWN_CLIP: f64 = 2.0;
 /// The pad, as the scripts number its buttons
@@ -97,6 +103,8 @@ struct Active {
     held: Vec<u32>,
     /// Her hijack clip playing (an index into her rig's clips).
     clip: Option<usize>,
+    /// The entrance, in the world when it started: the camera looks at it.
+    at: Vec3,
 }
 
 /// What the HUD shows of a hijack.
@@ -367,11 +375,15 @@ impl Hijacks {
                 actions: Vec::new(),
                 held: Vec::new(),
                 clip: None,
+                at: c.at,
             });
             // Her clips move her from here on (`down` keeps her own
-            // moves and gaits from playing over them).
+            // moves and gaits from playing over them); the camera looks
+            // across the vehicle from its side.
             if let Some(p) = &mut game.scene.player {
                 p.down = true;
+                p.yaw = yaw + std::f32::consts::FRAC_PI_2;
+                p.pitch = CAMERA_PITCH;
             }
         } else {
             eprintln!("hijack: {}'s script did not start", c.template);
@@ -460,11 +472,12 @@ impl Hijacks {
     /// way), as the vehicle's own are.
     pub fn place(&self, game: &mut Game) {
         let Some(a) = &self.active else { return };
-        let Some(clip) = a.clip else { return };
         let scene = &mut game.scene;
         let (Some(world), Some(p)) = (&scene.world, &mut scene.player) else {
             return;
         };
+        p.chase_target = Some((a.at, CAMERA_DISTANCE));
+        let Some(clip) = a.clip else { return };
         let Some(at) = scene.vehicles[a.vehicle]
             .id
             .and_then(|id| world.physics.vehicle_transform(id))
@@ -576,6 +589,7 @@ fn follow(
                 eprintln!("hijack: failed");
                 if let Some(p) = &mut game.scene.player {
                     p.down = false;
+                    p.chase_target = None;
                 }
                 over = true;
             }
