@@ -112,6 +112,9 @@ const VEHICLE_LOOK: u32 = 10;
 pub struct MissionView {
     /// A line about the scripts themselves (loading, failed), if any.
     pub status: Option<String>,
+    /// How black the scripts' screen fade has it, 0 to 1 (as she is
+    /// moved to the next contract).
+    pub black: f32,
     /// The objectives to do, readable.
     pub objectives: Vec<String>,
     /// The tutorial line up, readable.
@@ -1132,6 +1135,7 @@ impl MissionLink {
             .collect();
         MissionView {
             status: None,
+            black: mission.black(),
             tutorial: self
                 .tutorial
                 .as_ref()
