@@ -117,12 +117,13 @@ const LAUNCHER_RELOAD: f32 = 2.5;
 const LOB_RANGE: f32 = 250.0;
 const LOB_FLASH: f32 = 0.45;
 
-/// Rifle: seconds between shots, range, and damage per hit (three kill).
-const RIFLE_GAP: f32 = 0.11;
+/// Rifle: seconds between shots (the carbine's 562 a minute), range, and
+/// damage per hit (three kill).
+const RIFLE_GAP: f32 = 60.0 / 562.0;
 /// The carbine's clip (its template's `iClipSize`, the HUD's 30) and the
-/// rounds it keeps beyond it: its template's `MaxAmmoReserve` is 9, read
-/// as clips (inferred: the flag after it marks a count of clips), which
-/// the first contract's scripts fill it to.
+/// rounds it keeps beyond it: its template's `MaxAmmoReserve` is 9, which
+/// counts clips (every fired weapon's is 0 to 9, whatever its clip), and
+/// which the first contract's scripts fill it to.
 pub const RIFLE_CLIP: u32 = 30;
 pub const RIFLE_SPARE: u32 = 9 * RIFLE_CLIP;
 /// Seconds a clip takes to change (invented, until her reload clip is
