@@ -58,6 +58,8 @@ pub type ScriptLine = (u32, String, Option<Vec3>);
 pub const HERO: &str = "Jennifer";
 /// The grenades' weapon template.
 const GRENADE: &str = "Grenade";
+/// Her rifle's template in the first contract.
+const CARBINE: &str = "Carbine";
 /// The water's surface as the layers' boats and docks show it (8 patrol
 /// boats and 4 air boats at exactly -36 m, docks at -36.0 to -36.4).
 pub(crate) const WATERLINE: f32 = -36.0;
@@ -491,6 +493,8 @@ impl MissionLink {
             }
             mission.set_health(PLAYER, game.combat.hp);
             mission.set_player_reserve(GRENADE, game.combat.grenades);
+            let spare = game.combat.rifle_rounds.stored;
+            mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -563,6 +567,9 @@ impl MissionLink {
                         eprintln!("mission: scripts give her {weapon} {rounds} in reserve");
                         if weapon.eq_ignore_ascii_case(GRENADE) {
                             game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
+                        } else if weapon.eq_ignore_ascii_case(CARBINE) {
+                            game.combat.rifle_rounds.stored =
+                                (*rounds * combat::RIFLE_CLIP).min(combat::RIFLE_SPARE);
                         }
                     }
                     Command::DropWeapon { who, weapon } => {

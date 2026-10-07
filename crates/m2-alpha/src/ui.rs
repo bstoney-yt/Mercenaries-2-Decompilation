@@ -30,8 +30,8 @@ pub struct HudInfo {
     pub second: Option<Weapon>,
     /// Grenades she has.
     pub grenades: u32,
-    /// The rounds of the weapon up when it runs out (the grenade
-    /// launcher's): in its clip, and stored.
+    /// The rounds of the weapon up when it runs out (the rifle's and the
+    /// grenade launcher's): in its clip, and stored.
     pub rounds: Option<(u32, u32)>,
     /// What the use key takes from within reach, as the game words it
     /// ("Equip Grenade Launcher").
@@ -312,7 +312,8 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
                 Weapon::GrenadeLauncher => "grenade launcher",
             };
             let up = match (info.weapon, info.rounds) {
-                (Weapon::Rifle, _) => "Carbine".to_owned(),
+                (Weapon::Rifle, Some((clip, stored))) => format!("Carbine {clip} | {stored}"),
+                (Weapon::Rifle, None) => "Carbine".to_owned(),
                 (Weapon::Rpg, _) => "RPG".to_owned(),
                 (Weapon::GrenadeLauncher, Some((clip, stored))) => {
                     format!("Grenade launcher {clip} | {stored}")

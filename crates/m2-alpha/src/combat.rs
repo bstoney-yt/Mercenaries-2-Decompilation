@@ -119,6 +119,15 @@ const LOB_FLASH: f32 = 0.45;
 
 /// Rifle: seconds between shots, range, and damage per hit (three kill).
 const RIFLE_GAP: f32 = 0.11;
+/// The carbine's clip (its template's `iClipSize`, the HUD's 30) and the
+/// rounds it keeps beyond it: its template's `MaxAmmoReserve` is 9, read
+/// as clips (inferred: the flag after it marks a count of clips), which
+/// the first contract's scripts fill it to.
+pub const RIFLE_CLIP: u32 = 30;
+pub const RIFLE_SPARE: u32 = 9 * RIFLE_CLIP;
+/// Seconds a clip takes to change (invented, until her reload clip is
+/// measured).
+const RIFLE_RELOAD: f32 = 2.0;
 const RIFLE_RANGE: f32 = 400.0;
 const RIFLE_DAMAGE: f32 = 34.0;
 /// How long she keeps the rifle up after a shot, seconds.
@@ -585,7 +594,7 @@ impl Weapon {
     /// the grenade launcher's template's 6.
     pub fn clip(self) -> u32 {
         match self {
-            Weapon::Rifle => 30,
+            Weapon::Rifle => RIFLE_CLIP,
             Weapon::Rpg => 1,
             Weapon::GrenadeLauncher => LAUNCHER_CLIP,
         }
@@ -746,6 +755,8 @@ enum Projectile {
 pub struct Trigger {
     /// Fire held.
     pub fire: bool,
+    /// Change the rifle's clip.
+    pub reload: bool,
     /// Aim held.
     pub aim: bool,
     pub throw: bool,
@@ -811,6 +822,10 @@ pub struct Combat {
     pub second: Option<Weapon>,
     /// The grenade launcher's rounds, while she carries one.
     pub launcher_rounds: Option<Rounds>,
+    /// The rifle's rounds.
+    pub rifle_rounds: Rounds,
+    /// Seconds until the rifle's new clip is in, while she changes it.
+    changing: Option<f32>,
     /// Grenades she has to throw.
     pub grenades: u32,
     /// She holds the satellite designator instead of her weapon
@@ -858,6 +873,8 @@ impl Default for Combat {
             picked: Picked::default(),
             second: Some(Weapon::Rpg),
             launcher_rounds: None,
+            rifle_rounds: Rounds::of(RIFLE_CLIP + RIFLE_SPARE, RIFLE_CLIP),
+            changing: None,
             grenades: MAX_GRENADES,
             designator: false,
             last_launch: None,
@@ -976,6 +993,8 @@ impl Combat {
     /// only the carbine, so she has no grenades (none in the footage until
     /// a pickup).
     pub fn carbine_only(&mut self) {
+        self.rifle_rounds = Rounds::of(RIFLE_CLIP, RIFLE_CLIP);
+        self.changing = None;
         self.second = None;
         self.launcher_rounds = None;
         self.grenades = 0;
@@ -983,10 +1002,14 @@ impl Combat {
     }
 
     /// Rounds taken from a pickup for `weapon`: the grenade launcher's go
-    /// with the one she carries (none, they are lost); the rest only add
-    /// to what the HUD counts.
+    /// with the one she carries (none, they are lost), the rifle's to its
+    /// spare clips; the RPG's only add to what the HUD counts.
     pub fn take_ammo(&mut self, weapon: Weapon, rounds: u32) {
         match (weapon, &mut self.launcher_rounds) {
+            (Weapon::Rifle, _) => {
+                let r = &mut self.rifle_rounds;
+                r.stored = (r.stored + rounds).min(RIFLE_SPARE);
+            }
             (Weapon::GrenadeLauncher, Some(r)) => {
                 r.stored = (r.stored + rounds).min(LAUNCHER_SPARE)
             }
@@ -1010,6 +1033,7 @@ impl Combat {
     pub fn can_use(&self, what: &crate::flights::Leaves) -> bool {
         let rounds = match what.gives {
             Some((Weapon::GrenadeLauncher, n)) => n > 0 && self.launcher_rounds.is_some(),
+            Some((Weapon::Rifle, n)) => n > 0 && self.rifle_rounds.stored < RIFLE_SPARE,
             Some((w, n)) => n > 0 && self.second == Some(w),
             None => false,
         };
@@ -1146,6 +1170,7 @@ impl Combat {
             _ => {}
         }
         f.player.launcher = self.weapon == Weapon::Rpg;
+        self.change_clip(trigger, on_foot, dt);
         // A grenade leaves her hand at its moment in the throw; knocked
         // down or in a vehicle by then, she never let go.
         if let Some(t) = &mut self.throw_in {
@@ -1172,7 +1197,7 @@ impl Combat {
         let throwing = self.throw_in.is_some() || f.player.throwing.is_some();
         let bashing = self.bash_in.is_some() || f.player.bashing.is_some();
         if on_foot && !throwing && !bashing {
-            if trigger.fire && self.reload <= 0.0 {
+            if trigger.fire && self.reload <= 0.0 && self.changing.is_none() {
                 match self.weapon {
                     Weapon::Rifle => self.player_shoot(f),
                     Weapon::Rpg => self.launch(f),
@@ -1205,7 +1230,8 @@ impl Combat {
         {
             self.vehicle_fire(f, i);
         }
-        let holding = on_foot && (trigger.aim || self.aim_left > 0.0);
+        // Changing the clip, she lowers the rifle.
+        let holding = on_foot && (trigger.aim || self.aim_left > 0.0) && self.changing.is_none();
         f.player.aiming = holding;
 
         // Soldiers' shots.
@@ -1271,7 +1297,36 @@ impl Combat {
             .map_or(chest, |m| m.transform_point3(w.muzzle))
     }
 
+    /// The rifle's clip: changed when she asks or once it is empty (as the
+    /// game does), while she holds it on foot with rounds to spare; put
+    /// away or out of her hands, the change starts over next time.
+    fn change_clip(&mut self, trigger: Trigger, on_foot: bool, dt: f32) {
+        let r = self.rifle_rounds;
+        let holding = on_foot && self.weapon == Weapon::Rifle && !self.designator;
+        if !holding {
+            self.changing = None;
+            return;
+        }
+        match &mut self.changing {
+            Some(t) => {
+                *t -= dt;
+                if *t <= 0.0 {
+                    self.changing = None;
+                    self.rifle_rounds = Rounds::of(r.total(), RIFLE_CLIP);
+                }
+            }
+            None if r.stored > 0 && r.clip < RIFLE_CLIP && (trigger.reload || r.clip == 0) => {
+                self.changing = Some(RIFLE_RELOAD);
+            }
+            None => {}
+        }
+    }
+
     fn player_shoot(&mut self, f: &mut Field<'_>) {
+        if self.rifle_rounds.clip == 0 {
+            return;
+        }
+        self.rifle_rounds.clip -= 1;
         self.reload = RIFLE_GAP;
         self.aim_left = AIM_AFTER_SHOT;
         let (eye, dir) = Self::aim_ray(f.player);
@@ -2831,6 +2886,41 @@ mod tests {
         assert!(lob_velocity(from, Vec3::new(0.0, 0.0, 60.0), LOB_SPEED, g).is_none());
         let far = farthest(Vec3::Z * 60.0, LOB_SPEED);
         assert!((far.y - far.z).abs() < 1e-4 && far.x == 0.0);
+    }
+
+    #[test]
+    fn the_rifle_changes_clips_when_asked_or_empty() {
+        let mut combat = Combat::default();
+        combat.carbine_only();
+        combat.take_ammo(Weapon::Rifle, 45);
+        combat.rifle_rounds.clip = 10;
+        let ask = Trigger {
+            reload: true,
+            ..Default::default()
+        };
+        // Not while driving.
+        combat.change_clip(ask, false, 0.1);
+        assert!(combat.changing.is_none());
+        combat.change_clip(ask, true, 0.1);
+        assert!(combat.changing.is_some());
+        for _ in 0..30 {
+            combat.change_clip(Trigger::default(), true, 0.1);
+        }
+        assert_eq!(
+            combat.rifle_rounds,
+            Rounds {
+                clip: 30,
+                stored: 25
+            }
+        );
+        // Empty, it changes by itself; with nothing to spare, it can't.
+        combat.rifle_rounds.clip = 0;
+        combat.change_clip(Trigger::default(), true, 0.1);
+        assert!(combat.changing.is_some());
+        combat.changing = None;
+        combat.rifle_rounds = Rounds::default();
+        combat.change_clip(ask, true, 0.1);
+        assert!(combat.changing.is_none());
     }
 
     #[test]
