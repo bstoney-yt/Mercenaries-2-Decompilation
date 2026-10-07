@@ -410,6 +410,9 @@ pub struct HudState {
     /// codes ([`flash_key`]): the PDA's movies' own `Key` listeners take
     /// them (the map's Home shows the current contract).
     pub keys: Vec<(i32, bool)>,
+    /// The contract's objectives for the PDA: text id and icon tag each
+    /// (`MissionView::pda_objectives`).
+    pub pda_objectives: Vec<(String, String)>,
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -901,9 +904,13 @@ impl GameHud {
 /// contract's `RefreshPdaDisplay` calls), then selected as the contract's
 /// task does when it starts (script 2f0b1589, `Activated`).
 const CONTRACT_IN_PDA: &str = r#"
+-- The objectives as `Net.SendEvent_AddPDAMission` has them: { text id,
+-- icon tag } each, which `BuildMissionDescription` lists under the
+-- objectives header.
+local objectives = ...
 local flow = rawget(_G, "MrxMissionFlow")
 if type(flow) == "table" and type(flow.AddPdaMissionDetails) == "function" then
-    flow.AddPdaMissionDetails("VzaCon001")
+    flow.AddPdaMissionDetails("VzaCon001", objectives)
 end
 local pda = rawget(_G, "Pda")
 if type(pda) == "table" and type(pda.Map) == "table" then
@@ -913,6 +920,17 @@ if type(pda) == "table" and type(pda.Map) == "table" then
     pda.Map:SetMissionChangeAllowed({ bAllow = false })
 end
 "#;
+
+/// Puts the contract in the PDA ([`CONTRACT_IN_PDA`]) with `objectives`.
+fn contract_in_pda(lua: &Lua, objectives: &[(String, String)]) -> mlua::Result<()> {
+    let list = lua.create_table()?;
+    for (text, icon) in objectives {
+        list.raw_push(lua.create_sequence_from([text.as_str(), icon.as_str()])?)?;
+    }
+    lua.load(CONTRACT_IN_PDA)
+        .set_name("=m2-hud contract")
+        .call(list)
+}
 
 /// What `MrxGuiPda.Open` checks, for the log: the PDA module's plain
 /// values (and those of its tables one level down), MrxState's lock and
@@ -1090,7 +1108,7 @@ struct Thread {
     /// Whether its script showed it, as last logged.
     pda_scripted: Option<bool>,
     pda_hid_logged: bool,
-    contract_in_pda: bool,
+    contract_in_pda: Option<Vec<(String, String)>>,
     /// The zones the radar's script holds, as last read.
     zones: Vec<Zone>,
     /// The island's roads, read with the radar's map.
@@ -1211,7 +1229,7 @@ impl Thread {
             since_toggle: u32::MAX,
             pda_scripted: None,
             pda_hid_logged: false,
-            contract_in_pda: false,
+            contract_in_pda: None,
             zones: Vec::new(),
             roads: Vec::new(),
             pda: None,
@@ -1245,15 +1263,11 @@ impl Thread {
             && self.since_toggle >= PDA_SETTLE
         {
             self.since_toggle = 0;
-            if !self.contract_in_pda {
-                self.contract_in_pda = true;
-                if let Err(e) = self
-                    .mission
-                    .lua()
-                    .load(CONTRACT_IN_PDA)
-                    .set_name("=m2-hud contract")
-                    .exec()
-                {
+            // The contract goes in (again when its objectives changed) as
+            // the PDA opens.
+            if state.support.pda && self.contract_in_pda.as_ref() != Some(&state.pda_objectives) {
+                self.contract_in_pda = Some(state.pda_objectives.clone());
+                if let Err(e) = contract_in_pda(self.mission.lua(), &state.pda_objectives) {
                     log.push(format!("contract in the PDA: {e}"));
                 }
             }
