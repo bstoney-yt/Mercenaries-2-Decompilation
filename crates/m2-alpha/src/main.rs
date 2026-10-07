@@ -2066,6 +2066,7 @@ fn mission_for_screenshot(
     };
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     let mut contract_done: Option<u32> = None;
+    let mut late_hud: Option<(ui::Hud, Config)> = None;
     let played = Instant::now();
     let every = if auto.is_some() { 10 } else { 30 };
     // With --autoplay, a picture of each delivery as its helicopter
@@ -2133,6 +2134,26 @@ fn mission_for_screenshot(
         link.tick(game, tick);
         if options.movies {
             movies_offscreen(&mut link, install, out);
+        }
+        // After the contract (--after-contract) the game's HUD runs too:
+        // the flow waits on its fanfare closing.
+        if contract_done.is_some() {
+            let (hud, settings) = late_hud.get_or_insert_with(|| {
+                let mut hud = ui::Hud::new();
+                hud.game = game_hud(Some(install), &Mode::Island(None), false);
+                (hud, Config::default())
+            });
+            let mut info = hud_info(game, Some(&link), fov, aspect);
+            info.game = Some(gamehud::HudState::of(game));
+            let (w, h) = backend.size();
+            let input = ui::headless_input(w, h, f64::from(i) * f64::from(tick));
+            let _ = hud.build(input, &info, settings);
+            if let Some(g) = &mut hud.game {
+                for seq in g.take_callbacks() {
+                    eprintln!("after contract: the HUD called back call {seq}");
+                    link.hud_callback(seq);
+                }
+            }
         }
         // After the contract (--after-contract), where she is every five
         // seconds.
@@ -3950,6 +3971,13 @@ impl Running {
         }
         let (action, output) = self.hud.build(input, &info, config);
         self.egui.handle_platform_output(&self.window, output);
+        // The mission's callbacks the game's HUD called (the contract
+        // fanfare closing), back to the mission's scripts.
+        if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
+            for seq in g.take_callbacks() {
+                m.hud_callback(seq);
+            }
+        }
         if config.window.vsync != vsync {
             self.backend.set_vsync(config.window.vsync);
         }

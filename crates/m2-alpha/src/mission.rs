@@ -178,6 +178,8 @@ end
 const HUD_CALLS: &str = r#"
 __m2_hud_calls = {}
 __m2_hud_call_count = 0
+-- Calls with a callback, by number, for the HUD to call back.
+__m2_hud_callbacks = {}
 local function copy(v, depth)
     if type(v) ~= "table" then
         if type(v) == "function" or type(v) == "userdata" then return nil end
@@ -202,8 +204,13 @@ for group, names in pairs(methods) do
             local f = g[name]
             g[name] = function(self, t, ...)
                 __m2_hud_call_count = __m2_hud_call_count + 1
+                local callback = type(t) == "table" and type(t.fCallback) == "function"
+                if callback then
+                    __m2_hud_callbacks[__m2_hud_call_count] = t
+                end
                 table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
-                    group = group, method = name, data = copy(t, 0) })
+                    group = group, method = name, data = copy(t, 0),
+                    callback = callback })
                 if #__m2_hud_calls > 32 then table.remove(__m2_hud_calls, 1) end
                 if type(f) == "function" then return f(self, t, ...) end
             end
@@ -377,6 +384,25 @@ impl MissionLink {
     /// Stocks and calls in these support items once the scripts run.
     pub fn with_support(self, support: Vec<String>) -> Self {
         Self { support, ..self }
+    }
+
+    /// The HUD called back the mission's HUD call number `seq` (the
+    /// contract fanfare closing): its `fCallback` runs, as the HUD's own
+    /// interface would run it, with its `tCallbackData`.
+    pub fn hud_callback(&mut self, seq: u64) {
+        let State::Running(m) = &mut self.state else {
+            return;
+        };
+        let code = format!(
+            "local t = __m2_hud_callbacks[{seq}]\n\
+             __m2_hud_callbacks[{seq}] = nil\n\
+             if t then MrxUtil.CallWithOptionalArgs(t.fCallback, t.tCallbackData) end"
+        );
+        if let Err(e) = m.run(&code, "hud callback") {
+            self.write([format!("hud callback {seq}: {e}")]);
+        } else {
+            self.write([format!("hud callback {seq}")]);
+        }
     }
 
     /// Has the scripts' movies (`01_AOA_J`, `02_AOB_J`) wait for the game:
@@ -1136,6 +1162,7 @@ fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
             group: t.get("group").unwrap_or_default(),
             method: t.get("method").unwrap_or_default(),
             data: Plain::of(&t.get("data").unwrap_or(mlua::Value::Nil)),
+            callback: t.get("callback").unwrap_or(false),
         })
         .collect()
 }
