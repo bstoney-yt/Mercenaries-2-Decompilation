@@ -121,6 +121,8 @@ m2-alpha [options]
                          this far from the nearest marker, looking at it
   --old-hud              our own stand-in HUD (health bar, weapon line,
                          crosshair) instead of the game's own
+  --smarter-ai           the enhanced, smarter enemy soldiers (not the
+                         original game's; settings [enhanced.smarter_ai])
   --autoplay             with --mission --screenshot: she plays the contract
                          herself by its markers (runs to places, shoots the
                          marked soldiers, opens and shuts her PDA when the
