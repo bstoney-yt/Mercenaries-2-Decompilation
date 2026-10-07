@@ -307,6 +307,15 @@ impl Autoplay {
         }
         match p.driving {
             Some(i) => {
+                // Shot to a wreck under her: out, on foot or into another.
+                if !self.leave && game.scene.vehicles.get(i).is_some_and(|v| v.wrecked) {
+                    eprintln!(
+                        "autoplay {:.1} s: the {} is wrecked: getting out",
+                        self.clock, game.scene.vehicles[i].spec.label
+                    );
+                    self.leave = true;
+                    self.fresh_headway();
+                }
                 self.ride = Some(i);
                 if !self.ridden.contains(&i) {
                     self.ridden.push(i);
@@ -1164,6 +1173,9 @@ impl Autoplay {
         let Some(v) = game.scene.vehicles.get(i) else {
             return Intent::default();
         };
+        if self.leave {
+            return self.press(speed);
+        }
         let cannon = v.spec.cannon();
         let d = target.distance(m.w_axis.truncate());
         if !cannon {
