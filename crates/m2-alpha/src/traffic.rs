@@ -188,11 +188,12 @@ impl Traffic {
                 continue;
             }
             let (at, forward) = start_of(t);
+            let crew = world.index.template_db.crew(name);
             eprintln!(
-                "traffic {entity:#x} ({}): {name} as {} at ({:.0}, {:.0}, {:.0})",
+                "traffic {entity:#x} ({}): {name} as {} at ({:.0}, {:.0}, {:.0}), crew {crew:?}",
                 t.name, models[0].label, at.x, at.y, at.z
             );
-            scene.load_world_vehicle(entity, at, forward.x.atan2(forward.z), models);
+            scene.load_world_vehicle(entity, at, forward.x.atan2(forward.z), crew, models);
             self.loading.insert(entity, 0.0);
             self.skipped.remove(&entity);
             self.wait.remove(&entity);
@@ -322,6 +323,9 @@ impl Traffic {
                     ""
                 },
             ));
+            if !v.crew.is_empty() {
+                lines.push(format!("    crew {:?}", v.crew));
+            }
         }
         let mut near: Vec<&TrafficPoint> = self.points.values().collect();
         near.sort_by(|a, b| {

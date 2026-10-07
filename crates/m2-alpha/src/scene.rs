@@ -463,6 +463,10 @@ pub struct ParkedVehicle {
     /// Where the island's layers park it (position, yaw), if the game's
     /// own: the entity and its spot.
     pub spot: Option<(u32, Vec3, f32)>,
+    /// Who rides in it, as its template's `Rider` records say: each
+    /// seat's name (`seat_driver`) and its rider's template name
+    /// (`Guerilla Soldier`). Not drawn or seated yet.
+    pub crew: Vec<(String, String)>,
     /// How far its turret is turned from straight ahead, radians
     /// (anticlockwise from above).
     pub turret: f32,
@@ -522,7 +526,7 @@ pub enum Loaded {
     MissionVehicle(u32, VehicleSpec, CpuModel),
     /// One of the game's own parked vehicles: its layer entity, where it
     /// stands (position, yaw), its spec and model.
-    WorldVehicle(u32, Vec3, f32, VehicleSpec, CpuModel),
+    WorldVehicle(u32, Vec3, f32, Vec<(String, String)>, VehicleSpec, CpuModel),
     Catalogue(Catalogue),
     /// A person's model: a role's, or a story character's (true).
     Person(PersonModel, CpuModel, Skeleton, bool),
@@ -925,9 +929,16 @@ impl Scene {
     /// Loads one of the game's own parked vehicles, layer entity `entity`
     /// standing at `at` facing `yaw`, from the first of `models` that
     /// drives.
-    pub fn load_world_vehicle(&self, entity: u32, at: Vec3, yaw: f32, models: Vec<CatalogueEntry>) {
+    pub fn load_world_vehicle(
+        &self,
+        entity: u32,
+        at: Vec3,
+        yaw: f32,
+        crew: Vec<(String, String)>,
+        models: Vec<CatalogueEntry>,
+    ) {
         self.load_vehicle_as(models, format!("vehicle {entity:#x}"), move |spec, cpu| {
-            Loaded::WorldVehicle(entity, at, yaw, spec, cpu)
+            Loaded::WorldVehicle(entity, at, yaw, crew, spec, cpu)
         });
     }
 
@@ -1082,7 +1093,7 @@ impl Scene {
             }
             Loaded::Vehicle(_, cpu)
             | Loaded::MissionVehicle(_, _, cpu)
-            | Loaded::WorldVehicle(_, _, _, _, cpu)
+            | Loaded::WorldVehicle(_, _, _, _, _, cpu)
             | Loaded::Person(_, cpu, _, _)
             | Loaded::Weapon(_, cpu, _)
             | Loaded::Flight(_, cpu, _, _) => cpu,
@@ -1108,6 +1119,7 @@ impl Scene {
                 wrecked: false,
                 guid: None,
                 spot: None,
+                crew: Vec::new(),
                 turret: 0.0,
                 gun: 0.0,
                 rolled: 0.0,
@@ -1115,6 +1127,11 @@ impl Scene {
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
+                let crew = self
+                    .world
+                    .as_ref()
+                    .map(|w| w.index.template_db.crew(&spec.label))
+                    .unwrap_or_default();
                 self.vehicles.push(ParkedVehicle {
                     spec: tune(spec),
                     model,
@@ -1122,13 +1139,14 @@ impl Scene {
                     wrecked: false,
                     guid: Some(guid),
                     spot: None,
+                    crew,
                     turret: 0.0,
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
                 });
             }
-            Loaded::WorldVehicle(entity, at, yaw, spec, _) => {
+            Loaded::WorldVehicle(entity, at, yaw, crew, spec, _) => {
                 self.vehicles.push(ParkedVehicle {
                     spec: tune(spec),
                     model,
@@ -1136,6 +1154,7 @@ impl Scene {
                     wrecked: false,
                     guid: None,
                     spot: Some((entity, at, yaw)),
+                    crew,
                     turret: 0.0,
                     gun: 0.0,
                     rolled: 0.0,

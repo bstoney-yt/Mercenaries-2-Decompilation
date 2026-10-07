@@ -2661,6 +2661,7 @@ mod tests {
             wrecked: false,
             guid: None,
             spot: None,
+            crew: Vec::new(),
             turret: 0.0,
             gun: 0.0,
             rolled: 0.0,
