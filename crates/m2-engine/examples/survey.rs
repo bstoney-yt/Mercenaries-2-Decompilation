@@ -73,6 +73,11 @@
 //! components[:<word>,..]    the template database's components (all, or
 //!                           those whose name holds a word): record count
 //!                           and each field's name (or hash), type, width
+//! scan:<hex>[,..]           every asset of every archive (and every loose
+//!                           file under data) holding all the given words
+//!                           (u32, little-endian): its block, type, name,
+//!                           how often each word appears, and the bytes
+//!                           around the first hit of the first word
 //! find:<hash>[,..]          names for hashes
 //! cues[:<name>,..]          which bank sounds the clips' sound events
 //!                           (and the names given) play: each name tried
@@ -800,6 +805,7 @@ fn main() -> Result<(), Error> {
             }
             "phy2rules" => phy2_rules(&mut source),
             "vo" => vo_lines(&install, arg),
+            "scan" => scan_words(&install, &names, arg),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
@@ -1004,6 +1010,111 @@ fn voices(install: &Install, names: &Names) -> Result<(), Error> {
 
 /// Finds scripted voice lines (`VO.Cue`'s line names) in the cue tables of
 /// `English.wad`, resident and per mission.
+fn scan_words(install: &Install, names: &Names, arg: &str) -> Result<(), Error> {
+    let words: Vec<u32> = arg.split(',').filter_map(hex).collect();
+    let report = |place: &str, data: &[u8]| {
+        let counts: Vec<usize> = words
+            .iter()
+            .map(|w| {
+                let b = w.to_le_bytes();
+                data.windows(4).filter(|x| *x == b).count()
+            })
+            .collect();
+        if counts.contains(&0) {
+            return;
+        }
+        println!("  {place} ({} bytes): counts {counts:?}", data.len());
+        let b = words[0].to_le_bytes();
+        if let Some(at) = data.windows(4).position(|x| x == b) {
+            let from = at.saturating_sub(64) & !3;
+            let to = (at + 128).min(data.len());
+            for (i, chunk) in data[from..to].chunks(16).enumerate() {
+                let line: Vec<String> = chunk
+                    .chunks(4)
+                    .map(|c| {
+                        let mut w = [0u8; 4];
+                        w[..c.len()].copy_from_slice(c);
+                        let v = u32::from_le_bytes(w);
+                        let f = f32::from_le_bytes(w);
+                        match names.get(v).filter(|_| v > 0xffff) {
+                            Some(n) => format!("{v:08x}({n})"),
+                            None if f.is_finite() && (1e-3..1e6).contains(&f.abs()) => {
+                                format!("{v:08x}({f})")
+                            }
+                            None => format!("{v:08x}"),
+                        }
+                    })
+                    .collect();
+                println!("      +{:06x} {}", from + i * 16, line.join(" "));
+            }
+        }
+    };
+    if words.is_empty() {
+        println!("scan: no words");
+        return Ok(());
+    }
+    let mut wads = Vec::new();
+    let mut loose = Vec::new();
+    let mut stack = vec![install.data.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("wad"))
+            {
+                wads.push(path);
+            } else {
+                loose.push(path);
+            }
+        }
+    }
+    for path in &loose {
+        if let Ok(data) = std::fs::read(path) {
+            report(&path.display().to_string(), &data);
+        }
+    }
+    for path in &wads {
+        let mut source = match open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{}: {e}", path.display());
+                continue;
+            }
+        };
+        let paths: Vec<String> = source
+            .archive()
+            .index()
+            .blocks()
+            .iter()
+            .map(|b| b.path.clone())
+            .collect();
+        for (b, p) in paths.iter().enumerate() {
+            let Ok(decoded) = source.block(b) else {
+                continue;
+            };
+            let Ok(contents) = BlockContents::parse(&decoded) else {
+                report(&format!("{} {p} (whole block)", path.display()), &decoded);
+                continue;
+            };
+            for (e, data) in contents.iter() {
+                let place = format!(
+                    "{} {p} type {:08x} {:08x} {}",
+                    path.file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into()),
+                    e.type_hash,
+                    e.name_hash,
+                    names.show(e.name_hash)
+                );
+                report(&place, data);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn vo_lines(install: &Install, arg: &str) -> Result<(), Error> {
     let lines: Vec<(&str, u32)> = arg
         .split(',')
