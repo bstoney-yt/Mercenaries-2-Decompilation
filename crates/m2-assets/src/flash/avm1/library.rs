@@ -13,6 +13,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use super::super::player::{ClipId, Kind, Player, TIMELINE_DEPTH};
+use super::super::text::Substitution;
 use super::super::{Matrix, push_clipped};
 use super::{Avm, Interval, Native, Obj, ObjKind, Object, Pen, Value, clip_id, native, number_str};
 
@@ -22,6 +23,52 @@ fn def(avm: &Avm, obj: &Obj, name: &str, f: Native) {
 
 fn same_object(a: &Value, b: &Value) -> bool {
     matches!((a, b), (Value::Object(x), Value::Object(y)) if Rc::ptr_eq(x, y))
+}
+
+/// One of `setImageSubstitutions`' objects.
+fn substitution(avm: &mut Avm, player: &mut Player, item: &Value) -> Option<Substitution> {
+    let get = |avm: &mut Avm, player: &mut Player, v: &Value, k: &str| avm.get(player, v, k);
+    let text = get(avm, player, item, "subString");
+    let text = avm.to_str(player, &text).to_string();
+    let image = get(avm, player, item, "image");
+    let Value::Str(texture) = get(avm, player, &image, "texture") else {
+        return None;
+    };
+    let number = |avm: &mut Avm, player: &mut Player, v: &Value, k: &str| {
+        let x = get(avm, player, v, k);
+        match x {
+            Value::Undefined => None,
+            x => Some(avm.to_number(player, &x) as f32),
+        }
+    };
+    let part = [
+        number(avm, player, &image, "u0").unwrap_or(0.0),
+        number(avm, player, &image, "v0").unwrap_or(0.0),
+        number(avm, player, &image, "u1").unwrap_or(1.0),
+        number(avm, player, &image, "v1").unwrap_or(1.0),
+    ];
+    let natural = [
+        number(avm, player, &image, "width").unwrap_or(0.0),
+        number(avm, player, &image, "height").unwrap_or(0.0),
+    ];
+    let size = [
+        number(avm, player, item, "width").unwrap_or(natural[0]),
+        number(avm, player, item, "height").unwrap_or(natural[1]),
+    ];
+    let baseline = number(avm, player, item, "baseLineY").unwrap_or(size[1]);
+    let id = get(avm, player, item, "id");
+    let id = match id {
+        Value::Undefined => String::new(),
+        v => avm.to_str(player, &v).to_string(),
+    };
+    (!text.is_empty()).then(|| Substitution {
+        text,
+        texture: texture.to_string(),
+        part,
+        size,
+        baseline,
+        id,
+    })
 }
 
 fn arg(args: &[Value], i: usize) -> Value {
@@ -292,6 +339,9 @@ pub fn install(avm: &mut Avm) {
             b.set("width", Value::Number(f64::from(image.width)));
             b.set("height", Value::Number(f64::from(image.height)));
             b.set("texture", Value::Str(image.texture.as_str().into()));
+            for (k, v) in ["u0", "v0", "u1", "v1"].into_iter().zip(image.part) {
+                b.set(k, Value::Number(f64::from(v)));
+            }
         }
         Value::Object(o)
     });
@@ -1247,13 +1297,72 @@ fn install_clip(avm: &mut Avm) {
         "stopDrag",
         "setTextFormat",
         "setNewTextFormat",
-        // Scaleform's inline images in text (not drawn yet).
-        "setImageSubstitutions",
-        "updateImageSubstitution",
         "unloadMovie",
     ] {
         def(avm, &cp, n, |_, _, _, _| Value::Undefined);
     }
+    // Scaleform's inline images in text: `{ subString, image, width,
+    // height, baseLineY, id }` each (an array of them, or one).
+    def(
+        avm,
+        &cp,
+        "setImageSubstitutions",
+        |avm, player, this, args| {
+            let Some(id) = clip_id(this) else {
+                return Value::Undefined;
+            };
+            let list = match arg(args, 0) {
+                Value::Object(o) => match &o.borrow().kind {
+                    ObjKind::Array(items) => items.clone(),
+                    _ => vec![Value::Object(Rc::clone(&o))],
+                },
+                _ => Vec::new(),
+            };
+            let mut subs = Vec::new();
+            for item in &list {
+                if let Some(sub) = substitution(avm, player, item) {
+                    subs.push(sub);
+                }
+            }
+            if let Some(c) = player.clip_mut(id) {
+                c.substitutions = subs;
+            }
+            Value::Undefined
+        },
+    );
+    // (id, image): that substitution shows another image.
+    def(
+        avm,
+        &cp,
+        "updateImageSubstitution",
+        |avm, player, this, args| {
+            let (Some(clip), name) = (clip_id(this), text(avm, player, &arg(args, 0))) else {
+                return Value::Undefined;
+            };
+            let image = arg(args, 1);
+            let texture = avm.get(player, &image, "texture");
+            let part = ["u0", "v0", "u1", "v1"].map(|k| {
+                let v = avm.get(player, &image, k);
+                avm.to_number(player, &v) as f32
+            });
+            let texture = match texture {
+                Value::Str(t) => Some(t.to_string()),
+                _ => None,
+            };
+            if let Some(c) = player.clip_mut(clip) {
+                for s in c.substitutions.iter_mut().filter(|s| s.id == name) {
+                    match &texture {
+                        Some(t) => {
+                            s.texture = t.clone();
+                            s.part = part;
+                        }
+                        None => s.texture.clear(),
+                    }
+                }
+            }
+            Value::Undefined
+        },
+    );
     def(avm, &cp, "getTextFormat", |avm, _, _, _| {
         Value::Object(avm.object())
     });

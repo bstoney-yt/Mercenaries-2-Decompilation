@@ -729,6 +729,7 @@ fn text_fields_lay_out_in_texture_glyphs() {
     text::layout(
         &def,
         "A A",
+        &[],
         &font,
         &Matrix::IDENTITY,
         &ColourTransform::IDENTITY,
@@ -744,6 +745,33 @@ fn text_fields_lay_out_in_texture_glyphs() {
     // Half size: 12 x 24, its baseline 18 px down (2 + ascent 18 - origin).
     assert!((b0[2] - b0[0] - 12.0).abs() < 1e-4 && (b0[3] - b0[1] - 24.0).abs() < 1e-4);
     assert!((b1[0] - b0[0] - 24.0).abs() < 1e-4);
+    // An inline image for "[f]", 10 px wide, sitting on the baseline: the
+    // second glyph moves along by its width.
+    let flag = text::Substitution {
+        text: "[f]".into(),
+        texture: "flag".into(),
+        part: [0.0, 0.0, 1.0, 1.0],
+        size: [10.0, 8.0],
+        baseline: 8.0,
+        id: String::new(),
+    };
+    out.clear();
+    text::layout(
+        &def,
+        "A[f]A",
+        &[flag],
+        &font,
+        &Matrix::IDENTITY,
+        &ColourTransform::IDENTITY,
+        None,
+        &mut out,
+    );
+    assert_eq!(out.len(), 6);
+    assert_eq!(out[2].texture.as_deref(), Some("flag"));
+    let image = bounds(&out[2..4]).unwrap();
+    assert!((image[2] - image[0] - 10.0).abs() < 1e-4);
+    let a1 = bounds(&out[4..]).unwrap();
+    assert!((a1[0] - b0[0] - 22.0).abs() < 1e-4);
     assert_eq!(
         plain(
             "<p align='left'><font color='#ff0000'>Marga</font></p>",

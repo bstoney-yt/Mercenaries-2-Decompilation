@@ -293,6 +293,48 @@ impl Font {
 }
 
 /// The fonts the movies may import, by name (any case).
+/// An image drawn in a text field's text in place of a string
+/// (Scaleform's `TextField.setImageSubstitutions`): the flag for
+/// `[flagvz]`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Substitution {
+    pub text: String,
+    /// The image's texture (none: the string is dropped) and its part.
+    pub texture: String,
+    pub part: [f32; 4],
+    /// Its size in the text, and how far down it the baseline goes.
+    pub size: [f32; 2],
+    pub baseline: f32,
+    /// Its name for `updateImageSubstitution`.
+    pub id: String,
+}
+
+/// A piece of a line: a character, or a substitution's image.
+#[derive(Clone, Copy)]
+enum Piece {
+    Char(char),
+    Image(usize),
+}
+
+fn pieces(line: &str, subs: &[Substitution]) -> Vec<Piece> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        if let Some((i, sub)) = subs
+            .iter()
+            .enumerate()
+            .find(|(_, s)| rest.starts_with(s.text.as_str()))
+        {
+            out.push(Piece::Image(i));
+            rest = &rest[sub.text.len()..];
+        } else {
+            out.push(Piece::Char(c));
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FontBook {
     pub fonts: HashMap<String, Font>,
@@ -410,9 +452,11 @@ pub fn plain(text: &str, html: bool) -> (String, Option<[f32; 4]>) {
 
 /// Lays out `text` in the field `def` with `font`, as textured quads
 /// (two triangles each), through `matrix` and `colour`, cut to `clip`.
+#[allow(clippy::too_many_arguments)]
 pub fn layout(
     def: &EditText,
     text: &str,
+    subs: &[Substitution],
     font: &Font,
     matrix: &Matrix,
     colour: &ColourTransform,
@@ -429,7 +473,11 @@ pub fn layout(
         return;
     }
     let width = (def.bounds[2] - def.bounds[0] - def.left_margin - def.right_margin).max(1.0);
-    let advance = |c: char| font.advance(c) * size;
+    let advance = |p: Piece| match p {
+        Piece::Char(c) => font.advance(c) * size,
+        Piece::Image(i) => subs[i].size[0],
+    };
+    let measure = |s: &str| -> f32 { pieces(s, subs).into_iter().map(advance).sum() };
     // Lines: the text's own, then wrapped at spaces to the box.
     let mut lines: Vec<String> = Vec::new();
     for line in text.split('\n') {
@@ -440,11 +488,11 @@ pub fn layout(
         let mut current = String::new();
         let mut w = 0.0;
         for word in line.split(' ') {
-            let ww: f32 = word.chars().map(advance).sum();
+            let ww = measure(word);
             let space = if current.is_empty() {
                 0.0
             } else {
-                advance(' ')
+                font.advance(' ') * size
             };
             if !current.is_empty() && w + space + ww > width {
                 lines.push(std::mem::take(&mut current));
@@ -463,42 +511,60 @@ pub fn layout(
     // Flash puts the first baseline 2 px in and down by the ascent.
     let mut baseline = def.bounds[1] + 2.0 + ascent;
     let scale = size / nominal.max(1.0);
+    let quad =
+        |out: &mut Vec<Triangle>, p0: [f32; 2], p1: [f32; 2], uv: [f32; 4], tint, tex: &str| {
+            let [u0, v0, u1, v1] = uv;
+            let corners = [p0, [p1[0], p0[1]], p1, [p0[0], p1[1]]].map(|p| matrix.apply(p));
+            let uv = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+            for [a, b, c] in [[0, 1, 2], [0, 2, 3]] {
+                push_clipped(
+                    out,
+                    [corners[a], corners[b], corners[c]],
+                    [uv[a], uv[b], uv[c]],
+                    tint,
+                    Some(tex.to_owned()),
+                    clip,
+                );
+            }
+        };
     for line in lines {
-        let w: f32 = line.chars().map(advance).sum();
+        let line = pieces(&line, subs);
+        let w: f32 = line.iter().copied().map(advance).sum();
         let left = def.bounds[0] + 2.0 + def.left_margin;
         let mut x = match def.align {
             1 => def.bounds[2] - 2.0 - def.right_margin - w,
             2 => left + (width - 4.0 - w) / 2.0,
             _ => left,
         };
-        for c in line.chars() {
-            if let Some(Some(g)) = font
-                .codes
-                .get(&c)
-                .map(|&i| glyphs.get(usize::from(i)).copied().flatten())
-            {
-                let [u0, v0, u1, v1] = g.uv;
-                let px = |u: f32, v: f32| {
-                    [
-                        x + (u - g.origin[0]) * tex_size[0] * scale,
-                        baseline + (v - g.origin[1]) * tex_size[1] * scale,
-                    ]
-                };
-                let (p0, p1) = (px(u0, v0), px(u1, v1));
-                let corners = [p0, [p1[0], p0[1]], p1, [p0[0], p1[1]]].map(|p| matrix.apply(p));
-                let uv = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
-                for [a, b, c] in [[0, 1, 2], [0, 2, 3]] {
-                    push_clipped(
-                        out,
-                        [corners[a], corners[b], corners[c]],
-                        [uv[a], uv[b], uv[c]],
-                        tint,
-                        Some(texture.clone()),
-                        clip,
-                    );
+        for p in line {
+            match p {
+                Piece::Char(c) => {
+                    if let Some(Some(g)) = font
+                        .codes
+                        .get(&c)
+                        .map(|&i| glyphs.get(usize::from(i)).copied().flatten())
+                    {
+                        let [u0, v0, u1, v1] = g.uv;
+                        let px = |u: f32, v: f32| {
+                            [
+                                x + (u - g.origin[0]) * tex_size[0] * scale,
+                                baseline + (v - g.origin[1]) * tex_size[1] * scale,
+                            ]
+                        };
+                        quad(out, px(u0, v0), px(u1, v1), g.uv, tint, texture);
+                    }
+                }
+                Piece::Image(i) => {
+                    let sub = &subs[i];
+                    if !sub.texture.is_empty() {
+                        let top = baseline - sub.baseline;
+                        let p1 = [x + sub.size[0], top + sub.size[1]];
+                        let white = colour.apply([1.0; 4]);
+                        quad(out, [x, top], p1, sub.part, white, &sub.texture);
+                    }
                 }
             }
-            x += advance(c);
+            x += advance(p);
         }
         baseline += line_height;
     }
