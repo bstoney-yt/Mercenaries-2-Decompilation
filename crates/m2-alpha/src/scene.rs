@@ -971,6 +971,34 @@ impl Scene {
             .unwrap_or_default();
         self.people_rig = model.as_ref().map(|(_, rig)| rig.shared());
         if let Some((_, rig)) = &model {
+            let h = |i: Option<usize>| {
+                i.map_or("none".to_owned(), |i| {
+                    let c = &rig.clips[i];
+                    let own = if rig.own.contains(&c.hash) {
+                        " own"
+                    } else {
+                        ""
+                    };
+                    format!("{:08x}{own}", c.hash)
+                })
+            };
+            eprintln!(
+                "hero: {hero} clips: aim {}, ready {}, run {}, jump {}, take-off {}/{}, land {}/{}, throw {}, bash {}/{}, die {}",
+                h(clips.aim),
+                h(clips.ready),
+                h(clips.run_low),
+                h(clips.jump),
+                h(clips.takeoff),
+                h(clips.takeoff_still),
+                h(clips.land),
+                h(clips.land_still),
+                h(clips.throw.map(|t| t.0)),
+                h(clips.bash.map(|t| t.0)),
+                h(clips.bash_low.map(|t| t.0)),
+                h(clips.die),
+            );
+        }
+        if let Some((_, rig)) = &model {
             let named = |c: Option<(usize, f32)>| {
                 c.map_or("none".to_owned(), |(i, at)| {
                     let clip = &rig.clips[i];
