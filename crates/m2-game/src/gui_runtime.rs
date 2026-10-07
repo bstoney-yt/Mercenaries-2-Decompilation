@@ -2017,11 +2017,22 @@ natives! {
         let id = a.id(0);
         let name = a.text(1).unwrap_or_default();
         let rest = match a.get(2) {
-            Some(Value::Table(t)) if a.0.len() == 3 => t
-                .sequence_values::<Value>()
-                .filter_map(Result::ok)
-                .map(|v| FlashArg::of(&v))
-                .collect(),
+            // Up to its last whole-number key, holes passed as undefined
+            // (`{ bRetry, nil, nPlayers, sMessage, bHost }`).
+            Some(Value::Table(t)) if a.0.len() == 3 => {
+                let n = t
+                    .pairs::<Value, Value>()
+                    .filter_map(Result::ok)
+                    .filter_map(|(k, _)| match k {
+                        Value::Integer(i) if i >= 1 => Some(i),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                (1..=n)
+                    .map(|i| FlashArg::of(&t.raw_get::<Value>(i).unwrap_or(Value::Nil)))
+                    .collect()
+            }
             _ => a.0.iter().skip(2).map(FlashArg::of).collect(),
         };
         if let Some(w) = s.widgets.get_mut(&id) {
