@@ -2192,7 +2192,7 @@ impl Combat {
         if let Some(d) = her {
             // For checking what hurts her (autoplay logs).
             eprintln!("blast: at {at:.1}, she takes {d:.0}");
-                        self.hurt_player(f, d, Some(at));
+            self.hurt_player(f, d, Some(at));
         }
         if killed {
             self.remarks.push(Remark::Kill);
