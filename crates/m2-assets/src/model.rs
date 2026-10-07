@@ -806,6 +806,11 @@ pub struct PartStates {
     /// at: its fires perhaps): (state name hash, node), each once a state,
     /// in order.
     pub points: Vec<(u32, u16)>,
+    /// Nodes a state starts the building collapse animation on
+    /// (`StartAnim` naming `CollapseAnim`: the template's
+    /// `BuildingCollapseAnim` sinks them, leaning, into the ground while
+    /// the wreck shows underneath), each once.
+    pub collapsing: Vec<u16>,
 }
 
 /// One part's states: what entering each shows and hides.
@@ -827,6 +832,10 @@ const ON_ENTER: u32 = 0x9da9_7065;
 impl PartStates {
     fn parse(u: &Ucfx<'_>, stam: usize, nodes: &[Node]) -> Self {
         let (show, hide) = (crate::name_hash("show"), crate::name_hash("hide"));
+        let (start_anim, collapse_anim) = (
+            crate::name_hash("StartAnim"),
+            crate::name_hash("CollapseAnim"),
+        );
         let words = |d: &[u8]| -> Vec<u32> {
             d.chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -880,6 +889,17 @@ impl PartStates {
                                     for &at in &operands {
                                         commands.extend(named(w[at]).map(|n| (n, verb == show)));
                                         switched[at] = true;
+                                    }
+                                }
+                                if verb == start_anim
+                                    && operands.iter().any(|&at| w[at] == collapse_anim)
+                                {
+                                    for &at in &operands {
+                                        for n in named(w[at]) {
+                                            if !states.collapsing.contains(&n) {
+                                                states.collapsing.push(n);
+                                            }
+                                        }
                                     }
                                 }
                                 operands.clear();
@@ -956,6 +976,28 @@ impl PartStates {
             }
         }
         points
+    }
+
+    /// Which of `nodes` the collapse animation sinks: those
+    /// [`collapsing`](Self::collapsing) names and everything under them.
+    pub fn sinking(&self, nodes: &[Node]) -> Vec<bool> {
+        (0..nodes.len())
+            .map(|i| {
+                let mut at = Some(i as u16);
+                let mut steps = 0;
+                while let Some(n) = at {
+                    if self.collapsing.contains(&n) {
+                        return true;
+                    }
+                    steps += 1;
+                    if steps > nodes.len() {
+                        break;
+                    }
+                    at = nodes.get(usize::from(n)).and_then(|x| x.parent);
+                }
+                false
+            })
+            .collect()
     }
 
     /// Which of `nodes` are hidden (with everything under them) intact,
