@@ -885,14 +885,15 @@ pub struct GpuModel {
     pub track_travel: f32,
 }
 
-/// How far a track's texture moves per metre the track runs. Invented:
-/// the game scrolls its tracks from code.
+/// How far a track's texture moves per metre the track runs where its
+/// geometry can't say. Invented: the game scrolls its tracks from code.
 const TRACK_UV_PER_METRE: f32 = 0.5;
 
 /// The texture offset per metre a track run by the range `first`, `count`
 /// of `piece` needs: along whichever of u and v runs the length of the
 /// vehicle (z), so the AMX-30's u-wise track doesn't scroll sideways as
-/// a v-wise one would (Brendan's play-test). Its sign is taken from the
+/// a v-wise one would (Brendan's play-test), at the texture's own rate
+/// along the vehicle (units per metre). Its sign is taken from the
 /// lower run, which must move back as the vehicle goes forward (+z,
 /// inferred); without readable positions and texture coordinates, v.
 fn track_scroll(piece: &CpuPiece, first: u32, count: u32) -> [f32; 2] {
@@ -940,6 +941,7 @@ fn track_scroll(piece: &CpuPiece, first: u32, count: u32) -> [f32; 2] {
     // with z, and on the lower run which way each goes with z.
     let mut along = [0.0f32; 2];
     let mut lower = [0.0f32; 2];
+    let mut run = 0.0f32;
     let mut verts = Vec::new();
     for k in first..first + count {
         let Some(i) = index(k) else {
@@ -954,6 +956,7 @@ fn track_scroll(piece: &CpuPiece, first: u32, count: u32) -> [f32; 2] {
     for w in verts.windows(2) {
         let ((p0, t0), (p1, t1)) = (w[0], w[1]);
         let dz = p1[2] - p0[2];
+        run += dz * dz;
         for a in 0..2 {
             let d = t1[a] - t0[a];
             along[a] += (d * dz).abs();
@@ -966,12 +969,16 @@ fn track_scroll(piece: &CpuPiece, first: u32, count: u32) -> [f32; 2] {
     if along[a] <= 0.0 {
         return fallback;
     }
-    let mut out = [0.0; 2];
-    out[a] = if lower[a] < 0.0 {
-        -TRACK_UV_PER_METRE
+    // The texture's own rate along the run, so the lower run holds still
+    // on the ground (round DT: the invented 0.5 ran the AMX-30's at half
+    // the ground's speed).
+    let rate = if run > 0.0 {
+        along[a] / run
     } else {
         TRACK_UV_PER_METRE
     };
+    let mut out = [0.0; 2];
+    out[a] = if lower[a] < 0.0 { -rate } else { rate };
     out
 }
 
