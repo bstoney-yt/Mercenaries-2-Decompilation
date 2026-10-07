@@ -74,6 +74,20 @@ pub trait World {
     fn health(&self, _guid: u32) -> Option<f32> {
         None
     }
+    /// Whether a character's action (`Human.SetState`'s animation key)
+    /// has played to its end.
+    fn action_done(&self, _guid: u32) -> bool {
+        false
+    }
+    /// Every pad button the player pressed, in order, for minigames
+    /// ([`crate::hijack`]).
+    fn hijack_presses(&self) -> &[(f64, u32)] {
+        &[]
+    }
+    /// Since when (game seconds) the player holds a pad button down.
+    fn hijack_held_since(&self, _button: u32) -> Option<f64> {
+        None
+    }
 }
 
 /// The kinds the scripts use, by how often.
@@ -109,6 +123,13 @@ struct Pending {
     held: bool,
     /// For conditions on each of several objects: those it held for.
     held_by: BTreeSet<u32>,
+    /// When it was made.
+    made: f64,
+    /// For minigames: how many of the player's presses it has read (none
+    /// before its first check: it reads those made since it was), and
+    /// the button it counted last.
+    read: Option<usize>,
+    memo: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -121,6 +142,17 @@ struct Store {
     trace: Vec<String>,
     /// Game time, seconds.
     now: f64,
+    /// The Lua state, for the strings minigames answer with.
+    lua: LuaRef,
+}
+
+#[derive(Default)]
+struct LuaRef(Option<mlua::WeakLua>);
+
+impl std::fmt::Debug for LuaRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LuaRef")
+    }
 }
 
 /// The pending events, shared with the `Event` library.
@@ -140,6 +172,7 @@ impl Events {
     /// Installs the `Event` library: the kind constants and `Create`,
     /// `CreatePersistent`, `Delete` and `Post`.
     pub fn install(&self, lua: &Lua) -> mlua::Result<()> {
+        self.store.borrow_mut().lua = LuaRef(Some(lua.weak()));
         let event = lua.create_table()?;
         for kind in KINDS {
             event.set(kind, kind)?;
@@ -195,6 +228,9 @@ impl Events {
                         last: now,
                         held: false,
                         held_by: BTreeSet::new(),
+                        made: now,
+                        read: None,
+                        memo: None,
                     });
                     Ok(MultiValue::from_vec(vec![Value::Number(f64::from(id))]))
                 })?,
@@ -282,6 +318,16 @@ impl Events {
         event.set_metatable(Some(meta))?;
         lua.globals().set("Event", event)?;
         Ok(())
+    }
+
+    /// The minigames waiting on the player's pad, for the prompt.
+    pub fn minigames(&self) -> Vec<crate::hijack::Minigame> {
+        let s = self.store.borrow();
+        s.pending
+            .iter()
+            .filter(|p| p.kind == "Minigame")
+            .filter_map(|p| crate::hijack::Minigame::of(&p.params, s.now - p.made))
+            .collect()
     }
 
     /// Events made and deleted since the last call (with `M2_STUB_ARGS`).
@@ -474,6 +520,25 @@ impl Events {
                         }
                         (!rising.is_empty()).then_some(rising)
                     }
+                    Check::Minigame(m) => {
+                        p.read = Some(m.read);
+                        p.memo = m.last;
+                        let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                        for (status, value) in m.fires {
+                            let Some(text) =
+                                lua.as_ref().and_then(|l| l.create_string(status).ok())
+                            else {
+                                continue;
+                            };
+                            let mut extra = vec![Value::String(text)];
+                            extra.extend(value.map(Value::Number));
+                            fired.push((p.kind.clone(), p.callback.clone(), p.data.clone(), extra));
+                        }
+                        if !m.done {
+                            keep.push(p);
+                        }
+                        continue;
+                    }
                 };
                 match extra {
                     Some(extras) => {
@@ -589,6 +654,9 @@ enum Check {
     /// A condition on each of several objects (an object filter's): per
     /// object, whether it holds and the values to pass.
     Each(Vec<(u32, bool, Vec<Value>)>),
+    /// A minigame's answers, each a status and maybe a value; it stays
+    /// (made with `Create` or not) until `done`.
+    Minigame(crate::hijack::MinigameCheck),
 }
 
 /// The objects a parameter names: a guid, `"hero"` (the player), or a
@@ -810,6 +878,16 @@ fn check(
             no
         }
         // { object, "awake" or "hibernate" }.
+        // { character }: when the action `Human.SetState` gave it has
+        // played to its end.
+        "HumanActionComplete" => match guid(&p.params, 1) {
+            Some(g) => Check::Holds(world.action_done(g), Vec::new()),
+            None => no,
+        },
+        // { player, seconds, mode, button, ... }: see `crate::hijack`.
+        "Minigame" => Check::Minigame(crate::hijack::check_minigame(
+            &p.params, p.made, now, p.read, p.memo, world,
+        )),
         "ObjectHibernation" => match guid(&p.params, 1) {
             Some(g) => {
                 let want_awake = text(&p.params, 2).as_deref() != Some("hibernate");

@@ -19,6 +19,7 @@ pub mod assets;
 pub mod atmosphere;
 pub mod audio;
 pub mod durability;
+pub mod hijack;
 pub mod model;
 pub mod motion;
 pub mod physics;

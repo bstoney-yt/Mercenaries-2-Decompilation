@@ -81,6 +81,12 @@
 //!                           template: name, model, components, and what
 //!                           the alpha's world index makes of it
 //! find:<hash>[,..]          names for hashes
+//! hijack                    every template that can be hijacked: its
+//!                           entrances' template, script, point, radius
+//!                           and flag, and whether vz.wad has the script
+//! names:<word>[,..]         every known name holding a word, with its
+//!                           hash and the world archive's assets of that
+//!                           name (type hash, block path); 400 at most
 //! cues[:<name>,..]          which bank sounds the clips' sound events
 //!                           (and the names given) play: each name tried
 //!                           as a sound's, bare, numbered, lettered and
@@ -804,6 +810,13 @@ fn main() -> Result<(), Error> {
                 phy2_census(&mut source, world.as_ref().expect("just built"), &names)
             }
             "phy2rules" => phy2_rules(&mut source),
+            "hijack" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                hijackable(&mut source, world.as_ref().expect("just built"), &names);
+                Ok(())
+            }
             "vo" => vo_lines(&install, arg),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
@@ -828,6 +841,7 @@ fn main() -> Result<(), Error> {
             "stam" => stam(&mut source, &names, arg),
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
+            "names" => names_holding(&mut source, &names, arg),
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -860,6 +874,93 @@ fn cut(s: &str, n: usize) -> String {
         Some((i, _)) => format!("{}..", &s[..i]),
         None => s.to_owned(),
     }
+}
+
+/// Every template that can be hijacked, with its entrances.
+fn hijackable<R: Read + Seek>(source: &mut AssetSource<R>, world: &WorldIndex, names: &Names) {
+    let db = &world.template_db;
+    let index = source.archive().index();
+    let scripts: HashSet<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == SCRIPT_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    let mut rows: Vec<(String, u32)> = db
+        .hijack
+        .keys()
+        .map(|&id| (db.names.get(&id).cloned().unwrap_or_default(), id))
+        .collect();
+    rows.sort();
+    println!("hijackable templates: {}", rows.len());
+    for (name, id) in rows {
+        let model = db.infos.get(&id).and_then(|i| i.model);
+        println!(
+            "  {id:08x} {name} model {}",
+            model.map_or("-".into(), |m| format!("{m:08x}"))
+        );
+        for e in &db.hijack[&id] {
+            let show =
+                |h: Option<u32>| h.map_or("-".to_owned(), |h| format!("{h:08x} {}", names.show(h)));
+            println!(
+                "    entrance {:08x} {} script {:08x} {}{} point {} radius {} flag {:?} hardpoint {} name {}",
+                e.entrance,
+                db.names.get(&e.entrance).map_or("?", String::as_str),
+                e.script,
+                names.show(e.script),
+                if scripts.contains(&e.script) {
+                    ""
+                } else {
+                    " (no such script)"
+                },
+                show(e.point),
+                e.radius,
+                e.flag,
+                show(e.hardpoint),
+                show(e.name),
+            );
+        }
+    }
+}
+
+/// Every known name holding a word, with the assets of that name.
+fn names_holding<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words = words_of(arg);
+    let mut hits: Vec<(&str, u32)> = names
+        .map
+        .iter()
+        .filter(|(_, n)| {
+            let l = n.to_ascii_lowercase();
+            words.iter().any(|w| l.contains(w))
+        })
+        .map(|(&h, n)| (n.as_str(), h))
+        .collect();
+    hits.sort_unstable();
+    println!("names holding a word: {}", hits.len());
+    let index = source.archive().index();
+    let mut assets: HashMap<u32, Vec<String>> = HashMap::new();
+    for a in index.assets() {
+        let path = index
+            .blocks()
+            .get(usize::from(a.block))
+            .map_or("?", |b| b.path.as_str());
+        assets
+            .entry(a.name_hash)
+            .or_default()
+            .push(format!("{:08x}@{path}", index.type_hash(a)));
+    }
+    for (n, h) in hits.iter().take(400) {
+        let mut found = assets.get(h).cloned().unwrap_or_default();
+        found.sort_unstable();
+        found.dedup();
+        found.truncate(4);
+        println!("  {h:08x} {} {}", cut(n, 80), found.join(" "));
+    }
+    Ok(())
 }
 
 /// The scripts' string constants holding a word, by script.
