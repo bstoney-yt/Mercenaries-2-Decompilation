@@ -44,11 +44,13 @@ mod config;
 mod destruct;
 mod drops;
 mod flights;
+mod flow;
 mod game;
 mod gamehud;
 mod hijack;
 mod input;
 mod mission;
+mod movie;
 mod moving;
 mod npc;
 mod player;
@@ -201,6 +203,17 @@ struct Options {
     /// in, answering every prompt at once.
     hijack: bool,
     mission_seconds: f32,
+    /// The whole game as it launches: the boot movies, the front end, the
+    /// first contract with its movies, then on (also with no options).
+    alpha: bool,
+    /// `--alpha` without the boot movies and front end.
+    no_boot: bool,
+    /// With `--mission --screenshot`: the scripts' movies wait for the
+    /// game, which opens each, decodes a few frames and pictures one.
+    movies: bool,
+    /// With `--mission --autoplay --screenshot`: seconds to play on after
+    /// the contract is done.
+    after_contract: f32,
     /// Our stand-in HUD instead of the game's own.
     old_hud: bool,
     /// With `--mission --screenshot`: her health drops to this eight
@@ -332,6 +345,10 @@ fn parse_args() -> anyhow::Result<Options> {
                     .to_radians()
             }
             "--mission" => o.mission = true,
+            "--alpha" => o.alpha = true,
+            "--no-boot" => o.no_boot = true,
+            "--movies" => o.movies = true,
+            "--after-contract" => o.after_contract = value()?.parse()?,
             "--old-hud" => o.old_hud = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
@@ -430,6 +447,26 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             _ => bail!("unknown argument {arg} (try --help)"),
         }
+    }
+    // Launched plainly (only where the game is, the window and settings
+    // named): the whole game, as `--alpha`.
+    const PLAIN: [&str; 7] = [
+        "--install",
+        "--config",
+        "--size",
+        "--fullscreen",
+        "--vsync",
+        "--no-boot",
+        "--smarter-ai",
+    ];
+    if std::env::args()
+        .skip(1)
+        .all(|a| !a.starts_with("--") || PLAIN.contains(&a.as_str()))
+    {
+        o.alpha = true;
+    }
+    if o.alpha {
+        o.mission = true;
     }
     Ok(o)
 }
@@ -545,6 +582,8 @@ fn main() -> anyhow::Result<()> {
         old_hud: options.old_hud,
         hijack_crew: options.hijack_crew.clone(),
         support: options.support.clone(),
+        alpha: options.alpha,
+        no_boot: options.no_boot,
         state: None,
         error: None,
     };
@@ -1941,6 +1980,46 @@ fn probe_for_screenshot(game: &Game) {
 /// Starts the mission scripts, waits for them to read the archive and
 /// start the first contract, then plays on while the island streams in
 /// where they put the player, printing the objectives.
+/// Offscreen, the movies the scripts are waiting on (`--movies`): each is
+/// opened, a frame three seconds in is pictured (`<out>-movie-<name>.ppm`)
+/// and its sound decoded, and the scripts are told it is over.
+fn movies_offscreen(link: &mut mission::MissionLink, install: &Install, out: &std::path::Path) {
+    while let Some(name) = link.take_movie() {
+        eprintln!("movies: the scripts play {name}");
+        match movie::ffmpeg() {
+            None => eprintln!("movies: no ffmpeg; {name} skipped"),
+            Some(ffmpeg) => match movie::Movie::open(&ffmpeg, install, &name) {
+                Err(e) => eprintln!("movies: {name}: {e:#}"),
+                Ok(mut m) => {
+                    let at = (m.info.fps * 3.0) as usize;
+                    let (w, h) = (m.info.width, m.info.height);
+                    let mut frame = None;
+                    for _ in 0..=at {
+                        match m.next_frame() {
+                            Some(f) => frame = Some(f.to_vec()),
+                            None => break,
+                        }
+                    }
+                    let stem = out
+                        .file_stem()
+                        .map_or("shot".into(), |s| s.to_string_lossy());
+                    let path = out.with_file_name(format!("{stem}-movie-{name}.ppm"));
+                    if let Some(rgba) = frame {
+                        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+                        ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+                        match std::fs::write(&path, ppm) {
+                            Ok(()) => eprintln!("movies: pictured {name}: {}", path.display()),
+                            Err(e) => eprintln!("movies: {}: {e}", path.display()),
+                        }
+                    }
+                    eprintln!("movies: {name} sound {:?} s", m.sound_seconds());
+                }
+            },
+        }
+        link.movie_done();
+    }
+}
+
 fn mission_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -1952,10 +2031,14 @@ fn mission_for_screenshot(
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
-        .with_support(options.support.clone());
+        .with_support(options.support.clone())
+        .with_movies(options.movies);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
+        if options.movies {
+            movies_offscreen(&mut link, install, out);
+        }
         if link
             .view()
             .status
@@ -1982,6 +2065,7 @@ fn mission_for_screenshot(
         10.0
     };
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
+    let mut contract_done: Option<u32> = None;
     let played = Instant::now();
     let every = if auto.is_some() { 10 } else { 30 };
     // With --autoplay, a picture of each delivery as its helicopter
@@ -2026,7 +2110,7 @@ fn mission_for_screenshot(
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
     let mut strike_seen: Option<u32> = None;
     for i in 0..(seconds / tick).round() as u32 {
-        let intent = match &mut auto {
+        let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
                 let marks = link.marks();
                 let objectives = link.view().objectives;
@@ -2047,6 +2131,20 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        if options.movies {
+            movies_offscreen(&mut link, install, out);
+        }
+        // After the contract (--after-contract), where she is every five
+        // seconds.
+        if contract_done.is_some() && i % (5.0 / tick).round() as u32 == 0 {
+            let view = link.view();
+            eprintln!(
+                "after contract: {:.0} s, she is at {:.1}, objectives {:?}",
+                i as f32 * tick,
+                game.focus(),
+                view.objectives
+            );
+        }
         // And the strike is pictured 2 s and 6 s after its first ordnance
         // goes off (`-strike`, `-strike-late`).
         if !options.support.is_empty() {
@@ -2278,12 +2376,16 @@ fn mission_for_screenshot(
                 }
             }
         }
-        if auto.is_some() && link.completed() {
+        if auto.is_some() && link.completed() && contract_done.is_none() {
             eprintln!(
                 "autoplay: contract completed after {:.1} s of play ({:.0} s here)",
                 i as f32 * tick,
                 played.elapsed().as_secs_f32()
             );
+            // She stops playing; the scripts go on (--after-contract).
+            contract_done = Some(i);
+        }
+        if contract_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
         }
     }
@@ -3674,6 +3776,8 @@ struct Running {
     egui: egui_winit::State,
     mission: Option<mission::MissionLink>,
     hijacks: Option<hijack::Hijacks>,
+    /// The launch's movies and front end (`--alpha`).
+    flow: Option<flow::Flow>,
 }
 
 struct App {
@@ -3693,6 +3797,10 @@ struct App {
     hijack_crew: Option<String>,
     /// Support items to call in (`--support`).
     support: Vec<String>,
+    /// The whole game's launch (`--alpha`): boot movies (unless
+    /// `no_boot`), front end, the scripts' movies.
+    alpha: bool,
+    no_boot: bool,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -3758,13 +3866,20 @@ impl App {
                 (Some(install), Mode::Island(_)) if self.mission => Some(
                     mission::MissionLink::start(install, self.mission_drivers.clone())
                         .with_keys(self.config.keys.clone())
-                        .with_support(self.support.clone()),
+                        .with_support(self.support.clone())
+                        .with_movies(self.alpha),
                 ),
                 _ => None,
             },
             hijacks: match (&self.install, &self.mode) {
                 (Some(install), Mode::Island(_)) => {
                     Some(hijack::Hijacks::start(install, self.hijack_crew.clone()))
+                }
+                _ => None,
+            },
+            flow: match &self.install {
+                Some(install) if self.alpha => {
+                    Some(flow::Flow::new(install.clone(), !self.no_boot))
                 }
                 _ => None,
             },
@@ -3805,6 +3920,18 @@ impl Running {
         }
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
+        if let Some(flow) = self.flow.as_mut().filter(|f| f.covers()) {
+            let output = self.hud.build_screen(input, |ui| flow.paint(ui));
+            self.egui.handle_platform_output(&self.window, output);
+            let (w, h) = self.backend.size();
+            return render(
+                &mut self.backend,
+                &mut self.game,
+                config.camera.fov,
+                w as f32 / h as f32,
+                Some(&mut self.hud),
+            );
+        }
         let (w, h) = self.backend.size();
         let mut info = hud_info(
             &self.game,
@@ -3899,6 +4026,18 @@ impl Running {
     }
 
     fn tick(&mut self, config: &Config, _event_loop: &ActiveEventLoop) {
+        if let Some(flow) = &mut self.flow {
+            if let Ok(mut mixer) = self.audio.out.mixer.lock() {
+                flow.tick(self.mission.as_mut(), &mut mixer);
+            }
+            if flow.holds() {
+                // The world waits under the movie or the front end.
+                self.input.clear();
+                let (ear, facing) = self.game.listener();
+                self.audio.update(ear, facing);
+                return;
+            }
+        }
         if self.input.take_pressed(Action::Quit) {
             if self.hud.menu {
                 self.close_menu();
@@ -4051,6 +4190,17 @@ impl ApplicationHandler for App {
                 state.input.clear();
                 if !focused {
                     state.set_mouse_look(false);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if state.focused && state.flow.as_ref().is_some_and(flow::Flow::holds) =>
+            {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let Some(flow) = &mut state.flow
+                {
+                    flow.key(code);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if state.focused => {

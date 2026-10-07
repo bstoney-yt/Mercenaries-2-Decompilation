@@ -58,6 +58,29 @@ end
 return true
 "#;
 
+/// The flow's full-screen movies (`_PlayMovie{sMovie = "01_AOA_J",
+/// fCallback = ...}`, as `WifMissionFlow` plays the contracts' intro and
+/// closing movies) wait for the game instead of ending at once: each
+/// request is queued in `__m2_movies` for [`Mission::take_movie`], and
+/// [`Mission::movie_done`] then runs its callback as the script's own
+/// skip path does (`MrxUtil.CallWithOptionalArgs(fCallback,
+/// tCallbackData)`).
+const HOLD_MOVIES: &str = r#"
+local play = _PlayMovie
+if type(play) ~= "function" then
+    return false
+end
+__m2_movies = {}
+_PlayMovie = function(t)
+    if type(t) == "table" and type(t.sMovie) == "string" then
+        table.insert(__m2_movies, t)
+    else
+        return play(t)
+    end
+end
+return true
+"#;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MissionError {
     #[error("archive: {0}")]
@@ -272,6 +295,8 @@ pub struct Mission {
     outbox: Vec<Command>,
     /// The game flies deliveries ([`fly_deliveries`](Self::fly_deliveries)).
     flown: bool,
+    /// A held movie was handed to the game and has not ended yet.
+    movie_out: bool,
 }
 
 impl Mission {
@@ -400,6 +425,7 @@ impl Mission {
             log,
             outbox: Vec::new(),
             flown: false,
+            movie_out: false,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -924,6 +950,57 @@ impl Mission {
         let mut w = self.world.borrow_mut();
         if let Some(who) = w.player {
             w.set_reserve(who, weapon, rounds);
+        }
+    }
+
+    /// Has the flow's movies wait for the game ([`HOLD_MOVIES`]): call
+    /// before [`start`](Self::start). Without it they end at once.
+    pub fn hold_movies(&mut self) {
+        let held = self
+            .host
+            .lua()
+            .load(HOLD_MOVIES)
+            .set_name("=hold movies")
+            .eval::<bool>();
+        self.log.push(match held {
+            Ok(true) => "movies: held for the game (_PlayMovie)".to_owned(),
+            Ok(false) => "movies: no _PlayMovie to hold".to_owned(),
+            Err(e) => format!("movies: {}", first_lines(&e.to_string())),
+        });
+    }
+
+    /// The next movie the flow asked for (`01_AOA_J`), if any: the game
+    /// plays it and then calls [`movie_done`](Self::movie_done).
+    pub fn take_movie(&mut self) -> Option<String> {
+        if self.movie_out {
+            return None;
+        }
+        let movies = self
+            .host
+            .lua()
+            .globals()
+            .raw_get::<mlua::Table>("__m2_movies")
+            .ok()?;
+        let first = movies.raw_get::<mlua::Table>(1).ok()?;
+        let name = first.raw_get::<String>("sMovie").ok()?;
+        self.log.push(format!("movie: {name}"));
+        self.movie_out = true;
+        Some(name)
+    }
+
+    /// The movie [`take_movie`](Self::take_movie) gave has ended (or was
+    /// skipped): its callback runs.
+    pub fn movie_done(&mut self) {
+        self.movie_out = false;
+        let code = r#"
+local t = table.remove(__m2_movies, 1)
+if t and t.fCallback then
+    MrxUtil.CallWithOptionalArgs(t.fCallback, t.tCallbackData)
+end
+"#;
+        if let Err(e) = self.run(code, "movie done") {
+            self.log
+                .push(format!("  movie done: {}", first_lines(&e.to_string())));
         }
     }
 
