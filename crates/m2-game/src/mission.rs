@@ -163,6 +163,27 @@ return 0
 /// read yet).
 const FADE_WIPE: f64 = 1.0;
 
+/// Skip mode (which [`Mission::start`] turns on so the intro movies end
+/// at once) also has `MrxUtil.TeleportHeroesToLocations` skip the
+/// teleport and only call back: with the movies held for the game, the
+/// teleports happen as without it (after the first contract's closing
+/// movie, to `PmcCon001_Start1`).
+const TELEPORTS: &str = r#"
+local util = rawget(_G, "MrxUtil")
+local cheat = rawget(_G, "MrxCheatBootstrap")
+if type(util) ~= "table" or type(cheat) ~= "table" then return false end
+local tele = rawget(util, "TeleportHeroesToLocations")
+if type(tele) ~= "function" then return false end
+rawset(util, "TeleportHeroesToLocations", function(...)
+    local skip = cheat.IsSkipModeEnabled
+    cheat.IsSkipModeEnabled = function() return false end
+    local ok, err = pcall(tele, ...)
+    cheat.IsSkipModeEnabled = skip
+    if not ok then error(err, 0) end
+end)
+return true
+"#;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MissionError {
     #[error("archive: {0}")]
@@ -1073,6 +1094,21 @@ impl Mission {
             .load(HOLD_MOVIES)
             .set_name("=hold movies")
             .eval::<u32>();
+        match self
+            .host
+            .lua()
+            .load(TELEPORTS)
+            .set_name("=teleports")
+            .eval::<bool>()
+        {
+            Ok(true) => {}
+            Ok(false) => self
+                .log
+                .push("teleports: no MrxUtil.TeleportHeroesToLocations".into()),
+            Err(e) => self
+                .log
+                .push(format!("teleports: {}", first_lines(&e.to_string()))),
+        }
         self.log.push(match held {
             Ok(0) => "movies: no _PlayMovie to hold".to_owned(),
             Ok(n) => format!("movies: held for the game ({n} _PlayMovie)"),
