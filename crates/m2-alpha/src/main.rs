@@ -2067,7 +2067,6 @@ fn mission_for_screenshot(
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     let mut contract_done: Option<u32> = None;
     let mut late_hud: Option<(ui::Hud, Config)> = None;
-    let mut fanfare_closed = false;
     let played = Instant::now();
     let every = if auto.is_some() { 10 } else { 30 };
     // With --autoplay, a picture of each delivery as its helicopter
@@ -2157,32 +2156,24 @@ fn mission_for_screenshot(
             }
             info.game = Some(state);
             let (w, h) = backend.size();
-            let input = ui::headless_input(w, h, f64::from(i) * f64::from(tick));
+            let mut input = ui::headless_input(w, h, f64::from(i) * f64::from(tick));
+            // And the Enter key itself, down then up, for the movie that
+            // has the controls (the fanfare's Key listener).
+            let every = (4.0 / tick).round() as u32;
+            if i % every <= 1 {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: i % every == 0,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
             let _ = hud.build(input, &info, settings);
             if let Some(g) = &mut hud.game {
                 for seq in g.take_callbacks() {
                     eprintln!("after contract: the HUD called back call {seq}");
-                    fanfare_closed = true;
                     link.hud_callback(seq);
-                }
-            }
-            // Test runs only: should the HUD not have closed the fanfare
-            // 30 s on, its callback runs anyway, so the rest of the flow
-            // (the next movie, the next contract) is still tried.
-            if !fanfare_closed
-                && contract_done.is_some_and(|d| i.saturating_sub(d) as f32 * tick > 30.0)
-            {
-                fanfare_closed = true;
-                let calls = link.view().hud_calls;
-                match calls.iter().rev().find(|c| c.callback) {
-                    Some(c) => {
-                        eprintln!(
-                            "after contract: the HUD never closed the fanfare; test shortcut: calling back {}.{} (call {})",
-                            c.group, c.method, c.seq
-                        );
-                        link.hud_callback(c.seq);
-                    }
-                    None => eprintln!("after contract: no HUD call with a callback to close"),
                 }
             }
         }
