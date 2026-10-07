@@ -43,9 +43,9 @@ const FIRE_ARC: f32 = 0.3;
 const FIRE_GAP: (f32, f32) = (0.9, 0.8);
 /// They fire in bursts: at least this many rounds, plus up to this many
 /// more at random, this many seconds apart (the "Assault Rifle"'s rate of
-/// fire; the burst sizes invented until the AI's are read).
+/// fire, 450 a minute; the burst sizes invented, as no field names them).
 const BURST: (u32, u32) = (3, 2);
-const BURST_GAP: f32 = 0.1;
+const BURST_GAP: f32 = 60.0 / 450.0;
 const PAUSE: (f32, f32) = (2.0, 6.0);
 /// People are drawn this close to the camera, metres.
 pub const DRAW_DISTANCE: f32 = 200.0;
@@ -103,6 +103,8 @@ pub struct FightClips {
     pub aim: Option<usize>,
     /// Standing, rifle held across the chest (resident 178a5642).
     pub ready: Option<usize>,
+    /// Running with the rifle held low across the body in both hands.
+    pub run_low: Option<usize>,
     /// A jump: take-off and the air, ending off the ground (resident
     /// c846e6fd); the stand-in when the take-offs below aren't there.
     pub jump: Option<usize>,
@@ -130,6 +132,10 @@ pub struct FightClips {
 impl FightClips {
     pub const AIM: u32 = 0x0163_f2aa;
     pub const READY: u32 = 0x178a_5642;
+    /// Running with the rifle low across the body, two-handed, likeliest
+    /// first (round 151: resident 5.21 m/s, then Jennifer's 4.65 m/s);
+    /// the run she had, 10912665, is Mattias's.
+    pub const RUN_LOW: [u32; 4] = [0x745e_b940, 0x2105_c540, 0xe340_14c3, 0x94b1_e4ac];
     pub const JUMP: u32 = 0xc846_e6fd;
     pub const DIE: u32 = 0x479c_4a51;
     /// Jennifer's running take-offs (0.93 s, 3.6 m/s), then the
@@ -179,6 +185,7 @@ impl FightClips {
         Self {
             aim: find(Self::AIM),
             ready,
+            run_low: first(&Self::RUN_LOW),
             jump: find(Self::JUMP),
             takeoff: first(&Self::TAKEOFF),
             takeoff_still: first(&Self::TAKEOFF_STILL),
