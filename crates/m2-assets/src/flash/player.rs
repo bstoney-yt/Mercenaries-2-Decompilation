@@ -335,6 +335,8 @@ pub struct Clip {
     /// What scripts have drawn on it (the drawing API), as triangles in
     /// its own space.
     pub drawing: Vec<Triangle>,
+    /// A text field's inline images (`setImageSubstitutions`).
+    pub substitutions: Vec<super::text::Substitution>,
 }
 
 impl Clip {
@@ -363,6 +365,7 @@ impl Clip {
             entered: false,
             children: BTreeMap::new(),
             drawing: Vec::new(),
+            substitutions: Vec::new(),
         }
     }
 
@@ -823,9 +826,9 @@ impl Player {
                 {
                     match &self.translate {
                         Some(tr) if s.contains('[') => {
-                            layout(t, &(tr.0)(s), font, &m, &col, clip, out);
+                            layout(t, &(tr.0)(s), &c.substitutions, font, &m, &col, clip, out);
                         }
-                        _ => layout(t, s, font, &m, &col, clip, out),
+                        _ => layout(t, s, &c.substitutions, font, &m, &col, clip, out),
                     }
                 }
             }
