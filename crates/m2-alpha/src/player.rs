@@ -74,6 +74,19 @@ impl ChaseRig {
     /// where the turret aims), else 2 m above its origin and back by about
     /// its length, swinging back behind it unless it runs on tracks.
     pub fn of(spec: &VehicleSpec) -> Self {
+        // A helicopter's: as far back as its template says (field
+        // ee30a43d; inferred), looking down its `DefaultPitch`, from above
+        // its hub height.
+        if let Some((distance, pitch)) = spec.tuning.chase.filter(|_| spec.is_helicopter()) {
+            return Self {
+                pivot: Vec3::Y * (spec.bounds.1.y * 0.6),
+                distance,
+                pitch: Some(-pitch),
+                pitch_range: (-1.2, 0.9),
+                follows_aim: false,
+                aim_lift: 0.0,
+            };
+        }
         match spec.tuning.camera {
             Some(c) => Self {
                 pivot: spec.pivot.unwrap_or(Vec3::ZERO).with_x(0.0) + Vec3::Y * c.height,
@@ -107,8 +120,10 @@ pub struct Intent {
     pub sprint: bool,
     pub walk: bool,
     pub jump: bool,
-    /// Jump held: the brake when driving.
+    /// Jump held: the brake when driving, climbing in a helicopter.
     pub hold_jump: bool,
+    /// Crouch held: coming down in a helicopter.
+    pub lower: bool,
     /// Get in or out of a vehicle.
     pub use_pressed: bool,
     /// Turn an overturned vehicle back up.
@@ -142,6 +157,7 @@ impl Intent {
             walk: input.held(Action::Walk),
             jump: input.take_pressed(Action::MoveUp),
             hold_jump: input.held(Action::MoveUp),
+            lower: input.held(Action::MoveDown),
             use_pressed: input.take_pressed(Action::Use),
             right_vehicle: input.take_pressed(Action::Reset),
             look,
@@ -681,6 +697,7 @@ mod tests {
             elevation: (0.0, 0.0),
             hull: (Vec3::new(-1.8, 0.0, -3.3), Vec3::new(1.8, 1.5, 3.3)),
             turret_box: None,
+            rotors: Vec::new(),
             tuning: Default::default(),
         };
         let plain = ChaseRig::of(&spec);
