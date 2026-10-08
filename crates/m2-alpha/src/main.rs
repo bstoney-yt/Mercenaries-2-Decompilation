@@ -104,6 +104,9 @@ struct Options {
     spawn: Option<(f32, f32)>,
     /// Who to play (`--hero`), over the settings'.
     hero: Option<Hero>,
+    /// Weapons to start with, by template name (`--gun`, repeated:
+    /// `Shotgun`, `Stinger`, `C4`).
+    guns: Vec<String>,
     gait: Option<Gait>,
     double_sided: bool,
     fly: bool,
@@ -236,6 +239,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 ));
             }
             "--turn" => o.turn = value()?.parse().context("--turn expects degrees")?,
+            "--gun" => o.guns.push(value()?),
             "--hero" => {
                 let v = value()?;
                 o.hero = Some(Hero::parse(&v).with_context(|| {
@@ -478,6 +482,7 @@ fn main() -> anyhow::Result<()> {
         fly: options.fly,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
+        guns: options.guns.clone(),
         state: None,
         error: None,
     };
@@ -558,6 +563,15 @@ fn build_scene(
     Ok(game)
 }
 
+/// Hands her the weapons `--gun` names.
+fn give_guns(game: &mut Game, guns: &[String]) {
+    for name in guns {
+        if !game.give(name) {
+            eprintln!("--gun {name}: no hand weapon of that name in the templates");
+        }
+    }
+}
+
 /// What the HUD shows: the game's, with the mission's objectives and the
 /// view their markers are placed with.
 fn hud_info(
@@ -622,6 +636,7 @@ fn screenshot(
         options.mission,
         config.hero,
     )?;
+    give_guns(&mut game, &options.guns);
     if options.fly {
         game.on_foot = false;
     }
@@ -3209,6 +3224,8 @@ struct App {
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
     mission_drivers: Vec<(String, String)>,
+    /// Weapons to start with (`--gun`).
+    guns: Vec<String>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -3237,6 +3254,7 @@ impl App {
             self.mission,
             self.config.hero,
         )?;
+        give_guns(&mut game, &self.guns);
         if self.fly {
             game.on_foot = false;
         }

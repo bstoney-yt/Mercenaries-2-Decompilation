@@ -51,6 +51,14 @@ pub struct PlayerSave {
     /// ran out had it full.
     #[serde(default)]
     pub rifle: Option<[u32; 2]>,
+    /// The templates of the guns in her hands' two places (her rifle's,
+    /// and what she carries in the launcher's), and the explosive she has
+    /// chosen with how many of C4 and mines she has; saves from before
+    /// had the carbine or her own, and none of either.
+    #[serde(default)]
+    pub guns: [String; 2],
+    #[serde(default)]
+    pub explosives: [u32; 3],
 }
 
 fn full_grenades() -> u32 {
@@ -127,6 +135,8 @@ mod tests {
                 launcher: Some([4, 12]),
                 rifle: Some([12, 90]),
                 grenades: 3,
+                guns: ["Shotgun".into(), "Stinger".into()],
+                explosives: [0, 2, 1],
             },
             vehicles: vec![VehicleSave {
                 model: 0x0307_555e,

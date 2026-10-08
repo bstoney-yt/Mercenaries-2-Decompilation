@@ -207,8 +207,12 @@ pub struct VehicleSpec {
     /// A tracked vehicle's road wheels as drawn: centre and radius, model
     /// space.
     pub road_wheels: Vec<(Vec3, f32)>,
-    /// Each node's rest transform (node to model).
+    /// Each node's rest transform (node to model), and its name's hash.
     pub rest: Vec<Mat4>,
+    pub node_names: Vec<u32>,
+    /// The weapons its riders fire, as its template mounts them
+    /// ([`VehicleSpec::armed_with`]).
+    pub armed: Vec<crate::weapons::Mounted>,
     /// The wheel each node turns with, if any: an index into `wheels`, or
     /// into `road_wheels` when tracked.
     pub node_wheel: Vec<Option<usize>>,
@@ -562,6 +566,8 @@ impl VehicleSpec {
             model: entry.model,
             kind: entry.kind.clone(),
             label: entry.label.clone(),
+            node_names: model.nodes.iter().map(|x| x.name_hash).collect(),
+            armed: Vec::new(),
             wheels,
             bounds,
             seat: marker(DRIVER_SEAT),
@@ -594,6 +600,19 @@ impl VehicleSpec {
                 Vec::new()
             },
         })
+    }
+
+    /// With the weapons its template's armament `arm` mounts, each at
+    /// its hardpoints' nodes.
+    pub fn armed_with(
+        mut self,
+        arm: Option<&crate::weapons::Armament>,
+        arms: &crate::weapons::Arms,
+    ) -> Self {
+        self.armed = arm.map_or_else(Vec::new, |a| {
+            crate::weapons::mounted(a, arms, &self.node_names)
+        });
+        self
     }
 
     /// With its template's tuning: its mass and how far its gun tilts.
@@ -930,6 +949,8 @@ mod tests {
             model: 1,
             kind: "car".into(),
             label: "test".into(),
+            node_names: Vec::new(),
+            armed: Vec::new(),
             wheels: vec![
                 wheel(-0.9, 1.4),
                 wheel(0.9, 1.4),
