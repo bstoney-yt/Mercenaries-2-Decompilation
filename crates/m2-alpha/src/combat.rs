@@ -307,6 +307,8 @@ pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
 /// measured).
 const RIFLE_RELOAD: f32 = 2.0;
 const RIFLE_RANGE: f32 = 400.0;
+/// What a carbine round does to crates and explosive props (theirs is
+/// the alpha's own scale, not yet the damage table's).
 const RIFLE_DAMAGE: f32 = 34.0;
 /// The carbine round's `Damage`, which [`RIFLE_DAMAGE`] stands for.
 const CARBINE_ROUND: f32 = 6.0;
@@ -1924,6 +1926,7 @@ impl Combat {
             Some(_) => Round::BulletLarge,
             None => Round::Bullet,
         };
+        let human = self.on_people(ammo.and_then(|a| a.key));
         // Each of its rounds a shot (the shotgun's 10), scattered by its
         // `WeaponScatter` (degrees across the cone).
         let spread = self.rifle.scatter.to_radians();
@@ -1945,12 +1948,15 @@ impl Combat {
             let damage = ammo.map_or(self.rifle.damage, |a| {
                 a.damage_at(hit.map_or(RIFLE_RANGE, |h| h.0))
             });
-            // What it does to people, as a carbine round's [`RIFLE_DAMAGE`]
-            // is to its `Damage` of 6 (people's health is the alpha's own).
-            let on_people = RIFLE_DAMAGE * damage / CARBINE_ROUND;
+            // What it does to people: its `Damage` times the damage
+            // table's `Human` cell for its `DamageKey`, against their
+            // template's `Health` (a VZ soldier's 75).
+            let on_people = damage * human;
+            // To crates and explosive props, the alpha's own scale.
+            let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
             if let Some((t, None)) = hit {
                 self.round_on_vehicle(f, (eye, dir, t), (damage, round), None);
-                self.hit_explosives_in(f.explosives, eye + dir * t, on_people);
+                self.hit_explosives_in(f.explosives, eye + dir * t, on_props);
                 // What it hit, if the scene's (a crate takes the round).
                 let key = f
                     .physics
@@ -1958,7 +1964,7 @@ impl Combat {
                     .and_then(|(_, _, key)| key);
                 self.struck.push(Strike {
                     at: eye + dir * t,
-                    damage: on_people,
+                    damage: on_props,
                     key,
                 });
             }
@@ -2354,12 +2360,14 @@ impl Combat {
         let ammo = w.ammo;
         match w.flight() {
             m2_engine::weapons::Flight::Round => {
+                let human = self.on_people(ammo.key);
                 for _ in 0..w.pellets.max(1) {
                     let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
                     let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
                     self.effect(Effect::Tracer { from, to }, 0.07);
                     let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
-                    let on_people = RIFLE_DAMAGE * damage / CARBINE_ROUND;
+                    let on_people = damage * human;
+                    let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
                     if let Some((_, Some(j))) = hit {
                         let soldier = f.people.npcs[j].soldier;
                         if f.people.npcs[j].hurt(on_people, aim * SHOT_PUSH) && soldier {
@@ -2373,7 +2381,7 @@ impl Combat {
                             _ => Round::BulletLarge,
                         };
                         self.round_on_vehicle(f, (from, aim, t), (damage, round), Some(id));
-                        self.hit_explosives_in(f.explosives, from + aim * t, on_people);
+                        self.hit_explosives_in(f.explosives, from + aim * t, on_props);
                     }
                 }
                 self.effect(
@@ -3093,6 +3101,19 @@ impl Combat {
         }
     }
 
+    /// Of a round's `Damage`, what the game's damage table's `Human` row
+    /// gives people for its `DamageKey` (`Bullet` 1, `BulletLarge` 1.5);
+    /// a round without a key is a `Bullet`.
+    fn on_people(&self, key: Option<u32>) -> f32 {
+        let key = key
+            .filter(|&k| k != 0)
+            .unwrap_or_else(|| m2_assets::name_hash("Bullet"));
+        self.damage_table
+            .as_ref()
+            .and_then(|t| t.scale(m2_assets::name_hash("Human"), key))
+            .unwrap_or(1.0)
+    }
+
     /// Explosion template `blast` going off at `at`, by its own `Radius`,
     /// `Damage` and `MinDamage` and the damage table's scale for its
     /// `DamageKey` (people's `Human` row, the hero's `Hero` row; vehicles
@@ -3633,7 +3654,9 @@ mod tests {
             fire: true,
             ..Trigger::default()
         };
-        for _ in 0..30 {
+        // A VZ soldier's `Health` of 75 takes 13 carbine rounds of 6.
+        people.npcs[0].hp = m2_engine::ai::AiProfile::default().health;
+        for _ in 0..600 {
             let mut field = Field {
                 physics: &mut physics,
                 player: &mut player,
@@ -3643,9 +3666,12 @@ mod tests {
                 explosives: &mut [],
             };
             combat.step(&mut field, fire, dt);
+            if !people.npcs[0].alive {
+                break;
+            }
         }
         assert!(!people.npcs[0].alive);
-        assert_eq!(combat.hits, 3);
+        assert_eq!(combat.hits, 13);
         assert!(people.npcs[1].alert, "gunfire within 60 m alerts");
         assert!(
             combat

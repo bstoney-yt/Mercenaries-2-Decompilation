@@ -1547,8 +1547,10 @@ impl People {
             npc.layer = s.layer;
             if let Some(ai) = s.ai {
                 npc.ai = ai;
-                npc.hp = ai.health;
             }
+            // Their template's `Health` (a plain VZ soldier's 75 when none
+            // speaks for them).
+            npc.hp = npc.ai.health;
             // A story character doesn't fight.
             npc.soldier = self.kinds[kind].soldier;
             self.npcs.push(npc);
