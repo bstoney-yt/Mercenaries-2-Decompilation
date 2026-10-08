@@ -1895,11 +1895,12 @@ fn look_at_marker(
 ) -> anyhow::Result<()> {
     use m2_math::glam::Vec3;
     let here = game.focus();
-    let Some((at, label, _)) = link
+    let Some((at, label)) = link
         .view()
         .markers
         .into_iter()
-        .min_by(|a, b| a.0.distance(here).total_cmp(&b.0.distance(here)))
+        .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
+        .map(|m| (m.at, m.label()))
     else {
         eprintln!("mission look: no markers");
         return Ok(());

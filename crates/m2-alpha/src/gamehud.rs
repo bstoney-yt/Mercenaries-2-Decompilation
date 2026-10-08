@@ -432,8 +432,9 @@ pub struct HudState {
     /// turning left, as the heading.
     pub position: Option<[f32; 3]>,
     pub facing: f32,
-    /// Objective markers for the minimap: where, icon (`deliverable`...),
-    /// colour (RGBA).
+    /// Objective markers for the minimap: where, icon
+    /// (`HUD_objective_deliverable`...), colour (RGBA). Their icons are
+    /// read for the world's markers too ([`GameHud::paint_texture`]).
     pub blips: Vec<([f32; 3], String, [u8; 4])>,
     /// Where the reticle goes: the screen point her weapon (or her
     /// vehicle's gun) aims at, -1..=1 across and up the screen as
@@ -1037,6 +1038,25 @@ impl GameHud {
     /// triangles smeared: their feathering assumes one winding.)
     pub fn paint(&self, painter: &egui::Painter) {
         self.paint_prims(painter, &self.prims);
+    }
+
+    /// Paints the HUD's texture `name` over `rect` (screen points), tinted
+    /// by `colour`, once the HUD has read it (the objective markers'
+    /// icons, read with the minimap's blips: [`HudState::blips`]). False
+    /// until then, or if the archive has no such texture.
+    pub fn paint_texture(
+        &self,
+        painter: &egui::Painter,
+        name: &str,
+        rect: egui::Rect,
+        colour: Color32,
+    ) -> bool {
+        let Some(Some(texture)) = self.textures.get(&name_hash(name)) else {
+            return false;
+        };
+        let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        painter.image(texture.id(), rect, uv, colour);
+        true
     }
 
     /// Paints what the shell draws under its movie widget (the widgets
@@ -1838,6 +1858,9 @@ impl Thread {
             log.push(format!("screen covers: {covers} of {} prims", prims.len()));
             self.covers_seen = covers;
         }
+        // The objective markers' icons, for the world's markers
+        // ([`GameHud::paint_texture`]) whether or not the minimap is up.
+        want.extend(state.blips.iter().map(|(_, icon, _)| name_hash(icon)));
         let mut images = Vec::new();
         for hash in want {
             if self.tried.insert(hash) {
@@ -3499,7 +3522,7 @@ fn minimap(
             let k = r / dx.hypot(dy).max(1e-3);
             [cx + dx * k, cy + dy * k]
         };
-        let hash = name_hash(&format!("HUD_objective_{}", icon.replace(' ', "_")));
+        let hash = name_hash(icon);
         want.push(hash);
         let s = r * 0.16;
         let c = colour.map(|v| f32::from(v) / 255.0);

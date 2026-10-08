@@ -122,8 +122,8 @@ pub struct MissionView {
     /// The same line with its key tokens (`[pda]`) as the scripts' text
     /// has them, for the game's own tutorial box to draw as glyphs.
     pub game_tutorial: Option<String>,
-    /// Markers over targets: where, what, colour (RGBA).
-    pub markers: Vec<(Vec3, String, [u8; 4])>,
+    /// Markers over targets.
+    pub markers: Vec<MarkerView>,
     /// The newest objective message: completed (or else added), and text.
     pub message: Option<(bool, String)>,
     /// The same message as the scripts sent it, for the game's own HUD to
@@ -145,6 +145,40 @@ pub struct MissionView {
     pub vehicle_disguise: bool,
     /// Her disguise while one holds: how much is left and whether it holds.
     pub disguise: Option<(f32, bool)>,
+}
+
+/// A marker the scripts put over one of their objects (`Marker.AddBlip`),
+/// as the HUD shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkerView {
+    /// Where: its height over its target; over the soldier a spawn target
+    /// placed, where he is now.
+    pub at: Vec3,
+    /// Its texture (`HUD_objective_destroy`).
+    pub icon: String,
+    /// RGBA.
+    pub colour: [u8; 4],
+    /// Shown from `near` to `far` metres away.
+    pub near: f32,
+    pub far: f32,
+    /// Its size as the scripts ask (the call's first size, 32 in the first
+    /// contract's).
+    pub size: f32,
+}
+
+impl MarkerView {
+    /// What the marker asks to be done there (`destroy`, `deliverable`):
+    /// its texture's name without the prefix.
+    pub fn label(&self) -> String {
+        self.icon
+            .trim_start_matches("HUD_objective_")
+            .replace('_', " ")
+    }
+
+    /// Whether it shows to someone at `from`: `near` to `far` metres away.
+    pub fn shown_from(&self, from: Vec3) -> bool {
+        (self.near..=self.far).contains(&self.at.distance(from))
+    }
 }
 
 /// What `FactionZone` last told the HUD (`TrespassStateChange`): whether
@@ -351,6 +385,11 @@ pub struct MissionLink {
     support: Vec<String>,
     /// Seconds she has been on foot ashore without a break.
     ashore_for: f32,
+    /// Where the soldiers stand that markers' spawn targets placed, by
+    /// target: the markers go over them, not over their spawns.
+    marked: HashMap<u32, Vec3>,
+    /// The markers logged, by handle.
+    markers_logged: HashSet<u32>,
 }
 
 /// The scripts' vehicles in play.
@@ -442,6 +481,8 @@ impl MissionLink {
             music: None,
             support: Vec::new(),
             ashore_for: 0.0,
+            marked: HashMap::new(),
+            markers_logged: HashSet::new(),
         }
     }
 
@@ -866,6 +907,7 @@ impl MissionLink {
             if let Some(line) = tutorial(mission) {
                 self.tutorial = line;
             }
+            follow_markers(game, mission, &mut self.marked, &mut self.markers_logged);
             break_props(game, mission);
             let w = mission.world().borrow();
             if let Some(m) = w.hud.messages.last() {
@@ -1218,12 +1260,21 @@ impl MissionLink {
             .markers
             .values()
             .filter_map(|m| {
-                let at = w.objects.get(&m.target?)?.position;
-                let label = m
-                    .icon
-                    .trim_start_matches("HUD_objective_")
-                    .replace('_', " ");
-                Some((Vec3::from(at) + Vec3::Y * m.height, label, m.colour))
+                let g = m.target?;
+                let o = w.objects.get(&g)?;
+                let at = self
+                    .marked
+                    .get(&g)
+                    .copied()
+                    .unwrap_or_else(|| Vec3::from(o.position));
+                Some(MarkerView {
+                    at: at + Vec3::Y * m.height,
+                    icon: m.icon.clone(),
+                    colour: m.colour,
+                    near: m.near,
+                    far: m.far,
+                    size: m.sizes[0],
+                })
             })
             .collect();
         MissionView {
@@ -1458,6 +1509,44 @@ fn go_ashore(game: &mut Game) -> bool {
 /// Whether `guid` is a layer entity that places a person.
 fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
     world.index.spawns.iter().any(|s| s.entity == guid)
+}
+
+/// Where the soldiers stand whom the markers' spawn targets placed (the
+/// first contract's "destroy" markers are on spawns, and the scripts'
+/// world keeps the spawn's place while he moves), by target; and each new
+/// marker logged once, with what the scripts asked of it.
+fn follow_markers(
+    game: &Game,
+    mission: &Mission,
+    marked: &mut HashMap<u32, Vec3>,
+    logged: &mut HashSet<u32>,
+) {
+    let w = mission.world().borrow();
+    marked.clear();
+    for (&handle, m) in &w.hud.markers {
+        let Some(g) = m.target else { continue };
+        if let Some(n) = game.scene.people.npcs.iter().find(|n| n.spawn == Some(g)) {
+            marked.insert(g, n.character.position);
+        }
+        if logged.insert(handle) {
+            eprintln!(
+                "mission: marker {} on {:?} ({g:#x}): colour {:?}, {} m up, shown {}..{} m, sizes {:?}, 2D only {}{}",
+                m.icon,
+                w.objects.get(&g).map_or("?", |o| o.name.as_str()),
+                m.colour,
+                m.height,
+                m.near,
+                m.far,
+                m.sizes,
+                m.flat,
+                if marked.contains_key(&g) {
+                    ", over the soldier it placed"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
 }
 
 /// The scripts' newest tutorial line since the last call, if they asked
@@ -2360,5 +2449,23 @@ mod tests {
         assert_eq!(models("Patrol Boat (VZ)"), [(0x123, "boat".to_owned())]);
         // Without a model in the database, the words find the catalogue's.
         assert_eq!(models("M151 Softtop (GL)"), [(1, "truck".to_owned())]);
+    }
+
+    #[test]
+    fn markers_show_from_near_to_far() {
+        // The first contract's: 2 m over its target, from 5 m to 175 m.
+        let m = MarkerView {
+            at: Vec3::new(0.0, 2.0, 0.0),
+            icon: "HUD_objective_deliverable".into(),
+            colour: [255, 200, 0, 255],
+            near: 5.0,
+            far: 175.0,
+            size: 32.0,
+        };
+        assert_eq!(m.label(), "deliverable");
+        assert!(!m.shown_from(Vec3::new(3.0, 0.0, 0.0)));
+        assert!(m.shown_from(Vec3::new(0.0, 0.0, 20.0)));
+        assert!(m.shown_from(Vec3::new(0.0, 2.0, 175.0)));
+        assert!(!m.shown_from(Vec3::new(0.0, 0.0, 200.0)));
     }
 }
