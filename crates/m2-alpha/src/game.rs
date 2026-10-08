@@ -1176,8 +1176,10 @@ impl Game {
         };
         let can_enter = match (&self.scene.world, player) {
             (Some(w), Some(p)) if p.driving.is_none() && p.landed => {
-                nearest(&w.physics, &self.scene.vehicles, p, REACH)
-                    .map(|i| self.scene.vehicles[i].spec.label.clone())
+                nearest(&w.physics, &self.scene.vehicles, p, REACH).map(|i| {
+                    let spec = &self.scene.vehicles[i].spec;
+                    vehicle_name(&w.index.template_db, &spec.label, spec.model)
+                })
             }
             _ => None,
         };
@@ -2011,6 +2013,27 @@ fn footprint_radius(spec: &m2_engine::VehicleSpec) -> f32 {
     (hi.x - lo.x).hypot(hi.z - lo.z) * 0.5
 }
 
+/// What the use prompt calls a vehicle: its template's name as the
+/// template database writes it (`M151 Softtop (V2)`), of the template its
+/// label names, else of the first sharing its model; its label (a texture
+/// name, `vz_veh_truck_M151`) only if neither is found. The string tables
+/// aren't read for a localised name yet. Each label's name is logged once.
+fn vehicle_name(db: &Templates, label: &str, model: u32) -> String {
+    static NAMED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let name = db
+        .names_for(label, model)
+        .first()
+        .and_then(|n| db.names.get(&db.id(n)?))
+        .cloned();
+    if let Ok(mut named) = NAMED.lock()
+        && !named.iter().any(|l| l == label)
+    {
+        named.push(label.to_owned());
+        eprintln!("vehicle: {label} (model {model:08x}) is named {name:?} to get in");
+    }
+    name.unwrap_or_else(|| label.to_owned())
+}
+
 /// The vehicle nearest her within `reach` metres of its door marker (or its
 /// hull, for those without one).
 fn nearest(
@@ -2094,4 +2117,45 @@ pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player)
     }
     player.driving = None;
     player.chase_target = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use m2_engine::TemplateInfo;
+
+    use super::*;
+
+    #[test]
+    fn the_use_prompt_names_vehicles_by_their_templates() {
+        let info = |model| TemplateInfo {
+            model: Some(model),
+            vehicle: None,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let db = Templates {
+            by_name: HashMap::from([
+                ("m151 softtop (v2)".to_owned(), info(7)),
+                ("amx30".to_owned(), info(9)),
+            ]),
+            names: HashMap::from([
+                (0x8000_0001, "M151 Softtop (V2)".to_owned()),
+                (0x8000_0002, "AMX30".to_owned()),
+            ]),
+            ..Templates::default()
+        };
+        // A template's label, whatever its case.
+        assert_eq!(vehicle_name(&db, "amx30", 9), "AMX30");
+        // A texture's (the play test's `vz_veh_truck_M151`): the template
+        // that shares its model.
+        assert_eq!(
+            vehicle_name(&db, "vz_veh_truck_M151", 7),
+            "M151 Softtop (V2)"
+        );
+        // Neither: as it is.
+        assert_eq!(vehicle_name(&db, "vz_veh_boat", 3), "vz_veh_boat");
+    }
 }
