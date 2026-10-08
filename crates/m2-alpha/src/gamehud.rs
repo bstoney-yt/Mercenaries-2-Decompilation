@@ -1889,7 +1889,7 @@ impl Thread {
         // the keys it waits for itself.
         let mut calls = Vec::new();
         if self.flash.values().any(|m| m.swf == crate::shell::MOVIE) {
-            calls.extend(self.native.start());
+            calls.extend(self.native.calls());
             for &(code, down) in &state.keys {
                 if down {
                     calls.extend(self.native.key(code));
