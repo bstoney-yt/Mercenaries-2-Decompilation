@@ -296,16 +296,25 @@ if w and w.SetText then w:SetText(text) end
 /// and the last press's mark (true a check, false a cross). As the
 /// minigame draws them: a wedge lights while the marker passes through it,
 /// the disc flashes green on a hit and red on a miss, under the check or
-/// cross. With no size the wheel is put away.
+/// cross. With no size the wheel is put away. Answers what it found
+/// ("no overlay", "no minigame", "put away" or "posed") and the overlay's
+/// and the minigame's widget ids, for the log.
 const SATELLITE_WHEEL: &str = r#"
 local size, angle, inside, mark = ...
+local base = rawget(_G, "MrxGuiBase")
+local function id_of(x)
+    for id, o in pairs(base and base.WidgetIdIndex or {}) do
+        if o == x then return id end
+    end
+end
 local w = MrxGui.GetWidgetByNameAndOwner("Satellite overlay", Sys.StringToGuid("0x1"))
-local m = w and w.CustomData.oMinigame
-if not m then return end
+if not w then return "no overlay" end
+local m = w.CustomData.oMinigame
+if not m then return "no minigame", id_of(w) end
 local c = m.CustomData
 if not size or size <= 0 then
     m:SetVisible(false)
-    return
+    return "put away", id_of(w), id_of(m)
 end
 m:SetVisible(true)
 w.CustomData.oReticle:SetVisible(false)
@@ -354,6 +363,7 @@ else
     c.oFeedback:SetTexture(mark and "icon_success" or "icon_fail")
     c.oFeedback:SetTranslucency(255)
 end
+return "posed", id_of(w), id_of(m)
 "#;
 /// The satellite view's help, in the tutorial box as the PC footage has
 /// it (its own `Satellite Help` text stays blank): what the first
@@ -1390,6 +1400,8 @@ struct Thread {
     /// titles and borders are only there, as `<name>_english`).
     language: Option<AssetSource<BufReader<File>>>,
     fonts: BTreeMap<String, Font>,
+    /// Fonts the text widgets name, looked for (read, or found missing).
+    fonts_tried: HashSet<String>,
     /// Textures tried (sent, or found missing).
     tried: HashSet<u32>,
     told: Told,
@@ -1431,8 +1443,13 @@ struct Thread {
     native: crate::shell::Native,
     /// `fscommand`s no script heard, for the engine (the front end's).
     unheard: Vec<(String, String)>,
-    /// Seconds since `M2_SHELL_PROBE` last logged.
+    /// Seconds since `M2_SHELL_PROBE` (or `M2_HUD_PROBE`) last logged.
     probe_time: f64,
+    /// How many natives the scripts called that aren't made, as last
+    /// logged.
+    unknown_seen: usize,
+    /// What posing the timing wheel found, as last logged.
+    wheel_seen: String,
 }
 
 /// The language archive beside `vz.wad` (English only for now).
@@ -1550,6 +1567,7 @@ impl Thread {
             assets,
             language,
             fonts,
+            fonts_tried: HashSet::new(),
             tried: HashSet::new(),
             told: Told::default(),
             fullscreen_seen: String::new(),
@@ -1573,6 +1591,8 @@ impl Thread {
             native: crate::shell::Native::default(),
             unheard: Vec::new(),
             probe_time: 0.0,
+            unknown_seen: 0,
+            wheel_seen: String::new(),
         }
     }
 
@@ -1676,7 +1696,7 @@ impl Thread {
             self.mission.tick(dt);
             gui_runtime::tick(self.mission.lua(), dt);
         }
-        if let Err(e) = self.pose_wheel(state) {
+        if let Err(e) = self.pose_wheel(state, &mut log) {
             log.push(format!("wheel: {e}"));
         }
         // Keys go to the movie that has the controls: the mission's
@@ -1691,6 +1711,17 @@ impl Thread {
         };
         let [w, h] = state.size;
         let items = screen.borrow().draw_list(w, h);
+        self.load_fonts(&items, &mut log);
+        // Natives the scripts call that aren't made (they answer nothing,
+        // or zeros), as more are called.
+        {
+            let s = screen.borrow();
+            if s.unknown().len() != self.unknown_seen {
+                self.unknown_seen = s.unknown().len();
+                let unknown: Vec<&str> = s.unknown().iter().map(String::as_str).collect();
+                log.push(format!("natives not made: {}", unknown.join(", ")));
+            }
+        }
         // The fullscreen widgets drawn (a fanfare and its fade), where in
         // the order and how opaque, when that changes.
         let fullscreen: Vec<String> = {
@@ -1824,12 +1855,35 @@ impl Thread {
                 hidden
             }
         };
+        // The tutorial box with nothing to say is left out, frame and all
+        // (inferred: its line emptied, by either of the paths that write
+        // it, would leave the frame drawn as a bare bar).
+        let mut hidden = hidden;
+        let tutorial = widgets_under(&screen.borrow(), &names, |n| n == "tutorial");
+        if !says_something(&items, &tutorial) {
+            hidden.extend(tutorial);
+        }
         let mut prims = Vec::new();
         let mut want = Vec::new();
         let shown = |i: &&DrawItem| {
             let w = widget_of(i);
             !hidden.contains(&w) && only.as_ref().is_none_or(|o| o.contains(&w))
         };
+        // `M2_HUD_PROBE=x,y` (screen points, as the HUD is drawn): once a
+        // second, what is drawn over that point, and what of it is left
+        // out here.
+        if let Some(at) = probe_point("M2_HUD_PROBE") {
+            self.probe_time += dt;
+            if self.probe_time >= 1.0 {
+                self.probe_time = 0.0;
+                log.push(format!("probe {},{}:", at[0], at[1]));
+                let s = screen.borrow();
+                for item in items.iter().filter(|i| holds(i, at)) {
+                    let left_out = if shown(&item) { "" } else { " (left out)" };
+                    log.push(format!("  {}{left_out}", probe_line(&s, &names, item)));
+                }
+            }
+        }
         if state.support.pda && !scripted {
             if self.pda.is_none() {
                 let started = Instant::now();
@@ -1929,6 +1983,46 @@ impl Thread {
             log,
             callbacks,
             shell: ShellNews::default(),
+        }
+    }
+
+    /// Reads the fonts the text widgets drawn name and the HUD hasn't
+    /// read yet (from the archive, else the language archive), once each:
+    /// text in a font not read isn't drawn. A font read is given to the
+    /// widgets' store too, for their measures. Those missing are logged.
+    fn load_fonts(&mut self, items: &[DrawItem], log: &mut Vec<String>) {
+        for item in items {
+            let DrawItem::Text { font, .. } = item else {
+                continue;
+            };
+            let name = font.to_ascii_lowercase();
+            if name.is_empty()
+                || self.fonts.contains_key(&name)
+                || !self.fonts_tried.insert(name.clone())
+            {
+                continue;
+            }
+            let hash = name_hash(&name);
+            let read = |a: &mut AssetSource<BufReader<File>>| {
+                a.asset(hash, FONT_TYPE)
+                    .map_err(|e| e.to_string())
+                    .and_then(|a| Font::parse(&a).map_err(|e| e.to_string()))
+            };
+            let found = read(&mut self.assets)
+                .or_else(|e| self.language.as_mut().and_then(|l| read(l).ok()).ok_or(e));
+            match found {
+                Ok(f) => {
+                    log.push(format!("font {name}: read for a text widget"));
+                    if let Some(screen) = gui_runtime::screen(self.mission.lua()) {
+                        screen.borrow_mut().set_font(&name, f.clone());
+                    }
+                    self.fonts.insert(name, f);
+                }
+                Err(e) => {
+                    eprintln!("game HUD: font {name}: {e}");
+                    log.push(format!("font {name}: {e}"));
+                }
+            }
         }
     }
 
@@ -2364,6 +2458,9 @@ impl Thread {
                 ))
             });
             log.push(match done {
+                // The tutorial box's: with what it says, as the box has
+                // another writer too (`Net.SetTutorialMessage`, [`TUTORIAL`]).
+                Ok(true) if c.group == "Tutorial" => format!("hud call {name} {:?}", c.data),
                 Ok(true) => format!("hud call {name}"),
                 Ok(false) => format!("hud call {name}: the HUD has no such method"),
                 Err(e) => format!("hud call {name}: {e}"),
@@ -2727,23 +2824,43 @@ impl Thread {
     }
 
     /// Poses the timing wheel's widgets as the play has the wheel, after
-    /// the scripts have stepped (see [`SATELLITE_WHEEL`]).
-    fn pose_wheel(&self, s: &HudState) -> mlua::Result<()> {
+    /// the scripts have stepped (see [`SATELLITE_WHEEL`]). What it found,
+    /// with the overlay's and the minigame's flags, goes in the log as
+    /// that changes: the wheel can be posed and still not drawn.
+    fn pose_wheel(&mut self, s: &HudState, log: &mut Vec<String>) -> mlua::Result<()> {
         if s.support.satellite.is_none() {
             return Ok(());
         }
-        let call = self
-            .mission
-            .lua()
-            .load(SATELLITE_WHEEL)
-            .set_name("=m2-hud wheel");
-        match &s.support.wheel {
-            Some(w) => {
-                let inside = support::sector(w.angle).map(|i| i + 1);
-                call.call::<()>((w.size, w.angle.to_degrees(), inside, w.mark))
-            }
-            None => call.call::<()>(()),
+        let lua = self.mission.lua();
+        let call = lua.load(SATELLITE_WHEEL).set_name("=m2-hud wheel");
+        let (found, overlay, minigame): (Option<String>, Option<u32>, Option<u32>) =
+            match &s.support.wheel {
+                Some(w) => {
+                    let inside = support::sector(w.angle).map(|i| i + 1);
+                    call.call((w.size, w.angle.to_degrees(), inside, w.mark))?
+                }
+                None => call.call(())?,
+            };
+        let flags = |id: Option<u32>| {
+            let screen = gui_runtime::screen(lua)?;
+            let screen = screen.borrow();
+            let w = screen.widget(id?)?;
+            Some(format!(
+                "{} visible {} asleep {} inactive {}",
+                id?, w.visible, w.sleeping, w.inactive
+            ))
+        };
+        let seen = format!(
+            "{}; overlay {}; minigame {}",
+            found.as_deref().unwrap_or("nothing"),
+            flags(overlay).unwrap_or_else(|| "-".to_owned()),
+            flags(minigame).unwrap_or_else(|| "-".to_owned()),
+        );
+        if seen != self.wheel_seen {
+            log.push(format!("wheel: {seen}"));
+            self.wheel_seen = seen;
         }
+        Ok(())
     }
 
     /// The zones the radar's script holds (`tRegions` of the
@@ -2916,6 +3033,87 @@ fn widgets_below(screen: &gui_runtime::Screen, named: impl Fn(u32) -> bool) -> H
             false
         })
         .collect()
+}
+
+/// Whether any of the text `items` of the widgets `held` says something
+/// (not only spaces).
+fn says_something(items: &[DrawItem], held: &HashSet<u32>) -> bool {
+    items.iter().any(|i| {
+        matches!(i, DrawItem::Text { widget, text, .. }
+            if held.contains(widget) && !text.trim().is_empty())
+    })
+}
+
+/// The point a probe's variable (`M2_HUD_PROBE=x,y`) names, if set.
+fn probe_point(var: &str) -> Option<[f32; 2]> {
+    let v = std::env::var(var).ok()?;
+    let (x, y) = v.split_once(',')?;
+    Some([x.trim().parse().ok()?, y.trim().parse().ok()?])
+}
+
+/// A draw item's box (screen points).
+fn rect_of(item: &DrawItem) -> [f32; 4] {
+    match item {
+        DrawItem::Quad { rect, .. }
+        | DrawItem::Fill { rect, .. }
+        | DrawItem::Text { rect, .. }
+        | DrawItem::Flash { rect, .. }
+        | DrawItem::Minimap { rect, .. }
+        | DrawItem::Movie { rect, .. } => *rect,
+    }
+}
+
+/// Whether `item`'s box (unturned) holds the point `at`.
+fn holds(item: &DrawItem, [x, y]: [f32; 2]) -> bool {
+    let r = rect_of(item);
+    (r[0]..=r[2]).contains(&x) && (r[1]..=r[3]).contains(&y)
+}
+
+/// The HUD probe's line for `item`: what it draws (the texture, or the
+/// font and text), its box, and its widget up through the parents, each
+/// by id and name, with the flags that keep it from drawing.
+fn probe_line(
+    screen: &gui_runtime::Screen,
+    names: &BTreeMap<u32, String>,
+    item: &DrawItem,
+) -> String {
+    let what = match item {
+        DrawItem::Quad { texture, .. } => format!("quad {texture}"),
+        DrawItem::Fill { colour, .. } => format!("fill {colour:.2?}"),
+        DrawItem::Text { font, text, .. } => format!("text {font} {text:?}"),
+        DrawItem::Flash { swf, .. } => format!("flash {swf:?}"),
+        DrawItem::Minimap { .. } => "minimap".to_owned(),
+        DrawItem::Movie { file, .. } => format!("movie {file:?}"),
+    };
+    let mut chain = Vec::new();
+    let mut at = Some(widget_of(item));
+    // Up the parents (bounded, should a parent point back down).
+    for _ in 0..64 {
+        let Some(id) = at else { break };
+        let w = screen.widget(id);
+        let name = names
+            .get(&id)
+            .map(String::as_str)
+            .or_else(|| w.map(|w| w.name.as_str()))
+            .unwrap_or_default();
+        let flags = w.map_or_else(
+            || " gone".to_owned(),
+            |w| {
+                [
+                    (!w.visible, " hidden"),
+                    (w.sleeping, " asleep"),
+                    (w.inactive, " inactive"),
+                ]
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, f)| *f)
+                .collect()
+            },
+        );
+        chain.push(format!("{id} {name:?}{flags}"));
+        at = w.and_then(|w| w.parent);
+    }
+    format!("{what} at {:.0?}: {}", rect_of(item), chain.join(" < "))
 }
 
 /// Clip, in the clip, stored, grenades, grenades stored: as
@@ -4470,6 +4668,72 @@ mod tests {
         assert!((filled - disc_area / 2.0).abs() < 2.0, "{filled}");
         // Only the edge through her is stroked: a diameter.
         assert!((area(&out, 1.0) - 100.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn the_tutorial_box_says_something_only_with_words() {
+        let text = |widget, text: &str| DrawItem::Text {
+            widget,
+            font: "english_18".into(),
+            text: text.into(),
+            spans: Vec::new(),
+            rect: [0.0; 4],
+            size: 1.0,
+            colour: [1.0; 4],
+            justification: Anchor::Start,
+        };
+        let held = HashSet::from([1, 2]);
+        let frame = DrawItem::Quad {
+            widget: 1,
+            texture: "frame".into(),
+            uv: [0.0, 0.0, 1.0, 1.0],
+            colour: [1.0; 4],
+            rect: [0.0, 0.0, 10.0, 10.0],
+            rotation: 0.0,
+            pie: None,
+        };
+        // Its frame and an emptied line: nothing.
+        assert!(!says_something(&[frame.clone(), text(2, " ")], &held));
+        // Words elsewhere aren't its.
+        assert!(!says_something(
+            &[frame.clone(), text(3, "Open PDA")],
+            &held
+        ));
+        assert!(says_something(&[frame, text(2, "Open PDA")], &held));
+    }
+
+    #[test]
+    fn the_probe_finds_what_is_over_its_point() {
+        let fill = DrawItem::Fill {
+            widget: 4,
+            colour: [1.0; 4],
+            rect: [10.0, 20.0, 30.0, 40.0],
+        };
+        assert!(holds(&fill, [10.0, 40.0]));
+        assert!(holds(&fill, [20.0, 30.0]));
+        assert!(!holds(&fill, [9.0, 30.0]));
+        assert!(!holds(&fill, [20.0, 41.0]));
+    }
+
+    /// What posing the timing wheel answers, with the HUD's scripts
+    /// standing in: no overlay, then one without its minigame.
+    #[test]
+    fn the_wheel_says_what_it_found() {
+        let lua = Lua::new();
+        lua.load(
+            r#"Sys = { StringToGuid = function() return 1 end }
+            overlay = { CustomData = {} }
+            MrxGuiBase = { WidgetIdIndex = { [7] = overlay } }
+            MrxGui = { GetWidgetByNameAndOwner = function() return found end }"#,
+        )
+        .exec()
+        .unwrap();
+        let pose = || -> (Option<String>, Option<u32>) {
+            lua.load(SATELLITE_WHEEL).call((0.5, 10.0)).unwrap()
+        };
+        assert_eq!(pose(), (Some("no overlay".into()), None));
+        lua.load("found = overlay").exec().unwrap();
+        assert_eq!(pose(), (Some("no minigame".into()), Some(7)));
     }
 }
 
