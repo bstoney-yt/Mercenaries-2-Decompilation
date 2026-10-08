@@ -2147,6 +2147,12 @@ fn front_end_offscreen(
             let screen = ctx.content_rect();
             let painter = ui.painter_at(screen);
             painter.rect_filled(screen, 0.0, egui::Color32::BLACK);
+            // `M2_BACKDROP_TOP`: the backdrop over the menus, to see what
+            // covers it.
+            let top = std::env::var_os("M2_BACKDROP_TOP").is_some();
+            if top {
+                shell.paint(&painter);
+            }
             if let Some((m, [x0, y0, x1, y1])) = &backdrop
                 && let Some((_, rgba)) = &m.frame
                 && picture
@@ -2164,7 +2170,9 @@ fn front_end_offscreen(
                     egui::Color32::WHITE,
                 );
             }
-            shell.paint(&painter);
+            if !top {
+                shell.paint(&painter);
+            }
         });
         if up_at.is_none() && shell.ready() {
             eprintln!("front end: the menus are up after {t:.1} s");
