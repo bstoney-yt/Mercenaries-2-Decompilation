@@ -88,7 +88,7 @@ impl Default for AiProfile {
     /// speaks for.
     fn default() -> Self {
         Self {
-            health: 100.0,
+            health: 75.0,
             aggressive: 0.3,
             offensive: 0.5,
             accuracy: 0.4,
