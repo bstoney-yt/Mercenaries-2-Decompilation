@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytemuck.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true

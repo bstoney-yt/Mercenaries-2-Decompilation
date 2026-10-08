@@ -312,9 +312,11 @@ impl Hud {
         let Some((shapes, mut delta, ppp)) = self.frame.take() else {
             return;
         };
-        let renderer = self
-            .renderer
-            .get_or_insert_with(|| Renderer::new(t.device, t.format, RendererOptions::default()));
+        let renderer = self.renderer.get_or_insert_with(|| {
+            let mut r = Renderer::new(t.device, t.format, RendererOptions::default());
+            crate::multiply::Resources::install(&mut r.callback_resources, t.device, t.format);
+            r
+        });
         for (id, images) in &delta.set {
             for image in images {
                 renderer.update_texture(t.device, t.queue, *id, image);

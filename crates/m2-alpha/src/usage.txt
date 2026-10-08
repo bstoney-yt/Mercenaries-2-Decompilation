@@ -12,6 +12,12 @@ m2-alpha [options]
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured
                          (<out>-movie-<name>.ppm)
+  --front-end            with --screenshot: the front end's own menus,
+                         pictured (<out>-front-<n>.ppm) once up and after
+                         each --shell-key
+  --shell-key <code>     a Flash key code pressed in --front-end (13 Enter,
+                         37/39 left/right, 38/40 up/down, 27 Escape;
+                         0 presses nothing)
   --after-contract <s>   with --mission --autoplay --screenshot: play on
                          this long after the contract is done, logging
                          where she is (Enter pressed every 4 s)

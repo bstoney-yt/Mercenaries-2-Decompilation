@@ -664,6 +664,9 @@ pub struct Triangle {
     pub uv: [[f32; 2]; 3],
     pub colour: [f32; 4],
     pub texture: Option<String>,
+    /// Drawn with the multiply blend mode (its clip's `PlaceObject3`):
+    /// what is under it multiplied by it.
+    pub multiply: bool,
 }
 
 /// A shape's triangles drawn through `matrix` and `colour`, bitmap fills
@@ -727,6 +730,7 @@ pub fn push_clipped(
             uv,
             colour,
             texture,
+            multiply: false,
         }),
         Some(rect) => {
             for (corners, uv) in clip_triangle(corners, uv, rect) {
@@ -735,6 +739,7 @@ pub fn push_clipped(
                     uv,
                     colour,
                     texture: texture.clone(),
+                    multiply: false,
                 });
             }
         }
@@ -757,6 +762,16 @@ fn bounds(tris: &[Triangle]) -> Option<[f32; 4]> {
 
 /// A triangle's three points (corners, or their texture coordinates).
 pub type Corners = [[f32; 2]; 3];
+
+/// Whether `p` is inside the triangle `t` (either winding).
+pub fn inside(p: [f32; 2], t: Corners) -> bool {
+    let side =
+        |a: [f32; 2], b: [f32; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+    let (d1, d2, d3) = (side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0]));
+    let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(neg && pos)
+}
 
 /// The parts of a triangle inside `rect` (x0, y0, x1, y1), with their
 /// texture coordinates, as triangles.

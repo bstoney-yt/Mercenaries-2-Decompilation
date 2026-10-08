@@ -719,6 +719,15 @@ impl Mission {
                 first_lines(&e.to_string())
             ));
         }
+        for (cue, error) in crate::vo::show_subtitles(&self.world, self.host.lua()) {
+            self.log.push(match error {
+                None => format!("  t={now:.1} subtitle {cue}"),
+                Some(e) => format!(
+                    "  t={now:.1} subtitle {cue}: {}",
+                    first_lines(&e.to_string())
+                ),
+            });
+        }
         let ended = crate::vo::update(&self.world, self.host.lua(), now);
         for (cue, error) in ended {
             self.log.push(match error {
@@ -1199,6 +1208,76 @@ impl Mission {
         self.log.push(format!("movie: {name}"));
         self.movie_out = true;
         Some(name)
+    }
+
+    /// Whether the player has subtitles on (`Sys.SubtitlesEnabled`; on
+    /// unless told).
+    pub fn set_subtitles(&mut self, on: bool) {
+        self.world.borrow_mut().subtitles_off = !on;
+    }
+
+    /// The subtitles of the movie [`take_movie`](Self::take_movie) gave,
+    /// if the scripts asked for them (`bSubtitles`) and it has any: its
+    /// `Subtitles_<movie>` script's `SubtitleData`, loaded as
+    /// `MrxGuiCinematic.ShowMovie` loads it.
+    pub fn movie_subtitles(&mut self) -> Option<Vec<crate::subtitles::Line>> {
+        let first = self
+            .host
+            .lua()
+            .globals()
+            .raw_get::<mlua::Table>("__m2_movies")
+            .ok()?
+            .raw_get::<mlua::Table>(1)
+            .ok()?;
+        if !first.raw_get::<bool>("bSubtitles").unwrap_or(false) {
+            return None;
+        }
+        let movie = first.raw_get::<String>("sMovie").ok()?;
+        let script = crate::subtitles::script_name(&movie);
+        let code = r#"
+local name = ...
+local m = __m2_module(name)
+local data = type(m) == "table" and rawget(m, "SubtitleData")
+if type(data) ~= "table" then return nil end
+local out = {}
+for i, e in ipairs(data) do
+    out[i] = { tonumber(e[1]) or 0, tostring(e[2] or ""), tonumber(e[3]), e[4] and true or false }
+end
+return out
+"#;
+        let lines = self
+            .host
+            .lua()
+            .load(code)
+            .set_name("=m2 subtitles")
+            .call::<Option<mlua::Table>>(script.as_str());
+        let lines = match lines {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                self.log.push(format!("subtitles: {script} has none"));
+                return None;
+            }
+            Err(e) => {
+                self.log.push(format!(
+                    "subtitles: {script}: {}",
+                    first_lines(&e.to_string())
+                ));
+                return None;
+            }
+        };
+        let lines: Vec<_> = lines
+            .sequence_values::<mlua::Table>()
+            .flatten()
+            .map(|e| crate::subtitles::Line {
+                time: e.raw_get(1).unwrap_or(0.0),
+                text: e.raw_get(2).unwrap_or_default(),
+                seconds: e.raw_get(3).ok().flatten(),
+                top: e.raw_get(4).unwrap_or(false),
+            })
+            .collect();
+        self.log
+            .push(format!("subtitles: {script}, {} lines", lines.len()));
+        Some(lines)
     }
 
     /// The movie [`take_movie`](Self::take_movie) gave has ended (or was
