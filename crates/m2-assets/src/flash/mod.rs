@@ -664,6 +664,9 @@ pub struct Triangle {
     pub uv: [[f32; 2]; 3],
     pub colour: [f32; 4],
     pub texture: Option<String>,
+    /// Drawn with the multiply blend mode (its clip's `PlaceObject3`):
+    /// what is under it multiplied by it.
+    pub multiply: bool,
 }
 
 /// A shape's triangles drawn through `matrix` and `colour`, bitmap fills
@@ -727,6 +730,7 @@ pub fn push_clipped(
             uv,
             colour,
             texture,
+            multiply: false,
         }),
         Some(rect) => {
             for (corners, uv) in clip_triangle(corners, uv, rect) {
@@ -735,6 +739,7 @@ pub fn push_clipped(
                     uv,
                     colour,
                     texture: texture.clone(),
+                    multiply: false,
                 });
             }
         }
