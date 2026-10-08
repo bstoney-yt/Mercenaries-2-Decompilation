@@ -843,6 +843,16 @@ fn main() -> Result<(), Error> {
                     |p| p.x,
                 )
             }
+            // Every entity with a component of that name, with all its
+            // records (`having:FactionZone`).
+            "having" => layer_entities_with(
+                &mut source,
+                &names,
+                usize::MAX,
+                Some(arg.as_str()),
+                |_, _, _| true,
+                |p| p.x,
+            ),
             "collision" => collision(&mut source, &names, arg),
             "phy2words" => {
                 if world.is_none() {
@@ -5249,6 +5259,19 @@ fn layer_entities<R: Read + Seek>(
     keep: impl Fn(&str, &str, Vec3) -> bool,
     order: impl Fn(Vec3) -> f32,
 ) -> Result<(), Error> {
+    layer_entities_with(source, names, most, None, keep, order)
+}
+
+/// [`layer_entities`], keeping only entities with a record of the named
+/// component, when one is named.
+fn layer_entities_with<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    most: usize,
+    having: Option<&str>,
+    keep: impl Fn(&str, &str, Vec3) -> bool,
+    order: impl Fn(Vec3) -> f32,
+) -> Result<(), Error> {
     let index = source.archive().index();
     let mut blocks: Vec<usize> = index
         .assets()
@@ -5271,9 +5294,21 @@ fn layer_entities<R: Read + Seek>(
             };
             let placements = layer.placements();
             let entity_names = layer.names();
+            let with: Option<std::collections::HashSet<u32>> = having.map(|h| {
+                layer
+                    .components
+                    .iter()
+                    .filter(|c| c.name.eq_ignore_ascii_case(h))
+                    .flat_map(|c| c.records().unwrap_or_default())
+                    .map(|(id, _)| id)
+                    .collect()
+            });
             let mut near: Vec<(f32, u32)> = placements
                 .iter()
                 .filter(|(id, p)| {
+                    if with.as_ref().is_some_and(|w| !w.contains(id)) {
+                        return false;
+                    }
                     let name = entity_names.get(id).copied().unwrap_or("");
                     keep(&layer_name, name, Vec3::from(p.position))
                 })
