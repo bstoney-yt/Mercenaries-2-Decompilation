@@ -5,8 +5,10 @@
 //! `EA`, then `Pandemic`, each to its end; `ShellBootstrap::Init` plays
 //! them letterboxed when `Sys.PlayIntroMovies` says so). The front end's
 //! menus are the shell's Flash screens, which the alpha does not run yet:
-//! in their place the main menu's backdrop movie (`shell_mainmenu`) loops
-//! under a stand-in prompt. Play's movies (`01_AOA_J` before the first
+//! in their place the main menu's backdrop movie loops under a stand-in
+//! prompt, where left and right pick the hero (the shell's own
+//! `shell_mainmenu_<hero>` backdrops, else `shell_mainmenu`) and Enter
+//! starts as them. Play's movies (`01_AOA_J` before the first
 //! contract, `02_AOB_J` after it) come from `WifMissionFlow`'s
 //! `_PlayMovie` through [`MissionLink::take_movie`].
 
@@ -17,6 +19,7 @@ use egui::{Align2, Color32, FontId, Rect, Sense, TextureHandle, TextureOptions, 
 use m2_engine::{Install, Mixer};
 use winit::keyboard::KeyCode;
 
+use crate::hero::Hero;
 use crate::mission::MissionLink;
 use crate::movie::Movie;
 
@@ -48,11 +51,18 @@ pub struct Flow {
     texture: Option<TextureHandle>,
     /// The movie and frame number in the texture.
     shown: Option<(String, u64)>,
+    /// The hero the front end has up.
+    hero: Hero,
+    /// The front end's left or right since the last tick: -1 or 1.
+    step: i32,
+    /// The hero a new game was started as, not yet taken.
+    picked: Option<Hero>,
 }
 
 impl Flow {
-    /// Starts with the boot movies, or (`boot` false) straight in play.
-    pub fn new(install: Install, boot: bool) -> Self {
+    /// Starts with the boot movies, or (`boot` false) straight in play;
+    /// the front end offers `hero` first.
+    pub fn new(install: Install, boot: bool, hero: Hero) -> Self {
         let ffmpeg = crate::movie::ffmpeg();
         match &ffmpeg {
             Some(p) => eprintln!("movies: decoding with {}", p.display()),
@@ -74,6 +84,9 @@ impl Flow {
             pressed: false,
             texture: None,
             shown: None,
+            hero,
+            step: 0,
+            picked: None,
         }
     }
 
@@ -83,8 +96,21 @@ impl Flow {
         self.stage != Stage::Game || self.movie.is_some()
     }
 
-    /// Takes keys for itself (skipping a movie, leaving the front end).
+    /// The hero a new game was started as in the front end, once.
+    pub fn take_pick(&mut self) -> Option<Hero> {
+        self.picked.take()
+    }
+
+    /// Takes keys for itself (skipping a movie, picking the hero, leaving
+    /// the front end).
     pub fn key(&mut self, code: KeyCode) {
+        if self.stage == Stage::FrontEnd {
+            match code {
+                KeyCode::ArrowLeft | KeyCode::KeyA => self.step = -1,
+                KeyCode::ArrowRight | KeyCode::KeyD => self.step = 1,
+                _ => {}
+            }
+        }
         if matches!(
             code,
             KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space | KeyCode::Escape
@@ -111,6 +137,16 @@ impl Flow {
                 eprintln!("movie {name}: {e:#}");
                 false
             }
+        }
+    }
+
+    /// Loops the front end's backdrop for the hero up: theirs, else the
+    /// shared one.
+    fn open_menu(&mut self, mixer: &mut Mixer) {
+        let own = format!("{MENU_MOVIE}_{}", self.hero.name().to_ascii_lowercase());
+        let opened = self.open(&own, mixer) || self.open(MENU_MOVIE, mixer);
+        if opened && let Some(m) = &mut self.movie {
+            m.looping = true;
         }
     }
 
@@ -144,18 +180,25 @@ impl Flow {
                     }
                     self.stage = Stage::FrontEnd;
                     eprintln!("flow: front end");
-                    if self.open(MENU_MOVIE, mixer)
-                        && let Some(m) = &mut self.movie
-                    {
-                        m.looping = true;
-                    }
+                    self.open_menu(mixer);
                 }
             }
             Stage::FrontEnd => {
                 if pressed {
                     self.close(mixer);
                     self.stage = Stage::Game;
-                    eprintln!("flow: new game");
+                    self.picked = Some(self.hero);
+                    eprintln!("flow: new game as {}", self.hero);
+                    return;
+                }
+                let step = std::mem::take(&mut self.step);
+                if step != 0 {
+                    let n = Hero::ALL.len() as i32;
+                    let at = Hero::ALL.iter().position(|&h| h == self.hero).unwrap_or(0) as i32;
+                    self.hero = Hero::ALL[(at + step).rem_euclid(n) as usize];
+                    eprintln!("flow: front end offers {}", self.hero);
+                    self.close(mixer);
+                    self.open_menu(mixer);
                     return;
                 }
                 let over = self
@@ -164,11 +207,7 @@ impl Flow {
                     .is_some_and(|m| m.update(|p| mixer.play(p)));
                 if over {
                     self.close(mixer);
-                    if self.open(MENU_MOVIE, mixer)
-                        && let Some(m) = &mut self.movie
-                    {
-                        m.looping = true;
-                    }
+                    self.open_menu(mixer);
                 }
             }
             Stage::Game => {
@@ -245,11 +284,19 @@ impl Flow {
             }
         }
         if self.stage == Stage::FrontEnd {
+            let size = (screen.height() * 0.035).max(14.0);
+            painter.text(
+                pos2(screen.center().x, screen.bottom() - screen.height() * 0.18),
+                Align2::CENTER_CENTER,
+                format!("<  {}  >", self.hero),
+                FontId::proportional(size * 1.2),
+                Color32::WHITE,
+            );
             painter.text(
                 pos2(screen.center().x, screen.bottom() - screen.height() * 0.12),
                 Align2::CENTER_CENTER,
-                "Press Enter to start",
-                FontId::proportional((screen.height() * 0.035).max(14.0)),
+                "Left/Right to choose, Enter to start",
+                FontId::proportional(size),
                 Color32::from_gray(230),
             );
         }

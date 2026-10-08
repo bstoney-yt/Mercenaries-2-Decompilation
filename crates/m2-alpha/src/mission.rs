@@ -55,9 +55,6 @@ const STEP: f32 = 0.1;
 /// where it is said (`None`: flat).
 pub type ScriptLine = (u32, String, Option<Vec3>);
 
-/// Who the scripts take the player for: Jennifer, whose model and voice
-/// the alpha plays (the scripts pick her replies on the radio by this).
-pub const HERO: &str = "Jennifer";
 /// The grenades' weapon template.
 const GRENADE: &str = "Grenade";
 /// What she throws to mark a support call: the scripts' support manager
@@ -747,7 +744,7 @@ impl MissionLink {
                             "mission: scripts set her health {:.1} -> {health:.1}",
                             game.combat.hp
                         );
-                        game.combat.hp = health.clamp(0.0, 100.0);
+                        game.combat.hp = health.clamp(0.0, game.combat.max_hp);
                     }
                     Command::Music(cue) => self.music = Some(cue.clone()),
                     Command::Invincible { guid, on } if *guid == PLAYER => {
@@ -807,8 +804,9 @@ impl MissionLink {
             .player
             .as_ref()
             .map_or([0.0; 3], |p| p.character.position.to_array());
-        match Mission::new(data, HERO, at) {
+        match Mission::new(data, game.scene.hero.name(), at) {
             Ok(mut mission) => {
+                mission.set_max_health(PLAYER, game.combat.max_hp);
                 mission.fly_deliveries();
                 if let Err(e) = mission.run(RADAR_REGIONS, "radar regions") {
                     self.write([format!("radar regions: {e}")]);

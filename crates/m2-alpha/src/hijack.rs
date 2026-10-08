@@ -221,7 +221,8 @@ impl Hijacks {
     pub fn tick(&mut self, game: &mut Game, input: &mut Input, dt: f32) {
         if let State::Loading(rx) = &self.state {
             match rx.try_recv() {
-                Ok(Ok((data, clips))) => match Mission::new(data, crate::mission::HERO, [0.0; 3]) {
+                Ok(Ok((data, clips))) => match Mission::new(data, game.scene.hero.name(), [0.0; 3])
+                {
                     Ok(mission) => {
                         eprintln!("hijacks: scripts loaded");
                         self.state = State::Ready(Box::new(Loaded { mission, clips }));

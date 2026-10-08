@@ -17,6 +17,7 @@ use m2_engine::audio::{EngineSounds, Falloff, Play, SoundLibrary};
 use m2_engine::{Category, Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
 use crate::combat::{Remark, Sound};
+use crate::hero::Hero;
 use crate::scene::Cue;
 use m2_assets::name_hash;
 use m2_math::glam::Vec3;
@@ -176,7 +177,9 @@ pub struct GameAudio {
     said: (Sender<Spoken>, Receiver<Spoken>),
     /// When each line now playing or decoding ends.
     speaking: Vec<Instant>,
-    /// When Jennifer may speak again.
+    /// Who the player is: whose voice set their remarks come from.
+    pub hero: Hero,
+    /// When the hero may speak again.
     quiet_until: Instant,
     /// Scripted lines playing, by the mission's id for them.
     lines: HashMap<u32, VoiceId>,
@@ -344,11 +347,83 @@ type Spoken = (SoundBuffer, Option<Vec3>, Falloff, f32, Option<u32>);
 pub const VZ_SOLDIERS: [u32; 2] = [0x5078_7bff, 0x467a_aad8];
 pub const CIVILIANS: [u32; 2] = [0x6b0c_3b0b, 0x910e_b574];
 pub const CIVILIAN_WOMEN: [u32; 2] = [0x3a6e_c728, 0xc46b_cecf];
-/// Jennifer's voice set, `vo_jen`.
-pub const JENNIFER: u32 = 0x7f74_6c16;
-/// Her lines for what happens to her, by cue (a line, or a group of
-/// variants to pick from), chosen by reading their subtitles.
-pub fn jennifer_cues(remark: Remark) -> &'static [u32] {
+/// The hero's lines for what happens to them, by cue (a line, or a group
+/// of variants to pick from) in their voice set ([`Hero::voice_set`]),
+/// chosen by reading their subtitles.
+pub fn hero_cues(hero: Hero, remark: Remark) -> &'static [u32] {
+    match hero {
+        Hero::Jennifer => jennifer_cues(remark),
+        Hero::Mattias => mattias_cues(remark),
+        Hero::Chris => chris_cues(remark),
+    }
+}
+
+/// Mattias's, in `vo_mattias` (heroes round 03, by their subtitles).
+fn mattias_cues(remark: Remark) -> &'static [u32] {
+    match remark {
+        // Two pairs about dead Venezuelan troops, two said to anyone.
+        Remark::Kill => &[
+            0xfac0_4d90,
+            0xe4c2_6985,
+            0xdab1_10a6,
+            0xe4bd_ec57,
+            0xe7d3_c09f,
+            0x05d1_b142,
+            0xdfcf_36d9,
+            0xd488_2edc,
+        ],
+        // He has a line for wrecking a vehicle.
+        Remark::Wreck => &[0x1da2_d5ed],
+        // His group of pain grunts, and short lines about being hit.
+        Remark::Hurt => &[
+            0x67f1_8134,
+            0x01d7_f391,
+            0x7fd0_6b26,
+            0xa1d2_df43,
+            0x9fdf_a810,
+            0x89e1_c405,
+            0x27da_6dfa,
+            0x89dd_46d7,
+        ],
+        // No group of his is labelled as death cries; not chosen yet.
+        Remark::Down => &[],
+        Remark::Vehicle => &[0xdf7d_d41a, 0x4185_2a25],
+    }
+}
+
+/// Chris's, in `vo_Chris` (heroes round 03, by their subtitles).
+fn chris_cues(remark: Remark) -> &'static [u32] {
+    match remark {
+        Remark::Kill => &[
+            0x5f13_cf48,
+            0xc916_b4bd,
+            0x6911_a06f,
+            0xbf05_5bde,
+            0x05db_41c3,
+            0xf899_1c61,
+            0x813f_807f,
+            0xedea_2685,
+        ],
+        // No line for wrecking a vehicle: a kill line said to anyone.
+        Remark::Wreck => &[0xedea_2685],
+        Remark::Hurt => &[
+            0x2707_1f3c,
+            0x8598_39a3,
+            0xb5c0_ed36,
+            0x37c8_75a1,
+            0xbdc5_76fc,
+            0x3fcc_ff67,
+            0x1dca_8b4a,
+            0xbfd2_4615,
+        ],
+        // His group of death cries.
+        Remark::Down => &[0x5650_1137],
+        Remark::Vehicle => &[0x151f_3354, 0x9524_7a02],
+    }
+}
+
+/// Jennifer's, in `vo_Jen`.
+fn jennifer_cues(remark: Remark) -> &'static [u32] {
     match remark {
         // Two about dead Venezuelan troops (everyone she fights here) and
         // two said to anyone.
@@ -783,6 +858,7 @@ impl GameAudio {
             ui_playing: HashMap::new(),
             hushed: HashSet::new(),
             speaking: Vec::new(),
+            hero: Hero::default(),
             quiet_until: Instant::now(),
             clip_sounds: None,
             clip_sounds_loading: install.map(|install| {
@@ -982,8 +1058,8 @@ impl GameAudio {
         self.speak(voices, line.stream, at, falloff, line.volume, None);
     }
 
-    /// Jennifer says something about `remark`, now and then: a cue from
-    /// [`jennifer_cues`] (one of a group's variants), flat, as her own.
+    /// The hero says something about `remark`, now and then: a cue from
+    /// [`hero_cues`] (one of a group's variants), flat, as their own.
     pub fn remark(&mut self, remark: Remark) {
         let now = Instant::now();
         // Going down cuts in; anything else waits its turn.
@@ -995,10 +1071,10 @@ impl GameAudio {
         let Some(voices) = self.voices.clone() else {
             return;
         };
-        let Some(table) = voices.set(JENNIFER) else {
+        let Some(table) = voices.set(self.hero.voice_set()) else {
             return;
         };
-        let streams: Vec<(u32, f32)> = jennifer_cues(remark)
+        let streams: Vec<(u32, f32)> = hero_cues(self.hero, remark)
             .iter()
             .filter_map(|&cue| {
                 let volume = table
@@ -1022,7 +1098,7 @@ impl GameAudio {
             .get(stream as usize)
             .map_or(0.0, |s| s.seconds());
         self.quiet_until = now + Duration::from_secs_f32(seconds + REMARK_GAP);
-        eprintln!("voice: Jennifer, {remark:?}, stream {stream}");
+        eprintln!("voice: {}, {remark:?}, stream {stream}", self.hero);
         self.speak(voices, stream, None, Falloff::default(), volume, None);
     }
 

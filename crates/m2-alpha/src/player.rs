@@ -18,6 +18,9 @@ const CHASE_HOLD: f32 = 1.5;
 const WALK: f32 = 1.4;
 const RUN: f32 = 5.0;
 const SPRINT: f32 = 7.2;
+/// Jennifer's walk, run and sprint; another hero's are these scaled by
+/// their template's speeds against hers ([`Player::hero_speeds`]).
+pub const SPEEDS: [f32; 3] = [WALK, RUN, SPRINT];
 /// Take-off speed of a jump, m/s (about 0.8 m high).
 const JUMP: f32 = 4.0;
 /// Seconds after take-off before touching the ground counts as landing.
@@ -216,6 +219,8 @@ pub struct Player {
     pub aiming: bool,
     /// Her rifle, jump, throw and fall clips.
     pub clips: FightClips,
+    /// Walking, running and sprinting speeds, m/s.
+    pub speeds: [f32; 3],
     /// In a jump, until she has landed.
     leap: Leap,
     /// Seconds into a grenade throw, while she throws.
@@ -251,6 +256,7 @@ impl Player {
             driving: None,
             aiming: false,
             clips: FightClips::default(),
+            speeds: SPEEDS,
             leap: Leap::No,
             throwing: None,
             bashing: None,
@@ -258,6 +264,18 @@ impl Player {
             down: false,
             seated: false,
         }
+    }
+
+    /// The speeds of a hero whose template gives `theirs` (walk, run,
+    /// sprint) where Jennifer's gives `hers`: hers scaled by each ratio.
+    pub fn hero_speeds(theirs: [f32; 3], hers: [f32; 3]) -> [f32; 3] {
+        let mut out = SPEEDS;
+        for ((o, t), h) in out.iter_mut().zip(theirs).zip(hers) {
+            if h > 0.0 {
+                *o *= t / h;
+            }
+        }
+        out
     }
 
     /// Starts throwing a grenade, if she has a throw to play and isn't
@@ -344,12 +362,13 @@ impl Player {
         // Right-handed, +y up: right is forward turned clockwise from above.
         let right = Vec3::new(-c, 0.0, s);
         let direction = forward * intent.movement.y + right * intent.movement.x;
+        let [walk, run, sprint] = self.speeds;
         let speed = if intent.walk {
-            WALK
+            walk
         } else if intent.sprint {
-            SPRINT
+            sprint
         } else {
-            RUN
+            run
         };
         // Bashing, she stands.
         let bashing = self.bashing.is_some();
