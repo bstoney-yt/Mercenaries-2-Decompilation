@@ -104,6 +104,7 @@ fn draw(vb: VertexBufferHandle, ib: IndexBufferHandle, material: u32, world: Mat
         world,
         skin: None,
         instances: None,
+        uv_offset: [0.0; 2],
     }
 }
 
@@ -152,13 +153,24 @@ fn draws_a_textured_unlit_quad() {
     b.draw(&draw(vb, ib, 1, Mat4::IDENTITY)).unwrap();
     b.end_frame().unwrap();
     let rgba = b.read_pixels().unwrap();
-    // Texture v runs down the screen, as in Direct3D.
-    assert_eq!(pixel(&rgba, 24, 24), [255, 0, 0, 255], "top left");
-    assert_eq!(pixel(&rgba, 40, 24), [0, 255, 0, 255], "top right");
-    assert_eq!(pixel(&rgba, 24, 40), [255, 255, 255, 255], "bottom left");
-    assert_eq!(pixel(&rgba, 40, 40), [0, 0, 0, 255], "bottom right");
+    // Texture v runs down the screen, as in Direct3D. The world is
+    // right-handed: looking along +z, +x is to the left.
+    assert_eq!(pixel(&rgba, 40, 24), [255, 0, 0, 255], "u 0, top");
+    assert_eq!(pixel(&rgba, 24, 24), [0, 255, 0, 255], "u 1, top");
+    assert_eq!(pixel(&rgba, 40, 40), [255, 255, 255, 255], "u 0, bottom");
+    assert_eq!(pixel(&rgba, 24, 40), [0, 0, 0, 255], "u 1, bottom");
     assert_eq!(pixel(&rgba, 2, 2), [0, 0, 255, 255], "sky outside");
     assert_eq!(b.live_buffers().texture, 1);
+    // Scrolled half way along u, the quadrants swap sides.
+    b.begin_frame(&view()).unwrap();
+    b.draw(&DrawCall {
+        uv_offset: [0.5, 0.0],
+        ..draw(vb, ib, 1, Mat4::IDENTITY)
+    })
+    .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    assert_eq!(pixel(&rgba, 40, 24), [0, 255, 0, 255], "scrolled u 0, top");
 }
 
 #[test]
@@ -316,7 +328,7 @@ fn skinned_vertices_follow_their_bones() {
     let rgba = b.read_pixels().unwrap();
     assert_eq!(pixel(&rgba, 32, 32), red, "bind pose");
 
-    // Bone 1 moves the quad right.
+    // Bone 1 moves the quad along +x: left, looking along +z.
     b.begin_frame(&view()).unwrap();
     let skin = b
         .set_skin(&[
@@ -332,7 +344,7 @@ fn skinned_vertices_follow_their_bones() {
     b.end_frame().unwrap();
     let rgba = b.read_pixels().unwrap();
     assert_eq!(pixel(&rgba, 32, 32), sky, "moved away");
-    assert_eq!(pixel(&rgba, 43, 32), red, "moved right");
+    assert_eq!(pixel(&rgba, 20, 32), red, "moved left");
 
     // A palette lasts one frame.
     b.begin_frame(&view()).unwrap();
@@ -367,6 +379,7 @@ fn instanced_draws_repeat_the_geometry() {
         .unwrap();
     b.draw(&DrawCall {
         instances: Some(instances),
+        uv_offset: [0.0; 2],
         ..draw(vb, ib, 1, Mat4::IDENTITY)
     })
     .unwrap();
@@ -496,4 +509,229 @@ fn overlays_draw_over_the_finished_world() {
     let pixels = backend.read_pixels().unwrap();
     let sky = &pixels[..4];
     assert!(sky[2] > sky[0], "{sky:?}");
+}
+
+#[test]
+fn objects_shadow_what_the_sun_lights_behind_them() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(MaterialId(1), &MaterialDesc::default())
+        .unwrap();
+    // A cut-out caster runs the shadow fragment stage.
+    b.set_material(
+        MaterialId(2),
+        &MaterialDesc {
+            blend: BlendMode::Masked { cutoff: 0.5 },
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    let mut v = View::perspective(
+        Vec3::new(0.0, 6.0, -6.0),
+        Vec3::new(0.0, -1.0, 1.0),
+        60f32.to_radians(),
+        1.0,
+        0.1,
+        100.0,
+    );
+    // Sunlight slanting down along +x: the slab 2 m up shades the ground
+    // around x = 2, not around x = -2.
+    v.lighting.sun_direction = Vec3::new(1.0, -1.0, 0.0);
+    let up = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let ground = Mat4::from_scale(Vec3::splat(10.0)) * up;
+    let slab = Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0)) * up;
+    let at = |p: Vec3| {
+        let c = (v.projection * v.view).project_point3(p);
+        (
+            ((c.x * 0.5 + 0.5) * SIZE as f32) as u32,
+            ((0.5 - c.y * 0.5) * SIZE as f32) as u32,
+        )
+    };
+    let frame = |b: &mut WgpuBackend, v: &View, slab_material| {
+        b.begin_frame(v).unwrap();
+        b.draw(&draw(vb, ib, 1, ground)).unwrap();
+        b.draw(&draw(vb, ib, slab_material, slab)).unwrap();
+        b.end_frame().unwrap();
+        b.read_pixels().unwrap()
+    };
+    let (s, l) = (at(Vec3::new(2.0, 0.0, 0.0)), at(Vec3::new(-2.0, 0.0, 0.0)));
+    for slab_material in [1, 2] {
+        let rgba = frame(&mut b, &v, slab_material);
+        let (shaded, lit) = (pixel(&rgba, s.0, s.1)[0], pixel(&rgba, l.0, l.1)[0]);
+        assert!(
+            shaded + 40 < lit,
+            "material {slab_material}: shaded {shaded}, lit {lit}"
+        );
+    }
+    // Without shadows both sides match.
+    v.lighting.shadow_distance = 0.0;
+    let rgba = frame(&mut b, &v, 1);
+    let (s, l) = (pixel(&rgba, s.0, s.1)[0], pixel(&rgba, l.0, l.1)[0]);
+    assert!(s.abs_diff(l) <= 2, "unshadowed {s}, {l}");
+}
+
+#[test]
+fn exposure_grade_and_bloom_finish_the_frame() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            lit: false,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    let mut v = view();
+    v.lighting.sky_color = Vec3::splat(0.25);
+    let mut frame = |v: &View| {
+        b.begin_frame(v).unwrap();
+        b.draw(&draw(vb, ib, 1, Mat4::IDENTITY)).unwrap();
+        b.end_frame().unwrap();
+        b.read_pixels().unwrap()
+    };
+    // Linear 0.25 is 137 in sRGB; twice the exposure is linear 0.5, 188.
+    let plain = frame(&v);
+    assert_eq!(pixel(&plain, 2, 2)[..3], [137, 137, 137]);
+    v.lighting.exposure = 2.0;
+    v.lighting.grade = Vec3::new(1.0, 0.5, 0.0);
+    let graded = pixel(&frame(&v), 2, 2);
+    // Within one step: the world target is half precision.
+    for (got, want) in graded.iter().zip([188u8, 137, 0]) {
+        assert!(got.abs_diff(want) <= 1, "{graded:?}");
+    }
+    // A white quad on black glows past its edges (the quad starts near
+    // x = 14).
+    v.lighting.sky_color = Vec3::ZERO;
+    v.lighting.exposure = 1.0;
+    v.lighting.grade = Vec3::ONE;
+    assert_eq!(pixel(&frame(&v), 8, 32)[..3], [0, 0, 0]);
+    v.lighting.bloom = 1.0;
+    v.lighting.bloom_threshold = 0.5;
+    let glow = frame(&v);
+    assert!(pixel(&glow, 8, 32)[0] > 20, "{:?}", pixel(&glow, 8, 32));
+    assert_eq!(pixel(&glow, 32, 32)[..3], [255, 255, 255]);
+}
+
+#[test]
+fn hazy_skies_pale_towards_the_horizon() {
+    let Some(mut b) = backend() else { return };
+    let mut v = View::perspective(
+        Vec3::ZERO,
+        Vec3::new(0.0, 1.0, 1.0),
+        90f32.to_radians(),
+        1.0,
+        0.1,
+        100.0,
+    );
+    // The outdoor atmosphere's multipliers on standard air.
+    v.lighting.sun_direction = Vec3::new(0.0, -0.5, 1.0);
+    v.lighting.haze = Haze {
+        rayleigh: Vec3::new(6.95e-6, 1.18e-5, 2.44e-5),
+        mie: Vec3::new(5.75e-5, 7.39e-5, 1.045e-4),
+        g: 0.805,
+        inscattering: 15.0,
+        ..Haze::default()
+    };
+    b.begin_frame(&v).unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    // Top row looks straight up, the bottom row along the horizon.
+    let (up, horizon) = (pixel(&rgba, 32, 1), pixel(&rgba, 32, SIZE - 2));
+    eprintln!("up {up:?}, horizon {horizon:?}");
+    assert!(up[2] > up[0], "blue overhead: {up:?}");
+    let sum = |p: [u8; 4]| p[..3].iter().map(|&c| u32::from(c)).sum::<u32>();
+    assert!(sum(horizon) > sum(up), "{horizon:?} vs {up:?}");
+    // Dense noise over most of the sky clouds it over, whiter overhead.
+    let noise = b
+        .create_texture(
+            &TextureDesc {
+                width: 4,
+                height: 4,
+                format: TextureFormat::Rgba8Unorm,
+            },
+            &[&[255; 64]],
+        )
+        .unwrap();
+    v.lighting.clouds = Clouds {
+        noise: Some(noise),
+        coverage: 0.8,
+        ..Clouds::default()
+    };
+    b.begin_frame(&v).unwrap();
+    b.end_frame().unwrap();
+    let cloudy = pixel(&b.read_pixels().unwrap(), 32, 1);
+    eprintln!("cloudy {cloudy:?}");
+    assert!(
+        sum(cloudy) > sum(up) + 60 && cloudy[2] - cloudy[0] < up[2] - up[0],
+        "{cloudy:?} vs {up:?}"
+    );
+}
+
+#[test]
+fn shallow_water_shows_the_bed_beneath() {
+    let Some(mut b) = backend() else { return };
+    let (vb, ib) = quad(&mut b);
+    b.set_material(
+        MaterialId(1),
+        &MaterialDesc {
+            color: [1.0, 0.0, 0.0, 1.0],
+            lit: false,
+            double_sided: true,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    b.set_material(
+        MaterialId(2),
+        &MaterialDesc {
+            color: [0.05, 0.22, 0.30, 0.85],
+            blend: BlendMode::Translucent,
+            double_sided: true,
+            water: true,
+            ..MaterialDesc::default()
+        },
+    )
+    .unwrap();
+    let v = View::perspective(
+        Vec3::new(0.0, 10.0, 0.0),
+        Vec3::new(0.0, -1.0, 0.001),
+        90f32.to_radians(),
+        1.0,
+        0.1,
+        100.0,
+    );
+    let up = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let at = |p: Vec3| {
+        let c = (v.projection * v.view).project_point3(p);
+        (
+            ((c.x * 0.5 + 0.5) * SIZE as f32) as u32,
+            ((0.5 - c.y * 0.5) * SIZE as f32) as u32,
+        )
+    };
+    // Deeper than the shore's foam.
+    let (shallow, deep) = (Vec3::new(4.0, -3.5, 0.0), Vec3::new(-4.0, -30.0, 0.0));
+    b.begin_frame(&v).unwrap();
+    b.draw(&draw(
+        vb,
+        ib,
+        1,
+        Mat4::from_translation(shallow) * Mat4::from_scale(Vec3::splat(3.0)) * up,
+    ))
+    .unwrap();
+    b.draw(&draw(
+        vb,
+        ib,
+        1,
+        Mat4::from_translation(deep) * Mat4::from_scale(Vec3::splat(20.0)) * up,
+    ))
+    .unwrap();
+    b.draw(&draw(vb, ib, 2, Mat4::from_scale(Vec3::splat(50.0)) * up))
+        .unwrap();
+    b.end_frame().unwrap();
+    let rgba = b.read_pixels().unwrap();
+    let (s, d) = (at(Vec3::new(4.0, 0.0, 0.0)), at(Vec3::new(-4.0, 0.0, 0.0)));
+    let (s, d) = (pixel(&rgba, s.0, s.1), pixel(&rgba, d.0, d.1));
+    eprintln!("shallow {s:?}, deep {d:?}");
+    assert!(s[0] > s[1] && s[0] > d[0] + 40, "shallow {s:?}, deep {d:?}");
 }

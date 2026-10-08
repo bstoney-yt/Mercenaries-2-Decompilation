@@ -153,7 +153,11 @@ pub struct TerrainRange {
 /// A group of strips sharing one vertex buffer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerrainGroup<'a> {
-    /// The 9 unknown words after the range counts (terrain cells only).
+    /// The 9 words after the range counts (terrain cells only): three per
+    /// level of detail, finest first. Per level: its number of material
+    /// ranges; its first material range (low 16 bits; the high 16 bits end
+    /// its terrain-shader ranges); its full ranges (count in the low 16
+    /// bits, first in the high). See [`lod_ranges`](Self::lod_ranges).
     pub unk_info: Vec<u32>,
     pub material_ranges: Vec<TerrainRange>,
     /// Ranges drawing the group with no particular material.
@@ -173,6 +177,31 @@ impl TerrainGroup<'_> {
             .into_iter()
             .map(|p| [p[0], p[1], p[2]])
             .collect()
+    }
+
+    /// The material ranges drawn at level of detail `lod` (0 the finest).
+    ///
+    /// A cell group stores every level's ranges one after another: the
+    /// finest level lays the ground with the layered terrain shaders, the
+    /// coarser ones cover the same ground again with fewer, plain
+    /// colour-map triangles; pieces laid into the ground (roads) repeat
+    /// theirs per level. Groups whose level words do not account for every
+    /// range (and tiles, which have none) have one level holding them all.
+    pub fn lod_ranges(&self, lod: usize) -> &[TerrainRange] {
+        let all = &self.material_ranges[..];
+        let one = if lod == 0 { all } else { &all[..0] };
+        let Some(info) = self.unk_info.get(..9) else {
+            return one;
+        };
+        let counts: Vec<usize> = (0..3).map(|l| info[l * 3] as usize).collect();
+        if counts.iter().sum::<usize>() != all.len() {
+            return one;
+        }
+        let Some(&count) = counts.get(lod) else {
+            return &all[..0];
+        };
+        let first = (info[lod * 3 + 1] & 0xFFFF) as usize;
+        all.get(first..first + count).unwrap_or(one)
     }
 
     /// A range's triangles, Direct3D winding (clockwise front faces).
@@ -596,17 +625,26 @@ mod tests {
     }
 
     fn patch(offset: [f32; 3]) -> UcfxNode {
+        let mut ranges = range(0x11, 0, 2, 0, 3);
+        ranges.extend(range(0x22, 0, 2, 0, 3));
+        patch_with(offset, [1, 1], [0; 9], ranges)
+    }
+
+    fn patch_with(
+        offset: [f32; 3],
+        counts: [u32; 2],
+        levels: [u32; 9],
+        ranges: Vec<u8>,
+    ) -> UcfxNode {
         let mut info = le(&[1]);
         info.extend(floats(&[
             0.0, 0.0, 0.0, 70.0, -50.0, 0.0, -50.0, 50.0, 5.0, 50.0,
         ]));
         let mut prmg = vec![UcfxNode::Leaf(*b"INFO", {
-            let mut i = le(&[1, 1]);
-            i.extend(le(&[0; 9]));
+            let mut i = le(&counts);
+            i.extend(le(&levels));
             i
         })];
-        let mut ranges = range(0x11, 0, 2, 0, 3);
-        ranges.extend(range(0x22, 0, 2, 0, 3));
         prmg.extend(group_parts(ranges));
         UcfxNode::Container(
             *b"GEOM",
@@ -671,6 +709,56 @@ mod tests {
         assert_eq!(g.material_ranges[0].vertex_count, 4);
         assert_eq!(g.positions()[3], [10.0, 3.0, 10.0]);
         assert_eq!(g.triangles(&g.material_ranges[0]), [[0, 1, 2], [2, 1, 3]]);
+    }
+
+    #[test]
+    fn splits_ranges_by_level_of_detail() {
+        // Two finest-level ranges, one coarse, one coarsest, then 3 full.
+        let mut ranges = Vec::new();
+        for shader in 0..7 {
+            ranges.extend(range(shader, 0, 2, 0, 3));
+        }
+        let levels = [
+            2,
+            0x0002_0000,
+            1,
+            1,
+            0x0003_0002,
+            0x0001_0001,
+            1,
+            0x0004_0003,
+            0x0002_0001,
+        ];
+        let mut info = floats(&[-200.0, -10.0, -200.0, 200.0, 50.0, 200.0]);
+        info.extend(le(&[2, 1]));
+        let a = ucfx(&[
+            UcfxNode::Leaf(*b"INFO", info),
+            UcfxNode::Leaf(*b"MTRL", {
+                let mut m = material(0x11);
+                m.extend(material(0x22));
+                m.extend(floats(&[0.0; 128]));
+                m
+            }),
+            patch_with([0.0; 3], [4, 3], levels, ranges),
+        ]);
+        let c = TerrainCell::parse(&a).unwrap();
+        let g = &c.patches[0].groups[0];
+        let shaders = |lod| {
+            g.lod_ranges(lod)
+                .iter()
+                .map(|r| r.shader_hash)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shaders(0), [0, 1]);
+        assert_eq!(shaders(1), [2]);
+        assert_eq!(shaders(2), [3]);
+        assert!(shaders(3).is_empty());
+        // Words that miss ranges: one level with everything.
+        let b = cell();
+        let p = TerrainCell::parse(&b).unwrap();
+        let g = &p.patches[0].groups[0];
+        assert_eq!(g.lod_ranges(0).len(), 1);
+        assert!(g.lod_ranges(1).is_empty());
     }
 
     #[test]

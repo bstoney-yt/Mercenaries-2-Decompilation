@@ -2,8 +2,8 @@
 //! running over a world built from its entity layers, as the headless
 //! `mission` example and m2-alpha both run them.
 //!
-//! [`GameData::read`] collects the scripts, the layers' named entities and
-//! the region shapes from `vz.wad`. [`Mission::new`] loads every module
+//! [`GameData::read`] collects the scripts, the layers' named entities,
+//! the region shapes and the English strings from `vz.wad`. [`Mission::new`] loads every module
 //! and entry script and sets the modules up; [`Mission::start`] then starts
 //! play as the engine does (the bootstrap's `Init`, which starts a new game,
 //! then its "GUI loaded" step), and [`Mission::tick`] advances it. Layer
@@ -16,20 +16,176 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
-use m2_assets::layer::LAYER_TYPE;
+use m2_assets::layer::{Component, LAYER_TYPE, TEMPLATE_DB_TYPE};
 use m2_assets::lua::{Chunk, SCRIPT_TYPE};
 use m2_assets::region::REGION_TYPE;
-use m2_assets::{BlockContents, Layer, Region, WadArchive, WadError};
+use m2_assets::strings::STRINGS_TYPE;
+use m2_assets::{BlockContents, Layer, Region, StringTable, WadArchive, WadError, name_hash};
 use mlua::Function;
 
 use crate::api::{self, Command, Object, ScriptWorld, Shared};
 use crate::events::Events;
+use crate::hud::render;
 use crate::layers::{LayerOp, LayerState, finished, layer_name};
 use crate::library::{KNOWN_MODULES, LOADERS, Library};
 use crate::script::{ScriptError, ScriptHost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
 pub const BOOTSTRAP: u32 = 0xb442_0059;
+/// Activates the player's character as the engine does its object
+/// scripts: the hero module's `OnActivate` (healing, the survival
+/// system's one rescue, her inventory), which goes on once she is awake.
+const HERO_ACTIVATE: &str = "Hero.OnActivate(Player.GetCharacter(1))";
+
+/// The scripts' free support items (`MrxSupportData.AddFreebie`, as the
+/// first contract gives its Satellite Guided Bomb) reach the game too:
+/// each call goes on as it would, and the game hears of it
+/// ([`Command::Freebie`], [`Command::RemoveFreebie`]).
+const FOLLOW_FREEBIES: &str = r#"
+local data, ears = MrxSupportData, __m2_support
+if type(data) ~= "table" or type(data.AddFreebie) ~= "function" then
+    return false
+end
+local add, remove = data.AddFreebie, data.RemoveFreebie
+data.AddFreebie = function(...)
+    ears.AddFreebie(...)
+    return add(...)
+end
+data.RemoveFreebie = function(...)
+    ears.RemoveFreebie(...)
+    if type(remove) == "function" then return remove(...) end
+end
+return true
+"#;
+
+/// The flow's full-screen movies (`_PlayMovie{sMovie = "01_AOA_J",
+/// fCallback = ...}`, as `WifMissionFlow` plays the contracts' intro and
+/// closing movies) wait for the game instead of ending at once: each
+/// request is queued in `__m2_movies` for [`Mission::take_movie`], and
+/// [`Mission::movie_done`] then runs its callback as the script's own
+/// skip path does (`MrxUtil.CallWithOptionalArgs(fCallback,
+/// tCallbackData)`).
+const HOLD_MOVIES: &str = r#"
+__m2_movies = {}
+local held = 0
+local function hold(owner)
+    local play = rawget(owner, "_PlayMovie")
+    if type(play) ~= "function" then
+        return
+    end
+    rawset(owner, "_PlayMovie", function(t)
+        if type(t) == "table" and type(t.sMovie) == "string" then
+            table.insert(__m2_movies, t)
+        else
+            return play(t)
+        end
+    end)
+    held = held + 1
+end
+-- A module's `_PlayMovie` lives in its own table (`WifMissionFlow`),
+-- which its functions read it from.
+hold(_G)
+for _, v in pairs(_G) do
+    if type(v) == "table" and v ~= _G then
+        hold(v)
+    end
+end
+return held
+"#;
+
+/// The screen fade `MrxGui` runs through its own Flash widget
+/// (`GlobalFadeToBlack(fCallback, data)`: the `loadingscreen_standalone`
+/// movie wipes to black, its `wipeComplete` command runs
+/// `_FinishFadeToBlack`, and the next GUI update the callbacks queued, as
+/// the teleport after the first contract's closing movie;
+/// `GlobalFadeFromBlack` asks the movie to `fadeOut`, whose `close` command
+/// runs `_FinishFadeFromBlack`). There is no Flash in the mission's state,
+/// so this stands in for the movie: it loads at once and each wipe takes
+/// [`FADE_WIPE`] seconds. Returns how black the screen is, 0 to 1.
+const FADE: &str = r#"
+local dt, wipe = ...
+local m = __m2_fade_module
+if m == nil then
+    for _, t in pairs(_G) do
+        if type(t) == "table" and type(rawget(t, "_CompleteFadeFlashLoad")) == "function"
+            and type(rawget(t, "_FinishFadeToBlack")) == "function" then
+            m = t
+            break
+        end
+    end
+    if m == nil then return 0 end
+    __m2_fade_module = m
+    local from = rawget(m, "GlobalFadeFromBlack")
+    if type(from) == "function" then
+        rawset(m, "GlobalFadeFromBlack", function(...)
+            local was = rawget(m, "_bCurrentlyFadedIn") or rawget(m, "_bCurrentlyFadingIn")
+            local r = from(...)
+            if was and not rawget(m, "_bCurrentlyFadedIn") then __m2_fade.out = 0 end
+            return r
+        end)
+    end
+end
+__m2_fade = __m2_fade or {}
+local s = __m2_fade
+local w = rawget(m, "_oFadeFlash")
+if type(w) ~= "table" or type(w.CustomData) ~= "table" then return 0 end
+local c = w.CustomData
+if c.bLoading and not c.bLoaded then m._CompleteFadeFlashLoad() end
+if s.update then
+    s.update = nil
+    m._FadeUpdate(w)
+end
+if rawget(m, "_bCurrentlyFadingIn") then
+    -- A new fade to black takes over from a fade back that hadn't ended
+    -- (the movie restarts its wipe).
+    s.out = nil
+    s.t = (s.t or 0) + dt
+    if s.t >= wipe then
+        s.t = nil
+        m._FinishFadeToBlack(w)
+        s.update = true
+        return 1
+    end
+    return s.t / wipe
+end
+s.t = nil
+if s.out then
+    s.out = s.out + dt
+    if s.out >= wipe then
+        s.out = nil
+        if not rawget(m, "_bCurrentlyFadedIn") then m._FinishFadeFromBlack(w) end
+        return 0
+    end
+    return 1 - s.out / wipe
+end
+if rawget(m, "_bCurrentlyFadedIn") then return 1 end
+return 0
+"#;
+
+/// Seconds the fade's wipe takes (inferred: the movie's own length is not
+/// read yet).
+const FADE_WIPE: f64 = 1.0;
+
+/// Skip mode (which [`Mission::start`] turns on so the intro movies end
+/// at once) also has `MrxUtil.TeleportHeroesToLocations` skip the
+/// teleport and only call back: with the movies held for the game, the
+/// teleports happen as without it (after the first contract's closing
+/// movie, to `PmcCon001_Start1`).
+const TELEPORTS: &str = r#"
+local util = rawget(_G, "MrxUtil")
+local cheat = rawget(_G, "MrxCheatBootstrap")
+if type(util) ~= "table" or type(cheat) ~= "table" then return false end
+local tele = rawget(util, "TeleportHeroesToLocations")
+if type(tele) ~= "function" then return false end
+rawset(util, "TeleportHeroesToLocations", function(...)
+    local skip = cheat.IsSkipModeEnabled
+    cheat.IsSkipModeEnabled = function() return false end
+    local ok, err = pcall(tele, ...)
+    cheat.IsSkipModeEnabled = skip
+    if not ok then error(err, 0) end
+end)
+return true
+"#;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MissionError {
@@ -51,6 +207,13 @@ pub struct Entity {
     pub yaw: f32,
     /// The outline of a region entity (`LineRegion`).
     pub region: Option<Region>,
+    /// Its labels' name hashes: its template's and its own (`Label`).
+    pub labels: Vec<u32>,
+    /// The script the engine runs on it (`ObjectScript`), by module hash.
+    pub script: Option<u32>,
+    /// The faction a faction zone belongs to (`FactionZone`'s faction
+    /// template), as its guid: the name hash of the template's name.
+    pub faction: Option<u32>,
 }
 
 /// What a mission session needs from the archives.
@@ -61,11 +224,48 @@ pub struct GameData {
     pub layers: BTreeMap<String, Vec<Entity>>,
     /// Region shapes read.
     pub shapes: usize,
+    /// The game's English text by id, for the HUD's texts.
+    pub strings: StringTable,
+    /// Templates' labels (name hashes) by the template's name in lower
+    /// case, for objects the scripts spawn.
+    pub template_labels: HashMap<String, Vec<u32>>,
+    /// Weapon templates' `MaxAmmoReserve` and which are thrown, by name in
+    /// lower case ([`crate::inventory::read`]).
+    pub max_reserve: HashMap<String, u32>,
+    pub thrown: std::collections::HashSet<String>,
 }
 
+/// `Label`'s field: the label's name hash.
+const LABEL_FIELD: u32 = 0xfd08_4cce;
+
+/// Every `Label` record's name hash, by entity (or template).
+fn labels_of(c: Option<&Component<'_>>) -> HashMap<u32, Vec<u32>> {
+    let mut out: HashMap<u32, Vec<u32>> = HashMap::new();
+    let Some(c) = c else {
+        return out;
+    };
+    let at = c
+        .fields
+        .iter()
+        .find(|f| f.name_hash == LABEL_FIELD)
+        .map_or(0, |f| usize::from(f.offset));
+    for (id, r) in c.records().unwrap_or_default() {
+        if let Some(b) = r.get(at..at + 4) {
+            out.entry(id)
+                .or_default()
+                .push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+    }
+    out
+}
+
+/// The string table the HUD's texts come from.
+pub const LANGUAGE: &str = "english";
+
 impl GameData {
-    /// Reads the scripts, layers and region shapes of an archive
-    /// (`vz.wad`). Blocks that don't parse are skipped.
+    /// Reads the scripts, layers, region shapes and the English string
+    /// table of an archive (`vz.wad`). Blocks that don't parse are
+    /// skipped.
     pub fn read<R: Read + Seek>(wad: &mut WadArchive<R>) -> Result<Self, MissionError> {
         let paths: Vec<String> = wad
             .index()
@@ -77,6 +277,13 @@ impl GameData {
         let mut shapes: HashMap<u32, Region> = HashMap::new();
         // Entities with the shape hash their LineRegion names.
         let mut regions: Vec<(String, usize, u32)> = Vec::new();
+        // Entities' templates, to give them their templates' labels.
+        let mut templated: Vec<(String, usize, u32)> = Vec::new();
+        let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
+        // Faction zones' faction templates, and every template's name.
+        let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
+        let mut template_names: HashMap<u32, String> = HashMap::new();
+        let language = name_hash(LANGUAGE);
         for (block, path) in paths.iter().enumerate() {
             let decoded = wad.read_block(block)?;
             let Ok(contents) = BlockContents::parse(&decoded) else {
@@ -91,17 +298,46 @@ impl GameData {
                     if let Ok(r) = Region::parse(asset) {
                         shapes.insert(entry.name_hash, r);
                     }
+                } else if entry.type_hash == STRINGS_TYPE && entry.name_hash == language {
+                    if let Ok(t) = StringTable::parse(asset) {
+                        data.strings = t;
+                    }
+                } else if entry.type_hash == TEMPLATE_DB_TYPE
+                    && let Ok(db) = Layer::parse(asset)
+                {
+                    template_labels = labels_of(db.component("Label"));
+                    (data.max_reserve, data.thrown) = crate::inventory::read(&db);
+                    template_names = db
+                        .names()
+                        .into_iter()
+                        .map(|(id, n)| (id, n.to_owned()))
+                        .collect();
+                    for (id, name) in db.names() {
+                        if let Some(l) = template_labels.get(&id) {
+                            data.template_labels
+                                .insert(name.to_ascii_lowercase(), l.clone());
+                        }
+                    }
                 } else if entry.type_hash == LAYER_TYPE
                     && let Ok(layer) = Layer::parse(asset)
                 {
                     let name = layer_name(path);
                     let list = data.layers.entry(name.clone()).or_default();
                     let lines = layer.hashes("LineRegion");
+                    let scripts = layer.hashes("ObjectScript");
+                    let zones = layer.hashes("FactionZone");
                     let placements = layer.placements();
+                    let mut own = labels_of(layer.component("Label"));
                     for (guid, entity) in layer.names() {
                         let p = placements.get(&guid);
                         if let Some(&h) = lines.get(&guid) {
                             regions.push((name.clone(), list.len(), h));
+                        }
+                        if let Some(p) = p {
+                            templated.push((name.clone(), list.len(), p.parent));
+                        }
+                        if let Some(&t) = zones.get(&guid) {
+                            zone_factions.push((name.clone(), list.len(), t));
                         }
                         list.push(Entity {
                             guid,
@@ -109,9 +345,23 @@ impl GameData {
                             at: p.map_or([0.0; 3], |p| p.position),
                             yaw: p.map_or(0.0, |p| yaw(p.rotation)),
                             region: None,
+                            labels: own.remove(&guid).unwrap_or_default(),
+                            script: scripts.get(&guid).copied(),
+                            faction: None,
                         });
                     }
                 }
+            }
+        }
+        for (layer, i, template) in templated {
+            if let Some(l) = template_labels.get(&template) {
+                let e = &mut data.layers.get_mut(&layer).expect("indexed above")[i];
+                e.labels.extend(l.iter().copied());
+            }
+        }
+        for (layer, i, template) in zone_factions {
+            if let Some(n) = template_names.get(&template) {
+                data.layers.get_mut(&layer).expect("indexed above")[i].faction = Some(name_hash(n));
             }
         }
         for (layer, i, hash) in regions {
@@ -165,6 +415,7 @@ pub struct Mission {
     events: Events,
     world: Shared,
     layers: BTreeMap<String, Vec<Entity>>,
+    strings: StringTable,
     /// Modules loaded before play started.
     started: usize,
     /// Game time, seconds.
@@ -173,6 +424,12 @@ pub struct Mission {
     waiting_since: Option<f64>,
     log: Vec<String>,
     outbox: Vec<Command>,
+    /// The game flies deliveries ([`fly_deliveries`](Self::fly_deliveries)).
+    flown: bool,
+    /// A held movie was handed to the game and has not ended yet.
+    movie_out: bool,
+    /// How black `MrxGui`'s fade has the screen ([`FADE`]), 0 to 1.
+    black: f32,
 }
 
 impl Mission {
@@ -186,6 +443,10 @@ impl Mission {
             mut library,
             layers,
             shapes,
+            strings,
+            template_labels,
+            max_reserve,
+            thrown,
         } = data;
         let regions = layers
             .values()
@@ -193,14 +454,24 @@ impl Mission {
             .filter(|e| e.region.is_some())
             .count();
         let mut log = vec![format!(
-            "{} scripts; {} layers; {shapes} region shapes; {regions} regions; {} landing zones",
+            "{} scripts; {} layers; {shapes} region shapes; {regions} regions; {} landing zones; {} strings",
             library.scripts().len(),
             layers.len(),
-            one.len()
+            one.len(),
+            strings.strings.len()
         )];
         {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
+            w.template_labels = template_labels;
+            w.inventory.max_reserve = max_reserve;
+            w.inventory.thrown = thrown;
+            for e in layers.values().flatten() {
+                w.entities.insert(e.guid, e.at);
+                w.entity_names
+                    .entry(e.name.to_ascii_lowercase())
+                    .or_insert(e.guid);
+            }
             w.landing_zones.insert(1, one);
             w.landing_zones.insert(2, two);
             let mut player = Object::new(hero, at);
@@ -217,7 +488,7 @@ impl Mission {
                 world.borrow_mut().layers.loaded.insert(name.clone());
             }
         }
-        for (name, hash) in KNOWN_MODULES {
+        for (name, hash) in KNOWN_MODULES.into_iter().chain(OBJECT_SCRIPTS) {
             library.pin(name, hash);
         }
         let library = Rc::new(library);
@@ -228,6 +499,7 @@ impl Mission {
         host.complete_libraries(&api::LIBRARIES)?;
         let events = Events::default();
         events.install(host.lua())?;
+        crate::hijack::install(&host, &world)?;
         host.install_library(Rc::clone(&library), true)?;
 
         // Every module, by the name scripts spell it with, so code run
@@ -242,6 +514,14 @@ impl Mission {
                     spelled.entry(name.to_ascii_lowercase()).or_insert(name);
                 }
             }
+        }
+        // The object scripts the port runs: no script imports them by name
+        // (the engine loads them for their objects), but the faction
+        // manager's `Init` calls `FactionZone.Init` as a global.
+        for (name, _) in OBJECT_SCRIPTS {
+            spelled
+                .entry(name.to_ascii_lowercase())
+                .or_insert_with(|| name.to_owned());
         }
         let globals = host.lua().globals();
         let import: Function = globals.get("import")?;
@@ -279,11 +559,15 @@ impl Mission {
             events,
             world,
             layers,
+            strings,
             started,
             now: 0.0,
             waiting_since: None,
             log,
             outbox: Vec::new(),
+            flown: false,
+            movie_out: false,
+            black: 0.0,
         };
         mission.settle("set-up");
         Ok(mission)
@@ -302,8 +586,39 @@ impl Mission {
         for name in &names {
             place(&self.world, &self.layers[name], true);
             self.world.borrow_mut().layers.loaded.insert(name.clone());
+            let failed = activate(self.host.lua(), &self.layers[name], true);
+            self.log
+                .extend(failed.into_iter().map(|f| format!("  {f}")));
         }
         names
+    }
+
+    /// Puts the entity called `name` (any case) of any layer in the world,
+    /// with its region, without running its script: for a second view of
+    /// the world (the game HUD's) to find what the mission's scripts put
+    /// on the radar. Its guid, if one is called that.
+    pub fn adopt(&self, name: &str) -> Option<u32> {
+        let e = self
+            .layers
+            .values()
+            .flatten()
+            .find(|e| e.name.eq_ignore_ascii_case(name))?;
+        if !self.world.borrow().objects.contains_key(&e.guid) {
+            place(&self.world, std::slice::from_ref(e), true);
+        }
+        Some(e.guid)
+    }
+
+    /// The layers in the world now, lower case: blocks of their own
+    /// (`vz_state_vzacon001`) and the layers inside `layers_static`
+    /// (`vz_mar_village`), which the game loads by name.
+    pub fn loaded_layers(&self) -> Vec<String> {
+        self.world.borrow().layers.loaded.iter().cloned().collect()
+    }
+
+    /// The entities of a layer that is a block of its own (lower case).
+    pub fn layer(&self, name: &str) -> Option<&[Entity]> {
+        self.layers.get(name).map(Vec::as_slice)
     }
 
     /// The world as the scripts see it.
@@ -333,6 +648,7 @@ impl Mission {
     /// then the step the engine runs once the GUI has loaded. The first
     /// contract's mission is then waiting at its start.
     pub fn start(&mut self) {
+        self.follow_freebies();
         let steps = [
             (
                 "skip mode",
@@ -341,6 +657,7 @@ impl Mission {
             ("bootstrap", format!("Scripts[\"{BOOTSTRAP:08x}\"].Init()")),
             // The callback MrxGuiBootstrap.SetOnGuiLoadedFunc registers.
             ("gui loaded", "MrxBootstrap._GuiLoaded()".to_owned()),
+            ("hero activated", HERO_ACTIVATE.to_owned()),
         ];
         for (name, code) in steps {
             if let Err(e) = self.run(&code, name) {
@@ -348,6 +665,22 @@ impl Mission {
                     .push(format!("  {name}: {}", first_lines(&e.to_string())));
             }
         }
+    }
+
+    /// Has the scripts' free support items reach the game
+    /// ([`FOLLOW_FREEBIES`]); logs whether they can.
+    pub fn follow_freebies(&mut self) {
+        let followed = self
+            .host
+            .lua()
+            .load(FOLLOW_FREEBIES)
+            .set_name("=follow freebies")
+            .eval::<bool>();
+        self.log.push(match followed {
+            Ok(true) => "free support items: followed (MrxSupportData.AddFreebie)".to_owned(),
+            Ok(false) => "free support items: no MrxSupportData.AddFreebie to follow".to_owned(),
+            Err(e) => format!("free support items: {}", first_lines(&e.to_string())),
+        });
     }
 
     /// Advances game time by `dt` seconds: fires the events that are due
@@ -369,6 +702,9 @@ impl Mission {
                 }
             }
         }
+        for t in self.events.take_trace() {
+            self.log.push(format!("  t={:.1} event {t}", self.now));
+        }
         for e in self.events.update_shared(dt, &self.world) {
             self.log.push(format!(
                 "  t={now:.1} {} callback: {}",
@@ -376,7 +712,187 @@ impl Mission {
                 first_lines(&e.error.to_string())
             ));
         }
+        self.check_boundary(now);
+        for e in crate::api::answer_drop_tests(&self.world) {
+            self.log.push(format!(
+                "  t={now:.1} drop zone callback: {}",
+                first_lines(&e.to_string())
+            ));
+        }
+        let ended = crate::vo::update(&self.world, self.host.lua(), now);
+        for (cue, error) in ended {
+            self.log.push(match error {
+                None => format!("  t={now:.1} line {cue} ended"),
+                Some(e) => format!(
+                    "  t={now:.1} line {cue} ended; callback: {}",
+                    first_lines(&e.to_string())
+                ),
+            });
+        }
+        match self
+            .host
+            .lua()
+            .load(FADE)
+            .set_name("=m2 fade")
+            .call::<f32>((dt, FADE_WIPE))
+        {
+            Ok(b) => {
+                if (b >= 1.0) != (self.black >= 1.0) {
+                    self.log.push(format!(
+                        "  t={now:.1} screen {}",
+                        if b >= 1.0 { "black" } else { "fading in" }
+                    ));
+                }
+                self.black = b;
+            }
+            Err(e) => self.log.push(format!(
+                "  t={now:.1} fade: {}",
+                first_lines(&e.to_string())
+            )),
+        }
         self.settle(&format!("t={now:.1}"));
+    }
+
+    /// How black the scripts' fade has the screen, 0 to 1.
+    pub fn black(&self) -> f32 {
+        self.black
+    }
+
+    /// Tells the boundary callback when the player leaves the play area
+    /// (zone `"out"`, `"enter"`) or comes back (`"exit"`). The player is
+    /// out when inside none of the boundaries the game can place.
+    fn check_boundary(&mut self, now: f64) {
+        let call = {
+            let mut w = self.world.borrow_mut();
+            let Some(f) = w.boundary_callback.clone() else {
+                return;
+            };
+            // While a state change holds her (the black screen as a
+            // contract loads, `MrxState`), she is still at the last spot
+            // and about to be placed: not a real exit.
+            if w.invincible
+                .get(&PLAYER)
+                .is_some_and(|r| r.contains("MrxState"))
+            {
+                return;
+            }
+            let found: Vec<bool> = w
+                .boundaries
+                .iter()
+                .filter_map(|&b| crate::events::World::inside(&*w, PLAYER, b))
+                .collect();
+            let out = !found.is_empty() && !found.contains(&true);
+            if out == w.outside {
+                return;
+            }
+            w.outside = out;
+            (f, if out { "enter" } else { "exit" })
+        };
+        let (f, event) = call;
+        self.log
+            .push(format!("  t={now:.1} play area: out {event}"));
+        if let Err(e) = f.call::<()>((mlua::Value::Nil, "out", event)) {
+            self.log.push(format!(
+                "  t={now:.1} boundary callback: {}",
+                first_lines(&e.to_string())
+            ));
+        }
+    }
+
+    /// The game is playing scripted line `id` (a [`Command::Say`]), which
+    /// lasts `seconds`.
+    pub fn line_length(&mut self, id: u32, seconds: f64) {
+        self.world.borrow_mut().vo.set_length(id, seconds);
+    }
+
+    /// Starts a hijack as the engine does when the player takes a
+    /// vehicle at its hijack entrance: script `script` (`hijack_m1a2`'s
+    /// name hash; see `m2_engine::hijack`) loads its clips (`Init`) and
+    /// plays `StartHijack(hijacker, crewman, "d", vehicle)`. False if the
+    /// script refused or failed (the failure is logged).
+    pub fn start_hijack(&mut self, hijacker: u32, crewman: u32, vehicle: u32, script: u32) -> bool {
+        use crate::events::guid_value;
+        let run = || -> mlua::Result<bool> {
+            let scripts: mlua::Table = self.host.lua().globals().get("Scripts")?;
+            let Some(s) = scripts.get::<Option<mlua::Table>>(format!("{script:08x}"))? else {
+                return Ok(false);
+            };
+            let Some(start) = s.get::<Option<mlua::Function>>("StartHijack")? else {
+                return Ok(false);
+            };
+            if let Some(init) = s.get::<Option<mlua::Function>>("Init")? {
+                init.call::<()>(())?;
+            }
+            let started: mlua::Value = start.call((
+                guid_value(hijacker),
+                guid_value(crewman),
+                "d",
+                guid_value(vehicle),
+            ))?;
+            Ok(matches!(started, mlua::Value::Boolean(true)))
+        };
+        let started = run();
+        self.settle("hijack");
+        match started {
+            Ok(b) => b,
+            Err(e) => {
+                self.log.push(format!(
+                    "  hijack {script:08x}: {}",
+                    first_lines(&e.to_string())
+                ));
+                false
+            }
+        }
+    }
+
+    /// Spawns a template (`"M1A2"`) into the scripts' world as the
+    /// scripts' `Pg.Spawn` does, facing north; its guid.
+    pub fn spawn(&mut self, template: &str, at: [f32; 3]) -> Option<u32> {
+        let v: mlua::Value = self
+            .host
+            .lua()
+            .load(format!(
+                "return Pg.Spawn({template:?}, {}, {}, {}, 0)",
+                at[0], at[1], at[2]
+            ))
+            .eval()
+            .ok()?;
+        crate::events::as_guid(&v)
+    }
+
+    /// The minigames waiting on the player's pad (a hijack's prompts).
+    pub fn minigames(&self) -> Vec<crate::hijack::Minigame> {
+        self.events.minigames()
+    }
+
+    /// The player pressed a pad button, or started or stopped holding it
+    /// (`crate::hijack::BUTTONS` numbers).
+    pub fn press(&mut self, button: u32) {
+        let now = self.now;
+        self.world.borrow_mut().hijack.press(button, now);
+    }
+
+    /// Whether aircraft `guid` is in the air (`Vehicle.IsFlying`).
+    pub fn set_flying(&mut self, guid: u32, flying: bool) {
+        self.world.borrow_mut().hijack.set_flying(guid, flying);
+    }
+
+    /// Where `guid`'s hardpoint (`hp_seat_lt`, a node of its model, by
+    /// name hash) is in the world now; hijacks set off their explosions
+    /// there.
+    pub fn set_hardpoint(&mut self, guid: u32, name: u32, at: [f32; 3]) {
+        self.world.borrow_mut().hijack.set_hardpoint(guid, name, at);
+    }
+
+    pub fn hold(&mut self, button: u32, down: bool) {
+        let at = down.then_some(self.now);
+        self.world.borrow_mut().hijack.hold(button, at);
+    }
+
+    /// A character's action (a [`crate::hijack::HijackCommand::State`]
+    /// key) played to its end.
+    pub fn action_finished(&mut self, guid: u32) {
+        self.world.borrow_mut().hijack.action_finished(guid);
     }
 
     /// Game time so far.
@@ -398,8 +914,11 @@ impl Mission {
     /// Puts the player in a vehicle (or out of one, with `None`): seat
     /// events fire on the next tick.
     pub fn ride(&mut self, vehicle: Option<u32>) {
-        if let Some(o) = self.world.borrow_mut().objects.get_mut(&PLAYER) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&PLAYER)
+            && o.vehicle != vehicle
+        {
             o.vehicle = vehicle;
+            o.seated_instantly = false;
         }
     }
 
@@ -412,12 +931,299 @@ impl Mission {
         }
     }
 
+    /// Leaves deliveries to the game: an `Ai.Deliver` order stays a
+    /// [`Command::Goal`] (`"Deliver"`) for it to fly, and it reports the
+    /// arrival with [`arrived`](Self::arrived). Without this a delivery
+    /// arrives as soon as it is ordered.
+    pub fn fly_deliveries(&mut self) {
+        self.flown = true;
+    }
+
+    /// Reports that `guid` (a delivery's pilot) reached `at`: its cargo is
+    /// let go there and the scripts hear of it ([`api::arrived`]); what
+    /// they do about it is carried out at once.
+    pub fn arrived(&mut self, guid: u32, at: [f32; 3]) {
+        self.log.push(format!(
+            "t={:.1} delivery by {guid} arrived at {at:?}",
+            self.now
+        ));
+        for e in api::arrived(&self.world, guid, at) {
+            self.log
+                .push(format!("  goal callback: {}", first_lines(&e.to_string())));
+        }
+        self.settle(&format!("t={:.1}, delivered", self.now));
+    }
+
+    /// The support catalogue as the scripts hold it now, with her stock
+    /// of each item ([`crate::support`]).
+    pub fn support_items(&self) -> Vec<crate::support::SupportItem> {
+        crate::support::items(self.host.lua()).unwrap_or_default()
+    }
+
+    /// Adds `count` of support item `key` to her stockpile, and cash and
+    /// fuel, as a purchase or a find would (`MrxPmc.AddSupportQty`,
+    /// `AddCashQty`, `AddFuelQty`).
+    pub fn stock_support(&mut self, key: &str, count: i32, cash: f64, fuel: f64) {
+        let code = format!(
+            "MrxPmc.AddSupportQty({key:?}, {count}) MrxPmc.AddCashQty({cash}) MrxPmc.AddFuelQty({fuel})"
+        );
+        if let Err(e) = self.run(&code, "stock support") {
+            self.log
+                .push(format!("  stock support: {}", first_lines(&e.to_string())));
+        }
+    }
+
+    /// Calls support item `key` in for the player, as the PDA and the
+    /// support menu do ([`crate::support::CALL_IN`]): her designator for
+    /// it comes as [`Command::EquipDesignator`]. Whether the scripts took
+    /// the call.
+    pub fn use_support(&mut self, key: &str) -> bool {
+        let lua = self.host.lua();
+        let owner = self.world.borrow().player.map(crate::events::guid_value);
+        let set = lua.globals().set("__m2_key", key).and_then(|()| {
+            lua.globals()
+                .set("__m2_owner", owner.unwrap_or(mlua::Value::Nil))
+        });
+        let took = set.and_then(|()| {
+            lua.load(crate::support::CALL_IN)
+                .set_name("=call in support")
+                .eval::<bool>()
+        });
+        let took = match took {
+            Ok(t) => t,
+            Err(e) => {
+                self.log
+                    .push(format!("  call in {key}: {}", first_lines(&e.to_string())));
+                false
+            }
+        };
+        self.log
+            .push(format!("t={:.1} support {key} called in: {took}", self.now));
+        self.settle(&format!("t={:.1}, support {key}", self.now));
+        took
+    }
+
+    /// `owner` threw her designator, now at `at`: it becomes an object of
+    /// `what` (`"Smoke Grenade Projectile"`) whose script, the support
+    /// manager, takes up the call waiting for her
+    /// (`MrxSupportManager.OnActivate`). Its guid; tell
+    /// [`Mission::designator_settled`] when its timer runs out where it
+    /// lies.
+    pub fn designator_thrown(&mut self, owner: u32, what: &str, at: [f32; 3]) -> u32 {
+        let guid = {
+            let mut w = self.world.borrow_mut();
+            let g = w.spawn_guid();
+            w.insert(g, api::Object::new(what, at));
+            w.strikes.designators.insert(g, owner);
+            g
+        };
+        self.call_manager("OnActivate", guid, owner);
+        guid
+    }
+
+    /// The designator `guid` has lain at `at` its template's time
+    /// (`TriggerOnTimer`: 4 s for the smoke grenade): the support manager
+    /// marks the spot there (`OnTimer`), and the support's own script
+    /// takes over.
+    pub fn designator_settled(&mut self, guid: u32, at: [f32; 3]) {
+        let owner = {
+            let mut w = self.world.borrow_mut();
+            if let Some(o) = w.objects.get_mut(&guid) {
+                o.position = at;
+            }
+            w.strikes.designators.get(&guid).copied()
+        };
+        if let Some(owner) = owner {
+            self.call_manager("OnTimer", guid, owner);
+        }
+    }
+
+    fn call_manager(&mut self, what: &str, guid: u32, owner: u32) {
+        let lua = self.host.lua();
+        let call = lua
+            .globals()
+            .get::<mlua::Table>("MrxSupportManager")
+            .and_then(|m| m.get::<Function>(what))
+            .and_then(|f| {
+                f.call::<()>((
+                    crate::events::guid_value(guid),
+                    crate::events::guid_value(owner),
+                ))
+            });
+        if let Err(e) = call {
+            self.log.push(format!(
+                "  support manager {what}: {}",
+                first_lines(&e.to_string())
+            ));
+        }
+        self.settle(&format!("t={:.1}, designator {what}", self.now));
+    }
+
+    /// Aircraft `guid` (an [`Command::Flyby`]) has reached the end of its
+    /// run at `at`: its script lets its ordnance go.
+    pub fn flyby_arrived(&mut self, guid: u32, at: [f32; 3]) {
+        self.strike_callbacks(guid, at, true, "flyby arrived");
+    }
+
+    /// Ordnance `guid` (an [`Command::Ordnance`]) went off at `at`.
+    pub fn ordnance_burst(&mut self, guid: u32, at: [f32; 3]) {
+        self.strike_callbacks(guid, at, false, "ordnance burst");
+    }
+
+    fn strike_callbacks(&mut self, guid: u32, at: [f32; 3], arrival: bool, what: &str) {
+        let callbacks = {
+            let mut w = self.world.borrow_mut();
+            if let Some(o) = w.objects.get_mut(&guid) {
+                o.position = at;
+            }
+            w.strikes.take(guid, arrival)
+        };
+        for (f, data) in callbacks {
+            let args: Vec<mlua::Value> = match data {
+                Some(t) => t.sequence_values().filter_map(Result::ok).collect(),
+                None => Vec::new(),
+            };
+            if let Err(e) = f.call::<()>(mlua::MultiValue::from_vec(args)) {
+                self.log
+                    .push(format!("  {what}: {}", first_lines(&e.to_string())));
+            }
+        }
+        self.settle(&format!("t={:.1}, {what}", self.now));
+    }
+
+    /// Object `guid`'s health when whole (the hero template's `Health`:
+    /// Mattias's 120), and its health with it when it was whole.
+    pub fn set_max_health(&mut self, guid: u32, max: f32) {
+        if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
+            if o.health >= o.max_health {
+                o.health = max;
+            }
+            o.max_health = max;
+        }
+    }
+
     /// Reports that an object died in play (a soldier the player shot).
+    /// The game's reading of an object's health (the player's, as she is
+    /// hurt and healed).
+    pub fn set_health(&mut self, guid: u32, health: f32) {
+        let was = self
+            .world
+            .borrow_mut()
+            .objects
+            .get_mut(&guid)
+            .map(|o| std::mem::replace(&mut o.health, health));
+        // A drop the game made (not the scripts' own healing): what the
+        // scripts are watching for, while the health system is checked.
+        if guid == PLAYER && was.is_some_and(|w| health < w - 5.0) && crate::script::stub_args() {
+            self.log.push(format!(
+                "  t={:.1} her health {:.1} -> {health:.1}; pending: {}",
+                self.now,
+                was.unwrap_or(0.0),
+                self.events.describe().join(" ")
+            ));
+        }
+    }
+
+    /// The player died and is back on her feet: the hero module's
+    /// `OnDeath` sets its survival system up again once she is healthy.
+    pub fn player_died(&mut self) {
+        self.log.push(format!("  t={:.1} player died", self.now));
+        if let Err(e) = self.run("Hero.OnDeath(Player.GetCharacter(1))", "hero died") {
+            self.log
+                .push(format!("  hero died: {}", first_lines(&e.to_string())));
+        }
+    }
+
     pub fn kill(&mut self, guid: u32) {
         if let Some(o) = self.world.borrow_mut().objects.get_mut(&guid) {
             o.alive = false;
             o.health = 0.0;
         }
+    }
+
+    /// The game spent or picked up ammunition: the player's weapon of
+    /// template `weapon` now has `rounds` in reserve, as scripts read it
+    /// (`Weapon.GetReserveAmmo`).
+    pub fn set_player_reserve(&mut self, weapon: &str, rounds: u32) {
+        let mut w = self.world.borrow_mut();
+        if let Some(who) = w.player {
+            w.set_reserve(who, weapon, rounds);
+        }
+    }
+
+    /// Has the flow's movies wait for the game ([`HOLD_MOVIES`]): call
+    /// before [`start`](Self::start). Without it they end at once.
+    pub fn hold_movies(&mut self) {
+        let held = self
+            .host
+            .lua()
+            .load(HOLD_MOVIES)
+            .set_name("=hold movies")
+            .eval::<u32>();
+        match self
+            .host
+            .lua()
+            .load(TELEPORTS)
+            .set_name("=teleports")
+            .eval::<bool>()
+        {
+            Ok(true) => {}
+            Ok(false) => self
+                .log
+                .push("teleports: no MrxUtil.TeleportHeroesToLocations".into()),
+            Err(e) => self
+                .log
+                .push(format!("teleports: {}", first_lines(&e.to_string()))),
+        }
+        self.log.push(match held {
+            Ok(0) => "movies: no _PlayMovie to hold".to_owned(),
+            Ok(n) => format!("movies: held for the game ({n} _PlayMovie)"),
+            Err(e) => format!("movies: {}", first_lines(&e.to_string())),
+        });
+    }
+
+    /// The next movie the flow asked for (`01_AOA_J`), if any: the game
+    /// plays it and then calls [`movie_done`](Self::movie_done).
+    pub fn take_movie(&mut self) -> Option<String> {
+        if self.movie_out {
+            return None;
+        }
+        let movies = self
+            .host
+            .lua()
+            .globals()
+            .raw_get::<mlua::Table>("__m2_movies")
+            .ok()?;
+        let first = movies.raw_get::<mlua::Table>(1).ok()?;
+        let name = first.raw_get::<String>("sMovie").ok()?;
+        self.log.push(format!("movie: {name}"));
+        self.movie_out = true;
+        Some(name)
+    }
+
+    /// The movie [`take_movie`](Self::take_movie) gave has ended (or was
+    /// skipped): its callback runs.
+    pub fn movie_done(&mut self) {
+        self.movie_out = false;
+        let code = r#"
+local t = table.remove(__m2_movies, 1)
+if t and t.fCallback then
+    MrxUtil.CallWithOptionalArgs(t.fCallback, t.tCallbackData)
+end
+"#;
+        if let Err(e) = self.run(code, "movie done") {
+            self.log
+                .push(format!("  movie done: {}", first_lines(&e.to_string())));
+        }
+    }
+
+    /// The player pressed the GUI's button `name` (`"selection"`), for
+    /// the scripts' `Button` events.
+    pub fn press_button(&mut self, name: &str) {
+        let mut w = self.world.borrow_mut();
+        w.buttons.push((self.now, name.to_ascii_lowercase()));
+        let extra = w.buttons.len().saturating_sub(16);
+        w.buttons.drain(..extra);
     }
 
     /// Everything the scripts asked the game to do since the last call.
@@ -430,6 +1236,17 @@ impl Mission {
         std::mem::take(&mut self.log)
     }
 
+    /// A HUD text with its ids replaced by the game's English strings
+    /// (`[VzaCon001.Objectives.001]` as `Secure the beach`).
+    pub fn text(&self, text: &str) -> String {
+        render(text, &self.strings)
+    }
+
+    /// The game's English strings.
+    pub fn strings(&self) -> &StringTable {
+        &self.strings
+    }
+
     /// Modules loaded since play started: name and script.
     pub fn late_modules(&self) -> Vec<(String, Option<u32>)> {
         self.host.modules().into_iter().skip(self.started).collect()
@@ -438,6 +1255,34 @@ impl Mission {
     /// Pending events by kind.
     pub fn pending_events(&self) -> Vec<String> {
         self.events.kinds()
+    }
+
+    /// The names the scripts' pending `ScriptEvent` events wait for.
+    pub fn awaited_posts(&self) -> Vec<String> {
+        self.events.awaited()
+    }
+
+    /// Posts a script event as the engine does (`Event.Post(name)`): the
+    /// scripts waiting for it hear of it at the next tick.
+    pub fn post(&mut self, name: &str) {
+        self.events.post(name);
+    }
+
+    /// Posts a script event as the resident script's network-event
+    /// callback does for the PDA: `"PDA Open"` with `{ uPlayer = 1 }` (the
+    /// watch filters on whose PDA it was), `"PDA Close"` with an empty
+    /// table (`for_player` false).
+    pub fn post_net_event(&mut self, name: &str, for_player: bool) {
+        let data = self.host.lua().create_table().and_then(|t| {
+            if for_player {
+                t.set("uPlayer", 1)?;
+            }
+            Ok(t)
+        });
+        match data {
+            Ok(t) => self.events.post_data(name, mlua::Value::Table(t)),
+            Err(_) => self.events.post(name),
+        }
     }
 
     /// Logs what happened, then carries out layer requests and deliveries
@@ -471,6 +1316,7 @@ impl Mission {
                     ..
                 } = c
                     && goal == "Deliver"
+                    && !self.flown
                 {
                     self.log
                         .push(format!("  delivery by {guid} arrived at {at:?}"));
@@ -502,14 +1348,18 @@ impl Mission {
             for (op, name) in requests {
                 let found = self.layers.get(&name);
                 if let Some(entities) = found {
-                    match op {
-                        LayerOp::Load => place(&self.world, entities, true),
-                        LayerOp::Unload => place(&self.world, entities, false),
-                        LayerOp::Reload => {
-                            place(&self.world, entities, false);
-                            place(&self.world, entities, true);
-                        }
+                    let lua = self.host.lua();
+                    let mut failed = Vec::new();
+                    if op != LayerOp::Load {
+                        failed.extend(activate(lua, entities, false));
+                        place(&self.world, entities, false);
                     }
+                    if op != LayerOp::Unload {
+                        place(&self.world, entities, true);
+                        failed.extend(activate(lua, entities, true));
+                    }
+                    self.log
+                        .extend(failed.into_iter().map(|f| format!("  {f}")));
                 }
                 let what = found.map_or("part of layers_static".to_owned(), |e| {
                     format!("{} entities", e.len())
@@ -551,13 +1401,19 @@ impl Mission {
                 _ => runs.push((c.as_str(), 1)),
             }
         }
-        for (c, n) in runs.iter().take(120) {
+        // With arguments shown every call differs: keep them all.
+        let cap = if crate::script::stub_args() {
+            usize::MAX
+        } else {
+            120
+        };
+        for (c, n) in runs.iter().take(cap) {
             log.push(match n {
                 1 => format!("  stub {c}"),
                 _ => format!("  stub {c} x{n}"),
             });
         }
-        if runs.len() > 120 {
+        if runs.len() > cap {
             log.push(format!("  ... {} stub calls in all", calls.len()));
         }
         commands
@@ -575,6 +1431,8 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
         if load {
             let mut o = Object::new(&e.name, e.at);
             o.yaw = e.yaw;
+            o.label_hashes.clone_from(&e.labels);
+            o.faction = e.faction;
             w.insert(e.guid, o);
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
@@ -584,6 +1442,43 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             w.regions.remove(&e.guid);
         }
     }
+}
+
+/// The object scripts the engine runs on layer entities that the port runs
+/// too, by module name and hash: as an entity's layer comes in the engine
+/// calls the module's `OnActivate(guid, param)`, and as it goes,
+/// `OnDeactivate(guid)` (`Inheritable`'s, which deletes the instance).
+/// `FactionZone` makes each zone an instance that enables itself: the zone
+/// on the radar and PDA map, and a watch on the player crossing it that
+/// tells the HUD (`TrespassStateChange`).
+pub const OBJECT_SCRIPTS: [(&str, u32); 1] = [("FactionZone", 0x6726_7cc1)];
+
+/// Runs the object scripts of `entities` (see [`OBJECT_SCRIPTS`]) as their
+/// layer comes in (`load`) or goes. Returns what failed.
+fn activate(lua: &mlua::Lua, entities: &[Entity], load: bool) -> Vec<String> {
+    let mut failed = Vec::new();
+    for e in entities {
+        let Some((module, _)) = e
+            .script
+            .and_then(|h| OBJECT_SCRIPTS.iter().find(|(_, s)| *s == h))
+        else {
+            continue;
+        };
+        let call = if load { "OnActivate" } else { "OnDeactivate" };
+        let result = lua
+            .globals()
+            .get::<mlua::Table>(*module)
+            .and_then(|m| m.get::<mlua::Function>(call))
+            .and_then(|f| f.call::<()>(crate::events::guid_value(e.guid)));
+        if let Err(err) = result {
+            failed.push(format!(
+                "{module}.{call} {}: {}",
+                e.name,
+                first_lines(&err.to_string())
+            ));
+        }
+    }
+    failed
 }
 
 /// The first lines of a (Lua) error, on one line.
@@ -605,6 +1500,147 @@ mod tests {
     }
 
     #[test]
+    fn the_scripts_free_support_items_reach_the_game() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.follow_freebies();
+        assert!(m.take_log().iter().any(|l| l.contains("no MrxSupportData")));
+        m.run(
+            r#"
+            MrxSupportData = { tGiven = {} }
+            function MrxSupportData.AddFreebie(sKey, nQty, uPlayer, bFlag, nLimit)
+                local t = MrxSupportData.tGiven
+                t[sKey] = math.min((t[sKey] or 0) + nQty, nLimit or 99)
+            end
+            function MrxSupportData.RemoveFreebie(sKey)
+                MrxSupportData.tGiven[sKey] = nil
+            end
+            "#,
+            "support data",
+        )
+        .unwrap();
+        m.follow_freebies();
+        m.run(
+            r#"
+            MrxSupportData.AddFreebie("VzaCon01_SatBomb", 1, nil, nil, 1)
+            MrxSupportData.AddFreebie("VzaCon01_SatBomb", 1, nil, nil, 1)
+            assert(MrxSupportData.tGiven.VzaCon01_SatBomb == 1)
+            MrxSupportData.RemoveFreebie("VzaCon01_SatBomb")
+            assert(MrxSupportData.tGiven.VzaCon01_SatBomb == nil)
+            MrxSupportData.AddFreebie("Flare", 2)
+            "#,
+            "give",
+        )
+        .unwrap();
+        let bomb = || Command::Freebie {
+            key: "VzaCon01_SatBomb".into(),
+            quantity: 1,
+            limit: Some(1),
+        };
+        assert_eq!(
+            m.take_commands(),
+            [
+                bomb(),
+                bomb(),
+                Command::RemoveFreebie("VzaCon01_SatBomb".into()),
+                Command::Freebie {
+                    key: "Flare".into(),
+                    quantity: 2,
+                    limit: None
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_conversation_moves_on_as_each_line_ends() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            local function second(state) VO.Cue(0, "B", function() heard = state end) end
+            VO.Cue(0, "A", second, {}, 1, true)
+            VO.Cue(0, "C", function() cancelled = true end)
+            VO.Cancel(0, "C", true)
+            ordered = VO.PRIORITY_CINEMATIC < VO.PRIORITY_SCRIPTED_CONTRACT
+            "#,
+            "test",
+        )
+        .unwrap();
+        let say = |id, cue: &str| Command::Say {
+            id,
+            speaker: None,
+            cue: cue.into(),
+        };
+        assert_eq!(
+            m.take_commands(),
+            [say(1, "A"), say(2, "C"), Command::Hush(2)]
+        );
+        m.tick(0.1);
+        m.line_length(1, 1.0);
+        m.tick(0.5);
+        assert!(m.take_commands().is_empty());
+        m.tick(0.6);
+        assert_eq!(m.take_commands(), [say(3, "B")]);
+        for _ in 0..50 {
+            m.tick(0.1);
+        }
+        let g = m.host.lua().globals();
+        assert_eq!(g.raw_get::<String>("heard").unwrap(), "complete");
+        assert_eq!(g.raw_get::<Option<bool>>("cancelled").unwrap(), None);
+        assert!(g.raw_get::<bool>("ordered").unwrap());
+    }
+
+    #[test]
+    fn invincible_while_any_reason_holds() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            local hero = Player.GetCharacter(1)
+            Object.SetInvincible(hero, true, "MrxState")
+            Object.SetInvincible(hero, true, "Fanfare")
+            Object.SetInvincible(hero, false, "MrxState")
+            Object.SetInvincible(hero, false, "Fanfare")
+            "#,
+            "test",
+        )
+        .unwrap();
+        let on = |on| Command::Invincible { guid: PLAYER, on };
+        assert_eq!(m.take_commands(), [on(true), on(false)]);
+    }
+
+    #[test]
+    fn health_watches_fire_as_she_is_hurt() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.run(
+            r#"
+            dropped = 0
+            local hero = Player.GetCharacter(1)
+            Player.SetHealthClamp(1, true)
+            Event.Create(Event.ObjectHealth, { hero, "<", Object.GetHealth(hero) },
+                function() dropped = dropped + 1 end)
+            Sound.StopSound(0, "sfx_survival_lp")
+            "#,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            m.take_commands(),
+            [
+                Command::HealthClamp(true),
+                Command::StopSound {
+                    at: None,
+                    cue: "sfx_survival_lp".into()
+                }
+            ]
+        );
+        m.tick(0.1);
+        m.set_health(PLAYER, 60.0);
+        m.tick(0.1);
+        m.tick(0.1);
+        let dropped: i64 = m.lua().globals().raw_get("dropped").unwrap();
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
     fn play_reports_rides_and_places() {
         let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
         m.ride(Some(77));
@@ -618,9 +1654,156 @@ mod tests {
     }
 
     #[test]
+    fn the_scripts_fade_calls_back_once_black_and_clears_after_a_fade_back() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        // MrxGui's fade as its script runs it, cut down: a queued callback
+        // runs on the GUI update after the wipe; a fade back asks the
+        // movie to fade out.
+        m.run(
+            r#"
+            Fade = { _nCount = 0, _tCallbacks = {} }
+            local F = Fade
+            F._oFadeFlash = { CustomData = { bLoaded = false } }
+            function F.GlobalFadeToBlack(f)
+                table.insert(F._tCallbacks, f)
+                F._nCount = F._nCount + 1
+                if not F._oFadeFlash.CustomData.bLoaded then
+                    F._oFadeFlash.CustomData.bLoading = true
+                else
+                    F._bCurrentlyFadingIn = true
+                end
+            end
+            function F._CompleteFadeFlashLoad()
+                F._oFadeFlash.CustomData.bLoaded = true
+                F._oFadeFlash.CustomData.bLoading = false
+                F._bCurrentlyFadingIn = true
+            end
+            function F._FinishFadeToBlack(w)
+                F._bCurrentlyFadingIn = false
+                F._bCurrentlyFadedIn = true
+            end
+            function F._FadeUpdate(w)
+                for _, f in ipairs(F._tCallbacks) do f() end
+                F._tCallbacks = {}
+            end
+            function F.GlobalFadeFromBlack()
+                F._nCount = F._nCount - 1
+                F._bCurrentlyFadedIn = false
+                F._bCurrentlyFadingIn = false
+            end
+            function F._FinishFadeFromBlack(w) F.closed = (F.closed or 0) + 1 end
+            "#,
+            "fade",
+        )
+        .unwrap();
+        let lua = m.host.lua();
+        lua.load("Fade.GlobalFadeToBlack(function() called = true end)")
+            .exec()
+            .unwrap();
+        let mut blacks = Vec::new();
+        for _ in 0..30 {
+            m.tick(0.1);
+            blacks.push(m.black());
+        }
+        let lua = m.host.lua();
+        assert!(lua.globals().get::<bool>("called").unwrap());
+        assert_eq!(m.black(), 1.0);
+        // Back, and at once to black again: the fade back gives way.
+        lua.load("Fade.GlobalFadeFromBlack() Fade.GlobalFadeToBlack(function() end)")
+            .exec()
+            .unwrap();
+        for _ in 0..30 {
+            m.tick(0.1);
+        }
+        assert_eq!(m.black(), 1.0);
+        let lua = m.host.lua();
+        assert_eq!(
+            lua.load("return Fade.closed")
+                .eval::<Option<u32>>()
+                .unwrap(),
+            None
+        );
+        lua.load("Fade.GlobalFadeFromBlack()").exec().unwrap();
+        for _ in 0..30 {
+            m.tick(0.1);
+        }
+        assert_eq!(m.black(), 0.0);
+        let lua = m.host.lua();
+        assert_eq!(lua.load("return Fade.closed").eval::<u32>().unwrap(), 1);
+        assert!(blacks.iter().any(|&b| b > 0.0 && b < 1.0));
+    }
+
+    #[test]
+    fn flown_deliveries_wait_for_the_game_to_say_they_arrived() {
+        for flown in [false, true] {
+            let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+            if flown {
+                m.fly_deliveries();
+            }
+            {
+                let mut w = m.world().borrow_mut();
+                w.insert(80, Object::new("copter", [0.0, 100.0, 0.0]));
+                let mut pilot = Object::new("pilot", [0.0, 100.0, 0.0]);
+                pilot.vehicle = Some(80);
+                w.insert(81, pilot);
+                w.insert(82, Object::new("crate", [0.0, 95.0, 0.0]));
+            }
+            m.run(
+                r#"
+                local copter, crate = Sys.StringToGuid("80"), Sys.StringToGuid("82")
+                Object.AttachCargoToWinch(crate, copter)
+                Ai.Deliver(Sys.StringToGuid("81"), 50, 0, 60, 0.5)
+                "#,
+                "deliver",
+            )
+            .unwrap();
+            let at = [50.0, 0.0, 60.0];
+            let moved = |m: &mut Mission| {
+                m.take_commands()
+                    .iter()
+                    .any(|c| matches!(c, Command::Move { guid: 82, position } if *position == at))
+            };
+            let there = |m: &Mission| m.world().borrow().objects[&82].position == at;
+            // At once, unless the game flies it.
+            assert_eq!(moved(&mut m), !flown);
+            assert_eq!(there(&m), !flown);
+            if flown {
+                m.arrived(81, at);
+                assert!(moved(&mut m));
+                assert!(there(&m));
+            }
+        }
+    }
+
+    #[test]
     fn yaw_reads_turns_about_up() {
         let half = std::f32::consts::FRAC_PI_4;
         let q = [0.0, half.sin(), 0.0, half.cos()];
         assert!((yaw(q) - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_button_event_fires_on_its_press_after_it_was_made() {
+        let mut m = Mission::new(GameData::default(), "Jennifer", [0.0; 3]).unwrap();
+        m.press_button("selection");
+        m.tick(0.1);
+        m.run(
+            r#"
+            skipped = 0
+            Event.Create(Event.Button, { Player.GetLocalPlayer(), "selection", "press", true },
+                function() skipped = skipped + 1 end)
+            "#,
+            "test",
+        )
+        .unwrap();
+        m.tick(0.1);
+        m.press_button("cancel");
+        m.tick(0.1);
+        let skipped = |m: &Mission| m.host.lua().globals().get::<i64>("skipped").unwrap();
+        assert_eq!(skipped(&m), 0);
+        m.press_button("Selection");
+        m.tick(0.1);
+        m.tick(0.1);
+        assert_eq!(skipped(&m), 1);
     }
 }

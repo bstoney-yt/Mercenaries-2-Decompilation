@@ -39,7 +39,7 @@
 //!       f32x3 centre of mass, f32 mass, f32x4 unknown (0.3), u32x8 ?,
 //!       u32 0xDDDDDDDD
 //! shape, 0x6C bytes: u32 0xEEEEEEEE, then 26 words: 3 kind (2 mesh),
-//!       4 unknown (a material, probably), 5..10 f32x6 vertex pool bounds
+//!       4 collision class (see [`Shape::class`]), 5..10 f32x6 vertex pool bounds
 //!       (meshes), 16 vertex count, 18 vertex pool offset (meshes),
 //!       24 shape index, 25 0xFFFFFFFF
 //! vertex pool: u16x3 per vertex, quantised; a vertex is
@@ -115,7 +115,9 @@ impl From<OutOfBounds> for PhysicsError {
 /// Attaches a body or a shape to a model node, in a tree.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Part {
-    /// Unknown: identity on most parts.
+    /// Where the part sits (rotation as x, y, z, w): a body's part at its
+    /// node, in model space; a shape's part in its body's node space
+    /// ([`Physics::shape_place`]). Identity on most parts.
     pub position: [f32; 3],
     pub rotation: [f32; 4],
     pub node_hash: u32,
@@ -178,6 +180,27 @@ pub struct Shape {
     pub part: usize,
     /// The shape record's words, after the marker.
     pub record: [u32; 26],
+}
+
+/// The collision class of plants' and bushes' leafy hulls
+/// ([`Shape::class`]). Over the 18,031 shapes of the island's 2,471
+/// placed models with `PHY2`, 31 have it (record word 4 `0x28`), 19 of
+/// them on models named as plants or bushes and none on a tree, rock,
+/// wall or sign; 16,253 have class 7 (`0x27`), the rest 0, 3 or 5.
+pub const FOLIAGE: u32 = 8;
+
+impl Shape {
+    /// The low five bits of record word 4: the shape's collision class,
+    /// where Havok's group filter keeps a layer (unconfirmed). Nearly
+    /// every shape is class 7; leaves are [`FOLIAGE`].
+    pub fn class(&self) -> u32 {
+        self.record[4] & 0x1f
+    }
+
+    /// A plant's or bush's leaves ([`FOLIAGE`]).
+    pub fn is_foliage(&self) -> bool {
+        self.class() == FOLIAGE
+    }
 }
 
 /// A parsed `PHY2` section.
@@ -503,6 +526,17 @@ impl Physics {
             at = part.parent;
         }
         None
+    }
+
+    /// Where shape `shape` sits in its body node's space
+    /// ([`shape_node`](Self::shape_node)): its own part's place, position
+    /// and rotation (x, y, z, w). A gantry's sign panel hangs 14 m up on a
+    /// part of its own; across the archive's models this puts 720 of 724
+    /// boxes inside their model's bounds, against 698 by the body node
+    /// alone (convex shapes and meshes fit either way).
+    pub fn shape_place(&self, shape: usize) -> Option<([f32; 3], [f32; 4])> {
+        let part = self.parts.get(self.shapes.get(shape)?.part)?;
+        Some((part.position, part.rotation))
     }
 
     /// The model node whose space shape `shape` is in.
@@ -874,6 +908,12 @@ mod tests {
         assert_eq!((p.body_of(0), p.shape_node(0)), (Some(1), Some(2)));
         assert_eq!((p.body_of(1), p.shape_node(1)), (Some(1), Some(2)));
         assert_eq!((p.body_of(2), p.shape_node(2)), (Some(0), Some(0)));
+        // Each shape sits where its own part puts it.
+        for k in 0..3 {
+            let part = &p.parts[p.shapes[k].part];
+            assert_eq!(p.shape_place(k), Some((part.position, part.rotation)));
+        }
+        assert_eq!(p.shape_place(3), None);
     }
 
     #[test]

@@ -11,29 +11,60 @@
 //! Skinned geometry is drawn in its bind pose for now; animation drives it
 //! once the animation runtime lands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
+use std::sync::OnceLock;
 
-use m2_assets::model::{GeometryKind, Material, TOPOLOGY};
+use m2_assets::model::{GeometryKind, Material, ModelInfo, TOPOLOGY};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{Model, Ucfx};
-use m2_math::glam::{Mat4, Vec3};
+use m2_math::glam::{Mat4, Quat, Vec3};
 use m2_render::{
-    BackendError, BlendMode, DrawCall, DrawQueue, Geometry, IndexBufferDesc, IndexBufferHandle,
-    Layer, MaterialDesc, MaterialId, Primitive, RenderBackend, SkinHandle, TextureDesc,
-    TextureFormat, TextureHandle, VertexBufferDesc, VertexBufferHandle, generate_mips,
+    BackendError, BlendMode, DrawCall, DrawQueue, Emissive, Geometry, IndexBufferDesc,
+    IndexBufferHandle, IndexFormat, Layer, MaterialDesc, MaterialId, NormalMap, Primitive,
+    Reflection, RenderBackend, SkinHandle, Specular, TextureDesc, TextureFormat, TextureHandle,
+    Topology, VertexBufferDesc, VertexBufferHandle, VertexElement, VertexFormat, VertexSemantic,
+    generate_mips,
 };
 
 use crate::assets::{AssetError, AssetSource, DecodedTexture, ModelData};
 use crate::physics::CollisionShape;
+use crate::technique::Technique;
+
+/// An uploaded texture and what its pixels say about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Uploaded {
+    pub handle: TextureHandle,
+    /// Its alpha cuts shapes out.
+    pub alpha: bool,
+    /// As a normal map, x is in alpha rather than red.
+    pub alpha_x: bool,
+}
+
+/// What a model material is cached by.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MaterialKey {
+    name: u32,
+    textures: Vec<u32>,
+    technique: u32,
+    flags: u16,
+    constants: [u32; m2_assets::model::MATERIAL_CONSTANTS],
+    depth_bias: bool,
+}
 
 /// Textures and materials shared between models.
 #[derive(Debug)]
 pub struct MaterialCache {
     /// `None`: the texture could not be read; its materials draw untextured.
-    textures: HashMap<u32, Option<(TextureHandle, bool)>>,
-    materials: HashMap<(u32, Option<u32>), MaterialId>,
+    textures: HashMap<u32, Option<Uploaded>>,
+    /// By everything in the record that shapes the material, and depth
+    /// bias: records sharing a name can differ in flags, constants and
+    /// maps (the AMX-30's tracks are two-sided, the M1A1's of the same
+    /// name not).
+    materials: HashMap<MaterialKey, MaterialId>,
     defined: Vec<(MaterialId, MaterialDesc)>,
+    /// Materials that blend over what is behind them.
+    translucent: HashSet<MaterialId>,
     next_material: u32,
     /// Every material, including ones defined later, draws both faces.
     all_double_sided: bool,
@@ -47,10 +78,11 @@ impl Default for MaterialCache {
             textures: HashMap::new(),
             materials: HashMap::new(),
             defined: Vec::new(),
+            translucent: HashSet::new(),
             // 0 stays the backend's default material.
             next_material: 1,
             all_double_sided: false,
-            max_texture_width: 1024,
+            max_texture_width: MODEL_TEXTURE_WIDTH,
         }
     }
 }
@@ -67,6 +99,11 @@ impl MaterialCache {
 
     /// The uploaded texture `hash` and whether it has alpha.
     pub fn texture(&self, hash: u32) -> Option<(TextureHandle, bool)> {
+        self.uploaded(hash).map(|t| (t.handle, t.alpha))
+    }
+
+    /// The uploaded texture `hash`.
+    pub fn uploaded(&self, hash: u32) -> Option<Uploaded> {
         self.textures.get(&hash).copied().flatten()
     }
 
@@ -82,59 +119,278 @@ impl MaterialCache {
             return Ok(());
         }
         let uploaded = match texture {
-            Some(t) if !t.mips.is_empty() => Some(upload_texture(backend, t)?),
+            Some(t) if !t.mips.is_empty() => {
+                let (handle, alpha) = upload_texture(backend, t)?;
+                Some(Uploaded {
+                    handle,
+                    alpha,
+                    alpha_x: alpha_holds_x(t),
+                })
+            }
             _ => None,
         };
         self.textures.insert(hash, uploaded);
         Ok(())
     }
 
-    /// Reads and uploads the textures in `hashes` not yet known.
+    /// Reads and uploads the textures in `requests` not yet known: (hash,
+    /// whether it holds data rather than colour), as
+    /// [`material_textures`] lists them.
     pub fn load_textures<R: Read + Seek>(
         &mut self,
         backend: &mut dyn RenderBackend,
         source: &mut AssetSource<R>,
-        hashes: impl IntoIterator<Item = u32>,
+        requests: impl IntoIterator<Item = (u32, bool)>,
     ) -> Result<(), BackendError> {
-        for hash in hashes {
+        for (hash, linear) in requests {
             if !self.has_texture(hash) {
-                let t = source.texture(hash, self.max_texture_width).ok();
+                let t = source
+                    .texture(hash, self.max_texture_width)
+                    .ok()
+                    .map(|mut t| {
+                        t.linear = linear;
+                        t
+                    });
                 self.add_texture(backend, hash, t.as_ref())?;
             }
         }
         Ok(())
     }
 
-    /// The material for a model material record: its first texture as base
-    /// colour, alpha-tested when that texture has alpha. Add the texture
-    /// first; a texture not yet added draws untextured and is not cached.
+    /// Adds `cpu`'s textures: those it decoded ahead as they are, the rest
+    /// read from `source`.
+    pub fn load_model_textures<R: Read + Seek>(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        source: &mut AssetSource<R>,
+        cpu: &CpuModel,
+    ) -> Result<(), BackendError> {
+        for (hash, t) in &cpu.textures {
+            if !self.has_texture(*hash) {
+                self.add_texture(backend, *hash, t.as_ref())?;
+            }
+        }
+        self.load_textures(backend, source, cpu.texture_requests())
+    }
+
+    /// The material for a model material record, shaded as its technique
+    /// says (see [`Technique`]): base colour from slot 0, alpha-tested when
+    /// that texture has alpha, and the specular and normal maps when the
+    /// technique has them. Add the textures first; a texture not yet added
+    /// is left out and the material is not cached.
     pub fn material(
         &mut self,
         backend: &mut dyn RenderBackend,
         material: &Material,
     ) -> Result<MaterialId, BackendError> {
+        self.material_biased(backend, material, false)
+    }
+
+    /// As [`material`](Self::material), for a surface laid over another
+    /// (roads and markings on the ground): it wins the depth test.
+    pub fn overlay_material(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        material: &Material,
+    ) -> Result<MaterialId, BackendError> {
+        self.material_biased(backend, material, true)
+    }
+
+    fn material_biased(
+        &mut self,
+        backend: &mut dyn RenderBackend,
+        material: &Material,
+        depth_bias: bool,
+    ) -> Result<MaterialId, BackendError> {
         let texture_hash = base_texture(material);
-        let key = (material.name_hash, texture_hash);
+        let key = MaterialKey {
+            name: material.name_hash,
+            textures: material.textures.clone(),
+            technique: material.technique,
+            flags: material.flags,
+            constants: material.constants.map(f32::to_bits),
+            depth_bias,
+        };
         if let Some(&id) = self.materials.get(&key) {
             return Ok(id);
         }
+        let technique = Technique::from_hash(material.technique);
+        let slot = |i: usize| material.textures.get(i).copied().filter(|&t| t != 0);
         let texture = texture_hash.and_then(|t| self.texture(t));
+        let specular = technique.filter(|t| t.specular).map(|_| Specular {
+            color: [
+                material.constants[3],
+                material.constants[4],
+                material.constants[5],
+            ],
+            power: material.constants[13].max(1.0),
+            map: slot(1)
+                .filter(|_| technique.is_some_and(|t| !t.emissive))
+                .and_then(|t| self.uploaded(t))
+                .map(|t| t.handle),
+        });
+        // Emis techniques: slot 1 is the emissive map, constants 9-11 its
+        // colour (lamps 2 to 4, everything else 0).
+        let emissive = technique.filter(|t| t.emissive).and_then(|_| {
+            let color = [
+                material.constants[9],
+                material.constants[10],
+                material.constants[11],
+            ];
+            (color.iter().any(|&c| c > 0.0)).then(|| Emissive {
+                color,
+                map: slot(1).and_then(|t| self.uploaded(t)).map(|t| t.handle),
+            })
+        });
+        // Refl and Metal techniques mirror the surroundings, scaled by
+        // constant 14 (the shaders' constant0.x) and the specular map.
+        // Metal also weights it by Schlick's Fresnel. Its reflectance facing
+        // the eye is taken from constant 15 read as an index of refraction
+        // (only Metal materials set it, 1 to 3.34, mostly 2.705: about 0.21
+        // facing); that reading is inferred, not confirmed.
+        let reflection = technique
+            .filter(|t| t.reflection || t.metal)
+            .map(|_| material.constants[14])
+            .filter(|&s| s > 0.0)
+            .map(|strength| Reflection {
+                strength,
+                fresnel: technique.filter(|t| t.metal).map(|_| {
+                    let n = material.constants[15].max(1.0);
+                    ((n - 1.0) / (n + 1.0)).powi(2)
+                }),
+            });
+        let normal_map = technique
+            .filter(|t| t.normal)
+            .and_then(|_| slot(2))
+            .and_then(|t| self.uploaded(t))
+            .map(|t| NormalMap {
+                texture: t.handle,
+                alpha_x: t.alpha_x,
+            });
+        let has = |bit: u16| material.flags & bit != 0;
+        let alpha = matches!(texture, Some((_, true)));
+        let blend = if has(flags::ADDITIVE) {
+            BlendMode::Additive
+        } else if has(flags::BLENDED) {
+            BlendMode::Translucent
+        } else if alpha || has(flags::CUT_OUT) {
+            BlendMode::Masked { cutoff: 0.5 }
+        } else {
+            BlendMode::Opaque
+        };
+        // A beam of light (a searchlight's cone): blended, glowing with
+        // its own texture.
+        let beam = has(flags::BLENDED) && emissive.is_some() && slot(1) == slot(0);
+        // `M2_BEAM=old` draws beams as before: at the opacity constant and
+        // fading where their sides turn from the eye.
+        let old_beam = std::env::var("M2_BEAM").is_ok_and(|v| v == "old");
+        // The opacity constant scales the texture's alpha, except on
+        // beams: at the searchlights' 0.1 their cores came out a tenth as
+        // bright over the night sky as in footage (PC round D), so for
+        // them it is taken to mean something else (inferred).
+        let opacity = if beam && !old_beam {
+            1.0
+        } else {
+            material.constants[12].clamp(0.0, 1.0)
+        };
         let desc = MaterialDesc {
             texture: texture.map(|t| t.0),
-            blend: match texture {
-                Some((_, true)) => BlendMode::Masked { cutoff: 0.5 },
-                _ => BlendMode::Opaque,
-            },
-            double_sided: matches!(texture, Some((_, true))),
+            blend,
+            double_sided: has(flags::TWO_SIDED) || alpha,
             color: if texture.is_some() {
-                [1.0; 4]
+                [1.0, 1.0, 1.0, opacity]
             } else {
-                [0.6, 0.6, 0.6, 1.0]
+                [0.6, 0.6, 0.6, opacity]
             },
+            vertex_color: technique.is_some_and(|t| t.ambient_occlusion),
+            // materialData's diffuse and ambient colours; which constants
+            // feed them is read from how they vary, not confirmed.
+            direct: if technique.is_some() {
+                [
+                    material.constants[0],
+                    material.constants[1],
+                    material.constants[2],
+                ]
+            } else {
+                [1.0; 3]
+            },
+            ambient: if technique.is_some() {
+                [
+                    material.constants[6],
+                    material.constants[7],
+                    material.constants[8],
+                ]
+            } else {
+                [1.0; 3]
+            },
+            specular,
+            normal_map,
+            emissive,
+            reflection,
+            rim: technique.is_some_and(|t| t.rim),
+            depth_bias,
+            // The game's beam shader has no fade by how the surface faces
+            // the eye; ours did, under `M2_BEAM=old`.
+            soft_edge: beam && old_beam,
+            beam,
             ..MaterialDesc::default()
         };
+        let tinted = debug_tint(material, desc.texture.is_some());
+        let desc = if tinted {
+            MaterialDesc {
+                texture: None,
+                color: [1.0, 0.0, 1.0, opacity],
+                ..desc
+            }
+        } else {
+            desc
+        };
+        // `M2_MATERIAL_DUMP=<hex>,...`: those materials' records and what
+        // they draw with, each time one is built.
+        if std::env::var("M2_MATERIAL_DUMP").is_ok_and(|v| {
+            v.split(',')
+                .any(|h| u32::from_str_radix(h.trim(), 16) == Ok(material.name_hash))
+        }) {
+            eprintln!(
+                "material dump {:08x}: technique {:08x} {:?}, flags {:04x}, textures {:08x?} (have {:?}), constants {:?}{}\n  draws with {:?}",
+                material.name_hash,
+                material.technique,
+                technique,
+                material.flags,
+                material.textures,
+                material
+                    .textures
+                    .iter()
+                    .map(|&t| t != 0 && self.has_texture(t))
+                    .collect::<Vec<_>>(),
+                material.constants,
+                if depth_bias {
+                    " (terrain cell mesh)"
+                } else {
+                    ""
+                },
+                desc
+            );
+        }
         let id = self.define(backend, &desc)?;
-        if texture_hash.is_none_or(|t| self.has_texture(t)) {
+        if material_textures(material)
+            .iter()
+            .all(|&(t, _)| self.has_texture(t))
+        {
+            if tinted {
+                eprintln!(
+                    "tinted material {:08x}: technique {:08x}, flags {:04x}, textures {:08x?}{}",
+                    material.name_hash,
+                    material.technique,
+                    material.flags,
+                    material.textures,
+                    if depth_bias {
+                        " (terrain cell mesh)"
+                    } else {
+                        ""
+                    }
+                );
+            }
             self.materials.insert(key, id);
         }
         Ok(id)
@@ -157,7 +413,16 @@ impl MaterialCache {
             },
         )?;
         self.defined.push((id, *desc));
+        if desc.blend.is_translucent() {
+            self.translucent.insert(id);
+        }
         Ok(id)
+    }
+
+    /// Whether material `id` blends over what is behind it (draw it after
+    /// the opaque world, farthest first).
+    pub fn is_translucent(&self, id: MaterialId) -> bool {
+        self.translucent.contains(&id)
     }
 
     /// Redefines every material, and defines later ones, drawing both faces
@@ -188,9 +453,99 @@ impl MaterialCache {
     }
 }
 
+/// Widest model texture read by default; bigger mips are skipped.
+pub const MODEL_TEXTURE_WIDTH: u32 = 2048;
+
+/// Material flags bits, read from which materials carry them (a survey of
+/// every model material); not confirmed in the game's code.
+pub mod flags {
+    /// Alpha blended over what is behind: glass, blob shadows, water,
+    /// boards (vehicle glass is 0x0091 where the body is 0x0080).
+    pub const BLENDED: u16 = 0x0001;
+    /// Added to what is behind: lights, neon, light cones, trails.
+    pub const ADDITIVE: u16 = 0x0002;
+    /// Cut out by the texture's alpha: leaves, hedges, hair, nets.
+    pub const CUT_OUT: u16 = 0x0008;
+    /// Both faces drawn: hair, wires, plants, helmets' visors.
+    pub const TWO_SIDED: u16 = 0x0010;
+    /// Never drawn: every material carrying it is coloured with the
+    /// default normal map.
+    pub const HIDDEN: u16 = 0x0800;
+}
+
+/// Whether to draw `material` solid magenta, to find a surface on screen:
+/// `M2_TINT_FLAGS=<hex mask>` picks materials with any of those flag bits,
+/// `M2_TINT_MATERIAL=<hex name>,...` those named, `M2_TINT_UNTEXTURED=1`
+/// those drawn without a base texture. Each one is logged once its
+/// textures are in.
+fn debug_tint(material: &Material, textured: bool) -> bool {
+    struct Settings {
+        mask: u16,
+        names: HashSet<u32>,
+        untextured: bool,
+    }
+    static SETTINGS: OnceLock<Settings> = OnceLock::new();
+    let hex = |v: &str| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok();
+    let s = SETTINGS.get_or_init(|| Settings {
+        mask: std::env::var("M2_TINT_FLAGS")
+            .ok()
+            .and_then(|v| hex(&v))
+            .map_or(0, |m| m as u16),
+        names: std::env::var("M2_TINT_MATERIAL")
+            .map(|v| v.split(',').filter_map(hex).collect())
+            .unwrap_or_default(),
+        untextured: std::env::var_os("M2_TINT_UNTEXTURED").is_some(),
+    });
+    material.flags & s.mask != 0
+        || s.names.contains(&material.name_hash)
+        || (s.untextured && !textured)
+}
+
 /// A material record's base-colour texture (slot 0).
 pub fn base_texture(material: &Material) -> Option<u32> {
     material.textures.first().copied().filter(|&t| t != 0)
+}
+
+/// The textures a material record draws with, as (hash, holds data rather
+/// than colour): the base colour, and the specular, emissive and normal
+/// maps its technique uses.
+pub fn material_textures(material: &Material) -> Vec<(u32, bool)> {
+    let slot = |i: usize| material.textures.get(i).copied().filter(|&t| t != 0);
+    let mut out: Vec<(u32, bool)> = slot(0).map(|t| (t, false)).into_iter().collect();
+    if let Some(t) = Technique::from_hash(material.technique) {
+        if t.emissive {
+            out.extend(slot(1).map(|h| (h, false)));
+        } else if t.specular {
+            out.extend(slot(1).map(|h| (h, true)));
+        }
+        if t.normal {
+            out.extend(slot(2).map(|h| (h, true)));
+        }
+    }
+    out
+}
+
+/// Whether a normal map keeps x in alpha (the DXT5 swizzle, red left
+/// constant) rather than in red: whichever of the two varies more.
+fn alpha_holds_x(t: &DecodedTexture) -> bool {
+    // A small mip is enough to tell.
+    let Some(m) = t
+        .mips
+        .iter()
+        .find(|m| m.len() <= 64 * 64 * 4)
+        .or(t.mips.last())
+    else {
+        return false;
+    };
+    let spread = |c: usize| {
+        let n = (m.len() / 4).max(1) as f64;
+        let mean = m.chunks_exact(4).map(|p| f64::from(p[c])).sum::<f64>() / n;
+        m.chunks_exact(4)
+            .map(|p| (f64::from(p[c]) - mean).powi(2))
+            .sum::<f64>()
+            / n
+    };
+    spread(3) > spread(0)
 }
 
 /// Uploads a decoded texture, generating any mips its chain lacks.
@@ -201,7 +556,11 @@ pub fn upload_texture(
     let desc = TextureDesc {
         width: t.width,
         height: t.height,
-        format: TextureFormat::Rgba8Srgb,
+        format: if t.linear {
+            TextureFormat::Rgba8Unorm
+        } else {
+            TextureFormat::Rgba8Srgb
+        },
     };
     let generated;
     let mips: Vec<&[u8]> = if t.mips.len() as u32 == desc.full_chain_len() {
@@ -224,6 +583,13 @@ pub struct CpuPiece {
     pub local: Mat4,
     /// (first index, index count, index into the model's materials).
     pub ranges: Vec<(u32, u32, usize)>,
+    /// How `indices` are drawn: the model's strips, or a triangle list
+    /// where ranges were split by member.
+    pub topology: Topology,
+    /// For a merged batch (`TINY` geometry), the member each range draws
+    /// (by position in the batch's [`tiny_members`](CpuModel::tiny_members)),
+    /// so a member drawn by its own model can be left out; else empty.
+    pub members: Vec<u16>,
     /// Model-space centre, for sorting.
     pub centre: Vec3,
     /// For skinned geometry, the node each blend index names; empty for
@@ -232,6 +598,9 @@ pub struct CpuPiece {
     /// For rigid geometry, the node it hangs from (`local` is that node's
     /// rest transform), so posed models can move it with the node.
     pub node: Option<u16>,
+    /// The node its segment places it at (skinned or not), for showing
+    /// and hiding parts.
+    pub at: u16,
 }
 
 /// A model's geometry at one level of detail, decoded but not uploaded.
@@ -245,8 +614,41 @@ pub struct CpuModel {
     /// Groups left out because their vertex format isn't supported.
     pub skipped_groups: usize,
     /// Static collision in model space; [`from_data`](Self::from_data)
-    /// builds it, [`build`](Self::build) does not.
+    /// builds it, [`build`](Self::build) does not. A merged batch has none
+    /// of its own: its buildings' are in `members`.
     pub collision: Option<CollisionShape>,
+    /// The collision of a merged batch's buildings, one each.
+    pub members: Vec<MemberShape>,
+    /// Per node, whether its parts are hidden: intact, and wrecked (see
+    /// [`PartStates`](m2_assets::model::PartStates)). Empty when the model
+    /// switches nothing.
+    pub hidden: [Vec<bool>; 2],
+    /// Textures decoded ahead (on a loading thread, by
+    /// [`decode_textures`](Self::decode_textures)), for
+    /// [`MaterialCache::load_model_textures`] to upload without reading.
+    pub textures: Vec<(u32, Option<DecodedTexture>)>,
+    /// For a merged batch, the entity each member is (see
+    /// [`Model::tiny_members`]); empty otherwise.
+    pub tiny_members: Vec<u32>,
+    /// Per node, whether the collapse animation sinks it
+    /// ([`PartStates::sinking`](m2_assets::model::PartStates::sinking)).
+    /// Empty when nothing sinks.
+    pub sinks: Vec<bool>,
+    /// How it breaks apart when destroyed outright, for those who want
+    /// it ([`Breakup::of`](crate::Breakup::of)): neither
+    /// [`from_data`](Self::from_data) nor [`build`](Self::build) works it
+    /// out (the island's thousands of models have no use for it).
+    pub breakup: Option<std::sync::Arc<crate::Breakup>>,
+}
+
+/// The collision of one building of a merged batch (a `TINY` model).
+#[derive(Clone, Debug)]
+pub struct MemberShape {
+    pub shape: CollisionShape,
+    /// Where the shape goes: the building's own place in the world, when
+    /// it is its own model's `PHY2`; `None` for a shape cut from the
+    /// batch's geometry, which goes where the batch does.
+    pub placed: Option<(Vec3, Quat)>,
 }
 
 impl CpuModel {
@@ -260,7 +662,14 @@ impl CpuModel {
         let mut skipped_groups = 0;
         let mut lo = Vec3::splat(f32::MAX);
         let mut hi = Vec3::splat(f32::MIN);
+        let hidden = model.states.as_ref().map_or_else(Default::default, |s| {
+            [s.hidden(&model.nodes, false), s.hidden(&model.nodes, true)]
+        });
         for (segment, geometry) in model.lod(lod) {
+            let shown = !hidden[0]
+                .get(usize::from(segment.node))
+                .copied()
+                .unwrap_or(false);
             // Skinned positions are already in model space.
             let skinned = geometry.kind == GeometryKind::Skin;
             let local = match geometry.kind {
@@ -280,12 +689,24 @@ impl CpuModel {
                     skipped_groups += 1;
                     continue;
                 };
-                let ranges = group
+                let ranges: Vec<(u32, u32, usize)> = group
                     .material_ranges
                     .iter()
                     .filter(|r| r.start_index + r.index_count() <= group.indices.len() as u32)
+                    .filter(|r| {
+                        model
+                            .materials
+                            .get(r.material as usize)
+                            .is_none_or(|m| m.flags & flags::HIDDEN == 0)
+                    })
                     .map(|r| (r.start_index, r.index_count(), r.material as usize))
                     .collect();
+                let (ranges, indices, topology, members) = if geometry.kind == GeometryKind::Tiny {
+                    let (r, i, m) = split_members(group, &ranges);
+                    (r, i, Topology::TriangleList, m)
+                } else {
+                    (ranges, group.index_bytes(), TOPOLOGY, Vec::new())
+                };
                 let mut centre = Vec3::ZERO;
                 if let Some(pos) = group
                     .decl
@@ -299,17 +720,24 @@ impl CpuModel {
                         plo = plo.min(v);
                         phi = phi.max(v);
                     }
-                    lo = lo.min(plo);
-                    hi = hi.max(phi);
+                    if shown {
+                        lo = lo.min(plo);
+                        hi = hi.max(phi);
+                    }
                     centre = (plo + phi) * 0.5;
                 }
                 pieces.push(CpuPiece {
                     vertex_desc,
                     vertices: vertices.to_vec(),
-                    index_desc: group.index_buffer_desc(),
-                    indices: group.index_bytes(),
+                    index_desc: IndexBufferDesc {
+                        index_count: (indices.len() / 2) as u32,
+                        ..group.index_buffer_desc()
+                    },
+                    indices,
                     local,
                     ranges,
+                    topology,
+                    members,
                     centre,
                     bones: if skinned {
                         group.info.bone_nodes()
@@ -317,6 +745,7 @@ impl CpuModel {
                         Vec::new()
                     },
                     node: (!skinned).then_some(segment.node),
+                    at: segment.node,
                 });
             }
         }
@@ -330,6 +759,20 @@ impl CpuModel {
             bounds: (lo, hi),
             skipped_groups,
             collision: None,
+            members: Vec::new(),
+            hidden,
+            textures: Vec::new(),
+            tiny_members: if model.info.flags & ModelInfo::FLAG_TINY != 0 {
+                model.tiny_members()
+            } else {
+                Vec::new()
+            },
+            sinks: model
+                .states
+                .as_ref()
+                .filter(|s| !s.collapsing.is_empty())
+                .map_or_else(Vec::new, |s| s.sinking(&model.nodes)),
+            breakup: None,
         }
     }
 
@@ -344,10 +787,66 @@ impl CpuModel {
         Ok(cpu)
     }
 
-    /// Base-colour textures the model's materials use.
-    pub fn texture_hashes(&self) -> impl Iterator<Item = u32> + '_ {
-        self.materials.iter().filter_map(base_texture)
+    /// Textures the model's materials use, as [`material_textures`] lists
+    /// them.
+    pub fn texture_requests(&self) -> Vec<(u32, bool)> {
+        let mut out: Vec<(u32, bool)> = self.materials.iter().flat_map(material_textures).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
+
+    /// Reads and decodes the model's textures (up to `max_width` wide) into
+    /// [`textures`](Self::textures), so a loading thread does the work
+    /// rather than the frame that uploads the model.
+    pub fn decode_textures<R: Read + Seek>(&mut self, source: &mut AssetSource<R>, max_width: u32) {
+        self.textures = self
+            .texture_requests()
+            .into_iter()
+            .map(|(hash, linear)| {
+                let t = source.texture(hash, max_width).ok().map(|mut t| {
+                    t.linear = linear;
+                    t
+                });
+                (hash, t)
+            })
+            .collect();
+    }
+}
+
+/// (first index, index count, material index) draws, their index bytes
+/// and each draw's member.
+type SplitRanges = (Vec<(u32, u32, usize)>, Vec<u8>, Vec<u16>);
+
+/// Splits a merged batch's strip `ranges` by member (each vertex's
+/// position `w` is the member it belongs to), as triangle lists: the new
+/// ranges, their indices as bytes, and each range's member.
+fn split_members(
+    group: &m2_assets::model::PrimitiveGroup<'_>,
+    ranges: &[(u32, u32, usize)],
+) -> SplitRanges {
+    let member_of: Vec<u16> = group
+        .decl
+        .find(DeclUsage::Position, 0)
+        .and_then(|e| group.vertices.read(e))
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p[3].max(0.0).round() as u16)
+        .collect();
+    let (mut out, mut indices, mut members) = (Vec::new(), Vec::new(), Vec::new());
+    for &(first, count, material) in ranges {
+        let mut by_member: std::collections::BTreeMap<u16, Vec<u16>> = Default::default();
+        for tri in m2_assets::model::strip_triangles(&group.indices, first, count) {
+            let member = member_of.get(usize::from(tri[0])).copied().unwrap_or(0);
+            by_member.entry(member).or_default().extend(tri);
+        }
+        for (member, tris) in by_member {
+            out.push(((indices.len() / 2) as u32, tris.len() as u32, material));
+            indices.extend(tris.iter().flat_map(|i| i.to_le_bytes()));
+            members.push(member);
+        }
+    }
+    (out, indices, members)
 }
 
 /// One primitive group on the GPU.
@@ -356,10 +855,21 @@ struct Piece {
     vertex_buffer: VertexBufferHandle,
     index_buffer: IndexBufferHandle,
     local: Mat4,
-    ranges: Vec<(u32, u32, MaterialId)>,
+    /// First index, index count, material, and whether it blends.
+    ranges: Vec<(u32, u32, MaterialId, bool)>,
+    topology: Topology,
+    /// Per range, its batch member (empty: not a batch).
+    members: Vec<u16>,
+    /// Per range, if its material could be a vehicle's track (cut out,
+    /// as tracks' are: the AMX-30's are two-sided as well, the M1A1's
+    /// not), the texture offset per metre the track runs; else zero. A
+    /// model's coarser levels of detail aren't uploaded, so a cut-out LOD
+    /// material isn't drawn with them.
+    track: Vec<[f32; 2]>,
     centre: Vec3,
     bones: Vec<u16>,
     node: Option<u16>,
+    at: u16,
 }
 
 /// A model's geometry on the GPU, ready to draw.
@@ -371,6 +881,117 @@ pub struct GpuModel {
     pub bounds: (Vec3, Vec3),
     /// Groups left out because their vertex format isn't supported.
     pub skipped_groups: usize,
+    /// Per node, hidden intact and wrecked ([`CpuModel::hidden`]).
+    hidden: [Vec<bool>; 2],
+    /// Per node, whether the collapse animation sinks it
+    /// ([`CpuModel::sinks`]).
+    sinks: Vec<bool>,
+    /// Draw the wrecked parts instead of the intact ones.
+    pub wrecked: bool,
+    /// For a merged batch, the entity each member is.
+    pub tiny_members: Vec<u32>,
+    /// A tracked vehicle: its track materials scroll by
+    /// [`track_travel`](Self::track_travel).
+    pub tracks: bool,
+    /// Metres the tracks have run.
+    pub track_travel: f32,
+}
+
+/// How far a track's texture moves per metre the track runs where its
+/// geometry can't say. Invented: the game scrolls its tracks from code.
+const TRACK_UV_PER_METRE: f32 = 0.5;
+
+/// The texture offset per metre a track run by the range `first`, `count`
+/// of `piece` needs: along whichever of u and v runs the length of the
+/// vehicle (z), so the AMX-30's u-wise track doesn't scroll sideways as
+/// a v-wise one would (Brendan's play-test), at the texture's own rate
+/// along the vehicle (units per metre). Its sign is taken from the
+/// lower run, which must move back as the vehicle goes forward (+z,
+/// inferred); without readable positions and texture coordinates, v.
+fn track_scroll(piece: &CpuPiece, first: u32, count: u32) -> [f32; 2] {
+    let fallback = [0.0, TRACK_UV_PER_METRE];
+    let layout = &piece.vertex_desc.layout;
+    let (Some(pos), Some(uv)) = (
+        layout.find(VertexSemantic::Position),
+        layout.find(VertexSemantic::TexCoord(0)),
+    ) else {
+        return fallback;
+    };
+    let stride = layout.stride() as usize;
+    let read = |e: &VertexElement, i: usize, n: usize| -> Option<[f32; 3]> {
+        let at = i * stride + e.offset as usize;
+        let mut out = [0.0; 3];
+        for (c, o) in out.iter_mut().enumerate().take(n) {
+            *o = match e.format {
+                VertexFormat::Float2 | VertexFormat::Float3 | VertexFormat::Float4 => {
+                    let b = piece.vertices.get(at + c * 4..at + c * 4 + 4)?;
+                    f32::from_le_bytes(b.try_into().ok()?)
+                }
+                VertexFormat::Half2 | VertexFormat::Half4 => {
+                    let b = piece.vertices.get(at + c * 2..at + c * 2 + 2)?;
+                    m2_assets::vertex::half_to_f32(u16::from_le_bytes(b.try_into().ok()?))
+                }
+                _ => return None,
+            };
+        }
+        Some(out)
+    };
+    let index = |k: u32| -> Option<usize> {
+        let k = k as usize;
+        match piece.index_desc.format {
+            IndexFormat::U16 => piece
+                .indices
+                .get(k * 2..k * 2 + 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize),
+            IndexFormat::U32 => piece
+                .indices
+                .get(k * 4..k * 4 + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize),
+        }
+    };
+    // Along each edge of consecutive indices: how much u and v change
+    // with z, and on the lower run which way each goes with z.
+    let mut along = [0.0f32; 2];
+    let mut lower = [0.0f32; 2];
+    let mut run = 0.0f32;
+    let mut verts = Vec::new();
+    for k in first..first + count {
+        let Some(i) = index(k) else {
+            return fallback;
+        };
+        let (Some(p), Some(t)) = (read(pos, i, 3), read(uv, i, 2)) else {
+            return fallback;
+        };
+        verts.push((p, t));
+    }
+    let low = verts.iter().map(|(p, _)| p[1]).sum::<f32>() / verts.len().max(1) as f32;
+    for w in verts.windows(2) {
+        let ((p0, t0), (p1, t1)) = (w[0], w[1]);
+        let dz = p1[2] - p0[2];
+        run += dz * dz;
+        for a in 0..2 {
+            let d = t1[a] - t0[a];
+            along[a] += (d * dz).abs();
+            if p0[1] < low && p1[1] < low {
+                lower[a] += d * dz;
+            }
+        }
+    }
+    let a = usize::from(along[1] > along[0]);
+    if along[a] <= 0.0 {
+        return fallback;
+    }
+    // The texture's own rate along the run, so the lower run holds still
+    // on the ground (round DT: the invented 0.5 ran the AMX-30's at half
+    // the ground's speed).
+    let rate = if run > 0.0 {
+        along[a] / run
+    } else {
+        TRACK_UV_PER_METRE
+    };
+    let mut out = [0.0; 2];
+    out[a] = if lower[a] < 0.0 { -rate } else { rate };
+    out
 }
 
 impl GpuModel {
@@ -384,6 +1005,37 @@ impl GpuModel {
         for m in &cpu.materials {
             ids.push(materials.material(backend, m)?);
         }
+        // Which model draws a tinted material, as its textures may never
+        // all load to log it by.
+        let mut tinted: Vec<usize> = cpu
+            .pieces
+            .iter()
+            .flat_map(|p| p.ranges.iter().map(|r| r.2))
+            .filter(|&m| cpu.materials.get(m).is_some_and(|m| debug_tint(m, true)))
+            .collect();
+        tinted.sort_unstable();
+        tinted.dedup();
+        for m in tinted {
+            let m = &cpu.materials[m];
+            eprintln!(
+                "model {:08x} draws tinted material {:08x} (flags {:04x}, textures {:08x?})",
+                cpu.hash, m.name_hash, m.flags, m.textures
+            );
+        }
+        // `M2_LOG_FOLIAGE=on`: which models draw plain grey for want of
+        // their base texture.
+        if std::env::var("M2_LOG_FOLIAGE").as_deref() == Ok("on") {
+            for m in &cpu.materials {
+                if m.flags & flags::HIDDEN == 0
+                    && base_texture(m).is_none_or(|t| materials.texture(t).is_none())
+                {
+                    eprintln!(
+                        "foliage untextured: model {:08x} material {:08x} (flags {:04x}, textures {:08x?}), bounds {:.1?}",
+                        cpu.hash, m.name_hash, m.flags, m.textures, cpu.bounds
+                    );
+                }
+            }
+        }
         let mut pieces = Vec::with_capacity(cpu.pieces.len());
         for p in &cpu.pieces {
             let vertex_buffer = backend.create_vertex_buffer(&p.vertex_desc, Some(&p.vertices))?;
@@ -396,13 +1048,32 @@ impl GpuModel {
                     .ranges
                     .iter()
                     .map(|&(first, count, m)| {
-                        (first, count, ids.get(m).copied().unwrap_or_default())
+                        let id = ids.get(m).copied().unwrap_or_default();
+                        (first, count, id, materials.is_translucent(id))
+                    })
+                    .collect(),
+                topology: p.topology,
+                members: p.members.clone(),
+                track: p
+                    .ranges
+                    .iter()
+                    .map(|&(first, count, m)| {
+                        if cpu
+                            .materials
+                            .get(m)
+                            .is_some_and(|m| m.flags & flags::CUT_OUT != 0)
+                        {
+                            track_scroll(p, first, count)
+                        } else {
+                            [0.0; 2]
+                        }
                     })
                     .collect(),
                 // Kept in geometry space, so any transform places it.
                 centre: p.local.inverse().transform_point3(p.centre),
                 bones: p.bones.clone(),
                 node: p.node,
+                at: p.at,
             });
         }
         Ok(Self {
@@ -410,6 +1081,12 @@ impl GpuModel {
             pieces,
             bounds: cpu.bounds,
             skipped_groups: cpu.skipped_groups,
+            hidden: cpu.hidden.clone(),
+            sinks: cpu.sinks.clone(),
+            wrecked: false,
+            tiny_members: cpu.tiny_members.clone(),
+            tracks: false,
+            track_travel: 0.0,
         })
     }
 
@@ -424,15 +1101,130 @@ impl GpuModel {
     ) -> Result<Self, crate::AssetError> {
         let data = source.model(hash)?;
         let cpu = CpuModel::build(hash, &data.parse()?, lod);
-        materials.load_textures(backend, source, cpu.texture_hashes().collect::<Vec<_>>())?;
+        materials.load_textures(backend, source, cpu.texture_requests())?;
         Ok(Self::upload(backend, materials, &cpu)?)
+    }
+
+    /// Hides the pieces on the nodes `off` marks, intact and wrecked alike:
+    /// parts a template puts in a state that shows nothing (the soft-top
+    /// jeep's gun mount, [`crate::hijack::part_states`]).
+    pub fn hide(&mut self, off: &[bool]) {
+        for hidden in &mut self.hidden {
+            if hidden.len() < off.len() {
+                hidden.resize(off.len(), false);
+            }
+            for (h, &o) in hidden.iter_mut().zip(off) {
+                *h |= o;
+            }
+        }
     }
 
     /// Queues every piece at `world`, skinned geometry in its bind pose.
     pub fn draw(&self, queue: &mut DrawQueue, world: Mat4) {
-        for piece in &self.pieces {
-            Self::push(queue, piece, world, None);
+        self.draw_as(queue, world, self.wrecked);
+    }
+
+    /// As [`draw`](Self::draw), intact or `wrecked` whatever
+    /// [`wrecked`](Self::wrecked) says (one model drawn in many places).
+    pub fn draw_as(&self, queue: &mut DrawQueue, world: Mat4, wrecked: bool) {
+        for piece in self.shown(wrecked) {
+            self.push(queue, piece, world, None);
         }
+    }
+
+    /// Queues a merged batch at `world` without the members `hide` picks
+    /// (by position in [`tiny_members`](Self::tiny_members)): those drawn
+    /// by their own models.
+    pub fn draw_batch(&self, queue: &mut DrawQueue, world: Mat4, hide: &dyn Fn(u16) -> bool) {
+        for piece in self.shown(false) {
+            self.push_ranges(queue, piece, world * piece.local, None, |k| {
+                piece.members.get(k).is_none_or(|&m| !hide(m))
+            });
+        }
+    }
+
+    /// As [`draw_as`](Self::draw_as), with each rigid piece at its node's
+    /// place in the model as `nodes` has it (a loose prop's pieces flying,
+    /// [`Loose::posed`](crate::Loose::posed)); skinned pieces stay put.
+    /// Pieces on nodes `flying` marks are drawn whatever the state shows
+    /// (a broken prop's, [`Loose::flying`](crate::Loose::flying)).
+    pub fn draw_moved(
+        &self,
+        queue: &mut DrawQueue,
+        world: Mat4,
+        nodes: &[Mat4],
+        wrecked: bool,
+        flying: &[bool],
+    ) {
+        let hidden = &self.hidden[usize::from(wrecked)];
+        let at = |p: &Piece, marks: &[bool]| marks.get(usize::from(p.at)).copied().unwrap_or(false);
+        for piece in self
+            .pieces
+            .iter()
+            .filter(|p| at(p, flying) || !at(p, hidden))
+        {
+            match piece.node.and_then(|n| nodes.get(usize::from(n))) {
+                Some(&m) if piece.bones.is_empty() => self.push_at(queue, piece, world * m, None),
+                _ => self.push(queue, piece, world, None),
+            }
+        }
+    }
+
+    /// Whether the model has parts its collapse animation sinks (a
+    /// building's intact walls going down as its wreck shows).
+    pub fn sinks(&self) -> bool {
+        self.sinks.contains(&true)
+    }
+
+    /// Queues the parts the collapse animation sinks, intact, moved by
+    /// `sunk` (model space) on their way down.
+    pub fn draw_sinking(&self, queue: &mut DrawQueue, world: Mat4, sunk: Mat4) {
+        let marked = |p: &Piece| self.sinks.get(usize::from(p.at)).copied().unwrap_or(false);
+        for piece in self
+            .pieces
+            .iter()
+            .filter(|p| marked(p) && p.bones.is_empty())
+        {
+            self.push(queue, piece, world * sunk, None);
+        }
+    }
+
+    /// As [`draw_moved`](Self::draw_moved), only the pieces on nodes
+    /// `flying` marks (a broken prop's, the rest of it gone).
+    pub fn draw_flying(&self, queue: &mut DrawQueue, world: Mat4, nodes: &[Mat4], flying: &[bool]) {
+        let marked = |p: &Piece| flying.get(usize::from(p.at)).copied().unwrap_or(false);
+        for piece in self.pieces.iter().filter(|p| marked(p)) {
+            match piece.node.and_then(|n| nodes.get(usize::from(n))) {
+                Some(&m) if piece.bones.is_empty() => self.push_at(queue, piece, world * m, None),
+                _ => self.push(queue, piece, world, None),
+            }
+        }
+    }
+
+    /// What [`draw_moved`](Self::draw_moved) draws, `wrecked` or not, with
+    /// the nodes `flying` marks: how many pieces it draws at nodes not
+    /// flying, how many at nodes flying, and how many of those it draws
+    /// are skinned (which stay put, whatever their nodes do).
+    pub fn drawn_moved(&self, wrecked: bool, flying: &[bool]) -> (usize, usize, usize) {
+        let hidden = &self.hidden[usize::from(wrecked)];
+        let at = |p: &Piece, marks: &[bool]| marks.get(usize::from(p.at)).copied().unwrap_or(false);
+        let (mut rest, mut flown, mut skinned) = (0, 0, 0);
+        for p in &self.pieces {
+            if at(p, flying) {
+                flown += 1;
+            } else if !at(p, hidden) {
+                rest += 1;
+            } else {
+                continue;
+            }
+            skinned += usize::from(!p.bones.is_empty() || p.node.is_none());
+        }
+        (rest, flown, skinned)
+    }
+
+    /// Whether the model has wrecked parts to show.
+    pub fn has_wreck(&self) -> bool {
+        self.hidden[0] != self.hidden[1]
     }
 
     /// Whether any piece is skinned.
@@ -455,10 +1247,10 @@ impl GpuModel {
         skin: &[Mat4],
     ) -> Result<(), BackendError> {
         let mut palette = Vec::new();
-        for piece in &self.pieces {
+        for piece in self.shown(self.wrecked) {
             let handle = if piece.bones.is_empty() {
                 if let Some(&m) = piece.node.and_then(|n| nodes.get(usize::from(n))) {
-                    Self::push_at(queue, piece, world * m, None);
+                    self.push_at(queue, piece, world * m, None);
                     continue;
                 }
                 None
@@ -472,23 +1264,52 @@ impl GpuModel {
                 );
                 Some(backend.set_skin(&palette)?)
             };
-            Self::push(queue, piece, world, handle);
+            self.push(queue, piece, world, handle);
         }
         Ok(())
     }
 
-    fn push(queue: &mut DrawQueue, piece: &Piece, world: Mat4, skin: Option<SkinHandle>) {
-        Self::push_at(queue, piece, world * piece.local, skin);
+    /// The pieces drawn as the model stands, intact or wrecked.
+    fn shown(&self, wrecked: bool) -> impl Iterator<Item = &Piece> {
+        let hidden = &self.hidden[usize::from(wrecked)];
+        self.pieces
+            .iter()
+            .filter(|p| !hidden.get(usize::from(p.at)).copied().unwrap_or(false))
+    }
+
+    fn push(&self, queue: &mut DrawQueue, piece: &Piece, world: Mat4, skin: Option<SkinHandle>) {
+        self.push_at(queue, piece, world * piece.local, skin);
     }
 
     /// Queues `piece` with geometry-to-world `transform`.
-    fn push_at(queue: &mut DrawQueue, piece: &Piece, transform: Mat4, skin: Option<SkinHandle>) {
+    fn push_at(
+        &self,
+        queue: &mut DrawQueue,
+        piece: &Piece,
+        transform: Mat4,
+        skin: Option<SkinHandle>,
+    ) {
+        self.push_ranges(queue, piece, transform, skin, |_| true);
+    }
+
+    /// Queues the ranges of `piece` that `keep` picks (by index).
+    fn push_ranges(
+        &self,
+        queue: &mut DrawQueue,
+        piece: &Piece,
+        transform: Mat4,
+        skin: Option<SkinHandle>,
+        keep: impl Fn(usize) -> bool,
+    ) {
         let origin = transform.transform_point3(piece.centre);
-        for &(first, count, material) in &piece.ranges {
+        for (k, &(first, count, material, translucent)) in piece.ranges.iter().enumerate() {
+            if !keep(k) {
+                continue;
+            }
             queue.push(Primitive {
                 call: DrawCall {
                     material,
-                    topology: TOPOLOGY,
+                    topology: piece.topology,
                     vertex_buffer: piece.vertex_buffer,
                     geometry: Geometry::Indexed {
                         buffer: piece.index_buffer,
@@ -499,9 +1320,16 @@ impl GpuModel {
                     world: transform,
                     skin,
                     instances: None,
+                    uv_offset: match piece.track.get(k) {
+                        Some(&[u, v]) if self.tracks => [
+                            (self.track_travel * u).fract(),
+                            (self.track_travel * v).fract(),
+                        ],
+                        _ => [0.0; 2],
+                    },
                 },
                 layer: Layer::WORLD,
-                translucent: false,
+                translucent,
                 sort_origin: origin,
                 user: 0,
             });
@@ -564,6 +1392,7 @@ mod tests {
             height: 4,
             mips: vec![vec![255; 64]],
             alpha: true,
+            linear: false,
         };
         let (handle, alpha) = upload_texture(&mut backend, &t).unwrap();
         assert!(alpha);
@@ -580,6 +1409,7 @@ mod tests {
             height: 1,
             mips: vec![vec![1, 2, 3, 255]],
             alpha: false,
+            linear: false,
         };
         let cutout = DecodedTexture {
             alpha: true,
@@ -597,6 +1427,49 @@ mod tests {
 
         let m = cache.material(&mut backend, &material(2, 11)).unwrap();
         assert_eq!(backend.material(m).blend, BlendMode::Masked { cutoff: 0.5 });
+        assert!(!cache.is_translucent(m));
+        // Glass: the blend bit set, its opacity in the colour's alpha.
+        let mut glass = Material {
+            flags: 0x0091,
+            ..material(4, 11)
+        };
+        glass.constants[12] = 0.5;
+        let m = cache.material(&mut backend, &glass).unwrap();
+        assert_eq!(backend.material(m).blend, BlendMode::Translucent);
+        assert_eq!(backend.material(m).color[3], 0.5);
+        assert!(backend.material(m).double_sided);
+        assert!(cache.is_translucent(m));
+        // A light: added, even without alpha.
+        let light = Material {
+            flags: 0x0012,
+            ..material(5, 10)
+        };
+        let m = cache.material(&mut backend, &light).unwrap();
+        assert_eq!(backend.material(m).blend, BlendMode::Additive);
+        assert!(cache.is_translucent(m));
+        // A lamp lens: PgDiffEmisFP glows with constants 9-11 through slot 1.
+        let mut lamp = Material {
+            technique: 0x7ed2_de27,
+            textures: vec![10, 10],
+            ..material(6, 10)
+        };
+        lamp.constants[9..12].copy_from_slice(&[4.0, 4.0, 2.5]);
+        let m = cache.material(&mut backend, &lamp).unwrap();
+        let glow = backend.material(m).emissive.unwrap();
+        assert_eq!(glow.color, [4.0, 4.0, 2.5]);
+        assert!(glow.map.is_some());
+        // Paint: PgDiffSpecMetalNormFP mirrors by constant 14, weighted by
+        // Fresnel from constant 15.
+        let mut paint = Material {
+            technique: 0xb68e_1be7,
+            ..material(7, 10)
+        };
+        paint.constants[14] = 0.25;
+        paint.constants[15] = 3.0;
+        let m = cache.material(&mut backend, &paint).unwrap();
+        let shine = backend.material(m).reflection.unwrap();
+        assert_eq!(shine.strength, 0.25);
+        assert_eq!(shine.fresnel, Some(0.25));
 
         let m = cache.material(&mut backend, &material(3, 12)).unwrap();
         assert!(backend.material(m).texture.is_none());

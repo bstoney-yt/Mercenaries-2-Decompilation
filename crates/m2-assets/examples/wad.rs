@@ -9,13 +9,19 @@
 //! cargo run -p m2-assets --example wad -- dds     <archive.wad> <texture name> <out.dds>
 //! cargo run -p m2-assets --example wad -- models  <archive.wad>
 //! cargo run -p m2-assets --example wad -- obj     <archive.wad> <model hash> <out.obj> [lod]
+//! cargo run -p m2-assets --example wad -- material <archive.wad> <material hash>
 //! cargo run -p m2-assets --example wad -- anims   <archive.wad>
 //! cargo run -p m2-assets --example wad -- world   <archive.wad>
+//! cargo run -p m2-assets --example wad -- entities <archive.wad>
+//! cargo run -p m2-assets --example wad -- hash    <archive.wad> <name>...
+//! cargo run -p m2-assets --example wad -- grep    <archive.wad> <text> [max hits shown]
 //! cargo run -p m2-assets --example wad -- types   <archive.wad>
 //! cargo run -p m2-assets --example wad -- scripts <archive.wad>
 //! cargo run -p m2-assets --example wad -- script  <archive.wad> <script hash>
 //! cargo run -p m2-assets --example wad -- calls   <archive.wad> <callee> [first arg] [count]
 //! cargo run -p m2-assets --example wad -- strings <archive.wad> [text]
+//! cargo run -p m2-assets --example wad -- movies  <archive.wad>
+//! cargo run -p m2-assets --example wad -- fonts   <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -23,6 +29,10 @@
 //! `models` parses every model with its streamed chunks and checks indices,
 //! bounds and bone palettes; `obj` writes one level of detail of one model
 //! (by its name hash in hex) as a Wavefront `.obj` file, in model space.
+//! `material` finds every model drawing with a material (by its name hash
+//! in hex) and describes it: flags, levels of detail, segments, and for
+//! each primitive group using the material its geometry kind, vertex
+//! elements and the range of every element's values (no vertex data).
 //! `anims` decodes every animation clip, finds a model whose nodes cover its
 //! tracks, and checks quaternion lengths, frame rates, the first frame
 //! against the model's bind pose, and that sampled poses are finite; it
@@ -30,6 +40,12 @@
 //! `world` parses every terrain cell, low-resolution tile and entity layer,
 //! checks material references and that the layout layer places each cell
 //! on the 400 m grid, and summarises the components.
+//! `entities` lists every layer entity template (`civ_car 0x0012abcd` is
+//! the template `civ_car`), how many entities it has, which components they
+//! carry and which asset types its name's hash finds.
+//! `hash` prints each name's hash and the assets of the archive it keys.
+//! `grep` finds which assets hold a piece of text and shows the readable
+//! bytes around each hit, to find where a name is defined.
 //! `types` summarises every asset type: how many, their sizes, a few names
 //! and block paths, the section layout of one, any `Lua` bytecode or
 //! script-like text, and the longest readable strings in one sample, to
@@ -47,9 +63,18 @@
 //! instructions building the call and the start of any callback function
 //! named in it: how the engine function is used.
 //! `strings` lists every string table (block, count, whether its keys are
-//! sorted) and, for the strings that are exactly `text` (else contain it),
+//! sorted) and, for the text with id `text` (`VzaCon001.Objectives.001`)
+//! else the strings that are exactly `text` (else contain it),
 //! their key and the few strings stored either side, cut to 60
 //! characters: pairs of key and text to find the key hash with.
+//! `movies` parses every Scaleform movie (each copy, block by block) and
+//! lists its name (the exporter's swf name), size, stage, frame rate and
+//! count, tag and character counts and any tags that did not parse, then
+//! checks every external image names a texture in the archive.
+//! `fonts` parses every bitmap font: line height, glyph and material counts,
+//! the glyphs' code range and largest size, and each material's texture
+//! (by asset hash) with its size, checking every glyph rectangle lies on
+//! its page and agrees with the glyph's pixel size.
 //!
 //! Extracted files are for local inspection; keep them out of the repository
 //! (`dumps/` and `local/` are ignored).
@@ -71,6 +96,11 @@ use m2_assets::{
     TextureKind, Ucfx, WadArchive,
 };
 use m2_assets::{StringTable, strings::STRINGS_TYPE};
+use m2_assets::{
+    font::{FONT_TYPE, Font},
+    gfx::{Character, MOVIE_TYPE, movie_from_asset},
+    name_hash,
+};
 
 /// Type hash of texture assets.
 const TEXTURE_TYPE: u32 = 0xf011_157a;
@@ -185,14 +215,96 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {} bytes to {out}", data.len());
         }
         ("textures", []) => textures(&mut wad)?,
+        ("movies", []) => movies(&mut wad)?,
+        ("fonts", []) => fonts(&mut wad)?,
         ("dds", [name, out]) => {
             let dds = texture_dds(&mut wad, name)?;
             std::fs::write(out, &dds)?;
             println!("wrote {} bytes to {out}", dds.len());
         }
         ("models", []) => models(&mut wad)?,
+        ("material", [hash]) => material_users(&mut wad, u32::from_str_radix(hash, 16)?)?,
         ("anims", []) => anims(&mut wad)?,
         ("world", []) => world(&mut wad)?,
+        ("entities", []) => entities(&mut wad)?,
+        ("grep", [text, rest @ ..]) => {
+            // Which assets hold `text`, and the readable text around it.
+            let limit: usize = rest.first().map_or(Ok(40), |n| n.parse())?;
+            let types = index.type_hashes().to_vec();
+            let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+            let needle = text.as_bytes();
+            let mut shown = 0;
+            let mut hits = 0;
+            for (block, path) in paths.iter().enumerate() {
+                let decoded = match wad.read_block(block) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("block {block}: {e}");
+                        continue;
+                    }
+                };
+                let Ok(contents) = BlockContents::parse(&decoded) else {
+                    continue;
+                };
+                for (entry, data) in contents.iter() {
+                    let ty = types.iter().position(|&t| t == entry.type_hash);
+                    for at in memchr_all(needle, data) {
+                        hits += 1;
+                        if shown >= limit {
+                            continue;
+                        }
+                        shown += 1;
+                        let from = at.saturating_sub(48);
+                        let to = (at + needle.len() + 48).min(data.len());
+                        let around: String = data[from..to]
+                            .iter()
+                            .map(|&b| {
+                                if (0x20..0x7f).contains(&b) {
+                                    b as char
+                                } else {
+                                    '.'
+                                }
+                            })
+                            .collect();
+                        println!(
+                            "{path} {:08x} type {} {:#x}/{:#x}: {around}",
+                            entry.name_hash,
+                            ty.map_or("?".to_owned(), |t| t.to_string()),
+                            at,
+                            data.len()
+                        );
+                    }
+                }
+            }
+            println!("{hits} hits, {shown} shown");
+        }
+        ("hash", names) => {
+            // The index alone: which assets, of which types, each name finds.
+            for name in names {
+                let hash = m2_assets::name_hash(name);
+                let types: Vec<String> = index
+                    .assets()
+                    .iter()
+                    .filter(|a| a.name_hash == hash)
+                    .map(|a| {
+                        format!(
+                            "type {} ({:08x}) block {}",
+                            a.type_index,
+                            index.type_hash(a),
+                            a.block
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{hash:08x} {name}: {}",
+                    if types.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        types.join("; ")
+                    }
+                );
+            }
+        }
         ("obj", [hash, out, rest @ ..]) => {
             let hash = u32::from_str_radix(hash.trim_start_matches("0x"), 16)?;
             let lod = match rest {
@@ -561,6 +673,131 @@ fn models<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         "{} models, {chunks} streamed chunks, {groups} primitive groups, {errors} errors, {warnings} warnings",
         all.len()
     );
+    Ok(())
+}
+
+/// Describes every model drawing with the material named `material`.
+fn material_users<R: Read + Seek>(wad: &mut WadArchive<R>, material: u32) -> AnyResult<()> {
+    let mut all: HashMap<u32, ModelBytes> = HashMap::new();
+    for block in 0..wad.index().blocks().len() {
+        let _ = collect_models(wad, block, None, &mut all);
+    }
+    let mut hashes: Vec<u32> = all.keys().copied().collect();
+    hashes.sort_unstable();
+    let mut shown = 0;
+    for hash in hashes {
+        let Some(bytes) = all.get_mut(&hash) else {
+            continue;
+        };
+        let path = bytes.path.clone();
+        let Ok(model) = bytes.assemble() else {
+            continue;
+        };
+        let Some(index) = model.materials.iter().position(|m| m.name_hash == material) else {
+            continue;
+        };
+        shown += 1;
+        if shown > 6 {
+            println!("{hash:08x} {path} (more not described)");
+            continue;
+        }
+        let m = &model.materials[index];
+        println!(
+            "\n== model {hash:08x} {path}: flags {:#x}, lods {}, lod distance {}, nodes {}, materials {}, tiny members {}",
+            model.info.flags,
+            model.info.lod_count,
+            model.info.lod_distance,
+            model.nodes.len(),
+            model.materials.len(),
+            model.tiny_members().len(),
+        );
+        println!(
+            "material {index}: technique {:08x}, flags {:04x}, textures {:08x?}, constants {:?}",
+            m.technique, m.flags, m.textures, m.constants
+        );
+        for s in &model.segments {
+            let kind = model.geometry(s.slot).map(|g| format!("{:?}", g.kind));
+            println!(
+                "segment node {} slot {} lod mask {:#04b} {}",
+                s.node,
+                s.slot,
+                s.lod_mask,
+                kind.unwrap_or_else(|| "(not loaded)".into())
+            );
+        }
+        for slot in 0..model.info.slot_count as u8 {
+            let Some(g) = model.geometry(slot) else {
+                continue;
+            };
+            for (gi, group) in g.groups.iter().enumerate() {
+                let uses: Vec<String> = group
+                    .material_ranges
+                    .iter()
+                    .map(|r| format!("{}:{}", r.material, r.index_count()))
+                    .collect();
+                if !group
+                    .material_ranges
+                    .iter()
+                    .any(|r| r.material as usize == index)
+                {
+                    println!(
+                        "slot {slot} group {gi}: {:?}, ranges (material:indices) {}",
+                        g.kind,
+                        uses.join(" ")
+                    );
+                    continue;
+                }
+                println!(
+                    "slot {slot} group {gi}: {:?}, {} vertices, stride {}, ranges (material:indices) {}",
+                    g.kind,
+                    group.vertices.count,
+                    group.vertices.stride,
+                    uses.join(" ")
+                );
+                for e in group.decl.elements() {
+                    let Some(values) = group.vertices.read(e) else {
+                        println!(
+                            "  {:?}{} {:?} at {}: unreadable",
+                            e.usage, e.usage_index, e.ty, e.offset
+                        );
+                        continue;
+                    };
+                    let mut lo = [f32::MAX; 4];
+                    let mut hi = [f32::MIN; 4];
+                    let mut distinct_w = std::collections::BTreeSet::new();
+                    for v in &values {
+                        for c in 0..4 {
+                            lo[c] = lo[c].min(v[c]);
+                            hi[c] = hi[c].max(v[c]);
+                        }
+                        distinct_w.insert(v[3].to_bits());
+                    }
+                    let outside = if e.usage == DeclUsage::TexCoord {
+                        let n = values
+                            .iter()
+                            .filter(|v| {
+                                !(0.0..=1.0).contains(&v[0]) || !(0.0..=1.0).contains(&v[1])
+                            })
+                            .count();
+                        format!(", {n} outside 0..1")
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "  {:?}{} {:?} at {}: min {:.3?} max {:.3?}, {} distinct w{outside}",
+                        e.usage,
+                        e.usage_index,
+                        e.ty,
+                        e.offset,
+                        lo,
+                        hi,
+                        distinct_w.len()
+                    );
+                }
+            }
+        }
+    }
+    println!("\n{shown} models use material {material:08x}");
     Ok(())
 }
 
@@ -1049,8 +1286,9 @@ fn string_tables<R: Read + Seek>(
             );
             let Some(text) = text else { continue };
             order.sort_by_key(|e| e.1);
+            let id = m2_assets::name_hash(text);
             let exact: Vec<usize> = (0..order.len())
-                .filter(|&i| table.get(order[i].0) == Some(text))
+                .filter(|&i| order[i].0 == id || table.get(order[i].0) == Some(text))
                 .collect();
             let hits = if exact.is_empty() {
                 (0..order.len())
@@ -1478,5 +1716,398 @@ fn call_sites<R: std::io::Read + std::io::Seek>(
         }
     }
     println!("{shown} call sites shown");
+    Ok(())
+}
+
+/// Every layer entity's template, which assets its name finds, and which
+/// components its entities carry: `entity name 0x001384eb` or
+/// `_entity name 26` stems to `entity name`, whose `name_hash` is looked
+/// up in every type of the archive.
+fn entities<R: std::io::Read + std::io::Seek>(
+    wad: &mut WadArchive<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use m2_assets::Layer;
+    use m2_assets::layer::{LAYER_TYPE, TEMPLATE_DB_TYPE};
+
+    #[derive(Default)]
+    struct Template {
+        entities: usize,
+        layers: BTreeSet<String>,
+        components: BTreeSet<String>,
+        /// Type indices of the assets the stem's hash finds.
+        types: BTreeSet<usize>,
+        /// The template database's model for the name, and the
+        /// database's components of it.
+        db_model: Option<u32>,
+        db_components: Option<BTreeSet<String>>,
+    }
+
+    let types = wad.index().type_hashes().to_vec();
+    let paths: Vec<String> = wad
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    let mut assets: HashMap<u32, BTreeSet<usize>> = HashMap::new();
+    let mut layers: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut template_db: Option<Vec<u8>> = None;
+    for (block, path) in paths.iter().enumerate() {
+        let decoded = wad.read_block(block)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if let Some(t) = types.iter().position(|&t| t == e.type_hash) {
+                assets.entry(e.name_hash).or_default().insert(t);
+            }
+            if e.type_hash == LAYER_TYPE {
+                layers.push((path.clone(), data.to_vec()));
+            }
+            if e.type_hash == TEMPLATE_DB_TYPE {
+                template_db = Some(data.to_vec());
+            }
+        }
+    }
+
+    // The template database: template name to its id, model and
+    // components.
+    let mut db_models: HashMap<String, u32> = HashMap::new();
+    let mut db_components: HashMap<String, BTreeSet<String>> = HashMap::new();
+    if let Some(data) = &template_db {
+        match Layer::parse(data) {
+            Ok(db) => {
+                println!(
+                    "template database: {} components, enum {} bytes, UNIQ {} bytes, {} names",
+                    db.components.len(),
+                    db.enums.len(),
+                    db.uniq.len(),
+                    db.names().len()
+                );
+                let uniq: Vec<String> = db
+                    .uniq
+                    .iter()
+                    .take(64)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                println!("  UNIQ starts {}", uniq.join(" "));
+                let mut by_id: HashMap<u32, BTreeSet<String>> = HashMap::new();
+                for c in &db.components {
+                    let records = c.records();
+                    println!(
+                        "  {:28} {:6} records, {} fields, record {} bytes, data {} bytes{}",
+                        c.name,
+                        c.count,
+                        c.fields.len(),
+                        c.record_size,
+                        c.data.len(),
+                        if records.is_some() {
+                            ""
+                        } else {
+                            " (irregular)"
+                        }
+                    );
+                    for (id, _) in records.unwrap_or_default() {
+                        by_id.entry(id).or_default().insert(c.name.to_owned());
+                    }
+                }
+                let models = db.hashes("ModelName");
+                for (id, name) in db.names() {
+                    if let Some(&m) = models.get(&id) {
+                        db_models.insert(name.to_owned(), m);
+                    }
+                    db_components.insert(name.to_owned(), by_id.remove(&id).unwrap_or_default());
+                }
+                println!(
+                    "  {} templates have a ModelName, {} of them a model the archive holds",
+                    db_models.len(),
+                    db_models
+                        .values()
+                        .filter(|m| assets.get(m).is_some_and(|t| t.contains(&19)))
+                        .count()
+                );
+            }
+            Err(e) => eprintln!("template database: {e}"),
+        }
+    }
+
+    let stem = |name: &str| -> String {
+        let name = name.trim_start_matches('_');
+        name.rsplit_once(' ').map_or(name, |(s, _)| s).to_owned()
+    };
+    let mut templates: BTreeMap<String, Template> = BTreeMap::new();
+    // Per component: entities, and how many of them stem to an asset.
+    let mut by_component: BTreeMap<String, (usize, usize, BTreeSet<usize>)> = BTreeMap::new();
+    let mut errors = 0;
+    for (path, data) in &layers {
+        let layer = match Layer::parse(data) {
+            Ok(l) => l,
+            Err(e) => {
+                errors += 1;
+                eprintln!("layer in {path}: {e}");
+                continue;
+            }
+        };
+        let mut components: HashMap<u32, BTreeSet<String>> = HashMap::new();
+        for c in &layer.components {
+            for (entity, _) in c.records().unwrap_or_default() {
+                components
+                    .entry(entity)
+                    .or_default()
+                    .insert(c.name.to_owned());
+            }
+        }
+        for (entity, name) in layer.names() {
+            let stem = stem(name);
+            let found = assets.get(&m2_assets::name_hash(&stem));
+            let comps = components.remove(&entity).unwrap_or_default();
+            for c in &comps {
+                let e = by_component.entry(c.clone()).or_default();
+                e.0 += 1;
+                if let Some(f) = found {
+                    e.1 += 1;
+                    e.2.extend(f.iter().copied());
+                }
+            }
+            let db_model = db_models.get(&stem).copied();
+            let db_comps = db_components.get(&stem).cloned();
+            let t = templates.entry(stem).or_default();
+            t.entities += 1;
+            t.layers.insert(path.clone());
+            t.components.extend(comps);
+            if let Some(f) = found {
+                t.types.extend(f.iter().copied());
+            }
+            t.db_model = db_model;
+            t.db_components = db_comps;
+        }
+    }
+    println!("components: entities, of which the name finds an asset (of these types)");
+    for (name, (entities, found, types)) in &by_component {
+        println!("  {name:28} {entities:7} {found:7} {types:?}");
+    }
+    let mut list: Vec<(&String, &Template)> = templates.iter().collect();
+    list.sort_by_key(|(_, t)| std::cmp::Reverse(t.entities));
+    println!(
+        "{} templates over {} entities ({} in the template database, {} with a model there, {} with a model by name): count, asset types found, db model, name, components, db components, layers",
+        list.len(),
+        list.iter().map(|(_, t)| t.entities).sum::<usize>(),
+        list.iter()
+            .filter(|(_, t)| t.db_components.is_some())
+            .count(),
+        list.iter().filter(|(_, t)| t.db_model.is_some()).count(),
+        list.iter().filter(|(_, t)| t.types.contains(&19)).count(),
+    );
+    for (name, t) in list {
+        let types: Vec<String> = t.types.iter().map(|t| t.to_string()).collect();
+        let comps: Vec<&str> = t.components.iter().map(String::as_str).collect();
+        let layers: Vec<&str> = t.layers.iter().map(String::as_str).collect();
+        let db_comps: Vec<&str> = t
+            .db_components
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        println!(
+            "{:6} [{}] {} {name} {comps:?} db{db_comps:?} {}",
+            t.entities,
+            types.join(","),
+            t.db_model.map_or("-".to_owned(), |m| format!("{m:08x}")),
+            layers.join(",")
+        );
+    }
+    eprintln!("{errors} errors");
+    Ok(())
+}
+
+/// Every offset at which `needle` occurs in `hay`.
+fn memchr_all<'a>(needle: &'a [u8], hay: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    hay.windows(needle.len().max(1))
+        .enumerate()
+        .filter(move |(_, w)| !needle.is_empty() && *w == needle)
+        .map(|(i, _)| i)
+}
+
+/// The decoded blocks holding assets of `ty`, with those assets' entries.
+fn blocks_with_type<R: Read + Seek>(wad: &mut WadArchive<R>, ty: u32) -> Vec<usize> {
+    let index = wad.index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == ty)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    blocks
+}
+
+/// A texture's header, found by its asset hash.
+fn texture_info<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32) -> Option<TextureInfo> {
+    let blocks: Vec<usize> = wad
+        .index()
+        .assets_by_hash(hash)
+        .map(|a| usize::from(a.block))
+        .collect();
+    for b in blocks {
+        let decoded = wad.read_block(b).ok()?;
+        let contents = BlockContents::parse(&decoded).ok()?;
+        if let Some(e) = contents.find(hash, TEXTURE_TYPE)
+            && let Ok(t) = Texture::parse(contents.asset_data(e))
+        {
+            return Some(t.info);
+        }
+    }
+    None
+}
+
+fn movies<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    let (mut count, mut failed, mut tag_errors, mut images, mut missing) = (0, 0, 0, 0, 0);
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let path = wad.index().blocks()[block].path.clone();
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != MOVIE_TYPE {
+                continue;
+            }
+            count += 1;
+            let movie = match movie_from_asset(data) {
+                Ok(m) => m,
+                Err(err) => {
+                    println!("{:08x} {path}: {err}", e.name_hash);
+                    failed += 1;
+                    continue;
+                }
+            };
+            let s = movie.summary();
+            let name = s.exporter.as_ref().map_or("-", |x| x.4.as_str());
+            let (w, h) = movie.frame_size.size_px();
+            let tags: u32 = s.tag_counts.values().sum();
+            println!(
+                "{:08x} {name:<24} {:>8} bytes {w:>5}x{h:<4} {:>4} fps {:>5} frames {tags:>6} tags {:>4} chars {} errors  {}",
+                e.name_hash,
+                movie.body.len(),
+                movie.frame_rate,
+                movie.frame_count,
+                s.characters.len(),
+                s.errors.len(),
+                path.rsplit('\\').next().unwrap_or(&path),
+            );
+            tag_errors += s.errors.len();
+            for (timeline, code, offset) in &s.errors {
+                println!(
+                    "    tag {code} ({}) at {offset:#x} in timeline {timeline} did not parse",
+                    m2_assets::gfx::tag::name(*code)
+                );
+            }
+            for c in s.characters.values() {
+                let Character::ExternalImage(img) = c else {
+                    continue;
+                };
+                images += 1;
+                let key = if img.export_name.is_empty() {
+                    let f = img.file_name.rsplit(['\\', '/']).next().unwrap_or("");
+                    f.split('.').next().unwrap_or(f)
+                } else {
+                    img.export_name.as_str()
+                };
+                let hash = name_hash(key);
+                let index = wad.index();
+                if !index
+                    .assets_by_hash(hash)
+                    .any(|a| index.type_hash(a) == TEXTURE_TYPE)
+                {
+                    println!("    image {key:?} ({hash:08x}): no texture");
+                    missing += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "{count} movies, {failed} failed to parse, {tag_errors} tag errors, \
+         {images} external images, {missing} without a texture"
+    );
+    Ok(())
+}
+
+fn fonts<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    let (mut count, mut bad) = (0, 0);
+    let mut sizes: HashMap<u32, Option<(u16, u16)>> = HashMap::new();
+    for block in blocks_with_type(wad, FONT_TYPE) {
+        let path = wad.index().blocks()[block].path.clone();
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        let fonts: Vec<(u32, Vec<u8>)> = contents
+            .iter()
+            .filter(|(e, _)| e.type_hash == FONT_TYPE)
+            .map(|(e, d)| (e.name_hash, d.to_vec()))
+            .collect();
+        for (hash, data) in fonts {
+            count += 1;
+            let font = match Font::parse(&data) {
+                Ok(f) => f,
+                Err(err) => {
+                    println!("{hash:08x} {path}: {err}");
+                    bad += 1;
+                    continue;
+                }
+            };
+            let codes = font.glyphs.iter().map(|g| g.code);
+            let (lo, hi) = (codes.clone().min().unwrap_or(0), codes.max().unwrap_or(0));
+            let tallest = font.glyphs.iter().map(|g| g.height).max().unwrap_or(0);
+            let off_page = font.glyphs.iter().filter(|g| g.material != 0).count();
+            println!(
+                "{hash:08x} line {} tallest {} ({tallest} by glyph) +0x04 {} \
+                 {} glyphs ({off_page} off page 0) U+{lo:04X}..U+{hi:04X}  {}",
+                font.line_height,
+                font.tallest,
+                font.unk_0x04,
+                font.glyphs.len(),
+                path.rsplit('\\').next().unwrap_or(&path),
+            );
+            let sample: Vec<String> = "0 9 A g ."
+                .split(' ')
+                .filter_map(|c| {
+                    let g = font.glyph(u16::from(c.as_bytes()[0]))?;
+                    Some(format!("{c} {}x{} y+{}", g.width, g.height, g.y_offset))
+                })
+                .collect();
+            println!("    glyphs: {}", sample.join(", "));
+            for (i, m) in font.materials.iter().enumerate() {
+                let size = *sizes
+                    .entry(m.texture)
+                    .or_insert_with(|| texture_info(wad, m.texture).map(|t| (t.width, t.height)));
+                let glyphs: Vec<_> = font
+                    .glyphs
+                    .iter()
+                    .filter(|g| usize::from(g.material) == i)
+                    .collect();
+                let mut mismatched = 0;
+                if let Some((w, h)) = size {
+                    for g in &glyphs {
+                        let pw = (g.uv[2] - g.uv[0]) * f32::from(w);
+                        let ph = (g.uv[3] - g.uv[1]) * f32::from(h);
+                        let on_page = g.uv.iter().all(|x| (0.0..=1.0).contains(x));
+                        if !on_page
+                            || (pw - f32::from(g.width)).abs() > 1.5
+                            || (ph - f32::from(g.height)).abs() > 1.5
+                        {
+                            mismatched += 1;
+                        }
+                    }
+                }
+                println!(
+                    "    material {i}: texture {:08x} {} {} glyphs, {mismatched} off their rectangle",
+                    m.texture,
+                    size.map_or("not found".to_owned(), |(w, h)| format!("{w}x{h}")),
+                    glyphs.len(),
+                );
+                if size.is_none() || mismatched > 0 {
+                    bad += 1;
+                }
+            }
+        }
+    }
+    println!("{count} fonts, {bad} problems");
     Ok(())
 }

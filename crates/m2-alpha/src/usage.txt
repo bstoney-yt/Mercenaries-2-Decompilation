@@ -1,11 +1,33 @@
 m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
 
 m2-alpha [options]
+  (no options, or only --install/--config/--size/--vsync/--fullscreen:
+  the whole game, as --alpha)
+  --alpha                the game as it launches: the boot movies (EA,
+                         Pandemic), the front end (Enter starts), the first
+                         contract with its movies, then on to free roam.
+                         Movies need ffmpeg (M2_FFMPEG, beside m2-alpha, or
+                         on the PATH); Enter/Space/Escape skips one
+  --no-boot              with --alpha: no boot movies or front end
+  --movies               with --mission --screenshot: the scripts' movies
+                         wait; each is decoded offscreen and pictured
+                         (<out>-movie-<name>.ppm)
+  --after-contract <s>   with --mission --autoplay --screenshot: play on
+                         this long after the contract is done, logging
+                         where she is (Enter pressed every 4 s)
   --install <dir>        the game's install folder (holding data\vz.wad); the EA app
                          folder in Program Files is found without it
-  --spawn <x>,<z>        where on the island to start (default 450,-1950)
+  --hero <name>          who to play: mattias, jennifer (default) or chris
+                         (also `hero` in the settings, and the pause menu)
+  --spawn <x>,<z>        where on the island to start (default: the PMC's
+                         headquarters, where free roam begins after the
+                         first contract; with --mission, 450,-1950)
   --fly                  start with the free camera instead of on foot
   --model <hash>         a model to show (hex name hash; repeatable)
+  --clip <hash>[@<s>]    with --model: a clip for each model to play (hex
+                         hash; repeatable, in model order); with @seconds,
+                         held still that far in
+  --turn <degrees>       with --model: turn the models (90 shows a side)
   --gait <gait>          idle, walk, run or sprint: what characters shown
                          with --model play first; with --screenshot on the
                          island, how the player moves before the picture
@@ -13,13 +35,101 @@ m2-alpha [options]
   --size <w>x<h>         window size
   --vsync on|off
   --fullscreen
-  --sea <metres>         sea level (default -45, fitted by eye)
+  --sea <metres>         sea level (default -36, the game's water shader)
   --double-sided         start with back-face culling off (as F3)
   --screenshot <out.ppm> render one frame offscreen and exit
   --drive                with --screenshot on the island: get in the
                          nearest parked vehicle and drive it forward first
+                         (backing out first if it is boxed in, steering
+                         round what it meets)
+  --jump                 with --screenshot on the island: jump just before
+                         the picture
+  --throw                with --screenshot on the island: throw a grenade
+                         just before the picture
+  --bash                 with --screenshot on the island: a melee bash just
+                         before the picture
+  --bash-clip <hash>     with --bash: bash with this clip (one of those the
+                         "player meleebash clips:" line lists)
+  --lead <s>             with --jump, --throw or --bash: seconds before the
+                         picture she starts (default 0.2)
   --fight                with --screenshot on the island: shoot the nearest
-                         soldier, rocket a vehicle, throw a grenade first
+                         soldier, rocket a vehicle, throw a grenade first,
+                         then look at the body
+  --traffic <s>          with --screenshot on the island: play this many
+                         seconds before the picture, logging the traffic
+                         spawned from the layers' spawners every 5 s (each
+                         vehicle's place, speed and waypoint) and the five
+                         spawners nearest her
+  --fight-wait <s>       with --fight or --blast: wait this long before
+                         the picture
+  --blast                with --screenshot on the island: fire a rocket at
+                         the fuel tank or barrel nearest where she starts
+  --demolish <n>         with --screenshot on foot: rocket the nearest
+                         building (health and a collapse in its template)
+                         until it comes down, at most n rockets, logging
+                         its damage; pictures -before, -1s, -2s and -6s
+  --plough <kind>        with --drive: park facing the nearest fence,
+                         plant, lamp or box (within 150 m) and drive
+                         straight through it
+  --vehicle <name>       with --drive: get in the nearest vehicle whose
+                         name holds this (stryker, m1a1, amx30, hmmwv...)
+  --look <degrees>       with --drive: stop and swing the camera this far
+                         before the picture (turrets follow it)
+  --spawns <n>           with --screenshot: list the n spawns nearest where
+                         she starts (name, place, who they spawn)
+  --face <degrees>       with --screenshot on foot: face this way first
+                         (0 is +z, 90 is +x)
+  --aim                  with --screenshot on foot: weapon up for the picture
+  --hit-from <deg>[,..]  with --screenshot on foot: hits from these directions
+                         (degrees clockwise from where the camera looks, 0
+                         ahead) just before the picture, to see the hit arcs
+  --hud-seconds <s>      with --screenshot: run the game's HUD this long before
+                         the picture (default 2)
+  --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
+                         (gl: the supply crate's grenade launcher)
+  --satellite <stage>    with --screenshot on foot: call a Satellite Guided
+                         Bomb on the spot 45 m ahead of her (the support
+                         key, the use key, the view steered over it and
+                         confirmed, the wheel pressed in each wedge); the
+                         picture through the satellite's view (view), with
+                         the timing wheel after the first press (wheel),
+                         or --fight-wait seconds (at least 0.8) after the
+                         bomb lands (bomb)
+  --gates                with --screenshot: bring down each of the mission's
+                         gates as the satellite bomb does, four times
+                         (its pieces thrown as fast as in play, 0.6 and
+                         1.6 times as fast, then as in play with the other
+                         models mostly in its box and the island's statics
+                         in it taken down), logging how its pieces set
+                         off and where they are 2 s and 8 s on; first it
+                         lists the other models and the statics in each
+                         gate's box and pictures the place without it
+                         (-gate1-without.ppm); pictures from 50 m south of
+                         each, the first time, of the rest of it alone and
+                         its pieces alone as it breaks (-gate1-rest.ppm,
+                         -gate1-pieces.ppm), and 2 s and 8 s on
+                         (-gate1-2s.ppm, -gate1-8s.ppm), with the pieces
+                         that hardly moved and what they touch at 2 s; the
+                         last time the same at 2 s and 8 s
+                         (-gate1-alone-2s.ppm, -gate1-alone-8s.ppm);
+                         before all that it reads the fight's sounds as
+                         play does and logs which it found
+  --closeup              with --screenshot on foot: the picture from close by
+                         her right side, to see her hands
+  --pda                  with --screenshot: the picture with her PDA open
+  --behind               with --screenshot on foot: the picture from close
+                         behind her, to see the weapons on her back
+  --slung rpg|gl         with --screenshot on foot: give her this weapon in
+                         the launcher's place, on her back with the rifle up
+  --probe                with --screenshot: list what rays from where she
+                         stands hit (unseen walls, steps in the ground)
+  --wreck                with --drive: wreck the vehicle at speed at the
+                         end and log how it comes to rest
+  --fire                 with --aim or --drive: fire just before the
+                         picture
+  --grip attach|hands    draw weapons on the hand's attach node as posed
+                         (attach, the default), or held as worked out from
+                         the hands (hands)
   --mission              run the game's mission scripts: the first contract
                          starts as in the game, with its objectives and
                          markers on screen (log: m2-alpha-mission.log);
@@ -27,15 +137,66 @@ m2-alpha [options]
   --mission-driver <lua> Lua to run before the scripts start, to test them
                          (crates/m2-game/examples/drivers/vzacon001.lua
                          plays the first contract); repeatable
+  --hijack-crew <name>   every hijackable vehicle without a driver is
+                         driven by this human template, to test hijacking
+                         (I/K/J/L are the pad's Y/A/X/B; the movement
+                         keys its stick)
+  --hijack               with --screenshot --drive: hijack the vehicle
+                         (--vehicle's) instead, answering every prompt
+  --support <key>        with --mission: stock support item <key> (clusterbomb,
+                         Support) and call it in once the scripts run, to
+                         test their strikes and drops; repeatable
+  --seated               with --screenshot --drive: load the seats' clips
+                         first and show her sitting in the vehicle
+                         (also <stem>-seated.ppm before it moves)
   --mission-seconds <s>  with --screenshot: play this long instead of ten
+  --look-pickup <m>      with --screenshot: take the picture from this far
+                         off the pickup lying nearest her, looking at it
+  --mission-look <m>     with --mission --screenshot: take the picture from
+                         this far from the nearest marker, looking at it
+  --old-hud              our own stand-in HUD (health bar, weapon line,
+                         crosshair) instead of the game's own
+  --smarter-ai           the enhanced, smarter enemy soldiers (not the
+                         original game's; settings [enhanced.smarter_ai])
+  --autoplay             with --mission --screenshot: she plays the contract
+                         herself by its markers (runs to places, shoots the
+                         marked soldiers, opens and shuts her PDA when the
+                         scripts wait for it, calls a satellite bomb on the
+                         marked gates, waits for the vehicles brought and
+                         takes them, going a
+                         way planned round walls, the sea and steep
+                         ground), logging how it goes, until it is done or
+                         --mission-seconds are up; each delivery is
+                         pictured beside the screenshot as its helicopter
+                         hovers (<out>-delivery1.ppm, ...) and once its
+                         load is down (-delivery1-down.ppm), the start's
+                         boat five seconds after she is seated in it
+                         (-boat.ppm), her three seconds after she gets out
+                         of it (-ashore.ppm), what each crate leaves
+                         (-pickup1.ppm, ...), her PDA as she opens it
+                         (-pda1.ppm, ...), the satellite's view as each
+                         timing wheel comes up (-satellite1.ppm, ...) and
+                         her view two seconds after each bomb (-bomb1.ppm)
   --write-config         print the settings file and exit
 
 On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
 E gets in or out of a vehicle (a row is parked ahead of where you start).
 Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
 Fighting (mouse captured): left button or F fires, right button aims,
-1 rifle, 2 rocket launcher, G throws a grenade.
+1 rifle, 2 rocket launcher, G throws a grenade, B or the middle button
+bashes (a supply crate breaks open).
+Support: T opens the support menu, and E takes up the item's designator
+and looks through the satellite: WASD or the mouse moves its view, fire
+or E confirms, and fire or E as the timing wheel's needle passes through
+each grey wedge sends the bomb (a press outside them undoes the presses
+made; moving the view away puts the wheel away). T, 1 or 2 calls it off;
+so does being hurt. P opens and shuts the PDA (the first contract's
+scripts give the bomb once she has looked at it).
 V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
 M music on/off, Tab or right mouse captures the mouse, N next gait
 (--model), F11 fullscreen, F3 culling, F5 quick save, F9 quick load,
 Escape opens the menu (settings, save and load, quit).
+
+M2_POST=exposure=..,bloom=..,threshold=..,contrast=..,saturation=..,
+grade=r/g/b,haze=..,inscatter=..,density=.. overrides the finishing pass
+and haze (any subset; haze and inscatter multiply) for matching footage.

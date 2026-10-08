@@ -8,7 +8,7 @@
 //! INFO  0x48 bytes                      header, below
 //! HIER  0xB0 bytes per node             node hierarchy
 //! MTRL  variable records                materials
-//! TINY  u32 n + 4 bytes * n             (optional) per-sub-object records, opaque
+//! TINY  u32 n + u32 * n                (optional) per sub-object, the layer entity it is
 //! BSHP  8 bytes per blend shape         (optional) {u32 name hash, u32 0}
 //! SEGM  4 bytes per segment             {u16 node, u8 geometry slot, u8 LOD mask}
 //! PHY2, STAM/, MIXR/                    (optional) collision, state machine and
@@ -784,6 +784,275 @@ pub struct Geometry<'a> {
     pub groups: Vec<PrimitiveGroup<'a>>,
 }
 
+/// The parts of a model its state machine (`STAM`) switches: a vehicle
+/// holds its intact and its wrecked parts (body, turret, hatches) side by
+/// side, and its states show one or the other.
+///
+/// `STAM` holds `INFO`, then `SWIT` (the name hash of each switchable
+/// node), then per part a `NODE` record (the part's node, its state count)
+/// followed by its states: `STAT` (the state's name hash), then `CHDR`
+/// (handler kind: on enter or on exit, and length) and `CEXE` (commands)
+/// pairs. A `CEXE` is a token stream: 1 then an operand, 2 then a verb
+/// applying to the operands before it, 3 to end. Nodes are named by name
+/// hash; verbs include `show` and `hide`. Switchable nodes start hidden.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartStates {
+    /// The switchable nodes (`SWIT`).
+    pub switchable: Vec<u16>,
+    /// Each part's state machine.
+    pub machines: Vec<PartMachine>,
+    /// Nodes named on entering a state other than by `show` and `hide`
+    /// (a `SetState`'s part, the points a gate's break-up does something
+    /// at: its fires perhaps): (state name hash, node), each once a state,
+    /// in order.
+    pub points: Vec<(u32, u16)>,
+    /// Nodes a state starts the building collapse animation on
+    /// (`StartAnim` naming `CollapseAnim`: the template's
+    /// `BuildingCollapseAnim` sinks them, leaning, into the ground while
+    /// the wreck shows underneath), each once.
+    pub collapsing: Vec<u16>,
+}
+
+/// One part's states: what entering each shows and hides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartMachine {
+    /// The part's node (`NODE`), if named.
+    pub node: Option<u16>,
+    /// (state name hash, on entering it: (node, shown) in order).
+    pub states: Vec<(u32, Vec<(u16, bool)>)>,
+}
+
+/// The state a part is in when intact.
+pub const STATE_INTACT: u32 = 0xacb5_1200;
+/// And when wrecked.
+pub const STATE_WRECKED: u32 = 0x7687_df41;
+/// `CHDR` kind of the commands run on entering a state.
+const ON_ENTER: u32 = 0x9da9_7065;
+
+impl PartStates {
+    fn parse(u: &Ucfx<'_>, stam: usize, nodes: &[Node]) -> Self {
+        let (show, hide) = (crate::name_hash("show"), crate::name_hash("hide"));
+        let (start_anim, collapse_anim) = (
+            crate::name_hash("StartAnim"),
+            crate::name_hash("CollapseAnim"),
+        );
+        let words = |d: &[u8]| -> Vec<u32> {
+            d.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        // Nodes are named by their name hashes.
+        let named = |h: u32| {
+            nodes
+                .iter()
+                .enumerate()
+                .filter(move |(_, n)| n.name_hash == h)
+                .map(|(i, _)| i as u16)
+        };
+        let mut states = Self::default();
+        let sections = u.sections();
+        let last = (stam + sections[stam].descendants as usize).min(sections.len() - 1);
+        let mut entering = false;
+        for sec in &sections[stam + 1..=last] {
+            let Some(data) = sec.data else { continue };
+            let w = words(data);
+            match &sec.fourcc {
+                b"SWIT" => states.switchable = w.into_iter().flat_map(named).collect(),
+                b"NODE" => states.machines.push(PartMachine {
+                    node: w.first().and_then(|&h| named(h).next()),
+                    states: Vec::new(),
+                }),
+                b"STAT" => {
+                    if states.machines.is_empty() {
+                        states.machines.push(PartMachine::default());
+                    }
+                    if let (Some(m), Some(&name)) = (states.machines.last_mut(), w.first()) {
+                        m.states.push((name, Vec::new()));
+                    }
+                }
+                b"CHDR" => entering = w.first() == Some(&ON_ENTER),
+                b"CEXE" if entering => {
+                    let Some((state, commands)) =
+                        states.machines.last_mut().and_then(|m| m.states.last_mut())
+                    else {
+                        continue;
+                    };
+                    let state = *state;
+                    // The words a show or hide applies to, by position.
+                    let mut switched = vec![false; w.len()];
+                    let mut operands = Vec::new();
+                    for (k, pair) in w.chunks_exact(2).enumerate() {
+                        match (pair[0], pair[1]) {
+                            (1, _) => operands.push(2 * k + 1),
+                            (2, verb) => {
+                                if verb == show || verb == hide {
+                                    for &at in &operands {
+                                        commands.extend(named(w[at]).map(|n| (n, verb == show)));
+                                        switched[at] = true;
+                                    }
+                                }
+                                if verb == start_anim
+                                    && operands.iter().any(|&at| w[at] == collapse_anim)
+                                {
+                                    for &at in &operands {
+                                        for n in named(w[at]) {
+                                            if !states.collapsing.contains(&n) {
+                                                states.collapsing.push(n);
+                                            }
+                                        }
+                                    }
+                                }
+                                operands.clear();
+                            }
+                            _ => break,
+                        }
+                    }
+                    // Every other word naming a node, whatever names it: a
+                    // `SetState`, an effect at a locator, or a token this
+                    // reader doesn't know (a gate's break-up names its
+                    // locators after such, round 97).
+                    for (at, &x) in w.iter().enumerate() {
+                        for n in named(x) {
+                            if !switched[at] && !states.points.contains(&(state, n)) {
+                                states.points.push((state, n));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        states
+    }
+
+    /// The pieces the model breaks into as it is destroyed: nodes a state
+    /// shows (a gate's as the bomb falls on it) that it hides both intact
+    /// and wrecked, each once.
+    pub fn chunks(&self, nodes: &[Node]) -> Vec<u16> {
+        let (intact, wrecked) = (self.hidden(nodes, false), self.hidden(nodes, true));
+        let off = |n: u16| {
+            let n = usize::from(n);
+            intact.get(n).copied().unwrap_or(false) && wrecked.get(n).copied().unwrap_or(false)
+        };
+        let mut chunks: Vec<u16> = self
+            .machines
+            .iter()
+            .flat_map(|m| &m.states)
+            .flat_map(|(_, commands)| commands)
+            .filter(|&&(n, shown)| shown && off(n))
+            .map(|&(n, _)| n)
+            .collect();
+        chunks.sort_unstable();
+        chunks.dedup();
+        chunks
+    }
+
+    /// The [`points`](Self::points) named by the states that show or name
+    /// any of `chunks` (as the model breaks up: a gate's destroy state
+    /// shows them, or puts each in the state that shows it), but for the
+    /// chunks themselves: each once, in order.
+    pub fn breaking_points(&self, chunks: &[u16]) -> Vec<u16> {
+        let mut breaking: Vec<u32> = self
+            .machines
+            .iter()
+            .flat_map(|m| &m.states)
+            .filter(|(_, commands)| {
+                commands
+                    .iter()
+                    .any(|&(n, shown)| shown && chunks.contains(&n))
+            })
+            .map(|&(name, _)| name)
+            .collect();
+        breaking.extend(
+            self.points
+                .iter()
+                .filter(|(_, n)| chunks.contains(n))
+                .map(|&(state, _)| state),
+        );
+        let mut points = Vec::new();
+        for &(state, n) in &self.points {
+            if breaking.contains(&state) && !chunks.contains(&n) && !points.contains(&n) {
+                points.push(n);
+            }
+        }
+        points
+    }
+
+    /// Which of `nodes` the collapse animation sinks: those
+    /// [`collapsing`](Self::collapsing) names and everything under them.
+    pub fn sinking(&self, nodes: &[Node]) -> Vec<bool> {
+        (0..nodes.len())
+            .map(|i| {
+                let mut at = Some(i as u16);
+                let mut steps = 0;
+                while let Some(n) = at {
+                    if self.collapsing.contains(&n) {
+                        return true;
+                    }
+                    steps += 1;
+                    if steps > nodes.len() {
+                        break;
+                    }
+                    at = nodes.get(usize::from(n)).and_then(|x| x.parent);
+                }
+                false
+            })
+            .collect()
+    }
+
+    /// Which of `nodes` are hidden (with everything under them) intact,
+    /// or `wrecked`: switchable nodes start hidden, then each part enters
+    /// its intact or wrecked state (intact if it has no wrecked one).
+    pub fn hidden(&self, nodes: &[Node], wrecked: bool) -> Vec<bool> {
+        let mut off = vec![false; nodes.len()];
+        let mut any = false;
+        for &n in &self.switchable {
+            if let Some(o) = off.get_mut(usize::from(n)) {
+                *o = true;
+            }
+        }
+        for m in &self.machines {
+            let state = |name: u32| m.states.iter().find(|s| s.0 == name);
+            let entered = if wrecked {
+                state(STATE_WRECKED).or_else(|| state(STATE_INTACT))
+            } else {
+                state(STATE_INTACT)
+            };
+            for &(n, shown) in entered.map_or(&[][..], |s| &s.1) {
+                if let Some(o) = off.get_mut(usize::from(n)) {
+                    *o = !shown;
+                    any |= shown;
+                }
+            }
+        }
+        if !any {
+            // Nothing read as shown: draw everything rather than nothing.
+            return vec![false; nodes.len()];
+        }
+        let parent = |n: u16| nodes.get(usize::from(n)).and_then(|x| x.parent);
+        // A node goes with the nearest switchable node at or above it: a
+        // hidden turret takes its barrel, but a wheel shown on a wreck
+        // shows though the intact body it hangs from is hidden.
+        (0..nodes.len())
+            .map(|i| {
+                let mut at = Some(i as u16);
+                let mut steps = 0;
+                while let Some(n) = at {
+                    if self.switchable.contains(&n) {
+                        return off.get(usize::from(n)).copied().unwrap_or(false);
+                    }
+                    at = parent(n);
+                    steps += 1;
+                    if steps > nodes.len() {
+                        break;
+                    }
+                }
+                false
+            })
+            .collect()
+    }
+}
+
 /// A parsed model, with whichever streamed chunks have been added.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model<'a> {
@@ -793,8 +1062,10 @@ pub struct Model<'a> {
     pub segments: Vec<Segment>,
     /// Name hashes of the blend shape channels (top-level `BSHP`).
     pub blend_shapes: Vec<u32>,
-    /// Top-level `TINY` data, opaque.
+    /// Top-level `TINY` data: see [`tiny_members`](Self::tiny_members).
     pub tiny: Option<&'a [u8]>,
+    /// The parts the state machine (`STAM`) shows and hides, if any.
+    pub states: Option<PartStates>,
     /// Indexed by geometry slot; `None` until its chunk is added.
     slots: Vec<Option<Geometry<'a>>>,
 }
@@ -806,6 +1077,7 @@ impl<'a> Model<'a> {
         let mut sections: [Option<&'a [u8]>; 6] = [None; 6];
         const NAMES: [[u8; 4]; 6] = [*b"INFO", *b"HIER", *b"MTRL", *b"SEGM", *b"BSHP", *b"TINY"];
         let mut geom = None;
+        let mut stam = None;
         for c in u.children(None) {
             let sec = &u.sections()[c];
             match (sec.fourcc, sec.data) {
@@ -814,7 +1086,8 @@ impl<'a> Model<'a> {
                     sections[i] = Some(d);
                 }
                 (cc, None) if &cc == b"GEOM" => geom = Some(c),
-                // Collision, state machine and mixer data are not decoded.
+                (cc, None) if &cc == b"STAM" => stam = Some(c),
+                // Collision and mixer data are not decoded here.
                 (cc, _) if [*b"PHY2", *b"STAM", *b"MIXR"].contains(&cc) => {}
                 (found, _) => {
                     return Err(ModelError::UnexpectedSection {
@@ -843,6 +1116,7 @@ impl<'a> Model<'a> {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
+        let states = stam.map(|c| PartStates::parse(&u, c, &nodes));
         let mut model = Self {
             info,
             nodes,
@@ -850,10 +1124,19 @@ impl<'a> Model<'a> {
             segments,
             blend_shapes,
             tiny: sections[5],
+            states,
             slots: vec![None; info.slot_count as usize],
         };
         model.add_geom(&u, geom.ok_or(ModelError::MissingSection(*b"GEOM"))?)?;
         Ok(model)
+    }
+
+    /// The sub-objects of a merged batch (a `TINY` model): the id of the
+    /// layer entity each one is (its own building, placed in the static
+    /// layers), indexed by the `w` of the batch's vertex positions. Empty
+    /// on other models.
+    pub fn tiny_members(&self) -> Vec<u32> {
+        tiny_members(self.tiny.unwrap_or_default())
     }
 
     /// Adds a streamed chunk: an asset with the same name and type hash
@@ -1143,7 +1426,7 @@ fn parse_nodes(hier: &[u8], count: u32) -> Result<Vec<Node>, ModelError> {
 /// The triangles of the strip `indices[start..start + count]`, skipping
 /// degenerates and alternating winding as strips do. Empty if the range is
 /// outside `indices`.
-pub(crate) fn strip_triangles(indices: &[u16], start: u32, count: u32) -> Vec<[u16; 3]> {
+pub fn strip_triangles(indices: &[u16], start: u32, count: u32) -> Vec<[u16; 3]> {
     let start = start as usize;
     let Some(strip) = indices.get(start..start + count as usize) else {
         return Vec::new();
@@ -1233,9 +1516,33 @@ fn parse_segments(segm: &[u8], info: &ModelInfo) -> Result<Vec<Segment>, ModelEr
         .collect()
 }
 
+/// The records of a `TINY` section: a count, then that many entity ids.
+fn tiny_members(tiny: &[u8]) -> Vec<u32> {
+    let Some(count) = tiny.get(..4) else {
+        return Vec::new();
+    };
+    let count = u32::from_le_bytes([count[0], count[1], count[2], count[3]]) as usize;
+    tiny[4..]
+        .chunks_exact(4)
+        .take(count)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_records_are_entity_ids() {
+        let mut tiny = 2u32.to_le_bytes().to_vec();
+        tiny.extend(0x0001_0419u32.to_le_bytes());
+        tiny.extend(0x0013_84ebu32.to_le_bytes());
+        tiny.extend([7, 7]);
+        assert_eq!(tiny_members(&tiny), [0x0001_0419, 0x0013_84eb]);
+        assert_eq!(tiny_members(&[]), []);
+        assert_eq!(tiny_members(&9u32.to_le_bytes()), []);
+    }
     use crate::testutil::{UcfxNode, ucfx};
     use crate::vertex::tests::{decl, f32_to_half};
     use crate::vertex::{DeclType::*, DeclUsage::*};
@@ -1448,6 +1755,215 @@ mod tests {
         ]);
         let chunk = ucfx(&[geom(&[1], vec![kind(b"SKIN", vec![skin_group()])])]);
         (base, chunk)
+    }
+
+    #[test]
+    fn wrecks_swap_switchable_parts() {
+        let (show, hide) = (crate::name_hash("show"), crate::name_hash("hide"));
+        // Root 0 holds the intact body 1 and the wrecked body 2; the intact
+        // body holds a glow 3 (never shown) and a turret 4.
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        let exit = || leaf(b"CHDR", le(&[0xdb41_017d, 0]));
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", le(&[5, 15, 7])),
+                leaf(b"SWIT", le(&[101, 102, 103, 105])),
+                leaf(b"NODE", le(&[100, 3])),
+                leaf(b"STAT", le(&[0x0ace_072a])),
+                enter(),
+                leaf(b"CEXE", le(&[1, STATE_INTACT, 1, 100, 2, 0x9b31_491a, 3])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 101, 2, show, 1, 103, 2, hide, 3])),
+                exit(),
+                leaf(b"CEXE", le(&[1, 101, 2, hide, 3])),
+                leaf(b"STAT", le(&[STATE_WRECKED])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 102, 2, show, 1, 105, 2, show, 3])),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [
+            n(100, None),
+            n(101, Some(0)),
+            n(102, Some(0)),
+            n(103, Some(1)),
+            n(104, Some(1)),
+            n(105, Some(1)),
+        ];
+        let states = PartStates::parse(&u, stam, &nodes);
+        assert_eq!(states.switchable, vec![1, 2, 3, 5]);
+        assert_eq!(states.machines.len(), 1);
+        assert_eq!(states.machines[0].node, Some(0));
+        // The first state's other verb names the part's node.
+        assert_eq!(states.points, vec![(0x0ace_072a, 0)]);
+        assert!(states.chunks(&nodes).is_empty());
+        assert_eq!(
+            states.hidden(&nodes, false),
+            vec![false, false, true, true, false, true]
+        );
+        assert_eq!(
+            states.hidden(&nodes, true),
+            vec![false, true, false, true, true, false]
+        );
+    }
+
+    #[test]
+    fn a_break_up_shows_chunks_and_names_points() {
+        let (show, hide) = (crate::name_hash("show"), crate::name_hash("hide"));
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        // Root 0 holds the intact wall 1 (with a locator 4) and the wreck
+        // 2, which holds a chunk 3: breaking, the wall shows the wreck and
+        // the chunk, and does something (`flare`) at the locator; the
+        // chunk's own state shows it after another verb (`loose`).
+        let flare = crate::name_hash("flare");
+        let loose = crate::name_hash("loose");
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", le(&[5, 15, 7])),
+                leaf(b"SWIT", le(&[101, 102, 103])),
+                leaf(b"NODE", le(&[101, 3])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 101, 2, show, 3])),
+                leaf(b"STAT", le(&[0x6946_83eb])),
+                enter(),
+                leaf(
+                    b"CEXE",
+                    le(&[
+                        1, 101, 2, hide, 1, 102, 1, 103, 2, show, 1, 104, 2, flare, 3,
+                    ]),
+                ),
+                leaf(b"STAT", le(&[STATE_WRECKED])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 102, 2, show, 1, 101, 2, hide, 3])),
+                leaf(b"NODE", le(&[103, 2])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                leaf(b"STAT", le(&[0x37a6_05ff])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 103, 2, loose, 1, 103, 2, show, 3])),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [
+            n(100, None),
+            n(101, Some(0)),
+            n(102, Some(0)),
+            n(103, Some(2)),
+            n(104, Some(1)),
+        ];
+        let states = PartStates::parse(&u, stam, &nodes);
+        assert_eq!(
+            states.hidden(&nodes, false),
+            vec![false, false, true, true, false]
+        );
+        assert_eq!(
+            states.hidden(&nodes, true),
+            vec![false, true, false, true, true]
+        );
+        assert_eq!(states.points, vec![(0x6946_83eb, 4), (0x37a6_05ff, 3)]);
+        let chunks = states.chunks(&nodes);
+        assert_eq!(chunks, vec![3]);
+        assert_eq!(states.breaking_points(&chunks), vec![4]);
+    }
+
+    #[test]
+    fn a_break_up_that_sets_its_chunks_states_names_its_points() {
+        let show = crate::name_hash("show");
+        let set_state = 0x9b31_491a;
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        // As the gate's (round 97): breaking, the wall shows the wreck 2,
+        // puts its chunk 3 in the state that shows it, and names its
+        // locators 4 and 5 twice each after a token this reader doesn't
+        // know.
+        let breaking = [
+            [1, 102, 2, show],
+            [1, 0x37a6_05ff, 1, 103],
+            [2, set_state, 7, 104],
+            [7, 105, 7, 104],
+            [7, 105, 3, 0],
+        ]
+        .concat();
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", le(&[5, 15, 7])),
+                leaf(b"SWIT", le(&[101, 102, 103])),
+                leaf(b"NODE", le(&[101, 3])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 101, 2, show, 3])),
+                leaf(b"STAT", le(&[0x6946_83eb])),
+                enter(),
+                leaf(b"CEXE", le(&breaking)),
+                leaf(b"STAT", le(&[STATE_WRECKED])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 102, 2, show, 3])),
+                leaf(b"NODE", le(&[103, 2])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                leaf(b"STAT", le(&[0x37a6_05ff])),
+                enter(),
+                leaf(b"CEXE", le(&[1, 103, 2, show, 3])),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [
+            n(100, None),
+            n(101, Some(0)),
+            n(102, Some(0)),
+            n(103, Some(2)),
+            n(104, Some(1)),
+            n(105, Some(1)),
+        ];
+        let states = PartStates::parse(&u, stam, &nodes);
+        assert_eq!(
+            states.points,
+            vec![(0x6946_83eb, 3), (0x6946_83eb, 4), (0x6946_83eb, 5)]
+        );
+        let chunks = states.chunks(&nodes);
+        assert_eq!(chunks, vec![3]);
+        assert_eq!(states.breaking_points(&chunks), vec![4, 5]);
     }
 
     #[test]
