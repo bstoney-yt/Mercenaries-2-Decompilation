@@ -342,6 +342,8 @@ pub struct ScriptWorld {
     templates: HashMap<String, u32>,
     /// Scripted voice lines playing.
     pub vo: crate::vo::Lines,
+    /// The player has subtitles off (`Sys.SubtitlesEnabled`).
+    pub subtitles_off: bool,
     /// The score.
     pub music: crate::music::Music,
     /// Why each object is invincible (`Object.SetInvincible` reasons).
@@ -1870,7 +1872,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // cue them (`MrxVoSequence`) do their own ordering by priority, so
     // `AddSequence`/`RemoveSequence` need do nothing here.
     let vo = lib("VO")?;
-    add(&vo, "Cue", |w, _, a| {
+    // `CueWithoutSubtitles` says the same with no subtitle; `Cue` puts
+    // the line's text up as the game does, through `MrxSubtitle.Add`
+    // (see [`crate::vo`]).
+    fn cue(w: &mut ScriptWorld, a: &[Value], subtitled: bool) -> mlua::Result<MultiValue> {
         let Some(Value::String(cue)) = a.get(1) else {
             return values([Value::Boolean(false)]);
         };
@@ -1879,10 +1884,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             Some(Value::Function(f)) => Some(f.clone()),
             _ => None,
         };
-        let say = w.vo.cue(speaker, cue.to_string_lossy(), callback);
+        let subtitled = subtitled && !w.subtitles_off;
+        let say =
+            w.vo.cue(speaker, cue.to_string_lossy(), callback, subtitled);
         w.commands.push(say);
         values([Value::Boolean(true)])
-    })?;
+    }
+    add(&vo, "Cue", |w, _, a| cue(w, a, true))?;
+    add(&vo, "CueWithoutSubtitles", |w, _, a| cue(w, a, false))?;
     add(&vo, "Cancel", |w, _, a| {
         let speaker = id(a.first()).filter(|&g| g != 0);
         let cue = match a.get(1) {
@@ -1922,6 +1931,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         add(&sys, name, |_, _, _| values([Value::Nil]))?;
     }
     add(&sys, "SetSkipMission", |_, _, _| values([]))?;
+    add(&sys, "SubtitlesEnabled", |w, _, _| {
+        values([Value::Boolean(!w.subtitles_off)])
+    })?;
     // Guids print as their number.
     add(&sys, "StringToGuid", |_, _, a| {
         let g = match a.first() {

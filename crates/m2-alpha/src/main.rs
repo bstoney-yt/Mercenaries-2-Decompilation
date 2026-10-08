@@ -53,15 +53,18 @@ mod input;
 mod mission;
 mod movie;
 mod moving;
+mod multiply;
 mod npc;
 mod player;
 mod props;
 mod route;
 mod save;
 mod scene;
+mod shell;
 mod sound;
 mod startup;
 mod strikes;
+mod subtitles;
 mod support;
 mod traffic;
 mod ui;
@@ -227,6 +230,11 @@ struct Options {
     /// With `--mission --screenshot`: the scripts' movies wait for the
     /// game, which opens each, decodes a few frames and pictures one.
     movies: bool,
+    /// With `--screenshot`: the front end alone (the shell's menus),
+    /// pictured as `--shell-key`s are pressed.
+    front_end: bool,
+    /// Flash key codes pressed in the front end, two seconds apart.
+    shell_keys: Vec<i32>,
     /// With `--mission --autoplay --screenshot`: seconds to play on after
     /// the contract is done.
     after_contract: f32,
@@ -373,6 +381,12 @@ fn parse_args() -> anyhow::Result<Options> {
             "--alpha" => o.alpha = true,
             "--no-boot" => o.no_boot = true,
             "--movies" => o.movies = true,
+            "--front-end" => o.front_end = true,
+            "--shell-key" => o.shell_keys.push(
+                value()?
+                    .parse()
+                    .context("--shell-key expects a Flash key code")?,
+            ),
             "--after-contract" => o.after_contract = value()?.parse()?,
             "--old-hud" => o.old_hud = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
@@ -594,6 +608,9 @@ fn main() -> anyhow::Result<()> {
         })
     };
 
+    if let (Some(out), true, Some(install)) = (&options.screenshot, options.front_end, &install) {
+        return front_end_offscreen(&config, install, &options.shell_keys, out);
+    }
     if let Some(out) = &options.screenshot {
         return screenshot(&config, install.as_ref(), &mode, &options, out);
     }
@@ -2024,25 +2041,250 @@ fn probe_for_screenshot(game: &Game) {
 /// Starts the mission scripts, waits for them to read the archive and
 /// start the first contract, then plays on while the island streams in
 /// where they put the player, printing the objectives.
+/// Offscreen, the front end alone (`--front-end`): the shell's own menus
+/// start as after the boot movies, and once up are pictured
+/// (`<out>-front-<n>.ppm`) before the first of `keys` (Flash's key
+/// codes), and a second and a half after each; their backdrop movie plays
+/// in its box under them. Ends two seconds after the last key, when they
+/// start a new game, or after a minute without them coming up.
+fn front_end_offscreen(
+    config: &Config,
+    install: &Install,
+    keys: &[i32],
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    let (w, h) = (config.window.width, config.window.height);
+    let mut backend = WgpuBackend::headless(w, h)?;
+    let mut game = build_scene(
+        &mut backend,
+        None,
+        &Mode::Models(Showcase {
+            models: Vec::new(),
+            gait: Gait::Idle,
+            clips: Vec::new(),
+            turn: 0.0,
+        }),
+        false,
+        config.world.sea_level,
+        false,
+        config.hero,
+    )?;
+    let mut hud = ui::Hud::new();
+    let mut shell = gamehud::GameHud::start_shell(install);
+    let ffmpeg = movie::ffmpeg();
+    let mut backdrop: Option<(movie::Movie, [f32; 4])> = None;
+    let mut texture: Option<egui::TextureHandle> = None;
+    let stem = out
+        .file_stem()
+        .map_or("shot".into(), |s| s.to_string_lossy().into_owned());
+    let step = 1.0 / 30.0;
+    let (mut t, mut up_at) = (0.0f64, None::<f64>);
+    let mut pictured = 0usize;
+    loop {
+        t += step;
+        let since = up_at.map(|u| t - u);
+        // Keys at 3 s, 5 s...; pictures 1.5 s before each and after the
+        // last.
+        let mut pressed = Vec::new();
+        let mut picture = false;
+        if let Some(since) = since {
+            for (i, &k) in keys.iter().enumerate() {
+                let at = 3.0 + 2.0 * i as f64;
+                // Key 0 only waits.
+                if since < at && since + step >= at && k != 0 {
+                    pressed.extend([(k, true), (k, false)]);
+                    eprintln!("front end: key {k} at {t:.1} s");
+                }
+            }
+            for i in 0..=keys.len() {
+                let at = 1.5 + 2.0 * i as f64;
+                if since < at && since + step >= at {
+                    picture = true;
+                }
+            }
+            if since > 4.0 + 2.0 * keys.len() as f64 {
+                break;
+            }
+        } else if t > 60.0 {
+            eprintln!("front end: the menus did not come up in a minute");
+            break;
+        }
+        if shell.failed() {
+            break;
+        }
+        // The backdrop the menus ask for.
+        let wanted = shell.shell().movie.clone();
+        if wanted.as_ref().map(|(n, _)| n) != backdrop.as_ref().map(|(m, _)| &m.name) {
+            backdrop = None;
+            if let (Some((name, rect)), Some(ffmpeg)) = (&wanted, &ffmpeg) {
+                eprintln!("front end: plays {name} in {rect:?}");
+                match movie::Movie::open(ffmpeg, install, name) {
+                    Ok(m) => backdrop = Some((m, *rect)),
+                    Err(e) => eprintln!("front end: {name}: {e:#}"),
+                }
+            }
+        }
+        if let Some((m, rect)) = &mut backdrop {
+            *rect = wanted.map_or(*rect, |(_, r)| r);
+            // Whole frames over its rate, looping at its end.
+            let due = (t * m.info.fps.max(1.0)) as u64;
+            while m.frame.as_ref().is_none_or(|(n, _)| *n < due) {
+                if m.next_frame().is_none() {
+                    break;
+                }
+            }
+        }
+        let input = ui::headless_input(w, h, t);
+        let state = gamehud::HudState {
+            size: [w as f32, h as f32],
+            dt: if up_at.is_some() { step } else { 0.0 },
+            keys: pressed,
+            ..Default::default()
+        };
+        let _ = hud.build_screen(input, |ui| {
+            let ctx = ui.ctx().clone();
+            shell.update_and_wait(&ctx, state.clone(), Duration::from_secs(5));
+            let screen = ctx.content_rect();
+            let painter = ui.painter_at(screen);
+            painter.rect_filled(screen, 0.0, egui::Color32::BLACK);
+            // `M2_BACKDROP_TOP`: the backdrop over the menus, to see what
+            // covers it.
+            let top = std::env::var_os("M2_BACKDROP_TOP").is_some();
+            if top {
+                shell.paint(&painter);
+            } else {
+                shell.paint_under(&painter);
+            }
+            if let Some((m, [x0, y0, x1, y1])) = &backdrop
+                && let Some((_, rgba)) = &m.frame
+                && picture
+            {
+                let size = [m.info.width as usize, m.info.height as usize];
+                let image = egui::ColorImage::from_rgba_unmultiplied(size, rgba);
+                let t = texture.get_or_insert_with(|| {
+                    ctx.load_texture("backdrop", image.clone(), egui::TextureOptions::LINEAR)
+                });
+                t.set(image, egui::TextureOptions::LINEAR);
+                painter.image(
+                    t.id(),
+                    egui::Rect::from_min_max(egui::pos2(*x0, *y0), egui::pos2(*x1, *y1)),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            if !top {
+                shell.paint_over(&painter);
+            }
+        });
+        if up_at.is_none() && shell.ready() {
+            eprintln!("front end: the menus are up after {t:.1} s");
+            up_at = Some(t);
+        }
+        if let Some(who) = shell.take_new_game() {
+            eprintln!("front end: a new game as {who} ({})", shell::hero(&who));
+            picture = true;
+        }
+        if picture {
+            if let Some((m, rect)) = &backdrop {
+                eprintln!(
+                    "front end: backdrop {} frame {:?} in {rect:?}, over {} prims",
+                    m.name,
+                    m.frame.as_ref().map(|(n, _)| n),
+                    shell.shell().under
+                );
+                // The backdrop's frame alone, to tell it from what covers
+                // it.
+                if let Some((_, rgba)) = &m.frame {
+                    let (bw, bh) = (m.info.width, m.info.height);
+                    let mut ppm = format!("P6\n{bw} {bh}\n255\n").into_bytes();
+                    ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+                    let path = out.with_file_name(format!("{stem}-backdrop-{pictured}.ppm"));
+                    let _ = std::fs::write(path, ppm);
+                }
+            }
+            render(
+                &mut backend,
+                &mut game,
+                60.0,
+                w as f32 / h as f32,
+                Some(&mut hud),
+            )?;
+            let path = out.with_file_name(format!("{stem}-front-{pictured}.ppm"));
+            write_ppm(&backend, &path)?;
+            eprintln!("front end: pictured {}", path.display());
+            pictured += 1;
+        }
+    }
+    eprintln!("front end: done after {t:.1} s");
+    Ok(())
+}
+
 /// Offscreen, the movies the scripts are waiting on (`--movies`): each is
 /// opened, a frame three seconds in is pictured (`<out>-movie-<name>.ppm`)
 /// and its sound decoded, and the scripts are told it is over.
 fn movies_offscreen(link: &mut mission::MissionLink, install: &Install, out: &std::path::Path) {
-    while let Some(name) = link.take_movie() {
+    while let Some((name, lines)) = link.take_movie() {
         eprintln!("movies: the scripts play {name}");
+        let captions = lines.as_ref().map(|lines| {
+            let strings = link.strings().cloned().unwrap_or_default();
+            (subtitles::Captions::load(install, strings), lines.clone())
+        });
+        match &captions {
+            None => eprintln!("movies: {name} has no subtitles"),
+            Some((Err(e), _)) => eprintln!("movies: {name} subtitles: {e}"),
+            Some((Ok(c), lines)) => {
+                for l in lines {
+                    eprintln!(
+                        "movies: {name} subtitle at {:.2} s{}{}: {}",
+                        l.time,
+                        l.seconds
+                            .map(|s| format!(" for {s:.2} s"))
+                            .unwrap_or_default(),
+                        if l.top { " (top)" } else { "" },
+                        c.plain(&l.text).replace('\n', " / ")
+                    );
+                }
+            }
+        }
         match movie::ffmpeg() {
             None => eprintln!("movies: no ffmpeg; {name} skipped"),
             Some(ffmpeg) => match movie::Movie::open(&ffmpeg, install, &name) {
                 Err(e) => eprintln!("movies: {name}: {e:#}"),
                 Ok(mut m) => {
-                    let at = (m.info.fps * 3.0) as usize;
+                    // Three seconds in, or half a second into its first
+                    // subtitle, with the subtitles up then drawn on it.
+                    let mut shown = captions.as_ref().and_then(|(c, lines)| {
+                        let c = c.as_ref().ok()?;
+                        Some((c, subtitles::MovieSubtitles::new(lines.clone(), true)?))
+                    });
+                    let first = captions.as_ref().and_then(|(_, lines)| {
+                        lines
+                            .iter()
+                            .filter(|l| !l.top && l.time > 0.0)
+                            .map(|l| l.time)
+                            .reduce(f64::min)
+                    });
+                    let seconds = first.map_or(3.0, |t| t + 0.5);
+                    // The scripts count the movie's time as its frame over
+                    // 30.
+                    let at = if first.is_some() {
+                        (seconds * 30.0) as usize
+                    } else {
+                        (m.info.fps * seconds) as usize
+                    };
                     let (w, h) = (m.info.width, m.info.height);
                     let mut frame = None;
-                    for _ in 0..=at {
+                    for n in 0..=at {
                         match m.next_frame() {
                             Some(f) => frame = Some(f.to_vec()),
                             None => break,
                         }
+                        if let Some((_, s)) = &mut shown {
+                            s.update(n as u64);
+                        }
+                    }
+                    if let (Some(rgba), Some((c, s))) = (&mut frame, &shown) {
+                        c.composite(rgba, w, h, s.bottom(), s.top());
                     }
                     let stem = out
                         .file_stem()
@@ -4205,7 +4447,8 @@ impl App {
                     mission::MissionLink::start(install, self.mission_drivers.clone())
                         .with_keys(self.config.keys.clone())
                         .with_support(self.support.clone())
-                        .with_movies(self.alpha),
+                        .with_movies(self.alpha)
+                        .with_subtitles(self.config.options.subtitles),
                 ),
                 _ => None,
             },
@@ -4220,6 +4463,7 @@ impl App {
                     install.clone(),
                     !self.no_boot,
                     self.config.hero,
+                    self.config.options.subtitles,
                 )),
                 _ => None,
             },

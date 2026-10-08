@@ -21,6 +21,7 @@
 //! cargo run -p m2-assets --example wad -- calls   <archive.wad> <callee> [first arg] [count]
 //! cargo run -p m2-assets --example wad -- strings <archive.wad> [text]
 //! cargo run -p m2-assets --example wad -- movies  <archive.wad>
+//! cargo run -p m2-assets --example wad -- actions <archive.wad> <movie name>
 //! cargo run -p m2-assets --example wad -- fonts   <archive.wad>
 //! ```
 //!
@@ -216,6 +217,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         ("textures", []) => textures(&mut wad)?,
         ("movies", []) => movies(&mut wad)?,
+        ("actions", [name]) => actions(&mut wad, name)?,
         ("fonts", []) => fonts(&mut wad)?,
         ("dds", [name, out]) => {
             let dds = texture_dds(&mut wad, name)?;
@@ -1958,6 +1960,330 @@ fn texture_info<R: Read + Seek>(wad: &mut WadArchive<R>, hash: u32) -> Option<Te
         }
     }
     None
+}
+
+/// Lists a movie's timelines (the root's and each sprite's): frame
+/// labels, exported names, placed clips' names and every action, one per
+/// line, with pushed values (constants resolved). For reading what a
+/// movie's scripts wait for; the output is the game's own: keep it local.
+fn actions<R: Read + Seek>(wad: &mut WadArchive<R>, name: &str) -> AnyResult<()> {
+    let hash = m2_assets::name_hash(name);
+    let mut found = None;
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash == MOVIE_TYPE && e.name_hash == hash {
+                found = Some(movie_from_asset(data)?);
+            }
+        }
+    }
+    let movie = found.ok_or_else(|| format!("no movie {name} ({hash:08x})"))?;
+    let root: Vec<(u16, &[u8])> = movie
+        .tags
+        .iter()
+        .map(|t| (t.code, &movie.body[t.offset..t.offset + t.len]))
+        .collect();
+    timeline_actions("root", &root);
+    // Blend modes, where set.
+    let lib = m2_assets::flash::Library::new(&movie);
+    let names: HashMap<u16, String> = lib.exports.iter().map(|(n, &id)| (id, n.clone())).collect();
+    let mut timelines: Vec<(String, &m2_assets::flash::player::Timeline)> =
+        vec![("root".into(), &lib.root)];
+    for (id, t) in &lib.sprites {
+        timelines.push((format!("sprite {id}"), t));
+    }
+    for (who, t) in timelines {
+        for (f, controls) in t.frames.iter().enumerate() {
+            for c in controls {
+                if let m2_assets::flash::player::Control::Place(p) = c
+                    && let Some(blend) = p.blend.filter(|&b| b > 1)
+                {
+                    let ch = p.character;
+                    println!(
+                        "{who} frame {}: blend {blend} on depth {} character {ch:?} {:?} as {:?}",
+                        f + 1,
+                        p.depth,
+                        ch.and_then(|c| names.get(&c)),
+                        p.name
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn timeline_actions(who: &str, tags: &[(u16, &[u8])]) {
+    let mut frame = 1;
+    for &(code, data) in tags {
+        match code {
+            1 => frame += 1,
+            43 => println!("{who} frame {frame}: label {:?}", cstr(data)),
+            56 => {
+                let n = u16::from_le_bytes([data[0], data[1]]);
+                let mut p = 2;
+                for _ in 0..n {
+                    let id = u16::from_le_bytes([data[p], data[p + 1]]);
+                    let s = cstr(&data[p + 2..]);
+                    p += 3 + s.len();
+                    println!("{who}: export {id} as {s:?}");
+                }
+            }
+            39 => {
+                let id = u16::from_le_bytes([data[0], data[1]]);
+                let inner = m2_assets::flash::tags(&data[4..]);
+                timeline_actions(&format!("sprite {id}"), &inner);
+            }
+            26 | 70 => {
+                // PlaceObject2/3: the clip's name, if any.
+                let flags = data[0];
+                let mut p = if code == 70 { 2 } else { 1 } + 2;
+                let flags3 = if code == 70 { data[1] } else { 0 };
+                if code == 70 && (flags3 & 0x08 != 0 || (flags3 & 0x10 != 0 && flags & 0x02 != 0)) {
+                    p += cstr(&data[p..]).len() + 1;
+                }
+                let mut id = None;
+                if flags & 0x02 != 0 {
+                    id = Some(u16::from_le_bytes([data[p], data[p + 1]]));
+                    p += 2;
+                }
+                // The matrix and colour transform are bit-packed: the name
+                // is found only when neither is there.
+                if flags & 0x20 != 0 && flags & 0x0c == 0 {
+                    if flags & 0x10 != 0 {
+                        p += 2;
+                    }
+                    println!(
+                        "{who} frame {frame}: places {id:?} as {:?}",
+                        cstr(&data[p..])
+                    );
+                } else if flags & 0x20 != 0 {
+                    println!("{who} frame {frame}: places {id:?} (named)");
+                }
+                if flags & 0x80 != 0 {
+                    println!("{who} frame {frame}: clip events on {id:?}");
+                }
+            }
+            12 => {
+                println!("{who} frame {frame}: actions");
+                disassemble(data, "  ");
+            }
+            59 => {
+                let id = u16::from_le_bytes([data[0], data[1]]);
+                println!("{who}: init actions for {id}");
+                disassemble(&data[2..], "  ");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn cstr(data: &[u8]) -> String {
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    String::from_utf8_lossy(&data[..end]).into_owned()
+}
+
+fn disassemble(code: &[u8], indent: &str) {
+    let mut pool: Vec<String> = Vec::new();
+    let mut p = 0;
+    while p < code.len() {
+        let at = p;
+        let op = code[p];
+        p += 1;
+        if op == 0 {
+            break;
+        }
+        let mut body: &[u8] = &[];
+        if op >= 0x80 {
+            if p + 2 > code.len() {
+                break;
+            }
+            let len = usize::from(u16::from_le_bytes([code[p], code[p + 1]]));
+            p += 2;
+            body = &code[p..(p + len).min(code.len())];
+            p += len;
+        }
+        let name = match op {
+            0x04 => "nextFrame",
+            0x05 => "prevFrame",
+            0x06 => "play",
+            0x07 => "stop",
+            0x0A => "add",
+            0x0B => "subtract",
+            0x0C => "multiply",
+            0x0D => "divide",
+            0x0E => "equals",
+            0x0F => "less",
+            0x10 => "and",
+            0x11 => "or",
+            0x12 => "not",
+            0x17 => "pop",
+            0x1C => "getVariable",
+            0x1D => "setVariable",
+            0x20 => "setTarget2",
+            0x21 => "stringAdd",
+            0x22 => "getProperty",
+            0x23 => "setProperty",
+            0x24 => "cloneSprite",
+            0x26 => "trace",
+            0x34 => "getTime",
+            0x3A => "delete",
+            0x3B => "delete2",
+            0x3C => "defineLocal",
+            0x3D => "callFunction",
+            0x3E => "return",
+            0x40 => "new",
+            0x41 => "defineLocal2",
+            0x42 => "initArray",
+            0x43 => "initObject",
+            0x44 => "typeof",
+            0x47 => "add2",
+            0x48 => "less2",
+            0x49 => "equals2",
+            0x4C => "pushDuplicate",
+            0x4E => "getMember",
+            0x4F => "setMember",
+            0x50 => "increment",
+            0x51 => "decrement",
+            0x52 => "callMethod",
+            0x53 => "newMethod",
+            0x54 => "instanceOf",
+            0x66 => "strictEquals",
+            0x67 => "greater",
+            0x87 => "storeRegister",
+            0x99 => "jump",
+            0x9D => "if",
+            0x9F => "gotoFrame2",
+            0x8B => "setTarget",
+            0x94 => "with",
+            _ => "",
+        };
+        match op {
+            0x88 => {
+                pool.clear();
+                let mut q = 2;
+                while q < body.len() {
+                    let s = cstr(&body[q..]);
+                    q += s.len() + 1;
+                    pool.push(s);
+                }
+            }
+            0x96 => {
+                let mut vals = Vec::new();
+                let mut q = 0;
+                while q < body.len() {
+                    let t = body[q];
+                    q += 1;
+                    let v = match t {
+                        0 => {
+                            let s = cstr(&body[q..]);
+                            q += s.len() + 1;
+                            format!("{s:?}")
+                        }
+                        1 => {
+                            q += 4;
+                            format!(
+                                "{}",
+                                f32::from_le_bytes(body[q - 4..q].try_into().unwrap_or([0; 4]))
+                            )
+                        }
+                        2 => "null".into(),
+                        3 => "undefined".into(),
+                        4 => {
+                            q += 1;
+                            format!("r{}", body[q - 1])
+                        }
+                        5 => {
+                            q += 1;
+                            format!("{}", body[q - 1] != 0)
+                        }
+                        6 => {
+                            q += 8;
+                            let b = &body[q - 8..q];
+                            let mut swapped = [0u8; 8];
+                            swapped[..4].copy_from_slice(&b[4..]);
+                            swapped[4..].copy_from_slice(&b[..4]);
+                            format!("{}", f64::from_le_bytes(swapped))
+                        }
+                        7 => {
+                            q += 4;
+                            format!(
+                                "{}",
+                                i32::from_le_bytes(body[q - 4..q].try_into().unwrap_or([0; 4]))
+                            )
+                        }
+                        8 => {
+                            q += 1;
+                            format!(
+                                "{:?}",
+                                pool.get(usize::from(body[q - 1]))
+                                    .cloned()
+                                    .unwrap_or_default()
+                            )
+                        }
+                        9 => {
+                            q += 2;
+                            let i = usize::from(u16::from_le_bytes([body[q - 2], body[q - 1]]));
+                            format!("{:?}", pool.get(i).cloned().unwrap_or_default())
+                        }
+                        _ => break,
+                    };
+                    vals.push(v);
+                }
+                println!("{indent}{at:5} push {}", vals.join(", "));
+            }
+            0x9B => {
+                let fname = cstr(body);
+                let mut q = fname.len() + 1;
+                let n = u16::from_le_bytes([body[q], body[q + 1]]);
+                q += 2;
+                for _ in 0..n {
+                    q += cstr(&body[q..]).len() + 1;
+                }
+                let size = usize::from(u16::from_le_bytes([body[q], body[q + 1]]));
+                println!("{indent}{at:5} function {fname:?} to {}", p + size);
+            }
+            0x8E => {
+                let fname = cstr(body);
+                let mut q = fname.len() + 1;
+                let n = u16::from_le_bytes([body[q], body[q + 1]]);
+                let regs = body[q + 2];
+                let flags = u16::from_le_bytes([body[q + 3], body[q + 4]]);
+                q += 5;
+                let mut params = Vec::new();
+                for _ in 0..n {
+                    let reg = body[q];
+                    let pname = cstr(&body[q + 1..]);
+                    q += 1 + pname.len() + 1;
+                    params.push(format!("r{reg}={pname}"));
+                }
+                let size = usize::from(u16::from_le_bytes([body[q], body[q + 1]]));
+                println!(
+                    "{indent}{at:5} function2 {fname:?}({}) regs {regs} flags {flags:#06x} to {}",
+                    params.join(", "),
+                    p + size
+                );
+            }
+            0x8C => println!("{indent}{at:5} gotoLabel {:?}", cstr(body)),
+            0x81 => println!(
+                "{indent}gotoFrame {}",
+                u16::from_le_bytes([body[0], body[1]]) + 1
+            ),
+            0x83 => println!("{indent}{at:5} getURL {:?}", cstr(body)),
+            0x9A => println!("{indent}{at:5} getURL2"),
+            0x99 | 0x9D => {
+                let off = i16::from_le_bytes([body[0], body[1]]) as i64;
+                println!(
+                    "{indent}{at:5} {} -> {}",
+                    if op == 0x99 { "jump" } else { "if" },
+                    p as i64 + off
+                );
+            }
+            _ if !name.is_empty() => println!("{indent}{at:5} {name}"),
+            _ => println!("{indent}{at:5} op {op:02x}"),
+        }
+    }
 }
 
 fn movies<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {

@@ -43,6 +43,10 @@ pub struct Place {
     pub colour: Option<ColourTransform>,
     pub name: Option<String>,
     pub clip_depth: Option<u16>,
+    /// `PlaceObject3`'s blend mode, if set: 1 normal, 2 layer, 3 multiply,
+    /// 4 screen, 5 lighten, 6 darken, 7 difference, 8 add, 9 subtract,
+    /// 10 invert, 11 alpha, 12 erase, 13 overlay, 14 hard light.
+    pub blend: Option<u8>,
     /// Changes the character at the depth (with `character`, replaces it).
     pub moving: bool,
 }
@@ -137,6 +141,10 @@ fn place23(data: &[u8], three: bool) -> Place {
     }
     let name = (flags & 32 != 0).then(|| b.cstr());
     let clip_depth = (flags & 64 != 0).then(|| b.u16());
+    if flags3 & 1 != 0 {
+        skip_filters(&mut b);
+    }
+    let blend = (flags3 & 2 != 0).then(|| b.u8());
     Place {
         depth,
         character,
@@ -144,7 +152,33 @@ fn place23(data: &[u8], three: bool) -> Place {
         colour,
         name,
         clip_depth,
+        blend,
         moving: flags & 1 != 0,
+    }
+}
+
+/// Reads past a `PlaceObject3`'s filter list.
+fn skip_filters(b: &mut Bits) {
+    for _ in 0..b.u8() {
+        let len = match b.u8() {
+            0 => 23,
+            1 => 9,
+            2 => 15,
+            3 => 27,
+            4 | 7 => {
+                let n = usize::from(b.u8());
+                5 * n + 19
+            }
+            5 => {
+                let (x, y) = (usize::from(b.u8()), usize::from(b.u8()));
+                8 + 4 * x * y + 5
+            }
+            6 => 80,
+            _ => return,
+        };
+        for _ in 0..len {
+            b.u8();
+        }
     }
 }
 
@@ -323,6 +357,8 @@ pub struct Clip {
     pub colour: ColourTransform,
     pub visible: bool,
     pub clip_depth: Option<i32>,
+    /// Its blend mode (see [`Place::blend`]), 0 if never set.
+    pub blend: u8,
     /// Placed by its parent's timeline (cleared when that goes back).
     pub from_timeline: bool,
     pub timeline: Option<Rc<Timeline>>,
@@ -358,6 +394,7 @@ impl Clip {
             colour: ColourTransform::IDENTITY,
             visible: true,
             clip_depth: None,
+            blend: 0,
             from_timeline: false,
             timeline: None,
             frame: 0,
@@ -580,6 +617,7 @@ impl Player {
                         .clip_depth
                         .map(|d| i32::from(d) + TIMELINE_DEPTH)
                         .or(keep.as_ref().and_then(|o| o.clip_depth));
+                    c.blend = p.blend.or(keep.as_ref().map(|o| o.blend)).unwrap_or(0);
                     c.name = p.name.clone().or(keep.map(|o| o.name)).unwrap_or_default();
                 }
                 // A sprite shows its first frame as it is placed.
@@ -598,6 +636,9 @@ impl Player {
                     }
                     if let Some(d) = p.clip_depth {
                         c.clip_depth = Some(i32::from(d) + TIMELINE_DEPTH);
+                    }
+                    if let Some(b) = p.blend {
+                        c.blend = b;
                     }
                     if let Some(n) = &p.name {
                         c.name.clone_from(n);
@@ -690,6 +731,46 @@ impl Player {
             at = c.parent;
         }
         m
+    }
+
+    /// The clips (to `depth` levels down from the root) whose drawing
+    /// covers stage point `at`: each one's path, frame, visibility, alpha
+    /// multiplier, blend mode and how many of its triangles cover it. For
+    /// finding what hides something.
+    pub fn covering(&self, at: [f32; 2], depth: usize, fonts: &FontBook) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![(self.root, String::from("_root"), 0usize)];
+        while let Some((id, path, d)) = stack.pop() {
+            let Some(c) = self.clip(id) else { continue };
+            let mut tris = Vec::new();
+            self.draw_from(id, &Matrix::IDENTITY, fonts, &mut tris);
+            let covering: Vec<&Triangle> = tris
+                .iter()
+                .filter(|t| super::inside(at, t.corners))
+                .collect();
+            let hits = covering.len();
+            if hits == 0 {
+                continue;
+            }
+            let top = covering.last().map(|t| (t.colour, t.texture.clone()));
+            out.push(format!(
+                "{path} #{} frame {} visible {} alpha {:.2} blend {} mask {:?} covers with {hits} of {}, last {top:?}",
+                c.character,
+                c.frame + 1,
+                c.visible,
+                c.colour.mult[3],
+                c.blend,
+                c.clip_depth,
+                tris.len()
+            ));
+            if d < depth {
+                for &k in c.children.values() {
+                    let name = self.clip(k).map(|kc| kc.name.clone()).unwrap_or_default();
+                    stack.push((k, format!("{path}.{name}"), d + 1));
+                }
+            }
+        }
+        out
     }
 
     /// What is on stage as triangles, through `matrix`; text fields in the
@@ -812,6 +893,7 @@ impl Player {
         if !c.visible || nesting > 64 {
             return;
         }
+        let start = out.len();
         let m = parent_matrix.then(&c.matrix);
         let col = parent_colour.then(&c.colour);
         match &c.kind {
@@ -870,6 +952,13 @@ impl Player {
                 })
             });
             self.draw_clip(child, &m, &col, inner, fonts, out, nesting + 1);
+        }
+        // Multiply: each triangle multiplies what is under it (as the
+        // whole would, where they do not overlap).
+        if c.blend == 3 {
+            for t in &mut out[start..] {
+                t.multiply = true;
+            }
         }
     }
 }

@@ -19,6 +19,7 @@ pub struct Config {
     pub camera: CameraConfig,
     pub world: WorldConfig,
     pub keys: Bindings,
+    pub options: GameOptions,
     /// Changes from the original game, each off unless switched on.
     pub enhanced: EnhancedConfig,
 }
@@ -28,6 +29,22 @@ pub struct Config {
 pub struct EnhancedConfig {
     /// Smarter enemy soldiers (`enabled = true` to switch on).
     pub smarter_ai: crate::npc::SmarterAi,
+}
+
+/// The game's own options (its pause menu's).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GameOptions {
+    /// Subtitles for the movies and the characters' lines
+    /// (`Sys.SubtitlesEnabled`). Captions such as place names show
+    /// either way, as the game shows them.
+    pub subtitles: bool,
+}
+
+impl Default for GameOptions {
+    fn default() -> Self {
+        Self { subtitles: true }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
