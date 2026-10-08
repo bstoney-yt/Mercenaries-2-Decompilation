@@ -4164,9 +4164,17 @@ impl Running {
             info.prompt = (!v.running).then(|| format!("Hijack {}", v.vehicle));
             info.can_enter = None;
         }
+        // The hijack scripts' calls to the HUD, taken whether it runs or
+        // not.
+        let gui_calls = self
+            .hijacks
+            .as_ref()
+            .map(hijack::Hijacks::take_gui_calls)
+            .unwrap_or_default();
         if self.hud.game.is_some() {
             let mut state = gamehud::HudState::of(&mut self.game);
             state.buttons = std::mem::take(&mut self.buttons);
+            state.gui_calls = gui_calls;
             info.game = Some(state);
         }
         let (action, output) = self.hud.build(input, &info, config);

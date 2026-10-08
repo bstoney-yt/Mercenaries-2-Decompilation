@@ -174,7 +174,7 @@ end
 /// The scripts' calls to the HUD's interface through the engine's `Hud`
 /// library (`Hud.Fanfare:Create`, `:AddItem`, `:Commence` as a contract
 /// ends...), which the engine hands to the HUD's `HudInterface`: kept,
-/// with their data copied as it was, in `__m2_hud_calls` (the latest 32)
+/// with their data copied as it was, in `__m2_hud_calls` (the latest 64)
 /// for the game HUD, which runs in a Lua state of its
 /// own. Each call then goes on as it would. The groups and methods are
 /// those `MrxGuiInterface` gives `HudInterface`.
@@ -185,7 +185,8 @@ __m2_hud_call_count = 0
 __m2_hud_callbacks = {}
 local function copy(v, depth)
     if type(v) ~= "table" then
-        if type(v) == "function" or type(v) == "userdata" then return nil end
+        -- Guids (userdata) go across; the HUD's state knows them.
+        if type(v) == "function" then return nil end
         return v
     end
     if depth > 3 then return nil end
@@ -199,10 +200,22 @@ local methods = {
     ContactFanfare = { "Commence" },
     CardFanfare = { "Commence" },
     JobFanfare = { "Complete", "Failed" },
+    EventFanfare = { "Commence" },
+    TextFanfare = { "Commence" },
+    Announcement = { "Show" },
+    MapLabel = { "Show" },
+    MessageBox = { "AddMessage", "ModifyPendingMessage", "RemovePendingMessage", "Clear" },
+    SubtitleBuffer = { "AddMessage", "RemovePendingMessage", "Clear" },
+    ObjectiveTray = { "SetSlotToText", "SetSlotToImage", "SetSlotToWidget", "ClearSlot" },
+    ResourceCounter = { "SetCash", "SetFuel", "SetSuppressed", "Show", "Hide" },
+    FactionDisplay = { "Show", "SetValue", "SetInsideFactionZone", "ConfigureThresholds",
+        "AddMeter", "StartTimer", "StartPursuit", "HideMeter", "RemoveMeter",
+        "RemoveAllMeters" },
+    Tutorial = { "SetText", "ShowTutorialForObject", "ShowTutorialOnscreen" },
 }
 for group, names in pairs(methods) do
     local g = Hud and Hud[group]
-    if g then
+    if type(g) == "table" then
         for _, name in ipairs(names) do
             local f = g[name]
             g[name] = function(self, t, ...)
@@ -214,7 +227,7 @@ for group, names in pairs(methods) do
                 table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
                     group = group, method = name, data = copy(t, 0),
                     callback = callback })
-                if #__m2_hud_calls > 32 then table.remove(__m2_hud_calls, 1) end
+                if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
                 if type(f) == "function" then return f(self, t, ...) end
             end
         end
@@ -2004,6 +2017,32 @@ mod tests {
             kind: kind.into(),
             label: label.into(),
         }
+    }
+
+    #[test]
+    fn cash_and_the_objective_tray_reach_the_hud_with_their_guids() {
+        let lua = mlua::Lua::new();
+        lua.load("Hud = { ResourceCounter = {}, ObjectiveTray = {}, Radar = function() end }")
+            .exec()
+            .unwrap();
+        lua.globals()
+            .set("me", m2_game::events::guid_value(1))
+            .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        lua.load(
+            r#"Hud.ResourceCounter:SetCash({ vPlayer = me, nValue = 25000 })
+            Hud.ObjectiveTray:SetSlotToText({ vPlayer = me, nSlot = 1, sText = "4" })"#,
+        )
+        .exec()
+        .unwrap();
+        let calls = hud_calls(&lua);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].group, "ResourceCounter");
+        let Plain::Table(cash) = &calls[0].data else {
+            panic!("{:?}", calls[0].data);
+        };
+        assert!(cash.contains(&(Plain::Text("vPlayer".into()), Plain::Guid(1))));
+        assert_eq!(calls[1].method, "SetSlotToText");
     }
 
     #[test]
