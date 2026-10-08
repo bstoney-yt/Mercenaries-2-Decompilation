@@ -62,6 +62,7 @@ mod scene;
 mod sound;
 mod startup;
 mod strikes;
+mod subtitles;
 mod support;
 mod traffic;
 mod ui;
@@ -2028,21 +2029,68 @@ fn probe_for_screenshot(game: &Game) {
 /// opened, a frame three seconds in is pictured (`<out>-movie-<name>.ppm`)
 /// and its sound decoded, and the scripts are told it is over.
 fn movies_offscreen(link: &mut mission::MissionLink, install: &Install, out: &std::path::Path) {
-    while let Some(name) = link.take_movie() {
+    while let Some((name, lines)) = link.take_movie() {
         eprintln!("movies: the scripts play {name}");
+        let captions = lines.as_ref().map(|lines| {
+            let strings = link.strings().cloned().unwrap_or_default();
+            (subtitles::Captions::load(install, strings), lines.clone())
+        });
+        match &captions {
+            None => eprintln!("movies: {name} has no subtitles"),
+            Some((Err(e), _)) => eprintln!("movies: {name} subtitles: {e}"),
+            Some((Ok(c), lines)) => {
+                for l in lines {
+                    eprintln!(
+                        "movies: {name} subtitle at {:.2} s{}{}: {}",
+                        l.time,
+                        l.seconds
+                            .map(|s| format!(" for {s:.2} s"))
+                            .unwrap_or_default(),
+                        if l.top { " (top)" } else { "" },
+                        c.plain(&l.text).replace('\n', " / ")
+                    );
+                }
+            }
+        }
         match movie::ffmpeg() {
             None => eprintln!("movies: no ffmpeg; {name} skipped"),
             Some(ffmpeg) => match movie::Movie::open(&ffmpeg, install, &name) {
                 Err(e) => eprintln!("movies: {name}: {e:#}"),
                 Ok(mut m) => {
-                    let at = (m.info.fps * 3.0) as usize;
+                    // Three seconds in, or half a second into its first
+                    // subtitle, with the subtitles up then drawn on it.
+                    let mut shown = captions.as_ref().and_then(|(c, lines)| {
+                        let c = c.as_ref().ok()?;
+                        Some((c, subtitles::MovieSubtitles::new(lines.clone(), true)?))
+                    });
+                    let first = captions.as_ref().and_then(|(_, lines)| {
+                        lines
+                            .iter()
+                            .filter(|l| !l.top && l.time > 0.0)
+                            .map(|l| l.time)
+                            .reduce(f64::min)
+                    });
+                    let seconds = first.map_or(3.0, |t| t + 0.5);
+                    // The scripts count the movie's time as its frame over
+                    // 30.
+                    let at = if first.is_some() {
+                        (seconds * 30.0) as usize
+                    } else {
+                        (m.info.fps * seconds) as usize
+                    };
                     let (w, h) = (m.info.width, m.info.height);
                     let mut frame = None;
-                    for _ in 0..=at {
+                    for n in 0..=at {
                         match m.next_frame() {
                             Some(f) => frame = Some(f.to_vec()),
                             None => break,
                         }
+                        if let Some((_, s)) = &mut shown {
+                            s.update(n as u64);
+                        }
+                    }
+                    if let (Some(rgba), Some((c, s))) = (&mut frame, &shown) {
+                        c.composite(rgba, w, h, s.bottom(), s.top());
                     }
                     let stem = out
                         .file_stem()
@@ -4205,7 +4253,8 @@ impl App {
                     mission::MissionLink::start(install, self.mission_drivers.clone())
                         .with_keys(self.config.keys.clone())
                         .with_support(self.support.clone())
-                        .with_movies(self.alpha),
+                        .with_movies(self.alpha)
+                        .with_subtitles(self.config.options.subtitles),
                 ),
                 _ => None,
             },
@@ -4220,6 +4269,7 @@ impl App {
                     install.clone(),
                     !self.no_boot,
                     self.config.hero,
+                    self.config.options.subtitles,
                 )),
                 _ => None,
             },

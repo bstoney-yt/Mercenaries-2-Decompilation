@@ -301,6 +301,8 @@ pub struct MissionLink {
     /// The flow's movies wait for the game to play them
     /// ([`Mission::hold_movies`]); otherwise they end at once.
     movies: bool,
+    /// The player has subtitles on.
+    subtitles: bool,
     /// Time not yet given to the scripts.
     lag: f32,
     log: Option<BufWriter<File>>,
@@ -409,6 +411,7 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             movies: false,
+            subtitles: true,
             lag: 0.0,
             log,
             message: None,
@@ -461,16 +464,31 @@ impl MissionLink {
         Self { movies, ..self }
     }
 
-    /// The next movie the scripts are waiting on, if any: once it has
-    /// played, [`movie_done`](Self::movie_done).
-    pub fn take_movie(&mut self) -> Option<String> {
+    /// Whether the player has subtitles on (the game's option).
+    pub fn with_subtitles(self, subtitles: bool) -> Self {
+        Self { subtitles, ..self }
+    }
+
+    /// The next movie the scripts are waiting on, if any, with its
+    /// subtitles if it has them: once it has played,
+    /// [`movie_done`](Self::movie_done).
+    pub fn take_movie(&mut self) -> Option<(String, Option<Vec<m2_game::subtitles::Line>>)> {
         let State::Running(m) = &mut self.state else {
             return None;
         };
         let name = m.take_movie();
+        let subtitles = name.as_ref().and_then(|_| m.movie_subtitles());
         let lines = m.take_log();
         self.write(lines);
-        name
+        name.map(|n| (n, subtitles))
+    }
+
+    /// The game's English strings, once the scripts run.
+    pub fn strings(&self) -> Option<&m2_assets::StringTable> {
+        match &self.state {
+            State::Running(m) => Some(m.strings()),
+            _ => None,
+        }
     }
 
     /// The movie [`take_movie`](Self::take_movie) gave is over.
@@ -875,6 +893,7 @@ impl MissionLink {
                 if self.movies {
                     mission.hold_movies();
                 }
+                mission.set_subtitles(self.subtitles);
                 mission.start();
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
