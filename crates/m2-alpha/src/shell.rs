@@ -71,13 +71,43 @@ MrxGuiShellBootstrap.EnterShell()
 /// `shell.wad`, not started).
 pub fn open(mission: &mut Mission) -> Result<(), String> {
     mission.run(OPEN, "m2 shell").map_err(|e| e.to_string())?;
-    // The layouts load: their callbacks run (`ShellScreenLoaded`).
+    // The layouts load: their callbacks run (`ShellScreenLoaded`, which
+    // asks for the `Shell` game state: see [`game_states`]).
     gui_runtime::tick(mission.lua(), 0.0);
     gui_runtime::tick(mission.lua(), 0.0);
-    // The game state it asked for.
-    gui_runtime::fire(mission.lua(), "GuiGameStateChange", ("Shell", "Enter"))
-        .map_err(|e| format!("GuiGameStateChange: {e}"))?;
     Ok(())
+}
+
+/// The game states the scripts asked for (`Sys.RequestGameState`) among
+/// `commands`, entered as the engine enters them: the GUI is told the
+/// state left (`GuiGameStateChange` with `Exit`) and the one entered
+/// (`Enter`). `state` is the state the shell is in. Returns lines for the
+/// log.
+pub fn game_states(
+    lua: &Lua,
+    commands: &[m2_game::api::Command],
+    state: &mut Option<String>,
+) -> Vec<String> {
+    let mut log = Vec::new();
+    for c in commands {
+        let m2_game::api::Command::GameState(next) = c else {
+            continue;
+        };
+        let mut tell = |name: &str, phase: &str| match gui_runtime::fire(
+            lua,
+            "GuiGameStateChange",
+            (name.to_owned(), phase),
+        ) {
+            Ok(n) => log.push(format!("shell: game state {name} {phase} ({n} handlers)")),
+            Err(e) => log.push(format!("shell: game state {name} {phase}: {e}")),
+        };
+        if let Some(old) = state.take() {
+            tell(&old, "Exit");
+        }
+        tell(next, "Enter");
+        *state = Some(next.clone());
+    }
+    log
 }
 
 /// The character a new game was started as since the last call

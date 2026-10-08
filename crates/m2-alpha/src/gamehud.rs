@@ -1279,6 +1279,10 @@ struct Thread {
     /// The movies playing in the Flash widgets, by widget.
     flash: BTreeMap<u32, FlashMovie>,
     mode: Mode,
+    /// The game state the front end is in (`Shell`), once entered.
+    game_state: Option<String>,
+    /// The front end's Flash widgets' state, as last logged.
+    shell_seen: String,
 }
 
 /// The language archive beside `vz.wad` (English only for now).
@@ -1414,6 +1418,8 @@ impl Thread {
             movies: Rc::new(RefCell::new(movies)),
             flash: BTreeMap::new(),
             mode,
+            game_state: None,
+            shell_seen: String::new(),
         }
     }
 
@@ -1807,6 +1813,24 @@ impl Thread {
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
             return Output::Failed("no GUI runtime".into());
         };
+        let seen: String = screen
+            .borrow()
+            .widgets()
+            .filter(|(_, w)| matches!(w.kind, gui_runtime::Kind::Flash | gui_runtime::Kind::Movie))
+            .map(|(id, w)| {
+                format!(
+                    "{id} {:?} {:?}{}{}; ",
+                    w.swf,
+                    w.movie,
+                    if w.flash_paused { " paused" } else { "" },
+                    if w.movie_playing { " playing" } else { "" }
+                )
+            })
+            .collect();
+        if seen != self.shell_seen {
+            log.push(format!("shell widgets: {seen}"));
+            self.shell_seen = seen;
+        }
         let [w, h] = state.size;
         let items = screen.borrow().draw_list(w, h);
         let mut prims = Vec::new();
@@ -1826,7 +1850,12 @@ impl Thread {
         self.log_flash_shown(&items, &|_| true, &mut log);
         log.extend(screen.borrow_mut().take_log());
         log.extend(self.mission.take_log());
-        let _ = self.mission.take_commands();
+        let commands = self.mission.take_commands();
+        log.extend(crate::shell::game_states(
+            self.mission.lua(),
+            &commands,
+            &mut self.game_state,
+        ));
         let new_game = crate::shell::take_new_game(self.mission.lua());
         let mut images = Vec::new();
         for hash in want {
