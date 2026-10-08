@@ -1123,7 +1123,19 @@ fn run(data: &std::path::Path, rx: Receiver<HudState>, tx: Sender<Output>) {
         while let Ok(later) = rx.try_recv() {
             state.merge(later);
         }
-        let out = hud.frame(&state);
+        let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hud.frame(&state)))
+        {
+            Ok(out) => out,
+            Err(e) => {
+                let why = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default();
+                let _ = tx.send(Output::Failed(format!("the HUD's frame panicked: {why}")));
+                return;
+            }
+        };
         if tx.send(out).is_err() {
             return;
         }

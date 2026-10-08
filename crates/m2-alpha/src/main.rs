@@ -2622,6 +2622,10 @@ fn hijack_for_screenshot(
     let mut pad = hijack::Autopad::default();
     let mut t = 0.0;
     let mut shots = 0;
+    // Pictures of the buttons the scripts put up: just after each shows,
+    // and a second on (a tap's prompt stays up while she taps).
+    let mut button_shots: Vec<f32> = Vec::new();
+    let mut button_shot = 0;
     loop {
         hijacks.tick(game, &mut input, tick);
         input.button(Action::Use, false);
@@ -2635,6 +2639,9 @@ fn hijack_for_screenshot(
             state.gui_calls = hijacks.take_gui_calls();
             for c in &state.gui_calls {
                 eprintln!("hijack: t={t:.1} HUD call {}.{}", c.module, c.method);
+                if c.method == "ShowButton" {
+                    button_shots.extend([t + 0.1, t + 1.0]);
+                }
             }
             info.game = Some(state);
             let (w, h) = backend.size();
@@ -2657,6 +2664,19 @@ fn hijack_for_screenshot(
                     "{}-{shots:02}.ppm",
                     out.file_stem().and_then(|s| s.to_str()).unwrap_or("hijack")
                 ));
+                write_ppm(backend, &path)?;
+            }
+        }
+        if let Some(k) = button_shots.iter().position(|&at| t >= at) {
+            button_shots.remove(k);
+            button_shot += 1;
+            render(backend, game, fov, aspect, Some(&mut hud))?;
+            if let Some(out) = &options.screenshot {
+                let path = out.with_file_name(format!(
+                    "{}-button{button_shot:02}.ppm",
+                    out.file_stem().and_then(|s| s.to_str()).unwrap_or("hijack")
+                ));
+                eprintln!("hijack: t={t:.1} button picture {}", path.display());
                 write_ppm(backend, &path)?;
             }
         }
