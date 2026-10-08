@@ -150,6 +150,8 @@ pub struct Native {
     /// The press-start screen is up (`pressStartEnabled`), waiting for a
     /// key.
     press_start: bool,
+    /// Calls to make at the next frame.
+    pending: Vec<Call>,
 }
 
 /// The menu movie's name.
@@ -159,26 +161,46 @@ pub const MOVIE: &str = "shell";
 /// arguments.
 pub type Call = (&'static str, Vec<m2_assets::flash::avm1::Value>);
 
+/// `onlineLTIIsConnected`'s page for a new game (the main menu's New
+/// Game sets `ProfilePage` 2 and asks with it).
+const NEW_GAME_PAGE: &str = "2";
+
 impl Native {
-    /// What to call in the movie as it starts (once).
-    pub fn start(&mut self) -> Vec<Call> {
+    /// What to call in the movie now: set up as it starts (once), then
+    /// the answers to what it asked.
+    pub fn calls(&mut self) -> Vec<Call> {
         use m2_assets::flash::avm1::Value;
-        if std::mem::replace(&mut self.set_up, true) {
-            return Vec::new();
+        let mut calls = Vec::new();
+        if !std::mem::replace(&mut self.set_up, true) {
+            calls.extend([
+                ("setPlatform", vec![Value::Str("PC".into())]),
+                ("firstTimeLoad", vec![Value::Bool(true)]),
+                ("setRegion", vec![Value::Str("US".into())]),
+                ("setTerritory", vec![Value::Str("EN".into())]),
+            ]);
         }
-        vec![
-            ("setPlatform", vec![Value::Str("PC".into())]),
-            ("firstTimeLoad", vec![Value::Bool(true)]),
-            ("setRegion", vec![Value::Str("US".into())]),
-            ("setTerritory", vec![Value::Str("EN".into())]),
-        ]
+        calls.append(&mut self.pending);
+        calls
     }
 
     /// An `fscommand` no script handles: whether it is the engine's.
+    ///
+    /// `onlineLTIIsConnected` asks the PC's library whether the player
+    /// may go on to the page asked for. For a new game (single player)
+    /// the answer is `LTIgotoGame`, whose page 2 goes on to the
+    /// characters (`newGameSelect`; its trace says "new game - success").
+    /// The other pages (continue and load: saves; join: online) are not
+    /// answered.
     pub fn command(&mut self, command: &str, arg: &str) -> bool {
         match command {
             "pressStartEnabled" => {
                 self.press_start = arg != "false";
+                true
+            }
+            "onlineLTIIsConnected" => {
+                if arg == NEW_GAME_PAGE {
+                    self.pending.push(("LTIgotoGame", Vec::new()));
+                }
                 true
             }
             _ => false,
@@ -199,20 +221,33 @@ impl Native {
 mod tests {
     use super::*;
 
+    fn names(calls: Vec<Call>) -> Vec<&'static str> {
+        calls.into_iter().map(|c| c.0).collect()
+    }
+
     #[test]
     fn the_movie_is_set_up_once_and_enter_starts_the_shell_from_press_start() {
         let mut n = Native::default();
-        let first: Vec<_> = n.start().into_iter().map(|c| c.0).collect();
         assert_eq!(
-            first,
+            names(n.calls()),
             ["setPlatform", "firstTimeLoad", "setRegion", "setTerritory"]
         );
-        assert!(n.start().is_empty());
+        assert!(n.calls().is_empty());
         assert!(n.key(13).is_empty());
         assert!(n.command("pressStartEnabled", "true"));
         assert!(n.key(32).is_empty());
-        assert_eq!(n.key(13)[0].0, "startShell");
+        assert_eq!(names(n.key(13)), ["startShell"]);
         assert!(n.key(13).is_empty());
         assert!(!n.command("startMovie", "x"));
+    }
+
+    #[test]
+    fn a_new_game_goes_on_to_the_characters() {
+        let mut n = Native::default();
+        n.calls();
+        assert!(n.command("onlineLTIIsConnected", "3"));
+        assert!(n.calls().is_empty());
+        assert!(n.command("onlineLTIIsConnected", "2"));
+        assert_eq!(names(n.calls()), ["LTIgotoGame"]);
     }
 }
