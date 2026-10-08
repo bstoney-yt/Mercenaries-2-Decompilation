@@ -52,6 +52,12 @@ pub struct Marker {
     /// Shown from `near` to `far` metres away.
     pub near: f32,
     pub far: f32,
+    /// The call's two sizes (its third and eleventh arguments: 32 and 32
+    /// in the first contract's); which is for what isn't known yet.
+    pub sizes: [f32; 2],
+    /// The call's last argument ("2D only"), as given; what it changes
+    /// isn't known yet.
+    pub flat: bool,
 }
 
 /// What the scripts want shown.
@@ -335,6 +341,8 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
                 height: f(7, 0.0),
                 near: f(8, 5.0),
                 far: f(9, 175.0),
+                sizes: [f(2, 0.0), f(10, 0.0)],
+                flat: matches!(a.get(12), Some(Value::Boolean(true))),
             },
         );
         Ok(MultiValue::from_vec(vec![guid_value(handle)]))
@@ -451,6 +459,7 @@ mod tests {
             );
             let m = hud.markers.values().next().unwrap();
             assert_eq!((m.target, m.height, m.far), (Some(734_801), 2.0, 175.0));
+            assert_eq!((m.sizes, m.flat), ([32.0, 32.0], false));
         }
         host.lua()
             .load(
