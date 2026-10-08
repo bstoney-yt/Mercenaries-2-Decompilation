@@ -2248,12 +2248,22 @@ fn disassemble(code: &[u8], indent: &str) {
                 let fname = cstr(body);
                 let mut q = fname.len() + 1;
                 let n = u16::from_le_bytes([body[q], body[q + 1]]);
+                let regs = body[q + 2];
+                let flags = u16::from_le_bytes([body[q + 3], body[q + 4]]);
                 q += 5;
+                let mut params = Vec::new();
                 for _ in 0..n {
-                    q += 1 + cstr(&body[q + 1..]).len() + 1;
+                    let reg = body[q];
+                    let pname = cstr(&body[q + 1..]);
+                    q += 1 + pname.len() + 1;
+                    params.push(format!("r{reg}={pname}"));
                 }
                 let size = usize::from(u16::from_le_bytes([body[q], body[q + 1]]));
-                println!("{indent}{at:5} function2 {fname:?} to {}", p + size);
+                println!(
+                    "{indent}{at:5} function2 {fname:?}({}) regs {regs} flags {flags:#06x} to {}",
+                    params.join(", "),
+                    p + size
+                );
             }
             0x8C => println!("{indent}{at:5} gotoLabel {:?}", cstr(body)),
             0x81 => println!(
