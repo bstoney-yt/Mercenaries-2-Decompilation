@@ -2235,6 +2235,17 @@ impl Combat {
         let forward = body.transform_vector3(Vec3::Z).normalize_or(Vec3::Z);
         let aim = (goal - from).normalize_or(forward);
         let w = &m.weapon;
+        if self.ripple == 1 {
+            eprintln!(
+                "vehicle fire: {} ({:?}, {:.0} a minute) from node {node:?} at {from:.2}, {} hardpoints, ammo {:.0} m/s {:?}",
+                w.name,
+                w.flight(),
+                w.rate_of_fire,
+                m.nodes.len(),
+                w.ammo.velocity,
+                w.ammo.burst().map(|b| (b.radius, b.damage))
+            );
+        }
         let gap = w.gap();
         if priority == 0 {
             self.reload = gap;

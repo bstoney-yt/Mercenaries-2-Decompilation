@@ -1555,9 +1555,9 @@ impl Scene {
                 _ if fight.designator => self.arsenal.designator.as_ref(),
                 (Some(_), _) if fight.grenade_in_hand() => self.arsenal.grenade.as_ref(),
                 (Some(_), _) => None,
-                (None, Weapon::Rifle) => self.arsenal.hers(&fight.rifle),
-                (None, Weapon::Rpg) => self.arsenal.rpg.as_ref(),
-                (None, Weapon::GrenadeLauncher) => self.arsenal.launcher.as_ref(),
+                (None, Weapon::Rifle) => self.arsenal.of_gun(&fight.rifle),
+                (None, Weapon::Rpg) => self.arsenal.of_gun(&fight.launcher),
+                (None, Weapon::GrenadeLauncher) => self.arsenal.of_gun(&fight.launcher),
             };
             if !player.down
                 && let Some(w) = weapon
@@ -1575,9 +1575,9 @@ impl Scene {
             let holding = !fight.designator && player.throwing.is_none() && !player.down;
             for (slot, slung) in fight.slung(holding).into_iter().enumerate() {
                 let model = match slung {
-                    Some(Weapon::Rifle) => self.arsenal.hers(&fight.rifle),
-                    Some(Weapon::Rpg) => self.arsenal.rpg.as_ref(),
-                    Some(Weapon::GrenadeLauncher) => self.arsenal.launcher.as_ref(),
+                    Some(Weapon::Rifle) => self.arsenal.of_gun(&fight.rifle),
+                    Some(Weapon::Rpg) => self.arsenal.of_gun(&fight.launcher),
+                    Some(Weapon::GrenadeLauncher) => self.arsenal.of_gun(&fight.launcher),
                     None => None,
                 };
                 if let Some(w) = model
