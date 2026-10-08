@@ -1,9 +1,25 @@
 name: CI
 
+# Runs on Brendan's PC (a self-hosted Windows x64 runner labelled m2-pc),
+# not GitHub's machines: the private repo's free Actions minutes ran out.
+# The runner keeps its checkout and target directory between runs, so
+# builds are incremental and need no cache step.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+# A new push to a PR cancels the run it supersedes; runs on main finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,13 +27,12 @@ env:
 
 jobs:
   host:
-    name: Lint and test (Linux host)
-    runs-on: ubuntu-latest
+    name: Lint and test (host)
+    runs-on: [self-hosted, Windows, X64, m2-pc]
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml installs the pinned toolchain and the i686 target.
       - run: rustup show
-      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
@@ -25,18 +40,17 @@ jobs:
 
   windows-i686:
     name: Build (i686-pc-windows-msvc)
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, m2-pc]
+    needs: host
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      # Lints the Windows target here, where the C parts (the vendored Lua
-      # in m2-game) can be compiled.
+      # Lints the Windows target, where the C parts (the vendored Lua in
+      # m2-game) are compiled.
       - run: cargo clippy --workspace --all-targets --target i686-pc-windows-msvc
       - run: cargo build --workspace --target i686-pc-windows-msvc
       # The script host's Lua raises errors with longjmp, which unwinds
-      # differently on Windows; run its tests there on both targets.
-      - run: cargo test -p m2-game
+      # differently on Windows; run its tests on the 32-bit target too.
       - run: cargo test -p m2-game --target i686-pc-windows-msvc
       - name: Build the alpha exe
         run: cargo build --release -p m2-alpha --target i686-pc-windows-msvc
@@ -45,3 +59,4 @@ jobs:
         with:
           name: m2-alpha-windows-i686
           path: target/i686-pc-windows-msvc/release/m2-alpha.exe
+          retention-days: 7
