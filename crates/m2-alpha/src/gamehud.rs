@@ -49,6 +49,7 @@ use mlua::{IntoLuaMulti, Lua, Table, Value};
 use crate::combat::{Combat, Fired, Picked, RIFLE_CLIP, Rounds, Weapon};
 use crate::config::Config;
 use crate::game::Game;
+use crate::hijack::GuiCall;
 use crate::support::{self, SupportHud};
 
 /// The fonts the HUD's text widgets use.
@@ -69,9 +70,8 @@ const RIFLE_NAME: &str = "Carbine";
 const RPG_NAME: &str = "RPG";
 const LAUNCHER_NAME: &str = "Grenade Launcher";
 /// The ammo the counters show of what the play doesn't count yet: the
-/// rockets stored and the grenades count down and start again full.
+/// rockets stored count down and start again full.
 const RPG_STORED: u32 = 4;
-const GRENADES: u32 = 4;
 /// The weapons' icons (`uNewCurrentGun`): textures of their own, as the
 /// game names them (`weapons_*`).
 const RIFLE_ICON: &str = "weapons_m4";
@@ -120,6 +120,17 @@ local g = type(hud) == "table" and hud[group]
 local f = type(g) == "table" and g[method]
 if type(f) ~= "function" then return false end
 f(g, data)
+return true
+"#;
+/// A call of the hijack scripts to one of the HUD's modules
+/// (`MrxGuiHudActionHijack.ShowButton(player, button, ...)`), made here
+/// as they made it.
+const GUI_CALL: &str = r#"
+local module, method, n = ...
+local m = rawget(_G, module)
+local f = type(m) == "table" and m[method]
+if type(f) ~= "function" then return false end
+f(select(4, ...))
 return true
 "#;
 /// A region onto the radar by its name, as `WifVzBoundary` puts its
@@ -378,6 +389,8 @@ pub struct HudState {
     pub picked: Picked,
     /// The grenade launcher's rounds, while she carries one.
     pub launcher: Option<Rounds>,
+    /// The grenades she has to throw (the counter by her health).
+    pub grenades: u32,
     /// The label of the vehicle she is in.
     pub vehicle: Option<String>,
     /// The templates that vehicle may be, its own first: their labels
@@ -422,6 +435,9 @@ pub struct HudState {
     /// The mission's calls to the HUD's interface (`Hud.Fanfare:Create`...)
     /// not yet passed on.
     pub hud_calls: Vec<HudCall>,
+    /// The hijack scripts' calls to the HUD's modules (the buttons to
+    /// press), not yet passed on.
+    pub gui_calls: Vec<GuiCall>,
     /// Keys going down (true) or up while the PDA is open, as Flash's key
     /// codes ([`flash_key`]): the PDA's movies' own `Key` listeners take
     /// them (the map's Home shows the current contract).
@@ -465,14 +481,16 @@ pub fn flash_key(key: egui::Key) -> Option<i32> {
 }
 
 /// A value passed between the mission's scripts and the HUD's, which run
-/// in Lua states of their own: what a table of plain values holds
-/// (functions and userdata are left out).
+/// in Lua states of their own: what a table of plain values holds, and
+/// guids (functions and other userdata are left out). The states agree
+/// on guids: the player is 1 in both.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Plain {
     Nil,
     Bool(bool),
     Number(f64),
     Text(String),
+    Guid(u32),
     Table(Vec<(Plain, Plain)>),
 }
 
@@ -490,6 +508,7 @@ impl Plain {
             Value::Integer(n) => Plain::Number(*n as f64),
             Value::Number(n) => Plain::Number(*n),
             Value::String(s) => Plain::Text(s.to_string_lossy()),
+            Value::LightUserData(_) => as_guid(v).map_or(Plain::Nil, Plain::Guid),
             Value::Table(t) if depth < Self::DEPTH => Plain::Table(
                 t.pairs::<Value, Value>()
                     .flatten()
@@ -511,6 +530,7 @@ impl Plain {
             }
             Plain::Number(n) => Value::Number(*n),
             Plain::Text(t) => Value::String(lua.create_string(t)?),
+            Plain::Guid(g) => guid_value(*g),
             Plain::Table(pairs) => {
                 let t = lua.create_table()?;
                 for (k, v) in pairs {
@@ -574,6 +594,7 @@ impl HudState {
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             rifle: game.combat.rifle_rounds,
+            grenades: game.combat.grenades,
             vehicle: vehicle.map(|v| v.spec.label.clone()),
             vehicle_templates: vehicle
                 .zip(game.scene.world.as_ref())
@@ -597,6 +618,8 @@ impl HudState {
         let mut hurts = std::mem::take(&mut self.hurts);
         let mut messages = std::mem::take(&mut self.messages);
         let mut hud_calls = std::mem::take(&mut self.hud_calls);
+        let mut gui_calls = std::mem::take(&mut self.gui_calls);
+        gui_calls.extend(later.gui_calls.iter().cloned());
         let mut keys = std::mem::take(&mut self.keys);
         keys.extend(later.keys.iter().copied());
         let mut buttons = std::mem::take(&mut self.buttons);
@@ -609,6 +632,7 @@ impl HudState {
             hurts,
             messages,
             hud_calls,
+            gui_calls,
             keys,
             buttons,
             ..later
@@ -1873,9 +1897,34 @@ impl Thread {
         }
     }
 
-    /// Hands the mission's HUD calls to the HUD's interface ([`HUD_CALL`]).
+    /// Hands the mission's HUD calls to the HUD's interface ([`HUD_CALL`]),
+    /// and the hijack scripts' to the HUD's modules ([`GUI_CALL`]).
     fn pass_calls(&mut self, s: &HudState, log: &mut Vec<String>) {
         let lua = self.mission.lua();
+        for c in &s.gui_calls {
+            let name = format!("{}.{}", c.module, c.method);
+            let done = (|| {
+                let mut args = vec![
+                    Value::String(lua.create_string(&c.module)?),
+                    Value::String(lua.create_string(&c.method)?),
+                    Value::Integer(c.args.len().max(1) as mlua::Integer),
+                ];
+                // Each takes the player first: she is the HUD's only one,
+                // whatever the hijack's state called her.
+                args.push(guid_value(PLAYER));
+                for a in c.args.iter().skip(1) {
+                    args.push(a.to_lua(lua)?);
+                }
+                lua.load(GUI_CALL)
+                    .set_name("=m2-gui call")
+                    .call::<bool>(mlua::MultiValue::from_vec(args))
+            })();
+            log.push(match done {
+                Ok(true) => format!("gui call {name}"),
+                Ok(false) => format!("gui call {name}: the HUD has no such function"),
+                Err(e) => format!("gui call {name}: {e}"),
+            });
+        }
         for c in &s.hud_calls {
             let name = format!("{}.{}", c.group, c.method);
             let done = c.data.to_lua(lua).and_then(|data| {
@@ -1998,7 +2047,9 @@ impl Thread {
             )?;
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
         }
-        let ammo = ammo(s.weapon, s.fired, s.picked, s.rifle, s.launcher, s.cannon);
+        let ammo = ammo(
+            s.weapon, s.fired, s.picked, s.rifle, s.launcher, s.cannon, s.grenades,
+        );
         if self.told.ammo != Some(ammo) {
             self.told.ammo = Some(ammo);
             let names = [
@@ -2411,8 +2462,8 @@ fn ammo(
     rifle: Rounds,
     launcher: Option<Rounds>,
     cannon: Option<(u32, u32)>,
+    grenades: u32,
 ) -> [i64; 5] {
-    let grenades = GRENADES - fired.grenades % GRENADES;
     if let Some((left, _)) = cannon {
         return [0, i64::from(left), -1, i64::from(grenades), 0];
     }
@@ -3575,6 +3626,8 @@ mod tests {
             .load(r#"return { sType = "contract", nPlayer = 1, nValue = 2.5, t = { true } }"#)
             .eval()
             .unwrap();
+        let Value::Table(table) = &v else { panic!() };
+        table.set("vPlayer", guid_value(1)).unwrap();
         let plain = Plain::of(&v);
         let other = Lua::new();
         other
@@ -3590,6 +3643,7 @@ mod tests {
         assert_eq!(t.get::<f64>("nValue").unwrap(), 2.5);
         let inner: Table = t.get("t").unwrap();
         assert!(inner.get::<bool>(1).unwrap());
+        assert_eq!(as_guid(&t.get::<Value>("vPlayer").unwrap()), Some(1));
     }
 
     #[test]
@@ -3641,7 +3695,7 @@ mod tests {
         // The rifle's rounds are the play's: a full clip and nine spare.
         let full = Rounds::of(RIFLE_CLIP + crate::combat::RIFLE_SPARE, RIFLE_CLIP);
         assert_eq!(
-            ammo(Weapon::Rifle, fired(0, 0, 0), none, full, None, None)[..3],
+            ammo(Weapon::Rifle, fired(0, 0, 0), none, full, None, None, 0)[..3],
             [30, 30, 270]
         );
         let used = Rounds {
@@ -3649,24 +3703,25 @@ mod tests {
             stored: 120,
         };
         assert_eq!(
-            ammo(Weapon::Rifle, fired(29, 0, 0), none, used, None, None)[..3],
+            ammo(Weapon::Rifle, fired(29, 0, 0), none, used, None, None, 0)[..3],
             [30, 1, 120]
         );
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 0, 0), none, full, None, None)[..3],
+            ammo(Weapon::Rpg, fired(0, 0, 0), none, full, None, None, 0)[..3],
             [1, 1, i64::from(RPG_STORED)]
         );
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 1, 0), none, full, None, None)[2],
+            ammo(Weapon::Rpg, fired(0, 1, 0), none, full, None, None, 0)[2],
             i64::from(RPG_STORED) - 1
         );
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 4, 0), none, full, None, None)[2],
+            ammo(Weapon::Rpg, fired(0, 4, 0), none, full, None, None, 0)[2],
             i64::from(RPG_STORED)
         );
+        // Her own grenades, whatever she has thrown.
         assert_eq!(
-            ammo(Weapon::Rifle, fired(0, 0, 1), none, full, None, None)[3],
-            i64::from(GRENADES) - 1
+            ammo(Weapon::Rifle, fired(0, 0, 1), none, full, None, None, 3)[3],
+            3
         );
         // A crate's 20 rockets after three fired: 21 left.
         let crate_ = Picked {
@@ -3674,7 +3729,7 @@ mod tests {
             ..Picked::default()
         };
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 3, 0), crate_, full, None, None)[2],
+            ammo(Weapon::Rpg, fired(0, 3, 0), crate_, full, None, None, 0)[2],
             i64::from(RPG_STORED) + 17
         );
         // The launcher's own rounds: "6 / 12" as the crate gives it.
@@ -3689,7 +3744,8 @@ mod tests {
                 none,
                 full,
                 launcher,
-                None
+                None,
+                0
             )[..3],
             [6, 6, 12]
         );
@@ -3701,7 +3757,8 @@ mod tests {
                 none,
                 full,
                 None,
-                Some((37, 40))
+                Some((37, 40)),
+                0
             )[..3],
             [0, 37, -1]
         );

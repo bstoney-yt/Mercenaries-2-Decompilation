@@ -17,7 +17,8 @@
 //! hijackable vehicle without one a driver of that template.
 //!
 //! Not yet: the hero's, crewman's and vehicle's clips are timed but not
-//! shown. The prompts are for the HUD to draw ([`Hijacks::view`]).
+//! shown. The scripts' own calls to the HUD (the buttons to press) go to
+//! the game's HUD ([`Hijacks::take_gui_calls`]).
 //!
 //! [`ParkedVehicle::crew`]: crate::scene::ParkedVehicle::crew
 //!
@@ -41,6 +42,7 @@ use m2_game::mission::{GameData, Mission};
 use m2_math::glam::{Mat4, Vec3};
 
 use crate::game::Game;
+use crate::gamehud::Plain;
 use crate::input::{Action, Input};
 
 /// The scripts run ten times a second, as the mission's do.
@@ -75,6 +77,46 @@ const PAD: [(Action, u32); 8] = [
 struct Loaded {
     mission: Mission,
     clips: ClipTimes,
+}
+
+/// The hijack scripts' calls to the HUD (`MrxGuiHudActionHijack.ShowButton`
+/// and its kin, `MrxGuiManager.ToggleHud`), which run in the game HUD's own
+/// Lua state: kept in `__m2_gui_calls` (module, method, then the call's
+/// plain arguments, `n` of them) for [`Hijacks::take_gui_calls`].
+const GUI_CALLS: &str = r##"
+__m2_gui_calls = {}
+local function record(module, method, f)
+    return function(...)
+        local call = { module, method, n = select("#", ...) }
+        for i = 1, call.n do
+            local v = select(i, ...)
+            if type(v) ~= "function" and type(v) ~= "table" then call[i + 2] = v end
+        end
+        table.insert(__m2_gui_calls, call)
+        if #__m2_gui_calls > 64 then table.remove(__m2_gui_calls, 1) end
+        if type(f) == "function" then return f(...) end
+    end
+end
+local hijack = {}
+for _, method in ipairs({ "ShowButton", "HideButton", "ShowFail", "SetDisplayVisible",
+        "SetDisplayButton", "SetDisplayMashAnimation" }) do
+    hijack[method] = record("MrxGuiHudActionHijack", method)
+end
+MrxGuiHudActionHijack = hijack
+local manager = MrxGuiManager
+if type(manager) == "table" then
+    manager.ToggleHud = record("MrxGuiManager", "ToggleHud", rawget(manager, "ToggleHud"))
+end
+"##;
+
+/// A call the hijack scripts made to the HUD ([`GUI_CALLS`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuiCall {
+    /// `MrxGuiHudActionHijack`, `MrxGuiManager`.
+    pub module: String,
+    pub method: String,
+    /// Its arguments, nil ones in place.
+    pub args: Vec<Plain>,
 }
 
 enum State {
@@ -216,6 +258,34 @@ impl Hijacks {
         })
     }
 
+    /// The hijack scripts' calls to the HUD since the last time, oldest
+    /// first.
+    pub fn take_gui_calls(&self) -> Vec<GuiCall> {
+        let State::Ready(l) = &self.state else {
+            return Vec::new();
+        };
+        let lua = l.mission.lua();
+        let Ok(Some(calls)) = lua.globals().get::<Option<mlua::Table>>("__m2_gui_calls") else {
+            return Vec::new();
+        };
+        let out = calls
+            .sequence_values::<mlua::Table>()
+            .flatten()
+            .map(|t| {
+                let n: i64 = t.get("n").unwrap_or(0);
+                GuiCall {
+                    module: t.get(1).unwrap_or_default(),
+                    method: t.get(2).unwrap_or_default(),
+                    args: (1..=n)
+                        .map(|i| Plain::of(&t.get(i + 2).unwrap_or(mlua::Value::Nil)))
+                        .collect(),
+                }
+            })
+            .collect();
+        let _ = lua.globals().set("__m2_gui_calls", lua.create_table().ok());
+        out
+    }
+
     /// Runs before the game's own tick: takes the use key when a hijack
     /// is in reach, and the pad's buttons while one is under way.
     pub fn tick(&mut self, game: &mut Game, input: &mut Input, dt: f32) {
@@ -225,6 +295,14 @@ impl Hijacks {
                 {
                     Ok(mission) => {
                         eprintln!("hijacks: scripts loaded");
+                        if let Err(e) = mission
+                            .lua()
+                            .load(GUI_CALLS)
+                            .set_name("=m2-gui calls")
+                            .exec()
+                        {
+                            eprintln!("hijacks: HUD calls not kept: {e}");
+                        }
                         self.state = State::Ready(Box::new(Loaded { mission, clips }));
                     }
                     Err(e) => {
@@ -1127,6 +1205,32 @@ impl Flat for Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scripts_hud_calls_are_kept_with_their_nils() {
+        let lua = mlua::Lua::new();
+        lua.load("MrxGuiManager = { ToggleHud = function(_, on) toggled = on end }")
+            .exec()
+            .unwrap();
+        lua.load(GUI_CALLS).exec().unwrap();
+        lua.load(
+            r#"MrxGuiHudActionHijack.ShowButton(1, 7, 0.75, nil, 0.5)
+            MrxGuiManager.ToggleHud(1, false, "hijack")"#,
+        )
+        .exec()
+        .unwrap();
+        // The game's own function still runs.
+        assert!(!lua.globals().get::<bool>("toggled").unwrap());
+        let calls: mlua::Table = lua.globals().get("__m2_gui_calls").unwrap();
+        let show: mlua::Table = calls.get(1).unwrap();
+        assert_eq!(show.get::<String>(2).unwrap(), "ShowButton");
+        assert_eq!(show.get::<i64>("n").unwrap(), 5);
+        assert!(show.get::<mlua::Value>(6).unwrap().is_nil());
+        assert_eq!(show.get::<f64>(7).unwrap(), 0.5);
+        let toggle: mlua::Table = calls.get(2).unwrap();
+        assert_eq!(toggle.get::<String>(1).unwrap(), "MrxGuiManager");
+        assert_eq!(toggle.get::<String>(5).unwrap(), "hijack");
+    }
 
     #[test]
     fn the_pad_numbers_match_the_scripts() {
