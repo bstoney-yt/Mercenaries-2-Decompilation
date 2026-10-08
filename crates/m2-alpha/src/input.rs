@@ -35,8 +35,16 @@ pub enum Action {
     /// Raise the weapon (also the right mouse button, once the mouse is
     /// captured).
     Aim,
-    /// Throw a grenade.
+    /// Throw a grenade (or the explosive chosen with
+    /// [`Explosive`](Self::Explosive)).
     Throw,
+    /// Choose the next explosive to throw: grenades, C4, proximity mines.
+    Explosive,
+    /// Set off the C4 she has placed.
+    Detonate,
+    /// Move to the next seat of the vehicle she rides (the driver's, the
+    /// gunner's).
+    Seat,
     /// A melee bash with what she holds (also the middle mouse button,
     /// once the mouse is captured): opens a supply crate.
     Melee,
@@ -90,6 +98,9 @@ impl Default for Bindings {
             (Fire, vec![KeyF]),
             (Aim, vec![]),
             (Throw, vec![KeyG]),
+            (Explosive, vec![Digit3]),
+            (Detonate, vec![KeyX]),
+            (Seat, vec![KeyY]),
             (Melee, vec![KeyB]),
             (Rifle, vec![Digit1]),
             (Launcher, vec![Digit2]),

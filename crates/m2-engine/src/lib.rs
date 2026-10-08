@@ -22,6 +22,7 @@ pub mod scatter;
 pub mod stream;
 pub mod tuning;
 pub mod vehicle;
+pub mod weapons;
 pub mod world;
 
 pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
