@@ -488,7 +488,7 @@ impl Mission {
                 world.borrow_mut().layers.loaded.insert(name.clone());
             }
         }
-        for (name, hash) in KNOWN_MODULES {
+        for (name, hash) in KNOWN_MODULES.into_iter().chain(OBJECT_SCRIPTS) {
             library.pin(name, hash);
         }
         let library = Rc::new(library);
