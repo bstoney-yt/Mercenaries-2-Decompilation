@@ -164,6 +164,8 @@ pub struct Widget {
     /// is sent only what changed, as the engine's per-frame updates must.
     pda_blips: BTreeMap<String, Vec<FlashArg>>,
     pub movie: Option<String>,
+    /// `PlayMovie` started its movie and no `StopMovie` has stopped it.
+    pub movie_playing: bool,
     /// `SetWidgetFullscreen`: drawn over the whole screen, whatever its box.
     pub fullscreen: bool,
     /// `MinimapCreate` arguments as text.
@@ -211,6 +213,7 @@ impl Widget {
             flash_restarts: 0,
             pda_blips: BTreeMap::new(),
             movie: None,
+            movie_playing: false,
             fullscreen: false,
             minimap: None,
             minimap_calls: BTreeMap::new(),
@@ -299,11 +302,13 @@ pub enum DrawItem {
         /// Metres from the centre to the rim, if set.
         range: Option<f32>,
     },
-    /// A video's place.
+    /// A video's place, and whether it plays (`PlayMovie`, until
+    /// `StopMovie`).
     Movie {
         widget: u32,
         file: Option<String>,
         rect: [f32; 4],
+        playing: bool,
     },
 }
 
@@ -830,6 +835,7 @@ impl Screen {
                     widget: id,
                     file: w.movie.clone(),
                     rect,
+                    playing: w.movie_playing,
                 }),
             }
         }
@@ -1852,7 +1858,12 @@ natives! {
     // The movie ends at once: its end callback runs at the next tick
     // (the cinematics' scripts wait on it, as 02_AOB_M does).
     "PlayMovie" => |s, _, a| {
-        if let Some(cb) = s.widgets.get_mut(&a.id(0)).and_then(|w| w.movie_end.take()) {
+        let w = s.widgets.get_mut(&a.id(0));
+        let cb = w.and_then(|w| {
+            w.movie_playing = true;
+            w.movie_end.take()
+        });
+        if let Some(cb) = cb {
             s.due.push((cb, Vec::new()));
         }
         Ok(MultiValue::new())
@@ -1943,7 +1954,12 @@ natives! {
         Ok(MultiValue::new())
     },
     "PauseMovie" => |_, _, _| Ok(MultiValue::new()),
-    "StopMovie" => |_, _, _| Ok(MultiValue::new()),
+    "StopMovie" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.movie_playing = false;
+        }
+        Ok(MultiValue::new())
+    },
     "SetMinimapBorder" => |_, _, _| Ok(MultiValue::new()),
     "SetMinimapOwner" => |_, _, _| Ok(MultiValue::new()),
     "SetSpriteTextureSize" => |s, _, a| {
