@@ -30,9 +30,9 @@
 //!       e.g. `blocks\Loading\loading_base_P000_Q3.block`.
 //! ```
 //!
-//! Each block's stored bytes are an [`sges`] container. The hash
-//! function behind the name and type hashes is not yet known, so assets are
-//! found by hash and blocks by path.
+//! Each block's stored bytes are an [`sges`] container. Name hashes are
+//! [`crate::name_hash`] of the asset's name, so assets can be found by
+//! name; blocks are found by path. The type hash's function is not known.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};

@@ -3,6 +3,8 @@
 //! Everything that calls into Win32, Direct3D 9 or the original executable
 //! goes through this crate, so `unsafe` stays concentrated in one place.
 
+pub mod bink;
+
 #[cfg(windows)]
 pub use windows;
 

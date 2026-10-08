@@ -16,7 +16,8 @@
 //!
 //! Right now this opens a window on the island, streamed from the install
 //! around the player: Jennifer on foot with a third-person camera
-//! (`--spawn` picks where to start; the default is the first town). WASD
+//! (`--spawn` picks where to start; the default is the PMC's headquarters,
+//! where free roam begins after the first contract). WASD
 //! runs, Shift sprints, Q held walks, Space jumps. E gets in and out of
 //! the vehicles parked ahead of the spawn (WASD drive, Space brakes, R
 //! rights an overturned one). V switches to a
@@ -35,25 +36,44 @@
 //! `--fight` she shoots the nearest soldier, fires a rocket at a vehicle and
 //! throws a grenade.
 
+mod autoplay;
 mod cache;
 mod camera;
 mod combat;
 mod config;
+mod destruct;
+mod drops;
+mod flights;
+mod flow;
 mod game;
+mod gamehud;
+mod hero;
+mod hijack;
 mod input;
 mod mission;
+mod movie;
+mod moving;
 mod npc;
 mod player;
+mod props;
+mod route;
 mod save;
 mod scene;
 mod sound;
+mod startup;
+mod strikes;
+mod support;
+mod traffic;
 mod ui;
 
+use crate::hero::Hero;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
+use m2_engine::physics::PLANE_SPEED;
 use m2_engine::{Gait, Install, WorldSettings};
 use m2_render::gpu::WgpuBackend;
 use m2_render::{DrawQueue, RenderBackend};
@@ -61,7 +81,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use camera::FlyCamera;
@@ -76,21 +96,154 @@ const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
 /// Longest real time a single frame may advance the simulation by, so a
 /// stall (dragging the window, a breakpoint) doesn't fast-forward the game.
 const MAX_FRAME: Duration = Duration::from_millis(250);
+/// How far off people's clip sounds (foley, footsteps) are heard, metres:
+/// as far as those sounds carry.
+const CUE_REACH: f32 = 35.0;
 
 #[derive(Debug, Default)]
 struct Options {
     config_path: Option<PathBuf>,
     install: Option<PathBuf>,
     models: Vec<u32>,
+    /// With `--model`: a clip for each model to play instead of a gait,
+    /// or to hold still this many seconds in.
+    clips: Vec<(u32, Option<f32>)>,
+    /// With `--model`: degrees to turn the models (90 shows their side).
+    turn: f32,
     spawn: Option<(f32, f32)>,
+    /// Who to play (`--hero`), over the settings'.
+    hero: Option<Hero>,
+    /// Weapons to start with, by template name (`--gun`, repeated:
+    /// `Shotgun`, `Stinger`, `C4`).
+    guns: Vec<String>,
     gait: Option<Gait>,
     double_sided: bool,
     fly: bool,
     drive: bool,
+    /// With `--screenshot` on foot: jump just before the picture.
+    jump: bool,
+    /// With `--screenshot` on foot: throw a grenade just before it.
+    throw: bool,
+    /// With `--screenshot` on foot: bash just before it.
+    bash: bool,
+    /// With `--bash`: the clip (by hash) to bash with, rather than the one
+    /// chosen.
+    bash_clip: Option<u32>,
+    /// With `--jump`, `--throw` or `--bash`: seconds before the picture she
+    /// starts.
+    lead: Option<f32>,
     fight: bool,
+    /// With `--screenshot`: rocket the nearest fuel tank or barrel.
+    blast: bool,
+    /// With `--screenshot`: rocket the nearest building until it comes
+    /// down, at most this many rockets.
+    demolish: Option<u32>,
+    /// With `--drive`: park the vehicle facing the nearest thing of this
+    /// kind it breaks or shoves (fence, plant, lamp, box) and drive
+    /// straight through it.
+    plough: Option<String>,
+    /// With `--drive`: wreck it at speed at the end and watch it stop.
+    wreck: bool,
+    /// With `--drive`: fire from the next seat with a weapon.
+    gunner: bool,
+    /// With `--drive`: a vehicle whose name holds this.
+    vehicle: Option<String>,
+    /// With `--drive`: swing the camera this far (radians) before the picture.
+    look: f32,
+    /// With `--screenshot`: how many of the nearest spawns to list.
+    list_spawns: usize,
+    /// With `--fight`: seconds to wait after it before the picture.
+    fight_wait: f32,
+    /// With `--screenshot`: seconds of play to watch the traffic for.
+    traffic: Option<f32>,
+    /// With `--screenshot` on foot: face this way (radians from +z towards
+    /// +x) before the picture.
+    face: Option<f32>,
+    /// With `--screenshot` on foot: hold the weapon up to aim at the end.
+    aim: bool,
+    /// With `--screenshot` on foot: the weapon she has up.
+    weapon: Option<combat::Weapon>,
+    /// Weapons held as worked out from the hands (`--grip hands`), not
+    /// on the hand's attach node as posed.
+    hands_grip: bool,
+    /// With `--screenshot` on foot: take the picture close up, from her
+    /// right and a little ahead, at chest height, to see her hands.
+    closeup: bool,
+    /// With `--screenshot` on foot: take the picture close up from behind
+    /// her, to see what hangs on her back.
+    behind: bool,
+    /// With `--screenshot` on foot: give her this weapon in the
+    /// launcher's place without taking it up (`--slung gl`: the crate's
+    /// grenade launcher on her back while the carbine is up).
+    slung: Option<combat::Weapon>,
+    /// With `--screenshot`: cast rays around where she stands and list
+    /// what they hit, to find unseen obstacles.
+    probe: bool,
+    /// With `--aim` (or `--drive --look`): fire just before the picture.
+    fire: bool,
+    /// With `--screenshot` on foot: hits she takes just before the
+    /// picture, from these directions (degrees clockwise from where the
+    /// camera looks), to see the HUD's hit arcs.
+    hit_from: Vec<f32>,
+    /// With `--screenshot`: seconds the game's HUD runs before the
+    /// picture (2, or 0.5 with `--hit-from`).
+    hud_seconds: Option<f64>,
+    /// With `--screenshot` on foot: call a Satellite Guided Bomb on the
+    /// spot ahead of her, the picture with the support menu open (menu),
+    /// through the satellite's view, with the timing wheel up, or after
+    /// the bomb lands.
+    satellite: Option<SatelliteShot>,
+    /// With `--screenshot`: the picture with her PDA open.
+    pda: bool,
+    /// With `--pda`: keys pressed (Flash key codes, 36 the map's current
+    /// contract) half way through the HUD's run.
+    pda_keys: Vec<i32>,
+    /// With `--mission --screenshot`: take the picture from this far from
+    /// the nearest marker, looking at it.
+    mission_look: Option<f32>,
+    /// With `--screenshot`: take the picture from this far from the
+    /// pickup lying nearest her, looking down at it.
+    look_pickup: Option<f32>,
     mission: bool,
     mission_drivers: Vec<(String, String)>,
+    /// Every hijackable vehicle is crewed by this human template, to test
+    /// hijacking ([`hijack`]) before the island's vehicles have crews.
+    hijack_crew: Option<String>,
+    /// `--support`: support items to stock and call in once the scripts
+    /// run, as if bought, for testing.
+    support: Vec<String>,
+    /// With `--screenshot --drive`: hijack the vehicle instead of getting
+    /// in, answering every prompt at once.
+    hijack: bool,
+    /// With `--screenshot --drive`: load the seats' clips first, so she
+    /// is seen sitting in the vehicle as she drives it.
+    seated: bool,
     mission_seconds: f32,
+    /// The whole game as it launches: the boot movies, the front end, the
+    /// first contract with its movies, then on (also with no options).
+    alpha: bool,
+    /// `--alpha` without the boot movies and front end.
+    no_boot: bool,
+    /// With `--mission --screenshot`: the scripts' movies wait for the
+    /// game, which opens each, decodes a few frames and pictures one.
+    movies: bool,
+    /// With `--mission --autoplay --screenshot`: seconds to play on after
+    /// the contract is done.
+    after_contract: f32,
+    /// Our stand-in HUD instead of the game's own.
+    old_hud: bool,
+    /// With `--mission --screenshot`: her health drops to this eight
+    /// seconds in, to see the scripts' healing and survival rescue.
+    hurt: Option<f32>,
+    /// With `--mission --screenshot`: she plays the mission herself, by
+    /// its markers, until it is done or the seconds are up.
+    autoplay: bool,
+    /// Switch the smarter enemy soldiers on (the settings'
+    /// `[enhanced.smarter_ai] enabled`).
+    smarter_ai: bool,
+    /// With `--screenshot`: bring down the mission's gates as the bomb
+    /// does, logging where their pieces go ([`gates_for_screenshot`]).
+    gates: bool,
     sea: Option<f32>,
     size: Option<(u32, u32)>,
     vsync: Option<bool>,
@@ -98,6 +251,22 @@ struct Options {
     screenshot: Option<PathBuf>,
     write_config: bool,
 }
+
+/// How far a `--satellite` call goes with the bomb.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SatelliteShot {
+    /// The support menu open, the bomb in it.
+    Menu,
+    /// Looking through the satellite, over the spot.
+    View,
+    /// The timing wheel, after the first press.
+    Wheel,
+    /// The bomb landed.
+    Bomb,
+}
+
+/// A `--satellite` call's spot lies this far ahead of her, metres.
+const SATELLITE_AHEAD: f32 = 45.0;
 
 fn parse_args() -> anyhow::Result<Options> {
     let mut o = Options::default();
@@ -113,6 +282,32 @@ fn parse_args() -> anyhow::Result<Options> {
                     u32::from_str_radix(v.trim_start_matches("0x"), 16)
                         .with_context(|| format!("--model {v}: expected a hex hash"))?,
                 );
+            }
+            "--clip" => {
+                let v = value()?;
+                let (hash, at) = match v.split_once('@') {
+                    Some((h, t)) => (
+                        h,
+                        Some(
+                            t.parse()
+                                .with_context(|| format!("--clip {v}: expected seconds after @"))?,
+                        ),
+                    ),
+                    None => (v.as_str(), None),
+                };
+                o.clips.push((
+                    u32::from_str_radix(hash.trim_start_matches("0x"), 16)
+                        .with_context(|| format!("--clip {v}: expected a hex hash"))?,
+                    at,
+                ));
+            }
+            "--turn" => o.turn = value()?.parse().context("--turn expects degrees")?,
+            "--gun" => o.guns.push(value()?),
+            "--hero" => {
+                let v = value()?;
+                o.hero = Some(Hero::parse(&v).with_context(|| {
+                    format!("--hero expects mattias, jennifer or chris, not {v}")
+                })?);
             }
             "--spawn" => {
                 let v = value()?;
@@ -144,14 +339,126 @@ fn parse_args() -> anyhow::Result<Options> {
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--drive" => o.drive = true,
+            "--gunner" => o.gunner = true,
+            "--jump" => o.jump = true,
+            "--throw" => o.throw = true,
+            "--bash" => o.bash = true,
+            "--bash-clip" => {
+                let v = value()?;
+                o.bash_clip = Some(
+                    u32::from_str_radix(v.trim_start_matches("0x"), 16)
+                        .context("--bash-clip expects a clip's hash (8 hex digits)")?,
+                );
+            }
+            "--lead" => o.lead = Some(value()?.parse().context("--lead expects seconds")?),
             "--fight" => o.fight = true,
+            "--blast" => o.blast = true,
+            "--demolish" => {
+                o.demolish = Some(
+                    value()?
+                        .parse()
+                        .context("--demolish expects a rocket count")?,
+                )
+            }
+            "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
+            "--wreck" => o.wreck = true,
+            "--vehicle" => o.vehicle = Some(value()?.to_ascii_lowercase()),
+            "--look" => {
+                o.look = value()?
+                    .parse::<f32>()
+                    .context("--look expects degrees")?
+                    .to_radians()
+            }
             "--mission" => o.mission = true,
+            "--alpha" => o.alpha = true,
+            "--no-boot" => o.no_boot = true,
+            "--movies" => o.movies = true,
+            "--after-contract" => o.after_contract = value()?.parse()?,
+            "--old-hud" => o.old_hud = true,
+            "--hijack-crew" => o.hijack_crew = Some(value()?),
+            "--hijack" => o.hijack = true,
+            "--seated" => o.seated = true,
             "--mission-driver" => {
                 let path = value()?;
                 let code =
                     std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
                 o.mission_drivers.push((path, code));
             }
+            "--support" => o.support.push(value()?),
+            "--spawns" => o.list_spawns = value()?.parse().context("--spawns expects a count")?,
+            "--face" => {
+                o.face = Some(
+                    value()?
+                        .parse::<f32>()
+                        .context("--face expects degrees")?
+                        .to_radians(),
+                )
+            }
+            "--aim" => o.aim = true,
+            "--hit-from" => {
+                for d in value()?.split(',') {
+                    o.hit_from
+                        .push(d.parse().context("--hit-from expects degrees")?);
+                }
+            }
+            "--hud-seconds" => {
+                o.hud_seconds = Some(value()?.parse().context("--hud-seconds expects seconds")?)
+            }
+            "--weapon" => {
+                o.weapon = Some(match value()?.as_str() {
+                    "rifle" => combat::Weapon::Rifle,
+                    "rpg" => combat::Weapon::Rpg,
+                    "gl" => combat::Weapon::GrenadeLauncher,
+                    v => bail!("--weapon {v}: expected rifle, rpg or gl"),
+                })
+            }
+            "--closeup" => o.closeup = true,
+            "--pda" => o.pda = true,
+            "--pda-key" => o.pda_keys.push(
+                value()?
+                    .parse()
+                    .context("--pda-key expects a Flash key code")?,
+            ),
+            "--behind" => o.behind = true,
+            "--slung" => {
+                o.slung = Some(match value()?.as_str() {
+                    "rpg" => combat::Weapon::Rpg,
+                    "gl" => combat::Weapon::GrenadeLauncher,
+                    v => bail!("--slung {v}: expected rpg or gl"),
+                })
+            }
+            "--satellite" => {
+                o.satellite = Some(match value()?.as_str() {
+                    "menu" => SatelliteShot::Menu,
+                    "view" => SatelliteShot::View,
+                    "wheel" => SatelliteShot::Wheel,
+                    "bomb" => SatelliteShot::Bomb,
+                    v => bail!("--satellite {v}: expected menu, view, wheel or bomb"),
+                })
+            }
+            "--grip" => {
+                o.hands_grip = match value()?.as_str() {
+                    "attach" => false,
+                    "hands" => true,
+                    v => bail!("--grip {v}: expected attach or hands"),
+                }
+            }
+            "--probe" => o.probe = true,
+            "--fire" => o.fire = true,
+            "--look-pickup" => {
+                o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
+            }
+            "--mission-look" => {
+                o.mission_look = Some(value()?.parse().context("--mission-look expects metres")?)
+            }
+            "--traffic" => o.traffic = Some(value()?.parse().context("--traffic expects seconds")?),
+            "--fight-wait" => {
+                o.fight_wait = value()?.parse().context("--fight-wait expects seconds")?
+            }
+            "--autoplay" => o.autoplay = true,
+            "--smarter-ai" => o.smarter_ai = true,
+            "--hurt" => o.hurt = Some(value()?.parse().context("--hurt expects health")?),
+            "--gates" => o.gates = true,
             "--mission-seconds" => {
                 o.mission_seconds = value()?
                     .parse()
@@ -166,6 +473,26 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             _ => bail!("unknown argument {arg} (try --help)"),
         }
+    }
+    // Launched plainly (only where the game is, the window and settings
+    // named): the whole game, as `--alpha`.
+    const PLAIN: [&str; 7] = [
+        "--install",
+        "--config",
+        "--size",
+        "--fullscreen",
+        "--vsync",
+        "--no-boot",
+        "--smarter-ai",
+    ];
+    if std::env::args()
+        .skip(1)
+        .all(|a| !a.starts_with("--") || PLAIN.contains(&a.as_str()))
+    {
+        o.alpha = true;
+    }
+    if o.alpha {
+        o.mission = true;
     }
     Ok(o)
 }
@@ -189,14 +516,22 @@ fn keep_crash_reports() {
     }));
 }
 
+/// When `--hurt` takes her health: after the start's fade, which keeps her
+/// from harm.
+const HURT_AT: f32 = 8.0;
+
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
     let options = parse_args()?;
+    combat::use_attach_frame(!options.hands_grip);
     let config_path = options
         .config_path
         .clone()
         .unwrap_or_else(Config::default_path);
     let mut config = Config::load(&config_path)?;
+    if let Some(hero) = options.hero {
+        config.hero = hero;
+    }
     if let Some(install) = &options.install {
         config.install = Some(install.clone());
     }
@@ -211,6 +546,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(sea) = options.sea {
         config.world.sea_level = sea;
     }
+    config.enhanced.smarter_ai.enabled |= options.smarter_ai;
     if options.write_config {
         print!("{}", config.to_toml());
         return Ok(());
@@ -235,11 +571,27 @@ fn main() -> anyhow::Result<()> {
     // grid, which shows only the ground).
     let gait = options.gait.unwrap_or(Gait::Idle);
     let mode = if !options.models.is_empty() {
-        Mode::Models(options.models.clone(), gait)
+        Mode::Models(Showcase {
+            models: options.models.clone(),
+            gait,
+            clips: options.clips.clone(),
+            turn: options.turn,
+        })
     } else if install.is_some() {
-        Mode::Island(options.spawn.unwrap_or(scene::DEFAULT_SPAWN))
+        // Free roam starts at the PMC's headquarters (found in the layers);
+        // a mission's scripts move her from the first town.
+        Mode::Island(
+            options
+                .spawn
+                .or(options.mission.then_some(scene::DEFAULT_SPAWN)),
+        )
     } else {
-        Mode::Models(vec![scene::DEFAULT_MODEL], gait)
+        Mode::Models(Showcase {
+            models: vec![scene::DEFAULT_MODEL],
+            gait,
+            clips: Vec::new(),
+            turn: 0.0,
+        })
     };
 
     if let Some(out) = &options.screenshot {
@@ -256,6 +608,12 @@ fn main() -> anyhow::Result<()> {
         fly: options.fly,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
+        old_hud: options.old_hud,
+        hijack_crew: options.hijack_crew.clone(),
+        support: options.support.clone(),
+        alpha: options.alpha,
+        no_boot: options.no_boot,
+        guns: options.guns.clone(),
         state: None,
         error: None,
     };
@@ -269,21 +627,40 @@ fn main() -> anyhow::Result<()> {
 /// What to show.
 #[derive(Clone, Debug)]
 enum Mode {
-    /// The streamed island, starting above (x, z).
-    Island((f32, f32)),
+    /// The streamed island, starting above (x, z), or at the PMC's
+    /// headquarters.
+    Island(Option<(f32, f32)>),
     /// These models on a ground grid, characters in this gait.
-    Models(Vec<u32>, Gait),
+    Models(Showcase),
+}
+
+/// Models shown side by side (`--model`): what characters play.
+#[derive(Clone, Debug)]
+pub struct Showcase {
+    pub models: Vec<u32>,
+    pub gait: Gait,
+    /// A clip per model (by hash) played instead of the gait, or held
+    /// still this many seconds in.
+    pub clips: Vec<(u32, Option<f32>)>,
+    /// Degrees each model is turned about the vertical.
+    pub turn: f32,
 }
 
 /// Builds the scene on `backend` and points a camera at it.
+/// Frames timed before a screenshot.
+const FRAMES_TIMED: u32 = 60;
+
 fn build_scene(
     backend: &mut dyn RenderBackend,
     install: Option<&Install>,
     mode: &Mode,
     double_sided: bool,
     sea_level: f32,
+    mission: bool,
+    hero: Hero,
 ) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
+    scene.hero = hero;
     if double_sided {
         scene.materials.set_double_sided(backend, true)?;
     }
@@ -296,20 +673,48 @@ fn build_scene(
                 };
                 scene.open_world(backend, install, settings, *spawn)?;
             }
-            Mode::Models(models, gait) => {
+            Mode::Models(show) => {
                 scene.open(install)?;
-                if let Err(e) = scene.load_models(backend, models, *gait) {
+                if let Err(e) = scene.load_models(backend, show) {
                     eprintln!("could not load models: {e:#}");
                 }
             }
         }
     }
     let (eye, target) = scene.focus;
-    Ok(Game::new(scene, FlyCamera::looking_at(eye, target)))
+    let mut game = Game::new(scene, FlyCamera::looking_at(eye, target));
+    if let (Some(install), Mode::Island(_)) = (install, mode) {
+        // A state layer's people wait for the scripts to load it.
+        game.scene.people.state_layers = Some(HashSet::new());
+        // Free roam: the island's vehicles stand where the game's start-up
+        // layers put them (with `--mission` the scripts' own layers do).
+        if !mission {
+            game.startup = Some(startup::Startup::start(install, game.scene.hero));
+        }
+    }
+    Ok(game)
+}
+
+/// Hands her the weapons `--gun` names.
+fn give_guns(game: &mut Game, guns: &[String]) {
+    for name in guns {
+        if !game.give(name) {
+            eprintln!("--gun {name}: no hand weapon of that name in the templates");
+        }
+    }
 }
 
 /// What the HUD shows: the game's, with the mission's objectives and the
 /// view their markers are placed with.
+/// The game's own HUD, on the island with the game's files (unless
+/// `--old-hud`).
+fn game_hud(install: Option<&Install>, mode: &Mode, old: bool) -> Option<gamehud::GameHud> {
+    match (install, mode) {
+        (Some(install), Mode::Island(_)) if !old => Some(gamehud::GameHud::start(install)),
+        _ => None,
+    }
+}
+
 fn hud_info(
     game: &Game,
     mission: Option<&mission::MissionLink>,
@@ -319,9 +724,9 @@ fn hud_info(
     let mut info = game.hud_info();
     if let Some(m) = mission {
         info.mission = Some(m.view());
-        let view = game.view(fov, aspect);
-        info.view_proj = Some(view.projection * view.view);
     }
+    let view = game.view(fov, aspect);
+    info.view_proj = Some(view.projection * view.view);
     info
 }
 
@@ -341,8 +746,7 @@ fn render(
     game.scene.update(backend, focus)?;
     let mut queue = DrawQueue::new();
     backend.begin_frame(&view)?;
-    game.scene
-        .draw(backend, &mut queue, view.eye(), &game.combat)?;
+    game.scene.draw(backend, &mut queue, &view, &game.combat)?;
     queue.flush(&view, backend)?;
     match hud {
         Some(hud) => backend.end_frame_with(&mut |t| hud.paint(t))?,
@@ -354,6 +758,38 @@ fn render(
 /// Renders one frame offscreen and writes it as a binary PPM. On the
 /// island, once it has streamed in, the player lands and (with `gait`
 /// walk, run or sprint) heads forward for three seconds first.
+/// Plays `seconds` on, logging the traffic every five seconds.
+fn traffic_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    seconds: f32,
+) -> anyhow::Result<()> {
+    let tick = TICK.as_secs_f32();
+    let mut t = 0.0;
+    let mut next_log = 0.0;
+    while t <= seconds {
+        if t >= next_log {
+            next_log += 5.0;
+            if let Some(world) = &game.scene.world {
+                let focus = game.focus();
+                eprintln!("traffic at {t:.0} s:");
+                for line in game
+                    .traffic
+                    .report(&world.physics, &game.scene.vehicles, focus)
+                {
+                    eprintln!("{line}");
+                }
+            }
+        }
+        game.step(Intent::default(), tick);
+        render(backend, game, fov, aspect, None)?;
+        t += tick;
+    }
+    Ok(())
+}
+
 fn screenshot(
     config: &Config,
     install: Option<&Install>,
@@ -370,7 +806,11 @@ fn screenshot(
         mode,
         options.double_sided,
         config.world.sea_level,
+        options.mission,
+        config.hero,
     )?;
+    game.scene.people.smarter = config.enhanced.smarter_ai;
+    give_guns(&mut game, &options.guns);
     if options.fly {
         game.on_foot = false;
     }
@@ -391,23 +831,107 @@ fn screenshot(
             .is_some_and(|p| game.on_foot && !p.landed);
         if (stats.pending == 0 && !waiting) || started.elapsed() > Duration::from_secs(180) {
             eprintln!("{stats:?} after {:.1} s", started.elapsed().as_secs_f32());
+            eprintln!("atmosphere: {:?}", world.index.atmosphere);
+            for r in &world.index.atmosphere_regions {
+                let names: Vec<String> = r
+                    .settings
+                    .iter()
+                    .map(|(n, a)| {
+                        format!(
+                            "{n:08x} light time {} intensity {}",
+                            a.light_time[0], a.light_intensity
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "atmosphere region {} {:08x}: {} corners, {:.0} m2, {}",
+                    r.name,
+                    r.entity,
+                    r.outline.len(),
+                    r.area,
+                    names.join("; ")
+                );
+            }
             break;
         }
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
-    // And for the vehicles and people, and the people to find their feet.
+    // And for the vehicles and people, and the people to find their feet,
+    // and for the vehicles to be parked by her (a look for a spot can take
+    // a while: not timed). The island's own vehicles get half a minute, as
+    // one may fail, and the props within reach two minutes: the frames
+    // are timed as play goes, not as the island first loads.
     while game.scene.world.is_some()
-        && game.scene.vehicles_loading()
+        && (game.scene.vehicles_loading()
+            || (game.on_foot
+                && game.scene.player.as_ref().is_some_and(|p| p.landed)
+                && !game.parking_done())
+            || (game.island_vehicles_loading() && started.elapsed() < Duration::from_secs(30))
+            || (!game.scene.props.settled() && started.elapsed() < Duration::from_secs(120)))
         && started.elapsed() < Duration::from_secs(300)
     {
         game.step(Intent::default(), tick);
         render(&mut backend, &mut game, fov, aspect, None)?;
     }
-    for _ in 0..30 {
+    eprintln!(
+        "props within reach {} after {:.1} s",
+        if game.scene.props.settled() {
+            "loaded"
+        } else {
+            "still loading"
+        },
+        started.elapsed().as_secs_f32()
+    );
+    // The last frames are timed: the frame rate here, for checking.
+    // Where the time goes: the tick, streaming, building the draws, and
+    // submitting the frame.
+    let timed = Instant::now();
+    let mut parts = [0.0f32; 4];
+    game.scene.streamed = Default::default();
+    for _ in 0..FRAMES_TIMED {
+        let mut lap = Instant::now();
+        let mut split = |i: usize, lap: &mut Instant| {
+            parts[i] += lap.elapsed().as_secs_f32();
+            *lap = Instant::now();
+        };
         game.step(Intent::default(), tick);
-        render(&mut backend, &mut game, fov, aspect, None)?;
+        split(0, &mut lap);
+        let mut view = game.view(fov, aspect);
+        view.lighting.fog_density = 0.00025;
+        let focus = game.focus();
+        game.scene.update(&mut backend, focus)?;
+        split(1, &mut lap);
+        let mut queue = DrawQueue::new();
+        backend.begin_frame(&view)?;
+        game.scene
+            .draw(&mut backend, &mut queue, &view, &game.combat)?;
+        queue.flush(&view, &mut backend)?;
+        split(2, &mut lap);
+        backend.end_frame()?;
+        split(3, &mut lap);
     }
+    let each = timed.elapsed().as_secs_f32() / FRAMES_TIMED as f32;
+    let ms = parts.map(|p| p * 1000.0 / FRAMES_TIMED as f32);
+    let streamed = game
+        .scene
+        .streamed
+        .map(|d| d.as_secs_f32() * 1000.0 / FRAMES_TIMED as f32);
+    eprintln!(
+        "frames: {:.2} ms each ({:.0} fps) over {FRAMES_TIMED}, with a tick each: \
+         tick {:.2}, streaming {:.2} (the island {:.2}, vehicles and people {:.2}, \
+         props {:.2}), draws {:.2}, submit {:.2} ms",
+        each * 1000.0,
+        1.0 / each.max(1e-6),
+        ms[0],
+        ms[1],
+        streamed[0],
+        streamed[1],
+        streamed[2],
+        ms[2],
+        ms[3]
+    );
+    eprintln!("props: {}", game.scene.props.counts());
     let people = &game.scene.people;
     eprintln!(
         "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",
@@ -422,9 +946,9 @@ fn screenshot(
         // Where the soldiers' spawns are, for checking placement.
         let focus = game.focus();
         let spawns = &world.index.spawns;
-        let mut near: Vec<(f32, &str)> = spawns
+        let mut near: Vec<(f32, &m2_engine::world::SpawnPoint)> = spawns
             .iter()
-            .map(|s| (s.position.distance(focus), s.name.as_str()))
+            .map(|s| (s.position.distance(focus), s))
             .collect();
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         eprintln!(
@@ -436,10 +960,49 @@ fn screenshot(
                 .count(),
             near.iter()
                 .take(6)
-                .map(|(d, n)| format!("{n:?} {d:.0} m"))
+                .map(|(d, s)| format!("{:?} {d:.0} m", s.name))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        for (d, s) in near.iter().take(options.list_spawns) {
+            let kind = s
+                .template
+                .as_deref()
+                .and_then(|t| people.kind_for(t))
+                .or_else(|| people.kind_for(&s.name));
+            eprintln!(
+                "  spawn {:08x} {:?} {d:.0} m at {:.0}, template {:?}, layer {} ({}), {} route points, {}{}",
+                s.entity,
+                s.name,
+                s.position,
+                s.template,
+                s.layer.map_or("static".to_owned(), |l| format!("{l:08x}")),
+                if people.layer_in(s.layer) {
+                    "in"
+                } else {
+                    "out"
+                },
+                s.route.len(),
+                if kind.is_some() {
+                    "a soldier"
+                } else if people.mission_soldiers.contains(&s.entity) {
+                    "a mission soldier"
+                } else {
+                    "nobody"
+                },
+                if people.npcs.iter().any(|n| n.spawn == Some(s.entity)) {
+                    ", standing"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    if let Some(seconds) = options.traffic {
+        traffic_for_screenshot(&mut backend, &mut game, fov, aspect, seconds)?;
+    }
+    if options.probe {
+        probe_for_screenshot(&game);
     }
     let mut link = None;
     if options.mission
@@ -452,12 +1015,41 @@ fn screenshot(
             options,
             fov,
             aspect,
+            out,
         )?);
     }
-    if options.fight && game.on_foot && game.scene.player.is_some() {
-        fight_for_screenshot(&mut backend, &mut game, fov, aspect)?;
+    if options.gates {
+        if let Some(install) = install {
+            eprintln!(
+                "sound: {} of the fight's 6 sounds found",
+                sound::fight_sounds_found(install)
+            );
+        }
+        gates_for_screenshot(&mut backend, &mut game, fov, aspect, out)?;
+    }
+    if let Some(stage) = options
+        .satellite
+        .filter(|_| game.on_foot && game.scene.player.is_some())
+    {
+        satellite_for_screenshot(
+            &mut backend,
+            &mut game,
+            fov,
+            aspect,
+            stage,
+            options.fight_wait,
+        )?;
+    } else if options.fight && game.on_foot && game.scene.player.is_some() {
+        fight_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
+    } else if let Some(rockets) = options
+        .demolish
+        .filter(|_| game.on_foot && game.scene.player.is_some())
+    {
+        demolish_for_screenshot(&mut backend, &mut game, fov, aspect, rockets, out)?;
+    } else if options.blast && game.on_foot && game.scene.player.is_some() {
+        blast_for_screenshot(&mut backend, &mut game, fov, aspect, options.fight_wait)?;
     } else if options.drive && game.on_foot && game.scene.player.is_some() {
-        drive_for_screenshot(&mut backend, &mut game, fov, aspect)?;
+        drive_for_screenshot(&mut backend, &mut game, fov, aspect, options, install)?;
     } else if game.on_foot && game.scene.player.is_some() {
         let gait = options.gait.unwrap_or(Gait::Idle);
         let intent = Intent {
@@ -471,37 +1063,1007 @@ fn screenshot(
             ..Intent::default()
         };
         let from = game.scene.player.as_ref().map(|p| p.character.position);
+        // A jump, throw or bash starts this many ticks before the picture.
+        let lead = (options.lead.unwrap_or(0.2) * 60.0)
+            .round()
+            .clamp(1.0, 179.0) as usize;
+        // The crate's grenade launcher, as she takes it up: three clips.
+        if options.weapon == Some(combat::Weapon::GrenadeLauncher) {
+            game.combat
+                .equip(combat::Weapon::GrenadeLauncher, 3 * combat::LAUNCHER_CLIP);
+        }
+        // A launcher on her back, the rifle up.
+        if let Some(w) = options.slung {
+            game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
+            game.combat.weapon = options.weapon.unwrap_or(combat::Weapon::Rifle);
+        }
         for i in 0..180 {
-            game.step(intent, tick);
+            if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
+                p.yaw = face;
+                if i == 0 {
+                    p.facing = face;
+                }
+            }
+            // The bash clip asked for, with its blow's time.
+            if let (Some(want), Some(p)) = (options.bash_clip, game.scene.player.as_mut())
+                && i == 0
+            {
+                let found = p.model.as_ref().and_then(|(_, rig)| {
+                    let c = rig.clips.iter().position(|c| c.hash == want)?;
+                    let at = rig.clips[c]
+                        .clip
+                        .events
+                        .iter()
+                        .find(|e| e.name.eq_ignore_ascii_case("meleebash"))
+                        .map_or(0.37, |e| e.time);
+                    Some((c, at))
+                });
+                match found {
+                    Some(clip) => p.clips.bash = Some(clip),
+                    None => eprintln!("--bash-clip {want:08x}: she has no such clip"),
+                }
+            }
+            // A jump takes the picture on the way up (by default), a
+            // throw with the grenade still in her hand; aiming, the
+            // weapon comes up for the last second.
+            let jump = options.jump && i == 180 - lead;
+            let trigger = combat::Trigger {
+                aim: options.aim && i >= 120,
+                // The last shot's flash is still up for the picture.
+                fire: options.fire && i == 177,
+                throw: options.throw && i == 180 - lead,
+                melee: options.bash && i == 180 - lead,
+                select: options.weapon.filter(|_| i == 0),
+                ..combat::Trigger::default()
+            };
+            game.step(
+                Intent {
+                    jump,
+                    hold_jump: jump,
+                    trigger,
+                    ..intent
+                },
+                tick,
+            );
             if i % 30 == 0 {
                 // Keep streaming around her as she goes.
                 render(&mut backend, &mut game, fov, aspect, None)?;
             }
         }
         if let (Some(p), Some(from)) = (&game.scene.player, from) {
+            let hash = |c: usize| p.model.as_ref().map_or(0, |(_, r)| r.clips[c].hash);
             eprintln!(
-                "player: {:?} from {from:.2} to {:.2}, grounded {}",
-                gait, p.character.position, p.character.grounded
+                "player: {:?} from {from:.2} to {:.2}, grounded {}, clip {:?}, upper {:?}, throwing {:?}, grenade in hand {}, grenades out {}, bashing {:?}",
+                gait,
+                p.character.position,
+                p.character.grounded,
+                p.model
+                    .as_ref()
+                    .and_then(|(_, r)| r.animator.current())
+                    .map(|(c, t)| format!("{:08x} at {t:.2} s", hash(c))),
+                p.model
+                    .as_ref()
+                    .and_then(|(_, r)| r.animator.upper())
+                    .map(|c| format!("{:08x}", hash(c))),
+                p.throwing,
+                game.combat.grenade_in_hand(),
+                game.combat
+                    .projectiles()
+                    .filter(|(what, ..)| *what == combat::Flying::Grenade)
+                    .count(),
+                p.bashing,
             );
         }
     }
-    // The picture, with the HUD.
+    if options.closeup
+        && let Some(p) = &game.scene.player
+    {
+        // From her right and a little ahead, at chest height.
+        let chest = p.character.position + m2_math::glam::Vec3::Y * 1.25;
+        let ahead = m2_math::glam::Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
+        let right = m2_math::glam::Vec3::new(-ahead.z, 0.0, ahead.x);
+        game.on_foot = false;
+        game.camera = FlyCamera::looking_at(chest + right * 1.3 + ahead * 0.9, chest);
+        eprintln!("closeup: chest {chest:.2}, facing {ahead:.2}");
+        if let Some(line) = describe_hold(&game) {
+            eprintln!("closeup: {line}");
+        }
+    }
+    if options.behind
+        && let Some(p) = &game.scene.player
+    {
+        // From behind her and a little to her right, at shoulder height.
+        let shoulders = p.character.position + m2_math::glam::Vec3::Y * 1.4;
+        let ahead = m2_math::glam::Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
+        let right = m2_math::glam::Vec3::new(-ahead.z, 0.0, ahead.x);
+        game.on_foot = false;
+        game.camera = FlyCamera::looking_at(shoulders - ahead * 1.6 + right * 0.5, shoulders);
+        for line in describe_slung(&game) {
+            eprintln!("behind: {line}");
+        }
+    }
+    if let (Some(reach), Some(link)) = (options.mission_look, &link) {
+        look_at_marker(&mut backend, &mut game, link, reach, fov, aspect)?;
+    }
+    if let Some(reach) = options.look_pickup {
+        look_at_pickup(&mut game, reach);
+    }
+    if let Some(p) = game.scene.player.as_ref().filter(|_| game.on_foot) {
+        // Hits from around her, as the camera sees it: 0 ahead, 90 right.
+        let at = p.character.position + m2_math::glam::Vec3::Y;
+        let ahead = game.camera.forward().with_y(0.0).normalize_or_zero();
+        let right = game.camera.right();
+        for d in &options.hit_from {
+            let (s, c) = d.to_radians().sin_cos();
+            game.combat
+                .hurt_from(15.0, at + (ahead * c + right * s) * 10.0);
+        }
+    }
+    if options.pda {
+        game.support.pda = true;
+    }
+    // The picture, with the HUD (the game's, once its scripts have
+    // started and run two seconds, for its boxes to have opened and the
+    // gun box to have switched; half of one for hits, whose arcs fade).
     let mut hud = ui::Hud::new();
+    hud.game = game_hud(install, mode, options.old_hud);
     let mut settings = config.clone();
-    let info = hud_info(&game, link.as_ref(), fov, aspect);
+    let mut info = hud_info(&game, link.as_ref(), fov, aspect);
+    if hud.game.is_some() {
+        info.game = Some(gamehud::HudState::of(&mut game));
+        let seconds = options
+            .hud_seconds
+            .unwrap_or(if options.hit_from.is_empty() {
+                2.0
+            } else {
+                0.5
+            });
+        hud.settle(
+            &info,
+            (w, h),
+            seconds,
+            &options.pda_keys,
+            Duration::from_secs(120),
+        );
+        info.game = Some(gamehud::HudState::of(&mut game));
+    }
     let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
+    write_ppm(&backend, out)?;
+    eprintln!("wrote {}", out.display());
+    // The same frame without the HUD's fades, to compare (`M2_PAINT_AB`).
+    if std::env::var_os("M2_PAINT_AB").is_some()
+        && let Some(g) = hud.game.as_mut()
+    {
+        g.skip_covers = true;
+        let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
+        render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
+        let plain = out.with_extension("nocover.ppm");
+        write_ppm(&backend, &plain)?;
+        eprintln!("wrote {}", plain.display());
+    }
+    Ok(())
+}
+
+/// Puts the camera `reach` metres off the pickup lying nearest her, a
+/// little above it and looking at it, and says which it is and whether
+/// its model has loaded.
+fn look_at_pickup(game: &mut Game, reach: f32) {
+    let Some(her) = game.scene.player.as_ref().map(|p| p.character.position) else {
+        return;
+    };
+    let flights = &game.scene.flights;
+    let Some(p) = flights
+        .pickups()
+        .iter()
+        .min_by(|a, b| a.at.distance(her).total_cmp(&b.at.distance(her)))
+    else {
+        eprintln!("look-pickup: nothing lies to be taken");
+        return;
+    };
+    eprintln!(
+        "look-pickup: {:#x} at {:.1}, {:.1} m from her, model {:?} {}",
+        p.what.template,
+        p.at,
+        p.at.distance(her),
+        p.what.model,
+        if p.what.model.is_some_and(|m| flights.has_model(m)) {
+            "loaded"
+        } else {
+            "not loaded"
+        }
+    );
+    let at = p.at + m2_math::glam::Vec3::Y * 0.2;
+    // Who lies or stands by it (the soldier who left it).
+    if let Some(n) = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .filter(|n| n.character.position.distance(p.at) < 3.0)
+        .min_by(|a, b| {
+            a.character
+                .position
+                .distance(p.at)
+                .total_cmp(&b.character.position.distance(p.at))
+        })
+    {
+        eprintln!(
+            "look-pickup: a person {:.1} m away, {}, {}",
+            n.character.position.distance(p.at),
+            if n.alive { "alive" } else { "dead" },
+            if n.ragdoll.is_some() {
+                "limp"
+            } else {
+                "not limp"
+            }
+        );
+    }
+    // From above, so that a body by it doesn't hide it.
+    let back = (her - at).with_y(0.0).normalize_or(m2_math::glam::Vec3::Z);
+    game.on_foot = false;
+    game.camera =
+        FlyCamera::looking_at(at + back * reach * 0.5 + m2_math::glam::Vec3::Y * reach, at);
+}
+
+/// What stands where a bomb fell (`at`, x and z), as its pictures are
+/// taken: the state layers' models near it and how each stands (a gate
+/// the bomb broke: its pieces, how far the rest has sunk, what is drawn
+/// of it), and the island's own placed models whose boxes cover the spot
+/// (round 99's broken gates still showed an arch and doors at 8 s, when
+/// the gate's own wreck is drawn no more).
+fn describe_bombed(game: &Game, at: m2_math::glam::Vec2, fov: f32, aspect: f32) {
+    let Some(world) = &game.scene.world else {
+        return;
+    };
+    let props = &game.scene.props;
+    let mut near: Vec<(f32, u32)> = props
+        .shown()
+        .map(|(e, p)| {
+            (
+                p.position
+                    .with_y(0.0)
+                    .distance(m2_math::glam::Vec3::new(at.x, 0.0, at.y)),
+                e,
+            )
+        })
+        .filter(|&(d, _)| d < BOMBED_REACH)
+        .collect();
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (d, e) in near.iter().take(4) {
+        if let Some(s) = props.describe(&world.physics, *e) {
+            eprintln!("  prop {d:.1} m from the bomb: {s}");
+        }
+    }
+    let spot = near
+        .first()
+        .and_then(|&(_, e)| props.centre(e))
+        .unwrap_or(m2_math::glam::Vec3::new(at.x, game.focus().y, at.y));
+    let eye = game.view(fov, aspect).eye();
+    let over: Vec<String> = world
+        .covering(spot, eye, 2.0)
+        .into_iter()
+        .map(|(model, place, size)| {
+            format!(
+                "{model:08x} at {place:.1}, {:.1}x{:.1}x{:.1} m",
+                size.x, size.y, size.z
+            )
+        })
+        .collect();
+    eprintln!(
+        "  the island's models drawn over {spot:.1}: {}",
+        if over.is_empty() {
+            "none".to_owned()
+        } else {
+            over.join("; ")
+        }
+    );
+}
+
+/// How far from where a bomb fell [`describe_bombed`] looks for the state
+/// layers' models (metres): a gate's middle, as far as from one end of it.
+const BOMBED_REACH: f32 = 40.0;
+
+/// The mission's gates' model (`_jungle_wallgate`'s), which the gate test
+/// brings down wherever a state layer places it.
+const GATE_MODEL: u32 = 0x1923_143c;
+
+/// How fast the gate test throws a gate's pieces each time it brings it
+/// down, and whether everything else in its box is taken down first: as
+/// in play first (and pictured), then slower and faster, to see how the
+/// look depends on it, then as in play alone (and pictured).
+const GATE_TRIES: [(f32, bool); 4] = [(1.0, false), (0.6, false), (1.6, false), (1.0, true)];
+
+/// How much of another model's box has to be inside a gate's for the
+/// gate test's last try to take it down.
+const GATE_ALONE_SHARE: f32 = 0.5;
+
+/// How many of the other models in a gate's box the gate test lists.
+const GATE_LISTED: usize = 12;
+
+/// How far (metres) a gate's piece may have gone and still be listed as
+/// held, with what it touches: round 101's gatehouse pieces went 1 to 2 m.
+const GATE_HELD: f32 = 2.5;
+
+/// With `--gates`: brings down each of the mission's gates (the state
+/// layers' [`GATE_MODEL`]s) as the satellite bomb does, its blast on the
+/// middle of the gate's top, once for each of [`GATE_TRIES`], logging how
+/// its pieces set off (`gate N, try T: sets off: ...`) and where they are
+/// 2 s and 8 s on. First it lists what else stands in the gate's box (the
+/// state layers' models, with the layer that put each up, and every
+/// static collider) and pictures the place without the gate
+/// (`<out>-gateN-without.ppm`): round 101's gates still showed whole walls
+/// either side 8 s after the bomb, where the gate has no pieces, and its
+/// gatehouse's pieces were held where they started. The first time,
+/// pictures from 50 m south of it (as the mission comes at it) of the rest
+/// of it alone and its pieces alone as it breaks (`-gateN-rest`,
+/// `-gateN-pieces`), and of all of it 2 s and 8 s on (`-gateN-2s`,
+/// `-gateN-8s`), with the pieces still near where they started and what
+/// they touch at 2 s; the last time, with the other models mostly in its
+/// box taken down and the island's statics in it (its ground aside) gone,
+/// the same at 2 s and 8 s (`-gateN-alone-2s`, `-gateN-alone-8s`).
+fn gates_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    use m2_math::glam::Vec3;
+    let tick = TICK.as_secs_f32();
+    let stem = out
+        .file_stem()
+        .map_or("shot".into(), |s| s.to_string_lossy());
+    let picture = |name: String| out.with_file_name(format!("{stem}-{name}.ppm"));
+    let Some(world) = &game.scene.world else {
+        return Ok(());
+    };
+    let mut gates: Vec<(u32, Vec3)> = world
+        .index
+        .state_objects
+        .iter()
+        .filter(|(_, o)| o.model == GATE_MODEL)
+        .map(|(&e, o)| (e, o.position))
+        .collect();
+    gates.sort_by_key(|g| g.0);
+    eprintln!(
+        "gates: {} placed: {}",
+        gates.len(),
+        gates
+            .iter()
+            .map(|(e, at)| format!("{e:#x} at {at:.1}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    game.on_foot = false;
+    // Steps the game `seconds` on, drawing every tenth tick so the island
+    // streams around the camera.
+    let run = |backend: &mut WgpuBackend, game: &mut Game, seconds: f32| {
+        for i in 0..(seconds / tick).round() as u32 {
+            game.step(Intent::default(), tick);
+            if i % 10 == 0 {
+                render(backend, game, fov, aspect, None)?;
+            }
+        }
+        anyhow::Ok(())
+    };
+    for (k, &(gate, position)) in gates.iter().enumerate() {
+        let n = k + 1;
+        // From the south, 50 m off and above the ground there, as the
+        // mission comes at it.
+        let look = |game: &mut Game, at: Vec3| {
+            let mut eye = at + Vec3::new(0.0, 6.0, -50.0);
+            if let Some(ground) = game
+                .scene
+                .world
+                .as_ref()
+                .and_then(|w| w.physics.island_below(eye.with_y(eye.y + 200.0), 400.0))
+            {
+                eye.y = eye.y.max(ground + 2.0);
+            }
+            game.camera = FlyCamera::looking_at(eye, at);
+            eye
+        };
+        look(game, position + Vec3::Y * 8.0);
+        game.scene.show_props([gate]);
+        let started = Instant::now();
+        // The gate, the start-up layers' models round it and the island
+        // there all in.
+        while game.scene.props.get(gate).is_none_or(|(_, loaded)| !loaded)
+            || game.startup.as_ref().is_some_and(startup::Startup::loading)
+            || game.scene.props.counts().loading + game.scene.props.counts().waiting_near > 0
+            || game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|w| w.stats().pending > 0)
+        {
+            if started.elapsed() > Duration::from_secs(120) {
+                break;
+            }
+            run(backend, game, 0.5)?;
+        }
+        let (Some(centre), Some(top)) = (game.scene.props.centre(gate), game.scene.props.top(gate))
+        else {
+            eprintln!("gate {n} ({gate:#x}): its model never loaded");
+            continue;
+        };
+        let eye = look(game, centre);
+        let facing = game
+            .scene
+            .props
+            .get(gate)
+            .map_or(Vec3::Z, |(p, _)| p.rotation * Vec3::Z);
+        eprintln!(
+            "gate {n} ({gate:#x}) at {position:.1}, seen from {eye:.1}, its z axis {facing:.2}"
+        );
+        if let Some(world) = &game.scene.world {
+            let props = &game.scene.props;
+            let others = props.others_in_box(&world.physics, gate);
+            eprintln!(
+                "gate {n}: {} other models in its box, biggest first: {}",
+                others.len(),
+                others
+                    .iter()
+                    .take(GATE_LISTED)
+                    .map(|(_, _, line)| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            if let Some((place, bounds)) = props.placed_bounds(gate) {
+                let statics: Vec<String> = world
+                    .physics
+                    .statics_in_box(place, bounds)
+                    .into_iter()
+                    .filter(|&k| k != m2_engine::StaticKey::Entity(gate))
+                    .map(|k| gate_static_name(world, props, k))
+                    .collect();
+                eprintln!(
+                    "gate {n}: {} statics in its box: {}",
+                    statics.len(),
+                    statics.join("; ")
+                );
+            }
+        }
+        game.scene.props.skip = Some(gate);
+        render(backend, game, fov, aspect, None)?;
+        write_ppm(backend, &picture(format!("gate{n}-without")))?;
+        game.scene.props.skip = None;
+        // The bomb goes off on its top.
+        let blast = top - Vec3::Y * 0.2;
+        for (t, &(scale, alone)) in GATE_TRIES.iter().enumerate() {
+            if alone && let Some(world) = &mut game.scene.world {
+                // Everything else mostly in its box taken down, and the
+                // island's statics in it but its ground.
+                let props = &mut game.scene.props;
+                let others: Vec<u32> = props
+                    .others_in_box(&world.physics, gate)
+                    .into_iter()
+                    .filter(|o| o.1 >= GATE_ALONE_SHARE)
+                    .map(|o| o.0)
+                    .collect();
+                let statics: Vec<m2_engine::StaticKey> = props
+                    .placed_bounds(gate)
+                    .map(|(place, bounds)| world.physics.statics_in_box(place, bounds))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|k| {
+                        matches!(
+                            k,
+                            m2_engine::StaticKey::Object(_) | m2_engine::StaticKey::Member(..)
+                        )
+                    })
+                    .collect();
+                props.hide(&mut world.physics, others.iter().copied());
+                for &k in &statics {
+                    world.physics.remove_static(k);
+                }
+                eprintln!(
+                    "gate {n}, alone: took down {} other models and {} island statics",
+                    others.len(),
+                    statics.len()
+                );
+            }
+            // Whole again.
+            if let Some(world) = &mut game.scene.world {
+                game.scene.props.hide(&mut world.physics, [gate]);
+            }
+            game.scene.show_props([gate]);
+            run(backend, game, 0.1)?;
+            let Some(world) = &mut game.scene.world else {
+                break;
+            };
+            if !game
+                .scene
+                .props
+                .wreck_scaled(&mut world.physics, gate, Some(blast), scale)
+            {
+                eprintln!("gate {n}: it would not break");
+                break;
+            }
+            let try_n = t + 1;
+            eprintln!(
+                "gate {n}, try {try_n} ({scale} times as fast{}), blast at {blast:.1}: sets off: \
+                 {}",
+                if alone { ", alone" } else { "" },
+                game.scene
+                    .props
+                    .pieces_report(&world.physics, gate)
+                    .unwrap_or_else(|| "no pieces".to_owned())
+            );
+            let first = t == 0;
+            let tag = if alone { "-alone" } else { "" };
+            if first {
+                // Burning where its break-up says, as in play.
+                for at in game.scene.props.breakup_points(gate) {
+                    game.combat.blaze(&world.physics, at);
+                }
+                for (parts, name) in [
+                    (props::Parts::Rest, "rest"),
+                    (props::Parts::Pieces, "pieces"),
+                ] {
+                    game.scene.props.parts = parts;
+                    render(backend, game, fov, aspect, None)?;
+                    write_ppm(backend, &picture(format!("gate{n}-{name}")))?;
+                }
+                game.scene.props.parts = props::Parts::All;
+            }
+            let mut gone = 0.0;
+            for (on, name) in [(2.0, "2s"), (8.0, "8s")] {
+                run(backend, game, on - gone)?;
+                gone = on;
+                let Some(world) = &game.scene.world else {
+                    break;
+                };
+                let props = &game.scene.props;
+                eprintln!(
+                    "gate {n}, try {try_n}: {on} s on: {}; {}",
+                    props.pieces_moved(&world.physics, gate).unwrap_or_default(),
+                    props.describe(&world.physics, gate).unwrap_or_default()
+                );
+                if (first || alone) && on < 8.0 {
+                    let held: Vec<String> = props
+                        .pieces_held(&world.physics, gate, GATE_HELD)
+                        .into_iter()
+                        .map(|(node, keys)| {
+                            let by: Vec<String> = keys
+                                .into_iter()
+                                .map(|k| gate_static_name(world, props, k))
+                                .collect();
+                            format!(
+                                "n{node} by {}",
+                                if by.is_empty() {
+                                    "nothing static".to_owned()
+                                } else {
+                                    by.join(", ")
+                                }
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "gate {n}, try {try_n}: {on} s on, {} pieces within {GATE_HELD} m of \
+                         where they started: {}",
+                        held.len(),
+                        held.join("; ")
+                    );
+                }
+                if first || alone {
+                    render(backend, game, fov, aspect, None)?;
+                    write_ppm(backend, &picture(format!("gate{n}{tag}-{name}")))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Draws a frame with the HUD (and the mission's objectives) and writes
+/// it to `out` as a binary PPM.
+fn hud_picture(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    link: &mission::MissionLink,
+    fov: f32,
+    aspect: f32,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    let (w, h) = backend.size();
+    let mut hud = ui::Hud::new();
+    let mut settings = config::Config::default();
+    let info = hud_info(game, Some(link), fov, aspect);
+    let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
+    render(backend, game, fov, aspect, Some(&mut hud))?;
+    write_ppm(backend, out)
+}
+
+/// Writes the frame just rendered offscreen as a binary PPM.
+fn write_ppm(backend: &WgpuBackend, out: &std::path::Path) -> anyhow::Result<()> {
+    let (w, h) = backend.size();
     let rgba = backend.read_pixels()?;
     let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
     ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
-    std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))?;
-    eprintln!("wrote {}", out.display());
+    std::fs::write(out, ppm).with_context(|| format!("writing {}", out.display()))
+}
+
+/// A picture of a delivery, from 30 m off its drop point `to` on her
+/// side and 6 m up (clear of the ground there), looking at `at`; written
+/// to `out`, the camera going back to her after.
+#[allow(clippy::too_many_arguments)]
+fn delivery_picture(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    to: m2_math::glam::Vec3,
+    at: m2_math::glam::Vec3,
+    eye: Option<m2_math::glam::Vec3>,
+    out: &std::path::Path,
+) -> anyhow::Result<m2_math::glam::Vec3> {
+    use m2_math::glam::Vec3;
+    let eye = eye.unwrap_or_else(|| {
+        let away = (game.focus() - to)
+            .with_y(0.0)
+            .try_normalize()
+            .unwrap_or(Vec3::X);
+        let mut eye = to + away * 30.0 + Vec3::Y * 6.0;
+        if let Some(world) = &game.scene.world {
+            let top = eye + Vec3::Y * 300.0;
+            if let Some((t, _)) = world.physics.cast_ray(top, Vec3::NEG_Y, 600.0) {
+                eye.y = eye.y.max(top.y - t + 2.0);
+            }
+        }
+        eye
+    });
+    let (on_foot, camera) = (game.on_foot, game.camera);
+    game.on_foot = false;
+    game.camera = FlyCamera::looking_at(eye, at);
+    render(backend, game, fov, aspect, None)?;
+    let written = write_ppm(backend, out);
+    game.on_foot = on_foot;
+    game.camera = camera;
+    written?;
+    eprintln!(
+        "delivery picture: wrote {} from {eye:.1} looking at {at:.1}",
+        out.display()
+    );
+    Ok(eye)
+}
+
+/// How she holds her weapon, for close-ups: where its barrel and its top
+/// point (ahead, to her right, up; and degrees below level), and where the
+/// grip and muzzle are from her right hand's attach point, in metres
+/// (ahead, right, up).
+fn describe_hold(game: &Game) -> Option<String> {
+    use m2_math::glam::Vec3;
+    let p = game.scene.player.as_ref()?;
+    let (_, rig) = p.model.as_ref()?;
+    let arsenal = &game.scene.arsenal;
+    let w = match game.combat.weapon {
+        combat::Weapon::Rifle => arsenal.rifle.as_ref()?,
+        combat::Weapon::Rpg => arsenal.rpg.as_ref()?,
+        combat::Weapon::GrenadeLauncher => arsenal.launcher.as_ref()?,
+    };
+    let (nodes, _) = rig.posed();
+    let body = p.model_matrix();
+    let held = arsenal.in_hand(
+        w,
+        body,
+        &nodes,
+        (arsenal.hand, arsenal.attach),
+        rig.two_handed,
+    )?;
+    let ahead = Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
+    let right = Vec3::new(-ahead.z, 0.0, ahead.x);
+    let local = |v: Vec3| Vec3::new(v.dot(ahead), v.dot(right), v.y);
+    let barrel = held.transform_vector3(w.muzzle).normalize_or_zero();
+    let top = held.transform_vector3(Vec3::Y).normalize_or_zero();
+    let palm = (body * nodes[arsenal.attach?]).w_axis.truncate();
+    let grip = held.w_axis.truncate();
+    let muzzle = held.transform_point3(w.muzzle);
+    Some(format!(
+        "{:?} held {}, barrel {:.2} ({:.0} deg below level), top {:.2}, grip {:.2} and muzzle {:.2} from the palm",
+        game.combat.weapon,
+        if rig.two_handed {
+            "two-handed"
+        } else {
+            "in the right hand"
+        },
+        local(barrel),
+        (-barrel.y).asin().to_degrees(),
+        local(top),
+        local(grip - palm),
+        local(muzzle - palm),
+    ))
+}
+
+/// How the weapons on her back hang: for each, which side, which way its
+/// barrel and its top point (ahead, right, up of her), and where its grip
+/// and muzzle are from the middle of her back at the attach points'
+/// height.
+fn describe_slung(game: &Game) -> Vec<String> {
+    use m2_math::glam::Vec3;
+    let Some(p) = game.scene.player.as_ref() else {
+        return Vec::new();
+    };
+    let Some((_, rig)) = p.model.as_ref() else {
+        return Vec::new();
+    };
+    let arsenal = &game.scene.arsenal;
+    let (nodes, _) = rig.posed();
+    let body = p.model_matrix();
+    let ahead = Vec3::new(p.facing.sin(), 0.0, p.facing.cos());
+    let right = Vec3::new(-ahead.z, 0.0, ahead.x);
+    let local = |v: Vec3| Vec3::new(v.dot(ahead), v.dot(right), v.y);
+    let holding = !game.combat.designator && p.throwing.is_none() && !p.down;
+    let mut lines = Vec::new();
+    for (slot, slung) in game.combat.slung(holding).into_iter().enumerate() {
+        let Some(weapon) = slung else { continue };
+        let model = match weapon {
+            combat::Weapon::Rifle => arsenal.of_gun(&game.combat.rifle),
+            combat::Weapon::Rpg | combat::Weapon::GrenadeLauncher => {
+                arsenal.of_gun(&game.combat.launcher)
+            }
+        };
+        let side = ["right", "left"][slot];
+        let Some((w, at)) = model.and_then(|w| Some((w, arsenal.on_back(w, body, &nodes, slot)?)))
+        else {
+            lines.push(format!(
+                "{weapon:?} on her {side}: no model or attach point"
+            ));
+            continue;
+        };
+        let middle = body.transform_point3(Vec3::new(0.0, 1.4, 0.0));
+        // Along its length (its box's longest side), toward its muzzle's end.
+        let (lo, hi) = w.model.bounds;
+        let size = hi - lo;
+        let long = (0..3).fold(0, |a, b| if size[b] > size[a] { b } else { a });
+        let mut length = Vec3::ZERO;
+        length[long] = if w.muzzle[long] < (lo[long] + hi[long]) * 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
+        let barrel = at.transform_vector3(length).normalize_or_zero();
+        let top = at.transform_vector3(Vec3::Y).normalize_or_zero();
+        // Its box's corners, from her middle (ahead, right, up).
+        let corners: Vec<Vec3> = (0..8)
+            .map(|k| {
+                let pick = |bit: usize, a: f32, b: f32| if k & bit == 0 { a } else { b };
+                let c = Vec3::new(
+                    pick(1, lo.x, hi.x),
+                    pick(2, lo.y, hi.y),
+                    pick(4, lo.z, hi.z),
+                );
+                local(at.transform_point3(c) - middle)
+            })
+            .collect();
+        let span = |i: usize| {
+            corners
+                .iter()
+                .map(|c| c[i])
+                .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(v), b.max(v)))
+        };
+        let (ahead_span, right_span, up_span) = (span(0), span(1), span(2));
+        let muzzle_end = if barrel.y < 0.0 { "down" } else { "up" };
+        lines.push(format!(
+            "{weapon:?} on her {side}: length {:.2} ({:.0} deg above level, muzzle end {muzzle_end}), \
+             from {:.2} to {:.2} m above her feet, {:.2} to {:.2} m to her right, {:.2} to {:.2} m \
+             ahead of her middle; top {:.2}, grip {:.2} and muzzle {:.2} from her back's middle",
+            local(barrel),
+            barrel.y.asin().to_degrees(),
+            up_span.0 + 1.4,
+            up_span.1 + 1.4,
+            right_span.0,
+            right_span.1,
+            ahead_span.0,
+            ahead_span.1,
+            local(top),
+            local(at.w_axis.truncate() - middle),
+            local(at.transform_point3(w.muzzle) - middle),
+        ));
+    }
+    lines
+}
+
+/// Puts the camera `reach` metres from the mission marker nearest the
+/// player, on her side of it and a little above, looking at it, and lets
+/// the island stream in around it.
+fn look_at_marker(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    link: &mission::MissionLink,
+    reach: f32,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    use m2_math::glam::Vec3;
+    let here = game.focus();
+    let Some((at, label, _)) = link
+        .view()
+        .markers
+        .into_iter()
+        .min_by(|a, b| a.0.distance(here).total_cmp(&b.0.distance(here)))
+    else {
+        eprintln!("mission look: no markers");
+        return Ok(());
+    };
+    let side = (here - at).with_y(0.0).normalize_or(Vec3::X);
+    let eye = at + side * reach + Vec3::Y * (reach * 0.4);
+    eprintln!("mission look: {label} at {at:.1} from {eye:.1}");
+    game.on_foot = false;
+    game.camera = FlyCamera::looking_at(eye, at);
+    let tick = TICK.as_secs_f32();
+    let started = Instant::now();
+    for i in 0.. {
+        game.step(Intent::default(), tick);
+        if i % 10 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        let pending = game.scene.world.as_ref().map_or(0, |w| w.stats().pending);
+        if (i > 120 && pending == 0) || started.elapsed() > Duration::from_secs(60) {
+            break;
+        }
+    }
     Ok(())
+}
+
+/// [`static_name`], with the layer that put up a state layer's model
+/// (the gate test's lists).
+fn gate_static_name(
+    world: &m2_engine::World,
+    props: &props::Props,
+    key: m2_engine::StaticKey,
+) -> String {
+    let name = static_name(world, Some(key));
+    match key {
+        m2_engine::StaticKey::Entity(e) => {
+            format!("{name} of {}", props.layer(e).unwrap_or("no layer noted"))
+        }
+        _ => name,
+    }
+}
+
+/// What a static collider is: a placed object and its model, a building
+/// of a batch, a terrain cell or a state layer's model (`None`: something
+/// not static, such as a vehicle).
+pub(crate) fn static_name(world: &m2_engine::World, key: Option<m2_engine::StaticKey>) -> String {
+    use m2_engine::StaticKey;
+    match key {
+        Some(StaticKey::Object(i)) => world.index.objects.get(i).map_or_else(
+            || format!("object {i}"),
+            |o| format!("object {i}, model {:08x} at {:.1}", o.model, o.position),
+        ),
+        Some(StaticKey::Member(i, k)) => world.index.objects.get(i).map_or_else(
+            || format!("building {k} of object {i}"),
+            |o| format!("building {k} of object {i} (batch {:08x})", o.model),
+        ),
+        Some(StaticKey::Cell(h)) => format!("terrain cell {h:08x}"),
+        Some(StaticKey::Entity(e)) => world.index.state_objects.get(&e).map_or_else(
+            || format!("state layer entity {e:08x}"),
+            |o| format!("state layer entity {e:08x}, model {:08x}", o.model),
+        ),
+        None => "something not static".to_owned(),
+    }
+}
+
+/// Looks for what stops vehicles where she stands: rays out to 25 m in
+/// 16 directions at four heights over the ground, and the ground's height
+/// every metre along lines through the spot, printing what each hits.
+fn probe_for_screenshot(game: &Game) {
+    use m2_engine::StaticKey;
+    use m2_math::glam::Vec3;
+    let (Some(world), Some(player)) = (&game.scene.world, &game.scene.player) else {
+        return;
+    };
+    let here = player.character.position;
+    let what = |key: Option<StaticKey>| static_name(world, key);
+    let down = |x: f32, z: f32| {
+        let top = here.y + 60.0;
+        world
+            .physics
+            .cast_ray_keyed(Vec3::new(x, top, z), -Vec3::Y, 200.0)
+            .map(|(d, n, k)| (top - d, n, k))
+    };
+    let Some((ground, normal, key)) = down(here.x, here.z) else {
+        eprintln!("probe: no ground under {here:.1}");
+        return;
+    };
+    eprintln!(
+        "probe: at {here:.1}, ground {ground:.2}, normal {normal:.2} ({})",
+        what(key)
+    );
+    for up in [0.2, 0.6, 1.2, 2.5] {
+        let from = Vec3::new(here.x, ground + up, here.z);
+        let mut hits = Vec::new();
+        for k in 0..16 {
+            let a = k as f32 * std::f32::consts::TAU / 16.0;
+            let dir = Vec3::new(a.sin(), 0.0, a.cos());
+            if let Some((d, n, key)) = world.physics.cast_ray_keyed(from, dir, 25.0) {
+                hits.push(format!(
+                    "{:>3.0} deg: {d:4.1} m, normal {n:.2}, {}",
+                    a.to_degrees(),
+                    what(key)
+                ));
+            }
+        }
+        eprintln!("probe: {up} m up, {} of 16 rays hit:", hits.len());
+        for h in hits {
+            eprintln!("  {h}");
+        }
+    }
+    for (label, axis) in [("x", Vec3::X), ("z", Vec3::Z)] {
+        let mut last: Option<(f32, Option<StaticKey>)> = None;
+        let mut notes = Vec::new();
+        for step in -30..=30 {
+            let p = here + axis * step as f32;
+            match down(p.x, p.z) {
+                Some((y, _, key)) => {
+                    if let Some((ly, lk)) = last {
+                        if (y - ly).abs() > 0.25 {
+                            notes.push(format!("{:+.2} m at {step:+} ({})", y - ly, what(key)));
+                        } else if lk != key {
+                            notes.push(format!("onto {} at {step:+}", what(key)));
+                        }
+                    }
+                    last = Some((y, key));
+                }
+                None => notes.push(format!("no ground at {step:+}")),
+            }
+        }
+        eprintln!(
+            "probe: along {label} from -30 to +30 m: {}",
+            if notes.is_empty() {
+                "smooth".to_owned()
+            } else {
+                notes.join("; ")
+            }
+        );
+    }
 }
 
 /// Starts the mission scripts, waits for them to read the archive and
 /// start the first contract, then plays on while the island streams in
 /// where they put the player, printing the objectives.
+/// Offscreen, the movies the scripts are waiting on (`--movies`): each is
+/// opened, a frame three seconds in is pictured (`<out>-movie-<name>.ppm`)
+/// and its sound decoded, and the scripts are told it is over.
+fn movies_offscreen(link: &mut mission::MissionLink, install: &Install, out: &std::path::Path) {
+    while let Some(name) = link.take_movie() {
+        eprintln!("movies: the scripts play {name}");
+        match movie::ffmpeg() {
+            None => eprintln!("movies: no ffmpeg; {name} skipped"),
+            Some(ffmpeg) => match movie::Movie::open(&ffmpeg, install, &name) {
+                Err(e) => eprintln!("movies: {name}: {e:#}"),
+                Ok(mut m) => {
+                    let at = (m.info.fps * 3.0) as usize;
+                    let (w, h) = (m.info.width, m.info.height);
+                    let mut frame = None;
+                    for _ in 0..=at {
+                        match m.next_frame() {
+                            Some(f) => frame = Some(f.to_vec()),
+                            None => break,
+                        }
+                    }
+                    let stem = out
+                        .file_stem()
+                        .map_or("shot".into(), |s| s.to_string_lossy());
+                    let path = out.with_file_name(format!("{stem}-movie-{name}.ppm"));
+                    if let Some(rgba) = frame {
+                        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+                        ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+                        match std::fs::write(&path, ppm) {
+                            Ok(()) => eprintln!("movies: pictured {name}: {}", path.display()),
+                            Err(e) => eprintln!("movies: {}: {e}", path.display()),
+                        }
+                    }
+                    eprintln!("movies: {name} sound {:?} s", m.sound_seconds());
+                }
+            },
+        }
+        link.movie_done();
+    }
+}
+
 fn mission_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -509,12 +2071,18 @@ fn mission_for_screenshot(
     options: &Options,
     fov: f32,
     aspect: f32,
+    out: &std::path::Path,
 ) -> anyhow::Result<mission::MissionLink> {
     let tick = TICK.as_secs_f32();
-    let mut link = mission::MissionLink::start(install, options.mission_drivers.clone());
+    let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
+        .with_support(options.support.clone())
+        .with_movies(options.movies);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
+        if options.movies {
+            movies_offscreen(&mut link, install, out);
+        }
         if link
             .view()
             .status
@@ -533,18 +2101,409 @@ fn mission_for_screenshot(
         },
         started.elapsed().as_secs_f32()
     );
-    // Ten seconds of play (or as asked), streaming as it goes.
+    // Ten seconds of play (or as asked), streaming as it goes; with
+    // --autoplay she plays it herself, until the contract is done.
     let seconds = if options.mission_seconds > 0.0 {
         options.mission_seconds
     } else {
         10.0
     };
+    let mut auto = options.autoplay.then(autoplay::Autoplay::default);
+    let mut contract_done: Option<u32> = None;
+    let mut late_hud: Option<(ui::Hud, Config)> = None;
+    let played = Instant::now();
+    let every = if auto.is_some() { 10 } else { 30 };
+    // With --autoplay, a picture of each delivery as its helicopter
+    // hovers over the drop point (`<out>-delivery1.ppm`, ...), and one
+    // from the same place once the load has come down (`-down`).
+    let stem = out
+        .file_stem()
+        .map_or("shot".into(), |s| s.to_string_lossy());
+    let picture = |name: String| out.with_file_name(format!("{stem}-{name}.ppm"));
+    let mut pictured: HashSet<u32> = HashSet::new();
+    let mut down: Vec<(u32, usize, m2_math::glam::Vec3, m2_math::glam::Vec3)> = Vec::new();
+    // And the start's boat from the chase camera once it planes (round
+    // 89's, five seconds after she was seated, caught it barely moving),
+    // or twenty seconds after she is seated if it never does (`-boat`),
+    // and her three seconds after she gets out of it (`-ashore`): the
+    // tick she was seated and the tick each picture is due.
+    let mut seated: Option<u32> = None;
+    let mut boat_shot: Option<u32> = None;
+    let mut ashore_shot: Option<u32> = None;
+    // And what each crate broken open left, as soon as it lies there
+    // (she takes it within a second or two), from 5 m off (`-pickupN`):
+    // the crates seen, and the pictures due (tick, crate).
+    let mut opened: HashSet<(u32, u32)> = HashSet::new();
+    // When to picture each, which, and its number.
+    let mut pickup_shots: Vec<(u32, (u32, u32), usize)> = Vec::new();
+    // And the satellite's view as the timing wheel comes up for each
+    // call (`-satelliteN`), her PDA as she opens it (`-pdaN`), and her own
+    // view two seconds after each bomb lands (`-bombN`) and eight
+    // (`-bombN-late`, when the videos' gates lie broken: round 96), all
+    // with the HUD: whether the wheel (the PDA) was up, the pictures taken
+    // and those due (tick, number, seconds after).
+    let mut wheel_up = false;
+    let mut satellite_shots = 0;
+    let (mut pda_shots, mut pda_up) = (0, false);
+    let mut bombs = 0;
+    let mut bomb_shots: Vec<(u32, usize, u32, m2_math::glam::Vec2)> = Vec::new();
+    // The tutorial box's line as last shown, its keys named (round 99's
+    // `[sprint]` showed in no picture).
+    let mut tutorial_shown: Option<String> = None;
+    // The clips' sound events met, by category and name: how many hers,
+    // how many others' within earshot.
+    let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
+    let mut strike_seen: Option<u32> = None;
     for i in 0..(seconds / tick).round() as u32 {
-        game.step(Intent::default(), tick);
+        let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
+            Some(a) => {
+                let marks = link.marks();
+                let objectives = link.view().objectives;
+                a.step(game, &marks, &objectives, &link.awaited(), tick)
+            }
+            None => Intent::default(),
+        };
+        if let Some(hp) = options.hurt
+            && i == (HURT_AT / tick).round() as u32
+        {
+            eprintln!("hurt: her health {:.1} -> {hp:.1}", game.combat.hp);
+            game.combat.hp = hp;
+        }
+        // With --support she throws the marker the scripts hand her.
+        let mut intent = intent;
+        if !options.support.is_empty() && game.combat.to_throw {
+            intent.trigger.throw = true;
+        }
+        game.step(intent, tick);
         link.tick(game, tick);
-        if i % 30 == 0 {
+        if options.movies {
+            movies_offscreen(&mut link, install, out);
+        }
+        // After the contract (--after-contract) the game's HUD runs too:
+        // the flow waits on its fanfare closing.
+        if contract_done.is_some() {
+            let (hud, settings) = late_hud.get_or_insert_with(|| {
+                let mut hud = ui::Hud::new();
+                hud.game = game_hud(Some(install), &Mode::Island(None), false);
+                hud.wait = true;
+                if let Some(g) = &mut hud.game {
+                    g.log_to(&out.with_file_name(format!("{stem}-late-hud.log")));
+                }
+                (hud, Config::default())
+            });
+            let mut info = hud_info(game, Some(&link), fov, aspect);
+            let mut state = gamehud::HudState::of(game);
+            // She presses Enter every four seconds, as a player would to
+            // close the contract's fanfare.
+            if i % (4.0 / tick).round() as u32 == 0 {
+                state.buttons.push("selection".into());
+            }
+            info.game = Some(state);
+            let (w, h) = backend.size();
+            let mut input = ui::headless_input(w, h, f64::from(i) * f64::from(tick));
+            // And the Enter key itself, down then up, for the movie that
+            // has the controls (the fanfare's Key listener).
+            let every = (4.0 / tick).round() as u32;
+            if i % every <= 1 {
+                input.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: i % every == 0,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = hud.build(input, &info, settings);
+            if let Some(g) = &mut hud.game {
+                for seq in g.take_callbacks() {
+                    eprintln!("after contract: the HUD called back call {seq}");
+                    link.hud_callback(seq);
+                }
+            }
+        }
+        // After the contract (--after-contract), where she is every five
+        // seconds.
+        if contract_done.is_some() && i % (5.0 / tick).round() as u32 == 0 {
+            let view = link.view();
+            eprintln!(
+                "after contract: {:.0} s, she is at {:.1}, objectives {:?}",
+                i as f32 * tick,
+                game.focus(),
+                view.objectives
+            );
+        }
+        // And the strike is pictured 2 s and 6 s after its first ordnance
+        // goes off (`-strike`, `-strike-late`).
+        if !options.support.is_empty() {
+            let strikes = &game.scene.strikes;
+            if strikes.went_off > 0 && strike_seen.is_none() {
+                strike_seen = Some(i);
+                eprintln!(
+                    "support: first ordnance went off at {:.1}, {:.1} s in",
+                    strikes.first.unwrap_or_default(),
+                    i as f32 * tick
+                );
+            }
+            for (after, name) in [(2.0, "strike"), (6.0, "strike-late")] {
+                if strike_seen.is_some_and(|s| i == s + (after / tick) as u32) {
+                    let path = picture(name.into());
+                    hud_picture(backend, game, &link, fov, aspect, &path)?;
+                    eprintln!(
+                        "support: pictured her view {after} s after the first blast ({} gone off), health {:.0}: {}",
+                        game.scene.strikes.went_off,
+                        game.combat.hp,
+                        path.display()
+                    );
+                }
+            }
+        }
+        if auto.is_some() {
+            let shown = link.view().tutorial;
+            if shown != tutorial_shown {
+                eprintln!(
+                    "autoplay: the tutorial box reads {shown:?} at {:.1} s",
+                    i as f32 * tick
+                );
+                tutorial_shown = shown;
+            }
+        }
+        for c in game.scene.take_cues(game.focus(), CUE_REACH) {
+            let e = heard.entry((c.category, c.name)).or_default();
+            if c.hers {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
+        // Lost (round 88 went on 40 minutes at NaN): nothing more to see.
+        if auto.is_some() && !game.focus().is_finite() {
+            eprintln!(
+                "autoplay: her position is not a number after {:.1} s of play: stopping",
+                i as f32 * tick
+            );
+            break;
+        }
+        if i % every == 0 {
             render(backend, game, fov, aspect, None)?;
         }
+        if auto.is_some() {
+            for (copter, at, to) in game.scene.flights.hovering() {
+                if pictured.insert(copter) {
+                    let n = pictured.len();
+                    let look = (at + to) * 0.5;
+                    let path = picture(format!("delivery{n}"));
+                    let eye = delivery_picture(backend, game, fov, aspect, to, look, None, &path)?;
+                    let vehicles = &game.scene.vehicles;
+                    for (l, hangs, found) in game.scene.flights.hung_from(copter, vehicles) {
+                        match found.map(|i| &vehicles[i]) {
+                            Some(v) => eprintln!(
+                                "delivery picture: {} ({:#x}) hangs at {hangs:.1}, {:.1} m from the eye, \
+                                 its box {:.2}..{:.2}{}",
+                                v.spec.label,
+                                l.guid,
+                                hangs.distance(eye),
+                                v.model.bounds.0,
+                                v.model.bounds.1,
+                                if v.id.is_some() { ", also in play" } else { "" }
+                            ),
+                            None if l.model.is_some() => eprintln!(
+                                "delivery picture: crate {:#x} hangs at {hangs:.1}",
+                                l.guid
+                            ),
+                            None => eprintln!(
+                                "delivery picture: vehicle {:#x} hangs at {hangs:.1} but has not loaded: not drawn",
+                                l.guid
+                            ),
+                        }
+                    }
+                    // Hovering, letting go and four seconds' fall and
+                    // settling.
+                    down.push((i + (6.0 / tick) as u32, n, eye, to));
+                }
+            }
+            let due: Vec<_> = down.iter().filter(|d| d.0 <= i).copied().collect();
+            down.retain(|d| d.0 > i);
+            for (_, n, eye, to) in due {
+                let path = picture(format!("delivery{n}-down"));
+                let look = to + m2_math::glam::Vec3::Y;
+                delivery_picture(backend, game, fov, aspect, to, look, Some(eye), &path)?;
+            }
+            let in_boat = game
+                .scene
+                .player
+                .as_ref()
+                .and_then(|p| p.driving)
+                .and_then(|v| game.scene.vehicles.get(v))
+                .is_some_and(|v| v.spec.is_boat());
+            if in_boat {
+                let since = *seated.get_or_insert(i);
+                let planing = game.driving().is_some_and(|(_, s)| s >= PLANE_SPEED);
+                if boat_shot.is_none() && (planing || i >= since + (20.0 / tick) as u32) {
+                    boat_shot = Some(i);
+                }
+            } else if seated.is_some() {
+                ashore_shot.get_or_insert(i + (3.0 / tick) as u32);
+            }
+            for p in game.scene.flights.pickups() {
+                if opened.insert(p.key()) {
+                    // Two seconds on, when the soldier who left it has
+                    // fallen.
+                    pickup_shots.push((i + (2.0 / tick) as u32, p.key(), opened.len()));
+                }
+            }
+            let due: Vec<((u32, u32), usize)> = pickup_shots
+                .iter()
+                .filter(|s| s.0 == i)
+                .map(|s| (s.1, s.2))
+                .collect();
+            for (key, n) in due {
+                let lying = game
+                    .scene
+                    .flights
+                    .pickups()
+                    .iter()
+                    .find(|p| p.key() == key)
+                    .copied();
+                let Some(p) = lying else {
+                    eprintln!(
+                        "pickup picture: the {:#x} the crate {:#x} left was taken first",
+                        key.1, key.0
+                    );
+                    continue;
+                };
+                let away = (p.at - game.focus())
+                    .with_y(0.0)
+                    .try_normalize()
+                    .unwrap_or(m2_math::glam::Vec3::X);
+                // Steeply from above, so that a body by it doesn't hide it.
+                let eye = p.at + away * 1.5 + m2_math::glam::Vec3::Y * 3.5;
+                delivery_picture(
+                    backend,
+                    game,
+                    fov,
+                    aspect,
+                    p.at,
+                    p.at,
+                    Some(eye),
+                    &picture(format!("pickup{n}")),
+                )?;
+                eprintln!(
+                    "pickup picture: {:#x} lies at {:.1}, its model {}",
+                    p.what.template,
+                    p.at,
+                    match p.what.model {
+                        Some(m) if game.scene.flights.has_model(m) => format!("{m:08x} drawn"),
+                        Some(m) => format!("{m:08x} not loaded: not drawn"),
+                        None => "none".into(),
+                    }
+                );
+            }
+            let timing = matches!(game.support.phase, support::Phase::Timing { .. });
+            if timing && !wheel_up {
+                satellite_shots += 1;
+                let path = picture(format!("satellite{satellite_shots}"));
+                hud_picture(backend, game, &link, fov, aspect, &path)?;
+                eprintln!(
+                    "autoplay: pictured the satellite's view over {:.1} from her at {:.1}: {}",
+                    game.support.looking().unwrap_or_default(),
+                    game.focus(),
+                    path.display()
+                );
+            }
+            wheel_up = timing;
+            if game.support.pda && !pda_up {
+                pda_shots += 1;
+                let path = picture(format!("pda{pda_shots}"));
+                hud_picture(backend, game, &link, fov, aspect, &path)?;
+                eprintln!(
+                    "autoplay: pictured her PDA open, the tutorial line {:?}: {}",
+                    link.view().tutorial,
+                    path.display()
+                );
+            }
+            pda_up = game.support.pda;
+            if let Some(at) = game.support.landed.iter().find_map(|l| match l {
+                support::Impact::Bomb(at) => Some(*at),
+                _ => None,
+            }) {
+                bombs += 1;
+                for after in [2, 8] {
+                    bomb_shots.push((i + (after as f32 / tick) as u32, bombs, after, at));
+                }
+            }
+            let due: Vec<(usize, u32, m2_math::glam::Vec2)> = bomb_shots
+                .iter()
+                .filter(|s| s.0 == i)
+                .map(|s| (s.1, s.2, s.3))
+                .collect();
+            for (n, after, at) in due {
+                let late = if after > 2 { "-late" } else { "" };
+                let path = picture(format!("bomb{n}{late}"));
+                hud_picture(backend, game, &link, fov, aspect, &path)?;
+                eprintln!(
+                    "autoplay: pictured her view {after} s after bomb {n}, from {:.1}, health {:.0}: {}",
+                    game.focus(),
+                    game.combat.hp,
+                    path.display()
+                );
+                describe_bombed(game, at, fov, aspect);
+            }
+            for (due, name) in [(boat_shot, "boat"), (ashore_shot, "ashore")] {
+                if due == Some(i) {
+                    render(backend, game, fov, aspect, None)?;
+                    write_ppm(backend, &picture(name.into()))?;
+                    match game.driving() {
+                        Some((_, speed)) => eprintln!(
+                            "autoplay: pictured {name} at {:.1} going {speed:.1} m/s, {:.1} s after she was seated",
+                            game.focus(),
+                            (i - seated.unwrap_or(i)) as f32 * tick
+                        ),
+                        None => eprintln!("autoplay: pictured {name} at {:.1}", game.focus()),
+                    }
+                }
+            }
+        }
+        if auto.is_some() && link.completed() && contract_done.is_none() {
+            eprintln!(
+                "autoplay: contract completed after {:.1} s of play ({:.0} s here)",
+                i as f32 * tick,
+                played.elapsed().as_secs_f32()
+            );
+            // She stops playing; the scripts go on (--after-contract).
+            contract_done = Some(i);
+        }
+        if contract_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
+            break;
+        }
+    }
+    if auto.is_some() {
+        let mut sounds = sound::ClipSounds::load(install);
+        let rows: Vec<String> = heard
+            .iter()
+            .map(|((category, name), (hers, others))| {
+                format!(
+                    "{category}/{name} {hers}+{others} ({} sounds)",
+                    sounds.sounds(name).len()
+                )
+            })
+            .collect();
+        eprintln!(
+            "clip cues met (hers+others'; the sounds they play of {}): {}",
+            sounds.len(),
+            rows.join(", ")
+        );
+    }
+    if let Some(a) = &auto {
+        eprintln!(
+            "autoplay: {}{}",
+            a.summary(),
+            if link.completed() {
+                ""
+            } else {
+                "; the contract was not completed"
+            }
+        );
+        look_at_story_character(game);
     }
     while let Some(world) = &game.scene.world {
         let waiting = game.scene.player.as_ref().is_some_and(|p| !p.landed);
@@ -571,16 +2530,267 @@ fn mission_for_screenshot(
             None => eprintln!("mission vehicle {label} not placed"),
         }
     }
+    for line in link.report(game) {
+        eprintln!("mission: {line}");
+    }
     Ok(link)
 }
 
+/// Turns the camera onto the nearest story character within 40 m (the
+/// last picture shows them), saying whether anything stands between.
+fn look_at_story_character(game: &mut Game) {
+    let here = game.focus();
+    let people = &game.scene.people;
+    let Some((name, chest)) = people
+        .npcs
+        .iter()
+        .filter(|n| people.kinds.get(n.kind).is_some_and(|k| k.named))
+        .map(|n| (people.kinds[n.kind].role.clone(), n.chest()))
+        .filter(|(_, c)| c.distance(here) < 40.0)
+        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
+    else {
+        eprintln!("autoplay: no story character within 40 m");
+        return;
+    };
+    aim_at(game, chest);
+    let (Some(world), Some(p)) = (&game.scene.world, &game.scene.player) else {
+        return;
+    };
+    let eye = p.eye();
+    let to = chest - eye;
+    let between = world
+        .physics
+        .cast_ray_keyed(eye, to, to.length())
+        .map(|(d, _, key)| format!("{} at {d:.1} m", static_name(world, key)));
+    eprintln!(
+        "autoplay: looking at {name} at {chest:.1}, {:.1} m from the camera; in the way: {}",
+        to.length(),
+        between.as_deref().unwrap_or("nothing")
+    );
+}
+
 /// Waits for the parked vehicles, gets in the nearest and drives it
-/// forward for four seconds, printing how it went.
+/// forward for four seconds (backing out first if it is parked close
+/// behind something, and steering round what it meets), printing how it
+/// went.
+/// With `--screenshot --drive --hijack`: puts her beside the nearest
+/// hijackable vehicle (`--vehicle`'s, if given), starts the hijack and
+/// answers its prompts at once ([`hijack::Autopad`]), and leaves her in the
+/// picture where it ends: driving it, or let go beside it.
+fn hijack_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    options: &Options,
+    install: &Install,
+) -> anyhow::Result<()> {
+    let tick = TICK.as_secs_f32();
+    let mut hijacks = hijack::Hijacks::start(install, options.hijack_crew.clone());
+    let mut input = Input::default();
+    let started = Instant::now();
+    // The game's HUD, for the buttons the scripts put up.
+    let mut hud = ui::Hud::new();
+    hud.game = game_hud(Some(install), &Mode::Island(None), options.old_hud);
+    hud.wait = true;
+    if let (Some(g), Some(out)) = (&mut hud.game, &options.screenshot) {
+        g.log_to(&out.with_file_name(format!(
+            "{}-hud.log",
+            out.file_stem().and_then(|s| s.to_str()).unwrap_or("hijack")
+        )));
+    }
+    let mut settings = Config::default();
+    while hijacks.loading() && started.elapsed() < Duration::from_secs(120) {
+        hijacks.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+    }
+    eprintln!(
+        "hijack: scripts {} after {:.1} s",
+        if hijacks.loading() {
+            "still loading"
+        } else {
+            "loaded"
+        },
+        started.elapsed().as_secs_f32()
+    );
+    let Some(i) = hijack::beside(game, &mut hijacks, options.vehicle.as_deref()) else {
+        eprintln!("hijack: no hijackable vehicle with a driver parked");
+        return Ok(());
+    };
+    // Let her land.
+    for _ in 0..60 {
+        hijacks.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+    }
+    let Some(view) = hijacks.view() else {
+        eprintln!(
+            "hijack: no prompt beside the {}",
+            game.scene.vehicles[i].spec.label
+        );
+        return Ok(());
+    };
+    eprintln!("hijack: prompt \"Hijack {}\"", view.vehicle);
+    // The HUD up before she starts (its scripts load in the background).
+    if hud.game.is_some() {
+        let mut info = hud_info(game, None, fov, aspect);
+        info.game = Some(gamehud::HudState::of(game));
+        let (w, h) = backend.size();
+        let _ = hud.build(ui::headless_input(w, h, 0.0), &info, &mut settings);
+    }
+    input.button(Action::Use, true);
+    let mut pad = hijack::Autopad::default();
+    let mut t = 0.0;
+    let mut shots = 0;
+    // Pictures of the buttons the scripts put up: just after each shows,
+    // and a second on (a tap's prompt stays up while she taps).
+    let mut button_shots: Vec<f32> = Vec::new();
+    let mut button_shot = 0;
+    loop {
+        hijacks.tick(game, &mut input, tick);
+        input.button(Action::Use, false);
+        game.step(Intent::default(), tick);
+        hijacks.place(game);
+        hijacks.seat(game, tick);
+        t += tick;
+        if hud.game.is_some() {
+            let mut info = hud_info(game, None, fov, aspect);
+            let mut state = gamehud::HudState::of(game);
+            state.gui_calls = hijacks.take_gui_calls();
+            for c in &state.gui_calls {
+                eprintln!("hijack: t={t:.1} HUD call {}.{}", c.module, c.method);
+                if c.method == "ShowButton" {
+                    button_shots.extend([t + 0.1, t + 1.0]);
+                }
+            }
+            info.game = Some(state);
+            let (w, h) = backend.size();
+            let _ = hud.build(ui::headless_input(w, h, f64::from(t)), &info, &mut settings);
+        }
+        // A picture every two seconds of it, beside the one at the end.
+        if t >= 2.0 * (shots + 1) as f32 && options.screenshot.is_some() {
+            shots += 1;
+            if let Some((her, (lo, hi), body)) = hijacks.her_in_vehicle(game) {
+                eprintln!(
+                    "hijack: t={t:.1} her feet in the vehicle's space {:.2?} (its box {:.2?} to {:.2?}) {body}",
+                    her.to_array(),
+                    lo.to_array(),
+                    hi.to_array()
+                );
+            }
+            render(backend, game, fov, aspect, Some(&mut hud))?;
+            if let Some(out) = &options.screenshot {
+                let path = out.with_file_name(format!(
+                    "{}-{shots:02}.ppm",
+                    out.file_stem().and_then(|s| s.to_str()).unwrap_or("hijack")
+                ));
+                write_ppm(backend, &path)?;
+            }
+        }
+        if let Some(k) = button_shots.iter().position(|&at| t >= at) {
+            button_shots.remove(k);
+            button_shot += 1;
+            render(backend, game, fov, aspect, Some(&mut hud))?;
+            if let Some(out) = &options.screenshot {
+                let path = out.with_file_name(format!(
+                    "{}-button{button_shot:02}.ppm",
+                    out.file_stem().and_then(|s| s.to_str()).unwrap_or("hijack")
+                ));
+                eprintln!("hijack: t={t:.1} button picture {}", path.display());
+                write_ppm(backend, &path)?;
+            }
+        }
+        if !hijacks.running() || t > 60.0 {
+            break;
+        }
+        let prompts = hijacks.view().map(|v| v.prompts).unwrap_or_default();
+        pad.answer(&prompts, &mut input, t);
+    }
+    let driving = game.scene.player.as_ref().and_then(|p| p.driving) == Some(i);
+    eprintln!("hijack: over after {t:.1} s; driving it: {driving}");
+    render(backend, game, fov, aspect, None)?;
+    Ok(())
+}
+
+/// Parks the vehicle she drives 12 m short of the nearest placed object
+/// of `kind` (within 150 m) that vehicles break or shove: "fence" (broken
+/// by a heavy enough vehicle), "plant" (flattened), "lamp" (knocked over)
+/// or "box" (loose, no such property), facing it. True if it found one.
+fn plough_at(game: &mut Game, kind: &str) -> bool {
+    use m2_engine::durability::CrashHow;
+    use m2_math::glam::{Quat, Vec3};
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        return false;
+    };
+    let Some(world) = game.scene.world.as_mut() else {
+        return false;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return false;
+    };
+    let Some(here) = world
+        .physics
+        .vehicle_transform(id)
+        .map(|t| t.w_axis.truncate())
+    else {
+        return false;
+    };
+    let wanted = |w: &m2_engine::World, o: usize| {
+        let t = w.index.objects[o].template;
+        let crash = w.index.template_db.crashable.get(&t).map(|c| c.how);
+        match kind {
+            "fence" => crash == Some(CrashHow::Breaks),
+            "plant" => crash == Some(CrashHow::Flattened),
+            "lamp" => crash == Some(CrashHow::KnockedOver),
+            "box" => crash.is_none() && w.loose_mass(o).is_some(),
+            _ => crash.is_some(),
+        }
+    };
+    let Some((o, d)) = world
+        .near(here, 150.0)
+        .into_iter()
+        .filter(|&(o, _)| wanted(world, o))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        eprintln!("plough: no {kind} within 150 m of {here:.1}");
+        return false;
+    };
+    let target = world.index.objects[o];
+    let back = (here - target.position).with_y(0.0).normalize_or(Vec3::X);
+    let spot = target.position + back * 12.0;
+    let ground = world
+        .physics
+        .island_below(spot.with_y(spot.y + 200.0), 400.0)
+        .unwrap_or(spot.y);
+    let ahead = -back;
+    let turn = Quat::from_rotation_y(ahead.x.atan2(ahead.z));
+    world.physics.remove_vehicle(id);
+    let v = &mut game.scene.vehicles[i];
+    v.id = Some(
+        world
+            .physics
+            .add_vehicle_turned(&v.spec, spot.with_y(ground + 1.0), turn),
+    );
+    eprintln!(
+        "plough: {kind}: object {o} (model {:08x}, template {:08x}, crash {:?}, loose {:?}) at \
+         {:.1}, {d:.1} m off; the {} parked 12 m short at {:.1}, facing it",
+        target.model,
+        target.template,
+        world.index.template_db.crashable.get(&target.template),
+        world.loose_mass(o),
+        target.position,
+        v.spec.label,
+        spot.with_y(ground)
+    );
+    true
+}
+
 fn drive_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
     fov: f32,
     aspect: f32,
+    options: &Options,
+    install: Option<&Install>,
 ) -> anyhow::Result<()> {
     let tick = TICK.as_secs_f32();
     let started = Instant::now();
@@ -606,7 +2816,80 @@ fn drive_for_screenshot(
     for _ in 0..90 {
         game.step(Intent::default(), tick);
     }
-    if !game.enter_nearest(f32::INFINITY) {
+    // A vehicle asked for that isn't parked here: one is parked.
+    if let Some(want) = &options.vehicle {
+        let have = |game: &Game| {
+            game.scene.vehicles.iter().any(|v| {
+                v.id.is_some() && v.spec.label.to_ascii_lowercase().contains(want.as_str())
+            })
+        };
+        if !have(game) {
+            let models: Vec<m2_engine::CatalogueEntry> = game
+                .scene
+                .catalogue
+                .as_ref()
+                .map(|c| {
+                    c.vehicles
+                        .iter()
+                        .filter(|e| e.label.to_ascii_lowercase().contains(want.as_str()))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "drive: no {want} parked; parking one of [{}]",
+                models
+                    .iter()
+                    .map(|e| format!("{} ({}, model {:08x})", e.label, e.kind, e.model))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if !models.is_empty() {
+                game.park_more(models);
+                let waited = Instant::now();
+                while !have(game) && waited.elapsed() < Duration::from_secs(90) {
+                    game.step(Intent::default(), tick);
+                    render(backend, game, fov, aspect, None)?;
+                }
+                for _ in 0..90 {
+                    game.step(Intent::default(), tick);
+                }
+            }
+        }
+    }
+    if options.hijack {
+        if let Some(install) = install {
+            hijack_for_screenshot(backend, game, fov, aspect, options, install)?;
+        }
+        return Ok(());
+    }
+    let entered = match &options.vehicle {
+        Some(want) => {
+            let here = game.focus();
+            let world = game.scene.world.as_ref();
+            let pick = game
+                .scene
+                .vehicles
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.spec.label.to_ascii_lowercase().contains(want.as_str()))
+                .filter_map(|(i, v)| {
+                    let at = world?
+                        .physics
+                        .vehicle_transform(v.id?)?
+                        .transform_point3(m2_math::glam::Vec3::ZERO);
+                    Some((i, at.distance(here)))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i);
+            if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
+                p.driving = Some(i);
+            }
+            pick.is_some()
+        }
+        None => game.enter_nearest(f32::INFINITY),
+    };
+    if !entered {
         eprintln!("drive: no vehicle to get in");
         return Ok(());
     }
@@ -617,36 +2900,429 @@ fn drive_for_screenshot(
         .and_then(|p| p.driving)
         .map(|i| game.scene.vehicles[i].spec.label.clone())
         .unwrap_or_default();
-    let from = game.driving().map(|(at, _)| at);
-    let throttle = Intent {
-        movement: m2_math::glam::Vec2::Y,
-        ..Intent::default()
+    // Seated: wait for the clips, then a picture of her sitting still.
+    let mut seats = match install {
+        Some(install) if options.seated => {
+            let mut h = hijack::Hijacks::start(install, None);
+            let mut input = Input::default();
+            let waited = Instant::now();
+            while h.loading() && waited.elapsed() < Duration::from_secs(120) {
+                h.tick(game, &mut input, tick);
+                game.step(Intent::default(), tick);
+            }
+            for _ in 0..60 {
+                h.tick(game, &mut input, tick);
+                game.step(Intent::default(), tick);
+                h.seat(game, tick);
+            }
+            if let Some(p) = &game.scene.player {
+                eprintln!(
+                    "seat: in the {label}: seated {} at {:.2?}",
+                    p.seated,
+                    p.character.position.to_array()
+                );
+            }
+            render(backend, game, fov, aspect, None)?;
+            if let Some(out) = &options.screenshot {
+                let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("drive");
+                write_ppm(backend, &out.with_file_name(format!("{stem}-seated.ppm")))?;
+            }
+            Some(h)
+        }
+        _ => None,
     };
+    let driven = |game: &Game| {
+        let i = game.scene.player.as_ref()?.driving?;
+        let v = &game.scene.vehicles[i];
+        Some((v.id?, v.spec.hull))
+    };
+    // Parked close behind another (the Stryker in the military line):
+    // back out first, as a player would, then drive on round it.
+    if let (Some(world), Some((id, hull))) = (game.scene.world.as_ref(), driven(game))
+        && autoplay::blocked_ahead(&world.physics, id, hull, 2.0)
+    {
+        eprintln!("drive: something within 2 m ahead: backing out for 2 s");
+        let back = Intent {
+            movement: m2_math::glam::Vec2::NEG_Y,
+            ..Intent::default()
+        };
+        for _ in 0..120 {
+            game.step(back, tick);
+        }
+        let brake = Intent {
+            hold_jump: true,
+            ..Intent::default()
+        };
+        for _ in 0..30 {
+            game.step(brake, tick);
+        }
+    }
+    // A helicopter climbs for three seconds first, then flies on.
+    let flies = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|p| p.driving)
+        .is_some_and(|i| game.scene.vehicles[i].spec.is_helicopter());
+    if flies {
+        let ground = game.driving().map(|(at, _)| at.y);
+        let climb = Intent {
+            hold_jump: true,
+            ..Intent::default()
+        };
+        for _ in 0..180 {
+            game.step(climb, tick);
+        }
+        for _ in 0..60 {
+            game.step(Intent::default(), tick);
+        }
+        if let (Some(ground), Some((at, speed))) = (ground, game.driving()) {
+            eprintln!(
+                "drive: helicopter climbed {:.1} m in 3 s, hovering at {speed:.1} m/s",
+                at.y - ground
+            );
+        }
+    }
+    let ploughing = options
+        .plough
+        .as_deref()
+        .is_some_and(|kind| plough_at(game, kind));
+    let from = game.driving().map(|(at, _)| at);
+    // Who is about, to see they keep moving while she drives.
+    let before: Vec<m2_math::glam::Vec3> = game
+        .scene
+        .people
+        .npcs
+        .iter()
+        .map(|n| n.character.position)
+        .collect();
     for i in 0..240 {
+        let steer = match (game.scene.world.as_ref(), driven(game)) {
+            (Some(w), Some((id, hull))) if !ploughing => {
+                autoplay::steer_round(&w.physics, id, hull)
+            }
+            _ => 0.0,
+        };
+        let throttle = Intent {
+            movement: m2_math::glam::Vec2::new(steer, 1.0),
+            ..Intent::default()
+        };
         game.step(throttle, tick);
+        if let Some(h) = &mut seats {
+            h.seat(game, tick);
+        }
         if i % 30 == 0 {
             render(backend, game, fov, aspect, None)?;
         }
     }
     if let (Some(from), Some((to, speed))) = (from, game.driving()) {
         eprintln!(
-            "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s",
-            (to - from).length()
+            "drive: {label} from {from:.2} to {to:.2} ({:.1} m), {speed:.1} m/s, {} objects knocked loose",
+            (to - from).length(),
+            game.scene.world.as_ref().map_or(0, |w| w.knocked())
         );
+        // Hardly moved, or stopped: what holds it.
+        if ((to - from).length() < 8.0 || speed.abs() < 1.0)
+            && let Some(world) = game.scene.world.as_ref()
+            && let Some(v) = game
+                .scene
+                .player
+                .as_ref()
+                .and_then(|p| p.driving)
+                .map(|i| &game.scene.vehicles[i])
+            && let Some(id) = v.id
+        {
+            eprintln!(
+                "drive: held: {}",
+                autoplay::stuck_report(world, id, v.spec.hull, false)
+            );
+        }
+    }
+    if let Some(v) = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|p| p.driving)
+        .map(|i| &game.scene.vehicles[i])
+    {
+        eprintln!(
+            "drive: {} wheels, {} road wheels, tracked {}, wheels rolled {:.1} m, turret pivot {:?}, gun pivot {:?} ({} nodes, muzzle on it {})",
+            v.spec.wheels.len(),
+            v.spec.road_wheels.len(),
+            v.spec.tracked,
+            v.rolled,
+            v.spec.pivot,
+            v.spec.gun_pivot,
+            v.spec.gun.iter().filter(|g| **g).count(),
+            v.spec.muzzle_on_gun
+        );
+        let (lo, hi) = v.spec.hull;
+        let stand = |w: &m2_engine::vehicle::WheelSpec| format!("{:.2}", w.centre);
+        eprintln!(
+            "drive: hull {lo:.2} to {hi:.2}, turret box {:.2?}, mass {:.0} kg, wheels at [{}]",
+            v.spec.turret_box,
+            v.spec.mass,
+            v.spec
+                .wheels
+                .iter()
+                .map(stand)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let t = &v.spec.tuning;
+        if v.spec.is_helicopter() {
+            eprintln!(
+                "drive: helicopter: flight {:?}, chase {:?}, {} rotors",
+                t.flight,
+                t.chase,
+                v.spec.rotors.len()
+            );
+        }
+        eprintln!(
+            "drive: template tuning: top speed {:?} m/s, turret {:?}, camera {:?}, gun {:?}",
+            t.max_speed,
+            t.turret.map(|t| format!(
+                "{:.0} deg/s, gun {:.0}..{:.0} deg at {:.0} deg/s",
+                t.yaw_speed.to_degrees(),
+                t.pitch.0.to_degrees(),
+                t.pitch.1.to_degrees(),
+                t.pitch_speed.to_degrees()
+            )),
+            t.camera,
+            t.gun.map(|g| format!(
+                "{:08x}: {:.0} a minute, {} rounds, {:.0} m/s (most {:.0}), gravity x{:.1}, flash {:?} s, bank {:08x?}",
+                g.weapon, g.rate_of_fire, g.rounds, g.velocity, g.max_velocity, g.gravity_scale, g.flash, g.sound_bank
+            ))
+        );
+        eprintln!(
+            "drive: health {:?}, armour {:?}, blasts x{:?}, burns below {:?}, rounds x{:?}",
+            t.health, t.armour, t.blast_scale, t.burns_below, t.rounds
+        );
+        let arm = game.scene.world.as_ref().and_then(|w| {
+            w.index
+                .template_db
+                .armament_for(&v.spec.label, v.spec.model)
+        });
+        eprintln!(
+            "drive: armament {:?}; armed {:?}; her seat {}",
+            arm.map(|a| (&a.seats, a.mounts.len(), &a.couplings)),
+            v.spec
+                .armed
+                .iter()
+                .map(|m| (m.seat, m.priority, m.weapon.name.as_str(), &m.nodes))
+                .collect::<Vec<_>>(),
+            game.combat.seat
+        );
+        let templated = game
+            .scene
+            .world
+            .as_ref()
+            .and_then(|w| w.index.template_db.engine_for_model(v.spec.model))
+            .is_some();
+        if let Some(e) = game.engine() {
+            eprintln!(
+                "drive: engine bank {:08x} {} ({}), throttle {:.1}",
+                e.bank,
+                sound::bank_name(e.bank).unwrap_or("?"),
+                if templated {
+                    "its template's"
+                } else {
+                    "by kind"
+                },
+                e.throttle
+            );
+            // What it plays (read here: the picture has no sound).
+            if let Some(install) = install {
+                sound::load_engine(install, e.bank);
+                let tank = game
+                    .scene
+                    .player
+                    .as_ref()
+                    .and_then(|p| p.driving)
+                    .is_some_and(|i| game.scene.vehicles[i].spec.cannon());
+                if tank {
+                    sound::log_tank_gun(install);
+                }
+            }
+        }
+    }
+    let npcs = &game.scene.people.npcs;
+    let moved = npcs
+        .iter()
+        .zip(&before)
+        .filter(|(n, b)| n.alive && n.character.position.distance(**b) > 0.5)
+        .count();
+    // What those who stayed put are doing.
+    let mut still = std::collections::BTreeMap::<&str, usize>::new();
+    for (n, b) in npcs.iter().zip(&before) {
+        if !(n.alive && n.character.position.distance(*b) > 0.5) {
+            *still.entry(n.doing()).or_default() += 1;
+        }
+    }
+    eprintln!(
+        "drive: {moved} of {} people moved more than 0.5 m during the drive; the rest: {}",
+        npcs.len().min(before.len()),
+        still
+            .iter()
+            .map(|(what, k)| format!("{k} {what}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if options.wreck {
+        wreck_at_speed(game, tick);
+    }
+    if options.look != 0.0 || options.fire {
+        // Stop, then swing the camera and watch the turret follow.
+        let brake = Intent {
+            hold_jump: true,
+            ..Intent::default()
+        };
+        for _ in 0..60 {
+            game.step(brake, tick);
+        }
+        let swing = 10;
+        for i in 0..90 {
+            let look = if i < swing {
+                m2_math::glam::Vec2::new(options.look / swing as f32, 0.0)
+            } else {
+                m2_math::glam::Vec2::ZERO
+            };
+            let trigger = combat::Trigger {
+                fire: options.fire && i == 89,
+                // `--gunner`: to the gunner's seat first.
+                seat: options.gunner && i == 0,
+                ..combat::Trigger::default()
+            };
+            game.step(
+                Intent {
+                    look,
+                    trigger,
+                    ..brake
+                },
+                tick,
+            );
+            if i % 15 == 14
+                && let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving)
+            {
+                let v = &game.scene.vehicles[i];
+                // The hull's heading, for the turret's on the island.
+                let heading =
+                    v.id.zip(game.scene.world.as_ref())
+                        .and_then(|(id, w)| w.physics.vehicle_transform(id))
+                        .map_or(0.0, |at| {
+                            let f = at.transform_vector3(m2_math::glam::Vec3::Z);
+                            f.x.atan2(f.z)
+                        });
+                let island = (heading + v.turret).to_degrees().rem_euclid(360.0);
+                eprintln!(
+                    "drive: turret at {:.0} deg on the hull ({island:.0} deg on the island, hull {:.0}), gun raised {:.1} deg, camera yaw {:.0} deg, pitch {:.0} deg",
+                    v.turret.to_degrees(),
+                    heading.to_degrees().rem_euclid(360.0),
+                    v.gun.to_degrees(),
+                    game.scene
+                        .player
+                        .as_ref()
+                        .map_or(0.0, |p| p.yaw.to_degrees().rem_euclid(360.0)),
+                    game.scene
+                        .player
+                        .as_ref()
+                        .map_or(0.0, |p| p.pitch.to_degrees())
+                );
+            }
+        }
+        if options.fire {
+            describe_vehicle_fire(game);
+        }
     }
     Ok(())
 }
 
-/// Turns the player's camera so the crosshair is on `target`.
-fn aim_at(game: &mut Game, target: m2_math::glam::Vec3) {
-    let Some(p) = game.scene.player.as_mut() else {
+/// Where the gun of the vehicle she drives fired from: its muzzle on the
+/// model, and where its flash is, on the model and in the world.
+fn describe_vehicle_fire(game: &Game) {
+    let Some(v) = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|p| p.driving)
+        .map(|i| &game.scene.vehicles[i])
+    else {
         return;
     };
-    // The eye moves as the camera turns: settle in a few steps.
-    for _ in 0..4 {
-        let to = target - p.eye();
-        p.yaw = to.x.atan2(to.z);
-        p.pitch = (to.y / to.length().max(0.01)).asin();
+    let body =
+        v.id.zip(game.scene.world.as_ref())
+            .and_then(|(id, w)| w.physics.vehicle_transform(id));
+    let flash = game
+        .combat
+        .effects
+        .iter()
+        .rev()
+        .find_map(|(e, ..)| match e {
+            combat::Effect::Flash { at, size, .. } => Some((*at, *size)),
+            _ => None,
+        });
+    match (v.spec.muzzle, body, flash) {
+        (None, ..) => eprintln!("drive: fire: no gun (no muzzle on a turret)"),
+        (Some(m), Some(body), Some((at, size))) => eprintln!(
+            "drive: fire: muzzle {m:.2} on the model, turret at {:.0} deg, gun raised {:.1} deg; flash {size:.2} m at {:.2} on the model, {at:.2} in the world; {} shells, {} rockets flying",
+            v.turret.to_degrees(),
+            v.gun.to_degrees(),
+            body.inverse().transform_point3(at),
+            game.combat.shells(),
+            game.combat
+                .projectiles()
+                .filter(|(what, ..)| *what == combat::Flying::Rocket)
+                .count()
+        ),
+        (Some(m), _, None) => eprintln!("drive: fire: muzzle {m:.2}, but no flash"),
+        (Some(m), None, _) => eprintln!("drive: fire: muzzle {m:.2}, vehicle not placed"),
+    }
+}
+
+/// Wrecks the vehicle she drives, as it goes, and logs how it comes to
+/// rest: how fast it went, how far it slid, and how much lower it sits.
+fn wreck_at_speed(game: &mut Game, tick: f32) {
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        return;
+    };
+    let Some(id) = game.scene.vehicles[i].id else {
+        return;
+    };
+    let state = |game: &Game| {
+        let physics = &game.scene.world.as_ref()?.physics;
+        Some((
+            physics.vehicle_transform(id)?.w_axis.truncate(),
+            physics.vehicle_velocity(id).length(),
+        ))
+    };
+    let Some((from, speed)) = state(game) else {
+        return;
+    };
+    game.scene.vehicles[i].wrecked = true;
+    if let Some(world) = game.scene.world.as_mut() {
+        world.physics.wreck_vehicle(id);
+    }
+    let mut stopped = None;
+    for k in 0..240 {
+        game.step(Intent::default(), tick);
+        if stopped.is_none() && state(game).is_some_and(|(_, v)| v < 0.3) {
+            stopped = Some(k as f32 * tick);
+        }
+    }
+    if let Some((to, now)) = state(game) {
+        eprintln!(
+            "drive: wrecked at {speed:.1} m/s; slid {:.1} m, {:.2} m lower, moving {now:.2} m/s after 4 s, stopped {}",
+            (to - from).with_y(0.0).length(),
+            from.y - to.y,
+            stopped.map_or("never".to_owned(), |t| format!("after {t:.1} s"))
+        );
+    }
+}
+
+/// Turns the player's camera so the crosshair is on `target`.
+fn aim_at(game: &mut Game, target: m2_math::glam::Vec3) {
+    if let Some(p) = game.scene.player.as_mut() {
+        p.aim_crosshair_at(target);
     }
 }
 
@@ -658,6 +3334,7 @@ fn fight_for_screenshot(
     game: &mut Game,
     fov: f32,
     aspect: f32,
+    wait: f32,
 ) -> anyhow::Result<()> {
     use combat::{Trigger, Weapon};
     let tick = TICK.as_secs_f32();
@@ -719,7 +3396,7 @@ fn fight_for_screenshot(
         aim_at(game, game.scene.people.npcs[i].chest());
         if let (Some(world), Some(player)) = (&game.scene.world, &game.scene.player) {
             let n = &game.scene.people.npcs[i];
-            let (eye, dir) = (player.eye(), player.camera_forward());
+            let (eye, dir) = (player.eye(), player.aim_forward());
             let to = n.chest() - eye;
             let miss = (to - dir * to.dot(dir)).length();
             let blocked = world.physics.cast_ray(eye, to, to.length()).map(|h| h.0);
@@ -800,20 +3477,80 @@ fn fight_for_screenshot(
     for _ in 0..200 {
         game.step(Intent::default(), tick);
     }
+    // Wrecks should stay put, not slide on.
+    if let Some(world) = &game.scene.world {
+        for v in game.scene.vehicles.iter().filter(|v| v.wrecked) {
+            if let Some(id) = v.id {
+                eprintln!(
+                    "fight: wreck {} at {:.1}, moving {:.2} m/s",
+                    v.spec.label,
+                    world
+                        .physics
+                        .vehicle_transform(id)
+                        .map_or(m2_math::glam::Vec3::ZERO, |t| t
+                            .transform_point3(m2_math::glam::Vec3::ZERO)),
+                    world.physics.vehicle_velocity(id).length()
+                );
+            }
+        }
+    }
     let c = &game.combat;
     let people = &game.scene.people.npcs;
     eprintln!(
-        "fight: {} hits, {} blasts; player hp {:.0}{}; {} of {} people dead, {} soldiers alert",
+        "fight: {} hits, {} blasts; player hp {:.0}{}; {} of {} people dead ({} limp), {} soldiers alert",
         c.hits,
         c.blasts,
         c.hp,
         if c.down > 0.0 { " (down)" } else { "" },
         people.iter().filter(|n| !n.alive).count(),
         people.len(),
+        people.iter().filter(|n| n.ragdoll.is_some()).count(),
         people.iter().filter(|n| n.alert).count(),
     );
-    // The picture: aiming, with soldiers firing back.
-    if let Some(i) = soldier {
+    // Smoke clears and bodies settle.
+    for i in 0..(wait / tick) as usize {
+        game.step(Intent::default(), tick);
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    // A body to look at: stand a few metres from it.
+    let body = soldier.and_then(|i| {
+        let doll = game.scene.people.npcs.get(i)?.ragdoll?;
+        let nodes = game.scene.world.as_ref()?.physics.ragdoll_nodes(doll)?;
+        let points: Vec<_> = nodes
+            .iter()
+            .map(|m| m.transform_point3(m2_math::glam::Vec3::ZERO))
+            .collect();
+        let (lo, hi) = points.iter().fold(
+            (
+                m2_math::glam::Vec3::splat(f32::MAX),
+                m2_math::glam::Vec3::splat(f32::MIN),
+            ),
+            |(lo, hi), p| (lo.min(*p), hi.max(*p)),
+        );
+        eprintln!(
+            "fight: body at {:.1}, {} nodes spanning {:.2}",
+            (lo + hi) / 2.0,
+            points.len(),
+            hi - lo
+        );
+        Some((lo + hi) / 2.0)
+    });
+    // The picture: the body from close above, else aiming, with
+    // soldiers firing back.
+    if let (Some(at), Some(i)) = (body, soldier) {
+        let n = &game.scene.people.npcs[i];
+        eprintln!(
+            "fight: body drawn: landed {}, {:.1} m from her",
+            n.landed,
+            n.character.position.distance(game.focus())
+        );
+        game.on_foot = false;
+        game.camera = FlyCamera::looking_at(at + m2_math::glam::Vec3::new(1.5, 2.5, 1.5), at);
+        render(backend, game, fov, aspect, None)?;
+        return Ok(());
+    } else if let Some(i) = soldier {
         let chest = game.scene.people.npcs[i].chest();
         aim_at(game, chest + m2_math::glam::Vec3::Y * 0.5);
     }
@@ -829,7 +3566,520 @@ fn fight_for_screenshot(
             tick,
         );
     }
+    // How far the aim clip alone points off the crosshair, and what is
+    // left once the pose is turned to it.
+    if let Some((_, rig)) = game.scene.player.as_ref().and_then(|p| p.model.as_ref())
+        && let Some(want) = rig.aim
+    {
+        let pose = rig.animator.pose(&rig.skeleton, &rig.clips);
+        let off = rig.aim_error(&pose, want);
+        let left = rig.aimed_pose().and_then(|p| rig.aim_error(&p, want));
+        let deg = |e: Option<(f32, f32)>| {
+            e.map(|(y, p)| format!("yaw {:.0} pitch {:.0}", y.to_degrees(), p.to_degrees()))
+        };
+        eprintln!(
+            "aim: clip off by {:?}, turned off by {:?}",
+            deg(off),
+            deg(left)
+        );
+    }
     render(backend, game, fov, aspect, None)?;
+    Ok(())
+}
+
+/// Calls a Satellite Guided Bomb on the spot [`SATELLITE_AHEAD`] metres
+/// ahead of her as a player would (the support key, the use key, the view
+/// steered over it and confirmed, the wheel pressed in each wedge), for
+/// the picture: the support menu just opened, looking through the
+/// satellite, with the timing wheel's check after the first press, or
+/// `wait` seconds (at least 0.8) after the bomb lands, from her camera.
+fn satellite_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    stage: SatelliteShot,
+    wait: f32,
+) -> anyhow::Result<()> {
+    use combat::Trigger;
+    use m2_math::glam::{Vec2, Vec3};
+    let tick = TICK.as_secs_f32();
+    let Some(p) = game.scene.player.as_ref() else {
+        return Ok(());
+    };
+    let her = p.character.position;
+    let spot = her + Vec3::new(p.yaw.sin(), 0.0, p.yaw.cos()) * SATELLITE_AHEAD;
+    let goal = Vec2::new(spot.x, spot.z);
+    game.support.grant(support::Kind::SatelliteBomb, 1, Some(1));
+    let press = |game: &mut Game, intent: Intent| {
+        game.step(intent, tick);
+        game.step(Intent::default(), tick);
+    };
+    let keys = |trigger: Trigger| Intent {
+        trigger,
+        ..Intent::default()
+    };
+    press(
+        game,
+        keys(Trigger {
+            support: true,
+            ..Trigger::default()
+        }),
+    );
+    if stage == SatelliteShot::Menu {
+        return Ok(());
+    }
+    press(
+        game,
+        Intent {
+            use_pressed: true,
+            ..Intent::default()
+        },
+    );
+    // The designator comes up, and the view opens.
+    for _ in 0..60 {
+        if !game.support.holding() {
+            break;
+        }
+        game.step(Intent::default(), tick);
+    }
+    for i in 0..1200 {
+        let Some(at) = game.support.looking() else {
+            break;
+        };
+        let to = goal - at;
+        if to.length() < 0.3 {
+            break;
+        }
+        // Screen right is the world's -x, looking down.
+        let movement = Vec2::new(-to.x, to.y).clamp_length_max(1.0);
+        game.step(
+            Intent {
+                movement,
+                ..Intent::default()
+            },
+            tick,
+        );
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    eprintln!(
+        "satellite: {:?}, her at {her:.1}, the spot {goal:.1}",
+        game.support.phase
+    );
+    if stage == SatelliteShot::View {
+        return Ok(());
+    }
+    press(
+        game,
+        keys(Trigger {
+            fire: true,
+            ..Trigger::default()
+        }),
+    );
+    // A press as the marker passes through each wedge; the wheel's
+    // picture is of the marker in the first, before the press (as the
+    // footage shows the wheel turning).
+    for wedge in 0..2 {
+        for _ in 0..600 {
+            if game.support.wheel_ready() {
+                break;
+            }
+            game.step(Intent::default(), tick);
+        }
+        if stage == SatelliteShot::Wheel {
+            return Ok(());
+        }
+        press(
+            game,
+            Intent {
+                use_pressed: true,
+                ..Intent::default()
+            },
+        );
+        eprintln!("satellite: wedge {wedge}: {:?}", game.support.phase);
+    }
+    let (hp, alive) = (
+        game.combat.hp,
+        game.scene.people.npcs.iter().filter(|n| n.alive).count(),
+    );
+    let mut landed = false;
+    for i in 0..1200 {
+        game.step(Intent::default(), tick);
+        landed |= game
+            .support
+            .landed
+            .iter()
+            .any(|l| matches!(l, support::Impact::Bomb(_)));
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        if landed {
+            break;
+        }
+    }
+    for i in 0..(wait.max(0.8) / tick) as usize {
+        game.step(Intent::default(), tick);
+        if i % 10 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    eprintln!(
+        "satellite: the bomb {}; her health {hp:.0} -> {:.0}, people standing {alive} -> {}, \
+         flash {:.2}, shaking {:.2} s",
+        if landed { "landed" } else { "never landed" },
+        game.combat.hp,
+        game.scene.people.npcs.iter().filter(|n| n.alive).count(),
+        game.support.flash,
+        game.support.shake.1
+    );
+    Ok(())
+}
+
+/// Blows up the fuel tank or barrel nearest where she starts for the
+/// screenshot: stands 25 m off, fires a rocket at it, and takes the
+/// picture looking at where it stood.
+fn blast_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    wait: f32,
+) -> anyhow::Result<()> {
+    use combat::{Trigger, Weapon};
+    let tick = TICK.as_secs_f32();
+    let here = game.focus();
+    let Some(at) = game
+        .scene
+        .explosives
+        .iter()
+        .map(|e| e.at)
+        .min_by(|a, b| a.distance(here).total_cmp(&b.distance(here)))
+    else {
+        eprintln!("blast: no explosives");
+        return Ok(());
+    };
+    let near = |game: &Game, r: f32| {
+        game.scene
+            .explosives
+            .iter()
+            .filter(|e| e.at.distance(at) < r)
+            .count()
+    };
+    eprintln!(
+        "blast: explosive at {at:.1} ({:.0} m off); {} within 10 m, {} within 30 m",
+        at.distance(here),
+        near(game, 10.0),
+        near(game, 30.0)
+    );
+    // Somewhere 20 m off with a clear line to it, trying round from
+    // where she starts.
+    let toward = (here - at).with_y(0.0);
+    let start = toward.z.atan2(toward.x);
+    let stand = (0..16)
+        .map(|k| {
+            let a = start + k as f32 * std::f32::consts::TAU / 16.0;
+            at + m2_math::glam::Vec3::new(a.cos(), 0.0, a.sin()) * 20.0
+        })
+        .find(|&p| {
+            let Some(world) = &game.scene.world else {
+                return false;
+            };
+            let eye = p + m2_math::glam::Vec3::Y * 1.5;
+            let to = at - eye;
+            world
+                .physics
+                .cast_ray(eye, to, to.length())
+                .is_none_or(|h| h.0 > to.length() - 6.0)
+        });
+    eprintln!("blast: standing at {stand:.1?}");
+    if let Some(p) = game.scene.player.as_mut() {
+        let toward = toward.try_normalize().unwrap_or(m2_math::glam::Vec3::X);
+        p.character.position = stand.unwrap_or(at + toward * 20.0) + m2_math::glam::Vec3::Y * 2.0;
+        p.character.velocity = m2_math::glam::Vec3::ZERO;
+        p.landed = false;
+    }
+    for _ in 0..90 {
+        game.step(Intent::default(), tick);
+    }
+    aim_at(game, at);
+    if let (Some(world), Some(player)) = (&game.scene.world, &game.scene.player) {
+        let (eye, dir) = (player.eye(), player.aim_forward());
+        eprintln!(
+            "blast: eye {eye:.1}, {:.1} m to it, aim ray hits at {:?}",
+            eye.distance(at),
+            world.physics.cast_ray(eye, dir, 100.0).map(|h| h.0)
+        );
+    }
+    // Shoulder the launcher first, as a player would.
+    let aim = |fire, select| Intent {
+        trigger: Trigger {
+            fire,
+            aim: true,
+            select,
+            ..Trigger::default()
+        },
+        ..Intent::default()
+    };
+    game.step(aim(false, Some(Weapon::Rpg)), tick);
+    for _ in 0..30 {
+        aim_at(game, at);
+        game.step(aim(false, None), tick);
+    }
+    game.step(aim(true, None), tick);
+    eprintln!(
+        "blast: rocket from {:.1?} towards {:.1?}",
+        game.combat.last_launch.map(|l| l.0),
+        game.combat.last_launch.map(|l| l.1)
+    );
+    for _ in 0..120 {
+        game.step(Intent::default(), tick);
+    }
+    let spent = game.scene.explosives.iter().filter(|e| e.gone).count();
+    eprintln!(
+        "blast: {} blasts, the last at {:.1?}; {spent} of {} explosives spent; player hp {:.0}",
+        game.combat.blasts,
+        game.combat.last_blast,
+        game.scene.explosives.len(),
+        game.combat.hp
+    );
+    for i in 0..(wait / tick) as usize {
+        game.step(Intent::default(), tick);
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    aim_at(game, at);
+    game.step(Intent::default(), tick);
+    render(backend, game, fov, aspect, None)?;
+    Ok(())
+}
+
+/// Rockets the nearest of the island's buildings (an object whose
+/// template has health and a collapse, its model a wreck) until it comes
+/// down, at most `rockets`, printing the damage it takes; pictures before,
+/// and 1 s and 6 s after it comes down, beside `out`.
+fn demolish_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    fov: f32,
+    aspect: f32,
+    rockets: u32,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    use combat::{Trigger, Weapon};
+    use m2_math::glam::Vec3;
+    let tick = TICK.as_secs_f32();
+    let stem = out
+        .file_stem()
+        .map_or("shot".into(), |s| s.to_string_lossy());
+    let picture = |name: &str| out.with_file_name(format!("{stem}-{name}.ppm"));
+    // The island round her in first.
+    for i in 0..600 {
+        game.step(Intent::default(), tick);
+        if i % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        if i > 120
+            && game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|w| w.stats().pending == 0)
+        {
+            break;
+        }
+    }
+    let here = game.focus();
+    let Some(world) = &game.scene.world else {
+        return Ok(());
+    };
+    let db = &world.index.template_db;
+    let mut blasts: Vec<String> = db
+        .explosions
+        .iter()
+        .filter_map(|(id, e)| {
+            let n = db.names.get(id)?;
+            Some(format!(
+                "{n:?} {:.0} m {:.0}..{:.0}",
+                e.radius, e.damage, e.least
+            ))
+        })
+        .collect();
+    blasts.sort();
+    eprintln!("demolish: blasts: {}", blasts.join("; "));
+    let target = world
+        .near(here, 150.0)
+        .into_iter()
+        .filter(|&(i, _)| {
+            let o = &world.index.objects[i];
+            world.loose_mass(i).is_none()
+                && world.object_model(i).is_some_and(|m| m.has_wreck())
+                && db
+                    .durability
+                    .get(&o.template)
+                    .is_some_and(|d| !d.invincible && d.health > 0.0 && d.collapse.is_some())
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    let Some((i, _)) = target else {
+        eprintln!("demolish: no building within 150 m of {here:.1}");
+        return Ok(());
+    };
+    let o = world.index.objects[i];
+    let (lo, hi) = world
+        .object_model(i)
+        .map_or((Vec3::ZERO, Vec3::ZERO), |m| m.bounds);
+    let at = o.position + o.rotation * ((lo + hi) * 0.5);
+    eprintln!(
+        "demolish: object {i} model {:08x} template {:08x} {:?} at {:.1}, {:.1?} m, {:?}",
+        o.model,
+        o.template,
+        db.names.get(&o.template),
+        o.position,
+        hi - lo,
+        db.durability.get(&o.template)
+    );
+    // Stand 35 m off with a clear line to it, trying round from where she
+    // starts.
+    let toward = (here - at).with_y(0.0);
+    let start = toward.z.atan2(toward.x);
+    let far = 35.0 + (hi - lo).with_y(0.0).length() * 0.5;
+    let stand = (0..16)
+        .map(|k| {
+            let a = start + k as f32 * std::f32::consts::TAU / 16.0;
+            at.with_y(o.position.y) + Vec3::new(a.cos(), 0.0, a.sin()) * far
+        })
+        .find(|&p| {
+            let eye = p + Vec3::Y * 1.5;
+            let to = at - eye;
+            world
+                .physics
+                .cast_ray(eye, to, to.length())
+                .is_none_or(|h| h.0 > to.length() - (hi - lo).length() * 0.5)
+        });
+    // On the ground there, which needn't be as high as the building's foot.
+    let stand = stand.unwrap_or(at.with_y(o.position.y) + toward.normalize_or(Vec3::X) * far);
+    let stand = world
+        .physics
+        .island_below(stand.with_y(stand.y + 200.0), 400.0)
+        .map_or(stand, |g| stand.with_y(g));
+    eprintln!("demolish: standing at {stand:.1}");
+    if let Some(p) = game.scene.player.as_mut() {
+        p.character.position = stand + Vec3::Y * 2.0;
+        p.character.velocity = Vec3::ZERO;
+        p.landed = false;
+    }
+    for k in 0..120 {
+        game.step(Intent::default(), tick);
+        if k % 30 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    let aim = |fire, select| Intent {
+        trigger: Trigger {
+            fire,
+            aim: true,
+            select,
+            ..Trigger::default()
+        },
+        ..Intent::default()
+    };
+    aim_at(game, at);
+    game.step(aim(false, Some(Weapon::Rpg)), tick);
+    render(backend, game, fov, aspect, None)?;
+    write_ppm(backend, &picture("before"))?;
+    eprintln!(
+        "demolish: player at {:.1?}, landed {:?}, on foot {}, weapon {:?}",
+        game.scene.player.as_ref().map(|p| p.character.position),
+        game.scene.player.as_ref().map(|p| p.landed),
+        game.on_foot,
+        game.combat.weapon
+    );
+    let mut fired = 0;
+    while fired < rockets && !game.destruction.destroyed.contains(&i) {
+        for _ in 0..30 {
+            aim_at(game, at);
+            game.step(aim(false, None), tick);
+        }
+        game.step(aim(true, None), tick);
+        fired += 1;
+        for _ in 0..120 {
+            aim_at(game, at);
+            game.step(aim(false, None), tick);
+        }
+        eprintln!(
+            "demolish: rocket {fired} from {:.1?}, {} blasts, the last at {:.1?}; damage {:.0}",
+            game.combat.last_launch.map(|l| l.0),
+            game.combat.blasts,
+            game.combat.last_blast,
+            game.destruction.damage(i)
+        );
+    }
+    // No rocket left her (she hasn't landed where she stands): blasts at
+    // its middle as a rocket's would be, to see it come down all the same.
+    if game.combat.last_launch.is_none()
+        && let (Some(world), Some(install)) =
+            (game.scene.world.as_mut(), game.scene.install.as_ref())
+    {
+        let e = world
+            .index
+            .template_db
+            .id("Explosion (Handheld RPG)")
+            .and_then(|id| world.index.template_db.explosions.get(&id).copied());
+        for k in 0..rockets {
+            if game.destruction.destroyed.contains(&i) {
+                break;
+            }
+            let blast = destruct::Blast {
+                at,
+                radius: e.map_or(5.0, |e| e.radius),
+                damage: e.map_or(200.0, |e| e.damage),
+                least: e.map_or(0.0, |e| e.least),
+            };
+            game.destruction
+                .blast(world, &mut game.scene.props, install, blast);
+            eprintln!(
+                "demolish: no rocket left her; direct blast {} at {at:.1}: damage {:.0}",
+                k + 1,
+                game.destruction.damage(i)
+            );
+        }
+    }
+    if !game.destruction.destroyed.contains(&i) {
+        eprintln!("demolish: still standing after {fired} rockets");
+        return Ok(());
+    }
+    for (name, wait) in [("1s", 1.0), ("2s", 1.0), ("6s", 4.0)] {
+        for k in 0..(wait / tick) as usize {
+            aim_at(game, at);
+            game.step(Intent::default(), tick);
+            if k % 30 == 0 {
+                render(backend, game, fov, aspect, None)?;
+            }
+        }
+        render(backend, game, fov, aspect, None)?;
+        write_ppm(backend, &picture(name))?;
+        eprintln!(
+            "demolish: {name}: taken {}, {}; player at {:.1?}",
+            game.scene.world.as_ref().is_some_and(|w| w.is_taken(i)),
+            game.scene.props.counts(),
+            game.scene.player.as_ref().map(|p| p.character.position)
+        );
+        if let Some(world) = &game.scene.world
+            && let Some(report) = game
+                .scene
+                .props
+                .pieces_report(&world.physics, destruct::key(i))
+        {
+            eprintln!("demolish: {name}: pieces {report}");
+        }
+        if let Some(world) = &game.scene.world
+            && let Some(s) = game.scene.props.describe(&world.physics, destruct::key(i))
+        {
+            eprintln!("demolish: {name}: {s}");
+        }
+    }
     Ok(())
 }
 
@@ -838,6 +4088,8 @@ struct Running {
     backend: WgpuBackend,
     game: Game,
     audio: sound::GameAudio,
+    /// Whether she was driving last tick (getting in is worth a word).
+    was_driving: bool,
     input: Input,
     mouse_look: bool,
     /// Keyboard input is ignored while another window has focus.
@@ -850,6 +4102,12 @@ struct Running {
     hud: ui::Hud,
     egui: egui_winit::State,
     mission: Option<mission::MissionLink>,
+    hijacks: Option<hijack::Hijacks>,
+    /// The launch's movies and front end (`--alpha`).
+    flow: Option<flow::Flow>,
+    /// The GUI's named buttons pressed since the last frame (Enter is
+    /// `"selection"`), for the game HUD's scripts.
+    buttons: Vec<String>,
 }
 
 struct App {
@@ -864,6 +4122,17 @@ struct App {
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
     mission_drivers: Vec<(String, String)>,
+    /// Our stand-in HUD instead of the game's own.
+    old_hud: bool,
+    hijack_crew: Option<String>,
+    /// Support items to call in (`--support`).
+    support: Vec<String>,
+    /// The whole game's launch (`--alpha`): boot movies (unless
+    /// `no_boot`), front end, the scripts' movies.
+    alpha: bool,
+    no_boot: bool,
+    /// Weapons to start with (`--gun`).
+    guns: Vec<String>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -889,12 +4158,17 @@ impl App {
             &self.mode,
             self.double_sided,
             self.config.world.sea_level,
+            self.mission,
+            self.config.hero,
         )?;
+        game.scene.people.smarter = self.config.enhanced.smarter_ai;
+        give_guns(&mut game, &self.guns);
         if self.fly {
             game.on_foot = false;
         }
         let focused = window.has_focus();
-        let hud = ui::Hud::new();
+        let mut hud = ui::Hud::new();
+        hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud);
         let egui = egui_winit::State::new(
             hud.ctx.clone(),
             egui::ViewportId::ROOT,
@@ -911,7 +4185,12 @@ impl App {
             window,
             backend,
             game,
-            audio: sound::GameAudio::start(self.install.as_ref()),
+            audio: {
+                let mut audio = sound::GameAudio::start(self.install.as_ref());
+                audio.hero = self.config.hero;
+                audio
+            },
+            was_driving: false,
             input: Input::default(),
             mouse_look: false,
             focused,
@@ -923,10 +4202,28 @@ impl App {
             hud,
             mission: match (&self.install, &self.mode) {
                 (Some(install), Mode::Island(_)) if self.mission => Some(
-                    mission::MissionLink::start(install, self.mission_drivers.clone()),
+                    mission::MissionLink::start(install, self.mission_drivers.clone())
+                        .with_keys(self.config.keys.clone())
+                        .with_support(self.support.clone())
+                        .with_movies(self.alpha),
                 ),
                 _ => None,
             },
+            hijacks: match (&self.install, &self.mode) {
+                (Some(install), Mode::Island(_)) => {
+                    Some(hijack::Hijacks::start(install, self.hijack_crew.clone()))
+                }
+                _ => None,
+            },
+            flow: match &self.install {
+                Some(install) if self.alpha => Some(flow::Flow::new(
+                    install.clone(),
+                    !self.no_boot,
+                    self.config.hero,
+                )),
+                _ => None,
+            },
+            buttons: Vec::new(),
         })
     }
 
@@ -964,15 +4261,53 @@ impl Running {
         }
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
+        if let Some(flow) = self.flow.as_mut().filter(|f| f.covers()) {
+            let output = self.hud.build_screen(input, |ui| flow.paint(ui));
+            self.egui.handle_platform_output(&self.window, output);
+            let (w, h) = self.backend.size();
+            return render(
+                &mut self.backend,
+                &mut self.game,
+                config.camera.fov,
+                w as f32 / h as f32,
+                Some(&mut self.hud),
+            );
+        }
         let (w, h) = self.backend.size();
-        let info = hud_info(
+        let mut info = hud_info(
             &self.game,
             self.mission.as_ref(),
             config.camera.fov,
             w as f32 / h as f32,
         );
+        if let Some(v) = self.hijacks.as_ref().and_then(hijack::Hijacks::view) {
+            // The game's own prompt (`Hijack %s`); the buttons it asks
+            // for are the HUD's to draw.
+            info.prompt = (!v.running).then(|| format!("Hijack {}", v.vehicle));
+            info.can_enter = None;
+        }
+        // The hijack scripts' calls to the HUD, taken whether it runs or
+        // not.
+        let gui_calls = self
+            .hijacks
+            .as_ref()
+            .map(hijack::Hijacks::take_gui_calls)
+            .unwrap_or_default();
+        if self.hud.game.is_some() {
+            let mut state = gamehud::HudState::of(&mut self.game);
+            state.buttons = std::mem::take(&mut self.buttons);
+            state.gui_calls = gui_calls;
+            info.game = Some(state);
+        }
         let (action, output) = self.hud.build(input, &info, config);
         self.egui.handle_platform_output(&self.window, output);
+        // The mission's callbacks the game's HUD called (the contract
+        // fanfare closing), back to the mission's scripts.
+        if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
+            for seq in g.take_callbacks() {
+                m.hud_callback(seq);
+            }
+        }
         if config.window.vsync != vsync {
             self.backend.set_vsync(config.window.vsync);
         }
@@ -989,6 +4324,13 @@ impl Running {
             Some(ui::MenuAction::LoadGame) => {
                 self.load_game();
                 self.close_menu();
+            }
+            Some(ui::MenuAction::Hero(hero)) => {
+                // The body, clips, health and voice change now; the
+                // scripts take the new name on the next start.
+                eprintln!("hero: playing as {hero}");
+                self.game.set_hero(&mut self.backend, hero);
+                self.audio.hero = hero;
             }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
             None => {}
@@ -1049,6 +4391,26 @@ impl Running {
     }
 
     fn tick(&mut self, config: &Config, _event_loop: &ActiveEventLoop) {
+        if let Some(flow) = &mut self.flow {
+            if let Ok(mut mixer) = self.audio.out.mixer.lock() {
+                flow.tick(self.mission.as_mut(), &mut mixer);
+            }
+            // The hero picked in the front end, before the scripts start.
+            if let Some(hero) = flow.take_pick()
+                && hero != self.game.scene.hero
+            {
+                eprintln!("hero: playing as {hero}");
+                self.game.set_hero(&mut self.backend, hero);
+                self.audio.hero = hero;
+            }
+            if flow.holds() {
+                // The world waits under the movie or the front end.
+                self.input.clear();
+                let (ear, facing) = self.game.listener();
+                self.audio.update(ear, facing);
+                return;
+            }
+        }
         if self.input.take_pressed(Action::Quit) {
             if self.hud.menu {
                 self.close_menu();
@@ -1097,19 +4459,74 @@ impl Running {
                 if self.culling { "on" } else { "off" }
             );
         }
+        if let Some(h) = &mut self.hijacks {
+            h.tick(&mut self.game, &mut self.input, TICK.as_secs_f32());
+        }
         self.game.tick(
             &mut self.input,
             &config.camera,
             self.mouse_look,
             TICK.as_secs_f32(),
         );
+        if let Some(h) = &mut self.hijacks {
+            h.place(&mut self.game);
+            h.seat(&mut self.game, TICK.as_secs_f32());
+        }
         if let Some(m) = &mut self.mission {
             m.tick(&mut self.game, TICK.as_secs_f32());
+            let (lines, hushed) = m.take_lines();
+            for (id, cue, at) in lines {
+                if let Some(seconds) = self.audio.say(id, &cue, at) {
+                    m.line_length(id, seconds);
+                }
+            }
+            for id in hushed {
+                self.audio.hush(id);
+            }
+            for change in m.take_fades() {
+                self.audio.change_category(change);
+            }
+            for (cue, stop) in m.take_sounds() {
+                if stop {
+                    self.audio.stop_ui_sound(&cue);
+                } else {
+                    self.audio.ui_sound(&cue);
+                }
+            }
+            if let Some(cue) = m.take_music() {
+                self.audio.music_cue(cue.as_deref());
+            }
         }
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
+        if self.audio.ambient_due(TICK.as_secs_f32()) {
+            let town = self.game.near_town();
+            self.audio.play_ambient(town, ear);
+        }
+        for (i, shout, at) in self.game.scene.people.take_shouts() {
+            let sets = match shout {
+                npc::Shout::Alert => sound::VZ_SOLDIERS,
+                npc::Shout::Flee if self.game.scene.people.is_woman(i) => sound::CIVILIAN_WOMEN,
+                npc::Shout::Flee => sound::CIVILIANS,
+            };
+            self.audio.shout(sets[i % sets.len()], Some(at));
+        }
         let sounds = self.game.combat.take_sounds();
         self.audio.play_fight(&sounds);
+        let cues = self.game.scene.take_cues(ear, CUE_REACH);
+        self.audio.play_cues(&cues);
+        let engine = self.game.engine();
+        self.audio.engine(engine, TICK.as_secs_f32());
+        self.audio.rotors(&self.game.scene.flights.sounding());
+        let driving = self.game.driving().is_some();
+        let mut remarks = self.game.combat.take_remarks();
+        if driving && !self.was_driving {
+            remarks.push(combat::Remark::Vehicle);
+        }
+        self.was_driving = driving;
+        for remark in remarks {
+            self.audio.remark(remark);
+        }
     }
 }
 
@@ -1136,8 +4553,10 @@ impl ApplicationHandler for App {
         if to_menu {
             return;
         }
-        if !state.hud.menu && !matches!(event, WindowEvent::KeyboardInput { .. }) {
-            // Keep egui's idea of the window (size, scale) current.
+        if !state.hud.menu {
+            // Keep egui's idea of the window (size, scale) current, and
+            // hand it the keys: the HUD's movies that hold the controls
+            // (the PDA, a fanfare's Enter) take them from its events.
             let _ = state.egui.on_window_event(&state.window, &event);
         }
         match event {
@@ -1152,7 +4571,24 @@ impl ApplicationHandler for App {
                     state.set_mouse_look(false);
                 }
             }
+            WindowEvent::KeyboardInput { event, .. }
+                if state.focused && state.flow.as_ref().is_some_and(flow::Flow::holds) =>
+            {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && let Some(flow) = &mut state.flow
+                {
+                    flow.key(code);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if state.focused => {
+                if let PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) = event.physical_key
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                {
+                    state.buttons.push("selection".into());
+                }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     state.input.key(
                         &self.config.keys,
@@ -1167,7 +4603,7 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Right | winit::event::MouseButton::Left,
                 ..
             } if !state.mouse_look && !state.hud.menu => state.set_mouse_look(true),
-            // With the mouse captured, the buttons fire and aim.
+            // With the mouse captured, the buttons fire, aim and bash.
             WindowEvent::MouseInput {
                 state: pressed,
                 button,
@@ -1176,6 +4612,7 @@ impl ApplicationHandler for App {
                 let action = match button {
                     winit::event::MouseButton::Left => Some(Action::Fire),
                     winit::event::MouseButton::Right => Some(Action::Aim),
+                    winit::event::MouseButton::Middle => Some(Action::Melee),
                     _ => None,
                 };
                 if let Some(a) = action {

@@ -1958,15 +1958,14 @@ function toggleMusic() {
 // Voices: `--streams` also lists the game's 27 resident voice sets (cue
 // tables in English.wad), each with its positional lines: shouts heard from
 // where the speaker stands, fading from the distance the table gives (most
-// 10 m) and silent beyond its cut-off (125 m). Which set is which character
-// is named only by hash, so the panel plays samples and picks the set
-// soldiers and civilians use, kept in this browser. The defaults were picked
-// blind, then checked by ear (the soldier set sounds like soldiers, most of
-// the civilian set like civilians), not from the game's data; music and
-// ambience dip while a voice plays. When a soldier turns alert or is hit, and now and then in a
+// 10 m) and silent beyond its cut-off (125 m). Sets are keyed by the name
+// hash of their names: the defaults are vo_vzSoldier_01 and vo_vzCiv_01,
+// and the panel plays samples and picks another set for soldiers or
+// civilians, kept in this browser; music and ambience dip while a voice
+// plays. When a soldier turns alert or is hit, and now and then in a
 // fight, he shouts a random line of 0.5-3 s from his set; a civilian shouts
 // when running away. The triggers and timing are invented, not the game's.
-const voices = { sets: null, picked: { soldier: '6cffc547', civilian: 'cf4f8b9c' }, speaking: 0 };
+const voices = { sets: null, picked: { soldier: '50787bff', civilian: '6b0c3b0b' }, speaking: 0 };
 
 function loadVoices() {
   const sets = music.list && music.list.voices && music.list.voices.filter(s => s.lines.length);

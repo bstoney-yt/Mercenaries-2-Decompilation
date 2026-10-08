@@ -19,10 +19,13 @@ committed or shipped.
   shop, and the GUI.
 - **Modules.** Scripts load each other with `import` (257 scripts) and
   `inherit` (171). The import names are module names (`MrxUtil`,
-  `MrxLayerManager`, and so on), while assets are keyed by the unsolved name
-  hash. Imports are therefore resolved by matching each module's members
-  used elsewhere (`MrxUtil.GetRandomTableElement`) against the globals each
-  script defines.
+  `MrxLayerManager`, and so on), and scripts are keyed by
+  `m2_assets::name_hash` of that name (FNV-1a of the name with bit 5 set in
+  each byte and a `*` appended; `MrxTask` is `d302a66f`). Before the hash was known,
+  imports were resolved by matching each module's members used elsewhere
+  (`MrxUtil.GetRandomTableElement`) against the globals each script
+  defines; that match remains the fallback for a name no script's hash
+  matches.
 - **Per-mission world state.** This lives in the `vz_state_*` entity
   layers, which the scripts add and remove through `MrxLayerManager.Add`
   and `MrxLayerManager.Remove`. Our layer parser already reads them.
@@ -55,8 +58,11 @@ The scripts tell the HUD about objectives through these calls; the alpha
 draws its own HUD from them. Text is never literal: every visible string is
 a bracketed id such as `[VzaCon001.Objectives.001]`, joined with others and
 inline icon tags (`[objt][objdeliver]`), with progress appended as
-` (0/4)`. Where the string table is stored is not known yet (no plain or
-UTF-16 copy of the ids in English.wad).
+` (0/4)`. The ids are keys of the string tables (type `39e5e978`, the
+English one named `english` in `vz.wad` and `shell.wad`, 18,299 strings)
+through `m2_assets::name_hash`: `objective.Objectivecompleted` is
+`923171d8`, "Objective completed:". `m2_game::hud::render` puts the
+strings in; `m2-alpha --mission` shows them.
 
 | Call | Arguments | Removed by |
 |---|---|---|

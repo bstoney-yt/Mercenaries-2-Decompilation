@@ -32,7 +32,8 @@ pub mod queue;
 pub mod texture;
 
 pub use backend::{
-    BackendError, DrawCall, Geometry, Lighting, LiveBuffers, RenderBackend, Topology, View,
+    Adaptation, BackendError, Clouds, DrawCall, Geometry, Haze, Lighting, LiveBuffers,
+    RenderBackend, ToneMap, Topology, View, WATER_RAMP_DEPTH,
 };
 pub use buffer::{
     BufferUsage, IndexBufferDesc, IndexBufferHandle, IndexFormat, SkinHandle, TextureHandle,
@@ -42,4 +43,7 @@ pub use buffer::{
 pub use key::{Layer, MaterialId, SortKey};
 pub use null::{Command, NullBackend, RecordingBackend};
 pub use queue::{DrawQueue, Primitive, QueueError, SubmitStats};
-pub use texture::{BlendMode, DetailMap, MaterialDesc, TextureDesc, TextureFormat, generate_mips};
+pub use texture::{
+    BlendMode, DetailMap, Emissive, MaterialDesc, NormalMap, Reflection, Specular, TerrainLayer,
+    TextureDesc, TextureFormat, generate_mips,
+};

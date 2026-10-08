@@ -25,18 +25,39 @@ pub enum Action {
     ToggleMusic,
     /// Get in or out of a vehicle.
     Use,
-    /// Turn an overturned vehicle back up.
+    /// Turn an overturned vehicle back up (driving).
     Reset,
+    /// Change the rifle's clip (on foot; the same key as
+    /// [`Reset`](Self::Reset) by default).
+    Reload,
     /// Fire the weapon in hand (also the left mouse button).
     Fire,
     /// Raise the weapon (also the right mouse button, once the mouse is
     /// captured).
     Aim,
-    /// Throw a grenade.
+    /// Throw a grenade (or the explosive chosen with
+    /// [`Explosive`](Self::Explosive)).
     Throw,
-    /// Take up the rifle, or the rocket launcher.
+    /// Choose the next explosive to throw: grenades, C4, proximity mines.
+    Explosive,
+    /// Set off the C4 she has placed.
+    Detonate,
+    /// Move to the next seat of the vehicle she rides (the driver's, the
+    /// gunner's).
+    Seat,
+    /// A melee bash with what she holds (also the middle mouse button,
+    /// once the mouse is captured): opens a supply crate.
+    Melee,
+    /// Take up the rifle, or what she carries in the launcher's place
+    /// (the RPG, or the grenade launcher once she has taken one up).
     Rifle,
     Launcher,
+    /// Open or close the support menu (her support items: the first
+    /// contract's Satellite Guided Bomb).
+    Support,
+    /// Open or close the PDA (the first contract has her look at it before
+    /// it gives her the bomb).
+    Pda,
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
@@ -48,6 +69,13 @@ pub enum Action {
     QuickSave,
     QuickLoad,
     Quit,
+    /// The pad's face buttons Y, A, X and B, which a hijack's prompts ask
+    /// for ([`crate::hijack`]); the left stick's pushes are the movement
+    /// keys.
+    PadY,
+    PadA,
+    PadX,
+    PadB,
 }
 
 /// Which keys trigger each action, as written in the settings file
@@ -73,11 +101,18 @@ impl Default for Bindings {
             (ToggleMusic, vec![KeyM]),
             (Use, vec![KeyE]),
             (Reset, vec![KeyR]),
+            (Reload, vec![KeyR]),
             (Fire, vec![KeyF]),
             (Aim, vec![]),
             (Throw, vec![KeyG]),
+            (Explosive, vec![Digit3]),
+            (Detonate, vec![KeyX]),
+            (Seat, vec![KeyY]),
+            (Melee, vec![KeyB]),
             (Rifle, vec![Digit1]),
             (Launcher, vec![Digit2]),
+            (Support, vec![KeyT]),
+            (Pda, vec![KeyP]),
             (ToggleMouse, vec![Tab]),
             (Fullscreen, vec![F11]),
             (NextGait, vec![KeyN]),
@@ -85,6 +120,12 @@ impl Default for Bindings {
             (QuickSave, vec![F5]),
             (QuickLoad, vec![F9]),
             (Quit, vec![Escape]),
+            // Laid out as the face buttons are (not the PC game's keys,
+            // which aren't known yet).
+            (PadY, vec![KeyI]),
+            (PadA, vec![KeyK]),
+            (PadX, vec![KeyJ]),
+            (PadB, vec![KeyL]),
         ]))
     }
 }
@@ -97,6 +138,82 @@ impl Bindings {
             .filter(move |(_, keys)| keys.contains(&key))
             .map(|(&a, _)| a)
     }
+
+    /// The name of the first key bound to `action` (`P`), if any.
+    pub fn key_name(&self, action: Action) -> Option<String> {
+        self.0.get(&action)?.first().map(|&k| key_name(k))
+    }
+}
+
+/// A key's name as written on it: `P`, `1`, `Shift`, `F11`.
+fn key_name(key: KeyCode) -> String {
+    use KeyCode::*;
+    let name = format!("{key:?}");
+    if let Some(short) = name
+        .strip_prefix("Key")
+        .or_else(|| name.strip_prefix("Digit"))
+    {
+        return short.to_owned();
+    }
+    match key {
+        ShiftLeft | ShiftRight => "Shift",
+        ControlLeft | ControlRight => "Ctrl",
+        AltLeft | AltRight => "Alt",
+        Escape => "Esc",
+        ArrowUp => "Up",
+        ArrowDown => "Down",
+        ArrowLeft => "Left",
+        ArrowRight => "Right",
+        _ => return name,
+    }
+    .to_owned()
+}
+
+/// A line of the game's text with its key tokens (`[pda] Open PDA`) named
+/// as the keys bound here, in brackets (`[P] Open PDA`): `[pda]` the PDA's
+/// key, `[support]` the support menu's, `[pfire]` the PC's fire (the left
+/// mouse button), `[confirm]` the consoles' (here the use key), `[move]`
+/// the keys that move, `[sprint]` sprint's (round 98 met it after the
+/// first gate). Other tokens, and keys left unbound, stay as they are.
+pub fn name_keys(line: &str, keys: &Bindings) -> String {
+    use Action::*;
+    let name = |a| keys.key_name(a);
+    let named = |token: &str| match token {
+        "pda" => name(Pda),
+        "support" => name(Support),
+        "confirm" => name(Use),
+        "sprint" => name(Sprint),
+        "pfire" => Some("Left click".to_owned()),
+        "move" => {
+            let names: Vec<String> = [MoveForward, MoveLeft, MoveBack, MoveRight]
+                .into_iter()
+                .filter_map(name)
+                .collect();
+            let letters = names.iter().all(|n| n.chars().count() == 1);
+            (!names.is_empty()).then(|| names.join(if letters { "" } else { "/" }))
+        }
+        _ => None,
+    };
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        rest = &rest[open..];
+        let Some(close) = rest.find(']') else {
+            break;
+        };
+        match named(&rest[1..close]) {
+            Some(key) => {
+                out.push('[');
+                out.push_str(&key);
+                out.push(']');
+            }
+            None => out.push_str(&rest[..=close]),
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Held actions, actions pressed since the last tick, and mouse motion.
@@ -179,6 +296,23 @@ mod tests {
         assert_eq!(input.axis(Action::MoveBack, Action::MoveForward), 1.0);
         input.key(&b, KeyCode::KeyW, false, false);
         assert!(!input.held(Action::MoveForward));
+    }
+
+    #[test]
+    fn key_tokens_are_named_as_bound() {
+        let b = Bindings::default();
+        assert_eq!(name_keys("[pda] Look", &b), "[P] Look");
+        assert_eq!(
+            name_keys("[support] One\n[pfire] Two [move] [confirm]", &b),
+            "[T] One\n[Left click] Two [WASD] [E]"
+        );
+        assert_eq!(name_keys("[sprint] Sprint", &b), "[Shift] Sprint");
+        assert_eq!(name_keys("[other] stays [", &b), "[other] stays [");
+        let mut b = b;
+        b.0.insert(Action::MoveForward, vec![KeyCode::ArrowUp]);
+        assert_eq!(name_keys("[move]", &b), "[Up/A/S/D]");
+        b.0.insert(Action::Pda, Vec::new());
+        assert_eq!(name_keys("[pda]", &b), "[pda]");
     }
 
     #[test]

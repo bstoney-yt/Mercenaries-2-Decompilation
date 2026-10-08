@@ -34,10 +34,45 @@ pub struct ScriptHost {
     stub_meta: Table,
     /// Modules loaded so far, in order, with the script each resolved to.
     modules: Rc<RefCell<Vec<LoadedModule>>>,
+    /// Modules in the order their chunks finished running: a module after
+    /// everything it imports, the order `Init` runs in.
+    finished: Rc<RefCell<Vec<String>>>,
 }
 
 /// A module name as loaded, and the script hash it resolved to.
 pub type LoadedModule = (String, Option<u32>);
+
+thread_local! {
+    /// Whether stub calls are logged with their arguments.
+    static STUB_ARGS: bool = std::env::var_os("M2_STUB_ARGS").is_some();
+}
+
+/// Whether stub calls are logged with their arguments (`M2_STUB_ARGS`).
+pub fn stub_args() -> bool {
+    STUB_ARGS.with(|on| *on)
+}
+
+/// A stub call's argument as the log shows it: numbers, short strings,
+/// stubs by name, other tables as `{}`.
+pub(crate) fn show_arg(v: &Value) -> String {
+    match v {
+        Value::Nil => "nil".to_owned(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Number(n) => format!("{n:.2}"),
+        Value::String(s) => {
+            let s = s.to_string_lossy();
+            let cut: String = s.chars().take(40).collect();
+            format!("{cut:?}")
+        }
+        Value::Table(t) => t
+            .raw_get::<Option<String>>(STUB_NAME)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "{}".to_owned()),
+        other => other.type_name().to_owned(),
+    }
+}
 
 /// Key in a stub table holding its name.
 const STUB_NAME: &str = "__m2_stub";
@@ -95,16 +130,26 @@ impl ScriptHost {
                 let name: String = callee.raw_get(STUB_NAME)?;
                 // A method call passes a stub as self: `m:SetTimer` rather
                 // than `m.SetTimer`.
-                let receiver = args.next().and_then(|a| match a {
+                let first = args.next();
+                let receiver = first.as_ref().and_then(|a| match a {
                     Value::Table(t) => t.raw_get::<Option<String>>(STUB_NAME).ok().flatten(),
                     _ => None,
                 });
-                let shown = match receiver {
-                    Some(r) if name.strip_prefix(&r).is_some_and(|k| k.starts_with('.')) => {
-                        format!("{r}:{}", &name[r.len() + 1..])
-                    }
+                let method = receiver.as_ref().is_some_and(|r| {
+                    name.strip_prefix(r.as_str())
+                        .is_some_and(|k| k.starts_with('.'))
+                });
+                let mut shown = match &receiver {
+                    Some(r) if method => format!("{r}:{}", &name[r.len() + 1..]),
                     _ => name.clone(),
                 };
+                // With `M2_STUB_ARGS` set, the arguments too (to learn what
+                // the scripts ask of a call before it is written).
+                if STUB_ARGS.with(|on| *on) {
+                    let rest = (!method).then_some(first).flatten().into_iter().chain(args);
+                    let shown_args: Vec<String> = rest.map(|v| show_arg(&v)).collect();
+                    shown = format!("{shown}({})", shown_args.join(", "));
+                }
                 call_log.borrow_mut().push(shown);
                 Ok(MultiValue::from_vec(vec![Value::Table(stub(
                     lua,
@@ -149,6 +194,7 @@ impl ScriptHost {
             log,
             stub_meta,
             modules: Rc::default(),
+            finished: Rc::default(),
         })
     }
 
@@ -186,6 +232,12 @@ impl ScriptHost {
                     if name.starts_with('_') {
                         return Ok(MultiValue::from_vec(vec![Value::Nil]));
                     }
+                    // A name in lower case alone (`bil`, a slip for `nil`
+                    // in the satellite designator) is no engine library:
+                    // nil, as in plain Lua.
+                    if name.bytes().all(|b| b.is_ascii_lowercase()) {
+                        return Ok(MultiValue::from_vec(vec![Value::Nil]));
+                    }
                     let value = match default_for(lua, &name)? {
                         Some(v) => v,
                         None => Value::Table(stub(lua, &name)?),
@@ -209,32 +261,57 @@ impl ScriptHost {
             let Value::Table(t) = self.lua.globals().raw_get::<Value>(library)? else {
                 continue;
             };
-            if t.metatable().is_some() {
-                continue;
+            // Tables of their own inside a library (`Graphics.Atmosphere`)
+            // stub what they lack too.
+            for pair in t.pairs::<Value, Value>() {
+                if let (Value::String(k), Value::Table(inner)) = pair? {
+                    self.stub_members(&inner, &format!("{library}.{}", k.to_string_lossy()))?;
+                }
             }
-            let meta = self.lua.create_table()?;
-            let log = Rc::clone(&self.log);
-            let library = library.to_owned();
-            meta.set(
-                "__index",
-                safe_function(&self.lua, move |lua, args| {
-                    let (Some(Value::Table(t)), Some(Value::String(k))) =
-                        (args.front(), args.get(1))
-                    else {
-                        return Ok(MultiValue::new());
-                    };
-                    let name = format!("{library}.{}", k.to_string_lossy());
-                    let log = Rc::clone(&log);
-                    let f = safe_function(lua, move |_, _| {
-                        log.borrow_mut().push(name.clone());
-                        Ok(MultiValue::new())
-                    })?;
-                    t.raw_set(k.clone(), &f)?;
-                    Ok(MultiValue::from_vec(vec![Value::Function(f)]))
-                })?,
-            )?;
-            t.set_metatable(Some(meta))?;
+            self.stub_members(&t, library)?;
         }
+        Ok(())
+    }
+
+    /// Gives table `t` (library `library`) a logged no-op for every member
+    /// it lacks, unless it has a metatable already.
+    fn stub_members(&self, t: &Table, library: &str) -> Result<(), ScriptError> {
+        if t.metatable().is_some() {
+            return Ok(());
+        }
+        let meta = self.lua.create_table()?;
+        let log = Rc::clone(&self.log);
+        let library = library.to_owned();
+        meta.set(
+            "__index",
+            safe_function(&self.lua, move |lua, args| {
+                let (Some(Value::Table(t)), Some(Value::String(k))) = (args.front(), args.get(1))
+                else {
+                    return Ok(MultiValue::new());
+                };
+                let name = format!("{library}.{}", k.to_string_lossy());
+                // `Player.GetAllTargetMarkerPos()`: a list, which
+                // scripts walk with `ipairs` straight away; empty.
+                let list = k.to_string_lossy().starts_with("GetAll");
+                let log = Rc::clone(&log);
+                let f = safe_function(lua, move |lua, args| {
+                    let mut shown = name.clone();
+                    if STUB_ARGS.with(|on| *on) {
+                        let args: Vec<String> = args.iter().map(show_arg).collect();
+                        shown = format!("{shown}({})", args.join(", "));
+                    }
+                    log.borrow_mut().push(shown);
+                    Ok(if list {
+                        MultiValue::from_vec(vec![Value::Table(lua.create_table()?)])
+                    } else {
+                        MultiValue::new()
+                    })
+                })?;
+                t.raw_set(k.clone(), &f)?;
+                Ok(MultiValue::from_vec(vec![Value::Function(f)]))
+            })?,
+        )?;
+        t.set_metatable(Some(meta))?;
         Ok(())
     }
 
@@ -280,6 +357,7 @@ impl ScriptHost {
     ) -> Result<(), ScriptError> {
         let cache = self.lua.create_table()?;
         let modules = Rc::clone(&self.modules);
+        let finished = Rc::clone(&self.finished);
         let module = safe_function(&self.lua, move |lua, args| {
             let Some(Value::String(name)) = args.front() else {
                 return Err(mlua::Error::runtime("module name must be a string"));
@@ -348,6 +426,7 @@ impl ScriptHost {
                     .set_mode(ChunkMode::Binary)
                     .set_environment(env.clone())
                     .exec()?;
+                finished.borrow_mut().push(name.clone());
             }
             Ok(MultiValue::from_vec(vec![Value::Table(env)]))
         })?;
@@ -452,24 +531,34 @@ impl ScriptHost {
         Ok(run.call::<(usize, Vec<String>)>(())?)
     }
 
-    /// Calls `Init` on every module loaded so far that defines one, in the
-    /// order they loaded, as the game's bootstraps do before play: many
-    /// modules set up their tables there. Returns those that failed.
+    /// Calls `Init` on every module loaded so far that defines one, as the
+    /// game's bootstraps do before play: many modules set up their tables
+    /// there. A module's `Init` runs after those of the modules it
+    /// imports (`MrxPmc.Init` builds widgets with what `MrxGui.Init` set
+    /// up). Returns those that failed.
     pub fn init_modules(&self) -> Result<Vec<String>, ScriptError> {
         let mut failed = Vec::new();
         let globals = self.lua.globals();
-        for (name, hash) in self.modules() {
-            if hash.is_none() {
-                continue;
+        // An Init may import more modules, which append to the list (and
+        // must not find it borrowed): snapshot it, and go round again for
+        // the ones that joined.
+        let mut done = 0;
+        loop {
+            let order = self.finished.borrow().clone();
+            if done >= order.len() {
+                break;
             }
-            let Ok(Value::Table(m)) = globals.raw_get::<Value>(name.as_str()) else {
-                continue;
-            };
-            if let Ok(Value::Function(init)) = m.raw_get::<Value>("Init")
-                && let Err(e) = init.call::<()>(())
-            {
-                failed.push(format!("{name}: {}", tidy(&e.to_string())));
+            for name in &order[done..] {
+                let Ok(Value::Table(m)) = globals.raw_get::<Value>(name.as_str()) else {
+                    continue;
+                };
+                if let Ok(Value::Function(init)) = m.raw_get::<Value>("Init")
+                    && let Err(e) = init.call::<()>(())
+                {
+                    failed.push(format!("{name}: {}", tidy(&e.to_string())));
+                }
             }
+            done = order.len();
         }
         Ok(failed)
     }
@@ -516,6 +605,13 @@ fn default_for(lua: &Lua, name: &str) -> mlua::Result<Option<Value>> {
         ('s', _) => Some(Value::String(lua.create_string("")?)),
         ('b', _) => Some(Value::Boolean(false)),
         ('t', _) => Some(Value::Table(lua.create_table()?)),
+        // A handle (`uPlayer`) no script has set is nil: VzaCon001's PDA
+        // Close watch fires only while the global `uPlayer` is unset.
+        ('u', _) => Some(Value::Nil),
+        // An object a script keeps (`oSystemDialogBoxFlash`): nil until
+        // made, as scripts test it (`if MrxGuiDialogBox.oSystemDialogBoxFlash
+        // then`, read through the module to here).
+        ('o', _) => Some(Value::Nil),
         _ => None,
     })
 }
@@ -556,6 +652,15 @@ where
     wrap.call(raw)
 }
 
+/// The name of a stub (`"HealthCounter.Update"`), `None` for any other
+/// value.
+pub fn stub_name(value: &Value) -> Option<String> {
+    match value {
+        Value::Table(t) => t.raw_get::<Option<String>>(STUB_NAME).ok().flatten(),
+        _ => None,
+    }
+}
+
 fn stub(lua: &Lua, name: &str) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.raw_set(STUB_NAME, name)?;
@@ -588,6 +693,19 @@ mod tests {
             host.take_calls(),
             ["Objective_Add", "Hud.Show", "m:SetTimer"]
         );
+    }
+
+    #[test]
+    fn unset_globals_are_stubs_unless_read_raw() {
+        let host = ScriptHost::new().unwrap();
+        host.stub_missing_globals().unwrap();
+        // Test drivers read their settings raw (`DRIVE_UNTIL`).
+        let (plain, raw): (String, String) = host
+            .lua()
+            .load("return type(DRIVE_SOMEWHERE), type(rawget(_G, 'DRIVE_UNTIL'))")
+            .eval()
+            .unwrap();
+        assert_eq!((plain.as_str(), raw.as_str()), ("table", "nil"));
     }
 
     #[test]
@@ -647,6 +765,44 @@ mod tests {
         assert!(host.init_modules().unwrap().is_empty());
         let ready: bool = host.lua().load("return Util.ready").eval().unwrap();
         assert!(ready);
+    }
+
+    #[test]
+    fn modules_init_after_the_modules_they_import() {
+        let host = ScriptHost::new().unwrap();
+        let library = Rc::new(crate::library::tests::library());
+        host.install_library(library, false).unwrap();
+        // Task imports Util: Task starts loading first, Util finishes
+        // first, and Init follows the finishing order.
+        host.lua()
+            .load(
+                r#"
+                import("Task")
+                order = {}
+                Util.Init = function() order[#order + 1] = "Util" end
+                -- An Init may import more: those run their Init too.
+                Task.Init = function()
+                    order[#order + 1] = "Task"
+                    import("There").Init = function() order[#order + 1] = "There" end
+                end
+                "#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            host.modules(),
+            [("Task".to_owned(), Some(2)), ("Util".to_owned(), Some(1))]
+        );
+        assert!(host.init_modules().unwrap().is_empty());
+        let order: Vec<String> = host
+            .lua()
+            .load("return order")
+            .eval::<Table>()
+            .unwrap()
+            .sequence_values()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(order, ["Util", "Task", "There"]);
     }
 
     #[test]
@@ -714,6 +870,8 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!((h, n, s.as_str(), b), (450.0, 1.0, "x", false));
+        let no_object: bool = host.lua().load("return oFlash == nil").eval().unwrap();
+        assert!(no_object);
         let is_stub: bool = host
             .lua()
             .load("return getmetatable(Event) ~= nil and tList[1] == 2")
@@ -729,7 +887,10 @@ mod tests {
         // A script's own state reads nil until set, and after it is unset.
         let unset: bool = host
             .lua()
-            .load("_bDone = true; _bDone = nil; return _bDone == nil and _tList == nil")
+            .load(
+                "_bDone = true; _bDone = nil; \
+                 return _bDone == nil and _tList == nil and uPlayer == nil",
+            )
             .eval()
             .unwrap();
         assert!(unset);
@@ -750,6 +911,12 @@ mod tests {
             .unwrap();
         assert_eq!((known, missing), (1, None));
         assert_eq!(host.take_calls(), ["Pg.LoadSomething"]);
+        let empty: bool = host
+            .lua()
+            .load("return #Pg.GetAllMarkers() == 0")
+            .eval()
+            .unwrap();
+        assert!(empty);
     }
 
     #[test]

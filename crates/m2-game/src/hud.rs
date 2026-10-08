@@ -5,11 +5,13 @@
 //! The game draws these with its own (Flash) interface; scripts reach it
 //! through `Net.SendEvent_*` calls (sent to every player in co-op) and
 //! `Marker`. Here they fill a [`Hud`] the game draws its own way. Texts are
-//! ids such as `[VzaCon001.Objectives.001]` into a string table not found
-//! yet; [`readable`] makes something showable of them meanwhile.
+//! ids such as `[VzaCon001.Objectives.001]` into the language's string
+//! table; [`render`] puts the table's text in, and [`readable`] makes
+//! something showable of an id the table lacks.
 
 use std::collections::BTreeMap;
 
+use m2_assets::StringTable;
 use mlua::{Lua, MultiValue, Table, Value};
 
 use crate::api::Shared;
@@ -57,24 +59,69 @@ pub struct Marker {
 pub struct Hud {
     /// The current mission's objective list: text id and icon tag.
     pub mission: Vec<(String, String)>,
+    /// Tutorial lines asked for and not yet shown
+    /// (`Net.SetTutorialMessage`): each call's arguments as text, in
+    /// order (see [`tutorial_text`]).
+    pub tutorials: Vec<Vec<String>>,
     /// Objectives on the map, by the scripts' name for them (the target's
     /// guid as text, or `<mission>_PreMission`).
     pub objectives: BTreeMap<String, Objective>,
     pub radar: BTreeMap<String, Blip>,
     /// World markers by handle.
     pub markers: BTreeMap<u32, Marker>,
-    /// Messages not yet shown: completed (or else added), and the text id.
-    pub messages: Vec<(bool, String)>,
+    /// Objective messages not yet shown.
+    pub messages: Vec<ObjectiveMessage>,
     next_marker: u32,
+}
+
+/// An objective message as the scripts send it
+/// (`Net.SendEvent_ObjectiveMessage`, for `MrxGuiInterface.
+/// DisplayObjectiveMessage` to show).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectiveMessage {
+    /// Its kind, a key of `MrxGuiInterface.tObjectiveMessageConfigs`:
+    /// `"add"`, `"upd"`, `"cpl"`, `"ccl"`, `"bonus_add"`...
+    pub kind: String,
+    /// Its icon, an index into `MrxUtil.tInlineIcons` (`[objdeliver]`...).
+    pub icon: i64,
+    /// The objective's text id.
+    pub text: String,
+}
+
+impl ObjectiveMessage {
+    /// An objective completed (else added, updated or cancelled).
+    pub fn done(&self) -> bool {
+        self.kind.ends_with("cpl")
+    }
 }
 
 /// Marker handles start here.
 const FIRST_MARKER: u32 = 0x5000_0000;
 
-/// A text id made readable until the string table is decoded: icon tags
-/// dropped, `[VzaCon001.Objectives.003] (0/4)` as
-/// `VzaCon001 objective 3 (0/4)`.
+/// A text with its ids replaced by the table's strings
+/// (`[VzaCon001.Objectives.003] (0/4)` as `Secure the beach (0/4)`), and
+/// ids the table lacks made [`readable`].
+pub fn render(text: &str, table: &StringTable) -> String {
+    render_with(text, |id| table.lookup(id).map(str::to_owned))
+}
+
+/// A text id made readable without the string table: icon tags dropped,
+/// `[VzaCon001.Objectives.003] (0/4)` as `VzaCon001 objective 3 (0/4)`.
 pub fn readable(text: &str) -> String {
+    render_with(text, |_| None)
+}
+
+/// Line by line: the scripts join texts with line breaks, and the table's
+/// own texts break with `[n]`. Lines left empty go.
+fn render_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    text.split('\n')
+        .map(|line| render_line(line, &lookup))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_line(text: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(open) = rest.find('[') {
@@ -87,6 +134,13 @@ pub fn readable(text: &str) -> String {
         };
         let id = &rest[open + 1..open + close];
         rest = &rest[open + close + 1..];
+        if let Some(found) = lookup(id) {
+            let found = found.trim();
+            if !found.is_empty() {
+                out.push(found.replace("[n]", "\n"));
+            }
+            continue;
+        }
         let parts: Vec<&str> = id.split('.').collect();
         match parts.as_slice() {
             // An icon tag: `[objdeliver]`.
@@ -116,6 +170,28 @@ fn text(v: Option<&Value>) -> String {
         Some(Value::Number(n)) => n.to_string(),
         _ => String::new(),
     }
+}
+
+/// A script value as text, for a call whose arguments aren't known yet:
+/// strings and numbers as they are, others by their type.
+fn shown(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.to_string_lossy(),
+        Value::Integer(i) => i.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Nil => "nil".to_owned(),
+        other => other.type_name().to_owned(),
+    }
+}
+
+/// The text id of a tutorial line, from its call's arguments
+/// ([`Hud::tutorials`]): the first in brackets (`[Tutorial.OpenPDA]`),
+/// none when the call clears the line.
+pub fn tutorial_text(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(|a| a.trim())
+        .find(|a| a.starts_with('[') && a.contains(']'))
 }
 
 fn number(v: Option<&Value>) -> Option<f64> {
@@ -167,6 +243,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     let none = || Ok(MultiValue::new());
 
     let net = lib("Net")?;
+    // A tutorial line: the call's arguments are kept as they come (what
+    // each is for isn't known yet; the text id is the one in brackets).
+    add(&net, "SetTutorialMessage", |hud, _, a| {
+        hud.tutorials.push(a.iter().map(shown).collect());
+        Ok(MultiValue::new())
+    })?;
     // (mission index, {{text id, icon tag}, ...}, repeatable): the whole
     // list, sent again whenever it changes.
     add(&net, "SendEvent_AddPDAMission", |hud, _, a| {
@@ -215,9 +297,13 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         hud.radar.remove(&text(a.first()));
         Ok(MultiValue::new())
     })?;
-    // (icon index, "add" or "cpl", text id, player).
+    // (icon index, kind, text id, player).
     add(&net, "SendEvent_ObjectiveMessage", |hud, _, a| {
-        hud.messages.push((text(a.get(1)) == "cpl", text(a.get(2))));
+        hud.messages.push(ObjectiveMessage {
+            kind: text(a.get(1)),
+            icon: int(a.first()),
+            text: text(a.get(2)),
+        });
         Ok(MultiValue::new())
     })?;
     // The network copies of world markers: the markers are already here.
@@ -286,6 +372,45 @@ mod tests {
     }
 
     #[test]
+    fn the_tables_text_replaces_the_id() {
+        let mut table = StringTable::default();
+        for (id, text) in [
+            ("VzaCon001.Objectives.001", "Secure the beach"),
+            ("objective.Objectivecompleted", "Objective completed:"),
+        ] {
+            table
+                .strings
+                .insert(m2_assets::name_hash(id), text.to_owned());
+        }
+        assert_eq!(
+            render("[VzaCon001.Objectives.001] (0/4)", &table),
+            "Secure the beach (0/4)"
+        );
+        assert_eq!(
+            render(
+                "[objt][objdeliver] [objective.Objectivecompleted] [VzaCon001.Objectives.002]",
+                &table
+            ),
+            "Objective completed: VzaCon001 objective 2"
+        );
+    }
+
+    #[test]
+    fn line_breaks_stay() {
+        let mut table = StringTable::default();
+        for (id, text) in [("Test.First", "[pda] One[n]two"), ("Test.Second", "Three")] {
+            table
+                .strings
+                .insert(m2_assets::name_hash(id), text.to_owned());
+        }
+        assert_eq!(
+            render("[Test.First]\n[Test.Second]\n", &table),
+            "[pda] One\ntwo\nThree"
+        );
+        assert_eq!(readable("[Test.First]\n[Test.Second]"), "First\nSecond");
+    }
+
+    #[test]
     fn objectives_and_markers_come_and_go() {
         let host = ScriptHost::new().unwrap();
         let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
@@ -318,7 +443,11 @@ mod tests {
             assert_eq!(hud.radar["734801"].colour, [255, 200, 0]);
             assert_eq!(
                 hud.messages,
-                [(false, "[VzaCon001.Objectives.001]".to_owned())]
+                [ObjectiveMessage {
+                    kind: "add".to_owned(),
+                    icon: 5,
+                    text: "[VzaCon001.Objectives.001]".to_owned(),
+                }]
             );
             let m = hud.markers.values().next().unwrap();
             assert_eq!((m.target, m.height, m.far), (Some(734_801), 2.0, 175.0));
@@ -335,5 +464,26 @@ mod tests {
             .unwrap();
         let w = world.borrow();
         assert!(w.hud.objectives.is_empty() && w.hud.radar.is_empty() && w.hud.markers.is_empty());
+    }
+
+    #[test]
+    fn tutorial_lines_keep_their_arguments() {
+        let host = ScriptHost::new().unwrap();
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        api::install(host.lua(), &world).unwrap();
+        host.lua()
+            .load(
+                r#"
+                Net.SetTutorialMessage(nil, "[Tutorial.OpenPDA]", 8, true)
+                Net.SetTutorialMessage(nil, "")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        let t = &w.hud.tutorials;
+        assert_eq!(t[0], ["nil", "[Tutorial.OpenPDA]", "8", "true"]);
+        assert_eq!(tutorial_text(&t[0]), Some("[Tutorial.OpenPDA]"));
+        assert_eq!(tutorial_text(&t[1]), None);
     }
 }

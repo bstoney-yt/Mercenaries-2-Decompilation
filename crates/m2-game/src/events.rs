@@ -17,7 +17,7 @@
 //! (see `wad -- calls`); the readings are noted per kind below.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::rc::Rc;
 
 use mlua::{Function, Lua, MultiValue, Table, Value};
@@ -60,6 +60,39 @@ pub trait World {
     fn winch(&self, _cargo: u32) -> Option<Option<u32>> {
         None
     }
+    /// Whether it got into (or out of) its seat at once, put there by a
+    /// script.
+    fn seated_instantly(&self, _guid: u32) -> bool {
+        false
+    }
+    /// An object's labels (`"Boat"`, `"Tank"`) as name hashes, for class
+    /// expressions.
+    fn labels(&self, _guid: u32) -> Vec<u32> {
+        Vec::new()
+    }
+    /// An object's health, if the world tracks it.
+    fn health(&self, _guid: u32) -> Option<f32> {
+        None
+    }
+    /// Whether a character's action (`Human.SetState`'s animation key)
+    /// has played to its end.
+    fn action_done(&self, _guid: u32) -> bool {
+        false
+    }
+    /// Every pad button the player pressed, in order, for minigames
+    /// ([`crate::hijack`]).
+    fn hijack_presses(&self) -> &[(f64, u32)] {
+        &[]
+    }
+    /// Since when (game seconds) the player holds a pad button down.
+    fn hijack_held_since(&self, _button: u32) -> Option<f64> {
+        None
+    }
+    /// The player's presses of the GUI's named buttons (`"selection"`,
+    /// `"cancel"`), each with its game time, for `Button` events.
+    fn button_presses(&self) -> &[(f64, String)] {
+        &[]
+    }
 }
 
 /// The kinds the scripts use, by how often.
@@ -95,6 +128,24 @@ struct Pending {
     held: bool,
     /// For conditions on each of several objects: those it held for.
     held_by: BTreeSet<u32>,
+    /// When it was made.
+    made: f64,
+    /// For minigames: how many of the player's presses it has read (none
+    /// before its first check: it reads those made since it was), and
+    /// the button it counted last.
+    read: Option<usize>,
+    memo: Option<u32>,
+    /// The scripts' state, to make tables to pass.
+    lua: LuaHandle,
+}
+
+/// The scripts' state, weakly (the state holds the events).
+struct LuaHandle(mlua::WeakLua);
+
+impl std::fmt::Debug for LuaHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LuaHandle")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -103,8 +154,21 @@ struct Store {
     pending: Vec<Pending>,
     /// `Event.Post` calls not yet delivered: name and data.
     posted: Vec<(String, Value)>,
+    /// With `M2_STUB_ARGS`: events made and deleted, for diagnostics.
+    trace: Vec<String>,
     /// Game time, seconds.
     now: f64,
+    /// The Lua state, for the strings minigames answer with.
+    lua: LuaRef,
+}
+
+#[derive(Default)]
+struct LuaRef(Option<mlua::WeakLua>);
+
+impl std::fmt::Debug for LuaRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LuaRef")
+    }
 }
 
 /// The pending events, shared with the `Event` library.
@@ -124,6 +188,7 @@ impl Events {
     /// Installs the `Event` library: the kind constants and `Create`,
     /// `CreatePersistent`, `Delete` and `Post`.
     pub fn install(&self, lua: &Lua) -> mlua::Result<()> {
+        self.store.borrow_mut().lua = LuaRef(Some(lua.weak()));
         let event = lua.create_table()?;
         for kind in KINDS {
             event.set(kind, kind)?;
@@ -132,7 +197,7 @@ impl Events {
             let store = Rc::clone(&self.store);
             event.set(
                 name,
-                safe_function(lua, move |_, args| {
+                safe_function(lua, move |lua, args| {
                     let mut args = args.into_iter();
                     let kind = match args.next() {
                         Some(Value::String(s)) => s.to_string_lossy(),
@@ -159,6 +224,16 @@ impl Events {
                     s.next_id += 1;
                     let id = s.next_id;
                     let now = s.now;
+                    if crate::script::stub_args() && !kind.starts_with("Gui") {
+                        let shown: Vec<String> = params
+                            .clone()
+                            .sequence_values::<Value>()
+                            .filter_map(Result::ok)
+                            .map(|v| crate::script::show_arg(&v))
+                            .collect();
+                        s.trace
+                            .push(format!("{name} {id} {kind}{{{}}}", shown.join(", ")));
+                    }
                     s.pending.push(Pending {
                         id,
                         kind,
@@ -169,6 +244,10 @@ impl Events {
                         last: now,
                         held: false,
                         held_by: BTreeSet::new(),
+                        made: now,
+                        read: None,
+                        memo: None,
+                        lua: LuaHandle(lua.weak()),
                     });
                     Ok(MultiValue::from_vec(vec![Value::Number(f64::from(id))]))
                 })?,
@@ -179,7 +258,19 @@ impl Events {
             "Delete",
             safe_function(lua, move |_, args| {
                 if let Some(id) = args.front().and_then(as_id) {
-                    store.borrow_mut().pending.retain(|p| p.id != id);
+                    let mut s = store.borrow_mut();
+                    if crate::script::stub_args() {
+                        let gone = s
+                            .pending
+                            .iter()
+                            .find(|p| p.id == id)
+                            .map(|p| p.kind.clone());
+                        s.trace.push(format!(
+                            "Delete {id} ({})",
+                            gone.as_deref().unwrap_or("none")
+                        ));
+                    }
+                    s.pending.retain(|p| p.id != id);
                 }
                 Ok(MultiValue::new())
             })?,
@@ -199,6 +290,41 @@ impl Events {
                 Ok(MultiValue::new())
             })?,
         )?;
+        // `Event.__m2_fire(kind, ...)`: the engine's own events (the GUI's
+        // `GuiHealthUpdate` and the like): calls the callbacks of pending
+        // events of that kind with their data then the arguments (one-shot
+        // events are used up). Returns how many ran.
+        let store = Rc::clone(&self.store);
+        event.set(
+            "__m2_fire",
+            safe_function(lua, move |_, args| {
+                let mut args = args.into_iter();
+                let Some(Value::String(kind)) = args.next() else {
+                    return Ok(MultiValue::from_vec(vec![Value::Integer(0)]));
+                };
+                let kind = kind.to_string_lossy();
+                let extra: Vec<Value> = args.collect();
+                let hits: Vec<(Value, Option<Table>)> = {
+                    let mut s = store.borrow_mut();
+                    let hits = s
+                        .pending
+                        .iter()
+                        .filter(|p| p.kind == kind)
+                        .map(|p| (p.callback.clone(), p.data.clone()))
+                        .collect();
+                    s.pending.retain(|p| p.persistent || p.kind != kind);
+                    hits
+                };
+                let mut ran = 0;
+                for (callback, data) in hits {
+                    if let Value::Function(f) = callback {
+                        call(&f, data.as_ref(), extra.clone())?;
+                        ran += 1;
+                    }
+                }
+                Ok(MultiValue::from_vec(vec![Value::Integer(ran)]))
+            })?,
+        )?;
         // Kinds not listed (`Event.Minigame`) read as their own name, so
         // events of them can be made and simply never fire.
         let meta = lua.create_table()?;
@@ -209,6 +335,21 @@ impl Events {
         event.set_metatable(Some(meta))?;
         lua.globals().set("Event", event)?;
         Ok(())
+    }
+
+    /// The minigames waiting on the player's pad, for the prompt.
+    pub fn minigames(&self) -> Vec<crate::hijack::Minigame> {
+        let s = self.store.borrow();
+        s.pending
+            .iter()
+            .filter(|p| p.kind == "Minigame")
+            .filter_map(|p| crate::hijack::Minigame::of(&p.params, s.now - p.made))
+            .collect()
+    }
+
+    /// Events made and deleted since the last call (with `M2_STUB_ARGS`).
+    pub fn take_trace(&self) -> Vec<String> {
+        std::mem::take(&mut self.store.borrow_mut().trace)
     }
 
     /// How many events are pending.
@@ -230,23 +371,110 @@ impl Events {
             .collect()
     }
 
+    /// Pending events with their parameters, for diagnostics:
+    /// `ObjectHealth{1, "<", 100}`.
+    pub fn describe(&self) -> Vec<String> {
+        self.store
+            .borrow()
+            .pending
+            .iter()
+            .map(|p| {
+                let params: Vec<String> = p
+                    .params
+                    .clone()
+                    .sequence_values::<Value>()
+                    .filter_map(Result::ok)
+                    .map(|v| crate::script::show_arg(&v))
+                    .collect();
+                format!("{}{{{}}}", p.kind, params.join(", "))
+            })
+            .collect()
+    }
+
+    /// The names pending `ScriptEvent` events wait to be posted.
+    pub fn awaited(&self) -> Vec<String> {
+        self.store
+            .borrow()
+            .pending
+            .iter()
+            .filter(|p| p.kind == "ScriptEvent")
+            .filter_map(|p| p.params.raw_get::<String>(1).ok())
+            .collect()
+    }
+
+    /// Posts `name` with no data, as `Event.Post(name)` does: the engine's
+    /// own posts (the satellite's view, say). It is delivered at the next
+    /// update.
+    pub fn post(&self, name: &str) {
+        self.post_data(name, Value::Nil);
+    }
+
+    /// Posts `name` with `data`, as `Event.Post(name, data)` does.
+    pub fn post_data(&self, name: &str, data: Value) {
+        self.store.borrow_mut().posted.push((name.to_owned(), data));
+    }
+
     /// Advances game time by `dt` seconds and fires every event whose
     /// condition holds. Callbacks run after the checks, so events they
     /// create wait for the next update. Returns the callbacks that failed.
     pub fn update(&self, dt: f64, world: &dyn World) -> Vec<EventError> {
-        let fired = self.due(dt, world);
-        fire(fired)
+        let (accepted, mut errors) = self.filter_posts();
+        let fired = self.due(dt, world, &accepted);
+        errors.extend(fire(fired));
+        errors
     }
 
     /// [`Events::update`] for a world the scripts also change: it is
     /// borrowed only while the conditions are checked, so callbacks can
     /// move, spawn and kill.
     pub fn update_shared<W: World>(&self, dt: f64, world: &RefCell<W>) -> Vec<EventError> {
-        let fired = self.due(dt, &*world.borrow());
-        fire(fired)
+        let (accepted, mut errors) = self.filter_posts();
+        let fired = self.due(dt, &*world.borrow(), &accepted);
+        errors.extend(fire(fired));
+        errors
     }
 
-    fn due(&self, dt: f64, world: &dyn World) -> Vec<Fired> {
+    /// Asks each waiting `ScriptEvent`'s filter about each post, before
+    /// anything is borrowed: filters are script functions and may call
+    /// the game (`Debug.Printf`). The (filter, post) pairs it says yes to,
+    /// and the filters that failed.
+    fn filter_posts(&self) -> (Accepted, Vec<EventError>) {
+        let (posted, filters) = {
+            let s = self.store.borrow();
+            let filters: Vec<(String, Function)> = s
+                .pending
+                .iter()
+                .filter(|p| p.kind == "ScriptEvent")
+                .filter_map(|p| {
+                    let name = p.params.raw_get::<String>(1).ok()?;
+                    let f = p.params.raw_get::<Option<Function>>(2).ok().flatten()?;
+                    Some((name, f))
+                })
+                .collect();
+            if filters.is_empty() {
+                return (Accepted::new(), Vec::new());
+            }
+            (s.posted.clone(), filters)
+        };
+        let (mut accepted, mut errors) = (Accepted::new(), Vec::new());
+        for (name, f) in &filters {
+            for (i, (n, data)) in posted.iter().enumerate().filter(|(_, (n, _))| n == name) {
+                match f.call::<Value>(data.clone()) {
+                    Ok(Value::Nil | Value::Boolean(false)) => {}
+                    Ok(_) => {
+                        accepted.insert((f.to_pointer() as usize, i));
+                    }
+                    Err(error) => errors.push(EventError {
+                        kind: format!("ScriptEvent {n} filter"),
+                        error,
+                    }),
+                }
+            }
+        }
+        (accepted, errors)
+    }
+
+    fn due(&self, dt: f64, world: &dyn World, accepted: &Accepted) -> Vec<Fired> {
         {
             let mut s = self.store.borrow_mut();
             s.now += dt;
@@ -255,13 +483,40 @@ impl Events {
             let mut fired = Vec::new();
             let mut keep = Vec::with_capacity(s.pending.len());
             for mut p in std::mem::take(&mut s.pending) {
-                let extra = match check(&p, now, &posted, world) {
+                let extra = match check(&p, now, &posted, accepted, world) {
                     Check::Fire(extra) => Some(vec![extra]),
                     // Fires as the condition starts to hold.
                     Check::Holds(holds, extra) => {
                         let rising = holds && !p.held;
                         p.held = holds;
                         rising.then_some(vec![extra])
+                    }
+                    // `held_by` keeps who was seated at the last check
+                    // (none before the first).
+                    Check::Seats(riders) => {
+                        let mode = seat_mode(&p);
+                        let any = mode.contains('a');
+                        let mut fire = Vec::new();
+                        let mut seated = BTreeSet::new();
+                        for (r, (inside, instantly), extra) in riders {
+                            let was = p.held_by.contains(&r);
+                            if inside {
+                                seated.insert(r);
+                            }
+                            let (inn, out) = if instantly { ('i', 'o') } else { ('e', 'x') };
+                            let got_in = inside && !was;
+                            let got_out = !inside && was;
+                            if (got_in && (any || mode.contains(inn)))
+                                || (got_out && (any || mode.contains(out)))
+                            {
+                                fire.push(extra);
+                            }
+                        }
+                        p.held_by = seated;
+                        if !p.persistent {
+                            fire.truncate(1);
+                        }
+                        (!fire.is_empty()).then_some(fire)
                     }
                     // Fires for each object as the condition starts to
                     // hold for it; once only, unless persistent.
@@ -281,6 +536,50 @@ impl Events {
                             rising.truncate(1);
                         }
                         (!rising.is_empty()).then_some(rising)
+                    }
+                    // `held_by` keeps who was inside at the last check
+                    // (none before the first: one inside then enters).
+                    Check::Crossings(members) => {
+                        let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                        let mut crossed = Vec::new();
+                        let mut inside = BTreeSet::new();
+                        for (g, holds, mut extra) in members {
+                            if holds {
+                                inside.insert(g);
+                            }
+                            if holds != p.held_by.contains(&g)
+                                && let Some(word) = lua.as_ref().and_then(|l| {
+                                    l.create_string(if holds { "enter" } else { "exit" }).ok()
+                                })
+                            {
+                                extra.push(Value::String(word));
+                                crossed.push(extra);
+                            }
+                        }
+                        p.held_by = inside;
+                        if !p.persistent {
+                            crossed.truncate(1);
+                        }
+                        (!crossed.is_empty()).then_some(crossed)
+                    }
+                    Check::Minigame(m) => {
+                        p.read = Some(m.read);
+                        p.memo = m.last;
+                        let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                        for (status, value) in m.fires {
+                            let Some(text) =
+                                lua.as_ref().and_then(|l| l.create_string(status).ok())
+                            else {
+                                continue;
+                            };
+                            let mut extra = vec![Value::String(text)];
+                            extra.extend(value.map(Value::Number));
+                            fired.push((p.kind.clone(), p.callback.clone(), p.data.clone(), extra));
+                        }
+                        if !m.done {
+                            keep.push(p);
+                        }
+                        continue;
                     }
                 };
                 match extra {
@@ -353,15 +652,57 @@ fn guid(t: &Table, i: i64) -> Option<u32> {
     as_id(&t.raw_get::<Value>(i).ok()?)
 }
 
+/// Whether an object with `labels` is of class `expr`: labels joined by
+/// `&&`, each maybe negated with `!` (`"Tank && !APC"`), in any case.
+pub(crate) fn class_matches(expr: &str, labels: &[u32]) -> bool {
+    class_terms(expr)
+        .iter()
+        .all(|&(h, not)| labels.contains(&h) != not)
+}
+
+/// A class expression's labels as name hashes, each with whether it is
+/// negated.
+pub(crate) fn class_terms(expr: &str) -> Vec<(u32, bool)> {
+    expr.split("&&")
+        .map(|term| {
+            let term = term.trim();
+            match term.strip_prefix('!') {
+                Some(not) => (m2_assets::name_hash(not.trim()), true),
+                None => (m2_assets::name_hash(term), false),
+            }
+        })
+        .collect()
+}
+
+/// How a seat event's mode letters (`"E"`, `"xo"`, ...) read; the old
+/// words `"enter"` and `"exit"` as `"ei"` and `"xo"`.
+fn seat_mode(p: &Pending) -> String {
+    match text(&p.params, 4).as_deref() {
+        Some("enter") | None => "ei".to_owned(),
+        Some("exit") => "xo".to_owned(),
+        Some(m) => m.to_owned(),
+    }
+}
+
 enum Check {
     /// Fire now with these values after the callback's data.
     Fire(Vec<Value>),
     /// A condition: whether it holds, and the values to pass when it
     /// starts to.
     Holds(bool, Vec<Value>),
+    /// Riders and whether each is in a wanted seat, with the values to
+    /// pass: fired by the event's mode as they get in or out.
+    Seats(Vec<(u32, (bool, bool), Vec<Value>)>),
     /// A condition on each of several objects (an object filter's): per
     /// object, whether it holds and the values to pass.
     Each(Vec<(u32, bool, Vec<Value>)>),
+    /// A minigame's answers, each a status and maybe a value; it stays
+    /// (made with `Create` or not) until `done`.
+    Minigame(crate::hijack::MinigameCheck),
+    /// Whether each of several objects is inside a region, with the values
+    /// to pass: fired as each goes in or out, the values then followed by
+    /// `"enter"` or `"exit"`.
+    Crossings(Vec<(u32, bool, Vec<Value>)>),
 }
 
 /// The objects a parameter names: a guid, `"hero"` (the player), or a
@@ -425,7 +766,17 @@ fn text(t: &Table, i: i64) -> Option<String> {
 
 /// Checks `p` against the world. Readings of each kind's parameters come
 /// from the game's call sites.
-fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -> Check {
+/// The (filter function's address, post's index) pairs a `ScriptEvent`'s
+/// filter said yes to.
+type Accepted = HashSet<(usize, usize)>;
+
+fn check(
+    p: &Pending,
+    now: f64,
+    posted: &[(String, Value)],
+    accepted: &Accepted,
+    world: &dyn World,
+) -> Check {
     let no = Check::Holds(false, Vec::new());
     let id = guid_value;
     match p.kind.as_str() {
@@ -444,46 +795,89 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
                 .map(|g| (g, !world.is_alive(g), vec![id(g)]))
                 .collect(),
         ),
-        // { a, b, "<" or ">", metres, ... }: when some a is within (or
-        // beyond) the distance of some b; a and b are guids, "hero" or
-        // labels. Passes the pair.
+        // { a, b, op, metres, stopped, flat }: when some a is within
+        // ("<", "<=") or beyond (">", ">=") the distance of some b,
+        // checked whenever it is pending (scripts wanting repeats make a
+        // "<" and a ">" in turn); flat measures across the ground only
+        // (`stopped` isn't followed yet). a and b are guids, "hero",
+        // labels or filters. Passes the a's that hold: one guid as a
+        // guid, a label's or filter's as a list (as WifTutorialTankHijack
+        // and the gate scripts read it).
         "ObjectProximity" => {
             let r = number(&p.params, 4).unwrap_or(0.0);
-            let beyond = text(&p.params, 3).as_deref() == Some(">");
+            let beyond = text(&p.params, 3).is_some_and(|op| op.starts_with('>'));
+            let flat = matches!(p.params.raw_get::<Value>(6), Ok(Value::Boolean(true)));
             let (aa, bb) = (objects(&p.params, 1, world), objects(&p.params, 2, world));
-            for &a in &aa {
-                for &b in &bb {
-                    let (Some(pa), Some(pb)) = (world.position(a), world.position(b)) else {
-                        continue;
-                    };
-                    let d2: f32 = (0..3).map(|i| (pa[i] - pb[i]).powi(2)).sum();
-                    let within = f64::from(d2) <= r * r;
-                    if within != beyond {
-                        return Check::Holds(true, vec![id(a), id(b)]);
-                    }
-                }
+            let holds = |a: u32| {
+                let Some(pa) = world.position(a) else {
+                    return false;
+                };
+                bb.iter().filter_map(|&b| world.position(b)).any(|pb| {
+                    let d2: f32 = [0, 1, 2]
+                        .into_iter()
+                        .filter(|&i| !(flat && i == 1))
+                        .map(|i| (pa[i] - pb[i]).powi(2))
+                        .sum();
+                    (f64::from(d2) <= r * r) != beyond
+                })
+            };
+            let near: Vec<u32> = aa.into_iter().filter(|&a| holds(a)).collect();
+            if near.is_empty() {
+                return no;
             }
-            no
+            let one = match p.params.raw_get::<Value>(1) {
+                Ok(Value::String(s)) => s.to_string_lossy().eq_ignore_ascii_case("hero"),
+                Ok(Value::Table(_)) => false,
+                _ => true,
+            };
+            if one {
+                return Check::Holds(true, vec![id(near[0])]);
+            }
+            let list = p
+                .lua
+                .0
+                .try_upgrade()
+                .and_then(|lua| lua.create_sequence_from(near.iter().map(|&g| id(g))).ok());
+            match list {
+                Some(t) => Check::Holds(true, vec![Value::Table(t)]),
+                None => no,
+            }
         }
-        // { rider, vehicle, seat, "enter" or "exit" }: rider is a guid,
-        // "hero" or a label, vehicle a guid (or anything for any), seat a
-        // seat type ("Gunner", "Any"; not told apart yet). Passes the
+        // { rider, vehicle, seat, mode }: rider is a guid, "hero" or a
+        // label; vehicle a guid (0: any), a vehicle's name or a class
+        // expression of labels ("Boat", "Tank && !APC"); seat a seat code
+        // ("D" the driver's; not told apart yet); mode letters, each a
+        // way of getting in or out: e climbing in, i put in at once, x
+        // climbing out, o put out ("ei" and "xo" either; "a" any). A
+        // vehicle script waits for "E" and "I" alike and leaves the other
+        // pending, so the two never fire for the same move. Passes the
         // rider and vehicle.
         "ObjectInSeat" => {
-            // The vehicle may be named rather than a guid.
-            let vehicle =
-                guid(&p.params, 2).or_else(|| objects(&p.params, 2, world).first().copied());
-            let exit = text(&p.params, 4).as_deref() == Some("exit");
-            for r in objects(&p.params, 1, world) {
-                let seated = world
-                    .vehicle_of(r)
-                    .filter(|v| vehicle.is_none_or(|want| want == *v));
-                if seated.is_some() != exit {
-                    let v = seated.or(vehicle).unwrap_or(0);
-                    return Check::Holds(true, vec![id(r), id(v)]);
+            let wanted = |v: u32| match p.params.raw_get::<Value>(2) {
+                Ok(Value::String(s)) => {
+                    let named = objects(&p.params, 2, world);
+                    if named.is_empty() {
+                        class_matches(&s.to_string_lossy(), &world.labels(v))
+                    } else {
+                        named.contains(&v)
+                    }
                 }
-            }
-            no
+                Ok(other) => as_id(&other).is_none_or(|want| want == 0 || want == v),
+                Err(_) => true,
+            };
+            Check::Seats(
+                objects(&p.params, 1, world)
+                    .into_iter()
+                    .map(|r| {
+                        let seated = world.vehicle_of(r).filter(|&v| wanted(v));
+                        (
+                            r,
+                            (seated.is_some(), world.seated_instantly(r)),
+                            vec![id(r), id(seated.unwrap_or(0))],
+                        )
+                    })
+                    .collect(),
+            )
         }
         // { state, "enter" or "exit" }: as the game enters or leaves a
         // state; passes both.
@@ -507,7 +901,18 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
                 Ok(Value::String(s)) => world.named(&s.to_string_lossy()),
                 _ => None,
             });
-            let (Some(b), exit) = (boundary, text(&p.params, 3).as_deref() == Some("exit")) else {
+            let mode = text(&p.params, 3);
+            // `"any"`: both ways, the callback told which (the faction
+            // zones' trespass watch).
+            if let (Some(b), Some("any")) = (boundary, mode.as_deref()) {
+                return Check::Crossings(
+                    objects(&p.params, 1, world)
+                        .into_iter()
+                        .filter_map(|o| Some((o, world.inside(o, b)?, vec![id(o), id(b)])))
+                        .collect(),
+                );
+            }
+            let (Some(b), exit) = (boundary, mode.as_deref() == Some("exit")) else {
                 return no;
             };
             for o in objects(&p.params, 1, world) {
@@ -538,7 +943,48 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             extra.extend(carrier.map(id));
             Check::Holds(holds, extra)
         }
+        // { object, "<" or ">", health }: while its health is below (or
+        // above) the figure; passes the object. The hero's survival
+        // script watches for drops below her current health this way.
+        "ObjectHealth" => {
+            let Some(figure) = number(&p.params, 3) else {
+                return no;
+            };
+            let above = text(&p.params, 2).as_deref() == Some(">");
+            for o in objects(&p.params, 1, world) {
+                if let Some(h) = world.health(o)
+                    && (f64::from(h) > figure) == above
+                    && f64::from(h) != figure
+                {
+                    return Check::Holds(true, vec![id(o)]);
+                }
+            }
+            no
+        }
         // { object, "awake" or "hibernate" }.
+        // { character }: when the action `Human.SetState` gave it has
+        // played to its end.
+        "HumanActionComplete" => match guid(&p.params, 1) {
+            Some(g) => Check::Holds(world.action_done(g), Vec::new()),
+            None => no,
+        },
+        // { player, seconds, mode, button, ... }: see `crate::hijack`.
+        // { player, button, "press", ... }: when the player presses the
+        // named button (`"selection"`: the fanfare's skip), after the
+        // event was made (persistent: after it last fired).
+        "Button" => match text(&p.params, 2) {
+            Some(button) => {
+                let pressed = world
+                    .button_presses()
+                    .iter()
+                    .any(|(t, b)| *b == button && *t >= p.last && (*t > p.last || !p.persistent));
+                if pressed { Check::Fire(Vec::new()) } else { no }
+            }
+            None => no,
+        },
+        "Minigame" => Check::Minigame(crate::hijack::check_minigame(
+            &p.params, p.made, now, p.read, p.memo, world,
+        )),
         "ObjectHibernation" => match guid(&p.params, 1) {
             Some(g) => {
                 let want_awake = text(&p.params, 2).as_deref() != Some("hibernate");
@@ -546,14 +992,27 @@ fn check(p: &Pending, now: f64, posted: &[(String, Value)], world: &dyn World) -
             }
             None => no,
         },
-        // { name, ... }: when something posts that name; passes the
-        // posted data.
+        // { name, filter }: when something posts that name, and the
+        // filter, if any, says yes to the posted data (the faction
+        // manager's attitude watches compare it with what they want);
+        // passes the posted data.
         "ScriptEvent" => {
             let Ok(name) = p.params.raw_get::<String>(1) else {
                 return no;
             };
-            match posted.iter().find(|(n, _)| *n == name) {
-                Some((_, data)) => Check::Fire(vec![data.clone()]),
+            // Filters ran before the checks ([`Events::filter_posts`]).
+            let filter = p.params.raw_get::<Option<Function>>(2).ok().flatten();
+            let wanted = |i: usize| {
+                filter
+                    .as_ref()
+                    .is_none_or(|f| accepted.contains(&(f.to_pointer() as usize, i)))
+            };
+            match posted
+                .iter()
+                .enumerate()
+                .find(|(i, (n, _))| *n == name && wanted(*i))
+            {
+                Some((_, (_, data))) => Check::Fire(vec![data.clone()]),
                 None => no,
             }
         }
@@ -607,6 +1066,8 @@ mod tests {
         fn labelled(&self, label: &str) -> Vec<u32> {
             if label == "Prisoner" {
                 vec![2]
+            } else if label == "tank" {
+                vec![4, 5]
             } else {
                 Vec::new()
             }
@@ -716,9 +1177,83 @@ mod tests {
         got.sort();
         assert_eq!(
             got,
-            ["awake 3", "dead 7,7", "near 1,2", "posted x,y", "seat 1,99"]
+            ["awake 3", "dead 7,7", "near 1", "posted x,y", "seat 1,99"]
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_filter_picks_which_posts_fire() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"
+                -- Filters may call the game (VzaCon001's print first).
+                local function hostile(d)
+                    Event.Post("Checked")
+                    return d[2] == "Pmc" and d[4] == "Hostile"
+                end
+                Event.CreatePersistent(Event.ScriptEvent, { "Attitude", hostile },
+                    function(d) table.insert(log, "angry " .. d[1]) end)
+                Event.Post("Attitude", { "Gur", "Pmc", "Neutral", "Friendly" })
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let world = TestWorld::default();
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty());
+        host.lua()
+            .load(r#"Event.Post("Attitude", { "Gur", "Pmc", "Neutral", "Hostile" })"#)
+            .exec()
+            .unwrap();
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["angry Gur"]);
+    }
+
+    #[test]
+    fn proximity_to_a_label_passes_the_list_of_those_near() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"
+                Event.Create(Event.ObjectProximity, { "tank", "hero", "<", 12, false, true },
+                    function(tanks)
+                        for _, t in ipairs(tanks) do table.insert(log, "tank " .. gid(t)) end
+                    end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        world.positions.insert(1, [0.0, 0.0, 0.0]);
+        // Above her: near across the ground, not in a straight line.
+        world.positions.insert(4, [10.0, 15.0, 0.0]);
+        world.positions.insert(5, [30.0, 0.0, 0.0]);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["tank 4"]);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn the_engine_posts_what_scripts_wait_for() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"Event.Create(Event.ScriptEvent, { "Satellite Targetting Start" },
+                    function() table.insert(log, "started") end)"#,
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(events.awaited(), ["Satellite Targetting Start"]);
+        let world = TestWorld::default();
+        events.post("Something else");
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty());
+        events.post("Satellite Targetting Start");
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["started"]);
+        assert!(events.awaited().is_empty());
     }
 
     #[test]

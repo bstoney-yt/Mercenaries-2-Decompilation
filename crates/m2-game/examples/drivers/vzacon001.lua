@@ -10,7 +10,11 @@ vehicle is the objective's own target. Run it before play starts:
   cargo run -p m2-game --example mission -- <vz.wad> \
     --driver crates/m2-game/examples/drivers/vzacon001.lua --seconds 900
 
-The contract is done when the log shows Notify("Pg.ContractCompleted"). ]]
+The contract is done when the log shows Notify("Pg.ContractCompleted").
+
+A driver run before this one may set DRIVE_UNTIL to part of an objective's
+name ('DestroyGate'): this one then stops acting once that objective is
+active, leaving it and the rest to the player. ]]
 
 -- Objective (part of its name), what to do, and where or whom.
 local acts = {
@@ -100,8 +104,22 @@ local function act(nm, a)
   end
 end
 
+local stopped = false
+-- Read raw: a global nobody set answers a stub table, not nil.
+local untilName = rawget(_G, 'DRIVE_UNTIL')
+if type(untilName) ~= 'string' then untilName = nil end
+
 -- Every second, act on each active objective every fourth try, ten times.
 Event.CreatePersistent(Event.TimerRelative, { 1 }, function()
+  if not stopped and untilName then
+    for nm, st in pairs(state) do
+      if st == 'active' and nm:find(untilName, 1, true) then
+        Debug.Printf('>>> drive: stopped at ' .. nm)
+        stopped = true
+      end
+    end
+  end
+  if stopped then return end
   for nm, st in pairs(state) do
     if st == 'active' then
       for _, a in ipairs(acts) do
