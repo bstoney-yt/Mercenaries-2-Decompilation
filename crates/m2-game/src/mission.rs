@@ -719,7 +719,7 @@ impl Mission {
                 first_lines(&e.to_string())
             ));
         }
-        for (cue, error) in crate::vo::show_subtitles(&self.world, self.host.lua()) {
+        for (cue, error) in crate::vo::show_subtitles(&self.world, self.host.lua(), now) {
             self.log.push(match error {
                 None => format!("  t={now:.1} subtitle {cue}"),
                 Some(e) => format!(

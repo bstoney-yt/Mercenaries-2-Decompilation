@@ -105,7 +105,7 @@ return c.sColor .. tag .. " [objective." .. c.sPrefix .. c.sStatus .. "]" .. " "
 /// its own environment like every module: its globals are the module's
 /// members.
 const HUD_CALL: &str = r#"
-local group, method, data, seq = ...
+local group, method, data, seq, call = ...
 -- The mission's callback (`fCallback`, kept in the mission's own Lua
 -- state) stands here as a note of the call's number, for the game to
 -- hand back ([`HudCall::callback`]).
@@ -120,7 +120,18 @@ local hud = type(module) == "table" and module.HudInterface
 local g = type(hud) == "table" and hud[group]
 local f = type(g) == "table" and g[method]
 if type(f) ~= "function" then return false end
-f(g, data)
+-- Message ids: the mission knows a message by its call's number
+-- (`{ __m2_seq = n }`), the buffers by their own ids, kept here.
+__m2_message_ids = __m2_message_ids or {}
+local ids = type(data) == "table" and data.tMessageIds
+if type(ids) == "table" and ids.__m2_seq then
+    data.tMessageIds = __m2_message_ids[ids.__m2_seq] or {}
+    __m2_message_ids[ids.__m2_seq] = nil
+end
+local r = f(g, data)
+if method == "AddMessage" and call then
+    __m2_message_ids[call] = r
+end
 return true
 "#;
 /// A call of the hijack scripts to one of the HUD's modules
@@ -367,7 +378,7 @@ const MAP_TEXTURE: &str = "vz_lrterrain";
 const BORDER_TEXTURE: &str = "global_gui_hud_radar";
 const BORDER: f32 = 154.0 / 100.0;
 /// What the radar strokes its dashed roads with: two dashes, white in a
-/// black rim, along 32 × 8 pixels.
+/// black rim, along 32 Ã— 8 pixels.
 const PATH_TEXTURE: &str = "global_radar_path";
 /// The texture's across (u) through the middle of a dash: a paved road is
 /// stroked with that column alone, solid with the dashes' rim.
@@ -2310,6 +2321,7 @@ impl Thread {
                     c.method.as_str(),
                     data,
                     c.callback.then_some(c.seq),
+                    c.seq,
                 ))
             });
             log.push(match done {
@@ -3591,7 +3603,7 @@ fn road_strokes(view: &MapView, roads: &[Road], out: &mut Vec<Prim>, want: &mut 
 /// The part of segment `a b` inside the disc round `centre` of radius
 /// `r`: from and to (0..=1 along it), or None if it misses.
 fn clip_to_disc(a: [f32; 2], b: [f32; 2], centre: [f32; 2], r: f32) -> Option<(f32, f32)> {
-    // |a + t (b - a) - centre|² = r², solved for t.
+    // |a + t (b - a) - centre|Â² = rÂ², solved for t.
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     let (fx, fy) = (a[0] - centre[0], a[1] - centre[1]);
     let qa = dx * dx + dy * dy;
