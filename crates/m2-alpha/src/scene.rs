@@ -1631,9 +1631,16 @@ impl Scene {
             {
                 w.model.draw(queue, at);
             }
-            // What she carries but doesn't hold hangs on her back.
+            // What she carries but doesn't hold hangs on her back (not
+            // seated: it would go through the seat's back, and the one
+            // she holds isn't drawn there either).
             let holding = !fight.designator && player.throwing.is_none() && !player.down;
-            for (slot, slung) in fight.slung(holding).into_iter().enumerate() {
+            let slung = if player.seated {
+                [None; 2]
+            } else {
+                fight.slung(holding)
+            };
+            for (slot, slung) in slung.into_iter().enumerate() {
                 let model = match slung {
                     Some(Weapon::Rifle) => self.arsenal.of_gun(&fight.rifle),
                     Some(Weapon::Rpg) => self.arsenal.of_gun(&fight.launcher),
