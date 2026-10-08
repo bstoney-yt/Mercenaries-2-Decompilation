@@ -519,7 +519,9 @@ impl Mission {
         // (the engine loads them for their objects), but the faction
         // manager's `Init` calls `FactionZone.Init` as a global.
         for (name, _) in OBJECT_SCRIPTS {
-            spelled.entry(name.to_ascii_lowercase()).or_insert_with(|| name.to_owned());
+            spelled
+                .entry(name.to_ascii_lowercase())
+                .or_insert_with(|| name.to_owned());
         }
         let globals = host.lua().globals();
         let import: Function = globals.get("import")?;
