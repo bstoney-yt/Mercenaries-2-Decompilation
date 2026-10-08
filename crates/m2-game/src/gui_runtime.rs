@@ -709,7 +709,10 @@ impl Screen {
     /// included). A widget never corrected draws in the virtual screen
     /// centred on the screen: as a centre-anchored one does, so a widget
     /// the scripts make later and place where a corrected one is (the hit
-    /// arcs over the reticle) lands on it.
+    /// arcs over the reticle) lands on it. A child of a full-screen
+    /// container (the front end's, `SetFullscreen("pan and scan")`) is
+    /// placed on the screen by its own anchors, as a top-level widget is:
+    /// the container is the screen.
     fn correction(&self, id: u32, width: f32, height: f32) -> Correction {
         let scale = height / VIRTUAL_SIZE.1;
         let mut at = Some(id);
@@ -725,6 +728,12 @@ impl Screen {
                         p[1] * height / VIRTUAL_SIZE.1 - p[1] * scale,
                     ],
                 };
+            }
+            if w.parent
+                .and_then(|p| self.widgets.get(&p))
+                .is_some_and(|p| p.fullscreen && p.kind == Kind::Widget)
+            {
+                return Correction::new(self.rect(i), w.anchors, width, height);
             }
             at = w.parent;
         }
