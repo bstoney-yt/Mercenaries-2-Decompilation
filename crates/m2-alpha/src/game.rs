@@ -1231,6 +1231,7 @@ impl Game {
             support: self
                 .support
                 .hud(player.map_or(self.camera.position.y, |p| p.character.position.y)),
+            hero: self.scene.hero,
             ..HudInfo::default()
         }
     }

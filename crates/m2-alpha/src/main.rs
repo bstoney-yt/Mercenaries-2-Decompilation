@@ -4570,11 +4570,8 @@ impl Running {
                 self.close_menu();
             }
             Some(ui::MenuAction::Hero(hero)) => {
-                // The body, clips, health and voice change now; the
-                // scripts take the new name on the next start.
                 eprintln!("hero: playing as {hero}");
-                self.game.set_hero(&mut self.backend, hero);
-                self.audio.hero = hero;
+                self.set_hero(hero);
             }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
             None => {}
@@ -4613,6 +4610,22 @@ impl Running {
         self.set_mouse_look(true);
     }
 
+    /// Plays as `hero` from now on: the body, clips, health and voice, and
+    /// the scripts' player (the mission's and the hijacks'; the HUD's hears
+    /// with its next state). What the scripts already chose by the old
+    /// hero stays theirs.
+    fn set_hero(&mut self, hero: Hero) {
+        self.game.set_hero(&mut self.backend, hero);
+        self.audio.hero = hero;
+        let max = self.game.combat.max_hp;
+        if let Some(m) = &mut self.mission {
+            m.set_hero(hero, max);
+        }
+        if let Some(h) = &mut self.hijacks {
+            h.set_hero(hero, max);
+        }
+    }
+
     fn save_game(&mut self) {
         let path = save::SaveGame::default_path();
         match self.game.save() {
@@ -4634,20 +4647,23 @@ impl Running {
         }
     }
 
-    fn tick(&mut self, config: &Config, _event_loop: &ActiveEventLoop) {
+    fn tick(&mut self, config: &mut Config, _event_loop: &ActiveEventLoop) {
         if let Some(flow) = &mut self.flow {
             if let Ok(mut mixer) = self.audio.out.mixer.lock() {
                 flow.tick(self.mission.as_mut(), &mut mixer);
             }
-            // The hero picked in the front end, before the scripts start.
-            if let Some(hero) = flow.take_pick()
-                && hero != self.game.scene.hero
-            {
-                eprintln!("hero: playing as {hero}");
-                self.game.set_hero(&mut self.backend, hero);
-                self.audio.hero = hero;
+            // The hero picked in the front end, before the scripts start;
+            // the pause menu offers them as the settings' hero.
+            let picked = flow.take_pick();
+            let holds = flow.holds();
+            if let Some(hero) = picked {
+                config.hero = hero;
+                if hero != self.game.scene.hero {
+                    eprintln!("hero: playing as {hero}");
+                    self.set_hero(hero);
+                }
             }
-            if flow.holds() {
+            if holds {
                 // The world waits under the movie or the front end.
                 self.input.clear();
                 let (ear, facing) = self.game.listener();
