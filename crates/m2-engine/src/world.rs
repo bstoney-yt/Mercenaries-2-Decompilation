@@ -293,6 +293,8 @@ pub struct Templates {
     pub equipment: HashMap<u32, Vec<u32>>,
     /// The game's damage table, if found.
     pub damage: Option<DamageTable>,
+    /// Every gun, thrown weapon and vehicle armament ([`crate::weapons`]).
+    pub arms: crate::weapons::Arms,
 }
 
 impl Templates {
@@ -446,6 +448,36 @@ impl Templates {
             .or_else(|| self.tuning_for_model(model))
     }
 
+    /// The armament of template `name` (a vehicle's own), else of the
+    /// first by name of `model`'s templates whose driver fires something,
+    /// else that mounts anything.
+    pub fn armament_for(&self, name: &str, model: u32) -> Option<&crate::weapons::Armament> {
+        if let Some(a) = self
+            .ids(name)
+            .iter()
+            .find_map(|id| self.arms.armaments.get(id))
+        {
+            return Some(a);
+        }
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        let found: Vec<&crate::weapons::Armament> = ids
+            .iter()
+            .filter_map(|(_, id)| self.arms.armaments.get(id))
+            .collect();
+        let driver = name_hash("seat_driver");
+        found
+            .iter()
+            .find(|a| !a.of_seat(driver).is_empty())
+            .or_else(|| found.iter().find(|a| !a.mounts.is_empty()))
+            .copied()
+    }
+
     /// The tuning of a template of `model`: a model's templates are
     /// variants that share it (the AMX-30's with and without a driver,
     /// for the scripts or the player; an anti-aircraft tank on a tank's
@@ -586,6 +618,7 @@ impl Templates {
             speeds: crate::tuning::human_speeds(&db),
             guns: crate::tuning::hand_guns(&db),
             equipment: crate::tuning::equipment(&db),
+            arms: crate::weapons::read(&db),
             damage,
         };
         (templates, atmosphere)

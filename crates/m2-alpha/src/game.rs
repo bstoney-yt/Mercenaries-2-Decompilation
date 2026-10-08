@@ -150,6 +150,27 @@ impl Game {
         if let Some(rifle) = scene.hero_rifle() {
             combat.take_own_rifle(rifle);
         }
+        if let Some(arms) = scene.arms() {
+            combat.arm(arms, scene.damage_table());
+        }
+        // What their template hands them to throw (free roam; the
+        // contract's scripts give her their own).
+        for (name, n) in scene.hero_explosives() {
+            match name.to_ascii_lowercase().as_str() {
+                "grenade" => combat.grenades = n,
+                "c4" => combat.charges = n,
+                "proximity mine" => combat.mines = n,
+                _ => {}
+            }
+        }
+        eprintln!(
+            "hero: carries {} grenades, {} C4, {} mines; launcher {} ({:?})",
+            combat.grenades,
+            combat.charges,
+            combat.mines,
+            combat.launcher.name,
+            combat.launcher_rounds
+        );
         let r = &combat.rifle;
         eprintln!(
             "hero: {} rifle {} ({}), {:.0} a minute, clip {}, spare {}, round {}; blasts on her {:?}",
@@ -186,6 +207,44 @@ impl Game {
             input_locked: false,
             support_hp: 0.0,
         }
+    }
+
+    /// Hands her weapon `name` by its template's name, full: a gun taken
+    /// up in its place (what she held there dropped), or an explosive
+    /// chosen to throw. False if the templates have no hand weapon so
+    /// named.
+    pub fn give(&mut self, name: &str) -> bool {
+        let Some(arms) = self.scene.arms() else {
+            return false;
+        };
+        if let Some(spec) = arms.named(name).filter(|w| w.class.is_some()) {
+            let gun = self.combat.stock(spec);
+            eprintln!(
+                "gun: {} ({:?}), {:.0} a minute, clip {}, spare {}, {} a shot, round {:?}",
+                gun.name,
+                gun.slot(),
+                60.0 / gun.gap,
+                gun.clip,
+                gun.spare,
+                gun.pellets,
+                gun.ammo
+            );
+            self.combat.equip_gun(gun, 0);
+            return true;
+        }
+        let slot = self.combat.throwables.iter().position(|t| {
+            t.as_ref()
+                .is_some_and(|t| t.name.eq_ignore_ascii_case(name))
+        });
+        let Some(i) = slot else { return false };
+        let max = self.combat.throwables[i].as_ref().map_or(0, |t| t.max);
+        match i {
+            1 => self.combat.charges = max,
+            2 => self.combat.mines = max,
+            _ => self.combat.grenades = max,
+        }
+        self.combat.explosive = i;
+        true
     }
 
     /// Plays as `hero` from now on: their body, clips and health (whole),
@@ -439,7 +498,22 @@ impl Game {
                     .and_then(|i| scene.vehicles.get(i))
                     .and_then(|v| v.id.map(|id| (id, v)));
                 self.throttle = 0.0;
+                // In a gunner's seat nobody drives: it stops.
+                let gunner = self.combat.seat > 0;
                 if let Some((id, v)) = id
+                    && !v.wrecked
+                    && gunner
+                {
+                    physics.drive(
+                        id,
+                        VehicleControls {
+                            // A helicopter holds its height.
+                            parked: !v.spec.is_helicopter(),
+                            ..VehicleControls::default()
+                        },
+                    );
+                    physics.fly(id, 0.0);
+                } else if let Some((id, v)) = id
                     && !v.wrecked
                 {
                     self.throttle = intent.movement.y;
@@ -937,13 +1011,22 @@ impl Game {
                 launcher: self
                     .combat
                     .launcher_rounds
-                    .filter(|_| self.combat.second == Some(Weapon::GrenadeLauncher))
+                    .filter(|_| self.combat.second.is_some())
                     .map(|r| [r.clip, r.stored]),
                 grenades: self.combat.grenades,
                 rifle: Some([
                     self.combat.rifle_rounds.clip,
                     self.combat.rifle_rounds.stored,
                 ]),
+                guns: [
+                    self.combat.rifle.name.clone(),
+                    self.combat.launcher.name.clone(),
+                ],
+                explosives: [
+                    self.combat.explosive as u32,
+                    self.combat.charges,
+                    self.combat.mines,
+                ],
             },
             vehicles,
             killed: self.scene.people.all_killed(),
@@ -976,28 +1059,59 @@ impl Game {
         player.yaw = p.yaw;
         player.pitch = p.pitch;
         let max_hp = self.combat.max_hp;
-        let hers = (
-            self.combat.rifle.clone(),
-            self.combat.own_rifle,
-            self.combat.hero_damage,
-        );
-        self.combat = Combat::default();
+        let old = std::mem::take(&mut self.combat);
         self.combat.max_hp = max_hp;
-        (
-            self.combat.rifle,
-            self.combat.own_rifle,
-            self.combat.hero_damage,
-        ) = hers;
+        self.combat.rifle = old.rifle;
+        self.combat.own_rifle = old.own_rifle;
+        self.combat.hero_damage = old.hero_damage;
+        // What the templates gave her weapons stays.
+        self.combat.damage_table = old.damage_table;
+        self.combat.throwables = old.throwables;
+        self.combat.carbine = old.carbine;
+        self.combat.rpg = old.rpg;
+        self.combat.gl = old.gl;
+        self.combat.launcher = self.combat.rpg.clone();
         self.combat.hp = p.hp.clamp(1.0, max_hp);
-        match (p.second.as_str(), p.launcher) {
-            ("grenade launcher", Some([clip, stored])) => {
+        let [rifle, launcher] = &p.guns;
+        let named = |name: &str| {
+            self.scene
+                .arms()
+                .and_then(|a| a.named(name))
+                .filter(|w| w.class.is_some() && !name.is_empty())
+                .map(|spec| self.combat.stock(spec))
+        };
+        let (rifle, launcher) = (named(rifle), named(launcher));
+        match (p.second.as_str(), p.launcher, launcher) {
+            (_, rounds, Some(gun)) if gun.slot() != Weapon::Rifle => {
+                self.combat.equip_gun(gun, 0);
+                if let Some([clip, stored]) = rounds {
+                    self.combat.launcher_rounds = Some(combat::Rounds { clip, stored });
+                }
+            }
+            ("grenade launcher", Some([clip, stored]), _) => {
                 self.combat.equip(Weapon::GrenadeLauncher, 0);
                 self.combat.launcher_rounds = Some(combat::Rounds { clip, stored });
             }
-            ("rpg", _) => {}
+            ("rpg", rounds, _) => {
+                if let Some([clip, stored]) = rounds {
+                    self.combat.launcher_rounds = Some(combat::Rounds { clip, stored });
+                }
+            }
             _ => self.combat.carbine_only(),
         }
+        // The gun in her rifle's place, if the save names one.
+        if let Some(gun) = rifle.filter(|g| g.slot() == Weapon::Rifle) {
+            self.combat.equip_gun(gun, 0);
+        }
+        self.combat.weapon = match p.weapon.as_str() {
+            "rifle" => Weapon::Rifle,
+            _ => self.combat.second.unwrap_or(Weapon::Rifle),
+        };
         self.combat.grenades = p.grenades.min(combat::MAX_GRENADES);
+        let [explosive, charges, mines] = p.explosives;
+        self.combat.charges = charges;
+        self.combat.mines = mines;
+        self.combat.explosive = (explosive as usize).min(2);
         if let Some([clip, stored]) = p.rifle {
             self.combat.rifle_rounds = combat::Rounds {
                 clip: clip.min(self.combat.rifle.clip),
@@ -1037,7 +1151,12 @@ impl Game {
         let driving = player.and_then(|p| p.driving).and_then(|i| {
             let v = self.scene.vehicles.get(i)?;
             let speed = self.driving().map_or(0.0, |d| d.1);
-            Some((v.spec.label.clone(), speed, v.wrecked))
+            // In a gunner's seat, so marked.
+            let label = match self.combat.seat {
+                0 => v.spec.label.clone(),
+                _ => format!("{} (gunner)", v.spec.label),
+            };
+            Some((label, speed, v.wrecked))
         });
         // What the crosshair is on: on foot, or in a vehicle with a gun.
         let crosshair = match (&self.scene.world, player) {
@@ -1046,7 +1165,7 @@ impl Game {
                     .scene
                     .vehicles
                     .get(i)
-                    .filter(|v| v.spec.muzzle.is_some() && !v.wrecked)
+                    .filter(|v| (v.spec.muzzle.is_some() || !v.spec.armed.is_empty()) && !v.wrecked)
                     .map(|v| Combat::aim_point(&w.physics, &self.scene.people, p, v.id)),
                 None if self.on_foot && p.landed => {
                     Some(Combat::aim_point(&w.physics, &self.scene.people, p, None))
@@ -1092,11 +1211,15 @@ impl Game {
             weapon: self.combat.weapon,
             rifle: self.combat.rifle.name.clone(),
             second: self.combat.second,
-            grenades: self.combat.grenades,
+            launcher: self.combat.launcher.name.clone(),
+            grenades: self.combat.explosive_left().1,
+            explosive: match self.combat.explosive {
+                0 => String::new(),
+                _ => self.combat.explosive_left().0.to_owned(),
+            },
             rounds: match self.combat.weapon {
                 Weapon::Rifle => Some(self.combat.rifle_rounds),
-                Weapon::GrenadeLauncher => self.combat.launcher_rounds,
-                Weapon::Rpg => None,
+                Weapon::GrenadeLauncher | Weapon::Rpg => self.combat.launcher_rounds,
             }
             .map(|r| (r.clip, r.stored)),
             // Looking through the satellite, its own overlay is shown.
@@ -1450,21 +1573,31 @@ fn take_up(
         );
         return;
     };
-    let left = combat.equip(weapon, rounds);
+    let spec = p.what.gun.and_then(|g| templates.arms.weapons.get(&g));
+    let gun = match (spec, weapon) {
+        (Some(spec), _) => combat.stock(spec),
+        (None, Weapon::GrenadeLauncher) => combat.gl.clone(),
+        (None, Weapon::Rpg) => combat.rpg.clone(),
+        (None, Weapon::Rifle) => combat.carbine.clone(),
+    };
+    let left = combat
+        .equip_gun(gun, rounds)
+        .map(|(g, n)| (g.slot(), n, g.template, g.model_hash, g.name));
     eprintln!(
-        "pickup: she takes up the {weapon:?} ({:#x}) at {:.1} with {rounds} rounds{}",
+        "pickup: she takes up the {} ({:#x}) at {:.1} with {rounds} rounds{}",
+        spec.map_or(format!("{weapon:?}"), |s| s.name.clone()),
         p.what.template,
         p.at,
-        match left {
-            Some((w, 0)) => format!(", leaving her {w:?}"),
-            Some((w, n)) => format!(", leaving her {w:?} with {n} rounds"),
+        match &left {
+            Some((_, 0, _, _, name)) => format!(", leaving her {name}"),
+            Some((_, n, _, _, name)) => format!(", leaving her {name} with {n} rounds"),
             None => String::new(),
         }
     );
-    let Some((left, kept)) = left else {
+    let Some((left, kept, gun, model, _)) = left else {
         return;
     };
-    let model = m2_assets::name_hash(left.model_name());
+    let model = model.unwrap_or_else(|| m2_assets::name_hash(left.model_name()));
     // Its template: the pickup with its model (the lowest id of several).
     let template = templates
         .leavings
@@ -1485,6 +1618,7 @@ fn take_up(
             model: Some(model),
             reach: template.map_or(1.0, |(_, info)| info.radius),
             weapon: Some(left),
+            gun,
             gives: Some((left, kept)),
             ..crate::flights::Leaves::default()
         },

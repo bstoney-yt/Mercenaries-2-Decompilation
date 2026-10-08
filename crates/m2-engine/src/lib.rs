@@ -31,6 +31,7 @@ pub mod stream;
 pub mod technique;
 pub mod tuning;
 pub mod vehicle;
+pub mod weapons;
 pub mod world;
 
 pub use ai::{AiFlags, AiProfile};

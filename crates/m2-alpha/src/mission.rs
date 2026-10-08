@@ -737,6 +737,7 @@ impl MissionLink {
                 }
             }
             report_strikes(game, mission);
+            mission.set_player_reserve("C4", game.combat.charges);
             let spare = game.combat.rifle_rounds.stored;
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
             mission.tick(f64::from(STEP));
@@ -811,6 +812,8 @@ impl MissionLink {
                         eprintln!("mission: scripts give her {weapon} {rounds} in reserve");
                         if weapon.eq_ignore_ascii_case(GRENADE) {
                             game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
+                        } else if weapon.eq_ignore_ascii_case("C4") {
+                            game.combat.charges = *rounds;
                         } else if weapon.eq_ignore_ascii_case(CARBINE) {
                             game.combat.rifle_rounds.stored =
                                 (*rounds * combat::RIFLE_CLIP).min(combat::RIFLE_SPARE);
@@ -1938,6 +1941,27 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     };
     let info = templates.leavings.pickups.get(&id)?;
     let model = templates.by_id(id).and_then(|(_, t)| t.model);
+    // A gun of the templates' with its model (of several, the lowest).
+    let gun = model.and_then(|m| {
+        templates
+            .arms
+            .weapons
+            .values()
+            .filter(|w| w.class.is_some() && w.model == Some(m))
+            .min_by_key(|w| w.template)
+    });
+    if let Some(spec) = gun {
+        let slot = combat::Rifle::from_spec(spec).slot();
+        return Some(Leaves {
+            template: id,
+            model,
+            reach: info.radius,
+            weapon: Some(slot),
+            gun: Some(spec.template),
+            gives: Some((slot, info.rounds.max(1) * spec.clip.max(1))),
+            ..Leaves::default()
+        });
+    }
     let weapon = Weapon::ALL
         .into_iter()
         .find(|w| model == Some(name_hash(w.model_name())));
@@ -1976,6 +2000,7 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
         model,
         reach: info.radius,
         weapon,
+        gun: None,
         gives,
         launcher,
         grenades,

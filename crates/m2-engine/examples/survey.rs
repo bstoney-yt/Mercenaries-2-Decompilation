@@ -90,6 +90,14 @@
 //!                           engine bank, its other components, and what
 //!                           the alpha does with it; one tab-separated
 //!                           line each after a `fleet\t` head
+//! arsenal[:<word>,..]       every weapon template (a `Weapon*` component),
+//!                           or those whose name holds a word: the weapon
+//!                           side's components and fields; per weapon a
+//!                           tab-separated `arsenal\t` line (model and
+//!                           whether archived, placements, weapon fields,
+//!                           ammunition's fields, who names it through
+//!                           which component); then `detail\t` dumps of
+//!                           each and what it names, two links deep
 //! components[:<word>,..]    the template database's components (all, or
 //!                           those whose name holds a word): record count
 //!                           and each field's name (or hash), type, width
@@ -376,7 +384,7 @@ fn open(path: &Path) -> Result<AssetSource<BufReader<File>>, Error> {
 /// Template fields whose names appear in no file: guessed, each hashing
 /// to a field of the vehicle, weapon and camera components (the AMX-30's
 /// values read sensibly under them).
-const FIELD_NAMES: [&str; 91] = [
+const FIELD_NAMES: &[&str] = &[
     "MaxSpeed",
     "Mass",
     "Brake",
@@ -468,6 +476,83 @@ const FIELD_NAMES: [&str; 91] = [
     "Fudge",
     "Scale",
     "Multiplier",
+    "Spread",
+    "fSpread",
+    "MinSpread",
+    "MaxSpread",
+    "Accuracy",
+    "Range",
+    "MaxRange",
+    "MinRange",
+    "fRange",
+    "ReloadTime",
+    "fReloadTime",
+    "MinRadius",
+    "MaxRadius",
+    "LockOn",
+    "LockTime",
+    "LockOnTime",
+    "LockRange",
+    "Zoom",
+    "ZoomFOV",
+    "Recoil",
+    "ThrowSpeed",
+    "ThrowVelocity",
+    "LifeTime",
+    "SpawnTemplate",
+    "DamageKey",
+    "WeaponType",
+    "WeaponClass",
+    "BurstCount",
+    "BurstSize",
+    "BurstDelay",
+    "Overheat",
+    "HeatPerShot",
+    "CoolDown",
+    "CoolRate",
+    "SpinUp",
+    "SpinUpTime",
+    "Accel",
+    "AccelTime",
+    "MaxVelocity",
+    "Bounce",
+    "Restitution",
+    "Friction",
+    "Homing",
+    "TracerTemplate",
+    "Force",
+    "BlastRadius",
+    "ExplosionRadius",
+    "Ammo",
+    "AmmoType",
+    "Icon",
+    "HudIcon",
+    "Scope",
+    "bScope",
+    "bAutomatic",
+    "Automatic",
+    "Silenced",
+    "Penetrate",
+    "Splash",
+    "SplashDamage",
+    "SplashRadius",
+    "ImpulseScale",
+    "Impulse",
+    "MinVelocity",
+    "Drag",
+    "Seek",
+    "SeekTime",
+    "ArmTime",
+    "ArmingTime",
+    "MaxLifetime",
+    "Timer",
+    "StickTime",
+    "Sticky",
+    "MaxCount",
+    "MaxCarry",
+    "Count",
+    "Amount",
+    "Type",
 ];
 
 /// Every name in the archives and data files; with `gather`, what the
@@ -897,6 +982,7 @@ fn main() -> Result<(), Error> {
             "templates" => templates(&mut source, &names, arg),
             "ai" => ai_side(&mut source, &names, arg),
             "fleet" => fleet(&mut source, &mut lazy, &names, arg),
+            "arsenal" => arsenal(&mut source, &names, arg),
             "components" => components(&mut source, &names, arg),
             "parents" => parents(&mut source, &names, arg),
             "cues" => cues(&mut source, &names, arg),
@@ -4941,6 +5027,283 @@ fn fleet<R: Read + Seek>(
     );
     for l in loose {
         println!("  {l}");
+    }
+    Ok(())
+}
+
+/// Every weapon template (one with a component whose name starts with
+/// `Weapon`), or those whose name holds a word: first the weapon-side
+/// components and their fields; then one tab-separated line per weapon
+/// after an `arsenal\t` head (model and whether the archives hold it,
+/// its weapon components' fields, its ammunition's fields and what that
+/// spawns, placements, and which templates name it through which
+/// component: heroes' and soldiers' `EquipmentLink`s, vehicles'
+/// `PhysicalLink`s, pickups); then every weapon and every template it
+/// names (two links deep) with all its fields, after `detail\t` heads.
+fn arsenal<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words = words_of(arg);
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let models: HashSet<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let model_of = db.hashes("ModelName");
+    let records: Vec<ComponentRecords<'_>> = db
+        .components
+        .iter()
+        .filter(|c| c.name != "Name")
+        .map(|c| (c.name, c.fields.clone(), by_entity(c)))
+        .collect();
+    let field_name = |h: u32| names.get(h).map_or(format!("{h:08x}"), str::to_owned);
+
+    const SIDE: [&str; 20] = [
+        "weapon",
+        "ammo",
+        "projectile",
+        "explos",
+        "grenade",
+        "thrown",
+        "melee",
+        "pickup",
+        "spawn",
+        "damage",
+        "missile",
+        "rocket",
+        "bullet",
+        "burst",
+        "lock",
+        "equip",
+        "physicallink",
+        "inventory",
+        "fire",
+        "controller",
+    ];
+    println!("weapon-side components: name, records, fields (name or hash, type, bits)");
+    for c in &db.components {
+        let n = c.name.to_ascii_lowercase();
+        if !SIDE.iter().any(|w| n.contains(w)) {
+            continue;
+        }
+        let fields: Vec<String> = c
+            .fields
+            .iter()
+            .map(|f| {
+                let bits = if f.bit_width > 0 {
+                    format!(":{}@{}", f.bit_width, f.bit_shift)
+                } else {
+                    String::new()
+                };
+                format!("{} t{}{bits}", field_name(f.name_hash), f.ty)
+            })
+            .collect();
+        println!("  {} ({}): {}", c.name, c.count, fields.join(", "));
+    }
+
+    // A template's fields, per component, and the templates they name.
+    let fields_of = |id: u32| -> Vec<(&str, String, Vec<u32>)> {
+        let mut out = Vec::new();
+        for (cname, fields, recs) in &records {
+            for rec in recs.get(&id).into_iter().flatten() {
+                let mut named = Vec::new();
+                let values: Vec<String> = fields
+                    .iter()
+                    .map(|f| {
+                        let shown = field_value(names, f, rec);
+                        let at = usize::from(f.offset);
+                        let other = (f.ty != STRING_FIELD && f.bit_width == 0)
+                            .then(|| rec.get(at..at + 4))
+                            .flatten()
+                            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .filter(|v| *v != id)
+                            .and_then(|v| tnames.get(&v).map(|n| (v, n)));
+                        match other {
+                            Some((v, n)) => {
+                                named.push(v);
+                                format!("{shown} -> {n:?}")
+                            }
+                            None => shown,
+                        }
+                    })
+                    .collect();
+                out.push((*cname, values.join(", "), named));
+            }
+        }
+        out
+    };
+    // Who names whom, through which component.
+    let mut named_by: HashMap<u32, Vec<(u32, &str)>> = HashMap::new();
+    for (cname, fields, recs) in &records {
+        for (&owner, rs) in recs {
+            for rec in rs {
+                for f in fields {
+                    if f.ty == STRING_FIELD || f.bit_width != 0 {
+                        continue;
+                    }
+                    let at = usize::from(f.offset);
+                    let Some(b) = rec.get(at..at + 4) else {
+                        continue;
+                    };
+                    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    if v != owner && tnames.contains_key(&v) {
+                        named_by.entry(v).or_default().push((owner, *cname));
+                    }
+                }
+            }
+        }
+    }
+    let mut weapon_comps: HashMap<u32, Vec<&str>> = HashMap::new();
+    for (cname, _, recs) in &records {
+        if cname.to_ascii_lowercase().starts_with("weapon") {
+            for &id in recs.keys() {
+                weapon_comps.entry(id).or_default().push(cname);
+            }
+        }
+    }
+    // Placements by parent template, in static and state layers.
+    let mut placed: HashMap<u32, [usize; 2]> = HashMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        let at = usize::from(!paths[b].contains("layers_static"));
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            for (_, p) in layer.placements() {
+                placed.entry(p.parent).or_default()[at] += 1;
+            }
+        }
+    }
+    let show = |h: u32| -> String {
+        tnames
+            .get(&h)
+            .map(|n| (*n).to_owned())
+            .unwrap_or_else(|| format!("{h:08x}"))
+    };
+    let mut list: Vec<(&str, u32)> = weapon_comps
+        .keys()
+        .map(|&id| (tnames.get(&id).copied().unwrap_or(""), id))
+        .filter(|(n, _)| {
+            let n = n.to_ascii_lowercase();
+            words.is_empty() || words.iter().any(|w| n.contains(w.as_str()))
+        })
+        .collect();
+    list.sort_unstable_by_key(|&(n, id)| (n.to_ascii_lowercase(), id));
+    println!("{} weapon templates", list.len());
+    println!(
+        "arsenal\tid\tname\tweapon components\tmodel\tin archive\tstatic\tstate\tweapon fields\tammo\tammo fields\tammo names\tnamed by"
+    );
+    let ammo_field = m2_assets::name_hash("AmmoTemplate");
+    for &(name, id) in &list {
+        let model = model_of.get(&id).copied().filter(|&m| m != 0);
+        let in_archive = model.is_some_and(|m| models.contains(&m));
+        let mine = fields_of(id);
+        let mut comps = weapon_comps[&id].clone();
+        comps.sort_unstable();
+        comps.dedup();
+        let wfields: Vec<String> = mine
+            .iter()
+            .filter(|(c, _, _)| c.to_ascii_lowercase().starts_with("weapon"))
+            .map(|(c, v, _)| format!("{c}{{{v}}}"))
+            .collect();
+        // Its ammunition: the AmmoTemplate field of any weapon component.
+        let ammo = records
+            .iter()
+            .filter(|(c, _, _)| c.to_ascii_lowercase().starts_with("weapon"))
+            .find_map(|(_, fields, recs)| {
+                let f = fields.iter().find(|f| f.name_hash == ammo_field)?;
+                let rec = recs.get(&id)?.first()?;
+                let at = usize::from(f.offset);
+                let b = rec.get(at..at + 4)?;
+                Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]])).filter(|&v| v != 0)
+            });
+        let (afields, anamed) = ammo.map_or((String::new(), String::new()), |a| {
+            let f = fields_of(a);
+            let names: Vec<String> = f
+                .iter()
+                .flat_map(|(c, _, n)| n.iter().map(move |&t| format!("{c}:{}", show(t))))
+                .collect();
+            (
+                f.iter()
+                    .map(|(c, v, _)| format!("{c}{{{v}}}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                names.join(", "),
+            )
+        });
+        let mut by: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for &(owner, c) in named_by.get(&id).into_iter().flatten() {
+            by.entry(c).or_default().push(show(owner));
+        }
+        let by: Vec<String> = by
+            .into_iter()
+            .map(|(c, mut o)| {
+                o.sort_unstable();
+                o.dedup();
+                let n = o.len();
+                o.truncate(8);
+                format!("{c} {n}: {}", o.join("; "))
+            })
+            .collect();
+        let [stat, state] = placed.get(&id).copied().unwrap_or_default();
+        println!(
+            "arsenal\t{id:08x}\t{name}\t{}\t{}\t{}\t{stat}\t{state}\t{}\t{}\t{afields}\t{anamed}\t{}",
+            comps.join(" "),
+            model.map_or("-".to_owned(), |m| format!("{m:08x} {}", names.show(m))),
+            if in_archive { "yes" } else { "no" },
+            wfields.join(" "),
+            ammo.map_or("-".to_owned(), &show),
+            by.join(" | ")
+        );
+    }
+    // Every weapon, and what it names two links deep, in full.
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut queue: Vec<(u32, u32)> = list.iter().map(|&(_, id)| (id, 0)).collect();
+    queue.reverse();
+    while let Some((id, depth)) = queue.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        println!("detail\t{id:08x}\t{}\tdepth {depth}", show(id));
+        for (c, v, named) in fields_of(id) {
+            println!("  {c}: {v}");
+            if depth < 2 {
+                for t in named {
+                    if !seen.contains(&t) {
+                        queue.push((t, depth + 1));
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

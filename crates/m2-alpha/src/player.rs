@@ -166,6 +166,9 @@ impl Intent {
                 reload: input.take_pressed(Action::Reload),
                 aim: input.held(Action::Aim),
                 throw: input.take_pressed(Action::Throw),
+                next_explosive: input.take_pressed(Action::Explosive),
+                detonate: input.take_pressed(Action::Detonate),
+                seat: input.take_pressed(Action::Seat),
                 melee: input.take_pressed(Action::Melee),
                 select: if input.take_pressed(Action::Rifle) {
                     Some(Weapon::Rifle)
@@ -679,6 +682,8 @@ mod tests {
             model: 1,
             kind: "tank".into(),
             label: "amx30".into(),
+            node_names: Vec::new(),
+            armed: Vec::new(),
             wheels: Vec::new(),
             bounds: (Vec3::new(-1.8, 0.0, -3.3), Vec3::new(2.0, 4.2, 8.1)),
             seat: None,

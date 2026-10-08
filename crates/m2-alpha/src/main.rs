@@ -113,6 +113,9 @@ struct Options {
     spawn: Option<(f32, f32)>,
     /// Who to play (`--hero`), over the settings'.
     hero: Option<Hero>,
+    /// Weapons to start with, by template name (`--gun`, repeated:
+    /// `Shotgun`, `Stinger`, `C4`).
+    guns: Vec<String>,
     gait: Option<Gait>,
     double_sided: bool,
     fly: bool,
@@ -141,6 +144,8 @@ struct Options {
     plough: Option<String>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
+    /// With `--drive`: fire from the next seat with a weapon.
+    gunner: bool,
     /// With `--drive`: a vehicle whose name holds this.
     vehicle: Option<String>,
     /// With `--drive`: swing the camera this far (radians) before the picture.
@@ -297,6 +302,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 ));
             }
             "--turn" => o.turn = value()?.parse().context("--turn expects degrees")?,
+            "--gun" => o.guns.push(value()?),
             "--hero" => {
                 let v = value()?;
                 o.hero = Some(Hero::parse(&v).with_context(|| {
@@ -333,6 +339,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--drive" => o.drive = true,
+            "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
             "--throw" => o.throw = true,
             "--bash" => o.bash = true,
@@ -606,6 +613,7 @@ fn main() -> anyhow::Result<()> {
         support: options.support.clone(),
         alpha: options.alpha,
         no_boot: options.no_boot,
+        guns: options.guns.clone(),
         state: None,
         error: None,
     };
@@ -685,6 +693,15 @@ fn build_scene(
         }
     }
     Ok(game)
+}
+
+/// Hands her the weapons `--gun` names.
+fn give_guns(game: &mut Game, guns: &[String]) {
+    for name in guns {
+        if !game.give(name) {
+            eprintln!("--gun {name}: no hand weapon of that name in the templates");
+        }
+    }
 }
 
 /// What the HUD shows: the game's, with the mission's objectives and the
@@ -793,6 +810,7 @@ fn screenshot(
         config.hero,
     )?;
     game.scene.people.smarter = config.enhanced.smarter_ai;
+    give_guns(&mut game, &options.guns);
     if options.fly {
         game.on_foot = false;
     }
@@ -1781,9 +1799,10 @@ fn describe_slung(game: &Game) -> Vec<String> {
     for (slot, slung) in game.combat.slung(holding).into_iter().enumerate() {
         let Some(weapon) = slung else { continue };
         let model = match weapon {
-            combat::Weapon::Rifle => arsenal.hers(&game.combat.rifle),
-            combat::Weapon::Rpg => arsenal.rpg.as_ref(),
-            combat::Weapon::GrenadeLauncher => arsenal.launcher.as_ref(),
+            combat::Weapon::Rifle => arsenal.of_gun(&game.combat.rifle),
+            combat::Weapon::Rpg | combat::Weapon::GrenadeLauncher => {
+                arsenal.of_gun(&game.combat.launcher)
+            }
         };
         let side = ["right", "left"][slot];
         let Some((w, at)) = model.and_then(|w| Some((w, arsenal.on_back(w, body, &nodes, slot)?)))
@@ -3079,6 +3098,21 @@ fn drive_for_screenshot(
             "drive: health {:?}, armour {:?}, blasts x{:?}, burns below {:?}, rounds x{:?}",
             t.health, t.armour, t.blast_scale, t.burns_below, t.rounds
         );
+        let arm = game.scene.world.as_ref().and_then(|w| {
+            w.index
+                .template_db
+                .armament_for(&v.spec.label, v.spec.model)
+        });
+        eprintln!(
+            "drive: armament {:?}; armed {:?}; her seat {}",
+            arm.map(|a| (&a.seats, a.mounts.len(), &a.couplings)),
+            v.spec
+                .armed
+                .iter()
+                .map(|m| (m.seat, m.priority, m.weapon.name.as_str(), &m.nodes))
+                .collect::<Vec<_>>(),
+            game.combat.seat
+        );
         let templated = game
             .scene
             .world
@@ -3155,6 +3189,8 @@ fn drive_for_screenshot(
             };
             let trigger = combat::Trigger {
                 fire: options.fire && i == 89,
+                // `--gunner`: to the gunner's seat first.
+                seat: options.gunner && i == 0,
                 ..combat::Trigger::default()
             };
             game.step(
@@ -4095,6 +4131,8 @@ struct App {
     /// `no_boot`), front end, the scripts' movies.
     alpha: bool,
     no_boot: bool,
+    /// Weapons to start with (`--gun`).
+    guns: Vec<String>,
     state: Option<Running>,
     error: Option<anyhow::Error>,
 }
@@ -4124,6 +4162,7 @@ impl App {
             self.config.hero,
         )?;
         game.scene.people.smarter = self.config.enhanced.smarter_ai;
+        give_guns(&mut game, &self.guns);
         if self.fly {
             game.on_foot = false;
         }
