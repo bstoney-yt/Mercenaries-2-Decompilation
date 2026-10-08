@@ -1479,11 +1479,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // `Graphics.Atmosphere`: the light of a line region, by the name of
     // one of its records.
     let graphics = lib("Graphics")?;
-    // `Graphics.Camera` (the hijack's `SetFocusParams`): a table of its
-    // own, whose members the library's stubbing fills in. Left out, the
-    // library's stubs would answer it with a function.
-    if !matches!(graphics.raw_get::<Value>("Camera")?, Value::Table(_)) {
-        graphics.raw_set("Camera", lua.create_table()?)?;
+    // `Graphics.Camera` and `Graphics.Effect` (the hijack's
+    // `SetFocusParams`, `CameraFade`): tables of their own, whose members
+    // the library's stubbing fills in. Left out, the library's stubs
+    // would answer them with functions.
+    for name in ["Camera", "Effect"] {
+        if !matches!(graphics.raw_get::<Value>(name)?, Value::Table(_)) {
+            graphics.raw_set(name, lua.create_table()?)?;
+        }
     }
     let atmosphere = match graphics.raw_get::<Value>("Atmosphere")? {
         Value::Table(t) if t.metatable().is_none() => t,
@@ -2300,6 +2303,7 @@ mod tests {
                 Graphics.Atmosphere.SetSky("afternoon")
                 Graphics.Atmosphere.ChangeLineRegionSetting(Pg.GetGuidByName("Mattias"), "night")
                 Graphics.Camera.SetFocusParams(0, 0, 0.1, 4, 6, 1)
+                Graphics.Effect.CameraFade(1, 0.5)
                 "#,
             )
             .exec()
