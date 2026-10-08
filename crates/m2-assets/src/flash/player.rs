@@ -744,17 +744,23 @@ impl Player {
             let Some(c) = self.clip(id) else { continue };
             let mut tris = Vec::new();
             self.draw_from(id, &Matrix::IDENTITY, fonts, &mut tris);
-            let hits = tris.iter().filter(|t| super::inside(at, t.corners)).count();
+            let covering: Vec<&Triangle> = tris
+                .iter()
+                .filter(|t| super::inside(at, t.corners))
+                .collect();
+            let hits = covering.len();
             if hits == 0 {
                 continue;
             }
+            let top = covering.last().map(|t| (t.colour, t.texture.clone()));
             out.push(format!(
-                "{path} #{} frame {} visible {} alpha {:.2} blend {} covers with {hits} of {}",
+                "{path} #{} frame {} visible {} alpha {:.2} blend {} mask {:?} covers with {hits} of {}, last {top:?}",
                 c.character,
                 c.frame + 1,
                 c.visible,
                 c.colour.mult[3],
                 c.blend,
+                c.clip_depth,
                 tris.len()
             ));
             if d < depth {
