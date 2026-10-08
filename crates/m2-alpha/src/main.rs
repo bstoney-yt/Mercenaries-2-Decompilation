@@ -2570,6 +2570,17 @@ fn hijack_for_screenshot(
     let mut hijacks = hijack::Hijacks::start(install, options.hijack_crew.clone());
     let mut input = Input::default();
     let started = Instant::now();
+    // The game's HUD, for the buttons the scripts put up.
+    let mut hud = ui::Hud::new();
+    hud.game = game_hud(Some(install), &Mode::Island(None), options.old_hud);
+    hud.wait = true;
+    if let (Some(g), Some(out)) = (&mut hud.game, &options.screenshot) {
+        g.log_to(&out.with_file_name(format!(
+            "{}-hud.log",
+            out.file_stem().and_then(|s| s.to_str()).unwrap_or("hijack")
+        )));
+    }
+    let mut settings = Config::default();
     while hijacks.loading() && started.elapsed() < Duration::from_secs(120) {
         hijacks.tick(game, &mut input, tick);
         game.step(Intent::default(), tick);
@@ -2600,6 +2611,13 @@ fn hijack_for_screenshot(
         return Ok(());
     };
     eprintln!("hijack: prompt \"Hijack {}\"", view.vehicle);
+    // The HUD up before she starts (its scripts load in the background).
+    if hud.game.is_some() {
+        let mut info = hud_info(game, None, fov, aspect);
+        info.game = Some(gamehud::HudState::of(game));
+        let (w, h) = backend.size();
+        let _ = hud.build(ui::headless_input(w, h, 0.0), &info, &mut settings);
+    }
     input.button(Action::Use, true);
     let mut pad = hijack::Autopad::default();
     let mut t = 0.0;
@@ -2611,6 +2629,17 @@ fn hijack_for_screenshot(
         hijacks.place(game);
         hijacks.seat(game, tick);
         t += tick;
+        if hud.game.is_some() {
+            let mut info = hud_info(game, None, fov, aspect);
+            let mut state = gamehud::HudState::of(game);
+            state.gui_calls = hijacks.take_gui_calls();
+            for c in &state.gui_calls {
+                eprintln!("hijack: t={t:.1} HUD call {}.{}", c.module, c.method);
+            }
+            info.game = Some(state);
+            let (w, h) = backend.size();
+            let _ = hud.build(ui::headless_input(w, h, f64::from(t)), &info, &mut settings);
+        }
         // A picture every two seconds of it, beside the one at the end.
         if t >= 2.0 * (shots + 1) as f32 && options.screenshot.is_some() {
             shots += 1;
@@ -2622,7 +2651,7 @@ fn hijack_for_screenshot(
                     hi.to_array()
                 );
             }
-            render(backend, game, fov, aspect, None)?;
+            render(backend, game, fov, aspect, Some(&mut hud))?;
             if let Some(out) = &options.screenshot {
                 let path = out.with_file_name(format!(
                     "{}-{shots:02}.ppm",
