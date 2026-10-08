@@ -2088,6 +2088,7 @@ fn disassemble(code: &[u8], indent: &str) {
     let mut pool: Vec<String> = Vec::new();
     let mut p = 0;
     while p < code.len() {
+        let at = p;
         let op = code[p];
         p += 1;
         if op == 0 {
@@ -2230,25 +2231,47 @@ fn disassemble(code: &[u8], indent: &str) {
                     };
                     vals.push(v);
                 }
-                println!("{indent}push {}", vals.join(", "));
+                println!("{indent}{at:5} push {}", vals.join(", "));
             }
             0x9B => {
                 let fname = cstr(body);
-                println!("{indent}function {fname:?}");
+                let mut q = fname.len() + 1;
+                let n = u16::from_le_bytes([body[q], body[q + 1]]);
+                q += 2;
+                for _ in 0..n {
+                    q += cstr(&body[q..]).len() + 1;
+                }
+                let size = usize::from(u16::from_le_bytes([body[q], body[q + 1]]));
+                println!("{indent}{at:5} function {fname:?} to {}", p + size);
             }
             0x8E => {
                 let fname = cstr(body);
-                println!("{indent}function2 {fname:?}");
+                let mut q = fname.len() + 1;
+                let n = u16::from_le_bytes([body[q], body[q + 1]]);
+                q += 5;
+                for _ in 0..n {
+                    q += 1 + cstr(&body[q + 1..]).len() + 1;
+                }
+                let size = usize::from(u16::from_le_bytes([body[q], body[q + 1]]));
+                println!("{indent}{at:5} function2 {fname:?} to {}", p + size);
             }
-            0x8C => println!("{indent}gotoLabel {:?}", cstr(body)),
+            0x8C => println!("{indent}{at:5} gotoLabel {:?}", cstr(body)),
             0x81 => println!(
                 "{indent}gotoFrame {}",
                 u16::from_le_bytes([body[0], body[1]]) + 1
             ),
-            0x83 => println!("{indent}getURL {:?}", cstr(body)),
-            0x9A => println!("{indent}getURL2"),
-            _ if !name.is_empty() => println!("{indent}{name}"),
-            _ => println!("{indent}op {op:02x}"),
+            0x83 => println!("{indent}{at:5} getURL {:?}", cstr(body)),
+            0x9A => println!("{indent}{at:5} getURL2"),
+            0x99 | 0x9D => {
+                let off = i16::from_le_bytes([body[0], body[1]]) as i64;
+                println!(
+                    "{indent}{at:5} {} -> {}",
+                    if op == 0x99 { "jump" } else { "if" },
+                    p as i64 + off
+                );
+            }
+            _ if !name.is_empty() => println!("{indent}{at:5} {name}"),
+            _ => println!("{indent}{at:5} op {op:02x}"),
         }
     }
 }
