@@ -122,6 +122,9 @@ pub struct MissionView {
     /// The same line with its key tokens (`[pda]`) as the scripts' text
     /// has them, for the game's own tutorial box to draw as glyphs.
     pub game_tutorial: Option<String>,
+    /// The keys bound to those tokens (`("pda", "P")`), for the game's own
+    /// HUD to name those its fonts have no picture for.
+    pub key_names: Vec<(String, String)>,
     /// Markers over targets.
     pub markers: Vec<MarkerView>,
     /// The newest objective message: completed (or else added), and text.
@@ -1285,6 +1288,7 @@ impl MissionLink {
                 .as_ref()
                 .map(|t| crate::input::name_keys(t, &self.keys)),
             game_tutorial: self.tutorial.clone(),
+            key_names: crate::input::token_keys(&self.keys),
             objectives,
             markers,
             message,

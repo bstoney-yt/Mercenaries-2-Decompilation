@@ -164,6 +164,7 @@ impl Hud {
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.key_names = m.key_names.clone();
             state.pda_objectives = m.pda_objectives.clone();
             state.trespass = m.trespass.clone();
             state.vehicle_disguise = m.vehicle_disguise;
@@ -221,6 +222,7 @@ impl Hud {
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.key_names = m.key_names.clone();
             state.pda_objectives = m.pda_objectives.clone();
             state.trespass = m.trespass.clone();
             state.vehicle_disguise = m.vehicle_disguise;

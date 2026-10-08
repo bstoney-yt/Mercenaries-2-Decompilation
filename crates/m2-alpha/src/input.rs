@@ -169,30 +169,57 @@ fn key_name(key: KeyCode) -> String {
     .to_owned()
 }
 
-/// A line of the game's text with its key tokens (`[pda] Open PDA`) named
-/// as the keys bound here, in brackets (`[P] Open PDA`): `[pda]` the PDA's
-/// key, `[support]` the support menu's, `[pfire]` the PC's fire (the left
-/// mouse button), `[confirm]` the consoles' (here the use key), `[move]`
-/// the keys that move, `[sprint]` sprint's (round 98 met it after the
-/// first gate). Other tokens, and keys left unbound, stay as they are.
-pub fn name_keys(line: &str, keys: &Bindings) -> String {
+/// The key tokens of the game's texts (`[pda] Open PDA`) and the action
+/// each names here: `[pda]` the PDA's key, `[support]` the support menu's,
+/// `[confirm]` the consoles' (here the use key), `[sprint]` sprint's
+/// (round 98 met it after the first gate), `[reload]` the reload's and
+/// `[jump]` the jump's, which is the brake when driving (`[jump]
+/// Handbrake`; the play test met both). `[pfire]` and `[move]` are named
+/// apart ([`token_keys`]).
+const TOKENS: [(&str, Action); 6] = [
+    ("pda", Action::Pda),
+    ("support", Action::Support),
+    ("confirm", Action::Use),
+    ("sprint", Action::Sprint),
+    ("reload", Action::Reload),
+    ("jump", Action::MoveUp),
+];
+
+/// The key tokens of the game's texts named as the keys bound here
+/// (`("pda", "P")`): those of [`TOKENS`], `[pfire]` the PC's fire (the
+/// left mouse button) and `[move]` the keys that move. Keys left unbound
+/// are left out.
+pub fn token_keys(keys: &Bindings) -> Vec<(String, String)> {
     use Action::*;
-    let name = |a| keys.key_name(a);
-    let named = |token: &str| match token {
-        "pda" => name(Pda),
-        "support" => name(Support),
-        "confirm" => name(Use),
-        "sprint" => name(Sprint),
-        "pfire" => Some("Left click".to_owned()),
-        "move" => {
-            let names: Vec<String> = [MoveForward, MoveLeft, MoveBack, MoveRight]
-                .into_iter()
-                .filter_map(name)
-                .collect();
-            let letters = names.iter().all(|n| n.chars().count() == 1);
-            (!names.is_empty()).then(|| names.join(if letters { "" } else { "/" }))
-        }
-        _ => None,
+    let mut out: Vec<(String, String)> = TOKENS
+        .iter()
+        .filter_map(|&(token, action)| Some((token.to_owned(), keys.key_name(action)?)))
+        .collect();
+    out.push(("pfire".to_owned(), "Left click".to_owned()));
+    let names: Vec<String> = [MoveForward, MoveLeft, MoveBack, MoveRight]
+        .into_iter()
+        .filter_map(|a| keys.key_name(a))
+        .collect();
+    if !names.is_empty() {
+        let letters = names.iter().all(|n| n.chars().count() == 1);
+        out.push((
+            "move".to_owned(),
+            names.join(if letters { "" } else { "/" }),
+        ));
+    }
+    out
+}
+
+/// A line of the game's text with its key tokens (`[pda] Open PDA`) named
+/// as the keys bound here, in brackets (`[P] Open PDA`; see
+/// [`token_keys`]). Other tokens, and keys left unbound, stay as they are.
+pub fn name_keys(line: &str, keys: &Bindings) -> String {
+    let tokens = token_keys(keys);
+    let named = |token: &str| {
+        tokens
+            .iter()
+            .find(|(t, _)| t == token)
+            .map(|(_, key)| key.clone())
     };
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
@@ -307,6 +334,11 @@ mod tests {
             "[T] One\n[Left click] Two [WASD] [E]"
         );
         assert_eq!(name_keys("[sprint] Sprint", &b), "[Shift] Sprint");
+        // The play test's: the reload, and the jump that brakes.
+        assert_eq!(
+            name_keys("[reload] Reload\n[jump] Handbrake", &b),
+            "[R] Reload\n[Space] Handbrake"
+        );
         assert_eq!(name_keys("[other] stays [", &b), "[other] stays [");
         let mut b = b;
         b.0.insert(Action::MoveForward, vec![KeyCode::ArrowUp]);
