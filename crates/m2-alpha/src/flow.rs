@@ -380,6 +380,11 @@ impl Flow {
             };
             s.update(ui.ctx(), state);
         }
+        // What the shell draws under its movie widget, for the backdrop to
+        // go over.
+        if shell && let Some(s) = &self.shell {
+            s.paint_under(&painter);
+        }
         if let Some(m) = &self.movie
             && let Some((n, rgba)) = &m.frame
         {
@@ -422,7 +427,7 @@ impl Flow {
             c.paint(&painter, s.bottom(), s.top());
         }
         if shell && let Some(s) = &self.shell {
-            s.paint(&painter);
+            s.paint_over(&painter);
         } else if self.stage == Stage::FrontEnd {
             let size = (screen.height() * 0.035).max(14.0);
             painter.text(

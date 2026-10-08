@@ -733,6 +733,9 @@ pub struct ShellNews {
     /// The backdrop movie its movie widget plays (`shell_mainmenu_jennifer`)
     /// and the widget's box, screen points.
     pub movie: Option<(String, [f32; 4])>,
+    /// How many of the prims come before the movie widget in the draw
+    /// order, and so go under its picture ([`GameHud::paint_under`]).
+    pub under: usize,
     /// A new game was started, as this character (`MrxGuiShellBootstrap.
     /// GetSelectedCharacter`: `Chris`, `Jen` or `mattias`).
     pub new_game: Option<String>,
@@ -1022,6 +1025,24 @@ impl GameHud {
     /// egui's white texel. (As egui shapes, the PDA's thousands of small
     /// triangles smeared: their feathering assumes one winding.)
     pub fn paint(&self, painter: &egui::Painter) {
+        self.paint_prims(painter, &self.prims);
+    }
+
+    /// Paints what the shell draws under its movie widget (the widgets
+    /// before it, such as the screen's black), for the movie's picture to
+    /// go over; [`paint_over`](Self::paint_over) paints the rest.
+    pub fn paint_under(&self, painter: &egui::Painter) {
+        let at = self.shell.under.min(self.prims.len());
+        self.paint_prims(painter, &self.prims[..at]);
+    }
+
+    /// Paints what the shell draws over its movie widget (its menus).
+    pub fn paint_over(&self, painter: &egui::Painter) {
+        let at = self.shell.under.min(self.prims.len());
+        self.paint_prims(painter, &self.prims[at..]);
+    }
+
+    fn paint_prims(&self, painter: &egui::Painter, prims: &[Prim]) {
         let mut mesh = Mesh::default();
         // Multiplying triangles in a row with one texture, drawn together.
         let mut multiply: Option<(u64, Vec<crate::multiply::Vertex>)> = None;
@@ -1045,7 +1066,7 @@ impl GameHud {
         // `M2_NO_MULTIPLY`: leave the multiplying triangles out, to see
         // what they do.
         let no_multiply = std::env::var_os("M2_NO_MULTIPLY").is_some();
-        for p in &self.prims {
+        for p in prims {
             if p.multiply {
                 if no_multiply {
                     continue;
@@ -1975,6 +1996,7 @@ impl Thread {
         let mut prims = Vec::new();
         let mut want = Vec::new();
         let mut movie = None;
+        let mut under = 0;
         for item in &items {
             match item {
                 DrawItem::Movie {
@@ -1982,7 +2004,10 @@ impl Thread {
                     rect,
                     playing: true,
                     ..
-                } => movie = Some((file.clone(), *rect)),
+                } => {
+                    movie = Some((file.clone(), *rect));
+                    under = prims.len();
+                }
                 _ => self.prims(item, state, &mut prims, &mut want),
             }
         }
@@ -2008,7 +2033,11 @@ impl Thread {
             images,
             log,
             callbacks: Vec::new(),
-            shell: ShellNews { movie, new_game },
+            shell: ShellNews {
+                movie,
+                under,
+                new_game,
+            },
         }
     }
 
