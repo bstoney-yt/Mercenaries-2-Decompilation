@@ -297,6 +297,17 @@ impl Player {
         out
     }
 
+    /// Takes `model` as her body, with its rig's fight `clips`: a jump,
+    /// throw or bash under way played the old rig's clips by index, so it
+    /// stops.
+    pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips) {
+        self.model = model;
+        self.clips = clips;
+        self.leap = Leap::No;
+        self.throwing = None;
+        self.bashing = None;
+    }
+
     /// Starts throwing a grenade, if she has a throw to play and isn't
     /// throwing already: the seconds until it leaves her hand. `None`
     /// without the clip (the grenade goes at once).

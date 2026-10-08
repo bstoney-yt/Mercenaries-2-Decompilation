@@ -1162,9 +1162,13 @@ impl Scene {
             "hero: {hero} walks {:.2}, runs {:.2}, sprints {:.2} m/s",
             speeds[0], speeds[1], speeds[2]
         );
+        // The weapons already loaded were held by the last body's
+        // skeleton.
+        if let Some((_, rig)) = &model {
+            self.arsenal.rehold(rig);
+        }
         if let Some(player) = &mut self.player {
-            player.model = model;
-            player.clips = clips;
+            player.set_body(model, clips);
             player.speeds = speeds;
         }
     }

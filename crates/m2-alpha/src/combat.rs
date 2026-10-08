@@ -560,26 +560,66 @@ impl Arsenal {
         muzzle: Vec3,
         rig: Option<&Rig>,
     ) -> WeaponModel {
-        let (grip, grip_hand) = match rig.and_then(|r| grip(r, muzzle)) {
-            Some((m, hand)) => (m, Some(hand)),
-            None => (Mat4::IDENTITY, None),
-        };
-        let carry = rig.and_then(|r| carry(r, muzzle));
-        if let Some(r) = rig {
-            self.hand = r.rifle_hand();
-            self.attach = right_attach(&r.skeleton);
-            self.back = BACK_ATTACH.map(|h| node(&r.skeleton, h));
-            self.spine = node(&r.skeleton, SPINE);
-            self.neck = node(&r.skeleton, NECK);
-        }
-        WeaponModel {
+        let mut w = WeaponModel {
             model,
             muzzle,
-            grip,
-            grip_hand,
-            carry,
+            grip: Mat4::IDENTITY,
+            grip_hand: None,
+            carry: None,
             hang: if launcher { HANG_LAUNCHER } else { HANG_DOWN },
+        };
+        if let Some(r) = rig {
+            self.nodes_of(r);
+            fit(&mut w, r);
         }
+        w
+    }
+
+    /// Every weapon held in `rig`'s hands and hung on its back from now
+    /// on, in place of the rig they were held by: a new hero's skeleton
+    /// has its own nodes (Mattias's 116 are not Jennifer's 92), and the
+    /// weapons mostly load during the front end, before the hero is
+    /// picked, so they were held by the default hero's.
+    pub fn rehold(&mut self, rig: &Rig) {
+        self.nodes_of(rig);
+        let named = [
+            &mut self.rifle,
+            &mut self.rpg,
+            &mut self.rocket,
+            &mut self.grenade,
+            &mut self.launcher,
+            &mut self.round,
+            &mut self.carbine,
+            &mut self.designator,
+            &mut self.bullpup,
+        ];
+        for w in named
+            .into_iter()
+            .flatten()
+            .chain(self.by_model.values_mut())
+        {
+            fit(w, rig);
+        }
+        eprintln!(
+            "weapons: held by a {}-node skeleton: hand {:?}, attach {:?}, back {:?}, spine {:?}, neck {:?}",
+            rig.skeleton.len(),
+            self.hand,
+            self.attach,
+            self.back,
+            self.spine,
+            self.neck
+        );
+    }
+
+    /// The hand, attach point, back, spine and neck nodes of `rig`'s
+    /// skeleton.
+    fn nodes_of(&mut self, rig: &Rig) {
+        let s = &rig.skeleton;
+        self.hand = rig.rifle_hand();
+        self.attach = right_attach(s);
+        self.back = BACK_ATTACH.map(|h| node(s, h));
+        self.spine = node(s, SPINE);
+        self.neck = node(s, NECK);
     }
 
     /// The model of her rifle `rifle`: else the carbine's, else the
@@ -761,6 +801,16 @@ fn palm(skeleton: &Skeleton, nodes: &[Mat4], hand: usize) -> Vec3 {
         Some(f) => at(hand).lerp(at(f), 0.6),
         None => at(hand),
     }
+}
+
+/// Weapon `w`'s hold in `rig`'s hands, two-handed and carried
+/// ([`grip`], [`carry`]).
+fn fit(w: &mut WeaponModel, rig: &Rig) {
+    (w.grip, w.grip_hand) = match grip(rig, w.muzzle) {
+        Some((m, hand)) => (m, Some(hand)),
+        None => (Mat4::IDENTITY, None),
+    };
+    w.carry = carry(rig, w.muzzle);
 }
 
 /// Where a weapon with its muzzle at `muzzle` sits in the aim clip's
@@ -3854,6 +3904,68 @@ mod tests {
             at.transform_point3(Vec3::new(0.0, 0.0, -0.3)).z < point.z,
             "behind her"
         );
+    }
+
+    #[test]
+    fn a_new_hero_holds_the_weapons_in_his_own_hands() {
+        // Two skeletons with the hands, attach points, back and neck at
+        // different nodes, as Jennifer's and Mattias's have.
+        let rig_of = |names: Vec<u32>| {
+            let n = names.len();
+            let mut r = rig();
+            r.skeleton = std::sync::Arc::new(Skeleton {
+                name_hashes: names,
+                parents: (0..n).map(|i| i.checked_sub(1)).collect(),
+                rest: vec![
+                    m2_engine::anim::Local {
+                        translation: Vec3::ZERO,
+                        rotation: Quat::IDENTITY,
+                        scale: Vec3::ONE,
+                    };
+                    n
+                ],
+                inverse_bind: vec![Mat4::IDENTITY; n],
+            });
+            r
+        };
+        let hers = rig_of(vec![1, RIGHT_HAND, RIGHT_ATTACH, LEFT_HAND, SPINE, NECK]);
+        let [back_right, back_left] = BACK_ATTACH;
+        let his = rig_of(vec![
+            1,
+            2,
+            3,
+            SPINE,
+            NECK,
+            LEFT_HAND,
+            4,
+            RIGHT_HAND,
+            RIGHT_ATTACH,
+            back_right,
+            back_left,
+        ]);
+        let mut arsenal = Arsenal::default();
+        arsenal.add("m4", crate::npc::tests::empty_model(), Vec3::Z, Some(&hers));
+        assert_eq!((arsenal.hand, arsenal.attach), (Some(1), Some(2)));
+        arsenal.rehold(&his);
+        assert_eq!((arsenal.hand, arsenal.attach), (Some(7), Some(8)));
+        assert_eq!(arsenal.back, [Some(9), Some(10)]);
+        assert_eq!((arsenal.spine, arsenal.neck), (Some(3), Some(4)));
+        // Drawn at his right hand's attach point, not at the node hers
+        // was (his left hand's neighbour).
+        let nodes: Vec<Mat4> = (0..11)
+            .map(|i| Mat4::from_translation(Vec3::X * i as f32))
+            .collect();
+        let w = arsenal.carbine.as_ref().unwrap();
+        let at = arsenal
+            .in_hand(
+                w,
+                Mat4::IDENTITY,
+                &nodes,
+                (arsenal.hand, arsenal.attach),
+                false,
+            )
+            .unwrap();
+        assert_eq!(at.w_axis.x, 8.0);
     }
 
     #[test]
