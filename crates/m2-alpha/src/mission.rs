@@ -1480,13 +1480,20 @@ pub(crate) fn template_models(
     match templates.get(name) {
         Some(&TemplateInfo {
             model: Some(model),
-            vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank | VehicleKind::Boat)),
+            vehicle:
+                Some(
+                    kind @ (VehicleKind::Car
+                    | VehicleKind::Tank
+                    | VehicleKind::Boat
+                    | VehicleKind::Helicopter),
+                ),
             ..
         }) => vec![CatalogueEntry {
             model,
             kind: match kind {
                 VehicleKind::Tank => "tank",
                 VehicleKind::Boat => m2_engine::vehicle::BOAT,
+                VehicleKind::Helicopter => m2_engine::vehicle::HELICOPTER,
                 _ => "car",
             }
             .to_owned(),

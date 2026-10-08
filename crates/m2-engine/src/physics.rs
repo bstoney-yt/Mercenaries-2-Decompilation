@@ -30,6 +30,7 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
+use crate::tuning::FlightTuning;
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
 
@@ -764,6 +765,21 @@ const CLIMB: f32 = 0.52;
 /// almost any hill"; the steepness is invented).
 const CLIMB_TRACKED: f32 = 0.87;
 
+/// A helicopter's turn at full stick, of its template's `maxYawSpeed`
+/// (whose units are unknown): the AH-1Z's 3.5 gives 1.2 radians a second.
+/// Inferred; check against footage.
+const YAW_SHARE: f32 = 0.35;
+/// How quickly a helicopter's speed follows the stick, a second: across
+/// and along, and up and down. Inferred.
+const FLY_EASE: f32 = 0.6;
+const CLIMB_EASE: f32 = 1.5;
+/// How quickly it leans to the tilt its stick asks, a second (its
+/// template's `PitchAccel` and `RollAccel` scale it).
+const LEAN_EASE: f32 = 3.0;
+/// A helicopter's body is at most this wide, metres either side: its hull
+/// box leaves the rotor disc out.
+const FUSELAGE_HALF: f32 = 1.6;
+
 /// A vehicle in the physics world.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VehicleId(usize);
@@ -796,6 +812,16 @@ struct VehicleBody {
     before: Vec3,
     /// A boat's: it floats instead of rolling on wheels.
     hull: Option<Hull>,
+    /// A helicopter's: it flies.
+    rotor: Option<Rotorcraft>,
+}
+
+/// A helicopter's handling and what its pilot asks of it.
+struct Rotorcraft {
+    flight: FlightTuning,
+    controls: VehicleControls,
+    /// Up (1) or down (-1).
+    lift: f32,
 }
 
 /// A boat's hull in the water: the points on its waterline that float it,
@@ -1042,6 +1068,7 @@ impl Physics {
             v.controller.update_vehicle(dt, queries);
         }
         self.float_boats(dt);
+        self.fly_helicopters(dt);
         self.world.step();
         self.hold_ragdolls_together();
         self.settle_debris();
@@ -1143,6 +1170,57 @@ impl Physics {
             let yaw = yaw + (want - yaw) * (3.0 * dt * wet).min(1.0);
             let rock = (spin - up * spin.dot(up)) * ease(BOAT_ROCK);
             b.set_angvel(vector(rock + up * yaw), true);
+        }
+    }
+
+    /// Flies helicopters as their pilots ask: speed along, up and down
+    /// eases to what the stick asks of the template's fastest
+    /// (`MaxFwdSpeed`, `MaxElevationSpeed`), it turns at its share of
+    /// `maxYawSpeed`, dips its nose to `MaxPitch` flying forwards and
+    /// banks to `MaxRollBank` turning at speed. With nobody flying it (or
+    /// wrecked) its rotor stops holding it up and it falls.
+    fn fly_helicopters(&mut self, dt: f32) {
+        for v in self.vehicles.iter().flatten() {
+            let Some(r) = v.rotor.as_ref().filter(|_| !v.held) else {
+                continue;
+            };
+            let Some(b) = self.world.bodies.get_mut(v.controller.chassis) else {
+                continue;
+            };
+            let c = r.controls;
+            if v.wrecked || c.parked {
+                b.set_gravity_scale(1.0, true);
+                continue;
+            }
+            b.set_gravity_scale(0.0, true);
+            let f = r.flight;
+            let turn = Quat::from_array(b.position().rotation.to_array());
+            let ahead = (turn * Vec3::Z).with_y(0.0).normalize_or(Vec3::Z);
+            let heading = ahead.x.atan2(ahead.z);
+            let velocity = vec3(b.linvel());
+            let flat = velocity.with_y(0.0);
+            let throttle = c.throttle.clamp(-1.0, 1.0);
+            let steer = c.steer.clamp(-1.0, 1.0);
+            let want = ahead * throttle * f.forward;
+            let flat = flat + (want - flat) * (FLY_EASE * dt).min(1.0);
+            let rise = velocity.y
+                + (r.lift.clamp(-1.0, 1.0) * f.climb - velocity.y) * (CLIMB_EASE * dt).min(1.0);
+            b.set_linvel(vector(flat + Vec3::Y * rise), true);
+            // Nose down flying forwards; right side down turning right at
+            // speed (+x is its left).
+            let bank = (flat.length() / f.bank_speed.max(1.0)).min(1.0);
+            let lean = Quat::from_rotation_y(heading)
+                * Quat::from_rotation_x(throttle * f.pitch)
+                * Quat::from_rotation_z(steer * f.roll_bank * bank);
+            let mut error = lean * turn.inverse();
+            if error.w < 0.0 {
+                error = -error;
+            }
+            let (axis, angle) = error.to_axis_angle();
+            let rate = LEAN_EASE * 0.5 * (f.pitch_accel + f.roll_accel);
+            let yaw = -steer * f.yaw * YAW_SHARE;
+            let spin = (axis * angle * rate).with_y(0.0) + Vec3::Y * yaw;
+            b.set_angvel(vector(spin), true);
         }
     }
 
@@ -1321,12 +1399,15 @@ impl Physics {
             .map(|w| w.centre.y)
             .fold(lo.y, f32::max)
             .min(hi.y - 0.2);
-        let half = Vec3::new(
+        let mut half = Vec3::new(
             (hi.x - lo.x) * 0.5,
             (hi.y - floor) * 0.5,
             (hi.z - lo.z) * 0.5,
         )
         .max(Vec3::splat(0.1));
+        if spec.is_helicopter() {
+            half.x = half.x.min(FUSELAGE_HALF);
+        }
         let centre = Vec3::new((lo.x + hi.x) * 0.5, floor + half.y, (lo.z + hi.z) * 0.5);
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
@@ -1405,6 +1486,18 @@ impl Physics {
                 controls: VehicleControls::default(),
             }
         });
+        let rotor = spec
+            .tuning
+            .flight
+            .filter(|_| spec.is_helicopter())
+            .map(|flight| Rotorcraft {
+                flight,
+                controls: VehicleControls {
+                    parked: true,
+                    ..VehicleControls::default()
+                },
+                lift: 0.0,
+            });
         let top = if boat { BOAT_TOP } else { TOP_SPEED };
         let id = VehicleId(self.vehicles.len());
         self.vehicles.push(Some(VehicleBody {
@@ -1417,6 +1510,7 @@ impl Physics {
             held: false,
             before: Vec3::ZERO,
             hull,
+            rotor,
         }));
         id
     }
@@ -1441,9 +1535,14 @@ impl Physics {
         else {
             return;
         };
-        // A boat is driven as it floats (`float_boats`).
+        // A boat is driven as it floats (`float_boats`), a helicopter as
+        // it flies (`fly_helicopters`).
         if let Some(hull) = &mut v.hull {
             hull.controls = controls;
+            return;
+        }
+        if let Some(rotor) = &mut v.rotor {
+            rotor.controls = controls;
             return;
         }
         let speed = v.controller.current_vehicle_speed;
@@ -1537,6 +1636,27 @@ impl Physics {
             let keep = w - up * w.dot(up);
             body.set_angvel(keep + up * rate, true);
         }
+    }
+
+    /// Asks a helicopter to climb (1) or come down (-1), as fast as it
+    /// can; 0 holds its height.
+    pub fn fly(&mut self, id: VehicleId, lift: f32) {
+        if let Some(r) = self
+            .vehicles
+            .get_mut(id.0)
+            .and_then(Option::as_mut)
+            .and_then(|v| v.rotor.as_mut())
+        {
+            r.lift = lift;
+        }
+    }
+
+    /// Whether a vehicle flies (a helicopter with its template's handling).
+    pub fn flies(&self, id: VehicleId) -> bool {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|v| v.rotor.is_some())
     }
 
     /// Model-to-world transform of a vehicle.
@@ -2437,6 +2557,7 @@ mod tests {
             elevation: (0.0, 0.0),
             hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             turret_box: None,
+            rotors: Vec::new(),
             tuning: crate::VehicleTuning::default(),
         }
     }
@@ -2451,6 +2572,126 @@ mod tests {
             mass: 2000.0,
             ..car()
         }
+    }
+
+    fn helicopter() -> VehicleSpec {
+        let hull = (Vec3::new(-6.0, 0.0, -7.0), Vec3::new(6.0, 3.5, 7.0));
+        VehicleSpec {
+            kind: crate::vehicle::HELICOPTER.into(),
+            wheels: Vec::new(),
+            bounds: hull,
+            hull,
+            mass: 8300.0,
+            tuning: crate::VehicleTuning {
+                // The AH-1Z's.
+                flight: Some(crate::tuning::FlightTuning {
+                    climb: 25.0,
+                    forward: 30.0,
+                    sideways: 30.0,
+                    yaw: 3.5,
+                    low_speed: 25.0,
+                    low_speed_yaw: 6.5,
+                    pitch: 0.4,
+                    pitch_accel: 0.9,
+                    roll_side: 0.3,
+                    roll_bank: 0.3,
+                    roll_accel: 1.0,
+                    bank_speed: 25.0,
+                }),
+                ..Default::default()
+            },
+            ..car()
+        }
+    }
+
+    #[test]
+    fn a_helicopter_climbs_flies_turns_and_falls_unflown() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(2000.0, 1.0, 2000.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let id = p.add_vehicle(&helicopter(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        assert!(p.flies(id));
+        let place = |p: &Physics| p.vehicle_transform(id).unwrap();
+        // Parked, it sits on the ground.
+        for _ in 0..120 {
+            p.drive(
+                id,
+                VehicleControls {
+                    parked: true,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        assert!(
+            place(&p).w_axis.y.abs() < 0.3,
+            "sits at {}",
+            place(&p).w_axis.y
+        );
+        // Flown up for two seconds: well off the ground, still level.
+        let flown = |throttle: f32, steer: f32| VehicleControls {
+            throttle,
+            steer,
+            ..Default::default()
+        };
+        p.fly(id, 1.0);
+        for _ in 0..120 {
+            p.drive(id, flown(0.0, 0.0));
+            p.step(DT);
+        }
+        let up = place(&p).w_axis.y;
+        assert!(up > 20.0, "climbed to {up}");
+        assert!(place(&p).transform_vector3(Vec3::Y).y > 0.99, "level");
+        // Let go of the climb: it slows to a hover.
+        p.fly(id, 0.0);
+        for _ in 0..240 {
+            p.drive(id, flown(0.0, 0.0));
+            p.step(DT);
+        }
+        let up = place(&p).w_axis.y;
+        assert!(p.vehicle_velocity(id).length() < 0.5, "hovers");
+        // Holding its height, flat out ahead: fast, nose down.
+        for _ in 0..600 {
+            p.drive(id, flown(1.0, 0.0));
+            p.step(DT);
+        }
+        let m = place(&p);
+        let v = p.vehicle_velocity(id);
+        assert!(v.with_y(0.0).length() > 25.0, "flies at {v}");
+        assert!(
+            (m.w_axis.y - up).abs() < 3.0,
+            "held its height: {}",
+            m.w_axis.y
+        );
+        assert!(m.transform_vector3(Vec3::Z).y < -0.3, "nose down");
+        // Steering right turns it right (clockwise from above) and banks
+        // it right side down.
+        let before = m.transform_vector3(Vec3::Z);
+        for _ in 0..30 {
+            p.drive(id, flown(1.0, 1.0));
+            p.step(DT);
+        }
+        let m = place(&p);
+        let after = m.transform_vector3(Vec3::Z);
+        assert!(before.cross(after).y < 0.0, "turned right");
+        assert!(m.transform_vector3(Vec3::X).y > 0.05, "banked");
+        // Nobody flying it: it falls.
+        for _ in 0..60 {
+            p.drive(
+                id,
+                VehicleControls {
+                    parked: true,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        assert!(p.vehicle_velocity(id).y < -5.0, "falls");
     }
 
     #[test]

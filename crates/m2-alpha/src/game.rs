@@ -30,6 +30,9 @@ struct Spot<'a> {
     yaw: f32,
 }
 
+/// How fast a flown helicopter's rotors turn, radians a second (about five
+/// turns; invented, the rotor blur hides it).
+const ROTOR_SPIN: f32 = 30.0;
 /// How fast a turret turns after the camera, and its gun tilts to the
 /// crosshair, radians a second, when its template doesn't say (invented).
 const TURRET_RATE: f32 = 1.2;
@@ -373,6 +376,10 @@ impl Game {
                             parked: false,
                         },
                     );
+                    physics.fly(
+                        id,
+                        f32::from(u8::from(intent.hold_jump)) - f32::from(u8::from(intent.lower)),
+                    );
                     if intent.right_vehicle {
                         physics.right_vehicle(id);
                     }
@@ -457,7 +464,14 @@ impl Game {
                         world.physics.hold_vehicle(id, false);
                     }
                 }
-                v.rolled += world.physics.vehicle_speed(id) * dt;
+                if v.spec.is_helicopter() {
+                    // Her helicopter's rotors turn; parked ones stand.
+                    if driven == Some(i) && !v.wrecked {
+                        v.rolled += ROTOR_SPIN * dt;
+                    }
+                } else {
+                    v.rolled += world.physics.vehicle_speed(id) * dt;
+                }
                 // Nobody at the wheel: it brakes to a stop and stays put,
                 // on a hill too (a wreck drags on its rims, driven by
                 // nobody).
