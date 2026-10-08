@@ -923,6 +923,27 @@ impl Scene {
         Ok(())
     }
 
+    /// The hero's own rifle: the gun their template's `EquipmentLink`s
+    /// hand them.
+    pub fn hero_rifle(&self) -> Option<crate::combat::Rifle> {
+        let db = &self.world.as_ref()?.index.template_db;
+        let (name, gun) = db.own_rifle(self.hero.template())?;
+        Some(crate::combat::Rifle::of(name, &gun))
+    }
+
+    /// What blasts and rounds do to the hero, by the game's damage table's
+    /// `Hero` row (all three heroes' `ModifierKey`).
+    pub fn hero_damage(&self) -> crate::combat::HeroDamage {
+        let db = self.world.as_ref().map(|w| &w.index.template_db);
+        let scale = |key: &str| db.and_then(|db| db.damage_scale("Hero", key));
+        let known = crate::combat::HeroDamage::default();
+        crate::combat::HeroDamage {
+            explosion: scale("Explosion").unwrap_or(known.explosion),
+            explosion_large: scale("ExplosionLarge").unwrap_or(known.explosion_large),
+            bullet_large: scale("BulletLarge").unwrap_or(known.bullet_large),
+        }
+    }
+
     /// The hero's `Health` when whole, from their template.
     pub fn hero_health(&self) -> Option<f32> {
         self.world
@@ -1459,16 +1480,15 @@ impl Scene {
             model.draw_posed(backend, queue, body, &nodes, &skin)?;
             // Throwing, her weapon is put away and the grenade is in her
             // hand until it goes; calling a support strike, the
-            // designator is. Her rifle is the carbine (soldiers' the
-            // AK47).
+            // designator is. Her rifle is her own or the carbine
+            // ([`crate::combat::Rifle`]).
             let weapon = match (player.throwing, fight.weapon) {
-                _ if fight.designator => &self.arsenal.designator,
-                (Some(_), _) if fight.grenade_in_hand() => &self.arsenal.grenade,
-                (Some(_), _) => &None,
-                (None, Weapon::Rifle) if self.arsenal.carbine.is_some() => &self.arsenal.carbine,
-                (None, Weapon::Rifle) => &self.arsenal.rifle,
-                (None, Weapon::Rpg) => &self.arsenal.rpg,
-                (None, Weapon::GrenadeLauncher) => &self.arsenal.launcher,
+                _ if fight.designator => self.arsenal.designator.as_ref(),
+                (Some(_), _) if fight.grenade_in_hand() => self.arsenal.grenade.as_ref(),
+                (Some(_), _) => None,
+                (None, Weapon::Rifle) => self.arsenal.hers(&fight.rifle),
+                (None, Weapon::Rpg) => self.arsenal.rpg.as_ref(),
+                (None, Weapon::GrenadeLauncher) => self.arsenal.launcher.as_ref(),
             };
             if !player.down
                 && let Some(w) = weapon
@@ -1486,11 +1506,10 @@ impl Scene {
             let holding = !fight.designator && player.throwing.is_none() && !player.down;
             for (slot, slung) in fight.slung(holding).into_iter().enumerate() {
                 let model = match slung {
-                    Some(Weapon::Rifle) if self.arsenal.carbine.is_some() => &self.arsenal.carbine,
-                    Some(Weapon::Rifle) => &self.arsenal.rifle,
-                    Some(Weapon::Rpg) => &self.arsenal.rpg,
-                    Some(Weapon::GrenadeLauncher) => &self.arsenal.launcher,
-                    None => &None,
+                    Some(Weapon::Rifle) => self.arsenal.hers(&fight.rifle),
+                    Some(Weapon::Rpg) => self.arsenal.rpg.as_ref(),
+                    Some(Weapon::GrenadeLauncher) => self.arsenal.launcher.as_ref(),
+                    None => None,
                 };
                 if let Some(w) = model
                     && let Some(at) = self.arsenal.on_back(w, body, &nodes, slot)
