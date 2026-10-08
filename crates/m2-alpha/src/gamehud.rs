@@ -1042,8 +1042,14 @@ impl GameHud {
                 ));
             }
         };
+        // `M2_NO_MULTIPLY`: leave the multiplying triangles out, to see
+        // what they do.
+        let no_multiply = std::env::var_os("M2_NO_MULTIPLY").is_some();
         for p in &self.prims {
             if p.multiply {
+                if no_multiply {
+                    continue;
+                }
                 if p.texture.is_some_and(|h| !self.pixels.contains_key(&h)) {
                     continue;
                 }
