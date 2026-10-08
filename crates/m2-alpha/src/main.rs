@@ -2175,6 +2175,13 @@ fn front_end_offscreen(
             picture = true;
         }
         if picture {
+            if let Some((m, rect)) = &backdrop {
+                eprintln!(
+                    "front end: backdrop {} frame {:?} in {rect:?}",
+                    m.name,
+                    m.frame.as_ref().map(|(n, _)| n)
+                );
+            }
             render(
                 &mut backend,
                 &mut game,
