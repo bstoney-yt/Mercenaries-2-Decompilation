@@ -144,6 +144,12 @@ if guid then
         nRed = r, nGreen = g, nBlue = b, nAlpha = a, bInvert = invert })
 end
 "#;
+/// `FactionZone`'s `TrespassStateChange`, sent to the HUD's handlers.
+const TRESPASS_EVENT: &str = r#"
+local inside, faction = ...
+MrxGui.SendEvent({ EventType = "TrespassStateChange", bTrespassing = inside,
+    sFaction = faction })
+"#;
 const REMOVE_REGION: &str = r#"
 local guid = Pg.GetGuidByName(...)
 if guid then
@@ -448,6 +454,12 @@ pub struct HudState {
     /// The contract's objectives for the PDA: text id and icon tag each
     /// (`MissionView::pda_objectives`).
     pub pda_objectives: Vec<(String, String)>,
+    /// What the faction zones last told the HUD (`MissionView::trespass`).
+    pub trespass: crate::mission::Trespass,
+    /// Whether vehicle disguises work, and her disguise while one holds:
+    /// how much is left (0..=100) and whether it holds.
+    pub vehicle_disguise: bool,
+    pub disguise: Option<(f32, bool)>,
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -1150,6 +1162,8 @@ struct Told {
     satellite: bool,
     /// What the tutorial box says (None: never anything).
     tutorial: Option<Option<String>>,
+    trespass: crate::mission::Trespass,
+    disguise: Option<Option<(f32, bool)>>,
 }
 
 /// How far (in -1..=1 screen units, across plus up) the aim point moves
@@ -1997,6 +2011,9 @@ impl Thread {
             self.told.hp = Some(hp);
             fire(lua, "GuiHealthUpdate", (hp.0, 100, hp.1))?;
         }
+        // Before the vehicle box hears of the vehicle: it shows the gauge
+        // then if disguises work.
+        self.mission.world().borrow_mut().vehicle_disguise = s.vehicle_disguise;
         if self.told.vehicle.as_ref() != Some(&s.vehicle) {
             self.told.vehicle = Some(s.vehicle.clone());
             let (name, faction) = match &s.vehicle {
@@ -2010,6 +2027,24 @@ impl Thread {
                 None => (Value::Boolean(false), Value::Nil),
             };
             fire(lua, "GuiVehicleNameUpdate", (name, faction))?;
+        }
+        // The disguise gauge in the vehicle box shows only while disguises
+        // work (`Player.GetVehicleDisguise`); the engine tells it how much
+        // of her disguise is left and whether it holds.
+        if self.told.disguise != Some(s.disguise) {
+            self.told.disguise = Some(s.disguise);
+            self.mission.world().borrow_mut().disguise = s.disguise;
+            if let Some((level, held)) = s.disguise {
+                fire(lua, "GuiVehicleDisguiseUpdate", (f64::from(level), held))?;
+            }
+        }
+        // A faction zone's word to the HUD, sent on as the zone's script
+        // sent it: the trespass icon by the radar and its map label.
+        if self.told.trespass != s.trespass {
+            self.told.trespass = s.trespass.clone();
+            lua.load(TRESPASS_EVENT)
+                .set_name("=m2-hud trespass")
+                .call::<()>((s.trespass.inside, s.trespass.faction.clone()))?;
         }
         let holding = s.support.designator.is_some();
         let cannon = s.in_vehicle && s.cannon.is_some();
@@ -2138,6 +2173,9 @@ impl Thread {
                 .call::<()>(r.name.as_str())?;
         }
         for r in s.radar_regions.iter().filter(|r| !told.contains(r)) {
+            // A region of a layer this view hasn't loaded (a contract's
+            // faction zone): taken in, outline and all.
+            self.mission.adopt(&r.name);
             let [red, green, blue, alpha] = r.colour;
             lua.load(ADD_REGION)
                 .set_name("=m2-hud region")

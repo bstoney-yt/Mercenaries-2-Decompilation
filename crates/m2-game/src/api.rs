@@ -54,6 +54,9 @@ pub struct Object {
     /// Fuel for the player's support (`Player.GetFuel`), in the units of
     /// `Player.GetFuelCapacity`.
     pub fuel: f32,
+    /// The faction it belongs to (`Ai.GetFactionGuid`): the name hash of
+    /// the faction's template (`"VZ"`), as the HUD's faction guids are.
+    pub faction: Option<u32>,
 }
 
 impl Object {
@@ -371,6 +374,14 @@ pub struct ScriptWorld {
     pub buttons: Vec<(f64, String)>,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
+    /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
+    /// mission flow turns them off for a new game and back on only once
+    /// OilCon021 is done, so off until a script says otherwise.
+    pub vehicle_disguise: bool,
+    /// Her disguise while she drives another faction's vehicle with
+    /// disguises on: how much is left (0..=100) and whether it holds.
+    /// `None` out of one.
+    pub disguise: Option<(f32, bool)>,
 }
 
 impl ScriptWorld {
@@ -726,6 +737,13 @@ fn category(v: Option<&Value>) -> Option<String> {
     }
 }
 
+/// The factions' templates' names: their name hashes are the factions'
+/// guids (`MrxGuiHudVehicleDisguise.Init`'s faction textures are keyed by
+/// them).
+pub const FACTIONS: [&str; 9] = [
+    "Allied", "China", "Civ", "Guerilla", "OC", "Pirate", "PMC", "VZ", "Police",
+];
+
 /// [`Object.GetHibernationDistance`]'s answer, metres.
 const HIBERNATION_DISTANCE: f64 = 155.0;
 
@@ -934,6 +952,14 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let object = lib("Object")?;
+    // Whether the player passes for her vehicle's faction (the faction
+    // manager then takes the vehicle's faction for hers).
+    add(&object, "IsDisguised", |w, _, a| {
+        let her = id(a.first()).is_some_and(|g| Some(g) == w.player);
+        values([Value::Boolean(
+            her && w.disguise.is_some_and(|(_, held)| held),
+        )])
+    })?;
     add(&object, "GetPosition", |w, _, a| {
         match id(a.first()).and_then(|g| w.objects.get(&g)) {
             Some(o) => values(o.position.map(|c| Value::Number(f64::from(c)))),
@@ -1197,10 +1223,16 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     add(&object, "GetName", |w, lua, a| {
-        let o = id(a.first()).and_then(|g| w.objects.get(&g));
-        values([match o {
-            Some(o) => Value::String(lua.create_string(&o.name)?),
-            None => Value::Nil,
+        let g = id(a.first());
+        let o = g.and_then(|g| w.objects.get(&g));
+        values([match (o, g) {
+            (Some(o), _) => Value::String(lua.create_string(&o.name)?),
+            // A faction's name as the faction zones look it up: keyed by
+            // `String.GetHash` of the name, which its guid already is.
+            (None, Some(g)) if FACTIONS.iter().any(|f| m2_assets::name_hash(f) == g) => {
+                Value::Number(f64::from(g))
+            }
+            _ => Value::Nil,
         }])
     })?;
     // Winches: cargo hangs under a helicopter until it is let go.
@@ -1349,10 +1381,29 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         let p = id(a.first()).or(w.player);
         values([guid_value(p.map(|p| w.vehicle_of(p).unwrap_or(p)))])
     })?;
-    // Whether her vehicle passes for the enemy's: the play has no
-    // disguises, so the vehicle box shows no disguise meter.
-    add(&player, "GetVehicleDisguise", |_, _, _| {
-        values([Value::Boolean(false)])
+    // Whether vehicle disguises work at all: the vehicle box shows its
+    // disguise gauge only then. `MrxMissionFlow.SetVehicleDisguiseEnabled`
+    // passes a boolean; 0 or 1 are taken too.
+    add(&player, "SetVehicleDisguise", |w, _, a| {
+        w.vehicle_disguise = match a.first() {
+            Some(Value::Boolean(b)) => *b,
+            v => num(v).is_some_and(|n| n != 0.0),
+        };
+        if !w.vehicle_disguise {
+            w.disguise = None;
+        }
+        values([])
+    })?;
+    add(&player, "GetVehicleDisguise", |w, _, _| {
+        values([Value::Boolean(w.vehicle_disguise)])
+    })?;
+    // `{ Player = character }`: whether her disguise holds, nil out of a
+    // disguise (the disguise tutorial tells the two apart by
+    // `tostring`).
+    add(&player, "GetVehicleDisguiseState", |w, _, _| {
+        values([w
+            .disguise
+            .map_or(Value::Nil, |(_, held)| Value::Boolean(held))])
     })?;
     // One player slot; the game creates the player itself.
     add(&player, "GetMaximumPlayers", |_, _, _| {
@@ -1517,6 +1568,10 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     })?;
 
     let ai = lib("Ai")?;
+    add(&ai, "GetFactionGuid", |w, _, a| {
+        let faction = id(a.first()).and_then(|g| w.objects.get(&g)?.faction);
+        values([guid_value(faction)])
+    })?;
     // How one faction's AI regards another, -100 (hostile) to 100
     // (friendly), as the faction manager sets it (`Ai.SetRelation(a, b,
     // value)`); the faction manager reads attitudes back from it. Pairs
@@ -2490,6 +2545,81 @@ mod tests {
         assert!(events.update_shared(0.1, &world).is_empty());
         let arrived: String = host.lua().globals().get("arrived").unwrap();
         assert_eq!(arrived, "1@70");
+    }
+
+    #[test]
+    fn an_any_boundary_tells_its_callback_each_way_she_crosses() {
+        let (host, world) = setup();
+        {
+            let mut w = world.borrow_mut();
+            let mut zone = Object::new("RGN_Zone", [100.0, 0.0, 100.0]);
+            zone.faction = Some(m2_assets::name_hash("VZ"));
+            w.insert(70, zone);
+            let corners = vec![[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]];
+            w.regions.insert(
+                70,
+                m2_assets::Region {
+                    flags: 0x0004_0002,
+                    unk_0x04: 0,
+                    corners,
+                },
+            );
+        }
+        let events = crate::events::Events::default();
+        events.install(host.lua()).unwrap();
+        host.lua()
+            .load(
+                r#"
+                crossed = {}
+                local zone = Pg.GetGuidByName("RGN_Zone")
+                faction = Object.GetName(Ai.GetFactionGuid(zone))
+                Event.CreatePersistent(Event.Boundary,
+                    {Player.GetLocalCharacter(), zone, "any", false},
+                    function(tag, who, where, how)
+                        crossed[#crossed + 1] = tag .. " " .. how
+                    end, {"zone"})
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let faction: f64 = host.lua().globals().get("faction").unwrap();
+        assert_eq!(faction as u32, m2_assets::name_hash("VZ"));
+        let crossed = || -> Vec<String> { host.lua().globals().get("crossed").unwrap() };
+        assert!(events.update_shared(0.1, &world).is_empty());
+        assert!(crossed().is_empty());
+        let walk = |at: [f32; 3]| {
+            world.borrow_mut().objects.get_mut(&1).unwrap().position = at;
+            assert!(events.update_shared(0.1, &world).is_empty());
+        };
+        walk([103.0, 0.0, 98.0]);
+        walk([104.0, 0.0, 99.0]);
+        walk([120.0, 0.0, 99.0]);
+        walk([101.0, 0.0, 101.0]);
+        assert_eq!(crossed(), ["zone enter", "zone exit", "zone enter"]);
+    }
+
+    #[test]
+    fn vehicle_disguises_work_once_a_script_turns_them_on() {
+        let (host, world) = setup();
+        let ask = |code: &str| -> Value { host.lua().load(code).eval().unwrap() };
+        assert_eq!(
+            ask("return Player.GetVehicleDisguise()"),
+            Value::Boolean(false)
+        );
+        assert_eq!(ask("return Player.GetVehicleDisguiseState({})"), Value::Nil);
+        ask("Player.SetVehicleDisguise(true)");
+        assert_eq!(
+            ask("return Player.GetVehicleDisguise()"),
+            Value::Boolean(true)
+        );
+        world.borrow_mut().disguise = Some((80.0, true));
+        assert_eq!(
+            ask("return Object.IsDisguised(Player.GetLocalCharacter())"),
+            Value::Boolean(true)
+        );
+        ask("Player.SetVehicleDisguise(false)");
+        assert_eq!(world.borrow().disguise, None);
+        assert_eq!(ask("return Player.GetVehicleDisguiseState({})"), Value::Nil);
     }
 
     #[test]

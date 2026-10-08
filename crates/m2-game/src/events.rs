@@ -537,6 +537,31 @@ impl Events {
                         }
                         (!rising.is_empty()).then_some(rising)
                     }
+                    // `held_by` keeps who was inside at the last check
+                    // (none before the first: one inside then enters).
+                    Check::Crossings(members) => {
+                        let lua = s.lua.0.as_ref().and_then(mlua::WeakLua::try_upgrade);
+                        let mut crossed = Vec::new();
+                        let mut inside = BTreeSet::new();
+                        for (g, holds, mut extra) in members {
+                            if holds {
+                                inside.insert(g);
+                            }
+                            if holds != p.held_by.contains(&g)
+                                && let Some(word) = lua.as_ref().and_then(|l| {
+                                    l.create_string(if holds { "enter" } else { "exit" }).ok()
+                                })
+                            {
+                                extra.push(Value::String(word));
+                                crossed.push(extra);
+                            }
+                        }
+                        p.held_by = inside;
+                        if !p.persistent {
+                            crossed.truncate(1);
+                        }
+                        (!crossed.is_empty()).then_some(crossed)
+                    }
                     Check::Minigame(m) => {
                         p.read = Some(m.read);
                         p.memo = m.last;
@@ -674,6 +699,10 @@ enum Check {
     /// A minigame's answers, each a status and maybe a value; it stays
     /// (made with `Create` or not) until `done`.
     Minigame(crate::hijack::MinigameCheck),
+    /// Whether each of several objects is inside a region, with the values
+    /// to pass: fired as each goes in or out, the values then followed by
+    /// `"enter"` or `"exit"`.
+    Crossings(Vec<(u32, bool, Vec<Value>)>),
 }
 
 /// The objects a parameter names: a guid, `"hero"` (the player), or a
@@ -872,7 +901,18 @@ fn check(
                 Ok(Value::String(s)) => world.named(&s.to_string_lossy()),
                 _ => None,
             });
-            let (Some(b), exit) = (boundary, text(&p.params, 3).as_deref() == Some("exit")) else {
+            let mode = text(&p.params, 3);
+            // `"any"`: both ways, the callback told which (the faction
+            // zones' trespass watch).
+            if let (Some(b), Some("any")) = (boundary, mode.as_deref()) {
+                return Check::Crossings(
+                    objects(&p.params, 1, world)
+                        .into_iter()
+                        .filter_map(|o| Some((o, world.inside(o, b)?, vec![id(o), id(b)])))
+                        .collect(),
+                );
+            }
+            let (Some(b), exit) = (boundary, mode.as_deref() == Some("exit")) else {
                 return no;
             };
             for o in objects(&p.params, 1, world) {

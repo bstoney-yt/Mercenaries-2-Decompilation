@@ -209,6 +209,11 @@ pub struct Entity {
     pub region: Option<Region>,
     /// Its labels' name hashes: its template's and its own (`Label`).
     pub labels: Vec<u32>,
+    /// The script the engine runs on it (`ObjectScript`), by module hash.
+    pub script: Option<u32>,
+    /// The faction a faction zone belongs to (`FactionZone`'s faction
+    /// template), as its guid: the name hash of the template's name.
+    pub faction: Option<u32>,
 }
 
 /// What a mission session needs from the archives.
@@ -275,6 +280,9 @@ impl GameData {
         // Entities' templates, to give them their templates' labels.
         let mut templated: Vec<(String, usize, u32)> = Vec::new();
         let mut template_labels: HashMap<u32, Vec<u32>> = HashMap::new();
+        // Faction zones' faction templates, and every template's name.
+        let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
+        let mut template_names: HashMap<u32, String> = HashMap::new();
         let language = name_hash(LANGUAGE);
         for (block, path) in paths.iter().enumerate() {
             let decoded = wad.read_block(block)?;
@@ -299,6 +307,11 @@ impl GameData {
                 {
                     template_labels = labels_of(db.component("Label"));
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
+                    template_names = db
+                        .names()
+                        .into_iter()
+                        .map(|(id, n)| (id, n.to_owned()))
+                        .collect();
                     for (id, name) in db.names() {
                         if let Some(l) = template_labels.get(&id) {
                             data.template_labels
@@ -311,6 +324,8 @@ impl GameData {
                     let name = layer_name(path);
                     let list = data.layers.entry(name.clone()).or_default();
                     let lines = layer.hashes("LineRegion");
+                    let scripts = layer.hashes("ObjectScript");
+                    let zones = layer.hashes("FactionZone");
                     let placements = layer.placements();
                     let mut own = labels_of(layer.component("Label"));
                     for (guid, entity) in layer.names() {
@@ -321,6 +336,9 @@ impl GameData {
                         if let Some(p) = p {
                             templated.push((name.clone(), list.len(), p.parent));
                         }
+                        if let Some(&t) = zones.get(&guid) {
+                            zone_factions.push((name.clone(), list.len(), t));
+                        }
                         list.push(Entity {
                             guid,
                             name: entity.to_owned(),
@@ -328,6 +346,8 @@ impl GameData {
                             yaw: p.map_or(0.0, |p| yaw(p.rotation)),
                             region: None,
                             labels: own.remove(&guid).unwrap_or_default(),
+                            script: scripts.get(&guid).copied(),
+                            faction: None,
                         });
                     }
                 }
@@ -337,6 +357,11 @@ impl GameData {
             if let Some(l) = template_labels.get(&template) {
                 let e = &mut data.layers.get_mut(&layer).expect("indexed above")[i];
                 e.labels.extend(l.iter().copied());
+            }
+        }
+        for (layer, i, template) in zone_factions {
+            if let Some(n) = template_names.get(&template) {
+                data.layers.get_mut(&layer).expect("indexed above")[i].faction = Some(name_hash(n));
             }
         }
         for (layer, i, hash) in regions {
@@ -553,8 +578,27 @@ impl Mission {
         for name in &names {
             place(&self.world, &self.layers[name], true);
             self.world.borrow_mut().layers.loaded.insert(name.clone());
+            let failed = activate(self.host.lua(), &self.layers[name], true);
+            self.log
+                .extend(failed.into_iter().map(|f| format!("  {f}")));
         }
         names
+    }
+
+    /// Puts the entity called `name` (any case) of any layer in the world,
+    /// with its region, without running its script: for a second view of
+    /// the world (the game HUD's) to find what the mission's scripts put
+    /// on the radar. Its guid, if one is called that.
+    pub fn adopt(&self, name: &str) -> Option<u32> {
+        let e = self
+            .layers
+            .values()
+            .flatten()
+            .find(|e| e.name.eq_ignore_ascii_case(name))?;
+        if !self.world.borrow().objects.contains_key(&e.guid) {
+            place(&self.world, std::slice::from_ref(e), true);
+        }
+        Some(e.guid)
     }
 
     /// The layers in the world now, lower case: blocks of their own
@@ -1296,14 +1340,18 @@ end
             for (op, name) in requests {
                 let found = self.layers.get(&name);
                 if let Some(entities) = found {
-                    match op {
-                        LayerOp::Load => place(&self.world, entities, true),
-                        LayerOp::Unload => place(&self.world, entities, false),
-                        LayerOp::Reload => {
-                            place(&self.world, entities, false);
-                            place(&self.world, entities, true);
-                        }
+                    let lua = self.host.lua();
+                    let mut failed = Vec::new();
+                    if op != LayerOp::Load {
+                        failed.extend(activate(lua, entities, false));
+                        place(&self.world, entities, false);
                     }
+                    if op != LayerOp::Unload {
+                        place(&self.world, entities, true);
+                        failed.extend(activate(lua, entities, true));
+                    }
+                    self.log
+                        .extend(failed.into_iter().map(|f| format!("  {f}")));
                 }
                 let what = found.map_or("part of layers_static".to_owned(), |e| {
                     format!("{} entities", e.len())
@@ -1376,6 +1424,7 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             let mut o = Object::new(&e.name, e.at);
             o.yaw = e.yaw;
             o.label_hashes.clone_from(&e.labels);
+            o.faction = e.faction;
             w.insert(e.guid, o);
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
@@ -1385,6 +1434,43 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             w.regions.remove(&e.guid);
         }
     }
+}
+
+/// The object scripts the engine runs on layer entities that the port runs
+/// too, by module name and hash: as an entity's layer comes in the engine
+/// calls the module's `OnActivate(guid, param)`, and as it goes,
+/// `OnDeactivate(guid)` (`Inheritable`'s, which deletes the instance).
+/// `FactionZone` makes each zone an instance that enables itself: the zone
+/// on the radar and PDA map, and a watch on the player crossing it that
+/// tells the HUD (`TrespassStateChange`).
+pub const OBJECT_SCRIPTS: [(&str, u32); 1] = [("FactionZone", 0x6726_7cc1)];
+
+/// Runs the object scripts of `entities` (see [`OBJECT_SCRIPTS`]) as their
+/// layer comes in (`load`) or goes. Returns what failed.
+fn activate(lua: &mlua::Lua, entities: &[Entity], load: bool) -> Vec<String> {
+    let mut failed = Vec::new();
+    for e in entities {
+        let Some((module, _)) = e
+            .script
+            .and_then(|h| OBJECT_SCRIPTS.iter().find(|(_, s)| *s == h))
+        else {
+            continue;
+        };
+        let call = if load { "OnActivate" } else { "OnDeactivate" };
+        let result = lua
+            .globals()
+            .get::<mlua::Table>(*module)
+            .and_then(|m| m.get::<mlua::Function>(call))
+            .and_then(|f| f.call::<()>(crate::events::guid_value(e.guid)));
+        if let Err(err) = result {
+            failed.push(format!(
+                "{module}.{call} {}: {}",
+                e.name,
+                first_lines(&err.to_string())
+            ));
+        }
+    }
+    failed
 }
 
 /// The first lines of a (Lua) error, on one line.
