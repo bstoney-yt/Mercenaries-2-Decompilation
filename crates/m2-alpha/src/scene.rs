@@ -624,6 +624,9 @@ pub enum Loaded {
     Person(PersonModel, CpuModel, Skeleton, bool),
     /// A hand weapon: name, model, muzzle (model space).
     Weapon(&'static str, CpuModel, Vec3),
+    /// Any other hand weapon's model the templates name: its name's hash,
+    /// model, muzzle.
+    HandModel(u32, CpuModel, Vec3),
     /// A model for the helicopters' deliveries (a helicopter's, a supply
     /// crate's): its hash, each node's place at rest, and its rotors.
     Flight(u32, CpuModel, Vec<Mat4>, Vec<m2_assets::vehicle::Rotor>),
@@ -632,7 +635,7 @@ pub enum Loaded {
 /// Finds the island's vehicle and person models and decodes the soldiers,
 /// a few civilians and up to [`PARKED`] vehicles, on a thread (the search
 /// reads the whole archive).
-fn load_cast(install: Install) -> Receiver<Loaded> {
+fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -709,6 +712,26 @@ fn load_cast(install: Install) -> Receiver<Loaded> {
                 }
             }
             eprintln!("weapons: {}", weapons.join(", "));
+            // Every other gun and explosive the templates name, where the
+            // archive has its model.
+            let mut more = 0;
+            for hash in hand {
+                if found.weapons.iter().any(|&(_, h)| h == hash) {
+                    continue;
+                }
+                let Ok(data) = source.model(hash) else {
+                    continue;
+                };
+                let Ok(model) = data.parse() else { continue };
+                let muzzle = m2_assets::vehicle::marker(&model, combat::MUZZLE)
+                    .map_or(Vec3::new(0.0, 0.0, model.info.bounds.max[2]), Vec3::from);
+                let cpu = CpuModel::build(hash, &model, 0);
+                if tx.send(Loaded::HandModel(hash, cpu, muzzle)).is_err() {
+                    return Ok(());
+                }
+                more += 1;
+            }
+            eprintln!("hand weapons from the templates: {more} more models");
             let all = &found.vehicles;
             let drivable: Vec<&CatalogueEntry> = all
                 .iter()
@@ -954,7 +977,12 @@ impl Scene {
         self.open(install)?;
         self.player = Some(Player::new(x, z, facing, None));
         self.load_hero(backend, self.hero);
-        self.vehicle_loads = Some(load_cast(install.clone()));
+        let hand = self
+            .world
+            .as_ref()
+            .map(|w| w.index.template_db.arms.hand_models())
+            .unwrap_or_default();
+        self.vehicle_loads = Some(load_cast(install.clone(), hand));
         self.install = Some(install.clone());
         Ok(())
     }
@@ -964,7 +992,36 @@ impl Scene {
     pub fn hero_rifle(&self) -> Option<crate::combat::Rifle> {
         let db = &self.world.as_ref()?.index.template_db;
         let (name, gun) = db.own_rifle(self.hero.template())?;
-        Some(crate::combat::Rifle::of(name, &gun))
+        Some(match db.arms.weapons.get(&gun.template) {
+            Some(spec) => crate::combat::Rifle::from_spec(spec),
+            None => crate::combat::Rifle::of(name, &gun),
+        })
+    }
+
+    /// Every gun, thrown weapon and vehicle armament the templates give.
+    pub fn arms(&self) -> Option<&m2_engine::weapons::Arms> {
+        Some(&self.world.as_ref()?.index.template_db.arms)
+    }
+
+    /// The game's damage table, if found.
+    pub fn damage_table(&self) -> Option<m2_engine::tuning::DamageTable> {
+        self.world.as_ref()?.index.template_db.damage.clone()
+    }
+
+    /// The thrown weapons the hero's template's `EquipmentLink`s hand
+    /// them (free roam), each with how many they carry.
+    pub fn hero_explosives(&self) -> Vec<(String, u32)> {
+        let Some(w) = &self.world else {
+            return Vec::new();
+        };
+        let db = &w.index.template_db;
+        db.ids(self.hero.template())
+            .iter()
+            .filter_map(|id| db.equipment.get(id))
+            .flatten()
+            .filter_map(|t| db.arms.throwables.get(t))
+            .map(|t| (t.name.clone(), t.max))
+            .collect()
     }
 
     /// What blasts and rounds do to the hero, by the game's damage table's
@@ -1301,6 +1358,7 @@ impl Scene {
             | Loaded::WorldVehicle(_, _, _, _, _, cpu)
             | Loaded::Person(_, cpu, _, _)
             | Loaded::Weapon(_, cpu, _)
+            | Loaded::HandModel(_, cpu, _)
             | Loaded::Flight(_, cpu, _, _) => cpu,
         };
         self.materials.load_model_textures(backend, source, cpu)?;
@@ -1308,11 +1366,12 @@ impl Scene {
         // What its template says of its handling and its gun: its own
         // (the mission's `AMX30 (Full)`), else its model's.
         let tune = |spec: VehicleSpec| {
-            let t = self
-                .world
-                .as_ref()
-                .and_then(|w| w.index.template_db.tuning_for(&spec.label, spec.model));
-            spec.tuned(t)
+            let Some(db) = self.world.as_ref().map(|w| &w.index.template_db) else {
+                return spec.tuned(None);
+            };
+            let t = db.tuning_for(&spec.label, spec.model);
+            let arm = db.armament_for(&spec.label, spec.model);
+            spec.tuned(t).armed_with(arm, &db.arms)
         };
         match loaded {
             Loaded::Catalogue(_) => {}
@@ -1385,6 +1444,14 @@ impl Scene {
                     .and_then(|pl| pl.model.as_ref())
                     .map(|(_, rig)| rig);
                 self.arsenal.add(name, model, muzzle, rig);
+            }
+            Loaded::HandModel(hash, _, muzzle) => {
+                let rig = self
+                    .player
+                    .as_ref()
+                    .and_then(|pl| pl.model.as_ref())
+                    .map(|(_, rig)| rig);
+                self.arsenal.add_model(hash, model, muzzle, rig);
             }
             Loaded::Person(p, _, skeleton, named) => {
                 // The hero's clips fit every human skeleton.
@@ -1543,9 +1610,9 @@ impl Scene {
                 _ if fight.designator => self.arsenal.designator.as_ref(),
                 (Some(_), _) if fight.grenade_in_hand() => self.arsenal.grenade.as_ref(),
                 (Some(_), _) => None,
-                (None, Weapon::Rifle) => self.arsenal.hers(&fight.rifle),
-                (None, Weapon::Rpg) => self.arsenal.rpg.as_ref(),
-                (None, Weapon::GrenadeLauncher) => self.arsenal.launcher.as_ref(),
+                (None, Weapon::Rifle) => self.arsenal.of_gun(&fight.rifle),
+                (None, Weapon::Rpg) => self.arsenal.of_gun(&fight.launcher),
+                (None, Weapon::GrenadeLauncher) => self.arsenal.of_gun(&fight.launcher),
             };
             if !player.down
                 && !player.seated
@@ -1564,9 +1631,9 @@ impl Scene {
             let holding = !fight.designator && player.throwing.is_none() && !player.down;
             for (slot, slung) in fight.slung(holding).into_iter().enumerate() {
                 let model = match slung {
-                    Some(Weapon::Rifle) => self.arsenal.hers(&fight.rifle),
-                    Some(Weapon::Rpg) => self.arsenal.rpg.as_ref(),
-                    Some(Weapon::GrenadeLauncher) => self.arsenal.launcher.as_ref(),
+                    Some(Weapon::Rifle) => self.arsenal.of_gun(&fight.rifle),
+                    Some(Weapon::Rpg) => self.arsenal.of_gun(&fight.launcher),
+                    Some(Weapon::GrenadeLauncher) => self.arsenal.of_gun(&fight.launcher),
                     None => None,
                 };
                 if let Some(w) = model
@@ -1609,12 +1676,14 @@ impl Scene {
         }
         for (what, at, velocity) in fight.projectiles() {
             let model = match what {
-                combat::Flying::Rocket => &self.arsenal.rocket,
-                combat::Flying::Grenade => &self.arsenal.grenade,
-                combat::Flying::Round => match &self.arsenal.round {
-                    Some(_) => &self.arsenal.round,
-                    None => &self.arsenal.grenade,
-                },
+                combat::Flying::Charge(m) => m.and_then(|m| self.arsenal.by_model.get(&m)),
+                combat::Flying::Rocket => self.arsenal.rocket.as_ref(),
+                combat::Flying::Grenade => self.arsenal.grenade.as_ref(),
+                combat::Flying::Round => self
+                    .arsenal
+                    .round
+                    .as_ref()
+                    .or(self.arsenal.grenade.as_ref()),
             };
             if let Some(w) = model {
                 // A rocket's nose (its muzzle marker) along its flight, and
@@ -1623,7 +1692,7 @@ impl Scene {
                     w.muzzle.normalize_or(Vec3::Z),
                     velocity.normalize_or(Vec3::Z),
                 );
-                let spin = if what == combat::Flying::Grenade {
+                let spin = if matches!(what, combat::Flying::Grenade | combat::Flying::Charge(_)) {
                     Quat::IDENTITY
                 } else {
                     turn

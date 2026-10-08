@@ -2566,6 +2566,8 @@ mod tests {
             model: 1,
             kind: "car".into(),
             label: "test".into(),
+            node_names: Vec::new(),
+            armed: Vec::new(),
             wheels: vec![
                 wheel(-0.9, 1.4),
                 wheel(0.9, 1.4),

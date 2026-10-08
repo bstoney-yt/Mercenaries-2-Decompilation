@@ -115,6 +115,9 @@ pub struct Leaves {
     pub reach: f32,
     /// The weapon of hers it is, if it is one: taking it takes it up.
     pub weapon: Option<Weapon>,
+    /// The gun template it is, if the templates name one with its model:
+    /// that gun is what she takes up (`weapon` its place).
+    pub gun: Option<u32>,
     /// The rounds it gives, and for which of her weapons (those of a
     /// weapon she doesn't carry give her nothing).
     pub gives: Option<(Weapon, u32)>,

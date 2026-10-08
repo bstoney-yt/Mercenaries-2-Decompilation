@@ -35,8 +35,13 @@ pub struct HudInfo {
     pub rifle: String,
     /// What she carries in the launcher's place, if anything.
     pub second: Option<Weapon>,
-    /// Grenades she has.
+    /// What she carries in the launcher's place, by its template's name
+    /// (`RPG`, `Stinger`); empty, by its kind.
+    pub launcher: String,
+    /// Grenades she has; or of the explosive she has chosen to throw
+    /// (`explosive`: its template's name, empty for grenades).
     pub grenades: u32,
+    pub explosive: String,
     /// The rounds of the weapon up when it runs out (the rifle's and the
     /// grenade launcher's): in its clip, and stored.
     pub rounds: Option<(u32, u32)>,
@@ -652,18 +657,25 @@ fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
                 Weapon::Rpg => "RPG",
                 Weapon::GrenadeLauncher => "grenade launcher",
             };
+            let launcher = |w: Weapon| match (&info.launcher, w) {
+                (n, _) if !n.is_empty() => n.clone(),
+                (_, Weapon::GrenadeLauncher) => "Grenade launcher".to_owned(),
+                _ => "RPG".to_owned(),
+            };
             let up = match (info.weapon, info.rounds) {
                 (Weapon::Rifle, Some((clip, stored))) => {
                     format!("{} {clip} | {stored}", info.rifle)
                 }
                 (Weapon::Rifle, None) => info.rifle.clone(),
-                (Weapon::Rpg, _) => "RPG".to_owned(),
-                (Weapon::GrenadeLauncher, Some((clip, stored))) => {
-                    format!("Grenade launcher {clip} | {stored}")
+                (w, Some((clip, stored))) => {
+                    format!("{} {clip} | {stored}", launcher(w))
                 }
-                (Weapon::GrenadeLauncher, None) => "Grenade launcher".to_owned(),
+                (w, None) => launcher(w),
             };
             let other = match (info.weapon, info.second) {
+                (Weapon::Rifle, Some(_)) if !info.launcher.is_empty() => {
+                    format!("   ·   2 {}", info.launcher)
+                }
                 (Weapon::Rifle, Some(w)) => format!("   ·   2 {}", name(w)),
                 (Weapon::Rifle, None) => String::new(),
                 _ => "   ·   1 rifle".to_owned(),
@@ -676,7 +688,15 @@ fn stand_in<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             text(
                 screen.right_bottom() + vec2(-24.0, -28.0),
                 Align2::RIGHT_BOTTOM,
-                &format!("{up}{other}   ·   G grenade ({})", info.grenades),
+                &format!(
+                    "{up}{other}   ·   G {} ({})",
+                    if info.explosive.is_empty() {
+                        "grenade"
+                    } else {
+                        &info.explosive
+                    },
+                    info.grenades
+                ),
                 18.0,
                 white,
             );
