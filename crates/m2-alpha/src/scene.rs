@@ -545,7 +545,8 @@ pub struct ParkedVehicle {
     /// How far its gun is raised, radians (down is negative).
     pub gun: f32,
     /// How far it has rolled, metres (backwards less), for turning a
-    /// tracked vehicle's road wheels.
+    /// tracked vehicle's road wheels; a helicopter's: how far its rotors
+    /// have turned, radians.
     pub rolled: f32,
     /// Shells its cannon has fired.
     pub fired: u32,
@@ -1506,12 +1507,13 @@ impl Scene {
                 let Some(at) = world.physics.vehicle_transform(id) else {
                     continue;
                 };
-                let nodes = v.spec.posed_nodes(
+                let mut nodes = v.spec.posed_nodes(
                     &world.physics.vehicle_wheels(id),
                     v.rolled,
                     v.turret,
                     v.gun,
                 );
+                v.spec.spin_rotors(&mut nodes, v.rolled);
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
             }
         }

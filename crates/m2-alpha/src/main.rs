@@ -2938,6 +2938,32 @@ fn drive_for_screenshot(
             game.step(brake, tick);
         }
     }
+    // A helicopter climbs for three seconds first, then flies on.
+    let flies = game
+        .scene
+        .player
+        .as_ref()
+        .and_then(|p| p.driving)
+        .is_some_and(|i| game.scene.vehicles[i].spec.is_helicopter());
+    if flies {
+        let ground = game.driving().map(|(at, _)| at.y);
+        let climb = Intent {
+            hold_jump: true,
+            ..Intent::default()
+        };
+        for _ in 0..180 {
+            game.step(climb, tick);
+        }
+        for _ in 0..60 {
+            game.step(Intent::default(), tick);
+        }
+        if let (Some(ground), Some((at, speed))) = (ground, game.driving()) {
+            eprintln!(
+                "drive: helicopter climbed {:.1} m in 3 s, hovering at {speed:.1} m/s",
+                at.y - ground
+            );
+        }
+    }
     let ploughing = options
         .plough
         .as_deref()
@@ -3025,6 +3051,14 @@ fn drive_for_screenshot(
                 .join(", ")
         );
         let t = &v.spec.tuning;
+        if v.spec.is_helicopter() {
+            eprintln!(
+                "drive: helicopter: flight {:?}, chase {:?}, {} rotors",
+                t.flight,
+                t.chase,
+                v.spec.rotors.len()
+            );
+        }
         eprintln!(
             "drive: template tuning: top speed {:?} m/s, turret {:?}, camera {:?}, gun {:?}",
             t.max_speed,

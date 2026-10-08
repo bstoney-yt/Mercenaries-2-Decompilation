@@ -3148,6 +3148,7 @@ mod tests {
             elevation: (0.0, 0.0),
             hull,
             turret_box: None,
+            rotors: Vec::new(),
             tuning: VehicleTuning {
                 gun: Some(gun),
                 ..VehicleTuning::default()

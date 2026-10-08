@@ -2054,6 +2054,7 @@ mod tests {
             elevation: (0.0, 0.0),
             hull,
             turret_box: None,
+            rotors: Vec::new(),
             tuning: Default::default(),
         };
         let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, 0.0), 0.0);
