@@ -222,12 +222,17 @@ impl AnimationTable {
 
     /// [`best`](Self::best) by column names; unknown columns fail.
     pub fn lookup(&self, filters: &[(&str, Option<u32>)], out: &str) -> Option<u32> {
+        let row = self.lookup_row(filters)?;
+        self.cell(row, self.column(out)?).filter(|&v| v != ANY)
+    }
+
+    /// The row [`lookup`](Self::lookup) reads.
+    pub fn lookup_row(&self, filters: &[(&str, Option<u32>)]) -> Option<usize> {
         let filters: Option<Vec<_>> = filters
             .iter()
             .map(|&(name, v)| Some((self.column(name)?, v)))
             .collect();
-        let row = self.best(&filters?)?;
-        self.cell(row, self.column(out)?).filter(|&v| v != ANY)
+        self.best(&filters?)
     }
 }
 
@@ -252,9 +257,23 @@ pub fn seat_clip(
     vehicles: &AnimationTable,
     stance: &str,
     action: &str,
-    (class, name): (u32, u32),
+    set: (u32, u32),
     seat: Option<u32>,
 ) -> Option<u32> {
+    seat_clip_row(actions, vehicles, stance, action, set, seat).map(|(clip, _)| clip)
+}
+
+/// [`seat_clip`], with the row of the vehicle table that gives it: which
+/// of its cells name the vehicle's class, the vehicle and the seat, and
+/// which are [`ANY`], says whether the clip is the vehicle's own.
+pub fn seat_clip_row(
+    actions: &AnimationTable,
+    vehicles: &AnimationTable,
+    stance: &str,
+    action: &str,
+    (class, name): (u32, u32),
+    seat: Option<u32>,
+) -> Option<(u32, usize)> {
     let handle = actions.lookup(
         &[
             ("Stance", Some(crate::name_hash(stance))),
@@ -268,17 +287,18 @@ pub fn seat_clip(
         ],
         "AnimationHandles",
     )?;
-    vehicles.lookup(
-        &[
-            ("Handle", Some(handle)),
-            ("VehicleClass", Some(class)),
-            ("VehicleName", Some(name)),
-            ("SeatName", seat),
-            ("MountedEquipmentClass", None),
-            ("MountedEquipmentName", None),
-        ],
-        "Animation",
-    )
+    let row = vehicles.lookup_row(&[
+        ("Handle", Some(handle)),
+        ("VehicleClass", Some(class)),
+        ("VehicleName", Some(name)),
+        ("SeatName", seat),
+        ("MountedEquipmentClass", None),
+        ("MountedEquipmentName", None),
+    ])?;
+    let clip = vehicles
+        .cell(row, vehicles.column("Animation")?)
+        .filter(|&v| v != ANY)?;
+    Some((clip, row))
 }
 
 #[cfg(test)]
@@ -388,6 +408,19 @@ mod tests {
             None
         );
         assert_eq!(vehicle_clip(&a, &b, "InVehicle", "Idle", 0xc1, 0x51), None);
+        // With the row it came from: the vehicle's own, else its class's.
+        let row = |name| {
+            seat_clip_row(
+                &a,
+                &b,
+                "InVehicle",
+                "ActionHijackHijackerA",
+                (0xc1, name),
+                None,
+            )
+        };
+        assert_eq!(row(0x51), Some((0xbbbb, 2)));
+        assert_eq!(row(0x52), Some((0xaaaa, 1)));
     }
 
     #[test]
