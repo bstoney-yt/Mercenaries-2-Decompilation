@@ -133,6 +133,18 @@ impl Game {
         if let Some(rifle) = scene.hero_rifle() {
             combat.take_own_rifle(rifle);
         }
+        let r = &combat.rifle;
+        eprintln!(
+            "hero: {} rifle {} ({}), {:.0} a minute, clip {}, spare {}, round {}; blasts on her {:?}",
+            scene.hero,
+            r.name,
+            r.model,
+            60.0 / r.gap,
+            r.clip,
+            r.spare,
+            r.damage,
+            combat.hero_damage
+        );
         Self {
             scene,
             camera,
