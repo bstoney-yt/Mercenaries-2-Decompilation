@@ -143,6 +143,22 @@ impl Game {
             combat.max_hp = hp;
             combat.hp = hp;
         }
+        combat.hero_damage = scene.hero_damage();
+        if let Some(rifle) = scene.hero_rifle() {
+            combat.take_own_rifle(rifle);
+        }
+        let r = &combat.rifle;
+        eprintln!(
+            "hero: {} rifle {} ({}), {:.0} a minute, clip {}, spare {}, round {}; blasts on her {:?}",
+            scene.hero,
+            r.name,
+            r.model,
+            60.0 / r.gap,
+            r.clip,
+            r.spare,
+            r.damage,
+            combat.hero_damage
+        );
         Self {
             scene,
             camera,
@@ -169,7 +185,8 @@ impl Game {
         }
     }
 
-    /// Plays as `hero` from now on: their body, clips and health (whole).
+    /// Plays as `hero` from now on: their body, clips and health (whole),
+    /// and in free roam their own rifle.
     pub fn set_hero(
         &mut self,
         backend: &mut dyn m2_render::RenderBackend,
@@ -179,6 +196,12 @@ impl Game {
         if let Some(hp) = self.scene.hero_health() {
             self.combat.max_hp = hp;
             self.combat.hp = hp;
+        }
+        // Their own rifle, unless the scripts handed her one.
+        if self.combat.own_rifle
+            && let Some(rifle) = self.scene.hero_rifle()
+        {
+            self.combat.take_own_rifle(rifle);
         }
     }
 
@@ -939,8 +962,18 @@ impl Game {
         player.yaw = p.yaw;
         player.pitch = p.pitch;
         let max_hp = self.combat.max_hp;
+        let hers = (
+            self.combat.rifle.clone(),
+            self.combat.own_rifle,
+            self.combat.hero_damage,
+        );
         self.combat = Combat::default();
         self.combat.max_hp = max_hp;
+        (
+            self.combat.rifle,
+            self.combat.own_rifle,
+            self.combat.hero_damage,
+        ) = hers;
         self.combat.hp = p.hp.clamp(1.0, max_hp);
         match (p.second.as_str(), p.launcher) {
             ("grenade launcher", Some([clip, stored])) => {
@@ -953,8 +986,8 @@ impl Game {
         self.combat.grenades = p.grenades.min(combat::MAX_GRENADES);
         if let Some([clip, stored]) = p.rifle {
             self.combat.rifle_rounds = combat::Rounds {
-                clip: clip.min(combat::RIFLE_CLIP),
-                stored: stored.min(combat::RIFLE_SPARE),
+                clip: clip.min(self.combat.rifle.clip),
+                stored: stored.min(self.combat.rifle.spare),
             };
         }
         self.combat.weapon = match (p.weapon.as_str(), self.combat.second) {
@@ -1043,6 +1076,7 @@ impl Game {
                 .map_or(self.combat.hp_percent(), ParkedVehicle::health),
             down: self.combat.down > 0.0,
             weapon: self.combat.weapon,
+            rifle: self.combat.rifle.name.clone(),
             second: self.combat.second,
             grenades: self.combat.grenades,
             rounds: match self.combat.weapon {
