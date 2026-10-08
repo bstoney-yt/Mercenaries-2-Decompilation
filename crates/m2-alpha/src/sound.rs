@@ -181,8 +181,9 @@ pub struct GameAudio {
     pub hero: Hero,
     /// When the hero may speak again.
     quiet_until: Instant,
-    /// Scripted lines playing, by the mission's id for them.
-    lines: HashMap<u32, VoiceId>,
+    /// Scripted lines playing, by the mission's id for them, with when
+    /// each ends if played through.
+    lines: HashMap<u32, (VoiceId, Instant)>,
     /// Interface sounds started, by cue in lower case.
     ui_playing: HashMap<String, VoiceId>,
     /// Scripted lines stopped before they were decoded.
@@ -462,6 +463,9 @@ const REMARK_GAP: f32 = 10.0;
 const SHOUT_LONGEST: f32 = 3.5;
 /// Most lines said at once.
 const MAX_SPEAKING: usize = 2;
+/// How much sooner than its length a scripted line may stop on its own
+/// before it counts as cut off (the mixer's blocks; inferred).
+const LINE_SLACK: Duration = Duration::from_millis(250);
 
 /// Picks the loudest sound in `bank` passing `keep`.
 fn pick(
@@ -1138,7 +1142,7 @@ impl GameAudio {
         self.quiet_until = self
             .quiet_until
             .max(now + Duration::from_secs_f32(seconds + REMARK_GAP));
-        eprintln!("voice: line {cue}, stream {stream}, {seconds:.1} s");
+        eprintln!("voice: line {cue} (#{id}), stream {stream}, {seconds:.1} s");
         self.speak(
             voices,
             stream,
@@ -1150,10 +1154,18 @@ impl GameAudio {
         Some(seconds)
     }
 
-    /// Stops scripted line `id`.
+    /// Stops scripted line `id`, as the scripts asked (`VO.Cancel`), at
+    /// once.
     pub fn hush(&mut self, id: u32) {
         match self.lines.remove(&id) {
-            Some(voice) => self.out.with(|m| m.stop(voice)),
+            Some((voice, end)) => {
+                let left = end.saturating_duration_since(Instant::now());
+                eprintln!(
+                    "voice: line #{id} cancelled by the scripts, {:.1} s before its end",
+                    left.as_secs_f32()
+                );
+                self.out.with(|m| m.stop(voice));
+            }
             None => {
                 self.hushed.insert(id);
             }
@@ -1423,9 +1435,11 @@ impl GameAudio {
             self.voices_loading = None;
         }
         while let Ok((buffer, at, falloff, gain, line)) = self.said.1.try_recv() {
-            if line.is_some_and(|l| self.hushed.remove(&l)) {
+            if let Some(l) = line.filter(|l| self.hushed.remove(l)) {
+                eprintln!("voice: line #{l} cancelled by the scripts before it played");
                 continue;
             }
+            let end = Instant::now() + Duration::from_secs_f32(buffer.seconds());
             // Scripted lines (the radio's too) are dialogue; the rest,
             // hers included, are people's barks.
             let category = if line.is_some() {
@@ -1443,11 +1457,22 @@ impl GameAudio {
             .category(category);
             let voice = self.out.with(|m| m.play(play.gain(gain)));
             if let Some(l) = line {
-                self.lines.insert(l, voice);
+                self.lines.insert(l, (voice, end));
             }
         }
-        self.lines
-            .retain(|_, v| self.out.with(|m| m.is_playing(*v)));
+        // A line gone before its end that the scripts did not cancel
+        // ([`GameAudio::hush`]) was dropped by the mixer, every voice busy.
+        let now = Instant::now();
+        self.lines.retain(|id, (v, end)| {
+            let playing = self.out.with(|m| m.is_playing(*v));
+            if !playing && *end > now + LINE_SLACK {
+                eprintln!(
+                    "voice: line #{id} cut off {:.1} s before its end: the mixer dropped it",
+                    (*end - now).as_secs_f32()
+                );
+            }
+            playing
+        });
         while let Ok((which, buffer)) = self.decoded.1.try_recv() {
             if which == "music" {
                 let Some((hash, looped)) = self.music_wanted else {
