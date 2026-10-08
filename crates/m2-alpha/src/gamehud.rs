@@ -1283,6 +1283,10 @@ struct Thread {
     game_state: Option<String>,
     /// The front end's Flash widgets' state, as last logged.
     shell_seen: String,
+    /// The engine's side of the front end's menu movie.
+    native: crate::shell::Native,
+    /// `fscommand`s no script heard, for the engine (the front end's).
+    unheard: Vec<(String, String)>,
 }
 
 /// The language archive beside `vz.wad` (English only for now).
@@ -1420,6 +1424,8 @@ impl Thread {
             mode,
             game_state: None,
             shell_seen: String::new(),
+            native: crate::shell::Native::default(),
+            unheard: Vec::new(),
         }
     }
 
@@ -1809,7 +1815,33 @@ impl Thread {
             self.mission.tick(dt);
             gui_runtime::tick(self.mission.lua(), dt);
         }
+        // The engine's calls into the menu movie: set up as it starts, and
+        // the keys it waits for itself.
+        let mut calls = Vec::new();
+        if self.flash.values().any(|m| m.swf == crate::shell::MOVIE) {
+            calls.extend(self.native.start());
+            for &(code, down) in &state.keys {
+                if down {
+                    calls.extend(self.native.key(code));
+                }
+            }
+        }
+        if let Some(m) = self
+            .flash
+            .values_mut()
+            .find(|m| m.swf == crate::shell::MOVIE)
+        {
+            for (name, args) in calls {
+                log.push(format!("shell: the engine calls {name}"));
+                m.rt.call(name, &args);
+            }
+        }
         self.play_flash(dt, &mut log);
+        for (command, arg) in std::mem::take(&mut self.unheard) {
+            if self.native.command(&command, &arg) {
+                log.push(format!("shell: the engine hears {command}({arg})"));
+            }
+        }
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
             return Output::Failed("no GUI runtime".into());
         };
@@ -2038,9 +2070,14 @@ impl Thread {
         for (id, (command, arg)) in commands {
             match gui_runtime::flash_command(lua, id, &command, &arg) {
                 Ok(true) => {}
-                Ok(false) => log.push(format!(
-                    "flash: widget {id}: fscommand {command}({arg}) unheard"
-                )),
+                Ok(false) => {
+                    log.push(format!(
+                        "flash: widget {id}: fscommand {command}({arg}) unheard"
+                    ));
+                    if self.mode == Mode::Shell {
+                        self.unheard.push((command, arg));
+                    }
+                }
                 Err(e) => log.push(format!("flash: widget {id}: {command}: {e}")),
             }
         }
