@@ -16,7 +16,9 @@
 //! (`LTIStartNewGame` with the character on the PC; `newGame` elsewhere)
 //! sets the character (`MrxGuiShellBootstrap.SetSelectedCharacter`) and
 //! calls `Sys.StartSingleplayer`, which here notes the character for the
-//! game ([`take_new_game`]).
+//! game ([`take_new_game`]). The movie's own `newGame` carries no
+//! character: the engine starts the game as the profile's
+//! ([`Native::character`], [`start_new_game`]).
 //!
 //! The menu movie itself waits on the engine: its first frame stops until
 //! told the platform, and its press-start screen (`pressStartEnabled`)
@@ -154,6 +156,10 @@ pub struct Native {
     pending: Vec<Call>,
     /// The save operation waiting on the profile's save.
     saving: Option<&'static str>,
+    /// The profile's character, as the movie last set it
+    /// (`onlineSetParameters` with `profileCharacter`): see
+    /// [`Native::character`].
+    character: Option<&'static str>,
 }
 
 /// The menu movie's name.
@@ -233,8 +239,32 @@ impl Native {
                 }
                 true
             }
+            // The movie's settings for the profile (`outputSettings`, one
+            // "name, value" each), saved by the engine: the character is
+            // the one accepted on the character screen.
+            "onlineSetParameters" => {
+                if let Some(("profileCharacter", n)) = arg.split_once(", ") {
+                    self.character = profile_character(n.trim()).or(self.character);
+                }
+                true
+            }
             _ => false,
         }
+    }
+
+    /// The character the profile was given (`chris`, `jennifer` or
+    /// `mattias`, as the shell's scripts name them), once the movie has
+    /// set it.
+    ///
+    /// The movie starts the game with `fscommand("newGame", 1)` from its
+    /// `_newgameStart` frame: the argument is a constant, not the
+    /// character. On the PC the character is the profile's
+    /// (`profileCharacter`), which the engine hands the scripts as
+    /// `sCharacter` for their `LTIStartNewGame` handler
+    /// (`MrxGuiShell._LTIStartNewGame`, which reads that global, not its
+    /// argument).
+    pub fn character(&self) -> Option<&'static str> {
+        self.character
     }
 
     /// A key (Flash's code) going down: what to call for it.
@@ -245,6 +275,32 @@ impl Native {
         }
         Vec::new()
     }
+}
+
+/// The scripts' name for the movie's `profileCharacterVar`: 1, 2 and 3 are
+/// Mattias, Chris and Jennifer (its character buttons' order, which
+/// `newGameTransition` and the saves' pages read the same way).
+fn profile_character(n: &str) -> Option<&'static str> {
+    match n {
+        "1" => Some("mattias"),
+        "2" => Some("chris"),
+        "3" => Some("jennifer"),
+        _ => None,
+    }
+}
+
+/// Starts the new game the menu movie asked for (`fscommand("newGame", _)`
+/// from widget `widget`) as the PC does, as `character` (see
+/// [`Native::character`]): the scripts' `sCharacter` is set and their
+/// `LTIStartNewGame` handler runs if the widget has one; otherwise their
+/// `newGame` handler (`_NewGameFlashCallback`, which takes the character
+/// as its argument) is given it. Returns whether a handler ran.
+pub fn start_new_game(lua: &Lua, widget: u32, character: &str) -> mlua::Result<bool> {
+    lua.globals().set("sCharacter", character)?;
+    if gui_runtime::flash_command(lua, widget, "LTIStartNewGame", character)? {
+        return Ok(true);
+    }
+    gui_runtime::flash_command(lua, widget, "newGame", character)
 }
 
 #[cfg(test)]
@@ -287,5 +343,21 @@ mod tests {
         assert_eq!(names(n.calls()), ["saveCompleteContinue"]);
         assert!(n.command("onlineSaveProfile", "true"));
         assert!(n.calls().is_empty());
+    }
+
+    #[test]
+    fn the_profile_keeps_the_accepted_character() {
+        let mut n = Native::default();
+        assert_eq!(n.character(), None);
+        assert!(n.command("onlineSetParameters", "serverOnline, true"));
+        assert_eq!(n.character(), None);
+        assert!(n.command("onlineSetParameters", "profileCharacter, 2"));
+        assert_eq!(n.character(), Some("chris"));
+        assert!(n.command("onlineSetParameters", "profileCharacter, undefined"));
+        assert_eq!(n.character(), Some("chris"));
+        assert!(n.command("onlineSetParameters", "profileCharacter, 3"));
+        assert_eq!(n.character(), Some("jennifer"));
+        assert!(n.command("onlineSetParameters", "profileCharacter, 1"));
+        assert_eq!(n.character(), Some("mattias"));
     }
 }
