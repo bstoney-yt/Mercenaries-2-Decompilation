@@ -43,6 +43,10 @@ pub struct Place {
     pub colour: Option<ColourTransform>,
     pub name: Option<String>,
     pub clip_depth: Option<u16>,
+    /// `PlaceObject3`'s blend mode, if set: 1 normal, 2 layer, 3 multiply,
+    /// 4 screen, 5 lighten, 6 darken, 7 difference, 8 add, 9 subtract,
+    /// 10 invert, 11 alpha, 12 erase, 13 overlay, 14 hard light.
+    pub blend: Option<u8>,
     /// Changes the character at the depth (with `character`, replaces it).
     pub moving: bool,
 }
@@ -137,6 +141,10 @@ fn place23(data: &[u8], three: bool) -> Place {
     }
     let name = (flags & 32 != 0).then(|| b.cstr());
     let clip_depth = (flags & 64 != 0).then(|| b.u16());
+    if flags3 & 1 != 0 {
+        skip_filters(&mut b);
+    }
+    let blend = (flags3 & 2 != 0).then(|| b.u8());
     Place {
         depth,
         character,
@@ -144,7 +152,33 @@ fn place23(data: &[u8], three: bool) -> Place {
         colour,
         name,
         clip_depth,
+        blend,
         moving: flags & 1 != 0,
+    }
+}
+
+/// Reads past a `PlaceObject3`'s filter list.
+fn skip_filters(b: &mut Bits) {
+    for _ in 0..b.u8() {
+        let len = match b.u8() {
+            0 => 23,
+            1 => 9,
+            2 => 15,
+            3 => 27,
+            4 | 7 => {
+                let n = usize::from(b.u8());
+                5 * n + 19
+            }
+            5 => {
+                let (x, y) = (usize::from(b.u8()), usize::from(b.u8()));
+                8 + 4 * x * y + 5
+            }
+            6 => 80,
+            _ => return,
+        };
+        for _ in 0..len {
+            b.u8();
+        }
     }
 }
 
