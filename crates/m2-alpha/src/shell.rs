@@ -165,6 +165,9 @@ pub type Call = (&'static str, Vec<m2_assets::flash::avm1::Value>);
 /// Game sets `ProfilePage` 2 and asks with it).
 const NEW_GAME_PAGE: &str = "2";
 
+/// `saveCheck`'s operation for a new game (accepting a character).
+const NEW_GAME_OPERATION: &str = "newGame";
+
 impl Native {
     /// What to call in the movie now: set up as it starts (once), then
     /// the answers to what it asked.
@@ -200,6 +203,21 @@ impl Native {
             "onlineLTIIsConnected" => {
                 if arg == NEW_GAME_PAGE {
                     self.pending.push(("LTIgotoGame", Vec::new()));
+                }
+                true
+            }
+            // `saveCheck(kind, operation)` asks the engine to get the
+            // saves ready (`preoperation` with "kind,operation") and waits
+            // for `preopComplete(operation, true)`: what the movie's own
+            // test path calls straight away. A new game's goes on to start
+            // it; the others need saves, which there are none of yet.
+            "preoperation" => {
+                if arg.split(',').nth(1) == Some(NEW_GAME_OPERATION) {
+                    use m2_assets::flash::avm1::Value;
+                    self.pending.push((
+                        "preopComplete",
+                        vec![Value::Str(NEW_GAME_OPERATION.into()), Value::Bool(true)],
+                    ));
                 }
                 true
             }
@@ -249,5 +267,9 @@ mod tests {
         assert!(n.calls().is_empty());
         assert!(n.command("onlineLTIIsConnected", "2"));
         assert_eq!(names(n.calls()), ["LTIgotoGame"]);
+        assert!(n.command("preoperation", "load,"));
+        assert!(n.calls().is_empty());
+        assert!(n.command("preoperation", "save,newGame"));
+        assert_eq!(names(n.calls()), ["preopComplete"]);
     }
 }
