@@ -2181,7 +2181,10 @@ fn front_end_offscreen(
             up_at = Some(t);
         }
         if let Some(who) = shell.take_new_game() {
-            eprintln!("front end: a new game as {who} ({})", shell::hero(&who));
+            eprintln!(
+                "front end: a new game as {who} ({})",
+                shell::hero(&who).map_or("no hero", Hero::name)
+            );
             picture = true;
         }
         if picture {
