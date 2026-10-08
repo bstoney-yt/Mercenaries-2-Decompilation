@@ -1357,6 +1357,8 @@ struct Thread {
     native: crate::shell::Native,
     /// `fscommand`s no script heard, for the engine (the front end's).
     unheard: Vec<(String, String)>,
+    /// Seconds since `M2_SHELL_PROBE` last logged.
+    probe_time: f64,
 }
 
 /// The language archive beside `vz.wad` (English only for now).
@@ -1496,6 +1498,7 @@ impl Thread {
             shell_seen: String::new(),
             native: crate::shell::Native::default(),
             unheard: Vec::new(),
+            probe_time: 0.0,
         }
     }
 
@@ -1907,6 +1910,34 @@ impl Thread {
             }
         }
         self.play_flash(dt, &mut log);
+        // `M2_SHELL_PROBE=x,y`: once a second, what covers that stage
+        // point in the menu movie.
+        if let Some((x, y)) = std::env::var("M2_SHELL_PROBE")
+            .ok()
+            .and_then(|v| {
+                v.split_once(',')
+                    .map(|(a, b)| (a.parse().ok(), b.parse().ok()))
+            })
+            .and_then(|(a, b)| a.zip(b))
+        {
+            self.probe_time += dt;
+            if self.probe_time >= 1.0 {
+                self.probe_time = 0.0;
+                let movies = self.movies.borrow();
+                if let (Some(m), Some(fonts)) = (
+                    self.flash.values().find(|m| m.swf == crate::shell::MOVIE),
+                    movies.fonts.as_ref(),
+                ) {
+                    log.push(format!("probe {x},{y}:"));
+                    log.extend(
+                        m.rt.player
+                            .covering([x, y], 4, fonts)
+                            .into_iter()
+                            .map(|l| format!("  {l}")),
+                    );
+                }
+            }
+        }
         for (command, arg) in std::mem::take(&mut self.unheard) {
             if self.native.command(&command, &arg) {
                 log.push(format!("shell: the engine hears {command}({arg})"));

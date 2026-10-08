@@ -733,6 +733,40 @@ impl Player {
         m
     }
 
+    /// The clips (to `depth` levels down from the root) whose drawing
+    /// covers stage point `at`: each one's path, frame, visibility, alpha
+    /// multiplier, blend mode and how many of its triangles cover it. For
+    /// finding what hides something.
+    pub fn covering(&self, at: [f32; 2], depth: usize, fonts: &FontBook) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![(self.root, String::from("_root"), 0usize)];
+        while let Some((id, path, d)) = stack.pop() {
+            let Some(c) = self.clip(id) else { continue };
+            let mut tris = Vec::new();
+            self.draw_from(id, &Matrix::IDENTITY, fonts, &mut tris);
+            let hits = tris.iter().filter(|t| super::inside(at, t.corners)).count();
+            if hits == 0 {
+                continue;
+            }
+            out.push(format!(
+                "{path} #{} frame {} visible {} alpha {:.2} blend {} covers with {hits} of {}",
+                c.character,
+                c.frame + 1,
+                c.visible,
+                c.colour.mult[3],
+                c.blend,
+                tris.len()
+            ));
+            if d < depth {
+                for &k in c.children.values() {
+                    let name = self.clip(k).map(|kc| kc.name.clone()).unwrap_or_default();
+                    stack.push((k, format!("{path}.{name}"), d + 1));
+                }
+            }
+        }
+        out
+    }
+
     /// What is on stage as triangles, through `matrix`; text fields in the
     /// fonts `fonts` has.
     pub fn draw(&self, matrix: &Matrix, fonts: &FontBook, out: &mut Vec<Triangle>) {
