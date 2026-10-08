@@ -78,7 +78,9 @@ const RPG_STORED: u32 = 4;
 const RIFLE_ICON: &str = "weapons_m4";
 const RPG_ICON: &str = "weapons_rpg";
 const LAUNCHER_ICON: &str = "weapons_grenade_launcher_2";
-/// Their reticles (`uReticleTexture`), `reticle_*` by the kind of round.
+/// Their reticles (`uReticleTexture`), `reticle_*` by the kind of round
+/// (inferred from the textures' names: the guns' `WeaponUI` records, which
+/// name them, aren't read yet).
 const RIFLE_RETICLE: &str = "reticle_bullets";
 const RPG_RETICLE: &str = "reticle_rockets";
 const LAUNCHER_RETICLE: &str = "reticle_grenade";
@@ -407,7 +409,8 @@ pub struct HudState {
     pub picked: Picked,
     /// The grenade launcher's rounds, while she carries one.
     pub launcher: Option<Rounds>,
-    /// The grenades she has to throw (the counter by her health).
+    /// What she has left of the explosive she has chosen to throw
+    /// (grenades, C4 or mines): the explosives box's count.
     pub grenades: u32,
     /// The label of the vehicle she is in.
     pub vehicle: Option<String>,
@@ -426,8 +429,9 @@ pub struct HudState {
     /// Messages for the message buffer since the last state.
     pub messages: Vec<ObjectiveMessage>,
     /// Who is under the reticle, as `GuiReticleUpdate` takes it: -1 an
-    /// enemy, 0 anyone else; and their health (of 100).
-    pub target: Option<(i32, i32)>,
+    /// enemy, 0 anyone else; their health, and its most (their template's
+    /// `Health`: a VZ soldier's 75).
+    pub target: Option<(i32, i32, i32)>,
     /// Where she is (world), and which way she faces: degrees, growing
     /// turning left, as the heading.
     pub position: Option<[f32; 3]>,
@@ -593,7 +597,8 @@ impl HudState {
             .and_then(|i| game.scene.vehicles.get(i));
         let at = player.map(|p| p.character.position);
         // On foot, the person a shot fired now would hit: soldiers who
-        // have turned on her are enemies.
+        // have turned on her are enemies. Their health of their own most
+        // (their template's), which the arc shows a share of.
         let people = &game.scene.people;
         let target = player
             .filter(|p| p.driving.is_none())
@@ -603,7 +608,12 @@ impl HudState {
             .filter(|n| n.alive)
             .map(|n| {
                 let enemy = n.soldier && n.alert;
-                (-i32::from(enemy), n.hp.round().clamp(0.0, 100.0) as i32)
+                let most = n.ai.health.round().max(1.0);
+                (
+                    -i32::from(enemy),
+                    n.hp.round().clamp(0.0, most) as i32,
+                    most as i32,
+                )
             });
         let hurts = game
             .combat
@@ -619,7 +629,7 @@ impl HudState {
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             rifle: game.combat.rifle_rounds,
-            grenades: game.combat.grenades,
+            grenades: game.combat.explosive_left().1,
             vehicle: vehicle.map(|v| v.spec.label.clone()),
             vehicle_templates: vehicle
                 .zip(game.scene.world.as_ref())
@@ -1349,7 +1359,7 @@ struct Told {
     ammo: Option<[i64; 5]>,
     vehicle: Option<Option<String>>,
     vehicle_templates: Option<Vec<String>>,
-    target: Option<Option<(i32, i32)>>,
+    target: Option<Option<(i32, i32, i32)>>,
     reticle: Option<Option<[f32; 2]>>,
     regions: Option<Vec<RadarRegion>>,
     /// The support item ready (how many, whether free), and the menu.
@@ -2464,7 +2474,9 @@ impl Thread {
             };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
-            // health type: that bar shows only on a target.
+            // health type: that bar shows only on a target. The crosshair
+            // for every gun but the cannon (inferred, as the textures are:
+            // the tank's none is its own template's).
             let t = table(
                 lua,
                 [
@@ -2520,19 +2532,27 @@ impl Thread {
                 fire(lua, "GuiReticlePositionChange", t)?;
             }
         }
-        if self.told.target != Some(s.target) {
+        // (target, centre x, y, spread x, y, health, maximum), again as the
+        // aim moves too, not only as who is under it changes: the centre
+        // is the aim point, -1..=1 as `GuiReticlePositionChange` has it
+        // (inferred: the handler isn't read here), for the crosshair to sit
+        // where shots go rather than at the layout's middle. No spread (0,
+        // inferred: the guns' spreads aren't read). No health fades the
+        // target-health arc (opaque as laid out); a health shows that share
+        // of the target's own most.
+        if moved || self.told.target != Some(s.target) {
             self.told.target = Some(s.target);
-            // (target, centre x, y, spread x, y, health, maximum): no
-            // health fades the target-health arc (opaque as laid out);
-            // a health shows that much of it.
-            match s.target {
-                Some((kind, hp)) => fire(
-                    lua,
-                    "GuiReticleUpdate",
-                    (kind, Value::Nil, Value::Nil, 0, 0, hp, 100),
-                )?,
-                None => fire(lua, "GuiReticleUpdate", 0)?,
-            }
+            let number = |v: f32| Value::Number(v.into());
+            let (x, y) = s
+                .reticle
+                .map_or((Value::Nil, Value::Nil), |[x, y]| (number(x), number(y)));
+            let (kind, hp, most) = match s.target {
+                Some((kind, hp, most)) => {
+                    (kind, Value::Integer(hp.into()), Value::Integer(most.into()))
+                }
+                None => (0, Value::Nil, Value::Nil),
+            };
+            fire(lua, "GuiReticleUpdate", (kind, x, y, 0, 0, hp, most))?;
         }
         for &(damage, direction) in &s.hurts {
             fire(lua, "GuiPlayerReceiveDamage", (direction, damage))?;
