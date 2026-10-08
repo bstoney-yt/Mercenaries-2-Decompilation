@@ -46,6 +46,12 @@ pub const ACTIONS: u32 = 0x6802_c321;
 pub const VEHICLE_ANIMATIONS: u32 = 0x1826_24e1;
 /// The on-foot handle table.
 pub const CHARACTER_ANIMATIONS: u32 = 0xe00b_080c;
+/// The on-foot table's columns for who plays a row's clips, named as the
+/// `HumanAnimationSet` fields that say it of a character (inferred, as
+/// the vehicle table's `VehicleClass` and `VehicleName` are its
+/// `VehicleAnimationSet`'s).
+pub const GENDER: &str = "Gender";
+pub const CHARACTER_NAME: &str = "CharacterName";
 
 /// A column's type code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +307,54 @@ pub fn seat_clip_row(
     Some((clip, row))
 }
 
+/// The clip a character plays where the on-foot table
+/// ([`CHARACTER_ANIMATIONS`]) gives someone else `clip`. Each row listing
+/// `clip` (in its `Animation` list) is picked by its cells (its handle,
+/// equipment and the rest of the name-hash columns before the list, as
+/// the other tables lay out their filters); the same cells with the
+/// character's own `who` (column and value: [`GENDER`] and
+/// [`CHARACTER_NAME`]) pick the row whose list is the character's
+/// ([`AnimationTable::best`]). Of those lists, `clip` itself if one has
+/// it and it `fits`, else the first listed that `fits`. `None` when no row
+/// lists `clip`, none fits, or the table lacks a column named.
+pub fn character_clip(
+    table: &AnimationTable,
+    clip: u32,
+    who: &[(&str, u32)],
+    fits: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let list = table.column("Animation")?;
+    if table.columns[list].kind != ColumnKind::List {
+        return None;
+    }
+    let who: Vec<(usize, u32)> = who
+        .iter()
+        .map(|&(name, v)| Some((table.column(name)?, v)))
+        .collect::<Option<_>>()?;
+    let mut theirs = Vec::new();
+    for row in 1..table.rows() {
+        if !table.list(row, list).contains(&clip) {
+            continue;
+        }
+        let filters: Vec<(usize, Option<u32>)> = (0..table.columns.len())
+            .filter_map(|c| match who.iter().find(|w| w.0 == c) {
+                Some(&(_, v)) => Some((c, Some(v))),
+                None if c < list && table.columns[c].kind == ColumnKind::Hash => {
+                    Some((c, table.cell(row, c).filter(|&v| v != ANY)))
+                }
+                None => None,
+            })
+            .collect();
+        if let Some(best) = table.best(&filters) {
+            theirs.extend_from_slice(table.list(best, list));
+        }
+    }
+    if theirs.contains(&clip) && fits(clip) {
+        return Some(clip);
+    }
+    theirs.into_iter().find(|&c| fits(c))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +487,58 @@ mod tests {
         let t = AnimationTable::parse(&asset).unwrap();
         assert_eq!(t.list(1, 1), &[0x9d88_6544]);
         assert_eq!(t.list(0, 1), &[] as &[u32]);
+    }
+
+    #[test]
+    fn a_character_gets_the_clip_its_own_row_lists() {
+        let (run, aim) = (0x1111, 0x2222);
+        let (hero, jen, mat, chris) = (0x51, 0x60, 0x61, 0x62);
+        let (rifle, pistol) = (0x71, 0x72);
+        let m = (-1.0f32).to_bits();
+        // Lists at word offsets 2 (anyone's rifle run), 4 (hers), 6 (his
+        // two), 9 (his pistol run) and 11 (anyone's aim).
+        let asto = [0, 1, 0xa1, 1, 0xe3, 2, 0x10, 0x11, 1, 0x20, 1, 0x01];
+        let asset = table(
+            &[
+                ("Handle", 4),
+                (GENDER, 4),
+                (CHARACTER_NAME, 4),
+                ("EquipmentClass", 4),
+                ("Animation", 8),
+                ("MinTimeScale", 3),
+            ],
+            &[
+                &[ANY; 6],
+                &[run, ANY, ANY, rifle, 2, m],
+                &[run, hero, jen, rifle, 4, m],
+                &[run, hero, mat, rifle, 6, m],
+                &[run, hero, mat, pistol, 9, m],
+                &[aim, ANY, ANY, rifle, 11, m],
+            ],
+            Some(&asto),
+        );
+        let t = AnimationTable::parse(&asset).unwrap();
+        let who = |name| [(GENDER, hero), (CHARACTER_NAME, name)];
+        let all = |_| true;
+        // Her rifle run: his rifle run (not his pistol one), the first
+        // listed that fits.
+        assert_eq!(character_clip(&t, 0xe3, &who(mat), all), Some(0x10));
+        assert_eq!(
+            character_clip(&t, 0xe3, &who(mat), |c| c != 0x10),
+            Some(0x11)
+        );
+        // From anyone's row too; with no row of his own, anyone's.
+        assert_eq!(character_clip(&t, 0xa1, &who(mat), all), Some(0x10));
+        assert_eq!(character_clip(&t, 0xe3, &who(chris), all), Some(0xa1));
+        // The aim is everyone's: kept.
+        assert_eq!(character_clip(&t, 0x01, &who(mat), all), Some(0x01));
+        // Not listed, nothing fitting, or no such column: nothing.
+        assert_eq!(character_clip(&t, 0x99, &who(mat), all), None);
+        assert_eq!(character_clip(&t, 0xe3, &who(mat), |_| false), None);
+        assert_eq!(
+            character_clip(&t, 0xe3, &[("CharacterNameX", mat)], all),
+            None
+        );
     }
 
     #[test]

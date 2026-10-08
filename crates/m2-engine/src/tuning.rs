@@ -351,6 +351,21 @@ pub fn human_speeds(db: &Layer<'_>) -> HashMap<u32, [f32; 3]> {
         .collect()
 }
 
+/// Every person template's `HumanAnimationSet`: its `Gender` and
+/// `CharacterName` (name hashes: Mattias's `Hero` and `mattias`), which
+/// pick the character's rows of the on-foot animation table
+/// ([`m2_assets::animation_table::character_clip`]), by id.
+pub fn human_animation_sets(db: &Layer<'_>) -> HashMap<u32, (u32, u32)> {
+    let sets = Table::new(db, "HumanAnimationSet");
+    let (gender, name) = (name_hash("Gender"), name_hash("CharacterName"));
+    sets.templates()
+        .filter_map(|t| {
+            let r = sets.of_template(t).first()?;
+            Some((t, (sets.word(r, gender)?, sets.word(r, name)?)))
+        })
+        .collect()
+}
+
 /// Every template's `Health` value, by id: a vehicle's, a person's, a
 /// hero's (the `Mattias` template's 120).
 pub fn healths(db: &Layer<'_>) -> HashMap<u32, f32> {
@@ -669,6 +684,11 @@ mod tests {
             // its blade and blur nodes are `vehicle::MAIN_ROTOR`'s.
             ("RotorHubBoneName", 0xc93e_7607),
             ("SpinDir", 0xc9d2_9446),
+            // `HumanAnimationSet`'s values for the heroes (heroes round
+            // 02): `Gender` `Hero`, `CharacterName` `mattias`, `Chris`.
+            ("Hero", 0x5172_8909),
+            ("mattias", 0x030e_6c38),
+            ("Chris", 0xd64b_b122),
         ] {
             assert_eq!(name_hash(name), key, "{name}");
         }
