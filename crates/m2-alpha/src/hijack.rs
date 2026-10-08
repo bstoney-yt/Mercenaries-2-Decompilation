@@ -34,6 +34,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use m2_assets::WadArchive;
 use m2_assets::animation::{ANIMATION_TYPE, Clip};
+use m2_assets::animation_table;
 use m2_engine::Install;
 use m2_engine::hijack::HijackEntrance;
 use m2_game::api::Command;
@@ -213,6 +214,8 @@ struct Seat {
     clip: u32,
     /// The seat, model space: her clip's origin goes there.
     at: Vec3,
+    /// She can be seen there: not inside, under a hatch.
+    shown: bool,
 }
 
 impl Hijacks {
@@ -725,7 +728,8 @@ impl Hijacks {
         if let Some(p) = &mut game.scene.player {
             p.off_foot();
         }
-        let seated = self.seats[&key].and_then(|seat| {
+        // Inside, under a hatch, she isn't seen.
+        let seated = self.seats[&key].filter(|s| s.shown).and_then(|seat| {
             let index = bind(game, seat.clip)?;
             let scene = &mut game.scene;
             let world = scene.world.as_ref()?;
@@ -896,6 +900,14 @@ fn follow(
                     p.landed = true;
                 }
                 over = true;
+            }
+            // Not acted on yet: whether the scripts hide her (gone in
+            // through the hatch) tells which seats she is seen in.
+            HijackCommand::Visible { guid, on } if guid == a.hero => {
+                eprintln!(
+                    "hijack: the scripts {} her",
+                    if on { "show" } else { "hide" }
+                );
             }
             HijackCommand::AbortDone { hero } if hero == a.hero => {
                 eprintln!("hijack: failed");
@@ -1086,7 +1098,10 @@ fn dress(
 /// The driver's seat of vehicle `i`: its template (the first by name of
 /// those with its model and an animation set), that template's
 /// `seat_driver` (else first) `SeatLink` and the hardpoint it names, else
-/// the model's driver's seat marker.
+/// the model's driver's seat marker; and whether she is seen there
+/// ([`Seat::shown`]). `None` (she is not drawn) without a template with
+/// an animation set, a seated clip or a place for the seat. Each says
+/// why in the log.
 fn find_seat(
     game: &mut Game,
     points: &mut HashMap<(u32, u32), Option<Vec3>>,
@@ -1096,6 +1111,7 @@ fn find_seat(
     let scene = &mut game.scene;
     let v = scene.vehicles.get(i)?;
     let (model, marker) = (v.spec.model, v.spec.seat);
+    let (hull, turret) = (v.spec.hull, v.spec.turret_box);
     let label = v.spec.label.to_ascii_lowercase();
     let db = &scene.world.as_ref()?.index.template_db;
     // Its own template when its label names one (`M151 Softtop (GR)`),
@@ -1108,21 +1124,66 @@ fn find_seat(
         .filter(|name| clips.sets.contains_key(name))
         .collect();
     names.sort_by_key(|n| (*n != label, !clips.seats.contains_key(n), n.clone()));
-    let name = names.first()?;
+    let Some(name) = names.first() else {
+        eprintln!("seat: {label}: no template of its model has a VehicleAnimationSet: not drawn");
+        return None;
+    };
     let set = clips.sets[name];
     let driver = m2_assets::name_hash("seat_driver");
     let links = clips.seats.get(name.as_str());
     let link = links.and_then(|l| l.iter().find(|s| s.0 == driver).or(l.first()));
-    let clip = clips
-        .seated(set, link.map(|l| l.0))
-        .or_else(|| clips.seated(set, None))?;
     let hardpoint = link
         .and_then(|l| l.1)
         .and_then(|h| point(points, scene.source.as_mut(), model, h));
     eprintln!("seat: {name} link {link:x?} hardpoint {hardpoint:?} marker {marker:?}");
+    // The tables' clip for the seat, and the row of the vehicle table
+    // that gives it (the vehicle's own, its class's, or one for any).
+    let Some(((clip, row), vehicles)) = clips.tables.as_ref().and_then(|(actions, vehicles)| {
+        let seat = link.map(|l| l.0);
+        let found =
+            animation_table::seat_clip_row(actions, vehicles, "InVehicle", "Idle", set, seat)?;
+        Some((found, vehicles))
+    }) else {
+        eprintln!("seat: {name}: the tables give its seat no InVehicle Idle clip: not drawn");
+        return None;
+    };
+    let cell = |column: &str| match vehicles.column(column).and_then(|c| vehicles.cell(row, c)) {
+        Some(animation_table::ANY) => "any".to_owned(),
+        Some(v) => format!("{v:08x}"),
+        None => "-".to_owned(),
+    };
+    eprintln!(
+        "seat: {name}: clip {clip:08x} from the vehicle table's row {row} (class {}, vehicle {}, seat {}; set {:08x?})",
+        cell("VehicleClass"),
+        cell("VehicleName"),
+        cell("SeatName"),
+        [set.0, set.1],
+    );
+    let Some(at) = hardpoint.or(marker) else {
+        eprintln!("seat: {name}: no hardpoint or seat marker for the seat: not drawn");
+        return None;
+    };
+    // Inferred: a seat on a turret, above the top of the hull, is under
+    // its hatch: whoever sits there is inside, out of sight. The AMX30's
+    // seat_driver hardpoint is on its turret, 2.0 m up (Brendan's
+    // playtest drew her standing on it the whole drive), and a tank's
+    // driver is expected hidden in the hull (the hijack thread's notes).
+    let hatch = turret.is_some() && at.y > hull.1.y;
+    eprintln!(
+        "seat: {name}: seat {:.2} m up, hull top {:.2} m{}: {}",
+        at.y,
+        hull.1.y,
+        if turret.is_some() { ", turreted" } else { "" },
+        if hatch {
+            "under a hatch, she is not drawn"
+        } else {
+            "she is drawn there"
+        }
+    );
     Some(Seat {
         clip,
-        at: hardpoint.or(marker)?,
+        at,
+        shown: !hatch,
     })
 }
 
