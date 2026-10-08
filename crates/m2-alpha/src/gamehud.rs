@@ -1860,17 +1860,17 @@ impl Thread {
                 images.push((hash, image));
             }
         }
-        let callbacks = self
-            .mission
-            .lua()
-            .globals()
+        // Taken out, not emptied: mlua's `Table::clear` (Lua 5.1) leaves the
+        // table on the Lua stack, one slot a frame, until every call into
+        // the HUD's scripts fails ("out of Lua stack") after ~8000 frames.
+        let globals = self.mission.lua().globals();
+        let callbacks = globals
             .raw_get::<Option<mlua::Table>>("__m2_hud_done")
             .ok()
             .flatten()
             .map(|t| {
-                let seqs: Vec<u64> = t.sequence_values::<u64>().flatten().collect();
-                t.clear().ok();
-                seqs
+                let _ = globals.raw_set("__m2_hud_done", mlua::Value::Nil);
+                t.sequence_values::<u64>().flatten().collect()
             })
             .unwrap_or_default();
         Output::Frame {
