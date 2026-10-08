@@ -53,6 +53,7 @@ mod input;
 mod mission;
 mod movie;
 mod moving;
+mod multiply;
 mod npc;
 mod player;
 mod props;
@@ -2089,7 +2090,8 @@ fn front_end_offscreen(
         if let Some(since) = since {
             for (i, &k) in keys.iter().enumerate() {
                 let at = 3.0 + 2.0 * i as f64;
-                if since < at && since + step >= at {
+                // Key 0 only waits.
+                if since < at && since + step >= at && k != 0 {
                     pressed.extend([(k, true), (k, false)]);
                     eprintln!("front end: key {k} at {t:.1} s");
                 }

@@ -357,6 +357,8 @@ pub struct Clip {
     pub colour: ColourTransform,
     pub visible: bool,
     pub clip_depth: Option<i32>,
+    /// Its blend mode (see [`Place::blend`]), 0 if never set.
+    pub blend: u8,
     /// Placed by its parent's timeline (cleared when that goes back).
     pub from_timeline: bool,
     pub timeline: Option<Rc<Timeline>>,
@@ -392,6 +394,7 @@ impl Clip {
             colour: ColourTransform::IDENTITY,
             visible: true,
             clip_depth: None,
+            blend: 0,
             from_timeline: false,
             timeline: None,
             frame: 0,
@@ -614,6 +617,7 @@ impl Player {
                         .clip_depth
                         .map(|d| i32::from(d) + TIMELINE_DEPTH)
                         .or(keep.as_ref().and_then(|o| o.clip_depth));
+                    c.blend = p.blend.or(keep.as_ref().map(|o| o.blend)).unwrap_or(0);
                     c.name = p.name.clone().or(keep.map(|o| o.name)).unwrap_or_default();
                 }
                 // A sprite shows its first frame as it is placed.
@@ -632,6 +636,9 @@ impl Player {
                     }
                     if let Some(d) = p.clip_depth {
                         c.clip_depth = Some(i32::from(d) + TIMELINE_DEPTH);
+                    }
+                    if let Some(b) = p.blend {
+                        c.blend = b;
                     }
                     if let Some(n) = &p.name {
                         c.name.clone_from(n);
@@ -846,6 +853,7 @@ impl Player {
         if !c.visible || nesting > 64 {
             return;
         }
+        let start = out.len();
         let m = parent_matrix.then(&c.matrix);
         let col = parent_colour.then(&c.colour);
         match &c.kind {
@@ -904,6 +912,13 @@ impl Player {
                 })
             });
             self.draw_clip(child, &m, &col, inner, fonts, out, nesting + 1);
+        }
+        // Multiply: each triangle multiplies what is under it (as the
+        // whole would, where they do not overlap).
+        if c.blend == 3 {
+            for t in &mut out[start..] {
+                t.multiply = true;
+            }
         }
     }
 }

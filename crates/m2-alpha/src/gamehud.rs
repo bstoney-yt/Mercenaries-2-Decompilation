@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write as _};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
@@ -701,6 +702,8 @@ pub struct Prim {
     pub corners: [[f32; 2]; 4],
     pub uv: [[f32; 2]; 4],
     pub colour: [f32; 4],
+    /// Multiplies what is under it (Flash's multiply blend mode).
+    pub multiply: bool,
 }
 
 /// RGBA8 pixels.
@@ -761,6 +764,9 @@ pub struct GameHud {
     pending: Vec<(u32, Option<Image>)>,
     /// Textures by asset hash (`None`: missing in the archive).
     textures: HashMap<u32, Option<TextureHandle>>,
+    /// Their pixels, for the triangles drawn multiplying
+    /// ([`crate::multiply`]).
+    pixels: HashMap<u32, Arc<crate::multiply::Pixels>>,
     /// Leave out solid prims over most of the screen (fades): for
     /// pictures with and without them (`M2_PAINT_AB`).
     pub skip_covers: bool,
@@ -825,6 +831,7 @@ impl GameHud {
             prims: Vec::new(),
             pending: Vec::new(),
             textures: HashMap::new(),
+            pixels: HashMap::new(),
             skip_covers: false,
             last_message: None,
             last_call: 0,
@@ -985,6 +992,16 @@ impl GameHud {
 
     fn upload(&mut self, ctx: &egui::Context) {
         for (hash, image) in self.pending.drain(..) {
+            if let Some(i) = &image {
+                self.pixels.insert(
+                    hash,
+                    Arc::new(crate::multiply::Pixels {
+                        width: i.width,
+                        height: i.height,
+                        rgba: i.rgba.clone(),
+                    }),
+                );
+            }
             let handle = image.map(|i| {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
                     [i.width as usize, i.height as usize],
@@ -1006,7 +1023,59 @@ impl GameHud {
     /// triangles smeared: their feathering assumes one winding.)
     pub fn paint(&self, painter: &egui::Painter) {
         let mut mesh = Mesh::default();
+        // Multiplying triangles in a row with one texture, drawn together.
+        let mut multiply: Option<(u64, Vec<crate::multiply::Vertex>)> = None;
+        let clip = painter.clip_rect();
+        let flush_multiply = |m: &mut Option<(u64, Vec<crate::multiply::Vertex>)>| {
+            if let Some((key, vertices)) = m.take() {
+                let pixels = match self.pixels.get(&(key as u32)) {
+                    Some(p) if key <= u64::from(u32::MAX) => Arc::clone(p),
+                    _ => Arc::new(crate::multiply::Pixels {
+                        width: 1,
+                        height: 1,
+                        rgba: vec![255; 4],
+                    }),
+                };
+                painter.add(egui_wgpu::Callback::new_paint_callback(
+                    clip,
+                    crate::multiply::Multiply::new((key, pixels), vertices),
+                ));
+            }
+        };
         for p in &self.prims {
+            if p.multiply {
+                if p.texture.is_some_and(|h| !self.pixels.contains_key(&h)) {
+                    continue;
+                }
+                // Solid fills multiply by a white texel.
+                let key = p.texture.map_or(u64::MAX, u64::from);
+                if multiply.as_ref().is_some_and(|(k, _)| *k != key) {
+                    flush_multiply(&mut multiply);
+                }
+                if !mesh.is_empty() {
+                    painter.add(std::mem::take(&mut mesh));
+                }
+                let (_, vertices) = multiply.get_or_insert_with(|| (key, Vec::new()));
+                let ndc = |c: [f32; 2]| {
+                    [
+                        (c[0] - clip.min.x) / clip.width().max(1.0) * 2.0 - 1.0,
+                        1.0 - (c[1] - clip.min.y) / clip.height().max(1.0) * 2.0,
+                    ]
+                };
+                for i in [0, 1, 2, 0, 2, 3] {
+                    vertices.push(crate::multiply::Vertex {
+                        pos: ndc(p.corners[i]),
+                        uv: if p.texture.is_some() {
+                            p.uv[i]
+                        } else {
+                            [0.5; 2]
+                        },
+                        colour: p.colour.map(|c| c.clamp(0.0, 1.0)),
+                    });
+                }
+                continue;
+            }
+            flush_multiply(&mut multiply);
             let texture = match p.texture {
                 Some(hash) => match self.textures.get(&hash) {
                     Some(Some(t)) => t.id(),
@@ -1036,6 +1105,7 @@ impl GameHud {
             }
             mesh.indices.extend([0, 1, 2, 0, 2, 3].map(|i| base + i));
         }
+        flush_multiply(&mut multiply);
         if !mesh.is_empty() {
             painter.add(mesh);
         }
@@ -2778,6 +2848,7 @@ fn quad(texture: Option<u32>, r: [f32; 4], uv: [f32; 4], colour: [f32; 4], degre
             [uv[0], uv[3]],
         ],
         colour,
+        multiply: false,
     }
 }
 
@@ -3131,6 +3202,7 @@ fn triangle_prims(triangles: &[flash::Triangle], out: &mut Vec<Prim>, want: &mut
             corners: [a, b, c, c],
             uv: [ua, ub, uc, uc],
             colour: t.colour,
+            multiply: t.multiply,
         });
     }
 }
@@ -3313,6 +3385,7 @@ fn minimap(
             corners: [[cx, cy], point(a), point(b), point(b)],
             uv: [centre_uv, ua, ub, ub],
             colour: white,
+            multiply: false,
         });
     }
     road_strokes(view, roads, out, want);
@@ -3415,6 +3488,7 @@ fn road_strokes(view: &MapView, roads: &[Road], out: &mut Vec<Prim>, want: &mut 
                     ],
                     uv: [[u, 0.0], [u2, 0.0], [u2, 1.0], [u, 1.0]],
                     colour,
+                    multiply: false,
                 });
             };
             if road.paved {
@@ -3663,6 +3737,7 @@ fn fan(poly: &[[f32; 2]], colour: [f32; 4], out: &mut Vec<Prim>) {
             corners: [a, b, c, c],
             uv: [[0.0; 2]; 4],
             colour,
+            multiply: false,
         });
     }
 }
@@ -3712,6 +3787,7 @@ fn stroke(a: [f32; 2], b: [f32; 2], width: f32, colour: [f32; 4]) -> Prim {
         ],
         uv: [[0.0; 2]; 4],
         colour,
+        multiply: false,
     }
 }
 
@@ -3780,6 +3856,7 @@ fn wedge(
                 corners: points.map(turned),
                 uv: points.map(uv_at),
                 colour,
+                multiply: false,
             }
         })
         .collect()
@@ -4274,6 +4351,7 @@ mod paint_tests {
             )],
             pending: Vec::new(),
             textures: HashMap::new(),
+            pixels: HashMap::new(),
             skip_covers: false,
             last_message: None,
             last_call: 0,
