@@ -1985,6 +1985,32 @@ fn actions<R: Read + Seek>(wad: &mut WadArchive<R>, name: &str) -> AnyResult<()>
         .map(|t| (t.code, &movie.body[t.offset..t.offset + t.len]))
         .collect();
     timeline_actions("root", &root);
+    // Blend modes, where set.
+    let lib = m2_assets::flash::Library::new(&movie);
+    let names: HashMap<u16, String> = lib.exports.iter().map(|(n, &id)| (id, n.clone())).collect();
+    let mut timelines: Vec<(String, &m2_assets::flash::player::Timeline)> =
+        vec![("root".into(), &lib.root)];
+    for (id, t) in &lib.sprites {
+        timelines.push((format!("sprite {id}"), t));
+    }
+    for (who, t) in timelines {
+        for (f, controls) in t.frames.iter().enumerate() {
+            for c in controls {
+                if let m2_assets::flash::player::Control::Place(p) = c
+                    && let Some(blend) = p.blend.filter(|&b| b > 1)
+                {
+                    let ch = p.character;
+                    println!(
+                        "{who} frame {}: blend {blend} on depth {} character {ch:?} {:?} as {:?}",
+                        f + 1,
+                        p.depth,
+                        ch.and_then(|c| names.get(&c)),
+                        p.name
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
