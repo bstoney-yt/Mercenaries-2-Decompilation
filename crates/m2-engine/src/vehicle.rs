@@ -69,13 +69,15 @@ pub const WEAPONS: [(&str, &str); 4] = [
 /// Hand weapons found by their models' own names (the names their
 /// templates' `ModelName` hash): the first contract's supply crate's
 /// grenade launcher and its 40 mm round, her carbine (the template
-/// "Carbine") and the satellite designator (the template "Satellite
-/// Designator").
-pub const NAMED_WEAPONS: [(&str, &str); 4] = [
+/// "Carbine"), the satellite designator (the template "Satellite
+/// Designator") and Jennifer's own rifle (the template "Bullpup Rifle";
+/// Mattias's "Assault Rifle" is the AK-47).
+pub const NAMED_WEAPONS: [(&str, &str); 5] = [
     ("mgl", "global_weapon_mgl"),
     ("40mm", "global_weapon_40mmgrenade"),
     ("m4", "global_weapon_m4"),
     ("detonator", "global_weapon_detonator"),
+    ("bullpup", "global_weapon_bullpup"),
 ];
 
 /// Root node of every human skeleton.

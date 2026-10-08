@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever `catalogue()` changes what it finds, so old caches are
 /// searched afresh.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const FILE_NAME: &str = "m2-alpha-catalogue.toml";
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
