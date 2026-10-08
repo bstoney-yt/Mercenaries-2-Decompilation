@@ -199,8 +199,9 @@ pub struct Hijacks {
     points: HashMap<(u32, u32), Option<Vec3>>,
     near: Option<Candidate>,
     active: Option<Active>,
-    /// Each vehicle model's driver's seat, once looked up.
-    seats: HashMap<u32, Option<Seat>>,
+    /// Each vehicle's driver's seat, once looked up, by its model and
+    /// label (its template's name, which picks the seat).
+    seats: HashMap<(u32, String), Option<Seat>>,
     /// Vehicles (index, model) whose parts are set as their templates say.
     dressed: std::collections::HashSet<(usize, u32)>,
 }
@@ -527,10 +528,12 @@ impl Hijacks {
                 ),
             });
             // Her clips move her from here on (`down` keeps her own
-            // moves and gaits from playing over them); the camera looks
-            // across the vehicle from its side.
+            // moves and gaits from playing over them, and what she did on
+            // foot stops: her weapon's pose would lie over the clips);
+            // the camera looks across the vehicle from its side.
             if let Some(p) = &mut game.scene.player {
                 p.down = true;
+                p.off_foot();
                 // From the entrance's side of the vehicle.
                 let side = at.inverse().transform_point3(c.at).x.signum();
                 let out = at.transform_vector3(Vec3::X * side);
@@ -674,8 +677,9 @@ impl Hijacks {
     }
 
     /// While she drives (and no hijack plays), she sits in the driver's
-    /// seat, playing the clip the tables give that seat. Runs after the
-    /// game's tick, like [`place`](Self::place).
+    /// seat, playing the clip the tables give that seat, turned and
+    /// tilted with the vehicle. Runs after the game's tick, like
+    /// [`place`](Self::place).
     pub fn seat(&mut self, game: &mut Game, dt: f32) {
         let State::Ready(loaded) = &self.state else {
             return;
@@ -687,19 +691,41 @@ impl Hijacks {
         let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
             if let Some(p) = &mut game.scene.player {
                 p.seated = false;
+                p.seat_frame = None;
             }
             return;
         };
         let Some(v) = game.scene.vehicles.get(i) else {
             return;
         };
-        let model = v.spec.model;
-        if !self.seats.contains_key(&model) {
+        // By the template the seat comes from (its label names it): the
+        // soft-top and gun M151s share a model, not their seats.
+        let key = (v.spec.model, v.spec.label.to_ascii_lowercase());
+        if !self.seats.contains_key(&key) {
             let seat = find_seat(game, &mut self.points, &loaded.clips, i);
-            eprintln!("seat: model {model:08x} {seat:?}");
-            self.seats.insert(model, seat);
+            eprintln!("seat: model {:08x} ({}) {seat:?}", key.0, key.1);
+            // Where the clip has her from its origin (pinned as a walk
+            // is, her pelvis would go on the seat point).
+            if let Some(index) = seat.and_then(|s| bind(game, s.clip))
+                && let Some((_, rig)) = game.scene.player.as_ref().and_then(|p| p.model.as_ref())
+            {
+                let c = &rig.clips[index];
+                eprintln!(
+                    "seat: clip {:08x}: root starts at {:.2?} (x, z), pelvis {:.2} m up at {:.2?}",
+                    c.hash,
+                    c.info.root_start.to_array(),
+                    c.info.hips,
+                    (c.info.root_start - c.info.pin).to_array()
+                );
+            }
+            self.seats.insert(key.clone(), seat);
         }
-        let seated = self.seats[&model].and_then(|seat| {
+        // What she did on foot stops (Player::update, which would end it,
+        // doesn't run while she drives).
+        if let Some(p) = &mut game.scene.player {
+            p.off_foot();
+        }
+        let seated = self.seats[&key].and_then(|seat| {
             let index = bind(game, seat.clip)?;
             let scene = &mut game.scene;
             let world = scene.world.as_ref()?;
@@ -714,12 +740,20 @@ impl Hijacks {
                 .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
             let ahead = at.transform_vector3(Vec3::Z);
             p.facing = ahead.x.atan2(ahead.z) + forward.x.atan2(forward.y);
-            p.character.position = at.transform_point3(seat.at);
+            // Her clip's space is the vehicle's, its origin on the seat
+            // (her model's axes the vehicle's, as the hijack clips'),
+            // with the vehicle's whole turn.
+            let frame = at * Mat4::from_translation(seat.at + seat_offset(rig, index));
+            p.seat_frame = Some(frame);
+            p.character.position = frame.transform_point3(Vec3::ZERO);
             p.character.velocity = Vec3::ZERO;
             Some(())
         });
         if let Some(p) = &mut game.scene.player {
             p.seated = seated.is_some();
+            if !p.seated {
+                p.seat_frame = None;
+            }
         }
     }
 
@@ -1089,6 +1123,31 @@ fn find_seat(
     Some(Seat {
         clip,
         at: hardpoint.or(marker)?,
+    })
+}
+
+/// Where her seated loop (clip `clip`, an index into her rig's clips)
+/// has its root now from the clip's origin, flat. The animator pins every
+/// clip's pelvis over her model's origin, as a walk's must be; the seated
+/// loops are cut with their origin on the seat (the viewer's, checked by
+/// eye on the HMMWV, played them so), so the root goes back where the
+/// clip has it, as [`Hijacks::place`] puts a hijack clip's.
+fn seat_offset(rig: &crate::scene::Rig, clip: usize) -> Vec3 {
+    let Some(c) = rig.clips.get(clip) else {
+        return Vec3::ZERO;
+    };
+    let t = rig
+        .animator
+        .current()
+        .filter(|cur| cur.0 == clip)
+        .map_or(0.0, |cur| cur.1);
+    let pose = c.sample_looped(&rig.skeleton, t);
+    pose.0.get(rig.skeleton.root()).map_or(Vec3::ZERO, |l| {
+        Vec3::new(
+            l.translation.x - c.info.pin.x,
+            0.0,
+            l.translation.z - c.info.pin.y,
+        )
     })
 }
 
