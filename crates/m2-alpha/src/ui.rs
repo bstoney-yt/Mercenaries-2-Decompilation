@@ -26,6 +26,8 @@ pub struct HudInfo {
     pub hp: f32,
     pub down: bool,
     pub weapon: Weapon,
+    /// Her rifle's template name (`Carbine`, `Bullpup Rifle`).
+    pub rifle: String,
     /// What she carries in the launcher's place, if anything.
     pub second: Option<Weapon>,
     /// Grenades she has.
@@ -314,8 +316,10 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
                 Weapon::GrenadeLauncher => "grenade launcher",
             };
             let up = match (info.weapon, info.rounds) {
-                (Weapon::Rifle, Some((clip, stored))) => format!("Carbine {clip} | {stored}"),
-                (Weapon::Rifle, None) => "Carbine".to_owned(),
+                (Weapon::Rifle, Some((clip, stored))) => {
+                    format!("{} {clip} | {stored}", info.rifle)
+                }
+                (Weapon::Rifle, None) => info.rifle.clone(),
                 (Weapon::Rpg, _) => "RPG".to_owned(),
                 (Weapon::GrenadeLauncher, Some((clip, stored))) => {
                     format!("Grenade launcher {clip} | {stored}")
