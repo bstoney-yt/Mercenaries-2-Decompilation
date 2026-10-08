@@ -718,8 +718,30 @@ enum Output {
         log: Vec<String>,
         /// The mission calls whose callbacks the HUD called.
         callbacks: Vec<u64>,
+        /// The front end's news (nothing for the HUD).
+        shell: ShellNews,
     },
     Failed(String),
+}
+
+/// What the front end ([`GameHud::start_shell`]) asks of the game.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShellNews {
+    /// The backdrop movie its movie widget plays (`shell_mainmenu_jennifer`)
+    /// and the widget's box, screen points.
+    pub movie: Option<(String, [f32; 4])>,
+    /// A new game was started, as this character (`MrxGuiShellBootstrap.
+    /// GetSelectedCharacter`: `Chris`, `Jen` or `mattias`).
+    pub new_game: Option<String>,
+}
+
+/// What a [`GameHud`] thread runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// The HUD, from `vz.wad`.
+    Hud,
+    /// The front end's menus, from `shell.wad`.
+    Shell,
 }
 
 enum Status {
@@ -750,6 +772,8 @@ pub struct GameHud {
     last_time: Option<f64>,
     /// Mission calls whose callbacks the HUD has called, to hand back.
     callbacks: Vec<u64>,
+    /// The front end's latest news (see [`GameHud::start_shell`]).
+    shell: ShellNews,
     log: Option<BufWriter<File>>,
 }
 
@@ -765,14 +789,33 @@ impl std::fmt::Debug for GameHud {
 impl GameHud {
     /// Starts the HUD's scripts reading `install` in the background.
     pub fn start(install: &Install) -> Self {
+        Self::start_mode(install, Mode::Hud, "m2-alpha-hud.log")
+    }
+
+    /// Starts the front end instead: the shell's own scripts and Flash
+    /// menus (`MrxGuiShell` and `shell.gfx`), as the game opens them after
+    /// its boot movies, drawn like the HUD. What they ask of the game
+    /// comes back as [`ShellNews`].
+    pub fn start_shell(install: &Install) -> Self {
+        Self::start_mode(install, Mode::Shell, "m2-alpha-shell.log")
+    }
+
+    fn start_mode(install: &Install, mode: Mode, log: &str) -> Self {
         let (tx, thread_rx) = channel();
         let (thread_tx, rx) = channel();
         let data = install.data.clone();
         std::thread::Builder::new()
-            .name("game hud".into())
-            .spawn(move || run(&data, thread_rx, thread_tx))
+            .name(
+                if mode == Mode::Shell {
+                    "front end"
+                } else {
+                    "game hud"
+                }
+                .into(),
+            )
+            .spawn(move || run(&data, mode, thread_rx, thread_tx))
             .expect("could not start the HUD thread");
-        let path = Config::file_beside("m2-alpha-hud.log");
+        let path = Config::file_beside(log);
         let log = File::create(&path).ok().map(BufWriter::new);
         Self {
             tx,
@@ -786,8 +829,19 @@ impl GameHud {
             last_message: None,
             last_call: 0,
             last_time: None,
+            shell: ShellNews::default(),
             log,
         }
+    }
+
+    /// The front end's latest news.
+    pub fn shell(&self) -> &ShellNews {
+        &self.shell
+    }
+
+    /// The character a new game was started as in the front end, once.
+    pub fn take_new_game(&mut self) -> Option<String> {
+        self.shell.new_game.take()
     }
 
     /// Logs to `path` instead of `m2-alpha-hud.log` (a second HUD in one
@@ -900,8 +954,11 @@ impl GameHud {
                 images,
                 log,
                 callbacks,
+                shell,
             } => {
                 self.callbacks.extend(callbacks);
+                let new_game = self.shell.new_game.take().or(shell.new_game);
+                self.shell = ShellNews { new_game, ..shell };
                 self.status = Status::Ready;
                 self.prims = prims;
                 self.pending.extend(images);
@@ -1122,8 +1179,8 @@ fn covers(p: &Prim, screen: egui::Rect) -> bool {
 
 /// The thread: reads the scripts, fonts and strings, starts the HUD, then
 /// draws each state sent until the sender goes.
-fn run(data: &std::path::Path, rx: Receiver<HudState>, tx: Sender<Output>) {
-    let mut hud = match Thread::start(data) {
+fn run(data: &std::path::Path, mode: Mode, rx: Receiver<HudState>, tx: Sender<Output>) {
+    let mut hud = match Thread::start(data, mode) {
         Ok(h) => h,
         Err(e) => {
             let _ = tx.send(Output::Failed(e));
@@ -1221,14 +1278,18 @@ struct Thread {
     movies: Rc<RefCell<Movies>>,
     /// The movies playing in the Flash widgets, by widget.
     flash: BTreeMap<u32, FlashMovie>,
+    mode: Mode,
 }
 
 /// The language archive beside `vz.wad` (English only for now).
 const LANGUAGE_WAD: &str = "English.wad";
 
 impl Thread {
-    fn start(data: &std::path::Path) -> Result<Self, String> {
-        let wad = data.join("vz.wad");
+    fn start(data: &std::path::Path, mode: Mode) -> Result<Self, String> {
+        let wad = data.join(match mode {
+            Mode::Hud => "vz.wad",
+            Mode::Shell => "shell.wad",
+        });
         let open = || {
             File::open(&wad)
                 .map(BufReader::new)
@@ -1269,6 +1330,10 @@ impl Thread {
             for (name, f) in &fonts {
                 s.set_font(name, f.clone());
             }
+        }
+        if mode == Mode::Shell {
+            crate::shell::open(&mut mission)?;
+            return Ok(Self::new(mission, assets, language, fonts, movies, mode));
         }
         // Her guns, for the gun box to name.
         {
@@ -1315,7 +1380,18 @@ impl Thread {
         // movies' load callbacks (the PDA's closes it, `_FinishLoadAndClose`;
         // left open, the support menu won't open over it).
         gui_runtime::tick(mission.lua(), 0.0);
-        Ok(Self {
+        Ok(Self::new(mission, assets, language, fonts, movies, mode))
+    }
+
+    fn new(
+        mission: Mission,
+        assets: AssetSource<BufReader<File>>,
+        language: Option<AssetSource<BufReader<File>>>,
+        fonts: BTreeMap<String, Font>,
+        movies: Movies,
+        mode: Mode,
+    ) -> Self {
+        Self {
             mission,
             assets,
             language,
@@ -1337,10 +1413,14 @@ impl Thread {
             pda: None,
             movies: Rc::new(RefCell::new(movies)),
             flash: BTreeMap::new(),
-        })
+            mode,
+        }
     }
 
     fn frame(&mut self, state: &HudState) -> Output {
+        if self.mode == Mode::Shell {
+            return self.shell_frame(state);
+        }
         let mut log = Vec::new();
         if let Err(e) = self.feed(state) {
             log.push(format!("event: {e}"));
@@ -1664,23 +1744,7 @@ impl Thread {
                     images.push((hash, image));
                     continue;
                 }
-                let found = self.assets.texture(hash, MAX_TEXTURE).or_else(|e| {
-                    self.language
-                        .as_mut()
-                        .and_then(|l| l.texture(hash, MAX_TEXTURE).ok())
-                        .ok_or(e)
-                });
-                let image = match found {
-                    Ok(t) => t.mips.into_iter().next().map(|rgba| Image {
-                        width: t.width,
-                        height: t.height,
-                        rgba,
-                    }),
-                    Err(e) => {
-                        log.push(format!("texture {hash:08x}: {e}"));
-                        None
-                    }
-                };
+                let image = self.decode(hash, &mut log);
                 images.push((hash, image));
             }
         }
@@ -1702,6 +1766,81 @@ impl Thread {
             images,
             log,
             callbacks,
+            shell: ShellNews::default(),
+        }
+    }
+
+    /// Texture `hash` from the archive (or the language archive).
+    fn decode(&mut self, hash: u32, log: &mut Vec<String>) -> Option<Image> {
+        let found = self.assets.texture(hash, MAX_TEXTURE).or_else(|e| {
+            self.language
+                .as_mut()
+                .and_then(|l| l.texture(hash, MAX_TEXTURE).ok())
+                .ok_or(e)
+        });
+        match found {
+            Ok(t) => t.mips.into_iter().next().map(|rgba| Image {
+                width: t.width,
+                height: t.height,
+                rgba,
+            }),
+            Err(e) => {
+                log.push(format!("texture {hash:08x}: {e}"));
+                None
+            }
+        }
+    }
+
+    /// One frame of the front end ([`Mode::Shell`]): every key goes to its
+    /// movies, the scripts and movies run, and everything on screen is
+    /// drawn but the movie widget's video, which the game plays under it
+    /// ([`ShellNews::movie`]).
+    fn shell_frame(&mut self, state: &HudState) -> Output {
+        let mut log = Vec::new();
+        let dt = state.dt.min(MAX_STEP);
+        self.keys.extend(state.keys.iter().copied());
+        if dt > 0.0 {
+            self.mission.tick(dt);
+            gui_runtime::tick(self.mission.lua(), dt);
+        }
+        self.play_flash(dt, &mut log);
+        let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
+            return Output::Failed("no GUI runtime".into());
+        };
+        let [w, h] = state.size;
+        let items = screen.borrow().draw_list(w, h);
+        let mut prims = Vec::new();
+        let mut want = Vec::new();
+        let mut movie = None;
+        for item in &items {
+            match item {
+                DrawItem::Movie {
+                    file: Some(file),
+                    rect,
+                    playing: true,
+                    ..
+                } => movie = Some((file.clone(), *rect)),
+                _ => self.prims(item, state, &mut prims, &mut want),
+            }
+        }
+        self.log_flash_shown(&items, &|_| true, &mut log);
+        log.extend(screen.borrow_mut().take_log());
+        log.extend(self.mission.take_log());
+        let _ = self.mission.take_commands();
+        let new_game = crate::shell::take_new_game(self.mission.lua());
+        let mut images = Vec::new();
+        for hash in want {
+            if self.tried.insert(hash) {
+                let image = self.decode(hash, &mut log);
+                images.push((hash, image));
+            }
+        }
+        Output::Frame {
+            prims,
+            images,
+            log,
+            callbacks: Vec::new(),
+            shell: ShellNews { movie, new_game },
         }
     }
 
@@ -4059,6 +4198,7 @@ mod paint_tests {
             rx,
             status: Status::Ready,
             callbacks: Vec::new(),
+            shell: ShellNews::default(),
             prims: vec![quad(
                 None,
                 [0.0, 0.0, 800.0, 600.0],
