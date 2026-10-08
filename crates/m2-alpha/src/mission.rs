@@ -138,6 +138,21 @@ pub struct MissionView {
     /// The contract's objective list for the PDA as the scripts send it
     /// (`Net.SendEvent_AddPDAMission`): text id and icon tag each.
     pub pda_objectives: Vec<(String, String)>,
+    /// Whether she is trespassing in a faction's zone, and whose (`"Vz"`),
+    /// as the zone's script last told the HUD (see [`TRESPASS`]).
+    pub trespass: Trespass,
+    /// Whether vehicle disguises work, as the scripts set it.
+    pub vehicle_disguise: bool,
+    /// Her disguise while one holds: how much is left and whether it holds.
+    pub disguise: Option<(f32, bool)>,
+}
+
+/// What `FactionZone` last told the HUD (`TrespassStateChange`): whether
+/// she is trespassing, and the zone's faction as the HUD's radar names it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Trespass {
+    pub inside: bool,
+    pub faction: Option<String>,
 }
 
 /// Seconds the contract's completion stays up.
@@ -167,6 +182,25 @@ if radar then
         local name = t and t.uGuid and Object.GetName(t.uGuid)
         if name then __m2_radar_regions[name] = nil end
         if remove then return remove(self, t) end
+    end
+end
+"#;
+
+/// The faction zones' word to the HUD (`MrxGui.SendEvent{ EventType =
+/// "TrespassStateChange", bTrespassing, sFaction }`): the game HUD runs in
+/// a Lua state of its own, so the latest is kept in `__m2_trespass` for it.
+/// The event then goes on as it would.
+const TRESPASS: &str = r#"
+__m2_trespass = { bTrespassing = false }
+local gui = rawget(_G, "MrxGui")
+if type(gui) == "table" and type(gui.SendEvent) == "function" then
+    local send = gui.SendEvent
+    gui.SendEvent = function(t, ...)
+        if type(t) == "table" and t.EventType == "TrespassStateChange" then
+            __m2_trespass = { bTrespassing = t.bTrespassing and true or false,
+                sFaction = t.sFaction }
+        end
+        return send(t, ...)
     end
 end
 "#;
@@ -827,6 +861,9 @@ impl MissionLink {
                 if let Err(e) = mission.run(HUD_CALLS, "hud calls") {
                     self.write([format!("hud calls: {e}")]);
                 }
+                if let Err(e) = mission.run(TRESPASS, "trespass") {
+                    self.write([format!("trespass: {e}")]);
+                }
                 for (name, code) in std::mem::take(&mut self.drivers) {
                     if let Err(e) = mission.run(&code, &name) {
                         self.write([format!("{name}: {e}")]);
@@ -1172,6 +1209,9 @@ impl MissionLink {
             radar_regions: radar_regions(mission.lua()),
             hud_calls: hud_calls(mission.lua()),
             pda_objectives: hud.mission.clone(),
+            trespass: trespass(mission.lua()),
+            vehicle_disguise: w.vehicle_disguise,
+            disguise: w.disguise,
         }
     }
 }
@@ -1192,6 +1232,17 @@ fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
             callback: t.get("callback").unwrap_or(false),
         })
         .collect()
+}
+
+/// What [`TRESPASS`] keeps.
+fn trespass(lua: &mlua::Lua) -> Trespass {
+    let Ok(Some(t)) = lua.globals().get::<Option<mlua::Table>>("__m2_trespass") else {
+        return Trespass::default();
+    };
+    Trespass {
+        inside: t.get("bTrespassing").unwrap_or(false),
+        faction: t.get("sFaction").ok().flatten(),
+    }
 }
 
 /// The regions [`RADAR_REGIONS`] keeps, by name.

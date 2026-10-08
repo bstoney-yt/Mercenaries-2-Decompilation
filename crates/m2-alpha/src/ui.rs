@@ -157,6 +157,9 @@ impl Hud {
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
             state.pda_objectives = m.pda_objectives.clone();
+            state.trespass = m.trespass.clone();
+            state.vehicle_disguise = m.vehicle_disguise;
+            state.disguise = m.disguise;
         }
         // The HUD's movies take them while they hold the controls (the
         // PDA, a fanfare).
@@ -211,6 +214,9 @@ impl Hud {
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
             state.pda_objectives = m.pda_objectives.clone();
+            state.trespass = m.trespass.clone();
+            state.vehicle_disguise = m.vehicle_disguise;
+            state.disguise = m.disguise;
         }
         let step = 1.0 / 30.0;
         game.update_and_wait(
@@ -1347,6 +1353,7 @@ mod tests {
                 pda_objectives: Vec::new(),
                 status: None,
                 contract_complete: true,
+                ..MissionView::default()
             }),
             view_proj: Some(Mat4::perspective_rh(1.0, 1.333, 0.1, 100.0)),
             ..HudInfo::default()
