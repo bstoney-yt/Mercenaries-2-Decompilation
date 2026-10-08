@@ -1550,9 +1550,10 @@ fn describe_slung(game: &Game) -> Vec<String> {
     for (slot, slung) in game.combat.slung(holding).into_iter().enumerate() {
         let Some(weapon) = slung else { continue };
         let model = match weapon {
-            combat::Weapon::Rifle => arsenal.hers(&game.combat.rifle),
-            combat::Weapon::Rpg => arsenal.rpg.as_ref(),
-            combat::Weapon::GrenadeLauncher => arsenal.launcher.as_ref(),
+            combat::Weapon::Rifle => arsenal.of_gun(&game.combat.rifle),
+            combat::Weapon::Rpg | combat::Weapon::GrenadeLauncher => {
+                arsenal.of_gun(&game.combat.launcher)
+            }
         };
         let side = ["right", "left"][slot];
         let Some((w, at)) = model.and_then(|w| Some((w, arsenal.on_back(w, body, &nodes, slot)?)))
