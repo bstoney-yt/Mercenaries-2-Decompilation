@@ -2457,6 +2457,21 @@ fn drive_for_screenshot(
             "drive: health {:?}, armour {:?}, blasts x{:?}, burns below {:?}, rounds x{:?}",
             t.health, t.armour, t.blast_scale, t.burns_below, t.rounds
         );
+        let arm = game.scene.world.as_ref().and_then(|w| {
+            w.index
+                .template_db
+                .armament_for(&v.spec.label, v.spec.model)
+        });
+        eprintln!(
+            "drive: armament {:?}; armed {:?}; her seat {}",
+            arm.map(|a| (&a.seats, a.mounts.len(), &a.couplings)),
+            v.spec
+                .armed
+                .iter()
+                .map(|m| (m.seat, m.priority, m.weapon.name.as_str(), &m.nodes))
+                .collect::<Vec<_>>(),
+            game.combat.seat
+        );
         let templated = game
             .scene
             .world
