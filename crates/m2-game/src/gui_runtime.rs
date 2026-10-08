@@ -337,9 +337,22 @@ pub struct Screen {
     reticle: [f32; 2],
     /// Which way the camera looks, degrees (`Player.GetCameraXZHeading`).
     heading: f32,
+    /// The keys bound to control words the fonts have no picture for
+    /// (`support`: `T`), by word in lower case ([`Screen::set_key_names`]).
+    key_names: BTreeMap<String, String>,
 }
 
 impl Screen {
+    /// Names the keys bound to control words (`[support]`, `[reload]`):
+    /// a text shows such a word as its key in brackets (`[T]`) where the
+    /// fonts have no button picture for it ([`button_glyph`]).
+    pub fn set_key_names(&mut self, names: impl IntoIterator<Item = (String, String)>) {
+        self.key_names = names
+            .into_iter()
+            .map(|(word, key)| (word.to_ascii_lowercase(), key))
+            .collect();
+    }
+
     /// Sets where the player aims: -1..=1 from the left edge to the right
     /// and from the bottom to the top (0, 0 is the middle), as
     /// `Gui.GetReticlePosition` answers. Fire `GuiReticlePositionChange`
@@ -641,6 +654,12 @@ impl Screen {
                 });
             } else if let Some(glyph) = button_glyph(id).filter(|_| parts.len() == 1) {
                 push(out, glyph.encode_utf8(&mut [0; 4]));
+            } else if let Some(key) = self
+                .key_names
+                .get(&id.to_ascii_lowercase())
+                .filter(|_| parts.len() == 1)
+            {
+                push(out, &format!("[{key}]"));
             } else if let Some(icon) = inline_icon(id).filter(|_| parts.len() == 1) {
                 // In the colour so far, which goes on after it.
                 let colour = out.last().and_then(|s| s.colour);
@@ -1040,7 +1059,9 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
 /// the glyphs' order, so they are matched by picture: the PC footage's
 /// satellite help shows `[move]` as the four arrows and `[confirm]` as the
 /// pistol (the fire button confirms), and the rest are the pictures that
-/// say what the words do. Words not matched yet stay as written.
+/// say what the words do. Words not matched yet show the key bound to
+/// them, if the host named it ([`Screen::set_key_names`]), else stay as
+/// written.
 fn button_glyph(word: &str) -> Option<char> {
     Some(match word.to_ascii_lowercase().as_str() {
         "crouch" => '\u{e004}',
@@ -2533,6 +2554,21 @@ mod tests {
         );
         // Not matched to a picture yet: as written.
         assert_eq!(s.display_text("[honk] Honk"), "[honk] Honk");
+    }
+
+    #[test]
+    fn control_words_without_a_picture_name_their_keys() {
+        let mut s = Screen::default();
+        s.set_key_names([
+            ("Support".to_owned(), "T".to_owned()),
+            ("pfire".to_owned(), "F".to_owned()),
+        ]);
+        assert_eq!(
+            s.display_text("[support] Open support menu"),
+            "[T] Open support menu"
+        );
+        // A word the fonts have a picture for keeps it; others as written.
+        assert_eq!(s.display_text("[pfire] [reload]"), "\u{e005} [reload]");
     }
 
     #[test]

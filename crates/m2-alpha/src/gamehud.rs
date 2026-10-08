@@ -477,6 +477,10 @@ pub struct HudState {
     /// how much is left (0..=100) and whether it holds.
     pub vehicle_disguise: bool,
     pub disguise: Option<(f32, bool)>,
+    /// The keys bound to the texts' control words (`("support", "T")`,
+    /// [`crate::input::token_keys`]), for those the fonts have no picture
+    /// for ([`gui_runtime::Screen::set_key_names`]).
+    pub key_names: Vec<(String, String)>,
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -1371,6 +1375,8 @@ struct Told {
     tutorial: Option<Option<String>>,
     trespass: crate::mission::Trespass,
     disguise: Option<Option<(f32, bool)>>,
+    /// The keys the texts' control words name ([`HudState::key_names`]).
+    key_names: Option<Vec<(String, String)>>,
 }
 
 /// How far (in -1..=1 screen units, across plus up) the aim point moves
@@ -2388,6 +2394,16 @@ impl Thread {
         };
         if let Some(screen) = gui_runtime::screen(lua) {
             screen.borrow_mut().set_camera_heading(heading);
+        }
+        // The keys the texts' control words name, as the bindings are (and
+        // again should they change): before any text this frame is set.
+        if self.told.key_names.as_ref() != Some(&s.key_names) {
+            self.told.key_names = Some(s.key_names.clone());
+            if let Some(screen) = gui_runtime::screen(lua) {
+                screen
+                    .borrow_mut()
+                    .set_key_names(s.key_names.iter().cloned());
+            }
         }
         // Where she is for the minimap, each frame as the engine does: its
         // handler hands it on to `MinimapUpdate`, with the heading as the
