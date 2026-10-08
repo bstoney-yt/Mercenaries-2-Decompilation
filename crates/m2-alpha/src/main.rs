@@ -1781,7 +1781,7 @@ fn describe_slung(game: &Game) -> Vec<String> {
     for (slot, slung) in game.combat.slung(holding).into_iter().enumerate() {
         let Some(weapon) = slung else { continue };
         let model = match weapon {
-            combat::Weapon::Rifle => arsenal.carbine.as_ref().or(arsenal.rifle.as_ref()),
+            combat::Weapon::Rifle => arsenal.hers(&game.combat.rifle),
             combat::Weapon::Rpg => arsenal.rpg.as_ref(),
             combat::Weapon::GrenadeLauncher => arsenal.launcher.as_ref(),
         };
