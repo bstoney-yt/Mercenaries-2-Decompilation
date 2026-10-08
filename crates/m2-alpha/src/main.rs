@@ -128,6 +128,8 @@ struct Options {
     blast: bool,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
+    /// With `--drive`: fire from the next seat with a weapon.
+    gunner: bool,
     /// With `--drive`: a vehicle whose name holds this.
     vehicle: Option<String>,
     /// With `--drive`: swing the camera this far (radians) before the picture.
@@ -276,6 +278,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--drive" => o.drive = true,
+            "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
             "--throw" => o.throw = true,
             "--bash" => o.bash = true,
@@ -2530,6 +2533,8 @@ fn drive_for_screenshot(
             };
             let trigger = combat::Trigger {
                 fire: options.fire && i == 89,
+                // `--gunner`: to the gunner's seat first.
+                seat: options.gunner && i == 0,
                 ..combat::Trigger::default()
             };
             game.step(
