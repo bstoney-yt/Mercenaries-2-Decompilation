@@ -254,8 +254,15 @@ impl FightClips {
     const BASH: &str = "meleebash";
     const BASH_LOW: &str = "MeleeBashLow";
 
+    /// The clips by name and by their events; a hero's not of another
+    /// hero's own group ([`Rig::foreign`]: Jennifer's run and jumps are
+    /// hers), so that the next listed, everyone's, is taken.
     pub fn find(rig: &Rig) -> Self {
-        let find = |hash| rig.clips.iter().position(|c| c.hash == hash);
+        let find = |hash| {
+            rig.clips
+                .iter()
+                .position(|c| c.hash == hash && !rig.foreign.contains(&hash))
+        };
         let first = |hashes: &[u32]| hashes.iter().find_map(|&h| find(h));
         let throw = Self::THROW.iter().find_map(|&h| {
             let i = find(h)?;
@@ -302,14 +309,15 @@ impl FightClips {
         }
     }
 
-    /// The clips carrying `event`: each one's index, when in it the event
-    /// comes, and how far its first pose is from the rifle held ready
-    /// (clip `ready`), nearest first.
+    /// The clips carrying `event` (not another hero's): each one's index,
+    /// when in it the event comes, and how far its first pose is from the
+    /// rifle held ready (clip `ready`), nearest first.
     fn carrying(rig: &Rig, event: &str, ready: Option<usize>) -> Vec<Carrying> {
         let mut list: Vec<Carrying> = rig
             .clips
             .iter()
             .enumerate()
+            .filter(|(_, c)| !rig.foreign.contains(&c.hash))
             .filter_map(|(i, c)| {
                 let at = c
                     .clip
@@ -331,18 +339,96 @@ impl FightClips {
         [Self::BASH, Self::BASH_LOW].map(|e| (e, Self::carrying(rig, e, ready)))
     }
 
+    /// A hero's, by the on-foot animation table: each slot's clip as
+    /// `theirs` gives the hero one in place of the clips the slot is
+    /// picked from by name (Jennifer's first: the table's rows for them
+    /// say which handle and equipment the slot is), where that clip is on
+    /// the rig and not another hero's; throws and bashes only with their
+    /// event. Returns the clips the table settled, which
+    /// [`own_group`](Self::own_group) leaves be.
+    pub fn by_table(&mut self, rig: &Rig, theirs: &dyn Fn(u32) -> Option<u32>) -> HashSet<usize> {
+        let index = |hash: u32| {
+            rig.clips
+                .iter()
+                .position(|c| c.hash == hash && !rig.foreign.contains(&hash))
+        };
+        let event_at = |i: usize, name: &str| {
+            rig.clips[i]
+                .clip
+                .events
+                .iter()
+                .find(|e| e.name.eq_ignore_ascii_case(name))
+                .map(|e| e.time)
+        };
+        let low = self.bash_low.map(|(i, _)| rig.clips[i].hash);
+        let mut settled = HashSet::new();
+        let mut table = |slot: &mut Option<usize>, keys: &[u32]| {
+            if let Some(i) = keys.iter().find_map(|&k| index(theirs(k)?)) {
+                *slot = Some(i);
+                settled.insert(i);
+            }
+        };
+        table(&mut self.aim, &[Self::AIM]);
+        table(&mut self.ready, &[Self::READY]);
+        table(&mut self.run_low, &Self::RUN_LOW);
+        table(&mut self.jump, &[Self::JUMP]);
+        table(&mut self.takeoff, &Self::TAKEOFF);
+        table(&mut self.takeoff_still, &Self::TAKEOFF_STILL);
+        table(&mut self.land, &Self::LAND);
+        table(&mut self.land_still, &Self::LAND_STILL);
+        table(&mut self.die, &[Self::DIE]);
+        let mut timed = |slot: &mut Option<(usize, f32)>, keys: &[u32], event: &str| {
+            if let Some((i, at)) = keys.iter().find_map(|&k| {
+                let i = index(theirs(k)?)?;
+                Some((i, event_at(i, event)?))
+            }) {
+                *slot = Some((i, at));
+                settled.insert(i);
+            }
+        };
+        timed(&mut self.throw, &Self::THROW, Self::RELEASE);
+        timed(&mut self.bash, &Self::BASH_CLIPS, Self::BASH);
+        timed(&mut self.bash_low, low.as_slice(), Self::BASH_LOW);
+        settled
+    }
+
+    /// Each slot's clip, by the slot's name (for the logs).
+    pub fn slots(&self) -> [(&'static str, Option<usize>); 12] {
+        [
+            ("aim", self.aim),
+            ("ready", self.ready),
+            ("run", self.run_low),
+            ("jump", self.jump),
+            ("take-off", self.takeoff),
+            ("standing take-off", self.takeoff_still),
+            ("land", self.land),
+            ("standing land", self.land_still),
+            ("throw", self.throw.map(|t| t.0)),
+            ("bash", self.bash.map(|t| t.0)),
+            ("low bash", self.bash_low.map(|t| t.0)),
+            ("die", self.die),
+        ]
+    }
+
     /// A hero's: where a clip picked by name is not of the hero's own
-    /// group ([`Rig::own`]) and the group has clips of that kind, the
-    /// group's (heroes round 02: each group holds its hero's runs,
-    /// jumps, landings, throws and low bashes, told apart by their events
-    /// and root speeds); of several, the one starting nearest the rifle
-    /// held ready. The high bash stays the butt smash picked from
+    /// group ([`Rig::own`]) nor `settled` by the on-foot table
+    /// ([`by_table`](Self::by_table)) and the group has clips of that
+    /// kind, the group's (heroes round 02: each group holds its hero's
+    /// runs, jumps, landings, throws and low bashes, told apart by their
+    /// events and root speeds); of several, the one starting nearest the
+    /// rifle held ready. The group holds runs and jumps that are not the
+    /// rifle's too, so a run must go forward standing (as the gaits are
+    /// chosen, [`m2_engine::Locomotion`]) with the hands kept together as
+    /// the two-handed run picked by name keeps them, and a jump on the run
+    /// must go forward. The high bash stays the butt smash picked from
     /// pictures (the groups' `meleebash` clips are not known to be one).
-    pub fn own_group(mut self, rig: &Rig) -> Self {
+    pub fn own_group(mut self, rig: &Rig, settled: &HashSet<usize>) -> Self {
         if rig.own.is_empty() {
             return self;
         }
-        let own = |i: Option<usize>| i.is_some_and(|i| rig.own.contains(&rig.clips[i].hash));
+        let own = |i: Option<usize>| {
+            i.is_some_and(|i| settled.contains(&i) || rig.own.contains(&rig.clips[i].hash))
+        };
         let has = |c: &BoundClip, word: &str| {
             c.clip
                 .events
@@ -382,17 +468,82 @@ impl FightClips {
                 *slot = Some(i);
             }
         };
+        // Forward and standing, as `Locomotion` takes its gaits.
+        let forward = rig.locomotion.as_ref().map(|l| l.forward);
+        let ahead = |c: &BoundClip| forward.is_some_and(|f| c.info.direction.dot(f) > 0.95);
+        let standing = |c: &BoundClip| c.info.hips > 0.85;
+        // How far apart the hands get over the whole clip, for its hip
+        // height: a rifle held in both hands keeps them close.
+        let hands = crate::combat::hands(&rig.skeleton);
+        let spread = |c: &BoundClip| -> Option<f32> {
+            let (right, left) = hands?;
+            let last = c.clip.frame_count.saturating_sub(1).max(1) as f32;
+            let widest = (0..c.clip.frame_count)
+                .map(|f| {
+                    let pose = c.sample(&rig.skeleton, c.info.duration * f as f32 / last);
+                    let nodes = rig.skeleton.model_matrices(&pose);
+                    (nodes[right].w_axis - nodes[left].w_axis)
+                        .truncate()
+                        .length()
+                })
+                .fold(0.0, f32::max);
+            (c.info.hips > 0.0).then(|| widest / c.info.hips)
+        };
+        // Two-handed: nearer the spread of the run picked by name (the
+        // rifle low across the body in both hands) than that of the run
+        // gait (the arms free). Without both, or with the gait's hands no
+        // further apart, no run is swapped.
+        let runs = (
+            self.run_low.and_then(|i| spread(&rig.clips[i])),
+            rig.gait_clip(Gait::Run).and_then(|i| spread(&rig.clips[i])),
+        );
+        let two_handed = |c: &BoundClip| match (runs, spread(c)) {
+            ((Some(both), Some(free)), Some(s)) if both < free => s < (both + free) * 0.5,
+            _ => false,
+        };
+        let running = |c: &BoundClip| has(c, "footstep_run") && (4.0..6.0).contains(&c.info.speed);
+        let listed = if own(self.run_low) {
+            Vec::new()
+        } else {
+            candidates(&running)
+        };
+        for i in listed {
+            let c = &rig.clips[i];
+            eprintln!(
+                "hero clips: own run {:08x}: {:.2} m/s, {}, {}, hands {} apart for the hips (two-handed run {}, run gait {}): {}",
+                c.hash,
+                c.info.speed,
+                if ahead(c) { "forward" } else { "not forward" },
+                if standing(c) {
+                    "standing"
+                } else {
+                    "not standing"
+                },
+                spread(c).map_or("?".to_owned(), |s| format!("{s:.2}")),
+                runs.0.map_or("?".to_owned(), |s| format!("{s:.2}")),
+                runs.1.map_or("?".to_owned(), |s| format!("{s:.2}")),
+                if ahead(c) && standing(c) && two_handed(c) {
+                    "the rifle's"
+                } else {
+                    "not the rifle's"
+                },
+            );
+        }
         swap(&mut self.run_low, &|c| {
-            has(c, "footstep_run") && (4.0..6.0).contains(&c.info.speed)
+            running(c) && ahead(c) && standing(c) && two_handed(c)
         });
         swap(&mut self.takeoff, &|c| {
-            has(c, "jumptakeoff") && c.info.speed >= 1.0
+            has(c, "jumptakeoff") && c.info.speed >= 1.0 && ahead(c)
         });
         swap(&mut self.takeoff_still, &|c| {
             has(c, "jumptakeoff") && c.info.speed < 0.5
         });
         swap(&mut self.land, &|c| {
-            has(c, "jumpland") && !air(c) && c.info.speed >= 3.0 && c.info.duration >= 0.3
+            has(c, "jumpland")
+                && !air(c)
+                && c.info.speed >= 3.0
+                && c.info.duration >= 0.3
+                && ahead(c)
         });
         swap(&mut self.land_still, &|c| {
             has(c, "jumpland") && !air(c) && c.info.speed < 0.5 && c.info.duration <= 1.0
@@ -1672,6 +1823,7 @@ pub(crate) mod tests {
             arm: Default::default(),
             cues: Vec::new(),
             own: Default::default(),
+            foreign: Default::default(),
         }
     }
 

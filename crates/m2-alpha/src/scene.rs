@@ -83,6 +83,9 @@ pub struct Rig {
     pub cues: Vec<(usize, usize)>,
     /// A hero's: the name hashes of the clips of the hero's own group.
     pub own: Arc<HashSet<u32>>,
+    /// A hero's: the name hashes of the clips only in the other heroes'
+    /// own groups, which this hero never plays.
+    pub foreign: Arc<HashSet<u32>>,
 }
 
 /// Most clip events a rig keeps for the taking (older ones are dropped:
@@ -114,6 +117,128 @@ fn hero_clips(source: &AssetSource<BufReader<File>>, hero: Hero) -> (HashSet<u32
     (allowed, own)
 }
 
+/// What the on-foot animation table gives `hero` (`set`: the template's
+/// `HumanAnimationSet` gender and character name) in place of the clips
+/// picked by name and the gaits ([`animation_table::character_clip`]),
+/// where those are on `rig` and not another hero's: put in `clips` and
+/// the rig's gaits, but for Jennifer, whose footage-matched picks stay
+/// (hers are only logged, to check the table against). Returns the clips
+/// the table settled.
+///
+/// [`animation_table::character_clip`]: m2_assets::animation_table::character_clip
+fn table_clips(
+    source: &mut AssetSource<BufReader<File>>,
+    set: Option<(u32, u32)>,
+    hero: Hero,
+    rig: &mut Rig,
+    clips: &mut npc::FightClips,
+) -> HashSet<usize> {
+    use m2_assets::animation_table::{self as table, AnimationTable};
+    let read = source
+        .asset(table::CHARACTER_ANIMATIONS, table::ANIMATION_TABLE_TYPE)
+        .map_err(anyhow::Error::from)
+        .and_then(|a| Ok(AnimationTable::parse(&a)?));
+    let t = match read {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "hero clips: {hero}: no on-foot table {:08x}: {e:#}",
+                table::CHARACTER_ANIMATIONS
+            );
+            return HashSet::new();
+        }
+    };
+    let columns: Vec<String> = t
+        .columns
+        .iter()
+        .map(|c| format!("{} {:?}", c.name, c.kind))
+        .collect();
+    eprintln!(
+        "hero clips: the on-foot table {:08x}: {} rows, columns {}",
+        table::CHARACTER_ANIMATIONS,
+        t.rows(),
+        columns.join(", ")
+    );
+    // The rows giving the aim and her run, to read the table's layout by.
+    if let Some(list) = t.column("Animation") {
+        for key in [npc::FightClips::AIM, npc::FightClips::RUN_LOW[0]] {
+            for row in (1..t.rows()).filter(|&r| t.list(r, list).contains(&key)) {
+                let cells: Vec<String> = (0..t.columns.len())
+                    .filter(|&c| c != list)
+                    .map(|c| format!("{} {:08x}", t.columns[c].name, t.cell(row, c).unwrap_or(0)))
+                    .collect();
+                eprintln!(
+                    "hero clips: the on-foot table's row {row} lists {key:08x}: {}; clips {:08x?}",
+                    cells.join(", "),
+                    t.list(row, list)
+                );
+            }
+        }
+    }
+    let Some((gender, name)) = set else {
+        eprintln!("hero clips: {hero}: no HumanAnimationSet for the template: the table not used");
+        return HashSet::new();
+    };
+    let who = [(table::GENDER, gender), (table::CHARACTER_NAME, name)];
+    let index = |hash: u32| {
+        rig.clips
+            .iter()
+            .position(|c| c.hash == hash && !rig.foreign.contains(&hash))
+    };
+    let theirs = |key: u32| table::character_clip(&t, key, &who, |c| index(c).is_some());
+    let mut picked = *clips;
+    let settled = picked.by_table(rig, &theirs);
+    let mut gaits: Vec<(Gait, usize, Option<usize>)> = rig
+        .locomotion
+        .iter()
+        .flat_map(|l| l.clips.iter())
+        .map(|(&g, &i)| (g, i, theirs(rig.clips[i].hash).and_then(index)))
+        .collect();
+    gaits.sort_by_key(|g| g.0);
+    let hash =
+        |i: Option<usize>| i.map_or("none".to_owned(), |i| format!("{:08x}", rig.clips[i].hash));
+    let said = |slot: &str, was: Option<usize>, now: Option<usize>| match now {
+        Some(n) if Some(n) == was => format!("{slot} {} kept", hash(was)),
+        Some(_) => format!("{slot} {} -> {}", hash(was), hash(now)),
+        None => format!("{slot} {} not given", hash(was)),
+    };
+    let mut line: Vec<String> = clips
+        .slots()
+        .into_iter()
+        .zip(picked.slots())
+        .map(|((slot, was), (_, now))| said(slot, was, now.filter(|i| settled.contains(i))))
+        .collect();
+    line.extend(
+        gaits
+            .iter()
+            .map(|&(g, was, now)| said(&format!("{g:?}").to_lowercase(), Some(was), now)),
+    );
+    let apply = hero != Hero::Jennifer;
+    eprintln!(
+        "hero clips: {hero}, the on-foot table's for gender {gender:08x}, character {name:08x}{}: {}",
+        if apply {
+            ""
+        } else {
+            " (a check only: her footage-matched picks stay)"
+        },
+        line.join(", ")
+    );
+    if !apply {
+        return HashSet::new();
+    }
+    *clips = picked;
+    if let Some(l) = rig.locomotion.as_mut() {
+        for (g, _, now) in gaits {
+            if let Some(n) = now {
+                l.clips.insert(g, n);
+            }
+        }
+    }
+    let gait = rig.gait;
+    rig.set_gait(gait);
+    settled
+}
+
 /// How a rifle is held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Carry {
@@ -128,9 +253,9 @@ pub enum Carry {
 impl Rig {
     /// Reads model `hash`'s skeleton and every clip that fits it. For a
     /// `hero` other than Jennifer, the gaits come from the clips everyone shares and the
-    /// hero's own group (not the other heroes'), and [`Rig::own`] holds
-    /// the own group's clips; every clip stays loaded, for the clips
-    /// picked by name.
+    /// hero's own group (not the other heroes'), [`Rig::own`] holds
+    /// the own group's clips and [`Rig::foreign`] the other heroes';
+    /// every clip stays loaded, for the clips picked by name.
     pub fn load(
         source: &mut AssetSource<BufReader<File>>,
         hash: u32,
@@ -148,6 +273,13 @@ impl Rig {
                 let mut rig = Rig::new(skeleton, Vec::new(), gait);
                 rig.locomotion =
                     Locomotion::choose_where(&clips, |i| allowed.contains(&clips[i].hash));
+                rig.foreign = Arc::new(
+                    clips
+                        .iter()
+                        .map(|c| c.hash)
+                        .filter(|h| !allowed.contains(h))
+                        .collect(),
+                );
                 rig.clips = Arc::new(clips);
                 rig.own = Arc::new(own);
                 rig.set_gait(gait);
@@ -241,6 +373,7 @@ impl Rig {
             }),
             animator: Animator::default(),
             own: Default::default(),
+            foreign: Default::default(),
             gait: Gait::Idle,
             cues: Vec::new(),
         })
@@ -261,6 +394,7 @@ impl Rig {
             gait,
             cues: Vec::new(),
             own: Default::default(),
+            foreign: Default::default(),
         };
         rig.set_gait(gait);
         rig
@@ -272,6 +406,7 @@ impl Rig {
         let mut rig = Self {
             locomotion: Locomotion::choose(&self.clips),
             own: Default::default(),
+            foreign: Default::default(),
             animator: Animator::default(),
             cues: Vec::new(),
             ..self.clone()
@@ -1069,7 +1204,7 @@ impl Scene {
                 " (no template: Jennifer's)"
             }
         );
-        let model = match GpuModel::load(backend, source, &mut self.materials, hash, 0)
+        let mut model = match GpuModel::load(backend, source, &mut self.materials, hash, 0)
             .map_err(anyhow::Error::from)
             .and_then(|gpu| Ok((gpu, Rig::load(source, hash, Gait::Idle, Some(hero))?)))
         {
@@ -1079,10 +1214,24 @@ impl Scene {
                 None
             }
         };
-        let clips = model
+        // The clips by name, then as the on-foot table gives them the
+        // hero, then the hero's own group's for those it doesn't.
+        let set = self
+            .world
             .as_ref()
-            .map(|(_, rig)| npc::FightClips::find(rig).own_group(rig))
+            .and_then(|w| w.index.template_db.animation_set(hero.template()));
+        let mut clips = model
+            .as_ref()
+            .map(|(_, rig)| npc::FightClips::find(rig))
             .unwrap_or_default();
+        let settled = match &mut model {
+            Some((_, rig)) => table_clips(source, set, hero, rig, &mut clips),
+            None => HashSet::new(),
+        };
+        let clips = match &model {
+            Some((_, rig)) => clips.own_group(rig, &settled),
+            None => clips,
+        };
         self.people_rig = model.as_ref().map(|(_, rig)| rig.shared());
         if let Some((_, rig)) = &model {
             let h = |i: Option<usize>| {
@@ -1093,7 +1242,8 @@ impl Scene {
                     } else {
                         ""
                     };
-                    format!("{:08x}{own}", c.hash)
+                    let table = if settled.contains(&i) { " table" } else { "" };
+                    format!("{:08x}{own}{table}", c.hash)
                 })
             };
             eprintln!(
@@ -1143,9 +1293,12 @@ impl Scene {
                 eprintln!("player {event} clips: {}", shown.join(", "));
             }
         }
-        self.people.clips = model
+        // Everyone's, whoever the hero is: found on the people's rig,
+        // which shares the hero's clips but not the hero's own picks.
+        self.people.clips = self
+            .people_rig
             .as_ref()
-            .map(|(_, rig)| npc::FightClips::find(rig))
+            .map(npc::FightClips::find)
             .unwrap_or_default();
         let templates = self.world.as_ref().map(|w| &w.index.template_db);
         let speeds = templates
