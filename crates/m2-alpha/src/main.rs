@@ -2152,6 +2152,8 @@ fn front_end_offscreen(
             let top = std::env::var_os("M2_BACKDROP_TOP").is_some();
             if top {
                 shell.paint(&painter);
+            } else {
+                shell.paint_under(&painter);
             }
             if let Some((m, [x0, y0, x1, y1])) = &backdrop
                 && let Some((_, rgba)) = &m.frame
@@ -2171,7 +2173,7 @@ fn front_end_offscreen(
                 );
             }
             if !top {
-                shell.paint(&painter);
+                shell.paint_over(&painter);
             }
         });
         if up_at.is_none() && shell.ready() {
@@ -2185,9 +2187,10 @@ fn front_end_offscreen(
         if picture {
             if let Some((m, rect)) = &backdrop {
                 eprintln!(
-                    "front end: backdrop {} frame {:?} in {rect:?}",
+                    "front end: backdrop {} frame {:?} in {rect:?}, over {} prims",
                     m.name,
-                    m.frame.as_ref().map(|(n, _)| n)
+                    m.frame.as_ref().map(|(n, _)| n),
+                    shell.shell().under
                 );
                 // The backdrop's frame alone, to tell it from what covers
                 // it.
