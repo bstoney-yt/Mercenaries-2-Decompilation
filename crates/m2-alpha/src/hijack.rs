@@ -84,9 +84,9 @@ struct Loaded {
 /// Lua state: kept in `__m2_gui_calls` (module, method, then the call's
 /// plain arguments, `n` of them) for [`Hijacks::take_gui_calls`].
 const GUI_CALLS: &str = r##"
-__m2_gui_calls = {}
+__m2_gui_calls = __m2_gui_calls or {}
 local function record(module, method, f)
-    return function(...)
+    local wrapped = function(...)
         local call = { module, method, n = select("#", ...) }
         for i = 1, call.n do
             local v = select(i, ...)
@@ -96,17 +96,29 @@ local function record(module, method, f)
         if #__m2_gui_calls > 64 then table.remove(__m2_gui_calls, 1) end
         if type(f) == "function" then return f(...) end
     end
+    __m2_gui_wrapped = __m2_gui_wrapped or setmetatable({}, { __mode = "k" })
+    __m2_gui_wrapped[wrapped] = true
+    return wrapped
 end
-local hijack = {}
-for _, method in ipairs({ "ShowButton", "HideButton", "ShowFail", "SetDisplayVisible",
-        "SetDisplayButton", "SetDisplayMashAnimation" }) do
-    hijack[method] = record("MrxGuiHudActionHijack", method)
+-- Wraps the module's functions where they are: the scripts import the
+-- game's own module (over any table put here before), so this runs again
+-- as they go.
+local function wrap(module, methods)
+    local m = _G[module]
+    if type(m) ~= "table" then
+        m = {}
+        rawset(_G, module, m)
+    end
+    for _, method in ipairs(methods) do
+        local f = m[method]
+        if not (__m2_gui_wrapped and __m2_gui_wrapped[f]) then
+            rawset(m, method, record(module, method, f))
+        end
+    end
 end
-MrxGuiHudActionHijack = hijack
-local manager = MrxGuiManager
-if type(manager) == "table" then
-    manager.ToggleHud = record("MrxGuiManager", "ToggleHud", rawget(manager, "ToggleHud"))
-end
+wrap("MrxGuiHudActionHijack", { "ShowButton", "HideButton", "ShowFail", "SetDisplayVisible",
+    "SetDisplayButton", "SetDisplayMashAnimation" })
+wrap("MrxGuiManager", { "ToggleHud" })
 "##;
 
 /// A call the hijack scripts made to the HUD ([`GUI_CALLS`]).
@@ -265,6 +277,10 @@ impl Hijacks {
             return Vec::new();
         };
         let lua = l.mission.lua();
+        // Again, over the modules the scripts have imported since.
+        if let Err(e) = lua.load(GUI_CALLS).set_name("=m2-gui calls").exec() {
+            eprintln!("hijacks: HUD calls not kept: {e}");
+        }
         let Ok(Some(calls)) = lua.globals().get::<Option<mlua::Table>>("__m2_gui_calls") else {
             return Vec::new();
         };
@@ -1213,15 +1229,24 @@ mod tests {
             .exec()
             .unwrap();
         lua.load(GUI_CALLS).exec().unwrap();
+        // The scripts import the game's own module over it; kept again.
+        lua.load("MrxGuiHudActionHijack = { ShowButton = function() shown = true end }")
+            .exec()
+            .unwrap();
+        lua.load(GUI_CALLS).exec().unwrap();
+        lua.load(GUI_CALLS).exec().unwrap();
         lua.load(
             r#"MrxGuiHudActionHijack.ShowButton(1, 7, 0.75, nil, 0.5)
             MrxGuiManager.ToggleHud(1, false, "hijack")"#,
         )
         .exec()
         .unwrap();
-        // The game's own function still runs.
+        // The game's own functions still run.
         assert!(!lua.globals().get::<bool>("toggled").unwrap());
+        assert!(lua.globals().get::<bool>("shown").unwrap());
         let calls: mlua::Table = lua.globals().get("__m2_gui_calls").unwrap();
+        // Once each, though wrapped again.
+        assert_eq!(calls.raw_len(), 2);
         let show: mlua::Table = calls.get(1).unwrap();
         assert_eq!(show.get::<String>(2).unwrap(), "ShowButton");
         assert_eq!(show.get::<i64>("n").unwrap(), 5);
