@@ -2181,6 +2181,15 @@ fn front_end_offscreen(
                     m.name,
                     m.frame.as_ref().map(|(n, _)| n)
                 );
+                // The backdrop's frame alone, to tell it from what covers
+                // it.
+                if let Some((_, rgba)) = &m.frame {
+                    let (bw, bh) = (m.info.width, m.info.height);
+                    let mut ppm = format!("P6\n{bw} {bh}\n255\n").into_bytes();
+                    ppm.extend(rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+                    let path = out.with_file_name(format!("{stem}-backdrop-{pictured}.ppm"));
+                    let _ = std::fs::write(path, ppm);
+                }
             }
             render(
                 &mut backend,
