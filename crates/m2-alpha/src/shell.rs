@@ -152,6 +152,8 @@ pub struct Native {
     press_start: bool,
     /// Calls to make at the next frame.
     pending: Vec<Call>,
+    /// The save operation waiting on the profile's save.
+    saving: Option<&'static str>,
 }
 
 /// The menu movie's name.
@@ -195,6 +197,7 @@ impl Native {
     /// The other pages (continue and load: saves; join: online) are not
     /// answered.
     pub fn command(&mut self, command: &str, arg: &str) -> bool {
+        use m2_assets::flash::avm1::Value;
         match command {
             "pressStartEnabled" => {
                 self.press_start = arg != "false";
@@ -206,18 +209,27 @@ impl Native {
                 }
                 true
             }
-            // `saveCheck(kind, operation)` asks the engine to get the
-            // saves ready (`preoperation` with "kind,operation") and waits
-            // for `preopComplete(operation, true)`: what the movie's own
-            // test path calls straight away. A new game's goes on to start
-            // it; the others need saves, which there are none of yet.
+            // `saveCheck(perform, what)` asks the engine to get the saves
+            // ready (`preoperation` with "perform,what") and waits for
+            // `preopComplete(true, what)`, which saves the profile
+            // (`onlineSaveProfile`) and waits again, for
+            // `saveCompleteContinue(what)`: what the movie's own test path
+            // calls straight away at each step. A new game's goes on to
+            // start it; the others need saves, which there are none of yet.
             "preoperation" => {
                 if arg.split(',').nth(1) == Some(NEW_GAME_OPERATION) {
-                    use m2_assets::flash::avm1::Value;
                     self.pending.push((
                         "preopComplete",
-                        vec![Value::Str(NEW_GAME_OPERATION.into()), Value::Bool(true)],
+                        vec![Value::Bool(true), Value::Str(NEW_GAME_OPERATION.into())],
                     ));
+                    self.saving = Some(NEW_GAME_OPERATION);
+                }
+                true
+            }
+            "onlineSaveProfile" => {
+                if let Some(what) = self.saving.take() {
+                    self.pending
+                        .push(("saveCompleteContinue", vec![Value::Str(what.into())]));
                 }
                 true
             }
@@ -271,5 +283,9 @@ mod tests {
         assert!(n.calls().is_empty());
         assert!(n.command("preoperation", "save,newGame"));
         assert_eq!(names(n.calls()), ["preopComplete"]);
+        assert!(n.command("onlineSaveProfile", "true"));
+        assert_eq!(names(n.calls()), ["saveCompleteContinue"]);
+        assert!(n.command("onlineSaveProfile", "true"));
+        assert!(n.calls().is_empty());
     }
 }
