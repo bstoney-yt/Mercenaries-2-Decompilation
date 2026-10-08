@@ -70,6 +70,16 @@
 //!                           (default vzacon001,vza_con001) with its parent
 //!                           template: name, model, components, and what
 //!                           the alpha's world index makes of it
+//! fleet[:<word>,..]         every vehicle template (any vehicle physics
+//!                           component), or those whose name holds a word:
+//!                           physics, model (in the archive? the texture
+//!                           catalogue's label and kind; wheels the alpha
+//!                           finds), placements in static and state
+//!                           layers, health, damage key, seats, entrances
+//!                           and hijack script, turrets, linked weapons,
+//!                           engine bank, its other components, and what
+//!                           the alpha does with it; one tab-separated
+//!                           line each after a `fleet\t` head
 //! components[:<word>,..]    the template database's components (all, or
 //!                           those whose name holds a word): record count
 //!                           and each field's name (or hash), type, width
@@ -813,6 +823,7 @@ fn main() -> Result<(), Error> {
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
+            "fleet" => fleet(&mut source, &mut lazy, &names, arg),
             "components" => components(&mut source, &names, arg),
             "parents" => parents(&mut source, &names, arg),
             "cues" => cues(&mut source, &names, arg),
@@ -4407,6 +4418,356 @@ fn vehicles<R: Read + Seek>(
                 named.get(&n.name_hash).map_or("?", String::as_str)
             );
         }
+    }
+    Ok(())
+}
+
+/// The vehicle physics components, each with the kind the alpha's world
+/// index gives it.
+const VEHICLE_PHYSICS: [&str; 4] = [
+    "_CarPhysicsV2",
+    "_TankPhysics",
+    "_BoatPhysics",
+    "_HelicopterPhysics",
+];
+/// `EntranceLink`/`PhysicalLink`/`SeatLink`'s field naming the linked
+/// template.
+const LINK_FIELD: u32 = 0x5470_4554;
+/// `EntranceParameters`' hijack script.
+const HIJACK_SCRIPT: u32 = 0x2c5d_34dc;
+/// `Health`'s hit points.
+const HEALTH_FIELD: u32 = 0xd122_919d;
+/// `SoundEffect`'s engine bank.
+const BANK_FIELD: u32 = 0x14a6_7fa6;
+
+/// The `u32` of a record's field, by the field's name hash.
+fn field_u32(c: &m2_assets::layer::Component<'_>, rec: &[u8], name: u32) -> Option<u32> {
+    let f = c.fields.iter().find(|f| f.name_hash == name)?;
+    let at = usize::from(f.offset);
+    let b = rec.get(at..at + 4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Every vehicle template with what the data gives it and what the alpha
+/// makes of it, one tab-separated line each.
+fn fleet<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    lazy: &mut Lazy,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words = words_of(arg);
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let models: HashSet<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    let scripts: HashSet<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == SCRIPT_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let model_of = db.hashes("ModelName");
+
+    // Each template's components, and records of the ones read here.
+    let mut comps: HashMap<u32, Vec<&str>> = HashMap::new();
+    let mut unreadable: Vec<&str> = Vec::new();
+    for c in &db.components {
+        match c.records() {
+            Some(recs) => {
+                for (id, _) in recs {
+                    comps.entry(id).or_default().push(c.name);
+                }
+            }
+            None => unreadable.push(c.name),
+        }
+    }
+    println!(
+        "components not read per template (text fields): {}",
+        unreadable.join(", ")
+    );
+    let recs = |name: &str| -> (
+        Option<&m2_assets::layer::Component<'_>>,
+        HashMap<u32, Vec<&[u8]>>,
+    ) {
+        match db.component(name) {
+            Some(c) => (Some(c), by_entity(c)),
+            None => (None, HashMap::new()),
+        }
+    };
+    let mut kind_of: HashMap<u32, &str> = HashMap::new();
+    for p in VEHICLE_PHYSICS {
+        if let Some(c) = db.component(p) {
+            for (id, _) in c.records().unwrap_or_default() {
+                kind_of.insert(id, p);
+            }
+        }
+    }
+    let (health_c, health) = recs("Health");
+    let (sound_c, sound) = recs("SoundEffect");
+    let (entrance_c, entrances) = recs("EntranceLink");
+    let (params_c, params) = recs("EntranceParameters");
+    let (link_c, links) = recs("PhysicalLink");
+    let (seat_c, seats) = recs("SeatLink");
+    let (_, turrets) = recs("Turret");
+    let (modkey_c, modkeys) = recs("ModifierKey");
+
+    // Placements: by the entity's parent, else by its name's stem.
+    let lower: HashMap<String, u32> = tnames
+        .iter()
+        .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+        .collect();
+    let mut placed: HashMap<u32, [usize; 2]> = HashMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        let at = usize::from(!paths[b].contains("layers_static"));
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            let entity_names = layer.names();
+            for (id, p) in layer.placements() {
+                let by_stem = entity_names.get(&id).and_then(|n| {
+                    lower.get(&m2_engine::world::member_stem(n).to_ascii_lowercase())
+                });
+                let t = if kind_of.contains_key(&p.parent) {
+                    Some(p.parent)
+                } else {
+                    by_stem.copied()
+                };
+                if let Some(t) = t.filter(|t| kind_of.contains_key(t)) {
+                    placed.entry(t).or_default()[at] += 1;
+                }
+            }
+        }
+    }
+
+    let catalogue = lazy.catalogue(source)?.clone();
+    let mut wheels: HashMap<u32, String> = HashMap::new();
+    let show = |h: u32| -> String {
+        tnames
+            .get(&h)
+            .map(|n| (*n).to_owned())
+            .or_else(|| names.get(h).map(str::to_owned))
+            .unwrap_or_else(|| format!("{h:08x}"))
+    };
+    let mut list: Vec<(&str, u32, &str)> = kind_of
+        .iter()
+        .map(|(&id, &k)| (tnames.get(&id).copied().unwrap_or(""), id, k))
+        .filter(|(n, _, _)| {
+            let n = n.to_ascii_lowercase();
+            words.is_empty() || words.iter().any(|w| n.contains(w.as_str()))
+        })
+        .collect();
+    list.sort_unstable_by_key(|&(n, id, k)| (k, n.to_ascii_lowercase(), id));
+    println!(
+        "fleet\tid\tname\tphysics\tmodel\tin archive\tcatalogue\twheels\tstatic\tstate\thealth\tdamage key\tseats\tentrances\thijack\tturrets\tweapons\tengine\talpha\tother components"
+    );
+    let mut by_kind: BTreeMap<&str, [usize; 4]> = BTreeMap::new();
+    for (name, id, kind) in list {
+        let model = model_of.get(&id).copied();
+        let in_archive = model.is_some_and(|m| models.contains(&m));
+        let entry = model.and_then(|m| catalogue.vehicles.iter().find(|e| e.model == m));
+        let wheel = match (model, in_archive) {
+            (Some(m), true) => wheels
+                .entry(m)
+                .or_insert_with(|| {
+                    let e = entry.cloned().unwrap_or(CatalogueEntry {
+                        model: m,
+                        kind: "car".into(),
+                        label: name.to_owned(),
+                    });
+                    match source.model(m).ok().and_then(|d| {
+                        d.parse().ok().map(|md| {
+                            VehicleSpec::from_model(&e, &md).map(|s| (s.wheels.len(), s.tracked))
+                        })
+                    }) {
+                        Some(Some((n, t))) => format!("{n}{}", if t { " tracked" } else { "" }),
+                        Some(None) => "none".into(),
+                        None => "unreadable".into(),
+                    }
+                })
+                .clone(),
+            _ => "-".into(),
+        };
+        let [stat, state] = placed.get(&id).copied().unwrap_or_default();
+        let hp = health_c
+            .and_then(|c| {
+                health
+                    .get(&id)?
+                    .first()
+                    .and_then(|r| field_u32(c, r, HEALTH_FIELD))
+            })
+            .map_or("-".to_owned(), |v| format!("{}", f32::from_bits(v)));
+        let modkey = modkey_c.map_or(String::new(), |c| {
+            modkeys
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .filter_map(|r| {
+                    c.fields.first().and_then(|f| {
+                        let at = usize::from(f.offset);
+                        r.get(at..at + 4)
+                            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    })
+                })
+                .map(&show)
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        let seat_names = seat_c.map_or(String::new(), |c| {
+            seats
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .map(|r| {
+                    c.fields
+                        .iter()
+                        .filter(|f| f.bit_width == 0)
+                        .filter_map(|f| {
+                            let at = usize::from(f.offset);
+                            let b = r.get(at..at + 4)?;
+                            let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                            names.get(v).filter(|_| v > 0xffff).map(str::to_owned)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        let n_seats = seats.get(&id).map_or(0, Vec::len);
+        let mut hijack = Vec::new();
+        let n_entrances = entrances.get(&id).map_or(0, Vec::len);
+        if let (Some(ec), Some(pc)) = (entrance_c, params_c) {
+            for r in entrances.get(&id).into_iter().flatten() {
+                let Some(t) = field_u32(ec, r, LINK_FIELD) else {
+                    continue;
+                };
+                for pr in params.get(&t).into_iter().flatten() {
+                    if let Some(s) = field_u32(pc, pr, HIJACK_SCRIPT).filter(|&s| s != 0) {
+                        hijack.push(format!(
+                            "{}{}",
+                            show(s),
+                            if scripts.contains(&s) {
+                                ""
+                            } else {
+                                " (no script)"
+                            }
+                        ));
+                    }
+                }
+            }
+        }
+        let weapons = link_c.map_or(String::new(), |c| {
+            links
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .filter_map(|r| field_u32(c, r, LINK_FIELD).filter(|&v| v != 0))
+                .map(&show)
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
+        let engine = sound_c
+            .and_then(|c| {
+                sound
+                    .get(&id)?
+                    .iter()
+                    .find_map(|r| field_u32(c, r, BANK_FIELD).filter(|&v| v != 0))
+            })
+            .map_or("-".to_owned(), &show);
+        // What the alpha does with it: cars and tanks drive, boats float
+        // when a mission places them, helicopters stand as models.
+        let alpha = match (kind, in_archive) {
+            (_, false) => "nothing (no model)",
+            ("_HelicopterPhysics", _) => "stands (not flown)",
+            ("_BoatPhysics", _) => "floats (mission boats drive)",
+            (_, _) if wheel == "none" => "stands (no wheels found)",
+            _ => "drives",
+        };
+        let mut other: Vec<&str> = comps.get(&id).cloned().unwrap_or_default();
+        other.sort_unstable();
+        other.dedup();
+        other.retain(|c| {
+            !matches!(
+                *c,
+                "Name"
+                    | "ModelName"
+                    | "Health"
+                    | "SoundEffect"
+                    | "EntranceLink"
+                    | "PhysicalLink"
+                    | "SeatLink"
+                    | "Turret"
+                    | "ModifierKey"
+            ) && !VEHICLE_PHYSICS.contains(c)
+        });
+        let k = by_kind.entry(kind).or_default();
+        k[0] += 1;
+        k[1] += usize::from(in_archive);
+        k[2] += usize::from(stat + state > 0);
+        k[3] += usize::from(alpha == "drives" || alpha.starts_with("floats"));
+        println!(
+            "fleet\t{id:08x}\t{name}\t{}\t{}\t{}\t{}\t{wheel}\t{stat}\t{state}\t{hp}\t{modkey}\t{n_seats} {seat_names}\t{n_entrances}\t{}\t{}\t{weapons}\t{engine}\t{alpha}\t{}",
+            kind.trim_start_matches('_'),
+            model.map_or("-".to_owned(), |m| format!("{m:08x}")),
+            if in_archive { "yes" } else { "no" },
+            entry.map_or("-".to_owned(), |e| format!("{} {}", e.kind, e.label)),
+            hijack.join(","),
+            turrets.get(&id).map_or(0, Vec::len),
+            other.join(" ")
+        );
+    }
+    println!("by physics: templates, with a model, placed, used by the alpha");
+    for (k, [n, m, p, u]) in by_kind {
+        println!("  {k}: {n} {m} {p} {u}");
+    }
+    // Catalogue models no vehicle template names.
+    let named: HashSet<u32> = kind_of
+        .keys()
+        .filter_map(|id| model_of.get(id))
+        .copied()
+        .collect();
+    let loose: Vec<String> = catalogue
+        .vehicles
+        .iter()
+        .filter(|e| !named.contains(&e.model))
+        .map(|e| format!("{:08x} {} {}", e.model, e.kind, e.label))
+        .collect();
+    println!(
+        "catalogue vehicle models no vehicle template names: {}",
+        loose.len()
+    );
+    for l in loose {
+        println!("  {l}");
     }
     Ok(())
 }
