@@ -17,6 +17,8 @@ m2-alpha [options]
                          where she is (Enter pressed every 4 s)
   --install <dir>        the game's install folder (holding data\vz.wad); the EA app
                          folder in Program Files is found without it
+  --hero <name>          who to play: mattias, jennifer (default) or chris
+                         (also `hero` in the settings, and the pause menu)
   --spawn <x>,<z>        where on the island to start (default: the PMC's
                          headquarters, where free roam begins after the
                          first contract; with --mission, 450,-1950)

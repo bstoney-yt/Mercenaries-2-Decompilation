@@ -567,7 +567,7 @@ impl HudState {
             .map(|(damage, from)| (damage, direction(at, from)))
             .collect();
         Self {
-            hp: vehicle.map_or(game.combat.hp, |v| v.health()),
+            hp: vehicle.map_or(game.combat.hp_percent(), |v| v.health()),
             in_vehicle: vehicle.is_some(),
             weapon: game.combat.weapon,
             fired: game.combat.fired,

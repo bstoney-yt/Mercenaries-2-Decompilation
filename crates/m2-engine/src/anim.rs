@@ -404,16 +404,25 @@ pub fn load_clips<R: Read + Seek>(
     skeleton: &Skeleton,
     filters: &[&str],
 ) -> Result<Vec<BoundClip>, AssetError> {
+    load_clips_where(source, skeleton, |path| {
+        filters.iter().any(|f| path.contains(f))
+    })
+}
+
+/// Every clip that fits `skeleton` from the blocks whose path `keep`
+/// takes, sorted by name hash.
+pub fn load_clips_where<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    skeleton: &Skeleton,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<BoundClip>, AssetError> {
     let index = source.archive().index();
     let mut blocks: Vec<usize> = index
         .assets()
         .iter()
         .filter(|a| index.type_hash(a) == ANIMATION_TYPE)
         .map(|a| usize::from(a.block))
-        .filter(|&b| {
-            let path = &index.blocks()[b].path;
-            filters.iter().any(|f| path.contains(f))
-        })
+        .filter(|&b| keep(&index.blocks()[b].path))
         .collect();
     blocks.sort_unstable();
     blocks.dedup();
@@ -477,9 +486,17 @@ impl Locomotion {
     /// clips travel, the pelvis upright, the longest still clip as idle.
     /// `None` if any gait has no clip.
     pub fn choose(clips: &[BoundClip]) -> Option<Self> {
+        Self::choose_where(clips, |_| true)
+    }
+
+    /// As [`choose`](Self::choose), from the clips `keep` takes (by
+    /// index) only.
+    pub fn choose_where(clips: &[BoundClip], keep: impl Fn(usize) -> bool) -> Option<Self> {
         let movers: Vec<&ClipInfo> = clips
             .iter()
-            .map(|c| &c.info)
+            .enumerate()
+            .filter(|(i, _)| keep(*i))
+            .map(|(_, c)| &c.info)
             .filter(|i| i.speed > 4.0)
             .collect();
         let forward = movers
@@ -493,9 +510,13 @@ impl Locomotion {
         let mut chosen = HashMap::new();
         for gait in [Gait::Walk, Gait::Run, Gait::Sprint] {
             let (lo, hi) = gait.band();
-            let (i, _) = clips.iter().enumerate().find(|(_, c)| {
+            let (i, _) = clips.iter().enumerate().find(|&(n, c)| {
                 let i = &c.info;
-                standing(i) && i.direction.dot(forward) > 0.95 && i.speed >= lo && i.speed < hi
+                keep(n)
+                    && standing(i)
+                    && i.direction.dot(forward) > 0.95
+                    && i.speed >= lo
+                    && i.speed < hi
             })?;
             chosen.insert(gait, i);
         }
@@ -506,6 +527,7 @@ impl Locomotion {
         let idle = clips
             .iter()
             .enumerate()
+            .filter(|&(i, _)| keep(i))
             .filter(|(_, c)| c.info.speed * c.info.duration < 1e-3 && c.info.duration >= 1.0)
             .filter(|(_, c)| c.info.hips > 0.85 && c.info.hips < 1.3)
             .map(|(i, c)| {

@@ -13,6 +13,8 @@ pub const FILE_NAME: &str = "m2-alpha.toml";
 pub struct Config {
     /// The game's install folder (the one holding `data\`).
     pub install: Option<PathBuf>,
+    /// Who to play: `mattias`, `jennifer` or `chris`.
+    pub hero: crate::hero::Hero,
     pub window: WindowConfig,
     pub camera: CameraConfig,
     pub world: WorldConfig,

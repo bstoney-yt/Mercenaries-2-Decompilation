@@ -30,7 +30,7 @@
 use std::collections::HashSet;
 
 use m2_engine::world::SpawnPoint;
-use m2_engine::{AiProfile, Character, Gait, GpuModel, Physics, RagdollId};
+use m2_engine::{AiProfile, BoundClip, Character, Gait, GpuModel, Physics, RagdollId};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
@@ -329,6 +329,102 @@ impl FightClips {
     pub fn by_posture(rig: &Rig) -> [(&'static str, Vec<Carrying>); 2] {
         let ready = rig.clips.iter().position(|c| c.hash == Self::READY);
         [Self::BASH, Self::BASH_LOW].map(|e| (e, Self::carrying(rig, e, ready)))
+    }
+
+    /// A hero's: where a clip picked by name is not of the hero's own
+    /// group ([`Rig::own`]) and the group has clips of that kind, the
+    /// group's (heroes round 02: each group holds its hero's runs,
+    /// jumps, landings, throws and low bashes, told apart by their events
+    /// and root speeds); of several, the one starting nearest the rifle
+    /// held ready. The high bash stays the butt smash picked from
+    /// pictures (the groups' `meleebash` clips are not known to be one).
+    pub fn own_group(mut self, rig: &Rig) -> Self {
+        if rig.own.is_empty() {
+            return self;
+        }
+        let own = |i: Option<usize>| i.is_some_and(|i| rig.own.contains(&rig.clips[i].hash));
+        let has = |c: &BoundClip, word: &str| {
+            c.clip
+                .events
+                .iter()
+                .any(|e| e.name.to_ascii_lowercase().contains(word))
+        };
+        // A short clip of the air alone carries the bare `jump` event.
+        let air = |c: &BoundClip| {
+            c.clip
+                .events
+                .iter()
+                .any(|e| e.name.eq_ignore_ascii_case("jump"))
+        };
+        let candidates = |keep: &dyn Fn(&BoundClip) -> bool| -> Vec<usize> {
+            rig.clips
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| rig.own.contains(&c.hash) && keep(c))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        // Of several, the one starting nearest the rifle held ready (as
+        // the low bash is picked).
+        let ready = self.ready;
+        let nearest = |list: Vec<usize>| -> Option<usize> {
+            list.into_iter().min_by(|&a, &b| {
+                let d = |i: usize| {
+                    ready.map_or(0.0, |r| rig.clips[i].posture_distance_to(&rig.clips[r]))
+                };
+                d(a).total_cmp(&d(b))
+            })
+        };
+        let swap = |slot: &mut Option<usize>, keep: &dyn Fn(&BoundClip) -> bool| {
+            if !own(*slot)
+                && let Some(i) = nearest(candidates(keep))
+            {
+                *slot = Some(i);
+            }
+        };
+        swap(&mut self.run_low, &|c| {
+            has(c, "footstep_run") && (4.0..6.0).contains(&c.info.speed)
+        });
+        swap(&mut self.takeoff, &|c| {
+            has(c, "jumptakeoff") && c.info.speed >= 1.0
+        });
+        swap(&mut self.takeoff_still, &|c| {
+            has(c, "jumptakeoff") && c.info.speed < 0.5
+        });
+        swap(&mut self.land, &|c| {
+            has(c, "jumpland") && !air(c) && c.info.speed >= 3.0 && c.info.duration >= 0.3
+        });
+        swap(&mut self.land_still, &|c| {
+            has(c, "jumpland") && !air(c) && c.info.speed < 0.5 && c.info.duration <= 1.0
+        });
+        // Throws and bashes keep when in them the grenade leaves or the
+        // blow lands.
+        let event_at = |i: usize, name: &str| {
+            rig.clips[i]
+                .clip
+                .events
+                .iter()
+                .find(|e| e.name.eq_ignore_ascii_case(name))
+                .map(|e| e.time)
+        };
+        for (slot, name) in [
+            (&mut self.throw, Self::RELEASE),
+            (&mut self.bash_low, Self::BASH_LOW),
+        ] {
+            if own(slot.map(|(i, _)| i)) {
+                continue;
+            }
+            if let Some(i) = nearest(candidates(&|c| {
+                c.clip
+                    .events
+                    .iter()
+                    .any(|e| e.name.eq_ignore_ascii_case(name))
+            })) && let Some(at) = event_at(i, name)
+            {
+                *slot = Some((i, at));
+            }
+        }
+        self
     }
 
     /// Every clip, for rebinding.
@@ -1573,6 +1669,7 @@ pub(crate) mod tests {
             hands: Default::default(),
             arm: Default::default(),
             cues: Vec::new(),
+            own: Default::default(),
         }
     }
 
