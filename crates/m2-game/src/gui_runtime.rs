@@ -1,4 +1,4 @@
-//! The game's widget library (`_GuiInternal`) rebuilt as a widget store,
+﻿//! The game's widget library (`_GuiInternal`) rebuilt as a widget store,
 //! so the game's own interface scripts build and drive the HUD.
 //!
 //! The scripts never draw: `MrxGuiBase` wraps each native widget in a Lua
@@ -1558,6 +1558,14 @@ macro_rules! natives {
 fn create(kind: Kind) -> impl Fn(&mut Screen, &Lua, &Args) -> mlua::Result<MultiValue> {
     move |s, lua, a| {
         let id = s.create(kind, a.text(0).unwrap_or_default());
+        // Not drawn until added: the scripts' widget objects start
+        // disabled (`bEnabled = false`), and `MrxGui.AddWidget` activates
+        // them (`ActivateWidget(id, true)`), `RemoveWidget` deactivates.
+        // The text buffers make each message's widget as it is queued
+        // and add it only when its turn comes.
+        if let Some(w) = s.widgets.get_mut(&id) {
+            w.inactive = true;
+        }
         ret(lua, id)
     }
 }
@@ -1826,7 +1834,7 @@ natives! {
     "SetImageTextureTransience" => |_, _, _| Ok(MultiValue::new()),
     // The text cut into lines that fit the widget's width, at spaces
     // (`TextWidget:SplitIntoLines` makes a widget of each).
-    "SplitText" => |s, l, a| {
+    "SplitText" => |s, _, a| {
         let id = a.id(0);
         let Some(w) = s.widget(id) else {
             return Ok(MultiValue::new());
@@ -1852,9 +1860,23 @@ natives! {
             }
             lines.push(line);
         }
+        // A new text widget for each line, in the widget's font, scale,
+        // colour and justification: `SplitIntoLines` wraps each id it is
+        // given in a `TextWidget` (`TextWidget.new(nil, uId)`), and the
+        // text buffers show the lines one after another.
+        let (font, scale, colour, justification) =
+            (w.font.clone(), w.scale, w.colour, w.justification);
         let mut out = MultiValue::new();
         for line in lines {
-            out.push_back(Value::String(l.create_string(&line)?));
+            let line_id = s.create(Kind::Text, String::new());
+            if let Some(n) = s.widgets.get_mut(&line_id) {
+                n.text = line;
+                n.font = font.clone();
+                n.scale = scale;
+                n.colour = colour;
+                n.justification = justification;
+            }
+            out.push_back(Value::Integer(mlua::Integer::from(line_id)));
         }
         Ok(out)
     },
@@ -2219,6 +2241,44 @@ mod tests {
         host.lua().load(code).exec().unwrap();
     }
 
+    /// Activates every widget made so far, as the scripts'
+    /// `MrxGui.AddWidget` does for the ones they show.
+    fn added(screen: &ScreenRef) {
+        for w in screen.borrow_mut().widgets.values_mut() {
+            w.inactive = false;
+        }
+    }
+
+    #[test]
+    fn widgets_draw_once_added() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            queued = G.CreateTextWidget()
+            shown = G.CreateTextWidget()
+            G.SetTextText(queued, "later")
+            G.SetTextText(shown, "now")
+            G.ActivateWidget(shown, true)
+            "#,
+        );
+        let texts = || {
+            screen
+                .borrow()
+                .draw_list(640.0, 480.0)
+                .into_iter()
+                .filter_map(|i| match i {
+                    DrawItem::Text { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(), ["now"]);
+        run(&host, "_GuiInternal.ActivateWidget(queued, true)");
+        assert_eq!(texts(), ["later", "now"]);
+    }
+
     #[test]
     fn sprite_runs_step_through_their_frames() {
         let (host, screen) = host();
@@ -2276,6 +2336,7 @@ mod tests {
             G.Frobnicate(img)
             "#,
         );
+        added(&screen);
         let s = screen.borrow();
         let items = s.draw_list(640.0, 480.0);
         assert_eq!(items.len(), 1);
@@ -2390,6 +2451,7 @@ mod tests {
             G.SetWidgetFullscreen(f, true)
             "#,
         );
+        added(&screen);
         let items = screen.borrow().draw_list(1280.0, 720.0);
         let Some(DrawItem::Flash {
             rect, fullscreen, ..
@@ -2424,6 +2486,7 @@ mod tests {
             G.PushWidgetToBack(back)
             "#,
         );
+        added(&screen);
         let mut s = screen.borrow_mut();
         let mut strings = StringTable::default();
         strings
@@ -2653,6 +2716,7 @@ mod tests {
             G.SetWidgetLocation(late, 300, 220, 340, 260)
             "#,
         );
+        added(&screen);
         let s = screen.borrow();
         let rects: Vec<[f32; 4]> = s
             .draw_list(1280.0, 720.0)
