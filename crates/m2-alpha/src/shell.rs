@@ -18,6 +18,15 @@
 //! calls `Sys.StartSingleplayer`, which here notes the character for the
 //! game ([`take_new_game`]).
 //!
+//! The menu movie itself waits on the engine: its first frame stops until
+//! told the platform, and its press-start screen (`pressStartEnabled`)
+//! until a key starts the shell. What the engine tells it is what the
+//! movie's own test path (taken when its `testingVAR` is set) tells it:
+//! `setPlatform`, `firstTimeLoad(true)`, `setRegion("US")` and
+//! `setTerritory("EN")`, with the platform the PC's (`PC`, which its text
+//! tables tell apart); then, once press-start is up, Enter calls
+//! `startShell` (see [`Native`]).
+//!
 //! `LTILibName` is the PC version's own library behind its options
 //! screens (video modes, key bindings, the profile): the engine's, not the
 //! scripts'. Its functions answer nothing here (each noted once), but
@@ -129,5 +138,81 @@ pub fn hero(character: &str) -> crate::hero::Hero {
         "chris" => Hero::Chris,
         "jen" | "jennifer" => Hero::Jennifer,
         _ => Hero::Mattias,
+    }
+}
+
+/// The engine's side of the menu movie (`shell.gfx`): what it calls in
+/// the movie, and when.
+#[derive(Debug, Default)]
+pub struct Native {
+    /// The movie has been told the platform.
+    set_up: bool,
+    /// The press-start screen is up (`pressStartEnabled`), waiting for a
+    /// key.
+    press_start: bool,
+}
+
+/// The menu movie's name.
+pub const MOVIE: &str = "shell";
+
+/// The engine's calls into the movie: the function's name and its
+/// arguments.
+pub type Call = (&'static str, Vec<m2_assets::flash::avm1::Value>);
+
+impl Native {
+    /// What to call in the movie as it starts (once).
+    pub fn start(&mut self) -> Vec<Call> {
+        use m2_assets::flash::avm1::Value;
+        if std::mem::replace(&mut self.set_up, true) {
+            return Vec::new();
+        }
+        vec![
+            ("setPlatform", vec![Value::Str("PC".into())]),
+            ("firstTimeLoad", vec![Value::Bool(true)]),
+            ("setRegion", vec![Value::Str("US".into())]),
+            ("setTerritory", vec![Value::Str("EN".into())]),
+        ]
+    }
+
+    /// An `fscommand` no script handles: whether it is the engine's.
+    pub fn command(&mut self, command: &str, arg: &str) -> bool {
+        match command {
+            "pressStartEnabled" => {
+                self.press_start = arg != "false";
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A key (Flash's code) going down: what to call for it.
+    pub fn key(&mut self, code: i32) -> Vec<Call> {
+        if self.press_start && code == 13 {
+            self.press_start = false;
+            return vec![("startShell", Vec::new())];
+        }
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_movie_is_set_up_once_and_enter_starts_the_shell_from_press_start() {
+        let mut n = Native::default();
+        let first: Vec<_> = n.start().into_iter().map(|c| c.0).collect();
+        assert_eq!(
+            first,
+            ["setPlatform", "firstTimeLoad", "setRegion", "setTerritory"]
+        );
+        assert!(n.start().is_empty());
+        assert!(n.key(13).is_empty());
+        assert!(n.command("pressStartEnabled", "true"));
+        assert!(n.key(32).is_empty());
+        assert_eq!(n.key(13)[0].0, "startShell");
+        assert!(n.key(13).is_empty());
+        assert!(!n.command("startMovie", "x"));
     }
 }
