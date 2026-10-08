@@ -10,7 +10,8 @@
 //! `shell_mainmenu_<hero>` backdrops, else `shell_mainmenu`) and Enter
 //! starts as them. Play's movies (`01_AOA_J` before the first
 //! contract, `02_AOB_J` after it) come from `WifMissionFlow`'s
-//! `_PlayMovie` through [`MissionLink::take_movie`].
+//! `_PlayMovie` through [`MissionLink::take_movie`], with their subtitles
+//! when the scripts ask for them (see [`crate::subtitles`]).
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ use winit::keyboard::KeyCode;
 use crate::hero::Hero;
 use crate::mission::MissionLink;
 use crate::movie::Movie;
+use crate::subtitles::{Captions, MovieSubtitles};
 
 /// The shell bootstrap's `tMovies`, in order.
 pub const BOOT_MOVIES: [&str; 2] = ["EA", "Pandemic"];
@@ -57,12 +59,20 @@ pub struct Flow {
     step: i32,
     /// The hero a new game was started as, not yet taken.
     picked: Option<Hero>,
+    /// The player has subtitles on.
+    subtitles_on: bool,
+    /// The scripted movie's subtitles, if it has any.
+    subtitles: Option<MovieSubtitles>,
+    /// What they are drawn with: not read yet, or read (None if they could
+    /// not be).
+    captions: Option<Option<Captions>>,
 }
 
 impl Flow {
     /// Starts with the boot movies, or (`boot` false) straight in play;
-    /// the front end offers `hero` first.
-    pub fn new(install: Install, boot: bool, hero: Hero) -> Self {
+    /// the front end offers `hero` first; `subtitles` is the player's
+    /// option.
+    pub fn new(install: Install, boot: bool, hero: Hero, subtitles: bool) -> Self {
         let ffmpeg = crate::movie::ffmpeg();
         match &ffmpeg {
             Some(p) => eprintln!("movies: decoding with {}", p.display()),
@@ -87,6 +97,9 @@ impl Flow {
             hero,
             step: 0,
             picked: None,
+            subtitles_on: subtitles,
+            subtitles: None,
+            captions: None,
         }
     }
 
@@ -151,6 +164,7 @@ impl Flow {
     }
 
     fn close(&mut self, mixer: &mut Mixer) {
+        self.subtitles = None;
         if let Some(m) = self.movie.take()
             && let Some(v) = m.voice
         {
@@ -213,12 +227,24 @@ impl Flow {
             Stage::Game => {
                 let Some(mission) = mission else { return };
                 if self.movie.is_none() {
-                    if let Some(name) = mission.take_movie() {
+                    if let Some((name, lines)) = mission.take_movie() {
                         eprintln!("flow: the scripts play movie {name}");
                         self.scripted = true;
                         if !self.open(&name, mixer) {
                             self.scripted = false;
                             mission.movie_done();
+                            return;
+                        }
+                        if let Some(lines) = lines {
+                            if self.captions.is_none() {
+                                let strings = mission.strings().cloned().unwrap_or_default();
+                                self.captions = Some(
+                                    Captions::load(&self.install, strings)
+                                        .map_err(|e| eprintln!("subtitles: {e}"))
+                                        .ok(),
+                                );
+                            }
+                            self.subtitles = MovieSubtitles::new(lines, self.subtitles_on);
                         }
                     }
                     return;
@@ -227,6 +253,23 @@ impl Flow {
                     .movie
                     .as_mut()
                     .is_some_and(|m| pressed || m.update(|p| mixer.play(p)));
+                if let (Some(s), Some(m)) = (&mut self.subtitles, &self.movie)
+                    && let Some((frame, _)) = &m.frame
+                {
+                    let (was_bottom, was_top) =
+                        (s.bottom().map(str::to_owned), s.top().map(str::to_owned));
+                    s.update(*frame);
+                    if let Some(Some(c)) = &self.captions {
+                        for (now, was) in [(s.bottom(), was_bottom), (s.top(), was_top)] {
+                            if let Some(t) = now.filter(|t| was.as_deref() != Some(*t)) {
+                                eprintln!(
+                                    "subtitles: frame {frame}: {}",
+                                    c.plain(t).replace('\n', " / ")
+                                );
+                            }
+                        }
+                    }
+                }
                 if over {
                     let name = self.movie.as_ref().map(|m| m.name.clone());
                     self.close(mixer);
@@ -282,6 +325,9 @@ impl Flow {
                     Color32::WHITE,
                 );
             }
+        }
+        if let (Some(s), Some(Some(c))) = (&self.subtitles, &mut self.captions) {
+            c.paint(&painter, s.bottom(), s.top());
         }
         if self.stage == Stage::FrontEnd {
             let size = (screen.height() * 0.035).max(14.0);

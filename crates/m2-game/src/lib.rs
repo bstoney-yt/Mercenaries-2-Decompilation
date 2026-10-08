@@ -13,5 +13,6 @@ pub mod library;
 pub mod mission;
 pub mod music;
 pub mod script;
+pub mod subtitles;
 pub mod support;
 pub mod vo;
