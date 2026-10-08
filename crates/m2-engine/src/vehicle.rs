@@ -342,7 +342,10 @@ impl VehicleSpec {
             return None;
         }
         let found = vehicle::find_wheels(model);
-        let usable = (4..=10).contains(&found.len())
+        // Two wheels in line: a motorbike (every one of the island's has
+        // its pair found, round 04 of the vehicles thread).
+        let bike = found.len() == 2 && found.iter().all(|w| w.centre[0].abs() < 0.15);
+        let usable = ((4..=10).contains(&found.len()) || bike)
             && found.iter().all(|w| (0.15..=1.3).contains(&w.radius));
         let boat = entry.kind == BOAT;
         let flies = entry.kind == HELICOPTER;
@@ -604,6 +607,12 @@ impl VehicleSpec {
             self.elevation = turret.pitch;
         }
         self
+    }
+
+    /// Whether it rides on two wheels in line (a motorbike): it is held
+    /// upright and leans into its turns.
+    pub fn is_bike(&self) -> bool {
+        self.wheels.len() == 2
     }
 
     /// Whether it is a helicopter: it flies and has no wheels.

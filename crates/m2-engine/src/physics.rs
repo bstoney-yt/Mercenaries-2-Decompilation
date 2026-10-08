@@ -776,6 +776,12 @@ const CLIMB_EASE: f32 = 1.5;
 /// How quickly it leans to the tilt its stick asks, a second (its
 /// template's `PitchAccel` and `RollAccel` scale it).
 const LEAN_EASE: f32 = 3.0;
+/// How far a motorbike leans into a full-lock turn, radians, from this
+/// speed up (m/s), and how quickly it gets there, a second. Invented.
+const BIKE_LEAN: f32 = 0.45;
+const BIKE_LEAN_SPEED: f32 = 12.0;
+const BIKE_EASE: f32 = 8.0;
+
 /// A helicopter's body is at most this wide, metres either side: its hull
 /// box leaves the rotor disc out.
 const FUSELAGE_HALF: f32 = 1.6;
@@ -802,6 +808,8 @@ struct VehicleBody {
     steers: Vec<bool>,
     /// On tracks: turns on the spot instead of steering wheels.
     tracked: bool,
+    /// On two wheels in line: held upright, leaning into its turns.
+    bike: bool,
     /// Top speed forwards, m/s.
     top: f32,
     /// Wrecked: nothing drives it any more.
@@ -1206,19 +1214,19 @@ impl Physics {
             let rise = velocity.y
                 + (r.lift.clamp(-1.0, 1.0) * f.climb - velocity.y) * (CLIMB_EASE * dt).min(1.0);
             b.set_linvel(vector(flat + Vec3::Y * rise), true);
-            // Nose down flying forwards; right side down turning right at
-            // speed (+x is its left).
+            // Nose down flying forwards; banked into a turn at speed (as
+            // the wheels, positive steering turns left; +x is its left).
             let bank = (flat.length() / f.bank_speed.max(1.0)).min(1.0);
             let lean = Quat::from_rotation_y(heading)
                 * Quat::from_rotation_x(throttle * f.pitch)
-                * Quat::from_rotation_z(steer * f.roll_bank * bank);
+                * Quat::from_rotation_z(-steer * f.roll_bank * bank);
             let mut error = lean * turn.inverse();
             if error.w < 0.0 {
                 error = -error;
             }
             let (axis, angle) = error.to_axis_angle();
             let rate = LEAN_EASE * 0.5 * (f.pitch_accel + f.roll_accel);
-            let yaw = -steer * f.yaw * YAW_SHARE;
+            let yaw = steer * f.yaw * YAW_SHARE;
             let spin = (axis * angle * rate).with_y(0.0) + Vec3::Y * yaw;
             b.set_angvel(vector(spin), true);
         }
@@ -1505,6 +1513,7 @@ impl Physics {
             mass: spec.mass,
             steers: spec.wheels.iter().map(|w| w.steers).collect(),
             tracked: spec.tracked,
+            bike: spec.is_bike(),
             top: spec.tuning.max_speed.unwrap_or(top),
             wrecked: false,
             held: false,
@@ -1615,6 +1624,29 @@ impl Physics {
             .count()
             >= 2;
         let mass = v.mass;
+        // A motorbike stays upright, leaning into the turn (the stand
+        // holds it up parked).
+        if v.bike
+            && let Some(body) = self.world.bodies.get_mut(v.controller.chassis)
+        {
+            let turn = Quat::from_array(body.position().rotation.to_array());
+            let ahead = turn * Vec3::Z;
+            let up = turn * Vec3::Y;
+            let flat = ahead.with_y(0.0).normalize_or(Vec3::Z);
+            // Steering left (positive, as the wheels turn) leans it left.
+            let lean = controls.steer.clamp(-1.0, 1.0)
+                * BIKE_LEAN
+                * (speed.abs() / BIKE_LEAN_SPEED).min(1.0);
+            let want = Quat::from_axis_angle(flat, -lean) * Vec3::Y;
+            // Turning about `flat` the positive way tips the top this way
+            // (to its right).
+            let right = flat.cross(Vec3::Y);
+            let error = (up - want).dot(right);
+            let w = vec3(body.angvel());
+            let roll = w.dot(flat);
+            let fix = -error * BIKE_EASE;
+            body.set_angvel(vector(w + flat * (fix - roll)), true);
+        }
         // Tracks turn the hull on the spot (one track forward, the other
         // back), so the yaw is set directly; a little slower on the move.
         if let Some((chassis, turn)) = tracked
@@ -2605,6 +2637,87 @@ mod tests {
     }
 
     #[test]
+    fn a_motorbike_stays_up_and_leans_into_a_turn() {
+        let mut p = Physics::new();
+        let ground = CollisionShape::cuboid(Vec3::new(2000.0, 1.0, 2000.0));
+        p.add_static(
+            StaticKey::Cell(1),
+            &ground,
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+        );
+        let wheel = |z: f32| crate::vehicle::WheelSpec {
+            centre: Vec3::new(0.0, 0.3, z),
+            radius: 0.3,
+            width: 0.15,
+            steers: z > 0.0,
+        };
+        let hull = (Vec3::new(-0.45, 0.0, -1.1), Vec3::new(0.45, 1.3, 1.1));
+        let bike = VehicleSpec {
+            wheels: vec![wheel(0.7), wheel(-0.75)],
+            bounds: hull,
+            hull,
+            mass: 250.0,
+            ..car()
+        };
+        assert!(bike.is_bike());
+        let id = p.add_vehicle(&bike, Vec3::new(0.0, 0.2, 0.0), 0.0);
+        let place = |p: &Physics| p.vehicle_transform(id).unwrap();
+        for _ in 0..120 {
+            p.drive(
+                id,
+                VehicleControls {
+                    parked: true,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        assert!(
+            place(&p).transform_vector3(Vec3::Y).y > 0.98,
+            "stands parked"
+        );
+        for _ in 0..240 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        assert!(
+            place(&p).transform_vector3(Vec3::Y).y > 0.98,
+            "upright riding"
+        );
+        assert!(
+            p.vehicle_speed(id) > 5.0,
+            "rides at {}",
+            p.vehicle_speed(id)
+        );
+        let before = place(&p).transform_vector3(Vec3::Z);
+        for _ in 0..60 {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    steer: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+        }
+        let m = place(&p);
+        assert!(
+            before.cross(m.transform_vector3(Vec3::Z)).y > 0.0,
+            "turned left"
+        );
+        assert!(m.transform_vector3(Vec3::X).y < -0.1, "leans left");
+        assert!(m.transform_vector3(Vec3::Y).y > 0.8, "still up");
+    }
+
+    #[test]
     fn a_helicopter_climbs_flies_turns_and_falls_unflown() {
         let mut p = Physics::new();
         let ground = CollisionShape::cuboid(Vec3::new(2000.0, 1.0, 2000.0));
@@ -2669,8 +2782,8 @@ mod tests {
             m.w_axis.y
         );
         assert!(m.transform_vector3(Vec3::Z).y < -0.3, "nose down");
-        // Steering right turns it right (clockwise from above) and banks
-        // it right side down.
+        // Steering left (positive, as the wheels) turns it left
+        // (anticlockwise from above) and banks it left side down.
         let before = m.transform_vector3(Vec3::Z);
         for _ in 0..30 {
             p.drive(id, flown(1.0, 1.0));
@@ -2678,8 +2791,8 @@ mod tests {
         }
         let m = place(&p);
         let after = m.transform_vector3(Vec3::Z);
-        assert!(before.cross(after).y < 0.0, "turned right");
-        assert!(m.transform_vector3(Vec3::X).y > 0.05, "banked");
+        assert!(before.cross(after).y > 0.0, "turned left");
+        assert!(m.transform_vector3(Vec3::X).y < -0.05, "banked");
         // Nobody flying it: it falls.
         for _ in 0..60 {
             p.drive(
