@@ -224,9 +224,9 @@ const NPC_DAMAGE: f32 = 9.0 * 0.25;
 /// `Hero` row (all three heroes' `ModifierKey`) for the blasts'
 /// `DamageKey`s. Her grenades', rockets', tank shells' and C4's
 /// explosions are `Explosion` (0.2); the satellite bomb's and its final
-/// strike's `ExplosionLarge`, its frag's `BulletLarge` (0.4). The
-/// defaults are the table's cells as read in rounds 158-160, but for
-/// `ExplosionLarge`, not yet seen (unscaled until the table gives it).
+/// strike's `ExplosionLarge` (0.5), its frag's `BulletLarge` (0.4). The
+/// defaults are the table's cells as read on Brendan's PC (rounds
+/// 158-160, heroes round 04); the game reads them from the table.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HeroDamage {
     pub explosion: f32,
@@ -238,7 +238,7 @@ impl Default for HeroDamage {
     fn default() -> Self {
         Self {
             explosion: 0.2,
-            explosion_large: 1.0,
+            explosion_large: 0.5,
             bullet_large: 0.4,
         }
     }
