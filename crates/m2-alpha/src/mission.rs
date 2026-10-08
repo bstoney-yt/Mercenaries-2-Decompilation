@@ -262,7 +262,18 @@ for group, names in pairs(methods) do
                     group = group, method = name, data = copy(t, 0),
                     callback = callback })
                 if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
-                if type(f) == "function" then return f(self, t, ...) end
+                local r
+                if type(f) == "function" then r = f(self, t, ...) end
+                -- A message added here gets the call's number as its id,
+                -- for the HUD to tell its own message by: what the
+                -- scripts keep to take it down again (`MrxSubtitle`'s
+                -- `_tMsgIds`, passed back as `tMessageIds`). What the
+                -- engine's own `Hud` answers here (a stub) means nothing
+                -- to the HUD.
+                if name == "AddMessage" then
+                    r = { __m2_seq = __m2_hud_call_count }
+                end
+                return r
             end
         end
     end
