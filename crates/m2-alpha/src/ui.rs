@@ -26,6 +26,8 @@ pub struct HudInfo {
     pub hp: f32,
     pub down: bool,
     pub weapon: Weapon,
+    /// Her rifle's template name (`Carbine`, `Bullpup Rifle`).
+    pub rifle: String,
     /// What she carries in the launcher's place, if anything.
     pub second: Option<Weapon>,
     /// Grenades she has.
@@ -64,6 +66,8 @@ pub enum MenuAction {
     /// Save the game, or load the saved game.
     SaveGame,
     LoadGame,
+    /// Play as another mercenary (also kept in the settings).
+    Hero(crate::hero::Hero),
     Quit,
 }
 
@@ -312,8 +316,10 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo) {
                 Weapon::GrenadeLauncher => "grenade launcher",
             };
             let up = match (info.weapon, info.rounds) {
-                (Weapon::Rifle, Some((clip, stored))) => format!("Carbine {clip} | {stored}"),
-                (Weapon::Rifle, None) => "Carbine".to_owned(),
+                (Weapon::Rifle, Some((clip, stored))) => {
+                    format!("{} {clip} | {stored}", info.rifle)
+                }
+                (Weapon::Rifle, None) => info.rifle.clone(),
                 (Weapon::Rpg, _) => "RPG".to_owned(),
                 (Weapon::GrenadeLauncher, Some((clip, stored))) => {
                     format!("Grenade launcher {clip} | {stored}")
@@ -948,6 +954,20 @@ fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
                 }
                 if ui.button("Load game (F9)").clicked() {
                     action = Some(MenuAction::LoadGame);
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Play as");
+                for hero in crate::hero::Hero::ALL {
+                    if ui
+                        .selectable_label(config.hero == hero, hero.name())
+                        .clicked()
+                        && config.hero != hero
+                    {
+                        config.hero = hero;
+                        action = Some(MenuAction::Hero(hero));
+                    }
                 }
             });
             ui.separator();

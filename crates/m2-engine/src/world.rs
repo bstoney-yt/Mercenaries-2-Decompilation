@@ -31,7 +31,7 @@ use m2_render::{
 use crate::assets::{AssetError, AssetSource};
 use crate::physics::CollisionShape;
 use crate::pickup::Leavings;
-use crate::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable, VehicleTuning};
+use crate::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable, HandGun, VehicleTuning};
 
 /// Side of the island in metres (20 cells of 400 m).
 pub const ISLAND: f32 = 8000.0;
@@ -134,6 +134,17 @@ pub struct Templates {
     pub tuning: HashMap<u32, VehicleTuning>,
     /// What templates leave when destroyed, and what pickups give.
     pub leavings: Leavings,
+    /// Each template's `Health`, by id, where it has one.
+    pub health: HashMap<u32, f32>,
+    /// Each person template's walk, run and sprint speeds, by id
+    /// ([`crate::tuning::human_speeds`]).
+    pub speeds: HashMap<u32, [f32; 3]>,
+    /// Hand-held guns that fire rounds, by id ([`crate::tuning::hand_guns`]).
+    pub guns: HashMap<u32, HandGun>,
+    /// What each template's `EquipmentLink`s hand it, by id.
+    pub equipment: HashMap<u32, Vec<u32>>,
+    /// The game's damage table, if found.
+    pub damage: Option<DamageTable>,
 }
 
 impl Templates {
@@ -173,6 +184,51 @@ impl Templates {
             None => self.by_name.get(&name.to_ascii_lowercase())?,
         };
         Some((name, info))
+    }
+
+    /// Template `name`'s `Health`, whatever its case: of several so
+    /// named, the first that gives one.
+    pub fn health(&self, name: &str) -> Option<f32> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.health.get(id).copied())
+    }
+
+    /// Template `name`'s walk, run and sprint speeds, whatever its case.
+    pub fn speeds(&self, name: &str) -> Option<[f32; 3]> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.speeds.get(id).copied())
+    }
+
+    /// The rifle template `name` (a hero: `Jen`) is handed by its
+    /// `EquipmentLink`s: the first that is a gun firing rounds (Jen's
+    /// `Bullpup Rifle`, Mattias's `Assault Rifle`, Chris's `Carbine`; the
+    /// RPG fires rockets), with its template's name.
+    pub fn own_rifle(&self, name: &str) -> Option<(&str, HandGun)> {
+        self.ids(name).iter().find_map(|id| {
+            let gun = self
+                .equipment
+                .get(id)?
+                .iter()
+                .find_map(|t| self.guns.get(t))?;
+            Some((self.names.get(&gun.template)?.as_str(), *gun))
+        })
+    }
+
+    /// The gun template `name` (`Carbine`), whatever its case.
+    pub fn gun(&self, name: &str) -> Option<HandGun> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.guns.get(id).copied())
+    }
+
+    /// What damage of kind `damage` (`Explosion`) does to a target of
+    /// kind `target` (`Hero`), of the damage, by the game's damage table.
+    pub fn damage_scale(&self, target: &str, damage: &str) -> Option<f32> {
+        self.damage
+            .as_ref()?
+            .scale(name_hash(target), name_hash(damage))
     }
 
     /// The tuning of template `name` (a vehicle's own, `AMX30 (Full)`),
@@ -307,6 +363,11 @@ impl Templates {
                 .collect(),
             tuning: crate::tuning::read(&db, damage.as_ref()),
             leavings: crate::pickup::read(&db),
+            health: crate::tuning::healths(&db),
+            speeds: crate::tuning::human_speeds(&db),
+            guns: crate::tuning::hand_guns(&db),
+            equipment: crate::tuning::equipment(&db),
+            damage,
         }
     }
 }

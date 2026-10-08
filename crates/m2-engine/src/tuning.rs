@@ -325,6 +325,118 @@ impl<'a> Table<'a> {
 
 /// The tuning of every template the database gives any, by template id.
 /// `damage` is the game's damage table, if found.
+/// `_HumanPhysics` fields that differ between the heroes as their
+/// speeds do (heroes round 02; names unsolved, so read as speeds by
+/// inference): Jennifer 2.0, 5.0 and 7.0, Chris 1.5, 4.5 and 6.25,
+/// Mattias 1.5, 4.5 and 5.5. Her run (5.0) is the alpha's run speed.
+const HUMAN_SPEEDS: [u32; 3] = [0xb535_3104, 0x5cc8_c4d9, 0x6167_d5fc];
+
+/// Every person template's three `_HumanPhysics` speeds (walk, run,
+/// sprint; inferred, see [`HUMAN_SPEEDS`]), by id.
+pub fn human_speeds(db: &Layer<'_>) -> HashMap<u32, [f32; 3]> {
+    let physics = Table::new(db, "_HumanPhysics");
+    physics
+        .records
+        .keys()
+        .filter_map(|&id| {
+            let record = physics.of_template(id).first()?;
+            let mut out = [0.0; 3];
+            for (o, field) in out.iter_mut().zip(HUMAN_SPEEDS) {
+                *o = f32::from_bits(physics.word(record, field)?);
+            }
+            out.iter()
+                .all(|v| v.is_normal() && *v > 0.0)
+                .then_some((id, out))
+        })
+        .collect()
+}
+
+/// Every template's `Health` value, by id: a vehicle's, a person's, a
+/// hero's (the `Mattias` template's 120).
+pub fn healths(db: &Layer<'_>) -> HashMap<u32, f32> {
+    let health = Table::new(db, "Health");
+    health
+        .records
+        .keys()
+        .filter_map(|&id| Some((id, health.number(id, HEALTH)?)))
+        .collect()
+}
+
+/// A hand-held gun that fires rounds (`WeaponProjectileBase` with
+/// `FireType` 0; the RPG and the grenade launcher are 1): what a hero
+/// carries as their rifle. The Carbine's 562 a minute, 30 a clip, 9
+/// clips spare and its round's 6; the Bullpup Rifle's 487, 30, 7 and 8;
+/// the Assault Rifle's 450, 30, 7 and 9 (round 137's dump).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HandGun {
+    /// The weapon's template id.
+    pub template: u32,
+    /// Its `ModelName` (`global_weapon_bullpup`).
+    pub model: Option<u32>,
+    /// Shots a minute (`RateOfFire`).
+    pub rate_of_fire: f32,
+    /// Rounds a clip (`iClipSize`, two bytes) and clips kept beyond it
+    /// (`MaxAmmoReserve`, one byte: it counts clips).
+    pub clip: u32,
+    pub reserve_clips: u32,
+    /// Its round's `ProjectilePhysics` `Damage`, and the round's
+    /// `DamageKey` (name hash; `Bullet` for every rifle).
+    pub damage: f32,
+    pub damage_key: Option<u32>,
+}
+
+/// Every hand-held gun that fires rounds ([`HandGun`]), by template id.
+pub fn hand_guns(db: &Layer<'_>) -> HashMap<u32, HandGun> {
+    let weapon = Table::new(db, "WeaponProjectileBase");
+    let physics = Table::new(db, "ProjectilePhysics");
+    let key = Table::new(db, "DamageKey");
+    let models = db.hashes("ModelName");
+    weapon
+        .templates()
+        .filter_map(|id| {
+            let r = *weapon.of_template(id).first()?;
+            if weapon.word(r, name_hash("FireType"))? != 0 {
+                return None;
+            }
+            let ammo = weapon.word(r, name_hash("AmmoTemplate"))?;
+            Some((
+                id,
+                HandGun {
+                    template: id,
+                    model: models.get(&id).copied().filter(|&m| m != 0),
+                    rate_of_fire: weapon
+                        .float(r, name_hash("RateOfFire"))
+                        .filter(|&f| f > 0.0)?,
+                    clip: weapon.word(r, name_hash("iClipSize"))? & 0xffff,
+                    reserve_clips: weapon.word(r, name_hash("MaxAmmoReserve"))? & 0xff,
+                    damage: physics.get(ammo, "Damage")?,
+                    damage_key: key
+                        .of_template(ammo)
+                        .first()
+                        .and_then(|k| key.word(k, name_hash("DamageKey"))),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// What each template's `EquipmentLink`s hand it (a hero's `Grenade`,
+/// `C4`, `RPG` and own rifle), template ids in the database's order.
+pub fn equipment(db: &Layer<'_>) -> HashMap<u32, Vec<u32>> {
+    let link = Table::new(db, "EquipmentLink");
+    link.templates()
+        .map(|id| {
+            let items = link
+                .of_template(id)
+                .iter()
+                .filter_map(|r| link.word(r, LINK))
+                .filter(|&t| t != 0)
+                .collect();
+            (id, items)
+        })
+        .collect()
+}
+
 pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, VehicleTuning> {
     let tank = Table::new(db, "_TankPhysics");
     let car = Table::new(db, "_CarPhysicsV2");
@@ -540,6 +652,8 @@ mod tests {
             ("Bullet", 0x74fd_1ba9),
             ("BulletLarge", 0x7f01_0e06),
             ("Car", 0xce27_c791),
+            ("Explosion", 0x1693_0afe),
+            ("ExplosionLarge", 0xdc0a_895f),
             (DAMAGE_TABLE, 0x99c2_b81f),
             ("MaxElevationSpeed", 0x68cf_364b),
             ("MaxFwdSpeed", 0x4fc8_d911),

@@ -7,6 +7,7 @@
 //! The set is found by running the start-up scripts headless on a thread
 //! of their own, as `--mission` does, and keeping only what they loaded.
 
+use crate::hero::Hero;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
@@ -59,7 +60,7 @@ pub enum Startup {
 
 impl Startup {
     /// Starts the scripts reading `install` in the background.
-    pub fn start(install: &Install) -> Self {
+    pub fn start(install: &Install, hero: Hero) -> Self {
         let wad = install.data.join("vz.wad");
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -67,7 +68,7 @@ impl Startup {
                 .map_err(|e| format!("{}: {e}", wad.display()))
                 .and_then(|f| WadArchive::open(BufReader::new(f)).map_err(|e| e.to_string()))
                 .and_then(|mut w| GameData::read(&mut w).map_err(|e| e.to_string()))
-                .and_then(|data| run(data).map_err(|e| e.to_string()));
+                .and_then(|data| run(data, hero).map_err(|e| e.to_string()));
             // The game may have quit meanwhile.
             let _ = tx.send(found);
         });
@@ -104,8 +105,8 @@ impl Startup {
 }
 
 /// Runs the start-up scripts and keeps the layers they loaded.
-fn run(data: GameData) -> Result<StartupLayers, m2_game::mission::MissionError> {
-    let mut mission = Mission::new(data, crate::mission::HERO, [0.0; 3])?;
+fn run(data: GameData, hero: Hero) -> Result<StartupLayers, m2_game::mission::MissionError> {
+    let mut mission = Mission::new(data, hero.name(), [0.0; 3])?;
     mission.start();
     let mut t = 0.0;
     while t < SETTLE {
