@@ -2204,7 +2204,17 @@ impl Thread {
             }
         }
         for (id, (command, arg)) in commands {
-            match gui_runtime::flash_command(lua, id, &command, &arg) {
+            let character = self.native.character();
+            let heard = match character {
+                Some(who) if self.mode == Mode::Shell && command == "newGame" => {
+                    log.push(format!(
+                        "shell: newGame({arg}) as the profile's character, {who}"
+                    ));
+                    crate::shell::start_new_game(lua, id, who)
+                }
+                _ => gui_runtime::flash_command(lua, id, &command, &arg),
+            };
+            match heard {
                 Ok(true) => {}
                 Ok(false) => {
                     log.push(format!(
