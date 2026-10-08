@@ -145,6 +145,9 @@ pub struct Widget {
     pub font: String,
     pub scale: f32,
     pub justification: Anchor,
+    /// Wrapped at the widget's width (`SetTextWrapping`, which the
+    /// scripts' `TextWidget:Wrap` turns on).
+    pub wraps: bool,
     pub swf: Option<String>,
     /// `CallFlashScriptFunction` calls not yet taken by the host
     /// ([`Screen::take_flash_calls`]): the movie's function and its
@@ -206,6 +209,7 @@ impl Widget {
             font: String::new(),
             scale: 1.0,
             justification: Anchor::Start,
+            wraps: false,
             swf: None,
             flash_calls: Vec::new(),
             flash_handlers: BTreeMap::new(),
@@ -676,12 +680,31 @@ impl Screen {
             .map(str::to_owned)
     }
 
+    /// Widget `id`'s text in spans as drawn: wrapped at its width, at
+    /// spaces, when it wraps ([`Widget::wraps`]).
+    pub fn text_spans(&self, id: u32) -> Vec<TextSpan> {
+        let Some(w) = self.widgets.get(&id) else {
+            return Vec::new();
+        };
+        let spans = self.spans(&w.text);
+        if !w.wraps {
+            return spans;
+        }
+        let r = self.rect(id);
+        let font = self.fonts.get(&w.font.to_ascii_lowercase());
+        let unit = VIRTUAL_SIZE.1 / FONT_LINES * w.scale;
+        let line_px = font.map_or(30.0, |f| f32::from(f.line_height));
+        let width =
+            |t: &str| unit * font.map_or(t.chars().count() as f32 * 12.0, |f| f.text_width(t));
+        wrap_spans(spans, (r[2] - r[0]).max(1.0), width, line_px * unit)
+    }
+
     /// Text width in virtual units, by the font if given one.
     fn text_width(&self, id: u32) -> f32 {
         let Some(w) = self.widgets.get(&id) else {
             return 0.0;
         };
-        let text = self.display_text(&w.text);
+        let text: String = self.text_spans(id).into_iter().map(|s| s.text).collect();
         let font = self.fonts.get(&w.font.to_ascii_lowercase());
         // The widest line.
         let px = text
@@ -694,6 +717,8 @@ impl Screen {
         px * VIRTUAL_SIZE.1 / FONT_LINES * w.scale
     }
 
+    /// Text height in virtual units: a line's for each line (wrapped
+    /// ones too: the text buffers size their messages by it).
     fn text_height(&self, id: u32) -> f32 {
         let Some(w) = self.widgets.get(&id) else {
             return 0.0;
@@ -702,7 +727,9 @@ impl Screen {
             .fonts
             .get(&w.font.to_ascii_lowercase())
             .map_or(30.0, |f| f32::from(f.line_height));
-        px * VIRTUAL_SIZE.1 / FONT_LINES * w.scale
+        let text: String = self.text_spans(id).into_iter().map(|s| s.text).collect();
+        let lines = text.trim_end_matches('\n').split('\n').count().max(1);
+        px * lines as f32 * VIRTUAL_SIZE.1 / FONT_LINES * w.scale
     }
 
     /// The correction of the widget's nearest corrected ancestor (itself
@@ -805,11 +832,12 @@ impl Screen {
                 }
                 Kind::Text => {
                     if !w.text.is_empty() {
+                        let spans = self.text_spans(id);
                         out.push(DrawItem::Text {
                             widget: id,
                             font: w.font.clone(),
-                            text: self.display_text(&w.text),
-                            spans: self.spans(&w.text),
+                            text: spans.iter().map(|s| s.text.as_str()).collect(),
+                            spans,
                             rect,
                             size: c.scale * VIRTUAL_SIZE.1 / FONT_LINES * w.scale,
                             colour,
@@ -866,6 +894,59 @@ pub struct TextSpan {
     /// An inline icon in its place instead of text: the texture, a line
     /// high and square, tinted by the colour.
     pub icon: Option<String>,
+}
+
+/// `spans` with a new line put for the space before each word that would
+/// take its line past `max` (as `width` measures text; an icon is
+/// `icon` wide). A word wider than `max` keeps a line to itself.
+fn wrap_spans(
+    spans: Vec<TextSpan>,
+    max: f32,
+    width: impl Fn(&str) -> f32,
+    icon: f32,
+) -> Vec<TextSpan> {
+    let mut out: Vec<TextSpan> = Vec::with_capacity(spans.len());
+    // The width of the line so far.
+    let mut line = 0.0f32;
+    for span in spans {
+        if span.icon.is_some() {
+            line += icon;
+            out.push(span);
+            continue;
+        }
+        let mut text = String::with_capacity(span.text.len());
+        for (i, para) in span.text.split('\n').enumerate() {
+            if i > 0 {
+                text.push('\n');
+                line = 0.0;
+            }
+            for (j, word) in para.split(' ').enumerate() {
+                let space = if j > 0 { width(" ") } else { 0.0 };
+                let w = width(word);
+                if line > 0.0 && line + space + w > max {
+                    // The break goes where the space was.
+                    if j == 0 {
+                        // At a span's start: the space ended the last one.
+                        if let Some(prev) = out.iter_mut().rev().find(|s| s.icon.is_none())
+                            && prev.text.ends_with(' ')
+                        {
+                            prev.text.pop();
+                        }
+                    }
+                    text.push('\n');
+                    line = w;
+                } else {
+                    if j > 0 {
+                        text.push(' ');
+                    }
+                    line += space + w;
+                }
+                text.push_str(word);
+            }
+        }
+        out.push(TextSpan { text, ..span });
+    }
+    out
 }
 
 /// The length of the bracketed token `s` starts with, nested brackets
@@ -2019,7 +2100,12 @@ natives! {
         let j = s.widget(a.id(0)).map_or(Anchor::Start, |w| w.justification);
         ret(l, anchor_name(j, true))
     },
-    "SetTextWrapping" => |_, _, _| Ok(MultiValue::new()),
+    "SetTextWrapping" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.wraps = a.truthy(1);
+        }
+        Ok(MultiValue::new())
+    },
     "GetTextWidth" => |s, l, a| ret(l, s.text_width(a.id(0))),
     "GetTextHeight" => |s, l, a| ret(l, s.text_height(a.id(0))),
     "SetFlashSwfFile" => |s, l, a| {
@@ -2098,6 +2184,30 @@ natives! {
 mod tests {
     use super::*;
     use crate::script::ScriptHost;
+
+    fn plain(spans: &[TextSpan]) -> String {
+        spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn wrapping_breaks_at_the_spaces_that_would_overflow() {
+        let span = |t: &str, c: Option<[f32; 3]>| TextSpan {
+            text: t.into(),
+            colour: c,
+            icon: None,
+        };
+        let width = |t: &str| t.chars().count() as f32;
+        let one = vec![span("aaa bbb ccc ddd", None)];
+        assert_eq!(plain(&wrap_spans(one, 7.0, width, 1.0)), "aaa bbb\nccc ddd");
+        // Across colours, the space that ended a span is the break.
+        let two = vec![span("aaa bbb ", None), span("ccc", Some([1.0, 0.0, 0.0]))];
+        let wrapped = wrap_spans(two, 8.0, width, 1.0);
+        assert_eq!(plain(&wrapped), "aaa bbb\nccc");
+        assert_eq!(wrapped[1].colour, Some([1.0, 0.0, 0.0]));
+        // Lines already short enough, and a word too long, stay as they are.
+        let three = vec![span("a\nlongword b", None)];
+        assert_eq!(plain(&wrap_spans(three, 4.0, width, 1.0)), "a\nlongword\nb");
+    }
 
     fn host() -> (ScriptHost, ScreenRef) {
         let host = ScriptHost::new().unwrap();
