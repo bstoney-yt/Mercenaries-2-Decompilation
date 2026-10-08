@@ -244,6 +244,8 @@ pub struct VehicleSpec {
     /// What its template says of how it handles and fights
     /// ([`VehicleSpec::tuned`]).
     pub tuning: VehicleTuning,
+    /// A helicopter's rotors (none for others).
+    pub rotors: Vec<RotorSpec>,
 }
 
 /// How a vehicle sits on uneven ground ([`VehicleSpec::rest_on`]).
@@ -261,6 +263,22 @@ pub struct Rest {
 
 /// The [`CatalogueEntry::kind`] of boats (a template with `_BoatPhysics`).
 pub const BOAT: &str = "boat";
+
+/// The kind of a helicopter: it flies ([`Physics::fly`]) and has no
+/// wheels.
+///
+/// [`Physics::fly`]: crate::Physics::fly
+pub const HELICOPTER: &str = "helicopter";
+
+/// A rotor as drawn: the nodes that spin with it (its blades and their
+/// blur, [`vehicle::rotors`]), where it spins about and on what axis,
+/// model space.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RotorSpec {
+    pub nodes: Vec<bool>,
+    pub centre: Vec3,
+    pub axis: Vec3,
+}
 
 /// Node name hash of a gun's muzzle marker (the hand weapons have it).
 pub const GUN_MUZZLE: u32 = 0xb148_6ef3;
@@ -327,6 +345,7 @@ impl VehicleSpec {
         let usable = (4..=10).contains(&found.len())
             && found.iter().all(|w| (0.15..=1.3).contains(&w.radius));
         let boat = entry.kind == BOAT;
+        let flies = entry.kind == HELICOPTER;
         // A wheeled APC (the Stryker) drives on its wheels.
         let tracked = entry.kind == "tank" || (entry.kind == "apc" && !usable);
         let n = model.nodes.len();
@@ -351,7 +370,7 @@ impl VehicleSpec {
             }
         };
         let mut road_wheels = Vec::new();
-        let mut wheels: Vec<WheelSpec> = if boat {
+        let mut wheels: Vec<WheelSpec> = if boat || flies {
             Vec::new()
         } else if usable && !tracked {
             let (back, front) = found
@@ -557,6 +576,18 @@ impl VehicleSpec {
             hull,
             turret_box,
             tuning: VehicleTuning::default(),
+            rotors: if flies {
+                vehicle::rotors(model)
+                    .into_iter()
+                    .map(|r| RotorSpec {
+                        nodes: (0..n as u16).map(|i| r.nodes.contains(&i)).collect(),
+                        centre: Vec3::from(r.centre),
+                        axis: Vec3::from(r.axis),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -573,6 +604,28 @@ impl VehicleSpec {
             self.elevation = turret.pitch;
         }
         self
+    }
+
+    /// Whether it is a helicopter: it flies and has no wheels.
+    pub fn is_helicopter(&self) -> bool {
+        self.kind == HELICOPTER
+    }
+
+    /// Spins its rotors' nodes in `nodes` (as [`posed_nodes`] gives them)
+    /// `angle` radians about their hubs.
+    ///
+    /// [`posed_nodes`]: Self::posed_nodes
+    pub fn spin_rotors(&self, nodes: &mut [Mat4], angle: f32) {
+        for r in &self.rotors {
+            let turn = Mat4::from_translation(r.centre)
+                * Mat4::from_axis_angle(r.axis, angle)
+                * Mat4::from_translation(-r.centre);
+            for (m, &on) in nodes.iter_mut().zip(&r.nodes) {
+                if on {
+                    *m = turn * *m;
+                }
+            }
+        }
     }
 
     /// Whether it is a boat: it floats ([`Physics::set_water`]) and has
@@ -892,6 +945,7 @@ mod tests {
             elevation: (0.0, 0.0),
             hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             turret_box: None,
+            rotors: Vec::new(),
             tuning: VehicleTuning::default(),
         }
     }

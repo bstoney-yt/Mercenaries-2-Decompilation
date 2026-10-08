@@ -712,12 +712,19 @@ impl WorldIndex {
                             named: true,
                         })
                     }
-                    // A vehicle template that drives: the alpha places it.
+                    // A vehicle template that drives, floats or flies: the
+                    // alpha places it.
                     (
                         _,
                         Some(&TemplateInfo {
                             model,
-                            vehicle: Some(kind @ (VehicleKind::Car | VehicleKind::Tank)),
+                            vehicle:
+                                Some(
+                                    kind @ (VehicleKind::Car
+                                    | VehicleKind::Tank
+                                    | VehicleKind::Boat
+                                    | VehicleKind::Helicopter),
+                                ),
                             ..
                         }),
                     ) => self.templates.push(TemplatePlacement {
@@ -729,9 +736,8 @@ impl WorldIndex {
                         kind,
                         layer: layer_hash,
                     }),
-                    // A template with a model that doesn't drive yet (a
-                    // boat, a helicopter) or has no physics (a pickup, an
-                    // emplacement, a prop): placed as it stands.
+                    // A template with a model and no vehicle physics (a
+                    // pickup, an emplacement, a prop): placed as it stands.
                     (
                         _,
                         Some(&TemplateInfo {

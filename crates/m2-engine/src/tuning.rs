@@ -43,6 +43,42 @@ pub struct VehicleTuning {
     pub turret: Option<TurretTuning>,
     pub camera: Option<TankCamera>,
     pub gun: Option<GunTuning>,
+    /// A helicopter's handling (`_HelicopterPhysics`).
+    pub flight: Option<FlightTuning>,
+    /// How far behind a helicopter its pilot's camera sits, metres, and
+    /// how far it looks down, radians (`CameraHelicopter`'s field
+    /// `ee30a43d`, name unknown: 20 for the light helicopters, 39 for the
+    /// Mi-26; and `DefaultPitch`).
+    pub chase: Option<(f32, f32)>,
+}
+
+/// How a helicopter flies, from its `_HelicopterPhysics` (names found by
+/// hash, 2026-10-08; the AH-1Z's values in brackets).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlightTuning {
+    /// Fastest climb or descent, forwards, sideways, m/s
+    /// (`MaxElevationSpeed` 25, `MaxFwdSpeed` 30, `MaxRightSpeed` 30).
+    pub climb: f32,
+    pub forward: f32,
+    pub sideways: f32,
+    /// Fastest turn (`maxYawSpeed` 3.5) and, below `low_speed`
+    /// (`LowSpeedLimit` 25), its turn on the spot (`LowSpeedYawSpeed`
+    /// 6.5); units unknown.
+    pub yaw: f32,
+    pub low_speed: f32,
+    pub low_speed_yaw: f32,
+    /// How far the nose dips flying forwards, radians (`MaxPitch` 0.4),
+    /// and how quickly (`PitchAccel` 0.9).
+    pub pitch: f32,
+    pub pitch_accel: f32,
+    /// How far it rolls sliding sideways and banking into a turn,
+    /// radians (`MaxRollSide` 0.3, `MaxRollBank` 0.3), and how quickly
+    /// (`RollAccel` 1.0); it banks fully from `bank_speed` (`BankSpeedLimit`
+    /// 25 m/s).
+    pub roll_side: f32,
+    pub roll_bank: f32,
+    pub roll_accel: f32,
+    pub bank_speed: f32,
 }
 
 /// A `Turret`: how fast it turns and how far its gun tilts.
@@ -191,6 +227,8 @@ const CAMERA_HEIGHT: u32 = 0x2afa_6ae4;
 /// firing the main gun (the LAV III's gunner; its template also has a
 /// camera for the rear passenger's hatch, `seat_passenger_rr`).
 const CAMERA_SEATS: [&str; 2] = ["seat_driver", "seat_gunner"];
+/// `CameraHelicopter`'s distance behind (name unknown).
+const CHASE_DISTANCE: u32 = 0xee30_a43d;
 /// Unnamed fields (round 154): `Health`'s value, `ExplosionFudge`'s
 /// scale and `TickDamage`'s threshold.
 const HEALTH: u32 = 0xd122_919d;
@@ -300,6 +338,8 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
     let fudge = Table::new(db, "ExplosionFudge");
     let tick = Table::new(db, "TickDamage");
     let modifier = Table::new(db, "ModifierKey");
+    let heli = Table::new(db, "_HelicopterPhysics");
+    let heli_camera = Table::new(db, "CameraHelicopter");
     let guns = Guns {
         weapon: Table::new(db, "WeaponProjectileBase"),
         effects: Table::new(db, "WeaponEffects"),
@@ -313,6 +353,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
         .keys()
         .chain(car.records.keys())
         .chain(boat.records.keys())
+        .chain(heli.records.keys())
         .chain(turret.records.keys())
         .chain(camera.records.keys())
         .copied()
@@ -322,7 +363,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
     ids.into_iter()
         .map(|id| {
             let t = VehicleTuning {
-                mass: [&tank, &car, &boat]
+                mass: [&tank, &car, &boat, &heli]
                     .iter()
                     .find_map(|t| t.get(id, "Mass").filter(|m| *m > 0.0)),
                 max_speed: [&tank, &car, &boat]
@@ -393,6 +434,35 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     .filter_map(|r| links.word(r, LINK))
                     .filter_map(|weapon| guns.gun(weapon))
                     .min_by(|a, b| a.rate_of_fire.total_cmp(&b.rate_of_fire)),
+                flight: (|| {
+                    let f = |name| heli.get(id, name);
+                    Some(FlightTuning {
+                        climb: f("MaxElevationSpeed")?,
+                        forward: f("MaxFwdSpeed")?,
+                        sideways: f("MaxRightSpeed")?,
+                        yaw: f("maxYawSpeed")?,
+                        low_speed: f("LowSpeedLimit")?,
+                        low_speed_yaw: f("LowSpeedYawSpeed")?,
+                        pitch: f("MaxPitch")?,
+                        pitch_accel: f("PitchAccel")?,
+                        roll_side: f("MaxRollSide")?,
+                        roll_bank: f("MaxRollBank")?,
+                        roll_accel: f("RollAccel")?,
+                        bank_speed: f("BankSpeedLimit")?,
+                    })
+                })(),
+                chase: (|| {
+                    let records = heli_camera.of_template(id);
+                    let seat = name_hash("SeatName");
+                    let r = records
+                        .iter()
+                        .find(|r| heli_camera.word(r, seat) == Some(name_hash("seat_driver")))
+                        .or(records.first())?;
+                    Some((
+                        heli_camera.float(r, CHASE_DISTANCE)?,
+                        heli_camera.float(r, name_hash("DefaultPitch"))?,
+                    ))
+                })(),
             };
             (id, t)
         })
@@ -471,6 +541,20 @@ mod tests {
             ("BulletLarge", 0x7f01_0e06),
             ("Car", 0xce27_c791),
             (DAMAGE_TABLE, 0x99c2_b81f),
+            ("MaxElevationSpeed", 0x68cf_364b),
+            ("MaxFwdSpeed", 0x4fc8_d911),
+            ("MaxRightSpeed", 0xd86d_f802),
+            ("LowSpeedLimit", 0xd17f_d0ef),
+            ("LowSpeedYawSpeed", 0xe121_ab18),
+            ("PitchAccel", 0x05e9_f647),
+            ("MaxRollSide", 0x520d_bfb9),
+            ("MaxRollBank", 0xde44_cb52),
+            ("RollAccel", 0x8700_d608),
+            ("BankSpeedLimit", 0xb027_46f1),
+            // `Rotor`: its hub node, and which way it spins (1 or -1);
+            // its blade and blur nodes are `vehicle::MAIN_ROTOR`'s.
+            ("RotorHubBoneName", 0xc93e_7607),
+            ("SpinDir", 0xc9d2_9446),
         ] {
             assert_eq!(name_hash(name), key, "{name}");
         }
