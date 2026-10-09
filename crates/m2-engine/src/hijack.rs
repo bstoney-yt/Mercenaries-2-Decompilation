@@ -137,6 +137,26 @@ pub fn seat_links(db: &Layer<'_>) -> HashMap<u32, Vec<(u32, Option<u32>)>> {
     out
 }
 
+/// Every template's `SeatLink` records, by template id, each as every
+/// field's name hash and word: what decides whether whoever sits in a
+/// seat is seen (an enclosed seat, a tank's driver under his hatch) is not
+/// known, so the whole record is logged to find it by.
+pub fn seat_link_fields(db: &Layer<'_>) -> HashMap<u32, Vec<Vec<(u32, u32)>>> {
+    let links = Table::new(db, "SeatLink");
+    let fields = links.fields();
+    let mut out: HashMap<u32, Vec<Vec<(u32, u32)>>> = HashMap::new();
+    for t in links.templates() {
+        for r in links.of_template(t) {
+            let row = fields
+                .iter()
+                .filter_map(|&f| Some((f, links.word(r, f)?)))
+                .collect();
+            out.entry(t).or_default().push(row);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
