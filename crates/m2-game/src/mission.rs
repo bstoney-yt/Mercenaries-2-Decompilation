@@ -16,11 +16,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
-use m2_assets::layer::{Component, LAYER_TYPE, TEMPLATE_DB_TYPE};
+use m2_assets::layer::{Component, LAYER_TYPE, Placement, TEMPLATE_DB_TYPE};
 use m2_assets::lua::{Chunk, SCRIPT_TYPE};
+use m2_assets::path::PATH_TYPE;
 use m2_assets::region::REGION_TYPE;
 use m2_assets::strings::STRINGS_TYPE;
-use m2_assets::{BlockContents, Layer, Region, StringTable, WadArchive, WadError, name_hash};
+use m2_assets::{BlockContents, Layer, Path, Region, StringTable, WadArchive, WadError, name_hash};
+use m2_engine::population::{riders, seat_name};
+use m2_math::glam::{Quat, Vec3};
 use mlua::Function;
 
 use crate::api::{self, Command, Object, ScriptWorld, Shared};
@@ -235,6 +238,15 @@ pub struct Entity {
     /// The faction a faction zone belongs to (`FactionZone`'s faction
     /// template), as its guid: the name hash of the template's name.
     pub faction: Option<u32>,
+    /// A path entity's points (`Path`, [`m2_assets::path`]) in the world:
+    /// the route an `Ai.Goal` `PathMove` sends a driver along (PmcCon001's
+    /// `Path_PMC001_GarageSmash`). Empty for other entities.
+    pub path: Vec<[f32; 3]>,
+    /// Who rides in it as it comes into play: (seat, rider template), as
+    /// its own `Rider` records say, else its template's (PmcCon001's
+    /// villa tank, `Scorpion90 (Driver) (PMC001)`, has a `VZ Tank
+    /// Commander` in `seat_driver`). Empty for most.
+    pub crew: Vec<(String, String)>,
 }
 
 /// What a mission session needs from the archives.
@@ -280,6 +292,14 @@ fn labels_of(c: Option<&Component<'_>>) -> HashMap<u32, Vec<u32>> {
     out
 }
 
+/// `Rider` records: (seat name hash, person template id).
+type Riders = Vec<(u32, u32)>;
+
+/// The top bit of a template id: the template database's `UNIQ` ids have
+/// it, and entities' parents and riders name templates with or without
+/// it (as `m2_engine`'s crews read them).
+const TEMPLATE_BIT: u32 = 0x8000_0000;
+
 /// The string table the HUD's texts come from.
 pub const LANGUAGE: &str = "english";
 
@@ -304,6 +324,13 @@ impl GameData {
         // Faction zones' faction templates, and every template's name.
         let mut zone_factions: Vec<(String, usize, u32)> = Vec::new();
         let mut template_names: HashMap<u32, String> = HashMap::new();
+        // Path assets' points, and the path entities naming them.
+        let mut path_points: HashMap<u32, Vec<[f32; 3]>> = HashMap::new();
+        let mut routes: Vec<(String, usize, u32, Placement)> = Vec::new();
+        // `Rider` records (seat hash, person template id): the template
+        // database's by template id, and entities' own.
+        let mut template_riders: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+        let mut own_riders: Vec<(String, usize, Riders)> = Vec::new();
         let language = name_hash(LANGUAGE);
         for (block, path) in paths.iter().enumerate() {
             let decoded = wad.read_block(block)?;
@@ -314,6 +341,10 @@ impl GameData {
                 if entry.type_hash == SCRIPT_TYPE {
                     if let Ok(c) = Chunk::from_asset(asset) {
                         data.library.add(entry.name_hash, c);
+                    }
+                } else if entry.type_hash == PATH_TYPE {
+                    if let Ok(p) = Path::parse(asset) {
+                        path_points.insert(entry.name_hash, p.points);
                     }
                 } else if entry.type_hash == REGION_TYPE {
                     if let Ok(r) = Region::parse(asset) {
@@ -327,6 +358,7 @@ impl GameData {
                     && let Ok(db) = Layer::parse(asset)
                 {
                     template_labels = labels_of(db.component("Label"));
+                    template_riders = db.component("Rider").map(|c| riders(c)).unwrap_or_default();
                     (data.max_reserve, data.thrown) = crate::inventory::read(&db);
                     template_names = db
                         .names()
@@ -347,6 +379,11 @@ impl GameData {
                     let lines = layer.hashes("LineRegion");
                     let scripts = layer.hashes("ObjectScript");
                     let zones = layer.hashes("FactionZone");
+                    let path_of = layer.hashes("Path");
+                    let mut rides = layer
+                        .component("Rider")
+                        .map(|c| riders(c))
+                        .unwrap_or_default();
                     let placements = layer.placements();
                     let mut own = labels_of(layer.component("Label"));
                     for (guid, entity) in layer.names() {
@@ -369,14 +406,22 @@ impl GameData {
                             labels: own.remove(&guid).unwrap_or_default(),
                             script: scripts.get(&guid).copied(),
                             faction: None,
+                            path: Vec::new(),
+                            crew: Vec::new(),
                         });
+                        if let Some(r) = rides.remove(&guid) {
+                            own_riders.push((name.clone(), list.len() - 1, r));
+                        }
+                        if let (Some(&asset), Some(p)) = (path_of.get(&guid), p) {
+                            routes.push((name.clone(), list.len() - 1, asset, *p));
+                        }
                     }
                 }
             }
         }
-        for (layer, i, template) in templated {
-            if let Some(l) = template_labels.get(&template) {
-                let e = &mut data.layers.get_mut(&layer).expect("indexed above")[i];
+        for (layer, i, template) in &templated {
+            if let Some(l) = template_labels.get(template) {
+                let e = &mut data.layers.get_mut(layer).expect("indexed above")[*i];
                 e.labels.extend(l.iter().copied());
             }
         }
@@ -388,6 +433,38 @@ impl GameData {
         for (layer, i, hash) in regions {
             if let Some(r) = shapes.get(&hash) {
                 data.layers.get_mut(&layer).expect("indexed above")[i].region = Some(r.clone());
+            }
+        }
+        // Crews: an entity's own riders, else its template's; each rider
+        // named by its template. Template ids are looked up with and
+        // without their top bit, as the engine's crews are.
+        let named = |id: u32| {
+            template_names
+                .get(&id)
+                .or_else(|| template_names.get(&(id | TEMPLATE_BIT)))
+                .cloned()
+        };
+        let crew_of = |records: &[(u32, u32)]| -> Vec<(String, String)> {
+            records
+                .iter()
+                .filter_map(|&(seat, person)| Some((seat_name(seat), named(person)?)))
+                .collect()
+        };
+        for (layer, i, template) in &templated {
+            let records = template_riders
+                .get(template)
+                .or_else(|| template_riders.get(&(template & !TEMPLATE_BIT)));
+            if let Some(r) = records {
+                data.layers.get_mut(layer).expect("indexed above")[*i].crew = crew_of(r);
+            }
+        }
+        for (layer, i, records) in own_riders {
+            data.layers.get_mut(&layer).expect("indexed above")[i].crew = crew_of(&records);
+        }
+        for (layer, i, asset, placed) in routes {
+            if let Some(points) = path_points.get(&asset) {
+                data.layers.get_mut(&layer).expect("indexed above")[i].path =
+                    place_points(points, &placed);
             }
         }
         data.shapes = shapes.len();
@@ -422,6 +499,23 @@ pub fn landing_zone(name: &str) -> Option<(i64, usize)> {
         .strip_suffix('_')?;
     let n = rest.get(..2)?.parse().ok()?;
     rest[2..].starts_with('_').then_some((n, player))
+}
+
+/// A path's points, in the space of the entity that names it, placed in
+/// the world by that entity's `Transform` (as [`m2_assets::path`] says;
+/// a rotation that isn't one counts as none).
+fn place_points(points: &[[f32; 3]], placed: &Placement) -> Vec<[f32; 3]> {
+    let q = Quat::from_array(placed.rotation);
+    let q = if q.is_finite() && q.length() > 0.5 {
+        q.normalize()
+    } else {
+        Quat::IDENTITY
+    };
+    let at = Vec3::from(placed.position);
+    points
+        .iter()
+        .map(|&p| (at + q * Vec3::from(p)).to_array())
+        .collect()
 }
 
 /// The turn about the vertical axis of an (x, y, z, w) rotation.
@@ -977,6 +1071,16 @@ impl Mission {
             o.vehicle = vehicle;
             o.seated_instantly = false;
         }
+    }
+
+    /// The points of path entity `guid` in the world ([`Entity::path`]),
+    /// of whichever layer names it; empty if none does.
+    pub fn path(&self, guid: u32) -> &[[f32; 3]] {
+        self.layers
+            .values()
+            .flatten()
+            .find(|e| e.guid == guid && !e.path.is_empty())
+            .map_or(&[], |e| e.path.as_slice())
     }
 
     /// Reports where an object is in play (a vehicle that was driven or
@@ -1619,11 +1723,44 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
             if let Some(r) = &e.region {
                 w.regions.insert(e.guid, r.clone());
             }
+            seat_crew(&mut w, e.guid, e.at, &e.crew);
         } else {
             w.objects.remove(&e.guid);
             w.regions.remove(&e.guid);
+            // Its crew goes with it.
+            w.objects
+                .retain(|&g, o| g < api::FIRST_SPAWNED || o.vehicle != Some(e.guid));
         }
     }
+}
+
+/// Seats a vehicle's crew ([`Entity::crew`]) as it comes into play, as
+/// the engine does: an object per rider, named by its template and
+/// labelled as it, in `vehicle` from the start, the driver's seat
+/// (`seat_driver`) first so `Vehicle.GetDriver` answers it (PmcCon001's
+/// `GarageSmash` orders the villa tank's driver along its path the moment
+/// the tank's layer is in). Returns the riders' guids.
+fn seat_crew(
+    w: &mut ScriptWorld,
+    vehicle: u32,
+    at: [f32; 3],
+    crew: &[(String, String)],
+) -> Vec<u32> {
+    let mut seats: Vec<&(String, String)> = crew.iter().collect();
+    seats.sort_by_key(|(seat, _)| !seat.eq_ignore_ascii_case("seat_driver"));
+    let mut out = Vec::new();
+    for (_, template) in seats {
+        let guid = w.spawn_guid();
+        let mut o = Object::new(template, at);
+        o.vehicle = Some(vehicle);
+        o.seated_instantly = true;
+        if let Some(l) = w.template_labels.get(&template.to_ascii_lowercase()) {
+            o.label_hashes.clone_from(l);
+        }
+        w.insert(guid, o);
+        out.push(guid);
+    }
+    out
 }
 
 /// The object scripts the engine runs on layer entities that the port runs
@@ -2039,6 +2176,125 @@ mod tests {
                 assert!(there(&m));
             }
         }
+    }
+
+    #[test]
+    fn path_points_are_placed_by_their_entity() {
+        // A quarter turn about up (x goes to -z) and a move.
+        let half = std::f32::consts::FRAC_PI_4;
+        let placed = Placement {
+            position: [10.0, 1.0, 20.0],
+            rotation: [0.0, half.sin(), 0.0, half.cos()],
+            ..placement()
+        };
+        let out = place_points(&[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], &placed);
+        assert_eq!(out[0], [10.0, 1.0, 20.0]);
+        let [x, y, z] = out[1];
+        assert!((x - 10.0).abs() < 1e-5 && (y - 1.0).abs() < 1e-5 && (z - 18.0).abs() < 1e-5);
+        // A rotation that isn't one counts as none.
+        let bad = Placement {
+            rotation: [0.0; 4],
+            ..placed
+        };
+        assert_eq!(place_points(&[[2.0, 0.0, 0.0]], &bad), [[12.0, 1.0, 20.0]]);
+    }
+
+    fn placement() -> Placement {
+        Placement {
+            position: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            parent: 0,
+            flags: 0,
+        }
+    }
+
+    fn villa_tank() -> Entity {
+        Entity {
+            guid: 0xfaa53,
+            name: "PMC001_EntourageScorpion".into(),
+            at: [5.0, 0.0, 5.0],
+            yaw: 0.0,
+            region: None,
+            labels: Vec::new(),
+            script: None,
+            faction: None,
+            path: Vec::new(),
+            crew: vec![
+                ("seat_gunner".into(), "VZ Soldier".into()),
+                ("seat_driver".into(), "VZ Tank Commander".into()),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_crewed_vehicle_comes_in_with_its_driver_and_goes_with_it() {
+        let world: Shared = Rc::new(RefCell::new(ScriptWorld::default()));
+        let tank = villa_tank();
+        place(&world, std::slice::from_ref(&tank), true);
+        {
+            let w = world.borrow();
+            let mut riders: Vec<(u32, &str)> = w
+                .objects
+                .iter()
+                .filter(|(_, o)| o.vehicle == Some(tank.guid))
+                .map(|(&g, o)| (g, o.name.as_str()))
+                .collect();
+            riders.sort_unstable();
+            // The driver first, as `Vehicle.GetDriver` takes the first.
+            assert_eq!(riders.len(), 2);
+            assert_eq!(riders[0].1, "VZ Tank Commander");
+            assert_eq!(riders[1].1, "VZ Soldier");
+            assert!(w.objects[&riders[0].0].seated_instantly);
+            assert_eq!(w.objects[&riders[0].0].position, [5.0, 0.0, 5.0]);
+        }
+        place(&world, std::slice::from_ref(&tank), false);
+        assert!(world.borrow().objects.values().all(|o| o.vehicle.is_none()));
+    }
+
+    #[test]
+    fn the_villa_tanks_driver_is_sent_along_its_path() {
+        let path = Entity {
+            guid: 0x11a600,
+            name: "Path_PMC001_GarageSmash".into(),
+            crew: Vec::new(),
+            path: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 30.0]],
+            ..villa_tank()
+        };
+        let mut data = GameData::default();
+        data.layers.insert(
+            "vz_state_pmccon001_actionhijacktutorial".into(),
+            vec![villa_tank(), path],
+        );
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        assert_eq!(m.path(0x11a600), [[0.0, 0.0, 0.0], [0.0, 0.0, 30.0]]);
+        assert!(m.path(0xfaa53).is_empty());
+        let layer = m
+            .layer("vz_state_pmccon001_actionhijacktutorial")
+            .unwrap()
+            .to_vec();
+        place(m.world(), &layer, true);
+        m.run(
+            r#"Ai.Goal({ AIGuid = Vehicle.GetDriver(Pg.GetGuidByName("PMC001_EntourageScorpion")),
+                Goal = "PathMove", Target = Pg.GetGuidByName("Path_PMC001_GarageSmash"),
+                Priority = "HiPri", Haste = 1 })"#,
+            "garage smash",
+        )
+        .unwrap();
+        let goal = m.take_commands().into_iter().find_map(|c| match c {
+            Command::Goal {
+                guid,
+                goal,
+                target,
+                haste,
+                ..
+            } => Some((guid, goal, target, haste)),
+            _ => None,
+        });
+        let (driver, goal, target, haste) = goal.expect("a goal for the tank's driver");
+        assert_eq!(goal, "PathMove");
+        assert_eq!(target, Some(0x11a600));
+        assert_eq!(haste, Some(1.0));
+        assert_eq!(m.world().borrow().objects[&driver].vehicle, Some(0xfaa53));
     }
 
     #[test]

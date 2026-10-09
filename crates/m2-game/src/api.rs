@@ -175,6 +175,8 @@ pub enum Command {
         goal: String,
         location: Option<[f32; 3]>,
         target: Option<u32>,
+        /// Its `Haste`, if given (PmcCon001's garage smash gives 1).
+        haste: Option<f32>,
     },
     ExitVehicle(u32),
     /// Open a gate or door (`Object.OpenGate`): PmcCon001's villa doors
@@ -1757,6 +1759,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         };
         let target = id(t.raw_get::<Value>("Target").ok().as_ref());
+        let haste = num(t.raw_get::<Value>("Haste").ok().as_ref());
         if let Value::Function(f) = t.raw_get::<Value>("Callback")? {
             let data = t.raw_get::<Option<Table>>("CallbackData")?;
             w.goal_callbacks.push((guid, f, data));
@@ -1766,6 +1769,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             goal,
             location,
             target,
+            haste,
         });
         values([])
     })?;
@@ -1785,6 +1789,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             goal: "Deliver".into(),
             location,
             target: None,
+            haste: None,
         });
         values([])
     })?;
@@ -2730,7 +2735,8 @@ mod tests {
                 guid: g,
                 goal: "MoveTo".into(),
                 location: Some([4.0, 5.0, 6.0]),
-                target: None
+                target: None,
+                haste: None
             }
         );
         assert!(goal_finished(&world, g).is_empty());
