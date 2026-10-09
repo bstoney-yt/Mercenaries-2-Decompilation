@@ -451,7 +451,15 @@ impl Game {
             self.toggle_fly();
         }
         if self.on_foot {
-            let intent = Intent::from_input(input, config, mouse_look);
+            let mut intent = Intent::from_input(input, config, mouse_look);
+            // The pad's switch: the other of the rifle and what she
+            // carries in the launcher's place.
+            if input.take_pressed(Action::SwitchWeapon) && intent.trigger.select.is_none() {
+                intent.trigger.select = Some(match self.combat.weapon {
+                    Weapon::Rifle => Weapon::Rpg,
+                    _ => Weapon::Rifle,
+                });
+            }
             self.step(intent, dt);
         } else {
             self.camera.update(input, config, mouse_look, dt);
@@ -930,7 +938,9 @@ impl Game {
         let call = match her {
             Some(_) => Call {
                 menu: intent.trigger.support,
-                use_pressed: intent.use_pressed,
+                // At the menu or the view, the jump (the pad's A, which
+                // the texts' `[confirm]` shows) confirms as well.
+                use_pressed: intent.use_pressed || (intent.jump && self.support.busy()),
                 fire: intent.trigger.fire,
                 steer: intent.movement,
                 look: intent.look,

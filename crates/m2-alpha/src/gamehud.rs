@@ -500,6 +500,10 @@ pub struct HudState {
     /// [`crate::input::token_keys`]), for those the fonts have no picture
     /// for ([`gui_runtime::Screen::set_key_names`]).
     pub key_names: Vec<(String, String)>,
+    /// An Xbox pad plays ([`crate::pad`]): the texts' control words show
+    /// its pictures and the hijack's buttons its Xbox ones
+    /// ([`gui_runtime::Screen::set_pad`]).
+    pub pad: bool,
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -2045,6 +2049,10 @@ impl Thread {
         // The objective markers' icons, for the world's markers
         // ([`GameHud::paint_texture`]) whether or not the minimap is up.
         want.extend(state.blips.iter().map(|(_, icon, _)| name_hash(icon)));
+        // The pad's Y, for the use prompts with a pad (`crate::ui`).
+        if state.pad {
+            want.push(name_hash(crate::pad::Button::Y.texture()));
+        }
         let mut images = Vec::new();
         for hash in want {
             if self.tried.insert(hash) {
@@ -2604,7 +2612,9 @@ impl Thread {
             s.heading
         };
         if let Some(screen) = gui_runtime::screen(lua) {
-            screen.borrow_mut().set_camera_heading(heading);
+            let mut screen = screen.borrow_mut();
+            screen.set_camera_heading(heading);
+            screen.set_pad(s.pad);
         }
         // The keys the texts' control words name, as the bindings are (and
         // again should they change): before any text this frame is set.

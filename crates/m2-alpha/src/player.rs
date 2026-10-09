@@ -150,17 +150,13 @@ pub struct Intent {
 
 impl Intent {
     pub fn from_input(input: &mut Input, config: &CameraConfig, mouse_look: bool) -> Self {
-        let (dx, dy) = input.take_mouse();
-        let look = if mouse_look {
-            let invert = if config.invert_y { -1.0 } else { 1.0 };
-            // Turning right turns the yaw (from +z towards +x) back.
-            Vec2::new(
-                -dx as f32 * config.mouse_sensitivity,
-                -dy as f32 * config.mouse_sensitivity * invert,
-            )
-        } else {
-            Vec2::ZERO
-        };
+        let (dx, dy) = input.take_look(mouse_look);
+        let invert = if config.invert_y { -1.0 } else { 1.0 };
+        // Turning right turns the yaw (from +z towards +x) back.
+        let look = Vec2::new(
+            -dx as f32 * config.mouse_sensitivity,
+            -dy as f32 * config.mouse_sensitivity * invert,
+        );
         Self {
             movement: Vec2::new(
                 input.axis(Action::MoveLeft, Action::MoveRight),
