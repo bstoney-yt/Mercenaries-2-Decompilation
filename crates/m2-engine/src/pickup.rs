@@ -30,11 +30,14 @@ const LABEL: u32 = 0xfd08_4cce;
 /// A pickup's `Type`: health (its amount health points), ammunition, or
 /// a weapon taken up.
 pub const HEALTH: u32 = 0;
+pub const AMMUNITION: u32 = 1;
+pub const EQUIPMENT: u32 = 2;
 
 /// A pickup's template: what walking up to it gives.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PickupInfo {
-    /// Its first `Pickup`'s `Type` ([`HEALTH`], 1 ammunition, 2 a weapon).
+    /// Its first `Pickup`'s `Type` ([`HEALTH`], [`AMMUNITION`], [`EQUIPMENT`]: a
+    /// weapon).
     pub kind: u32,
     /// How near she must come to take it, metres (`radius`).
     pub radius: f32,
@@ -45,6 +48,12 @@ pub struct PickupInfo {
     /// `Pickup` per kind (`Ammo Pickup (Rocket)`: the RPG's rockets, the
     /// grenade launcher's rounds, missiles), the first of them as above.
     pub gives: Vec<(u32, u32)>,
+    /// Those of [`gives`](Self::gives) whose own `Type` is
+    /// [`AMMUNITION`]: what is taken walking over it, even where it is a
+    /// weapon lying there (the `Assault Rifle`, 8000436f, a soldier's gun:
+    /// a `Type` 2 equipment record of radius 1.5, and a `Type` 1 record of
+    /// 8 `Assault Rifle Bullet`; PC data, 2026-10-09).
+    pub walked: Vec<(u32, u32)>,
     /// Name hashes of its sound or message on being taken and of its
     /// effect.
     pub cue: Option<u32>,
@@ -71,6 +80,7 @@ pub fn read(db: &Layer<'_>) -> Leavings {
     let weapon = Table::new(db, "WeaponProjectileBase");
     let label = Table::new(db, "Label");
     let nonzero = |v: Option<u32>| v.filter(|&v| v != 0);
+    let kind = name_hash("Type");
     Leavings {
         spawns: spawn
             .templates()
@@ -91,12 +101,20 @@ pub fn read(db: &Layer<'_>) -> Leavings {
                 Some((
                     id,
                     PickupInfo {
-                        kind: pickup.word(r, name_hash("Type")).unwrap_or(1),
+                        kind: pickup.word(r, kind).unwrap_or(AMMUNITION),
                         radius: pickup.float(r, name_hash("radius"))?,
                         ammo: nonzero(pickup.word(r, AMMO)),
                         rounds: pickup.word(r, ROUNDS).unwrap_or(0),
                         gives: records
                             .iter()
+                            .filter_map(|r| {
+                                let ammo = nonzero(pickup.word(r, AMMO))?;
+                                Some((ammo, pickup.word(r, ROUNDS).unwrap_or(0)))
+                            })
+                            .collect(),
+                        walked: records
+                            .iter()
+                            .filter(|r| pickup.word(r, kind).unwrap_or(AMMUNITION) == AMMUNITION)
                             .filter_map(|r| {
                                 let ammo = nonzero(pickup.word(r, AMMO))?;
                                 Some((ammo, pickup.word(r, ROUNDS).unwrap_or(0)))

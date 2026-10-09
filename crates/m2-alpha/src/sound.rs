@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use std::time::{Duration, Instant};
 
-use m2_engine::audio::{EngineSounds, Falloff, Play, SoundLibrary};
+use m2_engine::audio::{EngineSounds, Falloff, KeySounds, Play, SoundLibrary};
 use m2_engine::{Category, Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
 use crate::combat::{Remark, Sound};
@@ -194,7 +194,28 @@ pub struct GameAudio {
     /// The interface's sounds (`ui_hud`), once read (on a thread).
     ui: Option<UiSounds>,
     ui_loading: Option<Receiver<UiSounds>>,
+    /// What each template `SoundKey` asked for plays, once read (`None`:
+    /// nothing found for it); keys are read on a thread the first time one
+    /// is heard ([`KeySounds::resolve`]).
+    keys: HashMap<u32, Option<Arc<KeySounds>>>,
+    key_loads: (Sender<KeyLoad>, Receiver<KeyLoad>),
+    /// Keys whose reading has started.
+    key_asked: HashSet<u32>,
+    /// The world's cue tables, read once by the first key's thread for
+    /// every later one.
+    key_tables: Arc<Mutex<Option<Arc<Vec<m2_assets::CueTable>>>>>,
+    /// Breaks heard before their key's sounds were read: the key, where,
+    /// and when (played once read, if still fresh).
+    key_waiting: Vec<(u32, Vec3, Instant)>,
 }
+
+/// A sound key read: the key, and what it plays.
+type KeyLoad = (u32, Option<KeySounds>);
+
+/// How long a break waits for its key's sounds to be read before it is
+/// let go unheard (a key read late shouldn't sound seconds after the
+/// fence went down).
+const KEY_FRESH: Duration = Duration::from_millis(750);
 
 /// The interface's sound bank, `ui_hud`: its cue table (cue name hash to
 /// record, record to the bank's sound) and its sounds; and the music's cue
@@ -891,6 +912,11 @@ impl GameAudio {
                 });
                 rx
             }),
+            keys: HashMap::new(),
+            key_loads: channel(),
+            key_asked: HashSet::new(),
+            key_tables: Arc::default(),
+            key_waiting: Vec::new(),
         }
     }
 
@@ -1249,6 +1275,7 @@ impl GameAudio {
 
     /// Plays the fight's sounds where they happened.
     pub fn play_fight(&mut self, sounds: &[Sound]) {
+        self.keys_loaded();
         for sound in sounds {
             let (i, at, gain) = match *sound {
                 Sound::Shot(at) => (0, at, 0.9),
@@ -1258,9 +1285,92 @@ impl GameAudio {
                 Sound::Cannon(at) => (3, at, 1.3),
                 Sound::Lob(at) => (4, at, 1.0),
                 Sound::Collapse(at) => (5, at, 2.0),
+                Sound::Break { at, key } => {
+                    self.play_key(key, at);
+                    continue;
+                }
             };
             if let Some(buffer) = self.fight[i].clone() {
                 self.out.with(|m| m.play(Play::at(buffer, at).gain(gain)));
+            }
+        }
+    }
+
+    /// Plays what sound key `key` plays at `at`, as its cue's volume has
+    /// it; a key not yet read is read on a thread, and played once read
+    /// if still fresh ([`KEY_FRESH`]). A key that nothing answers stays
+    /// silent: no other sound stands in for it.
+    fn play_key(&mut self, key: u32, at: Vec3) {
+        match self.keys.get(&key) {
+            Some(Some(found)) => {
+                let found = found.clone();
+                let pick = self.random();
+                if let Some(buffer) = found.pick(pick).cloned() {
+                    eprintln!(
+                        "sound: break, key {key:08x}, sound {:08x} ({:.2} s) at {at:.1}",
+                        buffer.hash,
+                        buffer.seconds()
+                    );
+                    self.out
+                        .with(|m| m.play(Play::at(buffer, at).gain(found.volume)));
+                }
+            }
+            Some(None) => eprintln!("sound: break, key {key:08x}: nothing found for it, silent"),
+            None => {
+                let Some(install) = self.install.clone() else {
+                    self.keys.insert(key, None);
+                    return;
+                };
+                self.key_waiting.push((key, at, Instant::now()));
+                // Read once, whatever is heard meanwhile.
+                if !self.key_asked.insert(key) {
+                    return;
+                }
+                let tx = self.key_loads.0.clone();
+                let tables = self.key_tables.clone();
+                std::thread::spawn(move || {
+                    let found = install.open_world().ok().and_then(|mut source| {
+                        let tables = {
+                            let mut held = tables.lock().unwrap_or_else(|e| e.into_inner());
+                            held.get_or_insert_with(|| {
+                                let t = m2_engine::audio::world_cue_tables(&mut source);
+                                eprintln!("sound: {} cue tables in the world archive", t.len());
+                                Arc::new(t)
+                            })
+                            .clone()
+                        };
+                        KeySounds::resolve(&mut source, &tables, key)
+                    });
+                    match &found {
+                        Some(k) => eprintln!("sound: key {key:08x} plays {}", k.how),
+                        None => eprintln!(
+                            "sound: key {key:08x} is no cue of the world's cue tables, no bank \
+                             and no block: not played (survey find:{key:08x} on the PC names it)"
+                        ),
+                    }
+                    drop(tx.send((key, found)));
+                });
+            }
+        }
+    }
+
+    /// Takes in the sound keys read, and plays the breaks that waited for
+    /// them while still fresh.
+    fn keys_loaded(&mut self) {
+        while let Ok((key, found)) = self.key_loads.1.try_recv() {
+            self.keys.insert(key, found.map(Arc::new));
+        }
+        let now = Instant::now();
+        let waiting = std::mem::take(&mut self.key_waiting);
+        for (key, at, when) in waiting {
+            if !self.keys.contains_key(&key) {
+                if now.duration_since(when) < KEY_FRESH {
+                    self.key_waiting.push((key, at, when));
+                }
+                continue;
+            }
+            if now.duration_since(when) < KEY_FRESH {
+                self.play_key(key, at);
             }
         }
     }
