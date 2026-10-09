@@ -549,6 +549,10 @@ pub fn install(host: &ScriptHost, world: &Shared) -> mlua::Result<()> {
     add(&object, "SetVisible", |w, _, a| {
         if let Some(guid) = id(a.first()) {
             let on = on(a.get(1));
+            // Hidden, it is off screen for `Event.ObjectIsVisible`.
+            if let Some(o) = w.objects.get_mut(&guid) {
+                o.hidden = !on;
+            }
             w.commands
                 .push(Command::Hijack(HijackCommand::Visible { guid, on }));
         }

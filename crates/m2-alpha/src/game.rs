@@ -132,6 +132,10 @@ pub struct Game {
     dropped: u32,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
+    /// The field of view (degrees, bottom to top) and the screen's width
+    /// over its height the last frame was drawn with: what the scripts'
+    /// camera sees (`Event.ObjectIsVisible`).
+    pub lens: (f32, f32),
 }
 
 /// A soldier's pickup is told from the others by its "crate": this, plus
@@ -216,6 +220,7 @@ impl Game {
             dropped: 0,
             input_locked: false,
             support_hp: 0.0,
+            lens: (60.0, 16.0 / 9.0),
         }
     }
 

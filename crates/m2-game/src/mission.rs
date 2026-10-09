@@ -744,6 +744,7 @@ impl Mission {
                 }
             }
         }
+        self.world.borrow_mut().update_hibernation();
         for t in self.events.take_trace() {
             self.log.push(format!("  t={:.1} event {t}", self.now));
         }
@@ -752,6 +753,11 @@ impl Mission {
                 "  t={now:.1} {} callback: {}",
                 e.kind,
                 first_lines(&e.error.to_string())
+            ));
+        }
+        for kind in self.events.take_unhandled() {
+            self.log.push(format!(
+                "  t={now:.1} events: unhandled kind {kind} (its events never fire)"
             ));
         }
         self.check_boundary(now);
@@ -1415,6 +1421,27 @@ end
     /// The names the scripts' pending `ScriptEvent` events wait for.
     pub fn awaited_posts(&self) -> Vec<String> {
         self.events.awaited()
+    }
+
+    /// Where the player's camera looks from and how wide it sees, as the
+    /// game draws it this tick: what `Event.ObjectIsVisible` checks
+    /// against.
+    pub fn set_camera(&mut self, camera: api::Camera) {
+        self.world.borrow_mut().camera = Some(camera);
+    }
+
+    /// The objects pending `ObjectIsVisible` events wait to see, for the
+    /// game to look whether anything solid stands between each and the
+    /// camera ([`set_unseen`](Self::set_unseen)).
+    pub fn sight_watched(&self) -> Vec<u32> {
+        self.events.sight_watched(&*self.world.borrow())
+    }
+
+    /// The objects the game found behind something solid from the camera
+    /// (of those [`sight_watched`](Self::sight_watched) named): not on
+    /// screen, though in view.
+    pub fn set_unseen(&mut self, unseen: std::collections::HashSet<u32>) {
+        self.world.borrow_mut().unseen = unseen;
     }
 
     /// Posts a script event as the engine does (`Event.Post(name)`): the

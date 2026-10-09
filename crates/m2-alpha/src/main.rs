@@ -782,6 +782,7 @@ fn render(
     aspect: f32,
     hud: Option<&mut ui::Hud>,
 ) -> anyhow::Result<()> {
+    game.lens = (fov, aspect);
     let mut view = game.view(fov, aspect);
     if game.scene.world.is_some() {
         view.lighting.fog_density = 0.00025;
