@@ -54,6 +54,11 @@ pub struct PickupInfo {
     /// a `Type` 2 equipment record of radius 1.5, and a `Type` 1 record of
     /// 8 `Assault Rifle Bullet`; PC data, 2026-10-09).
     pub walked: Vec<(u32, u32)>,
+    /// The health its [`HEALTH`] records give, together: the `Health
+    /// Pickup`'s one record of 50, and the 3 of the `Ammo Pickup (Small)`'s
+    /// record of that `Type` among its 19 ammunition records (8000a286; PC
+    /// data, 2026-10-09).
+    pub heals: u32,
     /// Name hashes of its sound or message on being taken and of its
     /// effect.
     pub cue: Option<u32>,
@@ -120,6 +125,11 @@ pub fn read(db: &Layer<'_>) -> Leavings {
                                 Some((ammo, pickup.word(r, ROUNDS).unwrap_or(0)))
                             })
                             .collect(),
+                        heals: records
+                            .iter()
+                            .filter(|r| pickup.word(r, kind) == Some(HEALTH))
+                            .map(|r| pickup.word(r, ROUNDS).unwrap_or(0))
+                            .sum(),
                         cue: nonzero(pickup.word(r, CUE)),
                         effect: nonzero(pickup.word(r, EFFECT)),
                     },
