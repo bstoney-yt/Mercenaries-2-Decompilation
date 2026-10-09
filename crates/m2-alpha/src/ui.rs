@@ -67,6 +67,8 @@ pub struct HudInfo {
     /// Her support: the item ready, the designator, the satellite's view,
     /// the timing wheel, the bomb's flash.
     pub support: SupportHud,
+    /// The hero she is (the pause menu marks them).
+    pub hero: crate::hero::Hero,
 }
 
 /// What the pause menu asked for.
@@ -269,7 +271,7 @@ impl Hud {
         let output = self.ctx.run_ui(input, |ui| {
             hud(ui, info, game);
             if menu {
-                action = pause_menu(ui.ctx(), config);
+                action = pause_menu(ui.ctx(), config, info.hero);
             }
         });
         let ppp = output.pixels_per_point;
@@ -1250,7 +1252,13 @@ fn project(view_proj: Mat4, world: Vec3, screen: egui::Rect) -> Option<egui::Pos
     ))
 }
 
-fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
+/// The pause menu, with `playing` (the hero she is) marked under "Play
+/// as".
+fn pause_menu(
+    ctx: &egui::Context,
+    config: &mut Config,
+    playing: crate::hero::Hero,
+) -> Option<MenuAction> {
     let mut action = None;
     // Dim the game behind the menu.
     ctx.layer_painter(egui::LayerId::new(
@@ -1280,10 +1288,8 @@ fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
             ui.horizontal(|ui| {
                 ui.label("Play as");
                 for hero in crate::hero::Hero::ALL {
-                    if ui
-                        .selectable_label(config.hero == hero, hero.name())
-                        .clicked()
-                        && config.hero != hero
+                    if ui.selectable_label(playing == hero, hero.name()).clicked()
+                        && playing != hero
                     {
                         config.hero = hero;
                         action = Some(MenuAction::Hero(hero));

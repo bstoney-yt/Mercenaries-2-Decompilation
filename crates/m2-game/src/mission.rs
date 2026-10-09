@@ -1111,6 +1111,40 @@ impl Mission {
         }
     }
 
+    /// Makes the player `hero` from now on (named as [`Mission::new`]
+    /// takes it), whose template is `template` (`mattias`, `Jen`, `Chris`),
+    /// whole at `max` health (as the game makes her, hurt or not): the
+    /// scripts find her by the new name, tell her apart by the new
+    /// hero's label, and see her template's labels as the data gives them
+    /// (none if it has none for `template`). What they already chose by
+    /// the old hero (lines cued, a contract's movies) stays as it was.
+    /// Returns how many template labels she has.
+    pub fn set_hero(&mut self, hero: &str, template: &str, max: f32) -> usize {
+        let labels = {
+            let mut w = self.world.borrow_mut();
+            let labels = w
+                .template_labels
+                .get(&template.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_default();
+            let n = labels.len();
+            if let Some(p) = w.objects.get_mut(&PLAYER) {
+                let old = std::mem::replace(&mut p.name, hero.to_owned());
+                p.labels.retain(|l| !l.eq_ignore_ascii_case(&old));
+                p.labels.push(hero.to_ascii_lowercase());
+                p.label_hashes = labels;
+                p.max_health = max;
+                p.health = max;
+            }
+            n
+        };
+        self.log.push(format!(
+            "  t={:.1} the player is {hero} (template {template}, {labels} labels), {max} health",
+            self.now
+        ));
+        labels
+    }
+
     /// Reports that an object died in play (a soldier the player shot).
     /// The game's reading of an object's health (the player's, as she is
     /// hurt and healed).
@@ -1653,6 +1687,12 @@ mod tests {
             m.take_commands(),
             [say(1, "A"), say(2, "C"), Command::Hush(2)]
         );
+        // The call as the scripts made it, for the log.
+        assert!(
+            m.take_log()
+                .iter()
+                .any(|l| l == r#"  print VO.Cancel(0, "C"): speaker None, stops lines [2]"#)
+        );
         m.tick(0.1);
         m.line_length(1, 1.0);
         m.tick(0.5);
@@ -1717,6 +1757,51 @@ mod tests {
         m.tick(0.1);
         let dropped: i64 = m.lua().globals().raw_get("dropped").unwrap();
         assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn the_player_becomes_another_hero() {
+        let data = GameData {
+            template_labels: HashMap::from([("jen".to_owned(), vec![name_hash("HeroLabel")])]),
+            ..GameData::default()
+        };
+        let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
+        m.set_max_health(PLAYER, 120.0);
+        // Hurt: the new hero is whole all the same.
+        m.set_health(PLAYER, 60.0);
+        m.run(
+            r#"
+            local me = Player.GetCharacter(1)
+            assert(Object.GetName(me) == "Mattias")
+            assert(Object.HasLabel(me, "mattias"))
+            Object.AddLabel(me, "Scripted")
+            "#,
+            "before",
+        )
+        .unwrap();
+        assert_eq!(m.set_hero("Jennifer", "Jen", 100.0), 1);
+        m.run(
+            r#"
+            local me = Player.GetCharacter(1)
+            assert(Object.GetName(me) == "Jennifer")
+            assert(Pg.GetGuidByName("Jennifer") == me)
+            assert(Object.HasLabel(me, "jennifer"))
+            assert(not Object.HasLabel(me, "mattias"))
+            assert(Object.HasLabel(me, "HeroLabel"))
+            assert(Object.HasLabel(me, "Scripted"))
+            assert(Object.GetMaxHealth(me) == 100)
+            assert(Object.GetHealth(me) == 100)
+            "#,
+            "after",
+        )
+        .unwrap();
+        // A template the data has no labels for leaves her none of it.
+        assert_eq!(m.set_hero("Chris", "Chris", 100.0), 0);
+        let w = m.world().borrow();
+        let p = &w.objects[&PLAYER];
+        assert_eq!(p.name, "Chris");
+        assert!(p.label_hashes.is_empty());
+        assert_eq!(p.labels, ["Scripted", "chris"]);
     }
 
     #[test]

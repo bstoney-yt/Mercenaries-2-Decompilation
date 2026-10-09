@@ -138,6 +138,25 @@ pub struct Game {
 /// how many were left before it.
 const DROPPED: u32 = 0x7000_0000;
 
+/// Gives her what her template hands her to throw (`explosives`, from
+/// [`Scene::hero_explosives`]: free roam; the contract's scripts give her
+/// their own), as many of each as it says, and of what it doesn't name as
+/// many as a new game starts with.
+fn own_explosives(combat: &mut Combat, explosives: Vec<(String, u32)>) {
+    let fresh = Combat::default();
+    combat.grenades = fresh.grenades;
+    combat.charges = fresh.charges;
+    combat.mines = fresh.mines;
+    for (name, n) in explosives {
+        match name.to_ascii_lowercase().as_str() {
+            "grenade" => combat.grenades = n,
+            "c4" => combat.charges = n,
+            "proximity mine" => combat.mines = n,
+            _ => {}
+        }
+    }
+}
+
 impl Game {
     pub fn new(scene: Scene, camera: FlyCamera) -> Self {
         let on_foot = scene.player.is_some();
@@ -153,16 +172,7 @@ impl Game {
         if let Some(arms) = scene.arms() {
             combat.arm(arms, scene.damage_table());
         }
-        // What their template hands them to throw (free roam; the
-        // contract's scripts give her their own).
-        for (name, n) in scene.hero_explosives() {
-            match name.to_ascii_lowercase().as_str() {
-                "grenade" => combat.grenades = n,
-                "c4" => combat.charges = n,
-                "proximity mine" => combat.mines = n,
-                _ => {}
-            }
-        }
+        own_explosives(&mut combat, scene.hero_explosives());
         eprintln!(
             "hero: carries {} grenades, {} C4, {} mines; launcher {} ({:?})",
             combat.grenades,
@@ -248,7 +258,7 @@ impl Game {
     }
 
     /// Plays as `hero` from now on: their body, clips and health (whole),
-    /// and in free roam their own rifle.
+    /// and in free roam their own rifle and what they carry to throw.
     pub fn set_hero(
         &mut self,
         backend: &mut dyn m2_render::RenderBackend,
@@ -259,11 +269,20 @@ impl Game {
             self.combat.max_hp = hp;
             self.combat.hp = hp;
         }
-        // Their own rifle, unless the scripts handed her one.
+        // Their own rifle and explosives, as a game started as them has
+        // ([`Game::new`]): the rifle unless she has taken up another, the
+        // explosives unless the contract's scripts handed her theirs.
         if self.combat.own_rifle
             && let Some(rifle) = self.scene.hero_rifle()
         {
             self.combat.take_own_rifle(rifle);
+        }
+        if !self.combat.scripted_loadout {
+            own_explosives(&mut self.combat, self.scene.hero_explosives());
+            eprintln!(
+                "hero: {hero} carries {} grenades, {} C4, {} mines",
+                self.combat.grenades, self.combat.charges, self.combat.mines
+            );
         }
     }
 
@@ -1063,6 +1082,7 @@ impl Game {
         self.combat.max_hp = max_hp;
         self.combat.rifle = old.rifle;
         self.combat.own_rifle = old.own_rifle;
+        self.combat.scripted_loadout = old.scripted_loadout;
         self.combat.hero_damage = old.hero_damage;
         // What the templates gave her weapons stays.
         self.combat.damage_table = old.damage_table;
@@ -1231,6 +1251,7 @@ impl Game {
             support: self
                 .support
                 .hud(player.map_or(self.camera.position.y, |p| p.character.position.y)),
+            hero: self.scene.hero,
             ..HudInfo::default()
         }
     }

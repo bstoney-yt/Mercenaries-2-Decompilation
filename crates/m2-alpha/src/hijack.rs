@@ -309,8 +309,14 @@ impl Hijacks {
             match rx.try_recv() {
                 Ok(Ok((data, clips))) => match Mission::new(data, game.scene.hero.name(), [0.0; 3])
                 {
-                    Ok(mission) => {
+                    Ok(mut mission) => {
                         eprintln!("hijacks: scripts loaded");
+                        crate::mission::set_hero(
+                            &mut mission,
+                            game.scene.hero,
+                            game.combat.max_hp,
+                            "hijacks",
+                        );
                         if let Err(e) = mission
                             .lua()
                             .load(GUI_CALLS)
@@ -773,6 +779,16 @@ impl Hijacks {
     /// A hijack is under way.
     pub fn running(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// She is `hero` from now on, whole at `max` health: the loaded
+    /// scripts' player takes their name, labels and health
+    /// ([`crate::mission::set_hero`]). Scripts still loading start as
+    /// whoever she is then.
+    pub fn set_hero(&mut self, hero: crate::hero::Hero, max: f32) {
+        if let State::Ready(l) = &mut self.state {
+            crate::mission::set_hero(&mut l.mission, hero, max, "hijacks");
+        }
     }
 }
 

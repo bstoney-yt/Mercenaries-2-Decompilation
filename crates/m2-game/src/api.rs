@@ -1899,6 +1899,26 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         };
         let hush = w.vo.cancel(speaker, cue.as_deref());
+        // As called, and what it stopped: a nil speaker (or one that is no
+        // guid) is taken for the radio, which is ours to decide.
+        let raw = |v: Option<&Value>| match v {
+            None | Some(Value::Nil) => "nil".to_owned(),
+            Some(Value::String(s)) => format!("{:?}", s.to_string_lossy()),
+            Some(Value::Integer(i)) => i.to_string(),
+            Some(v) => v.type_name().to_owned(),
+        };
+        let ids: Vec<u32> = hush
+            .iter()
+            .filter_map(|c| match c {
+                Command::Hush(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        w.printed.push(format!(
+            "VO.Cancel({}, {}): speaker {speaker:?}, stops lines {ids:?}",
+            raw(a.first()),
+            raw(a.get(1))
+        ));
         w.commands.extend(hush);
         values([])
     })?;

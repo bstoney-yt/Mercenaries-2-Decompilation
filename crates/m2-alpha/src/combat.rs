@@ -1163,6 +1163,10 @@ pub struct Combat {
     /// one the scripts handed her.
     pub rifle: Rifle,
     pub own_rifle: bool,
+    /// The contract's scripts have handed her her weapons or their
+    /// reserves (`Command::Loadout`, `Command::Reserve`): what she carries
+    /// to throw is theirs, not her template's.
+    pub scripted_loadout: bool,
     /// What blasts do to her, of their damage.
     pub hero_damage: HeroDamage,
     pub rifle_rounds: Rounds,
@@ -1273,6 +1277,7 @@ impl Default for Combat {
             launcher_rounds: Some(Rounds::of(1 + RPG_SPARE, 1)),
             rifle: Rifle::default(),
             own_rifle: true,
+            scripted_loadout: false,
             hero_damage: HeroDamage::default(),
             rifle_rounds: Rounds::of(RIFLE_CLIP + RIFLE_SPARE, RIFLE_CLIP),
             changing: None,

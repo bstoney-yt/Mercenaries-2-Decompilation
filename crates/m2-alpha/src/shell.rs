@@ -133,14 +133,14 @@ pub fn take_new_game(lua: &Lua) -> Option<String> {
     Some(who)
 }
 
-/// The hero the shell's character name stands for.
-pub fn hero(character: &str) -> crate::hero::Hero {
-    use crate::hero::Hero;
-    match character.to_ascii_lowercase().as_str() {
-        "chris" => Hero::Chris,
-        "jen" | "jennifer" => Hero::Jennifer,
-        _ => Hero::Mattias,
+/// The hero the shell's character name stands for (`Chris`, `Jen`,
+/// `mattias`, any case), if it names one; one that does not is logged.
+pub fn hero(character: &str) -> Option<crate::hero::Hero> {
+    let hero = crate::hero::Hero::parse(character);
+    if hero.is_none() {
+        eprintln!("front end: the character {character:?} names no hero");
     }
+    hero
 }
 
 /// The engine's side of the menu movie (`shell.gfx`): what it calls in
@@ -343,6 +343,19 @@ mod tests {
         assert_eq!(names(n.calls()), ["saveCompleteContinue"]);
         assert!(n.command("onlineSaveProfile", "true"));
         assert!(n.calls().is_empty());
+    }
+
+    #[test]
+    fn only_the_heroes_names_pick_a_hero() {
+        use crate::hero::Hero;
+        assert_eq!(hero("Chris"), Some(Hero::Chris));
+        assert_eq!(hero("Jen"), Some(Hero::Jennifer));
+        assert_eq!(hero("jennifer"), Some(Hero::Jennifer));
+        assert_eq!(hero("mattias"), Some(Hero::Mattias));
+        // What a missing or stubbed `GetSelectedCharacter` leaves.
+        assert_eq!(hero(""), None);
+        assert_eq!(hero("table: 0x0123"), None);
+        assert_eq!(hero("1"), None);
     }
 
     #[test]
