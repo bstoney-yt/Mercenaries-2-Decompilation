@@ -400,6 +400,10 @@ pub struct HudState {
     /// Health, 0..=100: hers, or the vehicle's she is in.
     pub hp: f32,
     pub in_vehicle: bool,
+    /// The hero she is and her health when whole: the HUD's scripts know
+    /// her player by them ([`crate::mission::set_hero`]). `None` leaves
+    /// them be (the HUD starts as [`GameHud::start`]'s hero).
+    pub hero: Option<(Hero, f32)>,
     pub weapon: Weapon,
     pub fired: Fired,
     /// The rifle's rounds: in the clip, stored.
@@ -473,10 +477,6 @@ pub struct HudState {
     /// how much is left (0..=100) and whether it holds.
     pub vehicle_disguise: bool,
     pub disguise: Option<(f32, bool)>,
-    /// The hero she is and her health when whole: the HUD's scripts know
-    /// her player by them ([`crate::mission::set_hero`]). `None` leaves
-    /// them be.
-    pub hero: Option<(Hero, f32)>,
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -813,9 +813,11 @@ impl std::fmt::Debug for GameHud {
 }
 
 impl GameHud {
-    /// Starts the HUD's scripts reading `install` in the background.
-    pub fn start(install: &Install) -> Self {
-        Self::start_mode(install, Mode::Hud, "m2-alpha-hud.log")
+    /// Starts the HUD's scripts reading `install` in the background, their
+    /// player `hero` whole at `max` health (play's, as the game starts;
+    /// a later pick comes with [`HudState::hero`]).
+    pub fn start(install: &Install, hero: Hero, max: f32) -> Self {
+        Self::start_mode(install, Mode::Hud, Some((hero, max)), "m2-alpha-hud.log")
     }
 
     /// Starts the front end instead: the shell's own scripts and Flash
@@ -823,10 +825,10 @@ impl GameHud {
     /// its boot movies, drawn like the HUD. What they ask of the game
     /// comes back as [`ShellNews`].
     pub fn start_shell(install: &Install) -> Self {
-        Self::start_mode(install, Mode::Shell, "m2-alpha-shell.log")
+        Self::start_mode(install, Mode::Shell, None, "m2-alpha-shell.log")
     }
 
-    fn start_mode(install: &Install, mode: Mode, log: &str) -> Self {
+    fn start_mode(install: &Install, mode: Mode, hero: Option<(Hero, f32)>, log: &str) -> Self {
         let (tx, thread_rx) = channel();
         let (thread_tx, rx) = channel();
         let data = install.data.clone();
@@ -839,7 +841,7 @@ impl GameHud {
                 }
                 .into(),
             )
-            .spawn(move || run(&data, mode, thread_rx, thread_tx))
+            .spawn(move || run(&data, mode, hero, thread_rx, thread_tx))
             .expect("could not start the HUD thread");
         let path = Config::file_beside(log);
         let log = File::create(&path).ok().map(BufWriter::new);
@@ -1291,10 +1293,16 @@ fn covers(p: &Prim, screen: egui::Rect) -> bool {
     w * h > screen.area() / 2.0
 }
 
-/// The thread: reads the scripts, fonts and strings, starts the HUD, then
-/// draws each state sent until the sender goes.
-fn run(data: &std::path::Path, mode: Mode, rx: Receiver<HudState>, tx: Sender<Output>) {
-    let mut hud = match Thread::start(data, mode) {
+/// The thread: reads the scripts, fonts and strings, starts the HUD (its
+/// player `hero`), then draws each state sent until the sender goes.
+fn run(
+    data: &std::path::Path,
+    mode: Mode,
+    hero: Option<(Hero, f32)>,
+    rx: Receiver<HudState>,
+    tx: Sender<Output>,
+) {
+    let mut hud = match Thread::start(data, mode, hero) {
         Ok(h) => h,
         Err(e) => {
             let _ = tx.send(Output::Failed(e));
@@ -1411,7 +1419,11 @@ struct Thread {
 const LANGUAGE_WAD: &str = "English.wad";
 
 impl Thread {
-    fn start(data: &std::path::Path, mode: Mode) -> Result<Self, String> {
+    fn start(
+        data: &std::path::Path,
+        mode: Mode,
+        hero: Option<(Hero, f32)>,
+    ) -> Result<Self, String> {
         let wad = data.join(match mode {
             Mode::Hud => "vz.wad",
             Mode::Shell => "shell.wad",
@@ -1447,11 +1459,14 @@ impl Thread {
             }
         }
         let strings = game_data.strings.clone();
-        // The HUD starts before the front end has a hero: its player
-        // becomes the one play names with its first state
-        // ([`HudState::hero`]).
-        let mut mission =
-            Mission::new(game_data, "Mattias", [0.0; 3]).map_err(|e| e.to_string())?;
+        // Its player is play's hero from the start, for the modules' `Init`
+        // and `CreateGui` to see; a later pick renames her
+        // ([`HudState::hero`]). The front end's world keeps "Mattias".
+        let name = hero.map_or("Mattias", |(h, _)| h.name());
+        let mut mission = Mission::new(game_data, name, [0.0; 3]).map_err(|e| e.to_string())?;
+        if let Some((h, max)) = hero {
+            crate::mission::set_hero(&mut mission, h, max, "game HUD");
+        }
         let screen = gui_runtime::screen(mission.lua()).ok_or("no GUI runtime")?;
         {
             let mut s = screen.borrow_mut();
@@ -1509,7 +1524,9 @@ impl Thread {
         // movies' load callbacks (the PDA's closes it, `_FinishLoadAndClose`;
         // left open, the support menu won't open over it).
         gui_runtime::tick(mission.lua(), 0.0);
-        Ok(Self::new(mission, assets, language, fonts, movies, mode))
+        let mut thread = Self::new(mission, assets, language, fonts, movies, mode);
+        thread.hero = hero.map(|(h, _)| h);
+        Ok(thread)
     }
 
     fn new(

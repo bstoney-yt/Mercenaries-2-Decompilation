@@ -724,10 +724,19 @@ fn give_guns(game: &mut Game, guns: &[String]) {
 /// What the HUD shows: the game's, with the mission's objectives and the
 /// view their markers are placed with.
 /// The game's own HUD, on the island with the game's files (unless
-/// `--old-hud`).
-fn game_hud(install: Option<&Install>, mode: &Mode, old: bool) -> Option<gamehud::GameHud> {
+/// `--old-hud`), its scripts' player the hero `game` plays.
+fn game_hud(
+    install: Option<&Install>,
+    mode: &Mode,
+    old: bool,
+    game: &Game,
+) -> Option<gamehud::GameHud> {
     match (install, mode) {
-        (Some(install), Mode::Island(_)) if !old => Some(gamehud::GameHud::start(install)),
+        (Some(install), Mode::Island(_)) if !old => Some(gamehud::GameHud::start(
+            install,
+            game.scene.hero,
+            game.combat.max_hp,
+        )),
         _ => None,
     }
 }
@@ -1223,7 +1232,7 @@ fn screenshot(
     // started and run two seconds, for its boxes to have opened and the
     // gun box to have switched; half of one for hits, whose arcs fade).
     let mut hud = ui::Hud::new();
-    hud.game = game_hud(install, mode, options.old_hud);
+    hud.game = game_hud(install, mode, options.old_hud, &game);
     let mut settings = config.clone();
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
@@ -2429,7 +2438,7 @@ fn mission_for_screenshot(
         if contract_done.is_some() {
             let (hud, settings) = late_hud.get_or_insert_with(|| {
                 let mut hud = ui::Hud::new();
-                hud.game = game_hud(Some(install), &Mode::Island(None), false);
+                hud.game = game_hud(Some(install), &Mode::Island(None), false, game);
                 hud.wait = true;
                 if let Some(g) = &mut hud.game {
                     g.log_to(&out.with_file_name(format!("{stem}-late-hud.log")));
@@ -2836,7 +2845,7 @@ fn hijack_for_screenshot(
     let started = Instant::now();
     // The game's HUD, for the buttons the scripts put up.
     let mut hud = ui::Hud::new();
-    hud.game = game_hud(Some(install), &Mode::Island(None), options.old_hud);
+    hud.game = game_hud(Some(install), &Mode::Island(None), options.old_hud, game);
     hud.wait = true;
     if let (Some(g), Some(out)) = (&mut hud.game, &options.screenshot) {
         g.log_to(&out.with_file_name(format!(
@@ -4413,7 +4422,7 @@ impl App {
         }
         let focused = window.has_focus();
         let mut hud = ui::Hud::new();
-        hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud);
+        hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud, &game);
         let egui = egui_winit::State::new(
             hud.ctx.clone(),
             egui::ViewportId::ROOT,
