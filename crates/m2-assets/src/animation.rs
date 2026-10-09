@@ -34,8 +34,14 @@
 //! 0x08  u32       encoding: 1 interleaved, 2 delta, 3 wavelet
 //! 0x0C  f32       duration in seconds = (frames - 1) / frame rate
 //! 0x10  u32       track count, equal to trnm's
-//! 0x14  u32 x 4   unknown (0)
+//! 0x14  u32       float track count (0)
+//! 0x18  ptr       extracted motion (0: root motion stays on the root track)
+//! 0x1C  {ptr, u32 count}  annotation tracks (empty; events are in evnt)
 //! ```
+//!
+//! These are Havok's `hkaSkeletalAnimation` fields (`type`, `duration`,
+//! `numberOfTransformTracks`, `numberOfFloatTracks`, `extractedMotion`,
+//! `annotationTracks`); the compressed layouts below use Havok's names too.
 //!
 //! Frames are uniform, at 30 or 29.97 per second; no clip stores key times.
 //! Each track holds ten values per frame: translation xyz, rotation
@@ -49,7 +55,7 @@
 //! 0x24  {ptr, u32 count}  transforms, count = frames * tracks, frame-major,
 //!                         48 bytes each: f32 t[4], q[4], s[4]
 //!                         (t.w and s.w unused)
-//! 0x2C  {ptr, u32 count}  unknown, empty on every clip
+//! 0x2C  {ptr, u32 count}  float track values (`floats`), empty on every clip
 //! ```
 //!
 //! # Compressed clips
@@ -87,59 +93,66 @@
 //! Wavelet clip fields:
 //!
 //! ```text
-//! 0x24  u32  frames
-//! 0x28  u32  block length in frames (8)
-//! 0x2C  u8   largest bit width
-//! 0x2D  u8   unknown (0)
-//! 0x30  u32  dynamic DOF count
-//! 0x34  u32  buffer index of the offsets
-//! 0x38  u32  buffer index of the scales
-//! 0x3C  u32  buffer index of the bit widths
-//! 0x40  u32  buffer index of the static masks
-//! 0x44  u32  buffer index of the static values
-//! 0x48  u32  buffer index of the block table (u32 byte offset per block)
-//! 0x4C  u32  block count = ceil(frames / 8)
-//! 0x50  u32  buffer index of the quantized blocks
-//! 0x54  u32  quantized block bytes
-//! 0x58  ptr  buffer
+//! 0x24  u32  frames                          numberOfPoses
+//! 0x28  u32  block length in frames (8)      blockSize
+//! 0x2C  u8   largest bit width               qFormat.maxBitWidth
+//! 0x2D  u8   preserved values per block (0)  qFormat.preserved
+//! 0x30  u32  dynamic DOF count               qFormat.numD
+//! 0x34  u32  buffer index of the offsets     qFormat.offsetIdx
+//! 0x38  u32  buffer index of the scales      qFormat.scaleIdx
+//! 0x3C  u32  buffer index of the bit widths  qFormat.bitWidthIdx
+//! 0x40  u32  buffer index of the static masks           staticMaskIdx
+//! 0x44  u32  buffer index of the static values          staticDOFsIdx
+//! 0x48  u32  buffer index of the block table            blockIndexIdx
+//!            (u32 byte offset per block)
+//! 0x4C  u32  block count = ceil(frames / 8)             blockIndexSize
+//! 0x50  u32  buffer index of the quantized blocks       quantizedDataIdx
+//! 0x54  u32  quantized block bytes                      quantizedDataSize
+//! 0x58  ptr  buffer                                     dataBuffer
 //! 0x5C  u32  buffer length
 //! ```
 //!
 //! Block `b` covers frames `8b` to `8b + 7`, the last padded by repeating
 //! the last frame. For each dynamic DOF it holds a `u8` zero mask (bit `j`
-//! set: coefficient `j` is 0 and not stored), then each stored coefficient
-//! as a `bw`-bit integer `q` read least significant bit first, then padding
-//! to a byte. A coefficient is `offset + scale * q / (2^bw - 1)`. The eight
-//! coefficients `[s, d3, d2_0, d2_1, d1_0 .. d1_3]` are a three-level
-//! LeGall 5/3 lifting wavelet; see [`inverse_wavelet`].
+//! set: coefficient `j` is not stored), then each stored coefficient as a
+//! `bw`-bit integer `q` read least significant bit first, then padding to a
+//! byte. A coefficient is the middle of bucket `q`, `offset + scale * (q +
+//! 0.5) / 2^bw`; a masked one is the bucket holding 0, `q = trunc(-offset /
+//! scale * 2^bw)` kept below `2^bw`, so it decodes to nearly but not exactly
+//! 0. A DOF whose range was never set (offset `f32::MAX`, scale `-inf`; 359
+//! DOFs, every coefficient masked) decodes to exactly 0, where the bucket
+//! arithmetic would give `-inf`. The eight coefficients `[s, d3, d2_0, d2_1, d1_0 .. d1_3]` are a
+//! three-level LeGall 5/3 lifting wavelet; see [`inverse_wavelet`].
 //!
 //! Delta clip fields:
 //!
 //! ```text
-//! 0x24  u32  frames
-//! 0x28  u32  block length in frames (8)
-//! 0x2C  u8   largest bit width
-//! 0x2D  u8   unknown (1)
-//! 0x30  u32  dynamic DOF count
-//! 0x34  u32  buffer index of the offsets
-//! 0x38  u32  buffer index of the scales
-//! 0x3C  u32  buffer index of the bit widths
-//! 0x40  u32  buffer index of the quantized blocks
-//! 0x44  u32  quantized block bytes
-//! 0x48  u32  buffer index of the static masks
-//! 0x4C  u32  unknown
-//! 0x50  u32  buffer index of the static values
-//! 0x54  u32  unknown
-//! 0x58  u32  bytes per full block
-//! 0x5C  u32  bytes in the last block
-//! 0x60  ptr  buffer
+//! 0x24  u32  frames                          numberOfPoses
+//! 0x28  u32  block length in frames (8)      blockSize
+//! 0x2C  u8   largest bit width               qFormat.maxBitWidth
+//! 0x2D  u8   preserved values per block (1)  qFormat.preserved
+//! 0x30  u32  dynamic DOF count               qFormat.numD
+//! 0x34  u32  buffer index of the offsets     qFormat.offsetIdx
+//! 0x38  u32  buffer index of the scales      qFormat.scaleIdx
+//! 0x3C  u32  buffer index of the bit widths  qFormat.bitWidthIdx
+//! 0x40  u32  buffer index of the quantized blocks       quantizedDataIdx
+//! 0x44  u32  quantized block bytes                      quantizedDataSize
+//! 0x48  u32  buffer index of the static masks           staticMaskIdx
+//! 0x4C  u32  static mask bytes                          staticMaskSize
+//! 0x50  u32  buffer index of the static values          staticDOFsIdx
+//! 0x54  u32  static value bytes                         staticDOFsSize
+//! 0x58  u32  bytes per full block                       totalBlockSize
+//! 0x5C  u32  bytes in the last block                    lastBlockSize
+//! 0x60  ptr  buffer                                     dataBuffer
 //! 0x64  u32  buffer length
 //! ```
 //!
-//! Blocks are back to back. For each dynamic DOF a block holds the first
-//! frame's value as an `f32`, then one `bw`-bit delta per further frame
-//! (least significant bit first), then padding to a byte; each value is the
-//! previous one plus `offset + scale * q / (2^bw - 1)`.
+//! Blocks are back to back. For each dynamic DOF a block holds its first
+//! `preserved` values as `f32`, then one `bw`-bit integer `q` per further
+//! frame (least significant bit first), then padding to a byte. A quantized
+//! value is the middle of bucket `q`, `offset + scale * (q + 0.5) / 2^bw`,
+//! and the block's frames are the single-precision running sum of all its
+//! values, so every frame is the previous one plus its delta.
 //!
 //! # Conventions
 //!
@@ -150,14 +163,19 @@
 //!
 //! # Provenance
 //!
-//! Format-from-samples: inferred from all 4,232 skeletal clips (4,103
-//! wavelet, 73 interleaved, 56 delta) in the archives of a legally installed
-//! copy. Every compressed block decodes to exactly its stored length,
-//! decoded quaternions are unit length to within 0.002 (wavelet) and 0.01
-//! (delta, whose error accumulates), and the first frame of every clip
-//! matches its model's bind pose on the nodes the clip leaves still. 4,222
-//! clips name only nodes of one model. No bytes from the archives are
-//! committed.
+//! Layouts inferred from all 4,232 skeletal clips (4,103 wavelet, 73
+//! interleaved, 56 delta) in the archives of a legally installed copy, then
+//! checked against Havok's own decoder in the Xbox 360 build of the game,
+//! whose clip layouts match these field for field. The field names come
+//! from its `hkClass` reflection tables, and the dequantization (bucket
+//! middle, `2^bw` buckets), the wavelet zero code, the preserved count and
+//! the running sum from its decompression routines. Every compressed block
+//! decodes to exactly its stored length; decoded quaternions are unit length
+//! to within 0.0018 (wavelet, mean 0.000006) and 0.0096 (delta, whose 16-bit
+//! deltas are quantized per component; blocks restart every 8 frames, so the
+//! error does not grow along a clip). Havok renormalizes rotations after
+//! sampling. 4,222 clips name only nodes of one model. No bytes from the
+//! archives or the executable are committed.
 
 use m2_math::{RawMatrix44, RawQuat, RawVec3};
 
@@ -284,6 +302,8 @@ pub enum AnimationError {
     BlockCount { found: u32, expected: u32 },
     #[error("block {block} is {len:#x} bytes, but its values need {used:#x}")]
     BlockSize { block: u32, len: usize, used: usize },
+    #[error("wavelet clip preserves {0} values per block, expected 0")]
+    Preserved(u32),
     #[error("event section has {0} bytes left over")]
     EventTrailing(usize),
 }
@@ -777,12 +797,33 @@ struct Dequant {
 }
 
 impl Dequant {
+    /// The middle of quantization bucket `q`: `offset + scale * (q + 0.5) /
+    /// 2^bits`, in Havok's order of single-precision operations. A 0-bit
+    /// value is bucket 0 too, so it decodes to `offset + scale / 2`.
     fn value(&self, q: u32) -> f32 {
-        if self.bits == 0 {
-            return self.offset;
+        let step = (-(self.bits as i32) as f32).exp2();
+        (q as f32 + 0.5) * (step * self.scale) + self.offset
+    }
+
+    /// The code a wavelet block's zero mask stands for: the bucket holding
+    /// 0, `trunc(-offset / scale * 2^bits)`, kept below `2^bits`.
+    fn zero_code(&self) -> u32 {
+        let n = (1u64 << self.bits) as f32;
+        let z = (-self.offset / self.scale * n) as i64;
+        let z = if z == n as i64 { z - 1 } else { z };
+        (z as u64 & ((1u64 << self.bits) - 1)) as u32
+    }
+
+    /// What a masked wavelet coefficient decodes to: the zero bucket's
+    /// middle, or exactly 0 for a DOF whose range was never set (offset
+    /// `f32::MAX`, scale `-inf`: every coefficient was 0 and masked), where
+    /// the bucket arithmetic would give `-inf`.
+    fn zero_value(&self) -> f32 {
+        if self.offset.is_finite() && self.scale.is_finite() {
+            self.value(self.zero_code())
+        } else {
+            0.0
         }
-        let max = ((1u64 << self.bits) - 1) as f32;
-        self.offset + self.scale * (q as f32 / max)
     }
 }
 
@@ -938,16 +979,23 @@ fn header_u32s<const N: usize>(
     Ok(out)
 }
 
+/// The quantization format's preserved value count: the byte at 0x2D,
+/// after the largest bit width at 0x2C, read here as part of a word.
+fn preserved(format: u32) -> u32 {
+    (format >> 8) & 0xFF
+}
+
 fn decode_wavelet(
     section: &PackSection<'_>,
     clip: u32,
     tracks: u32,
 ) -> Result<(u32, Vec<Transform>), AnimationError> {
-    // 0x2C (bit width bytes) is read as a word and ignored.
+    // 0x2C holds the quantization format's largest bit width and preserved
+    // value count bytes.
     let [
         frames,
         block_len,
-        _,
+        format,
         dynamic,
         offsets,
         scales,
@@ -962,6 +1010,10 @@ fn decode_wavelet(
     let buffer_len = header_u32s::<1>(section, clip as usize + 0x5C)?[0];
     if block_len != WAVELET_BLOCK {
         return Err(AnimationError::BlockLength(block_len));
+    }
+    let preserved = preserved(format);
+    if preserved != 0 {
+        return Err(AnimationError::Preserved(preserved));
     }
     check_size(frames, tracks)?;
     let expected = frames.div_ceil(WAVELET_BLOCK);
@@ -1011,9 +1063,11 @@ fn decode_wavelet(
             let zero = bits.read(8).ok_or_else(|| short(&bits))?;
             let mut coef = [0.0; 8];
             for (j, c) in coef.iter_mut().enumerate() {
-                if zero & (1 << j) == 0 {
-                    *c = d.value(bits.read(d.bits).ok_or_else(|| short(&bits))?);
-                }
+                *c = if zero & (1 << j) == 0 {
+                    d.value(bits.read(d.bits).ok_or_else(|| short(&bits))?)
+                } else {
+                    d.zero_value()
+                };
             }
             bits.align();
             let first = b * WAVELET_BLOCK as usize;
@@ -1042,7 +1096,7 @@ fn decode_delta(
     let [
         frames,
         block_len,
-        _,
+        format,
         dynamic,
         offsets,
         scales,
@@ -1050,9 +1104,9 @@ fn decode_delta(
         quant,
         quant_len,
         masks,
-        _,
+        _mask_len,
         statics,
-        _,
+        _statics_len,
         full_len,
         last_len,
         _,
@@ -1061,6 +1115,7 @@ fn decode_delta(
     if block_len == 0 {
         return Err(AnimationError::BlockLength(block_len));
     }
+    let preserved = preserved(format) as usize;
     check_size(frames, tracks)?;
     let buffer = pointed(section, clip, 0x60, buffer_len as usize)?;
     let c = Compressed {
@@ -1097,10 +1152,16 @@ fn decode_delta(
             used: bits.bytes_used() + 1,
         };
         for (k, d) in dq.iter().enumerate() {
-            let mut x = f32::from_bits(bits.read(32).ok_or_else(|| short(&bits))?);
-            values[k * n + first] = x;
-            for j in 1..count {
-                x += d.value(bits.read(d.bits).ok_or_else(|| short(&bits))?);
+            // The first `preserved` values are stored as f32, the rest
+            // quantized; the block is then a running sum of them all.
+            let mut x = 0.0f32;
+            for j in 0..count {
+                let v = if j < preserved {
+                    f32::from_bits(bits.read(32).ok_or_else(|| short(&bits))?)
+                } else {
+                    d.value(bits.read(d.bits).ok_or_else(|| short(&bits))?)
+                };
+                x = if j == 0 { v } else { x + v };
                 values[k * n + first + j] = x;
             }
             bits.align();
@@ -1173,9 +1234,21 @@ mod tests {
         out
     }
 
+    /// The bucket of `2^BW` across `[off, off + scale]` holding `v`; the
+    /// decoder returns its middle.
     fn quantize(v: f32, off: f32, scale: f32) -> u32 {
-        let max = ((1u32 << BW) - 1) as f32;
-        ((v - off) / scale * max).round().clamp(0.0, max) as u32
+        let n = (1u32 << BW) as f32;
+        ((v - off) / scale * n).floor().clamp(0.0, n - 1.0) as u32
+    }
+
+    /// What the decoder makes of bucket `q`.
+    fn dequantize(q: u32, off: f32, scale: f32) -> f32 {
+        Dequant {
+            offset: off,
+            scale,
+            bits: BW,
+        }
+        .value(q)
     }
 
     /// A clip to encode: per track a static mask and per-frame values.
@@ -1325,7 +1398,6 @@ mod tests {
                 ranges.push((lo, scale));
             }
             let quant = buf.len();
-            let max = ((1u32 << BW) - 1) as f32;
             let mut lens = Vec::new();
             for first in (0..n).step_by(8) {
                 let count = (n - first).min(8);
@@ -1335,7 +1407,7 @@ mod tests {
                     w.write(r.to_bits(), 32);
                     for j in 1..count {
                         let q = quantize(s[first + j] - r, lo, scale);
-                        r += lo + scale * (q as f32 / max);
+                        r += dequantize(q, lo, scale);
                         w.write(q, BW);
                     }
                     w.align();
@@ -1688,6 +1760,45 @@ mod tests {
             Clip::parse(&asset(src.interleaved(), 3, false)),
             Err(AnimationError::Class { encoding: 1, .. })
         ));
+    }
+
+    #[test]
+    fn dequantization_takes_the_middle_of_each_bucket() {
+        let d = |bits| Dequant {
+            offset: -1.0,
+            scale: 2.0,
+            bits,
+        };
+        // 4 bits: buckets of 2/16 starting at -1, decoded at their middle.
+        assert_eq!(d(4).value(0), -1.0 + 1.0 / 16.0);
+        assert_eq!(d(4).value(15), 1.0 - 1.0 / 16.0);
+        // A 0-bit value is bucket 0 of 1: the middle of the range.
+        assert_eq!(d(0).value(0), 0.0);
+        // The zero mask's code is the bucket holding 0.
+        assert_eq!(d(4).zero_code(), 8);
+        assert_eq!(d(4).value(d(4).zero_code()), 1.0 / 16.0);
+        // A range ending at 0 keeps the code below 2^bits.
+        let top = Dequant {
+            offset: -2.0,
+            scale: 2.0,
+            bits: 4,
+        };
+        assert_eq!(top.zero_code(), 15);
+        assert_eq!(d(0).zero_code(), 0);
+        // A range never set (every coefficient masked) decodes to 0.
+        let unset = Dequant {
+            offset: f32::MAX,
+            scale: f32::NEG_INFINITY,
+            bits: 11,
+        };
+        assert_eq!(unset.zero_value(), 0.0);
+        assert_eq!(d(4).zero_value(), 1.0 / 16.0);
+    }
+
+    #[test]
+    fn preserved_count_is_the_second_format_byte() {
+        assert_eq!(preserved(BW | 1 << 8), 1);
+        assert_eq!(preserved(BW), 0);
     }
 
     #[test]
