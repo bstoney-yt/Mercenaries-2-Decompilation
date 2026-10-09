@@ -40,6 +40,11 @@
 //! spot:<x>,<z>[,<r>]        what stands near a spot (default 30 m): models
 //!                           with their techniques and textures, and the
 //!                           layer entities with their components' fields
+//! atmospheres[:<word>,..]   every atmosphere region (area, centre) with
+//!                           its records' time of day, sunlight, clouds,
+//!                           top ambient light and haze; then the region
+//!                           and record over each start point whose name
+//!                           holds a word
 //! entities:<word>[,..]      every entity of the layers whose name holds a
 //!                           word, or whose own name does, with its
 //!                           components' fields (400 a layer at most)
@@ -1004,6 +1009,13 @@ fn main() -> Result<(), Error> {
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
             "names" => names_holding(&mut source, &names, arg),
+            "atmospheres" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                atmospheres(world.as_ref().expect("just built"), &names, arg);
+                Ok(())
+            }
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -1020,6 +1032,75 @@ fn main() -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Every atmosphere region with its records (name, `LightTime`, sunlight
+/// strength and colour, cloud tone and cover, the ambient cube's top
+/// face), then, for each start point whose name holds one of `arg`'s
+/// words, the region and record over it.
+fn atmospheres(world: &WorldIndex, names: &Names, arg: &str) {
+    let show = |a: &m2_engine::Atmosphere| {
+        format!(
+            "time {:.3} li {:.2} light {:.2},{:.2},{:.2} tone {:.2},{:.2},{:.2} cover {:.2} up {:.2},{:.2},{:.2} interp {:.1} dark {:.0} inscat {:.1} haze {:?}",
+            a.light_time[0],
+            a.light_intensity,
+            a.light_color.x,
+            a.light_color.y,
+            a.light_color.z,
+            a.tone.x,
+            a.tone.y,
+            a.tone.z,
+            a.coverage,
+            a.ambient_cube[2].x,
+            a.ambient_cube[2].y,
+            a.ambient_cube[2].z,
+            a.interpolate_time,
+            a.cloud_darkness,
+            a.inscattering,
+            a.haze_layers
+        )
+    };
+    if let Some(a) = &world.atmosphere {
+        println!("default: {}", show(a));
+    }
+    let regions = &world.atmosphere_regions;
+    for r in regions {
+        let n = r.outline.len().max(1) as f32;
+        let c = r
+            .outline
+            .iter()
+            .fold(m2_math::glam::Vec2::ZERO, |s, p| s + *p)
+            / n;
+        println!(
+            "region {} ({:08x}) area {:.0} centre {:.0},{:.0}, default record {}",
+            r.name,
+            r.entity,
+            r.area,
+            c.x,
+            c.y,
+            r.default_setting()
+        );
+        for (i, (name, a)) in r.settings.iter().enumerate() {
+            println!("  #{i} {} ({name:08x}): {}", names.show(*name), show(a));
+        }
+    }
+    let words = words_of(arg);
+    let mix = m2_engine::atmosphere::AtmosphereMix::default();
+    for s in &world.starts {
+        let lower = s.name.to_ascii_lowercase();
+        if !words.iter().any(|w| lower.contains(w.as_str())) {
+            continue;
+        }
+        let over = mix
+            .over(regions, s.position)
+            .map_or("the default".to_owned(), |(r, k)| {
+                format!("{} #{k}", regions[r].name)
+            });
+        println!(
+            "start {} at {:.0},{:.0},{:.0}: {over}",
+            s.name, s.position.x, s.position.y, s.position.z
+        );
+    }
 }
 
 /// The words of a section's argument, lower case.
