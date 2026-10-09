@@ -1793,7 +1793,7 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         Command::Move { guid, .. } if fleet.dropped.remove(guid) => return false,
         // Moved by the scripts: a vehicle is placed afresh where they now
         // say, with her back in it if she was driving it; a layer's model
-        // just moves.
+        // or person just moves.
         Command::Move { guid, .. } | Command::Remove(guid) if *guid != PLAYER => {
             if let (Some(i), Some(world)) = (index(guid), &mut game.scene.world)
                 && let Some(id) = game.scene.vehicles[i].id.take()
@@ -1808,9 +1808,13 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             if let Some(world) = &mut scene.world {
                 match c {
                     Command::Move { position, .. } => {
-                        scene
-                            .props
-                            .put(&mut world.physics, *guid, Vec3::from(*position));
+                        let at = Vec3::from(*position);
+                        scene.props.put(&mut world.physics, *guid, at);
+                        // A person the layers place (a story character):
+                        // there they stand.
+                        if is_spawn(world, *guid) {
+                            scene.people.put(*guid, at);
+                        }
                     }
                     _ if is_spawn(world, *guid) => {
                         scene.people.script_kill(&mut world.physics, *guid, true);

@@ -413,14 +413,18 @@ impl Templates {
     /// `Bullpup Rifle`, Mattias's `Assault Rifle`, Chris's `Carbine`; the
     /// RPG fires rockets), with its template's name.
     pub fn own_rifle(&self, name: &str) -> Option<(&str, HandGun)> {
-        self.ids(name).iter().find_map(|id| {
-            let gun = self
-                .equipment
-                .get(id)?
-                .iter()
-                .find_map(|t| self.guns.get(t))?;
-            Some((self.names.get(&gun.template)?.as_str(), *gun))
-        })
+        self.ids(name).iter().find_map(|&id| self.rifle_of(id))
+    }
+
+    /// The rifle template id `id`'s `EquipmentLink`s hand it, as
+    /// [`own_rifle`](Self::own_rifle) finds it by name.
+    pub fn rifle_of(&self, id: u32) -> Option<(&str, HandGun)> {
+        let gun = self
+            .equipment
+            .get(&id)?
+            .iter()
+            .find_map(|t| self.guns.get(t))?;
+        Some((self.names.get(&gun.template)?.as_str(), *gun))
     }
 
     /// The gun template `name` (`Carbine`), whatever its case.
@@ -761,6 +765,9 @@ pub struct SpawnPoint {
     /// How its template fights, with the entity's own `AiBehavior`
     /// switches when it has them; `None` when the template has no `Ai`.
     pub ai: Option<AiProfile>,
+    /// The rifle its template's `EquipmentLink`s hand it
+    /// ([`Templates::rifle_of`]); `None` when they hand it none.
+    pub gun: Option<HandGun>,
 }
 
 /// Where everything on the island is.
@@ -1251,6 +1258,7 @@ impl WorldIndex {
                 model: template.and_then(|(_, t)| t.model.filter(|_| t.human)),
                 list: people_of(id, p),
                 ai,
+                gun: templates.rifle_of(p.parent).map(|(_, g)| g),
             }
         };
         for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {

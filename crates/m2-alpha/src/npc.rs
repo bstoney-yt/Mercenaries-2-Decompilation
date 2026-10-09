@@ -11,10 +11,13 @@
 //! model for the role their name asks for (`VZ Soldier ..`, `VZ Heavy ..`,
 //! `VZ Deathsquad ..`), as in the browser viewer. Which side anyone is on
 //! is not decoded: the Venezuelans (by name) and a mission's targets
-//! fight. A story character (placed by a layer, not fighting: `Carmona`)
-//! is the scripts': they stay where they are put. The behaviour (standing
-//! at posts, walking routes there and back with pauses, running from
-//! gunfire) is invented: the game's AI code is not decoded.
+//! fight. Whom spawners send out stand whoever they are, but of the
+//! rest the layers place only story characters do (a one-word template:
+//! `Carmona`), not another army's. A story character is the scripts':
+//! they stay where they are put. The
+//! behaviour (standing at posts, walking routes there and back with
+//! pauses, running from gunfire) is invented: the game's AI code is not
+//! decoded.
 //!
 //! How a soldier fights comes from their template's AI data
 //! ([`AiProfile`]): their health, the cone they see in (`VisionFOV`, 180
@@ -36,7 +39,7 @@
 //! to those near, spread around her rather than stepping at random, run
 //! for cover when hit, throw grenades sooner, and aim better.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use m2_engine::tuning::HandGun;
 use m2_engine::world::SpawnPoint;
@@ -1166,6 +1169,9 @@ pub struct People {
     /// Static sub-layers said (in the log) not to be loaded where their
     /// people would stand.
     unloaded: HashSet<u32>,
+    /// Where the scripts last put people, by spawn entity: there they
+    /// stand, not where their layer has them.
+    moved: HashMap<u32, Vec3>,
     active: HashSet<u32>,
     rng: Rng,
     /// The enhanced, smarter soldiers' settings (off: the original's).
@@ -1183,8 +1189,29 @@ enum Who {
     },
     /// Their model (or a spawner's pick's) is loading.
     Waiting,
-    /// Nobody: a vehicle's spawn, a person of no model.
+    /// Nobody: a vehicle's spawn, a person of no model, another army's.
     Nobody,
+}
+
+/// Whether a person of template or entity name `name` is a Venezuelan
+/// (`VZ Soldier`, `VZ Tank Crew`): they fight. For people in a
+/// template's own model, where [`role_for`]'s vehicle words don't apply.
+fn venezuelan(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("vz ")
+}
+
+/// Whether spawn `s` (a `target` of a mission's or not) is in its
+/// template's own model but left out: which side people are on isn't
+/// decoded, so of those who don't fight only a story character (a
+/// one-word template, `Carmona`) stands, not another army's or a
+/// passer-by's (`Allied Soldier`, `GR Defender`).
+fn left_out(s: &SpawnPoint, target: bool) -> bool {
+    let fights = target
+        || [s.template.as_deref(), Some(s.name.as_str())]
+            .iter()
+            .flatten()
+            .any(|n| venezuelan(n));
+    s.model.is_some() && !fights && s.template.as_deref().is_some_and(|t| t.contains(' '))
 }
 
 /// The role a name asks for when it is a Venezuelan's (`VZ Heavy ..`):
@@ -1254,11 +1281,15 @@ impl People {
     /// a spawner's pick from its list; else (no model of their own, or one
     /// that won't do) the catalogue's model for the role their name asks
     /// for, a plain soldier's for a mission's `target`. The Venezuelans
-    /// (by name) and a mission's targets fight.
+    /// (by name) and a mission's targets fight; of the rest in a model of
+    /// their own, only story characters stand ([`left_out`]).
     fn who(&mut self, s: &SpawnPoint, target: bool) -> Who {
         let names = [s.template.as_deref(), Some(s.name.as_str())];
-        let fights = target || names.iter().flatten().any(|n| role_for(n).is_some());
         if let (Some(template), Some(model)) = (s.template.as_deref(), s.model) {
+            if left_out(s, target) {
+                return Who::Nobody;
+            }
+            let fights = target || names.iter().flatten().any(|n| venezuelan(n));
             if let Some(kind) = self.own(template, model) {
                 return Who::Kind {
                     kind,
@@ -1306,7 +1337,7 @@ impl People {
             return Who::Nobody;
         };
         let (template, model, _) = &s.list[i as usize];
-        let fights = role_for(template).is_some();
+        let fights = venezuelan(template);
         if let Some(kind) = self.own(template, *model) {
             return Who::Kind {
                 kind,
@@ -1345,6 +1376,11 @@ impl People {
             };
             return format!("{:?} ({how} {:08x}), {what}", k.role, k.model.hash);
         }
+        let target = self.mission_soldiers.contains(&s.entity);
+        if left_out(s, target) {
+            return "nobody (in a model of its own, not fighting, not a story character)"
+                .to_owned();
+        }
         if let (Some(template), Some(model)) = (s.template.as_deref(), s.model) {
             let key = (model, template.to_owned());
             let state = if self.refused.contains(&key) {
@@ -1359,7 +1395,6 @@ impl People {
         if !s.list.is_empty() {
             return format!("a spawner of {} templates", s.list.len());
         }
-        let target = self.mission_soldiers.contains(&s.entity);
         let role = [s.template.as_deref(), Some(s.name.as_str())]
             .iter()
             .flatten()
@@ -1517,6 +1552,25 @@ impl People {
         out
     }
 
+    /// The scripts put the person of spawn `entity` at `at`: they stand
+    /// there, at a post facing the way they do, and there they stand
+    /// when they next come.
+    pub fn put(&mut self, entity: u32, at: Vec3) {
+        self.moved.insert(entity, at);
+        for n in self
+            .npcs
+            .iter_mut()
+            .filter(|n| n.spawn == Some(entity) && n.alive)
+        {
+            n.character.position = at;
+            n.character.velocity = Vec3::ZERO;
+            n.landed = false;
+            n.flee = None;
+            n.brain = Brain::Post { facing: n.facing };
+        }
+        eprintln!("people: the scripts put {entity:08x} at {at:.1}");
+    }
+
     /// The scripts killed the soldier of spawn `entity` (or took it away,
     /// `gone`): dead where they stand, or not there at all. Either way they
     /// don't come back.
@@ -1623,18 +1677,35 @@ impl People {
                 }
             }
         }
+        // One the scripts made a mission's target after they stood (a
+        // guard whose objective comes later) fights from then on.
+        for n in &mut self.npcs {
+            if !n.soldier && n.spawn.is_some_and(|e| self.mission_soldiers.contains(&e)) {
+                n.soldier = true;
+                n.held = false;
+                eprintln!(
+                    "people: {:?} ({:08x}) is a mission's target now: fights",
+                    self.kinds[n.kind].role,
+                    n.spawn.unwrap_or(0)
+                );
+            }
+        }
         // People who come into range: a mission's targets first, then the
-        // nearest.
+        // nearest. Where the scripts put someone, they stand.
         let soldiers = self.npcs.iter().filter(|n| n.spawn.is_some()).count();
-        let mut near: Vec<(f32, &SpawnPoint)> = spawns
+        let mut near: Vec<(f32, &SpawnPoint, Vec3)> = spawns
             .iter()
-            .filter(|s| {
+            .map(|s| (s, self.moved.get(&s.entity).copied()))
+            .filter(|&(s, moved)| {
                 !self.active.contains(&s.entity)
                     && !self.killed.contains(&s.entity)
-                    && !far(s.position, ACTIVE)
+                    && !far(moved.unwrap_or(s.position), ACTIVE)
                     && self.layer_in(s.layer)
             })
-            .map(|s| (s.position.distance(focus), s))
+            .map(|(s, moved)| {
+                let at = moved.unwrap_or(s.position);
+                (at.distance(focus), s, at)
+            })
             .collect();
         let targets = &self.mission_soldiers;
         near.sort_by(|a, b| {
@@ -1645,7 +1716,7 @@ impl People {
         // A mission's targets come even when the island's soldiers fill
         // the place up.
         let mut room = MAX_SOLDIERS.saturating_sub(soldiers);
-        for (_, s) in near {
+        for (_, s, at) in near {
             let target = self.mission_soldiers.contains(&s.entity);
             if room == 0 && !target {
                 break;
@@ -1667,7 +1738,7 @@ impl People {
             room = room.saturating_sub(1);
             let forward = s.rotation * Vec3::Z;
             let facing = forward.x.atan2(forward.z);
-            let brain = if s.route.len() >= 2 {
+            let brain = if s.route.len() >= 2 && !self.moved.contains_key(&s.entity) {
                 Brain::Patrol {
                     route: s.route.clone(),
                     next: 0,
@@ -1681,7 +1752,7 @@ impl People {
             let mut npc = Npc::new(
                 kind,
                 &self.kinds[kind].rig,
-                s.position,
+                at,
                 facing,
                 brain,
                 Some(s.entity),
@@ -1697,7 +1768,13 @@ impl People {
             // A story character the layers place is the scripts': where
             // they are put, they stay.
             npc.held = !fights && !listed;
-            npc.gun = self.kinds[kind].gun;
+            // Their own template's gun (in the catalogue's model too); a
+            // spawner's pick's, by the kind of their template.
+            npc.gun = if listed {
+                self.kinds[kind].gun
+            } else {
+                s.gun.or(self.kinds[kind].gun)
+            };
             self.tell(s, &npc);
             self.npcs.push(npc);
         }
@@ -2005,6 +2082,7 @@ pub(crate) mod tests {
             SpawnPoint {
                 template: Some("VZ Soldier".into()),
                 model: Some(0x45cc),
+                gun: Some(rifle()),
                 ..spawn(1, "vza_beachguard_1", 10.0)
             },
             SpawnPoint {
@@ -2025,7 +2103,9 @@ pub(crate) mod tests {
             .map(|n| (n.spawn, people.kinds[n.kind].role.as_str()))
             .collect();
         assert_eq!(stood, [(Some(1), "vz_hum_soldier")]);
-        assert!(people.npcs[0].soldier && people.npcs[0].gun.is_none());
+        // In the catalogue's model, still with his template's gun.
+        assert!(people.npcs[0].soldier);
+        assert_eq!(people.npcs[0].gun, Some(rifle()));
         assert!(people.wanted.is_empty(), "not asked for again");
     }
 
@@ -2096,6 +2176,103 @@ pub(crate) mod tests {
         assert!(people.take_shouts().is_empty(), "nor shouts");
     }
 
+    #[test]
+    fn other_armies_and_passers_by_in_their_own_models_dont_stand() {
+        let mut physics = ground();
+        let mut people = People::default();
+        let own = |entity, template: &str, model| SpawnPoint {
+            template: Some(template.into()),
+            model: Some(model),
+            ..spawn(entity, &format!("{template} 01"), 10.0)
+        };
+        let spawns = [
+            own(1, "Allied Soldier", 0x11),
+            own(2, "GR Defender", 0x12),
+            own(3, "VZ Tank Crew", 0x13),
+        ];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        // Only the Venezuelan's model is asked for: a crewman fights.
+        assert_eq!(people.wanted, [(0x13, "VZ Tank Crew".to_owned())]);
+        people.wanted.clear();
+        people.add_kind(kind("VZ Tank Crew", true));
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let stood: Vec<(Option<u32>, bool, bool)> = people
+            .npcs
+            .iter()
+            .map(|n| (n.spawn, n.soldier, n.held))
+            .collect();
+        assert_eq!(stood, [(Some(3), true, false)]);
+        // A mission's target stands whatever army he is.
+        people.mission_soldiers.insert(1);
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        assert_eq!(people.wanted, [(0x11, "Allied Soldier".to_owned())]);
+    }
+
+    #[test]
+    fn a_story_character_made_a_target_fights() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.kinds.push(kind("Carmona", true));
+        let spawns = [SpawnPoint {
+            template: Some("Carmona".into()),
+            model: Some(0xbf83),
+            ..spawn(7, "Carmona_VzaCon001", 10.0)
+        }];
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        assert!(people.npcs[0].held && !people.npcs[0].soldier);
+        people.mission_soldiers.insert(7);
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        assert_eq!(people.npcs.len(), 1);
+        assert!(people.npcs[0].soldier && !people.npcs[0].held);
+    }
+
+    #[test]
+    fn story_characters_stand_where_the_scripts_put_them() {
+        let mut physics = ground();
+        let carmona = || {
+            let mut people = People::default();
+            people.kinds.push(kind("Carmona", true));
+            people
+        };
+        let spawns = [SpawnPoint {
+            template: Some("Carmona".into()),
+            model: Some(0xbf83),
+            route: vec![Vec3::new(10.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 20.0)],
+            ..spawn(7, "Carmona_VzaCon001", 10.0)
+        }];
+        let to = Vec3::new(30.0, 0.0, 5.0);
+        let flat = |p: Vec3| Vec2::new(p.x, p.z);
+        let mut people = carmona();
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        people.put(7, to);
+        for _ in 0..120 {
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        }
+        let him = &people.npcs[0];
+        assert!(flat(him.character.position).distance(flat(to)) < 0.1);
+        assert!(matches!(him.brain, Brain::Post { .. }), "he stays put");
+        // Put before he stands: he comes there, not to his layer's place.
+        let mut people = carmona();
+        people.put(7, to);
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
+        let him = &people.npcs[0];
+        assert!(flat(him.character.position).distance(flat(to)) < 0.1);
+        assert!(matches!(him.brain, Brain::Post { .. }));
+    }
+
+    /// A rifle as a template's `EquipmentLink`s hand it.
+    fn rifle() -> HandGun {
+        HandGun {
+            template: 0x8000_0456,
+            model: Some(0x98),
+            rate_of_fire: 487.0,
+            clip: 30,
+            reserve_clips: 7,
+            damage: 8.0,
+            damage_key: None,
+        }
+    }
+
     /// A kind of `role`: in a template's own model (`named`), or the
     /// catalogue's.
     fn kind(role: &str, named: bool) -> PersonKind {
@@ -2122,6 +2299,7 @@ pub(crate) mod tests {
             model: None,
             list: Vec::new(),
             ai: None,
+            gun: None,
         }
     }
 
