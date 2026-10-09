@@ -2013,6 +2013,7 @@ mod tests {
                         rounds: 3,
                         gives: vec![(round, 3)],
                         walked: vec![(round, 3)],
+                        heals: 0,
                         cue: None,
                         effect: None,
                     },

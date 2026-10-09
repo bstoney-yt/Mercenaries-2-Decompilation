@@ -2311,7 +2311,7 @@ pub(crate) fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
 
 /// What pickup template `id` is, as [`leaves`] reads it: a weapon taken
 /// up, else ammunition and health (`Health Pickup`: 50, points of her
-/// 100).
+/// 100; `Ammo Pickup (Small)`: 3, beside its rounds).
 pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     let info = templates.leavings.pickups.get(&id)?;
     let model = templates.by_id(id).and_then(|(_, t)| t.model);
@@ -2365,11 +2365,9 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
         // "Grenade Launcher Projectile", not the "GL Projectile" it fires
         // (round 94: taken up empty).
         gives: weapon.map(|w| (w, info.rounds.max(1) * w.clip())),
-        health: if info.kind == m2_engine::pickup::HEALTH {
-            info.rounds as f32
-        } else {
-            0.0
-        },
+        // Every health record's, not only a health pickup's: the small
+        // ammunition box heals 3 as well.
+        health: info.heals as f32,
     })
 }
 
@@ -2427,7 +2425,16 @@ pub(crate) fn refill(
     combat: &combat::Combat,
     what: &Leaves,
 ) -> combat::Refill {
-    let records = templates
+    let records = given(templates, what);
+    combat.refill(records, |weapon, fires, ammo| {
+        takes(templates, weapon, fires, ammo)
+    })
+}
+
+/// The `Pickup` records of `what`'s template that count walking over it:
+/// every one, or a weapon lying there's ammunition records alone.
+fn given<'a>(templates: &'a Templates, what: &Leaves) -> &'a [(u32, u32)] {
+    templates
         .leavings
         .pickups
         .get(&what.template)
@@ -2437,10 +2444,26 @@ pub(crate) fn refill(
             } else {
                 p.gives.as_slice()
             }
-        });
-    combat.refill(records, |weapon, fires, ammo| {
-        takes(templates, weapon, fires, ammo)
-    })
+        })
+}
+
+/// Why pickup `what` gives her nothing now, for the log: the records
+/// [`refill`] reads, each to the weapon of hers that [`takes`] it and that
+/// weapon's room, or to none ([`combat::Combat::refusal`]).
+pub(crate) fn refusal(templates: &Templates, combat: &combat::Combat, what: &Leaves) -> String {
+    let records = given(templates, what);
+    combat.refusal(
+        records,
+        what.health,
+        |weapon, fires, ammo| takes(templates, weapon, fires, ammo),
+        |id| {
+            templates
+                .names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("{id:#x}"))
+        },
+    )
 }
 
 /// Pickup template `id`'s `Pickup` records, for the log: each
@@ -2709,6 +2732,7 @@ mod tests {
                         rounds: 0,
                         gives: vec![(bullet, 8)],
                         walked: vec![(bullet, 8)],
+                        heals: 0,
                         cue: None,
                         effect: None,
                     },
@@ -2745,6 +2769,42 @@ mod tests {
         combat.rifle.ammo = None;
         combat.rifle.model_hash = None;
         assert_eq!(refill(&db, &combat, &gun), combat::Refill::default());
+        // The PC data's `Ammo Pickup (Small)` (8000a286): a record for each
+        // of 18 rounds (the shotgun's first, the rifles' 3 clips) and one
+        // of 3 health. With the rifle back, walked over, its bullets go to
+        // the rifle and it heals; once the rifle is full the log says why
+        // it lies.
+        let (small, shotgun) = (0x8000_a286, 0x8000_56a0);
+        let mut db = db;
+        let records = vec![(shotgun, 3), (bullet, 3)];
+        db.leavings.pickups.insert(
+            small,
+            PickupInfo {
+                kind: 1,
+                radius: 1.0,
+                ammo: Some(shotgun),
+                rounds: 3,
+                gives: records.clone(),
+                walked: records,
+                heals: 3,
+                cue: None,
+                effect: None,
+            },
+        );
+        combat.rifle = combat::Rifle::from_spec(&spec);
+        let small = pickup(&db, small).unwrap();
+        assert_eq!((small.weapon, small.health), (None, 3.0));
+        assert_eq!(refill(&db, &combat, &small).rifle, 90);
+        combat.rifle_rounds.stored = combat.rifle.spare;
+        let why = refusal(&db, &combat, &small);
+        assert!(
+            why.contains("Assault Rifle Bullet 3 to her Assault Rifle, full at 30+240 of 240"),
+            "{why}"
+        );
+        assert!(
+            why.contains("1 of 2 records for no weapon of hers"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -2772,6 +2832,7 @@ mod tests {
             rounds,
             gives: vec![(ammo, rounds)],
             walked: vec![(ammo, rounds)],
+            heals: 0,
             cue: None,
             effect: None,
         };

@@ -1,7 +1,7 @@
 //! The player on foot: Jennifer walking the island under the character
 //! controller, with a third-person camera behind her.
 
-use m2_engine::{Character, Gait, GpuModel, Physics, VehicleSpec};
+use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
 
@@ -38,6 +38,13 @@ const TURN_RATE: f32 = 10.0;
 const LOOK_HEIGHT: f32 = 1.6;
 const CAMERA_DISTANCE: f32 = 4.0;
 const CAMERA_MIN: f32 = 0.6;
+/// How far the eye keeps from what is between it and the point it turns
+/// about, metres: a ball this big is swept out from that point, so the
+/// near plane (0.1 m off, its corners about 0.13 m from the eye at the
+/// 60 degree camera) stays out of walls, pillars and doors a slanting ray
+/// passed beside. The game's camera keeps clear of them too (PC footage);
+/// its own margin isn't in the data (inferred).
+const CAMERA_RADIUS: f32 = 0.25;
 /// How far above the ground under it the chase camera keeps.
 const CAMERA_CLEARANCE: f32 = 0.4;
 /// How the chase camera follows a vehicle.
@@ -642,17 +649,19 @@ impl Player {
         }
     }
 
-    /// Pulls the camera in when something is between it and her, and
-    /// until it is clear of the ground beneath it: a ray from her head
-    /// can graze a slope rising behind her and miss it, which left the eye
-    /// under the bank at sea2, looking up through the ground's back faces.
+    /// Pulls the camera in in front of anything between it and her (a
+    /// ball of [`CAMERA_RADIUS`] swept back from her head, so the view
+    /// doesn't cut into a pillar, a door or a wall at a slant, as a ray
+    /// from her head let it: the owner's second play test), and until it
+    /// is clear of the ground beneath it: a ray from her head can graze a
+    /// slope rising behind her and miss it, which left the eye under the
+    /// bank at sea2, looking up through the ground's back faces.
     fn camera(&mut self, physics: &Physics) {
         let back = -self.camera_forward();
         let head = self.look_at();
-        let mut distance = match physics.cast_ray(head, back, CAMERA_DISTANCE) {
-            Some((d, _)) => (d - 0.2).max(CAMERA_MIN),
-            None => CAMERA_DISTANCE,
-        };
+        let mut distance = physics
+            .cast_sphere(head, back, CAMERA_DISTANCE, CAMERA_RADIUS, None)
+            .map_or(CAMERA_DISTANCE, |d| d.max(CAMERA_MIN));
         // Ground (not a roof or a bridge high over it) from a little above
         // the eye to a little below.
         let below = |eye: Vec3| {
@@ -709,6 +718,20 @@ impl Player {
         // She rides along, so streaming and sound follow the vehicle.
         self.character.position = transform.transform_point3(Vec3::ZERO);
         self.character.velocity = Vec3::ZERO;
+    }
+
+    /// Pulls the chase camera of the vehicle she drives (`vehicle`, which
+    /// it passes through) in in front of what is between it and the point
+    /// it turns about, as on foot ([`CAMERA_RADIUS`]): it went into walls
+    /// and buildings beside the road (the owner's second play test).
+    pub fn keep_chase_clear(&mut self, physics: &Physics, vehicle: Option<VehicleId>) {
+        let Some((at, distance)) = self.chase_target else {
+            return;
+        };
+        let back = -self.camera_forward();
+        if let Some(d) = physics.cast_sphere(at, back, distance, CAMERA_RADIUS, vehicle) {
+            self.chase_target = Some((at, d.max(CAMERA_MIN).min(distance)));
+        }
     }
 
     pub fn eye(&self) -> Vec3 {
@@ -867,6 +890,42 @@ mod tests {
         // The camera is behind her and above.
         let eye = p.eye();
         assert!(eye.x < at.x && eye.y > at.y, "{eye}");
+    }
+
+    // A pillar 2 m behind her, its side 0.1 m off the line from her head
+    // back to the eye: a ray passes it by, the camera's ball doesn't, and
+    // the eye stops in front of it, not inside it.
+    #[test]
+    fn the_camera_stops_in_front_of_a_pillar_beside_its_line() {
+        let mut physics = ground();
+        let pillar = CollisionShape::cuboid(Vec3::new(0.3, 3.0, 0.3));
+        // Camera facing +z: the eye 4 m back along -z, the pillar's side
+        // at x = 0.1.
+        physics.add_static(
+            StaticKey::Cell(2),
+            &pillar,
+            Vec3::new(0.4, 13.0, -2.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        let dt = 1.0 / 60.0;
+        for _ in 0..usize::from(SETTLED) + 1 {
+            p.update(&physics, Intent::default(), dt);
+        }
+        assert!(p.landed);
+        p.pitch = 0.0;
+        p.camera(&physics);
+        let head = p.look_at();
+        assert!(
+            physics
+                .cast_ray(head, Vec3::NEG_Z, CAMERA_DISTANCE)
+                .is_none(),
+            "the ray passes beside it"
+        );
+        let eye = p.eye();
+        assert!(eye.z > -1.7, "in front of it: {eye}");
+        assert!(eye.z < -1.0, "pulled in only to the pillar: {eye}");
     }
 
     #[test]

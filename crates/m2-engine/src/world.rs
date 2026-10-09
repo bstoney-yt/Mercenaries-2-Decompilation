@@ -300,6 +300,11 @@ pub struct Templates {
     pub guns: HashMap<u32, HandGun>,
     /// What each template's `EquipmentLink`s hand it, by id.
     pub equipment: HashMap<u32, Vec<u32>>,
+    /// Each template's `LocalizedName` key, by id: the string table's key
+    /// for the name the game shows (the `Chopper`'s 1177c0fc reads
+    /// "Chopper"; `M151 Softtop (VZ)`'s is `vehicle.m151softtopvz`; PC
+    /// data, 2026-10-09).
+    pub localized: HashMap<u32, u32>,
     /// The game's damage table, if found.
     pub damage: Option<DamageTable>,
     /// Every gun, thrown weapon and vehicle armament ([`crate::weapons`]).
@@ -400,6 +405,21 @@ impl Templates {
             .filter_map(|id| self.names.get(id).cloned())
             .chain(by_model)
             .collect()
+    }
+
+    /// The string table keys of the names the game shows for what
+    /// [`names_for`](Self::names_for) `name` and `model` give, in that
+    /// order: the `LocalizedName`s of those templates that have one.
+    pub fn localized_keys(&self, name: &str, model: u32) -> Vec<u32> {
+        let mut keys = Vec::new();
+        for id in self.names_for(name, model).iter().flat_map(|n| self.ids(n)) {
+            if let Some(&k) = self.localized.get(&id)
+                && !keys.contains(&k)
+            {
+                keys.push(k);
+            }
+        }
+        keys
     }
 
     /// Template `name`'s `Health`, whatever its case: of several so
@@ -643,10 +663,24 @@ impl Templates {
             guns: crate::tuning::hand_guns(&db),
             equipment: crate::tuning::equipment(&db),
             arms: crate::weapons::read(&db),
+            localized: localized_names(&db),
             damage,
         };
         (templates, atmosphere)
     }
+}
+
+/// Each template's `LocalizedName` key (its field `kEy`, a name hash),
+/// by id, where it gives one.
+fn localized_names(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = crate::tuning::Table::new(db, "LocalizedName");
+    let field = name_hash("kEy");
+    t.templates()
+        .filter_map(|id| {
+            let key = t.word(t.of_template(id).first()?, field)?;
+            (key != 0).then_some((id, key))
+        })
+        .collect()
 }
 
 /// The templates whose `Health` is 0 (its first field, an f32).
