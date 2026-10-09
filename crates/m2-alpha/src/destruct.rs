@@ -260,7 +260,17 @@ impl Destruction {
         {
             self.falling.push((i, cause));
         } else {
+            // Drawn as its wreck at once: heard now, as one coming down
+            // would be ([`update`](Self::update)), if it is no building.
             world.destroyed.insert(i);
+            let db = &world.index.template_db;
+            let building = db
+                .durability
+                .get(&o.template)
+                .is_some_and(|d| d.collapse.is_some());
+            if let Some(&k) = db.sound_keys.get(&o.template).filter(|_| !building) {
+                self.heard.push((o.position, k));
+            }
         }
         world.take_static(i);
     }
