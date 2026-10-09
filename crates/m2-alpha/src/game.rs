@@ -754,11 +754,14 @@ impl Game {
             }
             // What lies within her reach: a weapon taken up with the use
             // key; ammunition and health as she walks over them, if they
-            // give her anything (else with the use key, as before).
+            // give her anything (else with the use key, as before). A
+            // weapon lying there whose ammunition records give a weapon of
+            // hers rounds she has room for (a dead soldier's `Assault
+            // Rifle`, to her own rifle) is walked over for them.
             let templates = &world.index.template_db;
             let near = scene.flights.within(player.character.position).map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
-                p.what.weapon.is_none() && self.combat.can_use(refill, p.what.health)
+                self.combat.can_use(refill, p.what.health)
             });
             if player.driving.is_none()
                 && (taking || near == Some(true))
@@ -770,6 +773,7 @@ impl Game {
                     &world.index.template_db,
                     player,
                     p,
+                    !taking,
                 );
             }
         }
@@ -780,8 +784,13 @@ impl Game {
     }
 
     /// The soldiers killed this tick leave what their death script picks,
-    /// and what their template's `SpawnOnDeath`s name that is a pickup (as
-    /// a broken crate's do), where they fell.
+    /// what their template's `SpawnOnDeath`s name that is a pickup (as a
+    /// broken crate's do), and the weapons they carry that are pickups
+    /// themselves, where they fell: the `VZ Soldier`'s `Assault Rifle`
+    /// (8000436f) has its own `Pickup` records (an equipment record of
+    /// radius 1.5, and 8 `Assault Rifle Bullet`) and the ak47's model, so
+    /// the rifle a soldier dropped lies there to be taken (PC data,
+    /// 2026-10-09).
     fn drop_pickups(&mut self) {
         let deaths = self.scene.people.take_deaths();
         let Some(world) = &self.scene.world else {
@@ -806,15 +815,20 @@ impl Game {
                 seated: false,
             };
             // What the template names: its pickups on dying, and the
-            // weapons it carries with their own `Pickup` records (nothing
-            // here drops those; the log tells whether the data could).
+            // weapons it carries, those with their own `Pickup` records
+            // dropped as they are.
             let mut left = template.map_or_else(Vec::new, |t| crate::mission::leaves(templates, t));
             let name_of = |t: u32| templates.by_id(t).map_or("?", |t| t.0);
-            let carries: Vec<String> = id
+            let equipment = id
                 .and_then(|id| templates.equipment.get(&id))
-                .map_or(&[][..], Vec::as_slice)
+                .map_or(&[][..], Vec::as_slice);
+            let carries: Vec<String> = equipment
                 .iter()
                 .map(|&w| format!("{} {}", name_of(w), crate::mission::records(templates, w)))
+                .collect();
+            let guns: Vec<_> = equipment
+                .iter()
+                .filter_map(|&w| crate::mission::pickup(templates, w))
                 .collect();
             eprintln!(
                 "drop: a {} dies at {at:.1}; its template leaves [{}] and carries [{}]",
@@ -825,6 +839,23 @@ impl Game {
                     .join(", "),
                 carries.join(", ")
             );
+            for gun in &guns {
+                eprintln!(
+                    "drop: its {} ({:#x}, model {:x?}) falls with it, a pickup of reach {:.1}: \
+                     taken up with {:?}, walked over for {}",
+                    name_of(gun.template),
+                    gun.template,
+                    gun.model,
+                    gun.reach,
+                    gun.gives,
+                    templates
+                        .leavings
+                        .pickups
+                        .get(&gun.template)
+                        .map_or_else(String::new, |p| format!("{:x?}", p.walked))
+                );
+            }
+            left.extend(guns);
             if let Some(name) =
                 self.drops
                     .on_death(soldier, Some(self.combat.grenades), self.combat.hp)
@@ -1610,16 +1641,18 @@ const LEFT_BESIDE: f32 = 0.6;
 
 /// What she takes from a pickup: a weapon is taken up in the launcher's
 /// place (what she carried there left lying beside her, to be taken
-/// back), ammunition goes with its weapon.
+/// back), ammunition goes with its weapon. One `walked` over (not taken
+/// with the use key) gives only its ammunition, a weapon's too.
 fn take_up(
     combat: &mut Combat,
     flights: &mut crate::flights::Flights,
     templates: &m2_engine::Templates,
     player: &Player,
     p: crate::flights::Pickup,
+    walked: bool,
 ) {
     let rounds = p.what.gives.map_or(0, |(_, n)| n);
-    let Some(weapon) = p.what.weapon else {
+    let Some(weapon) = p.what.weapon.filter(|_| !walked) else {
         let refill = crate::mission::refill(templates, combat, &p.what);
         combat.take_supplies(refill, p.what.health);
         eprintln!(

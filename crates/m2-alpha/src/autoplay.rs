@@ -763,8 +763,10 @@ impl Autoplay {
             if press {
                 self.pressed = 0.0;
             }
+            // A rifle lying there is walked over for its rounds, not taken
+            // up in place of hers ([`wanted`]).
             return Intent {
-                use_pressed: press,
+                use_pressed: press && p.what.weapon != Some(Weapon::Rifle),
                 ..Intent::default()
             };
         }
@@ -1646,12 +1648,14 @@ impl Autoplay {
 /// Whether she wants what lies at `p`: a weapon she doesn't carry (one
 /// she left herself only once what took its place is spent), or
 /// ammunition or health she would take walking over it (its template's
-/// `Pickup` records for the weapons she carries, with room for them).
+/// `Pickup` records for the weapons she carries, with room for them). A
+/// rifle lying there (a dead soldier's `Assault Rifle`) she wants only for
+/// the rounds she would take walking over it: she keeps her own.
 fn wanted(templates: &Templates, combat: &Combat, p: &crate::flights::Pickup) -> bool {
     match p.what.weapon {
         Some(w) if p.from == 0 => combat.second != Some(w) && !combat.second_loaded(),
-        Some(w) => combat.second != Some(w),
-        None => {
+        Some(w) if w != Weapon::Rifle => combat.second != Some(w),
+        _ => {
             let refill = crate::mission::refill(templates, combat, &p.what);
             combat.can_use(refill, p.what.health)
         }
@@ -2008,6 +2012,7 @@ mod tests {
                         ammo: Some(round),
                         rounds: 3,
                         gives: vec![(round, 3)],
+                        walked: vec![(round, 3)],
                         cue: None,
                         effect: None,
                     },
