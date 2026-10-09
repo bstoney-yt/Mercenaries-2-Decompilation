@@ -19,8 +19,9 @@
 //! (`--spawn` picks where to start; the default is the PMC's headquarters,
 //! where free roam begins after the first contract). WASD
 //! runs, Shift sprints, Q held walks, Space jumps. E gets in and out of
-//! the vehicles parked ahead of the spawn (WASD drive, Space brakes, R
-//! rights an overturned one). V switches to a
+//! vehicles: in free roam also those parked ahead of the spawn, with a
+//! mission only those the layers and scripts place (WASD drive, Space
+//! brakes, R rights an overturned one). V switches to a
 //! free-flying camera and back (`--fly` starts flying): WASD/Space/C fly,
 //! Shift speeds up. With `--model` it shows those models on a ground grid
 //! instead, characters playing the game's locomotion clips in place (N
@@ -678,6 +679,8 @@ fn build_scene(
 ) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
     scene.hero = hero;
+    // The catalogue's vehicles are no mission's.
+    scene.park = !mission;
     if double_sided {
         scene.materials.set_double_sided(backend, true)?;
     }

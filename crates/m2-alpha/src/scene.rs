@@ -499,6 +499,11 @@ pub struct Scene {
     people_rig: Option<Rig>,
     /// Drivable vehicles near the spawn.
     pub vehicles: Vec<ParkedVehicle>,
+    /// Whether up to [`PARKED`] of the catalogue's vehicles are parked by
+    /// her as she starts: not the game's, so not with a mission (the
+    /// plain launch's included), where only those the layers and scripts
+    /// place stand.
+    pub park: bool,
     /// The people the layers place.
     pub people: People,
     pub arsenal: Arsenal,
@@ -638,9 +643,9 @@ pub enum Loaded {
 }
 
 /// Finds the island's vehicle and person models and decodes the soldiers'
-/// role models ([`ARMY`]) and up to [`PARKED`] vehicles, on a thread (the
-/// search reads the whole archive).
-fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
+/// role models ([`ARMY`]) and, when `park`, up to [`PARKED`] vehicles, on
+/// a thread (the search reads the whole archive).
+fn load_cast(install: Install, hand: Vec<u32>, park: bool) -> Receiver<Loaded> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -746,6 +751,12 @@ fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
                 drivable.len(),
                 started.elapsed().as_secs_f32()
             );
+            if !park {
+                eprintln!(
+                    "vehicles: none of the catalogue's parked (a mission: only those the layers and scripts place)"
+                );
+                return Ok(());
+            }
             let rank = |e: &CatalogueEntry| {
                 DRIVABLE
                     .iter()
@@ -812,6 +823,7 @@ impl Scene {
             hero: Hero::default(),
             people_rig: None,
             vehicles: Vec::new(),
+            park: true,
             people: People::default(),
             arsenal: Arsenal::default(),
             explosives: Vec::new(),
@@ -980,7 +992,7 @@ impl Scene {
             .as_ref()
             .map(|w| w.index.template_db.arms.hand_models())
             .unwrap_or_default();
-        self.vehicle_loads = Some(load_cast(install.clone(), hand));
+        self.vehicle_loads = Some(load_cast(install.clone(), hand, self.park));
         self.install = Some(install.clone());
         Ok(())
     }
