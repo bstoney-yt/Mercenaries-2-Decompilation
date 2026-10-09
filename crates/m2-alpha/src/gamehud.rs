@@ -2579,6 +2579,27 @@ impl Thread {
         // again should they change): before any text this frame is set.
         if self.told.key_names.as_ref() != Some(&s.key_names) {
             self.told.key_names = Some(s.key_names.clone());
+            // The words the fonts have no picture matched for, as their
+            // keys, and what the PC must look at to match them.
+            let keyed: Vec<String> = s
+                .key_names
+                .iter()
+                .filter(|(w, _)| gui_runtime::button_glyph(w).is_none())
+                .map(|(w, k)| format!("[{w}] as [{k}]"))
+                .collect();
+            if !keyed.is_empty() {
+                eprintln!(
+                    "hud text: no button picture matched for {}: on the PC, which of \
+                     english_18's button page (pc\\common_18_buttons) glyphs {} (or past \
+                     U+E013) is each",
+                    keyed.join(", "),
+                    gui_runtime::UNMATCHED_GLYPHS
+                        .iter()
+                        .map(|c| format!("U+{:04X}", u32::from(*c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             if let Some(screen) = gui_runtime::screen(lua) {
                 screen
                     .borrow_mut()
