@@ -19,8 +19,9 @@
 //! (`--spawn` picks where to start; the default is the PMC's headquarters,
 //! where free roam begins after the first contract). WASD
 //! runs, Shift sprints, Q held walks, Space jumps. E gets in and out of
-//! the vehicles parked ahead of the spawn (WASD drive, Space brakes, R
-//! rights an overturned one). V switches to a
+//! vehicles: in free roam also those parked ahead of the spawn, with a
+//! mission only those the layers and scripts place (WASD drive, Space
+//! brakes, R rights an overturned one). V switches to a
 //! free-flying camera and back (`--fly` starts flying): WASD/Space/C fly,
 //! Shift speeds up. With `--model` it shows those models on a ground grid
 //! instead, characters playing the game's locomotion clips in place (N
@@ -678,6 +679,8 @@ fn build_scene(
 ) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
     scene.hero = hero;
+    // The catalogue's vehicles are no mission's.
+    scene.park = !mission;
     if double_sided {
         scene.materials.set_double_sided(backend, true)?;
     }
@@ -960,10 +963,11 @@ fn screenshot(
     eprintln!("props: {}", game.scene.props.counts());
     let people = &game.scene.people;
     eprintln!(
-        "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",
+        "people: {} kinds, {} about ({} soldiers, {} story characters, {} patrolling, {} landed) after {:.1} s",
         people.kinds.len(),
         people.npcs.len(),
-        people.npcs.iter().filter(|n| n.spawn.is_some()).count(),
+        people.npcs.iter().filter(|n| n.soldier).count(),
+        people.npcs.iter().filter(|n| n.held).count(),
         people.npcs.iter().filter(|n| n.patrolling()).count(),
         people.npcs.iter().filter(|n| n.landed).count(),
         started.elapsed().as_secs_f32()
@@ -991,30 +995,28 @@ fn screenshot(
                 .join(", ")
         );
         for (d, s) in near.iter().take(options.list_spawns) {
-            let kind = s
-                .template
-                .as_deref()
-                .and_then(|t| people.kind_for(t))
-                .or_else(|| people.kind_for(&s.name));
             eprintln!(
-                "  spawn {:08x} {:?} {d:.0} m at {:.0}, template {:?}, layer {} ({}), {} route points, {}{}",
+                "  spawn {:08x} {:?} {d:.0} m at {:.0}, template {:?}, layer {} ({}), {} route points, {}{}{}",
                 s.entity,
                 s.name,
                 s.position,
                 s.template,
-                s.layer.map_or("static".to_owned(), |l| format!("{l:08x}")),
+                match (s.layer, s.static_layer) {
+                    (Some(l), true) => format!("static {l:08x}"),
+                    (Some(l), false) => format!("{l:08x}"),
+                    (None, _) => "none".to_owned(),
+                },
                 if people.layer_in(s.layer) {
                     "in"
                 } else {
                     "out"
                 },
                 s.route.len(),
-                if kind.is_some() {
-                    "a soldier"
-                } else if people.mission_soldiers.contains(&s.entity) {
-                    "a mission soldier"
+                people.stands_as(s),
+                if people.mission_soldiers.contains(&s.entity) {
+                    ", a mission's target"
                 } else {
-                    "nobody"
+                    ""
                 },
                 if people.npcs.iter().any(|n| n.spawn == Some(s.entity)) {
                     ", standing"
@@ -2799,7 +2801,7 @@ fn look_at_story_character(game: &mut Game) {
     let Some((name, chest)) = people
         .npcs
         .iter()
-        .filter(|n| people.kinds.get(n.kind).is_some_and(|k| k.named))
+        .filter(|n| n.held)
         .map(|n| (people.kinds[n.kind].role.clone(), n.chest()))
         .filter(|(_, c)| c.distance(here) < 40.0)
         .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))

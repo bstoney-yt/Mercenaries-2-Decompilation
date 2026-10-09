@@ -424,14 +424,18 @@ impl Templates {
     /// `Bullpup Rifle`, Mattias's `Assault Rifle`, Chris's `Carbine`; the
     /// RPG fires rockets), with its template's name.
     pub fn own_rifle(&self, name: &str) -> Option<(&str, HandGun)> {
-        self.ids(name).iter().find_map(|id| {
-            let gun = self
-                .equipment
-                .get(id)?
-                .iter()
-                .find_map(|t| self.guns.get(t))?;
-            Some((self.names.get(&gun.template)?.as_str(), *gun))
-        })
+        self.ids(name).iter().find_map(|&id| self.rifle_of(id))
+    }
+
+    /// The rifle template id `id`'s `EquipmentLink`s hand it, as
+    /// [`own_rifle`](Self::own_rifle) finds it by name.
+    pub fn rifle_of(&self, id: u32) -> Option<(&str, HandGun)> {
+        let gun = self
+            .equipment
+            .get(&id)?
+            .iter()
+            .find_map(|t| self.guns.get(t))?;
+        Some((self.names.get(&gun.template)?.as_str(), *gun))
     }
 
     /// The gun template `name` (`Carbine`), whatever its case.
@@ -726,8 +730,12 @@ pub struct TrafficPoint {
     pub name: String,
     pub position: Vec3,
     pub rotation: Quat,
-    /// The state layer it is in, by name hash; `None` for a static one.
+    /// The layer it is in, by name hash: a state layer, or one of the
+    /// static sub-layers `layers_static` holds (`vz_mar_village`), which
+    /// the game loads by name too. `None`: no layer known (it stands).
     pub layer: Option<u32>,
+    /// Its layer is one of `layers_static`'s, not a mission's state layer.
+    pub static_layer: bool,
     pub spawner: crate::population::Spawner,
     /// What it spawns: template names that drive, with their weights.
     pub vehicles: Vec<(String, f32)>,
@@ -753,10 +761,14 @@ pub struct SpawnPoint {
     /// The patrol route its `AiPatrol` names, world space; empty for a
     /// post.
     pub route: Vec<Vec3>,
-    /// The state layer placing it, by name hash (`vz_state_vzacon001_cp02`):
-    /// in the game it is there only while that layer is in. `None` for
-    /// the static layers.
+    /// The layer placing it, by name hash: a state layer
+    /// (`vz_state_vzacon001_cp02`) or one of the static sub-layers
+    /// `layers_static` holds (`vz_mar_village`), which the start-up
+    /// scripts load by name too. In the game it is there only while that
+    /// layer is in. `None`: no layer known (it stands).
     pub layer: Option<u32>,
+    /// Its layer is one of `layers_static`'s, not a mission's state layer.
+    pub static_layer: bool,
     /// The model of its template, when that is a person's (`Carmona`'s).
     pub model: Option<u32>,
     /// For a spawner of people (`PathSpawner_GurHQ_Peds`): whom its list
@@ -765,6 +777,9 @@ pub struct SpawnPoint {
     /// How its template fights, with the entity's own `AiBehavior`
     /// switches when it has them; `None` when the template has no `Ai`.
     pub ai: Option<AiProfile>,
+    /// The rifle its template's `EquipmentLink`s hand it
+    /// ([`Templates::rifle_of`]); `None` when they hand it none.
+    pub gun: Option<HandGun>,
 }
 
 /// Where everything on the island is.
@@ -1250,10 +1265,12 @@ impl WorldIndex {
                 position: Vec3::from(p.position),
                 rotation: rotation(p.rotation),
                 route: Vec::new(),
-                layer: (!is_static).then_some(layer_hash),
+                layer: Some(layer_hash),
+                static_layer: is_static,
                 model: template.and_then(|(_, t)| t.model.filter(|_| t.human)),
                 list: people_of(id, p),
                 ai,
+                gun: templates.rifle_of(p.parent).map(|(_, g)| g),
             }
         };
         for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
@@ -1356,7 +1373,8 @@ impl WorldIndex {
                 name: member_stem(names.get(&entity).copied().unwrap_or("")).to_owned(),
                 position: Vec3::from(p.position),
                 rotation: rotation(p.rotation),
-                layer: (!is_static).then_some(layer_hash),
+                layer: Some(layer_hash),
+                static_layer: is_static,
                 spawner,
                 vehicles,
                 route: Vec::new(),
