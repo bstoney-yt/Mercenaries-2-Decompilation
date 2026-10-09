@@ -2234,6 +2234,44 @@ impl Physics {
             .map(|(_, hit)| (hit.time_of_impact, vec3(hit.normal)))
     }
 
+    /// How far a ball of `radius` metres goes from `origin` along
+    /// `direction` before it touches something solid, within `max`
+    /// metres, passing through vehicle `skip`: how near a camera may come
+    /// to a wall, a pillar or a door before its near plane cuts into it,
+    /// which a thin ray misses at a slant. What the ball starts touching
+    /// and moves away from doesn't stop it.
+    pub fn cast_sphere(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+        radius: f32,
+        skip: Option<VehicleId>,
+    ) -> Option<f32> {
+        let mut filter = solid();
+        if let Some(v) = skip
+            .and_then(|v| self.vehicles.get(v.0))
+            .and_then(Option::as_ref)
+        {
+            filter = filter.exclude_rigid_body(v.controller.chassis);
+        }
+        let ball = r::Ball::new(radius.max(1e-3));
+        let options = rapier3d::parry::query::ShapeCastOptions {
+            max_time_of_impact: max,
+            stop_at_penetration: false,
+            ..Default::default()
+        };
+        self.world
+            .cast_shape(
+                &pose(origin, Quat::IDENTITY),
+                vector(direction.normalize_or_zero()),
+                &ball,
+                options,
+                filter,
+            )
+            .map(|(_, hit)| hit.time_of_impact)
+    }
+
     /// The first solid thing along a ray, passing through vehicle `skip`:
     /// its distance, and the vehicle it is if one (what a round hits).
     pub fn cast_ray_vehicle(

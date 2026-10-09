@@ -565,6 +565,7 @@ impl Game {
                     Some((at, v, id)) => {
                         let speed = physics.vehicle_speed(id);
                         player.chase(at, ChaseRig::of(&v.spec), intent.look, speed, dt);
+                        player.keep_chase_clear(physics, Some(id));
                     }
                     None => {
                         player.driving = None;
