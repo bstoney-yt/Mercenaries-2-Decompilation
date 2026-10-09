@@ -220,9 +220,10 @@ struct Seat {
     clip: u32,
     /// The seat, model space: her clip's origin goes there.
     at: Vec3,
-    /// She can be seen there: not inside, under a hatch. A guess from
-    /// where the seat is ([`find_seat`]); the hijack scripts' showing or
-    /// hiding her goes over it ([`Hijacks::scripts_shown`]).
+    /// She can be seen there: not inside, under a hatch. The vehicle's
+    /// entrance being a `DriverHatch` says so ([`find_seat`]); the hijack
+    /// scripts' showing or hiding her goes over it
+    /// ([`Hijacks::scripts_shown`]).
     shown: bool,
 }
 
@@ -759,7 +760,8 @@ impl Hijacks {
             p.off_foot();
         }
         // Inside, under a hatch, she isn't seen: as the hijack scripts
-        // left her, else as the seat's guess has it.
+        // left her, else as the vehicle's entrance has it (a DriverHatch:
+        // inside).
         let shown = |s: &Seat| self.scripts_shown.get(&key).copied().unwrap_or(s.shown);
         let seated = self.seats[&key].filter(shown).and_then(|seat| {
             let index = bind(game, seat.clip)?;
@@ -1154,7 +1156,8 @@ fn dress(
 /// those with its model and an animation set), that template's
 /// `seat_driver` (else first) `SeatLink` and the hardpoint it names, else
 /// the model's driver's seat marker; and whether she is seen there
-/// ([`Seat::shown`]). `None` (she is not drawn) without a template with
+/// ([`Seat::shown`]: not when the vehicle's entrance is a `DriverHatch`).
+/// `None` (she is not drawn) without a template with
 /// an animation set, a seated clip or a place for the seat. Each says
 /// why in the log.
 fn find_seat(
@@ -1166,20 +1169,22 @@ fn find_seat(
     let scene = &mut game.scene;
     let v = scene.vehicles.get(i)?;
     let (model, marker) = (v.spec.model, v.spec.seat);
-    let (hull, turret) = (v.spec.hull, v.spec.turret_box);
     let label = v.spec.label.to_ascii_lowercase();
     let db = &scene.world.as_ref()?.index.template_db;
     // Its own template when its label names one (`M151 Softtop (GR)`),
     // else one with seats before one without (`M151 (Base)` has none).
-    let mut names: Vec<String> = db
+    let of_model: Vec<(String, u32)> = db
         .infos
         .iter()
         .filter(|(_, info)| info.model == Some(model))
-        .filter_map(|(id, _)| Some(db.names.get(id)?.to_ascii_lowercase()))
-        .filter(|name| clips.sets.contains_key(name))
+        .filter_map(|(&id, _)| Some((db.names.get(&id)?.to_ascii_lowercase(), id)))
         .collect();
-    names.sort_by_key(|n| (*n != label, !clips.seats.contains_key(n), n.clone()));
-    let Some(name) = names.first() else {
+    let mut names: Vec<&(String, u32)> = of_model
+        .iter()
+        .filter(|(name, _)| clips.sets.contains_key(name))
+        .collect();
+    names.sort_by_key(|(n, id)| (*n != label, !clips.seats.contains_key(n), n.clone(), *id));
+    let Some((name, id)) = names.first().map(|e| (&e.0, e.1)) else {
         eprintln!("seat: {label}: no template of its model has a VehicleAnimationSet: not drawn");
         return None;
     };
@@ -1239,24 +1244,33 @@ fn find_seat(
         eprintln!("seat: {name}: no hardpoint or seat marker for the seat: not drawn");
         return None;
     };
-    // A fallback (inferred) until the data's own word is found (the
-    // SeatLink records above; the hijack scripts hiding her, which
-    // [`Hijacks::seat`] takes over this): a seat on a turret, above the
-    // top of the hull, is under its hatch: whoever sits there is inside,
-    // out of sight. The AMX30's seat_driver hardpoint is on its turret,
-    // 2.0 m up (Brendan's playtest drew her standing on it the whole
-    // drive), and a tank's driver is expected hidden in the hull (the
-    // hijack thread's notes).
-    let hatch = turret.is_some() && at.y > hull.1.y;
+    // The data's rule (the hijack scripts hiding her, which
+    // [`Hijacks::seat`] takes, go over it): a driver got in through a
+    // `DriverHatch` entrance is inside, out of sight. The PC footage of
+    // the AMX30 shows her on top only while climbing in, hidden while
+    // driving. Its own template's entrances, else those of another
+    // template of its model.
+    let hatch_point = m2_assets::name_hash("DriverHatch");
+    let entrances = db
+        .entrance_points
+        .get(&id)
+        .map(|p| (name.as_str(), p))
+        .or_else(|| {
+            of_model
+                .iter()
+                .find_map(|(n, t)| Some((n.as_str(), db.entrance_points.get(t)?)))
+        });
+    let hatch = entrances.is_some_and(|(_, p)| p.contains(&hatch_point));
     eprintln!(
-        "seat: {name}: seat {:.2} m up, hull top {:.2} m{}: {} (inferred fallback)",
-        at.y,
-        hull.1.y,
-        if turret.is_some() { ", turreted" } else { "" },
+        "seat: {name}: entrances {}: {}",
+        entrances.map_or_else(
+            || "none".to_owned(),
+            |(of, p)| format!("{p:08x?} (of {of})")
+        ),
         if hatch {
-            "under a hatch, she is not drawn"
+            "a DriverHatch: inside, she is not drawn while seated"
         } else {
-            "she is drawn there"
+            "no DriverHatch: she is drawn there"
         }
     );
     Some(Seat {

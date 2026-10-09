@@ -82,6 +82,34 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, Vec<HijackEntrance>> {
     out
 }
 
+/// Every template's entrances' points, by template id, as name hashes:
+/// each `EntranceLink`'s entrance's `EntranceParameters` point
+/// (`DriverHatch`, `front_left`), else the link's own `Hardpoint`;
+/// whether or not a script hijacks through it (unlike [`read`]). A seat
+/// got into through `DriverHatch` (the AMX30's, the M1A2's) is inside:
+/// the PC footage of the AMX30 shows her on top only while climbing in,
+/// not while driving.
+pub fn entrance_points(db: &Layer<'_>) -> HashMap<u32, Vec<u32>> {
+    let links = Table::new(db, "EntranceLink");
+    let params = Table::new(db, "EntranceParameters");
+    let hardpoint = name_hash("Hardpoint");
+    let mut out: HashMap<u32, Vec<u32>> = HashMap::new();
+    for vehicle in links.templates() {
+        for r in links.of_template(vehicle) {
+            let point = links
+                .word(r, LINK)
+                .and_then(|e| params.of_template(e).first())
+                .and_then(|p| params.word(p, POINT))
+                .filter(|&p| p != 0)
+                .or_else(|| links.word(r, hardpoint).filter(|&h| h != 0));
+            if let Some(p) = point {
+                out.entry(vehicle).or_default().push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Every template's `VehicleAnimationSet`: the class and name (`Tank`,
 /// `M1A2`, as name hashes) the animation tables pick a vehicle's
 /// characters' clips by ([`m2_assets::animation_table::vehicle_clip`]).
