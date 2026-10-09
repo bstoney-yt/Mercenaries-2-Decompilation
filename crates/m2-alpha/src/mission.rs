@@ -568,24 +568,29 @@ impl MissionLink {
         // A crate she broke open is destroyed for the scripts too (what
         // it held, it leaves of itself: no script spawns it).
         for (g, at) in scene.flights.take_broken() {
+            let none = Templates::default();
+            let templates = scene.world.as_ref().map_or(&none, |w| &w.index.template_db);
             let left: Vec<String> = scene
                 .flights
                 .pickups()
                 .iter()
                 .filter(|p| p.from == g)
                 .map(|p| {
+                    // A weapon comes with its rounds; ammunition gives by
+                    // its records, to what she carries when she comes.
+                    let giving = match p.what.gives {
+                        Some((w, n)) => format!("{n} rounds for her {w:?}"),
+                        None => format!(
+                            "{} (for her now {:?})",
+                            records(templates, p.what.template),
+                            refill(templates, &game.combat, &p.what)
+                        ),
+                    };
                     format!(
-                        "{} ({:#x}), model {}, giving {}",
-                        scene
-                            .world
-                            .as_ref()
-                            .and_then(|w| w.index.template_db.by_id(p.what.template))
-                            .map_or("?", |t| t.0),
+                        "{} ({:#x}), model {}, giving {giving}",
+                        templates.by_id(p.what.template).map_or("?", |t| t.0),
                         p.what.template,
                         p.what.model.map_or("none".into(), |m| format!("{m:08x}")),
-                        p.what.gives.map_or("her nothing".into(), |(w, n)| format!(
-                            "{n} rounds for her {w:?}"
-                        )),
                     )
                 })
                 .collect();
