@@ -1,9 +1,11 @@
 //! The island's traffic, as its layers place it: each vehicle spawner
-//! ([`TrafficPoint`]) in a layer that is in spawns a vehicle from its list
-//! while the player is within its `ActiveRadius`, again `SecondsPerCycle`
-//! after the last one is wrecked. A vehicle with a patrol path drives it at
-//! its `Haste`; one without stands where its spawner is (the roadblocks'
-//! gun trucks). The player can take any of them over.
+//! ([`TrafficPoint`]) in a layer that is in (a state layer, or a static
+//! sub-layer the game loaded: `layers_static` holds many, and the game
+//! loads only some) spawns a vehicle from its list while the player is
+//! within its `ActiveRadius`, again `SecondsPerCycle` after the last one
+//! is wrecked. A vehicle with a patrol path drives it at its `Haste`; one
+//! without stands where its spawner is (the roadblocks' gun trucks). The
+//! player can take any of them over.
 //!
 //! What `Haste` scales is not known: it is taken as the part of the
 //! template's top speed to drive at.
@@ -91,8 +93,8 @@ impl Traffic {
         (x >> 8) as f32 / (1u32 << 24) as f32
     }
 
-    /// Spawns what is due near `focus`; `layer_in` says whether a state
-    /// layer is in.
+    /// Spawns what is due near `focus`; `layer_in` says whether a layer
+    /// (a state layer, or a static sub-layer) is in.
     pub fn spawn(
         &mut self,
         scene: &Scene,
@@ -350,7 +352,11 @@ impl Traffic {
                 t.position.x,
                 t.position.y,
                 t.position.z,
-                t.layer.map_or("static".to_owned(), |l| format!("{l:08x}")),
+                match (t.layer, t.static_layer) {
+                    (Some(l), true) => format!("static {l:08x}"),
+                    (Some(l), false) => format!("{l:08x}"),
+                    (None, _) => "none".to_owned(),
+                },
                 t.spawner.reach(),
                 t.spawner.seconds_per_cycle,
                 t.route.len(),
@@ -443,6 +449,7 @@ mod tests {
             position: Vec3::new(40.0, 20.0, 0.0),
             rotation: m2_math::glam::Quat::IDENTITY,
             layer: None,
+            static_layer: false,
             spawner: m2_engine::population::Spawner {
                 list: 0,
                 seconds_per_cycle: 10.0,
