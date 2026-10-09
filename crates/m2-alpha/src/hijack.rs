@@ -174,6 +174,8 @@ struct Active {
     /// from her first clip, and that clip, played unlifted on the ground.
     lift: Option<f32>,
     first: Option<usize>,
+    /// Whether the scripts last showed or hid her (`SetVisible`).
+    shown: Option<bool>,
 }
 
 /// What the HUD shows of a hijack.
@@ -203,6 +205,10 @@ pub struct Hijacks {
     /// Each vehicle's driver's seat, once looked up, by its model and
     /// label (its template's name, which picks the seat).
     seats: HashMap<(u32, String), Option<Seat>>,
+    /// Whether the hijack scripts left her seen or hidden in a vehicle
+    /// (by the same key as [`Hijacks::seats`]), over the seat's own guess
+    /// ([`Seat::shown`]).
+    scripts_shown: HashMap<(u32, String), bool>,
     /// Vehicles (index, model) whose parts are set as their templates say.
     dressed: std::collections::HashSet<(usize, u32)>,
 }
@@ -214,7 +220,9 @@ struct Seat {
     clip: u32,
     /// The seat, model space: her clip's origin goes there.
     at: Vec3,
-    /// She can be seen there: not inside, under a hatch.
+    /// She can be seen there: not inside, under a hatch. A guess from
+    /// where the seat is ([`find_seat`]); the hijack scripts' showing or
+    /// hiding her goes over it ([`Hijacks::scripts_shown`]).
     shown: bool,
 }
 
@@ -245,6 +253,7 @@ impl Hijacks {
             points: HashMap::new(),
             near: None,
             seats: HashMap::new(),
+            scripts_shown: HashMap::new(),
             dressed: Default::default(),
             active: None,
         }
@@ -370,7 +379,14 @@ impl Hijacks {
                 eprintln!("hijack: {line}");
             }
             let commands = l.mission.take_commands();
-            if !follow(&mut self.active, &l.clips, &mut l.mission, commands, game) {
+            if !follow(
+                &mut self.active,
+                &mut self.scripts_shown,
+                &l.clips,
+                &mut l.mission,
+                commands,
+                game,
+            ) {
                 self.active = None;
                 game.input_locked = false;
                 return;
@@ -515,6 +531,7 @@ impl Hijacks {
                 vehicle_clip: None,
                 lift: None,
                 first: None,
+                shown: None,
                 vehicle: c.vehicle,
                 hero,
                 set: l.clips.sets.get(&c.template.to_ascii_lowercase()).copied(),
@@ -550,7 +567,14 @@ impl Hijacks {
             eprintln!("hijack: {line}");
         }
         let commands = m.take_commands();
-        if !follow(&mut self.active, &l.clips, m, commands, game) {
+        if !follow(
+            &mut self.active,
+            &mut self.scripts_shown,
+            &l.clips,
+            m,
+            commands,
+            game,
+        ) {
             self.active = None;
             game.input_locked = false;
         }
@@ -728,8 +752,10 @@ impl Hijacks {
         if let Some(p) = &mut game.scene.player {
             p.off_foot();
         }
-        // Inside, under a hatch, she isn't seen.
-        let seated = self.seats[&key].filter(|s| s.shown).and_then(|seat| {
+        // Inside, under a hatch, she isn't seen: as the hijack scripts
+        // left her, else as the seat's guess has it.
+        let shown = |s: &Seat| self.scripts_shown.get(&key).copied().unwrap_or(s.shown);
+        let seated = self.seats[&key].filter(shown).and_then(|seat| {
             let index = bind(game, seat.clip)?;
             let scene = &mut game.scene;
             let world = scene.world.as_ref()?;
@@ -818,6 +844,7 @@ impl Hijacks {
 /// False once the hijack is over.
 fn follow(
     active: &mut Option<Active>,
+    scripts_shown: &mut HashMap<(u32, String), bool>,
     clips: &ClipTimes,
     mission: &mut Mission,
     commands: Vec<Command>,
@@ -890,6 +917,17 @@ fn follow(
                 if let Some(p) = &mut game.scene.player {
                     p.down = false;
                 }
+                // Seen in the seat or not as the scripts left her (gone in
+                // through the hatch, hidden).
+                if let (Some(on), Some(v)) = (a.shown, game.scene.vehicles.get(a.vehicle)) {
+                    let key = (v.spec.model, v.spec.label.to_ascii_lowercase());
+                    eprintln!(
+                        "seat: {}: the hijack scripts left her {}: so she is in its seat (over the seat's guess)",
+                        key.1,
+                        if on { "shown" } else { "hidden" }
+                    );
+                    scripts_shown.insert(key, on);
+                }
                 // The driver is out (the scripts remove or kill him).
                 if let Some(v) = game.scene.vehicles.get_mut(a.vehicle) {
                     v.crew
@@ -901,13 +939,14 @@ fn follow(
                 }
                 over = true;
             }
-            // Not acted on yet: whether the scripts hide her (gone in
-            // through the hatch) tells which seats she is seen in.
+            // Whether the scripts hide her (gone in through the hatch)
+            // tells whether she is seen in the seat (taken when done).
             HijackCommand::Visible { guid, on } if guid == a.hero => {
                 eprintln!(
                     "hijack: the scripts {} her",
                     if on { "show" } else { "hide" }
                 );
+                a.shown = Some(on);
             }
             HijackCommand::AbortDone { hero } if hero == a.hero => {
                 eprintln!("hijack: failed");
@@ -1136,13 +1175,34 @@ fn find_seat(
         .and_then(|l| l.1)
         .and_then(|h| point(points, scene.source.as_mut(), model, h));
     eprintln!("seat: {name} link {link:x?} hardpoint {hardpoint:?} marker {marker:?}");
+    // Every SeatLink record of the template whole: which field (if any)
+    // says the seat is enclosed is not known yet.
+    for (k, row) in clips
+        .seat_fields
+        .get(name.as_str())
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let cells: Vec<String> = row
+            .iter()
+            .map(|&(field, word)| match clips.seat_templates.get(&word) {
+                Some(t) => format!("{field:08x}={word:08x} ({t})"),
+                None => format!("{field:08x}={word:08x}"),
+            })
+            .collect();
+        eprintln!("seat: {name}: SeatLink {k}: {}", cells.join(", "));
+    }
     // The tables' clip for the seat, and the row of the vehicle table
     // that gives it (the vehicle's own, its class's, or one for any).
+    // The seat's own row first; one the seat-less query finds when that
+    // gives no clip (a seat's row whose Animation is any).
     let Some(((clip, row), vehicles)) = clips.tables.as_ref().and_then(|(actions, vehicles)| {
         let seat = link.map(|l| l.0);
-        let found =
-            animation_table::seat_clip_row(actions, vehicles, "InVehicle", "Idle", set, seat)?;
-        Some((found, vehicles))
+        let row = |seat| {
+            animation_table::seat_clip_row(actions, vehicles, "InVehicle", "Idle", set, seat)
+        };
+        Some((row(seat).or_else(|| row(None))?, vehicles))
     }) else {
         eprintln!("seat: {name}: the tables give its seat no InVehicle Idle clip: not drawn");
         return None;
@@ -1163,14 +1223,17 @@ fn find_seat(
         eprintln!("seat: {name}: no hardpoint or seat marker for the seat: not drawn");
         return None;
     };
-    // Inferred: a seat on a turret, above the top of the hull, is under
-    // its hatch: whoever sits there is inside, out of sight. The AMX30's
-    // seat_driver hardpoint is on its turret, 2.0 m up (Brendan's
-    // playtest drew her standing on it the whole drive), and a tank's
-    // driver is expected hidden in the hull (the hijack thread's notes).
+    // A fallback (inferred) until the data's own word is found (the
+    // SeatLink records above; the hijack scripts hiding her, which
+    // [`Hijacks::seat`] takes over this): a seat on a turret, above the
+    // top of the hull, is under its hatch: whoever sits there is inside,
+    // out of sight. The AMX30's seat_driver hardpoint is on its turret,
+    // 2.0 m up (Brendan's playtest drew her standing on it the whole
+    // drive), and a tank's driver is expected hidden in the hull (the
+    // hijack thread's notes).
     let hatch = turret.is_some() && at.y > hull.1.y;
     eprintln!(
-        "seat: {name}: seat {:.2} m up, hull top {:.2} m{}: {}",
+        "seat: {name}: seat {:.2} m up, hull top {:.2} m{}: {} (inferred fallback)",
         at.y,
         hull.1.y,
         if turret.is_some() { ", turreted" } else { "" },

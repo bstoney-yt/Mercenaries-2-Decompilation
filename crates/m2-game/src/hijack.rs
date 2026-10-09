@@ -716,6 +716,12 @@ pub struct ClipTimes {
     /// Seats (name hash, hardpoint name hash) by template name, lower
     /// case ([`m2_engine::hijack::seat_links`]).
     pub seats: HashMap<String, Vec<(u32, Option<u32>)>>,
+    /// Each `SeatLink` record whole (field name hash, word) by template
+    /// name, lower case ([`m2_engine::hijack::seat_link_fields`]), and
+    /// the names of the templates their words name (the seats' own
+    /// templates, `Vehicle Seat (Tank Default) (Driver)`): for the log.
+    pub seat_fields: HashMap<String, Vec<Vec<(u32, u32)>>>,
+    pub seat_templates: HashMap<u32, String>,
     /// Parts' starting states (part node name hash, state) by template
     /// name, lower case ([`m2_engine::hijack::part_states`]).
     pub parts: HashMap<String, Vec<(u32, u32)>>,
@@ -780,12 +786,24 @@ impl ClipTimes {
                     let sets = m2_engine::hijack::animation_sets(&db);
                     let mut seats = m2_engine::hijack::seat_links(&db);
                     let mut parts = m2_engine::hijack::part_states(&db);
-                    for (id, name) in db.names() {
+                    let mut fields = m2_engine::hijack::seat_link_fields(&db);
+                    let names = db.names();
+                    for row in fields.values().flatten() {
+                        for (_, word) in row {
+                            if let Some(n) = names.get(word) {
+                                out.seat_templates.insert(*word, (*n).to_owned());
+                            }
+                        }
+                    }
+                    for (id, name) in names {
                         if let Some(&s) = sets.get(&id) {
                             out.sets.insert(name.to_ascii_lowercase(), s);
                         }
                         if let Some(s) = seats.remove(&id) {
                             out.seats.insert(name.to_ascii_lowercase(), s);
+                        }
+                        if let Some(f) = fields.remove(&id) {
+                            out.seat_fields.insert(name.to_ascii_lowercase(), f);
                         }
                         if let Some(p) = parts.remove(&id) {
                             out.parts.insert(name.to_ascii_lowercase(), p);

@@ -277,6 +277,13 @@ impl<'a> Table<'a> {
         self.records.keys().copied()
     }
 
+    /// The fields' name hashes, in order.
+    pub(crate) fn fields(&self) -> Vec<u32> {
+        let mut f: Vec<u32> = self.fields.keys().copied().collect();
+        f.sort_unstable();
+        f
+    }
+
     /// Template `id`'s records (a component may be on it more than once).
     pub(crate) fn of_template(&self, id: u32) -> &[&'a [u8]] {
         self.records.get(&id).map_or(&[], Vec::as_slice)
