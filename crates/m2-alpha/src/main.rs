@@ -724,10 +724,19 @@ fn give_guns(game: &mut Game, guns: &[String]) {
 /// What the HUD shows: the game's, with the mission's objectives and the
 /// view their markers are placed with.
 /// The game's own HUD, on the island with the game's files (unless
-/// `--old-hud`).
-fn game_hud(install: Option<&Install>, mode: &Mode, old: bool) -> Option<gamehud::GameHud> {
+/// `--old-hud`), its scripts' player the hero `game` plays.
+fn game_hud(
+    install: Option<&Install>,
+    mode: &Mode,
+    old: bool,
+    game: &Game,
+) -> Option<gamehud::GameHud> {
     match (install, mode) {
-        (Some(install), Mode::Island(_)) if !old => Some(gamehud::GameHud::start(install)),
+        (Some(install), Mode::Island(_)) if !old => Some(gamehud::GameHud::start(
+            install,
+            game.scene.hero,
+            game.combat.max_hp,
+        )),
         _ => None,
     }
 }
@@ -1223,7 +1232,7 @@ fn screenshot(
     // started and run two seconds, for its boxes to have opened and the
     // gun box to have switched; half of one for hits, whose arcs fade).
     let mut hud = ui::Hud::new();
-    hud.game = game_hud(install, mode, options.old_hud);
+    hud.game = game_hud(install, mode, options.old_hud, &game);
     let mut settings = config.clone();
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
@@ -2181,7 +2190,10 @@ fn front_end_offscreen(
             up_at = Some(t);
         }
         if let Some(who) = shell.take_new_game() {
-            eprintln!("front end: a new game as {who} ({})", shell::hero(&who));
+            eprintln!(
+                "front end: a new game as {who} ({})",
+                shell::hero(&who).map_or("no hero", Hero::name)
+            );
             picture = true;
         }
         if picture {
@@ -2426,7 +2438,7 @@ fn mission_for_screenshot(
         if contract_done.is_some() {
             let (hud, settings) = late_hud.get_or_insert_with(|| {
                 let mut hud = ui::Hud::new();
-                hud.game = game_hud(Some(install), &Mode::Island(None), false);
+                hud.game = game_hud(Some(install), &Mode::Island(None), false, game);
                 hud.wait = true;
                 if let Some(g) = &mut hud.game {
                     g.log_to(&out.with_file_name(format!("{stem}-late-hud.log")));
@@ -2833,7 +2845,7 @@ fn hijack_for_screenshot(
     let started = Instant::now();
     // The game's HUD, for the buttons the scripts put up.
     let mut hud = ui::Hud::new();
-    hud.game = game_hud(Some(install), &Mode::Island(None), options.old_hud);
+    hud.game = game_hud(Some(install), &Mode::Island(None), options.old_hud, game);
     hud.wait = true;
     if let (Some(g), Some(out)) = (&mut hud.game, &options.screenshot) {
         g.log_to(&out.with_file_name(format!(
@@ -4410,7 +4422,7 @@ impl App {
         }
         let focused = window.has_focus();
         let mut hud = ui::Hud::new();
-        hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud);
+        hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud, &game);
         let egui = egui_winit::State::new(
             hud.ctx.clone(),
             egui::ViewportId::ROOT,
@@ -4570,11 +4582,8 @@ impl Running {
                 self.close_menu();
             }
             Some(ui::MenuAction::Hero(hero)) => {
-                // The body, clips, health and voice change now; the
-                // scripts take the new name on the next start.
                 eprintln!("hero: playing as {hero}");
-                self.game.set_hero(&mut self.backend, hero);
-                self.audio.hero = hero;
+                self.set_hero(hero);
             }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
             None => {}
@@ -4613,6 +4622,22 @@ impl Running {
         self.set_mouse_look(true);
     }
 
+    /// Plays as `hero` from now on: the body, clips, health and voice, and
+    /// the scripts' player (the mission's and the hijacks'; the HUD's hears
+    /// with its next state). What the scripts already chose by the old
+    /// hero stays theirs.
+    fn set_hero(&mut self, hero: Hero) {
+        self.game.set_hero(&mut self.backend, hero);
+        self.audio.hero = hero;
+        let max = self.game.combat.max_hp;
+        if let Some(m) = &mut self.mission {
+            m.set_hero(hero, max);
+        }
+        if let Some(h) = &mut self.hijacks {
+            h.set_hero(hero, max);
+        }
+    }
+
     fn save_game(&mut self) {
         let path = save::SaveGame::default_path();
         match self.game.save() {
@@ -4634,20 +4659,23 @@ impl Running {
         }
     }
 
-    fn tick(&mut self, config: &Config, _event_loop: &ActiveEventLoop) {
+    fn tick(&mut self, config: &mut Config, _event_loop: &ActiveEventLoop) {
         if let Some(flow) = &mut self.flow {
             if let Ok(mut mixer) = self.audio.out.mixer.lock() {
                 flow.tick(self.mission.as_mut(), &mut mixer);
             }
-            // The hero picked in the front end, before the scripts start.
-            if let Some(hero) = flow.take_pick()
-                && hero != self.game.scene.hero
-            {
-                eprintln!("hero: playing as {hero}");
-                self.game.set_hero(&mut self.backend, hero);
-                self.audio.hero = hero;
+            // The hero picked in the front end, before the scripts start;
+            // the pause menu offers them as the settings' hero.
+            let picked = flow.take_pick();
+            let holds = flow.holds();
+            if let Some(hero) = picked {
+                config.hero = hero;
+                if hero != self.game.scene.hero {
+                    eprintln!("hero: playing as {hero}");
+                    self.set_hero(hero);
+                }
             }
-            if flow.holds() {
+            if holds {
                 // The world waits under the movie or the front end.
                 self.input.clear();
                 let (ear, facing) = self.game.listener();

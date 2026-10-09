@@ -46,6 +46,7 @@ use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::gamehud::{HudCall, Plain, RadarRegion};
+use crate::hero::Hero;
 use crate::scene::NOT_DRIVABLE;
 use crate::support::{self, FALLBACK_AFTER, Impact, Kind};
 
@@ -832,6 +833,7 @@ impl MissionLink {
                     Command::Loadout { who, weapons } if *who == PLAYER => {
                         eprintln!("mission: her loadout is now {weapons:?}");
                         game.combat.carbine_only();
+                        game.combat.scripted_loadout = true;
                     }
                     Command::Reserve {
                         who,
@@ -839,6 +841,7 @@ impl MissionLink {
                         rounds,
                     } if *who == PLAYER => {
                         eprintln!("mission: scripts give her {weapon} {rounds} in reserve");
+                        game.combat.scripted_loadout = true;
                         if weapon.eq_ignore_ascii_case(GRENADE) {
                             game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
                         } else if weapon.eq_ignore_ascii_case("C4") {
@@ -885,7 +888,7 @@ impl MissionLink {
             .map_or([0.0; 3], |p| p.character.position.to_array());
         match Mission::new(data, game.scene.hero.name(), at) {
             Ok(mut mission) => {
-                mission.set_max_health(PLAYER, game.combat.max_hp);
+                set_hero(&mut mission, game.scene.hero, game.combat.max_hp, "mission");
                 mission.fly_deliveries();
                 if let Err(e) = mission.run(RADAR_REGIONS, "radar regions") {
                     self.write([format!("radar regions: {e}")]);
@@ -954,6 +957,17 @@ impl MissionLink {
     pub fn line_length(&mut self, id: u32, seconds: f32) {
         if let State::Running(m) = &mut self.state {
             m.line_length(id, f64::from(seconds));
+        }
+    }
+
+    /// She is `hero` from now on, whole at `max` health: the running
+    /// scripts' player takes their name, labels and health (see
+    /// [`set_hero`]). Scripts still loading start as whoever she is then.
+    pub fn set_hero(&mut self, hero: Hero, max: f32) {
+        if let State::Running(m) = &mut self.state {
+            set_hero(m, hero, max, "mission");
+            let lines = m.take_log();
+            self.write(lines);
         }
     }
 
@@ -1247,6 +1261,18 @@ impl MissionLink {
             disguise: w.disguise,
         }
     }
+}
+
+/// Makes the player of `mission` (the mission's scripts, the hijack
+/// scripts' or the HUD's) `hero`, whole at `max` health: their name, the
+/// labels their template has in the data, and their health
+/// ([`Mission::set_hero`]). Says so on stderr after `who`.
+pub fn set_hero(mission: &mut Mission, hero: Hero, max: f32, who: &str) {
+    let labels = mission.set_hero(hero.name(), hero.template(), max);
+    eprintln!(
+        "{who}: the scripts' player is {hero}, {max} health, {labels} labels from template {}",
+        hero.template()
+    );
 }
 
 /// The calls [`HUD_CALLS`] keeps, oldest first.
