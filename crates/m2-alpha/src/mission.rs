@@ -34,8 +34,11 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use m2_assets::{WadArchive, name_hash};
 use m2_engine::vehicle::DRIVABLE;
 use m2_engine::world::member_stem;
-use m2_engine::{CatalogueEntry, Install, TemplateInfo, Templates, VehicleKind};
-use m2_game::api::Command;
+use m2_engine::{
+    CatalogueEntry, Install, Physics, StaticKey, TemplateInfo, Templates, VehicleKind,
+};
+use m2_game::api::{Camera, Command, VISIBLE_RANGE};
+use m2_game::events::World as _;
 use m2_game::hud::ObjectiveMessage;
 use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
@@ -404,6 +407,9 @@ pub struct MissionLink {
     marked: HashMap<u32, Vec3>,
     /// The markers logged, by handle.
     markers_logged: HashSet<u32>,
+    /// Whether each object `ObjectIsVisible` events wait for was on
+    /// screen at the last look, for the log.
+    sighted: HashMap<u32, bool>,
 }
 
 /// The scripts' vehicles in play.
@@ -498,6 +504,7 @@ impl MissionLink {
             ashore_for: 0.0,
             marked: HashMap::new(),
             markers_logged: HashSet::new(),
+            sighted: HashMap::new(),
         }
     }
 
@@ -836,6 +843,7 @@ impl MissionLink {
             mission.set_player_reserve("C4", game.combat.charges);
             let spare = game.combat.rifle_rounds.stored;
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
+            look(game, mission, &mut self.sighted);
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -1539,6 +1547,117 @@ impl Fleet {
     }
 }
 
+/// A ray from the camera that stops this far short of an object (metres)
+/// still reaches it: what it hits there is the object itself or stands
+/// right by it (a tank's hull, the wall it is parked against).
+const SIGHT_PAD: f32 = 4.0;
+/// How high above its place an object is looked at (metres): about a
+/// vehicle's middle (inferred).
+const SIGHT_HEIGHT: f32 = 1.5;
+/// A ray from the camera passes through at most this many vehicles and
+/// people (her own body first): they don't hide what is behind them.
+const SIGHT_SKIPS: usize = 8;
+
+/// Tells the scripts where her camera is and how wide it sees, and which
+/// of the objects their `ObjectIsVisible` events wait for stand behind
+/// something solid from it: the island's ground and buildings, the state
+/// layers' models (vehicles and people don't hide what is behind them).
+/// Logs each as it comes on screen or leaves it.
+fn look(game: &Game, mission: &mut Mission, sighted: &mut HashMap<u32, bool>) {
+    let (eye, forward) = game.listener();
+    let (fov, aspect) = game.lens;
+    let camera = Camera {
+        eye: eye.to_array(),
+        forward: forward.to_array(),
+        fov_y: fov.to_radians(),
+        aspect,
+        range: VISIBLE_RANGE,
+    };
+    mission.set_camera(camera);
+    let watched = mission.sight_watched();
+    sighted.retain(|g, _| watched.contains(g));
+    if watched.is_empty() {
+        return;
+    }
+    // Looked at: a prop's middle, else a little above its place.
+    let targets: Vec<(u32, Vec3, String)> = {
+        let w = mission.world().borrow();
+        watched
+            .iter()
+            .filter_map(|&g| {
+                let Some(o) = w.objects.get(&g) else {
+                    if sighted.insert(g, false).is_none() {
+                        eprintln!(
+                            "mission: ObjectIsVisible waits for {g:#x}, not in play (its layer \
+                             isn't loaded): never on screen"
+                        );
+                    }
+                    return None;
+                };
+                let at = game
+                    .scene
+                    .props
+                    .centre(g)
+                    .unwrap_or(Vec3::from(o.position) + Vec3::Y * SIGHT_HEIGHT);
+                Some((g, at, o.name.clone()))
+            })
+            .collect()
+    };
+    let mut unseen = HashSet::new();
+    let mut viewed = Vec::new();
+    for (g, at, name) in targets {
+        let in_view = camera.sees(at.to_array());
+        let behind = in_view
+            && game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|world| behind_something(&world.physics, eye, at, g));
+        if behind {
+            unseen.insert(g);
+        }
+        viewed.push((g, name, at, in_view, behind));
+    }
+    mission.set_unseen(unseen);
+    let w = mission.world().borrow();
+    for (g, name, at, in_view, behind) in viewed {
+        let seen = w.is_visible(g) == Some(true);
+        if sighted.insert(g, seen) != Some(seen) {
+            eprintln!(
+                "mission: {name} ({g:#x}) at {at:.1} {} for the scripts (in view {in_view}, \
+                 behind something {behind}, {:.0} m from the camera)",
+                if seen { "on screen" } else { "not on screen" },
+                at.distance(eye)
+            );
+        }
+    }
+}
+
+/// Whether something solid stands between `eye` and `at`, short of
+/// [`SIGHT_PAD`]: the island's or a state layer's model other than
+/// `target`'s own, passing through vehicles and people.
+fn behind_something(physics: &Physics, eye: Vec3, at: Vec3, target: u32) -> bool {
+    let way = at - eye;
+    let reach = way.length() - SIGHT_PAD;
+    let dir = way.normalize_or_zero();
+    let (mut from, mut gone) = (eye, 0.0);
+    for _ in 0..SIGHT_SKIPS {
+        if reach - gone <= 0.0 {
+            return false;
+        }
+        match physics.cast_ray_keyed(from, dir, reach - gone) {
+            None => return false,
+            Some((_, _, Some(StaticKey::Entity(e)))) if e == target => return false,
+            Some((_, _, Some(_))) => return true,
+            Some((t, _, None)) => {
+                from += dir * (t + 0.1);
+                gone += t + 0.1;
+            }
+        }
+    }
+    false
+}
+
 /// Seconds the scripts keep a vehicle a helicopter let go at its drop
 /// point (where they moved it) while it falls the last few metres and
 /// settles, so they see it delivered there.
@@ -2038,6 +2157,31 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                 && is_spawn(world, *guid)
             {
                 scene.people.script_kill(&mut world.physics, *guid, false);
+            }
+            return false;
+        }
+        // A gate or door opened (PmcCon001's villa doors): its model is
+        // taken down with its collision, so she walks through (inferred:
+        // the door's own opening animation isn't played).
+        Command::OpenGate(guid) => {
+            let name = mission
+                .world()
+                .borrow()
+                .objects
+                .get(guid)
+                .map_or_else(|| "?".to_owned(), |o| o.name.clone());
+            let scene = &mut game.scene;
+            match (&mut scene.world, scene.props.get(*guid)) {
+                (Some(world), Some(_)) => {
+                    scene.props.hide(&mut world.physics, [*guid]);
+                    eprintln!(
+                        "mission: Object.OpenGate {name} ({guid:#x}): opened, its model and \
+                         collision taken down (inferred: no opening animation)"
+                    );
+                }
+                _ => eprintln!(
+                    "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
+                ),
             }
             return false;
         }
