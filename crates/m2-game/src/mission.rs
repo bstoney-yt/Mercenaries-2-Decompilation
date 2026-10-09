@@ -1113,8 +1113,8 @@ impl Mission {
 
     /// Makes the player `hero` from now on (named as [`Mission::new`]
     /// takes it), whose template is `template` (`mattias`, `Jen`, `Chris`),
-    /// whole at `max` health ([`set_max_health`](Self::set_max_health)):
-    /// the scripts find her by the new name, tell her apart by the new
+    /// whole at `max` health (as the game makes her, hurt or not): the
+    /// scripts find her by the new name, tell her apart by the new
     /// hero's label, and see her template's labels as the data gives them
     /// (none if it has none for `template`). What they already chose by
     /// the old hero (lines cued, a contract's movies) stays as it was.
@@ -1133,10 +1133,11 @@ impl Mission {
                 p.labels.retain(|l| !l.eq_ignore_ascii_case(&old));
                 p.labels.push(hero.to_ascii_lowercase());
                 p.label_hashes = labels;
+                p.max_health = max;
+                p.health = max;
             }
             n
         };
-        self.set_max_health(PLAYER, max);
         self.log.push(format!(
             "  t={:.1} the player is {hero} (template {template}, {labels} labels), {max} health",
             self.now
@@ -1686,6 +1687,12 @@ mod tests {
             m.take_commands(),
             [say(1, "A"), say(2, "C"), Command::Hush(2)]
         );
+        // The call as the scripts made it, for the log.
+        assert!(
+            m.take_log()
+                .iter()
+                .any(|l| l == r#"  print VO.Cancel(0, "C"): speaker None, stops lines [2]"#)
+        );
         m.tick(0.1);
         m.line_length(1, 1.0);
         m.tick(0.5);
@@ -1760,6 +1767,8 @@ mod tests {
         };
         let mut m = Mission::new(data, "Mattias", [0.0; 3]).unwrap();
         m.set_max_health(PLAYER, 120.0);
+        // Hurt: the new hero is whole all the same.
+        m.set_health(PLAYER, 60.0);
         m.run(
             r#"
             local me = Player.GetCharacter(1)
