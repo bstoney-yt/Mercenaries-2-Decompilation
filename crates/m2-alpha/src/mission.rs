@@ -897,7 +897,11 @@ impl MissionLink {
                     // Her weapons, as the contract's scripts hand them out:
                     // fresh ones come with nothing in reserve.
                     Command::Loadout { who, weapons } if *who == PLAYER => {
-                        eprintln!("mission: her loadout is now {weapons:?}");
+                        eprintln!(
+                            "mission: her loadout is now {weapons:?}; her grenades, C4 and mines \
+                             start at 0 until the scripts give them a reserve (the explosives \
+                             box shows 0 till then)"
+                        );
                         game.combat.carbine_only();
                         game.combat.scripted_loadout = true;
                     }
