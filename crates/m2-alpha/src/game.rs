@@ -1048,9 +1048,7 @@ impl Game {
             v.damage = 0.0;
         }
         let p = &save.player;
-        player.character.position = Vec3::from(p.position);
-        player.character.velocity = Vec3::ZERO;
-        player.landed = false;
+        player.drop_at(Vec3::from(p.position));
         player.driving = None;
         player.chase_target = None;
         player.down = false;
@@ -2085,12 +2083,11 @@ pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player)
         v.id.and_then(|id| physics.vehicle_transform(id))
             .filter(|at| at.is_finite())
     {
-        let out = door_out(at, &v.spec);
-        player.character.position = Vec3::new(out.x, 0.0, out.z);
-        player.character.velocity = Vec3::ZERO;
+        // At the hull's height: onto the ground by the door, not onto a
+        // boulder or roof over it.
+        player.drop_at(door_out(at, &v.spec));
         let f = at.transform_vector3(Vec3::Z);
         player.facing = f.x.atan2(f.z);
-        player.landed = false;
     }
     player.driving = None;
     player.chase_target = None;

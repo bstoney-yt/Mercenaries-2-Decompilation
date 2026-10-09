@@ -112,6 +112,13 @@ impl ChaseRig {
 /// collision can arrive a few frames after the ground under it.
 const SETTLED: u8 = 3;
 
+/// Put down at a height ([`Player::drop_at`]), she lands on what is under
+/// a point this far above it, found within this far down: the floor or
+/// ground there rather than a roof or deck over it (inferred, as
+/// [`crate::npc`] lands people at their posts).
+const LAND_ABOVE: f32 = 2.0;
+const LAND_REACH: f32 = 60.0;
+
 /// What the player asks for this tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Intent {
@@ -225,6 +232,10 @@ pub struct Player {
     aim_lift: f32,
     /// False until there is ground under the spawn point to land on.
     pub landed: bool,
+    /// The spot she was put down at ([`Player::drop_at`]), to land near
+    /// while she is still over it; otherwise (a spawn's x and z alone, or
+    /// moved since) she lands on the top of whatever is under her.
+    land_from: Option<Vec3>,
     /// Set each tick the world around her is still streaming in: she does
     /// not land until it has been quiet for [`SETTLED`] ticks, so that she
     /// lands on the buildings and not inside one that loads a moment later.
@@ -269,6 +280,7 @@ impl Player {
             aim_lift: 0.0,
             look_still: 0.0,
             landed: false,
+            land_from: None,
             streaming: false,
             settled: 0,
             model,
@@ -341,6 +353,17 @@ impl Player {
         Some(hit)
     }
 
+    /// Puts her at `at` (getting out of a vehicle, moved by the scripts),
+    /// to land on what is under it once the world there has loaded: the
+    /// floor or ground nearest under the spot, not the top of whatever
+    /// stands over it.
+    pub fn drop_at(&mut self, at: Vec3) {
+        self.character.position = at;
+        self.character.velocity = Vec3::ZERO;
+        self.landed = false;
+        self.land_from = Some(at);
+    }
+
     /// One fixed tick of `dt` seconds.
     pub fn update(&mut self, physics: &Physics, intent: Intent, dt: f32) {
         self.yaw += intent.look.x;
@@ -348,19 +371,35 @@ impl Player {
 
         if !self.landed {
             // Wait for the ground and whatever stands on it, then stand on
-            // the top of that.
+            // what is under the spot she was put at, else on the top of
+            // whatever is there.
             self.settled = if self.streaming {
                 0
             } else {
                 self.settled.saturating_add(1)
             };
             let p = self.character.position;
+            let near = |at: Vec3| {
+                let from = at + Vec3::Y * LAND_ABOVE;
+                physics
+                    .cast_ray(from, -Vec3::Y, LAND_REACH)
+                    .map(|(d, _)| from.y - d)
+            };
+            let top = || {
+                physics
+                    .cast_ray(Vec3::new(p.x, 3000.0, p.z), -Vec3::Y, 6000.0)
+                    .map(|(d, _)| 3000.0 - d)
+            };
             if self.settled >= SETTLED
-                && let Some((d, _)) =
-                    physics.cast_ray(Vec3::new(p.x, 3000.0, p.z), -Vec3::Y, 6000.0)
+                && let Some(y) = self
+                    .land_from
+                    .filter(|at| at.x == p.x && at.z == p.z)
+                    .and_then(near)
+                    .or_else(top)
             {
-                self.character.position.y = 3000.0 - d + 0.05;
+                self.character.position.y = y + 0.05;
                 self.landed = true;
+                self.land_from = None;
                 self.settled = 0;
             }
             self.camera(physics);
@@ -789,6 +828,48 @@ mod tests {
         // The camera is behind her and above.
         let eye = p.eye();
         assert!(eye.x < at.x && eye.y > at.y, "{eye}");
+    }
+
+    #[test]
+    fn put_down_she_lands_under_the_spot_not_on_the_roof_over_it() {
+        // The ground at 10 m, a roof over it at 20 m.
+        let mut physics = ground();
+        let h = 5.0;
+        let v = [
+            Vec3::new(-h, 0.0, -h),
+            Vec3::new(h, 0.0, -h),
+            Vec3::new(h, 0.0, h),
+            Vec3::new(-h, 0.0, h),
+        ];
+        let roof = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        physics.add_static(
+            StaticKey::Cell(2),
+            &roof,
+            Vec3::new(0.0, 20.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let dt = 1.0 / 60.0;
+        let land = |p: &mut Player| {
+            for _ in 0..usize::from(SETTLED) {
+                p.update(&physics, Intent::default(), dt);
+            }
+            assert!(p.landed);
+            p.character.position.y
+        };
+        // A spawn's x and z alone: the top of what is there.
+        let mut p = Player::new(1.0, 1.0, 0.0, None);
+        assert!((land(&mut p) - 20.0).abs() < 0.2);
+        // Put down at the ground's height: the ground under the roof.
+        p.drop_at(Vec3::new(1.0, 10.5, 1.0));
+        assert!((land(&mut p) - 10.0).abs() < 0.2);
+        // Nothing near under the spot: the top again.
+        p.drop_at(Vec3::new(1.0, 200.0, 1.0));
+        assert!((land(&mut p) - 20.0).abs() < 0.2);
+        // Moved since she was put down: where she is now decides.
+        p.drop_at(Vec3::new(1.0, 10.5, 1.0));
+        p.character.position = Vec3::new(30.0, 0.0, 30.0);
+        assert!((land(&mut p) - 10.0).abs() < 0.2);
     }
 
     #[test]
