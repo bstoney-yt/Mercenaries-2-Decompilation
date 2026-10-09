@@ -122,6 +122,9 @@ struct Options {
     gait: Option<Gait>,
     double_sided: bool,
     fly: bool,
+    /// The developer's keys in the whole game's launch too (`--dev`): the
+    /// free camera, quick save and load, culling, the gait cycle.
+    dev: bool,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -346,6 +349,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--fullscreen" => o.fullscreen = true,
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
+            "--dev" => o.dev = true,
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -490,7 +494,7 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 7] = [
+    const PLAIN: [&str; 8] = [
         "--install",
         "--config",
         "--size",
@@ -623,6 +627,9 @@ fn main() -> anyhow::Result<()> {
         mode,
         double_sided: options.double_sided,
         fly: options.fly,
+        // The whole game plays as it launches, without the developer's
+        // keys, unless asked for; the test launches keep them.
+        dev: options.dev || options.fly || !options.alpha,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
         old_hud: options.old_hud,
@@ -4350,6 +4357,8 @@ struct Running {
     /// The GUI's named buttons pressed since the last frame (Enter is
     /// `"selection"`), for the game HUD's scripts.
     buttons: Vec<String>,
+    /// The developer's keys work ([`App::dev`]).
+    dev: bool,
 }
 
 struct App {
@@ -4360,6 +4369,13 @@ struct App {
     double_sided: bool,
     /// Start flying rather than on foot.
     fly: bool,
+    /// The developer's keys work: the free camera, quick save and load,
+    /// back-face culling, the gait cycle. Off in the whole game's launch
+    /// (`--alpha`, or no options) unless `--dev` asks: there the free
+    /// camera would leave her body wherever the scripts lose track of
+    /// it, and a quick load puts the world back without the scripts'
+    /// state.
+    dev: bool,
     /// Run the mission scripts.
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
@@ -4411,6 +4427,11 @@ impl App {
         let focused = window.has_focus();
         let mut hud = ui::Hud::new();
         hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud);
+        eprintln!(
+            "keys: the developer's (V free camera, F5/F9 quick save and load, F3 culling, \
+             N gait) {}",
+            if self.dev { "on" } else { "off (--dev)" }
+        );
         let egui = egui_winit::State::new(
             hud.ctx.clone(),
             egui::ViewportId::ROOT,
@@ -4468,6 +4489,7 @@ impl App {
                 _ => None,
             },
             buttons: Vec::new(),
+            dev: self.dev,
         })
     }
 
@@ -4676,19 +4698,25 @@ impl Running {
             self.window
                 .set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
         }
-        if self.input.take_pressed(Action::QuickSave) {
+        // The developer's keys are taken either way, and do nothing
+        // without `--dev` in the whole game's launch.
+        let dev = self.dev;
+        if !dev {
+            self.input.take_pressed(Action::ToggleFly);
+        }
+        if self.input.take_pressed(Action::QuickSave) && dev {
             self.save_game();
         }
-        if self.input.take_pressed(Action::QuickLoad) {
+        if self.input.take_pressed(Action::QuickLoad) && dev {
             self.load_game();
         }
         if self.input.take_pressed(Action::ToggleMusic) {
             self.audio.toggle_music();
         }
-        if self.input.take_pressed(Action::NextGait) {
+        if self.input.take_pressed(Action::NextGait) && dev {
             self.game.scene.cycle_gaits();
         }
-        if self.input.take_pressed(Action::ToggleCulling) {
+        if self.input.take_pressed(Action::ToggleCulling) && dev {
             self.culling = !self.culling;
             if let Err(e) = self
                 .game
