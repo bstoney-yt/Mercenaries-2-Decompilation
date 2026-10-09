@@ -131,6 +131,9 @@ pub struct MissionView {
     pub game_message: Option<ObjectiveMessage>,
     /// The contract was just completed (for [`BANNER_TIME`] seconds).
     pub contract_complete: bool,
+    /// The contract is completed and its fanfare waits for Enter to
+    /// close it ([`MissionLink::waiting_fanfare`]).
+    pub fanfare_waiting: bool,
     /// The regions the scripts have on the radar (see [`RADAR_REGIONS`]).
     pub radar_regions: Vec<RadarRegion>,
     /// The scripts' latest calls to the HUD's interface (see [`HUD_CALLS`]).
@@ -257,6 +260,8 @@ for group, names in pairs(methods) do
                 local callback = type(t) == "table" and type(t.fCallback) == "function"
                 if callback then
                     __m2_hud_callbacks[__m2_hud_call_count] = t
+                    -- The contract's fanfare, which the flow waits on.
+                    if group == "Fanfare" then __m2_fanfare = __m2_hud_call_count end
                 end
                 table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
                     group = group, method = name, data = copy(t, 0),
@@ -1181,6 +1186,16 @@ impl MissionLink {
         self.completed.is_some()
     }
 
+    /// The newest of the scripts' fanfare calls (`Hud.Fanfare`) whose
+    /// callback is still to be called: the contract's, which the flow
+    /// waits on until the fanfare's Enter closes it.
+    pub fn waiting_fanfare(&self) -> Option<u64> {
+        match &self.state {
+            State::Running(m) => waiting_fanfare(m.lua()),
+            _ => None,
+        }
+    }
+
     /// What the HUD shows.
     pub fn view(&self) -> MissionView {
         let recent = self.message.as_ref().filter(|m| m.2 < MESSAGE_TIME);
@@ -1239,6 +1254,7 @@ impl MissionLink {
             message,
             game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
+            fanfare_waiting: self.completed.is_some() && waiting_fanfare(mission.lua()).is_some(),
             radar_regions: radar_regions(mission.lua()),
             hud_calls: hud_calls(mission.lua()),
             pda_objectives: hud.mission.clone(),
@@ -1265,6 +1281,15 @@ fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
             callback: t.get("callback").unwrap_or(false),
         })
         .collect()
+}
+
+/// The fanfare call [`HUD_CALLS`] kept last with a callback, while that
+/// callback has not been called.
+fn waiting_fanfare(lua: &mlua::Lua) -> Option<u64> {
+    let g = lua.globals();
+    let seq = g.get::<Option<u64>>("__m2_fanfare").ok().flatten()?;
+    let callbacks = g.get::<mlua::Table>("__m2_hud_callbacks").ok()?;
+    callbacks.contains_key(seq).ok()?.then_some(seq)
 }
 
 /// What [`TRESPASS`] keeps.
@@ -2198,6 +2223,30 @@ mod tests {
         assert!(item.contains(&(Plain::Text("nValue".into()), Plain::Number(5.0))));
         // The call still reaches what was there.
         assert_eq!(lua.globals().get::<i64>("got").unwrap(), 1);
+    }
+
+    #[test]
+    fn the_contract_fanfare_waits_until_called_back() {
+        let lua = mlua::Lua::new();
+        lua.load("Hud = { Fanfare = {}, SubtitleBuffer = {} }")
+            .exec()
+            .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        assert_eq!(waiting_fanfare(&lua), None);
+        lua.load(
+            r#"
+            Hud.Fanfare:Create({ sType = "contract", fCallback = function() end })
+            Hud.Fanfare:Commence({})
+            Hud.SubtitleBuffer:AddMessage({ fCallback = function() end })
+            "#,
+        )
+        .exec()
+        .unwrap();
+        // The fanfare's, not the subtitle's after it.
+        assert_eq!(waiting_fanfare(&lua), Some(1));
+        // Called back (as `MissionLink::hud_callback` does): no longer.
+        lua.load("__m2_hud_callbacks[1] = nil").exec().unwrap();
+        assert_eq!(waiting_fanfare(&lua), None);
     }
 
     #[test]

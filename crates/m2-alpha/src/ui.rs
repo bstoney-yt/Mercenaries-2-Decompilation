@@ -1146,8 +1146,9 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     if let Some(line) = m.tutorial.as_ref().filter(|_| message) {
         tutorial(painter, screen, line);
     }
-    // The game's HUD has its own fanfare (`Hud.Fanfare`).
-    if m.contract_complete && message {
+    // The game's HUD has its own fanfare (`Hud.Fanfare`). Ours stays up
+    // while the fanfare waits for Enter, as the game's does.
+    if (m.contract_complete || m.fanfare_waiting) && message {
         text(
             screen.center() + vec2(0.0, -60.0),
             Align2::CENTER_CENTER,
@@ -1155,6 +1156,15 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             40.0,
             gold,
         );
+        if m.fanfare_waiting {
+            text(
+                screen.center() + vec2(0.0, -20.0),
+                Align2::CENTER_CENTER,
+                "Enter to continue",
+                18.0,
+                white,
+            );
+        }
     }
     if let Some((done, line)) = m.message.as_ref().filter(|_| message) {
         let head = if *done {
