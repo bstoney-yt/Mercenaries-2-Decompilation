@@ -819,10 +819,7 @@ fn fit(w: &mut WeaponModel, rig: &Rig) {
 fn grip(rig: &Rig, muzzle: Vec3) -> Option<(Mat4, usize)> {
     let skeleton = &rig.skeleton;
     let (rear, front) = rig.aim_hands()?;
-    let aim = rig
-        .clips
-        .iter()
-        .find(|c| c.hash == crate::npc::FightClips::AIM)?;
+    let aim = aim_clip(rig)?;
     let pose = aim.sample(skeleton, aim.info.duration * 0.5);
     let nodes = skeleton.model_matrices(&pose);
     let pr = nodes[rear].transform_point3(Vec3::ZERO);
@@ -833,17 +830,25 @@ fn grip(rig: &Rig, muzzle: Vec3) -> Option<(Mat4, usize)> {
     ))
 }
 
+/// The clip `rig` aims with: the hero's own ([`Rig::aim_clip`]), else
+/// the aim clip by name, unless that is only another hero's.
+fn aim_clip(rig: &Rig) -> Option<&m2_engine::BoundClip> {
+    match rig.aim_clip {
+        Some(i) => rig.clips.get(i),
+        None => rig
+            .clips
+            .iter()
+            .find(|c| c.hash == crate::npc::FightClips::AIM && !rig.foreign.contains(&c.hash)),
+    }
+}
+
 /// Of a human skeleton's hands, (rear, front) in the aim clip: the
 /// trigger hand and the one under the barrel. Without the clip, right
 /// then left.
 pub fn aim_hands(rig: &Rig) -> Option<(usize, usize)> {
     let skeleton = &rig.skeleton;
     let (rh, lh) = hands(skeleton)?;
-    let Some(aim) = rig
-        .clips
-        .iter()
-        .find(|c| c.hash == crate::npc::FightClips::AIM)
-    else {
+    let Some(aim) = aim_clip(rig) else {
         return Some((rh, lh));
     };
     let forward = rig
@@ -2171,7 +2176,7 @@ impl Combat {
             self.down = DOWN_TIME;
             f.player.down = true;
             f.player.aiming = false;
-            if let (Some(die), Some((_, rig))) = (f.people.clips.die, &mut f.player.model) {
+            if let (Some(die), Some((_, rig))) = (f.player.clips.die, &mut f.player.model) {
                 rig.animator.set_upper(None);
                 rig.two_handed = false;
                 rig.animator.play_once(die);

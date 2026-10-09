@@ -86,6 +86,10 @@ pub struct Rig {
     /// A hero's: the name hashes of the clips only in the other heroes'
     /// own groups, which this hero never plays.
     pub foreign: Arc<HashSet<u32>>,
+    /// A hero's: the clip the hero aims with ([`Rig::set_aim_clip`]),
+    /// which the weapons' grip and the aim's hands are read from. `None`:
+    /// the aim clip by name.
+    pub aim_clip: Option<usize>,
 }
 
 /// Most clip events a rig keeps for the taking (older ones are dropped:
@@ -374,6 +378,7 @@ impl Rig {
             animator: Animator::default(),
             own: Default::default(),
             foreign: Default::default(),
+            aim_clip: None,
             gait: Gait::Idle,
             cues: Vec::new(),
         })
@@ -395,6 +400,7 @@ impl Rig {
             cues: Vec::new(),
             own: Default::default(),
             foreign: Default::default(),
+            aim_clip: None,
         };
         rig.set_gait(gait);
         rig
@@ -407,6 +413,8 @@ impl Rig {
             locomotion: Locomotion::choose(&self.clips),
             own: Default::default(),
             foreign: Default::default(),
+            aim_clip: None,
+            hands: Default::default(),
             animator: Animator::default(),
             cues: Vec::new(),
             ..self.clone()
@@ -471,6 +479,14 @@ impl Rig {
         let mut pose = self.animator.pose(&self.skeleton, &self.clips);
         self.point(&mut pose, want);
         Some(pose)
+    }
+
+    /// Aims with clip `clip` (the hero's own pick, which for Mattias and
+    /// Chris can be the on-foot table's rather than the aim clip by name):
+    /// the aim's hands are found again from it.
+    pub fn set_aim_clip(&mut self, clip: Option<usize>) {
+        self.aim_clip = clip;
+        self.hands = Default::default();
     }
 
     /// The (rear, front) hands of the aim pose
@@ -1293,13 +1309,6 @@ impl Scene {
                 eprintln!("player {event} clips: {}", shown.join(", "));
             }
         }
-        // Everyone's, whoever the hero is: found on the people's rig,
-        // which shares the hero's clips but not the hero's own picks.
-        self.people.clips = self
-            .people_rig
-            .as_ref()
-            .map(npc::FightClips::find)
-            .unwrap_or_default();
         let templates = self.world.as_ref().map(|w| &w.index.template_db);
         let speeds = templates
             .and_then(|t| {
@@ -1317,7 +1326,8 @@ impl Scene {
         );
         // The weapons already loaded were held by the last body's
         // skeleton.
-        if let Some((_, rig)) = &model {
+        if let Some((_, rig)) = &mut model {
+            rig.set_aim_clip(clips.aim);
             self.arsenal.rehold(rig);
         }
         if let Some(player) = &mut self.player {
@@ -2250,6 +2260,20 @@ fn ground(
 mod tests {
     use super::*;
     use m2_render::NullBackend;
+
+    #[test]
+    fn a_heros_aim_clip_finds_the_hands_again_and_stays_the_heros() {
+        let mut rig = crate::npc::tests::rig();
+        let _ = rig.hands.set(Some((1, 2)));
+        rig.set_aim_clip(Some(0));
+        assert_eq!(rig.aim_clip, Some(0));
+        assert!(rig.hands.get().is_none(), "the old aim's hands are kept");
+        // The people's rigs aim with the clip by name, not the hero's.
+        let _ = rig.hands.set(Some((1, 2)));
+        let people = rig.shared();
+        assert_eq!(people.aim_clip, None);
+        assert!(people.hands.get().is_none());
+    }
 
     #[test]
     fn ground_draws_through_the_null_backend() {
