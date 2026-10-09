@@ -273,6 +273,9 @@ pub struct Templates {
     pub explosions: HashMap<u32, crate::durability::Explosion>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
+    /// Where each template's entrances are got in by (`DriverHatch`), by
+    /// id ([`crate::hijack::entrance_points`]).
+    pub entrance_points: HashMap<u32, Vec<u32>>,
     /// How air strikes' ordnance flies and what its blasts do.
     pub ordnance: crate::ordnance::Ordnance,
     /// How vehicles break each template's objects running into them.
@@ -630,6 +633,7 @@ impl Templates {
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
+            entrance_points: crate::hijack::entrance_points(&db),
             ordnance: crate::ordnance::read(&db),
             crashable: crate::durability::crashable(&db),
             sound_keys: crate::durability::sound_keys(&db),
