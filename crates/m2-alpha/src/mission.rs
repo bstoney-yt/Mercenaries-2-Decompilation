@@ -833,6 +833,7 @@ impl MissionLink {
                     Command::Loadout { who, weapons } if *who == PLAYER => {
                         eprintln!("mission: her loadout is now {weapons:?}");
                         game.combat.carbine_only();
+                        game.combat.scripted_loadout = true;
                     }
                     Command::Reserve {
                         who,
@@ -840,6 +841,7 @@ impl MissionLink {
                         rounds,
                     } if *who == PLAYER => {
                         eprintln!("mission: scripts give her {weapon} {rounds} in reserve");
+                        game.combat.scripted_loadout = true;
                         if weapon.eq_ignore_ascii_case(GRENADE) {
                             game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
                         } else if weapon.eq_ignore_ascii_case("C4") {

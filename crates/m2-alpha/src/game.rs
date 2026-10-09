@@ -140,8 +140,13 @@ const DROPPED: u32 = 0x7000_0000;
 
 /// Gives her what her template hands her to throw (`explosives`, from
 /// [`Scene::hero_explosives`]: free roam; the contract's scripts give her
-/// their own), as many of each as it says.
+/// their own), as many of each as it says, and of what it doesn't name as
+/// many as a new game starts with.
 fn own_explosives(combat: &mut Combat, explosives: Vec<(String, u32)>) {
+    let fresh = Combat::default();
+    combat.grenades = fresh.grenades;
+    combat.charges = fresh.charges;
+    combat.mines = fresh.mines;
     for (name, n) in explosives {
         match name.to_ascii_lowercase().as_str() {
             "grenade" => combat.grenades = n,
@@ -265,23 +270,19 @@ impl Game {
             self.combat.hp = hp;
         }
         // Their own rifle and explosives, as a game started as them has
-        // ([`Game::new`]), unless the scripts handed her theirs.
-        if self.combat.own_rifle {
-            if let Some(rifle) = self.scene.hero_rifle() {
-                self.combat.take_own_rifle(rifle);
-            }
-            let explosives = self.scene.hero_explosives();
-            if !explosives.is_empty() {
-                let fresh = Combat::default();
-                self.combat.grenades = fresh.grenades;
-                self.combat.charges = fresh.charges;
-                self.combat.mines = fresh.mines;
-                own_explosives(&mut self.combat, explosives);
-                eprintln!(
-                    "hero: {hero} carries {} grenades, {} C4, {} mines",
-                    self.combat.grenades, self.combat.charges, self.combat.mines
-                );
-            }
+        // ([`Game::new`]): the rifle unless she has taken up another, the
+        // explosives unless the contract's scripts handed her theirs.
+        if self.combat.own_rifle
+            && let Some(rifle) = self.scene.hero_rifle()
+        {
+            self.combat.take_own_rifle(rifle);
+        }
+        if !self.combat.scripted_loadout {
+            own_explosives(&mut self.combat, self.scene.hero_explosives());
+            eprintln!(
+                "hero: {hero} carries {} grenades, {} C4, {} mines",
+                self.combat.grenades, self.combat.charges, self.combat.mines
+            );
         }
     }
 
@@ -1081,6 +1082,7 @@ impl Game {
         self.combat.max_hp = max_hp;
         self.combat.rifle = old.rifle;
         self.combat.own_rifle = old.own_rifle;
+        self.combat.scripted_loadout = old.scripted_loadout;
         self.combat.hero_damage = old.hero_damage;
         // What the templates gave her weapons stays.
         self.combat.damage_table = old.damage_table;
