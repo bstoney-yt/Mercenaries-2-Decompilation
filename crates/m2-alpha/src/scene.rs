@@ -643,12 +643,19 @@ pub struct Scene {
     pub player: Option<Player>,
     /// Who the player is.
     pub hero: Hero,
-    /// What the people's rigs are made from: the hero's skeleton and
-    /// clips, with the gaits everyone's clips give ([`Rig::shared`]).
+    /// What the people's rigs are made from, whoever the hero is:
+    /// Jennifer's skeleton and every clip that fits it, with the gaits
+    /// everyone's clips give ([`Rig::shared`]). Made once: switching hero
+    /// leaves the people be.
     people_rig: Option<Rig>,
     /// Drivable vehicles near the spawn.
     pub vehicles: Vec<ParkedVehicle>,
-    /// Soldiers and civilians.
+    /// Whether up to [`PARKED`] of the catalogue's vehicles are parked by
+    /// her as she starts: not the game's, so not with a mission (the
+    /// plain launch's included), where only those the layers and scripts
+    /// place stand.
+    pub park: bool,
+    /// The people the layers place.
     pub people: People,
     pub arsenal: Arsenal,
     /// Fuel tanks and barrels that blow up when hit.
@@ -757,10 +764,10 @@ const PARKED: usize = 8;
 /// reach goes by its size, which is known once it has loaded).
 const PROP_MARGIN: f32 = 100.0;
 
-/// Person models loaded: the soldiers the spawn names ask for, then
-/// civilians.
+/// The catalogue's person models loaded up front: those of the roles
+/// soldiers' names ask for, for soldiers whose template has no model of
+/// its own (the rest stand in their template's).
 const ARMY: [&str; 3] = ["vz_hum_soldier", "vz_hum_soldierelite", "vz_hum_deathsquad"];
-const CIVILIAN_MODELS: usize = 6;
 
 /// A model the loading thread has decoded.
 pub enum Loaded {
@@ -771,8 +778,11 @@ pub enum Loaded {
     /// stands (position, yaw), its spec and model.
     WorldVehicle(u32, Vec3, f32, Vec<(String, String)>, VehicleSpec, CpuModel),
     Catalogue(Catalogue),
-    /// A person's model: a role's, or a story character's (true).
+    /// A person's model: a role's, or a template's own (true).
     Person(PersonModel, CpuModel, Skeleton, bool),
+    /// A template's own person model that could not be read: model and
+    /// template.
+    NoPerson(u32, String),
     /// A hand weapon: name, model, muzzle (model space).
     Weapon(&'static str, CpuModel, Vec3),
     /// Any other hand weapon's model the templates name: its name's hash,
@@ -783,10 +793,10 @@ pub enum Loaded {
     Flight(u32, CpuModel, Vec<Mat4>, Vec<m2_assets::vehicle::Rotor>),
 }
 
-/// Finds the island's vehicle and person models and decodes the soldiers,
-/// a few civilians and up to [`PARKED`] vehicles, on a thread (the search
-/// reads the whole archive).
-fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
+/// Finds the island's vehicle and person models and decodes the soldiers'
+/// role models ([`ARMY`]) and, when `park`, up to [`PARKED`] vehicles, on
+/// a thread (the search reads the whole archive).
+fn load_cast(install: Install, hand: Vec<u32>, park: bool) -> Receiver<Loaded> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -814,13 +824,6 @@ fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
                 .people
                 .iter()
                 .filter(|p| ARMY.contains(&p.role.as_str()))
-                .chain(
-                    found
-                        .people
-                        .iter()
-                        .filter(|p| !p.soldier)
-                        .take(CIVILIAN_MODELS),
-                )
                 .collect();
             eprintln!(
                 "people: {} roles; loading {}",
@@ -899,6 +902,12 @@ fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
                 drivable.len(),
                 started.elapsed().as_secs_f32()
             );
+            if !park {
+                eprintln!(
+                    "vehicles: none of the catalogue's parked (a mission: only those the layers and scripts place)"
+                );
+                return Ok(());
+            }
             let rank = |e: &CatalogueEntry| {
                 DRIVABLE
                     .iter()
@@ -965,6 +974,7 @@ impl Scene {
             hero: Hero::default(),
             people_rig: None,
             vehicles: Vec::new(),
+            park: true,
             people: People::default(),
             arsenal: Arsenal::default(),
             explosives: Vec::new(),
@@ -1133,7 +1143,7 @@ impl Scene {
             .as_ref()
             .map(|w| w.index.template_db.arms.hand_models())
             .unwrap_or_default();
-        self.vehicle_loads = Some(load_cast(install.clone(), hand));
+        self.vehicle_loads = Some(load_cast(install.clone(), hand, self.park));
         self.install = Some(install.clone());
         Ok(())
     }
@@ -1230,6 +1240,24 @@ impl Scene {
                 None
             }
         };
+        if self.people_rig.is_none() {
+            // Jennifer's own rig is loaded as no hero's is (every clip
+            // that fits her): hers will do when she is the hero. Taken
+            // before the hero's clips are picked, so nothing done to her
+            // rig for her reaches the people's.
+            self.people_rig = match &model {
+                Some((_, rig)) if hero == Hero::Jennifer && hash == DEFAULT_MODEL => {
+                    Some(rig.shared())
+                }
+                _ => match Rig::load(source, DEFAULT_MODEL, Gait::Idle, None) {
+                    Ok(rig) => Some(rig.shared()),
+                    Err(e) => {
+                        eprintln!("people's rig: {e:#}; the hero's instead");
+                        model.as_ref().map(|(_, rig)| rig.shared())
+                    }
+                },
+            };
+        }
         // The clips by name, then as the on-foot table gives them the
         // hero, then the hero's own group's for those it doesn't.
         let set = self
@@ -1248,7 +1276,6 @@ impl Scene {
             Some((_, rig)) => clips.own_group(rig, &settled),
             None => clips,
         };
-        self.people_rig = model.as_ref().map(|(_, rig)| rig.shared());
         if let Some((_, rig)) = &model {
             let h = |i: Option<usize>| {
                 i.map_or("none".to_owned(), |i| {
@@ -1395,7 +1422,7 @@ impl Scene {
         });
     }
 
-    /// Loads a story character's model (`Carmona`'s, by their template)
+    /// Loads a template's own person model (`Carmona`'s, a `VZ Soldier`'s)
     /// on a thread; it joins the people's kinds as `template`.
     fn load_character(&self, model: u32, template: String) {
         let Some(install) = self.install.clone() else {
@@ -1406,7 +1433,8 @@ impl Scene {
             let result = (|| -> anyhow::Result<()> {
                 let mut source = install.open_world()?;
                 let data = source.model(model)?;
-                let cpu = CpuModel::from_data(&data, 0)?;
+                let mut cpu = CpuModel::from_data(&data, 0)?;
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                 let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
                 let person = PersonModel {
                     model,
@@ -1418,6 +1446,7 @@ impl Scene {
             })();
             if let Err(e) = result {
                 eprintln!("{template} ({model:08x}): {e:#}");
+                let _ = tx.send(Loaded::NoPerson(model, template));
             }
         });
     }
@@ -1520,6 +1549,10 @@ impl Scene {
                 self.catalogue = Some(c.clone());
                 return Ok(());
             }
+            Loaded::NoPerson(model, template) => {
+                self.people.refuse(*model, template.clone());
+                return Ok(());
+            }
             Loaded::Vehicle(_, cpu)
             | Loaded::MissionVehicle(_, _, cpu)
             | Loaded::WorldVehicle(_, _, _, _, _, cpu)
@@ -1528,8 +1561,24 @@ impl Scene {
             | Loaded::HandModel(_, cpu, _)
             | Loaded::Flight(_, cpu, _, _) => cpu,
         };
-        self.materials.load_model_textures(backend, source, cpu)?;
-        let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
+        let uploaded = self
+            .materials
+            .load_model_textures(backend, source, cpu)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| Ok(GpuModel::upload(backend, &mut self.materials, cpu)?));
+        let model = match uploaded {
+            Ok(model) => model,
+            Err(e) => {
+                // A template's own person model that won't go up: its
+                // spawns stand as their name's role, or not at all,
+                // rather than wait for it.
+                if let Loaded::Person(p, _, _, true) = &loaded {
+                    eprintln!("person {} ({:08x}): {e:#}; left out", p.role, p.model);
+                    self.people.refuse(p.model, p.role.clone());
+                }
+                return Err(e);
+            }
+        };
         // What its template says of its handling and its gun: its own
         // (the mission's `AMX30 (Full)`), else its model's.
         let tune = |spec: VehicleSpec| {
@@ -1541,7 +1590,7 @@ impl Scene {
             spec.tuned(t).armed_with(arm, &db.arms)
         };
         match loaded {
-            Loaded::Catalogue(_) => {}
+            Loaded::Catalogue(_) | Loaded::NoPerson(..) => {}
             Loaded::Vehicle(spec, _) => self.vehicles.push(ParkedVehicle {
                 spec: tune(spec),
                 model,
@@ -1621,31 +1670,52 @@ impl Scene {
                 self.arsenal.add_model(hash, model, muzzle, rig);
             }
             Loaded::Person(p, _, skeleton, named) => {
-                // The hero's clips fit every human skeleton.
+                // The people's clips fit every human skeleton.
                 let template = self
                     .people_rig
                     .as_ref()
                     .and_then(|rig| rig.for_skeleton(skeleton));
+                // A template's own gun (`EquipmentLink`); a role's none.
+                let db = self.world.as_ref().map(|w| &w.index.template_db);
+                let gun = db
+                    .filter(|_| named)
+                    .and_then(|db| db.own_rifle(&p.role))
+                    .map(|(name, gun)| (name.to_owned(), gun));
                 match template {
                     Some(rig) => {
                         eprintln!(
-                            "person {}: {} bones, {} clips",
+                            "person {} ({:08x}): {} bones, {} clips, gun {}",
                             p.role,
+                            p.model,
                             rig.skeleton.len(),
-                            rig.clips.len()
+                            rig.clips.len(),
+                            gun.as_ref()
+                                .map_or("none of its own".to_owned(), |(name, g)| {
+                                    format!(
+                                        "{name} (model {:08x}, {:.0} a minute, {} a round)",
+                                        g.model.unwrap_or(0),
+                                        g.rate_of_fire,
+                                        g.damage
+                                    )
+                                })
                         );
                         self.people.add_kind(PersonKind {
                             role: p.role,
-                            soldier: p.soldier,
                             named,
+                            gun: gun.map(|(_, g)| g),
                             model,
                             rig,
                         });
                     }
-                    None => eprintln!(
-                        "person {}: the clips don't fit its skeleton; left out",
-                        p.role
-                    ),
+                    None => {
+                        eprintln!(
+                            "person {}: the clips don't fit its skeleton; left out",
+                            p.role
+                        );
+                        if named {
+                            self.people.refuse(p.model, p.role);
+                        }
+                    }
                 }
             }
         }
@@ -1840,7 +1910,7 @@ impl Scene {
             model.draw_posed(backend, queue, body, &nodes, &skin)?;
             if n.soldier
                 && n.alive
-                && let Some(w) = &self.arsenal.rifle
+                && let Some(w) = self.arsenal.npc_gun(n.gun)
                 && let Some(at) =
                     self.arsenal
                         .in_hand(w, body, &nodes, (n.hand, n.attach), n.rig.two_handed)
