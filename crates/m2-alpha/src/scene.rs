@@ -1077,13 +1077,11 @@ impl Scene {
                 None
             }
         };
-        let clips = model
-            .as_ref()
-            .map(|(_, rig)| npc::FightClips::find(rig).own_group(rig))
-            .unwrap_or_default();
         if self.people_rig.is_none() {
             // Jennifer's own rig is loaded as no hero's is (every clip
-            // that fits her): hers will do when she is the hero.
+            // that fits her): hers will do when she is the hero. Taken
+            // before the hero's clips are picked, so nothing done to her
+            // rig for her reaches the people's.
             self.people_rig = match &model {
                 Some((_, rig)) if hero == Hero::Jennifer && hash == DEFAULT_MODEL => {
                     Some(rig.shared())
@@ -1097,6 +1095,10 @@ impl Scene {
                 },
             };
         }
+        let clips = model
+            .as_ref()
+            .map(|(_, rig)| npc::FightClips::find(rig).own_group(rig))
+            .unwrap_or_default();
         if let Some((_, rig)) = &model {
             let h = |i: Option<usize>| {
                 i.map_or("none".to_owned(), |i| {
@@ -1380,8 +1382,24 @@ impl Scene {
             | Loaded::HandModel(_, cpu, _)
             | Loaded::Flight(_, cpu, _, _) => cpu,
         };
-        self.materials.load_model_textures(backend, source, cpu)?;
-        let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
+        let uploaded = self
+            .materials
+            .load_model_textures(backend, source, cpu)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| Ok(GpuModel::upload(backend, &mut self.materials, cpu)?));
+        let model = match uploaded {
+            Ok(model) => model,
+            Err(e) => {
+                // A template's own person model that won't go up: its
+                // spawns stand as their name's role, or not at all,
+                // rather than wait for it.
+                if let Loaded::Person(p, _, _, true) = &loaded {
+                    eprintln!("person {} ({:08x}): {e:#}; left out", p.role, p.model);
+                    self.people.refuse(p.model, p.role.clone());
+                }
+                return Err(e);
+            }
+        };
         // What its template says of its handling and its gun: its own
         // (the mission's `AMX30 (Full)`), else its model's.
         let tune = |spec: VehicleSpec| {
