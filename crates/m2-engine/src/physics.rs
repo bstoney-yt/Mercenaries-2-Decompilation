@@ -7,9 +7,10 @@
 //! them on the main thread is quick.
 //!
 //! People move with Rapier's kinematic character controller: a capsule that
-//! slides along walls, climbs steps up to [`STEP_HEIGHT`] and slopes up to
-//! [`MAX_SLOPE`], and keeps to the ground going down. Gravity and jumping
-//! are integrated here, not by the solver.
+//! slides along walls, climbs steps up to [`STEP_HEIGHT`] (loose pieces
+//! lying about too) and slopes up to [`MAX_SLOPE`], and keeps to the
+//! ground going down. Gravity and jumping are integrated here, not by the
+//! solver.
 //!
 //! # Provenance
 //!
@@ -476,8 +477,8 @@ fn standing(p: &Phy2, k: usize, hidden: &[bool]) -> bool {
     !s.is_foliage() && !hidden.get(node).copied().unwrap_or(false)
 }
 
-/// A box round `PHY2` shape `k` (its convex radius included), placed by
-/// `to` from its body node's space.
+/// A box round `PHY2` shape `k` (its convex radius included, as its
+/// triangles have it), placed by `to` from its body node's space.
 fn shape_box(p: &Phy2, k: usize, to: Mat4) -> Option<(r::Pose, r::SharedShape)> {
     let s = p.shapes.get(k)?;
     let (v, _) = s.geometry.triangles(s.radius);
@@ -492,8 +493,7 @@ fn shape_box(p: &Phy2, k: usize, to: Mat4) -> Option<(r::Pose, r::SharedShape)> 
         * p.shape_place(k).map_or(Mat4::IDENTITY, place)
         * Mat4::from_translation((lo + hi) * 0.5);
     let (scale, rotation, translation) = at.to_scale_rotation_translation();
-    let half = ((hi - lo) * 0.5 * scale.abs() + Vec3::splat(s.radius.max(0.0)))
-        .max(Vec3::splat(LOOSE_HALF));
+    let half = ((hi - lo) * 0.5 * scale.abs()).max(Vec3::splat(LOOSE_HALF));
     (half.is_finite() && translation.is_finite() && rotation.is_finite()).then(|| {
         (
             pose(translation, rotation.normalize()),
@@ -990,7 +990,10 @@ impl Physics {
             autostep: Some(CharacterAutostep {
                 max_height: CharacterLength::Absolute(STEP_HEIGHT),
                 min_width: CharacterLength::Absolute(0.2),
-                include_dynamic_bodies: false,
+                // Loose pieces lying about (a plank, a post knocked over)
+                // are stepped over as a static of their height is: else
+                // she can't climb a piece she can't push either.
+                include_dynamic_bodies: true,
             }),
             max_slope_climb_angle: MAX_SLOPE,
             min_slope_slide_angle: MAX_SLOPE,
@@ -1417,12 +1420,17 @@ impl Physics {
             half.x = half.x.min(FUSELAGE_HALF);
         }
         let centre = Vec3::new((lo.x + hi.x) * 0.5, floor + half.y, (lo.z + hi.z) * 0.5);
+        // Swept, as loose pieces are: at speed a step carries it further
+        // than a fence or a post is thick, and the hull would end up
+        // inside one (a static's triangles have no inside to push it out
+        // of the way it came).
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
                 .pose(pose(position, rotation))
                 .linear_damping(0.1)
                 .angular_damping(0.5)
-                .can_sleep(false),
+                .can_sleep(false)
+                .ccd_enabled(true),
         );
         // Mass low in the hull (as an engine and axles put it) and inertia
         // a little above a solid box's, so it takes a steep slope or a
@@ -2524,6 +2532,24 @@ mod tests {
         let mut c = Character::new(Vec3::new(0.0, 0.0, -10.0));
         walk(&p, &mut c, Vec3::new(4.0, 0.0, 0.0), 3.0);
         assert!(c.position.x < 5.0, "through the wall: {}", c.position);
+    }
+
+    #[test]
+    fn steps_over_a_loose_piece_lying_in_the_way() {
+        let mut p = ready();
+        // A plank 0.25 m thick knocked down across her way at z = 3, as
+        // a static of its height is stepped over.
+        let plank = LoosePiece::block(None, Vec3::ZERO, Vec3::new(2.0, 0.125, 0.15), 30.0);
+        let at = Mat4::from_translation(Vec3::new(0.0, 0.13, 3.0));
+        let id = p.add_debris(&plank, at, Vec3::ZERO, Vec3::ZERO);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let lying = p.debris_place(id).unwrap().w_axis;
+        assert!((lying.z - 3.0).abs() < 0.1 && lying.y < 0.2, "{lying}");
+        let mut c = Character::new(Vec3::ZERO);
+        walk(&p, &mut c, Vec3::new(0.0, 0.0, 4.0), 3.0);
+        assert!(c.position.z > 5.0, "held by the plank: {}", c.position);
     }
 
     #[test]

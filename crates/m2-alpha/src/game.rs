@@ -664,6 +664,11 @@ impl Game {
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
+            // What came down (to a vehicle, the traffic's too, or a blast
+            // last tick) comes down whether she is on foot or the free
+            // camera flies: its island copy has lost its collision already.
+            self.destruction
+                .update(world, &mut self.scene.props, &mut self.combat);
             self.scene.props.advance(dt);
             self.spray_wait -= dt;
             if self.spray_wait <= 0.0 {
@@ -730,8 +735,6 @@ impl Game {
                         .blast(world, &mut scene.props, install, blast);
                 }
             }
-            self.destruction
-                .update(world, &mut scene.props, &mut self.combat);
             // A supply crate broken open: a puff of dust off its boards.
             let broken = scene.flights.strike(
                 &mut world.physics,
@@ -1808,7 +1811,8 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
 /// ploughs on slowed as by the mass it shifted, rather than stopped as by
 /// a wall (the step just taken stopped it). First they break what they
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
-/// bushes, fences, lampposts), going on through it.
+/// bushes, fences, lampposts, the island's and the state layers'), going
+/// on through it.
 fn knock_loose(
     world: &mut World,
     props: &mut Props,
@@ -1838,15 +1842,17 @@ fn knock_loose(
                 velocity: before,
                 mass,
             };
-            for c in destruction.crash(world, props, install, &crasher) {
+            // What its body touched in the step counts as run into, as
+            // what its box meets does.
+            for c in destruction.crash(world, props, install, &crasher, &keys) {
                 match c {
-                    Crashed::Down(i) => {
-                        ploughed |= keys.contains(&StaticKey::Object(i));
-                        down.push(StaticKey::Object(i));
+                    Crashed::Down(key) => {
+                        ploughed |= keys.contains(&key);
+                        down.push(key);
                     }
-                    Crashed::Loose(i) => {
-                        if !keys.contains(&StaticKey::Object(i)) {
-                            keys.push(StaticKey::Object(i));
+                    Crashed::Loose(key) => {
+                        if !keys.contains(&key) {
+                            keys.push(key);
                         }
                     }
                 }
@@ -1863,9 +1869,7 @@ fn knock_loose(
             let Some(m) = loose.filter(|&m| mass * speed >= KNOCK_RATIO * m) else {
                 continue;
             };
-            let ahead = before.with_y(0.0);
-            let fling = before * (mass / (mass + m)) * FLING + Vec3::Y * FLING_UP;
-            let topple = Vec3::Y.cross(ahead.normalize_or_zero()) * (ahead.length() * TOPPLE);
+            let (fling, topple) = flung(before, mass, m);
             let knocked = match key {
                 StaticKey::Object(i) => world.knock(i, fling, topple),
                 StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
@@ -1885,6 +1889,18 @@ fn knock_loose(
                 .set_vehicle_velocity(id, before * (mass / (mass + shifted)));
         }
     }
+}
+
+/// How what a vehicle of `mass` (kg) going at `velocity` (m/s) knocks
+/// loose, `shifted` kg of it, is flung: its velocity, a little faster than
+/// the two would go on together and up ([`FLING`], [`FLING_UP`]), and its
+/// spin, toppling the way it was hit ([`TOPPLE`]). What a vehicle breaks
+/// apart goes the same way ([`Destruction::crash`]).
+pub(crate) fn flung(velocity: Vec3, mass: f32, shifted: f32) -> (Vec3, Vec3) {
+    let ahead = velocity.with_y(0.0);
+    let fling = velocity * (mass / (mass + shifted)) * FLING + Vec3::Y * FLING_UP;
+    let topple = Vec3::Y.cross(ahead.normalize_or_zero()) * (ahead.length() * TOPPLE);
+    (fling, topple)
 }
 
 /// Blasts knock loose what comes loose within `reach` (as far as they
