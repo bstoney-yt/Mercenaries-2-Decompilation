@@ -101,6 +101,10 @@ pub struct Hud {
     /// Each frame waits for the game's HUD to draw it (play run offscreen,
     /// faster than the HUD's scripts would keep up with).
     pub wait: bool,
+    /// The developer's keys work (`--dev`, or a test launch): the menu
+    /// names F5/F9 for saving and loading, and loads while the mission
+    /// scripts run, though a load puts the world back without their state.
+    pub dev: bool,
 }
 
 impl std::fmt::Debug for Hud {
@@ -138,6 +142,7 @@ impl Hud {
             frame: None,
             game: None,
             wait: false,
+            dev: true,
         }
     }
 
@@ -266,10 +271,14 @@ impl Hud {
         let menu = self.menu;
         self.feed(&input, info);
         let game = self.game.as_ref().filter(|g| g.ready());
+        // Without the developer's keys, no load while the scripts run: it
+        // would put the world back without their state.
+        let load = self.dev || info.mission.is_none();
+        let dev = self.dev;
         let output = self.ctx.run_ui(input, |ui| {
             hud(ui, info, game);
             if menu {
-                action = pause_menu(ui.ctx(), config);
+                action = pause_menu(ui.ctx(), config, dev, load);
             }
         });
         let ppp = output.pixels_per_point;
@@ -537,7 +546,17 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     }
     if let Some(m) = &info.mission {
         // The game's HUD shows the messages in its message buffer.
-        mission(&painter, screen, info.view_proj, m, game.is_none(), &text);
+        // Nor, when its fanfare call failed in its scripts, the fanfare.
+        let dropped = game.is_some_and(|g| g.dropped_fanfare());
+        mission(
+            &painter,
+            screen,
+            info.view_proj,
+            m,
+            game.is_none(),
+            dropped,
+            &text,
+        );
     }
     if !info.playing {
         text(
@@ -1118,13 +1137,15 @@ fn wheel(painter: &egui::Painter, c: egui::Pos2, r: f32, w: &WheelHud) {
 
 /// The mission's objectives (top left), its newest message (top centre)
 /// and tutorial line (left) if `message` (no game HUD to show them), and
-/// markers over its targets.
+/// markers over its targets. The contract's end shows if `message`, or
+/// if `dropped` (the game HUD's fanfare call failed).
 fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     painter: &egui::Painter,
     screen: egui::Rect,
     view_proj: Option<Mat4>,
     m: &MissionView,
     message: bool,
+    dropped: bool,
     text: &T,
 ) {
     let white = Color32::from_gray(235);
@@ -1146,9 +1167,10 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     if let Some(line) = m.tutorial.as_ref().filter(|_| message) {
         tutorial(painter, screen, line);
     }
-    // The game's HUD has its own fanfare (`Hud.Fanfare`). Ours stays up
-    // while the fanfare waits for Enter, as the game's does.
-    if (m.contract_complete || m.fanfare_waiting) && message {
+    // The game's HUD has its own fanfare (`Hud.Fanfare`), unless its call
+    // failed there. Ours stays up while the fanfare waits for Enter, as the
+    // game's does.
+    if (m.contract_complete || m.fanfare_waiting) && (message || dropped) {
         text(
             screen.center() + vec2(0.0, -60.0),
             Align2::CENTER_CENTER,
@@ -1260,7 +1282,14 @@ fn project(view_proj: Mat4, world: Vec3, screen: egui::Rect) -> Option<egui::Pos
     ))
 }
 
-fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
+/// The pause menu. `dev`: the save and load buttons name their keys (which
+/// work only then); `load`: a saved game can be loaded.
+fn pause_menu(
+    ctx: &egui::Context,
+    config: &mut Config,
+    dev: bool,
+    load: bool,
+) -> Option<MenuAction> {
     let mut action = None;
     // Dim the game behind the menu.
     ctx.layer_painter(egui::LayerId::new(
@@ -1279,10 +1308,15 @@ fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
                 action = Some(MenuAction::Resume);
             }
             ui.horizontal(|ui| {
-                if ui.button("Save game (F5)").clicked() {
+                let (save, load_label) = if dev {
+                    ("Save game (F5)", "Load game (F9)")
+                } else {
+                    ("Save game", "Load game")
+                };
+                if ui.button(save).clicked() {
                     action = Some(MenuAction::SaveGame);
                 }
-                if ui.button("Load game (F9)").clicked() {
+                if load && ui.button(load_label).clicked() {
                     action = Some(MenuAction::LoadGame);
                 }
             });

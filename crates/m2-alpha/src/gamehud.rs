@@ -1003,6 +1003,12 @@ impl GameHud {
                 shell,
             } => {
                 self.callbacks.extend(callbacks);
+                // Handed over already (a frame queued before it in this
+                // drain broke): a later frame does not take it back.
+                if self.failed() {
+                    self.write(log);
+                    return;
+                }
                 let new_game = self.shell.new_game.take().or(shell.new_game);
                 self.shell = ShellNews { new_game, ..shell };
                 self.dropped_fanfare |= log.iter().any(|l| fanfare_failed(l));
@@ -4454,26 +4460,18 @@ mod tests {
 mod paint_tests {
     use super::*;
 
-    /// A fade (a black, three-quarters solid quad over the screen) leaves
-    /// egui as a mesh over the screen.
-    #[test]
-    fn solid_quads_reach_the_tessellated_output() {
+    /// A HUD with no thread behind it, at `status`, holding `prims`.
+    fn test_hud(status: Status, prims: Vec<Prim>) -> GameHud {
         let (tx, _rx) = channel();
         let (_tx, rx) = channel();
-        let mut hud = GameHud {
+        GameHud {
             tx,
             rx,
-            status: Status::Ready,
+            status,
             callbacks: Vec::new(),
             dropped_fanfare: false,
             shell: ShellNews::default(),
-            prims: vec![quad(
-                None,
-                [0.0, 0.0, 800.0, 600.0],
-                [0.0; 4],
-                [0.0, 0.0, 0.0, 0.75],
-                0.0,
-            )],
+            prims,
             pending: Vec::new(),
             textures: HashMap::new(),
             pixels: HashMap::new(),
@@ -4482,7 +4480,23 @@ mod paint_tests {
             last_call: 0,
             last_time: None,
             log: None,
-        };
+        }
+    }
+
+    /// A fade (a black, three-quarters solid quad over the screen) leaves
+    /// egui as a mesh over the screen.
+    #[test]
+    fn solid_quads_reach_the_tessellated_output() {
+        let mut hud = test_hud(
+            Status::Ready,
+            vec![quad(
+                None,
+                [0.0, 0.0, 800.0, 600.0],
+                [0.0; 4],
+                [0.0, 0.0, 0.0, 0.75],
+                0.0,
+            )],
+        );
         let ctx = egui::Context::default();
         hud.upload(&ctx);
         let out = ctx.run_ui(crate::ui::headless_input(800, 600, 0.0), |ui| {
@@ -4517,25 +4531,7 @@ mod paint_tests {
     /// to the stand-in HUD, while a script's own error does not.
     #[test]
     fn a_broken_hud_hands_over_to_the_stand_in() {
-        let (tx, _rx) = channel();
-        let (_tx, rx) = channel();
-        let mut hud = GameHud {
-            tx,
-            rx,
-            status: Status::Loading,
-            callbacks: Vec::new(),
-            dropped_fanfare: false,
-            shell: ShellNews::default(),
-            prims: Vec::new(),
-            pending: Vec::new(),
-            textures: HashMap::new(),
-            pixels: HashMap::new(),
-            skip_covers: false,
-            last_message: None,
-            last_call: 0,
-            last_time: None,
-            log: None,
-        };
+        let mut hud = test_hud(Status::Loading, Vec::new());
         hud.take(frame(&[
             "hud call Fanfare.Create",
             "hud call SubtitleBuffer.AddMessage: [string \"x\"]:1: stack overflow",
@@ -4548,6 +4544,9 @@ mod paint_tests {
         hud.take(frame(&[
             "gui call MrxGui.Show: out of Lua stack, too many arguments",
         ]));
+        assert!(hud.failed() && !hud.ready());
+        // A clean frame queued behind it does not take it back.
+        hud.take(frame(&[]));
         assert!(hud.failed() && !hud.ready());
     }
 }

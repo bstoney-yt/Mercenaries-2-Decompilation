@@ -125,6 +125,10 @@ struct Options {
     /// The developer's keys in the whole game's launch too (`--dev`): the
     /// free camera, quick save and load, culling, the gait cycle.
     dev: bool,
+    /// With `--alpha` (or `--mission --movies --screenshot`): the scripts'
+    /// skip mode ends once their start has run, rather than staying on for
+    /// the session.
+    skip_mode_off: bool,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -350,6 +354,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--dev" => o.dev = true,
+            "--skip-mode-off" => o.skip_mode_off = true,
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -494,7 +499,7 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 8] = [
+    const PLAIN: [&str; 9] = [
         "--install",
         "--config",
         "--size",
@@ -503,6 +508,7 @@ fn parse_args() -> anyhow::Result<Options> {
         "--no-boot",
         "--smarter-ai",
         "--dev",
+        "--skip-mode-off",
     ];
     if std::env::args()
         .skip(1)
@@ -638,6 +644,7 @@ fn main() -> anyhow::Result<()> {
         support: options.support.clone(),
         alpha: options.alpha,
         no_boot: options.no_boot,
+        skip_mode_off: options.skip_mode_off,
         guns: options.guns.clone(),
         state: None,
         error: None,
@@ -2326,7 +2333,8 @@ fn mission_for_screenshot(
     let tick = TICK.as_secs_f32();
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
         .with_support(options.support.clone())
-        .with_movies(options.movies);
+        .with_movies(options.movies)
+        .with_skip_mode_off(options.skip_mode_off);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -4390,6 +4398,8 @@ struct App {
     /// `no_boot`), front end, the scripts' movies.
     alpha: bool,
     no_boot: bool,
+    /// End the scripts' skip mode after their start (`--skip-mode-off`).
+    skip_mode_off: bool,
     /// Weapons to start with (`--gun`).
     guns: Vec<String>,
     state: Option<Running>,
@@ -4428,6 +4438,7 @@ impl App {
         let focused = window.has_focus();
         let mut hud = ui::Hud::new();
         hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud);
+        hud.dev = self.dev;
         eprintln!(
             "keys: the developer's (V free camera, F5/F9 quick save and load, F3 culling, \
              N gait) {}",
@@ -4470,6 +4481,7 @@ impl App {
                         .with_keys(self.config.keys.clone())
                         .with_support(self.support.clone())
                         .with_movies(self.alpha)
+                        .with_skip_mode_off(self.skip_mode_off)
                         .with_subtitles(self.config.options.subtitles),
                 ),
                 _ => None,

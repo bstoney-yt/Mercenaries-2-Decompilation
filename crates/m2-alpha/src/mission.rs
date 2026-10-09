@@ -317,6 +317,11 @@ pub struct MissionLink {
     /// The flow's movies wait for the game to play them
     /// ([`Mission::hold_movies`]); otherwise they end at once.
     movies: bool,
+    /// With [`movies`](Self::movies), the scripts' skip mode ends once the
+    /// start has run ([`Mission::end_skip_mode`], `--skip-mode-off`).
+    /// Off by default until the scripts that ask about it are surveyed on
+    /// the game's data: the flow was only seen to finish with it on.
+    end_skip: bool,
     /// The player has subtitles on.
     subtitles: bool,
     /// Time not yet given to the scripts.
@@ -427,6 +432,7 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             movies: false,
+            end_skip: false,
             subtitles: true,
             lag: 0.0,
             log,
@@ -478,6 +484,12 @@ impl MissionLink {
     /// [`take_movie`](Self::take_movie) hands them out.
     pub fn with_movies(self, movies: bool) -> Self {
         Self { movies, ..self }
+    }
+
+    /// Ends the scripts' skip mode once the start has run, when the movies
+    /// wait for the game (`--skip-mode-off`).
+    pub fn with_skip_mode_off(self, end_skip: bool) -> Self {
+        Self { end_skip, ..self }
     }
 
     /// Whether the player has subtitles on (the game's option).
@@ -911,10 +923,12 @@ impl MissionLink {
                 }
                 mission.set_subtitles(self.subtitles);
                 mission.start();
-                if self.movies {
+                if self.movies && self.end_skip {
                     // The movies wait for the game, so the scripts' skip
                     // mode has done its part.
                     mission.end_skip_mode();
+                } else if self.movies {
+                    eprintln!("mission: the scripts' skip mode stays on (--skip-mode-off)");
                 }
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
@@ -1851,16 +1865,17 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                     );
                 }
             }
-            // Gone, or hidden, while she waited to get back in: she stays
-            // out, and the scripts hear where she is again.
+            // Gone, or hidden, while she waited to get in: the wait ends
+            // on the next step as if it had run out, so she stays out (and
+            // goes ashore if she waits in the sea, as for the start's boat)
+            // and the scripts hear where she is again.
             if fleet.reenter == Some(*guid)
                 && match c {
                     Command::Move { position, .. } => position[1] <= HIDDEN_BELOW,
                     _ => true,
                 }
             {
-                fleet.reenter = None;
-                fleet.boarding = 0;
+                fleet.boarding = 1;
             }
             let scene = &mut game.scene;
             if let Some(world) = &mut scene.world {
@@ -1882,9 +1897,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             if let Some(i) = index(guid) {
                 game.scene.vehicles[i].wrecked = true;
             }
+            // Wrecked while she waited to get in: the wait ends, as above.
             if fleet.reenter == Some(*guid) {
-                fleet.reenter = None;
-                fleet.boarding = 0;
+                fleet.boarding = 1;
             }
             let scene = &mut game.scene;
             if let Some(world) = &mut scene.world

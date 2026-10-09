@@ -2,7 +2,7 @@ m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
 
 m2-alpha [options]
   (no options, or only --install/--config/--size/--vsync/--fullscreen/
-  --no-boot/--smarter-ai/--dev: the whole game, as --alpha)
+  --no-boot/--smarter-ai/--dev/--skip-mode-off: the whole game, as --alpha)
   --alpha                the game as it launches: the boot movies (EA,
                          Pandemic), the front end (Enter starts), the first
                          contract with its movies, then on to free roam.
@@ -14,6 +14,11 @@ m2-alpha [options]
                          gait), which the whole game's launch leaves out;
                          the other launches (--mission, --spawn, --model,
                          --fly...) always have them
+  --skip-mode-off        with --alpha (or --mission --movies
+                         --screenshot): the scripts' developer skip mode
+                         (on so their intro movies end at once) ends once
+                         their start has run, instead of staying on all
+                         session
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured
                          (<out>-movie-<name>.ppm)
