@@ -132,6 +132,24 @@ pub fn crashable(db: &Layer<'_>) -> HashMap<u32, Crash> {
         .collect()
 }
 
+/// Each template's `SoundKey`, by id, where it isn't zero: the sound its
+/// objects make as they break (`_global_fencewoodpanel`'s `286115a2`,
+/// `prop_sheetmetal_sml`; the chain-link fences' `16117a0b`,
+/// `prop_metal_chainlinkfence`; PC survey `soundkeys`, 2026-10-09). A
+/// template with no `BuildingCollapseAnim` ([`Durability::collapse`])
+/// doesn't come down as a building does, with its rumble: it is heard as
+/// its own key says.
+pub fn sound_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = Table::new(db, "SoundKey");
+    let field = name_hash("SoundKey");
+    t.templates()
+        .filter_map(|id| {
+            let key = t.word(t.of_template(id).first()?, field)?;
+            (key != 0).then_some((id, key))
+        })
+        .collect()
+}
+
 /// A blast's reach and damage (`Explosive`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Explosion {

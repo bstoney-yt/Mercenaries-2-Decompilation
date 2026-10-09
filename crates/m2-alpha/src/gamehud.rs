@@ -1431,6 +1431,10 @@ struct Told {
     /// she drives a vehicle with a cannon.
     weapon: Option<(Weapon, bool, bool)>,
     ammo: Option<[i64; 5]>,
+    /// She was in a vehicle ([`HudState::in_vehicle`]).
+    in_vehicle: Option<bool>,
+    /// The gun box's icon widgets as last logged ([`Thread::gun_box`]).
+    gun_box: String,
     vehicle: Option<Option<String>>,
     vehicle_templates: Option<Vec<String>>,
     target: Option<Option<(i32, i32, i32)>>,
@@ -1447,6 +1451,18 @@ struct Told {
     disguise: Option<Option<(f32, bool)>>,
     /// The keys the texts' control words name ([`HudState::key_names`]).
     key_names: Option<Vec<(String, String)>>,
+}
+
+impl Told {
+    /// She is `in_vehicle` now: got out of one, her gun and its rounds are
+    /// to be told again (as for a change of gun).
+    fn seat(&mut self, in_vehicle: bool) {
+        if self.in_vehicle == Some(true) && !in_vehicle {
+            self.weapon = None;
+            self.ammo = None;
+        }
+        self.in_vehicle = Some(in_vehicle);
+    }
 }
 
 /// How far (in -1..=1 screen units, across plus up) the aim point moves
@@ -1782,6 +1798,7 @@ impl Thread {
         if let Err(e) = self.pose_wheel(state, &mut log) {
             log.push(format!("wheel: {e}"));
         }
+        self.gun_box(state, &mut log);
         // Keys go to the movie that has the controls: the mission's
         // fanfare while it is up (its Key listener's Enter continues, as
         // `_HandleFanfareInput` passes the select button on), else the PDA.
@@ -2579,6 +2596,27 @@ impl Thread {
         // again should they change): before any text this frame is set.
         if self.told.key_names.as_ref() != Some(&s.key_names) {
             self.told.key_names = Some(s.key_names.clone());
+            // The words the fonts have no picture matched for, as their
+            // keys, and what the PC must look at to match them.
+            let keyed: Vec<String> = s
+                .key_names
+                .iter()
+                .filter(|(w, _)| gui_runtime::button_glyph(w).is_none())
+                .map(|(w, k)| format!("[{w}] as [{k}]"))
+                .collect();
+            if !keyed.is_empty() {
+                eprintln!(
+                    "hud text: no button picture matched for {}: on the PC, which of \
+                     english_18's button page (pc\\common_18_buttons) glyphs {} (or past \
+                     U+E013) is each",
+                    keyed.join(", "),
+                    gui_runtime::UNMATCHED_GLYPHS
+                        .iter()
+                        .map(|c| format!("U+{:04X}", u32::from(*c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             if let Some(screen) = gui_runtime::screen(lua) {
                 screen
                     .borrow_mut()
@@ -2652,6 +2690,12 @@ impl Thread {
         }
         let holding = s.support.designator.is_some();
         let cannon = s.in_vehicle && s.cannon.is_some();
+        // Out of a vehicle, she has her gun in hand again, and the HUD is
+        // told so as for a change of gun, and her rounds after it: the
+        // gun box (shown by `GuiWeaponEquippedUpdate`) had been shown only
+        // once, on the boat at the start, and never again on foot, as no
+        // gun was changed after (PC playtest, 2026-10-08).
+        self.told.seat(s.in_vehicle);
         if self.told.weapon != Some((s.weapon, holding, cannon)) {
             self.told.weapon = Some((s.weapon, holding, cannon));
             let (icon, guid, reticle) = match s.weapon {
@@ -2904,6 +2948,84 @@ impl Thread {
             self.told.tutorial = Some(tutorial);
         }
         Ok(())
+    }
+
+    /// The gun box as the scripts left it, logged as it changes: each
+    /// widget showing one of the guns' icons (the box's picture of the
+    /// gun in hand), with whatever of it and its parents keeps it from
+    /// drawing (hidden, asleep, inactive, see-through), on foot or in a
+    /// vehicle. Tells a PC run what keeps the box away on foot, should it
+    /// still be.
+    fn gun_box(&mut self, s: &HudState, log: &mut Vec<String>) {
+        let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
+            return;
+        };
+        let screen = screen.borrow();
+        let icons = [
+            RIFLE_ICON,
+            RPG_ICON,
+            LAUNCHER_ICON,
+            DESIGNATOR_ICON,
+            CANNON_ICON,
+        ];
+        let mut seen: Vec<String> = screen
+            .widgets()
+            .filter_map(|(id, w)| {
+                let icon = w.texture.as_deref()?;
+                icons.iter().any(|i| icon.eq_ignore_ascii_case(i)).then(|| {
+                    let mut kept = Vec::new();
+                    let mut at = Some(id);
+                    // Up the parents (bounded, should one point back down).
+                    for _ in 0..64 {
+                        let Some(i) = at else { break };
+                        let Some(x) = screen.widget(i) else {
+                            kept.push(format!("{i} gone"));
+                            break;
+                        };
+                        let flags: String = [
+                            (!x.visible, " hidden"),
+                            (x.sleeping, " asleep"),
+                            (x.inactive, " inactive"),
+                            (x.colour[3] <= 0.0, " clear"),
+                        ]
+                        .iter()
+                        .filter(|(on, _)| *on)
+                        .map(|(_, f)| *f)
+                        .collect();
+                        if !flags.is_empty() {
+                            kept.push(format!("{i} {:?}{flags}", x.name));
+                        }
+                        at = x.parent;
+                    }
+                    format!(
+                        "{id} {icon} {}",
+                        if kept.is_empty() {
+                            "shown".to_owned()
+                        } else {
+                            format!("kept by {}", kept.join(", "))
+                        }
+                    )
+                })
+            })
+            .collect();
+        seen.sort();
+        let line = format!(
+            "{}: {}",
+            if s.in_vehicle {
+                "in a vehicle"
+            } else {
+                "on foot"
+            },
+            if seen.is_empty() {
+                "no gun icon widget".to_owned()
+            } else {
+                seen.join("; ")
+            }
+        );
+        if line != self.told.gun_box {
+            log.push(format!("gun box: {line}"));
+            self.told.gun_box = line;
+        }
     }
 
     /// Poses the timing wheel's widgets as the play has the wheel, after
@@ -4377,6 +4499,24 @@ mod tests {
     /// where its art points.
     fn arc(heading: f32, from: Vec3) -> f32 {
         (direction(Some(Vec3::ZERO), Some(from)) + heading).rem_euclid(360.0)
+    }
+
+    #[test]
+    fn getting_out_of_a_vehicle_tells_her_gun_again() {
+        let mut told = Told::default();
+        let gun = Some((Weapon::Rifle, false, false));
+        // On the boat at the start: the gun told once.
+        told.seat(true);
+        told.weapon = gun;
+        told.ammo = Some([30, 30, 270, 0, 0]);
+        told.seat(true);
+        assert_eq!(told.weapon, gun);
+        // Ashore: told again, rounds and all; and not again on foot.
+        told.seat(false);
+        assert_eq!((told.weapon, told.ammo), (None, None));
+        told.weapon = gun;
+        told.seat(false);
+        assert_eq!(told.weapon, gun);
     }
 
     #[test]

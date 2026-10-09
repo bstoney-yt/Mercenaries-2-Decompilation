@@ -1051,6 +1051,13 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
     })
 }
 
+/// The button page's glyphs below U+E014 that [`button_glyph`] gives no
+/// word: one of these (or one past U+E013) is each word still without a
+/// picture, to be told apart by looking at them on the PC.
+pub const UNMATCHED_GLYPHS: [char; 6] = [
+    '\u{e000}', '\u{e001}', '\u{e002}', '\u{e003}', '\u{e00c}', '\u{e00f}',
+];
+
 /// The glyph a control word stands for on the PC (`[pfire] Shoot`): the
 /// HUD fonts keep the PC's button pictures on a page of their own
 /// (`english_18`'s second, `pc\common_18_buttons`), at private-use
@@ -1061,8 +1068,11 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
 /// pistol (the fire button confirms), and the rest are the pictures that
 /// say what the words do. Words not matched yet show the key bound to
 /// them, if the host named it ([`Screen::set_key_names`]), else stay as
-/// written.
-fn button_glyph(word: &str) -> Option<char> {
+/// written. `[support]`, `[reload]`, `[jump]` and `[bash]` are among
+/// those: the PC footage shows each as a picture, but which of the
+/// unmatched glyphs ([`UNMATCHED_GLYPHS`]) is which hasn't been looked at;
+/// nothing read here (the words' list, the font) ties a word to a glyph.
+pub fn button_glyph(word: &str) -> Option<char> {
     Some(match word.to_ascii_lowercase().as_str() {
         "crouch" => '\u{e004}',
         // Fire, and what the fire button does.
@@ -2554,6 +2564,31 @@ mod tests {
         );
         // Not matched to a picture yet: as written.
         assert_eq!(s.display_text("[honk] Honk"), "[honk] Honk");
+        // The words still without one, and the glyphs no word has.
+        for w in ["support", "reload", "jump", "bash"] {
+            assert_eq!(button_glyph(w), None, "{w}");
+        }
+        let words = [
+            "crouch",
+            "pfire",
+            "sfire",
+            "pswitch",
+            "move",
+            "aim",
+            "sprint",
+            "zoom",
+            "pda",
+            "pause",
+            "dpad left",
+            "dpad right",
+            "dpad up",
+            "dpad down",
+        ];
+        let given: Vec<char> = words.iter().filter_map(|w| button_glyph(w)).collect();
+        for g in UNMATCHED_GLYPHS {
+            assert!(!given.contains(&g), "{g:?}");
+        }
+        assert_eq!(given.len() + UNMATCHED_GLYPHS.len(), 0x14);
     }
 
     #[test]

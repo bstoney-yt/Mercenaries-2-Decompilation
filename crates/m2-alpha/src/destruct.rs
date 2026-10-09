@@ -16,6 +16,12 @@
 //! props (crates) are shoved. What a vehicle breaks comes apart as the
 //! vehicle knocks it on, not as a blast throws it: no building's rumble,
 //! no smoke.
+//!
+//! Only what has a building's collapse (its template's
+//! `BuildingCollapseAnim`) is heard coming down as a building, with the
+//! rumble; anything else (a fence, a sign) is heard as its template's own
+//! `SoundKey` says (`_global_fencewoodpanel`'s `prop_sheetmetal_sml`), as
+//! a blast brings it down or a vehicle does ([`break_sound`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -190,6 +196,9 @@ pub struct Destruction {
     /// What a vehicle's body touched and left standing, logged once each
     /// ([`held`]).
     held: HashSet<StaticKey>,
+    /// Breaks to be heard at the next [`update`](Self::update): where, and
+    /// the template's `SoundKey`.
+    heard: Vec<(Vec3, u32)>,
 }
 
 impl Destruction {
@@ -251,7 +260,17 @@ impl Destruction {
         {
             self.falling.push((i, cause));
         } else {
+            // Drawn as its wreck at once: heard now, as one coming down
+            // would be ([`update`](Self::update)), if it is no building.
             world.destroyed.insert(i);
+            let db = &world.index.template_db;
+            let building = db
+                .durability
+                .get(&o.template)
+                .is_some_and(|d| d.collapse.is_some());
+            if let Some(&k) = db.sound_keys.get(&o.template).filter(|_| !building) {
+                self.heard.push((o.position, k));
+            }
         }
         world.take_static(i);
     }
@@ -302,7 +321,7 @@ impl Destruction {
                         crash.map(|c| c.how),
                         vehicle.mass,
                         vehicle.velocity.length(),
-                        no_sound(world, o.template)
+                        break_sound(world, o.template)
                     );
                     let cause = Cause::Crash {
                         velocity: vehicle.velocity,
@@ -338,8 +357,11 @@ impl Destruction {
                         crash.map(|c| c.how),
                         vehicle.mass,
                         vehicle.velocity.length(),
-                        no_sound(world, template)
+                        break_sound(world, template)
                     );
+                    if let Some(&k) = world.index.template_db.sound_keys.get(&template) {
+                        self.heard.push((position, k));
+                    }
                     props.wreck_crashed(&mut world.physics, e, |shifted| {
                         crate::game::flung(vehicle.velocity, vehicle.mass, shifted)
                     });
@@ -358,9 +380,13 @@ impl Destruction {
     /// Brings down those destroyed whose props have loaded: the island's
     /// copy goes, the prop breaks apart (or shows its wreck). One a blast
     /// destroyed is heard coming down, dust rising where its break-up
-    /// names points; one a vehicle ran into is knocked on by it, and
-    /// nothing is heard ([`no_sound`]).
+    /// names points, if it has a building's collapse; one a vehicle ran
+    /// into is knocked on by it. Either, with no building's collapse, is
+    /// heard as its template's `SoundKey` says ([`break_sound`]).
     pub fn update(&mut self, world: &mut World, props: &mut Props, combat: &mut Combat) {
+        for (at, key) in self.heard.drain(..) {
+            combat.broke(at, key);
+        }
         self.falling.retain(|&(i, cause)| {
             let key = key(i);
             match props.get(key) {
@@ -373,10 +399,17 @@ impl Destruction {
                 }
             }
             world.take(i);
+            let template = world.index.objects[i].template;
+            let db = &world.index.template_db;
+            let building = db
+                .durability
+                .get(&template)
+                .is_some_and(|d| d.collapse.is_some());
+            let sound_key = db.sound_keys.get(&template).copied();
             match cause {
                 Cause::Blast(from) => {
                     props.wreck(&mut world.physics, key, Some(from));
-                    if props.broke_apart(key) {
+                    if props.broke_apart(key) && building {
                         if let Some(at) = props.centre(key) {
                             combat.collapse(at);
                         }
@@ -391,28 +424,34 @@ impl Destruction {
                     });
                 }
             }
+            if !building && let Some(k) = sound_key {
+                let at = props.centre(key).unwrap_or(world.index.objects[i].position);
+                combat.broke(at, k);
+            }
             false
         });
     }
 }
 
-/// Why nothing is heard as a vehicle breaks one of `template`'s: no field
-/// read from the template database names a break sound yet (the building
-/// rumble a blast's collapse plays is not one, and no gain is made up for
-/// another). Names the template, and the bank its `SoundEffect` names if
-/// it has one, for a survey to find the field by (`templates:<name>`,
-/// `sounddb:<name>`).
-fn no_sound(world: &World, template: u32) -> String {
+/// What is heard as one of `template`'s breaks, for the log: a building
+/// (it has `BuildingCollapseAnim`) comes down to a blast with the
+/// collapse's rumble; anything else is heard as its `SoundKey` says
+/// (`sound: key ... plays ...` logs what that is), or not at all if it
+/// has none (no other sound stands in).
+fn break_sound(world: &World, template: u32) -> String {
     let db = &world.index.template_db;
-    format!(
-        "no break sound read for template {template:08x} {:?} (its SoundEffect's bank {}): none \
-         played",
-        db.names.get(&template).map_or("?", String::as_str),
-        db.infos
-            .get(&template)
-            .and_then(|t| t.engine)
-            .map_or_else(|| "none".to_owned(), |b| format!("{b:08x}"))
-    )
+    let name = db.names.get(&template).map_or("?", String::as_str);
+    let building = db
+        .durability
+        .get(&template)
+        .is_some_and(|d| d.collapse.is_some());
+    match db.sound_keys.get(&template) {
+        _ if building => {
+            format!("template {template:08x} {name:?} has a building's collapse: no break sound")
+        }
+        Some(k) => format!("template {template:08x} {name:?} heard by its SoundKey {k:08x}"),
+        None => format!("template {template:08x} {name:?} has no SoundKey: none played"),
+    }
 }
 
 /// The line logged for what a vehicle's body touched and left standing

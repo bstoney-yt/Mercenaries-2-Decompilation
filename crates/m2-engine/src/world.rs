@@ -273,10 +273,16 @@ pub struct Templates {
     pub explosions: HashMap<u32, crate::durability::Explosion>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
+    /// Where each template's entrances are got in by (`DriverHatch`), by
+    /// id ([`crate::hijack::entrance_points`]).
+    pub entrance_points: HashMap<u32, Vec<u32>>,
     /// How air strikes' ordnance flies and what its blasts do.
     pub ordnance: crate::ordnance::Ordnance,
     /// How vehicles break each template's objects running into them.
     pub crashable: HashMap<u32, crate::durability::Crash>,
+    /// The sound each template's objects make breaking (its `SoundKey`),
+    /// by id ([`crate::durability::sound_keys`]).
+    pub sound_keys: HashMap<u32, u32>,
     /// The templates that stand already destroyed, by id: those whose
     /// `Health` is 0. All 201 such are ruins (`_marsh_bridgemid_ruined`,
     /// `AMX30_RUIN`), each with the model of its intact twin, whose
@@ -627,8 +633,10 @@ impl Templates {
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
+            entrance_points: crate::hijack::entrance_points(&db),
             ordnance: crate::ordnance::read(&db),
             crashable: crate::durability::crashable(&db),
+            sound_keys: crate::durability::sound_keys(&db),
             health: crate::tuning::healths(&db),
             speeds: crate::tuning::human_speeds(&db),
             human_sets: crate::tuning::human_animation_sets(&db),

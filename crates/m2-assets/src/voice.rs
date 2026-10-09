@@ -150,6 +150,9 @@ pub struct PlainCue {
 /// A record as the cue list points at it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
+    /// The cue hash its first word holds (0 for a record too short to
+    /// hold one).
+    pub cue: u32,
     pub volume: f32,
     pub variants: Vec<(u32, u32, f32)>,
 }
@@ -164,6 +167,14 @@ impl CueTable {
     pub fn cue_record(&self, cue: u32) -> Option<&Record> {
         let c = self.plain_cue(cue)?;
         self.records.get(c.record as usize)
+    }
+
+    /// The record cue `cue` plays: through the cue list
+    /// ([`cue_record`](Self::cue_record)), else the record whose own first
+    /// word is the cue (a line's or a group's).
+    pub fn record_of(&self, cue: u32) -> Option<&Record> {
+        self.cue_record(cue)
+            .or_else(|| self.records.iter().find(|r| r.cue == cue && cue != 0))
     }
 
     /// The plain cue keyed by `cue`.
@@ -238,6 +249,7 @@ impl CueTable {
                     GROUP_VARIANTS
                 };
                 all.push(Record {
+                    cue: word(0),
                     volume: f32::from_bits(word(0x10)),
                     variants: (first..size)
                         .step_by(12)
@@ -247,6 +259,7 @@ impl CueTable {
                 });
             } else {
                 all.push(Record {
+                    cue: 0,
                     volume: 0.0,
                     variants: Vec::new(),
                 });
