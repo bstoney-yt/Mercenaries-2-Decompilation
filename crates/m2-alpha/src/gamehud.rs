@@ -601,6 +601,20 @@ pub struct HudCall {
     pub callback: bool,
 }
 
+/// The reticle's kind and health for a person under it: soldiers who have
+/// turned on her are enemies (-1), anyone else 0; their health of the most
+/// they started with (a soldier's template's, a civilian's 100), which the
+/// arc shows a share of.
+fn target_health(n: &crate::npc::Npc) -> (i32, i32, i32) {
+    let enemy = n.soldier && n.alert;
+    let most = n.most_hp.round().max(1.0);
+    (
+        -i32::from(enemy),
+        n.hp.round().clamp(0.0, most) as i32,
+        most as i32,
+    )
+}
+
 impl HudState {
     /// What the play shows now (the screen size and time step are the
     /// HUD's to fill in). Takes her hurts from `game`.
@@ -610,9 +624,7 @@ impl HudState {
             .and_then(|p| p.driving)
             .and_then(|i| game.scene.vehicles.get(i));
         let at = player.map(|p| p.character.position);
-        // On foot, the person a shot fired now would hit: soldiers who
-        // have turned on her are enemies. Their health of their own most
-        // (their template's), which the arc shows a share of.
+        // On foot, the person a shot fired now would hit.
         let people = &game.scene.people;
         let target = player
             .filter(|p| p.driving.is_none())
@@ -620,15 +632,7 @@ impl HudState {
             .and_then(|(p, w)| Combat::aim_probe(&w.physics, people, p))
             .and_then(|(_, person)| people.npcs.get(person?))
             .filter(|n| n.alive)
-            .map(|n| {
-                let enemy = n.soldier && n.alert;
-                let most = n.ai.health.round().max(1.0);
-                (
-                    -i32::from(enemy),
-                    n.hp.round().clamp(0.0, most) as i32,
-                    most as i32,
-                )
-            });
+            .map(target_health);
         let hurts = game
             .combat
             .take_hurts()
@@ -4787,5 +4791,33 @@ mod paint_tests {
             .flatten()
             .collect();
         assert!(verts.iter().any(|v| v.color.a() > 150 && v.pos.x > 700.0));
+    }
+
+    #[test]
+    fn the_target_arc_reads_each_person_of_their_own_most() {
+        use crate::npc::{Brain, Npc, tests::rig};
+        let person = |spawn: Option<u32>| {
+            Npc::new(
+                0,
+                &rig(),
+                Vec3::ZERO,
+                0.0,
+                Brain::Post { facing: 0.0 },
+                spawn,
+            )
+        };
+        // A civilian keeps the default profile (75) but starts at 100:
+        // full reads full, half reads half.
+        let mut civilian = person(None);
+        assert_eq!(target_health(&civilian), (0, 100, 100));
+        civilian.hp = 50.0;
+        assert_eq!(target_health(&civilian), (0, 50, 100));
+        // A soldier placed with their template's health, turned on her.
+        let mut soldier = person(Some(1));
+        soldier.hp = soldier.ai.health;
+        soldier.most_hp = soldier.ai.health;
+        soldier.alert = true;
+        let most = soldier.ai.health.round() as i32;
+        assert_eq!(target_health(&soldier), (-1, most, most));
     }
 }
