@@ -21,6 +21,28 @@
 //! name (`Graphics.Atmosphere.ChangeLineRegionSetting`): `VzaCon001` puts
 //! `rgn_atmo_carmonaislandrain` on `night` for its boat ride.
 //!
+//! What the first two contracts light themselves with, from the scripts'
+//! calls and the regions' outlines (the survey example's `atmospheres`
+//! section lists every region, record and start point):
+//!
+//! - `VzaCon001`: the boat starts in `carmonaislandrain` `Default` (dusk,
+//!   `LightTime` 0.1) and the script puts that region on `Night` at once,
+//!   so the sea ride is night; ashore the island is `carmonaisland` and,
+//!   from z 3029 up to Carmona's villa, `carmonaislandtop` (`LightTime`
+//!   0.075), neither of which any script changes. The Xbox 360 footage
+//!   agrees: night at sea, a low warm sun on the island and at the villa.
+//! - `PmcCon001` ("Go to Solano's villa"): its start by the bar (2763,
+//!   -16) lies in no region, so the island's default lights it (`LightTime`
+//!   0.2, `LightIntensity` 1.15, white sunlight); the villa grounds are
+//!   `PMC Outpost` `Default` (`LightTime` 0.85, sunlight 1.1, 0.95, 0.95),
+//!   and the script puts the house's own small region, `PMCinterior`, on
+//!   `warzone` (`LightTime` 0.65) as the contract starts. Footage: full
+//!   day on the drive, a bright late-afternoon sun at the villa; no night.
+//!
+//! The records are chosen as the game chooses them; by day the alpha still
+//! draws them too dark (round TOD: the drive and villa at L 45 to 57
+//! against the Xbox's 100 to 140, the default's sky near black).
+//!
 //! The time of day is each record's `LightTime` (`LightTimeSpeed` is 0 in
 //! every record, so the sun stands still): 0.05 to 0.1 in the records of
 //! the islands, whose reference footage is at sunset and dusk, 0.2 in the
