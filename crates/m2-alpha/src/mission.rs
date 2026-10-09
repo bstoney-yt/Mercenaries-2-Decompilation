@@ -2178,13 +2178,29 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     });
     if let Some(spec) = gun {
         let slot = combat::Rifle::from_spec(spec).slot();
+        // Its clips: its first record's amount (the crate launcher's 3);
+        // else, where that is none (the soldiers' `Assault Rifle`, whose
+        // equipment record gives no amount), what its ammunition records
+        // give that the gun takes (its 8 `Assault Rifle Bullet`); else one.
+        let fires = Some(spec.ammo.template);
+        let ammo: u32 = info
+            .walked
+            .iter()
+            .filter(|&&(a, _)| takes(templates, Some(spec.template), fires, a))
+            .map(|&(_, n)| n)
+            .sum();
+        let clips = match info.rounds {
+            0 if ammo > 0 => ammo,
+            0 => 1,
+            n => n,
+        };
         return Some(Leaves {
             template: id,
             model,
             reach: info.radius,
             weapon: Some(slot),
             gun: Some(spec.template),
-            gives: Some((slot, info.rounds.max(1) * spec.clip.max(1))),
+            gives: Some((slot, clips * spec.clip.max(1))),
             ..Leaves::default()
         });
     }
@@ -2254,20 +2270,26 @@ pub(crate) fn takes(
 
 /// What pickup `what` gives her now, as ammunition: every `Pickup`
 /// record of its template, each to the weapon of hers that [`takes`] it.
-/// A weapon lying there gives nothing so; it is taken up.
+/// A weapon lying there is taken up; as she walks over it, it gives only
+/// what its ammunition records (`Type` 1) give a weapon of hers (a dead
+/// soldier's `Assault Rifle`: its 8 `Assault Rifle Bullet` to a rifle
+/// that fires them), none for most.
 pub(crate) fn refill(
     templates: &Templates,
     combat: &combat::Combat,
     what: &Leaves,
 ) -> combat::Refill {
-    if what.weapon.is_some() {
-        return combat::Refill::default();
-    }
     let records = templates
         .leavings
         .pickups
         .get(&what.template)
-        .map_or(&[][..], |p| p.gives.as_slice());
+        .map_or(&[][..], |p| {
+            if what.weapon.is_some() {
+                p.walked.as_slice()
+            } else {
+                p.gives.as_slice()
+            }
+        });
     combat.refill(records, |weapon, fires, ammo| {
         takes(templates, weapon, fires, ammo)
     })
@@ -2474,6 +2496,110 @@ mod tests {
     }
 
     #[test]
+    fn a_soldiers_rifle_lies_loaded_and_gives_its_bullets_walked_over() {
+        use m2_engine::pickup::{EQUIPMENT, Leavings, PickupInfo};
+        use m2_engine::weapons::{Ammo, Arms, WeaponSpec};
+        // The PC data's `Assault Rifle` (8000436f): an equipment record of
+        // radius 1.5 and a record of 8 `Assault Rifle Bullet`, the ak47's
+        // model. Its clip here is made up for the test.
+        let (ak, bullet) = (0x8000_436f, 0x8000_0b01);
+        let model = name_hash("global_weapon_ak47");
+        let spec = WeaponSpec {
+            template: ak,
+            name: "Assault Rifle".into(),
+            model: Some(model),
+            class: Some(name_hash("Rifle")),
+            semi: false,
+            rate_of_fire: 600.0,
+            clip: 30,
+            reserve_clips: 8,
+            pellets: 1,
+            rounds_per_reload: 0,
+            scatter: 1.0,
+            ammo: Ammo {
+                template: bullet,
+                velocity: 300.0,
+                max_velocity: 0.0,
+                human_boost: 1.0,
+                gravity: 0.0,
+                damage: 10.0,
+                damage_min: 10.0,
+                falloff: (0.0, 0.0),
+                key: None,
+                blast: None,
+                timer: None,
+                timer_blast: None,
+                homing: None,
+                model: None,
+                sticky: false,
+            },
+            lock_on: None,
+            pickup: Some(8),
+        };
+        let db = Templates {
+            infos: HashMap::from([(
+                ak,
+                TemplateInfo {
+                    model: Some(model),
+                    vehicle: None,
+                    engine: None,
+                    person: false,
+                    human: false,
+                },
+            )]),
+            names: HashMap::from([
+                (ak, "Assault Rifle".to_owned()),
+                (bullet, "Assault Rifle Bullet".to_owned()),
+            ]),
+            leavings: Leavings {
+                pickups: HashMap::from([(
+                    ak,
+                    PickupInfo {
+                        kind: EQUIPMENT,
+                        radius: 1.5,
+                        ammo: None,
+                        rounds: 0,
+                        gives: vec![(bullet, 8)],
+                        walked: vec![(bullet, 8)],
+                        cue: None,
+                        effect: None,
+                    },
+                )]),
+                ammo: HashMap::from([(ak, bullet)]),
+                ..Leavings::default()
+            },
+            arms: Arms {
+                weapons: HashMap::from([(ak, spec.clone())]),
+                ..Arms::default()
+            },
+            ..Templates::default()
+        };
+        // Taken up: the rifle, with its 8 clips of bullets.
+        let gun = pickup(&db, ak).unwrap();
+        assert_eq!(
+            gun,
+            Leaves {
+                template: ak,
+                model: Some(model),
+                reach: 1.5,
+                weapon: Some(Weapon::Rifle),
+                gun: Some(ak),
+                gives: Some((Weapon::Rifle, 240)),
+                ..Leaves::default()
+            }
+        );
+        // Walked over with a rifle that fires its bullets: they are hers.
+        let mut combat = combat::Combat::default();
+        combat.rifle = combat::Rifle::from_spec(&spec);
+        assert_eq!(refill(&db, &combat, &gun).rifle, 240);
+        // With a rifle that fires another round: nothing; it is taken up.
+        combat.rifle.template = Some(0x8000_0c01);
+        combat.rifle.ammo = None;
+        combat.rifle.model_hash = None;
+        assert_eq!(refill(&db, &combat, &gun), combat::Refill::default());
+    }
+
+    #[test]
     fn a_broken_supply_crate_leaves_a_grenade_launcher_and_rockets() {
         use m2_engine::pickup::{Leavings, PickupInfo};
         let info = |model| TemplateInfo {
@@ -2497,6 +2623,7 @@ mod tests {
             ammo: Some(ammo),
             rounds,
             gives: vec![(ammo, rounds)],
+            walked: vec![(ammo, rounds)],
             cue: None,
             effect: None,
         };
