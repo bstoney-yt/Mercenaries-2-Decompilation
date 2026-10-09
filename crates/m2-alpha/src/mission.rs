@@ -911,6 +911,11 @@ impl MissionLink {
                 }
                 mission.set_subtitles(self.subtitles);
                 mission.start();
+                if self.movies {
+                    // The movies wait for the game, so the scripts' skip
+                    // mode has done its part.
+                    mission.end_skip_mode();
+                }
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
                     if obey(game, &mission, &mut self.vehicles, &c) {
