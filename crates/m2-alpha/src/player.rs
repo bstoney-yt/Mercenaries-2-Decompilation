@@ -254,6 +254,10 @@ pub struct Player {
     /// Sitting in the seat of the vehicle she drives, posed and placed
     /// there (`hijack::Hijacks::seat`): drawn though driving.
     pub seated: bool,
+    /// Seated: model to world for her body, the vehicle's whole turn
+    /// (pitch and roll as well as heading) with her clip's origin on the
+    /// seat ([`model_matrix`](Self::model_matrix)).
+    pub seat_frame: Option<Mat4>,
 }
 
 impl Player {
@@ -282,6 +286,7 @@ impl Player {
             launcher: false,
             down: false,
             seated: false,
+            seat_frame: None,
         }
     }
 
@@ -295,6 +300,33 @@ impl Player {
             }
         }
         out
+    }
+
+    /// Takes `model` as her body, with its rig's fight `clips`: a jump,
+    /// throw or bash under way played the old rig's clips by index, so it
+    /// stops.
+    pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips) {
+        self.model = model;
+        self.clips = clips;
+        self.leap = Leap::No;
+        self.throwing = None;
+        self.bashing = None;
+    }
+
+    /// Leaves what she does on foot behind for a vehicle's clips (in a
+    /// seat, or hijacking one), which only [`update`](Self::update)
+    /// would otherwise end: the weapon's pose over her upper body (a
+    /// carried rifle's arm, an aim, a throw), her aim's turn, a bash and
+    /// a jump. Back on foot, `update` takes them up again.
+    pub fn off_foot(&mut self) {
+        self.leap = Leap::No;
+        self.throwing = None;
+        self.bashing = None;
+        if let Some((_, rig)) = &mut self.model {
+            rig.animator.set_upper(None);
+            rig.aim = None;
+            rig.two_handed = false;
+        }
     }
 
     /// Starts throwing a grenade, if she has a throw to play and isn't
@@ -658,8 +690,15 @@ impl Player {
         )
     }
 
-    /// Model to world for her model, turned so its forward is her facing.
+    /// Model to world for her model, turned so its forward is her facing;
+    /// seated in what she drives, its [`seat_frame`](Self::seat_frame).
     pub fn model_matrix(&self) -> Mat4 {
+        if let Some(seat) = self
+            .seat_frame
+            .filter(|_| self.seated && self.driving.is_some())
+        {
+            return seat;
+        }
         let model_forward = self
             .model
             .as_ref()
@@ -798,5 +837,31 @@ mod tests {
         // Without a rig the model is taken to face +z.
         let forward = p.model_matrix().transform_vector3(Vec3::Z);
         assert!((forward - Vec3::X).length() < 1e-5, "{forward}");
+        // Seated, she leans with the vehicle (here pitched nose down);
+        // out of it, she stands up straight again.
+        let tilted = Mat4::from_rotation_x(0.3) * Mat4::from_translation(Vec3::Y);
+        p.seat_frame = Some(tilted);
+        p.seated = true;
+        p.driving = Some(0);
+        assert_eq!(p.model_matrix(), tilted);
+        p.driving = None;
+        let up = p.model_matrix().transform_vector3(Vec3::Y);
+        assert!((up - Vec3::Y).length() < 1e-5, "{up}");
+    }
+
+    #[test]
+    fn getting_in_leaves_her_aim_and_carry_behind() {
+        let mut rig = crate::npc::tests::rig();
+        rig.animator.set_upper(Some((0, vec![true].into())));
+        rig.aim = Some(Vec3::X);
+        rig.two_handed = true;
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.model = Some((crate::npc::tests::empty_model(), rig));
+        p.throwing = Some(0.2);
+        p.off_foot();
+        let (_, rig) = p.model.as_ref().unwrap();
+        assert_eq!(rig.animator.upper(), None);
+        assert_eq!((rig.aim, rig.two_handed), (None, false));
+        assert_eq!((p.throwing, p.bashing, p.leap), (None, None, Leap::No));
     }
 }
