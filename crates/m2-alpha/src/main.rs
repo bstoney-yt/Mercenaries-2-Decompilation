@@ -993,7 +993,11 @@ fn screenshot(
                 s.name,
                 s.position,
                 s.template,
-                s.layer.map_or("static".to_owned(), |l| format!("{l:08x}")),
+                match (s.layer, s.static_layer) {
+                    (Some(l), true) => format!("static {l:08x}"),
+                    (Some(l), false) => format!("{l:08x}"),
+                    (None, _) => "none".to_owned(),
+                },
                 if people.layer_in(s.layer) {
                     "in"
                 } else {

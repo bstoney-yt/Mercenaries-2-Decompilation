@@ -350,11 +350,13 @@ impl Game {
             s.poll();
         }
         // Where they may stand: the static layers the game starts with
-        // (all of them if that set isn't known) and its state layers.
+        // (all of them if that set isn't known) and its state layers; with
+        // `--mission`, the static layers the scripts have loaded so far
+        // (the people's set; their state layers' vehicles are theirs).
         let (static_layers, state_layers) = match &self.startup {
             Some(Startup::Loading(_)) => return,
             Some(Startup::Ready(set)) => (Some(&set.hashes), set.entities.as_slice()),
-            _ => (None, &[][..]),
+            _ => (scene.people.state_layers.as_ref(), &[][..]),
         };
 
         let near = player.character.position;

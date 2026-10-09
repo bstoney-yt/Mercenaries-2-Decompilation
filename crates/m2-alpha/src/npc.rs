@@ -446,8 +446,8 @@ pub struct Npc {
     pub landed: bool,
     /// The layer entity that placed them (soldiers).
     pub spawn: Option<u32>,
-    /// The state layer that placed them, if not a static one: they go
-    /// when it does.
+    /// The layer that placed them (a state layer or a static sub-layer):
+    /// they go when it does.
     pub layer: Option<u32>,
     pub hp: f32,
     pub alive: bool,
@@ -1117,8 +1117,9 @@ pub struct People {
     /// Spawns a mission wants soldiers at though their names don't say
     /// so (`vza_beachguard_1`): plain VZ soldiers.
     pub mission_soldiers: HashSet<u32>,
-    /// The state layers in, by name hash: a state layer's people stand
-    /// only while it is. `None` when that isn't known (all of them stand).
+    /// The layers in, by name hash (state layers and static sub-layers): a
+    /// layer's people stand only while it is. `None` when that isn't
+    /// known (all of them stand).
     pub state_layers: Option<HashSet<u32>>,
     /// Story characters' models to load, by their template: model and
     /// template name (taken by the scene).
@@ -1127,6 +1128,9 @@ pub struct People {
     /// templates share a model (the guerrillas' men and the GR
     /// Defenders), and each becomes a kind of its own.
     asked: HashSet<(u32, String)>,
+    /// Static sub-layers said (in the log) not to be loaded where their
+    /// people would stand.
+    unloaded: HashSet<u32>,
     active: HashSet<u32>,
     rng: Rng,
     /// The enhanced, smarter soldiers' settings (off: the original's).
@@ -1417,8 +1421,9 @@ impl People {
         }
     }
 
-    /// Whether a spawn of state layer `layer` (`None`: a static one) can
-    /// stand now: it is in, or which are in isn't known.
+    /// Whether a spawn of layer `layer` (a state layer or a static
+    /// sub-layer; `None`: none known) can stand now: it is in, or which
+    /// are in isn't known.
     pub fn layer_in(&self, layer: Option<u32>) -> bool {
         layer.is_none_or(|l| {
             self.state_layers
@@ -1451,6 +1456,29 @@ impl People {
             }
             _ => true,
         });
+        // Said once each, for checking against the layers the game loads:
+        // static sub-layers whose people near here don't stand (not while
+        // which are in is still to come).
+        if self
+            .state_layers
+            .as_ref()
+            .is_some_and(|set| !set.is_empty())
+        {
+            for s in spawns
+                .iter()
+                .filter(|s| s.static_layer && !far(s.position, ACTIVE))
+            {
+                if let Some(l) = s.layer
+                    && !self.layer_in(s.layer)
+                    && self.unloaded.insert(l)
+                {
+                    eprintln!(
+                        "people: static layer {l:08x} isn't loaded: {:?} and its other people don't stand",
+                        s.name
+                    );
+                }
+            }
+        }
         let civilian_kinds: Vec<usize> = (0..self.kinds.len())
             .filter(|&k| !self.kinds[k].soldier && !self.kinds[k].named)
             .collect();
@@ -1722,6 +1750,7 @@ pub(crate) mod tests {
             rotation: Quat::IDENTITY,
             route: Vec::new(),
             layer: None,
+            static_layer: false,
             model: None,
             list: Vec::new(),
             ai: None,
@@ -1774,6 +1803,7 @@ pub(crate) mod tests {
             rotation: Quat::IDENTITY,
             route: Vec::new(),
             layer: None,
+            static_layer: false,
             model: None,
             list: vec![
                 ("Guerilla Soldier".into(), 0x6a11, 1.0),
@@ -1823,6 +1853,7 @@ pub(crate) mod tests {
             rotation: Quat::IDENTITY,
             route: Vec::new(),
             layer: None,
+            static_layer: false,
             model: Some(model),
             list: Vec::new(),
             ai: None,
@@ -1874,11 +1905,26 @@ pub(crate) mod tests {
             rotation: Quat::IDENTITY,
             route: Vec::new(),
             layer: Some(0xc0),
+            static_layer: false,
             model: None,
             list: Vec::new(),
             ai: None,
         };
-        let spawns = [guard];
+        // A garrison of a static sub-layer the game may not load.
+        let garrison = SpawnPoint {
+            entity: 6,
+            name: "VZ Soldier 04".into(),
+            template: None,
+            position: Vec3::new(20.0, 0.0, 0.0),
+            rotation: Quat::IDENTITY,
+            route: Vec::new(),
+            layer: Some(0x51),
+            static_layer: true,
+            model: None,
+            list: Vec::new(),
+            ai: None,
+        };
+        let spawns = [guard, garrison];
         let tick = |people: &mut People, physics: &mut Physics| {
             people.update(physics, &spawns, Vec3::ZERO, None, 1.0 / 60.0);
             people
@@ -1891,11 +1937,13 @@ pub(crate) mod tests {
         assert!(tick(&mut people, &mut physics).is_empty());
         people.state_layers = Some(HashSet::from([0xc0]));
         assert_eq!(tick(&mut people, &mut physics), [5]);
+        people.state_layers = Some(HashSet::from([0xc0, 0x51]));
+        assert_eq!(tick(&mut people, &mut physics), [5, 6]);
         people.state_layers = Some(HashSet::new());
         assert!(tick(&mut people, &mut physics).is_empty());
         // Not knowing which layers are in, they stand.
         people.state_layers = None;
-        assert_eq!(tick(&mut people, &mut physics), [5]);
+        assert_eq!(tick(&mut people, &mut physics), [5, 6]);
     }
 
     #[test]
