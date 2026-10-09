@@ -502,6 +502,7 @@ fn parse_args() -> anyhow::Result<Options> {
         "--vsync",
         "--no-boot",
         "--smarter-ai",
+        "--dev",
     ];
     if std::env::args()
         .skip(1)
@@ -4559,9 +4560,11 @@ impl Running {
             .as_ref()
             .map(hijack::Hijacks::take_gui_calls)
             .unwrap_or_default();
+        let buttons = std::mem::take(&mut self.buttons);
+        let selected = buttons.iter().any(|b| b == "selection");
         if self.hud.game.is_some() {
             let mut state = gamehud::HudState::of(&mut self.game);
-            state.buttons = std::mem::take(&mut self.buttons);
+            state.buttons = buttons;
             state.gui_calls = gui_calls;
             info.game = Some(state);
         }
@@ -4573,6 +4576,28 @@ impl Running {
             for seq in g.take_callbacks() {
                 m.hud_callback(seq);
             }
+        }
+        // With no game HUD to show the contract's fanfare (`--old-hud`,
+        // its scripts not up or broken, or the fanfare's call failed in
+        // them), Enter closes it as the fanfare's own Enter does, and the
+        // flow goes on to the next contract.
+        let no_fanfare = self
+            .hud
+            .game
+            .as_ref()
+            .is_none_or(|g| !g.ready() || g.dropped_fanfare());
+        if let Some(m) = &mut self.mission
+            && selected
+            && no_fanfare
+            && !self.hud.menu
+            && m.completed()
+            && let Some(seq) = m.waiting_fanfare()
+        {
+            eprintln!(
+                "mission: Enter closes the contract's fanfare (HUD call {seq}), which the \
+                 game's HUD can't show"
+            );
+            m.hud_callback(seq);
         }
         if config.window.vsync != vsync {
             self.backend.set_vsync(config.window.vsync);

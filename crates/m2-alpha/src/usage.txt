@@ -203,6 +203,7 @@ each grey wedge sends the bomb (a press outside them undoes the presses
 made; moving the view away puts the wheel away). T, 1 or 2 calls it off;
 so does being hurt. P opens and shuts the PDA (the first contract's
 scripts give the bomb once she has looked at it).
+The contract done, Enter closes its fanfare and the flow goes on.
 M music on/off, Tab or right mouse captures the mouse, F11 fullscreen,
 Escape opens the menu (settings, save and load, quit).
 The developer's keys (--dev, or any launch but the whole game's): V
