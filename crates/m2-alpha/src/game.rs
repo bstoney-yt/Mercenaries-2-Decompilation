@@ -106,6 +106,8 @@ pub struct Game {
     fetched: HashSet<u32>,
     /// The island's traffic spawners and what they have out.
     pub traffic: crate::traffic::Traffic,
+    /// Vehicles the mission scripts send along a path (`crate::paths`).
+    pub paths: crate::paths::PathMoves,
     /// Seconds to the next look for the island's vehicles near the player.
     vehicle_wait: f32,
     /// The layers the game starts with, which the island's vehicles come
@@ -211,6 +213,7 @@ impl Game {
             destruction: Destruction::default(),
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
+            paths: crate::paths::PathMoves::default(),
             vehicle_wait: 0.0,
             startup: None,
             props_up: false,
@@ -676,6 +679,8 @@ impl Game {
                 }
             }
             self.traffic
+                .drive(&mut world.physics, &self.scene.vehicles, driven);
+            self.paths
                 .drive(&mut world.physics, &self.scene.vehicles, driven);
             knock_loose(
                 world,

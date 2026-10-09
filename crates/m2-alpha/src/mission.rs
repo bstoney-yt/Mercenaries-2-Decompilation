@@ -2144,9 +2144,55 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // A driver sent along a path (PmcCon001's villa tank, through the
+        // garage wall the scripts have just killed): its vehicle drives it
+        // ([`crate::paths`]). A person on foot sent along one isn't walked
+        // yet (the villa's wave soldiers).
+        Command::Goal {
+            guid,
+            goal,
+            target: Some(path),
+            haste,
+            ..
+        } if goal == "PathMove" => {
+            let vehicle = mission.world().borrow().vehicle_of(*guid);
+            let route: Vec<Vec3> = mission.path(*path).iter().map(|&p| Vec3::from(p)).collect();
+            match vehicle {
+                Some(v) if !route.is_empty() => {
+                    eprintln!(
+                        "mission: {guid:#x} drives {v:#x} along path {path:#x} ({} points, haste \
+                         {haste:?}): {:.1?} to {:.1?}",
+                        route.len(),
+                        route[0],
+                        route[route.len() - 1]
+                    );
+                    game.paths.start(v, route, haste.unwrap_or(1.0));
+                }
+                _ => eprintln!(
+                    "mission: PathMove for {guid:#x} along {path:#x} not driven (vehicle \
+                     {vehicle:x?}, {} points)",
+                    route.len()
+                ),
+            }
+            return false;
+        }
         Command::Kill(guid) => {
             if let Some(i) = index(guid) {
                 game.scene.vehicles[i].wrecked = true;
+            }
+            // A prop the scripts kill (PmcCon001's garage entrance, the
+            // villa hall's wall the tank comes through) breaks: its wreck,
+            // else it goes.
+            let scene = &mut game.scene;
+            if let Some(world) = &mut scene.world
+                && scene.props.get(*guid).is_some()
+            {
+                let centre = scene.props.centre(*guid);
+                let broke = scene.props.wreck(&mut world.physics, *guid, centre);
+                eprintln!(
+                    "mission: the scripts killed prop {guid:#x}: {}",
+                    if broke { "broken" } else { "already broken" }
+                );
             }
             // Wrecked while she waited to get in: the wait ends, as above.
             if fleet.reenter == Some(*guid) {
