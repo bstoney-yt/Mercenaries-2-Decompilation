@@ -1888,9 +1888,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
     };
     let Some(to) = to else { return false };
     if let Some(p) = game.scene.player.as_mut() {
-        p.character.position = Vec3::from(to);
-        p.character.velocity = Vec3::ZERO;
-        p.landed = false;
+        // At the height they give: onto the floor or ground there, not a
+        // roof over it.
+        p.drop_at(Vec3::from(to));
         p.driving = None;
         p.chase_target = None;
     }
