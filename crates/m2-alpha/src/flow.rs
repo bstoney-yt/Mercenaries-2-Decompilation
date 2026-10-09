@@ -353,6 +353,12 @@ impl Flow {
         }
     }
 
+    /// Whether the front end is up (or the game is yet to start): its
+    /// menus, where the mouse pointer shows.
+    pub fn in_menus(&self) -> bool {
+        self.stage != Stage::Game
+    }
+
     /// Whether a screen of its own covers the game.
     pub fn covers(&self) -> bool {
         self.movie.is_some() || self.stage != Stage::Game

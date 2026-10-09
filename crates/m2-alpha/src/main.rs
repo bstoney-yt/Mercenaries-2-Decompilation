@@ -765,7 +765,7 @@ fn hud_info(
     fov: f32,
     aspect: f32,
 ) -> ui::HudInfo {
-    let mut info = game.hud_info();
+    let mut info = game.hud_info(mission.and_then(mission::MissionLink::strings));
     if let Some(m) = mission {
         info.mission = Some(m.view());
     }
@@ -4365,7 +4365,12 @@ struct Running {
     /// Whether she was driving last tick (getting in is worth a word).
     was_driving: bool,
     input: Input,
+    /// The mouse is captured and its pointer hidden: in play, as the
+    /// game's (the pointer shows only in the front end and the pause
+    /// menu), unless the mouse key let it go (`released`) or the window
+    /// lost the focus.
     mouse_look: bool,
+    released: bool,
     /// Keyboard input is ignored while another window has focus.
     focused: bool,
     culling: bool,
@@ -4484,6 +4489,7 @@ impl App {
             was_driving: false,
             input: Input::default(),
             mouse_look: false,
+            released: false,
             focused,
             culling: !self.double_sided,
             last: Instant::now(),
@@ -4544,6 +4550,52 @@ impl Running {
         }
     }
 
+    /// Captures the mouse and hides its pointer in play, and lets it go
+    /// in the front end and the pause menu, as the game does; the pointer
+    /// was left showing over play until a click captured it (round 2 of
+    /// the owner's play tests). Each change is logged.
+    fn keep_mouse(&mut self) {
+        let menus = self.hud.menu || self.flow.as_ref().is_some_and(flow::Flow::in_menus);
+        let want = !menus && self.focused && !self.released;
+        if want != self.mouse_look {
+            self.set_mouse_look(want);
+            if self.mouse_look != want {
+                // The window wouldn't grab it: not again until a click.
+                eprintln!("mouse: the window would not capture it");
+                self.released = true;
+                return;
+            }
+            eprintln!(
+                "mouse: {} ({})",
+                if self.mouse_look {
+                    "captured, pointer hidden"
+                } else {
+                    "free, pointer shown"
+                },
+                if menus {
+                    "menus"
+                } else if !self.focused {
+                    "window not focused"
+                } else if self.released {
+                    "let go by its key"
+                } else {
+                    "play"
+                }
+            );
+        }
+    }
+
+    /// The UI's output to the window, the pointer hidden while the mouse
+    /// is captured: egui shows it again whenever its own pointer icon
+    /// changes, as it does on the window's first frames and each time the
+    /// pointer comes back in.
+    fn platform_output(&mut self, mut output: egui::PlatformOutput) {
+        if self.mouse_look {
+            output.cursor_icon = egui::CursorIcon::None;
+        }
+        self.egui.handle_platform_output(&self.window, output);
+    }
+
     /// Advances the simulation by whole ticks (none while the menu is
     /// open) and draws a frame with the HUD.
     fn frame(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
@@ -4554,11 +4606,12 @@ impl Running {
             self.lag -= TICK;
             self.tick(config, event_loop);
         }
+        self.keep_mouse();
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
         if let Some(flow) = self.flow.as_mut().filter(|f| f.covers()) {
             let output = self.hud.build_screen(input, |ui| flow.paint(ui));
-            self.egui.handle_platform_output(&self.window, output);
+            self.platform_output(output);
             let (w, h) = self.backend.size();
             return render(
                 &mut self.backend,
@@ -4597,7 +4650,7 @@ impl Running {
             info.game = Some(state);
         }
         let (action, output) = self.hud.build(input, &info, config);
-        self.egui.handle_platform_output(&self.window, output);
+        self.platform_output(output);
         // The mission's callbacks the game's HUD called (the contract
         // fanfare closing), back to the mission's scripts.
         if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
@@ -4675,14 +4728,15 @@ impl Running {
 
     fn open_menu(&mut self) {
         self.hud.menu = true;
-        self.set_mouse_look(false);
+        self.keep_mouse();
         self.input.clear();
     }
 
     fn close_menu(&mut self) {
         self.hud.menu = false;
         self.input.clear();
-        self.set_mouse_look(true);
+        self.released = false;
+        self.keep_mouse();
     }
 
     /// Plays as `hero` from now on: the body, clips, health and voice, and
@@ -4760,7 +4814,7 @@ impl Running {
             return;
         }
         if self.input.take_pressed(Action::ToggleMouse) {
-            self.set_mouse_look(!self.mouse_look);
+            self.released = self.mouse_look;
         }
         if self.input.take_pressed(Action::Fullscreen) {
             let full = self.window.fullscreen().is_none();
@@ -4908,9 +4962,7 @@ impl ApplicationHandler for App {
                 // clean either way.
                 state.focused = focused;
                 state.input.clear();
-                if !focused {
-                    state.set_mouse_look(false);
-                }
+                state.keep_mouse();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if state.focused && state.flow.as_ref().is_some_and(flow::Flow::holds) =>
@@ -4943,7 +4995,7 @@ impl ApplicationHandler for App {
                 state: ElementState::Pressed,
                 button: winit::event::MouseButton::Right | winit::event::MouseButton::Left,
                 ..
-            } if !state.mouse_look && !state.hud.menu => state.set_mouse_look(true),
+            } if !state.mouse_look && !state.hud.menu => state.released = false,
             // With the mouse captured, the buttons fire, aim and bash.
             WindowEvent::MouseInput {
                 state: pressed,
