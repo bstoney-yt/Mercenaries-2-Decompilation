@@ -923,6 +923,8 @@ fn anims<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
     let mut material_tracks = 0;
     let (mut bind_checked, mut bind_matched, mut non_finite) = (0usize, 0usize, 0);
     let mut worst_quat = 0.0f32;
+    // Per codec: quaternions checked, summed and largest |length - 1|.
+    let mut quat_err: HashMap<&str, (usize, f64, f32)> = HashMap::new();
     for (hash, data) in &clips {
         let clip = match Clip::parse(data) {
             Ok(c) => c,
@@ -959,9 +961,12 @@ fn anims<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
             .map_or("-".to_owned(), |r| format!("{r:.2}"));
         *rates.entry(rate).or_default() += 1;
         events += clip.events.len();
+        let err = quat_err.entry(name).or_default();
         for f in 0..clip.frame_count {
             for t in clip.frame(f).unwrap_or_default() {
-                worst_quat = worst_quat.max((t.rotation.length() - 1.0).abs());
+                let e = (t.rotation.length() - 1.0).abs();
+                worst_quat = worst_quat.max(e);
+                *err = (err.0 + 1, err.1 + f64::from(e), err.2.max(e));
             }
         }
 
@@ -1017,6 +1022,14 @@ fn anims<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
     );
     println!("frame rates {rates:?}");
     println!("{events} events; largest |quaternion length - 1| {worst_quat:.5}");
+    let mut quat_err: Vec<_> = quat_err.into_iter().collect();
+    quat_err.sort_by_key(|(name, _)| *name);
+    for (name, (n, sum, max)) in quat_err {
+        println!(
+            "  {name}: |quaternion length - 1| mean {:.6}, largest {max:.5} over {n} rotations",
+            sum / n.max(1) as f64
+        );
+    }
     println!(
         "{covered} clips covered by one of {} models",
         skeletons.len()
