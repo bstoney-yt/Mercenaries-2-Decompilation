@@ -1897,7 +1897,7 @@ natives! {
                 n.colour = colour;
                 n.justification = justification;
             }
-            out.push_back(Value::Integer(mlua::Integer::from(line_id)));
+            out.push_back(Value::Integer(line_id as mlua::Integer));
         }
         Ok(out)
     },
