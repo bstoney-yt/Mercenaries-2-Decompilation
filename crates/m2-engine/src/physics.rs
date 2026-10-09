@@ -7,9 +7,10 @@
 //! them on the main thread is quick.
 //!
 //! People move with Rapier's kinematic character controller: a capsule that
-//! slides along walls, climbs steps up to [`STEP_HEIGHT`] and slopes up to
-//! [`MAX_SLOPE`], and keeps to the ground going down. Gravity and jumping
-//! are integrated here, not by the solver.
+//! slides along walls, climbs steps up to [`STEP_HEIGHT`] (loose pieces
+//! lying about too) and slopes up to [`MAX_SLOPE`], and keeps to the
+//! ground going down. Gravity and jumping are integrated here, not by the
+//! solver.
 //!
 //! # Provenance
 //!
@@ -989,7 +990,10 @@ impl Physics {
             autostep: Some(CharacterAutostep {
                 max_height: CharacterLength::Absolute(STEP_HEIGHT),
                 min_width: CharacterLength::Absolute(0.2),
-                include_dynamic_bodies: false,
+                // Loose pieces lying about (a plank, a post knocked over)
+                // are stepped over as a static of their height is: else
+                // she can't climb a piece she can't push either.
+                include_dynamic_bodies: true,
             }),
             max_slope_climb_angle: MAX_SLOPE,
             min_slope_slide_angle: MAX_SLOPE,
@@ -2523,6 +2527,24 @@ mod tests {
         let mut c = Character::new(Vec3::new(0.0, 0.0, -10.0));
         walk(&p, &mut c, Vec3::new(4.0, 0.0, 0.0), 3.0);
         assert!(c.position.x < 5.0, "through the wall: {}", c.position);
+    }
+
+    #[test]
+    fn steps_over_a_loose_piece_lying_in_the_way() {
+        let mut p = ready();
+        // A plank 0.25 m thick knocked down across her way at z = 3, as
+        // a static of its height is stepped over.
+        let plank = LoosePiece::block(None, Vec3::ZERO, Vec3::new(2.0, 0.125, 0.15), 30.0);
+        let at = Mat4::from_translation(Vec3::new(0.0, 0.13, 3.0));
+        let id = p.add_debris(&plank, at, Vec3::ZERO, Vec3::ZERO);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let lying = p.debris_place(id).unwrap().w_axis;
+        assert!((lying.z - 3.0).abs() < 0.1 && lying.y < 0.2, "{lying}");
+        let mut c = Character::new(Vec3::ZERO);
+        walk(&p, &mut c, Vec3::new(0.0, 0.0, 4.0), 3.0);
+        assert!(c.position.z > 5.0, "held by the plank: {}", c.position);
     }
 
     #[test]
