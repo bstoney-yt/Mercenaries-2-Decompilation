@@ -77,24 +77,20 @@ pub struct Crasher {
 impl Crasher {
     /// Whether its box meets a model's box (`bounds`, model space) placed
     /// at `at`, for one its body hasn't touched (a bush with no
-    /// collision): that box's middle comes within its reach of the
-    /// vehicle's box, flat, and the two overlap in height (a helicopter
-    /// or a vehicle on a bridge flattens nothing under it, as nothing
-    /// over it).
+    /// collision, or something low its hull rides over): the two boxes,
+    /// each turned as placed, overlap ([`boxes_meet`]: a long hedge hit
+    /// at its end is met, a fence it drives along a few metres off is
+    /// not), and so do their heights (a helicopter or a vehicle on a
+    /// bridge flattens nothing under it, as nothing over it).
     fn meets(&self, at: Mat4, (olo, ohi): (Vec3, Vec3)) -> bool {
         let (lo, hi) = self.bounds;
-        // Its box's middle, and how far it reaches, in the vehicle's
-        // space: it is hit if that comes within the vehicle's box.
         let centre = at.transform_point3((olo + ohi) * 0.5);
-        let local = self.place.inverse().transform_point3(centre);
         let half = (ohi - olo) * 0.5;
-        let reach = half.x.max(half.z).min(half.length() * 0.5);
-        let nearest = local.clamp(lo, hi);
         let (low, high) = (centre.y - half.y, centre.y + half.y);
         let height = |y: f32| self.place.transform_point3(Vec3::new(0.0, y, 0.0)).y;
-        (local - nearest).with_y(0.0).length() <= reach
-            && low <= height(hi.y)
+        low <= height(hi.y)
             && high >= height(lo.y)
+            && boxes_meet((self.place, self.bounds), (at, (olo, ohi)))
     }
 
     /// What it does to what it runs into (under `key`), whose template
@@ -118,6 +114,45 @@ impl Crasher {
             None
         }
     }
+}
+
+/// Whether two boxes (each its model-space corners, placed by its
+/// matrix) overlap, turned as they are: no line separates them, tried
+/// along each box's three edges and every pair of one's edge with the
+/// other's (the separating-axis test for two boxes).
+fn boxes_meet(
+    (a, (alo, ahi)): (Mat4, (Vec3, Vec3)),
+    (b, (blo, bhi)): (Mat4, (Vec3, Vec3)),
+) -> bool {
+    // Each box's middle, its edges' directions, and how far it reaches
+    // along each (scaled as its matrix has it).
+    let turned = |m: Mat4, lo: Vec3, hi: Vec3| {
+        let half = (hi - lo) * 0.5;
+        let axes = [m.x_axis, m.y_axis, m.z_axis].map(|c| c.truncate());
+        let reach = Vec3::new(
+            half.x * axes[0].length(),
+            half.y * axes[1].length(),
+            half.z * axes[2].length(),
+        );
+        let axes = axes.map(|v| v.normalize_or_zero());
+        (m.transform_point3((lo + hi) * 0.5), axes, reach)
+    };
+    let (ac, aa, ar) = turned(a, alo, ahi);
+    let (bc, ba, br) = turned(b, blo, bhi);
+    let apart = bc - ac;
+    let parted = |l: Vec3| {
+        // Edges near parallel give no direction to try.
+        if l.length_squared() < 1e-8 {
+            return false;
+        }
+        let along = |axes: &[Vec3; 3], reach: Vec3| {
+            (0..3).map(|i| axes[i].dot(l).abs() * reach[i]).sum::<f32>()
+        };
+        apart.dot(l).abs() > along(&aa, ar) + along(&ba, br)
+    };
+    let edges = aa.iter().chain(&ba).copied();
+    let crossed = aa.iter().flat_map(|&u| ba.iter().map(move |&v| u.cross(v)));
+    !edges.chain(crossed).any(parted)
 }
 
 /// What [`Destruction::crash`] did to one of the island's placed objects
@@ -152,6 +187,9 @@ pub struct Destruction {
     falling: Vec<(usize, Cause)>,
     /// Destroyed, by placed object.
     pub destroyed: HashSet<usize>,
+    /// What a vehicle's body touched and left standing, logged once each
+    /// ([`held`]).
+    held: HashSet<StaticKey>,
 }
 
 impl Destruction {
@@ -225,7 +263,8 @@ impl Destruction {
     /// the vehicle to knock loose. What it runs into is what its body
     /// touched in the step just taken (`touched`: a long fence hit near
     /// its end post counts, as one hit in its middle does), and what its
-    /// box meets ([`Crasher::meets`]: a bush with no collision).
+    /// box meets ([`Crasher::meets`]: a bush with no collision). What its
+    /// body touched and still stands is logged once ([`held`]).
     pub fn crash(
         &mut self,
         world: &mut World,
@@ -273,6 +312,9 @@ impl Destruction {
                     out.push(Crashed::Down(key));
                 }
                 Some(c) => out.push(c),
+                None if touched.contains(&key) && self.held.insert(key) => {
+                    eprintln!("{}", held(world, key, o.model, o.template, crash, vehicle));
+                }
                 None => {}
             }
         }
@@ -304,6 +346,9 @@ impl Destruction {
                     out.push(Crashed::Down(key));
                 }
                 Some(c) => out.push(c),
+                None if touched.contains(&key) && self.held.insert(key) => {
+                    eprintln!("{}", held(world, key, model, template, crash, vehicle));
+                }
                 None => {}
             }
         }
@@ -370,8 +415,37 @@ fn no_sound(world: &World, template: u32) -> String {
     )
 }
 
+/// The line logged for what a vehicle's body touched and left standing
+/// (`key`, of `model` and `template`, whose template has `crash`, if
+/// any): which template holds it, by name, and what its
+/// `PhysicsPropertyCrashable` reads, for a run to tell a wall the data
+/// keeps standing from one it should break.
+fn held(
+    world: &World,
+    key: StaticKey,
+    model: u32,
+    template: u32,
+    crash: Option<Crash>,
+    vehicle: &Crasher,
+) -> String {
+    format!(
+        "destruct: a {:.0} kg vehicle at {:.1} m/s held by {key:?} ({model:08x}), template \
+         {template:08x} {:?}, crashable {crash:?}",
+        vehicle.mass,
+        vehicle.velocity.length(),
+        world
+            .index
+            .template_db
+            .names
+            .get(&template)
+            .map_or("?", String::as_str),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use m2_math::glam::Quat;
+
     use super::*;
 
     /// A jeep: 4.4 m long along z, 2 m wide, 1.6 m high, standing at
@@ -399,6 +473,41 @@ mod tests {
         // A sign hung 5 m over the road: driven under.
         let sign = Mat4::from_translation(Vec3::new(0.0, 5.0, 2.5));
         assert!(!jeep(Vec3::ZERO).meets(sign, bush));
+    }
+
+    #[test]
+    fn a_vehicle_meets_what_its_box_overlaps_not_what_is_near() {
+        // A fence 20 m long along x, 2 m high, 0.2 m thick.
+        let fence = (Vec3::new(-10.0, 0.0, -0.1), Vec3::new(10.0, 2.0, 0.1));
+        let at = Mat4::IDENTITY;
+        // The jeep driving along it, facing +x, its side 3 m and then
+        // 4 m off: it passes the fence by.
+        let along = |z: f32| Crasher {
+            place: Mat4::from_rotation_translation(
+                Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+                Vec3::new(0.0, 0.0, z),
+            ),
+            ..jeep(Vec3::ZERO)
+        };
+        assert!(!along(4.0).meets(at, fence));
+        assert!(!along(5.0).meets(at, fence));
+        // A 4 m panel a metre beside it: passed by too.
+        let panel = (Vec3::new(-2.0, 0.0, -0.1), Vec3::new(2.0, 2.0, 0.1));
+        assert!(!along(2.0).meets(at, panel));
+        // Scraping it: met.
+        assert!(along(1.05).meets(at, fence));
+        // A hedge 20 m long, its end run into by the jeep's nose: met,
+        // though its middle is 9 m off.
+        let hedge = (Vec3::new(-10.0, 0.0, -0.5), Vec3::new(10.0, 1.5, 0.5));
+        assert!(jeep(Vec3::new(9.5, 0.0, -2.5)).meets(at, hedge));
+        // Turned across the jeep's way at 45 degrees, its end in front of
+        // the nose: met; the jeep 2.5 m further along it, past its end:
+        // not.
+        let turned = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_4);
+        let end = turned.transform_point3(Vec3::X * 9.5);
+        assert!(jeep(end - Vec3::Z * 2.5).meets(turned, hedge));
+        let past = turned.transform_point3(Vec3::X * 12.0);
+        assert!(!jeep(past - Vec3::Z * 2.5).meets(turned, hedge));
     }
 
     #[test]

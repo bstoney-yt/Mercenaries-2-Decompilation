@@ -38,9 +38,9 @@ pub struct Prop {
     /// break it as its `PhysicsPropertyCrashable` says, as they do the
     /// island's objects of it ([`crate::destruct`]).
     pub template: u32,
-    /// Placed by its entity's name rather than a `ModelName`: one whose
-    /// model has no collision of its own is in nobody's way, as on the
-    /// island.
+    /// Placed by its entity's name rather than a `ModelName`: on the
+    /// island one whose model has no collision of its own is in nobody's
+    /// way; here it is only logged ([`through_on_island`]).
     pub named: bool,
 }
 
@@ -584,7 +584,7 @@ impl Props {
         if let Some(Some(m)) = self.models.get(&p.model)
             && let Some(shape) = &m.collision
             && !p.wrecked
-            && stands(entity, p, shape)
+            && stands(entity)
         {
             physics.add_static(StaticKey::Entity(entity), shape, p.position, p.rotation);
         }
@@ -1038,18 +1038,25 @@ impl Props {
             self.widest = self.widest.max(reach);
         }
         if let Some(shape) = &cpu.collision {
-            let mut through = 0;
+            let mut through = Vec::new();
             for (&e, p) in self.shown.iter().filter(|(_, p)| p.model == hash) {
-                if !stands(e, p, shape) {
-                    through += usize::from(!crate::destruct::adopted(e));
-                } else if !p.wrecked && !self.knocked.contains_key(&e) {
+                if !stands(e) {
+                    continue;
+                }
+                if through_on_island(p, shape) {
+                    through.push(format!("{e:#x} (template {:08x})", p.template));
+                }
+                if !p.wrecked && !self.knocked.contains_key(&e) {
                     physics.add_static(StaticKey::Entity(e), shape, p.position, p.rotation);
                 }
             }
-            if through > 0 {
+            if !through.is_empty() {
+                through.sort_unstable();
                 eprintln!(
-                    "props: {hash:08x} has no collision of its own: {through} placed by name \
-                     are in nobody's way, as the island's are"
+                    "props: {hash:08x} has no collision of its own (no PHY2): {} placed by name \
+                     kept in the way, though the island's are in nobody's way: {}",
+                    through.len(),
+                    through.join(", ")
                 );
             }
         }
@@ -1172,15 +1179,22 @@ impl Props {
     }
 }
 
-/// Whether `shape`, prop `entity`'s (`p`) model's collision, stands in
-/// the way while it stands: not a stand-in cut from the model's drawn
-/// triangles for one placed by name (a bush, a plant: its model has no
-/// `PHY2`), which vehicles and people go through as they go through the
-/// island's ([`m2_engine::World`] puts none up for those); nor for one of
-/// the island's objects put up only to come down
+/// Whether prop `entity`'s model's collision stands in the way while it
+/// stands: not for one of the island's objects put up only to come down
 /// ([`crate::destruct::adopted`]), whose collision is already gone.
-fn stands(entity: u32, p: &Prop, shape: &CollisionShape) -> bool {
-    !(p.named && shape.stand_in) && !crate::destruct::adopted(entity)
+fn stands(entity: u32) -> bool {
+    !crate::destruct::adopted(entity)
+}
+
+/// Whether prop `p`'s collision, `shape`, is a stand-in cut from its
+/// model's drawn triangles for one placed by name (its model has no
+/// `PHY2`): the island's such are in nobody's way ([`m2_engine::World`]
+/// puts none up for them). A state layer's are kept in the way and only
+/// logged until a census of the models without `PHY2` shows the island's
+/// rule holds for them too: an outpost's sandbags and walls, or a
+/// mission's gate, may be among them.
+fn through_on_island(p: &Prop, shape: &CollisionShape) -> bool {
+    p.named && shape.stand_in
 }
 
 /// How a building's intact walls go down as it collapses, as its
@@ -1571,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prop_placed_by_name_without_collision_of_its_own_is_in_nobodys_way() {
+    fn a_prop_without_collision_of_its_own_stays_in_the_way_but_is_noted() {
         let mut shape = CollisionShape::cuboid(Vec3::ONE);
         let p = Prop {
             model: 1,
@@ -1581,15 +1595,14 @@ mod tests {
             template: 0,
             named: true,
         };
-        assert!(stands(5, &p, &shape));
-        // Cut from its drawn triangles: as on the island, nothing for one
-        // placed by name, the stand-in for one placed by its `ModelName`.
+        assert!(stands(5) && !through_on_island(&p, &shape));
+        // Cut from its drawn triangles: the island puts none up for one
+        // placed by name; a state layer's stays in the way, only noted.
         shape.stand_in = true;
-        assert!(!stands(5, &p, &shape));
-        assert!(stands(5, &Prop { named: false, ..p }, &shape));
+        assert!(stands(5) && through_on_island(&p, &shape));
+        assert!(!through_on_island(&Prop { named: false, ..p }, &shape));
         // One of the island's put up to come down has lost its collision.
-        shape.stand_in = false;
-        assert!(!stands(crate::destruct::key(3), &p, &shape));
+        assert!(!stands(crate::destruct::key(3)));
     }
 
     #[test]
