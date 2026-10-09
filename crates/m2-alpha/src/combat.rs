@@ -983,6 +983,16 @@ impl Picked {
     }
 }
 
+/// What an ammunition pickup's `Pickup` records give her, by the weapons
+/// she carries now ([`Combat::refill`]): rounds for her rifle and for the
+/// gun in the launcher's place, and grenades.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Refill {
+    pub rifle: u32,
+    pub launcher: u32,
+    pub grenades: u32,
+}
+
 /// What flies, to draw: a rocket, a thrown grenade or a launched round.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flying {
@@ -1541,36 +1551,60 @@ impl Combat {
         self.hp * 100.0 / self.max_hp.max(1.0)
     }
 
-    /// Launcher rounds, grenades and health from a pickup: as many as she
-    /// has room for, health up to full.
-    pub fn take_supplies(&mut self, launcher: u32, grenades: u32, health: f32) {
-        if launcher > 0 {
-            self.take_ammo(Weapon::GrenadeLauncher, launcher);
+    /// What an ammunition pickup's `Pickup` records (each its ammunition
+    /// template and amount) give her: each record goes to the first of her
+    /// rifle, the gun in the launcher's place and her grenades that
+    /// `takes` it (asked with the weapon's template, the ammunition it
+    /// fires and the record's). A gun's amount counts its clips (the
+    /// crate launcher's 3 are the footage's "6 2"); a thrown weapon's
+    /// counts itself.
+    pub fn refill(
+        &self,
+        records: &[(u32, u32)],
+        takes: impl Fn(Option<u32>, Option<u32>, u32) -> bool,
+    ) -> Refill {
+        let gun = |g: &Rifle, ammo| takes(g.template, g.ammo.map(|a| a.template), ammo);
+        let grenade = self.throwables.first().and_then(Option::as_ref);
+        let mut out = Refill::default();
+        for &(ammo, n) in records {
+            if gun(&self.rifle, ammo) {
+                out.rifle += n * self.rifle.clip.max(1);
+            } else if self.second.is_some() && gun(&self.launcher, ammo) {
+                out.launcher += n * self.launcher.clip.max(1);
+            } else if grenade.is_some_and(|g| takes(Some(g.template), Some(g.ammo.template), ammo))
+            {
+                out.grenades += n;
+            }
         }
-        self.grenades = (self.grenades + grenades).min(MAX_GRENADES);
+        out
+    }
+
+    /// What a pickup gives her ([`refill`](Self::refill)), and its health:
+    /// as much as she has room for, health up to full.
+    pub fn take_supplies(&mut self, refill: Refill, health: f32) {
+        if refill.rifle > 0 {
+            self.take_ammo(Weapon::Rifle, refill.rifle);
+        }
+        if let Some(w) = self.second.filter(|_| refill.launcher > 0) {
+            self.take_ammo(w, refill.launcher);
+        }
+        self.grenades = (self.grenades + refill.grenades).min(MAX_GRENADES);
         self.hp = (self.hp + health).min(self.max_hp);
     }
 
-    /// Whether ammunition or health lying there gives her anything: what
-    /// she walks over she takes only then.
-    pub fn can_use(&self, what: &crate::flights::Leaves) -> bool {
-        let rounds = match what.gives {
-            Some((Weapon::GrenadeLauncher, n)) => {
-                n > 0 && self.second == Some(Weapon::GrenadeLauncher)
-            }
-            Some((Weapon::Rifle, n)) => n > 0 && self.rifle_rounds.stored < self.rifle.spare,
-            Some((w, n)) => n > 0 && self.second == Some(w),
-            None => false,
-        };
-        let launcher = what.launcher > 0
-            && self.second == Some(Weapon::GrenadeLauncher)
+    /// Whether ammunition or health lying there gives her anything she
+    /// has room for: what she walks over she takes only then.
+    pub fn can_use(&self, refill: Refill, health: f32) -> bool {
+        let rifle = refill.rifle > 0 && self.rifle_rounds.stored < self.rifle.spare;
+        let launcher = refill.launcher > 0
+            && self.second.is_some()
             && self
                 .launcher_rounds
                 .is_some_and(|r| r.stored < self.launcher.spare);
-        rounds
+        rifle
             || launcher
-            || (what.grenades > 0 && self.grenades < MAX_GRENADES)
-            || (what.health > 0.0 && self.hp < self.max_hp)
+            || (refill.grenades > 0 && self.grenades < MAX_GRENADES)
+            || (health > 0.0 && self.hp < self.max_hp)
     }
 
     /// The weapons she carries but doesn't hold, which hang on her back:
@@ -4338,6 +4372,93 @@ mod tests {
     }
 
     #[test]
+    fn a_pickup_refills_the_weapons_she_carries_by_their_ammunition() {
+        let ammo = |template| Ammo {
+            template,
+            velocity: 0.0,
+            max_velocity: 0.0,
+            human_boost: 1.0,
+            gravity: 0.0,
+            damage: 0.0,
+            damage_min: 0.0,
+            falloff: (0.0, 0.0),
+            key: None,
+            blast: None,
+            timer: None,
+            timer_blast: None,
+            homing: None,
+            model: None,
+            sticky: false,
+        };
+        let mut combat = Combat {
+            carbine: Rifle {
+                template: Some(10),
+                ammo: Some(ammo(11)),
+                ..Rifle::default()
+            },
+            ..Combat::default()
+        };
+        combat.set_thrown(
+            Throwable {
+                template: 20,
+                name: "Grenade".to_owned(),
+                model: None,
+                ammo: ammo(21),
+                max: MAX_GRENADES,
+                speeds: [0.0; 3],
+                pitches: [0.0; 3],
+                throw_angle: 0.0,
+                cook: false,
+                detonator: None,
+                planted: None,
+            },
+            None,
+            None,
+        );
+        combat.carbine_only();
+        // A record per kind of ammunition: the carbine's 3 clips, 2
+        // grenades, and rounds for a launcher she doesn't carry.
+        let records = [(99, 5), (11, 3), (21, 2), (31, 4)];
+        let fires = |_: Option<u32>, fires: Option<u32>, ammo: u32| fires == Some(ammo);
+        let refill = combat.refill(&records, fires);
+        assert_eq!(
+            refill,
+            Refill {
+                rifle: 90,
+                launcher: 0,
+                grenades: 2
+            }
+        );
+        assert!(combat.can_use(refill, 0.0));
+        combat.take_supplies(refill, 0.0);
+        assert_eq!(
+            combat.rifle_rounds,
+            Rounds {
+                clip: 30,
+                stored: 90
+            }
+        );
+        assert_eq!(combat.grenades, 2);
+        // Ammunition for none of hers gives nothing; a weapon's own link
+        // (`takes` by its template) counts as well as what it fires.
+        assert!(!combat.can_use(combat.refill(&[(99, 5)], fires), 0.0));
+        combat.launcher = Rifle {
+            template: Some(30),
+            ammo: Some(ammo(32)),
+            ..Rifle::launcher(Weapon::GrenadeLauncher)
+        };
+        combat.second = Some(Weapon::GrenadeLauncher);
+        combat.launcher_rounds = Some(Rounds::default());
+        let own =
+            |w: Option<u32>, f: Option<u32>, a: u32| f == Some(a) || (w == Some(30) && a == 31);
+        assert_eq!(combat.refill(&records, own).launcher, 24);
+        // Full, the rifle's rounds leave the pickup lying.
+        combat.rifle_rounds.stored = combat.rifle.spare;
+        let rifle_only = combat.refill(&[(11, 1)], fires);
+        assert!(!combat.can_use(rifle_only, 0.0));
+    }
+
+    #[test]
     fn the_grenade_launcher_takes_the_rpgs_place_and_runs_out() {
         let mut physics = ground();
         let dt = 1.0 / 60.0;
@@ -4411,14 +4532,14 @@ mod tests {
         // More rounds go with it, two clips beyond the one at most (a
         // rocket pickup's 20 clips); the RPG taken back leaves it, with
         // them.
-        let rockets = crate::flights::Leaves {
+        let rockets = Refill {
             launcher: 120,
-            ..crate::flights::Leaves::default()
+            ..Refill::default()
         };
-        assert!(combat.can_use(&rockets));
-        combat.take_supplies(rockets.launcher, 0, 0.0);
+        assert!(combat.can_use(rockets, 0.0));
+        combat.take_supplies(rockets, 0.0);
         assert_eq!(combat.launcher_rounds.map(Rounds::total), Some(12));
-        assert!(!combat.can_use(&rockets));
+        assert!(!combat.can_use(rockets, 0.0));
         combat.launcher_rounds = Some(Rounds::default());
         combat.take_ammo(Weapon::GrenadeLauncher, 6);
         assert!(combat.second_loaded());
