@@ -601,6 +601,9 @@ pub struct Npc {
     /// when it does.
     pub layer: Option<u32>,
     pub hp: f32,
+    /// The health they started with (their template's for a soldier, 100
+    /// for a civilian): the HUD's target arc shows a share of it.
+    pub most_hp: f32,
     pub alive: bool,
     /// A soldier turned on the player.
     pub alert: bool,
@@ -695,6 +698,7 @@ impl Npc {
             spawn,
             layer: None,
             hp: 100.0,
+            most_hp: 100.0,
             alive: true,
             alert: false,
             fires: false,
@@ -1610,7 +1614,7 @@ impl People {
                 n.character.velocity = Vec3::ZERO;
                 n.landed = false;
                 n.alive = true;
-                n.hp = 100.0;
+                n.hp = n.most_hp;
                 n.dead_for = 0.0;
                 if let Some(doll) = n.ragdoll.take() {
                     physics.remove_ragdoll(doll);
@@ -1700,6 +1704,7 @@ impl People {
             // Their template's `Health` (a plain VZ soldier's 75 when none
             // speaks for them).
             npc.hp = npc.ai.health;
+            npc.most_hp = npc.ai.health;
             // A story character doesn't fight.
             npc.soldier = self.kinds[kind].soldier;
             self.npcs.push(npc);

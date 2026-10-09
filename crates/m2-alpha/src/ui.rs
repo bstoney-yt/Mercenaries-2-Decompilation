@@ -3,8 +3,9 @@
 //! Health, ammo and weapon, the reticle, hit arcs and messages are the
 //! game's own HUD ([`GameHud`]) once its scripts have started; until then,
 //! or without the game's files, a stand-in of our own draws health, weapon
-//! and a crosshair. What the player can do next, the mission's objectives
-//! and markers, and loading lines are ours, in egui's bundled fonts.
+//! and a crosshair, and the mission's objectives and markers. The markers
+//! are then the game's icons. What the player can do next and loading
+//! lines are ours, in egui's bundled fonts.
 
 use std::time::Duration;
 
@@ -165,6 +166,7 @@ impl Hud {
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.key_names = m.key_names.clone();
             state.pda_objectives = m.pda_objectives.clone();
             state.trespass = m.trespass.clone();
             state.vehicle_disguise = m.vehicle_disguise;
@@ -222,6 +224,7 @@ impl Hud {
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.key_names = m.key_names.clone();
             state.pda_objectives = m.pda_objectives.clone();
             state.trespass = m.trespass.clone();
             state.vehicle_disguise = m.vehicle_disguise;
@@ -457,7 +460,7 @@ fn blips(info: &HudInfo) -> Vec<([f32; 3], String, [u8; 4])> {
     info.mission.as_ref().map_or_else(Vec::new, |m| {
         m.markers
             .iter()
-            .map(|(at, label, colour)| (at.to_array(), label.clone(), *colour))
+            .map(|m| (m.at.to_array(), m.icon.clone(), m.colour))
             .collect()
     })
 }
@@ -519,7 +522,8 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
         game.paint(&painter);
         return;
     }
-    if time < HINT_TIME && info.playing {
+    // Ours, until the game's HUD runs.
+    if time < HINT_TIME && info.playing && game.is_none() {
         text(
             screen.center_top() + vec2(0.0, 56.0),
             Align2::CENTER_TOP,
@@ -532,13 +536,19 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     if info.playing
         && let Some(game) = game
     {
+        // The scripts' markers in the world, under the HUD.
+        if let (Some(m), Some(vp)) = (&info.mission, info.view_proj) {
+            let here = info.game.as_ref().and_then(|s| s.position).map(Vec3::from);
+            world_markers(&painter, screen, vp, m, game, here);
+        }
         game.paint(&painter);
         if std::env::var_os("M2_PAINT_TEST").is_some() {
             paint_test(&painter);
         }
     }
     if let Some(m) = &info.mission {
-        // The game's HUD shows the messages in its message buffer.
+        // The game's HUD shows the messages in its message buffer, and
+        // the markers as the game draws them.
         mission(&painter, screen, info.view_proj, m, game.is_none(), &text);
     }
     if !info.playing {
@@ -551,17 +561,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
         );
         return;
     }
-    if game.is_some() {
-        if let Some((_, _, true)) = &info.driving {
-            text(
-                screen.center() + vec2(0.0, 60.0),
-                Align2::CENTER_TOP,
-                "Wrecked: E to get out",
-                17.0,
-                white,
-            );
-        }
-    } else {
+    if game.is_none() {
         stand_in(&painter, screen, info, &text);
     }
     if let Some(prompt) = &info.prompt {
@@ -1118,9 +1118,9 @@ fn wheel(painter: &egui::Painter, c: egui::Pos2, r: f32, w: &WheelHud) {
     }
 }
 
-/// The mission's objectives (top left), its newest message (top centre)
-/// and tutorial line (left) if `message` (no game HUD to show them), and
-/// markers over its targets.
+/// The mission's objectives (top left), its newest message (top centre),
+/// tutorial line (left) and markers over its targets, if `message` (no
+/// game HUD to show them).
 fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     painter: &egui::Painter,
     screen: egui::Rect,
@@ -1132,11 +1132,13 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     let white = Color32::from_gray(235);
     let gold = Color32::from_rgb(255, 200, 0);
     let mut at = screen.left_top() + vec2(20.0, 20.0);
-    if let Some(status) = &m.status {
+    // Ours, as the rest, until the game's HUD runs (which has no such
+    // list on screen).
+    if let Some(status) = m.status.as_ref().filter(|_| message) {
         text(at, Align2::LEFT_TOP, status, 15.0, white);
         at.y += 22.0;
     }
-    if !m.objectives.is_empty() {
+    if !m.objectives.is_empty() && message {
         text(at, Align2::LEFT_TOP, "Objectives", 16.0, gold);
         at.y += 22.0;
         for o in &m.objectives {
@@ -1172,20 +1174,53 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             gold,
         );
     }
-    let Some(vp) = view_proj else { return };
-    for (world, label, [r, g, b, _]) in &m.markers {
-        let Some(p) = to_screen(vp, *world, screen) else {
+    // The game's HUD draws the markers' icons ([`world_markers`]).
+    let Some(vp) = view_proj.filter(|_| message) else {
+        return;
+    };
+    for marker in &m.markers {
+        let Some(p) = to_screen(vp, marker.at, screen) else {
             continue;
         };
-        let colour = Color32::from_rgb(*r, *g, *b);
+        let [r, g, b, _] = marker.colour;
+        let colour = Color32::from_rgb(r, g, b);
         painter.circle_stroke(p, 9.0, Stroke::new(2.5, colour));
         text(
             p + vec2(0.0, -14.0),
             Align2::CENTER_BOTTOM,
-            label,
+            &marker.label(),
             14.0,
             colour,
         );
+    }
+}
+
+/// The scripts' markers (`Marker.AddBlip`) over the world, under the
+/// game's HUD: each its icon (the HUD's texture) tinted its colour,
+/// centred on its point while she is within its `near` to `far` metres
+/// (inferred: from her rather than from the camera). Its size is taken
+/// as the HUD's 640x480 units (inferred: the call's units aren't known),
+/// and one off the screen isn't drawn (nor pinned to its edge).
+fn world_markers(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    view_proj: Mat4,
+    m: &MissionView,
+    game: &GameHud,
+    here: Option<Vec3>,
+) {
+    let unit = screen.height() / m2_game::gui::VIRTUAL_SIZE.1;
+    for marker in &m.markers {
+        if here.is_some_and(|h| !marker.shown_from(h)) {
+            continue;
+        }
+        let Some(p) = project(view_proj, marker.at, screen) else {
+            continue;
+        };
+        let rect = Rect::from_center_size(p, vec2(marker.size, marker.size) * unit);
+        let [r, g, b, a] = marker.colour;
+        let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
+        game.paint_texture(painter, &marker.icon, rect, colour);
     }
 }
 
@@ -1373,11 +1408,14 @@ mod tests {
                 objectives: vec!["VzaCon001 objective 1".into()],
                 tutorial: Some("[P] VzaCon001 tutorial 1\nline 2".into()),
                 game_tutorial: Some("[pda] VzaCon001 tutorial 1\nline 2".into()),
-                markers: vec![(
-                    Vec3::new(0.0, 0.0, -10.0),
-                    "deliverable".into(),
-                    [255, 200, 0, 255],
-                )],
+                markers: vec![crate::mission::MarkerView {
+                    at: Vec3::new(0.0, 0.0, -10.0),
+                    icon: "HUD_objective_deliverable".into(),
+                    colour: [255, 200, 0, 255],
+                    near: 5.0,
+                    far: 175.0,
+                    size: 32.0,
+                }],
                 message: Some((false, "VzaCon001 objective 1".into())),
                 game_message: None,
                 radar_regions: Vec::new(),
