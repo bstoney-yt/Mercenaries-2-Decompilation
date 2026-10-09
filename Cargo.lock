@@ -1184,6 +1184,7 @@ dependencies = [
  "m2-game",
  "m2-math",
  "m2-render",
+ "m2-sys",
  "mlua",
  "serde",
  "toml",
