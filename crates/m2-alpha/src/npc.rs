@@ -1261,8 +1261,6 @@ impl Npc {
 pub struct People {
     pub kinds: Vec<PersonKind>,
     pub npcs: Vec<Npc>,
-    /// The player's aim and fall clips.
-    pub clips: FightClips,
     /// Soldiers (by spawn entity) killed: they stay dead.
     pub killed: HashSet<u32>,
     /// Spawns a mission wants soldiers at though their names don't say
@@ -1824,6 +1822,7 @@ pub(crate) mod tests {
             cues: Vec::new(),
             own: Default::default(),
             foreign: Default::default(),
+            aim_clip: None,
         }
     }
 
