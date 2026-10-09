@@ -353,13 +353,41 @@ impl FightClips {
         [Self::BASH, Self::BASH_LOW].map(|e| (e, Self::carrying(rig, e, ready)))
     }
 
+    /// Each slot's name ([`slots`](Self::slots)'s, in its order) and the
+    /// clip of Jennifer's that keys it in the on-foot animation table:
+    /// the first row listing it gives the slot's animation handle
+    /// ([`m2_assets::animation_table::character_clip`]). Her clip of each
+    /// slot as picked by name (the first listed), and for the low bash the
+    /// one picked on her rig by its event (`0ae19446`, PC log of
+    /// 2026-10-08). Measured on the PC (2026-10-09), the handles are:
+    /// aim `9f4eb947`, ready `f2322e08` (her row there is a pistol one),
+    /// run `b99ad3b3`, jump `cca02d6b` (anyone's, anything held),
+    /// take-offs `2ae219a8` and `24af79c8`, landings `42f2ab41` and
+    /// `d1f2ee32` (her rows there are rocket ones), throw `399f45f4`
+    /// (with a grenade in use), bashes `fbc71879` and `7a9110c8`, die
+    /// `f9d7a61c`.
+    pub const TABLE_KEYS: [(&'static str, u32); 12] = [
+        ("aim", Self::AIM),
+        ("ready", Self::READY),
+        ("run", Self::RUN_LOW[0]),
+        ("jump", Self::JUMP),
+        ("take-off", Self::TAKEOFF[0]),
+        ("standing take-off", Self::TAKEOFF_STILL[0]),
+        ("land", Self::LAND[0]),
+        ("standing land", Self::LAND_STILL[0]),
+        ("throw", Self::THROW[0]),
+        ("bash", Self::BASH_CLIPS[0]),
+        ("low bash", 0x0ae1_9446),
+        ("die", Self::DIE),
+    ];
+
     /// A hero's, by the on-foot animation table: each slot's clip as
-    /// `theirs` gives the hero one in place of the clips the slot is
-    /// picked from by name (Jennifer's first: the table's rows for them
-    /// say which handle and equipment the slot is), where that clip is on
-    /// the rig and not another hero's; throws and bashes only with their
-    /// event. Returns the clips the table settled, which
-    /// [`own_group`](Self::own_group) leaves be.
+    /// `theirs` gives the hero one for the slot's key
+    /// ([`TABLE_KEYS`](Self::TABLE_KEYS)), where that clip is on the rig
+    /// and not another hero's; throws and bashes only with their event.
+    /// Returns the clips the table settled, which
+    /// [`own_group`](Self::own_group) leaves be. A slot `theirs` gives
+    /// nothing keeps what it was picked by.
     pub fn by_table(&mut self, rig: &Rig, theirs: &dyn Fn(u32) -> Option<u32>) -> HashSet<usize> {
         let index = |hash: u32| {
             rig.clips
@@ -374,35 +402,39 @@ impl FightClips {
                 .find(|e| e.name.eq_ignore_ascii_case(name))
                 .map(|e| e.time)
         };
-        let low = self.bash_low.map(|(i, _)| rig.clips[i].hash);
+        let key = |slot: &str| {
+            Self::TABLE_KEYS
+                .iter()
+                .find(|k| k.0 == slot)
+                .map_or(0, |k| k.1)
+        };
         let mut settled = HashSet::new();
-        let mut table = |slot: &mut Option<usize>, keys: &[u32]| {
-            if let Some(i) = keys.iter().find_map(|&k| index(theirs(k)?)) {
+        let mut table = |slot: &mut Option<usize>, name: &str| {
+            if let Some(i) = theirs(key(name)).and_then(index) {
                 *slot = Some(i);
                 settled.insert(i);
             }
         };
-        table(&mut self.aim, &[Self::AIM]);
-        table(&mut self.ready, &[Self::READY]);
-        table(&mut self.run_low, &Self::RUN_LOW);
-        table(&mut self.jump, &[Self::JUMP]);
-        table(&mut self.takeoff, &Self::TAKEOFF);
-        table(&mut self.takeoff_still, &Self::TAKEOFF_STILL);
-        table(&mut self.land, &Self::LAND);
-        table(&mut self.land_still, &Self::LAND_STILL);
-        table(&mut self.die, &[Self::DIE]);
-        let mut timed = |slot: &mut Option<(usize, f32)>, keys: &[u32], event: &str| {
-            if let Some((i, at)) = keys.iter().find_map(|&k| {
-                let i = index(theirs(k)?)?;
-                Some((i, event_at(i, event)?))
-            }) {
+        table(&mut self.aim, "aim");
+        table(&mut self.ready, "ready");
+        table(&mut self.run_low, "run");
+        table(&mut self.jump, "jump");
+        table(&mut self.takeoff, "take-off");
+        table(&mut self.takeoff_still, "standing take-off");
+        table(&mut self.land, "land");
+        table(&mut self.land_still, "standing land");
+        table(&mut self.die, "die");
+        let mut timed = |slot: &mut Option<(usize, f32)>, name: &str, event: &str| {
+            if let Some(i) = theirs(key(name)).and_then(index)
+                && let Some(at) = event_at(i, event)
+            {
                 *slot = Some((i, at));
                 settled.insert(i);
             }
         };
-        timed(&mut self.throw, &Self::THROW, Self::RELEASE);
-        timed(&mut self.bash, &Self::BASH_CLIPS, Self::BASH);
-        timed(&mut self.bash_low, low.as_slice(), Self::BASH_LOW);
+        timed(&mut self.throw, "throw", Self::RELEASE);
+        timed(&mut self.bash, "bash", Self::BASH);
+        timed(&mut self.bash_low, "low bash", Self::BASH_LOW);
         settled
     }
 
@@ -2011,6 +2043,13 @@ pub(crate) mod tests {
     use super::*;
     use m2_engine::{Animator, CollisionShape, Skeleton, StaticKey};
     use m2_math::glam::Quat;
+
+    #[test]
+    fn the_table_keys_follow_the_slots() {
+        let names: Vec<&str> = FightClips::default().slots().iter().map(|s| s.0).collect();
+        let keyed: Vec<&str> = FightClips::TABLE_KEYS.iter().map(|k| k.0).collect();
+        assert_eq!(names, keyed);
+    }
     use std::sync::Arc;
 
     pub(crate) fn ground() -> Physics {
