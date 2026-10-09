@@ -1084,7 +1084,7 @@ impl MissionLink {
         }
         // Story characters: who stands, and the spawns that should.
         let people = &game.scene.people;
-        for n in people.npcs.iter().filter(|n| people.kinds[n.kind].named) {
+        for n in people.npcs.iter().filter(|n| n.held) {
             out.push(format!(
                 "story character {} at {:.1}, {}, {}, {}",
                 people.kinds[n.kind].role,
