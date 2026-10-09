@@ -550,13 +550,22 @@ impl Physics {
 }
 
 impl Geometry {
-    /// A triangle mesh of the shape, without the convex radius: positions
+    /// A triangle mesh of the shape with its convex radius, as Havok
+    /// collides with it: a box's half extents and a hull's vertices sit
+    /// `radius` inside its surface (the hull's planes sit there). Positions
     /// and triangles wound counter-clockwise seen from outside (right-handed
-    /// axes) for the closed shapes, as stored for meshes. Spheres and
-    /// capsules are approximated.
+    /// axes) for the closed shapes, as stored for meshes (their thin shell
+    /// left out). Spheres and capsules are approximated, and a box's or a
+    /// hull's corners are sharp where Havok's are rounded.
     pub fn triangles(&self, radius: f32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+        let pad = if radius.is_finite() {
+            radius.max(0.0)
+        } else {
+            0.0
+        };
         match self {
-            Self::Box { half_extents: h } => {
+            Self::Box { half_extents } => {
+                let h = half_extents.map(|e| e + pad);
                 let v: Vec<[f32; 3]> = (0..8)
                     .map(|i| {
                         let s = |bit: usize, e: f32| if i >> bit & 1 == 1 { e } else { -e };
@@ -573,7 +582,9 @@ impl Geometry {
                 ];
                 (v.clone(), hull_faces(&v, &planes))
             }
-            Self::Convex { vertices, planes } => (vertices.clone(), hull_faces(vertices, planes)),
+            Self::Convex { vertices, planes } => {
+                (inflate(vertices, planes, pad), hull_faces(vertices, planes))
+            }
             Self::Mesh {
                 vertices,
                 triangles,
@@ -657,6 +668,86 @@ fn hull_faces(vertices: &[[f32; 3]], planes: &[[f32; 4]]) -> Vec<[u32; 3]> {
         }
     }
     tris
+}
+
+/// A convex hull's `vertices` pushed out `pad` across the faces (of
+/// `planes`) each lies on, to where those faces meet once moved out by
+/// `pad`: at a corner where more than three meet, the nearest point to
+/// all of them. None goes further than a box's corner does (`pad` times
+/// the square root of 3), so a sharp edge grows no spike.
+fn inflate(vertices: &[[f32; 3]], planes: &[[f32; 4]], pad: f32) -> Vec<[f32; 3]> {
+    if pad <= 0.0 {
+        return vertices.to_vec();
+    }
+    let extent = vertices
+        .iter()
+        .flatten()
+        .fold(0.0f32, |m, &c| m.max(c.abs()));
+    let eps = 1e-3 * extent.max(1.0);
+    // Each face's normal and how far out along it the hull reaches.
+    let faces: Vec<([f32; 3], f32)> = planes
+        .iter()
+        .map(|pl| normalise([pl[0], pl[1], pl[2]]))
+        .filter(|n| n.iter().all(|c| c.is_finite()) && dot(*n, *n) > 0.0)
+        .map(|n| {
+            let top = vertices
+                .iter()
+                .map(|&v| dot(n, v))
+                .fold(f32::NEG_INFINITY, f32::max);
+            (n, top)
+        })
+        .collect();
+    let most = pad * 3.0f32.sqrt();
+    vertices
+        .iter()
+        .map(|&v| {
+            // Least squares over the faces it lies on: the offset `o` with
+            // n · o as near `pad` as can be for each face's normal n.
+            let (mut m, mut s) = ([[0.0f32; 3]; 3], [0.0f32; 3]);
+            for &(n, top) in &faces {
+                if dot(n, v) < top - eps {
+                    continue;
+                }
+                for a in 0..3 {
+                    s[a] += n[a];
+                    for b in 0..3 {
+                        m[a][b] += n[a] * n[b];
+                    }
+                }
+            }
+            let o = solve(m, s.map(|x| x * pad)).unwrap_or_else(|| {
+                let d = normalise(s);
+                d.map(|x| x * pad)
+            });
+            let length = dot(o, o).sqrt();
+            let o = if length > most {
+                o.map(|x| x * most / length)
+            } else {
+                o
+            };
+            if o.iter().all(|c| c.is_finite()) {
+                [v[0] + o[0], v[1] + o[1], v[2] + o[2]]
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
+/// `x` with `m x = b` for a 3 x 3 `m`, by Cramer's rule; `None` when `m`
+/// is near singular (the faces at a vertex don't pin it).
+fn solve(m: [[f32; 3]; 3], b: [f32; 3]) -> Option<[f32; 3]> {
+    let det3 = |c: [[f32; 3]; 3]| dot(c[0], cross(c[1], c[2]));
+    let det = det3(m);
+    if det.abs() < 1e-4 || !det.is_finite() {
+        return None;
+    }
+    // m is symmetric: its rows are its columns.
+    Some(std::array::from_fn(|k| {
+        let mut c = m;
+        c[k] = b;
+        det3(c) / det
+    }))
 }
 
 /// A low-polygon capsule between `a` and `b` (a sphere when they meet).
@@ -963,6 +1054,35 @@ mod tests {
         }
         let (v, t) = Geometry::Sphere.triangles(0.5);
         assert!(!t.is_empty() && v.iter().all(|p| (dot(*p, *p).sqrt() - 0.5).abs() < 1e-4));
+    }
+
+    #[test]
+    fn closed_shapes_take_their_convex_radius() {
+        let cube = Geometry::Box {
+            half_extents: [1.0, 2.0, 3.0],
+        };
+        let (v, _) = cube.triangles(0.05);
+        for p in &v {
+            for (c, h) in p.iter().zip([1.05, 2.05, 3.05]) {
+                assert!((c.abs() - h).abs() < 1e-5, "{p:?}");
+            }
+        }
+        // The fixture's hull: a cube of ±1 inside planes at ±1.05.
+        let (s, _) = fixture();
+        let p = Physics::parse(&s).unwrap();
+        let hull = &p.shapes[1];
+        let Geometry::Convex { planes, .. } = &hull.geometry else {
+            panic!()
+        };
+        let (v, t) = hull.geometry.triangles(hull.radius);
+        assert_eq!((v.len(), t.len()), (8, 12));
+        for p in &v {
+            assert!(p.iter().all(|c| (c.abs() - 1.05).abs() < 1e-5), "{p:?}");
+            // On or inside every plane.
+            for pl in planes {
+                assert!(dot([pl[0], pl[1], pl[2]], *p) + pl[3] < 1e-5, "{p:?}");
+            }
+        }
     }
 
     #[test]
