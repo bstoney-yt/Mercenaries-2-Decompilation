@@ -43,6 +43,12 @@ pub const DEFAULT_SPAWN: (f32, f32) = (450.0, -1950.0);
 /// player once the first contract is done (VzaCon001's flow binding
 /// teleports her to the next contract's start, by the PMC's offices).
 pub const FREE_ROAM_START: &str = "PmcCon001_Start1";
+/// Where a mission starts without `--spawn`: the first contract's own
+/// spawn point, which its scripts name as they start (`SetSpawnLocations
+/// VzaCon001_Start1`), by the speed boat they seat her in. From the town
+/// she stayed the boat's 4 km off, hibernating (beyond 155 m), and the
+/// scripts never seated her.
+pub const MISSION_START: &str = "VzaCon001_Start1";
 
 /// Half the ground's width in metres.
 const GROUND_HALF: f32 = 1000.0;
@@ -1174,13 +1180,15 @@ impl Scene {
     }
 
     /// Indexes the island and starts streaming it, with the camera placed
-    /// above `(x, z)`.
+    /// above `spawn`, or else at the start point named `start_name`
+    /// ([`MISSION_START`], [`FREE_ROAM_START`]).
     pub fn open_world(
         &mut self,
         backend: &mut dyn RenderBackend,
         install: &Install,
         settings: WorldSettings,
         spawn: Option<(f32, f32)>,
+        start_name: &str,
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         let mut world = World::open(install, backend, &mut self.materials, settings)
@@ -1198,11 +1206,11 @@ impl Scene {
         );
         self.explosives = crate::combat::explosives(&world.index);
         eprintln!("explosives: {}", self.explosives.len());
-        // Without a place asked for, where the first contract leaves her,
-        // facing the way that start point does.
+        // Without a place asked for, the start point named (where the first
+        // contract starts her, or where it leaves her), facing its way.
         let start = spawn
             .is_none()
-            .then(|| world.index.start(FREE_ROAM_START))
+            .then(|| world.index.start(start_name))
             .flatten();
         let ((x, z), facing) = match (spawn, start) {
             (Some(at), _) => (at, 0.0),
@@ -1215,7 +1223,7 @@ impl Scene {
                 ((s.position.x, s.position.z), f.x.atan2(f.z))
             }
             (None, None) => {
-                eprintln!("start: no {FREE_ROAM_START} in the layers; the first town instead");
+                eprintln!("start: no {start_name} in the layers; the first town instead");
                 (DEFAULT_SPAWN, 0.0)
             }
         };

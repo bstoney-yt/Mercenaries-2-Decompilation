@@ -605,13 +605,9 @@ fn main() -> anyhow::Result<()> {
             turn: options.turn,
         })
     } else if install.is_some() {
-        // Free roam starts at the PMC's headquarters (found in the layers);
-        // a mission's scripts move her from the first town.
-        Mode::Island(
-            options
-                .spawn
-                .or(options.mission.then_some(scene::DEFAULT_SPAWN)),
-        )
+        // Free roam starts at the PMC's headquarters, a mission at the
+        // first contract's spawn point (both found in the layers).
+        Mode::Island(options.spawn)
     } else {
         Mode::Models(Showcase {
             models: vec![scene::DEFAULT_MODEL],
@@ -707,7 +703,12 @@ fn build_scene(
                     sea_level,
                     ..WorldSettings::default()
                 };
-                scene.open_world(backend, install, settings, *spawn)?;
+                let start = if mission {
+                    scene::MISSION_START
+                } else {
+                    scene::FREE_ROAM_START
+                };
+                scene.open_world(backend, install, settings, *spawn, start)?;
             }
             Mode::Models(show) => {
                 scene.open(install)?;
