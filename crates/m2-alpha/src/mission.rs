@@ -1830,9 +1830,37 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             {
                 world.physics.remove_vehicle(id);
                 let driving = game.scene.player.as_ref().and_then(|p| p.driving);
-                if matches!(c, Command::Move { .. }) && driving == Some(i) {
+                // She goes with it, as when they seat her in one: there,
+                // so the ground loads around it and it is placed, with
+                // the same time to be. Not where they hide it under the
+                // island; there she stays on foot.
+                if let Command::Move { position, .. } = c
+                    && driving == Some(i)
+                    && position[1] > HIDDEN_BELOW
+                    && let Some(p) = game.scene.player.as_mut()
+                {
                     fleet.reenter = Some(*guid);
+                    fleet.boarding = BOARDING;
+                    p.drop_at(Vec3::from(*position));
+                    p.driving = None;
+                    p.chase_target = None;
+                    eprintln!(
+                        "mission: the scripts moved {guid:#x} with her in it: she waits at \
+                         {:.1?} to be seated again",
+                        position
+                    );
                 }
+            }
+            // Gone, or hidden, while she waited to get back in: she stays
+            // out, and the scripts hear where she is again.
+            if fleet.reenter == Some(*guid)
+                && match c {
+                    Command::Move { position, .. } => position[1] <= HIDDEN_BELOW,
+                    _ => true,
+                }
+            {
+                fleet.reenter = None;
+                fleet.boarding = 0;
             }
             let scene = &mut game.scene;
             if let Some(world) = &mut scene.world {
@@ -1853,6 +1881,10 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         Command::Kill(guid) => {
             if let Some(i) = index(guid) {
                 game.scene.vehicles[i].wrecked = true;
+            }
+            if fleet.reenter == Some(*guid) {
+                fleet.reenter = None;
+                fleet.boarding = 0;
             }
             let scene = &mut game.scene;
             if let Some(world) = &mut scene.world
