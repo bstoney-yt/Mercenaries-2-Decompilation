@@ -476,8 +476,8 @@ fn standing(p: &Phy2, k: usize, hidden: &[bool]) -> bool {
     !s.is_foliage() && !hidden.get(node).copied().unwrap_or(false)
 }
 
-/// A box round `PHY2` shape `k` (its convex radius included), placed by
-/// `to` from its body node's space.
+/// A box round `PHY2` shape `k` (its convex radius included, as its
+/// triangles have it), placed by `to` from its body node's space.
 fn shape_box(p: &Phy2, k: usize, to: Mat4) -> Option<(r::Pose, r::SharedShape)> {
     let s = p.shapes.get(k)?;
     let (v, _) = s.geometry.triangles(s.radius);
@@ -492,8 +492,7 @@ fn shape_box(p: &Phy2, k: usize, to: Mat4) -> Option<(r::Pose, r::SharedShape)> 
         * p.shape_place(k).map_or(Mat4::IDENTITY, place)
         * Mat4::from_translation((lo + hi) * 0.5);
     let (scale, rotation, translation) = at.to_scale_rotation_translation();
-    let half = ((hi - lo) * 0.5 * scale.abs() + Vec3::splat(s.radius.max(0.0)))
-        .max(Vec3::splat(LOOSE_HALF));
+    let half = ((hi - lo) * 0.5 * scale.abs()).max(Vec3::splat(LOOSE_HALF));
     (half.is_finite() && translation.is_finite() && rotation.is_finite()).then(|| {
         (
             pose(translation, rotation.normalize()),
