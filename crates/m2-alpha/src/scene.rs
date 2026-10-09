@@ -492,8 +492,10 @@ pub struct Scene {
     pub player: Option<Player>,
     /// Who the player is.
     pub hero: Hero,
-    /// What the people's rigs are made from: the hero's skeleton and
-    /// clips, with the gaits everyone's clips give ([`Rig::shared`]).
+    /// What the people's rigs are made from, whoever the hero is:
+    /// Jennifer's skeleton and every clip that fits it, with the gaits
+    /// everyone's clips give ([`Rig::shared`]). Made once: switching hero
+    /// leaves the people be.
     people_rig: Option<Rig>,
     /// Drivable vehicles near the spawn.
     pub vehicles: Vec<ParkedVehicle>,
@@ -1079,7 +1081,22 @@ impl Scene {
             .as_ref()
             .map(|(_, rig)| npc::FightClips::find(rig).own_group(rig))
             .unwrap_or_default();
-        self.people_rig = model.as_ref().map(|(_, rig)| rig.shared());
+        if self.people_rig.is_none() {
+            // Jennifer's own rig is loaded as no hero's is (every clip
+            // that fits her): hers will do when she is the hero.
+            self.people_rig = match &model {
+                Some((_, rig)) if hero == Hero::Jennifer && hash == DEFAULT_MODEL => {
+                    Some(rig.shared())
+                }
+                _ => match Rig::load(source, DEFAULT_MODEL, Gait::Idle, None) {
+                    Ok(rig) => Some(rig.shared()),
+                    Err(e) => {
+                        eprintln!("people's rig: {e:#}; the hero's instead");
+                        model.as_ref().map(|(_, rig)| rig.shared())
+                    }
+                },
+            };
+        }
         if let Some((_, rig)) = &model {
             let h = |i: Option<usize>| {
                 i.map_or("none".to_owned(), |i| {
