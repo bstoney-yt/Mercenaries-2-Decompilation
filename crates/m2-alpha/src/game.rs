@@ -130,6 +130,9 @@ pub struct Game {
     /// leave ([`crate::drops`]), and how many have.
     drops: Drops,
     dropped: u32,
+    /// The pickups she has stood at and left lying, each logged once
+    /// with why.
+    refused: std::collections::HashSet<(u32, u32)>,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
 }
@@ -214,6 +217,7 @@ impl Game {
             support: Support::default(),
             drops: Drops::default(),
             dropped: 0,
+            refused: std::collections::HashSet::new(),
             input_locked: false,
             support_hp: 0.0,
         }
@@ -761,7 +765,23 @@ impl Game {
             let templates = &world.index.template_db;
             let near = scene.flights.within(player.character.position).map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
-                self.combat.can_use(refill, p.what.health)
+                let usable = self.combat.can_use(refill, p.what.health);
+                // Each pickup she stands at and leaves lying, once, with
+                // why: what each record would go to and its room.
+                if !usable && !taking && self.refused.insert(p.key()) {
+                    eprintln!(
+                        "pickup: she leaves {} ({:#x}) at {:.1} lying: {}{}",
+                        templates.by_id(p.what.template).map_or("?", |t| t.0),
+                        p.what.template,
+                        p.at,
+                        crate::mission::refusal(templates, &self.combat, &p.what),
+                        match p.what.weapon {
+                            Some(w) => format!(" (a weapon, {w:?}: taken up with the use key)"),
+                            None => String::new(),
+                        }
+                    );
+                }
+                usable
             });
             if player.driving.is_none()
                 && (taking || near == Some(true))

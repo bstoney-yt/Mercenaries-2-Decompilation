@@ -1690,6 +1690,89 @@ impl Combat {
             || (health > 0.0 && self.hp < self.max_hp)
     }
 
+    /// Why walking over a pickup whose `records` (ammunition template,
+    /// amount) and `health` give her nothing she has room for leaves it
+    /// lying, for the log: each record a weapon of hers takes (as
+    /// [`refill`](Self::refill) asks `takes`) with that weapon's rounds and
+    /// room, how many records none of hers takes and what hers fire, and
+    /// her health against the most. `name` names a template.
+    pub fn refusal(
+        &self,
+        records: &[(u32, u32)],
+        health: f32,
+        takes: impl Fn(Option<u32>, Option<u32>, u32) -> bool,
+        name: impl Fn(u32) -> String,
+    ) -> String {
+        let gun = |g: &Rifle, ammo| takes(g.template, g.ammo.map(|a| a.template), ammo);
+        let grenade = self.throwables.first().and_then(Option::as_ref);
+        let mut why = Vec::new();
+        let mut none = 0;
+        for &(ammo, n) in records {
+            if gun(&self.rifle, ammo) {
+                let r = self.rifle_rounds;
+                why.push(format!(
+                    "{} {n} to her {}, full at {}+{} of {} spare",
+                    name(ammo),
+                    self.rifle.name,
+                    r.clip,
+                    r.stored,
+                    self.rifle.spare
+                ));
+            } else if self.second.is_some() && gun(&self.launcher, ammo) {
+                let r = self.launcher_rounds.unwrap_or_default();
+                why.push(format!(
+                    "{} {n} to her {}, full at {}+{} of {} spare",
+                    name(ammo),
+                    self.launcher.name,
+                    r.clip,
+                    r.stored,
+                    self.launcher.spare
+                ));
+            } else if grenade.is_some_and(|g| takes(Some(g.template), Some(g.ammo.template), ammo))
+            {
+                why.push(format!(
+                    "{} {n} to her grenades, full at {} of {MAX_GRENADES}",
+                    name(ammo),
+                    self.grenades
+                ));
+            } else {
+                none += 1;
+            }
+        }
+        if none > 0 {
+            let fires = |g: &Rifle| g.ammo.map_or_else(|| "?".to_owned(), |a| name(a.template));
+            why.push(format!(
+                "{none} of {} records for no weapon of hers (her {} fires {}{}{})",
+                records.len(),
+                self.rifle.name,
+                fires(&self.rifle),
+                match self.second {
+                    Some(_) => format!(
+                        ", her {} fires {}",
+                        self.launcher.name,
+                        fires(&self.launcher)
+                    ),
+                    None => String::new(),
+                },
+                match grenade {
+                    Some(g) => format!(", her grenades are {}", name(g.ammo.template)),
+                    None => ", no grenades".to_owned(),
+                }
+            ));
+        }
+        if health > 0.0 {
+            why.push(format!(
+                "{health} health, she has {:.0} of {:.0}",
+                self.hp, self.max_hp
+            ));
+        }
+        if why.is_empty() {
+            "it gives nothing walked over".to_owned()
+        } else {
+            why.join("; ")
+        }
+    }
+
     /// The weapons she carries but doesn't hold, which hang on her back:
     /// the rifle on her right unless it is up in her hands, and what she
     /// carries in the launcher's place on her left unless that is (with
