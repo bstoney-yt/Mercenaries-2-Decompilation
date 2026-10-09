@@ -750,10 +750,11 @@ impl Game {
             // What lies within her reach: a weapon taken up with the use
             // key; ammunition and health as she walks over them, if they
             // give her anything (else with the use key, as before).
-            let near = scene
-                .flights
-                .within(player.character.position)
-                .map(|p| p.what.weapon.is_none() && self.combat.can_use(&p.what));
+            let templates = &world.index.template_db;
+            let near = scene.flights.within(player.character.position).map(|p| {
+                let refill = crate::mission::refill(templates, &self.combat, &p.what);
+                p.what.weapon.is_none() && self.combat.can_use(refill, p.what.health)
+            });
             if player.driving.is_none()
                 && (taking || near == Some(true))
                 && let Some(p) = scene.flights.take_within(player.character.position)
@@ -774,7 +775,8 @@ impl Game {
     }
 
     /// The soldiers killed this tick leave what their death script picks,
-    /// where they fell.
+    /// and what their template's `SpawnOnDeath`s name that is a pickup (as
+    /// a broken crate's do), where they fell.
     fn drop_pickups(&mut self) {
         let deaths = self.scene.people.take_deaths();
         let Some(world) = &self.scene.world else {
@@ -782,11 +784,13 @@ impl Game {
         };
         let templates = &world.index.template_db;
         for (at, spawn) in deaths {
-            // Their template's labels (the first contract's AT defenders
-            // are heavy rocket soldiers).
-            let labels = spawn
+            // Their template, and its labels (the first contract's AT
+            // defenders are heavy rocket soldiers).
+            let template = spawn
                 .and_then(|e| world.index.spawns.iter().find(|s| s.entity == e))
-                .and_then(|s| templates.id(s.template.as_deref()?))
+                .and_then(|s| s.template.as_deref());
+            let id = template.and_then(|t| templates.id(t));
+            let labels = id
                 .and_then(|id| templates.leavings.labels.get(&id))
                 .map_or(&[][..], Vec::as_slice);
             let is = |label: &str| labels.contains(&m2_assets::name_hash(label));
@@ -796,27 +800,55 @@ impl Game {
                 machine_gun: is("MGSoldier"),
                 seated: false,
             };
-            let Some(name) =
+            // What the template names: its pickups on dying, and the
+            // weapons it carries with their own `Pickup` records (nothing
+            // here drops those; the log tells whether the data could).
+            let mut left = template.map_or_else(Vec::new, |t| crate::mission::leaves(templates, t));
+            let name_of = |t: u32| templates.by_id(t).map_or("?", |t| t.0);
+            let carries: Vec<String> = id
+                .and_then(|id| templates.equipment.get(&id))
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .map(|&w| format!("{} {}", name_of(w), crate::mission::records(templates, w)))
+                .collect();
+            eprintln!(
+                "drop: a {} dies at {at:.1}; its template leaves [{}] and carries [{}]",
+                template.unwrap_or("soldier"),
+                left.iter()
+                    .map(|l| name_of(l.template))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                carries.join(", ")
+            );
+            if let Some(name) =
                 self.drops
                     .on_death(soldier, Some(self.combat.grenades), self.combat.hp)
-            else {
-                continue;
-            };
-            let Some(what) = templates
-                .id(name)
-                .and_then(|id| crate::mission::pickup(templates, id))
-            else {
-                eprintln!("drop: {name} isn't a pickup");
-                continue;
-            };
-            self.dropped += 1;
-            eprintln!("drop: a soldier leaves {name} at {at:.1}");
-            self.scene.flights.leave(crate::flights::Pickup {
-                from: DROPPED + self.dropped,
-                what,
-                at: at + Vec3::Y * 0.1,
-                yaw: 0.0,
-            });
+            {
+                match templates
+                    .id(name)
+                    .and_then(|id| crate::mission::pickup(templates, id))
+                {
+                    Some(what) => left.push(what),
+                    None => eprintln!("drop: {name} isn't a pickup"),
+                }
+            }
+            for what in left {
+                self.dropped += 1;
+                eprintln!(
+                    "drop: a soldier leaves {} {} at {at:.1}; for her now {:?} (her {} fires {})",
+                    name_of(what.template),
+                    crate::mission::records(templates, what.template),
+                    crate::mission::refill(templates, &self.combat, &what),
+                    self.combat.rifle.name,
+                    self.combat.rifle.ammo.map_or("?", |a| name_of(a.template))
+                );
+                self.scene.flights.leave(crate::flights::Pickup {
+                    from: DROPPED + self.dropped,
+                    what,
+                    at: at + Vec3::Y * 0.1,
+                    yaw: 0.0,
+                });
+            }
         }
     }
 
@@ -1582,17 +1614,26 @@ fn take_up(
 ) {
     let rounds = p.what.gives.map_or(0, |(_, n)| n);
     let Some(weapon) = p.what.weapon else {
-        if let Some((w, n)) = p.what.gives {
-            combat.take_ammo(w, n);
-        }
-        combat.take_supplies(p.what.launcher, p.what.grenades, p.what.health);
+        let refill = crate::mission::refill(templates, combat, &p.what);
+        combat.take_supplies(refill, p.what.health);
         eprintln!(
-            "pickup: she takes {:#x} at {:.1}{}",
+            "pickup: she takes {} ({:#x}) at {:.1}: {} rounds for her {}, {} for her {}, \
+             {} grenades, {} health; she has {}+{}, {:?}, {} grenades",
+            templates.by_id(p.what.template).map_or("?", |t| t.0),
             p.what.template,
             p.at,
-            p.what.gives.map_or(String::new(), |(w, n)| format!(
-                ": {n} rounds for her {w:?}"
-            ))
+            refill.rifle,
+            combat.rifle.name,
+            refill.launcher,
+            combat
+                .second
+                .map_or("nothing", |_| combat.launcher.name.as_str()),
+            refill.grenades,
+            p.what.health,
+            combat.rifle_rounds.clip,
+            combat.rifle_rounds.stored,
+            combat.launcher_rounds.map(|r| (r.clip, r.stored)),
+            combat.grenades
         );
         return;
     };
