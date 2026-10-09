@@ -765,7 +765,7 @@ fn hud_info(
     fov: f32,
     aspect: f32,
 ) -> ui::HudInfo {
-    let mut info = game.hud_info();
+    let mut info = game.hud_info(mission.and_then(mission::MissionLink::strings));
     if let Some(m) = mission {
         info.mission = Some(m.view());
     }

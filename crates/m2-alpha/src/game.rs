@@ -1241,8 +1241,9 @@ impl Game {
         self.park_tries >= PARK_TRIES || !self.scene.vehicles.iter().any(parkable)
     }
 
-    /// What the HUD shows.
-    pub fn hud_info(&self) -> HudInfo {
+    /// What the HUD shows, its words from `strings` (the game's English
+    /// strings, once the scripts have read them).
+    pub fn hud_info(&self, strings: Option<&m2_assets::StringTable>) -> HudInfo {
         let player = self.scene.player.as_ref();
         let loading = match &self.scene.world {
             // The island-wide tiles; nearby detail streams in quietly.
@@ -1284,7 +1285,7 @@ impl Game {
             (Some(w), Some(p)) if p.driving.is_none() && p.landed => {
                 nearest(&w.physics, &self.scene.vehicles, p, REACH).map(|i| {
                     let spec = &self.scene.vehicles[i].spec;
-                    vehicle_name(&w.index.template_db, &spec.label, spec.model)
+                    vehicle_name(&w.index.template_db, strings, &spec.label, spec.model)
                 })
             }
             _ => None,
@@ -2147,25 +2148,44 @@ fn footprint_radius(spec: &m2_engine::VehicleSpec) -> f32 {
     (hi.x - lo.x).hypot(hi.z - lo.z) * 0.5
 }
 
-/// What the use prompt calls a vehicle: its template's name as the
-/// template database writes it (`M151 Softtop (V2)`), of the template its
-/// label names, else of the first sharing its model; its label (a texture
-/// name, `vz_veh_truck_M151`) only if neither is found. The string tables
-/// aren't read for a localised name yet. Each label's name is logged once.
-fn vehicle_name(db: &Templates, label: &str, model: u32) -> String {
+/// What the use prompt calls a vehicle: the name the game shows for it,
+/// the English string its template's `LocalizedName` keys in `strings`
+/// (the `Chopper`'s reads "Chopper"), of the template its label names,
+/// else of the first sharing its model that the strings hold
+/// ([`Templates::localized_keys`]);
+/// without one, its template's name as the template database writes it
+/// (`M151 Softtop (V2)`); its label (a texture name, `vz_veh_truck_M151`)
+/// only if no template is found. Each label's name is logged once.
+fn vehicle_name(
+    db: &Templates,
+    strings: Option<&m2_assets::StringTable>,
+    label: &str,
+    model: u32,
+) -> String {
     static NAMED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let keys = db.localized_keys(label, model);
+    let found = keys
+        .iter()
+        .find_map(|&k| Some((k, strings?.strings.get(&k)?.clone())));
+    let key = found.as_ref().map(|f| f.0).or(keys.first().copied());
+    let shown = found.map(|f| f.1);
     let name = db
         .names_for(label, model)
         .first()
         .and_then(|n| db.names.get(&db.id(n)?))
         .cloned();
-    if let Ok(mut named) = NAMED.lock()
+    // Logged once its strings are read, if they ever are.
+    if strings.is_some()
+        && let Ok(mut named) = NAMED.lock()
         && !named.iter().any(|l| l == label)
     {
         named.push(label.to_owned());
-        eprintln!("vehicle: {label} (model {model:08x}) is named {name:?} to get in");
+        eprintln!(
+            "vehicle: {label} (model {model:08x}) is shown as {shown:?} (string {key:08x?}), \
+             its template {name:?}, to get in"
+        );
     }
-    name.unwrap_or_else(|| label.to_owned())
+    shown.or(name).unwrap_or_else(|| label.to_owned())
 }
 
 /// The vehicle nearest her within `reach` metres of its door marker (or its
@@ -2261,7 +2281,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_use_prompt_names_vehicles_by_their_templates() {
+    fn the_use_prompt_names_vehicles_as_the_game_shows_them() {
         let info = |model| TemplateInfo {
             model: Some(model),
             vehicle: None,
@@ -2281,14 +2301,30 @@ mod tests {
             ..Templates::default()
         };
         // A template's label, whatever its case.
-        assert_eq!(vehicle_name(&db, "amx30", 9), "AMX30");
+        assert_eq!(vehicle_name(&db, None, "amx30", 9), "AMX30");
         // A texture's (the play test's `vz_veh_truck_M151`): the template
         // that shares its model.
         assert_eq!(
-            vehicle_name(&db, "vz_veh_truck_M151", 7),
+            vehicle_name(&db, None, "vz_veh_truck_M151", 7),
             "M151 Softtop (V2)"
         );
         // Neither: as it is.
-        assert_eq!(vehicle_name(&db, "vz_veh_boat", 3), "vz_veh_boat");
+        assert_eq!(vehicle_name(&db, None, "vz_veh_boat", 3), "vz_veh_boat");
+        // With the strings read, the name the game shows: its template's
+        // `LocalizedName` string.
+        let mut db = db;
+        db.localized.insert(0x8000_0001, 0x1177_c0fc);
+        let mut strings = m2_assets::StringTable::default();
+        strings.strings.insert(0x1177_c0fc, "Jeep".to_owned());
+        assert_eq!(
+            vehicle_name(&db, Some(&strings), "vz_veh_truck_M151", 7),
+            "Jeep"
+        );
+        // A key the strings lack: the template's name.
+        strings.strings.clear();
+        assert_eq!(
+            vehicle_name(&db, Some(&strings), "vz_veh_truck_M151", 7),
+            "M151 Softtop (V2)"
+        );
     }
 }

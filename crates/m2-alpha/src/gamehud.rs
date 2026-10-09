@@ -432,6 +432,10 @@ pub struct HudState {
     /// The templates that vehicle may be, its own first: their labels
     /// pick the health box's armour badge.
     pub vehicle_templates: Vec<String>,
+    /// The string table keys of the names the game shows for those
+    /// templates (their `LocalizedName`s), in the same order: the vehicle
+    /// box names it by the first the strings hold.
+    pub vehicle_names: Vec<u32>,
     /// Its cannon's shells, when they run out: left, and how many it
     /// carries (the AMX-30's 40, counted down in the gun box).
     pub cannon: Option<(u32, u32)>,
@@ -658,6 +662,14 @@ impl HudState {
                 .zip(game.scene.world.as_ref())
                 .map(|(v, w)| w.index.template_db.names_for(&v.spec.label, v.spec.model))
                 .unwrap_or_default(),
+            vehicle_names: vehicle
+                .zip(game.scene.world.as_ref())
+                .map(|(v, w)| {
+                    w.index
+                        .template_db
+                        .localized_keys(&v.spec.label, v.spec.model)
+                })
+                .unwrap_or_default(),
             cannon: vehicle.and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
             heading: game.camera.yaw.to_degrees(),
             target,
@@ -718,10 +730,12 @@ fn direction(at: Option<Vec3>, from: Option<Vec3>) -> f32 {
     (-d.x.atan2(d.z)).to_degrees().rem_euclid(360.0)
 }
 
-/// What the vehicle box shows for a vehicle label: its name, and its
-/// faction as the game's guid for it (`SetVehicleName(name, faction)`
-/// picks the faction's icon; none shows the PMC's). Labels start with the
-/// faction (`"vz_veh_truck_m151"` is the VZ's `"truck m151"`).
+/// What the vehicle box shows for a vehicle label: its name (where none
+/// of its templates' shown names is found, [`HudState::vehicle_names`]),
+/// and its faction as the game's guid for it (`SetVehicleName(name,
+/// faction)` picks the faction's icon; none shows the PMC's). Labels
+/// start with the faction (`"vz_veh_truck_m151"` is the VZ's `"truck
+/// m151"`).
 fn vehicle_name(label: &str) -> (String, Option<u32>) {
     let (faction, name) = label.split_once("_veh_").unwrap_or(("", label));
     // `MrxGuiHudVehicleDisguise.Init`'s faction guids.
@@ -2661,6 +2675,15 @@ impl Thread {
             let (name, faction) = match &s.vehicle {
                 Some(label) => {
                     let (name, faction) = vehicle_name(label);
+                    // The name the game shows, its template's
+                    // `LocalizedName` string ("Chopper"), where the
+                    // strings hold one; else the label's.
+                    let strings = &self.mission.strings().strings;
+                    let name = s
+                        .vehicle_names
+                        .iter()
+                        .find_map(|k| strings.get(k).cloned())
+                        .unwrap_or(name);
                     (
                         Value::String(lua.create_string(name)?),
                         faction.map_or(Value::Nil, guid_value),
