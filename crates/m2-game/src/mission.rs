@@ -187,6 +187,27 @@ end)
 return true
 "#;
 
+/// Puts `MrxCheatBootstrap.IsSkipModeEnabled` back as the scripts had it
+/// before [`Mission::start`] turned skip mode on, if that answers no; else
+/// (none, an error, or yes) one that answers no. Returns what the scripts'
+/// own answered.
+const END_SKIP_MODE: &str = r#"
+local cheat = rawget(_G, "MrxCheatBootstrap")
+if type(cheat) ~= "table" then return "no MrxCheatBootstrap" end
+local own = __m2_own_skip_mode
+local said = "none"
+if type(own) == "function" then
+    local ok, on = pcall(own)
+    said = ok and tostring(on) or ("error: " .. tostring(on))
+    if ok and not on then
+        cheat.IsSkipModeEnabled = own
+        return said
+    end
+end
+cheat.IsSkipModeEnabled = function() return false end
+return said
+"#;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MissionError {
     #[error("archive: {0}")]
@@ -652,7 +673,9 @@ impl Mission {
         let steps = [
             (
                 "skip mode",
-                "MrxCheatBootstrap.IsSkipModeEnabled = function() return true end".to_owned(),
+                "__m2_own_skip_mode = MrxCheatBootstrap.IsSkipModeEnabled\n\
+                 MrxCheatBootstrap.IsSkipModeEnabled = function() return true end"
+                    .to_owned(),
             ),
             ("bootstrap", format!("Scripts[\"{BOOTSTRAP:08x}\"].Init()")),
             // The callback MrxGuiBootstrap.SetOnGuiLoadedFunc registers.
@@ -665,6 +688,25 @@ impl Mission {
                     .push(format!("  {name}: {}", first_lines(&e.to_string())));
             }
         }
+    }
+
+    /// Turns the scripts' developer skip mode, which [`start`](Self::start)
+    /// turns on so the intro movies end at once, off again once the movies
+    /// wait for the game ([`hold_movies`](Self::hold_movies)): for the
+    /// rest of play the scripts that ask (`MrxCheatBootstrap.
+    /// IsSkipModeEnabled`) are told no. The scripts' own answer is logged,
+    /// and their own function put back when it answers no.
+    pub fn end_skip_mode(&mut self) {
+        let ended = self
+            .host
+            .lua()
+            .load(END_SKIP_MODE)
+            .set_name("=end skip mode")
+            .eval::<String>();
+        self.log.push(match ended {
+            Ok(own) => format!("skip mode: off after the start (the scripts' own: {own})"),
+            Err(e) => format!("skip mode: {}", first_lines(&e.to_string())),
+        });
     }
 
     /// Has the scripts' free support items reach the game
@@ -1610,6 +1652,39 @@ mod tests {
         assert_eq!(landing_zone("03_mar_airport_llz_playerone"), Some((3, 1)));
         assert_eq!(landing_zone("lz_helipad_playerone"), None);
         assert_eq!(landing_zone("06_gua_upperclass_playerone"), None);
+    }
+
+    #[test]
+    fn skip_mode_ends_after_the_start() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        m.run(
+            "MrxCheatBootstrap = { IsSkipModeEnabled = function() return false end }",
+            "cheats",
+        )
+        .unwrap();
+        m.start();
+        let on = |m: &Mission| {
+            m.lua()
+                .load("return MrxCheatBootstrap.IsSkipModeEnabled()")
+                .eval::<bool>()
+                .unwrap()
+        };
+        assert!(on(&m), "the start turns it on");
+        m.end_skip_mode();
+        assert!(!on(&m));
+        assert!(
+            m.take_log()
+                .iter()
+                .any(|l| l == "skip mode: off after the start (the scripts' own: false)")
+        );
+        // Scripts whose own says yes are told no all the same.
+        m.run(
+            "__m2_own_skip_mode = function() return true end",
+            "own says yes",
+        )
+        .unwrap();
+        m.end_skip_mode();
+        assert!(!on(&m));
     }
 
     #[test]
