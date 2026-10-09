@@ -1104,9 +1104,7 @@ impl Game {
             v.damage = 0.0;
         }
         let p = &save.player;
-        player.character.position = Vec3::from(p.position);
-        player.character.velocity = Vec3::ZERO;
-        player.landed = false;
+        player.drop_at(Vec3::from(p.position));
         player.driving = None;
         player.chase_target = None;
         player.down = false;
@@ -1353,23 +1351,26 @@ impl Game {
         })
     }
 
-    /// Switches between walking and flying. Flying starts from the player's
-    /// camera; walking starts by dropping to the ground under the camera.
+    /// Switches between walking and flying (a developer's aid, `--dev`).
+    /// Flying starts from the player's camera, and not while the scripts
+    /// have her controls off; walking takes up her body where it was left
+    /// (or where the scripts moved it meanwhile), not where the camera is:
+    /// on foot she lands there again once the ground around it has
+    /// streamed back in.
     pub fn toggle_fly(&mut self) {
         let Some(player) = &mut self.scene.player else {
             return;
         };
         if self.on_foot {
+            if self.input_locked {
+                eprintln!("free camera: not while the scripts have her controls off");
+                return;
+            }
             self.camera.position = player.eye();
             self.camera.yaw = player.yaw;
             self.camera.pitch = player.pitch;
-        } else {
-            let p = self.camera.position;
-            player.character.position = Vec3::new(p.x, 0.0, p.z);
-            player.character.velocity = Vec3::ZERO;
-            player.landed = false;
-            player.yaw = self.camera.yaw;
-            player.facing = self.camera.yaw;
+        } else if player.driving.is_none() && player.landed {
+            player.drop_at(player.character.position);
         }
         self.on_foot = !self.on_foot;
     }
@@ -2188,12 +2189,11 @@ pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player)
         v.id.and_then(|id| physics.vehicle_transform(id))
             .filter(|at| at.is_finite())
     {
-        let out = door_out(at, &v.spec);
-        player.character.position = Vec3::new(out.x, 0.0, out.z);
-        player.character.velocity = Vec3::ZERO;
+        // At the hull's height: onto the ground by the door, not onto a
+        // boulder or roof over it.
+        player.drop_at(door_out(at, &v.spec));
         let f = at.transform_vector3(Vec3::Z);
         player.facing = f.x.atan2(f.z);
-        player.landed = false;
     }
     player.driving = None;
     player.chase_target = None;

@@ -123,6 +123,13 @@ struct Options {
     gait: Option<Gait>,
     double_sided: bool,
     fly: bool,
+    /// The developer's keys in the whole game's launch too (`--dev`): the
+    /// free camera, quick save and load, culling, the gait cycle.
+    dev: bool,
+    /// With `--alpha` (or `--mission --movies --screenshot`): the scripts'
+    /// skip mode ends once their start has run, rather than staying on for
+    /// the session.
+    skip_mode_off: bool,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -347,6 +354,8 @@ fn parse_args() -> anyhow::Result<Options> {
             "--fullscreen" => o.fullscreen = true,
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
+            "--dev" => o.dev = true,
+            "--skip-mode-off" => o.skip_mode_off = true,
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -491,7 +500,7 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 7] = [
+    const PLAIN: [&str; 9] = [
         "--install",
         "--config",
         "--size",
@@ -499,6 +508,8 @@ fn parse_args() -> anyhow::Result<Options> {
         "--vsync",
         "--no-boot",
         "--smarter-ai",
+        "--dev",
+        "--skip-mode-off",
     ];
     if std::env::args()
         .skip(1)
@@ -624,6 +635,9 @@ fn main() -> anyhow::Result<()> {
         mode,
         double_sided: options.double_sided,
         fly: options.fly,
+        // The whole game plays as it launches, without the developer's
+        // keys, unless asked for; the test launches keep them.
+        dev: options.dev || options.fly || !options.alpha,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
         old_hud: options.old_hud,
@@ -631,6 +645,7 @@ fn main() -> anyhow::Result<()> {
         support: options.support.clone(),
         alpha: options.alpha,
         no_boot: options.no_boot,
+        skip_mode_off: options.skip_mode_off,
         guns: options.guns.clone(),
         state: None,
         error: None,
@@ -2333,7 +2348,8 @@ fn mission_for_screenshot(
     let tick = TICK.as_secs_f32();
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
         .with_support(options.support.clone())
-        .with_movies(options.movies);
+        .with_movies(options.movies)
+        .with_skip_mode_off(options.skip_mode_off);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -4365,6 +4381,8 @@ struct Running {
     /// The GUI's named buttons pressed since the last frame (Enter is
     /// `"selection"`), for the game HUD's scripts.
     buttons: Vec<String>,
+    /// The developer's keys work ([`App::dev`]).
+    dev: bool,
 }
 
 struct App {
@@ -4375,6 +4393,13 @@ struct App {
     double_sided: bool,
     /// Start flying rather than on foot.
     fly: bool,
+    /// The developer's keys work: the free camera, quick save and load,
+    /// back-face culling, the gait cycle. Off in the whole game's launch
+    /// (`--alpha`, or no options) unless `--dev` asks: there the free
+    /// camera would leave her body wherever the scripts lose track of
+    /// it, and a quick load puts the world back without the scripts'
+    /// state.
+    dev: bool,
     /// Run the mission scripts.
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
@@ -4388,6 +4413,8 @@ struct App {
     /// `no_boot`), front end, the scripts' movies.
     alpha: bool,
     no_boot: bool,
+    /// End the scripts' skip mode after their start (`--skip-mode-off`).
+    skip_mode_off: bool,
     /// Weapons to start with (`--gun`).
     guns: Vec<String>,
     state: Option<Running>,
@@ -4426,6 +4453,12 @@ impl App {
         let focused = window.has_focus();
         let mut hud = ui::Hud::new();
         hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud, &game);
+        hud.dev = self.dev;
+        eprintln!(
+            "keys: the developer's (V free camera, F5/F9 quick save and load, F3 culling, \
+             N gait) {}",
+            if self.dev { "on" } else { "off (--dev)" }
+        );
         let egui = egui_winit::State::new(
             hud.ctx.clone(),
             egui::ViewportId::ROOT,
@@ -4463,6 +4496,7 @@ impl App {
                         .with_keys(self.config.keys.clone())
                         .with_support(self.support.clone())
                         .with_movies(self.alpha)
+                        .with_skip_mode_off(self.skip_mode_off)
                         .with_subtitles(self.config.options.subtitles),
                 ),
                 _ => None,
@@ -4483,6 +4517,7 @@ impl App {
                 _ => None,
             },
             buttons: Vec::new(),
+            dev: self.dev,
         })
     }
 
@@ -4552,9 +4587,11 @@ impl Running {
             .as_ref()
             .map(hijack::Hijacks::take_gui_calls)
             .unwrap_or_default();
+        let buttons = std::mem::take(&mut self.buttons);
+        let selected = buttons.iter().any(|b| b == "selection");
         if self.hud.game.is_some() {
             let mut state = gamehud::HudState::of(&mut self.game);
-            state.buttons = std::mem::take(&mut self.buttons);
+            state.buttons = buttons;
             state.gui_calls = gui_calls;
             info.game = Some(state);
         }
@@ -4566,6 +4603,28 @@ impl Running {
             for seq in g.take_callbacks() {
                 m.hud_callback(seq);
             }
+        }
+        // With no game HUD to show the contract's fanfare (`--old-hud`,
+        // its scripts not up or broken, or the fanfare's call failed in
+        // them), Enter closes it as the fanfare's own Enter does, and the
+        // flow goes on to the next contract.
+        let no_fanfare = self
+            .hud
+            .game
+            .as_ref()
+            .is_none_or(|g| !g.ready() || g.dropped_fanfare());
+        if let Some(m) = &mut self.mission
+            && selected
+            && no_fanfare
+            && !self.hud.menu
+            && m.completed()
+            && let Some(seq) = m.waiting_fanfare()
+        {
+            eprintln!(
+                "mission: Enter closes the contract's fanfare (HUD call {seq}), which the \
+                 game's HUD can't show"
+            );
+            m.hud_callback(seq);
         }
         if config.window.vsync != vsync {
             self.backend.set_vsync(config.window.vsync);
@@ -4707,19 +4766,25 @@ impl Running {
             self.window
                 .set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
         }
-        if self.input.take_pressed(Action::QuickSave) {
+        // The developer's keys are taken either way, and do nothing
+        // without `--dev` in the whole game's launch.
+        let dev = self.dev;
+        if !dev {
+            self.input.take_pressed(Action::ToggleFly);
+        }
+        if self.input.take_pressed(Action::QuickSave) && dev {
             self.save_game();
         }
-        if self.input.take_pressed(Action::QuickLoad) {
+        if self.input.take_pressed(Action::QuickLoad) && dev {
             self.load_game();
         }
         if self.input.take_pressed(Action::ToggleMusic) {
             self.audio.toggle_music();
         }
-        if self.input.take_pressed(Action::NextGait) {
+        if self.input.take_pressed(Action::NextGait) && dev {
             self.game.scene.cycle_gaits();
         }
-        if self.input.take_pressed(Action::ToggleCulling) {
+        if self.input.take_pressed(Action::ToggleCulling) && dev {
             self.culling = !self.culling;
             if let Err(e) = self
                 .game

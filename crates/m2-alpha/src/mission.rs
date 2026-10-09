@@ -135,6 +135,9 @@ pub struct MissionView {
     pub game_message: Option<ObjectiveMessage>,
     /// The contract was just completed (for [`BANNER_TIME`] seconds).
     pub contract_complete: bool,
+    /// The contract is completed and its fanfare waits for Enter to
+    /// close it ([`MissionLink::waiting_fanfare`]).
+    pub fanfare_waiting: bool,
     /// The regions the scripts have on the radar (see [`RADAR_REGIONS`]).
     pub radar_regions: Vec<RadarRegion>,
     /// The scripts' latest calls to the HUD's interface (see [`HUD_CALLS`]).
@@ -295,6 +298,8 @@ for group, names in pairs(methods) do
                 local callback = type(t) == "table" and type(t.fCallback) == "function"
                 if callback then
                     __m2_hud_callbacks[__m2_hud_call_count] = t
+                    -- The contract's fanfare, which the flow waits on.
+                    if group == "Fanfare" then __m2_fanfare = __m2_hud_call_count end
                 end
                 table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
                     group = group, method = name, data = copy(t, 0),
@@ -350,6 +355,11 @@ pub struct MissionLink {
     /// The flow's movies wait for the game to play them
     /// ([`Mission::hold_movies`]); otherwise they end at once.
     movies: bool,
+    /// With [`movies`](Self::movies), the scripts' skip mode ends once the
+    /// start has run ([`Mission::end_skip_mode`], `--skip-mode-off`).
+    /// Off by default until the scripts that ask about it are surveyed on
+    /// the game's data: the flow was only seen to finish with it on.
+    end_skip: bool,
     /// The player has subtitles on.
     subtitles: bool,
     /// Time not yet given to the scripts.
@@ -465,6 +475,7 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             movies: false,
+            end_skip: false,
             subtitles: true,
             lag: 0.0,
             log,
@@ -518,6 +529,12 @@ impl MissionLink {
     /// [`take_movie`](Self::take_movie) hands them out.
     pub fn with_movies(self, movies: bool) -> Self {
         Self { movies, ..self }
+    }
+
+    /// Ends the scripts' skip mode once the start has run, when the movies
+    /// wait for the game (`--skip-mode-off`).
+    pub fn with_skip_mode_off(self, end_skip: bool) -> Self {
+        Self { end_skip, ..self }
     }
 
     /// Whether the player has subtitles on (the game's option).
@@ -959,6 +976,13 @@ impl MissionLink {
                 }
                 mission.set_subtitles(self.subtitles);
                 mission.start();
+                if self.movies && self.end_skip {
+                    // The movies wait for the game, so the scripts' skip
+                    // mode has done its part.
+                    mission.end_skip_mode();
+                } else if self.movies {
+                    eprintln!("mission: the scripts' skip mode stays on (--skip-mode-off)");
+                }
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
                     if obey(game, &mission, &mut self.vehicles, &c) {
@@ -1245,6 +1269,16 @@ impl MissionLink {
         self.completed.is_some()
     }
 
+    /// The newest of the scripts' fanfare calls (`Hud.Fanfare`) whose
+    /// callback is still to be called: the contract's, which the flow
+    /// waits on until the fanfare's Enter closes it.
+    pub fn waiting_fanfare(&self) -> Option<u64> {
+        match &self.state {
+            State::Running(m) => waiting_fanfare(m.lua()),
+            _ => None,
+        }
+    }
+
     /// What the HUD shows.
     pub fn view(&self) -> MissionView {
         let recent = self.message.as_ref().filter(|m| m.2 < MESSAGE_TIME);
@@ -1313,6 +1347,7 @@ impl MissionLink {
             message,
             game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
+            fanfare_waiting: self.completed.is_some() && waiting_fanfare(mission.lua()).is_some(),
             radar_regions: radar_regions(mission.lua()),
             hud_calls: hud_calls(mission.lua()),
             pda_objectives: hud.mission.clone(),
@@ -1351,6 +1386,15 @@ fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
             callback: t.get("callback").unwrap_or(false),
         })
         .collect()
+}
+
+/// The fanfare call [`HUD_CALLS`] kept last with a callback, while that
+/// callback has not been called.
+fn waiting_fanfare(lua: &mlua::Lua) -> Option<u64> {
+    let g = lua.globals();
+    let seq = g.get::<Option<u64>>("__m2_fanfare").ok().flatten()?;
+    let callbacks = g.get::<mlua::Table>("__m2_hud_callbacks").ok()?;
+    callbacks.contains_key(seq).ok()?.then_some(seq)
 }
 
 /// What [`TRESPASS`] keeps.
@@ -1924,9 +1968,38 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             {
                 world.physics.remove_vehicle(id);
                 let driving = game.scene.player.as_ref().and_then(|p| p.driving);
-                if matches!(c, Command::Move { .. }) && driving == Some(i) {
+                // She goes with it, as when they seat her in one: there,
+                // so the ground loads around it and it is placed, with
+                // the same time to be. Not where they hide it under the
+                // island; there she stays on foot.
+                if let Command::Move { position, .. } = c
+                    && driving == Some(i)
+                    && position[1] > HIDDEN_BELOW
+                    && let Some(p) = game.scene.player.as_mut()
+                {
                     fleet.reenter = Some(*guid);
+                    fleet.boarding = BOARDING;
+                    p.drop_at(Vec3::from(*position));
+                    p.driving = None;
+                    p.chase_target = None;
+                    eprintln!(
+                        "mission: the scripts moved {guid:#x} with her in it: she waits at \
+                         {:.1?} to be seated again",
+                        position
+                    );
                 }
+            }
+            // Gone, or hidden, while she waited to get in: the wait ends
+            // on the next step as if it had run out, so she stays out (and
+            // goes ashore if she waits in the sea, as for the start's boat)
+            // and the scripts hear where she is again.
+            if fleet.reenter == Some(*guid)
+                && match c {
+                    Command::Move { position, .. } => position[1] <= HIDDEN_BELOW,
+                    _ => true,
+                }
+            {
+                fleet.boarding = 1;
             }
             let scene = &mut game.scene;
             if let Some(world) = &mut scene.world {
@@ -1951,6 +2024,10 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         Command::Kill(guid) => {
             if let Some(i) = index(guid) {
                 game.scene.vehicles[i].wrecked = true;
+            }
+            // Wrecked while she waited to get in: the wait ends, as above.
+            if fleet.reenter == Some(*guid) {
+                fleet.boarding = 1;
             }
             let scene = &mut game.scene;
             if let Some(world) = &mut scene.world
@@ -2016,9 +2093,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
     };
     let Some(to) = to else { return false };
     if let Some(p) = game.scene.player.as_mut() {
-        p.character.position = Vec3::from(to);
-        p.character.velocity = Vec3::ZERO;
-        p.landed = false;
+        // At the height they give: onto the floor or ground there, not a
+        // roof over it.
+        p.drop_at(Vec3::from(to));
         p.driving = None;
         p.chase_target = None;
     }
@@ -2370,6 +2447,30 @@ mod tests {
         assert!(item.contains(&(Plain::Text("nValue".into()), Plain::Number(5.0))));
         // The call still reaches what was there.
         assert_eq!(lua.globals().get::<i64>("got").unwrap(), 1);
+    }
+
+    #[test]
+    fn the_contract_fanfare_waits_until_called_back() {
+        let lua = mlua::Lua::new();
+        lua.load("Hud = { Fanfare = {}, SubtitleBuffer = {} }")
+            .exec()
+            .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        assert_eq!(waiting_fanfare(&lua), None);
+        lua.load(
+            r#"
+            Hud.Fanfare:Create({ sType = "contract", fCallback = function() end })
+            Hud.Fanfare:Commence({})
+            Hud.SubtitleBuffer:AddMessage({ fCallback = function() end })
+            "#,
+        )
+        .exec()
+        .unwrap();
+        // The fanfare's, not the subtitle's after it.
+        assert_eq!(waiting_fanfare(&lua), Some(1));
+        // Called back (as `MissionLink::hud_callback` does): no longer.
+        lua.load("__m2_hud_callbacks[1] = nil").exec().unwrap();
+        assert_eq!(waiting_fanfare(&lua), None);
     }
 
     #[test]

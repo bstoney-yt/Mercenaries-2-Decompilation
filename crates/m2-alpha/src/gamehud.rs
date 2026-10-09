@@ -759,6 +759,21 @@ struct Image {
     rgba: Vec<u8>,
 }
 
+/// Whether a HUD log line tells of a mission fanfare call that failed
+/// (`hud call Fanfare.Create: ...`, as the HUD thread logs its calls).
+fn fanfare_failed(line: &str) -> bool {
+    line.strip_prefix("hud call Fanfare.")
+        .is_some_and(|rest| rest.contains(": "))
+}
+
+/// Whether a HUD log line tells of its Lua state out of stack (mlua's
+/// "out of Lua stack"), after which every call into its scripts fails. A
+/// script's own error, even a runaway one ("stack overflow"), unwinds and
+/// leaves the state as it was.
+fn broken_lua(line: &str) -> bool {
+    line.contains("out of Lua stack")
+}
+
 /// What the thread sends back.
 enum Output {
     Frame {
@@ -827,6 +842,9 @@ pub struct GameHud {
     last_time: Option<f64>,
     /// Mission calls whose callbacks the HUD has called, to hand back.
     callbacks: Vec<u64>,
+    /// A mission fanfare call (`Hud.Fanfare`) failed in the HUD's scripts:
+    /// it can't show, nor its Enter close it.
+    dropped_fanfare: bool,
     /// The front end's latest news (see [`GameHud::start_shell`]).
     shell: ShellNews,
     log: Option<BufWriter<File>>,
@@ -879,6 +897,7 @@ impl GameHud {
             rx,
             status: Status::Loading,
             callbacks: Vec::new(),
+            dropped_fanfare: false,
             prims: Vec::new(),
             pending: Vec::new(),
             textures: HashMap::new(),
@@ -913,9 +932,15 @@ impl GameHud {
         matches!(self.status, Status::Ready)
     }
 
-    /// The scripts could not start: the old HUD stands in.
+    /// The scripts could not start, or broke: the old HUD stands in.
     pub fn failed(&self) -> bool {
         matches!(self.status, Status::Failed)
+    }
+
+    /// A mission fanfare call failed in the HUD's scripts (the log says
+    /// which): the contract's fanfare isn't up for Enter to close.
+    pub fn dropped_fanfare(&self) -> bool {
+        self.dropped_fanfare
     }
 
     /// Seconds since the last frame, from egui's input `time`.
@@ -1015,12 +1040,29 @@ impl GameHud {
                 shell,
             } => {
                 self.callbacks.extend(callbacks);
+                // Handed over already (a frame queued before it in this
+                // drain broke): a later frame does not take it back.
+                if self.failed() {
+                    self.write(log);
+                    return;
+                }
                 let new_game = self.shell.new_game.take().or(shell.new_game);
                 self.shell = ShellNews { new_game, ..shell };
+                self.dropped_fanfare |= log.iter().any(|l| fanfare_failed(l));
+                let broken = log.iter().find(|l| broken_lua(l)).cloned();
+                self.write(log);
+                if let Some(line) = broken {
+                    // Every call into its scripts fails from here on: the
+                    // stand-in HUD shows the objectives, the support menu,
+                    // the PDA and the satellite's view instead.
+                    self.fail(format!(
+                        "the HUD's scripts broke ({line}); the stand-in HUD takes over"
+                    ));
+                    return;
+                }
                 self.status = Status::Ready;
                 self.prims = prims;
                 self.pending.extend(images);
-                self.write(log);
             }
             Output::Failed(why) => self.fail(why),
         }
@@ -4782,25 +4824,18 @@ mod tests {
 mod paint_tests {
     use super::*;
 
-    /// A fade (a black, three-quarters solid quad over the screen) leaves
-    /// egui as a mesh over the screen.
-    #[test]
-    fn solid_quads_reach_the_tessellated_output() {
+    /// A HUD with no thread behind it, at `status`, holding `prims`.
+    fn test_hud(status: Status, prims: Vec<Prim>) -> GameHud {
         let (tx, _rx) = channel();
         let (_tx, rx) = channel();
-        let mut hud = GameHud {
+        GameHud {
             tx,
             rx,
-            status: Status::Ready,
+            status,
             callbacks: Vec::new(),
+            dropped_fanfare: false,
             shell: ShellNews::default(),
-            prims: vec![quad(
-                None,
-                [0.0, 0.0, 800.0, 600.0],
-                [0.0; 4],
-                [0.0, 0.0, 0.0, 0.75],
-                0.0,
-            )],
+            prims,
             pending: Vec::new(),
             textures: HashMap::new(),
             pixels: HashMap::new(),
@@ -4809,7 +4844,23 @@ mod paint_tests {
             last_call: 0,
             last_time: None,
             log: None,
-        };
+        }
+    }
+
+    /// A fade (a black, three-quarters solid quad over the screen) leaves
+    /// egui as a mesh over the screen.
+    #[test]
+    fn solid_quads_reach_the_tessellated_output() {
+        let mut hud = test_hud(
+            Status::Ready,
+            vec![quad(
+                None,
+                [0.0, 0.0, 800.0, 600.0],
+                [0.0; 4],
+                [0.0, 0.0, 0.0, 0.75],
+                0.0,
+            )],
+        );
         let ctx = egui::Context::default();
         hud.upload(&ctx);
         let out = ctx.run_ui(crate::ui::headless_input(800, 600, 0.0), |ui| {
@@ -4856,5 +4907,38 @@ mod paint_tests {
         soldier.alert = true;
         let most = soldier.ai.health.round() as i32;
         assert_eq!(target_health(&soldier), (-1, most, most));
+    }
+
+    fn frame(log: &[&str]) -> Output {
+        Output::Frame {
+            prims: Vec::new(),
+            images: Vec::new(),
+            log: log.iter().map(|l| (*l).to_owned()).collect(),
+            callbacks: Vec::new(),
+            shell: ShellNews::default(),
+        }
+    }
+
+    /// A failed fanfare call is noted; a Lua state out of stack hands over
+    /// to the stand-in HUD, while a script's own error does not.
+    #[test]
+    fn a_broken_hud_hands_over_to_the_stand_in() {
+        let mut hud = test_hud(Status::Loading, Vec::new());
+        hud.take(frame(&[
+            "hud call Fanfare.Create",
+            "hud call SubtitleBuffer.AddMessage: [string \"x\"]:1: stack overflow",
+        ]));
+        assert!(hud.ready() && !hud.dropped_fanfare());
+        hud.take(frame(&[
+            "hud call Fanfare.Commence: the HUD has no such method",
+        ]));
+        assert!(hud.ready() && hud.dropped_fanfare());
+        hud.take(frame(&[
+            "gui call MrxGui.Show: out of Lua stack, too many arguments",
+        ]));
+        assert!(hud.failed() && !hud.ready());
+        // A clean frame queued behind it does not take it back.
+        hud.take(frame(&[]));
+        assert!(hud.failed() && !hud.ready());
     }
 }
