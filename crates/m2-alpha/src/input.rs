@@ -174,10 +174,10 @@ fn key_name(key: KeyCode) -> String {
 /// `[confirm]` the consoles' (here the use key), `[sprint]` sprint's
 /// (round 98 met it after the first gate), `[reload]` the reload's and
 /// `[jump]` the jump's, which is the brake when driving (`[jump]
-/// Handbrake`; the play test met both), and `[bash]` the melee's (one of
-/// the engine's 33 words; the fonts' picture for it isn't matched yet,
-/// [`m2_game::gui_runtime::button_glyph`]). `[pfire]` and `[move]` are
-/// named apart ([`token_keys`]).
+/// Handbrake`; the play test met both), and `[bash]` the melee's. Texts
+/// draw these as the fonts' button pictures where there is one
+/// ([`m2_game::gui_runtime::button_glyph`]); the keys are the fallback.
+/// `[pfire]` and `[move]` are named apart ([`token_keys`]).
 const TOKENS: [(&str, Action); 7] = [
     ("pda", Action::Pda),
     ("support", Action::Support),

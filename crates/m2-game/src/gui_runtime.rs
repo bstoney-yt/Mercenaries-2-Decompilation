@@ -1,4 +1,4 @@
-﻿//! The game's widget library (`_GuiInternal`) rebuilt as a widget store,
+//! The game's widget library (`_GuiInternal`) rebuilt as a widget store,
 //! so the game's own interface scripts build and drive the HUD.
 //!
 //! The scripts never draw: `MrxGuiBase` wraps each native widget in a Lua
@@ -338,12 +338,12 @@ pub struct Screen {
     /// Which way the camera looks, degrees (`Player.GetCameraXZHeading`).
     heading: f32,
     /// The keys bound to control words the fonts have no picture for
-    /// (`support`: `T`), by word in lower case ([`Screen::set_key_names`]).
+    /// (`l-stick up`: `T`), by word in lower case ([`Screen::set_key_names`]).
     key_names: BTreeMap<String, String>,
 }
 
 impl Screen {
-    /// Names the keys bound to control words (`[support]`, `[reload]`):
+    /// Names the keys bound to control words (`[l-stick up]`):
     /// a text shows such a word as its key in brackets (`[T]`) where the
     /// fonts have no button picture for it ([`button_glyph`]).
     pub fn set_key_names(&mut self, names: impl IntoIterator<Item = (String, String)>) {
@@ -1052,43 +1052,59 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
 }
 
 /// The button page's glyphs below U+E014 that [`button_glyph`] gives no
-/// word: one of these (or one past U+E013) is each word still without a
-/// picture, to be told apart by looking at them on the PC.
-pub const UNMATCHED_GLYPHS: [char; 6] = [
-    '\u{e000}', '\u{e001}', '\u{e002}', '\u{e003}', '\u{e00c}', '\u{e00f}',
-];
+/// word: U+E00C is an empty black disc and U+E00F is not on the page.
+pub const UNMATCHED_GLYPHS: [char; 2] = ['\u{e00c}', '\u{e00f}'];
 
 /// The glyph a control word stands for on the PC (`[pfire] Shoot`): the
 /// HUD fonts keep the PC's button pictures on a page of their own
 /// (`english_18`'s second, `pc\common_18_buttons`), at private-use
-/// characters U+E000 on. The engine's list of the words (`[move]`,
-/// `[left stick]`, `[aim]`... `[dpad down]`, 33 of them) does not follow
-/// the glyphs' order, so they are matched by picture: the PC footage's
-/// satellite help shows `[move]` as the four arrows and `[confirm]` as the
-/// pistol (the fire button confirms), and the rest are the pictures that
-/// say what the words do. Words not matched yet show the key bound to
-/// them, if the host named it ([`Screen::set_key_names`]), else stay as
-/// written. `[support]`, `[reload]`, `[jump]` and `[bash]` are among
-/// those: the PC footage shows each as a picture, but which of the
-/// unmatched glyphs ([`UNMATCHED_GLYPHS`]) is which hasn't been looked at;
-/// nothing read here (the words' list, the font) ties a word to a glyph.
+/// characters U+E000 on.
+///
+/// Which pad button each word is comes from the game's data: the HUD
+/// movies' text formatter (`formatText` in `topbar` and `minimap`, vz.wad)
+/// swaps each word for a pad picture loaded by name, `[confirm]` for
+/// `button_A`, `[bash]`, `[honk]` and `[cancel]` for `button_B`,
+/// `[reload]` for `button_X`, `[action]` for `button_Y`, `[left stick]`
+/// for `button_joystick_L` (as `[move]`), `[sswitch]` for
+/// `button_Dpad_left`, `[support]` for `button_joystick_L_press`. Those
+/// are the console's pictures; the PC font page has its own, and the four
+/// round ones (U+E000 to U+E003, the only face-button discs on it) are
+/// taken to be A, B, X and Y in that order, the formatter's own order
+/// (`b1` to `b4`). The pictures agree where they can be read (U+E001 a
+/// fist for the bash, U+E002 a magazine for the reload), but no data ties
+/// a code point to a pad button: inferred, unchecked on the PC.
+/// `[jump]` is not in the formatter; it is given U+E000, the face disc
+/// no other word takes (`[confirm]` is the pistol on the PC, below).
+/// `[support]` is given the headset (U+E01C), the support radio, by
+/// picture: the page has no disc of its own for the left stick's press.
+///
+/// The rest are matched by picture: the PC footage's satellite help shows
+/// `[move]` as the four arrows and `[confirm]` as the pistol (the fire
+/// button confirms), and the others are the pictures that say what the
+/// words do. Words without a glyph show the key bound to them, if the
+/// host named it ([`Screen::set_key_names`]), else stay as written.
 pub fn button_glyph(word: &str) -> Option<char> {
     Some(match word.to_ascii_lowercase().as_str() {
+        "jump" => '\u{e000}',
+        "bash" | "honk" | "cancel" => '\u{e001}',
+        "reload" => '\u{e002}',
+        "action" => '\u{e003}',
         "crouch" => '\u{e004}',
         // Fire, and what the fire button does.
         "pfire" | "confirm" => '\u{e005}',
         "sfire" => '\u{e006}',
         "pswitch" => '\u{e007}',
-        "move" => '\u{e008}',
+        "move" | "left stick" => '\u{e008}',
         "aim" => '\u{e009}',
         "sprint" => '\u{e00a}',
         "zoom" => '\u{e00b}',
         "pda" => '\u{e00d}',
         "pause" => '\u{e00e}',
-        "dpad left" => '\u{e010}',
+        "dpad left" | "sswitch" => '\u{e010}',
         "dpad right" => '\u{e011}',
         "dpad up" => '\u{e012}',
         "dpad down" => '\u{e013}',
+        "support" => '\u{e01c}',
         _ => return None,
     })
 }
@@ -2562,13 +2578,29 @@ mod tests {
             s.display_text("Press [pfire] at[n][move] Move view"),
             "Press \u{e005} at\n\u{e008} Move view"
         );
-        // Not matched to a picture yet: as written.
-        assert_eq!(s.display_text("[honk] Honk"), "[honk] Honk");
-        // The words still without one, and the glyphs no word has.
-        for w in ["support", "reload", "jump", "bash"] {
-            assert_eq!(button_glyph(w), None, "{w}");
+        // Not a control word: as written.
+        assert_eq!(s.display_text("[beep] Beep"), "[beep] Beep");
+        // The face buttons, by the HUD movies' formatter: A B X Y.
+        assert_eq!(
+            s.display_text("[jump] Handbrake[n][reload] Reload"),
+            "\u{e000} Handbrake\n\u{e002} Reload"
+        );
+        for (w, g) in [
+            ("bash", '\u{e001}'),
+            ("honk", '\u{e001}'),
+            ("cancel", '\u{e001}'),
+            ("action", '\u{e003}'),
+            ("left stick", '\u{e008}'),
+            ("sswitch", '\u{e010}'),
+            ("support", '\u{e01c}'),
+        ] {
+            assert_eq!(button_glyph(w), Some(g), "{w}");
         }
         let words = [
+            "jump",
+            "bash",
+            "reload",
+            "action",
             "crouch",
             "pfire",
             "sfire",
@@ -2595,15 +2627,15 @@ mod tests {
     fn control_words_without_a_picture_name_their_keys() {
         let mut s = Screen::default();
         s.set_key_names([
-            ("Support".to_owned(), "T".to_owned()),
+            ("L-Stick Up".to_owned(), "T".to_owned()),
             ("pfire".to_owned(), "F".to_owned()),
         ]);
-        assert_eq!(
-            s.display_text("[support] Open support menu"),
-            "[T] Open support menu"
-        );
+        assert_eq!(s.display_text("[l-stick up] Look up"), "[T] Look up");
         // A word the fonts have a picture for keeps it; others as written.
-        assert_eq!(s.display_text("[pfire] [reload]"), "\u{e005} [reload]");
+        assert_eq!(
+            s.display_text("[pfire] [l-stick down]"),
+            "\u{e005} [l-stick down]"
+        );
     }
 
     #[test]
