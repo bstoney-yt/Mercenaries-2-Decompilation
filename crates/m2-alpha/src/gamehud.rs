@@ -2810,9 +2810,11 @@ impl Thread {
                 .reticle
                 .map_or((Value::Nil, Value::Nil), |[x, y]| (number(x), number(y)));
             let (kind, hp, most) = match s.target {
-                Some((kind, hp, most)) => {
-                    (kind, Value::Integer(hp.into()), Value::Integer(most.into()))
-                }
+                Some((kind, hp, most)) => (
+                    kind,
+                    Value::Integer(hp as mlua::Integer),
+                    Value::Integer(most as mlua::Integer),
+                ),
                 None => (0, Value::Nil, Value::Nil),
             };
             fire(lua, "GuiReticleUpdate", (kind, x, y, 0, 0, hp, most))?;
