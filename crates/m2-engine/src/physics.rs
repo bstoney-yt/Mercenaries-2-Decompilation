@@ -1420,12 +1420,17 @@ impl Physics {
             half.x = half.x.min(FUSELAGE_HALF);
         }
         let centre = Vec3::new((lo.x + hi.x) * 0.5, floor + half.y, (lo.z + hi.z) * 0.5);
+        // Swept, as loose pieces are: at speed a step carries it further
+        // than a fence or a post is thick, and the hull would end up
+        // inside one (a static's triangles have no inside to push it out
+        // of the way it came).
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
                 .pose(pose(position, rotation))
                 .linear_damping(0.1)
                 .angular_damping(0.5)
-                .can_sleep(false),
+                .can_sleep(false)
+                .ccd_enabled(true),
         );
         // Mass low in the hull (as an engine and axles put it) and inertia
         // a little above a solid box's, so it takes a steep slope or a
