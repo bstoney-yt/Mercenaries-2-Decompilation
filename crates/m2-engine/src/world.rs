@@ -277,6 +277,9 @@ pub struct Templates {
     pub ordnance: crate::ordnance::Ordnance,
     /// How vehicles break each template's objects running into them.
     pub crashable: HashMap<u32, crate::durability::Crash>,
+    /// The sound each template's objects make breaking (its `SoundKey`),
+    /// by id ([`crate::durability::sound_keys`]).
+    pub sound_keys: HashMap<u32, u32>,
     /// The templates that stand already destroyed, by id: those whose
     /// `Health` is 0. All 201 such are ruins (`_marsh_bridgemid_ruined`,
     /// `AMX30_RUIN`), each with the model of its intact twin, whose
@@ -629,6 +632,7 @@ impl Templates {
             hijack: crate::hijack::read(&db),
             ordnance: crate::ordnance::read(&db),
             crashable: crate::durability::crashable(&db),
+            sound_keys: crate::durability::sound_keys(&db),
             health: crate::tuning::healths(&db),
             speeds: crate::tuning::human_speeds(&db),
             human_sets: crate::tuning::human_animation_sets(&db),

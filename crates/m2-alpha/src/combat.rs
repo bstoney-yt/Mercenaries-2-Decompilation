@@ -1024,6 +1024,12 @@ pub enum Sound {
     Bomb(Vec3),
     /// A building the bomb brought down coming apart.
     Collapse(Vec3),
+    /// Something with no building's collapse (a fence, a sign) breaking:
+    /// its template's `SoundKey` (`prop_sheetmetal_sml`).
+    Break {
+        at: Vec3,
+        key: u32,
+    },
 }
 
 /// A blow or a round that landed on something of the world's rather than
@@ -1780,6 +1786,12 @@ impl Combat {
     /// A building the bomb brought down comes apart at `at`: heard.
     pub fn collapse(&mut self, at: Vec3) {
         self.sounds.push(Sound::Collapse(at));
+    }
+
+    /// Something that doesn't come down as a building does breaks at
+    /// `at`: heard as its template's `SoundKey` `key` says.
+    pub fn broke(&mut self, at: Vec3, key: u32) {
+        self.sounds.push(Sound::Break { at, key });
     }
 
     /// Where she is a target: her chest, or `None` while down, flying or

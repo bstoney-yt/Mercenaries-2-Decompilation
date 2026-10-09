@@ -700,6 +700,160 @@ impl SoundLibrary {
     }
 }
 
+/// Every cue table the world archive holds (`ui_hud`'s, the music's, and
+/// whatever others its blocks carry), each block read once; tables that
+/// don't parse are left out.
+pub fn world_cue_tables<R: Read + Seek>(source: &mut AssetSource<R>) -> Vec<CueTable> {
+    let index = source.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == CUE_TABLE_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut tables: Vec<CueTable> = Vec::new();
+    for b in blocks {
+        let Ok(decoded) = source.block(b) else {
+            continue;
+        };
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (e, data) in contents.iter() {
+            if e.type_hash != CUE_TABLE_TYPE {
+                continue;
+            }
+            if let Ok(t) = CueTable::parse(data)
+                && !tables.iter().any(|o| o.hash == t.hash)
+            {
+                tables.push(t);
+            }
+        }
+    }
+    tables
+}
+
+/// The sounds a template's `SoundKey` (a name hash, `prop_sheetmetal_sml`)
+/// plays, each with its weight, how loud, and how they were found, for
+/// the log.
+#[derive(Clone, Debug, Default)]
+pub struct KeySounds {
+    pub sounds: Vec<(SoundBuffer, f32)>,
+    pub volume: f32,
+    pub how: String,
+}
+
+impl KeySounds {
+    /// What sound key `key` plays, found as the game finds its interface's
+    /// sounds (`ui_hud`): a cue of that name in one of the world's cue
+    /// `tables`, whose record names its variants (bank, sound, weight);
+    /// else a bank named so, each of its sounds alike (as a cue's variants
+    /// would be: which is the break the bank doesn't say); else the banks
+    /// of a block named so. `None` when none of these is there: the key
+    /// names something not yet read.
+    pub fn resolve<R: Read + Seek>(
+        source: &mut AssetSource<R>,
+        tables: &[CueTable],
+        key: u32,
+    ) -> Option<Self> {
+        for t in tables {
+            let Some(record) = t.record_of(key) else {
+                continue;
+            };
+            let mut banks: Vec<u32> = record.variants.iter().map(|v| v.0).collect();
+            banks.sort_unstable();
+            banks.dedup();
+            let library = SoundLibrary::load_banks(source, &banks);
+            let sounds: Vec<(SoundBuffer, f32)> = record
+                .variants
+                .iter()
+                .filter_map(|&(bank, i, weight)| {
+                    let (_, list) = library.bank_hash(bank)?;
+                    Some((list.get(i as usize)?.clone(), weight.max(0.0)))
+                })
+                .filter(|(s, _)| s.frames() > 0)
+                .collect();
+            if sounds.is_empty() {
+                continue;
+            }
+            let how = format!(
+                "cue of table {:08x}: {} of its {} variants (banks {}), volume {:.2}",
+                t.hash,
+                sounds.len(),
+                record.variants.len(),
+                banks
+                    .iter()
+                    .map(|b| format!("{b:08x}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                record.volume
+            );
+            let volume = if record.volume > 0.0 {
+                record.volume
+            } else {
+                1.0
+            };
+            return Some(Self {
+                sounds,
+                volume,
+                how,
+            });
+        }
+        let alike = |list: &[SoundBuffer], how: String| {
+            let sounds: Vec<(SoundBuffer, f32)> = list
+                .iter()
+                .filter(|s| s.frames() > 0)
+                .map(|s| (s.clone(), 1.0))
+                .collect();
+            (!sounds.is_empty()).then(|| Self {
+                how: format!(
+                    "{how}: {} sounds ({}), each alike",
+                    sounds.len(),
+                    sounds
+                        .iter()
+                        .map(|(s, _)| format!("{:08x} {:.2} s", s.hash, s.seconds()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                sounds,
+                volume: 1.0,
+            })
+        };
+        let library = SoundLibrary::load_banks(source, &[key]);
+        if let Some(found) = library
+            .bank_hash(key)
+            .and_then(|(_, list)| alike(list, "the bank named so".to_owned()))
+        {
+            return Some(found);
+        }
+        let library = SoundLibrary::load_hashes(source, &[key]).ok()?;
+        let (name, list) = library.bank_hash(key)?;
+        alike(list, format!("the banks of block {name}"))
+    }
+
+    /// One of its sounds, `pick` (0 to 1) choosing by weight.
+    pub fn pick(&self, pick: f32) -> Option<&SoundBuffer> {
+        let total: f32 = self.sounds.iter().map(|s| s.1).sum();
+        if total <= 0.0 {
+            let i = (pick * self.sounds.len() as f32) as usize;
+            return self
+                .sounds
+                .get(i.min(self.sounds.len().saturating_sub(1)))
+                .map(|s| &s.0);
+        }
+        let mut left = pick.clamp(0.0, 1.0) * total;
+        for (s, w) in &self.sounds {
+            if left <= *w {
+                return Some(s);
+            }
+            left -= w;
+        }
+        self.sounds.last().map(|s| &s.0)
+    }
+}
+
 /// A bank's sound, decoded.
 fn buffer(s: &m2_assets::sound::Sound) -> SoundBuffer {
     SoundBuffer {
@@ -1132,6 +1286,31 @@ mod tests {
             rate,
             samples: (0..frames).map(|_| 16384i16).collect(),
         }
+    }
+
+    #[test]
+    fn a_key_picks_its_sounds_by_weight() {
+        let sound = |hash| SoundBuffer {
+            hash,
+            ..tone(22050, 10)
+        };
+        let key = KeySounds {
+            sounds: vec![(sound(1), 0.25), (sound(2), 0.75)],
+            volume: 1.0,
+            how: String::new(),
+        };
+        assert_eq!(key.pick(0.0).map(|s| s.hash), Some(1));
+        assert_eq!(key.pick(0.2).map(|s| s.hash), Some(1));
+        assert_eq!(key.pick(0.3).map(|s| s.hash), Some(2));
+        assert_eq!(key.pick(1.0).map(|s| s.hash), Some(2));
+        // No weights: each alike.
+        let alike = KeySounds {
+            sounds: vec![(sound(1), 0.0), (sound(2), 0.0)],
+            ..key
+        };
+        assert_eq!(alike.pick(0.1).map(|s| s.hash), Some(1));
+        assert_eq!(alike.pick(0.9).map(|s| s.hash), Some(2));
+        assert!(KeySounds::default().pick(0.5).is_none());
     }
 
     #[test]
