@@ -344,7 +344,9 @@ const MG_RANGE: f32 = 500.0;
 /// Gunfire puts soldiers this close on alert and sends civilians running.
 const ALERT_RANGE: f32 = 60.0;
 const PANIC_RANGE: f32 = 40.0;
-/// A soldier's hit on her: the "Assault Rifle Bullet" template's Damage
+/// A soldier's hit on her when his template names no gun (the AK47
+/// stands in; the rest hit as their own gun's round does,
+/// [`Combat::npc_round`]): the "Assault Rifle Bullet" template's Damage
 /// (the VZ soldiers' rifle, 9, `DamageKey` `Bullet`) times the game's
 /// damage table's `Hero` row for a `Bullet` (0.25; see
 /// `m2_engine::tuning::DamageTable`), whoever the hero is (all three
@@ -592,6 +594,21 @@ impl Arsenal {
         }
         .or(self.carbine.as_ref())
         .or(self.rifle.as_ref())
+    }
+
+    /// The model a soldier holds: his template's gun's own, else the AK47
+    /// that stands in (for templates naming no gun, or whose gun's model
+    /// isn't loaded).
+    pub fn npc_gun(&self, gun: Option<m2_engine::tuning::HandGun>) -> Option<&WeaponModel> {
+        let own = gun.and_then(|g| g.model).and_then(|h| {
+            self.by_model.get(&h).or_else(|| {
+                [&self.rifle, &self.carbine, &self.bullpup]
+                    .into_iter()
+                    .flatten()
+                    .find(|w| w.model.hash == h)
+            })
+        });
+        own.or(self.rifle.as_ref())
     }
 
     /// Weapon to world for `weapon` slung on the back of a character
@@ -2016,7 +2033,8 @@ impl Combat {
     fn npc_shoot(&mut self, f: &mut Field<'_>, i: usize, target: Option<Vec3>) {
         let Some(aim) = target else { return };
         let n = &f.people.npcs[i];
-        let from = match (&f.arsenal.rifle, f.people.kinds.get(n.kind)) {
+        let gun = n.gun;
+        let from = match (f.arsenal.npc_gun(gun), f.people.kinds.get(n.kind)) {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
                 f.arsenal
@@ -2067,7 +2085,8 @@ impl Combat {
         let closest = from + dir * (aim - from).dot(dir).max(0.0);
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
         if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
-            self.hurt_player(f, NPC_DAMAGE, Some(from));
+            let damage = self.npc_round(gun);
+            self.hurt_player(f, damage, Some(from));
         }
         if let Some((t, None)) = hit {
             self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
@@ -3114,6 +3133,23 @@ impl Combat {
             .unwrap_or(1.0)
     }
 
+    /// What a soldier's round does to her: his template's gun's round's
+    /// `Damage` times the game's damage table's `Hero` row for its
+    /// `DamageKey` (a round without a key is a `Bullet`); the Assault
+    /// Rifle Bullet's [`NPC_DAMAGE`] when his template names no gun, or
+    /// the table isn't found.
+    fn npc_round(&self, gun: Option<m2_engine::tuning::HandGun>) -> f32 {
+        let Some(g) = gun else { return NPC_DAMAGE };
+        let key = g
+            .damage_key
+            .filter(|&k| k != 0)
+            .unwrap_or_else(|| m2_assets::name_hash("Bullet"));
+        self.damage_table
+            .as_ref()
+            .and_then(|t| t.scale(m2_assets::name_hash("Hero"), key))
+            .map_or(NPC_DAMAGE, |scale| g.damage * scale)
+    }
+
     /// Explosion template `blast` going off at `at`, by its own `Radius`,
     /// `Damage` and `MinDamage` and the damage table's scale for its
     /// `DamageKey` (people's `Human` row, the hero's `Hero` row; vehicles
@@ -3501,7 +3537,7 @@ fn farthest(way: Vec3, speed: f32) -> Vec3 {
 }
 
 /// Gunfire or a blast at `at`: soldiers close by turn on the player,
-/// civilians close by run.
+/// those close by who don't fight run (not story characters).
 fn alarm(people: &mut People, at: Vec3) {
     for n in &mut people.npcs {
         if !n.alive {
@@ -4216,6 +4252,36 @@ mod tests {
         }
         assert!(combat.down > 0.0 && player.down);
         assert_eq!(combat.target(&player, true), None);
+    }
+
+    // A soldier's round hurts her as his template's gun's does, by the
+    // damage table's `Hero` row; with no gun of his own, as the Assault
+    // Rifle Bullet does.
+    #[test]
+    fn soldiers_rounds_hurt_her_as_their_guns_do() {
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(1);
+        put(1);
+        put(m2_assets::name_hash("Hero"));
+        put(m2_assets::name_hash("Bullet"));
+        put(0.25f32.to_bits());
+        let combat = Combat {
+            damage_table: m2_engine::tuning::DamageTable::parse(&data),
+            ..Combat::default()
+        };
+        assert!(combat.damage_table.is_some());
+        let gun = m2_engine::tuning::HandGun {
+            template: 1,
+            model: None,
+            rate_of_fire: 600.0,
+            clip: 30,
+            reserve_clips: 7,
+            damage: 12.0,
+            damage_key: None,
+        };
+        assert_eq!(combat.npc_round(Some(gun)), 3.0);
+        assert_eq!(combat.npc_round(None), NPC_DAMAGE);
     }
 
     #[test]

@@ -951,10 +951,11 @@ fn screenshot(
     eprintln!("props: {}", game.scene.props.counts());
     let people = &game.scene.people;
     eprintln!(
-        "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",
+        "people: {} kinds, {} about ({} soldiers, {} story characters, {} patrolling, {} landed) after {:.1} s",
         people.kinds.len(),
         people.npcs.len(),
-        people.npcs.iter().filter(|n| n.spawn.is_some()).count(),
+        people.npcs.iter().filter(|n| n.soldier).count(),
+        people.npcs.iter().filter(|n| n.held).count(),
         people.npcs.iter().filter(|n| n.patrolling()).count(),
         people.npcs.iter().filter(|n| n.landed).count(),
         started.elapsed().as_secs_f32()
@@ -982,13 +983,8 @@ fn screenshot(
                 .join(", ")
         );
         for (d, s) in near.iter().take(options.list_spawns) {
-            let kind = s
-                .template
-                .as_deref()
-                .and_then(|t| people.kind_for(t))
-                .or_else(|| people.kind_for(&s.name));
             eprintln!(
-                "  spawn {:08x} {:?} {d:.0} m at {:.0}, template {:?}, layer {} ({}), {} route points, {}{}",
+                "  spawn {:08x} {:?} {d:.0} m at {:.0}, template {:?}, layer {} ({}), {} route points, {}{}{}",
                 s.entity,
                 s.name,
                 s.position,
@@ -1004,12 +1000,11 @@ fn screenshot(
                     "out"
                 },
                 s.route.len(),
-                if kind.is_some() {
-                    "a soldier"
-                } else if people.mission_soldiers.contains(&s.entity) {
-                    "a mission soldier"
+                people.stands_as(s),
+                if people.mission_soldiers.contains(&s.entity) {
+                    ", a mission's target"
                 } else {
-                    "nobody"
+                    ""
                 },
                 if people.npcs.iter().any(|n| n.spawn == Some(s.entity)) {
                     ", standing"
@@ -2790,7 +2785,7 @@ fn look_at_story_character(game: &mut Game) {
     let Some((name, chest)) = people
         .npcs
         .iter()
-        .filter(|n| people.kinds.get(n.kind).is_some_and(|k| k.named))
+        .filter(|n| n.held)
         .map(|n| (people.kinds[n.kind].role.clone(), n.chest()))
         .filter(|(_, c)| c.distance(here) < 40.0)
         .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))

@@ -497,7 +497,7 @@ pub struct Scene {
     people_rig: Option<Rig>,
     /// Drivable vehicles near the spawn.
     pub vehicles: Vec<ParkedVehicle>,
-    /// Soldiers and civilians.
+    /// The people the layers place.
     pub people: People,
     pub arsenal: Arsenal,
     /// Fuel tanks and barrels that blow up when hit.
@@ -606,10 +606,10 @@ const PARKED: usize = 8;
 /// reach goes by its size, which is known once it has loaded).
 const PROP_MARGIN: f32 = 100.0;
 
-/// Person models loaded: the soldiers the spawn names ask for, then
-/// civilians.
+/// The catalogue's person models loaded up front: those of the roles
+/// soldiers' names ask for, for soldiers whose template has no model of
+/// its own (the rest stand in their template's).
 const ARMY: [&str; 3] = ["vz_hum_soldier", "vz_hum_soldierelite", "vz_hum_deathsquad"];
-const CIVILIAN_MODELS: usize = 6;
 
 /// A model the loading thread has decoded.
 pub enum Loaded {
@@ -620,8 +620,11 @@ pub enum Loaded {
     /// stands (position, yaw), its spec and model.
     WorldVehicle(u32, Vec3, f32, Vec<(String, String)>, VehicleSpec, CpuModel),
     Catalogue(Catalogue),
-    /// A person's model: a role's, or a story character's (true).
+    /// A person's model: a role's, or a template's own (true).
     Person(PersonModel, CpuModel, Skeleton, bool),
+    /// A template's own person model that could not be read: model and
+    /// template.
+    NoPerson(u32, String),
     /// A hand weapon: name, model, muzzle (model space).
     Weapon(&'static str, CpuModel, Vec3),
     /// Any other hand weapon's model the templates name: its name's hash,
@@ -632,9 +635,9 @@ pub enum Loaded {
     Flight(u32, CpuModel, Vec<Mat4>, Vec<m2_assets::vehicle::Rotor>),
 }
 
-/// Finds the island's vehicle and person models and decodes the soldiers,
-/// a few civilians and up to [`PARKED`] vehicles, on a thread (the search
-/// reads the whole archive).
+/// Finds the island's vehicle and person models and decodes the soldiers'
+/// role models ([`ARMY`]) and up to [`PARKED`] vehicles, on a thread (the
+/// search reads the whole archive).
 fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
@@ -663,13 +666,6 @@ fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
                 .people
                 .iter()
                 .filter(|p| ARMY.contains(&p.role.as_str()))
-                .chain(
-                    found
-                        .people
-                        .iter()
-                        .filter(|p| !p.soldier)
-                        .take(CIVILIAN_MODELS),
-                )
                 .collect();
             eprintln!(
                 "people: {} roles; loading {}",
@@ -1228,7 +1224,7 @@ impl Scene {
         });
     }
 
-    /// Loads a story character's model (`Carmona`'s, by their template)
+    /// Loads a template's own person model (`Carmona`'s, a `VZ Soldier`'s)
     /// on a thread; it joins the people's kinds as `template`.
     fn load_character(&self, model: u32, template: String) {
         let Some(install) = self.install.clone() else {
@@ -1239,7 +1235,8 @@ impl Scene {
             let result = (|| -> anyhow::Result<()> {
                 let mut source = install.open_world()?;
                 let data = source.model(model)?;
-                let cpu = CpuModel::from_data(&data, 0)?;
+                let mut cpu = CpuModel::from_data(&data, 0)?;
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                 let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
                 let person = PersonModel {
                     model,
@@ -1251,6 +1248,7 @@ impl Scene {
             })();
             if let Err(e) = result {
                 eprintln!("{template} ({model:08x}): {e:#}");
+                let _ = tx.send(Loaded::NoPerson(model, template));
             }
         });
     }
@@ -1353,6 +1351,10 @@ impl Scene {
                 self.catalogue = Some(c.clone());
                 return Ok(());
             }
+            Loaded::NoPerson(model, template) => {
+                self.people.refuse(*model, template.clone());
+                return Ok(());
+            }
             Loaded::Vehicle(_, cpu)
             | Loaded::MissionVehicle(_, _, cpu)
             | Loaded::WorldVehicle(_, _, _, _, _, cpu)
@@ -1374,7 +1376,7 @@ impl Scene {
             spec.tuned(t).armed_with(arm, &db.arms)
         };
         match loaded {
-            Loaded::Catalogue(_) => {}
+            Loaded::Catalogue(_) | Loaded::NoPerson(..) => {}
             Loaded::Vehicle(spec, _) => self.vehicles.push(ParkedVehicle {
                 spec: tune(spec),
                 model,
@@ -1454,31 +1456,52 @@ impl Scene {
                 self.arsenal.add_model(hash, model, muzzle, rig);
             }
             Loaded::Person(p, _, skeleton, named) => {
-                // The hero's clips fit every human skeleton.
+                // The people's clips fit every human skeleton.
                 let template = self
                     .people_rig
                     .as_ref()
                     .and_then(|rig| rig.for_skeleton(skeleton));
+                // A template's own gun (`EquipmentLink`); a role's none.
+                let db = self.world.as_ref().map(|w| &w.index.template_db);
+                let gun = db
+                    .filter(|_| named)
+                    .and_then(|db| db.own_rifle(&p.role))
+                    .map(|(name, gun)| (name.to_owned(), gun));
                 match template {
                     Some(rig) => {
                         eprintln!(
-                            "person {}: {} bones, {} clips",
+                            "person {} ({:08x}): {} bones, {} clips, gun {}",
                             p.role,
+                            p.model,
                             rig.skeleton.len(),
-                            rig.clips.len()
+                            rig.clips.len(),
+                            gun.as_ref()
+                                .map_or("none of its own".to_owned(), |(name, g)| {
+                                    format!(
+                                        "{name} (model {:08x}, {:.0} a minute, {} a round)",
+                                        g.model.unwrap_or(0),
+                                        g.rate_of_fire,
+                                        g.damage
+                                    )
+                                })
                         );
                         self.people.add_kind(PersonKind {
                             role: p.role,
-                            soldier: p.soldier,
                             named,
+                            gun: gun.map(|(_, g)| g),
                             model,
                             rig,
                         });
                     }
-                    None => eprintln!(
-                        "person {}: the clips don't fit its skeleton; left out",
-                        p.role
-                    ),
+                    None => {
+                        eprintln!(
+                            "person {}: the clips don't fit its skeleton; left out",
+                            p.role
+                        );
+                        if named {
+                            self.people.refuse(p.model, p.role);
+                        }
+                    }
                 }
             }
         }
@@ -1666,7 +1689,7 @@ impl Scene {
             model.draw_posed(backend, queue, body, &nodes, &skin)?;
             if n.soldier
                 && n.alive
-                && let Some(w) = &self.arsenal.rifle
+                && let Some(w) = self.arsenal.npc_gun(n.gun)
                 && let Some(at) =
                     self.arsenal
                         .in_hand(w, body, &nodes, (n.hand, n.attach), n.rig.two_handed)
