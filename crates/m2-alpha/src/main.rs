@@ -59,6 +59,7 @@ mod npc;
 mod pad;
 mod particles;
 mod paths;
+mod placed;
 mod player;
 mod props;
 mod route;
@@ -230,6 +231,9 @@ struct Options {
     /// With `--screenshot --drive`: hijack the vehicle instead of getting
     /// in, answering every prompt at once.
     hijack: bool,
+    /// With `--mission`: try every placed pickup, crate and emplaced gun
+    /// as the layers put them out ([`placed::check`]), for testing.
+    placed_check: bool,
     /// With `--screenshot --drive`: load the seats' clips first, so she
     /// is seen sitting in the vehicle as she drives it.
     seated: bool,
@@ -412,6 +416,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--no-fx" => o.no_fx = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
+            "--placed-check" => o.placed_check = true,
             "--seated" => o.seated = true,
             "--mission-driver" => {
                 let path = value()?;
@@ -562,6 +567,10 @@ const HURT_AT: f32 = 8.0;
 /// wall first (in the PC footage it bursts in 4 s before "Hijack tank" is
 /// added; inferred, not measured from the game).
 const HIJACK_WAIT: f32 = 8.0;
+
+/// With `--mission --placed-check`, how often what the layers put out is
+/// tried, seconds.
+const PLACED_CHECK_EVERY: f32 = 5.0;
 
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
@@ -2463,6 +2472,7 @@ fn mission_for_screenshot(
     let mut hijack_pad = hijack::Autopad::default();
     let (mut hijack_tries, mut hijack_use, mut hijack_t) = (0, None, 0.0);
     let mut action_since: Option<u32> = None;
+    let mut placed_tried = std::collections::HashSet::new();
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -2485,6 +2495,21 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        // With --placed-check, what the layers have put out is tried
+        // every few seconds ([`placed::check`]).
+        // Not before she is ashore: the first contract's boat ride is
+        // the scripts' to end.
+        if options.placed_check
+            && i % (PLACED_CHECK_EVERY / tick).round() as u32 == 0
+            && !link
+                .view()
+                .objectives
+                .iter()
+                .any(|o| o.contains("Land on the beach"))
+            && game.scene.player.as_ref().is_some_and(|p| p.landed)
+        {
+            placed::check(game, &mut placed_tried, tick);
+        }
         if let Some(h) = &mut hijacks {
             if hijack_use == Some(i) {
                 hijack_input.button(Action::Use, true);

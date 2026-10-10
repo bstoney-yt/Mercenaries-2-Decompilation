@@ -423,6 +423,12 @@ impl Flights {
         Some(self.pickups.remove(i))
     }
 
+    /// Takes away what lies under `key` ([`Pickup::key`]) untaken: a
+    /// placed pickup whose layer went out.
+    pub fn forget(&mut self, key: (u32, u32)) {
+        self.pickups.retain(|p| p.key() != key);
+    }
+
     /// Lays `p` down to be taken (a weapon she left for another), its
     /// model loaded if it isn't.
     pub fn leave(&mut self, p: Pickup) {

@@ -135,6 +135,8 @@ pub struct Game {
     /// The pickups she has stood at and left lying, each logged once
     /// with why.
     refused: std::collections::HashSet<(u32, u32)>,
+    /// The pickups, crates and emplaced guns the state layers place.
+    pub placed: crate::placed::Placed,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
     /// The field of view (degrees, bottom to top) and the screen's width
@@ -225,6 +227,7 @@ impl Game {
             drops: Drops::default(),
             dropped: 0,
             refused: std::collections::HashSet::new(),
+            placed: crate::placed::Placed::default(),
             input_locked: false,
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
@@ -513,15 +516,63 @@ impl Game {
                     park(physics, &mut scene.vehicles, player, self.park_tries);
                 }
                 if intent.use_pressed {
+                    // The emplaced gun she would man, if nothing nearer
+                    // takes the key.
+                    let manning = (player.driving.is_none()
+                        && self.combat.manned.is_none()
+                        && scene.flights.within(player.character.position).is_none())
+                    .then(|| {
+                        self.placed.emplacement_near(
+                            &scene.props,
+                            &world.index.template_db,
+                            player.character.position,
+                        )
+                    })
+                    .flatten();
                     match player.driving {
                         // Not out of a boat into deep water.
                         Some(i) if can_get_out(physics, &scene.vehicles[i]) => {
                             get_out(physics, &scene.vehicles[i], player)
                         }
                         Some(_) => {}
+                        // Off the emplaced gun she mans.
+                        None if self.combat.manned.is_some() => {
+                            if let Some(m) = self.combat.manned.take() {
+                                eprintln!(
+                                    "placed: she leaves the emplaced gun {:#x} with {} rounds",
+                                    m.entity, m.rounds
+                                );
+                            }
+                        }
                         // What lies within reach before any vehicle.
                         None if scene.flights.within(player.character.position).is_some() => {
                             taking = true;
+                        }
+                        // An emplaced gun, before any vehicle.
+                        None if manning.is_some() => {
+                            let Some(m) = manning else { unreachable!() };
+                            eprintln!(
+                                "placed: she mans {} ({:#x}) at {:.1}: {} ({} rounds, {:.0} a \
+                                 minute), turning {:.0}..{:.0} and tilting {:.0}..{:.0} degrees",
+                                world
+                                    .index
+                                    .template_db
+                                    .names
+                                    .get(&m.template)
+                                    .map_or("?", String::as_str),
+                                m.entity,
+                                m.pivot,
+                                m.weapon.name,
+                                m.rounds,
+                                m.weapon.rate_of_fire,
+                                m.yaw.0.to_degrees(),
+                                m.yaw.1.to_degrees(),
+                                m.pitch.0.to_degrees(),
+                                m.pitch.1.to_degrees()
+                            );
+                            // Where she stands, facing the way it does.
+                            player.facing = m.facing;
+                            self.combat.manned = Some(m);
                         }
                         None => {
                             player.driving = nearest(physics, &scene.vehicles, player, REACH);
@@ -586,6 +637,17 @@ impl Game {
                     None => {
                         player.driving = None;
                         player.chase_target = None;
+                        // At an emplaced gun she stands behind it and only
+                        // looks.
+                        let intent = match self.combat.manned {
+                            Some(_) => Intent {
+                                movement: Vec2::ZERO,
+                                sprint: false,
+                                jump: false,
+                                ..intent
+                            },
+                            None => intent,
+                        };
                         player.update(physics, intent, dt);
                     }
                 }
@@ -761,11 +823,20 @@ impl Game {
                 }
             }
             // A supply crate broken open: a puff of dust off its boards.
-            let broken = scene.flights.strike(
+            let mut broken = scene.flights.strike(
                 &mut world.physics,
                 &self.combat.struck,
                 &self.combat.went_off,
             );
+            // The state layers' crates too ([`crate::placed`]).
+            broken.extend(self.placed.strike(
+                &mut scene.props,
+                &mut world.physics,
+                &mut scene.flights,
+                &world.index.template_db,
+                &self.combat.struck,
+                &self.combat.went_off,
+            ));
             for (_, at) in broken {
                 self.combat.show(
                     Effect::Smoke {
@@ -777,48 +848,84 @@ impl Game {
                 self.combat
                     .show_fx(crate::combat::fx::CRATE, at + Vec3::Y * 0.6);
             }
-            // What lies within her reach: a weapon taken up with the use
-            // key; ammunition and health as she walks over them, if they
-            // give her anything (else with the use key, as before). A
-            // weapon lying there whose ammunition records give a weapon of
-            // hers rounds she has room for (a dead soldier's `Assault
-            // Rifle`, to her own rifle) is walked over for them.
+            // What lies within her reach, taken as the real game takes it
+            // ([`crate::mission::offer`]): health and the small ammunition
+            // box as she walks over them, if they give her anything; an
+            // ammunition box, or a weapon she carries, with the use key for
+            // its ammunition ("Take Ammo"); a weapon she doesn't carry with
+            // the use key, taken up ("Equip").
+            use crate::mission::Offer;
             let templates = &world.index.template_db;
             let near = scene.flights.within(player.character.position).map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
                 let usable = self.combat.can_use(refill, p.what.health);
+                let offer = crate::mission::offer(templates, &self.combat, &p.what);
                 // Each pickup she stands at and leaves lying, once, with
                 // why: what each record would go to and its room.
-                if !usable && !taking && self.refused.insert(p.key()) {
+                if !usable && offer != Offer::Equip && self.refused.insert(p.key()) {
                     eprintln!(
-                        "pickup: she leaves {} ({:#x}) at {:.1} lying: {}{}",
+                        "pickup: she leaves {} ({:#x}) at {:.1} lying ({offer:?}): {}",
                         templates.by_id(p.what.template).map_or("?", |t| t.0),
                         p.what.template,
                         p.at,
                         crate::mission::refusal(templates, &self.combat, &p.what),
-                        match p.what.weapon {
-                            Some(w) => format!(" (a weapon, {w:?}: taken up with the use key)"),
-                            None => String::new(),
-                        }
                     );
                 }
-                usable
+                (offer, usable)
             });
+            let take = match near {
+                Some((Offer::Walk, usable)) => usable,
+                Some((Offer::TakeAmmo, usable)) => taking && usable,
+                Some((Offer::Equip, _)) => taking,
+                None => false,
+            };
             if player.driving.is_none()
-                && (taking || near == Some(true))
+                && self.combat.manned.is_none()
+                && take
                 && let Some(p) = scene.flights.take_within(player.character.position)
             {
+                let walked = near.is_some_and(|n| n.0 != Offer::Equip);
+                let from = p.from;
                 take_up(
                     &mut self.combat,
                     &mut scene.flights,
                     &world.index.template_db,
                     player,
                     p,
-                    !taking,
+                    walked,
                 );
+                // A placed one's prop comes down with it.
+                if self.placed.is_pickup(from) {
+                    self.placed
+                        .taken(from, &mut scene.props, &mut world.physics);
+                }
+            }
+            // Off an emplaced gun once she is down, in a vehicle, or it
+            // is gone with its layer.
+            if let Some(m) = &self.combat.manned
+                && (self.combat.down > 0.0
+                    || player.driving.is_some()
+                    || scene.props.get(m.entity).is_none_or(|(p, _)| p.wrecked))
+            {
+                self.combat.manned = None;
             }
         }
         self.drop_pickups();
+        // What the state layers place, as they come and go.
+        if let Some(world) = &self.scene.world {
+            let new = self.placed.sync(
+                &self.scene.props,
+                &mut self.scene.flights,
+                &world.index.template_db,
+                dt,
+            );
+            if new != crate::placed::Counts::default() {
+                eprintln!(
+                    "placed: {new:?} more stand; in play {:?}",
+                    self.placed.counts()
+                );
+            }
+        }
         self.support_impacts();
         self.strike_impacts(dt);
         self.run_particles(dt);
@@ -1327,21 +1434,39 @@ impl Game {
         };
         // What the use key takes, as the game words it.
         let prompt = match (&self.scene.world, player) {
-            (Some(w), Some(p)) if p.driving.is_none() && p.landed && self.on_foot => self
-                .scene
-                .flights
-                .within(p.character.position)
-                // Ammunition is walked over, unworded (round 138).
-                .and_then(|p| {
-                    let weapon = p.what.weapon?;
-                    Some(format!(
-                        "Equip {}",
-                        w.index
-                            .template_db
-                            .by_id(p.what.template)
-                            .map_or_else(|| format!("{weapon:?}"), |t| t.0.to_owned())
-                    ))
-                }),
+            (Some(w), Some(p)) if p.driving.is_none() && p.landed && self.on_foot => {
+                use crate::mission::Offer;
+                let db = &w.index.template_db;
+                let word = |key: u32, english: &str| {
+                    strings
+                        .and_then(|s| s.strings.get(&key).cloned())
+                        .unwrap_or_else(|| english.to_owned())
+                };
+                match self.scene.flights.within(p.character.position) {
+                    Some(lying) => match crate::mission::offer(db, &self.combat, &lying.what) {
+                        // Walked over, unworded.
+                        Offer::Walk => None,
+                        Offer::TakeAmmo => {
+                            let refill = crate::mission::refill(db, &self.combat, &lying.what);
+                            self.combat
+                                .can_use(refill, lying.what.health)
+                                .then(|| word(TAKE_AMMO, "Take Ammo"))
+                        }
+                        Offer::Equip => Some(word(EQUIP, "Equip %s").replace(
+                            "%s",
+                            &shown_name(db, strings, lying.what.template, lying.what.gun),
+                        )),
+                    },
+                    None if self.combat.manned.is_none() => self
+                        .placed
+                        .emplacement_near(&self.scene.props, db, p.character.position)
+                        .map(|m| {
+                            word(USE, "Use %s")
+                                .replace("%s", &shown_name(db, strings, m.template, None))
+                        }),
+                    None => None,
+                }
+            }
             _ => None,
         };
         HudInfo {
@@ -1361,9 +1486,14 @@ impl Game {
                 0 => String::new(),
                 _ => self.combat.explosive_left().0.to_owned(),
             },
-            rounds: match self.combat.weapon {
-                Weapon::Rifle => Some(self.combat.rifle_rounds),
-                Weapon::GrenadeLauncher | Weapon::Rpg => self.combat.launcher_rounds,
+            // At an emplaced gun, its rounds.
+            rounds: match (&self.combat.manned, self.combat.weapon) {
+                (Some(m), _) => Some(combat::Rounds {
+                    clip: m.rounds,
+                    stored: 0,
+                }),
+                (None, Weapon::Rifle) => Some(self.combat.rifle_rounds),
+                (None, Weapon::GrenadeLauncher | Weapon::Rpg) => self.combat.launcher_rounds,
             }
             .map(|r| (r.clip, r.stored)),
             // Looking through the satellite, its own overlay is shown.
@@ -2221,6 +2351,28 @@ fn vehicle_name(
         );
     }
     shown.or(name).unwrap_or_else(|| label.to_owned())
+}
+
+/// The game's words for the use key at what lies within reach, by their
+/// string table keys (`English.wad`; PC data, 2026-10-10): "Take Ammo",
+/// "Equip %s", "Use %s".
+const TAKE_AMMO: u32 = 0xbd07_d121;
+const EQUIP: u32 = 0xdb58_ae4b;
+const USE: u32 = 0x93e3_1c00;
+
+/// The name the game shows for template `t` (or, without one, for `or`):
+/// the English string its `LocalizedName` keys; else its template's name.
+fn shown_name(
+    db: &Templates,
+    strings: Option<&m2_assets::StringTable>,
+    t: u32,
+    or: Option<u32>,
+) -> String {
+    let localized = |t: u32| strings?.strings.get(db.localized.get(&t)?).cloned();
+    localized(t)
+        .or_else(|| or.and_then(localized))
+        .or_else(|| db.names.get(&t).cloned())
+        .unwrap_or_else(|| format!("{t:#x}"))
 }
 
 /// The vehicle nearest her within `reach` metres of its door marker (or its
