@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use m2_engine::atmosphere::AtmosphereMix;
-use m2_engine::durability::Explosion;
+use m2_engine::durability::{CrashHow, Explosion};
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{
     CatalogueEntry, Install, Physics, StaticKey, Templates, VehicleControls, VehicleSpec, World,
@@ -2005,9 +2005,26 @@ fn hit_world(
     destruction: &mut Destruction,
     combat: &mut Combat,
 ) {
+    // Rounds, blows and blasts wear down the physics props first (a café
+    // chair breaks to a clip; a box takes nothing); what still stands
+    // and comes loose is knocked loose after.
+    for s in &combat.struck {
+        if let Some(key) = s.key {
+            destruction.wear(world, props, install, key, (s.round, s.kind), s.at);
+        }
+    }
+    let (radius, damage, least) = blast_strength(&world.index.template_db);
+    for &at in &combat.went_off {
+        let blast = Blast {
+            at,
+            radius,
+            damage,
+            least,
+        };
+        destruction.blast_props(world, props, install, blast);
+    }
     blast_loose(world, props, &combat.went_off, combat::REACH, false);
     if let Some(install) = install {
-        let (radius, damage, least) = blast_strength(&world.index.template_db);
         for &at in &combat.went_off {
             let blast = Blast {
                 at,
@@ -2178,12 +2195,23 @@ fn run_into(
     // What broke is not knocked loose as well.
     keys.retain(|k| !down.contains(k));
     for key in keys {
-        let loose = match key {
-            StaticKey::Object(i) => world.loose_mass(i),
-            StaticKey::Entity(e) => props.loose_mass(&world.physics, e),
-            _ => None,
+        let (loose, template) = match key {
+            StaticKey::Object(i) => (world.loose_mass(i), world.index.objects[i].template),
+            StaticKey::Entity(e) => (
+                props.loose_mass(&world.physics, e),
+                props.get(e).map_or(0, |(p, _)| p.template),
+            ),
+            _ => (None, 0),
         };
-        let Some(m) = loose.filter(|&m| mass * speed >= KNOCK_RATIO * m) else {
+        // What its template says a vehicle this light doesn't break (a
+        // wall a jeep runs into) stands, loose or not.
+        let holds = world
+            .index
+            .template_db
+            .crashable
+            .get(&template)
+            .is_some_and(|c| c.how == CrashHow::Breaks && mass < c.takes);
+        let Some(m) = loose.filter(|&m| !holds && mass * speed >= KNOCK_RATIO * m) else {
             continue;
         };
         let (fling, topple) = flung(vehicle.velocity, mass, m);

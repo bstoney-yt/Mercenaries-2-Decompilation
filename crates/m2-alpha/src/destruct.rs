@@ -183,6 +183,30 @@ enum Cause {
     Crash { velocity: Vec3, mass: f32 },
 }
 
+/// How fast a prop broken by a blast with nothing to show broken goes
+/// flying away from it, and up, m/s (invented).
+const FLY_AWAY: (f32, f32) = (5.0, 4.0);
+
+impl Cause {
+    /// How what it brought down of `mass` (kg), standing at `at`, flies
+    /// when it has no wreck to show but comes loose: on with the vehicle
+    /// ([`crate::game::flung`]), or away from the blast and up.
+    fn flings(&self, at: Vec3, mass: f32) -> (Vec3, Vec3) {
+        match *self {
+            Cause::Crash { velocity, mass: by } => crate::game::flung(velocity, by, mass),
+            Cause::Blast(from) => blown(from, at),
+        }
+    }
+}
+
+/// How something at `at` flies from a blast at `from`: away and up
+/// ([`FLY_AWAY`]), turning over the way it goes.
+pub fn blown(from: Vec3, at: Vec3) -> (Vec3, Vec3) {
+    let away = (at - from).with_y(0.0).normalize_or(Vec3::X);
+    let (out, up) = FLY_AWAY;
+    (away * out + Vec3::Y * up, Vec3::Y.cross(away) * 3.0)
+}
+
 /// The damage done to the island's placed objects, and those coming down.
 #[derive(Debug, Default)]
 pub struct Destruction {
@@ -199,7 +223,13 @@ pub struct Destruction {
     /// Breaks to be heard at the next [`update`](Self::update): where, and
     /// the template's `SoundKey`.
     heard: Vec<(Vec3, u32)>,
+    /// Damage the physics props have taken so far ([`wear`](Self::wear)).
+    worn: HashMap<StaticKey, f32>,
 }
+
+/// The damage table's column for a blast (the RPG's, the grenade's:
+/// their templates' `DamageKey`).
+const EXPLOSION: &str = "Explosion";
 
 impl Destruction {
     /// The damage placed object `i` has taken.
@@ -207,12 +237,129 @@ impl Destruction {
         self.taken.get(&i).copied().unwrap_or(0.0)
     }
 
+    /// Wears down physics prop `key` (the island's placed object or a
+    /// state layer's, its template `_PropPhysics`) by `damage` of kind
+    /// `kind` (a `DamageKey`'s name hash) landing at `at`: as much as its
+    /// `ModifierKey` row of the damage table takes of that kind (a
+    /// `PropFragile` chair all of a `Bullet`, half of an `Explosion`; a
+    /// `Prop` box nothing). At its `Health` it breaks: its wreck if its
+    /// model has one, else it goes flying ([`blown`]). True if it broke.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wear(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: Option<&Install>,
+        key: StaticKey,
+        (damage, kind): (f32, u32),
+        at: Vec3,
+    ) -> bool {
+        let template = match key {
+            StaticKey::Object(i) => {
+                if self.destroyed.contains(&i)
+                    || world.destroyed.contains(&i)
+                    || world.is_taken(i)
+                    || world.knocked_loose(i).is_some()
+                {
+                    return false;
+                }
+                world.index.objects[i].template
+            }
+            StaticKey::Entity(e) => match props.get(e) {
+                Some((p, _)) if !p.wrecked && !adopted(e) && props.knocked_loose(e).is_none() => {
+                    p.template
+                }
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let db = &world.index.template_db;
+        if !db.prop_physics.contains_key(&template) {
+            return false;
+        }
+        let Some(health) = db.health.get(&template).copied().filter(|h| *h > 0.0) else {
+            return false;
+        };
+        let scale = db
+            .modifiers
+            .get(&template)
+            .zip(db.damage.as_ref())
+            .and_then(|(&row, table)| table.scale(row, kind))
+            .unwrap_or(0.0);
+        let hit = damage * scale;
+        if hit <= 0.0 {
+            return false;
+        }
+        let taken = self.worn.entry(key).or_default();
+        *taken += hit;
+        if *taken < health {
+            return false;
+        }
+        let taken = *taken;
+        let name = db
+            .names
+            .get(&template)
+            .map_or("?", String::as_str)
+            .to_owned();
+        let sound = db.sound_keys.get(&template).copied();
+        eprintln!(
+            "destruct: physics prop {key:?} ({name}) broken at {at:.1}: {taken:.0} of {health:.0} \
+             health, last {hit:.0}"
+        );
+        match key {
+            StaticKey::Object(i) => match install {
+                Some(install) => self.bring_down(world, props, install, i, Cause::Blast(at)),
+                None => return false,
+            },
+            StaticKey::Entity(e) => {
+                props.wreck(&mut world.physics, e, Some(at));
+                if let (Some(k), Some(c)) = (sound, props.centre(e)) {
+                    self.heard.push((c, k));
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Wears down the physics props `blast` reaches ([`wear`](Self::wear)),
+    /// the island's and the state layers', by its damage where it reaches
+    /// each (as far as its box's middle less half its size).
+    pub fn blast_props(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: Option<&Install>,
+        blast: Blast,
+    ) {
+        let kind = m2_assets::name_hash(EXPLOSION);
+        let mut reached: Vec<(StaticKey, f32)> = world
+            .near(blast.at, blast.radius)
+            .into_iter()
+            .map(|(i, d)| (StaticKey::Object(i), d))
+            .collect();
+        for e in props.standing_near(blast.at, blast.radius) {
+            if let Some((at, (lo, hi))) = props.placed_bounds(e) {
+                let centre = at.transform_point3((lo + hi) * 0.5);
+                let d = (centre.distance(blast.at) - (hi - lo).length() * 0.5).max(0.0);
+                reached.push((StaticKey::Entity(e), d));
+            }
+        }
+        for (key, d) in reached {
+            let damage = blast.at_distance(d);
+            self.wear(world, props, install, key, (damage, kind), blast.at);
+        }
+    }
+
     /// Wears down what `blast` reaches; those it destroys come down.
+    /// Physics props are worn down by [`blast_props`](Self::blast_props).
     pub fn blast(&mut self, world: &mut World, props: &mut Props, install: &Install, blast: Blast) {
         for (i, d) in world.near(blast.at, blast.radius) {
             if self.destroyed.contains(&i)
                 || world.destroyed.contains(&i)
                 || world.loose_mass(i).is_some()
+                || (world.index.template_db.prop_physics)
+                    .contains_key(&world.index.objects[i].template)
             {
                 continue;
             }
@@ -256,9 +403,19 @@ impl Destruction {
     ) {
         self.destroyed.insert(i);
         let o = world.index.objects[i];
+        let loose = world.loose_mass(i);
         if world.object_model(i).is_some_and(|m| m.has_wreck()) && props.adopt(install, key(i), &o)
         {
             self.falling.push((i, cause));
+        } else if let Some(m) = loose {
+            // No wreck to show, but it comes loose (a café chair, a
+            // planter): it goes flying, as what is knocked loose does,
+            // rather than vanish.
+            let (velocity, spin) = cause.flings(o.position, m);
+            world.knock(i, velocity, spin);
+            if let Some(&k) = world.index.template_db.sound_keys.get(&o.template) {
+                self.heard.push((o.position, k));
+            }
         } else {
             // Drawn as its wreck at once: heard now, as one coming down
             // would be ([`update`](Self::update)), if it is no building.
@@ -569,5 +726,15 @@ mod tests {
         // A crate (no such property) is shoved; a rock stands.
         assert_eq!(car.does(key, None, true), Some(Crashed::Loose(key)));
         assert_eq!(car.does(key, None, false), None);
+    }
+
+    #[test]
+    fn what_a_blast_breaks_with_no_wreck_flies_away_and_up() {
+        let (velocity, spin) = blown(Vec3::ZERO, Vec3::new(3.0, 0.5, 0.0));
+        assert!(velocity.x > 0.0 && velocity.y > 0.0 && velocity.z.abs() < 1e-5);
+        assert!(spin.length() > 0.0);
+        // Right on top of it: still away (along x) and up.
+        let (velocity, _) = blown(Vec3::ONE, Vec3::ONE);
+        assert!(velocity.x > 0.0 && velocity.y > 0.0);
     }
 }

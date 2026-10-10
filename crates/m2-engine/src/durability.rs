@@ -172,6 +172,21 @@ pub struct PropPhysics {
     pub heavy: bool,
 }
 
+/// What a physics prop weighs when its `Mass` doesn't say (0 or -1, on
+/// most), kg: the game's own default isn't in the data. Invented: a light
+/// prop's 50 (a chair, a crate; the data's own masses run 20 to 200 for
+/// such), a heavy one's 2,000 (as the car ruins').
+const PROP_KG: f32 = 50.0;
+const HEAVY_KG: f32 = 2000.0;
+
+impl PropPhysics {
+    /// Its mass, kg: its own, else [`PROP_KG`] or [`HEAVY_KG`].
+    pub fn kg(&self) -> f32 {
+        self.mass
+            .unwrap_or(if self.heavy { HEAVY_KG } else { PROP_KG })
+    }
+}
+
 /// Each template's `_PropPhysics`, by id.
 pub fn prop_physics(db: &Layer<'_>) -> HashMap<u32, PropPhysics> {
     let t = Table::new(db, "_PropPhysics");
@@ -234,4 +249,28 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_prop_weighs_its_own_mass_else_a_light_or_heavy_default() {
+        let planter = PropPhysics {
+            mass: Some(200.0),
+            heavy: false,
+        };
+        assert_eq!(planter.kg(), 200.0);
+        let chair = PropPhysics {
+            mass: None,
+            heavy: false,
+        };
+        assert_eq!(chair.kg(), PROP_KG);
+        let dumpster = PropPhysics {
+            mass: None,
+            heavy: true,
+        };
+        assert_eq!(dumpster.kg(), HEAVY_KG);
+    }
 }

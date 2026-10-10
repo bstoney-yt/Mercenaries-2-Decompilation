@@ -1236,6 +1236,7 @@ impl Scene {
         };
         let y = world.index.rough_height(x, z) + 40.0;
         self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));
+        self.props.physics_props = world.index.template_db.prop_physics.clone();
         self.world = Some(world);
 
         // The hero, to walk the island as.

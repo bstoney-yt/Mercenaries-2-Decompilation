@@ -1058,6 +1058,18 @@ pub struct Strike {
     pub at: Vec3,
     pub damage: f32,
     pub key: Option<StaticKey>,
+    /// The round's or blow's own `Damage`, and its `DamageKey` (name
+    /// hash: `Bullet`, `BulletLarge`, `MeleeBash`; 0 for none): what the
+    /// damage table's row of what it hit takes of it
+    /// ([`crate::destruct::Destruction::wear`]).
+    pub round: f32,
+    pub kind: u32,
+}
+
+/// A round's `DamageKey`: its ammunition's, a plain `Bullet` for none.
+fn round_kind(key: Option<u32>) -> u32 {
+    key.filter(|&k| k != 0)
+        .unwrap_or_else(|| m2_assets::name_hash("Bullet"))
 }
 
 /// Rounds she has picked up for her rifle and RPG: the play keeps no
@@ -2339,6 +2351,8 @@ impl Combat {
                 at: from + aim * t,
                 damage: on_props,
                 key,
+                round: damage,
+                kind: round_kind(ammo.key),
             });
         }
         if let Some((_, Some(j))) = hit {
@@ -2418,6 +2432,8 @@ impl Combat {
                     at: eye + dir * t,
                     damage: on_props,
                     key,
+                    round: damage,
+                    kind: round_kind(ammo.and_then(|a| a.key)),
                 });
             }
             if let Some((_, Some(i))) = hit {
@@ -3136,6 +3152,8 @@ impl Combat {
                 at: from + ahead * t,
                 damage: BASH_BREAK,
                 key,
+                round: BASH_DAMAGE,
+                kind: m2_assets::name_hash("MeleeBash"),
             });
         }
     }
@@ -3147,6 +3165,8 @@ impl Combat {
             at,
             damage: RIFLE_DAMAGE * self.rifle.damage / CARBINE_ROUND,
             key,
+            round: self.rifle.damage,
+            kind: round_kind(self.rifle.ammo.and_then(|a| a.key)),
         }
     }
 
