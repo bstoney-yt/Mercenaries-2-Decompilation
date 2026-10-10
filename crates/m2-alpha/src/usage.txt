@@ -77,7 +77,8 @@ m2-alpha [options]
                          vehicle's place, speed and waypoint) and the five
                          spawners nearest her
   --fight-wait <s>       with --fight or --blast: wait this long before
-                         the picture
+                         the picture (with --blast, counted from the
+                         rocket's blast)
   --blast                with --screenshot on the island: fire a rocket at
                          the fuel tank or barrel nearest where she starts
   --demolish <n>         with --screenshot on foot: rocket the nearest
@@ -172,6 +173,10 @@ m2-alpha [options]
                          this far from the nearest marker, looking at it
   --old-hud              our own stand-in HUD (health bar, weapon line,
                          crosshair) instead of the game's own
+  --old-fx               fire and smoke as the old coloured spheres, not the
+                         game's own particle effects (to compare)
+  --no-fx                no fire or smoke drawn at all (to measure what
+                         they cover)
   --smarter-ai           the enhanced, smarter enemy soldiers (not the
                          original game's; settings [enhanced.smarter_ai])
   --autoplay             with --mission --screenshot: she plays the contract
