@@ -474,10 +474,12 @@ impl Autoplay {
                 .iter()
                 // What the layers place she leaves to the player: going out
                 // of her way for each would keep her from the contract.
+                // (Cheapest first: there are hundreds placed.)
                 .filter(|p| {
-                    wanted(templates, &game.combat, p)
+                    !game.placed.is_pickup(p.from)
+                        && p.at.distance(here) < OPEN_NEAR
                         && !self.left_lying.contains(&p.key())
-                        && !game.placed.is_pickup(p.from)
+                        && wanted(templates, &game.combat, p)
                 })
                 .map(|p| (p.key(), p.at.distance(here)))
                 .filter(|&(_, d)| d < OPEN_NEAR)

@@ -2724,8 +2724,9 @@ fn mission_for_screenshot(
             } else if seated.is_some() {
                 ashore_shot.get_or_insert(i + (3.0 / tick) as u32);
             }
+            // Not what the layers place: hundreds stand from the start.
             for p in game.scene.flights.pickups() {
-                if opened.insert(p.key()) {
+                if !game.placed.is_pickup(p.from) && opened.insert(p.key()) {
                     // Two seconds on, when the soldier who left it has
                     // fallen.
                     pickup_shots.push((i + (2.0 / tick) as u32, p.key(), opened.len()));
