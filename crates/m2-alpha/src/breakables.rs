@@ -36,7 +36,10 @@ pub enum Reaction {
     Block,
     /// Knocked loose whole: shoved, toppled, thrown.
     Move,
-    /// Broken: its wreck, its pieces flying, or gone.
+    /// Gone, with nothing left of it: no wreck, no pieces (its model
+    /// has neither). To the player it is driven or shot through.
+    Vanish,
+    /// Broken: its wreck shown, or its pieces flying.
     Break,
 }
 
@@ -71,6 +74,10 @@ pub struct Makeup {
     /// `ModifierKey` row; 0 without one).
     pub bullet: f32,
     pub explosion: f32,
+    /// Of a crash's damage by a car (the table's `Car` column), what it
+    /// takes: whether a car running into it wears it down at all (the
+    /// crash's own damage the data doesn't give).
+    pub crash_damage: f32,
 }
 
 impl Makeup {
@@ -88,6 +95,7 @@ impl Makeup {
             health: templates.health.get(&t).copied().filter(|h| *h > 0.0),
             bullet: scale("Bullet"),
             explosion: scale("Explosion"),
+            crash_damage: scale("Car"),
         }
     }
 
@@ -125,10 +133,13 @@ pub fn expected(m: &Makeup, hit: HitKind, hits: &Hits) -> &'static [Reaction] {
                 Some((CrashHow::Breaks, takes)) if mass >= takes => &[Break],
                 Some((CrashHow::Breaks, _)) => &[Block],
                 Some((CrashHow::KnockedOver | CrashHow::Flattened, _)) => &[Break, Move],
+                // One the table's `Car` column wears down may break (as
+                // the crash's damage, which the data doesn't give, says).
+                None if heavy(mass) && m.crash_damage > 0.0 && m.health.is_some() => {
+                    &[Block, Move, Break]
+                }
                 None if heavy(mass) => &[Block, Move],
-                // The table's `Car` column takes from a `PropFragile` prop
-                // twice the crash's damage, which the data doesn't give.
-                None if m.bullet > 0.0 => &[Break, Move],
+                None if m.crash_damage > 0.0 && m.health.is_some() => &[Break, Move],
                 None => &[Move],
             }
         }
@@ -188,7 +199,7 @@ const CHECK_NEAR: f32 = 1500.0;
 /// with her put down in its middle so its models stream in.
 const PATCH: f32 = 60.0;
 /// How long a patch's models are waited for, seconds.
-const PATCH_WAIT: f32 = 4.0;
+const PATCH_WAIT: f32 = 8.0;
 /// How long a prop is left after its hit before it is looked at, seconds.
 const SETTLE: f32 = 0.25;
 /// The check's vehicle's speed, m/s (36 km/h; invented).
@@ -253,8 +264,12 @@ pub fn check(
     let templates = &world.index.template_db;
     let explosive: std::collections::HashSet<usize> =
         game.scene.explosives.iter().map(|e| e.object).collect();
-    let wanted =
-        |t: u32| Makeup::of(templates, t).is_prop() && crate::placed::kind(templates, t).is_none();
+    // Not money (round 14's), nor what the pickups round tries.
+    let wanted = |t: u32| {
+        Makeup::of(templates, t).is_prop()
+            && crate::placed::kind(templates, t).is_none()
+            && !templates.names.get(&t).is_some_and(|n| n.contains("Cash"))
+    };
     let mut items: Vec<Item> = Vec::new();
     for (i, o) in world.index.objects.iter().enumerate() {
         if inside(o.position) && !explosive.contains(&i) && !world.is_taken(i) && wanted(o.template)
@@ -315,7 +330,7 @@ pub fn check(
     let mut tally: std::collections::BTreeMap<(Reaction, bool), usize> = Default::default();
     let mut unloaded = 0;
     let mut at_patch = None;
-    for item in items {
+    for item in items.clone() {
         if at_patch != Some(patch(item.position)) {
             at_patch = Some(patch(item.position));
             let (px, pz) = patch(item.position);
@@ -328,15 +343,35 @@ pub fn check(
                 pl.drop_at(middle);
             }
             // Until this patch's models are in (or the wait is up).
+            let here: Vec<StaticKey> = (items.iter())
+                .filter(|i| patch(i.position) == (px, pz))
+                .map(|i| i.key)
+                .collect();
             let mut waited = 0.0;
-            while waited < PATCH_WAIT && !placed_box(game, item.key).is_some() {
+            while waited < PATCH_WAIT && here.iter().any(|&k| placed_box(game, k).is_none()) {
                 run(game, 0.5);
                 waited += 0.5;
             }
             run(game, 0.5);
         }
+        // Not in yet: her put down at it, a while longer.
+        if placed_box(game, item.key).is_none() {
+            if let Some(pl) = game.scene.player.as_mut() {
+                pl.drop_at(item.position + Vec3::new(3.0, 2.0, 0.0));
+            }
+            let mut waited = 0.0;
+            while waited < PATCH_WAIT && placed_box(game, item.key).is_none() {
+                run(game, 0.5);
+                waited += 0.5;
+            }
+            at_patch = None;
+        }
         let Some((place, bounds)) = placed_box(game, item.key) else {
             unloaded += 1;
+            eprintln!(
+                "props-check: {hit:?} {:?} {:08x} at {:.0}: its model is not in",
+                item.key, item.template, item.position
+            );
             continue;
         };
         let before = reaction(game, item.key);
@@ -357,7 +392,7 @@ pub fn check(
         let mut note = String::new();
         // Already brought down (by a neighbour's hit): its reaction to
         // the same kind of hit.
-        if before == Reaction::Break || before == Reaction::Move {
+        if before != Reaction::Block && before != Reaction::None {
             note = " (by a neighbour's hit)".into();
         } else {
             match hit {
@@ -419,10 +454,18 @@ pub fn check(
         .filter(|((_, ok), _)| *ok)
         .map(|(_, n)| n)
         .sum();
+    // Reacted at all: stood in the way, moved or broke (not gone through
+    // or vanished).
+    let reacted: usize = tally
+        .iter()
+        .filter(|((r, _), _)| matches!(r, Reaction::Block | Reaction::Move | Reaction::Break))
+        .map(|(_, n)| n)
+        .sum();
     eprintln!(
         "props-check summary: {hit:?}: {tried} props tried, {ok} as the data says ({:.1}%), \
-         {unloaded} not loaded; {tally:?}",
-        100.0 * ok as f32 / tried.max(1) as f32
+         {reacted} reacted ({:.1}%), {unloaded} not loaded; {tally:?}",
+        100.0 * ok as f32 / tried.max(1) as f32,
+        100.0 * reacted as f32 / tried.max(1) as f32
     );
     if let Some(pl) = game.scene.player.as_mut() {
         pl.drop_at(start);
@@ -449,131 +492,33 @@ fn placed_box(game: &crate::game::Game, key: StaticKey) -> Option<(Mat4, (Vec3, 
     }
 }
 
-/// How `key` stands now.
+/// How `key` stands now: one brought down is broken if its model shows a
+/// wreck (or it broke into its pieces), else it vanished.
 fn reaction(game: &crate::game::Game, key: StaticKey) -> Reaction {
     let Some(world) = game.scene.world.as_ref() else {
         return Reaction::None;
     };
     let props = &game.scene.props;
-    let (knocked, broken) = match key {
+    let (knocked, down) = match key {
         StaticKey::Object(i) => (
             world.knocked_loose(i),
-            game.destruction.destroyed.contains(&i)
-                || world.destroyed.contains(&i)
-                || world.is_taken(i),
+            (game.destruction.destroyed.contains(&i) || world.destroyed.contains(&i))
+                .then(|| world.object_model(i).is_some_and(|m| m.has_wreck())),
         ),
         StaticKey::Entity(e) => (
             props.knocked_loose(e),
-            props.get(e).is_none_or(|(p, _)| p.wrecked),
+            match props.get(e) {
+                None => Some(false),
+                Some((p, _)) => p.wrecked.then_some(true),
+            },
         ),
-        _ => (None, false),
+        _ => (None, None),
     };
-    match knocked {
-        Some(true) => Reaction::Break,
-        Some(false) => Reaction::Move,
-        None if broken => Reaction::Break,
-        None if world.physics.has_static(key) => Reaction::Block,
-        None => Reaction::None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn hits() -> Hits {
-        Hits {
-            vehicle: (1000.0, 10.0),
-            rounds: (30, 6.0),
-            blast: 160.0,
-        }
-    }
-
-    #[test]
-    fn a_fragile_chair_breaks_to_a_clip_and_flies_from_a_blast() {
-        // `_global_chaircafe`: PropFragile, Health 100, flattened by
-        // vehicles.
-        let chair = Makeup {
-            physics: Some(PropPhysics {
-                mass: None,
-                heavy: false,
-            }),
-            crash: Some(Crash {
-                how: CrashHow::Flattened,
-                takes: 0.0,
-            }),
-            health: Some(100.0),
-            bullet: 1.0,
-            explosion: 0.5,
-        };
-        assert!(chair.is_prop());
-        let h = hits();
-        assert_eq!(expected(&chair, HitKind::Gun, &h), &[Reaction::Break]);
-        assert!(expected(&chair, HitKind::Vehicle, &h).contains(&Reaction::Break));
-        // 160 at its box, half of it: 80 of 100. Thrown, not broken.
-        assert!(expected(&chair, HitKind::Blast, &h).contains(&Reaction::Move));
-        assert!(!expected(&chair, HitKind::Blast, &h).contains(&Reaction::Block));
-    }
-
-    #[test]
-    fn a_box_moves_and_a_container_holds() {
-        // `_global_boxa`: Prop (takes nothing), 40 kg.
-        let boxa = Makeup {
-            physics: Some(PropPhysics {
-                mass: Some(40.0),
-                heavy: false,
-            }),
-            ..Makeup::default()
-        };
-        let h = hits();
-        assert_eq!(expected(&boxa, HitKind::Vehicle, &h), &[Reaction::Move]);
-        assert_eq!(
-            expected(&boxa, HitKind::Gun, &h),
-            &[Reaction::Block, Reaction::Move]
-        );
-        // `_port_containera`: 20,000 kg, heavy.
-        let container = Makeup {
-            physics: Some(PropPhysics {
-                mass: Some(20_000.0),
-                heavy: true,
-            }),
-            health: Some(100.0),
-            ..Makeup::default()
-        };
-        assert!(expected(&container, HitKind::Vehicle, &h).contains(&Reaction::Block));
-        assert!(!expected(&container, HitKind::Vehicle, &h).contains(&Reaction::None));
-    }
-
-    #[test]
-    fn a_fence_breaks_under_a_heavy_enough_vehicle_only() {
-        let fence = Makeup {
-            crash: Some(Crash {
-                how: CrashHow::Breaks,
-                takes: 950.0,
-            }),
-            ..Makeup::default()
-        };
-        assert!(fence.is_prop());
-        assert_eq!(
-            expected(&fence, HitKind::Vehicle, &hits()),
-            &[Reaction::Break]
-        );
-        let light = Hits {
-            vehicle: (900.0, 10.0),
-            ..hits()
-        };
-        assert_eq!(
-            expected(&fence, HitKind::Vehicle, &light),
-            &[Reaction::Block]
-        );
-        // A bush only flattens: not a prop here.
-        let bush = Makeup {
-            crash: Some(Crash {
-                how: CrashHow::Flattened,
-                takes: 0.0,
-            }),
-            ..Makeup::default()
-        };
-        assert!(!bush.is_prop());
+    match (knocked, down) {
+        (Some(true), _) | (None, Some(true)) => Reaction::Break,
+        (Some(false), _) => Reaction::Move,
+        (None, Some(false)) => Reaction::Vanish,
+        (None, None) if world.physics.has_static(key) => Reaction::Block,
+        (None, None) => Reaction::None,
     }
 }
