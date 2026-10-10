@@ -144,11 +144,15 @@ const OVER_WATER: f32 = 30.0;
 /// most every this long (seconds).
 const ROUNDABOUT: f32 = 1.15;
 const LOG_WAY: f32 = 30.0;
-/// A supply crate down within this far (metres) is opened on the way,
+/// A supply crate down within this far (metres) is opened before going on,
 /// standing this far from its side (with a bash's 1.8 m reach), turned to
 /// it within this much (radians); one not open after this many seconds is
-/// left.
-const OPEN_NEAR: f32 = 40.0;
+/// left. The crates are the deliveries' and land where the scripts call
+/// her: in the real game's first contract she smashes the weapon crate
+/// (1:18) before the beach guards (1:26); here the guards can draw her
+/// 100 m up the beach before it lands (from the recordings; she still
+/// fights back first when they're within [`DEFEND`]).
+const OPEN_NEAR: f32 = 250.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
 const OPEN_FOR: f32 = 45.0;

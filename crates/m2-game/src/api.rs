@@ -361,6 +361,10 @@ pub struct ScriptWorld {
     /// `Debug.Printf` output, oldest first.
     pub printed: Vec<String>,
     next_spawn: u32,
+    /// Spawned since hibernation was last updated: they start in play, so
+    /// the scripts' next look finds them awake wherever they are
+    /// ([`Self::update_hibernation`]).
+    fresh: Vec<u32>,
     /// What `Sys.GetAssetRequestMax` answers; scripts raise it while
     /// layers load and put it back.
     pub asset_request_max: u32,
@@ -503,6 +507,7 @@ impl ScriptWorld {
             object.label_hashes.clone_from(l);
         }
         self.insert(guid, object);
+        self.fresh.push(guid);
         self.commands.push(Command::Spawn {
             guid,
             what,
@@ -626,7 +631,18 @@ impl ScriptWorld {
     /// she comes back). She, what she rides, templates and carried
     /// weapons keep theirs. Objects of layers not loaded aren't in play
     /// at all, and never awake.
+    ///
+    /// What the scripts spawned since the last update is left awake this
+    /// once: a spawn starts in play, and the supply drops wait for their
+    /// helicopter to be awake (`Event.ObjectHibernation`) before they hang
+    /// its cargo and send it off. The helicopters start at the contract's
+    /// spawn points, which can lie beyond the hibernation distance
+    /// (VzaCon001's weapon drop: about 190 m from where she lands, 172 m
+    /// from the drop zone); in the real game's recording that helicopter
+    /// comes 4 s after the objective is shown, so it isn't waiting for her
+    /// to come near (inferred from the scripts and the footage).
     pub fn update_hibernation(&mut self) {
+        let fresh = std::mem::take(&mut self.fresh);
         let Some(her) = self.player.and_then(|p| self.objects.get(&p)) else {
             return;
         };
@@ -637,6 +653,7 @@ impl ScriptWorld {
                 || Some(*g) == riding
                 || (FIRST_TEMPLATE..FIRST_SPAWNED).contains(g)
                 || self.inventory.carried.contains_key(g)
+                || fresh.contains(g)
             {
                 continue;
             }
@@ -2432,6 +2449,22 @@ mod tests {
         w.objects.get_mut(&1).unwrap().position = [far - 10.0, 0.0, 0.0];
         w.update_hibernation();
         assert!(w.is_awake(50));
+    }
+
+    #[test]
+    fn a_spawn_far_off_is_awake_when_the_scripts_next_look() {
+        // VzaCon001's weapon drop: the helicopter starts about 190 m from
+        // her, and the drop waits for it to be awake before sending it.
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        w.objects.get_mut(&1).unwrap().position = [0.0; 3];
+        let far = [0.0, 80.0, 175.0];
+        let copter = w.spawn("Alouette3 Transport (VZA Intro) (Driver)".into(), far, 0.0);
+        w.update_hibernation();
+        assert!(w.is_awake(copter));
+        // After that look it sleeps as anything that far off does.
+        w.update_hibernation();
+        assert!(!w.is_awake(copter));
     }
 
     #[test]
