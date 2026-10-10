@@ -29,7 +29,7 @@ A Cargo workspace targeting the original 32-bit process (`i686-pc-windows-msvc`)
 
 `symbols/` tracks every identified function (name, RVA, signature, translation status); see `symbols/README.md`. Conventions for translating code are in `docs/conventions.md`.
 
-The plan to a playable alpha is in `docs/alpha-roadmap.md`. `m2-alpha` is the native game: it plays the island from your own install of Mercenaries 2 (the EA app edition is found on its own; otherwise pass `--install`). Nothing from the game ships with it. Jennifer starts in the first town on foot, with vehicles parked ahead, soldiers at their posts and civilians about. Esc opens the menu (settings, controls, save, load, quit); F5 and F9 quick save and load. Handling, damage and AI are our own, not the game's.
+The plan to a playable alpha is in `docs/alpha-roadmap.md`. `m2-alpha` is the native game: it plays the island from your own install of Mercenaries 2 (the EA app edition is found on its own; otherwise pass `--install`). Nothing from the game ships with it. Jennifer starts in the first town on foot, with the vehicles and soldiers the layers place. Esc opens the menu (settings, controls, save, load, quit); F5 and F9 quick save and load. An Xbox controller plays too, with the game's own pad layout and button pictures. Handling, damage and AI are our own, not the game's.
 
 Each CI run builds `m2-alpha.exe` (32-bit Windows) and keeps it as a downloadable artifact. To build it yourself:
 

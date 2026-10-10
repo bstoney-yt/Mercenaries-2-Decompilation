@@ -273,10 +273,19 @@ pub struct Templates {
     pub explosions: HashMap<u32, crate::durability::Explosion>,
     /// How the templates that can be hijacked are, by id.
     pub hijack: HashMap<u32, Vec<crate::hijack::HijackEntrance>>,
+    /// Where each template's entrances are got in by (`DriverHatch`), by
+    /// id ([`crate::hijack::entrance_points`]).
+    pub entrance_points: HashMap<u32, Vec<u32>>,
     /// How air strikes' ordnance flies and what its blasts do.
     pub ordnance: crate::ordnance::Ordnance,
+    /// The effects each template shows, by id
+    /// ([`crate::particles::template_effects`]).
+    pub effects: HashMap<u32, Vec<u32>>,
     /// How vehicles break each template's objects running into them.
     pub crashable: HashMap<u32, crate::durability::Crash>,
+    /// The sound each template's objects make breaking (its `SoundKey`),
+    /// by id ([`crate::durability::sound_keys`]).
+    pub sound_keys: HashMap<u32, u32>,
     /// The templates that stand already destroyed, by id: those whose
     /// `Health` is 0. All 201 such are ruins (`_marsh_bridgemid_ruined`,
     /// `AMX30_RUIN`), each with the model of its intact twin, whose
@@ -287,10 +296,18 @@ pub struct Templates {
     /// Each person template's walk, run and sprint speeds, by id
     /// ([`crate::tuning::human_speeds`]).
     pub speeds: HashMap<u32, [f32; 3]>,
+    /// Each person template's `HumanAnimationSet` gender and character
+    /// name, by id ([`crate::tuning::human_animation_sets`]).
+    pub human_sets: HashMap<u32, (u32, u32)>,
     /// Hand-held guns that fire rounds, by id ([`crate::tuning::hand_guns`]).
     pub guns: HashMap<u32, HandGun>,
     /// What each template's `EquipmentLink`s hand it, by id.
     pub equipment: HashMap<u32, Vec<u32>>,
+    /// Each template's `LocalizedName` key, by id: the string table's key
+    /// for the name the game shows (the `Chopper`'s 1177c0fc reads
+    /// "Chopper"; `M151 Softtop (VZ)`'s is `vehicle.m151softtopvz`; PC
+    /// data, 2026-10-09).
+    pub localized: HashMap<u32, u32>,
     /// The game's damage table, if found.
     pub damage: Option<DamageTable>,
     /// Every gun, thrown weapon and vehicle armament ([`crate::weapons`]).
@@ -393,6 +410,21 @@ impl Templates {
             .collect()
     }
 
+    /// The string table keys of the names the game shows for what
+    /// [`names_for`](Self::names_for) `name` and `model` give, in that
+    /// order: the `LocalizedName`s of those templates that have one.
+    pub fn localized_keys(&self, name: &str, model: u32) -> Vec<u32> {
+        let mut keys = Vec::new();
+        for id in self.names_for(name, model).iter().flat_map(|n| self.ids(n)) {
+            if let Some(&k) = self.localized.get(&id)
+                && !keys.contains(&k)
+            {
+                keys.push(k);
+            }
+        }
+        keys
+    }
+
     /// Template `name`'s `Health`, whatever its case: of several so
     /// named, the first that gives one.
     pub fn health(&self, name: &str) -> Option<f32> {
@@ -408,19 +440,31 @@ impl Templates {
             .find_map(|id| self.speeds.get(id).copied())
     }
 
+    /// Template `name`'s `HumanAnimationSet` gender and character name
+    /// (name hashes), whatever its case.
+    pub fn animation_set(&self, name: &str) -> Option<(u32, u32)> {
+        self.ids(name)
+            .iter()
+            .find_map(|id| self.human_sets.get(id).copied())
+    }
+
     /// The rifle template `name` (a hero: `Jen`) is handed by its
     /// `EquipmentLink`s: the first that is a gun firing rounds (Jen's
     /// `Bullpup Rifle`, Mattias's `Assault Rifle`, Chris's `Carbine`; the
     /// RPG fires rockets), with its template's name.
     pub fn own_rifle(&self, name: &str) -> Option<(&str, HandGun)> {
-        self.ids(name).iter().find_map(|id| {
-            let gun = self
-                .equipment
-                .get(id)?
-                .iter()
-                .find_map(|t| self.guns.get(t))?;
-            Some((self.names.get(&gun.template)?.as_str(), *gun))
-        })
+        self.ids(name).iter().find_map(|&id| self.rifle_of(id))
+    }
+
+    /// The rifle template id `id`'s `EquipmentLink`s hand it, as
+    /// [`own_rifle`](Self::own_rifle) finds it by name.
+    pub fn rifle_of(&self, id: u32) -> Option<(&str, HandGun)> {
+        let gun = self
+            .equipment
+            .get(&id)?
+            .iter()
+            .find_map(|t| self.guns.get(t))?;
+        Some((self.names.get(&gun.template)?.as_str(), *gun))
     }
 
     /// The gun template `name` (`Carbine`), whatever its case.
@@ -612,17 +656,35 @@ impl Templates {
             durability: crate::durability::read(&db),
             explosions: crate::durability::explosions(&db),
             hijack: crate::hijack::read(&db),
+            entrance_points: crate::hijack::entrance_points(&db),
             ordnance: crate::ordnance::read(&db),
+            effects: crate::particles::template_effects(&db),
             crashable: crate::durability::crashable(&db),
+            sound_keys: crate::durability::sound_keys(&db),
             health: crate::tuning::healths(&db),
             speeds: crate::tuning::human_speeds(&db),
+            human_sets: crate::tuning::human_animation_sets(&db),
             guns: crate::tuning::hand_guns(&db),
             equipment: crate::tuning::equipment(&db),
             arms: crate::weapons::read(&db),
+            localized: localized_names(&db),
             damage,
         };
         (templates, atmosphere)
     }
+}
+
+/// Each template's `LocalizedName` key (its field `kEy`, a name hash),
+/// by id, where it gives one.
+fn localized_names(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = crate::tuning::Table::new(db, "LocalizedName");
+    let field = name_hash("kEy");
+    t.templates()
+        .filter_map(|id| {
+            let key = t.word(t.of_template(id).first()?, field)?;
+            (key != 0).then_some((id, key))
+        })
+        .collect()
 }
 
 /// The templates whose `Health` is 0 (its first field, an f32).
@@ -714,8 +776,12 @@ pub struct TrafficPoint {
     pub name: String,
     pub position: Vec3,
     pub rotation: Quat,
-    /// The state layer it is in, by name hash; `None` for a static one.
+    /// The layer it is in, by name hash: a state layer, or one of the
+    /// static sub-layers `layers_static` holds (`vz_mar_village`), which
+    /// the game loads by name too. `None`: no layer known (it stands).
     pub layer: Option<u32>,
+    /// Its layer is one of `layers_static`'s, not a mission's state layer.
+    pub static_layer: bool,
     pub spawner: crate::population::Spawner,
     /// What it spawns: template names that drive, with their weights.
     pub vehicles: Vec<(String, f32)>,
@@ -741,10 +807,14 @@ pub struct SpawnPoint {
     /// The patrol route its `AiPatrol` names, world space; empty for a
     /// post.
     pub route: Vec<Vec3>,
-    /// The state layer placing it, by name hash (`vz_state_vzacon001_cp02`):
-    /// in the game it is there only while that layer is in. `None` for
-    /// the static layers.
+    /// The layer placing it, by name hash: a state layer
+    /// (`vz_state_vzacon001_cp02`) or one of the static sub-layers
+    /// `layers_static` holds (`vz_mar_village`), which the start-up
+    /// scripts load by name too. In the game it is there only while that
+    /// layer is in. `None`: no layer known (it stands).
     pub layer: Option<u32>,
+    /// Its layer is one of `layers_static`'s, not a mission's state layer.
+    pub static_layer: bool,
     /// The model of its template, when that is a person's (`Carmona`'s).
     pub model: Option<u32>,
     /// For a spawner of people (`PathSpawner_GurHQ_Peds`): whom its list
@@ -753,6 +823,9 @@ pub struct SpawnPoint {
     /// How its template fights, with the entity's own `AiBehavior`
     /// switches when it has them; `None` when the template has no `Ai`.
     pub ai: Option<AiProfile>,
+    /// The rifle its template's `EquipmentLink`s hand it
+    /// ([`Templates::rifle_of`]); `None` when they hand it none.
+    pub gun: Option<HandGun>,
 }
 
 /// Where everything on the island is.
@@ -1238,10 +1311,12 @@ impl WorldIndex {
                 position: Vec3::from(p.position),
                 rotation: rotation(p.rotation),
                 route: Vec::new(),
-                layer: (!is_static).then_some(layer_hash),
+                layer: Some(layer_hash),
+                static_layer: is_static,
                 model: template.and_then(|(_, t)| t.model.filter(|_| t.human)),
                 list: people_of(id, p),
                 ai,
+                gun: templates.rifle_of(p.parent).map(|(_, g)| g),
             }
         };
         for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
@@ -1344,7 +1419,8 @@ impl WorldIndex {
                 name: member_stem(names.get(&entity).copied().unwrap_or("")).to_owned(),
                 position: Vec3::from(p.position),
                 rotation: rotation(p.rotation),
-                layer: (!is_static).then_some(layer_hash),
+                layer: Some(layer_hash),
+                static_layer: is_static,
                 spawner,
                 vehicles,
                 route: Vec::new(),

@@ -38,6 +38,13 @@ pub trait World {
     /// Whether an object is simulated near the player rather than
     /// hibernating far away.
     fn is_awake(&self, guid: u32) -> bool;
+    /// Whether an object is on the player's screen: in front of her
+    /// camera, inside its field of view and draw range, not hidden, and
+    /// (when the game can tell) not behind something solid. `None` when
+    /// the world doesn't know where the camera is.
+    fn is_visible(&self, _guid: u32) -> Option<bool> {
+        None
+    }
     /// Whether an object is inside a boundary object's area; `None` when
     /// the boundary's shape isn't known.
     fn inside(&self, guid: u32, boundary: u32) -> Option<bool>;
@@ -96,7 +103,7 @@ pub trait World {
 }
 
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 14] = [
+pub const KINDS: [&str; 15] = [
     "TimerRelative",
     "ObjectHibernation",
     "Boundary",
@@ -111,7 +118,13 @@ pub const KINDS: [&str; 14] = [
     "ObjectDamage",
     "GameStateChange",
     "ObjectWinched",
+    "ObjectIsVisible",
 ];
+
+/// Kinds the game delivers itself through `Event.__m2_fire` (besides
+/// every `Gui...` kind), never checked against the world: not reported
+/// as unhandled.
+const ENGINE_FIRED: [&str; 2] = ["TogglePDA", "PlayerCashChanged"];
 
 #[derive(Debug)]
 struct Pending {
@@ -160,6 +173,10 @@ struct Store {
     now: f64,
     /// The Lua state, for the strings minigames answer with.
     lua: LuaRef,
+    /// Kinds pending events were made of that [`check`] doesn't know
+    /// (they never fire), each once; and those not yet taken for the log.
+    unhandled: BTreeSet<String>,
+    fresh_unhandled: Vec<String>,
 }
 
 #[derive(Default)]
@@ -350,6 +367,31 @@ impl Events {
     /// Events made and deleted since the last call (with `M2_STUB_ARGS`).
     pub fn take_trace(&self) -> Vec<String> {
         std::mem::take(&mut self.store.borrow_mut().trace)
+    }
+
+    /// Kinds of pending events no check knows, first met since the last
+    /// call: each is reported once, so the kinds still missing show in
+    /// the log (an `ObjectIsVisible` that never fired was PmcCon001's
+    /// soft lock at the villa).
+    pub fn take_unhandled(&self) -> Vec<String> {
+        std::mem::take(&mut self.store.borrow_mut().fresh_unhandled)
+    }
+
+    /// The objects pending `ObjectIsVisible` events wait to see, for the
+    /// game to look whether something solid stands between each and the
+    /// camera.
+    pub fn sight_watched(&self, world: &dyn World) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .store
+            .borrow()
+            .pending
+            .iter()
+            .filter(|p| p.kind == "ObjectIsVisible")
+            .flat_map(|p| objects(&p.params, 1, world))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// How many events are pending.
@@ -562,6 +604,14 @@ impl Events {
                         }
                         (!crossed.is_empty()).then_some(crossed)
                     }
+                    // Never fires; its kind is reported once.
+                    Check::Unhandled => {
+                        if s.unhandled.insert(p.kind.clone()) {
+                            s.fresh_unhandled.push(p.kind.clone());
+                        }
+                        keep.push(p);
+                        continue;
+                    }
                     Check::Minigame(m) => {
                         p.read = Some(m.read);
                         p.memo = m.last;
@@ -703,6 +753,8 @@ enum Check {
     /// to pass: fired as each goes in or out, the values then followed by
     /// `"enter"` or `"exit"`.
     Crossings(Vec<(u32, bool, Vec<Value>)>),
+    /// A kind no check knows: it never fires.
+    Unhandled,
 }
 
 /// The objects a parameter names: a guid, `"hero"` (the player), or a
@@ -961,7 +1013,6 @@ fn check(
             }
             no
         }
-        // { object, "awake" or "hibernate" }.
         // { character }: when the action `Human.SetState` gave it has
         // played to its end.
         "HumanActionComplete" => match guid(&p.params, 1) {
@@ -985,13 +1036,32 @@ fn check(
         "Minigame" => Check::Minigame(crate::hijack::check_minigame(
             &p.params, p.made, now, p.read, p.memo, world,
         )),
+        // { object, "awake" or "hibernated" }: while it is simulated near
+        // the player (or hibernates away from her); passes the object.
+        // The scripts write "hibernated" (25 calls in vz.wad: PmcCon001's
+        // gate opener waits for its front door to sleep, then to wake
+        // again); "hibernate" reads the same. Anything else is awake.
         "ObjectHibernation" => match guid(&p.params, 1) {
             Some(g) => {
-                let want_awake = text(&p.params, 2).as_deref() != Some("hibernate");
+                let want_awake = !text(&p.params, 2).is_some_and(|t| t.starts_with("hibernat"));
                 Check::Holds(world.is_awake(g) == want_awake, vec![id(g)])
             }
             None => no,
         },
+        // { object }: while it is on the player's screen
+        // ([`World::is_visible`]): PmcCon001 waits, once she is inside the
+        // villa, for the outpost's tank column to come into view to load
+        // the tank (`LoadTank`). A label or filter names several: the
+        // first seen. Passes the object.
+        "ObjectIsVisible" => {
+            let seen = objects(&p.params, 1, world)
+                .into_iter()
+                .find(|&g| world.is_visible(g) == Some(true));
+            match seen {
+                Some(g) => Check::Holds(true, vec![id(g)]),
+                None => no,
+            }
+        }
         // { name, filter }: when something posts that name, and the
         // filter, if any, says yes to the posted data (the faction
         // manager's attitude watches compare it with what they want);
@@ -1016,8 +1086,10 @@ fn check(
                 None => no,
             }
         }
-        // Not simulated yet: never fires.
-        _ => no,
+        // The game's own (the GUI's): fired by `Event.__m2_fire`.
+        kind if kind.starts_with("Gui") || ENGINE_FIRED.contains(&kind) => no,
+        // Not simulated yet: never fires, and is reported.
+        _ => Check::Unhandled,
     }
 }
 
@@ -1042,9 +1114,15 @@ mod tests {
         positions: HashMap<u32, [f32; 3]>,
         dead: Vec<u32>,
         seats: HashMap<u32, u32>,
+        /// Whether the camera is known, and what it sees.
+        camera: bool,
+        visible: Vec<u32>,
     }
 
     impl World for TestWorld {
+        fn is_visible(&self, guid: u32) -> Option<bool> {
+            self.camera.then(|| self.visible.contains(&guid))
+        }
         fn position(&self, guid: u32) -> Option<[f32; 3]> {
             self.positions.get(&guid).copied()
         }
@@ -1284,6 +1362,85 @@ mod tests {
             .unwrap();
         events.update(0.1, &world);
         assert_eq!(log(&host).len(), 2);
+    }
+
+    #[test]
+    fn hibernated_waits_for_sleep_and_awake_for_waking() {
+        let (host, events) = setup();
+        // PmcCon001's gate opener: the door awake opens the gates; the
+        // door hibernated waits for her to leave, then for it to wake.
+        host.lua()
+            .load(
+                r#"
+                Event.Create(Event.ObjectHibernation, { 3, "awake" },
+                    function(d) table.insert(log, "awake " .. gid(d)) end)
+                Event.Create(Event.ObjectHibernation, { 3, "hibernated" },
+                    function(d) table.insert(log, "hibernated " .. gid(d)) end)
+                Event.Create(Event.ObjectHibernation, { 3, "hibernate" },
+                    function(d) table.insert(log, "hibernate " .. gid(d)) end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        world.positions.insert(3, [0.0, 0.0, 0.0]);
+        for _ in 0..5 {
+            events.update(0.1, &world);
+        }
+        assert_eq!(log(&host), ["awake 3"]);
+        assert_eq!(events.len(), 2);
+        world.positions.remove(&3);
+        events.update(0.1, &world);
+        let mut got = log(&host);
+        got.sort();
+        assert_eq!(got, ["awake 3", "hibernate 3", "hibernated 3"]);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn object_is_visible_fires_once_it_is_on_screen() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"
+                Event.Create(Event.ObjectIsVisible, { 9 },
+                    function(who, seen) table.insert(log, who .. " saw " .. gid(seen)) end,
+                    { "LoadTank" })
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld::default();
+        // Nowhere to see from yet, then not in view: it waits.
+        events.update(0.1, &world);
+        world.camera = true;
+        events.update(0.1, &world);
+        assert!(log(&host).is_empty());
+        assert_eq!(events.sight_watched(&world), [9]);
+        world.visible.push(9);
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["LoadTank saw 9"]);
+        assert!(events.is_empty());
+        assert!(events.take_unhandled().is_empty());
+    }
+
+    #[test]
+    fn unknown_kinds_are_reported_once() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                "Event.Create(Event.ObjectSpotted, {}, function() end)\n\
+                 Event.Create(Event.ObjectSpotted, {}, function() end)\n\
+                 Event.Create(Event.GuiHealthUpdate, {}, function() end)",
+            )
+            .exec()
+            .unwrap();
+        let world = TestWorld::default();
+        events.update(0.1, &world);
+        assert_eq!(events.take_unhandled(), ["ObjectSpotted"]);
+        events.update(0.1, &world);
+        assert!(events.take_unhandled().is_empty());
+        assert_eq!(events.len(), 3);
     }
 
     #[test]

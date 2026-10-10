@@ -43,6 +43,12 @@ pub const DEFAULT_SPAWN: (f32, f32) = (450.0, -1950.0);
 /// player once the first contract is done (VzaCon001's flow binding
 /// teleports her to the next contract's start, by the PMC's offices).
 pub const FREE_ROAM_START: &str = "PmcCon001_Start1";
+/// Where a mission starts without `--spawn`: the first contract's own
+/// spawn point, which its scripts name as they start (`SetSpawnLocations
+/// VzaCon001_Start1`), by the speed boat they seat her in. From the town
+/// she stayed the boat's 4 km off, hibernating (beyond 155 m), and the
+/// scripts never seated her.
+pub const MISSION_START: &str = "VzaCon001_Start1";
 
 /// Half the ground's width in metres.
 const GROUND_HALF: f32 = 1000.0;
@@ -83,6 +89,13 @@ pub struct Rig {
     pub cues: Vec<(usize, usize)>,
     /// A hero's: the name hashes of the clips of the hero's own group.
     pub own: Arc<HashSet<u32>>,
+    /// A hero's: the name hashes of the clips only in the other heroes'
+    /// own groups, which this hero never plays.
+    pub foreign: Arc<HashSet<u32>>,
+    /// A hero's: the clip the hero aims with ([`Rig::set_aim_clip`]),
+    /// which the weapons' grip and the aim's hands are read from. `None`:
+    /// the aim clip by name.
+    pub aim_clip: Option<usize>,
 }
 
 /// Most clip events a rig keeps for the taking (older ones are dropped:
@@ -114,6 +127,217 @@ fn hero_clips(source: &AssetSource<BufReader<File>>, hero: Hero) -> (HashSet<u32
     (allowed, own)
 }
 
+/// The gaits' keys in the on-foot animation table: the clip of each gait
+/// Jennifer's rig plays (chosen by speed from every clip, PC logs of
+/// 2026-10-08: "model 15d89832 ... locomotion"), whose first row gives
+/// the gait's animation handle ([`m2_assets::animation_table::character_clip`]):
+/// idle `5aac9b8d`, walk `695f945a`, run `b99ad3b3` (the run's, as the
+/// rifle run's), sprint `f71c4238` (PC, 2026-10-09). That those handles
+/// are the gaits is inferred from these clips' speeds alone: the
+/// handles' names are not known.
+const GAIT_KEYS: [(Gait, u32); 4] = [
+    (Gait::Idle, 0x01ca_8a69),
+    (Gait::Walk, 0x067a_b57f),
+    (Gait::Run, 0x1091_2665),
+    (Gait::Sprint, 0x076a_6136),
+];
+
+/// What the on-foot table settled for a hero ([`table_clips`]).
+#[derive(Debug, Default)]
+struct TableClips {
+    /// The clips it gave, which the own group's leave be.
+    settled: HashSet<usize>,
+    /// By slot name ([`npc::FightClips::slots`]): the row each clip it
+    /// gave came from, for the log.
+    from: HashMap<&'static str, String>,
+}
+
+/// The clips the on-foot animation table (`e00b080c`) gives `hero`, a
+/// hero holding a rifle (`set`: the template's `HumanAnimationSet`
+/// gender and character name): for each slot of `clips` and each gait
+/// of `rig`, its key's handle ([`npc::FightClips::TABLE_KEYS`],
+/// [`GAIT_KEYS`]), then the hero's own row for the handle with a rifle,
+/// else anyone's with a rifle, else anyone's
+/// ([`animation_table::character_clip`]), of the clips on `rig` and not
+/// another hero's. Those replace the slots and gaits; the rest keep
+/// what they were picked by (by name, by speed, or the own group's
+/// after this). Jennifer's footage-matched picks stay: hers are taken
+/// only where the table gives her the clip she has, and logged where it
+/// doesn't. Every gait is logged here, each slot by
+/// [`log_hero_clips`]: "hero clips: <hero>: <slot> <hash> from row ..."
+/// or "... from fallback ...".
+///
+/// [`animation_table::character_clip`]: m2_assets::animation_table::character_clip
+fn table_clips(
+    source: &mut AssetSource<BufReader<File>>,
+    set: Option<(u32, u32)>,
+    hero: Hero,
+    rig: &mut Rig,
+    clips: &mut npc::FightClips,
+) -> TableClips {
+    use m2_assets::animation_table::{self as table, AnimationTable, Precedence};
+    let read = source
+        .asset(table::CHARACTER_ANIMATIONS, table::ANIMATION_TABLE_TYPE)
+        .map_err(anyhow::Error::from)
+        .and_then(|a| Ok(AnimationTable::parse(&a)?));
+    let t = match read {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "hero clips: {hero}: no on-foot table {:08x}: {e:#}",
+                table::CHARACTER_ANIMATIONS
+            );
+            return TableClips::default();
+        }
+    };
+    let columns: Vec<String> = t
+        .columns
+        .iter()
+        .map(|c| format!("{} {:?}", c.name, c.kind))
+        .collect();
+    let listed = t.column(table::ANIMATION).map_or(0, |list| {
+        (1..t.rows())
+            .filter(|&r| !t.list(r, list).is_empty())
+            .count()
+    });
+    eprintln!(
+        "hero clips: the on-foot table {:08x}: {} rows ({listed} listing clips), columns {}",
+        table::CHARACTER_ANIMATIONS,
+        t.rows(),
+        columns.join(", ")
+    );
+    // The template's, else the values the heroes' templates hold
+    // (`Hero`, the character's name; inferred from Mattias's).
+    let (gender, name) = set.unwrap_or_else(|| {
+        eprintln!(
+            "hero clips: {hero}: no HumanAnimationSet for the template: gender Hero, character {}",
+            hero.name()
+        );
+        (
+            m2_assets::name_hash("Hero"),
+            m2_assets::name_hash(hero.name()),
+        )
+    });
+    let index = |hash: u32| {
+        rig.clips
+            .iter()
+            .position(|c| c.hash == hash && !rig.foreign.contains(&hash))
+    };
+    let resolve = |key: u32| {
+        table::character_clip(&t, key, (gender, name), table::RIFLE, |c| {
+            index(c).is_some()
+        })
+    };
+    let whose = match hero {
+        Hero::Jennifer => "her",
+        _ => "his",
+    };
+    let row = |p: &table::CharacterClip| {
+        format!(
+            "row {} (handle {:08x}, {})",
+            p.row,
+            p.handle,
+            match p.by {
+                Precedence::Own => format!("{whose} own rifle row"),
+                Precedence::Equipment => "anyone's rifle row".to_owned(),
+                Precedence::Handle => "anyone's row".to_owned(),
+            }
+        )
+    };
+    let jennifer = hero == Hero::Jennifer;
+    let hash = |i: Option<usize>| i.map(|i| rig.clips[i].hash);
+    // Each key's slot clip as picked by name, for Jennifer's to stay.
+    let had: HashMap<u32, Option<u32>> = npc::FightClips::TABLE_KEYS
+        .iter()
+        .zip(clips.slots())
+        .map(|(&(_, key), (_, i))| (key, hash(i)))
+        .collect();
+    let theirs = |key: u32| {
+        let p = resolve(key)?;
+        (!jennifer || had.get(&key).copied().flatten() == Some(p.clip)).then_some(p.clip)
+    };
+    let mut picked = *clips;
+    let settled = picked.by_table(rig, &theirs);
+    let mut from = HashMap::new();
+    for (&(slot, key), (_, now)) in npc::FightClips::TABLE_KEYS.iter().zip(picked.slots()) {
+        match (resolve(key), now) {
+            (Some(p), Some(i)) if settled.contains(&i) && rig.clips[i].hash == p.clip => {
+                from.insert(slot, row(&p));
+            }
+            (Some(p), _) if jennifer => eprintln!(
+                "hero clips: {hero}: {slot}: the table's {} gives {:08x}: her footage-matched pick stays",
+                row(&p),
+                p.clip
+            ),
+            (Some(p), _) => eprintln!(
+                "hero clips: {hero}: {slot}: the table's {} gives {:08x}, which lacks the slot's event",
+                row(&p),
+                p.clip
+            ),
+            (None, _) => eprintln!(
+                "hero clips: {hero}: {slot}: the table gives nothing for {key:08x} (no row, or none on the rig)"
+            ),
+        }
+    }
+    *clips = picked;
+    // The gaits: worked out first, then put in (the rig is read till then).
+    let shown = |h: Option<u32>| h.map_or("none".to_owned(), |h| format!("{h:08x}"));
+    let mut gaits = Vec::new();
+    for (gait, key) in GAIT_KEYS {
+        let g = format!("{gait:?}").to_lowercase();
+        let was = rig.gait_clip(gait).map(|i| rig.clips[i].hash);
+        match resolve(key).and_then(|p| Some((p, index(p.clip)?))) {
+            Some((p, i)) if !jennifer || was == Some(p.clip) => {
+                eprintln!("hero clips: {hero}: {g} {:08x} from {}", p.clip, row(&p));
+                gaits.push((gait, i));
+            }
+            Some((p, _)) => eprintln!(
+                "hero clips: {hero}: {g} {} from fallback (by speed; the table's {} gives {:08x}: her footage-matched pick stays)",
+                shown(was),
+                row(&p),
+                p.clip
+            ),
+            None => eprintln!(
+                "hero clips: {hero}: {g} {} from fallback (by speed; the table gives nothing for {key:08x})",
+                shown(was)
+            ),
+        }
+    }
+    if let Some(l) = rig.locomotion.as_mut() {
+        l.clips.extend(gaits);
+    }
+    let gait = rig.gait;
+    rig.set_gait(gait);
+    TableClips { settled, from }
+}
+
+/// One line for each of `hero`'s fight clips, once the table's and the
+/// own group's are in: "hero clips: <hero>: <slot> <hash> from row <n>
+/// (handle <h>, <whose row>)" where the on-foot table gave it, else
+/// "... from fallback (<how it was picked>)".
+fn log_hero_clips(hero: Hero, rig: &Rig, clips: &npc::FightClips, table: &TableClips) {
+    for (slot, i) in clips.slots() {
+        let Some(i) = i else {
+            eprintln!("hero clips: {hero}: {slot} none");
+            continue;
+        };
+        let c = rig.clips[i].hash;
+        match table.from.get(slot) {
+            Some(row) if table.settled.contains(&i) => {
+                eprintln!("hero clips: {hero}: {slot} {c:08x} from {row}");
+            }
+            _ => eprintln!(
+                "hero clips: {hero}: {slot} {c:08x} from fallback ({})",
+                if rig.own.contains(&c) {
+                    "the own group's"
+                } else {
+                    "by name"
+                }
+            ),
+        }
+    }
+}
+
 /// How a rifle is held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Carry {
@@ -128,9 +352,9 @@ pub enum Carry {
 impl Rig {
     /// Reads model `hash`'s skeleton and every clip that fits it. For a
     /// `hero` other than Jennifer, the gaits come from the clips everyone shares and the
-    /// hero's own group (not the other heroes'), and [`Rig::own`] holds
-    /// the own group's clips; every clip stays loaded, for the clips
-    /// picked by name.
+    /// hero's own group (not the other heroes'), [`Rig::own`] holds
+    /// the own group's clips and [`Rig::foreign`] the other heroes';
+    /// every clip stays loaded, for the clips picked by name.
     pub fn load(
         source: &mut AssetSource<BufReader<File>>,
         hash: u32,
@@ -148,6 +372,13 @@ impl Rig {
                 let mut rig = Rig::new(skeleton, Vec::new(), gait);
                 rig.locomotion =
                     Locomotion::choose_where(&clips, |i| allowed.contains(&clips[i].hash));
+                rig.foreign = Arc::new(
+                    clips
+                        .iter()
+                        .map(|c| c.hash)
+                        .filter(|h| !allowed.contains(h))
+                        .collect(),
+                );
                 rig.clips = Arc::new(clips);
                 rig.own = Arc::new(own);
                 rig.set_gait(gait);
@@ -241,6 +472,8 @@ impl Rig {
             }),
             animator: Animator::default(),
             own: Default::default(),
+            foreign: Default::default(),
+            aim_clip: None,
             gait: Gait::Idle,
             cues: Vec::new(),
         })
@@ -261,6 +494,8 @@ impl Rig {
             gait,
             cues: Vec::new(),
             own: Default::default(),
+            foreign: Default::default(),
+            aim_clip: None,
         };
         rig.set_gait(gait);
         rig
@@ -272,6 +507,9 @@ impl Rig {
         let mut rig = Self {
             locomotion: Locomotion::choose(&self.clips),
             own: Default::default(),
+            foreign: Default::default(),
+            aim_clip: None,
+            hands: Default::default(),
             animator: Animator::default(),
             cues: Vec::new(),
             ..self.clone()
@@ -336,6 +574,14 @@ impl Rig {
         let mut pose = self.animator.pose(&self.skeleton, &self.clips);
         self.point(&mut pose, want);
         Some(pose)
+    }
+
+    /// Aims with clip `clip` (the hero's own pick, which for Mattias and
+    /// Chris can be the on-foot table's rather than the aim clip by name):
+    /// the aim's hands are found again from it.
+    pub fn set_aim_clip(&mut self, clip: Option<usize>) {
+        self.aim_clip = clip;
+        self.hands = Default::default();
     }
 
     /// The (rear, front) hands of the aim pose
@@ -492,12 +738,19 @@ pub struct Scene {
     pub player: Option<Player>,
     /// Who the player is.
     pub hero: Hero,
-    /// What the people's rigs are made from: the hero's skeleton and
-    /// clips, with the gaits everyone's clips give ([`Rig::shared`]).
+    /// What the people's rigs are made from, whoever the hero is:
+    /// Jennifer's skeleton and every clip that fits it, with the gaits
+    /// everyone's clips give ([`Rig::shared`]). Made once: switching hero
+    /// leaves the people be.
     people_rig: Option<Rig>,
     /// Drivable vehicles near the spawn.
     pub vehicles: Vec<ParkedVehicle>,
-    /// Soldiers and civilians.
+    /// Whether up to [`PARKED`] of the catalogue's vehicles are parked by
+    /// her as she starts: not the game's, so not with a mission (the
+    /// plain launch's included), where only those the layers and scripts
+    /// place stand.
+    pub park: bool,
+    /// The people the layers place.
     pub people: People,
     pub arsenal: Arsenal,
     /// Fuel tanks and barrels that blow up when hit.
@@ -510,6 +763,11 @@ pub struct Scene {
     pub strikes: crate::strikes::Strikes,
     /// Mesh and materials for shots, flashes, fire and smoke.
     effects: Effects,
+    /// The game's own particle effects, once the island is loaded; the
+    /// spheres stand in for fire and smoke without them.
+    pub particles: Option<crate::particles::ParticleDraw>,
+    /// Draw no fire or smoke at all (`--no-fx`, to measure what they cover).
+    pub hide_fx: bool,
     vehicle_loads: Option<Receiver<Loaded>>,
     /// The archive's vehicle, person and weapon models, once found.
     pub catalogue: Option<Catalogue>,
@@ -606,10 +864,10 @@ const PARKED: usize = 8;
 /// reach goes by its size, which is known once it has loaded).
 const PROP_MARGIN: f32 = 100.0;
 
-/// Person models loaded: the soldiers the spawn names ask for, then
-/// civilians.
+/// The catalogue's person models loaded up front: those of the roles
+/// soldiers' names ask for, for soldiers whose template has no model of
+/// its own (the rest stand in their template's).
 const ARMY: [&str; 3] = ["vz_hum_soldier", "vz_hum_soldierelite", "vz_hum_deathsquad"];
-const CIVILIAN_MODELS: usize = 6;
 
 /// A model the loading thread has decoded.
 pub enum Loaded {
@@ -620,8 +878,11 @@ pub enum Loaded {
     /// stands (position, yaw), its spec and model.
     WorldVehicle(u32, Vec3, f32, Vec<(String, String)>, VehicleSpec, CpuModel),
     Catalogue(Catalogue),
-    /// A person's model: a role's, or a story character's (true).
+    /// A person's model: a role's, or a template's own (true).
     Person(PersonModel, CpuModel, Skeleton, bool),
+    /// A template's own person model that could not be read: model and
+    /// template.
+    NoPerson(u32, String),
     /// A hand weapon: name, model, muzzle (model space).
     Weapon(&'static str, CpuModel, Vec3),
     /// Any other hand weapon's model the templates name: its name's hash,
@@ -632,10 +893,10 @@ pub enum Loaded {
     Flight(u32, CpuModel, Vec<Mat4>, Vec<m2_assets::vehicle::Rotor>),
 }
 
-/// Finds the island's vehicle and person models and decodes the soldiers,
-/// a few civilians and up to [`PARKED`] vehicles, on a thread (the search
-/// reads the whole archive).
-fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
+/// Finds the island's vehicle and person models and decodes the soldiers'
+/// role models ([`ARMY`]) and, when `park`, up to [`PARKED`] vehicles, on
+/// a thread (the search reads the whole archive).
+fn load_cast(install: Install, hand: Vec<u32>, park: bool) -> Receiver<Loaded> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -663,13 +924,6 @@ fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
                 .people
                 .iter()
                 .filter(|p| ARMY.contains(&p.role.as_str()))
-                .chain(
-                    found
-                        .people
-                        .iter()
-                        .filter(|p| !p.soldier)
-                        .take(CIVILIAN_MODELS),
-                )
                 .collect();
             eprintln!(
                 "people: {} roles; loading {}",
@@ -748,6 +1002,12 @@ fn load_cast(install: Install, hand: Vec<u32>) -> Receiver<Loaded> {
                 drivable.len(),
                 started.elapsed().as_secs_f32()
             );
+            if !park {
+                eprintln!(
+                    "vehicles: none of the catalogue's parked (a mission: only those the layers and scripts place)"
+                );
+                return Ok(());
+            }
             let rank = |e: &CatalogueEntry| {
                 DRIVABLE
                     .iter()
@@ -814,6 +1074,7 @@ impl Scene {
             hero: Hero::default(),
             people_rig: None,
             vehicles: Vec::new(),
+            park: true,
             people: People::default(),
             arsenal: Arsenal::default(),
             explosives: Vec::new(),
@@ -821,6 +1082,8 @@ impl Scene {
             flights: Flights::default(),
             strikes: crate::strikes::Strikes::default(),
             effects,
+            particles: None,
+            hide_fx: false,
             vehicle_loads: None,
             catalogue: None,
             install: None,
@@ -924,13 +1187,15 @@ impl Scene {
     }
 
     /// Indexes the island and starts streaming it, with the camera placed
-    /// above `(x, z)`.
+    /// above `spawn`, or else at the start point named `start_name`
+    /// ([`MISSION_START`], [`FREE_ROAM_START`]).
     pub fn open_world(
         &mut self,
         backend: &mut dyn RenderBackend,
         install: &Install,
         settings: WorldSettings,
         spawn: Option<(f32, f32)>,
+        start_name: &str,
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         let mut world = World::open(install, backend, &mut self.materials, settings)
@@ -948,11 +1213,11 @@ impl Scene {
         );
         self.explosives = crate::combat::explosives(&world.index);
         eprintln!("explosives: {}", self.explosives.len());
-        // Without a place asked for, where the first contract leaves her,
-        // facing the way that start point does.
+        // Without a place asked for, the start point named (where the first
+        // contract starts her, or where it leaves her), facing its way.
         let start = spawn
             .is_none()
-            .then(|| world.index.start(FREE_ROAM_START))
+            .then(|| world.index.start(start_name))
             .flatten();
         let ((x, z), facing) = match (spawn, start) {
             (Some(at), _) => (at, 0.0),
@@ -965,7 +1230,7 @@ impl Scene {
                 ((s.position.x, s.position.z), f.x.atan2(f.z))
             }
             (None, None) => {
-                eprintln!("start: no {FREE_ROAM_START} in the layers; the first town instead");
+                eprintln!("start: no {start_name} in the layers; the first town instead");
                 (DEFAULT_SPAWN, 0.0)
             }
         };
@@ -975,6 +1240,17 @@ impl Scene {
 
         // The hero, to walk the island as.
         self.open(install)?;
+        if let (Some(source), Some(world)) = (self.source.as_mut(), self.world.as_ref()) {
+            match crate::particles::ParticleDraw::load(
+                backend,
+                &mut self.materials,
+                source,
+                &world.index.template_db,
+            ) {
+                Ok(p) => self.particles = Some(p),
+                Err(e) => eprintln!("particles: {e:#}; fire and smoke drawn as spheres"),
+            }
+        }
         self.player = Some(Player::new(x, z, facing, None));
         self.load_hero(backend, self.hero);
         let hand = self
@@ -982,7 +1258,7 @@ impl Scene {
             .as_ref()
             .map(|w| w.index.template_db.arms.hand_models())
             .unwrap_or_default();
-        self.vehicle_loads = Some(load_cast(install.clone(), hand));
+        self.vehicle_loads = Some(load_cast(install.clone(), hand, self.park));
         self.install = Some(install.clone());
         Ok(())
     }
@@ -1069,7 +1345,7 @@ impl Scene {
                 " (no template: Jennifer's)"
             }
         );
-        let model = match GpuModel::load(backend, source, &mut self.materials, hash, 0)
+        let mut model = match GpuModel::load(backend, source, &mut self.materials, hash, 0)
             .map_err(anyhow::Error::from)
             .and_then(|gpu| Ok((gpu, Rig::load(source, hash, Gait::Idle, Some(hero))?)))
         {
@@ -1079,11 +1355,47 @@ impl Scene {
                 None
             }
         };
-        let clips = model
+        if self.people_rig.is_none() {
+            // Jennifer's own rig is loaded as no hero's is (every clip
+            // that fits her): hers will do when she is the hero. Taken
+            // before the hero's clips are picked, so nothing done to her
+            // rig for her reaches the people's.
+            self.people_rig = match &model {
+                Some((_, rig)) if hero == Hero::Jennifer && hash == DEFAULT_MODEL => {
+                    Some(rig.shared())
+                }
+                _ => match Rig::load(source, DEFAULT_MODEL, Gait::Idle, None) {
+                    Ok(rig) => Some(rig.shared()),
+                    Err(e) => {
+                        eprintln!("people's rig: {e:#}; the hero's instead");
+                        model.as_ref().map(|(_, rig)| rig.shared())
+                    }
+                },
+            };
+        }
+        // The clips by name, then as the on-foot table gives them the
+        // hero, then the hero's own group's for those it doesn't.
+        let set = self
+            .world
             .as_ref()
-            .map(|(_, rig)| npc::FightClips::find(rig).own_group(rig))
+            .and_then(|w| w.index.template_db.animation_set(hero.template()));
+        let mut clips = model
+            .as_ref()
+            .map(|(_, rig)| npc::FightClips::find(rig))
             .unwrap_or_default();
-        self.people_rig = model.as_ref().map(|(_, rig)| rig.shared());
+        let from_table = match &mut model {
+            Some((_, rig)) => table_clips(source, set, hero, rig, &mut clips),
+            None => TableClips::default(),
+        };
+        let settled = &from_table.settled;
+        let clips = match &model {
+            Some((_, rig)) => {
+                let clips = clips.own_group(rig, settled);
+                log_hero_clips(hero, rig, &clips, &from_table);
+                clips
+            }
+            None => clips,
+        };
         if let Some((_, rig)) = &model {
             let h = |i: Option<usize>| {
                 i.map_or("none".to_owned(), |i| {
@@ -1093,7 +1405,8 @@ impl Scene {
                     } else {
                         ""
                     };
-                    format!("{:08x}{own}", c.hash)
+                    let table = if settled.contains(&i) { " table" } else { "" };
+                    format!("{:08x}{own}{table}", c.hash)
                 })
             };
             eprintln!(
@@ -1143,10 +1456,6 @@ impl Scene {
                 eprintln!("player {event} clips: {}", shown.join(", "));
             }
         }
-        self.people.clips = model
-            .as_ref()
-            .map(|(_, rig)| npc::FightClips::find(rig))
-            .unwrap_or_default();
         let templates = self.world.as_ref().map(|w| &w.index.template_db);
         let speeds = templates
             .and_then(|t| {
@@ -1162,9 +1471,14 @@ impl Scene {
             "hero: {hero} walks {:.2}, runs {:.2}, sprints {:.2} m/s",
             speeds[0], speeds[1], speeds[2]
         );
+        // The weapons already loaded were held by the last body's
+        // skeleton.
+        if let Some((_, rig)) = &mut model {
+            rig.set_aim_clip(clips.aim);
+            self.arsenal.rehold(rig);
+        }
         if let Some(player) = &mut self.player {
-            player.model = model;
-            player.clips = clips;
+            player.set_body(model, clips);
             player.speeds = speeds;
         }
     }
@@ -1228,7 +1542,7 @@ impl Scene {
         });
     }
 
-    /// Loads a story character's model (`Carmona`'s, by their template)
+    /// Loads a template's own person model (`Carmona`'s, a `VZ Soldier`'s)
     /// on a thread; it joins the people's kinds as `template`.
     fn load_character(&self, model: u32, template: String) {
         let Some(install) = self.install.clone() else {
@@ -1239,7 +1553,8 @@ impl Scene {
             let result = (|| -> anyhow::Result<()> {
                 let mut source = install.open_world()?;
                 let data = source.model(model)?;
-                let cpu = CpuModel::from_data(&data, 0)?;
+                let mut cpu = CpuModel::from_data(&data, 0)?;
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
                 let skeleton = Skeleton::from_nodes(&data.parse()?.nodes);
                 let person = PersonModel {
                     model,
@@ -1251,6 +1566,7 @@ impl Scene {
             })();
             if let Err(e) = result {
                 eprintln!("{template} ({model:08x}): {e:#}");
+                let _ = tx.send(Loaded::NoPerson(model, template));
             }
         });
     }
@@ -1353,6 +1669,10 @@ impl Scene {
                 self.catalogue = Some(c.clone());
                 return Ok(());
             }
+            Loaded::NoPerson(model, template) => {
+                self.people.refuse(*model, template.clone());
+                return Ok(());
+            }
             Loaded::Vehicle(_, cpu)
             | Loaded::MissionVehicle(_, _, cpu)
             | Loaded::WorldVehicle(_, _, _, _, _, cpu)
@@ -1361,8 +1681,24 @@ impl Scene {
             | Loaded::HandModel(_, cpu, _)
             | Loaded::Flight(_, cpu, _, _) => cpu,
         };
-        self.materials.load_model_textures(backend, source, cpu)?;
-        let model = GpuModel::upload(backend, &mut self.materials, cpu)?;
+        let uploaded = self
+            .materials
+            .load_model_textures(backend, source, cpu)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| Ok(GpuModel::upload(backend, &mut self.materials, cpu)?));
+        let model = match uploaded {
+            Ok(model) => model,
+            Err(e) => {
+                // A template's own person model that won't go up: its
+                // spawns stand as their name's role, or not at all,
+                // rather than wait for it.
+                if let Loaded::Person(p, _, _, true) = &loaded {
+                    eprintln!("person {} ({:08x}): {e:#}; left out", p.role, p.model);
+                    self.people.refuse(p.model, p.role.clone());
+                }
+                return Err(e);
+            }
+        };
         // What its template says of its handling and its gun: its own
         // (the mission's `AMX30 (Full)`), else its model's.
         let tune = |spec: VehicleSpec| {
@@ -1374,7 +1710,7 @@ impl Scene {
             spec.tuned(t).armed_with(arm, &db.arms)
         };
         match loaded {
-            Loaded::Catalogue(_) => {}
+            Loaded::Catalogue(_) | Loaded::NoPerson(..) => {}
             Loaded::Vehicle(spec, _) => self.vehicles.push(ParkedVehicle {
                 spec: tune(spec),
                 model,
@@ -1454,31 +1790,52 @@ impl Scene {
                 self.arsenal.add_model(hash, model, muzzle, rig);
             }
             Loaded::Person(p, _, skeleton, named) => {
-                // The hero's clips fit every human skeleton.
+                // The people's clips fit every human skeleton.
                 let template = self
                     .people_rig
                     .as_ref()
                     .and_then(|rig| rig.for_skeleton(skeleton));
+                // A template's own gun (`EquipmentLink`); a role's none.
+                let db = self.world.as_ref().map(|w| &w.index.template_db);
+                let gun = db
+                    .filter(|_| named)
+                    .and_then(|db| db.own_rifle(&p.role))
+                    .map(|(name, gun)| (name.to_owned(), gun));
                 match template {
                     Some(rig) => {
                         eprintln!(
-                            "person {}: {} bones, {} clips",
+                            "person {} ({:08x}): {} bones, {} clips, gun {}",
                             p.role,
+                            p.model,
                             rig.skeleton.len(),
-                            rig.clips.len()
+                            rig.clips.len(),
+                            gun.as_ref()
+                                .map_or("none of its own".to_owned(), |(name, g)| {
+                                    format!(
+                                        "{name} (model {:08x}, {:.0} a minute, {} a round)",
+                                        g.model.unwrap_or(0),
+                                        g.rate_of_fire,
+                                        g.damage
+                                    )
+                                })
                         );
                         self.people.add_kind(PersonKind {
                             role: p.role,
-                            soldier: p.soldier,
                             named,
+                            gun: gun.map(|(_, g)| g),
                             model,
                             rig,
                         });
                     }
-                    None => eprintln!(
-                        "person {}: the clips don't fit its skeleton; left out",
-                        p.role
-                    ),
+                    None => {
+                        eprintln!(
+                            "person {}: the clips don't fit its skeleton; left out",
+                            p.role
+                        );
+                        if named {
+                            self.people.refuse(p.model, p.role);
+                        }
+                    }
                 }
             }
         }
@@ -1627,9 +1984,16 @@ impl Scene {
             {
                 w.model.draw(queue, at);
             }
-            // What she carries but doesn't hold hangs on her back.
+            // What she carries but doesn't hold hangs on her back (not
+            // seated: it would go through the seat's back, and the one
+            // she holds isn't drawn there either).
             let holding = !fight.designator && player.throwing.is_none() && !player.down;
-            for (slot, slung) in fight.slung(holding).into_iter().enumerate() {
+            let slung = if player.seated {
+                [None; 2]
+            } else {
+                fight.slung(holding)
+            };
+            for (slot, slung) in slung.into_iter().enumerate() {
                 let model = match slung {
                     Some(Weapon::Rifle) => self.arsenal.of_gun(&fight.rifle),
                     Some(Weapon::Rpg) => self.arsenal.of_gun(&fight.launcher),
@@ -1666,7 +2030,7 @@ impl Scene {
             model.draw_posed(backend, queue, body, &nodes, &skin)?;
             if n.soldier
                 && n.alive
-                && let Some(w) = &self.arsenal.rifle
+                && let Some(w) = self.arsenal.npc_gun(n.gun)
                 && let Some(at) =
                     self.arsenal
                         .in_hand(w, body, &nodes, (n.hand, n.attach), n.rig.two_handed)
@@ -1702,7 +2066,21 @@ impl Scene {
             }
         }
         for &(effect, left, life) in &fight.effects {
+            // The game's own effects draw fire and smoke when they loaded.
+            let standing_in = matches!(
+                effect,
+                combat::Effect::Fire { .. }
+                    | combat::Effect::Smoke { .. }
+                    | combat::Effect::Soot { .. }
+            );
+            if standing_in && (self.particles.is_some() || self.hide_fx) {
+                continue;
+            }
             self.effects.draw(queue, effect, 1.0 - left / life);
+        }
+        let hide = self.hide_fx;
+        if let Some(p) = self.particles.as_mut().filter(|_| !hide) {
+            p.draw(backend, queue, view)?;
         }
         for p in &self.models {
             match &p.rig {
@@ -2086,6 +2464,20 @@ fn ground(
 mod tests {
     use super::*;
     use m2_render::NullBackend;
+
+    #[test]
+    fn a_heros_aim_clip_finds_the_hands_again_and_stays_the_heros() {
+        let mut rig = crate::npc::tests::rig();
+        let _ = rig.hands.set(Some((1, 2)));
+        rig.set_aim_clip(Some(0));
+        assert_eq!(rig.aim_clip, Some(0));
+        assert!(rig.hands.get().is_none(), "the old aim's hands are kept");
+        // The people's rigs aim with the clip by name, not the hero's.
+        let _ = rig.hands.set(Some((1, 2)));
+        let people = rig.shared();
+        assert_eq!(people.aim_clip, None);
+        assert!(people.hands.get().is_none());
+    }
 
     #[test]
     fn ground_draws_through_the_null_backend() {

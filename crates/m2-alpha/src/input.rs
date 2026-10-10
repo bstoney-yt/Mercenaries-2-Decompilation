@@ -76,6 +76,9 @@ pub enum Action {
     PadA,
     PadX,
     PadB,
+    /// Take up the other weapon: the rifle, or what she carries in the
+    /// launcher's place (the pad's right bumper, `Switch_Primary`).
+    SwitchWeapon,
 }
 
 /// Which keys trigger each action, as written in the settings file
@@ -126,6 +129,7 @@ impl Default for Bindings {
             (PadA, vec![KeyK]),
             (PadX, vec![KeyJ]),
             (PadB, vec![KeyL]),
+            (SwitchWeapon, Vec::new()),
         ]))
     }
 }
@@ -169,30 +173,60 @@ fn key_name(key: KeyCode) -> String {
     .to_owned()
 }
 
-/// A line of the game's text with its key tokens (`[pda] Open PDA`) named
-/// as the keys bound here, in brackets (`[P] Open PDA`): `[pda]` the PDA's
-/// key, `[support]` the support menu's, `[pfire]` the PC's fire (the left
-/// mouse button), `[confirm]` the consoles' (here the use key), `[move]`
-/// the keys that move, `[sprint]` sprint's (round 98 met it after the
-/// first gate). Other tokens, and keys left unbound, stay as they are.
-pub fn name_keys(line: &str, keys: &Bindings) -> String {
+/// The key tokens of the game's texts (`[pda] Open PDA`) and the action
+/// each names here: `[pda]` the PDA's key, `[support]` the support menu's,
+/// `[confirm]` the consoles' (here the use key), `[sprint]` sprint's
+/// (round 98 met it after the first gate), `[reload]` the reload's and
+/// `[jump]` the jump's, which is the brake when driving (`[jump]
+/// Handbrake`; the play test met both), and `[bash]` the melee's. Texts
+/// draw these as the fonts' button pictures where there is one
+/// ([`m2_game::gui_runtime::button_glyph`]); the keys are the fallback.
+/// `[pfire]` and `[move]` are named apart ([`token_keys`]).
+const TOKENS: [(&str, Action); 7] = [
+    ("pda", Action::Pda),
+    ("support", Action::Support),
+    ("confirm", Action::Use),
+    ("sprint", Action::Sprint),
+    ("reload", Action::Reload),
+    ("jump", Action::MoveUp),
+    ("bash", Action::Melee),
+];
+
+/// The key tokens of the game's texts named as the keys bound here
+/// (`("pda", "P")`): those of [`TOKENS`], `[pfire]` the PC's fire (the
+/// left mouse button) and `[move]` the keys that move. Keys left unbound
+/// are left out.
+pub fn token_keys(keys: &Bindings) -> Vec<(String, String)> {
     use Action::*;
-    let name = |a| keys.key_name(a);
-    let named = |token: &str| match token {
-        "pda" => name(Pda),
-        "support" => name(Support),
-        "confirm" => name(Use),
-        "sprint" => name(Sprint),
-        "pfire" => Some("Left click".to_owned()),
-        "move" => {
-            let names: Vec<String> = [MoveForward, MoveLeft, MoveBack, MoveRight]
-                .into_iter()
-                .filter_map(name)
-                .collect();
-            let letters = names.iter().all(|n| n.chars().count() == 1);
-            (!names.is_empty()).then(|| names.join(if letters { "" } else { "/" }))
-        }
-        _ => None,
+    let mut out: Vec<(String, String)> = TOKENS
+        .iter()
+        .filter_map(|&(token, action)| Some((token.to_owned(), keys.key_name(action)?)))
+        .collect();
+    out.push(("pfire".to_owned(), "Left click".to_owned()));
+    let names: Vec<String> = [MoveForward, MoveLeft, MoveBack, MoveRight]
+        .into_iter()
+        .filter_map(|a| keys.key_name(a))
+        .collect();
+    if !names.is_empty() {
+        let letters = names.iter().all(|n| n.chars().count() == 1);
+        out.push((
+            "move".to_owned(),
+            names.join(if letters { "" } else { "/" }),
+        ));
+    }
+    out
+}
+
+/// A line of the game's text with its key tokens (`[pda] Open PDA`) named
+/// as the keys bound here, in brackets (`[P] Open PDA`; see
+/// [`token_keys`]). Other tokens, and keys left unbound, stay as they are.
+pub fn name_keys(line: &str, keys: &Bindings) -> String {
+    let tokens = token_keys(keys);
+    let named = |token: &str| {
+        tokens
+            .iter()
+            .find(|(t, _)| t == token)
+            .map(|(_, key)| key.clone())
     };
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
@@ -216,16 +250,32 @@ pub fn name_keys(line: &str, keys: &Bindings) -> String {
     out
 }
 
-/// Held actions, actions pressed since the last tick, and mouse motion.
+/// Held actions, actions pressed since the last tick, and mouse motion;
+/// and the pad's sticks ([`crate::pad`]).
 #[derive(Debug, Default)]
 pub struct Input {
     held: HashSet<Action>,
     pressed: HashSet<Action>,
     mouse: (f64, f64),
+    /// The pad was used last (not the keyboard or mouse): the texts show
+    /// its pictures.
+    pad: bool,
+    /// What the pad holds beyond its buttons (L3's sprint, a light push's
+    /// walk), and its left stick's pushes past half way (a hijack's
+    /// `LStick_Left`): held, but not counted by [`axis`](Self::axis).
+    pad_holds: HashSet<Action>,
+    stick_pushes: HashSet<Action>,
+    /// The left stick, -1..=1 right and forward.
+    stick: [f32; 2],
+    /// The right stick's turn since the last tick, in mouse counts.
+    pad_look: (f64, f64),
 }
 
 impl Input {
     pub fn key(&mut self, bindings: &Bindings, key: KeyCode, down: bool, repeat: bool) {
+        if down {
+            self.pad = false;
+        }
         for action in bindings.actions_for(key) {
             if down {
                 if !repeat {
@@ -253,15 +303,86 @@ impl Input {
         self.mouse.1 += dy;
     }
 
+    /// The keyboard and mouse were used (a mouse button): the texts go back
+    /// to the keys' pictures.
+    pub fn mouse_used(&mut self) {
+        self.pad = false;
+    }
+
+    /// The pad was used last.
+    pub fn pad(&self) -> bool {
+        self.pad
+    }
+
+    pub fn set_pad(&mut self, pad: bool) {
+        self.pad = pad;
+    }
+
+    /// The pad holds `action` (or not) by other than a button.
+    pub fn set_pad_hold(&mut self, action: Action, down: bool) {
+        if down {
+            self.pad_holds.insert(action);
+        } else {
+            self.pad_holds.remove(&action);
+        }
+    }
+
+    /// The left stick, -1..=1 right and forward.
+    pub fn set_stick(&mut self, stick: [f32; 2]) {
+        self.stick = stick;
+    }
+
+    /// The left stick pushes towards `action`'s way past half way (or
+    /// not): a press as it gets there.
+    pub fn set_stick_push(&mut self, action: Action, pushed: bool) {
+        if pushed {
+            if self.stick_pushes.insert(action) {
+                self.pressed.insert(action);
+            }
+        } else {
+            self.stick_pushes.remove(&action);
+        }
+    }
+
+    /// The right stick turned the view by this many mouse counts.
+    pub fn pad_look(&mut self, dx: f64, dy: f64) {
+        self.pad_look.0 += dx;
+        self.pad_look.1 += dy;
+    }
+
+    /// The right stick's turn since the last call, in mouse counts.
+    pub fn take_pad_look(&mut self) -> (f64, f64) {
+        std::mem::take(&mut self.pad_look)
+    }
+
+    /// The turn since the last call, in mouse counts: the mouse's while
+    /// it is captured (`mouse_look`), and the pad's right stick's either
+    /// way.
+    pub fn take_look(&mut self, mouse_look: bool) -> (f64, f64) {
+        let (mx, my) = self.take_mouse();
+        let (px, py) = self.take_pad_look();
+        if mouse_look {
+            (mx + px, my + py)
+        } else {
+            (px, py)
+        }
+    }
+
     /// Releases everything (the window lost focus).
     pub fn clear(&mut self) {
         self.held.clear();
         self.pressed.clear();
         self.mouse = (0.0, 0.0);
+        self.pad_holds.clear();
+        self.stick_pushes.clear();
+        self.stick = [0.0; 2];
+        self.pad_look = (0.0, 0.0);
     }
 
     pub fn held(&self, action: Action) -> bool {
         self.held.contains(&action)
+            || self.pad_holds.contains(&action)
+            || self.stick_pushes.contains(&action)
     }
 
     /// True once per key press.
@@ -274,9 +395,17 @@ impl Input {
         std::mem::take(&mut self.mouse)
     }
 
-    /// -1, 0 or 1 from a pair of opposing actions.
+    /// -1..=1 from a pair of opposing actions: their keys' -1, 0 or 1,
+    /// and the left stick's tilt for the movement pairs.
     pub fn axis(&self, negative: Action, positive: Action) -> f32 {
-        f32::from(i8::from(self.held(positive)) - i8::from(self.held(negative)))
+        let keys = |a| self.held.contains(&a);
+        let digital = f32::from(i8::from(keys(positive)) - i8::from(keys(negative)));
+        let stick = match (negative, positive) {
+            (Action::MoveLeft, Action::MoveRight) => self.stick[0],
+            (Action::MoveBack, Action::MoveForward) => self.stick[1],
+            _ => 0.0,
+        };
+        (digital + stick).clamp(-1.0, 1.0)
     }
 }
 
@@ -307,6 +436,11 @@ mod tests {
             "[T] One\n[Left click] Two [WASD] [E]"
         );
         assert_eq!(name_keys("[sprint] Sprint", &b), "[Shift] Sprint");
+        // The play test's: the reload, and the jump that brakes.
+        assert_eq!(
+            name_keys("[reload] Reload\n[jump] Handbrake", &b),
+            "[R] Reload\n[Space] Handbrake"
+        );
         assert_eq!(name_keys("[other] stays [", &b), "[other] stays [");
         let mut b = b;
         b.0.insert(Action::MoveForward, vec![KeyCode::ArrowUp]);

@@ -34,6 +34,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use m2_assets::WadArchive;
 use m2_assets::animation::{ANIMATION_TYPE, Clip};
+use m2_assets::animation_table;
 use m2_engine::Install;
 use m2_engine::hijack::HijackEntrance;
 use m2_game::api::Command;
@@ -173,6 +174,8 @@ struct Active {
     /// from her first clip, and that clip, played unlifted on the ground.
     lift: Option<f32>,
     first: Option<usize>,
+    /// Whether the scripts last showed or hid her (`SetVisible`).
+    shown: Option<bool>,
 }
 
 /// What the HUD shows of a hijack.
@@ -199,8 +202,13 @@ pub struct Hijacks {
     points: HashMap<(u32, u32), Option<Vec3>>,
     near: Option<Candidate>,
     active: Option<Active>,
-    /// Each vehicle model's driver's seat, once looked up.
-    seats: HashMap<u32, Option<Seat>>,
+    /// Each vehicle's driver's seat, once looked up, by its model and
+    /// label (its template's name, which picks the seat).
+    seats: HashMap<(u32, String), Option<Seat>>,
+    /// Whether the hijack scripts left her seen or hidden in a vehicle
+    /// (by the same key as [`Hijacks::seats`]), over the seat's own guess
+    /// ([`Seat::shown`]).
+    scripts_shown: HashMap<(u32, String), bool>,
     /// Vehicles (index, model) whose parts are set as their templates say.
     dressed: std::collections::HashSet<(usize, u32)>,
 }
@@ -212,6 +220,11 @@ struct Seat {
     clip: u32,
     /// The seat, model space: her clip's origin goes there.
     at: Vec3,
+    /// She can be seen there: not inside, under a hatch. The vehicle's
+    /// entrance being a `DriverHatch` says so ([`find_seat`]); the hijack
+    /// scripts' showing or hiding her goes over it
+    /// ([`Hijacks::scripts_shown`]).
+    shown: bool,
 }
 
 impl Hijacks {
@@ -241,6 +254,7 @@ impl Hijacks {
             points: HashMap::new(),
             near: None,
             seats: HashMap::new(),
+            scripts_shown: HashMap::new(),
             dressed: Default::default(),
             active: None,
         }
@@ -309,8 +323,14 @@ impl Hijacks {
             match rx.try_recv() {
                 Ok(Ok((data, clips))) => match Mission::new(data, game.scene.hero.name(), [0.0; 3])
                 {
-                    Ok(mission) => {
+                    Ok(mut mission) => {
                         eprintln!("hijacks: scripts loaded");
+                        crate::mission::set_hero(
+                            &mut mission,
+                            game.scene.hero,
+                            game.combat.max_hp,
+                            "hijacks",
+                        );
                         if let Err(e) = mission
                             .lua()
                             .load(GUI_CALLS)
@@ -366,7 +386,14 @@ impl Hijacks {
                 eprintln!("hijack: {line}");
             }
             let commands = l.mission.take_commands();
-            if !follow(&mut self.active, &l.clips, &mut l.mission, commands, game) {
+            if !follow(
+                &mut self.active,
+                &mut self.scripts_shown,
+                &l.clips,
+                &mut l.mission,
+                commands,
+                game,
+            ) {
                 self.active = None;
                 game.input_locked = false;
                 return;
@@ -511,6 +538,7 @@ impl Hijacks {
                 vehicle_clip: None,
                 lift: None,
                 first: None,
+                shown: None,
                 vehicle: c.vehicle,
                 hero,
                 set: l.clips.sets.get(&c.template.to_ascii_lowercase()).copied(),
@@ -527,10 +555,12 @@ impl Hijacks {
                 ),
             });
             // Her clips move her from here on (`down` keeps her own
-            // moves and gaits from playing over them); the camera looks
-            // across the vehicle from its side.
+            // moves and gaits from playing over them, and what she did on
+            // foot stops: her weapon's pose would lie over the clips);
+            // the camera looks across the vehicle from its side.
             if let Some(p) = &mut game.scene.player {
                 p.down = true;
+                p.off_foot();
                 // From the entrance's side of the vehicle.
                 let side = at.inverse().transform_point3(c.at).x.signum();
                 let out = at.transform_vector3(Vec3::X * side);
@@ -544,7 +574,14 @@ impl Hijacks {
             eprintln!("hijack: {line}");
         }
         let commands = m.take_commands();
-        if !follow(&mut self.active, &l.clips, m, commands, game) {
+        if !follow(
+            &mut self.active,
+            &mut self.scripts_shown,
+            &l.clips,
+            m,
+            commands,
+            game,
+        ) {
             self.active = None;
             game.input_locked = false;
         }
@@ -674,8 +711,9 @@ impl Hijacks {
     }
 
     /// While she drives (and no hijack plays), she sits in the driver's
-    /// seat, playing the clip the tables give that seat. Runs after the
-    /// game's tick, like [`place`](Self::place).
+    /// seat, playing the clip the tables give that seat, turned and
+    /// tilted with the vehicle. Runs after the game's tick, like
+    /// [`place`](Self::place).
     pub fn seat(&mut self, game: &mut Game, dt: f32) {
         let State::Ready(loaded) = &self.state else {
             return;
@@ -687,19 +725,45 @@ impl Hijacks {
         let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
             if let Some(p) = &mut game.scene.player {
                 p.seated = false;
+                p.seat_frame = None;
             }
             return;
         };
         let Some(v) = game.scene.vehicles.get(i) else {
             return;
         };
-        let model = v.spec.model;
-        if !self.seats.contains_key(&model) {
+        // By the template the seat comes from (its label names it): the
+        // soft-top and gun M151s share a model, not their seats.
+        let key = (v.spec.model, v.spec.label.to_ascii_lowercase());
+        if !self.seats.contains_key(&key) {
             let seat = find_seat(game, &mut self.points, &loaded.clips, i);
-            eprintln!("seat: model {model:08x} {seat:?}");
-            self.seats.insert(model, seat);
+            eprintln!("seat: model {:08x} ({}) {seat:?}", key.0, key.1);
+            // Where the clip has her from its origin (pinned as a walk
+            // is, her pelvis would go on the seat point).
+            if let Some(index) = seat.and_then(|s| bind(game, s.clip))
+                && let Some((_, rig)) = game.scene.player.as_ref().and_then(|p| p.model.as_ref())
+            {
+                let c = &rig.clips[index];
+                eprintln!(
+                    "seat: clip {:08x}: root starts at {:.2?} (x, z), pelvis {:.2} m up at {:.2?}",
+                    c.hash,
+                    c.info.root_start.to_array(),
+                    c.info.hips,
+                    (c.info.root_start - c.info.pin).to_array()
+                );
+            }
+            self.seats.insert(key.clone(), seat);
         }
-        let seated = self.seats[&model].and_then(|seat| {
+        // What she did on foot stops (Player::update, which would end it,
+        // doesn't run while she drives).
+        if let Some(p) = &mut game.scene.player {
+            p.off_foot();
+        }
+        // Inside, under a hatch, she isn't seen: as the hijack scripts
+        // left her, else as the vehicle's entrance has it (a DriverHatch:
+        // inside).
+        let shown = |s: &Seat| self.scripts_shown.get(&key).copied().unwrap_or(s.shown);
+        let seated = self.seats[&key].filter(shown).and_then(|seat| {
             let index = bind(game, seat.clip)?;
             let scene = &mut game.scene;
             let world = scene.world.as_ref()?;
@@ -714,12 +778,20 @@ impl Hijacks {
                 .map_or(m2_math::glam::Vec2::Y, |l| l.forward);
             let ahead = at.transform_vector3(Vec3::Z);
             p.facing = ahead.x.atan2(ahead.z) + forward.x.atan2(forward.y);
-            p.character.position = at.transform_point3(seat.at);
+            // Her clip's space is the vehicle's, its origin on the seat
+            // (her model's axes the vehicle's, as the hijack clips'),
+            // with the vehicle's whole turn.
+            let frame = at * Mat4::from_translation(seat.at + seat_offset(rig, index));
+            p.seat_frame = Some(frame);
+            p.character.position = frame.transform_point3(Vec3::ZERO);
             p.character.velocity = Vec3::ZERO;
             Some(())
         });
         if let Some(p) = &mut game.scene.player {
             p.seated = seated.is_some();
+            if !p.seated {
+                p.seat_frame = None;
+            }
         }
     }
 
@@ -774,12 +846,23 @@ impl Hijacks {
     pub fn running(&self) -> bool {
         self.active.is_some()
     }
+
+    /// She is `hero` from now on, whole at `max` health: the loaded
+    /// scripts' player takes their name, labels and health
+    /// ([`crate::mission::set_hero`]). Scripts still loading start as
+    /// whoever she is then.
+    pub fn set_hero(&mut self, hero: crate::hero::Hero, max: f32) {
+        if let State::Ready(l) = &mut self.state {
+            crate::mission::set_hero(&mut l.mission, hero, max, "hijacks");
+        }
+    }
 }
 
 /// Carries out the scripts' hijack commands and ends the actions due.
 /// False once the hijack is over.
 fn follow(
     active: &mut Option<Active>,
+    scripts_shown: &mut HashMap<(u32, String), bool>,
     clips: &ClipTimes,
     mission: &mut Mission,
     commands: Vec<Command>,
@@ -823,6 +906,8 @@ fn follow(
                 0.6,
                 0.6,
             ));
+            // The template the script spawns, its own effects.
+            game.combat.show_fx(what, Vec3::from(*position));
         }
         let Command::Hijack(h) = c else {
             continue;
@@ -852,6 +937,17 @@ fn follow(
                 if let Some(p) = &mut game.scene.player {
                     p.down = false;
                 }
+                // Seen in the seat or not as the scripts left her (gone in
+                // through the hatch, hidden).
+                if let (Some(on), Some(v)) = (a.shown, game.scene.vehicles.get(a.vehicle)) {
+                    let key = (v.spec.model, v.spec.label.to_ascii_lowercase());
+                    eprintln!(
+                        "seat: {}: the hijack scripts left her {}: so she is in its seat (over the seat's guess)",
+                        key.1,
+                        if on { "shown" } else { "hidden" }
+                    );
+                    scripts_shown.insert(key, on);
+                }
                 // The driver is out (the scripts remove or kill him).
                 if let Some(v) = game.scene.vehicles.get_mut(a.vehicle) {
                     v.crew
@@ -862,6 +958,15 @@ fn follow(
                     p.landed = true;
                 }
                 over = true;
+            }
+            // Whether the scripts hide her (gone in through the hatch)
+            // tells whether she is seen in the seat (taken when done).
+            HijackCommand::Visible { guid, on } if guid == a.hero => {
+                eprintln!(
+                    "hijack: the scripts {} her",
+                    if on { "show" } else { "hide" }
+                );
+                a.shown = Some(on);
             }
             HijackCommand::AbortDone { hero } if hero == a.hero => {
                 eprintln!("hijack: failed");
@@ -1052,7 +1157,11 @@ fn dress(
 /// The driver's seat of vehicle `i`: its template (the first by name of
 /// those with its model and an animation set), that template's
 /// `seat_driver` (else first) `SeatLink` and the hardpoint it names, else
-/// the model's driver's seat marker.
+/// the model's driver's seat marker; and whether she is seen there
+/// ([`Seat::shown`]: not when the vehicle's entrance is a `DriverHatch`).
+/// `None` (she is not drawn) without a template with
+/// an animation set, a seated clip or a place for the seat. Each says
+/// why in the log.
 fn find_seat(
     game: &mut Game,
     points: &mut HashMap<(u32, u32), Option<Vec3>>,
@@ -1066,29 +1175,135 @@ fn find_seat(
     let db = &scene.world.as_ref()?.index.template_db;
     // Its own template when its label names one (`M151 Softtop (GR)`),
     // else one with seats before one without (`M151 (Base)` has none).
-    let mut names: Vec<String> = db
+    let of_model: Vec<(String, u32)> = db
         .infos
         .iter()
         .filter(|(_, info)| info.model == Some(model))
-        .filter_map(|(id, _)| Some(db.names.get(id)?.to_ascii_lowercase()))
-        .filter(|name| clips.sets.contains_key(name))
+        .filter_map(|(&id, _)| Some((db.names.get(&id)?.to_ascii_lowercase(), id)))
         .collect();
-    names.sort_by_key(|n| (*n != label, !clips.seats.contains_key(n), n.clone()));
-    let name = names.first()?;
+    let mut names: Vec<&(String, u32)> = of_model
+        .iter()
+        .filter(|(name, _)| clips.sets.contains_key(name))
+        .collect();
+    names.sort_by_key(|(n, id)| (*n != label, !clips.seats.contains_key(n), n.clone(), *id));
+    let Some((name, id)) = names.first().map(|e| (&e.0, e.1)) else {
+        eprintln!("seat: {label}: no template of its model has a VehicleAnimationSet: not drawn");
+        return None;
+    };
     let set = clips.sets[name];
     let driver = m2_assets::name_hash("seat_driver");
     let links = clips.seats.get(name.as_str());
     let link = links.and_then(|l| l.iter().find(|s| s.0 == driver).or(l.first()));
-    let clip = clips
-        .seated(set, link.map(|l| l.0))
-        .or_else(|| clips.seated(set, None))?;
     let hardpoint = link
         .and_then(|l| l.1)
         .and_then(|h| point(points, scene.source.as_mut(), model, h));
     eprintln!("seat: {name} link {link:x?} hardpoint {hardpoint:?} marker {marker:?}");
+    // Every SeatLink record of the template whole: which field (if any)
+    // says the seat is enclosed is not known yet.
+    for (k, row) in clips
+        .seat_fields
+        .get(name.as_str())
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let cells: Vec<String> = row
+            .iter()
+            .map(|&(field, word)| match clips.seat_templates.get(&word) {
+                Some(t) => format!("{field:08x}={word:08x} ({t})"),
+                None => format!("{field:08x}={word:08x}"),
+            })
+            .collect();
+        eprintln!("seat: {name}: SeatLink {k}: {}", cells.join(", "));
+    }
+    // The tables' clip for the seat, and the row of the vehicle table
+    // that gives it (the vehicle's own, its class's, or one for any).
+    // The seat's own row first; one the seat-less query finds when that
+    // gives no clip (a seat's row whose Animation is any).
+    let Some(((clip, row), vehicles)) = clips.tables.as_ref().and_then(|(actions, vehicles)| {
+        let seat = link.map(|l| l.0);
+        let row = |seat| {
+            animation_table::seat_clip_row(actions, vehicles, "InVehicle", "Idle", set, seat)
+        };
+        Some((row(seat).or_else(|| row(None))?, vehicles))
+    }) else {
+        eprintln!("seat: {name}: the tables give its seat no InVehicle Idle clip: not drawn");
+        return None;
+    };
+    let cell = |column: &str| match vehicles.column(column).and_then(|c| vehicles.cell(row, c)) {
+        Some(animation_table::ANY) => "any".to_owned(),
+        Some(v) => format!("{v:08x}"),
+        None => "-".to_owned(),
+    };
+    eprintln!(
+        "seat: {name}: clip {clip:08x} from the vehicle table's row {row} (class {}, vehicle {}, seat {}; set {:08x?})",
+        cell("VehicleClass"),
+        cell("VehicleName"),
+        cell("SeatName"),
+        [set.0, set.1],
+    );
+    let Some(at) = hardpoint.or(marker) else {
+        eprintln!("seat: {name}: no hardpoint or seat marker for the seat: not drawn");
+        return None;
+    };
+    // The data's rule (the hijack scripts hiding her, which
+    // [`Hijacks::seat`] takes, go over it): a driver got in through a
+    // `DriverHatch` entrance is inside, out of sight. The PC footage of
+    // the AMX30 shows her on top only while climbing in, hidden while
+    // driving. Its own template's entrances, else those of another
+    // template of its model.
+    let hatch_point = m2_assets::name_hash("DriverHatch");
+    let entrances = db
+        .entrance_points
+        .get(&id)
+        .map(|p| (name.as_str(), p))
+        .or_else(|| {
+            of_model
+                .iter()
+                .find_map(|(n, t)| Some((n.as_str(), db.entrance_points.get(t)?)))
+        });
+    let hatch = entrances.is_some_and(|(_, p)| p.contains(&hatch_point));
+    eprintln!(
+        "seat: {name}: entrances {}: {}",
+        entrances.map_or_else(
+            || "none".to_owned(),
+            |(of, p)| format!("{p:08x?} (of {of})")
+        ),
+        if hatch {
+            "a DriverHatch: inside, she is not drawn while seated"
+        } else {
+            "no DriverHatch: she is drawn there"
+        }
+    );
     Some(Seat {
         clip,
-        at: hardpoint.or(marker)?,
+        at,
+        shown: !hatch,
+    })
+}
+
+/// Where her seated loop (clip `clip`, an index into her rig's clips)
+/// has its root now from the clip's origin, flat. The animator pins every
+/// clip's pelvis over her model's origin, as a walk's must be; the seated
+/// loops are cut with their origin on the seat (the viewer's, checked by
+/// eye on the HMMWV, played them so), so the root goes back where the
+/// clip has it, as [`Hijacks::place`] puts a hijack clip's.
+fn seat_offset(rig: &crate::scene::Rig, clip: usize) -> Vec3 {
+    let Some(c) = rig.clips.get(clip) else {
+        return Vec3::ZERO;
+    };
+    let t = rig
+        .animator
+        .current()
+        .filter(|cur| cur.0 == clip)
+        .map_or(0.0, |cur| cur.1);
+    let pose = c.sample_looped(&rig.skeleton, t);
+    pose.0.get(rig.skeleton.root()).map_or(Vec3::ZERO, |l| {
+        Vec3::new(
+            l.translation.x - c.info.pin.x,
+            0.0,
+            l.translation.z - c.info.pin.y,
+        )
     })
 }
 

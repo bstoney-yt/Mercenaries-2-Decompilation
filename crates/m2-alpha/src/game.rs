@@ -106,6 +106,8 @@ pub struct Game {
     fetched: HashSet<u32>,
     /// The island's traffic spawners and what they have out.
     pub traffic: crate::traffic::Traffic,
+    /// Vehicles the mission scripts send along a path (`crate::paths`).
+    pub paths: crate::paths::PathMoves,
     /// Seconds to the next look for the island's vehicles near the player.
     vehicle_wait: f32,
     /// The layers the game starts with, which the island's vehicles come
@@ -130,13 +132,39 @@ pub struct Game {
     /// leave ([`crate::drops`]), and how many have.
     drops: Drops,
     dropped: u32,
+    /// The pickups she has stood at and left lying, each logged once
+    /// with why.
+    refused: std::collections::HashSet<(u32, u32)>,
     /// The scripts have turned her controls off (a loading fade).
     pub input_locked: bool,
+    /// The field of view (degrees, bottom to top) and the screen's width
+    /// over its height the last frame was drawn with: what the scripts'
+    /// camera sees (`Event.ObjectIsVisible`).
+    pub lens: (f32, f32),
 }
 
 /// A soldier's pickup is told from the others by its "crate": this, plus
 /// how many were left before it.
 const DROPPED: u32 = 0x7000_0000;
+
+/// Gives her what her template hands her to throw (`explosives`, from
+/// [`Scene::hero_explosives`]: free roam; the contract's scripts give her
+/// their own), as many of each as it says, and of what it doesn't name as
+/// many as a new game starts with.
+fn own_explosives(combat: &mut Combat, explosives: Vec<(String, u32)>) {
+    let fresh = Combat::default();
+    combat.grenades = fresh.grenades;
+    combat.charges = fresh.charges;
+    combat.mines = fresh.mines;
+    for (name, n) in explosives {
+        match name.to_ascii_lowercase().as_str() {
+            "grenade" => combat.grenades = n,
+            "c4" => combat.charges = n,
+            "proximity mine" => combat.mines = n,
+            _ => {}
+        }
+    }
+}
 
 impl Game {
     pub fn new(scene: Scene, camera: FlyCamera) -> Self {
@@ -153,16 +181,7 @@ impl Game {
         if let Some(arms) = scene.arms() {
             combat.arm(arms, scene.damage_table());
         }
-        // What their template hands them to throw (free roam; the
-        // contract's scripts give her their own).
-        for (name, n) in scene.hero_explosives() {
-            match name.to_ascii_lowercase().as_str() {
-                "grenade" => combat.grenades = n,
-                "c4" => combat.charges = n,
-                "proximity mine" => combat.mines = n,
-                _ => {}
-            }
-        }
+        own_explosives(&mut combat, scene.hero_explosives());
         eprintln!(
             "hero: carries {} grenades, {} C4, {} mines; launcher {} ({:?})",
             combat.grenades,
@@ -194,6 +213,7 @@ impl Game {
             destruction: Destruction::default(),
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
+            paths: crate::paths::PathMoves::default(),
             vehicle_wait: 0.0,
             startup: None,
             props_up: false,
@@ -204,8 +224,10 @@ impl Game {
             support: Support::default(),
             drops: Drops::default(),
             dropped: 0,
+            refused: std::collections::HashSet::new(),
             input_locked: false,
             support_hp: 0.0,
+            lens: (60.0, 16.0 / 9.0),
         }
     }
 
@@ -248,7 +270,7 @@ impl Game {
     }
 
     /// Plays as `hero` from now on: their body, clips and health (whole),
-    /// and in free roam their own rifle.
+    /// and in free roam their own rifle and what they carry to throw.
     pub fn set_hero(
         &mut self,
         backend: &mut dyn m2_render::RenderBackend,
@@ -259,11 +281,20 @@ impl Game {
             self.combat.max_hp = hp;
             self.combat.hp = hp;
         }
-        // Their own rifle, unless the scripts handed her one.
+        // Their own rifle and explosives, as a game started as them has
+        // ([`Game::new`]): the rifle unless she has taken up another, the
+        // explosives unless the contract's scripts handed her theirs.
         if self.combat.own_rifle
             && let Some(rifle) = self.scene.hero_rifle()
         {
             self.combat.take_own_rifle(rifle);
+        }
+        if !self.combat.scripted_loadout {
+            own_explosives(&mut self.combat, self.scene.hero_explosives());
+            eprintln!(
+                "hero: {hero} carries {} grenades, {} C4, {} mines",
+                self.combat.grenades, self.combat.charges, self.combat.mines
+            );
         }
     }
 
@@ -350,11 +381,13 @@ impl Game {
             s.poll();
         }
         // Where they may stand: the static layers the game starts with
-        // (all of them if that set isn't known) and its state layers.
+        // (all of them if that set isn't known) and its state layers; with
+        // `--mission`, the static layers the scripts have loaded so far
+        // (the people's set; their state layers' vehicles are theirs).
         let (static_layers, state_layers) = match &self.startup {
             Some(Startup::Loading(_)) => return,
             Some(Startup::Ready(set)) => (Some(&set.hashes), set.entities.as_slice()),
-            _ => (None, &[][..]),
+            _ => (scene.people.state_layers.as_ref(), &[][..]),
         };
 
         let near = player.character.position;
@@ -421,7 +454,15 @@ impl Game {
             self.toggle_fly();
         }
         if self.on_foot {
-            let intent = Intent::from_input(input, config, mouse_look);
+            let mut intent = Intent::from_input(input, config, mouse_look);
+            // The pad's switch: the other of the rifle and what she
+            // carries in the launcher's place.
+            if input.take_pressed(Action::SwitchWeapon) && intent.trigger.select.is_none() {
+                intent.trigger.select = Some(match self.combat.weapon {
+                    Weapon::Rifle => Weapon::Rpg,
+                    _ => Weapon::Rifle,
+                });
+            }
             self.step(intent, dt);
         } else {
             self.camera.update(input, config, mouse_look, dt);
@@ -540,6 +581,7 @@ impl Game {
                     Some((at, v, id)) => {
                         let speed = physics.vehicle_speed(id);
                         player.chase(at, ChaseRig::of(&v.spec), intent.look, speed, dt);
+                        player.keep_chase_clear(physics, Some(id));
                     }
                     None => {
                         player.driving = None;
@@ -638,6 +680,8 @@ impl Game {
             }
             self.traffic
                 .drive(&mut world.physics, &self.scene.vehicles, driven);
+            self.paths
+                .drive(&mut world.physics, &self.scene.vehicles, driven);
             knock_loose(
                 world,
                 &mut self.scene.props,
@@ -645,6 +689,11 @@ impl Game {
                 &mut self.destruction,
                 self.scene.install.as_ref(),
             );
+            // What came down (to a vehicle, the traffic's too, or a blast
+            // last tick) comes down whether she is on foot or the free
+            // camera flies: its island copy has lost its collision already.
+            self.destruction
+                .update(world, &mut self.scene.props, &mut self.combat);
             self.scene.props.advance(dt);
             self.spray_wait -= dt;
             if self.spray_wait <= 0.0 {
@@ -711,8 +760,6 @@ impl Game {
                         .blast(world, &mut scene.props, install, blast);
                 }
             }
-            self.destruction
-                .update(world, &mut scene.props, &mut self.combat);
             // A supply crate broken open: a puff of dust off its boards.
             let broken = scene.flights.strike(
                 &mut world.physics,
@@ -727,14 +774,36 @@ impl Game {
                     },
                     1.2,
                 );
+                self.combat
+                    .show_fx(crate::combat::fx::CRATE, at + Vec3::Y * 0.6);
             }
             // What lies within her reach: a weapon taken up with the use
             // key; ammunition and health as she walks over them, if they
-            // give her anything (else with the use key, as before).
-            let near = scene
-                .flights
-                .within(player.character.position)
-                .map(|p| p.what.weapon.is_none() && self.combat.can_use(&p.what));
+            // give her anything (else with the use key, as before). A
+            // weapon lying there whose ammunition records give a weapon of
+            // hers rounds she has room for (a dead soldier's `Assault
+            // Rifle`, to her own rifle) is walked over for them.
+            let templates = &world.index.template_db;
+            let near = scene.flights.within(player.character.position).map(|p| {
+                let refill = crate::mission::refill(templates, &self.combat, &p.what);
+                let usable = self.combat.can_use(refill, p.what.health);
+                // Each pickup she stands at and leaves lying, once, with
+                // why: what each record would go to and its room.
+                if !usable && !taking && self.refused.insert(p.key()) {
+                    eprintln!(
+                        "pickup: she leaves {} ({:#x}) at {:.1} lying: {}{}",
+                        templates.by_id(p.what.template).map_or("?", |t| t.0),
+                        p.what.template,
+                        p.at,
+                        crate::mission::refusal(templates, &self.combat, &p.what),
+                        match p.what.weapon {
+                            Some(w) => format!(" (a weapon, {w:?}: taken up with the use key)"),
+                            None => String::new(),
+                        }
+                    );
+                }
+                usable
+            });
             if player.driving.is_none()
                 && (taking || near == Some(true))
                 && let Some(p) = scene.flights.take_within(player.character.position)
@@ -745,17 +814,36 @@ impl Game {
                     &world.index.template_db,
                     player,
                     p,
+                    !taking,
                 );
             }
         }
         self.drop_pickups();
         self.support_impacts();
         self.strike_impacts(dt);
+        self.run_particles(dt);
         self.scene.tick(dt);
     }
 
+    /// Sets off the game's effects the fight asked for and runs them.
+    fn run_particles(&mut self, dt: f32) {
+        let asked = std::mem::take(&mut self.combat.game_fx);
+        let scene = &mut self.scene;
+        let (Some(p), Some(world)) = (scene.particles.as_mut(), scene.world.as_ref()) else {
+            return;
+        };
+        p.take(asked, &world.index.template_db);
+        p.step(dt);
+    }
+
     /// The soldiers killed this tick leave what their death script picks,
-    /// where they fell.
+    /// what their template's `SpawnOnDeath`s name that is a pickup (as a
+    /// broken crate's do), and the weapons they carry that are pickups
+    /// themselves, where they fell: the `VZ Soldier`'s `Assault Rifle`
+    /// (8000436f) has its own `Pickup` records (an equipment record of
+    /// radius 1.5, and 8 `Assault Rifle Bullet`) and the ak47's model, so
+    /// the rifle a soldier dropped lies there to be taken (PC data,
+    /// 2026-10-09).
     fn drop_pickups(&mut self) {
         let deaths = self.scene.people.take_deaths();
         let Some(world) = &self.scene.world else {
@@ -763,11 +851,13 @@ impl Game {
         };
         let templates = &world.index.template_db;
         for (at, spawn) in deaths {
-            // Their template's labels (the first contract's AT defenders
-            // are heavy rocket soldiers).
-            let labels = spawn
+            // Their template, and its labels (the first contract's AT
+            // defenders are heavy rocket soldiers).
+            let template = spawn
                 .and_then(|e| world.index.spawns.iter().find(|s| s.entity == e))
-                .and_then(|s| templates.id(s.template.as_deref()?))
+                .and_then(|s| s.template.as_deref());
+            let id = template.and_then(|t| templates.id(t));
+            let labels = id
                 .and_then(|id| templates.leavings.labels.get(&id))
                 .map_or(&[][..], Vec::as_slice);
             let is = |label: &str| labels.contains(&m2_assets::name_hash(label));
@@ -777,27 +867,77 @@ impl Game {
                 machine_gun: is("MGSoldier"),
                 seated: false,
             };
-            let Some(name) =
+            // What the template names: its pickups on dying, and the
+            // weapons it carries, those with their own `Pickup` records
+            // dropped as they are.
+            let mut left = template.map_or_else(Vec::new, |t| crate::mission::leaves(templates, t));
+            let name_of = |t: u32| templates.by_id(t).map_or("?", |t| t.0);
+            let equipment = id
+                .and_then(|id| templates.equipment.get(&id))
+                .map_or(&[][..], Vec::as_slice);
+            let carries: Vec<String> = equipment
+                .iter()
+                .map(|&w| format!("{} {}", name_of(w), crate::mission::records(templates, w)))
+                .collect();
+            let guns: Vec<_> = equipment
+                .iter()
+                .filter_map(|&w| crate::mission::pickup(templates, w))
+                .collect();
+            eprintln!(
+                "drop: a {} dies at {at:.1}; its template leaves [{}] and carries [{}]",
+                template.unwrap_or("soldier"),
+                left.iter()
+                    .map(|l| name_of(l.template))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                carries.join(", ")
+            );
+            for gun in &guns {
+                eprintln!(
+                    "drop: its {} ({:#x}, model {:x?}) falls with it, a pickup of reach {:.1}: \
+                     taken up with {:?}, walked over for {}",
+                    name_of(gun.template),
+                    gun.template,
+                    gun.model,
+                    gun.reach,
+                    gun.gives,
+                    templates
+                        .leavings
+                        .pickups
+                        .get(&gun.template)
+                        .map_or_else(String::new, |p| format!("{:x?}", p.walked))
+                );
+            }
+            left.extend(guns);
+            if let Some(name) =
                 self.drops
                     .on_death(soldier, Some(self.combat.grenades), self.combat.hp)
-            else {
-                continue;
-            };
-            let Some(what) = templates
-                .id(name)
-                .and_then(|id| crate::mission::pickup(templates, id))
-            else {
-                eprintln!("drop: {name} isn't a pickup");
-                continue;
-            };
-            self.dropped += 1;
-            eprintln!("drop: a soldier leaves {name} at {at:.1}");
-            self.scene.flights.leave(crate::flights::Pickup {
-                from: DROPPED + self.dropped,
-                what,
-                at: at + Vec3::Y * 0.1,
-                yaw: 0.0,
-            });
+            {
+                match templates
+                    .id(name)
+                    .and_then(|id| crate::mission::pickup(templates, id))
+                {
+                    Some(what) => left.push(what),
+                    None => eprintln!("drop: {name} isn't a pickup"),
+                }
+            }
+            for what in left {
+                self.dropped += 1;
+                eprintln!(
+                    "drop: a soldier leaves {} {} at {at:.1}; for her now {:?} (her {} fires {})",
+                    name_of(what.template),
+                    crate::mission::records(templates, what.template),
+                    crate::mission::refill(templates, &self.combat, &what),
+                    self.combat.rifle.name,
+                    self.combat.rifle.ammo.map_or("?", |a| name_of(a.template))
+                );
+                self.scene.flights.leave(crate::flights::Pickup {
+                    from: DROPPED + self.dropped,
+                    what,
+                    at: at + Vec3::Y * 0.1,
+                    yaw: 0.0,
+                });
+            }
         }
     }
 
@@ -817,7 +957,9 @@ impl Game {
         let call = match her {
             Some(_) => Call {
                 menu: intent.trigger.support,
-                use_pressed: intent.use_pressed,
+                // At the menu or the view, the jump (the pad's A, which
+                // the texts' `[confirm]` shows) confirms as well.
+                use_pressed: intent.use_pressed || (intent.jump && self.support.busy()),
                 fire: intent.trigger.fire,
                 steer: intent.movement,
                 look: intent.look,
@@ -1048,9 +1190,7 @@ impl Game {
             v.damage = 0.0;
         }
         let p = &save.player;
-        player.character.position = Vec3::from(p.position);
-        player.character.velocity = Vec3::ZERO;
-        player.landed = false;
+        player.drop_at(Vec3::from(p.position));
         player.driving = None;
         player.chase_target = None;
         player.down = false;
@@ -1063,6 +1203,7 @@ impl Game {
         self.combat.max_hp = max_hp;
         self.combat.rifle = old.rifle;
         self.combat.own_rifle = old.own_rifle;
+        self.combat.scripted_loadout = old.scripted_loadout;
         self.combat.hero_damage = old.hero_damage;
         // What the templates gave her weapons stays.
         self.combat.damage_table = old.damage_table;
@@ -1135,8 +1276,9 @@ impl Game {
         self.park_tries >= PARK_TRIES || !self.scene.vehicles.iter().any(parkable)
     }
 
-    /// What the HUD shows.
-    pub fn hud_info(&self) -> HudInfo {
+    /// What the HUD shows, its words from `strings` (the game's English
+    /// strings, once the scripts have read them).
+    pub fn hud_info(&self, strings: Option<&m2_assets::StringTable>) -> HudInfo {
         let player = self.scene.player.as_ref();
         let loading = match &self.scene.world {
             // The island-wide tiles; nearby detail streams in quietly.
@@ -1176,8 +1318,10 @@ impl Game {
         };
         let can_enter = match (&self.scene.world, player) {
             (Some(w), Some(p)) if p.driving.is_none() && p.landed => {
-                nearest(&w.physics, &self.scene.vehicles, p, REACH)
-                    .map(|i| self.scene.vehicles[i].spec.label.clone())
+                nearest(&w.physics, &self.scene.vehicles, p, REACH).map(|i| {
+                    let spec = &self.scene.vehicles[i].spec;
+                    vehicle_name(&w.index.template_db, strings, &spec.label, spec.model)
+                })
             }
             _ => None,
         };
@@ -1231,6 +1375,7 @@ impl Game {
             support: self
                 .support
                 .hud(player.map_or(self.camera.position.y, |p| p.character.position.y)),
+            hero: self.scene.hero,
             ..HudInfo::default()
         }
     }
@@ -1293,23 +1438,26 @@ impl Game {
         })
     }
 
-    /// Switches between walking and flying. Flying starts from the player's
-    /// camera; walking starts by dropping to the ground under the camera.
+    /// Switches between walking and flying (a developer's aid, `--dev`).
+    /// Flying starts from the player's camera, and not while the scripts
+    /// have her controls off; walking takes up her body where it was left
+    /// (or where the scripts moved it meanwhile), not where the camera is:
+    /// on foot she lands there again once the ground around it has
+    /// streamed back in.
     pub fn toggle_fly(&mut self) {
         let Some(player) = &mut self.scene.player else {
             return;
         };
         if self.on_foot {
+            if self.input_locked {
+                eprintln!("free camera: not while the scripts have her controls off");
+                return;
+            }
             self.camera.position = player.eye();
             self.camera.yaw = player.yaw;
             self.camera.pitch = player.pitch;
-        } else {
-            let p = self.camera.position;
-            player.character.position = Vec3::new(p.x, 0.0, p.z);
-            player.character.velocity = Vec3::ZERO;
-            player.landed = false;
-            player.yaw = self.camera.yaw;
-            player.facing = self.camera.yaw;
+        } else if player.driving.is_none() && player.landed {
+            player.drop_at(player.character.position);
         }
         self.on_foot = !self.on_foot;
     }
@@ -1549,27 +1697,38 @@ const LEFT_BESIDE: f32 = 0.6;
 
 /// What she takes from a pickup: a weapon is taken up in the launcher's
 /// place (what she carried there left lying beside her, to be taken
-/// back), ammunition goes with its weapon.
+/// back), ammunition goes with its weapon. One `walked` over (not taken
+/// with the use key) gives only its ammunition, a weapon's too.
 fn take_up(
     combat: &mut Combat,
     flights: &mut crate::flights::Flights,
     templates: &m2_engine::Templates,
     player: &Player,
     p: crate::flights::Pickup,
+    walked: bool,
 ) {
     let rounds = p.what.gives.map_or(0, |(_, n)| n);
-    let Some(weapon) = p.what.weapon else {
-        if let Some((w, n)) = p.what.gives {
-            combat.take_ammo(w, n);
-        }
-        combat.take_supplies(p.what.launcher, p.what.grenades, p.what.health);
+    let Some(weapon) = p.what.weapon.filter(|_| !walked) else {
+        let refill = crate::mission::refill(templates, combat, &p.what);
+        combat.take_supplies(refill, p.what.health);
         eprintln!(
-            "pickup: she takes {:#x} at {:.1}{}",
+            "pickup: she takes {} ({:#x}) at {:.1}: {} rounds for her {}, {} for her {}, \
+             {} grenades, {} health; she has {}+{}, {:?}, {} grenades",
+            templates.by_id(p.what.template).map_or("?", |t| t.0),
             p.what.template,
             p.at,
-            p.what.gives.map_or(String::new(), |(w, n)| format!(
-                ": {n} rounds for her {w:?}"
-            ))
+            refill.rifle,
+            combat.rifle.name,
+            refill.launcher,
+            combat
+                .second
+                .map_or("nothing", |_| combat.launcher.name.as_str()),
+            refill.grenades,
+            p.what.health,
+            combat.rifle_rounds.clip,
+            combat.rifle_rounds.stored,
+            combat.launcher_rounds.map(|r| (r.clip, r.stored)),
+            combat.grenades
         );
         return;
     };
@@ -1744,7 +1903,8 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
 /// ploughs on slowed as by the mass it shifted, rather than stopped as by
 /// a wall (the step just taken stopped it). First they break what they
 /// run into that their weight breaks ([`Destruction::crash`]: plants,
-/// bushes, fences, lampposts), going on through it.
+/// bushes, fences, lampposts, the island's and the state layers'), going
+/// on through it.
 fn knock_loose(
     world: &mut World,
     props: &mut Props,
@@ -1774,15 +1934,17 @@ fn knock_loose(
                 velocity: before,
                 mass,
             };
-            for c in destruction.crash(world, props, install, &crasher) {
+            // What its body touched in the step counts as run into, as
+            // what its box meets does.
+            for c in destruction.crash(world, props, install, &crasher, &keys) {
                 match c {
-                    Crashed::Down(i) => {
-                        ploughed |= keys.contains(&StaticKey::Object(i));
-                        down.push(StaticKey::Object(i));
+                    Crashed::Down(key) => {
+                        ploughed |= keys.contains(&key);
+                        down.push(key);
                     }
-                    Crashed::Loose(i) => {
-                        if !keys.contains(&StaticKey::Object(i)) {
-                            keys.push(StaticKey::Object(i));
+                    Crashed::Loose(key) => {
+                        if !keys.contains(&key) {
+                            keys.push(key);
                         }
                     }
                 }
@@ -1799,9 +1961,7 @@ fn knock_loose(
             let Some(m) = loose.filter(|&m| mass * speed >= KNOCK_RATIO * m) else {
                 continue;
             };
-            let ahead = before.with_y(0.0);
-            let fling = before * (mass / (mass + m)) * FLING + Vec3::Y * FLING_UP;
-            let topple = Vec3::Y.cross(ahead.normalize_or_zero()) * (ahead.length() * TOPPLE);
+            let (fling, topple) = flung(before, mass, m);
             let knocked = match key {
                 StaticKey::Object(i) => world.knock(i, fling, topple),
                 StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
@@ -1821,6 +1981,18 @@ fn knock_loose(
                 .set_vehicle_velocity(id, before * (mass / (mass + shifted)));
         }
     }
+}
+
+/// How what a vehicle of `mass` (kg) going at `velocity` (m/s) knocks
+/// loose, `shifted` kg of it, is flung: its velocity, a little faster than
+/// the two would go on together and up ([`FLING`], [`FLING_UP`]), and its
+/// spin, toppling the way it was hit ([`TOPPLE`]). What a vehicle breaks
+/// apart goes the same way ([`Destruction::crash`]).
+pub(crate) fn flung(velocity: Vec3, mass: f32, shifted: f32) -> (Vec3, Vec3) {
+    let ahead = velocity.with_y(0.0);
+    let fling = velocity * (mass / (mass + shifted)) * FLING + Vec3::Y * FLING_UP;
+    let topple = Vec3::Y.cross(ahead.normalize_or_zero()) * (ahead.length() * TOPPLE);
+    (fling, topple)
 }
 
 /// Blasts knock loose what comes loose within `reach` (as far as they
@@ -2011,6 +2183,46 @@ fn footprint_radius(spec: &m2_engine::VehicleSpec) -> f32 {
     (hi.x - lo.x).hypot(hi.z - lo.z) * 0.5
 }
 
+/// What the use prompt calls a vehicle: the name the game shows for it,
+/// the English string its template's `LocalizedName` keys in `strings`
+/// (the `Chopper`'s reads "Chopper"), of the template its label names,
+/// else of the first sharing its model that the strings hold
+/// ([`Templates::localized_keys`]);
+/// without one, its template's name as the template database writes it
+/// (`M151 Softtop (V2)`); its label (a texture name, `vz_veh_truck_M151`)
+/// only if no template is found. Each label's name is logged once.
+fn vehicle_name(
+    db: &Templates,
+    strings: Option<&m2_assets::StringTable>,
+    label: &str,
+    model: u32,
+) -> String {
+    static NAMED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let keys = db.localized_keys(label, model);
+    let found = keys
+        .iter()
+        .find_map(|&k| Some((k, strings?.strings.get(&k)?.clone())));
+    let key = found.as_ref().map(|f| f.0).or(keys.first().copied());
+    let shown = found.map(|f| f.1);
+    let name = db
+        .names_for(label, model)
+        .first()
+        .and_then(|n| db.names.get(&db.id(n)?))
+        .cloned();
+    // Logged once its strings are read, if they ever are.
+    if strings.is_some()
+        && let Ok(mut named) = NAMED.lock()
+        && !named.iter().any(|l| l == label)
+    {
+        named.push(label.to_owned());
+        eprintln!(
+            "vehicle: {label} (model {model:08x}) is shown as {shown:?} (string {key:08x?}), \
+             its template {name:?}, to get in"
+        );
+    }
+    shown.or(name).unwrap_or_else(|| label.to_owned())
+}
+
 /// The vehicle nearest her within `reach` metres of its door marker (or its
 /// hull, for those without one).
 fn nearest(
@@ -2085,13 +2297,69 @@ pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player)
         v.id.and_then(|id| physics.vehicle_transform(id))
             .filter(|at| at.is_finite())
     {
-        let out = door_out(at, &v.spec);
-        player.character.position = Vec3::new(out.x, 0.0, out.z);
-        player.character.velocity = Vec3::ZERO;
+        // At the hull's height: onto the ground by the door, not onto a
+        // boulder or roof over it.
+        player.drop_at(door_out(at, &v.spec));
         let f = at.transform_vector3(Vec3::Z);
         player.facing = f.x.atan2(f.z);
-        player.landed = false;
     }
     player.driving = None;
     player.chase_target = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use m2_engine::TemplateInfo;
+
+    use super::*;
+
+    #[test]
+    fn the_use_prompt_names_vehicles_as_the_game_shows_them() {
+        let info = |model| TemplateInfo {
+            model: Some(model),
+            vehicle: None,
+            engine: None,
+            person: false,
+            human: false,
+        };
+        let db = Templates {
+            by_name: HashMap::from([
+                ("m151 softtop (v2)".to_owned(), info(7)),
+                ("amx30".to_owned(), info(9)),
+            ]),
+            names: HashMap::from([
+                (0x8000_0001, "M151 Softtop (V2)".to_owned()),
+                (0x8000_0002, "AMX30".to_owned()),
+            ]),
+            ..Templates::default()
+        };
+        // A template's label, whatever its case.
+        assert_eq!(vehicle_name(&db, None, "amx30", 9), "AMX30");
+        // A texture's (the play test's `vz_veh_truck_M151`): the template
+        // that shares its model.
+        assert_eq!(
+            vehicle_name(&db, None, "vz_veh_truck_M151", 7),
+            "M151 Softtop (V2)"
+        );
+        // Neither: as it is.
+        assert_eq!(vehicle_name(&db, None, "vz_veh_boat", 3), "vz_veh_boat");
+        // With the strings read, the name the game shows: its template's
+        // `LocalizedName` string.
+        let mut db = db;
+        db.localized.insert(0x8000_0001, 0x1177_c0fc);
+        let mut strings = m2_assets::StringTable::default();
+        strings.strings.insert(0x1177_c0fc, "Jeep".to_owned());
+        assert_eq!(
+            vehicle_name(&db, Some(&strings), "vz_veh_truck_M151", 7),
+            "Jeep"
+        );
+        // A key the strings lack: the template's name.
+        strings.strings.clear();
+        assert_eq!(
+            vehicle_name(&db, Some(&strings), "vz_veh_truck_M151", 7),
+            "M151 Softtop (V2)"
+        );
+    }
 }

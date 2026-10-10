@@ -14,9 +14,10 @@
 //! Target, Priority, Force, Callback, CallbackData }`.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+use m2_math::glam::Vec3;
 use mlua::{Function, Lua, MultiValue, Table, Value};
 
 use crate::events::World;
@@ -29,6 +30,49 @@ pub const FIRST_SPAWNED: u32 = 0x4000_0000;
 pub const PILOT: &str = "Pilot";
 /// Guids of object templates start here.
 pub const FIRST_TEMPLATE: u32 = 0x3000_0000;
+/// How far off an object can be seen on screen, metres (inferred: about
+/// as far as the game draws the scripts' vehicles; the engine's own draw
+/// distance isn't read).
+pub const VISIBLE_RANGE: f32 = 400.0;
+/// The scripts put objects they don't want seen far under the island
+/// (about 40 km down): those below this height are hidden.
+const HIDDEN_BELOW: f32 = -1000.0;
+/// An awake object goes to sleep this far beyond its hibernation distance
+/// (metres), so one at the edge doesn't wake and sleep by turns
+/// (inferred).
+const HIBERNATION_MARGIN: f32 = 10.0;
+
+/// Where the player's camera looks from and how wide it sees: the game
+/// feeds it each tick, for `Event.ObjectIsVisible`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Camera {
+    pub eye: [f32; 3],
+    /// The way it looks.
+    pub forward: [f32; 3],
+    /// The field of view from bottom to top, radians.
+    pub fov_y: f32,
+    /// The screen's width over its height.
+    pub aspect: f32,
+    /// How far off anything is drawn, metres ([`VISIBLE_RANGE`]).
+    pub range: f32,
+}
+
+impl Camera {
+    /// Whether `point` is on screen: in front of the camera, within its
+    /// field of view's four sides and its range (`+y` up).
+    pub fn sees(&self, point: [f32; 3]) -> bool {
+        let forward = Vec3::from(self.forward).normalize_or_zero();
+        let d = Vec3::from(point) - Vec3::from(self.eye);
+        let depth = d.dot(forward);
+        if forward == Vec3::ZERO || depth <= 0.0 || d.length() > self.range {
+            return false;
+        }
+        let right = forward.cross(Vec3::Y).normalize_or(Vec3::X);
+        let up = right.cross(forward);
+        let tall = (self.fov_y * 0.5).tan();
+        d.dot(up).abs() <= depth * tall && d.dot(right).abs() <= depth * tall * self.aspect
+    }
+}
 
 /// One object the scripts can see.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -49,8 +93,12 @@ pub struct Object {
     /// climbing in itself: seat events tell the two apart.
     pub seated_instantly: bool,
     pub player_controlled: bool,
-    /// Simulated near the player rather than hibernating.
+    /// Simulated near the player rather than hibernating
+    /// ([`ScriptWorld::update_hibernation`]).
     pub awake: bool,
+    /// Hidden by the scripts (`Object.SetVisible(o, false)`): not on
+    /// screen.
+    pub hidden: bool,
     /// Fuel for the player's support (`Player.GetFuel`), in the units of
     /// `Player.GetFuelCapacity`.
     pub fuel: f32,
@@ -127,8 +175,13 @@ pub enum Command {
         goal: String,
         location: Option<[f32; 3]>,
         target: Option<u32>,
+        /// Its `Haste`, if given (PmcCon001's garage smash gives 1).
+        haste: Option<f32>,
     },
     ExitVehicle(u32),
+    /// Open a gate or door (`Object.OpenGate`): PmcCon001's villa doors
+    /// as the player comes near them.
+    OpenGate(u32),
     /// Seat a character in a vehicle (seat as the scripts name it, `"d"`
     /// for the driver); `instant` skips the climb-in.
     EnterVehicle {
@@ -308,6 +361,10 @@ pub struct ScriptWorld {
     /// `Debug.Printf` output, oldest first.
     pub printed: Vec<String>,
     next_spawn: u32,
+    /// Spawned since hibernation was last updated: they start in play, so
+    /// the scripts' next look finds them awake wherever they are
+    /// ([`Self::update_hibernation`]).
+    fresh: Vec<u32>,
     /// What `Sys.GetAssetRequestMax` answers; scripts raise it while
     /// layers load and put it back.
     pub asset_request_max: u32,
@@ -384,6 +441,12 @@ pub struct ScriptWorld {
     /// disguises on: how much is left (0..=100) and whether it holds.
     /// `None` out of one.
     pub disguise: Option<(f32, bool)>,
+    /// The player's camera as the game last fed it; `None` until it has.
+    pub camera: Option<Camera>,
+    /// Objects the game found behind something solid from the camera at
+    /// its last look (it looks at those `ObjectIsVisible` events wait
+    /// for: [`crate::mission::Mission::sight_watched`]).
+    pub unseen: HashSet<u32>,
 }
 
 impl ScriptWorld {
@@ -444,6 +507,7 @@ impl ScriptWorld {
             object.label_hashes.clone_from(l);
         }
         self.insert(guid, object);
+        self.fresh.push(guid);
         self.commands.push(Command::Spawn {
             guid,
             what,
@@ -556,6 +620,51 @@ impl ScriptWorld {
         self.next_spawn += 1;
         FIRST_SPAWNED + self.next_spawn
     }
+
+    /// Wakes the objects the player has come within their hibernation
+    /// distance of ([`HIBERNATION_DISTANCE`], every object's until the
+    /// templates' own are read) and puts to sleep those she has left
+    /// [`HIBERNATION_MARGIN`] beyond it: what `Object.IsAwake` and
+    /// `Event.ObjectHibernation` read. The engine hibernates what is far
+    /// from the player (inferred from the scripts: PmcCon001's gate
+    /// opener waits for the villa's front door to sleep, then to wake as
+    /// she comes back). She, what she rides, templates and carried
+    /// weapons keep theirs. Objects of layers not loaded aren't in play
+    /// at all, and never awake.
+    ///
+    /// What the scripts spawned since the last update is left awake this
+    /// once: a spawn starts in play, and the supply drops wait for their
+    /// helicopter to be awake (`Event.ObjectHibernation`) before they hang
+    /// its cargo and send it off. The helicopters start at the contract's
+    /// spawn points, which can lie beyond the hibernation distance
+    /// (VzaCon001's weapon drop: about 190 m from where she lands, 172 m
+    /// from the drop zone); in the real game's recording that helicopter
+    /// comes 4 s after the objective is shown, so it isn't waiting for her
+    /// to come near (inferred from the scripts and the footage).
+    pub fn update_hibernation(&mut self) {
+        let fresh = std::mem::take(&mut self.fresh);
+        let Some(her) = self.player.and_then(|p| self.objects.get(&p)) else {
+            return;
+        };
+        let (at, riding) = (Vec3::from(her.position), her.vehicle);
+        let wake = HIBERNATION_DISTANCE as f32;
+        for (g, o) in &mut self.objects {
+            if Some(*g) == self.player
+                || Some(*g) == riding
+                || (FIRST_TEMPLATE..FIRST_SPAWNED).contains(g)
+                || self.inventory.carried.contains_key(g)
+                || fresh.contains(g)
+            {
+                continue;
+            }
+            let d = Vec3::from(o.position).distance(at);
+            if o.awake && d > wake + HIBERNATION_MARGIN {
+                o.awake = false;
+            } else if !o.awake && d <= wake {
+                o.awake = true;
+            }
+        }
+    }
 }
 
 impl World for ScriptWorld {
@@ -573,6 +682,20 @@ impl World for ScriptWorld {
     }
     fn is_awake(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.awake)
+    }
+    /// On screen: in play, not hidden (nor put under the island), its
+    /// place (a rider's, its vehicle's) inside the camera's view, and not
+    /// found behind something solid at the game's last look.
+    fn is_visible(&self, guid: u32) -> Option<bool> {
+        let camera = self.camera?;
+        let Some(o) = self.objects.get(&guid) else {
+            return Some(false);
+        };
+        let at = o
+            .vehicle
+            .and_then(|v| self.objects.get(&v))
+            .map_or(o.position, |v| v.position);
+        Some(!o.hidden && at[1] > HIDDEN_BELOW && camera.sees(at) && !self.unseen.contains(&guid))
     }
     fn seated_instantly(&self, guid: u32) -> bool {
         self.objects.get(&guid).is_some_and(|o| o.seated_instantly)
@@ -1064,6 +1187,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             w.objects.remove(&guid);
             w.inventory.drop(guid);
             w.commands.push(Command::Remove(guid));
+        }
+        values([])
+    })?;
+    // (gate): opens a gate or door, by guid (or name); the game swings it
+    // out of the way. PmcCon001's gate opener opens the villa's doors
+    // this way as each wakes.
+    add(&object, "OpenGate", |w, _, a| {
+        let gate = id(a.first()).or_else(|| match a.first() {
+            Some(Value::String(s)) => w.by_name(&s.to_string_lossy()),
+            _ => None,
+        });
+        if let Some(guid) = gate {
+            w.commands.push(Command::OpenGate(guid));
         }
         values([])
     })?;
@@ -1640,6 +1776,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         };
         let target = id(t.raw_get::<Value>("Target").ok().as_ref());
+        let haste = num(t.raw_get::<Value>("Haste").ok().as_ref());
         if let Value::Function(f) = t.raw_get::<Value>("Callback")? {
             let data = t.raw_get::<Option<Table>>("CallbackData")?;
             w.goal_callbacks.push((guid, f, data));
@@ -1649,6 +1786,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             goal,
             location,
             target,
+            haste,
         });
         values([])
     })?;
@@ -1668,6 +1806,7 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             goal: "Deliver".into(),
             location,
             target: None,
+            haste: None,
         });
         values([])
     })?;
@@ -1899,6 +2038,26 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => None,
         };
         let hush = w.vo.cancel(speaker, cue.as_deref());
+        // As called, and what it stopped: a nil speaker (or one that is no
+        // guid) is taken for the radio, which is ours to decide.
+        let raw = |v: Option<&Value>| match v {
+            None | Some(Value::Nil) => "nil".to_owned(),
+            Some(Value::String(s)) => format!("{:?}", s.to_string_lossy()),
+            Some(Value::Integer(i)) => i.to_string(),
+            Some(v) => v.type_name().to_owned(),
+        };
+        let ids: Vec<u32> = hush
+            .iter()
+            .filter_map(|c| match c {
+                Command::Hush(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        w.printed.push(format!(
+            "VO.Cancel({}, {}): speaker {speaker:?}, stops lines {ids:?}",
+            raw(a.first()),
+            raw(a.get(1))
+        ));
         w.commands.extend(hush);
         values([])
     })?;
@@ -2226,6 +2385,105 @@ mod tests {
     }
 
     #[test]
+    fn the_camera_sees_what_is_in_front_within_its_view_and_range() {
+        // Looking down +z, 60 degrees tall, twice as wide.
+        let camera = Camera {
+            eye: [0.0, 2.0, 0.0],
+            forward: [0.0, 0.0, 1.0],
+            fov_y: 60f32.to_radians(),
+            aspect: 2.0,
+            range: VISIBLE_RANGE,
+        };
+        assert!(camera.sees([0.0, 2.0, 50.0]));
+        // Behind, beyond the range, above the top edge (tan 30 = 0.58).
+        assert!(!camera.sees([0.0, 2.0, -50.0]));
+        assert!(!camera.sees([0.0, 2.0, VISIBLE_RANGE + 1.0]));
+        assert!(!camera.sees([0.0, 2.0 + 35.0, 50.0]));
+        // Off to the side: within the wider sides (2 x 0.58), not past.
+        assert!(camera.sees([50.0, 2.0, 50.0]));
+        assert!(!camera.sees([-60.0, 2.0, 50.0]));
+    }
+
+    #[test]
+    fn objects_are_visible_on_screen_unless_hidden_or_behind_something() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        // No camera fed yet: unknown.
+        assert_eq!(w.is_visible(50), None);
+        w.camera = Some(Camera {
+            eye: [0.0, 2.0, -20.0],
+            forward: [0.0, 0.0, 1.0],
+            fov_y: 1.0,
+            aspect: 16.0 / 9.0,
+            range: VISIBLE_RANGE,
+        });
+        assert_eq!(w.is_visible(50), Some(true));
+        assert_eq!(w.is_visible(999), Some(false));
+        w.unseen.insert(50);
+        assert_eq!(w.is_visible(50), Some(false));
+        w.unseen.clear();
+        // Hidden (`Object.SetVisible`), or put under the island.
+        w.objects.get_mut(&50).unwrap().hidden = true;
+        assert_eq!(w.is_visible(50), Some(false));
+        w.objects.get_mut(&50).unwrap().hidden = false;
+        w.objects.get_mut(&50).unwrap().position[1] = -40_000.0;
+        assert_eq!(w.is_visible(50), Some(false));
+    }
+
+    #[test]
+    fn objects_far_from_the_player_hibernate_and_wake_as_she_nears() {
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        w.update_hibernation();
+        assert!(w.is_awake(50));
+        let far = HIBERNATION_DISTANCE as f32 + 5.0;
+        // Just past the distance: still awake (the margin), then asleep.
+        w.objects.get_mut(&1).unwrap().position = [far, 0.0, 0.0];
+        w.update_hibernation();
+        assert!(w.is_awake(50));
+        w.objects.get_mut(&1).unwrap().position = [far + HIBERNATION_MARGIN, 0.0, 0.0];
+        w.update_hibernation();
+        assert!(!w.is_awake(50));
+        // She keeps hers.
+        assert!(w.is_awake(1));
+        w.objects.get_mut(&1).unwrap().position = [far - 10.0, 0.0, 0.0];
+        w.update_hibernation();
+        assert!(w.is_awake(50));
+    }
+
+    #[test]
+    fn a_spawn_far_off_is_awake_when_the_scripts_next_look() {
+        // VzaCon001's weapon drop: the helicopter starts about 190 m from
+        // her, and the drop waits for it to be awake before sending it.
+        let (_host, world) = setup();
+        let mut w = world.borrow_mut();
+        w.objects.get_mut(&1).unwrap().position = [0.0; 3];
+        let far = [0.0, 80.0, 175.0];
+        let copter = w.spawn("Alouette3 Transport (VZA Intro) (Driver)".into(), far, 0.0);
+        w.update_hibernation();
+        assert!(w.is_awake(copter));
+        // After that look it sleeps as anything that far off does.
+        w.update_hibernation();
+        assert!(!w.is_awake(copter));
+    }
+
+    #[test]
+    fn open_gate_asks_the_game_to_open_it() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                "Object.OpenGate(Pg.GetGuidByName('_global_veh_jeep 0x0001'))\n\
+                 Object.OpenGate('_global_veh_jeep 0x0001')",
+            )
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::OpenGate(50), Command::OpenGate(50)]
+        );
+    }
+
+    #[test]
     fn scripts_read_and_change_the_world() {
         let (host, world) = setup();
         let (x, name, alive): (f64, String, bool) = host
@@ -2510,7 +2768,8 @@ mod tests {
                 guid: g,
                 goal: "MoveTo".into(),
                 location: Some([4.0, 5.0, 6.0]),
-                target: None
+                target: None,
+                haste: None
             }
         );
         assert!(goal_finished(&world, g).is_empty());

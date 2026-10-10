@@ -162,10 +162,14 @@ pub struct ToneMap {
     /// rather than, as the game's post shaders appear to, the plain mean
     /// of the luminance of display values raised to 0.4.
     pub log_average: bool,
-    /// What the plain mean is raised to before it is adapted to: 1 takes
-    /// it as it is, 2.5 undoes the 0.4 each pixel was raised to; 0
-    /// averages each pixel's luminance as the game's HDR codec packs it
-    /// (0.375 of it up to 1) and adapts to that packed mean.
+    /// How the frame is averaged. Negative: as the game's luminance
+    /// shaders do (from its shaders: each pixel's Rec. 601 luminance `l`
+    /// of display values kept as `ln(l + 0.001)` and `l^2.5`, both
+    /// averaged, and `0.9 exp(mean ln) + 0.1 mean(l^2.5)^0.4` adapted to).
+    /// Otherwise what the plain mean of luminance^0.4 is raised to before
+    /// it is adapted to: 1 takes it as it is (the earlier default, about
+    /// twice the game's average by day), 2.5 undoes the 0.4; 0 averages
+    /// each pixel's luminance as the game's HDR codec packs it.
     pub average_power: f32,
 }
 

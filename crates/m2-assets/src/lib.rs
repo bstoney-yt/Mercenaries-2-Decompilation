@@ -12,6 +12,8 @@
 //! - [`texture`]: texture assets: header, mip chain (including mips streamed
 //!   from other blocks) and conversion to RGBA8.
 //! - [`dxt`]: DXT1, DXT3 and DXT5 decoding.
+//! - [`effect`]: particle effects (explosions, fire, smoke): emitters,
+//!   their particles' settings, colour over life and textures.
 //! - [`font`]: the bitmap fonts the game's own GUI widgets draw text with.
 //! - [`gfx`]: Scaleform GFx (Flash) movies the interface is built from:
 //!   header, tags, and the layout and names they describe.
@@ -56,6 +58,7 @@ pub mod animation_table;
 pub mod block;
 mod bytes;
 pub mod dxt;
+pub mod effect;
 pub mod flash;
 pub mod font;
 pub mod gfx;
