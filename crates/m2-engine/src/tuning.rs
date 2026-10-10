@@ -277,6 +277,13 @@ impl<'a> Table<'a> {
         self.records.keys().copied()
     }
 
+    /// The fields' name hashes, in order.
+    pub(crate) fn fields(&self) -> Vec<u32> {
+        let mut f: Vec<u32> = self.fields.keys().copied().collect();
+        f.sort_unstable();
+        f
+    }
+
     /// Template `id`'s records (a component may be on it more than once).
     pub(crate) fn of_template(&self, id: u32) -> &[&'a [u8]] {
         self.records.get(&id).map_or(&[], Vec::as_slice)
@@ -347,6 +354,21 @@ pub fn human_speeds(db: &Layer<'_>) -> HashMap<u32, [f32; 3]> {
             out.iter()
                 .all(|v| v.is_normal() && *v > 0.0)
                 .then_some((id, out))
+        })
+        .collect()
+}
+
+/// Every person template's `HumanAnimationSet`: its `Gender` and
+/// `CharacterName` (name hashes: Mattias's `Hero` and `mattias`), which
+/// pick the character's rows of the on-foot animation table
+/// ([`m2_assets::animation_table::character_clip`]), by id.
+pub fn human_animation_sets(db: &Layer<'_>) -> HashMap<u32, (u32, u32)> {
+    let sets = Table::new(db, "HumanAnimationSet");
+    let (gender, name) = (name_hash("Gender"), name_hash("CharacterName"));
+    sets.templates()
+        .filter_map(|t| {
+            let r = sets.of_template(t).first()?;
+            Some((t, (sets.word(r, gender)?, sets.word(r, name)?)))
         })
         .collect()
 }
@@ -669,6 +691,11 @@ mod tests {
             // its blade and blur nodes are `vehicle::MAIN_ROTOR`'s.
             ("RotorHubBoneName", 0xc93e_7607),
             ("SpinDir", 0xc9d2_9446),
+            // `HumanAnimationSet`'s values for the heroes (heroes round
+            // 02): `Gender` `Hero`, `CharacterName` `mattias`, `Chris`.
+            ("Hero", 0x5172_8909),
+            ("mattias", 0x030e_6c38),
+            ("Chris", 0xd64b_b122),
         ] {
             assert_eq!(name_hash(name), key, "{name}");
         }

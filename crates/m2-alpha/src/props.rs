@@ -5,7 +5,8 @@
 //! when the model has one, else gone, and no longer in the way; one that
 //! breaks apart ([`Breakup`], a gate) throws its pieces, which lie where
 //! they land. Those whose model comes loose ([`Loose`]) are knocked loose
-//! by vehicles and blasts, as the island's are.
+//! by vehicles and blasts, and vehicles break them as their template says
+//! ([`crate::destruct`]), as the island's are.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -33,6 +34,14 @@ pub struct Prop {
     pub rotation: Quat,
     /// Broken: drawn as its wreck, and nothing to bump into.
     pub wrecked: bool,
+    /// The template its entity is an instance of (0 for none): vehicles
+    /// break it as its `PhysicsPropertyCrashable` says, as they do the
+    /// island's objects of it ([`crate::destruct`]).
+    pub template: u32,
+    /// Placed by its entity's name rather than a `ModelName`: on the
+    /// island one whose model has no collision of its own is in nobody's
+    /// way; here it is only logged ([`through_on_island`]).
+    pub named: bool,
 }
 
 /// A model's GPU copy and collision, once loaded, and how it breaks
@@ -92,6 +101,9 @@ pub struct Props {
     pub skip: Option<u32>,
     /// The layer that put each up, by entity (the gate test's lists).
     layers: HashMap<u32, Arc<str>>,
+    /// How far any loaded model reaches from its origin, metres (its
+    /// box's middle, and half its size beyond).
+    widest: f32,
 }
 
 /// What [`Props::draw`] draws of a model broken apart.
@@ -104,6 +116,17 @@ pub enum Parts {
     Rest,
     /// Its pieces alone.
     Pieces,
+}
+
+/// What brings a prop down ([`Props::wreck`], [`Props::wreck_crashed`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hit {
+    /// A blast, where it went off if known: what breaks apart is thrown
+    /// from there, this many times as fast as [`THROW_SPEED`] has it.
+    Blast(Option<Vec3>, f32),
+    /// A vehicle running into it: what breaks apart goes on at this
+    /// velocity (m/s), turning at this spin (radians a second).
+    Crash(Vec3, Vec3),
 }
 
 /// How the props stand ([`Props::counts`]): how many are shown, and of
@@ -204,6 +227,8 @@ impl Props {
                     rotation: o.rotation,
                     // A ruin stands as its model's wreck from the start.
                     wrecked: index.ruined.contains(&e),
+                    template: o.template,
+                    named: o.named,
                 },
             );
             added += 1;
@@ -239,6 +264,8 @@ impl Props {
                 position: o.position,
                 rotation: o.rotation,
                 wrecked: false,
+                template: o.template,
+                named: o.named,
             },
         );
         self.changes += 1;
@@ -350,6 +377,34 @@ impl Props {
         std::mem::take(&mut self.fresh_knocks)
     }
 
+    /// Those standing whole with their models loaded that a vehicle may
+    /// break, with any of their model within `reach` metres of `at` (as
+    /// far as its box's middle less half its size): not the
+    /// [`sturdy`](Self::sturdy) (a mission's gates fall to its scripts),
+    /// nor the island's objects put up to come down.
+    pub fn standing_near(&self, at: Vec3, reach: f32) -> Vec<u32> {
+        // Asked every tick for every vehicle going: those too far for any
+        // model to reach are passed over first, cheaply.
+        let far = reach + self.widest;
+        self.shown
+            .iter()
+            .filter(|&(_, p)| !p.wrecked && p.position.distance_squared(at) <= far * far)
+            .filter_map(|(&e, p)| {
+                let m = self.models.get(&p.model)?.as_ref()?;
+                let (lo, hi) = m.gpu.bounds;
+                let centre = p.position + p.rotation * ((lo + hi) * 0.5);
+                let d = centre.distance(at) - (hi - lo).length() * 0.5;
+                (d <= reach).then_some(e)
+            })
+            .filter(|e| {
+                !crate::destruct::adopted(*e)
+                    && !self.sturdy.contains(e)
+                    && !self.knocked.contains_key(e)
+                    && !self.broken.contains_key(e)
+            })
+            .collect()
+    }
+
     /// Those standing that come loose with any of their model within
     /// `reach` metres of `at` (as far as its box's middle less half its
     /// size), with how far; the [`sturdy`](Self::sturdy) too with
@@ -397,6 +452,30 @@ impl Props {
         blast: Option<Vec3>,
         scale: f32,
     ) -> bool {
+        self.wreck_by(physics, entity, Hit::Blast(blast, scale))
+    }
+
+    /// [`wreck`](Self::wreck) by a vehicle running into it: nothing
+    /// sinks, and what breaks apart is knocked on as the vehicle knocks
+    /// loose what it hits, not thrown as from a blast. `push` gives the
+    /// pieces' velocity (m/s) and spin (radians a second) for the mass
+    /// (kg) they make up together.
+    pub fn wreck_crashed(
+        &mut self,
+        physics: &mut Physics,
+        entity: u32,
+        push: impl FnOnce(f32) -> (Vec3, Vec3),
+    ) -> bool {
+        let mass = self
+            .shown
+            .get(&entity)
+            .and_then(|p| self.models.get(&p.model)?.as_ref()?.breakup.as_deref())
+            .map_or(0.0, |b| b.pieces.mass);
+        let (velocity, spin) = push(mass);
+        self.wreck_by(physics, entity, Hit::Crash(velocity, spin))
+    }
+
+    fn wreck_by(&mut self, physics: &mut Physics, entity: u32, hit: Hit) -> bool {
         let Some(p) = self.shown.get_mut(&entity).filter(|p| !p.wrecked) else {
             return false;
         };
@@ -405,29 +484,46 @@ impl Props {
         if let Some(m) = model.filter(|m| m.gpu.has_wreck()) {
             p.wrecked = true;
             let placed = Mat4::from_rotation_translation(p.rotation, p.position);
-            let sinking = match blast {
-                Some(from) if m.gpu.sinks() => Sinking::from(entity, placed, m.gpu.bounds, from),
+            let sinking = match hit {
+                Hit::Blast(Some(from), _) if m.gpu.sinks() => {
+                    Sinking::from(entity, placed, m.gpu.bounds, from)
+                }
                 _ => Sinking::under(),
             };
             self.sinking.insert(entity, sinking);
             if let Some(breakup) = m.breakup.as_deref()
                 && !self.knocked.contains_key(&entity)
             {
-                let pieces = throw(physics, breakup, placed, blast, scale);
+                let pieces = match hit {
+                    Hit::Blast(blast, scale) => throw(physics, breakup, placed, blast, scale),
+                    Hit::Crash(velocity, spin) => {
+                        Some(knock_on(physics, breakup, placed, velocity, spin))
+                    }
+                };
                 if let Some(pieces) = pieces {
-                    eprintln!(
-                        "props: {entity:#x} ({:08x}) breaks apart into {} pieces, away from \
-                         {:.1}, burning at {} points, intact walls {}",
-                        p.model,
-                        pieces.len(),
-                        blast.unwrap_or_default(),
-                        breakup.points.len(),
-                        if sinking.done(m.gpu.bounds) {
-                            "gone at once (no collapse animation)".to_owned()
-                        } else {
-                            format!("sinking {:.1} deg over", sinking.lean.to_degrees())
-                        }
-                    );
+                    match hit {
+                        Hit::Blast(blast, _) => eprintln!(
+                            "props: {entity:#x} ({:08x}) breaks apart into {} pieces, away from \
+                             {:.1}, burning at {} points, intact walls {}",
+                            p.model,
+                            pieces.len(),
+                            blast.unwrap_or_default(),
+                            breakup.points.len(),
+                            if sinking.done(m.gpu.bounds) {
+                                "gone at once (no collapse animation)".to_owned()
+                            } else {
+                                format!("sinking {:.1} deg over", sinking.lean.to_degrees())
+                            }
+                        ),
+                        Hit::Crash(velocity, _) => eprintln!(
+                            "props: {entity:#x} ({:08x}) breaks apart into {} pieces ({:.0} kg) \
+                             under a vehicle, knocked on at {:.1} m/s",
+                            p.model,
+                            pieces.len(),
+                            breakup.pieces.mass,
+                            velocity.length()
+                        ),
+                    }
                     self.broken.insert(entity, pieces);
                 }
             }
@@ -488,6 +584,7 @@ impl Props {
         if let Some(Some(m)) = self.models.get(&p.model)
             && let Some(shape) = &m.collision
             && !p.wrecked
+            && stands(entity)
         {
             physics.add_static(StaticKey::Entity(entity), shape, p.position, p.rotation);
         }
@@ -935,11 +1032,32 @@ impl Props {
         };
         materials.load_model_textures(backend, source, &cpu)?;
         let gpu = GpuModel::upload(backend, materials, &cpu)?;
+        let (lo, hi) = gpu.bounds;
+        let reach = ((lo + hi) * 0.5).length() + (hi - lo).length() * 0.5;
+        if reach.is_finite() {
+            self.widest = self.widest.max(reach);
+        }
         if let Some(shape) = &cpu.collision {
+            let mut through = Vec::new();
             for (&e, p) in self.shown.iter().filter(|(_, p)| p.model == hash) {
+                if !stands(e) {
+                    continue;
+                }
+                if through_on_island(p, shape) {
+                    through.push(format!("{e:#x} (template {:08x})", p.template));
+                }
                 if !p.wrecked && !self.knocked.contains_key(&e) {
                     physics.add_static(StaticKey::Entity(e), shape, p.position, p.rotation);
                 }
+            }
+            if !through.is_empty() {
+                through.sort_unstable();
+                eprintln!(
+                    "props: {hash:08x} has no collision of its own (no PHY2): {} placed by name \
+                     kept in the way, though the island's are in nobody's way: {}",
+                    through.len(),
+                    through.join(", ")
+                );
             }
         }
         if !members.is_empty() {
@@ -1059,6 +1177,24 @@ impl Props {
             m.gpu.draw_sinking(queue, placed, s.place(m.gpu.bounds));
         }
     }
+}
+
+/// Whether prop `entity`'s model's collision stands in the way while it
+/// stands: not for one of the island's objects put up only to come down
+/// ([`crate::destruct::adopted`]), whose collision is already gone.
+fn stands(entity: u32) -> bool {
+    !crate::destruct::adopted(entity)
+}
+
+/// Whether prop `p`'s collision, `shape`, is a stand-in cut from its
+/// model's drawn triangles for one placed by name (its model has no
+/// `PHY2`): the island's such are in nobody's way ([`m2_engine::World`]
+/// puts none up for them). A state layer's are kept in the way and only
+/// logged until a census of the models without `PHY2` shows the island's
+/// rule holds for them too: an outpost's sandbags and walls, or a
+/// mission's gate, may be among them.
+fn through_on_island(p: &Prop, shape: &CollisionShape) -> bool {
+    p.named && shape.stand_in
 }
 
 /// How a building's intact walls go down as it collapses, as its
@@ -1224,6 +1360,29 @@ fn throw(
         })
         .collect();
     Some(pieces)
+}
+
+/// Sends `breakup`'s pieces, the model placed at `placed`, on at
+/// `velocity` (m/s) turning at `spin` (radians a second), as a vehicle
+/// sends on what it knocks loose: no blast throws them. Each is lifted out
+/// of the ground it starts in, as [`throw`] lifts them.
+fn knock_on(
+    physics: &mut Physics,
+    breakup: &Breakup,
+    placed: Mat4,
+    velocity: Vec3,
+    spin: Vec3,
+) -> Vec<DebrisId> {
+    let loose = &breakup.pieces;
+    loose
+        .pieces
+        .iter()
+        .zip(loose.starts(placed))
+        .map(|(piece, at)| {
+            let lift = Mat4::from_translation(Vec3::Y * buried(physics, &corners(at, piece)));
+            physics.add_rubble(piece, lift * at, velocity, spin)
+        })
+        .collect()
 }
 
 /// The corners of `piece`'s box, its node placed at `at`.
@@ -1423,6 +1582,27 @@ mod tests {
         assert!((s.depth(bounds) - 9.1).abs() < 1e-4);
         // One found broken is under already.
         assert!(Sinking::under().done(bounds));
+    }
+
+    #[test]
+    fn a_prop_without_collision_of_its_own_stays_in_the_way_but_is_noted() {
+        let mut shape = CollisionShape::cuboid(Vec3::ONE);
+        let p = Prop {
+            model: 1,
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            wrecked: false,
+            template: 0,
+            named: true,
+        };
+        assert!(stands(5) && !through_on_island(&p, &shape));
+        // Cut from its drawn triangles: the island puts none up for one
+        // placed by name; a state layer's stays in the way, only noted.
+        shape.stand_in = true;
+        assert!(stands(5) && through_on_island(&p, &shape));
+        assert!(!through_on_island(&Prop { named: false, ..p }, &shape));
+        // One of the island's put up to come down has lost its collision.
+        assert!(!stands(crate::destruct::key(3)));
     }
 
     #[test]

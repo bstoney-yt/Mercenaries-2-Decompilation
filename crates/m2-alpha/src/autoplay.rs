@@ -9,7 +9,7 @@
 //! the later objectives, and the hops show where the way is blocked.
 
 use m2_engine::physics::FLOAT_DEPTH;
-use m2_engine::{Physics, VehicleControls, VehicleId, VehicleSpec};
+use m2_engine::{Physics, Templates, VehicleControls, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 
 use crate::combat::{Combat, Trigger, Weapon};
@@ -144,11 +144,15 @@ const OVER_WATER: f32 = 30.0;
 /// most every this long (seconds).
 const ROUNDABOUT: f32 = 1.15;
 const LOG_WAY: f32 = 30.0;
-/// A supply crate down within this far (metres) is opened on the way,
+/// A supply crate down within this far (metres) is opened before going on,
 /// standing this far from its side (with a bash's 1.8 m reach), turned to
 /// it within this much (radians); one not open after this many seconds is
-/// left.
-const OPEN_NEAR: f32 = 40.0;
+/// left. The crates are the deliveries' and land where the scripts call
+/// her: in the real game's first contract she smashes the weapon crate
+/// (1:18) before the beach guards (1:26); here the guards can draw her
+/// 100 m up the beach before it lands (from the recordings; she still
+/// fights back first when they're within [`DEFEND`]).
+const OPEN_NEAR: f32 = 250.0;
 const OPEN_FROM: f32 = 0.9;
 const OPEN_FACING: f32 = 0.2;
 const OPEN_FOR: f32 = 45.0;
@@ -456,13 +460,21 @@ impl Autoplay {
             ));
         }
         // What a crate she broke open left for her: taken before going on.
+        let none = Templates::default();
+        let templates = game
+            .scene
+            .world
+            .as_ref()
+            .map_or(&none, |w| &w.index.template_db);
         if driving.is_none()
             && let Some((from, d)) = game
                 .scene
                 .flights
                 .pickups()
                 .iter()
-                .filter(|p| wanted(&game.combat, p) && !self.left_lying.contains(&p.key()))
+                .filter(|p| {
+                    wanted(templates, &game.combat, p) && !self.left_lying.contains(&p.key())
+                })
                 .map(|p| (p.key(), p.at.distance(here)))
                 .filter(|&(_, d)| d < OPEN_NEAR)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -755,8 +767,10 @@ impl Autoplay {
             if press {
                 self.pressed = 0.0;
             }
+            // A rifle lying there is walked over for its rounds, not taken
+            // up in place of hers ([`wanted`]).
             return Intent {
-                use_pressed: press,
+                use_pressed: press && p.what.weapon != Some(Weapon::Rifle),
                 ..Intent::default()
             };
         }
@@ -1636,14 +1650,19 @@ impl Autoplay {
 }
 
 /// Whether she wants what lies at `p`: a weapon she doesn't carry (one
-/// she left herself only once what took its place is spent), or rounds
-/// for one she does.
-fn wanted(combat: &Combat, p: &crate::flights::Pickup) -> bool {
-    match (p.what.weapon, p.what.gives) {
-        (Some(w), _) if p.from == 0 => combat.second != Some(w) && !combat.second_loaded(),
-        (Some(w), _) => combat.second != Some(w),
-        (None, Some((w, _))) => w == Weapon::Rifle || combat.second == Some(w),
-        (None, None) => false,
+/// she left herself only once what took its place is spent), or
+/// ammunition or health she would take walking over it (its template's
+/// `Pickup` records for the weapons she carries, with room for them). A
+/// rifle lying there (a dead soldier's `Assault Rifle`) she wants only for
+/// the rounds she would take walking over it: she keeps her own.
+fn wanted(templates: &Templates, combat: &Combat, p: &crate::flights::Pickup) -> bool {
+    match p.what.weapon {
+        Some(w) if p.from == 0 => combat.second != Some(w) && !combat.second_loaded(),
+        Some(w) if w != Weapon::Rifle => combat.second != Some(w),
+        _ => {
+            let refill = crate::mission::refill(templates, combat, &p.what);
+            combat.can_use(refill, p.what.health)
+        }
     }
 }
 
@@ -1962,6 +1981,72 @@ pub(crate) fn stuck_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A box of the carbine's rounds is wanted while it has room for them,
+    // as walking over it takes it.
+    #[test]
+    fn rifle_ammunition_is_wanted_while_there_is_room() {
+        use crate::flights::{Leaves, Pickup};
+        use m2_engine::TemplateInfo;
+        use m2_engine::pickup::{Leavings, PickupInfo};
+        use std::collections::HashMap;
+        let (gun, round, small) = (0x8000_0010, 0x8000_0011, 0x8000_0012);
+        let templates = Templates {
+            by_name: HashMap::from([(
+                "carbine".to_owned(),
+                TemplateInfo {
+                    model: Some(0xabc),
+                    vehicle: None,
+                    engine: None,
+                    person: false,
+                    human: false,
+                },
+            )]),
+            names: HashMap::from([
+                (gun, "Carbine".to_owned()),
+                (round, "Carbine Round".to_owned()),
+                (small, "Ammo Pickup (Small)".to_owned()),
+            ]),
+            leavings: Leavings {
+                pickups: HashMap::from([(
+                    small,
+                    PickupInfo {
+                        kind: 1,
+                        radius: 1.0,
+                        ammo: Some(round),
+                        rounds: 3,
+                        gives: vec![(round, 3)],
+                        walked: vec![(round, 3)],
+                        heals: 0,
+                        cue: None,
+                        effect: None,
+                    },
+                )]),
+                // The carbine fires the round, by its model.
+                ammo: HashMap::from([(gun, round)]),
+                ..Leavings::default()
+            },
+            ..Templates::default()
+        };
+        let mut combat = Combat::default();
+        combat.carbine.template = Some(gun);
+        combat.carbine_only();
+        let p = Pickup {
+            from: 0x4000_0001,
+            what: Leaves {
+                template: small,
+                ..Leaves::default()
+            },
+            at: Vec3::ZERO,
+            yaw: 0.0,
+        };
+        assert!(combat.rifle_rounds.stored < combat.rifle.spare);
+        assert!(wanted(&templates, &combat, &p));
+        combat.rifle_rounds.stored = combat.rifle.spare;
+        assert!(!wanted(&templates, &combat, &p));
+        // Nothing of hers takes it: not wanted.
+        assert!(!wanted(&Templates::default(), &Combat::default(), &p));
+    }
 
     #[test]
     fn a_target_behind_a_wall_is_seen_from_round_it() {

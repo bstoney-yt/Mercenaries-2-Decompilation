@@ -118,14 +118,12 @@ pub struct Leaves {
     /// The gun template it is, if the templates name one with its model:
     /// that gun is what she takes up (`weapon` its place).
     pub gun: Option<u32>,
-    /// The rounds it gives, and for which of her weapons (those of a
-    /// weapon she doesn't carry give her nothing).
+    /// The rounds a weapon comes with, and its place. What ammunition
+    /// gives is worked out when she comes to it, from its template's
+    /// `Pickup` records and the weapons she carries then
+    /// ([`crate::mission::refill`]).
     pub gives: Option<(Weapon, u32)>,
-    /// Grenade launcher rounds an ammunition pickup gives besides (`Ammo
-    /// Pickup (Rocket)`'s `Grenade Launcher Projectile` record), grenades
-    /// (`Grenade Projectile`), and health.
-    pub launcher: u32,
-    pub grenades: u32,
+    /// The health it gives.
     pub health: f32,
 }
 
@@ -1077,7 +1075,6 @@ mod tests {
             model: Some(98),
             reach: 1.0,
             weapon: None,
-            gives: Some((Weapon::Rpg, 20)),
             ..Leaves::default()
         };
         let mut flights = Flights::default();

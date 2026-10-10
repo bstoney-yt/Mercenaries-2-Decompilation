@@ -1,7 +1,7 @@
 //! The player on foot: Jennifer walking the island under the character
 //! controller, with a third-person camera behind her.
 
-use m2_engine::{Character, Gait, GpuModel, Physics, VehicleSpec};
+use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
 
@@ -38,6 +38,13 @@ const TURN_RATE: f32 = 10.0;
 const LOOK_HEIGHT: f32 = 1.6;
 const CAMERA_DISTANCE: f32 = 4.0;
 const CAMERA_MIN: f32 = 0.6;
+/// How far the eye keeps from what is between it and the point it turns
+/// about, metres: a ball this big is swept out from that point, so the
+/// near plane (0.1 m off, its corners about 0.13 m from the eye at the
+/// 60 degree camera) stays out of walls, pillars and doors a slanting ray
+/// passed beside. The game's camera keeps clear of them too (PC footage);
+/// its own margin isn't in the data (inferred).
+const CAMERA_RADIUS: f32 = 0.25;
 /// How far above the ground under it the chase camera keeps.
 const CAMERA_CLEARANCE: f32 = 0.4;
 /// How the chase camera follows a vehicle.
@@ -112,6 +119,13 @@ impl ChaseRig {
 /// collision can arrive a few frames after the ground under it.
 const SETTLED: u8 = 3;
 
+/// Put down at a height ([`Player::drop_at`]), she lands on what is under
+/// a point this far above it, found within this far down: the floor or
+/// ground there rather than a roof or deck over it (inferred, as
+/// [`crate::npc`] lands people at their posts).
+const LAND_ABOVE: f32 = 2.0;
+const LAND_REACH: f32 = 60.0;
+
 /// What the player asks for this tick.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Intent {
@@ -136,17 +150,13 @@ pub struct Intent {
 
 impl Intent {
     pub fn from_input(input: &mut Input, config: &CameraConfig, mouse_look: bool) -> Self {
-        let (dx, dy) = input.take_mouse();
-        let look = if mouse_look {
-            let invert = if config.invert_y { -1.0 } else { 1.0 };
-            // Turning right turns the yaw (from +z towards +x) back.
-            Vec2::new(
-                -dx as f32 * config.mouse_sensitivity,
-                -dy as f32 * config.mouse_sensitivity * invert,
-            )
-        } else {
-            Vec2::ZERO
-        };
+        let (dx, dy) = input.take_look(mouse_look);
+        let invert = if config.invert_y { -1.0 } else { 1.0 };
+        // Turning right turns the yaw (from +z towards +x) back.
+        let look = Vec2::new(
+            -dx as f32 * config.mouse_sensitivity,
+            -dy as f32 * config.mouse_sensitivity * invert,
+        );
         Self {
             movement: Vec2::new(
                 input.axis(Action::MoveLeft, Action::MoveRight),
@@ -225,6 +235,10 @@ pub struct Player {
     aim_lift: f32,
     /// False until there is ground under the spawn point to land on.
     pub landed: bool,
+    /// The spot she was put down at ([`Player::drop_at`]), to land near
+    /// while she is still over it; otherwise (a spawn's x and z alone, or
+    /// moved since) she lands on the top of whatever is under her.
+    land_from: Option<Vec3>,
     /// Set each tick the world around her is still streaming in: she does
     /// not land until it has been quiet for [`SETTLED`] ticks, so that she
     /// lands on the buildings and not inside one that loads a moment later.
@@ -254,6 +268,10 @@ pub struct Player {
     /// Sitting in the seat of the vehicle she drives, posed and placed
     /// there (`hijack::Hijacks::seat`): drawn though driving.
     pub seated: bool,
+    /// Seated: model to world for her body, the vehicle's whole turn
+    /// (pitch and roll as well as heading) with her clip's origin on the
+    /// seat ([`model_matrix`](Self::model_matrix)).
+    pub seat_frame: Option<Mat4>,
 }
 
 impl Player {
@@ -269,6 +287,7 @@ impl Player {
             aim_lift: 0.0,
             look_still: 0.0,
             landed: false,
+            land_from: None,
             streaming: false,
             settled: 0,
             model,
@@ -282,6 +301,7 @@ impl Player {
             launcher: false,
             down: false,
             seated: false,
+            seat_frame: None,
         }
     }
 
@@ -295,6 +315,33 @@ impl Player {
             }
         }
         out
+    }
+
+    /// Takes `model` as her body, with its rig's fight `clips`: a jump,
+    /// throw or bash under way played the old rig's clips by index, so it
+    /// stops.
+    pub fn set_body(&mut self, model: Option<(GpuModel, Rig)>, clips: FightClips) {
+        self.model = model;
+        self.clips = clips;
+        self.leap = Leap::No;
+        self.throwing = None;
+        self.bashing = None;
+    }
+
+    /// Leaves what she does on foot behind for a vehicle's clips (in a
+    /// seat, or hijacking one), which only [`update`](Self::update)
+    /// would otherwise end: the weapon's pose over her upper body (a
+    /// carried rifle's arm, an aim, a throw), her aim's turn, a bash and
+    /// a jump. Back on foot, `update` takes them up again.
+    pub fn off_foot(&mut self) {
+        self.leap = Leap::No;
+        self.throwing = None;
+        self.bashing = None;
+        if let Some((_, rig)) = &mut self.model {
+            rig.animator.set_upper(None);
+            rig.aim = None;
+            rig.two_handed = false;
+        }
     }
 
     /// Starts throwing a grenade, if she has a throw to play and isn't
@@ -341,6 +388,17 @@ impl Player {
         Some(hit)
     }
 
+    /// Puts her at `at` (getting out of a vehicle, moved by the scripts),
+    /// to land on what is under it once the world there has loaded: the
+    /// floor or ground nearest under the spot, not the top of whatever
+    /// stands over it.
+    pub fn drop_at(&mut self, at: Vec3) {
+        self.character.position = at;
+        self.character.velocity = Vec3::ZERO;
+        self.landed = false;
+        self.land_from = Some(at);
+    }
+
     /// One fixed tick of `dt` seconds.
     pub fn update(&mut self, physics: &Physics, intent: Intent, dt: f32) {
         self.yaw += intent.look.x;
@@ -348,19 +406,35 @@ impl Player {
 
         if !self.landed {
             // Wait for the ground and whatever stands on it, then stand on
-            // the top of that.
+            // what is under the spot she was put at, else on the top of
+            // whatever is there.
             self.settled = if self.streaming {
                 0
             } else {
                 self.settled.saturating_add(1)
             };
             let p = self.character.position;
+            let near = |at: Vec3| {
+                let from = at + Vec3::Y * LAND_ABOVE;
+                physics
+                    .cast_ray(from, -Vec3::Y, LAND_REACH)
+                    .map(|(d, _)| from.y - d)
+            };
+            let top = || {
+                physics
+                    .cast_ray(Vec3::new(p.x, 3000.0, p.z), -Vec3::Y, 6000.0)
+                    .map(|(d, _)| 3000.0 - d)
+            };
             if self.settled >= SETTLED
-                && let Some((d, _)) =
-                    physics.cast_ray(Vec3::new(p.x, 3000.0, p.z), -Vec3::Y, 6000.0)
+                && let Some(y) = self
+                    .land_from
+                    .filter(|at| at.x == p.x && at.z == p.z)
+                    .and_then(near)
+                    .or_else(top)
             {
-                self.character.position.y = 3000.0 - d + 0.05;
+                self.character.position.y = y + 0.05;
                 self.landed = true;
+                self.land_from = None;
                 self.settled = 0;
             }
             self.camera(physics);
@@ -571,17 +645,19 @@ impl Player {
         }
     }
 
-    /// Pulls the camera in when something is between it and her, and
-    /// until it is clear of the ground beneath it: a ray from her head
-    /// can graze a slope rising behind her and miss it, which left the eye
-    /// under the bank at sea2, looking up through the ground's back faces.
+    /// Pulls the camera in in front of anything between it and her (a
+    /// ball of [`CAMERA_RADIUS`] swept back from her head, so the view
+    /// doesn't cut into a pillar, a door or a wall at a slant, as a ray
+    /// from her head let it: the owner's second play test), and until it
+    /// is clear of the ground beneath it: a ray from her head can graze a
+    /// slope rising behind her and miss it, which left the eye under the
+    /// bank at sea2, looking up through the ground's back faces.
     fn camera(&mut self, physics: &Physics) {
         let back = -self.camera_forward();
         let head = self.look_at();
-        let mut distance = match physics.cast_ray(head, back, CAMERA_DISTANCE) {
-            Some((d, _)) => (d - 0.2).max(CAMERA_MIN),
-            None => CAMERA_DISTANCE,
-        };
+        let mut distance = physics
+            .cast_sphere(head, back, CAMERA_DISTANCE, CAMERA_RADIUS, None)
+            .map_or(CAMERA_DISTANCE, |d| d.max(CAMERA_MIN));
         // Ground (not a roof or a bridge high over it) from a little above
         // the eye to a little below.
         let below = |eye: Vec3| {
@@ -640,6 +716,20 @@ impl Player {
         self.character.velocity = Vec3::ZERO;
     }
 
+    /// Pulls the chase camera of the vehicle she drives (`vehicle`, which
+    /// it passes through) in in front of what is between it and the point
+    /// it turns about, as on foot ([`CAMERA_RADIUS`]): it went into walls
+    /// and buildings beside the road (the owner's second play test).
+    pub fn keep_chase_clear(&mut self, physics: &Physics, vehicle: Option<VehicleId>) {
+        let Some((at, distance)) = self.chase_target else {
+            return;
+        };
+        let back = -self.camera_forward();
+        if let Some(d) = physics.cast_sphere(at, back, distance, CAMERA_RADIUS, vehicle) {
+            self.chase_target = Some((at, d.max(CAMERA_MIN).min(distance)));
+        }
+    }
+
     pub fn eye(&self) -> Vec3 {
         match self.chase_target {
             Some((at, distance)) => at - self.camera_forward() * distance,
@@ -658,8 +748,15 @@ impl Player {
         )
     }
 
-    /// Model to world for her model, turned so its forward is her facing.
+    /// Model to world for her model, turned so its forward is her facing;
+    /// seated in what she drives, its [`seat_frame`](Self::seat_frame).
     pub fn model_matrix(&self) -> Mat4 {
+        if let Some(seat) = self
+            .seat_frame
+            .filter(|_| self.seated && self.driving.is_some())
+        {
+            return seat;
+        }
         let model_forward = self
             .model
             .as_ref()
@@ -791,6 +888,84 @@ mod tests {
         assert!(eye.x < at.x && eye.y > at.y, "{eye}");
     }
 
+    // A pillar 2 m behind her, its side 0.1 m off the line from her head
+    // back to the eye: a ray passes it by, the camera's ball doesn't, and
+    // the eye stops in front of it, not inside it.
+    #[test]
+    fn the_camera_stops_in_front_of_a_pillar_beside_its_line() {
+        let mut physics = ground();
+        let pillar = CollisionShape::cuboid(Vec3::new(0.3, 3.0, 0.3));
+        // Camera facing +z: the eye 4 m back along -z, the pillar's side
+        // at x = 0.1.
+        physics.add_static(
+            StaticKey::Cell(2),
+            &pillar,
+            Vec3::new(0.4, 13.0, -2.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        let dt = 1.0 / 60.0;
+        for _ in 0..usize::from(SETTLED) + 1 {
+            p.update(&physics, Intent::default(), dt);
+        }
+        assert!(p.landed);
+        p.pitch = 0.0;
+        p.camera(&physics);
+        let head = p.look_at();
+        assert!(
+            physics
+                .cast_ray(head, Vec3::NEG_Z, CAMERA_DISTANCE)
+                .is_none(),
+            "the ray passes beside it"
+        );
+        let eye = p.eye();
+        assert!(eye.z > -1.7, "in front of it: {eye}");
+        assert!(eye.z < -1.0, "pulled in only to the pillar: {eye}");
+    }
+
+    #[test]
+    fn put_down_she_lands_under_the_spot_not_on_the_roof_over_it() {
+        // The ground at 10 m, a roof over it at 20 m.
+        let mut physics = ground();
+        let h = 5.0;
+        let v = [
+            Vec3::new(-h, 0.0, -h),
+            Vec3::new(h, 0.0, -h),
+            Vec3::new(h, 0.0, h),
+            Vec3::new(-h, 0.0, h),
+        ];
+        let roof = CollisionShape::mesh(&v, &[[0, 1, 2], [0, 2, 3]]).unwrap();
+        physics.add_static(
+            StaticKey::Cell(2),
+            &roof,
+            Vec3::new(0.0, 20.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let dt = 1.0 / 60.0;
+        let land = |p: &mut Player| {
+            for _ in 0..usize::from(SETTLED) {
+                p.update(&physics, Intent::default(), dt);
+            }
+            assert!(p.landed);
+            p.character.position.y
+        };
+        // A spawn's x and z alone: the top of what is there.
+        let mut p = Player::new(1.0, 1.0, 0.0, None);
+        assert!((land(&mut p) - 20.0).abs() < 0.2);
+        // Put down at the ground's height: the ground under the roof.
+        p.drop_at(Vec3::new(1.0, 10.5, 1.0));
+        assert!((land(&mut p) - 10.0).abs() < 0.2);
+        // Nothing near under the spot: the top again.
+        p.drop_at(Vec3::new(1.0, 200.0, 1.0));
+        assert!((land(&mut p) - 20.0).abs() < 0.2);
+        // Moved since she was put down: where she is now decides.
+        p.drop_at(Vec3::new(1.0, 10.5, 1.0));
+        p.character.position = Vec3::new(30.0, 0.0, 30.0);
+        assert!((land(&mut p) - 10.0).abs() < 0.2);
+    }
+
     #[test]
     fn model_turns_to_face_her_heading() {
         let mut p = Player::new(0.0, 0.0, 0.0, None);
@@ -798,5 +973,31 @@ mod tests {
         // Without a rig the model is taken to face +z.
         let forward = p.model_matrix().transform_vector3(Vec3::Z);
         assert!((forward - Vec3::X).length() < 1e-5, "{forward}");
+        // Seated, she leans with the vehicle (here pitched nose down);
+        // out of it, she stands up straight again.
+        let tilted = Mat4::from_rotation_x(0.3) * Mat4::from_translation(Vec3::Y);
+        p.seat_frame = Some(tilted);
+        p.seated = true;
+        p.driving = Some(0);
+        assert_eq!(p.model_matrix(), tilted);
+        p.driving = None;
+        let up = p.model_matrix().transform_vector3(Vec3::Y);
+        assert!((up - Vec3::Y).length() < 1e-5, "{up}");
+    }
+
+    #[test]
+    fn getting_in_leaves_her_aim_and_carry_behind() {
+        let mut rig = crate::npc::tests::rig();
+        rig.animator.set_upper(Some((0, vec![true].into())));
+        rig.aim = Some(Vec3::X);
+        rig.two_handed = true;
+        let mut p = Player::new(0.0, 0.0, 0.0, None);
+        p.model = Some((crate::npc::tests::empty_model(), rig));
+        p.throwing = Some(0.2);
+        p.off_foot();
+        let (_, rig) = p.model.as_ref().unwrap();
+        assert_eq!(rig.animator.upper(), None);
+        assert_eq!((rig.aim, rig.two_handed), (None, false));
+        assert_eq!((p.throwing, p.bashing, p.leap), (None, None, Leap::No));
     }
 }

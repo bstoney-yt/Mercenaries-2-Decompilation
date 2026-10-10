@@ -145,6 +145,9 @@ pub struct Widget {
     pub font: String,
     pub scale: f32,
     pub justification: Anchor,
+    /// Wrapped at the widget's width (`SetTextWrapping`, which the
+    /// scripts' `TextWidget:Wrap` turns on).
+    pub wraps: bool,
     pub swf: Option<String>,
     /// `CallFlashScriptFunction` calls not yet taken by the host
     /// ([`Screen::take_flash_calls`]): the movie's function and its
@@ -206,6 +209,7 @@ impl Widget {
             font: String::new(),
             scale: 1.0,
             justification: Anchor::Start,
+            wraps: false,
             swf: None,
             flash_calls: Vec::new(),
             flash_handlers: BTreeMap::new(),
@@ -333,9 +337,37 @@ pub struct Screen {
     reticle: [f32; 2],
     /// Which way the camera looks, degrees (`Player.GetCameraXZHeading`).
     heading: f32,
+    /// The keys bound to control words the fonts have no picture for
+    /// (`l-stick up`: `T`), by word in lower case ([`Screen::set_key_names`]).
+    key_names: BTreeMap<String, String>,
+    /// An Xbox pad plays: control words show its pictures
+    /// ([`pad_picture`]) and `Gui.IsXboxController` answers true.
+    pad: bool,
 }
 
 impl Screen {
+    /// An Xbox pad plays (or the keyboard and mouse again): texts show
+    /// the pad's button pictures for their control words, and the
+    /// scripts that ask `Gui.IsXboxController` (the hijack's buttons,
+    /// `MrxGuiHudActionHijack`) pick their Xbox pictures.
+    pub fn set_pad(&mut self, pad: bool) {
+        self.pad = pad;
+    }
+
+    pub fn pad(&self) -> bool {
+        self.pad
+    }
+
+    /// Names the keys bound to control words (`[l-stick up]`):
+    /// a text shows such a word as its key in brackets (`[T]`) where the
+    /// fonts have no button picture for it ([`button_glyph`]).
+    pub fn set_key_names(&mut self, names: impl IntoIterator<Item = (String, String)>) {
+        self.key_names = names
+            .into_iter()
+            .map(|(word, key)| (word.to_ascii_lowercase(), key))
+            .collect();
+    }
+
     /// Sets where the player aims: -1..=1 from the left edge to the right
     /// and from the bottom to the top (0, 0 is the middle), as
     /// `Gui.GetReticlePosition` answers. Fire `GuiReticlePositionChange`
@@ -635,8 +667,26 @@ impl Screen {
                     colour: Some(c),
                     ..TextSpan::default()
                 });
+            } else if let Some(picture) = pad_picture(id).filter(|_| self.pad && parts.len() == 1) {
+                // Inline, as the objective icons are.
+                let colour = out.last().and_then(|s| s.colour);
+                out.push(TextSpan {
+                    colour,
+                    icon: Some(picture.to_owned()),
+                    ..TextSpan::default()
+                });
+                out.push(TextSpan {
+                    colour,
+                    ..TextSpan::default()
+                });
             } else if let Some(glyph) = button_glyph(id).filter(|_| parts.len() == 1) {
                 push(out, glyph.encode_utf8(&mut [0; 4]));
+            } else if let Some(key) = self
+                .key_names
+                .get(&id.to_ascii_lowercase())
+                .filter(|_| parts.len() == 1)
+            {
+                push(out, &format!("[{key}]"));
             } else if let Some(icon) = inline_icon(id).filter(|_| parts.len() == 1) {
                 // In the colour so far, which goes on after it.
                 let colour = out.last().and_then(|s| s.colour);
@@ -676,12 +726,31 @@ impl Screen {
             .map(str::to_owned)
     }
 
+    /// Widget `id`'s text in spans as drawn: wrapped at its width, at
+    /// spaces, when it wraps ([`Widget::wraps`]).
+    pub fn text_spans(&self, id: u32) -> Vec<TextSpan> {
+        let Some(w) = self.widgets.get(&id) else {
+            return Vec::new();
+        };
+        let spans = self.spans(&w.text);
+        if !w.wraps {
+            return spans;
+        }
+        let r = self.rect(id);
+        let font = self.fonts.get(&w.font.to_ascii_lowercase());
+        let unit = VIRTUAL_SIZE.1 / FONT_LINES * w.scale;
+        let line_px = font.map_or(30.0, |f| f32::from(f.line_height));
+        let width =
+            |t: &str| unit * font.map_or(t.chars().count() as f32 * 12.0, |f| f.text_width(t));
+        wrap_spans(spans, (r[2] - r[0]).max(1.0), width, line_px * unit)
+    }
+
     /// Text width in virtual units, by the font if given one.
     fn text_width(&self, id: u32) -> f32 {
         let Some(w) = self.widgets.get(&id) else {
             return 0.0;
         };
-        let text = self.display_text(&w.text);
+        let text: String = self.text_spans(id).into_iter().map(|s| s.text).collect();
         let font = self.fonts.get(&w.font.to_ascii_lowercase());
         // The widest line.
         let px = text
@@ -694,6 +763,8 @@ impl Screen {
         px * VIRTUAL_SIZE.1 / FONT_LINES * w.scale
     }
 
+    /// Text height in virtual units: a line's for each line (wrapped
+    /// ones too: the text buffers size their messages by it).
     fn text_height(&self, id: u32) -> f32 {
         let Some(w) = self.widgets.get(&id) else {
             return 0.0;
@@ -702,7 +773,9 @@ impl Screen {
             .fonts
             .get(&w.font.to_ascii_lowercase())
             .map_or(30.0, |f| f32::from(f.line_height));
-        px * VIRTUAL_SIZE.1 / FONT_LINES * w.scale
+        let text: String = self.text_spans(id).into_iter().map(|s| s.text).collect();
+        let lines = text.trim_end_matches('\n').split('\n').count().max(1);
+        px * lines as f32 * VIRTUAL_SIZE.1 / FONT_LINES * w.scale
     }
 
     /// The correction of the widget's nearest corrected ancestor (itself
@@ -805,11 +878,12 @@ impl Screen {
                 }
                 Kind::Text => {
                     if !w.text.is_empty() {
+                        let spans = self.text_spans(id);
                         out.push(DrawItem::Text {
                             widget: id,
                             font: w.font.clone(),
-                            text: self.display_text(&w.text),
-                            spans: self.spans(&w.text),
+                            text: spans.iter().map(|s| s.text.as_str()).collect(),
+                            spans,
                             rect,
                             size: c.scale * VIRTUAL_SIZE.1 / FONT_LINES * w.scale,
                             colour,
@@ -866,6 +940,59 @@ pub struct TextSpan {
     /// An inline icon in its place instead of text: the texture, a line
     /// high and square, tinted by the colour.
     pub icon: Option<String>,
+}
+
+/// `spans` with a new line put for the space before each word that would
+/// take its line past `max` (as `width` measures text; an icon is
+/// `icon` wide). A word wider than `max` keeps a line to itself.
+fn wrap_spans(
+    spans: Vec<TextSpan>,
+    max: f32,
+    width: impl Fn(&str) -> f32,
+    icon: f32,
+) -> Vec<TextSpan> {
+    let mut out: Vec<TextSpan> = Vec::with_capacity(spans.len());
+    // The width of the line so far.
+    let mut line = 0.0f32;
+    for span in spans {
+        if span.icon.is_some() {
+            line += icon;
+            out.push(span);
+            continue;
+        }
+        let mut text = String::with_capacity(span.text.len());
+        for (i, para) in span.text.split('\n').enumerate() {
+            if i > 0 {
+                text.push('\n');
+                line = 0.0;
+            }
+            for (j, word) in para.split(' ').enumerate() {
+                let space = if j > 0 { width(" ") } else { 0.0 };
+                let w = width(word);
+                if line > 0.0 && line + space + w > max {
+                    // The break goes where the space was.
+                    if j == 0 {
+                        // At a span's start: the space ended the last one.
+                        if let Some(prev) = out.iter_mut().rev().find(|s| s.icon.is_none())
+                            && prev.text.ends_with(' ')
+                        {
+                            prev.text.pop();
+                        }
+                    }
+                    text.push('\n');
+                    line = w;
+                } else {
+                    if j > 0 {
+                        text.push(' ');
+                    }
+                    line += space + w;
+                }
+                text.push_str(word);
+            }
+        }
+        out.push(TextSpan { text, ..span });
+    }
+    out
 }
 
 /// The length of the bracketed token `s` starts with, nested brackets
@@ -951,32 +1078,115 @@ fn colour_name(word: &str) -> Option<[f32; 3]> {
     })
 }
 
+/// The button page's glyphs below U+E014 that [`button_glyph`] gives no
+/// word: U+E00C is an empty black disc and U+E00F is not on the page.
+pub const UNMATCHED_GLYPHS: [char; 2] = ['\u{e00c}', '\u{e00f}'];
+
 /// The glyph a control word stands for on the PC (`[pfire] Shoot`): the
 /// HUD fonts keep the PC's button pictures on a page of their own
 /// (`english_18`'s second, `pc\common_18_buttons`), at private-use
-/// characters U+E000 on. The engine's list of the words (`[move]`,
-/// `[left stick]`, `[aim]`... `[dpad down]`, 33 of them) does not follow
-/// the glyphs' order, so they are matched by picture: the PC footage's
-/// satellite help shows `[move]` as the four arrows and `[confirm]` as the
-/// pistol (the fire button confirms), and the rest are the pictures that
-/// say what the words do. Words not matched yet stay as written.
-fn button_glyph(word: &str) -> Option<char> {
+/// characters U+E000 on.
+///
+/// Which pad button each word is comes from the game's data: the HUD
+/// movies' text formatter (`formatText` in `topbar` and `minimap`, vz.wad)
+/// swaps each word for a pad picture loaded by name, `[confirm]` for
+/// `button_A`, `[bash]`, `[honk]` and `[cancel]` for `button_B`,
+/// `[reload]` for `button_X`, `[action]` for `button_Y`, `[left stick]`
+/// for `button_joystick_L` (as `[move]`), `[sswitch]` for
+/// `button_Dpad_left`, `[support]` for `button_joystick_L_press`. Those
+/// are the console's pictures; the PC font page has its own, and the four
+/// round ones (U+E000 to U+E003, the only face-button discs on it) are
+/// taken to be A, B, X and Y in that order, the formatter's own order
+/// (`b1` to `b4`). The pictures agree where they can be read (U+E001 a
+/// fist for the bash, U+E002 a magazine for the reload), but no data ties
+/// a code point to a pad button: inferred, unchecked on the PC.
+/// `[jump]` is not in the formatter; it is given U+E000, the face disc
+/// no other word takes (`[confirm]` is the pistol on the PC, below).
+/// `[support]` is given the headset (U+E01C), the support radio, by
+/// picture: the page has no disc of its own for the left stick's press.
+///
+/// The rest are matched by picture: the PC footage's satellite help shows
+/// `[move]` as the four arrows and `[confirm]` as the pistol (the fire
+/// button confirms), and the others are the pictures that say what the
+/// words do. Words without a glyph show the key bound to them, if the
+/// host named it ([`Screen::set_key_names`]), else stay as written.
+pub fn button_glyph(word: &str) -> Option<char> {
     Some(match word.to_ascii_lowercase().as_str() {
+        "jump" => '\u{e000}',
+        "bash" | "honk" | "cancel" => '\u{e001}',
+        "reload" => '\u{e002}',
+        "action" => '\u{e003}',
         "crouch" => '\u{e004}',
         // Fire, and what the fire button does.
         "pfire" | "confirm" => '\u{e005}',
         "sfire" => '\u{e006}',
         "pswitch" => '\u{e007}',
-        "move" => '\u{e008}',
+        "move" | "left stick" => '\u{e008}',
         "aim" => '\u{e009}',
         "sprint" => '\u{e00a}',
         "zoom" => '\u{e00b}',
         "pda" => '\u{e00d}',
         "pause" => '\u{e00e}',
-        "dpad left" => '\u{e010}',
+        "dpad left" | "sswitch" => '\u{e010}',
         "dpad right" => '\u{e011}',
         "dpad up" => '\u{e012}',
         "dpad down" => '\u{e013}',
+        "support" => '\u{e01c}',
+        _ => return None,
+    })
+}
+
+/// The pad picture a control word stands for while an Xbox pad plays
+/// ([`Screen::set_pad`]): one of the console's button textures vz.wad
+/// keeps (`button_a`, `button_trigger_r`...), drawn inline as the
+/// objective icons are.
+///
+/// From the game's data, two tables:
+/// - the HUD movies' text formatter (`formatText`, as [`button_glyph`]
+///   gives it): `[confirm]` A, `[bash]`, `[honk]` and `[cancel]` B,
+///   `[reload]` X, `[action]` Y, `[move]` and `[left stick]` the left
+///   stick, `[sswitch]` the d-pad's left;
+/// - the pause screen's pad layout on foot (`tControlMap.human`, by the
+///   scripts' `Joystick.BUTTON_*` numbers, which the shell's
+///   `controllerText` puts by the pad's parts: 17 the left trigger, 18
+///   the left bumper, 19 the left stick's press, 20 to 22 the right's,
+///   23 Start, 24 Back): `[jump]` A, `[crouch]` the left trigger,
+///   `[sfire]` (`Use_Explosive`) the left bumper, `[sprint]` the left
+///   stick's press, `[pfire]` the right trigger, `[pswitch]` the right
+///   bumper, `[zoom]` the right stick's press, `[pause]` Start, `[pda]`
+///   Back (the texture `button_select`), `[support]` the d-pad's up
+///   (`Support_Menu`, up and down). The formatter has `[support]` on the
+///   left stick's press instead; the layout, which also puts sprint there,
+///   is taken.
+///
+/// `[aim]` is the right stick, which the shell's own sample layout labels
+/// `Aim Reticle/Camera`. The d-pad words, and the stick pushes the texts
+/// name (`[left stick up]`, `[r-stick down]`), are their own pictures
+/// (`button_joystick_l_up`...), which the PC font has none of.
+pub fn pad_picture(word: &str) -> Option<&'static str> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "confirm" | "jump" => "button_a",
+        "bash" | "honk" | "cancel" => "button_b",
+        "reload" => "button_x",
+        "action" => "button_y",
+        "move" | "left stick" => "button_joystick_l",
+        "left stick up" | "l-stick up" => "button_joystick_l_up",
+        "left stick down" | "l-stick down" => "button_joystick_l_down",
+        "r-stick up" | "right stick up" => "button_joystick_r_up",
+        "r-stick down" | "right stick down" => "button_joystick_r_down",
+        "aim" => "button_joystick_r",
+        "crouch" => "button_trigger_l",
+        "sfire" => "button_bumper_l",
+        "sprint" => "button_joystick_l_press",
+        "pfire" => "button_trigger_r",
+        "pswitch" => "button_bumper_r",
+        "zoom" => "button_joystick_r_press",
+        "pause" => "button_start",
+        "pda" => "button_select",
+        "support" | "dpad up" => "button_dpad_up",
+        "dpad down" => "button_dpad_down",
+        "dpad left" | "sswitch" => "button_dpad_left",
+        "dpad right" => "button_dpad_right",
         _ => return None,
     })
 }
@@ -1353,6 +1563,14 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
             ret(lua, (x, y))
         })?,
     )?;
+    // `Gui.IsXboxController()`: whether an Xbox pad plays. The PC's own
+    // hijack HUD asks it to pick `icon_hijack_xbox_button_*` over its
+    // keyboard pictures.
+    let s = Rc::clone(&screen);
+    gui.raw_set(
+        "IsXboxController",
+        safe_function(lua, move |lua, _| ret(lua, s.borrow().pad))?,
+    )?;
     // `Player.GetCameraXZHeading(owner)`, likewise in `Player`.
     let player = match lua.globals().raw_get::<Value>("Player")? {
         Value::Table(t) if t.metatable().is_none() => t,
@@ -1477,6 +1695,14 @@ macro_rules! natives {
 fn create(kind: Kind) -> impl Fn(&mut Screen, &Lua, &Args) -> mlua::Result<MultiValue> {
     move |s, lua, a| {
         let id = s.create(kind, a.text(0).unwrap_or_default());
+        // Not drawn until added: the scripts' widget objects start
+        // disabled (`bEnabled = false`), and `MrxGui.AddWidget` activates
+        // them (`ActivateWidget(id, true)`), `RemoveWidget` deactivates.
+        // The text buffers make each message's widget as it is queued
+        // and add it only when its turn comes.
+        if let Some(w) = s.widgets.get_mut(&id) {
+            w.inactive = true;
+        }
         ret(lua, id)
     }
 }
@@ -1745,7 +1971,7 @@ natives! {
     "SetImageTextureTransience" => |_, _, _| Ok(MultiValue::new()),
     // The text cut into lines that fit the widget's width, at spaces
     // (`TextWidget:SplitIntoLines` makes a widget of each).
-    "SplitText" => |s, l, a| {
+    "SplitText" => |s, _, a| {
         let id = a.id(0);
         let Some(w) = s.widget(id) else {
             return Ok(MultiValue::new());
@@ -1771,9 +1997,23 @@ natives! {
             }
             lines.push(line);
         }
+        // A new text widget for each line, in the widget's font, scale,
+        // colour and justification: `SplitIntoLines` wraps each id it is
+        // given in a `TextWidget` (`TextWidget.new(nil, uId)`), and the
+        // text buffers show the lines one after another.
+        let (font, scale, colour, justification) =
+            (w.font.clone(), w.scale, w.colour, w.justification);
         let mut out = MultiValue::new();
         for line in lines {
-            out.push_back(Value::String(l.create_string(&line)?));
+            let line_id = s.create(Kind::Text, String::new());
+            if let Some(n) = s.widgets.get_mut(&line_id) {
+                n.text = line;
+                n.font = font.clone();
+                n.scale = scale;
+                n.colour = colour;
+                n.justification = justification;
+            }
+            out.push_back(Value::Integer(line_id as mlua::Integer));
         }
         Ok(out)
     },
@@ -2019,7 +2259,12 @@ natives! {
         let j = s.widget(a.id(0)).map_or(Anchor::Start, |w| w.justification);
         ret(l, anchor_name(j, true))
     },
-    "SetTextWrapping" => |_, _, _| Ok(MultiValue::new()),
+    "SetTextWrapping" => |s, _, a| {
+        if let Some(w) = s.widgets.get_mut(&a.id(0)) {
+            w.wraps = a.truthy(1);
+        }
+        Ok(MultiValue::new())
+    },
     "GetTextWidth" => |s, l, a| ret(l, s.text_width(a.id(0))),
     "GetTextHeight" => |s, l, a| ret(l, s.text_height(a.id(0))),
     "SetFlashSwfFile" => |s, l, a| {
@@ -2099,6 +2344,30 @@ mod tests {
     use super::*;
     use crate::script::ScriptHost;
 
+    fn plain(spans: &[TextSpan]) -> String {
+        spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn wrapping_breaks_at_the_spaces_that_would_overflow() {
+        let span = |t: &str, c: Option<[f32; 3]>| TextSpan {
+            text: t.into(),
+            colour: c,
+            icon: None,
+        };
+        let width = |t: &str| t.chars().count() as f32;
+        let one = vec![span("aaa bbb ccc ddd", None)];
+        assert_eq!(plain(&wrap_spans(one, 7.0, width, 1.0)), "aaa bbb\nccc ddd");
+        // Across colours, the space that ended a span is the break.
+        let two = vec![span("aaa bbb ", None), span("ccc", Some([1.0, 0.0, 0.0]))];
+        let wrapped = wrap_spans(two, 8.0, width, 1.0);
+        assert_eq!(plain(&wrapped), "aaa bbb\nccc");
+        assert_eq!(wrapped[1].colour, Some([1.0, 0.0, 0.0]));
+        // Lines already short enough, and a word too long, stay as they are.
+        let three = vec![span("a\nlongword b", None)];
+        assert_eq!(plain(&wrap_spans(three, 4.0, width, 1.0)), "a\nlongword\nb");
+    }
+
     fn host() -> (ScriptHost, ScreenRef) {
         let host = ScriptHost::new().unwrap();
         let screen = install(host.lua()).unwrap();
@@ -2107,6 +2376,44 @@ mod tests {
 
     fn run(host: &ScriptHost, code: &str) {
         host.lua().load(code).exec().unwrap();
+    }
+
+    /// Activates every widget made so far, as the scripts'
+    /// `MrxGui.AddWidget` does for the ones they show.
+    fn added(screen: &ScreenRef) {
+        for w in screen.borrow_mut().widgets.values_mut() {
+            w.inactive = false;
+        }
+    }
+
+    #[test]
+    fn widgets_draw_once_added() {
+        let (host, screen) = host();
+        run(
+            &host,
+            r#"
+            local G = _GuiInternal
+            queued = G.CreateTextWidget()
+            shown = G.CreateTextWidget()
+            G.SetTextText(queued, "later")
+            G.SetTextText(shown, "now")
+            G.ActivateWidget(shown, true)
+            "#,
+        );
+        let texts = || {
+            screen
+                .borrow()
+                .draw_list(640.0, 480.0)
+                .into_iter()
+                .filter_map(|i| match i {
+                    DrawItem::Text { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(), ["now"]);
+        run(&host, "_GuiInternal.ActivateWidget(queued, true)");
+        assert_eq!(texts(), ["later", "now"]);
     }
 
     #[test]
@@ -2166,6 +2473,7 @@ mod tests {
             G.Frobnicate(img)
             "#,
         );
+        added(&screen);
         let s = screen.borrow();
         let items = s.draw_list(640.0, 480.0);
         assert_eq!(items.len(), 1);
@@ -2280,6 +2588,7 @@ mod tests {
             G.SetWidgetFullscreen(f, true)
             "#,
         );
+        added(&screen);
         let items = screen.borrow().draw_list(1280.0, 720.0);
         let Some(DrawItem::Flash {
             rect, fullscreen, ..
@@ -2314,6 +2623,7 @@ mod tests {
             G.PushWidgetToBack(back)
             "#,
         );
+        added(&screen);
         let mut s = screen.borrow_mut();
         let mut strings = StringTable::default();
         strings
@@ -2358,8 +2668,140 @@ mod tests {
             s.display_text("Press [pfire] at[n][move] Move view"),
             "Press \u{e005} at\n\u{e008} Move view"
         );
-        // Not matched to a picture yet: as written.
-        assert_eq!(s.display_text("[honk] Honk"), "[honk] Honk");
+        // Not a control word: as written.
+        assert_eq!(s.display_text("[beep] Beep"), "[beep] Beep");
+        // The face buttons, by the HUD movies' formatter: A B X Y.
+        assert_eq!(
+            s.display_text("[jump] Handbrake[n][reload] Reload"),
+            "\u{e000} Handbrake\n\u{e002} Reload"
+        );
+        for (w, g) in [
+            ("bash", '\u{e001}'),
+            ("honk", '\u{e001}'),
+            ("cancel", '\u{e001}'),
+            ("action", '\u{e003}'),
+            ("left stick", '\u{e008}'),
+            ("sswitch", '\u{e010}'),
+            ("support", '\u{e01c}'),
+        ] {
+            assert_eq!(button_glyph(w), Some(g), "{w}");
+        }
+        let words = [
+            "jump",
+            "bash",
+            "reload",
+            "action",
+            "crouch",
+            "pfire",
+            "sfire",
+            "pswitch",
+            "move",
+            "aim",
+            "sprint",
+            "zoom",
+            "pda",
+            "pause",
+            "dpad left",
+            "dpad right",
+            "dpad up",
+            "dpad down",
+        ];
+        let given: Vec<char> = words.iter().filter_map(|w| button_glyph(w)).collect();
+        for g in UNMATCHED_GLYPHS {
+            assert!(!given.contains(&g), "{g:?}");
+        }
+        assert_eq!(given.len() + UNMATCHED_GLYPHS.len(), 0x14);
+    }
+
+    #[test]
+    fn with_a_pad_control_words_are_its_button_textures() {
+        let mut s = Screen::default();
+        s.set_pad(true);
+        let spans = s.spans("[green][reload] Reload[n][jump] Handbrake");
+        let icons: Vec<_> = spans.iter().filter_map(|s| s.icon.as_deref()).collect();
+        assert_eq!(icons, ["button_x", "button_a"]);
+        // In the colour so far, and the text goes on after each.
+        assert!(spans.iter().all(|s| s.colour == colour_name("green")));
+        assert_eq!(s.display_text("[reload] Reload"), " Reload");
+        // The formatter's face buttons, and the pause screen's layout.
+        for (w, t) in [
+            ("confirm", "button_a"),
+            ("bash", "button_b"),
+            ("action", "button_y"),
+            ("move", "button_joystick_l"),
+            ("sswitch", "button_dpad_left"),
+            ("pfire", "button_trigger_r"),
+            ("crouch", "button_trigger_l"),
+            ("sfire", "button_bumper_l"),
+            ("pswitch", "button_bumper_r"),
+            ("sprint", "button_joystick_l_press"),
+            ("zoom", "button_joystick_r_press"),
+            ("pause", "button_start"),
+            ("pda", "button_select"),
+            ("support", "button_dpad_up"),
+            ("left stick up", "button_joystick_l_up"),
+            ("r-stick down", "button_joystick_r_down"),
+        ] {
+            assert_eq!(pad_picture(w), Some(t), "{w}");
+        }
+        // Every word the PC font has a picture for has a pad one too.
+        for w in [
+            "jump",
+            "bash",
+            "honk",
+            "cancel",
+            "reload",
+            "action",
+            "crouch",
+            "pfire",
+            "confirm",
+            "sfire",
+            "pswitch",
+            "move",
+            "left stick",
+            "aim",
+            "sprint",
+            "zoom",
+            "pda",
+            "pause",
+            "dpad left",
+            "sswitch",
+            "dpad right",
+            "dpad up",
+            "dpad down",
+            "support",
+        ] {
+            assert!(button_glyph(w).is_some(), "{w}");
+            assert!(pad_picture(w).is_some(), "{w}");
+        }
+        // Without the pad, the PC font's glyphs as before.
+        s.set_pad(false);
+        assert_eq!(s.display_text("[reload] Reload"), "\u{e002} Reload");
+    }
+
+    #[test]
+    fn the_hijack_hud_asks_whether_an_xbox_pad_plays() {
+        let (host, screen) = host();
+        run(&host, "a = Gui.IsXboxController()");
+        assert!(!host.lua().globals().get::<bool>("a").unwrap());
+        screen.borrow_mut().set_pad(true);
+        run(&host, "b = Gui.IsXboxController()");
+        assert!(host.lua().globals().get::<bool>("b").unwrap());
+    }
+
+    #[test]
+    fn control_words_without_a_picture_name_their_keys() {
+        let mut s = Screen::default();
+        s.set_key_names([
+            ("L-Stick Up".to_owned(), "T".to_owned()),
+            ("pfire".to_owned(), "F".to_owned()),
+        ]);
+        assert_eq!(s.display_text("[l-stick up] Look up"), "[T] Look up");
+        // A word the fonts have a picture for keeps it; others as written.
+        assert_eq!(
+            s.display_text("[pfire] [l-stick down]"),
+            "\u{e005} [l-stick down]"
+        );
     }
 
     #[test]
@@ -2543,6 +2985,7 @@ mod tests {
             G.SetWidgetLocation(late, 300, 220, 340, 260)
             "#,
         );
+        added(&screen);
         let s = screen.borrow();
         let rects: Vec<[f32; 4]> = s
             .draw_list(1280.0, 720.0)

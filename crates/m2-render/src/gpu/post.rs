@@ -62,6 +62,15 @@ fn log_average() -> bool {
     return !game_tone_map() || post.tone.w > 1.5;
 }
 
+// The game's own average (its luminance shaders): each pixel's Rec. 601
+// luminance of display values kept as ln(l + 0.001) and as l^2.5, both
+// averaged down to one texel, and adapted to nine tenths the geometric
+// mean (exp of the first) and a tenth the 2.5-power mean (the second
+// raised to 0.4). Chosen by a negative average power.
+fn game_average() -> bool {
+    return game_tone_map() && !log_average() && post.params.w < 0.0;
+}
+
 // The game lights and tone maps in display (gamma) space, its textures
 // never decoded: for its tone map our linear light is encoded first.
 fn to_game(c: vec3<f32>) -> vec3<f32> {
@@ -148,10 +157,14 @@ fn packed(l: f32) -> f32 {
 @fragment
 fn fs_log_luminance(v: Screen) -> @location(0) vec4<f32> {
     var sum = 0.0;
+    var both = vec2<f32>(0.0);
     for (var y = -1.0; y <= 1.0; y = y + 2.0) {
         for (var x = -1.0; x <= 1.0; x = x + 2.0) {
             let c = textureSampleLevel(source, linear, v.uv + vec2<f32>(x, y) * post.step.xy, 0.0).rgb;
-            if log_average() {
+            if game_average() {
+                let l = dot(to_game(c), vec3<f32>(0.299, 0.587, 0.114));
+                both = both + vec2<f32>(log(l + 0.001), pow(clamp(l, 0.0, 50.0), 2.5));
+            } else if log_average() {
                 sum = sum + log(max(luminance(to_game(c)), 1e-4));
             } else if post.params.w == 0.0 {
                 sum = sum + packed(luminance(pow(to_game(c), vec3<f32>(0.4))));
@@ -160,19 +173,22 @@ fn fs_log_luminance(v: Screen) -> @location(0) vec4<f32> {
             }
         }
     }
+    if game_average() {
+        return vec4<f32>(both * 0.25, 0.0, 1.0);
+    }
     return vec4<f32>(sum * 0.25, 0.0, 0.0, 1.0);
 }
 
 // The average of each 4 x 4 block: four filtered taps.
 @fragment
 fn fs_reduce(v: Screen) -> @location(0) vec4<f32> {
-    var sum = 0.0;
+    var sum = vec2<f32>(0.0);
     for (var y = -1.0; y <= 1.0; y = y + 2.0) {
         for (var x = -1.0; x <= 1.0; x = x + 2.0) {
-            sum = sum + textureSampleLevel(source, linear, v.uv + vec2<f32>(x, y) * post.step.xy, 0.0).r;
+            sum = sum + textureSampleLevel(source, linear, v.uv + vec2<f32>(x, y) * post.step.xy, 0.0).rg;
         }
     }
-    return vec4<f32>(sum * 0.25, 0.0, 0.0, 1.0);
+    return vec4<f32>(sum * 0.25, 0.0, 1.0);
 }
 
 // The adapted luminance, moved part of the way to this frame's. The
@@ -181,7 +197,8 @@ fn fs_reduce(v: Screen) -> @location(0) vec4<f32> {
 // logarithm.
 @fragment
 fn fs_adapt(v: Screen) -> @location(0) vec4<f32> {
-    let now = textureLoad(source, vec2<i32>(0, 0), 0).r;
+    let both = textureLoad(source, vec2<i32>(0, 0), 0).rg;
+    let now = both.x;
     let before = textureLoad(adapted, vec2<i32>(0, 0), 0).r;
     if game_tone_map() {
         let low = post.limits.x;
@@ -190,7 +207,11 @@ fn fs_adapt(v: Screen) -> @location(0) vec4<f32> {
         if post.params.w == 0.0 {
             mean = now;
         }
-        let l = clamp(select(mean, exp(now), log_average()), low, high);
+        var l = clamp(select(mean, exp(now), log_average()), low, high);
+        if game_average() {
+            // Mostly the geometric mean, a tenth the 2.5-power mean.
+            l = clamp(mix(exp(both.x), pow(max(both.y, 0.0), 0.4), 0.1), low, high);
+        }
         let k = mix(post.adapt.y, post.adapt.w, log(l / low) / log(high / low));
         return vec4<f32>(clamp(mix(before, l * k, post.adapt.z), 0.0, 1.0), 0.0, 0.0, 1.0);
     }
@@ -619,20 +640,21 @@ impl Post {
             (Some(t), _) => ([t.target, t.min_key, rate(t.retention), t.max_key], {
                 // `M2_TONE_CONTRAST=limit/multiplier` replaces the
                 // record's contrast limit and multiplier, to test.
-                // The records' contrast (multiplier 1.85-1.95) comes in with
-                // the night's monochrome ramp only: by day it crushed the
-                // ground's blue and doubled its saturation and speckle
-                // against PC footage (S .75 and SD 12 against .45 and 4-6;
-                // with it off all three land in range) while the night sea,
-                // which keeps it, matches (PC rounds Y and W; inferred, like
-                // the ramp's own night-only gate). `M2_CONTRAST=always`
-                // applies it as the records have it.
-                let night = if std::env::var("M2_CONTRAST").is_ok_and(|v| v == "always") {
-                    1.0
-                } else {
+                // The game's composite shader applies the records' contrast
+                // (multiplier 1.85-1.95 about a limit of 0.13-0.15) to every
+                // frame. Earlier rounds kept it to the night's monochrome
+                // ramp because by day it crushed the ground's blue; that was
+                // with the frame exposed about half as bright as the game's
+                // (the luminance average, see `game_average`). With the
+                // game's average it brings the day spots from L 58-69 to
+                // L 75-99 against PC footage's L 94-104 (round grade01).
+                // `M2_CONTRAST=night` keeps it to the night ramp as before.
+                let night = if std::env::var("M2_CONTRAST").is_ok_and(|v| v == "night") {
                     lighting
                         .monochrome
                         .map_or(0.0, |m| (m.w / 0.3).clamp(0.0, 1.0))
+                } else {
+                    1.0
                 };
                 let mut l = [
                     t.min,

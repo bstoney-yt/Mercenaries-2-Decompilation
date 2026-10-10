@@ -40,13 +40,11 @@ impl FlyCamera {
 
     /// One fixed tick of `dt` seconds.
     pub fn update(&mut self, input: &mut Input, config: &CameraConfig, mouse_look: bool, dt: f32) {
-        let (dx, dy) = input.take_mouse();
-        if mouse_look {
-            let invert = if config.invert_y { -1.0 } else { 1.0 };
-            self.yaw -= dx as f32 * config.mouse_sensitivity;
-            self.pitch -= dy as f32 * config.mouse_sensitivity * invert;
-            self.pitch = self.pitch.clamp(-1.55, 1.55);
-        }
+        let (dx, dy) = input.take_look(mouse_look);
+        let invert = if config.invert_y { -1.0 } else { 1.0 };
+        self.yaw -= dx as f32 * config.mouse_sensitivity;
+        self.pitch -= dy as f32 * config.mouse_sensitivity * invert;
+        self.pitch = self.pitch.clamp(-1.55, 1.55);
         let mut speed = config.speed;
         if input.held(Action::Sprint) {
             speed *= 5.0;
