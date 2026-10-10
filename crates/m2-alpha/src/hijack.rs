@@ -906,6 +906,8 @@ fn follow(
                 0.6,
                 0.6,
             ));
+            // The template the script spawns, its own effects.
+            game.combat.show_fx(what, Vec3::from(*position));
         }
         let Command::Hijack(h) = c else {
             continue;

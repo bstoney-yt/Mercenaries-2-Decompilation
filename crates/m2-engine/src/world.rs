@@ -278,6 +278,9 @@ pub struct Templates {
     pub entrance_points: HashMap<u32, Vec<u32>>,
     /// How air strikes' ordnance flies and what its blasts do.
     pub ordnance: crate::ordnance::Ordnance,
+    /// The effects each template shows, by id
+    /// ([`crate::particles::template_effects`]).
+    pub effects: HashMap<u32, Vec<u32>>,
     /// How vehicles break each template's objects running into them.
     pub crashable: HashMap<u32, crate::durability::Crash>,
     /// The sound each template's objects make breaking (its `SoundKey`),
@@ -655,6 +658,7 @@ impl Templates {
             hijack: crate::hijack::read(&db),
             entrance_points: crate::hijack::entrance_points(&db),
             ordnance: crate::ordnance::read(&db),
+            effects: crate::particles::template_effects(&db),
             crashable: crate::durability::crashable(&db),
             sound_keys: crate::durability::sound_keys(&db),
             health: crate::tuning::healths(&db),
