@@ -372,6 +372,14 @@ impl Props {
         true
     }
 
+    /// Whether `entity` was knocked loose (`None` if not): broken into
+    /// its pieces, its model's [`Loose::breaks`], or gone as one.
+    pub fn knocked_loose(&self, entity: u32) -> Option<bool> {
+        self.knocked
+            .contains_key(&entity)
+            .then(|| self.loose(entity).is_some_and(|l| l.breaks))
+    }
+
     /// Those knocked loose since the last call.
     pub fn take_knocked(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.fresh_knocks)

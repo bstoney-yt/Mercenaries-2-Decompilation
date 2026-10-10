@@ -3140,6 +3140,16 @@ impl Combat {
         }
     }
 
+    /// A round of her rifle's landing at `at` on `key`, as a shot of hers
+    /// strikes the world (the props check's).
+    pub fn rifle_strike(&self, at: Vec3, key: Option<StaticKey>) -> Strike {
+        Strike {
+            at,
+            damage: RIFLE_DAMAGE * self.rifle.damage / CARBINE_ROUND,
+            key,
+        }
+    }
+
     /// Whether a grenade is in her hand: she is throwing and hasn't let
     /// go yet.
     pub fn grenade_in_hand(&self) -> bool {

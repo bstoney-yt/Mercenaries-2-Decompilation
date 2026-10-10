@@ -38,6 +38,7 @@
 //! throws a grenade.
 
 mod autoplay;
+mod breakables;
 mod cache;
 mod camera;
 mod combat;
@@ -234,6 +235,11 @@ struct Options {
     /// With `--mission`: try every placed pickup, crate and emplaced gun
     /// as the layers put them out ([`placed::check`]), for testing.
     placed_check: bool,
+    /// With `--mission`: hit every placed prop as `--props-check` says
+    /// (`vehicle`, `gun` or `blast`), once she stands in `--props-area`
+    /// (x, z corners) if given, and stop ([`breakables::check`]).
+    props_check: Option<breakables::HitKind>,
+    props_area: Option<[f32; 4]>,
     /// With `--screenshot --drive`: load the seats' clips first, so she
     /// is seen sitting in the vehicle as she drives it.
     seated: bool,
@@ -417,6 +423,23 @@ fn parse_args() -> anyhow::Result<Options> {
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
             "--placed-check" => o.placed_check = true,
+            "--props-check" => {
+                let v = value()?;
+                o.props_check = Some(breakables::HitKind::parse(&v).with_context(|| {
+                    format!("--props-check expects vehicle, gun or blast, not {v}")
+                })?);
+            }
+            "--props-area" => {
+                let v: Vec<f32> = value()?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()
+                    .context("--props-area expects x0,z0,x1,z1")?;
+                o.props_area = Some(
+                    v.try_into()
+                        .map_err(|_| anyhow::anyhow!("--props-area expects x0,z0,x1,z1"))?,
+                );
+            }
             "--seated" => o.seated = true,
             "--mission-driver" => {
                 let path = value()?;
@@ -571,6 +594,10 @@ const HIJACK_WAIT: f32 = 8.0;
 /// With `--mission --placed-check`, how often what the layers put out is
 /// tried, seconds.
 const PLACED_CHECK_EVERY: f32 = 5.0;
+
+/// With `--mission --props-check`, how long she is ashore where the props
+/// are hit before they are, seconds: for the contract's layers to be in.
+const PROPS_CHECK_AFTER: f32 = 20.0;
 
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
@@ -2473,6 +2500,8 @@ fn mission_for_screenshot(
     let (mut hijack_tries, mut hijack_use, mut hijack_t) = (0, None, 0.0);
     let mut action_since: Option<u32> = None;
     let mut placed_tried = std::collections::HashSet::new();
+    // Seconds she has been where --props-check hits the props.
+    let mut props_ready = 0.0;
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -2509,6 +2538,39 @@ fn mission_for_screenshot(
             && game.scene.player.as_ref().is_some_and(|p| p.landed)
         {
             placed::check(game, &mut placed_tried, tick);
+        }
+        // With --props-check, every placed prop is hit once she has been
+        // ashore (and in --props-area, if given) a while, for the
+        // contract's layers to be in; then the run ends.
+        if let Some(hit) = options.props_check
+            && i % (PLACED_CHECK_EVERY / tick).round() as u32 == 0
+        {
+            let ashore = !link
+                .view()
+                .objectives
+                .iter()
+                .any(|o| o.contains("Land on the beach"));
+            let there = game
+                .scene
+                .player
+                .as_ref()
+                .filter(|p| p.landed)
+                .map(|p| p.character.position)
+                .is_some_and(|at| {
+                    options.props_area.is_none_or(|[x0, z0, x1, z1]| {
+                        (x0..=x1).contains(&at.x) && (z0..=z1).contains(&at.z)
+                    })
+                });
+            props_ready = if ashore && there {
+                props_ready + PLACED_CHECK_EVERY
+            } else {
+                0.0
+            };
+            if props_ready > PROPS_CHECK_AFTER
+                && breakables::check(game, hit, options.props_area, tick) > 0
+            {
+                break;
+            }
         }
         if let Some(h) = &mut hijacks {
             if hijack_use == Some(i) {

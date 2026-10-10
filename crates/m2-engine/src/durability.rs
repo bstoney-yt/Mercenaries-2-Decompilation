@@ -150,6 +150,58 @@ pub fn sound_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
         .collect()
 }
 
+/// `_PropPhysics`'s field read as a flag (name unknown; 1 on 102
+/// templates' records only for the heavy ones: shipping containers
+/// (20,000 kg), dumpsters, fuel and propane tanks (10,000 kg), the
+/// explosive barrel, car ruins (1,000 to 2,000 kg), the large cash case;
+/// 0 on chairs, benches, planters, boxes, barrels, barricades). PC
+/// survey `breakables`, round 6; from samples.
+const PROP_HEAVY: u32 = 0xeca7_c282;
+
+/// A template whose objects are loose physics props (`_PropPhysics`,
+/// against `_BuildingPhysics` for what stands fixed): chairs, benches,
+/// café tables, planters, boxes, barrels, barricades, trash, dumpsters,
+/// containers. They move when hit, as their `ModifierKey` row of the
+/// damage table says what breaks them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PropPhysics {
+    /// Kilograms (`Mass`), where it gives one: 0 or -1 on most (the
+    /// game's own default then, which the data doesn't give).
+    pub mass: Option<f32>,
+    /// [`PROP_HEAVY`] set: one of the heavy props.
+    pub heavy: bool,
+}
+
+/// Each template's `_PropPhysics`, by id.
+pub fn prop_physics(db: &Layer<'_>) -> HashMap<u32, PropPhysics> {
+    let t = Table::new(db, "_PropPhysics");
+    let mass = name_hash("Mass");
+    t.templates()
+        .filter_map(|id| {
+            let r = t.of_template(id).first()?;
+            Some((
+                id,
+                PropPhysics {
+                    mass: t.float(r, mass).filter(|m| m.is_finite() && *m > 0.0),
+                    heavy: t.word(r, PROP_HEAVY) == Some(1),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Each template's `ModifierKey` (its field of that name, a name hash:
+/// `PropFragile`, `Prop`, `Fence`, `Shack`, `Car`, `Tank`, ...), by id:
+/// the damage table's row for what its objects take of each kind of
+/// damage (on 1,083 templates).
+pub fn modifier_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = Table::new(db, "ModifierKey");
+    let field = name_hash("ModifierKey");
+    t.templates()
+        .filter_map(|id| Some((id, t.word(t.of_template(id).first()?, field)?)))
+        .collect()
+}
+
 /// A blast's reach and damage (`Explosive`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Explosion {

@@ -308,6 +308,13 @@ pub struct Templates {
     /// "Chopper"; `M151 Softtop (VZ)`'s is `vehicle.m151softtopvz`; PC
     /// data, 2026-10-09).
     pub localized: HashMap<u32, u32>,
+    /// Each template's `_PropPhysics`, by id: the props that move when
+    /// hit ([`crate::durability::prop_physics`]).
+    pub prop_physics: HashMap<u32, crate::durability::PropPhysics>,
+    /// Each template's `ModifierKey`, by id: the damage table's row that
+    /// says what each kind of damage does to its objects (`PropFragile`,
+    /// `Prop`, `Fence`, `Car`, ...).
+    pub modifiers: HashMap<u32, u32>,
     /// The game's damage table, if found.
     pub damage: Option<DamageTable>,
     /// Every gun, thrown weapon and vehicle armament ([`crate::weapons`]).
@@ -661,6 +668,8 @@ impl Templates {
             effects: crate::particles::template_effects(&db),
             crashable: crate::durability::crashable(&db),
             sound_keys: crate::durability::sound_keys(&db),
+            prop_physics: crate::durability::prop_physics(&db),
+            modifiers: crate::durability::modifier_keys(&db),
             health: crate::tuning::healths(&db),
             speeds: crate::tuning::human_speeds(&db),
             human_sets: crate::tuning::human_animation_sets(&db),

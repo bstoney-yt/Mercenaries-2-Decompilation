@@ -163,6 +163,11 @@ m2-alpha [options]
   --placed-check         with --mission: every 5 s, try each pickup, crate and
                          emplaced gun the layers have put out (logged as
                          placed-check lines), for testing
+  --props-check <hit>    with --mission: once she is ashore (and inside
+                         --props-area x0,z0,x1,z1 if given), hit every placed
+                         prop there by <hit> (vehicle, gun or blast), log what
+                         each did against what the data says (props-check
+                         lines and a summary), and stop; for testing
   --support <key>        with --mission: stock support item <key> (clusterbomb,
                          Support) and call it in once the scripts run, to
                          test their strikes and drops; repeatable

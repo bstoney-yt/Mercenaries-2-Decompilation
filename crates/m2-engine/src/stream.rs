@@ -777,6 +777,16 @@ impl World {
         true
     }
 
+    /// Whether placed object `i` was knocked loose (`None` if not):
+    /// broken into its pieces, its model's [`Loose::breaks`], or gone as
+    /// one.
+    pub fn knocked_loose(&self, i: usize) -> Option<bool> {
+        let o = self.index.objects.get(i)?;
+        self.knocked
+            .contains_key(&i)
+            .then(|| self.loose.get(&o.model).is_some_and(|l| l.breaks))
+    }
+
     /// Placed objects standing that come loose with any of their model
     /// within `reach` metres of `at` (as far as its box's middle less
     /// half its size), with how far.
