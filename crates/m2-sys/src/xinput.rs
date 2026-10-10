@@ -45,8 +45,8 @@ pub mod buttons {
 }
 
 /// `xinput.h`'s dead zones and trigger threshold.
-const LEFT_DEAD_ZONE: i16 = 7849;
-const RIGHT_DEAD_ZONE: i16 = 8689;
+pub const LEFT_DEAD_ZONE: i16 = 7849;
+pub const RIGHT_DEAD_ZONE: i16 = 8689;
 const TRIGGER_THRESHOLD: u8 = 30;
 
 /// A stick's raw axes, -32768..=32767, to -1..=1 with the round dead zone
