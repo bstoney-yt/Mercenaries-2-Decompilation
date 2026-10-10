@@ -39,9 +39,11 @@
 //!   `warzone` (`LightTime` 0.65) as the contract starts. Footage: full
 //!   day on the drive, a bright late-afternoon sun at the villa; no night.
 //!
-//! The records are chosen as the game chooses them; by day the alpha still
-//! draws them too dark (round TOD: the drive and villa at L 45 to 57
-//! against the Xbox's 100 to 140, the default's sky near black).
+//! The records are chosen as the game chooses them. By day the alpha drew
+//! them about half as bright as the game until its post pass took the
+//! game's luminance average (round grade01: five spots on the drive, the
+//! villa and the island from L 33-50 to L 75-99 against PC footage's
+//! L 94-104); the sky between the clouds is still darker than footage.
 //!
 //! The time of day is each record's `LightTime` (`LightTimeSpeed` is 0 in
 //! every record, so the sun stands still): 0.05 to 0.1 in the records of
@@ -101,10 +103,10 @@ pub struct Atmosphere {
     /// `Tone_R`, `Tone_G`, `Tone_B`: among the cloud settings (between
     /// `ShadowK` and `LightBlend`), so taken as the clouds' tint.
     pub tone: Vec3,
-    /// `DarknessK`: how thick the clouds may grow before they darken: the
-    /// game's cloud shader divides their light by `1 + mass * c`, `c`
-    /// taken as [`CLOUD_MASS`] over this (inferred: the night's 30 must
-    /// darken its clouds more than Guanare's 150 does the town's).
+    /// `DarknessK`: how dark thick cloud grows: the game's cloud shader
+    /// divides its light by `1 + mass * c`, `c` taken as this times
+    /// [`CLOUD_DARKNESS_PER_K`] (inferred: the clearest bright records have
+    /// 10, the war zones 300; see that constant).
     pub cloud_darkness: f32,
     /// `BloomAmount`, `BloomMultiplier`, `BloomThreshold`,
     /// `BloomBlurRadius` (the radius is not used yet).
@@ -134,8 +136,11 @@ pub struct Atmosphere {
     /// `Gradient0_Color2`: the middle of the post pass's monochrome ramp
     /// (a display colour) and, in its alpha byte, how much of the frame
     /// the ramp takes (black at 0, this at 0x80, white at 0xff, by the
-    /// ramp's stops); read for the night record only.
+    /// ramp's stops); read for every record.
     pub monochrome: Option<Vec4>,
+    /// 1 for the record named `night`, else 0, blended between records:
+    /// how far the searchlights' beams show (see [`BEAMS_FULL_RAMP`]).
+    pub night: f32,
 }
 
 /// Which way the sun stands at `LightTime` 0 (and 0.1, low in the
@@ -159,6 +164,20 @@ const BEAM_NIGHT_ALPHA: f32 = 0.5;
 /// The lowest the sun is drawn, in radians over the horizon, so that low
 /// `LightTime`s still light the ground a little.
 const SUN_LOWEST: f32 = 0.05;
+
+/// The cloud shader's darkness per unit of `DarknessK` (`c` in
+/// [`Atmosphere::cloud_darkness`]). The proportion is inferred from the
+/// records: `DarknessK` is 10 in the clearest, brightest ones (the
+/// default, `ALHQ`, `GRstripmine`) and 100 to 300 in the war zones and
+/// `PMCinterior`'s `warzone`; taken the other way round (400 over it, as
+/// before) the default's clouds were the darkest of all, black blotches
+/// over the PmcCon001 drive against white cloud in PC footage. The scale
+/// is fitted by eye: at 0.04 the default's clouds are white (round
+/// grade01). `M2_CLOUDK=inverse` takes [`CLOUD_MASS`] over it as before.
+const CLOUD_DARKNESS_PER_K: f32 = 0.04;
+
+/// [`ToneMap::average_power`] for the game's own luminance average.
+const GAME_AVERAGE: f32 = -1.0;
 
 /// The template database id of the `Atmosphere` template, whose one
 /// record is the outdoor `Default`.
@@ -294,20 +313,27 @@ impl Atmosphere {
                 float("LightMultiplier_Z").unwrap_or(1.0),
             ),
             interpolate_time: float("InterpolateTime").unwrap_or(0.0),
-            // Only the night's ramp is taken: its blue at 0.36 brought the
-            // night island from 34,39,36 to 28,35,44 and the near sea's
-            // brightness onto footage (PC round C), where by day Guanare's
-            // red ramp at 0.5 reddened and darkened the town and the AMX
-            // spot's pulled the tank's saturation away from footage. So
-            // something in code likely sets the blend by day; inferred.
-            // `M2_MONO=on` takes every record's ramp, `=off` none.
+            // Every record's ramp is taken, as the game's composite shader
+            // always blends the frame towards its monochrome map. Earlier
+            // rounds took the night's alone, since by day it reddened and
+            // darkened the town; that was with the frame exposed half as
+            // bright as the game's. With the game's luminance average and
+            // contrast the day ramp brings saturation from S .35-.63 to
+            // .25-.47 against PC footage's .28-.45 at five spots (round
+            // grade01). That its alpha byte is the blend is inferred.
+            // `M2_MONO=night` takes the night's ramp alone, `=off` none.
             monochrome: field("Gradient0_Color2")
                 .filter(|_| match std::env::var("M2_MONO").as_deref() {
-                    Ok("on") => true,
                     Ok("off") => false,
-                    _ => field("Name") == Some(name_hash("night")),
+                    Ok("night") => field("Name") == Some(name_hash("night")),
+                    _ => true,
                 })
                 .map(|v| Vec4::from_array(channels(v, Lit::Post))),
+            night: if field("Name") == Some(name_hash("night")) {
+                1.0
+            } else {
+                0.0
+            },
             tone_map: (|| {
                 let f = |names: &[&str]| names.iter().find_map(|n| float(n));
                 Some(ToneMap {
@@ -329,16 +355,17 @@ impl Atmosphere {
                     ])?,
                     contrast_limit: f(&["BloomContastLimit", "BloomContrastLimit"])?,
                     contrast: f(&["BloomContastMultiplier", "BloomContrastMultiplier"])?,
-                    // `M2_LUMINANCE=log`: the geometric mean, as before;
-                    // a number raises the plain mean to it; `=packed`
-                    // adapts to the mean of the codec's packed values,
-                    // which the game's shaders appear to read undecoded
-                    // (PC round E).
+                    // The game's own average (its luminance shaders, see
+                    // [`ToneMap::average_power`]). `M2_LUMINANCE=log`: the
+                    // plain geometric mean; a number raises the plain mean
+                    // of luminance^0.4 to it (`=1` the earlier default);
+                    // `=packed` adapts to the mean of the codec's packed
+                    // values (PC round E).
                     log_average: env_is("M2_LUMINANCE", "log"),
                     average_power: match std::env::var("M2_LUMINANCE").as_deref() {
                         Ok("packed") => 0.0,
-                        Ok(v) => v.parse().unwrap_or(1.0),
-                        Err(_) => 1.0,
+                        Ok(v) => v.parse().unwrap_or(GAME_AVERAGE),
+                        Err(_) => GAME_AVERAGE,
                     },
                 })
             })(),
@@ -414,6 +441,7 @@ impl Atmosphere {
                 (None, Some(b)) => Some(b.truncate().extend(0.0).lerp(b, t)),
                 (None, None) => None,
             },
+            night: f(self.night, to.night),
             water_ramp: match (self.water_ramp, to.water_ramp) {
                 (Some(a), Some(b)) => Some(std::array::from_fn(|i| a[i].lerp(b[i], t))),
                 (_, b) => b,
@@ -492,7 +520,16 @@ impl Atmosphere {
         // Clouds are lit by the game's formula; `M2_CLOUDS=old` lights
         // them as before.
         lighting.clouds.darkness =
-            (!env_is("M2_CLOUDS", "old")).then_some(cloud_mass() / self.cloud_darkness.max(1.0));
+            (!env_is("M2_CLOUDS", "old")).then_some(if env_is("M2_CLOUDK", "inverse") {
+                cloud_mass() / self.cloud_darkness.max(1.0)
+            } else {
+                // `M2_CLOUDK=<x>`: darkness `x` per unit of `DarknessK`.
+                std::env::var("M2_CLOUDK")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(CLOUD_DARKNESS_PER_K)
+                    * self.cloud_darkness.max(0.0)
+            });
         // `M2_CLOUDS=off` leaves the sky to the haze alone.
         lighting.clouds.coverage = if env_is("M2_CLOUDS", "off") {
             0.0
@@ -523,8 +560,8 @@ impl Atmosphere {
         lighting.clouds.wind = self.wind;
         lighting.water_ramp = self.water_ramp;
         lighting.tone_map = self.tone_map;
-        // The post shader blends towards the monochrome ramp (only the
-        // night's is read; see `from_record`).
+        // The post shader blends towards the monochrome ramp (see
+        // `from_record`).
         lighting.monochrome = self.monochrome;
         // The searchlights shine in the night record's air only: PC footage
         // shows their beams from dusk through the night and none by day, so
@@ -546,7 +583,7 @@ impl Atmosphere {
             }
         }
         lighting.beam_gain = self.monochrome.map_or(0.0, |m| {
-            (m.w / BEAMS_FULL_RAMP).clamp(0.0, 1.0) * BEAM_NIGHT_ALPHA
+            (m.w * self.night / BEAMS_FULL_RAMP).clamp(0.0, 1.0) * BEAM_NIGHT_ALPHA
         });
     }
 
@@ -952,6 +989,7 @@ mod tests {
             water_ramp: None,
             tone_map: None,
             monochrome: None,
+            night: 0.0,
         }
     }
 
@@ -1019,6 +1057,28 @@ mod tests {
     }
 
     #[test]
+    fn clouds_darken_with_darkness_k() {
+        let mut lighting = Lighting::default();
+        let clear = Atmosphere {
+            cloud_darkness: 10.0,
+            ..plain(0.2, 0.0)
+        };
+        clear.apply(&mut lighting);
+        let light = lighting.clouds.darkness.unwrap();
+        let warzone = Atmosphere {
+            cloud_darkness: 300.0,
+            ..plain(0.2, 0.0)
+        };
+        warzone.apply(&mut lighting);
+        let dark = lighting.clouds.darkness.unwrap();
+        assert!(
+            (light - 10.0 * CLOUD_DARKNESS_PER_K).abs() < 1e-6,
+            "{light}"
+        );
+        assert!((dark - 30.0 * light).abs() < 1e-3, "{dark}");
+    }
+
+    #[test]
     fn searchlight_beams_shine_only_as_the_night_ramp_comes_in() {
         let mut lighting = Lighting::default();
         let day = plain(0.2, 0.0);
@@ -1026,11 +1086,19 @@ mod tests {
         assert_eq!(lighting.beam_gain, 0.0);
         let night = Atmosphere {
             monochrome: Some(Vec4::new(0.2, 0.2, 0.3, 0.36)),
+            night: 1.0,
             ..plain(0.0, 0.0)
         };
         night.apply(&mut lighting);
         assert_eq!(lighting.beam_gain, BEAM_NIGHT_ALPHA);
         day.lerp(&night, 0.5).apply(&mut lighting);
         assert!(lighting.beam_gain > 0.0 && lighting.beam_gain < 1.0);
+        // A day record's own ramp (every record has one) lights no beams.
+        let ramped_day = Atmosphere {
+            monochrome: Some(Vec4::new(0.5, 0.45, 0.55, 0.5)),
+            ..plain(0.2, 0.0)
+        };
+        ramped_day.apply(&mut lighting);
+        assert_eq!(lighting.beam_gain, 0.0);
     }
 }
