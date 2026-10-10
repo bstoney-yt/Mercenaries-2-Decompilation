@@ -415,6 +415,7 @@ impl Destruction {
                         }
                         for at in props.breakup_points(key) {
                             combat.show(Effect::Smoke { at, size: 4.0 }, 6.0);
+                            combat.show_fx(crate::combat::fx::COLLAPSE, at);
                         }
                     }
                 }

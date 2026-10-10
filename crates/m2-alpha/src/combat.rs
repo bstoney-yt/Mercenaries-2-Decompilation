@@ -1010,6 +1010,24 @@ pub enum Effect {
     Wake { at: Vec3, size: f32 },
 }
 
+/// One of the game's own particle effects to set off: those a template
+/// shows (its `RedEffectComponent`s), at `at`. A held one (`hold`) keeps
+/// going, following `at`, while its source keeps asking for it (a fire,
+/// a smoking wreck); the rest run once.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GameFx {
+    pub template: FxTemplate,
+    pub at: Vec3,
+    pub hold: Option<u64>,
+}
+
+/// A template, by id or by name.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FxTemplate {
+    Id(u32),
+    Name(String),
+}
+
 /// A sound the fight makes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sound {
@@ -1173,6 +1191,48 @@ pub struct Trigger {
     pub pda: bool,
 }
 
+/// The game's effect templates the fight's own fire and smoke set off,
+/// where no template of the fight's says which (names from the template
+/// database; which source shows which is chosen by name: invented). A
+/// blast from an explosion template shows that template's own.
+pub mod fx {
+    /// A blast with no template (a barrel, a mine's chain).
+    pub const GRENADE: &str = "Explosion (Grenade)";
+    /// The satellite-guided bomb, and an air strike's big blasts.
+    pub const BOMB: &str = "Explosion (Airstike Bomb)";
+    /// An air strike's small blasts.
+    pub const BOMBLET: &str = "Explosion (Cluster Bomblet)";
+    /// The bomb's final strike.
+    pub const FINAL: &str = "Explosion (Smart Bomb)";
+    /// The launcher's back-blast and flash.
+    pub const BACK_BLAST: &str = "global_particle_muzzleflash_rpg";
+    /// A tank's main gun.
+    pub const CANNON: &str = "Muzzle Flash (RR)";
+    /// A rocket's trail.
+    pub const ROCKET: &str = "RPG Rocket";
+    /// A thrown marker's smoke.
+    pub const MARKER: &str = "FlareSmoke";
+    /// A wrecked vehicle burning.
+    pub const WRECK: [&str; 2] = [
+        "global_particle_firemediumsmoke_vehicle_box_flame",
+        "global_particle_firemediumsmoke_smoke_vehicle",
+    ];
+    /// A building's blaze.
+    pub const BLAZE: [&str; 2] = [
+        "global_particle_firelargesmoke",
+        "global_particle_firelargesmoke_smoke",
+    ];
+    /// A barrel or a bomb's fire burning on.
+    pub const FIRE: [&str; 2] = [
+        "global_particle_firesmall",
+        "global_particle_firesmall_smoke",
+    ];
+    /// A building coming apart.
+    pub const COLLAPSE: &str = "fx_CollapseCoverDust";
+    /// A supply crate broken open.
+    pub const CRATE: &str = "global_particle_impact_wood";
+}
+
 /// A thrown marker smokes from this long after it leaves her hand until
 /// this long, seconds, a puff every [`MARKER_PUFF`].
 const MARKER_SMOKE: (f32, f32) = (1.0, 30.0);
@@ -1222,6 +1282,9 @@ pub struct Combat {
     projectiles: Vec<Projectile>,
     /// Effects with their seconds left and lifetime.
     pub effects: Vec<(Effect, f32, f32)>,
+    /// The game's own effects set off since the scene last took them
+    /// ([`GameFx`]).
+    pub game_fx: Vec<GameFx>,
     /// Sounds made since the last call to [`take_sounds`](Self::take_sounds).
     sounds: Vec<Sound>,
     /// Wrecks smoke: (vehicle index, seconds to the next puff).
@@ -1352,6 +1415,7 @@ impl Default for Combat {
             bash_in: None,
             projectiles: Vec::new(),
             effects: Vec::new(),
+            game_fx: Vec::new(),
             sounds: Vec::new(),
             wrecks: Vec::new(),
             remarks: Vec::new(),
@@ -1854,6 +1918,25 @@ impl Combat {
     /// spray).
     pub fn show(&mut self, e: Effect, seconds: f32) {
         self.effect(e, seconds);
+    }
+
+    /// Sets off the effects template `name` shows at `at`, once.
+    pub fn show_fx(&mut self, name: &str, at: Vec3) {
+        self.game_fx.push(GameFx {
+            template: FxTemplate::Name(name.to_owned()),
+            at,
+            hold: None,
+        });
+    }
+
+    /// Keeps the effects template `name` shows going at `at` for source
+    /// `key` (see [`GameFx`]).
+    fn hold_fx(&mut self, name: &str, at: Vec3, key: u64) {
+        self.game_fx.push(GameFx {
+            template: FxTemplate::Name(name.to_owned()),
+            at,
+            hold: Some(key),
+        });
     }
 
     /// A fire burning on the ground under `at` for [`BLAZE_TIME`] with
@@ -2438,6 +2521,7 @@ impl Combat {
             },
             1.2,
         );
+        self.show_fx(fx::BACK_BLAST, from);
         self.sounds.push(Sound::Launch(from));
         alarm(f.people, f.player.character.position);
     }
@@ -2713,6 +2797,7 @@ impl Combat {
                 },
                 1.5,
             );
+            self.show_fx(fx::CANNON, from + aim * 0.8);
             self.sounds.push(Sound::Cannon(from));
         } else {
             if coax {
@@ -3059,6 +3144,7 @@ impl Combat {
                 },
                 3.0,
             );
+            self.hold_fx(fx::MARKER, at, place_key(1, at));
         }
         let mut puffs = Vec::new();
         let mut streaks = Vec::new();
@@ -3204,8 +3290,11 @@ impl Combat {
                 true
             }
         });
-        for at in puffs {
+        for (k, at) in puffs.into_iter().enumerate() {
             self.effect(Effect::Smoke { at, size: 0.4 }, 0.8);
+            // Rockets have no id: the k-th in flight (one at a time, as a
+            // rule).
+            self.hold_fx(fx::ROCKET, at, (2 << 32) | k as u64);
         }
         for (from, to) in streaks {
             self.effect(Effect::Tracer { from, to }, dt * 1.5);
@@ -3219,6 +3308,7 @@ impl Combat {
     /// near it wrecked and thrown.
     pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.burst(at, 1.0);
+        self.show_fx(fx::GRENADE, at);
         let mut killed = false;
         for n in &mut f.people.npcs {
             let d = n.chest().distance(at);
@@ -3351,6 +3441,11 @@ impl Combat {
         };
         // Fire and smoke the size of a grenade's at its 5 m reach.
         self.burst(at, (b.radius / 5.0).clamp(0.4, 3.0));
+        self.game_fx.push(GameFx {
+            template: FxTemplate::Id(b.template),
+            at,
+            hold: None,
+        });
         let human = match (&self.damage_table, b.key) {
             (Some(t), Some(k)) => t.scale(m2_assets::name_hash("Human"), k).unwrap_or(1.0),
             _ => 1.0,
@@ -3422,6 +3517,7 @@ impl Combat {
         self.sounds.push(Sound::Bomb(at));
         let hers = self.hero_damage;
         self.harm(f, at, BOMB, false, hers.explosion_large);
+        self.show_fx(fx::BOMB, at);
         self.harm(f, at + Vec3::Y, BOMB_FRAG, true, hers.bullet_large);
         self.effect(
             Effect::Fire {
@@ -3487,6 +3583,14 @@ impl Combat {
         // The strikes' ordnance keys aren't read yet: an `Explosion`.
         let hers = self.hero_damage.explosion;
         self.harm(f, at, (radius, damage), false, hers);
+        self.show_fx(
+            if radius >= BOMB.0 {
+                fx::BOMB
+            } else {
+                fx::BOMBLET
+            },
+            at,
+        );
         // Fire and smoke grow with the reach's square: a 20 m bomb's 10 m
         // across, a 15 m bomblet's under 6, so that forty bomblets
         // together don't fill the view. (Sizes judged by eye, not read.)
@@ -3527,6 +3631,7 @@ impl Combat {
         self.sounds.push(Sound::Explosion(at));
         let hers = self.hero_damage.explosion_large;
         self.harm(f, at, BOMB_FINAL, false, hers);
+        self.show_fx(fx::FINAL, at);
         self.effect(
             Effect::Fire {
                 at: at + Vec3::Y,
@@ -3632,11 +3737,14 @@ impl Combat {
             if let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) {
                 let (lo, hi) = v.spec.bounds;
                 let top = Vec3::new((lo.x + hi.x) * 0.5, hi.y, (lo.z + hi.z) * 0.5);
-                puffs.push(body.transform_point3(top));
+                puffs.push((*i, body.transform_point3(top)));
             }
         }
-        for at in puffs {
+        for (i, at) in puffs {
             self.effect(Effect::Smoke { at, size: 1.5 }, 3.0);
+            for name in fx::WRECK {
+                self.hold_fx(name, at, (3 << 32) | i as u64);
+            }
         }
         let mut flames = Vec::new();
         self.fires.retain_mut(|(at, size, left, next)| {
@@ -3659,6 +3767,9 @@ impl Combat {
             *left > 0.0
         });
         for at in blazing {
+            for name in fx::BLAZE {
+                self.hold_fx(name, at, place_key(4, at));
+            }
             self.effect(Effect::Fire { at, size: 3.0 }, 0.7);
             self.effect(
                 Effect::Soot {
@@ -3670,6 +3781,9 @@ impl Combat {
         }
         for (at, size) in flames {
             let low = at.with_y(at.y - size.min(1.2) + 0.5);
+            for name in fx::FIRE {
+                self.hold_fx(name, low, place_key(5, at));
+            }
             self.effect(
                 Effect::Fire {
                     at: low,
@@ -3793,6 +3907,13 @@ fn ray_capsule(origin: Vec3, dir: Vec3, a: Vec3, seg: Vec3, radius: f32) -> Opti
     let on_seg = a + seg * u;
     let s = dir.dot(on_seg - origin).max(0.0);
     ((origin + dir * s).distance(on_seg) <= radius).then_some(s)
+}
+
+/// A held effect's key for a source that stays put (a fire, a marker):
+/// its kind and where it is, to the decimetre.
+fn place_key(kind: u64, at: Vec3) -> u64 {
+    let q = |v: f32| u64::from((v * 10.0).round() as i32 as u16);
+    (kind << 48) | (q(at.x) << 32) | (q(at.y) << 16) | q(at.z)
 }
 
 #[cfg(test)]

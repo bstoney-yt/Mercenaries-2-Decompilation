@@ -763,6 +763,11 @@ pub struct Scene {
     pub strikes: crate::strikes::Strikes,
     /// Mesh and materials for shots, flashes, fire and smoke.
     effects: Effects,
+    /// The game's own particle effects, once the island is loaded; the
+    /// spheres stand in for fire and smoke without them.
+    pub particles: Option<crate::particles::ParticleDraw>,
+    /// Draw no fire or smoke at all (`--no-fx`, to measure what they cover).
+    pub hide_fx: bool,
     vehicle_loads: Option<Receiver<Loaded>>,
     /// The archive's vehicle, person and weapon models, once found.
     pub catalogue: Option<Catalogue>,
@@ -1077,6 +1082,8 @@ impl Scene {
             flights: Flights::default(),
             strikes: crate::strikes::Strikes::default(),
             effects,
+            particles: None,
+            hide_fx: false,
             vehicle_loads: None,
             catalogue: None,
             install: None,
@@ -1233,6 +1240,17 @@ impl Scene {
 
         // The hero, to walk the island as.
         self.open(install)?;
+        if let (Some(source), Some(world)) = (self.source.as_mut(), self.world.as_ref()) {
+            match crate::particles::ParticleDraw::load(
+                backend,
+                &mut self.materials,
+                source,
+                &world.index.template_db,
+            ) {
+                Ok(p) => self.particles = Some(p),
+                Err(e) => eprintln!("particles: {e:#}; fire and smoke drawn as spheres"),
+            }
+        }
         self.player = Some(Player::new(x, z, facing, None));
         self.load_hero(backend, self.hero);
         let hand = self
@@ -2048,7 +2066,21 @@ impl Scene {
             }
         }
         for &(effect, left, life) in &fight.effects {
+            // The game's own effects draw fire and smoke when they loaded.
+            let standing_in = matches!(
+                effect,
+                combat::Effect::Fire { .. }
+                    | combat::Effect::Smoke { .. }
+                    | combat::Effect::Soot { .. }
+            );
+            if standing_in && (self.particles.is_some() || self.hide_fx) {
+                continue;
+            }
             self.effects.draw(queue, effect, 1.0 - left / life);
+        }
+        let hide = self.hide_fx;
+        if let Some(p) = self.particles.as_mut().filter(|_| !hide) {
+            p.draw(backend, queue, view)?;
         }
         for p in &self.models {
             match &p.rig {

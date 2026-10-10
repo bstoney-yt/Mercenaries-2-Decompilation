@@ -37,6 +37,10 @@
 //!                           UV transforms, vertex layout, colour ranges per
 //!                           material, and its scatter's lean vs the ground
 //! fx[:<word>,..]            texture names holding effect words
+//! effects[:<word>,..]       every particle effect: name, the templates that
+//!                           show it, emitters and textures; each setting's
+//!                           values over all emitters; the emitters in full
+//!                           of effects whose templates' names hold a word
 //! spot:<x>,<z>[,<r>]        what stands near a spot (default 30 m): models
 //!                           with their techniques and textures, and the
 //!                           layer entities with their components' fields
@@ -861,7 +865,7 @@ fn main() -> Result<(), Error> {
     let gather = sections.iter().any(|(s, _)| {
         matches!(
             s.as_str(),
-            "slots" | "materials" | "fx" | "terrain" | "spot"
+            "slots" | "materials" | "fx" | "effects" | "terrain" | "spot"
         )
     });
     let (names, got) = harvest(&install, gather)?;
@@ -905,6 +909,7 @@ fn main() -> Result<(), Error> {
                     p.get(1).copied().unwrap_or(0.0),
                 )
             }
+            "effects" => effects(&mut source, &names, &got, arg),
             "fx" => {
                 fx(&names, &got, arg);
                 Ok(())
@@ -7036,4 +7041,287 @@ fn destruct<R: Read + Seek>(
         }
     }
     Ok(())
+}
+
+/// Every particle effect: its name, emitters and their textures; then,
+/// per place in the particle settings list, the name hash, kind and the
+/// range of its values over all emitters, and the same for transforms
+/// and forces.
+fn effects<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    got: &Gathered,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    use m2_assets::effect::{self, Attr, EFFECT_TYPE};
+    let paths: Vec<String> = source
+        .archive()
+        .index()
+        .blocks()
+        .iter()
+        .map(|b| b.path.clone())
+        .collect();
+    let mut all = Vec::new();
+    for (b, p) in paths.iter().enumerate() {
+        if !p.to_ascii_lowercase().contains("effects") {
+            continue;
+        }
+        let decoded = source.block(b)?;
+        let Ok(contents) = BlockContents::parse(&decoded) else {
+            continue;
+        };
+        for (e, data) in contents.iter() {
+            if e.type_hash != EFFECT_TYPE {
+                continue;
+            }
+            match effect::parse(data) {
+                Ok(fx) => all.push((e.name_hash, fx)),
+                Err(err) => println!("  {:08x} {err}", e.name_hash),
+            }
+        }
+    }
+    let set: HashSet<u32> = all.iter().map(|(h, _)| *h).collect();
+    let users = effect_users(source, names, &set)?;
+    let (mut tex, mut tex_found) = (0, 0);
+    for (h, fx) in &all {
+        println!(
+            "{:08x} {} emitters {} forces {} shapes {}",
+            h,
+            names.show(*h),
+            fx.emitters.len(),
+            fx.forces.len(),
+            fx.shapes.len()
+        );
+        let used = users.get(h).cloned().unwrap_or_default();
+        if !used.is_empty() {
+            println!(
+                "    used by {}: {}",
+                used.len(),
+                used.iter().take(4).cloned().collect::<Vec<_>>().join(" | ")
+            );
+        }
+        let detail = !words.is_empty()
+            && used.iter().any(|u| {
+                words
+                    .iter()
+                    .any(|w| u.to_ascii_lowercase().contains(w.as_str()))
+            });
+        if detail {
+            effect_detail(names, fx);
+        }
+        for e in &fx.emitters {
+            for &t in &e.textures {
+                tex += 1;
+                if got.textures.contains_key(&t) {
+                    tex_found += 1;
+                }
+            }
+            let t: Vec<String> = e
+                .textures
+                .iter()
+                .take(3)
+                .map(|&t| texture_line(names, got, t))
+                .collect();
+            println!("    tex {}: {}", e.textures.len(), t.join(" | "));
+        }
+    }
+    println!(
+        "effects {} named {}",
+        all.len(),
+        all.iter().filter(|(h, _)| names.get(*h).is_some()).count()
+    );
+    println!("emitter textures {tex}, found in vz.wad {tex_found}");
+    let stats = |label: &str, lists: Vec<&Vec<Attr>>| {
+        // By name where named; keyed settings by place.
+        let mut by: BTreeMap<String, (usize, BTreeMap<String, usize>)> = BTreeMap::new();
+        for list in lists {
+            for (i, a) in list.iter().enumerate() {
+                let key = match a.name {
+                    Some(n) => format!("{n:08x} {}", names.show(n)),
+                    None => format!("keyed@{i:02}"),
+                };
+                let v = if a.name.is_none() {
+                    format!("{:?}", a.keys)
+                } else if a.kind == 1 {
+                    format!("k{} f{:x} {}", a.kind, a.flags, a.float())
+                } else {
+                    format!("k{} f{:x} {:#x}", a.kind, a.flags, a.int())
+                };
+                let s = by.entry(key).or_default();
+                s.0 += 1;
+                *s.1.entry(v).or_default() += 1;
+            }
+        }
+        println!("-- {label}: {} settings", by.len());
+        for (k, (n, vals)) in by {
+            let mut v: Vec<_> = vals.into_iter().collect();
+            v.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let top: Vec<String> = v.iter().take(8).map(|(s, c)| format!("{s} x{c}")).collect();
+            println!("  {k} n{n} distinct {}: {}", v.len(), top.join("; "));
+        }
+    };
+    stats(
+        "particle",
+        all.iter()
+            .flat_map(|(_, f)| f.emitters.iter().map(|e| &e.particle))
+            .collect(),
+    );
+    stats(
+        "transform",
+        all.iter()
+            .flat_map(|(_, f)| f.emitters.iter().map(|e| &e.transform))
+            .collect(),
+    );
+    stats(
+        "force",
+        all.iter().flat_map(|(_, f)| f.forces.iter()).collect(),
+    );
+    Ok(())
+}
+
+/// Which template fields name effects: per (component, field) how many,
+/// then each effect's users (template, component, field).
+fn effect_users<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    effects: &HashSet<u32>,
+) -> Result<HashMap<u32, Vec<String>>, Error> {
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        return Ok(HashMap::new());
+    };
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames: HashMap<u32, String> = db
+        .names()
+        .into_iter()
+        .map(|(id, n)| (id, n.to_owned()))
+        .collect();
+    let mut fields: BTreeMap<String, usize> = BTreeMap::new();
+    let mut users: HashMap<u32, Vec<String>> = HashMap::new();
+    for c in &db.components {
+        let Some(records) = c.records() else {
+            continue;
+        };
+        for (id, r) in records {
+            for f in &c.fields {
+                let at = usize::from(f.offset);
+                let Some(b) = r.get(at..at + 4) else {
+                    continue;
+                };
+                let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                if effects.contains(&v) {
+                    let field = format!("{}.{}", c.name, names.show(f.name_hash));
+                    *fields.entry(field.clone()).or_default() += 1;
+                    let t = tnames.get(&id).map_or("?", String::as_str);
+                    users.entry(v).or_default().push(format!("{t} {field}"));
+                }
+            }
+        }
+    }
+    println!("-- template fields naming effects");
+    for (f, n) in fields {
+        println!("  {f} x{n}");
+    }
+    Ok(users)
+}
+
+/// Setting names solved from their hashes (`sizevar` and the rest).
+const EFFECT_SETTING_NAMES: &[&str] = &[
+    "sizevar",
+    "speedvar",
+    "spreadvar",
+    "massvar",
+    "posy",
+    "rotx",
+    "roty",
+    "rotz",
+    "life",
+    "lifevar",
+    "rate",
+    "ratevar",
+    "emissiondir",
+    "forcegravity",
+    "forcedrag",
+    "forcewind",
+    "inheritvel",
+    "decay",
+    "forcegravityvar",
+    "forcedragvar",
+    "forcewindvar",
+    "inheritvelvar",
+    "scale",
+    "radial",
+];
+
+fn setting_name(names: &Names, h: u32) -> String {
+    EFFECT_SETTING_NAMES
+        .iter()
+        .find(|n| hash_parts(&[n]) == h)
+        .map_or_else(
+            || names.get(h).map_or(format!("{h:08x}"), str::to_owned),
+            |n| (*n).to_owned(),
+        )
+}
+
+/// One effect's emitters in full: settings, colour keys, textures.
+fn effect_detail(names: &Names, fx: &m2_assets::effect::Effect) {
+    let show = |list: &[m2_assets::effect::Attr]| {
+        list.iter()
+            .enumerate()
+            .map(|(i, a)| match a.name {
+                Some(n) if a.kind & 1 == 1 => format!(
+                    "{}={}{}",
+                    setting_name(names, n),
+                    a.float(),
+                    if a.flags != 0 {
+                        format!("/f{}", a.flags)
+                    } else {
+                        String::new()
+                    }
+                ),
+                Some(n) => format!(
+                    "{}=#{:x}{}",
+                    setting_name(names, n),
+                    a.int(),
+                    if a.kind != 0 {
+                        format!("/k{:x}", a.kind)
+                    } else {
+                        String::new()
+                    }
+                ),
+                None => format!("@{i}={:?}", a.keys),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for (i, e) in fx.emitters.iter().enumerate() {
+        println!(
+            "    emitter {i} shape {:02x?} tex {} first {:08x?}",
+            e.shape_ref,
+            e.textures.len(),
+            e.textures.first()
+        );
+        println!("      trfm {}", show(&e.transform));
+        println!("      ptyp {}", show(&e.particle));
+        let keys: Vec<String> = [0usize, 10, 25, 50, 75, 99]
+            .iter()
+            .filter_map(|&k| e.colour.get(k))
+            .map(|c| format!("{:?} {:.2} {:.2}", c.rgba(), c.intensity, c.unknown_6))
+            .collect();
+        println!("      colr {}", keys.join(" | "));
+    }
+    for f in &fx.forces {
+        println!("    force {}", show(f));
+    }
 }

@@ -774,6 +774,8 @@ impl Game {
                     },
                     1.2,
                 );
+                self.combat
+                    .show_fx(crate::combat::fx::CRATE, at + Vec3::Y * 0.6);
             }
             // What lies within her reach: a weapon taken up with the use
             // key; ammunition and health as she walks over them, if they
@@ -819,7 +821,19 @@ impl Game {
         self.drop_pickups();
         self.support_impacts();
         self.strike_impacts(dt);
+        self.run_particles(dt);
         self.scene.tick(dt);
+    }
+
+    /// Sets off the game's effects the fight asked for and runs them.
+    fn run_particles(&mut self, dt: f32) {
+        let asked = std::mem::take(&mut self.combat.game_fx);
+        let scene = &mut self.scene;
+        let (Some(p), Some(world)) = (scene.particles.as_mut(), scene.world.as_ref()) else {
+            return;
+        };
+        p.take(asked, &world.index.template_db);
+        p.step(dt);
     }
 
     /// The soldiers killed this tick leave what their death script picks,
