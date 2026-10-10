@@ -1531,6 +1531,7 @@ impl Fleet {
                 let models = object_models(g, &o.name, island, &catalogue.vehicles);
                 (!models.is_empty()).then_some((d, g, models))
             })
+            .filter(|(_, g, models)| !ai_flown(&w, *g, models))
             .collect();
         // Those the scripts still have in play count against the most.
         let live = self
@@ -2530,6 +2531,21 @@ pub(crate) fn records(templates: &Templates, id: u32) -> String {
     format!("[{}]", named.join(", "))
 }
 
+/// A helicopter of the scripts' with someone other than her aboard (the
+/// pilot a `(Driver)` spawn comes with): it is in the air, flown by them,
+/// and only shown while it flies a delivery ([`fly`]). Parked as a vehicle
+/// of hers it stood on the ground where it was made, rotors turning, with
+/// nothing to bump into (playtest 3, BUGLIST #3, alpha recording 7:42).
+/// One she is in herself is still hers (inferred).
+fn ai_flown(w: &m2_game::api::ScriptWorld, guid: u32, models: &[CatalogueEntry]) -> bool {
+    models
+        .iter()
+        .any(|m| m.kind == m2_engine::vehicle::HELICOPTER)
+        && w.objects
+            .iter()
+            .any(|(&g, o)| o.vehicle == Some(guid) && Some(g) != w.player)
+}
+
 /// The models one of the scripts' objects drives as
 /// ([`template_models`]): by its name, else (a state layer's renamed
 /// entity, the first contract's `VzaCon001_StartingBoat`) by the template
@@ -2984,6 +3000,35 @@ mod tests {
         assert!(models("Alouette3 Transport (VZA Intro) (Driver)").is_empty());
         assert!(models("VZ Soldier 0x00000001").is_empty());
         assert!(models("Supply Drop (GL)").is_empty());
+    }
+
+    #[test]
+    fn helicopters_their_pilots_fly_are_not_parked_for_her() {
+        use m2_game::api::{Object, ScriptWorld};
+        let heli = [entry(4, "helicopter", "vz_veh_helicopter_alouetteiii")];
+        let tank = [entry(3, "tank", "vz_veh_tank_amx30")];
+        let mut w = ScriptWorld::default();
+        w.player = Some(1);
+        w.insert(1, Object::new("Jennifer", [0.0; 3]));
+        w.insert(
+            10,
+            Object::new("Alouette3 Transport (VZA Intro) (Driver)", [0.0; 3]),
+        );
+        w.insert(20, Object::new("AMX30", [0.0; 3]));
+        // Empty, it is hers to take.
+        assert!(!ai_flown(&w, 10, &heli));
+        let mut pilot = Object::new("Pilot", [0.0; 3]);
+        pilot.vehicle = Some(10);
+        w.insert(11, pilot);
+        assert!(ai_flown(&w, 10, &heli));
+        // A crewed ground vehicle is still parked; one she flies is hers.
+        let mut driver = Object::new("Pilot", [0.0; 3]);
+        driver.vehicle = Some(20);
+        w.insert(21, driver);
+        assert!(!ai_flown(&w, 20, &tank));
+        w.objects.remove(&11);
+        w.objects.get_mut(&1).unwrap().vehicle = Some(10);
+        assert!(!ai_flown(&w, 10, &heli));
     }
 
     #[test]
