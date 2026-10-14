@@ -423,7 +423,7 @@ pub fn check(
             );
             continue;
         };
-        let before = reaction(game, item.key);
+        let before = reaction(game, item.key, item.template);
         let centre = place.transform_point3((bounds.0 + bounds.1) * 0.5);
         let half = (bounds.1 - bounds.0).length() * 0.5;
         let floor = item.position.y;
@@ -493,7 +493,7 @@ pub fn check(
             }
             run(game, SETTLE);
         }
-        let mut got = reaction(game, item.key);
+        let mut got = reaction(game, item.key, item.template);
         // Standing with nothing in the way: a blast leaves it be.
         if hit == HitKind::Blast && got == Reaction::None {
             got = Reaction::Block;
@@ -557,7 +557,7 @@ fn placed_box(game: &crate::game::Game, key: StaticKey) -> Option<(Mat4, (Vec3, 
 
 /// How `key` stands now: one brought down is broken if its model shows a
 /// wreck (or it broke into its pieces), else it vanished.
-fn reaction(game: &crate::game::Game, key: StaticKey) -> Reaction {
+fn reaction(game: &crate::game::Game, key: StaticKey, template: u32) -> Reaction {
     let Some(world) = game.scene.world.as_ref() else {
         return Reaction::None;
     };
@@ -580,6 +580,10 @@ fn reaction(game: &crate::game::Game, key: StaticKey) -> Reaction {
     match (knocked, down) {
         (Some(true), _) | (None, Some(true)) => Reaction::Break,
         (Some(false), _) => Reaction::Move,
+        // Gone, blown up as its template says (an explosive barrel): broken.
+        (None, Some(false)) if crate::destruct::explodes(&world.index.template_db, template) => {
+            Reaction::Break
+        }
         (None, Some(false)) => Reaction::Vanish,
         (None, None) if world.physics.has_static(key) => Reaction::Block,
         (None, None) => Reaction::None,
