@@ -1,6 +1,6 @@
 name: CI
 
-# Runs on Brendan's PC (a self-hosted Windows x64 runner labelled m2-pc),
+# Runs on the test PC (a self-hosted Windows x64 runner labelled m2-pc),
 # not GitHub's machines: the private repo's free Actions minutes ran out.
 # The runner keeps its checkout and target directory between runs, so
 # builds are incremental and need no cache step.

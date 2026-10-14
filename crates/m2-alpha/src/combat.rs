@@ -360,7 +360,7 @@ const VZ_ACCURACY: f32 = 0.4;
 /// `DamageKey`s. Her grenades', rockets', tank shells' and C4's
 /// explosions are `Explosion` (0.2); the satellite bomb's and its final
 /// strike's `ExplosionLarge` (0.5), its frag's `BulletLarge` (0.4). The
-/// defaults are the table's cells as read on Brendan's PC (rounds
+/// defaults are the table's cells as read on the test PC (rounds
 /// 158-160, heroes round 04); the game reads them from the table.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HeroDamage {
