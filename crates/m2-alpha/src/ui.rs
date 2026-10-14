@@ -583,24 +583,42 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     if game.is_none() {
         stand_in(&painter, screen, info, &text);
     }
+    // What the use key does here: with a pad, after its Y (the layout's
+    // `Action`) as the game draws it.
+    let use_prompt = |what: &str| {
+        let at = screen.center() + vec2(0.0, 60.0);
+        let pad = info.game.as_ref().is_some_and(|s| s.pad);
+        if let Some(game) = game.filter(|_| pad) {
+            let size = 17.0;
+            let width = ctx.fonts_mut(|f| {
+                f.layout_no_wrap(what.to_owned(), FontId::proportional(size), white)
+                    .size()
+                    .x
+            });
+            let icon = size * 1.6;
+            let left = at.x - (icon + 6.0 + width) / 2.0;
+            let r = egui::Rect::from_min_size(egui::pos2(left, at.y - 4.0), vec2(icon, icon));
+            game.paint_texture(&painter, crate::pad::Button::Y.texture(), r, Color32::WHITE);
+            text(
+                egui::pos2(left + icon + 6.0, at.y),
+                Align2::LEFT_TOP,
+                what,
+                size,
+                white,
+            );
+        } else {
+            text(at, Align2::CENTER_TOP, &format!("E: {what}"), 17.0, white);
+        }
+    };
     if let Some(prompt) = &info.prompt {
-        text(
-            screen.center() + vec2(0.0, 60.0),
-            Align2::CENTER_TOP,
-            &format!("E: {prompt}"),
-            17.0,
-            white,
-        );
+        use_prompt(prompt);
     } else if let Some(name) = &info.can_enter
         && info.driving.is_none()
     {
-        text(
-            screen.center() + vec2(0.0, 60.0),
-            Align2::CENTER_TOP,
-            &format!("E: get in the {}", name.trim_start_matches("global_veh_")),
-            17.0,
-            white,
-        );
+        use_prompt(&format!(
+            "get in the {}",
+            name.trim_start_matches("global_veh_")
+        ));
     }
     if info.down {
         text(

@@ -211,6 +211,13 @@ scripts give the bomb once she has looked at it).
 The contract done, Enter closes its fanfare and the flow goes on.
 M music on/off, Tab or right mouse captures the mouse, F11 fullscreen,
 Escape opens the menu (settings, save and load, quit).
+An Xbox pad (One, Series or 360) plays as the game's own layout has it:
+left stick move (L3 sprint), right stick look, A jump, B melee, X reload,
+Y get in/use, RT fire, LT crouch, LB throw, RB switch weapon, R3 aim,
+d-pad up/down support, left next explosive, right detonate, Back PDA,
+Start menu. Driving: A forward, X reverse, LT handbrake, Y out. In the
+menus A is Enter, B back, the d-pad moves. While the pad is used, the
+HUD's prompts show its buttons.
 The developer's keys (--dev, or any launch but the whole game's): V
 switches to the free camera (WASD moves, Space/C up/down, Shift faster;
 not while the scripts have her controls off) and back to her where she

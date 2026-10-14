@@ -340,9 +340,24 @@ pub struct Screen {
     /// The keys bound to control words the fonts have no picture for
     /// (`l-stick up`: `T`), by word in lower case ([`Screen::set_key_names`]).
     key_names: BTreeMap<String, String>,
+    /// An Xbox pad plays: control words show its pictures
+    /// ([`pad_picture`]) and `Gui.IsXboxController` answers true.
+    pad: bool,
 }
 
 impl Screen {
+    /// An Xbox pad plays (or the keyboard and mouse again): texts show
+    /// the pad's button pictures for their control words, and the
+    /// scripts that ask `Gui.IsXboxController` (the hijack's buttons,
+    /// `MrxGuiHudActionHijack`) pick their Xbox pictures.
+    pub fn set_pad(&mut self, pad: bool) {
+        self.pad = pad;
+    }
+
+    pub fn pad(&self) -> bool {
+        self.pad
+    }
+
     /// Names the keys bound to control words (`[l-stick up]`):
     /// a text shows such a word as its key in brackets (`[T]`) where the
     /// fonts have no button picture for it ([`button_glyph`]).
@@ -650,6 +665,18 @@ impl Screen {
             } else if let Some(c) = colour_name(id).filter(|_| parts.len() == 1) {
                 out.push(TextSpan {
                     colour: Some(c),
+                    ..TextSpan::default()
+                });
+            } else if let Some(picture) = pad_picture(id).filter(|_| self.pad && parts.len() == 1) {
+                // Inline, as the objective icons are.
+                let colour = out.last().and_then(|s| s.colour);
+                out.push(TextSpan {
+                    colour,
+                    icon: Some(picture.to_owned()),
+                    ..TextSpan::default()
+                });
+                out.push(TextSpan {
+                    colour,
                     ..TextSpan::default()
                 });
             } else if let Some(glyph) = button_glyph(id).filter(|_| parts.len() == 1) {
@@ -1109,6 +1136,61 @@ pub fn button_glyph(word: &str) -> Option<char> {
     })
 }
 
+/// The pad picture a control word stands for while an Xbox pad plays
+/// ([`Screen::set_pad`]): one of the console's button textures vz.wad
+/// keeps (`button_a`, `button_trigger_r`...), drawn inline as the
+/// objective icons are.
+///
+/// From the game's data, two tables:
+/// - the HUD movies' text formatter (`formatText`, as [`button_glyph`]
+///   gives it): `[confirm]` A, `[bash]`, `[honk]` and `[cancel]` B,
+///   `[reload]` X, `[action]` Y, `[move]` and `[left stick]` the left
+///   stick, `[sswitch]` the d-pad's left;
+/// - the pause screen's pad layout on foot (`tControlMap.human`, by the
+///   scripts' `Joystick.BUTTON_*` numbers, which the shell's
+///   `controllerText` puts by the pad's parts: 17 the left trigger, 18
+///   the left bumper, 19 the left stick's press, 20 to 22 the right's,
+///   23 Start, 24 Back): `[jump]` A, `[crouch]` the left trigger,
+///   `[sfire]` (`Use_Explosive`) the left bumper, `[sprint]` the left
+///   stick's press, `[pfire]` the right trigger, `[pswitch]` the right
+///   bumper, `[zoom]` the right stick's press, `[pause]` Start, `[pda]`
+///   Back (the texture `button_select`), `[support]` the d-pad's up
+///   (`Support_Menu`, up and down). The formatter has `[support]` on the
+///   left stick's press instead; the layout, which also puts sprint there,
+///   is taken.
+///
+/// `[aim]` is the right stick, which the shell's own sample layout labels
+/// `Aim Reticle/Camera`. The d-pad words, and the stick pushes the texts
+/// name (`[left stick up]`, `[r-stick down]`), are their own pictures
+/// (`button_joystick_l_up`...), which the PC font has none of.
+pub fn pad_picture(word: &str) -> Option<&'static str> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "confirm" | "jump" => "button_a",
+        "bash" | "honk" | "cancel" => "button_b",
+        "reload" => "button_x",
+        "action" => "button_y",
+        "move" | "left stick" => "button_joystick_l",
+        "left stick up" | "l-stick up" => "button_joystick_l_up",
+        "left stick down" | "l-stick down" => "button_joystick_l_down",
+        "r-stick up" | "right stick up" => "button_joystick_r_up",
+        "r-stick down" | "right stick down" => "button_joystick_r_down",
+        "aim" => "button_joystick_r",
+        "crouch" => "button_trigger_l",
+        "sfire" => "button_bumper_l",
+        "sprint" => "button_joystick_l_press",
+        "pfire" => "button_trigger_r",
+        "pswitch" => "button_bumper_r",
+        "zoom" => "button_joystick_r_press",
+        "pause" => "button_start",
+        "pda" => "button_select",
+        "support" | "dpad up" => "button_dpad_up",
+        "dpad down" => "button_dpad_down",
+        "dpad left" | "sswitch" => "button_dpad_left",
+        "dpad right" => "button_dpad_right",
+        _ => return None,
+    })
+}
+
 /// The texture an inline icon word stands for (`MrxUtil.tInlineIcons`:
 /// `[objdeliver]`, and `[objdeliver2]` for secondary objectives), by the
 /// objective icon textures' names (`HUD_objective_deliverable`...).
@@ -1480,6 +1562,14 @@ pub fn install(lua: &Lua) -> mlua::Result<ScreenRef> {
             let [x, y] = s.borrow().reticle;
             ret(lua, (x, y))
         })?,
+    )?;
+    // `Gui.IsXboxController()`: whether an Xbox pad plays. The PC's own
+    // hijack HUD asks it to pick `icon_hijack_xbox_button_*` over its
+    // keyboard pictures.
+    let s = Rc::clone(&screen);
+    gui.raw_set(
+        "IsXboxController",
+        safe_function(lua, move |lua, _| ret(lua, s.borrow().pad))?,
     )?;
     // `Player.GetCameraXZHeading(owner)`, likewise in `Player`.
     let player = match lua.globals().raw_get::<Value>("Player")? {
@@ -2621,6 +2711,82 @@ mod tests {
             assert!(!given.contains(&g), "{g:?}");
         }
         assert_eq!(given.len() + UNMATCHED_GLYPHS.len(), 0x14);
+    }
+
+    #[test]
+    fn with_a_pad_control_words_are_its_button_textures() {
+        let mut s = Screen::default();
+        s.set_pad(true);
+        let spans = s.spans("[green][reload] Reload[n][jump] Handbrake");
+        let icons: Vec<_> = spans.iter().filter_map(|s| s.icon.as_deref()).collect();
+        assert_eq!(icons, ["button_x", "button_a"]);
+        // In the colour so far, and the text goes on after each.
+        assert!(spans.iter().all(|s| s.colour == colour_name("green")));
+        assert_eq!(s.display_text("[reload] Reload"), " Reload");
+        // The formatter's face buttons, and the pause screen's layout.
+        for (w, t) in [
+            ("confirm", "button_a"),
+            ("bash", "button_b"),
+            ("action", "button_y"),
+            ("move", "button_joystick_l"),
+            ("sswitch", "button_dpad_left"),
+            ("pfire", "button_trigger_r"),
+            ("crouch", "button_trigger_l"),
+            ("sfire", "button_bumper_l"),
+            ("pswitch", "button_bumper_r"),
+            ("sprint", "button_joystick_l_press"),
+            ("zoom", "button_joystick_r_press"),
+            ("pause", "button_start"),
+            ("pda", "button_select"),
+            ("support", "button_dpad_up"),
+            ("left stick up", "button_joystick_l_up"),
+            ("r-stick down", "button_joystick_r_down"),
+        ] {
+            assert_eq!(pad_picture(w), Some(t), "{w}");
+        }
+        // Every word the PC font has a picture for has a pad one too.
+        for w in [
+            "jump",
+            "bash",
+            "honk",
+            "cancel",
+            "reload",
+            "action",
+            "crouch",
+            "pfire",
+            "confirm",
+            "sfire",
+            "pswitch",
+            "move",
+            "left stick",
+            "aim",
+            "sprint",
+            "zoom",
+            "pda",
+            "pause",
+            "dpad left",
+            "sswitch",
+            "dpad right",
+            "dpad up",
+            "dpad down",
+            "support",
+        ] {
+            assert!(button_glyph(w).is_some(), "{w}");
+            assert!(pad_picture(w).is_some(), "{w}");
+        }
+        // Without the pad, the PC font's glyphs as before.
+        s.set_pad(false);
+        assert_eq!(s.display_text("[reload] Reload"), "\u{e002} Reload");
+    }
+
+    #[test]
+    fn the_hijack_hud_asks_whether_an_xbox_pad_plays() {
+        let (host, screen) = host();
+        run(&host, "a = Gui.IsXboxController()");
+        assert!(!host.lua().globals().get::<bool>("a").unwrap());
+        screen.borrow_mut().set_pad(true);
+        run(&host, "b = Gui.IsXboxController()");
+        assert!(host.lua().globals().get::<bool>("b").unwrap());
     }
 
     #[test]

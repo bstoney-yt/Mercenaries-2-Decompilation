@@ -56,6 +56,7 @@ mod movie;
 mod moving;
 mod multiply;
 mod npc;
+mod pad;
 mod player;
 mod props;
 mod route;
@@ -604,13 +605,9 @@ fn main() -> anyhow::Result<()> {
             turn: options.turn,
         })
     } else if install.is_some() {
-        // Free roam starts at the PMC's headquarters (found in the layers);
-        // a mission's scripts move her from the first town.
-        Mode::Island(
-            options
-                .spawn
-                .or(options.mission.then_some(scene::DEFAULT_SPAWN)),
-        )
+        // Free roam starts at the PMC's headquarters, a mission at the
+        // first contract's spawn point (both found in the layers).
+        Mode::Island(options.spawn)
     } else {
         Mode::Models(Showcase {
             models: vec![scene::DEFAULT_MODEL],
@@ -706,7 +703,12 @@ fn build_scene(
                     sea_level,
                     ..WorldSettings::default()
                 };
-                scene.open_world(backend, install, settings, *spawn)?;
+                let start = if mission {
+                    scene::MISSION_START
+                } else {
+                    scene::FREE_ROAM_START
+                };
+                scene.open_world(backend, install, settings, *spawn, start)?;
             }
             Mode::Models(show) => {
                 scene.open(install)?;
@@ -4365,6 +4367,8 @@ struct Running {
     /// Whether she was driving last tick (getting in is worth a word).
     was_driving: bool,
     input: Input,
+    /// The Xbox pad, read each frame into `input`.
+    pad: pad::Pad,
     /// The mouse is captured and its pointer hidden: in play, as the
     /// game's (the pointer shows only in the front end and the pause
     /// menu), unless the mouse key let it go (`released`) or the window
@@ -4488,6 +4492,7 @@ impl App {
             },
             was_driving: false,
             input: Input::default(),
+            pad: pad::Pad::default(),
             mouse_look: false,
             released: false,
             focused,
@@ -4600,6 +4605,7 @@ impl Running {
     /// open) and draws a frame with the HUD.
     fn frame(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
         let now = Instant::now();
+        self.read_pad((now - self.last).min(MAX_FRAME).as_secs_f64());
         self.lag += (now - self.last).min(MAX_FRAME);
         self.last = now;
         while self.lag >= TICK {
@@ -4647,6 +4653,7 @@ impl Running {
             let mut state = gamehud::HudState::of(&mut self.game);
             state.buttons = buttons;
             state.gui_calls = gui_calls;
+            state.pad = self.input.pad();
             info.game = Some(state);
         }
         let (action, output) = self.hud.build(input, &info, config);
@@ -4724,6 +4731,65 @@ impl Running {
             self.fps = (now, 0);
         }
         Ok(())
+    }
+
+    /// Reads the Xbox pad into the input (`dt` seconds since the last
+    /// read), and hands its menu keys on: to the front end while it holds
+    /// the screen, else as keys to the menus and the HUD's movies (the
+    /// PDA, a fanfare), A being Enter.
+    fn read_pad(&mut self, dt: f64) {
+        if !self.focused {
+            return;
+        }
+        let driving = self.game.driving().is_some();
+        let keys = self.pad.poll(&mut self.input, driving, dt);
+        for key in keys {
+            use pad::MenuKey;
+            if let Some(flow) = self.flow.as_mut().filter(|f| f.holds()) {
+                flow.key(match key {
+                    MenuKey::Enter => KeyCode::Enter,
+                    MenuKey::Escape => KeyCode::Escape,
+                    MenuKey::Up => KeyCode::ArrowUp,
+                    MenuKey::Down => KeyCode::ArrowDown,
+                    MenuKey::Left => KeyCode::ArrowLeft,
+                    MenuKey::Right => KeyCode::ArrowRight,
+                });
+                continue;
+            }
+            // The pause menu's buttons are egui's: up and down step its
+            // focus as Tab does (egui's arrows need one focused first).
+            let menu = self.hud.menu;
+            let (egui_key, modifiers) = match key {
+                MenuKey::Enter => (egui::Key::Enter, egui::Modifiers::NONE),
+                MenuKey::Escape => {
+                    // B leaves the pause menu as Escape does (in play, B
+                    // is the bash).
+                    if menu {
+                        self.close_menu();
+                    }
+                    continue;
+                }
+                MenuKey::Up if menu => (egui::Key::Tab, egui::Modifiers::SHIFT),
+                MenuKey::Down if menu => (egui::Key::Tab, egui::Modifiers::NONE),
+                MenuKey::Up => (egui::Key::ArrowUp, egui::Modifiers::NONE),
+                MenuKey::Down => (egui::Key::ArrowDown, egui::Modifiers::NONE),
+                MenuKey::Left => (egui::Key::ArrowLeft, egui::Modifiers::NONE),
+                MenuKey::Right => (egui::Key::ArrowRight, egui::Modifiers::NONE),
+            };
+            if key == MenuKey::Enter && !menu {
+                self.buttons.push("selection".into());
+            }
+            let events = &mut self.egui.egui_input_mut().events;
+            for pressed in [true, false] {
+                events.push(egui::Event::Key {
+                    key: egui_key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                });
+            }
+        }
     }
 
     fn open_menu(&mut self) {
@@ -4995,7 +5061,10 @@ impl ApplicationHandler for App {
                 state: ElementState::Pressed,
                 button: winit::event::MouseButton::Right | winit::event::MouseButton::Left,
                 ..
-            } if !state.mouse_look && !state.hud.menu => state.released = false,
+            } if !state.mouse_look && !state.hud.menu => {
+                state.released = false;
+                state.input.mouse_used();
+            }
             // With the mouse captured, the buttons fire, aim and bash.
             WindowEvent::MouseInput {
                 state: pressed,
@@ -5009,6 +5078,9 @@ impl ApplicationHandler for App {
                     _ => None,
                 };
                 if let Some(a) = action {
+                    if pressed == ElementState::Pressed {
+                        state.input.mouse_used();
+                    }
                     state.input.button(a, pressed == ElementState::Pressed);
                 }
             }
