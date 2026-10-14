@@ -196,6 +196,16 @@ struct Loaders {
 }
 
 impl Props {
+    /// How many of `entity`'s `parts` (those its template's objects are
+    /// broken in, one at a time, by vehicles: a hedge's sections) stand:
+    /// none once it is wrecked or gone.
+    pub fn parts_standing(&self, entity: u32, parts: usize) -> usize {
+        match self.shown.get(&entity) {
+            Some(p) if !p.wrecked => parts,
+            _ => 0,
+        }
+    }
+
     /// The model of shown prop `entity`, and where it stands.
     pub fn placed(&self, entity: u32) -> Option<(u32, Vec3)> {
         self.shown.get(&entity).map(|p| (p.model, p.position))

@@ -283,6 +283,10 @@ pub struct Templates {
     pub effects: HashMap<u32, Vec<u32>>,
     /// How vehicles break each template's objects running into them.
     pub crashable: HashMap<u32, crate::durability::Crash>,
+    /// The parts of a template's objects vehicles break one at a time
+    /// (a hedge's sections, a gate's leaves), by id, each by its node's
+    /// name hash ([`crate::durability::crash_parts`]).
+    pub crash_parts: HashMap<u32, Vec<(u32, crate::durability::Crash)>>,
     /// The sound each template's objects make breaking (its `SoundKey`),
     /// by id ([`crate::durability::sound_keys`]).
     pub sound_keys: HashMap<u32, u32>,
@@ -670,6 +674,7 @@ impl Templates {
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
             crashable: crate::durability::crashable(&db),
+            crash_parts: crate::durability::crash_parts(&db),
             sound_keys: crate::durability::sound_keys(&db),
             prop_physics: crate::durability::prop_physics(&db),
             projectiles: crate::durability::projectiles(&db),

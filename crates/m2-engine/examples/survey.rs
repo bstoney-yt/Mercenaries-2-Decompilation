@@ -206,6 +206,21 @@
 //!                           and state, the handler kind and its commands
 //!                           (operands by name, node with its height, or
 //!                           number), and every node's height and box
+//! wrecks[:<word>,..]        across every model with a state machine, its
+//!                           geometry nodes by whether they show intact,
+//!                           wrecked, both or never; then each model with
+//!                           a wreck whose switched parts show both ways
+//!                           (or those whose name holds a word)
+//! doubles:<file>[,x0,z0,x1,z1] what stands twice: with the layers a run
+//!                           had in (its `state layers loaded:` line in
+//!                           the file), every two placed models or
+//!                           vehicles whose boxes lie one within the
+//!                           other (within the box, if given)
+//! treefit[:x0,z0,x1,z1]     how far the tree table's trees stand off the
+//!                           full-detail ground (default the villa's box),
+//!                           as decoded and moved by up to 12 m, per
+//!                           species and on slopes; the layers' plants
+//!                           likewise; the trees near a road's line
 //! ```
 //!
 //! Names come from every NUL-terminated string in the four archives and
@@ -1034,6 +1049,29 @@ fn main() -> Result<(), Error> {
             "breakables" => breakables(&mut source, &names, arg),
             "trees" => trees(&mut source, &names, arg),
             "stam" => stam(&mut source, &names, arg),
+            "wrecks" => wrecks(&mut source, &names, arg),
+            "treefit" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                treefit(
+                    &mut source,
+                    world.as_ref().expect("just built"),
+                    &names,
+                    arg,
+                )
+            }
+            "doubles" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                doubles(
+                    &mut source,
+                    world.as_ref().expect("just built"),
+                    &names,
+                    arg,
+                )
+            }
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
             "names" => names_holding(&mut source, &names, arg),
@@ -6853,6 +6891,606 @@ fn destruct_names(names: &Names) -> Names {
         names.add(w);
     }
     names
+}
+
+/// `wrecks[:<word>,..]`: across every model with a state machine, what
+/// its parts show intact and wrecked ([`m2_assets::model::PartStates::hidden`]
+/// as the alpha reads it): each node with geometry by whether it shows
+/// intact, wrecked, both or never, counting apart the nodes a switchable
+/// node governs that show both ways (a part the machine switches that
+/// stays up on the wreck: a gate's leaves standing over their own
+/// broken pieces). Then each model with such nodes, by name, or only
+/// those whose name holds a word.
+fn wrecks<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let index = source.archive().index();
+    let mut models: Vec<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    let (mut with_states, mut with_wreck, mut flagged) = (0usize, 0usize, 0usize);
+    // Geometry nodes: intact only, wrecked only, both, never; and of
+    // the both, those a switchable node governs.
+    let mut classes = [0usize; 5];
+    let mut lines = Vec::new();
+    for h in models {
+        let Ok(data) = source.model(h) else { continue };
+        let Ok(m) = data.parse() else { continue };
+        let Some(st) = &m.states else { continue };
+        with_states += 1;
+        let (intact, wrecked) = (st.hidden(&m.nodes, false), st.hidden(&m.nodes, true));
+        if intact != wrecked {
+            with_wreck += 1;
+        }
+        let governed = |i: usize| {
+            let mut at = Some(i as u16);
+            let mut steps = 0;
+            while let Some(n) = at {
+                if st.switchable.contains(&n) {
+                    return true;
+                }
+                at = m.nodes.get(usize::from(n)).and_then(|x| x.parent);
+                steps += 1;
+                if steps > m.nodes.len() {
+                    break;
+                }
+            }
+            false
+        };
+        let mut geometry: Vec<usize> = m.segments.iter().map(|s| usize::from(s.node)).collect();
+        geometry.sort_unstable();
+        geometry.dedup();
+        let mut both = Vec::new();
+        for &i in &geometry {
+            let on = |h: &[bool]| !h.get(i).copied().unwrap_or(false);
+            let k = match (on(&intact), on(&wrecked)) {
+                (true, false) => 0,
+                (false, true) => 1,
+                (true, true) => 2,
+                (false, false) => 3,
+            };
+            classes[k] += 1;
+            if k == 2 && intact != wrecked && governed(i) {
+                classes[4] += 1;
+                both.push(i);
+            }
+        }
+        if both.is_empty() {
+            continue;
+        }
+        flagged += 1;
+        let name = names.show(h).to_string();
+        if words.is_empty() || words.iter().any(|w| name.to_ascii_lowercase().contains(w)) {
+            let nodes: Vec<String> = both
+                .iter()
+                .map(|&i| {
+                    let n = &m.nodes[i];
+                    let size: Vec<String> = (0..3)
+                        .map(|k| format!("{:.1}", n.bounds_max[k] - n.bounds_min[k]))
+                        .collect();
+                    format!("n{i} {}", size.join("x"))
+                })
+                .collect();
+            lines.push(format!(
+                "wreck-both\t{h:08x}\t{name}\t{}\t{}",
+                both.len(),
+                nodes.join(", ")
+            ));
+        }
+    }
+    println!(
+        "wrecks: {with_states} models with a state machine, {with_wreck} with a wreck; geometry nodes intact only {}, wrecked only {}, both {}, never {}; both under a switchable node on a model with a wreck {} on {flagged} models",
+        classes[0], classes[1], classes[2], classes[3], classes[4]
+    );
+    for l in lines {
+        println!("{l}");
+    }
+    Ok(())
+}
+
+/// `doubles:<layers file>[,x0,z0,x1,z1]`: what stands twice. The layers
+/// in (a run's `mission: state layers loaded:` line, or the names in a
+/// file, comma or line separated) place models, island and state layers
+/// alike, and vehicles; any two of those whose placed boxes lie one
+/// within the other, near enough (centres within 1 m, the smaller box at
+/// least 60% inside the larger), are listed: the same model twice, a
+/// vehicle and something else, or two other models (a gate's leaves in
+/// its arch stand so; so would a ruin over its pristine twin). Within the
+/// box when one is given. Each by its layer, entity and model.
+fn doubles<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_math::glam::Mat4;
+    let mut parts = arg.split(',');
+    let file = parts.next().unwrap_or_default();
+    let area: Vec<f32> = parts.filter_map(|v| v.parse().ok()).collect();
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let text = text
+        .split_once("state layers loaded:")
+        .map_or(text.as_str(), |(_, rest)| rest.lines().next().unwrap_or(""));
+    let loaded: HashSet<String> = text
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|w| w.trim().to_ascii_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if loaded.is_empty() {
+        println!("doubles: no layers read from {file}");
+        return Ok(());
+    }
+    // Each entity's layer and name, from every layer.
+    let index = source.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut layer_of: HashMap<u32, (String, String)> = HashMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            let lname = names.show(e.name_hash).to_string().to_ascii_lowercase();
+            let enames = layer.names();
+            for id in layer.placements().keys() {
+                let n = enames.get(id).copied().unwrap_or("").to_owned();
+                layer_of.insert(*id, (lname.clone(), n));
+            }
+        }
+    }
+    let inside = |p: Vec3| match area[..] {
+        [x0, z0, x1, z1] => p.x >= x0 && p.x <= x1 && p.z >= z0 && p.z <= z1,
+        _ => true,
+    };
+    let in_loaded = |entity: u32| {
+        // A tree belongs to no layer: always in.
+        m2_engine::world::tree_species(entity).is_some()
+            || layer_of
+                .get(&entity)
+                .is_some_and(|(l, _)| loaded.contains(l))
+    };
+    // (entity, model, place, what): what is placed in the loaded layers.
+    let mut placed: Vec<(u32, u32, Mat4, &str)> = Vec::new();
+    for o in &world.objects {
+        if inside(o.position) && in_loaded(o.entity) {
+            let at = Mat4::from_rotation_translation(o.rotation, o.position);
+            placed.push((o.entity, o.model, at, "island"));
+        }
+    }
+    for (e, o) in &world.state_objects {
+        if inside(o.position) && in_loaded(*e) {
+            let at = Mat4::from_rotation_translation(o.rotation, o.position);
+            placed.push((*e, o.model, at, "state"));
+        }
+    }
+    for v in world.templates.iter().chain(world.state_vehicles.values()) {
+        if let Some(model) = v.model
+            && inside(v.position)
+            && in_loaded(v.entity)
+        {
+            let at = Mat4::from_rotation_translation(v.rotation, v.position);
+            placed.push((v.entity, model, at, "vehicle"));
+        }
+    }
+    // Each model's box.
+    let mut boxes: HashMap<u32, Option<(Vec3, Vec3)>> = HashMap::new();
+    for &(_, m, _, _) in &placed {
+        boxes.entry(m).or_insert_with(|| {
+            let data = source.model(m).ok()?;
+            let b = data.parse().ok()?.info.bounds;
+            Some((Vec3::from(b.min), Vec3::from(b.max)))
+        });
+    }
+    // Each placed box in the world, axis-aligned round its turned corners.
+    let world_box = |m: u32, at: Mat4| -> Option<(Vec3, Vec3)> {
+        let (lo, hi) = (*boxes.get(&m)?)?;
+        let mut wlo = Vec3::splat(f32::MAX);
+        let mut whi = Vec3::splat(f32::MIN);
+        for k in 0..8 {
+            let c = Vec3::new(
+                if k & 1 == 0 { lo.x } else { hi.x },
+                if k & 2 == 0 { lo.y } else { hi.y },
+                if k & 4 == 0 { lo.z } else { hi.z },
+            );
+            let w = at.transform_point3(c);
+            wlo = wlo.min(w);
+            whi = whi.max(w);
+        }
+        Some((wlo, whi))
+    };
+    let items: Vec<(usize, (Vec3, Vec3))> = placed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(_, m, at, _))| Some((i, world_box(m, at)?)))
+        .filter(|(_, (lo, hi))| (*hi - *lo).min_element() > 0.05)
+        .collect();
+    // Binned by 8 m.
+    let mut bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let bin = |p: Vec3| ((p.x / 8.0).floor() as i32, (p.z / 8.0).floor() as i32);
+    for (k, (_, (lo, hi))) in items.iter().enumerate() {
+        bins.entry(bin((*lo + *hi) * 0.5)).or_default().push(k);
+    }
+    let what = |i: usize| {
+        let (e, m, _, kind) = placed[i];
+        let (l, n) = layer_of.get(&e).cloned().unwrap_or_default();
+        format!("{kind} {l} {e:08x} \"{n}\" model {m:08x} {}", names.show(m))
+    };
+    let vol = |a: Vec3, b: Vec3| {
+        let s = b - a;
+        s.x * s.y * s.z
+    };
+    let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut lines = Vec::new();
+    for (k, (i, (lo, hi))) in items.iter().enumerate() {
+        let c = (*lo + *hi) * 0.5;
+        let (bx, bz) = bin(c);
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                for &k2 in bins.get(&(bx + dx, bz + dz)).into_iter().flatten() {
+                    if k2 <= k {
+                        continue;
+                    }
+                    let (j, (lo2, hi2)) = &items[k2];
+                    let c2 = (*lo2 + *hi2) * 0.5;
+                    if c.distance(c2) > 1.0 {
+                        continue;
+                    }
+                    let shared = (hi.min(*hi2) - lo.max(*lo2)).max(Vec3::ZERO);
+                    let inner = shared.x * shared.y * shared.z;
+                    if inner < 0.6 * vol(*lo, *hi).min(vol(*lo2, *hi2)) {
+                        continue;
+                    }
+                    let (a, b) = (placed[*i], placed[*j]);
+                    let class = if a.1 == b.1 {
+                        "same model"
+                    } else if a.3 == "vehicle" || b.3 == "vehicle" {
+                        "vehicle and another"
+                    } else {
+                        "two models"
+                    };
+                    *tally.entry(class).or_default() += 1;
+                    lines.push(format!(
+                        "double\t{class}\t{:.1}\t{}\t{}",
+                        c.distance(c2),
+                        what(*i),
+                        what(*j)
+                    ));
+                }
+            }
+        }
+    }
+    println!(
+        "doubles: {} layers in, {} placed with a box{}; pairs {tally:?}",
+        loaded.len(),
+        items.len(),
+        if area.len() == 4 {
+            format!(" in {area:?}")
+        } else {
+            String::new()
+        }
+    );
+    lines.sort();
+    for l in lines {
+        println!("{l}");
+    }
+    Ok(())
+}
+
+/// `treefit[:x0,z0,x1,z1]`: whether the tree table's trees stand where
+/// their heights say. A tree's decoded height is the ground's under its
+/// true place (the town species stand on it, round DX), so on sloping
+/// ground a tree put a few metres off its place stands above or below
+/// the ground there. Over the trees in the box (default the villa's,
+/// 2293,-1400,3127,147) on full-detail ground: per species, the median
+/// gap between a tree's height and the ground under it as decoded, and
+/// under it moved by each offset of up to 12 m on x and z (half-metre
+/// steps); the offset with the least gap, and that gap. All species
+/// together the same, for the trees on a slope of at least 1 in 5; and
+/// the plants the layers place on such slopes, whose places are exact,
+/// for comparison. Then how many trees stand near a road's line.
+fn treefit<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    world: &WorldIndex,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let b: Vec<f32> = arg.split(',').filter_map(|v| v.parse().ok()).collect();
+    let area = match b[..] {
+        [x0, z0, x1, z1] => [x0, z0, x1, z1],
+        _ => [2293.0, -1400.0, 3127.0, 147.0],
+    };
+    let index = source.archive().index();
+    let Some(tree_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == m2_assets::tree::TREE_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no tree table");
+        return Ok(());
+    };
+    let table = m2_assets::TreeTable::parse(&source.asset(tree_hash, m2_assets::tree::TREE_TYPE)?)
+        .map_err(|e| e.to_string())?;
+    // The ground: every full-detail cell over the box (and 10 m round it),
+    // its upward-facing triangles binned by 4 m.
+    const BIN: f32 = 4.0;
+    let pad = 10.0;
+    let mut tris: Vec<[Vec3; 3]> = Vec::new();
+    for (&cell, &centre) in &world.cells {
+        // Cells are 200 m squares round their centres.
+        if centre.x + 100.0 < area[0] - pad
+            || centre.x - 100.0 > area[2] + pad
+            || centre.z + 100.0 < area[1] - pad
+            || centre.z - 100.0 > area[3] + pad
+        {
+            continue;
+        }
+        let Ok(mesh) = m2_engine::world::terrain_cell(source, cell, centre) else {
+            continue;
+        };
+        let p = mesh.positions();
+        for t in mesh.indices.chunks_exact(3) {
+            let v = [0, 1, 2].map(|k| mesh.origin + p[t[k] as usize]);
+            let n = (v[1] - v[0]).cross(v[2] - v[0]);
+            if n.length() > 1e-6 && (n.normalize().y).abs() > 0.2 {
+                tris.push(v);
+            }
+        }
+    }
+    let mut bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    let key = |x: f32, z: f32| ((x / BIN).floor() as i32, (z / BIN).floor() as i32);
+    for (i, t) in tris.iter().enumerate() {
+        let lo = key(
+            t[0].x.min(t[1].x).min(t[2].x),
+            t[0].z.min(t[1].z).min(t[2].z),
+        );
+        let hi = key(
+            t[0].x.max(t[1].x).max(t[2].x),
+            t[0].z.max(t[1].z).max(t[2].z),
+        );
+        if (hi.0 - lo.0 + 1) * (hi.1 - lo.1 + 1) > 64 {
+            continue;
+        }
+        for bx in lo.0..=hi.0 {
+            for bz in lo.1..=hi.1 {
+                bins.entry((bx, bz)).or_default().push(i);
+            }
+        }
+    }
+    // The highest ground at (x, z).
+    let ground = |x: f32, z: f32| -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for &i in bins.get(&key(x, z))? {
+            let [a, b, c] = tris[i];
+            let d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+            if d.abs() < 1e-9 {
+                continue;
+            }
+            let u = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / d;
+            let v = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / d;
+            let w = 1.0 - u - v;
+            if u < -1e-4 || v < -1e-4 || w < -1e-4 {
+                continue;
+            }
+            let y = u * a.y + v * b.y + w * c.y;
+            best = Some(best.map_or(y, |m: f32| m.max(y)));
+        }
+        best
+    };
+    // Offsets of up to 12 m each way, by half metres.
+    let steps: Vec<f32> = (-24..=24).map(|k| k as f32 * 0.5).collect();
+    let n = steps.len();
+    let zero = (n / 2) * n + n / 2;
+    let median = |v: &mut Vec<f32>| -> f32 {
+        if v.is_empty() {
+            return f32::NAN;
+        }
+        v.sort_by(f32::total_cmp);
+        v[v.len() / 2]
+    };
+    let slope = |x: f32, z: f32| {
+        [(1.0, 0.0), (0.0, 1.0)]
+            .iter()
+            .filter_map(|&(dx, dz)| {
+                Some(((ground(x + dx, z + dz)? - ground(x - dx, z - dz)?) / 2.0).abs())
+            })
+            .fold(0.0f32, f32::max)
+    };
+    // How `points` fit the ground: how many stand on it, the median gap
+    // as placed, and the offset with the least median gap and that gap.
+    let fit = |points: &[[f32; 3]]| -> (usize, f32, f32, f32, f32) {
+        let mut gaps: Vec<Vec<f32>> = vec![Vec::new(); n * n];
+        let mut on = 0;
+        for &[x, y, z] in points {
+            if ground(x, z).is_none() {
+                continue;
+            }
+            on += 1;
+            for (a, &dx) in steps.iter().enumerate() {
+                for (c, &dz) in steps.iter().enumerate() {
+                    if let Some(g) = ground(x + dx, z + dz) {
+                        gaps[a * n + c].push((y - g).abs());
+                    }
+                }
+            }
+        }
+        let meds: Vec<f32> = gaps.iter_mut().map(median).collect();
+        let (best, gap) = meds
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.is_finite())
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map_or((zero, f32::NAN), |(k, m)| (k, *m));
+        (on, meds[zero], steps[best / n], steps[best % n], gap)
+    };
+    let inside =
+        |&[x, _, z]: &[f32; 3]| x >= area[0] && x <= area[2] && z >= area[1] && z <= area[3];
+    println!(
+        "treefit: {} ground triangles over {area:?}; per species: trees on ground, median gap as decoded, best offset (dx, dz) within 12 m and its gap",
+        tris.len()
+    );
+    let mut sloped: Vec<[f32; 3]> = Vec::new();
+    for s in &table.species {
+        let trees: Vec<[f32; 3]> = s.trees.iter().map(|t| t.position).filter(inside).collect();
+        if trees.is_empty() {
+            continue;
+        }
+        sloped.extend(trees.iter().filter(|&&[x, _, z]| slope(x, z) >= 0.2));
+        let (on, as_placed, dx, dz, gap) = fit(&trees);
+        println!(
+            "treefit\t{:08x}\t{}\t{on}\t{as_placed:.2}\t({dx:+.1}, {dz:+.1})\t{gap:.2}",
+            s.template,
+            names.show(s.template)
+        );
+    }
+    let (on, as_placed, dx, dz, gap) = fit(&sloped);
+    println!(
+        "treefit all trees on slopes of 1 in 5 or more: {on}, median gap as decoded {as_placed:.2}, best offset ({dx:+.1}, {dz:+.1}) gap {gap:.2}"
+    );
+    // The same for what the layers place on the ground by name (plants,
+    // bushes, ferns), whose places are exact: they should fit as placed.
+    let plants: Vec<[f32; 3]> = world
+        .objects
+        .iter()
+        .filter(|o| m2_engine::world::tree_species(o.entity).is_none() && o.named)
+        .filter(|o| {
+            let n = names.show(o.model).to_string();
+            n.contains("plant") || n.contains("bush") || n.contains("fern")
+        })
+        .map(|o| o.position.to_array())
+        .filter(inside)
+        .filter(|&[x, _, z]| slope(x, z) >= 0.2)
+        .collect();
+    let (on, as_placed, dx, dz, gap) = fit(&plants);
+    println!(
+        "treefit layer plants on slopes of 1 in 5 or more: {on}, median gap as placed {as_placed:.2}, best offset ({dx:+.1}, {dz:+.1}) gap {gap:.2}"
+    );
+    // The trees standing near a road's line (the `Road` entities' paths,
+    // as the world index reads them): within 2 m, 3.5 m (what the world
+    // clears, `ROAD_CLEAR`) and 6 m (the half width of a two-lane road,
+    // the villa's drive: `RoadIntersection`'s 6 and -6).
+    let index = source.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut roads: Vec<(Vec3, m2_math::glam::Quat, u32)> = Vec::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            let Some(c) = layer.component("Road") else {
+                continue;
+            };
+            let placements = layer.placements();
+            for (entity, rec) in c.records().unwrap_or_default() {
+                let (Some(p), Some(path)) = (
+                    placements.get(&entity),
+                    rec.get(..4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                ) else {
+                    continue;
+                };
+                let q = m2_math::glam::Quat::from_array(p.rotation);
+                let q = if q.is_finite() && q.length() > 0.5 {
+                    q.normalize()
+                } else {
+                    m2_math::glam::Quat::IDENTITY
+                };
+                roads.push((Vec3::from(p.position), q, path));
+            }
+        }
+    }
+    let mut segments: Vec<[f32; 4]> = Vec::new();
+    let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
+    for &(at, q, path) in &roads {
+        let points = paths.entry(path).or_insert_with(|| {
+            source
+                .asset(path, m2_assets::path::PATH_TYPE)
+                .ok()
+                .and_then(|d| m2_assets::Path::parse(&d).ok())
+                .map(|p| p.points.into_iter().map(Vec3::from).collect())
+                .unwrap_or_default()
+        });
+        for w in points.windows(2) {
+            let (a, b) = (at + q * w[0], at + q * w[1]);
+            let near = |p: Vec3| {
+                p.x >= area[0] - 50.0
+                    && p.x <= area[2] + 50.0
+                    && p.z >= area[1] - 50.0
+                    && p.z <= area[3] + 50.0
+            };
+            if near(a) || near(b) {
+                segments.push([a.x, a.z, b.x, b.z]);
+            }
+        }
+    }
+    let gap_to_road = |x: f32, z: f32| {
+        segments
+            .iter()
+            .map(|s| {
+                let (dx, dz) = (s[2] - s[0], s[3] - s[1]);
+                let len = dx * dx + dz * dz;
+                let t = if len > 0.0 {
+                    (((x - s[0]) * dx + (z - s[1]) * dz) / len).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (px, pz) = (s[0] + t * dx - x, s[1] + t * dz - z);
+                (px * px + pz * pz).sqrt()
+            })
+            .fold(f32::MAX, f32::min)
+    };
+    let mut near = [0usize; 3];
+    let mut all = 0;
+    for s in &table.species {
+        for t in s.trees.iter().map(|t| t.position).filter(inside) {
+            all += 1;
+            let d = gap_to_road(t[0], t[2]);
+            for (k, r) in [2.0, 3.5, 6.0].iter().enumerate() {
+                near[k] += usize::from(d < *r);
+            }
+        }
+    }
+    println!(
+        "treefit roads: {} road segments; of {all} trees, within 2 m of a road's line {}, 3.5 m {}, 6 m {}",
+        segments.len(),
+        near[0],
+        near[1],
+        near[2]
+    );
+    Ok(())
 }
 
 /// `stam:<hash>,..`: each model's state machine written out in full.
