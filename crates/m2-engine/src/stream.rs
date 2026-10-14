@@ -777,6 +777,27 @@ impl World {
         true
     }
 
+    /// The `_PropPhysics` of the first placed object of model `model`
+    /// whose template has one.
+    fn physics_prop(&self, model: u32) -> Option<crate::durability::PropPhysics> {
+        let db = &self.index.template_db;
+        self.by_model.get(&model)?.iter().find_map(|&i| {
+            db.prop_physics
+                .get(&self.index.objects[i].template)
+                .copied()
+        })
+    }
+
+    /// Whether placed object `i` was knocked loose (`None` if not):
+    /// broken into its pieces, its model's [`Loose::breaks`], or gone as
+    /// one.
+    pub fn knocked_loose(&self, i: usize) -> Option<bool> {
+        let o = self.index.objects.get(i)?;
+        self.knocked
+            .contains_key(&i)
+            .then(|| self.loose.get(&o.model).is_some_and(|l| l.breaks))
+    }
+
     /// Placed objects standing that come loose with any of their model
     /// within `reach` metres of `at` (as far as its box's middle less
     /// half its size), with how far.
@@ -1084,6 +1105,14 @@ impl World {
                             if let Some(loose) = m.collision.as_ref().and_then(|c| c.loose.clone())
                             {
                                 self.loose.insert(hash, loose);
+                            } else if let Some(whole) =
+                                m.collision.as_ref().and_then(|c| c.whole.as_ref())
+                                && let Some(prop) = self.physics_prop(hash)
+                            {
+                                // A physics prop (`_PropPhysics`) whose
+                                // model has no body that moves comes loose
+                                // as one, of its template's mass.
+                                self.loose.insert(hash, Arc::new(whole.weighing(prop.kg())));
                             }
                             for &i in self.by_model.get(&hash).map_or(&[][..], Vec::as_slice) {
                                 let o = &self.index.objects[i];
