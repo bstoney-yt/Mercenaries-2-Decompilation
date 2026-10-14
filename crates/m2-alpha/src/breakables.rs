@@ -227,6 +227,9 @@ const PATCH: f32 = 60.0;
 const PATCH_WAIT: f32 = 8.0;
 /// How long a prop is left after its hit before it is looked at, seconds.
 const SETTLE: f32 = 0.25;
+/// A frame is drawn every this many ticks while the check waits (the world
+/// streams in as frames are drawn).
+const DRAW_EVERY: u32 = 6;
 /// The check's vehicle's speed, m/s (36 km/h; invented).
 const SPEED: f32 = 10.0;
 /// The blast goes off this far from the prop's box, metres (invented).
@@ -272,6 +275,7 @@ pub fn check(
     hit: HitKind,
     area: Option<[f32; 4]>,
     tick: f32,
+    draw: &mut dyn FnMut(&mut crate::game::Game),
 ) -> usize {
     use crate::player::Intent;
     let Some(start) = game.scene.player.as_ref().map(|p| p.character.position) else {
@@ -354,10 +358,15 @@ pub fn check(
     if items.is_empty() {
         return 0;
     }
-    let run = |game: &mut crate::game::Game, secs: f32| {
-        for _ in 0..(secs / tick).ceil() as u32 {
+    // A frame drawn every so often, as the run does: the world and the
+    // props only stream in round her as frames are drawn.
+    let mut run = |game: &mut crate::game::Game, secs: f32| {
+        for k in 0..(secs / tick).ceil() as u32 {
             game.combat.hp = hp.max(1.0e6);
             game.step(Intent::default(), tick);
+            if k % DRAW_EVERY == 0 {
+                draw(game);
+            }
         }
     };
     let mut tally: std::collections::BTreeMap<(Reaction, bool), usize> = Default::default();

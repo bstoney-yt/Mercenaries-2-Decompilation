@@ -2567,7 +2567,12 @@ fn mission_for_screenshot(
                 0.0
             };
             if props_ready > PROPS_CHECK_AFTER
-                && breakables::check(game, hit, options.props_area, tick) > 0
+                && breakables::check(game, hit, options.props_area, tick, &mut |g| {
+                    // The world and the props stream in as a frame is drawn.
+                    if let Err(e) = render(backend, g, fov, aspect, None) {
+                        eprintln!("props-check: drawing a frame failed: {e}");
+                    }
+                }) > 0
             {
                 break;
             }
