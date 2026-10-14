@@ -83,6 +83,13 @@ pub fn ram(mass: f32, speed: f32) -> f32 {
     mass * speed / 1000.0
 }
 
+/// A ram's kind of damage: the vehicles' own `DamageKey` (the AMX30's and
+/// the jeeps' alike, PC data).
+const RAM_KIND: &str = "Car";
+/// A vehicle rams nothing slower than this, m/s (invented, as fast as it
+/// must go to knock anything loose).
+const RAM_SPEED: f32 = 1.0;
+
 /// A vehicle as it runs into things: where it is (its model's place),
 /// its model's box, how fast it was going before the step just taken
 /// stopped it against whatever it hit, and its mass (kg).
@@ -270,16 +277,42 @@ impl Destruction {
     /// something to show broken (a wreck, or a model that comes loose)
     /// is worn, and not what the scripts or the pickups bring down (a
     /// mission's gates, crates). True if it broke.
-    #[allow(clippy::too_many_arguments)]
     pub fn wear(
         &mut self,
         world: &mut World,
         props: &mut Props,
         install: Option<&Install>,
         key: StaticKey,
-        (damage, kind, unrowed): (f32, u32, f32),
+        hit: (f32, u32, f32),
         at: Vec3,
     ) -> bool {
+        self.wear_by(world, props, install, key, hit, Cause::Blast(at))
+    }
+
+    /// [`wear`](Self::wear) by `cause`: what breaks with nothing to show
+    /// broken flies as it says (on with a vehicle that ran into it, away
+    /// from a blast).
+    fn wear_by(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: Option<&Install>,
+        key: StaticKey,
+        (damage, kind, unrowed): (f32, u32, f32),
+        cause: Cause,
+    ) -> bool {
+        let at = match cause {
+            Cause::Blast(at) => at,
+            Cause::Crash { .. } => match key {
+                StaticKey::Object(i) => world
+                    .index
+                    .objects
+                    .get(i)
+                    .map_or(Vec3::ZERO, |o| o.position),
+                StaticKey::Entity(e) => props.centre(e).unwrap_or(Vec3::ZERO),
+                _ => Vec3::ZERO,
+            },
+        };
         let template = match key {
             StaticKey::Object(i) => {
                 if self.destroyed.contains(&i)
@@ -363,11 +396,18 @@ impl Destruction {
         }
         match key {
             StaticKey::Object(i) => match install {
-                Some(install) => self.bring_down(world, props, install, i, Cause::Blast(at)),
+                Some(install) => self.bring_down(world, props, install, i, cause),
                 None => return false,
             },
             StaticKey::Entity(e) => {
-                props.wreck(&mut world.physics, e, Some(at));
+                match cause {
+                    Cause::Blast(at) => props.wreck(&mut world.physics, e, Some(at)),
+                    Cause::Crash { velocity, mass } => {
+                        props.wreck_crashed(&mut world.physics, e, |shifted| {
+                            crate::game::flung(velocity, mass, shifted)
+                        })
+                    }
+                };
                 if let (Some(k), Some(c)) = (sound, props.centre(e)) {
                     self.heard.push((c, k));
                 }
@@ -375,6 +415,38 @@ impl Destruction {
             _ => {}
         }
         true
+    }
+
+    /// What `vehicle` does ramming what its body touched and its
+    /// template says no vehicle breaks running into it, nor comes loose
+    /// (a shack, a large jungle tree): it wears it down by its ram
+    /// ([`ram`], of the vehicles' kind, `Car`), as its row of the damage
+    /// table takes of that (a shack twice it, a big tree's `Vegetation`
+    /// ten times, a building or a canopy tree none). Only going at
+    /// [`RAM_SPEED`] or faster: a vehicle pushing on against what it
+    /// stopped at wears nothing more. True if it broke.
+    fn rammed(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: &Install,
+        key: StaticKey,
+        vehicle: &Crasher,
+    ) -> bool {
+        let speed = vehicle.velocity.length();
+        if speed < RAM_SPEED {
+            return false;
+        }
+        let cause = Cause::Crash {
+            velocity: vehicle.velocity,
+            mass: vehicle.mass,
+        };
+        let hit = (
+            ram(vehicle.mass, speed),
+            m2_assets::name_hash(RAM_KIND),
+            0.0,
+        );
+        self.wear_by(world, props, Some(install), key, hit, cause)
     }
 
     /// Wears down what `blast` reaches ([`wear`](Self::wear)), the
@@ -510,6 +582,11 @@ impl Destruction {
                     out.push(Crashed::Down(key));
                 }
                 Some(c) => out.push(c),
+                None if touched.contains(&key)
+                    && self.rammed(world, props, install, key, vehicle) =>
+                {
+                    out.push(Crashed::Down(key));
+                }
                 None if touched.contains(&key) && self.held.insert(key) => {
                     eprintln!("{}", held(world, key, o.model, o.template, crash, vehicle));
                 }
@@ -547,6 +624,11 @@ impl Destruction {
                     out.push(Crashed::Down(key));
                 }
                 Some(c) => out.push(c),
+                None if touched.contains(&key)
+                    && self.rammed(world, props, install, key, vehicle) =>
+                {
+                    out.push(Crashed::Down(key));
+                }
                 None if touched.contains(&key) && self.held.insert(key) => {
                     eprintln!("{}", held(world, key, model, template, crash, vehicle));
                 }
@@ -748,6 +830,15 @@ mod tests {
         // A crate (no such property) is shoved; a rock stands.
         assert_eq!(car.does(key, None, true), Some(Crashed::Loose(key)));
         assert_eq!(car.does(key, None, false), None);
+    }
+
+    #[test]
+    fn a_ram_grows_with_mass_and_speed() {
+        // A jeep at 10 m/s, a tank at 8.
+        assert_eq!(ram(1000.0, 10.0), 10.0);
+        assert_eq!(ram(32_000.0, 8.0), 256.0);
+        // Twice the speed, twice the ram.
+        assert_eq!(ram(32_000.0, 16.0), 2.0 * ram(32_000.0, 8.0));
     }
 
     #[test]
