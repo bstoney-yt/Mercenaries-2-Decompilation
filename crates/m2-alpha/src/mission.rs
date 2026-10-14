@@ -34,8 +34,11 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use m2_assets::{WadArchive, name_hash};
 use m2_engine::vehicle::DRIVABLE;
 use m2_engine::world::member_stem;
-use m2_engine::{CatalogueEntry, Install, TemplateInfo, Templates, VehicleKind};
-use m2_game::api::Command;
+use m2_engine::{
+    CatalogueEntry, Install, Physics, StaticKey, TemplateInfo, Templates, VehicleKind,
+};
+use m2_game::api::{Camera, Command, VISIBLE_RANGE};
+use m2_game::events::World as _;
 use m2_game::hud::ObjectiveMessage;
 use m2_game::layers::LayerOp;
 use m2_game::mission::{GameData, Mission, PLAYER};
@@ -46,6 +49,7 @@ use crate::config::Config;
 use crate::flights::{Copter, Leaves, Load};
 use crate::game::{Game, get_out, place};
 use crate::gamehud::{HudCall, Plain, RadarRegion};
+use crate::hero::Hero;
 use crate::scene::NOT_DRIVABLE;
 use crate::support::{self, FALLBACK_AFTER, Impact, Kind};
 
@@ -122,8 +126,11 @@ pub struct MissionView {
     /// The same line with its key tokens (`[pda]`) as the scripts' text
     /// has them, for the game's own tutorial box to draw as glyphs.
     pub game_tutorial: Option<String>,
-    /// Markers over targets: where, what, colour (RGBA).
-    pub markers: Vec<(Vec3, String, [u8; 4])>,
+    /// The keys bound to those tokens (`("pda", "P")`), for the game's own
+    /// HUD to name those its fonts have no picture for.
+    pub key_names: Vec<(String, String)>,
+    /// Markers over targets.
+    pub markers: Vec<MarkerView>,
     /// The newest objective message: completed (or else added), and text.
     pub message: Option<(bool, String)>,
     /// The same message as the scripts sent it, for the game's own HUD to
@@ -131,6 +138,9 @@ pub struct MissionView {
     pub game_message: Option<ObjectiveMessage>,
     /// The contract was just completed (for [`BANNER_TIME`] seconds).
     pub contract_complete: bool,
+    /// The contract is completed and its fanfare waits for Enter to
+    /// close it ([`MissionLink::waiting_fanfare`]).
+    pub fanfare_waiting: bool,
     /// The regions the scripts have on the radar (see [`RADAR_REGIONS`]).
     pub radar_regions: Vec<RadarRegion>,
     /// The scripts' latest calls to the HUD's interface (see [`HUD_CALLS`]).
@@ -145,6 +155,40 @@ pub struct MissionView {
     pub vehicle_disguise: bool,
     /// Her disguise while one holds: how much is left and whether it holds.
     pub disguise: Option<(f32, bool)>,
+}
+
+/// A marker the scripts put over one of their objects (`Marker.AddBlip`),
+/// as the HUD shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkerView {
+    /// Where: its height over its target; over the soldier a spawn target
+    /// placed, where he is now.
+    pub at: Vec3,
+    /// Its texture (`HUD_objective_destroy`).
+    pub icon: String,
+    /// RGBA.
+    pub colour: [u8; 4],
+    /// Shown from `near` to `far` metres away.
+    pub near: f32,
+    pub far: f32,
+    /// Its size as the scripts ask (the call's first size, 32 in the first
+    /// contract's).
+    pub size: f32,
+}
+
+impl MarkerView {
+    /// What the marker asks to be done there (`destroy`, `deliverable`):
+    /// its texture's name without the prefix.
+    pub fn label(&self) -> String {
+        self.icon
+            .trim_start_matches("HUD_objective_")
+            .replace('_', " ")
+    }
+
+    /// Whether it shows to someone at `from`: `near` to `far` metres away.
+    pub fn shown_from(&self, from: Vec3) -> bool {
+        (self.near..=self.far).contains(&self.at.distance(from))
+    }
 }
 
 /// What `FactionZone` last told the HUD (`TrespassStateChange`): whether
@@ -257,12 +301,25 @@ for group, names in pairs(methods) do
                 local callback = type(t) == "table" and type(t.fCallback) == "function"
                 if callback then
                     __m2_hud_callbacks[__m2_hud_call_count] = t
+                    -- The contract's fanfare, which the flow waits on.
+                    if group == "Fanfare" then __m2_fanfare = __m2_hud_call_count end
                 end
                 table.insert(__m2_hud_calls, { seq = __m2_hud_call_count,
                     group = group, method = name, data = copy(t, 0),
                     callback = callback })
                 if #__m2_hud_calls > 64 then table.remove(__m2_hud_calls, 1) end
-                if type(f) == "function" then return f(self, t, ...) end
+                local r
+                if type(f) == "function" then r = f(self, t, ...) end
+                -- A message added here gets the call's number as its id,
+                -- for the HUD to tell its own message by: what the
+                -- scripts keep to take it down again (`MrxSubtitle`'s
+                -- `_tMsgIds`, passed back as `tMessageIds`). What the
+                -- engine's own `Hud` answers here (a stub) means nothing
+                -- to the HUD.
+                if name == "AddMessage" then
+                    r = { __m2_seq = __m2_hud_call_count }
+                end
+                return r
             end
         end
     end
@@ -301,6 +358,11 @@ pub struct MissionLink {
     /// The flow's movies wait for the game to play them
     /// ([`Mission::hold_movies`]); otherwise they end at once.
     movies: bool,
+    /// With [`movies`](Self::movies), the scripts' skip mode ends once the
+    /// start has run ([`Mission::end_skip_mode`], `--skip-mode-off`).
+    /// Off by default until the scripts that ask about it are surveyed on
+    /// the game's data: the flow was only seen to finish with it on.
+    end_skip: bool,
     /// The player has subtitles on.
     subtitles: bool,
     /// Time not yet given to the scripts.
@@ -340,6 +402,14 @@ pub struct MissionLink {
     support: Vec<String>,
     /// Seconds she has been on foot ashore without a break.
     ashore_for: f32,
+    /// Where the soldiers stand that markers' spawn targets placed, by
+    /// target: the markers go over them, not over their spawns.
+    marked: HashMap<u32, Vec3>,
+    /// The markers logged, by handle.
+    markers_logged: HashSet<u32>,
+    /// Whether each object `ObjectIsVisible` events wait for was on
+    /// screen at the last look, for the log.
+    sighted: HashMap<u32, bool>,
 }
 
 /// The scripts' vehicles in play.
@@ -411,6 +481,7 @@ impl MissionLink {
         Self {
             state: State::Loading(rx),
             movies: false,
+            end_skip: false,
             subtitles: true,
             lag: 0.0,
             log,
@@ -431,6 +502,9 @@ impl MissionLink {
             music: None,
             support: Vec::new(),
             ashore_for: 0.0,
+            marked: HashMap::new(),
+            markers_logged: HashSet::new(),
+            sighted: HashMap::new(),
         }
     }
 
@@ -462,6 +536,12 @@ impl MissionLink {
     /// [`take_movie`](Self::take_movie) hands them out.
     pub fn with_movies(self, movies: bool) -> Self {
         Self { movies, ..self }
+    }
+
+    /// Ends the scripts' skip mode once the start has run, when the movies
+    /// wait for the game (`--skip-mode-off`).
+    pub fn with_skip_mode_off(self, end_skip: bool) -> Self {
+        Self { end_skip, ..self }
     }
 
     /// Whether the player has subtitles on (the game's option).
@@ -557,24 +637,29 @@ impl MissionLink {
         // A crate she broke open is destroyed for the scripts too (what
         // it held, it leaves of itself: no script spawns it).
         for (g, at) in scene.flights.take_broken() {
+            let none = Templates::default();
+            let templates = scene.world.as_ref().map_or(&none, |w| &w.index.template_db);
             let left: Vec<String> = scene
                 .flights
                 .pickups()
                 .iter()
                 .filter(|p| p.from == g)
                 .map(|p| {
+                    // A weapon comes with its rounds; ammunition gives by
+                    // its records, to what she carries when she comes.
+                    let giving = match p.what.gives {
+                        Some((w, n)) => format!("{n} rounds for her {w:?}"),
+                        None => format!(
+                            "{} (for her now {:?})",
+                            records(templates, p.what.template),
+                            refill(templates, &game.combat, &p.what)
+                        ),
+                    };
                     format!(
-                        "{} ({:#x}), model {}, giving {}",
-                        scene
-                            .world
-                            .as_ref()
-                            .and_then(|w| w.index.template_db.by_id(p.what.template))
-                            .map_or("?", |t| t.0),
+                        "{} ({:#x}), model {}, giving {giving}",
+                        templates.by_id(p.what.template).map_or("?", |t| t.0),
                         p.what.template,
                         p.what.model.map_or("none".into(), |m| format!("{m:08x}")),
-                        p.what.gives.map_or("her nothing".into(), |(w, n)| format!(
-                            "{n} rounds for her {w:?}"
-                        )),
                     )
                 })
                 .collect();
@@ -758,6 +843,7 @@ impl MissionLink {
             mission.set_player_reserve("C4", game.combat.charges);
             let spare = game.combat.rifle_rounds.stored;
             mission.set_player_reserve(CARBINE, spare.div_ceil(combat::RIFLE_CLIP));
+            look(game, mission, &mut self.sighted);
             mission.tick(f64::from(STEP));
             lines.extend(mission.take_log());
             for c in mission.take_commands() {
@@ -819,8 +905,13 @@ impl MissionLink {
                     // Her weapons, as the contract's scripts hand them out:
                     // fresh ones come with nothing in reserve.
                     Command::Loadout { who, weapons } if *who == PLAYER => {
-                        eprintln!("mission: her loadout is now {weapons:?}");
+                        eprintln!(
+                            "mission: her loadout is now {weapons:?}; her grenades, C4 and mines \
+                             start at 0 until the scripts give them a reserve (the explosives \
+                             box shows 0 till then)"
+                        );
                         game.combat.carbine_only();
+                        game.combat.scripted_loadout = true;
                     }
                     Command::Reserve {
                         who,
@@ -828,6 +919,7 @@ impl MissionLink {
                         rounds,
                     } if *who == PLAYER => {
                         eprintln!("mission: scripts give her {weapon} {rounds} in reserve");
+                        game.combat.scripted_loadout = true;
                         if weapon.eq_ignore_ascii_case(GRENADE) {
                             game.combat.grenades = (*rounds).min(combat::MAX_GRENADES);
                         } else if weapon.eq_ignore_ascii_case("C4") {
@@ -855,6 +947,7 @@ impl MissionLink {
             if let Some(line) = tutorial(mission) {
                 self.tutorial = line;
             }
+            follow_markers(game, mission, &mut self.marked, &mut self.markers_logged);
             break_props(game, mission);
             let w = mission.world().borrow();
             if let Some(m) = w.hud.messages.last() {
@@ -874,7 +967,7 @@ impl MissionLink {
             .map_or([0.0; 3], |p| p.character.position.to_array());
         match Mission::new(data, game.scene.hero.name(), at) {
             Ok(mut mission) => {
-                mission.set_max_health(PLAYER, game.combat.max_hp);
+                set_hero(&mut mission, game.scene.hero, game.combat.max_hp, "mission");
                 mission.fly_deliveries();
                 if let Err(e) = mission.run(RADAR_REGIONS, "radar regions") {
                     self.write([format!("radar regions: {e}")]);
@@ -895,6 +988,13 @@ impl MissionLink {
                 }
                 mission.set_subtitles(self.subtitles);
                 mission.start();
+                if self.movies && self.end_skip {
+                    // The movies wait for the game, so the scripts' skip
+                    // mode has done its part.
+                    mission.end_skip_mode();
+                } else if self.movies {
+                    eprintln!("mission: the scripts' skip mode stays on (--skip-mode-off)");
+                }
                 let lines = mission.take_log();
                 for c in mission.take_commands() {
                     if obey(game, &mission, &mut self.vehicles, &c) {
@@ -943,6 +1043,17 @@ impl MissionLink {
     pub fn line_length(&mut self, id: u32, seconds: f32) {
         if let State::Running(m) = &mut self.state {
             m.line_length(id, f64::from(seconds));
+        }
+    }
+
+    /// She is `hero` from now on, whole at `max` health: the running
+    /// scripts' player takes their name, labels and health (see
+    /// [`set_hero`]). Scripts still loading start as whoever she is then.
+    pub fn set_hero(&mut self, hero: Hero, max: f32) {
+        if let State::Running(m) = &mut self.state {
+            set_hero(m, hero, max, "mission");
+            let lines = m.take_log();
+            self.write(lines);
         }
     }
 
@@ -1073,7 +1184,7 @@ impl MissionLink {
         }
         // Story characters: who stands, and the spawns that should.
         let people = &game.scene.people;
-        for n in people.npcs.iter().filter(|n| people.kinds[n.kind].named) {
+        for n in people.npcs.iter().filter(|n| n.held) {
             out.push(format!(
                 "story character {} at {:.1}, {}, {}, {}",
                 people.kinds[n.kind].role,
@@ -1170,6 +1281,16 @@ impl MissionLink {
         self.completed.is_some()
     }
 
+    /// The newest of the scripts' fanfare calls (`Hud.Fanfare`) whose
+    /// callback is still to be called: the contract's, which the flow
+    /// waits on until the fanfare's Enter closes it.
+    pub fn waiting_fanfare(&self) -> Option<u64> {
+        match &self.state {
+            State::Running(m) => waiting_fanfare(m.lua()),
+            _ => None,
+        }
+    }
+
     /// What the HUD shows.
     pub fn view(&self) -> MissionView {
         let recent = self.message.as_ref().filter(|m| m.2 < MESSAGE_TIME);
@@ -1207,12 +1328,21 @@ impl MissionLink {
             .markers
             .values()
             .filter_map(|m| {
-                let at = w.objects.get(&m.target?)?.position;
-                let label = m
-                    .icon
-                    .trim_start_matches("HUD_objective_")
-                    .replace('_', " ");
-                Some((Vec3::from(at) + Vec3::Y * m.height, label, m.colour))
+                let g = m.target?;
+                let o = w.objects.get(&g)?;
+                let at = self
+                    .marked
+                    .get(&g)
+                    .copied()
+                    .unwrap_or_else(|| Vec3::from(o.position));
+                Some(MarkerView {
+                    at: at + Vec3::Y * m.height,
+                    icon: m.icon.clone(),
+                    colour: m.colour,
+                    near: m.near,
+                    far: m.far,
+                    size: m.sizes[0],
+                })
             })
             .collect();
         MissionView {
@@ -1223,11 +1353,13 @@ impl MissionLink {
                 .as_ref()
                 .map(|t| crate::input::name_keys(t, &self.keys)),
             game_tutorial: self.tutorial.clone(),
+            key_names: crate::input::token_keys(&self.keys),
             objectives,
             markers,
             message,
             game_message,
             contract_complete: self.completed.is_some_and(|age| age < BANNER_TIME),
+            fanfare_waiting: self.completed.is_some() && waiting_fanfare(mission.lua()).is_some(),
             radar_regions: radar_regions(mission.lua()),
             hud_calls: hud_calls(mission.lua()),
             pda_objectives: hud.mission.clone(),
@@ -1236,6 +1368,18 @@ impl MissionLink {
             disguise: w.disguise,
         }
     }
+}
+
+/// Makes the player of `mission` (the mission's scripts, the hijack
+/// scripts' or the HUD's) `hero`, whole at `max` health: their name, the
+/// labels their template has in the data, and their health
+/// ([`Mission::set_hero`]). Says so on stderr after `who`.
+pub fn set_hero(mission: &mut Mission, hero: Hero, max: f32, who: &str) {
+    let labels = mission.set_hero(hero.name(), hero.template(), max);
+    eprintln!(
+        "{who}: the scripts' player is {hero}, {max} health, {labels} labels from template {}",
+        hero.template()
+    );
 }
 
 /// The calls [`HUD_CALLS`] keeps, oldest first.
@@ -1254,6 +1398,15 @@ fn hud_calls(lua: &mlua::Lua) -> Vec<HudCall> {
             callback: t.get("callback").unwrap_or(false),
         })
         .collect()
+}
+
+/// The fanfare call [`HUD_CALLS`] kept last with a callback, while that
+/// callback has not been called.
+fn waiting_fanfare(lua: &mlua::Lua) -> Option<u64> {
+    let g = lua.globals();
+    let seq = g.get::<Option<u64>>("__m2_fanfare").ok().flatten()?;
+    let callbacks = g.get::<mlua::Table>("__m2_hud_callbacks").ok()?;
+    callbacks.contains_key(seq).ok()?.then_some(seq)
 }
 
 /// What [`TRESPASS`] keeps.
@@ -1378,6 +1531,7 @@ impl Fleet {
                 let models = object_models(g, &o.name, island, &catalogue.vehicles);
                 (!models.is_empty()).then_some((d, g, models))
             })
+            .filter(|(_, g, models)| !ai_flown(&w, *g, models))
             .collect();
         // Those the scripts still have in play count against the most.
         let live = self
@@ -1392,6 +1546,117 @@ impl Fleet {
             game.scene.load_vehicle(g, models);
         }
     }
+}
+
+/// A ray from the camera that stops this far short of an object (metres)
+/// still reaches it: what it hits there is the object itself or stands
+/// right by it (a tank's hull, the wall it is parked against).
+const SIGHT_PAD: f32 = 4.0;
+/// How high above its place an object is looked at (metres): about a
+/// vehicle's middle (inferred).
+const SIGHT_HEIGHT: f32 = 1.5;
+/// A ray from the camera passes through at most this many vehicles and
+/// people (her own body first): they don't hide what is behind them.
+const SIGHT_SKIPS: usize = 8;
+
+/// Tells the scripts where her camera is and how wide it sees, and which
+/// of the objects their `ObjectIsVisible` events wait for stand behind
+/// something solid from it: the island's ground and buildings, the state
+/// layers' models (vehicles and people don't hide what is behind them).
+/// Logs each as it comes on screen or leaves it.
+fn look(game: &Game, mission: &mut Mission, sighted: &mut HashMap<u32, bool>) {
+    let (eye, forward) = game.listener();
+    let (fov, aspect) = game.lens;
+    let camera = Camera {
+        eye: eye.to_array(),
+        forward: forward.to_array(),
+        fov_y: fov.to_radians(),
+        aspect,
+        range: VISIBLE_RANGE,
+    };
+    mission.set_camera(camera);
+    let watched = mission.sight_watched();
+    sighted.retain(|g, _| watched.contains(g));
+    if watched.is_empty() {
+        return;
+    }
+    // Looked at: a prop's middle, else a little above its place.
+    let targets: Vec<(u32, Vec3, String)> = {
+        let w = mission.world().borrow();
+        watched
+            .iter()
+            .filter_map(|&g| {
+                let Some(o) = w.objects.get(&g) else {
+                    if sighted.insert(g, false).is_none() {
+                        eprintln!(
+                            "mission: ObjectIsVisible waits for {g:#x}, not in play (its layer \
+                             isn't loaded): never on screen"
+                        );
+                    }
+                    return None;
+                };
+                let at = game
+                    .scene
+                    .props
+                    .centre(g)
+                    .unwrap_or(Vec3::from(o.position) + Vec3::Y * SIGHT_HEIGHT);
+                Some((g, at, o.name.clone()))
+            })
+            .collect()
+    };
+    let mut unseen = HashSet::new();
+    let mut viewed = Vec::new();
+    for (g, at, name) in targets {
+        let in_view = camera.sees(at.to_array());
+        let behind = in_view
+            && game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|world| behind_something(&world.physics, eye, at, g));
+        if behind {
+            unseen.insert(g);
+        }
+        viewed.push((g, name, at, in_view, behind));
+    }
+    mission.set_unseen(unseen);
+    let w = mission.world().borrow();
+    for (g, name, at, in_view, behind) in viewed {
+        let seen = w.is_visible(g) == Some(true);
+        if sighted.insert(g, seen) != Some(seen) {
+            eprintln!(
+                "mission: {name} ({g:#x}) at {at:.1} {} for the scripts (in view {in_view}, \
+                 behind something {behind}, {:.0} m from the camera)",
+                if seen { "on screen" } else { "not on screen" },
+                at.distance(eye)
+            );
+        }
+    }
+}
+
+/// Whether something solid stands between `eye` and `at`, short of
+/// [`SIGHT_PAD`]: the island's or a state layer's model other than
+/// `target`'s own, passing through vehicles and people.
+fn behind_something(physics: &Physics, eye: Vec3, at: Vec3, target: u32) -> bool {
+    let way = at - eye;
+    let reach = way.length() - SIGHT_PAD;
+    let dir = way.normalize_or_zero();
+    let (mut from, mut gone) = (eye, 0.0);
+    for _ in 0..SIGHT_SKIPS {
+        if reach - gone <= 0.0 {
+            return false;
+        }
+        match physics.cast_ray_keyed(from, dir, reach - gone) {
+            None => return false,
+            Some((_, _, Some(StaticKey::Entity(e)))) if e == target => return false,
+            Some((_, _, Some(_))) => return true,
+            Some((t, _, None)) => {
+                from += dir * (t + 0.1);
+                gone += t + 0.1;
+            }
+        }
+    }
+    false
 }
 
 /// Seconds the scripts keep a vehicle a helicopter let go at its drop
@@ -1447,6 +1712,44 @@ fn go_ashore(game: &mut Game) -> bool {
 /// Whether `guid` is a layer entity that places a person.
 fn is_spawn(world: &m2_engine::World, guid: u32) -> bool {
     world.index.spawns.iter().any(|s| s.entity == guid)
+}
+
+/// Where the soldiers stand whom the markers' spawn targets placed (the
+/// first contract's "destroy" markers are on spawns, and the scripts'
+/// world keeps the spawn's place while he moves), by target; and each new
+/// marker logged once, with what the scripts asked of it.
+fn follow_markers(
+    game: &Game,
+    mission: &Mission,
+    marked: &mut HashMap<u32, Vec3>,
+    logged: &mut HashSet<u32>,
+) {
+    let w = mission.world().borrow();
+    marked.clear();
+    for (&handle, m) in &w.hud.markers {
+        let Some(g) = m.target else { continue };
+        if let Some(n) = game.scene.people.npcs.iter().find(|n| n.spawn == Some(g)) {
+            marked.insert(g, n.character.position);
+        }
+        if logged.insert(handle) {
+            eprintln!(
+                "mission: marker {} on {:?} ({g:#x}): colour {:?}, {} m up, shown {}..{} m, sizes {:?}, 2D only {}{}",
+                m.icon,
+                w.objects.get(&g).map_or("?", |o| o.name.as_str()),
+                m.colour,
+                m.height,
+                m.near,
+                m.far,
+                m.sizes,
+                m.flat,
+                if marked.contains_key(&g) {
+                    ", over the soldier it placed"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
 }
 
 /// The scripts' newest tutorial line since the last call, if they asked
@@ -1782,24 +2085,57 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         Command::Move { guid, .. } if fleet.dropped.remove(guid) => return false,
         // Moved by the scripts: a vehicle is placed afresh where they now
         // say, with her back in it if she was driving it; a layer's model
-        // just moves.
+        // or person just moves.
         Command::Move { guid, .. } | Command::Remove(guid) if *guid != PLAYER => {
             if let (Some(i), Some(world)) = (index(guid), &mut game.scene.world)
                 && let Some(id) = game.scene.vehicles[i].id.take()
             {
                 world.physics.remove_vehicle(id);
                 let driving = game.scene.player.as_ref().and_then(|p| p.driving);
-                if matches!(c, Command::Move { .. }) && driving == Some(i) {
+                // She goes with it, as when they seat her in one: there,
+                // so the ground loads around it and it is placed, with
+                // the same time to be. Not where they hide it under the
+                // island; there she stays on foot.
+                if let Command::Move { position, .. } = c
+                    && driving == Some(i)
+                    && position[1] > HIDDEN_BELOW
+                    && let Some(p) = game.scene.player.as_mut()
+                {
                     fleet.reenter = Some(*guid);
+                    fleet.boarding = BOARDING;
+                    p.drop_at(Vec3::from(*position));
+                    p.driving = None;
+                    p.chase_target = None;
+                    eprintln!(
+                        "mission: the scripts moved {guid:#x} with her in it: she waits at \
+                         {:.1?} to be seated again",
+                        position
+                    );
                 }
+            }
+            // Gone, or hidden, while she waited to get in: the wait ends
+            // on the next step as if it had run out, so she stays out (and
+            // goes ashore if she waits in the sea, as for the start's boat)
+            // and the scripts hear where she is again.
+            if fleet.reenter == Some(*guid)
+                && match c {
+                    Command::Move { position, .. } => position[1] <= HIDDEN_BELOW,
+                    _ => true,
+                }
+            {
+                fleet.boarding = 1;
             }
             let scene = &mut game.scene;
             if let Some(world) = &mut scene.world {
                 match c {
                     Command::Move { position, .. } => {
-                        scene
-                            .props
-                            .put(&mut world.physics, *guid, Vec3::from(*position));
+                        let at = Vec3::from(*position);
+                        scene.props.put(&mut world.physics, *guid, at);
+                        // A person the layers place (a story character):
+                        // there they stand.
+                        if is_spawn(world, *guid) {
+                            scene.people.put(*guid, at);
+                        }
                     }
                     _ if is_spawn(world, *guid) => {
                         scene.people.script_kill(&mut world.physics, *guid, true);
@@ -1809,15 +2145,90 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // A driver sent along a path (PmcCon001's villa tank, through the
+        // garage wall the scripts have just killed): its vehicle drives it
+        // ([`crate::paths`]). A person on foot sent along one isn't walked
+        // yet (the villa's wave soldiers).
+        Command::Goal {
+            guid,
+            goal,
+            target: Some(path),
+            haste,
+            ..
+        } if goal == "PathMove" => {
+            let vehicle = mission.world().borrow().vehicle_of(*guid);
+            let route: Vec<Vec3> = mission.path(*path).iter().map(|&p| Vec3::from(p)).collect();
+            match vehicle {
+                Some(v) if !route.is_empty() => {
+                    eprintln!(
+                        "mission: {guid:#x} drives {v:#x} along path {path:#x} ({} points, haste \
+                         {haste:?}): {:.1?} to {:.1?}",
+                        route.len(),
+                        route[0],
+                        route[route.len() - 1]
+                    );
+                    game.paths.start(v, route, haste.unwrap_or(1.0));
+                }
+                _ => eprintln!(
+                    "mission: PathMove for {guid:#x} along {path:#x} not driven (vehicle \
+                     {vehicle:x?}, {} points)",
+                    route.len()
+                ),
+            }
+            return false;
+        }
         Command::Kill(guid) => {
             if let Some(i) = index(guid) {
                 game.scene.vehicles[i].wrecked = true;
+            }
+            // A prop the scripts kill (PmcCon001's garage entrance, the
+            // villa hall's wall the tank comes through) breaks: its wreck,
+            // else it goes.
+            let scene = &mut game.scene;
+            if let Some(world) = &mut scene.world
+                && scene.props.get(*guid).is_some()
+            {
+                let centre = scene.props.centre(*guid);
+                let broke = scene.props.wreck(&mut world.physics, *guid, centre);
+                eprintln!(
+                    "mission: the scripts killed prop {guid:#x}: {}",
+                    if broke { "broken" } else { "already broken" }
+                );
+            }
+            // Wrecked while she waited to get in: the wait ends, as above.
+            if fleet.reenter == Some(*guid) {
+                fleet.boarding = 1;
             }
             let scene = &mut game.scene;
             if let Some(world) = &mut scene.world
                 && is_spawn(world, *guid)
             {
                 scene.people.script_kill(&mut world.physics, *guid, false);
+            }
+            return false;
+        }
+        // A gate or door opened (PmcCon001's villa doors): its model is
+        // taken down with its collision, so she walks through (inferred:
+        // the door's own opening animation isn't played).
+        Command::OpenGate(guid) => {
+            let name = mission
+                .world()
+                .borrow()
+                .objects
+                .get(guid)
+                .map_or_else(|| "?".to_owned(), |o| o.name.clone());
+            let scene = &mut game.scene;
+            match (&mut scene.world, scene.props.get(*guid)) {
+                (Some(world), Some(_)) => {
+                    scene.props.hide(&mut world.physics, [*guid]);
+                    eprintln!(
+                        "mission: Object.OpenGate {name} ({guid:#x}): opened, its model and \
+                         collision taken down (inferred: no opening animation)"
+                    );
+                }
+                _ => eprintln!(
+                    "mission: Object.OpenGate {name} ({guid:#x}): no model of it up to open"
+                ),
             }
             return false;
         }
@@ -1877,9 +2288,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
     };
     let Some(to) = to else { return false };
     if let Some(p) = game.scene.player.as_mut() {
-        p.character.position = Vec3::from(to);
-        p.character.velocity = Vec3::ZERO;
-        p.landed = false;
+        // At the height they give: onto the floor or ground there, not a
+        // roof over it.
+        p.drop_at(Vec3::from(to));
         p.driving = None;
         p.chase_target = None;
     }
@@ -1928,12 +2339,12 @@ pub(crate) fn template_models(
 /// What the scripts' object `name` (a supply crate) leaves once destroyed:
 /// the pickups its template's `SpawnOnDeath`s name, in data order (the
 /// first contract's: a grenade launcher, then rockets). One with the
-/// model of a weapon of hers is that weapon, loaded; any other gives the
-/// rounds of one of her weapons when its ammunition is one of theirs (a
-/// template with that weapon's model fires it). A pickup's `rounds` count
-/// clips: the grenade launcher's 3 are the HUD's "6 2" in the footage, 6
-/// loaded and 2 clips more. What isn't a pickup it doesn't leave for her.
-fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
+/// model of a weapon of hers is that weapon, loaded; any other gives what
+/// [`refill`] reads off its records when she comes to it. A weapon's
+/// `rounds` count clips: the grenade launcher's 3 are the HUD's "6 2" in
+/// the footage, 6 loaded and 2 clips more. What isn't a pickup it doesn't
+/// leave for her.
+pub(crate) fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
     let Some(left) = templates
         .id(name)
         .and_then(|id| templates.leavings.spawns.get(&id))
@@ -1945,19 +2356,10 @@ fn leaves(templates: &Templates, name: &str) -> Vec<Leaves> {
         .collect()
 }
 
-/// What pickup template `id` gives her, as [`leaves`] reads it; besides,
-/// the grenades of its `Grenade Projectile` record and a health pickup's
-/// health (`Health Pickup`: 50, points of her 100).
+/// What pickup template `id` is, as [`leaves`] reads it: a weapon taken
+/// up, else ammunition and health (`Health Pickup`: 50, points of her
+/// 100; `Ammo Pickup (Small)`: 3, beside its rounds).
 pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
-    let fires = |weapon: &str, ammo: u32| {
-        let model = name_hash(weapon);
-        templates.leavings.ammo.iter().any(|(&w, &a)| {
-            a == ammo
-                && templates
-                    .by_id(w)
-                    .is_some_and(|(_, t)| t.model == Some(model))
-        })
-    };
     let info = templates.leavings.pickups.get(&id)?;
     let model = templates.by_id(id).and_then(|(_, t)| t.model);
     // A gun of the templates' with its model (of several, the lowest).
@@ -1971,64 +2373,177 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     });
     if let Some(spec) = gun {
         let slot = combat::Rifle::from_spec(spec).slot();
+        // Its clips: its first record's amount (the crate launcher's 3);
+        // else, where that is none (the soldiers' `Assault Rifle`, whose
+        // equipment record gives no amount), what its ammunition records
+        // give that the gun takes (its 8 `Assault Rifle Bullet`); else one.
+        let fires = Some(spec.ammo.template);
+        let ammo: u32 = info
+            .walked
+            .iter()
+            .filter(|&&(a, _)| takes(templates, Some(spec.template), fires, a))
+            .map(|&(_, n)| n)
+            .sum();
+        let clips = match info.rounds {
+            0 if ammo > 0 => ammo,
+            0 => 1,
+            n => n,
+        };
         return Some(Leaves {
             template: id,
             model,
             reach: info.radius,
             weapon: Some(slot),
             gun: Some(spec.template),
-            gives: Some((slot, info.rounds.max(1) * spec.clip.max(1))),
+            gives: Some((slot, clips * spec.clip.max(1))),
             ..Leaves::default()
         });
     }
     let weapon = Weapon::ALL
         .into_iter()
         .find(|w| model == Some(name_hash(w.model_name())));
-    let gives = match weapon {
-        // Its own rounds, whatever its record names: the launcher's names
-        // "Grenade Launcher Projectile", not the "GL Projectile" it fires
-        // (round 94: taken up empty).
-        Some(w) => Some((w, info.rounds.max(1) * w.clip())),
-        None => info.ammo.and_then(|ammo| {
-            Weapon::ALL
-                .into_iter()
-                .find(|w| fires(w.model_name(), ammo))
-                .map(|w| (w, info.rounds * w.clip()))
-        }),
-    };
-    // The launcher's rounds of an ammunition pickup: clips, as the
-    // launcher's own 3 are.
-    let launcher = match weapon {
-        Some(_) => 0,
-        None => info
-            .gives
-            .iter()
-            .filter(|&&(ammo, _)| fires(Weapon::GrenadeLauncher.model_name(), ammo))
-            .map(|(_, n)| n * Weapon::GrenadeLauncher.clip())
-            .sum(),
-    };
-    let grenade = templates.id("Grenade Projectile");
-    let grenades = info
-        .gives
-        .iter()
-        .filter(|(ammo, _)| Some(*ammo) == grenade)
-        .map(|(_, n)| n)
-        .sum();
     Some(Leaves {
         template: id,
         model,
         reach: info.radius,
         weapon,
         gun: None,
-        gives,
-        launcher,
-        grenades,
-        health: if info.kind == m2_engine::pickup::HEALTH {
-            info.rounds as f32
-        } else {
-            0.0
-        },
+        // Its own rounds, whatever its record names: the launcher's names
+        // "Grenade Launcher Projectile", not the "GL Projectile" it fires
+        // (round 94: taken up empty).
+        gives: weapon.map(|w| (w, info.rounds.max(1) * w.clip())),
+        // Every health record's, not only a health pickup's: the small
+        // ammunition box heals 3 as well.
+        health: info.heals as f32,
     })
+}
+
+/// Whether a `Pickup` record's ammunition `ammo` is for weapon template
+/// `weapon`, which fires `fires` (its `AmmoTemplate`), by the links the
+/// templates give: it is that ammunition, or the weapon itself (or one of
+/// the same name); it is what the weapon's own `Pickup`s give, lying as a
+/// pickup (the grenade launcher's `Grenade Launcher Projectile`, not the
+/// `GL Projectile` it fires); or a gun of the weapon's model fires it.
+pub(crate) fn takes(
+    templates: &Templates,
+    weapon: Option<u32>,
+    fires: Option<u32>,
+    ammo: u32,
+) -> bool {
+    let name = |id: u32| templates.names.get(&id);
+    let same = |a: u32| {
+        a == ammo
+            || name(a)
+                .zip(name(ammo))
+                .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+    };
+    if fires.is_some_and(same) {
+        return true;
+    }
+    let Some(weapon) = weapon else {
+        return false;
+    };
+    if same(weapon) {
+        return true;
+    }
+    let own = templates
+        .leavings
+        .pickups
+        .get(&weapon)
+        .is_some_and(|p| p.gives.iter().any(|&(a, _)| same(a)));
+    let model = templates.by_id(weapon).and_then(|(_, t)| t.model);
+    own || model.is_some_and(|m| {
+        templates
+            .leavings
+            .ammo
+            .iter()
+            .any(|(&w, &a)| same(a) && templates.by_id(w).is_some_and(|(_, t)| t.model == Some(m)))
+    })
+}
+
+/// What pickup `what` gives her now, as ammunition: every `Pickup`
+/// record of its template, each to the weapon of hers that [`takes`] it.
+/// A weapon lying there is taken up; as she walks over it, it gives only
+/// what its ammunition records (`Type` 1) give a weapon of hers (a dead
+/// soldier's `Assault Rifle`: its 8 `Assault Rifle Bullet` to a rifle
+/// that fires them), none for most.
+pub(crate) fn refill(
+    templates: &Templates,
+    combat: &combat::Combat,
+    what: &Leaves,
+) -> combat::Refill {
+    let records = given(templates, what);
+    combat.refill(records, |weapon, fires, ammo| {
+        takes(templates, weapon, fires, ammo)
+    })
+}
+
+/// The `Pickup` records of `what`'s template that count walking over it:
+/// every one, or a weapon lying there's ammunition records alone.
+fn given<'a>(templates: &'a Templates, what: &Leaves) -> &'a [(u32, u32)] {
+    templates
+        .leavings
+        .pickups
+        .get(&what.template)
+        .map_or(&[][..], |p| {
+            if what.weapon.is_some() {
+                p.walked.as_slice()
+            } else {
+                p.gives.as_slice()
+            }
+        })
+}
+
+/// Why pickup `what` gives her nothing now, for the log: the records
+/// [`refill`] reads, each to the weapon of hers that [`takes`] it and that
+/// weapon's room, or to none ([`combat::Combat::refusal`]).
+pub(crate) fn refusal(templates: &Templates, combat: &combat::Combat, what: &Leaves) -> String {
+    let records = given(templates, what);
+    combat.refusal(
+        records,
+        what.health,
+        |weapon, fires, ammo| takes(templates, weapon, fires, ammo),
+        |id| {
+            templates
+                .names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("{id:#x}"))
+        },
+    )
+}
+
+/// Pickup template `id`'s `Pickup` records, for the log: each
+/// ammunition's name and amount.
+pub(crate) fn records(templates: &Templates, id: u32) -> String {
+    let records = templates
+        .leavings
+        .pickups
+        .get(&id)
+        .map_or(&[][..], |p| p.gives.as_slice());
+    let named: Vec<String> = records
+        .iter()
+        .map(|&(ammo, n)| match templates.names.get(&ammo) {
+            Some(name) => format!("{name} {n}"),
+            None => format!("{ammo:#x} {n}"),
+        })
+        .collect();
+    format!("[{}]", named.join(", "))
+}
+
+/// A helicopter of the scripts' with someone other than her aboard (the
+/// pilot a `(Driver)` spawn comes with): it is in the air, flown by them,
+/// and only shown while it flies a delivery ([`fly`]). Parked as a vehicle
+/// of hers it stood on the ground where it was made, rotors turning, with
+/// nothing to bump into (playtest 3, BUGLIST #3, alpha recording 7:42).
+/// One she is in herself is still hers (inferred).
+fn ai_flown(w: &m2_game::api::ScriptWorld, guid: u32, models: &[CatalogueEntry]) -> bool {
+    models
+        .iter()
+        .any(|m| m.kind == m2_engine::vehicle::HELICOPTER)
+        && w.objects
+            .iter()
+            .any(|(&g, o)| o.vehicle == Some(guid) && Some(g) != w.player)
 }
 
 /// The models one of the scripts' objects drives as
@@ -2190,6 +2705,171 @@ mod tests {
     }
 
     #[test]
+    fn the_contract_fanfare_waits_until_called_back() {
+        let lua = mlua::Lua::new();
+        lua.load("Hud = { Fanfare = {}, SubtitleBuffer = {} }")
+            .exec()
+            .unwrap();
+        lua.load(HUD_CALLS).exec().unwrap();
+        assert_eq!(waiting_fanfare(&lua), None);
+        lua.load(
+            r#"
+            Hud.Fanfare:Create({ sType = "contract", fCallback = function() end })
+            Hud.Fanfare:Commence({})
+            Hud.SubtitleBuffer:AddMessage({ fCallback = function() end })
+            "#,
+        )
+        .exec()
+        .unwrap();
+        // The fanfare's, not the subtitle's after it.
+        assert_eq!(waiting_fanfare(&lua), Some(1));
+        // Called back (as `MissionLink::hud_callback` does): no longer.
+        lua.load("__m2_hud_callbacks[1] = nil").exec().unwrap();
+        assert_eq!(waiting_fanfare(&lua), None);
+    }
+
+    #[test]
+    fn a_soldiers_rifle_lies_loaded_and_gives_its_bullets_walked_over() {
+        use m2_engine::pickup::{EQUIPMENT, Leavings, PickupInfo};
+        use m2_engine::weapons::{Ammo, Arms, WeaponSpec};
+        // The PC data's `Assault Rifle` (8000436f): an equipment record of
+        // radius 1.5 and a record of 8 `Assault Rifle Bullet`, the ak47's
+        // model. Its clip here is made up for the test.
+        let (ak, bullet) = (0x8000_436f, 0x8000_0b01);
+        let model = name_hash("global_weapon_ak47");
+        let spec = WeaponSpec {
+            template: ak,
+            name: "Assault Rifle".into(),
+            model: Some(model),
+            class: Some(name_hash("Rifle")),
+            semi: false,
+            rate_of_fire: 600.0,
+            clip: 30,
+            reserve_clips: 8,
+            pellets: 1,
+            rounds_per_reload: 0,
+            scatter: 1.0,
+            ammo: Ammo {
+                template: bullet,
+                velocity: 300.0,
+                max_velocity: 0.0,
+                human_boost: 1.0,
+                gravity: 0.0,
+                damage: 10.0,
+                damage_min: 10.0,
+                falloff: (0.0, 0.0),
+                key: None,
+                blast: None,
+                timer: None,
+                timer_blast: None,
+                homing: None,
+                model: None,
+                sticky: false,
+            },
+            lock_on: None,
+            pickup: Some(8),
+        };
+        let db = Templates {
+            infos: HashMap::from([(
+                ak,
+                TemplateInfo {
+                    model: Some(model),
+                    vehicle: None,
+                    engine: None,
+                    person: false,
+                    human: false,
+                },
+            )]),
+            names: HashMap::from([
+                (ak, "Assault Rifle".to_owned()),
+                (bullet, "Assault Rifle Bullet".to_owned()),
+            ]),
+            leavings: Leavings {
+                pickups: HashMap::from([(
+                    ak,
+                    PickupInfo {
+                        kind: EQUIPMENT,
+                        radius: 1.5,
+                        ammo: None,
+                        rounds: 0,
+                        gives: vec![(bullet, 8)],
+                        walked: vec![(bullet, 8)],
+                        heals: 0,
+                        cue: None,
+                        effect: None,
+                    },
+                )]),
+                ammo: HashMap::from([(ak, bullet)]),
+                ..Leavings::default()
+            },
+            arms: Arms {
+                weapons: HashMap::from([(ak, spec.clone())]),
+                ..Arms::default()
+            },
+            ..Templates::default()
+        };
+        // Taken up: the rifle, with its 8 clips of bullets.
+        let gun = pickup(&db, ak).unwrap();
+        assert_eq!(
+            gun,
+            Leaves {
+                template: ak,
+                model: Some(model),
+                reach: 1.5,
+                weapon: Some(Weapon::Rifle),
+                gun: Some(ak),
+                gives: Some((Weapon::Rifle, 240)),
+                ..Leaves::default()
+            }
+        );
+        // Walked over with a rifle that fires its bullets: they are hers.
+        let mut combat = combat::Combat::default();
+        combat.rifle = combat::Rifle::from_spec(&spec);
+        assert_eq!(refill(&db, &combat, &gun).rifle, 240);
+        // With a rifle that fires another round: nothing; it is taken up.
+        combat.rifle.template = Some(0x8000_0c01);
+        combat.rifle.ammo = None;
+        combat.rifle.model_hash = None;
+        assert_eq!(refill(&db, &combat, &gun), combat::Refill::default());
+        // The PC data's `Ammo Pickup (Small)` (8000a286): a record for each
+        // of 18 rounds (the shotgun's first, the rifles' 3 clips) and one
+        // of 3 health. With the rifle back, walked over, its bullets go to
+        // the rifle and it heals; once the rifle is full the log says why
+        // it lies.
+        let (small, shotgun) = (0x8000_a286, 0x8000_56a0);
+        let mut db = db;
+        let records = vec![(shotgun, 3), (bullet, 3)];
+        db.leavings.pickups.insert(
+            small,
+            PickupInfo {
+                kind: 1,
+                radius: 1.0,
+                ammo: Some(shotgun),
+                rounds: 3,
+                gives: records.clone(),
+                walked: records,
+                heals: 3,
+                cue: None,
+                effect: None,
+            },
+        );
+        combat.rifle = combat::Rifle::from_spec(&spec);
+        let small = pickup(&db, small).unwrap();
+        assert_eq!((small.weapon, small.health), (None, 3.0));
+        assert_eq!(refill(&db, &combat, &small).rifle, 90);
+        combat.rifle_rounds.stored = combat.rifle.spare;
+        let why = refusal(&db, &combat, &small);
+        assert!(
+            why.contains("Assault Rifle Bullet 3 to her Assault Rifle, full at 30+240 of 240"),
+            "{why}"
+        );
+        assert!(
+            why.contains("1 of 2 records for no weapon of hers"),
+            "{why}"
+        );
+    }
+
+    #[test]
     fn a_broken_supply_crate_leaves_a_grenade_launcher_and_rockets() {
         use m2_engine::pickup::{Leavings, PickupInfo};
         let info = |model| TemplateInfo {
@@ -2213,6 +2893,8 @@ mod tests {
             ammo: Some(ammo),
             rounds,
             gives: vec![(ammo, rounds)],
+            walked: vec![(ammo, rounds)],
+            heals: 0,
             cue: None,
             effect: None,
         };
@@ -2231,6 +2913,8 @@ mod tests {
                 (rockets, "Ammo Pickup (Rocket)".to_owned()),
                 (rpg, "RPG".to_owned()),
                 (launcher, "Grenade Launcher".to_owned()),
+                (missile, "Rocket".to_owned()),
+                (0x8000_0003, "rocket".to_owned()),
             ]),
             leavings: Leavings {
                 // Not a pickup, so not left for her.
@@ -2244,9 +2928,11 @@ mod tests {
             },
             ..Templates::default()
         };
-        // The launcher, loaded with its 3 clips; 20 rockets (one a clip).
+        // The launcher, loaded with its 3 clips; the rockets, whose rounds
+        // go by the weapons she carries when she comes to them.
+        let left = leaves(&db, "Supply Drop (GL) 0x40000001");
         assert_eq!(
-            leaves(&db, "Supply Drop (GL) 0x40000001"),
+            left,
             [
                 Leaves {
                     template: launcher,
@@ -2261,11 +2947,25 @@ mod tests {
                     model: Some(0x8e77_a04d),
                     reach: 1.0,
                     weapon: None,
-                    gives: Some((Weapon::Rpg, 20)),
                     ..Leaves::default()
                 },
             ]
         );
+        // Carrying the RPG (its template, the round it fires unread): 20
+        // rockets, one a clip, by its model's link. The launcher is taken
+        // up, not walked over.
+        let mut combat = combat::Combat::default();
+        combat.launcher.template = Some(rpg);
+        assert_eq!(refill(&db, &combat, &left[1]).launcher, 20);
+        assert_eq!(refill(&db, &combat, &left[0]), combat::Refill::default());
+        // The launcher's own record names what refills it, whatever it
+        // fires; a round of the same name as hers is hers, and a record
+        // naming the weapon itself is for it.
+        assert!(takes(&db, Some(launcher), Some(0x8000_0002), grenade));
+        assert!(takes(&db, None, Some(0x8000_0003), missile));
+        assert!(takes(&db, Some(rpg), None, rpg));
+        assert!(!takes(&db, None, Some(0x8000_0002), missile));
+        assert_eq!(records(&db, rockets), "[Rocket 20]");
         // Ammunition for no weapon of hers gives her nothing, but a weapon
         // comes loaded whatever its record names; a template that leaves
         // nothing, nothing at all.
@@ -2273,7 +2973,7 @@ mod tests {
         db.leavings.ammo.clear();
         let left = leaves(&db, "Supply Drop (GL)");
         assert_eq!(left[0].gives, Some((Weapon::GrenadeLauncher, 18)));
-        assert_eq!(left[1].gives, None);
+        assert_eq!(refill(&db, &combat, &left[1]), combat::Refill::default());
         assert!(leaves(&db, "RPG").is_empty());
     }
 
@@ -2300,6 +3000,35 @@ mod tests {
         assert!(models("Alouette3 Transport (VZA Intro) (Driver)").is_empty());
         assert!(models("VZ Soldier 0x00000001").is_empty());
         assert!(models("Supply Drop (GL)").is_empty());
+    }
+
+    #[test]
+    fn helicopters_their_pilots_fly_are_not_parked_for_her() {
+        use m2_game::api::{Object, ScriptWorld};
+        let heli = [entry(4, "helicopter", "vz_veh_helicopter_alouetteiii")];
+        let tank = [entry(3, "tank", "vz_veh_tank_amx30")];
+        let mut w = ScriptWorld::default();
+        w.player = Some(1);
+        w.insert(1, Object::new("Jennifer", [0.0; 3]));
+        w.insert(
+            10,
+            Object::new("Alouette3 Transport (VZA Intro) (Driver)", [0.0; 3]),
+        );
+        w.insert(20, Object::new("AMX30", [0.0; 3]));
+        // Empty, it is hers to take.
+        assert!(!ai_flown(&w, 10, &heli));
+        let mut pilot = Object::new("Pilot", [0.0; 3]);
+        pilot.vehicle = Some(10);
+        w.insert(11, pilot);
+        assert!(ai_flown(&w, 10, &heli));
+        // A crewed ground vehicle is still parked; one she flies is hers.
+        let mut driver = Object::new("Pilot", [0.0; 3]);
+        driver.vehicle = Some(20);
+        w.insert(21, driver);
+        assert!(!ai_flown(&w, 20, &tank));
+        w.objects.remove(&11);
+        w.objects.get_mut(&1).unwrap().vehicle = Some(10);
+        assert!(!ai_flown(&w, 10, &heli));
     }
 
     #[test]
@@ -2349,5 +3078,23 @@ mod tests {
         assert_eq!(models("Patrol Boat (VZ)"), [(0x123, "boat".to_owned())]);
         // Without a model in the database, the words find the catalogue's.
         assert_eq!(models("M151 Softtop (GL)"), [(1, "truck".to_owned())]);
+    }
+
+    #[test]
+    fn markers_show_from_near_to_far() {
+        // The first contract's: 2 m over its target, from 5 m to 175 m.
+        let m = MarkerView {
+            at: Vec3::new(0.0, 2.0, 0.0),
+            icon: "HUD_objective_deliverable".into(),
+            colour: [255, 200, 0, 255],
+            near: 5.0,
+            far: 175.0,
+            size: 32.0,
+        };
+        assert_eq!(m.label(), "deliverable");
+        assert!(!m.shown_from(Vec3::new(3.0, 0.0, 0.0)));
+        assert!(m.shown_from(Vec3::new(0.0, 0.0, 20.0)));
+        assert!(m.shown_from(Vec3::new(0.0, 2.0, 175.0)));
+        assert!(!m.shown_from(Vec3::new(0.0, 0.0, 200.0)));
     }
 }

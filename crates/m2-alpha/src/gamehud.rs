@@ -50,6 +50,7 @@ use mlua::{IntoLuaMulti, Lua, Table, Value};
 use crate::combat::{Combat, Fired, Picked, RIFLE_CLIP, Rounds, Weapon};
 use crate::config::Config;
 use crate::game::Game;
+use crate::hero::Hero;
 use crate::hijack::GuiCall;
 use crate::support::{self, SupportHud};
 
@@ -78,7 +79,9 @@ const RPG_STORED: u32 = 4;
 const RIFLE_ICON: &str = "weapons_m4";
 const RPG_ICON: &str = "weapons_rpg";
 const LAUNCHER_ICON: &str = "weapons_grenade_launcher_2";
-/// Their reticles (`uReticleTexture`), `reticle_*` by the kind of round.
+/// Their reticles (`uReticleTexture`), `reticle_*` by the kind of round
+/// (inferred from the textures' names: the guns' `WeaponUI` records, which
+/// name them, aren't read yet).
 const RIFLE_RETICLE: &str = "reticle_bullets";
 const RPG_RETICLE: &str = "reticle_rockets";
 const LAUNCHER_RETICLE: &str = "reticle_grenade";
@@ -105,7 +108,7 @@ return c.sColor .. tag .. " [objective." .. c.sPrefix .. c.sStatus .. "]" .. " "
 /// its own environment like every module: its globals are the module's
 /// members.
 const HUD_CALL: &str = r#"
-local group, method, data, seq = ...
+local group, method, data, seq, call = ...
 -- The mission's callback (`fCallback`, kept in the mission's own Lua
 -- state) stands here as a note of the call's number, for the game to
 -- hand back ([`HudCall::callback`]).
@@ -120,7 +123,18 @@ local hud = type(module) == "table" and module.HudInterface
 local g = type(hud) == "table" and hud[group]
 local f = type(g) == "table" and g[method]
 if type(f) ~= "function" then return false end
-f(g, data)
+-- Message ids: the mission knows a message by its call's number
+-- (`{ __m2_seq = n }`), the buffers by their own ids, kept here.
+__m2_message_ids = __m2_message_ids or {}
+local ids = type(data) == "table" and data.tMessageIds
+if type(ids) == "table" and ids.__m2_seq then
+    data.tMessageIds = __m2_message_ids[ids.__m2_seq] or {}
+    __m2_message_ids[ids.__m2_seq] = nil
+end
+local r = f(g, data)
+if method == "AddMessage" and call then
+    __m2_message_ids[call] = r
+end
 return true
 "#;
 /// A call of the hijack scripts to one of the HUD's modules
@@ -283,16 +297,25 @@ if w and w.SetText then w:SetText(text) end
 /// and the last press's mark (true a check, false a cross). As the
 /// minigame draws them: a wedge lights while the marker passes through it,
 /// the disc flashes green on a hit and red on a miss, under the check or
-/// cross. With no size the wheel is put away.
+/// cross. With no size the wheel is put away. Answers what it found
+/// ("no overlay", "no minigame", "put away" or "posed") and the overlay's
+/// and the minigame's widget ids, for the log.
 const SATELLITE_WHEEL: &str = r#"
 local size, angle, inside, mark = ...
+local base = rawget(_G, "MrxGuiBase")
+local function id_of(x)
+    for id, o in pairs(base and base.WidgetIdIndex or {}) do
+        if o == x then return id end
+    end
+end
 local w = MrxGui.GetWidgetByNameAndOwner("Satellite overlay", Sys.StringToGuid("0x1"))
-local m = w and w.CustomData.oMinigame
-if not m then return end
+if not w then return "no overlay" end
+local m = w.CustomData.oMinigame
+if not m then return "no minigame", id_of(w) end
 local c = m.CustomData
 if not size or size <= 0 then
     m:SetVisible(false)
-    return
+    return "put away", id_of(w), id_of(m)
 end
 m:SetVisible(true)
 w.CustomData.oReticle:SetVisible(false)
@@ -341,6 +364,7 @@ else
     c.oFeedback:SetTexture(mark and "icon_success" or "icon_fail")
     c.oFeedback:SetTranslucency(255)
 end
+return "posed", id_of(w), id_of(m)
 "#;
 /// The satellite view's help, in the tutorial box as the PC footage has
 /// it (its own `Satellite Help` text stays blank): what the first
@@ -367,7 +391,7 @@ const MAP_TEXTURE: &str = "vz_lrterrain";
 const BORDER_TEXTURE: &str = "global_gui_hud_radar";
 const BORDER: f32 = 154.0 / 100.0;
 /// What the radar strokes its dashed roads with: two dashes, white in a
-/// black rim, along 32 × 8 pixels.
+/// black rim, along 32 Ã— 8 pixels.
 const PATH_TEXTURE: &str = "global_radar_path";
 /// The texture's across (u) through the middle of a dash: a paved road is
 /// stroked with that column alone, solid with the dashes' rim.
@@ -388,6 +412,10 @@ pub struct HudState {
     /// Health, 0..=100: hers, or the vehicle's she is in.
     pub hp: f32,
     pub in_vehicle: bool,
+    /// The hero she is and her health when whole: the HUD's scripts know
+    /// her player by them ([`crate::mission::set_hero`]). `None` leaves
+    /// them be (the HUD starts as [`GameHud::start`]'s hero).
+    pub hero: Option<(Hero, f32)>,
     pub weapon: Weapon,
     pub fired: Fired,
     /// The rifle's rounds: in the clip, stored.
@@ -396,13 +424,18 @@ pub struct HudState {
     pub picked: Picked,
     /// The grenade launcher's rounds, while she carries one.
     pub launcher: Option<Rounds>,
-    /// The grenades she has to throw (the counter by her health).
+    /// What she has left of the explosive she has chosen to throw
+    /// (grenades, C4 or mines): the explosives box's count.
     pub grenades: u32,
     /// The label of the vehicle she is in.
     pub vehicle: Option<String>,
     /// The templates that vehicle may be, its own first: their labels
     /// pick the health box's armour badge.
     pub vehicle_templates: Vec<String>,
+    /// The string table keys of the names the game shows for those
+    /// templates (their `LocalizedName`s), in the same order: the vehicle
+    /// box names it by the first the strings hold.
+    pub vehicle_names: Vec<u32>,
     /// Its cannon's shells, when they run out: left, and how many it
     /// carries (the AMX-30's 40, counted down in the gun box).
     pub cannon: Option<(u32, u32)>,
@@ -415,14 +448,16 @@ pub struct HudState {
     /// Messages for the message buffer since the last state.
     pub messages: Vec<ObjectiveMessage>,
     /// Who is under the reticle, as `GuiReticleUpdate` takes it: -1 an
-    /// enemy, 0 anyone else; and their health (of 100).
-    pub target: Option<(i32, i32)>,
+    /// enemy, 0 anyone else; their health, and its most (their template's
+    /// `Health`: a VZ soldier's 75).
+    pub target: Option<(i32, i32, i32)>,
     /// Where she is (world), and which way she faces: degrees, growing
     /// turning left, as the heading.
     pub position: Option<[f32; 3]>,
     pub facing: f32,
-    /// Objective markers for the minimap: where, icon (`deliverable`...),
-    /// colour (RGBA).
+    /// Objective markers for the minimap: where, icon
+    /// (`HUD_objective_deliverable`...), colour (RGBA). Their icons are
+    /// read for the world's markers too ([`GameHud::paint_texture`]).
     pub blips: Vec<([f32; 3], String, [u8; 4])>,
     /// Where the reticle goes: the screen point her weapon (or her
     /// vehicle's gun) aims at, -1..=1 across and up the screen as
@@ -461,6 +496,14 @@ pub struct HudState {
     /// how much is left (0..=100) and whether it holds.
     pub vehicle_disguise: bool,
     pub disguise: Option<(f32, bool)>,
+    /// The keys bound to the texts' control words (`("support", "T")`,
+    /// [`crate::input::token_keys`]), for those the fonts have no picture
+    /// for ([`gui_runtime::Screen::set_key_names`]).
+    pub key_names: Vec<(String, String)>,
+    /// An Xbox pad plays ([`crate::pad`]): the texts' control words show
+    /// its pictures and the hijack's buttons its Xbox ones
+    /// ([`gui_runtime::Screen::set_pad`]).
+    pub pad: bool,
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -571,6 +614,20 @@ pub struct HudCall {
     pub callback: bool,
 }
 
+/// The reticle's kind and health for a person under it: soldiers who have
+/// turned on her are enemies (-1), anyone else 0; their health of the most
+/// they started with (a soldier's template's, a civilian's 100), which the
+/// arc shows a share of.
+fn target_health(n: &crate::npc::Npc) -> (i32, i32, i32) {
+    let enemy = n.soldier && n.alert;
+    let most = n.most_hp.round().max(1.0);
+    (
+        -i32::from(enemy),
+        n.hp.round().clamp(0.0, most) as i32,
+        most as i32,
+    )
+}
+
 impl HudState {
     /// What the play shows now (the screen size and time step are the
     /// HUD's to fill in). Takes her hurts from `game`.
@@ -580,8 +637,7 @@ impl HudState {
             .and_then(|p| p.driving)
             .and_then(|i| game.scene.vehicles.get(i));
         let at = player.map(|p| p.character.position);
-        // On foot, the person a shot fired now would hit: soldiers who
-        // have turned on her are enemies.
+        // On foot, the person a shot fired now would hit.
         let people = &game.scene.people;
         let target = player
             .filter(|p| p.driving.is_none())
@@ -589,10 +645,7 @@ impl HudState {
             .and_then(|(p, w)| Combat::aim_probe(&w.physics, people, p))
             .and_then(|(_, person)| people.npcs.get(person?))
             .filter(|n| n.alive)
-            .map(|n| {
-                let enemy = n.soldier && n.alert;
-                (-i32::from(enemy), n.hp.round().clamp(0.0, 100.0) as i32)
-            });
+            .map(target_health);
         let hurts = game
             .combat
             .take_hurts()
@@ -607,11 +660,19 @@ impl HudState {
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             rifle: game.combat.rifle_rounds,
-            grenades: game.combat.grenades,
+            grenades: game.combat.explosive_left().1,
             vehicle: vehicle.map(|v| v.spec.label.clone()),
             vehicle_templates: vehicle
                 .zip(game.scene.world.as_ref())
                 .map(|(v, w)| w.index.template_db.names_for(&v.spec.label, v.spec.model))
+                .unwrap_or_default(),
+            vehicle_names: vehicle
+                .zip(game.scene.world.as_ref())
+                .map(|(v, w)| {
+                    w.index
+                        .template_db
+                        .localized_keys(&v.spec.label, v.spec.model)
+                })
                 .unwrap_or_default(),
             cannon: vehicle.and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
             heading: game.camera.yaw.to_degrees(),
@@ -620,6 +681,7 @@ impl HudState {
             facing: player.map_or(0.0, |p| p.facing.to_degrees()),
             hurts,
             sea_level: game.scene.world.as_ref().map(|w| w.settings.sea_level),
+            hero: Some((game.scene.hero, game.combat.max_hp)),
             ..Self::default()
         }
     }
@@ -672,10 +734,12 @@ fn direction(at: Option<Vec3>, from: Option<Vec3>) -> f32 {
     (-d.x.atan2(d.z)).to_degrees().rem_euclid(360.0)
 }
 
-/// What the vehicle box shows for a vehicle label: its name, and its
-/// faction as the game's guid for it (`SetVehicleName(name, faction)`
-/// picks the faction's icon; none shows the PMC's). Labels start with the
-/// faction (`"vz_veh_truck_m151"` is the VZ's `"truck m151"`).
+/// What the vehicle box shows for a vehicle label: its name (where none
+/// of its templates' shown names is found, [`HudState::vehicle_names`]),
+/// and its faction as the game's guid for it (`SetVehicleName(name,
+/// faction)` picks the faction's icon; none shows the PMC's). Labels
+/// start with the faction (`"vz_veh_truck_m151"` is the VZ's `"truck
+/// m151"`).
 fn vehicle_name(label: &str) -> (String, Option<u32>) {
     let (faction, name) = label.split_once("_veh_").unwrap_or(("", label));
     // `MrxGuiHudVehicleDisguise.Init`'s faction guids.
@@ -711,6 +775,21 @@ struct Image {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+}
+
+/// Whether a HUD log line tells of a mission fanfare call that failed
+/// (`hud call Fanfare.Create: ...`, as the HUD thread logs its calls).
+fn fanfare_failed(line: &str) -> bool {
+    line.strip_prefix("hud call Fanfare.")
+        .is_some_and(|rest| rest.contains(": "))
+}
+
+/// Whether a HUD log line tells of its Lua state out of stack (mlua's
+/// "out of Lua stack"), after which every call into its scripts fails. A
+/// script's own error, even a runaway one ("stack overflow"), unwinds and
+/// leaves the state as it was.
+fn broken_lua(line: &str) -> bool {
+    line.contains("out of Lua stack")
 }
 
 /// What the thread sends back.
@@ -781,6 +860,9 @@ pub struct GameHud {
     last_time: Option<f64>,
     /// Mission calls whose callbacks the HUD has called, to hand back.
     callbacks: Vec<u64>,
+    /// A mission fanfare call (`Hud.Fanfare`) failed in the HUD's scripts:
+    /// it can't show, nor its Enter close it.
+    dropped_fanfare: bool,
     /// The front end's latest news (see [`GameHud::start_shell`]).
     shell: ShellNews,
     log: Option<BufWriter<File>>,
@@ -796,9 +878,11 @@ impl std::fmt::Debug for GameHud {
 }
 
 impl GameHud {
-    /// Starts the HUD's scripts reading `install` in the background.
-    pub fn start(install: &Install) -> Self {
-        Self::start_mode(install, Mode::Hud, "m2-alpha-hud.log")
+    /// Starts the HUD's scripts reading `install` in the background, their
+    /// player `hero` whole at `max` health (play's, as the game starts;
+    /// a later pick comes with [`HudState::hero`]).
+    pub fn start(install: &Install, hero: Hero, max: f32) -> Self {
+        Self::start_mode(install, Mode::Hud, Some((hero, max)), "m2-alpha-hud.log")
     }
 
     /// Starts the front end instead: the shell's own scripts and Flash
@@ -806,10 +890,10 @@ impl GameHud {
     /// its boot movies, drawn like the HUD. What they ask of the game
     /// comes back as [`ShellNews`].
     pub fn start_shell(install: &Install) -> Self {
-        Self::start_mode(install, Mode::Shell, "m2-alpha-shell.log")
+        Self::start_mode(install, Mode::Shell, None, "m2-alpha-shell.log")
     }
 
-    fn start_mode(install: &Install, mode: Mode, log: &str) -> Self {
+    fn start_mode(install: &Install, mode: Mode, hero: Option<(Hero, f32)>, log: &str) -> Self {
         let (tx, thread_rx) = channel();
         let (thread_tx, rx) = channel();
         let data = install.data.clone();
@@ -822,7 +906,7 @@ impl GameHud {
                 }
                 .into(),
             )
-            .spawn(move || run(&data, mode, thread_rx, thread_tx))
+            .spawn(move || run(&data, mode, hero, thread_rx, thread_tx))
             .expect("could not start the HUD thread");
         let path = Config::file_beside(log);
         let log = File::create(&path).ok().map(BufWriter::new);
@@ -831,6 +915,7 @@ impl GameHud {
             rx,
             status: Status::Loading,
             callbacks: Vec::new(),
+            dropped_fanfare: false,
             prims: Vec::new(),
             pending: Vec::new(),
             textures: HashMap::new(),
@@ -865,9 +950,15 @@ impl GameHud {
         matches!(self.status, Status::Ready)
     }
 
-    /// The scripts could not start: the old HUD stands in.
+    /// The scripts could not start, or broke: the old HUD stands in.
     pub fn failed(&self) -> bool {
         matches!(self.status, Status::Failed)
+    }
+
+    /// A mission fanfare call failed in the HUD's scripts (the log says
+    /// which): the contract's fanfare isn't up for Enter to close.
+    pub fn dropped_fanfare(&self) -> bool {
+        self.dropped_fanfare
     }
 
     /// Seconds since the last frame, from egui's input `time`.
@@ -967,12 +1058,29 @@ impl GameHud {
                 shell,
             } => {
                 self.callbacks.extend(callbacks);
+                // Handed over already (a frame queued before it in this
+                // drain broke): a later frame does not take it back.
+                if self.failed() {
+                    self.write(log);
+                    return;
+                }
                 let new_game = self.shell.new_game.take().or(shell.new_game);
                 self.shell = ShellNews { new_game, ..shell };
+                self.dropped_fanfare |= log.iter().any(|l| fanfare_failed(l));
+                let broken = log.iter().find(|l| broken_lua(l)).cloned();
+                self.write(log);
+                if let Some(line) = broken {
+                    // Every call into its scripts fails from here on: the
+                    // stand-in HUD shows the objectives, the support menu,
+                    // the PDA and the satellite's view instead.
+                    self.fail(format!(
+                        "the HUD's scripts broke ({line}); the stand-in HUD takes over"
+                    ));
+                    return;
+                }
                 self.status = Status::Ready;
                 self.prims = prims;
                 self.pending.extend(images);
-                self.write(log);
             }
             Output::Failed(why) => self.fail(why),
         }
@@ -1026,6 +1134,25 @@ impl GameHud {
     /// triangles smeared: their feathering assumes one winding.)
     pub fn paint(&self, painter: &egui::Painter) {
         self.paint_prims(painter, &self.prims);
+    }
+
+    /// Paints the HUD's texture `name` over `rect` (screen points), tinted
+    /// by `colour`, once the HUD has read it (the objective markers'
+    /// icons, read with the minimap's blips: [`HudState::blips`]). False
+    /// until then, or if the archive has no such texture.
+    pub fn paint_texture(
+        &self,
+        painter: &egui::Painter,
+        name: &str,
+        rect: egui::Rect,
+        colour: Color32,
+    ) -> bool {
+        let Some(Some(texture)) = self.textures.get(&name_hash(name)) else {
+            return false;
+        };
+        let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        painter.image(texture.id(), rect, uv, colour);
+        true
     }
 
     /// Paints what the shell draws under its movie widget (the widgets
@@ -1274,10 +1401,16 @@ fn covers(p: &Prim, screen: egui::Rect) -> bool {
     w * h > screen.area() / 2.0
 }
 
-/// The thread: reads the scripts, fonts and strings, starts the HUD, then
-/// draws each state sent until the sender goes.
-fn run(data: &std::path::Path, mode: Mode, rx: Receiver<HudState>, tx: Sender<Output>) {
-    let mut hud = match Thread::start(data, mode) {
+/// The thread: reads the scripts, fonts and strings, starts the HUD (its
+/// player `hero`), then draws each state sent until the sender goes.
+fn run(
+    data: &std::path::Path,
+    mode: Mode,
+    hero: Option<(Hero, f32)>,
+    rx: Receiver<HudState>,
+    tx: Sender<Output>,
+) {
+    let mut hud = match Thread::start(data, mode, hero) {
         Ok(h) => h,
         Err(e) => {
             let _ = tx.send(Output::Failed(e));
@@ -1316,9 +1449,13 @@ struct Told {
     /// she drives a vehicle with a cannon.
     weapon: Option<(Weapon, bool, bool)>,
     ammo: Option<[i64; 5]>,
+    /// She was in a vehicle ([`HudState::in_vehicle`]).
+    in_vehicle: Option<bool>,
+    /// The gun box's icon widgets as last logged ([`Thread::gun_box`]).
+    gun_box: String,
     vehicle: Option<Option<String>>,
     vehicle_templates: Option<Vec<String>>,
-    target: Option<Option<(i32, i32)>>,
+    target: Option<Option<(i32, i32, i32)>>,
     reticle: Option<Option<[f32; 2]>>,
     regions: Option<Vec<RadarRegion>>,
     /// The support item ready (how many, whether free), and the menu.
@@ -1330,6 +1467,20 @@ struct Told {
     tutorial: Option<Option<String>>,
     trespass: crate::mission::Trespass,
     disguise: Option<Option<(f32, bool)>>,
+    /// The keys the texts' control words name ([`HudState::key_names`]).
+    key_names: Option<Vec<(String, String)>>,
+}
+
+impl Told {
+    /// She is `in_vehicle` now: got out of one, her gun and its rounds are
+    /// to be told again (as for a change of gun).
+    fn seat(&mut self, in_vehicle: bool) {
+        if self.in_vehicle == Some(true) && !in_vehicle {
+            self.weapon = None;
+            self.ammo = None;
+        }
+        self.in_vehicle = Some(in_vehicle);
+    }
 }
 
 /// How far (in -1..=1 screen units, across plus up) the aim point moves
@@ -1338,11 +1489,15 @@ const RETICLE_STEP: f32 = 0.002;
 
 struct Thread {
     mission: Mission,
+    /// The hero its player was last made ([`HudState::hero`]).
+    hero: Option<Hero>,
     assets: AssetSource<BufReader<File>>,
     /// The language archive: the HUD's localised textures (the fanfares'
     /// titles and borders are only there, as `<name>_english`).
     language: Option<AssetSource<BufReader<File>>>,
     fonts: BTreeMap<String, Font>,
+    /// Fonts the text widgets name, looked for (read, or found missing).
+    fonts_tried: HashSet<String>,
     /// Textures tried (sent, or found missing).
     tried: HashSet<u32>,
     told: Told,
@@ -1384,15 +1539,24 @@ struct Thread {
     native: crate::shell::Native,
     /// `fscommand`s no script heard, for the engine (the front end's).
     unheard: Vec<(String, String)>,
-    /// Seconds since `M2_SHELL_PROBE` last logged.
+    /// Seconds since `M2_SHELL_PROBE` (or `M2_HUD_PROBE`) last logged.
     probe_time: f64,
+    /// How many natives the scripts called that aren't made, as last
+    /// logged.
+    unknown_seen: usize,
+    /// What posing the timing wheel found, as last logged.
+    wheel_seen: String,
 }
 
 /// The language archive beside `vz.wad` (English only for now).
 const LANGUAGE_WAD: &str = "English.wad";
 
 impl Thread {
-    fn start(data: &std::path::Path, mode: Mode) -> Result<Self, String> {
+    fn start(
+        data: &std::path::Path,
+        mode: Mode,
+        hero: Option<(Hero, f32)>,
+    ) -> Result<Self, String> {
         let wad = data.join(match mode {
             Mode::Hud => "vz.wad",
             Mode::Shell => "shell.wad",
@@ -1428,8 +1592,14 @@ impl Thread {
             }
         }
         let strings = game_data.strings.clone();
-        let mut mission =
-            Mission::new(game_data, "Mattias", [0.0; 3]).map_err(|e| e.to_string())?;
+        // Its player is play's hero from the start, for the modules' `Init`
+        // and `CreateGui` to see; a later pick renames her
+        // ([`HudState::hero`]). The front end's world keeps "Mattias".
+        let name = hero.map_or("Mattias", |(h, _)| h.name());
+        let mut mission = Mission::new(game_data, name, [0.0; 3]).map_err(|e| e.to_string())?;
+        if let Some((h, max)) = hero {
+            crate::mission::set_hero(&mut mission, h, max, "game HUD");
+        }
         let screen = gui_runtime::screen(mission.lua()).ok_or("no GUI runtime")?;
         {
             let mut s = screen.borrow_mut();
@@ -1487,7 +1657,9 @@ impl Thread {
         // movies' load callbacks (the PDA's closes it, `_FinishLoadAndClose`;
         // left open, the support menu won't open over it).
         gui_runtime::tick(mission.lua(), 0.0);
-        Ok(Self::new(mission, assets, language, fonts, movies, mode))
+        let mut thread = Self::new(mission, assets, language, fonts, movies, mode);
+        thread.hero = hero.map(|(h, _)| h);
+        Ok(thread)
     }
 
     fn new(
@@ -1500,9 +1672,11 @@ impl Thread {
     ) -> Self {
         Self {
             mission,
+            hero: None,
             assets,
             language,
             fonts,
+            fonts_tried: HashSet::new(),
             tried: HashSet::new(),
             told: Told::default(),
             fullscreen_seen: String::new(),
@@ -1526,12 +1700,22 @@ impl Thread {
             native: crate::shell::Native::default(),
             unheard: Vec::new(),
             probe_time: 0.0,
+            unknown_seen: 0,
+            wheel_seen: String::new(),
         }
     }
 
     fn frame(&mut self, state: &HudState) -> Output {
         if self.mode == Mode::Shell {
             return self.shell_frame(state);
+        }
+        // Who she is, as play says: picked in the front end after this
+        // thread started, or changed from the pause menu.
+        if let Some((hero, max)) = state.hero
+            && self.hero != Some(hero)
+        {
+            self.hero = Some(hero);
+            crate::mission::set_hero(&mut self.mission, hero, max, "game HUD");
         }
         let mut log = Vec::new();
         if let Err(e) = self.feed(state) {
@@ -1629,9 +1813,10 @@ impl Thread {
             self.mission.tick(dt);
             gui_runtime::tick(self.mission.lua(), dt);
         }
-        if let Err(e) = self.pose_wheel(state) {
+        if let Err(e) = self.pose_wheel(state, &mut log) {
             log.push(format!("wheel: {e}"));
         }
+        self.gun_box(state, &mut log);
         // Keys go to the movie that has the controls: the mission's
         // fanfare while it is up (its Key listener's Enter continues, as
         // `_HandleFanfareInput` passes the select button on), else the PDA.
@@ -1644,6 +1829,17 @@ impl Thread {
         };
         let [w, h] = state.size;
         let items = screen.borrow().draw_list(w, h);
+        self.load_fonts(&items, &mut log);
+        // Natives the scripts call that aren't made (they answer nothing,
+        // or zeros), as more are called.
+        {
+            let s = screen.borrow();
+            if s.unknown().len() != self.unknown_seen {
+                self.unknown_seen = s.unknown().len();
+                let unknown: Vec<&str> = s.unknown().iter().map(String::as_str).collect();
+                log.push(format!("natives not made: {}", unknown.join(", ")));
+            }
+        }
         // The fullscreen widgets drawn (a fanfare and its fade), where in
         // the order and how opaque, when that changes.
         let fullscreen: Vec<String> = {
@@ -1777,12 +1973,35 @@ impl Thread {
                 hidden
             }
         };
+        // The tutorial box with nothing to say is left out, frame and all
+        // (inferred: its line emptied, by either of the paths that write
+        // it, would leave the frame drawn as a bare bar).
+        let mut hidden = hidden;
+        let tutorial = widgets_under(&screen.borrow(), &names, |n| n == "tutorial");
+        if !says_something(&items, &tutorial) {
+            hidden.extend(tutorial);
+        }
         let mut prims = Vec::new();
         let mut want = Vec::new();
         let shown = |i: &&DrawItem| {
             let w = widget_of(i);
             !hidden.contains(&w) && only.as_ref().is_none_or(|o| o.contains(&w))
         };
+        // `M2_HUD_PROBE=x,y` (screen points, as the HUD is drawn): once a
+        // second, what is drawn over that point, and what of it is left
+        // out here.
+        if let Some(at) = probe_point("M2_HUD_PROBE") {
+            self.probe_time += dt;
+            if self.probe_time >= 1.0 {
+                self.probe_time = 0.0;
+                log.push(format!("probe {},{}:", at[0], at[1]));
+                let s = screen.borrow();
+                for item in items.iter().filter(|i| holds(i, at)) {
+                    let left_out = if shown(&item) { "" } else { " (left out)" };
+                    log.push(format!("  {}{left_out}", probe_line(&s, &names, item)));
+                }
+            }
+        }
         if state.support.pda && !scripted {
             if self.pda.is_none() {
                 let started = Instant::now();
@@ -1827,6 +2046,13 @@ impl Thread {
             log.push(format!("screen covers: {covers} of {} prims", prims.len()));
             self.covers_seen = covers;
         }
+        // The objective markers' icons, for the world's markers
+        // ([`GameHud::paint_texture`]) whether or not the minimap is up.
+        want.extend(state.blips.iter().map(|(_, icon, _)| name_hash(icon)));
+        // The pad's Y, for the use prompts with a pad (`crate::ui`).
+        if state.pad {
+            want.push(name_hash(crate::pad::Button::Y.texture()));
+        }
         let mut images = Vec::new();
         for hash in want {
             if self.tried.insert(hash) {
@@ -1860,17 +2086,17 @@ impl Thread {
                 images.push((hash, image));
             }
         }
-        let callbacks = self
-            .mission
-            .lua()
-            .globals()
+        // Taken out, not emptied: mlua's `Table::clear` (Lua 5.1) leaves the
+        // table on the Lua stack, one slot a frame, until every call into
+        // the HUD's scripts fails ("out of Lua stack") after ~8000 frames.
+        let globals = self.mission.lua().globals();
+        let callbacks = globals
             .raw_get::<Option<mlua::Table>>("__m2_hud_done")
             .ok()
             .flatten()
             .map(|t| {
-                let seqs: Vec<u64> = t.sequence_values::<u64>().flatten().collect();
-                t.clear().ok();
-                seqs
+                let _ = globals.raw_set("__m2_hud_done", mlua::Value::Nil);
+                t.sequence_values::<u64>().flatten().collect()
             })
             .unwrap_or_default();
         Output::Frame {
@@ -1879,6 +2105,46 @@ impl Thread {
             log,
             callbacks,
             shell: ShellNews::default(),
+        }
+    }
+
+    /// Reads the fonts the text widgets drawn name and the HUD hasn't
+    /// read yet (from the archive, else the language archive), once each:
+    /// text in a font not read isn't drawn. A font read is given to the
+    /// widgets' store too, for their measures. Those missing are logged.
+    fn load_fonts(&mut self, items: &[DrawItem], log: &mut Vec<String>) {
+        for item in items {
+            let DrawItem::Text { font, .. } = item else {
+                continue;
+            };
+            let name = font.to_ascii_lowercase();
+            if name.is_empty()
+                || self.fonts.contains_key(&name)
+                || !self.fonts_tried.insert(name.clone())
+            {
+                continue;
+            }
+            let hash = name_hash(&name);
+            let read = |a: &mut AssetSource<BufReader<File>>| {
+                a.asset(hash, FONT_TYPE)
+                    .map_err(|e| e.to_string())
+                    .and_then(|a| Font::parse(&a).map_err(|e| e.to_string()))
+            };
+            let found = read(&mut self.assets)
+                .or_else(|e| self.language.as_mut().and_then(|l| read(l).ok()).ok_or(e));
+            match found {
+                Ok(f) => {
+                    log.push(format!("font {name}: read for a text widget"));
+                    if let Some(screen) = gui_runtime::screen(self.mission.lua()) {
+                        screen.borrow_mut().set_font(&name, f.clone());
+                    }
+                    self.fonts.insert(name, f);
+                }
+                Err(e) => {
+                    eprintln!("game HUD: font {name}: {e}");
+                    log.push(format!("font {name}: {e}"));
+                }
+            }
         }
     }
 
@@ -2204,7 +2470,17 @@ impl Thread {
             }
         }
         for (id, (command, arg)) in commands {
-            match gui_runtime::flash_command(lua, id, &command, &arg) {
+            let character = self.native.character();
+            let heard = match character {
+                Some(who) if self.mode == Mode::Shell && command == "newGame" => {
+                    log.push(format!(
+                        "shell: newGame({arg}) as the profile's character, {who}"
+                    ));
+                    crate::shell::start_new_game(lua, id, who)
+                }
+                _ => gui_runtime::flash_command(lua, id, &command, &arg),
+            };
+            match heard {
                 Ok(true) => {}
                 Ok(false) => {
                     log.push(format!(
@@ -2300,9 +2576,13 @@ impl Thread {
                     c.method.as_str(),
                     data,
                     c.callback.then_some(c.seq),
+                    c.seq,
                 ))
             });
             log.push(match done {
+                // The tutorial box's: with what it says, as the box has
+                // another writer too (`Net.SetTutorialMessage`, [`TUTORIAL`]).
+                Ok(true) if c.group == "Tutorial" => format!("hud call {name} {:?}", c.data),
                 Ok(true) => format!("hud call {name}"),
                 Ok(false) => format!("hud call {name}: the HUD has no such method"),
                 Err(e) => format!("hud call {name}: {e}"),
@@ -2332,7 +2612,40 @@ impl Thread {
             s.heading
         };
         if let Some(screen) = gui_runtime::screen(lua) {
-            screen.borrow_mut().set_camera_heading(heading);
+            let mut screen = screen.borrow_mut();
+            screen.set_camera_heading(heading);
+            screen.set_pad(s.pad);
+        }
+        // The keys the texts' control words name, as the bindings are (and
+        // again should they change): before any text this frame is set.
+        if self.told.key_names.as_ref() != Some(&s.key_names) {
+            self.told.key_names = Some(s.key_names.clone());
+            // The words the fonts have no picture matched for, as their
+            // keys, and what the PC must look at to match them.
+            let keyed: Vec<String> = s
+                .key_names
+                .iter()
+                .filter(|(w, _)| gui_runtime::button_glyph(w).is_none())
+                .map(|(w, k)| format!("[{w}] as [{k}]"))
+                .collect();
+            if !keyed.is_empty() {
+                eprintln!(
+                    "hud text: no button picture matched for {}: on the PC, which of \
+                     english_18's button page (pc\\common_18_buttons) glyphs {} (or past \
+                     U+E013) is each",
+                    keyed.join(", "),
+                    gui_runtime::UNMATCHED_GLYPHS
+                        .iter()
+                        .map(|c| format!("U+{:04X}", u32::from(*c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if let Some(screen) = gui_runtime::screen(lua) {
+                screen
+                    .borrow_mut()
+                    .set_key_names(s.key_names.iter().cloned());
+            }
         }
         // Where she is for the minimap, each frame as the engine does: its
         // handler hands it on to `MinimapUpdate`, with the heading as the
@@ -2372,6 +2685,15 @@ impl Thread {
             let (name, faction) = match &s.vehicle {
                 Some(label) => {
                     let (name, faction) = vehicle_name(label);
+                    // The name the game shows, its template's
+                    // `LocalizedName` string ("Chopper"), where the
+                    // strings hold one; else the label's.
+                    let strings = &self.mission.strings().strings;
+                    let name = s
+                        .vehicle_names
+                        .iter()
+                        .find_map(|k| strings.get(k).cloned())
+                        .unwrap_or(name);
                     (
                         Value::String(lua.create_string(name)?),
                         faction.map_or(Value::Nil, guid_value),
@@ -2401,6 +2723,12 @@ impl Thread {
         }
         let holding = s.support.designator.is_some();
         let cannon = s.in_vehicle && s.cannon.is_some();
+        // Out of a vehicle, she has her gun in hand again, and the HUD is
+        // told so as for a change of gun, and her rounds after it: the
+        // gun box (shown by `GuiWeaponEquippedUpdate`) had been shown only
+        // once, on the boat at the start, and never again on foot, as no
+        // gun was changed after (PC playtest, 2026-10-08).
+        self.told.seat(s.in_vehicle);
         if self.told.weapon != Some((s.weapon, holding, cannon)) {
             self.told.weapon = Some((s.weapon, holding, cannon));
             let (icon, guid, reticle) = match s.weapon {
@@ -2419,7 +2747,9 @@ impl Thread {
             };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
-            // health type: that bar shows only on a target.
+            // health type: that bar shows only on a target. The crosshair
+            // for every gun but the cannon (inferred, as the textures are:
+            // the tank's none is its own template's).
             let t = table(
                 lua,
                 [
@@ -2475,19 +2805,29 @@ impl Thread {
                 fire(lua, "GuiReticlePositionChange", t)?;
             }
         }
-        if self.told.target != Some(s.target) {
+        // (target, centre x, y, spread x, y, health, maximum), again as the
+        // aim moves too, not only as who is under it changes: the centre
+        // is the aim point, -1..=1 as `GuiReticlePositionChange` has it
+        // (inferred: the handler isn't read here), for the crosshair to sit
+        // where shots go rather than at the layout's middle. No spread (0,
+        // inferred: the guns' spreads aren't read). No health fades the
+        // target-health arc (opaque as laid out); a health shows that share
+        // of the target's own most.
+        if moved || self.told.target != Some(s.target) {
             self.told.target = Some(s.target);
-            // (target, centre x, y, spread x, y, health, maximum): no
-            // health fades the target-health arc (opaque as laid out);
-            // a health shows that much of it.
-            match s.target {
-                Some((kind, hp)) => fire(
-                    lua,
-                    "GuiReticleUpdate",
-                    (kind, Value::Nil, Value::Nil, 0, 0, hp, 100),
-                )?,
-                None => fire(lua, "GuiReticleUpdate", 0)?,
-            }
+            let number = |v: f32| Value::Number(v.into());
+            let (x, y) = s
+                .reticle
+                .map_or((Value::Nil, Value::Nil), |[x, y]| (number(x), number(y)));
+            let (kind, hp, most) = match s.target {
+                Some((kind, hp, most)) => (
+                    kind,
+                    Value::Integer(hp as mlua::Integer),
+                    Value::Integer(most as mlua::Integer),
+                ),
+                None => (0, Value::Nil, Value::Nil),
+            };
+            fire(lua, "GuiReticleUpdate", (kind, x, y, 0, 0, hp, most))?;
         }
         for &(damage, direction) in &s.hurts {
             fire(lua, "GuiPlayerReceiveDamage", (direction, damage))?;
@@ -2645,24 +2985,122 @@ impl Thread {
         Ok(())
     }
 
+    /// The gun box as the scripts left it, logged as it changes: each
+    /// widget showing one of the guns' icons (the box's picture of the
+    /// gun in hand), with whatever of it and its parents keeps it from
+    /// drawing (hidden, asleep, inactive, see-through), on foot or in a
+    /// vehicle. Tells a PC run what keeps the box away on foot, should it
+    /// still be.
+    fn gun_box(&mut self, s: &HudState, log: &mut Vec<String>) {
+        let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
+            return;
+        };
+        let screen = screen.borrow();
+        let icons = [
+            RIFLE_ICON,
+            RPG_ICON,
+            LAUNCHER_ICON,
+            DESIGNATOR_ICON,
+            CANNON_ICON,
+        ];
+        let mut seen: Vec<String> = screen
+            .widgets()
+            .filter_map(|(id, w)| {
+                let icon = w.texture.as_deref()?;
+                icons.iter().any(|i| icon.eq_ignore_ascii_case(i)).then(|| {
+                    let mut kept = Vec::new();
+                    let mut at = Some(id);
+                    // Up the parents (bounded, should one point back down).
+                    for _ in 0..64 {
+                        let Some(i) = at else { break };
+                        let Some(x) = screen.widget(i) else {
+                            kept.push(format!("{i} gone"));
+                            break;
+                        };
+                        let flags: String = [
+                            (!x.visible, " hidden"),
+                            (x.sleeping, " asleep"),
+                            (x.inactive, " inactive"),
+                            (x.colour[3] <= 0.0, " clear"),
+                        ]
+                        .iter()
+                        .filter(|(on, _)| *on)
+                        .map(|(_, f)| *f)
+                        .collect();
+                        if !flags.is_empty() {
+                            kept.push(format!("{i} {:?}{flags}", x.name));
+                        }
+                        at = x.parent;
+                    }
+                    format!(
+                        "{id} {icon} {}",
+                        if kept.is_empty() {
+                            "shown".to_owned()
+                        } else {
+                            format!("kept by {}", kept.join(", "))
+                        }
+                    )
+                })
+            })
+            .collect();
+        seen.sort();
+        let line = format!(
+            "{}: {}",
+            if s.in_vehicle {
+                "in a vehicle"
+            } else {
+                "on foot"
+            },
+            if seen.is_empty() {
+                "no gun icon widget".to_owned()
+            } else {
+                seen.join("; ")
+            }
+        );
+        if line != self.told.gun_box {
+            log.push(format!("gun box: {line}"));
+            self.told.gun_box = line;
+        }
+    }
+
     /// Poses the timing wheel's widgets as the play has the wheel, after
-    /// the scripts have stepped (see [`SATELLITE_WHEEL`]).
-    fn pose_wheel(&self, s: &HudState) -> mlua::Result<()> {
+    /// the scripts have stepped (see [`SATELLITE_WHEEL`]). What it found,
+    /// with the overlay's and the minigame's flags, goes in the log as
+    /// that changes: the wheel can be posed and still not drawn.
+    fn pose_wheel(&mut self, s: &HudState, log: &mut Vec<String>) -> mlua::Result<()> {
         if s.support.satellite.is_none() {
             return Ok(());
         }
-        let call = self
-            .mission
-            .lua()
-            .load(SATELLITE_WHEEL)
-            .set_name("=m2-hud wheel");
-        match &s.support.wheel {
-            Some(w) => {
-                let inside = support::sector(w.angle).map(|i| i + 1);
-                call.call::<()>((w.size, w.angle.to_degrees(), inside, w.mark))
-            }
-            None => call.call::<()>(()),
+        let lua = self.mission.lua();
+        let call = lua.load(SATELLITE_WHEEL).set_name("=m2-hud wheel");
+        let (found, overlay, minigame): (Option<String>, Option<u32>, Option<u32>) =
+            match &s.support.wheel {
+                Some(w) => {
+                    let inside = support::sector(w.angle).map(|i| i + 1);
+                    call.call((w.size, w.angle.to_degrees(), inside, w.mark))?
+                }
+                None => call.call(())?,
+            };
+        let flags = |id: Option<u32>| {
+            let screen = gui_runtime::screen(lua)?;
+            let screen = screen.borrow();
+            let w = screen.widget(id?)?;
+            Some(format!(
+                "{} visible {} asleep {} inactive {}",
+                id?, w.visible, w.sleeping, w.inactive
+            ))
+        };
+        let seen = format!(
+            "{}; overlay {}; minigame {}",
+            found.as_deref().unwrap_or("nothing"),
+            flags(overlay).unwrap_or_else(|| "-".to_owned()),
+            flags(minigame).unwrap_or_else(|| "-".to_owned()),
+        );
+        if seen != self.wheel_seen {
+            log.push(format!("wheel: {seen}"));
+            self.wheel_seen = seen;
         }
+        Ok(())
     }
 
     /// The zones the radar's script holds (`tRegions` of the
@@ -2835,6 +3273,87 @@ fn widgets_below(screen: &gui_runtime::Screen, named: impl Fn(u32) -> bool) -> H
             false
         })
         .collect()
+}
+
+/// Whether any of the text `items` of the widgets `held` says something
+/// (not only spaces).
+fn says_something(items: &[DrawItem], held: &HashSet<u32>) -> bool {
+    items.iter().any(|i| {
+        matches!(i, DrawItem::Text { widget, text, .. }
+            if held.contains(widget) && !text.trim().is_empty())
+    })
+}
+
+/// The point a probe's variable (`M2_HUD_PROBE=x,y`) names, if set.
+fn probe_point(var: &str) -> Option<[f32; 2]> {
+    let v = std::env::var(var).ok()?;
+    let (x, y) = v.split_once(',')?;
+    Some([x.trim().parse().ok()?, y.trim().parse().ok()?])
+}
+
+/// A draw item's box (screen points).
+fn rect_of(item: &DrawItem) -> [f32; 4] {
+    match item {
+        DrawItem::Quad { rect, .. }
+        | DrawItem::Fill { rect, .. }
+        | DrawItem::Text { rect, .. }
+        | DrawItem::Flash { rect, .. }
+        | DrawItem::Minimap { rect, .. }
+        | DrawItem::Movie { rect, .. } => *rect,
+    }
+}
+
+/// Whether `item`'s box (unturned) holds the point `at`.
+fn holds(item: &DrawItem, [x, y]: [f32; 2]) -> bool {
+    let r = rect_of(item);
+    (r[0]..=r[2]).contains(&x) && (r[1]..=r[3]).contains(&y)
+}
+
+/// The HUD probe's line for `item`: what it draws (the texture, or the
+/// font and text), its box, and its widget up through the parents, each
+/// by id and name, with the flags that keep it from drawing.
+fn probe_line(
+    screen: &gui_runtime::Screen,
+    names: &BTreeMap<u32, String>,
+    item: &DrawItem,
+) -> String {
+    let what = match item {
+        DrawItem::Quad { texture, .. } => format!("quad {texture}"),
+        DrawItem::Fill { colour, .. } => format!("fill {colour:.2?}"),
+        DrawItem::Text { font, text, .. } => format!("text {font} {text:?}"),
+        DrawItem::Flash { swf, .. } => format!("flash {swf:?}"),
+        DrawItem::Minimap { .. } => "minimap".to_owned(),
+        DrawItem::Movie { file, .. } => format!("movie {file:?}"),
+    };
+    let mut chain = Vec::new();
+    let mut at = Some(widget_of(item));
+    // Up the parents (bounded, should a parent point back down).
+    for _ in 0..64 {
+        let Some(id) = at else { break };
+        let w = screen.widget(id);
+        let name = names
+            .get(&id)
+            .map(String::as_str)
+            .or_else(|| w.map(|w| w.name.as_str()))
+            .unwrap_or_default();
+        let flags = w.map_or_else(
+            || " gone".to_owned(),
+            |w| {
+                [
+                    (!w.visible, " hidden"),
+                    (w.sleeping, " asleep"),
+                    (w.inactive, " inactive"),
+                ]
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, f)| *f)
+                .collect()
+            },
+        );
+        chain.push(format!("{id} {name:?}{flags}"));
+        at = w.and_then(|w| w.parent);
+    }
+    format!("{what} at {:.0?}: {}", rect_of(item), chain.join(" < "))
 }
 
 /// Clip, in the clip, stored, grenades, grenades stored: as
@@ -3477,7 +3996,7 @@ fn minimap(
             let k = r / dx.hypot(dy).max(1e-3);
             [cx + dx * k, cy + dy * k]
         };
-        let hash = name_hash(&format!("HUD_objective_{}", icon.replace(' ', "_")));
+        let hash = name_hash(icon);
         want.push(hash);
         let s = r * 0.16;
         let c = colour.map(|v| f32::from(v) / 255.0);
@@ -3581,7 +4100,7 @@ fn road_strokes(view: &MapView, roads: &[Road], out: &mut Vec<Prim>, want: &mut 
 /// The part of segment `a b` inside the disc round `centre` of radius
 /// `r`: from and to (0..=1 along it), or None if it misses.
 fn clip_to_disc(a: [f32; 2], b: [f32; 2], centre: [f32; 2], r: f32) -> Option<(f32, f32)> {
-    // |a + t (b - a) - centre|² = r², solved for t.
+    // |a + t (b - a) - centre|Â² = rÂ², solved for t.
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     let (fx, fy) = (a[0] - centre[0], a[1] - centre[1]);
     let qa = dx * dx + dy * dy;
@@ -4018,6 +4537,24 @@ mod tests {
     }
 
     #[test]
+    fn getting_out_of_a_vehicle_tells_her_gun_again() {
+        let mut told = Told::default();
+        let gun = Some((Weapon::Rifle, false, false));
+        // On the boat at the start: the gun told once.
+        told.seat(true);
+        told.weapon = gun;
+        told.ammo = Some([30, 30, 270, 0, 0]);
+        told.seat(true);
+        assert_eq!(told.weapon, gun);
+        // Ashore: told again, rounds and all; and not again on foot.
+        told.seat(false);
+        assert_eq!((told.weapon, told.ammo), (None, None));
+        told.weapon = gun;
+        told.seat(false);
+        assert_eq!(told.weapon, gun);
+    }
+
+    #[test]
     fn plain_values_cross_between_lua_states() {
         let lua = Lua::new();
         let v: Value = lua
@@ -4390,31 +4927,90 @@ mod tests {
         // Only the edge through her is stroked: a diameter.
         assert!((area(&out, 1.0) - 100.0).abs() < 1.0);
     }
+
+    #[test]
+    fn the_tutorial_box_says_something_only_with_words() {
+        let text = |widget, text: &str| DrawItem::Text {
+            widget,
+            font: "english_18".into(),
+            text: text.into(),
+            spans: Vec::new(),
+            rect: [0.0; 4],
+            size: 1.0,
+            colour: [1.0; 4],
+            justification: Anchor::Start,
+        };
+        let held = HashSet::from([1, 2]);
+        let frame = DrawItem::Quad {
+            widget: 1,
+            texture: "frame".into(),
+            uv: [0.0, 0.0, 1.0, 1.0],
+            colour: [1.0; 4],
+            rect: [0.0, 0.0, 10.0, 10.0],
+            rotation: 0.0,
+            pie: None,
+        };
+        // Its frame and an emptied line: nothing.
+        assert!(!says_something(&[frame.clone(), text(2, " ")], &held));
+        // Words elsewhere aren't its.
+        assert!(!says_something(
+            &[frame.clone(), text(3, "Open PDA")],
+            &held
+        ));
+        assert!(says_something(&[frame, text(2, "Open PDA")], &held));
+    }
+
+    #[test]
+    fn the_probe_finds_what_is_over_its_point() {
+        let fill = DrawItem::Fill {
+            widget: 4,
+            colour: [1.0; 4],
+            rect: [10.0, 20.0, 30.0, 40.0],
+        };
+        assert!(holds(&fill, [10.0, 40.0]));
+        assert!(holds(&fill, [20.0, 30.0]));
+        assert!(!holds(&fill, [9.0, 30.0]));
+        assert!(!holds(&fill, [20.0, 41.0]));
+    }
+
+    /// What posing the timing wheel answers, with the HUD's scripts
+    /// standing in: no overlay, then one without its minigame.
+    #[test]
+    fn the_wheel_says_what_it_found() {
+        let lua = Lua::new();
+        lua.load(
+            r#"Sys = { StringToGuid = function() return 1 end }
+            overlay = { CustomData = {} }
+            MrxGuiBase = { WidgetIdIndex = { [7] = overlay } }
+            MrxGui = { GetWidgetByNameAndOwner = function() return found end }"#,
+        )
+        .exec()
+        .unwrap();
+        let pose = || -> (Option<String>, Option<u32>) {
+            lua.load(SATELLITE_WHEEL).call((0.5, 10.0)).unwrap()
+        };
+        assert_eq!(pose(), (Some("no overlay".into()), None));
+        lua.load("found = overlay").exec().unwrap();
+        assert_eq!(pose(), (Some("no minigame".into()), Some(7)));
+    }
 }
 
 #[cfg(test)]
 mod paint_tests {
     use super::*;
 
-    /// A fade (a black, three-quarters solid quad over the screen) leaves
-    /// egui as a mesh over the screen.
-    #[test]
-    fn solid_quads_reach_the_tessellated_output() {
+    /// A HUD with no thread behind it, at `status`, holding `prims`.
+    fn test_hud(status: Status, prims: Vec<Prim>) -> GameHud {
         let (tx, _rx) = channel();
         let (_tx, rx) = channel();
-        let mut hud = GameHud {
+        GameHud {
             tx,
             rx,
-            status: Status::Ready,
+            status,
             callbacks: Vec::new(),
+            dropped_fanfare: false,
             shell: ShellNews::default(),
-            prims: vec![quad(
-                None,
-                [0.0, 0.0, 800.0, 600.0],
-                [0.0; 4],
-                [0.0, 0.0, 0.0, 0.75],
-                0.0,
-            )],
+            prims,
             pending: Vec::new(),
             textures: HashMap::new(),
             pixels: HashMap::new(),
@@ -4423,7 +5019,23 @@ mod paint_tests {
             last_call: 0,
             last_time: None,
             log: None,
-        };
+        }
+    }
+
+    /// A fade (a black, three-quarters solid quad over the screen) leaves
+    /// egui as a mesh over the screen.
+    #[test]
+    fn solid_quads_reach_the_tessellated_output() {
+        let mut hud = test_hud(
+            Status::Ready,
+            vec![quad(
+                None,
+                [0.0, 0.0, 800.0, 600.0],
+                [0.0; 4],
+                [0.0, 0.0, 0.0, 0.75],
+                0.0,
+            )],
+        );
         let ctx = egui::Context::default();
         hud.upload(&ctx);
         let out = ctx.run_ui(crate::ui::headless_input(800, 600, 0.0), |ui| {
@@ -4442,5 +5054,66 @@ mod paint_tests {
             .flatten()
             .collect();
         assert!(verts.iter().any(|v| v.color.a() > 150 && v.pos.x > 700.0));
+    }
+
+    #[test]
+    fn the_target_arc_reads_each_person_of_their_own_most() {
+        use crate::npc::{Brain, Npc, tests::rig};
+        let person = |spawn: Option<u32>| {
+            Npc::new(
+                0,
+                &rig(),
+                Vec3::ZERO,
+                0.0,
+                Brain::Post { facing: 0.0 },
+                spawn,
+            )
+        };
+        // A civilian keeps the default profile (75) but starts at 100:
+        // full reads full, half reads half.
+        let mut civilian = person(None);
+        assert_eq!(target_health(&civilian), (0, 100, 100));
+        civilian.hp = 50.0;
+        assert_eq!(target_health(&civilian), (0, 50, 100));
+        // A soldier placed with their template's health, turned on her.
+        let mut soldier = person(Some(1));
+        soldier.hp = soldier.ai.health;
+        soldier.most_hp = soldier.ai.health;
+        soldier.alert = true;
+        let most = soldier.ai.health.round() as i32;
+        assert_eq!(target_health(&soldier), (-1, most, most));
+    }
+
+    fn frame(log: &[&str]) -> Output {
+        Output::Frame {
+            prims: Vec::new(),
+            images: Vec::new(),
+            log: log.iter().map(|l| (*l).to_owned()).collect(),
+            callbacks: Vec::new(),
+            shell: ShellNews::default(),
+        }
+    }
+
+    /// A failed fanfare call is noted; a Lua state out of stack hands over
+    /// to the stand-in HUD, while a script's own error does not.
+    #[test]
+    fn a_broken_hud_hands_over_to_the_stand_in() {
+        let mut hud = test_hud(Status::Loading, Vec::new());
+        hud.take(frame(&[
+            "hud call Fanfare.Create",
+            "hud call SubtitleBuffer.AddMessage: [string \"x\"]:1: stack overflow",
+        ]));
+        assert!(hud.ready() && !hud.dropped_fanfare());
+        hud.take(frame(&[
+            "hud call Fanfare.Commence: the HUD has no such method",
+        ]));
+        assert!(hud.ready() && hud.dropped_fanfare());
+        hud.take(frame(&[
+            "gui call MrxGui.Show: out of Lua stack, too many arguments",
+        ]));
+        assert!(hud.failed() && !hud.ready());
+        // A clean frame queued behind it does not take it back.
+        hud.take(frame(&[]));
+        assert!(hud.failed() && !hud.ready());
     }
 }

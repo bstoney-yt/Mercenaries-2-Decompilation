@@ -82,6 +82,34 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, Vec<HijackEntrance>> {
     out
 }
 
+/// Every template's entrances' points, by template id, as name hashes:
+/// each `EntranceLink`'s entrance's `EntranceParameters` point
+/// (`DriverHatch`, `front_left`), else the link's own `Hardpoint`;
+/// whether or not a script hijacks through it (unlike [`read`]). A seat
+/// got into through `DriverHatch` (the AMX30's, the M1A2's) is inside:
+/// the PC footage of the AMX30 shows her on top only while climbing in,
+/// not while driving.
+pub fn entrance_points(db: &Layer<'_>) -> HashMap<u32, Vec<u32>> {
+    let links = Table::new(db, "EntranceLink");
+    let params = Table::new(db, "EntranceParameters");
+    let hardpoint = name_hash("Hardpoint");
+    let mut out: HashMap<u32, Vec<u32>> = HashMap::new();
+    for vehicle in links.templates() {
+        for r in links.of_template(vehicle) {
+            let point = links
+                .word(r, LINK)
+                .and_then(|e| params.of_template(e).first())
+                .and_then(|p| params.word(p, POINT))
+                .filter(|&p| p != 0)
+                .or_else(|| links.word(r, hardpoint).filter(|&h| h != 0));
+            if let Some(p) = point {
+                out.entry(vehicle).or_default().push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Every template's `VehicleAnimationSet`: the class and name (`Tank`,
 /// `M1A2`, as name hashes) the animation tables pick a vehicle's
 /// characters' clips by ([`m2_assets::animation_table::vehicle_clip`]).
@@ -132,6 +160,26 @@ pub fn seat_links(db: &Layer<'_>) -> HashMap<u32, Vec<(u32, Option<u32>)>> {
                 let p = links.word(r, point).filter(|&p| p != 0);
                 out.entry(t).or_default().push((n, p));
             }
+        }
+    }
+    out
+}
+
+/// Every template's `SeatLink` records, by template id, each as every
+/// field's name hash and word: what decides whether whoever sits in a
+/// seat is seen (an enclosed seat, a tank's driver under his hatch) is not
+/// known, so the whole record is logged to find it by.
+pub fn seat_link_fields(db: &Layer<'_>) -> HashMap<u32, Vec<Vec<(u32, u32)>>> {
+    let links = Table::new(db, "SeatLink");
+    let fields = links.fields();
+    let mut out: HashMap<u32, Vec<Vec<(u32, u32)>>> = HashMap::new();
+    for t in links.templates() {
+        for r in links.of_template(t) {
+            let row = fields
+                .iter()
+                .filter_map(|&f| Some((f, links.word(r, f)?)))
+                .collect();
+            out.entry(t).or_default().push(row);
         }
     }
     out

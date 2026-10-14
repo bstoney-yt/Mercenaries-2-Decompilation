@@ -41,6 +41,11 @@ pub enum AssetError {
     Model { hash: u32, source: ModelError },
     #[error("texture {hash:08x}: {source}")]
     Texture { hash: u32, source: TextureError },
+    #[error("effect {hash:08x}: {source}")]
+    Effect {
+        hash: u32,
+        source: m2_assets::effect::EffectError,
+    },
     #[error("terrain {hash:08x}: {message}")]
     Terrain { hash: u32, message: String },
     #[error(transparent)]

@@ -4,6 +4,7 @@
 //! goes through this crate, so `unsafe` stays concentrated in one place.
 
 pub mod bink;
+pub mod xinput;
 
 #[cfg(windows)]
 pub use windows;

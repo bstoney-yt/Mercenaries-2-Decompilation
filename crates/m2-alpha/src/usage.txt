@@ -1,14 +1,24 @@
 m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
 
 m2-alpha [options]
-  (no options, or only --install/--config/--size/--vsync/--fullscreen:
-  the whole game, as --alpha)
+  (no options, or only --install/--config/--size/--vsync/--fullscreen/
+  --no-boot/--smarter-ai/--dev/--skip-mode-off: the whole game, as --alpha)
   --alpha                the game as it launches: the boot movies (EA,
                          Pandemic), the front end (Enter starts), the first
                          contract with its movies, then on to free roam.
                          Movies need ffmpeg (M2_FFMPEG, beside m2-alpha, or
                          on the PATH); Enter/Space/Escape skips one
   --no-boot              with --alpha: no boot movies or front end
+  --dev                  with --alpha: the developer's keys too (V free
+                         camera, F5/F9 quick save and load, F3 culling, N
+                         gait), which the whole game's launch leaves out;
+                         the other launches (--mission, --spawn, --model,
+                         --fly...) always have them
+  --skip-mode-off        with --alpha (or --mission --movies
+                         --screenshot): the scripts' developer skip mode
+                         (on so their intro movies end at once) ends once
+                         their start has run, instead of staying on all
+                         session
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured
                          (<out>-movie-<name>.ppm)
@@ -67,7 +77,8 @@ m2-alpha [options]
                          vehicle's place, speed and waypoint) and the five
                          spawners nearest her
   --fight-wait <s>       with --fight or --blast: wait this long before
-                         the picture
+                         the picture (with --blast, counted from the
+                         rocket's blast)
   --blast                with --screenshot on the island: fire a rocket at
                          the fuel tank or barrel nearest where she starts
   --demolish <n>         with --screenshot on foot: rocket the nearest
@@ -162,6 +173,10 @@ m2-alpha [options]
                          this far from the nearest marker, looking at it
   --old-hud              our own stand-in HUD (health bar, weapon line,
                          crosshair) instead of the game's own
+  --old-fx               fire and smoke as the old coloured spheres, not the
+                         game's own particle effects (to compare)
+  --no-fx                no fire or smoke drawn at all (to measure what
+                         they cover)
   --smarter-ai           the enhanced, smarter enemy soldiers (not the
                          original game's; settings [enhanced.smarter_ai])
   --autoplay             with --mission --screenshot: she plays the contract
@@ -198,10 +213,21 @@ each grey wedge sends the bomb (a press outside them undoes the presses
 made; moving the view away puts the wheel away). T, 1 or 2 calls it off;
 so does being hurt. P opens and shuts the PDA (the first contract's
 scripts give the bomb once she has looked at it).
-V switches to the free camera: WASD moves, Space/C up/down, Shift faster.
-M music on/off, Tab or right mouse captures the mouse, N next gait
-(--model), F11 fullscreen, F3 culling, F5 quick save, F9 quick load,
+The contract done, Enter closes its fanfare and the flow goes on.
+M music on/off, Tab or right mouse captures the mouse, F11 fullscreen,
 Escape opens the menu (settings, save and load, quit).
+An Xbox pad (One, Series or 360) plays as the game's own layout has it:
+left stick move (L3 sprint), right stick look, A jump, B melee, X reload,
+Y get in/use, RT fire, LT crouch, LB throw, RB switch weapon, R3 aim,
+d-pad up/down support, left next explosive, right detonate, Back PDA,
+Start menu. Driving: A forward, X reverse, LT handbrake, Y out. In the
+menus A is Enter, B back, the d-pad moves. While the pad is used, the
+HUD's prompts show its buttons.
+The developer's keys (--dev, or any launch but the whole game's): V
+switches to the free camera (WASD moves, Space/C up/down, Shift faster;
+not while the scripts have her controls off) and back to her where she
+was left, N next gait (--model), F3 culling, F5 quick save, F9 quick load
+(the world only: the mission's scripts carry on as they were).
 
 M2_POST=exposure=..,bloom=..,threshold=..,contrast=..,saturation=..,
 grade=r/g/b,haze=..,inscatter=..,density=.. overrides the finishing pass

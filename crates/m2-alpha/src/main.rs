@@ -19,8 +19,9 @@
 //! (`--spawn` picks where to start; the default is the PMC's headquarters,
 //! where free roam begins after the first contract). WASD
 //! runs, Shift sprints, Q held walks, Space jumps. E gets in and out of
-//! the vehicles parked ahead of the spawn (WASD drive, Space brakes, R
-//! rights an overturned one). V switches to a
+//! vehicles: in free roam also those parked ahead of the spawn, with a
+//! mission only those the layers and scripts place (WASD drive, Space
+//! brakes, R rights an overturned one). V switches to a
 //! free-flying camera and back (`--fly` starts flying): WASD/Space/C fly,
 //! Shift speeds up. With `--model` it shows those models on a ground grid
 //! instead, characters playing the game's locomotion clips in place (N
@@ -55,6 +56,9 @@ mod movie;
 mod moving;
 mod multiply;
 mod npc;
+mod pad;
+mod particles;
+mod paths;
 mod player;
 mod props;
 mod route;
@@ -122,6 +126,13 @@ struct Options {
     gait: Option<Gait>,
     double_sided: bool,
     fly: bool,
+    /// The developer's keys in the whole game's launch too (`--dev`): the
+    /// free camera, quick save and load, culling, the gait cycle.
+    dev: bool,
+    /// With `--alpha` (or `--mission --movies --screenshot`): the scripts'
+    /// skip mode ends once their start has run, rather than staying on for
+    /// the session.
+    skip_mode_off: bool,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
@@ -155,7 +166,8 @@ struct Options {
     look: f32,
     /// With `--screenshot`: how many of the nearest spawns to list.
     list_spawns: usize,
-    /// With `--fight`: seconds to wait after it before the picture.
+    /// With `--fight`: seconds to wait after it before the picture; with
+    /// `--blast`, after the rocket's blast.
     fight_wait: f32,
     /// With `--screenshot`: seconds of play to watch the traffic for.
     traffic: Option<f32>,
@@ -240,6 +252,11 @@ struct Options {
     after_contract: f32,
     /// Our stand-in HUD instead of the game's own.
     old_hud: bool,
+    /// Fire and smoke as the old spheres, not the game's own effects (to
+    /// compare).
+    old_fx: bool,
+    /// No fire or smoke drawn at all (to measure what they cover).
+    no_fx: bool,
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
@@ -346,6 +363,8 @@ fn parse_args() -> anyhow::Result<Options> {
             "--fullscreen" => o.fullscreen = true,
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
+            "--dev" => o.dev = true,
+            "--skip-mode-off" => o.skip_mode_off = true,
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -389,6 +408,8 @@ fn parse_args() -> anyhow::Result<Options> {
             ),
             "--after-contract" => o.after_contract = value()?.parse()?,
             "--old-hud" => o.old_hud = true,
+            "--old-fx" => o.old_fx = true,
+            "--no-fx" => o.no_fx = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
             "--seated" => o.seated = true,
@@ -490,7 +511,7 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 7] = [
+    const PLAIN: [&str; 9] = [
         "--install",
         "--config",
         "--size",
@@ -498,6 +519,8 @@ fn parse_args() -> anyhow::Result<Options> {
         "--vsync",
         "--no-boot",
         "--smarter-ai",
+        "--dev",
+        "--skip-mode-off",
     ];
     if std::env::args()
         .skip(1)
@@ -533,6 +556,12 @@ fn keep_crash_reports() {
 /// When `--hurt` takes her health: after the start's fade, which keeps her
 /// from harm.
 const HURT_AT: f32 = 8.0;
+
+/// With `--mission --hijack`, how long an action marker's vehicle is left
+/// before she hijacks it, seconds: the villa tank comes through the hall
+/// wall first (in the PC footage it bursts in 4 s before "Hijack tank" is
+/// added; inferred, not measured from the game).
+const HIJACK_WAIT: f32 = 8.0;
 
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
@@ -592,13 +621,9 @@ fn main() -> anyhow::Result<()> {
             turn: options.turn,
         })
     } else if install.is_some() {
-        // Free roam starts at the PMC's headquarters (found in the layers);
-        // a mission's scripts move her from the first town.
-        Mode::Island(
-            options
-                .spawn
-                .or(options.mission.then_some(scene::DEFAULT_SPAWN)),
-        )
+        // Free roam starts at the PMC's headquarters, a mission at the
+        // first contract's spawn point (both found in the layers).
+        Mode::Island(options.spawn)
     } else {
         Mode::Models(Showcase {
             models: vec![scene::DEFAULT_MODEL],
@@ -623,6 +648,9 @@ fn main() -> anyhow::Result<()> {
         mode,
         double_sided: options.double_sided,
         fly: options.fly,
+        // The whole game plays as it launches, without the developer's
+        // keys, unless asked for; the test launches keep them.
+        dev: options.dev || options.fly || !options.alpha,
         mission: options.mission,
         mission_drivers: options.mission_drivers.clone(),
         old_hud: options.old_hud,
@@ -630,6 +658,7 @@ fn main() -> anyhow::Result<()> {
         support: options.support.clone(),
         alpha: options.alpha,
         no_boot: options.no_boot,
+        skip_mode_off: options.skip_mode_off,
         guns: options.guns.clone(),
         state: None,
         error: None,
@@ -678,6 +707,8 @@ fn build_scene(
 ) -> anyhow::Result<Game> {
     let mut scene = Scene::new(backend)?;
     scene.hero = hero;
+    // The catalogue's vehicles are no mission's.
+    scene.park = !mission;
     if double_sided {
         scene.materials.set_double_sided(backend, true)?;
     }
@@ -688,7 +719,12 @@ fn build_scene(
                     sea_level,
                     ..WorldSettings::default()
                 };
-                scene.open_world(backend, install, settings, *spawn)?;
+                let start = if mission {
+                    scene::MISSION_START
+                } else {
+                    scene::FREE_ROAM_START
+                };
+                scene.open_world(backend, install, settings, *spawn, start)?;
             }
             Mode::Models(show) => {
                 scene.open(install)?;
@@ -724,10 +760,19 @@ fn give_guns(game: &mut Game, guns: &[String]) {
 /// What the HUD shows: the game's, with the mission's objectives and the
 /// view their markers are placed with.
 /// The game's own HUD, on the island with the game's files (unless
-/// `--old-hud`).
-fn game_hud(install: Option<&Install>, mode: &Mode, old: bool) -> Option<gamehud::GameHud> {
+/// `--old-hud`), its scripts' player the hero `game` plays.
+fn game_hud(
+    install: Option<&Install>,
+    mode: &Mode,
+    old: bool,
+    game: &Game,
+) -> Option<gamehud::GameHud> {
     match (install, mode) {
-        (Some(install), Mode::Island(_)) if !old => Some(gamehud::GameHud::start(install)),
+        (Some(install), Mode::Island(_)) if !old => Some(gamehud::GameHud::start(
+            install,
+            game.scene.hero,
+            game.combat.max_hp,
+        )),
         _ => None,
     }
 }
@@ -738,7 +783,7 @@ fn hud_info(
     fov: f32,
     aspect: f32,
 ) -> ui::HudInfo {
-    let mut info = game.hud_info();
+    let mut info = game.hud_info(mission.and_then(mission::MissionLink::strings));
     if let Some(m) = mission {
         info.mission = Some(m.view());
     }
@@ -755,6 +800,7 @@ fn render(
     aspect: f32,
     hud: Option<&mut ui::Hud>,
 ) -> anyhow::Result<()> {
+    game.lens = (fov, aspect);
     let mut view = game.view(fov, aspect);
     if game.scene.world.is_some() {
         view.lighting.fog_density = 0.00025;
@@ -951,10 +997,11 @@ fn screenshot(
     eprintln!("props: {}", game.scene.props.counts());
     let people = &game.scene.people;
     eprintln!(
-        "people: {} kinds, {} about ({} soldiers, {} patrolling, {} landed) after {:.1} s",
+        "people: {} kinds, {} about ({} soldiers, {} story characters, {} patrolling, {} landed) after {:.1} s",
         people.kinds.len(),
         people.npcs.len(),
-        people.npcs.iter().filter(|n| n.spawn.is_some()).count(),
+        people.npcs.iter().filter(|n| n.soldier).count(),
+        people.npcs.iter().filter(|n| n.held).count(),
         people.npcs.iter().filter(|n| n.patrolling()).count(),
         people.npcs.iter().filter(|n| n.landed).count(),
         started.elapsed().as_secs_f32()
@@ -982,30 +1029,28 @@ fn screenshot(
                 .join(", ")
         );
         for (d, s) in near.iter().take(options.list_spawns) {
-            let kind = s
-                .template
-                .as_deref()
-                .and_then(|t| people.kind_for(t))
-                .or_else(|| people.kind_for(&s.name));
             eprintln!(
-                "  spawn {:08x} {:?} {d:.0} m at {:.0}, template {:?}, layer {} ({}), {} route points, {}{}",
+                "  spawn {:08x} {:?} {d:.0} m at {:.0}, template {:?}, layer {} ({}), {} route points, {}{}{}",
                 s.entity,
                 s.name,
                 s.position,
                 s.template,
-                s.layer.map_or("static".to_owned(), |l| format!("{l:08x}")),
+                match (s.layer, s.static_layer) {
+                    (Some(l), true) => format!("static {l:08x}"),
+                    (Some(l), false) => format!("{l:08x}"),
+                    (None, _) => "none".to_owned(),
+                },
                 if people.layer_in(s.layer) {
                     "in"
                 } else {
                     "out"
                 },
                 s.route.len(),
-                if kind.is_some() {
-                    "a soldier"
-                } else if people.mission_soldiers.contains(&s.entity) {
-                    "a mission soldier"
+                people.stands_as(s),
+                if people.mission_soldiers.contains(&s.entity) {
+                    ", a mission's target"
                 } else {
-                    "nobody"
+                    ""
                 },
                 if people.npcs.iter().any(|n| n.spawn == Some(s.entity)) {
                     ", standing"
@@ -1017,6 +1062,10 @@ fn screenshot(
     }
     if let Some(seconds) = options.traffic {
         traffic_for_screenshot(&mut backend, &mut game, fov, aspect, seconds)?;
+    }
+    game.scene.hide_fx = options.no_fx;
+    if options.old_fx {
+        game.scene.particles = None;
     }
     if options.probe {
         probe_for_screenshot(&game);
@@ -1223,7 +1272,7 @@ fn screenshot(
     // started and run two seconds, for its boxes to have opened and the
     // gun box to have switched; half of one for hits, whose arcs fade).
     let mut hud = ui::Hud::new();
-    hud.game = game_hud(install, mode, options.old_hud);
+    hud.game = game_hud(install, mode, options.old_hud, &game);
     let mut settings = config.clone();
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
@@ -1895,11 +1944,12 @@ fn look_at_marker(
 ) -> anyhow::Result<()> {
     use m2_math::glam::Vec3;
     let here = game.focus();
-    let Some((at, label, _)) = link
+    let Some((at, label)) = link
         .view()
         .markers
         .into_iter()
-        .min_by(|a, b| a.0.distance(here).total_cmp(&b.0.distance(here)))
+        .min_by(|a, b| a.at.distance(here).total_cmp(&b.at.distance(here)))
+        .map(|m| (m.at, m.label()))
     else {
         eprintln!("mission look: no markers");
         return Ok(());
@@ -2181,7 +2231,10 @@ fn front_end_offscreen(
             up_at = Some(t);
         }
         if let Some(who) = shell.take_new_game() {
-            eprintln!("front end: a new game as {who} ({})", shell::hero(&who));
+            eprintln!(
+                "front end: a new game as {who} ({})",
+                shell::hero(&who).map_or("no hero", Hero::name)
+            );
             picture = true;
         }
         if picture {
@@ -2318,7 +2371,8 @@ fn mission_for_screenshot(
     let tick = TICK.as_secs_f32();
     let mut link = mission::MissionLink::start(install, options.mission_drivers.clone())
         .with_support(options.support.clone())
-        .with_movies(options.movies);
+        .with_movies(options.movies)
+        .with_skip_mode_off(options.skip_mode_off);
     let started = Instant::now();
     while !link.running() && started.elapsed() < Duration::from_secs(300) {
         link.tick(game, tick);
@@ -2396,6 +2450,19 @@ fn mission_for_screenshot(
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
     let mut strike_seen: Option<u32> = None;
+    // With --hijack, the hijacks run as in the game, and she hijacks the
+    // vehicle an objective's "action" marker is on (PmcCon001's villa
+    // tank): once the marker has been up HIJACK_WAIT (the tank comes
+    // through the wall first), she is put beside it ([`hijack::beside`]),
+    // presses the use key a second later and answers its prompts at once
+    // ([`hijack::Autopad`]). For testing.
+    let mut hijacks = options
+        .hijack
+        .then(|| hijack::Hijacks::start(install, options.hijack_crew.clone()));
+    let mut hijack_input = Input::default();
+    let mut hijack_pad = hijack::Autopad::default();
+    let (mut hijack_tries, mut hijack_use, mut hijack_t) = (0, None, 0.0);
+    let mut action_since: Option<u32> = None;
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -2418,6 +2485,52 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        if let Some(h) = &mut hijacks {
+            if hijack_use == Some(i) {
+                hijack_input.button(Action::Use, true);
+            }
+            h.tick(game, &mut hijack_input, tick);
+            hijack_input.button(Action::Use, false);
+            h.place(game);
+            h.seat(game, tick);
+            hijack_t += tick;
+            let on_foot = game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_none());
+            let action = link
+                .marks()
+                .iter()
+                .filter(|m| m.kind == "action" && m.alive)
+                .find_map(|m| {
+                    let v = game
+                        .scene
+                        .vehicles
+                        .iter()
+                        .find(|v| v.guid == Some(m.target))?;
+                    Some(v.spec.label.to_ascii_lowercase())
+                });
+            action_since = action.as_ref().and(action_since.or(Some(i)));
+            if h.running() {
+                let prompts = h.view().map(|v| v.prompts).unwrap_or_default();
+                hijack_pad.answer(&prompts, &mut hijack_input, hijack_t);
+            } else if !h.loading()
+                && on_foot
+                && hijack_tries < 5
+                && action_since.is_some_and(|s| i >= s + (HIJACK_WAIT / tick).round() as u32)
+                && hijack_use.is_none_or(|u| i > u + (10.0 / tick) as u32)
+                && let Some(label) = action
+                && hijack::beside(game, h, Some(&label)).is_some()
+            {
+                hijack_tries += 1;
+                hijack_use = Some(i + (1.0 / tick).round() as u32);
+                eprintln!(
+                    "hijack: try {hijack_tries} at the {label} the action marker is on, {:.1} s in",
+                    i as f32 * tick
+                );
+            }
+        }
         if options.movies {
             movies_offscreen(&mut link, install, out);
         }
@@ -2426,7 +2539,7 @@ fn mission_for_screenshot(
         if contract_done.is_some() {
             let (hud, settings) = late_hud.get_or_insert_with(|| {
                 let mut hud = ui::Hud::new();
-                hud.game = game_hud(Some(install), &Mode::Island(None), false);
+                hud.game = game_hud(Some(install), &Mode::Island(None), false, game);
                 hud.wait = true;
                 if let Some(g) = &mut hud.game {
                     g.log_to(&out.with_file_name(format!("{stem}-late-hud.log")));
@@ -2786,7 +2899,7 @@ fn look_at_story_character(game: &mut Game) {
     let Some((name, chest)) = people
         .npcs
         .iter()
-        .filter(|n| people.kinds.get(n.kind).is_some_and(|k| k.named))
+        .filter(|n| n.held)
         .map(|n| (people.kinds[n.kind].role.clone(), n.chest()))
         .filter(|(_, c)| c.distance(here) < 40.0)
         .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)))
@@ -2833,7 +2946,7 @@ fn hijack_for_screenshot(
     let started = Instant::now();
     // The game's HUD, for the buttons the scripts put up.
     let mut hud = ui::Hud::new();
-    hud.game = game_hud(Some(install), &Mode::Island(None), options.old_hud);
+    hud.game = game_hud(Some(install), &Mode::Island(None), options.old_hud, game);
     hud.wait = true;
     if let (Some(g), Some(out)) = (&mut hud.game, &options.screenshot) {
         g.log_to(&out.with_file_name(format!(
@@ -4075,8 +4188,13 @@ fn blast_for_screenshot(
         game.combat.last_launch.map(|l| l.0),
         game.combat.last_launch.map(|l| l.1)
     );
-    for _ in 0..120 {
+    // Until the rocket bursts (4 s at most), so the wait counts from it.
+    let before = game.combat.blasts;
+    for _ in 0..240 {
         game.step(Intent::default(), tick);
+        if game.combat.blasts > before {
+            break;
+        }
     }
     let spent = game.scene.explosives.iter().filter(|e| e.gone).count();
     eprintln!(
@@ -4086,6 +4204,9 @@ fn blast_for_screenshot(
         game.scene.explosives.len(),
         game.combat.hp
     );
+    if let Some(p) = &game.scene.particles {
+        eprintln!("blast: {} particles alive", p.live());
+    }
     for i in 0..(wait / tick) as usize {
         game.step(Intent::default(), tick);
         if i % 30 == 0 {
@@ -4095,6 +4216,9 @@ fn blast_for_screenshot(
     aim_at(game, at);
     game.step(Intent::default(), tick);
     render(backend, game, fov, aspect, None)?;
+    if let Some(p) = &game.scene.particles {
+        eprintln!("blast: {} particles alive at the picture", p.live());
+    }
     Ok(())
 }
 
@@ -4333,7 +4457,14 @@ struct Running {
     /// Whether she was driving last tick (getting in is worth a word).
     was_driving: bool,
     input: Input,
+    /// The Xbox pad, read each frame into `input`.
+    pad: pad::Pad,
+    /// The mouse is captured and its pointer hidden: in play, as the
+    /// game's (the pointer shows only in the front end and the pause
+    /// menu), unless the mouse key let it go (`released`) or the window
+    /// lost the focus.
     mouse_look: bool,
+    released: bool,
     /// Keyboard input is ignored while another window has focus.
     focused: bool,
     culling: bool,
@@ -4350,6 +4481,8 @@ struct Running {
     /// The GUI's named buttons pressed since the last frame (Enter is
     /// `"selection"`), for the game HUD's scripts.
     buttons: Vec<String>,
+    /// The developer's keys work ([`App::dev`]).
+    dev: bool,
 }
 
 struct App {
@@ -4360,6 +4493,13 @@ struct App {
     double_sided: bool,
     /// Start flying rather than on foot.
     fly: bool,
+    /// The developer's keys work: the free camera, quick save and load,
+    /// back-face culling, the gait cycle. Off in the whole game's launch
+    /// (`--alpha`, or no options) unless `--dev` asks: there the free
+    /// camera would leave her body wherever the scripts lose track of
+    /// it, and a quick load puts the world back without the scripts'
+    /// state.
+    dev: bool,
     /// Run the mission scripts.
     mission: bool,
     /// Lua to run before they start (`--mission-driver`).
@@ -4373,6 +4513,8 @@ struct App {
     /// `no_boot`), front end, the scripts' movies.
     alpha: bool,
     no_boot: bool,
+    /// End the scripts' skip mode after their start (`--skip-mode-off`).
+    skip_mode_off: bool,
     /// Weapons to start with (`--gun`).
     guns: Vec<String>,
     state: Option<Running>,
@@ -4410,7 +4552,13 @@ impl App {
         }
         let focused = window.has_focus();
         let mut hud = ui::Hud::new();
-        hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud);
+        hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud, &game);
+        hud.dev = self.dev;
+        eprintln!(
+            "keys: the developer's (V free camera, F5/F9 quick save and load, F3 culling, \
+             N gait) {}",
+            if self.dev { "on" } else { "off (--dev)" }
+        );
         let egui = egui_winit::State::new(
             hud.ctx.clone(),
             egui::ViewportId::ROOT,
@@ -4434,7 +4582,9 @@ impl App {
             },
             was_driving: false,
             input: Input::default(),
+            pad: pad::Pad::default(),
             mouse_look: false,
+            released: false,
             focused,
             culling: !self.double_sided,
             last: Instant::now(),
@@ -4448,6 +4598,7 @@ impl App {
                         .with_keys(self.config.keys.clone())
                         .with_support(self.support.clone())
                         .with_movies(self.alpha)
+                        .with_skip_mode_off(self.skip_mode_off)
                         .with_subtitles(self.config.options.subtitles),
                 ),
                 _ => None,
@@ -4468,6 +4619,7 @@ impl App {
                 _ => None,
             },
             buttons: Vec::new(),
+            dev: self.dev,
         })
     }
 
@@ -4493,21 +4645,69 @@ impl Running {
         }
     }
 
+    /// Captures the mouse and hides its pointer in play, and lets it go
+    /// in the front end and the pause menu, as the game does; the pointer
+    /// was left showing over play until a click captured it (round 2 of
+    /// the owner's play tests). Each change is logged.
+    fn keep_mouse(&mut self) {
+        let menus = self.hud.menu || self.flow.as_ref().is_some_and(flow::Flow::in_menus);
+        let want = !menus && self.focused && !self.released;
+        if want != self.mouse_look {
+            self.set_mouse_look(want);
+            if self.mouse_look != want {
+                // The window wouldn't grab it: not again until a click.
+                eprintln!("mouse: the window would not capture it");
+                self.released = true;
+                return;
+            }
+            eprintln!(
+                "mouse: {} ({})",
+                if self.mouse_look {
+                    "captured, pointer hidden"
+                } else {
+                    "free, pointer shown"
+                },
+                if menus {
+                    "menus"
+                } else if !self.focused {
+                    "window not focused"
+                } else if self.released {
+                    "let go by its key"
+                } else {
+                    "play"
+                }
+            );
+        }
+    }
+
+    /// The UI's output to the window, the pointer hidden while the mouse
+    /// is captured: egui shows it again whenever its own pointer icon
+    /// changes, as it does on the window's first frames and each time the
+    /// pointer comes back in.
+    fn platform_output(&mut self, mut output: egui::PlatformOutput) {
+        if self.mouse_look {
+            output.cursor_icon = egui::CursorIcon::None;
+        }
+        self.egui.handle_platform_output(&self.window, output);
+    }
+
     /// Advances the simulation by whole ticks (none while the menu is
     /// open) and draws a frame with the HUD.
     fn frame(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
         let now = Instant::now();
+        self.read_pad((now - self.last).min(MAX_FRAME).as_secs_f64());
         self.lag += (now - self.last).min(MAX_FRAME);
         self.last = now;
         while self.lag >= TICK {
             self.lag -= TICK;
             self.tick(config, event_loop);
         }
+        self.keep_mouse();
         let vsync = config.window.vsync;
         let input = self.egui.take_egui_input(&self.window);
         if let Some(flow) = self.flow.as_mut().filter(|f| f.covers()) {
             let output = self.hud.build_screen(input, |ui| flow.paint(ui));
-            self.egui.handle_platform_output(&self.window, output);
+            self.platform_output(output);
             let (w, h) = self.backend.size();
             return render(
                 &mut self.backend,
@@ -4537,20 +4737,45 @@ impl Running {
             .as_ref()
             .map(hijack::Hijacks::take_gui_calls)
             .unwrap_or_default();
+        let buttons = std::mem::take(&mut self.buttons);
+        let selected = buttons.iter().any(|b| b == "selection");
         if self.hud.game.is_some() {
             let mut state = gamehud::HudState::of(&mut self.game);
-            state.buttons = std::mem::take(&mut self.buttons);
+            state.buttons = buttons;
             state.gui_calls = gui_calls;
+            state.pad = self.input.pad();
             info.game = Some(state);
         }
         let (action, output) = self.hud.build(input, &info, config);
-        self.egui.handle_platform_output(&self.window, output);
+        self.platform_output(output);
         // The mission's callbacks the game's HUD called (the contract
         // fanfare closing), back to the mission's scripts.
         if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
             for seq in g.take_callbacks() {
                 m.hud_callback(seq);
             }
+        }
+        // With no game HUD to show the contract's fanfare (`--old-hud`,
+        // its scripts not up or broken, or the fanfare's call failed in
+        // them), Enter closes it as the fanfare's own Enter does, and the
+        // flow goes on to the next contract.
+        let no_fanfare = self
+            .hud
+            .game
+            .as_ref()
+            .is_none_or(|g| !g.ready() || g.dropped_fanfare());
+        if let Some(m) = &mut self.mission
+            && selected
+            && no_fanfare
+            && !self.hud.menu
+            && m.completed()
+            && let Some(seq) = m.waiting_fanfare()
+        {
+            eprintln!(
+                "mission: Enter closes the contract's fanfare (HUD call {seq}), which the \
+                 game's HUD can't show"
+            );
+            m.hud_callback(seq);
         }
         if config.window.vsync != vsync {
             self.backend.set_vsync(config.window.vsync);
@@ -4570,11 +4795,8 @@ impl Running {
                 self.close_menu();
             }
             Some(ui::MenuAction::Hero(hero)) => {
-                // The body, clips, health and voice change now; the
-                // scripts take the new name on the next start.
                 eprintln!("hero: playing as {hero}");
-                self.game.set_hero(&mut self.backend, hero);
-                self.audio.hero = hero;
+                self.set_hero(hero);
             }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
             None => {}
@@ -4601,16 +4823,92 @@ impl Running {
         Ok(())
     }
 
+    /// Reads the Xbox pad into the input (`dt` seconds since the last
+    /// read), and hands its menu keys on: to the front end while it holds
+    /// the screen, else as keys to the menus and the HUD's movies (the
+    /// PDA, a fanfare), A being Enter.
+    fn read_pad(&mut self, dt: f64) {
+        if !self.focused {
+            return;
+        }
+        let driving = self.game.driving().is_some();
+        let keys = self.pad.poll(&mut self.input, driving, dt);
+        for key in keys {
+            use pad::MenuKey;
+            if let Some(flow) = self.flow.as_mut().filter(|f| f.holds()) {
+                flow.key(match key {
+                    MenuKey::Enter => KeyCode::Enter,
+                    MenuKey::Escape => KeyCode::Escape,
+                    MenuKey::Up => KeyCode::ArrowUp,
+                    MenuKey::Down => KeyCode::ArrowDown,
+                    MenuKey::Left => KeyCode::ArrowLeft,
+                    MenuKey::Right => KeyCode::ArrowRight,
+                });
+                continue;
+            }
+            // The pause menu's buttons are egui's: up and down step its
+            // focus as Tab does (egui's arrows need one focused first).
+            let menu = self.hud.menu;
+            let (egui_key, modifiers) = match key {
+                MenuKey::Enter => (egui::Key::Enter, egui::Modifiers::NONE),
+                MenuKey::Escape => {
+                    // B leaves the pause menu as Escape does (in play, B
+                    // is the bash).
+                    if menu {
+                        self.close_menu();
+                    }
+                    continue;
+                }
+                MenuKey::Up if menu => (egui::Key::Tab, egui::Modifiers::SHIFT),
+                MenuKey::Down if menu => (egui::Key::Tab, egui::Modifiers::NONE),
+                MenuKey::Up => (egui::Key::ArrowUp, egui::Modifiers::NONE),
+                MenuKey::Down => (egui::Key::ArrowDown, egui::Modifiers::NONE),
+                MenuKey::Left => (egui::Key::ArrowLeft, egui::Modifiers::NONE),
+                MenuKey::Right => (egui::Key::ArrowRight, egui::Modifiers::NONE),
+            };
+            if key == MenuKey::Enter && !menu {
+                self.buttons.push("selection".into());
+            }
+            let events = &mut self.egui.egui_input_mut().events;
+            for pressed in [true, false] {
+                events.push(egui::Event::Key {
+                    key: egui_key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                });
+            }
+        }
+    }
+
     fn open_menu(&mut self) {
         self.hud.menu = true;
-        self.set_mouse_look(false);
+        self.keep_mouse();
         self.input.clear();
     }
 
     fn close_menu(&mut self) {
         self.hud.menu = false;
         self.input.clear();
-        self.set_mouse_look(true);
+        self.released = false;
+        self.keep_mouse();
+    }
+
+    /// Plays as `hero` from now on: the body, clips, health and voice, and
+    /// the scripts' player (the mission's and the hijacks'; the HUD's hears
+    /// with its next state). What the scripts already chose by the old
+    /// hero stays theirs.
+    fn set_hero(&mut self, hero: Hero) {
+        self.game.set_hero(&mut self.backend, hero);
+        self.audio.hero = hero;
+        let max = self.game.combat.max_hp;
+        if let Some(m) = &mut self.mission {
+            m.set_hero(hero, max);
+        }
+        if let Some(h) = &mut self.hijacks {
+            h.set_hero(hero, max);
+        }
     }
 
     fn save_game(&mut self) {
@@ -4634,20 +4932,23 @@ impl Running {
         }
     }
 
-    fn tick(&mut self, config: &Config, _event_loop: &ActiveEventLoop) {
+    fn tick(&mut self, config: &mut Config, _event_loop: &ActiveEventLoop) {
         if let Some(flow) = &mut self.flow {
             if let Ok(mut mixer) = self.audio.out.mixer.lock() {
                 flow.tick(self.mission.as_mut(), &mut mixer);
             }
-            // The hero picked in the front end, before the scripts start.
-            if let Some(hero) = flow.take_pick()
-                && hero != self.game.scene.hero
-            {
-                eprintln!("hero: playing as {hero}");
-                self.game.set_hero(&mut self.backend, hero);
-                self.audio.hero = hero;
+            // The hero picked in the front end, before the scripts start;
+            // the pause menu offers them as the settings' hero.
+            let picked = flow.take_pick();
+            let holds = flow.holds();
+            if let Some(hero) = picked {
+                config.hero = hero;
+                if hero != self.game.scene.hero {
+                    eprintln!("hero: playing as {hero}");
+                    self.set_hero(hero);
+                }
             }
-            if flow.holds() {
+            if holds {
                 // The world waits under the movie or the front end.
                 self.input.clear();
                 let (ear, facing) = self.game.listener();
@@ -4669,26 +4970,32 @@ impl Running {
             return;
         }
         if self.input.take_pressed(Action::ToggleMouse) {
-            self.set_mouse_look(!self.mouse_look);
+            self.released = self.mouse_look;
         }
         if self.input.take_pressed(Action::Fullscreen) {
             let full = self.window.fullscreen().is_none();
             self.window
                 .set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
         }
-        if self.input.take_pressed(Action::QuickSave) {
+        // The developer's keys are taken either way, and do nothing
+        // without `--dev` in the whole game's launch.
+        let dev = self.dev;
+        if !dev {
+            self.input.take_pressed(Action::ToggleFly);
+        }
+        if self.input.take_pressed(Action::QuickSave) && dev {
             self.save_game();
         }
-        if self.input.take_pressed(Action::QuickLoad) {
+        if self.input.take_pressed(Action::QuickLoad) && dev {
             self.load_game();
         }
         if self.input.take_pressed(Action::ToggleMusic) {
             self.audio.toggle_music();
         }
-        if self.input.take_pressed(Action::NextGait) {
+        if self.input.take_pressed(Action::NextGait) && dev {
             self.game.scene.cycle_gaits();
         }
-        if self.input.take_pressed(Action::ToggleCulling) {
+        if self.input.take_pressed(Action::ToggleCulling) && dev {
             self.culling = !self.culling;
             if let Err(e) = self
                 .game
@@ -4811,9 +5118,7 @@ impl ApplicationHandler for App {
                 // clean either way.
                 state.focused = focused;
                 state.input.clear();
-                if !focused {
-                    state.set_mouse_look(false);
-                }
+                state.keep_mouse();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if state.focused && state.flow.as_ref().is_some_and(flow::Flow::holds) =>
@@ -4846,7 +5151,10 @@ impl ApplicationHandler for App {
                 state: ElementState::Pressed,
                 button: winit::event::MouseButton::Right | winit::event::MouseButton::Left,
                 ..
-            } if !state.mouse_look && !state.hud.menu => state.set_mouse_look(true),
+            } if !state.mouse_look && !state.hud.menu => {
+                state.released = false;
+                state.input.mouse_used();
+            }
             // With the mouse captured, the buttons fire, aim and bash.
             WindowEvent::MouseInput {
                 state: pressed,
@@ -4860,6 +5168,9 @@ impl ApplicationHandler for App {
                     _ => None,
                 };
                 if let Some(a) = action {
+                    if pressed == ElementState::Pressed {
+                        state.input.mouse_used();
+                    }
                     state.input.button(a, pressed == ElementState::Pressed);
                 }
             }

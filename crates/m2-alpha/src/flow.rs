@@ -233,7 +233,10 @@ impl Flow {
                     && shell.ready()
                 {
                     if let Some(who) = shell.take_new_game() {
-                        self.hero = crate::shell::hero(&who);
+                        // The scripts have left their menus: a character
+                        // naming no hero (logged) starts as the stand-in's
+                        // hero (the settings', unless changed there).
+                        self.hero = crate::shell::hero(&who).unwrap_or(self.hero);
                         self.shell = None;
                         self.close(mixer);
                         self.stage = Stage::Game;
@@ -348,6 +351,12 @@ impl Flow {
                 }
             }
         }
+    }
+
+    /// Whether the front end is up (or the game is yet to start): its
+    /// menus, where the mouse pointer shows.
+    pub fn in_menus(&self) -> bool {
+        self.stage != Stage::Game
     }
 
     /// Whether a screen of its own covers the game.

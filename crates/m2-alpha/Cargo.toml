@@ -22,6 +22,7 @@ m2-engine.workspace = true
 m2-game.workspace = true
 m2-math.workspace = true
 m2-render = { workspace = true, features = ["wgpu"] }
+m2-sys.workspace = true
 mlua.workspace = true
 serde.workspace = true
 toml.workspace = true

@@ -142,8 +142,9 @@ only) once item 11 lands.
   (voice chatter is not wired in yet).
 - Items 8 to 11, in `m2-alpha` for now: Jennifer on foot, enter, drive and
   get out of the parked vehicles, soldiers at their spawns (patrols where
-  the layer names a route) and wandering civilians, rifle, RPG, grenades,
-  wrecks. Handling, damage and AI timings are invented.
+  the layer names a route) in their templates' models, the spawners'
+  people, rifle, RPG, grenades, wrecks. Handling, damage and AI timings
+  are invented.
 - Item 12: egui HUD (health, weapon, speed, prompts, crosshair) and an Esc
   pause menu (field of view, mouse, vsync, controls, save, load, quit).
 - Item 13: F5/F9 quick save and load (`m2-alpha-save.toml`: player,

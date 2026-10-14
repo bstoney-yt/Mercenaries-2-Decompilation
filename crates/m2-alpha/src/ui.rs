@@ -3,8 +3,9 @@
 //! Health, ammo and weapon, the reticle, hit arcs and messages are the
 //! game's own HUD ([`GameHud`]) once its scripts have started; until then,
 //! or without the game's files, a stand-in of our own draws health, weapon
-//! and a crosshair. What the player can do next, the mission's objectives
-//! and markers, and loading lines are ours, in egui's bundled fonts.
+//! and a crosshair, and the mission's objectives and markers. The markers
+//! are then the game's icons. What the player can do next and loading
+//! lines are ours, in egui's bundled fonts.
 
 use std::time::Duration;
 
@@ -67,6 +68,8 @@ pub struct HudInfo {
     /// Her support: the item ready, the designator, the satellite's view,
     /// the timing wheel, the bomb's flash.
     pub support: SupportHud,
+    /// The hero she is (the pause menu marks them).
+    pub hero: crate::hero::Hero,
 }
 
 /// What the pause menu asked for.
@@ -101,6 +104,10 @@ pub struct Hud {
     /// Each frame waits for the game's HUD to draw it (play run offscreen,
     /// faster than the HUD's scripts would keep up with).
     pub wait: bool,
+    /// The developer's keys work (`--dev`, or a test launch): the menu
+    /// names F5/F9 for saving and loading, and loads while the mission
+    /// scripts run, though a load puts the world back without their state.
+    pub dev: bool,
 }
 
 impl std::fmt::Debug for Hud {
@@ -138,6 +145,7 @@ impl Hud {
             frame: None,
             game: None,
             wait: false,
+            dev: true,
         }
     }
 
@@ -163,6 +171,7 @@ impl Hud {
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.key_names = m.key_names.clone();
             state.pda_objectives = m.pda_objectives.clone();
             state.trespass = m.trespass.clone();
             state.vehicle_disguise = m.vehicle_disguise;
@@ -220,6 +229,7 @@ impl Hud {
         state.tutorial = info.mission.as_ref().and_then(|m| m.game_tutorial.clone());
         if let Some(m) = &info.mission {
             state.hud_calls = game.hud_calls(&m.hud_calls);
+            state.key_names = m.key_names.clone();
             state.pda_objectives = m.pda_objectives.clone();
             state.trespass = m.trespass.clone();
             state.vehicle_disguise = m.vehicle_disguise;
@@ -266,10 +276,14 @@ impl Hud {
         let menu = self.menu;
         self.feed(&input, info);
         let game = self.game.as_ref().filter(|g| g.ready());
+        // Without the developer's keys, no load while the scripts run: it
+        // would put the world back without their state.
+        let load = self.dev || info.mission.is_none();
+        let dev = self.dev;
         let output = self.ctx.run_ui(input, |ui| {
             hud(ui, info, game);
             if menu {
-                action = pause_menu(ui.ctx(), config);
+                action = pause_menu(ui.ctx(), config, info.hero, dev, load);
             }
         });
         let ppp = output.pixels_per_point;
@@ -455,7 +469,7 @@ fn blips(info: &HudInfo) -> Vec<([f32; 3], String, [u8; 4])> {
     info.mission.as_ref().map_or_else(Vec::new, |m| {
         m.markers
             .iter()
-            .map(|(at, label, colour)| (at.to_array(), label.clone(), *colour))
+            .map(|m| (m.at.to_array(), m.icon.clone(), m.colour))
             .collect()
     })
 }
@@ -517,7 +531,8 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
         game.paint(&painter);
         return;
     }
-    if time < HINT_TIME && info.playing {
+    // Ours, until the game's HUD runs.
+    if time < HINT_TIME && info.playing && game.is_none() {
         text(
             screen.center_top() + vec2(0.0, 56.0),
             Align2::CENTER_TOP,
@@ -530,14 +545,30 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     if info.playing
         && let Some(game) = game
     {
+        // The scripts' markers in the world, under the HUD.
+        if let (Some(m), Some(vp)) = (&info.mission, info.view_proj) {
+            let here = info.game.as_ref().and_then(|s| s.position).map(Vec3::from);
+            world_markers(&painter, screen, vp, m, game, here);
+        }
         game.paint(&painter);
         if std::env::var_os("M2_PAINT_TEST").is_some() {
             paint_test(&painter);
         }
     }
     if let Some(m) = &info.mission {
-        // The game's HUD shows the messages in its message buffer.
-        mission(&painter, screen, info.view_proj, m, game.is_none(), &text);
+        // The game's HUD shows the messages in its message buffer, and
+        // the markers as the game draws them. Nor, when its fanfare call
+        // failed in its scripts, the fanfare.
+        let dropped = game.is_some_and(|g| g.dropped_fanfare());
+        mission(
+            &painter,
+            screen,
+            info.view_proj,
+            m,
+            game.is_none(),
+            dropped,
+            &text,
+        );
     }
     if !info.playing {
         text(
@@ -549,37 +580,45 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
         );
         return;
     }
-    if game.is_some() {
-        if let Some((_, _, true)) = &info.driving {
-            text(
-                screen.center() + vec2(0.0, 60.0),
-                Align2::CENTER_TOP,
-                "Wrecked: E to get out",
-                17.0,
-                white,
-            );
-        }
-    } else {
+    if game.is_none() {
         stand_in(&painter, screen, info, &text);
     }
+    // What the use key does here: with a pad, after its Y (the layout's
+    // `Action`) as the game draws it.
+    let use_prompt = |what: &str| {
+        let at = screen.center() + vec2(0.0, 60.0);
+        let pad = info.game.as_ref().is_some_and(|s| s.pad);
+        if let Some(game) = game.filter(|_| pad) {
+            let size = 17.0;
+            let width = ctx.fonts_mut(|f| {
+                f.layout_no_wrap(what.to_owned(), FontId::proportional(size), white)
+                    .size()
+                    .x
+            });
+            let icon = size * 1.6;
+            let left = at.x - (icon + 6.0 + width) / 2.0;
+            let r = egui::Rect::from_min_size(egui::pos2(left, at.y - 4.0), vec2(icon, icon));
+            game.paint_texture(&painter, crate::pad::Button::Y.texture(), r, Color32::WHITE);
+            text(
+                egui::pos2(left + icon + 6.0, at.y),
+                Align2::LEFT_TOP,
+                what,
+                size,
+                white,
+            );
+        } else {
+            text(at, Align2::CENTER_TOP, &format!("E: {what}"), 17.0, white);
+        }
+    };
     if let Some(prompt) = &info.prompt {
-        text(
-            screen.center() + vec2(0.0, 60.0),
-            Align2::CENTER_TOP,
-            &format!("E: {prompt}"),
-            17.0,
-            white,
-        );
+        use_prompt(prompt);
     } else if let Some(name) = &info.can_enter
         && info.driving.is_none()
     {
-        text(
-            screen.center() + vec2(0.0, 60.0),
-            Align2::CENTER_TOP,
-            &format!("E: get in the {}", name.trim_start_matches("global_veh_")),
-            17.0,
-            white,
-        );
+        use_prompt(&format!(
+            "get in the {}",
+            name.trim_start_matches("global_veh_")
+        ));
     }
     if info.down {
         text(
@@ -1116,25 +1155,29 @@ fn wheel(painter: &egui::Painter, c: egui::Pos2, r: f32, w: &WheelHud) {
     }
 }
 
-/// The mission's objectives (top left), its newest message (top centre)
-/// and tutorial line (left) if `message` (no game HUD to show them), and
-/// markers over its targets.
+/// The mission's objectives (top left), its newest message (top centre),
+/// tutorial line (left) and markers over its targets, if `message` (no
+/// game HUD to show them). The contract's end shows if `message`, or if
+/// `dropped` (the game HUD's fanfare call failed).
 fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     painter: &egui::Painter,
     screen: egui::Rect,
     view_proj: Option<Mat4>,
     m: &MissionView,
     message: bool,
+    dropped: bool,
     text: &T,
 ) {
     let white = Color32::from_gray(235);
     let gold = Color32::from_rgb(255, 200, 0);
     let mut at = screen.left_top() + vec2(20.0, 20.0);
-    if let Some(status) = &m.status {
+    // Ours, as the rest, until the game's HUD runs (which has no such
+    // list on screen).
+    if let Some(status) = m.status.as_ref().filter(|_| message) {
         text(at, Align2::LEFT_TOP, status, 15.0, white);
         at.y += 22.0;
     }
-    if !m.objectives.is_empty() {
+    if !m.objectives.is_empty() && message {
         text(at, Align2::LEFT_TOP, "Objectives", 16.0, gold);
         at.y += 22.0;
         for o in &m.objectives {
@@ -1146,8 +1189,10 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
     if let Some(line) = m.tutorial.as_ref().filter(|_| message) {
         tutorial(painter, screen, line);
     }
-    // The game's HUD has its own fanfare (`Hud.Fanfare`).
-    if m.contract_complete && message {
+    // The game's HUD has its own fanfare (`Hud.Fanfare`), unless its call
+    // failed there. Ours stays up while the fanfare waits for Enter, as the
+    // game's does.
+    if (m.contract_complete || m.fanfare_waiting) && (message || dropped) {
         text(
             screen.center() + vec2(0.0, -60.0),
             Align2::CENTER_CENTER,
@@ -1155,6 +1200,15 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             40.0,
             gold,
         );
+        if m.fanfare_waiting {
+            text(
+                screen.center() + vec2(0.0, -20.0),
+                Align2::CENTER_CENTER,
+                "Enter to continue",
+                18.0,
+                white,
+            );
+        }
     }
     if let Some((done, line)) = m.message.as_ref().filter(|_| message) {
         let head = if *done {
@@ -1170,20 +1224,53 @@ fn mission<T: Fn(egui::Pos2, Align2, &str, f32, Color32)>(
             gold,
         );
     }
-    let Some(vp) = view_proj else { return };
-    for (world, label, [r, g, b, _]) in &m.markers {
-        let Some(p) = to_screen(vp, *world, screen) else {
+    // The game's HUD draws the markers' icons ([`world_markers`]).
+    let Some(vp) = view_proj.filter(|_| message) else {
+        return;
+    };
+    for marker in &m.markers {
+        let Some(p) = to_screen(vp, marker.at, screen) else {
             continue;
         };
-        let colour = Color32::from_rgb(*r, *g, *b);
+        let [r, g, b, _] = marker.colour;
+        let colour = Color32::from_rgb(r, g, b);
         painter.circle_stroke(p, 9.0, Stroke::new(2.5, colour));
         text(
             p + vec2(0.0, -14.0),
             Align2::CENTER_BOTTOM,
-            label,
+            &marker.label(),
             14.0,
             colour,
         );
+    }
+}
+
+/// The scripts' markers (`Marker.AddBlip`) over the world, under the
+/// game's HUD: each its icon (the HUD's texture) tinted its colour,
+/// centred on its point while she is within its `near` to `far` metres
+/// (inferred: from her rather than from the camera). Its size is taken
+/// as the HUD's 640x480 units (inferred: the call's units aren't known),
+/// and one off the screen isn't drawn (nor pinned to its edge).
+fn world_markers(
+    painter: &egui::Painter,
+    screen: egui::Rect,
+    view_proj: Mat4,
+    m: &MissionView,
+    game: &GameHud,
+    here: Option<Vec3>,
+) {
+    let unit = screen.height() / m2_game::gui::VIRTUAL_SIZE.1;
+    for marker in &m.markers {
+        if here.is_some_and(|h| !marker.shown_from(h)) {
+            continue;
+        }
+        let Some(p) = project(view_proj, marker.at, screen) else {
+            continue;
+        };
+        let rect = Rect::from_center_size(p, vec2(marker.size, marker.size) * unit);
+        let [r, g, b, a] = marker.colour;
+        let colour = Color32::from_rgba_unmultiplied(r, g, b, a);
+        game.paint_texture(painter, &marker.icon, rect, colour);
     }
 }
 
@@ -1250,7 +1337,16 @@ fn project(view_proj: Mat4, world: Vec3, screen: egui::Rect) -> Option<egui::Pos
     ))
 }
 
-fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
+/// The pause menu, with `playing` (the hero she is) marked under "Play
+/// as". `dev`: the save and load buttons name their keys (which work only
+/// then); `load`: a saved game can be loaded.
+fn pause_menu(
+    ctx: &egui::Context,
+    config: &mut Config,
+    playing: crate::hero::Hero,
+    dev: bool,
+    load: bool,
+) -> Option<MenuAction> {
     let mut action = None;
     // Dim the game behind the menu.
     ctx.layer_painter(egui::LayerId::new(
@@ -1269,10 +1365,15 @@ fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
                 action = Some(MenuAction::Resume);
             }
             ui.horizontal(|ui| {
-                if ui.button("Save game (F5)").clicked() {
+                let (save, load_label) = if dev {
+                    ("Save game (F5)", "Load game (F9)")
+                } else {
+                    ("Save game", "Load game")
+                };
+                if ui.button(save).clicked() {
                     action = Some(MenuAction::SaveGame);
                 }
-                if ui.button("Load game (F9)").clicked() {
+                if load && ui.button(load_label).clicked() {
                     action = Some(MenuAction::LoadGame);
                 }
             });
@@ -1280,10 +1381,8 @@ fn pause_menu(ctx: &egui::Context, config: &mut Config) -> Option<MenuAction> {
             ui.horizontal(|ui| {
                 ui.label("Play as");
                 for hero in crate::hero::Hero::ALL {
-                    if ui
-                        .selectable_label(config.hero == hero, hero.name())
-                        .clicked()
-                        && config.hero != hero
+                    if ui.selectable_label(playing == hero, hero.name()).clicked()
+                        && playing != hero
                     {
                         config.hero = hero;
                         action = Some(MenuAction::Hero(hero));
@@ -1367,11 +1466,14 @@ mod tests {
                 objectives: vec!["VzaCon001 objective 1".into()],
                 tutorial: Some("[P] VzaCon001 tutorial 1\nline 2".into()),
                 game_tutorial: Some("[pda] VzaCon001 tutorial 1\nline 2".into()),
-                markers: vec![(
-                    Vec3::new(0.0, 0.0, -10.0),
-                    "deliverable".into(),
-                    [255, 200, 0, 255],
-                )],
+                markers: vec![crate::mission::MarkerView {
+                    at: Vec3::new(0.0, 0.0, -10.0),
+                    icon: "HUD_objective_deliverable".into(),
+                    colour: [255, 200, 0, 255],
+                    near: 5.0,
+                    far: 175.0,
+                    size: 32.0,
+                }],
                 message: Some((false, "VzaCon001 objective 1".into())),
                 game_message: None,
                 radar_regions: Vec::new(),

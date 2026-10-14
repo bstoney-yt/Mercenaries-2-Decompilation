@@ -344,7 +344,9 @@ const MG_RANGE: f32 = 500.0;
 /// Gunfire puts soldiers this close on alert and sends civilians running.
 const ALERT_RANGE: f32 = 60.0;
 const PANIC_RANGE: f32 = 40.0;
-/// A soldier's hit on her: the "Assault Rifle Bullet" template's Damage
+/// A soldier's hit on her when his template names no gun (the AK47
+/// stands in; the rest hit as their own gun's round does,
+/// [`Combat::npc_round`]): the "Assault Rifle Bullet" template's Damage
 /// (the VZ soldiers' rifle, 9, `DamageKey` `Bullet`) times the game's
 /// damage table's `Hero` row for a `Bullet` (0.25; see
 /// `m2_engine::tuning::DamageTable`), whoever the hero is (all three
@@ -560,26 +562,66 @@ impl Arsenal {
         muzzle: Vec3,
         rig: Option<&Rig>,
     ) -> WeaponModel {
-        let (grip, grip_hand) = match rig.and_then(|r| grip(r, muzzle)) {
-            Some((m, hand)) => (m, Some(hand)),
-            None => (Mat4::IDENTITY, None),
-        };
-        let carry = rig.and_then(|r| carry(r, muzzle));
-        if let Some(r) = rig {
-            self.hand = r.rifle_hand();
-            self.attach = right_attach(&r.skeleton);
-            self.back = BACK_ATTACH.map(|h| node(&r.skeleton, h));
-            self.spine = node(&r.skeleton, SPINE);
-            self.neck = node(&r.skeleton, NECK);
-        }
-        WeaponModel {
+        let mut w = WeaponModel {
             model,
             muzzle,
-            grip,
-            grip_hand,
-            carry,
+            grip: Mat4::IDENTITY,
+            grip_hand: None,
+            carry: None,
             hang: if launcher { HANG_LAUNCHER } else { HANG_DOWN },
+        };
+        if let Some(r) = rig {
+            self.nodes_of(r);
+            fit(&mut w, r);
         }
+        w
+    }
+
+    /// Every weapon held in `rig`'s hands and hung on its back from now
+    /// on, in place of the rig they were held by: a new hero's skeleton
+    /// has its own nodes (Mattias's 116 are not Jennifer's 92), and the
+    /// weapons mostly load during the front end, before the hero is
+    /// picked, so they were held by the default hero's.
+    pub fn rehold(&mut self, rig: &Rig) {
+        self.nodes_of(rig);
+        let named = [
+            &mut self.rifle,
+            &mut self.rpg,
+            &mut self.rocket,
+            &mut self.grenade,
+            &mut self.launcher,
+            &mut self.round,
+            &mut self.carbine,
+            &mut self.designator,
+            &mut self.bullpup,
+        ];
+        for w in named
+            .into_iter()
+            .flatten()
+            .chain(self.by_model.values_mut())
+        {
+            fit(w, rig);
+        }
+        eprintln!(
+            "weapons: held by a {}-node skeleton: hand {:?}, attach {:?}, back {:?}, spine {:?}, neck {:?}",
+            rig.skeleton.len(),
+            self.hand,
+            self.attach,
+            self.back,
+            self.spine,
+            self.neck
+        );
+    }
+
+    /// The hand, attach point, back, spine and neck nodes of `rig`'s
+    /// skeleton.
+    fn nodes_of(&mut self, rig: &Rig) {
+        let s = &rig.skeleton;
+        self.hand = rig.rifle_hand();
+        self.attach = right_attach(s);
+        self.back = BACK_ATTACH.map(|h| node(s, h));
+        self.spine = node(s, SPINE);
+        self.neck = node(s, NECK);
     }
 
     /// The model of her rifle `rifle`: else the carbine's, else the
@@ -592,6 +634,21 @@ impl Arsenal {
         }
         .or(self.carbine.as_ref())
         .or(self.rifle.as_ref())
+    }
+
+    /// The model a soldier holds: his template's gun's own, else the AK47
+    /// that stands in (for templates naming no gun, or whose gun's model
+    /// isn't loaded).
+    pub fn npc_gun(&self, gun: Option<m2_engine::tuning::HandGun>) -> Option<&WeaponModel> {
+        let own = gun.and_then(|g| g.model).and_then(|h| {
+            self.by_model.get(&h).or_else(|| {
+                [&self.rifle, &self.carbine, &self.bullpup]
+                    .into_iter()
+                    .flatten()
+                    .find(|w| w.model.hash == h)
+            })
+        });
+        own.or(self.rifle.as_ref())
     }
 
     /// Weapon to world for `weapon` slung on the back of a character
@@ -763,16 +820,23 @@ fn palm(skeleton: &Skeleton, nodes: &[Mat4], hand: usize) -> Vec3 {
     }
 }
 
+/// Weapon `w`'s hold in `rig`'s hands, two-handed and carried
+/// ([`grip`], [`carry`]).
+fn fit(w: &mut WeaponModel, rig: &Rig) {
+    (w.grip, w.grip_hand) = match grip(rig, w.muzzle) {
+        Some((m, hand)) => (m, Some(hand)),
+        None => (Mat4::IDENTITY, None),
+    };
+    w.carry = carry(rig, w.muzzle);
+}
+
 /// Where a weapon with its muzzle at `muzzle` sits in the aim clip's
 /// pose: grip in the rear hand, barrel towards the front one, upright
 /// about the barrel; and the rear hand's node.
 fn grip(rig: &Rig, muzzle: Vec3) -> Option<(Mat4, usize)> {
     let skeleton = &rig.skeleton;
     let (rear, front) = rig.aim_hands()?;
-    let aim = rig
-        .clips
-        .iter()
-        .find(|c| c.hash == crate::npc::FightClips::AIM)?;
+    let aim = aim_clip(rig)?;
     let pose = aim.sample(skeleton, aim.info.duration * 0.5);
     let nodes = skeleton.model_matrices(&pose);
     let pr = nodes[rear].transform_point3(Vec3::ZERO);
@@ -783,17 +847,25 @@ fn grip(rig: &Rig, muzzle: Vec3) -> Option<(Mat4, usize)> {
     ))
 }
 
+/// The clip `rig` aims with: the hero's own ([`Rig::aim_clip`]), else
+/// the aim clip by name, unless that is only another hero's.
+fn aim_clip(rig: &Rig) -> Option<&m2_engine::BoundClip> {
+    match rig.aim_clip {
+        Some(i) => rig.clips.get(i),
+        None => rig
+            .clips
+            .iter()
+            .find(|c| c.hash == crate::npc::FightClips::AIM && !rig.foreign.contains(&c.hash)),
+    }
+}
+
 /// Of a human skeleton's hands, (rear, front) in the aim clip: the
 /// trigger hand and the one under the barrel. Without the clip, right
 /// then left.
 pub fn aim_hands(rig: &Rig) -> Option<(usize, usize)> {
     let skeleton = &rig.skeleton;
     let (rh, lh) = hands(skeleton)?;
-    let Some(aim) = rig
-        .clips
-        .iter()
-        .find(|c| c.hash == crate::npc::FightClips::AIM)
-    else {
+    let Some(aim) = aim_clip(rig) else {
         return Some((rh, lh));
     };
     let forward = rig
@@ -938,6 +1010,24 @@ pub enum Effect {
     Wake { at: Vec3, size: f32 },
 }
 
+/// One of the game's own particle effects to set off: those a template
+/// shows (its `RedEffectComponent`s), at `at`. A held one (`hold`) keeps
+/// going, following `at`, while its source keeps asking for it (a fire,
+/// a smoking wreck); the rest run once.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GameFx {
+    pub template: FxTemplate,
+    pub at: Vec3,
+    pub hold: Option<u64>,
+}
+
+/// A template, by id or by name.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FxTemplate {
+    Id(u32),
+    Name(String),
+}
+
 /// A sound the fight makes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sound {
@@ -952,6 +1042,12 @@ pub enum Sound {
     Bomb(Vec3),
     /// A building the bomb brought down coming apart.
     Collapse(Vec3),
+    /// Something with no building's collapse (a fence, a sign) breaking:
+    /// its template's `SoundKey` (`prop_sheetmetal_sml`).
+    Break {
+        at: Vec3,
+        key: u32,
+    },
 }
 
 /// A blow or a round that landed on something of the world's rather than
@@ -981,6 +1077,16 @@ impl Picked {
             Weapon::GrenadeLauncher => {}
         }
     }
+}
+
+/// What an ammunition pickup's `Pickup` records give her, by the weapons
+/// she carries now ([`Combat::refill`]): rounds for her rifle and for the
+/// gun in the launcher's place, and grenades.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Refill {
+    pub rifle: u32,
+    pub launcher: u32,
+    pub grenades: u32,
 }
 
 /// What flies, to draw: a rocket, a thrown grenade or a launched round.
@@ -1085,6 +1191,48 @@ pub struct Trigger {
     pub pda: bool,
 }
 
+/// The game's effect templates the fight's own fire and smoke set off,
+/// where no template of the fight's says which (names from the template
+/// database; which source shows which is chosen by name: invented). A
+/// blast from an explosion template shows that template's own.
+pub mod fx {
+    /// A blast with no template (a barrel, a mine's chain).
+    pub const GRENADE: &str = "Explosion (Grenade)";
+    /// The satellite-guided bomb, and an air strike's big blasts.
+    pub const BOMB: &str = "Explosion (Airstike Bomb)";
+    /// An air strike's small blasts.
+    pub const BOMBLET: &str = "Explosion (Cluster Bomblet)";
+    /// The bomb's final strike.
+    pub const FINAL: &str = "Explosion (Smart Bomb)";
+    /// The launcher's back-blast and flash.
+    pub const BACK_BLAST: &str = "global_particle_muzzleflash_rpg";
+    /// A tank's main gun.
+    pub const CANNON: &str = "Muzzle Flash (RR)";
+    /// A rocket's trail.
+    pub const ROCKET: &str = "RPG Rocket";
+    /// A thrown marker's smoke.
+    pub const MARKER: &str = "FlareSmoke";
+    /// A wrecked vehicle burning.
+    pub const WRECK: [&str; 2] = [
+        "global_particle_firemediumsmoke_vehicle_box_flame",
+        "global_particle_firemediumsmoke_smoke_vehicle",
+    ];
+    /// A building's blaze.
+    pub const BLAZE: [&str; 2] = [
+        "global_particle_firelargesmoke",
+        "global_particle_firelargesmoke_smoke",
+    ];
+    /// A barrel or a bomb's fire burning on.
+    pub const FIRE: [&str; 2] = [
+        "global_particle_firesmall",
+        "global_particle_firesmall_smoke",
+    ];
+    /// A building coming apart.
+    pub const COLLAPSE: &str = "fx_CollapseCoverDust";
+    /// A supply crate broken open.
+    pub const CRATE: &str = "global_particle_impact_wood";
+}
+
 /// A thrown marker smokes from this long after it leaves her hand until
 /// this long, seconds, a puff every [`MARKER_PUFF`].
 const MARKER_SMOKE: (f32, f32) = (1.0, 30.0);
@@ -1134,6 +1282,9 @@ pub struct Combat {
     projectiles: Vec<Projectile>,
     /// Effects with their seconds left and lifetime.
     pub effects: Vec<(Effect, f32, f32)>,
+    /// The game's own effects set off since the scene last took them
+    /// ([`GameFx`]).
+    pub game_fx: Vec<GameFx>,
     /// Sounds made since the last call to [`take_sounds`](Self::take_sounds).
     sounds: Vec<Sound>,
     /// Wrecks smoke: (vehicle index, seconds to the next puff).
@@ -1163,6 +1314,10 @@ pub struct Combat {
     /// one the scripts handed her.
     pub rifle: Rifle,
     pub own_rifle: bool,
+    /// The contract's scripts have handed her her weapons or their
+    /// reserves (`Command::Loadout`, `Command::Reserve`): what she carries
+    /// to throw is theirs, not her template's.
+    pub scripted_loadout: bool,
     /// What blasts do to her, of their damage.
     pub hero_damage: HeroDamage,
     pub rifle_rounds: Rounds,
@@ -1260,6 +1415,7 @@ impl Default for Combat {
             bash_in: None,
             projectiles: Vec::new(),
             effects: Vec::new(),
+            game_fx: Vec::new(),
             sounds: Vec::new(),
             wrecks: Vec::new(),
             remarks: Vec::new(),
@@ -1273,6 +1429,7 @@ impl Default for Combat {
             launcher_rounds: Some(Rounds::of(1 + RPG_SPARE, 1)),
             rifle: Rifle::default(),
             own_rifle: true,
+            scripted_loadout: false,
             hero_damage: HeroDamage::default(),
             rifle_rounds: Rounds::of(RIFLE_CLIP + RIFLE_SPARE, RIFLE_CLIP),
             changing: None,
@@ -1541,36 +1698,143 @@ impl Combat {
         self.hp * 100.0 / self.max_hp.max(1.0)
     }
 
-    /// Launcher rounds, grenades and health from a pickup: as many as she
-    /// has room for, health up to full.
-    pub fn take_supplies(&mut self, launcher: u32, grenades: u32, health: f32) {
-        if launcher > 0 {
-            self.take_ammo(Weapon::GrenadeLauncher, launcher);
+    /// What an ammunition pickup's `Pickup` records (each its ammunition
+    /// template and amount) give her: each record goes to the first of her
+    /// rifle, the gun in the launcher's place and her grenades that
+    /// `takes` it (asked with the weapon's template, the ammunition it
+    /// fires and the record's). A gun's amount counts its clips (the
+    /// crate launcher's 3 are the footage's "6 2"); a thrown weapon's
+    /// counts itself.
+    pub fn refill(
+        &self,
+        records: &[(u32, u32)],
+        takes: impl Fn(Option<u32>, Option<u32>, u32) -> bool,
+    ) -> Refill {
+        let gun = |g: &Rifle, ammo| takes(g.template, g.ammo.map(|a| a.template), ammo);
+        let grenade = self.throwables.first().and_then(Option::as_ref);
+        let mut out = Refill::default();
+        for &(ammo, n) in records {
+            if gun(&self.rifle, ammo) {
+                out.rifle += n * self.rifle.clip.max(1);
+            } else if self.second.is_some() && gun(&self.launcher, ammo) {
+                out.launcher += n * self.launcher.clip.max(1);
+            } else if grenade.is_some_and(|g| takes(Some(g.template), Some(g.ammo.template), ammo))
+            {
+                out.grenades += n;
+            }
         }
-        self.grenades = (self.grenades + grenades).min(MAX_GRENADES);
+        out
+    }
+
+    /// What a pickup gives her ([`refill`](Self::refill)), and its health:
+    /// as much as she has room for, health up to full.
+    pub fn take_supplies(&mut self, refill: Refill, health: f32) {
+        if refill.rifle > 0 {
+            self.take_ammo(Weapon::Rifle, refill.rifle);
+        }
+        if let Some(w) = self.second.filter(|_| refill.launcher > 0) {
+            self.take_ammo(w, refill.launcher);
+        }
+        self.grenades = (self.grenades + refill.grenades).min(MAX_GRENADES);
         self.hp = (self.hp + health).min(self.max_hp);
     }
 
-    /// Whether ammunition or health lying there gives her anything: what
-    /// she walks over she takes only then.
-    pub fn can_use(&self, what: &crate::flights::Leaves) -> bool {
-        let rounds = match what.gives {
-            Some((Weapon::GrenadeLauncher, n)) => {
-                n > 0 && self.second == Some(Weapon::GrenadeLauncher)
-            }
-            Some((Weapon::Rifle, n)) => n > 0 && self.rifle_rounds.stored < self.rifle.spare,
-            Some((w, n)) => n > 0 && self.second == Some(w),
-            None => false,
-        };
-        let launcher = what.launcher > 0
-            && self.second == Some(Weapon::GrenadeLauncher)
+    /// Whether ammunition or health lying there gives her anything she
+    /// has room for: what she walks over she takes only then.
+    pub fn can_use(&self, refill: Refill, health: f32) -> bool {
+        let rifle = refill.rifle > 0 && self.rifle_rounds.stored < self.rifle.spare;
+        let launcher = refill.launcher > 0
+            && self.second.is_some()
             && self
                 .launcher_rounds
                 .is_some_and(|r| r.stored < self.launcher.spare);
-        rounds
+        rifle
             || launcher
-            || (what.grenades > 0 && self.grenades < MAX_GRENADES)
-            || (what.health > 0.0 && self.hp < self.max_hp)
+            || (refill.grenades > 0 && self.grenades < MAX_GRENADES)
+            || (health > 0.0 && self.hp < self.max_hp)
+    }
+
+    /// Why walking over a pickup whose `records` (ammunition template,
+    /// amount) and `health` give her nothing she has room for leaves it
+    /// lying, for the log: each record a weapon of hers takes (as
+    /// [`refill`](Self::refill) asks `takes`) with that weapon's rounds and
+    /// room, how many records none of hers takes and what hers fire, and
+    /// her health against the most. `name` names a template.
+    pub fn refusal(
+        &self,
+        records: &[(u32, u32)],
+        health: f32,
+        takes: impl Fn(Option<u32>, Option<u32>, u32) -> bool,
+        name: impl Fn(u32) -> String,
+    ) -> String {
+        let gun = |g: &Rifle, ammo| takes(g.template, g.ammo.map(|a| a.template), ammo);
+        let grenade = self.throwables.first().and_then(Option::as_ref);
+        let mut why = Vec::new();
+        let mut none = 0;
+        for &(ammo, n) in records {
+            if gun(&self.rifle, ammo) {
+                let r = self.rifle_rounds;
+                why.push(format!(
+                    "{} {n} to her {}, full at {}+{} of {} spare",
+                    name(ammo),
+                    self.rifle.name,
+                    r.clip,
+                    r.stored,
+                    self.rifle.spare
+                ));
+            } else if self.second.is_some() && gun(&self.launcher, ammo) {
+                let r = self.launcher_rounds.unwrap_or_default();
+                why.push(format!(
+                    "{} {n} to her {}, full at {}+{} of {} spare",
+                    name(ammo),
+                    self.launcher.name,
+                    r.clip,
+                    r.stored,
+                    self.launcher.spare
+                ));
+            } else if grenade.is_some_and(|g| takes(Some(g.template), Some(g.ammo.template), ammo))
+            {
+                why.push(format!(
+                    "{} {n} to her grenades, full at {} of {MAX_GRENADES}",
+                    name(ammo),
+                    self.grenades
+                ));
+            } else {
+                none += 1;
+            }
+        }
+        if none > 0 {
+            let fires = |g: &Rifle| g.ammo.map_or_else(|| "?".to_owned(), |a| name(a.template));
+            why.push(format!(
+                "{none} of {} records for no weapon of hers (her {} fires {}{}{})",
+                records.len(),
+                self.rifle.name,
+                fires(&self.rifle),
+                match self.second {
+                    Some(_) => format!(
+                        ", her {} fires {}",
+                        self.launcher.name,
+                        fires(&self.launcher)
+                    ),
+                    None => String::new(),
+                },
+                match grenade {
+                    Some(g) => format!(", her grenades are {}", name(g.ammo.template)),
+                    None => ", no grenades".to_owned(),
+                }
+            ));
+        }
+        if health > 0.0 {
+            why.push(format!(
+                "{health} health, she has {:.0} of {:.0}",
+                self.hp, self.max_hp
+            ));
+        }
+        if why.is_empty() {
+            "it gives nothing walked over".to_owned()
+        } else {
+            why.join("; ")
+        }
     }
 
     /// The weapons she carries but doesn't hold, which hang on her back:
@@ -1656,6 +1920,25 @@ impl Combat {
         self.effect(e, seconds);
     }
 
+    /// Sets off the effects template `name` shows at `at`, once.
+    pub fn show_fx(&mut self, name: &str, at: Vec3) {
+        self.game_fx.push(GameFx {
+            template: FxTemplate::Name(name.to_owned()),
+            at,
+            hold: None,
+        });
+    }
+
+    /// Keeps the effects template `name` shows going at `at` for source
+    /// `key` (see [`GameFx`]).
+    fn hold_fx(&mut self, name: &str, at: Vec3, key: u64) {
+        self.game_fx.push(GameFx {
+            template: FxTemplate::Name(name.to_owned()),
+            at,
+            hold: Some(key),
+        });
+    }
+
     /// A fire burning on the ground under `at` for [`BLAZE_TIME`] with
     /// thick black smoke, where a building broke apart (a gate a bomb
     /// brought down: the videos' fires either side, smoke for many
@@ -1669,6 +1952,12 @@ impl Combat {
     /// A building the bomb brought down comes apart at `at`: heard.
     pub fn collapse(&mut self, at: Vec3) {
         self.sounds.push(Sound::Collapse(at));
+    }
+
+    /// Something that doesn't come down as a building does breaks at
+    /// `at`: heard as its template's `SoundKey` `key` says.
+    pub fn broke(&mut self, at: Vec3, key: u32) {
+        self.sounds.push(Sound::Break { at, key });
     }
 
     /// Where she is a target: her chest, or `None` while down, flying or
@@ -2016,7 +2305,8 @@ impl Combat {
     fn npc_shoot(&mut self, f: &mut Field<'_>, i: usize, target: Option<Vec3>) {
         let Some(aim) = target else { return };
         let n = &f.people.npcs[i];
-        let from = match (&f.arsenal.rifle, f.people.kinds.get(n.kind)) {
+        let gun = n.gun;
+        let from = match (f.arsenal.npc_gun(gun), f.people.kinds.get(n.kind)) {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
                 f.arsenal
@@ -2067,7 +2357,8 @@ impl Combat {
         let closest = from + dir * (aim - from).dot(dir).max(0.0);
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
         if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
-            self.hurt_player(f, NPC_DAMAGE, Some(from));
+            let damage = self.npc_round(gun);
+            self.hurt_player(f, damage, Some(from));
         }
         if let Some((t, None)) = hit {
             self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
@@ -2121,7 +2412,7 @@ impl Combat {
             self.down = DOWN_TIME;
             f.player.down = true;
             f.player.aiming = false;
-            if let (Some(die), Some((_, rig))) = (f.people.clips.die, &mut f.player.model) {
+            if let (Some(die), Some((_, rig))) = (f.player.clips.die, &mut f.player.model) {
                 rig.animator.set_upper(None);
                 rig.two_handed = false;
                 rig.animator.play_once(die);
@@ -2230,6 +2521,7 @@ impl Combat {
             },
             1.2,
         );
+        self.show_fx(fx::BACK_BLAST, from);
         self.sounds.push(Sound::Launch(from));
         alarm(f.people, f.player.character.position);
     }
@@ -2505,6 +2797,7 @@ impl Combat {
                 },
                 1.5,
             );
+            self.show_fx(fx::CANNON, from + aim * 0.8);
             self.sounds.push(Sound::Cannon(from));
         } else {
             if coax {
@@ -2851,6 +3144,7 @@ impl Combat {
                 },
                 3.0,
             );
+            self.hold_fx(fx::MARKER, at, place_key(1, at));
         }
         let mut puffs = Vec::new();
         let mut streaks = Vec::new();
@@ -2996,8 +3290,11 @@ impl Combat {
                 true
             }
         });
-        for at in puffs {
+        for (k, at) in puffs.into_iter().enumerate() {
             self.effect(Effect::Smoke { at, size: 0.4 }, 0.8);
+            // Rockets have no id: the k-th in flight (one at a time, as a
+            // rule).
+            self.hold_fx(fx::ROCKET, at, (2 << 32) | k as u64);
         }
         for (from, to) in streaks {
             self.effect(Effect::Tracer { from, to }, dt * 1.5);
@@ -3011,6 +3308,7 @@ impl Combat {
     /// near it wrecked and thrown.
     pub fn explode(&mut self, f: &mut Field<'_>, at: Vec3) {
         self.burst(at, 1.0);
+        self.show_fx(fx::GRENADE, at);
         let mut killed = false;
         for n in &mut f.people.npcs {
             let d = n.chest().distance(at);
@@ -3114,6 +3412,23 @@ impl Combat {
             .unwrap_or(1.0)
     }
 
+    /// What a soldier's round does to her: his template's gun's round's
+    /// `Damage` times the game's damage table's `Hero` row for its
+    /// `DamageKey` (a round without a key is a `Bullet`); the Assault
+    /// Rifle Bullet's [`NPC_DAMAGE`] when his template names no gun, or
+    /// the table isn't found.
+    fn npc_round(&self, gun: Option<m2_engine::tuning::HandGun>) -> f32 {
+        let Some(g) = gun else { return NPC_DAMAGE };
+        let key = g
+            .damage_key
+            .filter(|&k| k != 0)
+            .unwrap_or_else(|| m2_assets::name_hash("Bullet"));
+        self.damage_table
+            .as_ref()
+            .and_then(|t| t.scale(m2_assets::name_hash("Hero"), key))
+            .map_or(NPC_DAMAGE, |scale| g.damage * scale)
+    }
+
     /// Explosion template `blast` going off at `at`, by its own `Radius`,
     /// `Damage` and `MinDamage` and the damage table's scale for its
     /// `DamageKey` (people's `Human` row, the hero's `Hero` row; vehicles
@@ -3126,6 +3441,11 @@ impl Combat {
         };
         // Fire and smoke the size of a grenade's at its 5 m reach.
         self.burst(at, (b.radius / 5.0).clamp(0.4, 3.0));
+        self.game_fx.push(GameFx {
+            template: FxTemplate::Id(b.template),
+            at,
+            hold: None,
+        });
         let human = match (&self.damage_table, b.key) {
             (Some(t), Some(k)) => t.scale(m2_assets::name_hash("Human"), k).unwrap_or(1.0),
             _ => 1.0,
@@ -3197,6 +3517,7 @@ impl Combat {
         self.sounds.push(Sound::Bomb(at));
         let hers = self.hero_damage;
         self.harm(f, at, BOMB, false, hers.explosion_large);
+        self.show_fx(fx::BOMB, at);
         self.harm(f, at + Vec3::Y, BOMB_FRAG, true, hers.bullet_large);
         self.effect(
             Effect::Fire {
@@ -3262,6 +3583,14 @@ impl Combat {
         // The strikes' ordnance keys aren't read yet: an `Explosion`.
         let hers = self.hero_damage.explosion;
         self.harm(f, at, (radius, damage), false, hers);
+        self.show_fx(
+            if radius >= BOMB.0 {
+                fx::BOMB
+            } else {
+                fx::BOMBLET
+            },
+            at,
+        );
         // Fire and smoke grow with the reach's square: a 20 m bomb's 10 m
         // across, a 15 m bomblet's under 6, so that forty bomblets
         // together don't fill the view. (Sizes judged by eye, not read.)
@@ -3302,6 +3631,7 @@ impl Combat {
         self.sounds.push(Sound::Explosion(at));
         let hers = self.hero_damage.explosion_large;
         self.harm(f, at, BOMB_FINAL, false, hers);
+        self.show_fx(fx::FINAL, at);
         self.effect(
             Effect::Fire {
                 at: at + Vec3::Y,
@@ -3407,11 +3737,14 @@ impl Combat {
             if let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) {
                 let (lo, hi) = v.spec.bounds;
                 let top = Vec3::new((lo.x + hi.x) * 0.5, hi.y, (lo.z + hi.z) * 0.5);
-                puffs.push(body.transform_point3(top));
+                puffs.push((*i, body.transform_point3(top)));
             }
         }
-        for at in puffs {
+        for (i, at) in puffs {
             self.effect(Effect::Smoke { at, size: 1.5 }, 3.0);
+            for name in fx::WRECK {
+                self.hold_fx(name, at, (3 << 32) | i as u64);
+            }
         }
         let mut flames = Vec::new();
         self.fires.retain_mut(|(at, size, left, next)| {
@@ -3434,6 +3767,9 @@ impl Combat {
             *left > 0.0
         });
         for at in blazing {
+            for name in fx::BLAZE {
+                self.hold_fx(name, at, place_key(4, at));
+            }
             self.effect(Effect::Fire { at, size: 3.0 }, 0.7);
             self.effect(
                 Effect::Soot {
@@ -3445,6 +3781,9 @@ impl Combat {
         }
         for (at, size) in flames {
             let low = at.with_y(at.y - size.min(1.2) + 0.5);
+            for name in fx::FIRE {
+                self.hold_fx(name, low, place_key(5, at));
+            }
             self.effect(
                 Effect::Fire {
                     at: low,
@@ -3501,7 +3840,7 @@ fn farthest(way: Vec3, speed: f32) -> Vec3 {
 }
 
 /// Gunfire or a blast at `at`: soldiers close by turn on the player,
-/// civilians close by run.
+/// those close by who don't fight run (not story characters).
 fn alarm(people: &mut People, at: Vec3) {
     for n in &mut people.npcs {
         if !n.alive {
@@ -3568,6 +3907,13 @@ fn ray_capsule(origin: Vec3, dir: Vec3, a: Vec3, seg: Vec3, radius: f32) -> Opti
     let on_seg = a + seg * u;
     let s = dir.dot(on_seg - origin).max(0.0);
     ((origin + dir * s).distance(on_seg) <= radius).then_some(s)
+}
+
+/// A held effect's key for a source that stays put (a fire, a marker):
+/// its kind and where it is, to the decimetre.
+fn place_key(kind: u64, at: Vec3) -> u64 {
+    let q = |v: f32| u64::from((v * 10.0).round() as i32 as u16);
+    (kind << 48) | (q(at.x) << 32) | (q(at.y) << 16) | q(at.z)
 }
 
 #[cfg(test)]
@@ -3854,6 +4200,68 @@ mod tests {
             at.transform_point3(Vec3::new(0.0, 0.0, -0.3)).z < point.z,
             "behind her"
         );
+    }
+
+    #[test]
+    fn a_new_hero_holds_the_weapons_in_his_own_hands() {
+        // Two skeletons with the hands, attach points, back and neck at
+        // different nodes, as Jennifer's and Mattias's have.
+        let rig_of = |names: Vec<u32>| {
+            let n = names.len();
+            let mut r = rig();
+            r.skeleton = std::sync::Arc::new(Skeleton {
+                name_hashes: names,
+                parents: (0..n).map(|i| i.checked_sub(1)).collect(),
+                rest: vec![
+                    m2_engine::anim::Local {
+                        translation: Vec3::ZERO,
+                        rotation: Quat::IDENTITY,
+                        scale: Vec3::ONE,
+                    };
+                    n
+                ],
+                inverse_bind: vec![Mat4::IDENTITY; n],
+            });
+            r
+        };
+        let hers = rig_of(vec![1, RIGHT_HAND, RIGHT_ATTACH, LEFT_HAND, SPINE, NECK]);
+        let [back_right, back_left] = BACK_ATTACH;
+        let his = rig_of(vec![
+            1,
+            2,
+            3,
+            SPINE,
+            NECK,
+            LEFT_HAND,
+            4,
+            RIGHT_HAND,
+            RIGHT_ATTACH,
+            back_right,
+            back_left,
+        ]);
+        let mut arsenal = Arsenal::default();
+        arsenal.add("m4", crate::npc::tests::empty_model(), Vec3::Z, Some(&hers));
+        assert_eq!((arsenal.hand, arsenal.attach), (Some(1), Some(2)));
+        arsenal.rehold(&his);
+        assert_eq!((arsenal.hand, arsenal.attach), (Some(7), Some(8)));
+        assert_eq!(arsenal.back, [Some(9), Some(10)]);
+        assert_eq!((arsenal.spine, arsenal.neck), (Some(3), Some(4)));
+        // Drawn at his right hand's attach point, not at the node hers
+        // was (his left hand's neighbour).
+        let nodes: Vec<Mat4> = (0..11)
+            .map(|i| Mat4::from_translation(Vec3::X * i as f32))
+            .collect();
+        let w = arsenal.carbine.as_ref().unwrap();
+        let at = arsenal
+            .in_hand(
+                w,
+                Mat4::IDENTITY,
+                &nodes,
+                (arsenal.hand, arsenal.attach),
+                false,
+            )
+            .unwrap();
+        assert_eq!(at.w_axis.x, 8.0);
     }
 
     #[test]
@@ -4218,6 +4626,36 @@ mod tests {
         assert_eq!(combat.target(&player, true), None);
     }
 
+    // A soldier's round hurts her as his template's gun's does, by the
+    // damage table's `Hero` row; with no gun of his own, as the Assault
+    // Rifle Bullet does.
+    #[test]
+    fn soldiers_rounds_hurt_her_as_their_guns_do() {
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(1);
+        put(1);
+        put(m2_assets::name_hash("Hero"));
+        put(m2_assets::name_hash("Bullet"));
+        put(0.25f32.to_bits());
+        let combat = Combat {
+            damage_table: m2_engine::tuning::DamageTable::parse(&data),
+            ..Combat::default()
+        };
+        assert!(combat.damage_table.is_some());
+        let gun = m2_engine::tuning::HandGun {
+            template: 1,
+            model: None,
+            rate_of_fire: 600.0,
+            clip: 30,
+            reserve_clips: 7,
+            damage: 12.0,
+            damage_key: None,
+        };
+        assert_eq!(combat.npc_round(Some(gun)), 3.0);
+        assert_eq!(combat.npc_round(None), NPC_DAMAGE);
+    }
+
     #[test]
     fn her_own_rifle_is_her_templates_until_the_scripts_hand_her_the_carbine() {
         let bullpup = m2_engine::tuning::HandGun {
@@ -4338,6 +4776,93 @@ mod tests {
     }
 
     #[test]
+    fn a_pickup_refills_the_weapons_she_carries_by_their_ammunition() {
+        let ammo = |template| Ammo {
+            template,
+            velocity: 0.0,
+            max_velocity: 0.0,
+            human_boost: 1.0,
+            gravity: 0.0,
+            damage: 0.0,
+            damage_min: 0.0,
+            falloff: (0.0, 0.0),
+            key: None,
+            blast: None,
+            timer: None,
+            timer_blast: None,
+            homing: None,
+            model: None,
+            sticky: false,
+        };
+        let mut combat = Combat {
+            carbine: Rifle {
+                template: Some(10),
+                ammo: Some(ammo(11)),
+                ..Rifle::default()
+            },
+            ..Combat::default()
+        };
+        combat.set_thrown(
+            Throwable {
+                template: 20,
+                name: "Grenade".to_owned(),
+                model: None,
+                ammo: ammo(21),
+                max: MAX_GRENADES,
+                speeds: [0.0; 3],
+                pitches: [0.0; 3],
+                throw_angle: 0.0,
+                cook: false,
+                detonator: None,
+                planted: None,
+            },
+            None,
+            None,
+        );
+        combat.carbine_only();
+        // A record per kind of ammunition: the carbine's 3 clips, 2
+        // grenades, and rounds for a launcher she doesn't carry.
+        let records = [(99, 5), (11, 3), (21, 2), (31, 4)];
+        let fires = |_: Option<u32>, fires: Option<u32>, ammo: u32| fires == Some(ammo);
+        let refill = combat.refill(&records, fires);
+        assert_eq!(
+            refill,
+            Refill {
+                rifle: 90,
+                launcher: 0,
+                grenades: 2
+            }
+        );
+        assert!(combat.can_use(refill, 0.0));
+        combat.take_supplies(refill, 0.0);
+        assert_eq!(
+            combat.rifle_rounds,
+            Rounds {
+                clip: 30,
+                stored: 90
+            }
+        );
+        assert_eq!(combat.grenades, 2);
+        // Ammunition for none of hers gives nothing; a weapon's own link
+        // (`takes` by its template) counts as well as what it fires.
+        assert!(!combat.can_use(combat.refill(&[(99, 5)], fires), 0.0));
+        combat.launcher = Rifle {
+            template: Some(30),
+            ammo: Some(ammo(32)),
+            ..Rifle::launcher(Weapon::GrenadeLauncher)
+        };
+        combat.second = Some(Weapon::GrenadeLauncher);
+        combat.launcher_rounds = Some(Rounds::default());
+        let own =
+            |w: Option<u32>, f: Option<u32>, a: u32| f == Some(a) || (w == Some(30) && a == 31);
+        assert_eq!(combat.refill(&records, own).launcher, 24);
+        // Full, the rifle's rounds leave the pickup lying.
+        combat.rifle_rounds.stored = combat.rifle.spare;
+        let rifle_only = combat.refill(&[(11, 1)], fires);
+        assert!(!combat.can_use(rifle_only, 0.0));
+    }
+
+    #[test]
     fn the_grenade_launcher_takes_the_rpgs_place_and_runs_out() {
         let mut physics = ground();
         let dt = 1.0 / 60.0;
@@ -4411,14 +4936,14 @@ mod tests {
         // More rounds go with it, two clips beyond the one at most (a
         // rocket pickup's 20 clips); the RPG taken back leaves it, with
         // them.
-        let rockets = crate::flights::Leaves {
+        let rockets = Refill {
             launcher: 120,
-            ..crate::flights::Leaves::default()
+            ..Refill::default()
         };
-        assert!(combat.can_use(&rockets));
-        combat.take_supplies(rockets.launcher, 0, 0.0);
+        assert!(combat.can_use(rockets, 0.0));
+        combat.take_supplies(rockets, 0.0);
         assert_eq!(combat.launcher_rounds.map(Rounds::total), Some(12));
-        assert!(!combat.can_use(&rockets));
+        assert!(!combat.can_use(rockets, 0.0));
         combat.launcher_rounds = Some(Rounds::default());
         combat.take_ammo(Weapon::GrenadeLauncher, 6);
         assert!(combat.second_loaded());
