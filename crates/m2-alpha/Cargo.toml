@@ -26,10 +26,18 @@ serde.workspace = true
 toml.workspace = true
 winit = { workspace = true, features = ["serde"] }
 
-# Sound output. Windows only for now: elsewhere cpal needs the system's
-# ALSA development files, and the game is played on Windows.
+# Sound output. Windows and Android only for now: elsewhere cpal needs the
+# system's ALSA development files, and the game is played on Windows.
 [target.'cfg(windows)'.dependencies]
 cpal = "0.18"
+
+# The Android build (see crates/m2-alpha-android).
+[target.'cfg(target_os = "android")'.dependencies]
+cpal = "0.18"
+jni = "0.21"
+libc = "0.2"
+ndk-context = "0.1"
+winit = { workspace = true, features = ["serde", "android-native-activity"] }
 
 [lints]
 workspace = true

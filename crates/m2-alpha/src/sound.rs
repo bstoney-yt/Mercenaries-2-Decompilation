@@ -26,7 +26,7 @@ use m2_math::glam::Vec3;
 /// output: other platforms, or no sound device).
 pub struct AudioOut {
     pub mixer: Arc<Mutex<Mixer>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     _stream: Option<cpal::Stream>,
 }
 
@@ -37,7 +37,7 @@ impl std::fmt::Debug for AudioOut {
 }
 
 impl AudioOut {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn start() -> Self {
         match open_device() {
             Ok((mixer, stream)) => Self {
@@ -54,7 +54,7 @@ impl AudioOut {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "android")))]
     pub fn start() -> Self {
         eprintln!("sound: no output on this platform yet; playing silently");
         Self {
@@ -70,7 +70,7 @@ impl AudioOut {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn open_device() -> anyhow::Result<(Arc<Mutex<Mixer>>, cpal::Stream)> {
     use anyhow::Context as _;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};

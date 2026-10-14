@@ -1,0 +1,81 @@
+# The game built for Android (a phone in DeX, with a keyboard and mouse):
+# m2-alpha's sources as the library an Android activity loads. Its own
+# workspace, so the desktop builds and CI never compile it; build it with
+# build-apk.ps1 (see README.md), which also prepares the patched winit below.
+
+[package]
+name = "m2-alpha-android"
+description = "Mercenaries 2 alpha for Android."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "../crates/m2-alpha/src/main.rs"
+crate-type = ["cdylib"]
+
+# m2-alpha's dependencies with its Android ones (keep in step with
+# crates/m2-alpha/Cargo.toml and the root workspace's versions).
+[dependencies]
+anyhow = "1"
+cpal = "0.18"
+egui = "0.36"
+egui-wgpu = { version = "0.36", default-features = false }
+egui-winit = { version = "0.36", default-features = false }
+jni = "0.21"
+libc = "0.2"
+m2-assets = { path = "../crates/m2-assets" }
+m2-engine = { path = "../crates/m2-engine" }
+m2-game = { path = "../crates/m2-game" }
+m2-math = { path = "../crates/m2-math" }
+m2-render = { path = "../crates/m2-render", features = ["wgpu"] }
+mlua = { version = "0.11", features = ["lua51", "vendored"] }
+ndk-context = "0.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+winit = { version = "0.30", features = ["serde", "android-native-activity"] }
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+
+# winit reports a mouse on Android as touches; the patch (applied by
+# build-apk.ps1 to a copy of winit 0.30.13) reports its cursor, buttons,
+# wheel and raw motion as on the desktop.
+[patch.crates-io]
+winit = { path = "target/winit" }
+
+[package.metadata.android]
+package = "com.bstoney.m2alpha"
+apk_name = "Mercenaries2Alpha"
+build_targets = ["aarch64-linux-android"]
+strip = "strip"
+
+[package.metadata.android.sdk]
+# Old enough for any Vulkan phone; new enough for pointer capture.
+min_sdk_version = 26
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Mercenaries 2 Alpha"
+
+[package.metadata.android.application.activity]
+orientation = "landscape"
+config_changes = "orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|smallestScreenSize"
+resizeable_activity = true
+
+# Reading the game from the Mercenaries2Alpha folder the player drags onto
+# the phone ("all files access" on Android 11 and later).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+max_sdk_version = 32
+
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.vulkan.level"
+required = true
+version = 1
