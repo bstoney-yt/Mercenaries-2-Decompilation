@@ -230,7 +230,8 @@ impl Hud {
 
     /// Runs the game's HUD `seconds` on `info`, waiting for each step (and
     /// up to `timeout` for its scripts to start): for screenshots, which
-    /// draw one frame. `keys` (Flash key codes) are pressed half way.
+    /// draw one frame. `keys` (Flash key codes) are pressed half way and
+    /// held to the end.
     pub fn settle(
         &mut self,
         info: &HudInfo,
@@ -282,9 +283,11 @@ impl Hud {
             if !game.ready() {
                 break;
             }
+            // Held from half way to the last step (the PDA's map moves
+            // while its keys are held).
             state.keys = match i.checked_sub(steps / 2) {
                 Some(0) => keys.iter().map(|&k| (k, true)).collect(),
-                Some(1) => keys.iter().map(|&k| (k, false)).collect(),
+                Some(_) if i + 1 == steps => keys.iter().map(|&k| (k, false)).collect(),
                 _ => Vec::new(),
             };
             game.update_and_wait(&self.ctx, state.clone(), Duration::from_secs(10));

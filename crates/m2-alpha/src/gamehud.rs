@@ -1299,6 +1299,81 @@ if type(pda) == "table" and type(pda.Map) == "table" then
 end
 "#;
 
+/// The PDA map's left stick (x right, y up, -1..=1), as the game hands
+/// the map widget its `ControllerInput` event (`MrxGuiPda._HandleInput`,
+/// script 97f9c4ee: in map mode it passes `LeftAnalogX`/`Y` to the map
+/// movie's `leftAnalog`, which moves the map under its cursor). Inferred
+/// from the alpha's renders: the movie moves the map's picture by the pair
+/// as given, so the view's way across is the stick's reversed. Answers
+/// whether the PDA's map took it.
+const PDA_STICK: &str = r#"
+local x, y = ...
+local module = rawget(_G, "MrxGuiPda")
+if type(module) ~= "table" or type(module._HandleInput) ~= "function" then
+    return false
+end
+-- The PDA's widget: the one whose CustomData holds the map's movie
+-- (`oMapFlash`), found from the globals once.
+local widget = rawget(_G, "__m2_pda_widget")
+if widget == nil then
+    local seen = {}
+    local function find(t, depth)
+        if depth > 6 or seen[t] then return nil end
+        seen[t] = true
+        local cd = rawget(t, "CustomData")
+        if type(cd) == "table" and rawget(cd, "oMapFlash") ~= nil then
+            return t
+        end
+        for _, v in pairs(t) do
+            if type(v) == "table" then
+                local w = find(v, depth + 1)
+                if w then return w end
+            end
+        end
+        return nil
+    end
+    widget = find(_G, 0)
+    if widget == nil then return false end
+    rawset(_G, "__m2_pda_widget", widget)
+end
+-- It opens on its map page; the page change that says so
+-- (`_HandlePageChangeEvent`) comes only when the page is changed.
+if widget.CustomData.bMapMode == nil then
+    widget.CustomData.bMapMode = true
+end
+-- The movie moves the map's picture by the pair (right, down): up the
+-- screen is north, and the view goes against x, so x is reversed.
+module._HandleInput(widget, { LeftAnalogX = -x, LeftAnalogY = y })
+return true
+"#;
+
+/// The keys that move the PDA's map, as Flash key codes, and the way
+/// each pushes the stick (x right, y up): W A S D and the arrows.
+/// Invented: the PC game's PDA moves its cursor with these (the owner's
+/// play; the PC footage shows the cursor moving, not the keys).
+const PDA_STICK_KEYS: [(i32, [f32; 2]); 8] = [
+    (87, [0.0, 1.0]),
+    (65, [-1.0, 0.0]),
+    (83, [0.0, -1.0]),
+    (68, [1.0, 0.0]),
+    (38, [0.0, 1.0]),
+    (37, [-1.0, 0.0]),
+    (40, [0.0, -1.0]),
+    (39, [1.0, 0.0]),
+];
+
+/// The stick the PDA's movement keys `held` (Flash key codes) push.
+fn pda_stick(held: &HashSet<i32>) -> [f32; 2] {
+    let mut stick = [0.0f32; 2];
+    for (code, [x, y]) in PDA_STICK_KEYS {
+        if held.contains(&code) {
+            stick[0] += x;
+            stick[1] += y;
+        }
+    }
+    stick.map(|v| v.clamp(-1.0, 1.0))
+}
+
 /// Puts the contract in the PDA ([`CONTRACT_IN_PDA`]) with `objectives`.
 fn contract_in_pda(lua: &Lua, objectives: &[(String, String)]) -> mlua::Result<()> {
     let list = lua.create_table()?;
@@ -1524,6 +1599,10 @@ struct Thread {
     pda_shown: bool,
     /// Keys for the movies' `Key` listeners ([`HudState::keys`]).
     keys: Vec<(i32, bool)>,
+    /// The PDA's movement keys held ([`PDA_STICK_KEYS`]), and the stick
+    /// they last pushed its map with.
+    pda_held: HashSet<i32>,
+    pda_stick: [f32; 2],
     /// HUD updates since the PDA's movie loaded (`None`: not yet), and
     /// since `TogglePDA` was last sent.
     pda_ready: Option<u32>,
@@ -1697,6 +1776,8 @@ impl Thread {
             reticle_logged: false,
             pda_shown: false,
             keys: Vec::new(),
+            pda_held: HashSet::new(),
+            pda_stick: [0.0; 2],
             pda_ready: None,
             since_toggle: u32::MAX,
             pda_scripted: None,
@@ -1835,6 +1916,31 @@ impl Thread {
         // `_HandleFanfareInput` passes the select button on), else the PDA.
         if self.pda_shown || self.fanfare_up() {
             self.keys.extend(state.keys.iter().copied());
+        }
+        // The PDA's map moves while its movement keys are held, as the
+        // pad's left stick moves it.
+        for &(code, down) in &state.keys {
+            if down && self.pda_shown {
+                self.pda_held.insert(code);
+            } else {
+                self.pda_held.remove(&code);
+            }
+        }
+        if !self.pda_shown {
+            self.pda_held.clear();
+        }
+        let stick = pda_stick(&self.pda_held);
+        if stick != [0.0; 2] || self.pda_stick != [0.0; 2] {
+            let took = self
+                .mission
+                .lua()
+                .load(PDA_STICK)
+                .set_name("=m2-hud pda stick")
+                .call::<bool>((stick[0], stick[1]));
+            if stick != self.pda_stick {
+                log.push(format!("pda: stick {stick:?} ({took:?})"));
+            }
+            self.pda_stick = stick;
         }
         self.play_flash(dt, &mut log);
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
