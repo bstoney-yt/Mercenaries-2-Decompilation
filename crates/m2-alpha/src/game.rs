@@ -2739,4 +2739,18 @@ mod tests {
         assert_eq!(none.len(), 1);
         assert_eq!(none[0].kind, 0);
     }
+
+    #[test]
+    fn a_blast_throws_light_props_not_heavy_ones() {
+        let prop = |heavy| m2_engine::durability::PropPhysics { mass: None, heavy };
+        let db = Templates {
+            prop_physics: HashMap::from([(1, prop(false)), (2, prop(true))]),
+            ..Templates::default()
+        };
+        // A café chair flies; a 20 t container stands.
+        assert!(blown_loose(&db, 1));
+        assert!(!blown_loose(&db, 2));
+        // One the data gives no damage table row: thrown, as before.
+        assert!(blown_loose(&db, 3));
+    }
 }
