@@ -9,9 +9,10 @@
 //! need for the first time decoded. Drawing lags play by a frame.
 //!
 //! The minimap is drawn here, as the engine draws its own: the island's
-//! sea round her (see [`MAP_TEXTURE`]), turned with the camera, on the
-//! radar's backdrop, with the island's roads over it ([`road_strokes`]),
-//! the zones its Flash movie would outline (see [`Zone`]), the mission's
+//! sea round her (see [`MAP_TEXTURE`]), turned with the camera that draws
+//! the frame ([`HudState::heading`]), on the radar's backdrop, with the
+//! island's roads over it ([`road_strokes`]), the zones its Flash movie
+//! would outline (see [`Zone`]), the mission's
 //! markers and her white square. Not drawn yet: the other Flash
 //! pieces (pop-ups, the PDA) and clock wipes. With no aim point
 //! the reticle's widgets are left out ([`reticle_widgets`], by the names
@@ -439,8 +440,15 @@ pub struct HudState {
     /// Its cannon's shells, when they run out: left, and how many it
     /// carries (the AMX-30's 40, counted down in the gun box).
     pub cannon: Option<(u32, u32)>,
-    /// Which way the camera looks, degrees, growing as it turns left
-    /// (`Player.GetCameraXZHeading`).
+    /// Which way the camera that draws the frame looks, degrees, growing
+    /// as it turns left (`Player.GetCameraXZHeading`): hers in play, on
+    /// foot or driving ([`crate::game::Game::view_heading`]). The radar's
+    /// north pointer sits this far clockwise round its rim, as the PC
+    /// footage's does (from the footage: north found in every eighth of
+    /// the rim over the first contracts). That it is the camera's heading
+    /// and not her facing is from the scripts: `MinimapDataUpdateHandler`
+    /// passes the heading it is given on as the rotation; which heading
+    /// the engine gives it was not read from the 360 code.
     pub heading: f32,
     /// Hurts since the last state: damage and the bearing it came from
     /// (see [`direction`]).
@@ -678,7 +686,7 @@ impl HudState {
                 })
                 .unwrap_or_default(),
             cannon: vehicle.and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
-            heading: game.camera.yaw.to_degrees(),
+            heading: game.view_heading().to_degrees(),
             target,
             position: at.map(|p| p.to_array()),
             facing: player.map_or(0.0, |p| p.facing.to_degrees()),
