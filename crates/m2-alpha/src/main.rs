@@ -57,6 +57,7 @@ mod moving;
 mod multiply;
 mod npc;
 mod pad;
+mod paths;
 mod player;
 mod props;
 mod route;
@@ -547,6 +548,12 @@ fn keep_crash_reports() {
 /// from harm.
 const HURT_AT: f32 = 8.0;
 
+/// With `--mission --hijack`, how long an action marker's vehicle is left
+/// before she hijacks it, seconds: the villa tank comes through the hall
+/// wall first (in the PC footage it bursts in 4 s before "Hijack tank" is
+/// added; inferred, not measured from the game).
+const HIJACK_WAIT: f32 = 8.0;
+
 fn main() -> anyhow::Result<()> {
     keep_crash_reports();
     let options = parse_args()?;
@@ -605,13 +612,9 @@ fn main() -> anyhow::Result<()> {
             turn: options.turn,
         })
     } else if install.is_some() {
-        // Free roam starts at the PMC's headquarters (found in the layers);
-        // a mission's scripts move her from the first town.
-        Mode::Island(
-            options
-                .spawn
-                .or(options.mission.then_some(scene::DEFAULT_SPAWN)),
-        )
+        // Free roam starts at the PMC's headquarters, a mission at the
+        // first contract's spawn point (both found in the layers).
+        Mode::Island(options.spawn)
     } else {
         Mode::Models(Showcase {
             models: vec![scene::DEFAULT_MODEL],
@@ -707,7 +710,12 @@ fn build_scene(
                     sea_level,
                     ..WorldSettings::default()
                 };
-                scene.open_world(backend, install, settings, *spawn)?;
+                let start = if mission {
+                    scene::MISSION_START
+                } else {
+                    scene::FREE_ROAM_START
+                };
+                scene.open_world(backend, install, settings, *spawn, start)?;
             }
             Mode::Models(show) => {
                 scene.open(install)?;
@@ -2429,6 +2437,19 @@ fn mission_for_screenshot(
     // how many others' within earshot.
     let mut heard: std::collections::BTreeMap<(String, String), (u32, u32)> = Default::default();
     let mut strike_seen: Option<u32> = None;
+    // With --hijack, the hijacks run as in the game, and she hijacks the
+    // vehicle an objective's "action" marker is on (PmcCon001's villa
+    // tank): once the marker has been up HIJACK_WAIT (the tank comes
+    // through the wall first), she is put beside it ([`hijack::beside`]),
+    // presses the use key a second later and answers its prompts at once
+    // ([`hijack::Autopad`]). For testing.
+    let mut hijacks = options
+        .hijack
+        .then(|| hijack::Hijacks::start(install, options.hijack_crew.clone()));
+    let mut hijack_input = Input::default();
+    let mut hijack_pad = hijack::Autopad::default();
+    let (mut hijack_tries, mut hijack_use, mut hijack_t) = (0, None, 0.0);
+    let mut action_since: Option<u32> = None;
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -2451,6 +2472,52 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        if let Some(h) = &mut hijacks {
+            if hijack_use == Some(i) {
+                hijack_input.button(Action::Use, true);
+            }
+            h.tick(game, &mut hijack_input, tick);
+            hijack_input.button(Action::Use, false);
+            h.place(game);
+            h.seat(game, tick);
+            hijack_t += tick;
+            let on_foot = game
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_none());
+            let action = link
+                .marks()
+                .iter()
+                .filter(|m| m.kind == "action" && m.alive)
+                .find_map(|m| {
+                    let v = game
+                        .scene
+                        .vehicles
+                        .iter()
+                        .find(|v| v.guid == Some(m.target))?;
+                    Some(v.spec.label.to_ascii_lowercase())
+                });
+            action_since = action.as_ref().and(action_since.or(Some(i)));
+            if h.running() {
+                let prompts = h.view().map(|v| v.prompts).unwrap_or_default();
+                hijack_pad.answer(&prompts, &mut hijack_input, hijack_t);
+            } else if !h.loading()
+                && on_foot
+                && hijack_tries < 5
+                && action_since.is_some_and(|s| i >= s + (HIJACK_WAIT / tick).round() as u32)
+                && hijack_use.is_none_or(|u| i > u + (10.0 / tick) as u32)
+                && let Some(label) = action
+                && hijack::beside(game, h, Some(&label)).is_some()
+            {
+                hijack_tries += 1;
+                hijack_use = Some(i + (1.0 / tick).round() as u32);
+                eprintln!(
+                    "hijack: try {hijack_tries} at the {label} the action marker is on, {:.1} s in",
+                    i as f32 * tick
+                );
+            }
+        }
         if options.movies {
             movies_offscreen(&mut link, install, out);
         }
