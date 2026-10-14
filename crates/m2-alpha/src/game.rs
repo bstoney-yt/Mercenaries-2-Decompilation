@@ -1604,6 +1604,13 @@ impl Game {
         self.scene.player.as_ref().filter(|_| self.on_foot)
     }
 
+    /// The heading of the camera the frame is seen from ([`Self::view`]),
+    /// radians as [`FlyCamera::yaw`]: the HUD's compass and minimap turn
+    /// with it.
+    pub fn view_heading(&self) -> f32 {
+        view_heading(self.walking(), &self.camera)
+    }
+
     /// Moves the light on to the atmosphere region the player is in.
     fn update_sky(&mut self, dt: f32) {
         let focus = self.focus();
@@ -2695,6 +2702,13 @@ pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player)
     player.chase_target = None;
 }
 
+/// Her camera's heading while she is played, on foot or driving (its yaw
+/// turns with the mouse; the free camera's stays where it was left), else
+/// the free camera's.
+fn view_heading(player: Option<&Player>, fly: &FlyCamera) -> f32 {
+    player.map_or(fly.yaw, |p| p.yaw)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -2793,6 +2807,27 @@ mod tests {
         let none = rocket_blasts(&Templates::default(), at);
         assert_eq!(none.len(), 1);
         assert_eq!(none[0].kind, 0);
+    }
+
+    #[test]
+    fn the_compass_reads_the_camera_the_frame_is_seen_from() {
+        // The free camera left looking north; she looks east, then
+        // south-west, as the mouse turns her camera.
+        let fly = FlyCamera {
+            position: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        for yaw in [std::f32::consts::FRAC_PI_2, -2.4] {
+            let p = Player::new(0.0, 0.0, yaw, None);
+            let heading = view_heading(Some(&p), &fly);
+            // The heading her view looks along (right-handed: down -z).
+            let ahead = -p.view(60.0, 16.0 / 9.0).view.inverse().z_axis.truncate();
+            let seen = ahead.x.atan2(ahead.z);
+            assert!((heading - seen).abs() < 1e-4, "{heading} {seen}");
+        }
+        // Flying, the free camera's.
+        assert_eq!(view_heading(None, &fly), 0.0);
     }
 
     #[test]
