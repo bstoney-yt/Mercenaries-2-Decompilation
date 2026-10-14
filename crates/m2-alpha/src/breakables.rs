@@ -628,7 +628,13 @@ fn parts_left(game: &crate::game::Game, key: StaticKey, template: u32) -> Option
         .filter(|&n| n > 1)?;
     let down = match key {
         StaticKey::Object(i) => {
-            game.destruction.destroyed.contains(&i) || world.destroyed.contains(&i)
+            let destroyed = game.destruction.destroyed.contains(&i) || world.destroyed.contains(&i);
+            // Put up as a prop to break a part at a time.
+            let prop = crate::destruct::key(i);
+            if !destroyed && game.scene.props.get(prop).is_some() {
+                return Some((game.scene.props.parts_standing(prop, all), all));
+            }
+            destroyed
         }
         StaticKey::Entity(e) => return Some((game.scene.props.parts_standing(e, all), all)),
         _ => false,
@@ -663,8 +669,13 @@ fn reaction(game: &crate::game::Game, key: StaticKey, template: u32) -> Reaction
     let (knocked, down) = match key {
         StaticKey::Object(i) => (
             world.knocked_loose(i),
-            (game.destruction.destroyed.contains(&i) || world.destroyed.contains(&i))
-                .then(|| world.object_model(i).is_some_and(|m| m.has_wreck())),
+            if props.parts_broken(crate::destruct::key(i)) {
+                // Some of its parts broken, as a prop put up for it.
+                Some(true)
+            } else {
+                (game.destruction.destroyed.contains(&i) || world.destroyed.contains(&i))
+                    .then(|| world.object_model(i).is_some_and(|m| m.has_wreck()))
+            },
         ),
         StaticKey::Entity(e) => (
             props.knocked_loose(e),

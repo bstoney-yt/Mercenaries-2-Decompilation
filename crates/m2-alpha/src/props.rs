@@ -284,9 +284,9 @@ impl Props {
             && let Some(p) = self.shown.get(&entity)
         {
             physics.remove_static(StaticKey::Entity(entity));
-            if stands(entity)
-                && let Some(shape) = parts.collision(&wrecked)
-            {
+            // The rest stands in the way, an island object put up to
+            // break a part at a time too.
+            if let Some(shape) = parts.collision(&wrecked) {
                 physics.add_static(StaticKey::Entity(entity), &shape, p.position, p.rotation);
             }
         }
@@ -507,7 +507,7 @@ impl Props {
                 (d <= reach).then_some(e)
             })
             .filter(|e| {
-                !crate::destruct::adopted(*e)
+                (!crate::destruct::adopted(*e) || self.parts_down.contains_key(e))
                     && !self.sturdy.contains(e)
                     && !self.knocked.contains_key(e)
                     && !self.broken.contains_key(e)
