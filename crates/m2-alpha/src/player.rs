@@ -188,6 +188,7 @@ impl Intent {
                     None
                 },
                 support: input.take_pressed(Action::Support),
+                support_down: input.take_pressed(Action::SupportDown),
                 pda: input.take_pressed(Action::Pda),
             },
         }

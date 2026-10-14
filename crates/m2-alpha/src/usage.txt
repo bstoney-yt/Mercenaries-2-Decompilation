@@ -9,7 +9,7 @@ m2-alpha [options]
                          Movies need ffmpeg (M2_FFMPEG, beside m2-alpha, or
                          on the PATH); Enter/Space/Escape skips one
   --no-boot              with --alpha: no boot movies or front end
-  --dev                  with --alpha: the developer's keys too (V free
+  --dev                  with --alpha: the developer's keys too (F4 free
                          camera, F5/F9 quick save and load, F3 culling, N
                          gait), which the whole game's launch leaves out;
                          the other launches (--mission, --spawn, --model,
@@ -213,23 +213,31 @@ m2-alpha [options]
                          her view two seconds after each bomb (-bomb1.ppm)
   --write-config         print the settings file and exit
 
-On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
+The keys and mouse are the PC game's defaults (its Controls page; each
+can be rebound in the settings' [keys], with "MouseLeft", "MouseRight",
+"MouseMiddle", "WheelUp" and "WheelDown" for the mouse):
+On foot: WASD runs, Left Shift sprints, hold Left Ctrl to walk, Space
+jumps, hold C to crouch and aim (B too, for now), I/J/K/L look.
 E gets in or out of a vehicle (a row is parked ahead of where you start).
 Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
-Fighting (mouse captured): left button or F fires, right button aims,
-1 rifle, 2 rocket launcher, G throws a grenade, B or the middle button
-bashes (a supply crate breaks open).
-Support: T opens the support menu, and E takes up the item's designator
-and looks through the satellite: WASD or the mouse moves its view, fire
-or E confirms, and fire or E as the timing wheel's needle passes through
-each grey wedge sends the bomb (a press outside them undoes the presses
-made; moving the view away puts the wheel away). T, 1 or 2 calls it off;
-so does being hurt. P opens and shuts the PDA (the first contract's
-scripts give the bomb once she has looked at it).
+Fighting (mouse captured): left button fires, Tab or the wheel switches
+weapon, R reloads, right button or G throws a grenade, V picks the next
+explosive, F or the middle button bashes (a supply crate breaks open),
+X sets off C4, Y moves to the next seat. 4 or Right (the view switch) does
+nothing yet.
+Support: 1 or Up (and 2 or Down) opens the support menu and moves its
+line, and E takes up the item's designator and looks through the
+satellite: WASD moves its view, fire or E confirms, and fire or E as the
+timing wheel's needle passes through each grey wedge sends the bomb (a
+press outside them undoes the presses made; moving the view away puts
+the wheel away). Tab or the wheel puts the menu away; at the view, 1 or 2
+calls it off; so does being hurt. F1 opens and shuts the PDA, whose map
+WASD or the arrows move (the first contract's scripts give the bomb once
+she has looked at it).
 Shop and money: H opens the shop (a tab for each faction's; what each
 sells unlocks with contracts, or all at once with the settings'
 [enhanced.shop] unlock_all = true). What she buys is in the support
-menu: W/S or the arrows pick the item, E calls it in. G throws its smoke,
+menu: 1/2, the arrows or W/S pick the item, E calls it in. G throws its smoke,
 flare or beacon; a laser designator is held on the spot with fire; a
 satellite one is moved like the bomb's view and confirmed with fire.
 Cash and fuel lying about are taken by walking over them. The game saves
@@ -237,7 +245,7 @@ itself after a contract (m2-alpha-autosave.toml, with her cash, stock and
 the scripts' own data); putting the scripts back from it on loading is
 not done yet.
 The contract done, Enter closes its fanfare and the flow goes on.
-M music on/off, Tab or right mouse captures the mouse, F11 fullscreen,
+M music on/off, a click captures the mouse (F2 lets it go), F11 fullscreen,
 Escape opens the menu (settings, save and load, quit).
 An Xbox pad (One, Series or 360) plays as the game's own layout has it:
 left stick move (L3 sprint), right stick look, A jump, B melee, X reload,
@@ -246,7 +254,7 @@ d-pad up/down support, left next explosive, right detonate, Back PDA,
 Start menu. Driving: A forward, X reverse, LT handbrake, Y out. In the
 menus A is Enter, B back, the d-pad moves. While the pad is used, the
 HUD's prompts show its buttons.
-The developer's keys (--dev, or any launch but the whole game's): V
+The developer's keys (--dev, or any launch but the whole game's): F4
 switches to the free camera (WASD moves, Space/C up/down, Shift faster;
 not while the scripts have her controls off) and back to her where she
 was left, N next gait (--model), F3 culling, F5 quick save, F9 quick load
