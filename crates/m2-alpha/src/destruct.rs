@@ -71,6 +71,18 @@ impl Blast {
     }
 }
 
+/// How much damage a vehicle of `mass` (kg) running into something at
+/// `speed` (m/s) does to it, before its `ModifierKey` row scales it by the
+/// vehicle's `DamageKey` (`Car`, the AMX30's as the jeeps'): a tonne at a
+/// metre a second does 1, so a 1,000 kg jeep at 10 m/s does 10 and a
+/// 32,000 kg tank at 8 m/s 256. Invented: the data gives the kind of a
+/// ram's damage (the vehicles' `DamageKey`) and what each thing takes of
+/// it (the damage table's `Car` column: a shack twice it, vegetation ten
+/// times, a building or a tree's canopy none), not its size.
+pub fn ram(mass: f32, speed: f32) -> f32 {
+    mass * speed / 1000.0
+}
+
 /// A vehicle as it runs into things: where it is (its model's place),
 /// its model's box, how fast it was going before the step just taken
 /// stopped it against whatever it hit, and its mass (kg).

@@ -866,6 +866,8 @@ pub struct WorldIndex {
     /// Each tree species' far stand-in, by species (the tree table's
     /// order; `None` for a species not placed).
     pub far_trees: Vec<Option<FarTree>>,
+    /// Each tree species' template, by species (the tree table's order).
+    pub tree_templates: Vec<u32>,
     /// The outdoor light and air (ambient cube, sunlight, haze).
     pub atmosphere: Option<Atmosphere>,
     /// The regions whose light differs from it (`vz_atmosphere_regions`).
@@ -992,6 +994,19 @@ fn rotation(q: [f32; 4]) -> Quat {
 }
 
 impl WorldIndex {
+    /// The template placed object `i` is an instance of: its entity's, or
+    /// for a tree its species' ([`tree_templates`](Self::tree_templates));
+    /// 0 for none.
+    pub fn object_template(&self, i: usize) -> u32 {
+        let Some(o) = self.objects.get(i) else {
+            return 0;
+        };
+        match tree_species(o.entity) {
+            Some(s) if o.template == 0 => self.tree_templates.get(s).copied().unwrap_or(0),
+            _ => o.template,
+        }
+    }
+
     /// Reads every entity layer in the archive.
     pub fn build<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<Self, AssetError> {
         let index = source.archive().index();
@@ -1166,6 +1181,7 @@ impl WorldIndex {
             .copied();
         let mut no_model: Vec<(u32, usize)> = Vec::new();
         let mut cleared = 0usize;
+        self.tree_templates = table.species.iter().map(|s| s.template).collect();
         for (species, s) in table.species.iter().enumerate() {
             let model = templates.by_id(s.template).and_then(|(_, t)| t.model);
             let Some(model) = model.filter(|_| species < 1 << 12 && s.trees.len() <= 1 << 16)

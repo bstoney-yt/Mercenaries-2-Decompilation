@@ -73,6 +73,11 @@
 //!                           layers whose name holds a word (default
 //!                           vzacon001,pmccon001): their box, 150 m wider,
 //!                           over every layer; counts, then each one
+//! trees[:<x0>,<z0>,<x1>,<z1>] every species of the tree table: its
+//!                           template and trees (all, and within the box,
+//!                           default VzaCon001's breakables box), with the
+//!                           components that say how it reacts when hit
+//!                           (as `breakables`)
 //! breakables[:<word>,..]    every placed object in the areas of the state
 //!                           layers whose name holds a word (default
 //!                           vzacon001,pmccon001; their box, 150 m wider,
@@ -1027,6 +1032,7 @@ fn main() -> Result<(), Error> {
             }
             "pickups" => pickups(&mut source, arg),
             "breakables" => breakables(&mut source, &names, arg),
+            "trees" => trees(&mut source, &names, arg),
             "stam" => stam(&mut source, &names, arg),
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
@@ -5780,6 +5786,101 @@ fn breakables<R: Read + Seek>(
             let k = if k.is_empty() { "(none)" } else { k.as_str() };
             println!("tally\t{w}\t{n}\t{k}");
         }
+    }
+    Ok(())
+}
+
+/// The tree table's species, with what their templates say of how their
+/// trees react when hit (round 7: the tank's crushing).
+fn trees<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let b: Vec<f32> = arg.split(',').filter_map(|v| v.parse().ok()).collect();
+    let area = match b[..] {
+        [x0, z0, x1, z1] => [x0, z0, x1, z1],
+        _ => [-2133.0, 803.0, -618.0, 3371.0],
+    };
+    let index = source.archive().index();
+    let find = |kind: u32| {
+        index
+            .assets()
+            .iter()
+            .find(|a| index.type_hash(a) == kind)
+            .map(|a| a.name_hash)
+    };
+    let tree_type = m2_assets::tree::TREE_TYPE;
+    let (Some(db_hash), Some(tree_hash)) = (find(TEMPLATE_DB_TYPE), find(tree_type)) else {
+        println!("no template database or tree table");
+        return Ok(());
+    };
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let comps: Vec<_> = REACTING
+        .iter()
+        .filter_map(|n| db.components.iter().find(|c| c.name == *n))
+        .map(|c| (c, by_entity(c)))
+        .collect();
+    let table = match m2_assets::TreeTable::parse(&source.asset(tree_hash, tree_type)?) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("tree table: {e}");
+            return Ok(());
+        }
+    };
+    let name_field = m2_assets::name_hash("Name");
+    // Each species' model (its template's `ModelName`).
+    let model_of = db
+        .components
+        .iter()
+        .find(|c| c.name == "ModelName")
+        .and_then(|c| {
+            let f = c
+                .fields
+                .iter()
+                .find(|f| f.name_hash == m2_assets::name_hash("model"))?;
+            Some((by_entity(c), usize::from(f.offset)))
+        });
+    for (k, s) in table.species.iter().enumerate() {
+        let model = model_of
+            .as_ref()
+            .and_then(|(recs, at)| {
+                let r = recs.get(&s.template)?.first()?;
+                Some(u32::from_le_bytes(r.get(*at..*at + 4)?.try_into().ok()?))
+            })
+            .unwrap_or(0);
+        let inside = s
+            .trees
+            .iter()
+            .filter(|t| {
+                let [x, _, z] = t.position;
+                x >= area[0] && x <= area[2] && z >= area[1] && z <= area[3]
+            })
+            .count();
+        let mut fields = Vec::new();
+        for (c, recs) in &comps {
+            let Some(r) = recs.get(&s.template).and_then(|v| v.first()) else {
+                continue;
+            };
+            let vals: Vec<String> = c
+                .fields
+                .iter()
+                .filter(|f| f.name_hash != name_field)
+                .map(|f| field_value(names, f, r))
+                .collect();
+            fields.push(format!("{}({})", c.name, vals.join(" ")));
+        }
+        println!(
+            "species\t{k}\t{:08x}\t{}\tmodel {model:08x} {}\t{} trees\t{inside} in box\tscale {:.2?}\t{}",
+            s.template,
+            tnames.get(&s.template).copied().unwrap_or("?"),
+            names.show(model),
+            s.trees.len(),
+            s.scale,
+            fields.join(" ")
+        );
     }
     Ok(())
 }
