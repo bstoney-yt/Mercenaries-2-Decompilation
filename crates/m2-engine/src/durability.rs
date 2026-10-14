@@ -226,11 +226,56 @@ pub struct Explosion {
     pub damage: f32,
     /// At its edge (`minDamage`).
     pub least: f32,
+    /// Its template's `DamageKey` (name hash; 0 for none): the damage
+    /// table's column for what each thing it reaches takes of it (the
+    /// RPG's blast `Explosion`, its frag `Bullet`, the air strike's bomb
+    /// `ExplosionLarge`).
+    pub kind: u32,
+}
+
+/// Each template's `DamageKey` (name hash), by id, where it isn't 0.
+pub fn damage_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = Table::new(db, "DamageKey");
+    let field = name_hash("DamageKey");
+    t.templates()
+        .filter_map(|id| {
+            let k = t.word(t.of_template(id).first()?, field)?;
+            (k != 0).then_some((id, k))
+        })
+        .collect()
+}
+
+/// What a projectile does where it lands (`ProjectilePhysics`'s `Damage`)
+/// and of which kind (its `DamageKey`): the `RPG Rocket`'s 100 `Rocket`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Projectile {
+    pub damage: f32,
+    pub kind: u32,
+}
+
+/// Each template's projectile, by id: those with `ProjectilePhysics`.
+pub fn projectiles(db: &Layer<'_>) -> HashMap<u32, Projectile> {
+    let t = Table::new(db, "ProjectilePhysics");
+    let damage = name_hash("Damage");
+    let keys = damage_keys(db);
+    t.templates()
+        .filter_map(|id| {
+            let r = t.of_template(id).first()?;
+            Some((
+                id,
+                Projectile {
+                    damage: t.float(r, damage).unwrap_or(0.0),
+                    kind: keys.get(&id).copied().unwrap_or(0),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Each template's blast, by id: those with `Explosive`.
 pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
     let t = Table::new(db, "Explosive");
+    let keys = damage_keys(db);
     let (radius, damage, least) = (
         name_hash("radius"),
         name_hash("Damage"),
@@ -245,6 +290,7 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
                     radius: t.float(r, radius).unwrap_or(0.0),
                     damage: t.float(r, damage).unwrap_or(0.0),
                     least: t.float(r, least).unwrap_or(0.0),
+                    kind: keys.get(&id).copied().unwrap_or(0),
                 },
             ))
         })

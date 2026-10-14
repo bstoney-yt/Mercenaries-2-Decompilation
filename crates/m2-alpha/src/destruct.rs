@@ -56,6 +56,8 @@ pub struct Blast {
     pub radius: f32,
     pub damage: f32,
     pub least: f32,
+    /// Its `DamageKey` (name hash; 0 for none, taken in full).
+    pub kind: u32,
 }
 
 impl Blast {

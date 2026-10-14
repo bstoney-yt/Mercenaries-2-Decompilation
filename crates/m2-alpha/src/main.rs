@@ -4490,6 +4490,7 @@ fn demolish_for_screenshot(
                 radius: e.map_or(5.0, |e| e.radius),
                 damage: e.map_or(200.0, |e| e.damage),
                 least: e.map_or(0.0, |e| e.least),
+                kind: e.map_or(0, |e| e.kind),
             };
             game.destruction
                 .blast(world, &mut game.scene.props, install, blast);

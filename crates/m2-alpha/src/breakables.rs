@@ -78,6 +78,8 @@ pub struct Makeup {
     /// takes: whether a car running into it wears it down at all (the
     /// crash's own damage the data doesn't give).
     pub crash_damage: f32,
+    /// What the check's blast does to it, all told ([`Makeup::blasted`]).
+    pub blasted: f32,
 }
 
 impl Makeup {
@@ -96,7 +98,29 @@ impl Makeup {
             bullet: scale("Bullet"),
             explosion: scale("Explosion"),
             crash_damage: scale("Car"),
+            blasted: 0.0,
         }
+    }
+
+    /// What blasts doing `damage` of kind `kind` each (a `DamageKey`'s
+    /// name hash; 0 taken in full) do to template `t`'s objects, all
+    /// told: each as much as its `ModifierKey` row of the damage table
+    /// takes of that kind (none without a row).
+    pub fn blasted(templates: &Templates, t: u32, blasts: &[(f32, u32)]) -> f32 {
+        let row = templates.modifiers.get(&t).copied();
+        blasts
+            .iter()
+            .map(|&(damage, kind)| {
+                let scale = match kind {
+                    0 => 1.0,
+                    _ => row
+                        .zip(templates.damage.as_ref())
+                        .and_then(|(r, d)| d.scale(r, kind))
+                        .unwrap_or(0.0),
+                };
+                damage * scale
+            })
+            .sum()
     }
 
     /// Whether it is a prop the check tries: a loose physics prop, or one
@@ -109,18 +133,19 @@ impl Makeup {
 
 /// The hits the check tries, as the game's own would land.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Hits {
+pub struct Hits<'a> {
     /// The vehicle's mass (kg) and speed (m/s).
     pub vehicle: (f32, f32),
     /// Rounds fired, and each one's `Damage`.
     pub rounds: (u32, f32),
-    /// The blast's damage where it reaches the prop.
-    pub blast: f32,
+    /// The blasts' damage where they reach the prop, and their kinds (an
+    /// RPG's explosion, frag and rocket: [`crate::game::rocket_blasts`]).
+    pub blast: &'a [(f32, u32)],
 }
 
 /// What the data says `m` should do when hit by `hit` of `hits`: every
 /// reaction taken as right.
-pub fn expected(m: &Makeup, hit: HitKind, hits: &Hits) -> &'static [Reaction] {
+pub fn expected(m: &Makeup, hit: HitKind, hits: &Hits<'_>) -> &'static [Reaction] {
     use Reaction::{Block, Break, Move};
     let heavy = |vehicle: f32| {
         m.physics
@@ -152,7 +177,7 @@ pub fn expected(m: &Makeup, hit: HitKind, hits: &Hits) -> &'static [Reaction] {
             }
         }
         HitKind::Blast => match m.health {
-            Some(h) if m.explosion > 0.0 && hits.blast * m.explosion >= h => &[Break],
+            Some(h) if m.blasted >= h => &[Break],
             _ if m.physics.is_some() && !heavy(f32::MAX) => &[Move, Break],
             _ if m.physics.is_some() => &[Block, Move],
             _ => &[Block],
@@ -253,6 +278,16 @@ pub fn check(
         return 0;
     };
     let hp = game.combat.hp;
+    // On foot, wherever she is put (a driver stays with her vehicle, and
+    // the world streams in round the vehicle, not her).
+    if let Some(pl) = game.scene.player.as_mut()
+        && pl.driving.is_some()
+    {
+        pl.driving = None;
+        pl.chase_target = None;
+        eprintln!("props-check: she gets out of her vehicle for the check");
+    }
+    game.on_foot = true;
     let Some(world) = game.scene.world.as_ref() else {
         return 0;
     };
@@ -302,17 +337,15 @@ pub fn check(
         .and_then(|t| t.mass)
         .unwrap_or(1000.0);
     let rifle = &game.combat.rifle;
-    let (radius, damage, least) = crate::game::blast_strength(templates);
-    let blast = crate::destruct::Blast {
-        at: Vec3::ZERO,
-        radius,
-        damage,
-        least,
-    };
+    // An RPG's explosion, frag and rocket, where they reach the prop.
+    let blasts: Vec<(f32, u32)> = crate::game::rocket_blasts(templates, Vec3::ZERO)
+        .iter()
+        .map(|b| (b.at_distance(BLAST_OFF), b.kind))
+        .collect();
     let hits = Hits {
         vehicle: (mass, SPEED),
         rounds: (rifle.clip.max(1), rifle.damage),
-        blast: blast.at_distance(BLAST_OFF),
+        blast: &blasts,
     };
     eprintln!(
         "props-check: {hit:?} over {} props in {area:?} (else within {CHECK_NEAR} m of {start:.0}); {hits:?}",
@@ -368,9 +401,16 @@ pub fn check(
         }
         let Some((place, bounds)) = placed_box(game, item.key) else {
             unloaded += 1;
+            let her = game.scene.player.as_ref();
             eprintln!(
-                "props-check: {hit:?} {:?} {:08x} at {:.0}: its model is not in",
-                item.key, item.template, item.position
+                "props-check: {hit:?} {:?} {:08x} at {:.0}: its model is not in; she is at {:?} \
+                 (landed {:?}), the world's focus {:.0}",
+                item.key,
+                item.template,
+                item.position,
+                her.map(|p| p.character.position),
+                her.map(|p| p.landed),
+                game.focus()
             );
             continue;
         };
@@ -382,7 +422,10 @@ pub fn check(
         let forward = (centre - start).with_y(0.0).normalize_or(Vec3::Z);
         let world = game.scene.world.as_ref().expect("in play");
         let templates = &world.index.template_db;
-        let makeup = Makeup::of(templates, item.template);
+        let makeup = Makeup {
+            blasted: Makeup::blasted(templates, item.template, hits.blast),
+            ..Makeup::of(templates, item.template)
+        };
         let name = templates
             .names
             .get(&item.template)
@@ -401,18 +444,29 @@ pub fn check(
                     game.crash_with(&crasher);
                 }
                 HitKind::Gun => {
-                    // The first way in that its rounds reach it.
+                    // The first way in that its rounds reach it: from each
+                    // side and from above, at its middle and at a third
+                    // of its height above and below that (a low table's
+                    // top, a pole).
+                    let tall = (place.transform_point3(bounds.1)
+                        - place.transform_point3(bounds.0))
+                    .y
+                    .abs();
                     let ways = [
                         forward,
                         -forward,
                         forward.cross(Vec3::Y),
                         Vec3::Y.cross(forward),
+                        Vec3::NEG_Y,
                     ];
-                    let reached = ways.iter().find_map(|&w| {
-                        let from = centre - w * SHOT_FROM;
-                        let (_, _, key) =
-                            world.physics.cast_ray_keyed(from, w, SHOT_FROM + half)?;
-                        (key == Some(item.key)).then_some(from + w * SHOT_FROM)
+                    let aims = [0.0, tall / 3.0, -tall / 3.0].map(|y| centre + Vec3::Y * y);
+                    let reached = aims.iter().find_map(|&aim| {
+                        ways.iter().find_map(|&w| {
+                            let from = aim - w * SHOT_FROM;
+                            let (t, _, key) =
+                                world.physics.cast_ray_keyed(from, w, SHOT_FROM + half)?;
+                            (key == Some(item.key)).then_some(from + w * t)
+                        })
                     });
                     match reached {
                         Some(at) => {
@@ -520,5 +574,121 @@ fn reaction(game: &crate::game::Game, key: StaticKey) -> Reaction {
         (None, Some(false)) => Reaction::Vanish,
         (None, None) if world.physics.has_static(key) => Reaction::Block,
         (None, None) => Reaction::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hits() -> Hits<'static> {
+        Hits {
+            vehicle: (1000.0, 10.0),
+            rounds: (30, 6.0),
+            blast: &[(160.0, 0)],
+        }
+    }
+
+    #[test]
+    fn a_fragile_chair_breaks_to_a_clip_and_flies_from_a_blast() {
+        // `_global_chaircafe`: PropFragile, Health 100, flattened by
+        // vehicles.
+        let chair = Makeup {
+            physics: Some(PropPhysics {
+                mass: None,
+                heavy: false,
+            }),
+            crash: Some(Crash {
+                how: CrashHow::Flattened,
+                takes: 0.0,
+            }),
+            health: Some(100.0),
+            bullet: 1.0,
+            explosion: 0.5,
+            crash_damage: 2.0,
+            // The RPG's explosion alone at its box: 160, half of it.
+            blasted: 80.0,
+        };
+        assert!(chair.is_prop());
+        let h = hits();
+        assert_eq!(expected(&chair, HitKind::Gun, &h), &[Reaction::Break]);
+        assert!(expected(&chair, HitKind::Vehicle, &h).contains(&Reaction::Break));
+        // 160 at its box, half of it: 80 of 100. Thrown, not broken.
+        assert!(expected(&chair, HitKind::Blast, &h).contains(&Reaction::Move));
+        assert!(!expected(&chair, HitKind::Blast, &h).contains(&Reaction::Block));
+        // With its frag too (a Bullet, all of it): broken.
+        let fragged = Makeup {
+            blasted: 80.0 + 260.0,
+            ..chair
+        };
+        assert_eq!(expected(&fragged, HitKind::Blast, &h), &[Reaction::Break]);
+        // A wall (Building: no Explosion, no Bullet) stands.
+        let wall = Makeup {
+            health: Some(100.0),
+            ..Makeup::default()
+        };
+        assert_eq!(expected(&wall, HitKind::Blast, &h), &[Reaction::Block]);
+    }
+
+    #[test]
+    fn a_box_moves_and_a_container_holds() {
+        // `_global_boxa`: Prop (takes nothing), 40 kg.
+        let boxa = Makeup {
+            physics: Some(PropPhysics {
+                mass: Some(40.0),
+                heavy: false,
+            }),
+            ..Makeup::default()
+        };
+        let h = hits();
+        assert_eq!(expected(&boxa, HitKind::Vehicle, &h), &[Reaction::Move]);
+        assert_eq!(
+            expected(&boxa, HitKind::Gun, &h),
+            &[Reaction::Block, Reaction::Move]
+        );
+        // `_port_containera`: 20,000 kg, heavy.
+        let container = Makeup {
+            physics: Some(PropPhysics {
+                mass: Some(20_000.0),
+                heavy: true,
+            }),
+            health: Some(100.0),
+            ..Makeup::default()
+        };
+        assert!(expected(&container, HitKind::Vehicle, &h).contains(&Reaction::Block));
+        assert!(!expected(&container, HitKind::Vehicle, &h).contains(&Reaction::None));
+    }
+
+    #[test]
+    fn a_fence_breaks_under_a_heavy_enough_vehicle_only() {
+        let fence = Makeup {
+            crash: Some(Crash {
+                how: CrashHow::Breaks,
+                takes: 950.0,
+            }),
+            ..Makeup::default()
+        };
+        assert!(fence.is_prop());
+        assert_eq!(
+            expected(&fence, HitKind::Vehicle, &hits()),
+            &[Reaction::Break]
+        );
+        let light = Hits {
+            vehicle: (900.0, 10.0),
+            ..hits()
+        };
+        assert_eq!(
+            expected(&fence, HitKind::Vehicle, &light),
+            &[Reaction::Block]
+        );
+        // A bush only flattens: not a prop here.
+        let bush = Makeup {
+            crash: Some(Crash {
+                how: CrashHow::Flattened,
+                takes: 0.0,
+            }),
+            ..Makeup::default()
+        };
+        assert!(!bush.is_prop());
     }
 }

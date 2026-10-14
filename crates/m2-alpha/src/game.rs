@@ -1104,6 +1104,7 @@ impl Game {
                                 radius: e.map_or(radius, |e| e.radius),
                                 damage: e.map_or(damage, |e| e.damage),
                                 least: e.map_or(0.0, |e| e.least),
+                                kind: e.map_or(0, |e| e.kind),
                             };
                             self.destruction
                                 .blast(world, &mut scene.props, install, blast);
@@ -2020,6 +2021,7 @@ fn hit_world(
             radius,
             damage,
             least,
+            kind: 0,
         };
         destruction.blast_props(world, props, install, blast);
     }
@@ -2031,6 +2033,7 @@ fn hit_world(
                 radius,
                 damage,
                 least,
+                kind: 0,
             };
             destruction.blast(world, props, install, blast);
         }
@@ -2268,6 +2271,57 @@ pub(crate) fn blast_strength(db: &Templates) -> (f32, f32, f32) {
     explosion(db, &ROCKET_BLASTS).map_or((combat::REACH, 100.0, 0.0), |e| {
         (e.radius, e.damage, e.least)
     })
+}
+
+/// The RPG's frag and its rocket (`Explosion (Handheld RPG)` links
+/// `Explosion (Handheld RPG Frag)` as its `Frag`; the `RPG Rocket` is
+/// the projectile, PC data).
+const ROCKET_FRAG: &str = "Explosion (Handheld RPG Frag)";
+const ROCKET: &str = "RPG Rocket";
+/// How near a rocket's heart what it lands on is, metres (invented): its
+/// own `Damage` is done to what it strikes, not around.
+const ROCKET_HIT: f32 = 0.5;
+
+/// What an ordinary blast (a rocket's: combat doesn't yet tell them
+/// apart) does to what stands around it, as the data has an RPG's: its
+/// explosion (`Explosion`, 200 to nothing over 5 m), its frag (`Bullet`,
+/// 300 to 40 over 15 m) and the rocket itself on what it lands on
+/// (`Rocket`, 100, within [`ROCKET_HIT`]), each at `at`. Those the data
+/// doesn't give are left out; with none, combat's own reach and 100 to
+/// nothing.
+pub(crate) fn rocket_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
+    let of = |e: Explosion| Blast {
+        at,
+        radius: e.radius,
+        damage: e.damage,
+        least: e.least,
+        kind: e.kind,
+    };
+    let mut out: Vec<Blast> = [explosion(db, &ROCKET_BLASTS), explosion(db, &[ROCKET_FRAG])]
+        .into_iter()
+        .flatten()
+        .map(of)
+        .collect();
+    if let Some(p) = db.id(ROCKET).and_then(|id| db.projectiles.get(&id)) {
+        out.push(Blast {
+            at,
+            radius: ROCKET_HIT,
+            damage: p.damage,
+            least: p.damage,
+            kind: p.kind,
+        });
+    }
+    if out.is_empty() {
+        let (radius, damage, least) = blast_strength(db);
+        out.push(Blast {
+            at,
+            radius,
+            damage,
+            least,
+            kind: 0,
+        });
+    }
+    out
 }
 
 fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32, strike: bool) {
