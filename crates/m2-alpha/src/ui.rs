@@ -73,7 +73,7 @@ pub struct HudInfo {
 }
 
 /// What the pause menu asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MenuAction {
     Resume,
     /// Write the settings file.
@@ -84,6 +84,29 @@ pub enum MenuAction {
     /// Play as another mercenary (also kept in the settings).
     Hero(crate::hero::Hero),
     Quit,
+    /// Something done in the shop.
+    Shop(ShopAction),
+}
+
+/// What the player does in the shop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShopAction {
+    /// Look at faction `i`'s shop ([`crate::mission::SHOPS`]).
+    Faction(usize),
+    /// Buy one of this.
+    Buy(String),
+    /// Every shop's items unlocked or not (the cheat).
+    UnlockAll(bool),
+    Close,
+}
+
+/// The shop up: whose, what it sells, and what the last purchase said.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShopScreen {
+    pub faction: usize,
+    pub view: crate::mission::ShopView,
+    pub said: Option<String>,
+    pub unlock_all: bool,
 }
 
 /// Seconds the controls hint shows at the start.
@@ -97,6 +120,8 @@ pub struct Hud {
     uploaded: std::collections::HashSet<egui::TextureId>,
     /// The pause menu is open.
     pub menu: bool,
+    /// The shop is up, in the pause menu's place.
+    pub shop: Option<ShopScreen>,
     /// Tessellated and waiting to paint: shapes, texture changes, scale.
     frame: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
     /// The game's own HUD, if its files are there.
@@ -142,6 +167,7 @@ impl Hud {
             renderer: None,
             uploaded: Default::default(),
             menu: false,
+            shop: None,
             frame: None,
             game: None,
             wait: false,
@@ -164,6 +190,7 @@ impl Hud {
         state.blips = blips(info);
         state.reticle = reticle(info);
         state.support = info.support.clone();
+        state.cash = info.mission.as_ref().and_then(|m| m.cash);
         state.radar_regions = info
             .mission
             .as_ref()
@@ -222,6 +249,7 @@ impl Hud {
         state.blips = blips(info);
         state.reticle = reticle(info);
         state.support = info.support.clone();
+        state.cash = info.mission.as_ref().and_then(|m| m.cash);
         state.radar_regions = info
             .mission
             .as_ref()
@@ -280,9 +308,12 @@ impl Hud {
         // would put the world back without their state.
         let load = self.dev || info.mission.is_none();
         let dev = self.dev;
+        let shop = self.shop.as_ref();
         let output = self.ctx.run_ui(input, |ui| {
             hud(ui, info, game);
-            if menu {
+            if let (true, Some(shop)) = (menu, shop) {
+                action = shop_window(ui.ctx(), shop).map(MenuAction::Shop);
+            } else if menu {
                 action = pause_menu(ui.ctx(), config, info.hero, dev, load);
             }
         });
@@ -1335,6 +1366,89 @@ fn project(view_proj: Mat4, world: Vec3, screen: egui::Rect) -> Option<egui::Pos
         screen.left() + (ndc.x + 1.0) * 0.5 * screen.width(),
         screen.top() + (1.0 - ndc.y) * 0.5 * screen.height(),
     ))
+}
+
+/// The shop: a tab for each faction's, her cash, and what it sells, with
+/// a button to buy each that is unlocked and that she can pay for. The
+/// look is this game's own (the game's shop screen isn't drawn); what is
+/// sold, and at what price, is the scripts' (`MrxShop`).
+fn shop_window(ctx: &egui::Context, shop: &ShopScreen) -> Option<ShopAction> {
+    let mut action = None;
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new("dim"),
+    ))
+    .rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha(120));
+    egui::Window::new("Shop")
+        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_min_width(560.0);
+            ui.horizontal_wrapped(|ui| {
+                for (i, (_, name)) in crate::mission::SHOPS.iter().enumerate() {
+                    if ui.selectable_label(shop.faction == i, *name).clicked() && shop.faction != i
+                    {
+                        action = Some(ShopAction::Faction(i));
+                    }
+                }
+            });
+            ui.separator();
+            ui.label(format!(
+                "Cash ${}    Fuel {:.0}",
+                thousands(shop.view.cash),
+                shop.view.fuel
+            ));
+            if let Some(said) = &shop.said {
+                ui.label(said);
+            }
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("shop items")
+                        .striped(true)
+                        .num_columns(4)
+                        .show(ui, |ui| {
+                            for item in &shop.view.items {
+                                ui.label(&item.name).on_hover_text(&item.description);
+                                ui.label(format!("${}", thousands(item.price)));
+                                ui.label(format!("{} held", item.stock));
+                                let can = item.unlocked
+                                    && item.price <= shop.view.cash
+                                    && item.stock < item.most.max(1);
+                                let label = if item.unlocked { "Buy" } else { "Locked" };
+                                if ui.add_enabled(can, egui::Button::new(label)).clicked() {
+                                    action = Some(ShopAction::Buy(item.id.clone()));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            ui.separator();
+            ui.horizontal(|ui| {
+                let mut all = shop.unlock_all;
+                if ui.checkbox(&mut all, "Unlock everything (cheat)").changed() {
+                    action = Some(ShopAction::UnlockAll(all));
+                }
+                if ui.button("Close").clicked() {
+                    action = Some(ShopAction::Close);
+                }
+            });
+        });
+    action
+}
+
+/// A sum of money with its thousands apart: `1,250,000`.
+fn thousands(n: f64) -> String {
+    let digits = format!("{:.0}", n.abs());
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0.0 { format!("-{out}") } else { out }
 }
 
 /// The pause menu, with `playing` (the hero she is) marked under "Play

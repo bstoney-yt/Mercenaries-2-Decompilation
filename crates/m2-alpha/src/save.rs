@@ -23,6 +23,23 @@ pub struct SaveGame {
     pub vehicles: Vec<VehicleSave>,
     /// Spawn entities of the soldiers killed.
     pub killed: Vec<u32>,
+    /// Her cash, fuel and support stock as the scripts held them; saves
+    /// from before money have none.
+    #[serde(default)]
+    pub pmc: Option<PmcSave>,
+    /// The scripts' own save data, as Lua text
+    /// ([`m2_game::savedata`]): kept, not yet read back on loading.
+    #[serde(default)]
+    pub scripts: Option<String>,
+}
+
+/// What her PMC has: cash, fuel and the support items she holds, by
+/// their key in the scripts' catalogue (`"clusterbomb"`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PmcSave {
+    pub cash: f64,
+    pub fuel: f64,
+    pub stock: Vec<(String, i64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -92,6 +109,26 @@ impl SaveGame {
         crate::config::Config::file_beside(FILE_NAME)
     }
 
+    /// Where the scripts' saves in slot `slot` go: the autosaves
+    /// (`"autosave"`) beside the player's own, `m2-alpha-autosave.toml`.
+    pub fn slot_path(slot: &str) -> PathBuf {
+        let slot: String = slot.chars().filter(char::is_ascii_alphanumeric).collect();
+        crate::config::Config::file_beside(&format!("m2-alpha-{}.toml", slot.to_ascii_lowercase()))
+    }
+
+    /// The newest of the player's save and the autosave: what loading
+    /// loads.
+    pub fn newest_path() -> PathBuf {
+        let own = Self::default_path();
+        let auto = Self::slot_path(m2_game::api::AUTOSAVE);
+        let when = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        match (when(&own), when(&auto)) {
+            (Some(a), Some(b)) if b > a => auto,
+            (None, Some(_)) => auto,
+            _ => own,
+        }
+    }
+
     pub fn to_toml(&self) -> String {
         toml::to_string_pretty(self).expect("a save always serialises")
     }
@@ -145,6 +182,12 @@ mod tests {
                 wrecked: true,
             }],
             killed: vec![7, 9],
+            pmc: Some(PmcSave {
+                cash: 125_000.0,
+                fuel: 240.0,
+                stock: vec![("clusterbomb".into(), 2), ("Support".into(), 1)],
+            }),
+            scripts: Some("{[\"nAvailableCostumes\"]=1,}".into()),
         }
     }
 
@@ -169,8 +212,21 @@ pitch = 0.0
 hp = 100.0
 weapon = "rpg"
 "#;
-        let p = SaveGame::from_toml(old).unwrap().player;
-        assert_eq!((p.second.as_str(), p.launcher), ("rpg", None));
+        let s = SaveGame::from_toml(old).unwrap();
+        assert_eq!((s.player.second.as_str(), s.player.launcher), ("rpg", None));
+        // From before money: none kept.
+        assert_eq!((s.pmc, s.scripts), (None, None));
+    }
+
+    #[test]
+    fn the_scripts_autosaves_go_beside_the_players_own() {
+        let auto = SaveGame::slot_path(m2_game::api::AUTOSAVE);
+        assert_eq!(auto.file_name().unwrap(), "m2-alpha-autosave.toml");
+        assert_eq!(auto.parent(), SaveGame::default_path().parent());
+        assert_eq!(
+            SaveGame::slot_path("../retry").file_name().unwrap(),
+            "m2-alpha-retry.toml"
+        );
     }
 
     #[test]

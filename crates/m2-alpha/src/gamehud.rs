@@ -490,6 +490,9 @@ pub struct HudState {
     /// The contract's objectives for the PDA: text id and icon tag each
     /// (`MissionView::pda_objectives`).
     pub pda_objectives: Vec<(String, String)>,
+    /// Her cash, as the scripts hold it (`PlayerCashChanged` tells the HUD;
+    /// the PDA's stats page reads `Player.GetCash`).
+    pub cash: Option<f64>,
     /// What the faction zones last told the HUD (`MissionView::trespass`).
     pub trespass: crate::mission::Trespass,
     /// Whether vehicle disguises work, and her disguise while one holds:
@@ -1453,6 +1456,8 @@ struct Told {
     in_vehicle: Option<bool>,
     /// The gun box's icon widgets as last logged ([`Thread::gun_box`]).
     gun_box: String,
+    /// Her cash as last told, in whole dollars.
+    cash: Option<i64>,
     vehicle: Option<Option<String>>,
     vehicle_templates: Option<Vec<String>>,
     target: Option<Option<(i32, i32, i32)>>,
@@ -1634,7 +1639,7 @@ impl Thread {
         // the same userdata, not m2's number. The game has the dialog box
         // module loaded at boot; unloaded, its `oSystemDialogBoxFlash` is a
         // stub, and `MrxGuiPda.Open` takes that for a system dialog up.
-        // Her cash is 0, as `PlayerCashChanged` tells the HUD (the PDA's
+        // Her cash is the scripts', as `PlayerCashChanged` tells the HUD (the PDA's
         // stats page formats `Player.GetCash()`). She is the only player
         // (`UpdateAllPlayerMarkers` puts each on the PDA's map).
         mission
@@ -1643,7 +1648,7 @@ impl Thread {
                  for _, f in ipairs({\"GetLocalPlayer\", \"GetPrimaryPlayer\"}) do
                      rawset(Player, f, function() return me end)
                  end
-                 rawset(Player, \"GetCash\", function() return 0 end)
+                 rawset(Player, \"GetCash\", function() return __m2_cash or 0 end)
                  rawset(Player, \"GetAllPlayers\", function() return { me } end)
                  import(\"MrxGuiDialogBox\")
                  MrxGuiManager.CreateGui(me)",
@@ -2603,6 +2608,18 @@ impl Thread {
             lua.load(FUEL).set_name("=m2-hud fuel").call::<()>(0)?;
             let t = table(lua, [("nX", Value::Integer(0)), ("nY", Value::Integer(0))])?;
             fire(lua, "GuiReticlePositionChange", t)?;
+        }
+        // Her cash, whenever the scripts' changes.
+        let cash = s.cash.map(|c| c.round() as i64);
+        if cash.is_some() && cash != self.told.cash {
+            self.told.cash = cash;
+            let n = cash.unwrap_or(0) as f64;
+            lua.globals().set("__m2_cash", n)?;
+            let t = table(
+                lua,
+                [("uGuid", guid_value(PLAYER)), ("nValue", Value::Number(n))],
+            )?;
+            fire(lua, "PlayerCashChanged", t)?;
         }
         // The satellite looks down with north up: its compass reads the
         // camera's heading as the view opens.

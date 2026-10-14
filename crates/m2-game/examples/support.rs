@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run -p m2-game --example support -- <vz.wad> [table...] [--calls]
-//!     [--items] [--call <key>] [--listing <module>]
+//!     [--items] [--call <key> [--buy]] [--shop <faction>] [--listing <module>]
 //! ```
 //!
 //! Each `table` is a Lua expression read after start-up (default
@@ -17,8 +17,12 @@
 //! game would, standing in for the player and the world: she throws her
 //! designator 15 m ahead, it lies its 4 s, aircraft arrive at once and
 //! ordnance goes off where it set off; every command and log line is
-//! printed. `--listing <module>` prints a script's Lua 5.1 listing, to read
-//! its control flow locally. Nothing is written but stdout.
+//! printed. With `--buy` the item is bought in the first faction's shop
+//! that sells it instead, as the player would (cash given first).
+//! `--shop <faction>` opens a faction's shop as its contact does and lists
+//! what it sells. `--listing <module>` prints a script's Lua 5.1 listing
+//! (`all`: every script's, each headed by its hash), to read its control
+//! flow locally. Nothing is written but stdout.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -82,6 +86,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .position(|a| a == "--call")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let shop = args
+        .iter()
+        .position(|a| a == "--shop")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let buy = args.iter().any(|a| a == "--buy");
     let listing = args
         .iter()
         .position(|a| a == "--listing")
@@ -90,11 +100,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut tables: Vec<&str> = args[1..]
         .iter()
         .filter(|a| {
-            !a.starts_with("--") && Some(*a) != call.as_ref() && Some(*a) != listing.as_ref()
+            !a.starts_with("--")
+                && Some(*a) != call.as_ref()
+                && Some(*a) != listing.as_ref()
+                && Some(*a) != shop.as_ref()
         })
         .map(String::as_str)
         .collect();
-    if tables.is_empty() && !list_items && call.is_none() {
+    if tables.is_empty() && !list_items && call.is_none() && shop.is_none() {
         tables.push("MrxSupportData.tSupportData");
     }
     let mut wad = WadArchive::open(BufReader::new(File::open(path)?))?;
@@ -103,6 +116,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         list_calls(&data);
     }
     if let Some(m) = &listing {
+        // Every script's, each headed by its hash, to search them all.
+        if m == "all" {
+            for s in data.library.scripts() {
+                println!("== script {:#010x}", s.hash);
+                print!("{}", s.chunk.main.listing());
+            }
+            return Ok(());
+        }
         match data.library.by_hash(name_hash(m)) {
             Some(s) => print!("{}", s.chunk.main.listing()),
             None => println!("no script {m}"),
@@ -136,8 +157,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    if let Some(faction) = &shop {
+        list_shop(&mut mission, faction);
+    }
     if let Some(key) = &call {
-        call_in(&mut mission, key);
+        call_in(&mut mission, key, buy);
     }
     mission.lua().load(DUMP).set_name("=dump").exec()?;
     for t in tables {
@@ -151,7 +175,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Calls `key` in and plays the world's part, printing what happens.
-fn call_in(mission: &mut Mission, key: &str) {
+fn call_in(mission: &mut Mission, key: &str, buy: bool) {
     use m2_game::airstrike::Launch;
     use m2_game::api::Command;
     // Her recruits (the pilot and the helicopter pilot) join over the
@@ -164,7 +188,11 @@ fn call_in(mission: &mut Mission, key: &str) {
     if let Err(e) = mission.run(recruit, "recruit") {
         println!("recruit: {e}");
     }
-    mission.stock_support(key, 1, 1.0e6, 1000.0);
+    if buy {
+        buy_in_shop(mission, key);
+    } else {
+        mission.stock_support(key, 1, 1.0e6, 1000.0);
+    }
     let pmc = "print('cash', MrxPmc.GetCashQty(), 'fuel', MrxPmc.GetFuelQty(), \
         'capacity', MrxPmc.GetFuelCapacity(), 'stock', MrxPmc.GetSupportQty(__m2_probe), \
         'pilot', MrxSupportManager.IsRecruitAvailable('Pilot'), \
@@ -271,4 +299,56 @@ fn list_calls(data: &GameData) {
             println!("  {callee}({args}) x{n}");
         }
     }
+}
+
+/// The factions whose contacts keep a shop, as the scripts name them to
+/// `MrxShop.Open`'s vendor (`GetFaction`): `MrxFactionManager`'s keys.
+const FACTIONS: [&str; 6] = ["All", "Chi", "Gur", "Pir", "Oil", "Pmc"];
+
+/// Opens `faction`'s shop with cash to spend and lists what it sells.
+fn list_shop(mission: &mut Mission, faction: &str) {
+    mission.give_resources(1.0e6, 0.0, "[Generic.Pickups]");
+    let opened = mission.open_shop(faction);
+    let shop = mission.shop();
+    println!(
+        "shop {faction}: opened {opened}, {} items, cash {:?}",
+        shop.items.len(),
+        mission.resources()
+    );
+    for i in &shop.items {
+        println!(
+            "shop item {} ({}) {} cash {} stock {}/{} unlocked {} fuel tank {}",
+            i.id, i.raw_name, i.name, i.cash, i.stock, i.max_stock, i.unlocked, i.fuel_tank
+        );
+    }
+    for line in mission.take_log() {
+        println!("log {line}");
+    }
+    mission.close_shop();
+}
+
+/// Buys one of `key` in the first faction's shop that sells it unlocked,
+/// with cash given her first (as if earned), as the player would.
+fn buy_in_shop(mission: &mut Mission, key: &str) {
+    mission.give_resources(1.0e6, 1000.0, "[Generic.Pickups]");
+    for faction in FACTIONS {
+        mission.open_shop(faction);
+        let sells = mission
+            .shop()
+            .items
+            .iter()
+            .any(|i| i.id == key && i.unlocked);
+        if sells {
+            let before = mission.resources().0;
+            let bought = mission.buy(key, 1);
+            mission.close_shop();
+            println!(
+                "shop: {key} from {faction}: bought {bought}, cash {before} -> {}",
+                mission.resources().0
+            );
+            return;
+        }
+        mission.close_shop();
+    }
+    println!("shop: no shop sells {key} unlocked");
 }

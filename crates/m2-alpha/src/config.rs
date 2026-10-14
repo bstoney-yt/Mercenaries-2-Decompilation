@@ -29,6 +29,19 @@ pub struct Config {
 pub struct EnhancedConfig {
     /// Smarter enemy soldiers (`enabled = true` to switch on).
     pub smarter_ai: crate::npc::SmarterAi,
+    /// The shop from anywhere, every item unlocked (a cheat; the game
+    /// unlocks them as contract rewards).
+    pub shop: ShopCheat,
+}
+
+/// `[enhanced.shop]`: the shop opens anywhere with its key, as the game's
+/// contacts open it in their menus; `unlock_all` unlocks everything each
+/// shop could sell, and brings the pilots and mechanic the support needs
+/// (the story recruits them one by one).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShopCheat {
+    pub unlock_all: bool,
 }
 
 /// The game's own options (its pause menu's).
