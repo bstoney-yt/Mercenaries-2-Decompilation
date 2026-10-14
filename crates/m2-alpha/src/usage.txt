@@ -102,6 +102,8 @@ m2-alpha [options]
                          ahead) just before the picture, to see the hit arcs
   --hud-seconds <s>      with --screenshot: run the game's HUD this long before
                          the picture (default 2)
+  --loading-screen <s>   with --screenshot: the picture is of the loading screen
+                         this long after it came up
   --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
                          (gl: the supply crate's grenade launcher)
   --satellite <stage>    with --screenshot on foot: call a Satellite Guided

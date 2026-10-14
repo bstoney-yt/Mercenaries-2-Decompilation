@@ -606,18 +606,20 @@ impl Avm {
             },
             "textwidth" | "textheight" => match &c.kind {
                 Kind::Text(def, s) => {
-                    let h = c.lib.texts.get(def).map_or(12.0, |t| t.height);
-                    let lines = s.split(['\n', '\r']).count().max(1) as f32;
-                    let longest = s
-                        .split(['\n', '\r'])
-                        .map(|l| l.chars().count())
-                        .max()
-                        .unwrap_or(0) as f32;
-                    Value::Number(f64::from(if lower == "textwidth" {
-                        longest * h * 0.55
-                    } else {
-                        lines * h * 1.2
-                    }))
+                    // With the fonts, as laid out; else estimated.
+                    let (w, h) = match c.lib.texts.get(def) {
+                        Some(t) => {
+                            let font = player.fonts.as_deref().and_then(|book| {
+                                t.font.and_then(|f| Player::font_for(&c.lib, f, book))
+                            });
+                            match font {
+                                Some(font) => super::text::measure(t, s, font),
+                                None => t.text_size(s),
+                            }
+                        }
+                        None => (0.0, 12.0 * 1.2),
+                    };
+                    Value::Number(f64::from(if lower == "textwidth" { w } else { h }))
                 }
                 _ => return None,
             },

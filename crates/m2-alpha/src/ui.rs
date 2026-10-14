@@ -126,6 +126,8 @@ pub struct Hud {
     frame: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
     /// The game's own HUD, if its files are there.
     pub game: Option<GameHud>,
+    /// The game's loading screen, if `Loading.wad` reads.
+    pub loading: Option<crate::loading::LoadingScreen>,
     /// Each frame waits for the game's HUD to draw it (play run offscreen,
     /// faster than the HUD's scripts would keep up with).
     pub wait: bool,
@@ -170,6 +172,7 @@ impl Hud {
             shop: None,
             frame: None,
             game: None,
+            loading: None,
             wait: false,
             dev: true,
         }
@@ -312,8 +315,29 @@ impl Hud {
         let load = self.dev || info.mission.is_none();
         let dev = self.dev;
         let shop = self.shop.as_ref();
+        // The loading screen: up while the island loads and over the
+        // scripts' fades to black.
+        let mut loading = self.loading.as_mut();
+        if let Some(screen) = loading.as_deref_mut() {
+            let black = info.mission.as_ref().map_or(0.0, |m| m.black);
+            screen.update(info.loading.is_some(), black, input.time.unwrap_or(0.0));
+            for line in screen.take_log() {
+                eprintln!("{line}");
+            }
+        }
+        let covered = loading
+            .as_deref()
+            .is_some_and(crate::loading::LoadingScreen::showing);
         let output = self.ctx.run_ui(input, |ui| {
-            hud(ui, info, game);
+            hud(ui, info, game, covered);
+            if let Some(screen) = loading.as_deref_mut() {
+                let ctx = ui.ctx().clone();
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    "loading screen".into(),
+                ));
+                screen.paint(&ctx, &painter);
+            }
             if let (true, Some(shop)) = (menu, shop) {
                 action = shop_window(ui.ctx(), shop).map(MenuAction::Shop);
             } else if menu {
@@ -508,7 +532,9 @@ fn blips(info: &HudInfo) -> Vec<([f32; 3], String, [u8; 4])> {
     })
 }
 
-fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
+/// The HUD for `info`; `covered`: the game's loading screen is up, in
+/// place of the fade and the loading line.
+fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool) {
     let ctx = ui.ctx().clone();
     let screen = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
@@ -525,8 +551,14 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     };
     let white = Color32::from_gray(235);
     flash(&ctx, screen, info.support.flash);
-    // The scripts' fade to black (`MrxGui.GlobalFadeToBlack`), over all.
-    if let Some(black) = info.mission.as_ref().map(|m| m.black).filter(|&b| b > 0.0) {
+    // The scripts' fade to black (`MrxGui.GlobalFadeToBlack`), over all,
+    // unless its movie (the loading screen) plays it.
+    if let Some(black) = info
+        .mission
+        .as_ref()
+        .map(|m| m.black)
+        .filter(|&b| b > 0.0 && !covered)
+    {
         ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, "fade".into()))
             .rect_filled(
                 screen,
@@ -534,7 +566,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
                 Color32::from_black_alpha((black.min(1.0) * 255.0) as u8),
             );
     }
-    if let Some(loading) = &info.loading {
+    if let Some(loading) = info.loading.as_ref().filter(|_| !covered) {
         text(
             screen.center_top() + vec2(0.0, 24.0),
             Align2::CENTER_TOP,
