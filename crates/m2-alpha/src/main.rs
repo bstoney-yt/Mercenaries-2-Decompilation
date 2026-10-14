@@ -67,6 +67,7 @@ mod route;
 mod save;
 mod scene;
 mod shell;
+mod shopcheck;
 mod sound;
 mod startup;
 mod strikes;
@@ -229,6 +230,10 @@ struct Options {
     /// `--support`: support items to stock and call in once the scripts
     /// run, as if bought, for testing.
     support: Vec<String>,
+    /// `--shop-check all|<key,...>`: with `--mission`, every support item
+    /// (or those) bought and called in, one after another
+    /// ([`shopcheck`]), for testing.
+    shop_check: Option<Vec<String>>,
     /// With `--screenshot --drive`: hijack the vehicle instead of getting
     /// in, answering every prompt at once.
     hijack: bool,
@@ -448,6 +453,14 @@ fn parse_args() -> anyhow::Result<Options> {
                 o.mission_drivers.push((path, code));
             }
             "--support" => o.support.push(value()?),
+            "--shop-check" => {
+                let v = value()?;
+                o.shop_check = Some(if v == "all" {
+                    Vec::new()
+                } else {
+                    v.split(',').map(str::to_owned).collect()
+                });
+            }
             "--spawns" => o.list_spawns = value()?.parse().context("--spawns expects a count")?,
             "--face" => {
                 o.face = Some(
@@ -810,6 +823,33 @@ fn game_hud(
             game.combat.max_hp,
         )),
         _ => None,
+    }
+}
+
+/// Writes the game to `path`, with her cash, fuel and support stock and
+/// the scripts' own save data as the scripts hold them. Whether it was
+/// written.
+fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::path::Path) -> bool {
+    let Some(mut s) = game.save() else {
+        eprintln!("nothing to save until the island has loaded");
+        return false;
+    };
+    s.pmc = mission.and_then(mission::MissionLink::pmc_save);
+    s.scripts = mission.and_then(mission::MissionLink::script_save);
+    match s.write(path) {
+        Ok(()) => {
+            eprintln!(
+                "game saved to {} (cash {}, scripts' data {} bytes)",
+                path.display(),
+                s.pmc.as_ref().map_or(0.0, |p| p.cash),
+                s.scripts.as_ref().map_or(0, String::len)
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("could not save: {e:#}");
+            false
+        }
     }
 }
 
@@ -2502,6 +2542,7 @@ fn mission_for_screenshot(
     let mut placed_tried = std::collections::HashSet::new();
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
+    let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -2522,8 +2563,27 @@ fn mission_for_screenshot(
         if !options.support.is_empty() && game.combat.to_throw {
             intent.trigger.throw = true;
         }
+        // With --shop-check she buys and calls in every support item.
+        if let Some(sc) = &mut shop_check {
+            let ashore = !link
+                .view()
+                .objectives
+                .iter()
+                .any(|o| o.contains("Land on the beach"))
+                && game.scene.player.as_ref().is_some_and(|p| p.landed);
+            if let Some(i) = sc.step(game, &mut link, ashore, tick) {
+                intent = i;
+            }
+            if sc.finished() {
+                break;
+            }
+        }
         game.step(intent, tick);
         link.tick(game, tick);
+        // The saves the scripts ask for are written, as in play.
+        for slot in link.take_saves() {
+            write_save(game, Some(&link), &save::SaveGame::slot_path(&slot));
+        }
         // With --placed-check, what the layers have put out is tried
         // every few seconds ([`placed::check`]).
         // Not before she is ashore: the first contract's boat ride is
@@ -2923,6 +2983,13 @@ fn mission_for_screenshot(
         if contract_done.is_some_and(|d| i >= d + (options.after_contract / tick).round() as u32) {
             break;
         }
+    }
+    if let Some(sc) = &shop_check {
+        for line in sc.summary() {
+            eprintln!("{line}");
+        }
+        let (cash, fuel) = link.resources().unwrap_or_default();
+        eprintln!("shop-check: she ends with cash {cash:.0}, fuel {fuel:.0}");
     }
     if auto.is_some() {
         let mut sounds = sound::ClipSounds::load(install);
@@ -4883,6 +4950,7 @@ impl Running {
                 self.set_hero(hero);
             }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
+            Some(ui::MenuAction::Shop(a)) => self.shop_action(a, config),
             None => {}
         }
         let (w, h) = self.backend.size();
@@ -4973,6 +5041,11 @@ impl Running {
     }
 
     fn close_menu(&mut self) {
+        if self.hud.shop.take().is_some()
+            && let Some(m) = &mut self.mission
+        {
+            m.close_shop();
+        }
         self.hud.menu = false;
         self.input.clear();
         self.released = false;
@@ -4996,23 +5069,102 @@ impl Running {
     }
 
     fn save_game(&mut self) {
-        let path = save::SaveGame::default_path();
-        match self.game.save() {
-            Some(s) => match s.write(&path) {
-                Ok(()) => eprintln!("game saved to {}", path.display()),
-                Err(e) => eprintln!("could not save: {e:#}"),
-            },
-            None => eprintln!("nothing to save until the island has loaded"),
+        self.save_to(&save::SaveGame::default_path());
+    }
+
+    /// Writes the game to `path`, with her cash, fuel and support stock as
+    /// the scripts hold them.
+    fn save_to(&mut self, path: &std::path::Path) {
+        write_save(&self.game, self.mission.as_ref(), path);
+    }
+
+    /// Loads the newest save: the player's own, or the scripts' autosave.
+    fn load_game(&mut self) {
+        let path = save::SaveGame::newest_path();
+        match save::SaveGame::read(&path) {
+            Ok(mut s) => {
+                let pmc = s.pmc.take();
+                self.game.load(s);
+                if let (Some(pmc), Some(m)) = (pmc, &mut self.mission) {
+                    m.restore(&pmc);
+                }
+                eprintln!("game loaded from {}", path.display());
+            }
+            Err(e) => eprintln!("could not load: {e:#}"),
         }
     }
 
-    fn load_game(&mut self) {
-        match save::SaveGame::read(&save::SaveGame::default_path()) {
-            Ok(s) => {
-                self.game.load(s);
-                eprintln!("game loaded");
+    /// Puts faction `faction`'s shop up ([`mission::SHOPS`]), in the pause
+    /// menu's place: the world waits while she shops. Only once the
+    /// scripts run.
+    fn show_shop(&mut self, faction: usize, unlock_all: bool) {
+        let Some((key, name)) = mission::SHOPS.get(faction) else {
+            return;
+        };
+        let Some(view) = self
+            .mission
+            .as_mut()
+            .and_then(|m| m.open_shop(key, unlock_all))
+        else {
+            eprintln!("shop: {name}'s shop isn't there until the scripts run");
+            return;
+        };
+        eprintln!("shop: {name}'s, {} things on sale", view.items.len());
+        self.hud.shop = Some(ui::ShopScreen {
+            faction,
+            view,
+            said: None,
+            unlock_all,
+        });
+        if !self.hud.menu {
+            self.open_menu();
+        }
+    }
+
+    fn shop_action(&mut self, action: ui::ShopAction, config: &mut Config) {
+        let faction = self.hud.shop.as_ref().map_or(0, |s| s.faction);
+        match action {
+            ui::ShopAction::Close => self.close_menu(),
+            ui::ShopAction::Faction(i) => {
+                if let Some(m) = &mut self.mission {
+                    m.close_shop();
+                }
+                self.show_shop(i, config.enhanced.shop.unlock_all);
             }
-            Err(e) => eprintln!("could not load: {e:#}"),
+            ui::ShopAction::UnlockAll(on) => {
+                config.enhanced.shop.unlock_all = on;
+                self.show_shop(faction, on);
+            }
+            ui::ShopAction::Buy(id) => {
+                let Some((view, bought)) = self.mission.as_mut().and_then(|m| m.buy(&id)) else {
+                    return;
+                };
+                if let Some(shop) = &mut self.hud.shop {
+                    let name = view
+                        .items
+                        .iter()
+                        .find(|i| i.id == id)
+                        .map_or(id.clone(), |i| i.name.clone());
+                    shop.said = Some(if bought {
+                        format!("Bought: {name}. Call it in from the support menu.")
+                    } else {
+                        format!("Could not buy {name}.")
+                    });
+                    shop.view = view;
+                }
+            }
+        }
+    }
+
+    /// Writes the saves the scripts asked for: their autosaves after a
+    /// contract (`Sys.RequestAutosave`) and checkpoints, each to its
+    /// slot's file ([`save::SaveGame::slot_path`]).
+    fn answer_saves(&mut self) {
+        let Some(slots) = self.mission.as_mut().map(|m| m.take_saves()) else {
+            return;
+        };
+        for slot in slots {
+            self.save_to(&save::SaveGame::slot_path(&slot));
         }
     }
 
@@ -5046,6 +5198,10 @@ impl Running {
             } else {
                 self.open_menu();
             }
+        }
+        if self.input.take_pressed(Action::Shop) && !self.hud.menu {
+            let unlock = config.enhanced.shop.unlock_all;
+            self.show_shop(0, unlock);
         }
         if self.hud.menu {
             // Paused: the world waits, sound carries on.
@@ -5132,6 +5288,7 @@ impl Running {
                 self.audio.music_cue(cue.as_deref());
             }
         }
+        self.answer_saves();
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
         if self.audio.ambient_due(TICK.as_secs_f32()) {

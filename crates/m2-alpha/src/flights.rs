@@ -125,6 +125,18 @@ pub struct Leaves {
     pub gives: Option<(Weapon, u32)>,
     /// The health it gives.
     pub health: f32,
+    /// The cash and fuel it gives, if money (`Cash (Small)`, `Fuel Pickup
+    /// (Large)`): the scripts get them ([`m2_game::mission::Mission::
+    /// give_resources`]).
+    pub cash: u32,
+    pub fuel: u32,
+}
+
+impl Leaves {
+    /// Money: cash or fuel, taken walking over it whatever she carries.
+    pub fn is_money(&self) -> bool {
+        self.cash > 0 || self.fuel > 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

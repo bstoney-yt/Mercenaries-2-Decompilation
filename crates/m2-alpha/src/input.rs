@@ -58,6 +58,9 @@ pub enum Action {
     /// Open or close the PDA (the first contract has her look at it before
     /// it gives her the bomb).
     Pda,
+    /// Open the shop (the game opens it from a contact's menu; here it
+    /// opens anywhere).
+    Shop,
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
@@ -116,6 +119,7 @@ impl Default for Bindings {
             (Launcher, vec![Digit2]),
             (Support, vec![KeyT]),
             (Pda, vec![KeyP]),
+            (Shop, vec![KeyH]),
             (ToggleMouse, vec![Tab]),
             (Fullscreen, vec![F11]),
             (NextGait, vec![KeyN]),

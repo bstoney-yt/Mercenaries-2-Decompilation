@@ -595,6 +595,15 @@ fn default_for(lua: &Lua, name: &str) -> mlua::Result<Option<Value>> {
     let (Some(prefix), Some(next)) = (chars.next(), chars.next()) else {
         return Ok(None);
     };
+    // A script's own global, `g` before the type's prefix (`gtAllSupport`:
+    // the reward data's shop lists, built the first time they are asked
+    // for while nil), is nil until the script sets it.
+    if prefix == 'g'
+        && next.is_ascii_lowercase()
+        && chars.next().is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return Ok(Some(Value::Nil));
+    }
     if !next.is_ascii_uppercase() {
         return Ok(None);
     }
@@ -872,6 +881,13 @@ mod tests {
         assert_eq!((h, n, s.as_str(), b), (450.0, 1.0, "x", false));
         let no_object: bool = host.lua().load("return oFlash == nil").eval().unwrap();
         assert!(no_object);
+        // A script's own global (`gtAllSupport`) is nil until it builds it.
+        let built: i64 = host
+            .lua()
+            .load("if not gtAllSupport then gtAllSupport = { 7 } end return gtAllSupport[1]")
+            .eval()
+            .unwrap();
+        assert_eq!(built, 7);
         let is_stub: bool = host
             .lua()
             .load("return getmetatable(Event) ~= nil and tList[1] == 2")

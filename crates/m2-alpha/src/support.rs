@@ -161,6 +161,60 @@ impl Kind {
     }
 }
 
+/// An item of the scripts' catalogue she holds, bought in a shop or given
+/// free ([`m2_game::support::SupportItem`]): the support menu lists them
+/// after her own [`Item`]s, and calling one in is the scripts' to carry
+/// out (they hand her its designator).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stocked {
+    /// Its key in the catalogue (`"clusterbomb"`).
+    pub key: String,
+    /// As the support box names it, and how it is called in (the
+    /// designator's kind: `"Smoke"`, `"Laser"`).
+    pub name: String,
+    pub method: String,
+    pub count: u32,
+    pub free: bool,
+}
+
+/// How a designator the scripts hand her is aimed, rather than thrown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aim {
+    /// Through the satellite's view, as her own bomb's: the spot under
+    /// the view's middle, confirmed with fire or the use key.
+    Satellite,
+    /// With the laser: the point under the crosshair, held on it with
+    /// fire for [`LASE_TIME`].
+    Laser,
+}
+
+impl Aim {
+    /// How a designator of kind `kind` (`"Laser Designator"`) is aimed;
+    /// `None` for the thrown ones (smoke, flares, beacons).
+    pub fn of(kind: &str) -> Option<Aim> {
+        if kind.contains("Satellite") {
+            Some(Aim::Satellite)
+        } else if kind.contains("Laser") {
+            Some(Aim::Laser)
+        } else {
+            None
+        }
+    }
+
+    /// Its designator's template.
+    pub fn designator(self) -> &'static str {
+        match self {
+            Aim::Satellite => "Satellite Designator",
+            Aim::Laser => "Laser Designator",
+        }
+    }
+}
+
+/// Fire is held on the spot this long to lase it (seconds; invented: the
+/// laser's script takes the point the engine hands it, `LaserFinished`,
+/// and says nothing of how long).
+pub const LASE_TIME: f32 = 1.5;
+
 /// A support item she holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Item {
@@ -202,6 +256,15 @@ pub enum Phase {
         turned: f32,
         left: f32,
     },
+    /// Aiming a designator the scripts handed her ([`Aim`]): the
+    /// satellite's view middle (x, z), seconds since it opened, and how
+    /// long fire has been held on the laser's spot.
+    Designating {
+        aim: Aim,
+        at: Vec2,
+        open: f32,
+        held: f32,
+    },
 }
 
 /// What she does at the support this tick, from her keys.
@@ -223,6 +286,8 @@ pub struct Call {
     pub hurt: bool,
     /// The PDA key: the PDA opens, or closes.
     pub pda: bool,
+    /// Where the crosshair is on (for the laser).
+    pub aim_at: Option<Vec3>,
 }
 
 /// What came down this step, where (x, z).
@@ -309,6 +374,29 @@ pub struct Support {
     /// Seconds a strike has been wanted with nothing to call it with
     /// ([`fallback`](Self::fallback)).
     wanted: f32,
+    /// The scripts' items she holds, as they last said.
+    pub stock: Vec<Stocked>,
+    /// The menu's line chosen: her own items first, then [`stock`]'s.
+    ///
+    /// [`stock`]: Self::stock
+    pub selected: usize,
+    /// The way the menu was steered last tick (-1 down, 0, 1 up).
+    steered: i8,
+    /// An item of [`stock`](Self::stock) she chose in the menu, for the
+    /// scripts to call in.
+    pub call_in: Option<String>,
+    /// Where an aimed designator came down: its template and the spot
+    /// (on the ground she stands on, for the satellite's).
+    pub designated: Option<(&'static str, Vec3)>,
+    /// Where she stood last tick.
+    here: Vec3,
+}
+
+/// A line of the support menu.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Entry<'a> {
+    Own(Item),
+    Stocked(&'a Stocked),
 }
 
 /// The wedge of the wheel the needle at `angle` (radians clockwise from
@@ -378,6 +466,66 @@ impl Support {
         self.items.iter().copied().find(|i| i.count > 0)
     }
 
+    /// The support menu's lines: her own items she holds, then the
+    /// scripts'.
+    pub fn entries(&self) -> Vec<Entry<'_>> {
+        self.items
+            .iter()
+            .filter(|i| i.count > 0)
+            .map(|&i| Entry::Own(i))
+            .chain(
+                self.stock
+                    .iter()
+                    .filter(|s| s.count > 0)
+                    .map(Entry::Stocked),
+            )
+            .collect()
+    }
+
+    /// The menu's line chosen, if there are any.
+    pub fn chosen(&self) -> Option<Entry<'_>> {
+        let entries = self.entries();
+        let n = entries.len();
+        entries
+            .into_iter()
+            .nth(self.selected.min(n.saturating_sub(1)))
+    }
+
+    /// The scripts handed her a designator of kind `kind`: an aimed one
+    /// is taken up here (the thrown ones are the fight's to throw).
+    /// Whether it was.
+    pub fn equip(&mut self, kind: &str) -> bool {
+        let Some(aim) = Aim::of(kind) else {
+            return false;
+        };
+        self.phase = Phase::Designating {
+            aim,
+            at: Vec2::new(self.here.x, self.here.z),
+            open: 0.0,
+            held: 0.0,
+        };
+        true
+    }
+
+    /// The scripts took her designator back: an aimed one is put away.
+    pub fn unequip(&mut self) {
+        if matches!(self.phase, Phase::Designating { .. }) {
+            self.phase = Phase::Idle;
+        }
+    }
+
+    /// Aiming a designator with the laser: she looks and aims as she
+    /// does with a gun, and fire is the laser's.
+    pub fn lasing(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Designating {
+                aim: Aim::Laser,
+                ..
+            }
+        )
+    }
+
     /// Gives her `quantity` free `kind` (the scripts' `AddFreebie`), to
     /// hold at most `limit` if given.
     pub fn grant(&mut self, kind: Kind, quantity: u32, limit: Option<u32>) {
@@ -428,9 +576,14 @@ impl Support {
     /// Where the satellite looks (x, z), while she looks through it.
     pub fn looking(&self) -> Option<Vec2> {
         match self.phase {
-            Phase::Viewing { at, .. } | Phase::Timing { at, .. } | Phase::Confirmed { at, .. } => {
-                Some(at)
-            }
+            Phase::Viewing { at, .. }
+            | Phase::Timing { at, .. }
+            | Phase::Confirmed { at, .. }
+            | Phase::Designating {
+                aim: Aim::Satellite,
+                at,
+                ..
+            } => Some(at),
             _ => None,
         }
     }
@@ -465,7 +618,16 @@ impl Support {
         self.fire_was = call.fire;
         let press = fired || call.use_pressed;
         let here = Vec2::new(her.x, her.z);
+        self.here = her;
         let back = call.menu || call.select;
+        // The menu's line moves once for each push up or down.
+        let way = match call.steer.y {
+            y if y > 0.5 => 1,
+            y if y < -0.5 => -1,
+            _ => 0,
+        };
+        let pushed = (way != self.steered).then_some(way).filter(|&w| w != 0);
+        self.steered = way;
         // The PDA opens and shuts with its key while no call is under way;
         // while it is open the call's keys do nothing.
         if call.pda && self.phase == Phase::Idle {
@@ -481,11 +643,71 @@ impl Support {
         };
         self.phase = match self.phase {
             _ if self.pda => self.phase,
-            Phase::Idle if call.menu && self.ready().is_some() => Phase::Menu,
+            Phase::Idle if call.menu && !self.entries().is_empty() => Phase::Menu,
             Phase::Idle => Phase::Idle,
             Phase::Menu if back => Phase::Idle,
-            Phase::Menu if call.use_pressed => Phase::Holding { left: EQUIP_TIME },
-            Phase::Menu => Phase::Menu,
+            Phase::Menu if call.use_pressed => match self.chosen() {
+                Some(Entry::Own(_)) => Phase::Holding { left: EQUIP_TIME },
+                // The scripts call it in, and hand her its designator.
+                Some(Entry::Stocked(s)) => {
+                    self.call_in = Some(s.key.clone());
+                    Phase::Idle
+                }
+                None => Phase::Idle,
+            },
+            Phase::Menu => {
+                let n = self.entries().len().max(1);
+                self.selected = match pushed {
+                    // Up the list.
+                    Some(1) => (self.selected.min(n - 1) + n - 1) % n,
+                    Some(_) => (self.selected.min(n - 1) + 1) % n,
+                    None => self.selected.min(n - 1),
+                };
+                Phase::Menu
+            }
+            Phase::Designating { .. } if back || call.hurt => Phase::Idle,
+            Phase::Designating {
+                aim: Aim::Satellite,
+                at,
+                ..
+            } if press => {
+                self.designated = Some((Aim::Satellite.designator(), Vec3::new(at.x, her.y, at.y)));
+                Phase::Idle
+            }
+            Phase::Designating {
+                aim: Aim::Satellite,
+                at,
+                open,
+                held,
+            } => Phase::Designating {
+                aim: Aim::Satellite,
+                at: steer(at),
+                open: open + dt,
+                held,
+            },
+            Phase::Designating {
+                aim: Aim::Laser,
+                at,
+                open,
+                held,
+            } => match (call.fire, call.aim_at) {
+                (true, Some(p)) if held + dt >= LASE_TIME => {
+                    self.designated = Some((Aim::Laser.designator(), p));
+                    Phase::Idle
+                }
+                (true, Some(p)) => Phase::Designating {
+                    aim: Aim::Laser,
+                    at: Vec2::new(p.x, p.z),
+                    open: open + dt,
+                    held: held + dt,
+                },
+                _ => Phase::Designating {
+                    aim: Aim::Laser,
+                    at,
+                    open: open + dt,
+                    held: 0.0,
+                },
+            },
             Phase::Holding { .. } if back || call.hurt || self.ready().is_none() => Phase::Idle,
             Phase::Holding { left } if left <= dt => {
                 self.posts.push(TARGETTING_START);
@@ -663,7 +885,13 @@ impl Support {
             }
         };
         let (satellite, wheel) = match self.phase {
-            Phase::Viewing { at, open } => (Some((on(at), open, cost)), None),
+            Phase::Viewing { at, open }
+            | Phase::Designating {
+                aim: Aim::Satellite,
+                at,
+                open,
+                ..
+            } => (Some((on(at), open, cost)), None),
             Phase::Timing {
                 at,
                 open,
@@ -686,22 +914,31 @@ impl Support {
             ),
             _ => (None, None),
         };
-        SupportHud {
-            item: ready.map(|i| {
-                (
-                    i.kind.name().to_owned(),
-                    i.kind.method().to_owned(),
-                    i.count,
-                    i.free,
-                )
-            }),
-            menu: self.phase == Phase::Menu,
-            designator: (!matches!(self.phase, Phase::Idle | Phase::Menu)).then(|| {
+        // The menu's line chosen, or what she would call first.
+        let item = match self.chosen() {
+            Some(Entry::Stocked(s)) => Some((s.name.clone(), s.method.clone(), s.count, s.free)),
+            Some(Entry::Own(i)) => Some((
+                i.kind.name().to_owned(),
+                i.kind.method().to_owned(),
+                i.count,
+                i.free,
+            )),
+            None => None,
+        };
+        let designator = match self.phase {
+            Phase::Idle | Phase::Menu => None,
+            Phase::Designating { aim, .. } => Some(aim.designator().to_owned()),
+            _ => Some(
                 ready
                     .map_or(Kind::SatelliteBomb, |i| i.kind)
                     .designator()
-                    .to_owned()
-            }),
+                    .to_owned(),
+            ),
+        };
+        SupportHud {
+            item,
+            menu: self.phase == Phase::Menu,
+            designator,
             satellite,
             wheel,
             inbound: self.inbound(),
@@ -1070,5 +1307,122 @@ mod tests {
         assert!((clip(Vec3::new(100.0, 10.0, 255.0)).y - 1.0).abs() < 1e-3);
         // In front of the camera, within depth.
         assert!((0.0..=1.0).contains(&middle.z));
+    }
+
+    fn stocked(key: &str, method: &str) -> Stocked {
+        Stocked {
+            key: key.into(),
+            name: key.into(),
+            method: method.into(),
+            count: 1,
+            free: false,
+        }
+    }
+
+    #[test]
+    fn the_menu_lists_her_own_items_then_the_scripts_and_calls_one_in() {
+        let her = Vec3::new(10.0, 2.0, 20.0);
+        let mut posts = Vec::new();
+        let mut s = Support::default();
+        s.grant(Kind::SatelliteBomb, 1, None);
+        s.stock = vec![stocked("Support", "Smoke"), stocked("clusterbomb", "Smoke")];
+        assert_eq!(s.entries().len(), 3);
+        let menu = Call {
+            menu: true,
+            ..Call::default()
+        };
+        step(&mut s, menu, her, &mut posts);
+        assert_eq!(s.phase, Phase::Menu);
+        // Down twice, letting go between: the cluster bomb.
+        for _ in 0..2 {
+            let down = Call {
+                steer: Vec2::new(0.0, -1.0),
+                ..Call::default()
+            };
+            step(&mut s, down, her, &mut posts);
+            step(&mut s, Call::default(), her, &mut posts);
+        }
+        assert_eq!(s.hud(0.0).item.map(|i| i.0).as_deref(), Some("clusterbomb"));
+        let pick = Call {
+            use_pressed: true,
+            ..Call::default()
+        };
+        step(&mut s, pick, her, &mut posts);
+        assert_eq!(s.call_in.take().as_deref(), Some("clusterbomb"));
+        assert_eq!(s.phase, Phase::Idle);
+        // Up from the top goes round to the bottom.
+        step(&mut s, menu, her, &mut posts);
+        let up = Call {
+            steer: Vec2::new(0.0, 1.0),
+            ..Call::default()
+        };
+        step(&mut s, up, her, &mut posts);
+        assert_eq!(s.selected, 1);
+    }
+
+    #[test]
+    fn a_laser_held_on_its_spot_long_enough_marks_it() {
+        let her = Vec3::new(0.0, 5.0, 0.0);
+        let spot = Vec3::new(30.0, 2.0, 40.0);
+        let mut posts = Vec::new();
+        let mut s = Support::default();
+        assert!(!s.equip("Smoke Designator"), "thrown, not aimed");
+        assert!(s.equip("Laser Designator"));
+        assert!(s.lasing() && s.busy());
+        let lase = Call {
+            fire: true,
+            aim_at: Some(spot),
+            ..Call::default()
+        };
+        // Let go half way: it starts again.
+        for _ in 0..10 {
+            step(&mut s, lase, her, &mut posts);
+        }
+        step(&mut s, Call::default(), her, &mut posts);
+        let mut ticks = 0;
+        while s.designated.is_none() && ticks < 100 {
+            step(&mut s, lase, her, &mut posts);
+            ticks += 1;
+        }
+        // About its time (the seconds add up in steps of DT).
+        assert!(
+            (ticks - (LASE_TIME / DT).round() as i32).abs() <= 1,
+            "{ticks}"
+        );
+        assert_eq!(s.designated, Some(("Laser Designator", spot)));
+        assert_eq!(s.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn a_satellite_designation_marks_the_view_middle_on_confirming() {
+        let her = Vec3::new(100.0, 8.0, -50.0);
+        let mut posts = Vec::new();
+        let mut s = Support::default();
+        assert!(s.equip("Satellite Designator"));
+        // It opens where she stood last.
+        step(&mut s, Call::default(), her, &mut posts);
+        s.phase = Phase::Designating {
+            aim: Aim::Satellite,
+            at: Vec2::new(her.x, her.z),
+            open: 0.0,
+            held: 0.0,
+        };
+        assert_eq!(s.looking(), Some(Vec2::new(100.0, -50.0)));
+        let right = Call {
+            steer: Vec2::new(1.0, 0.0),
+            ..Call::default()
+        };
+        step(&mut s, right, her, &mut posts);
+        let at = s.looking().unwrap();
+        // Screen right is the world's -x.
+        assert!(at.x < 100.0);
+        press_fire(&mut s, her, &mut posts);
+        assert_eq!(
+            s.designated,
+            Some(("Satellite Designator", Vec3::new(at.x, her.y, at.y)))
+        );
+        // The scripts take the designator back: nothing more to do.
+        s.unequip();
+        assert_eq!(s.phase, Phase::Idle);
     }
 }
