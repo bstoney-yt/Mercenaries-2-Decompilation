@@ -891,3 +891,43 @@ fn key_listeners_hear_key_presses() {
     rt.key_up(36);
     assert!(rt.avm.keys_down.is_empty());
 }
+
+#[test]
+fn a_word_wrapped_field_measures_its_wrapped_lines() {
+    let field = EditText {
+        bounds: [0.0, 0.0, 604.0, 40.0],
+        height: 20.0,
+        word_wrap: true,
+        ..EditText::default()
+    };
+    // 92 characters at 11 px: 1012 px in 600, two lines of 24 px.
+    let hint = "x".repeat(92);
+    let round = |(w, h): (f32, f32)| (w.round(), h.round());
+    assert_eq!(round(field.text_size(&hint)), (600.0, 48.0));
+    // A short line, and two explicit ones.
+    assert_eq!(round(field.text_size("Loading")), (77.0, 24.0));
+    assert_eq!(field.text_size("a\nb").1, 48.0);
+    // Without word wrap, one line however long.
+    let one = EditText {
+        word_wrap: false,
+        ..field
+    };
+    assert_eq!(round(one.text_size(&hint)), (1012.0, 24.0));
+}
+
+#[test]
+fn going_back_keeps_an_instance_the_target_frame_has_too() {
+    let lib = library(vec![vec![put(1, 2, at(0.0, 0.0), "clip")]], sprite_frames());
+    let mut p = Player::new(lib);
+    let clip = p.child(p.root, "clip").unwrap();
+    let square = p.child(clip, "square").unwrap();
+    p.goto(clip, 1);
+    // A script's change to it (as a text field's text would be).
+    p.clip_mut(square).unwrap().visible = false;
+    p.goto(clip, 0);
+    // The same instance, its change kept, placed as frame one has it.
+    let again = p.clip(clip).unwrap().children[&(1 + TIMELINE_DEPTH)];
+    assert_eq!(again, square);
+    assert!(!p.clip(square).unwrap().visible);
+    assert_eq!(p.clip(square).unwrap().matrix.tx, 0.0);
+}

@@ -53,6 +53,7 @@ mod gamehud;
 mod hero;
 mod hijack;
 mod input;
+mod loading;
 mod mission;
 mod movie;
 mod moving;
@@ -207,6 +208,9 @@ struct Options {
     /// With `--screenshot`: seconds the game's HUD runs before the
     /// picture (2, or 0.5 with `--hit-from`).
     hud_seconds: Option<f64>,
+    /// With `--screenshot`: the picture is of the loading screen this many
+    /// seconds after it came up (as at the start, the island loading).
+    loading_seconds: Option<f64>,
     /// With `--screenshot` on foot: call a Satellite Guided Bomb on the
     /// spot ahead of her, the picture with the support menu open (menu),
     /// through the satellite's view, with the timing wheel up, or after
@@ -481,6 +485,13 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--hud-seconds" => {
                 o.hud_seconds = Some(value()?.parse().context("--hud-seconds expects seconds")?)
+            }
+            "--loading-screen" => {
+                o.loading_seconds = Some(
+                    value()?
+                        .parse()
+                        .context("--loading-screen expects seconds")?,
+                )
             }
             "--weapon" => {
                 o.weapon = Some(match value()?.as_str() {
@@ -825,6 +836,26 @@ fn game_hud(
             game.combat.max_hp,
         )),
         _ => None,
+    }
+}
+
+/// The game's loading screen from the install's `Loading.wad`, if it
+/// reads.
+fn loading_screen(install: Option<&Install>) -> Option<loading::LoadingScreen> {
+    match loading::LoadingScreen::open(&install?.data) {
+        Ok(screen) => {
+            eprintln!(
+                "loading screen: {} read, {} of {} hints",
+                loading::MOVIE,
+                screen.hints_read(),
+                loading::HINTS.len()
+            );
+            Some(screen)
+        }
+        Err(e) => {
+            eprintln!("loading screen: none ({e})");
+            None
+        }
     }
 }
 
@@ -1355,6 +1386,7 @@ fn screenshot(
     // gun box to have switched; half of one for hits, whose arcs fade).
     let mut hud = ui::Hud::new();
     hud.game = game_hud(install, mode, options.old_hud, &game);
+    hud.loading = loading_screen(install);
     let mut settings = config.clone();
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
@@ -1375,7 +1407,19 @@ fn screenshot(
         );
         info.game = Some(gamehud::HudState::of(&mut game));
     }
-    let _ = hud.build(ui::headless_input(w, h, 1.0), &info, &mut settings);
+    // The loading screen as at the start (`--loading-screen`): up from
+    // the first frame, run at 30 fps.
+    let mut time = 1.0;
+    if let Some(seconds) = options.loading_seconds {
+        info.loading = Some("--loading-screen".into());
+        let frames = (seconds * 30.0).round() as u32;
+        for i in 0..frames {
+            let t = f64::from(i) / 30.0;
+            let _ = hud.build(ui::headless_input(w, h, t), &info, &mut settings);
+        }
+        time = f64::from(frames) / 30.0;
+    }
+    let _ = hud.build(ui::headless_input(w, h, time), &info, &mut settings);
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
     write_ppm(&backend, out)?;
     eprintln!("wrote {}", out.display());
@@ -2489,6 +2533,9 @@ fn mission_for_screenshot(
     let mut auto = options.autoplay.then(autoplay::Autoplay::default);
     let mut contract_done: Option<u32> = None;
     let mut late_hud: Option<(ui::Hud, Config)> = None;
+    // The loading screen's steps over the scripts' fades until the late HUD
+    // (which draws it) runs, logged.
+    let mut screen_cycle = loading::Cycle::default();
     let played = Instant::now();
     let every = if auto.is_some() { 10 } else { 30 };
     // With --autoplay, a picture of each delivery as its helicopter
@@ -2692,12 +2739,19 @@ fn mission_for_screenshot(
         if options.movies {
             movies_offscreen(&mut link, install, out);
         }
+        if late_hud.is_none() {
+            let wanted = screen_cycle.wanted(false, link.black(), tick);
+            for step in screen_cycle.update(wanted, tick, false) {
+                eprintln!("loading screen: {step:?} at {:.1} s", i as f32 * tick);
+            }
+        }
         // After the contract (--after-contract) the game's HUD runs too:
         // the flow waits on its fanfare closing.
         if contract_done.is_some() {
             let (hud, settings) = late_hud.get_or_insert_with(|| {
                 let mut hud = ui::Hud::new();
                 hud.game = game_hud(Some(install), &Mode::Island(None), false, game);
+                hud.loading = loading_screen(Some(install));
                 hud.wait = true;
                 if let Some(g) = &mut hud.game {
                     g.log_to(&out.with_file_name(format!("{stem}-late-hud.log")));
@@ -4710,6 +4764,7 @@ impl App {
         let focused = window.has_focus();
         let mut hud = ui::Hud::new();
         hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud, &game);
+        hud.loading = loading_screen(self.install.as_ref());
         hud.dev = self.dev;
         eprintln!(
             "keys: the developer's (F4 free camera, F5/F9 quick save and load, F3 culling, \

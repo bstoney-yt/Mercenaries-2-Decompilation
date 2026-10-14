@@ -743,6 +743,15 @@ impl MissionLink {
         name.map(|n| (n, subtitles))
     }
 
+    /// How black the scripts' fade has the screen, 0 to 1 (0 until they
+    /// run).
+    pub fn black(&self) -> f32 {
+        match &self.state {
+            State::Running(m) => m.black(),
+            _ => 0.0,
+        }
+    }
+
     /// The game's English strings, once the scripts run.
     pub fn strings(&self) -> Option<&m2_assets::StringTable> {
         match &self.state {

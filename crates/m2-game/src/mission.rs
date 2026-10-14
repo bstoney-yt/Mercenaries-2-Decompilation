@@ -169,9 +169,10 @@ if rawget(m, "_bCurrentlyFadedIn") then return 1 end
 return 0
 "#;
 
-/// Seconds the fade's wipe takes (inferred: the movie's own length is not
-/// read yet).
-const FADE_WIPE: f64 = 1.0;
+/// Seconds the fade's wipe takes, each way: the movie's 60 frames at
+/// 30 fps (`_fadeOn` to `wipeComplete`, `_fadeOff` to `close`; from
+/// `Loading.wad`).
+const FADE_WIPE: f64 = 2.0;
 
 /// Skip mode (which [`Mission::start`] turns on so the intro movies end
 /// at once) also has `MrxUtil.TeleportHeroesToLocations` skip the
@@ -2234,6 +2235,8 @@ mod tests {
         let lua = m.host.lua();
         assert!(lua.globals().get::<bool>("called").unwrap());
         assert_eq!(m.black(), 1.0);
+        // The wipe takes the movie's two seconds.
+        assert!(blacks[17] < 1.0 && blacks[21] >= 1.0, "{blacks:?}");
         // Back, and at once to black again: the fade back gives way.
         lua.load("Fade.GlobalFadeFromBlack() Fade.GlobalFadeToBlack(function() end)")
             .exec()
