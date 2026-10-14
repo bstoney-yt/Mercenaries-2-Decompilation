@@ -28,6 +28,7 @@ use m2_render::{
 use crate::cache;
 use crate::combat::{self, Arsenal, Effect, Weapon};
 use crate::flights::{FlightModel, Flights};
+use crate::held;
 use crate::hero::{self, Hero};
 use crate::npc::{self, People, PersonKind};
 use crate::player::Player;
@@ -96,6 +97,10 @@ pub struct Rig {
     /// which the weapons' grip and the aim's hands are read from. `None`:
     /// the aim clip by name.
     pub aim_clip: Option<usize>,
+    /// Whether an aim is turned along [`Rig::aim`] by the rifle's barrel
+    /// (rear hand to front): not with a pistol up, held in one hand
+    /// (round 13: turned so, the one-handed aim bent her double).
+    pub barrel: bool,
 }
 
 /// Most clip events a rig keeps for the taking (older ones are dropped:
@@ -240,6 +245,7 @@ fn table_clips(
             match p.by {
                 Precedence::Own => format!("{whose} own rifle row"),
                 Precedence::Equipment => "anyone's rifle row".to_owned(),
+                Precedence::OwnAny => format!("{whose} own row"),
                 Precedence::Handle => "anyone's row".to_owned(),
             }
         )
@@ -309,6 +315,80 @@ fn table_clips(
     let gait = rig.gait;
     rig.set_gait(gait);
     TableClips { settled, from }
+}
+
+/// The clips `hero` plays for each class of weapon held, a switch and a
+/// pickup ([`held::resolve`]), from the on-foot and the stance and
+/// action tables; the rifle's are `clips` and the rig's gaits as already
+/// picked. Logged: "hero moves: <hero>: <class>: ..." a class, and
+/// "hero moves: <hero>: pickup <hash>".
+fn hero_moves(
+    source: &mut AssetSource<BufReader<File>>,
+    set: Option<(u32, u32)>,
+    hero: Hero,
+    rig: &Rig,
+    clips: npc::FightClips,
+) -> held::Moves {
+    use m2_assets::animation_table::{self as table, AnimationTable};
+    let mut read = |hash: u32| {
+        source
+            .asset(hash, table::ANIMATION_TABLE_TYPE)
+            .map_err(anyhow::Error::from)
+            .and_then(|a| Ok(AnimationTable::parse(&a)?))
+    };
+    let (t, actions) = match (read(table::CHARACTER_ANIMATIONS), read(table::ACTIONS)) {
+        (Ok(t), Ok(a)) => (t, a),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("hero moves: {hero}: no animation tables: {e:#}");
+            return held::Moves::default();
+        }
+    };
+    let who = set.unwrap_or((
+        m2_assets::name_hash("Hero"),
+        m2_assets::name_hash(hero.name()),
+    ));
+    let gaits: Vec<(Gait, usize)> = rig.locomotion.as_ref().map_or_else(Vec::new, |l| {
+        let mut g: Vec<_> = l.clips.iter().map(|(&g, &i)| (g, i)).collect();
+        g.sort_by_key(|(g, _)| format!("{g:?}"));
+        g
+    });
+    let moves = held::resolve(&t, &actions, who, rig, clips, &gaits, &GAIT_KEYS);
+    let h =
+        |i: Option<usize>| i.map_or("none".to_owned(), |i| format!("{:08x}", rig.clips[i].hash));
+    for (held, name) in moves.held.iter().zip(held::CLASSES) {
+        let gaits: Vec<String> = held
+            .gaits
+            .iter()
+            .map(|(g, i)| format!("{} {}", format!("{g:?}").to_lowercase(), h(Some(*i))))
+            .collect();
+        let moves_of = |map: &HashMap<(held::Side, bool), usize>| {
+            let mut v: Vec<String> = map
+                .iter()
+                .map(|(&(side, run), &i)| {
+                    let s = if side == held::Side::Right {
+                        "right"
+                    } else {
+                        "left"
+                    };
+                    let r = if run { "run" } else { "idle" };
+                    format!("{s} {r} {}", h(Some(i)))
+                })
+                .collect();
+            v.sort();
+            v.join(", ")
+        };
+        eprintln!(
+            "hero moves: {hero}: {name}: aim {}, ready {}, run {}, gaits {}; stow {}; take up {}",
+            h(held.clips.aim),
+            h(held.clips.ready),
+            h(held.clips.run_low),
+            gaits.join(", "),
+            moves_of(&held.stow),
+            moves_of(&held.equip)
+        );
+    }
+    eprintln!("hero moves: {hero}: pickup {}", h(moves.pickup));
+    moves
 }
 
 /// One line for each of `hero`'s fight clips, once the table's and the
@@ -474,6 +554,7 @@ impl Rig {
             own: Default::default(),
             foreign: Default::default(),
             aim_clip: None,
+            barrel: true,
             gait: Gait::Idle,
             cues: Vec::new(),
         })
@@ -496,6 +577,7 @@ impl Rig {
             own: Default::default(),
             foreign: Default::default(),
             aim_clip: None,
+            barrel: true,
         };
         rig.set_gait(gait);
         rig
@@ -509,6 +591,7 @@ impl Rig {
             own: Default::default(),
             foreign: Default::default(),
             aim_clip: None,
+            barrel: true,
             hands: Default::default(),
             animator: Animator::default(),
             cues: Vec::new(),
@@ -570,7 +653,7 @@ impl Rig {
 
     /// The pose turned to aim along [`Rig::aim`], when aiming.
     pub fn aimed_pose(&self) -> Option<Pose> {
-        let want = self.aim.filter(|_| self.two_handed)?;
+        let want = self.aim.filter(|_| self.two_handed && self.barrel)?;
         let mut pose = self.animator.pose(&self.skeleton, &self.clips);
         self.point(&mut pose, want);
         Some(pose)
@@ -1483,8 +1566,12 @@ impl Scene {
             rig.set_aim_clip(clips.aim);
             self.arsenal.rehold(rig);
         }
+        let moves = match &model {
+            Some((_, rig)) => hero_moves(source, set, hero, rig, clips),
+            None => held::Moves::default(),
+        };
         if let Some(player) = &mut self.player {
-            player.set_body(model, clips);
+            player.set_body(model, clips, moves);
             player.speeds = speeds;
         }
     }
