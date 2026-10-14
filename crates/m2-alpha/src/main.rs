@@ -4476,24 +4476,14 @@ fn demolish_for_screenshot(
         && let (Some(world), Some(install)) =
             (game.scene.world.as_mut(), game.scene.install.as_ref())
     {
-        let e = world
-            .index
-            .template_db
-            .id("Explosion (Handheld RPG)")
-            .and_then(|id| world.index.template_db.explosions.get(&id).copied());
         for k in 0..rockets {
             if game.destruction.destroyed.contains(&i) {
                 break;
             }
-            let blast = destruct::Blast {
-                at,
-                radius: e.map_or(5.0, |e| e.radius),
-                damage: e.map_or(200.0, |e| e.damage),
-                least: e.map_or(0.0, |e| e.least),
-                kind: e.map_or(0, |e| e.kind),
-            };
-            game.destruction
-                .blast(world, &mut game.scene.props, install, blast);
+            for blast in crate::game::rocket_blasts(&world.index.template_db, at) {
+                game.destruction
+                    .blast(world, &mut game.scene.props, Some(install), blast);
+            }
             eprintln!(
                 "demolish: no rocket left her; direct blast {} at {at:.1}: damage {:.0}",
                 k + 1,

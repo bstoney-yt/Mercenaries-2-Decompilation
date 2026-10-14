@@ -107,6 +107,8 @@ pub struct Props {
     /// The templates whose objects are physics props (`_PropPhysics`), by
     /// id: those whose model has no body that moves come loose as one.
     pub physics_props: HashMap<u32, m2_engine::durability::PropPhysics>,
+    /// Shown since their model came in, their collision not yet up.
+    unwalled: HashSet<u32>,
 }
 
 /// What [`Props::draw`] draws of a model broken apart.
@@ -236,9 +238,18 @@ impl Props {
             );
             added += 1;
             self.changes += 1;
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.models.entry(o.model) {
-                slot.insert(None);
-                self.waiting.insert(o.model);
+            match self.models.entry(o.model) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(None);
+                    self.waiting.insert(o.model);
+                }
+                // Its model is in already: its collision goes up at the
+                // next update (round 6b found barricades and crates put up
+                // again by a later layer standing with none).
+                std::collections::hash_map::Entry::Occupied(m) if m.get().is_some() => {
+                    self.unwalled.insert(e);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
             }
         }
         if !self.waiting.is_empty() && self.loaders.is_none() {
@@ -954,6 +965,23 @@ impl Props {
         reach: f32,
     ) -> anyhow::Result<()> {
         self.reach = reach;
+        // Those shown since their model came in: their collision.
+        for e in std::mem::take(&mut self.unwalled) {
+            let Some(p) = self.shown.get(&e) else {
+                continue;
+            };
+            let shape = (self.models.get(&p.model))
+                .and_then(Option::as_ref)
+                .and_then(|m| m.collision.as_ref());
+            if let Some(shape) = shape
+                && stands(e)
+                && !p.wrecked
+                && !self.knocked.contains_key(&e)
+                && !physics.has_static(StaticKey::Entity(e))
+            {
+                physics.add_static(StaticKey::Entity(e), shape, p.position, p.rotation);
+            }
+        }
         let Some(loaders) = &self.loaders else {
             return Ok(());
         };

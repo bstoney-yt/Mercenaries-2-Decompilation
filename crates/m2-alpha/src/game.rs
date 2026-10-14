@@ -1107,7 +1107,7 @@ impl Game {
                                 kind: e.map_or(0, |e| e.kind),
                             };
                             self.destruction
-                                .blast(world, &mut scene.props, install, blast);
+                                .blast(world, &mut scene.props, Some(install), blast);
                         }
                     }
                 }
@@ -2006,38 +2006,22 @@ fn hit_world(
     destruction: &mut Destruction,
     combat: &mut Combat,
 ) {
-    // Rounds, blows and blasts wear down the physics props first (a café
-    // chair breaks to a clip; a box takes nothing); what still stands
-    // and comes loose is knocked loose after.
+    // Rounds, blows and blasts wear down what they reach, each as the
+    // damage table's row for it says (a café chair breaks to a clip; a
+    // box or a wall takes nothing of a round); what still stands and
+    // comes loose is knocked loose after. A round does nothing to what
+    // has no row.
     for s in &combat.struck {
         if let Some(key) = s.key {
-            destruction.wear(world, props, install, key, (s.round, s.kind), s.at);
+            destruction.wear(world, props, install, key, (s.round, s.kind, 0.0), s.at);
         }
     }
-    let (radius, damage, least) = blast_strength(&world.index.template_db);
     for &at in &combat.went_off {
-        let blast = Blast {
-            at,
-            radius,
-            damage,
-            least,
-            kind: 0,
-        };
-        destruction.blast_props(world, props, install, blast);
-    }
-    blast_loose(world, props, &combat.went_off, combat::REACH, false);
-    if let Some(install) = install {
-        for &at in &combat.went_off {
-            let blast = Blast {
-                at,
-                radius,
-                damage,
-                least,
-                kind: 0,
-            };
+        for blast in rocket_blasts(&world.index.template_db, at) {
             destruction.blast(world, props, install, blast);
         }
     }
+    blast_loose(world, props, &combat.went_off, combat::REACH, false);
     let mut broken = flights.strike(&mut world.physics, &combat.struck, &combat.went_off);
     // The state layers' crates too ([`crate::placed`]).
     broken.extend(placed.strike(
@@ -2682,5 +2666,49 @@ mod tests {
             vehicle_name(&db, Some(&strings), "vz_veh_truck_M151", 7),
             "M151 Softtop (V2)"
         );
+    }
+
+    #[test]
+    fn an_rpg_blasts_with_its_explosion_frag_and_rocket_from_the_data() {
+        let key = m2_assets::name_hash;
+        let e = |radius, damage, least, kind: &str| Explosion {
+            radius,
+            damage,
+            least,
+            kind: key(kind),
+        };
+        let db = Templates {
+            names: HashMap::from([
+                (0x8000_0001, "Explosion (Handheld RPG)".to_owned()),
+                (0x8000_0002, "Explosion (Handheld RPG Frag)".to_owned()),
+                (0x8000_0003, "RPG Rocket".to_owned()),
+            ]),
+            explosions: HashMap::from([
+                (0x8000_0001, e(5.0, 200.0, 0.0, "Explosion")),
+                (0x8000_0002, e(15.0, 300.0, 40.0, "Bullet")),
+            ]),
+            projectiles: HashMap::from([(
+                0x8000_0003,
+                m2_engine::durability::Projectile {
+                    damage: 100.0,
+                    kind: key("Rocket"),
+                },
+            )]),
+            ..Templates::default()
+        };
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        let blasts = rocket_blasts(&db, at);
+        let kinds: Vec<u32> = blasts.iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, [key("Explosion"), key("Bullet"), key("Rocket")]);
+        assert!(blasts.iter().all(|b| b.at == at));
+        // The rocket only on what it lands on.
+        assert_eq!(blasts[2].at_distance(0.2), 100.0);
+        assert_eq!(blasts[2].at_distance(1.0), 0.0);
+        // The frag still bites at 10 m.
+        assert!(blasts[1].at_distance(10.0) > 100.0);
+        // With none in the data: one blast of combat's own, taken in full.
+        let none = rocket_blasts(&Templates::default(), at);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].kind, 0);
     }
 }

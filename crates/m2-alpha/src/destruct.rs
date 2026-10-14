@@ -229,23 +229,23 @@ pub struct Destruction {
     worn: HashMap<StaticKey, f32>,
 }
 
-/// The damage table's column for a blast (the RPG's, the grenade's:
-/// their templates' `DamageKey`).
-const EXPLOSION: &str = "Explosion";
-
 impl Destruction {
     /// The damage placed object `i` has taken.
     pub fn damage(&self, i: usize) -> f32 {
         self.taken.get(&i).copied().unwrap_or(0.0)
     }
 
-    /// Wears down physics prop `key` (the island's placed object or a
-    /// state layer's, its template `_PropPhysics`) by `damage` of kind
-    /// `kind` (a `DamageKey`'s name hash) landing at `at`: as much as its
-    /// `ModifierKey` row of the damage table takes of that kind (a
-    /// `PropFragile` chair all of a `Bullet`, half of an `Explosion`; a
-    /// `Prop` box nothing). At its `Health` it breaks: its wreck if its
-    /// model has one, else it goes flying ([`blown`]). True if it broke.
+    /// Wears down what `key` is (the island's placed object or a state
+    /// layer's) by `damage` of kind `kind` (a `DamageKey`'s name hash; 0
+    /// for none) landing at `at`: as much as its template's `ModifierKey`
+    /// row of the damage table takes of that kind (a `PropFragile` chair
+    /// all of a `Bullet`, half of an `Explosion`; a `Prop` box and a
+    /// `Building` wall nothing of either), or `unrowed` of it for a
+    /// template with no row. At its `Health` it breaks: its wreck if its
+    /// model has one, else it goes flying ([`blown`]). Only what has
+    /// something to show broken (a wreck, or a model that comes loose)
+    /// is worn, and not what the scripts or the pickups bring down (a
+    /// mission's gates, crates). True if it broke.
     #[allow(clippy::too_many_arguments)]
     pub fn wear(
         &mut self,
@@ -253,7 +253,7 @@ impl Destruction {
         props: &mut Props,
         install: Option<&Install>,
         key: StaticKey,
-        (damage, kind): (f32, u32),
+        (damage, kind, unrowed): (f32, u32, f32),
         at: Vec3,
     ) -> bool {
         let template = match key {
@@ -262,13 +262,21 @@ impl Destruction {
                     || world.destroyed.contains(&i)
                     || world.is_taken(i)
                     || world.knocked_loose(i).is_some()
+                    || !world
+                        .object_model(i)
+                        .is_some_and(|m| m.has_wreck() || world.loose_mass(i).is_some())
                 {
                     return false;
                 }
                 world.index.objects[i].template
             }
             StaticKey::Entity(e) => match props.get(e) {
-                Some((p, _)) if !p.wrecked && !adopted(e) && props.knocked_loose(e).is_none() => {
+                Some((p, _))
+                    if !p.wrecked
+                        && !adopted(e)
+                        && !props.sturdy.contains(&e)
+                        && props.knocked_loose(e).is_none() =>
+                {
                     p.template
                 }
                 _ => return false,
@@ -276,38 +284,42 @@ impl Destruction {
             _ => return false,
         };
         let db = &world.index.template_db;
-        if !db.prop_physics.contains_key(&template) {
+        if crate::placed::kind(db, template).is_some()
+            || db.names.get(&template).is_some_and(|n| n.contains("Cash"))
+        {
             return false;
         }
-        let Some(health) = db.health.get(&template).copied().filter(|h| *h > 0.0) else {
+        let Some(durability) = db.durability.get(&template).filter(|d| !d.invincible) else {
             return false;
         };
-        let scale = db
-            .modifiers
-            .get(&template)
-            .zip(db.damage.as_ref())
-            .and_then(|(&row, table)| table.scale(row, kind))
-            .unwrap_or(0.0);
+        let health = durability.health;
+        if health <= 0.0 {
+            return false;
+        }
+        let scale = match (db.modifiers.get(&template), db.damage.as_ref()) {
+            _ if kind == 0 => 1.0,
+            (Some(&row), Some(table)) => table.scale(row, kind).unwrap_or(0.0),
+            _ => unrowed,
+        };
         let hit = damage * scale;
         if hit <= 0.0 {
             return false;
         }
-        let taken = self.worn.entry(key).or_default();
+        let taken = match key {
+            StaticKey::Object(i) => self.taken.entry(i).or_default(),
+            _ => self.worn.entry(key).or_default(),
+        };
         *taken += hit;
         if *taken < health {
             return false;
         }
         let taken = *taken;
-        let name = db
-            .names
-            .get(&template)
-            .map_or("?", String::as_str)
-            .to_owned();
-        let sound = db.sound_keys.get(&template).copied();
+        let name = db.names.get(&template).map_or("?", String::as_str);
         eprintln!(
-            "destruct: physics prop {key:?} ({name}) broken at {at:.1}: {taken:.0} of {health:.0} \
-             health, last {hit:.0}"
+            "destruct: {key:?} ({name}) broken at {at:.1}: {taken:.0} of {health:.0} health, last \
+             {hit:.0} ({damage:.0} of kind {kind:08x} x {scale})"
         );
+        let sound = db.sound_keys.get(&template).copied();
         match key {
             StaticKey::Object(i) => match install {
                 Some(install) => self.bring_down(world, props, install, i, Cause::Blast(at)),
@@ -324,17 +336,17 @@ impl Destruction {
         true
     }
 
-    /// Wears down the physics props `blast` reaches ([`wear`](Self::wear)),
-    /// the island's and the state layers', by its damage where it reaches
-    /// each (as far as its box's middle less half its size).
-    pub fn blast_props(
+    /// Wears down what `blast` reaches ([`wear`](Self::wear)), the
+    /// island's placed objects and the state layers' props, by its damage
+    /// where it reaches each (as far as its box's middle less half its
+    /// size), of its kind; those it breaks come down.
+    pub fn blast(
         &mut self,
         world: &mut World,
         props: &mut Props,
         install: Option<&Install>,
         blast: Blast,
     ) {
-        let kind = m2_assets::name_hash(EXPLOSION);
         let mut reached: Vec<(StaticKey, f32)> = world
             .near(blast.at, blast.radius)
             .into_iter()
@@ -349,47 +361,14 @@ impl Destruction {
         }
         for (key, d) in reached {
             let damage = blast.at_distance(d);
-            self.wear(world, props, install, key, (damage, kind), blast.at);
-        }
-    }
-
-    /// Wears down what `blast` reaches; those it destroys come down.
-    /// Physics props are worn down by [`blast_props`](Self::blast_props).
-    pub fn blast(&mut self, world: &mut World, props: &mut Props, install: &Install, blast: Blast) {
-        for (i, d) in world.near(blast.at, blast.radius) {
-            if self.destroyed.contains(&i)
-                || world.destroyed.contains(&i)
-                || world.loose_mass(i).is_some()
-                || (world.index.template_db.prop_physics)
-                    .contains_key(&world.index.objects[i].template)
-            {
-                continue;
-            }
-            let o = world.index.objects[i];
-            let Some(durability) = world.index.template_db.durability.get(&o.template) else {
-                continue;
-            };
-            if durability.invincible || durability.health <= 0.0 {
-                continue;
-            }
-            let Some(m) = world.object_model(i) else {
-                continue;
-            };
-            if !m.has_wreck() {
-                continue;
-            }
-            let hit = blast.at_distance(d);
-            let taken = self.taken.entry(i).or_default();
-            *taken += hit;
-            if *taken < durability.health {
-                continue;
-            }
-            eprintln!(
-                "destruct: object {i} ({:08x}, template {:08x}) destroyed at {:.1}: {:.0} of {:.0} \
-                 health, last {hit:.0} at {d:.1} m",
-                o.model, o.template, o.position, taken, durability.health
+            self.wear(
+                world,
+                props,
+                install,
+                key,
+                (damage, blast.kind, 1.0),
+                blast.at,
             );
-            self.bring_down(world, props, install, i, Cause::Blast(blast.at));
         }
     }
 
