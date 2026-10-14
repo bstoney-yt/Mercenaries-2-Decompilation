@@ -86,6 +86,22 @@ const TOPPLE: f32 = 0.3;
 /// (metres).
 const BOMB_DROP: f32 = 600.0;
 
+/// A move by the scripts longer than this, metres, is a load with the
+/// loading screen up (inferred: the footage shows it on the move to PMC
+/// HQ at 19:54; the length that makes one is not known).
+pub const FAR_TELEPORT: f32 = 300.0;
+/// Seconds an arrival's load lasts at least, and at most (invented; the
+/// footage's screen there is up about 4 s with its wipes).
+pub const ARRIVAL_MIN: f32 = 1.0;
+pub const ARRIVAL_CAP: f32 = 20.0;
+
+/// Whether an arrival's load `t` seconds in is over: its place `in_place`
+/// (nothing near still loading) after [`ARRIVAL_MIN`], or at
+/// [`ARRIVAL_CAP`] whatever.
+fn arrived(t: f32, in_place: bool) -> bool {
+    t >= ARRIVAL_CAP || (t >= ARRIVAL_MIN && in_place)
+}
+
 #[derive(Debug)]
 pub struct Game {
     pub scene: Scene,
@@ -114,6 +130,11 @@ pub struct Game {
     /// from; `None` places them from every static layer (`--mission`,
     /// where the scripts' own layers rule).
     pub startup: Option<Startup>,
+    /// Seconds since the scripts moved her far ([`teleported`]), while
+    /// the place she came to still loads: the loading screen is up.
+    ///
+    /// [`teleported`]: Self::teleported
+    pub arrival: Option<f32>,
     /// The start-up's state layers have their models up.
     props_up: bool,
     /// The driver's throttle last tick, -1 (reverse) to 1.
@@ -221,6 +242,7 @@ impl Game {
             paths: crate::paths::PathMoves::default(),
             vehicle_wait: 0.0,
             startup: None,
+            arrival: None,
             props_up: false,
             throttle: 0.0,
             spray_wait: 0.0,
@@ -481,6 +503,33 @@ impl Game {
         }
     }
 
+    /// The scripts moved her from `from` to `to`: past [`FAR_TELEPORT`]
+    /// that is a load (the second contract's end takes her to PMC HQ), and
+    /// the loading screen stays up while the place loads.
+    pub fn teleported(&mut self, from: Vec3, to: Vec3) {
+        if from.distance(to) > FAR_TELEPORT {
+            self.arrival = Some(0.0);
+        }
+    }
+
+    /// The arrival's load, `dt` seconds on: over once her surroundings are
+    /// in (after [`ARRIVAL_MIN`]), or after [`ARRIVAL_CAP`] whatever.
+    fn arrive(&mut self, dt: f32) {
+        let Some(t) = &mut self.arrival else { return };
+        *t += dt;
+        let counts = self.scene.props.counts();
+        let in_place = counts.loading + counts.waiting_near == 0
+            && self
+                .scene
+                .world
+                .as_ref()
+                .is_none_or(|w| w.stats().pending == 0);
+        if arrived(*t, in_place) {
+            eprintln!("arrival: loaded after {t:.1} s");
+            self.arrival = None;
+        }
+    }
+
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
         self.update_sky(dt);
@@ -488,6 +537,7 @@ impl Game {
         self.moving.update(&mut self.scene, focus, dt);
         self.startup_props();
         self.fetch_world_vehicles(dt);
+        self.arrive(dt);
         let intent = if self.input_locked {
             Intent::default()
         } else {
@@ -1403,6 +1453,7 @@ impl Game {
             Some(_) if self.scene.vehicles_loading() => {
                 Some("Finding vehicles and people...".to_owned())
             }
+            _ if self.arrival.is_some() => Some("Arriving...".to_owned()),
             _ => None,
         };
         let driving = player.and_then(|p| p.driving).and_then(|i| {
@@ -2716,6 +2767,16 @@ mod tests {
     use m2_engine::TemplateInfo;
 
     use super::*;
+
+    #[test]
+    fn an_arrival_loads_until_its_place_is_in_or_its_time_is_up() {
+        // Not before the least time, even with everything in.
+        assert!(!arrived(ARRIVAL_MIN - 0.1, true));
+        assert!(arrived(ARRIVAL_MIN, true));
+        // Still loading: up until the cap.
+        assert!(!arrived(ARRIVAL_CAP - 0.1, false));
+        assert!(arrived(ARRIVAL_CAP, false));
+    }
 
     #[test]
     fn the_use_prompt_names_vehicles_as_the_game_shows_them() {

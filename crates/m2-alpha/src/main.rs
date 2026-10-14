@@ -2740,7 +2740,7 @@ fn mission_for_screenshot(
             movies_offscreen(&mut link, install, out);
         }
         if late_hud.is_none() {
-            let wanted = screen_cycle.wanted(false, link.black(), tick);
+            let wanted = screen_cycle.wanted(game.arrival.is_some(), link.black(), tick);
             for step in screen_cycle.update(wanted, tick, false) {
                 eprintln!("loading screen: {step:?} at {:.1} s", i as f32 * tick);
             }

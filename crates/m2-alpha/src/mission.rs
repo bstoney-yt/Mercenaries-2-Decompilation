@@ -2619,6 +2619,11 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             game.sky.immediate = *on;
             return false;
         }
+        // Up until the place has loaded (the engine's to take down).
+        Command::LoadingScreen(on) => {
+            game.arrival = on.then_some(0.0);
+            return false;
+        }
         // A state layer in or out: its models and people with it.
         Command::Layer { op, name } => {
             let entities: Vec<u32> = mission
@@ -2666,6 +2671,9 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
         _ => None,
     };
     let Some(to) = to else { return false };
+    if let Some(from) = game.scene.player.as_ref().map(|p| p.character.position) {
+        game.teleported(from, Vec3::from(to));
+    }
     if let Some(p) = game.scene.player.as_mut() {
         // At the height they give: onto the floor or ground there, not a
         // roof over it.

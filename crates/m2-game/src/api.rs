@@ -214,6 +214,10 @@ pub enum Command {
     /// Atmosphere changes from now on happen at once (true) or ease in
     /// over their records' time (false).
     AtmosphereImmediate(bool),
+    /// The loading screen up (true) or down (`Net.SetLoadingScreen`): the
+    /// teleport helpers and state changes put it up before a move; the
+    /// engine takes it down once the place has loaded.
+    LoadingScreen(bool),
     /// A call the game only needs to hear about:
     /// `"Pg.ContractActivated"`, `"Pg.ContractCompleted"`, ...
     Notify(String),
@@ -1884,6 +1888,11 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     ] {
         add(&net, name, |_, _, _| values([]))?;
     }
+    add(&net, "SetLoadingScreen", |w, _, a| {
+        let on = matches!(a.first(), Some(Value::Boolean(true)));
+        w.commands.push(Command::LoadingScreen(on));
+        values([])
+    })?;
 
     // Calls the game only needs to hear about.
     add(&pg, "SaveGame", |w, _, a| {
@@ -3297,6 +3306,20 @@ mod tests {
             .eval()
             .unwrap();
         assert!(server && !client && second.is_nil());
+    }
+
+    #[test]
+    fn the_scripts_put_the_loading_screen_up() {
+        let (host, world) = setup();
+        world.borrow_mut().take_commands();
+        host.lua()
+            .load("Net.SetLoadingScreen(true) Net.SetLoadingScreen(false)")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            world.borrow_mut().take_commands(),
+            [Command::LoadingScreen(true), Command::LoadingScreen(false)]
+        );
     }
 
     #[test]
