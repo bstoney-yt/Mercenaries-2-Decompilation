@@ -2308,6 +2308,27 @@ pub(crate) fn rocket_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
     out
 }
 
+/// Whether an ordinary blast throws loose what template `t`'s objects
+/// are: a light physics prop (`_PropPhysics`, not one of the heavy ones:
+/// a chair, a box, a barricade), or what the damage table's row for it
+/// takes something of a blast's explosion or frag (`Explosion`,
+/// `Bullet`: a lamp, a fence). A wall (`Building`) or a shipping
+/// container (`Tank`, 20,000 kg) takes nothing of either and stands, its
+/// breakable parts with it; one with no row is thrown as before.
+fn blown_loose(db: &Templates, t: u32) -> bool {
+    if let Some(p) = db.prop_physics.get(&t) {
+        return !p.heavy;
+    }
+    let (Some(&row), Some(table)) = (db.modifiers.get(&t), db.damage.as_ref()) else {
+        return true;
+    };
+    ["Explosion", "Bullet"].iter().any(|k| {
+        table
+            .scale(row, m2_assets::name_hash(k))
+            .is_some_and(|s| s > 0.0)
+    })
+}
+
 fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32, strike: bool) {
     let thrown = |blast: Vec3, at: Vec3, d: f32| {
         let near = (1.0 - d / reach).clamp(0.0, 1.0);
@@ -2318,13 +2339,20 @@ fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32
     };
     for &at in blasts {
         for (i, d) in world.loose_near(at, reach) {
-            let (velocity, spin) = thrown(at, world.index.objects[i].position, d);
+            let o = world.index.objects[i];
+            if !strike && !blown_loose(&world.index.template_db, o.template) {
+                continue;
+            }
+            let (velocity, spin) = thrown(at, o.position, d);
             world.knock(i, velocity, spin);
         }
         for (e, d) in props.loose_near(&world.physics, at, reach, strike) {
-            let Some(p) = props.get(e).map(|(p, _)| p.position) else {
+            let Some((p, template)) = props.get(e).map(|(p, _)| (p.position, p.template)) else {
                 continue;
             };
+            if !strike && !blown_loose(&world.index.template_db, template) {
+                continue;
+            }
             let (velocity, spin) = thrown(at, p, d);
             props.knock(&mut world.physics, e, velocity, spin, strike);
         }
