@@ -670,7 +670,9 @@ fn reaction(game: &crate::game::Game, key: StaticKey, template: u32) -> Reaction
             props.knocked_loose(e),
             match props.get(e) {
                 None => Some(false),
-                Some((p, _)) => p.wrecked.then_some(true),
+                // Some of its parts broken (a hedge's sections), the rest
+                // standing: broken where it was hit.
+                Some((p, _)) => (p.wrecked || props.parts_broken(e)).then_some(true),
             },
         ),
         _ => (None, None),

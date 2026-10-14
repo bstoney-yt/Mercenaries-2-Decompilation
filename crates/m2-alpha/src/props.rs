@@ -233,6 +233,13 @@ impl Props {
         self.models.get(&p.model)?.as_ref()?.gpu.parts.as_ref()
     }
 
+    /// Whether any of `entity`'s parts is broken, the rest standing.
+    pub fn parts_broken(&self, entity: u32) -> bool {
+        self.parts_down
+            .get(&entity)
+            .is_some_and(|d| d.wrecked.contains(&true))
+    }
+
     /// Whether part `k` of `entity` is broken.
     pub fn part_down(&self, entity: u32, k: usize) -> bool {
         self.parts_down
