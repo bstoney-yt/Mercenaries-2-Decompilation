@@ -1497,7 +1497,8 @@ impl Fleet {
             let (Some(g), Some(id)) = (v.guid, v.id) else {
                 continue;
             };
-            if v.wrecked {
+            // A ruin stands wrecked from the start: nothing died.
+            if v.wrecked && !game.scene.ruins.contains(&g) {
                 mission.kill(g);
             }
             if self.landing.contains_key(&g) {
@@ -1541,8 +1542,15 @@ impl Fleet {
             .count();
         drop(w);
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let w = mission.world().borrow();
         for (_, g, models) in wanted.into_iter().take(MAX_VEHICLES.saturating_sub(live)) {
             self.requested.insert(g);
+            // A vehicle's ruin (`M151_Ruin`) stands wrecked.
+            if let (Some(o), Some(island)) = (w.objects.get(&g), game.scene.world.as_ref())
+                && is_ruin(&island.index.template_db, &o.name)
+            {
+                game.scene.ruins.insert(g);
+            }
             game.scene.load_vehicle(g, models);
         }
     }
@@ -2332,6 +2340,11 @@ pub(crate) fn template_models(
             vehicle: Some(VehicleKind::Boat | VehicleKind::Helicopter),
             ..
         }) => Vec::new(),
+        // A template the database knows with no vehicle physics is no
+        // vehicle, whatever its name's words: `68Valiant_Ruin`, a burnt
+        // car its own model draws, isn't a Valiant to drive (round 8:
+        // the two ruins by VzaCon001's huts stood twice, intact too).
+        Some(&TemplateInfo { vehicle: None, .. }) => Vec::new(),
         _ => vehicle_models(name, catalogue),
     }
 }
@@ -2592,6 +2605,17 @@ fn ai_flown(w: &m2_game::api::ScriptWorld, guid: u32, models: &[CatalogueEntry])
 /// ([`template_models`]): by its name, else (a state layer's renamed
 /// entity, the first contract's `VzaCon001_StartingBoat`) by the template
 /// it is an instance of.
+/// Whether the template an object or entity named `name` is an instance
+/// of stands destroyed ([`Templates::ruined`]: its `Health` is 0): a
+/// vehicle's ruin (`M151_Ruin`, `AMX30_RUIN`) has its intact twin's
+/// model and physics, to stand wrecked.
+pub(crate) fn is_ruin(templates: &Templates, name: &str) -> bool {
+    templates
+        .ids(name)
+        .iter()
+        .any(|id| templates.ruined.contains(id))
+}
+
 fn object_models(
     guid: u32,
     name: &str,
@@ -3088,6 +3112,45 @@ mod tests {
         assert!(models("Alouette3 Transport (VZA Intro) (Driver)").is_empty());
         assert!(models("VZ Soldier 0x00000001").is_empty());
         assert!(models("Supply Drop (GL)").is_empty());
+    }
+
+    #[test]
+    fn a_burnt_car_is_no_car_to_drive_and_a_vehicle_ruin_stands_wrecked() {
+        let catalogue = [
+            entry(1, "car", "global_veh_68valiant"),
+            entry(2, "truck", "vz_veh_truck_m151"),
+        ];
+        let mut db = Templates::default();
+        // `68Valiant_Ruin`: a burnt car of its own model, no vehicle
+        // physics; `M151_Ruin`: the jeep's model and physics, `Health` 0.
+        for (id, name, vehicle) in [
+            (0x8000_6a30, "68Valiant_Ruin", None),
+            (0x9000_01f6, "M151_Ruin", Some(VehicleKind::Car)),
+        ] {
+            let info = TemplateInfo {
+                model: Some(id),
+                vehicle,
+                engine: None,
+                person: false,
+                human: false,
+            };
+            db.by_name.insert(name.to_ascii_lowercase(), info);
+            db.infos.insert(id, info);
+            db.names.insert(id, name.to_owned());
+            db.ruined.insert(id);
+        }
+        // Its name's words (`68valiant`) found the Valiant to drive.
+        assert_eq!(
+            vehicle_models("68Valiant_Ruin 0x00133154", &catalogue).len(),
+            1
+        );
+        assert!(template_models("68Valiant_Ruin 0x00133154", &db, &catalogue).is_empty());
+        assert_eq!(
+            template_models("M151_Ruin 0x000aef56", &db, &catalogue).len(),
+            1
+        );
+        assert!(is_ruin(&db, "M151_Ruin 0x000aef56"));
+        assert!(!is_ruin(&db, "M151 Softtop (VZ) 0x0012abcd"));
     }
 
     #[test]

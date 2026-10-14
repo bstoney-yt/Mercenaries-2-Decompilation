@@ -443,6 +443,10 @@ impl Game {
                 "island vehicle {:#x}: {} as {}",
                 t.entity, t.name, models[0].label
             );
+            // A vehicle's ruin stands wrecked.
+            if crate::mission::is_ruin(&world.index.template_db, t.name) {
+                scene.ruins.insert(t.entity);
+            }
             let crew = world.index.template_db.crew(t.name);
             loads.push((t.entity, t.at, t.yaw, crew, models));
         }
