@@ -907,7 +907,7 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
     // clouds stay overhead; sampled before any branch for mip selection.
     // Rays below a floor all met the deck at one far point per column,
     // which drew a band of vertical streaks along the horizon that
-    // shimmered as the camera turned (Brendan's play-test); the floor is
+    // shimmered as the camera turned (a play-test); the floor is
     // now low and the deck fades out above it.
     let up = max(r.y, HORIZON_UP);
     let deck = frame.eye.xz + r.xz * (CLOUD_HEIGHT / up);

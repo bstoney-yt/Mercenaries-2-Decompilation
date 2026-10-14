@@ -761,7 +761,7 @@ const PLANE_TRIM: f32 = 0.25;
 const CLIMB: f32 = 0.52;
 /// Tracks grip: on the ground, a tracked vehicle's weight doesn't pull it
 /// down hills up to this steep, radians, so it climbs, turns and stands on
-/// them as on the flat (Brendan: the game's tank "should be able to climb
+/// them as on the flat (a play-tester: the game's tank "should be able to climb
 /// almost any hill"; the steepness is invented).
 const CLIMB_TRACKED: f32 = 0.87;
 

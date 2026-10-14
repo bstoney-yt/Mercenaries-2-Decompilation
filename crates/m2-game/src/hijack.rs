@@ -20,7 +20,7 @@
 //!   `"hijack"`), props (`Object.Attach`), the crewman's AI and seat, and
 //!   the `Vehicle.Hijack*` hooks become [`HijackCommand`]s for the game.
 //!
-//! The call shapes are the scripts' own (rounds H2 and H3 on Brendan's
+//! The call shapes are the scripts' own (rounds H2 and H3 on the test
 //! PC). What the engine answered is not in the scripts; the choices made
 //! here are marked "inferred".
 
