@@ -649,6 +649,8 @@ pub struct MemberShape {
     /// it is its own model's `PHY2`; `None` for a shape cut from the
     /// batch's geometry, which goes where the batch does.
     pub placed: Option<(Vec3, Quat)>,
+    /// The building's entity (of its batch's `tiny_members`).
+    pub entity: u32,
 }
 
 impl CpuModel {

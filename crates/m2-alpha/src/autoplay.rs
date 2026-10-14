@@ -900,6 +900,19 @@ impl Autoplay {
         }
         if self.stalled > STALL {
             self.stalled = 0.0;
+            // Each stall logged, with what holds it (round 7 counts the
+            // tank's over its jungle drive).
+            if let (Some(w), Some(v)) = (game.scene.world.as_ref(), game.scene.vehicles.get(i))
+                && let Some(id) = v.id
+            {
+                eprintln!(
+                    "autoplay {:.1} s: stalled driving the {} at {:.1}: {}",
+                    self.clock,
+                    v.spec.label,
+                    game.focus(),
+                    stuck_report(w, id, v.spec.hull, false)
+                );
+            }
             // A boat run aground near the place: out, into the shallows
             // (further off, it backs off the rocks).
             if d < RIDE_FOR && self.can_leave(game, i) {

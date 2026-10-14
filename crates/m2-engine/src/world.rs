@@ -866,6 +866,8 @@ pub struct WorldIndex {
     /// Each tree species' far stand-in, by species (the tree table's
     /// order; `None` for a species not placed).
     pub far_trees: Vec<Option<FarTree>>,
+    /// Each tree species' template, by species (the tree table's order).
+    pub tree_templates: Vec<u32>,
     /// The outdoor light and air (ambient cube, sunlight, haze).
     pub atmosphere: Option<Atmosphere>,
     /// The regions whose light differs from it (`vz_atmosphere_regions`).
@@ -992,6 +994,19 @@ fn rotation(q: [f32; 4]) -> Quat {
 }
 
 impl WorldIndex {
+    /// The template placed object `i` is an instance of: its entity's, or
+    /// for a tree its species' ([`tree_templates`](Self::tree_templates));
+    /// 0 for none.
+    pub fn object_template(&self, i: usize) -> u32 {
+        let Some(o) = self.objects.get(i) else {
+            return 0;
+        };
+        match tree_species(o.entity) {
+            Some(s) if o.template == 0 => self.tree_templates.get(s).copied().unwrap_or(0),
+            _ => o.template,
+        }
+    }
+
     /// Reads every entity layer in the archive.
     pub fn build<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<Self, AssetError> {
         let index = source.archive().index();
@@ -1134,6 +1149,13 @@ impl WorldIndex {
     /// model stands upright at the position and at its own size (the
     /// species' scale range has no per-tree value to pick from).
     ///
+    /// Each tree is an instance of its species' template, as what the
+    /// layers place is of its entity's: its `Health`, `ModifierKey` and
+    /// `PhysicsPropertyCrashable` say how it reacts when hit (survey
+    /// `trees`, round 7: the small jungle canopies flatten under any
+    /// vehicle, the palms and small trees break, the medium and tall
+    /// jungle trees stand; rockets fell them).
+    ///
     /// Trees within [`ROAD_CLEAR`] of a road are left out: the table puts
     /// some there (893 within 3 m island-wide, round DX), which the game's
     /// footage shows clear, with trees along the edges.
@@ -1166,6 +1188,7 @@ impl WorldIndex {
             .copied();
         let mut no_model: Vec<(u32, usize)> = Vec::new();
         let mut cleared = 0usize;
+        self.tree_templates = table.species.iter().map(|s| s.template).collect();
         for (species, s) in table.species.iter().enumerate() {
             let model = templates.by_id(s.template).and_then(|(_, t)| t.model);
             let Some(model) = model.filter(|_| species < 1 << 12 && s.trees.len() <= 1 << 16)
@@ -1188,7 +1211,7 @@ impl WorldIndex {
                         rotation: Quat::from_rotation_y(t.yaw()),
                         named: true,
                         fade: Some(s.fade),
-                        template: 0,
+                        template: s.template,
                     }),
             );
             cleared += s.trees.len() - (self.objects.len() - before);
@@ -2548,5 +2571,41 @@ mod road_tests {
         assert!(roads.near(-2.0, 0.0, ROAD_CLEAR));
         assert!(!roads.near(50.0, 5.0, ROAD_CLEAR));
         assert!(!roads.near(110.0, 0.0, ROAD_CLEAR));
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn a_tree_is_an_instance_of_its_species_template() {
+        let placed = |entity, template| ObjectPlacement {
+            entity,
+            model: 1,
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            named: true,
+            fade: None,
+            template,
+        };
+        let index = WorldIndex {
+            objects: vec![
+                // Species 1's third tree, as an index built before trees
+                // carried their template had it; then as it does.
+                placed(TREE_ENTITIES | 1 << 16 | 2, 0),
+                placed(TREE_ENTITIES | 1 << 16 | 2, 0x8000_89be),
+                // A layer's entity.
+                placed(0x0012_3456, 0x8000_4ce8),
+                placed(0x0012_3457, 0),
+            ],
+            tree_templates: vec![0x8000_4ce8, 0x8000_89be],
+            ..WorldIndex::default()
+        };
+        assert_eq!(index.object_template(0), 0x8000_89be);
+        assert_eq!(index.object_template(1), 0x8000_89be);
+        assert_eq!(index.object_template(2), 0x8000_4ce8);
+        assert_eq!(index.object_template(3), 0);
+        assert_eq!(index.object_template(9), 0);
     }
 }

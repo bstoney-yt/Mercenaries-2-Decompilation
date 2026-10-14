@@ -46,9 +46,12 @@ pub enum Reaction {
 /// What hit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HitKind {
+    /// A jeep running into it.
     Vehicle,
     Gun,
     Blast,
+    /// A tank running into it (round 7: what it crushes).
+    Tank,
 }
 
 impl HitKind {
@@ -57,6 +60,7 @@ impl HitKind {
             "vehicle" => Some(Self::Vehicle),
             "gun" => Some(Self::Gun),
             "blast" => Some(Self::Blast),
+            "tank" => Some(Self::Tank),
             _ => None,
         }
     }
@@ -129,6 +133,17 @@ impl Makeup {
     pub fn is_prop(&self) -> bool {
         self.physics.is_some() || self.crash.is_some_and(|c| c.how != CrashHow::Flattened)
     }
+
+    /// Whether a tank running into it should do anything to it, as the
+    /// data says: a vehicle breaks, flattens or knocks it over
+    /// (`PhysicsPropertyCrashable`: trees, bushes, fences, lamps), it
+    /// comes loose, or a vehicle's ram wears it down (its row takes some
+    /// of the `Car` column and it has `Health`: shacks).
+    pub fn is_crushable(&self) -> bool {
+        self.crash.is_some()
+            || self.physics.is_some()
+            || (self.crash_damage > 0.0 && self.health.is_some())
+    }
 }
 
 /// The hits the check tries, as the game's own would land.
@@ -136,6 +151,8 @@ impl Makeup {
 pub struct Hits<'a> {
     /// The vehicle's mass (kg) and speed (m/s).
     pub vehicle: (f32, f32),
+    /// The tank's.
+    pub tank: (f32, f32),
     /// Rounds fired, and each one's `Damage`.
     pub rounds: (u32, f32),
     /// The blasts' damage where they reach the prop, and their kinds (an
@@ -152,8 +169,11 @@ pub fn expected(m: &Makeup, hit: HitKind, hits: &Hits<'_>) -> &'static [Reaction
             .is_some_and(|p| p.heavy || p.mass.is_some_and(|k| k >= vehicle))
     };
     match hit {
-        HitKind::Vehicle => {
-            let (mass, _) = hits.vehicle;
+        HitKind::Vehicle | HitKind::Tank => {
+            let (mass, speed) = match hit {
+                HitKind::Tank => hits.tank,
+                _ => hits.vehicle,
+            };
             match m.crash.map(|c| (c.how, c.takes)) {
                 Some((CrashHow::Breaks, takes)) if mass >= takes => &[Break],
                 Some((CrashHow::Breaks, _)) => &[Block],
@@ -164,8 +184,17 @@ pub fn expected(m: &Makeup, hit: HitKind, hits: &Hits<'_>) -> &'static [Reaction
                     &[Block, Move, Break]
                 }
                 None if heavy(mass) => &[Block, Move],
-                None if m.crash_damage > 0.0 && m.health.is_some() => &[Break, Move],
-                None => &[Move],
+                None if m.physics.is_some() && m.crash_damage > 0.0 && m.health.is_some() => {
+                    &[Break, Move]
+                }
+                None if m.physics.is_some() => &[Move],
+                // Fixed, worn down by the ram ([`crate::destruct::ram`]:
+                // its size invented, its kind the data's): broken once it
+                // takes its `Health`, else it stands.
+                None => match m.health {
+                    Some(h) if crate::destruct::ram(mass, speed) * m.crash_damage >= h => &[Break],
+                    _ => &[Block],
+                },
             }
         }
         HitKind::Gun => {
@@ -188,21 +217,25 @@ pub fn expected(m: &Makeup, hit: HitKind, hits: &Hits<'_>) -> &'static [Reaction
 /// The check's vehicle: a jeep's box (4.4 m long, 2 m wide, 1.6 m
 /// high, invented) at `speed` (m/s) of `mass` (kg).
 pub const JEEP_BOX: (Vec3, Vec3) = (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.6, 2.2));
+/// The check's tank: the AMX30's hull, about 3.1 m wide, 6.6 m long and
+/// 2.3 m high (invented, near the model's).
+pub const TANK_BOX: (Vec3, Vec3) = (Vec3::new(-1.55, 0.0, -3.3), Vec3::new(1.55, 2.3, 3.3));
 
-/// The check's vehicle placed to run into what stands at `centre` (on
-/// ground `floor`) along `forward`, its nose half a metre into it.
+/// The check's vehicle (its box `bounds`) placed to run into what stands
+/// at `centre` (on ground `floor`) along `forward`, its nose half a metre
+/// into it.
 pub fn crasher_at(
     centre: Vec3,
     floor: f32,
     forward: Vec3,
-    mass: f32,
-    speed: f32,
+    (mass, speed): (f32, f32),
+    bounds: (Vec3, Vec3),
 ) -> crate::destruct::Crasher {
     let yaw = forward.x.atan2(forward.z);
-    let back = centre.with_y(floor) - forward * (JEEP_BOX.1.z - 0.5);
+    let back = centre.with_y(floor) - forward * (bounds.1.z - 0.5);
     crate::destruct::Crasher {
         place: Mat4::from_rotation_translation(Quat::from_rotation_y(yaw), back),
-        bounds: JEEP_BOX,
+        bounds,
         velocity: forward * speed,
         mass,
     }
@@ -232,6 +265,9 @@ const SETTLE: f32 = 0.25;
 const DRAW_EVERY: u32 = 6;
 /// The check's vehicle's speed, m/s (36 km/h; invented).
 const SPEED: f32 = 10.0;
+/// The check's tank's speed, m/s: as the autoplay drives the AMX30 through
+/// the jungle (7 to 8 m/s, round 7's runs).
+const TANK_SPEED: f32 = 8.0;
 /// The blast goes off this far from the prop's box, metres (invented).
 const BLAST_OFF: f32 = 1.0;
 /// The rounds are fired from this far off, metres.
@@ -303,19 +339,25 @@ pub fn check(
     let templates = &world.index.template_db;
     let explosive: std::collections::HashSet<usize> =
         game.scene.explosives.iter().map(|e| e.object).collect();
-    // Not money (round 14's), nor what the pickups round tries.
+    // Not money (round 14's), nor what the pickups round tries. A tank
+    // tries what it should crush, too (trees, bushes, shacks).
     let wanted = |t: u32| {
-        Makeup::of(templates, t).is_prop()
-            && crate::placed::kind(templates, t).is_none()
+        let m = Makeup::of(templates, t);
+        (if hit == HitKind::Tank {
+            m.is_crushable()
+        } else {
+            m.is_prop()
+        }) && crate::placed::kind(templates, t).is_none()
             && !templates.names.get(&t).is_some_and(|n| n.contains("Cash"))
     };
     let mut items: Vec<Item> = Vec::new();
     for (i, o) in world.index.objects.iter().enumerate() {
-        if inside(o.position) && !explosive.contains(&i) && !world.is_taken(i) && wanted(o.template)
-        {
+        // A tree by its species' template.
+        let template = world.index.object_template(i);
+        if inside(o.position) && !explosive.contains(&i) && !world.is_taken(i) && wanted(template) {
             items.push(Item {
                 key: StaticKey::Object(i),
-                template: o.template,
+                template,
                 position: o.position,
             });
         }
@@ -335,11 +377,15 @@ pub fn check(
         (patch(a.position), a.position.distance(start).to_bits())
             .cmp(&(patch(b.position), b.position.distance(start).to_bits()))
     });
-    let mass = templates
-        .id("M151 Softtop (VZ)")
-        .and_then(|t| templates.tuning.get(&t))
-        .and_then(|t| t.mass)
-        .unwrap_or(1000.0);
+    let mass_of = |name: &str, or: f32| {
+        templates
+            .id(name)
+            .and_then(|t| templates.tuning.get(&t))
+            .and_then(|t| t.mass)
+            .unwrap_or(or)
+    };
+    let mass = mass_of("M151 Softtop (VZ)", 1000.0);
+    let tank_mass = mass_of("AMX30", 32_000.0);
     let rifle = &game.combat.rifle;
     // An RPG's explosion, frag and rocket, where they reach the prop.
     let blasts: Vec<(f32, u32)> = crate::game::rocket_blasts(templates, Vec3::ZERO)
@@ -348,6 +394,7 @@ pub fn check(
         .collect();
     let hits = Hits {
         vehicle: (mass, SPEED),
+        tank: (tank_mass, TANK_SPEED),
         rounds: (rifle.clip.max(1), rifle.damage),
         blast: &blasts,
     };
@@ -449,7 +496,11 @@ pub fn check(
         } else {
             match hit {
                 HitKind::Vehicle => {
-                    let crasher = crasher_at(centre, floor, forward, mass, SPEED);
+                    let crasher = crasher_at(centre, floor, forward, hits.vehicle, JEEP_BOX);
+                    game.crash_with(&crasher);
+                }
+                HitKind::Tank => {
+                    let crasher = crasher_at(centre, floor, forward, hits.tank, TANK_BOX);
                     game.crash_with(&crasher);
                 }
                 HitKind::Gun => {
@@ -577,7 +628,16 @@ fn reaction(game: &crate::game::Game, key: StaticKey, template: u32) -> Reaction
         ),
         _ => (None, None),
     };
+    // Brought down but still standing in its merged batch's collision (a
+    // shanty town's shack): in the way still.
+    let in_batch = match key {
+        StaticKey::Object(i) => world
+            .member_key(i)
+            .is_some_and(|m| world.physics.has_static(m)),
+        _ => false,
+    };
     match (knocked, down) {
+        (Some(_), _) | (None, Some(_)) if in_batch => Reaction::Block,
         (Some(true), _) | (None, Some(true)) => Reaction::Break,
         (Some(false), _) => Reaction::Move,
         // Gone, blown up as its template says (an explosive barrel): broken.
@@ -597,6 +657,7 @@ mod tests {
     fn hits() -> Hits<'static> {
         Hits {
             vehicle: (1000.0, 10.0),
+            tank: (32_000.0, 8.0),
             rounds: (30, 6.0),
             blast: &[(160.0, 0)],
         }
@@ -703,5 +764,60 @@ mod tests {
             ..Makeup::default()
         };
         assert!(!bush.is_prop());
+    }
+
+    #[test]
+    fn a_tank_crushes_canopies_trees_and_shacks_but_not_the_big_jungle_trees() {
+        let h = hits();
+        let crash = |how, takes| Some(Crash { how, takes });
+        // `_jungle_env_smallcanopy01`: flattened by any vehicle.
+        let canopy = Makeup {
+            crash: crash(CrashHow::Flattened, 0.0),
+            health: Some(300.0),
+            ..Makeup::default()
+        };
+        assert!(canopy.is_crushable());
+        assert!(expected(&canopy, HitKind::Tank, &h).contains(&Reaction::Break));
+        // `_global_env_palmtree01`: broken by any vehicle (takes 0).
+        let palm = Makeup {
+            crash: crash(CrashHow::Breaks, 0.0),
+            health: Some(100.0),
+            ..Makeup::default()
+        };
+        assert_eq!(expected(&palm, HitKind::Tank, &h), &[Reaction::Break]);
+        // `_village_bld_shacksmall02`: no crash property, Shack row (the
+        // `Car` column twice), 50 health: the tank's ram (256) breaks it,
+        // a jeep's (10) leaves it standing.
+        let shack = Makeup {
+            health: Some(50.0),
+            crash_damage: 2.0,
+            ..Makeup::default()
+        };
+        assert!(shack.is_crushable() && !shack.is_prop());
+        assert_eq!(expected(&shack, HitKind::Tank, &h), &[Reaction::Break]);
+        assert_eq!(expected(&shack, HitKind::Vehicle, &h), &[Reaction::Block]);
+        // `_jungle_env_treemedium03`: Canopy row (none of `Car`), no
+        // crash property: it stands.
+        let tree = Makeup {
+            health: Some(100.0),
+            ..Makeup::default()
+        };
+        assert!(!tree.is_crushable());
+        assert_eq!(expected(&tree, HitKind::Tank, &h), &[Reaction::Block]);
+        // `_jungle_env_largecanopy01`: Vegetation (ten times `Car`),
+        // 4,000 health: 2,560 at 8 m/s, it stands.
+        let big = Makeup {
+            health: Some(4000.0),
+            crash_damage: 10.0,
+            ..Makeup::default()
+        };
+        assert_eq!(expected(&big, HitKind::Tank, &h), &[Reaction::Block]);
+        // A wall a tank (32,000 kg) is heavy enough for (29,900).
+        let wall = Makeup {
+            crash: crash(CrashHow::Breaks, 29_900.0),
+            ..Makeup::default()
+        };
+        assert_eq!(expected(&wall, HitKind::Tank, &h), &[Reaction::Break]);
+        assert_eq!(expected(&wall, HitKind::Vehicle, &h), &[Reaction::Block]);
     }
 }
