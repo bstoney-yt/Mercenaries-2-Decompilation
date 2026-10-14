@@ -1945,6 +1945,70 @@ mod tests {
     }
 
     #[test]
+    fn a_hedge_breaks_a_section_at_a_time() {
+        // As `global_env_hedgelong` (round 8): two sections, each its own
+        // machine (nodes 1 and 2) showing its hedge (3, 4) intact and its
+        // stumps (5, 6) wrecked.
+        let show = crate::name_hash("show");
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        let section = |machine: u32, hedge: u32, stumps: u32| {
+            vec![
+                leaf(b"NODE", le(&[machine, 2])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                enter(),
+                leaf(b"CEXE", le(&[1, hedge, 2, show, 3])),
+                leaf(b"STAT", le(&[STATE_WRECKED])),
+                enter(),
+                leaf(b"CEXE", le(&[1, stumps, 2, show, 3])),
+            ]
+        };
+        let mut records = vec![
+            leaf(b"INFO", le(&[5, 15, 7])),
+            leaf(b"SWIT", le(&[103, 104, 105, 106])),
+        ];
+        records.extend(section(101, 103, 105));
+        records.extend(section(102, 104, 106));
+        let data = ucfx(&[node(b"STAM", records)]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [
+            n(100, None),
+            n(101, Some(0)),
+            n(102, Some(0)),
+            n(103, Some(1)),
+            n(104, Some(2)),
+            n(105, Some(1)),
+            n(106, Some(2)),
+        ];
+        let states = PartStates::parse(&u, stam, &nodes);
+        // A section is the machine's own node, or what its intact state shows.
+        assert_eq!(states.part_of(1), Some(0));
+        assert_eq!(states.part_of(4), Some(1));
+        assert_eq!(states.part_of(6), None);
+        // The first section run into: its stumps, the second still whole.
+        assert_eq!(
+            states.hidden_parts(&nodes, |k| k == 0),
+            vec![false, false, false, true, false, false, true]
+        );
+        assert_eq!(
+            states.hidden_parts(&nodes, |_| true),
+            states.hidden(&nodes, true)
+        );
+    }
+
+    #[test]
     fn a_break_up_shows_chunks_and_names_points() {
         let (show, hide) = (crate::name_hash("show"), crate::name_hash("hide"));
         let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));

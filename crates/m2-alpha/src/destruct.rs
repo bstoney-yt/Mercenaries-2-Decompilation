@@ -249,6 +249,9 @@ pub struct Destruction {
     /// Worn down and blowing up, to be set off by the fight
     /// ([`crate::combat::Combat::set_off`]): where, and how big.
     pub set_off: Vec<(Vec3, f32)>,
+    /// The island's objects destroyed whose links were followed
+    /// ([`fall_linked`](Self::fall_linked)).
+    linked: HashSet<usize>,
 }
 
 /// Whether template `t`'s objects blow up when destroyed: what it leaves
@@ -602,6 +605,12 @@ impl Destruction {
             if !touched.contains(&key) && !vehicle.meets(at, bounds) {
                 continue;
             }
+            // What breaks a part at a time (a hedge's sections, a gate's
+            // leaves): the parts it runs into, each as its own record says.
+            if let Some(hit) = self.crash_parts(world, props, e, at, vehicle, touched) {
+                out.extend(hit);
+                continue;
+            }
             let crash = world.index.template_db.crashable.get(&template).copied();
             let loose = props.loose_mass(&world.physics, e).is_some();
             match vehicle.does(key, crash, loose) {
@@ -638,13 +647,158 @@ impl Destruction {
         out
     }
 
+    /// What `vehicle` does to state layer prop `e` (placed at `at`) if its
+    /// template breaks a part at a time (`PhysicsPropertyCrashable`
+    /// records naming nodes, [`m2_engine::Templates::crash_parts`]) and its
+    /// model has those parts ([`m2_engine::ModelParts`]): each standing
+    /// part whose box the vehicle's meets breaks as its own record says
+    /// (a jeep flattens a hedge's section, breaks a gate's leaf), the rest
+    /// standing; one its body `touched` but whose parts' boxes it meets
+    /// none of breaks its nearest part. `None` for any other prop (left to
+    /// the whole-prop rule), else what it brought down (nothing, or the
+    /// prop).
+    fn crash_parts(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        e: u32,
+        at: Mat4,
+        vehicle: &Crasher,
+        touched: &[StaticKey],
+    ) -> Option<Vec<Crashed>> {
+        let template = props.get(e)?.0.template;
+        let named = world.index.template_db.crash_parts.get(&template)?.clone();
+        let parts = props.model_parts(e)?.clone();
+        let mine: Vec<(usize, Crash)> = named
+            .iter()
+            .filter_map(|&(node, crash)| Some((parts.part_named(node)?, crash)))
+            .collect();
+        if mine.is_empty() {
+            return None;
+        }
+        let key = StaticKey::Entity(e);
+        let standing: Vec<(usize, Crash, (Vec3, Vec3))> = mine
+            .iter()
+            .filter(|(k, _)| !props.part_down(e, *k))
+            .filter_map(|&(k, c)| Some((k, c, parts.part_box(k)?)))
+            .collect();
+        let mut met: Vec<(usize, Crash)> = standing
+            .iter()
+            .filter(|(_, _, b)| vehicle.meets(at, *b))
+            .map(|&(k, c, _)| (k, c))
+            .collect();
+        if met.is_empty() && touched.contains(&key) {
+            let (lo, hi) = vehicle.bounds;
+            let middle = vehicle.place.transform_point3((lo + hi) * 0.5);
+            met.extend(
+                standing
+                    .iter()
+                    .min_by(|a, b| {
+                        let d = |(lo, hi): (Vec3, Vec3)| {
+                            at.transform_point3((lo + hi) * 0.5).distance(middle)
+                        };
+                        d(a.2).total_cmp(&d(b.2))
+                    })
+                    .map(|&(k, c, _)| (k, c)),
+            );
+        }
+        let mut out = Vec::new();
+        for (k, crash) in met {
+            if vehicle.does(key, Some(crash), false) != Some(Crashed::Down(key)) {
+                if touched.contains(&key) && self.held.insert(key) {
+                    eprintln!(
+                        "destruct: prop {e:#x} part {k} held a {:.0} kg vehicle ({:?} takes {:.0})",
+                        vehicle.mass, crash.how, crash.takes
+                    );
+                }
+                continue;
+            }
+            let position = props.get(e).map_or(Vec3::ZERO, |(p, _)| p.position);
+            let db = &world.index.template_db;
+            eprintln!(
+                "destruct: prop {e:#x} (of {}) part {k} of {} at {position:.1} run into ({:?}) by a \
+                 {:.0} kg vehicle at {:.1} m/s; {}",
+                props.layer(e).unwrap_or("a layer not noted"),
+                parts.count(),
+                crash.how,
+                vehicle.mass,
+                vehicle.velocity.length(),
+                break_sound(world, template)
+            );
+            if let Some(&s) = db.sound_keys.get(&template) {
+                let c = parts
+                    .part_box(k)
+                    .map_or(position, |(lo, hi)| at.transform_point3((lo + hi) * 0.5));
+                self.heard.push((c, s));
+            }
+            props.wreck_part(&mut world.physics, e, k, |shifted| {
+                crate::game::flung(vehicle.velocity, vehicle.mass, shifted)
+            });
+            if !out.contains(&Crashed::Down(key)) {
+                out.push(Crashed::Down(key));
+            }
+        }
+        Some(out)
+    }
+
+    /// Brings down what falls with what was brought down
+    /// (`DestructionLink`, [`m2_engine::WorldIndex::falls_with`]): a state
+    /// layer's prop wrecked takes those linked to it down (props wrecked
+    /// where they stand; the island's objects as a blast there would), and
+    /// so on down the links.
+    fn fall_linked(&mut self, world: &mut World, props: &mut Props, install: Option<&Install>) {
+        let mut fallen = props.take_fallen();
+        // The island's objects destroyed since, by entity.
+        fallen.extend(
+            self.destroyed
+                .iter()
+                .filter(|i| !self.linked.contains(i))
+                .filter_map(|&i| world.index.objects.get(i).map(|o| o.entity))
+                .collect::<Vec<_>>(),
+        );
+        self.linked.extend(self.destroyed.iter().copied());
+        let mut seen: HashSet<u32> = HashSet::new();
+        while let Some(e) = fallen.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            let Some(targets) = world.index.falls_with.get(&e).cloned() else {
+                continue;
+            };
+            for t in targets {
+                if props.get(t).is_some_and(|(p, _)| !p.wrecked) {
+                    eprintln!("destruct: {t:#x} falls with {e:#x} (DestructionLink)");
+                    let at = props.centre(t);
+                    props.wreck(&mut world.physics, t, at);
+                    fallen.extend(props.take_fallen());
+                } else if let Some(i) = world.index.objects.iter().position(|o| o.entity == t)
+                    && !self.destroyed.contains(&i)
+                    && let Some(install) = install
+                {
+                    eprintln!("destruct: object {i} ({t:#x}) falls with {e:#x} (DestructionLink)");
+                    let at = world.index.objects[i].position;
+                    self.bring_down(world, props, install, i, Cause::Blast(at));
+                    self.linked.insert(i);
+                    fallen.push(t);
+                }
+            }
+        }
+    }
+
     /// Brings down those destroyed whose props have loaded: the island's
     /// copy goes, the prop breaks apart (or shows its wreck). One a blast
     /// destroyed is heard coming down, dust rising where its break-up
     /// names points, if it has a building's collapse; one a vehicle ran
     /// into is knocked on by it. Either, with no building's collapse, is
     /// heard as its template's `SoundKey` says ([`break_sound`]).
-    pub fn update(&mut self, world: &mut World, props: &mut Props, combat: &mut Combat) {
+    pub fn update(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        combat: &mut Combat,
+        install: Option<&Install>,
+    ) {
+        self.fall_linked(world, props, install);
         for (at, key) in self.heard.drain(..) {
             combat.broke(at, key);
         }

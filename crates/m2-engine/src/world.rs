@@ -245,6 +245,21 @@ const PERSON_AI: [&str; 2] = ["AiBehavior", "Ai"];
 /// hash (`veh_largegascrappy` for the HMMWVs and Valiants).
 const ENGINE_BANK_FIELD: u32 = 0x14a6_7fa6;
 
+/// `DestructionLink`'s field naming the entity linked (name unknown).
+const LINK_TARGET: u32 = 0x5470_4554;
+
+/// What an entity's `DestructionLink` naming `other` with direction `way`
+/// says falls with what, as (destroyed, destroyed with it) pairs
+/// ([`WorldIndex::add_links`]).
+fn falls(entity: u32, other: u32, way: u32) -> Vec<(u32, u32)> {
+    match way {
+        1 => vec![(entity, other)],
+        2 => vec![(other, entity)],
+        3 => vec![(entity, other), (other, entity)],
+        _ => Vec::new(),
+    }
+}
+
 /// The template database: what it says of each template by name (lower
 /// case), and the names by template id.
 #[derive(Clone, Debug, Default)]
@@ -892,6 +907,10 @@ pub struct WorldIndex {
     /// Those of [`state_objects`](Self::state_objects) whose template
     /// stands destroyed ([`Templates::ruined`]): drawn as their wrecks.
     pub ruined: HashSet<u32>,
+    /// What is destroyed with each entity (`DestructionLink`, every
+    /// layer): a lamp with the dock it stands on, a gate's leaves with
+    /// its arch ([`WorldIndex::add_links`]).
+    pub falls_with: HashMap<u32, Vec<u32>>,
     /// With `M2_LOG_FOLIAGE=on` only: each named entity of the static
     /// layers, its name and how it was placed (`m` by `ModelName`, `p` by
     /// its name or template, `v` a vehicle or unknown template, `c` left
@@ -1473,9 +1492,58 @@ impl WorldIndex {
         }
     }
 
+    /// A layer's `DestructionLink`s: an entity's record names another
+    /// (its first field) and a direction. Over the 2,431 records in the
+    /// layers, the two ends of a lamp on a dock (`_Proutpost_lampA`,
+    /// `_proutpost_dockB`), a sign on a bridge, a pipe on its support name
+    /// each other, the dock's with direction 1 and the lamp's with 2; 3
+    /// links pipes and their supports, and catwalks, both ways. Read as:
+    /// 1, the one named is destroyed with this one; 2, this one is
+    /// destroyed with the one named (it stands on it); 3, both. The villa
+    /// gate's leaves (`pmc_middle_gate`) name its arch with 2. From
+    /// samples; the record's float (0, 1 on 74, 0.2 on 3) is not read.
+    fn add_links(&mut self, layer: &Layer<'_>) {
+        let Some(c) = layer.component("DestructionLink") else {
+            return;
+        };
+        let field = |h: u32| {
+            c.fields
+                .iter()
+                .find(|f| f.name_hash == h)
+                .map(|f| (usize::from(f.offset), f.bit_shift, f.bit_width))
+        };
+        let (Some(to), Some(way)) = (field(LINK_TARGET), field(name_hash("direction"))) else {
+            return;
+        };
+        let word = |r: &[u8], (at, shift, width): (usize, u8, u8)| {
+            let b = r.get(at..at + 4)?;
+            let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            Some(if (1..32).contains(&width) {
+                (v >> shift) & ((1 << width) - 1)
+            } else {
+                v
+            })
+        };
+        for (entity, r) in c.records().unwrap_or_default() {
+            let (Some(other), Some(way)) = (word(r, to), word(r, way)) else {
+                continue;
+            };
+            if other == 0 || other == entity {
+                continue;
+            }
+            for (from, to) in falls(entity, other, way) {
+                let v = self.falls_with.entry(from).or_default();
+                if !v.contains(&to) {
+                    v.push(to);
+                }
+            }
+        }
+    }
+
     fn add_layer(&mut self, layer: &Layer<'_>, layer_hash: u32, is_static: bool, assets: &Assets) {
         let placements = layer.placements();
         self.add_motions(layer, &placements, &assets.templates);
+        self.add_links(layer);
         let at = |entity| placements.get(&entity);
         for (entity, asset) in layer.hashes("TerrainObject") {
             if let Some(p) = at(entity) {
@@ -2576,6 +2644,24 @@ mod road_tests {
         assert!(roads.near(-2.0, 0.0, ROAD_CLEAR));
         assert!(!roads.near(50.0, 5.0, ROAD_CLEAR));
         assert!(!roads.near(110.0, 0.0, ROAD_CLEAR));
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn what_stands_on_another_falls_with_it() {
+        // The dock (1) names its lamp (2) with direction 1; the lamp names
+        // the dock with 2: either way, the lamp goes when the dock does.
+        assert_eq!(falls(1, 2, 1), vec![(1, 2)]);
+        assert_eq!(falls(2, 1, 2), vec![(1, 2)]);
+        // The villa gate's leaves (3) name its arch (4) with 2.
+        assert_eq!(falls(3, 4, 2), vec![(4, 3)]);
+        // A pipe and its support go together.
+        assert_eq!(falls(5, 6, 3), vec![(5, 6), (6, 5)]);
+        assert!(falls(5, 6, 0).is_empty());
     }
 }
 
