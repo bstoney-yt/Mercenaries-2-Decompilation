@@ -36,7 +36,8 @@ pub struct EnhancedConfig {
 
 /// `[enhanced.shop]`: the shop opens anywhere with its key, as the game's
 /// contacts open it in their menus; `unlock_all` unlocks everything each
-/// shop could sell.
+/// shop could sell, and brings the pilots and mechanic the support needs
+/// (the story recruits them one by one).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShopCheat {

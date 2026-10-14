@@ -420,6 +420,9 @@ pub struct MissionLink {
     saves: Vec<String>,
     /// Steps to the next look at her support stock.
     stock_look: u32,
+    /// Aimed designators' marks (guid, where) waiting to settle, and the
+    /// scripts' time they do.
+    aimed: Vec<(u32, Vec3, f64)>,
     /// The pilots of support helicopters that have landed: they get out
     /// and walk off, and the helicopter stays for her.
     landed: HashSet<u32>,
@@ -536,6 +539,7 @@ impl MissionLink {
             sighted: HashMap::new(),
             saves: Vec::new(),
             stock_look: 0,
+            aimed: Vec::new(),
             landed: HashSet::new(),
             resources: None,
             earned: (0, 0),
@@ -1037,8 +1041,16 @@ impl MissionLink {
                 let at = ground_under(game, at);
                 let g = mission.designator_thrown(PLAYER, what, at.to_array());
                 eprintln!("mission: her {what} marks {at:.1} ({g:#x})");
-                mission.designator_settled(g, at.to_array());
+                self.aimed
+                    .push((g, at, mission.now() + f64::from(MARKER_TIMER)));
                 self.stock_look = 0;
+            }
+            // ... and settles there after a thrown marker's time: the
+            // manager checks the spot in between (its validation queue),
+            // and a mark settled at once is never taken up.
+            let now = mission.now();
+            for (g, at, _) in self.aimed.extract_if(.., |a| a.2 <= now) {
+                mission.designator_settled(g, at.to_array());
             }
             // Her stock, cash and fuel as the scripts hold them.
             if self.stock_look == 0 {
@@ -2085,9 +2097,15 @@ pub const SHOPS: [(&str, &str); 6] = [
 /// Lua that unlocks everything faction `f`'s shop could ever sell, as
 /// the contracts' rewards would one by one (`MrxRewardData`'s potential
 /// shop items; a support item is unlocked by its `tUnlockStatus` for the
-/// faction, equipment by `WifEquipmentData.UnlockItem`).
+/// faction, equipment by `WifEquipmentData.UnlockItem`). The recruits the
+/// support needs (the helicopter and jet pilots, the mechanic: the story
+/// brings them one by one, and without them a strike is refused, "Pilot
+/// unavailable") join too, as the scripts' own setters have them.
 const UNLOCK_ALL: &str = r#"
 function __m2_unlock_all(f)
+    MrxSupportData.SetHeliPilotRecruited(true)
+    MrxSupportData.SetJetPilotRecruited(true)
+    MrxSupportData.SetMechanicRecruited(true)
     local support, equipment = MrxRewardData.GetAllPotentialShopItems(f)
     local seen = MrxSupportData._knUnlockStatusViewed or 2
     for _, key in ipairs(support or {}) do
