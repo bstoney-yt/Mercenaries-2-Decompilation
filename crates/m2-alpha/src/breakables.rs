@@ -628,7 +628,16 @@ fn reaction(game: &crate::game::Game, key: StaticKey, template: u32) -> Reaction
         ),
         _ => (None, None),
     };
+    // Brought down but still standing in its merged batch's collision (a
+    // shanty town's shack): in the way still.
+    let in_batch = match key {
+        StaticKey::Object(i) => world
+            .member_key(i)
+            .is_some_and(|m| world.physics.has_static(m)),
+        _ => false,
+    };
     match (knocked, down) {
+        (Some(_), _) | (None, Some(_)) if in_batch => Reaction::Block,
         (Some(true), _) | (None, Some(true)) => Reaction::Break,
         (Some(false), _) => Reaction::Move,
         // Gone, blown up as its template says (an explosive barrel): broken.
@@ -755,5 +764,60 @@ mod tests {
             ..Makeup::default()
         };
         assert!(!bush.is_prop());
+    }
+
+    #[test]
+    fn a_tank_crushes_canopies_trees_and_shacks_but_not_the_big_jungle_trees() {
+        let h = hits();
+        let crash = |how, takes| Some(Crash { how, takes });
+        // `_jungle_env_smallcanopy01`: flattened by any vehicle.
+        let canopy = Makeup {
+            crash: crash(CrashHow::Flattened, 0.0),
+            health: Some(300.0),
+            ..Makeup::default()
+        };
+        assert!(canopy.is_crushable());
+        assert!(expected(&canopy, HitKind::Tank, &h).contains(&Reaction::Break));
+        // `_global_env_palmtree01`: broken by any vehicle (takes 0).
+        let palm = Makeup {
+            crash: crash(CrashHow::Breaks, 0.0),
+            health: Some(100.0),
+            ..Makeup::default()
+        };
+        assert_eq!(expected(&palm, HitKind::Tank, &h), &[Reaction::Break]);
+        // `_village_bld_shacksmall02`: no crash property, Shack row (the
+        // `Car` column twice), 50 health: the tank's ram (256) breaks it,
+        // a jeep's (10) leaves it standing.
+        let shack = Makeup {
+            health: Some(50.0),
+            crash_damage: 2.0,
+            ..Makeup::default()
+        };
+        assert!(shack.is_crushable() && !shack.is_prop());
+        assert_eq!(expected(&shack, HitKind::Tank, &h), &[Reaction::Break]);
+        assert_eq!(expected(&shack, HitKind::Vehicle, &h), &[Reaction::Block]);
+        // `_jungle_env_treemedium03`: Canopy row (none of `Car`), no
+        // crash property: it stands.
+        let tree = Makeup {
+            health: Some(100.0),
+            ..Makeup::default()
+        };
+        assert!(!tree.is_crushable());
+        assert_eq!(expected(&tree, HitKind::Tank, &h), &[Reaction::Block]);
+        // `_jungle_env_largecanopy01`: Vegetation (ten times `Car`),
+        // 4,000 health: 2,560 at 8 m/s, it stands.
+        let big = Makeup {
+            health: Some(4000.0),
+            crash_damage: 10.0,
+            ..Makeup::default()
+        };
+        assert_eq!(expected(&big, HitKind::Tank, &h), &[Reaction::Block]);
+        // A wall a tank (32,000 kg) is heavy enough for (29,900).
+        let wall = Makeup {
+            crash: crash(CrashHow::Breaks, 29_900.0),
+            ..Makeup::default()
+        };
+        assert_eq!(expected(&wall, HitKind::Tank, &h), &[Reaction::Break]);
+        assert_eq!(expected(&wall, HitKind::Vehicle, &h), &[Reaction::Block]);
     }
 }

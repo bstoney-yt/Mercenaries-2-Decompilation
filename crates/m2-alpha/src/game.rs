@@ -2162,6 +2162,13 @@ fn run_into(
     mut keys: Vec<StaticKey>,
     (speed, label): (f32, &str),
 ) -> (f32, bool) {
+    // A building of a merged batch touched is its own placed object (a
+    // shanty town's shack), where it is placed by its own model too.
+    for k in &mut keys {
+        *k = world.as_object(*k);
+    }
+    let mut seen = std::collections::HashSet::new();
+    keys.retain(|k| seen.insert(*k));
     let mass = vehicle.mass;
     let mut shifted = 0.0;
     let mut ploughed = false;
