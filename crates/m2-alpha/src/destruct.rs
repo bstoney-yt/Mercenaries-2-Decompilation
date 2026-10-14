@@ -747,4 +747,24 @@ mod tests {
         let (velocity, _) = blown(Vec3::ONE, Vec3::ONE);
         assert!(velocity.x > 0.0 && velocity.y > 0.0);
     }
+
+    #[test]
+    fn what_leaves_a_blast_on_dying_blows_up() {
+        let mut db = m2_engine::Templates::default();
+        // A barrel that leaves an explosion; a crate that leaves a pickup.
+        db.leavings.spawns.insert(1, vec![10]);
+        db.leavings.spawns.insert(2, vec![20]);
+        db.explosions.insert(
+            10,
+            m2_engine::durability::Explosion {
+                radius: 6.0,
+                damage: 300.0,
+                least: 0.0,
+                kind: 0,
+            },
+        );
+        assert!(explodes(&db, 1));
+        assert!(!explodes(&db, 2));
+        assert!(!explodes(&db, 3));
+    }
 }
