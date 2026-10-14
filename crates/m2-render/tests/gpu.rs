@@ -614,6 +614,47 @@ fn exposure_grade_and_bloom_finish_the_frame() {
 }
 
 #[test]
+fn the_game_tone_map_adapts_to_its_own_average() {
+    let Some(mut b) = backend() else { return };
+    let mut v = view();
+    // A plain grey frame of display value 0.3 under the default record's
+    // tone map.
+    v.lighting.sky_color = Vec3::splat(0.3f32.powf(2.2));
+    let tone = |average_power| ToneMap {
+        target: 0.4,
+        min: 0.01,
+        max: 0.8,
+        min_key: 2.5,
+        max_key: 0.85,
+        // None of the last frame kept: each frame adapts all the way.
+        retention: 0.0,
+        contrast_limit: 0.145,
+        contrast: 1.95,
+        log_average: false,
+        average_power,
+    };
+    let mut grey = |v: &View| {
+        // The first frame adapts; the second is drawn with it.
+        for _ in 0..2 {
+            b.begin_frame(v).unwrap();
+            b.end_frame().unwrap();
+        }
+        pixel(&b.read_pixels().unwrap(), 2, 2)[0]
+    };
+    // The game's average (0.9 of the geometric mean, 0.1 of the 2.5-power
+    // mean) is 0.3 here: adapted 0.3 * key 1.22, luminance 0.4 * 0.3 /
+    // 0.367 compressed to 0.254, stretched about 0.145 by 1.95 to 0.358.
+    v.lighting.tone_map = Some(tone(-1.0));
+    let game = grey(&v);
+    assert!(game.abs_diff(91) <= 2, "{game}");
+    // The earlier average of luminance^0.4 (0.62 here) exposes it at
+    // about 0.215.
+    v.lighting.tone_map = Some(tone(1.0));
+    let earlier = grey(&v);
+    assert!(earlier.abs_diff(55) <= 2, "{earlier}");
+}
+
+#[test]
 fn hazy_skies_pale_towards_the_horizon() {
     let Some(mut b) = backend() else { return };
     let mut v = View::perspective(
