@@ -57,6 +57,7 @@ mod moving;
 mod multiply;
 mod npc;
 mod pad;
+mod particles;
 mod paths;
 mod player;
 mod props;
@@ -165,7 +166,8 @@ struct Options {
     look: f32,
     /// With `--screenshot`: how many of the nearest spawns to list.
     list_spawns: usize,
-    /// With `--fight`: seconds to wait after it before the picture.
+    /// With `--fight`: seconds to wait after it before the picture; with
+    /// `--blast`, after the rocket's blast.
     fight_wait: f32,
     /// With `--screenshot`: seconds of play to watch the traffic for.
     traffic: Option<f32>,
@@ -250,6 +252,11 @@ struct Options {
     after_contract: f32,
     /// Our stand-in HUD instead of the game's own.
     old_hud: bool,
+    /// Fire and smoke as the old spheres, not the game's own effects (to
+    /// compare).
+    old_fx: bool,
+    /// No fire or smoke drawn at all (to measure what they cover).
+    no_fx: bool,
     /// With `--mission --screenshot`: her health drops to this eight
     /// seconds in, to see the scripts' healing and survival rescue.
     hurt: Option<f32>,
@@ -401,6 +408,8 @@ fn parse_args() -> anyhow::Result<Options> {
             ),
             "--after-contract" => o.after_contract = value()?.parse()?,
             "--old-hud" => o.old_hud = true,
+            "--old-fx" => o.old_fx = true,
+            "--no-fx" => o.no_fx = true,
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
             "--seated" => o.seated = true,
@@ -1053,6 +1062,10 @@ fn screenshot(
     }
     if let Some(seconds) = options.traffic {
         traffic_for_screenshot(&mut backend, &mut game, fov, aspect, seconds)?;
+    }
+    game.scene.hide_fx = options.no_fx;
+    if options.old_fx {
+        game.scene.particles = None;
     }
     if options.probe {
         probe_for_screenshot(&game);
@@ -4175,8 +4188,13 @@ fn blast_for_screenshot(
         game.combat.last_launch.map(|l| l.0),
         game.combat.last_launch.map(|l| l.1)
     );
-    for _ in 0..120 {
+    // Until the rocket bursts (4 s at most), so the wait counts from it.
+    let before = game.combat.blasts;
+    for _ in 0..240 {
         game.step(Intent::default(), tick);
+        if game.combat.blasts > before {
+            break;
+        }
     }
     let spent = game.scene.explosives.iter().filter(|e| e.gone).count();
     eprintln!(
@@ -4186,6 +4204,9 @@ fn blast_for_screenshot(
         game.scene.explosives.len(),
         game.combat.hp
     );
+    if let Some(p) = &game.scene.particles {
+        eprintln!("blast: {} particles alive", p.live());
+    }
     for i in 0..(wait / tick) as usize {
         game.step(Intent::default(), tick);
         if i % 30 == 0 {
@@ -4195,6 +4216,9 @@ fn blast_for_screenshot(
     aim_at(game, at);
     game.step(Intent::default(), tick);
     render(backend, game, fov, aspect, None)?;
+    if let Some(p) = &game.scene.particles {
+        eprintln!("blast: {} particles alive at the picture", p.live());
+    }
     Ok(())
 }
 
