@@ -227,6 +227,18 @@ pub struct Destruction {
     heard: Vec<(Vec3, u32)>,
     /// Damage the physics props have taken so far ([`wear`](Self::wear)).
     worn: HashMap<StaticKey, f32>,
+    /// Worn down and blowing up, to be set off by the fight
+    /// ([`crate::combat::Combat::set_off`]): where, and how big.
+    pub set_off: Vec<(Vec3, f32)>,
+}
+
+/// Whether template `t`'s objects blow up when destroyed: what it leaves
+/// on dying (`SpawnOnDeath`) is a blast (`Explosive`).
+pub fn explodes(db: &m2_engine::Templates, t: u32) -> bool {
+    db.leavings
+        .spawns
+        .get(&t)
+        .is_some_and(|s| s.iter().any(|s| db.explosions.contains_key(s)))
 }
 
 impl Destruction {
@@ -262,6 +274,7 @@ impl Destruction {
                     || world.destroyed.contains(&i)
                     || world.is_taken(i)
                     || world.knocked_loose(i).is_some()
+                    || explodes(&world.index.template_db, world.index.objects[i].template)
                     || !world
                         .object_model(i)
                         .is_some_and(|m| m.has_wreck() || world.loose_mass(i).is_some())
@@ -320,6 +333,22 @@ impl Destruction {
              {hit:.0} ({damage:.0} of kind {kind:08x} x {scale})"
         );
         let sound = db.sound_keys.get(&template).copied();
+        // A state layer's prop whose template leaves a blast on dying
+        // (`SpawnOnDeath` an `Explosive`: `_global_explosivebarrel`) blows
+        // up where it stood, leaving nothing (the island's explosives go
+        // off as they always have, by the fight's own count).
+        if let StaticKey::Entity(e) = key
+            && explodes(db, template)
+        {
+            let centre = props.centre(e).unwrap_or(at);
+            let size = props
+                .placed_bounds(e)
+                .map_or(0.5, |(_, (lo, hi))| (hi - lo).length() * 0.5);
+            eprintln!("destruct: {key:?} blows up at {centre:.1}");
+            props.hide(&mut world.physics, [e]);
+            self.set_off.push((centre, size));
+            return true;
+        }
         match key {
             StaticKey::Object(i) => match install {
                 Some(install) => self.bring_down(world, props, install, i, Cause::Blast(at)),

@@ -3158,6 +3158,15 @@ impl Combat {
         }
     }
 
+    /// Sets off something that blows up where it stood, at `at` (`size`
+    /// metres about its middle): a state layer's explosive barrel worn
+    /// down ([`crate::destruct::Destruction::set_off`]). It goes off a
+    /// moment later and burns, as the island's explosives do.
+    pub fn set_off(&mut self, at: Vec3, size: f32) {
+        self.fuses.push((at, CHAIN_DELAY));
+        self.fires.push((at, size, BURN, 0.0));
+    }
+
     /// A round of her rifle's landing at `at` on `key`, as a shot of hers
     /// strikes the world (the props check's).
     pub fn rifle_strike(&self, at: Vec3, key: Option<StaticKey>) -> Strike {

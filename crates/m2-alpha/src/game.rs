@@ -2022,6 +2022,10 @@ fn hit_world(
         }
     }
     blast_loose(world, props, &combat.went_off, combat::REACH, false);
+    // What was worn down and blows up goes off a moment later.
+    for (at, size) in destruction.set_off.drain(..) {
+        combat.set_off(at, size);
+    }
     let mut broken = flights.strike(&mut world.physics, &combat.struck, &combat.went_off);
     // The state layers' crates too ([`crate::placed`]).
     broken.extend(placed.strike(
