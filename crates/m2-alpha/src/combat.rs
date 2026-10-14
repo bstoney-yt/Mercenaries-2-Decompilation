@@ -1383,6 +1383,56 @@ pub struct Combat {
     /// Hurts since [`take_hurts`](Self::take_hurts): damage and where
     /// from, for the HUD.
     hurts: Vec<(f32, Option<Vec3>)>,
+    /// The emplaced gun she mans, if any ([`crate::placed`]): fire fires
+    /// it, and nothing she carries.
+    pub manned: Option<Manned>,
+}
+
+/// An emplaced gun she mans (`Emplaced MG (VZ)`): its template's
+/// `PhysicalLink`ed weapon (`Mounted Heavy MG (VZ)`) fired along the
+/// crosshair, held within its `Turret`'s turn (`MinYaw`..`MaxYaw`,
+/// `MinPitch`..`MaxPitch`, -90..90 and -20..30 degrees) from the way it
+/// was placed facing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Manned {
+    /// Its entity and template.
+    pub entity: u32,
+    pub template: u32,
+    /// Where the gun turns: its place, raised to the barrel
+    /// ([`MANNED_PIVOT`]), and the way it faces (yaw, radians; its
+    /// model's +z).
+    pub pivot: Vec3,
+    pub facing: f32,
+    /// How far it turns and tilts, radians.
+    pub yaw: (f32, f32),
+    pub pitch: (f32, f32),
+    pub weapon: m2_engine::weapons::WeaponSpec,
+    /// Rounds left: its clip and reserve clips together.
+    pub rounds: u32,
+}
+
+/// An emplaced gun's barrel above its place, metres (invented: the
+/// tripod's gun sits about a crouching soldier's shoulder high).
+pub const MANNED_PIVOT: f32 = 1.1;
+
+impl Manned {
+    /// `dir` held within its turn and tilt.
+    pub fn clamp(&self, dir: Vec3) -> Vec3 {
+        turret_clamp(dir, self.facing, self.yaw, self.pitch)
+    }
+}
+
+/// `dir` held within `yaw` (radians either side of `facing`, across the
+/// ground) and `pitch` (radians, up positive).
+fn turret_clamp(dir: Vec3, facing: f32, yaw: (f32, f32), pitch: (f32, f32)) -> Vec3 {
+    use std::f32::consts::{PI, TAU};
+    let flat = dir.with_y(0.0);
+    let off = (flat.x.atan2(flat.z) - facing + PI).rem_euclid(TAU) - PI;
+    let yaw = facing + off.clamp(yaw.0, yaw.1);
+    let pitch = dir.y.atan2(flat.length()).clamp(pitch.0, pitch.1);
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    Vec3::new(sy * cp, sp, cy * cp)
 }
 
 /// Hurts kept for [`Combat::take_hurts`].
@@ -1410,6 +1460,7 @@ impl Default for Combat {
             quiet: 0.0,
             reload: 0.0,
             mg_reload: 0.0,
+            manned: None,
             aim_left: 0.0,
             throw_in: None,
             bash_in: None,
@@ -1994,6 +2045,16 @@ impl Combat {
         }
 
         let on_foot = f.player.landed && f.player.driving.is_none() && self.down <= 0.0;
+        // At an emplaced gun: it fires, and nothing she carries.
+        let on_foot = match self.manned {
+            Some(_) if f.player.driving.is_none() && self.down <= 0.0 => {
+                if trigger.fire && self.reload <= 0.0 {
+                    self.manned_fire(f);
+                }
+                false
+            }
+            _ => on_foot,
+        };
         // Asked for a launcher: whichever she carries in its place.
         match (trigger.select, self.second) {
             (Some(Weapon::Rifle), _) => self.weapon = Weapon::Rifle,
@@ -2197,6 +2258,108 @@ impl Combat {
             }
             None => {}
         }
+    }
+
+    /// Fires the emplaced gun she mans ([`Manned`]): a round of its
+    /// weapon's from its barrel along the crosshair, held within its turn,
+    /// as a vehicle's machine gun's rounds do (people, vehicles, crates
+    /// and explosive props).
+    fn manned_fire(&mut self, f: &mut Field<'_>) {
+        let Some(m) = &mut self.manned else {
+            return;
+        };
+        if m.rounds == 0 {
+            return;
+        }
+        m.rounds -= 1;
+        let (_, dir) = Self::aim_ray(f.player);
+        let aim = m.clamp(dir);
+        let from = m.pivot + aim * 0.9;
+        let w = &m.weapon;
+        self.reload = w.gap();
+        let ammo = w.ammo;
+        let round = match ammo.key {
+            Some(k) if k == m2_assets::name_hash("Bullet") => Round::Bullet,
+            _ => Round::BulletLarge,
+        };
+        // A recoilless rifle's rocket, a howitzer's shell: as a vehicle's.
+        match w.flight() {
+            m2_engine::weapons::Flight::Round => {}
+            m2_engine::weapons::Flight::Lobbed => {
+                let goal = Self::aim_point(f.physics, f.people, f.player, None);
+                let speed = ammo.velocity.max(1.0);
+                let velocity = lob_velocity(from, goal, speed, m2_engine::physics::GRAVITY)
+                    .unwrap_or(aim * speed);
+                self.projectiles.push(Projectile::Round {
+                    at: from,
+                    velocity,
+                    flown: 0.0,
+                    blast: ammo.burst(),
+                });
+                self.sounds.push(Sound::Lob(from));
+                alarm(f.people, from);
+                return;
+            }
+            _ => {
+                self.projectiles.push(Projectile::Rocket {
+                    at: from,
+                    velocity: aim * ammo.velocity.max(1.0),
+                    flown: 0.0,
+                    shell: false,
+                    owner: None,
+                    blast: ammo.burst(),
+                    homing: None,
+                });
+                self.effect(
+                    Effect::Flash {
+                        at: from,
+                        dir: aim,
+                        size: MG_FLASH,
+                    },
+                    FLASH_TIME,
+                );
+                self.sounds.push(Sound::Launch(from));
+                alarm(f.people, from);
+                return;
+            }
+        }
+        let human = self.on_people(ammo.key);
+        let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, None);
+        let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
+        let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
+        let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
+        if let Some((t, None)) = hit {
+            self.round_on_vehicle(f, (from, aim, t), (damage, round), None);
+            self.hit_explosives_in(f.explosives, from + aim * t, on_props);
+            let key = f
+                .physics
+                .cast_ray_keyed(from, aim, t + 0.05)
+                .and_then(|(_, _, key)| key);
+            self.struck.push(Strike {
+                at: from + aim * t,
+                damage: on_props,
+                key,
+            });
+        }
+        if let Some((_, Some(j))) = hit {
+            let soldier = f.people.npcs[j].soldier;
+            if f.people.npcs[j].hurt(damage * human, aim * SHOT_PUSH) && soldier {
+                self.remarks.push(Remark::Kill);
+            }
+            self.hits += 1;
+        }
+        self.fired.rifle += 1;
+        self.effect(Effect::Tracer { from, to }, 0.07);
+        self.effect(
+            Effect::Flash {
+                at: from,
+                dir: aim,
+                size: MG_FLASH,
+            },
+            FLASH_TIME,
+        );
+        self.sounds.push(Sound::Shot(from));
+        alarm(f.people, from);
     }
 
     fn player_shoot(&mut self, f: &mut Field<'_>) {
@@ -4773,6 +4936,28 @@ mod tests {
         combat.rifle_rounds = Rounds::default();
         combat.change_clip(ask, true, 0.1);
         assert!(combat.changing.is_none());
+    }
+
+    #[test]
+    fn an_emplaced_gun_turns_and_tilts_only_as_far_as_its_turret() {
+        // `Emplaced MG (VZ)`'s `Turret`: -90..90 degrees round, -20..30 up.
+        let clamp = |dir: Vec3| {
+            turret_clamp(
+                dir,
+                0.0,
+                (-90f32.to_radians(), 90f32.to_radians()),
+                (-20f32.to_radians(), 30f32.to_radians()),
+            )
+        };
+        // Ahead and a little to the side: as asked.
+        let ahead = Vec3::new(0.3, 0.1, 1.0).normalize();
+        assert!(clamp(ahead).distance(ahead) < 1e-5);
+        // Behind it: as far round as it goes, to the nearer side.
+        let back = clamp(Vec3::new(0.2, 0.0, -1.0).normalize());
+        assert!(back.distance(Vec3::X) < 1e-5, "{back}");
+        // Straight up: tilted its most.
+        let up = clamp(Vec3::new(0.0, 1.0, 0.01).normalize());
+        assert!((up.y.asin().to_degrees() - 30.0).abs() < 1e-3, "{up}");
     }
 
     #[test]

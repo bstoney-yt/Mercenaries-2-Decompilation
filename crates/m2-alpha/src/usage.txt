@@ -160,6 +160,9 @@ m2-alpha [options]
                          keys its stick)
   --hijack               with --screenshot --drive: hijack the vehicle
                          (--vehicle's) instead, answering every prompt
+  --placed-check         with --mission: every 5 s, try each pickup, crate and
+                         emplaced gun the layers have put out (logged as
+                         placed-check lines), for testing
   --support <key>        with --mission: stock support item <key> (clusterbomb,
                          Support) and call it in once the scripts run, to
                          test their strikes and drops; repeatable

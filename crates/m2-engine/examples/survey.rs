@@ -67,6 +67,12 @@
 //!                           alpha makes of them (wheels, tracked, turret),
 //!                           and every node with its geometry box and how
 //!                           it fares in the wheel tests
+//! pickups[:<word>,..]       every placed pickup (health, ammunition, a
+//!                           weapon, cash), supply crate (what it leaves)
+//!                           and emplaced gun, in the areas of the state
+//!                           layers whose name holds a word (default
+//!                           vzacon001,pmccon001): their box, 150 m wider,
+//!                           over every layer; counts, then each one
 //! templates:<word|id>[,..]  templates whose name holds a word (or whose
 //!                           id is given, 8 hex digits), with their
 //!                           components' fields (text fields not read), a
@@ -1010,6 +1016,7 @@ fn main() -> Result<(), Error> {
                     arg,
                 )
             }
+            "pickups" => pickups(&mut source, arg),
             "stam" => stam(&mut source, &names, arg),
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
@@ -5436,6 +5443,155 @@ fn components<R: Read + Seek>(
             })
             .collect();
         println!("  {} [{}]: {}", c.name, c.count, fields.join(", "));
+    }
+    Ok(())
+}
+
+/// What a placed template is to the player, for the `pickups` census.
+fn pickup_kind(
+    leavings: &m2_engine::pickup::Leavings,
+    tnames: &HashMap<u32, &str>,
+    t: u32,
+) -> Option<&'static str> {
+    use m2_engine::pickup::EQUIPMENT;
+    let name = tnames.get(&t).copied().unwrap_or("");
+    if let Some(p) = leavings.pickups.get(&t) {
+        return Some(if name.contains("Cash") {
+            "cash"
+        } else if p.kind == EQUIPMENT {
+            "weapon"
+        } else if p.heals > 0 && p.gives.is_empty() {
+            "health"
+        } else {
+            "ammo"
+        });
+    }
+    let labels = leavings.labels.get(&t).map_or(&[][..], Vec::as_slice);
+    if labels.contains(&m2_assets::name_hash("Emplacedweapon")) {
+        return Some("emplaced");
+    }
+    // Whatever leaves a pickup when destroyed: a crate, labelled so or
+    // not.
+    let spawns = leavings.spawns.get(&t)?;
+    spawns
+        .iter()
+        .any(|s| leavings.pickups.contains_key(s))
+        .then_some("crate")
+}
+
+fn pickups<R: Read + Seek>(source: &mut AssetSource<R>, arg: &str) -> Result<(), Error> {
+    let mut words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if words.is_empty() {
+        words = vec!["vzacon001".into(), "pmccon001".into()];
+    }
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let leavings = m2_engine::pickup::read(&db);
+    // Every placed one: its layer, kind, template, entity and place.
+    let mut rows: Vec<(String, &str, u32, u32, Vec3)> = Vec::new();
+    // Each state layer's box.
+    let mut boxes: HashMap<String, (Vec3, Vec3)> = HashMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        let layer = m2_engine::world::layer_name(&paths[b]);
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(l) = Layer::parse(data) else {
+                continue;
+            };
+            for (id, p) in l.placements() {
+                let at = Vec3::from_array(p.position);
+                if layer.contains("state") {
+                    let b = boxes.entry(layer.clone()).or_insert((at, at));
+                    *b = (b.0.min(at), b.1.max(at));
+                }
+                if let Some(kind) = pickup_kind(&leavings, &tnames, p.parent) {
+                    rows.push((layer.clone(), kind, p.parent, id, at));
+                }
+            }
+        }
+    }
+    const WIDER: f32 = 150.0;
+    for w in &words {
+        let mut lo = Vec3::splat(f32::MAX);
+        let mut hi = Vec3::splat(f32::MIN);
+        for (_, b) in boxes
+            .iter()
+            .filter(|(n, _)| n.replace('_', "").contains(w.as_str()))
+        {
+            lo = lo.min(b.0);
+            hi = hi.max(b.1);
+        }
+        if lo.x > hi.x {
+            println!("{w}: no state layer");
+            continue;
+        }
+        let (lo, hi) = (lo - Vec3::splat(WIDER), hi + Vec3::splat(WIDER));
+        // In the box, of the island's layers or the contract's own
+        // (`vz_state_vza_con001_post` is VzaCon001's too), not another
+        // contract's that shares the ground.
+        let own =
+            |layer: &str| !layer.contains("state") || layer.replace('_', "").contains(w.as_str());
+        let inside: Vec<_> = rows
+            .iter()
+            .filter(|r| r.4.x >= lo.x && r.4.x <= hi.x && r.4.z >= lo.z && r.4.z <= hi.z)
+            .filter(|r| own(&r.0))
+            .collect();
+        let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+        for r in &inside {
+            *tally.entry(r.1).or_default() += 1;
+        }
+        println!(
+            "pickups\t{w}\tbox {:.0},{:.0}..{:.0},{:.0}\t{} placed\t{tally:?}",
+            lo.x,
+            lo.z,
+            hi.x,
+            hi.z,
+            inside.len()
+        );
+        for (layer, kind, t, id, at) in inside {
+            let leaves: Vec<&str> = leavings
+                .spawns
+                .get(t)
+                .into_iter()
+                .flatten()
+                .map(|s| tnames.get(s).copied().unwrap_or("?"))
+                .collect();
+            println!(
+                "placed\t{w}\t{kind}\t{t:08x}\t{}\t{layer}\t{id:#x}\t{:.1},{:.1},{:.1}\t{}",
+                tnames.get(t).copied().unwrap_or("?"),
+                at.x,
+                at.y,
+                at.z,
+                leaves.join("; ")
+            );
+        }
     }
     Ok(())
 }

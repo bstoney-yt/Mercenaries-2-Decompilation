@@ -929,6 +929,7 @@ mod tests {
                 pitch: (-0.14, 0.44),
                 pitch_speed: 1.0,
                 pitch_accel: 20.0,
+                yaw: None,
             }),
             ..VehicleTuning::default()
         };

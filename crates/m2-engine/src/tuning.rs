@@ -96,6 +96,10 @@ pub struct TurretTuning {
     pub pitch: (f32, f32),
     pub pitch_speed: f32,
     pub pitch_accel: f32,
+    /// How far it turns either way from straight ahead, radians (`MinYaw`,
+    /// `MaxYaw`, degrees: an emplaced machine gun's -90 and 90; a tank's
+    /// turret's go all the way round), if the template gives them.
+    pub yaw: Option<(f32, f32)>,
 }
 
 /// The damage table's scale for the two kinds of round: `Bullet` (rifles,
@@ -536,6 +540,7 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         pitch: (deg("MinPitch")?, deg("MaxPitch")?),
                         pitch_speed: deg("maxPitchSpeed")?,
                         pitch_accel: deg("maxPitchAccel")?,
+                        yaw: deg("MinYaw").zip(deg("MaxYaw")),
                     })
                 })(),
                 camera: (|| {
