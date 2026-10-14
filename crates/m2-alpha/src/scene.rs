@@ -728,6 +728,10 @@ const MAX_BEND: f32 = 0.9;
 pub struct Scene {
     /// The grid, drawn when there is no island.
     ground: (VertexBufferHandle, IndexBufferHandle, MaterialId),
+    /// The vehicles (the mission scripts' objects, the island's entities)
+    /// that are ruins of one ([`crate::mission::is_ruin`]): they stand
+    /// wrecked when they load.
+    pub ruins: std::collections::HashSet<u32>,
     pub world: Option<World>,
     pub models: Vec<Placed>,
     pub materials: MaterialCache,
@@ -1064,6 +1068,7 @@ impl Scene {
         let ground = ground(backend, &mut materials)?;
         let effects = Effects::new(backend, &mut materials)?;
         Ok(Self {
+            ruins: Default::default(),
             ground,
             world: None,
             models: Vec::new(),
@@ -1737,7 +1742,7 @@ impl Scene {
                     spec: tune(spec),
                     model,
                     id: None,
-                    wrecked: false,
+                    wrecked: self.ruins.contains(&guid),
                     guid: Some(guid),
                     spot: None,
                     crew,
@@ -1753,7 +1758,7 @@ impl Scene {
                     spec: tune(spec),
                     model,
                     id: None,
-                    wrecked: false,
+                    wrecked: self.ruins.contains(&entity),
                     guid: None,
                     spot: Some((entity, at, yaw)),
                     crew,

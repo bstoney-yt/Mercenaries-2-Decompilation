@@ -143,6 +143,63 @@ impl Crasher {
     }
 }
 
+/// The parts of a model placed at `at` ([`m2_engine::ModelParts`]) that
+/// `vehicle` breaks running into it, for a template whose
+/// `PhysicsPropertyCrashable` records name nodes (`named`,
+/// [`m2_engine::Templates::crash_parts`]): each standing part (not
+/// `down`) whose intact box the vehicle's box meets, if its record says
+/// the vehicle breaks it (a jeep flattens a hedge's section, breaks a
+/// gate's leaf); one its body `touched` but whose parts' boxes it meets
+/// none of, its nearest part (invented: the footage shows the parts hit
+/// broken, not how the game picks them). `None` if no record names one of
+/// the model's parts.
+fn parts_hit(
+    vehicle: &Crasher,
+    at: Mat4,
+    parts: &m2_engine::ModelParts,
+    named: &[(u32, Crash)],
+    down: impl Fn(usize) -> bool,
+    touched: bool,
+) -> Option<Vec<usize>> {
+    let mine: Vec<(usize, Crash)> = named
+        .iter()
+        .filter_map(|&(node, crash)| Some((parts.part_named(node)?, crash)))
+        .collect();
+    if mine.is_empty() {
+        return None;
+    }
+    let standing: Vec<(usize, Crash, (Vec3, Vec3))> = mine
+        .iter()
+        .filter(|(k, _)| !down(*k))
+        .filter_map(|&(k, c)| Some((k, c, parts.part_box(k)?)))
+        .collect();
+    let mut met: Vec<(usize, Crash)> = standing
+        .iter()
+        .filter(|(_, _, b)| vehicle.meets(at, *b))
+        .map(|&(k, c, _)| (k, c))
+        .collect();
+    if met.is_empty() && touched {
+        let (lo, hi) = vehicle.bounds;
+        let middle = vehicle.place.transform_point3((lo + hi) * 0.5);
+        let gap = |(lo, hi): (Vec3, Vec3)| at.transform_point3((lo + hi) * 0.5).distance(middle);
+        met.extend(
+            standing
+                .iter()
+                .min_by(|a, b| gap(a.2).total_cmp(&gap(b.2)))
+                .map(|&(k, c, _)| (k, c)),
+        );
+    }
+    let key = StaticKey::Entity(0);
+    let mut out: Vec<usize> = met
+        .into_iter()
+        .filter(|&(_, c)| vehicle.does(key, Some(c), false) == Some(Crashed::Down(key)))
+        .map(|(k, _)| k)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
 /// Whether two boxes (each its model-space corners, placed by its
 /// matrix) overlap, turned as they are: no line separates them, tried
 /// along each box's three edges and every pair of one's edge with the
@@ -249,6 +306,13 @@ pub struct Destruction {
     /// Worn down and blowing up, to be set off by the fight
     /// ([`crate::combat::Combat::set_off`]): where, and how big.
     pub set_off: Vec<(Vec3, f32)>,
+    /// The island's objects destroyed whose links were followed
+    /// ([`fall_linked`](Self::fall_linked)).
+    linked: HashSet<usize>,
+    /// The island's objects a vehicle broke some parts of, put up as
+    /// props, waiting for their models to break those parts: (object,
+    /// parts, the vehicle's velocity and mass).
+    parting: Vec<(usize, Vec<usize>, Vec3, f32)>,
 }
 
 /// Whether template `t`'s objects blow up when destroyed: what it leaves
@@ -560,6 +624,15 @@ impl Destruction {
             if !touched.contains(&key) && !vehicle.meets(at, m.bounds) {
                 continue;
             }
+            // Broken a part at a time: put up as a prop, its parts break
+            // as it loads; nothing more while it does.
+            if self.parting.iter().any(|p| p.0 == i) {
+                continue;
+            }
+            if let Some(hit) = self.crash_object_parts(world, props, install, i, vehicle, touched) {
+                out.extend(hit);
+                continue;
+            }
             let crash = world.index.template_db.crashable.get(&o.template).copied();
             let loose = world.loose_mass(i).is_some();
             match vehicle.does(key, crash, loose) {
@@ -602,6 +675,12 @@ impl Destruction {
             if !touched.contains(&key) && !vehicle.meets(at, bounds) {
                 continue;
             }
+            // What breaks a part at a time (a hedge's sections, a gate's
+            // leaves): the parts it runs into, each as its own record says.
+            if let Some(hit) = self.crash_parts(world, props, e, at, vehicle, touched) {
+                out.extend(hit);
+                continue;
+            }
             let crash = world.index.template_db.crashable.get(&template).copied();
             let loose = props.loose_mass(&world.physics, e).is_some();
             match vehicle.does(key, crash, loose) {
@@ -638,16 +717,197 @@ impl Destruction {
         out
     }
 
+    /// What `vehicle` does to state layer prop `e` (placed at `at`) if its
+    /// template breaks a part at a time ([`parts_hit`]): the parts it runs
+    /// into break, the rest standing. `None` for any other prop (left to
+    /// the whole-prop rule), else what it brought down (nothing, or the
+    /// prop).
+    fn crash_parts(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        e: u32,
+        at: Mat4,
+        vehicle: &Crasher,
+        touched: &[StaticKey],
+    ) -> Option<Vec<Crashed>> {
+        let template = props.get(e)?.0.template;
+        let named = world.index.template_db.crash_parts.get(&template)?.clone();
+        let parts = props.model_parts(e)?.clone();
+        let key = StaticKey::Entity(e);
+        let hit = parts_hit(
+            vehicle,
+            at,
+            &parts,
+            &named,
+            |k| props.part_down(e, k),
+            touched.contains(&key),
+        )?;
+        let mut out = Vec::new();
+        for k in hit {
+            let position = props.get(e).map_or(Vec3::ZERO, |(p, _)| p.position);
+            self.part_heard(world, template, &parts, at, k, position);
+            eprintln!(
+                "destruct: prop {e:#x} (of {}) part {k} of {} at {position:.1} run into by a {:.0} \
+                 kg vehicle at {:.1} m/s; {}",
+                props.layer(e).unwrap_or("a layer not noted"),
+                parts.count(),
+                vehicle.mass,
+                vehicle.velocity.length(),
+                break_sound(world, template)
+            );
+            props.wreck_part(&mut world.physics, e, k, |shifted| {
+                crate::game::flung(vehicle.velocity, vehicle.mass, shifted)
+            });
+            if !out.contains(&Crashed::Down(key)) {
+                out.push(Crashed::Down(key));
+            }
+        }
+        Some(out)
+    }
+
+    /// The same for the island's placed object `i`: the
+    /// parts it runs into break once the object is put up as a prop
+    /// ([`update`](Self::update)), the island's copy and its collision
+    /// going then. `None` for any other object, else what it brought
+    /// down.
+    fn crash_object_parts(
+        &mut self,
+        world: &World,
+        props: &mut Props,
+        install: &Install,
+        i: usize,
+        vehicle: &Crasher,
+        touched: &[StaticKey],
+    ) -> Option<Vec<Crashed>> {
+        let o = world.index.objects[i];
+        let at = Mat4::from_rotation_translation(o.rotation, o.position);
+        let named = world.index.template_db.crash_parts.get(&o.template)?;
+        let parts = world.object_model(i)?.parts.as_ref()?;
+        let key = StaticKey::Object(i);
+        let hit = parts_hit(vehicle, at, parts, named, |_| false, touched.contains(&key))?;
+        if hit.is_empty() {
+            return Some(Vec::new());
+        }
+        if !props.adopt(install, crate::destruct::key(i), &o) {
+            return Some(Vec::new());
+        }
+        eprintln!(
+            "destruct: object {i} ({:08x}) at {:.1}: parts {hit:?} of {} run into by a {:.0} kg \
+             vehicle at {:.1} m/s; {}",
+            o.model,
+            o.position,
+            parts.count(),
+            vehicle.mass,
+            vehicle.velocity.length(),
+            break_sound(world, o.template)
+        );
+        for &k in &hit {
+            self.part_heard(world, o.template, parts, at, k, o.position);
+        }
+        self.parting.push((i, hit, vehicle.velocity, vehicle.mass));
+        Some(vec![Crashed::Down(key)])
+    }
+
+    /// A part breaking is heard where it stood, as its template's
+    /// `SoundKey` says.
+    fn part_heard(
+        &mut self,
+        world: &World,
+        template: u32,
+        parts: &m2_engine::ModelParts,
+        at: Mat4,
+        k: usize,
+        or: Vec3,
+    ) {
+        if let Some(&s) = world.index.template_db.sound_keys.get(&template) {
+            let c = parts
+                .part_box(k)
+                .map_or(or, |(lo, hi)| at.transform_point3((lo + hi) * 0.5));
+            self.heard.push((c, s));
+        }
+    }
+
+    /// Brings down what falls with what was brought down
+    /// (`DestructionLink`, [`m2_engine::WorldIndex::falls_with`]): a state
+    /// layer's prop wrecked takes those linked to it down (props wrecked
+    /// where they stand; the island's objects as a blast there would), and
+    /// so on down the links.
+    fn fall_linked(&mut self, world: &mut World, props: &mut Props, install: Option<&Install>) {
+        let mut fallen = props.take_fallen();
+        // The island's objects destroyed since, by entity.
+        fallen.extend(
+            self.destroyed
+                .iter()
+                .filter(|i| !self.linked.contains(i))
+                .filter_map(|&i| world.index.objects.get(i).map(|o| o.entity))
+                .collect::<Vec<_>>(),
+        );
+        self.linked.extend(self.destroyed.iter().copied());
+        let mut seen: HashSet<u32> = HashSet::new();
+        while let Some(e) = fallen.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            let Some(targets) = world.index.falls_with.get(&e).cloned() else {
+                continue;
+            };
+            for t in targets {
+                if props.get(t).is_some_and(|(p, _)| !p.wrecked) {
+                    eprintln!("destruct: {t:#x} falls with {e:#x} (DestructionLink)");
+                    let at = props.centre(t);
+                    props.wreck(&mut world.physics, t, at);
+                    fallen.extend(props.take_fallen());
+                } else if let Some(i) = world.index.objects.iter().position(|o| o.entity == t)
+                    && !self.destroyed.contains(&i)
+                    && let Some(install) = install
+                {
+                    eprintln!("destruct: object {i} ({t:#x}) falls with {e:#x} (DestructionLink)");
+                    let at = world.index.objects[i].position;
+                    self.bring_down(world, props, install, i, Cause::Blast(at));
+                    self.linked.insert(i);
+                    fallen.push(t);
+                }
+            }
+        }
+    }
+
     /// Brings down those destroyed whose props have loaded: the island's
     /// copy goes, the prop breaks apart (or shows its wreck). One a blast
     /// destroyed is heard coming down, dust rising where its break-up
     /// names points, if it has a building's collapse; one a vehicle ran
     /// into is knocked on by it. Either, with no building's collapse, is
     /// heard as its template's `SoundKey` says ([`break_sound`]).
-    pub fn update(&mut self, world: &mut World, props: &mut Props, combat: &mut Combat) {
+    pub fn update(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        combat: &mut Combat,
+        install: Option<&Install>,
+    ) {
+        self.fall_linked(world, props, install);
         for (at, key) in self.heard.drain(..) {
             combat.broke(at, key);
         }
+        // The island's objects broken a part at a time whose props have
+        // loaded: the island's copy and its collision go, the prop stands
+        // with those parts broken (and its others in the way).
+        self.parting.retain(|(i, parts, velocity, mass)| {
+            let key = key(*i);
+            match props.get(key) {
+                Some((_, true)) => {}
+                Some((_, false)) => return true,
+                None => return false,
+            }
+            world.take(*i);
+            world.take_static(*i);
+            for &k in parts.iter() {
+                props.wreck_part(&mut world.physics, key, k, |shifted| {
+                    crate::game::flung(*velocity, *mass, shifted)
+                });
+            }
+            false
+        });
         self.falling.retain(|&(i, cause)| {
             let key = key(i);
             match props.get(key) {

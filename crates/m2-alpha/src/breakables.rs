@@ -341,12 +341,15 @@ pub fn check(
         game.scene.explosives.iter().map(|e| e.object).collect();
     // Not money (round 14's), nor what the pickups round tries. A tank
     // tries what it should crush, too (trees, bushes, shacks).
+    // What a vehicle breaks a part at a time (a hedge's sections, a
+    // gate's leaves) is tried by a jeep too (round 8).
+    let in_parts = |t: u32| templates.crash_parts.get(&t).is_some_and(|p| p.len() > 1);
     let wanted = |t: u32| {
         let m = Makeup::of(templates, t);
         (if hit == HitKind::Tank {
             m.is_crushable()
         } else {
-            m.is_prop()
+            m.is_prop() || (hit == HitKind::Vehicle && in_parts(t))
         }) && crate::placed::kind(templates, t).is_none()
             && !templates.names.get(&t).is_some_and(|n| n.contains("Cash"))
     };
@@ -417,6 +420,9 @@ pub fn check(
         }
     };
     let mut tally: std::collections::BTreeMap<(Reaction, bool), usize> = Default::default();
+    // Props whose template breaks a part at a time, hit: how many, their
+    // parts standing after, their parts.
+    let mut parts = (0usize, 0usize, 0usize);
     let mut unloaded = 0;
     let mut at_patch = None;
     for item in items.clone() {
@@ -554,12 +560,31 @@ pub fn check(
         *tally.entry((got, ok)).or_default() += 1;
         eprintln!(
             "props-check: {hit:?} {:?} {name} row {row} health {:?} physics {:?} crash {:?}: \
-             {got:?}, data {want:?} -> {}{note}",
+             {got:?}, data {want:?} -> {}{note}{}",
             item.key,
             makeup.health,
             makeup.physics.map(|p| (p.mass, p.heavy)),
             makeup.crash.map(|c| (c.how, c.takes)),
-            if ok { "ok" } else { "MISS" }
+            if ok { "ok" } else { "MISS" },
+            parts_left(game, item.key, item.template).map_or(String::new(), |(up, all)| format!(
+                "; parts standing {up} of {all}"
+            ))
+        );
+        // What a vehicle leaves of one it breaks a part at a time (a
+        // hedge's sections, a gate's leaves).
+        if let Some((up, all)) = parts_left(game, item.key, item.template)
+            && matches!(hit, HitKind::Vehicle | HitKind::Tank)
+        {
+            parts.0 += 1;
+            parts.1 += up;
+            parts.2 += all;
+        }
+    }
+    if parts.0 > 0 {
+        eprintln!(
+            "props-check parts: {hit:?}: {} props broken a part at a time hit; parts standing after \
+             the hit {} of {}",
+            parts.0, parts.1, parts.2
         );
     }
     let tried: usize = tally.values().sum();
@@ -589,6 +614,34 @@ pub fn check(
     tried
 }
 
+/// For one whose template a vehicle breaks a part at a time (two parts
+/// or more, [`m2_engine::Templates::crash_parts`]): its parts standing,
+/// and its parts.
+fn parts_left(game: &crate::game::Game, key: StaticKey, template: u32) -> Option<(usize, usize)> {
+    let world = game.scene.world.as_ref()?;
+    let all = world
+        .index
+        .template_db
+        .crash_parts
+        .get(&template)
+        .map(Vec::len)
+        .filter(|&n| n > 1)?;
+    let down = match key {
+        StaticKey::Object(i) => {
+            let destroyed = game.destruction.destroyed.contains(&i) || world.destroyed.contains(&i);
+            // Put up as a prop to break a part at a time.
+            let prop = crate::destruct::key(i);
+            if !destroyed && game.scene.props.get(prop).is_some() {
+                return Some((game.scene.props.parts_standing(prop, all), all));
+            }
+            destroyed
+        }
+        StaticKey::Entity(e) => return Some((game.scene.props.parts_standing(e, all), all)),
+        _ => false,
+    };
+    Some((if down { 0 } else { all }, all))
+}
+
 /// Where `key` stands and its model's box, once its model has loaded.
 fn placed_box(game: &crate::game::Game, key: StaticKey) -> Option<(Mat4, (Vec3, Vec3))> {
     match key {
@@ -616,14 +669,21 @@ fn reaction(game: &crate::game::Game, key: StaticKey, template: u32) -> Reaction
     let (knocked, down) = match key {
         StaticKey::Object(i) => (
             world.knocked_loose(i),
-            (game.destruction.destroyed.contains(&i) || world.destroyed.contains(&i))
-                .then(|| world.object_model(i).is_some_and(|m| m.has_wreck())),
+            if props.parts_broken(crate::destruct::key(i)) {
+                // Some of its parts broken, as a prop put up for it.
+                Some(true)
+            } else {
+                (game.destruction.destroyed.contains(&i) || world.destroyed.contains(&i))
+                    .then(|| world.object_model(i).is_some_and(|m| m.has_wreck()))
+            },
         ),
         StaticKey::Entity(e) => (
             props.knocked_loose(e),
             match props.get(e) {
                 None => Some(false),
-                Some((p, _)) => p.wrecked.then_some(true),
+                // Some of its parts broken (a hedge's sections), the rest
+                // standing: broken where it was hit.
+                Some((p, _)) => (p.wrecked || props.parts_broken(e)).then_some(true),
             },
         ),
         _ => (None, None),

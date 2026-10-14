@@ -132,6 +132,40 @@ pub fn crashable(db: &Layer<'_>) -> HashMap<u32, Crash> {
         .collect()
 }
 
+/// Each template whose `PhysicsPropertyCrashable` records name nodes of
+/// its model (their `Name`, a node's name hash): the parts a vehicle
+/// breaks one at a time, by id, each named node with how it breaks. A
+/// long hedge's sections each have one (`_global_env_hedgelong`: four,
+/// flattened); so do a gate's two leaves (`_pmcoutpost_gate`: broken by
+/// a vehicle of 950 kg or more). A record naming no node, beside named
+/// ones, is left to [`crashable`]. PC data; that a vehicle breaks only
+/// the parts it runs into is from the footage (the real game's jeep
+/// leaves a hedge's other sections standing, playtest 3, 11:40-12:14).
+pub fn crash_parts(db: &Layer<'_>) -> HashMap<u32, Vec<(u32, Crash)>> {
+    let crash = Table::new(db, "PhysicsPropertyCrashable");
+    let name = name_hash("Name");
+    crash
+        .templates()
+        .filter_map(|id| {
+            let parts: Vec<(u32, Crash)> = crash
+                .of_template(id)
+                .iter()
+                .filter_map(|r| {
+                    let node = crash.word(r, name).filter(|&n| n != 0)?;
+                    let how = match crash.word(r, CRASH_HOW).unwrap_or(0) {
+                        1 => CrashHow::KnockedOver,
+                        2 => CrashHow::Flattened,
+                        _ => CrashHow::Breaks,
+                    };
+                    let takes = crash.float(r, CRASH_TAKES).unwrap_or(0.0).max(0.0);
+                    Some((node, Crash { how, takes }))
+                })
+                .collect();
+            (!parts.is_empty()).then_some((id, parts))
+        })
+        .collect()
+}
+
 /// Each template's `SoundKey`, by id, where it isn't zero: the sound its
 /// objects make as they break (`_global_fencewoodpanel`'s `286115a2`,
 /// `prop_sheetmetal_sml`; the chain-link fences' `16117a0b`,
