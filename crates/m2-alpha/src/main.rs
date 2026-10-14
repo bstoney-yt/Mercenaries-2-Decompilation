@@ -50,6 +50,7 @@ mod flights;
 mod flow;
 mod game;
 mod gamehud;
+mod held;
 mod hero;
 mod hijack;
 mod input;
@@ -183,6 +184,10 @@ struct Options {
     aim: bool,
     /// With `--screenshot` on foot: the weapon she has up.
     weapon: Option<combat::Weapon>,
+    /// With `--screenshot` on foot: switch to the other weapon (`--lead`
+    /// seconds before the picture), or pick a weapon up then.
+    switch: bool,
+    pickup: bool,
     /// Weapons held as worked out from the hands (`--grip hands`), not
     /// on the hand's attach node as posed.
     hands_grip: bool,
@@ -501,6 +506,8 @@ fn parse_args() -> anyhow::Result<Options> {
                     v => bail!("--weapon {v}: expected rifle, rpg or gl"),
                 })
             }
+            "--switch" => o.switch = true,
+            "--pickup" => o.pickup = true,
             "--closeup" => o.closeup = true,
             "--pda" => o.pda = true,
             "--pda-key" => o.pda_keys.push(
@@ -1288,9 +1295,21 @@ fn screenshot(
                 fire: options.fire && i == 177,
                 throw: options.throw && i == 180 - lead,
                 melee: options.bash && i == 180 - lead,
-                select: options.weapon.filter(|_| i == 0),
+                select: options.weapon.filter(|_| i == 0).or_else(|| {
+                    (options.switch && i == 180 - lead).then_some(match game.combat.weapon {
+                        combat::Weapon::Rifle => combat::Weapon::Rpg,
+                        _ => combat::Weapon::Rifle,
+                    })
+                }),
                 ..combat::Trigger::default()
             };
+            if options.pickup
+                && i == 180 - lead
+                && let Some(p) = game.scene.player.as_mut()
+                && !p.start_pickup()
+            {
+                eprintln!("--pickup: she has no pickup clip, or is busy");
+            }
             game.step(
                 Intent {
                     jump,

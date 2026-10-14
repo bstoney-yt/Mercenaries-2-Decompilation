@@ -1899,7 +1899,7 @@ fn take_up(
     combat: &mut Combat,
     flights: &mut crate::flights::Flights,
     templates: &m2_engine::Templates,
-    player: &Player,
+    player: &mut Player,
     p: crate::flights::Pickup,
     walked: bool,
 ) {
@@ -1938,6 +1938,11 @@ fn take_up(
     let left = combat
         .equip_gun(gun, rounds)
         .map(|(g, n)| (g.slot(), n, g.template, g.model_hash, g.name));
+    // Taken up with the use key, she picks it up off the ground
+    // (`PickupWeapon`); walked over, it is just had.
+    if !walked {
+        player.start_pickup();
+    }
     eprintln!(
         "pickup: she takes up the {} ({:#x}) at {:.1} with {rounds} rounds{}",
         spec.map_or(format!("{weapon:?}"), |s| s.name.clone()),

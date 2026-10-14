@@ -2104,6 +2104,7 @@ pub(crate) mod tests {
             own: Default::default(),
             foreign: Default::default(),
             aim_clip: None,
+            barrel: true,
         }
     }
 

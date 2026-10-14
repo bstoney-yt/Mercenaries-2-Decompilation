@@ -106,6 +106,10 @@ m2-alpha [options]
                          this long after it came up
   --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
                          (gl: the supply crate's grenade launcher)
+  --switch               with --screenshot on foot: switch weapons --lead
+                         seconds before the picture (stow, then take up)
+  --pickup               with --screenshot on foot: pick a weapon up --lead
+                         seconds before the picture
   --satellite <stage>    with --screenshot on foot: call a Satellite Guided
                          Bomb on the spot 45 m ahead of her (the support
                          key, the use key, the view steered over it and
