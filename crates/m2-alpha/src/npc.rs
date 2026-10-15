@@ -81,6 +81,10 @@ const SPRINT: f32 = 7.2;
 /// how close to where he last saw her he goes (inferred).
 const GIVE_UP: f32 = 20.0;
 const CLOSE_ENOUGH: f32 = 2.0;
+/// A chase stopped by a wall goes along it until the way on is open this
+/// far, metres, or for at most this long, seconds (invented).
+const DETOUR_OPEN: f32 = 2.5;
+const DETOUR_TIME: f32 = 4.0;
 /// Between steps about in a fight: seconds (at least, plus up to), how
 /// far a step goes, metres, and how close he pushes in to her (inferred).
 const STEP_GAP: (f32, f32) = (2.0, 3.0);
@@ -686,8 +690,13 @@ pub struct Npc {
     /// and the seconds since he was last hit.
     cover: Option<(Vec3, f32)>,
     hit: bool,
-    /// Rounds left in the burst he is firing.
+    /// In a chase, a way round what stopped him: which way and for how
+    /// much longer; and the side (1 or -1, 0 for none yet) he went round.
+    detour: Option<(Vec3, f32)>,
+    detour_side: f32,
+    /// Rounds left in the burst he is firing, and seconds since his last.
     burst: u32,
+    since_shot: f32,
     /// Running from gunfire: where to, and for how much longer.
     flee: Option<(Vec3, f32)>,
     brain: Brain,
@@ -769,7 +778,10 @@ impl Npc {
             spotted: false,
             cover: None,
             hit: false,
+            detour: None,
+            detour_side: 0.0,
             burst: 0,
+            since_shot: f32::INFINITY,
             flee: None,
             brain,
         }
@@ -933,11 +945,30 @@ impl Npc {
             self.step = None;
         } else if !seen || distance > FIRE_RANGE {
             self.step = None;
-            let flat = (goal - at).with_y(0.0);
-            if flat.length() > CLOSE_ENOUGH {
-                wanted = flat.normalize() * SPRINT * self.ai.pursue_speed;
+            let mut toward = (goal - at).with_y(0.0);
+            // Where he last saw her, and she isn't there: on towards the
+            // fight, where she is (invented: he hears it).
+            if toward.length() <= CLOSE_ENOUGH {
+                toward = (threat - at).with_y(0.0);
+            }
+            // Going round what stopped him, until the way on is open.
+            if let Some((way, left)) = &mut self.detour {
+                *left -= dt;
+                let waist = at + Vec3::Y * 0.9;
+                let open = physics
+                    .cast_ray(waist, toward.normalize_or(Vec3::Z), DETOUR_OPEN)
+                    .is_none();
+                if *left <= 0.0 || open {
+                    self.detour = None;
+                } else {
+                    wanted = *way * SPRINT * self.ai.pursue_speed;
+                }
+            }
+            if self.detour.is_none() && toward.length() > CLOSE_ENOUGH {
+                wanted = toward.normalize() * SPRINT * self.ai.pursue_speed;
             }
         } else {
+            self.detour = None;
             self.step_wait -= dt;
             if self.step.is_none() && self.step_wait <= 0.0 {
                 self.step_wait = STEP_GAP.0 + rng.range(0.0, STEP_GAP.1);
@@ -975,11 +1006,38 @@ impl Npc {
         physics.move_character(&mut self.character, wanted, None, dt);
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
         if wanted != Vec3::ZERO && moved < 0.2 {
-            // Walked into something: stop stepping; a chase gives up on
-            // that spot and stands looking.
+            // Walked into something: stop stepping; a chase goes round it
+            // (along it the clearer way, or back if it is a corner) for a
+            // while, then on.
             self.step = None;
-            if !seen {
-                self.last_seen = Some(at);
+            let chasing = !hiding && (!seen || distance > FIRE_RANGE);
+            if chasing {
+                let waist = self.character.position + Vec3::Y * 0.9;
+                let clear = |d: Vec3| physics.cast_ray(waist, d, CLEAR).map_or(CLEAR, |(t, _)| t);
+                let way = match self.detour.take() {
+                    // The way round is blocked too: the other way.
+                    Some(_) => {
+                        self.detour_side = if self.detour_side > 0.0 { -1.0 } else { 1.0 };
+                        let ahead = (goal - at).with_y(0.0).normalize_or(Vec3::Z);
+                        Vec3::new(ahead.z, 0.0, -ahead.x) * self.detour_side
+                    }
+                    None => {
+                        let ahead = wanted.with_y(0.0).normalize_or(Vec3::Z);
+                        let side = Vec3::new(ahead.z, 0.0, -ahead.x);
+                        let (l, r) = (clear(side), clear(-side));
+                        // The side he went round last, while it is open;
+                        // else the clearer; back if it is a corner.
+                        if l.max(r) < 1.0 {
+                            -ahead
+                        } else {
+                            if self.detour_side == 0.0 || clear(side * self.detour_side) < 1.0 {
+                                self.detour_side = if l >= r { 1.0 } else { -1.0 };
+                            }
+                            side * self.detour_side
+                        }
+                    }
+                };
+                self.detour = Some((way, DETOUR_TIME));
             }
         }
         let seen = seen && !hiding;
@@ -1004,6 +1062,7 @@ impl Npc {
         self.cooldown -= dt;
         if seen && self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
             self.fires = true;
+            self.since_shot = 0.0;
             if self.burst == 0 {
                 let more = rng.range(0.0, BURST.1 as f32 + 1.0) as u32;
                 self.burst = BURST.0 + more.min(BURST.1);
@@ -1097,6 +1156,8 @@ impl Npc {
         self.last_seen = None;
         self.unseen = 0.0;
         self.step = None;
+        self.detour = None;
+        self.detour_side = 0.0;
         self.cover = None;
         self.hit = false;
     }
@@ -1180,6 +1241,7 @@ impl Npc {
             self.rig.advance(dt);
             return;
         }
+        self.since_shot += dt;
         // A soldier on watch who catches sight of her turns on her.
         if self.soldier && !self.alert && !self.ai.flags.pacifist {
             self.look -= dt;
@@ -1361,6 +1423,66 @@ pub struct People {
     rng: Rng,
     /// The enhanced, smarter soldiers' settings (off: the original's).
     pub smarter: SmarterAi,
+    /// What soldiers near her have been at (for checking).
+    pub idle: IdleTally,
+}
+
+/// Soldier-seconds near her, by what the soldiers were at (for checking
+/// soldiers who stand about in a fight): those on alert within
+/// `FIRE_RANGE` of her shooting (a round within [`STILL_AFTER`]),
+/// moving, or neither, with her in sight or not; and those not on alert
+/// within [`UNAWARE_RANGE`] with her in sight.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct IdleTally {
+    pub fighting: f32,
+    pub shooting: f32,
+    pub moving: f32,
+    pub still_seen: f32,
+    pub still_unseen: f32,
+    pub unaware: f32,
+}
+
+/// A soldier who hasn't fired for this long, seconds, isn't shooting (his
+/// longest pause between bursts is 1.7 s).
+const STILL_AFTER: f32 = 3.0;
+/// How near her a calm soldier who could see her counts, metres.
+const UNAWARE_RANGE: f32 = 30.0;
+
+impl IdleTally {
+    /// The tally in a line.
+    pub fn line(&self) -> String {
+        format!(
+            "soldier-seconds near her: {:.0} fighting ({:.0} shooting, {:.0} moving, {:.0} still with her in sight, {:.0} still without); {:.0} calm with her in sight",
+            self.fighting,
+            self.shooting,
+            self.moving,
+            self.still_seen,
+            self.still_unseen,
+            self.unaware
+        )
+    }
+
+    fn count(&mut self, physics: &Physics, n: &Npc, threat: Vec3, dt: f32) {
+        if !n.alive || !n.soldier || !n.landed {
+            return;
+        }
+        let d = n.character.position.distance(threat);
+        if n.alert && d < FIRE_RANGE {
+            self.fighting += dt;
+            let speed = Vec2::new(n.character.velocity.x, n.character.velocity.z).length();
+            if n.since_shot < STILL_AFTER {
+                self.shooting += dt;
+            } else if speed > 0.3 {
+                self.moving += dt;
+            } else if n.sees(physics, threat, true) {
+                self.still_seen += dt;
+            } else {
+                self.still_unseen += dt;
+            }
+        } else if !n.alert && d < UNAWARE_RANGE && n.sees(physics, threat, true) {
+            self.unaware += dt;
+        }
+    }
 }
 
 /// Who a spawn stands as.
@@ -1611,6 +1733,9 @@ impl People {
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
             npc.update(physics, &mut self.rng, threat, dt);
+            if let Some(t) = threat {
+                self.idle.count(physics, npc, t, dt);
+            }
             if std::mem::take(&mut npc.spotted) && npc.alive && self.smarter.enabled {
                 callouts.push(npc.character.position);
             }
@@ -1946,7 +2071,7 @@ impl People {
             if let Some(ai) = s.ai {
                 npc.ai = ai;
             }
-            // Their template's `Health` (a plain VZ soldier's 75 when none
+            // Their template's `Health` (a plain VZ soldier's 100 when none
             // speaks for them).
             npc.hp = npc.ai.health;
             npc.most_hp = npc.ai.health;
@@ -2752,6 +2877,40 @@ pub(crate) mod tests {
         }
         let p = n.character.position;
         assert!(p.x < 1.0 && p.z.abs() > 6.0, "{p}");
+    }
+
+    // Hit by her from behind a wall, a soldier chasing her goes round it
+    // and comes to see her, not stand against it.
+    #[test]
+    fn a_chase_goes_round_a_wall() {
+        let mut physics = ground();
+        let shape = CollisionShape::mesh(
+            &[
+                Vec3::new(-5.0, -1.0, 6.0),
+                Vec3::new(5.0, -1.0, 6.0),
+                Vec3::new(5.0, 4.0, 6.0),
+                Vec3::new(-5.0, 4.0, 6.0),
+            ],
+            &[[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]],
+        )
+        .unwrap();
+        physics.add_static(StaticKey::Cell(2), &shape, Vec3::ZERO, Quat::IDENTITY);
+        let dt = 1.0 / 60.0;
+        physics.step(dt);
+        let mut rng = Rng::default();
+        let post = Brain::Post { facing: 0.0 };
+        let mut n = Npc::new(0, &rig(), Vec3::new(0.0, 1.0, 0.0), 0.0, post, Some(1));
+        n.update(&physics, &mut rng, None, dt);
+        let her = Vec3::new(0.0, 1.2, 14.0);
+        assert!(!n.sees(&physics, her, true));
+        n.hurt(1.0, Vec3::ZERO);
+        let mut saw = false;
+        for _ in 0..60 * 12 {
+            n.update(&physics, &mut rng, Some(her), dt);
+            saw |= n.sees(&physics, her, true);
+        }
+        assert!(n.alert, "still fighting");
+        assert!(saw, "came round: {}", n.character.position);
     }
 
     #[test]
