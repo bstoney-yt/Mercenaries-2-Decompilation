@@ -35,6 +35,12 @@
 //!   at 7:58, the sixth at 20:44), so the engine shows them in stored
 //!   order, one more each time; [`HINT_SECONDS`] is between the 6 s the
 //!   first stayed and the 12 s before the second.
+//! - From the scripts: after the villa contract (PmcCon001), its
+//!   consequence in the mission flow (`ce4166ed`) unlocks the next
+//!   contracts and calls `WifPmcInterior.Enter`, which raises the screen
+//!   (`Net.SetLoadingScreen(true)`) for the move into the PMC HQ. The
+//!   footage shows two screens there (around the closing movie) and the
+//!   alpha one; the movie's own screen is not matched.
 //! - Invented: the order once the last is shown (back to the first), and
 //!   which loads show a hint (all here; the footage's screen after a
 //!   failed mission has none, which the engine's choice is not read for).

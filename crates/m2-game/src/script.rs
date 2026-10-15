@@ -238,7 +238,7 @@ impl ScriptHost {
                     if name.bytes().all(|b| b.is_ascii_lowercase()) {
                         return Ok(MultiValue::from_vec(vec![Value::Nil]));
                     }
-                    let value = match default_for(lua, &name)? {
+                    let value = match default_for(&name) {
                         Some(v) => v,
                         None => Value::Table(stub(lua, &name)?),
                     };
@@ -587,13 +587,19 @@ impl ScriptHost {
 }
 
 /// A value for a global the scripts read but nothing defines, from the
-/// type prefix of their naming convention (`nCount`, `sName`, `bActive`,
-/// `tList`): 0, "", false or an empty table. The screen size is the
-/// alpha's default window. `None` for other names, which become stubs.
-fn default_for(lua: &Lua, name: &str) -> mlua::Result<Option<Value>> {
+/// type prefix of their naming convention: the screen size (the alpha's
+/// default window), and nil for the other typed names (`nCount`, `sName`,
+/// `bActive`, `tList`, `uPlayer`, `oFlash`, `gtAllSupport`), as in plain
+/// Lua. A field an object's data leaves out falls through its class to the
+/// globals (`self.sHqName` on the `PmcBoss` starter, whose
+/// `WifStarterData` row has no HQ): it must read nil there, or the
+/// starter looks like it belongs to an HQ named "" and `MrxHqManager`
+/// fails before `WifPmcInterior.Enter`. `None` for other names, which
+/// become stubs.
+fn default_for(name: &str) -> Option<Value> {
     let mut chars = name.chars();
     let (Some(prefix), Some(next)) = (chars.next(), chars.next()) else {
-        return Ok(None);
+        return None;
     };
     // A script's own global, `g` before the type's prefix (`gtAllSupport`:
     // the reward data's shop lists, built the first time they are asked
@@ -602,27 +608,22 @@ fn default_for(lua: &Lua, name: &str) -> mlua::Result<Option<Value>> {
         && next.is_ascii_lowercase()
         && chars.next().is_some_and(|c| c.is_ascii_uppercase())
     {
-        return Ok(Some(Value::Nil));
+        return Some(Value::Nil);
     }
     if !next.is_ascii_uppercase() {
-        return Ok(None);
+        return None;
     }
-    Ok(match (prefix, name) {
+    match (prefix, name) {
         (_, "nScreenWidth") => Some(Value::Number(1600.0)),
         (_, "nScreenHeight") => Some(Value::Number(900.0)),
-        ('n', _) => Some(Value::Number(0.0)),
-        ('s', _) => Some(Value::String(lua.create_string("")?)),
-        ('b', _) => Some(Value::Boolean(false)),
-        ('t', _) => Some(Value::Table(lua.create_table()?)),
         // A handle (`uPlayer`) no script has set is nil: VzaCon001's PDA
-        // Close watch fires only while the global `uPlayer` is unset.
-        ('u', _) => Some(Value::Nil),
-        // An object a script keeps (`oSystemDialogBoxFlash`): nil until
+        // Close watch fires only while the global `uPlayer` is unset. An
+        // object a script keeps (`oSystemDialogBoxFlash`) is nil until
         // made, as scripts test it (`if MrxGuiDialogBox.oSystemDialogBoxFlash
         // then`, read through the module to here).
-        ('o', _) => Some(Value::Nil),
+        ('n' | 's' | 'b' | 't' | 'u' | 'o', _) => Some(Value::Nil),
         _ => None,
-    })
+    }
 }
 
 /// Drops the "runtime error: " each nested call adds to a message.
@@ -873,12 +874,17 @@ mod tests {
     fn missing_globals_default_by_their_prefix() {
         let host = ScriptHost::new().unwrap();
         host.stub_missing_globals().unwrap();
-        let (h, n, s, b): (f64, f64, String, bool) = host
+        let h: f64 = host.lua().load("return nScreenHeight / 2").eval().unwrap();
+        assert_eq!(h, 450.0);
+        // Typed names nothing sets read nil, as in plain Lua: an object's
+        // field missing from its data (`sHqName`) falls through its class
+        // to the globals and must stay nil there.
+        let plain: bool = host
             .lua()
-            .load("tList[1] = 2; return nScreenHeight / 2, nCount + 1, sName .. 'x', bActive")
+            .load("return nCount == nil and sName == nil and bActive == nil and tList == nil")
             .eval()
             .unwrap();
-        assert_eq!((h, n, s.as_str(), b), (450.0, 1.0, "x", false));
+        assert!(plain);
         let no_object: bool = host.lua().load("return oFlash == nil").eval().unwrap();
         assert!(no_object);
         // A script's own global (`gtAllSupport`) is nil until it builds it.
@@ -890,7 +896,7 @@ mod tests {
         assert_eq!(built, 7);
         let is_stub: bool = host
             .lua()
-            .load("return getmetatable(Event) ~= nil and tList[1] == 2")
+            .load("return getmetatable(Event) ~= nil")
             .eval()
             .unwrap();
         assert!(is_stub);
@@ -910,6 +916,25 @@ mod tests {
             .eval()
             .unwrap();
         assert!(unset);
+    }
+
+    #[test]
+    fn a_field_missing_from_an_objects_data_reads_nil_through_its_class() {
+        let host = ScriptHost::new().unwrap();
+        host.stub_missing_globals().unwrap();
+        // MrxStarter's pattern: the data row is the object, its class the
+        // fallback, and the class's environment falls back to the globals.
+        let hq: Value = host
+            .lua()
+            .load(
+                "local Class = setmetatable({}, { __index = _G }) \
+                 function Class.GetHq(self) return self.sHqName end \
+                 local PmcBoss = setmetatable({ bPmcStarter = true }, { __index = Class }) \
+                 return PmcBoss:GetHq()",
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(hq, Value::Nil);
     }
 
     #[test]
