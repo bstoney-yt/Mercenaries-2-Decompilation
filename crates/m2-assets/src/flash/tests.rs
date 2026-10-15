@@ -713,7 +713,7 @@ fn text_fields_lay_out_in_texture_glyphs() {
     font.codes.insert('A', 0);
     font.codes.insert(' ', 1);
     // Glyph A: a 24 x 48 box in a 512 x 256 texture, origin at its bottom
-    // left; drawn at 48 px nominal.
+    // left; drawn at 48 px nominal, so 32 px to the em.
     let g = text::TextureGlyph {
         uv: [0.0, 0.0, 24.0 / 512.0, 48.0 / 256.0],
         origin: [0.0, 36.0 / 256.0],
@@ -742,8 +742,8 @@ fn text_fields_lay_out_in_texture_glyphs() {
     assert_eq!(out[0].texture.as_deref(), Some("font_f0"));
     let b0 = bounds(&out[..2]).unwrap();
     let b1 = bounds(&out[2..]).unwrap();
-    // Half size: 12 x 24, its baseline 18 px down (2 + ascent 18 - origin).
-    assert!((b0[2] - b0[0] - 12.0).abs() < 1e-4 && (b0[3] - b0[1] - 24.0).abs() < 1e-4);
+    // A 24 px field takes 24 of the texture's 32 px em: 18 x 36.
+    assert!((b0[2] - b0[0] - 18.0).abs() < 1e-4 && (b0[3] - b0[1] - 36.0).abs() < 1e-4);
     assert!((b1[0] - b0[0] - 24.0).abs() < 1e-4);
     // An inline image for "[f]", 10 px wide, sitting on the baseline: the
     // second glyph moves along by its width.
@@ -779,6 +779,33 @@ fn text_fields_lay_out_in_texture_glyphs() {
         ),
         ("Marga".to_owned(), Some([1.0, 0.0, 0.0, 1.0]))
     );
+}
+
+#[test]
+fn a_font_texture_reads_its_padding_and_nominal_size() {
+    let mut d = Vec::new();
+    d.extend_from_slice(&[1, 0, 0, 0, 0, 0]);
+    d.push(9);
+    d.extend_from_slice(b"f0_F0.tga");
+    for v in [512u16, 256] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    d.push(2);
+    d.extend_from_slice(&48u16.to_le_bytes());
+    d.extend_from_slice(&1u16.to_le_bytes());
+    for v in [0.0f32, 0.0, 0.5, 0.25, 0.0, 0.2] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [1u16, 7, 1, 3, 0] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    let t = text::FontTexture::parse(&d).unwrap();
+    assert_eq!(t.name, "f0_F0");
+    assert_eq!((t.size, t.pad, t.nominal), ([512.0, 256.0], 2.0, 48.0));
+    assert_eq!(t.glyphs[0].origin, [0.0, 0.2]);
+    assert_eq!(t.maps[&7][&3], 0);
+    // Its glyphs were drawn 32 px to the em.
+    assert!((t.nominal * text::TEXTURE_EM - 32.0).abs() < 1e-4);
 }
 
 #[test]

@@ -35,6 +35,20 @@ const EM: f32 = 20480.0;
 /// Twips to pixels.
 const TWIPS: f32 = 20.0;
 
+/// The em a texture font's glyphs were drawn at, as a share of the
+/// texture's nominal size: a field's text is its height per em, so a
+/// glyph's texture pixels scale by `height / (nominal * TEXTURE_EM)`.
+///
+/// From samples: over all 18 font textures in `Loading`, `shell` and `vz`
+/// (all nominal 48, padding 2), the glyphs' reach above and below the
+/// baseline, less the padding, against the font's ascent + descent gives
+/// 30.4-33.2 px per em, Times New Roman's capitals (0.662 em) 33 px; and
+/// from footage: the loading screen's hint and "Loading" lines (0:20)
+/// line up best between 0.625 and 0.667 (lit-pixel IoU at the best shift,
+/// hint 0.23 at 1.0, 0.46 at 2/3; label 0.33, 0.73). Scaleform's own rule
+/// was not read; 2/3 is the fit.
+pub const TEXTURE_EM: f32 = 2.0 / 3.0;
+
 /// A text field's definition.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EditText {
@@ -144,7 +158,9 @@ pub struct FontTexture {
     /// The texture's name (its file without the extension).
     pub name: String,
     pub size: [f32; 2],
-    /// The em the glyphs were drawn at, pixels.
+    /// The blank pixels left round each glyph.
+    pub pad: f32,
+    /// The texture glyphs' nominal size, pixels (see [`TEXTURE_EM`]).
     pub nominal: f32,
     pub glyphs: Vec<TextureGlyph>,
     /// A font glyph's texture glyph, by font character id.
@@ -167,7 +183,7 @@ impl FontTexture {
             .rsplit_once('.')
             .map_or(name.clone(), |(s, _)| s.to_owned());
         let size = [f32::from(b.u16()), f32::from(b.u16())];
-        b.u8();
+        let pad = f32::from(b.u8());
         let nominal = f32::from(b.u16());
         let count = usize::from(b.u16());
         let mut glyphs = Vec::with_capacity(count);
@@ -196,6 +212,7 @@ impl FontTexture {
         (b.bit / 8 <= data.len()).then_some(FontTexture {
             name,
             size,
+            pad,
             nominal,
             glyphs,
             maps,
@@ -563,7 +580,7 @@ pub fn layout(
     let line_height = (font.ascent + font.descent).max(1.0) * size + def.leading;
     // Flash puts the first baseline 2 px in and down by the ascent.
     let mut baseline = def.bounds[1] + 2.0 + ascent;
-    let scale = size / nominal.max(1.0);
+    let scale = size / (nominal.max(1.0) * TEXTURE_EM);
     let quad =
         |out: &mut Vec<Triangle>, p0: [f32; 2], p1: [f32; 2], uv: [f32; 4], tint, tex: &str| {
             let [u0, v0, u1, v1] = uv;
