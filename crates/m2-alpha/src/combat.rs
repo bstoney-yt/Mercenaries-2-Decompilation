@@ -359,6 +359,14 @@ const PANIC_RANGE: f32 = 40.0;
 /// templates' `ModifierKey` is `Hero`). Any falloff with range is not
 /// decoded.
 const NPC_DAMAGE: f32 = 9.0 * 0.25;
+/// Her rounds do this many times their `Damage` to people (invented,
+/// from the footage: what the engine adds is not decoded). In the PC
+/// playthrough's first fight (3:36-3:48) the carbine kills three VZ
+/// deathsquad mooks with 7, 13 and 10 rounds; its round's `Damage` (6, to
+/// 15 m) on their `Human` row (1) against their `Health` (75) needs 13
+/// hits, so a kill in 7 rounds needs at least 75 / (7 * 6) = 1.79 times
+/// the round. This is the least whole tenth that does it.
+const HER_ROUNDS: f32 = 1.8;
 /// A VZ soldier's `Accuracy`, which the shot spread above was tuned for.
 const VZ_ACCURACY: f32 = 0.4;
 /// What blasts do to her, of their damage: the game's damage table's
@@ -1406,6 +1414,8 @@ pub struct Combat {
     seed: u64,
     /// What she has fired, for the HUD's ammo counters.
     pub fired: Fired,
+    /// What the fighting has come to (for checking).
+    pub tally: Tally,
     /// Hurts since [`take_hurts`](Self::take_hurts): damage and where
     /// from, for the HUD.
     hurts: Vec<(f32, Option<Vec3>)>,
@@ -1472,6 +1482,50 @@ pub struct Fired {
     pub grenades: u32,
 }
 
+/// What the fighting has come to, for checking the balance against the
+/// footage (where her ammunition counter and health box can be read):
+/// her rounds at people and what they did, and what was done to her.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Tally {
+    /// Her rounds that struck a living soldier, the damage they did him
+    /// (after the damage table), and the soldiers they killed.
+    pub hits: u32,
+    pub dealt: f32,
+    pub kills: u32,
+    /// Damage done to her by soldiers' rounds and by blasts, the rounds
+    /// that struck her, and the times she went down.
+    pub taken_rounds: f32,
+    pub taken_blasts: f32,
+    pub rounds_on_her: u32,
+    pub downs: u32,
+}
+
+impl Tally {
+    /// The tally in a line: rounds fired is hers to give (the rifle's).
+    pub fn line(&self, fired: u32) -> String {
+        let per = |n: f32, d: u32| {
+            if d == 0 {
+                "-".to_owned()
+            } else {
+                format!("{:.1}", n / d as f32)
+            }
+        };
+        format!(
+            "{fired} rounds, {} hits on soldiers ({} a hit), {} killed by rounds ({} rounds, {} hits each); \
+             she took {:.0} from {} rounds and {:.0} from blasts, down {} times",
+            self.hits,
+            per(self.dealt, self.hits),
+            self.kills,
+            per(fired as f32, self.kills),
+            per(self.hits as f32, self.kills),
+            self.taken_rounds,
+            self.rounds_on_her,
+            self.taken_blasts,
+            self.downs,
+        )
+    }
+}
+
 impl Default for Combat {
     fn default() -> Self {
         Self {
@@ -1535,6 +1589,7 @@ impl Default for Combat {
             ripple: 0,
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
+            tally: Tally::default(),
             hurts: Vec::new(),
         }
     }
@@ -2372,7 +2427,6 @@ impl Combat {
                 return;
             }
         }
-        let human = self.on_people(ammo.key);
         let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, None);
         let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
         let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
@@ -2392,12 +2446,10 @@ impl Combat {
                 kind: round_kind(ammo.key),
             });
         }
-        if let Some((_, Some(j))) = hit {
-            let soldier = f.people.npcs[j].soldier;
-            if f.people.npcs[j].hurt(damage * human, aim * SHOT_PUSH) && soldier {
-                self.remarks.push(Remark::Kill);
-            }
-            self.hits += 1;
+        if let Some((_, Some(j))) = hit
+            && self.round_on_person(f.people, j, damage, ammo.key, aim * SHOT_PUSH)
+        {
+            self.remarks.push(Remark::Kill);
         }
         self.fired.rifle += 1;
         self.effect(Effect::Tracer { from, to }, 0.07);
@@ -2429,7 +2481,6 @@ impl Combat {
             Some(_) => Round::BulletLarge,
             None => Round::Bullet,
         };
-        let human = self.on_people(ammo.and_then(|a| a.key));
         // Each of its rounds a shot (the shotgun's 10), scattered by its
         // `WeaponScatter` (degrees across the cone).
         let spread = self.rifle.scatter.to_radians();
@@ -2451,10 +2502,6 @@ impl Combat {
             let damage = ammo.map_or(self.rifle.damage, |a| {
                 a.damage_at(hit.map_or(RIFLE_RANGE, |h| h.0))
             });
-            // What it does to people: its `Damage` times the damage
-            // table's `Human` cell for its `DamageKey`, against their
-            // template's `Health` (a VZ soldier's 75).
-            let on_people = damage * human;
             // To crates and explosive props, the alpha's own scale.
             let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
             if let Some((t, None)) = hit {
@@ -2473,10 +2520,12 @@ impl Combat {
                     kind: round_kind(ammo.and_then(|a| a.key)),
                 });
             }
+            // What it does to people: its `Damage` times the damage
+            // table's cell for their `ModifierKey` and its `DamageKey`,
+            // against their template's `Health`.
             if let Some((_, Some(i))) = hit {
-                let soldier = f.people.npcs[i].soldier;
-                killed |= f.people.npcs[i].hurt(on_people, dir * SHOT_PUSH) && soldier;
-                self.hits += 1;
+                let key = ammo.and_then(|a| a.key);
+                killed |= self.round_on_person(f.people, i, damage, key, dir * SHOT_PUSH);
             }
             if self.rifle.pellets > 1 {
                 self.effect(Effect::Tracer { from, to }, 0.05);
@@ -2574,7 +2623,9 @@ impl Combat {
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
         if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
             let damage = self.npc_round(gun);
-            self.hurt_player(f, damage, Some(from));
+            let lost = self.hurt_player(f, damage, Some(from));
+            self.tally.taken_rounds += lost;
+            self.tally.rounds_on_her += u32::from(lost > 0.0);
         }
         if let Some((t, None)) = hit {
             self.round_on_vehicle(f, (from, dir, t), RIFLE_ON_VEHICLE, None);
@@ -2611,9 +2662,10 @@ impl Combat {
         self.npc_shoot(&mut f, 0, target);
     }
 
-    fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) {
+    /// `damage` done to her from `from`: the health she lost.
+    fn hurt_player(&mut self, f: &mut Field<'_>, damage: f32, from: Option<Vec3>) -> f32 {
         if self.down > 0.0 || self.invincible {
-            return;
+            return 0.0;
         }
         // Kept for the HUD; only the latest if nothing reads them.
         if self.hurts.len() >= MAX_HURTS {
@@ -2622,8 +2674,11 @@ impl Combat {
         self.hurts.push((damage, from));
         self.quiet = 0.0;
         let floor = if self.health_clamp { CLAMP_FLOOR } else { 0.0 };
+        let before = self.hp;
         self.hp = (self.hp - damage).max(floor.min(self.hp));
+        let lost = (before - self.hp).max(0.0);
         if self.hp <= 0.0 {
+            self.tally.downs += 1;
             self.remarks.push(Remark::Down);
             self.down = DOWN_TIME;
             f.player.down = true;
@@ -2637,6 +2692,7 @@ impl Combat {
         } else {
             self.remarks.push(Remark::Hurt);
         }
+        lost
     }
 
     /// Takes a round from the launcher's clip, loading the next clip from
@@ -2868,20 +2924,16 @@ impl Combat {
         let ammo = w.ammo;
         match w.flight() {
             m2_engine::weapons::Flight::Round => {
-                let human = self.on_people(ammo.key);
                 for _ in 0..w.pellets.max(1) {
                     let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
                     let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
                     self.effect(Effect::Tracer { from, to }, 0.07);
                     let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
-                    let on_people = damage * human;
                     let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
-                    if let Some((_, Some(j))) = hit {
-                        let soldier = f.people.npcs[j].soldier;
-                        if f.people.npcs[j].hurt(on_people, aim * SHOT_PUSH) && soldier {
-                            self.remarks.push(Remark::Kill);
-                        }
-                        self.hits += 1;
+                    if let Some((_, Some(j))) = hit
+                        && self.round_on_person(f.people, j, damage, ammo.key, aim * SHOT_PUSH)
+                    {
+                        self.remarks.push(Remark::Kill);
                     }
                     if let Some((t, None)) = hit {
                         let round = match ammo.key {
@@ -3580,7 +3632,8 @@ impl Combat {
             let d = (f.player.character.position + Vec3::Y).distance(at);
             if d < REACH {
                 let damage = 100.0 * (1.0 - d / REACH).max(0.0);
-                self.hurt_player(f, damage * self.hero_damage.explosion, Some(at));
+                self.tally.taken_blasts +=
+                    self.hurt_player(f, damage * self.hero_damage.explosion, Some(at));
             }
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
@@ -3643,17 +3696,49 @@ impl Combat {
         }
     }
 
-    /// Of a round's `Damage`, what the game's damage table's `Human` row
-    /// gives people for its `DamageKey` (`Bullet` 1, `BulletLarge` 1.5);
-    /// a round without a key is a `Bullet`.
-    fn on_people(&self, key: Option<u32>) -> f32 {
+    /// Of a round's or blast's `Damage` with `DamageKey` `key` (a round
+    /// without one is a `Bullet`), what the game's damage table gives
+    /// person `n`: the row of their template's `ModifierKey` (`Human`:
+    /// `Bullet` 1, `BulletLarge` 1.5, `Explosion` 1; `HumanArmor`, the VZ
+    /// heavies' and defenders': 0.25, 0.75, 0.5), the `Human` row for
+    /// those whose template names none or whose key the table lacks.
+    fn on_person(&self, n: &crate::npc::Npc, key: Option<u32>) -> f32 {
         let key = key
             .filter(|&k| k != 0)
             .unwrap_or_else(|| m2_assets::name_hash("Bullet"));
+        let human = m2_assets::name_hash("Human");
         self.damage_table
             .as_ref()
-            .and_then(|t| t.scale(m2_assets::name_hash("Human"), key))
+            .and_then(|t| {
+                t.scale(n.ai.modifier.unwrap_or(human), key)
+                    .or_else(|| t.scale(human, key))
+            })
             .unwrap_or(1.0)
+    }
+
+    /// Her round of `damage` (its `Damage` at that range) and `DamageKey`
+    /// `key` striking person `j`, shoving the body `push` if it kills:
+    /// they take what [`on_person`](Self::on_person) gives of it. True if
+    /// it killed a soldier.
+    fn round_on_person(
+        &mut self,
+        people: &mut People,
+        j: usize,
+        damage: f32,
+        key: Option<u32>,
+        push: Vec3,
+    ) -> bool {
+        let taken = damage * HER_ROUNDS * self.on_person(&people.npcs[j], key);
+        let n = &mut people.npcs[j];
+        let counts = n.alive && n.soldier;
+        let killed = n.hurt(taken, push) && n.soldier;
+        self.hits += 1;
+        if counts {
+            self.tally.hits += 1;
+            self.tally.dealt += taken;
+            self.tally.kills += u32::from(killed);
+        }
+        killed
     }
 
     /// What a soldier's round does to her: his template's gun's round's
@@ -3690,10 +3775,6 @@ impl Combat {
             at,
             hold: None,
         });
-        let human = match (&self.damage_table, b.key) {
-            (Some(t), Some(k)) => t.scale(m2_assets::name_hash("Human"), k).unwrap_or(1.0),
-            _ => 1.0,
-        };
         let hers = if b.key == Some(m2_assets::name_hash("ExplosionLarge")) {
             self.hero_damage.explosion_large
         } else {
@@ -3701,14 +3782,21 @@ impl Combat {
         };
         let reach = b.radius.max(0.5);
         let mut killed = false;
-        for n in &mut f.people.npcs {
+        for j in 0..f.people.npcs.len() {
+            // Their own row of the damage table for its `DamageKey`; all
+            // of it without a key.
+            let scale = match b.key {
+                Some(_) => self.on_person(&f.people.npcs[j], b.key),
+                None => 1.0,
+            };
+            let n = &mut f.people.npcs[j];
             let d = n.chest().distance(at);
             if d < reach {
                 let near = 1.0 - d / reach;
                 let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
                 let push =
                     away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-                killed |= n.hurt(b.damage_at(d) * human, push) && n.soldier;
+                killed |= n.hurt(b.damage_at(d) * scale, push) && n.soldier;
                 n.panic(at);
             } else if d < reach * 3.0 {
                 n.panic(at);
@@ -3724,7 +3812,7 @@ impl Combat {
         if f.player.driving.is_none() && f.player.landed {
             let d = (f.player.character.position + Vec3::Y).distance(at);
             if d < reach {
-                self.hurt_player(f, b.damage_at(d) * hers, Some(at));
+                self.tally.taken_blasts += self.hurt_player(f, b.damage_at(d) * hers, Some(at));
             }
         }
         for (i, v) in f.vehicles.iter_mut().enumerate() {
@@ -3966,7 +4054,7 @@ impl Combat {
         if let Some(d) = her {
             // For checking what hurts her (autoplay logs).
             eprintln!("blast: at {at:.1}, she takes {d:.0}");
-            self.hurt_player(f, d, Some(at));
+            self.tally.taken_blasts += self.hurt_player(f, d, Some(at));
         }
         if killed {
             self.remarks.push(Remark::Kill);
@@ -4284,7 +4372,8 @@ mod tests {
             fire: true,
             ..Trigger::default()
         };
-        // A VZ soldier's `Health` of 75 takes 13 carbine rounds of 6.
+        // A VZ soldier's `Health` of 100 takes 10 carbine rounds of 6, at
+        // `HER_ROUNDS` times.
         people.npcs[0].hp = m2_engine::ai::AiProfile::default().health;
         for _ in 0..600 {
             let mut field = Field {
@@ -4301,7 +4390,7 @@ mod tests {
             }
         }
         assert!(!people.npcs[0].alive);
-        assert_eq!(combat.hits, 13);
+        assert_eq!(combat.hits, 10);
         assert!(people.npcs[1].alert, "gunfire within 60 m alerts");
         assert!(
             combat
@@ -4941,6 +5030,57 @@ mod tests {
         };
         assert_eq!(combat.npc_round(Some(gun)), 3.0);
         assert_eq!(combat.npc_round(None), NPC_DAMAGE);
+    }
+
+    // Her rounds hurt each soldier by his own `ModifierKey` row (the VZ
+    // heavies' `HumanArmor` takes a quarter of a `Bullet`), the `Human`
+    // row for those without one, times [`HER_ROUNDS`]; and the tally
+    // counts the hits and the kill.
+    #[test]
+    fn her_rounds_hurt_soldiers_by_their_own_row() {
+        let (human, armor) = (
+            m2_assets::name_hash("Human"),
+            m2_assets::name_hash("HumanArmor"),
+        );
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(2);
+        put(1);
+        put(human);
+        put(armor);
+        put(m2_assets::name_hash("Bullet"));
+        put(1.0f32.to_bits());
+        put(0.25f32.to_bits());
+        let mut combat = Combat {
+            damage_table: m2_engine::tuning::DamageTable::parse(&data),
+            ..Combat::default()
+        };
+        let mut people = People::default();
+        for modifier in [None, Some(armor)] {
+            let mut n = crate::npc::Npc::new(
+                0,
+                &crate::npc::tests::rig(),
+                Vec3::ZERO,
+                0.0,
+                crate::npc::Brain::Post { facing: 0.0 },
+                Some(1),
+            );
+            n.ai.modifier = modifier;
+            n.hp = 75.0;
+            people.npcs.push(n);
+        }
+        assert_eq!(combat.on_person(&people.npcs[0], None), 1.0);
+        assert_eq!(combat.on_person(&people.npcs[1], None), 0.25);
+        // The carbine's round (6 to 15 m): a deathsquad mook's 75 health
+        // goes in 7 hits.
+        let kills: Vec<bool> = (0..7)
+            .map(|_| combat.round_on_person(&mut people, 0, 6.0, None, Vec3::ZERO))
+            .collect();
+        assert_eq!(kills.iter().filter(|k| **k).count(), 1);
+        assert!(kills[6]);
+        combat.round_on_person(&mut people, 1, 6.0, None, Vec3::ZERO);
+        assert!((people.npcs[1].hp - (75.0 - 6.0 * HER_ROUNDS * 0.25)).abs() < 1e-4);
+        assert_eq!((combat.tally.hits, combat.tally.kills), (8, 1));
     }
 
     #[test]
