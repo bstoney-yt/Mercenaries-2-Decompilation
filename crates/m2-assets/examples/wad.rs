@@ -23,6 +23,7 @@
 //! cargo run -p m2-assets --example wad -- movies  <archive.wad>
 //! cargo run -p m2-assets --example wad -- actions <archive.wad> <movie name>
 //! cargo run -p m2-assets --example wad -- fonts   <archive.wad>
+//! cargo run -p m2-assets --example wad -- flashfonts <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -219,6 +220,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("movies", []) => movies(&mut wad)?,
         ("actions", [name]) => actions(&mut wad, name)?,
         ("fonts", []) => fonts(&mut wad)?,
+        ("flashfonts", []) => flash_fonts(&mut wad)?,
         ("dds", [name, out]) => {
             let dds = texture_dds(&mut wad, name)?;
             std::fs::write(out, &dds)?;
@@ -2435,5 +2437,95 @@ fn fonts<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         }
     }
     println!("{count} fonts, {bad} problems");
+    Ok(())
+}
+
+/// Every Flash texture font in the archive's movies: its metrics (ems), the
+/// size its glyphs were drawn at, and how far some glyphs reach above and
+/// below the baseline in their texture, as a share of that size.
+fn flash_fonts<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    let (mut movies, mut with_text, mut fields) = (0, 0, 0);
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != MOVIE_TYPE {
+                continue;
+            }
+            let Ok(movie) = movie_from_asset(data) else {
+                continue;
+            };
+            let mut book = m2_assets::flash::FontBook::default();
+            book.add_movie(&movie);
+            movies += 1;
+            let n = movie
+                .tags
+                .iter()
+                .filter(|t| t.code == m2_assets::gfx::tag::DEFINE_EDIT_TEXT)
+                .count();
+            fields += n;
+            with_text += usize::from(n > 0);
+            let pads: HashMap<String, f32> = movie
+                .tags
+                .iter()
+                .filter(|t| t.code == 1002)
+                .filter_map(|t| m2_assets::flash::text::FontTexture::parse(movie.data(t)))
+                .map(|t| (t.name, t.pad))
+                .collect();
+            let mut names: Vec<_> = book.fonts.keys().cloned().collect();
+            names.sort();
+            for n in names {
+                let f = &book.fonts[&n];
+                let Some((tex, size, nominal, glyphs)) = &f.texture else {
+                    continue;
+                };
+                // The texture's reach over all the font's glyphs (pixels)
+                // against the font's ascent + descent (ems).
+                let (mut up, mut down) = (0f32, 0f32);
+                for g in glyphs.iter().flatten() {
+                    up = up.max((g.origin[1] - g.uv[1]) * size[1]);
+                    down = down.max((g.uv[3] - g.origin[1]) * size[1]);
+                }
+                let pad = pads.get(tex).copied().unwrap_or(0.0);
+                let mut reach = format!(
+                    " reach +{up:.0}/-{down:.0} px pad {pad}, em {:.1} px",
+                    (up + down - 2.0 * pad) / (f.ascent + f.descent)
+                );
+                for c in ['H', '_', '\u{2014}', '\u{2013}', 'W', 'M'] {
+                    let Some(g) = f
+                        .codes
+                        .get(&c)
+                        .and_then(|&i| glyphs.get(usize::from(i)).copied().flatten())
+                    else {
+                        continue;
+                    };
+                    let up = (g.origin[1] - g.uv[1]) * size[1] / nominal;
+                    let down = (g.uv[3] - g.origin[1]) * size[1] / nominal;
+                    let wide = (g.uv[2] - g.uv[0]) * size[0] / nominal;
+                    reach.push_str(&format!(" {c}:+{up:.3}/-{down:.3}/w{wide:.3}"));
+                    if let Some(a) = f
+                        .codes
+                        .get(&c)
+                        .and_then(|&i| f.advances.get(usize::from(i)))
+                    {
+                        let px = (g.uv[2] - g.uv[0]) * size[0];
+                        reach.push_str(&format!("[adv {a:.3} px {px:.1}]"));
+                    }
+                }
+                println!(
+                    "{:08x} {n} ({}) asc {:.3} desc {:.3} lead {:.3} nominal {nominal} tex {tex} {}x{} glyphs {}{reach}",
+                    e.name_hash,
+                    f.name,
+                    f.ascent,
+                    f.descent,
+                    f.leading,
+                    size[0],
+                    size[1],
+                    f.codes.len()
+                );
+            }
+        }
+    }
+    println!("{fields} text fields in {with_text} of {movies} movies");
     Ok(())
 }
