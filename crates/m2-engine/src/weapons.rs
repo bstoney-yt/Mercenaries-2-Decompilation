@@ -81,9 +81,9 @@ const STIMULUS_REACH: u32 = 0x1417_f4dd;
 const SCATTER: u32 = 0x0006_5d26;
 
 /// `WeaponEffects`' `ShellEjectHardpoint` (the gun model's node a spent
-/// case flies from, a name hash: `3d0f5c29` on all guns but the covert
-/// pistol's `7eabfa05`; round 17 read its bits as a float, 0.035, and took
-/// it for the flash's time) and `ShellEjectTemplate` (the case's effect,
+/// case flies from, a name hash: `hp_shelleject` on all guns but the
+/// covert pistol's `7eabfa05`; round 17 read its bits as a float, 0.035,
+/// and took it for the flash's time) and `ShellEjectTemplate` (the case's effect,
 /// `global_particle_shellsmall`). Both names found by hashing guesses.
 const SHELL_HARDPOINT: u32 = 0xd62d_ab7b;
 const SHELL: u32 = 0x1efe_cdea;
@@ -896,6 +896,8 @@ mod tests {
         assert_eq!(SCATTER_FIELDS[6], name_hash("ScatterPerShot"));
         assert_eq!(SHELL_HARDPOINT, name_hash("ShellEjectHardpoint"));
         assert_eq!(SHELL, name_hash("ShellEjectTemplate"));
+        // The carbine's (as read on a legally installed copy).
+        assert_eq!(name_hash("hp_shelleject"), 0x3d10_6439);
         let carbine = Feel {
             scatter: [1.0, 0.0, 1.0, 1.5, 1.0, 2.0, 0.2],
             ..Feel::default()

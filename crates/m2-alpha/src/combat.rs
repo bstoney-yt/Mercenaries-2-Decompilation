@@ -102,10 +102,10 @@ pub fn use_attach_frame(on: bool) {
 }
 /// Muzzle marker node of the weapon models.
 pub const MUZZLE: u32 = 0xb148_6ef3;
-/// The node spent cases fly from: every gun template's
-/// `ShellEjectHardpoint` but the covert pistol's (`3d0f5c29`; found on 77
-/// of the 86 guns' models, round 19).
-pub const EJECT: u32 = 0x3d0f_5c29;
+/// The node spent cases fly from, `hp_shelleject`: every gun template's
+/// `ShellEjectHardpoint` but the covert pistol's (found on 77 of the 86
+/// guns' models, round 19).
+pub const EJECT: u32 = 0x3d10_6439;
 
 /// Where a mounted gun of model `model` firing from `from` along `dir`
 /// throws its cases: as far behind its muzzle as its model's case node
