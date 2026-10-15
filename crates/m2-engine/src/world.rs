@@ -413,6 +413,37 @@ impl Templates {
             .collect()
     }
 
+    /// A `PopulationList` template's entries by its name
+    /// (`VehList_Mar_Big_Act1`): each one's template name and weight, in
+    /// the database's order; empty for a name that is no list.
+    pub fn list(&self, name: &str) -> Vec<(String, f32)> {
+        self.ids(name)
+            .into_iter()
+            .map(|id| self.list_of(id))
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+    }
+
+    /// A `PopulationList` template's entries by its id, as
+    /// [`list`](Self::list).
+    pub fn list_of(&self, id: u32) -> Vec<(String, f32)> {
+        let lists = &self.population.lists;
+        let Some(entries) = lists
+            .get(&id)
+            .or_else(|| lists.get(&(id & !TEMPLATE_BIT)))
+            .or_else(|| lists.get(&(id | TEMPLATE_BIT)))
+        else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|&(t, w)| {
+                let (name, _) = self.by_id(t).or_else(|| self.by_id(t | TEMPLATE_BIT))?;
+                Some((name.to_owned(), w))
+            })
+            .collect()
+    }
+
     /// The template with id `id` (an entity's parent): its name, and what
     /// the database says of it.
     pub fn by_id(&self, id: u32) -> Option<(&str, &TemplateInfo)> {
@@ -887,7 +918,26 @@ pub struct SpawnPoint {
     /// The rifle its template's `EquipmentLink`s hand it
     /// ([`Templates::rifle_of`]); `None` when they hand it none.
     pub gun: Option<HandGun>,
+    /// For a spawner: its `SecondsPerCycle`, how long after its last one
+    /// fell it sends another.
+    pub cycle: Option<f32>,
 }
+
+/// Passers-by on the roads (`WorldIndex::add_walkers`) have entities
+/// from here up, which no layer uses.
+pub const WALKER_BASE: u32 = 0xf100_0000;
+
+/// Whether spawn entity `entity` is a passer-by on a road.
+pub fn is_walker(entity: u32) -> bool {
+    entity & 0xff00_0000 == WALKER_BASE
+}
+
+/// One passer-by per this many metres of road in a zone with people,
+/// who walks to and fro along this much of its edge, this far out from
+/// it (metres; invented: the zones say how many are out, not where).
+const WALKER_EVERY: f32 = 90.0;
+const WALKER_STRETCH: f32 = 60.0;
+const WALKER_OUT: f32 = 1.5;
 
 /// Where everything on the island is.
 #[derive(Clone, Debug, Default)]
@@ -950,6 +1000,34 @@ pub struct WorldIndex {
     /// Spawners of vehicles the layers place (`PointTraffic_*`,
     /// `PathSpawner_*`).
     pub traffic: Vec<TrafficPoint>,
+    /// The road network: every `Road` the layers place, with its path.
+    pub roads: Vec<Road>,
+    /// Where roads meet (`RoadIntersection`).
+    pub junctions: Vec<Junction>,
+    /// The areas' traffic and passers-by (`PopulationDensity`).
+    pub zones: Vec<crate::population::DensityZone>,
+}
+
+/// A road a layer places: the line its path draws in the world (its
+/// middle, as the trees cleared off it show), between two junctions'
+/// ports.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Road {
+    pub entity: u32,
+    /// The layer placing it, by name hash (`vz_mar_roads`).
+    pub layer: u32,
+    pub points: Vec<Vec3>,
+    /// Metres across ([`road_width`]).
+    pub width: f32,
+}
+
+/// Where roads meet: each road's entity and the port, in the world, where
+/// its path ends.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Junction {
+    pub entity: u32,
+    pub position: Vec3,
+    pub ports: Vec<(u32, Vec3)>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -1100,8 +1178,9 @@ impl WorldIndex {
             ..Self::default()
         };
         let mut routes = Routes::default();
-        // Each road's placement and path, for clearing trees off it.
-        let mut roads: Vec<(Vec3, Quat, u32)> = Vec::new();
+        // Each road's placement and path, for clearing trees off it and
+        // for the traffic: (entity, layer, template, place, turn, path).
+        let mut roads: Vec<(u32, u32, u32, Vec3, Quat, u32)> = Vec::new();
         for (block, is_static) in blocks {
             let decoded = source.block(block)?;
             for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -1122,9 +1201,26 @@ impl WorldIndex {
                         ) else {
                             continue;
                         };
-                        roads.push((Vec3::from(p.position), rotation(p.rotation), path));
+                        roads.push((
+                            entity,
+                            e.name_hash,
+                            p.parent,
+                            Vec3::from(p.position),
+                            rotation(p.rotation),
+                            path,
+                        ));
                     }
                 }
+                world.add_junctions(&layer);
+                world.zones.extend(crate::population::read_zones(
+                    &layer,
+                    e.name_hash,
+                    is_static,
+                    |h| {
+                        let data = source.asset(h, m2_assets::region::REGION_TYPE).ok()?;
+                        Some(m2_assets::Region::parse(&data).ok()?.corners)
+                    },
+                ));
                 if layer.component("AtmosphereBase").is_some() {
                     world
                         .atmosphere_regions
@@ -1143,9 +1239,24 @@ impl WorldIndex {
                 world.add_traffic(&layer, e.name_hash, is_static, &assets.templates);
             }
         }
-        let roads = RoadLines::read(source, &roads);
-        world.add_trees(source, &assets.templates, &roads);
+        world.add_roads(source, &roads, &assets.templates);
+        let mut lines = RoadLines::default();
+        for road in &world.roads {
+            for w in road.points.windows(2) {
+                lines.add([w[0].x, w[0].z, w[1].x, w[1].z]);
+            }
+        }
+        world.add_trees(source, &assets.templates, &lines);
         world.template_db = assets.templates;
+        let before = world.spawns.len();
+        world.add_walkers();
+        eprintln!(
+            "roads: {} roads, {} junctions, {} traffic zones, {} passers-by placed",
+            world.roads.len(),
+            world.junctions.len(),
+            world.zones.len(),
+            world.spawns.len() - before
+        );
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
         let mut path_points = |asset: u32| -> Vec<Vec3> {
             paths
@@ -1405,6 +1516,10 @@ impl WorldIndex {
                 list: people_of(id, p),
                 ai,
                 gun: templates.rifle_of(p.parent).map(|(_, g)| g),
+                cycle: own_spawners
+                    .get(&id)
+                    .or_else(|| templates.population.spawners.get(&p.parent))
+                    .map(|s| s.seconds_per_cycle),
             }
         };
         for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
@@ -2597,12 +2712,17 @@ struct RoadLines {
 /// Side of a [`RoadLines`] bin (metres).
 const ROAD_BIN: f32 = 32.0;
 
-impl RoadLines {
-    /// Each road's path, placed by its entity's transform.
-    fn read<R: Read + Seek>(source: &mut AssetSource<R>, roads: &[(Vec3, Quat, u32)]) -> Self {
-        let mut lines = Self::default();
+impl WorldIndex {
+    /// Each road's path, placed by its entity's transform, with its
+    /// layer and how wide its template's name says it is.
+    fn add_roads<R: Read + Seek>(
+        &mut self,
+        source: &mut AssetSource<R>,
+        roads: &[(u32, u32, u32, Vec3, Quat, u32)],
+        templates: &Templates,
+    ) {
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
-        for &(at, q, path) in roads {
+        for &(entity, layer, parent, at, q, path) in roads {
             let points = paths.entry(path).or_insert_with(|| {
                 source
                     .asset(path, PATH_TYPE)
@@ -2611,14 +2731,181 @@ impl RoadLines {
                     .map(|p| p.points.into_iter().map(Vec3::from).collect())
                     .unwrap_or_default()
             });
-            for w in points.windows(2) {
-                let (a, b) = (at + q * w[0], at + q * w[1]);
-                lines.add([a.x, a.z, b.x, b.z]);
+            if points.len() < 2 {
+                continue;
             }
+            let template = templates.by_id(parent).map_or("", |(n, _)| n);
+            self.roads.push(Road {
+                entity,
+                layer,
+                points: points.iter().map(|&p| at + q * p).collect(),
+                width: road_width(template),
+            });
         }
-        lines
     }
 
+    /// A layer's `RoadIntersection`s: each names up to six roads (its
+    /// first six fields) and where each meets it (six offsets from its
+    /// place, at 28). Read off the install (free roam round F3): the
+    /// roads' paths end at these ports.
+    fn add_junctions(&mut self, layer: &Layer<'_>) {
+        let Some(c) = layer.component("RoadIntersection") else {
+            return;
+        };
+        let placements = layer.placements();
+        for (entity, rec) in c.records().unwrap_or_default() {
+            let Some(p) = placements.get(&entity) else {
+                continue;
+            };
+            let (at, q) = (Vec3::from(p.position), rotation(p.rotation));
+            let word = |o: usize| {
+                rec.get(o..o + 4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            };
+            let float = |o: usize| word(o).map(f32::from_bits).filter(|f| f.is_finite());
+            let ports: Vec<(u32, Vec3)> = (0..6)
+                .filter_map(|i| {
+                    let road = word(i * 4).filter(|&r| r != 0)?;
+                    let o = JUNCTION_PORTS + i * 12;
+                    let off = Vec3::new(float(o)?, float(o + 4)?, float(o + 8)?);
+                    Some((road, at + q * off))
+                })
+                .collect();
+            if !ports.is_empty() {
+                self.junctions.push(Junction {
+                    entity,
+                    position: at,
+                    ports,
+                });
+            }
+        }
+    }
+}
+
+impl WorldIndex {
+    /// Passers-by along the roads, where an area's traffic zone
+    /// ([`crate::population::DensityZone`]) has people: one per
+    /// [`WALKER_EVERY`] metres, each a spawner of the list of the zone
+    /// that rules there (whichever layers are in), walking to and fro
+    /// along a stretch of the road's edge, the sides taken in turn. Each
+    /// stands while its zone's layer is in.
+    fn add_walkers(&mut self) {
+        let templates = &self.template_db;
+        let mut lists: HashMap<u32, Vec<(String, u32, f32)>> = HashMap::new();
+        let mut walkers = Vec::new();
+        for road in &self.roads {
+            let length = path_length(&road.points);
+            let out = road.width / 2.0 + WALKER_OUT;
+            let mut along = WALKER_EVERY / 2.0;
+            while along + WALKER_STRETCH / 2.0 < length {
+                let s = along;
+                along += WALKER_EVERY;
+                let (mid, _) = point_along(&road.points, s);
+                let Some(zone) = crate::population::zone_at(&self.zones, mid.x, mid.z)
+                    .filter(|z| z.people > 0 && z.people_list != 0)
+                else {
+                    continue;
+                };
+                let list = lists.entry(zone.people_list).or_insert_with(|| {
+                    templates
+                        .list_of(zone.people_list)
+                        .into_iter()
+                        .filter_map(|(name, w)| {
+                            let info = templates.get(&name)?;
+                            let model = info.model.filter(|_| info.human)?;
+                            Some((name, model, w))
+                        })
+                        .collect()
+                });
+                if list.is_empty() {
+                    continue;
+                }
+                let side = if walkers.len() % 2 == 0 { 1.0 } else { -1.0 };
+                let from = (s - WALKER_STRETCH / 2.0).max(0.0);
+                let route: Vec<Vec3> = (0..=6)
+                    .map(|i| {
+                        let t = from + WALKER_STRETCH * i as f32 / 6.0;
+                        let (at, dir) = point_along(&road.points, t);
+                        at + Vec3::new(dir.z, 0.0, -dir.x) * out * side
+                    })
+                    .collect();
+                walkers.push(SpawnPoint {
+                    entity: WALKER_BASE + walkers.len() as u32,
+                    name: format!("walker of {}", zone.name),
+                    template: None,
+                    position: route[0],
+                    rotation: Quat::IDENTITY,
+                    route,
+                    layer: Some(zone.layer),
+                    static_layer: zone.static_layer,
+                    model: None,
+                    list: list.clone(),
+                    ai: None,
+                    gun: None,
+                    cycle: None,
+                });
+            }
+        }
+        self.spawns.extend(walkers);
+    }
+}
+
+/// How long a path is along the ground, metres.
+pub fn path_length(points: &[Vec3]) -> f32 {
+    points.windows(2).map(|w| w[0].distance(w[1])).sum()
+}
+
+/// The point `s` metres along a path and the way it runs there (level,
+/// unit length); past either end, the end.
+pub fn point_along(points: &[Vec3], s: f32) -> (Vec3, Vec3) {
+    let mut left = s.max(0.0);
+    for w in points.windows(2) {
+        let d = w[0].distance(w[1]);
+        let dir = Vec3::new(w[1].x - w[0].x, 0.0, w[1].z - w[0].z).normalize_or(Vec3::Z);
+        if left <= d || d == 0.0 && left == 0.0 {
+            let t = if d > 0.0 { left / d } else { 0.0 };
+            return (w[0].lerp(w[1], t), dir);
+        }
+        left -= d;
+    }
+    match points {
+        [.., a, b] => (
+            *b,
+            Vec3::new(b.x - a.x, 0.0, b.z - a.z).normalize_or(Vec3::Z),
+        ),
+        [a] => (*a, Vec3::Z),
+        [] => (Vec3::ZERO, Vec3::Z),
+    }
+}
+
+/// Where a `RoadIntersection` record's six port offsets start.
+const JUNCTION_PORTS: usize = 28;
+
+/// How wide a road is, metres, by its template's name: the number after
+/// "road" (`_commercial_road10t`, `_outskirt_road5`, `A8 15m Road`);
+/// 8 where the name has none. Inferred from the names, not decoded (the
+/// templates' `LaneData` may say it; its fields aren't named).
+pub fn road_width(template: &str) -> f32 {
+    let lower = template.to_ascii_lowercase();
+    let after = lower.find("road").map(|i| &lower[i + 4..]);
+    let before = lower.find("m road").map(|i| {
+        let head = &lower[..i];
+        let start = head
+            .rfind(|c: char| !c.is_ascii_digit())
+            .map_or(0, |j| j + 1);
+        &head[start..]
+    });
+    let digits = |s: &str| -> Option<f32> {
+        let n: String = s.chars().take_while(char::is_ascii_digit).collect();
+        n.parse().ok().filter(|&w: &f32| (3.0..=40.0).contains(&w))
+    };
+    after
+        .and_then(digits)
+        .or_else(|| before.and_then(digits))
+        .unwrap_or(8.0)
+}
+
+impl RoadLines {
     fn bin(x: f32, z: f32) -> (i32, i32) {
         ((x / ROAD_BIN).floor() as i32, (z / ROAD_BIN).floor() as i32)
     }
@@ -2663,6 +2950,30 @@ impl RoadLines {
 #[cfg(test)]
 mod road_tests {
     use super::*;
+
+    #[test]
+    fn a_roads_width_is_in_its_templates_name() {
+        assert_eq!(road_width("_commercial_road10t"), 10.0);
+        assert_eq!(road_width("_outskirt_road5"), 5.0);
+        assert_eq!(road_width("_commercial_road20Clean"), 20.0);
+        assert_eq!(road_width("A8 15m Road"), 15.0);
+        assert_eq!(road_width("Road"), 8.0);
+        assert_eq!(road_width(""), 8.0);
+    }
+
+    #[test]
+    fn points_along_a_path() {
+        let p = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 10.0),
+            Vec3::new(10.0, 0.0, 10.0),
+        ];
+        assert_eq!(path_length(&p), 20.0);
+        assert_eq!(point_along(&p, 5.0), (Vec3::new(0.0, 0.0, 5.0), Vec3::Z));
+        assert_eq!(point_along(&p, 15.0), (Vec3::new(5.0, 0.0, 10.0), Vec3::X));
+        assert_eq!(point_along(&p, 99.0), (Vec3::new(10.0, 0.0, 10.0), Vec3::X));
+        assert!(is_walker(WALKER_BASE + 7) && !is_walker(0x0012_3456));
+    }
 
     #[test]
     fn finds_points_near_a_road() {

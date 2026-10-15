@@ -124,6 +124,12 @@ pub struct Game {
     pub traffic: crate::traffic::Traffic,
     /// Vehicles the mission scripts send along a path (`crate::paths`).
     pub paths: crate::paths::PathMoves,
+    /// Traffic on the road network (`crate::roads`).
+    pub roads: crate::roads::RoadTraffic,
+    /// With `M2_LIFE_CENSUS=<seconds>` (or `--traffic`): how often to log
+    /// what lives near her ([`Game::life_census`]), the seconds run and
+    /// the seconds since the last.
+    pub census: Option<(f32, f32, f32)>,
     /// Seconds to the next look for the island's vehicles near the player.
     vehicle_wait: f32,
     /// The layers the game starts with, which the island's vehicles come
@@ -240,6 +246,11 @@ impl Game {
             fetched: HashSet::new(),
             traffic: crate::traffic::Traffic::default(),
             paths: crate::paths::PathMoves::default(),
+            roads: crate::roads::RoadTraffic::default(),
+            census: std::env::var("M2_LIFE_CENSUS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(|every: f32| (every, 0.0, every)),
             vehicle_wait: 0.0,
             startup: None,
             arrival: None,
@@ -449,10 +460,11 @@ impl Game {
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
         // Traffic has its own limit.
         let traffic = &self.traffic;
+        let roads = &self.roads;
         let mut placed = scene
             .vehicles
             .iter()
-            .filter(|v| v.spot.is_some_and(|(e, _, _)| !traffic.owns(e)))
+            .filter(|v| v.spot.is_some_and(|(e, _, _)| !traffic.owns(e)) && !roads.owns(v))
             .count();
         let mut loads = Vec::new();
         for (_, t) in wanted {
@@ -530,8 +542,63 @@ impl Game {
         }
     }
 
+    /// What lives near the player, for measuring against the footage: the
+    /// vehicles moving within 150 m (and of them, the road traffic's), and
+    /// the people standing within 100 m (fighting or not).
+    pub fn life_census(&self) -> String {
+        let focus = self.focus();
+        let near = |p: m2_math::glam::Vec3, d: f32| {
+            m2_math::glam::Vec2::new(p.x - focus.x, p.z - focus.z).length() < d
+        };
+        let (mut moving, mut road) = (0, 0);
+        if let Some(world) = &self.scene.world {
+            for v in &self.scene.vehicles {
+                let Some(id) = v.id.filter(|_| !v.wrecked) else {
+                    continue;
+                };
+                let Some(m) = world.physics.vehicle_transform(id) else {
+                    continue;
+                };
+                if near(m.w_axis.truncate(), 150.0) && world.physics.vehicle_speed(id) > 2.0 {
+                    moving += 1;
+                    road += usize::from(self.roads.owns(v));
+                }
+            }
+        }
+        let people = &self.scene.people.npcs;
+        let about = people
+            .iter()
+            .filter(|n| n.alive && near(n.character.position, 100.0));
+        let soldiers = about.clone().filter(|n| n.soldier).count();
+        let others = about.count() - soldiers;
+        let zone = self.scene.world.as_ref().and_then(|w| {
+            let people = &self.scene.people;
+            let zones = w
+                .index
+                .zones
+                .iter()
+                .filter(|z| people.layer_in(Some(z.layer)));
+            m2_engine::population::zone_at(zones, focus.x, focus.z)
+        });
+        let zone = zone.map_or("none".to_owned(), |z| {
+            format!("{} ({} vehicles, {} people)", z.name, z.vehicles, z.people)
+        });
+        format!(
+            "{moving} vehicles moving within 150 m ({road} road traffic), {others} people within 100 m not fighting, {soldiers} soldiers; zone {zone}"
+        )
+    }
+
     /// One fixed tick with `intent` for the player (ignored while flying).
     pub fn step(&mut self, intent: Intent, dt: f32) {
+        if let Some((every, run, since)) = &mut self.census {
+            *run += dt;
+            *since += dt;
+            if *since >= *every {
+                *since = 0.0;
+                let run = *run;
+                eprintln!("life at {run:.0} s: {}", self.life_census());
+            }
+        }
         self.update_sky(dt);
         let focus = self.focus();
         self.moving.update(&mut self.scene, focus, dt);
@@ -550,6 +617,20 @@ impl Game {
             let people = &self.scene.people;
             self.traffic
                 .spawn(&self.scene, focus, |l| people.layer_in(l), dt);
+        }
+        // The road traffic comes on foot and at the wheel alike, as the
+        // traffic zone there says, as do the passers-by.
+        if self.scene.player.as_ref().is_some_and(|p| p.landed) {
+            let focus = self.focus();
+            let layers = self.scene.people.state_layers.clone();
+            let layer_in = |l: u32| layers.as_ref().is_none_or(|set| set.contains(&l));
+            if let Some(world) = &self.scene.world {
+                let zones = world.index.zones.iter().filter(|z| layer_in(z.layer));
+                self.scene.people.walker_cap =
+                    m2_engine::population::zone_at(zones, focus.x, focus.z)
+                        .map_or(0, |z| z.people as usize);
+            }
+            self.roads.spawn(&mut self.scene, focus, layer_in, dt);
         }
         let intent = self.call_support(intent, dt);
         // The use key at what lies within reach: taken with the fight's.
@@ -802,6 +883,20 @@ impl Game {
                 .drive(&mut world.physics, &self.scene.vehicles, driven);
             self.paths
                 .drive(&mut world.physics, &self.scene.vehicles, driven);
+            let walking = self
+                .scene
+                .player
+                .as_ref()
+                .filter(|p| p.driving.is_none())
+                .map(|p| p.character.position);
+            self.roads.drive(
+                &mut world.physics,
+                &self.scene.vehicles,
+                &world.index.roads,
+                driven,
+                walking,
+                dt,
+            );
             knock_loose(
                 world,
                 &mut self.scene.props,

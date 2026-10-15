@@ -66,6 +66,7 @@ mod paths;
 mod placed;
 mod player;
 mod props;
+mod roads;
 mod route;
 mod save;
 mod scene;
@@ -957,6 +958,8 @@ fn traffic_for_screenshot(
     let tick = TICK.as_secs_f32();
     let mut t = 0.0;
     let mut next_log = 0.0;
+    // What lives near her, every 2 s.
+    game.census.get_or_insert((2.0, 0.0, 2.0));
     while t <= seconds {
         if t >= next_log {
             next_log += 5.0;
@@ -966,6 +969,12 @@ fn traffic_for_screenshot(
                 for line in game
                     .traffic
                     .report(&world.physics, &game.scene.vehicles, focus)
+                {
+                    eprintln!("{line}");
+                }
+                for line in
+                    game.roads
+                        .report(&world.physics, &game.scene.vehicles, &world.index.roads)
                 {
                     eprintln!("{line}");
                 }
