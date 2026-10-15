@@ -1001,6 +1001,22 @@ fn main() -> Result<(), Error> {
                 |_, _, _| true,
                 |p| p.x,
             ),
+            // Every entity of the layers whose name holds a word, with all
+            // their records (`layer:vz_state_car_estate`).
+            "layer" => {
+                let words = words_of(arg);
+                layer_entities_with(
+                    &mut source,
+                    &names,
+                    usize::MAX,
+                    None,
+                    |layer, _, _| {
+                        let l = layer.to_ascii_lowercase();
+                        words.iter().any(|w| l.contains(w.as_str()))
+                    },
+                    |p| p.x,
+                )
+            }
             "collision" => collision(&mut source, &names, arg),
             "phy2words" => {
                 if world.is_none() {
@@ -6022,8 +6038,13 @@ fn templates<R: Read + Seek>(
             }
         }
     };
-    let shown: Vec<u32> = picked.iter().take(150).map(|p| p.1).collect();
-    for &(name, id) in picked.iter().take(150) {
+    // 150 at most, or as many as `M2_SURVEY_MOST` says.
+    let most = std::env::var("M2_SURVEY_MOST")
+        .ok()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(150);
+    let shown: Vec<u32> = picked.iter().take(most).map(|p| p.1).collect();
+    for &(name, id) in picked.iter().take(most) {
         show(id, name, &mut named);
     }
     named.retain(|v| !shown.contains(v));

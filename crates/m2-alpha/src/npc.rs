@@ -42,7 +42,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::tuning::HandGun;
-use m2_engine::world::SpawnPoint;
+use m2_engine::world::{SpawnPoint, is_walker};
 use m2_engine::{AiProfile, BoundClip, Character, Gait, GpuModel, Physics, RagdollId};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
@@ -52,8 +52,15 @@ use crate::scene::{Carry, Rig};
 /// Soldiers come and go within these distances of the player, metres.
 const ACTIVE: f32 = 450.0;
 const INACTIVE: f32 = 500.0;
-/// Most soldiers about at once.
+/// Most soldiers about at once, and most passers-by on the roads
+/// (invented: the frame rate's limits; the traffic zones ask for 20 at
+/// most, Maracaibo's centre).
 const MAX_SOLDIERS: usize = 48;
+const MAX_WALKERS: usize = 24;
+/// A spawner whose one fell sends the next its `SecondsPerCycle` later,
+/// but not while she is this near it, metres (invented: the data's
+/// fields for how many it sends in all aren't decoded).
+const REFILL_CLEAR: f32 = 20.0;
 /// How far from where they settled after running people stroll, metres.
 const WANDER: f32 = 30.0;
 /// Walking and fleeing speeds, m/s, and the pause at each end of a route
@@ -1420,6 +1427,14 @@ pub struct People {
     /// stand, not where their layer has them.
     moved: HashMap<u32, Vec3>,
     active: HashSet<u32>,
+    /// Spawners sending from a list, by entity: their `SecondsPerCycle`
+    /// (filled on first use).
+    cycles: Option<HashMap<u32, f32>>,
+    /// Spawners whose one fell, by entity: seconds before the next.
+    pub refills: HashMap<u32, f32>,
+    /// How many passers-by the traffic zone where she is asks for (its
+    /// people count, [`m2_engine::population::DensityZone`]).
+    pub walker_cap: usize,
     rng: Rng,
     /// The enhanced, smarter soldiers' settings (off: the original's).
     pub smarter: SmarterAi,
@@ -1728,6 +1743,7 @@ impl People {
         threat: Option<Vec3>,
         dt: f32,
     ) {
+        self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
         let mut callouts = Vec::new();
         for npc in &mut self.npcs {
@@ -1941,6 +1957,40 @@ impl People {
         })
     }
 
+    /// A spawner sending from its list (not a mission's target) sends
+    /// another its `SecondsPerCycle` after its one fell, while it is in
+    /// reach and she isn't on top of it: the fallen one lies where he fell,
+    /// no longer the spawner's. From the data: the cycle; the rest is
+    /// invented (see [`REFILL_CLEAR`]).
+    fn refill(&mut self, spawns: &[SpawnPoint], focus: Vec3, dt: f32) {
+        let cycles = self.cycles.get_or_insert_with(|| {
+            spawns
+                .iter()
+                .filter(|s| !s.list.is_empty())
+                .filter_map(|s| Some((s.entity, s.cycle?)))
+                .collect()
+        });
+        for n in &mut self.npcs {
+            let Some(id) = n.spawn.filter(|_| !n.alive) else {
+                continue;
+            };
+            let Some(&cycle) = cycles.get(&id) else {
+                continue;
+            };
+            if self.mission_soldiers.contains(&id) {
+                continue;
+            }
+            let left = self.refills.entry(id).or_insert(cycle);
+            *left -= dt;
+            let at = n.character.position;
+            if *left <= 0.0 && Vec2::new(at.x - focus.x, at.z - focus.z).length() > REFILL_CLEAR {
+                self.refills.remove(&id);
+                self.active.remove(&id);
+                n.spawn = None;
+            }
+        }
+    }
+
     fn populate(&mut self, physics: &mut Physics, spawns: &[SpawnPoint], focus: Vec3) {
         let far = |p: Vec3, d: f32| Vec2::new(p.x - focus.x, p.z - focus.z).length() > d;
         // People out of range, or whose layer went, go.
@@ -2002,7 +2052,16 @@ impl People {
         }
         // People who come into range: a mission's targets first, then the
         // nearest. Where the scripts put someone, they stand.
-        let soldiers = self.npcs.iter().filter(|n| n.spawn.is_some()).count();
+        let soldiers = self
+            .npcs
+            .iter()
+            .filter(|n| n.spawn.is_some_and(|e| !is_walker(e)))
+            .count();
+        let walkers = self
+            .npcs
+            .iter()
+            .filter(|n| n.spawn.is_some_and(is_walker))
+            .count();
         let mut near: Vec<(f32, &SpawnPoint, Vec3)> = spawns
             .iter()
             .map(|s| (s, self.moved.get(&s.entity).copied()))
@@ -2026,10 +2085,16 @@ impl People {
         // A mission's targets come even when the island's soldiers fill
         // the place up.
         let mut room = MAX_SOLDIERS.saturating_sub(soldiers);
+        let mut walker_room = self.walker_cap.min(MAX_WALKERS).saturating_sub(walkers);
         for (_, s, at) in near {
             let target = self.mission_soldiers.contains(&s.entity);
-            if room == 0 && !target {
-                break;
+            let room = if is_walker(s.entity) {
+                &mut walker_room
+            } else {
+                &mut room
+            };
+            if *room == 0 && !target {
+                continue;
             }
             let (kind, fights, listed) = match self.who(s, target) {
                 Who::Kind {
@@ -2040,12 +2105,12 @@ impl People {
                 // One whose model is still loading keeps their place, so
                 // spawns further off don't take it meanwhile.
                 Who::Waiting => {
-                    room = room.saturating_sub(1);
+                    *room = room.saturating_sub(1);
                     continue;
                 }
                 Who::Nobody => continue,
             };
-            room = room.saturating_sub(1);
+            *room = room.saturating_sub(1);
             let forward = s.rotation * Vec3::Z;
             let facing = forward.x.atan2(forward.z);
             let brain = if s.route.len() >= 2 && !self.moved.contains_key(&s.entity) {
@@ -2343,6 +2408,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_spawner_sends_another_a_cycle_after_its_one_fell() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.add_kind(kind("VZ Soldier", true));
+        let spawner = SpawnPoint {
+            list: vec![("VZ Soldier".into(), 0x45cc, 1.0)],
+            cycle: Some(10.0),
+            ..spawn(9, "PopulationSpawner", 40.0)
+        };
+        let spawns = [spawner];
+        let dt = 1.0 / 60.0;
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        let first = people.npcs.iter().position(|n| n.spawn == Some(9));
+        let first = first.expect("sent one");
+        assert!(people.npcs[first].hurt(1000.0, Vec3::ZERO));
+        // Not before the cycle is out.
+        for _ in 0..(9.5 / dt) as usize {
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        }
+        assert_eq!(people.npcs.iter().filter(|n| n.alive).count(), 0);
+        for _ in 0..(1.0 / dt) as usize {
+            people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        }
+        let alive: Vec<&Npc> = people.npcs.iter().filter(|n| n.alive).collect();
+        assert_eq!(alive.len(), 1);
+        assert_eq!(alive[0].spawn, Some(9));
+        // The fallen one lies where he fell, the spawner's no more.
+        assert!(people.npcs.iter().any(|n| !n.alive && n.spawn.is_none()));
+        // Nor while she stands on top of it.
+        let i = people.npcs.iter().position(|n| n.alive).expect("one");
+        assert!(people.npcs[i].hurt(1000.0, Vec3::ZERO));
+        let near = Vec3::new(40.0, 0.0, 5.0);
+        for _ in 0..(12.0 / dt) as usize {
+            people.update(&mut physics, &spawns, near, None, dt);
+        }
+        assert_eq!(people.npcs.iter().filter(|n| n.alive).count(), 0);
+    }
+
+    #[test]
+    fn as_many_pass_by_as_the_zone_asks() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.add_kind(kind("Civ Casual (male)", true));
+        let walker = |i: u32, x: f32| SpawnPoint {
+            list: vec![("Civ Casual (male)".into(), 0x6e44, 1.0)],
+            ..spawn(m2_engine::world::WALKER_BASE + i, "walker", x)
+        };
+        let spawns = [walker(0, 5.0), walker(1, 10.0), walker(2, 15.0)];
+        let dt = 1.0 / 60.0;
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        assert!(people.npcs.is_empty(), "a zone of none");
+        people.walker_cap = 2;
+        people.update(&mut physics, &spawns, Vec3::ZERO, None, dt);
+        let out: Vec<Option<u32>> = people.npcs.iter().map(|n| n.spawn).collect();
+        // The nearest two.
+        let base = m2_engine::world::WALKER_BASE;
+        assert_eq!(out, [Some(base), Some(base + 1)]);
+        assert!(people.npcs.iter().all(|n| !n.soldier));
+    }
+
+    #[test]
     fn everyone_stands_in_their_templates_own_model() {
         let mut physics = ground();
         let mut people = People::default();
@@ -2622,6 +2748,7 @@ pub(crate) mod tests {
             list: Vec::new(),
             ai: None,
             gun: None,
+            cycle: None,
         }
     }
 
