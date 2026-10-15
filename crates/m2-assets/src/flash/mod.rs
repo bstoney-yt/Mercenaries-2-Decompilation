@@ -760,6 +760,129 @@ fn bounds(tris: &[Triangle]) -> Option<[f32; 4]> {
     }))
 }
 
+/// The parts of `tris` inside a mask's triangles (its shape's mesh drawn
+/// where the mask sits), cut piece by piece: what a mask layer shows of
+/// the layers under it. The mask's triangles don't overlap (a shape's
+/// mesh), so no part is drawn twice.
+pub fn cut_to_mask(tris: &[Triangle], mask: &[Corners]) -> Vec<Triangle> {
+    let boxes: Vec<[f32; 4]> = mask.iter().map(|m| corners_box(*m)).collect();
+    let mut out = Vec::new();
+    let mut piece = |t: &Triangle, corners: Corners, uv: Corners| {
+        out.push(Triangle {
+            corners,
+            uv,
+            colour: t.colour,
+            texture: t.texture.clone(),
+            multiply: t.multiply,
+        });
+    };
+    for t in tris {
+        let tb = corners_box(t.corners);
+        for (m, mb) in mask.iter().zip(&boxes) {
+            if mb[0] > tb[2] || mb[2] < tb[0] || mb[1] > tb[3] || mb[3] < tb[1] {
+                continue;
+            }
+            // Wholly inside one of the mask's triangles: all of it, and
+            // no other triangle of the mask holds any of it.
+            if t.corners.iter().all(|&p| inside(p, *m)) {
+                piece(t, t.corners, t.uv);
+                break;
+            }
+            // The mask's triangle wholly inside it: that triangle, its
+            // texture where the triangle sits.
+            if m.iter().all(|&p| inside(p, t.corners)) {
+                piece(t, *m, m.map(|p| uv_at(t, p)));
+                continue;
+            }
+            cut_triangle(t.corners, t.uv, *m, |c, uv| piece(t, c, uv));
+        }
+    }
+    out
+}
+
+/// The box round three points: x0, y0, x1, y1.
+fn corners_box(c: Corners) -> [f32; 4] {
+    c.iter()
+        .fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, p| {
+            [
+                b[0].min(p[0]),
+                b[1].min(p[1]),
+                b[2].max(p[0]),
+                b[3].max(p[1]),
+            ]
+        })
+}
+
+/// The texture coordinate at `p` in triangle `t` (by its barycentric
+/// weights).
+fn uv_at(t: &Triangle, p: [f32; 2]) -> [f32; 2] {
+    let [a, b, c] = t.corners;
+    let det = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
+    if det == 0.0 {
+        return t.uv[0];
+    }
+    let wa = ((b[1] - c[1]) * (p[0] - c[0]) + (c[0] - b[0]) * (p[1] - c[1])) / det;
+    let wb = ((c[1] - a[1]) * (p[0] - c[0]) + (a[0] - c[0]) * (p[1] - c[1])) / det;
+    let wc = 1.0 - wa - wb;
+    [0, 1].map(|i| wa * t.uv[0][i] + wb * t.uv[1][i] + wc * t.uv[2][i])
+}
+
+/// The part of a triangle inside the triangle `by` (either winding), with
+/// its texture coordinates, handed to `emit` as triangles.
+fn cut_triangle(
+    corners: Corners,
+    uv: Corners,
+    by: Corners,
+    mut emit: impl FnMut(Corners, Corners),
+) {
+    let cross = |a: [f32; 2], b: [f32; 2], p: [f32; 2]| {
+        (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+    };
+    let turn = cross(by[0], by[1], by[2]);
+    if turn == 0.0 {
+        return;
+    }
+    let sign = turn.signum();
+    // A triangle cut by three sides has at most six corners.
+    type Poly = ([([f32; 2], [f32; 2]); 9], usize);
+    let mut poly: Poly = ([([0.0; 2], [0.0; 2]); 9], 3);
+    for i in 0..3 {
+        poly.0[i] = (corners[i], uv[i]);
+    }
+    for e in 0..3 {
+        let (a, b) = (by[e], by[(e + 1) % 3]);
+        let side = |p: [f32; 2]| cross(a, b, p) * sign;
+        let mut next: Poly = ([([0.0; 2], [0.0; 2]); 9], 0);
+        let mut push = |v: ([f32; 2], [f32; 2])| {
+            if next.1 < next.0.len() {
+                next.0[next.1] = v;
+                next.1 += 1;
+            }
+        };
+        for i in 0..poly.1 {
+            let (p, q) = (poly.0[i], poly.0[(i + 1) % poly.1]);
+            let (sp, sq) = (side(p.0), side(q.0));
+            if sp >= 0.0 {
+                push(p);
+            }
+            if (sp >= 0.0) != (sq >= 0.0) {
+                let t = sp / (sp - sq);
+                let lerp =
+                    |u: [f32; 2], v: [f32; 2]| [u[0] + (v[0] - u[0]) * t, u[1] + (v[1] - u[1]) * t];
+                push((lerp(p.0, q.0), lerp(p.1, q.1)));
+            }
+        }
+        poly = next;
+        if poly.1 < 3 {
+            return;
+        }
+    }
+    let v = &poly.0;
+    for i in 1..poly.1 - 1 {
+        emit([v[0].0, v[i].0, v[i + 1].0], [v[0].1, v[i].1, v[i + 1].1]);
+    }
+}
+
 /// A triangle's three points (corners, or their texture coordinates).
 pub type Corners = [[f32; 2]; 3];
 

@@ -24,6 +24,7 @@
 //! cargo run -p m2-assets --example wad -- actions <archive.wad> <movie name>
 //! cargo run -p m2-assets --example wad -- fonts   <archive.wad>
 //! cargo run -p m2-assets --example wad -- flashfonts <archive.wad>
+//! cargo run -p m2-assets --example wad -- flashmasks <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -221,6 +222,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("actions", [name]) => actions(&mut wad, name)?,
         ("fonts", []) => fonts(&mut wad)?,
         ("flashfonts", []) => flash_fonts(&mut wad)?,
+        ("flashmasks", []) => flash_masks(&mut wad)?,
         ("dds", [name, out]) => {
             let dds = texture_dds(&mut wad, name)?;
             std::fs::write(out, &dds)?;
@@ -2527,5 +2529,100 @@ fn flash_fonts<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         }
     }
     println!("{fields} text fields in {with_text} of {movies} movies");
+    Ok(())
+}
+
+/// Every Flash mask in the archive's movies (a `PlaceObject` with a clip
+/// depth): how much of its box its shape fills. A mask drawn as its box
+/// shows the whole box; drawn as its shape, only that share.
+fn flash_masks<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    use m2_assets::flash::{Library, player::Control};
+    let (mut movies, mut with_masks) = (0, 0);
+    let (mut shapes, mut cut, mut sprites, mut sum) = (0, 0, 0, 0.0f64);
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != MOVIE_TYPE {
+                continue;
+            }
+            let Ok(movie) = movie_from_asset(data) else {
+                continue;
+            };
+            movies += 1;
+            let lib = Library::new(&movie);
+            // The characters placed as masks, and the shapes a mask
+            // sprite's frames hold (one level down).
+            let mut masks = std::collections::BTreeSet::new();
+            let timelines = std::iter::once(&lib.root).chain(lib.sprites.values());
+            for t in timelines {
+                for p in t.frames.iter().flatten().filter_map(|c| match c {
+                    Control::Place(p) if p.clip_depth.is_some() => p.character,
+                    _ => None,
+                }) {
+                    masks.insert(p);
+                }
+            }
+            if masks.is_empty() {
+                continue;
+            }
+            with_masks += 1;
+            let mut held = Vec::new();
+            for &id in &masks {
+                if let Some(t) = lib.sprites.get(&id) {
+                    sprites += 1;
+                    for c in t.frames.iter().flatten() {
+                        if let Control::Place(p) = c
+                            && let Some(ch) = p.character
+                        {
+                            held.push(ch);
+                        }
+                    }
+                } else {
+                    held.push(id);
+                }
+            }
+            held.sort_unstable();
+            held.dedup();
+            let (mut n, mut part) = (0, 0);
+            for id in held {
+                let Some((shape, mesh)) = lib.shapes.get(&id) else {
+                    continue;
+                };
+                let b = shape.bounds;
+                let boxed = f64::from((b[2] - b[0]) * (b[3] - b[1]));
+                if boxed <= 0.0 {
+                    continue;
+                }
+                let area: f64 = mesh
+                    .iter()
+                    .map(|t| {
+                        let [a, b, c] = t.corners;
+                        f64::from(
+                            ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs(),
+                        ) / 2.0
+                    })
+                    .sum();
+                let share = (area / boxed).min(1.0);
+                n += 1;
+                sum += share;
+                if share < 0.99 {
+                    part += 1;
+                }
+            }
+            shapes += n;
+            cut += part;
+            println!(
+                "{:08x}: {} masks, {n} shapes, {part} fill less than 99% of their box",
+                e.name_hash,
+                masks.len()
+            );
+        }
+    }
+    println!(
+        "{movies} movies, {with_masks} with masks ({sprites} mask sprites); {shapes} mask shapes, \
+         {cut} fill less than 99% of their box, mean share {:.3}",
+        sum / f64::from(shapes.max(1))
+    );
     Ok(())
 }

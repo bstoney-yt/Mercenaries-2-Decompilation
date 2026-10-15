@@ -23,7 +23,13 @@
 //!
 //! - From the game's data: the movie, its frames, labels and commands
 //!   (`Loading.wad`); the fade's steps (`MrxGui` in `vz.wad`); the hints'
-//!   text and stored order (`shell.wad`).
+//!   text and stored order (`shell.wad`). The wipe's edge is the mask's
+//!   own shape, one per frame (characters 2-121, up to 4,072 triangles,
+//!   58% of their box on average), cut by [`m2_assets::flash`] as Flash
+//!   masks do, not its box.
+//! - From the PC footage: the wipe in plays at 30 frames a second (the
+//!   footage's frames line up one to one with the movie's at 12:59); its
+//!   wipe back ran faster there (about 10 footage frames), not matched.
 //! - From the PC footage: a hint is up at the start (the first stored,
 //!   then the second about 12 s later) and on contract changes (the third
 //!   at 7:58, the sixth at 20:44), so the engine shows them in stored
