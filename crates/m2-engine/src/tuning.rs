@@ -43,6 +43,13 @@ pub struct VehicleTuning {
     pub turret: Option<TurretTuning>,
     pub camera: Option<TankCamera>,
     pub gun: Option<GunTuning>,
+    /// A wheeled vehicle's engine and gearbox (`_CarPhysicsV2`).
+    pub engine: Option<EngineTuning>,
+    /// A tracked vehicle's pull at a standstill, a third, two thirds and
+    /// all of its top speed, of its most (`_TankPhysics`'s
+    /// `EngineTorqueRatio0`..`3`, names found by hash: the AMX-30's 1,
+    /// 0.45, 0.3, 0.1; read as a curve over its speed, inferred).
+    pub tracks: Option<[f32; 4]>,
     /// A helicopter's handling (`_HelicopterPhysics`).
     pub flight: Option<FlightTuning>,
     /// How far behind a helicopter its pilot's camera sits, metres, and
@@ -79,6 +86,91 @@ pub struct FlightTuning {
     pub roll_bank: f32,
     pub roll_accel: f32,
     pub bank_speed: f32,
+}
+
+/// A wheeled vehicle's engine and gearbox, from its `_CarPhysicsV2`
+/// (names found by hash, round 18 of the playtest fixes; the M151's
+/// values in brackets). The fields are those of a Havok vehicle's
+/// engine and transmission (`minRPM`, `optRPM`, `maxRPM`, upshift and
+/// downshift RPM, primary ratio, a ratio a gear), so the game's own top
+/// speeds come out of them: the M151 in fifth at its optimum 3,000 rpm
+/// runs at 84 km/h against its `MaxSpeed` of 85.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EngineTuning {
+    /// Most torque, newton-metres (`EngineTorque` 130).
+    pub torque: f32,
+    /// Engine speeds, rpm: idle, the most torque, the most it turns
+    /// (`GearMinRPM` 900, `GearOptRPM` 3,000, `GearMaxRPM` 12,000).
+    pub rpm: (f32, f32, f32),
+    /// It changes up a gear above this, rpm (`GearUpshiftRPM` 4,000).
+    pub upshift: f32,
+    /// The final drive's ratio (`GearRatioPrimary` 3.5), each forward
+    /// gear's (`GearRatio1`..`5`: 4, 3.1, 2.4, 2, 1.5; a 0 is no gear)
+    /// and reverse's (`GearRatioReverse` 3.7).
+    pub primary: f32,
+    pub gears: [f32; 5],
+    pub reverse: f32,
+    /// The driven wheels' radius, metres (`RearWheelRadius` 0.39).
+    pub radius: f32,
+    /// Of its most torque, what it gives at idle and at its most rpm
+    /// (fields 766afb22 0.8 and 72b88cdc 1.0, names unknown: read as
+    /// Havok's `torqueFactorAtMinRPM` and `torqueFactorAtMaxRPM` by
+    /// where they sit after the shift speeds; inferred).
+    pub torque_at: (f32, f32),
+    /// Top speed backing up, m/s (`ReverseMaxSpeed`, km/h: 55).
+    pub reverse_speed: f32,
+}
+
+impl EngineTuning {
+    /// How many forward gears it has.
+    pub fn gear_count(&self) -> usize {
+        self.gears.iter().take_while(|&&g| g > 0.0).count().max(1)
+    }
+
+    /// How fast the engine turns, rpm, in a gear of `ratio` at `speed`
+    /// m/s.
+    pub fn rpm_at(&self, ratio: f32, speed: f32) -> f32 {
+        speed.abs() / self.radius * self.primary * ratio * 60.0 / std::f32::consts::TAU
+    }
+
+    /// The gear it drives in at `speed` m/s (0 is first): the lowest
+    /// that keeps the engine below its upshift speed, else its top gear.
+    /// (A Havok gearbox shifts up there and down at the downshift speed;
+    /// choosing by speed alone leaves out that lag; inferred.)
+    pub fn gear(&self, speed: f32) -> usize {
+        let n = self.gear_count();
+        (0..n)
+            .find(|&g| self.rpm_at(self.gears[g], speed) <= self.upshift)
+            .unwrap_or(n - 1)
+    }
+
+    /// Of its most torque, what the engine gives at `rpm`: rising from
+    /// idle to the optimum, falling from there to its most, nothing
+    /// beyond.
+    pub fn torque_factor(&self, rpm: f32) -> f32 {
+        let (min, opt, max) = self.rpm;
+        let rpm = rpm.max(min);
+        let along = |a: f32, b: f32| ((rpm - a) / (b - a).max(1.0)).clamp(0.0, 1.0);
+        if rpm <= opt {
+            self.torque_at.0 + (1.0 - self.torque_at.0) * along(min, opt)
+        } else if rpm <= max {
+            1.0 + (self.torque_at.1 - 1.0) * along(opt, max)
+        } else {
+            0.0
+        }
+    }
+
+    /// How hard the driven wheels push flat out at `speed` m/s, newtons,
+    /// forwards or backing up.
+    pub fn push(&self, speed: f32, backwards: bool) -> f32 {
+        let ratio = if backwards {
+            self.reverse
+        } else {
+            self.gears[self.gear(speed)]
+        };
+        let rpm = self.rpm_at(ratio, speed);
+        self.torque * self.torque_factor(rpm) * self.primary * ratio / self.radius
+    }
 }
 
 /// A `Turret`: how fast it turns and how far its gun tilts.
@@ -243,6 +335,10 @@ const CHASE_DISTANCE: u32 = 0xee30_a43d;
 const HEALTH: u32 = 0xd122_919d;
 const BLAST_SCALE: u32 = 0x6bcc_541e;
 const BURNS_BELOW: u32 = 0x9a66_63a4;
+/// Unnamed `_CarPhysicsV2` fields (round 18): of its most torque, what
+/// the engine gives at idle and at its most rpm ([`EngineTuning`]).
+const TORQUE_AT_MIN: u32 = 0x766a_fb22;
+const TORQUE_AT_MAX: u32 = 0x72b8_8cdc;
 
 /// One component's records by template id, and its fields by name hash.
 pub(crate) struct Table<'a> {
@@ -578,6 +674,49 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     .filter_map(|r| links.word(r, LINK))
                     .filter_map(|weapon| guns.gun(weapon))
                     .min_by(|a, b| a.rate_of_fire.total_cmp(&b.rate_of_fire)),
+                engine: (|| {
+                    let r = *car.of_template(id).first()?;
+                    let f = |name| car.float(r, name_hash(name));
+                    let gear = |name| f(name).unwrap_or(0.0).max(0.0);
+                    let e = EngineTuning {
+                        torque: f("EngineTorque")?,
+                        rpm: (f("GearMinRPM")?, f("GearOptRPM")?, f("GearMaxRPM")?),
+                        upshift: f("GearUpshiftRPM")?,
+                        primary: f("GearRatioPrimary")?,
+                        gears: [
+                            gear("GearRatio1"),
+                            gear("GearRatio2"),
+                            gear("GearRatio3"),
+                            gear("GearRatio4"),
+                            gear("GearRatio5"),
+                        ],
+                        reverse: f("GearRatioReverse")?,
+                        radius: f("RearWheelRadius")?,
+                        torque_at: (car.float(r, TORQUE_AT_MIN)?, car.float(r, TORQUE_AT_MAX)?),
+                        reverse_speed: f("ReverseMaxSpeed")? / 3.6,
+                    };
+                    (e.torque > 0.0
+                        && e.primary > 0.0
+                        && e.radius > 0.05
+                        && e.gears[0] > 0.0
+                        && e.rpm.0 < e.rpm.1
+                        && e.rpm.1 < e.rpm.2)
+                        .then_some(e)
+                })(),
+                tracks: (|| {
+                    let r = *tank.of_template(id).first()?;
+                    let f = |name| tank.float(r, name_hash(name));
+                    let curve = [
+                        f("EngineTorqueRatio0")?,
+                        f("EngineTorqueRatio1")?,
+                        f("EngineTorqueRatio2")?,
+                        f("EngineTorqueRatio3")?,
+                    ];
+                    curve
+                        .iter()
+                        .all(|c| (0.0..=1.0).contains(c))
+                        .then_some(curve)
+                })(),
                 flight: (|| {
                     let f = |name| heli.get(id, name);
                     Some(FlightTuning {
@@ -697,6 +836,22 @@ mod tests {
             ("MaxRollBank", 0xde44_cb52),
             ("RollAccel", 0x8700_d608),
             ("BankSpeedLimit", 0xb027_46f1),
+            // `_CarPhysicsV2`'s engine and gearbox (round 18).
+            ("EngineTorque", 0x354a_82b9),
+            ("GearMinRPM", 0x0c4f_7cff),
+            ("GearOptRPM", 0x5c4c_668e),
+            ("GearMaxRPM", 0x0d64_8cb5),
+            ("GearUpshiftRPM", 0x973e_48b8),
+            ("GearDownshiftRPM", 0x0476_13b3),
+            ("GearRatioPrimary", 0x6936_5ef9),
+            ("GearRatioReverse", 0x105f_f72d),
+            ("GearRatio1", 0x9324_acd2),
+            ("GearRatio5", 0x0b1a_dc5e),
+            ("RearWheelRadius", 0x77c6_830e),
+            ("ReverseMaxSpeed", 0x1958_7e8a),
+            // `_TankPhysics`'s pull over its speed.
+            ("EngineTorqueRatio0", 0xe8a9_e7ee),
+            ("EngineTorqueRatio3", 0x4ab1_3df9),
             // `Rotor`: its hub node, and which way it spins (1 or -1);
             // its blade and blur nodes are `vehicle::MAIN_ROTOR`'s.
             ("RotorHubBoneName", 0xc93e_7607),
@@ -709,6 +864,63 @@ mod tests {
         ] {
             assert_eq!(name_hash(name), key, "{name}");
         }
+    }
+
+    /// The M151's `_CarPhysicsV2` engine and gearbox.
+    fn m151() -> EngineTuning {
+        EngineTuning {
+            torque: 130.0,
+            rpm: (900.0, 3000.0, 12000.0),
+            upshift: 4000.0,
+            primary: 3.5,
+            gears: [4.0, 3.1, 2.4, 2.0, 1.5],
+            reverse: 3.7,
+            radius: 0.39,
+            torque_at: (0.8, 1.0),
+            reverse_speed: 55.0 / 3.6,
+        }
+    }
+
+    // Its top gear at its optimum rpm is its template's `MaxSpeed`, 85
+    // km/h, near enough.
+    #[test]
+    fn the_m151_tops_out_in_fifth_near_its_max_speed() {
+        let e = m151();
+        assert_eq!(e.gear_count(), 5);
+        let kmh = 3000.0 / (e.primary * 1.5) * std::f32::consts::TAU / 60.0 * e.radius * 3.6;
+        assert!((kmh - 85.0).abs() < 2.0, "{kmh}");
+        assert_eq!(e.gear(85.0 / 3.6), 4);
+        assert!((e.rpm_at(1.5, 85.0 / 3.6) - 3034.0).abs() < 5.0);
+    }
+
+    // It pulls away in first at its idle torque (0.8 of 130 Nm through
+    // 3.5 x 4 on 0.39 m wheels: 3.7 kN) and changes up as it goes.
+    #[test]
+    fn the_engine_pulls_through_its_gears() {
+        let e = m151();
+        assert_eq!(e.gear(0.0), 0);
+        assert!((e.push(0.0, false) - 3733.0).abs() < 2.0);
+        let gears: Vec<usize> = (0..25).map(|v| e.gear(v as f32)).collect();
+        assert!(gears.windows(2).all(|w| w[1] >= w[0]), "{gears:?}");
+        assert_eq!(gears[24], 4);
+        // Harder in first than in fifth; nothing past its most rpm.
+        assert!(e.push(5.0, false) > e.push(23.0, false));
+        assert_eq!(e.torque_factor(12_001.0), 0.0);
+        assert_eq!(e.torque_factor(3000.0), 1.0);
+        assert!((e.torque_factor(500.0) - 0.8).abs() < 1e-6);
+        // Backing up in reverse's ratio.
+        assert!((e.push(0.0, true) - 130.0 * 0.8 * 3.5 * 3.7 / 0.39).abs() < 2.0);
+    }
+
+    // A gearbox with fewer than five gears stops at its last.
+    #[test]
+    fn a_missing_gear_is_no_gear() {
+        let e = EngineTuning {
+            gears: [3.0, 2.0, 1.0, 0.0, 0.0],
+            ..m151()
+        };
+        assert_eq!(e.gear_count(), 3);
+        assert_eq!(e.gear(60.0), 2);
     }
 
     // A table laid out as the game's: two targets, three kinds of damage.
