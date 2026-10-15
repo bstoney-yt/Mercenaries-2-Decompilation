@@ -252,6 +252,9 @@ pub struct VehicleSpec {
     pub tuning: VehicleTuning,
     /// A helicopter's rotors (none for others).
     pub rotors: Vec<RotorSpec>,
+    /// What its parts do as they are damaged, if its model says
+    /// ([`crate::vehicle_damage`]).
+    pub damage: Option<std::sync::Arc<crate::vehicle_damage::DamageModel>>,
 }
 
 /// How a vehicle sits on uneven ground ([`VehicleSpec::rest_on`]).
@@ -587,6 +590,7 @@ impl VehicleSpec {
             hull,
             turret_box,
             tuning: VehicleTuning::default(),
+            damage: crate::vehicle_damage::DamageModel::from_model(model).map(std::sync::Arc::new),
             rotors: if flies {
                 vehicle::rotors(model)
                     .into_iter()
@@ -979,6 +983,7 @@ mod tests {
             hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             turret_box: None,
             rotors: Vec::new(),
+            damage: None,
             tuning: VehicleTuning::default(),
         }
     }
