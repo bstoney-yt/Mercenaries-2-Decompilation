@@ -1133,11 +1133,12 @@ pub enum Loaded {
     /// A template's own person model that could not be read: model and
     /// template.
     NoPerson(u32, String),
-    /// A hand weapon: name, model, muzzle (model space).
-    Weapon(&'static str, CpuModel, Vec3),
+    /// A hand weapon: name, model, muzzle and the node spent cases fly
+    /// from (model space).
+    Weapon(&'static str, CpuModel, Vec3, Option<Vec3>),
     /// Any other hand weapon's model the templates name: its name's hash,
-    /// model, muzzle.
-    HandModel(u32, CpuModel, Vec3),
+    /// model, muzzle, case node.
+    HandModel(u32, CpuModel, Vec3, Option<Vec3>),
     /// A model for the helicopters' deliveries (a helicopter's, a supply
     /// crate's): its hash, each node's place at rest, and its rotors.
     Flight(u32, CpuModel, Vec<Mat4>, Vec<m2_assets::vehicle::Rotor>),
@@ -1202,6 +1203,7 @@ fn load_cast(install: Install, hand: Vec<u32>, park: bool) -> Receiver<Loaded> {
                 let model = data.parse()?;
                 let muzzle = m2_assets::vehicle::marker(&model, combat::MUZZLE)
                     .map_or(Vec3::new(0.0, 0.0, model.info.bounds.max[2]), Vec3::from);
+                let eject = combat::eject_node(&model);
                 let (lo, hi) = (model.info.bounds.min, model.info.bounds.max);
                 weapons.push(format!(
                     "{name} {hash:08x} ({:.2} x {:.2} x {:.2} m)",
@@ -1211,7 +1213,7 @@ fn load_cast(install: Install, hand: Vec<u32>, park: bool) -> Receiver<Loaded> {
                 ));
                 let mut cpu = CpuModel::build(hash, &model, 0);
                 cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
-                if tx.send(Loaded::Weapon(name, cpu, muzzle)).is_err() {
+                if tx.send(Loaded::Weapon(name, cpu, muzzle, eject)).is_err() {
                     return Ok(());
                 }
             }
@@ -1229,8 +1231,12 @@ fn load_cast(install: Install, hand: Vec<u32>, park: bool) -> Receiver<Loaded> {
                 let Ok(model) = data.parse() else { continue };
                 let muzzle = m2_assets::vehicle::marker(&model, combat::MUZZLE)
                     .map_or(Vec3::new(0.0, 0.0, model.info.bounds.max[2]), Vec3::from);
+                let eject = combat::eject_node(&model);
                 let cpu = CpuModel::build(hash, &model, 0);
-                if tx.send(Loaded::HandModel(hash, cpu, muzzle)).is_err() {
+                if tx
+                    .send(Loaded::HandModel(hash, cpu, muzzle, eject))
+                    .is_err()
+                {
                     return Ok(());
                 }
                 more += 1;
@@ -1933,8 +1939,8 @@ impl Scene {
             | Loaded::MissionVehicle(_, _, cpu)
             | Loaded::WorldVehicle(_, _, _, _, _, cpu)
             | Loaded::Person(_, cpu, _, _)
-            | Loaded::Weapon(_, cpu, _)
-            | Loaded::HandModel(_, cpu, _)
+            | Loaded::Weapon(_, cpu, _, _)
+            | Loaded::HandModel(_, cpu, _, _)
             | Loaded::Flight(_, cpu, _, _) => cpu,
         };
         let uploaded = self
@@ -2035,21 +2041,21 @@ impl Scene {
                     },
                 );
             }
-            Loaded::Weapon(name, _, muzzle) => {
+            Loaded::Weapon(name, _, muzzle, eject) => {
                 let rig = self
                     .player
                     .as_ref()
                     .and_then(|pl| pl.model.as_ref())
                     .map(|(_, rig)| rig);
-                self.arsenal.add(name, model, muzzle, rig);
+                self.arsenal.add(name, model, (muzzle, eject), rig);
             }
-            Loaded::HandModel(hash, _, muzzle) => {
+            Loaded::HandModel(hash, _, muzzle, eject) => {
                 let rig = self
                     .player
                     .as_ref()
                     .and_then(|pl| pl.model.as_ref())
                     .map(|(_, rig)| rig);
-                self.arsenal.add_model(hash, model, muzzle, rig);
+                self.arsenal.add_model(hash, model, (muzzle, eject), rig);
             }
             Loaded::Person(p, _, skeleton, named) => {
                 // The people's clips fit every human skeleton.

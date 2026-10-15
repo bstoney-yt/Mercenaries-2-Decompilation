@@ -214,7 +214,27 @@ pub struct GameAudio {
     shots_heard: HashSet<u32>,
     /// Shots heard with their own cue, and with the rifle's standing in.
     shots: (u32, u32),
+    /// Spinning guns firing now: their loop's voice ([`GunCues::spin`]).
+    spins: Vec<Spin>,
 }
+
+/// A spinning gun's loop playing ([`GunCues::spin`]): its sound set, who
+/// fires it, where, and when it last fired.
+#[derive(Clone, Copy, Debug)]
+struct Spin {
+    voice: VoiceId,
+    set: u32,
+    npc: bool,
+    at: Vec3,
+    last: Instant,
+}
+
+/// A spinning gun's loop stops this long after its last round, and plays
+/// its tail; seconds (invented: three of the minigun's 900-a-minute
+/// rounds and a frame's slack).
+const SPIN_HOLD: f32 = 0.25;
+/// Rounds this close to a loop playing are that gun's, metres (invented).
+const SPIN_SAME: f32 = 4.0;
 
 /// A sound key read: the key, and what it plays.
 type KeyLoad = (u32, Option<KeySounds>);
@@ -942,6 +962,7 @@ impl GameAudio {
             }),
             shots_heard: HashSet::new(),
             shots: (0, 0),
+            spins: Vec::new(),
         }
     }
 
@@ -1301,6 +1322,7 @@ impl GameAudio {
     /// Plays the fight's sounds where they happened.
     pub fn play_fight(&mut self, sounds: &[Sound]) {
         self.keys_loaded();
+        self.spins_stopped();
         for sound in sounds {
             let (i, at, gain) = match *sound {
                 Sound::Shot { at, set, npc } => {
@@ -1355,8 +1377,12 @@ impl GameAudio {
                         buffer.hash,
                         buffer.seconds()
                     );
-                    self.out
-                        .with(|m| m.play(Play::at(buffer, at).gain(found.volume)));
+                    let play = Play::at(buffer, at).gain(found.volume);
+                    let play = match found.falloff {
+                        Some(f) => play.falloff(f),
+                        None => play,
+                    };
+                    self.out.with(|m| m.play(play));
                 }
             }
             Some(None) => eprintln!("sound: break, key {key:08x}: nothing found for it, silent"),
@@ -1378,6 +1404,9 @@ impl GameAudio {
     /// rifle's shot stands in. A cue not yet read is read on a thread.
     fn play_shot(&mut self, at: Vec3, set: Option<u32>, npc: bool) -> bool {
         let Some(set) = set else { return false };
+        if let Some(cue) = self.gun_cues.spin(set, npc) {
+            return self.spin(cue, set, npc, at);
+        }
         let own = self.gun_cues.shot(set, npc);
         let hero = npc
             .then(|| self.gun_cues.cue(set, m2_engine::gun_sounds::FIRE))
@@ -1398,8 +1427,14 @@ impl GameAudio {
                             buffer.seconds()
                         );
                     }
-                    self.out
-                        .with(|m| m.play(Play::at(buffer, at).gain(found.volume)));
+                    // As far as its cue's record carries (the carbine's 29
+                    // to 1000 m), else the mixer's default.
+                    let play = Play::at(buffer, at).gain(found.volume);
+                    let play = match found.falloff {
+                        Some(f) => play.falloff(f),
+                        None => play,
+                    };
+                    self.out.with(|m| m.play(play));
                     return true;
                 }
                 Some(None) => {}
@@ -1414,6 +1449,98 @@ impl GameAudio {
             }
         }
         false
+    }
+
+    /// A spinning gun of sound set `set` fired a round at `at`: its loop
+    /// (`cue`) plays on, moved to `at`, or starts. Whether it is heard.
+    fn spin(&mut self, cue: u32, set: u32, npc: bool, at: Vec3) -> bool {
+        let now = Instant::now();
+        if let Some(s) = self
+            .spins
+            .iter_mut()
+            .find(|s| s.set == set && s.npc == npc && s.at.distance(at) < SPIN_SAME)
+        {
+            s.at = at;
+            s.last = now;
+            let voice = s.voice;
+            self.out.with(|m| m.set_position(voice, at));
+            return true;
+        }
+        match self.keys.get(&cue) {
+            Some(Some(found)) => {
+                let found = found.clone();
+                let Some(buffer) = found.pick(0.0).cloned() else {
+                    return false;
+                };
+                if self.shots_heard.insert(cue) {
+                    eprintln!(
+                        "sound: spin, set {set:08x}{}, loop {cue:08x}: sound {:08x} ({:.2} s)",
+                        if npc { " (not the hero)" } else { "" },
+                        buffer.hash,
+                        buffer.seconds()
+                    );
+                }
+                let play = Play::at(buffer, at).looped().gain(found.volume);
+                let play = match found.falloff {
+                    Some(f) => play.falloff(f),
+                    None => play,
+                };
+                let voice = self.out.with(|m| m.play(play));
+                self.spins.push(Spin {
+                    voice,
+                    set,
+                    npc,
+                    at,
+                    last: now,
+                });
+                true
+            }
+            Some(None) => false,
+            None => {
+                if self.install.is_none() {
+                    self.keys.insert(cue, None);
+                } else {
+                    self.ask_key(cue);
+                }
+                false
+            }
+        }
+    }
+
+    /// Stops the loops of guns that stopped firing, each with its tail
+    /// (`weapon_fire_tail`), where read.
+    fn spins_stopped(&mut self) {
+        let now = Instant::now();
+        let (done, going): (Vec<Spin>, Vec<Spin>) = self
+            .spins
+            .drain(..)
+            .partition(|s| now.duration_since(s.last).as_secs_f32() > SPIN_HOLD);
+        self.spins = going;
+        for s in done {
+            self.out.with(|m| m.stop(s.voice));
+            let Some(tail) = self.gun_cues.cue(s.set, m2_engine::gun_sounds::FIRE_TAIL) else {
+                continue;
+            };
+            match self.keys.get(&tail) {
+                Some(Some(found)) => {
+                    let found = found.clone();
+                    if let Some(buffer) = found.pick(0.0).cloned() {
+                        let play = Play::at(buffer, s.at).gain(found.volume);
+                        let play = match found.falloff {
+                            Some(f) => play.falloff(f),
+                            None => play,
+                        };
+                        self.out.with(|m| m.play(play));
+                    }
+                }
+                Some(None) => {}
+                None => {
+                    if self.install.is_some() {
+                        self.ask_key(tail);
+                    }
+                }
+            }
+        }
     }
 
     /// Starts reading what sound key `key` plays on a thread, once.
