@@ -344,6 +344,11 @@ pub struct Templates {
     /// Each template's parts' health and the part that burns, by id
     /// ([`crate::vehicle_damage::read`]).
     pub part_healths: HashMap<u32, crate::vehicle_damage::PartHealths>,
+    /// The mixer profile each person template's `ModelMixerProfile`
+    /// names (`VZ Soldier`, `VZ Officer`: which of its model's parts it
+    /// may wear, [`m2_assets::mixer`]), by name, lower case, where it
+    /// names one; of twins by name, the lowest id's that names one.
+    pub mixer_profiles: HashMap<String, u32>,
 }
 
 impl Templates {
@@ -724,10 +729,18 @@ impl Templates {
         // `id`.
         let mut order: Vec<(u32, &str)> = names.iter().map(|(&id, &n)| (id, n)).collect();
         order.sort_unstable_by_key(|&(id, _)| std::cmp::Reverse(id));
+        let profiles = db.hashes("ModelMixerProfile");
         let templates = Self {
             by_name: order
                 .iter()
                 .map(|&(id, name)| (name.to_ascii_lowercase(), infos[&id]))
+                .collect(),
+            mixer_profiles: order
+                .iter()
+                .filter_map(|&(id, name)| {
+                    let p = profiles.get(&id).copied().filter(|&p| p != 0)?;
+                    Some((name.to_ascii_lowercase(), p))
+                })
                 .collect(),
             infos,
             names: names

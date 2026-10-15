@@ -687,6 +687,10 @@ pub struct Npc {
     /// Set by a tick when a soldier throws a grenade, at where; the
     /// fight lobs it.
     pub throws: Option<Vec3>,
+    /// Their look: per node of their model, hidden (the heads, bodies
+    /// and kit their mixer didn't pick, [`People::dress`]); empty for the
+    /// model's own.
+    pub outfit: Vec<bool>,
     grenade_wait: f32,
     /// The smarter soldiers' settings (off: the original's).
     pub smart: SmarterAi,
@@ -780,6 +784,7 @@ impl Npc {
             step: None,
             step_wait: 0.0,
             throws: None,
+            outfit: Vec::new(),
             grenade_wait: 0.0,
             smart: SmarterAi::default(),
             spotted: false,
@@ -1440,6 +1445,12 @@ pub struct People {
     pub smarter: SmarterAi,
     /// What soldiers near her have been at (for checking).
     pub idle: IdleTally,
+    /// Each person template's mixer profile, by name, lower case
+    /// ([`m2_engine::world::Templates::mixer_profiles`]).
+    pub mixer_profiles: HashMap<String, u32>,
+    /// The looks spawned so far, each by kind and parts picked (for
+    /// checking: each new one is said once).
+    pub looks_seen: HashSet<(usize, Vec<usize>)>,
 }
 
 /// Soldier-seconds near her, by what the soldiers were at (for checking
@@ -2151,9 +2162,46 @@ impl People {
             } else {
                 s.gun.or(self.kinds[kind].gun)
             };
+            npc.outfit = self.dress(kind, s);
             self.tell(s, &npc);
             self.npcs.push(npc);
         }
+    }
+
+    /// A look for one of kind `kind` spawned at `s`: of the parts their
+    /// template's `ModelMixerProfile` lets them wear in their model (every
+    /// part, for a template naming none or one the model lacks), a random
+    /// pick ([`m2_engine::Looks::pick`]); empty (the model's own) for a
+    /// model with no mixer. Each new look is said once.
+    fn dress(&mut self, kind: usize, s: &SpawnPoint) -> Vec<bool> {
+        let k = &self.kinds[kind];
+        let Some(looks) = k.model.looks.clone() else {
+            return Vec::new();
+        };
+        let template = if k.named {
+            k.role.clone()
+        } else {
+            s.template.clone().unwrap_or_else(|| s.name.clone())
+        };
+        let model = k.model.hash;
+        let profile = self
+            .mixer_profiles
+            .get(&template.to_ascii_lowercase())
+            .copied();
+        let rng = &mut self.rng;
+        let (picked, hidden) = looks.pick(profile, |n| {
+            ((rng.next() * n as f32) as usize).min(n.saturating_sub(1))
+        });
+        let has = profile.is_some_and(|p| looks.mixer.profiles.iter().any(|x| x.0 == p));
+        if self.looks_seen.insert((kind, picked.clone())) {
+            eprintln!(
+                "look: {template:?} in {model:08x}, profile {} ({}): parts {picked:?}; {} looks so far",
+                profile.map_or_else(|| "none".to_owned(), |p| format!("{p:08x}")),
+                if has { "its own" } else { "every part" },
+                self.looks_seen.len()
+            );
+        }
+        hidden
     }
 
     /// Says whom spawn `s` first stands as, once per kind and template:
@@ -2272,6 +2320,7 @@ pub(crate) mod tests {
             sinks: Vec::new(),
             breakup: None,
             parts: None,
+            looks: None,
         };
         let mut backend = m2_render::NullBackend::default();
         let mut materials = m2_engine::MaterialCache::new();

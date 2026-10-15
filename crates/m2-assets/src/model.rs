@@ -11,8 +11,9 @@
 //! TINY  u32 n + u32 * n                (optional) per sub-object, the layer entity it is
 //! BSHP  8 bytes per blend shape         (optional) {u32 name hash, u32 0}
 //! SEGM  4 bytes per segment             {u16 node, u8 geometry slot, u8 LOD mask}
-//! PHY2, STAM/, MIXR/                    (optional) collision, state machine and
-//!                                       animation mixer; not decoded here
+//! PHY2, STAM/                          (optional) collision and state machine
+//! MIXR/                                (optional) the parts a person model
+//!                                       mixes into looks ([`mixer`](crate::mixer))
 //! GEOM/ INFO   u32 geometry count
 //!       INDX   u16 geometry slot per geometry
 //!       MESH/ | SKIN/ | TINY/  one per geometry:
@@ -132,6 +133,7 @@ use m2_render::{BufferUsage, VertexBufferDesc, VertexLayout};
 use m2_render::{Geometry as Draw, IndexBufferDesc, IndexBufferHandle, IndexFormat, Topology};
 
 use crate::bytes::{OutOfBounds, Reader};
+use crate::mixer::Mixer;
 use crate::ucfx::{Ucfx, UcfxError};
 use crate::vertex::{VertexDecl, VertexError, VertexStream};
 
@@ -1267,6 +1269,8 @@ pub struct Model<'a> {
     pub tiny: Option<&'a [u8]>,
     /// The parts the state machine (`STAM`) shows and hides, if any.
     pub states: Option<PartStates>,
+    /// The parts it mixes into looks (`MIXR`), if any.
+    pub mixer: Option<Mixer>,
     /// Indexed by geometry slot; `None` until its chunk is added.
     slots: Vec<Option<Geometry<'a>>>,
 }
@@ -1279,6 +1283,7 @@ impl<'a> Model<'a> {
         const NAMES: [[u8; 4]; 6] = [*b"INFO", *b"HIER", *b"MTRL", *b"SEGM", *b"BSHP", *b"TINY"];
         let mut geom = None;
         let mut stam = None;
+        let mut mixr = None;
         for c in u.children(None) {
             let sec = &u.sections()[c];
             match (sec.fourcc, sec.data) {
@@ -1288,7 +1293,8 @@ impl<'a> Model<'a> {
                 }
                 (cc, None) if &cc == b"GEOM" => geom = Some(c),
                 (cc, None) if &cc == b"STAM" => stam = Some(c),
-                // Collision and mixer data are not decoded here.
+                (cc, None) if &cc == b"MIXR" => mixr = Some(c),
+                // Collision is decoded on its own ([`physics`](crate::physics)).
                 (cc, _) if [*b"PHY2", *b"STAM", *b"MIXR"].contains(&cc) => {}
                 (found, _) => {
                     return Err(ModelError::UnexpectedSection {
@@ -1318,6 +1324,7 @@ impl<'a> Model<'a> {
             .collect();
 
         let states = stam.map(|c| PartStates::parse(&u, c, &nodes));
+        let mixer = mixr.and_then(|c| Mixer::parse(&u, c, &nodes));
         let mut model = Self {
             info,
             nodes,
@@ -1326,6 +1333,7 @@ impl<'a> Model<'a> {
             blend_shapes,
             tiny: sections[5],
             states,
+            mixer,
             slots: vec![None; info.slot_count as usize],
         };
         model.add_geom(&u, geom.ok_or(ModelError::MissingSection(*b"GEOM"))?)?;
