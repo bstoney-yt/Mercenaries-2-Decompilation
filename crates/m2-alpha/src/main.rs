@@ -1463,10 +1463,18 @@ fn screenshot(
         info.game = Some(gamehud::HudState::of(&mut game));
     }
     // The loading screen as at the start (`--loading-screen`): up from
-    // the first frame, run at 30 fps.
+    // the first frame, run at 30 fps. `M2_LOADING_HINT=n` shows hint `n`.
     let mut time = 1.0;
     if let Some(seconds) = options.loading_seconds {
         info.loading = Some("--loading-screen".into());
+        if let (Some(screen), Some(n)) = (
+            hud.loading.as_mut(),
+            std::env::var("M2_LOADING_HINT")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+        ) {
+            screen.cycle.show_next(n);
+        }
         let frames = (seconds * 30.0).round() as u32;
         for i in 0..frames {
             let t = f64::from(i) / 30.0;
