@@ -8,12 +8,16 @@
 //! What decides it, and how sure it is:
 //! - From the data: the roads' paths and junctions, the zones' outlines,
 //!   lists and priorities, the lists' weights, who rides in each vehicle
-//!   (`Rider`).
+//!   (`Rider`), each road's width (its record's box) and its kind's
+//!   `LaneData` strips.
 //! - Inferred from samples: that a zone's first count is how many
-//!   vehicles are out, and that the zone of highest priority rules.
-//! - Invented (no field decoded says): how far off they come and go, the
-//!   side of the road they keep to, their speed, and that they slow for
-//!   what is ahead.
+//!   vehicles are out, and that the zone of highest priority rules; that
+//!   a `LaneData` strip of kind 0 is a lane of traffic, its width a share
+//!   of the road's ([`m2_engine::population::RoadLanes`]): they drive the
+//!   middle of one of the lanes on the right, and only on roads with one
+//!   (not the sidewalks, curbs, walls and driveways placed as roads).
+//! - Invented (no field decoded says): how far off they come and go,
+//!   their speed, and that they slow for what is ahead.
 
 use std::collections::{HashMap, HashSet};
 
@@ -66,6 +70,9 @@ struct Car {
     road: usize,
     forward: bool,
     next: usize,
+    /// Which of the road's lanes on its right it keeps to, inner first
+    /// (the outermost there is, where a road has fewer).
+    lane: usize,
     /// Seconds it has stood waiting for what is ahead.
     waited: f32,
     /// Seconds it has hardly moved (stuck on something).
@@ -205,13 +212,16 @@ impl RoadTraffic {
                 break;
             };
             let r = &index.roads[road];
-            let (at, dir) = lane(r, s, forward);
+            let lanes = r.lane_offsets().len().max(1);
+            let pick = ((self.roll() * lanes as f32) as usize).min(lanes - 1);
+            let (at, dir) = lane(r, s, forward, pick);
             let yaw = dir.x.atan2(dir.z);
             let next = next_point(&r.points, s, forward);
             let car = Car {
                 road,
                 forward,
                 next,
+                lane: pick,
                 waited: 0.0,
                 stuck: 0.0,
             };
@@ -281,7 +291,7 @@ impl RoadTraffic {
         focus: Vec3,
     ) -> Option<(usize, bool, f32, u32)> {
         let mut spots: Vec<(usize, f32, u32)> = Vec::new();
-        for (i, r) in roads.iter().enumerate() {
+        for (i, r) in roads.iter().enumerate().filter(|(_, r)| r.drivable()) {
             let mut along = 0.0;
             for w in r.points.windows(2) {
                 let d = flat(w[0] - focus).length();
@@ -345,7 +355,7 @@ impl RoadTraffic {
             // Along the road to its end, then on at the junction there.
             for _ in 0..4 {
                 let r = &roads[car.road];
-                let target = lane_point(r, car.next, car.forward);
+                let target = lane_point(r, car.next, car.forward, car.lane);
                 if flat(target - here).length() >= ARRIVE {
                     break;
                 }
@@ -357,7 +367,7 @@ impl RoadTraffic {
                 }
             }
             let r = &roads[car.road];
-            let mut target = lane_point(r, car.next, car.forward);
+            let mut target = lane_point(r, car.next, car.forward, car.lane);
             let forward = flat(at.transform_vector3(Vec3::Z)).normalize_or_zero();
             let top = v.spec.tuning.max_speed.unwrap_or(DEFAULT_TOP);
             let speed = physics.vehicle_speed(id);
@@ -433,6 +443,9 @@ impl RoadTraffic {
                         continue;
                     }
                     let other = &roads[k];
+                    if !other.drivable() {
+                        continue;
+                    }
                     let first = flat(other.points[0] - port).length();
                     let last = flat(other.points[other.points.len() - 1] - port).length();
                     ways.push((k, first <= last));
@@ -451,6 +464,7 @@ impl RoadTraffic {
                 } else {
                     1.min(last)
                 },
+                lane: car.lane,
                 waited: 0.0,
                 stuck: 0.0,
             };
@@ -466,6 +480,7 @@ impl RoadTraffic {
             } else {
                 last.saturating_sub(1)
             },
+            lane: car.lane,
             waited: 0.0,
             stuck: 0.0,
         }
@@ -486,13 +501,16 @@ impl RoadTraffic {
                 let at =
                     v.id.and_then(|id| physics.vehicle_transform(id))
                         .map(|m| m.w_axis.truncate())?;
+                let road = roads.get(car.road)?;
                 Some(format!(
-                    "  {} {e:#x} on road {:#x}: at ({:.0}, {:.0}, {:.0}), {:.1} m/s{}{}",
+                    "  {} {e:#x} on road {:#x} ({:.0} m wide): at ({:.0}, {:.0}, {:.0}), {:.1} m off its line, {:.1} m/s{}{}",
                     v.spec.label,
-                    roads.get(car.road).map_or(0, |r| r.entity),
+                    road.entity,
+                    road.width,
                     at.x,
                     at.y,
                     at.z,
+                    off_line(&road.points, at),
                     v.id.map_or(0.0, |id| physics.vehicle_speed(id)),
                     if v.wrecked { ", wrecked" } else { "" },
                     if self.taken.contains(&e) {
@@ -510,28 +528,46 @@ fn flat(v: Vec3) -> Vec2 {
     Vec2::new(v.x, v.z)
 }
 
+/// How far `at` is from a road's line, on the ground, metres.
+fn off_line(points: &[Vec3], at: Vec3) -> f32 {
+    points
+        .windows(2)
+        .map(|w| {
+            let (a, b, p) = (flat(w[0]), flat(w[1]), flat(at));
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+            (p - (a + ab * t)).length()
+        })
+        .fold(f32::MAX, f32::min)
+}
+
 /// The right-hand side of a road going `dir` (level, unit): for a vehicle
 /// facing +z, +x is its left.
 fn right_of(dir: Vec3) -> Vec3 {
     Vec3::new(-dir.z, 0.0, dir.x)
 }
 
-/// How far right of a road's middle its traffic keeps: the middle of the
-/// right half (invented: one lane each way).
-fn keep_right(road: &Road) -> f32 {
-    road.width / 4.0
+/// How far right of a road's middle its traffic in lane `lane` keeps
+/// ([`Road::lane_offsets`]; the outermost where it has fewer).
+fn keep_right(road: &Road, lane: usize) -> f32 {
+    let lanes = road.lane_offsets();
+    lanes
+        .get(lane)
+        .or(lanes.last())
+        .copied()
+        .unwrap_or(road.width / 4.0)
 }
 
-/// Where on road `road`, `s` metres along, a vehicle going `forward`
-/// drives, and its way there.
-fn lane(road: &Road, s: f32, forward: bool) -> (Vec3, Vec3) {
+/// Where on road `road`, `s` metres along, a vehicle going `forward` in
+/// lane `n` drives, and its way there.
+fn lane(road: &Road, s: f32, forward: bool, n: usize) -> (Vec3, Vec3) {
     let (at, dir) = m2_engine::world::point_along(&road.points, s);
     let dir = if forward { dir } else { -dir };
-    (at + right_of(dir) * keep_right(road), dir)
+    (at + right_of(dir) * keep_right(road, n), dir)
 }
 
-/// Point `i` of a road, moved to the lane of traffic going `forward`.
-fn lane_point(road: &Road, i: usize, forward: bool) -> Vec3 {
+/// Point `i` of a road, moved to lane `n` of traffic going `forward`.
+fn lane_point(road: &Road, i: usize, forward: bool, n: usize) -> Vec3 {
     let p = &road.points;
     let last = p.len() - 1;
     let (a, b) = if i < last {
@@ -543,7 +579,7 @@ fn lane_point(road: &Road, i: usize, forward: bool) -> Vec3 {
     if !forward {
         dir = -dir;
     }
-    p[i] + right_of(dir) * keep_right(road)
+    p[i] + right_of(dir) * keep_right(road, n)
 }
 
 /// The first point of a road past `s` metres along it going `forward`.
@@ -573,6 +609,9 @@ mod tests {
             layer: 0,
             points: points.iter().map(|&(x, z)| Vec3::new(x, 0.0, z)).collect(),
             width: 8.0,
+            kind: 0,
+            lanes: None,
+            named_road: true,
         }
     }
 
@@ -580,11 +619,38 @@ mod tests {
     fn traffic_keeps_to_the_right() {
         // Going +z, the right is -x; going back, +x.
         let r = road(1, &[(0.0, 0.0), (0.0, 100.0)]);
-        let (at, dir) = lane(&r, 50.0, true);
+        let (at, dir) = lane(&r, 50.0, true, 0);
         assert_eq!((at, dir), (Vec3::new(-2.0, 0.0, 50.0), Vec3::Z));
-        let (at, dir) = lane(&r, 50.0, false);
+        let (at, dir) = lane(&r, 50.0, false, 0);
         assert_eq!((at, dir), (Vec3::new(2.0, 0.0, 50.0), Vec3::NEG_Z));
-        assert_eq!(lane_point(&r, 1, true), Vec3::new(-2.0, 0.0, 100.0));
+        assert_eq!(lane_point(&r, 1, true, 0), Vec3::new(-2.0, 0.0, 100.0));
+    }
+
+    #[test]
+    fn traffic_drives_the_lanes_the_data_gives_and_not_the_sidewalks() {
+        use m2_engine::population::RoadLanes;
+        // A `commercial_road20`: 22 m each side by its box; median 4,
+        // two lanes of 7.5, walkway 4 (shares of the 22).
+        let mut r = road(1, &[(0.0, 0.0), (0.0, 100.0)]);
+        r.width = 44.0;
+        r.named_road = false;
+        r.lanes = Some(RoadLanes {
+            strips: [(2, 4.0), (0, 7.5), (0, 7.5), (1, 4.0)],
+            direction: None,
+        });
+        let x = |n| lane(&r, 50.0, true, n).0.x;
+        assert!((x(0) + 22.0 * 7.75 / 23.0).abs() < 1e-4, "{}", x(0));
+        assert!((x(1) + 22.0 * 15.25 / 23.0).abs() < 1e-4, "{}", x(1));
+        // A lane it hasn't: the outermost.
+        assert_eq!(x(5), x(1));
+        // A sidewalk: one walkway strip, no traffic.
+        r.lanes = Some(RoadLanes {
+            strips: [(1, 10.0), (3, 5.0), (3, 5.0), (3, 5.0)],
+            direction: None,
+        });
+        assert!(!r.drivable());
+        assert!(r.lane_offsets().is_empty());
+        assert_eq!(r.walk_offsets(), vec![11.0]);
     }
 
     #[test]
@@ -621,6 +687,7 @@ mod tests {
             road: 0,
             forward: true,
             next: 1,
+            lane: 0,
             waited: 0.0,
             stuck: 0.0,
         };
@@ -636,6 +703,7 @@ mod tests {
             road: 1,
             forward: true,
             next: 1,
+            lane: 0,
             waited: 0.0,
             stuck: 0.0,
         };

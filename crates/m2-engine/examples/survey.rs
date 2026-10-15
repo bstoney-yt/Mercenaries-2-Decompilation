@@ -139,6 +139,14 @@
 //!                           hash): each 4-byte word, 8 a line, as a name,
 //!                           a float or hex
 //! find:<hash>[,..]          names for hashes
+//! roadboxes                 every placed road by kind (its record's name
+//!                           hash at 4): its template's `LaneData`
+//!                           strips, and how far its record's box reaches
+//!                           past its path (median, most; a few samples)
+//! traffic                   what the alpha makes of the roads: widths,
+//!                           which carry traffic and in which lanes, and
+//!                           the passers-by placed and how far off their
+//!                           road's line they walk
 //! hijack                    every template that can be hijacked: its
 //!                           entrances' template, script, point, radius
 //!                           and flag, and whether vz.wad has the script
@@ -1036,6 +1044,13 @@ fn main() -> Result<(), Error> {
                 phy2_census(&mut source, world.as_ref().expect("just built"), &names)
             }
             "phy2rules" => phy2_rules(&mut source),
+            "traffic" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                traffic_census(world.as_ref().expect("just built"));
+                Ok(())
+            }
             "hijack" => {
                 if world.is_none() {
                     world = Some(WorldIndex::build(&mut source)?);
@@ -1046,6 +1061,7 @@ fn main() -> Result<(), Error> {
             "vo" => vo_lines(&install, arg),
             "scan" => scan_words(&install, &names, arg),
             "dump" => dump_assets(&mut source, &names, arg),
+            "roadboxes" => road_boxes(&mut source, &names),
             "engines" => engines(&mut source, &names, arg),
             "vehicle" => vehicles(&mut source, &mut lazy, &names, arg),
             "templates" => templates(&mut source, &names, arg),
@@ -8708,4 +8724,208 @@ fn effect_detail(names: &Names, fx: &m2_assets::effect::Effect) {
     for f in &fx.forces {
         println!("    force {}", show(f));
     }
+}
+
+/// Every placed `Road`, by the hash at 4 (the road kind's name without
+/// its leading underscore, `commercial_road10`): how many, and the two
+/// vectors at 16 and 28 against the extent of the road's own path (in the
+/// entity's space), to tell what those vectors measure.
+fn road_boxes<R: Read + Seek>(source: &mut AssetSource<R>, names: &Names) -> Result<(), Error> {
+    let index = source.archive().index();
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let f = |r: &[u8], o: usize| {
+        r.get(o..o + 4)
+            .map_or(f32::NAN, |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let w = |r: &[u8], o: usize| {
+        r.get(o..o + 4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    // (kind, path, box at 16, box at 28)
+    let mut roads: Vec<(u32, u32, Vec3, Vec3)> = Vec::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(layer) = Layer::parse(data) else {
+                continue;
+            };
+            for c in layer.components.iter().filter(|c| c.name == "Road") {
+                for (_, r) in c.records().unwrap_or_default() {
+                    let v = |o: usize| Vec3::new(f(r, o), f(r, o + 4), f(r, o + 8));
+                    roads.push((w(r, 4), w(r, 0), v(16), v(28)));
+                }
+            }
+        }
+    }
+    // The road kinds' templates: name hash without the leading underscore
+    // -> (name, LaneData strips as (type, width)).
+    let mut kind_names: HashMap<u32, (String, Vec<(u32, f32)>)> = HashMap::new();
+    let index = source.archive().index();
+    let db_hash = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash);
+    if let Some(h) = db_hash {
+        let data = source.asset(h, TEMPLATE_DB_TYPE)?;
+        let db = Layer::parse(&data)?;
+        let lanes: HashMap<u32, Vec<(u32, f32)>> = db
+            .component("LaneData")
+            .map(|c| {
+                c.records()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, r)| {
+                        let strips = (0..4).map(|i| (w(r, i * 16), f(r, i * 16 + 8))).collect();
+                        (id, strips)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (id, n) in db.names() {
+            let key = m2_assets::name_hash(n.trim_start_matches('_'));
+            kind_names
+                .entry(key)
+                .or_insert_with(|| (n.to_string(), lanes.get(&id).cloned().unwrap_or_default()));
+        }
+    }
+    let mut kinds: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    // Per kind, each road's widest spread of its box past its path.
+    let mut spreads: HashMap<u32, Vec<f32>> = HashMap::new();
+    for &(kind, path, lo, hi) in &roads {
+        *counts.entry(kind).or_default() += 1;
+        let points: Vec<Vec3> = source
+            .asset(path, m2_assets::path::PATH_TYPE)
+            .ok()
+            .and_then(|d| m2_assets::Path::parse(&d).ok())
+            .map(|p| p.points.into_iter().map(Vec3::from).collect())
+            .unwrap_or_default();
+        if !points.is_empty() {
+            let (mut a, mut b) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for p in &points {
+                a = a.min(*p);
+                b = b.max(*p);
+            }
+            let spread = (a.x - lo.x).max(hi.x - b.x).max(a.z - lo.z).max(hi.z - b.z);
+            spreads.entry(kind).or_default().push(spread);
+        }
+        let lines = kinds.entry(kind).or_default();
+        if lines.len() >= 3 {
+            continue;
+        }
+        let points: Vec<Vec3> = source
+            .asset(path, m2_assets::path::PATH_TYPE)
+            .ok()
+            .and_then(|d| m2_assets::Path::parse(&d).ok())
+            .map(|p| p.points.into_iter().map(Vec3::from).collect())
+            .unwrap_or_default();
+        let (mut pmin, mut pmax) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for p in &points {
+            pmin = pmin.min(*p);
+            pmax = pmax.max(*p);
+        }
+        lines.push(format!(
+            "    box ({:.2} {:.2} {:.2})..({:.2} {:.2} {:.2})  path {} pts ({:.2} {:.2} {:.2})..({:.2} {:.2} {:.2})",
+            lo.x, lo.y, lo.z, hi.x, hi.y, hi.z, points.len(), pmin.x, pmin.y, pmin.z, pmax.x, pmax.y, pmax.z
+        ));
+    }
+    println!("{} roads, {} kinds", roads.len(), kinds.len());
+    for (kind, lines) in &kinds {
+        let (name, lanes) = kind_names.get(kind).cloned().unwrap_or_default();
+        let mut sp = spreads.get(kind).cloned().unwrap_or_default();
+        sp.sort_by(f32::total_cmp);
+        let (med, max) = (
+            sp.get(sp.len() / 2).copied().unwrap_or(f32::NAN),
+            sp.last().copied().unwrap_or(f32::NAN),
+        );
+        let strips: Vec<String> = lanes.iter().map(|(t, w)| format!("{t}:{w}")).collect();
+        println!(
+            "  {kind:08x} {} x{} ({name}) spread median {med:.2} max {max:.2} lanes [{}]",
+            names.show(*kind),
+            counts[kind],
+            strips.join(" ")
+        );
+        for l in lines {
+            println!("{l}");
+        }
+    }
+    Ok(())
+}
+
+/// What the alpha makes of the island's roads for traffic and passers-by:
+/// how many roads, how wide (a histogram by metre), how many carry
+/// vehicle lanes and how far off the line they drive, and the passers-by
+/// placed (how many, how far off their road's line they walk).
+fn traffic_census(world: &WorldIndex) {
+    let roads = &world.roads;
+    let mut widths: BTreeMap<i32, usize> = BTreeMap::new();
+    for r in roads {
+        *widths.entry(r.width.round() as i32).or_default() += 1;
+    }
+    let length: f32 = roads
+        .iter()
+        .map(|r| m2_engine::world::path_length(&r.points))
+        .sum();
+    println!(
+        "roads {} ({:.0} km), widths (m: roads) {widths:?}",
+        roads.len(),
+        length / 1000.0
+    );
+    let driven: Vec<&m2_engine::world::Road> = roads.iter().filter(|r| r.drivable()).collect();
+    let mut lanes: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &driven {
+        let key = r
+            .lane_offsets()
+            .iter()
+            .map(|o| format!("{o:.1}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        *lanes.entry(key).or_default() += 1;
+    }
+    let driven_km: f32 = driven
+        .iter()
+        .map(|r| m2_engine::world::path_length(&r.points))
+        .sum::<f32>()
+        / 1000.0;
+    println!(
+        "drivable roads {} ({driven_km:.0} km); lane offsets (m: roads) {lanes:?}",
+        driven.len()
+    );
+    let walkers: Vec<&m2_engine::world::SpawnPoint> = world
+        .spawns
+        .iter()
+        .filter(|s| m2_engine::world::is_walker(s.entity))
+        .collect();
+    let mut outs: BTreeMap<i32, usize> = BTreeMap::new();
+    for w in &walkers {
+        // How far off the nearest road line its route starts.
+        let at = w.position;
+        let d = roads
+            .iter()
+            .flat_map(|r| r.points.windows(2))
+            .map(|s| {
+                let (a, b) = (s[0], s[1]);
+                let ab = Vec3::new(b.x - a.x, 0.0, b.z - a.z);
+                let ap = Vec3::new(at.x - a.x, 0.0, at.z - a.z);
+                let t = (ap.dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                (ap - ab * t).length()
+            })
+            .fold(f32::MAX, f32::min);
+        *outs.entry(d.round() as i32).or_default() += 1;
+    }
+    println!(
+        "passers-by {}; off the nearest road line (m: walkers) {outs:?}",
+        walkers.len()
+    );
 }
