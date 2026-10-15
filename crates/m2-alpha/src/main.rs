@@ -219,6 +219,11 @@ struct Options {
     /// With `--screenshot`: the picture is of the loading screen this many
     /// seconds after it came up (as at the start, the island loading).
     loading_seconds: Option<f64>,
+    /// With `--screenshot`: the loading screen comes up over the world
+    /// (its wipe plays) and the picture is this many seconds after; with
+    /// a second number the screen is let go then (its wipe back plays)
+    /// and the picture is that many seconds later.
+    loading_wipe: Option<(f64, Option<f64>)>,
     /// With `--screenshot` on foot: call a Satellite Guided Bomb on the
     /// spot ahead of her, the picture with the support menu open (menu),
     /// through the satellite's view, with the timing wheel up, or after
@@ -507,6 +512,19 @@ fn parse_args() -> anyhow::Result<Options> {
                         .parse()
                         .context("--loading-screen expects seconds")?,
                 )
+            }
+            "--loading-wipe" => {
+                let v = value()?;
+                let mut parts = v.split(',').map(str::parse::<f64>);
+                let up = parts
+                    .next()
+                    .and_then(Result::ok)
+                    .context("--loading-wipe expects seconds[,seconds]")?;
+                let out = parts
+                    .next()
+                    .transpose()
+                    .context("--loading-wipe expects seconds[,seconds]")?;
+                o.loading_wipe = Some((up, out));
             }
             "--weapon" => {
                 o.weapon = Some(match value()?.as_str() {
@@ -1455,6 +1473,32 @@ fn screenshot(
             let _ = hud.build(ui::headless_input(w, h, t), &info, &mut settings);
         }
         time = f64::from(frames) / 30.0;
+    }
+    // The wipes (`--loading-wipe`): a frame without the screen first, so
+    // it comes up over the world, not over black. `M2_WIPE_EVERY` also
+    // writes each frame on the way (`<picture>.fNNN.ppm`).
+    if let Some((up, out_seconds)) = options.loading_wipe {
+        let every = std::env::var_os("M2_WIPE_EVERY").is_some();
+        info.loading = None;
+        let _ = hud.build(ui::headless_input(w, h, 0.0), &info, &mut settings);
+        info.loading = Some("--loading-wipe".into());
+        let frames_up = (up * 30.0).round() as u32;
+        let frames = frames_up + out_seconds.map_or(0, |s| (s * 30.0).round() as u32);
+        for i in 1..=frames {
+            if i == frames_up + 1 {
+                info.loading = None;
+            }
+            let _ = hud.build(
+                ui::headless_input(w, h, f64::from(i) / 30.0),
+                &info,
+                &mut settings,
+            );
+            if every {
+                render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;
+                write_ppm(&backend, &out.with_extension(format!("f{i:03}.ppm")))?;
+            }
+        }
+        time = f64::from(frames + 1) / 30.0;
     }
     let _ = hud.build(ui::headless_input(w, h, time), &info, &mut settings);
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;

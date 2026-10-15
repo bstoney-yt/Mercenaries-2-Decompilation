@@ -21,7 +21,8 @@ use std::rc::Rc;
 
 use super::text::{EditText, Font, FontBook, layout};
 use super::{
-    Bits, ColourTransform, Image, Matrix, Shape, ShapeTriangle, Triangle, bounds, draw_shape, tags,
+    Bits, ColourTransform, Corners, Image, Matrix, Shape, ShapeTriangle, Triangle, bounds,
+    draw_shape, tags,
 };
 use crate::gfx::{Character, Movie, tag};
 
@@ -976,20 +977,27 @@ impl Player {
                 clip,
             );
         }
-        // Masks under way among the children: up to which depth, the box.
-        let mut masks: Vec<(i32, [f32; 4])> = Vec::new();
+        // Masks under way among the children: up to which depth, the box
+        // round the mask and its triangles. What they cover shows through
+        // its own shape, not its box (the loading screen's wipe is a
+        // ragged edge, from the movie).
+        let mut masks: Vec<(i32, [f32; 4], Vec<Corners>)> = Vec::new();
         for (&depth, &child) in &c.children {
-            masks.retain(|(to, _)| depth <= *to);
+            masks.retain(|(to, ..)| depth <= *to);
             let Some(k) = self.clip(child) else { continue };
             if let Some(to) = k.clip_depth {
                 let mut shape = Vec::new();
                 self.draw_clip(child, &m, &col, None, fonts, &mut shape, nesting + 1);
-                if let Some(b) = bounds(&shape) {
-                    masks.push((to, b));
-                }
+                // An empty mask shows nothing (Flash's rule).
+                let b = bounds(&shape).unwrap_or([0.0, 0.0, -1.0, -1.0]);
+                masks.push((to, b, shape.iter().map(|t| t.corners).collect()));
                 continue;
             }
-            let inner = masks.iter().fold(clip, |acc, (_, b)| {
+            if masks.is_empty() {
+                self.draw_clip(child, &m, &col, clip, fonts, out, nesting + 1);
+                continue;
+            }
+            let inner = masks.iter().fold(clip, |acc, (_, b, _)| {
                 Some(match acc {
                     Some(a) => [
                         a[0].max(b[0]),
@@ -1000,7 +1008,16 @@ impl Player {
                     None => *b,
                 })
             });
-            self.draw_clip(child, &m, &col, inner, fonts, out, nesting + 1);
+            if inner.is_some_and(|b| b[0] > b[2] || b[1] > b[3]) {
+                continue;
+            }
+            // Cut to the boxes first (cheap), then to each mask's shape.
+            let mut part = Vec::new();
+            self.draw_clip(child, &m, &col, inner, fonts, &mut part, nesting + 1);
+            for (_, _, tris) in &masks {
+                part = super::cut_to_mask(&part, tris);
+            }
+            out.extend(part);
         }
         // Multiply: each triangle multiplies what is under it (as the
         // whole would, where they do not overlap).

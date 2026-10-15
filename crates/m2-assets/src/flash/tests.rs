@@ -345,6 +345,47 @@ fn a_mask_clips_what_it_masks() {
     assert_eq!(bounds(&whole).unwrap(), [30.0, 0.0, 50.0, 20.0]);
 }
 
+#[test]
+fn a_mask_shows_through_its_shape_not_its_box() {
+    // A 20 px textured square (uv = corners / 20) under a mask that is the
+    // square's lower-left half, as two triangles of a shape's mesh.
+    let square = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| Triangle {
+        corners: [a, b, c],
+        uv: [a, b, c].map(|p| [p[0] / 20.0, p[1] / 20.0]),
+        colour: [1.0; 4],
+        texture: Some("t".into()),
+        multiply: true,
+    };
+    let content = [
+        square([0.0, 0.0], [20.0, 0.0], [20.0, 20.0]),
+        square([0.0, 0.0], [20.0, 20.0], [0.0, 20.0]),
+    ];
+    let mask = [
+        [[0.0, 0.0], [10.0, 10.0], [0.0, 20.0]],
+        [[0.0, 20.0], [20.0, 20.0], [10.0, 10.0]],
+    ];
+    let cut = super::cut_to_mask(&content, &mask);
+    let area: f32 = cut
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.corners;
+            ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0
+        })
+        .sum();
+    // Half the square (its box would have let all 400 through).
+    assert!((area - 200.0).abs() < 1e-3, "area {area}");
+    for t in &cut {
+        for (p, uv) in t.corners.iter().zip(t.uv) {
+            // Nothing above the diagonal; texture kept where it was.
+            assert!(p[1] >= p[0] - 1e-4, "{p:?} outside the mask");
+            assert!((uv[0] - p[0] / 20.0).abs() < 1e-5 && (uv[1] - p[1] / 20.0).abs() < 1e-5);
+        }
+        assert!(t.multiply && t.texture.as_deref() == Some("t"));
+    }
+    // Nothing under an empty mask.
+    assert!(super::cut_to_mask(&content, &[]).is_empty());
+}
+
 // ---- ActionScript ---------------------------------------------------------
 
 /// Assembles action bytes.
