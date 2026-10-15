@@ -935,6 +935,7 @@ mod tests {
             hull: (Vec3::new(-1.8, 0.0, -3.3), Vec3::new(1.8, 1.5, 3.3)),
             turret_box: None,
             rotors: Vec::new(),
+            damage: None,
             tuning: Default::default(),
         };
         let plain = ChaseRig::of(&spec);

@@ -795,7 +795,7 @@ pub struct Geometry<'a> {
 /// pairs. A `CEXE` is a token stream: 1 then an operand, 2 then a verb
 /// applying to the operands before it, 3 to end. Nodes are named by name
 /// hash; verbs include `show` and `hide`. Switchable nodes start hidden.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PartStates {
     /// The switchable nodes (`SWIT`).
     pub switchable: Vec<u16>,
@@ -814,7 +814,7 @@ pub struct PartStates {
 }
 
 /// One part's states: what entering each shows and hides.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PartMachine {
     /// The part's node (`NODE`), if named.
     pub node: Option<u16>,
@@ -826,7 +826,54 @@ pub struct PartMachine {
     /// machine of its own whose destroyed start is a state that shows
     /// nothing, not `DestroyedState` (`pmcoutpost_gate`, round 8).
     pub starts: [Option<u32>; 2],
+    /// Per state, in the order of [`states`](Self::states): what entering
+    /// it does besides showing and hiding.
+    pub acts: Vec<StateActs>,
 }
+
+/// What entering a state does besides showing and hiding (a vehicle's
+/// parts: a door that dents at half its health and comes off at none,
+/// the hood that catches fire, the body that smokes as a wreck).
+///
+/// Read from samples (`global_veh_68valiant`, `civ_veh_car_r90`, round
+/// 14): the verbs are named by name hash, and their meaning is read off
+/// what they name and where they stand.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StateActs {
+    /// Where a message sends the part from this state: (message, state).
+    /// A state of 0 drops the message (`DamageMsg` in the dented door's
+    /// own state). Verb [`ON_MESSAGE`], whose name is unknown.
+    pub on: Vec<(u32, u32)>,
+    /// The states it puts other parts in (`SetState` naming another
+    /// part's node: a wreck's body sends its glass to the state that
+    /// shows nothing), as (state, part node).
+    pub sets: Vec<(u32, u16)>,
+    /// The effects it starts (`StartEmitter`), as (effect name hash,
+    /// where): a node of the model, or a hash naming none (a locator the
+    /// model doesn't carry).
+    pub emitters: Vec<(u32, Result<u16, u32>)>,
+    /// The nodes it throws off as loose objects of their own
+    /// (`CreateObject` naming `DetachState`: a door, the hood).
+    pub detaches: Vec<u16>,
+    /// The damage it passes on to other parts (`SendDamage`), as
+    /// (amount, the part's node name hash): a lamp's breaking hurts the
+    /// hood.
+    pub sends: Vec<(f32, u32)>,
+    /// The effects leaving it stops (`StopEmitter` on exit: the hood's
+    /// fire as the burning body becomes a wreck), by name hash. Effects a
+    /// state starts run on until a state stops them (the wreck's smoke,
+    /// started on the way to `DestroyedState`).
+    pub stops: Vec<u32>,
+}
+
+/// The message a part takes when its health falls to its `NodeHealth`
+/// threshold (`DamageMsg`).
+pub const DAMAGE_MSG: u32 = 0xc650_7ee1;
+/// The message a part takes when its health is gone (`DestroyMsg`).
+pub const DESTROY_MSG: u32 = 0x1ed7_ad78;
+/// The verb that sends a part to a state on a message: operands (state,
+/// message, part node). Its name is not in the dictionary.
+pub const ON_MESSAGE: u32 = 0xe114_2510;
 
 /// The state a part is in when intact.
 pub const STATE_INTACT: u32 = 0xacb5_1200;
@@ -840,6 +887,13 @@ const ON_ENTER: u32 = 0x9da9_7065;
 const START_STATES: [u32; 2] = [0x0ace_072a, 0x5d30_8f4f];
 /// The verb `SetState`.
 const SET_STATE: u32 = 0x9b31_491a;
+/// The verbs `StartEmitter`, `CreateObject` and `SendDamage`, and the
+/// state `DetachState` a `CreateObject` names for a part thrown off.
+const START_EMITTER: u32 = 0x3347_914f;
+const CREATE_OBJECT: u32 = 0xc6e8_afa8;
+const SEND_DAMAGE: u32 = 0x82d1_e93c;
+const STOP_EMITTER: u32 = 0x687c_78c5;
+const DETACH_STATE: u32 = 0xa530_b827;
 
 impl PartStates {
     fn parse(u: &Ucfx<'_>, stam: usize, nodes: &[Node]) -> Self {
@@ -880,9 +934,31 @@ impl PartStates {
                     }
                     if let (Some(m), Some(&name)) = (states.machines.last_mut(), w.first()) {
                         m.states.push((name, Vec::new()));
+                        m.acts.push(StateActs::default());
                     }
                 }
                 b"CHDR" => entering = w.first() == Some(&ON_ENTER),
+                // On leaving a state: the effects it stops.
+                b"CEXE" if !entering => {
+                    let Some(a) = states.machines.last_mut().and_then(|m| m.acts.last_mut()) else {
+                        continue;
+                    };
+                    let mut first = None;
+                    for pair in w.chunks_exact(2) {
+                        match (pair[0], pair[1]) {
+                            (1, x) => {
+                                first.get_or_insert(x);
+                            }
+                            (2, verb) => {
+                                if verb == STOP_EMITTER {
+                                    a.stops.extend(first);
+                                }
+                                first = None;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
                 b"CEXE" if entering => {
                     let Some((state, commands)) =
                         states.machines.last_mut().and_then(|m| m.states.last_mut())
@@ -890,6 +966,9 @@ impl PartStates {
                         continue;
                     };
                     let state = *state;
+                    let mut acts = StateActs::default();
+                    let first = |h: u32| named(h).next();
+                    let float = |x: u32| f32::from_bits(x);
                     // The words a show or hide applies to, by position.
                     let mut switched = vec![false; w.len()];
                     let mut operands = Vec::new();
@@ -911,6 +990,36 @@ impl PartStates {
                                         commands.extend(named(w[at]).map(|n| (n, verb == show)));
                                         switched[at] = true;
                                     }
+                                }
+                                let op = |i: usize| operands.get(i).map(|&at| w[at]);
+                                match verb {
+                                    ON_MESSAGE => {
+                                        if let (Some(to), Some(msg)) = (op(0), op(1)) {
+                                            acts.on.push((msg, to));
+                                        }
+                                    }
+                                    SET_STATE => {
+                                        if let (Some(to), Some(n)) = (op(0), op(1).and_then(first))
+                                        {
+                                            acts.sets.push((to, n));
+                                        }
+                                    }
+                                    START_EMITTER => {
+                                        if let (Some(fx), Some(at)) = (op(0), op(1)) {
+                                            acts.emitters.push((fx, first(at).ok_or(at)));
+                                        }
+                                    }
+                                    CREATE_OBJECT => {
+                                        if operands.iter().any(|&at| w[at] == DETACH_STATE) {
+                                            acts.detaches.extend(op(1).and_then(first));
+                                        }
+                                    }
+                                    SEND_DAMAGE => {
+                                        if let (Some(amount), Some(to)) = (op(0), op(1)) {
+                                            acts.sends.push((float(amount), to));
+                                        }
+                                    }
+                                    _ => {}
                                 }
                                 if verb == start_anim
                                     && operands.iter().any(|&at| w[at] == collapse_anim)
@@ -942,6 +1051,21 @@ impl PartStates {
                     if let (Some(to), Some(m)) = (start, states.machines.last_mut()) {
                         let k = usize::from(state == START_STATES[1]);
                         m.starts[k].get_or_insert(to);
+                    }
+                    if let Some(a) = states.machines.last_mut().and_then(|m| m.acts.last_mut()) {
+                        let StateActs {
+                            on,
+                            sets,
+                            emitters,
+                            detaches,
+                            sends,
+                            ..
+                        } = acts;
+                        a.on.extend(on);
+                        a.sets.extend(sets);
+                        a.emitters.extend(emitters);
+                        a.detaches.extend(detaches);
+                        a.sends.extend(sends);
                     }
                 }
                 _ => {}
@@ -1053,6 +1177,39 @@ impl PartStates {
     /// `wrecked` says of its index: a hedge one of whose sections a
     /// vehicle flattened, the others standing.
     pub fn hidden_parts(&self, nodes: &[Node], wrecked: impl Fn(usize) -> bool) -> Vec<bool> {
+        self.hidden_in(nodes, |k, m| {
+            let state = |name: u32| m.states.iter().position(|s| s.0 == name);
+            // Where its start puts it, else the usual states: a part
+            // whose destroyed start shows nothing (a gate's leaf, gone to
+            // its pieces) is hidden on the wreck, not left up intact.
+            let started = |k: usize| m.starts[k].and_then(state);
+            if wrecked(k) {
+                started(1)
+                    .or_else(|| state(STATE_WRECKED))
+                    .or_else(|| state(STATE_INTACT))
+            } else {
+                started(0).or_else(|| state(STATE_INTACT))
+            }
+        })
+    }
+
+    /// The state part `m` is in at the start, intact: where its
+    /// `InitState` puts it, else `PristineState` (an index into its
+    /// [`states`](PartMachine::states)).
+    pub fn intact_state(m: &PartMachine) -> Option<usize> {
+        let state = |name: u32| m.states.iter().position(|s| s.0 == name);
+        m.starts[0].and_then(state).or_else(|| state(STATE_INTACT))
+    }
+
+    /// As [`hidden`](Self::hidden), each part in the state `state` picks
+    /// for it (an index into its [`states`](PartMachine::states); `None`
+    /// leaves it as switchable nodes start, hidden): a car's dented door
+    /// shown, the door thrown off hidden, the rest intact.
+    pub fn hidden_in(
+        &self,
+        nodes: &[Node],
+        state: impl Fn(usize, &PartMachine) -> Option<usize>,
+    ) -> Vec<bool> {
         let mut off = vec![false; nodes.len()];
         let mut any = false;
         for &n in &self.switchable {
@@ -1061,19 +1218,7 @@ impl PartStates {
             }
         }
         for (k, m) in self.machines.iter().enumerate() {
-            let state = |name: u32| m.states.iter().find(|s| s.0 == name);
-            let wrecked = wrecked(k);
-            // Where its start puts it, else the usual states: a part
-            // whose destroyed start shows nothing (a gate's leaf, gone to
-            // its pieces) is hidden on the wreck, not left up intact.
-            let started = |k: usize| m.starts[k].and_then(state);
-            let entered = if wrecked {
-                started(1)
-                    .or_else(|| state(STATE_WRECKED))
-                    .or_else(|| state(STATE_INTACT))
-            } else {
-                started(0).or_else(|| state(STATE_INTACT))
-            };
+            let entered = state(k, m).and_then(|s| m.states.get(s));
             for &(n, shown) in entered.map_or(&[][..], |s| &s.1) {
                 if let Some(o) = off.get_mut(usize::from(n)) {
                     *o = !shown;
@@ -1942,6 +2087,145 @@ mod tests {
         assert_eq!(states.hidden(&nodes, false), vec![false, false, true]);
         // Wrecked: the wreck shows and the leaf is gone with it.
         assert_eq!(states.hidden(&nodes, true), vec![false, true, false]);
+    }
+
+    #[test]
+    fn a_door_states_say_where_messages_send_it_and_what_it_throws_off() {
+        // As the Valiant's front door (round 14): part node 0 shows its
+        // whole door 1 pristine; `DamageMsg` sends it to the dented door
+        // 2's state, `DestroyMsg` to the state that throws the dented door
+        // off and passes 0.2 damage to the hood (name 200, not a node
+        // here); the dented state starts an effect at 1 and stops it on
+        // leaving.
+        let show = crate::name_hash("show");
+        let enter = || leaf(b"CHDR", le(&[ON_ENTER, 0]));
+        let exit = || leaf(b"CHDR", le(&[0xdb41_017d, 0]));
+        let (dented, thrown, fire) = (0x381b_e6a4, 0xce60_3754, 0x5151_0001);
+        let data = ucfx(&[node(
+            b"STAM",
+            vec![
+                leaf(b"INFO", le(&[5, 15, 7])),
+                leaf(b"SWIT", le(&[101, 102])),
+                leaf(b"NODE", le(&[100, 3])),
+                leaf(b"STAT", le(&[STATE_INTACT])),
+                enter(),
+                leaf(
+                    b"CEXE",
+                    le(&[
+                        1,
+                        101,
+                        2,
+                        show,
+                        1,
+                        dented,
+                        1,
+                        DAMAGE_MSG,
+                        1,
+                        100,
+                        2,
+                        ON_MESSAGE,
+                        1,
+                        thrown,
+                        1,
+                        DESTROY_MSG,
+                        1,
+                        100,
+                        2,
+                        ON_MESSAGE,
+                        3,
+                    ]),
+                ),
+                leaf(b"STAT", le(&[dented])),
+                enter(),
+                leaf(
+                    b"CEXE",
+                    le(&[
+                        1,
+                        102,
+                        2,
+                        show,
+                        1,
+                        0,
+                        1,
+                        DAMAGE_MSG,
+                        1,
+                        100,
+                        2,
+                        ON_MESSAGE,
+                        1,
+                        fire,
+                        1,
+                        101,
+                        2,
+                        START_EMITTER,
+                        3,
+                    ]),
+                ),
+                exit(),
+                leaf(b"CEXE", le(&[1, fire, 1, 101, 2, STOP_EMITTER, 3])),
+                leaf(b"STAT", le(&[thrown])),
+                enter(),
+                leaf(
+                    b"CEXE",
+                    le(&[
+                        1,
+                        1,
+                        1,
+                        102,
+                        1,
+                        0x1234_5678,
+                        1,
+                        DETACH_STATE,
+                        1,
+                        100,
+                        2,
+                        CREATE_OBJECT,
+                        1,
+                        0.2f32.to_bits(),
+                        1,
+                        200,
+                        2,
+                        SEND_DAMAGE,
+                        1,
+                        0xca26_1e5b,
+                        1,
+                        100,
+                        2,
+                        SET_STATE,
+                        3,
+                    ]),
+                ),
+            ],
+        )]);
+        let u = Ucfx::parse(&data).unwrap();
+        let stam = u.children(None).next().unwrap();
+        let n = |name: u32, parent: Option<u16>| Node {
+            name_hash: name,
+            flags: 0,
+            first_child: None,
+            parent,
+            next_sibling: None,
+            unk_0x0c: 0,
+            local: Default::default(),
+            inverse_bind: Default::default(),
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
+        };
+        let nodes = [n(100, None), n(101, Some(0)), n(102, Some(0))];
+        let states = PartStates::parse(&u, stam, &nodes);
+        let m = &states.machines[0];
+        assert_eq!(m.acts.len(), m.states.len());
+        assert_eq!(m.acts[0].on, [(DAMAGE_MSG, dented), (DESTROY_MSG, thrown)]);
+        assert_eq!(m.acts[1].on, [(DAMAGE_MSG, 0)]);
+        assert_eq!(m.acts[1].emitters, [(fire, Ok(1))]);
+        assert_eq!(m.acts[1].stops, [fire]);
+        assert_eq!(m.acts[2].detaches, [2]);
+        assert_eq!(m.acts[2].sends, [(0.2, 200)]);
+        assert_eq!(m.acts[2].sets, [(0xca26_1e5b, 0)]);
+        // The dented state shows the dented door alone.
+        let dented_look = states.hidden_in(&nodes, |_, _| Some(1));
+        assert_eq!(dented_look, [false, true, false]);
+        assert_eq!(PartStates::intact_state(m), Some(0));
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub mod stream;
 pub mod technique;
 pub mod tuning;
 pub mod vehicle;
+pub mod vehicle_damage;
 pub mod weapons;
 pub mod world;
 

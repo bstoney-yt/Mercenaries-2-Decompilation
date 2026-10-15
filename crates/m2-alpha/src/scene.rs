@@ -12,6 +12,7 @@ use anyhow::Context as _;
 use m2_engine::anim::load_clips;
 use m2_engine::model::MODEL_TEXTURE_WIDTH;
 use m2_engine::vehicle::{DRIVABLE, catalogue};
+use m2_engine::vehicle_damage::PartDamage;
 use m2_engine::{
     Animator, AssetSource, BoundClip, Catalogue, CatalogueEntry, CpuModel, Frustum, Gait, GpuModel,
     Install, Locomotion, MaterialCache, PersonModel, Pose, Skeleton, VehicleId, VehicleSpec, World,
@@ -897,6 +898,71 @@ pub struct ParkedVehicle {
     pub fired: u32,
     /// Damage it has taken, of its [`most_health`](Self::most_health).
     pub damage: f32,
+    /// Its parts as they stand: dented, broken, thrown off
+    /// ([`m2_engine::vehicle_damage`]), if its model and template say.
+    pub parts: Option<PartDamage>,
+    /// The parts it has thrown off, falling and lying where they fell.
+    pub loose: Vec<LoosePart>,
+}
+
+/// A part a vehicle threw off (a door, the hood): drawn from the
+/// vehicle's model, its own node's pieces alone, where it flew.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoosePart {
+    /// The vehicle's place when the part came off.
+    pub from: Mat4,
+    /// The part's middle then, world space.
+    pub centre: Vec3,
+    /// How far it has moved from there, and how fast it goes.
+    pub offset: Vec3,
+    pub velocity: Vec3,
+    /// What it turns about, and how far it has turned (radians).
+    pub axis: Vec3,
+    pub angle: f32,
+    /// How fast it turns, radians a second.
+    pub spin: f32,
+    /// The height it comes to rest at (its middle).
+    pub ground: f32,
+    /// Per node of the vehicle's model, whether it isn't the part's.
+    pub hidden: Vec<bool>,
+    pub age: f32,
+}
+
+/// How a thrown-off part flies: out from the vehicle's middle and up,
+/// m/s, turning so many radians a second, and how long it lies before
+/// it is gone, seconds. Invented: the game throws it as a loose object
+/// of its own (`CreateObject`), with physics this alpha doesn't have.
+const LOOSE_OUT: f32 = 2.5;
+const LOOSE_UP: f32 = 3.5;
+const LOOSE_SPIN: f32 = 5.0;
+const LOOSE_LASTS: f32 = 120.0;
+/// Thrown-off parts kept a vehicle at most.
+const LOOSE_MOST: usize = 12;
+
+impl LoosePart {
+    /// Its place now.
+    pub fn world(&self) -> Mat4 {
+        Mat4::from_translation(self.centre + self.offset)
+            * Mat4::from_axis_angle(self.axis, self.angle)
+            * Mat4::from_translation(-self.centre)
+            * self.from
+    }
+
+    /// Flies `dt` on: falls until its middle is down on the ground, then
+    /// lies there.
+    pub fn step(&mut self, dt: f32) {
+        self.age += dt;
+        if self.velocity == Vec3::ZERO {
+            return;
+        }
+        self.velocity.y -= 9.81 * dt;
+        self.offset += self.velocity * dt;
+        self.angle += self.spin * dt;
+        if self.centre.y + self.offset.y <= self.ground {
+            self.offset.y = self.ground - self.centre.y;
+            self.velocity = Vec3::ZERO;
+        }
+    }
 }
 
 /// A vehicle's health where its template gives none.
@@ -915,6 +981,103 @@ impl ParkedVehicle {
             return 0.0;
         }
         (100.0 * (1.0 - self.damage / self.most_health())).clamp(0.0, 100.0)
+    }
+
+    /// A round of `damage` struck it at `at` (world), its place `body`:
+    /// the part there takes it.
+    pub fn hit_parts(&mut self, body: Mat4, at: Vec3, damage: f32) {
+        let (Some(dm), Some(parts)) = (self.spec.damage.as_deref(), self.parts.as_mut()) else {
+            return;
+        };
+        if !self.wrecked {
+            parts.hit(dm, body.inverse().transform_point3(at), damage);
+        }
+    }
+
+    /// A blast at `at` (world), its place `body`, reaching `reach` metres
+    /// with `damage` at its heart: its parts in reach take their share.
+    pub fn blast_parts(&mut self, body: Mat4, at: Vec3, reach: f32, damage: f32) {
+        let (Some(dm), Some(parts)) = (self.spec.damage.as_deref(), self.parts.as_mut()) else {
+            return;
+        };
+        if !self.wrecked {
+            parts.blast(dm, body.inverse().transform_point3(at), reach, damage);
+        }
+    }
+
+    /// Its body's state as its health stands: damaged (burning, the hood
+    /// on fire) at its `TickDamage` health, destroyed once wrecked.
+    pub fn follow_health(&mut self) {
+        let burns = self
+            .spec
+            .tuning
+            .burns_below
+            .is_some_and(|b| self.damage > 0.0 && self.most_health() - self.damage <= b);
+        let (Some(dm), Some(parts)) = (self.spec.damage.as_deref(), self.parts.as_mut()) else {
+            return;
+        };
+        if burns || self.wrecked {
+            parts.body_damaged(dm);
+        }
+        if self.wrecked {
+            parts.body_destroyed(dm);
+        }
+    }
+
+    /// Throws off the parts its state machine let go since last asked,
+    /// from where it stands (`body`).
+    pub fn throw_loose(&mut self, body: Mat4) {
+        let (Some(dm), Some(parts)) = (self.spec.damage.as_deref(), self.parts.as_mut()) else {
+            return;
+        };
+        let (lo, hi) = self.spec.bounds;
+        let middle = body.transform_point3((lo + hi) * 0.5);
+        let ground = body.transform_point3(Vec3::new(0.0, lo.y, 0.0)).y + 0.15;
+        for d in parts.take_detached() {
+            let centre = body.transform_point3(d.centre);
+            let out = (centre - middle).with_y(0.0).normalize_or(Vec3::X);
+            // A turn of its own, by which part it is.
+            let k = d.part as f32;
+            let axis = Vec3::new(k.sin(), 0.5, k.cos()).normalize();
+            let mut hidden = vec![true; dm.nodes.len()];
+            for (i, h) in hidden.iter_mut().enumerate() {
+                let mut at = Some(i as u16);
+                for _ in 0..=dm.nodes.len() {
+                    match at {
+                        Some(n) if n == d.node => {
+                            *h = false;
+                            break;
+                        }
+                        Some(n) => at = dm.nodes[usize::from(n)].parent,
+                        None => break,
+                    }
+                }
+            }
+            if self.loose.len() >= LOOSE_MOST {
+                self.loose.remove(0);
+            }
+            self.loose.push(LoosePart {
+                from: body,
+                centre,
+                offset: Vec3::ZERO,
+                velocity: out * LOOSE_OUT + Vec3::Y * LOOSE_UP,
+                axis,
+                angle: 0.0,
+                spin: LOOSE_SPIN,
+                ground,
+                hidden,
+                age: 0.0,
+            });
+        }
+    }
+
+    /// Its thrown-off parts fly `dt` on; those that have lain long enough
+    /// are gone.
+    pub fn step_loose(&mut self, dt: f32) {
+        for l in &mut self.loose {
+            l.step(dt);
+        }
+        self.loose.retain(|l| l.age < LOOSE_LASTS);
     }
 
     /// The shells left in its cannon, which carries as many as its
@@ -1817,6 +1980,8 @@ impl Scene {
                 rolled: 0.0,
                 fired: 0,
                 damage: 0.0,
+                parts: None,
+                loose: Vec::new(),
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
@@ -1838,6 +2003,8 @@ impl Scene {
                     rolled: 0.0,
                     fired: 0,
                     damage: 0.0,
+                    parts: None,
+                    loose: Vec::new(),
                 });
             }
             Loaded::WorldVehicle(entity, at, yaw, crew, spec, _) => {
@@ -1854,6 +2021,8 @@ impl Scene {
                     rolled: 0.0,
                     fired: 0,
                     damage: 0.0,
+                    parts: None,
+                    loose: Vec::new(),
                 });
             }
             Loaded::Flight(hash, _, rest, rotors) => {
@@ -1947,6 +2116,45 @@ impl Scene {
                 rig.animator.advance(dt);
             }
         }
+        self.tick_vehicle_parts(dt);
+    }
+
+    /// Vehicles' parts: those just placed get their parts' health from
+    /// their template; parts let go are thrown off; thrown-off parts fly.
+    fn tick_vehicle_parts(&mut self, dt: f32) {
+        let Some(world) = self.world.as_ref() else {
+            return;
+        };
+        let db = &world.index.template_db;
+        for v in &mut self.vehicles {
+            if v.parts.is_none()
+                && let Some(dm) = v.spec.damage.as_deref()
+            {
+                let healths = db
+                    .part_healths_for(&v.spec.label, v.spec.model)
+                    .cloned()
+                    .unwrap_or_default();
+                let parts = PartDamage::new(dm, &healths);
+                eprintln!(
+                    "vehicle parts: {} {} parts, {} with health",
+                    v.spec.label,
+                    dm.states.machines.len(),
+                    parts.with_health()
+                );
+                v.parts = Some(parts);
+                // A wreck as it was loaded stands as its wreck, cold.
+                if v.wrecked
+                    && let Some(p) = v.parts.as_mut()
+                {
+                    p.start_destroyed(dm);
+                }
+            }
+            if let Some(body) = v.id.and_then(|id| world.physics.vehicle_transform(id)) {
+                v.follow_health();
+                v.throw_loose(body);
+            }
+            v.step_loose(dt);
+        }
     }
 
     /// The sound events the clips have met since last asked: the
@@ -2015,8 +2223,16 @@ impl Scene {
         }
         if let Some(world) = &self.world {
             for v in &mut self.vehicles {
-                // A wreck shows its wrecked body, turret and wheels.
+                // A wreck shows its wrecked body, turret and wheels; else
+                // its parts as they stand, once any has been hurt.
                 v.model.wrecked = v.wrecked;
+                v.model.parts_hidden = match (&v.parts, v.spec.damage.as_deref()) {
+                    (Some(p), Some(dm)) if !p.untouched() => Some(p.hidden(dm)),
+                    _ => None,
+                };
+                for l in &v.loose {
+                    v.model.draw_hiding(queue, l.world(), &l.hidden);
+                }
                 // Tracks run as far as the road wheels roll.
                 v.model.tracks = v.spec.tracked;
                 v.model.track_travel = v.rolled;
@@ -2557,6 +2773,37 @@ fn ground(
 mod tests {
     use super::*;
     use m2_render::NullBackend;
+
+    #[test]
+    fn a_thrown_off_part_flies_out_and_lies_where_it_lands() {
+        let mut l = LoosePart {
+            from: Mat4::IDENTITY,
+            centre: Vec3::new(1.0, 1.0, 0.0),
+            offset: Vec3::ZERO,
+            velocity: Vec3::new(LOOSE_OUT, LOOSE_UP, 0.0),
+            axis: Vec3::Y,
+            angle: 0.0,
+            spin: LOOSE_SPIN,
+            ground: 0.2,
+            hidden: Vec::new(),
+            age: 0.0,
+        };
+        // Up first, then down.
+        l.step(0.1);
+        assert!(l.offset.y > 0.0 && l.offset.x > 0.0);
+        for _ in 0..100 {
+            l.step(0.1);
+        }
+        // At rest with its middle on the ground, out from where it was.
+        assert_eq!(l.velocity, Vec3::ZERO);
+        assert!((l.centre.y + l.offset.y - 0.2).abs() < 1e-5);
+        let resting = l.offset;
+        l.step(0.1);
+        assert_eq!(l.offset, resting);
+        // Its pieces go with it: its middle is where it flew to.
+        let at = l.world().transform_point3(l.centre);
+        assert!(at.distance(l.centre + l.offset) < 1e-4);
+    }
 
     #[test]
     fn a_heros_aim_clip_finds_the_hands_again_and_stays_the_heros() {

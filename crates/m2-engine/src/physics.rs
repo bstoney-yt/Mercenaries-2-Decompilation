@@ -2736,6 +2736,7 @@ mod tests {
             hull: (Vec3::new(-1.0, 0.0, -2.2), Vec3::new(1.0, 1.5, 2.2)),
             turret_box: None,
             rotors: Vec::new(),
+            damage: None,
             tuning: crate::VehicleTuning::default(),
         }
     }

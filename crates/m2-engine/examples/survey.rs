@@ -211,6 +211,14 @@
 //!                           wrecked, both or never; then each model with
 //!                           a wreck whose switched parts show both ways
 //!                           (or those whose name holds a word)
+//! vdamage[:<word>,..]       vehicle models: parts, their health, the
+//!                           looks the alpha drew before and the looks
+//!                           their parts reach shot with rifle rounds,
+//!                           parts thrown off, burning and wreck effects
+//! blends[:<word>,..]        every model with blend shapes (top-level
+//!                           `BSHP`), and those with a texture whose name
+//!                           holds a word: blend shape names, morph
+//!                           targets per group, states and textures
 //! doubles:<file>[,x0,z0,x1,z1] what stands twice: with the layers a run
 //!                           had in (its `state layers loaded:` line in
 //!                           the file), every two placed models or
@@ -1050,6 +1058,8 @@ fn main() -> Result<(), Error> {
             "trees" => trees(&mut source, &names, arg),
             "stam" => stam(&mut source, &names, arg),
             "wrecks" => wrecks(&mut source, &names, arg),
+            "blends" => blends(&mut source, &names, arg),
+            "vdamage" => vdamage(&mut source, &names, arg),
             "treefit" => {
                 if world.is_none() {
                     world = Some(WorldIndex::build(&mut source)?);
@@ -6891,6 +6901,276 @@ fn destruct_names(names: &Names) -> Names {
         names.add(w);
     }
     names
+}
+
+/// `vdamage[:<word>,..]`: over every vehicle template (any vehicle
+/// physics component) whose model is in the archive, or those whose name
+/// holds a word, what its parts do as they are damaged
+/// ([`m2_engine::vehicle_damage`]): its parts, those its `NodeHealth`
+/// gives health, the records naming no part; how many looks the alpha
+/// drew before this round (intact, and the wreck if it has one) and how
+/// many its parts reach as each is shot with rifle rounds (9 damage) at
+/// its box's centre until it changes no more, the parts damaged and
+/// destroyed, those thrown off, and the effects the body starts burning
+/// and wrecked (and how many name a template). One tab-separated
+/// `vdamage` line per model, then totals.
+fn vdamage<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_engine::vehicle_damage::{DamageModel, PartDamage};
+    let words = words_of(arg);
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let models: HashSet<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let template_hashes: HashSet<u32> = tnames.values().map(|n| m2_assets::name_hash(n)).collect();
+    let model_of = db.hashes("ModelName");
+    let healths = m2_engine::vehicle_damage::read(&db);
+    let mut vehicles: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for p in VEHICLE_PHYSICS {
+        if let Some(c) = db.component(p) {
+            for (id, _) in c.records().unwrap_or_default() {
+                let Some(&m) = model_of.get(&id) else {
+                    continue;
+                };
+                let name = tnames.get(&id).copied().unwrap_or("").to_ascii_lowercase();
+                if models.contains(&m)
+                    && (words.is_empty() || words.iter().any(|w| name.contains(w.as_str())))
+                    && !vehicles.get(&m).is_some_and(|v| v.contains(&id))
+                {
+                    vehicles.entry(m).or_default().push(id);
+                }
+            }
+        }
+    }
+    println!(
+        "vdamage\tmodel\tname\ttemplate\tparts\twith health\tunmatched records\tlooks before\tlooks after\tdamaged\tdestroyed\tthrown off\tburning fx\twreck fx\tfx named"
+    );
+    let mut t = [0usize; 12];
+    for (m, ids) in &vehicles {
+        let Ok(data) = source.model(*m) else { continue };
+        let Ok(model) = data.parse() else { continue };
+        let wreck = model
+            .states
+            .as_ref()
+            .is_some_and(|s| s.hidden(&model.nodes, false) != s.hidden(&model.nodes, true));
+        let before = 1 + usize::from(wreck);
+        // The model's first template (by id) with parts' health.
+        let Some((id, h)) = ids
+            .iter()
+            .filter_map(|id| healths.get(id).map(|h| (*id, h)))
+            .min_by_key(|(id, _)| *id)
+        else {
+            t[0] += 1;
+            continue;
+        };
+        let Some(dm) = DamageModel::from_model(&model) else {
+            t[1] += 1;
+            println!(
+                "vdamage\t{m:08x}\t{}\t{}\t0\t0\t{}\t{before}\t{before}\t0\t0\t0\t0\t0\t0",
+                names.show(*m),
+                tnames.get(&id).copied().unwrap_or("?"),
+                h.parts.len()
+            );
+            t[3] += before;
+            t[4] += before;
+            continue;
+        };
+        let mut d = PartDamage::new(&dm, h);
+        let unmatched = h
+            .parts
+            .iter()
+            .filter(|p| dm.part_named(p.part).is_none())
+            .count();
+        let mut looks: HashSet<Vec<bool>> = HashSet::new();
+        looks.insert(d.hidden(&dm));
+        let parts = dm.states.machines.len();
+        let (mut damaged, mut destroyed, mut thrown) = (0, 0, 0);
+        for k in 0..parts {
+            if dm.boxes[k].is_none() || Some(k) == d.body {
+                continue;
+            }
+            let start = d.state[k];
+            for _ in 0..200 {
+                d.hurt(&dm, k, 9.0);
+                looks.insert(d.hidden(&dm));
+            }
+            if d.state[k] != start {
+                damaged += 1;
+                // Its last state: a wreck of it (broken glass), or
+                // nothing (thrown off).
+                let shows = |s: Option<usize>| {
+                    s.and_then(|s| dm.states.machines[k].states.get(s))
+                        .map(|s| s.1.iter().filter(|x| x.1).map(|x| x.0).collect::<Vec<_>>())
+                };
+                if shows(d.state[k]) != shows(start) {
+                    destroyed += 1;
+                }
+            }
+            thrown += d.take_detached().len();
+        }
+        let named = |fx: &[(usize, u32, Vec3)]| {
+            fx.iter().filter(|e| template_hashes.contains(&e.1)).count()
+        };
+        d.body_damaged(&dm);
+        let burning = d.emitters(&dm);
+        looks.insert(d.hidden(&dm));
+        d.body_destroyed(&dm);
+        let wrecked = d.emitters(&dm);
+        let fx_named = named(&burning) + named(&wrecked);
+        let after = looks.len().max(before);
+        println!(
+            "vdamage\t{m:08x}\t{}\t{}\t{parts}\t{}\t{unmatched}\t{before}\t{after}\t{damaged}\t{destroyed}\t{thrown}\t{}\t{}\t{fx_named}",
+            names.show(*m),
+            tnames.get(&id).copied().unwrap_or("?"),
+            d.with_health(),
+            burning.len(),
+            wrecked.len()
+        );
+        t[2] += 1;
+        t[3] += before;
+        t[4] += after;
+        t[5] += damaged;
+        t[6] += destroyed;
+        t[7] += thrown;
+        t[8] += burning.len() + wrecked.len();
+        t[9] += fx_named;
+        t[10] += parts;
+        t[11] += unmatched;
+    }
+    println!(
+        "vdamage totals: {} vehicle models; {} without NodeHealth, {} without part messages, {} with; parts {}, NodeHealth records naming no part {}; looks before {} after {}; parts changing state {} changing look {} thrown off {}; body effects {} ({} name a template)",
+        vehicles.len(),
+        t[0],
+        t[1],
+        t[2],
+        t[10],
+        t[11],
+        t[3],
+        t[4],
+        t[5],
+        t[6],
+        t[7],
+        t[8],
+        t[9]
+    );
+    Ok(())
+}
+
+/// `blends[:<word>,..]`: every model with blend shapes, and every model
+/// with a texture whose name holds a word: blend shape names, morph
+/// targets per group, state machine states, textures.
+fn blends<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let words: Vec<String> = arg
+        .split(',')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let index = source.archive().index();
+    let mut models: Vec<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    let (mut with_blends, mut shown) = (0usize, 0usize);
+    let mut shape_names: HashMap<String, usize> = HashMap::new();
+    for h in models {
+        let Ok(data) = source.model(h) else { continue };
+        let Ok(m) = data.parse() else { continue };
+        let mut textures: Vec<String> = m
+            .materials
+            .iter()
+            .flat_map(|x| x.textures.iter())
+            .filter(|&&t| t != 0)
+            .map(|&t| names.show(t).to_string())
+            .collect();
+        textures.sort();
+        textures.dedup();
+        let worded = !words.is_empty()
+            && textures
+                .iter()
+                .any(|t| words.iter().any(|w| t.to_ascii_lowercase().contains(w)));
+        if !m.blend_shapes.is_empty() {
+            with_blends += 1;
+            for &b in &m.blend_shapes {
+                *shape_names.entry(names.show(b).to_string()).or_default() += 1;
+            }
+        }
+        if m.blend_shapes.is_empty() && !worded {
+            continue;
+        }
+        shown += 1;
+        let shapes: Vec<String> = m
+            .blend_shapes
+            .iter()
+            .map(|&b| names.show(b).to_string())
+            .collect();
+        let mut groups = Vec::new();
+        for seg in &m.segments {
+            if let Some(g) = m.geometry(seg.slot) {
+                for (k, grp) in g.groups.iter().enumerate() {
+                    if !grp.morphs.is_empty() {
+                        groups.push(format!(
+                            "n{}/s{}/g{k}:{}x{}v",
+                            seg.node,
+                            seg.slot,
+                            grp.morphs.len(),
+                            grp.vertices.count
+                        ));
+                    }
+                }
+            }
+        }
+        groups.dedup();
+        let mut states: Vec<String> = m
+            .states
+            .iter()
+            .flat_map(|st| st.machines.iter())
+            .flat_map(|mc| mc.states.iter())
+            .map(|(s, _)| names.show(*s).to_string())
+            .collect();
+        states.sort();
+        states.dedup();
+        println!(
+            "blends\t{h:08x}\t{}\tshapes [{}]\tmorph groups [{}]\tstates [{}]\ttextures [{}]",
+            names.show(h),
+            shapes.join(", "),
+            groups.join(", "),
+            states.join(", "),
+            textures.join(", ")
+        );
+    }
+    let mut tally: Vec<(String, usize)> = shape_names.into_iter().collect();
+    tally.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    println!("blends: {with_blends} models with blend shapes, {shown} shown");
+    for (n, c) in tally {
+        println!("blend-name\t{c}\t{n}");
+    }
+    Ok(())
 }
 
 /// `wrecks[:<word>,..]`: across every model with a state machine, what
