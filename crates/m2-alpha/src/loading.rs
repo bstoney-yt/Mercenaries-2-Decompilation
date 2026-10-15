@@ -189,6 +189,11 @@ pub struct Cycle {
 }
 
 impl Cycle {
+    /// Makes hint `n` the next one shown (the harness's `M2_LOADING_HINT`).
+    pub fn show_next(&mut self, n: usize) {
+        self.next = n;
+    }
+
     /// Whether a load wants the screen, `dt` seconds on: the island still
     /// loading (for up to [`LOADING_CAP`] seconds at a time), or the
     /// mission's fade going to (or held at) black. Its fade back lets the

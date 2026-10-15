@@ -25,6 +25,7 @@
 //! cargo run -p m2-assets --example wad -- fonts   <archive.wad>
 //! cargo run -p m2-assets --example wad -- flashfonts <archive.wad>
 //! cargo run -p m2-assets --example wad -- flashmasks <archive.wad>
+//! cargo run -p m2-assets --example wad -- flashtext <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -223,6 +224,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("fonts", []) => fonts(&mut wad)?,
         ("flashfonts", []) => flash_fonts(&mut wad)?,
         ("flashmasks", []) => flash_masks(&mut wad)?,
+        ("flashtext", []) => flash_text(&mut wad)?,
         ("dds", [name, out]) => {
             let dds = texture_dds(&mut wad, name)?;
             std::fs::write(out, &dds)?;
@@ -2624,5 +2626,65 @@ fn flash_masks<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
          {cut} fill less than 99% of their box, mean share {:.3}",
         sum / f64::from(shapes.max(1))
     );
+    Ok(())
+}
+
+/// Every `DefineEditText` field's layout: box, font height, alignment,
+/// margins, indent, leading and flags, then how many fields use each.
+fn flash_text<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    use m2_assets::flash::text::EditText;
+    let mut count: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut fields = 0;
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != MOVIE_TYPE {
+                continue;
+            }
+            let Ok(movie) = movie_from_asset(data) else {
+                continue;
+            };
+            for t in &movie.tags {
+                if t.code != m2_assets::gfx::tag::DEFINE_EDIT_TEXT {
+                    continue;
+                }
+                let Some((id, d)) = EditText::parse(movie.data(t)) else {
+                    continue;
+                };
+                fields += 1;
+                let [x0, y0, x1, y1] = d.bounds;
+                println!(
+                    "{:08x} {id} {:?} box {x0:.1},{y0:.1},{x1:.1},{y1:.1} h {:.2} align {} margins {:.2}/{:.2} indent {:.2} leading {:.2} wrap {} multi {} html {} auto {}",
+                    e.name_hash,
+                    d.variable,
+                    d.height,
+                    d.align,
+                    d.left_margin,
+                    d.right_margin,
+                    d.indent,
+                    d.leading,
+                    u8::from(d.word_wrap),
+                    u8::from(d.multiline),
+                    u8::from(d.html),
+                    u8::from(d.auto_size)
+                );
+                for k in [
+                    format!("align {}", d.align),
+                    format!("leading {:.2}", d.leading),
+                    format!("indent {:.2}", d.indent),
+                    format!("margins {:.2}/{:.2}", d.left_margin, d.right_margin),
+                    format!("auto {}", u8::from(d.auto_size)),
+                    format!("wrap {}", u8::from(d.word_wrap)),
+                ] {
+                    *count.entry(k).or_default() += 1;
+                }
+            }
+        }
+    }
+    println!("fields {fields}");
+    for (k, n) in count {
+        println!("  {k}: {n}");
+    }
     Ok(())
 }

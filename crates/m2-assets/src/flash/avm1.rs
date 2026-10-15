@@ -563,10 +563,11 @@ impl Avm {
     fn clip_property(&mut self, player: &mut Player, id: ClipId, name: &str) -> Option<Value> {
         let c = player.clip(id)?;
         let m = c.matrix;
+        let corner = text_corner(c);
         let lower = name.to_ascii_lowercase();
         Some(match lower.as_str() {
-            "_x" => Value::Number(f64::from(m.tx)),
-            "_y" => Value::Number(f64::from(m.ty)),
+            "_x" => Value::Number(f64::from(m.tx + corner[0])),
+            "_y" => Value::Number(f64::from(m.ty + corner[1])),
             "_xscale" => Value::Number(f64::from(m.a.hypot(m.b) * 100.0)),
             "_yscale" => Value::Number(f64::from(m.c.hypot(m.d) * 100.0)),
             "_rotation" => Value::Number(f64::from(m.b.atan2(m.a).to_degrees())),
@@ -647,13 +648,14 @@ impl Avm {
                 } else {
                     None
                 };
+                let corner = player.clip(id).map_or([0.0; 2], text_corner);
                 let Some(c) = player.clip_mut(id) else {
                     return true;
                 };
                 let m = &mut c.matrix;
                 match lower.as_str() {
-                    "_x" => m.tx = n,
-                    "_y" => m.ty = n,
+                    "_x" => m.tx = n - corner[0],
+                    "_y" => m.ty = n - corner[1],
                     "_xscale" | "_yscale" | "_rotation" => {
                         let (sx, sy, r) = (m.a.hypot(m.b), m.c.hypot(m.d), m.b.atan2(m.a));
                         let (sx, sy, r) = match lower.as_str() {
@@ -2045,6 +2047,24 @@ fn goto_label(player: &mut Player, id: ClipId, label: &str, play: bool) {
 }
 
 /// The box round what instance `id` draws, in its parent's space.
+/// Where a text field's `_x`/`_y` sit from its origin: its box's top-left
+/// corner (the box's `-2, -2` from `DefineEditText`), through its matrix's
+/// scale and turn; other clips sit at their origin. Inferred from footage
+/// (the loading screen's hint lines, placed by `_y`, sit 2 px lower than
+/// with `_y` as the origin: 10 lines of 4 hints, tops 2.4 -> 0.4 px off
+/// with [`text::measure`](super::text::measure)'s last-line rule); Flash's
+/// rule itself not read.
+fn text_corner(c: &super::player::Clip) -> [f32; 2] {
+    match &c.kind {
+        Kind::Text(def, _) => c.lib.texts.get(def).map_or([0.0; 2], |t| {
+            let [x, y] = [t.bounds[0], t.bounds[1]];
+            let m = &c.matrix;
+            [m.a * x + m.c * y, m.b * x + m.d * y]
+        }),
+        _ => [0.0; 2],
+    }
+}
+
 fn clip_bounds(player: &Player, id: ClipId) -> Option<[f32; 4]> {
     let c = player.clip(id)?;
     let mut tris = Vec::new();
