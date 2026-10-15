@@ -102,6 +102,24 @@ pub fn use_attach_frame(on: bool) {
 }
 /// Muzzle marker node of the weapon models.
 pub const MUZZLE: u32 = 0xb148_6ef3;
+/// The node spent cases fly from: every gun template's
+/// `ShellEjectHardpoint` but the covert pistol's (`3d0f5c29`; found on 77
+/// of the 86 guns' models, round 19).
+pub const EJECT: u32 = 0x3d0f_5c29;
+
+/// Where a mounted gun of model `model` firing from `from` along `dir`
+/// throws its cases: as far behind its muzzle as its model's case node
+/// lies from its muzzle node, where the arsenal holds that model (the
+/// side and height of the node are not kept); else none.
+fn case_behind(arsenal: &Arsenal, model: Option<u32>, from: Vec3, dir: Vec3) -> Option<Vec3> {
+    let w = arsenal.by_model.get(&model?)?;
+    Some(from - dir * w.muzzle.distance(w.eject?))
+}
+
+/// A gun model's case node ([`EJECT`]), model space.
+pub fn eject_node(model: &m2_assets::model::Model) -> Option<Vec3> {
+    m2_assets::vehicle::marker(model, EJECT).map(Vec3::from)
+}
 
 /// The grenade launcher (its template, `Grenade Launcher`): 75 rounds a
 /// minute from a clip of 6; its round (`GL Projectile`) flies at 20 m/s
@@ -151,9 +169,6 @@ pub struct Rifle {
     /// 10).
     pub semi: bool,
     pub pellets: u32,
-    /// Its scatter, degrees (`WeaponScatter`'s first field: the carbine's
-    /// 1, the shotgun's 3.5; inferred).
-    pub scatter: f32,
     /// Its round as its template gives it: range falloff, damage key,
     /// speed, blast.
     pub ammo: Option<Ammo>,
@@ -183,7 +198,6 @@ impl Default for Rifle {
             model_hash: Some(m2_assets::name_hash("global_weapon_m4")),
             semi: false,
             pellets: 1,
-            scatter: 0.0,
             ammo: None,
             flight: Flight::Round,
             lock_on: None,
@@ -235,7 +249,6 @@ impl Rifle {
             model_hash: spec.model,
             semi: spec.semi,
             pellets: spec.pellets,
-            scatter: spec.scatter,
             ammo: Some(spec.ammo),
             flight: spec.flight(),
             lock_on: spec.lock_on,
@@ -364,14 +377,13 @@ const PANIC_RANGE: f32 = 40.0;
 /// templates' `ModifierKey` is `Hero`). Any falloff with range is not
 /// decoded.
 const NPC_DAMAGE: f32 = 9.0 * 0.25;
-/// Her rounds do this many times their `Damage` to people (invented,
-/// from the footage: what the engine adds is not decoded). In the PC
-/// playthrough's first fight (3:36-3:48) the carbine kills three VZ
-/// deathsquad mooks with 7, 13 and 10 rounds; its round's `Damage` (6, to
-/// 15 m) on their `Human` row (1) against their `Health` (75) needs 13
-/// hits, so a kill in 7 rounds needs at least 75 / (7 * 6) = 1.79 times
-/// the round. This is the least whole tenth that does it.
-const HER_ROUNDS: f32 = 1.8;
+// Her rounds do their round's `HeroMultiplier` times their `Damage` to
+// people ([`m2_engine::weapons::Ammo::hero`]: the carbine's 3). Round 15
+// stood 1.8 in for it, the least that fits the PC playthrough's first
+// fight (3:36-3:48: the carbine kills three VZ deathsquad mooks of 75
+// `Health` with 7, 13 and 10 rounds; 6 a round needs 13 hits, so a kill in
+// 7 rounds needs at least 1.79 times). At 3, five hits kill at up to 15 m,
+// and the footage's rounds per kill hold the misses.
 /// A VZ soldier's `Accuracy`, which the shot spread above was tuned for.
 const VZ_ACCURACY: f32 = 0.4;
 /// What blasts do to her, of their damage: the game's damage table's
@@ -495,6 +507,9 @@ const BOMB_FIRE_TIME: (f32, f32) = (4.0, 6.0);
 pub struct WeaponModel {
     pub model: GpuModel,
     pub muzzle: Vec3,
+    /// Where its spent cases fly from: its model's `ShellEjectHardpoint`
+    /// node ([`EJECT`]), if it has one.
+    pub eject: Option<Vec3>,
     /// Weapon to right-hand transform held in both hands (aiming, or at
     /// the ready).
     pub grip: Mat4,
@@ -540,9 +555,16 @@ pub struct Arsenal {
 }
 
 impl Arsenal {
-    /// Adds weapon `name`, gripped in `rig`'s right hand.
-    pub fn add(&mut self, name: &str, model: GpuModel, muzzle: Vec3, rig: Option<&Rig>) {
-        let w = Some(self.hold(name == "mgl", model, muzzle, rig));
+    /// Adds weapon `name`, gripped in `rig`'s right hand, with its muzzle
+    /// and case node.
+    pub fn add(
+        &mut self,
+        name: &str,
+        model: GpuModel,
+        points: (Vec3, Option<Vec3>),
+        rig: Option<&Rig>,
+    ) {
+        let w = Some(self.hold(name == "mgl", model, points, rig));
         match name {
             "ak47" => self.rifle = w,
             "rpg" => self.rpg = w,
@@ -558,9 +580,15 @@ impl Arsenal {
     }
 
     /// Adds the hand weapon whose model name hashes to `hash`.
-    pub fn add_model(&mut self, hash: u32, model: GpuModel, muzzle: Vec3, rig: Option<&Rig>) {
+    pub fn add_model(
+        &mut self,
+        hash: u32,
+        model: GpuModel,
+        points: (Vec3, Option<Vec3>),
+        rig: Option<&Rig>,
+    ) {
         let launcher = hash == m2_assets::name_hash("global_weapon_mgl");
-        let w = self.hold(launcher, model, muzzle, rig);
+        let w = self.hold(launcher, model, points, rig);
         self.by_model.insert(hash, w);
     }
 
@@ -581,12 +609,13 @@ impl Arsenal {
         &mut self,
         launcher: bool,
         model: GpuModel,
-        muzzle: Vec3,
+        (muzzle, eject): (Vec3, Option<Vec3>),
         rig: Option<&Rig>,
     ) -> WeaponModel {
         let mut w = WeaponModel {
             model,
             muzzle,
+            eject,
             grip: Mat4::IDENTITY,
             grip_hand: None,
             carry: None,
@@ -1320,6 +1349,9 @@ pub struct Combat {
     /// Seconds until a tank's machine gun fires again.
     mg_reload: f32,
     aim_left: f32,
+    /// What her shots have added to her gun's cone
+    /// ([`m2_engine::weapons::Bloom`]).
+    bloom: m2_engine::weapons::Bloom,
     /// Seconds until the grenade she is throwing leaves her hand.
     throw_in: Option<f32>,
     /// Seconds until the blow she is bashing with lands, and whether low.
@@ -1435,6 +1467,8 @@ pub struct Combat {
     /// and as the alpha's own: for the run's log.
     pub shots: std::collections::BTreeMap<(u32, bool), u32>,
     pub flashes: (u32, u32),
+    /// Spent cases thrown out (each its gun's `ShellEjectTemplate`).
+    pub cases: u32,
     /// What the fighting has come to (for checking).
     pub tally: Tally,
     /// Hurts since [`take_hurts`](Self::take_hurts): damage and where
@@ -1563,6 +1597,7 @@ impl Default for Combat {
             mg_reload: 0.0,
             manned: None,
             aim_left: 0.0,
+            bloom: m2_engine::weapons::Bloom::default(),
             throw_in: None,
             bash_in: None,
             projectiles: Vec::new(),
@@ -1613,6 +1648,7 @@ impl Default for Combat {
             fired: Fired::default(),
             shots: std::collections::BTreeMap::new(),
             flashes: (0, 0),
+            cases: 0,
             tally: Tally::default(),
             hurts: Vec::new(),
         }
@@ -2102,7 +2138,25 @@ impl Combat {
     /// A gun firing from `from` along `dir`, its template's `feel` if
     /// known: its muzzle flash (the game's effect its template names,
     /// else the alpha's own flash `size` metres long) and its shot.
-    fn gun_fired(&mut self, feel: Option<Feel>, from: Vec3, dir: Vec3, size: f32, npc: bool) {
+    /// A gun of `feel` fired from `from` along `dir`: its flash, its spent
+    /// case thrown out at `case` (its `ShellEjectTemplate`'s effect, where
+    /// its model's case node is known), and its shot's sound.
+    fn gun_fired(
+        &mut self,
+        feel: Option<Feel>,
+        (from, case): (Vec3, Option<Vec3>),
+        dir: Vec3,
+        size: f32,
+        npc: bool,
+    ) {
+        if let (Some(shell), Some(at)) = (feel.and_then(|f| f.shell), case) {
+            self.cases += 1;
+            self.game_fx.push(GameFx {
+                template: FxTemplate::Id(shell),
+                at,
+                hold: None,
+            });
+        }
         match feel.and_then(|f| f.flash) {
             Some(flash) => {
                 self.flashes.0 += 1;
@@ -2137,14 +2191,15 @@ impl Combat {
             .map(|(&(set, hero), n)| format!("{set:08x}{} {n}", if hero { " (hero)" } else { "" }))
             .collect();
         format!(
-            "shots by sound set: {}; flashes: {} the game's, {} the alpha's own",
+            "shots by sound set: {}; flashes: {} the game's, {} the alpha's own; cases {}",
             if sets.is_empty() {
                 "none".to_owned()
             } else {
                 sets.join(", ")
             },
             self.flashes.0,
-            self.flashes.1
+            self.flashes.1,
+            self.cases
         )
     }
 
@@ -2207,6 +2262,8 @@ impl Combat {
         self.reload -= dt;
         self.mg_reload -= dt;
         self.aim_left -= dt;
+        let feel = self.rifle.feel;
+        self.bloom.settle(&feel, dt);
         self.quiet += dt;
 
         if self.down > 0.0 {
@@ -2397,9 +2454,15 @@ impl Combat {
 
     /// A weapon's muzzle in her hands, or her chest.
     fn muzzle(f: &Field<'_>, weapon: Option<&WeaponModel>) -> Vec3 {
+        Self::muzzle_and_case(f, weapon).0
+    }
+
+    /// A weapon's muzzle in her hands (or her chest), and where its spent
+    /// cases leave it (its model's [`EJECT`] node), if it has one.
+    fn muzzle_and_case(f: &Field<'_>, weapon: Option<&WeaponModel>) -> (Vec3, Option<Vec3>) {
         let chest = f.player.character.position + Vec3::Y * 1.4;
         let (Some(w), Some((_, rig))) = (weapon, &f.player.model) else {
-            return chest;
+            return (chest, None);
         };
         let (nodes, _) = rig.posed();
         f.arsenal
@@ -2410,7 +2473,12 @@ impl Combat {
                 (f.arsenal.hand, f.arsenal.attach),
                 rig.two_handed,
             )
-            .map_or(chest, |m| m.transform_point3(w.muzzle))
+            .map_or((chest, None), |m| {
+                (
+                    m.transform_point3(w.muzzle),
+                    w.eject.map(|e| m.transform_point3(e)),
+                )
+            })
     }
 
     /// The rifle's clip: changed when she asks or once it is empty (as the
@@ -2456,6 +2524,7 @@ impl Combat {
         let w = &m.weapon;
         self.reload = w.gap();
         let feel = w.feel;
+        let case = case_behind(f.arsenal, w.model, from, aim);
         let ammo = w.ammo;
         let round = match ammo.key {
             Some(k) if k == m2_assets::name_hash("Bullet") => Round::Bullet,
@@ -2522,13 +2591,13 @@ impl Combat {
             });
         }
         if let Some((_, Some(j))) = hit
-            && self.round_on_person(f.people, j, damage, ammo.key, aim * SHOT_PUSH)
+            && self.round_on_person(f.people, j, (damage, ammo.hero), ammo.key, aim * SHOT_PUSH)
         {
             self.remarks.push(Remark::Kill);
         }
         self.fired.rifle += 1;
         self.effect(Effect::Tracer { from, to }, 0.07);
-        self.gun_fired(Some(feel), from, aim, MG_FLASH, false);
+        self.gun_fired(Some(feel), (from, case), aim, MG_FLASH, false);
         alarm(f.people, from);
     }
 
@@ -2541,16 +2610,19 @@ impl Combat {
         self.reload = self.rifle.gap;
         self.aim_left = AIM_AFTER_SHOT;
         let (eye, aim) = Self::aim_ray(f.player);
-        let from = Self::muzzle(f, f.arsenal.of_gun(&self.rifle));
+        let (from, case) = Self::muzzle_and_case(f, f.arsenal.of_gun(&self.rifle));
         let ammo = self.rifle.ammo;
         let round = match ammo.and_then(|a| a.key) {
             Some(k) if k == m2_assets::name_hash("Bullet") || k == 0 => Round::Bullet,
             Some(_) => Round::BulletLarge,
             None => Round::Bullet,
         };
-        // Each of its rounds a shot (the shotgun's 10), scattered by its
-        // `WeaponScatter` (degrees across the cone).
-        let spread = self.rifle.scatter.to_radians();
+        // Each of its rounds a shot (the shotgun's 10), scattered over its
+        // cone (degrees across: `ScatterMin`, more each shot held, to
+        // `ScatterMax`; [`Feel::cone`]).
+        let spread = self.rifle.feel.cone(self.bloom.added).to_radians();
+        let feel = self.rifle.feel;
+        self.bloom.shot(&feel);
         let mut killed = false;
         let mut first = None;
         for _ in 0..self.rifle.pellets.max(1) {
@@ -2592,7 +2664,8 @@ impl Combat {
             // against their template's `Health`.
             if let Some((_, Some(i))) = hit {
                 let key = ammo.and_then(|a| a.key);
-                killed |= self.round_on_person(f.people, i, damage, key, dir * SHOT_PUSH);
+                let hero = ammo.map_or(1.0, |a| a.hero);
+                killed |= self.round_on_person(f.people, i, (damage, hero), key, dir * SHOT_PUSH);
             }
             if self.rifle.pellets > 1 {
                 self.effect(Effect::Tracer { from, to }, 0.05);
@@ -2605,7 +2678,7 @@ impl Combat {
         let feel = self.rifle.feel;
         self.gun_fired(
             Some(feel),
-            from,
+            (from, case),
             (to - from).normalize_or(aim),
             RIFLE_FLASH,
             false,
@@ -2637,7 +2710,7 @@ impl Combat {
         let Some(aim) = target else { return };
         let n = &f.people.npcs[i];
         let gun = n.gun;
-        let from = match (f.arsenal.npc_gun(gun), f.people.kinds.get(n.kind)) {
+        let (from, case) = match (f.arsenal.npc_gun(gun), f.people.kinds.get(n.kind)) {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
                 f.arsenal
@@ -2648,9 +2721,14 @@ impl Combat {
                         (n.hand, n.attach),
                         n.rig.two_handed,
                     )
-                    .map_or(n.chest(), |m| m.transform_point3(w.muzzle))
+                    .map_or((n.chest(), None), |m| {
+                        (
+                            m.transform_point3(w.muzzle),
+                            w.eject.map(|e| m.transform_point3(e)),
+                        )
+                    })
             }
-            _ => n.chest(),
+            _ => (n.chest(), None),
         };
         let distance = from.distance(aim);
         // Spread grows with range: about a third hit at 20 m for a VZ
@@ -2677,7 +2755,7 @@ impl Combat {
         let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
         self.effect(Effect::Tracer { from, to: end }, 0.07);
         let feel = gun.and_then(|g| self.feels.get(&g.template).copied());
-        self.gun_fired(feel, from, dir, RIFLE_FLASH, true);
+        self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, true);
         let closest = from + dir * (aim - from).dot(dir).max(0.0);
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
         if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
@@ -2990,7 +3068,13 @@ impl Combat {
                     let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
                     let on_props = RIFLE_DAMAGE * damage / CARBINE_ROUND;
                     if let Some((_, Some(j))) = hit
-                        && self.round_on_person(f.people, j, damage, ammo.key, aim * SHOT_PUSH)
+                        && self.round_on_person(
+                            f.people,
+                            j,
+                            (damage, ammo.hero),
+                            ammo.key,
+                            aim * SHOT_PUSH,
+                        )
                     {
                         self.remarks.push(Remark::Kill);
                     }
@@ -3003,7 +3087,8 @@ impl Combat {
                         self.hit_explosives_in(f.explosives, from + aim * t, on_props);
                     }
                 }
-                self.gun_fired(Some(w.feel), from, aim, MG_FLASH, false);
+                let case = case_behind(f.arsenal, w.model, from, aim);
+                self.gun_fired(Some(w.feel), (from, case), aim, MG_FLASH, false);
             }
             m2_engine::weapons::Flight::Lobbed => {
                 let speed = ammo.velocity.max(1.0);
@@ -3059,6 +3144,15 @@ impl Combat {
             return;
         };
         let gun = v.spec.tuning.gun;
+        // Its machine gun as its template arms it (the AMX-30's "Mounted
+        // Heavy MG (Tank) (VZ)"): the first gun of its armament whose
+        // rounds are bullets.
+        let mg = v
+            .spec
+            .armed
+            .iter()
+            .find(|m| m.weapon.flight() == m2_engine::weapons::Flight::Round)
+            .map(|m| m.weapon.clone());
         let (from, barrel) = v
             .spec
             .muzzle_pose(v.turret, v.gun)
@@ -3118,6 +3212,37 @@ impl Combat {
             );
             self.show_fx(fx::CANNON, from + aim * 0.8);
             self.sounds.push(Sound::Cannon(from));
+        } else if let Some(w) = mg {
+            // Its own machine gun's rate, round and look and sound.
+            if coax {
+                self.mg_reload = w.gap();
+            } else {
+                self.reload = w.gap();
+            }
+            let ammo = w.ammo;
+            let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
+            let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
+            self.effect(Effect::Tracer { from, to }, 0.07);
+            let damage = ammo.damage_at(hit.map_or(MG_RANGE, |h| h.0));
+            if let Some((_, Some(j))) = hit
+                && self.round_on_person(f.people, j, (damage, ammo.hero), ammo.key, aim * SHOT_PUSH)
+            {
+                self.remarks.push(Remark::Kill);
+            }
+            if let Some((t, None)) = hit {
+                let round = match ammo.key {
+                    Some(k) if k == m2_assets::name_hash("Bullet") => Round::Bullet,
+                    _ => Round::BulletLarge,
+                };
+                self.round_on_vehicle(f, (from, aim, t), (damage, round), Some(id));
+                self.hit_explosives_in(
+                    f.explosives,
+                    from + aim * t,
+                    RIFLE_DAMAGE * damage / CARBINE_ROUND,
+                );
+            }
+            let case = case_behind(f.arsenal, w.model, from, aim);
+            self.gun_fired(Some(w.feel), (from, case), aim, MG_FLASH, false);
         } else {
             if coax {
                 self.mg_reload = TANK_MG_GAP;
@@ -3129,7 +3254,7 @@ impl Combat {
             self.effect(Effect::Tracer { from, to }, 0.07);
             // A vehicle's machine gun with no template read: the alpha's
             // own flash and the rifle's shot.
-            self.gun_fired(None, from, aim, MG_FLASH, false);
+            self.gun_fired(None, (from, None), aim, MG_FLASH, false);
             if let Some((_, Some(j))) = hit {
                 let soldier = f.people.npcs[j].soldier;
                 if f.people.npcs[j].hurt(MG_DAMAGE, aim * SHOT_PUSH) && soldier {
@@ -3769,11 +3894,11 @@ impl Combat {
         &mut self,
         people: &mut People,
         j: usize,
-        damage: f32,
+        (damage, hero): (f32, f32),
         key: Option<u32>,
         push: Vec3,
     ) -> bool {
-        let taken = damage * HER_ROUNDS * self.on_person(&people.npcs[j], key);
+        let taken = damage * hero * self.on_person(&people.npcs[j], key);
         let n = &mut people.npcs[j];
         let counts = n.alive && n.soldier;
         let killed = n.hurt(taken, push) && n.soldier;
@@ -4417,8 +4542,8 @@ mod tests {
             fire: true,
             ..Trigger::default()
         };
-        // A VZ soldier's `Health` of 100 takes 10 carbine rounds of 6, at
-        // `HER_ROUNDS` times.
+        // A VZ soldier's `Health` of 100 takes 17 carbine rounds of 6 (no
+        // template here, so no `HeroMultiplier`).
         people.npcs[0].hp = m2_engine::ai::AiProfile::default().health;
         for _ in 0..600 {
             let mut field = Field {
@@ -4435,7 +4560,7 @@ mod tests {
             }
         }
         assert!(!people.npcs[0].alive);
-        assert_eq!(combat.hits, 10);
+        assert_eq!(combat.hits, 17);
         assert!(people.npcs[1].alert, "gunfire within 60 m alerts");
         assert!(
             combat
@@ -4658,7 +4783,12 @@ mod tests {
             back_left,
         ]);
         let mut arsenal = Arsenal::default();
-        arsenal.add("m4", crate::npc::tests::empty_model(), Vec3::Z, Some(&hers));
+        arsenal.add(
+            "m4",
+            crate::npc::tests::empty_model(),
+            (Vec3::Z, None),
+            Some(&hers),
+        );
         assert_eq!((arsenal.hand, arsenal.attach), (Some(1), Some(2)));
         arsenal.rehold(&his);
         assert_eq!((arsenal.hand, arsenal.attach), (Some(7), Some(8)));
@@ -5079,7 +5209,8 @@ mod tests {
 
     // Her rounds hurt each soldier by his own `ModifierKey` row (the VZ
     // heavies' `HumanArmor` takes a quarter of a `Bullet`), the `Human`
-    // row for those without one, times [`HER_ROUNDS`]; and the tally
+    // row for those without one, times their round's `HeroMultiplier`;
+    // and the tally
     // counts the hits and the kill.
     #[test]
     fn her_rounds_hurt_soldiers_by_their_own_row() {
@@ -5116,16 +5247,16 @@ mod tests {
         }
         assert_eq!(combat.on_person(&people.npcs[0], None), 1.0);
         assert_eq!(combat.on_person(&people.npcs[1], None), 0.25);
-        // The carbine's round (6 to 15 m): a deathsquad mook's 75 health
-        // goes in 7 hits.
-        let kills: Vec<bool> = (0..7)
-            .map(|_| combat.round_on_person(&mut people, 0, 6.0, None, Vec3::ZERO))
+        // The carbine's round (6 to 15 m, `HeroMultiplier` 3): a deathsquad
+        // mook's 75 health goes in 5 hits.
+        let kills: Vec<bool> = (0..5)
+            .map(|_| combat.round_on_person(&mut people, 0, (6.0, 3.0), None, Vec3::ZERO))
             .collect();
         assert_eq!(kills.iter().filter(|k| **k).count(), 1);
-        assert!(kills[6]);
-        combat.round_on_person(&mut people, 1, 6.0, None, Vec3::ZERO);
-        assert!((people.npcs[1].hp - (75.0 - 6.0 * HER_ROUNDS * 0.25)).abs() < 1e-4);
-        assert_eq!((combat.tally.hits, combat.tally.kills), (8, 1));
+        assert!(kills[4]);
+        combat.round_on_person(&mut people, 1, (6.0, 3.0), None, Vec3::ZERO);
+        assert!((people.npcs[1].hp - (75.0 - 6.0 * 3.0 * 0.25)).abs() < 1e-4);
+        assert_eq!((combat.tally.hits, combat.tally.kills), (6, 1));
     }
 
     #[test]
@@ -5280,6 +5411,7 @@ mod tests {
             damage: 0.0,
             damage_min: 0.0,
             falloff: (0.0, 0.0),
+            hero: 1.0,
             key: None,
             blast: None,
             timer: None,

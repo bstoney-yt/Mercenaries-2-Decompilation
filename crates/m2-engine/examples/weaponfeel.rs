@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     guns.sort_by(|a, b| a.name.cmp(&b.name).then(a.template.cmp(&b.template)));
     println!("{} guns (weapon templates with a model)", guns.len());
-    println!("name\trate/min\tsemi\tbank\tset\tflash\tflash s\tshell\tscatter[7]");
+    println!("name\trate/min\tsemi\tbank\tset\tflash\tshell hp\tshell\tscatter[7]");
     for w in &guns {
         let f = &w.feel;
         println!(
@@ -74,7 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             f.sound_bank.map_or("-".to_owned(), bank_name),
             f.sound_set.map_or("-".to_owned(), |s| format!("{s:08x}")),
             f.flash.map_or("-".to_owned(), name),
-            f.flash_time.map_or("-".to_owned(), |t| format!("{t:.3}")),
+            f.shell_hardpoint
+                .map_or("-".to_owned(), |h| format!("{h:08x}")),
             f.shell.map_or("-".to_owned(), name),
             f.scatter
         );

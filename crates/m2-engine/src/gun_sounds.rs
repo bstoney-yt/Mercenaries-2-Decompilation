@@ -10,15 +10,23 @@
 //! events named so far are [`FIRE`] (`weapon_fire`: the gun's own bank,
 //! `wpn_combatrifle`'s three loud shots for the carbine), [`FIRE_NPC`]
 //! (`weapon_fire_npc`: a cue of the resident `wpn_shared` bank),
-//! [`DRY_FIRE`] (`weapon_dryfire`), `reload` and `stow`; two more
-//! (`450459d9`, `a639af36`) are not named. `Param` is [`ANY`] on most rows;
+//! [`DRY_FIRE`] (`weapon_dryfire`), `reload` and `stow`. A gun that spins
+//! (the mounted miniguns' set `624c0986`) has no shot: it plays [`LOOP`]
+//! (`weapon_loop`, `wpn_minigun_fire_loop`) or [`LOOP_NPC`]
+//! (`weapon_loop_npc`) for as long as it fires, and [`FIRE_TAIL`]
+//! (`weapon_fire_tail`, a row most sets have) when it stops. The grapple's
+//! set answers its own events (`grapple_fire`, `grapple_attach`,
+//! `grapple_reel`, `grapple_reel_loop`, `grapple_loop`,
+//! `grapple_release`); [`GRAPPLE_FIRE`] is its shot. One event
+//! (`a639af36`, a cue of the `ui_hud` bank on most sets) is not named. `Param` is [`ANY`] on most rows;
 //! the assault rifles' NPC shot has six rows with other `Param`s (not
 //! named), which pick between three cues.
 //!
 //! # Provenance
 //!
 //! From samples: the table's columns are its own names; the events'
-//! names are found by hashing guesses (`weapon_fire` hashes to the
+//! names are found by hashing guesses (round 19 named the loop, tail and
+//! grapple events so) (`weapon_fire` hashes to the
 //! carbine's row whose cue is its bank's loudest three-variant record);
 //! that a gun plays `weapon_fire` when the hero fires and
 //! `weapon_fire_npc` when anyone else does is inferred from the names. Not
@@ -38,6 +46,10 @@ pub const SOUNDS_TABLE: u32 = 0x9cd0_6f1d;
 pub const FIRE: &str = "weapon_fire";
 pub const FIRE_NPC: &str = "weapon_fire_npc";
 pub const DRY_FIRE: &str = "weapon_dryfire";
+pub const LOOP: &str = "weapon_loop";
+pub const LOOP_NPC: &str = "weapon_loop_npc";
+pub const FIRE_TAIL: &str = "weapon_fire_tail";
+pub const GRAPPLE_FIRE: &str = "grapple_fire";
 
 /// Each sound set's cue per event.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -107,12 +119,29 @@ impl GunCues {
     }
 
     /// The cue a gun of sound set `set` fires with: the hero's
-    /// ([`FIRE`]) or anyone else's ([`FIRE_NPC`], else [`FIRE`]).
+    /// ([`FIRE`]) or anyone else's ([`FIRE_NPC`], else [`FIRE`]); the
+    /// grapple's [`GRAPPLE_FIRE`].
     pub fn shot(&self, set: u32, npc: bool) -> Option<u32> {
         if npc {
             self.cue(set, FIRE_NPC).or_else(|| self.cue(set, FIRE))
         } else {
             self.cue(set, FIRE)
+        }
+        .or_else(|| self.cue(set, GRAPPLE_FIRE))
+    }
+
+    /// The cue a spinning gun of sound set `set` loops while it fires
+    /// ([`LOOP`], or [`LOOP_NPC`] for anyone but the hero, else
+    /// [`LOOP`]): `None` for a gun with a shot of its own
+    /// ([`shot`](Self::shot)).
+    pub fn spin(&self, set: u32, npc: bool) -> Option<u32> {
+        if self.shot(set, npc).is_some() {
+            return None;
+        }
+        if npc {
+            self.cue(set, LOOP_NPC).or_else(|| self.cue(set, LOOP))
+        } else {
+            self.cue(set, LOOP)
         }
     }
 
@@ -140,6 +169,31 @@ mod tests {
         assert_eq!(name_hash(DRY_FIRE), 0x6eea_9c0f);
         assert_eq!(name_hash("reload"), 0x8190_ec52);
         assert_eq!(name_hash("stow"), 0xd8db_0afe);
+        assert_eq!(name_hash(LOOP), 0xa670_3286);
+        assert_eq!(name_hash(LOOP_NPC), 0x9987_da7e);
+        assert_eq!(name_hash(FIRE_TAIL), 0x4504_59d9);
+        assert_eq!(name_hash(GRAPPLE_FIRE), 0x70d9_68fd);
+    }
+
+    // The minigun's rows as the table has them: a loop, an NPC loop, a
+    // tail and a dry fire, no shot. The grapple's shot is its own event.
+    #[test]
+    fn a_minigun_loops_and_the_grapple_fires_its_own_event() {
+        let (minigun, grapple, carbine) = (0x624c_0986, 0x25f7_53ca, 0x01b4_7c45);
+        let cues = GunCues::from_rows([
+            [minigun, 0x9987_da7e, ANY, 0x2b5d_d674],
+            [minigun, 0xa670_3286, ANY, 0xa51b_442a],
+            [minigun, 0x4504_59d9, ANY, 0x0bb3_1676],
+            [grapple, 0x70d9_68fd, ANY, 0x6513_964d],
+            [carbine, 0x8f87_f89c, ANY, 0x33a0_71cc],
+        ]);
+        assert_eq!(cues.shot(minigun, false), None);
+        assert_eq!(cues.spin(minigun, false), Some(0xa51b_442a));
+        assert_eq!(cues.spin(minigun, true), Some(0x2b5d_d674));
+        assert_eq!(cues.cue(minigun, FIRE_TAIL), Some(0x0bb3_1676));
+        assert_eq!(cues.shot(grapple, false), Some(0x6513_964d));
+        // A gun with a shot does not spin.
+        assert_eq!(cues.spin(carbine, false), None);
     }
 
     // The carbine's rows as the table has them, and the assault rifle's
