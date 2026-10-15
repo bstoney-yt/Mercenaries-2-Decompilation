@@ -862,6 +862,10 @@ pub struct Scene {
     pub install: Option<Install>,
     /// Vehicles loaded on request ([`Scene::load_vehicle`]).
     requests: (Sender<Loaded>, Receiver<Loaded>),
+    /// Chunks wrecks have thrown, flying or lying ([`Chunk`]).
+    pub chunks: Vec<Chunk>,
+    /// The chunks' models by hash, `None` while one loads.
+    chunk_models: HashMap<u32, Option<GpuModel>>,
     /// Time spent streaming since this was last cleared: the island's
     /// streamer, vehicles and people, and the state layers' props.
     pub streamed: [Duration; 3],
@@ -903,6 +907,9 @@ pub struct ParkedVehicle {
     pub parts: Option<PartDamage>,
     /// The parts it has thrown off, falling and lying where they fell.
     pub loose: Vec<LoosePart>,
+    /// Whether its wreck has thrown its chunks ([`Chunk`]); a vehicle
+    /// loaded wrecked never does.
+    pub debris_thrown: bool,
 }
 
 /// A part a vehicle threw off (a door, the hood): drawn from the
@@ -965,6 +972,116 @@ impl LoosePart {
     }
 }
 
+/// A chunk a wreck threw (its template's `DebrisEffect`: `Chunk_aa`'s
+/// model), flying, then lying where it fell until its time is up.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Chunk {
+    /// Its template's model.
+    pub model: u32,
+    pub at: Vec3,
+    pub velocity: Vec3,
+    /// How it turns as it flies: about `axis`, `spin` radians a second.
+    pub axis: Vec3,
+    pub angle: f32,
+    pub spin: f32,
+    pub age: f32,
+    /// How long it lasts, seconds (between its record's `MinChunkTime`
+    /// and `MaxChunkTime`).
+    pub lasts: f32,
+}
+
+/// The chunks kept at most, all wrecks' together, the oldest going first
+/// (invented: a bound on what is drawn, not the game's).
+const CHUNKS_MOST: usize = 64;
+/// How steeply chunks leave, radians above level, least and most
+/// (invented: the records give a speed, not a direction).
+const CHUNK_RISE: (f32, f32) = (0.5, 1.1);
+
+impl Chunk {
+    /// Its place now.
+    pub fn place(&self) -> Mat4 {
+        Mat4::from_translation(self.at) * Mat4::from_axis_angle(self.axis, self.angle)
+    }
+
+    /// Flies `dt` on, falling; `ground` gives how far below a point the
+    /// ground is within a reach, if it is: there it stops and lies.
+    pub fn step(&mut self, dt: f32, ground: impl Fn(Vec3, f32) -> Option<f32>) {
+        self.age += dt;
+        if self.velocity == Vec3::ZERO {
+            return;
+        }
+        self.velocity.y -= 9.81 * dt;
+        let step = self.velocity * dt;
+        if step.y < 0.0
+            && let Some(d) = ground(self.at, -step.y)
+        {
+            self.at += step.with_y(-d);
+            self.velocity = Vec3::ZERO;
+            return;
+        }
+        self.at += step;
+        self.angle += self.spin * dt;
+    }
+}
+
+/// The chunks a wreck standing at `body` (its box `bounds`, model space)
+/// throws, as its template's `DebrisEffect` records say: per record
+/// between `iMinChunks` and `iMaxChunks` of its chunk, from the
+/// vehicle's middle, leaving at between `MinChunkVel` and `MaxChunkVel`
+/// m/s and lasting between `MinChunkTime` and `MaxChunkTime` seconds.
+/// Which way each goes ([`CHUNK_RISE`], any heading) and how it turns
+/// ([`LOOSE_SPIN`]) are invented; `seed` picks within the ranges.
+/// Records whose chunk has no model throw nothing (a fuel can, which is
+/// a pickup).
+pub fn throw_chunks(
+    debris: &[m2_engine::vehicle_damage::Debris],
+    body: Mat4,
+    bounds: (Vec3, Vec3),
+    seed: u32,
+) -> Vec<Chunk> {
+    // Near seeds spread apart before xorshift32 takes over.
+    let mut state = (seed ^ 0x2545_f491).wrapping_mul(0x9e37_79b9) | 1;
+    let mut random = move || {
+        // xorshift32, in [0, 1).
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state >> 8) as f32 / (1u32 << 24) as f32
+    };
+    for _ in 0..4 {
+        random();
+    }
+    let between = |r: f32, (lo, hi): (f32, f32)| lo + (hi - lo) * r;
+    let middle = body.transform_point3((bounds.0 + bounds.1) * 0.5);
+    let mut out = Vec::new();
+    for d in debris {
+        let Some(model) = d.model else { continue };
+        let (lo, hi) = d.count;
+        let n = lo + ((hi - lo + 1) as f32 * random()) as u32;
+        for _ in 0..n.min(hi) {
+            let heading = random() * std::f32::consts::TAU;
+            let rise = between(random(), CHUNK_RISE);
+            let way = Vec3::new(
+                heading.cos() * rise.cos(),
+                rise.sin(),
+                heading.sin() * rise.cos(),
+            );
+            let axis = Vec3::new(random() - 0.5, 0.5, random() - 0.5).normalize();
+            out.push(Chunk {
+                model,
+                at: middle,
+                velocity: way * between(random(), d.speed),
+                axis,
+                angle: 0.0,
+                spin: LOOSE_SPIN,
+                age: 0.0,
+                lasts: between(random(), d.lasts),
+            });
+        }
+    }
+    out
+}
+
 /// A vehicle's health where its template gives none.
 const VEHICLE_HEALTH: f32 = 500.0;
 
@@ -994,15 +1111,32 @@ impl ParkedVehicle {
         }
     }
 
-    /// A blast at `at` (world), its place `body`, reaching `reach` metres
-    /// with `damage` at its heart: its parts in reach take their share.
-    pub fn blast_parts(&mut self, body: Mat4, at: Vec3, reach: f32, damage: f32) {
+    /// A blast at `at` (world), its place `body`, reaching `reach` metres:
+    /// its parts in reach take `damage_at` their distance from its heart.
+    pub fn blast_parts(
+        &mut self,
+        body: Mat4,
+        at: Vec3,
+        reach: f32,
+        damage_at: impl Fn(f32) -> f32,
+    ) {
         let (Some(dm), Some(parts)) = (self.spec.damage.as_deref(), self.parts.as_mut()) else {
             return;
         };
         if !self.wrecked {
-            parts.blast(dm, body.inverse().transform_point3(at), reach, damage);
+            parts.blast(dm, body.inverse().transform_point3(at), reach, damage_at);
         }
+    }
+
+    /// The `ModifierKey` of its own of the part a hit at `at` (world),
+    /// its place `body`, strikes (a weak point's), if that part has one.
+    pub fn struck_key(&self, body: Mat4, at: Vec3) -> Option<u32> {
+        let (dm, parts) = (self.spec.damage.as_deref()?, self.parts.as_ref()?);
+        let k = dm.part_at(
+            body.inverse().transform_point3(at),
+            m2_engine::vehicle_damage::HIT_SLACK,
+        )?;
+        parts.key(k)
     }
 
     /// Its body's state as its health stands: damaged (burning, the hood
@@ -1142,6 +1276,8 @@ pub enum Loaded {
     /// A model for the helicopters' deliveries (a helicopter's, a supply
     /// crate's): its hash, each node's place at rest, and its rotors.
     Flight(u32, CpuModel, Vec<Mat4>, Vec<m2_assets::vehicle::Rotor>),
+    /// A wreck's chunk's model ([`Chunk`]): its hash and model.
+    Chunk(u32, CpuModel),
 }
 
 /// Finds the island's vehicle and person models and decodes the soldiers'
@@ -1345,6 +1481,8 @@ impl Scene {
             catalogue: None,
             install: None,
             requests: channel(),
+            chunks: Vec::new(),
+            chunk_models: HashMap::new(),
             streamed: [Duration::ZERO; 3],
         })
     }
@@ -1804,6 +1942,27 @@ impl Scene {
         });
     }
 
+    /// Loads a wreck's chunk's model `hash` on a thread.
+    fn load_chunk_model(&self, hash: u32) {
+        let Some(install) = self.install.clone() else {
+            return;
+        };
+        let tx = self.requests.0.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let mut source = install.open_world()?;
+                let data = source.model(hash)?;
+                let mut cpu = CpuModel::from_data(&data, 0)?;
+                cpu.decode_textures(&mut source, MODEL_TEXTURE_WIDTH);
+                let _ = tx.send(Loaded::Chunk(hash, cpu));
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("chunk model {hash:08x}: {e:#}");
+            }
+        });
+    }
+
     /// Loads a template's own person model (`Carmona`'s, a `VZ Soldier`'s)
     /// on a thread; it joins the people's kinds as `template`.
     fn load_character(&self, model: u32, template: String) {
@@ -1941,7 +2100,8 @@ impl Scene {
             | Loaded::Person(_, cpu, _, _)
             | Loaded::Weapon(_, cpu, _, _)
             | Loaded::HandModel(_, cpu, _, _)
-            | Loaded::Flight(_, cpu, _, _) => cpu,
+            | Loaded::Flight(_, cpu, _, _)
+            | Loaded::Chunk(_, cpu) => cpu,
         };
         let uploaded = self
             .materials
@@ -1988,6 +2148,7 @@ impl Scene {
                 damage: 0.0,
                 parts: None,
                 loose: Vec::new(),
+                debris_thrown: false,
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
@@ -2011,6 +2172,7 @@ impl Scene {
                     damage: 0.0,
                     parts: None,
                     loose: Vec::new(),
+                    debris_thrown: self.ruins.contains(&guid),
                 });
             }
             Loaded::WorldVehicle(entity, at, yaw, crew, spec, _) => {
@@ -2029,7 +2191,22 @@ impl Scene {
                     damage: 0.0,
                     parts: None,
                     loose: Vec::new(),
+                    debris_thrown: self.ruins.contains(&entity),
                 });
+            }
+            Loaded::Chunk(hash, _) => {
+                let (lying, near) = (
+                    self.chunks
+                        .iter()
+                        .filter(|c| c.velocity == Vec3::ZERO)
+                        .count(),
+                    self.chunks.iter().filter(|c| c.model == hash).count(),
+                );
+                eprintln!(
+                    "chunk model {hash:08x} up: {near} of {} chunks its, {lying} lying",
+                    self.chunks.len()
+                );
+                self.chunk_models.insert(hash, Some(model));
             }
             Loaded::Flight(hash, _, rest, rotors) => {
                 self.flights.loaded(
@@ -2132,7 +2309,8 @@ impl Scene {
             return;
         };
         let db = &world.index.template_db;
-        for v in &mut self.vehicles {
+        let mut thrown = Vec::new();
+        for (i, v) in self.vehicles.iter_mut().enumerate() {
             if v.parts.is_none()
                 && let Some(dm) = v.spec.damage.as_deref()
             {
@@ -2158,8 +2336,47 @@ impl Scene {
             if let Some(body) = v.id.and_then(|id| world.physics.vehicle_transform(id)) {
                 v.follow_health();
                 v.throw_loose(body);
+                if v.wrecked && !v.debris_thrown {
+                    v.debris_thrown = true;
+                    let debris = db
+                        .part_healths_for(&v.spec.label, v.spec.model)
+                        .map(|h| h.debris.as_slice())
+                        .unwrap_or_default();
+                    let seed = v.spec.model ^ (i as u32 + 1).wrapping_mul(0x9e37_79b9);
+                    let chunks = throw_chunks(debris, body, v.spec.bounds, seed);
+                    eprintln!(
+                        "wreck debris: {} throws {} chunks ({} records)",
+                        v.spec.label,
+                        chunks.len(),
+                        debris.len()
+                    );
+                    thrown.extend(chunks);
+                }
             }
             v.step_loose(dt);
+        }
+        let physics = &world.physics;
+        let ground = |at: Vec3, reach: f32| physics.cast_ray(at, Vec3::NEG_Y, reach + 0.05);
+        for c in &mut self.chunks {
+            c.step(dt, |at, reach| ground(at, reach).map(|(d, _)| d));
+        }
+        self.chunks.retain(|c| c.age < c.lasts);
+        self.chunks.extend(thrown);
+        if self.chunks.len() > CHUNKS_MOST {
+            let over = self.chunks.len() - CHUNKS_MOST;
+            self.chunks.drain(..over);
+        }
+        let wanted: Vec<u32> = self
+            .chunks
+            .iter()
+            .map(|c| c.model)
+            .filter(|m| !self.chunk_models.contains_key(m))
+            .collect();
+        for m in wanted {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.chunk_models.entry(m) {
+                e.insert(None);
+                self.load_chunk_model(m);
+            }
         }
     }
 
@@ -2254,6 +2471,11 @@ impl Scene {
                 );
                 v.spec.spin_rotors(&mut nodes, v.rolled);
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
+            }
+        }
+        for c in &self.chunks {
+            if let Some(Some(m)) = self.chunk_models.get(&c.model) {
+                m.draw(queue, c.place());
             }
         }
         let hanging = self.flights.draw(queue, &self.vehicles);
@@ -2845,5 +3067,82 @@ mod tests {
         assert_eq!(queue.submit(&mut backend).unwrap().draws, 1);
         backend.end_frame().unwrap();
         assert_eq!(backend.live_buffers().texture, 1);
+    }
+
+    /// The Valiant's `Chunk_ae` record (2 to 4, 15 to 30 m/s, 5 to 20 s)
+    /// and its fuel can, which has no model.
+    fn valiant_debris() -> Vec<m2_engine::vehicle_damage::Debris> {
+        use m2_engine::vehicle_damage::Debris;
+        vec![
+            Debris {
+                template: 0x8000_6396,
+                model: Some(0x5d2e_359b),
+                hardpoint: None,
+                count: (2, 4),
+                speed: (15.0, 30.0),
+                lasts: (5.0, 20.0),
+            },
+            Debris {
+                template: 0x8000_8608,
+                model: None,
+                hardpoint: None,
+                count: (1, 1),
+                speed: (0.1, 0.15),
+                lasts: (0.0, 0.2),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_wreck_throws_its_records_chunks_within_their_ranges() {
+        let bounds = (Vec3::new(-1.0, 0.0, -2.5), Vec3::new(1.0, 1.5, 2.5));
+        let body = Mat4::from_translation(Vec3::new(10.0, 2.0, 0.0));
+        let mut counts = HashSet::new();
+        for seed in 0..64 {
+            let chunks = throw_chunks(&valiant_debris(), body, bounds, seed);
+            assert!((2..=4).contains(&chunks.len()), "{}", chunks.len());
+            counts.insert(chunks.len());
+            for c in &chunks {
+                assert_eq!(c.model, 0x5d2e_359b);
+                assert_eq!(c.at, Vec3::new(10.0, 2.75, 0.0));
+                let speed = c.velocity.length();
+                assert!((15.0..=30.0).contains(&speed), "{speed}");
+                assert!(c.velocity.y > 0.0);
+                assert!((5.0..=20.0).contains(&c.lasts));
+            }
+        }
+        // Every count the record allows comes up.
+        assert_eq!(counts.len(), 3);
+        // The same seed throws the same.
+        assert_eq!(
+            throw_chunks(&valiant_debris(), body, bounds, 7),
+            throw_chunks(&valiant_debris(), body, bounds, 7)
+        );
+    }
+
+    #[test]
+    fn a_chunk_falls_to_the_ground_and_lies_there() {
+        let mut c = Chunk {
+            model: 1,
+            at: Vec3::new(0.0, 5.0, 0.0),
+            velocity: Vec3::new(4.0, 6.0, 0.0),
+            axis: Vec3::Y,
+            angle: 0.0,
+            spin: 5.0,
+            age: 0.0,
+            lasts: 10.0,
+        };
+        // Flat ground at y 0.
+        let ground = |at: Vec3, reach: f32| (at.y <= reach).then_some(at.y);
+        for _ in 0..300 {
+            c.step(1.0 / 60.0, ground);
+        }
+        assert_eq!(c.velocity, Vec3::ZERO);
+        assert!(c.at.y.abs() < 1e-4, "{}", c.at.y);
+        assert!(c.at.x > 4.0);
+        let lying = c;
+        c.step(1.0, ground);
+        assert_eq!(c.at, lying.at);
+        assert!((c.age - 6.0).abs() < 1e-3);
     }
 }

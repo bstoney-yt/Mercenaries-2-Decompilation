@@ -1092,6 +1092,7 @@ fn main() -> Result<(), Error> {
             "wrecks" => wrecks(&mut source, &names, arg),
             "blends" => blends(&mut source, &names, arg),
             "vdamage" => vdamage(&mut source, &names, arg),
+            "partdata" => partdata(&mut source, &names, arg),
             "treefit" => {
                 if world.is_none() {
                     world = Some(WorldIndex::build(&mut source)?);
@@ -7001,6 +7002,9 @@ fn vdamage<R: Read + Seek>(
         "vdamage\tmodel\tname\ttemplate\tparts\twith health\tunmatched records\tlooks before\tlooks after\tdamaged\tdestroyed\tthrown off\tburning fx\twreck fx\tfx named"
     );
     let mut t = [0usize; 12];
+    // Records naming the unsolved whole-vehicle name, weak parts, chunks
+    // thrown (twice the mean: min + max), models throwing any.
+    let mut extra = [0usize; 4];
     for (m, ids) in &vehicles {
         let Ok(data) = source.model(*m) else { continue };
         let Ok(model) = data.parse() else { continue };
@@ -7036,6 +7040,17 @@ fn vdamage<R: Read + Seek>(
             .iter()
             .filter(|p| dm.part_named(p.part).is_none())
             .count();
+        let whole = h
+            .parts
+            .iter()
+            .filter(|p| p.part == m2_engine::vehicle_damage::UNNAMED_WHOLE)
+            .count();
+        let chunks: u32 = h
+            .debris
+            .iter()
+            .filter(|c| c.model.is_some())
+            .map(|c| c.count.0 + c.count.1)
+            .sum();
         let mut looks: HashSet<Vec<bool>> = HashSet::new();
         looks.insert(d.hidden(&dm));
         let parts = dm.states.machines.len();
@@ -7091,6 +7106,17 @@ fn vdamage<R: Read + Seek>(
         t[9] += fx_named;
         t[10] += parts;
         t[11] += unmatched;
+        extra[0] += whole;
+        extra[1] += d.with_key();
+        extra[2] += chunks as usize;
+        extra[3] += usize::from(chunks > 0);
+        if d.with_key() > 0 {
+            println!(
+                "vdweak\t{m:08x}\t{}\t{} weak parts",
+                tnames.get(&id).copied().unwrap_or("?"),
+                d.with_key()
+            );
+        }
     }
     println!(
         "vdamage totals: {} vehicle models; {} without NodeHealth, {} without part messages, {} with; parts {}, NodeHealth records naming no part {}; looks before {} after {}; parts changing state {} changing look {} thrown off {}; body effects {} ({} name a template)",
@@ -7107,6 +7133,257 @@ fn vdamage<R: Read + Seek>(
         t[7],
         t[8],
         t[9]
+    );
+    println!(
+        "vdamage parts: NodeHealth records naming no part {} = {} the unsolved c851b695 (health 1000, one a template) + {} nodes the model lacks; weak parts {}; models whose wreck throws chunks {}, {:.1} chunks each on average",
+        t[11],
+        extra[0],
+        t[11] - extra[0],
+        extra[1],
+        extra[3],
+        extra[2] as f32 / 2.0 / extra[3].max(1) as f32
+    );
+    Ok(())
+}
+
+/// One component's records by template, with a field reader by name
+/// hash (the survey's own: `m2_engine`'s table reader is the crate's).
+struct Recs<'a> {
+    fields: HashMap<u32, (usize, u8, u8)>,
+    by: HashMap<u32, Vec<&'a [u8]>>,
+}
+
+impl<'a> Recs<'a> {
+    fn new(db: &Layer<'a>, name: &str) -> Self {
+        let Some(c) = db.component(name) else {
+            return Self {
+                fields: HashMap::new(),
+                by: HashMap::new(),
+            };
+        };
+        let mut by: HashMap<u32, Vec<&'a [u8]>> = HashMap::new();
+        for (id, r) in c.records().unwrap_or_default() {
+            by.entry(id).or_default().push(r);
+        }
+        Self {
+            fields: c
+                .fields
+                .iter()
+                .map(|f| {
+                    (
+                        f.name_hash,
+                        (usize::from(f.offset), f.bit_shift, f.bit_width),
+                    )
+                })
+                .collect(),
+            by,
+        }
+    }
+
+    fn of(&self, id: u32) -> &[&'a [u8]] {
+        self.by.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    fn word(&self, r: &[u8], field: u32) -> Option<u32> {
+        let &(at, shift, width) = self.fields.get(&field)?;
+        let b = r.get(at..at + 4)?;
+        let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        Some(if (1..32).contains(&width) {
+            (v >> shift) & ((1 << width) - 1)
+        } else {
+            v
+        })
+    }
+
+    fn float(&self, r: &[u8], field: u32) -> Option<f32> {
+        self.word(r, field).map(f32::from_bits)
+    }
+}
+
+/// `partdata[:<word>,..]`: over every vehicle template (as `vdamage`
+/// finds them) the part data its template holds beyond what round 14
+/// read: `NodeHealth` records by what their `Name` names (a part of the
+/// state machine, another node, nothing in the model) with their two
+/// unread fields; `ModifierKey` records naming a node (a part's own
+/// damage key); `PhysicsPropertyCrashable`; `DebrisEffect` (the chunks a
+/// wreck throws) with its counts and four floats; `VehiclePart` types.
+/// `pd*` lines, then totals.
+fn partdata<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    use m2_engine::vehicle_damage::DamageModel;
+    let words = words_of(arg);
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let models: HashSet<u32> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == MODEL_TYPE)
+        .map(|a| a.name_hash)
+        .collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let model_of = db.hashes("ModelName");
+    let mut vehicles: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for p in VEHICLE_PHYSICS {
+        if let Some(c) = db.component(p) {
+            for (id, _) in c.records().unwrap_or_default() {
+                let Some(&m) = model_of.get(&id) else {
+                    continue;
+                };
+                let name = tnames.get(&id).copied().unwrap_or("").to_ascii_lowercase();
+                if models.contains(&m)
+                    && (words.is_empty() || words.iter().any(|w| name.contains(w.as_str())))
+                    && !vehicles.get(&m).is_some_and(|v| v.contains(&id))
+                {
+                    vehicles.entry(m).or_default().push(id);
+                }
+            }
+        }
+    }
+    let h = m2_assets::name_hash;
+    let nh = Recs::new(&db, "NodeHealth");
+    let mk = Recs::new(&db, "ModifierKey");
+    let crash = Recs::new(&db, "PhysicsPropertyCrashable");
+    let debris = Recs::new(&db, "DebrisEffect");
+    let vpart = Recs::new(&db, "VehiclePart");
+    let (name, health) = (h("Name"), h("Health"));
+    let show = |v: u32| match names.get(v) {
+        Some(n) => format!("{v:08x} {n}"),
+        None => format!("{v:08x}"),
+    };
+    // NodeHealth: records, naming a part, another node, nothing; per
+    // unmatched name, (records, templates); the other fields' values.
+    let mut t = [0usize; 4];
+    let mut unmatched: BTreeMap<u32, (usize, f32, f32)> = BTreeMap::new();
+    let mut extra: BTreeMap<(u32, String), usize> = BTreeMap::new();
+    let (mut mk_named, mut crash_n, mut debris_n, mut debris_tpl) = (0, 0, 0, 0);
+    let mut debris_vals: BTreeMap<String, usize> = BTreeMap::new();
+    let mut part_types: BTreeMap<u32, usize> = BTreeMap::new();
+    for (m, ids) in &vehicles {
+        let Ok(data) = source.model(*m) else { continue };
+        let Ok(model) = data.parse() else { continue };
+        let dm = DamageModel::from_model(&model);
+        let node = |v: u32| model.nodes.iter().position(|n| n.name_hash == v);
+        let part = |v: u32| dm.as_ref().and_then(|d| d.part_named(v));
+        for &id in ids {
+            let tn = tnames.get(&id).copied().unwrap_or("?");
+            for r in nh.of(id) {
+                let Some(n) = nh.word(r, name) else { continue };
+                t[0] += 1;
+                let hp = nh.float(r, health).unwrap_or(0.0);
+                if part(n).is_some() {
+                    t[1] += 1;
+                } else if node(n).is_some() {
+                    t[2] += 1;
+                    println!("pdnode\t{tn}\t{}\tnode {:?}\thealth {hp}", show(n), node(n));
+                } else {
+                    t[3] += 1;
+                    if n != 0xc851_b695 {
+                        println!(
+                            "pdmiss\t{tn}\t{}\tmodel {}\thealth {hp}",
+                            show(n),
+                            names.show(*m)
+                        );
+                    }
+                    let e = unmatched.entry(n).or_insert((0, f32::MAX, f32::MIN));
+                    e.0 += 1;
+                    e.1 = e.1.min(hp);
+                    e.2 = e.2.max(hp);
+                }
+                for f in [0x27c5_0f84u32, 0xea81_3967, 0x0ec0_aee7, 0x261b_2109] {
+                    let v = nh.float(r, f).unwrap_or(0.0);
+                    if v != 0.0 && !(f == 0x27c5_0f84 && v == 1.0) {
+                        *extra.entry((f, format!("{v}"))).or_default() += 1;
+                    }
+                }
+            }
+            for r in mk.of(id) {
+                let n = mk.word(r, name).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                mk_named += 1;
+                let key = mk.word(r, h("ModifierKey")).unwrap_or(0);
+                println!(
+                    "pdkey\t{tn}\t{}\tkey {}\tpart {:?}\tnode {:?}",
+                    show(n),
+                    show(key),
+                    part(n),
+                    node(n)
+                );
+            }
+            for r in crash.of(id) {
+                crash_n += 1;
+                let n = crash.word(r, name).unwrap_or(0);
+                println!(
+                    "pdcrash\t{tn}\t{}\tnode {:?}\taf54061b {}\t6b54d7a7 {}",
+                    show(n),
+                    node(n),
+                    crash.word(r, 0xaf54_061b).unwrap_or(0),
+                    crash.float(r, 0x6b54_d7a7).unwrap_or(f32::NAN)
+                );
+            }
+            let d = debris.of(id);
+            if !d.is_empty() {
+                debris_tpl += 1;
+            }
+            for r in d {
+                debris_n += 1;
+                let w = |f: u32| debris.word(r, f).unwrap_or(0);
+                let fl = |f: u32| debris.float(r, f).unwrap_or(f32::NAN);
+                let tpl = w(h("Template"));
+                let key = format!(
+                    "{} n {}-{} f {} {} {} {} trail {} type {} hp {}",
+                    tnames.get(&tpl).copied().unwrap_or("?"),
+                    w(0xc552_8d68),
+                    w(0xb4cb_8ad2),
+                    fl(0xb5d8_61c7),
+                    fl(0xcf25_e331),
+                    fl(0x83ba_82b5),
+                    fl(0x51d7_bd57),
+                    w(h("Trail")),
+                    w(h("Type")),
+                    show(w(h("Hardpoint"))),
+                );
+                *debris_vals.entry(key).or_default() += 1;
+            }
+            for r in vpart.of(id) {
+                *part_types
+                    .entry(vpart.word(r, h("Type")).unwrap_or(99))
+                    .or_default() += 1;
+            }
+        }
+    }
+    for (n, (k, lo, hi)) in &unmatched {
+        println!("pdunmatched\t{}\t{k} records\thealth {lo}..{hi}", show(*n));
+    }
+    for ((f, v), k) in &extra {
+        println!("pdfield\t{f:08x}\t{v}\t{k}");
+    }
+    for (v, k) in &debris_vals {
+        println!("pddebris\t{k}\t{v}");
+    }
+    println!("pdparttypes\t{part_types:?}");
+    println!(
+        "partdata totals: {} vehicle models; NodeHealth records {} (part {}, other node {}, nothing {}, {} names); part ModifierKeys {mk_named}; Crashable {crash_n}; DebrisEffect {debris_n} on {debris_tpl} templates",
+        vehicles.len(),
+        t[0],
+        t[1],
+        t[2],
+        t[3],
+        unmatched.len()
     );
     Ok(())
 }
