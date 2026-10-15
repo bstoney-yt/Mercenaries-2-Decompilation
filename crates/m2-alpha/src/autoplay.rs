@@ -1673,10 +1673,11 @@ impl Autoplay {
             game.scene.people.fight_summary()
         );
         eprintln!(
-            "autoplay tally {:.1} s: {}; {}",
+            "autoplay tally {:.1} s: {}; {}; {}",
             self.clock,
             game.combat.tally.line(game.combat.fired.rifle),
-            game.scene.people.idle.line()
+            game.scene.people.idle.line(),
+            game.combat.shots_line()
         );
     }
 
