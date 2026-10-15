@@ -780,12 +780,18 @@ pub enum StaticKey {
 
 /// Suspension rest length and travel, metres.
 const SUSPENSION: f32 = 0.3;
-/// Steering lock at a standstill, radians.
+/// Steering lock at a standstill, radians, for a vehicle whose template
+/// gives none (its `SteerMaxAngle` otherwise,
+/// [`Handling`](crate::tuning::Handling)). Invented.
 const MAX_STEER: f32 = 0.6;
-/// Braking with the throttle against the motion, the handbrake (on the
-/// wheels that don't steer), rolling with no throttle, and holding still,
-/// m/s² (as if all wheels braked so).
+/// Braking with the throttle against the motion (for a vehicle whose
+/// template gives no `FrontBrake` and `RearBrake`), the handbrake (on
+/// the wheels that don't steer), rolling with no throttle, and holding
+/// still, m/s² (as if all wheels braked so). Invented.
 const SERVICE_BRAKE: f32 = 8.0;
+/// The tyres' friction coefficient, for a vehicle whose template gives
+/// no `FrontWheelFrictionSide` and `RearWheelFrictionSide`. Invented.
+const GRIP: f32 = 2.0;
 const HANDBRAKE: f32 = 9.0;
 const ROLLING: f32 = 0.6;
 const HOLD: f32 = 3.0;
@@ -910,6 +916,8 @@ struct VehicleBody {
     /// speed ([`VehicleTuning`](crate::VehicleTuning)).
     engine: Option<crate::tuning::EngineTuning>,
     tracks: Option<[f32; 4]>,
+    /// Its template's steering lock and brakes, on wheels.
+    handling: Option<crate::tuning::Handling>,
     /// Wrecked: nothing drives it any more.
     wrecked: bool,
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
@@ -1579,16 +1587,20 @@ impl Physics {
         let mut controller = DynamicRayCastVehicleController::new(body);
         controller.index_up_axis = 1;
         controller.index_forward_axis = 2;
-        let tuning = WheelTuning {
-            suspension_stiffness: 40.0,
-            suspension_compression: 2.0,
-            suspension_damping: 3.0,
-            max_suspension_travel: SUSPENSION,
-            side_friction_stiffness: 1.0,
-            friction_slip: 2.0,
-            max_suspension_force: spec.mass * 40.0,
-        };
+        // Each axle's tyres grip as its template's side friction says (the
+        // steering axle's as the front's).
+        let handling = spec.tuning.handling.filter(|_| !spec.tracked);
+        let grip = |front: bool| handling.map_or(GRIP, |h| if front { h.grip.0 } else { h.grip.1 });
         for w in &spec.wheels {
+            let tuning = WheelTuning {
+                suspension_stiffness: 40.0,
+                suspension_compression: 2.0,
+                suspension_damping: 3.0,
+                max_suspension_travel: SUSPENSION,
+                side_friction_stiffness: 1.0,
+                friction_slip: grip(w.steers),
+                max_suspension_force: spec.mass * 40.0,
+            };
             controller.add_wheel(
                 vector(w.centre + Vec3::Y * SUSPENSION),
                 -r::Vector::Y,
@@ -1641,6 +1653,7 @@ impl Physics {
             },
             engine: spec.tuning.engine.filter(|_| !spec.tracked),
             tracks: spec.tuning.tracks,
+            handling: spec.tuning.handling.filter(|_| !spec.tracked),
             wrecked: false,
             held: false,
             before: Vec3::ZERO,
@@ -1713,6 +1726,14 @@ impl Physics {
         // flat, up to its steepest hill (tracks hold it by their grip).
         let most = if v.tracked { 0.0 } else { CLIMB };
         let uphill = (nose * throttle.signum()).clamp(0.0, most.sin());
+        // Braking against the motion: each axle as its template's brake
+        // says (else 8 m/s²), the front's on the wheels that steer.
+        let service = |front: bool| {
+            let decel = v
+                .handling
+                .map_or(SERVICE_BRAKE, |h| if front { h.brake.0 } else { h.brake.1 });
+            slowing(decel * throttle.abs())
+        };
         let (force, brake) = if controls.parked {
             let hard = if speed.abs() > PARKED_FAST {
                 HOLD
@@ -1723,7 +1744,7 @@ impl Physics {
         } else if controls.brake {
             (0.0, slowing(ROLLING))
         } else if against {
-            (0.0, slowing(SERVICE_BRAKE * throttle.abs()))
+            (0.0, -1.0)
         } else if throttle != 0.0 {
             let pull = push + GRAVITY * uphill;
             (throttle * v.mass * pull / wheels, 0.0)
@@ -1732,7 +1753,10 @@ impl Physics {
         } else {
             (0.0, slowing(ROLLING))
         };
-        let steer = controls.steer.clamp(-1.0, 1.0) * MAX_STEER / (1.0 + speed.abs() * 0.04);
+        // Its template's lock at a standstill, less as it speeds up (the
+        // fall with speed invented).
+        let lock = v.handling.map_or(MAX_STEER, |h| h.steer_lock);
+        let steer = controls.steer.clamp(-1.0, 1.0) * lock / (1.0 + speed.abs() * 0.04);
         let steer = if v.tracked { 0.0 } else { steer };
         let tracked = v
             .tracked
@@ -1746,6 +1770,8 @@ impl Physics {
             w.steering = if front { steer } else { 0.0 };
             w.brake = if controls.brake && !front {
                 slowing(HANDBRAKE)
+            } else if brake < 0.0 {
+                service(front)
             } else {
                 brake
             };
@@ -3508,6 +3534,67 @@ mod tests {
         assert!(p.vehicle_speed(id).abs() < 0.5, "{}", p.vehicle_speed(id));
         p.remove_vehicle(id);
         assert!(p.vehicle_transform(id).is_none());
+    }
+
+    // A car whose template gives its brakes and lock slows as its brakes
+    // say (the mean of its axles' m/s²) and turns its front wheels as
+    // far as its lock, not the invented 8 m/s² and 0.6 rad.
+    #[test]
+    fn brakes_and_lock_come_from_the_template() {
+        let slowing = |brake: (f32, f32), lock: f32| {
+            let mut spec = car();
+            spec.tuning.handling = Some(crate::tuning::Handling {
+                steer_lock: lock,
+                brake,
+                grip: (1.5, 1.5),
+            });
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+            p.step(DT);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -400.0), 0.0);
+            for _ in 0..60 {
+                p.step(DT);
+            }
+            // Full lock at a standstill.
+            p.drive(
+                id,
+                VehicleControls {
+                    steer: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            let steered = p.vehicle_wheels(id)[0].0;
+            while p.vehicle_speed(id) < 12.0 {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        throttle: 1.0,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+            }
+            let (v0, mut t) = (p.vehicle_speed(id), 0.0);
+            while p.vehicle_speed(id) > 0.3 && t < 10.0 {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        throttle: -1.0,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+                t += DT;
+            }
+            (steered, v0 / t)
+        };
+        let (lock, soft) = slowing((3.0, 1.0), 1.0);
+        assert!((lock - 1.0).abs() < 0.05, "{lock}");
+        assert!((soft - 2.0).abs() < 0.4, "{soft}");
+        let (lock, hard) = slowing((9.0, 7.0), 0.5);
+        assert!((lock - 0.5).abs() < 0.05, "{lock}");
+        assert!((hard - 8.0).abs() < 1.0, "{hard}");
     }
 
     #[test]
