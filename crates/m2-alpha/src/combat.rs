@@ -1196,9 +1196,10 @@ pub struct Trigger {
     pub detonate: bool,
     /// Move to the vehicle's next seat with a weapon.
     pub seat: bool,
-    /// The support key: the support menu opens or closes
-    /// ([`crate::support`]).
+    /// The support keys, up and down: the support menu opens, or its
+    /// line moves ([`crate::support`]).
     pub support: bool,
+    pub support_down: bool,
     /// The PDA key: the PDA opens or closes.
     pub pda: bool,
 }

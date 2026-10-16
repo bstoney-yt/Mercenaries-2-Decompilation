@@ -1062,12 +1062,12 @@ impl Game {
             Some(_) => Call {
                 aim_at,
                 menu: intent.trigger.support,
+                menu_down: intent.trigger.support_down,
                 // At the menu or the view, the jump (the pad's A, which
                 // the texts' `[confirm]` shows) confirms as well.
                 use_pressed: intent.use_pressed || (intent.jump && self.support.busy()),
                 fire: intent.trigger.fire,
                 steer: intent.movement,
-                look: intent.look,
                 select: intent.trigger.select.is_some(),
                 hurt: hp < self.support_hp,
                 pda: intent.trigger.pda,

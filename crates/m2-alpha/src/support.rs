@@ -51,10 +51,10 @@ const SAT_HEIGHT: f32 = 170.0;
 const SAT_SPAN: f32 = 110.0;
 const SAT_NEAR: f32 = 5.0;
 const SAT_FAR: f32 = 3000.0;
-/// The view moves this fast with the keys (m/s), this far for a radian of
-/// the mouse's turn (metres), and no further than this from her (metres).
+/// The view moves this fast with the keys or the stick (m/s), and no
+/// further than this from her (metres). The mouse leaves it be: on the PC
+/// it moves with W A S D (the owner's play of the PC game).
 const VIEW_SPEED: f32 = 5.0;
-const VIEW_PER_RADIAN: f32 = 150.0;
 pub const VIEW_REACH: f32 = 100.0;
 /// The designator comes up this long before the view opens (seconds; the
 /// videos: a moment, up to a second).
@@ -270,15 +270,15 @@ pub enum Phase {
 /// What she does at the support this tick, from her keys.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Call {
-    /// The support key: the support menu opens, or closes.
+    /// The support key (up): the support menu opens, or its line moves up.
     pub menu: bool,
+    /// The support key down: the menu opens, or its line moves down.
+    pub menu_down: bool,
     pub use_pressed: bool,
     /// Fire held.
     pub fire: bool,
     /// Steering the view with the keys: right and up the screen, -1 to 1.
     pub steer: Vec2,
-    /// The mouse's turn (radians: left, up), which steers the view too.
-    pub look: Vec2,
     /// A weapon taken up: the call is put away.
     pub select: bool,
     /// She was hurt: the designation is called off (a tutorial line says
@@ -619,7 +619,10 @@ impl Support {
         let press = fired || call.use_pressed;
         let here = Vec2::new(her.x, her.z);
         self.here = her;
-        let back = call.menu || call.select;
+        // The support keys, up and down: either opens the menu, then moves
+        // its line; a weapon taken up puts it away.
+        let support = call.menu || call.menu_down;
+        let back = support || call.select;
         // The menu's line moves once for each push up or down.
         let way = match call.steer.y {
             y if y > 0.5 => 1,
@@ -628,24 +631,27 @@ impl Support {
         };
         let pushed = (way != self.steered).then_some(way).filter(|&w| w != 0);
         self.steered = way;
+        let pushed = match (call.menu, call.menu_down) {
+            (true, false) => Some(1),
+            (false, true) => Some(-1),
+            _ => pushed,
+        };
         // The PDA opens and shuts with its key while no call is under way;
         // while it is open the call's keys do nothing.
         if call.pda && self.phase == Phase::Idle {
             self.pda = !self.pda;
             self.posts.push(if self.pda { PDA_OPEN } else { PDA_CLOSE });
         }
-        // Screen right is the world's -x, looking down with north (+z) up;
-        // the mouse to the right turns the look negative.
+        // Screen right is the world's -x, looking down with north (+z) up.
         let steer = |at: Vec2| {
-            let moved = Vec2::new(-call.steer.x, call.steer.y) * VIEW_SPEED * dt
-                + call.look * VIEW_PER_RADIAN;
+            let moved = Vec2::new(-call.steer.x, call.steer.y) * VIEW_SPEED * dt;
             here + (at + moved - here).clamp_length_max(VIEW_REACH)
         };
         self.phase = match self.phase {
             _ if self.pda => self.phase,
-            Phase::Idle if call.menu && !self.entries().is_empty() => Phase::Menu,
+            Phase::Idle if support && !self.entries().is_empty() => Phase::Menu,
             Phase::Idle => Phase::Idle,
-            Phase::Menu if back => Phase::Idle,
+            Phase::Menu if call.select => Phase::Idle,
             Phase::Menu if call.use_pressed => match self.chosen() {
                 Some(Entry::Own(_)) => Phase::Holding { left: EQUIP_TIME },
                 // The scripts call it in, and hand her its designator.
@@ -1331,6 +1337,16 @@ mod tests {
             menu: true,
             ..Call::default()
         };
+        step(&mut s, menu, her, &mut posts);
+        assert_eq!(s.phase, Phase::Menu);
+        // The support keys move the line (down, then back up), and stay
+        // in the menu.
+        let menu_down = Call {
+            menu_down: true,
+            ..Call::default()
+        };
+        step(&mut s, menu_down, her, &mut posts);
+        assert_eq!(s.hud(0.0).item.map(|i| i.0).as_deref(), Some("Support"));
         step(&mut s, menu, her, &mut posts);
         assert_eq!(s.phase, Phase::Menu);
         // Down twice, letting go between: the cluster bomb.

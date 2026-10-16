@@ -18,15 +18,16 @@
 //! around the player: Jennifer on foot with a third-person camera
 //! (`--spawn` picks where to start; the default is the PMC's headquarters,
 //! where free roam begins after the first contract). WASD
-//! runs, Shift sprints, Q held walks, Space jumps. E gets in and out of
+//! runs, Shift sprints, Left Ctrl held walks, Space jumps (the PC game's
+//! keys, [`input`]). E gets in and out of
 //! vehicles: in free roam also those parked ahead of the spawn, with a
 //! mission only those the layers and scripts place (WASD drive, Space
-//! brakes, R rights an overturned one). V switches to a
+//! brakes, R rights an overturned one). F4 switches to a
 //! free-flying camera and back (`--fly` starts flying): WASD/Space/C fly,
 //! Shift speeds up. With `--model` it shows those models on a ground grid
 //! instead, characters playing the game's locomotion clips in place (N
 //! steps through idle, walk, run and sprint; `--gait` picks the first).
-//! Tab or the right mouse button captures the mouse, F11 toggles
+//! A click captures the mouse (F2 lets it go), F11 toggles
 //! fullscreen, F3 toggles back-face culling, Escape releases the mouse,
 //! then quits.
 //!
@@ -214,7 +215,8 @@ struct Options {
     /// With `--screenshot`: the picture with her PDA open.
     pda: bool,
     /// With `--pda`: keys pressed (Flash key codes, 36 the map's current
-    /// contract) half way through the HUD's run.
+    /// contract, 87 W to move the map) half way through the HUD's run and
+    /// held to its end.
     pda_keys: Vec<i32>,
     /// With `--mission --screenshot`: take the picture from this far from
     /// the nearest marker, looking at it.
@@ -4710,7 +4712,7 @@ impl App {
         hud.game = game_hud(self.install.as_ref(), &self.mode, self.old_hud, &game);
         hud.dev = self.dev;
         eprintln!(
-            "keys: the developer's (V free camera, F5/F9 quick save and load, F3 culling, \
+            "keys: the developer's (F4 free camera, F5/F9 quick save and load, F3 culling, \
              N gait) {}",
             if self.dev { "on" } else { "off (--dev)" }
         );
@@ -4850,7 +4852,12 @@ impl Running {
     /// open) and draws a frame with the HUD.
     fn frame(&mut self, config: &mut Config, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
         let now = Instant::now();
-        self.read_pad((now - self.last).min(MAX_FRAME).as_secs_f64());
+        let dt = (now - self.last).min(MAX_FRAME).as_secs_f64();
+        self.read_pad(dt);
+        // The look keys (I J K L) turn the view as the pad's stick does.
+        if self.focused && !self.hud.menu {
+            self.input.key_look(dt);
+        }
         self.lag += (now - self.last).min(MAX_FRAME);
         self.last = now;
         while self.lag >= TICK {
@@ -5400,23 +5407,42 @@ impl ApplicationHandler for App {
                 state.released = false;
                 state.input.mouse_used();
             }
-            // With the mouse captured, the buttons fire, aim and bash.
+            // With the mouse captured, its buttons and wheel do what they
+            // are bound to (by default the PC game's: fire, the secondary
+            // attack, melee, and the wheel switches weapon).
             WindowEvent::MouseInput {
                 state: pressed,
                 button,
                 ..
             } if state.mouse_look && state.focused => {
-                let action = match button {
-                    winit::event::MouseButton::Left => Some(Action::Fire),
-                    winit::event::MouseButton::Right => Some(Action::Aim),
-                    winit::event::MouseButton::Middle => Some(Action::Melee),
+                let control = match button {
+                    winit::event::MouseButton::Left => Some(input::Mouse::Left),
+                    winit::event::MouseButton::Right => Some(input::Mouse::Right),
+                    winit::event::MouseButton::Middle => Some(input::Mouse::Middle),
                     _ => None,
                 };
-                if let Some(a) = action {
-                    if pressed == ElementState::Pressed {
+                if let Some(c) = control {
+                    let down = pressed == ElementState::Pressed;
+                    if down {
                         state.input.mouse_used();
                     }
-                    state.input.button(a, pressed == ElementState::Pressed);
+                    state.input.key(&self.config.keys, c, down, false);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if state.mouse_look && state.focused => {
+                let up = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                if up != 0.0 {
+                    let c = if up > 0.0 {
+                        input::Mouse::WheelUp
+                    } else {
+                        input::Mouse::WheelDown
+                    };
+                    state.input.mouse_used();
+                    state.input.key(&self.config.keys, c, true, false);
+                    state.input.key(&self.config.keys, c, false, false);
                 }
             }
             WindowEvent::RedrawRequested => {
