@@ -203,6 +203,20 @@ impl Default for Falloff {
 }
 
 impl Falloff {
+    /// A cue record's distances (`min_distance`, `max_distance`): full
+    /// within the first, silent past the second. `None` for a record that
+    /// gives none (0 or less, or the far no further than the near).
+    pub fn of_record(min_distance: f32, max_distance: f32) -> Option<Self> {
+        (min_distance.is_finite()
+            && max_distance.is_finite()
+            && max_distance > 0.0
+            && max_distance > min_distance)
+            .then(|| Self {
+                near: min_distance.max(1.0),
+                far: max_distance,
+            })
+    }
+
     pub fn gain(&self, distance: f32) -> f32 {
         if distance >= self.far {
             return 0.0;
@@ -330,6 +344,10 @@ impl Play {
 
     pub fn gain(self, gain: f32) -> Self {
         Self { gain, ..self }
+    }
+
+    pub fn falloff(self, falloff: Falloff) -> Self {
+        Self { falloff, ..self }
     }
 
     /// Marks it an interface sound, which no script fades.
@@ -742,6 +760,9 @@ pub fn world_cue_tables<R: Read + Seek>(source: &mut AssetSource<R>) -> Vec<CueT
 pub struct KeySounds {
     pub sounds: Vec<(SoundBuffer, f32)>,
     pub volume: f32,
+    /// How far it carries: its record's distances (a mixed cue's, the
+    /// farthest of its tracks' records'), where the record gives them.
+    pub falloff: Option<Falloff>,
     pub how: String,
 }
 
@@ -778,8 +799,9 @@ impl KeySounds {
             if sounds.is_empty() {
                 continue;
             }
+            let falloff = Falloff::of_record(record.min_distance, record.max_distance);
             let how = format!(
-                "cue of table {:08x}: {} of its {} variants (banks {}), volume {:.2}",
+                "cue of table {:08x}: {} of its {} variants (banks {}), volume {:.2}, heard {:.0} to {:.0} m",
                 t.hash,
                 sounds.len(),
                 record.variants.len(),
@@ -788,7 +810,9 @@ impl KeySounds {
                     .map(|b| format!("{b:08x}"))
                     .collect::<Vec<_>>()
                     .join(", "),
-                record.volume
+                record.volume,
+                record.min_distance,
+                record.max_distance
             );
             let volume = if record.volume > 0.0 {
                 record.volume
@@ -798,6 +822,7 @@ impl KeySounds {
             return Some(Self {
                 sounds,
                 volume,
+                falloff,
                 how,
             });
         }
@@ -826,6 +851,7 @@ impl KeySounds {
                 ),
                 sounds,
                 volume: 1.0,
+                falloff: None,
             })
         };
         let library = SoundLibrary::load_banks(source, &[key]);
@@ -848,53 +874,79 @@ impl KeySounds {
         tables: &[CueTable],
         mix: &m2_assets::MixedCue,
     ) -> Option<Self> {
-        let records: Vec<(&m2_assets::voice::Record, f32)> = mix
+        let records: Vec<(&m2_assets::voice::Record, f32, f32)> = mix
             .tracks
             .iter()
             .filter_map(|t| {
                 let table = tables.iter().find(|c| c.hash == t.table)?;
-                Some((table.records.get(t.record as usize)?, t.start))
+                Some((table.records.get(t.record as usize)?, t.start, t.level))
             })
             .collect();
         let mut banks: Vec<u32> = records
             .iter()
-            .flat_map(|(r, _)| r.variants.iter().map(|v| v.0))
+            .flat_map(|(r, _, _)| r.variants.iter().map(|v| v.0))
             .collect();
         banks.sort_unstable();
         banks.dedup();
         let library = SoundLibrary::load_banks(source, &banks);
+        // As far as its farthest-carrying record.
+        let falloff = records
+            .iter()
+            .filter_map(|(r, _, _)| Falloff::of_record(r.min_distance, r.max_distance))
+            .reduce(|a, b| Falloff {
+                near: a.near.max(b.near),
+                far: a.far.max(b.far),
+            });
         let layers: Vec<(Vec<SoundBuffer>, f32, f32)> = records
             .iter()
-            .map(|(r, start)| {
+            .map(|(r, start, level)| {
                 let sounds: Vec<SoundBuffer> = r
                     .variants
                     .iter()
                     .filter_map(|&(bank, i, _)| library.bank_hash(bank)?.1.get(i as usize).cloned())
                     .filter(|s| s.frames() > 0)
                     .collect();
-                (sounds, *start, if r.volume > 0.0 { r.volume } else { 1.0 })
+                let volume = if r.volume > 0.0 { r.volume } else { 1.0 };
+                (sounds, *start, volume * level)
             })
             .filter(|(s, _, _)| !s.is_empty())
             .collect();
+        // A loop (-1 s) starts at its first track: no silence ahead of it
+        // each time round (inferred; the minigun's starts 0.033 s in).
+        let lead = if mix.seconds < 0.0 {
+            layers.iter().map(|l| l.1).fold(f32::INFINITY, f32::min)
+        } else {
+            0.0
+        };
+        let layers: Vec<(Vec<SoundBuffer>, f32, f32)> = layers
+            .into_iter()
+            .map(|(s, start, gain)| (s, (start - lead).max(0.0), gain))
+            .collect();
         let most = layers.iter().map(|l| l.0.len()).max()?;
         let takes = most.clamp(1, MIXES);
+        let mut peak = 0.0_f32;
         let sounds: Vec<(SoundBuffer, f32)> = (0..takes)
             .filter_map(|k| {
                 let picked: Vec<(&SoundBuffer, f32, f32)> = layers
                     .iter()
                     .map(|(s, start, gain)| (&s[k % s.len()], *start, *gain))
                     .collect();
+                peak = peak.max(layers_peak(&picked).unwrap_or(0.0));
                 Some((mix_layers(mix.cue, &picked)?, 1.0))
             })
             .collect();
         (!sounds.is_empty()).then(|| Self {
             how: format!(
-                "mixed cue: {} of its {} tracks ({}), {} takes of {:.2} s",
+                "mixed cue: {} of its {} tracks ({}), {} takes of {:.2} s, peak {peak:.2} of full scale",
                 layers.len(),
                 mix.tracks.len(),
                 layers
                     .iter()
-                    .map(|(s, start, _)| format!("{} at {start:.2} s", s.len()))
+                    .map(|(s, start, gain)| format!(
+                        "{} at {start:.2} s x{gain:.2} ({} Hz)",
+                        s.len(),
+                        s[0].rate
+                    ))
                     .collect::<Vec<_>>()
                     .join(", "),
                 sounds.len(),
@@ -902,6 +954,7 @@ impl KeySounds {
             ),
             sounds,
             volume: 1.0,
+            falloff,
         })
     }
 
@@ -935,6 +988,24 @@ const MIXES: usize = 4;
 /// is (a mono layer goes to both sides), scaled to fit 16 bits. Layers at
 /// another rate are left out. `None` if nothing is left.
 pub fn mix_layers(hash: u32, layers: &[(&SoundBuffer, f32, f32)]) -> Option<SoundBuffer> {
+    let (sum, channels, rate) = sum_layers(layers)?;
+    // Scaled down as a whole where the layers' sum overflows (invented:
+    // the game's mixer is not decoded; clipped, a pistol's five layers
+    // cut off over 1,000 samples).
+    let peak = sum.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+    let fit = if peak > 32767.0 { 32767.0 / peak } else { 1.0 };
+    Some(SoundBuffer {
+        hash,
+        channels,
+        rate,
+        samples: sum
+            .iter()
+            .map(|v| (v * fit).round().clamp(-32768.0, 32767.0) as i16)
+            .collect(),
+    })
+}
+/// `layers` summed (see [`mix_layers`]): the samples, channels and rate.
+fn sum_layers(layers: &[(&SoundBuffer, f32, f32)]) -> Option<(Vec<f32>, u16, u32)> {
     let rate = layers.first()?.0.rate;
     let layers: Vec<_> = layers.iter().filter(|l| l.0.rate == rate).collect();
     let channels: u16 = if layers.iter().any(|l| l.0.channels > 1) {
@@ -959,21 +1030,16 @@ pub fn mix_layers(hash: u32, layers: &[(&SoundBuffer, f32, f32)]) -> Option<Soun
             }
         }
     }
-    // Scaled down as a whole where the layers' sum overflows (invented:
-    // the game's mixer is not decoded; clipped, a pistol's five layers
-    // cut off over 1,000 samples).
-    let peak = sum.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
-    let fit = if peak > 32767.0 { 32767.0 / peak } else { 1.0 };
-    Some(SoundBuffer {
-        hash,
-        channels,
-        rate,
-        samples: sum
-            .iter()
-            .map(|v| (v * fit).round().clamp(-32768.0, 32767.0) as i16)
-            .collect(),
-    })
+    Some((sum, channels, rate))
 }
+
+/// How loud `layers` summed peak, as a share of 16 bits' full scale
+/// (above 1: the sum overflows).
+pub fn layers_peak(layers: &[(&SoundBuffer, f32, f32)]) -> Option<f32> {
+    let (sum, _, _) = sum_layers(layers)?;
+    Some(sum.iter().fold(0.0_f32, |m, v| m.max(v.abs())) / 32767.0)
+}
+
 /// A bank's sound, decoded.
 fn buffer(s: &m2_assets::sound::Sound) -> SoundBuffer {
     SoundBuffer {
@@ -1417,6 +1483,7 @@ mod tests {
         let key = KeySounds {
             sounds: vec![(sound(1), 0.25), (sound(2), 0.75)],
             volume: 1.0,
+            falloff: None,
             how: String::new(),
         };
         assert_eq!(key.pick(0.0).map(|s| s.hash), Some(1));
@@ -1521,6 +1588,20 @@ mod tests {
         assert_eq!(f.gain(1.0), 1.0);
         assert!((f.gain(8.0) - 0.5).abs() < 1e-6);
         assert_eq!(f.gain(f.far), 0.0);
+    }
+
+    #[test]
+    fn a_records_distances_set_how_far_it_carries() {
+        // A gun shot's record: full to 10 m, gone at 1000 m.
+        let f = Falloff::of_record(10.0, 1000.0).unwrap();
+        assert_eq!((f.near, f.far), (10.0, 1000.0));
+        assert_eq!(f.gain(10.0), 1.0);
+        assert!(f.gain(300.0) > 0.0 && f.gain(1000.0) == 0.0);
+        // Nothing given, or nonsense: none.
+        assert_eq!(Falloff::of_record(0.0, 0.0), None);
+        assert_eq!(Falloff::of_record(50.0, 20.0), None);
+        // A near closer than a metre is a metre.
+        assert_eq!(Falloff::of_record(0.0, 40.0).unwrap().near, 1.0);
     }
 
     #[test]

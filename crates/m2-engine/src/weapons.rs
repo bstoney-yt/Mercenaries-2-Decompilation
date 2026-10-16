@@ -44,6 +44,11 @@ const HUMAN_BOOST: u32 = 0xf3f6_f0a9;
 /// their values (the carbine round's 15 and 50 m, the shotgun's 5 and 50,
 /// the heavy machine gun's 20 and 300); inferred.
 const DAMAGE_MINIMUM: u32 = 0x33f1_fb12;
+/// `ProjectilePhysics`' `HeroMultiplier` (name found by hashing guesses,
+/// round 19): the carbine's, rifles', pistols' and machine guns' rounds 3,
+/// the automatic rifle's and light machine gun's 2, the RPG's 1.5, the
+/// sniper and anti-material rifles' and every bomb's 1.
+const HERO_MULTIPLIER: u32 = 0x0858_81b0;
 const FALLOFF_NEAR: u32 = 0xe184_b8a0;
 const FALLOFF_FAR: u32 = 0x1d98_7340;
 /// `SpawnOnDeath`'s and `TimerResponse`'s template field (name unknown).
@@ -75,11 +80,12 @@ const STIMULUS_REACH: u32 = 0x1417_f4dd;
 /// `WeaponScatter`'s first field (see [`WeaponSpec::scatter`]).
 const SCATTER: u32 = 0x0006_5d26;
 
-/// `WeaponEffects`' unnamed fields: a float beside the muzzle flash (the
-/// carbine's and the anti-material rifle's 0.035; read as how long the
-/// flash shows, seconds: inferred) and the shell casing's effect
-/// (`global_particle_shellsmall`).
-const FLASH_TIME: u32 = 0xd62d_ab7b;
+/// `WeaponEffects`' `ShellEjectHardpoint` (the gun model's node a spent
+/// case flies from, a name hash: `hp_shelleject` on all guns but the
+/// covert pistol's `7eabfa05`; round 17 read its bits as a float, 0.035,
+/// and took it for the flash's time) and `ShellEjectTemplate` (the case's effect,
+/// `global_particle_shellsmall`). Both names found by hashing guesses.
+const SHELL_HARDPOINT: u32 = 0xd62d_ab7b;
 const SHELL: u32 = 0x1efe_cdea;
 /// `SoundEffect`'s field naming a sound bank (the carbine's
 /// `wpn_combatrifle` block's bank `50333181`; vehicles' engines too).
@@ -95,20 +101,97 @@ pub struct Feel {
     /// `Sounds` table keys its cues by ([`crate::gun_sounds`]).
     pub sound_set: Option<u32>,
     /// Its muzzle flash's template (`MuzzleFlashTemplate`:
-    /// `global_particle_muzzleflash_blue` for the carbine) and how long it
-    /// shows, seconds (see [`FLASH_TIME`]).
+    /// `global_particle_muzzleflash_blue` for the carbine).
     pub flash: Option<u32>,
-    pub flash_time: Option<f32>,
-    /// The effect of a spent case thrown out (`global_particle_shellsmall`).
+    /// The effect of a spent case thrown out (`ShellEjectTemplate`:
+    /// `global_particle_shellsmall`), and the model node it flies from
+    /// (`ShellEjectHardpoint`, see [`SHELL_HARDPOINT`]).
     pub shell: Option<u32>,
-    /// `WeaponScatter`'s seven fields in their order, unnamed (the first
-    /// is [`WeaponSpec::scatter`]).
+    pub shell_hardpoint: Option<u32>,
+    /// `WeaponScatter`'s seven fields in their order (see
+    /// [`SCATTER_FIELDS`]; [`Feel::scatter_min`] and the next two are
+    /// named, the first four are not).
     pub scatter: [f32; 7],
 }
 
+impl Feel {
+    /// `ScatterMin`, `ScatterMax` and `ScatterPerShot`: the cone a gun's
+    /// rounds leave in (degrees across, as the alpha reads them: the
+    /// carbine's 1 to 2, the assault rifle's 1.5 to 3, the sniper rifle's 0
+    /// to 3), and what each shot adds to it (0.2; the sniper rifle's 1).
+    pub fn scatter_min(&self) -> f32 {
+        self.scatter[4]
+    }
+
+    pub fn scatter_max(&self) -> f32 {
+        self.scatter[5]
+    }
+
+    pub fn scatter_per_shot(&self) -> f32 {
+        self.scatter[6]
+    }
+
+    /// The cone its next round leaves in, degrees across, when its shots
+    /// so far have added `bloom` ([`Bloom::added`]): `ScatterMin` plus that,
+    /// no more than `ScatterMax`.
+    pub fn cone(&self, bloom: f32) -> f32 {
+        let (lo, hi) = (self.scatter_min(), self.scatter_max());
+        (lo + bloom.max(0.0)).min(hi.max(lo))
+    }
+}
+
+/// What a gun's shots have added to its cone ([`Feel::cone`]): each
+/// shot `ScatterPerShot`, up to `ScatterMax`. Once the gun has gone
+/// [`Bloom::REST`] seconds without firing, the cone settles back to
+/// `ScatterMin`, in [`Bloom::SETTLE`] seconds from the most.
+///
+/// Provenance: the three fields and their names are the template's (from
+/// samples); that they add up so is inferred from the names; when and how
+/// fast the cone settles is invented (the game's own rule is not decoded:
+/// the first unnamed field, the sniper rifle's 0.1 to the minigun's 5,
+/// may be a rate; read as degrees a second it would hold the assault
+/// rifle's cone at its least however long it fires, as settling while
+/// firing at 1 s from the most also did).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Bloom {
+    /// Degrees added to `ScatterMin`.
+    pub added: f32,
+    /// Seconds since the last shot.
+    idle: f32,
+}
+
+impl Bloom {
+    /// Seconds without a shot before the cone settles (invented).
+    pub const REST: f32 = 0.25;
+    /// Seconds from `ScatterMax` back to `ScatterMin` (invented).
+    pub const SETTLE: f32 = 1.0;
+
+    /// After a shot of a gun that feels as `feel`.
+    pub fn shot(&mut self, feel: &Feel) {
+        let room = (feel.scatter_max() - feel.scatter_min()).max(0.0);
+        self.added = (self.added + feel.scatter_per_shot().max(0.0)).min(room);
+        self.idle = 0.0;
+    }
+
+    /// After `dt` seconds.
+    pub fn settle(&mut self, feel: &Feel, dt: f32) {
+        self.idle += dt;
+        if self.idle < Self::REST {
+            return;
+        }
+        let room = (feel.scatter_max() - feel.scatter_min()).max(0.0);
+        self.added = (self.added - room * dt / Self::SETTLE).max(0.0);
+    }
+}
+
 /// `WeaponScatter`'s fields in the order the template database lists
-/// them.
-const SCATTER_FIELDS: [u32; 7] = [
+/// them. The last three are `ScatterMin`, `ScatterMax` and
+/// `ScatterPerShot` (names found by hashing guesses, round 19); the first
+/// four are not named. The third and fourth look like a second pair of a
+/// least and a most (the third is never above the fourth, and both are
+/// mostly below `ScatterMin` and `ScatterMax`: the carbine's 1 and 1.5
+/// beside 1 and 2), perhaps for aiming or crouching; not decided.
+pub const SCATTER_FIELDS: [u32; 7] = [
     0x0006_5d26,
     0xa2f3_cad9,
     0x3a4e_af3b,
@@ -190,6 +273,9 @@ pub struct Ammo {
     pub damage: f32,
     pub damage_min: f32,
     pub falloff: (f32, f32),
+    /// `HeroMultiplier`: what the hero's rounds of it do, times `Damage`
+    /// (1 where the template gives none).
+    pub hero: f32,
     pub key: Option<u32>,
     /// What it becomes where it strikes (`SpawnOnDeath`).
     pub blast: Option<Blast>,
@@ -266,8 +352,9 @@ pub struct WeaponSpec {
     pub pellets: u32,
     /// Rounds a reload puts in (0: the whole clip).
     pub rounds_per_reload: u32,
-    /// Its scatter, degrees (`WeaponScatter`'s first field, unnamed: the
-    /// sniper rifle's 0.1, the carbine's 1, the shotgun's 3.5; inferred).
+    /// `WeaponScatter`'s first field, unnamed (the sniper rifle's 0.1, the
+    /// carbine's 1, the shotgun's 3.5). Round 17 read it as the cone; the
+    /// cone is now [`Feel::cone`], from the named fields.
     pub scatter: f32,
     pub ammo: Ammo,
     /// Seconds to lock on (`HomingWeapon` `LockOnTime`), and how far.
@@ -581,6 +668,7 @@ impl Parts<'_> {
                 p(FALLOFF_NEAR).unwrap_or(0.0),
                 p(FALLOFF_FAR).unwrap_or(0.0),
             ),
+            hero: p(HERO_MULTIPLIER).filter(|m| *m > 0.0).unwrap_or(1.0),
             key: self.damage_key(id),
             blast,
             timer,
@@ -667,10 +755,9 @@ pub fn read(db: &Layer<'_>) -> Arms {
                             .filter(|&s| s != 0),
                         flash: Parts::first(&effects, id, name_hash("MuzzleFlashTemplate"))
                             .filter(|&f| f != 0),
-                        // The covert pistol holds a hash there: not a time.
-                        flash_time: Parts::float(&effects, id, FLASH_TIME)
-                            .filter(|t| (0.0..10.0).contains(t) && *t > 0.0),
                         shell: Parts::first(&effects, id, SHELL).filter(|&s| s != 0),
+                        shell_hardpoint: Parts::first(&effects, id, SHELL_HARDPOINT)
+                            .filter(|&h| h != 0),
                         scatter: SCATTER_FIELDS
                             .map(|f| Parts::float(&scatter, id, f).unwrap_or(0.0)),
                     },
@@ -800,6 +887,50 @@ pub fn read(db: &Layer<'_>) -> Arms {
 mod tests {
     use super::*;
 
+    // The carbine's `WeaponScatter` as its template has it: 1, 0, 1, 1.5,
+    // then `ScatterMin` 1, `ScatterMax` 2, `ScatterPerShot` 0.2.
+    #[test]
+    fn a_guns_cone_grows_per_shot_to_its_most_and_settles() {
+        assert_eq!(SCATTER_FIELDS[4], name_hash("ScatterMin"));
+        assert_eq!(SCATTER_FIELDS[5], name_hash("ScatterMax"));
+        assert_eq!(SCATTER_FIELDS[6], name_hash("ScatterPerShot"));
+        assert_eq!(SHELL_HARDPOINT, name_hash("ShellEjectHardpoint"));
+        assert_eq!(SHELL, name_hash("ShellEjectTemplate"));
+        // The carbine's (as read on a legally installed copy).
+        assert_eq!(name_hash("hp_shelleject"), 0x3d10_6439);
+        let carbine = Feel {
+            scatter: [1.0, 0.0, 1.0, 1.5, 1.0, 2.0, 0.2],
+            ..Feel::default()
+        };
+        let mut bloom = Bloom::default();
+        assert_eq!(carbine.cone(bloom.added), 1.0);
+        // Held at 562 a minute: it grows, settling not while it fires.
+        for _ in 0..3 {
+            bloom.shot(&carbine);
+            bloom.settle(&carbine, 60.0 / 562.0);
+        }
+        assert!((carbine.cone(bloom.added) - 1.6).abs() < 1e-5);
+        for _ in 0..10 {
+            bloom.shot(&carbine);
+        }
+        assert_eq!(carbine.cone(bloom.added), 2.0);
+        // Let go: after a rest it settles, from the most in a second.
+        bloom.settle(&carbine, Bloom::REST);
+        bloom.settle(&carbine, 0.25);
+        assert!((carbine.cone(bloom.added) - 1.5).abs() < 1e-5);
+        bloom.settle(&carbine, Bloom::SETTLE);
+        assert_eq!(carbine.cone(bloom.added), 1.0);
+        // The sniper rifle: dead on first, 1 more a shot, at most 3.
+        let sniper = Feel {
+            scatter: [0.1, 0.0, 0.0, 2.0, 0.0, 3.0, 1.0],
+            ..Feel::default()
+        };
+        let mut bloom = Bloom::default();
+        assert_eq!(sniper.cone(bloom.added), 0.0);
+        bloom.shot(&sniper);
+        assert_eq!(sniper.cone(bloom.added), 1.0);
+    }
+
     // The gun banks' names hash to the banks the templates' `SoundEffect`
     // name (read on a legally installed copy: the carbine's `50333181`,
     // the pistol's `4a1f94d0`, the shotgun's `08e43a91`), and the flash
@@ -819,6 +950,7 @@ mod tests {
     fn the_names_hash_to_the_fields_keys() {
         for (name, key) in [
             ("DamageMinimum", DAMAGE_MINIMUM),
+            ("HeroMultiplier", HERO_MULTIPLIER),
             ("HumanBoost", HUMAN_BOOST),
             ("TurnSpeed", TURN_SPEED),
             ("MaxAngle", MAX_ANGLE),
@@ -841,6 +973,7 @@ mod tests {
             damage,
             damage_min: min,
             falloff,
+            hero: 1.0,
             key: None,
             blast: None,
             timer: None,
