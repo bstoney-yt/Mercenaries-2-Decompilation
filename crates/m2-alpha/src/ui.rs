@@ -86,6 +86,8 @@ pub enum MenuAction {
     Quit,
     /// Something done in the shop.
     Shop(ShopAction),
+    /// Something done in the cheat menu.
+    Cheat(crate::cheats::CheatAction),
 }
 
 /// What the player does in the shop.
@@ -122,6 +124,8 @@ pub struct Hud {
     pub menu: bool,
     /// The shop is up, in the pause menu's place.
     pub shop: Option<ShopScreen>,
+    /// The cheat menu is up, in the pause menu's place.
+    pub cheats: Option<crate::cheats::CheatScreen>,
     /// Tessellated and waiting to paint: shapes, texture changes, scale.
     frame: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
     /// The game's own HUD, if its files are there.
@@ -170,6 +174,7 @@ impl Hud {
             uploaded: Default::default(),
             menu: false,
             shop: None,
+            cheats: None,
             frame: None,
             game: None,
             loading: None,
@@ -315,6 +320,7 @@ impl Hud {
         let load = self.dev || info.mission.is_none();
         let dev = self.dev;
         let shop = self.shop.as_ref();
+        let cheats = self.cheats.as_ref();
         // The loading screen: up while the island loads and over the
         // scripts' fades to black.
         let mut loading = self.loading.as_mut();
@@ -338,7 +344,9 @@ impl Hud {
                 ));
                 screen.paint(&ctx, &painter);
             }
-            if let (true, Some(shop)) = (menu, shop) {
+            if let (true, Some(cheats)) = (menu, cheats) {
+                action = cheat_window(ui.ctx(), cheats).map(MenuAction::Cheat);
+            } else if let (true, Some(shop)) = (menu, shop) {
                 action = shop_window(ui.ctx(), shop).map(MenuAction::Shop);
             } else if menu {
                 action = pause_menu(ui.ctx(), config, info.hero, dev, load);
@@ -1469,6 +1477,161 @@ fn shop_window(ctx: &egui::Context, shop: &ShopScreen) -> Option<ShopAction> {
                     action = Some(ShopAction::Close);
                 }
             });
+        });
+    action
+}
+
+/// The test cheat menu ([`crate::cheats`]): a page each for weapons,
+/// vehicles and support (the game's own lists, with a filter) and one for
+/// her helpers.
+fn cheat_window(
+    ctx: &egui::Context,
+    cheats: &crate::cheats::CheatScreen,
+) -> Option<crate::cheats::CheatAction> {
+    use crate::cheats::{CheatAction as A, Tab, shown};
+    let mut action = None;
+    // Plain black goes under everything egui draws (it would hide the
+    // window drawn on the same layer order).
+    let (order, dim) = if cheats.plain {
+        (egui::Order::Background, Color32::BLACK)
+    } else {
+        (egui::Order::Middle, Color32::from_black_alpha(120))
+    };
+    ctx.layer_painter(egui::LayerId::new(order, egui::Id::new("dim")))
+        .rect_filled(ctx.content_rect(), 0.0, dim);
+    egui::Window::new("Cheats (test)")
+        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_min_width(560.0);
+            ui.horizontal(|ui| {
+                for tab in Tab::ALL {
+                    if ui.selectable_label(cheats.tab == tab, tab.name()).clicked()
+                        && cheats.tab != tab
+                    {
+                        action = Some(A::Tab(tab));
+                    }
+                }
+            });
+            ui.separator();
+            if cheats.tab != Tab::Player {
+                ui.horizontal(|ui| {
+                    ui.label("Filter");
+                    let mut filter = cheats.filter.clone();
+                    if ui.text_edit_singleline(&mut filter).changed() {
+                        action = Some(A::Filter(filter));
+                    }
+                });
+            }
+            if let Some(said) = &cheats.said {
+                ui.label(said);
+            }
+            let f = cheats.filter.as_str();
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| match cheats.tab {
+                    Tab::Weapons => {
+                        if cheats.weapons.is_empty() {
+                            ui.label("No weapon templates (the island's data isn't loaded).");
+                        }
+                        egui::Grid::new("cheat weapons")
+                            .striped(true)
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                for name in cheats.weapons.iter().filter(|n| shown(n, f)) {
+                                    ui.label(name);
+                                    if ui.button("Give").clicked() {
+                                        action = Some(A::Weapon(name.clone()));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    Tab::Vehicles => {
+                        if cheats.vehicles.is_empty() {
+                            ui.label("No vehicle templates (the island's data isn't loaded).");
+                        }
+                        egui::Grid::new("cheat vehicles")
+                            .striped(true)
+                            .num_columns(3)
+                            .show(ui, |ui| {
+                                for v in cheats
+                                    .vehicles
+                                    .iter()
+                                    .filter(|v| shown(&v.name, f) || shown(v.kind, f))
+                                {
+                                    ui.label(&v.name);
+                                    ui.label(v.kind);
+                                    if ui.button("Spawn").clicked() {
+                                        action = Some(A::Vehicle(v.name.clone()));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    Tab::Support => {
+                        if cheats.support.is_empty() {
+                            ui.label("No support catalogue until the mission scripts run.");
+                        }
+                        egui::Grid::new("cheat support")
+                            .striped(true)
+                            .num_columns(4)
+                            .show(ui, |ui| {
+                                for s in cheats.support.iter().filter(|s| {
+                                    shown(&s.name, f) || shown(&s.key, f) || shown(&s.kind, f)
+                                }) {
+                                    ui.label(&s.name).on_hover_text(&s.key);
+                                    ui.label(&s.kind);
+                                    if ui.button("Stock").clicked() {
+                                        action = Some(A::StockSupport(s.key.clone()));
+                                    }
+                                    if ui.button("Call in").clicked() {
+                                        action = Some(A::CallSupport(s.key.clone()));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    Tab::Player => {
+                        let mut god = cheats.toggles.god;
+                        if ui
+                            .checkbox(&mut god, "God mode (health kept whole)")
+                            .changed()
+                        {
+                            action = Some(A::God(god));
+                        }
+                        let mut ammo = cheats.toggles.ammo;
+                        if ui
+                            .checkbox(&mut ammo, "Infinite ammo (clips, reserves, explosives)")
+                            .changed()
+                        {
+                            action = Some(A::Ammo(ammo));
+                        }
+                        if ui.button("Heal").clicked() {
+                            action = Some(A::Heal);
+                        }
+                        let money = format!(
+                            "Give ${} and {:.0} fuel",
+                            thousands(crate::cheats::CASH),
+                            crate::cheats::FUEL
+                        );
+                        if ui.button(money).clicked() {
+                            action = Some(A::Money);
+                        }
+                        let ahead = format!("Teleport {:.0} m ahead", crate::cheats::AHEAD);
+                        if ui.button(ahead).clicked() {
+                            action = Some(A::TeleportAhead);
+                        }
+                        if ui.button("Teleport to the nearest objective").clicked() {
+                            action = Some(A::TeleportObjective);
+                        }
+                    }
+                });
+            ui.separator();
+            if ui.button("Close").clicked() {
+                action = Some(A::Close);
+            }
         });
     action
 }
