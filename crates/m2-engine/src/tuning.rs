@@ -48,6 +48,8 @@ pub struct VehicleTuning {
     pub gun: Option<GunTuning>,
     /// A wheeled vehicle's engine and gearbox (`_CarPhysicsV2`).
     pub engine: Option<EngineTuning>,
+    /// A wheeled vehicle's steering, brakes and grip (`_CarPhysicsV2`).
+    pub handling: Option<Handling>,
     /// A tracked vehicle's pull at a standstill, a third, two thirds and
     /// all of its top speed, of its most (`_TankPhysics`'s
     /// `EngineTorqueRatio0`..`3`, names found by hash: the AMX-30's 1,
@@ -122,6 +124,27 @@ pub struct EngineTuning {
     pub torque_at: (f32, f32),
     /// Top speed backing up, m/s (`ReverseMaxSpeed`, km/h: 55).
     pub reverse_speed: f32,
+}
+
+/// How a wheeled vehicle steers, brakes and holds the road, from its
+/// `_CarPhysicsV2` (names found by hash, gap round 4; the M151's values
+/// in brackets, the range over the 454 records after them).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Handling {
+    /// How far its front wheels turn, radians (`SteerMaxAngle` 0.7; 0.5
+    /// to 1.1, 29 to 63 degrees; radians inferred, as the database gives
+    /// the helicopters' and cameras' angles in them too).
+    pub steer_lock: f32,
+    /// Each axle's brake, front and back (`FrontBrake` 7, `RearBrake` 6;
+    /// 2.5 to 11 and 1 to 13). Read as the slowing it gives the whole
+    /// vehicle, m/s², if every wheel braked as that axle's do (inferred:
+    /// the heavy trucks' are the lowest, the garbage truck's 4 and 1, the
+    /// light cars' and bikes' the highest).
+    pub brake: (f32, f32),
+    /// Each axle's sideways grip (`FrontWheelFrictionSide` 1.5,
+    /// `RearWheelFrictionSide` 1.5; 0.5 to 3 and 0.7 to 5), read as the
+    /// tyres' friction coefficient (inferred).
+    pub grip: (f32, f32),
 }
 
 impl EngineTuning {
@@ -729,6 +752,15 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         && e.rpm.1 < e.rpm.2)
                         .then_some(e)
                 })(),
+                handling: (|| {
+                    let r = *car.of_template(id).first()?;
+                    let f = |name| car.float(r, name_hash(name)).filter(|v| *v > 0.0);
+                    Some(Handling {
+                        steer_lock: f("SteerMaxAngle").filter(|a| *a < 1.5)?,
+                        brake: (f("FrontBrake")?, f("RearBrake")?),
+                        grip: (f("FrontWheelFrictionSide")?, f("RearWheelFrictionSide")?),
+                    })
+                })(),
                 tracks: (|| {
                     let r = *tank.of_template(id).first()?;
                     let f = |name| tank.float(r, name_hash(name));
@@ -875,6 +907,12 @@ mod tests {
             ("GearRatio5", 0x0b1a_dc5e),
             ("RearWheelRadius", 0x77c6_830e),
             ("ReverseMaxSpeed", 0x1958_7e8a),
+            // Its steering, brakes and grip (gap round 4).
+            ("SteerMaxAngle", 0x8b96_7513),
+            ("FrontBrake", 0x3cbe_aa13),
+            ("RearBrake", 0x0175_b464),
+            ("FrontWheelFrictionSide", 0x0d87_1558),
+            ("RearWheelFrictionSide", 0x45a5_a093),
             // `_TankPhysics`'s pull over its speed.
             ("EngineTorqueRatio0", 0xe8a9_e7ee),
             ("EngineTorqueRatio3", 0x4ab1_3df9),
