@@ -370,6 +370,8 @@ pub struct MissionLink {
     end_skip: bool,
     /// The player has subtitles on.
     subtitles: bool,
+    /// The player has the tutorial tips on.
+    tutorials: bool,
     /// Time not yet given to the scripts.
     lag: f32,
     log: Option<BufWriter<File>>,
@@ -515,6 +517,7 @@ impl MissionLink {
             movies: false,
             end_skip: false,
             subtitles: true,
+            tutorials: true,
             lag: 0.0,
             log,
             message: None,
@@ -732,6 +735,17 @@ impl MissionLink {
     pub fn close_shop(&mut self) {
         if let State::Running(m) = &mut self.state {
             m.close_shop();
+        }
+    }
+
+    /// The player's subtitles and tutorial tips, from now on (the pause
+    /// menu's options).
+    pub fn set_options(&mut self, subtitles: bool, tutorials: bool) {
+        self.subtitles = subtitles;
+        self.tutorials = tutorials;
+        if let State::Running(m) = &mut self.state {
+            m.set_subtitles(subtitles);
+            m.set_tutorials(tutorials);
         }
     }
 
@@ -1269,6 +1283,7 @@ impl MissionLink {
                     mission.hold_movies();
                 }
                 mission.set_subtitles(self.subtitles);
+                mission.set_tutorials(self.tutorials);
                 mission.start();
                 if self.movies && self.end_skip {
                     // The movies wait for the game, so the scripts' skip

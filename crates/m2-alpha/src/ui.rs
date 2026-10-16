@@ -139,6 +139,9 @@ pub struct Hud {
     /// names F5/F9 for saving and loading, and loads while the mission
     /// scripts run, though a load puts the world back without their state.
     pub dev: bool,
+    /// The player's settings and saves for the game's own pause menu
+    /// ([`crate::pause`]), set as it opens.
+    pub pause_settings: crate::pause::Settings,
 }
 
 impl std::fmt::Debug for Hud {
@@ -180,6 +183,7 @@ impl Hud {
             loading: None,
             wait: false,
             dev: true,
+            pause_settings: crate::pause::Settings::default(),
         }
     }
 
@@ -193,6 +197,9 @@ impl Hud {
             .screen_rect
             .map_or([0.0; 2], |r| [r.width(), r.height()]);
         state.dt = game.frame_time(input.time);
+        // The menu is the game's own pause menu, but in the shop.
+        state.pause = self.menu && self.shop.is_none();
+        state.pause_settings = self.pause_settings.clone();
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
@@ -239,13 +246,15 @@ impl Hud {
     /// Runs the game's HUD `seconds` on `info`, waiting for each step (and
     /// up to `timeout` for its scripts to start): for screenshots, which
     /// draw one frame. `keys` (Flash key codes) are pressed half way and
-    /// held to the end.
+    /// held to the end; `typed`, they are typed one by one from a quarter
+    /// of the way, a third of a second apart (a menu walked through).
     pub fn settle(
         &mut self,
         info: &HudInfo,
         size: (u32, u32),
         seconds: f64,
         keys: &[i32],
+        typed: bool,
         timeout: Duration,
     ) {
         let (Some(game), Some(state)) = (&mut self.game, &info.game) else {
@@ -293,10 +302,20 @@ impl Hud {
             }
             // Held from half way to the last step (the PDA's map moves
             // while its keys are held).
-            state.keys = match i.checked_sub(steps / 2) {
-                Some(0) => keys.iter().map(|&k| (k, true)).collect(),
-                Some(_) if i + 1 == steps => keys.iter().map(|&k| (k, false)).collect(),
-                _ => Vec::new(),
+            state.keys = if typed {
+                const GAP: usize = 10;
+                match i.checked_sub(steps / 4) {
+                    Some(j) if j / GAP < keys.len() && j % GAP < 2 => {
+                        vec![(keys[j / GAP], j % GAP == 0)]
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                match i.checked_sub(steps / 2) {
+                    Some(0) => keys.iter().map(|&k| (k, true)).collect(),
+                    Some(_) if i + 1 == steps => keys.iter().map(|&k| (k, false)).collect(),
+                    _ => Vec::new(),
+                }
             };
             game.update_and_wait(&self.ctx, state.clone(), Duration::from_secs(10));
         }
@@ -321,6 +340,9 @@ impl Hud {
         let dev = self.dev;
         let shop = self.shop.as_ref();
         let cheats = self.cheats.as_ref();
+        // The game's own pause menu, once its scripts run: ours keeps the
+        // alpha's own settings beside it.
+        let own = self.game.as_ref().is_some_and(GameHud::pause_available);
         // The loading screen: up while the island loads and over the
         // scripts' fades to black.
         let mut loading = self.loading.as_mut();
@@ -349,7 +371,7 @@ impl Hud {
             } else if let (true, Some(shop)) = (menu, shop) {
                 action = shop_window(ui.ctx(), shop).map(MenuAction::Shop);
             } else if menu {
-                action = pause_menu(ui.ctx(), config, info.hero, dev, load);
+                action = pause_menu(ui.ctx(), config, info.hero, dev, load, own);
             }
         });
         let ppp = output.pixels_per_point;
@@ -1651,83 +1673,92 @@ fn thousands(n: f64) -> String {
 
 /// The pause menu, with `playing` (the hero she is) marked under "Play
 /// as". `dev`: the save and load buttons name their keys (which work only
-/// then); `load`: a saved game can be loaded.
+/// then); `load`: a saved game can be loaded. `own`: the game's own pause
+/// menu is up (the HUD's movie), and this is only the alpha's settings
+/// beside it, folded in a corner (its dim and its Resume are the game's).
 fn pause_menu(
     ctx: &egui::Context,
     config: &mut Config,
     playing: crate::hero::Hero,
     dev: bool,
     load: bool,
+    own: bool,
 ) -> Option<MenuAction> {
     let mut action = None;
-    // Dim the game behind the menu.
-    ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::new("dim"),
-    ))
-    .rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha(120));
-    egui::Window::new("Paused")
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .collapsible(false)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.set_min_width(300.0);
-            ui.spacing_mut().item_spacing.y = 8.0;
-            if ui.button("Resume").clicked() {
-                action = Some(MenuAction::Resume);
+    if !own {
+        // Dim the game behind the menu.
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("dim"),
+        ))
+        .rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha(120));
+    }
+    let window = if own {
+        egui::Window::new("Alpha settings")
+            .anchor(Align2::RIGHT_TOP, vec2(-16.0, 16.0))
+            .collapsible(true)
+            .default_open(false)
+    } else {
+        egui::Window::new("Paused")
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .collapsible(false)
+    };
+    window.resizable(false).show(ctx, |ui| {
+        ui.set_min_width(300.0);
+        ui.spacing_mut().item_spacing.y = 8.0;
+        if !own && ui.button("Resume").clicked() {
+            action = Some(MenuAction::Resume);
+        }
+        ui.horizontal(|ui| {
+            let (save, load_label) = if dev {
+                ("Save game (F5)", "Load game (F9)")
+            } else {
+                ("Save game", "Load game")
+            };
+            if ui.button(save).clicked() {
+                action = Some(MenuAction::SaveGame);
             }
-            ui.horizontal(|ui| {
-                let (save, load_label) = if dev {
-                    ("Save game (F5)", "Load game (F9)")
-                } else {
-                    ("Save game", "Load game")
-                };
-                if ui.button(save).clicked() {
-                    action = Some(MenuAction::SaveGame);
-                }
-                if load && ui.button(load_label).clicked() {
-                    action = Some(MenuAction::LoadGame);
-                }
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Play as");
-                for hero in crate::hero::Hero::ALL {
-                    if ui.selectable_label(playing == hero, hero.name()).clicked()
-                        && playing != hero
-                    {
-                        config.hero = hero;
-                        action = Some(MenuAction::Hero(hero));
-                    }
-                }
-            });
-            ui.separator();
-            ui.heading("Settings");
-            ui.add(egui::Slider::new(&mut config.camera.fov, 40.0..=100.0).text("Field of view"));
-            ui.add(
-                egui::Slider::new(&mut config.camera.mouse_sensitivity, 0.0005..=0.01)
-                    .logarithmic(true)
-                    .text("Mouse sensitivity"),
-            );
-            ui.checkbox(&mut config.camera.invert_y, "Invert mouse Y");
-            ui.checkbox(&mut config.window.vsync, "Vertical sync");
-            if ui.button("Save settings").clicked() {
-                action = Some(MenuAction::SaveSettings);
-            }
-            ui.separator();
-            ui.collapsing("Controls", |ui| {
-                for line in include_str!("usage.txt")
-                    .lines()
-                    .skip_while(|l| !l.starts_with("On foot"))
-                {
-                    ui.label(line);
-                }
-            });
-            ui.separator();
-            if ui.button("Quit to desktop").clicked() {
-                action = Some(MenuAction::Quit);
+            if load && ui.button(load_label).clicked() {
+                action = Some(MenuAction::LoadGame);
             }
         });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Play as");
+            for hero in crate::hero::Hero::ALL {
+                if ui.selectable_label(playing == hero, hero.name()).clicked() && playing != hero {
+                    config.hero = hero;
+                    action = Some(MenuAction::Hero(hero));
+                }
+            }
+        });
+        ui.separator();
+        ui.heading("Settings");
+        ui.add(egui::Slider::new(&mut config.camera.fov, 40.0..=100.0).text("Field of view"));
+        ui.add(
+            egui::Slider::new(&mut config.camera.mouse_sensitivity, 0.0005..=0.01)
+                .logarithmic(true)
+                .text("Mouse sensitivity"),
+        );
+        ui.checkbox(&mut config.camera.invert_y, "Invert mouse Y");
+        ui.checkbox(&mut config.window.vsync, "Vertical sync");
+        if ui.button("Save settings").clicked() {
+            action = Some(MenuAction::SaveSettings);
+        }
+        ui.separator();
+        ui.collapsing("Controls", |ui| {
+            for line in include_str!("usage.txt")
+                .lines()
+                .skip_while(|l| !l.starts_with("On foot"))
+            {
+                ui.label(line);
+            }
+        });
+        ui.separator();
+        if ui.button("Quit to desktop").clicked() {
+            action = Some(MenuAction::Quit);
+        }
+    });
     action
 }
 

@@ -140,6 +140,9 @@ m2-alpha [options]
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --pda                  with --screenshot: the picture with her PDA open
+  --pause                with --screenshot: the picture with the game's
+                         pause menu open, --pda-key's keys typed into it
+                         one by one (a third of a second apart)
   --behind               with --screenshot on foot: the picture from close
                          behind her, to see the weapons on her back
   --slung rpg|gl         with --screenshot on foot: give her this weapon in
@@ -261,7 +264,11 @@ the scripts' own data); putting the scripts back from it on loading is
 not done yet.
 The contract done, Enter closes its fanfare and the flow goes on.
 M music on/off, a click captures the mouse (F2 lets it go), F11 fullscreen,
-Escape opens the menu (settings, save and load, quit).
+Escape opens the game's own pause menu (its movie, once the HUD's scripts
+run; up/down through it, left/right a setting, Enter): resume, save,
+options (game, video, audio, controls) and quit. Its kept settings go to
+the settings file. The alpha's own settings (hero, field of view, mouse,
+vsync, quit to desktop) fold in the top right. Escape closes it.
 An Xbox pad (One, Series or 360) plays as the game's own layout has it:
 left stick move (L3 sprint), right stick look, A jump, B melee, X reload,
 Y get in/use, RT fire, LT crouch, LB throw, RB switch weapon, R3 aim,
