@@ -103,7 +103,7 @@ pub trait World {
 }
 
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 15] = [
+pub const KINDS: [&str; 16] = [
     "TimerRelative",
     "ObjectHibernation",
     "Boundary",
@@ -119,6 +119,7 @@ pub const KINDS: [&str; 15] = [
     "GameStateChange",
     "ObjectWinched",
     "ObjectIsVisible",
+    "ObjectDelete",
 ];
 
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
@@ -847,6 +848,14 @@ fn check(
                 .map(|g| (g, !world.is_alive(g), vec![id(g)]))
                 .collect(),
         ),
+        // { object }: once it is gone from play (removed, or faded out):
+        // the support helicopter's pilot is free again once his
+        // helicopter is (`MakeRecruitAvailable("Copter")`). Passes the
+        // object.
+        "ObjectDelete" => match guid(&p.params, 1) {
+            Some(g) => Check::Holds(world.position(g).is_none(), vec![id(g)]),
+            None => no,
+        },
         // { a, b, op, metres, stopped, flat }: when some a is within
         // ("<", "<=") or beyond (">", ">=") the distance of some b,
         // checked whenever it is pending (scripts wanting repeats make a

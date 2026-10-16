@@ -128,6 +128,9 @@ pub struct Game {
     /// health when it last stepped (hurt, a call is called off).
     pub support: Support,
     support_hp: f32,
+    /// Money she has picked up since the scripts last heard: cash and
+    /// fuel ([`crate::mission::MissionLink`] gives them to the scripts).
+    pub earned: Vec<(u32, u32)>,
     /// The soldier script's count of deaths and rolls: what the dead
     /// leave ([`crate::drops`]), and how many have.
     drops: Drops,
@@ -224,6 +227,7 @@ impl Game {
             sky: AtmosphereMix::default(),
             moving: MovingProps::default(),
             support: Support::default(),
+            earned: Vec::new(),
             drops: Drops::default(),
             dropped: 0,
             refused: std::collections::HashSet::new(),
@@ -829,7 +833,7 @@ impl Game {
             let templates = &world.index.template_db;
             let near = scene.flights.within(player.character.position).map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
-                let usable = self.combat.can_use(refill, p.what.health);
+                let usable = p.what.is_money() || self.combat.can_use(refill, p.what.health);
                 let offer = crate::mission::offer(templates, &self.combat, &p.what);
                 // Each pickup she stands at and leaves lying, once, with
                 // why: what each record would go to and its room.
@@ -857,14 +861,26 @@ impl Game {
             {
                 let walked = near.is_some_and(|n| n.0 != Offer::Equip);
                 let from = p.from;
-                take_up(
-                    &mut self.combat,
-                    &mut scene.flights,
-                    &world.index.template_db,
-                    player,
-                    p,
-                    walked,
-                );
+                if p.what.is_money() {
+                    eprintln!(
+                        "pickup: she takes {} ({:#x}) at {:.1}: cash {}, fuel {}",
+                        templates.by_id(p.what.template).map_or("?", |t| t.0),
+                        p.what.template,
+                        p.at,
+                        p.what.cash,
+                        p.what.fuel
+                    );
+                    self.earned.push((p.what.cash, p.what.fuel));
+                } else {
+                    take_up(
+                        &mut self.combat,
+                        &mut scene.flights,
+                        &world.index.template_db,
+                        player,
+                        p,
+                        walked,
+                    );
+                }
                 // A placed one's prop comes down with it.
                 if self.placed.is_pickup(from) {
                     self.placed
@@ -1032,8 +1048,19 @@ impl Game {
             .map(|p| p.character.position)
             .unwrap_or(self.camera.position);
         let hp = self.combat.hp;
+        // Lasing, the point the crosshair is on.
+        let aim_at = match (her, &self.scene.world) {
+            (Some(p), Some(world)) if self.support.lasing() => Some(Combat::aim_point(
+                &world.physics,
+                &self.scene.people,
+                p,
+                None,
+            )),
+            _ => None,
+        };
         let call = match her {
             Some(_) => Call {
+                aim_at,
                 menu: intent.trigger.support,
                 // At the menu or the view, the jump (the pad's A, which
                 // the texts' `[confirm]` shows) confirms as well.
@@ -1063,7 +1090,13 @@ impl Game {
         if before || self.support.busy() {
             // At the menu, the designator in her hands or looking through
             // the satellite, she stands, and fire is the satellite's.
+            // Lasing, she still looks and aims about.
+            let (look, aim) = (intent.look, intent.trigger.aim);
             intent = Intent::default();
+            if self.support.lasing() {
+                intent.look = look;
+                intent.trigger.aim = aim;
+            }
         }
         intent
     }
@@ -1251,6 +1284,9 @@ impl Game {
             },
             vehicles,
             killed: self.scene.people.all_killed(),
+            // The scripts' to fill in ([`crate::mission::MissionLink::pmc_save`]).
+            pmc: None,
+            scripts: None,
         })
     }
 

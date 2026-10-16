@@ -13,8 +13,9 @@
 //! use key ([`crate::combat::Manned`]). Which template is which comes from
 //! the template database: a `Pickup` record, a `SpawnOnDeath` naming a
 //! pickup, the `Emplacedweapon` label with a `PhysicalLink`ed weapon (PC
-//! data, 2026-10-10). Cash and what leaves only cash are left standing:
-//! money is a round of its own.
+//! data, 2026-10-10). Money (cash, fuel) is a pickup too, walked over, and
+//! a crate of it (`Cash (Large)`) breaks open to leave it (PC data,
+//! 2026-10-14).
 
 use std::collections::HashMap;
 
@@ -56,16 +57,8 @@ pub enum Kind {
     Emplaced,
 }
 
-/// Whether template `t` is money (`Cash (Small)`, `Pickup (Cash)`).
-fn cash(templates: &Templates, t: u32) -> bool {
-    templates.names.get(&t).is_some_and(|n| n.contains("Cash"))
-}
-
 /// What template `t` is to her, if anything.
 pub fn kind(templates: &Templates, t: u32) -> Option<Kind> {
-    if cash(templates, t) {
-        return None;
-    }
     if templates.leavings.pickups.contains_key(&t) {
         return Some(Kind::Pickup);
     }
@@ -82,7 +75,7 @@ pub fn kind(templates: &Templates, t: u32) -> Option<Kind> {
         .spawns
         .get(&t)?
         .iter()
-        .any(|&s| templates.leavings.pickups.contains_key(&s) && !cash(templates, s))
+        .any(|s| templates.leavings.pickups.contains_key(s))
         .then_some(Kind::Crate)
 }
 
@@ -516,8 +509,7 @@ pub fn check(game: &mut crate::game::Game, tried: &mut std::collections::HashSet
     game.combat.grenades = grenades;
 }
 
-/// What a crate of template `t` leaves: its `SpawnOnDeath` pickups, money
-/// aside.
+/// What a crate of template `t` leaves: its `SpawnOnDeath` pickups.
 pub fn leavings(templates: &Templates, t: u32) -> Vec<Leaves> {
     templates
         .leavings
@@ -525,7 +517,6 @@ pub fn leavings(templates: &Templates, t: u32) -> Vec<Leaves> {
         .get(&t)
         .into_iter()
         .flatten()
-        .filter(|&&s| !cash(templates, s))
         .filter_map(|&s| crate::mission::pickup(templates, s))
         .collect()
 }
@@ -533,7 +524,7 @@ pub fn leavings(templates: &Templates, t: u32) -> Vec<Leaves> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use m2_engine::pickup::{AMMUNITION, EQUIPMENT, HEALTH, Leavings, PickupInfo};
+    use m2_engine::pickup::{CASH, EQUIPMENT, HEALTH, Leavings, PickupInfo};
 
     fn info(kind: u32, heals: u32, gives: Vec<(u32, u32)>) -> PickupInfo {
         PickupInfo {
@@ -569,7 +560,14 @@ mod tests {
             pickups: HashMap::from([
                 (0x8000_6ea9, info(HEALTH, 50, Vec::new())),
                 (0x8000_56a1, info(EQUIPMENT, 0, vec![(0x8000_56a0, 8)])),
-                (0x8000_a277, info(AMMUNITION, 0, Vec::new())),
+                // `Cash (Medium)`'s record: type 5, 5000 in its rounds.
+                (
+                    0x8000_a277,
+                    PickupInfo {
+                        rounds: 5000,
+                        ..info(CASH, 0, Vec::new())
+                    },
+                ),
             ]),
             spawns: HashMap::from([
                 (0x8000_855d, vec![0x8000_6ea9, 0x8000_6ea9]),
@@ -591,9 +589,9 @@ mod tests {
         assert_eq!(kind(&db, 0x8000_56a1), Some(Kind::Pickup));
         assert_eq!(kind(&db, 0x8000_855d), Some(Kind::Crate));
         assert_eq!(kind(&db, 0x8000_855a), Some(Kind::Emplaced));
-        // Money is left for its own round, and so is a crate of it.
-        assert_eq!(kind(&db, 0x8000_a277), None);
-        assert_eq!(kind(&db, 0x8000_a278), None);
+        // Money is a pickup, and a crate of it a crate.
+        assert_eq!(kind(&db, 0x8000_a277), Some(Kind::Pickup));
+        assert_eq!(kind(&db, 0x8000_a278), Some(Kind::Crate));
         assert_eq!(kind(&db, 0x1234), None);
     }
 
@@ -606,7 +604,23 @@ mod tests {
             left.iter()
                 .all(|l| l.template == 0x8000_6ea9 && l.health == 50.0)
         );
-        assert!(leavings(&db, 0x8000_a278).is_empty());
+    }
+
+    #[test]
+    fn a_crate_of_cash_leaves_cash_walked_over() {
+        let db = db();
+        let left = leavings(&db, 0x8000_a278);
+        assert_eq!(left.len(), 1);
+        assert!(left[0].is_money());
+        assert_eq!(
+            (left[0].cash, left[0].fuel, left[0].weapon),
+            (5000, 0, None)
+        );
+        let combat = crate::combat::Combat::default();
+        assert_eq!(
+            crate::mission::offer(&db, &combat, &left[0]),
+            crate::mission::Offer::Walk
+        );
     }
 
     #[test]

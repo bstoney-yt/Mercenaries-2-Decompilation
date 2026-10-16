@@ -171,6 +171,11 @@ m2-alpha [options]
   --support <key>        with --mission: stock support item <key> (clusterbomb,
                          Support) and call it in once the scripts run, to
                          test their strikes and drops; repeatable
+  --shop-check <keys>    with --mission --autoplay: once she is ashore, buy
+                         every support item (all, or the comma-separated
+                         keys) in a shop with cash given her, call each in
+                         from the support menu, aim its designator, and log
+                         what came of it (shop-check lines and a summary)
   --seated               with --screenshot --drive: load the seats' clips
                          first and show her sitting in the vehicle
                          (also <stem>-seated.ppm before it moves)
@@ -221,6 +226,16 @@ each grey wedge sends the bomb (a press outside them undoes the presses
 made; moving the view away puts the wheel away). T, 1 or 2 calls it off;
 so does being hurt. P opens and shuts the PDA (the first contract's
 scripts give the bomb once she has looked at it).
+Shop and money: H opens the shop (a tab for each faction's; what each
+sells unlocks with contracts, or all at once with the settings'
+[enhanced.shop] unlock_all = true). What she buys is in the support
+menu: W/S or the arrows pick the item, E calls it in. G throws its smoke,
+flare or beacon; a laser designator is held on the spot with fire; a
+satellite one is moved like the bomb's view and confirmed with fire.
+Cash and fuel lying about are taken by walking over them. The game saves
+itself after a contract (m2-alpha-autosave.toml, with her cash, stock and
+the scripts' own data); putting the scripts back from it on loading is
+not done yet.
 The contract done, Enter closes its fanfare and the flow goes on.
 M music on/off, Tab or right mouse captures the mouse, F11 fullscreen,
 Escape opens the menu (settings, save and load, quit).

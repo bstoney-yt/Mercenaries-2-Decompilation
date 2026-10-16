@@ -17,7 +17,7 @@ use crate::game::{Game, can_get_out, get_out, place};
 use crate::mission::{Mark, WATERLINE};
 use crate::player::{Intent, Player};
 use crate::route::{Mover, Route};
-use crate::support::{PDA_CLOSE, PDA_OPEN, Phase};
+use crate::support::{Aim, PDA_CLOSE, PDA_OPEN, Phase};
 
 /// How fast she turns the camera, radians a second (a quick hand on the
 /// mouse).
@@ -1142,6 +1142,7 @@ impl Autoplay {
             Phase::Viewing { .. } => "the satellite's view",
             Phase::Timing { .. } => "the timing wheel",
             Phase::Confirmed { .. } => "confirmed",
+            Phase::Designating { .. } => "aiming a designator",
         };
         if step != self.support_logged {
             self.support_logged = step;
@@ -1182,7 +1183,12 @@ impl Autoplay {
             Phase::Menu => intent.use_pressed = true,
             // The view opens by itself.
             Phase::Holding { .. } => {}
-            Phase::Viewing { at: view, .. } => {
+            Phase::Viewing { at: view, .. }
+            | Phase::Designating {
+                aim: Aim::Satellite,
+                at: view,
+                ..
+            } => {
                 let to = Vec2::new(at.x, at.z) - view;
                 if to.length() < ON_SPOT {
                     intent.trigger.fire = self.tap();
@@ -1193,6 +1199,15 @@ impl Autoplay {
             }
             Phase::Timing { .. } => intent.trigger.fire = support.wheel_ready() && self.tap(),
             Phase::Confirmed { .. } => {}
+            // The laser held on the target.
+            Phase::Designating {
+                aim: Aim::Laser, ..
+            } => {
+                if let Some(p) = game.scene.player.as_ref() {
+                    intent.look = aim(p, at, dt).0;
+                }
+                intent.trigger.fire = true;
+            }
         }
         intent
     }

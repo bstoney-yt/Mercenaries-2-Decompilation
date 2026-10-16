@@ -32,6 +32,12 @@ const LABEL: u32 = 0xfd08_4cce;
 pub const HEALTH: u32 = 0;
 pub const AMMUNITION: u32 = 1;
 pub const EQUIPMENT: u32 = 2;
+/// Money: a `Pickup` of `Type` 5 gives as much cash as its rounds field
+/// says (`Cash (Small)` 1000, `Cash (Medium)` 5000, `Cash (Case)` 25000),
+/// one of `Type` 6 as much fuel (`Fuel Pickup (Small)` 25, `(Large)` 50).
+/// PC data, 2026-10-14.
+pub const CASH: u32 = 5;
+pub const FUEL: u32 = 6;
 
 /// A pickup's template: what walking up to it gives.
 #[derive(Clone, Debug, PartialEq)]
