@@ -1494,6 +1494,7 @@ impl Scene {
         let y = world.index.rough_height(x, z) + 40.0;
         self.focus = (Vec3::new(x, y, z), Vec3::new(x, y - 20.0, z + 60.0));
         self.props.physics_props = world.index.template_db.prop_physics.clone();
+        self.people.mixer_profiles = world.index.template_db.mixer_profiles.clone();
         self.world = Some(world);
 
         // The hero, to walk the island as.
@@ -2327,6 +2328,8 @@ impl Scene {
                 continue;
             }
             let model = &self.people.kinds[n.kind].model;
+            // Each in their own look, the dead too.
+            let outfit = Some(&n.outfit[..]).filter(|o| !o.is_empty());
             // The dead lie as their limp bodies fell.
             if let Some(doll) = n.ragdoll
                 && let Some(world) = &self.world
@@ -2337,12 +2340,12 @@ impl Scene {
                     .zip(&n.rig.skeleton.inverse_bind)
                     .map(|(m, ib)| *m * *ib)
                     .collect();
-                model.draw_posed(backend, queue, Mat4::IDENTITY, &nodes, &skin)?;
+                model.draw_posed_as(backend, queue, Mat4::IDENTITY, &nodes, &skin, outfit)?;
                 continue;
             }
             let (nodes, skin) = n.rig.posed();
             let body = n.model_matrix();
-            model.draw_posed(backend, queue, body, &nodes, &skin)?;
+            model.draw_posed_as(backend, queue, body, &nodes, &skin, outfit)?;
             if n.soldier
                 && n.alive
                 && let Some(w) = self.arsenal.npc_gun(n.gun)

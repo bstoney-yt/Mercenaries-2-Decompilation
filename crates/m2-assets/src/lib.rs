@@ -19,6 +19,8 @@
 //!   header, tags, and the layout and names they describe.
 //! - [`model`]: model assets: node hierarchy, materials, LOD segments and
 //!   primitive groups (including geometry streamed from other blocks).
+//! - [`mixer`]: the interchangeable parts of a person model (heads, bodies,
+//!   headgear) and which each kind of person may wear.
 //! - [`animation`]: skeletal animation clips: interleaved, delta and
 //!   wavelet encoded node tracks, timed events, a pose sampler and model
 //!   posing.
@@ -68,6 +70,7 @@ pub mod layer;
 pub mod lua;
 pub mod material_animation;
 pub mod minimap;
+pub mod mixer;
 pub mod model;
 pub mod path;
 pub mod physics;

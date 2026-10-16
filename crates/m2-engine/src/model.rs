@@ -15,7 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::sync::OnceLock;
 
-use m2_assets::model::{GeometryKind, Material, ModelInfo, TOPOLOGY};
+use m2_assets::mixer::Mixer;
+use m2_assets::model::{GeometryKind, Material, ModelInfo, Node, TOPOLOGY};
 use m2_assets::vertex::DeclUsage;
 use m2_assets::{Model, Ucfx};
 use m2_math::glam::{Mat4, Quat, Vec3};
@@ -642,6 +643,48 @@ pub struct CpuModel {
     /// Its parts a vehicle breaks one at a time, when its state machine
     /// has more than one ([`ModelParts`]).
     pub parts: Option<std::sync::Arc<ModelParts>>,
+    /// The looks a person model's mixer can give it ([`Looks`]).
+    pub looks: Option<std::sync::Arc<Looks>>,
+}
+
+/// A person model's mixer with its node tree: the looks it can give (one
+/// head, one body, headgear and kit, as a profile allows: see
+/// [`m2_assets::mixer`]) and which nodes each look hides.
+#[derive(Clone, Debug)]
+pub struct Looks {
+    pub mixer: Mixer,
+    nodes: Vec<Node>,
+}
+
+impl Looks {
+    /// Model `model`'s, if it has a mixer that names any of its nodes.
+    pub fn of(model: &Model<'_>) -> Option<Self> {
+        let mixer = model.mixer.clone()?;
+        mixer.parts.iter().any(|p| p.node.is_some()).then(|| Self {
+            mixer,
+            nodes: model.nodes.clone(),
+        })
+    }
+
+    /// A look for profile `profile` (a template's `ModelMixerProfile`;
+    /// `None`, or one the mixer lacks, may wear every part), the parts
+    /// shuffled by `roll` (`roll(k)` below `k`): the parts picked, and per
+    /// node whether the look hides it.
+    pub fn pick(
+        &self,
+        profile: Option<u32>,
+        roll: impl FnMut(usize) -> usize,
+    ) -> (Vec<usize>, Vec<bool>) {
+        let picked = self.mixer.pick(&self.mixer.allowed(profile), roll);
+        let hidden = self.mixer.hidden(&picked, &self.nodes);
+        (picked, hidden)
+    }
+
+    /// The look drawn when no one picks one: every part allowed, taken in
+    /// order (each that goes with those before it).
+    pub fn first(&self) -> Vec<bool> {
+        self.pick(None, |_| 0).1
+    }
 }
 
 /// A collision shape of a model's parts ([`ModelParts::meshes`]): the part
@@ -888,6 +931,20 @@ impl CpuModel {
         if lo.x > hi.x {
             (lo, hi) = (Vec3::ZERO, Vec3::ZERO);
         }
+        // A person model's mixer parts all start hidden, which read as
+        // nothing shown drew every head and hat at once: stand in its
+        // first look instead (each person picks their own, [`Looks`]).
+        let looks = Looks::of(model).map(std::sync::Arc::new);
+        let mut hidden = hidden;
+        if let Some(l) = &looks {
+            let first = l.first();
+            for h in &mut hidden {
+                h.resize(first.len(), false);
+                for (h, &f) in h.iter_mut().zip(&first) {
+                    *h |= f;
+                }
+            }
+        }
         Self {
             hash,
             pieces,
@@ -910,6 +967,7 @@ impl CpuModel {
                 .map_or_else(Vec::new, |s| s.sinking(&model.nodes)),
             breakup: None,
             parts,
+            looks,
         }
     }
 
@@ -1051,6 +1109,9 @@ pub struct GpuModel {
     pub parts_hidden: Option<Vec<bool>>,
     /// Per node, hidden whatever the state ([`hide`](Self::hide)).
     forced: Vec<bool>,
+    /// The looks a person model can take ([`CpuModel::looks`]); each
+    /// person's is drawn by [`draw_posed_as`](Self::draw_posed_as).
+    pub looks: Option<std::sync::Arc<Looks>>,
 }
 
 /// How far a track's texture moves per metre the track runs where its
@@ -1246,6 +1307,7 @@ impl GpuModel {
             parts: cpu.parts.clone(),
             parts_hidden: None,
             forced: Vec::new(),
+            looks: cpu.looks.clone(),
         })
     }
 
@@ -1420,8 +1482,23 @@ impl GpuModel {
         nodes: &[Mat4],
         skin: &[Mat4],
     ) -> Result<(), BackendError> {
+        self.draw_posed_as(backend, queue, world, nodes, skin, None)
+    }
+
+    /// As [`draw_posed`](Self::draw_posed), in look `look` (per node,
+    /// hidden: a person's own pick of heads and kit, [`Looks::pick`]) in
+    /// place of the model's own when given.
+    pub fn draw_posed_as(
+        &self,
+        backend: &mut dyn RenderBackend,
+        queue: &mut DrawQueue,
+        world: Mat4,
+        nodes: &[Mat4],
+        skin: &[Mat4],
+        look: Option<&[bool]>,
+    ) -> Result<(), BackendError> {
         let mut palette = Vec::new();
-        for piece in self.shown(self.wrecked) {
+        for piece in self.shown_as(self.wrecked, look) {
             let handle = if piece.bones.is_empty() {
                 if let Some(&m) = piece.node.and_then(|n| nodes.get(usize::from(n))) {
                     self.push_at(queue, piece, world * m, None);
@@ -1445,7 +1522,17 @@ impl GpuModel {
 
     /// The pieces drawn as the model stands, intact or wrecked.
     fn shown(&self, wrecked: bool) -> impl Iterator<Item = &Piece> {
-        let parts = self.parts_hidden.as_deref().filter(|_| !wrecked);
+        self.shown_as(wrecked, None)
+    }
+
+    /// As [`shown`](Self::shown), in look `look` (per node, hidden) when
+    /// given and not wrecked.
+    fn shown_as<'s>(
+        &'s self,
+        wrecked: bool,
+        look: Option<&'s [bool]>,
+    ) -> impl Iterator<Item = &'s Piece> {
+        let parts = look.or(self.parts_hidden.as_deref()).filter(|_| !wrecked);
         let hidden = parts.unwrap_or(&self.hidden[usize::from(wrecked)]);
         let forced = if parts.is_some() {
             &self.forced[..]
