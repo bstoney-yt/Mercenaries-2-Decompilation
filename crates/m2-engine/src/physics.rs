@@ -31,7 +31,7 @@ use rapier3d::control::{
     KinematicCharacterController, WheelTuning,
 };
 
-use crate::tuning::FlightTuning;
+use crate::tuning::{BoatTuning, FlightTuning};
 use crate::vehicle::VehicleSpec;
 use rapier3d::prelude as r;
 
@@ -905,8 +905,8 @@ const TRACK_TURN: f32 = 0.9;
 /// and backwards.
 const TOP_SPEED: f32 = 30.0;
 const REVERSE_SPEED: f32 = 8.0;
-/// A wheeled or tracked vehicle's drag, per second (a boat's and a
-/// helicopter's is 0.1). Until round 18 it was 0.1 too, which held every
+/// A wheeled or tracked vehicle's drag, per second (a helicopter's is
+/// 0.1, a boat's its water drag). Until round 18 it was 0.1 too, which held every
 /// car to about 60% of its template's `MaxSpeed` against the old pull of
 /// 4 m/s² falling to nothing at the top (the playtest's "vehicles feel
 /// slower"); its own engine now sets how it gathers speed. Invented.
@@ -920,24 +920,27 @@ const TOP_EASE: f32 = 1.0;
 const TRACK_PULL: f32 = 4.0;
 /// Boats ([`Physics::set_water`]): how deep a boat's origin floats,
 /// metres (the layers put the start's boat 0.35 m under the -36 m sea,
-/// patrol boats at it); how hard it pushes on flat out, m/s²; how its
-/// speed falls off coasting and braking, sideways (its keel) and up and
-/// down, and how its rocking dies down, per second; how fast it turns at
-/// speed, radians a second, from what speed, m/s; its top speed backing
-/// up and when its template gives none, m/s; and the most of its weight
-/// a wreck's buoyancy holds up (it sinks). All invented.
+/// patrol boats at it); how its rocking dies down, per second; how fast
+/// it turns at speed, radians a second, from what speed, m/s; its top
+/// speed when its template gives none, m/s; and the most of its weight a
+/// wreck's buoyancy holds up (it sinks). All invented.
 pub const FLOAT_DEPTH: f32 = 0.35;
-const BOAT_PUSH: f32 = 5.0;
-const BOAT_COAST: f32 = 0.3;
-const BOAT_BRAKE: f32 = 1.2;
-const BOAT_KEEL: f32 = 2.5;
-const BOAT_HEAVE: f32 = 3.0;
 const BOAT_ROCK: f32 = 2.5;
 const BOAT_TURN: f32 = 0.9;
 const BOAT_TURN_SPEED: f32 = 6.0;
-const BOAT_REVERSE: f32 = 4.0;
 const BOAT_TOP: f32 = 18.0;
 const WRECK_FLOAT: f32 = 0.4;
+/// A boat's engine and drag when its template gives none (its own
+/// `_BoatPhysics` otherwise, gap round 17): the alpha's earlier invented
+/// coasting, keel and heave drag (0.3, 2.5, 3 a second), braking 1.2 a
+/// second in all, 4 m/s backing up. Invented.
+const BOAT: BoatTuning = BoatTuning {
+    reverse_speed: 4.0,
+    torque: (1.0, 0.8),
+    drag: [0.3, 2.5, 3.0],
+    brake: 0.9,
+    curve: [1.0; 4],
+};
 /// A boat going fast planes (the playthroughs' speedboat rides high, bow
 /// up): from a standstill to this speed, m/s, its hull rises up to this
 /// far, metres, and its bow this much more than its stern (and the stern
@@ -1040,6 +1043,9 @@ struct Hull {
     /// its corners, the middles of its sides and its middle.
     points: Vec<Vec3>,
     controls: VehicleControls,
+    /// Its engine and how the water slows it: its template's, else
+    /// [`BOAT`].
+    water: BoatTuning,
 }
 
 /// A character's capsule and motion.
@@ -1307,7 +1313,8 @@ impl Physics {
     /// drives them as asked: each point of a hull's waterline under the
     /// surface lifts it as deep as it is (the hull's whole weight with its
     /// origin [`FLOAT_DEPTH`] under), and in the water a boat is pushed and
-    /// steered, slowed, kept from sliding sideways and stopped rocking.
+    /// steered, slowed along, across and up and down as its template's
+    /// drag says ([`BoatTuning`]), and stopped rocking.
     fn float_boats(&mut self, dt: f32) {
         let Some(water) = self.water else {
             return;
@@ -1368,21 +1375,21 @@ impl Physics {
             let mut along = velocity.dot(ahead);
             let throttle = c.throttle.clamp(-1.0, 1.0);
             let against = throttle * along < -0.5;
-            let top = if throttle >= 0.0 { v.top } else { BOAT_REVERSE };
-            if throttle != 0.0 && !against && !c.brake && !c.parked {
-                let headroom = (1.0 - along.abs() / top).clamp(0.0, 1.0);
-                along += throttle * BOAT_PUSH * headroom * dt * wet;
+            let w = hull.water;
+            // Its engine pulls the way the throttle asks (against the way
+            // it goes as well, so a boat with no brake stops); its drag
+            // along holds it at its top speed ahead; backing up, it goes
+            // no faster than its template's reverse top speed.
+            if throttle != 0.0 && !c.brake && !c.parked {
+                along += throttle * w.push(along, v.top, throttle < 0.0) * dt * wet;
             }
-            let slowing = if c.brake || c.parked || against {
-                BOAT_BRAKE
-            } else if throttle == 0.0 {
-                BOAT_COAST
-            } else {
-                0.0
-            };
-            along *= ease(slowing);
-            let across = velocity.dot(side) * ease(BOAT_KEEL);
-            let rise = velocity.y * ease(BOAT_HEAVE);
+            let braking = c.brake || c.parked || against;
+            along *= ease(w.drag[0] + if braking { w.brake } else { 0.0 });
+            if throttle < 0.0 && !braking {
+                along = along.max(-w.reverse_speed);
+            }
+            let across = velocity.dot(side) * ease(w.drag[1]);
+            let rise = velocity.y * ease(w.drag[2]);
             b.set_linvel(vector(ahead * along + side * across + Vec3::Y * rise), true);
             // The rudder bites as the water goes by (the other way round
             // backing up), a little with the throttle open at a standstill;
@@ -1645,7 +1652,11 @@ impl Physics {
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
                 .pose(pose(position, rotation))
-                .linear_damping(if spec.is_boat() || spec.is_helicopter() {
+                // A boat's water drag slows it instead
+                // ([`Physics::float_boats`]).
+                .linear_damping(if spec.is_boat() {
+                    0.0
+                } else if spec.is_helicopter() {
                     0.1
                 } else {
                     GROUND_DAMPING
@@ -1738,6 +1749,7 @@ impl Physics {
             Hull {
                 points,
                 controls: VehicleControls::default(),
+                water: spec.tuning.boat.unwrap_or(BOAT),
             }
         });
         let rotor = spec
@@ -3244,6 +3256,62 @@ mod tests {
         assert!(p.vehicle_velocity(id).y < -5.0, "falls");
     }
 
+    /// The Speed Boat's `_BoatPhysics` (gap round 17): flat out it
+    /// settles at its `MaxSpeed`, backing up at its `MaxSpeedReverse`,
+    /// and coasting and braking the water slows it at its drag's rate.
+    #[test]
+    fn a_boat_goes_and_slows_as_its_template_says() {
+        let spec = VehicleSpec {
+            tuning: crate::VehicleTuning {
+                max_speed: Some(120.0 / 3.6),
+                boat: Some(BoatTuning {
+                    reverse_speed: 40.0 / 3.6,
+                    torque: (1000.0, 500.0),
+                    drag: [0.2, 2.0, 2.0],
+                    brake: 3.0,
+                    curve: [1.0, 0.7, 0.6, 0.5],
+                }),
+                ..crate::VehicleTuning::default()
+            },
+            ..boat()
+        };
+        let run = |throttle: f32, brake: bool, secs: f32, from: Option<f32>| {
+            let mut p = Physics::new();
+            p.set_water(0.0);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.5, 0.0), 0.0);
+            for _ in 0..300 {
+                p.drive(id, VehicleControls::default());
+                p.step(DT);
+            }
+            if let Some(v) = from {
+                let up = p.vehicle_velocity(id).y;
+                p.set_vehicle_velocity(id, Vec3::new(0.0, up, v));
+            }
+            for _ in 0..(secs / DT) as usize {
+                let c = VehicleControls {
+                    throttle,
+                    brake,
+                    ..VehicleControls::default()
+                };
+                p.drive(id, c);
+                p.step(DT);
+            }
+            p.vehicle_velocity(id).z
+        };
+        let ahead = run(1.0, false, 40.0, None);
+        assert!((ahead - 33.33).abs() < 0.7, "ahead {ahead}");
+        let astern = run(-1.0, false, 30.0, None);
+        assert!((astern + 11.11).abs() < 0.3, "astern {astern}");
+        // From 8 m/s for a second: e^-0.2 and e^-(0.2 + 3) of it.
+        let coast = run(0.0, false, 1.0, Some(8.0));
+        assert!((coast - 8.0 * (-0.2f32).exp()).abs() < 0.2, "coast {coast}");
+        let braked = run(0.0, true, 1.0, Some(8.0));
+        assert!(
+            (braked - 8.0 * (-3.2f32).exp()).abs() < 0.1,
+            "braked {braked}"
+        );
+    }
+
     #[test]
     fn a_boat_floats_level_drives_turns_and_beaches() {
         let mut p = Physics::new();
@@ -3347,11 +3415,12 @@ mod tests {
             );
             p.step(DT);
         }
-        // The beach comes out of the water at z 241.
+        // The beach comes out of the water at z 241; it runs up it at its
+        // top speed (18 m/s since gap round 17, 13 before) and slides on.
         let m = place(&p);
         assert!(p.vehicle_speed(id).abs() < 2.0, "{}", p.vehicle_speed(id));
         assert!(
-            (215.0..250.0).contains(&m.w_axis.z),
+            (215.0..265.0).contains(&m.w_axis.z),
             "aground at {}",
             m.w_axis
         );

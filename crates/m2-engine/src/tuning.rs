@@ -57,6 +57,8 @@ pub struct VehicleTuning {
     pub tracks: Option<[f32; 4]>,
     /// A helicopter's handling (`_HelicopterPhysics`).
     pub flight: Option<FlightTuning>,
+    /// A boat's engine and the water's drag on it (`_BoatPhysics`).
+    pub boat: Option<BoatTuning>,
     /// How far behind a helicopter its pilot's camera sits, metres, and
     /// how far it looks down, radians (`CameraHelicopter`'s field
     /// `ee30a43d`, name unknown: 20 for the light helicopters, 39 for the
@@ -91,6 +93,70 @@ pub struct FlightTuning {
     pub roll_bank: f32,
     pub roll_accel: f32,
     pub bank_speed: f32,
+}
+
+/// A boat's engine and how the water slows it, from its `_BoatPhysics`
+/// (names found by hash, gap round 17; the Speed Boat's values in
+/// brackets, the range over the 110 records after them). Its top speed
+/// is [`VehicleTuning::max_speed`] (`MaxSpeed` 120 km/h).
+///
+/// Named but not read here: `Steering`, `LowSpeedSteering`,
+/// `LowSpeedLimit`, `SteerInertia`, `EngineInertia`, `HullFriction`,
+/// `RollInertia`, `PitchUpSpeed`, `PitchDownInertia`, `HandbrakeInertia`,
+/// `HandbrakeSteerBoost`; some 45 fields are still unnamed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoatTuning {
+    /// Top speed backing up, m/s (`MaxSpeedReverse`, km/h as `MaxSpeed`
+    /// is: 40; 6 to 45).
+    pub reverse_speed: f32,
+    /// Its engine's pull ahead and backing up (`EngineTorque` 1,000 and
+    /// `EngineReverseTorque` 500; 30 to 2,500 and 10 to 3,000). Only
+    /// their ratio is read: backing up it pulls that share of what it
+    /// pulls ahead (inferred: the Air Boat's 0.5 and the Barco's 0.44 of
+    /// their `MaxSpeed` are their `MaxSpeedReverse`). The units are
+    /// unknown: the torque over the mass varies 12-fold between boats
+    /// whose drag and top speed ask the same pull.
+    pub torque: (f32, f32),
+    /// How quickly the water slows it along, across and up and down, a
+    /// second (`WaterDragFwd` 0.2, `WaterDragSide` 2, `WaterDragUp` 2;
+    /// 0.1 to 0.5, 0.5 to 10, 0.5 to 26), read as a linear drag's rate
+    /// (inferred: they sit where the alpha's invented 0.3, 2.5 and 3
+    /// did; the Air Boat's sideways 0.5 lets it skid, the landing craft's
+    /// 10 holds it to its course).
+    pub drag: [f32; 3],
+    /// How much more its brake slows it, a second (`BrakeDrag` 3; 0 to 8;
+    /// added to its drag along, inferred).
+    pub brake: f32,
+    /// Its pull at a standstill, a third, two thirds and all of its top
+    /// speed (`EngineTorqueRatio0`..`3`, as a tank's are named: 1, 0.7,
+    /// 0.6, 0.5; read as a curve over its speed, as a tank's are,
+    /// inferred). Only their shape is read: scaled so that at its top
+    /// speed it pulls what holds it there.
+    pub curve: [f32; 4],
+}
+
+impl BoatTuning {
+    /// Its pull flat out at `speed` m/s, m/s²: at `top` m/s, what holds
+    /// it there against its drag along (inferred: the data gives no pull
+    /// its torque fits, see [`torque`](Self::torque)), more or less
+    /// below it as its [`curve`](Self::curve) says; backing up, its
+    /// share of that.
+    pub fn push(&self, speed: f32, top: f32, backwards: bool) -> f32 {
+        let c = self.curve;
+        let shape = if c[3] > 0.0 && top > 0.0 {
+            let at = (speed.abs() / top).clamp(0.0, 1.0) * 3.0;
+            let i = (at as usize).min(2);
+            (c[i] + (c[i + 1] - c[i]) * (at - i as f32)) / c[3]
+        } else {
+            1.0
+        };
+        let ahead = self.drag[0] * top * shape;
+        if backwards {
+            ahead * (self.torque.1 / self.torque.0).clamp(0.0, 2.0)
+        } else {
+            ahead
+        }
+    }
 }
 
 /// A wheeled vehicle's engine and gearbox, from its `_CarPhysicsV2`
@@ -840,6 +906,23 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         bank_speed: f("BankSpeedLimit")?,
                     })
                 })(),
+                boat: (|| {
+                    let r = *boat.of_template(id).first()?;
+                    let f = |name| boat.float(r, name_hash(name)).filter(|v| *v >= 0.0);
+                    let b = BoatTuning {
+                        reverse_speed: f("MaxSpeedReverse")? / 3.6,
+                        torque: (f("EngineTorque")?, f("EngineReverseTorque")?),
+                        drag: [f("WaterDragFwd")?, f("WaterDragSide")?, f("WaterDragUp")?],
+                        brake: f("BrakeDrag")?,
+                        curve: [
+                            f("EngineTorqueRatio0")?,
+                            f("EngineTorqueRatio1")?,
+                            f("EngineTorqueRatio2")?,
+                            f("EngineTorqueRatio3")?,
+                        ],
+                    };
+                    (b.torque.0 > 0.0 && b.drag[0] > 0.0).then_some(b)
+                })(),
                 chase: (|| {
                     let records = heli_camera.of_template(id);
                     let seat = name_hash("SeatName");
@@ -976,6 +1059,29 @@ mod tests {
             // `_TankPhysics`'s pull over its speed.
             ("EngineTorqueRatio0", 0xe8a9_e7ee),
             ("EngineTorqueRatio3", 0x4ab1_3df9),
+            // `_BoatPhysics`'s engine and drag (gap round 17); the rest
+            // named, unused.
+            ("MaxSpeedReverse", 0x1a48_1908),
+            ("EngineReverseTorque", 0x77f0_1515),
+            ("WaterDragFwd", 0xdf30_e58f),
+            ("WaterDragSide", 0x00a6_a021),
+            ("WaterDragUp", 0x2129_f9cf),
+            ("BrakeDrag", 0x5b27_5d58),
+            ("EngineTorqueRatio1", 0x4aac_c0cb),
+            ("EngineTorqueRatio2", 0x70af_3b34),
+            ("Steering", 0x0d6b_34d0),
+            ("LowSpeedSteering", 0xa9d5_82eb),
+            ("HullFriction", 0xb50c_fb8a),
+            ("RollInertia", 0x80dc_9cc6),
+            ("PitchUpSpeed", 0xf72b_c08f),
+            ("PitchDownInertia", 0xe125_7555),
+            ("HandbrakeInertia", 0x83d7_b1ab),
+            ("HandbrakeSteerBoost", 0x8572_4b6b),
+            // `_CarPhysicsV2`'s bike fields: named, unused.
+            ("BikeRollStabilityStrength", 0x215f_7ff3),
+            ("BikeExtraDampRoll", 0x0e1e_7f73),
+            ("BikeAirControlPitch", 0x280f_15d5),
+            ("BikeAirControlYaw", 0x1f16_345a),
             // `Rotor`: its hub node, and which way it spins (1 or -1);
             // its blade and blur nodes are `vehicle::MAIN_ROTOR`'s.
             ("RotorHubBoneName", 0xc93e_7607),
