@@ -42,6 +42,7 @@ mod autoplay;
 mod breakables;
 mod cache;
 mod camera;
+mod cheats;
 mod combat;
 mod config;
 mod destruct;
@@ -253,6 +254,9 @@ struct Options {
     /// (or those) bought and called in, one after another
     /// ([`shopcheck`]), for testing.
     shop_check: Option<Vec<String>>,
+    /// `--cheat-check`: with `--mission`, every cheat of the menu tried
+    /// once she is ashore ([`cheats::Check`]), for testing.
+    cheat_check: bool,
     /// With `--screenshot --drive`: hijack the vehicle instead of getting
     /// in, answering every prompt at once.
     hijack: bool,
@@ -479,6 +483,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 o.mission_drivers.push((path, code));
             }
             "--support" => o.support.push(value()?),
+            "--cheat-check" => o.cheat_check = true,
             "--shop-check" => {
                 let v = value()?;
                 o.shop_check = Some(if v == "all" {
@@ -2685,6 +2690,7 @@ fn mission_for_screenshot(
     // Seconds she has been where --props-check hits the props.
     let mut props_ready = 0.0;
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
+    let mut cheat_check = options.cheat_check.then(cheats::Check::default);
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -2702,7 +2708,7 @@ fn mission_for_screenshot(
         }
         // With --support she throws the marker the scripts hand her.
         let mut intent = intent;
-        if !options.support.is_empty() && game.combat.to_throw {
+        if (!options.support.is_empty() || options.cheat_check) && game.combat.to_throw {
             intent.trigger.throw = true;
         }
         // With --shop-check she buys and calls in every support item.
@@ -2717,6 +2723,18 @@ fn mission_for_screenshot(
                 intent = i;
             }
             if sc.finished() {
+                break;
+            }
+        }
+        // With --cheat-check, every cheat is tried once she is ashore.
+        if let Some(cc) = &mut cheat_check {
+            let ashore = !link
+                .view()
+                .objectives
+                .iter()
+                .any(|o| o.contains("Land on the beach"))
+                && game.scene.player.as_ref().is_some_and(|p| p.landed);
+            if cc.step(game, &mut link, ashore, tick) {
                 break;
             }
         }
@@ -4865,6 +4883,8 @@ struct Running {
     buttons: Vec<String>,
     /// The developer's keys work ([`App::dev`]).
     dev: bool,
+    /// The cheat menu's god mode and infinite ammo ([`cheats::keep_up`]).
+    cheats: cheats::Toggles,
 }
 
 struct App {
@@ -4939,7 +4959,7 @@ impl App {
         hud.dev = self.dev;
         eprintln!(
             "keys: the developer's (F4 free camera, F5/F9 quick save and load, F3 culling, \
-             N gait) {}",
+             N gait, F7 cheat menu) {}",
             if self.dev { "on" } else { "off (--dev)" }
         );
         let egui = egui_winit::State::new(
@@ -5003,6 +5023,7 @@ impl App {
             },
             buttons: Vec::new(),
             dev: self.dev,
+            cheats: cheats::Toggles::default(),
         })
     }
 
@@ -5188,6 +5209,7 @@ impl Running {
             }
             Some(ui::MenuAction::Quit) => event_loop.exit(),
             Some(ui::MenuAction::Shop(a)) => self.shop_action(a, config),
+            Some(ui::MenuAction::Cheat(a)) => self.cheat_action(a),
             None => {}
         }
         let (w, h) = self.backend.size();
@@ -5278,6 +5300,7 @@ impl Running {
     }
 
     fn close_menu(&mut self) {
+        self.hud.cheats = None;
         if self.hud.shop.take().is_some()
             && let Some(m) = &mut self.mission
         {
@@ -5328,6 +5351,50 @@ impl Running {
                 eprintln!("game loaded from {}", path.display());
             }
             Err(e) => eprintln!("could not load: {e:#}"),
+        }
+    }
+
+    /// Puts the cheat menu up ([`cheats`]), in the pause menu's place, its
+    /// lists read from the game's data and the scripts' catalogue.
+    fn show_cheats(&mut self) {
+        let mut screen = cheats::CheatScreen::read(&self.game, self.mission.as_ref());
+        screen.toggles = self.cheats;
+        eprintln!("cheats: {}", screen.counts());
+        self.hud.cheats = Some(screen);
+        self.open_menu();
+    }
+
+    fn cheat_action(&mut self, action: cheats::CheatAction) {
+        use cheats::CheatAction as A;
+        match action {
+            A::Close => self.close_menu(),
+            A::Tab(tab) => {
+                if let Some(c) = &mut self.hud.cheats {
+                    c.tab = tab;
+                    c.filter.clear();
+                    c.said = None;
+                }
+            }
+            A::Filter(f) => {
+                if let Some(c) = &mut self.hud.cheats {
+                    c.filter = f;
+                }
+            }
+            action => {
+                let done = cheats::apply(
+                    &mut self.game,
+                    self.mission.as_mut(),
+                    &mut self.cheats,
+                    action,
+                );
+                eprintln!("cheat: {}", done.said);
+                if done.close {
+                    self.close_menu();
+                } else if let Some(c) = &mut self.hud.cheats {
+                    c.toggles = self.cheats;
+                    c.said = Some(done.said);
+                }
+            }
         }
     }
 
@@ -5440,6 +5507,10 @@ impl Running {
             let unlock = config.enhanced.shop.unlock_all;
             self.show_shop(0, unlock);
         }
+        // The cheat menu is a developer's key: taken either way.
+        if self.input.take_pressed(Action::Cheats) && !self.hud.menu && self.dev {
+            self.show_cheats();
+        }
         if self.hud.menu {
             // Paused: the world waits, sound carries on.
             let (ear, facing) = self.game.listener();
@@ -5496,6 +5567,7 @@ impl Running {
             self.mouse_look,
             TICK.as_secs_f32(),
         );
+        cheats::keep_up(&mut self.game, self.cheats);
         if let Some(h) = &mut self.hijacks {
             h.place(&mut self.game);
             h.seat(&mut self.game, TICK.as_secs_f32());

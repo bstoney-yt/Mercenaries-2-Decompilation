@@ -561,6 +561,53 @@ impl MissionLink {
         }
     }
 
+    /// Every item of the scripts' support catalogue, readable, for the
+    /// cheat menu ([`crate::cheats`]).
+    pub fn cheat_support(&self) -> Vec<crate::cheats::SupportLine> {
+        let State::Running(m) = &self.state else {
+            return Vec::new();
+        };
+        let mut out: Vec<crate::cheats::SupportLine> = m
+            .support_items()
+            .into_iter()
+            .map(|i| crate::cheats::SupportLine {
+                name: m.text(&i.name),
+                key: i.key,
+                kind: i.kind,
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
+        out
+    }
+
+    /// The cheat menu's support: one of item `key` stocked free into her
+    /// support menu, and called in at once if `call`, as `--support`
+    /// does. The recruits that bring it are freed first, so a second call
+    /// isn't kept waiting. Whether the scripts took the call (true when
+    /// only stocked).
+    pub fn cheat_support_item(&mut self, key: &str, call: bool) -> bool {
+        self.free_recruits();
+        let State::Running(m) = &mut self.state else {
+            return false;
+        };
+        m.stock_support(key, 1, 0.0, 0.0);
+        let took = !call || m.use_support(key);
+        let lines = m.take_log();
+        self.write(lines);
+        self.stock_look = 0;
+        took
+    }
+
+    /// The cheat menu's money: `cash` and `fuel` given the scripts' way.
+    pub fn cheat_money(&mut self, cash: f64, fuel: f64) {
+        if let State::Running(m) = &mut self.state {
+            m.give_resources(cash, fuel, "[Generic.Pickups]");
+            let lines = m.take_log();
+            self.write(lines);
+            self.stock_look = 0;
+        }
+    }
+
     /// Frees every recruit of the support's (the helicopter pilot, the jet
     /// pilot...) at once, their cooldowns and errands cut short: for a
     /// check calling one item after another.
