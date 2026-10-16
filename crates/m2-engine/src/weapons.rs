@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 
 use m2_assets::{Layer, name_hash};
+use m2_math::glam::Vec3;
 
 use crate::tuning::Table;
 
@@ -440,6 +441,62 @@ impl FireHint {
         let (_, off) = self.burst(close);
         let firing = self.rounds(gap, close) as f32 * gap;
         firing / (firing + off).max(1e-3)
+    }
+}
+
+/// How far a soldier's rounds stray from where he aims: widths across,
+/// radians, sideways and up, each round a uniform pick within them
+/// ([`SoldierSpread::stray`]), as her own rounds scatter over her gun's
+/// cone. Two parts add up:
+///
+/// - his gun's `LowSkillScatter` (`WeaponScatter`'s first field, degrees
+///   across: the sniper rifle's 0.1, the rifles' 0.8 to 1.5, the pistols'
+///   3, the machine pistols' 4, the shotgun's 3.5), the same both ways;
+/// - a miss of his own that grows with range and with what his
+///   `AiAttributes` `Accuracy` lacks of a perfect 1, twice as wide
+///   sideways as up (rounds 1-14's whole rule, scaled by
+///   [`SoldierSpread::MISS`]).
+///
+/// Provenance: the field's name and values are the template's (from
+/// samples, gap round 13); that it is a soldier's cone is inferred from
+/// its name ("low skill") and that its values are cones of the same size
+/// as `ScatterMin`'s; that it is degrees across as `ScatterMin` is, and
+/// that the two parts add, are inferred. The miss by range and
+/// `Accuracy` is invented (no field read gives it), and its scale is
+/// fitted so that a VZ soldier ([`SoldierSpread::VZ_ACCURACY`]) with the
+/// Assault Rifle hits at 20 m as often as under the old rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoldierSpread {
+    pub side: f32,
+    pub up: f32,
+}
+
+impl SoldierSpread {
+    /// A VZ soldier's `Accuracy` (the old rule's anchor).
+    pub const VZ_ACCURACY: f32 = 0.4;
+    /// The old rule's miss, scaled down so his gun's cone added to it
+    /// leaves the VZ soldier's Assault Rifle hitting as often at 20 m
+    /// (fitted with the `soldierspread` example).
+    pub const MISS: f32 = 0.75;
+
+    /// For a soldier of `accuracy` firing a gun of `low_skill` degrees
+    /// (`LowSkillScatter`) at `distance` metres.
+    pub fn new(distance: f32, accuracy: f32, low_skill: f32) -> Self {
+        let lack = ((1.0 - accuracy) / (1.0 - Self::VZ_ACCURACY)).clamp(0.2, 2.0);
+        let miss = Self::MISS * (0.02 + distance.max(0.0) * 0.004) * lack;
+        let cone = low_skill.max(0.0).to_radians();
+        Self {
+            side: cone + 2.0 * miss,
+            up: cone + miss,
+        }
+    }
+
+    /// The way a round goes for an aim along unit `aim`, given two
+    /// uniform picks in [-0.5, 0.5).
+    pub fn stray(&self, aim: Vec3, a: f32, b: f32) -> Vec3 {
+        let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
+        let up = side.cross(aim).normalize_or(Vec3::Y);
+        (aim + side * (a * self.side) + up * (b * self.up)).normalize_or(aim)
     }
 }
 
@@ -1282,5 +1339,75 @@ mod tests {
         assert_eq!((m[0].seat, m[0].priority), (5, 0));
         assert_eq!(m[0].nodes, vec![Some(2), None, Some(0)]);
         assert_eq!(m[1].nodes, vec![None]);
+    }
+
+    /// Share of rounds within 0.45 m of a mark `distance` ahead, by a
+    /// fixed xorshift, for `spread`.
+    fn hit_share(spread: SoldierSpread, distance: f32) -> f32 {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut pick = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        let (n, at) = (20_000, Vec3::Z * distance);
+        let hits = (0..n)
+            .filter(|_| {
+                let dir = spread.stray(Vec3::Z, pick(), pick());
+                (dir * at.dot(dir)).distance(at) < 0.45
+            })
+            .count();
+        hits as f32 / n as f32
+    }
+
+    #[test]
+    fn soldiers_spread_by_their_guns_cone() {
+        let vz = SoldierSpread::VZ_ACCURACY;
+        // A perfect shot with the sniper rifle's 0.1 degrees still misses
+        // a little; the shotgun's 3.5 is wider than the carbine's 1.
+        let sniper = SoldierSpread::new(0.0, 1.0, 0.1);
+        assert!(sniper.up > 0.1f32.to_radians());
+        let (carbine, shotgun) = (
+            SoldierSpread::new(20.0, vz, 1.0),
+            SoldierSpread::new(20.0, vz, 3.5),
+        );
+        assert!((shotgun.side - carbine.side - 2.5f32.to_radians()).abs() < 1e-6);
+        assert!((shotgun.up - carbine.up - 2.5f32.to_radians()).abs() < 1e-6);
+        // The miss is twice as wide sideways and grows with range.
+        let far = SoldierSpread::new(40.0, vz, 0.0);
+        assert!((far.side - 2.0 * far.up).abs() < 1e-6);
+        assert!(far.up > SoldierSpread::new(20.0, vz, 0.0).up);
+        // A negative cone counts as none.
+        assert_eq!(
+            SoldierSpread::new(20.0, vz, -1.0),
+            SoldierSpread::new(20.0, vz, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_vz_soldiers_rifle_hits_at_20_m_as_before() {
+        // The old rule (0.1 rad up, 0.2 along the world's x and z, the
+        // same for every gun) hit 9.0% of his rounds at 20 m, over all
+        // headings (the soldierspread example). The fitted miss keeps his
+        // Assault Rifle (1.5 degrees) hitting as often.
+        let new = SoldierSpread::new(20.0, SoldierSpread::VZ_ACCURACY, 1.5);
+        let now = hit_share(new, 20.0);
+        assert!((now - 0.090).abs() < 0.01, "{now}");
+        // The machine pistols' 4 degrees hit less, the carbine's 1 more.
+        let vz = SoldierSpread::VZ_ACCURACY;
+        assert!(hit_share(SoldierSpread::new(10.0, vz, 4.0), 10.0) < 0.4);
+        assert!(hit_share(SoldierSpread::new(10.0, vz, 1.0), 10.0) > 0.74);
+    }
+
+    #[test]
+    fn a_stray_round_stays_within_the_widths() {
+        let s = SoldierSpread { side: 0.2, up: 0.1 };
+        let aim = Vec3::new(1.0, 0.0, 1.0).normalize();
+        let d = s.stray(aim, 0.5, -0.5);
+        let side = aim.cross(Vec3::Y).normalize();
+        assert!((d.dot(side) / d.dot(aim) - 0.1).abs() < 1e-5);
+        assert!((d.dot(Vec3::Y) / d.dot(aim) + 0.05).abs() < 1e-5);
+        assert!(s.stray(aim, 0.0, 0.0).distance(aim) < 1e-6);
     }
 }
