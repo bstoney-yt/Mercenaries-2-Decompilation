@@ -1471,6 +1471,9 @@ pub struct Combat {
     /// hero fired it, and the muzzle flashes drawn as the game's effect
     /// and as the alpha's own: for the run's log.
     pub shots: std::collections::BTreeMap<(u32, bool), u32>,
+    /// The people other than the hero who fired, by sound set: their
+    /// numbers (which pick their variant of the shot), for the log.
+    pub shooters: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
     pub flashes: (u32, u32),
     /// Spent cases thrown out (each its gun's `ShellEjectTemplate`).
     pub cases: u32,
@@ -1652,6 +1655,7 @@ impl Default for Combat {
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
             shots: std::collections::BTreeMap::new(),
+            shooters: std::collections::BTreeMap::new(),
             flashes: (0, 0),
             cases: 0,
             tally: Tally::default(),
@@ -2187,6 +2191,14 @@ impl Combat {
         let set = feel.and_then(|f| f.sound_set);
         let npc = shooter.is_some();
         *self.shots.entry((set.unwrap_or(0), !npc)).or_default() += 1;
+        if let Some(n) = shooter
+            && self.shooters.entry(set.unwrap_or(0)).or_default().insert(n)
+        {
+            eprintln!(
+                "combat: a soldier numbered {n} fires sound set {:08x}",
+                set.unwrap_or(0)
+            );
+        }
         self.sounds.push(Sound::Shot {
             at: from,
             set,
@@ -2202,12 +2214,23 @@ impl Combat {
             .iter()
             .map(|(&(set, hero), n)| format!("{set:08x}{} {n}", if hero { " (hero)" } else { "" }))
             .collect();
+        let shooters: Vec<String> = self
+            .shooters
+            .iter()
+            .map(|(set, who)| format!("{set:08x} {}", who.len()))
+            .collect();
         format!(
-            "shots by sound set: {}; flashes: {} the game's, {} the alpha's own; cases {}",
+            "shots by sound set: {} (others firing: {}); flashes: {} the game's, {} the \
+             alpha's own; cases {}",
             if sets.is_empty() {
                 "none".to_owned()
             } else {
                 sets.join(", ")
+            },
+            if shooters.is_empty() {
+                "none".to_owned()
+            } else {
+                shooters.join(", ")
             },
             self.flashes.0,
             self.flashes.1,
