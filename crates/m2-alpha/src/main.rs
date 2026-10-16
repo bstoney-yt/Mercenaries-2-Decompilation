@@ -185,6 +185,9 @@ struct Options {
     /// With `--screenshot` on foot: face this way (radians from +z towards
     /// +x) before the picture.
     face: Option<f32>,
+    /// With `--screenshot` on foot: tilt the camera this far (radians)
+    /// before the picture, to frame the sky.
+    pitch: Option<f32>,
     /// With `--screenshot` on foot: hold the weapon up to aim at the end.
     aim: bool,
     /// With `--screenshot` on foot: the weapon she has up.
@@ -501,6 +504,14 @@ fn parse_args() -> anyhow::Result<Options> {
                     value()?
                         .parse::<f32>()
                         .context("--face expects degrees")?
+                        .to_radians(),
+                )
+            }
+            "--pitch" => {
+                o.pitch = Some(
+                    value()?
+                        .parse::<f32>()
+                        .context("--pitch expects degrees")?
                         .to_radians(),
                 )
             }
@@ -1361,6 +1372,9 @@ fn screenshot(
                 if i == 0 {
                     p.facing = face;
                 }
+            }
+            if let (Some(pitch), Some(p)) = (options.pitch, game.scene.player.as_mut()) {
+                p.pitch = pitch;
             }
             // The bash clip asked for, with its blow's time.
             if let (Some(want), Some(p)) = (options.bash_clip, game.scene.player.as_mut())
