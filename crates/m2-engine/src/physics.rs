@@ -807,6 +807,19 @@ const TRACK_TURN: f32 = 0.9;
 /// and backwards.
 const TOP_SPEED: f32 = 30.0;
 const REVERSE_SPEED: f32 = 8.0;
+/// A wheeled or tracked vehicle's drag, per second (a boat's and a
+/// helicopter's is 0.1). Until round 18 it was 0.1 too, which held every
+/// car to about 60% of its template's `MaxSpeed` against the old pull of
+/// 4 m/s² falling to nothing at the top (the playtest's "vehicles feel
+/// slower"); its own engine now sets how it gathers speed. Invented.
+const GROUND_DAMPING: f32 = 0.02;
+/// How a vehicle's pull fades as it reaches its top speed, over this
+/// many m/s below it (its template's `MaxSpeed` caps it). Invented.
+const TOP_EASE: f32 = 1.0;
+/// A tracked vehicle's most pull, m/s², shaped by its tracks' curve
+/// ([`VehicleTuning::tracks`](crate::VehicleTuning)); and a vehicle's
+/// whose template gives neither engine nor tracks. Invented.
+const TRACK_PULL: f32 = 4.0;
 /// Boats ([`Physics::set_water`]): how deep a boat's origin floats,
 /// metres (the layers put the start's boat 0.35 m under the -36 m sea,
 /// patrol boats at it); how hard it pushes on flat out, m/s²; how its
@@ -890,8 +903,13 @@ struct VehicleBody {
     tracked: bool,
     /// On two wheels in line: held upright, leaning into its turns.
     bike: bool,
-    /// Top speed forwards, m/s.
+    /// Top speed forwards and backing up, m/s.
     top: f32,
+    reverse_top: f32,
+    /// Its template's engine and gearbox, or its tracks' pull over its
+    /// speed ([`VehicleTuning`](crate::VehicleTuning)).
+    engine: Option<crate::tuning::EngineTuning>,
+    tracks: Option<[f32; 4]>,
     /// Wrecked: nothing drives it any more.
     wrecked: bool,
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
@@ -974,6 +992,16 @@ const VEHICLE: r::Group = r::Group::GROUP_4;
 /// meets it (people walk and vehicles drive through it, as she goes
 /// through a gate's rubble in the videos; shots pass).
 const RUBBLE: r::Group = r::Group::GROUP_5;
+
+/// Of a tracked vehicle's most pull, what its tracks give at `along` of
+/// its top speed (0 to 1): its curve's four points at a standstill, a
+/// third, two thirds and all of it, between them in a line.
+fn track_pull(curve: [f32; 4], along: f32) -> f32 {
+    let at = along.clamp(0.0, 1.0) * 3.0;
+    let i = (at as usize).min(2);
+    let k = at - i as f32;
+    curve[i] + (curve[i + 1] - curve[i]) * k
+}
 
 /// Queries that see everything but ragdolls and rubble.
 fn solid<'a>() -> r::QueryFilter<'a> {
@@ -1507,7 +1535,11 @@ impl Physics {
         let body = self.world.insert_body(
             r::RigidBodyBuilder::dynamic()
                 .pose(pose(position, rotation))
-                .linear_damping(0.1)
+                .linear_damping(if spec.is_boat() || spec.is_helicopter() {
+                    0.1
+                } else {
+                    GROUND_DAMPING
+                })
                 .angular_damping(0.5)
                 .can_sleep(false)
                 .ccd_enabled(true),
@@ -1603,6 +1635,12 @@ impl Physics {
             tracked: spec.tracked,
             bike: spec.is_bike(),
             top: spec.tuning.max_speed.unwrap_or(top),
+            reverse_top: match spec.tuning.engine {
+                Some(e) if !spec.tracked => e.reverse_speed,
+                _ => (spec.tuning.max_speed.unwrap_or(top) * 0.5).min(REVERSE_SPEED),
+            },
+            engine: spec.tuning.engine.filter(|_| !spec.tracked),
+            tracks: spec.tuning.tracks,
             wrecked: false,
             held: false,
             before: Vec3::ZERO,
@@ -1655,14 +1693,22 @@ impl Physics {
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
         let throttle = controls.throttle.clamp(-1.0, 1.0);
         let against = speed.abs() > 0.5 && throttle * speed < 0.0;
-        // Accelerates at about 4 m/s² flat out, slower near top speed;
-        // backs up at half its top speed, at most 8 m/s.
+        // Pulls as its engine turns in the gear its speed puts it in, or
+        // as its tracks' curve says (else 4 m/s² falling to nothing at
+        // the top), up to its top speed; backs up to its reverse top
+        // speed (else half its top speed, at most 8 m/s).
         let top = if throttle >= 0.0 {
             v.top
         } else {
-            (v.top * 0.5).min(REVERSE_SPEED)
+            v.reverse_top
         };
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
+        let ease = ((top - speed.abs()) / TOP_EASE).clamp(0.0, 1.0);
+        let push = match (v.engine, v.tracks) {
+            (Some(e), _) => e.push(speed.abs(), throttle < 0.0) / v.mass * ease,
+            (None, Some(curve)) => TRACK_PULL * track_pull(curve, 1.0 - headroom) * ease,
+            (None, None) => TRACK_PULL * headroom,
+        };
         // Uphill (the way it is driven), the pull that holds it as on the
         // flat, up to its steepest hill (tracks hold it by their grip).
         let most = if v.tracked { 0.0 } else { CLIMB };
@@ -1679,7 +1725,7 @@ impl Physics {
         } else if against {
             (0.0, slowing(SERVICE_BRAKE * throttle.abs()))
         } else if throttle != 0.0 {
-            let pull = 4.0 * headroom + GRAVITY * uphill;
+            let pull = push + GRAVITY * uphill;
             (throttle * v.mass * pull / wheels, 0.0)
         } else if speed.abs() < 1.0 {
             (0.0, slowing(HOLD))
@@ -3322,6 +3368,75 @@ mod tests {
             "tilted {} degrees",
             up.angle_between(Vec3::Y).to_degrees()
         );
+    }
+
+    // Round 18: with the M151's engine and gearbox it reaches its
+    // template's 85 km/h in seconds and holds there (it used to level
+    // off at 60% of it), and backs up no faster than its 55 km/h.
+    #[test]
+    fn an_engine_drives_a_car_to_its_max_speed() {
+        let engine = crate::tuning::EngineTuning {
+            torque: 130.0,
+            rpm: (900.0, 3000.0, 12000.0),
+            upshift: 4000.0,
+            primary: 3.5,
+            gears: [4.0, 3.1, 2.4, 2.0, 1.5],
+            reverse: 3.7,
+            radius: 0.39,
+            torque_at: (0.8, 1.0),
+            reverse_speed: 55.0 / 3.6,
+        };
+        let spec = VehicleSpec {
+            mass: 1000.0,
+            tuning: crate::VehicleTuning {
+                max_speed: Some(85.0 / 3.6),
+                engine: Some(engine),
+                ..Default::default()
+            },
+            ..car()
+        };
+        let run = |throttle: f32, seconds: f32| {
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 600.0);
+            p.step(DT);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -500.0 * throttle), 0.0);
+            let mut speeds = Vec::new();
+            for _ in 0..(seconds / DT) as usize {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        throttle,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+                speeds.push(p.vehicle_speed(id).abs());
+            }
+            speeds
+        };
+        let ahead = run(1.0, 15.0);
+        let top = 85.0 / 3.6;
+        let reached = ahead.iter().position(|&s| s > 0.9 * top);
+        assert!(
+            reached.is_some_and(|i| (i as f32) * DT < 10.0),
+            "{reached:?}"
+        );
+        let fastest = ahead.iter().copied().fold(0.0, f32::max);
+        assert!(fastest < top * 1.03, "{fastest}");
+        let back = run(-1.0, 12.0);
+        let fastest = back.iter().copied().fold(0.0, f32::max);
+        assert!(fastest > 0.8 * engine.reverse_speed, "{fastest}");
+        assert!(fastest < engine.reverse_speed * 1.03, "{fastest}");
+    }
+
+    #[test]
+    fn tracks_pull_along_their_curve() {
+        let curve = [1.0, 0.45, 0.3, 0.1];
+        assert_eq!(track_pull(curve, 0.0), 1.0);
+        assert!((track_pull(curve, 1.0 / 3.0) - 0.45).abs() < 1e-5);
+        assert!((track_pull(curve, 0.5) - 0.375).abs() < 1e-5);
+        assert!((track_pull(curve, 1.0) - 0.1).abs() < 1e-5);
+        assert!((track_pull(curve, 2.0) - 0.1).abs() < 1e-5);
     }
 
     #[test]
