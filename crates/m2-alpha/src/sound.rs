@@ -1360,7 +1360,7 @@ impl GameAudio {
                     // Its weapon's own shot where its sound set has one
                     // (the RPG's, a tank gun's, a helicopter's
                     // missiles'), else the alpha's sound for its kind.
-                    let own = self.play_shot(at, set, false);
+                    let own = self.play_shot(at, set, false, 0);
                     if own {
                         self.launches.0 += 1;
                     } else {

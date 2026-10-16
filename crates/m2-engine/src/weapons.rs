@@ -1171,6 +1171,7 @@ mod tests {
                 lock_on: homing.then_some((1.0, 500.0)),
                 pickup: None,
                 feel: Default::default(),
+                hint: None,
             },
             nodes: vec![Some(0)],
         }
