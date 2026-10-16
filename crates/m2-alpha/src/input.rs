@@ -30,9 +30,9 @@
 //! view (`MrxGuiBinocularsLayout`); the view switch is bound but does
 //! nothing yet (the alpha has one camera); the alpha's own keys (the
 //! seats Y, C4 X, the shop H, music M, the mouse's release F2, the
-//! developer's F3 to F9) sit on keys the table leaves free. The hijack's
-//! face buttons stay on I K J L beside the look (the PC game's are not
-//! known).
+//! developer's F3 to F9, among them the cheat menu's F7) sit on keys the
+//! table leaves free. The hijack's face buttons stay on I K J L beside the
+//! look (the PC game's are not known).
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -104,6 +104,9 @@ pub enum Action {
     /// Save the game to the quick-save file, or load it back.
     QuickSave,
     QuickLoad,
+    /// Open or close the test cheat menu (a developer's key:
+    /// [`crate::cheats`]).
+    Cheats,
     Quit,
     /// The pad's face buttons Y, A, X and B, which a hijack's prompts ask
     /// for ([`crate::hijack`]); the left stick's pushes are the movement
@@ -217,6 +220,7 @@ impl Default for Bindings {
             (ToggleCulling, vec![k(F3)]),
             (QuickSave, vec![k(F5)]),
             (QuickLoad, vec![k(F9)]),
+            (Cheats, vec![k(F7)]),
             (Quit, vec![k(Escape)]),
             // Laid out as the face buttons are (the PC game's are not
             // known), beside the look keys.
@@ -677,6 +681,13 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn f7_opens_the_cheat_menu_and_nothing_else() {
+        let b = Bindings::default();
+        let on: Vec<Action> = b.actions_for(KeyCode::F7).collect();
+        assert_eq!(on, [Action::Cheats]);
     }
 
     #[test]
