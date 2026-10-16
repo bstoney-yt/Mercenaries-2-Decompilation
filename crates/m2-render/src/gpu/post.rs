@@ -15,6 +15,22 @@
 //! written against wgpu's public API. Adaptation is the usual one too:
 //! the frame's log luminance averaged down to one texel, followed over
 //! time, and exposure scaled towards a key.
+//!
+//! With the game's tone map (records with `Bloom*` tone settings) the
+//! bright pass gives way to the game's own blur, from its post shaders
+//! (332, 333, 018/019, 017 and the composite 526): the whole frame, no
+//! threshold, halved on display values and raised to 2.5, four levels
+//! each blurred by nine taps (.24, .15, .10, .08, .05), combined .6, .3,
+//! .08, .02 and raised to 0.4, its luminance kept in alpha. The composite
+//! takes the frame part of the way to 1.2 times that image (bloom) and
+//! compresses each pixel by the blurred luminance around it rather than
+//! its own (a local tone map). From the shaders: all of that. Inferred:
+//! the bloom's share is `BloomAmount` x `BloomMultiplier` (0.25 in most
+//! records; the shader's `imageParams.x` is set by the program), the
+//! levels' sizes (a quarter of the frame down to 1/32) and the taps' step
+//! (one texel; `BloomBlurRadius`, 0.55 in most records, may be it).
+//! `BloomThreshold` is read but no game shader applies a threshold.
+//! `M2_GRADE_BLUR=off` restores the bright pass (PC round grade27).
 
 use std::cell::Cell;
 use std::time::Instant;
@@ -48,6 +64,10 @@ struct Post {
     limits: vec4<f32>,
     // The game's: rgb: the monochrome ramp's middle, a: how much of it
     mono: vec4<f32>,
+    // The game's blur: x: 1 when its image is drawn (tone map and bloom
+    // read it), y: how far the bloom takes the frame to it
+    // (`imageParams.x`)
+    blur: vec4<f32>,
 };
 
 fn game_tone_map() -> bool {
@@ -86,6 +106,10 @@ fn to_game(c: vec3<f32>) -> vec3<f32> {
 @group(0) @binding(3) var linear: sampler;
 // The adapted log luminance (one texel).
 @group(0) @binding(4) var adapted: texture_2d<f32>;
+// The game's blur: its two coarsest levels while they are combined; the
+// combined image (`blurMap`) in the composite.
+@group(0) @binding(5) var extra: texture_2d<f32>;
+@group(0) @binding(6) var extra2: texture_2d<f32>;
 
 // Exposure, scaled for the eye's adaptation.
 fn exposure() -> f32 {
@@ -142,6 +166,61 @@ fn fs_blur(v: Screen) -> @location(0) vec4<f32> {
         c = c + textureSampleLevel(source, linear, v.uv - o, 0.0).rgb * weights[i];
     }
     return vec4<f32>(c, 1.0);
+}
+
+// The game's blur (its shaders 332, 333, 018/019 and 017; the codec its
+// levels are stored in is left out, our targets being floating point).
+// First the frame's 2 x 2 blocks averaged on display values and raised to
+// 2.5: the whole frame, no threshold.
+@fragment
+fn fs_game_down0(v: Screen) -> @location(0) vec4<f32> {
+    var c = vec3<f32>(0.0);
+    for (var y = -0.5; y <= 0.5; y = y + 1.0) {
+        for (var x = -0.5; x <= 0.5; x = x + 1.0) {
+            let s = textureSampleLevel(source, linear, v.uv + vec2<f32>(x, y) * post.step.xy, 0.0).rgb;
+            c = c + to_game(s * exposure());
+        }
+    }
+    return vec4<f32>(pow(c * 0.25, vec3<f32>(2.5)), 1.0);
+}
+
+// Each level down: the average of 2 x 2 blocks of the one above.
+@fragment
+fn fs_game_down(v: Screen) -> @location(0) vec4<f32> {
+    var c = vec3<f32>(0.0);
+    for (var y = -0.5; y <= 0.5; y = y + 1.0) {
+        for (var x = -0.5; x <= 0.5; x = x + 1.0) {
+            c = c + textureSampleLevel(source, linear, v.uv + vec2<f32>(x, y) * post.step.xy, 0.0).rgb;
+        }
+    }
+    return vec4<f32>(c * 0.25, 1.0);
+}
+
+// Nine taps along `step`, weighted .24 in the middle, then .15, .10, .08
+// and .05 out to four texels each side.
+@fragment
+fn fs_game_blur(v: Screen) -> @location(0) vec4<f32> {
+    let weights = array<f32, 5>(0.24, 0.15, 0.10, 0.08, 0.05);
+    var c = textureSampleLevel(source, linear, v.uv, 0.0).rgb * weights[0];
+    for (var i = 1; i < 5; i = i + 1) {
+        let o = post.step.xy * f32(i);
+        c = c + textureSampleLevel(source, linear, v.uv + o, 0.0).rgb * weights[i];
+        c = c + textureSampleLevel(source, linear, v.uv - o, 0.0).rgb * weights[i];
+    }
+    return vec4<f32>(c, 1.0);
+}
+
+// The four blurred levels, finest first, weighted .6, .3, .08 and .02,
+// raised to 0.4 (back to display values), with their Rec. 709 luminance
+// in alpha: the composite's `blurMap`.
+@fragment
+fn fs_game_combine(v: Screen) -> @location(0) vec4<f32> {
+    let c = textureSampleLevel(source, linear, v.uv, 0.0).rgb * 0.6
+        + textureSampleLevel(glow, linear, v.uv, 0.0).rgb * 0.3
+        + textureSampleLevel(extra, linear, v.uv, 0.0).rgb * 0.08
+        + textureSampleLevel(extra2, linear, v.uv, 0.0).rgb * 0.02;
+    let d = pow(max(c, vec3<f32>(0.0)), vec3<f32>(0.4));
+    return vec4<f32>(d, luminance(d));
 }
 
 // A luminance as the game's HDR codec packs it, the inverse of its
@@ -250,7 +329,9 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
     if post.grade.a < 0.5 {
         return vec4<f32>(textureSampleLevel(source, linear, v.uv, 0.0).rgb, 1.0);
     }
-    c = c + textureSampleLevel(glow, linear, v.uv, 0.0).rgb * post.params.z;
+    if !game_tone_map() || post.blur.x < 0.5 {
+        c = c + textureSampleLevel(glow, linear, v.uv, 0.0).rgb * post.params.z;
+    }
     if game_tone_map() {
         // As the game's: luminance scaled by the target over the adapted,
         // compressed, the colour kept at the new luminance, graded, then
@@ -258,9 +339,21 @@ fn fs_composite(v: Screen) -> @location(0) vec4<f32> {
         // frame takes as linear light, so they are decoded at the end).
         let a = textureLoad(adapted, vec2<i32>(0, 0), 0).r;
         c = to_game(c);
+        // Bloom: the frame taken part of the way to the blurred image
+        // times 1.2; the compression divides by the blurred image's
+        // luminance, not the pixel's own (a local tone map).
+        var lb = -1.0;
+        if post.blur.x > 0.5 {
+            let b = textureSampleLevel(extra, linear, v.uv, 0.0);
+            c = mix(c, b.rgb * 1.2, post.blur.y);
+            lb = b.a * post.adapt.x / (a + 0.001);
+        }
         let y = luminance(c);
         let ls = y * post.adapt.x / (a + 0.001);
-        let lout = 0.8 * ls / (0.7 + min(min(ls, pow(ls, 0.7)), 10.0));
+        if lb < 0.0 {
+            lb = ls;
+        }
+        let lout = 0.8 * ls / (0.7 + min(min(lb, pow(lb, 0.7)), 10.0));
         var d = c * (lout / max(y, 1e-5)) * post.grade.rgb;
         d = clamp(mix(vec3<f32>(post.limits.z), d, post.limits.w), vec3<f32>(0.0), vec3<f32>(1.0));
         // The monochrome ramp: black, its middle and white by luminance.
@@ -298,18 +391,37 @@ struct Uniforms {
     adapt: [f32; 4],
     limits: [f32; 4],
     mono: [f32; 4],
+    blur: [f32; 4],
 }
 
 /// The passes, in order: bright, blur across, blur down, composite, then
-/// log luminance and its reductions down to one texel, and adaptation.
-const PASSES: usize = 5 + LUMINANCE.len();
+/// log luminance and its reductions down to one texel, adaptation, and
+/// the game's blur (see [`GAME_BLUR`]).
+const PASSES: usize = GAME_BLUR + 2 + 3 * LEVELS;
 /// Side of each luminance image, from the frame's down to one texel.
 const LUMINANCE: [u32; 5] = [256, 64, 16, 4, 1];
 /// Pass indices.
 const BRIGHT: usize = 0;
 const COMPOSITE: usize = 3;
 const LOG_LUMINANCE: usize = 4;
-const ADAPT: usize = PASSES - 1;
+const ADAPT: usize = LOG_LUMINANCE + LUMINANCE.len();
+/// The game's blur: the frame halved, then for each level halved again
+/// and blurred across and down, then the levels combined.
+const GAME_BLUR: usize = ADAPT + 1;
+const COMBINE: usize = PASSES - 1;
+/// The game's blur levels (its combine shader, 017, reads four).
+const LEVELS: usize = 4;
+/// What each of the game's blur levels divides the frame's sides by.
+/// Inferred: its first shader (332) halves the frame and the next (333)
+/// halves again, but how many halvings come before the first level the
+/// combine reads is set by the program, not read; a quarter is taken.
+const LEVEL_DIVISORS: [u32; LEVELS] = [4, 8, 16, 32];
+
+/// The `index`th pass of level `level` of the game's blur: 0 the halving
+/// into it, 1 the blur across, 2 the blur down.
+const fn level_pass(level: usize, index: usize) -> usize {
+    GAME_BLUR + 1 + 3 * level + index
+}
 
 /// Targets and pipelines of the post pass.
 #[derive(Debug)]
@@ -322,25 +434,41 @@ pub struct Post {
     log_luminance: wgpu::RenderPipeline,
     reduce: wgpu::RenderPipeline,
     adapt: wgpu::RenderPipeline,
+    game_down0: wgpu::RenderPipeline,
+    game_down: wgpu::RenderPipeline,
+    game_blur: wgpu::RenderPipeline,
+    game_combine: wgpu::RenderPipeline,
     uniforms: [wgpu::Buffer; PASSES],
     /// The world's floating-point target, and its texture (copied for
     /// water to mirror).
     pub hdr: wgpu::TextureView,
     pub hdr_texture: wgpu::Texture,
-    /// Quarter-size glow images, ping-ponged by the blur.
-    glow: [wgpu::TextureView; 2],
+    /// Images that change with the frame's size.
+    sized: Images,
     /// The frame's log luminance, down to one texel.
     luminance: Vec<wgpu::TextureView>,
     /// The adapted log luminance, one texel each, ping-ponged by frame.
     adapted: [wgpu::TextureView; 2],
-    /// Each pass's bind group, for each way round of `adapted`.
-    groups: [[wgpu::BindGroup; PASSES]; 2],
     size: (u32, u32),
     /// Which `adapted` holds the last frame's, and when that was.
     parity: Cell<usize>,
     last: Cell<Option<Instant>>,
     /// Frames drawn, seeding the grain.
     frame: Cell<u32>,
+}
+
+/// The post pass's images sized by the frame, and its bind groups.
+#[derive(Debug)]
+struct Images {
+    /// Quarter-size glow images, ping-ponged by the blur.
+    glow: [wgpu::TextureView; 2],
+    /// The game's blur: the half-size frame, each level (ping-ponged by
+    /// its blur) and the levels combined.
+    half: wgpu::TextureView,
+    levels: [[wgpu::TextureView; 2]; LEVELS],
+    combined: wgpu::TextureView,
+    /// Each pass's bind group, for each way round of `adapted`.
+    groups: [[wgpu::BindGroup; PASSES]; 2],
 }
 
 /// A floating-point image `width` x `height` to draw into and sample.
@@ -374,6 +502,24 @@ fn target_texture(
             | usage,
         view_formats: &[],
     })
+}
+
+/// Whether the game's blur feeds its bloom and tone map
+/// (`M2_GRADE_BLUR=off`: the bright-pass glow added and each pixel
+/// compressed by its own luminance, as before).
+fn game_blur_on() -> bool {
+    !std::env::var("M2_GRADE_BLUR").is_ok_and(|v| v == "off")
+}
+
+/// How far apart the game's blur taps stand, in texels of their level:
+/// its blur shaders (018, 019) step by a constant the program sets
+/// (`blurScale`); one texel is taken (inferred). `M2_BLUR_STEP=<x>`
+/// changes it, to test.
+fn blur_step() -> f32 {
+    std::env::var("M2_BLUR_STEP")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.0)
 }
 
 impl Post {
@@ -415,6 +561,8 @@ impl Post {
                     count: None,
                 },
                 texture(4),
+                texture(5),
+                texture(6),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -472,7 +620,7 @@ impl Post {
             .map(|&side| target(device, "luminance", side, side))
             .collect();
         let adapted = std::array::from_fn(|_| target(device, "adapted", 1, 1));
-        let (hdr_texture, hdr, glow, groups) = Self::targets(
+        let (hdr_texture, hdr, sized) = Self::targets(
             device, &layout, &sampler, &uniforms, &luminance, &adapted, width, height,
         );
         Self {
@@ -482,15 +630,18 @@ impl Post {
             log_luminance: pipeline("fs_log_luminance", HDR_FORMAT),
             reduce: pipeline("fs_reduce", HDR_FORMAT),
             adapt: pipeline("fs_adapt", HDR_FORMAT),
+            game_down0: pipeline("fs_game_down0", HDR_FORMAT),
+            game_down: pipeline("fs_game_down", HDR_FORMAT),
+            game_blur: pipeline("fs_game_blur", HDR_FORMAT),
+            game_combine: pipeline("fs_game_combine", HDR_FORMAT),
             layout,
             sampler,
             uniforms,
             hdr,
             hdr_texture,
-            glow,
+            sized,
             luminance,
             adapted,
-            groups,
             size: (width, height),
             parity: Cell::new(0),
             last: Cell::new(None),
@@ -498,8 +649,8 @@ impl Post {
         }
     }
 
-    /// The world target, glow images and each pass's bind groups for a
-    /// frame `width` x `height`.
+    /// The world target, the images sized by the frame and each pass's
+    /// bind groups for a frame `width` x `height`.
     #[allow(clippy::too_many_arguments)]
     fn targets(
         device: &wgpu::Device,
@@ -510,12 +661,7 @@ impl Post {
         adapted: &[wgpu::TextureView; 2],
         width: u32,
         height: u32,
-    ) -> (
-        wgpu::Texture,
-        wgpu::TextureView,
-        [wgpu::TextureView; 2],
-        [[wgpu::BindGroup; PASSES]; 2],
-    ) {
+    ) -> (wgpu::Texture, wgpu::TextureView, Images) {
         let hdr_texture = target_texture(
             device,
             "world",
@@ -528,10 +674,21 @@ impl Post {
             target(device, "glow", width / 4, height / 4),
             target(device, "glow", width / 4, height / 4),
         ];
-        let group = |i: usize,
-                     source: &wgpu::TextureView,
-                     glow: &wgpu::TextureView,
-                     adapted: &wgpu::TextureView| {
+        let half = target(device, "blur half", width / 2, height / 2);
+        let levels = LEVEL_DIVISORS.map(|d| {
+            [
+                target(device, "blur level", width / d, height / d),
+                target(device, "blur level", width / d, height / d),
+            ]
+        });
+        let (cw, ch) = (width / LEVEL_DIVISORS[0], height / LEVEL_DIVISORS[0]);
+        let combined = target(device, "blur", cw, ch);
+        let group = |i: usize, views: [&wgpu::TextureView; 5]| {
+            let [source, glow, adapted, extra, extra2] = views;
+            let view = |binding, view| wgpu::BindGroupEntry {
+                binding,
+                resource: wgpu::BindingResource::TextureView(view),
+            };
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("post"),
                 layout,
@@ -540,56 +697,87 @@ impl Post {
                         binding: 0,
                         resource: uniforms[i].as_entire_binding(),
                     },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(source),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(glow),
-                    },
+                    view(1, source),
+                    view(2, glow),
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::Sampler(sampler),
                     },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(adapted),
-                    },
+                    view(4, adapted),
+                    view(5, extra),
+                    view(6, extra2),
                 ],
             })
         };
         // With last frame's adaptation in `adapted[p]`: log luminance:
         // world -> luminance 0; each reduction: luminance i - 1 -> i;
         // adapt: the last luminance and adapted[p] -> adapted[1 - p].
-        // Bright: world -> glow 0; across: 0 -> 1; down: 1 -> 0;
-        // composite: world + glow 0 -> frame, both with adapted[1 - p]. A
-        // pass's unused bindings are filled with images it doesn't draw
-        // into.
+        // Bright: world -> glow 0; across: 0 -> 1; down: 1 -> 0. The
+        // game's blur: world -> half -> level 0 (a), blurred across into
+        // b and down back into a, halved into level 1 (a) and so on; the
+        // levels' a images combined. Composite: world + glow 0 + the
+        // combined blur -> frame, all with adapted[1 - p]. A pass's
+        // unused bindings are filled with images it doesn't draw into.
         let last = luminance.len() - 1;
         let groups = std::array::from_fn(|p| {
             let (before, now) = (&adapted[p], &adapted[1 - p]);
+            let spare = &combined;
             std::array::from_fn(|i| match i {
-                BRIGHT => group(i, &hdr, &glow[1], now),
-                1 => group(i, &glow[0], &hdr, now),
-                2 => group(i, &glow[1], &hdr, now),
-                COMPOSITE => group(i, &hdr, &glow[0], now),
-                LOG_LUMINANCE => group(i, &hdr, &glow[0], now),
-                ADAPT => group(i, &luminance[last], &glow[0], before),
+                BRIGHT => group(i, [&hdr, &glow[1], now, spare, spare]),
+                1 => group(i, [&glow[0], &hdr, now, spare, spare]),
+                2 => group(i, [&glow[1], &hdr, now, spare, spare]),
+                COMPOSITE => group(i, [&hdr, &glow[0], now, &combined, &half]),
+                ADAPT => group(i, [&luminance[last], &glow[0], before, spare, spare]),
+                GAME_BLUR => group(i, [&hdr, &glow[0], now, spare, spare]),
+                COMBINE => group(
+                    i,
+                    [
+                        &levels[0][0],
+                        &levels[1][0],
+                        now,
+                        &levels[2][0],
+                        &levels[3][0],
+                    ],
+                ),
+                i if i > GAME_BLUR => {
+                    let level = (i - GAME_BLUR - 1) / 3;
+                    let source = match (i - GAME_BLUR - 1) % 3 {
+                        0 if level == 0 => &half,
+                        0 => &levels[level - 1][0],
+                        1 => &levels[level][0],
+                        _ => &levels[level][1],
+                    };
+                    group(i, [source, &glow[0], now, spare, spare])
+                }
                 _ => {
                     let level = i - LOG_LUMINANCE;
-                    group(i, &luminance[level - 1], &glow[0], now)
+                    let source = if level == 0 {
+                        &hdr
+                    } else {
+                        &luminance[level - 1]
+                    };
+                    group(i, [source, &glow[0], now, spare, spare])
                 }
             })
         });
-        (hdr_texture, hdr, glow, groups)
+        (
+            hdr_texture,
+            hdr,
+            Images {
+                glow,
+                half,
+                levels,
+                combined,
+                groups,
+            },
+        )
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if (width, height) == self.size {
             return;
         }
-        (self.hdr_texture, self.hdr, self.glow, self.groups) = Self::targets(
+        (self.hdr_texture, self.hdr, self.sized) = Self::targets(
             device,
             &self.layout,
             &self.sampler,
@@ -610,11 +798,8 @@ impl Post {
         lighting: &Lighting,
         target: &wgpu::TextureView,
     ) {
-        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
-        let (gw, gh) = (
-            (self.size.0 / 4).max(1) as f32,
-            (self.size.1 / 4).max(1) as f32,
-        );
+        let (w, h) = (self.size.0, self.size.1);
+        let (gw, gh) = ((w / 4).max(1) as f32, (h / 4).max(1) as f32);
         let params = [
             lighting.exposure,
             lighting.bloom_threshold,
@@ -626,7 +811,6 @@ impl Post {
             .grade
             .extend(if raw { 0.0 } else { 1.0 })
             .to_array();
-        let glowing = lighting.bloom > 0.0;
         // How far to follow this frame's luminance: all the way at first.
         let now = Instant::now();
         let dt = self
@@ -683,8 +867,14 @@ impl Post {
             (None, None) => ([0.0; 4], [1.0, 1.0, 0.0, 0.0]),
         };
         let game = lighting.tone_map.is_some();
+        // With the game's tone map its own blur runs every frame: its
+        // compression reads it even where nothing blooms.
+        let game_blur = game && game_blur_on();
+        let glowing = lighting.bloom > 0.0 && !game_blur;
+        let blur = [if game_blur { 1.0 } else { 0.0 }, lighting.bloom, 0.0, 0.0];
+        let texel = |w: u32, h: u32| [1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32];
         let mut steps = [[0.0f32; 2]; PASSES];
-        steps[BRIGHT] = [1.0 / w, 1.0 / h];
+        steps[BRIGHT] = [1.0 / w as f32, 1.0 / h as f32];
         steps[1] = [1.0 / gw, 0.0];
         steps[2] = [0.0, 1.0 / gh];
         // Four taps spread over each texel of the first luminance image,
@@ -692,6 +882,17 @@ impl Post {
         steps[LOG_LUMINANCE] = [0.25 / LUMINANCE[0] as f32; 2];
         for level in 1..LUMINANCE.len() {
             steps[LOG_LUMINANCE + level] = [1.0 / LUMINANCE[level - 1] as f32; 2];
+        }
+        // The game's blur: each halving's taps half a texel of its
+        // source either side, each blur's a step apart.
+        steps[GAME_BLUR] = texel(w, h);
+        let spread = blur_step();
+        for (level, d) in LEVEL_DIVISORS.into_iter().enumerate() {
+            let source = if level == 0 { 2 } else { d / 2 };
+            steps[level_pass(level, 0)] = texel(w / source, h / source);
+            let [x, y] = texel(w / d, h / d);
+            steps[level_pass(level, 1)] = [x * spread, 0.0];
+            steps[level_pass(level, 2)] = [0.0, y * spread];
         }
         let frame = self.frame.get() % 65536;
         self.frame.set(frame + 1);
@@ -720,11 +921,12 @@ impl Post {
                     .monochrome
                     .filter(|_| game)
                     .map_or([0.0; 4], |m| m.to_array()),
+                blur,
             };
             queue.write_buffer(buffer, 0, bytemuck::bytes_of(&u));
         }
         let parity = self.parity.get();
-        let groups = &self.groups[parity];
+        let groups = &self.sized.groups[parity];
         let mut pass = |pipeline: &wgpu::RenderPipeline, group: &wgpu::BindGroup, target| {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("post"),
@@ -763,9 +965,20 @@ impl Post {
             self.parity.set(1 - parity);
         }
         if glowing {
-            pass(&self.bright, &groups[BRIGHT], &self.glow[0]);
-            pass(&self.blur, &groups[1], &self.glow[1]);
-            pass(&self.blur, &groups[2], &self.glow[0]);
+            let glow = &self.sized.glow;
+            pass(&self.bright, &groups[BRIGHT], &glow[0]);
+            pass(&self.blur, &groups[1], &glow[1]);
+            pass(&self.blur, &groups[2], &glow[0]);
+        }
+        if game_blur {
+            let levels = &self.sized.levels;
+            pass(&self.game_down0, &groups[GAME_BLUR], &self.sized.half);
+            for (level, images) in levels.iter().enumerate() {
+                pass(&self.game_down, &groups[level_pass(level, 0)], &images[0]);
+                pass(&self.game_blur, &groups[level_pass(level, 1)], &images[1]);
+                pass(&self.game_blur, &groups[level_pass(level, 2)], &images[0]);
+            }
+            pass(&self.game_combine, &groups[COMBINE], &self.sized.combined);
         }
         pass(&self.composite, &groups[COMPOSITE], target);
     }
@@ -783,5 +996,40 @@ mod tests {
         )
         .validate(&module)
         .unwrap();
+    }
+
+    #[test]
+    fn the_game_blur_passes_run_in_order_to_the_combine() {
+        use super::*;
+        let mut seen = vec![GAME_BLUR];
+        for level in 0..LEVELS {
+            for index in 0..3 {
+                seen.push(level_pass(level, index));
+            }
+        }
+        seen.push(COMBINE);
+        let expected: Vec<usize> = (GAME_BLUR..PASSES).collect();
+        assert_eq!(seen, expected);
+        const { assert!(ADAPT < GAME_BLUR) };
+        // Each level halves the one before.
+        for pair in LEVEL_DIVISORS.windows(2) {
+            assert_eq!(pair[1], pair[0] * 2);
+        }
+    }
+
+    #[test]
+    fn the_game_blur_keeps_the_shaders_weights() {
+        // The blur's nine taps (018/019) and the combine's four levels
+        // (017) each sum to one.
+        let taps: f32 = 0.24 + 2.0 * (0.15 + 0.10 + 0.08 + 0.05);
+        assert!((taps - 1.0).abs() < 1e-6);
+        assert!((0.6f32 + 0.3 + 0.08 + 0.02 - 1.0).abs() < 1e-6);
+        let shader = super::SHADER;
+        assert!(shader.contains("array<f32, 5>(0.24, 0.15, 0.10, 0.08, 0.05)"));
+        for weight in ["* 0.6", "* 0.3", "* 0.08", "* 0.02", "b.rgb * 1.2"] {
+            assert!(shader.contains(weight), "{weight}");
+        }
+        // The compression reads the blurred luminance.
+        assert!(shader.contains("min(min(lb, pow(lb, 0.7)), 10.0)"));
     }
 }
