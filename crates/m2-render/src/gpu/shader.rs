@@ -78,7 +78,9 @@ struct Frame {
     glint_fit: vec4<f32>,
     // x: the cloud deck takes the sun's colour twice, as the game's (0:
     // once, `M2_DECK=old`), y: its Tone scales display values
-    // (`M2_DECK=full`; see `deck_light`)
+    // (`M2_DECK=full`; see `deck_light`), z: half the width of the
+    // cloud quad whose corners the sky's haze is taken at (`quad_air`;
+    // 0: along each ray), w: the clouds take that haze too
     deck_fit: vec4<f32>,
     // x: water mirrors the scene drawn before it (0: `M2_SEA_MIRROR=off`),
     // y: scale on what it mirrors, z: how far it looks (metres; see
@@ -280,6 +282,33 @@ fn game_sky(r: vec3<f32>) -> vec3<f32> {
     return game_air(eye + along * d).rgb;
 }
 
+// The air in front of the cloud deck along the unit ray r as the game's
+// sky has it: its cloud quad's vertex shader (025) reckons the haze
+// (`game_air`) at the quad's vertices and the pixels between take it
+// blended across the quad, so the sky overhead is about as hazy as the
+// far corners, not the thin air straight up. The quad is taken as one
+// square centred under the eye at the deck's height, `frame.deck_fit.z`
+// metres each way from the middle (its vertices and size come from code:
+// fitted to footage's open sky); rays past its edge take the edge's.
+fn quad_air(r: vec3<f32>) -> vec4<f32> {
+    let half = frame.deck_fit.z;
+    let up = max(r.y, 1e-3);
+    let at = clamp(r.xz * (CLOUD_HEIGHT / up), vec2<f32>(-half), vec2<f32>(half));
+    let t = at / (2.0 * half) + 0.5;
+    let e = frame.eye.xyz;
+    let y = e.y + CLOUD_HEIGHT;
+    let a00 = game_air(vec3<f32>(e.x - half, y, e.z - half));
+    let a10 = game_air(vec3<f32>(e.x + half, y, e.z - half));
+    let a01 = game_air(vec3<f32>(e.x - half, y, e.z + half));
+    let a11 = game_air(vec3<f32>(e.x + half, y, e.z + half));
+    return mix(mix(a00, a10, t.x), mix(a01, a11, t.x), t.y);
+}
+
+// Whether the sky's haze is the cloud quad's (`quad_air`).
+fn quad_sky() -> bool {
+    return game_haze() && frame.deck_fit.z > 0.0;
+}
+
 // The light at rgb seen through air h (`haze_terms`): with the game's
 // haze, blended in display values as its shaders do.
 fn through_air(rgb: vec3<f32>, h: vec4<f32>) -> vec3<f32> {
@@ -442,6 +471,9 @@ fn deck_through_air(cloud_in: vec3<f32>, r: vec3<f32>) -> vec3<f32> {
             reach = min(reach, frame.deck.x);
         }
         var air = game_air(frame.eye.xyz + r * reach);
+        if quad_sky() && frame.deck_fit.w > 0.5 {
+            air = quad_air(r);
+        }
         air = vec4<f32>(air.rgb * frame.surface.w, 1.0 - frame.surface.w * (1.0 - air.a));
         cloud = through_air(cloud, air);
     } else if frame.wind.w >= 0.0 && hazy() {
@@ -903,6 +935,12 @@ fn fs_sky(v: SkyVaryings) -> @location(0) vec4<f32> {
     let p = frame.inv_view_proj * vec4<f32>(v.ndc, 1.0, 1.0);
     let r = normalize(p.xyz / p.w - frame.eye.xyz);
     var rgb = sky(r);
+    if quad_sky() && r.y > 0.0 {
+        // Above the horizon the sky is the quad's haze, meeting the far
+        // air that land fades into at the horizon.
+        let quad = light_from_display(quad_air(r).rgb);
+        rgb = mix(rgb, quad, smoothstep(0.0, 4.0 * HORIZON_UP, r.y));
+    }
     // Where the ray meets the cloud deck, the deck moving with the eye so
     // clouds stay overhead; sampled before any branch for mip selection.
     // Rays below a floor all met the deck at one far point per column,
@@ -1102,6 +1140,17 @@ mod tests {
     #[test]
     fn sky_compiles() {
         validate(&sky_source());
+    }
+
+    #[test]
+    fn sky_takes_the_cloud_quads_haze() {
+        // The sky above the horizon and the clouds' air both come from the
+        // quad's corners when its size is set, as the game's vertex shader
+        // reckons them.
+        let sky = sky_source();
+        assert!(sky.contains("fn quad_air("));
+        assert_eq!(sky.matches("quad_air(r)").count(), 2);
+        assert!(sky.contains("frame.deck_fit.z > 0.0"));
     }
 
     #[test]
