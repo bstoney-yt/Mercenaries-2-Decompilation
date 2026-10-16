@@ -951,9 +951,11 @@ impl GameAudio {
                 match GunCues::read(install) {
                     Ok(c) => {
                         eprintln!(
-                            "sound: Sounds table: {} gun sound sets fire, {} as others",
+                            "sound: Sounds table: {} gun sound sets fire, {} as others, {} with \
+                             variants by shooter",
                             c.sets_with(m2_engine::gun_sounds::FIRE),
-                            c.sets_with(m2_engine::gun_sounds::FIRE_NPC)
+                            c.sets_with(m2_engine::gun_sounds::FIRE_NPC),
+                            c.varied()
                         );
                         c
                     }
@@ -1329,8 +1331,13 @@ impl GameAudio {
         self.spins_stopped();
         for sound in sounds {
             let (i, at, gain) = match *sound {
-                Sound::Shot { at, set, npc } => {
-                    let own = self.play_shot(at, set, npc);
+                Sound::Shot {
+                    at,
+                    set,
+                    npc,
+                    shooter,
+                } => {
+                    let own = self.play_shot(at, set, npc, shooter);
                     if own {
                         self.shots.0 += 1;
                     } else {
@@ -1426,16 +1433,18 @@ impl GameAudio {
     }
 
     /// A gun's shot at `at`, of sound set `set`, by the hero or someone
-    /// else (`npc`): the cue the `Sounds` table gives it (someone else's
-    /// shot falls back to the hero's cue if its own plays nothing).
+    /// else (`npc`, numbered `shooter`, whose variant of the shot it plays
+    /// where the set has variants): the cue the `Sounds` table gives it
+    /// (someone else's shot falls back to the hero's cue if its own plays
+    /// nothing).
     /// False when no cue of its is read yet or none plays anything: the
     /// rifle's shot stands in. A cue not yet read is read on a thread.
-    fn play_shot(&mut self, at: Vec3, set: Option<u32>, npc: bool) -> bool {
+    fn play_shot(&mut self, at: Vec3, set: Option<u32>, npc: bool, shooter: u32) -> bool {
         let Some(set) = set else { return false };
         if let Some(cue) = self.gun_cues.spin(set, npc) {
             return self.spin(cue, set, npc, at);
         }
-        let own = self.gun_cues.shot(set, npc);
+        let own = self.gun_cues.shot_by(set, npc, shooter);
         let hero = npc
             .then(|| self.gun_cues.cue(set, m2_engine::gun_sounds::FIRE))
             .flatten();
