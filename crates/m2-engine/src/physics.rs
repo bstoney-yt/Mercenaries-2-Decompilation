@@ -864,8 +864,14 @@ pub enum StaticKey {
     Entity(u32),
 }
 
-/// Suspension rest length and travel, metres.
+/// Suspension rest length and travel, metres. Invented.
 const SUSPENSION: f32 = 0.3;
+/// Each wheel's spring and dampers (squeezed, stretched), per kilogram,
+/// for a vehicle whose template gives no `FrontWheelSuspStrength` and
+/// the rest ([`Handling`](crate::tuning::Handling)'s `spring` and
+/// `damping`). Invented.
+const SPRING: f32 = 40.0;
+const DAMPING: (f32, f32) = (2.0, 3.0);
 /// Steering lock at a standstill, radians, for a vehicle whose template
 /// gives none (its `SteerMaxAngle` otherwise,
 /// [`Handling`](crate::tuning::Handling)). Invented.
@@ -1687,11 +1693,23 @@ impl Physics {
         // steering axle's as the front's).
         let handling = spec.tuning.handling.filter(|_| !spec.tracked);
         let grip = |front: bool| handling.map_or(GRIP, |h| if front { h.grip.0 } else { h.grip.1 });
+        // Its springs and dampers as its template's, each axle's own.
+        let spring = |front: bool| {
+            handling.map_or((SPRING, DAMPING), |h| {
+                let (k, c) = if front {
+                    (h.spring.0, h.damping.0)
+                } else {
+                    (h.spring.1, h.damping.1)
+                };
+                (k, (c, c))
+            })
+        };
         for w in &spec.wheels {
+            let (stiffness, (squeezed, stretched)) = spring(w.steers);
             let tuning = WheelTuning {
-                suspension_stiffness: 40.0,
-                suspension_compression: 2.0,
-                suspension_damping: 3.0,
+                suspension_stiffness: stiffness,
+                suspension_compression: squeezed,
+                suspension_damping: stretched,
                 max_suspension_travel: SUSPENSION,
                 side_friction_stiffness: 1.0,
                 friction_slip: grip(w.steers),
@@ -1978,6 +1996,29 @@ impl Physics {
                     .wheels()
                     .iter()
                     .map(|w| (w.steering, w.rotation))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// How far each of a vehicle's springs is compressed from its rest
+    /// length, metres (0 for a wheel off the ground).
+    pub fn vehicle_suspension(&self, id: VehicleId) -> Vec<f32> {
+        self.vehicles
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|v| {
+                v.controller
+                    .wheels()
+                    .iter()
+                    .map(|w| {
+                        let ray = w.raycast_info();
+                        if ray.is_in_contact {
+                            w.suspension_rest_length - ray.suspension_length
+                        } else {
+                            0.0
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -3727,6 +3768,8 @@ mod tests {
                 steer_speed: 100.0,
                 low_speed: 0.0,
                 low_steer_speed: 0.0,
+                spring: (40.0, 40.0),
+                damping: (2.5, 2.5),
             });
             let mut p = Physics::new();
             floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
@@ -3790,6 +3833,8 @@ mod tests {
             steer_speed: 0.6,
             low_speed: 35.0 / 3.6,
             low_steer_speed: 0.9,
+            spring: (40.0, 40.0),
+            damping: (2.5, 2.5),
         });
         let mut p = Physics::new();
         floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
@@ -3823,6 +3868,61 @@ mod tests {
         let h = spec.tuning.handling.expect("set");
         assert_eq!(h.swing(5.0), 0.9);
         assert_eq!(h.swing(-12.0), 0.6);
+    }
+
+    // Its springs and dampers are its template's, per kilogram: on four
+    // wheels of strength k it sits g / 4k down on them, and kicked
+    // downwards bounces back past its settled height after half a swing
+    // at sqrt(4k (1 - zeta^2)) rad/s, zeta = 4c / (2 sqrt(4k)).
+    #[test]
+    fn springs_and_dampers_come_from_the_template() {
+        let ride = |k: f32, c: f32| {
+            let mut spec = car();
+            spec.tuning.handling = Some(crate::tuning::Handling {
+                steer_lock: 0.7,
+                brake: (7.0, 6.0),
+                grip: (1.5, 1.5),
+                steer_speed: 0.6,
+                low_speed: 0.0,
+                low_steer_speed: 0.0,
+                spring: (k, k),
+                damping: (c, c),
+            });
+            let mut p = Physics::new();
+            floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+            p.step(DT);
+            let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -400.0), 0.0);
+            for _ in 0..180 {
+                p.step(DT);
+            }
+            let sag = p.vehicle_suspension(id).iter().sum::<f32>() / 4.0;
+            let height = |p: &Physics| p.vehicle_transform(id).expect("car").w_axis.y;
+            let rest = height(&p);
+            let v = p.vehicle_velocity(id);
+            p.set_vehicle_velocity(id, v - Vec3::Y * 0.3);
+            let mut t = 0.0;
+            loop {
+                p.step(DT);
+                t += DT;
+                if height(&p) >= rest || t > 2.0 {
+                    break;
+                }
+            }
+            (sag, t)
+        };
+        let half = |k: f32, c: f32| {
+            let w = (4.0 * k).sqrt();
+            let zeta = 4.0 * c / (2.0 * w);
+            std::f32::consts::PI / (w * (1.0 - zeta * zeta).sqrt())
+        };
+        // An M151's 25 and 1.7: 9.8 cm down, back up after 0.34 s.
+        let (sag, t) = ride(25.0, 1.7);
+        assert!((sag - 9.81 / 100.0).abs() < 0.01, "{sag}");
+        assert!((t - half(25.0, 1.7)).abs() < 0.04, "{t}");
+        // A sports car's 60 and 3: 4.1 cm, 0.22 s.
+        let (sag, t) = ride(60.0, 3.0);
+        assert!((sag - 9.81 / 240.0).abs() < 0.01, "{sag}");
+        assert!((t - half(60.0, 3.0)).abs() < 0.04, "{t}");
     }
 
     #[test]

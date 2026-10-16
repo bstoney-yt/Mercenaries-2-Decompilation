@@ -157,6 +157,20 @@ pub struct Handling {
     /// the 454 records).
     pub low_speed: f32,
     pub low_steer_speed: f32,
+    /// Each axle's springs, front and back (`FrontWheelSuspStrength`
+    /// 25, `RearWheelSuspStrength` 25; 4.5 to 80 and 8 to 80; gap round
+    /// 16): the push of each wheel's spring per metre it is compressed,
+    /// per kilogram the vehicle weighs (read per unit of mass, as a
+    /// Havok or Bullet ray-cast suspension takes it, inferred: the
+    /// 11-tonne Escort's is 13, the 200 kg scooter's 70, so it does not
+    /// grow with the weight). The body bounces at the square root of
+    /// their sum, rad/s: an M151's 25 x 4 at 1.6 Hz.
+    pub spring: (f32, f32),
+    /// Each axle's dampers (`FrontWheelSuspDamp` 1.7,
+    /// `RearWheelSuspDamp` 1.7; 0.8 to 10 and 0.4 to 10), per kilogram
+    /// as the springs are, the same squeezed or stretched (one field
+    /// each; inferred).
+    pub damping: (f32, f32),
 }
 
 impl Handling {
@@ -791,6 +805,8 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         steer_speed: f("SteerSpeed")?,
                         low_speed: low.map_or(0.0, |l| l.0),
                         low_steer_speed: low.map_or(0.0, |l| l.1),
+                        spring: (f("FrontWheelSuspStrength")?, f("RearWheelSuspStrength")?),
+                        damping: (f("FrontWheelSuspDamp")?, f("RearWheelSuspDamp")?),
                     })
                 })(),
                 tracks: (|| {
@@ -950,6 +966,13 @@ mod tests {
             ("SteerSpeed", 0x0db1_c8d9),
             ("SteeringInertia", 0xefc4_dc7a),
             ("LowSpeedSteerSpeed", 0xb36b_7486),
+            // Its springs and dampers (gap round 16; `FrontWheelRadius`
+            // named, unused: the model's own wheels are used).
+            ("FrontWheelSuspStrength", 0x6ae9_c849),
+            ("RearWheelSuspStrength", 0xeda3_7cb2),
+            ("FrontWheelSuspDamp", 0x7a4b_af98),
+            ("RearWheelSuspDamp", 0x9198_0ac7),
+            ("FrontWheelRadius", 0xbf59_a7fd),
             // `_TankPhysics`'s pull over its speed.
             ("EngineTorqueRatio0", 0xe8a9_e7ee),
             ("EngineTorqueRatio3", 0x4ab1_3df9),
