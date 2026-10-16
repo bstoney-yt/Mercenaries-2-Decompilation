@@ -36,12 +36,15 @@
 //! words. It is a complete kd-tree of depth L (a + b = 2^L; n = 2^L when
 //! a = b = 0), written depth first, node before children:
 //!
-//! - a node at depth d splits its box on that depth's axis at a fraction
-//!   of the axis's split bits; the low half comes first;
+//! - a node at depth d splits its box on that depth's axis by a field
+//!   `q` of the axis's split bits: the low half reaches up to `q + 1`,
+//!   the high half starts at `q` (the halves overlap by a step); the low
+//!   half comes first;
 //! - a one-tree leaf is a 4-bit code (2), x, y and z at depth L's bits
 //!   within the leaf's box, and a 4-bit tail;
-//! - a two-tree leaf is a `w`-bit split on axis L and two one-tree leaves
-//!   at depth L + 1's bits, the low half's first.
+//! - a two-tree leaf is a `w`-bit split on axis L (its halves overlapping
+//!   so too) and two one-tree leaves at depth L + 1's bits, the low
+//!   half's first.
 //!
 //! A field of `k` bits holding `q` is `lo + q / (2^k - 1) * (hi - lo)`.
 //! The tail is such a field over a full turn: the tree's yaw (see
@@ -68,12 +71,21 @@
 //! the leaf; in every one, the stream's bit count is
 //! `c + a (g + 1) + b (2g + w)` and the decode ends on it exactly; the
 //! species' counts sum to 36,993 trees, whose heights lie a median 2.7 m
-//! from the low-resolution ground (layer-placed objects: 1.3 m). On the
-//! full-detail ground within 1.5 km of the Carmona gate, town species
-//! stand on it (median 0.00 m), palms on the lowest ground within about
-//! 2 m of the trunk, and the jungle species 1-2.6 m below it, spread
-//! from 0 to 6 m; the height's quantum is 0.01-0.04 m, so it is not
-//! rounding. No bytes from the archives are committed.
+//! from the low-resolution ground (layer-placed objects: 1.3 m).
+//!
+//! The split's overlapping halves are from samples too (round 8): a
+//! tree's height is the full-detail ground's under its place, so on a
+//! slope a tree put off its place stands above or below the ground there.
+//! Read as one split point at `q`, the trees on slopes of 1 in 5 or more
+//! stood a median 1.46 m off the ground over nine 1 km squares across the
+//! island, and moving them a few metres up x and z brought them to it
+//! (the squares to the south-west most, by up to 6 m, those to the
+//! north-east least: the error each split's step makes, summed down the
+//! tree); read with the halves overlapping, 0.08 m, with no move doing
+//! better. Other readings of the split (`q / 2^k`, `(q + 1) / 2^k`,
+//! `q / (2^k - 2)`, one split point at the middle) left 1.0 m or more.
+//! Plants the layers place on the same slopes stand 0.01-0.6 m off it.
+//! No bytes from the archives are committed.
 
 use std::collections::HashSet;
 
@@ -498,7 +510,10 @@ impl Decoder<'_> {
         Some(v)
     }
 
-    /// Splits `lo .. hi` on `axis` at a `bits`-bit fraction.
+    /// Splits `lo .. hi` on `axis` at a `bits`-bit field `q`: the low half
+    /// reaches up to `q + 1` of the field's steps, the high half starts at
+    /// `q`, so the halves overlap by a step (a split quantised down, and
+    /// each half kept wide enough to hold the trees on its side).
     fn split(
         &mut self,
         axis: usize,
@@ -506,10 +521,10 @@ impl Decoder<'_> {
         lo: [f32; 3],
         hi: [f32; 3],
     ) -> Option<([f32; 3], [f32; 3])> {
-        let at = quantum(self.read(bits)?, bits, lo[axis], hi[axis]);
+        let q = self.read(bits)?;
         let (mut low_hi, mut high_lo) = (hi, lo);
-        low_hi[axis] = at;
-        high_lo[axis] = at;
+        low_hi[axis] = quantum(q + 1, bits, lo[axis], hi[axis]);
+        high_lo[axis] = quantum(q, bits, lo[axis], hi[axis]);
         Some((low_hi, high_lo))
     }
 
@@ -652,8 +667,8 @@ mod tests {
         s.put(tail, 4);
     }
 
-    /// Depth 1: the root splits x at 128/255 of the box, a one-tree leaf
-    /// on the low side and a two-tree leaf on the high side.
+    /// Depth 1: the root splits x at 128/255 of the box (the low half up
+    /// to 129/255), a one-tree leaf on the low side and a two-tree leaf on the high side.
     fn mixed() -> BitWriter {
         let mut s = BitWriter::default();
         s.put(0x80, 8); // root split
@@ -684,12 +699,14 @@ mod tests {
         assert_eq!(tr.len(), 3);
         assert_eq!(tr[0].tail, 5);
         assert_eq!(tr[0].position, [0.0, 15.0, 127.0 / 255.0 * 256.0]);
-        // The pair splits at the leaf's high x: tree A spans the leaf.
-        assert!((tr[1].position[0] - 256.0).abs() < 1e-3);
+        // The pair splits at the leaf's high x: tree A spans the leaf and
+        // one step past it (the high leaf is 128/255 .. 1 of 256 wide).
+        let leaf = 256.0 - 128.0 / 255.0 * 256.0;
+        assert!((tr[1].position[0] - (256.0 + leaf / 255.0)).abs() < 1e-3);
         assert_eq!((tr[1].tail, tr[2].tail), (14, 0));
         assert_eq!(tr[2].position[2], 256.0);
-        // x at depth 1 has 7 bits over the low half's 128/255 * 256.
-        assert!((tr[0].step[0] - 128.0 / 255.0 * 256.0 / 127.0).abs() < 1e-4);
+        // x at depth 1 has 7 bits over the low half's 129/255 * 256.
+        assert!((tr[0].step[0] - 129.0 / 255.0 * 256.0 / 127.0).abs() < 1e-4);
         assert_eq!(tr[2].yaw(), 0.0);
         assert!((tr[0].yaw() - std::f32::consts::TAU / 3.0).abs() < 1e-6);
     }
@@ -703,8 +720,10 @@ mod tests {
         let a = table(&[record(1, &s, 1, [2, 0, 0, 0])]);
         let t = TreeTable::parse(&a).unwrap();
         let tr = &t.species[0].trees;
-        assert_eq!(tr[0].position[0], 64.0 / 255.0 * 256.0);
-        assert_eq!(tr[1].position[0], 64.0 / 255.0 * 256.0);
+        // The low half reaches one step past the split, to 65/255; the
+        // high half starts at it, 64/255.
+        assert!((tr[0].position[0] - 65.0 / 255.0 * 256.0).abs() < 1e-3);
+        assert!((tr[1].position[0] - 64.0 / 255.0 * 256.0).abs() < 1e-3);
     }
 
     #[test]

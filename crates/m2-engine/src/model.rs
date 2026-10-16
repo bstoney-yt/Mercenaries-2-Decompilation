@@ -639,6 +639,133 @@ pub struct CpuModel {
     /// [`from_data`](Self::from_data) nor [`build`](Self::build) works it
     /// out (the island's thousands of models have no use for it).
     pub breakup: Option<std::sync::Arc<crate::Breakup>>,
+    /// Its parts a vehicle breaks one at a time, when its state machine
+    /// has more than one ([`ModelParts`]).
+    pub parts: Option<std::sync::Arc<ModelParts>>,
+}
+
+/// A collision shape of a model's parts ([`ModelParts::meshes`]): the part
+/// it stands on, if any, its vertices (model space) and its triangles.
+pub type PartMesh = (Option<usize>, Vec<Vec3>, Vec<[u32; 3]>);
+
+/// The parts of a model its state machine switches one at a time: a long
+/// hedge's sections, a gate's two leaves. A vehicle breaks those its
+/// template names one at a time (`PhysicsPropertyCrashable` records naming
+/// a node, [`crate::durability::crash_parts`]), each to its own wrecked
+/// state, the rest standing ([`PartStates::hidden_parts`]).
+///
+/// [`PartStates::hidden_parts`]: m2_assets::model::PartStates::hidden_parts
+#[derive(Clone, Debug)]
+pub struct ModelParts {
+    states: m2_assets::model::PartStates,
+    nodes: Vec<m2_assets::model::Node>,
+    /// Per part, the nodes that show only while it stands (hidden once it
+    /// alone is wrecked), and the box of their geometry (model space).
+    shows: Vec<Vec<u16>>,
+    boxes: Vec<Option<(Vec3, Vec3)>>,
+    /// Its collision's shapes (model space): the part each stands on
+    /// (`None` for one on no part), their vertices and triangles
+    /// ([`CollisionShape::shape_meshes`]).
+    pub meshes: Vec<PartMesh>,
+}
+
+impl ModelParts {
+    /// `model`'s, with `hidden` its intact and wrecked nodes and
+    /// `node_boxes` each node's geometry box: `None` unless two of its
+    /// parts or more show geometry of their own intact.
+    fn of(
+        model: &Model<'_>,
+        hidden: &[Vec<bool>; 2],
+        node_boxes: &HashMap<u16, (Vec3, Vec3)>,
+    ) -> Option<Self> {
+        let states = model.states.as_ref()?;
+        if states.machines.len() < 2 || hidden[0].is_empty() {
+            return None;
+        }
+        let mut shows = Vec::new();
+        let mut boxes = Vec::new();
+        for k in 0..states.machines.len() {
+            let alone = states.hidden_parts(&model.nodes, |j| j == k);
+            let nodes: Vec<u16> = (0..model.nodes.len())
+                .filter(|&i| !hidden[0][i] && alone.get(i).copied().unwrap_or(false))
+                .map(|i| i as u16)
+                .collect();
+            let b = nodes.iter().filter_map(|n| node_boxes.get(n)).fold(
+                None,
+                |acc: Option<(Vec3, Vec3)>, &(lo, hi)| {
+                    Some(acc.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))))
+                },
+            );
+            shows.push(nodes);
+            boxes.push(b);
+        }
+        (boxes.iter().filter(|b| b.is_some()).count() >= 2).then(|| Self {
+            states: states.clone(),
+            nodes: model.nodes.clone(),
+            shows,
+            boxes,
+            meshes: Vec::new(),
+        })
+    }
+
+    /// How many parts it has (its state machine's).
+    pub fn count(&self) -> usize {
+        self.boxes.len()
+    }
+
+    /// The part the node named `name` (a name hash) belongs to
+    /// ([`PartStates::part_of`](m2_assets::model::PartStates::part_of)).
+    pub fn part_named(&self, name: u32) -> Option<usize> {
+        let node = self.nodes.iter().position(|n| n.name_hash == name)?;
+        self.states.part_of(node as u16)
+    }
+
+    /// The box of what part `k` shows intact (model space), if anything.
+    pub fn part_box(&self, k: usize) -> Option<(Vec3, Vec3)> {
+        self.boxes.get(k).copied().flatten()
+    }
+
+    /// The part whose standing shows `node` or a node above it: what a
+    /// collision shape on `node` goes with.
+    fn part_holding(&self, node: u16) -> Option<usize> {
+        let mut at = Some(node);
+        let mut steps = 0;
+        while let Some(n) = at {
+            if let Some(k) = self.shows.iter().position(|s| s.contains(&n)) {
+                return Some(k);
+            }
+            at = self.nodes.get(usize::from(n)).and_then(|x| x.parent);
+            steps += 1;
+            if steps > self.nodes.len() {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Per node, whether it is hidden with the parts `wrecked` marks
+    /// wrecked and the rest standing.
+    pub fn hidden(&self, wrecked: &[bool]) -> Vec<bool> {
+        self.states
+            .hidden_parts(&self.nodes, |k| wrecked.get(k).copied().unwrap_or(false))
+    }
+
+    /// Its collision with the parts `wrecked` marks taken away: `None` if
+    /// nothing is left, or if its collision has no shapes of its own (one
+    /// cut from its drawn triangles stays whole until all of it breaks).
+    pub fn collision(&self, wrecked: &[bool]) -> Option<CollisionShape> {
+        let mut vertices = Vec::new();
+        let mut triangles = Vec::new();
+        for (part, v, t) in &self.meshes {
+            if part.is_some_and(|k| wrecked.get(k).copied().unwrap_or(false)) {
+                continue;
+            }
+            let first = vertices.len() as u32;
+            vertices.extend_from_slice(v);
+            triangles.extend(t.iter().map(|t| t.map(|i| first + i)));
+        }
+        CollisionShape::mesh(&vertices, &triangles)
+    }
 }
 
 /// The collision of one building of a merged batch (a `TINY` model).
@@ -667,6 +794,8 @@ impl CpuModel {
         let hidden = model.states.as_ref().map_or_else(Default::default, |s| {
             [s.hidden(&model.nodes, false), s.hidden(&model.nodes, true)]
         });
+        // Each node's geometry box, model space, for the parts' boxes.
+        let mut node_boxes: HashMap<u16, (Vec3, Vec3)> = HashMap::new();
         for (segment, geometry) in model.lod(lod) {
             let shown = !hidden[0]
                 .get(usize::from(segment.node))
@@ -726,6 +855,10 @@ impl CpuModel {
                         lo = lo.min(plo);
                         hi = hi.max(phi);
                     }
+                    let b = node_boxes
+                        .entry(segment.node)
+                        .or_insert((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)));
+                    *b = (b.0.min(plo), b.1.max(phi));
                     centre = (plo + phi) * 0.5;
                 }
                 pieces.push(CpuPiece {
@@ -751,6 +884,7 @@ impl CpuModel {
                 });
             }
         }
+        let parts = ModelParts::of(model, &hidden, &node_boxes).map(std::sync::Arc::new);
         if lo.x > hi.x {
             (lo, hi) = (Vec3::ZERO, Vec3::ZERO);
         }
@@ -775,6 +909,7 @@ impl CpuModel {
                 .filter(|s| !s.collapsing.is_empty())
                 .map_or_else(Vec::new, |s| s.sinking(&model.nodes)),
             breakup: None,
+            parts,
         }
     }
 
@@ -786,6 +921,16 @@ impl CpuModel {
             .ok()
             .and_then(|u| u.top_level(*b"PHY2"));
         cpu.collision = CollisionShape::for_model(&model, phy2, lod);
+        // What each part a vehicle breaks on its own stands in the way
+        // with (a hedge's section).
+        if let Some(parts) = cpu.parts.take() {
+            let mut parts = std::sync::Arc::unwrap_or_clone(parts);
+            parts.meshes = CollisionShape::shape_meshes(&model, phy2)
+                .into_iter()
+                .map(|(node, v, t)| (parts.part_holding(node), v, t))
+                .collect();
+            cpu.parts = Some(std::sync::Arc::new(parts));
+        }
         Ok(cpu)
     }
 
@@ -897,6 +1042,8 @@ pub struct GpuModel {
     pub tracks: bool,
     /// Metres the tracks have run.
     pub track_travel: f32,
+    /// Its parts a vehicle breaks one at a time ([`CpuModel::parts`]).
+    pub parts: Option<std::sync::Arc<ModelParts>>,
 }
 
 /// How far a track's texture moves per metre the track runs where its
@@ -1089,6 +1236,7 @@ impl GpuModel {
             tiny_members: cpu.tiny_members.clone(),
             tracks: false,
             track_travel: 0.0,
+            parts: cpu.parts.clone(),
         })
     }
 
@@ -1130,6 +1278,15 @@ impl GpuModel {
     /// [`wrecked`](Self::wrecked) says (one model drawn in many places).
     pub fn draw_as(&self, queue: &mut DrawQueue, world: Mat4, wrecked: bool) {
         for piece in self.shown(wrecked) {
+            self.push(queue, piece, world, None);
+        }
+    }
+
+    /// Queues every piece at `world` but those on nodes `hidden` marks
+    /// ([`ModelParts::hidden`]: some parts broken, the rest standing).
+    pub fn draw_hiding(&self, queue: &mut DrawQueue, world: Mat4, hidden: &[bool]) {
+        let off = |p: &Piece| hidden.get(usize::from(p.at)).copied().unwrap_or(false);
+        for piece in self.pieces.iter().filter(|p| !off(p)) {
             self.push(queue, piece, world, None);
         }
     }

@@ -443,6 +443,10 @@ impl Game {
                 "island vehicle {:#x}: {} as {}",
                 t.entity, t.name, models[0].label
             );
+            // A vehicle's ruin stands wrecked.
+            if crate::mission::is_ruin(&world.index.template_db, t.name) {
+                scene.ruins.insert(t.entity);
+            }
             let crew = world.index.template_db.crew(t.name);
             loads.push((t.entity, t.at, t.yaw, crew, models));
         }
@@ -754,8 +758,12 @@ impl Game {
             // What came down (to a vehicle, the traffic's too, or a blast
             // last tick) comes down whether she is on foot or the free
             // camera flies: its island copy has lost its collision already.
-            self.destruction
-                .update(world, &mut self.scene.props, &mut self.combat);
+            self.destruction.update(
+                world,
+                &mut self.scene.props,
+                &mut self.combat,
+                self.scene.install.as_ref(),
+            );
             self.scene.props.advance(dt);
             self.spray_wait -= dt;
             if self.spray_wait <= 0.0 {

@@ -2081,6 +2081,7 @@ pub(crate) mod tests {
             tiny_members: Vec::new(),
             sinks: Vec::new(),
             breakup: None,
+            parts: None,
         };
         let mut backend = m2_render::NullBackend::default();
         let mut materials = m2_engine::MaterialCache::new();

@@ -87,6 +87,10 @@ impl fmt::Debug for CollisionShape {
     }
 }
 
+/// A `PHY2` shape as [`CollisionShape::shape_meshes`] gives it: its node,
+/// its vertices (model space) and triangles.
+pub type ShapeMesh = (u16, Vec<Vec3>, Vec<[u32; 3]>);
+
 /// How a prop comes loose when a vehicle or a blast knocks it (its `PHY2`
 /// has bodies that move: traffic lights, plants, barricades, poles): its
 /// standing collision goes and its pieces fly.
@@ -584,6 +588,40 @@ impl CollisionShape {
     /// in).
     pub fn for_model(model: &Model<'_>, phy2: Option<&[u8]>, lod: u32) -> Option<Self> {
         Self::for_model_part(model, phy2, lod, None)
+    }
+
+    /// The `PHY2` shapes [`for_model`](Self::for_model) stands in the
+    /// way, one by one: each one's node, and its vertices (model space)
+    /// and triangles. None for a model without `PHY2` shapes.
+    pub fn shape_meshes(model: &Model<'_>, phy2: Option<&[u8]>) -> Vec<ShapeMesh> {
+        let Some(p) = phy2.and_then(|d| Phy2::parse(d).ok()) else {
+            return Vec::new();
+        };
+        let hidden = model
+            .states
+            .as_ref()
+            .map(|s| s.hidden(&model.nodes, false))
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for (k, s) in p.shapes.iter().enumerate() {
+            if !standing(&p, k, &hidden) {
+                continue;
+            }
+            let Some(node) = p.shape_node(k).and_then(|n| u16::try_from(n).ok()) else {
+                continue;
+            };
+            let to_model = model.node_to_model(node).unwrap_or(Mat4::IDENTITY)
+                * p.shape_place(k).map_or(Mat4::IDENTITY, place);
+            let (v, t) = s.geometry.triangles(s.radius);
+            out.push((
+                node,
+                v.iter()
+                    .map(|&x| to_model.transform_point3(Vec3::from(x)))
+                    .collect(),
+                t,
+            ));
+        }
+        out
     }
 
     /// One sub-object of a merged batch (a `TINY` model), by the index its
