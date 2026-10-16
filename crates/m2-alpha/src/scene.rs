@@ -2492,6 +2492,7 @@ impl Scene {
         if let Some(player) = &self.player
             && player.landed
             && (player.driving.is_none() || player.seated)
+            && player.binoculars.is_none()
             && let Some((model, rig)) = &player.model
         {
             let (nodes, skin) = rig.posed();

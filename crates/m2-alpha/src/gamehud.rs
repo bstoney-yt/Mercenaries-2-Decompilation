@@ -48,6 +48,7 @@ use m2_game::mission::{GameData, Mission};
 use m2_math::glam::Vec3;
 use mlua::{IntoLuaMulti, Lua, Table, Value};
 
+use crate::binoculars;
 use crate::combat::{Combat, Fired, Picked, RIFLE_CLIP, Rounds, Weapon};
 use crate::config::Config;
 use crate::game::Game;
@@ -543,6 +544,9 @@ pub struct HudState {
     /// The player's settings and saves, for the pause menu's movie
     /// ([`crate::pause`]).
     pub pause_settings: crate::pause::Settings,
+    /// Her binoculars are up: what their screen shows
+    /// ([`crate::binoculars`]).
+    pub binoculars: Option<binoculars::View>,
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -721,6 +725,13 @@ impl HudState {
             hurts,
             sea_level: game.scene.world.as_ref().map(|w| w.settings.sea_level),
             hero: Some((game.scene.hero, game.combat.max_hp)),
+            binoculars: game.walking().and_then(|p| {
+                p.binoculars.map(|b| binoculars::View {
+                    zoom: b.zoom,
+                    heading: binoculars::wrap_degrees(game.view_heading().to_degrees()),
+                    pitch: p.pitch.to_degrees(),
+                })
+            }),
             ..Self::default()
         }
     }
@@ -1610,6 +1621,11 @@ struct Told {
     menu: Option<bool>,
     /// The satellite's view is open.
     satellite: bool,
+    /// What the binocular screen was last told (None: down).
+    binoculars: Option<binoculars::View>,
+    /// The zoom and the handlers that answered when the meters were last
+    /// logged.
+    binoculars_logged: Option<(u8, usize)>,
     /// What the tutorial box says (None: never anything).
     tutorial: Option<Option<String>>,
     trespass: crate::mission::Trespass,
@@ -1988,6 +2004,9 @@ impl Thread {
         if let Err(e) = self.feed_support(state, dt) {
             log.push(format!("support: {e}"));
         }
+        if let Err(e) = self.feed_binoculars(state, &mut log) {
+            log.push(format!("binoculars: {e}"));
+        }
         if dt > 0.0 {
             self.mission.tick(dt);
             gui_runtime::tick(self.mission.lua(), dt);
@@ -2157,6 +2176,13 @@ impl Thread {
                 ));
             }
             Some(keep)
+        } else if state.binoculars.is_some() {
+            // Through the binoculars only their screen shows: the scripts
+            // put the HUD to sleep (`ToggleHud(owner, false, "scope")`),
+            // which leaves some of it awake here.
+            Some(widgets_under(&screen.borrow(), &names, |n| {
+                n == "Binoculars"
+            }))
         } else {
             state.support.satellite.map(|_| {
                 widgets_under(&screen.borrow(), &names, |n| {
@@ -2165,8 +2191,12 @@ impl Thread {
             })
         };
         // No aim point: the reticle's widgets are left out (not the
-        // satellite's own, its crosshair).
-        let hidden = match state.reticle.or(state.support.satellite.map(|_| [0.0; 2])) {
+        // satellite's own, its crosshair, nor the binoculars').
+        let hidden = match state
+            .reticle
+            .or(state.support.satellite.map(|_| [0.0; 2]))
+            .or(state.binoculars.map(|_| [0.0; 2]))
+        {
             Some(_) => HashSet::new(),
             None => {
                 let hidden = reticle_widgets(&screen.borrow(), &names);
@@ -3201,6 +3231,86 @@ impl Thread {
                 .call::<()>((r.name.as_str(), red, green, blue, alpha, r.invert))?;
         }
         self.told.regions = Some(s.radar_regions.clone());
+        Ok(())
+    }
+
+    /// Feeds the binocular screen the engine's events, as
+    /// `MrxGuiBinoculars` takes them ([`crate::binoculars`]):
+    /// `BinocularsEnter` as they come up, `BinocularsUpdate` with the
+    /// heading, pitch and zoom while they are up, `BinocularsExit` as they
+    /// go down. The faction badge is told a number (none: put away) and the
+    /// name under the reticle is not told.
+    fn feed_binoculars(&mut self, s: &HudState, log: &mut Vec<String>) -> mlua::Result<()> {
+        let lua = self.mission.lua();
+        let was = self.told.binoculars;
+        if was.is_none() && s.binoculars.is_none() {
+            return Ok(());
+        }
+        let event = |kind: &str| -> mlua::Result<Table> {
+            let t = lua.create_table()?;
+            t.raw_set("EventType", kind)?;
+            t.raw_set("uPlayerGuid", guid_value(PLAYER))?;
+            Ok(t)
+        };
+        match (was, s.binoculars) {
+            (None, Some(_)) => {
+                let t = event("BinocularsEnter")?;
+                t.set("bSniper", false)?;
+                let n = gui_runtime::fire(lua, "BinocularsEnter", t)?;
+                log.push(format!("binoculars: up ({n} handlers)"));
+            }
+            (Some(_), None) => {
+                let n = gui_runtime::fire(lua, "BinocularsExit", event("BinocularsExit")?)?;
+                log.push(format!("binoculars: down ({n} handlers)"));
+            }
+            _ => {}
+        }
+        // Each frame while they are up, as the engine does: the meters'
+        // handlers answer only once the frame has closed in
+        // (`_FinishEnter` enables them).
+        if let Some(v) = s.binoculars {
+            let t = event("BinocularsUpdate")?;
+            t.set("nCameraHeading", f64::from(v.heading))?;
+            t.set("nPitch", f64::from(v.pitch))?;
+            t.set("nZoomLevel", f64::from(v.zoom))?;
+            t.set("FactionTexture", 0)?;
+            let n = gui_runtime::fire(lua, "BinocularsUpdate", t)?;
+            if self.told.binoculars_logged != Some((v.zoom, n)) {
+                self.told.binoculars_logged = Some((v.zoom, n));
+                // Where the handlers put the meters' pointers: the
+                // pointer's middle from its meter's, a share of the
+                // meter's length, against the share their sums give.
+                let names = gui_runtime::script_names(lua);
+                let mut at = Vec::new();
+                if let Some(screen) = gui_runtime::screen(lua) {
+                    let screen = screen.borrow();
+                    for (id, name) in &names {
+                        let (across, want) = match name.as_str() {
+                            "top pointer" => (true, binoculars::heading_meter(v.heading)),
+                            "left pointer" => (false, binoculars::pitch_meter(v.pitch)),
+                            "right pointer" => (false, binoculars::zoom_meter(f32::from(v.zoom))),
+                            _ => continue,
+                        };
+                        let Some(bar) = screen.widget(*id).and_then(|w| w.parent) else {
+                            continue;
+                        };
+                        let (p, b) = (screen.rect(*id), screen.rect(bar));
+                        let i = if across { 0 } else { 1 };
+                        let mid = |r: [f32; 4]| (r[i] + r[i + 2]) * 0.5;
+                        let share = (mid(p) - mid(b)) / (b[i + 2] - b[i]).max(1e-3);
+                        at.push(format!("{name} {share:.3} (sums {want:.3})"));
+                    }
+                }
+                log.push(format!(
+                    "binoculars: zoom {}x heading {:.1} pitch {:.1} ({n} handlers): {}",
+                    v.zoom,
+                    v.heading,
+                    v.pitch,
+                    at.join(", ")
+                ));
+            }
+        }
+        self.told.binoculars = s.binoculars;
         Ok(())
     }
 

@@ -28,8 +28,9 @@
 //! hijack scripts' buttons are Y, A, X and B and the left stick's pushes
 //! (`RPad_Up`... in [`m2_game::hijack::BUTTONS`]).
 //!
-//! Invented where the alpha has a thing the layout doesn't: R3 raises the
-//! weapon on foot ([`Action::Aim`], beside the zoom the layout gives it)
+//! R3 puts the binoculars up on foot (the layout's zoom: [`Action::Binoculars`]).
+//! Invented where the alpha has a thing the layout doesn't: LT raises the
+//! weapon as well on foot ([`Action::Aim`], as crouch does on the keys)
 //! and rights an overturned vehicle when driving ([`Action::Reset`], where
 //! the layout resets the camera); the d-pad's right sets off C4 on foot
 //! ([`Action::Detonate`]); the d-pad's up and down move to the next seat
@@ -124,7 +125,8 @@ pub const ON_FOOT: &[(Button, Action)] = &[
     (Button::LeftBumper, Action::Throw),
     (Button::RightTrigger, Action::Fire),
     (Button::RightBumper, Action::SwitchWeapon),
-    (Button::RightStick, Action::Aim),
+    (Button::LeftTrigger, Action::Aim),
+    (Button::RightStick, Action::Binoculars),
     (Button::DpadUp, Action::Support),
     (Button::DpadDown, Action::SupportDown),
     (Button::DpadLeft, Action::Explosive),
@@ -328,6 +330,7 @@ mod tests {
             Action::Reload,
             Action::Fire,
             Action::Aim,
+            Action::Binoculars,
             Action::Throw,
             Action::Explosive,
             Action::Detonate,

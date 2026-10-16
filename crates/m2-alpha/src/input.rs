@@ -17,7 +17,7 @@
 //! | use              | E                     | [`Action::Use`]            |
 //! | jump             | Space                 | [`Action::MoveUp`]         |
 //! | crouch           | C                     | [`Action::MoveDown`], aim  |
-//! | binoculars       | B                     | [`Action::Aim`]            |
+//! | binoculars       | B                     | [`Action::Binoculars`]     |
 //! | PDA              | F1                    | [`Action::Pda`]            |
 //! | look             | I K J L               | [`Action::LookUp`]...      |
 //! | support up, down | 1 or Up, 2 or Down    | [`Action::Support`], down  |
@@ -26,9 +26,10 @@
 //!
 //! Inferred: crouch also raises the weapon ([`Action::Aim`]); the game's
 //! crouch is how she aims steadily (the owner's play of the PC game).
-//! Invented: B raises the weapon until the alpha has the game's binocular
-//! view (`MrxGuiBinocularsLayout`); the view switch is bound but does
-//! nothing yet (the alpha has one camera); the alpha's own keys (the
+//! Invented: through the binoculars ([`crate::binoculars`]) the wheel
+//! zooms ([`Action::ZoomIn`], [`Action::ZoomOut`]) and Tab steps the zoom
+//! up and round, in place of switching weapons; the view switch is bound
+//! but does nothing yet (the alpha has one camera); the alpha's own keys (the
 //! seats Y, C4 X, the shop H, music M, the mouse's release F2, the
 //! developer's F3 to F9, among them the cheat menu's F7) sit on keys the
 //! table leaves free. The hijack's face buttons stay on I K J L beside the
@@ -123,6 +124,12 @@ pub enum Action {
     SupportDown,
     /// The PC game's view switch (not yet: the alpha has one camera).
     ViewSwitch,
+    /// Put her binoculars up, or down ([`crate::binoculars`]).
+    Binoculars,
+    /// Through the binoculars: zoom a level in or out (the wheel's
+    /// notches, which switch weapons otherwise).
+    ZoomIn,
+    ZoomOut,
     /// Look with the keys, as the mouse does ([`KEY_LOOK_RATE`]).
     LookUp,
     LookDown,
@@ -196,7 +203,10 @@ impl Default for Bindings {
             (Reset, vec![k(KeyR)]),
             (Reload, vec![k(KeyR)]),
             (Fire, vec![m(Mouse::Left)]),
-            (Aim, vec![k(KeyC), k(KeyB)]),
+            (Aim, vec![k(KeyC)]),
+            (Binoculars, vec![k(KeyB)]),
+            (ZoomIn, vec![m(WheelUp)]),
+            (ZoomOut, vec![m(WheelDown)]),
             (Throw, vec![m(Mouse::Right), k(KeyG)]),
             (Explosive, vec![k(KeyV)]),
             (Detonate, vec![k(KeyX)]),
@@ -298,7 +308,7 @@ fn key_name(key: KeyCode) -> String {
 /// draw these as the fonts' button pictures where there is one
 /// ([`m2_game::gui_runtime::button_glyph`]); the keys are the fallback.
 /// `[pfire]` and `[move]` are named apart ([`token_keys`]).
-const TOKENS: [(&str, Action); 7] = [
+const TOKENS: [(&str, Action); 8] = [
     ("pda", Action::Pda),
     ("support", Action::Support),
     ("confirm", Action::Use),
@@ -306,6 +316,7 @@ const TOKENS: [(&str, Action); 7] = [
     ("reload", Action::Reload),
     ("jump", Action::MoveUp),
     ("bash", Action::Melee),
+    ("zoom", Action::Binoculars),
 ];
 
 /// The key tokens of the game's texts named as the keys bound here
@@ -641,7 +652,7 @@ mod tests {
             ("use", K(KeyE), Use),
             ("jump", K(Space), MoveUp),
             ("crouch", K(KeyC), MoveDown),
-            ("binoculars", K(KeyB), Aim),
+            ("binoculars", K(KeyB), Binoculars),
             ("pda", K(F1), Pda),
             ("look", K(KeyI), LookUp),
             ("look", K(KeyK), LookDown),
@@ -714,6 +725,8 @@ mod tests {
                     || matches!(
                         action,
                         Action::Aim
+                            | Action::ZoomIn
+                            | Action::ZoomOut
                             | Action::Reset
                             | Action::PadY
                             | Action::PadA
@@ -734,6 +747,16 @@ mod tests {
         assert!(!input.held(Action::SwitchWeapon));
         assert!(input.take_pressed(Action::SwitchWeapon));
         assert!(!input.take_pressed(Action::SwitchWeapon));
+        // Through the binoculars the same notch zooms; B puts them up
+        // and no longer raises the weapon.
+        assert!(input.take_pressed(Action::ZoomIn));
+        input.key(&b, Mouse::WheelDown, true, false);
+        assert!(input.take_pressed(Action::ZoomOut));
+        assert!(!input.take_pressed(Action::ZoomIn));
+        assert_eq!(
+            b.actions_for(KeyCode::KeyB).collect::<Vec<_>>(),
+            [Action::Binoculars]
+        );
     }
 
     #[test]

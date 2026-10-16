@@ -5,6 +5,7 @@ use m2_engine::{Character, Gait, GpuModel, Physics, VehicleId, VehicleSpec};
 use m2_math::glam::{Mat4, Vec2, Vec3};
 use m2_render::View;
 
+use crate::binoculars::Binoculars;
 use crate::combat::{Trigger, Weapon};
 use crate::config::CameraConfig;
 use crate::held::{InHand, Moves, Phase, Switch};
@@ -283,6 +284,9 @@ pub struct Player {
     shown: InHand,
     /// A weapon switch, while it plays over her upper body.
     pub switching: Option<Switch>,
+    /// Her binoculars, while they are up ([`crate::binoculars`]): the
+    /// frame is seen through them and her body is left out.
+    pub binoculars: Option<Binoculars>,
     /// Picking a weapon up: the clip and seconds in (she stands).
     pub picking: Option<(usize, f32)>,
 }
@@ -320,6 +324,7 @@ impl Player {
             shown: InHand::default(),
             switching: None,
             picking: None,
+            binoculars: None,
         }
     }
 
@@ -872,7 +877,19 @@ impl Player {
         }
     }
 
+    /// Her camera's view; through her binoculars, from the point the
+    /// camera turns about above her head, with their narrower lens.
     pub fn view(&self, fov_degrees: f32, aspect: f32) -> View {
+        if let Some(b) = self.binoculars.filter(|_| self.driving.is_none()) {
+            return View::perspective(
+                self.look_at(),
+                self.camera_forward(),
+                b.fov(fov_degrees).to_radians(),
+                aspect,
+                0.1,
+                10_000.0,
+            );
+        }
         View::perspective(
             self.eye(),
             self.camera_forward(),
