@@ -1333,8 +1333,12 @@ fn screenshot(
     if let Some(p) = game.scene.player.as_ref().filter(|_| game.on_foot) {
         // Hits from around her, as the camera sees it: 0 ahead, 90 right.
         let at = p.character.position + m2_math::glam::Vec3::Y;
-        let ahead = game.camera.forward().with_y(0.0).normalize_or_zero();
-        let right = game.camera.right();
+        let look = FlyCamera {
+            yaw: game.view_heading(),
+            ..game.camera
+        };
+        let ahead = look.forward().with_y(0.0).normalize_or_zero();
+        let right = look.right();
         for d in &options.hit_from {
             let (s, c) = d.to_radians().sin_cos();
             game.combat
