@@ -387,6 +387,10 @@ const MAX_TEXTURE: u32 = 2048;
 /// `+x` and `+z` towards its left and top edges: its sea (see
 /// [`radar_map`]), and the grey of its paved roads tells them from tracks.
 const MAP_TEXTURE: &str = "vz_lrterrain";
+/// The radar's movie, whose `roads_mc` holds the island's map of sea and
+/// roads ([`minimap::MovieMap`]): the radar's map is drawn from it, and
+/// from the terrain and the road network only without it.
+const RADAR_MOVIE: &str = "minimap";
 /// The radar's backdrop (its `sBorderTexture`), with the north pointer on
 /// its rim, `BORDER` virtual units across round a minimap 100 across.
 const BORDER_TEXTURE: &str = "global_gui_hud_radar";
@@ -2183,11 +2187,15 @@ impl Thread {
                     let image = match radar_map(&mut self.assets, sea) {
                         Ok((i, roads)) => {
                             let paved = roads.iter().filter(|r| r.paved).count();
+                            let from = if roads.iter().any(|r| r.width.is_some()) {
+                                format!("the radar movie's map, {} road strokes", roads.len())
+                            } else {
+                                format!("sea at {sea} m, {} roads ({paved} paved)", roads.len())
+                            };
                             log.push(format!(
-                                "radar map: {}x{}, sea at {sea} m, {} roads ({paved} paved), in {:.0?}",
+                                "radar map: {}x{}, {from}, in {:.0?}",
                                 i.width,
                                 i.height,
-                                roads.len(),
                                 started.elapsed()
                             ));
                             self.roads = roads;
@@ -3632,6 +3640,16 @@ fn radar_map(
         .map_err(|e| e.to_string())?;
     let rgba = texture.mips.first().ok_or("no mips")?;
     let (width, height) = (texture.width as usize, texture.height as usize);
+    if let Some(map) = movie_map(assets) {
+        return Ok((
+            Image {
+                width: texture.width,
+                height: width as u32,
+                rgba: map.image(width, ISLAND),
+            },
+            map.roads,
+        ));
+    }
     let index = WorldIndex::build(assets).map_err(|e| e.to_string())?;
     let mut heights = Heights::new(width, ISLAND);
     for (&hash, centre) in &index.tiles {
@@ -3664,6 +3682,14 @@ fn radar_map(
         },
         roads,
     ))
+}
+
+/// The radar movie's own map (see [`minimap::MovieMap`]), if it reads.
+fn movie_map(assets: &mut AssetSource<BufReader<File>>) -> Option<minimap::MovieMap> {
+    let data = assets.asset(name_hash(RADAR_MOVIE), MOVIE_TYPE).ok()?;
+    let lib = flash::Library::new(&movie_from_asset(&data).ok()?);
+    let (shape, mesh) = minimap::roads_shape(&lib)?;
+    Some(minimap::MovieMap::new(shape, mesh))
 }
 
 /// How dark the scene goes behind the PDA (the black's alpha): the
@@ -4163,10 +4189,12 @@ fn road_strokes(view: &MapView, roads: &[Road], out: &mut Vec<Prim>, want: &mut 
     let period = minimap::DASH + minimap::DASH_GAP;
     let at = [view.player[0], view.player[2]];
     for road in roads.iter().filter(|road| road.near(at, view.range)) {
-        let width = if road.paved {
-            minimap::PAVED_WIDTH
-        } else {
-            minimap::ROAD_WIDTH
+        // A stroke of the movie's map is so many metres across, as the
+        // movie's strokes widen with its map.
+        let width = match road.width {
+            Some(metres) => metres / view.range.max(1.0),
+            None if road.paved => minimap::PAVED_WIDTH,
+            None => minimap::ROAD_WIDTH,
         };
         let half = r * width / 2.0;
         // Metres along the road, for its dashes to run on unbroken.
@@ -4872,6 +4900,29 @@ mod tests {
         );
         // The map's corners: +x and +z at its left and top.
         assert_eq!(map_uv([ISLAND / 2.0, ISLAND / 2.0]), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_stroke_of_the_movie_map_widens_with_the_map() {
+        // A 12 m stroke across the middle of a minimap 200 across.
+        let road = Road::stroke(vec![[-50.0, 0.0], [50.0, 0.0]], 12.0);
+        let across = |range: f32| {
+            let view = MapView {
+                rect: [0.0, 0.0, 200.0, 200.0],
+                player: [0.0; 3],
+                heading: 0.0,
+                range,
+            };
+            let (mut out, mut want) = (Vec::new(), Vec::new());
+            road_strokes(&view, std::slice::from_ref(&road), &mut out, &mut want);
+            assert_eq!(out.len(), 1, "solid: one quad");
+            let [a, _, _, d] = out[0].corners;
+            (a[0] - d[0]).hypot(a[1] - d[1])
+        };
+        // 12 m of 150 m to the rim, of a radius of 100: 8 across; twice
+        // as far out, half as wide.
+        assert!((across(150.0) - 8.0).abs() < 1e-3, "{}", across(150.0));
+        assert!((across(300.0) - 4.0).abs() < 1e-3);
     }
 
     #[test]
