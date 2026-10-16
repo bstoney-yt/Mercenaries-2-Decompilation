@@ -2802,8 +2802,21 @@ pub(crate) fn template_models(
         // car its own model draws, isn't a Valiant to drive (round 8:
         // the two ruins by VzaCon001's huts stood twice, intact too).
         Some(&TemplateInfo { vehicle: None, .. }) => Vec::new(),
+        // A prop the layers place by its model's name (a leading `_`)
+        // or a ruin's or wreck's name: drawn as itself, no vehicle
+        // (playtest 4: `_global_veh_ruin_68valiant`, by the porch hut,
+        // stood a second, drivable Valiant).
+        _ if placed_prop_or_ruin(name) => Vec::new(),
         _ => vehicle_models(name, catalogue),
     }
+}
+
+/// Whether an object's `name` is a prop placed by its model's name or a
+/// ruin's or wreck's (the words `m2_assets::vehicle` keeps out of its
+/// shared models).
+fn placed_prop_or_ruin(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with('_') || n.contains("ruin") || n.contains("wreck")
 }
 
 /// What the scripts' object `name` (a supply crate) leaves once destroyed:
@@ -3178,6 +3191,21 @@ mod tests {
     }
 
     #[test]
+    fn a_ruin_prop_placed_by_its_models_name_is_no_vehicle() {
+        let catalogue = [entry(1, "car", "global_veh_68valiant")];
+        let none = Templates::default();
+        assert!(
+            template_models("_global_veh_ruin_68valiant 0x000d8eac", &none, &catalogue).is_empty()
+        );
+        assert!(template_models("68Valiant Wreck", &none, &catalogue).is_empty());
+        // A script's car by that name still finds its model.
+        assert_eq!(
+            template_models("68Valiant 0x000fab16", &none, &catalogue).len(),
+            1
+        );
+    }
+
+    #[test]
     fn only_the_vehicles_near_her_count_against_the_most() {
         // Playtest 4: 37 loaded from the first contract, 4 km behind her
         // at the villa, left no room for the tank.
@@ -3374,6 +3402,7 @@ mod tests {
             pickup: Some(8),
             feel: Default::default(),
             hint: None,
+            ui: None,
         };
         let db = Templates {
             infos: HashMap::from([(

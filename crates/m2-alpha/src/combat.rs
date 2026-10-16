@@ -183,6 +183,8 @@ pub struct Rifle {
     /// Its shots' sound set, muzzle flash and scatter, as its template
     /// gives them.
     pub feel: Feel,
+    /// What the HUD shows of it (`WeaponUI`), if its template says.
+    pub ui: Option<m2_engine::weapons::GunUi>,
 }
 
 impl Default for Rifle {
@@ -203,6 +205,7 @@ impl Default for Rifle {
             lock_on: None,
             class: None,
             feel: Feel::default(),
+            ui: None,
         }
     }
 }
@@ -254,6 +257,7 @@ impl Rifle {
             lock_on: spec.lock_on,
             class: spec.class,
             feel: spec.feel,
+            ui: spec.ui,
         }
     }
 
@@ -1059,6 +1063,12 @@ impl Rounds {
     pub fn total(self) -> u32 {
         self.clip + self.stored
     }
+}
+
+/// `r` reloaded into a clip of `size`: `None` when it is full or nothing
+/// is stored to load.
+fn topped_up(r: Rounds, size: u32) -> Option<Rounds> {
+    (r.clip < size && r.stored > 0).then(|| Rounds::of(r.total(), size))
 }
 
 /// Something brief to draw.
@@ -2606,6 +2616,18 @@ impl Combat {
     /// game does), while she holds it on foot with rounds to spare; put
     /// away or out of her hands, the change starts over next time.
     fn change_clip(&mut self, trigger: Trigger, on_foot: bool, dt: f32) {
+        // The launcher reloads on R too, its magazine part spent
+        // (playtest 4: only once empty).
+        if on_foot
+            && trigger.reload
+            && self.weapon == self.launcher.slot()
+            && self.reload <= 0.0
+            && let Some(r) = self.launcher_rounds.as_mut()
+            && let Some(full) = topped_up(*r, self.launcher.clip.max(1))
+        {
+            *r = full;
+            self.reload = LAUNCHER_RELOAD;
+        }
         let r = self.rifle_rounds;
         let holding = on_foot && self.weapon == Weapon::Rifle && !self.designator;
         if !holding {
@@ -4692,6 +4714,22 @@ mod tests {
     use super::*;
     use crate::npc::tests::{ground, rig};
     use crate::npc::{Brain, Npc};
+
+    #[test]
+    fn a_part_spent_launcher_reloads_from_what_is_stored() {
+        // 2 of 6 loaded, 10 stored: 6 loaded, 6 stored.
+        let r = Rounds {
+            clip: 2,
+            stored: 10,
+        };
+        assert_eq!(topped_up(r, 6), Some(Rounds { clip: 6, stored: 6 }));
+        // 2 loaded and 1 stored: 3 loaded.
+        let r = Rounds { clip: 2, stored: 1 };
+        assert_eq!(topped_up(r, 6), Some(Rounds { clip: 3, stored: 0 }));
+        // Full, or nothing stored: no reload.
+        assert_eq!(topped_up(Rounds { clip: 6, stored: 4 }, 6), None);
+        assert_eq!(topped_up(Rounds { clip: 2, stored: 0 }, 6), None);
+    }
 
     #[test]
     fn a_blow_rights_a_vehicle_on_its_side_in_front_of_her() {

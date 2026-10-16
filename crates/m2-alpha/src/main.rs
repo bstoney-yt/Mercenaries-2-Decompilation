@@ -5542,6 +5542,9 @@ impl Running {
     /// settings kept (written to the settings file, as the game saves its
     /// profile), its sounds.
     fn pause_news(&mut self, news: pause::News, config: &mut Config, event_loop: &ActiveEventLoop) {
+        for cue in &news.stops {
+            self.audio.stop_ui_sound(cue);
+        }
         for cue in &news.sounds {
             self.audio.ui_sound(cue);
         }
