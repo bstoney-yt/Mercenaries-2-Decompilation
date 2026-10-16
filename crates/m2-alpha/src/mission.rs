@@ -364,9 +364,11 @@ pub struct MissionLink {
     /// ([`Mission::hold_movies`]); otherwise they end at once.
     movies: bool,
     /// With [`movies`](Self::movies), the scripts' skip mode ends once the
-    /// start has run ([`Mission::end_skip_mode`], `--skip-mode-off`).
-    /// Off by default until the scripts that ask about it are surveyed on
-    /// the game's data: the flow was only seen to finish with it on.
+    /// start has run ([`Mission::end_skip_mode`]; `--skip-mode-on` keeps
+    /// it). Surveyed on the game's data (round 25): 7 scripts ask, 36
+    /// times; the mission flow (27 of them) skips its fades and voice
+    /// sequences with it, the PMC HQ its interior. Both contracts' flows
+    /// were seen to finish with it off.
     end_skip: bool,
     /// The player has subtitles on.
     subtitles: bool,
@@ -780,7 +782,7 @@ impl MissionLink {
     }
 
     /// Ends the scripts' skip mode once the start has run, when the movies
-    /// wait for the game (`--skip-mode-off`).
+    /// wait for the game (unless `--skip-mode-on`).
     pub fn with_skip_mode_off(self, end_skip: bool) -> Self {
         Self { end_skip, ..self }
     }
@@ -1290,7 +1292,7 @@ impl MissionLink {
                     // mode has done its part.
                     mission.end_skip_mode();
                 } else if self.movies {
-                    eprintln!("mission: the scripts' skip mode stays on (--skip-mode-off)");
+                    eprintln!("mission: the scripts' skip mode stays on (--skip-mode-on)");
                 }
                 let lines = mission.take_log();
                 for c in mission.take_commands() {

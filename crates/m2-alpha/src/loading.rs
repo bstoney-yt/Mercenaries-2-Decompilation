@@ -39,8 +39,13 @@
 //!   consequence in the mission flow (`ce4166ed`) unlocks the next
 //!   contracts and calls `WifPmcInterior.Enter`, which raises the screen
 //!   (`Net.SetLoadingScreen(true)`) for the move into the PMC HQ. The
-//!   footage shows two screens there (around the closing movie) and the
-//!   alpha one; the movie's own screen is not matched.
+//!   footage shows two screens there, one either side of the closing movie
+//!   (`06_YNH`): the first is the flow's fade (`MrxState.Enter
+//!   (STATE_WAITFORGAME)`) before `_PlayMovie`, which the scripts' skip
+//!   mode leaves out, so it comes only with skip mode off (the default
+//!   since round 25). Talking to Fiona in the HQ fades the same way
+//!   (`WifPmcInterior._EnableStarter`'s `ContextAction` event), and her
+//!   briefing's end raises the screen itself (`Net.SetLoadingScreen`).
 //! - Invented: the order once the last is shown (back to the first), and
 //!   which loads show a hint (all here; the footage's screen after a
 //!   failed mission has none, which the engine's choice is not read for).
