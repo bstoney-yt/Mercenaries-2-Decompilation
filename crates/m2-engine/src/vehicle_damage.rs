@@ -32,14 +32,33 @@
 //!   sets it again (the dented door's state sets only `DamageMsg`, to
 //!   nothing; its `DestroyMsg` still throws the door off).
 //! - How much of a hit a part takes: the hit's own damage (a rifle round's
-//!   9) times the part's scale, nearest part to where it struck; a blast
-//!   hurts every part within its reach as it hurts the vehicle. Invented.
+//!   9) times the part's scale, nearest part to where it struck (within
+//!   [`HIT_SLACK`], invented). A blast hurts each part in reach by its
+//!   own distance from the heart, by the explosion template's fall from
+//!   `Damage` to `MinDamage` (round 21; before, a straight fall to
+//!   nothing, invented).
+//! - A part's own `ModifierKey` record (`Name` its node: 329 of the
+//!   vehicle templates', `WeakPointTank` on the tanks' and IFVs',
+//!   `WeakPointHeli` on the helicopters') makes it a weak point: where a
+//!   hit strikes it, the damage table's row for that key stands in for
+//!   the vehicle's (read off the rows: the weak points' give rockets 5 to
+//!   10 times the tank's, rounds the same; not checked against the 360
+//!   code).
+//! - `DebrisEffect`'s fields by their hashes ([`Debris`]): its counts,
+//!   speeds and times are read as such from their names; that the speed
+//!   is how fast a chunk leaves and the time how long it lasts is
+//!   inferred.
+//!
+//! Of the `NodeHealth` records, 668 (one a template, health 1000) name
+//! `c851b695` ([`UNNAMED_WHOLE`]), which no model's node is; the rest
+//! that name no part name nodes their template's model lacks (a template
+//! sharing its records with another model's). Neither is a part.
 //!
 //! Not read: what the handlers on leaving a state do but hide and stop
 //! emitters (a lamp passes damage to the hood as it breaks), the third
-//! message the parts take (its hash unnamed, shown by the survey as a
-//! float), and parts whose own `ModifierKey` the damage table scales (a
-//! tank's weak point).
+//! message the parts take (`3d0d4c99`, unnamed: it sends a part where
+//! `DestroyMsg` does), `NodeHealth`'s `0ec0aee7` (0 throughout) and
+//! `261b2109` (1 on 229 records).
 //!
 //! Not done here: bullet holes in paint and glass (the footage's 14:06).
 //! No part state shows them; read as decals the game places where
@@ -56,8 +75,10 @@ use crate::tuning::Table;
 /// `NodeHealth`'s scale and damaged-at fields (names unknown).
 const SCALE: u32 = 0x27c5_0f84;
 const DAMAGED_AT: u32 = 0xea81_3967;
-/// `TickDamage`'s part (name unknown).
-const BURN_PART: u32 = 0x9ae0_feac;
+/// The name `NodeHealth` records give that no model's node has (668 of
+/// the vehicle templates' 6,696 records, every one with health 1000; the
+/// name itself unsolved). Not a part: the survey counts them apart.
+pub const UNNAMED_WHOLE: u32 = 0xc851_b695;
 
 /// One part's health, from a `NodeHealth` record.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -71,20 +92,66 @@ pub struct NodeHealth {
     pub damaged_at: f32,
 }
 
-/// A template's parts' health, and the part that burns.
+/// The chunks a wreck throws, one `DebrisEffect` record (field names
+/// matched to their hashes: `iMinChunks`, `iMaxChunks`, `MinChunkVel`,
+/// `MaxChunkVel`, `MinChunkTime`, `MaxChunkTime`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Debris {
+    /// The chunk's template (`Chunk_aa`) and that template's model, if
+    /// it is debris (`_DebrisPhysics`; not the fuel can, a pickup).
+    pub template: u32,
+    pub model: Option<u32>,
+    /// The node it flies from (`Hardpoint`; `None`: the vehicle's
+    /// middle, as every record sampled has it).
+    pub hardpoint: Option<u32>,
+    /// How many, fewest and most.
+    pub count: (u32, u32),
+    /// How fast they leave, m/s, slowest and fastest (read as speeds).
+    pub speed: (f32, f32),
+    /// How long they last, seconds, shortest and longest (read as
+    /// lifetimes).
+    pub lasts: (f32, f32),
+}
+
+/// A template's parts' health, the part that burns, its parts' own
+/// damage keys and the chunks its wreck throws.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PartHealths {
     pub parts: Vec<NodeHealth>,
-    /// The part `TickDamage` names: the body.
+    /// The part `TickDamage` names (its field `NodeName`): the body.
     pub burn_part: Option<u32>,
+    /// Parts with a `ModifierKey` of their own, (node name hash, key):
+    /// a tank's or helicopter's weak point (`WeakPointTank`,
+    /// `WeakPointHeli`), which the damage table hurts more by rockets.
+    pub keys: Vec<(u32, u32)>,
+    /// What its wreck throws (`DebrisEffect`).
+    pub debris: Vec<Debris>,
 }
 
-/// Each template's parts' health, by id: those with `NodeHealth`.
+/// Each template's parts' health, by id: those with `NodeHealth`, a
+/// part's own `ModifierKey` or `DebrisEffect`.
 pub fn read(db: &Layer<'_>) -> HashMap<u32, PartHealths> {
     let node = Table::new(db, "NodeHealth");
     let tick = Table::new(db, "TickDamage");
+    let modifier = Table::new(db, "ModifierKey");
+    let effect = Table::new(db, "DebrisEffect");
+    let models = db.hashes("ModelName");
+    let physics = Table::new(db, "_DebrisPhysics");
     let (name, health) = (name_hash("Name"), name_hash("Health"));
-    node.templates()
+    let key = name_hash("ModifierKey");
+    let mut ids: Vec<u32> = node
+        .templates()
+        .chain(effect.templates())
+        .chain(modifier.templates().filter(|&id| {
+            modifier
+                .of_template(id)
+                .iter()
+                .any(|r| modifier.word(r, name).is_some_and(|n| n != 0))
+        }))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter()
         .map(|id| {
             let parts = node
                 .of_template(id)
@@ -101,9 +168,48 @@ pub fn read(db: &Layer<'_>) -> HashMap<u32, PartHealths> {
             let burn_part = tick
                 .of_template(id)
                 .first()
-                .and_then(|r| tick.word(r, BURN_PART))
+                .and_then(|r| tick.word(r, name_hash("NodeName")))
                 .filter(|&h| h != 0);
-            (id, PartHealths { parts, burn_part })
+            let keys = modifier
+                .of_template(id)
+                .iter()
+                .filter_map(|r| {
+                    let part = modifier.word(r, name).filter(|&n| n != 0)?;
+                    Some((part, modifier.word(r, key).filter(|&k| k != 0)?))
+                })
+                .collect();
+            let debris = effect
+                .of_template(id)
+                .iter()
+                .filter_map(|r| {
+                    let w = |f: &str| effect.word(r, name_hash(f));
+                    let fl = |f: &str| effect.float(r, name_hash(f));
+                    let template = w("Template").filter(|&t| t != 0)?;
+                    let (lo, hi) = (w("iMinChunks")?, w("iMaxChunks")?);
+                    Some(Debris {
+                        template,
+                        // Only a chunk of debris (`_DebrisPhysics`) is thrown as
+                        // one; the fuel can some records name is a pickup.
+                        model: models
+                            .get(&template)
+                            .copied()
+                            .filter(|&m| m != 0 && !physics.of_template(template).is_empty()),
+                        hardpoint: w("Hardpoint").filter(|&h| h != 0),
+                        count: (lo.min(hi), lo.max(hi)),
+                        speed: (fl("MinChunkVel")?, fl("MaxChunkVel")?),
+                        lasts: (fl("MinChunkTime")?, fl("MaxChunkTime")?),
+                    })
+                })
+                .collect();
+            (
+                id,
+                PartHealths {
+                    parts,
+                    burn_part,
+                    keys,
+                    debris,
+                },
+            )
         })
         .collect()
 }
@@ -244,6 +350,8 @@ pub struct PartDamage {
     handlers: Vec<Vec<(u32, u32)>>,
     /// Per part, whether it has taken its `DamageMsg` and `DestroyMsg`.
     sent: Vec<[bool; 2]>,
+    /// Per part, its own `ModifierKey`, if its template gives one.
+    keys: Vec<Option<u32>>,
     /// The body (the part `TickDamage` names).
     pub body: Option<usize>,
     /// Parts thrown off since last taken ([`take_detached`]).
@@ -266,6 +374,7 @@ impl PartDamage {
             health: vec![None; n],
             handlers: vec![Vec::new(); n],
             sent: vec![[false; 2]; n],
+            keys: vec![None; n],
             body: healths.burn_part.and_then(|h| model.part_named(h)),
             detached: Vec::new(),
             running: Vec::new(),
@@ -274,6 +383,11 @@ impl PartDamage {
         for h in &healths.parts {
             if let Some(k) = model.part_named(h.part) {
                 d.health[k] = Some((h.health, *h));
+            }
+        }
+        for &(part, key) in &healths.keys {
+            if let Some(k) = model.part_named(part) {
+                d.keys[k] = Some(key);
             }
         }
         for (k, m) in model.states.machines.iter().enumerate() {
@@ -289,6 +403,16 @@ impl PartDamage {
     /// The parts with health of their own.
     pub fn with_health(&self) -> usize {
         self.health.iter().flatten().count()
+    }
+
+    /// Part `k`'s own `ModifierKey` (a weak point's), if it has one.
+    pub fn key(&self, k: usize) -> Option<u32> {
+        self.keys.get(k).copied().flatten()
+    }
+
+    /// The parts with a `ModifierKey` of their own.
+    pub fn with_key(&self) -> usize {
+        self.keys.iter().flatten().count()
     }
 
     fn set_handlers(&mut self, model: &DamageModel, k: usize, s: usize) {
@@ -413,10 +537,17 @@ impl PartDamage {
         Some(k)
     }
 
-    /// A blast at `at` (model space) reaching `reach` metres, `damage` at
-    /// its heart falling off to nothing at its edge: every part but the
-    /// body within reach takes its share.
-    pub fn blast(&mut self, model: &DamageModel, at: Vec3, reach: f32, damage: f32) {
+    /// A blast at `at` (model space) reaching `reach` metres: every part
+    /// but the body within reach takes `damage_at` its distance from the
+    /// blast's heart (an explosion template's own fall from `Damage` to
+    /// `MinDamage`).
+    pub fn blast(
+        &mut self,
+        model: &DamageModel,
+        at: Vec3,
+        reach: f32,
+        damage_at: impl Fn(f32) -> f32,
+    ) {
         for k in 0..model.boxes.len() {
             let Some((lo, hi)) = model.boxes[k] else {
                 continue;
@@ -426,7 +557,7 @@ impl PartDamage {
             }
             let d = (lo - at).max(at - hi).max(Vec3::ZERO).length();
             if d < reach {
-                self.hurt(model, k, damage * (1.0 - d / reach));
+                self.hurt(model, k, damage_at(d));
             }
         }
     }
@@ -629,6 +760,8 @@ mod tests {
                 },
             ],
             burn_part: Some(101),
+            keys: Vec::new(),
+            debris: Vec::new(),
         }
     }
 
@@ -684,10 +817,39 @@ mod tests {
     fn a_blast_reaches_the_parts_in_its_reach() {
         let m = car();
         let mut d = PartDamage::new(&m, &healths());
-        d.blast(&m, Vec3::new(3.0, 0.5, 0.5), 5.0, 200.0);
+        d.blast(&m, Vec3::new(3.0, 0.5, 0.5), 5.0, |_| 200.0);
         assert_eq!(d.state[1], Some(3));
         let mut far = PartDamage::new(&m, &healths());
-        far.blast(&m, Vec3::new(9.0, 0.5, 0.5), 5.0, 200.0);
+        far.blast(&m, Vec3::new(9.0, 0.5, 0.5), 5.0, |_| 200.0);
         assert!(far.untouched());
+    }
+
+    #[test]
+    fn a_blast_hurts_each_part_by_its_own_distance() {
+        let m = car();
+        // The door's box is 2 m from the heart: a blast falling from 20
+        // to 10 over 4 m gives it 15 of its 30, and it dents at 15.
+        let fall = |d: f32| 20.0 - 10.0 * d / 4.0;
+        let mut d = PartDamage::new(&m, &healths());
+        d.blast(&m, Vec3::new(3.0, 0.5, 0.5), 4.0, fall);
+        assert_eq!(d.state[1], Some(1));
+        // The reach's edge's 10 where it stands leaves it whole.
+        let mut edge = PartDamage::new(&m, &healths());
+        edge.blast(&m, Vec3::new(3.0, 0.5, 0.5), 4.0, |_| 10.0);
+        assert!(edge.untouched());
+    }
+
+    #[test]
+    fn a_part_with_its_own_key_is_a_weak_point() {
+        let m = car();
+        let weak = m2_assets::name_hash("WeakPointTank");
+        let mut h = healths();
+        // The door's node, and a node the model doesn't have.
+        h.keys = vec![(103, weak), (999, weak)];
+        let d = PartDamage::new(&m, &h);
+        assert_eq!(d.with_key(), 1);
+        assert_eq!(d.key(1), Some(weak));
+        assert_eq!(d.key(0), None);
+        assert_eq!(d.key(7), None);
     }
 }

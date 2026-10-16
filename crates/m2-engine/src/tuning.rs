@@ -40,6 +40,9 @@ pub struct VehicleTuning {
     /// What rounds do to it, of their damage, by its `ModifierKey` in the
     /// game's damage table (an M151's `Car`: a rifle round a fortieth).
     pub rounds: Option<RoundScale>,
+    /// That `ModifierKey` itself (`Car`, `Tank`), the whole vehicle's:
+    /// its record with no `Name`.
+    pub key: Option<u32>,
     pub turret: Option<TurretTuning>,
     pub camera: Option<TankCamera>,
     pub gun: Option<GunTuning>,
@@ -264,6 +267,22 @@ impl DamageTable {
         (&self.rows, &self.columns)
     }
 
+    /// What damage of kind `damage` does to a part with a key of its own
+    /// (`part`: `WeakPointTank`), times what it does to the whole vehicle
+    /// (`vehicle`: `Tank`): a rocket (`Rocket`) on a tank's weak point 5
+    /// (1 against 0.2), a `RocketLarge` 10. `None` where the table has
+    /// either key not, or the whole vehicle takes none of it (then there
+    /// is no damage of its own to scale).
+    ///
+    /// That a part's key stands in for the vehicle's where the part is
+    /// struck is read off the rows' shape (the weak points' rows give
+    /// rockets more, nothing else), not checked against the 360 code.
+    pub fn weak_point(&self, vehicle: u32, part: u32, damage: u32) -> Option<f32> {
+        let whole = self.scale(vehicle, damage)?;
+        let own = self.scale(part, damage)?;
+        (whole > 0.0).then(|| own / whole)
+    }
+
     /// The rounds' scales for a target of kind `target`.
     pub fn rounds(&self, target: u32) -> Option<RoundScale> {
         Some(RoundScale {
@@ -339,6 +358,17 @@ const BURNS_BELOW: u32 = 0x9a66_63a4;
 /// the engine gives at idle and at its most rpm ([`EngineTuning`]).
 const TORQUE_AT_MIN: u32 = 0x766a_fb22;
 const TORQUE_AT_MAX: u32 = 0x72b8_8cdc;
+
+/// Template `id`'s whole `ModifierKey`: its record with no `Name` (the
+/// named ones are its parts').
+fn whole_key(modifier: &Table<'_>, id: u32) -> Option<u32> {
+    modifier
+        .of_template(id)
+        .iter()
+        .find(|r| modifier.word(r, name_hash("Name")).is_none_or(|n| n == 0))
+        .and_then(|r| modifier.word(r, name_hash("ModifierKey")))
+        .filter(|&k| k != 0)
+}
 
 /// One component's records by template id, and its fields by name hash.
 pub(crate) struct Table<'a> {
@@ -620,12 +650,8 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                 burns_below: tick.number(id, BURNS_BELOW),
                 // The whole vehicle's key: its record with no `Name` (the
                 // named ones are parts).
-                rounds: modifier
-                    .of_template(id)
-                    .iter()
-                    .find(|r| modifier.word(r, name_hash("Name")).is_none_or(|n| n == 0))
-                    .and_then(|r| modifier.word(r, name_hash("ModifierKey")))
-                    .and_then(|key| damage?.rounds(key)),
+                rounds: whole_key(&modifier, id).and_then(|key| damage?.rounds(key)),
+                key: whole_key(&modifier, id),
                 turret: (|| {
                     let named = turret.named(id, MAIN_TURRET);
                     let r = match (named, turret.of_template(id)) {
@@ -954,5 +980,34 @@ mod tests {
         );
         assert_eq!(t.scale(name_hash("Human"), bullet), None);
         assert!(DamageTable::parse(&data[..data.len() - 1]).is_none());
+    }
+
+    // The game's rows for a tank and its weak point (round 15's dump):
+    // rockets 0.2 and 0.2 against 1 and 2, rounds nothing either way.
+    #[test]
+    fn a_weak_point_takes_its_own_row_of_the_vehicles() {
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(2);
+        put(3);
+        let (tank, weak) = (name_hash("Tank"), name_hash("WeakPointTank"));
+        let (bullet, rocket, large) = (
+            name_hash("Bullet"),
+            name_hash("Rocket"),
+            name_hash("RocketLarge"),
+        );
+        for k in [tank, weak, bullet, rocket, large] {
+            put(k);
+        }
+        for v in [0.0f32, 0.2, 0.2, 0.0, 1.0, 2.0] {
+            put(v.to_bits());
+        }
+        let t = DamageTable::parse(&data).expect("parses");
+        let near = |a: Option<f32>, b: f32| a.is_some_and(|a| (a - b).abs() < 1e-5);
+        assert!(near(t.weak_point(tank, weak, rocket), 5.0));
+        assert!(near(t.weak_point(tank, weak, large), 10.0));
+        // A tank takes no round at all: nothing to scale.
+        assert_eq!(t.weak_point(tank, weak, bullet), None);
+        assert_eq!(t.weak_point(tank, name_hash("Car"), rocket), None);
     }
 }

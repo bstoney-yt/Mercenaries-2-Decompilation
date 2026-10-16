@@ -1200,6 +1200,9 @@ enum Projectile {
         owner: Option<VehicleId>,
         blast: Option<Blast>,
         homing: Option<(VehicleId, f32)>,
+        /// Its round's `DamageKey` (`Rocket`): what a weak point it
+        /// strikes takes of its blast ([`DamageTable::weak_point`]).
+        key: Option<u32>,
     },
     Grenade {
         at: Vec3,
@@ -2557,6 +2560,7 @@ impl Combat {
                     owner: None,
                     blast: ammo.burst(),
                     homing: None,
+                    key: ammo.key,
                 });
                 self.effect(
                     Effect::Flash {
@@ -2912,6 +2916,7 @@ impl Combat {
             owner: None,
             blast: self.launcher.blast(),
             homing,
+            key: self.launcher.ammo.and_then(|a| a.key),
         });
         self.effect(
             Effect::Flash {
@@ -3111,6 +3116,7 @@ impl Combat {
                     owner: Some(id),
                     blast: ammo.burst(),
                     homing: None,
+                    key: ammo.key,
                 });
                 self.effect(
                     Effect::Flash {
@@ -3184,6 +3190,7 @@ impl Combat {
                 owner: Some(id),
                 blast: None,
                 homing: None,
+                key: None,
             });
             if let Some(v) = f.vehicles.get_mut(i) {
                 v.fired += 1;
@@ -3316,6 +3323,21 @@ impl Combat {
         }
     }
 
+    /// What a hit of `DamageKey` `key` at `at` (world) does to vehicle `v`
+    /// (its place `body`), times its usual: where it strikes a part with a
+    /// `ModifierKey` of its own (a tank's weak point), the damage table's
+    /// [`weak_point`](DamageTable::weak_point) scale, else 1.
+    fn weak_point(&self, v: &ParkedVehicle, body: Mat4, at: Vec3, key: Option<u32>) -> f32 {
+        let (Some(table), Some(key), Some(whole)) =
+            (self.damage_table.as_ref(), key, v.spec.tuning.key)
+        else {
+            return 1.0;
+        };
+        v.struck_key(body, at)
+            .and_then(|part| table.weak_point(whole, part, key))
+            .unwrap_or(1.0)
+    }
+
     /// A round from `from` along `dir` that struck something solid `t`
     /// metres on: a vehicle (not `own`) takes `damage`.
     fn round_on_vehicle(
@@ -3329,16 +3351,30 @@ impl Combat {
             return;
         };
         if let Some(i) = f.vehicles.iter().position(|v| v.id == Some(id)) {
+            let body = f.physics.vehicle_transform(id);
+            let key = m2_assets::name_hash(match round {
+                Round::Bullet => "Bullet",
+                Round::BulletLarge => "BulletLarge",
+            });
             let v = &mut f.vehicles[i];
-            let scale = v.spec.tuning.rounds.map_or(0.0, |r| match round {
+            let at = from + dir * t;
+            let mut scale = v.spec.tuning.rounds.map_or(0.0, |r| match round {
                 Round::Bullet => r.bullet,
                 Round::BulletLarge => r.bullet_large,
             });
+            // A part with a key of its own (a helicopter's weak point)
+            // takes its own row's scale.
+            if let (Some(body), Some(table)) = (body, self.damage_table.as_ref())
+                && let Some(part) = v.struck_key(body, at)
+                && let Some(own) = table.scale(part, key)
+            {
+                scale = own;
+            }
             if damage * scale > 0.0 {
                 // The part it struck takes the round's own damage (the
                 // table's scale is the whole vehicle's; invented).
-                if let Some(body) = f.physics.vehicle_transform(id) {
-                    v.hit_parts(body, from + dir * t, damage);
+                if let Some(body) = body {
+                    v.hit_parts(body, at, damage);
                 }
                 self.hurt_vehicle(f.physics, v, i, damage * scale);
             }
@@ -3571,11 +3607,11 @@ impl Combat {
     }
 
     fn fly(&mut self, f: &mut Field<'_>, dt: f32) {
-        let mut blasts: Vec<(Vec3, Option<Blast>)> = Vec::new();
+        let mut blasts: Vec<(Vec3, Option<Blast>, Option<u32>)> = Vec::new();
         self.fuses.retain_mut(|(at, left)| {
             *left -= dt;
             if *left <= 0.0 {
-                blasts.push((*at, None));
+                blasts.push((*at, None, None));
             }
             *left > 0.0
         });
@@ -3636,6 +3672,7 @@ impl Combat {
                 owner,
                 blast,
                 homing,
+                key,
             } => {
                 // Turning after the vehicle it locked on, no faster than its
                 // turn rate.
@@ -3655,7 +3692,7 @@ impl Combat {
                 let len = step.length();
                 let hit = cast_shot(f.physics, f.people, *at, step, len, None, *owner);
                 if let Some((d, _)) = hit {
-                    blasts.push((*at + step.normalize_or_zero() * d, *blast));
+                    blasts.push((*at + step.normalize_or_zero() * d, *blast, *key));
                     return false;
                 }
                 if *shell {
@@ -3666,7 +3703,7 @@ impl Combat {
                 *at += step;
                 *flown += len;
                 if *flown > ROCKET_RANGE {
-                    blasts.push((*at, *blast));
+                    blasts.push((*at, *blast, *key));
                     return false;
                 }
                 true
@@ -3681,14 +3718,14 @@ impl Combat {
                 let step = *velocity * dt;
                 let len = step.length();
                 if let Some((d, _)) = cast_shot(f.physics, f.people, *at, step, len, None, None) {
-                    blasts.push((*at + step.normalize_or_zero() * d, *blast));
+                    blasts.push((*at + step.normalize_or_zero() * d, *blast, None));
                     return false;
                 }
                 *at += step;
                 *flown += len;
                 // Into the sea, or never landing: it bursts there.
                 if f.physics.water().is_some_and(|w| at.y < w) || *flown > LOB_RANGE {
-                    blasts.push((*at, *blast));
+                    blasts.push((*at, *blast, None));
                     return false;
                 }
                 true
@@ -3720,14 +3757,14 @@ impl Combat {
                         m.life -= dt;
                         let armed = *timer <= 0.0;
                         if armed && near.iter().any(|p| p.distance(*at) < m.reach) {
-                            blasts.push((*at, m.blast));
+                            blasts.push((*at, m.blast, None));
                             return false;
                         }
                         // Its planted template's timer: it is gone, unexploded.
                         !(armed && m.life <= -m.arm)
                     }
                     None if *timer <= 0.0 => {
-                        blasts.push((*at, *blast));
+                        blasts.push((*at, *blast, None));
                         false
                     }
                     None => true,
@@ -3749,7 +3786,7 @@ impl Combat {
                 }
                 *fuse -= dt;
                 if *fuse <= 0.0 {
-                    blasts.push((*at, *blast));
+                    blasts.push((*at, *blast, None));
                     return false;
                 }
                 true
@@ -3764,8 +3801,8 @@ impl Combat {
         for (from, to) in streaks {
             self.effect(Effect::Tracer { from, to }, dt * 1.5);
         }
-        for (at, blast) in blasts {
-            self.explode_blast(f, at, blast);
+        for (at, blast, key) in blasts {
+            self.explode_keyed(f, at, blast, key);
         }
     }
 
@@ -3775,16 +3812,20 @@ impl Combat {
         self.burst(at, 1.0);
         self.show_fx(fx::GRENADE, at);
         let mut killed = false;
+        let key = Some(m2_assets::name_hash("Explosion"));
         for n in &mut f.people.npcs {
             let d = n.chest().distance(at);
             // Thrown out and up, harder the nearer.
             let near = (1.0 - d / REACH).max(0.0);
             let away = (n.chest() - at).with_y(0.0).normalize_or(Vec3::X);
             let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
+            // Each by their own row of the table (`Human` 1 of an
+            // `Explosion`, `HumanArmor` 0.5).
+            let own = self.on_person(n, key);
             if d < KILL {
-                killed |= n.hurt(1000.0, push) && n.soldier;
+                killed |= n.hurt(1000.0 * own, push) && n.soldier;
             } else if d < REACH {
-                killed |= n.hurt(100.0 * near, push) && n.soldier;
+                killed |= n.hurt(100.0 * near * own, push) && n.soldier;
                 n.panic(at);
             } else if d < REACH * 3.0 {
                 n.panic(at);
@@ -3818,7 +3859,7 @@ impl Combat {
             let (heart, edge, radius) = BLAST_ON_VEHICLE;
             if d < radius && !v.wrecked {
                 let damage = heart + (edge - heart) * d / radius;
-                v.blast_parts(body, at, radius, heart);
+                v.blast_parts(body, at, radius, |p| heart + (edge - heart) * p / radius);
                 self.hurt_vehicle(
                     f.physics,
                     v,
@@ -3934,6 +3975,20 @@ impl Combat {
     /// take their `ExplosionFudge` of it). Without one, the old blast
     /// ([`Combat::explode`]).
     fn explode_blast(&mut self, f: &mut Field<'_>, at: Vec3, blast: Option<Blast>) {
+        self.explode_keyed(f, at, blast, None);
+    }
+
+    /// [`explode_blast`](Self::explode_blast) of a round whose own
+    /// `DamageKey` is `key` (a rocket's `Rocket`): a vehicle part with a
+    /// key of its own at the blast's heart (a tank's weak point) has the
+    /// vehicle take [`DamageTable::weak_point`] times its share.
+    fn explode_keyed(
+        &mut self,
+        f: &mut Field<'_>,
+        at: Vec3,
+        blast: Option<Blast>,
+        key: Option<u32>,
+    ) {
         let Some(b) = blast else {
             self.explode(f, at);
             return;
@@ -3994,8 +4049,12 @@ impl Combat {
             let centre = body.transform_point3((lo + hi) * 0.5);
             let d = (centre.distance(at) - (hi - lo).max_element() * 0.25).max(0.0);
             if d < reach && !v.wrecked {
-                let damage = b.damage_at(d) * v.spec.tuning.blast_scale.unwrap_or(1.0);
-                v.blast_parts(body, at, reach, b.damage_at(0.0));
+                let weak = self.weak_point(v, body, at, key);
+                if weak != 1.0 {
+                    eprintln!("weak point: {} takes {weak:.1}x of the blast", v.spec.label);
+                }
+                let damage = b.damage_at(d) * v.spec.tuning.blast_scale.unwrap_or(1.0) * weak;
+                v.blast_parts(body, at, reach, |p| b.damage_at(p));
                 self.hurt_vehicle(f.physics, v, i, damage);
                 if v.wrecked {
                     let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
@@ -4019,9 +4078,15 @@ impl Combat {
         self.went_off.push(at);
         self.sounds.push(Sound::Bomb(at));
         let hers = self.hero_damage;
-        self.harm(f, at, BOMB, false, hers.explosion_large);
+        self.harm(f, at, BOMB, false, (hers.explosion_large, "ExplosionLarge"));
         self.show_fx(fx::BOMB, at);
-        self.harm(f, at + Vec3::Y, BOMB_FRAG, true, hers.bullet_large);
+        self.harm(
+            f,
+            at + Vec3::Y,
+            BOMB_FRAG,
+            true,
+            (hers.bullet_large, "BulletLarge"),
+        );
         self.effect(
             Effect::Fire {
                 at: at + Vec3::Y * 3.0,
@@ -4085,7 +4150,7 @@ impl Combat {
         });
         // The strikes' ordnance keys aren't read yet: an `Explosion`.
         let hers = self.hero_damage.explosion;
-        self.harm(f, at, (radius, damage), false, hers);
+        self.harm(f, at, (radius, damage), false, (hers, "Explosion"));
         self.show_fx(
             if radius >= BOMB.0 {
                 fx::BOMB
@@ -4125,7 +4190,7 @@ impl Combat {
     pub fn harm_at(&mut self, f: &mut Field<'_>, at: Vec3, radius: f32, damage: f32) {
         // Frag, as the satellite bomb's: a `BulletLarge`.
         let hers = self.hero_damage.bullet_large;
-        self.harm(f, at, (radius, damage), false, hers);
+        self.harm(f, at, (radius, damage), false, (hers, "BulletLarge"));
     }
 
     /// The bomb's final strike at `at`, after it lands.
@@ -4133,7 +4198,7 @@ impl Combat {
         self.went_off.push(at);
         self.sounds.push(Sound::Explosion(at));
         let hers = self.hero_damage.explosion_large;
-        self.harm(f, at, BOMB_FINAL, false, hers);
+        self.harm(f, at, BOMB_FINAL, false, (hers, "ExplosionLarge"));
         self.show_fx(fx::FINAL, at);
         self.effect(
             Effect::Fire {
@@ -4149,15 +4214,19 @@ impl Combat {
     /// stands between (the ground, walls, props) stops it. People are
     /// thrown and those near run, vehicles hit hard enough are wrecked
     /// and thrown, explosives within it go off. She takes `hers` of what
-    /// reaches her ([`HeroDamage`]).
+    /// reaches her ([`HeroDamage`]), each person what the damage table's
+    /// row for their `ModifierKey` gives of damage kind `key`
+    /// ([`on_person`](Self::on_person): a `HumanArmor` heavy half of an
+    /// `Explosion`).
     fn harm(
         &mut self,
         f: &mut Field<'_>,
         at: Vec3,
         (radius, damage): (f32, f32),
         cover: bool,
-        hers: f32,
+        (hers, key): (f32, &str),
     ) {
+        let key = Some(m2_assets::name_hash(key));
         let physics: &Physics = f.physics;
         let shielded = |to: Vec3| {
             let way = to - at;
@@ -4177,7 +4246,8 @@ impl Combat {
             let near = 1.0 - d / radius;
             let away = (chest - at).with_y(0.0).normalize_or(Vec3::X);
             let push = away * (BLAST_PUSH.0 * near + 3.0) + Vec3::Y * (BLAST_PUSH.1 * near + 2.0);
-            killed |= n.hurt(damage * near, push) && n.soldier;
+            let own = self.on_person(n, key);
+            killed |= n.hurt(damage * near * own, push) && n.soldier;
         }
         let her = (f.player.driving.is_none() && f.player.landed)
             .then(|| f.player.character.position + Vec3::Y)
@@ -4204,7 +4274,7 @@ impl Combat {
             }
             let scale = v.spec.tuning.blast_scale.unwrap_or(1.0);
             if let Some(body) = f.physics.vehicle_transform(id) {
-                v.blast_parts(body, at, radius, damage);
+                v.blast_parts(body, at, radius, |p| damage * (1.0 - p / radius));
             }
             self.hurt_vehicle(f.physics, v, i, damage * near * scale);
             if v.wrecked {
@@ -5017,6 +5087,7 @@ mod tests {
             damage: 0.0,
             parts: None,
             loose: Vec::new(),
+            debris_thrown: false,
         }];
         assert_eq!(vehicles[0].rounds(), Some(2));
         let mut player = Player::new(0.0, 0.0, 0.0, None);
