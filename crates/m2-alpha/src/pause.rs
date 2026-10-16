@@ -34,6 +34,9 @@
 //!   (`preopComplete(true, what)`): listing them (`listLoadGame`), the
 //!   engine first hands it each (`addSaveGame`); saving, it says the slot
 //!   (`saveGame` with its number).
+//! - Its keyboard and mouse table (Controls, Keyboard/Mouse): filled as
+//!   it starts, rebound a cell at a time, kept on Accept
+//!   ([`crate::keytable`]).
 //! - Leaving: its Resume (`closePause`) and Quit (`quitGame`) run the
 //!   scripts' handlers, which ask for the `ingame` and `unloading` game
 //!   states ([`News`]).
@@ -50,6 +53,9 @@
 //! Nothing from the executable.
 
 use m2_assets::flash::avm1::Value;
+
+use crate::input::Control;
+use crate::keytable::{KeyTable, ROWS};
 
 /// The menu movie's name.
 pub const MOVIE: &str = "pause_menu";
@@ -103,6 +109,8 @@ pub struct Settings {
     pub refresh: String,
     /// The saves to list on the save screen.
     pub saves: Vec<SaveEntry>,
+    /// The keyboard and mouse table ([`crate::keytable`]).
+    pub keys: KeyTable,
 }
 
 impl Default for Settings {
@@ -127,6 +135,7 @@ impl Default for Settings {
             resolution: String::new(),
             refresh: "60".into(),
             saves: Vec::new(),
+            keys: KeyTable::default(),
         }
     }
 }
@@ -185,6 +194,11 @@ pub struct News {
     pub sounds: Vec<String>,
     /// Settings the menu kept that play has nothing for, as `name=value`.
     pub unused: Vec<String>,
+    /// The keyboard table wants the next key or mouse button pressed
+    /// ([`Native::captured`]), or no longer does.
+    pub capture: Option<bool>,
+    /// The keyboard table accepted: bind as it says.
+    pub keys: Option<KeyTable>,
 }
 
 impl News {
@@ -198,6 +212,8 @@ impl News {
         self.volumes = later.volumes.or(self.volumes);
         self.sounds.extend(later.sounds);
         self.unused.extend(later.unused);
+        self.capture = later.capture.or(self.capture);
+        self.keys = later.keys.or(self.keys.take());
     }
 }
 
@@ -214,6 +230,10 @@ pub struct Native {
     /// The movie's settings play has nothing for (online, advanced
     /// video...), as it last reported them.
     other: std::collections::BTreeMap<String, String>,
+    /// The keyboard table as the movie shows it, and the cell (row,
+    /// column) waiting for a key.
+    keys: KeyTable,
+    waiting: Option<(usize, usize)>,
 }
 
 impl Native {
@@ -221,6 +241,7 @@ impl Native {
     pub fn reset(&mut self) {
         self.set_up = false;
         self.pending.clear();
+        self.stop_waiting();
     }
 
     /// What to call in the movie now, `settings` being play's: set up as
@@ -240,6 +261,9 @@ impl Native {
             // Its settings too: a movie the scripts start again
             // (`_FinishPauseOpen` restarts it) may not ask again.
             calls.extend(self.setting_calls());
+            // The keyboard table, filled before its screen counts the rows.
+            self.keys = settings.keys.clone();
+            calls.extend(self.key_calls());
         }
         calls.append(&mut self.pending);
         calls
@@ -272,8 +296,96 @@ impl Native {
                 self.pending.extend(self.controls_calls());
                 true
             }
+            "LTIInputKMEnter" | "LTIInputKMExit" => {
+                // As last accepted: what was changed and not accepted goes.
+                self.stop_waiting();
+                self.keys = self.settings.keys.clone();
+                self.pending.extend(self.key_calls());
+                self.pending.push(("LTIInputKMUpdateTable", Vec::new()));
+                true
+            }
+            "LTIInputKMChangeInput" => {
+                let Ok(cell) = arg.trim().parse::<usize>() else {
+                    return false;
+                };
+                let (row, column) = (cell % 100, cell / 100);
+                if row >= ROWS.len() || column > 1 {
+                    return false;
+                }
+                self.waiting = Some((row, column));
+                self.news.capture = Some(true);
+                true
+            }
+            "LTIInputKMCancelInput" => {
+                self.stop_waiting();
+                true
+            }
+            "LTIInputKMDefault" => {
+                self.stop_waiting();
+                self.keys = KeyTable::default();
+                self.pending.extend(self.key_calls());
+                self.pending.push(("LTIInputKMUpdateTable", Vec::new()));
+                true
+            }
+            "LTIInputKMApplyChanges" => {
+                self.stop_waiting();
+                self.settings.keys = self.keys.clone();
+                self.news.keys = Some(self.keys.clone());
+                true
+            }
             _ => false,
         }
+    }
+
+    /// The key or mouse button pressed while the keyboard table waited
+    /// for one: into its cell, or, Escape, the wait called off.
+    pub fn captured(&mut self, control: Control) {
+        let Some((row, column)) = self.waiting.take() else {
+            return;
+        };
+        self.news.capture = Some(false);
+        if control == Control::Key(winit::keyboard::KeyCode::Escape) {
+            self.pending.push(("LTIInputKMCancel", Vec::new()));
+            return;
+        }
+        for r in self.keys.set(row, column, control.into()) {
+            self.pending.extend(self.row_calls(r).into_iter().skip(1));
+        }
+        self.pending
+            .push(("LTIFinishedGettingInput", vec![Value::Bool(false)]));
+        self.pending.push(("LTIInputKMUpdateTable", Vec::new()));
+    }
+
+    /// The keyboard table no longer waits for a key.
+    fn stop_waiting(&mut self) {
+        if self.waiting.take().is_some() {
+            self.news.capture = Some(false);
+        }
+    }
+
+    /// Row `row` of the keyboard table, into the movie: its name, then its
+    /// primary and secondary keys.
+    fn row_calls(&self, row: usize) -> [Call; 3] {
+        let n = Value::Number(row as f64);
+        [
+            (
+                "LTIInputKMSetActionName",
+                vec![n.clone(), text(ROWS[row].name)],
+            ),
+            (
+                "LTIInputKMKeyMap",
+                vec![n.clone(), Value::Bool(false), text(&self.keys.text(row, 0))],
+            ),
+            (
+                "LTIInputKMKeyMap",
+                vec![n, Value::Bool(true), text(&self.keys.text(row, 1))],
+            ),
+        ]
+    }
+
+    /// The whole keyboard table, into the movie.
+    fn key_calls(&self) -> Vec<Call> {
+        (0..ROWS.len()).flat_map(|r| self.row_calls(r)).collect()
     }
 
     fn item_changed(&mut self, arg: &str) -> bool {
@@ -526,6 +638,99 @@ fn save_args(s: &SaveEntry) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use winit::keyboard::KeyCode;
+
+    fn texts(call: &Call) -> Vec<String> {
+        call.1
+            .iter()
+            .map(|v| match v {
+                Value::Str(s) => s.to_string(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_keyboard_table_is_filled_as_the_movie_starts() {
+        let mut n = Native::default();
+        let calls = n.calls(&Settings::default());
+        let rows: Vec<_> = calls
+            .iter()
+            .filter(|c| c.0 == "LTIInputKMSetActionName")
+            .collect();
+        assert_eq!(rows.len(), 24);
+        assert_eq!(texts(rows[0]), ["0", "[SHELL.PCShell.MoveForward]"]);
+        let keys: Vec<Vec<String>> = calls
+            .iter()
+            .filter(|c| c.0 == "LTIInputKMKeyMap")
+            .map(texts)
+            .collect();
+        assert_eq!(keys.len(), 48);
+        assert_eq!(keys[10], ["5", "false", "TAB"]);
+        assert_eq!(keys[11], ["5", "true", "MWHEEL"]);
+        assert_eq!(keys[1], ["0", "true", crate::keytable::EMPTY]);
+    }
+
+    #[test]
+    fn a_cell_takes_the_next_key_and_accept_binds_it() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        assert!(n.library("LTIInputKMEnter", ""));
+        // Jump's secondary cell (row 11, column 2 in the movie: + 100).
+        assert!(n.library("LTIInputKMChangeInput", "111"));
+        assert_eq!(n.take_news().capture, Some(true));
+        n.calls(&s);
+        n.captured(Control::Key(KeyCode::KeyQ));
+        assert_eq!(n.take_news().capture, Some(false));
+        let calls = n.calls(&s);
+        assert!(calls.iter().any(|c| texts(c) == ["11", "true", "Q"]));
+        assert_eq!(
+            names(calls)[2..],
+            ["LTIFinishedGettingInput", "LTIInputKMUpdateTable"]
+        );
+        assert!(n.library("LTIInputKMApplyChanges", ""));
+        let kept = n.take_news().keys.unwrap();
+        let mut b = crate::input::Bindings::default();
+        kept.apply(&mut b);
+        assert_eq!(
+            b.0[&crate::input::Action::MoveUp],
+            vec![KeyCode::Space.into(), KeyCode::KeyQ.into()]
+        );
+    }
+
+    #[test]
+    fn escape_calls_the_wait_off_and_leaving_drops_what_was_not_accepted() {
+        let mut n = Native::default();
+        let s = Settings::default();
+        n.calls(&s);
+        assert!(n.library("LTIInputKMChangeInput", "0"));
+        n.captured(Control::Key(KeyCode::Escape));
+        assert_eq!(names(n.calls(&s)), ["LTIInputKMCancel"]);
+        assert!(n.library("LTIInputKMChangeInput", "0"));
+        n.captured(Control::Key(KeyCode::KeyP));
+        n.calls(&s);
+        assert!(n.library("LTIInputKMExit", ""));
+        let calls = n.calls(&s);
+        assert!(calls.iter().any(|c| texts(c) == ["0", "false", "W"]));
+        assert!(n.take_news().keys.is_none());
+        assert!(!n.library("LTIInputKMChangeInput", "250"));
+    }
+
+    #[test]
+    fn defaults_put_the_games_table_back() {
+        let mut n = Native::default();
+        let mut s = Settings::default();
+        s.keys
+            .set(0, 0, crate::keytable::Slot::Control(KeyCode::KeyP.into()));
+        n.calls(&s);
+        assert!(n.library("LTIInputKMDefault", ""));
+        let calls = n.calls(&s);
+        assert!(calls.iter().any(|c| texts(c) == ["0", "false", "W"]));
+        assert_eq!(names(calls).last(), Some(&"LTIInputKMUpdateTable"));
+    }
 
     fn names(calls: Vec<Call>) -> Vec<&'static str> {
         calls.into_iter().map(|c| c.0).collect()

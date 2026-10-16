@@ -544,6 +544,9 @@ pub struct HudState {
     /// The player's settings and saves, for the pause menu's movie
     /// ([`crate::pause`]).
     pub pause_settings: crate::pause::Settings,
+    /// Keys and mouse buttons pressed while the pause menu's keyboard
+    /// table waited for one ([`crate::pause::News::capture`]).
+    pub pause_captured: Vec<crate::input::Control>,
     /// Her binoculars are up: what their screen shows
     /// ([`crate::binoculars`]).
     pub binoculars: Option<binoculars::View>,
@@ -749,6 +752,8 @@ impl HudState {
         keys.extend(later.keys.iter().copied());
         let mut buttons = std::mem::take(&mut self.buttons);
         buttons.extend(later.buttons.iter().cloned());
+        let mut pause_captured = std::mem::take(&mut self.pause_captured);
+        pause_captured.extend(later.pause_captured.iter().copied());
         hurts.extend(later.hurts.iter().copied());
         messages.extend(later.messages.iter().cloned());
         hud_calls.extend(later.hud_calls.iter().cloned());
@@ -760,6 +765,7 @@ impl HudState {
             gui_calls,
             keys,
             buttons,
+            pause_captured,
             ..later
         };
     }
@@ -2046,6 +2052,10 @@ impl Thread {
                 log.push(format!("pda: stick {stick:?} ({took:?})"));
             }
             self.pda_stick = stick;
+        }
+        for &c in &state.pause_captured {
+            log.push(format!("pause: the keyboard table takes {c:?}"));
+            self.pause_native.captured(c);
         }
         self.pause_calls(state, &mut log);
         self.play_flash(dt, &mut log);
