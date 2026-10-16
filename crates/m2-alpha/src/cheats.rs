@@ -1,5 +1,5 @@
 //! The test cheat menu (F7, with the developer's keys: `--dev`, or a test
-//! launch): any hand weapon, any vehicle and any support item, each from
+//! launch; or [`CODE`] typed in play, in any launch): any hand weapon, any vehicle and any support item, each from
 //! the game's own lists, and the usual helpers (god mode, infinite ammo,
 //! money, a teleport).
 //!
@@ -80,6 +80,37 @@ impl Tab {
             Tab::Support => "Support",
             Tab::Player => "Player",
         }
+    }
+}
+
+/// The code typed in play that puts the menu up without `--dev`
+/// (invented: the PC game has no cheat code for its menu).
+pub const CODE: &str = "MERCS";
+
+/// Watches the letters typed in play for [`CODE`].
+#[derive(Clone, Debug, Default)]
+pub struct CodeWatch {
+    typed: String,
+}
+
+impl CodeWatch {
+    /// One key pressed: a letter joins what was typed, anything else
+    /// starts it over. True when the letters typed last spell [`CODE`]
+    /// (and starts over).
+    pub fn key(&mut self, letter: Option<char>) -> bool {
+        let Some(c) = letter.filter(char::is_ascii_alphabetic) else {
+            self.typed.clear();
+            return false;
+        };
+        self.typed.push(c.to_ascii_uppercase());
+        if self.typed.len() > CODE.len() {
+            self.typed.remove(0);
+        }
+        let done = self.typed == CODE;
+        if done {
+            self.typed.clear();
+        }
+        done
     }
 }
 
@@ -615,6 +646,24 @@ mod tests {
             person: false,
             human: false,
         }
+    }
+
+    #[test]
+    fn the_code_opens_the_menu_once_spelled_in_a_row() {
+        let mut w = CodeWatch::default();
+        let typed =
+            |w: &mut CodeWatch, s: &str| s.chars().map(|c| w.key(Some(c))).collect::<Vec<_>>();
+        // Letters before it (walking about) don't matter.
+        assert_eq!(
+            typed(&mut w, "wasdmercs"),
+            [false, false, false, false, false, false, false, false, true]
+        );
+        // Spelled again, it opens again.
+        assert_eq!(typed(&mut w, "MERCS").last(), Some(&true));
+        // A key that isn't a letter in between starts it over.
+        typed(&mut w, "MER");
+        assert!(!w.key(None));
+        assert_eq!(typed(&mut w, "CS"), [false, false]);
     }
 
     #[test]

@@ -5022,6 +5022,10 @@ struct Running {
     dev: bool,
     /// The cheat menu's god mode and infinite ammo ([`cheats::keep_up`]).
     cheats: cheats::Toggles,
+    /// The letters typed in play, for the cheat menu's code ([`cheats::CODE`]).
+    cheat_code: cheats::CodeWatch,
+    /// The code was typed: the cheat menu comes up on the next frame.
+    cheat_typed: bool,
 }
 
 struct App {
@@ -5163,6 +5167,8 @@ impl App {
             buttons: Vec::new(),
             dev: self.dev,
             cheats: cheats::Toggles::default(),
+            cheat_code: cheats::CodeWatch::default(),
+            cheat_typed: false,
         };
         running.apply_options(&self.config);
         Ok(running)
@@ -5805,8 +5811,10 @@ impl Running {
             let unlock = config.enhanced.shop.unlock_all;
             self.show_shop(0, unlock);
         }
-        // The cheat menu is a developer's key: taken either way.
-        if self.input.take_pressed(Action::Cheats) && !self.hud.menu && self.dev {
+        // The cheat menu: a developer's key (taken either way), or its
+        // code typed in play by anyone.
+        let typed = std::mem::take(&mut self.cheat_typed);
+        if (self.input.take_pressed(Action::Cheats) && self.dev || typed) && !self.hud.menu {
             self.show_cheats();
         }
         if self.hud.menu {
@@ -6017,6 +6025,13 @@ impl ApplicationHandler for App {
                     state.buttons.push("selection".into());
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && state.cheat_code.key(input::letter(code))
+                    {
+                        eprintln!("cheats: code typed");
+                        state.cheat_typed = true;
+                    }
                     state.input.key(
                         &self.config.keys,
                         code,

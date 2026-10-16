@@ -1834,12 +1834,17 @@ impl Fleet {
             })
             .filter(|(_, g, models)| !ai_flown(&w, *g, models))
             .collect();
-        // Those the scripts still have in play count against the most.
-        let live = self
-            .requested
-            .iter()
-            .filter(|g| w.objects.get(g).is_some_and(|o| o.alive))
-            .count();
+        // Those the scripts still have in play near her count against the
+        // most: the first contract's boats and jeeps, kilometres behind
+        // her, mustn't keep the villa's tank from loading (playtest 4).
+        let live = in_play_near(
+            self.requested
+                .iter()
+                .filter_map(|g| w.objects.get(g))
+                .filter(|o| o.alive)
+                .map(|o| Vec3::from(o.position)),
+            near,
+        );
         drop(w);
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
         let w = mission.world().borrow();
@@ -1854,6 +1859,15 @@ impl Fleet {
             game.scene.load_vehicle(g, models);
         }
     }
+}
+
+/// How many of the loaded vehicles at `positions` count against
+/// [`MAX_VEHICLES`]: those within [`VEHICLE_REACH`] of `near`.
+fn in_play_near(positions: impl IntoIterator<Item = Vec3>, near: Vec3) -> usize {
+    positions
+        .into_iter()
+        .filter(|p| p.distance(near) <= VEHICLE_REACH)
+        .count()
 }
 
 /// A ray from the camera that stops this far short of an object (metres)
@@ -3161,6 +3175,22 @@ mod tests {
             kind: kind.into(),
             label: label.into(),
         }
+    }
+
+    #[test]
+    fn only_the_vehicles_near_her_count_against_the_most() {
+        // Playtest 4: 37 loaded from the first contract, 4 km behind her
+        // at the villa, left no room for the tank.
+        let villa = Vec3::new(2625.0, -13.0, -953.0);
+        let island = Vec3::new(-1500.0, 0.0, 600.0);
+        let far = std::iter::repeat_n(island, 37);
+        assert_eq!(in_play_near(far.clone(), villa), 0);
+        let near = std::iter::repeat_n(villa + Vec3::X * 50.0, 3);
+        assert_eq!(in_play_near(far.chain(near), villa), 3);
+        assert_eq!(
+            in_play_near([villa + Vec3::Z * (VEHICLE_REACH + 1.0)], villa),
+            0
+        );
     }
 
     #[test]

@@ -38,6 +38,17 @@ const LEFT_APART: f32 = 0.7;
 /// (invented: its `Vehicle Entrance (_Default)` gives a hardpoint, no
 /// reach).
 pub const MAN_REACH: f32 = 2.0;
+/// Manning one, she stands this far behind its pivot, metres (invented:
+/// its entrance hardpoint isn't read yet; playtest 4 had her fire it from
+/// wherever she stood, beside it).
+pub const MAN_BEHIND: f32 = 0.8;
+
+/// Where she stands to man a gun turning about `pivot`, facing `facing`
+/// (radians, 0 along +Z), her feet at height `feet_y`: behind it.
+pub fn stand_behind(pivot: Vec3, facing: f32, feet_y: f32) -> Vec3 {
+    let ahead = Vec3::new(facing.sin(), 0.0, facing.cos());
+    (pivot - ahead * MAN_BEHIND).with_y(feet_y)
+}
 /// The keys of what a placed crate leaves (its entity in the low bits,
 /// which stay below `0x2000_0000`; the leaving's place in bits 29-30):
 /// apart from crates' guids and soldiers' drops (`0x7000_0000 + n`).
@@ -525,6 +536,16 @@ pub fn leavings(templates: &Templates, t: u32) -> Vec<Leaves> {
 mod tests {
     use super::*;
     use m2_engine::pickup::{CASH, EQUIPMENT, HEALTH, Leavings, PickupInfo};
+
+    #[test]
+    fn she_mans_a_gun_from_behind_it() {
+        // A gun facing +Z at the origin: she stands on -Z, on her feet.
+        let at = stand_behind(Vec3::new(0.0, 1.1, 0.0), 0.0, -0.2);
+        assert!((at - Vec3::new(0.0, -0.2, -MAN_BEHIND)).length() < 1e-5);
+        // Facing +X: she stands on -X.
+        let at = stand_behind(Vec3::ZERO, std::f32::consts::FRAC_PI_2, 0.0);
+        assert!((at - Vec3::new(-MAN_BEHIND, 0.0, 0.0)).length() < 1e-5);
+    }
 
     fn info(kind: u32, heals: u32, gives: Vec<(u32, u32)>) -> PickupInfo {
         PickupInfo {

@@ -275,6 +275,16 @@ fn control_name(control: Control) -> String {
     }
 }
 
+/// The letter a letter key types (`KeyM`: `M`), for typed codes.
+pub fn letter(key: KeyCode) -> Option<char> {
+    let name = format!("{key:?}");
+    let mut rest = name.strip_prefix("Key")?.chars();
+    match (rest.next(), rest.next()) {
+        (Some(c), None) if c.is_ascii_alphabetic() => Some(c),
+        _ => None,
+    }
+}
+
 /// A key's name as written on it: `P`, `1`, `Shift`, `F11`.
 fn key_name(key: KeyCode) -> String {
     use KeyCode::*;
@@ -692,6 +702,15 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn only_letter_keys_type_letters() {
+        assert_eq!(letter(KeyCode::KeyM), Some('M'));
+        assert_eq!(letter(KeyCode::KeyZ), Some('Z'));
+        assert_eq!(letter(KeyCode::Digit1), None);
+        assert_eq!(letter(KeyCode::Space), None);
+        assert_eq!(letter(KeyCode::F7), None);
     }
 
     #[test]

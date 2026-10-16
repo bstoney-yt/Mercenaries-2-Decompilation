@@ -100,6 +100,29 @@ pub struct Crasher {
     pub mass: f32,
 }
 
+/// Whether a vehicle runs into what is under `key`: its body touched it,
+/// else its box overlaps its collision (`boxed`), or, for what has no
+/// collision (a bush), its drawn box (`drawn_meets`, [`Crasher::meets`]).
+fn runs_into(
+    world: &World,
+    boxed: &[StaticKey],
+    touched: &[StaticKey],
+    key: StaticKey,
+    drawn_meets: impl FnOnce() -> bool,
+) -> bool {
+    met(
+        touched.contains(&key),
+        world.physics.has_static(key).then(|| boxed.contains(&key)),
+        drawn_meets,
+    )
+}
+
+/// [`runs_into`]'s rule: `collision` is whether the box overlaps its
+/// collision, `None` for what has none.
+fn met(touched: bool, collision: Option<bool>, drawn_meets: impl FnOnce() -> bool) -> bool {
+    touched || collision.unwrap_or_else(drawn_meets)
+}
+
 impl Crasher {
     /// Whether its box meets a model's box (`bounds`, model space) placed
     /// at `at`, for one its body hasn't touched (a bush with no
@@ -609,6 +632,10 @@ impl Destruction {
         let (lo, hi) = vehicle.bounds;
         let middle = vehicle.place.transform_point3((lo + hi) * 0.5);
         let radius = (hi - lo).length() * 0.5;
+        // The collision its box overlaps: for what has collision (a
+        // tree's trunk), that, not its drawn box (a tree's canopy reaches
+        // over the road: playtest 4).
+        let boxed = world.physics.statics_in_box(vehicle.place, vehicle.bounds);
         let mut out = Vec::new();
         for (i, _) in world.near(middle, radius) {
             if self.destroyed.contains(&i) || world.destroyed.contains(&i) {
@@ -620,7 +647,7 @@ impl Destruction {
             };
             let key = StaticKey::Object(i);
             let at = Mat4::from_rotation_translation(o.rotation, o.position);
-            if !touched.contains(&key) && !vehicle.meets(at, m.bounds) {
+            if !runs_into(world, &boxed, touched, key, || vehicle.meets(at, m.bounds)) {
                 continue;
             }
             // Broken a part at a time: put up as a prop, its parts break
@@ -671,7 +698,7 @@ impl Destruction {
             };
             let (template, model, position) = (p.template, p.model, p.position);
             let key = StaticKey::Entity(e);
-            if !touched.contains(&key) && !vehicle.meets(at, bounds) {
+            if !runs_into(world, &boxed, touched, key, || vehicle.meets(at, bounds)) {
                 continue;
             }
             // What breaks a part at a time (a hedge's sections, a gate's
@@ -1017,6 +1044,22 @@ mod tests {
             velocity: Vec3::new(0.0, 0.0, 8.0),
             mass: 1000.0,
         }
+    }
+
+    #[test]
+    fn a_tree_with_collision_goes_over_only_when_its_trunk_is_met() {
+        // A jeep 2 m from a trunk, inside the tree's 8 m canopy box: the
+        // canopy's box meets it, the trunk's collision doesn't.
+        let tree = (Vec3::new(-4.0, 0.0, -4.0), Vec3::new(4.0, 10.0, 4.0));
+        let at = Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0));
+        let canopy = || jeep(Vec3::ZERO).meets(at, tree);
+        assert!(canopy());
+        assert!(!met(false, Some(false), canopy));
+        assert!(met(false, Some(true), canopy));
+        assert!(met(true, Some(false), canopy));
+        // A bush with no collision: its drawn box decides.
+        assert!(met(false, None, canopy));
+        assert!(!met(false, None, || false));
     }
 
     #[test]

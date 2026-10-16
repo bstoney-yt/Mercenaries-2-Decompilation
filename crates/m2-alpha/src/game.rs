@@ -522,6 +522,19 @@ impl Game {
             if let Some(p) = self.scene.player.as_mut() {
                 p.binoculars = None;
             }
+            // In a vehicle the weapon switch picks its gun: the main gun or
+            // the machine gun.
+            if input.take_pressed(Action::SwitchWeapon) {
+                self.combat.vehicle_gun = (self.combat.vehicle_gun + 1) % 2;
+                eprintln!(
+                    "vehicle: {} chosen",
+                    if self.combat.vehicle_gun == 1 {
+                        "machine gun"
+                    } else {
+                        "main gun"
+                    }
+                );
+            }
             self.camera.update(input, config, mouse_look, dt);
             self.step(Intent::default(), dt);
         }
@@ -755,8 +768,13 @@ impl Game {
                                 m.pitch.0.to_degrees(),
                                 m.pitch.1.to_degrees()
                             );
-                            // Where she stands, facing the way it does.
+                            // Behind it, facing the way it does.
                             player.facing = m.facing;
+                            player.character.position = crate::placed::stand_behind(
+                                m.pivot,
+                                m.facing,
+                                player.character.position.y,
+                            );
                             self.combat.manned = Some(m);
                         }
                         None => {
@@ -764,8 +782,9 @@ impl Game {
                             // Seated: she no longer waits to land (people
                             // wait on that, and she may have hopped out and
                             // back in before the ground streamed).
-                            if player.driving.is_some() {
+                            if let Some(i) = player.driving {
                                 player.landed = true;
+                                take_seat(&mut scene.vehicles[i]);
                             }
                         }
                     }
@@ -2822,6 +2841,17 @@ fn shown_name(
         .unwrap_or_else(|| format!("{t:#x}"))
 }
 
+/// She gets into `v`'s driver's seat: whoever drove it is put out (its
+/// crew forgets them: playtest 4, no car could be taken from traffic).
+fn take_seat(v: &mut ParkedVehicle) {
+    let before = v.crew.len();
+    v.crew
+        .retain(|(seat, _)| !seat.to_ascii_lowercase().contains("driver"));
+    if v.crew.len() < before {
+        eprintln!("hijack: she takes the {} from its driver", v.spec.label);
+    }
+}
+
 /// The vehicle nearest her within `reach` metres of its door marker (or its
 /// hull, for those without one).
 fn nearest(
@@ -2835,12 +2865,10 @@ fn nearest(
         .iter()
         .enumerate()
         .filter(|(_, v)| !v.wrecked)
-        // One with someone in the driver's seat is hijacked, not got into.
-        .filter(|(_, v)| {
-            !v.crew
-                .iter()
-                .any(|(seat, _)| seat.to_ascii_lowercase().contains("driver"))
-        })
+        // One with someone in the driver's seat is taken from them: the
+        // action hijacks (tanks, helicopters) took the key first if near
+        // ([`crate::hijack`]); cars, bikes and jeeps have none in the data
+        // and are got into, the driver put out ([`take_seat`]).
         .filter_map(|(i, v)| {
             let at = physics.vehicle_transform(v.id?)?;
             let local = at.inverse() * p.extend(1.0);
