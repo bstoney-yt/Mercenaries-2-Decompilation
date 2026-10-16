@@ -73,7 +73,7 @@
 //! 0x6A  u16       texture count n
 //! 0x6C  u32 x n   texture asset name hashes (0 = none)
 //!       u32       probably a shader or technique id
-//!       u32       unknown (0x959d8470 so far)
+//!       u32       surface: the name hash of what it is made of (`GENERIC`, `METAL`, ...)
 //! ```
 //!
 //! Group `INFO` (0x3C bytes on MESH and TINY, 0x38 on SKIN):
@@ -403,8 +403,18 @@ pub struct Material {
     pub textures: Vec<u32>,
     /// Probably a shader or technique id.
     pub technique: u32,
-    /// Trailing field; 0x959d8470 so far.
-    pub unk_tail: u32,
+    /// What the surface is made of, as the name hash of an upper-case word
+    /// (`GENERIC` 0x959d8470, `METAL`, `CONCRETE`, `WOOD`, `TERRAIN_DIRT`,
+    /// ...): what a round striking it throws up
+    /// (`m2_engine::surface`).
+    ///
+    /// From samples: over the 16,161 materials of `vz.wad`'s 3,007 models
+    /// the word takes 31 values; 18 hash to such words (13 unnamed); the
+    /// template database's `DamageChunks` records key
+    /// their decals by the same hashes (`3ddecal_dirt` for `DIRT`,
+    /// `SAND`, `GRASS` and the three `TERRAIN_` grounds). Terrain cells'
+    /// materials carry it too.
+    pub surface: u32,
 }
 
 /// One `SEGM` entry: a geometry slot placed at a node.
@@ -1670,7 +1680,7 @@ pub(crate) fn read_material(r: &mut Reader<'_>) -> Result<Material, OutOfBounds>
         flags,
         textures,
         technique: r.u32()?,
-        unk_tail: r.u32()?,
+        surface: r.u32()?,
     })
 }
 

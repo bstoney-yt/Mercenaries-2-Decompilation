@@ -74,6 +74,10 @@ pub struct CollisionShape {
     /// (`_PropPhysics`: a café chair, a planter), whose mass it is given
     /// ([`Loose::weighing`]).
     pub whole: Option<Arc<Loose>>,
+    /// What its triangles are made of ([`crate::surface`]): runs of
+    /// (first triangle, surface name hash) in triangle order; empty when
+    /// nothing says (surface 0).
+    pub surfaces: Arc<[(u32, u32)]>,
 }
 
 impl fmt::Debug for CollisionShape {
@@ -550,31 +554,57 @@ impl CollisionShape {
             stand_in: false,
             loose: None,
             whole: None,
+            surfaces: Arc::new([]),
         }
     }
 
     /// A triangle mesh; `None` if it has no valid triangle.
     pub fn mesh(vertices: &[Vec3], triangles: &[[u32; 3]]) -> Option<Self> {
+        Self::mesh_of(vertices, triangles, &[])
+    }
+
+    /// A triangle mesh whose triangles are made of `surfaces`, one per
+    /// triangle (surface 0 past its end); `None` if it has no valid
+    /// triangle.
+    pub fn mesh_of(vertices: &[Vec3], triangles: &[[u32; 3]], surfaces: &[u32]) -> Option<Self> {
         let n = vertices.len() as u32;
-        let triangles: Vec<[u32; 3]> = triangles
-            .iter()
-            .copied()
-            .filter(|t| t.iter().all(|&i| i < n) && t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
-            .collect();
-        if triangles.is_empty() || vertices.iter().any(|v| !v.is_finite()) {
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        let mut kept: Vec<[u32; 3]> = Vec::with_capacity(triangles.len());
+        for (k, t) in triangles.iter().enumerate() {
+            if !(t.iter().all(|&i| i < n) && t[0] != t[1] && t[1] != t[2] && t[0] != t[2]) {
+                continue;
+            }
+            let s = surfaces.get(k).copied().unwrap_or(0);
+            if runs.last().is_none_or(|r| r.1 != s) {
+                runs.push((kept.len() as u32, s));
+            }
+            kept.push(*t);
+        }
+        if kept.is_empty() || vertices.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        let count = triangles.len();
+        if runs.iter().all(|r| r.1 == 0) {
+            runs.clear();
+        }
+        let count = kept.len();
         let shape =
-            r::SharedShape::trimesh(vertices.iter().map(|&v| vector(v)).collect(), triangles)
-                .ok()?;
+            r::SharedShape::trimesh(vertices.iter().map(|&v| vector(v)).collect(), kept).ok()?;
         Some(Self {
             shape,
             triangles: count,
             stand_in: false,
             loose: None,
             whole: None,
+            surfaces: runs.into(),
         })
+    }
+
+    /// What triangle `face` is made of (a surface name hash; 0 for none
+    /// known). Faces past the triangle count wrap round.
+    pub fn surface_of(&self, face: u32) -> u32 {
+        let face = face % (self.triangles.max(1) as u32);
+        let k = self.surfaces.partition_point(|r| r.0 <= face);
+        k.checked_sub(1).map_or(0, |k| self.surfaces[k].1)
     }
 
     /// The box the shape fills, in its own space.
@@ -639,6 +669,7 @@ impl CollisionShape {
     ) -> Option<Self> {
         let mut vertices = Vec::new();
         let mut triangles = Vec::new();
+        let mut surfaces = Vec::new();
         let mut loose = None;
         // Shapes of its own, whether or not any stands in the way: no
         // stand-in then.
@@ -722,6 +753,11 @@ impl CollisionShape {
                         })
                     };
                     for range in group.material_ranges.iter().filter(|r| solid(r.material)) {
+                        let surface = model
+                            .materials
+                            .get(range.material as usize)
+                            .map_or(0, |m| m.surface);
+                        let before = triangles.len();
                         triangles.extend(
                             group
                                 .triangles(range)
@@ -729,11 +765,16 @@ impl CollisionShape {
                                 .filter(|t| t.iter().all(|&i| mine(i)))
                                 .map(|t| t.map(|i| first + u32::from(i))),
                         );
+                        surfaces.resize(surfaces.len() + triangles.len() - before, surface);
                     }
                 }
             }
+        } else {
+            // Its shapes say nothing of what they are made of: they take
+            // the surface most of its solid drawn area has (inferred).
+            surfaces = vec![drawn_surface(model, lod); triangles.len()];
         }
-        let shape = Self::mesh(&vertices, &triangles)?;
+        let shape = Self::mesh_of(&vertices, &triangles, &surfaces)?;
         let whole = match (&loose, sub_object) {
             (None, None) => Loose::whole(model, shape.bounds()).map(Arc::new),
             _ => None,
@@ -745,6 +786,51 @@ impl CollisionShape {
             ..shape
         })
     }
+}
+
+/// The surface ([`m2_assets::model::Material::surface`]) of most of a
+/// model's solid drawn area at `lod` (or its next level drawn); 0 for a
+/// model drawing nothing solid.
+pub fn drawn_surface(model: &Model<'_>, lod: u32) -> u32 {
+    let lod = (lod..model.info.lod_count.max(lod + 1))
+        .find(|&l| model.has_lod(l))
+        .unwrap_or(lod);
+    let mut area: Vec<(u32, f32)> = Vec::new();
+    for (_, geometry) in model.lod(lod) {
+        for group in &geometry.groups {
+            let Some(pos) = group
+                .decl
+                .find(DeclUsage::Position, 0)
+                .and_then(|e| group.vertices.read(e))
+            else {
+                continue;
+            };
+            let at = |i: u16| {
+                pos.get(usize::from(i))
+                    .map_or(Vec3::ZERO, |p| Vec3::new(p[0], p[1], p[2]))
+            };
+            for range in &group.material_ranges {
+                let Some(m) = model.materials.get(range.material as usize) else {
+                    continue;
+                };
+                if m.flags & NOT_SOLID != 0 {
+                    continue;
+                }
+                let a: f32 = group
+                    .triangles(range)
+                    .into_iter()
+                    .map(|[a, b, c]| (at(b) - at(a)).cross(at(c) - at(a)).length() * 0.5)
+                    .sum();
+                match area.iter_mut().find(|e| e.0 == m.surface) {
+                    Some(e) => e.1 += a,
+                    None => area.push((m.surface, a)),
+                }
+            }
+        }
+    }
+    area.into_iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or(0, |e| e.0)
 }
 
 /// Material flags of surfaces nothing stands on or bumps into: additive
@@ -1063,6 +1149,8 @@ pub struct Physics {
     statics: HashMap<StaticKey, r::ColliderHandle>,
     /// What each static collider belongs to.
     keys: HashMap<r::ColliderHandle, StaticKey>,
+    /// What each static's triangles are made of ([`CollisionShape::surfaces`]).
+    surfaces: HashMap<r::ColliderHandle, CollisionShape>,
     controller: KinematicCharacterController,
     vehicles: Vec<Option<VehicleBody>>,
     ragdolls: Vec<Option<Ragdoll>>,
@@ -1121,6 +1209,7 @@ impl Physics {
             world: r::PhysicsWorld::default(),
             statics: HashMap::new(),
             keys: HashMap::new(),
+            surfaces: HashMap::new(),
             controller,
             vehicles: Vec::new(),
             ragdolls: Vec::new(),
@@ -1155,11 +1244,15 @@ impl Physics {
         let handle = self.world.insert_collider(collider, None);
         self.statics.insert(key, handle);
         self.keys.insert(handle, key);
+        if !shape.surfaces.is_empty() {
+            self.surfaces.insert(handle, shape.clone());
+        }
     }
 
     pub fn remove_static(&mut self, key: StaticKey) {
         if let Some(h) = self.statics.remove(&key) {
             self.keys.remove(&h);
+            self.surfaces.remove(&h);
             self.world.remove_collider(h);
         }
     }
@@ -2475,6 +2568,29 @@ impl Physics {
         Some((hit.time_of_impact, vec3(hit.normal), key))
     }
 
+    /// [`cast_ray_keyed`](Self::cast_ray_keyed), with what the triangle it
+    /// strikes is made of (a surface name hash, [`crate::surface`]; 0 for
+    /// none known or not a static).
+    pub fn cast_ray_surface(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max: f32,
+    ) -> Option<(f32, Vec3, Option<StaticKey>, u32)> {
+        let ray = r::Ray::new(vector(origin), vector(direction.normalize_or_zero()));
+        let (handle, hit) = self
+            .world
+            .query_pipeline_with_filter(solid())
+            .cast_ray_and_get_normal(&ray, max, true)?;
+        let key = self.keys.get(&handle).copied();
+        // A triangle mesh names the triangle struck as the hit's sub-shape.
+        let surface = self
+            .surfaces
+            .get(&handle)
+            .map_or(0, |shape| shape.surface_of(hit.subshape));
+        Some((hit.time_of_impact, vec3(hit.normal), key, surface))
+    }
+
     /// [`cast_ray`](Self::cast_ray) that passes through the statics whose
     /// keys `skip` picks: the ground under a building that is coming down.
     pub fn cast_ray_skipping(
@@ -2573,6 +2689,54 @@ mod tests {
             Vec3::new(x, y, z),
             Quat::IDENTITY,
         );
+    }
+
+    #[test]
+    fn meshes_keep_their_triangles_surfaces_past_dropped_ones() {
+        let v = [Vec3::ZERO, Vec3::X, Vec3::Z, Vec3::new(1.0, 0.0, 1.0)];
+        // The second triangle is degenerate and dropped; the runs follow
+        // the triangles kept.
+        let shape =
+            CollisionShape::mesh_of(&v, &[[0, 1, 2], [0, 0, 1], [1, 3, 2]], &[7, 8, 9]).unwrap();
+        assert_eq!(shape.triangles, 2);
+        assert_eq!(&shape.surfaces[..], &[(0, 7), (1, 9)]);
+        assert_eq!((shape.surface_of(0), shape.surface_of(1)), (7, 9));
+        // Past the count, faces wrap round.
+        assert_eq!(shape.surface_of(3), 9);
+        // Nothing said, nothing kept.
+        assert!(
+            CollisionShape::mesh(&v, &[[0, 1, 2]])
+                .unwrap()
+                .surfaces
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rays_find_the_surface_of_the_triangle_they_strike() {
+        let mut p = Physics::new();
+        // Two halves of a 4 m floor: dirt on the -x side, rock on the +x.
+        let v = [
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(0.0, 0.0, -2.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Vec3::new(-2.0, 0.0, 2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+        ];
+        let tris = [[0, 2, 1], [0, 3, 2], [1, 2, 5], [1, 5, 4]];
+        let shape = CollisionShape::mesh_of(&v, &tris, &[11, 11, 22, 22]).unwrap();
+        p.add_static(StaticKey::Cell(5), &shape, Vec3::ZERO, Quat::IDENTITY);
+        p.step(DT);
+        let down =
+            |p: &Physics, x: f32| p.cast_ray_surface(Vec3::new(x, 3.0, 0.5), Vec3::NEG_Y, 10.0);
+        let (t, _, key, surface) = down(&p, -1.0).unwrap();
+        assert!((t - 3.0).abs() < 1e-3);
+        assert_eq!((key, surface), (Some(StaticKey::Cell(5)), 11));
+        assert_eq!(down(&p, 1.0).unwrap().3, 22);
+        p.remove_static(StaticKey::Cell(5));
+        p.step(DT);
+        assert!(down(&p, 1.0).is_none());
     }
 
     fn walk(physics: &Physics, c: &mut Character, velocity: Vec3, seconds: f32) {
@@ -3841,6 +4005,7 @@ mod tests {
             stand_in: false,
             loose: None,
             whole: None,
+            surfaces: Arc::new([]),
         };
         let base = Vec3::new(0.0, 0.0, 12.0);
         p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);

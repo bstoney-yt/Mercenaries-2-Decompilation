@@ -30,6 +30,7 @@ pub mod pickup;
 pub mod population;
 pub mod scatter;
 pub mod stream;
+pub mod surface;
 pub mod technique;
 pub mod tuning;
 pub mod vehicle;

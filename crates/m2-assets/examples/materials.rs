@@ -411,13 +411,13 @@ fn run(path: &str, name_files: &[String]) -> AnyResult<()> {
         };
         for m in &model.materials {
             material_names.insert(m.name_hash);
-            tails.add(format!("{:08x}", m.unk_tail));
+            tails.add(format!("{:08x}", m.surface));
             by_flags
                 .entry(m.flags)
                 .or_default()
                 .add(&textures, m, &names);
             by_tail
-                .entry(m.unk_tail)
+                .entry(m.surface)
                 .or_default()
                 .add(&textures, m, &names);
             for &t in &m.textures {

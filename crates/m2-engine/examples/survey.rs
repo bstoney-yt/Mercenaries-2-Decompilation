@@ -3598,7 +3598,7 @@ fn print_model_materials(names: &Names, got: &Gathered, model: &Model<'_>) {
             m.technique,
             names.show(m.technique),
             m.flags,
-            m.unk_tail
+            m.surface
         );
         println!("      constants {}", constants.join(" "));
         for (s, &t) in m.textures.iter().enumerate() {
