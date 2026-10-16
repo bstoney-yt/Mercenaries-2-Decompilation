@@ -2177,6 +2177,17 @@ impl Physics {
             .map_or(0.0, |v| v.controller.current_vehicle_speed)
     }
 
+    /// The forward gear a wheeled vehicle's engine drives in (0 is first)
+    /// and how fast that engine turns in it, rpm; `None` without an
+    /// engine from its template.
+    pub fn vehicle_gear(&self, id: VehicleId) -> Option<(usize, f32)> {
+        let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
+        let e = v.engine?;
+        let speed = v.controller.current_vehicle_speed.abs();
+        let gear = e.gear(speed);
+        Some((gear, e.rpm_at(e.gears[gear], speed)))
+    }
+
     /// Makes a vehicle a wreck: burst tyres and bent axles no longer carry
     /// it, so it drops onto its rims and belly and scrapes to a stop
     /// instead of rolling on.
@@ -3710,6 +3721,8 @@ mod tests {
             torque: 130.0,
             rpm: (900.0, 3000.0, 12000.0),
             upshift: 4000.0,
+            downshift: 2500.0,
+            clutch_delay: 0.0,
             primary: 3.5,
             gears: [4.0, 3.1, 2.4, 2.0, 1.5],
             reverse: 3.7,

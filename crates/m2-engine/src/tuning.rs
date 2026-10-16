@@ -216,8 +216,15 @@ pub struct EngineTuning {
     /// Engine speeds, rpm: idle, the most torque, the most it turns
     /// (`GearMinRPM` 900, `GearOptRPM` 3,000, `GearMaxRPM` 12,000).
     pub rpm: (f32, f32, f32),
-    /// It changes up a gear above this, rpm (`GearUpshiftRPM` 4,000).
+    /// It changes up a gear above this, rpm (`GearUpshiftRPM` 4,000),
+    /// and down one below this (`GearDownshiftRPM` 2,500; 1,500 to
+    /// 5,500 over the 454 records).
     pub upshift: f32,
+    pub downshift: f32,
+    /// How long a change of gear takes, seconds, the engine driving
+    /// nothing meanwhile (`ClutchDelayTime` 0; 0 in 307 of the 454
+    /// records, up to 1.75).
+    pub clutch_delay: f32,
     /// The final drive's ratio (`GearRatioPrimary` 3.5), each forward
     /// gear's (`GearRatio1`..`5`: 4, 3.1, 2.4, 2, 1.5; a 0 is no gear)
     /// and reverse's (`GearRatioReverse` 3.7).
@@ -882,6 +889,8 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                         torque: f("EngineTorque")?,
                         rpm: (f("GearMinRPM")?, f("GearOptRPM")?, f("GearMaxRPM")?),
                         upshift: f("GearUpshiftRPM")?,
+                        downshift: f("GearDownshiftRPM").unwrap_or(0.0).max(0.0),
+                        clutch_delay: f("ClutchDelayTime").unwrap_or(0.0).max(0.0),
                         primary: f("GearRatioPrimary")?,
                         gears: [
                             gear("GearRatio1"),
@@ -1164,6 +1173,8 @@ mod tests {
             torque: 130.0,
             rpm: (900.0, 3000.0, 12000.0),
             upshift: 4000.0,
+            downshift: 2500.0,
+            clutch_delay: 0.0,
             primary: 3.5,
             gears: [4.0, 3.1, 2.4, 2.0, 1.5],
             reverse: 3.7,
