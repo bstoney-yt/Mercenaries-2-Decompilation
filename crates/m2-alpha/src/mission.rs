@@ -2418,6 +2418,48 @@ pub(crate) fn pickup(templates: &Templates, id: u32) -> Option<Leaves> {
     })
 }
 
+/// How she takes a pickup lying within reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// As she walks over it, unworded.
+    Walk,
+    /// With the use key, worded "Take Ammo": its ammunition only.
+    TakeAmmo,
+    /// With the use key, worded "Equip <its name>": the weapon taken up
+    /// in place of one of hers.
+    Equip,
+}
+
+/// How she takes pickup `what`, as the real game's footage shows it
+/// (playtest 3; inferred, no `Pickup` field found to say it): what has a
+/// health record (`Health Pickup`, and `Ammo Pickup (Small)`, which heals
+/// 3) is walked over (3:32, health 62 to 100); a weapon she doesn't carry
+/// is "Equip Assault Rifle" (3:14, 14:20, 15:24); one she carries, and an
+/// ammunition box without health (`Ammo Pickup (Bullet)`, the rockets),
+/// "Take Ammo" (9:00, 9:42, 15:38, 16:36).
+pub(crate) fn offer(templates: &Templates, combat: &combat::Combat, what: &Leaves) -> Offer {
+    if what.weapon.is_some() {
+        let is = |t: Option<u32>| t.is_some() && (t == what.gun || t == Some(what.template));
+        let carries =
+            is(combat.rifle.template) || (combat.second.is_some() && is(combat.launcher.template));
+        return if carries {
+            Offer::TakeAmmo
+        } else {
+            Offer::Equip
+        };
+    }
+    let heals = templates
+        .leavings
+        .pickups
+        .get(&what.template)
+        .is_some_and(|p| p.heals > 0);
+    if heals || what.health > 0.0 {
+        Offer::Walk
+    } else {
+        Offer::TakeAmmo
+    }
+}
+
 /// Whether a `Pickup` record's ammunition `ammo` is for weapon template
 /// `weapon`, which fires `fires` (its `AmmoTemplate`), by the links the
 /// templates give: it is that ammunition, or the weapon itself (or one of
@@ -2726,6 +2768,52 @@ mod tests {
         // Called back (as `MissionLink::hud_callback` does): no longer.
         lua.load("__m2_hud_callbacks[1] = nil").exec().unwrap();
         assert_eq!(waiting_fanfare(&lua), None);
+    }
+
+    #[test]
+    fn health_and_small_boxes_are_walked_over_and_the_rest_worded() {
+        use m2_engine::pickup::{AMMUNITION, HEALTH, Leavings, PickupInfo};
+        let info = |kind, heals, gives: Vec<(u32, u32)>| PickupInfo {
+            kind,
+            radius: 1.0,
+            ammo: None,
+            rounds: 0,
+            walked: gives.clone(),
+            gives,
+            heals,
+            cue: None,
+            effect: None,
+        };
+        // The PC data's `Health Pickup` (50), `Ammo Pickup (Small)` (3
+        // rounds and 3 health), `Ammo Pickup (Bullet)` (20 rounds).
+        let (health, small, bullet) = (0x8000_6ea9, 0x8000_a286, 0x8000_233e);
+        let db = Templates {
+            leavings: Leavings {
+                pickups: HashMap::from([
+                    (health, info(HEALTH, 50, Vec::new())),
+                    (small, info(AMMUNITION, 3, vec![(0x8000_4375, 3)])),
+                    (bullet, info(AMMUNITION, 0, vec![(0x8000_4375, 20)])),
+                ]),
+                ..Leavings::default()
+            },
+            ..Templates::default()
+        };
+        let mut combat = combat::Combat::default();
+        let lying = |template, weapon: Option<Weapon>| Leaves {
+            template,
+            weapon,
+            ..Leaves::default()
+        };
+        assert_eq!(offer(&db, &combat, &lying(health, None)), Offer::Walk);
+        assert_eq!(offer(&db, &combat, &lying(small, None)), Offer::Walk);
+        assert_eq!(offer(&db, &combat, &lying(bullet, None)), Offer::TakeAmmo);
+        // A soldier's `Assault Rifle`: "Equip" over her carbine, "Take
+        // Ammo" once she carries one.
+        let ak = lying(0x8000_436f, Some(Weapon::Rifle));
+        combat.rifle.template = Some(0x8000_af91);
+        assert_eq!(offer(&db, &combat, &ak), Offer::Equip);
+        combat.rifle.template = Some(0x8000_436f);
+        assert_eq!(offer(&db, &combat, &ak), Offer::TakeAmmo);
     }
 
     #[test]

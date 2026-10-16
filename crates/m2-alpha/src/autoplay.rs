@@ -472,8 +472,14 @@ impl Autoplay {
                 .flights
                 .pickups()
                 .iter()
+                // What the layers place she leaves to the player: going out
+                // of her way for each would keep her from the contract.
+                // (Cheapest first: there are hundreds placed.)
                 .filter(|p| {
-                    wanted(templates, &game.combat, p) && !self.left_lying.contains(&p.key())
+                    !game.placed.is_pickup(p.from)
+                        && p.at.distance(here) < OPEN_NEAR
+                        && !self.left_lying.contains(&p.key())
+                        && wanted(templates, &game.combat, p)
                 })
                 .map(|p| (p.key(), p.at.distance(here)))
                 .filter(|&(_, d)| d < OPEN_NEAR)
@@ -767,10 +773,15 @@ impl Autoplay {
             if press {
                 self.pressed = 0.0;
             }
-            // A rifle lying there is walked over for its rounds, not taken
-            // up in place of hers ([`wanted`]).
+            // A rifle lying there is taken for its rounds ("Take Ammo"),
+            // not taken up in place of hers ([`wanted`]).
+            let templates = game.scene.world.as_ref().map(|w| &w.index.template_db);
+            let swap = p.what.weapon == Some(Weapon::Rifle)
+                && templates.is_none_or(|t| {
+                    crate::mission::offer(t, &game.combat, &p.what) == crate::mission::Offer::Equip
+                });
             return Intent {
-                use_pressed: press && p.what.weapon != Some(Weapon::Rifle),
+                use_pressed: press && !swap,
                 ..Intent::default()
             };
         }
@@ -1659,6 +1670,13 @@ fn wanted(templates: &Templates, combat: &Combat, p: &crate::flights::Pickup) ->
     match p.what.weapon {
         Some(w) if p.from == 0 => combat.second != Some(w) && !combat.second_loaded(),
         Some(w) if w != Weapon::Rifle => combat.second != Some(w),
+        // A rifle she doesn't carry gives nothing short of taking it up.
+        Some(_)
+            if crate::mission::offer(templates, combat, &p.what)
+                == crate::mission::Offer::Equip =>
+        {
+            false
+        }
         _ => {
             let refill = crate::mission::refill(templates, combat, &p.what);
             combat.can_use(refill, p.what.health)
