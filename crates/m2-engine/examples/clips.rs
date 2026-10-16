@@ -3,8 +3,11 @@
 //! whether the feet leave the ground, how fast the body moves.
 //!
 //! ```text
-//! cargo run --release -p m2-engine --example clips -- "<install dir>" [model hash] > clips.tsv
+//! cargo run --release -p m2-engine --example clips -- "<install dir>" [model hash] [hash,hash,...] > clips.tsv
 //! ```
+//!
+//! The clips listed last also have both hands traced at their start, a
+//! quarter, half and three quarters in, and their end (stderr, "trace").
 //!
 //! Prints one tab-separated row per clip to stdout and, to stderr, the
 //! blocks holding animations and the best candidates for a shouldered
@@ -68,6 +71,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(h) => u32::from_str_radix(h.trim_start_matches("0x"), 16)?,
         None => DEFAULT_MODEL,
     };
+    // Clips (comma-separated hashes) whose hands are traced at five
+    // moments, to stderr.
+    let trace: Vec<u32> = args
+        .get(2)
+        .map(|s| {
+            s.split(',')
+                .filter_map(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                .collect()
+        })
+        .unwrap_or_default();
     let install = Install::find(Path::new(root))?;
     let mut source = install.open_world()?;
     let skeleton = Skeleton::from_nodes(&source.model(model)?.parse()?.nodes);
@@ -196,6 +209,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             spread = spread.max(origin(&m[rh]).distance(origin(&m[lh])));
         }
         let mid = at(d * 0.5);
+        if trace.contains(&c.hash) {
+            for k in 0..=4 {
+                let m = at(d * k as f32 / 4.0);
+                let (r, l) = (from_root(&m, rh), from_root(&m, lh));
+                eprintln!(
+                    "trace {:08x} {:3}%: rh up {:5.2} fwd {:5.2} side {:5.2}  lh up {:5.2} fwd {:5.2} side {:5.2}",
+                    c.hash,
+                    k * 25,
+                    r.x,
+                    r.y,
+                    r.z,
+                    l.x,
+                    l.y,
+                    l.z
+                );
+            }
+        }
         let top = mid
             .iter()
             .map(|m| origin(m).y)

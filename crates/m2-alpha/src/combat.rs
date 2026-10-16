@@ -161,6 +161,10 @@ pub struct Rifle {
     /// launchers) and from how far.
     pub flight: Flight,
     pub lock_on: Option<(f32, f32)>,
+    /// Its `Equipment` carry class (name hash: `Rifle`, `Pistol`,
+    /// `Rocket`), which picks the clips she holds it with; `None` read as
+    /// a rifle's in the rifle's place and a rocket's in the launcher's.
+    pub class: Option<u32>,
 }
 
 impl Default for Rifle {
@@ -180,6 +184,7 @@ impl Default for Rifle {
             ammo: None,
             flight: Flight::Round,
             lock_on: None,
+            class: None,
         }
     }
 }
@@ -230,6 +235,7 @@ impl Rifle {
             ammo: Some(spec.ammo),
             flight: spec.flight(),
             lock_on: spec.lock_on,
+            class: spec.class,
         }
     }
 
@@ -1918,6 +1924,27 @@ impl Combat {
         }
     }
 
+    /// The weapon up in her hands as her clips see it: its carry class
+    /// and the side of her back it hangs on (the rifle's right, the
+    /// launcher's left; [`slung`](Self::slung)).
+    pub fn in_hand(&self) -> crate::held::InHand {
+        use crate::held::{InHand, Side};
+        use m2_assets::animation_table::RIFLE;
+        match self.weapon {
+            Weapon::Rifle => InHand {
+                class: self.rifle.class.unwrap_or(RIFLE),
+                side: Side::Right,
+            },
+            _ => InHand {
+                class: self
+                    .launcher
+                    .class
+                    .unwrap_or_else(|| m2_assets::name_hash("rocket")),
+                side: Side::Left,
+            },
+        }
+    }
+
     /// Whether the weapon in the launcher's place can fire: the RPG
     /// always, a grenade launcher with rounds left.
     pub fn second_loaded(&self) -> bool {
@@ -2075,6 +2102,7 @@ impl Combat {
             _ => {}
         }
         f.player.launcher = self.weapon == Weapon::Rpg;
+        f.player.in_hand = self.in_hand();
         self.change_clip(trigger, on_foot, dt);
         // A grenade leaves her hand at its moment in the throw; knocked
         // down or in a vehicle by then, she never let go.
