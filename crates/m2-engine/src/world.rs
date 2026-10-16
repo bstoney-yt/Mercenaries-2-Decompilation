@@ -2116,6 +2116,9 @@ pub struct TerrainMesh {
     pub indices: Vec<u32>,
     /// What each range is drawn with.
     pub surfaces: Vec<TerrainSurface>,
+    /// What the ground of each of `surfaces` is made of: its material's
+    /// surface word ([`crate::surface`]; 0 for none).
+    pub made_of: Vec<u32>,
     /// (first index, index count, index into `surfaces`), one per surface
     /// used, back to back over `indices`.
     pub ranges: Vec<(u32, u32, usize)>,
@@ -2172,7 +2175,15 @@ impl TerrainMesh {
             .chunks_exact(3)
             .map(|t| [t[0], t[1], t[2]])
             .collect();
-        self.collision = CollisionShape::mesh(&self.positions(), &triangles);
+        let mut surfaces = vec![0; triangles.len()];
+        for &(first, count, s) in &self.ranges {
+            let made_of = self.made_of.get(s).copied().unwrap_or(0);
+            let (a, b) = ((first / 3) as usize, ((first + count) / 3) as usize);
+            if let Some(run) = surfaces.get_mut(a..b.min(triangles.len())) {
+                run.fill(made_of);
+            }
+        }
+        self.collision = CollisionShape::mesh_of(&self.positions(), &triangles, &surfaces);
     }
 
     pub fn vertex_desc(&self) -> VertexBufferDesc {
@@ -2472,6 +2483,7 @@ pub fn terrain_cell<R: Read + Seek>(
     })?;
     let mut mesh = TerrainMesh::empty(centre);
     mesh.surfaces = cell.materials.iter().map(cell_surface).collect();
+    mesh.made_of = cell.materials.iter().map(|m| m.material.surface).collect();
     // Groups drawn without a material range use the cell's plain ground.
     let fallback = mesh.surfaces.len();
     mesh.surfaces.push(TerrainSurface::Ground {
@@ -2717,6 +2729,14 @@ mod tests {
         assert_eq!(mesh.ranges, vec![(0, 6 + 4 * 12, 0)]);
         assert_eq!(mesh.bounds.0.y, -2.0);
         assert!(mesh.indices.iter().all(|&i| i < 8));
+        // The ground's collision is made of what its range's material is.
+        mesh.made_of = vec![m2_assets::name_hash("TERRAIN_DIRT")];
+        mesh.build_collision();
+        let collision = mesh.collision.as_ref().unwrap();
+        assert_eq!(
+            &collision.surfaces[..],
+            &[(0, m2_assets::name_hash("TERRAIN_DIRT"))]
+        );
     }
 
     #[test]

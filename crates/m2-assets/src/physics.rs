@@ -28,7 +28,8 @@
 //!   hkpMoppBvTreeShape      +0x10 hkpMoppCode *, +0x34 child shape *
 //!   WpMeshShape16           +0x18 f32 radius, +0x1C hkArray of 0x30-byte
 //!                           subparts {f32x4 origin, f32x4 scale,
-//!                           hkArray<u16 a, b, c, flags> triangles,
+//!                           hkArray<u16 a, b, c, flags> triangles (flags 0 on
+//!                           all 1,040,652 triangles: no surface),
 //!                           hkArray<u16> unknown (vertex subset)}
 //!
 //! then, offsets from the start of PHY2, 0xFFFFFFFF for none:
@@ -167,6 +168,8 @@ pub enum Geometry {
     Mesh {
         vertices: Vec<[f32; 3]>,
         triangles: Vec<[u32; 3]>,
+        /// Each triangle's fourth `u16`, after its three indices.
+        flags: Vec<u16>,
     },
 }
 
@@ -448,6 +451,7 @@ impl Physics {
                     let sdata = p.section(subs)?.data;
                     let mut vertices = Vec::new();
                     let mut triangles = Vec::new();
+                    let mut flags = Vec::new();
                     for j in 0..nsub {
                         let sp = sub_at + 0x30 * j;
                         let mut r = Reader::at(sdata, sp);
@@ -459,7 +463,7 @@ impl Physics {
                         let mut r = Reader::at(p.section(ts)?.data, ta);
                         for _ in 0..nt {
                             let t = [r.u16()?, r.u16()?, r.u16()?];
-                            r.u16()?;
+                            flags.push(r.u16()?);
                             let mut tri = [0u32; 3];
                             for (out, &q) in tri.iter_mut().zip(&t) {
                                 if u32::from(q) >= pool_n {
@@ -486,6 +490,7 @@ impl Physics {
                         Geometry::Mesh {
                             vertices,
                             triangles,
+                            flags,
                         },
                     )
                 }
@@ -588,6 +593,7 @@ impl Geometry {
             Self::Mesh {
                 vertices,
                 triangles,
+                ..
             } => (vertices.clone(), triangles.clone()),
             Self::Sphere => capsule([0.0; 3], [0.0; 3], radius),
             Self::Capsule { a, b } => capsule(*a, *b, radius),
@@ -986,11 +992,13 @@ mod tests {
         let Geometry::Mesh {
             vertices,
             triangles,
+            flags,
         } = &p.shapes[2].geometry
         else {
             panic!()
         };
         assert_eq!(triangles, &[[0, 1, 2], [2, 1, 3]]);
+        assert_eq!(flags.len(), triangles.len());
         assert_eq!(vertices[1], [11.0, 0.0, -5.0]);
         assert_eq!(vertices[3], [11.0, 1.0, -1.0]);
         assert_eq!(p.shapes[2].radius, 0.01);
