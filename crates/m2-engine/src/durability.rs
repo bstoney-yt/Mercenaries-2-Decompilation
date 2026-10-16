@@ -132,6 +132,40 @@ pub fn crashable(db: &Layer<'_>) -> HashMap<u32, Crash> {
         .collect()
 }
 
+/// Each template whose `PhysicsPropertyCrashable` records name nodes of
+/// its model (their `Name`, a node's name hash): the parts a vehicle
+/// breaks one at a time, by id, each named node with how it breaks. A
+/// long hedge's sections each have one (`_global_env_hedgelong`: four,
+/// flattened); so do a gate's two leaves (`_pmcoutpost_gate`: broken by
+/// a vehicle of 950 kg or more). A record naming no node, beside named
+/// ones, is left to [`crashable`]. PC data; that a vehicle breaks only
+/// the parts it runs into is from the footage (the real game's jeep
+/// leaves a hedge's other sections standing, playtest 3, 11:40-12:14).
+pub fn crash_parts(db: &Layer<'_>) -> HashMap<u32, Vec<(u32, Crash)>> {
+    let crash = Table::new(db, "PhysicsPropertyCrashable");
+    let name = name_hash("Name");
+    crash
+        .templates()
+        .filter_map(|id| {
+            let parts: Vec<(u32, Crash)> = crash
+                .of_template(id)
+                .iter()
+                .filter_map(|r| {
+                    let node = crash.word(r, name).filter(|&n| n != 0)?;
+                    let how = match crash.word(r, CRASH_HOW).unwrap_or(0) {
+                        1 => CrashHow::KnockedOver,
+                        2 => CrashHow::Flattened,
+                        _ => CrashHow::Breaks,
+                    };
+                    let takes = crash.float(r, CRASH_TAKES).unwrap_or(0.0).max(0.0);
+                    Some((node, Crash { how, takes }))
+                })
+                .collect();
+            (!parts.is_empty()).then_some((id, parts))
+        })
+        .collect()
+}
+
 /// Each template's `SoundKey`, by id, where it isn't zero: the sound its
 /// objects make as they break (`_global_fencewoodpanel`'s `286115a2`,
 /// `prop_sheetmetal_sml`; the chain-link fences' `16117a0b`,
@@ -150,6 +184,109 @@ pub fn sound_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
         .collect()
 }
 
+/// `_PropPhysics`'s field read as a flag (name unknown; 1 on 102
+/// templates' records only for the heavy ones: shipping containers
+/// (20,000 kg), dumpsters, fuel and propane tanks (10,000 kg), the
+/// explosive barrel, car ruins (1,000 to 2,000 kg), the large cash case;
+/// 0 on chairs, benches, planters, boxes, barrels, barricades). PC
+/// survey `breakables`, round 6; from samples.
+const PROP_HEAVY: u32 = 0xeca7_c282;
+
+/// A template whose objects are loose physics props (`_PropPhysics`,
+/// against `_BuildingPhysics` for what stands fixed): chairs, benches,
+/// café tables, planters, boxes, barrels, barricades, trash, dumpsters,
+/// containers. They move when hit, as their `ModifierKey` row of the
+/// damage table says what breaks them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PropPhysics {
+    /// Kilograms (`Mass`), where it gives one: 0 or -1 on most (the
+    /// game's own default then, which the data doesn't give).
+    pub mass: Option<f32>,
+    /// [`PROP_HEAVY`] set: one of the heavy props.
+    pub heavy: bool,
+}
+
+/// What a physics prop weighs when its `Mass` doesn't say (0 or -1, on
+/// most), kg: the game's own default isn't in the data. Invented: a light
+/// prop's 50 (a chair, a crate; the data's own masses run 20 to 200 for
+/// such), a heavy one's 2,000 (as the car ruins').
+const PROP_KG: f32 = 50.0;
+const HEAVY_KG: f32 = 2000.0;
+
+impl PropPhysics {
+    /// Its mass, kg: its own, else [`PROP_KG`] or [`HEAVY_KG`].
+    pub fn kg(&self) -> f32 {
+        self.mass
+            .unwrap_or(if self.heavy { HEAVY_KG } else { PROP_KG })
+    }
+}
+
+/// Each template's `_PropPhysics`, by id.
+pub fn prop_physics(db: &Layer<'_>) -> HashMap<u32, PropPhysics> {
+    let t = Table::new(db, "_PropPhysics");
+    let mass = name_hash("Mass");
+    t.templates()
+        .filter_map(|id| {
+            let r = t.of_template(id).first()?;
+            Some((
+                id,
+                PropPhysics {
+                    mass: t.float(r, mass).filter(|m| m.is_finite() && *m > 0.0),
+                    heavy: t.word(r, PROP_HEAVY) == Some(1),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Each template's `ModifierKey` (its field of that name, a name hash:
+/// `PropFragile`, `Prop`, `Fence`, `Shack`, `Car`, `Tank`, ...), by id:
+/// the damage table's row for what its objects take of each kind of
+/// damage (on 1,083 templates).
+pub fn modifier_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = Table::new(db, "ModifierKey");
+    let field = name_hash("ModifierKey");
+    t.templates()
+        .filter_map(|id| Some((id, t.word(t.of_template(id).first()?, field)?)))
+        .collect()
+}
+
+/// How hard a vehicle of `mass` (kg) running into something at `speed`
+/// (m/s) hits it, before the damage table scales it by what it hits (its
+/// `ModifierKey` row) and the vehicle's kind of damage ([`RAM_KIND`]): a
+/// tonne at a metre a second does 1, so a 2,000 kg Valiant at 10 m/s does
+/// 20 and a 32,000 kg tank at 8 m/s 256. Invented: the data gives the kind
+/// of a ram's damage and what each thing takes of it, not its size.
+pub fn ram(mass: f32, speed: f32) -> f32 {
+    mass * speed / 1000.0
+}
+
+/// A ram's kind of damage where its vehicle's template names none: `Car`,
+/// the damage table's column every vehicle template that names a
+/// `DamageKey` of its own names (survey `runover`).
+pub const RAM_KIND: &str = "Car";
+
+/// What a vehicle of `mass` (kg) whose ram is of kind `key` (a name hash:
+/// `Car`, `Tank`) does to a person whose `ModifierKey` row is `row`
+/// (`Human`, `HumanArmor`, `Hero`), running into them at `speed` (m/s):
+/// its [`ram`] times the damage table's cell. A `Human` takes three times a
+/// `Car`'s and twice a `Tank`'s, a `HumanArmor` once either, the `Hero`
+/// a fifth. A row or column the table lacks takes the `Human` row's, then
+/// the ram itself.
+pub fn run_over(
+    table: &crate::tuning::DamageTable,
+    row: u32,
+    key: u32,
+    mass: f32,
+    speed: f32,
+) -> f32 {
+    let scale = table
+        .scale(row, key)
+        .or_else(|| table.scale(name_hash("Human"), key))
+        .unwrap_or(1.0);
+    ram(mass, speed) * scale
+}
+
 /// A blast's reach and damage (`Explosive`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Explosion {
@@ -159,11 +296,56 @@ pub struct Explosion {
     pub damage: f32,
     /// At its edge (`minDamage`).
     pub least: f32,
+    /// Its template's `DamageKey` (name hash; 0 for none): the damage
+    /// table's column for what each thing it reaches takes of it (the
+    /// RPG's blast `Explosion`, its frag `Bullet`, the air strike's bomb
+    /// `ExplosionLarge`).
+    pub kind: u32,
+}
+
+/// Each template's `DamageKey` (name hash), by id, where it isn't 0.
+pub fn damage_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
+    let t = Table::new(db, "DamageKey");
+    let field = name_hash("DamageKey");
+    t.templates()
+        .filter_map(|id| {
+            let k = t.word(t.of_template(id).first()?, field)?;
+            (k != 0).then_some((id, k))
+        })
+        .collect()
+}
+
+/// What a projectile does where it lands (`ProjectilePhysics`'s `Damage`)
+/// and of which kind (its `DamageKey`): the `RPG Rocket`'s 100 `Rocket`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Projectile {
+    pub damage: f32,
+    pub kind: u32,
+}
+
+/// Each template's projectile, by id: those with `ProjectilePhysics`.
+pub fn projectiles(db: &Layer<'_>) -> HashMap<u32, Projectile> {
+    let t = Table::new(db, "ProjectilePhysics");
+    let damage = name_hash("Damage");
+    let keys = damage_keys(db);
+    t.templates()
+        .filter_map(|id| {
+            let r = t.of_template(id).first()?;
+            Some((
+                id,
+                Projectile {
+                    damage: t.float(r, damage).unwrap_or(0.0),
+                    kind: keys.get(&id).copied().unwrap_or(0),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Each template's blast, by id: those with `Explosive`.
 pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
     let t = Table::new(db, "Explosive");
+    let keys = damage_keys(db);
     let (radius, damage, least) = (
         name_hash("radius"),
         name_hash("Damage"),
@@ -178,8 +360,56 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
                     radius: t.float(r, radius).unwrap_or(0.0),
                     damage: t.float(r, damage).unwrap_or(0.0),
                     least: t.float(r, least).unwrap_or(0.0),
+                    kind: keys.get(&id).copied().unwrap_or(0),
                 },
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A ram is a tonne a metre a second, times the table's cell for the
+    // person's row and the vehicle's kind; a row the table lacks takes the
+    // `Human` row's.
+    #[test]
+    fn a_run_over_is_the_ram_times_the_tables_cell() {
+        let (human, hero, car) = (name_hash("Human"), name_hash("Hero"), name_hash(RAM_KIND));
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(2);
+        put(1);
+        put(human);
+        put(hero);
+        put(car);
+        put(3.0f32.to_bits());
+        put(0.2f32.to_bits());
+        let table = crate::tuning::DamageTable::parse(&data).expect("table");
+        assert_eq!(ram(2000.0, 10.0), 20.0);
+        assert_eq!(run_over(&table, human, car, 2000.0, 10.0), 60.0);
+        assert!((run_over(&table, hero, car, 2000.0, 10.0) - 4.0).abs() < 1e-5);
+        assert_eq!(run_over(&table, 0x1234, car, 2000.0, 10.0), 60.0);
+        assert_eq!(run_over(&table, human, 0x1234, 2000.0, 10.0), 20.0);
+    }
+
+    #[test]
+    fn a_prop_weighs_its_own_mass_else_a_light_or_heavy_default() {
+        let planter = PropPhysics {
+            mass: Some(200.0),
+            heavy: false,
+        };
+        assert_eq!(planter.kg(), 200.0);
+        let chair = PropPhysics {
+            mass: None,
+            heavy: false,
+        };
+        assert_eq!(chair.kg(), PROP_KG);
+        let dumpster = PropPhysics {
+            mass: None,
+            heavy: true,
+        };
+        assert_eq!(dumpster.kg(), HEAVY_KG);
+    }
 }

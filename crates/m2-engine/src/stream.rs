@@ -250,6 +250,7 @@ fn batch_members<R: std::io::Read + std::io::Seek>(
                 Some(MemberShape {
                     shape,
                     placed: Some((member.position, member.rotation)),
+                    entity,
                 })
             })
         });
@@ -257,6 +258,7 @@ fn batch_members<R: std::io::Read + std::io::Seek>(
             CollisionShape::for_sub_object(batch, i as u32, 0).map(|shape| MemberShape {
                 shape,
                 placed: None,
+                entity,
             })
         });
         out.extend(shape);
@@ -587,6 +589,15 @@ pub struct World {
     /// Placed objects taken off the island ([`take`](Self::take)): what is
     /// left of them is drawn elsewhere (a building that came down).
     taken: HashSet<usize>,
+    /// Placed objects whose standing collision was taken away
+    /// ([`take_static`](Self::take_static)): destroyed, in nobody's way.
+    felled: HashSet<usize>,
+    /// Placed objects that are also a building of a merged batch, with
+    /// the batch's placed object and the building's place in it: its
+    /// collision there ([`StaticKey::Member`]) goes with its own.
+    member_of: HashMap<usize, (usize, usize)>,
+    /// The other way: each such building's placed object.
+    member_object: HashMap<(usize, usize), usize>,
     /// Full-detail cells and placed models as static colliders. Step it
     /// each tick; colliders added by [`update`](Self::update) join scene
     /// queries on the next step.
@@ -718,6 +729,9 @@ impl World {
             loose: HashMap::new(),
             knocked: HashMap::new(),
             taken: HashSet::new(),
+            felled: HashSet::new(),
+            member_of: HashMap::new(),
+            member_object: HashMap::new(),
             physics: Physics::new(),
             foliage_logged: std::time::Instant::now(),
             hidden: std::env::var("M2_HIDE")
@@ -765,8 +779,8 @@ impl World {
         let Some(loose) = self.loose.get(&o.model).cloned() else {
             return false;
         };
-        self.physics.remove_static(StaticKey::Object(i));
         let placed = Mat4::from_rotation_translation(o.rotation, o.position);
+        self.remove_object_static(i);
         let pieces = loose
             .pieces
             .iter()
@@ -775,6 +789,27 @@ impl World {
             .collect();
         self.knocked.insert(i, pieces);
         true
+    }
+
+    /// The `_PropPhysics` of the first placed object of model `model`
+    /// whose template has one.
+    fn physics_prop(&self, model: u32) -> Option<crate::durability::PropPhysics> {
+        let db = &self.index.template_db;
+        self.by_model.get(&model)?.iter().find_map(|&i| {
+            db.prop_physics
+                .get(&self.index.objects[i].template)
+                .copied()
+        })
+    }
+
+    /// Whether placed object `i` was knocked loose (`None` if not):
+    /// broken into its pieces, its model's [`Loose::breaks`], or gone as
+    /// one.
+    pub fn knocked_loose(&self, i: usize) -> Option<bool> {
+        let o = self.index.objects.get(i)?;
+        self.knocked
+            .contains_key(&i)
+            .then(|| self.loose.get(&o.model).is_some_and(|l| l.breaks))
     }
 
     /// Placed objects standing that come loose with any of their model
@@ -791,14 +826,46 @@ impl World {
     /// way or knocked loose (what is left of it is drawn elsewhere).
     pub fn take(&mut self, i: usize) {
         if self.taken.insert(i) {
-            self.physics.remove_static(StaticKey::Object(i));
+            self.remove_object_static(i);
         }
     }
 
     /// Takes placed object `i`'s standing collision away (it was
     /// destroyed; what is left of it is in nobody's way).
     pub fn take_static(&mut self, i: usize) {
+        self.felled.insert(i);
+        self.remove_object_static(i);
+    }
+
+    /// Placed object `i`'s standing collision, and its collision as a
+    /// building of a merged batch if it is one (a shanty town's shack:
+    /// broken, it would otherwise still stand in the batch's).
+    fn remove_object_static(&mut self, i: usize) {
         self.physics.remove_static(StaticKey::Object(i));
+        if let Some(&(batch, k)) = self.member_of.get(&i) {
+            self.physics.remove_static(StaticKey::Member(batch, k));
+        }
+    }
+
+    /// Placed object `i`'s collision as a building of a merged batch, if
+    /// it is one.
+    pub fn member_key(&self, i: usize) -> Option<StaticKey> {
+        self.member_of
+            .get(&i)
+            .map(|&(batch, k)| StaticKey::Member(batch, k))
+    }
+
+    /// What `key` stands for as a placed object: a building of a merged
+    /// batch that is placed by its own model too is that object; anything
+    /// else is itself.
+    pub fn as_object(&self, key: StaticKey) -> StaticKey {
+        match key {
+            StaticKey::Member(batch, k) => self
+                .member_object
+                .get(&(batch, k))
+                .map_or(key, |&j| StaticKey::Object(j)),
+            _ => key,
+        }
     }
 
     /// Whether placed object `i` was [taken](Self::take).
@@ -1084,6 +1151,14 @@ impl World {
                             if let Some(loose) = m.collision.as_ref().and_then(|c| c.loose.clone())
                             {
                                 self.loose.insert(hash, loose);
+                            } else if let Some(whole) =
+                                m.collision.as_ref().and_then(|c| c.whole.as_ref())
+                                && let Some(prop) = self.physics_prop(hash)
+                            {
+                                // A physics prop (`_PropPhysics`) whose
+                                // model has no body that moves comes loose
+                                // as one, of its template's mass.
+                                self.loose.insert(hash, Arc::new(whole.weighing(prop.kg())));
                             }
                             for &i in self.by_model.get(&hash).map_or(&[][..], Vec::as_slice) {
                                 let o = &self.index.objects[i];
@@ -1103,6 +1178,22 @@ impl World {
                                 for (k, member) in m.members.iter().enumerate() {
                                     let (position, rotation) =
                                         member.placed.unwrap_or((o.position, o.rotation));
+                                    // A building placed by its own model
+                                    // too stands in the batch's collision
+                                    // only while it stands itself.
+                                    if let Some(&j) = self.by_entity.get(&member.entity)
+                                        && j != i
+                                    {
+                                        self.member_of.insert(j, (i, k));
+                                        self.member_object.insert((i, k), j);
+                                        if self.destroyed.contains(&j)
+                                            || self.taken.contains(&j)
+                                            || self.knocked.contains_key(&j)
+                                            || self.felled.contains(&j)
+                                        {
+                                            continue;
+                                        }
+                                    }
                                     self.physics.add_static(
                                         StaticKey::Member(i, k),
                                         &member.shape,

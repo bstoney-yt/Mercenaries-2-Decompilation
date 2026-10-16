@@ -62,6 +62,8 @@ pub struct ParticleDraw {
     vertices: Vec<f32>,
     /// Templates asked for by name, resolved to ids.
     ids: HashMap<String, Option<u32>>,
+    /// Template ids by their names' hashes, once one is asked for so.
+    by_hash: Option<HashMap<u32, u32>>,
     /// Per template asked for (its name, or its id in hex).
     pub resolved: HashMap<String, Resolved>,
 }
@@ -155,6 +157,7 @@ impl ParticleDraw {
             sprites: Vec::new(),
             vertices: Vec::new(),
             ids: HashMap::new(),
+            by_hash: None,
             resolved: HashMap::new(),
         })
     }
@@ -167,6 +170,21 @@ impl ParticleDraw {
                 FxTemplate::Name(n) => {
                     let id = *self.ids.entry(n.clone()).or_insert_with(|| templates.id(n));
                     (n.clone(), id)
+                }
+                FxTemplate::Hash(h) => {
+                    let by_hash = self.by_hash.get_or_insert_with(|| {
+                        let mut ids: Vec<(&u32, &String)> = templates.names.iter().collect();
+                        // Of twins by name, the lowest id's.
+                        ids.sort_unstable_by_key(|&(&id, _)| std::cmp::Reverse(id));
+                        ids.into_iter()
+                            .map(|(&id, n)| (m2_assets::name_hash(n), id))
+                            .collect()
+                    });
+                    let id = by_hash.get(h).copied();
+                    let label = id
+                        .and_then(|id| templates.names.get(&id).cloned())
+                        .unwrap_or_else(|| format!("#{h:08x}"));
+                    (label, id)
                 }
             };
             let effects: Vec<u32> =

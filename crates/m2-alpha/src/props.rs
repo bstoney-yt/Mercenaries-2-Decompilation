@@ -104,6 +104,25 @@ pub struct Props {
     /// How far any loaded model reaches from its origin, metres (its
     /// box's middle, and half its size beyond).
     widest: f32,
+    /// The templates whose objects are physics props (`_PropPhysics`), by
+    /// id: those whose model has no body that moves come loose as one.
+    pub physics_props: HashMap<u32, m2_engine::durability::PropPhysics>,
+    /// Shown since their model came in, their collision not yet up.
+    unwalled: HashSet<u32>,
+    /// Those a vehicle broke some parts of, a part at a time (a hedge's
+    /// sections, a gate's leaf): which parts, and the nodes that hides.
+    parts_down: HashMap<u32, PartsDown>,
+    /// Wrecked since [`take_fallen`](Self::take_fallen): what falls with
+    /// them is brought down too (`DestructionLink`).
+    fallen: Vec<u32>,
+}
+
+/// Which parts of a prop are broken ([`m2_engine::ModelParts`]), and the
+/// nodes hidden for it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PartsDown {
+    wrecked: Vec<bool>,
+    hidden: Vec<bool>,
 }
 
 /// What [`Props::draw`] draws of a model broken apart.
@@ -191,6 +210,95 @@ struct Loaders {
 }
 
 impl Props {
+    /// How many of `entity`'s `parts` (those its template's objects are
+    /// broken in, one at a time, by vehicles: a hedge's sections) stand:
+    /// none once it is wrecked or gone.
+    pub fn parts_standing(&self, entity: u32, parts: usize) -> usize {
+        match self.shown.get(&entity) {
+            Some(p) if !p.wrecked => {
+                let down = self
+                    .parts_down
+                    .get(&entity)
+                    .map_or(0, |d| d.wrecked.iter().filter(|&&w| w).count());
+                parts.saturating_sub(down)
+            }
+            _ => 0,
+        }
+    }
+
+    /// The parts of `entity` a vehicle breaks one at a time, if its model
+    /// has them ([`m2_engine::ModelParts`]) and it stands.
+    pub fn model_parts(&self, entity: u32) -> Option<&Arc<m2_engine::ModelParts>> {
+        let p = self.shown.get(&entity).filter(|p| !p.wrecked)?;
+        self.models.get(&p.model)?.as_ref()?.gpu.parts.as_ref()
+    }
+
+    /// Whether any of `entity`'s parts is broken, the rest standing.
+    pub fn parts_broken(&self, entity: u32) -> bool {
+        self.parts_down
+            .get(&entity)
+            .is_some_and(|d| d.wrecked.contains(&true))
+    }
+
+    /// Whether part `k` of `entity` is broken.
+    pub fn part_down(&self, entity: u32, k: usize) -> bool {
+        self.parts_down
+            .get(&entity)
+            .is_some_and(|d| d.wrecked.get(k).copied().unwrap_or(false))
+    }
+
+    /// Breaks part `k` of `entity` alone ([`m2_engine::ModelParts`]): it
+    /// shows its own wreck (a hedge section's stumps; a gate leaf's
+    /// nothing, its pieces not thrown) and its collision goes, the rest
+    /// standing. Once every part with something of its own to show is
+    /// broken, the whole is wrecked as a vehicle breaks it
+    /// ([`wreck_crashed`](Self::wreck_crashed), with `push`). True if it
+    /// broke anything.
+    pub fn wreck_part(
+        &mut self,
+        physics: &mut Physics,
+        entity: u32,
+        k: usize,
+        push: impl FnOnce(f32) -> (Vec3, Vec3),
+    ) -> bool {
+        let Some(parts) = self.model_parts(entity).cloned() else {
+            return false;
+        };
+        if k >= parts.count() || self.part_down(entity, k) {
+            return false;
+        }
+        let down = self.parts_down.entry(entity).or_default();
+        down.wrecked.resize(parts.count(), false);
+        down.wrecked[k] = true;
+        let all = (0..parts.count()).all(|j| down.wrecked[j] || parts.part_box(j).is_none());
+        if all {
+            self.parts_down.remove(&entity);
+            return self.wreck_crashed(physics, entity, push);
+        }
+        down.hidden = parts.hidden(&down.wrecked);
+        let wrecked = down.wrecked.clone();
+        self.changes += 1;
+        // Its collision without the broken parts' shapes (one cut from
+        // its drawn triangles stays whole).
+        if !parts.meshes.is_empty()
+            && let Some(p) = self.shown.get(&entity)
+        {
+            physics.remove_static(StaticKey::Entity(entity));
+            // The rest stands in the way, an island object put up to
+            // break a part at a time too.
+            if let Some(shape) = parts.collision(&wrecked) {
+                physics.add_static(StaticKey::Entity(entity), &shape, p.position, p.rotation);
+            }
+        }
+        true
+    }
+
+    /// Those wrecked since this was last asked (for what falls with them,
+    /// `DestructionLink`).
+    pub fn take_fallen(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.fallen)
+    }
+
     /// The model of shown prop `entity`, and where it stands.
     pub fn placed(&self, entity: u32) -> Option<(u32, Vec3)> {
         self.shown.get(&entity).map(|p| (p.model, p.position))
@@ -233,9 +341,18 @@ impl Props {
             );
             added += 1;
             self.changes += 1;
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.models.entry(o.model) {
-                slot.insert(None);
-                self.waiting.insert(o.model);
+            match self.models.entry(o.model) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(None);
+                    self.waiting.insert(o.model);
+                }
+                // Its model is in already: its collision goes up at the
+                // next update (round 6b found barricades and crates put up
+                // again by a later layer standing with none).
+                std::collections::hash_map::Entry::Occupied(m) if m.get().is_some() => {
+                    self.unwalled.insert(e);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
             }
         }
         if !self.waiting.is_empty() && self.loaders.is_none() {
@@ -300,6 +417,7 @@ impl Props {
                 physics.remove_static(StaticKey::Entity(e));
                 self.changes += 1;
             }
+            self.parts_down.remove(&e);
             self.sinking.remove(&e);
             let broken = self.broken.remove(&e).into_iter().flatten();
             for d in self.knocked.remove(&e).into_iter().flatten().chain(broken) {
@@ -353,23 +471,15 @@ impl Props {
             true => self.any_loose_mass(physics, entity),
             false => self.loose_mass(physics, entity),
         };
-        if mass.is_none() {
-            return false;
-        }
-        let (Some(p), Some(loose)) = (self.shown.get(&entity), self.loose(entity)) else {
-            return false;
-        };
-        physics.remove_static(StaticKey::Entity(entity));
-        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
-        let pieces = loose
-            .pieces
-            .iter()
-            .zip(loose.starts(placed))
-            .map(|(piece, at)| physics.add_debris(piece, at, velocity, spin))
-            .collect();
-        self.knocked.insert(entity, pieces);
-        self.fresh_knocks.push(entity);
-        true
+        mass.is_some() && self.fling(physics, entity, velocity, spin)
+    }
+
+    /// Whether `entity` was knocked loose (`None` if not): broken into
+    /// its pieces, its model's [`Loose::breaks`], or gone as one.
+    pub fn knocked_loose(&self, entity: u32) -> Option<bool> {
+        self.knocked
+            .contains_key(&entity)
+            .then(|| self.loose(entity).is_some_and(|l| l.breaks))
     }
 
     /// Those knocked loose since the last call.
@@ -397,7 +507,7 @@ impl Props {
                 (d <= reach).then_some(e)
             })
             .filter(|e| {
-                !crate::destruct::adopted(*e)
+                (!crate::destruct::adopted(*e) || self.parts_down.contains_key(e))
                     && !self.sturdy.contains(e)
                     && !self.knocked.contains_key(e)
                     && !self.broken.contains_key(e)
@@ -480,6 +590,8 @@ impl Props {
             return false;
         };
         physics.remove_static(StaticKey::Entity(entity));
+        self.fallen.push(entity);
+        self.parts_down.remove(&entity);
         let model = self.models.get(&p.model).and_then(Option::as_ref);
         if let Some(m) = model.filter(|m| m.gpu.has_wreck()) {
             p.wrecked = true;
@@ -528,10 +640,39 @@ impl Props {
                 }
             }
         } else if !self.knocked.contains_key(&entity) {
-            // Loose pieces stay where they fell.
-            self.shown.remove(&entity);
-            self.changes += 1;
+            // No wreck to show, but it comes loose (a barricade, a café
+            // chair): it goes flying rather than vanish.
+            let (velocity, spin) = match hit {
+                Hit::Crash(velocity, spin) => (velocity, spin),
+                Hit::Blast(Some(from), _) => crate::destruct::blown(from, p.position),
+                Hit::Blast(None, _) => (Vec3::Y * 2.0, Vec3::ZERO),
+            };
+            if !self.fling(physics, entity, velocity, spin) {
+                // Loose pieces stay where they fell.
+                self.shown.remove(&entity);
+                self.changes += 1;
+            }
         }
+        true
+    }
+
+    /// Sends `entity`'s model flying as it comes loose (its standing
+    /// collision already gone): its pieces off at `velocity` (m/s),
+    /// turning at `spin`. False unless its model comes loose.
+    fn fling(&mut self, physics: &mut Physics, entity: u32, velocity: Vec3, spin: Vec3) -> bool {
+        let (Some(p), Some(loose)) = (self.shown.get(&entity), self.loose(entity)) else {
+            return false;
+        };
+        physics.remove_static(StaticKey::Entity(entity));
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let pieces = loose
+            .pieces
+            .iter()
+            .zip(loose.starts(placed))
+            .map(|(piece, at)| physics.add_debris(piece, at, velocity, spin))
+            .collect();
+        self.knocked.insert(entity, pieces);
+        self.fresh_knocks.push(entity);
         true
     }
 
@@ -930,6 +1071,31 @@ impl Props {
         reach: f32,
     ) -> anyhow::Result<()> {
         self.reach = reach;
+        // Those shown since their model came in: their collision.
+        for e in std::mem::take(&mut self.unwalled) {
+            let Some(p) = self.shown.get(&e) else {
+                continue;
+            };
+            let model = (self.models.get(&p.model)).and_then(Option::as_ref);
+            // Some parts broken: the rest's collision.
+            let partial = (model.and_then(|m| m.gpu.parts.as_ref()))
+                .filter(|parts| !parts.meshes.is_empty())
+                .zip(self.parts_down.get(&e))
+                .map(|(parts, down)| parts.collision(&down.wrecked));
+            let shape = model.and_then(|m| m.collision.as_ref());
+            let shape = match &partial {
+                Some(s) => s.as_ref(),
+                None => shape,
+            };
+            if let Some(shape) = shape
+                && stands(e)
+                && !p.wrecked
+                && !self.knocked.contains_key(&e)
+                && !physics.has_static(StaticKey::Entity(e))
+            {
+                physics.add_static(StaticKey::Entity(e), shape, p.position, p.rotation);
+            }
+        }
         let Some(loaders) = &self.loaders else {
             return Ok(());
         };
@@ -1022,7 +1188,7 @@ impl Props {
         hash: u32,
         cpu: Result<(CpuModel, Vec<u32>), String>,
     ) -> anyhow::Result<()> {
-        let (cpu, members) = match cpu {
+        let (mut cpu, members) = match cpu {
             Ok(cpu) => cpu,
             Err(e) => {
                 eprintln!("state layer model {hash:08x}: {e}");
@@ -1030,6 +1196,17 @@ impl Props {
                 return Ok(());
             }
         };
+        // A physics prop (`_PropPhysics`) whose model has no body that
+        // moves comes loose as one, of its template's mass.
+        let physics_prop = (self.shown.values())
+            .filter(|p| p.model == hash)
+            .find_map(|p| self.physics_props.get(&p.template).copied());
+        if let (Some(c), Some(prop)) = (cpu.collision.as_mut(), physics_prop)
+            && c.loose.is_none()
+            && let Some(whole) = &c.whole
+        {
+            c.loose = Some(Arc::new(whole.weighing(prop.kg())));
+        }
         materials.load_model_textures(backend, source, &cpu)?;
         let gpu = GpuModel::upload(backend, materials, &cpu)?;
         let (lo, hi) = gpu.bounds;
@@ -1161,9 +1338,14 @@ impl Props {
                 continue;
             }
             let at = Mat4::from_rotation_translation(p.rotation, p.position);
-            match self.poses.get(e).filter(|_| !p.wrecked) {
-                Some(nodes) => m.gpu.draw_moved(queue, at, nodes, false, &[]),
-                None => m.gpu.draw_as(queue, at, p.wrecked),
+            match (
+                self.poses.get(e).filter(|_| !p.wrecked),
+                self.parts_down.get(e),
+            ) {
+                (Some(nodes), _) => m.gpu.draw_moved(queue, at, nodes, false, &[]),
+                // Some parts broken, the rest standing.
+                (None, Some(down)) if !p.wrecked => m.gpu.draw_hiding(queue, at, &down.hidden),
+                _ => m.gpu.draw_as(queue, at, p.wrecked),
             }
             self.draw_sinking(queue, *e, m, at);
         }

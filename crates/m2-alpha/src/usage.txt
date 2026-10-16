@@ -2,23 +2,25 @@ m2-alpha: Mercenaries 2 on a native Rust engine, from your own install.
 
 m2-alpha [options]
   (no options, or only --install/--config/--size/--vsync/--fullscreen/
-  --no-boot/--smarter-ai/--dev/--skip-mode-off: the whole game, as --alpha)
+  --no-boot/--smarter-ai/--dev/--skip-mode-on: the whole game, as --alpha)
   --alpha                the game as it launches: the boot movies (EA,
                          Pandemic), the front end (Enter starts), the first
                          contract with its movies, then on to free roam.
                          Movies need ffmpeg (M2_FFMPEG, beside m2-alpha, or
                          on the PATH); Enter/Space/Escape skips one
   --no-boot              with --alpha: no boot movies or front end
-  --dev                  with --alpha: the developer's keys too (V free
+  --dev                  with --alpha: the developer's keys too (F4 free
                          camera, F5/F9 quick save and load, F3 culling, N
                          gait), which the whole game's launch leaves out;
                          the other launches (--mission, --spawn, --model,
                          --fly...) always have them
-  --skip-mode-off        with --alpha (or --mission --movies
+  --skip-mode-on         with --alpha (or --mission --movies
                          --screenshot): the scripts' developer skip mode
-                         (on so their intro movies end at once) ends once
-                         their start has run, instead of staying on all
-                         session
+                         (on so their intro movies end at once) stays on
+                         all session, instead of ending once their start
+                         has run (the default; --skip-mode-off is still
+                         taken). Left on, the flow skips its fades and the
+                         move into the PMC HQ
   --movies               with --mission --screenshot: the scripts' movies
                          wait; each is decoded offscreen and pictured
                          (<out>-movie-<name>.ppm)
@@ -102,8 +104,14 @@ m2-alpha [options]
                          ahead) just before the picture, to see the hit arcs
   --hud-seconds <s>      with --screenshot: run the game's HUD this long before
                          the picture (default 2)
+  --loading-screen <s>   with --screenshot: the picture is of the loading screen
+                         this long after it came up
   --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
                          (gl: the supply crate's grenade launcher)
+  --switch               with --screenshot on foot: switch weapons --lead
+                         seconds before the picture (stow, then take up)
+  --pickup               with --screenshot on foot: pick a weapon up --lead
+                         seconds before the picture
   --satellite <stage>    with --screenshot on foot: call a Satellite Guided
                          Bomb on the spot 45 m ahead of her (the support
                          key, the use key, the view steered over it and
@@ -134,6 +142,11 @@ m2-alpha [options]
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --pda                  with --screenshot: the picture with her PDA open
+  --binoculars <zoom>    with --screenshot: the picture through her
+                         binoculars at zoom 1..7, their screen up
+  --pause                with --screenshot: the picture with the game's
+                         pause menu open, --pda-key's keys typed into it
+                         one by one (a third of a second apart)
   --behind               with --screenshot on foot: the picture from close
                          behind her, to see the weapons on her back
   --slung rpg|gl         with --screenshot on foot: give her this weapon in
@@ -160,9 +173,31 @@ m2-alpha [options]
                          keys its stick)
   --hijack               with --screenshot --drive: hijack the vehicle
                          (--vehicle's) instead, answering every prompt
+  --placed-check         with --mission: every 5 s, try each pickup, crate and
+                         emplaced gun the layers have put out (logged as
+                         placed-check lines), for testing
+  --props-check <hit>    with --mission: once she is ashore (and inside
+                         --props-area x0,z0,x1,z1 if given), hit every placed
+                         prop there by <hit> (vehicle, gun or blast), log what
+                         each did against what the data says (props-check
+                         lines and a summary), and stop; for testing
   --support <key>        with --mission: stock support item <key> (clusterbomb,
                          Support) and call it in once the scripts run, to
                          test their strikes and drops; repeatable
+  --shop-check <keys>    with --mission --autoplay: once she is ashore, buy
+                         every support item (all, or the comma-separated
+                         keys) in a shop with cash given her, call each in
+                         from the support menu, aim its designator, and log
+                         what came of it (shop-check lines and a summary)
+  --cheat-menu <page>    with --screenshot: the F7 cheat menu up at that page
+                         (weapons, vehicles, support, player), alone over
+                         black
+  --cheat-check          with --mission --autoplay: once she is ashore, try
+                         the F7 cheat menu's cheats (every weapon, a few
+                         vehicles of each kind, every support item, a
+                         strike, money, god mode, infinite ammo, a
+                         teleport) and log what came of it (cheat-check
+                         lines)
   --seated               with --screenshot --drive: load the seats' clips
                          first and show her sitting in the vehicle
                          (also <stem>-seated.ppm before it moves)
@@ -200,22 +235,44 @@ m2-alpha [options]
                          her view two seconds after each bomb (-bomb1.ppm)
   --write-config         print the settings file and exit
 
-On foot: WASD runs, Shift sprints, hold Q to walk, Space jumps.
+The keys and mouse are the PC game's defaults (its Controls page; each
+can be rebound in the settings' [keys], with "MouseLeft", "MouseRight",
+"MouseMiddle", "WheelUp" and "WheelDown" for the mouse):
+On foot: WASD runs, Left Shift sprints, hold Left Ctrl to walk, Space
+jumps, hold C to crouch and aim (B too, for now), I/J/K/L look.
 E gets in or out of a vehicle (a row is parked ahead of where you start).
 Driving: W/S throttle and reverse, A/D steer, Space brakes, R rights it.
-Fighting (mouse captured): left button or F fires, right button aims,
-1 rifle, 2 rocket launcher, G throws a grenade, B or the middle button
-bashes (a supply crate breaks open).
-Support: T opens the support menu, and E takes up the item's designator
-and looks through the satellite: WASD or the mouse moves its view, fire
-or E confirms, and fire or E as the timing wheel's needle passes through
-each grey wedge sends the bomb (a press outside them undoes the presses
-made; moving the view away puts the wheel away). T, 1 or 2 calls it off;
-so does being hurt. P opens and shuts the PDA (the first contract's
-scripts give the bomb once she has looked at it).
+Fighting (mouse captured): left button fires, Tab or the wheel switches
+weapon, R reloads, right button or G throws a grenade, V picks the next
+explosive, F or the middle button bashes (a supply crate breaks open),
+X sets off C4, Y moves to the next seat. 4 or Right (the view switch) does
+nothing yet.
+Support: 1 or Up (and 2 or Down) opens the support menu and moves its
+line, and E takes up the item's designator and looks through the
+satellite: WASD moves its view, fire or E confirms, and fire or E as the
+timing wheel's needle passes through each grey wedge sends the bomb (a
+press outside them undoes the presses made; moving the view away puts
+the wheel away). Tab or the wheel puts the menu away; at the view, 1 or 2
+calls it off; so does being hurt. F1 opens and shuts the PDA, whose map
+WASD or the arrows move (the first contract's scripts give the bomb once
+she has looked at it).
+Shop and money: H opens the shop (a tab for each faction's; what each
+sells unlocks with contracts, or all at once with the settings'
+[enhanced.shop] unlock_all = true). What she buys is in the support
+menu: 1/2, the arrows or W/S pick the item, E calls it in. G throws its smoke,
+flare or beacon; a laser designator is held on the spot with fire; a
+satellite one is moved like the bomb's view and confirmed with fire.
+Cash and fuel lying about are taken by walking over them. The game saves
+itself after a contract (m2-alpha-autosave.toml, with her cash, stock and
+the scripts' own data); putting the scripts back from it on loading is
+not done yet.
 The contract done, Enter closes its fanfare and the flow goes on.
-M music on/off, Tab or right mouse captures the mouse, F11 fullscreen,
-Escape opens the menu (settings, save and load, quit).
+M music on/off, a click captures the mouse (F2 lets it go), F11 fullscreen,
+Escape opens the game's own pause menu (its movie, once the HUD's scripts
+run; up/down through it, left/right a setting, Enter): resume, save,
+options (game, video, audio, controls) and quit. Its kept settings go to
+the settings file. The alpha's own settings (hero, field of view, mouse,
+vsync, quit to desktop) fold in the top right. Escape closes it.
 An Xbox pad (One, Series or 360) plays as the game's own layout has it:
 left stick move (L3 sprint), right stick look, A jump, B melee, X reload,
 Y get in/use, RT fire, LT crouch, LB throw, RB switch weapon, R3 aim,
@@ -223,7 +280,7 @@ d-pad up/down support, left next explosive, right detonate, Back PDA,
 Start menu. Driving: A forward, X reverse, LT handbrake, Y out. In the
 menus A is Enter, B back, the d-pad moves. While the pad is used, the
 HUD's prompts show its buttons.
-The developer's keys (--dev, or any launch but the whole game's): V
+The developer's keys (--dev, or any launch but the whole game's): F4
 switches to the free camera (WASD moves, Space/C up/down, Shift faster;
 not while the scripts have her controls off) and back to her where she
 was left, N next gait (--model), F3 culling, F5 quick save, F9 quick load

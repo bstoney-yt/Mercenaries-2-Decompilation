@@ -19,6 +19,7 @@ pub mod assets;
 pub mod atmosphere;
 pub mod audio;
 pub mod durability;
+pub mod gun_sounds;
 pub mod hijack;
 pub mod model;
 pub mod motion;
@@ -29,9 +30,11 @@ pub mod pickup;
 pub mod population;
 pub mod scatter;
 pub mod stream;
+pub mod surface;
 pub mod technique;
 pub mod tuning;
 pub mod vehicle;
+pub mod vehicle_damage;
 pub mod weapons;
 pub mod world;
 
@@ -40,7 +43,7 @@ pub use anim::{Animator, BoundClip, Gait, Locomotion, Pose, Skeleton};
 pub use assets::{AssetError, AssetSource, DecodedTexture, Install, ModelData};
 pub use atmosphere::Atmosphere;
 pub use audio::{Category, Mixer, Play, SoundBuffer, SoundLibrary, Streams, VoiceId, Voices};
-pub use model::{CpuModel, GpuModel, MaterialCache};
+pub use model::{CpuModel, GpuModel, Looks, MaterialCache, ModelParts};
 pub use physics::{
     Breakup, Character, CollisionShape, DebrisId, Loose, LoosePiece, Physics, RagdollId, StaticKey,
     VehicleControls, VehicleId,

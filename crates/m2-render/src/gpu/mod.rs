@@ -83,6 +83,13 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// How far water looks for the scene it mirrors (metres; inferred: far
 /// enough for the hills across a bay). `M2_SEA_MIRROR_REACH` sets it.
 const SEA_MIRROR_REACH: f32 = 600.0;
+/// Half the width of the cloud quad whose corners the sky's haze is
+/// reckoned at (metres; see `quad_air` in the shaders). The game's comes
+/// from code. Fitted: past about this the corners' haze has saturated
+/// (cantina sky looking up, open sky L 67 at 16 km, 93 at 64 km, 91 at
+/// 256 and 1,000 km), and its blue matches PC footage (B/R 1.32 against
+/// 1.27-1.35).
+const SKY_QUAD: f32 = 64000.0;
 /// Per-draw uniforms are packed at this stride (wgpu's minimum dynamic
 /// offset alignment on every backend).
 const DRAW_STRIDE: u64 = 256;
@@ -258,7 +265,10 @@ struct FrameUniforms {
     glint_fit: [f32; 4],
     /// x: the cloud deck takes the sun's colour twice, as the game's
     /// (`M2_DECK=old`: 0), y: its Tone scales display values
-    /// (`M2_DECK=full`: 1).
+    /// (`M2_DECK=full`: 1), z: half the width of the cloud quad the sky's
+    /// haze is taken at the corners of ([`SKY_QUAD`]; `M2_SKY_QUAD=<m>`,
+    /// `=off`: 0, along each ray as before), w: the clouds take that haze
+    /// too (`M2_SKY_QUAD_CLOUDS=off`: 0).
     deck_fit: [f32; 4],
     /// Water mirroring the scene drawn before it: x 1 to mirror it
     /// (`M2_SEA_MIRROR=off`: 0), y scale on what it mirrors
@@ -1937,8 +1947,16 @@ impl WgpuBackend {
                 [
                     if mode == "old" { 0.0 } else { 1.0 },
                     if mode == "full" { 1.0 } else { 0.0 },
-                    0.0,
-                    0.0,
+                    match std::env::var("M2_SKY_QUAD").ok().as_deref() {
+                        Some("off") => 0.0,
+                        Some(v) => v.parse::<f32>().map_or(SKY_QUAD, |m| m.max(0.0)),
+                        None => SKY_QUAD,
+                    },
+                    if std::env::var("M2_SKY_QUAD_CLOUDS").is_ok_and(|v| v == "off") {
+                        0.0
+                    } else {
+                        1.0
+                    },
                 ]
             },
             mirror: {

@@ -299,6 +299,14 @@ pub fn seat_clip(
 /// [`seat_clip`], with the row of the vehicle table that gives it: which
 /// of its cells name the vehicle's class, the vehicle and the seat, and
 /// which are [`ANY`], says whether the clip is the vehicle's own.
+///
+/// The seat filters both tables: the stance and action table's `Seat`
+/// column names seats too (round 13: its 43 `InVehicle` `Idle` rows each
+/// name one, `seat_driver` among them, and none is any), so without it
+/// the lookup fell through to the table's catch-all row 1 and every
+/// seat of every vehicle got the vehicle table's catch-all clip. That
+/// the column takes the `SeatLink` `Name` is inferred from the values:
+/// the tables' seat cells are the templates' seat names.
 pub fn seat_clip_row(
     actions: &AnimationTable,
     vehicles: &AnimationTable,
@@ -313,7 +321,7 @@ pub fn seat_clip_row(
             ("Action", Some(crate::name_hash(action))),
             ("AimState", None),
             ("Tandem", None),
-            ("Seat", None),
+            ("Seat", seat),
             ("Target", None),
             ("ActionDirection", None),
             ("DamageDirection", None),
@@ -342,6 +350,9 @@ pub enum Precedence {
     Own,
     /// Anyone's row for the handle and equipment.
     Equipment,
+    /// The character's own row for the handle, whatever is held (the
+    /// heroes' own pickups: Chris's and Mattias's rows name no weapon).
+    OwnAny,
     /// Anyone's row for the handle, whatever is held.
     Handle,
 }
@@ -375,7 +386,9 @@ pub fn row_listing(table: &AnimationTable, clip: u32) -> Option<usize> {
 ///    as the primary weapon's class ([`Precedence::Own`]);
 /// 2. anyone's (character [`ANY`]; the gender the character's or
 ///    [`ANY`]) with `equipment` ([`Precedence::Equipment`]);
-/// 3. anyone's with any equipment ([`Precedence::Handle`]);
+/// 3. the character's own with any equipment ([`Precedence::OwnAny`];
+///    inferred: its place between 2 and 4 is not known);
+/// 4. anyone's with any equipment ([`Precedence::Handle`]);
 ///
 /// with a clip that `fits` (is on the character's rig): `key` if the row
 /// lists it, else the first listed. An empty list, or one with nothing
@@ -386,8 +399,63 @@ pub fn row_listing(table: &AnimationTable, clip: u32) -> Option<usize> {
 pub fn character_clip(
     table: &AnimationTable,
     key: u32,
+    who: (u32, u32),
+    equipment: u32,
+    fits: impl Fn(u32) -> bool,
+) -> Option<CharacterClip> {
+    let col = |n: &str| table.column(n);
+    let handle = col(HANDLE)?;
+    let (uc, un) = (col(IN_USE_EQUIPMENT_CLASS)?, col(IN_USE_EQUIPMENT_NAME)?);
+    let first = row_listing(table, key)?;
+    let cell = |row: usize, column: usize| table.cell(row, column).unwrap_or(ANY);
+    let h = cell(first, handle);
+    let in_use = (cell(first, uc), cell(first, un));
+    handle_rows(table, h, in_use, who, equipment, Some(key), fits)
+}
+
+/// The clip a character plays for animation handle `handle` (one the
+/// stance and action table gives, [`action_handle`]), with nothing in
+/// use: as [`character_clip`] picks it, the first listed that `fits`.
+pub fn handle_clip(
+    table: &AnimationTable,
+    handle: u32,
+    who: (u32, u32),
+    equipment: u32,
+    fits: impl Fn(u32) -> bool,
+) -> Option<CharacterClip> {
+    handle_rows(table, handle, (ANY, ANY), who, equipment, None, fits)
+}
+
+/// The animation handle the stance and action table ([`ACTIONS`]) gives
+/// a character in `stance` doing `action`, with no other filter set
+/// (`Upright`, `EquipRightIdle`). `None` where the row's handle is
+/// [`ANY`] (`None` in the table's own words: the locomotion's clips, not
+/// one of the on-foot table's).
+pub fn action_handle(actions: &AnimationTable, stance: &str, action: &str) -> Option<u32> {
+    actions.lookup(
+        &[
+            ("Stance", Some(crate::name_hash(stance))),
+            ("Action", Some(crate::name_hash(action))),
+            ("AimState", None),
+            ("Tandem", None),
+            ("Seat", None),
+            ("Target", None),
+            ("ActionDirection", None),
+            ("DamageDirection", None),
+        ],
+        "AnimationHandles",
+    )
+}
+
+/// [`character_clip`]'s and [`handle_clip`]'s search over handle `h`'s
+/// rows with `in_use`, preferring `key` where a row lists it.
+fn handle_rows(
+    table: &AnimationTable,
+    h: u32,
+    in_use: (u32, u32),
     (gender, name): (u32, u32),
     equipment: u32,
+    key: Option<u32>,
     fits: impl Fn(u32) -> bool,
 ) -> Option<CharacterClip> {
     let col = |n: &str| table.column(n);
@@ -399,13 +467,11 @@ pub fn character_clip(
     if table.columns[list].kind != ColumnKind::List {
         return None;
     }
-    let first = row_listing(table, key)?;
     let cell = |row: usize, column: usize| table.cell(row, column).unwrap_or(ANY);
-    let h = cell(first, handle);
-    let in_use = (cell(first, uc), cell(first, un));
     let steps = [
         (Precedence::Own, name, equipment),
         (Precedence::Equipment, ANY, equipment),
+        (Precedence::OwnAny, name, ANY),
         (Precedence::Handle, ANY, ANY),
     ];
     for (by, character, class) in steps {
@@ -420,7 +486,7 @@ pub fn character_clip(
         let unnamed = rows.filter(|&r| gender != ANY && cell(r, g) == ANY);
         for row in named.chain(unnamed) {
             let clips = table.list(row, list);
-            let clip = if clips.contains(&key) && fits(key) {
+            let clip = if let Some(key) = key.filter(|&k| clips.contains(&k) && fits(k)) {
                 Some(key)
             } else {
                 clips.iter().copied().find(|&x| fits(x))
@@ -604,7 +670,7 @@ mod tests {
         );
         // (handle, gender, character, primary class, in-use class, clips)
         type Row<'a> = (u32, u32, u32, u32, u32, &'a [u32]);
-        let rows: [Row; 18] = [
+        let rows: [Row; 21] = [
             (ANY, ANY, ANY, ANY, ANY, &[ANY]),
             (aim, ANY, ANY, RIFLE, ANY, &[0xb29a_c474]),
             (aim, ANY, ANY, pistol, ANY, &[0xed1d_af4f]),
@@ -623,6 +689,11 @@ mod tests {
             (throw, ANY, ANY, RIFLE, grenade, &[0x690b_c7d1]),
             (throw, ANY, ANY, rocket, grenade, &[0xec6f_fa31]),
             (still, ANY, ANY, ANY, ANY, &[0xe824_3172, 0x3aee_9ae8]),
+            // `PickupWeapon`'s handle: anyone's, Chris's own whatever he
+            // holds, Jennifer's with a pistol.
+            (PICKUP, ANY, ANY, ANY, ANY, &[0x9874_62fc]),
+            (PICKUP, hero, chris, ANY, ANY, &[0x4916_51da]),
+            (PICKUP, hero, jen, pistol, ANY, &[0x777b_d24e]),
         ];
         let mut asto = Vec::new();
         let m = (-1.0f32).to_bits();
@@ -737,5 +808,94 @@ mod tests {
             AnimationTable::parse(&asset),
             Err(AnimationTableError::Values { .. })
         ));
+    }
+
+    /// `PickupWeapon`'s animation handle in the game's stance and action
+    /// table.
+    const PICKUP: u32 = 0x9e6d_9806;
+
+    #[test]
+    fn a_handle_gives_the_heros_own_row_whatever_is_held() {
+        let t = on_foot();
+        let hero = name_hash("Hero");
+        let pick = |name: &str, class| {
+            handle_clip(&t, PICKUP, (hero, name_hash(name)), class, |_| true)
+                .map(|p| (p.clip, p.by))
+        };
+        let pistol = name_hash("pistol");
+        use Precedence::*;
+        // Chris's own row names no weapon: his, before anyone's.
+        assert_eq!(pick("Chris", pistol), Some((0x4916_51da, OwnAny)));
+        // Hers names the pistol.
+        assert_eq!(pick("jennifer", pistol), Some((0x777b_d24e, Own)));
+        // Mattias has no row of his own here: anyone's.
+        assert_eq!(pick("mattias", pistol), Some((0x9874_62fc, Handle)));
+        // A handle no row gives: nothing.
+        assert_eq!(handle_clip(&t, 0x1234, (hero, 1), RIFLE, |_| true), None);
+    }
+
+    #[test]
+    fn a_seats_own_idle_row_outranks_the_catch_all() {
+        let stance = name_hash("InVehicle");
+        let idle = name_hash("Idle");
+        let seat = name_hash("seat_driver");
+        let a_cols: Vec<(&str, u16)> = [
+            "Stance",
+            "Action",
+            "AimState",
+            "Tandem",
+            "Seat",
+            "Target",
+            "ActionDirection",
+            "DamageDirection",
+            "AnimationHandles",
+        ]
+        .iter()
+        .map(|&c| (c, 4))
+        .collect();
+        // As the game's: row 1 a catch-all, and every `InVehicle` `Idle`
+        // row naming a seat.
+        let a = table(
+            &a_cols,
+            &[
+                &[ANY; 9],
+                &[ANY, ANY, ANY, ANY, ANY, ANY, ANY, ANY, 0x9999],
+                &[stance, idle, ANY, ANY, seat, ANY, ANY, ANY, 0x3333],
+            ],
+            None,
+        );
+        let m = (-1.0f32).to_bits();
+        let b_cols: Vec<(&str, u16)> = [
+            ("Handle", 4),
+            ("VehicleClass", 4),
+            ("VehicleName", 4),
+            ("SeatName", 4),
+            ("MountedEquipmentClass", 4),
+            ("MountedEquipmentName", 4),
+            ("Animation", 4),
+            ("MinTimeScale", 3),
+            ("MaxTimeScale", 3),
+        ]
+        .to_vec();
+        let b = table(
+            &b_cols,
+            &[
+                &[ANY; 9],
+                &[ANY, ANY, ANY, ANY, ANY, ANY, 0x9d88_6544, m, m],
+                &[0x3333, 0xc1, ANY, ANY, ANY, ANY, 0xcccc, m, m],
+            ],
+            None,
+        );
+        let (a, b) = (
+            AnimationTable::parse(&a).unwrap(),
+            AnimationTable::parse(&b).unwrap(),
+        );
+        let clip = |seat| seat_clip(&a, &b, "InVehicle", "Idle", (0xc1, 0x51), seat);
+        // The driver's seat: its own row's handle, the class's clip.
+        assert_eq!(clip(Some(seat)), Some(0xcccc));
+        // No seat given, or one no row names: the catch-all.
+        assert_eq!(clip(None), Some(0x9d88_6544));
+        assert_eq!(clip(Some(0x0bad)), Some(0x9d88_6544));
+        assert_eq!(action_handle(&a, "InVehicle", "Idle"), Some(0x9999));
     }
 }

@@ -29,6 +29,19 @@ pub struct Config {
 pub struct EnhancedConfig {
     /// Smarter enemy soldiers (`enabled = true` to switch on).
     pub smarter_ai: crate::npc::SmarterAi,
+    /// The shop from anywhere, every item unlocked (a cheat; the game
+    /// unlocks them as contract rewards).
+    pub shop: ShopCheat,
+}
+
+/// `[enhanced.shop]`: the shop opens anywhere with its key, as the game's
+/// contacts open it in their menus; `unlock_all` unlocks everything each
+/// shop could sell, and brings the pilots and mechanic the support needs
+/// (the story recruits them one by one).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShopCheat {
+    pub unlock_all: bool,
 }
 
 /// The game's own options (its pause menu's).
@@ -39,11 +52,38 @@ pub struct GameOptions {
     /// (`Sys.SubtitlesEnabled`). Captions such as place names show
     /// either way, as the game shows them.
     pub subtitles: bool,
+    /// The tutorial tips (`Sys.TutorialsEnabled`).
+    pub tutorials: bool,
+    /// The scripts' autosaves after a contract are written.
+    pub autosave: bool,
+    /// The pause menu's sliders, 0 to 100 (see [`crate::pause::Settings`]):
+    /// the pad's look speed, the brightness and view distance (kept, not
+    /// used yet) and the volumes.
+    pub pad_sensitivity: f64,
+    pub invert_pad: bool,
+    pub rumble: bool,
+    pub brightness: f64,
+    pub view_distance: f64,
+    pub sfx_volume: f64,
+    pub music_volume: f64,
+    pub dialog_volume: f64,
 }
 
 impl Default for GameOptions {
     fn default() -> Self {
-        Self { subtitles: true }
+        Self {
+            subtitles: true,
+            tutorials: true,
+            autosave: true,
+            pad_sensitivity: 50.0,
+            invert_pad: false,
+            rumble: true,
+            brightness: 50.0,
+            view_distance: 100.0,
+            sfx_volume: 100.0,
+            music_volume: 100.0,
+            dialog_volume: 100.0,
+        }
     }
 }
 

@@ -245,6 +245,21 @@ const PERSON_AI: [&str; 2] = ["AiBehavior", "Ai"];
 /// hash (`veh_largegascrappy` for the HMMWVs and Valiants).
 const ENGINE_BANK_FIELD: u32 = 0x14a6_7fa6;
 
+/// `DestructionLink`'s field naming the entity linked (name unknown).
+const LINK_TARGET: u32 = 0x5470_4554;
+
+/// What an entity's `DestructionLink` naming `other` with direction `way`
+/// says falls with what, as (destroyed, destroyed with it) pairs
+/// ([`WorldIndex::add_links`]).
+fn falls(entity: u32, other: u32, way: u32) -> Vec<(u32, u32)> {
+    match way {
+        1 => vec![(entity, other)],
+        2 => vec![(other, entity)],
+        3 => vec![(entity, other), (other, entity)],
+        _ => Vec::new(),
+    }
+}
+
 /// The template database: what it says of each template by name (lower
 /// case), and the names by template id.
 #[derive(Clone, Debug, Default)]
@@ -283,6 +298,10 @@ pub struct Templates {
     pub effects: HashMap<u32, Vec<u32>>,
     /// How vehicles break each template's objects running into them.
     pub crashable: HashMap<u32, crate::durability::Crash>,
+    /// The parts of a template's objects vehicles break one at a time
+    /// (a hedge's sections, a gate's leaves), by id, each by its node's
+    /// name hash ([`crate::durability::crash_parts`]).
+    pub crash_parts: HashMap<u32, Vec<(u32, crate::durability::Crash)>>,
     /// The sound each template's objects make breaking (its `SoundKey`),
     /// by id ([`crate::durability::sound_keys`]).
     pub sound_keys: HashMap<u32, u32>,
@@ -308,10 +327,28 @@ pub struct Templates {
     /// "Chopper"; `M151 Softtop (VZ)`'s is `vehicle.m151softtopvz`; PC
     /// data, 2026-10-09).
     pub localized: HashMap<u32, u32>,
+    /// Each template's `_PropPhysics`, by id: the props that move when
+    /// hit ([`crate::durability::prop_physics`]).
+    pub prop_physics: HashMap<u32, crate::durability::PropPhysics>,
+    /// What each projectile does where it lands, by id
+    /// ([`crate::durability::projectiles`]).
+    pub projectiles: HashMap<u32, crate::durability::Projectile>,
+    /// Each template's `ModifierKey`, by id: the damage table's row that
+    /// says what each kind of damage does to its objects (`PropFragile`,
+    /// `Prop`, `Fence`, `Car`, ...).
+    pub modifiers: HashMap<u32, u32>,
     /// The game's damage table, if found.
     pub damage: Option<DamageTable>,
     /// Every gun, thrown weapon and vehicle armament ([`crate::weapons`]).
     pub arms: crate::weapons::Arms,
+    /// Each template's parts' health and the part that burns, by id
+    /// ([`crate::vehicle_damage::read`]).
+    pub part_healths: HashMap<u32, crate::vehicle_damage::PartHealths>,
+    /// The mixer profile each person template's `ModelMixerProfile`
+    /// names (`VZ Soldier`, `VZ Officer`: which of its model's parts it
+    /// may wear, [`m2_assets::mixer`]), by name, lower case, where it
+    /// names one; of twins by name, the lowest id's that names one.
+    pub mixer_profiles: HashMap<String, u32>,
 }
 
 impl Templates {
@@ -377,6 +414,37 @@ impl Templates {
                     .by_id(person)
                     .or_else(|| self.by_id(person | TEMPLATE_BIT))?;
                 Some((crate::population::seat_name(seat), who.to_owned()))
+            })
+            .collect()
+    }
+
+    /// A `PopulationList` template's entries by its name
+    /// (`VehList_Mar_Big_Act1`): each one's template name and weight, in
+    /// the database's order; empty for a name that is no list.
+    pub fn list(&self, name: &str) -> Vec<(String, f32)> {
+        self.ids(name)
+            .into_iter()
+            .map(|id| self.list_of(id))
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+    }
+
+    /// A `PopulationList` template's entries by its id, as
+    /// [`list`](Self::list).
+    pub fn list_of(&self, id: u32) -> Vec<(String, f32)> {
+        let lists = &self.population.lists;
+        let Some(entries) = lists
+            .get(&id)
+            .or_else(|| lists.get(&(id & !TEMPLATE_BIT)))
+            .or_else(|| lists.get(&(id | TEMPLATE_BIT)))
+        else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|&(t, w)| {
+                let (name, _) = self.by_id(t).or_else(|| self.by_id(t | TEMPLATE_BIT))?;
+                Some((name.to_owned(), w))
             })
             .collect()
     }
@@ -490,6 +558,30 @@ impl Templates {
             .iter()
             .find_map(|id| self.tuning.get(id).copied())
             .or_else(|| self.tuning_for_model(model))
+    }
+
+    /// The parts' health of template `name` (a vehicle's own), else of
+    /// the first by name of `model`'s templates that give them.
+    pub fn part_healths_for(
+        &self,
+        name: &str,
+        model: u32,
+    ) -> Option<&crate::vehicle_damage::PartHealths> {
+        if let Some(p) = self
+            .ids(name)
+            .iter()
+            .find_map(|id| self.part_healths.get(id))
+        {
+            return Some(p);
+        }
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        ids.iter().find_map(|(_, id)| self.part_healths.get(id))
     }
 
     /// The armament of template `name` (a vehicle's own), else of the
@@ -637,10 +729,18 @@ impl Templates {
         // `id`.
         let mut order: Vec<(u32, &str)> = names.iter().map(|(&id, &n)| (id, n)).collect();
         order.sort_unstable_by_key(|&(id, _)| std::cmp::Reverse(id));
+        let profiles = db.hashes("ModelMixerProfile");
         let templates = Self {
             by_name: order
                 .iter()
                 .map(|&(id, name)| (name.to_ascii_lowercase(), infos[&id]))
+                .collect(),
+            mixer_profiles: order
+                .iter()
+                .filter_map(|&(id, name)| {
+                    let p = profiles.get(&id).copied().filter(|&p| p != 0)?;
+                    Some((name.to_ascii_lowercase(), p))
+                })
                 .collect(),
             infos,
             names: names
@@ -648,6 +748,7 @@ impl Templates {
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
             tuning: crate::tuning::read(&db, damage.as_ref()),
+            part_healths: crate::vehicle_damage::read(&db),
             leavings: crate::pickup::read(&db),
             ruined: ruined(&db),
             motions: crate::motion::read_templates(&db),
@@ -660,7 +761,11 @@ impl Templates {
             ordnance: crate::ordnance::read(&db),
             effects: crate::particles::template_effects(&db),
             crashable: crate::durability::crashable(&db),
+            crash_parts: crate::durability::crash_parts(&db),
             sound_keys: crate::durability::sound_keys(&db),
+            prop_physics: crate::durability::prop_physics(&db),
+            projectiles: crate::durability::projectiles(&db),
+            modifiers: crate::durability::modifier_keys(&db),
             health: crate::tuning::healths(&db),
             speeds: crate::tuning::human_speeds(&db),
             human_sets: crate::tuning::human_animation_sets(&db),
@@ -826,7 +931,26 @@ pub struct SpawnPoint {
     /// The rifle its template's `EquipmentLink`s hand it
     /// ([`Templates::rifle_of`]); `None` when they hand it none.
     pub gun: Option<HandGun>,
+    /// For a spawner: its `SecondsPerCycle`, how long after its last one
+    /// fell it sends another.
+    pub cycle: Option<f32>,
 }
+
+/// Passers-by on the roads (`WorldIndex::add_walkers`) have entities
+/// from here up, which no layer uses.
+pub const WALKER_BASE: u32 = 0xf100_0000;
+
+/// Whether spawn entity `entity` is a passer-by on a road.
+pub fn is_walker(entity: u32) -> bool {
+    entity & 0xff00_0000 == WALKER_BASE
+}
+
+/// One passer-by per this many metres of road with a walkway in a zone
+/// with people, who walks to and fro along this much of it (metres;
+/// invented: the zones say how many are out, not where; the walkway
+/// they keep to is the road's own, [`Road::walk_offsets`]).
+const WALKER_EVERY: f32 = 90.0;
+const WALKER_STRETCH: f32 = 60.0;
 
 /// Where everything on the island is.
 #[derive(Clone, Debug, Default)]
@@ -853,6 +977,8 @@ pub struct WorldIndex {
     /// Each tree species' far stand-in, by species (the tree table's
     /// order; `None` for a species not placed).
     pub far_trees: Vec<Option<FarTree>>,
+    /// Each tree species' template, by species (the tree table's order).
+    pub tree_templates: Vec<u32>,
     /// The outdoor light and air (ambient cube, sunlight, haze).
     pub atmosphere: Option<Atmosphere>,
     /// The regions whose light differs from it (`vz_atmosphere_regions`).
@@ -872,6 +998,10 @@ pub struct WorldIndex {
     /// Those of [`state_objects`](Self::state_objects) whose template
     /// stands destroyed ([`Templates::ruined`]): drawn as their wrecks.
     pub ruined: HashSet<u32>,
+    /// What is destroyed with each entity (`DestructionLink`, every
+    /// layer): a lamp with the dock it stands on, a gate's leaves with
+    /// its arch ([`WorldIndex::add_links`]).
+    pub falls_with: HashMap<u32, Vec<u32>>,
     /// With `M2_LOG_FOLIAGE=on` only: each named entity of the static
     /// layers, its name and how it was placed (`m` by `ModelName`, `p` by
     /// its name or template, `v` a vehicle or unknown template, `c` left
@@ -883,6 +1013,87 @@ pub struct WorldIndex {
     /// Spawners of vehicles the layers place (`PointTraffic_*`,
     /// `PathSpawner_*`).
     pub traffic: Vec<TrafficPoint>,
+    /// The road network: every `Road` the layers place, with its path.
+    pub roads: Vec<Road>,
+    /// Where roads meet (`RoadIntersection`).
+    pub junctions: Vec<Junction>,
+    /// The areas' traffic and passers-by (`PopulationDensity`).
+    pub zones: Vec<crate::population::DensityZone>,
+}
+
+/// A road a layer places: the line its path draws in the world (its
+/// middle, as the trees cleared off it show), between two junctions'
+/// ports.
+///
+/// Its kind is the name its record gives at 4: its template's name
+/// without the leading underscore (`commercial_road10`, 57 kinds over
+/// the 3,667 roads), whose `LaneData` says what strips it has
+/// ([`RoadLanes`]). Its record's vectors at 16 and 28 are a box round it
+/// in the entity's space: its path widened by the same distance each
+/// side (read off the install, 2026-10-15: every one of the 184
+/// `commercial_road10`s whose path runs along an axis is 13.00 m wider
+/// each side, the `commercial_road20`s 22.00 m, the `commercial_road5`s
+/// 9.00 m; a `road10` junction's ports are 13 m from its middle). So
+/// that distance is taken as its half-width, the median over its kind
+/// (a bent path's box spreads less or more).
+///
+/// [`RoadLanes`]: crate::population::RoadLanes
+#[derive(Clone, Debug, PartialEq)]
+pub struct Road {
+    pub entity: u32,
+    /// The layer placing it, by name hash (`vz_mar_roads`).
+    pub layer: u32,
+    pub points: Vec<Vec3>,
+    /// Metres across: twice its kind's half-width, by the boxes; where
+    /// the boxes say nothing, [`road_width`].
+    pub width: f32,
+    /// Its kind's name hash (the record's word at 4).
+    pub kind: u32,
+    /// Its kind's `LaneData`, if the kind has one.
+    pub lanes: Option<crate::population::RoadLanes>,
+    /// Whether its kind's template has no `LaneData` but is named a road
+    /// (`_mar_commercial_road20Clean`): driven as one lane each way.
+    pub named_road: bool,
+}
+
+impl Road {
+    /// Whether traffic drives it: it has a lane of traffic (none of the
+    /// sidewalks, curbs, walls and driveways placed as roads do), or no
+    /// `LaneData` but a road's name.
+    pub fn drivable(&self) -> bool {
+        match &self.lanes {
+            Some(l) => !l.traffic(self.width / 2.0).is_empty(),
+            None => self.named_road,
+        }
+    }
+
+    /// How far right of its line vehicles keep, metres, a lane each
+    /// (inner first): its lanes of traffic's middles, else half of its
+    /// right half.
+    pub fn lane_offsets(&self) -> Vec<f32> {
+        match &self.lanes {
+            Some(l) => l.traffic(self.width / 2.0),
+            None if self.named_road => vec![self.width / 4.0],
+            None => Vec::new(),
+        }
+    }
+
+    /// How far each side of its line people walk, metres: its walkways'
+    /// middles.
+    pub fn walk_offsets(&self) -> Vec<f32> {
+        self.lanes
+            .map(|l| l.walkways(self.width / 2.0))
+            .unwrap_or_default()
+    }
+}
+
+/// Where roads meet: each road's entity and the port, in the world, where
+/// its path ends.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Junction {
+    pub entity: u32,
+    pub position: Vec3,
+    pub ports: Vec<(u32, Vec3)>,
 }
 
 /// A placed entity of the static layers, as a building of a merged batch.
@@ -979,6 +1190,19 @@ fn rotation(q: [f32; 4]) -> Quat {
 }
 
 impl WorldIndex {
+    /// The template placed object `i` is an instance of: its entity's, or
+    /// for a tree its species' ([`tree_templates`](Self::tree_templates));
+    /// 0 for none.
+    pub fn object_template(&self, i: usize) -> u32 {
+        let Some(o) = self.objects.get(i) else {
+            return 0;
+        };
+        match tree_species(o.entity) {
+            Some(s) if o.template == 0 => self.tree_templates.get(s).copied().unwrap_or(0),
+            _ => o.template,
+        }
+    }
+
     /// Reads every entity layer in the archive.
     pub fn build<R: Read + Seek>(source: &mut AssetSource<R>) -> Result<Self, AssetError> {
         let index = source.archive().index();
@@ -1020,8 +1244,9 @@ impl WorldIndex {
             ..Self::default()
         };
         let mut routes = Routes::default();
-        // Each road's placement and path, for clearing trees off it.
-        let mut roads: Vec<(Vec3, Quat, u32)> = Vec::new();
+        // Each road's placement and path, for clearing trees off it and
+        // for the traffic.
+        let mut roads: Vec<PlacedRoad> = Vec::new();
         for (block, is_static) in blocks {
             let decoded = source.block(block)?;
             for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -1035,16 +1260,39 @@ impl WorldIndex {
                 if let Some(c) = layer.component("Road") {
                     let placements = layer.placements();
                     for (entity, rec) in c.records().unwrap_or_default() {
-                        let (Some(p), Some(path)) = (
-                            placements.get(&entity),
-                            rec.get(..4)
-                                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-                        ) else {
+                        let word = |o: usize| {
+                            rec.get(o..o + 4)
+                                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        };
+                        let float =
+                            |o: usize| word(o).map(f32::from_bits).filter(|f| f.is_finite());
+                        let corner =
+                            |o: usize| Some(Vec3::new(float(o)?, float(o + 4)?, float(o + 8)?));
+                        let (Some(p), Some(path)) = (placements.get(&entity), word(0)) else {
                             continue;
                         };
-                        roads.push((Vec3::from(p.position), rotation(p.rotation), path));
+                        roads.push(PlacedRoad {
+                            entity,
+                            layer: e.name_hash,
+                            template: p.parent,
+                            at: Vec3::from(p.position),
+                            turn: rotation(p.rotation),
+                            path,
+                            kind: word(ROAD_KIND).unwrap_or(0),
+                            bounds: corner(ROAD_BOX).zip(corner(ROAD_BOX + 12)),
+                        });
                     }
                 }
+                world.add_junctions(&layer);
+                world.zones.extend(crate::population::read_zones(
+                    &layer,
+                    e.name_hash,
+                    is_static,
+                    |h| {
+                        let data = source.asset(h, m2_assets::region::REGION_TYPE).ok()?;
+                        Some(m2_assets::Region::parse(&data).ok()?.corners)
+                    },
+                ));
                 if layer.component("AtmosphereBase").is_some() {
                     world
                         .atmosphere_regions
@@ -1063,9 +1311,24 @@ impl WorldIndex {
                 world.add_traffic(&layer, e.name_hash, is_static, &assets.templates);
             }
         }
-        let roads = RoadLines::read(source, &roads);
-        world.add_trees(source, &assets.templates, &roads);
+        world.add_roads(source, &roads, &assets.templates);
+        let mut lines = RoadLines::default();
+        for road in &world.roads {
+            for w in road.points.windows(2) {
+                lines.add([w[0].x, w[0].z, w[1].x, w[1].z]);
+            }
+        }
+        world.add_trees(source, &assets.templates, &lines);
         world.template_db = assets.templates;
+        let before = world.spawns.len();
+        world.add_walkers();
+        eprintln!(
+            "roads: {} roads, {} junctions, {} traffic zones, {} passers-by placed",
+            world.roads.len(),
+            world.junctions.len(),
+            world.zones.len(),
+            world.spawns.len() - before
+        );
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
         let mut path_points = |asset: u32| -> Vec<Vec3> {
             paths
@@ -1121,6 +1384,13 @@ impl WorldIndex {
     /// model stands upright at the position and at its own size (the
     /// species' scale range has no per-tree value to pick from).
     ///
+    /// Each tree is an instance of its species' template, as what the
+    /// layers place is of its entity's: its `Health`, `ModifierKey` and
+    /// `PhysicsPropertyCrashable` say how it reacts when hit (survey
+    /// `trees`, round 7: the small jungle canopies flatten under any
+    /// vehicle, the palms and small trees break, the medium and tall
+    /// jungle trees stand; rockets fell them).
+    ///
     /// Trees within [`ROAD_CLEAR`] of a road are left out: the table puts
     /// some there (893 within 3 m island-wide, round DX), which the game's
     /// footage shows clear, with trees along the edges.
@@ -1153,6 +1423,7 @@ impl WorldIndex {
             .copied();
         let mut no_model: Vec<(u32, usize)> = Vec::new();
         let mut cleared = 0usize;
+        self.tree_templates = table.species.iter().map(|s| s.template).collect();
         for (species, s) in table.species.iter().enumerate() {
             let model = templates.by_id(s.template).and_then(|(_, t)| t.model);
             let Some(model) = model.filter(|_| species < 1 << 12 && s.trees.len() <= 1 << 16)
@@ -1175,7 +1446,7 @@ impl WorldIndex {
                         rotation: Quat::from_rotation_y(t.yaw()),
                         named: true,
                         fade: Some(s.fade),
-                        template: 0,
+                        template: s.template,
                     }),
             );
             cleared += s.trees.len() - (self.objects.len() - before);
@@ -1317,6 +1588,10 @@ impl WorldIndex {
                 list: people_of(id, p),
                 ai,
                 gun: templates.rifle_of(p.parent).map(|(_, g)| g),
+                cycle: own_spawners
+                    .get(&id)
+                    .or_else(|| templates.population.spawners.get(&p.parent))
+                    .map(|s| s.seconds_per_cycle),
             }
         };
         for component in ["PopulationSimpleSpawner", "Ai", "AiPatrol"] {
@@ -1432,9 +1707,58 @@ impl WorldIndex {
         }
     }
 
+    /// A layer's `DestructionLink`s: an entity's record names another
+    /// (its first field) and a direction. Over the 2,431 records in the
+    /// layers, the two ends of a lamp on a dock (`_Proutpost_lampA`,
+    /// `_proutpost_dockB`), a sign on a bridge, a pipe on its support name
+    /// each other, the dock's with direction 1 and the lamp's with 2; 3
+    /// links pipes and their supports, and catwalks, both ways. Read as:
+    /// 1, the one named is destroyed with this one; 2, this one is
+    /// destroyed with the one named (it stands on it); 3, both. The villa
+    /// gate's leaves (`pmc_middle_gate`) name its arch with 2. From
+    /// samples; the record's float (0, 1 on 74, 0.2 on 3) is not read.
+    fn add_links(&mut self, layer: &Layer<'_>) {
+        let Some(c) = layer.component("DestructionLink") else {
+            return;
+        };
+        let field = |h: u32| {
+            c.fields
+                .iter()
+                .find(|f| f.name_hash == h)
+                .map(|f| (usize::from(f.offset), f.bit_shift, f.bit_width))
+        };
+        let (Some(to), Some(way)) = (field(LINK_TARGET), field(name_hash("direction"))) else {
+            return;
+        };
+        let word = |r: &[u8], (at, shift, width): (usize, u8, u8)| {
+            let b = r.get(at..at + 4)?;
+            let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            Some(if (1..32).contains(&width) {
+                (v >> shift) & ((1 << width) - 1)
+            } else {
+                v
+            })
+        };
+        for (entity, r) in c.records().unwrap_or_default() {
+            let (Some(other), Some(way)) = (word(r, to), word(r, way)) else {
+                continue;
+            };
+            if other == 0 || other == entity {
+                continue;
+            }
+            for (from, to) in falls(entity, other, way) {
+                let v = self.falls_with.entry(from).or_default();
+                if !v.contains(&to) {
+                    v.push(to);
+                }
+            }
+        }
+    }
+
     fn add_layer(&mut self, layer: &Layer<'_>, layer_hash: u32, is_static: bool, assets: &Assets) {
         let placements = layer.placements();
         self.add_motions(layer, &placements, &assets.templates);
+        self.add_links(layer);
         let at = |entity| placements.get(&entity);
         for (entity, asset) in layer.hashes("TerrainObject") {
             if let Some(p) = at(entity) {
@@ -1805,6 +2129,9 @@ pub struct TerrainMesh {
     pub indices: Vec<u32>,
     /// What each range is drawn with.
     pub surfaces: Vec<TerrainSurface>,
+    /// What the ground of each of `surfaces` is made of: its material's
+    /// surface word ([`crate::surface`]; 0 for none).
+    pub made_of: Vec<u32>,
     /// (first index, index count, index into `surfaces`), one per surface
     /// used, back to back over `indices`.
     pub ranges: Vec<(u32, u32, usize)>,
@@ -1861,7 +2188,15 @@ impl TerrainMesh {
             .chunks_exact(3)
             .map(|t| [t[0], t[1], t[2]])
             .collect();
-        self.collision = CollisionShape::mesh(&self.positions(), &triangles);
+        let mut surfaces = vec![0; triangles.len()];
+        for &(first, count, s) in &self.ranges {
+            let made_of = self.made_of.get(s).copied().unwrap_or(0);
+            let (a, b) = ((first / 3) as usize, ((first + count) / 3) as usize);
+            if let Some(run) = surfaces.get_mut(a..b.min(triangles.len())) {
+                run.fill(made_of);
+            }
+        }
+        self.collision = CollisionShape::mesh_of(&self.positions(), &triangles, &surfaces);
     }
 
     pub fn vertex_desc(&self) -> VertexBufferDesc {
@@ -2161,6 +2496,7 @@ pub fn terrain_cell<R: Read + Seek>(
     })?;
     let mut mesh = TerrainMesh::empty(centre);
     mesh.surfaces = cell.materials.iter().map(cell_surface).collect();
+    mesh.made_of = cell.materials.iter().map(|m| m.material.surface).collect();
     // Groups drawn without a material range use the cell's plain ground.
     let fallback = mesh.surfaces.len();
     mesh.surfaces.push(TerrainSurface::Ground {
@@ -2406,6 +2742,14 @@ mod tests {
         assert_eq!(mesh.ranges, vec![(0, 6 + 4 * 12, 0)]);
         assert_eq!(mesh.bounds.0.y, -2.0);
         assert!(mesh.indices.iter().all(|&i| i < 8));
+        // The ground's collision is made of what its range's material is.
+        mesh.made_of = vec![m2_assets::name_hash("TERRAIN_DIRT")];
+        mesh.build_collision();
+        let collision = mesh.collision.as_ref().unwrap();
+        assert_eq!(
+            &collision.surfaces[..],
+            &[(0, m2_assets::name_hash("TERRAIN_DIRT"))]
+        );
     }
 
     #[test]
@@ -2460,28 +2804,259 @@ struct RoadLines {
 /// Side of a [`RoadLines`] bin (metres).
 const ROAD_BIN: f32 = 32.0;
 
-impl RoadLines {
-    /// Each road's path, placed by its entity's transform.
-    fn read<R: Read + Seek>(source: &mut AssetSource<R>, roads: &[(Vec3, Quat, u32)]) -> Self {
-        let mut lines = Self::default();
+impl WorldIndex {
+    /// Each road's path, placed by its entity's transform, with its
+    /// layer and how wide its template's name says it is.
+    fn add_roads<R: Read + Seek>(
+        &mut self,
+        source: &mut AssetSource<R>,
+        roads: &[PlacedRoad],
+        templates: &Templates,
+    ) {
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
-        for &(at, q, path) in roads {
-            let points = paths.entry(path).or_insert_with(|| {
+        // Each kind's half-widths, a road each, by its box.
+        let mut spreads: HashMap<u32, Vec<f32>> = HashMap::new();
+        let mut placed: Vec<(&PlacedRoad, Vec<Vec3>)> = Vec::new();
+        for road in roads {
+            let points = paths.entry(road.path).or_insert_with(|| {
                 source
-                    .asset(path, PATH_TYPE)
+                    .asset(road.path, PATH_TYPE)
                     .ok()
                     .and_then(|data| Path::parse(&data).ok())
                     .map(|p| p.points.into_iter().map(Vec3::from).collect())
                     .unwrap_or_default()
             });
-            for w in points.windows(2) {
-                let (a, b) = (at + q * w[0], at + q * w[1]);
-                lines.add([a.x, a.z, b.x, b.z]);
+            if points.len() < 2 {
+                continue;
             }
+            if let Some(spread) = road.bounds.and_then(|b| box_spread(points, b)) {
+                spreads.entry(road.kind).or_default().push(spread);
+            }
+            placed.push((road, points.clone()));
         }
-        lines
+        let half: HashMap<u32, f32> = spreads
+            .into_iter()
+            .filter_map(|(kind, mut s)| {
+                s.sort_by(f32::total_cmp);
+                Some((kind, *s.get(s.len() / 2)?))
+            })
+            .collect();
+        let kinds = &templates.population.road_kinds;
+        for (road, points) in placed {
+            let template = templates.by_id(road.template).map_or("", |(n, _)| n);
+            let kind = kinds.get(&road.kind);
+            self.roads.push(Road {
+                entity: road.entity,
+                layer: road.layer,
+                points: points.iter().map(|&p| road.at + road.turn * p).collect(),
+                width: half
+                    .get(&road.kind)
+                    .filter(|&&h| h > 0.0)
+                    .map_or_else(|| road_width(template), |h| 2.0 * h),
+                kind: road.kind,
+                lanes: kind.and_then(|k| k.lanes),
+                named_road: kind.is_some_and(|k| k.lanes.is_none()),
+            });
+        }
     }
 
+    /// A layer's `RoadIntersection`s: each names up to six roads (its
+    /// first six fields) and where each meets it (six offsets from its
+    /// place, at 28). Read off the install (free roam round F3): the
+    /// roads' paths end at these ports.
+    fn add_junctions(&mut self, layer: &Layer<'_>) {
+        let Some(c) = layer.component("RoadIntersection") else {
+            return;
+        };
+        let placements = layer.placements();
+        for (entity, rec) in c.records().unwrap_or_default() {
+            let Some(p) = placements.get(&entity) else {
+                continue;
+            };
+            let (at, q) = (Vec3::from(p.position), rotation(p.rotation));
+            let word = |o: usize| {
+                rec.get(o..o + 4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            };
+            let float = |o: usize| word(o).map(f32::from_bits).filter(|f| f.is_finite());
+            let ports: Vec<(u32, Vec3)> = (0..6)
+                .filter_map(|i| {
+                    let road = word(i * 4).filter(|&r| r != 0)?;
+                    let o = JUNCTION_PORTS + i * 12;
+                    let off = Vec3::new(float(o)?, float(o + 4)?, float(o + 8)?);
+                    Some((road, at + q * off))
+                })
+                .collect();
+            if !ports.is_empty() {
+                self.junctions.push(Junction {
+                    entity,
+                    position: at,
+                    ports,
+                });
+            }
+        }
+    }
+}
+
+impl WorldIndex {
+    /// Passers-by along the roads, where an area's traffic zone
+    /// ([`crate::population::DensityZone`]) has people: one per
+    /// [`WALKER_EVERY`] metres, each a spawner of the list of the zone
+    /// that rules there (whichever layers are in), walking to and fro
+    /// along a stretch of the road's edge, the sides taken in turn. Each
+    /// stands while its zone's layer is in.
+    fn add_walkers(&mut self) {
+        let templates = &self.template_db;
+        let mut lists: HashMap<u32, Vec<(String, u32, f32)>> = HashMap::new();
+        let mut walkers = Vec::new();
+        for road in &self.roads {
+            // On its outer walkway; a road without one has none walking.
+            let Some(&out) = road.walk_offsets().last() else {
+                continue;
+            };
+            let length = path_length(&road.points);
+            let mut along = WALKER_EVERY / 2.0;
+            while along + WALKER_STRETCH / 2.0 < length {
+                let s = along;
+                along += WALKER_EVERY;
+                let (mid, _) = point_along(&road.points, s);
+                let Some(zone) = crate::population::zone_at(&self.zones, mid.x, mid.z)
+                    .filter(|z| z.people > 0 && z.people_list != 0)
+                else {
+                    continue;
+                };
+                let list = lists.entry(zone.people_list).or_insert_with(|| {
+                    templates
+                        .list_of(zone.people_list)
+                        .into_iter()
+                        .filter_map(|(name, w)| {
+                            let info = templates.get(&name)?;
+                            let model = info.model.filter(|_| info.human)?;
+                            Some((name, model, w))
+                        })
+                        .collect()
+                });
+                if list.is_empty() {
+                    continue;
+                }
+                let side = if walkers.len() % 2 == 0 { 1.0 } else { -1.0 };
+                let from = (s - WALKER_STRETCH / 2.0).max(0.0);
+                let route: Vec<Vec3> = (0..=6)
+                    .map(|i| {
+                        let t = from + WALKER_STRETCH * i as f32 / 6.0;
+                        let (at, dir) = point_along(&road.points, t);
+                        at + Vec3::new(dir.z, 0.0, -dir.x) * out * side
+                    })
+                    .collect();
+                walkers.push(SpawnPoint {
+                    entity: WALKER_BASE + walkers.len() as u32,
+                    name: format!("walker of {}", zone.name),
+                    template: None,
+                    position: route[0],
+                    rotation: Quat::IDENTITY,
+                    route,
+                    layer: Some(zone.layer),
+                    static_layer: zone.static_layer,
+                    model: None,
+                    list: list.clone(),
+                    ai: None,
+                    gun: None,
+                    cycle: None,
+                });
+            }
+        }
+        self.spawns.extend(walkers);
+    }
+}
+
+/// How long a path is along the ground, metres.
+pub fn path_length(points: &[Vec3]) -> f32 {
+    points.windows(2).map(|w| w[0].distance(w[1])).sum()
+}
+
+/// The point `s` metres along a path and the way it runs there (level,
+/// unit length); past either end, the end.
+pub fn point_along(points: &[Vec3], s: f32) -> (Vec3, Vec3) {
+    let mut left = s.max(0.0);
+    for w in points.windows(2) {
+        let d = w[0].distance(w[1]);
+        let dir = Vec3::new(w[1].x - w[0].x, 0.0, w[1].z - w[0].z).normalize_or(Vec3::Z);
+        if left <= d || d == 0.0 && left == 0.0 {
+            let t = if d > 0.0 { left / d } else { 0.0 };
+            return (w[0].lerp(w[1], t), dir);
+        }
+        left -= d;
+    }
+    match points {
+        [.., a, b] => (
+            *b,
+            Vec3::new(b.x - a.x, 0.0, b.z - a.z).normalize_or(Vec3::Z),
+        ),
+        [a] => (*a, Vec3::Z),
+        [] => (Vec3::ZERO, Vec3::Z),
+    }
+}
+
+/// Where a `RoadIntersection` record's six port offsets start.
+const JUNCTION_PORTS: usize = 28;
+
+/// A `Road` record's kind (its template's name hash, without the
+/// underscore) and its box's two corners ([`Road`]).
+const ROAD_KIND: usize = 4;
+const ROAD_BOX: usize = 16;
+
+/// A road as its layer places it.
+struct PlacedRoad {
+    entity: u32,
+    layer: u32,
+    /// Its entity's template (the placement's parent).
+    template: u32,
+    at: Vec3,
+    turn: Quat,
+    /// Its path asset.
+    path: u32,
+    kind: u32,
+    /// Its record's box, in the entity's space.
+    bounds: Option<(Vec3, Vec3)>,
+}
+
+/// How far a road's box reaches past its path's own, the most of its
+/// four sides (x and z): its half-width where the path runs along an
+/// axis.
+fn box_spread(points: &[Vec3], (lo, hi): (Vec3, Vec3)) -> Option<f32> {
+    let first = *points.first()?;
+    let (a, b) = points
+        .iter()
+        .fold((first, first), |(a, b), &p| (a.min(p), b.max(p)));
+    let spread = (a.x - lo.x).max(hi.x - b.x).max(a.z - lo.z).max(hi.z - b.z);
+    (spread.is_finite() && spread >= 0.0).then_some(spread)
+}
+
+/// How wide a road is, metres, by its template's name: the number after
+/// "road" (`_commercial_road10t`, `_outskirt_road5`, `A8 15m Road`);
+/// 8 where the name has none. Inferred from the names: only for a road
+/// whose kind's boxes say nothing ([`Road`]).
+pub fn road_width(template: &str) -> f32 {
+    let lower = template.to_ascii_lowercase();
+    let after = lower.find("road").map(|i| &lower[i + 4..]);
+    let before = lower.find("m road").map(|i| {
+        let head = &lower[..i];
+        let start = head
+            .rfind(|c: char| !c.is_ascii_digit())
+            .map_or(0, |j| j + 1);
+        &head[start..]
+    });
+    let digits = |s: &str| -> Option<f32> {
+        let n: String = s.chars().take_while(char::is_ascii_digit).collect();
+        n.parse().ok().filter(|&w: &f32| (3.0..=40.0).contains(&w))
+    };
+    after
+        .and_then(digits)
+        .or_else(|| before.and_then(digits))
+        .unwrap_or(8.0)
+}
+
+impl RoadLines {
     fn bin(x: f32, z: f32) -> (i32, i32) {
         ((x / ROAD_BIN).floor() as i32, (z / ROAD_BIN).floor() as i32)
     }
@@ -2528,6 +3103,79 @@ mod road_tests {
     use super::*;
 
     #[test]
+    fn a_roads_width_is_in_its_templates_name() {
+        assert_eq!(road_width("_commercial_road10t"), 10.0);
+        assert_eq!(road_width("_outskirt_road5"), 5.0);
+        assert_eq!(road_width("_commercial_road20Clean"), 20.0);
+        assert_eq!(road_width("A8 15m Road"), 15.0);
+        assert_eq!(road_width("Road"), 8.0);
+        assert_eq!(road_width(""), 8.0);
+    }
+
+    #[test]
+    fn a_roads_box_spreads_past_its_path_by_its_half_width() {
+        // A `commercial_road10` off the install: its path runs 78.42 m up
+        // z, about a metre off the axis; its box reaches 13 m past it.
+        let path = [
+            Vec3::new(-1.16, -0.11, 0.0),
+            Vec3::new(0.3, 0.0, 40.0),
+            Vec3::new(1.15, 0.0, 78.42),
+        ];
+        let b = (Vec3::new(-14.16, -0.11, 0.0), Vec3::new(14.15, 0.17, 78.42));
+        let s = box_spread(&path, b).unwrap();
+        assert!((s - 13.0).abs() < 1e-3, "{s}");
+        assert_eq!(box_spread(&[], b), None);
+    }
+
+    #[test]
+    fn only_roads_with_a_lane_of_traffic_are_driven() {
+        use crate::population::RoadLanes;
+        let mut r = Road {
+            entity: 1,
+            layer: 0,
+            points: vec![Vec3::ZERO, Vec3::Z * 50.0],
+            width: 26.0,
+            kind: 0,
+            lanes: Some(RoadLanes {
+                strips: [(3, 5.0), (0, 8.0), (1, 4.0), (3, 5.0)],
+                direction: None,
+            }),
+            named_road: false,
+        };
+        assert!(r.drivable());
+        let one = |v: Vec<f32>, want: f32| v.len() == 1 && (v[0] - want).abs() < 1e-4;
+        assert!(one(r.lane_offsets(), 13.0 * 4.0 / 12.0));
+        assert!(one(r.walk_offsets(), 13.0 * 10.0 / 12.0));
+        // A curb: no strips.
+        r.lanes = Some(RoadLanes {
+            strips: [(3, 5.0); 4],
+            direction: None,
+        });
+        assert!(!r.drivable());
+        assert!(r.walk_offsets().is_empty());
+        // No `LaneData`: driven if its template is named a road.
+        r.lanes = None;
+        assert!(!r.drivable());
+        r.named_road = true;
+        assert!(r.drivable());
+        assert_eq!(r.lane_offsets(), vec![6.5]);
+    }
+
+    #[test]
+    fn points_along_a_path() {
+        let p = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 10.0),
+            Vec3::new(10.0, 0.0, 10.0),
+        ];
+        assert_eq!(path_length(&p), 20.0);
+        assert_eq!(point_along(&p, 5.0), (Vec3::new(0.0, 0.0, 5.0), Vec3::Z));
+        assert_eq!(point_along(&p, 15.0), (Vec3::new(5.0, 0.0, 10.0), Vec3::X));
+        assert_eq!(point_along(&p, 99.0), (Vec3::new(10.0, 0.0, 10.0), Vec3::X));
+        assert!(is_walker(WALKER_BASE + 7) && !is_walker(0x0012_3456));
+    }
+
+    #[test]
     fn finds_points_near_a_road() {
         let mut roads = RoadLines::default();
         roads.add([0.0, 0.0, 100.0, 0.0]);
@@ -2535,5 +3183,59 @@ mod road_tests {
         assert!(roads.near(-2.0, 0.0, ROAD_CLEAR));
         assert!(!roads.near(50.0, 5.0, ROAD_CLEAR));
         assert!(!roads.near(110.0, 0.0, ROAD_CLEAR));
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn what_stands_on_another_falls_with_it() {
+        // The dock (1) names its lamp (2) with direction 1; the lamp names
+        // the dock with 2: either way, the lamp goes when the dock does.
+        assert_eq!(falls(1, 2, 1), vec![(1, 2)]);
+        assert_eq!(falls(2, 1, 2), vec![(1, 2)]);
+        // The villa gate's leaves (3) name its arch (4) with 2.
+        assert_eq!(falls(3, 4, 2), vec![(4, 3)]);
+        // A pipe and its support go together.
+        assert_eq!(falls(5, 6, 3), vec![(5, 6), (6, 5)]);
+        assert!(falls(5, 6, 0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn a_tree_is_an_instance_of_its_species_template() {
+        let placed = |entity, template| ObjectPlacement {
+            entity,
+            model: 1,
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            named: true,
+            fade: None,
+            template,
+        };
+        let index = WorldIndex {
+            objects: vec![
+                // Species 1's third tree, as an index built before trees
+                // carried their template had it; then as it does.
+                placed(TREE_ENTITIES | 1 << 16 | 2, 0),
+                placed(TREE_ENTITIES | 1 << 16 | 2, 0x8000_89be),
+                // A layer's entity.
+                placed(0x0012_3456, 0x8000_4ce8),
+                placed(0x0012_3457, 0),
+            ],
+            tree_templates: vec![0x8000_4ce8, 0x8000_89be],
+            ..WorldIndex::default()
+        };
+        assert_eq!(index.object_template(0), 0x8000_89be);
+        assert_eq!(index.object_template(1), 0x8000_89be);
+        assert_eq!(index.object_template(2), 0x8000_4ce8);
+        assert_eq!(index.object_template(3), 0);
+        assert_eq!(index.object_template(9), 0);
     }
 }

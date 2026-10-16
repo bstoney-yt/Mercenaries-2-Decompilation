@@ -23,6 +23,9 @@
 //! cargo run -p m2-assets --example wad -- movies  <archive.wad>
 //! cargo run -p m2-assets --example wad -- actions <archive.wad> <movie name>
 //! cargo run -p m2-assets --example wad -- fonts   <archive.wad>
+//! cargo run -p m2-assets --example wad -- flashfonts <archive.wad>
+//! cargo run -p m2-assets --example wad -- flashmasks <archive.wad>
+//! cargo run -p m2-assets --example wad -- flashtext <archive.wad>
 //! ```
 //!
 //! `textures` parses every texture header, finds its streamed mips and checks
@@ -219,6 +222,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ("movies", []) => movies(&mut wad)?,
         ("actions", [name]) => actions(&mut wad, name)?,
         ("fonts", []) => fonts(&mut wad)?,
+        ("flashfonts", []) => flash_fonts(&mut wad)?,
+        ("flashmasks", []) => flash_masks(&mut wad)?,
+        ("flashtext", []) => flash_text(&mut wad)?,
         ("dds", [name, out]) => {
             let dds = texture_dds(&mut wad, name)?;
             std::fs::write(out, &dds)?;
@@ -2448,5 +2454,250 @@ fn fonts<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
         }
     }
     println!("{count} fonts, {bad} problems");
+    Ok(())
+}
+
+/// Every Flash texture font in the archive's movies: its metrics (ems), the
+/// size its glyphs were drawn at, and how far some glyphs reach above and
+/// below the baseline in their texture, as a share of that size.
+fn flash_fonts<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    let (mut movies, mut with_text, mut fields) = (0, 0, 0);
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != MOVIE_TYPE {
+                continue;
+            }
+            let Ok(movie) = movie_from_asset(data) else {
+                continue;
+            };
+            let mut book = m2_assets::flash::FontBook::default();
+            book.add_movie(&movie);
+            movies += 1;
+            let n = movie
+                .tags
+                .iter()
+                .filter(|t| t.code == m2_assets::gfx::tag::DEFINE_EDIT_TEXT)
+                .count();
+            fields += n;
+            with_text += usize::from(n > 0);
+            let pads: HashMap<String, f32> = movie
+                .tags
+                .iter()
+                .filter(|t| t.code == 1002)
+                .filter_map(|t| m2_assets::flash::text::FontTexture::parse(movie.data(t)))
+                .map(|t| (t.name, t.pad))
+                .collect();
+            let mut names: Vec<_> = book.fonts.keys().cloned().collect();
+            names.sort();
+            for n in names {
+                let f = &book.fonts[&n];
+                let Some((tex, size, nominal, glyphs)) = &f.texture else {
+                    continue;
+                };
+                // The texture's reach over all the font's glyphs (pixels)
+                // against the font's ascent + descent (ems).
+                let (mut up, mut down) = (0f32, 0f32);
+                for g in glyphs.iter().flatten() {
+                    up = up.max((g.origin[1] - g.uv[1]) * size[1]);
+                    down = down.max((g.uv[3] - g.origin[1]) * size[1]);
+                }
+                let pad = pads.get(tex).copied().unwrap_or(0.0);
+                let mut reach = format!(
+                    " reach +{up:.0}/-{down:.0} px pad {pad}, em {:.1} px",
+                    (up + down - 2.0 * pad) / (f.ascent + f.descent)
+                );
+                for c in ['H', '_', '\u{2014}', '\u{2013}', 'W', 'M'] {
+                    let Some(g) = f
+                        .codes
+                        .get(&c)
+                        .and_then(|&i| glyphs.get(usize::from(i)).copied().flatten())
+                    else {
+                        continue;
+                    };
+                    let up = (g.origin[1] - g.uv[1]) * size[1] / nominal;
+                    let down = (g.uv[3] - g.origin[1]) * size[1] / nominal;
+                    let wide = (g.uv[2] - g.uv[0]) * size[0] / nominal;
+                    reach.push_str(&format!(" {c}:+{up:.3}/-{down:.3}/w{wide:.3}"));
+                    if let Some(a) = f
+                        .codes
+                        .get(&c)
+                        .and_then(|&i| f.advances.get(usize::from(i)))
+                    {
+                        let px = (g.uv[2] - g.uv[0]) * size[0];
+                        reach.push_str(&format!("[adv {a:.3} px {px:.1}]"));
+                    }
+                }
+                println!(
+                    "{:08x} {n} ({}) asc {:.3} desc {:.3} lead {:.3} nominal {nominal} tex {tex} {}x{} glyphs {}{reach}",
+                    e.name_hash,
+                    f.name,
+                    f.ascent,
+                    f.descent,
+                    f.leading,
+                    size[0],
+                    size[1],
+                    f.codes.len()
+                );
+            }
+        }
+    }
+    println!("{fields} text fields in {with_text} of {movies} movies");
+    Ok(())
+}
+
+/// Every Flash mask in the archive's movies (a `PlaceObject` with a clip
+/// depth): how much of its box its shape fills. A mask drawn as its box
+/// shows the whole box; drawn as its shape, only that share.
+fn flash_masks<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    use m2_assets::flash::{Library, player::Control};
+    let (mut movies, mut with_masks) = (0, 0);
+    let (mut shapes, mut cut, mut sprites, mut sum) = (0, 0, 0, 0.0f64);
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != MOVIE_TYPE {
+                continue;
+            }
+            let Ok(movie) = movie_from_asset(data) else {
+                continue;
+            };
+            movies += 1;
+            let lib = Library::new(&movie);
+            // The characters placed as masks, and the shapes a mask
+            // sprite's frames hold (one level down).
+            let mut masks = std::collections::BTreeSet::new();
+            let timelines = std::iter::once(&lib.root).chain(lib.sprites.values());
+            for t in timelines {
+                for p in t.frames.iter().flatten().filter_map(|c| match c {
+                    Control::Place(p) if p.clip_depth.is_some() => p.character,
+                    _ => None,
+                }) {
+                    masks.insert(p);
+                }
+            }
+            if masks.is_empty() {
+                continue;
+            }
+            with_masks += 1;
+            let mut held = Vec::new();
+            for &id in &masks {
+                if let Some(t) = lib.sprites.get(&id) {
+                    sprites += 1;
+                    for c in t.frames.iter().flatten() {
+                        if let Control::Place(p) = c
+                            && let Some(ch) = p.character
+                        {
+                            held.push(ch);
+                        }
+                    }
+                } else {
+                    held.push(id);
+                }
+            }
+            held.sort_unstable();
+            held.dedup();
+            let (mut n, mut part) = (0, 0);
+            for id in held {
+                let Some((shape, mesh)) = lib.shapes.get(&id) else {
+                    continue;
+                };
+                let b = shape.bounds;
+                let boxed = f64::from((b[2] - b[0]) * (b[3] - b[1]));
+                if boxed <= 0.0 {
+                    continue;
+                }
+                let area: f64 = mesh
+                    .iter()
+                    .map(|t| {
+                        let [a, b, c] = t.corners;
+                        f64::from(
+                            ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs(),
+                        ) / 2.0
+                    })
+                    .sum();
+                let share = (area / boxed).min(1.0);
+                n += 1;
+                sum += share;
+                if share < 0.99 {
+                    part += 1;
+                }
+            }
+            shapes += n;
+            cut += part;
+            println!(
+                "{:08x}: {} masks, {n} shapes, {part} fill less than 99% of their box",
+                e.name_hash,
+                masks.len()
+            );
+        }
+    }
+    println!(
+        "{movies} movies, {with_masks} with masks ({sprites} mask sprites); {shapes} mask shapes, \
+         {cut} fill less than 99% of their box, mean share {:.3}",
+        sum / f64::from(shapes.max(1))
+    );
+    Ok(())
+}
+
+/// Every `DefineEditText` field's layout: box, font height, alignment,
+/// margins, indent, leading and flags, then how many fields use each.
+fn flash_text<R: Read + Seek>(wad: &mut WadArchive<R>) -> AnyResult<()> {
+    use m2_assets::flash::text::EditText;
+    let mut count: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut fields = 0;
+    for block in blocks_with_type(wad, MOVIE_TYPE) {
+        let decoded = wad.read_block(block)?;
+        let contents = BlockContents::parse(&decoded)?;
+        for (e, data) in contents.iter() {
+            if e.type_hash != MOVIE_TYPE {
+                continue;
+            }
+            let Ok(movie) = movie_from_asset(data) else {
+                continue;
+            };
+            for t in &movie.tags {
+                if t.code != m2_assets::gfx::tag::DEFINE_EDIT_TEXT {
+                    continue;
+                }
+                let Some((id, d)) = EditText::parse(movie.data(t)) else {
+                    continue;
+                };
+                fields += 1;
+                let [x0, y0, x1, y1] = d.bounds;
+                println!(
+                    "{:08x} {id} {:?} box {x0:.1},{y0:.1},{x1:.1},{y1:.1} h {:.2} align {} margins {:.2}/{:.2} indent {:.2} leading {:.2} wrap {} multi {} html {} auto {}",
+                    e.name_hash,
+                    d.variable,
+                    d.height,
+                    d.align,
+                    d.left_margin,
+                    d.right_margin,
+                    d.indent,
+                    d.leading,
+                    u8::from(d.word_wrap),
+                    u8::from(d.multiline),
+                    u8::from(d.html),
+                    u8::from(d.auto_size)
+                );
+                for k in [
+                    format!("align {}", d.align),
+                    format!("leading {:.2}", d.leading),
+                    format!("indent {:.2}", d.indent),
+                    format!("margins {:.2}/{:.2}", d.left_margin, d.right_margin),
+                    format!("auto {}", u8::from(d.auto_size)),
+                    format!("wrap {}", u8::from(d.word_wrap)),
+                ] {
+                    *count.entry(k).or_default() += 1;
+                }
+            }
+        }
+    }
+    println!("fields {fields}");
+    for (k, n) in count {
+        println!("  {k}: {n}");
+    }
     Ok(())
 }

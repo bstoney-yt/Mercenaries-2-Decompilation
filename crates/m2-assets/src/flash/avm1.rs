@@ -563,10 +563,11 @@ impl Avm {
     fn clip_property(&mut self, player: &mut Player, id: ClipId, name: &str) -> Option<Value> {
         let c = player.clip(id)?;
         let m = c.matrix;
+        let corner = text_corner(c);
         let lower = name.to_ascii_lowercase();
         Some(match lower.as_str() {
-            "_x" => Value::Number(f64::from(m.tx)),
-            "_y" => Value::Number(f64::from(m.ty)),
+            "_x" => Value::Number(f64::from(m.tx + corner[0])),
+            "_y" => Value::Number(f64::from(m.ty + corner[1])),
             "_xscale" => Value::Number(f64::from(m.a.hypot(m.b) * 100.0)),
             "_yscale" => Value::Number(f64::from(m.c.hypot(m.d) * 100.0)),
             "_rotation" => Value::Number(f64::from(m.b.atan2(m.a).to_degrees())),
@@ -604,23 +605,10 @@ impl Avm {
                 Kind::Text(_, s) => Value::Str(s.as_str().into()),
                 _ => return None,
             },
-            "textwidth" | "textheight" => match &c.kind {
-                Kind::Text(def, s) => {
-                    let h = c.lib.texts.get(def).map_or(12.0, |t| t.height);
-                    let lines = s.split(['\n', '\r']).count().max(1) as f32;
-                    let longest = s
-                        .split(['\n', '\r'])
-                        .map(|l| l.chars().count())
-                        .max()
-                        .unwrap_or(0) as f32;
-                    Value::Number(f64::from(if lower == "textwidth" {
-                        longest * h * 0.55
-                    } else {
-                        lines * h * 1.2
-                    }))
-                }
-                _ => return None,
-            },
+            "textwidth" | "textheight" => {
+                let (w, h) = player.text_size(id)?;
+                Value::Number(f64::from(if lower == "textwidth" { w } else { h }))
+            }
             _ => return None,
         })
     }
@@ -640,18 +628,23 @@ impl Avm {
                 if n.is_nan() {
                     return true;
                 }
-                let bounds = if lower == "_width" || lower == "_height" {
+                let sizing = lower == "_width" || lower == "_height";
+                if sizing && resize_text_box(player, id, lower == "_width", n) {
+                    return true;
+                }
+                let bounds = if sizing {
                     clip_bounds(player, id)
                 } else {
                     None
                 };
+                let corner = player.clip(id).map_or([0.0; 2], text_corner);
                 let Some(c) = player.clip_mut(id) else {
                     return true;
                 };
                 let m = &mut c.matrix;
                 match lower.as_str() {
-                    "_x" => m.tx = n,
-                    "_y" => m.ty = n,
+                    "_x" => m.tx = n - corner[0],
+                    "_y" => m.ty = n - corner[1],
                     "_xscale" | "_yscale" | "_rotation" => {
                         let (sx, sy, r) = (m.a.hypot(m.b), m.c.hypot(m.d), m.b.atan2(m.a));
                         let (sx, sy, r) = match lower.as_str() {
@@ -701,6 +694,25 @@ impl Avm {
                 }
                 true
             }
+            "autosize" if matches!(player.clip(id).map(|c| &c.kind), Some(Kind::Text(..))) => {
+                let anchor = match value {
+                    Value::Bool(true) => Some(0.0),
+                    Value::Str(s) => match s.to_ascii_lowercase().as_str() {
+                        "left" => Some(0.0),
+                        "center" => Some(0.5),
+                        "right" => Some(1.0),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(c) = player.clip_mut(id) {
+                    c.auto_size = anchor;
+                }
+                if let Some(anchor) = anchor {
+                    fit_text_box(player, id, anchor);
+                }
+                true
+            }
             "text" | "htmltext" => {
                 if !matches!(player.clip(id).map(|c| &c.kind), Some(Kind::Text(..))) {
                     return false;
@@ -710,6 +722,10 @@ impl Avm {
                     && let Kind::Text(_, t) = &mut c.kind
                 {
                     *t = s.to_string();
+                }
+                // Fitted again to the new text, while it fits itself.
+                if let Some(anchor) = player.clip(id).and_then(|c| c.auto_size) {
+                    fit_text_box(player, id, anchor);
                 }
                 true
             }
@@ -2043,14 +2059,87 @@ fn goto_label(player: &mut Player, id: ClipId, label: &str, play: bool) {
 }
 
 /// The box round what instance `id` draws, in its parent's space.
+/// Where a text field's `_x`/`_y` sit from its origin: its box's top-left
+/// corner (the box's `-2, -2` from `DefineEditText`), through its matrix's
+/// scale and turn; other clips sit at their origin. Inferred from footage
+/// (the loading screen's hint lines, placed by `_y`, sit 2 px lower than
+/// with `_y` as the origin: 10 lines of 4 hints, tops 2.4 -> 0.4 px off
+/// with [`text::measure`](super::text::measure)'s last-line rule); Flash's
+/// rule itself not read.
+fn text_corner(c: &super::player::Clip) -> [f32; 2] {
+    c.text_def().map_or([0.0; 2], |t| {
+        let [x, y] = [t.bounds[0], t.bounds[1]];
+        let m = &c.matrix;
+        [m.a * x + m.c * y, m.b * x + m.d * y]
+    })
+}
+
+/// A text field's `_width` or `_height` set: its box resized, from its
+/// top-left corner, not the text scaled (Flash's rule for text fields;
+/// the pause menu's tables size each cell's field to its text). Whether
+/// `id` is a text field.
+fn resize_text_box(player: &mut Player, id: ClipId, width: bool, n: f32) -> bool {
+    let Some(c) = player.clip_mut(id) else {
+        return false;
+    };
+    let Some(mut b) = c.text_def().map(|t| t.bounds) else {
+        return false;
+    };
+    let m = &c.matrix;
+    let scale = if width {
+        m.a.hypot(m.b)
+    } else {
+        m.c.hypot(m.d)
+    };
+    let size = n.max(0.0) / if scale > 0.0 { scale } else { 1.0 };
+    if width {
+        b[2] = b[0] + size;
+    } else {
+        b[3] = b[1] + size;
+    }
+    c.text_box = Some(b);
+    true
+}
+
+/// A text field's `autoSize` set: its box as high as its text and the
+/// gutters (2 px each side) from its top; one that does not wrap also as
+/// wide, from its left edge (`anchor` 0), centre (0.5) or right edge (1),
+/// its text measured on one line. A wrapping field keeps its width
+/// (Flash's rule for `autoSize` with `wordWrap`).
+fn fit_text_box(player: &mut Player, id: ClipId, anchor: f32) {
+    let Some((b, wraps)) = player
+        .clip(id)
+        .and_then(|c| c.text_def())
+        .map(|t| (t.bounds, t.word_wrap))
+    else {
+        return;
+    };
+    if !wraps && let Some(c) = player.clip_mut(id) {
+        c.text_box = Some([b[0], b[1], b[0] + 1.0e5, b[3]]);
+    }
+    let Some((w, h)) = player.text_size(id) else {
+        return;
+    };
+    let Some(c) = player.clip_mut(id) else {
+        return;
+    };
+    let [x0, x1] = if wraps {
+        [b[0], b[2]]
+    } else {
+        let x = b[0] + (b[2] - b[0] - (w + 4.0)) * anchor;
+        [x, x + w + 4.0]
+    };
+    c.text_box = Some([x0, b[1], x1, b[1] + h + 4.0]);
+}
+
 fn clip_bounds(player: &Player, id: ClipId) -> Option<[f32; 4]> {
     let c = player.clip(id)?;
     let mut tris = Vec::new();
     collect(player, id, &c.matrix, &mut tris, 0);
     super::bounds(&tris).or_else(|| {
         // A text field: its box.
-        if let Kind::Text(def, _) = &c.kind {
-            let b = c.lib.texts.get(def)?.bounds;
+        if matches!(c.kind, Kind::Text(..)) {
+            let b = c.text_def()?.bounds;
             let p = [c.matrix.apply([b[0], b[1]]), c.matrix.apply([b[2], b[3]])];
             Some([p[0][0], p[0][1], p[1][0], p[1][1]])
         } else {

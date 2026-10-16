@@ -24,7 +24,7 @@ use m2_assets::strings::STRINGS_TYPE;
 use m2_assets::{BlockContents, Layer, Path, Region, StringTable, WadArchive, WadError, name_hash};
 use m2_engine::population::{riders, seat_name};
 use m2_math::glam::{Quat, Vec3};
-use mlua::Function;
+use mlua::{Function, Table, Value};
 
 use crate::api::{self, Command, Object, ScriptWorld, Shared};
 use crate::events::Events;
@@ -35,6 +35,10 @@ use crate::script::{ScriptError, ScriptHost};
 
 /// The script that starts the game (`Init`, then `LoadGame`).
 pub const BOOTSTRAP: u32 = 0xb442_0059;
+
+/// The goal a support helicopter is given to land at her mark
+/// (`MrxSupportCopterDelivery._HeliReady`).
+pub const LAND: &str = "HeliLand";
 /// Activates the player's character as the engine does its object
 /// scripts: the hero module's `OnActivate` (healing, the survival
 /// system's one rescue, her inventory), which goes on once she is awake.
@@ -165,9 +169,10 @@ if rawget(m, "_bCurrentlyFadedIn") then return 1 end
 return 0
 "#;
 
-/// Seconds the fade's wipe takes (inferred: the movie's own length is not
-/// read yet).
-const FADE_WIPE: f64 = 1.0;
+/// Seconds the fade's wipe takes, each way: the movie's 60 frames at
+/// 30 fps (`_fadeOn` to `wipeComplete`, `_fadeOff` to `close`; from
+/// `Loading.wad`).
+const FADE_WIPE: f64 = 2.0;
 
 /// Skip mode (which [`Mission::start`] turns on so the intro movies end
 /// at once) also has `MrxUtil.TeleportHeroesToLocations` skip the
@@ -262,6 +267,10 @@ pub struct GameData {
     /// Templates' labels (name hashes) by the template's name in lower
     /// case, for objects the scripts spawn.
     pub template_labels: HashMap<String, Vec<u32>>,
+    /// Who drives a template's vehicle as its `Rider` in `seat_driver`
+    /// names them (`"AH1Z (Ewan)"`: `"Recruit Ewen Garret"`), by the
+    /// template's name in lower case, for vehicles the scripts spawn.
+    pub template_drivers: HashMap<String, String>,
     /// Weapon templates' `MaxAmmoReserve` and which are thrown, by name in
     /// lower case ([`crate::inventory::read`]).
     pub max_reserve: HashMap<String, u32>,
@@ -458,6 +467,15 @@ impl GameData {
                 data.layers.get_mut(layer).expect("indexed above")[*i].crew = crew_of(r);
             }
         }
+        for (&template, records) in &template_riders {
+            let driver = crew_of(records)
+                .into_iter()
+                .find(|(seat, _)| seat == "seat_driver");
+            if let (Some(name), Some((_, driver))) = (named(template), driver) {
+                data.template_drivers
+                    .insert(name.to_ascii_lowercase(), driver);
+            }
+        }
         for (layer, i, records) in own_riders {
             data.layers.get_mut(&layer).expect("indexed above")[i].crew = crew_of(&records);
         }
@@ -560,6 +578,7 @@ impl Mission {
             shapes,
             strings,
             template_labels,
+            template_drivers,
             max_reserve,
             thrown,
         } = data;
@@ -579,6 +598,7 @@ impl Mission {
             let mut w = world.borrow_mut();
             w.layers.known = layers.keys().cloned().collect();
             w.template_labels = template_labels;
+            w.template_drivers = template_drivers;
             w.inventory.max_reserve = max_reserve;
             w.inventory.thrown = thrown;
             for e in layers.values().flatten() {
@@ -855,6 +875,12 @@ impl Mission {
             ));
         }
         self.check_boundary(now);
+        for e in crate::api::answer_asset_loads(&self.world) {
+            self.log.push(format!(
+                "  t={now:.1} asset load callback: {}",
+                first_lines(&e.to_string())
+            ));
+        }
         for e in crate::api::answer_drop_tests(&self.world) {
             self.log.push(format!(
                 "  t={now:.1} drop zone callback: {}",
@@ -1092,10 +1118,11 @@ impl Mission {
         }
     }
 
-    /// Leaves deliveries to the game: an `Ai.Deliver` order stays a
-    /// [`Command::Goal`] (`"Deliver"`) for it to fly, and it reports the
-    /// arrival with [`arrived`](Self::arrived). Without this a delivery
-    /// arrives as soon as it is ordered.
+    /// Leaves deliveries to the game: an `Ai.Deliver` order, and a
+    /// support helicopter's landing (an `Ai.Goal` [`LAND`]), stay a
+    /// [`Command::Goal`] for it to fly, and it reports the arrival with
+    /// [`arrived`](Self::arrived). Without this they arrive as soon as
+    /// they are ordered.
     pub fn fly_deliveries(&mut self) {
         self.flown = true;
     }
@@ -1119,6 +1146,109 @@ impl Mission {
     /// of each item ([`crate::support`]).
     pub fn support_items(&self) -> Vec<crate::support::SupportItem> {
         crate::support::items(self.host.lua()).unwrap_or_default()
+    }
+
+    /// Her cash and fuel as the scripts hold them (`MrxPmc.GetCashQty`,
+    /// `GetFuelQty`; the cash is the engine's, `Player.GetCash`).
+    pub fn resources(&self) -> (f64, f64) {
+        let lua = self.host.lua();
+        let get = |f: &str| {
+            lua.globals()
+                .get::<Table>("MrxPmc")
+                .and_then(|m| m.get::<Function>(f))
+                .and_then(|f| f.call::<Option<f64>>(()))
+                .ok()
+                .flatten()
+        };
+        let cash = get("GetCashQty").unwrap_or(self.world.borrow().cash);
+        (cash, get("GetFuelQty").unwrap_or(0.0))
+    }
+
+    /// Gives her `cash` (taken, if less than 0) and `fuel` as the scripts
+    /// do (`MrxPmc.AddCashQty`, which clamps it and tells the HUD and the
+    /// stats, with `reason`, a string key such as `"[Generic.Pickups]"`;
+    /// `AddFuelQty`, which stops at her tanks' capacity).
+    pub fn give_resources(&mut self, cash: f64, fuel: f64, reason: &str) {
+        let code = format!(
+            "if {cash} ~= 0 then MrxPmc.AddCashQty({cash}, nil, {reason:?}) end \
+             if {fuel} ~= 0 then MrxPmc.AddFuelQty({fuel}) end"
+        );
+        if let Err(e) = self.run(&code, "give resources") {
+            self.log
+                .push(format!("  give resources: {}", first_lines(&e.to_string())));
+        }
+    }
+
+    /// The scripts' own save data now, as Lua text
+    /// ([`crate::savedata::generate`]).
+    pub fn save_data(&self) -> Result<String, MissionError> {
+        Ok(crate::savedata::generate(self.host.lua(), BOOTSTRAP)?)
+    }
+
+    /// Opens faction `faction`'s shop (`MrxFactionManager`'s keys: `"All"`,
+    /// `"Chi"`, `"Gur"`, `"Pir"`, `"Oil"`, `"Pmc"`) as its
+    /// contact's menu does ([`crate::shop::OPEN`]); read it with
+    /// [`shop`](Self::shop). Whether it came up.
+    pub fn open_shop(&mut self, faction: &str) -> bool {
+        let lua = self.host.lua();
+        let opened = lua.globals().set("__m2_faction", faction).and_then(|()| {
+            lua.load(crate::shop::OPEN)
+                .set_name("=open shop")
+                .eval::<bool>()
+        });
+        let opened = match opened {
+            Ok(o) => o,
+            Err(e) => {
+                self.log
+                    .push(format!("  open shop: {}", first_lines(&e.to_string())));
+                false
+            }
+        };
+        self.settle(&format!("t={:.1}, shop {faction}", self.now));
+        opened
+    }
+
+    /// The shop the scripts have up, as they filled it.
+    pub fn shop(&self) -> crate::shop::Shop {
+        crate::shop::Shop::read(self.host.lua()).unwrap_or_default()
+    }
+
+    /// Buys `quantity` of shop item `id` as the shop's own selection does
+    /// (the scripts' callback, `MrxShop._ShopSelection`): whether they
+    /// sold it.
+    pub fn buy(&mut self, id: &str, quantity: u32) -> bool {
+        let lua = self.host.lua();
+        let bought = lua
+            .globals()
+            .get::<Table>("__m2_shop")
+            .and_then(|s| s.get::<Function>("fCallback"))
+            .and_then(|f| f.call::<Value>((id, quantity)));
+        let bought = match bought {
+            Ok(v) => !matches!(v, Value::Nil | Value::Boolean(false)),
+            Err(e) => {
+                self.log
+                    .push(format!("  buy {id}: {}", first_lines(&e.to_string())));
+                false
+            }
+        };
+        self.log.push(format!(
+            "t={:.1} shop: {quantity} {id} bought: {bought}",
+            self.now
+        ));
+        self.settle(&format!("t={:.1}, bought {id}", self.now));
+        bought
+    }
+
+    /// Closes the shop as the player leaving it does: the scripts' close
+    /// callback, then `MrxShop.Close`.
+    pub fn close_shop(&mut self) {
+        let code = "local s = __m2_shop \
+                    if s and s.open and type(s.fClose) == 'function' then s.fClose() end \
+                    if __m2_shop and __m2_shop.open then MrxShop.Close() end";
+        if let Err(e) = self.run(code, "close shop") {
+            self.log
+                .push(format!("  close shop: {}", first_lines(&e.to_string())));
+        }
     }
 
     /// Adds `count` of support item `key` to her stockpile, and cash and
@@ -1402,6 +1532,12 @@ impl Mission {
         self.world.borrow_mut().subtitles_off = !on;
     }
 
+    /// Whether the player has the tutorial tips on
+    /// (`Sys.TutorialsEnabled`; on unless told).
+    pub fn set_tutorials(&mut self, on: bool) {
+        self.world.borrow_mut().tutorials_off = !on;
+    }
+
     /// The subtitles of the movie [`take_movie`](Self::take_movie) gave,
     /// if the scripts asked for them (`bSubtitles`) and it has any: its
     /// `Subtitles_<movie>` script's `SubtitleData`, loaded as
@@ -1601,7 +1737,7 @@ end
                     location: Some(at),
                     ..
                 } = c
-                    && goal == "Deliver"
+                    && (goal == "Deliver" || goal == LAND)
                     && !self.flown
                 {
                     self.log
@@ -1816,6 +1952,23 @@ mod tests {
         assert_eq!(landing_zone("03_mar_airport_llz_playerone"), Some((3, 1)));
         assert_eq!(landing_zone("lz_helipad_playerone"), None);
         assert_eq!(landing_zone("06_gua_upperclass_playerone"), None);
+    }
+
+    #[test]
+    fn the_players_subtitles_and_tutorials_reach_the_scripts() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let ask = |m: &Mission| {
+            m.lua()
+                .load("return { Sys.SubtitlesEnabled(), Sys.TutorialsEnabled() }")
+                .eval::<Vec<bool>>()
+                .unwrap()
+        };
+        assert_eq!(ask(&m), [true, true]);
+        m.set_tutorials(false);
+        assert_eq!(ask(&m), [true, false]);
+        m.set_subtitles(false);
+        m.set_tutorials(true);
+        assert_eq!(ask(&m), [false, true]);
     }
 
     #[test]
@@ -2111,6 +2264,8 @@ mod tests {
         let lua = m.host.lua();
         assert!(lua.globals().get::<bool>("called").unwrap());
         assert_eq!(m.black(), 1.0);
+        // The wipe takes the movie's two seconds.
+        assert!(blacks[17] < 1.0 && blacks[21] >= 1.0, "{blacks:?}");
         // Back, and at once to black again: the fade back gives way.
         lua.load("Fade.GlobalFadeFromBlack() Fade.GlobalFadeToBlack(function() end)")
             .exec()

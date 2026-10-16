@@ -73,7 +73,7 @@ pub struct HudInfo {
 }
 
 /// What the pause menu asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MenuAction {
     Resume,
     /// Write the settings file.
@@ -84,6 +84,31 @@ pub enum MenuAction {
     /// Play as another mercenary (also kept in the settings).
     Hero(crate::hero::Hero),
     Quit,
+    /// Something done in the shop.
+    Shop(ShopAction),
+    /// Something done in the cheat menu.
+    Cheat(crate::cheats::CheatAction),
+}
+
+/// What the player does in the shop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShopAction {
+    /// Look at faction `i`'s shop ([`crate::mission::SHOPS`]).
+    Faction(usize),
+    /// Buy one of this.
+    Buy(String),
+    /// Every shop's items unlocked or not (the cheat).
+    UnlockAll(bool),
+    Close,
+}
+
+/// The shop up: whose, what it sells, and what the last purchase said.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShopScreen {
+    pub faction: usize,
+    pub view: crate::mission::ShopView,
+    pub said: Option<String>,
+    pub unlock_all: bool,
 }
 
 /// Seconds the controls hint shows at the start.
@@ -97,10 +122,16 @@ pub struct Hud {
     uploaded: std::collections::HashSet<egui::TextureId>,
     /// The pause menu is open.
     pub menu: bool,
+    /// The shop is up, in the pause menu's place.
+    pub shop: Option<ShopScreen>,
+    /// The cheat menu is up, in the pause menu's place.
+    pub cheats: Option<crate::cheats::CheatScreen>,
     /// Tessellated and waiting to paint: shapes, texture changes, scale.
     frame: Option<(Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32)>,
     /// The game's own HUD, if its files are there.
     pub game: Option<GameHud>,
+    /// The game's loading screen, if `Loading.wad` reads.
+    pub loading: Option<crate::loading::LoadingScreen>,
     /// Each frame waits for the game's HUD to draw it (play run offscreen,
     /// faster than the HUD's scripts would keep up with).
     pub wait: bool,
@@ -108,6 +139,12 @@ pub struct Hud {
     /// names F5/F9 for saving and loading, and loads while the mission
     /// scripts run, though a load puts the world back without their state.
     pub dev: bool,
+    /// The player's settings and saves for the game's own pause menu
+    /// ([`crate::pause`]), set as it opens.
+    pub pause_settings: crate::pause::Settings,
+    /// Keys and mouse buttons for the pause menu's keyboard table, not yet
+    /// passed on.
+    pub pause_captured: Vec<crate::input::Control>,
 }
 
 impl std::fmt::Debug for Hud {
@@ -142,10 +179,15 @@ impl Hud {
             renderer: None,
             uploaded: Default::default(),
             menu: false,
+            shop: None,
+            cheats: None,
             frame: None,
             game: None,
+            loading: None,
             wait: false,
             dev: true,
+            pause_settings: crate::pause::Settings::default(),
+            pause_captured: Vec::new(),
         }
     }
 
@@ -159,11 +201,16 @@ impl Hud {
             .screen_rect
             .map_or([0.0; 2], |r| [r.width(), r.height()]);
         state.dt = game.frame_time(input.time);
+        // The menu is the game's own pause menu, but in the shop.
+        state.pause = self.menu && self.shop.is_none();
+        state.pause_settings = self.pause_settings.clone();
+        state.pause_captured = std::mem::take(&mut self.pause_captured);
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
         state.reticle = reticle(info);
         state.support = info.support.clone();
+        state.cash = info.mission.as_ref().and_then(|m| m.cash);
         state.radar_regions = info
             .mission
             .as_ref()
@@ -203,13 +250,16 @@ impl Hud {
 
     /// Runs the game's HUD `seconds` on `info`, waiting for each step (and
     /// up to `timeout` for its scripts to start): for screenshots, which
-    /// draw one frame. `keys` (Flash key codes) are pressed half way.
+    /// draw one frame. `keys` (Flash key codes) are pressed half way and
+    /// held to the end; `typed`, they are typed one by one from a quarter
+    /// of the way, a third of a second apart (a menu walked through).
     pub fn settle(
         &mut self,
         info: &HudInfo,
         size: (u32, u32),
         seconds: f64,
         keys: &[i32],
+        typed: bool,
         timeout: Duration,
     ) {
         let (Some(game), Some(state)) = (&mut self.game, &info.game) else {
@@ -222,6 +272,7 @@ impl Hud {
         state.blips = blips(info);
         state.reticle = reticle(info);
         state.support = info.support.clone();
+        state.cash = info.mission.as_ref().and_then(|m| m.cash);
         state.radar_regions = info
             .mission
             .as_ref()
@@ -254,10 +305,22 @@ impl Hud {
             if !game.ready() {
                 break;
             }
-            state.keys = match i.checked_sub(steps / 2) {
-                Some(0) => keys.iter().map(|&k| (k, true)).collect(),
-                Some(1) => keys.iter().map(|&k| (k, false)).collect(),
-                _ => Vec::new(),
+            // Held from half way to the last step (the PDA's map moves
+            // while its keys are held).
+            state.keys = if typed {
+                const GAP: usize = 10;
+                match i.checked_sub(steps / 4) {
+                    Some(j) if j / GAP < keys.len() && j % GAP < 2 => {
+                        vec![(keys[j / GAP], j % GAP == 0)]
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                match i.checked_sub(steps / 2) {
+                    Some(0) => keys.iter().map(|&k| (k, true)).collect(),
+                    Some(_) if i + 1 == steps => keys.iter().map(|&k| (k, false)).collect(),
+                    _ => Vec::new(),
+                }
             };
             game.update_and_wait(&self.ctx, state.clone(), Duration::from_secs(10));
         }
@@ -280,10 +343,40 @@ impl Hud {
         // would put the world back without their state.
         let load = self.dev || info.mission.is_none();
         let dev = self.dev;
+        let shop = self.shop.as_ref();
+        let cheats = self.cheats.as_ref();
+        // The game's own pause menu, once its scripts run: ours keeps the
+        // alpha's own settings beside it.
+        let own = self.game.as_ref().is_some_and(GameHud::pause_available);
+        // The loading screen: up while the island loads and over the
+        // scripts' fades to black.
+        let mut loading = self.loading.as_mut();
+        if let Some(screen) = loading.as_deref_mut() {
+            let black = info.mission.as_ref().map_or(0.0, |m| m.black);
+            screen.update(info.loading.is_some(), black, input.time.unwrap_or(0.0));
+            for line in screen.take_log() {
+                eprintln!("{line}");
+            }
+        }
+        let covered = loading
+            .as_deref()
+            .is_some_and(crate::loading::LoadingScreen::showing);
         let output = self.ctx.run_ui(input, |ui| {
-            hud(ui, info, game);
-            if menu {
-                action = pause_menu(ui.ctx(), config, info.hero, dev, load);
+            hud(ui, info, game, covered);
+            if let Some(screen) = loading.as_deref_mut() {
+                let ctx = ui.ctx().clone();
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    "loading screen".into(),
+                ));
+                screen.paint(&ctx, &painter);
+            }
+            if let (true, Some(cheats)) = (menu, cheats) {
+                action = cheat_window(ui.ctx(), cheats).map(MenuAction::Cheat);
+            } else if let (true, Some(shop)) = (menu, shop) {
+                action = shop_window(ui.ctx(), shop).map(MenuAction::Shop);
+            } else if menu {
+                action = pause_menu(ui.ctx(), config, info.hero, dev, load, own);
             }
         });
         let ppp = output.pixels_per_point;
@@ -474,7 +567,9 @@ fn blips(info: &HudInfo) -> Vec<([f32; 3], String, [u8; 4])> {
     })
 }
 
-fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
+/// The HUD for `info`; `covered`: the game's loading screen is up, in
+/// place of the fade and the loading line.
+fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>, covered: bool) {
     let ctx = ui.ctx().clone();
     let screen = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
@@ -491,8 +586,14 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
     };
     let white = Color32::from_gray(235);
     flash(&ctx, screen, info.support.flash);
-    // The scripts' fade to black (`MrxGui.GlobalFadeToBlack`), over all.
-    if let Some(black) = info.mission.as_ref().map(|m| m.black).filter(|&b| b > 0.0) {
+    // The scripts' fade to black (`MrxGui.GlobalFadeToBlack`), over all,
+    // unless its movie (the loading screen) plays it.
+    if let Some(black) = info
+        .mission
+        .as_ref()
+        .map(|m| m.black)
+        .filter(|&b| b > 0.0 && !covered)
+    {
         ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, "fade".into()))
             .rect_filled(
                 screen,
@@ -500,7 +601,7 @@ fn hud(ui: &mut egui::Ui, info: &HudInfo, game: Option<&GameHud>) {
                 Color32::from_black_alpha((black.min(1.0) * 255.0) as u8),
             );
     }
-    if let Some(loading) = &info.loading {
+    if let Some(loading) = info.loading.as_ref().filter(|_| !covered) {
         text(
             screen.center_top() + vec2(0.0, 24.0),
             Align2::CENTER_TOP,
@@ -1337,85 +1438,332 @@ fn project(view_proj: Mat4, world: Vec3, screen: egui::Rect) -> Option<egui::Pos
     ))
 }
 
+/// The shop: a tab for each faction's, her cash, and what it sells, with
+/// a button to buy each that is unlocked and that she can pay for. The
+/// look is this game's own (the game's shop screen isn't drawn); what is
+/// sold, and at what price, is the scripts' (`MrxShop`).
+fn shop_window(ctx: &egui::Context, shop: &ShopScreen) -> Option<ShopAction> {
+    let mut action = None;
+    ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new("dim"),
+    ))
+    .rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha(120));
+    egui::Window::new("Shop")
+        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_min_width(560.0);
+            ui.horizontal_wrapped(|ui| {
+                for (i, (_, name)) in crate::mission::SHOPS.iter().enumerate() {
+                    if ui.selectable_label(shop.faction == i, *name).clicked() && shop.faction != i
+                    {
+                        action = Some(ShopAction::Faction(i));
+                    }
+                }
+            });
+            ui.separator();
+            ui.label(format!(
+                "Cash ${}    Fuel {:.0}",
+                thousands(shop.view.cash),
+                shop.view.fuel
+            ));
+            if let Some(said) = &shop.said {
+                ui.label(said);
+            }
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("shop items")
+                        .striped(true)
+                        .num_columns(4)
+                        .show(ui, |ui| {
+                            for item in &shop.view.items {
+                                ui.label(&item.name).on_hover_text(&item.description);
+                                ui.label(format!("${}", thousands(item.price)));
+                                ui.label(format!("{} held", item.stock));
+                                let can = item.unlocked
+                                    && item.price <= shop.view.cash
+                                    && item.stock < item.most.max(1);
+                                let label = if item.unlocked { "Buy" } else { "Locked" };
+                                if ui.add_enabled(can, egui::Button::new(label)).clicked() {
+                                    action = Some(ShopAction::Buy(item.id.clone()));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            ui.separator();
+            ui.horizontal(|ui| {
+                let mut all = shop.unlock_all;
+                if ui.checkbox(&mut all, "Unlock everything (cheat)").changed() {
+                    action = Some(ShopAction::UnlockAll(all));
+                }
+                if ui.button("Close").clicked() {
+                    action = Some(ShopAction::Close);
+                }
+            });
+        });
+    action
+}
+
+/// The test cheat menu ([`crate::cheats`]): a page each for weapons,
+/// vehicles and support (the game's own lists, with a filter) and one for
+/// her helpers.
+fn cheat_window(
+    ctx: &egui::Context,
+    cheats: &crate::cheats::CheatScreen,
+) -> Option<crate::cheats::CheatAction> {
+    use crate::cheats::{CheatAction as A, Tab, shown};
+    let mut action = None;
+    // Plain black goes under everything egui draws (it would hide the
+    // window drawn on the same layer order).
+    let (order, dim) = if cheats.plain {
+        (egui::Order::Background, Color32::BLACK)
+    } else {
+        (egui::Order::Middle, Color32::from_black_alpha(120))
+    };
+    ctx.layer_painter(egui::LayerId::new(order, egui::Id::new("dim")))
+        .rect_filled(ctx.content_rect(), 0.0, dim);
+    egui::Window::new("Cheats (test)")
+        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_min_width(560.0);
+            ui.horizontal(|ui| {
+                for tab in Tab::ALL {
+                    if ui.selectable_label(cheats.tab == tab, tab.name()).clicked()
+                        && cheats.tab != tab
+                    {
+                        action = Some(A::Tab(tab));
+                    }
+                }
+            });
+            ui.separator();
+            if cheats.tab != Tab::Player {
+                ui.horizontal(|ui| {
+                    ui.label("Filter");
+                    let mut filter = cheats.filter.clone();
+                    if ui.text_edit_singleline(&mut filter).changed() {
+                        action = Some(A::Filter(filter));
+                    }
+                });
+            }
+            if let Some(said) = &cheats.said {
+                ui.label(said);
+            }
+            let f = cheats.filter.as_str();
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| match cheats.tab {
+                    Tab::Weapons => {
+                        if cheats.weapons.is_empty() {
+                            ui.label("No weapon templates (the island's data isn't loaded).");
+                        }
+                        egui::Grid::new("cheat weapons")
+                            .striped(true)
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                for name in cheats.weapons.iter().filter(|n| shown(n, f)) {
+                                    ui.label(name);
+                                    if ui.button("Give").clicked() {
+                                        action = Some(A::Weapon(name.clone()));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    Tab::Vehicles => {
+                        if cheats.vehicles.is_empty() {
+                            ui.label("No vehicle templates (the island's data isn't loaded).");
+                        }
+                        egui::Grid::new("cheat vehicles")
+                            .striped(true)
+                            .num_columns(3)
+                            .show(ui, |ui| {
+                                for v in cheats
+                                    .vehicles
+                                    .iter()
+                                    .filter(|v| shown(&v.name, f) || shown(v.kind, f))
+                                {
+                                    ui.label(&v.name);
+                                    ui.label(v.kind);
+                                    if ui.button("Spawn").clicked() {
+                                        action = Some(A::Vehicle(v.name.clone()));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    Tab::Support => {
+                        if cheats.support.is_empty() {
+                            ui.label("No support catalogue until the mission scripts run.");
+                        }
+                        egui::Grid::new("cheat support")
+                            .striped(true)
+                            .num_columns(4)
+                            .show(ui, |ui| {
+                                for s in cheats.support.iter().filter(|s| {
+                                    shown(&s.name, f) || shown(&s.key, f) || shown(&s.kind, f)
+                                }) {
+                                    ui.label(&s.name).on_hover_text(&s.key);
+                                    ui.label(&s.kind);
+                                    if ui.button("Stock").clicked() {
+                                        action = Some(A::StockSupport(s.key.clone()));
+                                    }
+                                    if ui.button("Call in").clicked() {
+                                        action = Some(A::CallSupport(s.key.clone()));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    Tab::Player => {
+                        let mut god = cheats.toggles.god;
+                        if ui
+                            .checkbox(&mut god, "God mode (health kept whole)")
+                            .changed()
+                        {
+                            action = Some(A::God(god));
+                        }
+                        let mut ammo = cheats.toggles.ammo;
+                        if ui
+                            .checkbox(&mut ammo, "Infinite ammo (clips, reserves, explosives)")
+                            .changed()
+                        {
+                            action = Some(A::Ammo(ammo));
+                        }
+                        if ui.button("Heal").clicked() {
+                            action = Some(A::Heal);
+                        }
+                        let money = format!(
+                            "Give ${} and {:.0} fuel",
+                            thousands(crate::cheats::CASH),
+                            crate::cheats::FUEL
+                        );
+                        if ui.button(money).clicked() {
+                            action = Some(A::Money);
+                        }
+                        let ahead = format!("Teleport {:.0} m ahead", crate::cheats::AHEAD);
+                        if ui.button(ahead).clicked() {
+                            action = Some(A::TeleportAhead);
+                        }
+                        if ui.button("Teleport to the nearest objective").clicked() {
+                            action = Some(A::TeleportObjective);
+                        }
+                    }
+                });
+            ui.separator();
+            if ui.button("Close").clicked() {
+                action = Some(A::Close);
+            }
+        });
+    action
+}
+
+/// A sum of money with its thousands apart: `1,250,000`.
+fn thousands(n: f64) -> String {
+    let digits = format!("{:.0}", n.abs());
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0.0 { format!("-{out}") } else { out }
+}
+
 /// The pause menu, with `playing` (the hero she is) marked under "Play
 /// as". `dev`: the save and load buttons name their keys (which work only
-/// then); `load`: a saved game can be loaded.
+/// then); `load`: a saved game can be loaded. `own`: the game's own pause
+/// menu is up (the HUD's movie), and this is only the alpha's settings
+/// beside it, folded in a corner (its dim and its Resume are the game's).
 fn pause_menu(
     ctx: &egui::Context,
     config: &mut Config,
     playing: crate::hero::Hero,
     dev: bool,
     load: bool,
+    own: bool,
 ) -> Option<MenuAction> {
     let mut action = None;
-    // Dim the game behind the menu.
-    ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::new("dim"),
-    ))
-    .rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha(120));
-    egui::Window::new("Paused")
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .collapsible(false)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.set_min_width(300.0);
-            ui.spacing_mut().item_spacing.y = 8.0;
-            if ui.button("Resume").clicked() {
-                action = Some(MenuAction::Resume);
+    if !own {
+        // Dim the game behind the menu.
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("dim"),
+        ))
+        .rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha(120));
+    }
+    let window = if own {
+        egui::Window::new("Alpha settings")
+            .anchor(Align2::RIGHT_TOP, vec2(-16.0, 16.0))
+            .collapsible(true)
+            .default_open(false)
+    } else {
+        egui::Window::new("Paused")
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .collapsible(false)
+    };
+    window.resizable(false).show(ctx, |ui| {
+        ui.set_min_width(300.0);
+        ui.spacing_mut().item_spacing.y = 8.0;
+        if !own && ui.button("Resume").clicked() {
+            action = Some(MenuAction::Resume);
+        }
+        ui.horizontal(|ui| {
+            let (save, load_label) = if dev {
+                ("Save game (F5)", "Load game (F9)")
+            } else {
+                ("Save game", "Load game")
+            };
+            if ui.button(save).clicked() {
+                action = Some(MenuAction::SaveGame);
             }
-            ui.horizontal(|ui| {
-                let (save, load_label) = if dev {
-                    ("Save game (F5)", "Load game (F9)")
-                } else {
-                    ("Save game", "Load game")
-                };
-                if ui.button(save).clicked() {
-                    action = Some(MenuAction::SaveGame);
-                }
-                if load && ui.button(load_label).clicked() {
-                    action = Some(MenuAction::LoadGame);
-                }
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Play as");
-                for hero in crate::hero::Hero::ALL {
-                    if ui.selectable_label(playing == hero, hero.name()).clicked()
-                        && playing != hero
-                    {
-                        config.hero = hero;
-                        action = Some(MenuAction::Hero(hero));
-                    }
-                }
-            });
-            ui.separator();
-            ui.heading("Settings");
-            ui.add(egui::Slider::new(&mut config.camera.fov, 40.0..=100.0).text("Field of view"));
-            ui.add(
-                egui::Slider::new(&mut config.camera.mouse_sensitivity, 0.0005..=0.01)
-                    .logarithmic(true)
-                    .text("Mouse sensitivity"),
-            );
-            ui.checkbox(&mut config.camera.invert_y, "Invert mouse Y");
-            ui.checkbox(&mut config.window.vsync, "Vertical sync");
-            if ui.button("Save settings").clicked() {
-                action = Some(MenuAction::SaveSettings);
-            }
-            ui.separator();
-            ui.collapsing("Controls", |ui| {
-                for line in include_str!("usage.txt")
-                    .lines()
-                    .skip_while(|l| !l.starts_with("On foot"))
-                {
-                    ui.label(line);
-                }
-            });
-            ui.separator();
-            if ui.button("Quit to desktop").clicked() {
-                action = Some(MenuAction::Quit);
+            if load && ui.button(load_label).clicked() {
+                action = Some(MenuAction::LoadGame);
             }
         });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Play as");
+            for hero in crate::hero::Hero::ALL {
+                if ui.selectable_label(playing == hero, hero.name()).clicked() && playing != hero {
+                    config.hero = hero;
+                    action = Some(MenuAction::Hero(hero));
+                }
+            }
+        });
+        ui.separator();
+        ui.heading("Settings");
+        ui.add(egui::Slider::new(&mut config.camera.fov, 40.0..=100.0).text("Field of view"));
+        ui.add(
+            egui::Slider::new(&mut config.camera.mouse_sensitivity, 0.0005..=0.01)
+                .logarithmic(true)
+                .text("Mouse sensitivity"),
+        );
+        ui.checkbox(&mut config.camera.invert_y, "Invert mouse Y");
+        ui.checkbox(&mut config.window.vsync, "Vertical sync");
+        if ui.button("Save settings").clicked() {
+            action = Some(MenuAction::SaveSettings);
+        }
+        ui.separator();
+        ui.collapsing("Controls", |ui| {
+            for line in include_str!("usage.txt")
+                .lines()
+                .skip_while(|l| !l.starts_with("On foot"))
+            {
+                ui.label(line);
+            }
+        });
+        ui.separator();
+        if ui.button("Quit to desktop").clicked() {
+            action = Some(MenuAction::Quit);
+        }
+    });
     action
 }
 

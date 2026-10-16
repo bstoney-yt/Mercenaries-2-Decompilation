@@ -1,5 +1,39 @@
-//! Actions, their key bindings, and the input state the game reads each
-//! tick.
+//! Actions, their key and mouse bindings, and the input state the game
+//! reads each tick.
+//!
+//! The default bindings are the PC game's own defaults, as its controls
+//! screen lists them (from the PC footage: the pause menu's Controls
+//! page, keyboard and mouse):
+//!
+//! | control          | keys                  | here                       |
+//! |------------------|-----------------------|----------------------------|
+//! | move, strafe     | W S, A D              | [`Action::MoveForward`]... |
+//! | primary attack   | left click            | [`Action::Fire`]           |
+//! | primary switch   | Tab, mouse wheel      | [`Action::SwitchWeapon`]   |
+//! | reload           | R                     | [`Action::Reload`]         |
+//! | secondary attack | right click, G        | [`Action::Throw`]          |
+//! | secondary switch | V                     | [`Action::Explosive`]      |
+//! | melee            | F, middle click       | [`Action::Melee`]          |
+//! | use              | E                     | [`Action::Use`]            |
+//! | jump             | Space                 | [`Action::MoveUp`]         |
+//! | crouch           | C                     | [`Action::MoveDown`], aim  |
+//! | binoculars       | B                     | [`Action::Binoculars`]     |
+//! | PDA              | F1                    | [`Action::Pda`]            |
+//! | look             | I K J L               | [`Action::LookUp`]...      |
+//! | support up, down | 1 or Up, 2 or Down    | [`Action::Support`], down  |
+//! | view switch      | 4 or Right            | [`Action::ViewSwitch`]     |
+//! | walk, sprint     | Left Ctrl, Left Shift | [`Action::Walk`], sprint   |
+//!
+//! Inferred: crouch also raises the weapon ([`Action::Aim`]); the game's
+//! crouch is how she aims steadily (the owner's play of the PC game).
+//! Invented: through the binoculars ([`crate::binoculars`]) the wheel
+//! zooms ([`Action::ZoomIn`], [`Action::ZoomOut`]) and Tab steps the zoom
+//! up and round, in place of switching weapons; the view switch is bound
+//! but does nothing yet (the alpha has one camera); the alpha's own keys (the
+//! seats Y, C4 X, the shop H, music M, the mouse's release F2, the
+//! developer's F3 to F9, among them the cheat menu's F7) sit on keys the
+//! table leaves free. The hijack's face buttons stay on I K J L beside the
+//! look (the PC game's are not known).
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -58,6 +92,9 @@ pub enum Action {
     /// Open or close the PDA (the first contract has her look at it before
     /// it gives her the bomb).
     Pda,
+    /// Open the shop (the game opens it from a contact's menu; here it
+    /// opens anywhere).
+    Shop,
     /// Capture or release the mouse for looking around.
     ToggleMouse,
     Fullscreen,
@@ -68,6 +105,9 @@ pub enum Action {
     /// Save the game to the quick-save file, or load it back.
     QuickSave,
     QuickLoad,
+    /// Open or close the test cheat menu (a developer's key:
+    /// [`crate::cheats`]).
+    Cheats,
     Quit,
     /// The pad's face buttons Y, A, X and B, which a hijack's prompts ask
     /// for ([`crate::hijack`]); the left stick's pushes are the movement
@@ -79,73 +119,159 @@ pub enum Action {
     /// Take up the other weapon: the rifle, or what she carries in the
     /// launcher's place (the pad's right bumper, `Switch_Primary`).
     SwitchWeapon,
+    /// The support menu's line down (its [`Support`](Self::Support) is
+    /// up); either opens the menu while it is shut.
+    SupportDown,
+    /// The PC game's view switch (not yet: the alpha has one camera).
+    ViewSwitch,
+    /// Put her binoculars up, or down ([`crate::binoculars`]).
+    Binoculars,
+    /// Through the binoculars: zoom a level in or out (the wheel's
+    /// notches, which switch weapons otherwise).
+    ZoomIn,
+    ZoomOut,
+    /// Look with the keys, as the mouse does ([`KEY_LOOK_RATE`]).
+    LookUp,
+    LookDown,
+    LookLeft,
+    LookRight,
 }
 
-/// Which keys trigger each action, as written in the settings file
-/// (`move_forward = ["KeyW", "ArrowUp"]`).
+/// How fast the look keys turn the view, mouse counts a second: as the
+/// pad's right stick at full push ([`crate::pad::LOOK_RATE`]).
+pub const KEY_LOOK_RATE: f64 = crate::pad::LOOK_RATE;
+
+/// A mouse button, or a notch of its wheel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Mouse {
+    #[serde(rename = "MouseLeft")]
+    Left,
+    #[serde(rename = "MouseRight")]
+    Right,
+    #[serde(rename = "MouseMiddle")]
+    Middle,
+    WheelUp,
+    WheelDown,
+}
+
+/// A key or a mouse control, as written in the settings file (`"KeyW"`,
+/// `"MouseLeft"`, `"WheelUp"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Control {
+    Key(KeyCode),
+    Mouse(Mouse),
+}
+
+impl From<KeyCode> for Control {
+    fn from(key: KeyCode) -> Self {
+        Self::Key(key)
+    }
+}
+
+impl From<Mouse> for Control {
+    fn from(m: Mouse) -> Self {
+        Self::Mouse(m)
+    }
+}
+
+/// Which keys and mouse controls trigger each action, as written in the
+/// settings file (`fire = ["MouseLeft"]`, `move_forward = ["KeyW"]`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Bindings(pub BTreeMap<Action, Vec<KeyCode>>);
+pub struct Bindings(pub BTreeMap<Action, Vec<Control>>);
 
 impl Default for Bindings {
     fn default() -> Self {
         use Action::*;
         use KeyCode::*;
+        use Mouse::*;
+        let k = Control::Key;
+        let m = Control::Mouse;
         Self(BTreeMap::from([
-            (MoveForward, vec![KeyW, ArrowUp]),
-            (MoveBack, vec![KeyS, ArrowDown]),
-            (MoveLeft, vec![KeyA, ArrowLeft]),
-            (MoveRight, vec![KeyD, ArrowRight]),
-            (MoveUp, vec![Space]),
-            (MoveDown, vec![KeyC, ControlLeft]),
-            (Sprint, vec![ShiftLeft, ShiftRight]),
-            (Walk, vec![KeyQ]),
-            (ToggleFly, vec![KeyV]),
-            (ToggleMusic, vec![KeyM]),
-            (Use, vec![KeyE]),
-            (Reset, vec![KeyR]),
-            (Reload, vec![KeyR]),
-            (Fire, vec![KeyF]),
-            (Aim, vec![]),
-            (Throw, vec![KeyG]),
-            (Explosive, vec![Digit3]),
-            (Detonate, vec![KeyX]),
-            (Seat, vec![KeyY]),
-            (Melee, vec![KeyB]),
-            (Rifle, vec![Digit1]),
-            (Launcher, vec![Digit2]),
-            (Support, vec![KeyT]),
-            (Pda, vec![KeyP]),
-            (ToggleMouse, vec![Tab]),
-            (Fullscreen, vec![F11]),
-            (NextGait, vec![KeyN]),
-            (ToggleCulling, vec![F3]),
-            (QuickSave, vec![F5]),
-            (QuickLoad, vec![F9]),
-            (Quit, vec![Escape]),
-            // Laid out as the face buttons are (not the PC game's keys,
-            // which aren't known yet).
-            (PadY, vec![KeyI]),
-            (PadA, vec![KeyK]),
-            (PadX, vec![KeyJ]),
-            (PadB, vec![KeyL]),
-            (SwitchWeapon, Vec::new()),
+            (MoveForward, vec![k(KeyW)]),
+            (MoveBack, vec![k(KeyS)]),
+            (MoveLeft, vec![k(KeyA)]),
+            (MoveRight, vec![k(KeyD)]),
+            (MoveUp, vec![k(Space)]),
+            (MoveDown, vec![k(KeyC)]),
+            (Sprint, vec![k(ShiftLeft)]),
+            (Walk, vec![k(ControlLeft)]),
+            (ToggleFly, vec![k(F4)]),
+            (ToggleMusic, vec![k(KeyM)]),
+            (Use, vec![k(KeyE)]),
+            (Reset, vec![k(KeyR)]),
+            (Reload, vec![k(KeyR)]),
+            (Fire, vec![m(Mouse::Left)]),
+            (Aim, vec![k(KeyC)]),
+            (Binoculars, vec![k(KeyB)]),
+            (ZoomIn, vec![m(WheelUp)]),
+            (ZoomOut, vec![m(WheelDown)]),
+            (Throw, vec![m(Mouse::Right), k(KeyG)]),
+            (Explosive, vec![k(KeyV)]),
+            (Detonate, vec![k(KeyX)]),
+            (Seat, vec![k(KeyY)]),
+            (Melee, vec![k(KeyF), m(Mouse::Middle)]),
+            // The PC game switches with Tab and the wheel only.
+            (Rifle, Vec::new()),
+            (Launcher, Vec::new()),
+            (Support, vec![k(Digit1), k(ArrowUp)]),
+            (SupportDown, vec![k(Digit2), k(ArrowDown)]),
+            (ViewSwitch, vec![k(Digit4), k(ArrowRight)]),
+            (LookUp, vec![k(KeyI)]),
+            (LookDown, vec![k(KeyK)]),
+            (LookLeft, vec![k(KeyJ)]),
+            (LookRight, vec![k(KeyL)]),
+            (Pda, vec![k(F1)]),
+            (Shop, vec![k(KeyH)]),
+            (ToggleMouse, vec![k(F2)]),
+            (Fullscreen, vec![k(F11)]),
+            (NextGait, vec![k(KeyN)]),
+            (ToggleCulling, vec![k(F3)]),
+            (QuickSave, vec![k(F5)]),
+            (QuickLoad, vec![k(F9)]),
+            (Cheats, vec![k(F7)]),
+            (Quit, vec![k(Escape)]),
+            // Laid out as the face buttons are (the PC game's are not
+            // known), beside the look keys.
+            (PadY, vec![k(KeyI)]),
+            (PadA, vec![k(KeyK)]),
+            (PadX, vec![k(KeyJ)]),
+            (PadB, vec![k(KeyL)]),
+            (SwitchWeapon, vec![k(Tab), m(WheelUp), m(WheelDown)]),
         ]))
     }
 }
 
 impl Bindings {
-    /// The actions `key` triggers.
-    pub fn actions_for(&self, key: KeyCode) -> impl Iterator<Item = Action> + '_ {
+    /// The actions `control` triggers.
+    pub fn actions_for(&self, control: impl Into<Control>) -> impl Iterator<Item = Action> + '_ {
+        let control = control.into();
         self.0
             .iter()
-            .filter(move |(_, keys)| keys.contains(&key))
+            .filter(move |(_, controls)| controls.contains(&control))
             .map(|(&a, _)| a)
     }
 
-    /// The name of the first key bound to `action` (`P`), if any.
+    /// The name of the first key or mouse control bound to `action` (`F1`,
+    /// `Left click`), if any.
     pub fn key_name(&self, action: Action) -> Option<String> {
-        self.0.get(&action)?.first().map(|&k| key_name(k))
+        self.0.get(&action)?.first().map(|&c| control_name(c))
+    }
+}
+
+/// A control's name as written on it: `P`, `F1`, `Left click`.
+fn control_name(control: Control) -> String {
+    match control {
+        Control::Key(key) => key_name(key),
+        Control::Mouse(m) => match m {
+            Mouse::Left => "Left click",
+            Mouse::Right => "Right click",
+            Mouse::Middle => "Middle click",
+            Mouse::WheelUp => "Wheel up",
+            Mouse::WheelDown => "Wheel down",
+        }
+        .to_owned(),
     }
 }
 
@@ -182,7 +308,7 @@ fn key_name(key: KeyCode) -> String {
 /// draw these as the fonts' button pictures where there is one
 /// ([`m2_game::gui_runtime::button_glyph`]); the keys are the fallback.
 /// `[pfire]` and `[move]` are named apart ([`token_keys`]).
-const TOKENS: [(&str, Action); 7] = [
+const TOKENS: [(&str, Action); 8] = [
     ("pda", Action::Pda),
     ("support", Action::Support),
     ("confirm", Action::Use),
@@ -190,10 +316,11 @@ const TOKENS: [(&str, Action); 7] = [
     ("reload", Action::Reload),
     ("jump", Action::MoveUp),
     ("bash", Action::Melee),
+    ("zoom", Action::Binoculars),
 ];
 
 /// The key tokens of the game's texts named as the keys bound here
-/// (`("pda", "P")`): those of [`TOKENS`], `[pfire]` the PC's fire (the
+/// (`("pda", "F1")`): those of [`TOKENS`], `[pfire]` the fire's (the
 /// left mouse button) and `[move]` the keys that move. Keys left unbound
 /// are left out.
 pub fn token_keys(keys: &Bindings) -> Vec<(String, String)> {
@@ -202,7 +329,9 @@ pub fn token_keys(keys: &Bindings) -> Vec<(String, String)> {
         .iter()
         .filter_map(|&(token, action)| Some((token.to_owned(), keys.key_name(action)?)))
         .collect();
-    out.push(("pfire".to_owned(), "Left click".to_owned()));
+    if let Some(fire) = keys.key_name(Fire) {
+        out.push(("pfire".to_owned(), fire));
+    }
     let names: Vec<String> = [MoveForward, MoveLeft, MoveBack, MoveRight]
         .into_iter()
         .filter_map(|a| keys.key_name(a))
@@ -272,7 +401,10 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn key(&mut self, bindings: &Bindings, key: KeyCode, down: bool, repeat: bool) {
+    /// A key or mouse control went down (`repeat`: the system's repeat
+    /// while held) or up. A wheel's notch goes down and up at once: a
+    /// press.
+    pub fn key(&mut self, bindings: &Bindings, key: impl Into<Control>, down: bool, repeat: bool) {
         if down {
             self.pad = false;
         }
@@ -348,6 +480,17 @@ impl Input {
     pub fn pad_look(&mut self, dx: f64, dy: f64) {
         self.pad_look.0 += dx;
         self.pad_look.1 += dy;
+    }
+
+    /// The look keys held turn the view for `dt` seconds, as the pad's
+    /// right stick does at full push ([`KEY_LOOK_RATE`]).
+    pub fn key_look(&mut self, dt: f64) {
+        let x = self.axis(Action::LookLeft, Action::LookRight);
+        let y = self.axis(Action::LookUp, Action::LookDown);
+        self.pad_look(
+            f64::from(x) * KEY_LOOK_RATE * dt,
+            f64::from(y) * KEY_LOOK_RATE * dt,
+        );
     }
 
     /// The right stick's turn since the last call, in mouse counts.
@@ -430,11 +573,12 @@ mod tests {
     #[test]
     fn key_tokens_are_named_as_bound() {
         let b = Bindings::default();
-        assert_eq!(name_keys("[pda] Look", &b), "[P] Look");
+        assert_eq!(name_keys("[pda] Look", &b), "[F1] Look");
         assert_eq!(
             name_keys("[support] One\n[pfire] Two [move] [confirm]", &b),
-            "[T] One\n[Left click] Two [WASD] [E]"
+            "[1] One\n[Left click] Two [WASD] [E]"
         );
+        assert_eq!(name_keys("[bash]", &b), "[F]");
         assert_eq!(name_keys("[sprint] Sprint", &b), "[Shift] Sprint");
         // The play test's: the reload, and the jump that brakes.
         assert_eq!(
@@ -443,7 +587,7 @@ mod tests {
         );
         assert_eq!(name_keys("[other] stays [", &b), "[other] stays [");
         let mut b = b;
-        b.0.insert(Action::MoveForward, vec![KeyCode::ArrowUp]);
+        b.0.insert(Action::MoveForward, vec![KeyCode::ArrowUp.into()]);
         assert_eq!(name_keys("[move]", &b), "[Up/A/S/D]");
         b.0.insert(Action::Pda, Vec::new());
         assert_eq!(name_keys("[pda]", &b), "[pda]");
@@ -455,8 +599,10 @@ mod tests {
         struct File {
             keys: Bindings,
         }
-        let f: File =
-            toml::from_str("[keys]\nmove_forward = [\"KeyZ\"]\nquit = [\"KeyQ\"]").unwrap();
+        let f: File = toml::from_str(
+            "[keys]\nmove_forward = [\"KeyZ\"]\nquit = [\"KeyQ\"]\nfire = [\"MouseRight\", \"KeyF\"]",
+        )
+        .unwrap();
         assert_eq!(
             f.keys.actions_for(KeyCode::KeyZ).collect::<Vec<_>>(),
             [Action::MoveForward]
@@ -465,5 +611,166 @@ mod tests {
             f.keys.actions_for(KeyCode::KeyQ).collect::<Vec<_>>(),
             [Action::Quit]
         );
+        assert_eq!(
+            f.keys.actions_for(Mouse::Right).collect::<Vec<_>>(),
+            [Action::Fire]
+        );
+        assert_eq!(
+            f.keys.actions_for(KeyCode::KeyF).collect::<Vec<_>>(),
+            [Action::Fire]
+        );
+        // And the defaults write out and read back the same.
+        let text = toml::to_string(&Bindings::default()).unwrap();
+        assert_eq!(
+            toml::from_str::<Bindings>(&text).unwrap(),
+            Bindings::default()
+        );
+        assert!(text.contains("fire = [\"MouseLeft\"]"), "{text}");
+    }
+
+    /// The PC game's controls screen (keyboard and mouse defaults, from
+    /// the PC footage): each control and the action it does here.
+    const PC_DEFAULTS: [(&str, Control, Action); 30] = {
+        use Action::*;
+        use Control::{Key as K, Mouse as M};
+        use KeyCode::*;
+        use Mouse::*;
+        [
+            ("move", K(KeyW), MoveForward),
+            ("move", K(KeyS), MoveBack),
+            ("strafe", K(KeyA), MoveLeft),
+            ("strafe", K(KeyD), MoveRight),
+            ("primary attack", M(Mouse::Left), Fire),
+            ("primary switch", K(Tab), SwitchWeapon),
+            ("primary switch", M(WheelUp), SwitchWeapon),
+            ("reload", K(KeyR), Reload),
+            ("secondary attack", M(Mouse::Right), Throw),
+            ("secondary attack", K(KeyG), Throw),
+            ("secondary switch", K(KeyV), Explosive),
+            ("melee", K(KeyF), Melee),
+            ("melee", M(Mouse::Middle), Melee),
+            ("use", K(KeyE), Use),
+            ("jump", K(Space), MoveUp),
+            ("crouch", K(KeyC), MoveDown),
+            ("binoculars", K(KeyB), Binoculars),
+            ("pda", K(F1), Pda),
+            ("look", K(KeyI), LookUp),
+            ("look", K(KeyK), LookDown),
+            ("look", K(KeyJ), LookLeft),
+            ("look", K(KeyL), LookRight),
+            ("support up", K(Digit1), Support),
+            ("support up", K(ArrowUp), Support),
+            ("support down", K(Digit2), SupportDown),
+            ("support down", K(ArrowDown), SupportDown),
+            ("view switch", K(Digit4), ViewSwitch),
+            ("view switch", K(ArrowRight), ViewSwitch),
+            ("walk", K(ControlLeft), Walk),
+            ("sprint", K(ShiftLeft), Sprint),
+        ]
+    };
+
+    /// The PC table's controls that don't do their action in `b`, and
+    /// those that also do a gameplay action the table gives another
+    /// control (the alpha's old F that fired, C that also flew down).
+    fn pc_misses(b: &Bindings) -> Vec<String> {
+        let table: HashSet<Action> = PC_DEFAULTS.iter().map(|&(_, _, a)| a).collect();
+        let mut out = Vec::new();
+        for &(name, control, action) in &PC_DEFAULTS {
+            let does: Vec<Action> = b.actions_for(control).collect();
+            if !does.contains(&action) {
+                out.push(format!("{name} {control:?}: {does:?}"));
+            }
+            // Crouch raises the weapon too; the hijack's face buttons sit
+            // beside the look.
+            let stray: Vec<&Action> = does
+                .iter()
+                .filter(|&&a| a != action && table.contains(&a))
+                .filter(|&&a| !(action == Action::MoveDown && a == Action::Aim))
+                .collect();
+            if !stray.is_empty() {
+                out.push(format!("{name} {control:?} also {stray:?}"));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn f7_opens_the_cheat_menu_and_nothing_else() {
+        let b = Bindings::default();
+        let on: Vec<Action> = b.actions_for(KeyCode::F7).collect();
+        assert_eq!(on, [Action::Cheats]);
+    }
+
+    #[test]
+    fn the_defaults_are_the_pc_games() {
+        let b = Bindings::default();
+        assert_eq!(pc_misses(&b), Vec::<String>::new());
+        // Crouch raises the weapon; the wheel switches either way.
+        assert!(b.actions_for(KeyCode::KeyC).any(|a| a == Action::Aim));
+        assert!(
+            b.actions_for(Mouse::WheelDown)
+                .any(|a| a == Action::SwitchWeapon)
+        );
+        // No gameplay action is left on a key the PC table gives another.
+        let table: HashSet<Control> = PC_DEFAULTS.iter().map(|&(_, c, _)| c).collect();
+        for (action, controls) in &b.0 {
+            for c in controls {
+                let pc: Vec<Action> = PC_DEFAULTS
+                    .iter()
+                    .filter(|&&(_, pc, _)| pc == *c)
+                    .map(|&(_, _, a)| a)
+                    .collect();
+                let fine = !table.contains(c)
+                    || pc.contains(action)
+                    || matches!(
+                        action,
+                        Action::Aim
+                            | Action::ZoomIn
+                            | Action::ZoomOut
+                            | Action::Reset
+                            | Action::PadY
+                            | Action::PadA
+                            | Action::PadX
+                            | Action::PadB
+                    );
+                assert!(fine, "{action:?} on {c:?}, which the PC game gives {pc:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wheel_notch_is_one_press() {
+        let b = Bindings::default();
+        let mut input = Input::default();
+        input.key(&b, Mouse::WheelUp, true, false);
+        input.key(&b, Mouse::WheelUp, false, false);
+        assert!(!input.held(Action::SwitchWeapon));
+        assert!(input.take_pressed(Action::SwitchWeapon));
+        assert!(!input.take_pressed(Action::SwitchWeapon));
+        // Through the binoculars the same notch zooms; B puts them up
+        // and no longer raises the weapon.
+        assert!(input.take_pressed(Action::ZoomIn));
+        input.key(&b, Mouse::WheelDown, true, false);
+        assert!(input.take_pressed(Action::ZoomOut));
+        assert!(!input.take_pressed(Action::ZoomIn));
+        assert_eq!(
+            b.actions_for(KeyCode::KeyB).collect::<Vec<_>>(),
+            [Action::Binoculars]
+        );
+    }
+
+    #[test]
+    fn the_look_keys_turn_as_the_pads_stick() {
+        let b = Bindings::default();
+        let mut input = Input::default();
+        input.key(&b, KeyCode::KeyL, true, false);
+        input.key(&b, KeyCode::KeyI, true, false);
+        input.key_look(0.5);
+        let (dx, dy) = input.take_look(false);
+        assert_eq!((dx, dy), (KEY_LOOK_RATE * 0.5, -KEY_LOOK_RATE * 0.5));
+        input.key(&b, KeyCode::KeyL, false, false);
+        input.key(&b, KeyCode::KeyI, false, false);
+        input.key_look(0.5);
+        assert_eq!(input.take_look(true), (0.0, 0.0));
     }
 }
