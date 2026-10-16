@@ -1526,6 +1526,12 @@ impl Mission {
         self.world.borrow_mut().subtitles_off = !on;
     }
 
+    /// Whether the player has the tutorial tips on
+    /// (`Sys.TutorialsEnabled`; on unless told).
+    pub fn set_tutorials(&mut self, on: bool) {
+        self.world.borrow_mut().tutorials_off = !on;
+    }
+
     /// The subtitles of the movie [`take_movie`](Self::take_movie) gave,
     /// if the scripts asked for them (`bSubtitles`) and it has any: its
     /// `Subtitles_<movie>` script's `SubtitleData`, loaded as
@@ -1940,6 +1946,23 @@ mod tests {
         assert_eq!(landing_zone("03_mar_airport_llz_playerone"), Some((3, 1)));
         assert_eq!(landing_zone("lz_helipad_playerone"), None);
         assert_eq!(landing_zone("06_gua_upperclass_playerone"), None);
+    }
+
+    #[test]
+    fn the_players_subtitles_and_tutorials_reach_the_scripts() {
+        let mut m = Mission::new(GameData::default(), "Mattias", [0.0; 3]).unwrap();
+        let ask = |m: &Mission| {
+            m.lua()
+                .load("return { Sys.SubtitlesEnabled(), Sys.TutorialsEnabled() }")
+                .eval::<Vec<bool>>()
+                .unwrap()
+        };
+        assert_eq!(ask(&m), [true, true]);
+        m.set_tutorials(false);
+        assert_eq!(ask(&m), [true, false]);
+        m.set_subtitles(false);
+        m.set_tutorials(true);
+        assert_eq!(ask(&m), [false, true]);
     }
 
     #[test]

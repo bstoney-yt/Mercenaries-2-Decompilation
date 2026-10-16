@@ -183,6 +183,11 @@ pub struct Pad {
     holding: Vec<(Button, Action)>,
     /// Sprint latched by L3.
     sprint: bool,
+    /// The pause menu's pad options: its look speed, times
+    /// [`LOOK_RATE`] (unset: 1), and the right stick's up and down
+    /// swapped.
+    pub look: Option<f64>,
+    pub invert: bool,
 }
 
 impl Pad {
@@ -251,8 +256,10 @@ impl Pad {
         }
         // Look: squared, so small pushes aim finely.
         let [rx, ry] = s.right;
+        let ry = if self.invert { -ry } else { ry };
         let curve = |v: f32| f64::from(v * v.abs());
-        input.pad_look(curve(rx) * LOOK_RATE * dt, -curve(ry) * LOOK_RATE * dt);
+        let rate = LOOK_RATE * self.look.unwrap_or(1.0);
+        input.pad_look(curve(rx) * rate * dt, -curve(ry) * rate * dt);
         self.last = s;
     }
 
@@ -406,6 +413,18 @@ mod tests {
         );
         let (dx, dy) = input.take_pad_look();
         assert!((dx - 0.25 * LOOK_RATE * 0.5).abs() < 1e-9 && dy == 0.0);
+        // The pause menu's options: twice as fast, up and down swapped.
+        pad.look = Some(2.0);
+        pad.invert = true;
+        let up = PadState {
+            right: [0.0, 0.5],
+            ..PadState::default()
+        };
+        pad.feed(&mut input, up, false, 0.5);
+        let (_, dy) = input.take_pad_look();
+        assert!((dy - 0.25 * LOOK_RATE).abs() < 1e-9, "{dy}");
+        pad.look = None;
+        pad.invert = false;
         // Half way or less walks.
         let s = PadState {
             left: [0.3, 0.0],

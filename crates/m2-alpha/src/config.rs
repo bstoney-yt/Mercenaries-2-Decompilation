@@ -52,11 +52,38 @@ pub struct GameOptions {
     /// (`Sys.SubtitlesEnabled`). Captions such as place names show
     /// either way, as the game shows them.
     pub subtitles: bool,
+    /// The tutorial tips (`Sys.TutorialsEnabled`).
+    pub tutorials: bool,
+    /// The scripts' autosaves after a contract are written.
+    pub autosave: bool,
+    /// The pause menu's sliders, 0 to 100 (see [`crate::pause::Settings`]):
+    /// the pad's look speed, the brightness and view distance (kept, not
+    /// used yet) and the volumes.
+    pub pad_sensitivity: f64,
+    pub invert_pad: bool,
+    pub rumble: bool,
+    pub brightness: f64,
+    pub view_distance: f64,
+    pub sfx_volume: f64,
+    pub music_volume: f64,
+    pub dialog_volume: f64,
 }
 
 impl Default for GameOptions {
     fn default() -> Self {
-        Self { subtitles: true }
+        Self {
+            subtitles: true,
+            tutorials: true,
+            autosave: true,
+            pad_sensitivity: 50.0,
+            invert_pad: false,
+            rumble: true,
+            brightness: 50.0,
+            view_distance: 100.0,
+            sfx_volume: 100.0,
+            music_volume: 100.0,
+            dialog_volume: 100.0,
+        }
     }
 }
 

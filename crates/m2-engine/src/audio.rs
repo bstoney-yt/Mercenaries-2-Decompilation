@@ -392,6 +392,9 @@ pub struct Mixer {
     /// conversation and slow it in the survival rescue).
     levels: [Glide; Category::ALL],
     pitches: [Glide; Category::ALL],
+    /// Each category's volume as the player set it (the options' sliders),
+    /// under the scripts' levels.
+    volumes: [f32; Category::ALL],
     /// Most voices played at once; the quietest are dropped past it.
     pub max_voices: usize,
 }
@@ -408,6 +411,7 @@ impl Mixer {
             master: 0.8,
             levels: [Glide::ONE; Category::ALL],
             pitches: [Glide::ONE; Category::ALL],
+            volumes: [1.0; Category::ALL],
             max_voices: 64,
         }
     }
@@ -431,6 +435,16 @@ impl Mixer {
     /// The level `category`'s sounds play at now.
     pub fn level(&self, category: Category) -> f32 {
         self.levels[category.index()].now
+    }
+
+    /// Sets the player's volume for `category` (0 silent, 1 as made).
+    pub fn set_volume(&mut self, category: Category, volume: f32) {
+        self.volumes[category.index()] = volume.clamp(0.0, 1.0);
+    }
+
+    /// The player's volume for `category`.
+    pub fn volume(&self, category: Category) -> f32 {
+        self.volumes[category.index()]
     }
 
     pub fn play(&mut self, play: Play) -> VoiceId {
@@ -500,7 +514,7 @@ impl Mixer {
 
     /// Left and right gain for `play` from the listener.
     fn gains(&self, play: &Play) -> (f32, f32) {
-        let g = play.gain * self.master * self.level(play.category);
+        let g = play.gain * self.master * self.level(play.category) * self.volume(play.category);
         let Some(at) = play.position else {
             return (g, g);
         };
@@ -1532,6 +1546,32 @@ mod tests {
         m.mix(&mut out);
         m.mix(&mut out);
         assert!((out[2 * 49] - 0.5).abs() < 1e-3, "{}", out[98]);
+    }
+
+    #[test]
+    fn the_players_volume_scales_its_category_under_the_scripts_level() {
+        let mut m = Mixer::new(100);
+        m.master = 1.0;
+        m.set_volume(Category::Music, 0.5);
+        m.fade(Category::Music, 0.5, 0.0);
+        m.play(
+            Play::flat(tone(100, 1000))
+                .looped()
+                .category(Category::Music),
+        );
+        m.play(Play::flat(tone(100, 1000)).looped().ui());
+        let mut out = vec![0.0; 2 * 50];
+        m.mix(&mut out);
+        m.mix(&mut out);
+        // Music at 0.5 x 0.5 of its 0.5, the interface's whole.
+        assert!(
+            (out[2 * 49] - (0.5 * 0.25 + 0.5)).abs() < 1e-3,
+            "{}",
+            out[98]
+        );
+        assert_eq!(m.volume(Category::Music), 0.5);
+        m.set_volume(Category::Vo, 3.0);
+        assert_eq!(m.volume(Category::Vo), 1.0);
     }
 
     #[test]
