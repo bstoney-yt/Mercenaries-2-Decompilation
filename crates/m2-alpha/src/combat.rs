@@ -1087,11 +1087,13 @@ pub enum Sound {
     /// A gun's shot: its template's sound set, if it has one (the cue it
     /// plays is the sound set's in the `Sounds` table,
     /// [`m2_engine::gun_sounds`]), and whether someone other than the
-    /// hero fired it.
+    /// hero fired it, and their number (0 for the hero), which picks
+    /// their variant of the shot.
     Shot {
         at: Vec3,
         set: Option<u32>,
         npc: bool,
+        shooter: u32,
     },
     Launch(Vec3),
     /// The grenade launcher's.
@@ -2143,14 +2145,15 @@ impl Combat {
     /// else the alpha's own flash `size` metres long) and its shot.
     /// A gun of `feel` fired from `from` along `dir`: its flash, its spent
     /// case thrown out at `case` (its `ShellEjectTemplate`'s effect, where
-    /// its model's case node is known), and its shot's sound.
+    /// its model's case node is known), and its shot's sound: the hero's
+    /// (`shooter` `None`) or someone else's, by their number.
     fn gun_fired(
         &mut self,
         feel: Option<Feel>,
         (from, case): (Vec3, Option<Vec3>),
         dir: Vec3,
         size: f32,
-        npc: bool,
+        shooter: Option<u32>,
     ) {
         if let (Some(shell), Some(at)) = (feel.and_then(|f| f.shell), case) {
             self.cases += 1;
@@ -2182,8 +2185,14 @@ impl Combat {
             }
         }
         let set = feel.and_then(|f| f.sound_set);
+        let npc = shooter.is_some();
         *self.shots.entry((set.unwrap_or(0), !npc)).or_default() += 1;
-        self.sounds.push(Sound::Shot { at: from, set, npc });
+        self.sounds.push(Sound::Shot {
+            at: from,
+            set,
+            npc,
+            shooter: shooter.unwrap_or(0),
+        });
     }
 
     /// The shots fired so far by sound set, and the flashes, in a line.
@@ -2601,7 +2610,7 @@ impl Combat {
         }
         self.fired.rifle += 1;
         self.effect(Effect::Tracer { from, to }, 0.07);
-        self.gun_fired(Some(feel), (from, case), aim, MG_FLASH, false);
+        self.gun_fired(Some(feel), (from, case), aim, MG_FLASH, None);
         alarm(f.people, from);
     }
 
@@ -2685,7 +2694,7 @@ impl Combat {
             (from, case),
             (to - from).normalize_or(aim),
             RIFLE_FLASH,
-            false,
+            None,
         );
         if killed {
             self.remarks.push(Remark::Kill);
@@ -2714,6 +2723,7 @@ impl Combat {
         let Some(aim) = target else { return };
         let n = &f.people.npcs[i];
         let gun = n.gun;
+        let shooter = n.shooter;
         let (from, case) = match (f.arsenal.npc_gun(gun), f.people.kinds.get(n.kind)) {
             (Some(w), Some(_)) => {
                 let (nodes, _) = n.rig.posed();
@@ -2759,7 +2769,7 @@ impl Combat {
         let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
         self.effect(Effect::Tracer { from, to: end }, 0.07);
         let feel = gun.and_then(|g| self.feels.get(&g.template).copied());
-        self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, true);
+        self.gun_fired(feel, (from, case), dir, RIFLE_FLASH, Some(shooter));
         let closest = from + dir * (aim - from).dot(dir).max(0.0);
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
         if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
@@ -3093,7 +3103,7 @@ impl Combat {
                     }
                 }
                 let case = case_behind(f.arsenal, w.model, from, aim);
-                self.gun_fired(Some(w.feel), (from, case), aim, MG_FLASH, false);
+                self.gun_fired(Some(w.feel), (from, case), aim, MG_FLASH, None);
             }
             m2_engine::weapons::Flight::Lobbed => {
                 let speed = ammo.velocity.max(1.0);
@@ -3249,7 +3259,7 @@ impl Combat {
                 );
             }
             let case = case_behind(f.arsenal, w.model, from, aim);
-            self.gun_fired(Some(w.feel), (from, case), aim, MG_FLASH, false);
+            self.gun_fired(Some(w.feel), (from, case), aim, MG_FLASH, None);
         } else {
             if coax {
                 self.mg_reload = TANK_MG_GAP;
@@ -3261,7 +3271,7 @@ impl Combat {
             self.effect(Effect::Tracer { from, to }, 0.07);
             // A vehicle's machine gun with no template read: the alpha's
             // own flash and the rifle's shot.
-            self.gun_fired(None, (from, None), aim, MG_FLASH, false);
+            self.gun_fired(None, (from, None), aim, MG_FLASH, None);
             if let Some((_, Some(j))) = hit {
                 let soldier = f.people.npcs[j].soldier;
                 if f.people.npcs[j].hurt(MG_DAMAGE, aim * SHOT_PUSH) && soldier {

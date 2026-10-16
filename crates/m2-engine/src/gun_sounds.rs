@@ -18,9 +18,13 @@
 //! set answers its own events (`grapple_fire`, `grapple_attach`,
 //! `grapple_reel`, `grapple_reel_loop`, `grapple_loop`,
 //! `grapple_release`); [`GRAPPLE_FIRE`] is its shot. One event
-//! (`a639af36`, a cue of the `ui_hud` bank on most sets) is not named. `Param` is [`ANY`] on most rows;
-//! the assault rifles' NPC shot has six rows with other `Param`s (not
-//! named), which pick between three cues.
+//! (`a639af36`, a cue of the `ui_hud` bank on most sets) is not named.
+//! `Param` is [`ANY`] on most rows. The assault rifles' NPC shot (set
+//! `7473fe68`, which hashes as `assaultrifle`) has six rows keyed
+//! `variant_1` to `variant_6` instead, giving three cues (records 11, 12
+//! and 13 of the `wpn_shared` bank) in turn: 1 and 4, 2 and 5, 3 and 6
+//! share a cue. No other gun set has such rows. [`GunCues::shot_by`]
+//! picks a shooter's variant from a number of theirs.
 //!
 //! # Provenance
 //!
@@ -29,8 +33,13 @@
 //! grapple events so) (`weapon_fire` hashes to the
 //! carbine's row whose cue is its bank's loudest three-variant record);
 //! that a gun plays `weapon_fire` when the hero fires and
-//! `weapon_fire_npc` when anyone else does is inferred from the names. Not
-//! checked against the game's code.
+//! `weapon_fire_npc` when anyone else does is inferred from the names. The
+//! `variant_N` names are found the same way (all six rows). That each
+//! shooter keeps one variant (so soldiers sound apart, rather than each
+//! shot picking anew) is inferred from there being six variants for three
+//! cues; how the game numbers a shooter's variant is invented here (a
+//! number of theirs, modulo the variants the set has). Not checked
+//! against the game's code.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -55,6 +64,17 @@ pub const GRAPPLE_FIRE: &str = "grapple_fire";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GunCues {
     cues: HashMap<(u32, u32), u32>,
+    /// A set's cue per event keyed `variant_1`, `variant_2`, ... in
+    /// order, for sets and events with no plain row.
+    variants: HashMap<(u32, u32), Vec<u32>>,
+}
+
+/// The most `variant_N` keys looked for.
+const MOST_VARIANTS: u32 = 16;
+
+/// The `Param` hash of `variant_<n>`.
+fn variant_key(n: u32) -> u32 {
+    name_hash(&format!("variant_{n}"))
 }
 
 impl GunCues {
@@ -62,12 +82,23 @@ impl GunCues {
     /// `SoundID`): of several rows for a set and event, the one whose
     /// `Param` is [`ANY`], else the first. Rows naming no set (the
     /// [`ANY`] set's, which key the set in `Param` instead) are left out.
+    /// Rows keyed `variant_1`, `variant_2`, ... (up to the first number
+    /// missing) are kept apart too, as the set's variants for the event.
     pub fn from_rows(rows: impl IntoIterator<Item = [u32; 4]>) -> Self {
+        let keys: HashMap<u32, u32> = (1..=MOST_VARIANTS).map(|n| (variant_key(n), n)).collect();
         let mut cues = HashMap::new();
         let mut plain = std::collections::HashSet::new();
+        let mut numbered: HashMap<(u32, u32), HashMap<u32, u32>> = HashMap::new();
         for [set, event, param, cue] in rows {
             if set == ANY || cue == ANY || cue == 0 {
                 continue;
+            }
+            if let Some(&n) = keys.get(&param) {
+                numbered
+                    .entry((set, event))
+                    .or_default()
+                    .entry(n)
+                    .or_insert(cue);
             }
             if param == ANY {
                 if plain.insert((set, event)) {
@@ -77,7 +108,17 @@ impl GunCues {
                 cues.entry((set, event)).or_insert(cue);
             }
         }
-        Self { cues }
+        let variants = numbered
+            .into_iter()
+            .filter(|(key, _)| !plain.contains(key))
+            .filter_map(|(key, by_n)| {
+                let list: Vec<u32> = (1..=MOST_VARIANTS)
+                    .map_while(|n| by_n.get(&n).copied())
+                    .collect();
+                (!list.is_empty()).then_some((key, list))
+            })
+            .collect();
+        Self { cues, variants }
     }
 
     /// From the parsed table; `None` if it lacks one of its columns.
@@ -128,6 +169,30 @@ impl GunCues {
             self.cue(set, FIRE)
         }
         .or_else(|| self.cue(set, GRAPPLE_FIRE))
+    }
+
+    /// [`shot`](Self::shot), for a shooter numbered `shooter`: where the
+    /// event has `variant_N` rows, the shooter's variant (`shooter`
+    /// modulo their count; invented); else the plain shot.
+    pub fn shot_by(&self, set: u32, npc: bool, shooter: u32) -> Option<u32> {
+        let event = name_hash(if npc { FIRE_NPC } else { FIRE });
+        match self.variants.get(&(set, event)) {
+            Some(list) => list.get(shooter as usize % list.len()).copied(),
+            None => self.shot(set, npc),
+        }
+    }
+
+    /// The `variant_N` cues sound set `set` has for `event`, in order:
+    /// empty for most.
+    pub fn variants(&self, set: u32, event: &str) -> &[u32] {
+        self.variants
+            .get(&(set, name_hash(event)))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Set and event pairs with `variant_N` rows.
+    pub fn varied(&self) -> usize {
+        self.variants.len()
     }
 
     /// The cue a spinning gun of sound set `set` loops while it fires
@@ -228,5 +293,65 @@ mod tests {
     fn a_plain_row_wins_over_keyed_ones() {
         let cues = GunCues::from_rows([[1, 2, 7, 10], [1, 2, ANY, 20], [1, 2, 8, 30]]);
         assert_eq!(cues.cues.get(&(1, 2)), Some(&20));
+    }
+
+    // The `Param` values of the assault rifles' NPC shot (read from a
+    // legally installed copy's table) hash as `variant_1` to `variant_6`.
+    #[test]
+    fn the_assault_rifles_params_hash_as_variants() {
+        let rows = [
+            0x6333_f2bc,
+            0x3d31_7853,
+            0x5b2f_68f6,
+            0x6540_c1d5,
+            0x3b3e_4120,
+            0xe53b_7b27,
+        ];
+        for (n, row) in (1..).zip(rows) {
+            assert_eq!(variant_key(n), row);
+        }
+        assert_eq!(name_hash("assaultrifle"), 0x7473_fe68);
+    }
+
+    // The table's six rows give three cues in turn; a shooter keeps
+    // theirs; the hero's shot and other sets are untouched.
+    #[test]
+    fn shooters_take_their_variant_of_the_npc_shot() {
+        let ak = 0x7473_fe68;
+        let (a, b, c) = (0xd8ce_1427, 0x8827_8c4f, 0xfe2a_84a8);
+        let cues = GunCues::from_rows([
+            [ak, 0x3842_7a98, 0x6333_f2bc, a],
+            [ak, 0x3842_7a98, 0x3d31_7853, b],
+            [ak, 0x3842_7a98, 0x5b2f_68f6, c],
+            [ak, 0x3842_7a98, 0x6540_c1d5, a],
+            [ak, 0x3842_7a98, 0x3b3e_4120, b],
+            [ak, 0x3842_7a98, 0xe53b_7b27, c],
+            [ak, 0x8f87_f89c, ANY, 0x4988_08cf],
+            [9, 0x3842_7a98, ANY, 0x77],
+        ]);
+        assert_eq!(cues.variants(ak, FIRE_NPC), &[a, b, c, a, b, c]);
+        assert_eq!(cues.varied(), 1);
+        let heard: Vec<_> = (0..6).map(|s| cues.shot_by(ak, true, s).unwrap()).collect();
+        assert_eq!(heard, [a, b, c, a, b, c]);
+        assert_eq!(cues.shot_by(ak, true, 7), Some(b));
+        // Without a shooter, the first, as before.
+        assert_eq!(cues.shot(ak, true), Some(a));
+        assert_eq!(cues.shot_by(ak, false, 3), Some(0x4988_08cf));
+        assert_eq!(cues.shot_by(9, true, 3), Some(0x77));
+    }
+
+    // A plain row for the event leaves its variants unused, and the
+    // numbering stops at the first number missing.
+    #[test]
+    fn variants_need_no_plain_row_and_no_gap() {
+        let cues = GunCues::from_rows([
+            [1, 2, variant_key(1), 10],
+            [1, 2, ANY, 20],
+            [3, 2, variant_key(1), 30],
+            [3, 2, variant_key(3), 40],
+        ]);
+        assert_eq!(cues.variants.get(&(1, 2)), None);
+        assert_eq!(cues.variants.get(&(3, 2)), Some(&vec![30]));
+        assert_eq!(cues.varied(), 1);
     }
 }

@@ -725,6 +725,10 @@ pub struct Npc {
     /// point.
     pub hand: Option<usize>,
     pub attach: Option<usize>,
+    /// A number of this person's, fixed where they came in: picks their
+    /// variant of a gun's shot ([`m2_engine::gun_sounds::GunCues::shot_by`];
+    /// invented).
+    pub shooter: u32,
     /// Seconds since they died.
     dead_for: f32,
     /// Their body gone limp, once dead.
@@ -747,6 +751,18 @@ pub enum Shout {
     Flee,
 }
 
+/// A person's number from where they came in and which way they faced:
+/// the bits mixed (FNV-1a over the three words), so people a step apart
+/// differ.
+fn shooter_number(at: Vec3, facing: f32) -> u32 {
+    [at.x, at.z, facing]
+        .iter()
+        .flat_map(|v| v.to_bits().to_le_bytes())
+        .fold(0x811c_9dc5_u32, |h, b| {
+            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+        })
+}
+
 impl Npc {
     pub(crate) fn new(
         kind: usize,
@@ -764,6 +780,7 @@ impl Npc {
             clips,
             hand,
             attach: crate::combat::right_attach(&rig.skeleton),
+            shooter: shooter_number(at, facing),
             dead_for: 0.0,
             ragdoll: None,
             fling: None,
@@ -2266,6 +2283,20 @@ pub(crate) mod tests {
         assert_eq!(names, keyed);
     }
     use std::sync::Arc;
+
+    // A squad standing a step apart takes all three of the assault
+    // rifles' shot cues (six variants), and a person keeps their number.
+    #[test]
+    fn a_squad_a_step_apart_spreads_over_the_variants() {
+        let at = |i: usize| Vec3::new(10.0 + i as f32, 0.0, -4.0);
+        let mut cues = std::collections::HashSet::new();
+        for i in 0..8 {
+            cues.insert(shooter_number(at(i), 0.5) % 3);
+        }
+        assert_eq!(cues.len(), 3);
+        assert_eq!(shooter_number(at(2), 0.5), shooter_number(at(2), 0.5));
+        assert_ne!(shooter_number(at(2), 0.5), shooter_number(at(2), 0.6));
+    }
 
     pub(crate) fn ground() -> Physics {
         let mut p = Physics::new();
