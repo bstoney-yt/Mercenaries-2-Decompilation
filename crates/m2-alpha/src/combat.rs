@@ -1093,12 +1093,24 @@ pub enum Sound {
         set: Option<u32>,
         npc: bool,
     },
-    Launch(Vec3),
-    /// The grenade launcher's.
-    Lob(Vec3),
+    /// A rocket or missile fired, a grenade lobbed, a tank's main gun: the
+    /// weapon's sound set where its template has one (its cue is played
+    /// as a shot's; every launcher's, cannon's and missile's reaches a
+    /// sound but one, round 12 of the gap fills), else the alpha's own
+    /// sound for each.
+    Launch {
+        at: Vec3,
+        set: Option<u32>,
+    },
+    Lob {
+        at: Vec3,
+        set: Option<u32>,
+    },
     Explosion(Vec3),
-    /// A tank's main gun.
-    Cannon(Vec3),
+    Cannon {
+        at: Vec3,
+        set: Option<u32>,
+    },
     /// The satellite-guided bomb landing.
     Bomb(Vec3),
     /// A building the bomb brought down coming apart.
@@ -2547,7 +2559,10 @@ impl Combat {
                     flown: 0.0,
                     blast: ammo.burst(),
                 });
-                self.sounds.push(Sound::Lob(from));
+                self.sounds.push(Sound::Lob {
+                    at: from,
+                    set: feel.sound_set,
+                });
                 alarm(f.people, from);
                 return;
             }
@@ -2570,7 +2585,10 @@ impl Combat {
                     },
                     FLASH_TIME,
                 );
-                self.sounds.push(Sound::Launch(from));
+                self.sounds.push(Sound::Launch {
+                    at: from,
+                    set: feel.sound_set,
+                });
                 alarm(f.people, from);
                 return;
             }
@@ -2936,7 +2954,10 @@ impl Combat {
             1.2,
         );
         self.show_fx(fx::BACK_BLAST, from);
-        self.sounds.push(Sound::Launch(from));
+        self.sounds.push(Sound::Launch {
+            at: from,
+            set: self.launcher.feel.sound_set,
+        });
         alarm(f.people, f.player.character.position);
     }
 
@@ -2978,7 +2999,10 @@ impl Combat {
             },
             FLASH_TIME * 1.4,
         );
-        self.sounds.push(Sound::Lob(from));
+        self.sounds.push(Sound::Lob {
+            at: from,
+            set: self.launcher.feel.sound_set,
+        });
         alarm(f.people, f.player.character.position);
     }
 
@@ -3105,7 +3129,10 @@ impl Combat {
                     flown: 0.0,
                     blast: ammo.burst(),
                 });
-                self.sounds.push(Sound::Lob(from));
+                self.sounds.push(Sound::Lob {
+                    at: from,
+                    set: w.feel.sound_set,
+                });
             }
             _ => {
                 self.projectiles.push(Projectile::Rocket {
@@ -3126,7 +3153,10 @@ impl Combat {
                     },
                     FLASH_TIME,
                 );
-                self.sounds.push(Sound::Launch(from));
+                self.sounds.push(Sound::Launch {
+                    at: from,
+                    set: w.feel.sound_set,
+                });
             }
         }
         alarm(f.people, from);
@@ -3151,14 +3181,14 @@ impl Combat {
         };
         let gun = v.spec.tuning.gun;
         // Its machine gun as its template arms it (the AMX-30's "Mounted
-        // Heavy MG (Tank) (VZ)"): the first gun of its armament whose
-        // rounds are bullets.
-        let mg = v
-            .spec
-            .armed
-            .iter()
-            .find(|m| m.weapon.flight() == m2_engine::weapons::Flight::Round)
-            .map(|m| m.weapon.clone());
+        // Heavy MG (Tank) (VZ)"; see
+        // [`m2_engine::weapons::machine_gun`]). A template that mounts no
+        // such gun has none to fire.
+        let mg = match m2_engine::weapons::machine_gun(&v.spec.armed) {
+            m2_engine::weapons::MachineGun::Mounted(w) => Some(w.clone()),
+            m2_engine::weapons::MachineGun::Unmounted if coax || !cannon => return,
+            _ => None,
+        };
         let (from, barrel) = v
             .spec
             .muzzle_pose(v.turret, v.gun)
@@ -3218,7 +3248,12 @@ impl Combat {
                 1.5,
             );
             self.show_fx(fx::CANNON, from + aim * 0.8);
-            self.sounds.push(Sound::Cannon(from));
+            self.sounds.push(Sound::Cannon {
+                at: from,
+                set: gun
+                    .and_then(|g| self.feels.get(&g.weapon))
+                    .and_then(|f| f.sound_set),
+            });
         } else if let Some(w) = mg {
             // Its own machine gun's rate, round and look and sound.
             if coax {
@@ -5095,6 +5130,15 @@ mod tests {
         let mut people = People::default();
         let arsenal = Arsenal::default();
         let mut combat = Combat::default();
+        // Its gun's template (`Mounted Tank Gun (Default)`) has a sound set:
+        // its shots carry it, to be heard as that set's shot.
+        combat.feels.insert(
+            gun.weapon,
+            Feel {
+                sound_set: Some(0x40b7_1f4e),
+                ..Feel::default()
+            },
+        );
         let fire = Trigger {
             fire: true,
             ..Trigger::default()
@@ -5114,7 +5158,15 @@ mod tests {
             let sounds = combat.take_sounds();
             shots += sounds
                 .iter()
-                .filter(|s| matches!(s, Sound::Cannon(_)))
+                .filter(|s| {
+                    matches!(
+                        s,
+                        Sound::Cannon {
+                            set: Some(0x40b7_1f4e),
+                            ..
+                        }
+                    )
+                })
                 .count();
         }
         assert_eq!(shots, 2);
@@ -5626,7 +5678,7 @@ mod tests {
         let lobs = combat
             .take_sounds()
             .iter()
-            .filter(|s| matches!(s, Sound::Lob(_)))
+            .filter(|s| matches!(s, Sound::Lob { .. }))
             .count();
         assert_eq!(lobs, 18);
         assert!(!combat.second_loaded());

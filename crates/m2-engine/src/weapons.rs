@@ -529,6 +529,36 @@ pub fn mounted(arm: &Armament, arms: &Arms, nodes: &[u32]) -> Vec<Mounted> {
     out
 }
 
+/// What a vehicle's machine gun fires as ([`machine_gun`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MachineGun<'a> {
+    /// A gun its template mounts: its own rate, round, flash and sound.
+    Mounted(&'a WeaponSpec),
+    /// Its template mounts weapons, none of them a gun for this: it has
+    /// no such gun, and fires nothing.
+    Unmounted,
+    /// No template armament was read: the alpha's own gun stands in.
+    StandIn,
+}
+
+/// What a vehicle armed with `armed` fires as its machine gun (beside a
+/// tank's cannon, or a turret gun no seat's mount fires): the first
+/// mount whose rounds are bullets ([`Flight::Round`]: the AMX-30's
+/// `Mounted Heavy MG (Tank) (VZ)`). A vehicle whose armament mounts none
+/// has no machine gun: the AMX-30 AA and the PGZ95 mount missiles and
+/// their own gun, nothing beside it.
+///
+/// Provenance: the mounts are the template's (from samples); that a
+/// template with no bullet gun has no machine gun to fire is inferred
+/// from the mounts (the game's seat logic is not decoded).
+pub fn machine_gun(armed: &[Mounted]) -> MachineGun<'_> {
+    match armed.iter().find(|m| m.weapon.flight() == Flight::Round) {
+        Some(m) => MachineGun::Mounted(&m.weapon),
+        None if armed.is_empty() => MachineGun::StandIn,
+        None => MachineGun::Unmounted,
+    }
+}
+
 /// Every weapon the database names.
 #[derive(Clone, Debug, Default)]
 pub struct Arms {
@@ -982,6 +1012,57 @@ mod tests {
             model: None,
             sticky: false,
         }
+    }
+
+    fn mount(template: u32, ammo: Ammo, homing: bool) -> Mounted {
+        Mounted {
+            seat: 1,
+            priority: 0,
+            weapon: WeaponSpec {
+                template,
+                name: format!("gun {template}"),
+                model: None,
+                class: None,
+                semi: false,
+                rate_of_fire: 400.0,
+                clip: 100,
+                reserve_clips: 0,
+                pellets: 1,
+                rounds_per_reload: 0,
+                scatter: 0.0,
+                ammo,
+                lock_on: homing.then_some((1.0, 500.0)),
+                pickup: None,
+                feel: Default::default(),
+            },
+            nodes: vec![Some(0)],
+        }
+    }
+
+    // The AMX-30: a heavy MG beside its gun; the PGZ95: its own bursting
+    // gun and missiles, no machine gun.
+    #[test]
+    fn a_vehicles_machine_gun_is_its_mounted_bullet_gun_or_none() {
+        let blast = Blast {
+            template: 9,
+            radius: 2.0,
+            damage: 40.0,
+            min_damage: 0.0,
+            max_force: 0.0,
+            key: None,
+        };
+        let shell = Ammo {
+            blast: Some(blast),
+            ..ammo(40.0, 40.0, (0.0, 0.0))
+        };
+        let bullet = mount(1, ammo(6.0, 3.0, (15.0, 50.0)), false);
+        let cannon = mount(2, shell, false);
+        let missile = mount(3, ammo(100.0, 100.0, (0.0, 0.0)), true);
+
+        let armed = [cannon.clone(), bullet.clone()];
+        assert_eq!(machine_gun(&armed), MachineGun::Mounted(&bullet.weapon));
+        assert_eq!(machine_gun(&[cannon, missile]), MachineGun::Unmounted);
+        assert_eq!(machine_gun(&[]), MachineGun::StandIn);
     }
 
     // The carbine round: 6 out to 15 m, 3 from 50 m; 340 m/s from her

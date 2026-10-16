@@ -214,6 +214,9 @@ pub struct GameAudio {
     shots_heard: HashSet<u32>,
     /// Shots heard with their own cue, and with the rifle's standing in.
     shots: (u32, u32),
+    /// Launches, lobs and cannon shots heard with their weapon's own cue,
+    /// and with the alpha's sound standing in.
+    launches: (u32, u32),
     /// Spinning guns firing now: their loop's voice ([`GunCues::spin`]).
     spins: Vec<Spin>,
 }
@@ -962,6 +965,7 @@ impl GameAudio {
             }),
             shots_heard: HashSet::new(),
             shots: (0, 0),
+            launches: (0, 0),
             spins: Vec::new(),
         }
     }
@@ -1345,11 +1349,35 @@ impl GameAudio {
                     }
                     (0, at, 0.9)
                 }
-                Sound::Launch(at) => (1, at, 1.0),
+                Sound::Launch { at, set } | Sound::Lob { at, set } | Sound::Cannon { at, set } => {
+                    // Its weapon's own shot where its sound set has one
+                    // (the RPG's, a tank gun's, a helicopter's
+                    // missiles'), else the alpha's sound for its kind.
+                    let own = self.play_shot(at, set, false);
+                    if own {
+                        self.launches.0 += 1;
+                    } else {
+                        self.launches.1 += 1;
+                    }
+                    let (a, b) = self.launches;
+                    if (a + b) % 20 == 1 {
+                        eprintln!(
+                            "sound: {} launches: {a} with their weapon's own cue, {b} with \
+                             the alpha's standing in",
+                            a + b
+                        );
+                    }
+                    if own {
+                        continue;
+                    }
+                    match *sound {
+                        Sound::Launch { .. } => (1, at, 1.0),
+                        Sound::Cannon { .. } => (3, at, 1.3),
+                        _ => (4, at, 1.0),
+                    }
+                }
                 Sound::Explosion(at) => (2, at, 1.4),
                 Sound::Bomb(at) => (2, at, 2.5),
-                Sound::Cannon(at) => (3, at, 1.3),
-                Sound::Lob(at) => (4, at, 1.0),
                 Sound::Collapse(at) => (5, at, 2.0),
                 Sound::Break { at, key } => {
                     self.play_key(key, at);
