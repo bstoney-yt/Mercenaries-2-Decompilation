@@ -1150,7 +1150,7 @@ fn main() -> Result<(), Error> {
 fn atmospheres(world: &WorldIndex, names: &Names, arg: &str) {
     let show = |a: &m2_engine::Atmosphere| {
         format!(
-            "time {:.3} li {:.2} light {:.2},{:.2},{:.2} tone {:.2},{:.2},{:.2} cover {:.2} up {:.2},{:.2},{:.2} interp {:.1} dark {:.0} inscat {:.1} haze {:?}",
+            "time {:.3} li {:.2} light {:.2},{:.2},{:.2} tone {:.2},{:.2},{:.2} cover {:.2} up {:.2},{:.2},{:.2} interp {:.1} dark {:.0} inscat {:.1} haze {:?} bloom {:?} tone map {:?}",
             a.light_time[0],
             a.light_intensity,
             a.light_color.x,
@@ -1166,7 +1166,9 @@ fn atmospheres(world: &WorldIndex, names: &Names, arg: &str) {
             a.interpolate_time,
             a.cloud_darkness,
             a.inscattering,
-            a.haze_layers
+            a.haze_layers,
+            a.bloom,
+            a.tone_map
         )
     };
     if let Some(a) = &world.atmosphere {
