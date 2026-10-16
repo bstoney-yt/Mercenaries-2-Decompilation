@@ -42,6 +42,7 @@
 use std::collections::{HashMap, HashSet};
 
 use m2_engine::tuning::HandGun;
+use m2_engine::weapons::FireHint;
 use m2_engine::world::{SpawnPoint, is_walker};
 use m2_engine::{AiProfile, BoundClip, Character, Gait, GpuModel, Physics, RagdollId};
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3};
@@ -71,7 +72,8 @@ const FLEE_TIME: f32 = 6.0;
 /// How far a runner who meets a wall looks along it each way, metres.
 const CLEAR: f32 = 6.0;
 /// A soldier fights within this range of the player, and fires within
-/// `FIRE_RANGE` once facing within `FIRE_ARC` radians of them.
+/// his gun's `FireRange` once facing within `FIRE_ARC` radians of them
+/// (`FIRE_RANGE` for one with no gun: the "Assault Rifle"'s).
 const FIGHT_RANGE: f32 = 80.0;
 const FIRE_RANGE: f32 = 70.0;
 const FIRE_ARC: f32 = 0.3;
@@ -97,15 +99,25 @@ const DETOUR_TIME: f32 = 4.0;
 const STEP_GAP: (f32, f32) = (2.0, 3.0);
 const STEP: (f32, f32) = (3.0, 6.0);
 const PUSH_TO: f32 = 15.0;
-/// Seconds between a soldier's shots: at least this, plus up to as much
-/// again at random.
-const FIRE_GAP: (f32, f32) = (0.9, 0.8);
-/// They fire in bursts: at least this many rounds, plus up to this many
-/// more at random (invented, as no field names them), at their gun's
-/// `RateOfFire`; this many seconds apart for those whose template names
-/// no gun (the "Assault Rifle"'s 450 a minute, as the AK47 stands in).
-const BURST: (u32, u32) = (3, 2);
+/// They fire in bursts as their gun's `WeaponHint` has it
+/// ([`FireHint`]): rounds at its `RateOfFire` for `BurstOnLength`, then
+/// `BurstOffLength`'s pause (the close pair within [`FireHint::CLOSE`]),
+/// between its `MinFireRange` and `FireRange`. Those whose template names
+/// no gun fire as the "Assault Rifle" does (the AK47 stands in): 450 a
+/// minute, its `WeaponHint` below (gap round 13's dump).
 const BURST_GAP: f32 = 60.0 / 450.0;
+const STAND_IN: FireHint = FireHint {
+    min_range: 1.0,
+    range: FIRE_RANGE,
+    angle: 2,
+    on: 0.8,
+    off: 9.0,
+    on_close: 0.8,
+    off_close: 1.5,
+};
+/// Each pause is this much longer or shorter at random, so soldiers who
+/// see her together don't fire together (invented).
+const PAUSE_JITTER: f32 = 0.25;
 const PAUSE: (f32, f32) = (2.0, 6.0);
 /// A soldier lobs a grenade at where she hides once she has been out of
 /// his sight this long, seconds, within this reach, metres, and no
@@ -877,7 +889,8 @@ impl Npc {
     }
 
     /// A soldier's tick in a fight with the player at `threat`. While he
-    /// sees her within `FIRE_RANGE` he turns to her, aims and fires, and
+    /// sees her within his gun's `FireRange` he turns to her, aims and
+    /// fires in its bursts (no nearer than its `MinFireRange`), and
     /// every few seconds steps aside or (as `Offensive` has it) closer;
     /// otherwise he runs to where he last saw her (`PursueSpeed`). False
     /// when the fight is off: she is out of his sight's reach, or he has
@@ -950,7 +963,7 @@ impl Npc {
         }
         if hiding {
             self.step = None;
-        } else if !seen || distance > FIRE_RANGE {
+        } else if !seen || distance > self.fire_hint().range {
             self.step = None;
             let mut toward = (goal - at).with_y(0.0);
             // Where he last saw her, and she isn't there: on towards the
@@ -1017,7 +1030,7 @@ impl Npc {
             // (along it the clearer way, or back if it is a corner) for a
             // while, then on.
             self.step = None;
-            let chasing = !hiding && (!seen || distance > FIRE_RANGE);
+            let chasing = !hiding && (!seen || distance > self.fire_hint().range);
             if chasing {
                 let waist = self.character.position + Vec3::Y * 0.9;
                 let clear = |d: Vec3| physics.cast_ray(waist, d, CLEAR).map_or(CLEAR, |(t, _)| t);
@@ -1067,19 +1080,25 @@ impl Npc {
             self.rig.aim_along(self.facing, Some(threat - self.chest()));
         }
         self.cooldown -= dt;
-        if seen && self.cooldown <= 0.0 && off < FIRE_ARC && distance < FIRE_RANGE {
+        let hint = self.fire_hint();
+        if seen
+            && self.cooldown <= 0.0
+            && off < FIRE_ARC
+            && distance < hint.range
+            && distance >= hint.min_range
+        {
             self.fires = true;
             self.since_shot = 0.0;
+            let close = distance < FireHint::CLOSE;
             if self.burst == 0 {
-                let more = rng.range(0.0, BURST.1 as f32 + 1.0) as u32;
-                self.burst = BURST.0 + more.min(BURST.1);
+                self.burst = hint.rounds(self.burst_gap(), close);
             }
             self.burst -= 1;
-            self.cooldown = if self.burst > 0 {
-                self.burst_gap()
-            } else {
-                FIRE_GAP.0 + rng.range(0.0, FIRE_GAP.1)
-            };
+            self.cooldown = self.burst_gap();
+            if self.burst == 0 {
+                let pause = hint.burst(close).1;
+                self.cooldown += pause * rng.range(1.0 - PAUSE_JITTER, 1.0 + PAUSE_JITTER);
+            }
         }
         let rate = match self.rig.gait_speed(gait) {
             Some(clip) if gait != Gait::Idle && clip > 0.1 => (moved / clip).clamp(0.6, 1.4),
@@ -1095,6 +1114,12 @@ impl Npc {
         self.gun
             .filter(|g| g.rate_of_fire > 0.0)
             .map_or(BURST_GAP, |g| 60.0 / g.rate_of_fire)
+    }
+
+    /// How he fires his gun: its `WeaponHint`, else the "Assault
+    /// Rifle"'s ([`STAND_IN`]).
+    fn fire_hint(&self) -> FireHint {
+        self.gun.and_then(|g| g.hint).unwrap_or(STAND_IN)
     }
 
     /// His `Accuracy`, as the smarter soldiers have it when on.
@@ -2501,6 +2526,7 @@ pub(crate) mod tests {
             reserve_clips: 7,
             damage: 9.0,
             damage_key: None,
+            hint: None,
         };
         people.add_kind(kind("Carmona", true));
         people.add_kind(PersonKind {
@@ -2718,6 +2744,7 @@ pub(crate) mod tests {
             reserve_clips: 7,
             damage: 8.0,
             damage_key: None,
+            hint: None,
         }
     }
 

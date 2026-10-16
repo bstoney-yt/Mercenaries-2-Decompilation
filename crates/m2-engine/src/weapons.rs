@@ -148,10 +148,9 @@ impl Feel {
 /// Provenance: the three fields and their names are the template's (from
 /// samples); that they add up so is inferred from the names; when and how
 /// fast the cone settles is invented (the game's own rule is not decoded:
-/// the first unnamed field, the sniper rifle's 0.1 to the minigun's 5,
-/// may be a rate; read as degrees a second it would hold the assault
-/// rifle's cone at its least however long it fires, as settling while
-/// firing at 1 s from the most also did).
+/// the first field, once taken for a rate, is `LowSkillScatter`; none of
+/// the 31 components on the guns' templates names a settle rate among
+/// the fields named so far, gap round 13).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Bloom {
     /// Degrees added to `ScatterMin`.
@@ -187,7 +186,8 @@ impl Bloom {
 /// `WeaponScatter`'s fields in the order the template database lists
 /// them. The last three are `ScatterMin`, `ScatterMax` and
 /// `ScatterPerShot` (names found by hashing guesses, round 19); the first
-/// four are not named. The third and fourth look like a second pair of a
+/// is `LowSkillScatter` (gap round 13: a soldier's cone, not a settle
+/// rate); the second to fourth are not named. The third and fourth look like a second pair of a
 /// least and a most (the third is never above the fourth, and both are
 /// mostly below `ScatterMin` and `ScatterMax`: the carbine's 1 and 1.5
 /// beside 1 and 2), perhaps for aiming or crouching; not decided.
@@ -352,8 +352,8 @@ pub struct WeaponSpec {
     pub pellets: u32,
     /// Rounds a reload puts in (0: the whole clip).
     pub rounds_per_reload: u32,
-    /// `WeaponScatter`'s first field, unnamed (the sniper rifle's 0.1, the
-    /// carbine's 1, the shotgun's 3.5). Round 17 read it as the cone; the
+    /// `WeaponScatter`'s first field, `LowSkillScatter` (the sniper
+    /// rifle's 0.1, the carbine's 1, the shotgun's 3.5). Round 17 read it as the cone; the
     /// cone is now [`Feel::cone`], from the named fields.
     pub scatter: f32,
     pub ammo: Ammo,
@@ -363,6 +363,84 @@ pub struct WeaponSpec {
     pub pickup: Option<u32>,
     /// Its shots' sound, muzzle flash and scatter.
     pub feel: Feel,
+    /// How soldiers fire it (`WeaponHint`), if its template says.
+    pub hint: Option<FireHint>,
+}
+
+/// How a soldier fires a gun, from its template's `WeaponHint` (names
+/// found by hashing guesses, gap round 13; the carbine's values in
+/// brackets): within what range, and in bursts of how long with what
+/// pauses between, far off and close in.
+///
+/// Provenance: the names and values are the template's (from samples).
+/// That the lengths are seconds is inferred from the names and values
+/// (the carbine's 0.3 s burst is 3 rounds at its 562 a minute, the
+/// minigun's 2 s 30 at 900); that a negative close length means "as far
+/// off" is inferred (it is -1 or a length, never 0); the range at which
+/// a target counts as close is not in this table and is invented
+/// ([`FireHint::CLOSE`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FireHint {
+    /// Nearest and farthest a soldier fires it at, metres (`MinFireRange`
+    /// 1, `FireRange` 70).
+    pub min_range: f32,
+    pub range: f32,
+    /// `FireAngle`'s word (0, 1 or 2: the carbine's 0, the assault
+    /// rifle's 2; a whole number, so not degrees; meaning unknown, unused).
+    pub angle: u32,
+    /// A burst's length and the pause after it, seconds
+    /// (`BurstOnLength` 0.3, `BurstOffLength` 4.5).
+    pub on: f32,
+    pub off: f32,
+    /// The same at close range (`BurstOnCloseLength` -1,
+    /// `BurstOffCloseLength` 0.75); below 0, as far off.
+    pub on_close: f32,
+    pub off_close: f32,
+}
+
+impl FireHint {
+    /// Within this of its target, metres, a soldier fires the close
+    /// bursts (invented: no field read gives it).
+    pub const CLOSE: f32 = 15.0;
+
+    /// Template `id`'s, from the `WeaponHint` table.
+    pub(crate) fn read(hint: &Table<'_>, id: u32) -> Option<Self> {
+        let r = *hint.of_template(id).first()?;
+        let f = |name: &str| hint.float(r, name_hash(name));
+        Some(Self {
+            min_range: f("MinFireRange")?,
+            range: f("FireRange")?,
+            angle: hint.word(r, name_hash("FireAngle")).unwrap_or(0),
+            on: f("BurstOnLength")?,
+            off: f("BurstOffLength")?,
+            on_close: f("BurstOnCloseLength")?,
+            off_close: f("BurstOffCloseLength")?,
+        })
+    }
+
+    /// A burst's length and the pause after it, seconds, far off or
+    /// `close`.
+    pub fn burst(&self, close: bool) -> (f32, f32) {
+        let pick = |near: f32, far: f32| if close && near >= 0.0 { near } else { far };
+        (
+            pick(self.on_close, self.on).max(0.0),
+            pick(self.off_close, self.off).max(0.0),
+        )
+    }
+
+    /// Rounds a burst fires `gap` seconds apart: as many as start within
+    /// its length (the first at once), so a length of 0 is one round.
+    pub fn rounds(&self, gap: f32, close: bool) -> u32 {
+        let (on, _) = self.burst(close);
+        (on / gap.max(1e-3) + 1e-3).floor() as u32 + 1
+    }
+
+    /// The share of the time a soldier who keeps firing spends in bursts.
+    pub fn firing_share(&self, gap: f32, close: bool) -> f32 {
+        let (_, off) = self.burst(close);
+        let firing = self.rounds(gap, close) as f32 * gap;
+        firing / (firing + off).max(1e-3)
+    }
 }
 
 impl WeaponSpec {
@@ -703,6 +781,7 @@ pub fn read(db: &Layer<'_>) -> Arms {
     let lock = Table::new(db, "HomingWeapon");
     let pickup = Table::new(db, "Pickup");
     let scatter = Table::new(db, "WeaponScatter");
+    let hint = Table::new(db, "WeaponHint");
     let effects = Table::new(db, "WeaponEffects");
     let sound = Table::new(db, "SoundEffect");
     let name_of = |id: u32| names.get(&id).map_or(String::new(), |n| (*n).to_owned());
@@ -761,6 +840,7 @@ pub fn read(db: &Layer<'_>) -> Arms {
                         scatter: SCATTER_FIELDS
                             .map(|f| Parts::float(&scatter, id, f).unwrap_or(0.0)),
                     },
+                    hint: FireHint::read(&hint, id),
                 },
             ))
         })
@@ -1017,6 +1097,64 @@ mod tests {
         assert_eq!(t.speed_at(60.0), 16.0);
     }
 
+    // `WeaponHint`'s names hash to the fields the database lists, in
+    // order after the four leading words (gap round 13).
+    #[test]
+    fn weapon_hint_names_hash_as_listed() {
+        let listed = [
+            ("MinFireRange", 0x67a3_cde6),
+            ("FireRange", 0x12b4_9564),
+            ("FireAngle", 0x8d62_0c3a),
+            ("BurstOnLength", 0xee64_1a7e),
+            ("BurstOffLength", 0xb5ef_5ea8),
+            ("ChargeTime", 0x2d59_5f06),
+            ("BurstOnCloseLength", 0x169f_a172),
+            ("BurstOffCloseLength", 0x6a2c_0fb4),
+        ];
+        for (name, hash) in listed {
+            assert_eq!(name_hash(name), hash, "{name}");
+        }
+        // And `WeaponScatter`'s first field.
+        assert_eq!(SCATTER_FIELDS[0], name_hash("LowSkillScatter"));
+    }
+
+    // The carbine's and the minigun's bursts (their `WeaponHint`s).
+    #[test]
+    fn bursts_follow_the_hint() {
+        let carbine = FireHint {
+            min_range: 1.0,
+            range: 70.0,
+            angle: 0,
+            on: 0.3,
+            off: 4.5,
+            on_close: -1.0,
+            off_close: 0.75,
+        };
+        let gap = 60.0 / 562.0;
+        // 0.3 s at 562 a minute: rounds at 0, 0.107 and 0.214 s.
+        assert_eq!(carbine.rounds(gap, false), 3);
+        // Close in, the far burst (-1) with the close pause.
+        assert_eq!(carbine.burst(true), (0.3, 0.75));
+        assert_eq!(carbine.rounds(gap, true), 3);
+        let share = carbine.firing_share(gap, false);
+        assert!((share - 0.32 / 4.82).abs() < 0.01, "{share}");
+        // A 0 s burst is a single round; the pistol's 0 s pause fires at
+        // its rate.
+        let pistol = FireHint {
+            on: 0.0,
+            off: 0.0,
+            ..carbine
+        };
+        assert_eq!(pistol.rounds(0.4, false), 1);
+        assert_eq!(pistol.firing_share(0.4, false), 1.0);
+        let minigun = FireHint {
+            on: 3.0,
+            off: 4.0,
+            ..carbine
+        };
+        assert_eq!(minigun.rounds(60.0 / 900.0, false), 46);
+    }
+
     // A rocket pod chain: each pod once, in the coupling's order.
     #[test]
     fn coupled_mounts_fire_in_turn() {
@@ -1052,6 +1190,7 @@ mod tests {
             lock_on: None,
             pickup: None,
             feel: Default::default(),
+            hint: None,
         };
         let arms = Arms {
             weapons: HashMap::from([(7, spec)]),
