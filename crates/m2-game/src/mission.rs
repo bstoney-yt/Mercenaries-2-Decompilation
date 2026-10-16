@@ -875,6 +875,12 @@ impl Mission {
             ));
         }
         self.check_boundary(now);
+        for e in crate::api::answer_asset_loads(&self.world) {
+            self.log.push(format!(
+                "  t={now:.1} asset load callback: {}",
+                first_lines(&e.to_string())
+            ));
+        }
         for e in crate::api::answer_drop_tests(&self.world) {
             self.log.push(format!(
                 "  t={now:.1} drop zone callback: {}",

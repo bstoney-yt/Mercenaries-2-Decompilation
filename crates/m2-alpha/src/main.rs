@@ -139,8 +139,10 @@ struct Options {
     /// free camera, quick save and load, culling, the gait cycle.
     dev: bool,
     /// With `--alpha` (or `--mission --movies --screenshot`): the scripts'
-    /// skip mode ends once their start has run, rather than staying on for
-    /// the session.
+    /// skip mode ends once their start has run (the default), rather than
+    /// staying on for the session (`--skip-mode-on`). Left on, the flow
+    /// skips the fade before the villa's closing movie and the move into
+    /// the PMC HQ, and Fiona's Talk never comes.
     skip_mode_off: bool,
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
@@ -336,7 +338,10 @@ enum SatelliteShot {
 const SATELLITE_AHEAD: f32 = 45.0;
 
 fn parse_args() -> anyhow::Result<Options> {
-    let mut o = Options::default();
+    let mut o = Options {
+        skip_mode_off: true,
+        ..Options::default()
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
@@ -406,7 +411,9 @@ fn parse_args() -> anyhow::Result<Options> {
             "--double-sided" => o.double_sided = true,
             "--fly" => o.fly = true,
             "--dev" => o.dev = true,
+            // The default since round 25; kept so old launch lines work.
             "--skip-mode-off" => o.skip_mode_off = true,
+            "--skip-mode-on" => o.skip_mode_off = false,
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
@@ -616,7 +623,7 @@ fn parse_args() -> anyhow::Result<Options> {
     }
     // Launched plainly (only where the game is, the window and settings
     // named): the whole game, as `--alpha`.
-    const PLAIN: [&str; 9] = [
+    const PLAIN: [&str; 10] = [
         "--install",
         "--config",
         "--size",
@@ -626,6 +633,7 @@ fn parse_args() -> anyhow::Result<Options> {
         "--smarter-ai",
         "--dev",
         "--skip-mode-off",
+        "--skip-mode-on",
     ];
     if std::env::args()
         .skip(1)
@@ -4978,7 +4986,8 @@ struct App {
     /// `no_boot`), front end, the scripts' movies.
     alpha: bool,
     no_boot: bool,
-    /// End the scripts' skip mode after their start (`--skip-mode-off`).
+    /// End the scripts' skip mode after their start (unless
+    /// `--skip-mode-on`).
     skip_mode_off: bool,
     /// Weapons to start with (`--gun`).
     guns: Vec<String>,
