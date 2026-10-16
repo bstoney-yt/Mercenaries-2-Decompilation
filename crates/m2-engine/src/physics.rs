@@ -1017,6 +1017,10 @@ struct VehicleBody {
     /// speed ([`VehicleTuning`](crate::VehicleTuning)).
     engine: Option<crate::tuning::EngineTuning>,
     tracks: Option<[f32; 4]>,
+    /// The forward gear its engine is in (0 is first), and how long its
+    /// clutch is still out changing to it, seconds.
+    gear: usize,
+    clutch: f32,
     /// Its template's steering lock and brakes, on wheels.
     handling: Option<crate::tuning::Handling>,
     /// Where its front wheels point now, radians (left positive): they
@@ -1844,6 +1848,8 @@ impl Physics {
             },
             engine: spec.tuning.engine.filter(|_| !spec.tracked),
             tracks: spec.tuning.tracks,
+            gear: 0,
+            clutch: 0.0,
             handling: spec.tuning.handling.filter(|_| !spec.tracked),
             steering: 0.0,
             wrecked: false,
@@ -1898,10 +1904,25 @@ impl Physics {
         let slowing = |decel: f32| v.mass * decel * dt / wheels;
         let throttle = controls.throttle.clamp(-1.0, 1.0);
         let against = speed.abs() > 0.5 && throttle * speed < 0.0;
-        // Pulls as its engine turns in the gear its speed puts it in, or
-        // as its tracks' curve says (else 4 m/s² falling to nothing at
-        // the top), up to its top speed; backs up to its reverse top
-        // speed (else half its top speed, at most 8 m/s).
+        // Its gearbox changes up and down as its template's shift speeds
+        // say, rolling forwards, and while its clutch is out its engine
+        // drives nothing (the clutch's delay read so, inferred).
+        if let Some(e) = v.engine {
+            if v.clutch > 0.0 {
+                v.clutch -= dt;
+            } else {
+                let next = e.shift(v.gear, speed.max(0.0));
+                if next != v.gear {
+                    v.gear = next;
+                    v.clutch = e.clutch_delay;
+                }
+            }
+        }
+        let declutched = v.clutch > 0.0 && throttle > 0.0;
+        // Pulls as its engine turns in the gear it is in, or as its
+        // tracks' curve says (else 4 m/s² falling to nothing at the
+        // top), up to its top speed; backs up to its reverse top speed
+        // (else half its top speed, at most 8 m/s).
         let top = if throttle >= 0.0 {
             v.top
         } else {
@@ -1910,7 +1931,8 @@ impl Physics {
         let headroom = (1.0 - speed.abs() / top).clamp(0.0, 1.0);
         let ease = ((top - speed.abs()) / TOP_EASE).clamp(0.0, 1.0);
         let push = match (v.engine, v.tracks) {
-            (Some(e), _) => e.push(speed.abs(), throttle < 0.0) / v.mass * ease,
+            (Some(_), _) if declutched => 0.0,
+            (Some(e), _) => e.push_in(v.gear, speed.abs(), throttle < 0.0) / v.mass * ease,
             (None, Some(curve)) => TRACK_PULL * track_pull(curve, 1.0 - headroom) * ease,
             (None, None) => TRACK_PULL * headroom,
         };
@@ -2268,6 +2290,16 @@ impl Physics {
             .get(id.0)
             .and_then(Option::as_ref)
             .map_or(0.0, |v| v.controller.current_vehicle_speed)
+    }
+
+    /// The forward gear a wheeled vehicle's engine drives in (0 is first)
+    /// and how fast that engine turns in it, rpm; `None` without an
+    /// engine from its template.
+    pub fn vehicle_gear(&self, id: VehicleId) -> Option<(usize, f32)> {
+        let v = self.vehicles.get(id.0).and_then(Option::as_ref)?;
+        let e = v.engine?;
+        let speed = v.controller.current_vehicle_speed.abs();
+        Some((v.gear, e.rpm_at(e.gears[v.gear], speed)))
     }
 
     /// Makes a vehicle a wreck: burst tyres and bent axles no longer carry
@@ -3874,6 +3906,8 @@ mod tests {
             torque: 130.0,
             rpm: (900.0, 3000.0, 12000.0),
             upshift: 4000.0,
+            downshift: 2500.0,
+            clutch_delay: 0.0,
             primary: 3.5,
             gears: [4.0, 3.1, 2.4, 2.0, 1.5],
             reverse: 3.7,
@@ -3922,6 +3956,69 @@ mod tests {
         let fastest = back.iter().copied().fold(0.0, f32::max);
         assert!(fastest > 0.8 * engine.reverse_speed, "{fastest}");
         assert!(fastest < engine.reverse_speed * 1.03, "{fastest}");
+    }
+
+    // Gap round 24: with its template's clutch delay, its gearbox changes
+    // up one gear at a time as it speeds up, and for that long after
+    // each change its engine drives nothing, so it gathers no speed.
+    #[test]
+    fn a_change_of_gear_takes_its_clutch_delay() {
+        let engine = crate::tuning::EngineTuning {
+            torque: 130.0,
+            rpm: (900.0, 3000.0, 12000.0),
+            upshift: 4000.0,
+            downshift: 2500.0,
+            clutch_delay: 0.5,
+            primary: 3.5,
+            gears: [4.0, 3.1, 2.4, 2.0, 1.5],
+            reverse: 3.7,
+            radius: 0.39,
+            torque_at: (0.8, 1.0),
+            reverse_speed: 55.0 / 3.6,
+        };
+        let spec = VehicleSpec {
+            mass: 1000.0,
+            tuning: crate::VehicleTuning {
+                max_speed: Some(85.0 / 3.6),
+                engine: Some(engine),
+                ..Default::default()
+            },
+            ..car()
+        };
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 600.0);
+        p.step(DT);
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -500.0), 0.0);
+        let mut steps = Vec::new();
+        for _ in 0..(12.0 / DT) as usize {
+            p.drive(
+                id,
+                VehicleControls {
+                    throttle: 1.0,
+                    ..Default::default()
+                },
+            );
+            p.step(DT);
+            steps.push((
+                p.vehicle_gear(id).expect("an engine").0,
+                p.vehicle_speed(id),
+            ));
+        }
+        let first_change = steps.iter().position(|s| s.0 == 1).expect("changes up");
+        assert_eq!(steps[first_change - 1].0, 0);
+        // Over the delay that follows it gains next to nothing.
+        let after = steps[first_change + (0.4 / DT) as usize];
+        assert!(after.1 - steps[first_change].1 < 0.1, "{after:?}");
+        // Then it pulls again.
+        let later = steps[first_change + (1.0 / DT) as usize];
+        assert!(later.1 - after.1 > 0.5, "{later:?}");
+        // One gear at a time, never back down while it speeds up.
+        assert!(
+            steps
+                .windows(2)
+                .all(|w| w[1].0 == w[0].0 || w[1].0 == w[0].0 + 1)
+        );
+        assert!(steps.last().expect("steps").0 >= 3);
     }
 
     #[test]

@@ -2,7 +2,12 @@
 //! plane, as the alpha's physics drives it, and prints how fast it gets:
 //! the time to 50 km/h and to 90% of its template's `MaxSpeed`, its
 //! speed after 5, 10 and 20 s and the fastest it went in 40 s, beside
-//! what its template's `MaxSpeed` asks for.
+//! what its template's `MaxSpeed` asks for. Then it brakes to a stop,
+//! and for a vehicle with an engine and gearbox it prints its changes of
+//! gear: how many up and down, how many undone within a second (the
+//! gearbox hunting), and how far from its template's `GearUpshiftRPM`
+//! and `GearDownshiftRPM` the engine turned when it changed (mean of
+//! |rpm - data| / data).
 //!
 //! ```text
 //! cargo run --release -p m2-engine --example drivetest -- "<install dir>"
@@ -23,6 +28,7 @@ use m2_math::glam::{Quat, Vec3};
 
 const DT: f32 = 1.0 / 60.0;
 const SECONDS: f32 = 40.0;
+const BRAKING: f32 = 20.0;
 
 /// A model and its physics record: what drives alike.
 type Driven = (u32, Vec<u8>);
@@ -77,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         groups.len()
     );
     println!(
-        "template\tcount\tkind\tmass\tdata km/h\tt50 s\tt90 s\tv5\tv10\tv20\ttop km/h\tof data"
+        "template\tcount\tkind\tmass\tdata km/h\tt50 s\tt90 s\tv5\tv10\tv20\ttop km/h\tof data\tups\tdowns\thunts\tup err\tdown err"
     );
     let (mut driven, mut no_spec, mut no_model) = (0, 0, 0);
     let mut rows = Vec::new();
@@ -108,10 +114,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let run = drive(&spec);
         driven += ids.len();
         let kmh = |v: f32| format!("{:.0}", v * 3.6);
+        let shifts = spec.tuning.engine.map_or("-\t-\t-\t-\t-".to_owned(), |e| {
+            run.shifts(e.upshift, e.downshift)
+        });
         let at = |t: Option<f32>| t.map_or("-".to_owned(), |t| format!("{t:.1}"));
         let t90 = want.and_then(|w| run.time_to(0.9 * w));
         rows.push(format!(
-            "{name}\t{}\t{kind}\t{:.0}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{name}\t{}\t{kind}\t{:.0}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{shifts}",
             ids.len(),
             spec.mass,
             want.map_or("-".to_owned(), kmh),
@@ -131,8 +140,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Forward speed, m/s, every step of a full-throttle run.
-struct Run(Vec<f32>);
+/// Forward speed, m/s, every step of a full-throttle run; and its gear
+/// and engine rpm every step of that run and the stop after it.
+struct Run(Vec<f32>, Vec<Option<(usize, f32)>>);
 
 impl Run {
     fn at(&self, t: f32) -> f32 {
@@ -147,6 +157,43 @@ impl Run {
     }
     fn top(&self) -> f32 {
         self.0.iter().copied().fold(0.0, f32::max)
+    }
+    /// Its changes of gear: up, down, undone within a second, and the
+    /// mean error of the rpm it changed up and down at against `up` and
+    /// `down`.
+    fn shifts(&self, up: f32, down: f32) -> String {
+        let mut changes = Vec::new();
+        for (i, w) in self.1.windows(2).enumerate() {
+            if let [Some((a, rpm)), Some((b, _))] = w
+                && a != b
+            {
+                changes.push((i, *b > *a, *rpm));
+            }
+        }
+        let second = (1.0 / DT) as usize;
+        let hunts = changes
+            .windows(2)
+            .filter(|w| w[0].1 != w[1].1 && w[1].0 - w[0].0 <= second)
+            .count();
+        let err = |rising: bool, want: f32| {
+            let e: Vec<f32> = changes
+                .iter()
+                .filter(|c| c.1 == rising)
+                .map(|c| (c.2 - want).abs() / want.max(1.0))
+                .collect();
+            if e.is_empty() {
+                "-".to_owned()
+            } else {
+                format!("{:.3}", e.iter().sum::<f32>() / e.len() as f32)
+            }
+        };
+        let ups = changes.iter().filter(|c| c.1).count();
+        format!(
+            "{ups}\t{}\t{hunts}\t{}\t{}",
+            changes.len() - ups,
+            err(true, up),
+            err(false, down)
+        )
     }
 }
 
@@ -170,7 +217,7 @@ fn drive(spec: &VehicleSpec) -> Run {
         p.drive(id, VehicleControls::default());
         p.step(DT);
     }
-    let mut out = Vec::new();
+    let (mut out, mut gears) = (Vec::new(), Vec::new());
     for _ in 0..(SECONDS / DT) as usize {
         p.drive(
             id,
@@ -181,6 +228,20 @@ fn drive(spec: &VehicleSpec) -> Run {
         );
         p.step(DT);
         out.push(p.vehicle_speed(id));
+        gears.push(p.vehicle_gear(id));
     }
-    Run(out)
+    // Brakes to a stop: throttle against the way it rolls.
+    for _ in 0..(BRAKING / DT) as usize {
+        let rolling = p.vehicle_speed(id) > 0.5;
+        p.drive(
+            id,
+            VehicleControls {
+                throttle: if rolling { -1.0 } else { 0.0 },
+                ..Default::default()
+            },
+        );
+        p.step(DT);
+        gears.push(p.vehicle_gear(id));
+    }
+    Run(out, gears)
 }
