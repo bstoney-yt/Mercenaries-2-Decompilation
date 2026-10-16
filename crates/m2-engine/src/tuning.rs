@@ -563,6 +563,8 @@ pub struct HandGun {
     /// `DamageKey` (name hash; `Bullet` for every rifle).
     pub damage: f32,
     pub damage_key: Option<u32>,
+    /// How soldiers fire it (`WeaponHint`, [`crate::weapons::FireHint`]).
+    pub hint: Option<crate::weapons::FireHint>,
 }
 
 /// Every hand-held gun that fires rounds ([`HandGun`]), by template id.
@@ -570,6 +572,7 @@ pub fn hand_guns(db: &Layer<'_>) -> HashMap<u32, HandGun> {
     let weapon = Table::new(db, "WeaponProjectileBase");
     let physics = Table::new(db, "ProjectilePhysics");
     let key = Table::new(db, "DamageKey");
+    let hint = Table::new(db, "WeaponHint");
     let models = db.hashes("ModelName");
     weapon
         .templates()
@@ -594,6 +597,7 @@ pub fn hand_guns(db: &Layer<'_>) -> HashMap<u32, HandGun> {
                         .of_template(ammo)
                         .first()
                         .and_then(|k| key.word(k, name_hash("DamageKey"))),
+                    hint: crate::weapons::FireHint::read(&hint, id),
                 },
             ))
         })

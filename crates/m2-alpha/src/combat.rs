@@ -5273,6 +5273,7 @@ mod tests {
             reserve_clips: 7,
             damage: 12.0,
             damage_key: None,
+            hint: None,
         };
         assert_eq!(combat.npc_round(Some(gun)), 3.0);
         assert_eq!(combat.npc_round(None), NPC_DAMAGE);
@@ -5340,6 +5341,7 @@ mod tests {
             reserve_clips: 7,
             damage: 8.0,
             damage_key: Some(m2_assets::name_hash("Bullet")),
+            hint: None,
         };
         let rifle = Rifle::of("Bullpup Rifle", &bullpup);
         assert_eq!((rifle.model, rifle.clip, rifle.spare), ("bullpup", 30, 210));
