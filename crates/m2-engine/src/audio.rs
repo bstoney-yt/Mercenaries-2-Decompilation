@@ -801,6 +801,13 @@ impl KeySounds {
                 how,
             });
         }
+        if let Some(found) = tables
+            .iter()
+            .find_map(|t| t.mix(key))
+            .and_then(|m| Self::mixed(source, tables, m))
+        {
+            return Some(found);
+        }
         let alike = |list: &[SoundBuffer], how: String| {
             let sounds: Vec<(SoundBuffer, f32)> = list
                 .iter()
@@ -833,6 +840,71 @@ impl KeySounds {
         alike(list, format!("the banks of block {name}"))
     }
 
+    /// A mixed cue's sounds: its tracks' records layered, each from its
+    /// start, as [`MIXES`] takes of them (take `k` plays each record's
+    /// `k`th variant, round its variants), each record at its volume.
+    fn mixed<R: Read + Seek>(
+        source: &mut AssetSource<R>,
+        tables: &[CueTable],
+        mix: &m2_assets::MixedCue,
+    ) -> Option<Self> {
+        let records: Vec<(&m2_assets::voice::Record, f32)> = mix
+            .tracks
+            .iter()
+            .filter_map(|t| {
+                let table = tables.iter().find(|c| c.hash == t.table)?;
+                Some((table.records.get(t.record as usize)?, t.start))
+            })
+            .collect();
+        let mut banks: Vec<u32> = records
+            .iter()
+            .flat_map(|(r, _)| r.variants.iter().map(|v| v.0))
+            .collect();
+        banks.sort_unstable();
+        banks.dedup();
+        let library = SoundLibrary::load_banks(source, &banks);
+        let layers: Vec<(Vec<SoundBuffer>, f32, f32)> = records
+            .iter()
+            .map(|(r, start)| {
+                let sounds: Vec<SoundBuffer> = r
+                    .variants
+                    .iter()
+                    .filter_map(|&(bank, i, _)| library.bank_hash(bank)?.1.get(i as usize).cloned())
+                    .filter(|s| s.frames() > 0)
+                    .collect();
+                (sounds, *start, if r.volume > 0.0 { r.volume } else { 1.0 })
+            })
+            .filter(|(s, _, _)| !s.is_empty())
+            .collect();
+        let most = layers.iter().map(|l| l.0.len()).max()?;
+        let takes = most.clamp(1, MIXES);
+        let sounds: Vec<(SoundBuffer, f32)> = (0..takes)
+            .filter_map(|k| {
+                let picked: Vec<(&SoundBuffer, f32, f32)> = layers
+                    .iter()
+                    .map(|(s, start, gain)| (&s[k % s.len()], *start, *gain))
+                    .collect();
+                Some((mix_layers(mix.cue, &picked)?, 1.0))
+            })
+            .collect();
+        (!sounds.is_empty()).then(|| Self {
+            how: format!(
+                "mixed cue: {} of its {} tracks ({}), {} takes of {:.2} s",
+                layers.len(),
+                mix.tracks.len(),
+                layers
+                    .iter()
+                    .map(|(s, start, _)| format!("{} at {start:.2} s", s.len()))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                sounds.len(),
+                sounds[0].0.seconds()
+            ),
+            sounds,
+            volume: 1.0,
+        })
+    }
+
     /// One of its sounds, `pick` (0 to 1) choosing by weight.
     pub fn pick(&self, pick: f32) -> Option<&SoundBuffer> {
         let total: f32 = self.sounds.iter().map(|s| s.1).sum();
@@ -854,6 +926,54 @@ impl KeySounds {
     }
 }
 
+/// Most takes a mixed cue is pre-mixed into (each a different pick of
+/// its records' variants).
+const MIXES: usize = 4;
+
+/// `layers` (a sound, its start in seconds and its gain) summed into one
+/// sound hashed `hash`: at the first layer's rate, stereo if any layer
+/// is (a mono layer goes to both sides), scaled to fit 16 bits. Layers at
+/// another rate are left out. `None` if nothing is left.
+pub fn mix_layers(hash: u32, layers: &[(&SoundBuffer, f32, f32)]) -> Option<SoundBuffer> {
+    let rate = layers.first()?.0.rate;
+    let layers: Vec<_> = layers.iter().filter(|l| l.0.rate == rate).collect();
+    let channels: u16 = if layers.iter().any(|l| l.0.channels > 1) {
+        2
+    } else {
+        1
+    };
+    let ch = usize::from(channels);
+    let offset = |start: f32| (start.max(0.0) * rate as f32).round() as usize;
+    let frames = layers
+        .iter()
+        .map(|(s, start, _)| offset(*start) + s.frames())
+        .max()?;
+    let mut sum = vec![0.0_f32; frames * ch];
+    for (s, start, gain) in &layers {
+        let at = offset(*start);
+        let sc = usize::from(s.channels.max(1));
+        for f in 0..s.frames() {
+            for c in 0..ch {
+                let v = s.samples[f * sc + c.min(sc - 1)];
+                sum[(at + f) * ch + c] += f32::from(v) * gain;
+            }
+        }
+    }
+    // Scaled down as a whole where the layers' sum overflows (invented:
+    // the game's mixer is not decoded; clipped, a pistol's five layers
+    // cut off over 1,000 samples).
+    let peak = sum.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+    let fit = if peak > 32767.0 { 32767.0 / peak } else { 1.0 };
+    Some(SoundBuffer {
+        hash,
+        channels,
+        rate,
+        samples: sum
+            .iter()
+            .map(|v| (v * fit).round().clamp(-32768.0, 32767.0) as i16)
+            .collect(),
+    })
+}
 /// A bank's sound, decoded.
 fn buffer(s: &m2_assets::sound::Sound) -> SoundBuffer {
     SoundBuffer {
@@ -1571,5 +1691,42 @@ mod tests {
         let e = EngineSounds::pick("veh_jeep", &many);
         let order: Vec<u32> = e.loops.iter().map(|l| l.0.hash).collect();
         assert_eq!(order, [0, 2, 4, 6]);
+    }
+
+    // Layers sum from their starts; a mono layer goes to both sides of a
+    // stereo mix; a layer at another rate is left out; a sum too loud
+    // is scaled down whole.
+    #[test]
+    fn mixes_layers_from_their_starts() {
+        let mono = SoundBuffer {
+            hash: 1,
+            channels: 1,
+            rate: 10,
+            samples: vec![100, 200].into(),
+        };
+        let stereo = SoundBuffer {
+            hash: 2,
+            channels: 2,
+            rate: 10,
+            samples: vec![1, 2, 30_000, 30_000].into(),
+        };
+        let other = SoundBuffer {
+            hash: 3,
+            channels: 1,
+            rate: 20,
+            samples: vec![5; 4].into(),
+        };
+        let m = mix_layers(
+            9,
+            &[(&mono, 0.0, 1.0), (&stereo, 0.1, 1.0), (&other, 0.0, 1.0)],
+        )
+        .unwrap();
+        assert_eq!((m.hash, m.channels, m.rate, m.frames()), (9, 2, 10, 3));
+        assert_eq!(&*m.samples, &[100, 100, 201, 202, 30_000, 30_000]);
+        let loud = mix_layers(9, &[(&stereo, 0.0, 1.0), (&stereo, 0.0, 1.0)]).unwrap();
+        assert_eq!((loud.samples[0], loud.samples[2]), (1, 32_767));
+        let half = mix_layers(9, &[(&mono, 0.0, 0.5)]).unwrap();
+        assert_eq!(&*half.samples, &[50, 100]);
+        assert!(mix_layers(9, &[]).is_none());
     }
 }

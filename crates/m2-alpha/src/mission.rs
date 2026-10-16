@@ -3277,6 +3277,7 @@ mod tests {
             },
             lock_on: None,
             pickup: Some(8),
+            feel: Default::default(),
         };
         let db = Templates {
             infos: HashMap::from([(

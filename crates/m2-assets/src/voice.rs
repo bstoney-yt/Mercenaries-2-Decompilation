@@ -131,9 +131,45 @@ pub struct CueTable {
     /// Every record by its index: volume, and what it may play (bank hash,
     /// sound or stream index, weight).
     pub records: Vec<Record>,
-    /// The cue list's plain cues. (Cues that mix several records, flagged
-    /// 0x100, are not read.)
+    /// The cue list's plain cues.
     pub cues: Vec<PlainCue>,
+    /// The cue list's cues that mix several records ([`MixedCue`]).
+    pub mixes: Vec<MixedCue>,
+}
+
+/// A cue that plays several records at once, each from its own start
+/// (flagged 0x100 in the cue list: a gun's shot, `wpn_assaultrifle_fire`,
+/// layers six of its bank's records, one 0.57 s in).
+///
+/// ```text
+/// 0x00  u32  cue hash
+/// 0x04  u32  flags: 0x100 set (0x10100, 0x140100 on some; the low byte
+///            and the top byte clear)
+/// 0x08  f32  a value not yet known (0.4 to 0.75 on the guns' shots)
+/// 0x0c  f32  how long it lasts, seconds
+/// ...        a header not decoded, then per track:
+///       u32  1, f32 its start (seconds), u32 0x10, u32 table hash,
+///       u32 record index, f32 weight
+/// ```
+///
+/// Format-from-samples: tracks are found by that pattern up to the next
+/// cue, as the list's layout between them is not known.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MixedCue {
+    pub cue: u32,
+    pub seconds: f32,
+    pub tracks: Vec<Track>,
+}
+
+/// One record a [`MixedCue`] plays.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Track {
+    /// The cue table holding the record, and its index there.
+    pub table: u32,
+    pub record: u32,
+    /// Seconds from the cue's start.
+    pub start: f32,
+    pub weight: f32,
 }
 
 /// A plain cue: its name hash, the record it plays, and how long it
@@ -175,6 +211,11 @@ impl CueTable {
     pub fn record_of(&self, cue: u32) -> Option<&Record> {
         self.cue_record(cue)
             .or_else(|| self.records.iter().find(|r| r.cue == cue && cue != 0))
+    }
+
+    /// The mixed cue keyed by `cue`.
+    pub fn mix(&self, cue: u32) -> Option<&MixedCue> {
+        self.mixes.iter().find(|m| m.cue == cue)
     }
 
     /// The plain cue keyed by `cue`.
@@ -329,14 +370,95 @@ impl CueTable {
                 }
             }
         }
+        let mixes = data
+            .get(list..list_end.min(data.len()))
+            .map_or_else(Vec::new, |region| mixed_cues(region, hash, count));
         Ok(Self {
             hash,
             lines,
             groups,
             records: all,
             cues,
+            mixes,
         })
     }
+}
+
+/// The mixed cues of a cue list `region` of table `hash` with `count`
+/// records: each cue flagged 0x100 with the tracks found after it, up to
+/// the next cue, plain or mixed (see [`MixedCue`]).
+fn mixed_cues(region: &[u8], hash: u32, count: usize) -> Vec<MixedCue> {
+    let word = |at: usize| {
+        region
+            .get(at..at + 4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let float = |at: usize| f32::from_bits(word(at));
+    let mut mixes = Vec::new();
+    let mut current: Option<MixedCue> = None;
+    let close = |m: Option<MixedCue>, mixes: &mut Vec<MixedCue>| {
+        if let Some(m) = m.filter(|m| !m.tracks.is_empty()) {
+            mixes.push(m);
+        }
+    };
+    let mut at = 0;
+    while at + 4 <= region.len() {
+        let (w, flags) = (word(at), word(at + 4));
+        let (a, seconds) = (float(at + 8), float(at + 12));
+        if at + 16 <= region.len()
+            && w != 0
+            && w != hash
+            && flags & 0x100 != 0
+            && flags & 0xff == 0
+            && flags >> 24 == 0
+            && a > 0.0
+            && a <= 2.0
+            && seconds > 0.0
+            && seconds < 600.0
+        {
+            close(current.take(), &mut mixes);
+            current = Some(MixedCue {
+                cue: w,
+                seconds,
+                tracks: Vec::new(),
+            });
+            at += 16;
+            continue;
+        }
+        if at + PLAIN_CUE <= region.len()
+            && w != 0
+            && flags == 0
+            && word(at + 16) == hash
+            && (word(at + 20) as usize) < count
+        {
+            close(current.take(), &mut mixes);
+            at += PLAIN_CUE;
+            continue;
+        }
+        if at >= 12
+            && at + 12 <= region.len()
+            && w != 0
+            && word(at - 4) == 0x10
+            && word(at - 12) == 1
+            && let Some(m) = current.as_mut()
+        {
+            let start = float(at - 8);
+            let weight = float(at + 8);
+            if start.is_finite() && start >= 0.0 && weight.is_finite() {
+                m.tracks.push(Track {
+                    table: w,
+                    record: word(at + 4),
+                    start,
+                    weight,
+                });
+                at += 12;
+                continue;
+            }
+        }
+        at += 4;
+    }
+    close(current, &mut mixes);
+    mixes
 }
 
 #[cfg(test)]
@@ -463,6 +585,90 @@ mod tests {
             (0.7, &[(0, 16, 0.0)][..])
         );
         assert!(t.cue_record(0x77).is_none());
+    }
+
+    // A mixed cue as the assault rifle's table lays its shot out (words
+    // shaped as read on a legally installed copy; values made up): its
+    // header, words not decoded, two tracks, then a plain cue ending it.
+    #[test]
+    fn finds_mixed_cues_and_their_tracks() {
+        let mut d = table(&[
+            line(1, RADIO, 10.0, 1000.0, 15),
+            line(2, RADIO, 10.0, 1000.0, 16),
+        ]);
+        let list = d.len() as u32;
+        let f = |v: f32| v.to_bits();
+        let words: Vec<u32> = vec![
+            0x99,
+            0x100,
+            f(0.75),
+            f(1.35), // the mixed cue
+            0x6_0000,
+            0x600,
+            f(1.0),
+            f(-1.0),
+            0x44,
+            0x1ac, // not decoded
+            0x102_0200,
+            1,
+            f(0.0),
+            0x10,
+            0xabcd,
+            1,
+            f(1.0),
+            0, // track
+            0x1_0000,
+            f(-1.0),
+            0x1c, // not decoded
+            0x102_0205,
+            1,
+            f(0.5667),
+            0x10,
+            0xabcd,
+            0,
+            f(1.0),
+            0, // track
+            0x55,
+            0,
+            f(0.5),
+            f(0.125),
+            0xabcd,
+            1, // a plain cue
+            0x102_0200,
+            1,
+            f(0.0),
+            0x10,
+            0xabcd,
+            0,
+            f(1.0), // after it: none
+        ];
+        d.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        let end = d.len() as u32;
+        d[0x18..0x1c].copy_from_slice(&list.to_le_bytes());
+        d[0x1c..0x20].copy_from_slice(&end.to_le_bytes());
+        let t = CueTable::parse_data(&d).unwrap();
+        assert_eq!(t.cues.len(), 1);
+        let m = t.mix(0x99).unwrap();
+        assert_eq!(m.seconds, 1.35);
+        assert_eq!(
+            m.tracks,
+            [
+                Track {
+                    table: 0xabcd,
+                    record: 1,
+                    start: 0.0,
+                    weight: 1.0
+                },
+                Track {
+                    table: 0xabcd,
+                    record: 0,
+                    start: 0.5667,
+                    weight: 1.0
+                }
+            ]
+        );
+        assert_eq!(t.mixes.len(), 1);
+        assert!(t.mix(0x55).is_none());
     }
 
     #[test]

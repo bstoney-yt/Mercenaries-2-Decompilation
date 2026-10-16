@@ -75,6 +75,80 @@ const STIMULUS_REACH: u32 = 0x1417_f4dd;
 /// `WeaponScatter`'s first field (see [`WeaponSpec::scatter`]).
 const SCATTER: u32 = 0x0006_5d26;
 
+/// `WeaponEffects`' unnamed fields: a float beside the muzzle flash (the
+/// carbine's and the anti-material rifle's 0.035; read as how long the
+/// flash shows, seconds: inferred) and the shell casing's effect
+/// (`global_particle_shellsmall`).
+const FLASH_TIME: u32 = 0xd62d_ab7b;
+const SHELL: u32 = 0x1efe_cdea;
+/// `SoundEffect`'s field naming a sound bank (the carbine's
+/// `wpn_combatrifle` block's bank `50333181`; vehicles' engines too).
+const SOUND_BANK: u32 = 0x14a6_7fa6;
+
+/// What firing a gun looks and sounds like, as its template says.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Feel {
+    /// Its shots' sound bank (`SoundEffect`), a name hash: each gun
+    /// family has its own (`wpn_combatrifle`, `wpn_shotgun`, ...).
+    pub sound_bank: Option<u32>,
+    /// Its `SoundSet` (a hash; the carbine's `01b47c45`): what the
+    /// `Sounds` table keys its cues by ([`crate::gun_sounds`]).
+    pub sound_set: Option<u32>,
+    /// Its muzzle flash's template (`MuzzleFlashTemplate`:
+    /// `global_particle_muzzleflash_blue` for the carbine) and how long it
+    /// shows, seconds (see [`FLASH_TIME`]).
+    pub flash: Option<u32>,
+    pub flash_time: Option<f32>,
+    /// The effect of a spent case thrown out (`global_particle_shellsmall`).
+    pub shell: Option<u32>,
+    /// `WeaponScatter`'s seven fields in their order, unnamed (the first
+    /// is [`WeaponSpec::scatter`]).
+    pub scatter: [f32; 7],
+}
+
+/// `WeaponScatter`'s fields in the order the template database lists
+/// them.
+const SCATTER_FIELDS: [u32; 7] = [
+    0x0006_5d26,
+    0xa2f3_cad9,
+    0x3a4e_af3b,
+    0x0bbd_cc45,
+    0x2de4_f3c3,
+    0x2f0e_093d,
+    0x9318_44be,
+];
+
+/// The hand guns' sound banks, by name: each is its own block
+/// (`wpn_combatrifle_P000_Q3.block`), and a gun template's `SoundEffect`
+/// names one by hash (the carbine's `50333181`, `wpn_combatrifle`).
+pub const GUN_BANKS: [&str; 26] = [
+    "wpn_antiair",
+    "wpn_antimaterialrifle",
+    "wpn_assaultrifle",
+    "wpn_automaticrifle",
+    "wpn_bullpuprifle",
+    "wpn_coilgun",
+    "wpn_combatrifle",
+    "wpn_covertpistol",
+    "wpn_covertsmg",
+    "wpn_designator_flare",
+    "wpn_emplacedheavymg",
+    "wpn_emplacedlightmg",
+    "wpn_grapplegun",
+    "wpn_grenadelauncher",
+    "wpn_heavyatmissile",
+    "wpn_huntingpistol",
+    "wpn_lightmg",
+    "wpn_machinepistol",
+    "wpn_minigun",
+    "wpn_pistol",
+    "wpn_rocketlauncher",
+    "wpn_rpg",
+    "wpn_shotgun",
+    "wpn_smg",
+    "wpn_sniperrifle",
+    "wpn_tankgun",
+];
 /// An explosion: `Explosive` and the explosion template's `DamageKey`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Blast {
@@ -200,6 +274,8 @@ pub struct WeaponSpec {
     pub lock_on: Option<(f32, f32)>,
     /// Rounds an ammunition pickup of it gives (its `Pickup` of type 1).
     pub pickup: Option<u32>,
+    /// Its shots' sound, muzzle flash and scatter.
+    pub feel: Feel,
 }
 
 impl WeaponSpec {
@@ -539,6 +615,8 @@ pub fn read(db: &Layer<'_>) -> Arms {
     let lock = Table::new(db, "HomingWeapon");
     let pickup = Table::new(db, "Pickup");
     let scatter = Table::new(db, "WeaponScatter");
+    let effects = Table::new(db, "WeaponEffects");
+    let sound = Table::new(db, "SoundEffect");
     let name_of = |id: u32| names.get(&id).map_or(String::new(), |n| (*n).to_owned());
     let model_of = |id: u32| parts.models.get(&id).copied().filter(|&m| m != 0);
     let class_of = |id: u32| Parts::first(&equipment, id, CLASS).filter(|&c| c != 0);
@@ -583,6 +661,19 @@ pub fn read(db: &Layer<'_>) -> Arms {
                     ammo: parts.ammo(ammo_id),
                     lock_on,
                     pickup: refill(id, ammo_id),
+                    feel: Feel {
+                        sound_bank: Parts::first(&sound, id, SOUND_BANK).filter(|&b| b != 0),
+                        sound_set: Parts::first(&sound, id, name_hash("SoundSet"))
+                            .filter(|&s| s != 0),
+                        flash: Parts::first(&effects, id, name_hash("MuzzleFlashTemplate"))
+                            .filter(|&f| f != 0),
+                        // The covert pistol holds a hash there: not a time.
+                        flash_time: Parts::float(&effects, id, FLASH_TIME)
+                            .filter(|t| (0.0..10.0).contains(t) && *t > 0.0),
+                        shell: Parts::first(&effects, id, SHELL).filter(|&s| s != 0),
+                        scatter: SCATTER_FIELDS
+                            .map(|f| Parts::float(&scatter, id, f).unwrap_or(0.0)),
+                    },
                 },
             ))
         })
@@ -709,6 +800,19 @@ pub fn read(db: &Layer<'_>) -> Arms {
 mod tests {
     use super::*;
 
+    // The gun banks' names hash to the banks the templates' `SoundEffect`
+    // name (read on a legally installed copy: the carbine's `50333181`,
+    // the pistol's `4a1f94d0`, the shotgun's `08e43a91`), and the flash
+    // field to its key.
+    #[test]
+    fn gun_banks_hash_to_the_templates_banks() {
+        assert_eq!(name_hash("wpn_combatrifle"), 0x5033_3181);
+        assert_eq!(name_hash("wpn_pistol"), 0x4a1f_94d0);
+        assert_eq!(name_hash("wpn_shotgun"), 0x08e4_3a91);
+        assert!(GUN_BANKS.contains(&"wpn_combatrifle"));
+        assert_eq!(name_hash("MuzzleFlashTemplate"), 0x87ac_b4be);
+    }
+
     // The names that hash to the weapon fields' keys (survey `arsenal`
     // and the weapons thread's brute force).
     #[test]
@@ -814,6 +918,7 @@ mod tests {
             ammo: ammo(50.0, 50.0, (0.0, 0.0)),
             lock_on: None,
             pickup: None,
+            feel: Default::default(),
         };
         let arms = Arms {
             weapons: HashMap::from([(7, spec)]),

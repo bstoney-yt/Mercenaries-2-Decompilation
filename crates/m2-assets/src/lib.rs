@@ -105,7 +105,7 @@ pub use scatter::{Scatter, ScatterError};
 pub use sges::{Segment, SgesError, SgesHeader};
 pub use sound::{SoundBank, SoundError, StreamIndex};
 pub use strings::{StringTable, StringsError};
-pub use voice::{CueTable, Group, VoiceError};
+pub use voice::{CueTable, Group, MixedCue, Track, VoiceError};
 
 pub use terrain::{LowResTile, TerrainCell, TerrainError};
 pub use texture::{Mip, PixelFormat, Texture, TextureError, TextureInfo, TextureKind};

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use m2_engine::audio::{EngineSounds, Falloff, KeySounds, Play, SoundLibrary};
+use m2_engine::gun_sounds::GunCues;
 use m2_engine::{Category, Install, Mixer, SoundBuffer, Streams, VoiceId, Voices};
 
 use crate::combat::{Remark, Sound};
@@ -207,6 +208,12 @@ pub struct GameAudio {
     /// Breaks heard before their key's sounds were read: the key, where,
     /// and when (played once read, if still fresh).
     key_waiting: Vec<(u32, Vec3, Instant)>,
+    /// Which cue each gun's sound set fires with (the `Sounds` table),
+    /// and the shot cues heard so far (each logged once).
+    gun_cues: GunCues,
+    shots_heard: HashSet<u32>,
+    /// Shots heard with their own cue, and with the rifle's standing in.
+    shots: (u32, u32),
 }
 
 /// A sound key read: the key, and what it plays.
@@ -917,6 +924,24 @@ impl GameAudio {
             key_asked: HashSet::new(),
             key_tables: Arc::default(),
             key_waiting: Vec::new(),
+            gun_cues: install.map_or_else(GunCues::default, |install| {
+                match GunCues::read(install) {
+                    Ok(c) => {
+                        eprintln!(
+                            "sound: Sounds table: {} gun sound sets fire, {} as others",
+                            c.sets_with(m2_engine::gun_sounds::FIRE),
+                            c.sets_with(m2_engine::gun_sounds::FIRE_NPC)
+                        );
+                        c
+                    }
+                    Err(e) => {
+                        eprintln!("sound: no Sounds table ({e}): every gun fires the rifle's shot");
+                        GunCues::default()
+                    }
+                }
+            }),
+            shots_heard: HashSet::new(),
+            shots: (0, 0),
         }
     }
 
@@ -1278,7 +1303,26 @@ impl GameAudio {
         self.keys_loaded();
         for sound in sounds {
             let (i, at, gain) = match *sound {
-                Sound::Shot(at) => (0, at, 0.9),
+                Sound::Shot { at, set, npc } => {
+                    let own = self.play_shot(at, set, npc);
+                    if own {
+                        self.shots.0 += 1;
+                    } else {
+                        self.shots.1 += 1;
+                    }
+                    let (a, b) = self.shots;
+                    if (a + b) % 200 == 0 {
+                        eprintln!(
+                            "sound: {} shots: {a} with their gun's own cue, {b} with the \
+                             rifle's standing in",
+                            a + b
+                        );
+                    }
+                    if own {
+                        continue;
+                    }
+                    (0, at, 0.9)
+                }
                 Sound::Launch(at) => (1, at, 1.0),
                 Sound::Explosion(at) => (2, at, 1.4),
                 Sound::Bomb(at) => (2, at, 2.5),
@@ -1317,41 +1361,94 @@ impl GameAudio {
             }
             Some(None) => eprintln!("sound: break, key {key:08x}: nothing found for it, silent"),
             None => {
-                let Some(install) = self.install.clone() else {
+                if self.install.is_none() {
                     self.keys.insert(key, None);
                     return;
-                };
-                self.key_waiting.push((key, at, Instant::now()));
-                // Read once, whatever is heard meanwhile.
-                if !self.key_asked.insert(key) {
-                    return;
                 }
-                let tx = self.key_loads.0.clone();
-                let tables = self.key_tables.clone();
-                std::thread::spawn(move || {
-                    let found = install.open_world().ok().and_then(|mut source| {
-                        let tables = {
-                            let mut held = tables.lock().unwrap_or_else(|e| e.into_inner());
-                            held.get_or_insert_with(|| {
-                                let t = m2_engine::audio::world_cue_tables(&mut source);
-                                eprintln!("sound: {} cue tables in the world archive", t.len());
-                                Arc::new(t)
-                            })
-                            .clone()
-                        };
-                        KeySounds::resolve(&mut source, &tables, key)
-                    });
-                    match &found {
-                        Some(k) => eprintln!("sound: key {key:08x} plays {}", k.how),
-                        None => eprintln!(
-                            "sound: key {key:08x} is no cue of the world's cue tables, no bank \
-                             and no block: not played (survey find:{key:08x} on the PC names it)"
-                        ),
-                    }
-                    drop(tx.send((key, found)));
-                });
+                self.key_waiting.push((key, at, Instant::now()));
+                self.ask_key(key);
             }
         }
+    }
+
+    /// A gun's shot at `at`, of sound set `set`, by the hero or someone
+    /// else (`npc`): the cue the `Sounds` table gives it (someone else's
+    /// shot falls back to the hero's cue if its own plays nothing).
+    /// False when no cue of its is read yet or none plays anything: the
+    /// rifle's shot stands in. A cue not yet read is read on a thread.
+    fn play_shot(&mut self, at: Vec3, set: Option<u32>, npc: bool) -> bool {
+        let Some(set) = set else { return false };
+        let own = self.gun_cues.shot(set, npc);
+        let hero = npc
+            .then(|| self.gun_cues.cue(set, m2_engine::gun_sounds::FIRE))
+            .flatten();
+        for cue in [own, hero].into_iter().flatten() {
+            match self.keys.get(&cue) {
+                Some(Some(found)) => {
+                    let found = found.clone();
+                    let pick = self.random();
+                    let Some(buffer) = found.pick(pick).cloned() else {
+                        continue;
+                    };
+                    if self.shots_heard.insert(cue) {
+                        eprintln!(
+                            "sound: shot, set {set:08x}{}, cue {cue:08x}: sound {:08x} ({:.2} s)",
+                            if npc { " (not the hero)" } else { "" },
+                            buffer.hash,
+                            buffer.seconds()
+                        );
+                    }
+                    self.out
+                        .with(|m| m.play(Play::at(buffer, at).gain(found.volume)));
+                    return true;
+                }
+                Some(None) => {}
+                None => {
+                    if self.install.is_none() {
+                        self.keys.insert(cue, None);
+                        continue;
+                    }
+                    self.ask_key(cue);
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    /// Starts reading what sound key `key` plays on a thread, once.
+    fn ask_key(&mut self, key: u32) {
+        let Some(install) = self.install.clone() else {
+            return;
+        };
+        // Read once, whatever is heard meanwhile.
+        if !self.key_asked.insert(key) {
+            return;
+        }
+        let tx = self.key_loads.0.clone();
+        let tables = self.key_tables.clone();
+        std::thread::spawn(move || {
+            let found = install.open_world().ok().and_then(|mut source| {
+                let tables = {
+                    let mut held = tables.lock().unwrap_or_else(|e| e.into_inner());
+                    held.get_or_insert_with(|| {
+                        let t = m2_engine::audio::world_cue_tables(&mut source);
+                        eprintln!("sound: {} cue tables in the world archive", t.len());
+                        Arc::new(t)
+                    })
+                    .clone()
+                };
+                KeySounds::resolve(&mut source, &tables, key)
+            });
+            match &found {
+                Some(k) => eprintln!("sound: key {key:08x} plays {}", k.how),
+                None => eprintln!(
+                    "sound: key {key:08x} is no cue of the world's cue tables, no bank \
+                             and no block: not played (survey find:{key:08x} on the PC names it)"
+                ),
+            }
+            drop(tx.send((key, found)));
+        });
     }
 
     /// Takes in the sound keys read, and plays the breaks that waited for

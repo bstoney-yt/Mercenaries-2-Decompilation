@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use m2_engine::tuning::DamageTable;
-use m2_engine::weapons::{Ammo, Blast, Flight, Throwable, WeaponSpec};
+use m2_engine::weapons::{Ammo, Blast, Feel, Flight, Throwable, WeaponSpec};
 use m2_engine::{GpuModel, Physics, Skeleton, StaticKey, VehicleId};
 use m2_math::glam::{Mat4, Quat, Vec3};
 
@@ -165,6 +165,9 @@ pub struct Rifle {
     /// `Rocket`), which picks the clips she holds it with; `None` read as
     /// a rifle's in the rifle's place and a rocket's in the launcher's.
     pub class: Option<u32>,
+    /// Its shots' sound set, muzzle flash and scatter, as its template
+    /// gives them.
+    pub feel: Feel,
 }
 
 impl Default for Rifle {
@@ -185,6 +188,7 @@ impl Default for Rifle {
             flight: Flight::Round,
             lock_on: None,
             class: None,
+            feel: Feel::default(),
         }
     }
 }
@@ -236,6 +240,7 @@ impl Rifle {
             flight: spec.flight(),
             lock_on: spec.lock_on,
             class: spec.class,
+            feel: spec.feel,
         }
     }
 
@@ -1050,7 +1055,15 @@ pub enum FxTemplate {
 /// A sound the fight makes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Sound {
-    Shot(Vec3),
+    /// A gun's shot: its template's sound set, if it has one (the cue it
+    /// plays is the sound set's in the `Sounds` table,
+    /// [`m2_engine::gun_sounds`]), and whether someone other than the
+    /// hero fired it.
+    Shot {
+        at: Vec3,
+        set: Option<u32>,
+        npc: bool,
+    },
     Launch(Vec3),
     /// The grenade launcher's.
     Lob(Vec3),
@@ -1317,6 +1330,9 @@ pub struct Combat {
     /// The game's own effects set off since the scene last took them
     /// ([`GameFx`]).
     pub game_fx: Vec<GameFx>,
+    /// Every gun's shots' sound set and muzzle flash, by template (for
+    /// the guns people carry, [`arm`](Self::arm)).
+    feels: std::collections::HashMap<u32, Feel>,
     /// Sounds made since the last call to [`take_sounds`](Self::take_sounds).
     sounds: Vec<Sound>,
     /// Wrecks smoke: (vehicle index, seconds to the next puff).
@@ -1414,6 +1430,11 @@ pub struct Combat {
     seed: u64,
     /// What she has fired, for the HUD's ammo counters.
     pub fired: Fired,
+    /// Every shot fired, by its gun's sound set (0: none) and whether the
+    /// hero fired it, and the muzzle flashes drawn as the game's effect
+    /// and as the alpha's own: for the run's log.
+    pub shots: std::collections::BTreeMap<(u32, bool), u32>,
+    pub flashes: (u32, u32),
     /// What the fighting has come to (for checking).
     pub tally: Tally,
     /// Hurts since [`take_hurts`](Self::take_hurts): damage and where
@@ -1547,6 +1568,7 @@ impl Default for Combat {
             projectiles: Vec::new(),
             effects: Vec::new(),
             game_fx: Vec::new(),
+            feels: std::collections::HashMap::new(),
             sounds: Vec::new(),
             wrecks: Vec::new(),
             part_fx_next: 0.0,
@@ -1589,6 +1611,8 @@ impl Default for Combat {
             ripple: 0,
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
+            shots: std::collections::BTreeMap::new(),
+            flashes: (0, 0),
             tally: Tally::default(),
             hurts: Vec::new(),
         }
@@ -1743,6 +1767,7 @@ impl Combat {
     /// name, and the grenade, C4 and proximity mine to throw.
     pub fn arm(&mut self, arms: &m2_engine::weapons::Arms, table: Option<DamageTable>) {
         self.damage_table = table;
+        self.feels = arms.weapons.iter().map(|(&id, w)| (id, w.feel)).collect();
         if let Some(c) = arms.named("Carbine") {
             self.carbine = Rifle::from_spec(c);
             if !self.own_rifle {
@@ -2074,6 +2099,55 @@ impl Combat {
         self.effect(e, seconds);
     }
 
+    /// A gun firing from `from` along `dir`, its template's `feel` if
+    /// known: its muzzle flash (the game's effect its template names,
+    /// else the alpha's own flash `size` metres long) and its shot.
+    fn gun_fired(&mut self, feel: Option<Feel>, from: Vec3, dir: Vec3, size: f32, npc: bool) {
+        match feel.and_then(|f| f.flash) {
+            Some(flash) => {
+                self.flashes.0 += 1;
+                self.game_fx.push(GameFx {
+                    template: FxTemplate::Id(flash),
+                    at: from,
+                    hold: None,
+                });
+            }
+            None => {
+                self.flashes.1 += 1;
+                self.effect(
+                    Effect::Flash {
+                        at: from,
+                        dir,
+                        size,
+                    },
+                    FLASH_TIME,
+                );
+            }
+        }
+        let set = feel.and_then(|f| f.sound_set);
+        *self.shots.entry((set.unwrap_or(0), !npc)).or_default() += 1;
+        self.sounds.push(Sound::Shot { at: from, set, npc });
+    }
+
+    /// The shots fired so far by sound set, and the flashes, in a line.
+    pub fn shots_line(&self) -> String {
+        let sets: Vec<String> = self
+            .shots
+            .iter()
+            .map(|(&(set, hero), n)| format!("{set:08x}{} {n}", if hero { " (hero)" } else { "" }))
+            .collect();
+        format!(
+            "shots by sound set: {}; flashes: {} the game's, {} the alpha's own",
+            if sets.is_empty() {
+                "none".to_owned()
+            } else {
+                sets.join(", ")
+            },
+            self.flashes.0,
+            self.flashes.1
+        )
+    }
+
     /// Sets off the effects template `name` shows at `at`, once.
     pub fn show_fx(&mut self, name: &str, at: Vec3) {
         self.game_fx.push(GameFx {
@@ -2381,6 +2455,7 @@ impl Combat {
         let from = m.pivot + aim * 0.9;
         let w = &m.weapon;
         self.reload = w.gap();
+        let feel = w.feel;
         let ammo = w.ammo;
         let round = match ammo.key {
             Some(k) if k == m2_assets::name_hash("Bullet") => Round::Bullet,
@@ -2453,15 +2528,7 @@ impl Combat {
         }
         self.fired.rifle += 1;
         self.effect(Effect::Tracer { from, to }, 0.07);
-        self.effect(
-            Effect::Flash {
-                at: from,
-                dir: aim,
-                size: MG_FLASH,
-            },
-            FLASH_TIME,
-        );
-        self.sounds.push(Sound::Shot(from));
+        self.gun_fired(Some(feel), from, aim, MG_FLASH, false);
         alarm(f.people, from);
     }
 
@@ -2535,15 +2602,14 @@ impl Combat {
         if self.rifle.pellets <= 1 {
             self.effect(Effect::Tracer { from, to }, 0.07);
         }
-        self.effect(
-            Effect::Flash {
-                at: from,
-                dir: (to - from).normalize_or(aim),
-                size: RIFLE_FLASH,
-            },
-            FLASH_TIME,
+        let feel = self.rifle.feel;
+        self.gun_fired(
+            Some(feel),
+            from,
+            (to - from).normalize_or(aim),
+            RIFLE_FLASH,
+            false,
         );
-        self.sounds.push(Sound::Shot(from));
         if killed {
             self.remarks.push(Remark::Kill);
         }
@@ -2610,15 +2676,8 @@ impl Combat {
         );
         let end = hit.map_or(from + dir * (distance + 2.0), |h| from + dir * h.0);
         self.effect(Effect::Tracer { from, to: end }, 0.07);
-        self.effect(
-            Effect::Flash {
-                at: from,
-                dir,
-                size: RIFLE_FLASH,
-            },
-            FLASH_TIME,
-        );
-        self.sounds.push(Sound::Shot(from));
+        let feel = gun.and_then(|g| self.feels.get(&g.template).copied());
+        self.gun_fired(feel, from, dir, RIFLE_FLASH, true);
         let closest = from + dir * (aim - from).dot(dir).max(0.0);
         let blocked = hit.is_some_and(|h| h.0 < distance - 1.0);
         if f.player.driving.is_none() && !blocked && closest.distance(aim) < 0.45 {
@@ -2944,15 +3003,7 @@ impl Combat {
                         self.hit_explosives_in(f.explosives, from + aim * t, on_props);
                     }
                 }
-                self.effect(
-                    Effect::Flash {
-                        at: from,
-                        dir: aim,
-                        size: MG_FLASH,
-                    },
-                    FLASH_TIME,
-                );
-                self.sounds.push(Sound::Shot(from));
+                self.gun_fired(Some(w.feel), from, aim, MG_FLASH, false);
             }
             m2_engine::weapons::Flight::Lobbed => {
                 let speed = ammo.velocity.max(1.0);
@@ -3076,15 +3127,9 @@ impl Combat {
             let hit = cast_shot(f.physics, f.people, from, aim, MG_RANGE, None, Some(id));
             let to = hit.map_or(from + aim * MG_RANGE, |h| from + aim * h.0);
             self.effect(Effect::Tracer { from, to }, 0.07);
-            self.effect(
-                Effect::Flash {
-                    at: from,
-                    dir: aim,
-                    size: MG_FLASH,
-                },
-                FLASH_TIME,
-            );
-            self.sounds.push(Sound::Shot(from));
+            // A vehicle's machine gun with no template read: the alpha's
+            // own flash and the rifle's shot.
+            self.gun_fired(None, from, aim, MG_FLASH, false);
             if let Some((_, Some(j))) = hit {
                 let soldier = f.people.npcs[j].soldier;
                 if f.people.npcs[j].hurt(MG_DAMAGE, aim * SHOT_PUSH) && soldier {
@@ -4396,7 +4441,7 @@ mod tests {
             combat
                 .take_sounds()
                 .iter()
-                .all(|s| matches!(s, Sound::Shot(_)))
+                .all(|s| matches!(s, Sound::Shot { .. }))
         );
     }
 
