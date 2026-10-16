@@ -999,3 +999,82 @@ fn going_back_keeps_an_instance_the_target_frame_has_too() {
     assert!(!p.clip(square).unwrap().visible);
     assert_eq!(p.clip(square).unwrap().matrix.tx, 0.0);
 }
+
+#[test]
+fn a_text_fields_x_and_y_name_its_box_corner() {
+    // got = t._y; t._y = 50;
+    let mut a = Asm::default();
+    a.set("got", |a| {
+        a.str("t").op(0x1C).str("_y").op(0x4E);
+    });
+    a.str("t").op(0x1C).str("_y").int(50).op(0x4F);
+    let mut lib = Rc::try_unwrap(library(
+        vec![vec![
+            put(1, 3, at(10.0, 20.0), "t"),
+            Control::Script(a.bytes()),
+        ]],
+        sprite_frames(),
+    ))
+    .unwrap();
+    lib.texts.insert(
+        3,
+        EditText {
+            bounds: [-2.0, -2.0, 100.0, 20.0],
+            ..EditText::default()
+        },
+    );
+    let mut rt = Runtime::new(Player::new(Rc::new(lib)));
+    // The box's top is 2 px above the field's origin: `_y` reads 18, and
+    // setting it to 50 puts the origin at 52.
+    assert_eq!(number(&var(&mut rt, "got")), 18.0);
+    let t = rt.player.child(rt.player.root, "t").unwrap();
+    assert_eq!(rt.player.clip(t).unwrap().matrix.ty, 52.0);
+}
+
+#[test]
+fn a_wrapped_centred_line_keeps_its_break_space() {
+    let mut font = Font {
+        ascent: 0.75,
+        descent: 0.25,
+        advances: vec![0.5, 0.5],
+        ..Font::default()
+    };
+    font.codes.insert('A', 0);
+    font.codes.insert(' ', 1);
+    let g = text::TextureGlyph {
+        uv: [0.0, 0.0, 24.0 / 512.0, 48.0 / 256.0],
+        origin: [0.0, 36.0 / 256.0],
+    };
+    font.texture = Some(("f".into(), [512.0, 256.0], 48.0, vec![Some(g), None]));
+    let def = EditText {
+        bounds: [0.0, 0.0, 50.0, 60.0],
+        height: 24.0,
+        colour: [1.0; 4],
+        align: 2,
+        leading: 2.0,
+        word_wrap: true,
+        multiline: true,
+        ..EditText::default()
+    };
+    // 12 px a character: "A A A" (60) breaks in 50 as "A A " and "A".
+    let mut out = Vec::new();
+    text::layout(
+        &def,
+        "A A A",
+        &[],
+        &font,
+        &Matrix::IDENTITY,
+        &ColourTransform::IDENTITY,
+        None,
+        &mut out,
+    );
+    assert_eq!(out.len(), 6);
+    // Centred in 46 px past the 2 px gutter: the first line 48 wide with
+    // its space (x 1, not 7), the last 12 (x 19).
+    assert!((bounds(&out[..2]).unwrap()[0] - 1.0).abs() < 1e-4);
+    assert!((bounds(&out[4..]).unwrap()[0] - 19.0).abs() < 1e-4);
+    // textWidth leaves the space out; textHeight has no leading under the
+    // last line: 2 x 26 - 2.
+    let (w, h) = text::measure(&def, "A A A", &font);
+    assert_eq!((w, h), (36.0, 50.0));
+}

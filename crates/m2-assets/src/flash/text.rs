@@ -62,7 +62,11 @@ pub struct EditText {
     pub align: u8,
     pub left_margin: f32,
     pub right_margin: f32,
+    /// The first line's extra indent, pixels.
+    pub indent: f32,
     pub leading: f32,
+    /// The tag's AutoSize flag.
+    pub auto_size: bool,
     pub word_wrap: bool,
     pub multiline: bool,
     pub html: bool,
@@ -112,6 +116,7 @@ impl EditText {
             word_wrap: f1 & 0x40 != 0,
             multiline: f1 & 0x20 != 0,
             html: f2 & 0x02 != 0,
+            auto_size: f2 & 0x40 != 0,
             ..EditText::default()
         };
         if f1 & 0x01 != 0 {
@@ -133,7 +138,7 @@ impl EditText {
             t.align = b.u8();
             t.left_margin = f32::from(b.u16()) / TWIPS;
             t.right_margin = f32::from(b.u16()) / TWIPS;
-            b.u16();
+            t.indent = f32::from(b.u16()) / TWIPS;
             t.leading = f32::from(b.u16() as i16) / TWIPS;
         }
         t.variable = b.cstr();
@@ -520,6 +525,11 @@ fn wrap(def: &EditText, text: &str, subs: &[Substitution], font: &Font) -> Vec<S
                 font.advance(' ') * size
             };
             if !current.is_empty() && w + space + ww > width {
+                // The space it breaks at stays on the line, so counts in
+                // its alignment (inferred from footage: wrapped hint lines
+                // centre half a space left of their ink; 10 lines of 4
+                // hints, centres 2.45 -> 0.25 px off).
+                current.push(' ');
                 lines.push(std::mem::take(&mut current));
                 w = 0.0;
             } else if !current.is_empty() {
@@ -542,10 +552,22 @@ pub fn measure(def: &EditText, text: &str, font: &Font) -> (f32, f32) {
     let lines = wrap(def, &text, &[], font);
     let widest = lines
         .iter()
-        .map(|l| l.chars().map(|c| font.advance(c) * size).sum::<f32>())
+        .map(|l| {
+            l.trim_end_matches(' ')
+                .chars()
+                .map(|c| font.advance(c) * size)
+                .sum::<f32>()
+        })
         .fold(0.0, f32::max);
     let line_height = (font.ascent + font.descent).max(1.0) * size + def.leading;
-    (widest, lines.len().max(1) as f32 * line_height)
+    // No leading under the last line (inferred from footage, with the
+    // text box corner rule in avm1: the hint lines, placed by
+    // `textHeight`, tops 1.4 -> 0.4 px off; Flash's rule not read).
+    // Trailing spaces (a wrapped line's break) don't count in the width.
+    (
+        widest,
+        lines.len().max(1) as f32 * line_height - def.leading,
+    )
 }
 
 /// Lays out `text` in the field `def` with `font`, as textured quads
