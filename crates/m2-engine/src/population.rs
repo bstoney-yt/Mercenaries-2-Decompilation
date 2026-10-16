@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use m2_assets::layer::Component;
 use m2_assets::{Layer, name_hash};
+use m2_math::glam::{Quat, Vec2, Vec3};
 
 /// A spawner's settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -216,6 +217,137 @@ fn weight_of(b: &[u8]) -> f32 {
     }
 }
 
+/// An area's traffic and passers-by: a `LineRegion` entity's outline with
+/// its `PopulationDensity` record. Read off the install (2026-10-14, 281
+/// records in 80 layers): each names a vehicle list and a people list
+/// (`VehList_Mar_Outskirt_Act1`, `PedList_Mar_Outskirt_Act1`; or
+/// `VehList_Blank` and `PedList_Blank`, in the `*_DeadTraffic` regions
+/// round the mission sites), two counts, a `Priority` (5 to 100) and a
+/// `faction`. Inferred from samples, not from the code: the first count
+/// is how many vehicles are out (Maracaibo's city centre 8, its
+/// outskirts 6, a dead region 1), the second how many people (the city
+/// centre 20, the outskirts 2), and where regions overlap the one of
+/// highest priority rules (the dead regions are 100, the island-wide
+/// `mar_bigA` 5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DensityZone {
+    pub entity: u32,
+    pub name: String,
+    /// The layer placing it, by name hash: a state layer
+    /// (`vz_state_mar_outskirt_act1`) or a static sub-layer.
+    pub layer: u32,
+    pub static_layer: bool,
+    /// Its outline on the ground (x, z), world space.
+    pub outline: Vec<Vec2>,
+    pub vehicles: u32,
+    pub people: u32,
+    /// The lists, by template id (0: none).
+    pub vehicle_list: u32,
+    pub people_list: u32,
+    pub priority: u32,
+    pub faction: u32,
+}
+
+impl DensityZone {
+    /// Whether the column over (`x`, `z`) is inside.
+    pub fn contains(&self, x: f32, z: f32) -> bool {
+        let mut inside = false;
+        let n = self.outline.len();
+        for i in 0..n {
+            let (a, b) = (self.outline[i], self.outline[(i + n - 1) % n]);
+            if (a.y > z) != (b.y > z) && x < (b.x - a.x) * (z - a.y) / (b.y - a.y) + a.x {
+                inside = !inside;
+            }
+        }
+        inside
+    }
+}
+
+/// The zone of `zones` that rules at (`x`, `z`): of those it is inside,
+/// the one of highest priority (the lowest entity of equals).
+pub fn zone_at<'a>(
+    zones: impl IntoIterator<Item = &'a DensityZone>,
+    x: f32,
+    z: f32,
+) -> Option<&'a DensityZone> {
+    zones
+        .into_iter()
+        .filter(|zone| zone.contains(x, z))
+        .min_by_key(|zone| (std::cmp::Reverse(zone.priority), zone.entity))
+}
+
+const DENSITY_VEHICLES: u32 = 0x263c_1369;
+const DENSITY_PEOPLE: u32 = 0xc63c_9abc;
+const DENSITY_VEHICLE_LIST: u32 = 0x77e8_38e4;
+const DENSITY_PEOPLE_LIST: u32 = 0xafb4_5fd9;
+
+/// A layer's traffic zones: its entities with `PopulationDensity` and a
+/// `LineRegion`, whose outline `shape` reads from the region's hash (in
+/// the entity's own space).
+pub fn read_zones(
+    layer: &Layer<'_>,
+    layer_hash: u32,
+    static_layer: bool,
+    mut shape: impl FnMut(u32) -> Option<Vec<[f32; 2]>>,
+) -> Vec<DensityZone> {
+    let Some(c) = layer.component("PopulationDensity") else {
+        return Vec::new();
+    };
+    let by_hash = |h: u32| {
+        c.fields
+            .iter()
+            .find(|f| f.name_hash == h)
+            .map(|f| usize::from(f.offset))
+    };
+    let at = [
+        by_hash(DENSITY_VEHICLES),
+        by_hash(DENSITY_PEOPLE),
+        by_hash(DENSITY_VEHICLE_LIST),
+        by_hash(DENSITY_PEOPLE_LIST),
+        field_at(c, "Priority"),
+        field_at(c, "faction"),
+    ];
+    let lines = layer.hashes("LineRegion");
+    let placements = layer.placements();
+    let names = layer.names();
+    let mut out: Vec<DensityZone> = c
+        .records()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(entity, r)| {
+            let [v, p, vl, pl, pr, f] = at.map(|o| o.and_then(|o| word(r, o)).unwrap_or(0));
+            let place = placements.get(&entity)?;
+            let corners = shape(*lines.get(&entity)?)?;
+            let (centre, q) = (
+                Vec3::from(place.position),
+                Quat::from_array(place.rotation).normalize(),
+            );
+            let outline = corners
+                .iter()
+                .map(|&[x, z]| {
+                    let w = centre + q * Vec3::new(x, 0.0, z);
+                    Vec2::new(w.x, w.z)
+                })
+                .collect();
+            Some(DensityZone {
+                entity,
+                name: names.get(&entity).copied().unwrap_or("").to_owned(),
+                layer: layer_hash,
+                static_layer,
+                outline,
+                vehicles: v,
+                people: p,
+                vehicle_list: vl,
+                people_list: pl,
+                priority: pr,
+                faction: f,
+            })
+        })
+        .collect();
+    out.sort_unstable_by_key(|z| z.entity);
+    out
+}
+
 /// Picks an entry by weight; `roll` is in [0, 1).
 pub fn pick(entries: &[(u32, f32)], roll: f32) -> Option<u32> {
     let total: f32 = entries.iter().map(|&(_, w)| w.max(0.0)).sum();
@@ -263,6 +395,39 @@ mod tests {
         assert_eq!(seat_name(0xf8b8_325f), "seat_driver");
         assert_eq!(seat_name(0x1b21_7b8a), "seat_gunner_rearcenter");
         assert_eq!(seat_name(0xd055_9110), "d0559110");
+    }
+
+    #[test]
+    fn the_zone_of_highest_priority_rules() {
+        let square = |x0: f32, z0: f32, side: f32| {
+            vec![
+                Vec2::new(x0, z0),
+                Vec2::new(x0 + side, z0),
+                Vec2::new(x0 + side, z0 + side),
+                Vec2::new(x0, z0 + side),
+            ]
+        };
+        let zone = |entity, outline, priority| DensityZone {
+            entity,
+            name: String::new(),
+            layer: 0,
+            static_layer: false,
+            outline,
+            vehicles: 6,
+            people: 2,
+            vehicle_list: 0,
+            people_list: 0,
+            priority,
+            faction: 0,
+        };
+        // An island-wide zone of 5 and a dead one of 100 inside it.
+        let zones = [
+            zone(1, square(0.0, 0.0, 1000.0), 5),
+            zone(2, square(100.0, 100.0, 50.0), 100),
+        ];
+        assert_eq!(zone_at(&zones, 500.0, 500.0).map(|z| z.entity), Some(1));
+        assert_eq!(zone_at(&zones, 120.0, 130.0).map(|z| z.entity), Some(2));
+        assert_eq!(zone_at(&zones, -5.0, 10.0), None);
     }
 
     #[test]
