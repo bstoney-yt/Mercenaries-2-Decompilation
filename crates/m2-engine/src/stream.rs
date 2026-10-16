@@ -2111,10 +2111,15 @@ fn inland_water<R: std::io::Read + std::io::Seek>(
             if h <= sea_level + 0.5 {
                 continue;
             }
-            // The square around the point (round DW: drawn from the point
-            // on, it sat half a cell towards +x and +z).
-            let x = water.origin[0] + (column as f32 - 0.5) * water.cell;
-            let z = water.origin[1] + (row as f32 - 0.5) * water.cell;
+            // The square from the point on towards +x and +z. Round DW
+            // centred it on the point by eye while the heights were read
+            // two points early; read right, the square from the point fits
+            // the villa moat's banks (x -1536 against -1530, z 3008
+            // against 3015) and leaves the fewest dry squares beside water
+            // with ground below it (16.4%, against 18.1% centred;
+            // `waterfit` example). Inferred.
+            let x = water.origin[0] + column as f32 * water.cell;
+            let z = water.origin[1] + row as f32 * water.cell;
             water_square(
                 &mut vertices,
                 &mut indices,
@@ -2152,31 +2157,26 @@ fn inland_water<R: std::io::Read + std::io::Seek>(
     Ok(Some((vb, ib, count)))
 }
 
-/// Water the consoles show that no decoded data places yet: the moat
-/// under the villa's bridge (VzaCon001), which the north waterfall drains
-/// into. Its height is a little under the jetski spawns'
-/// (`PointTraffic_PirateHQ_Jetski`, y 17.5), below the bridge planking's
-/// lowest point (17.2); its bounds are where the banks rise above it, cut
-/// at the lip of the falls to the south (z 3015) (round EA). All inferred;
-/// the water grid reads far below it there. `M2_MOAT=x0,z0,x1,z1,h`
-/// replaces it, `M2_MOAT=off` drops it.
-const MOAT: ([f32; 4], f32) = ([-1530.0, 3015.0, -1465.0, 3105.0], 17.0);
-
-/// The water [`MOAT`] adds, as (x0, z0, x1, z1) bounds and height.
+/// Water once added by hand where the grid, read two points early, had
+/// none: the moat under the villa's bridge (VzaCon001), height and bounds
+/// fitted by eye (round EA). Read right, the grid's own points there say
+/// 17.51 over x -1536..-1440, z 3008..3136, so it is no longer added.
+/// `M2_MOAT=x0,z0,x1,z1,h` still adds a square of water, for trying
+/// spots by eye. As (x0, z0, x1, z1) bounds and height.
 fn missing_water() -> Vec<([f32; 4], f32)> {
     match std::env::var("M2_MOAT").as_deref() {
-        Ok("off") => Vec::new(),
+        Ok("off") | Ok("") => Vec::new(),
         Ok(v) => {
             let f: Vec<f32> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
             match f[..] {
                 [x0, z0, x1, z1, h] => vec![([x0, z0, x1, z1], h)],
                 _ => {
                     eprintln!("M2_MOAT: expected x0,z0,x1,z1,h");
-                    vec![MOAT]
+                    Vec::new()
                 }
             }
         }
-        Err(_) => vec![MOAT],
+        Err(_) => Vec::new(),
     }
 }
 
