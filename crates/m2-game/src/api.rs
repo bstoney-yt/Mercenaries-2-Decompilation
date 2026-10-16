@@ -411,6 +411,8 @@ pub struct ScriptWorld {
     pub vo: crate::vo::Lines,
     /// The player has subtitles off (`Sys.SubtitlesEnabled`).
     pub subtitles_off: bool,
+    /// The player has the tutorial tips off (`Sys.TutorialsEnabled`).
+    pub tutorials_off: bool,
     /// The score.
     pub music: crate::music::Music,
     /// Why each object is invincible (`Object.SetInvincible` reasons).
@@ -2157,9 +2159,9 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
 
     // Developer switches (skip to a mission, force a briefing): all off.
     let sys = lib("Sys")?;
-    // The game shows its tutorial tips.
-    add(&sys, "TutorialsEnabled", |_, _, _| {
-        values([Value::Boolean(true)])
+    // The game shows its tutorial tips, unless the player turned them off.
+    add(&sys, "TutorialsEnabled", |w, _, _| {
+        values([Value::Boolean(!w.tutorials_off)])
     })?;
     for name in ["GetSkipMission", "GetINIBriefing", "GetForceNewGame"] {
         add(&sys, name, |_, _, _| values([Value::Nil]))?;

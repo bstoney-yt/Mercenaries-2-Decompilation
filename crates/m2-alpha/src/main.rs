@@ -63,6 +63,7 @@ mod npc;
 mod pad;
 mod particles;
 mod paths;
+mod pause;
 mod placed;
 mod player;
 mod props;
@@ -231,6 +232,9 @@ struct Options {
     satellite: Option<SatelliteShot>,
     /// With `--screenshot`: the picture with her PDA open.
     pda: bool,
+    /// With `--screenshot`: the picture with the game's pause menu open,
+    /// `--pda-key`'s keys typed into it one by one.
+    pause: bool,
     /// With `--pda`: keys pressed (Flash key codes, 36 the map's current
     /// contract, 87 W to move the map) half way through the HUD's run and
     /// held to its end.
@@ -538,6 +542,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--pickup" => o.pickup = true,
             "--closeup" => o.closeup = true,
             "--pda" => o.pda = true,
+            "--pause" => o.pause = true,
             "--pda-key" => o.pda_keys.push(
                 value()?
                     .parse()
@@ -897,6 +902,50 @@ fn loading_screen(install: Option<&Install>) -> Option<loading::LoadingScreen> {
 /// Writes the game to `path`, with her cash, fuel and support stock and
 /// the scripts' own save data as the scripts hold them. Whether it was
 /// written.
+/// The game's pause menu's save slots go up to this; slot 0 is the
+/// scripts' autosave.
+const PAUSE_SLOTS: u32 = 20;
+
+/// Where the pause menu's save slot `n` is: the scripts' autosave for 0.
+fn pause_save_path(n: u32) -> std::path::PathBuf {
+    if n == 0 {
+        save::SaveGame::slot_path(m2_game::api::AUTOSAVE)
+    } else {
+        save::SaveGame::slot_path(&format!("save{n}"))
+    }
+}
+
+/// The saves there are, as the pause menu's save screen lists them, as
+/// `hero`'s (a save doesn't say whose it is).
+fn pause_saves(hero: Hero) -> Vec<pause::SaveEntry> {
+    (0..=PAUSE_SLOTS)
+        .filter_map(|n| {
+            let path = pause_save_path(n);
+            let when = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            let s = save::SaveGame::read(&path).ok()?;
+            let secs = when
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let pmc = s.pmc.unwrap_or_default();
+            Some(pause::SaveEntry {
+                number: n,
+                timestamp: pause::timestamp(secs),
+                character: match hero {
+                    Hero::Mattias => 1,
+                    Hero::Chris => 2,
+                    Hero::Jennifer => 3,
+                },
+                money: pmc.cash,
+                fuel: pmc.fuel,
+                played: String::new(),
+                last_contract: String::new(),
+                auto: n == 0,
+                percent: 0.0,
+            })
+        })
+        .collect()
+}
+
 fn write_save(game: &Game, mission: Option<&mission::MissionLink>, path: &std::path::Path) -> bool {
     let Some(mut s) = game.save() else {
         eprintln!("nothing to save until the island has loaded");
@@ -1445,7 +1494,11 @@ fn screenshot(
     let mut settings = config.clone();
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
-        info.game = Some(gamehud::HudState::of(&mut game));
+        let mut state = gamehud::HudState::of(&mut game);
+        state.pause = options.pause;
+        state.pause_settings.profile = game.scene.hero.full_name().into();
+        state.pause_settings.resolution = format!("{w} x {h}");
+        info.game = Some(state);
         let seconds = options
             .hud_seconds
             .unwrap_or(if options.hit_from.is_empty() {
@@ -1458,9 +1511,21 @@ fn screenshot(
             (w, h),
             seconds,
             &options.pda_keys,
+            options.pause,
             Duration::from_secs(120),
         );
-        info.game = Some(gamehud::HudState::of(&mut game));
+        let mut state = gamehud::HudState::of(&mut game);
+        state.pause = options.pause;
+        state.pause_settings.profile = game.scene.hero.full_name().into();
+        state.pause_settings.resolution = format!("{w} x {h}");
+        info.game = Some(state);
+        // What the game's pause menu asked of play, for the log.
+        if let Some(g) = hud.game.as_mut() {
+            let news = g.take_pause_news();
+            if news != pause::News::default() {
+                eprintln!("pause news: {news:?}");
+            }
+        }
     }
     // The loading screen as at the start (`--loading-screen`): up from
     // the first frame, run at 30 fps. `M2_LOADING_HINT=n` shows hint `n`.
@@ -4950,7 +5015,7 @@ impl App {
             None,
             None,
         );
-        Ok(Running {
+        let mut running = Running {
             title: format!(
                 "Mercenaries 2 (alpha) - {} on {}",
                 adapter.name, adapter.backend
@@ -5003,7 +5068,9 @@ impl App {
             },
             buttons: Vec::new(),
             dev: self.dev,
-        })
+        };
+        running.apply_options(&self.config);
+        Ok(running)
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, e: anyhow::Error) {
@@ -5136,6 +5203,14 @@ impl Running {
         }
         let (action, output) = self.hud.build(input, &info, config);
         self.platform_output(output);
+        if let Some(news) = self
+            .hud
+            .game
+            .as_mut()
+            .map(gamehud::GameHud::take_pause_news)
+        {
+            self.pause_news(news, config, event_loop);
+        }
         // The mission's callbacks the game's HUD called (the contract
         // fanfare closing), back to the mission's scripts.
         if let (Some(g), Some(m)) = (&mut self.hud.game, &mut self.mission) {
@@ -5235,15 +5310,25 @@ impl Running {
                 });
                 continue;
             }
-            // The pause menu's buttons are egui's: up and down step its
+            // Our pause menu's buttons are egui's: up and down step its
             // focus as Tab does (egui's arrows need one focused first).
-            let menu = self.hud.menu;
+            // The game's own takes the arrows (its movie's keys: up and
+            // down through its list, left and right a setting, Enter);
+            // B leaves it as Escape does, as Start would.
+            let own = self.hud.menu
+                && self.hud.shop.is_none()
+                && self
+                    .hud
+                    .game
+                    .as_ref()
+                    .is_some_and(gamehud::GameHud::pause_available);
+            let menu = self.hud.menu && !own;
             let (egui_key, modifiers) = match key {
                 MenuKey::Enter => (egui::Key::Enter, egui::Modifiers::NONE),
                 MenuKey::Escape => {
                     // B leaves the pause menu as Escape does (in play, B
                     // is the bash).
-                    if menu {
+                    if self.hud.menu {
                         self.close_menu();
                     }
                     continue;
@@ -5255,7 +5340,7 @@ impl Running {
                 MenuKey::Left => (egui::Key::ArrowLeft, egui::Modifiers::NONE),
                 MenuKey::Right => (egui::Key::ArrowRight, egui::Modifiers::NONE),
             };
-            if key == MenuKey::Enter && !menu {
+            if key == MenuKey::Enter && !self.hud.menu {
                 self.buttons.push("selection".into());
             }
             let events = &mut self.egui.egui_input_mut().events;
@@ -5289,6 +5374,121 @@ impl Running {
         self.keep_mouse();
     }
 
+    /// The player's options as the game's pause menu shows them, with the
+    /// window as it is and the saves there are.
+    fn pause_settings(&self, config: &Config) -> pause::Settings {
+        let o = &config.options;
+        let size = self.window.inner_size();
+        let refresh = self
+            .window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map_or(60, |r| (r + 500) / 1000);
+        pause::Settings {
+            profile: self.game.scene.hero.full_name().into(),
+            subtitles: o.subtitles,
+            tutorials: o.tutorials,
+            autosave: o.autosave,
+            invert_mouse: config.camera.invert_y,
+            mouse: pause::mouse_slider(config.camera.mouse_sensitivity),
+            invert_pad: o.invert_pad,
+            pad: o.pad_sensitivity,
+            rumble: o.rumble,
+            vsync: config.window.vsync,
+            brightness: o.brightness,
+            view_distance: o.view_distance,
+            sfx: o.sfx_volume,
+            music: o.music_volume,
+            dialog: o.dialog_volume,
+            wide: size.width * 2 > size.height * 3,
+            resolution: format!("{} x {}", size.width, size.height),
+            refresh: refresh.to_string(),
+            saves: pause_saves(self.game.scene.hero),
+        }
+    }
+
+    /// Applies the player's options that live outside the settings file's
+    /// readers: the volumes, the pad, the scripts' subtitles and tips.
+    fn apply_options(&mut self, config: &Config) {
+        let o = &config.options;
+        self.set_volumes([o.sfx_volume, o.music_volume, o.dialog_volume]);
+        self.pad.look = Some(pause::pad_scale(o.pad_sensitivity));
+        self.pad.invert = o.invert_pad;
+        if let Some(m) = &mut self.mission {
+            m.set_options(o.subtitles, o.tutorials);
+        }
+    }
+
+    /// The SFX, music and dialog volumes, 0 to 100 (see
+    /// [`pause::Settings`] for what each covers).
+    fn set_volumes(&mut self, [sfx, music, dialog]: [f64; 3]) {
+        use m2_engine::Category;
+        let level = |v: f64| (v / 100.0) as f32;
+        self.audio.out.with(|m| {
+            for c in [Category::World, Category::Chatter, Category::Ui] {
+                m.set_volume(c, level(sfx));
+            }
+            m.set_volume(Category::Music, level(music));
+            m.set_volume(Category::Vo, level(dialog));
+        });
+    }
+
+    /// Does what the game's pause menu asked: leaving it, saving, its
+    /// settings kept (written to the settings file, as the game saves its
+    /// profile), its sounds.
+    fn pause_news(&mut self, news: pause::News, config: &mut Config, event_loop: &ActiveEventLoop) {
+        for cue in &news.sounds {
+            self.audio.ui_sound(cue);
+        }
+        if let Some(v) = news.volumes {
+            self.set_volumes(v);
+        }
+        for unused in &news.unused {
+            eprintln!("pause: {unused} kept in the menu; the alpha has nothing for it");
+        }
+        if let Some(s) = news.settings {
+            let o = &mut config.options;
+            o.subtitles = s.subtitles;
+            o.tutorials = s.tutorials;
+            o.autosave = s.autosave;
+            o.invert_pad = s.invert_pad;
+            o.pad_sensitivity = s.pad;
+            o.rumble = s.rumble;
+            o.brightness = s.brightness;
+            o.view_distance = s.view_distance;
+            o.sfx_volume = s.sfx;
+            o.music_volume = s.music;
+            o.dialog_volume = s.dialog;
+            config.camera.invert_y = s.invert_mouse;
+            config.camera.mouse_sensitivity = pause::mouse_radians(s.mouse);
+            config.window.vsync = s.vsync;
+            self.apply_options(config);
+            let path = config::Config::default_path();
+            match std::fs::write(&path, config.to_toml()) {
+                Ok(()) => eprintln!("pause: settings kept, saved to {}", path.display()),
+                Err(e) => eprintln!("pause: could not save {}: {e}", path.display()),
+            }
+        }
+        if let Some(n) = news.save {
+            let path = pause_save_path(n);
+            eprintln!("pause: the game saved in slot {n}");
+            self.save_to(&path);
+        }
+        if let Some(n) = news.load {
+            eprintln!("pause: loading slot {n}");
+            self.load_from(&pause_save_path(n));
+            self.close_menu();
+        }
+        if news.quit {
+            // The game goes back to its main menu; the alpha can't start
+            // play again from its front end yet, so it closes.
+            eprintln!("pause: Quit: the alpha closes (the game goes back to its main menu)");
+            event_loop.exit();
+        } else if news.resume && self.hud.menu {
+            self.close_menu();
+        }
+    }
+
     /// Plays as `hero` from now on: the body, clips, health and voice, and
     /// the scripts' player (the mission's and the hijacks'; the HUD's hears
     /// with its next state). What the scripts already chose by the old
@@ -5317,7 +5517,12 @@ impl Running {
 
     /// Loads the newest save: the player's own, or the scripts' autosave.
     fn load_game(&mut self) {
-        let path = save::SaveGame::newest_path();
+        self.load_from(&save::SaveGame::newest_path());
+    }
+
+    /// Loads the save at `path`.
+    fn load_from(&mut self, path: &std::path::Path) {
+        let path = path.to_path_buf();
         match save::SaveGame::read(&path) {
             Ok(mut s) => {
                 let pmc = s.pmc.take();
@@ -5395,12 +5600,17 @@ impl Running {
 
     /// Writes the saves the scripts asked for: their autosaves after a
     /// contract (`Sys.RequestAutosave`) and checkpoints, each to its
-    /// slot's file ([`save::SaveGame::slot_path`]).
-    fn answer_saves(&mut self) {
+    /// slot's file ([`save::SaveGame::slot_path`]). With `autosave` off
+    /// (the pause menu's option) the autosaves are left out.
+    fn answer_saves(&mut self, autosave: bool) {
         let Some(slots) = self.mission.as_mut().map(|m| m.take_saves()) else {
             return;
         };
         for slot in slots {
+            if !autosave && slot == m2_game::api::AUTOSAVE {
+                eprintln!("save: the scripts' autosave left out (Auto Save is off)");
+                continue;
+            }
             self.save_to(&save::SaveGame::slot_path(&slot));
         }
     }
@@ -5433,6 +5643,7 @@ impl Running {
             if self.hud.menu {
                 self.close_menu();
             } else {
+                self.hud.pause_settings = self.pause_settings(config);
                 self.open_menu();
             }
         }
@@ -5525,7 +5736,7 @@ impl Running {
                 self.audio.music_cue(cue.as_deref());
             }
         }
-        self.answer_saves();
+        self.answer_saves(config.options.autosave);
         let (ear, facing) = self.game.listener();
         self.audio.update(ear, facing);
         if self.audio.ambient_due(TICK.as_secs_f32()) {

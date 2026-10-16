@@ -55,6 +55,23 @@ use crate::hero::Hero;
 use crate::hijack::GuiCall;
 use crate::support::{self, SupportHud};
 
+/// The pause menu's movie (`MrxGuiPauseScreen._Initialize`'s `sFile`).
+const PAUSE_MOVIE: &str = crate::pause::MOVIE;
+/// The pause layout's widget (`Pause_Layout`).
+const PAUSE_LAYOUT: &str = "Pause Layout";
+/// The PC's library behind the pause menu's options (`LTILibName`): its
+/// calls are queued for the engine ([`crate::pause::Native::library`]).
+const LTI_LIBRARY: &str = r#"
+__m2_lti = {}
+LTILibName = setmetatable({}, {
+    __index = function(_, k)
+        return function(a)
+            local q = __m2_lti
+            q[#q + 1] = { tostring(k), a == nil and "" or tostring(a) }
+        end
+    end,
+})
+"#;
 /// The fonts the HUD's text widgets use.
 const FONTS: [&str; 2] = ["english_18", "english_20"];
 /// The player's guid as the scripts know her (`Sys.StringToGuid("0x1")`).
@@ -519,6 +536,13 @@ pub struct HudState {
     /// its pictures and the hijack's buttons its Xbox ones
     /// ([`gui_runtime::Screen::set_pad`]).
     pub pad: bool,
+    /// The pause menu is wanted open (Escape, the pad's Start): the
+    /// engine's `Pause` game state, which the pause layout's
+    /// `MrxGuiPauseScreen` opens its movie for.
+    pub pause: bool,
+    /// The player's settings and saves, for the pause menu's movie
+    /// ([`crate::pause`]).
+    pub pause_settings: crate::pause::Settings,
 }
 
 /// Flash's key code (the PC's virtual-key code) of `key`, for the keys
@@ -817,8 +841,18 @@ enum Output {
         callbacks: Vec<u64>,
         /// The front end's news (nothing for the HUD).
         shell: ShellNews,
+        /// The pause menu's (nothing for the front end).
+        pause: Box<PauseOut>,
     },
     Failed(String),
+}
+
+/// What the pause menu ([`crate::pause`]) asks of play, and whether the
+/// game's own is there to open.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PauseOut {
+    news: crate::pause::News,
+    available: bool,
 }
 
 /// What the front end ([`GameHud::start_shell`]) asks of the game.
@@ -880,6 +914,10 @@ pub struct GameHud {
     dropped_fanfare: bool,
     /// The front end's latest news (see [`GameHud::start_shell`]).
     shell: ShellNews,
+    /// What the game's pause menu asked of play, not yet taken, and
+    /// whether the HUD's scripts have it ([`crate::pause`]).
+    pause_news: crate::pause::News,
+    pause_available: bool,
     log: Option<BufWriter<File>>,
 }
 
@@ -940,8 +978,21 @@ impl GameHud {
             last_call: 0,
             last_time: None,
             shell: ShellNews::default(),
+            pause_news: crate::pause::News::default(),
+            pause_available: false,
             log,
         }
+    }
+
+    /// The game's own pause menu can open: its scripts run and have its
+    /// layout ([`HudState::pause`]).
+    pub fn pause_available(&self) -> bool {
+        self.ready() && self.pause_available
+    }
+
+    /// What the game's pause menu asked of play since the last time.
+    pub fn take_pause_news(&mut self) -> crate::pause::News {
+        std::mem::take(&mut self.pause_news)
     }
 
     /// The front end's latest news.
@@ -1071,8 +1122,12 @@ impl GameHud {
                 log,
                 callbacks,
                 shell,
+                pause,
             } => {
                 self.callbacks.extend(callbacks);
+                let pause = *pause;
+                self.pause_news.merge(pause.news);
+                self.pause_available = pause.available;
                 // Handed over already (a frame queued before it in this
                 // drain broke): a later frame does not take it back.
                 if self.failed() {
@@ -1603,6 +1658,14 @@ struct Thread {
     pda_shown: bool,
     /// Keys for the movies' `Key` listeners ([`HudState::keys`]).
     keys: Vec<(i32, bool)>,
+    /// Whether the scripts were told the `Pause` game state was entered.
+    pause: bool,
+    /// The engine's side of the pause menu's movie, and the movie it
+    /// set up (widget, restarts).
+    pause_native: crate::pause::Native,
+    pause_movie: Option<(u32, u32)>,
+    /// The player's options as last told the HUD's scripts.
+    options_told: Option<(bool, bool, bool, bool)>,
     /// The PDA's movement keys held ([`PDA_STICK_KEYS`]), and the stick
     /// they last pushed its map with.
     pda_held: HashSet<i32>,
@@ -1635,6 +1698,8 @@ struct Thread {
     native: crate::shell::Native,
     /// `fscommand`s no script heard, for the engine (the front end's).
     unheard: Vec<(String, String)>,
+    /// The HUD's, with the widget whose movie said them.
+    unheard_by: Vec<(u32, String, String)>,
     /// Seconds since `M2_SHELL_PROBE` (or `M2_HUD_PROBE`) last logged.
     probe_time: f64,
     /// How many natives the scripts called that aren't made, as last
@@ -1749,6 +1814,9 @@ impl Thread {
         mission
             .run(VIEW_POINT, "m2-hud view point")
             .map_err(|e| e.to_string())?;
+        mission
+            .run(LTI_LIBRARY, "m2-hud pc library")
+            .map_err(|e| e.to_string())?;
         // What the game finishes while it loads, before play: the
         // movies' load callbacks (the PDA's closes it, `_FinishLoadAndClose`;
         // left open, the support menu won't open over it).
@@ -1780,6 +1848,10 @@ impl Thread {
             reticle_logged: false,
             pda_shown: false,
             keys: Vec::new(),
+            pause: false,
+            pause_native: crate::pause::Native::default(),
+            pause_movie: None,
+            options_told: None,
             pda_held: HashSet::new(),
             pda_stick: [0.0; 2],
             pda_ready: None,
@@ -1797,6 +1869,7 @@ impl Thread {
             shell_seen: String::new(),
             native: crate::shell::Native::default(),
             unheard: Vec::new(),
+            unheard_by: Vec::new(),
             probe_time: 0.0,
             unknown_seen: 0,
             wheel_seen: String::new(),
@@ -1903,6 +1976,14 @@ impl Thread {
                 Err(e) => log.push(format!("TogglePDA: {e}")),
             }
         }
+        if state.pause != self.pause {
+            self.pause = state.pause;
+            let phase = if state.pause { "Enter" } else { "Exit" };
+            match gui_runtime::fire(self.mission.lua(), "GuiGameStateChange", ("Pause", phase)) {
+                Ok(n) => log.push(format!("pause: game state Pause {phase} ({n} handlers)")),
+                Err(e) => log.push(format!("pause: game state Pause {phase}: {e}")),
+            }
+        }
         let dt = state.dt.min(MAX_STEP);
         if let Err(e) = self.feed_support(state, dt) {
             log.push(format!("support: {e}"));
@@ -1918,7 +1999,8 @@ impl Thread {
         // Keys go to the movie that has the controls: the mission's
         // fanfare while it is up (its Key listener's Enter continues, as
         // `_HandleFanfareInput` passes the select button on), else the PDA.
-        if self.pda_shown || self.fanfare_up() {
+        self.tell_options(&state.pause_settings, &mut log);
+        if self.pda_shown || self.fanfare_up() || self.pause_up() {
             self.keys.extend(state.keys.iter().copied());
         }
         // The PDA's map moves while its movement keys are held, as the
@@ -1946,7 +2028,9 @@ impl Thread {
             }
             self.pda_stick = stick;
         }
+        self.pause_calls(state, &mut log);
         self.play_flash(dt, &mut log);
+        self.pause_answers(&mut log);
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
             return Output::Failed("no GUI runtime".into());
         };
@@ -1991,8 +2075,14 @@ impl Thread {
         }
         log.extend(screen.borrow_mut().take_log());
         log.extend(self.mission.take_log());
-        // The scripts' own commands (sounds, camera) are not the HUD's.
-        let _ = self.mission.take_commands();
+        // The scripts' own commands (sounds, camera) are not the HUD's,
+        // but the game states the pause menu's ask for (leaving it).
+        for c in self.mission.take_commands() {
+            if let m2_game::api::Command::GameState(s) = c {
+                log.push(format!("pause: the scripts ask for game state {s}"));
+                self.pause_native.game_state(&s);
+            }
+        }
         let names = gui_runtime::script_names(self.mission.lua());
         let zones = self.zones(&names);
         if zones.len() != self.zones.len() {
@@ -2232,6 +2322,10 @@ impl Thread {
             log,
             callbacks,
             shell: ShellNews::default(),
+            pause: Box::new(PauseOut {
+                news: self.pause_native.take_news(),
+                available: names.values().any(|n| n == PAUSE_LAYOUT),
+            }),
         }
     }
 
@@ -2431,6 +2525,7 @@ impl Thread {
                 under,
                 new_game,
             },
+            pause: Box::default(),
         }
     }
 
@@ -2441,6 +2536,92 @@ impl Thread {
     /// A fanfare movie is playing (`fanfare_mission`...).
     fn fanfare_up(&self) -> bool {
         self.flash.values().any(|m| m.swf.contains("fanfare"))
+    }
+
+    /// The pause menu's movie is playing.
+    fn pause_up(&self) -> bool {
+        self.flash.values().any(|m| m.swf == PAUSE_MOVIE)
+    }
+
+    /// The engine's calls into the pause menu's movie: set up as it
+    /// starts (again when the scripts load it again), then its answers.
+    fn pause_calls(&mut self, state: &HudState, log: &mut Vec<String>) {
+        let movie = self
+            .flash
+            .iter()
+            .find(|(_, m)| m.swf == PAUSE_MOVIE)
+            .map(|(&id, m)| (id, m.restarts));
+        if movie != self.pause_movie {
+            self.pause_movie = movie;
+            self.pause_native.reset();
+        }
+        let Some((id, _)) = movie else {
+            return;
+        };
+        let calls = self.pause_native.calls(&state.pause_settings);
+        if let Some(m) = self.flash.get_mut(&id) {
+            for (name, args) in calls {
+                log.push(format!(
+                    "pause: the engine calls {name}({} args)",
+                    args.len()
+                ));
+                m.rt.call(name, &args);
+            }
+        }
+    }
+
+    /// The scripts' calls to the PC's library ([`LTI_LIBRARY`]) and the
+    /// pause movie's commands no script heard, for the engine.
+    fn pause_answers(&mut self, log: &mut Vec<String>) {
+        let lua = self.mission.lua();
+        let globals = lua.globals();
+        let calls: Vec<(String, String)> = globals
+            .raw_get::<Option<mlua::Table>>("__m2_lti")
+            .ok()
+            .flatten()
+            .map(|t| {
+                t.sequence_values::<mlua::Table>()
+                    .flatten()
+                    .filter_map(|c| Some((c.get(1).ok()?, c.get(2).ok()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !calls.is_empty() {
+            let _ = globals.raw_set("__m2_lti", lua.create_table().ok());
+        }
+        for (name, arg) in calls {
+            let answered = self.pause_native.library(&name, &arg);
+            log.push(format!(
+                "pause: LTILibName.{name}({arg}){}",
+                if answered { "" } else { " not answered" }
+            ));
+        }
+        let pause = self.pause_movie.map(|(id, _)| id);
+        for (id, command, arg) in std::mem::take(&mut self.unheard_by) {
+            if Some(id) == pause && self.pause_native.command(&command, &arg) {
+                log.push(format!("pause: the engine hears {command}({arg})"));
+            }
+        }
+    }
+
+    /// The player's options the HUD's own scripts read (`Sys.*`), as they
+    /// change.
+    fn tell_options(&mut self, s: &crate::pause::Settings, log: &mut Vec<String>) {
+        let told = (s.subtitles, s.tutorials, s.rumble, s.invert_pad);
+        if self.options_told == Some(told) {
+            return;
+        }
+        self.options_told = Some(told);
+        self.mission.set_subtitles(s.subtitles);
+        self.mission.set_tutorials(s.tutorials);
+        let set = format!(
+            "rawset(Sys, \"RumbleEnabled\", function() return {} end)
+             rawset(Sys, \"YAxisInverted\", function() return {} end)",
+            s.rumble, s.invert_pad
+        );
+        if let Err(e) = self.mission.run(&set, "m2-hud options") {
+            log.push(format!("options: {e}"));
+        }
     }
 
     fn play_flash(&mut self, dt: f64, log: &mut Vec<String>) {
@@ -2542,12 +2723,16 @@ impl Thread {
                 "flash: key {code} {}",
                 if down { "down" } else { "up" }
             ));
+            // The pause menu over all holds them; else a fanfare.
+            let pause = self.pause_up();
             let fanfare = self.fanfare_up();
-            for m in self
-                .flash
-                .values_mut()
-                .filter(|m| !fanfare || m.swf.contains("fanfare"))
-            {
+            for m in self.flash.values_mut().filter(|m| {
+                if pause {
+                    m.swf == PAUSE_MOVIE
+                } else {
+                    !fanfare || m.swf.contains("fanfare")
+                }
+            }) {
                 if down {
                     m.rt.key_down(code);
                 } else {
@@ -2615,6 +2800,8 @@ impl Thread {
                     ));
                     if self.mode == Mode::Shell {
                         self.unheard.push((command, arg));
+                    } else {
+                        self.unheard_by.push((id, command, arg));
                     }
                 }
                 Err(e) => log.push(format!("flash: widget {id}: {command}: {e}")),
@@ -3344,7 +3531,11 @@ impl Thread {
                 ..
             } => {
                 if let Some(m) = self.flash.get(widget) {
-                    flash_prims(m, &self.movies.borrow(), *rect, *fullscreen, out, want);
+                    // The pause menu fills the screen, its stage stretched
+                    // across (the PC footage: its 850 x 720 stage spans
+                    // the 1280 x 720 picture, 1.5 times wider than high).
+                    let fit = *fullscreen && m.swf != PAUSE_MOVIE;
+                    flash_prims(m, &self.movies.borrow(), *rect, fit, out, want);
                 }
             }
             // Not drawn yet (see the module docs).
@@ -5200,6 +5391,8 @@ mod paint_tests {
             last_message: None,
             last_call: 0,
             last_time: None,
+            pause_news: crate::pause::News::default(),
+            pause_available: false,
             log: None,
         }
     }
@@ -5273,6 +5466,7 @@ mod paint_tests {
             log: log.iter().map(|l| (*l).to_owned()).collect(),
             callbacks: Vec::new(),
             shell: ShellNews::default(),
+            pause: Box::default(),
         }
     }
 
