@@ -1834,12 +1834,17 @@ impl Fleet {
             })
             .filter(|(_, g, models)| !ai_flown(&w, *g, models))
             .collect();
-        // Those the scripts still have in play count against the most.
-        let live = self
-            .requested
-            .iter()
-            .filter(|g| w.objects.get(g).is_some_and(|o| o.alive))
-            .count();
+        // Those the scripts still have in play near her count against the
+        // most: the first contract's boats and jeeps, kilometres behind
+        // her, mustn't keep the villa's tank from loading (playtest 4).
+        let live = in_play_near(
+            self.requested
+                .iter()
+                .filter_map(|g| w.objects.get(g))
+                .filter(|o| o.alive)
+                .map(|o| Vec3::from(o.position)),
+            near,
+        );
         drop(w);
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
         let w = mission.world().borrow();
@@ -1854,6 +1859,15 @@ impl Fleet {
             game.scene.load_vehicle(g, models);
         }
     }
+}
+
+/// How many of the loaded vehicles at `positions` count against
+/// [`MAX_VEHICLES`]: those within [`VEHICLE_REACH`] of `near`.
+fn in_play_near(positions: impl IntoIterator<Item = Vec3>, near: Vec3) -> usize {
+    positions
+        .into_iter()
+        .filter(|p| p.distance(near) <= VEHICLE_REACH)
+        .count()
 }
 
 /// A ray from the camera that stops this far short of an object (metres)
@@ -2788,8 +2802,21 @@ pub(crate) fn template_models(
         // car its own model draws, isn't a Valiant to drive (round 8:
         // the two ruins by VzaCon001's huts stood twice, intact too).
         Some(&TemplateInfo { vehicle: None, .. }) => Vec::new(),
+        // A prop the layers place by its model's name (a leading `_`)
+        // or a ruin's or wreck's name: drawn as itself, no vehicle
+        // (playtest 4: `_global_veh_ruin_68valiant`, by the porch hut,
+        // stood a second, drivable Valiant).
+        _ if placed_prop_or_ruin(name) => Vec::new(),
         _ => vehicle_models(name, catalogue),
     }
+}
+
+/// Whether an object's `name` is a prop placed by its model's name or a
+/// ruin's or wreck's (the words `m2_assets::vehicle` keeps out of its
+/// shared models).
+fn placed_prop_or_ruin(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with('_') || n.contains("ruin") || n.contains("wreck")
 }
 
 /// What the scripts' object `name` (a supply crate) leaves once destroyed:
@@ -3164,6 +3191,37 @@ mod tests {
     }
 
     #[test]
+    fn a_ruin_prop_placed_by_its_models_name_is_no_vehicle() {
+        let catalogue = [entry(1, "car", "global_veh_68valiant")];
+        let none = Templates::default();
+        assert!(
+            template_models("_global_veh_ruin_68valiant 0x000d8eac", &none, &catalogue).is_empty()
+        );
+        assert!(template_models("68Valiant Wreck", &none, &catalogue).is_empty());
+        // A script's car by that name still finds its model.
+        assert_eq!(
+            template_models("68Valiant 0x000fab16", &none, &catalogue).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn only_the_vehicles_near_her_count_against_the_most() {
+        // Playtest 4: 37 loaded from the first contract, 4 km behind her
+        // at the villa, left no room for the tank.
+        let villa = Vec3::new(2625.0, -13.0, -953.0);
+        let island = Vec3::new(-1500.0, 0.0, 600.0);
+        let far = std::iter::repeat_n(island, 37);
+        assert_eq!(in_play_near(far.clone(), villa), 0);
+        let near = std::iter::repeat_n(villa + Vec3::X * 50.0, 3);
+        assert_eq!(in_play_near(far.chain(near), villa), 3);
+        assert_eq!(
+            in_play_near([villa + Vec3::Z * (VEHICLE_REACH + 1.0)], villa),
+            0
+        );
+    }
+
+    #[test]
     fn cash_and_the_objective_tray_reach_the_hud_with_their_guids() {
         let lua = mlua::Lua::new();
         lua.load("Hud = { ResourceCounter = {}, ObjectiveTray = {}, Radar = function() end }")
@@ -3344,6 +3402,7 @@ mod tests {
             pickup: Some(8),
             feel: Default::default(),
             hint: None,
+            ui: None,
         };
         let db = Templates {
             infos: HashMap::from([(

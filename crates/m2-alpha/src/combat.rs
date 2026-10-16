@@ -183,6 +183,8 @@ pub struct Rifle {
     /// Its shots' sound set, muzzle flash and scatter, as its template
     /// gives them.
     pub feel: Feel,
+    /// What the HUD shows of it (`WeaponUI`), if its template says.
+    pub ui: Option<m2_engine::weapons::GunUi>,
 }
 
 impl Default for Rifle {
@@ -203,6 +205,7 @@ impl Default for Rifle {
             lock_on: None,
             class: None,
             feel: Feel::default(),
+            ui: None,
         }
     }
 }
@@ -254,6 +257,7 @@ impl Rifle {
             lock_on: spec.lock_on,
             class: spec.class,
             feel: spec.feel,
+            ui: spec.ui,
         }
     }
 
@@ -452,6 +456,21 @@ pub const MAX_GRENADES: u32 = 9;
 /// `DamageKey` is `MeleeBash`, so the blow's own size stays invented).
 const BASH_REACH: f32 = 1.8;
 const BASH_ARC: f32 = 0.5;
+/// A vehicle whose up axis leans further than this from straight up
+/// (its cosine) lies on its side or roof, for a blow to right (invented).
+const OVERTURNED_UP: f32 = 0.5;
+
+/// Whether a vehicle whose up axis is `up` lies on its side or roof.
+fn overturned(up: Vec3) -> bool {
+    up.y < OVERTURNED_UP
+}
+
+/// Whether her blow from `feet`, facing `ahead`, reaches a vehicle with its
+/// middle at `middle` and about `half` metres from its middle to its side.
+fn within_bash(feet: Vec3, ahead: Vec3, middle: Vec3, half: f32) -> bool {
+    let to = (middle - feet).with_y(0.0);
+    to.length() <= BASH_REACH + half && to.normalize_or_zero().dot(ahead) >= BASH_ARC
+}
 const BASH_DAMAGE: f32 = 60.0;
 const BASH_BREAK: f32 = 100.0;
 const BASH_PUSH: (f32, f32) = (3.0, 1.0);
@@ -1046,6 +1065,12 @@ impl Rounds {
     }
 }
 
+/// `r` reloaded into a clip of `size`: `None` when it is full or nothing
+/// is stored to load.
+fn topped_up(r: Rounds, size: u32) -> Option<Rounds> {
+    (r.clip < size && r.stored > 0).then(|| Rounds::of(r.total(), size))
+}
+
 /// Something brief to draw.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Effect {
@@ -1482,6 +1507,11 @@ pub struct Combat {
     /// driver's), and how many rounds its weapons have fired, to fire
     /// from their hardpoints in turn.
     pub seat: usize,
+    /// In a vehicle: which of its guns Fire fires, 0 its main gun (a
+    /// tank's cannon) and 1 its machine gun, chosen with the weapon
+    /// switch (Tab, the wheel) as the game's tank controls do
+    /// (`Switch_Primary`).
+    pub vehicle_gun: usize,
     ripple: usize,
     seed: u64,
     /// What she has fired, for the HUD's ammo counters.
@@ -1676,6 +1706,7 @@ impl Default for Combat {
             fire_held: false,
             lock: None,
             seat: 0,
+            vehicle_gun: 0,
             ripple: 0,
             seed: 0x2545_f491_4f6c_dd1d,
             fired: Fired::default(),
@@ -2475,13 +2506,19 @@ impl Combat {
             Some(_) => {}
             None => self.seat = 0,
         }
+        if f.player.driving.is_none() {
+            self.vehicle_gun = 0;
+        }
+        // Fire fires the gun chosen with the switch: the main gun, or the
+        // machine gun (as Aim does too).
+        let mg = self.vehicle_gun == 1;
         if let Some(i) = f.player.driving
             && self.down <= 0.0
             && trigger.fire
-            && self.reload <= 0.0
-            && !self.mounted_fire(f, i, 0)
+            && (if mg { self.mg_reload } else { self.reload }) <= 0.0
+            && !self.mounted_fire(f, i, usize::from(mg))
         {
-            self.vehicle_fire(f, i, false);
+            self.vehicle_fire(f, i, mg);
         }
         if let Some(i) = f.player.driving
             && self.down <= 0.0
@@ -2579,6 +2616,18 @@ impl Combat {
     /// game does), while she holds it on foot with rounds to spare; put
     /// away or out of her hands, the change starts over next time.
     fn change_clip(&mut self, trigger: Trigger, on_foot: bool, dt: f32) {
+        // The launcher reloads on R too, its magazine part spent
+        // (playtest 4: only once empty).
+        if on_foot
+            && trigger.reload
+            && self.weapon == self.launcher.slot()
+            && self.reload <= 0.0
+            && let Some(r) = self.launcher_rounds.as_mut()
+            && let Some(full) = topped_up(*r, self.launcher.clip.max(1))
+        {
+            *r = full;
+            self.reload = LAUNCHER_RELOAD;
+        }
         let r = self.rifle_rounds;
         let holding = on_foot && self.weapon == Weapon::Rifle && !self.designator;
         if !holding {
@@ -3531,7 +3580,8 @@ impl Combat {
 
     /// Her blow, high or low, the way she faces: it hurts and shoves those
     /// within reach ahead of her and strikes what of the world's it meets
-    /// (a supply crate breaks open).
+    /// (a supply crate breaks open), and rights an overturned vehicle
+    /// there.
     fn bash(&mut self, f: &mut Field<'_>, low: bool) {
         let feet = f.player.character.position;
         let ahead = Vec3::new(f.player.facing.sin(), 0.0, f.player.facing.cos());
@@ -3556,6 +3606,26 @@ impl Combat {
                 self.remarks.push(Remark::Kill);
             }
             self.hits += 1;
+        }
+        // A vehicle on its side or roof in front of her: the blow rights it
+        // (from the owner's play of the game; nothing in the data says so).
+        for v in f
+            .vehicles
+            .iter()
+            .filter(|v| !v.wrecked && f.player.driving.is_none())
+        {
+            let Some(id) = v.id else { continue };
+            let Some(m) = f.physics.vehicle_transform(id) else {
+                continue;
+            };
+            let (lo, hi) = v.model.bounds;
+            let middle = m.transform_point3((lo + hi) * 0.5);
+            let up = m.transform_vector3(Vec3::Y).normalize_or_zero();
+            if within_bash(feet, ahead, middle, (hi - lo).max_element() * 0.5) && overturned(up) {
+                f.physics.right_vehicle(id);
+                eprintln!("bash: she rights {} (up {:.2})", v.spec.label, up.y);
+                break;
+            }
         }
         if let Some((t, _, key)) = f.physics.cast_ray_keyed(from, ahead, BASH_REACH) {
             self.struck.push(Strike {
@@ -4644,6 +4714,37 @@ mod tests {
     use super::*;
     use crate::npc::tests::{ground, rig};
     use crate::npc::{Brain, Npc};
+
+    #[test]
+    fn a_part_spent_launcher_reloads_from_what_is_stored() {
+        // 2 of 6 loaded, 10 stored: 6 loaded, 6 stored.
+        let r = Rounds {
+            clip: 2,
+            stored: 10,
+        };
+        assert_eq!(topped_up(r, 6), Some(Rounds { clip: 6, stored: 6 }));
+        // 2 loaded and 1 stored: 3 loaded.
+        let r = Rounds { clip: 2, stored: 1 };
+        assert_eq!(topped_up(r, 6), Some(Rounds { clip: 3, stored: 0 }));
+        // Full, or nothing stored: no reload.
+        assert_eq!(topped_up(Rounds { clip: 6, stored: 4 }, 6), None);
+        assert_eq!(topped_up(Rounds { clip: 2, stored: 0 }, 6), None);
+    }
+
+    #[test]
+    fn a_blow_rights_a_vehicle_on_its_side_in_front_of_her() {
+        // Upright, leaning on a slope, on its side, on its roof.
+        assert!(!overturned(Vec3::Y));
+        assert!(!overturned(Vec3::new(0.5, 0.86, 0.0)));
+        assert!(overturned(Vec3::X));
+        assert!(overturned(-Vec3::Y));
+        // A jeep 1 m wide lying 2.5 m ahead of her is in reach; behind her
+        // or 5 m off it isn't.
+        let (feet, ahead) = (Vec3::ZERO, Vec3::Z);
+        assert!(within_bash(feet, ahead, Vec3::new(0.0, 0.5, 2.5), 1.0));
+        assert!(!within_bash(feet, ahead, Vec3::new(0.0, 0.5, -2.5), 1.0));
+        assert!(!within_bash(feet, ahead, Vec3::new(0.0, 0.5, 5.0), 1.0));
+    }
 
     #[test]
     fn rounds_striking_the_world_throw_up_their_surfaces_impact() {

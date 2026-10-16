@@ -108,7 +108,11 @@ pub fn read(db: &Layer<'_>) -> Leavings {
             .templates()
             .filter_map(|id| {
                 let records = pickup.of_template(id);
-                let r = records.first()?;
+                // A gun's equipment record says what it is and how near
+                // she must be, wherever it stands among its records (the
+                // `Machine Pistol (Uzi)` lists its bullets first, radius
+                // 1.0, then itself, 1.5; PC data: playtest 4).
+                let r = deciding(records, |r| pickup.word(r, kind))?;
                 Some((
                     id,
                     PickupInfo {
@@ -163,9 +167,29 @@ pub fn read(db: &Layer<'_>) -> Leavings {
     }
 }
 
+/// Of a template's pickup records, the one that says what it is and its
+/// reach: its [`EQUIPMENT`] record if it has one, else its first.
+fn deciding<R>(records: &[R], kind_of: impl Fn(&R) -> Option<u32>) -> Option<&R> {
+    records
+        .iter()
+        .find(|r| kind_of(r) == Some(EQUIPMENT))
+        .or_else(|| records.first())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guns_equipment_record_decides_wherever_it_stands() {
+        // (Type, radius): the Uzi's bullets first, then the gun.
+        let uzi = [(AMMUNITION, 1.0), (EQUIPMENT, 1.5)];
+        assert_eq!(deciding(&uzi, |r| Some(r.0)), Some(&(EQUIPMENT, 1.5)));
+        // A plain ammunition pickup: its first.
+        let ammo = [(AMMUNITION, 1.0), (HEALTH, 1.0)];
+        assert_eq!(deciding(&ammo, |r| Some(r.0)), Some(&(AMMUNITION, 1.0)));
+        assert_eq!(deciding::<(u32, f32)>(&[], |r| Some(r.0)), None);
+    }
 
     // The survey names the rocket pickup's fields `Type` and `radius`
     // by these keys, and its weapons' `AmmoTemplate`.

@@ -190,8 +190,12 @@ pub struct News {
     pub settings: Option<Settings>,
     /// Volumes (SFX, music, dialog) to hear while a slider moves.
     pub volumes: Option<[f64; 3]>,
-    /// Interface sounds the movie played (`Sound.Play`).
+    /// Interface sounds the movie played (`Sound.Play`, `Sound.Loop`: a
+    /// looped cue loops), and those the HUD's scripts cued.
     pub sounds: Vec<String>,
+    /// Interface sounds the movie or the HUD's scripts stopped
+    /// (`Sound.Stop`: the PDA map's pan loop as the stick lets go).
+    pub stops: Vec<String>,
     /// Settings the menu kept that play has nothing for, as `name=value`.
     pub unused: Vec<String>,
     /// The keyboard table wants the next key or mouse button pressed
@@ -211,6 +215,7 @@ impl News {
         self.settings = later.settings.or(self.settings.take());
         self.volumes = later.volumes.or(self.volumes);
         self.sounds.extend(later.sounds);
+        self.stops.extend(later.stops);
         self.unused.extend(later.unused);
         self.capture = later.capture.or(self.capture);
         self.keys = later.keys.or(self.keys.take());
@@ -431,11 +436,14 @@ impl Native {
     /// An `fscommand` no script handles: whether it is the engine's.
     pub fn command(&mut self, command: &str, arg: &str) -> bool {
         match command {
-            "Sound.Play" => {
+            "Sound.Play" | "Sound.Loop" => {
                 self.news.sounds.push(arg.to_owned());
                 true
             }
-            "Sound.Loop" | "Sound.Stop" => true,
+            "Sound.Stop" => {
+                self.news.stops.push(arg.to_owned());
+                true
+            }
             "audioSetSFXVolume"
             | "audioSetFXVolume"
             | "audioSetMusicVolume"
