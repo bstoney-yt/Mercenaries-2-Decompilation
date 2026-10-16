@@ -918,6 +918,9 @@ struct VehicleBody {
     tracks: Option<[f32; 4]>,
     /// Its template's steering lock and brakes, on wheels.
     handling: Option<crate::tuning::Handling>,
+    /// Where its front wheels point now, radians (left positive): they
+    /// swing towards where the driver steers as its `handling` says.
+    steering: f32,
     /// Wrecked: nothing drives it any more.
     wrecked: bool,
     /// Held where it is ([`Physics::hold_vehicle`]): its body fixed.
@@ -1654,6 +1657,7 @@ impl Physics {
             engine: spec.tuning.engine.filter(|_| !spec.tracked),
             tracks: spec.tuning.tracks,
             handling: spec.tuning.handling.filter(|_| !spec.tracked),
+            steering: 0.0,
             wrecked: false,
             held: false,
             before: Vec3::ZERO,
@@ -1754,10 +1758,19 @@ impl Physics {
             (0.0, slowing(ROLLING))
         };
         // Its template's lock at a standstill, less as it speeds up (the
-        // fall with speed invented).
+        // fall with speed invented); the wheels swing there as quickly
+        // as its template says at this speed (else at once).
         let lock = v.handling.map_or(MAX_STEER, |h| h.steer_lock);
-        let steer = controls.steer.clamp(-1.0, 1.0) * lock / (1.0 + speed.abs() * 0.04);
-        let steer = if v.tracked { 0.0 } else { steer };
+        let want = controls.steer.clamp(-1.0, 1.0) * lock / (1.0 + speed.abs() * 0.04);
+        let want = if v.tracked { 0.0 } else { want };
+        v.steering = match v.handling {
+            Some(h) => {
+                let most = h.swing(speed) * dt;
+                v.steering + (want - v.steering).clamp(-most, most)
+            }
+            None => want,
+        };
+        let steer = v.steering;
         let tracked = v
             .tracked
             .then(|| (v.controller.chassis, controls.steer.clamp(-1.0, 1.0)));
@@ -3547,6 +3560,9 @@ mod tests {
                 steer_lock: lock,
                 brake,
                 grip: (1.5, 1.5),
+                steer_speed: 100.0,
+                low_speed: 0.0,
+                low_steer_speed: 0.0,
             });
             let mut p = Physics::new();
             floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
@@ -3595,6 +3611,54 @@ mod tests {
         let (lock, hard) = slowing((9.0, 7.0), 0.5);
         assert!((lock - 0.5).abs() < 0.05, "{lock}");
         assert!((hard - 8.0).abs() < 1.0, "{hard}");
+    }
+
+    // Its front wheels swing towards full lock as quickly as its template
+    // says (radians a second): `LowSpeedSteerSpeed` below its
+    // `LowSpeedLimit`, `SteerSpeed` above it; and back as quickly.
+    #[test]
+    fn wheels_swing_at_the_templates_steer_speed() {
+        let mut spec = car();
+        spec.tuning.handling = Some(crate::tuning::Handling {
+            steer_lock: 0.7,
+            brake: (7.0, 6.0),
+            grip: (1.5, 1.5),
+            steer_speed: 0.6,
+            low_speed: 35.0 / 3.6,
+            low_steer_speed: 0.9,
+        });
+        let mut p = Physics::new();
+        floor(&mut p, 1, 0.0, 0.0, 0.0, 500.0);
+        p.step(DT);
+        let id = p.add_vehicle(&spec, Vec3::new(0.0, 0.1, -400.0), 0.0);
+        for _ in 0..60 {
+            p.step(DT);
+        }
+        let steer = |p: &mut Physics, steer: f32, secs: f32| {
+            for _ in 0..(secs / DT).round() as usize {
+                p.drive(
+                    id,
+                    VehicleControls {
+                        steer,
+                        ..Default::default()
+                    },
+                );
+                p.step(DT);
+            }
+            p.vehicle_wheels(id)[0].0
+        };
+        // At a standstill: 0.9 rad/s, so 0.45 rad after half a second,
+        // full lock (0.7) by 0.8 s, and straight again 0.8 s later.
+        let half = steer(&mut p, 1.0, 0.5);
+        assert!((half - 0.45).abs() < 0.03, "{half}");
+        let full = steer(&mut p, 1.0, 0.5);
+        assert!((full - 0.7).abs() < 0.01, "{full}");
+        let back = steer(&mut p, 0.0, 0.8);
+        assert!(back.abs() < 0.01, "{back}");
+        // Above 35 km/h: 0.6 rad/s.
+        let h = spec.tuning.handling.expect("set");
+        assert_eq!(h.swing(5.0), 0.9);
+        assert_eq!(h.swing(-12.0), 0.6);
     }
 
     #[test]

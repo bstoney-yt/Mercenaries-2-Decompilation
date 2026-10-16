@@ -145,6 +145,30 @@ pub struct Handling {
     /// `RearWheelFrictionSide` 1.5; 0.5 to 3 and 0.7 to 5), read as the
     /// tyres' friction coefficient (inferred).
     pub grip: (f32, f32),
+    /// How quickly its front wheels swing towards where the driver
+    /// steers, radians a second (`SteerSpeed` 0.6; 0.1 to 10; gap round
+    /// 14, the unit inferred, as the lock's is radians).
+    pub steer_speed: f32,
+    /// Below this speed, m/s, they swing at `low_steer_speed` instead
+    /// (`LowSpeedLimit` 35 and `LowSpeedSteerSpeed` 0.9; 0 to 80 and 0
+    /// to 6). The limit read as km/h, as its `MaxSpeed` is (inferred);
+    /// the pair read as the helicopters' `LowSpeedLimit` and
+    /// `LowSpeedYawSpeed` are. 0 when its template gives no limit (7 of
+    /// the 454 records).
+    pub low_speed: f32,
+    pub low_steer_speed: f32,
+}
+
+impl Handling {
+    /// How quickly its front wheels swing at `speed` m/s, radians a
+    /// second.
+    pub fn swing(&self, speed: f32) -> f32 {
+        if speed.abs() < self.low_speed {
+            self.low_steer_speed
+        } else {
+            self.steer_speed
+        }
+    }
 }
 
 impl EngineTuning {
@@ -759,10 +783,14 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                 handling: (|| {
                     let r = *car.of_template(id).first()?;
                     let f = |name| car.float(r, name_hash(name)).filter(|v| *v > 0.0);
+                    let low = (|| Some((f("LowSpeedLimit")? / 3.6, f("LowSpeedSteerSpeed")?)))();
                     Some(Handling {
                         steer_lock: f("SteerMaxAngle").filter(|a| *a < 1.5)?,
                         brake: (f("FrontBrake")?, f("RearBrake")?),
                         grip: (f("FrontWheelFrictionSide")?, f("RearWheelFrictionSide")?),
+                        steer_speed: f("SteerSpeed")?,
+                        low_speed: low.map_or(0.0, |l| l.0),
+                        low_steer_speed: low.map_or(0.0, |l| l.1),
                     })
                 })(),
                 tracks: (|| {
@@ -917,6 +945,11 @@ mod tests {
             ("RearBrake", 0x0175_b464),
             ("FrontWheelFrictionSide", 0x0d87_1558),
             ("RearWheelFrictionSide", 0x45a5_a093),
+            // How quickly it steers (gap round 14; `SteeringInertia`
+            // named, unused).
+            ("SteerSpeed", 0x0db1_c8d9),
+            ("SteeringInertia", 0xefc4_dc7a),
+            ("LowSpeedSteerSpeed", 0xb36b_7486),
             // `_TankPhysics`'s pull over its speed.
             ("EngineTorqueRatio0", 0xe8a9_e7ee),
             ("EngineTorqueRatio3", 0x4ab1_3df9),
