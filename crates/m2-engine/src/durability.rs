@@ -251,6 +251,42 @@ pub fn modifier_keys(db: &Layer<'_>) -> HashMap<u32, u32> {
         .collect()
 }
 
+/// How hard a vehicle of `mass` (kg) running into something at `speed`
+/// (m/s) hits it, before the damage table scales it by what it hits (its
+/// `ModifierKey` row) and the vehicle's kind of damage ([`RAM_KIND`]): a
+/// tonne at a metre a second does 1, so a 2,000 kg Valiant at 10 m/s does
+/// 20 and a 32,000 kg tank at 8 m/s 256. Invented: the data gives the kind
+/// of a ram's damage and what each thing takes of it, not its size.
+pub fn ram(mass: f32, speed: f32) -> f32 {
+    mass * speed / 1000.0
+}
+
+/// A ram's kind of damage where its vehicle's template names none: `Car`,
+/// the damage table's column every vehicle template that names a
+/// `DamageKey` of its own names (survey `runover`).
+pub const RAM_KIND: &str = "Car";
+
+/// What a vehicle of `mass` (kg) whose ram is of kind `key` (a name hash:
+/// `Car`, `Tank`) does to a person whose `ModifierKey` row is `row`
+/// (`Human`, `HumanArmor`, `Hero`), running into them at `speed` (m/s):
+/// its [`ram`] times the damage table's cell. A `Human` takes three times a
+/// `Car`'s and twice a `Tank`'s, a `HumanArmor` once either, the `Hero`
+/// a fifth. A row or column the table lacks takes the `Human` row's, then
+/// the ram itself.
+pub fn run_over(
+    table: &crate::tuning::DamageTable,
+    row: u32,
+    key: u32,
+    mass: f32,
+    speed: f32,
+) -> f32 {
+    let scale = table
+        .scale(row, key)
+        .or_else(|| table.scale(name_hash("Human"), key))
+        .unwrap_or(1.0);
+    ram(mass, speed) * scale
+}
+
 /// A blast's reach and damage (`Explosive`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Explosion {
@@ -334,6 +370,29 @@ pub fn explosions(db: &Layer<'_>) -> HashMap<u32, Explosion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A ram is a tonne a metre a second, times the table's cell for the
+    // person's row and the vehicle's kind; a row the table lacks takes the
+    // `Human` row's.
+    #[test]
+    fn a_run_over_is_the_ram_times_the_tables_cell() {
+        let (human, hero, car) = (name_hash("Human"), name_hash("Hero"), name_hash(RAM_KIND));
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(2);
+        put(1);
+        put(human);
+        put(hero);
+        put(car);
+        put(3.0f32.to_bits());
+        put(0.2f32.to_bits());
+        let table = crate::tuning::DamageTable::parse(&data).expect("table");
+        assert_eq!(ram(2000.0, 10.0), 20.0);
+        assert_eq!(run_over(&table, human, car, 2000.0, 10.0), 60.0);
+        assert!((run_over(&table, hero, car, 2000.0, 10.0) - 4.0).abs() < 1e-5);
+        assert_eq!(run_over(&table, 0x1234, car, 2000.0, 10.0), 60.0);
+        assert_eq!(run_over(&table, human, 0x1234, 2000.0, 10.0), 20.0);
+    }
 
     #[test]
     fn a_prop_weighs_its_own_mass_else_a_light_or_heavy_default() {

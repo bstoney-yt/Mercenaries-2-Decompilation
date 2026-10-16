@@ -79,13 +79,12 @@ impl Blast {
 /// ram's damage (the vehicles' `DamageKey`) and what each thing takes of
 /// it (the damage table's `Car` column: a shack twice it, vegetation ten
 /// times, a building or a tree's canopy none), not its size.
-pub fn ram(mass: f32, speed: f32) -> f32 {
-    mass * speed / 1000.0
-}
+/// The same ram hurts people ([`m2_engine::durability::run_over`]).
+pub use m2_engine::durability::ram;
 
-/// A ram's kind of damage: the vehicles' own `DamageKey` (the AMX30's and
-/// the jeeps' alike, PC data).
-const RAM_KIND: &str = "Car";
+/// A ram's kind of damage: the vehicles' own `DamageKey` (`Car` on 520
+/// vehicle templates, none on 259, nothing else; survey `runover`).
+use m2_engine::durability::RAM_KIND;
 /// A vehicle rams nothing slower than this, m/s (invented, as fast as it
 /// must go to knock anything loose).
 const RAM_SPEED: f32 = 1.0;

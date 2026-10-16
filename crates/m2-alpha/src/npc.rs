@@ -180,6 +180,10 @@ const TURN_RATE: f32 = 6.0;
 const TOPPLE: f32 = 0.6;
 /// Slowest a vehicle hurts people it meets, m/s.
 const RUN_OVER: f32 = 2.5;
+/// Seconds after a vehicle hurts someone it doesn't kill before one can
+/// hurt them again, and how hard it shoves them aside (m/s). Invented.
+pub const RAM_GAP: f32 = 1.0;
+const SHOVE: f32 = 4.0;
 /// How far ahead (seconds) people see a vehicle coming at them.
 const DODGE_TIME: f32 = 2.0;
 
@@ -684,6 +688,8 @@ pub struct Npc {
     pub alert: bool,
     /// Set by a tick when a soldier fires; the fight takes the shot.
     pub fires: bool,
+    /// Seconds before a vehicle can hurt them again ([`RAM_GAP`]).
+    pub rammed: f32,
     cooldown: f32,
     /// How their template fights (a plain VZ soldier's when unknown).
     pub ai: AiProfile,
@@ -784,6 +790,7 @@ impl Npc {
             alive: true,
             alert: false,
             fires: false,
+            rammed: 0.0,
             cooldown: 0.0,
             ai: AiProfile::default(),
             last_seen: None,
@@ -1773,6 +1780,7 @@ impl People {
         let mut callouts = Vec::new();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
+            npc.rammed = (npc.rammed - dt).max(0.0);
             npc.update(physics, &mut self.rng, threat, dt);
             if let Some(t) = threat {
                 self.idle.count(physics, npc, t, dt);
@@ -1826,13 +1834,24 @@ impl People {
     }
 
     /// Vehicles going through people: `cars` are (model to world,
-    /// velocity, model-space hull box) of each one moving. Anyone a car's
-    /// box meets is knocked flying, dead; those who don't fight in its
-    /// path (as wide as it is, and a little more) dive out of the way, but
-    /// story characters. The number of soldiers killed.
-    pub fn traffic(&mut self, cars: &[(Mat4, Vec3, (Vec3, Vec3))]) -> usize {
+    /// velocity, model-space hull box, mass in kg) of each one moving.
+    /// Anyone a car's box meets takes its ram by the damage table `table`
+    /// ([`m2_engine::durability::run_over`]: a `Human` three times a
+    /// `Car`'s, a `HumanArmor` once, the bosses and targets once) and is
+    /// knocked flying if it kills, shoved aside if not (and not hurt by a
+    /// vehicle again for [`RAM_GAP`]); without the table, as before, it
+    /// kills. Those who don't fight in its path (as wide as it is, and a
+    /// little more) dive out of the way, but story characters. The number
+    /// of soldiers killed.
+    pub fn traffic(
+        &mut self,
+        cars: &[(Mat4, Vec3, (Vec3, Vec3), f32)],
+        table: Option<&m2_engine::tuning::DamageTable>,
+    ) -> usize {
+        let human = m2_assets::name_hash("Human");
+        let kind = m2_assets::name_hash(m2_engine::durability::RAM_KIND);
         let mut killed = 0;
-        for &(at, velocity, (lo, hi)) in cars {
+        for &(at, velocity, (lo, hi), mass) in cars {
             let speed = velocity.length();
             if speed < RUN_OVER {
                 continue;
@@ -1846,9 +1865,24 @@ impl People {
                 let local = to_car.transform_point3(p + Vec3::Y * 0.9);
                 let pad = Vec3::new(0.35, 0.9, 0.35);
                 if local.cmpge(lo - pad).all() && local.cmple(hi + pad).all() {
+                    if n.rammed > 0.0 {
+                        continue;
+                    }
                     let push = velocity * 1.1 + Vec3::Y * (2.0 + speed * 0.15);
-                    if n.hurt(1000.0, push) && n.soldier {
-                        killed += 1;
+                    let damage = table.map_or(1000.0, |t| {
+                        let row = n.ai.modifier.unwrap_or(human);
+                        m2_engine::durability::run_over(t, row, kind, mass, speed)
+                    });
+                    if n.hurt(damage, push) {
+                        killed += usize::from(n.soldier);
+                    } else {
+                        // Knocked aside, off the way it drives.
+                        let rel = (p - centre).with_y(0.0);
+                        let side = (rel - heading * rel.dot(heading))
+                            .normalize_or(Vec3::new(heading.z, 0.0, -heading.x));
+                        n.character.velocity = heading * speed * 0.5 + side * SHOVE;
+                        n.rammed = RAM_GAP;
+                        n.panic(centre);
                     }
                     continue;
                 }
@@ -2645,7 +2679,10 @@ pub(crate) mod tests {
         let mut people = People::default();
         people.npcs.push(him);
         let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
-        people.traffic(&[(Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds)]);
+        people.traffic(
+            &[(Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds, 1000.0)],
+            None,
+        );
         assert!(people.npcs[0].alive && people.npcs[0].flee.is_none());
         assert!(people.take_shouts().is_empty(), "nor shouts");
     }
@@ -2983,8 +3020,8 @@ pub(crate) mod tests {
         }
         // A car at the origin doing 10 m/s along +z.
         let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
-        let car = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds);
-        people.traffic(&[car]);
+        let car = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds, 1000.0);
+        people.traffic(&[car], None);
         let [hit, ahead, behind] = &people.npcs[..] else {
             unreachable!()
         };
@@ -2996,8 +3033,63 @@ pub(crate) mod tests {
         let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, 1.5), 0.0, stroll(), None);
         n.landed = true;
         people.npcs.push(n);
-        people.traffic(&[(Mat4::IDENTITY, Vec3::ZERO, bounds)]);
+        people.traffic(&[(Mat4::IDENTITY, Vec3::ZERO, bounds, 1000.0)], None);
         assert!(people.npcs[0].alive);
+    }
+
+    // With the damage table, a car hurts as its ram times their row's
+    // `Car` cell: a tonne at 10 m/s does 30 to a `Human` (3x), who is
+    // shoved aside and not hurt again at once; two tonnes at 20 m/s do
+    // 120 and kill; a `HumanArmor` (1x) takes 40 of that and lives.
+    #[test]
+    fn a_car_hurts_people_by_the_damage_table() {
+        let (human, armor, car_key) = (
+            m2_assets::name_hash("Human"),
+            m2_assets::name_hash("HumanArmor"),
+            m2_assets::name_hash("Car"),
+        );
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(2);
+        put(1);
+        put(human);
+        put(armor);
+        put(car_key);
+        put(3.0f32.to_bits());
+        put(1.0f32.to_bits());
+        let table = m2_engine::tuning::DamageTable::parse(&data).expect("table");
+        let stroll = || Brain::Wander {
+            home: Vec3::ZERO,
+            target: Vec3::ZERO,
+            wait: 10.0,
+        };
+        let bounds = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+        let person = |modifier: Option<u32>| {
+            let mut n = Npc::new(0, &rig(), Vec3::new(0.3, 0.0, 1.5), 0.0, stroll(), None);
+            n.landed = true;
+            n.ai.modifier = modifier;
+            n
+        };
+        let mut people = People::default();
+        people.npcs.push(person(None));
+        let slow = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds, 1000.0);
+        assert_eq!(people.traffic(&[slow], Some(&table)), 0);
+        let n = &people.npcs[0];
+        assert!(n.alive && n.hp == 70.0 && n.rammed == RAM_GAP);
+        assert!(n.character.velocity.x > 0.0, "shoved off its line");
+        people.traffic(&[slow], Some(&table));
+        assert_eq!(people.npcs[0].hp, 70.0, "not again at once");
+        // Faster and heavier: a soldier dies, a heavy lives.
+        let fast = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 20.0), bounds, 2000.0);
+        let mut people = People::default();
+        people.npcs.push(person(Some(human)));
+        people.npcs.push(person(Some(armor)));
+        for n in &mut people.npcs {
+            n.soldier = true;
+        }
+        assert_eq!(people.traffic(&[fast], Some(&table)), 1);
+        assert!(!people.npcs[0].alive);
+        assert!(people.npcs[1].alive && people.npcs[1].hp == 60.0);
     }
 
     // Running from a car into a wall, they run along it, not stand
