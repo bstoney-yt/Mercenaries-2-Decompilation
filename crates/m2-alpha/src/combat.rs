@@ -447,7 +447,9 @@ pub const MAX_GRENADES: u32 = 9;
 /// of its half-angle), how much it hurts a person and what of the world's
 /// it meets (a supply crate's 100 health: one blow opens it), how hard it
 /// shoves (out, up; m/s), and seconds before she can bash or fire again.
-/// Invented, from the playthroughs.
+/// Invented, from the playthroughs. A person takes the blow times their
+/// damage table row's `MeleeBash` cell (from the data; no template's
+/// `DamageKey` is `MeleeBash`, so the blow's own size stays invented).
 const BASH_REACH: f32 = 1.8;
 const BASH_ARC: f32 = 0.5;
 const BASH_DAMAGE: f32 = 60.0;
@@ -3544,8 +3546,13 @@ impl Combat {
             {
                 continue;
             }
+            // Of the blow, what the damage table's row for them gives of a
+            // `MeleeBash`: a thousand times for a `Human` or `HumanArmor`
+            // (one blow fells any soldier), nothing for the bosses and
+            // targets (`cab45462`: Carmona, Blanco, Peng).
+            let taken = BASH_DAMAGE * self.on_person(n, Some(m2_assets::name_hash("MeleeBash")));
             let soldier = n.soldier;
-            if n.hurt(BASH_DAMAGE, push) && soldier {
+            if n.hurt(taken, push) && soldier {
                 self.remarks.push(Remark::Kill);
             }
             self.hits += 1;
@@ -4860,6 +4867,69 @@ mod tests {
         let s = combat.struck.first().copied().expect("struck");
         assert_eq!(s.key, Some(StaticKey::Entity(7)));
         assert!(s.at.y < 0.8 && s.damage >= 100.0, "{s:?}");
+    }
+
+    // With the damage table, a blow hurts by the row's `MeleeBash` cell:
+    // a `Human` takes a thousand times it (one blow drops him), a boss's
+    // row (`cab45462`) nothing.
+    #[test]
+    fn a_bash_hurts_by_the_damage_table() {
+        let (human, boss) = (m2_assets::name_hash("Human"), 0xcab4_5462);
+        let mut data = vec![0u8; 0x48];
+        let mut put = |v: u32| data.extend_from_slice(&v.to_le_bytes());
+        put(2);
+        put(1);
+        put(human);
+        put(boss);
+        put(m2_assets::name_hash("MeleeBash"));
+        put(1000.0f32.to_bits());
+        put(0.0f32.to_bits());
+        for (modifier, dies) in [(None, true), (Some(boss), false)] {
+            let mut physics = ground();
+            let dt = 1.0 / 60.0;
+            let mut player = Player::new(0.0, 0.0, 0.0, None);
+            let mut people = People::default();
+            let mut n = Npc::new(
+                0,
+                &rig(),
+                Vec3::new(0.0, 1.0, 1.2),
+                std::f32::consts::PI,
+                Brain::Post { facing: 0.0 },
+                Some(1),
+            );
+            n.ai.modifier = modifier;
+            people.npcs.push(n);
+            for _ in 0..3 {
+                people.update(&mut physics, &[], Vec3::ZERO, None, dt);
+                player.update(&physics, Default::default(), dt);
+            }
+            let arsenal = Arsenal::default();
+            let mut vehicles = Vec::new();
+            let mut combat = Combat {
+                damage_table: m2_engine::tuning::DamageTable::parse(&data),
+                ..Combat::default()
+            };
+            for k in 0..30 {
+                let mut field = Field {
+                    physics: &mut physics,
+                    player: &mut player,
+                    people: &mut people,
+                    vehicles: &mut vehicles,
+                    arsenal: &arsenal,
+                    explosives: &mut [],
+                };
+                let trigger = Trigger {
+                    melee: k == 0,
+                    ..Trigger::default()
+                };
+                combat.step(&mut field, trigger, dt);
+            }
+            assert_eq!(combat.hits, 1);
+            assert_eq!(!people.npcs[0].alive, dies);
+            if !dies {
+                assert_eq!(people.npcs[0].hp, 100.0);
+            }
+        }
     }
 
     #[test]

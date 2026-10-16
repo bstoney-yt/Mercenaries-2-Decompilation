@@ -984,10 +984,17 @@ impl Game {
                 .filter_map(|v| {
                     let id = v.id?;
                     let at = world.physics.vehicle_transform(id)?;
-                    Some((at, world.physics.vehicle_velocity(id), v.spec.hull))
+                    let velocity = world.physics.vehicle_velocity(id);
+                    Some((at, velocity, v.spec.hull, v.spec.mass))
                 })
                 .collect();
-            self.scene.people.traffic(&cars);
+            let run_over = self
+                .scene
+                .people
+                .traffic(&cars, self.combat.damage_table.as_ref());
+            if run_over > 0 {
+                eprintln!("run over: {run_over} soldier(s) killed by a vehicle");
+            }
         }
         let scene = &mut self.scene;
         if self.on_foot

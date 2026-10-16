@@ -219,6 +219,9 @@
 //!                           wrecked, both or never; then each model with
 //!                           a wreck whose switched parts show both ways
 //!                           (or those whose name holds a word)
+//! runover                   every vehicle's mass and ram kind, every
+//!                           person's health and damage row: kill speeds
+//!                           and bashes to kill, before and after
 //! vdamage[:<word>,..]       vehicle models: parts, their health, the
 //!                           looks the alpha drew before and the looks
 //!                           their parts reach shot with rifle rounds,
@@ -1092,6 +1095,7 @@ fn main() -> Result<(), Error> {
             "wrecks" => wrecks(&mut source, &names, arg),
             "blends" => blends(&mut source, &names, arg),
             "vdamage" => vdamage(&mut source, &names, arg),
+            "runover" => runover(&mut source, &names, arg),
             "partdata" => partdata(&mut source, &names, arg),
             "treefit" => {
                 if world.is_none() {
@@ -9207,4 +9211,197 @@ fn traffic_census(world: &WorldIndex) {
         "passers-by {}; off the nearest road line (m: walkers) {outs:?}",
         walkers.len()
     );
+}
+
+/// Run-overs and bashes against the damage table (gap round 23): every
+/// vehicle template's mass and `DamageKey`, every person template's
+/// health and `ModifierKey`, the templates whose `DamageKey` is
+/// `MeleeBash`; then, per person row, the speed each vehicle must go to
+/// kill (before: any vehicle at 2.5 m/s; after: `run_over`) and the
+/// bashes to kill (before: 60 a blow; after: times the row's `MeleeBash`).
+fn runover<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    _arg: &str,
+) -> Result<(), Error> {
+    use m2_engine::durability::{RAM_KIND, damage_keys, modifier_keys, run_over};
+    use m2_engine::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable};
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let table = source
+        .asset(m2_assets::name_hash(DAMAGE_TABLE), DAMAGE_TABLE_TYPE)
+        .ok()
+        .and_then(|d| DamageTable::parse(&d));
+    let Some(table) = table else {
+        println!("no damage table");
+        return Ok(());
+    };
+    let key_name = |k: u32| names.get(k).map_or(format!("{k:08x}"), str::to_owned);
+    let dkeys = damage_keys(&db);
+    let mods = modifier_keys(&db);
+    let tuning = m2_engine::tuning::read(&db, Some(&table));
+    // Vehicles: any with a vehicle physics component.
+    let mut vehicles: BTreeMap<u32, (f32, u32)> = BTreeMap::new();
+    for p in VEHICLE_PHYSICS {
+        if let Some(c) = db.component(p) {
+            for (id, _) in c.records().unwrap_or_default() {
+                let Some(mass) = tuning.get(&id).and_then(|t| t.mass) else {
+                    continue;
+                };
+                vehicles.insert(id, (mass, dkeys.get(&id).copied().unwrap_or(0)));
+            }
+        }
+    }
+    let mut by_key: BTreeMap<String, usize> = BTreeMap::new();
+    for (mass, k) in vehicles.values() {
+        let _ = mass;
+        *by_key.entry(key_name(*k)).or_default() += 1;
+    }
+    println!("vehicles\t{}\tby DamageKey {by_key:?}", vehicles.len());
+    // Bash templates.
+    let bash = m2_assets::name_hash("MeleeBash");
+    for (&id, &k) in &dkeys {
+        if k == bash {
+            println!(
+                "bashkey\t{id:08x}\t{}",
+                tnames.get(&id).copied().unwrap_or("?")
+            );
+        }
+    }
+    // People.
+    let people = m2_engine::ai::read(&db);
+    let human = m2_assets::name_hash("Human");
+    let mut rows: BTreeMap<u32, Vec<(u32, f32)>> = BTreeMap::new();
+    for (&id, p) in &people {
+        let row = p
+            .modifier
+            .or_else(|| mods.get(&id).copied())
+            .unwrap_or(human);
+        rows.entry(row).or_default().push((id, p.health));
+    }
+    // Each row: the cells, and over every (vehicle, person) pair the kill
+    // speed.
+    let ram_default = m2_assets::name_hash(RAM_KIND);
+    let speeds = [2.5f32, 5.0, 10.0, 15.0, 20.0, 30.0];
+    let mut pairs = 0usize;
+    let mut killed_before = [0usize; 6];
+    let mut killed_after = [0usize; 6];
+    for (&row, who) in &rows {
+        let cells: Vec<String> = [
+            "Car",
+            "Armor",
+            "MediumArmor",
+            "Tank",
+            "CarMonsterTruck",
+            "MeleeBash",
+        ]
+        .iter()
+        .map(|c| {
+            table
+                .scale(row, m2_assets::name_hash(c))
+                .map_or("-".into(), |v| format!("{c} {v}"))
+        })
+        .collect();
+        let mut hp: Vec<f32> = who.iter().map(|w| w.1).collect();
+        hp.sort_by(f32::total_cmp);
+        let bash_scale = table.scale(row, bash).unwrap_or(1.0);
+        let bashes = |h: f32, per: f32| {
+            if per > 0.0 {
+                (h / per).ceil()
+            } else {
+                f32::INFINITY
+            }
+        };
+        println!(
+            "row\t{}\t{} templates\thealth {}..{}\t{}\tbashes to kill (median hp) {} -> {}",
+            key_name(row),
+            who.len(),
+            hp[0],
+            hp[hp.len() - 1],
+            cells.join(", "),
+            bashes(hp[hp.len() / 2], 60.0),
+            bashes(hp[hp.len() / 2], 60.0 * bash_scale),
+        );
+        if who.len() <= 12 {
+            let list: Vec<String> = who
+                .iter()
+                .map(|(id, h)| format!("{} {h}", tnames.get(id).copied().unwrap_or("?")))
+                .collect();
+            println!("row	{}	who	{}", key_name(row), list.join("; "));
+        }
+        for &(_, h) in who {
+            for (mass, k) in vehicles.values() {
+                let key = if *k == 0 { ram_default } else { *k };
+                pairs += 1;
+                for (i, &v) in speeds.iter().enumerate() {
+                    killed_before[i] += usize::from(v >= 2.5);
+                    killed_after[i] += usize::from(run_over(&table, row, key, *mass, v) >= h);
+                }
+            }
+        }
+    }
+    // Blows to kill each person template: 60 a blow before, times the
+    // row's `MeleeBash` after.
+    let (mut one_before, mut one_after, mut never, mut all) = (0, 0, 0, 0);
+    for (&row, who) in &rows {
+        let scale = table.scale(row, bash).unwrap_or(1.0);
+        for &(_, h) in who {
+            all += 1;
+            one_before += usize::from(60.0 >= h);
+            if scale <= 0.0 {
+                never += 1;
+            } else {
+                one_after += usize::from(60.0 * scale >= h);
+            }
+        }
+    }
+    println!("bash\tone blow kills {one_before}/{all} -> {one_after}/{all}; never {never}");
+    println!("pairs\t{pairs} (person template x vehicle template)");
+    for (i, v) in speeds.iter().enumerate() {
+        println!(
+            "killed at {v} m/s\t{:.3} -> {:.3}",
+            killed_before[i] as f64 / pairs as f64,
+            killed_after[i] as f64 / pairs as f64
+        );
+    }
+    // Named examples.
+    for (vn, pn) in [
+        ("Valiant", "VZ Soldier"),
+        ("Valiant", "VZ Heavy (RPG)"),
+        ("AMX30", "VZ Soldier"),
+    ] {
+        let v = vehicles
+            .iter()
+            .find(|(id, _)| tnames.get(id).copied() == Some(vn));
+        let p = people
+            .iter()
+            .find(|(id, _)| tnames.get(id).copied() == Some(pn));
+        if let (Some((_, &(mass, k))), Some((pid, prof))) = (v, p) {
+            let row = prof
+                .modifier
+                .or_else(|| mods.get(pid).copied())
+                .unwrap_or(human);
+            let key = if k == 0 { ram_default } else { k };
+            let per = run_over(&table, row, key, mass, 1.0);
+            println!(
+                "example\t{vn} ({mass} kg, {}) on {pn} ({} hp, {}): kills from {:.1} m/s",
+                key_name(key),
+                prof.health,
+                key_name(row),
+                prof.health / per.max(1e-6)
+            );
+        }
+    }
+    Ok(())
 }
