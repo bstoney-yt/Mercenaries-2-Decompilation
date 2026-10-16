@@ -393,6 +393,10 @@ pub struct ScriptWorld {
     /// Drop and landing zone tests asked for (`Ai.TestDropZone`): the
     /// callback to answer and the spot tested.
     drop_tests: Vec<(Function, [f32; 3])>,
+    /// Assets asked for with a callback (`Pg.LoadAsset(name, type,
+    /// callback, data)`): answered as loaded on the next tick
+    /// ([`answer_asset_loads`]).
+    asset_loads: Vec<(Function, Value)>,
     /// The outlines of region objects (`LineRegion`), by the region's guid;
     /// placed at the object's position and yaw.
     pub regions: HashMap<u32, m2_assets::Region>,
@@ -834,6 +838,29 @@ pub fn answer_drop_tests(world: &Shared) -> Vec<mlua::Error> {
     let mut errors = Vec::new();
     for (f, [x, y, z]) in tests {
         if let Err(e) = f.call::<()>((true, x, y, z)) {
+            errors.push(e);
+        }
+    }
+    errors
+}
+
+/// Tells the scripts the assets they asked for have loaded: each load's
+/// callback with its data unpacked, as `MrxUtil.CallWithOptionalArgs`
+/// calls it (a table's items, else the value itself). The callbacks take
+/// that shape (`MrxBriefing`'s takes the asset's name and false for "not
+/// timed out", `MrxStarter`'s its name, type and false, `MrxUtil.
+/// LoadingCallback` its counter); their own 15 s timers give the same call
+/// with true. Returns any errors.
+pub fn answer_asset_loads(world: &Shared) -> Vec<mlua::Error> {
+    let loads = std::mem::take(&mut world.borrow_mut().asset_loads);
+    let mut errors = Vec::new();
+    for (f, data) in loads {
+        let args: Vec<Value> = match data {
+            Value::Table(t) => t.sequence_values().filter_map(Result::ok).collect(),
+            Value::Nil => Vec::new(),
+            other => vec![other],
+        };
+        if let Err(e) = f.call::<()>(MultiValue::from_vec(args)) {
             errors.push(e);
         }
     }
@@ -1684,9 +1711,12 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([Value::Table(t)])
     })?;
     // Riders change seats at once here, so seat events see it on the next
-    // update; the command lets the game animate it.
+    // update; the command lets the game animate it. Vehicle.Exit(vehicle,
+    // rider, instant): all 21 calls in the scripts pass the vehicle first
+    // (`Vehicle.GetFromRider(hero)`, `Player.GetControlledObject`) and the
+    // rider second; a lone argument is the rider.
     add(&vehicle, "Exit", |w, _, a| {
-        if let Some(guid) = id(a.first()) {
+        if let Some(guid) = id(a.get(1)).or_else(|| id(a.first())) {
             if let Some(o) = w.objects.get_mut(&guid) {
                 o.vehicle = None;
                 o.seated_instantly = false;
@@ -1822,6 +1852,19 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
             _ => values([Value::Boolean(false)]),
         }
     })?;
+    // Pg.LoadAsset(name, type[, callback, data]): the alpha reads what it
+    // draws itself, so every asset is there at once; a callback hears so
+    // on the next tick ([`answer_asset_loads`]). Of the scripts' calls,
+    // most preload (name and type); four pass a callback: the HQ's starter
+    // and its briefing wait on them before the screen comes down.
+    add(&pg, "LoadAsset", |w, _, a| {
+        if let Some(Value::Function(f)) = a.get(2) {
+            w.asset_loads
+                .push((f.clone(), a.get(3).cloned().unwrap_or(Value::Nil)));
+        }
+        values([])
+    })?;
+    add(&pg, "UnloadAsset", |_, _, _| values([]))?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -2869,10 +2912,51 @@ mod tests {
         assert!(events.update_shared(0.1, &world).is_empty());
         let log: String = host.lua().globals().get("log").unwrap();
         assert_eq!(log, "car ");
-        host.lua().load("Vehicle.Exit(1)").exec().unwrap();
+        // The vehicle first, then its rider, as the scripts call it.
+        host.lua().load("Vehicle.Exit(50, 1, true)").exec().unwrap();
         assert!(events.update_shared(0.1, &world).is_empty());
         let log: String = host.lua().globals().get("log").unwrap();
         assert_eq!(log, "car out ");
+        assert_eq!(world.borrow().objects.get(&1).and_then(|o| o.vehicle), None);
+    }
+
+    #[test]
+    fn asset_loads_call_back_with_their_data_unpacked() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                r#"
+                log = {}
+                Pg.LoadAsset("preload", "animation")
+                Pg.LoadAsset("fx", "facefxanimationset", function(name, timed_out)
+                    table.insert(log, name .. " " .. tostring(timed_out))
+                end, { "fx", false })
+                local counter = { n = 1 }
+                Pg.LoadAsset("bank", "soundbank", function(t)
+                    t.n = t.n - 1
+                    table.insert(log, "counter " .. t.n)
+                end, { counter })
+                Pg.UnloadAsset("preload", "animation")
+                "#,
+            )
+            .exec()
+            .unwrap();
+        // Nothing yet: the load answers on the next tick.
+        let count = |host: &ScriptHost| host.lua().load("return #log").eval::<i64>().unwrap();
+        assert_eq!(count(&host), 0);
+        assert!(answer_asset_loads(&world).is_empty());
+        let log: Vec<String> = host
+            .lua()
+            .globals()
+            .get::<Table>("log")
+            .unwrap()
+            .sequence_values()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(log, ["fx false", "counter 0"]);
+        // Each once.
+        assert!(answer_asset_loads(&world).is_empty());
+        assert_eq!(count(&host), 2);
     }
 
     #[test]
