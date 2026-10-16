@@ -1672,6 +1672,12 @@ impl Autoplay {
             self.hops.len(),
             game.scene.people.fight_summary()
         );
+        eprintln!(
+            "autoplay tally {:.1} s: {}; {}",
+            self.clock,
+            game.combat.tally.line(game.combat.fired.rifle),
+            game.scene.people.idle.line()
+        );
     }
 
     /// A summary for the end of the run.

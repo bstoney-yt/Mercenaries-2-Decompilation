@@ -2821,10 +2821,18 @@ fn mission_for_screenshot(
         if contract_done.is_some() && i % (5.0 / tick).round() as u32 == 0 {
             let view = link.view();
             eprintln!(
-                "after contract: {:.0} s, she is at {:.1}, objectives {:?}",
+                "after contract: {:.0} s, she is at {:.1}, health {:.0}, objectives {:?}",
                 i as f32 * tick,
                 game.focus(),
+                game.combat.hp,
                 view.objectives
+            );
+            eprintln!(
+                "after contract tally {:.0} s: {}; {}; {}",
+                i as f32 * tick,
+                game.combat.tally.line(game.combat.fired.rifle),
+                game.scene.people.idle.line(),
+                game.scene.people.fight_summary()
             );
         }
         // And the strike is pictured 2 s and 6 s after its first ordnance
