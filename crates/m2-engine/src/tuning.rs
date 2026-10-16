@@ -59,6 +59,9 @@ pub struct VehicleTuning {
     pub flight: Option<FlightTuning>,
     /// A boat's engine and the water's drag on it (`_BoatPhysics`).
     pub boat: Option<BoatTuning>,
+    /// A motorbike's balance and damping (`_CarPhysicsV2`'s `Bike*`
+    /// fields).
+    pub bike: Option<BikeTuning>,
     /// How far behind a helicopter its pilot's camera sits, metres, and
     /// how far it looks down, radians (`CameraHelicopter`'s field
     /// `ee30a43d`, name unknown: 20 for the light helicopters, 39 for the
@@ -157,6 +160,46 @@ impl BoatTuning {
             ahead
         }
     }
+}
+
+/// How a motorbike holds itself up, from its `_CarPhysicsV2`'s `Bike*`
+/// fields (names found by hash, gap round 17; read here gap round 18;
+/// the Offroad Motorcycle (AL)'s values in brackets, the range over the
+/// 11 distinct bike records after them). Only bikes give them (every
+/// other record's `BikeRollStabilityStrength` is 0).
+///
+/// Read as the suspension's strengths and damps are, per kilogram the
+/// bike weighs (inferred from samples, not checked against the game's
+/// code): a torque of strength x lean x mass, newton-metres. Gravity
+/// tips a bike with 9.81 x its centre of mass's height (0.33 to 0.48 m
+/// in the alpha's bodies), 3.3 to 4.7 N m/kg a radian, so even the
+/// weakest record (the player's off-road bike's 10) holds itself up
+/// twice over, and the AI's 100 and the street `Motorcycle`'s 250 with
+/// room to spare. Read the other way, as a turning acceleration per
+/// radian, the five records at 10 to 20 barely beat gravity: shoved at
+/// speed they hang leaning over 3 degrees for 6 s (biketest, gap round
+/// 18), where per kilogram every bike stands back up within 1.7 s. The damps against
+/// its roll, pitch and yaw, and its control in the air, read per
+/// kilogram alike: in the air its stick then turns it at control / damp
+/// rad/s, 0.2 to 0.5 for the nose (the AI-only bike's 3.5).
+///
+/// Named but not read: `BikeWheeliePitch` (0.85; 0.5 to 1) and
+/// `BikeWheelieSideDamp` (10; 10 throughout), as the alpha has no
+/// wheelie. The four fields between them (@148 to @154) are unnamed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BikeTuning {
+    /// What holds it up towards the lean that balances its turn,
+    /// newton-metres per radian off it, per kilogram
+    /// (`BikeRollStabilityStrength` 10; 10 to 250).
+    pub roll: f32,
+    /// Damping against its roll, pitch and yaw, newton-metres per rad/s,
+    /// per kilogram (`BikeExtraDampRoll` 6, `BikeExtraDampPitch` 10,
+    /// `BikeExtraDampYaw` 0; 5 to 50, 10 throughout, 0 to 3).
+    pub damp: [f32; 3],
+    /// In the air, what its stick turns its nose and its heading with,
+    /// newton-metres per kilogram at full stick (`BikeAirControlPitch`
+    /// 2, `BikeAirControlYaw` 1.5; 1 to 35, 1.5 to 4).
+    pub air: (f32, f32),
 }
 
 /// A wheeled vehicle's engine and gearbox, from its `_CarPhysicsV2`
@@ -923,6 +966,20 @@ pub fn read(db: &Layer<'_>, damage: Option<&DamageTable>) -> HashMap<u32, Vehicl
                     };
                     (b.torque.0 > 0.0 && b.drag[0] > 0.0).then_some(b)
                 })(),
+                bike: (|| {
+                    let r = *car.of_template(id).first()?;
+                    let f = |name| car.float(r, name_hash(name)).filter(|v| *v >= 0.0);
+                    let b = BikeTuning {
+                        roll: f("BikeRollStabilityStrength")?,
+                        damp: [
+                            f("BikeExtraDampRoll")?,
+                            f("BikeExtraDampPitch")?,
+                            f("BikeExtraDampYaw")?,
+                        ],
+                        air: (f("BikeAirControlPitch")?, f("BikeAirControlYaw")?),
+                    };
+                    (b.roll > 0.0).then_some(b)
+                })(),
                 chase: (|| {
                     let records = heli_camera.of_template(id);
                     let seat = name_hash("SeatName");
@@ -1077,9 +1134,14 @@ mod tests {
             ("PitchDownInertia", 0xe125_7555),
             ("HandbrakeInertia", 0x83d7_b1ab),
             ("HandbrakeSteerBoost", 0x8572_4b6b),
-            // `_CarPhysicsV2`'s bike fields: named, unused.
+            // `_CarPhysicsV2`'s bike fields (gap round 18); the
+            // wheelie's named, unused.
             ("BikeRollStabilityStrength", 0x215f_7ff3),
             ("BikeExtraDampRoll", 0x0e1e_7f73),
+            ("BikeExtraDampPitch", 0x118c_dd84),
+            ("BikeExtraDampYaw", 0xc0d6_6bd3),
+            ("BikeWheeliePitch", 0x2943_a829),
+            ("BikeWheelieSideDamp", 0xdb84_6836),
             ("BikeAirControlPitch", 0x280f_15d5),
             ("BikeAirControlYaw", 0x1f16_345a),
             // `Rotor`: its hub node, and which way it spins (1 or -1);
