@@ -1543,7 +1543,7 @@ mod tests {
             flags: 0,
             textures: vec![texture],
             technique: 0,
-            unk_tail: 0,
+            surface: 0,
         }
     }
 

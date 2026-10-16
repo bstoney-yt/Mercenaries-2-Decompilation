@@ -341,6 +341,10 @@ const AIM_AFTER_SHOT: f32 = 0.6;
 /// Muzzle flashes: how long they last (a few frames) and how far they
 /// reach from the muzzle, metres. Invented, to look like the game's.
 const FLASH_TIME: f32 = 0.05;
+/// A round's impact is set off this far short of where it strikes,
+/// metres, so it shows off the face rather than half inside it
+/// (invented).
+const IMPACT_BACK: f32 = 0.05;
 const RIFLE_FLASH: f32 = 0.3;
 const RPG_FLASH: f32 = 0.7;
 const MG_FLASH: f32 = 0.45;
@@ -1472,6 +1476,12 @@ pub struct Combat {
     pub flashes: (u32, u32),
     /// Spent cases thrown out (each its gun's `ShellEjectTemplate`).
     pub cases: u32,
+    /// Rounds that struck the world and threw up an impact: the one
+    /// their surface's word names, or the generic one standing in
+    /// ([`m2_engine::surface::bullet_impact`]).
+    pub impacts: (u32, u32),
+    /// Those impacts by template.
+    pub impact_kinds: std::collections::BTreeMap<&'static str, u32>,
     /// What the fighting has come to (for checking).
     pub tally: Tally,
     /// Hurts since [`take_hurts`](Self::take_hurts): damage and where
@@ -1652,6 +1662,8 @@ impl Default for Combat {
             shots: std::collections::BTreeMap::new(),
             flashes: (0, 0),
             cases: 0,
+            impacts: (0, 0),
+            impact_kinds: std::collections::BTreeMap::new(),
             tally: Tally::default(),
             hurts: Vec::new(),
         }
@@ -2194,7 +2206,8 @@ impl Combat {
             .map(|(&(set, hero), n)| format!("{set:08x}{} {n}", if hero { " (hero)" } else { "" }))
             .collect();
         format!(
-            "shots by sound set: {}; flashes: {} the game's, {} the alpha's own; cases {}",
+            "shots by sound set: {}; flashes: {} the game's, {} the alpha's own; cases {}; \
+             impacts {} by surface, {} generic ({})",
             if sets.is_empty() {
                 "none".to_owned()
             } else {
@@ -2202,8 +2215,40 @@ impl Combat {
             },
             self.flashes.0,
             self.flashes.1,
-            self.cases
+            self.cases,
+            self.impacts.0,
+            self.impacts.1,
+            self.impact_kinds
+                .iter()
+                .map(|(t, n)| format!("{} {n}", t.trim_start_matches("global_particle_impact_")))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
+    }
+
+    /// A round from `from` along `dir` striking the world `t` metres on:
+    /// it throws up the impact for what the triangle it struck is made of
+    /// ([`m2_engine::surface::bullet_impact`]), and this is what it
+    /// struck, if one of the scene's.
+    fn strike_world(
+        &mut self,
+        physics: &Physics,
+        from: Vec3,
+        dir: Vec3,
+        t: f32,
+    ) -> Option<StaticKey> {
+        let (key, surface) = physics
+            .cast_ray_surface(from, dir, t + 0.05)
+            .map_or((None, 0), |(_, _, key, surface)| (key, surface));
+        let (template, named) = m2_engine::surface::bullet_impact(surface);
+        if named {
+            self.impacts.0 += 1;
+        } else {
+            self.impacts.1 += 1;
+        }
+        *self.impact_kinds.entry(template).or_default() += 1;
+        self.show_fx(template, from + dir * (t - IMPACT_BACK).max(0.0));
+        key
     }
 
     /// Sets off the effects template `name` shows at `at`, once.
@@ -2582,10 +2627,7 @@ impl Combat {
         if let Some((t, None)) = hit {
             self.round_on_vehicle(f, (from, aim, t), (damage, round), None);
             self.hit_explosives_in(f.explosives, from + aim * t, on_props);
-            let key = f
-                .physics
-                .cast_ray_keyed(from, aim, t + 0.05)
-                .and_then(|(_, _, key)| key);
+            let key = self.strike_world(f.physics, from, aim, t);
             self.struck.push(Strike {
                 at: from + aim * t,
                 damage: on_props,
@@ -2650,11 +2692,9 @@ impl Combat {
             if let Some((t, None)) = hit {
                 self.round_on_vehicle(f, (eye, dir, t), (damage, round), None);
                 self.hit_explosives_in(f.explosives, eye + dir * t, on_props);
-                // What it hit, if the scene's (a crate takes the round).
-                let key = f
-                    .physics
-                    .cast_ray_keyed(eye, dir, t + 0.05)
-                    .and_then(|(_, _, key)| key);
+                // What it hit, if the scene's (a crate takes the round),
+                // and the impact it throws up.
+                let key = self.strike_world(f.physics, eye, dir, t);
                 self.struck.push(Strike {
                     at: eye + dir * t,
                     damage: on_props,
@@ -4533,6 +4573,44 @@ mod tests {
     use super::*;
     use crate::npc::tests::{ground, rig};
     use crate::npc::{Brain, Npc};
+
+    #[test]
+    fn rounds_striking_the_world_throw_up_their_surfaces_impact() {
+        let mut physics = Physics::new();
+        let v = [
+            Vec3::new(-5.0, 0.0, -5.0),
+            Vec3::new(5.0, 0.0, -5.0),
+            Vec3::new(5.0, 0.0, 5.0),
+            Vec3::new(-5.0, 0.0, 5.0),
+        ];
+        let metal = m2_assets::name_hash("METAL");
+        let floor =
+            m2_engine::CollisionShape::mesh_of(&v, &[[0, 2, 1], [0, 3, 2]], &[metal; 2]).unwrap();
+        physics.add_static(StaticKey::Cell(3), &floor, Vec3::ZERO, Quat::IDENTITY);
+        let bare = m2_engine::CollisionShape::mesh(&v, &[[0, 2, 1], [0, 3, 2]]).unwrap();
+        physics.add_static(
+            StaticKey::Cell(4),
+            &bare,
+            Vec3::new(20.0, 0.0, 0.0),
+            Quat::IDENTITY,
+        );
+        physics.step(1.0 / 60.0);
+        let mut combat = Combat::default();
+        let from = Vec3::new(0.0, 2.0, 0.0);
+        let key = combat.strike_world(&physics, from, Vec3::NEG_Y, 2.0);
+        assert_eq!(key, Some(StaticKey::Cell(3)));
+        let shown = |c: &Combat| match &c.game_fx.last().unwrap().template {
+            FxTemplate::Name(n) => n.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(shown(&combat), "global_particle_impact_bullet_metal");
+        // Just short of the floor, off its face.
+        assert!((combat.game_fx[0].at.y - IMPACT_BACK).abs() < 1e-4);
+        // Ground that says nothing throws up the generic impact.
+        combat.strike_world(&physics, from + Vec3::X * 20.0, Vec3::NEG_Y, 2.0);
+        assert_eq!(shown(&combat), m2_engine::surface::GENERIC_IMPACT);
+        assert_eq!(combat.impacts, (1, 1));
+    }
 
     /// A pose standing side-on, as the game's aim clip does: the rifle
     /// (right hand to left) points along +x while the body faces +z.
