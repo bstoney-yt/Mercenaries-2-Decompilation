@@ -58,6 +58,29 @@ pub struct EditText {
 }
 
 impl EditText {
+    /// `textWidth` and `textHeight` of `text` in this field, estimated
+    /// without the font: each character 0.55 of the font's height wide,
+    /// each line 1.2 high, and a word-wrapped field's paragraphs as many
+    /// lines as that width needs inside its 2 px gutters (inferred; a
+    /// two-line hint in the loading screen's field comes out two lines).
+    pub fn text_size(&self, text: &str) -> (f32, f32) {
+        let h = self.height;
+        let inside = (self.bounds[2] - self.bounds[0] - 4.0).max(1.0);
+        let mut longest: f32 = 0.0;
+        let mut lines = 0.0;
+        for paragraph in text.split(['\n', '\r']) {
+            let w = paragraph.chars().count() as f32 * h * 0.55;
+            if self.word_wrap && w > inside {
+                lines += (w / inside).ceil();
+                longest = longest.max(inside);
+            } else {
+                lines += 1.0;
+                longest = longest.max(w);
+            }
+        }
+        (longest, f32::max(lines, 1.0) * h * 1.2)
+    }
+
     /// Parses a `DefineEditText` tag's body.
     pub fn parse(data: &[u8]) -> Option<(u16, EditText)> {
         if data.len() < 6 {
@@ -450,35 +473,20 @@ pub fn plain(text: &str, html: bool) -> (String, Option<[f32; 4]>) {
     (out.trim_end_matches('\n').to_owned(), colour)
 }
 
-/// Lays out `text` in the field `def` with `font`, as textured quads
-/// (two triangles each), through `matrix` and `colour`, cut to `clip`.
-#[allow(clippy::too_many_arguments)]
-pub fn layout(
-    def: &EditText,
-    text: &str,
-    subs: &[Substitution],
-    font: &Font,
-    matrix: &Matrix,
-    colour: &ColourTransform,
-    clip: Option<[f32; 4]>,
-    out: &mut Vec<Triangle>,
-) {
-    let Some((texture, tex_size, nominal, glyphs)) = &font.texture else {
-        return;
-    };
-    let (text, html_colour) = plain(text, def.html);
+/// `text` (plain) in lines as the field `def` shows it with `font`: its
+/// own lines, word-wrapped fields' also wrapped at spaces to the box.
+fn wrap(def: &EditText, text: &str, subs: &[Substitution], font: &Font) -> Vec<String> {
     let size = def.height;
-    let tint = colour.apply(html_colour.unwrap_or(def.colour));
-    if tint[3] <= 0.0 || size <= 0.0 {
-        return;
-    }
     let width = (def.bounds[2] - def.bounds[0] - def.left_margin - def.right_margin).max(1.0);
-    let advance = |p: Piece| match p {
-        Piece::Char(c) => font.advance(c) * size,
-        Piece::Image(i) => subs[i].size[0],
+    let measure = |s: &str| -> f32 {
+        pieces(s, subs)
+            .into_iter()
+            .map(|p| match p {
+                Piece::Char(c) => font.advance(c) * size,
+                Piece::Image(i) => subs[i].size[0],
+            })
+            .sum()
     };
-    let measure = |s: &str| -> f32 { pieces(s, subs).into_iter().map(advance).sum() };
-    // Lines: the text's own, then wrapped at spaces to the box.
     let mut lines: Vec<String> = Vec::new();
     for line in text.split('\n') {
         if !def.word_wrap {
@@ -506,6 +514,51 @@ pub fn layout(
         }
         lines.push(current);
     }
+    lines
+}
+
+/// `textWidth` and `textHeight` of `text` in the field `def` with `font`:
+/// its widest line, and its lines' height as [`layout`] spaces them.
+pub fn measure(def: &EditText, text: &str, font: &Font) -> (f32, f32) {
+    let (text, _) = plain(text, def.html);
+    let size = def.height;
+    let lines = wrap(def, &text, &[], font);
+    let widest = lines
+        .iter()
+        .map(|l| l.chars().map(|c| font.advance(c) * size).sum::<f32>())
+        .fold(0.0, f32::max);
+    let line_height = (font.ascent + font.descent).max(1.0) * size + def.leading;
+    (widest, lines.len().max(1) as f32 * line_height)
+}
+
+/// Lays out `text` in the field `def` with `font`, as textured quads
+/// (two triangles each), through `matrix` and `colour`, cut to `clip`.
+#[allow(clippy::too_many_arguments)]
+pub fn layout(
+    def: &EditText,
+    text: &str,
+    subs: &[Substitution],
+    font: &Font,
+    matrix: &Matrix,
+    colour: &ColourTransform,
+    clip: Option<[f32; 4]>,
+    out: &mut Vec<Triangle>,
+) {
+    let Some((texture, tex_size, nominal, glyphs)) = &font.texture else {
+        return;
+    };
+    let (text, html_colour) = plain(text, def.html);
+    let size = def.height;
+    let tint = colour.apply(html_colour.unwrap_or(def.colour));
+    if tint[3] <= 0.0 || size <= 0.0 {
+        return;
+    }
+    let width = (def.bounds[2] - def.bounds[0] - def.left_margin - def.right_margin).max(1.0);
+    let advance = |p: Piece| match p {
+        Piece::Char(c) => font.advance(c) * size,
+        Piece::Image(i) => subs[i].size[0],
+    };
+    let lines = wrap(def, &text, subs, font);
     let ascent = if font.ascent > 0.0 { font.ascent } else { 0.8 } * size;
     let line_height = (font.ascent + font.descent).max(1.0) * size + def.leading;
     // Flash puts the first baseline 2 px in and down by the ascent.

@@ -430,6 +430,9 @@ pub struct Player {
     /// Looks up the text ids in what text fields show (`[0x129ee2f1]`), as
     /// the game's translator does when they draw; the scripts keep the ids.
     pub translate: Option<Translator>,
+    /// The fonts its text is drawn with, if the scripts may measure it
+    /// (`textWidth`, `textHeight`); else those are estimated.
+    pub fonts: Option<Rc<FontBook>>,
 }
 
 /// Text as drawn from text as set ([`Player::translate`]).
@@ -455,6 +458,7 @@ impl Player {
             clock: 0.0,
             scripts: Vec::new(),
             translate: None,
+            fonts: None,
         };
         p.goto(0, 0);
         p
@@ -530,8 +534,32 @@ impl Player {
         if entered && frame == from {
             return;
         }
+        // Going back, an instance the timeline has at the same depth with
+        // the same character at the target frame stays (with what scripts
+        // set on it, such as a text field's text), as Flash keeps it: by
+        // depth, the frame its placement there was made on.
+        let mut kept: HashMap<i32, usize> = HashMap::new();
         let start = if !entered || frame < from {
-            // Back to the start: what the timeline placed goes.
+            let mut target: HashMap<i32, (u16, usize)> = HashMap::new();
+            for (f, controls) in timeline.frames.iter().enumerate().take(frame + 1) {
+                for control in controls {
+                    match control {
+                        Control::Place(p) => {
+                            let depth = i32::from(p.depth) + TIMELINE_DEPTH;
+                            if let Some(ch) = p.character
+                                && (p.moving || !target.contains_key(&depth))
+                            {
+                                target.insert(depth, (ch, f));
+                            }
+                        }
+                        Control::Remove(d) => {
+                            target.remove(&(i32::from(*d) + TIMELINE_DEPTH));
+                        }
+                        Control::Script(_) => {}
+                    }
+                }
+            }
+            // What the timeline placed goes, but for those.
             let placed: Vec<(i32, ClipId)> = c
                 .children
                 .iter()
@@ -539,7 +567,13 @@ impl Player {
                 .map(|(d, k)| (*d, *k))
                 .collect();
             for (depth, child) in placed {
-                self.remove(id, depth, child);
+                let same = self.clip(child).map(|k| k.character);
+                match target.get(&depth) {
+                    Some(&(ch, born)) if entered && same == Some(ch) => {
+                        kept.insert(depth, born);
+                    }
+                    _ => self.remove(id, depth, child),
+                }
             }
             0
         } else {
@@ -547,8 +581,23 @@ impl Player {
         };
         for f in start..=frame {
             for control in &timeline.frames[f] {
+                let depth_of = |d: u16| i32::from(d) + TIMELINE_DEPTH;
                 match control {
-                    Control::Place(p) => self.place(id, p),
+                    Control::Place(p) => match kept.get(&depth_of(p.depth)) {
+                        // Before a kept instance was placed: not its.
+                        Some(&born) if f < born => {}
+                        // Its placement: only what it sets.
+                        Some(&born) if f == born => self.place(
+                            id,
+                            &Place {
+                                character: None,
+                                moving: true,
+                                ..p.clone()
+                            },
+                        ),
+                        _ => self.place(id, p),
+                    },
+                    Control::Remove(d) if kept.get(&depth_of(*d)).is_some_and(|&b| f < b) => {}
                     Control::Remove(depth) => {
                         let depth = i32::from(*depth) + TIMELINE_DEPTH;
                         if let Some(child) =
