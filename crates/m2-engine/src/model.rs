@@ -904,7 +904,7 @@ const TRACK_UV_PER_METRE: f32 = 0.5;
 /// The texture offset per metre a track run by the range `first`, `count`
 /// of `piece` needs: along whichever of u and v runs the length of the
 /// vehicle (z), so the AMX-30's u-wise track doesn't scroll sideways as
-/// a v-wise one would (Brendan's play-test), at the texture's own rate
+/// a v-wise one would (a play-test), at the texture's own rate
 /// along the vehicle (units per metre). Its sign is taken from the
 /// lower run, which must move back as the vehicle goes forward (+z,
 /// inferred); without readable positions and texture coordinates, v.
