@@ -140,6 +140,8 @@ m2-alpha [options]
   --closeup              with --screenshot on foot: the picture from close by
                          her right side, to see her hands
   --pda                  with --screenshot: the picture with her PDA open
+  --binoculars <zoom>    with --screenshot: the picture through her
+                         binoculars at zoom 1..7, their screen up
   --pause                with --screenshot: the picture with the game's
                          pause menu open, --pda-key's keys typed into it
                          one by one (a third of a second apart)

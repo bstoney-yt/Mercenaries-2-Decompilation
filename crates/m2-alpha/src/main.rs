@@ -39,6 +39,7 @@
 //! throws a grenade.
 
 mod autoplay;
+mod binoculars;
 mod breakables;
 mod cache;
 mod camera;
@@ -232,6 +233,9 @@ struct Options {
     satellite: Option<SatelliteShot>,
     /// With `--screenshot`: the picture with her PDA open.
     pda: bool,
+    /// With `--screenshot` on foot: the picture through her binoculars at
+    /// this zoom, their screen up ([`binoculars`]).
+    binoculars: Option<u8>,
     /// With `--screenshot`: the picture with the game's pause menu open,
     /// `--pda-key`'s keys typed into it one by one.
     pause: bool,
@@ -543,6 +547,13 @@ fn parse_args() -> anyhow::Result<Options> {
             "--closeup" => o.closeup = true,
             "--pda" => o.pda = true,
             "--pause" => o.pause = true,
+            "--binoculars" => {
+                o.binoculars = Some(
+                    value()?
+                        .parse()
+                        .context("--binoculars expects a zoom level")?,
+                )
+            }
             "--pda-key" => o.pda_keys.push(
                 value()?
                     .parse()
@@ -1481,6 +1492,13 @@ fn screenshot(
             game.combat
                 .hurt_from(15.0, at + (ahead * c + right * s) * 10.0);
         }
+    }
+    if let Some(zoom) = options.binoculars
+        && let Some(p) = game.scene.player.as_mut()
+    {
+        let mut b = binoculars::Binoculars::default();
+        b.step(i32::from(zoom) - i32::from(b.zoom));
+        p.binoculars = Some(b);
     }
     if options.pda {
         game.support.pda = true;

@@ -12,6 +12,7 @@ use m2_engine::{
 use m2_math::glam::{Mat4, Quat, Vec2, Vec3, Vec4, Vec4Swizzles};
 use m2_render::View;
 
+use crate::binoculars::Binoculars;
 use crate::camera::FlyCamera;
 use crate::combat::{self, Combat, Effect, Field, Weapon};
 use crate::config::CameraConfig;
@@ -500,9 +501,17 @@ impl Game {
         }
         if self.on_foot {
             let mut intent = Intent::from_input(input, config, mouse_look);
+            let toggle = input.take_pressed(Action::Binoculars);
+            let zoom = i32::from(input.take_pressed(Action::ZoomIn))
+                - i32::from(input.take_pressed(Action::ZoomOut));
+            let switch = input.take_pressed(Action::SwitchWeapon);
+            if self.binoculars(toggle, zoom, switch, &mut intent) {
+                self.step(intent, dt);
+                return;
+            }
             // The pad's switch: the other of the rifle and what she
             // carries in the launcher's place.
-            if input.take_pressed(Action::SwitchWeapon) && intent.trigger.select.is_none() {
+            if switch && intent.trigger.select.is_none() {
                 intent.trigger.select = Some(match self.combat.weapon {
                     Weapon::Rifle => Weapon::Rpg,
                     _ => Weapon::Rifle,
@@ -510,9 +519,46 @@ impl Game {
             }
             self.step(intent, dt);
         } else {
+            if let Some(p) = self.scene.player.as_mut() {
+                p.binoculars = None;
+            }
             self.camera.update(input, config, mouse_look, dt);
             self.step(Intent::default(), dt);
         }
+    }
+
+    /// Her binoculars ([`crate::binoculars`]): `toggle` puts them up or
+    /// down, `zoom` steps their zoom (the wheel) and `switch` steps it up
+    /// and round (Tab, the pad's right bumper). They come up only on
+    /// foot, standing, with no support call or PDA in hand, and go down
+    /// when that changes or the support menu or PDA is asked for. While
+    /// they are up she stands and only looks, slower by the zoom: `intent`
+    /// is cut down to that, and true is returned.
+    fn binoculars(&mut self, toggle: bool, zoom: i32, switch: bool, intent: &mut Intent) -> bool {
+        let busy = self.support.busy() || self.support.pda;
+        let Some(player) = self.scene.player.as_mut() else {
+            return false;
+        };
+        let free = player.driving.is_none() && !player.down && player.landed && !busy;
+        let wanted = intent.trigger.support || intent.trigger.pda;
+        player.binoculars = match player.binoculars {
+            Some(_) if toggle || !free || wanted => None,
+            None if toggle && free => Some(Binoculars::default()),
+            b => b,
+        };
+        let Some(b) = &mut player.binoculars else {
+            return false;
+        };
+        b.step(zoom);
+        if switch && zoom == 0 {
+            b.cycle();
+        }
+        let look = intent.look * b.look_scale();
+        *intent = Intent {
+            look,
+            ..Intent::default()
+        };
+        true
     }
 
     /// The scripts moved her from `from` to `to`: past [`FAR_TELEPORT`]
@@ -1746,7 +1792,7 @@ impl Game {
         self.on_foot = !self.on_foot;
     }
 
-    fn walking(&self) -> Option<&crate::player::Player> {
+    pub fn walking(&self) -> Option<&crate::player::Player> {
         self.scene.player.as_ref().filter(|_| self.on_foot)
     }
 
