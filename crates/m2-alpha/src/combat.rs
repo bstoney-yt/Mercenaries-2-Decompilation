@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use m2_engine::tuning::DamageTable;
-use m2_engine::weapons::{Ammo, Blast, Feel, Flight, Throwable, WeaponSpec};
+use m2_engine::weapons::{Ammo, Blast, Feel, Flight, SoldierSpread, Throwable, WeaponSpec};
 use m2_engine::{GpuModel, Physics, Skeleton, StaticKey, VehicleId};
 use m2_math::glam::{Mat4, Quat, Vec3};
 
@@ -384,8 +384,9 @@ const NPC_DAMAGE: f32 = 9.0 * 0.25;
 // `Health` with 7, 13 and 10 rounds; 6 a round needs 13 hits, so a kill in
 // 7 rounds needs at least 1.79 times). At 3, five hits kill at up to 15 m,
 // and the footage's rounds per kill hold the misses.
-/// A VZ soldier's `Accuracy`, which the shot spread above was tuned for.
-const VZ_ACCURACY: f32 = 0.4;
+/// A soldier's gun's `LowSkillScatter` when his template names no gun
+/// (the Assault Rifle's 1.5 degrees, as its round stands in above).
+const NPC_CONE: f32 = 1.5;
 /// What blasts do to her, of their damage: the game's damage table's
 /// `Hero` row (all three heroes' `ModifierKey`) for the blasts'
 /// `DamageKey`s. Her grenades', rockets', tank shells' and C4's
@@ -2735,18 +2736,14 @@ impl Combat {
             _ => (n.chest(), None),
         };
         let distance = from.distance(aim);
-        // Spread grows with range: about a third hit at 20 m for a VZ
-        // soldier (`Accuracy` 0.4); the more accurate miss by less
-        // (inferred: by what they lack of a perfect 1).
-        let spread = (0.02 + distance * 0.004)
-            * ((1.0 - n.accuracy()) / (1.0 - VZ_ACCURACY)).clamp(0.2, 2.0);
-        let dir = ((aim - from).normalize_or_zero()
-            + Vec3::new(
-                self.random() * spread * 2.0,
-                self.random() * spread,
-                self.random() * spread * 2.0,
-            ))
-        .normalize_or_zero();
+        // His gun's cone (`LowSkillScatter`) and a miss of his own by
+        // range and `Accuracy` ([`SoldierSpread`]).
+        let cone = gun
+            .and_then(|g| self.feels.get(&g.template))
+            .map_or(NPC_CONE, |f| f.scatter[0]);
+        let spread = SoldierSpread::new(distance, n.accuracy(), cone);
+        let (a, b) = (self.random(), self.random());
+        let dir = spread.stray((aim - from).normalize_or(Vec3::Z), a, b);
         let hit = cast_shot(
             f.physics,
             f.people,
