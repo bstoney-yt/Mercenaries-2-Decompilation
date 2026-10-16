@@ -179,7 +179,7 @@ const TURN_RATE: f32 = 6.0;
 /// Seconds the dead take to topple when no fall clip fits their model.
 const TOPPLE: f32 = 0.6;
 /// Slowest a vehicle hurts people it meets, m/s.
-const RUN_OVER: f32 = 2.5;
+pub const RUN_OVER: f32 = 2.5;
 /// Seconds after a vehicle hurts someone it doesn't kill before one can
 /// hurt them again, and how hard it shoves them aside (m/s). Invented.
 pub const RAM_GAP: f32 = 1.0;
@@ -1618,6 +1618,14 @@ fn role_for(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether someone whose middle (0.9 m above their feet) is at `local`, in
+/// a vehicle's space, is in the way of its hull `(lo, hi)`: the hull
+/// padded by a person's half-width and half-height (invented).
+pub fn in_ram(local: Vec3, (lo, hi): (Vec3, Vec3)) -> bool {
+    let pad = Vec3::new(0.35, 0.9, 0.35);
+    local.cmpge(lo - pad).all() && local.cmple(hi + pad).all()
+}
+
 impl People {
     /// The kind of the catalogue's model a name's role asks for
     /// ([`role_for`]), for soldiers whose template has no model of its own.
@@ -1633,6 +1641,16 @@ impl People {
             .get(i)
             .and_then(|n| self.kinds.get(n.kind))
             .is_some_and(|k| k.role.to_ascii_lowercase().contains("female"))
+    }
+
+    /// The kind a vehicle's rider of template `template` is drawn as: its
+    /// own model `model` when it has one (asked for the first time; `None`
+    /// until it is in), else its name's role ([`kind_for`](Self::kind_for)).
+    pub(crate) fn rider_kind(&mut self, template: &str, model: Option<u32>) -> Option<usize> {
+        match model {
+            Some(m) if !self.refused.contains(&(m, template.to_owned())) => self.own(template, m),
+            _ => self.kind_for(template),
+        }
     }
 
     /// The kind of template `template` in its own model `model`, once
@@ -1891,8 +1909,7 @@ impl People {
             for n in self.npcs.iter_mut().filter(|n| n.alive && n.landed) {
                 let p = n.character.position;
                 let local = to_car.transform_point3(p + Vec3::Y * 0.9);
-                let pad = Vec3::new(0.35, 0.9, 0.35);
-                if local.cmpge(lo - pad).all() && local.cmple(hi + pad).all() {
+                if in_ram(local, (lo, hi)) {
                     if n.rammed > 0.0 {
                         continue;
                     }
@@ -2250,6 +2267,14 @@ impl People {
     /// pick ([`m2_engine::Looks::pick`]); empty (the model's own) for a
     /// model with no mixer. Each new look is said once.
     fn dress(&mut self, kind: usize, s: &SpawnPoint) -> Vec<bool> {
+        let template = s.template.clone().unwrap_or_else(|| s.name.clone());
+        self.dress_as(kind, &template)
+    }
+
+    /// A look for someone of kind `kind` spawned as template `template`
+    /// (a template's own model is dressed as that template), as
+    /// [`dress`](Self::dress) picks one.
+    pub(crate) fn dress_as(&mut self, kind: usize, template: &str) -> Vec<bool> {
         let k = &self.kinds[kind];
         let Some(looks) = k.model.looks.clone() else {
             return Vec::new();
@@ -2257,7 +2282,7 @@ impl People {
         let template = if k.named {
             k.role.clone()
         } else {
-            s.template.clone().unwrap_or_else(|| s.name.clone())
+            template.to_owned()
         };
         let model = k.model.hash;
         let profile = self
@@ -2355,6 +2380,16 @@ impl Rng {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_hull_padded_by_a_person_rams_them() {
+        let hull = (Vec3::new(-1.0, 0.0, -2.0), Vec3::new(1.0, 1.5, 2.0));
+        // Beside the bumper, within a person's half-width.
+        assert!(in_ram(Vec3::new(1.3, 0.9, 0.0), hull));
+        assert!(!in_ram(Vec3::new(1.4, 0.9, 0.0), hull));
+        // Standing well above the roof.
+        assert!(!in_ram(Vec3::new(0.0, 2.5, 0.0), hull));
+    }
     use m2_engine::{Animator, CollisionShape, Skeleton, StaticKey};
     use m2_math::glam::Quat;
 

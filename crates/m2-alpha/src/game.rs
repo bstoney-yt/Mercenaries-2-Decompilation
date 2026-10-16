@@ -1028,6 +1028,7 @@ impl Game {
                 explosives: &mut scene.explosives,
             };
             self.combat.step(&mut field, intent.trigger, dt);
+            self.combat.vehicles_hit_her(&mut field, dt);
             world
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));

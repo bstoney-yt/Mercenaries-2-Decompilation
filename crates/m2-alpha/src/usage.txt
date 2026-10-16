@@ -94,6 +94,9 @@ m2-alpha [options]
                          name holds this (stryker, m1a1, amx30, hmmwv...)
   --look <degrees>       with --drive: stop and swing the camera this far
                          before the picture (turrets follow it)
+  --riders               with --screenshot on the island: seat the riders of
+                         the vehicles near her before the picture, and log
+                         how many were drawn
   --spawns <n>           with --screenshot: list the n spawns nearest where
                          she starts (name, place, who they spawn)
   --face <degrees>       with --screenshot on foot: face this way first

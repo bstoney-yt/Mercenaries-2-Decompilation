@@ -216,6 +216,8 @@ struct Options {
     /// With `--screenshot`: cast rays around where she stands and list
     /// what they hit, to find unseen obstacles.
     probe: bool,
+    /// `--riders`: seat the vehicles' riders before the picture.
+    riders: bool,
     /// With `--aim` (or `--drive --look`): fire just before the picture.
     fire: bool,
     /// With `--screenshot` on foot: hits she takes just before the
@@ -617,6 +619,7 @@ fn parse_args() -> anyhow::Result<Options> {
                 }
             }
             "--probe" => o.probe = true,
+            "--riders" => o.riders = true,
             "--fire" => o.fire = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
@@ -1060,6 +1063,68 @@ fn render(
 /// island, once it has streamed in, the player lands and (with `gait`
 /// walk, run or sprint) heads forward for three seconds first.
 /// Plays `seconds` on, logging the traffic every five seconds.
+/// `--riders`: seats the riders of the vehicles near her, as play does
+/// every tick ([`hijack::Hijacks::seat`]), waiting up to 90 s for the
+/// clips and their people's models, and logs how they came out.
+fn riders_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    install: &Install,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    let tick = TICK.as_secs_f32();
+    let mut h = hijack::Hijacks::start(install, None);
+    let mut input = Input::default();
+    let waited = Instant::now();
+    while h.loading() && waited.elapsed() < Duration::from_secs(120) {
+        h.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+    }
+    let waited = Instant::now();
+    for i in 0.. {
+        h.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+        h.seat(game, tick);
+        // The scene takes what has loaded (people's models) as it draws.
+        if i % 10 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+        let done = i > 60 && h.riders.no_kind == 0;
+        if done || waited.elapsed() > Duration::from_secs(90) {
+            break;
+        }
+    }
+    // Beside the nearest one seated, looking at them, for the picture.
+    let here = game.focus();
+    let nearest = game
+        .scene
+        .riders
+        .iter()
+        .map(|r| {
+            let side = r.frame.transform_vector3(m2_math::glam::Vec3::X);
+            (r.frame.transform_point3(m2_math::glam::Vec3::ZERO), side)
+        })
+        .min_by(|a, b| a.0.distance(here).total_cmp(&b.0.distance(here)));
+    if let (Some((at, side)), Some(p)) = (nearest, game.scene.player.as_mut()) {
+        // Out from the driver's side (the seat's +x), level with them.
+        let side = side.with_y(0.0).normalize_or(m2_math::glam::Vec3::X);
+        let spot = at + side * 5.0 + m2_math::glam::Vec3::Y * 0.5;
+        p.character.position = spot;
+        p.character.velocity = m2_math::glam::Vec3::ZERO;
+        p.landed = false;
+        p.facing = (at.x - spot.x).atan2(at.z - spot.z);
+        p.yaw = p.facing;
+        eprintln!("riders: the picture from beside {:.1?}", at.to_array());
+        for _ in 0..20 {
+            game.step(Intent::default(), tick);
+            h.seat(game, tick);
+        }
+    }
+    eprintln!("riders: for the picture {:?}", h.riders);
+    Ok(())
+}
+
 fn traffic_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
@@ -1308,6 +1373,11 @@ fn screenshot(
     }
     if let Some(seconds) = options.traffic {
         traffic_for_screenshot(&mut backend, &mut game, fov, aspect, seconds)?;
+    }
+    if options.riders
+        && let Some(install) = install
+    {
+        riders_for_screenshot(&mut backend, &mut game, install, fov, aspect)?;
     }
     game.scene.hide_fx = options.no_fx;
     if options.old_fx {

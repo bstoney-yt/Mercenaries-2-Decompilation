@@ -16,6 +16,12 @@
 //! driver can't be hijacked. `--hijack-crew` (a testing aid) gives every
 //! hijackable vehicle without one a driver of that template.
 //!
+//! Every rider of the vehicles near her is drawn in the seat its template
+//! links (`SeatLink` and its hardpoint), playing the tables' `InVehicle`
+//! `Idle` clip for that seat, as she sits driving ([`Rider`]); the driver
+//! under a `DriverHatch` is inside, out of sight. From the data; the
+//! 200 m reach is the people's.
+//!
 //! Not yet: the hero's, crewman's and vehicle's clips are timed but not
 //! shown. The scripts' own calls to the HUD (the buttons to press) go to
 //! the game's HUD ([`Hijacks::take_gui_calls`]).
@@ -211,6 +217,54 @@ pub struct Hijacks {
     scripts_shown: HashMap<(u32, String), bool>,
     /// Vehicles (index, model) whose parts are set as their templates say.
     dressed: std::collections::HashSet<(usize, u32)>,
+    /// Riders' seats, by the vehicle's model and label and the seat.
+    rider_seats: HashMap<(u32, String, u32), Option<Seat>>,
+    /// Seated clips read for riders, by hash.
+    rider_clips: HashMap<u32, Option<Clip>>,
+    /// The riders' looks, by vehicle (index, model) and seat: kept while
+    /// the vehicle is.
+    rider_looks: HashMap<(usize, u32, u32), Vec<bool>>,
+    /// The latest riders' tally, and the last one written to the log.
+    pub riders: RiderTally,
+    told_riders: RiderTally,
+}
+
+/// Riders are drawn in vehicles this near her, metres (as far as people
+/// on foot are drawn, [`crate::npc::DRAW_DISTANCE`]).
+const RIDER_DISTANCE: f32 = crate::npc::DRAW_DISTANCE;
+
+/// Someone drawn sitting in a vehicle: one of its template's riders
+/// ([`ParkedVehicle::crew`]), in the seat its `SeatLink` names, playing the
+/// tables' `InVehicle` `Idle` clip for that seat, as she sits driving.
+///
+/// [`ParkedVehicle::crew`]: crate::scene::ParkedVehicle::crew
+#[derive(Clone, Debug)]
+pub struct Rider {
+    /// Index into the scene's vehicles.
+    pub vehicle: usize,
+    /// The seat, by its name's hash (`seat_driver`).
+    pub seat: u32,
+    /// Index into the people's kinds: whom they are drawn as.
+    pub kind: usize,
+    /// Their rig, holding only the seated clip.
+    pub rig: crate::scene::Rig,
+    /// Their look ([`crate::npc::Npc::outfit`]).
+    pub outfit: Vec<bool>,
+    /// Model to world: the clip's origin on the seat, with the vehicle's
+    /// whole turn.
+    pub frame: Mat4,
+}
+
+/// How the riders of the vehicles near her came out, for the log: seats
+/// asked for, drawn, and why the rest were not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RiderTally {
+    pub seats: usize,
+    pub drawn: usize,
+    pub no_seat: usize,
+    pub no_kind: usize,
+    pub no_clip: usize,
+    pub hidden: usize,
 }
 
 /// Where and how she sits driving a vehicle.
@@ -256,6 +310,11 @@ impl Hijacks {
             seats: HashMap::new(),
             scripts_shown: HashMap::new(),
             dressed: Default::default(),
+            rider_seats: HashMap::new(),
+            rider_clips: HashMap::new(),
+            rider_looks: HashMap::new(),
+            riders: RiderTally::default(),
+            told_riders: RiderTally::default(),
             active: None,
         }
     }
@@ -710,6 +769,149 @@ impl Hijacks {
         p.character.velocity = Vec3::ZERO;
     }
 
+    /// Seats the riders of the vehicles near her ([`Rider`]) in the
+    /// scene's [`riders`](crate::scene::Scene::riders): every rider of
+    /// every vehicle within [`RIDER_DISTANCE`] that isn't wrecked, but the
+    /// driver of what she drives and the vehicle a hijack plays on (its
+    /// crewman is out on foot). Their kinds load as people's do; until
+    /// then they aren't drawn.
+    fn seat_riders(&mut self, game: &mut Game, dt: f32) {
+        let mut riders = std::mem::take(&mut game.scene.riders);
+        let mut tally = RiderTally::default();
+        let here = game.focus();
+        let hers = game.scene.player.as_ref().and_then(|p| p.driving);
+        let busy = self.active.as_ref().map(|a| a.vehicle);
+        let driver_seat = m2_assets::name_hash("seat_driver");
+        let mut wanted: Vec<(usize, u32, String)> = Vec::new();
+        if let Some(world) = game.scene.world.as_ref() {
+            for (i, v) in game.scene.vehicles.iter().enumerate() {
+                if v.wrecked || v.crew.is_empty() || Some(i) == busy {
+                    continue;
+                }
+                let Some(at) = v.id.and_then(|id| world.physics.vehicle_transform(id)) else {
+                    continue;
+                };
+                if at.transform_point3(Vec3::ZERO).distance(here) > RIDER_DISTANCE {
+                    continue;
+                }
+                for (seat, who) in &v.crew {
+                    let hash = seat_hash(seat);
+                    if Some(i) == hers && hash == driver_seat {
+                        continue;
+                    }
+                    wanted.push((i, hash, who.clone()));
+                }
+            }
+        }
+        riders.retain(|r| wanted.iter().any(|w| w.0 == r.vehicle && w.1 == r.seat));
+        for (i, hash, who) in wanted {
+            tally.seats += 1;
+            let v = &game.scene.vehicles[i];
+            let vehicle_model = v.spec.model;
+            let key = (vehicle_model, v.spec.label.to_ascii_lowercase(), hash);
+            if !self.rider_seats.contains_key(&key) {
+                let State::Ready(loaded) = &self.state else {
+                    return;
+                };
+                let seat = find_seat(game, &mut self.points, &loaded.clips, i, Some(hash));
+                eprintln!(
+                    "rider: model {:08x} ({}) seat {hash:08x}: {seat:?}",
+                    key.0, key.1
+                );
+                self.rider_seats.insert(key.clone(), seat);
+            }
+            let Some(seat) = self.rider_seats[&key] else {
+                tally.no_seat += 1;
+                continue;
+            };
+            if !seat.shown {
+                tally.hidden += 1;
+                continue;
+            }
+            let model = game.scene.world.as_ref().and_then(|w| {
+                let db = &w.index.template_db;
+                db.get(&who).and_then(|t| t.model)
+            });
+            let Some(kind) = game.scene.people.rider_kind(&who, model) else {
+                tally.no_kind += 1;
+                continue;
+            };
+            let place = riders
+                .iter()
+                .position(|r| r.vehicle == i && r.seat == hash && r.kind == kind);
+            let index = match place {
+                Some(p) => p,
+                None => {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        self.rider_clips.entry(seat.clip)
+                    {
+                        e.insert(load(game, seat.clip));
+                    }
+                    let k = &game.scene.people.kinds[kind];
+                    let Some(bound) = self.rider_clips[&seat.clip]
+                        .clone()
+                        .and_then(|c| m2_engine::BoundClip::bind(seat.clip, c, &k.rig.skeleton))
+                    else {
+                        tally.no_clip += 1;
+                        continue;
+                    };
+                    let mut rig = crate::scene::Rig {
+                        clips: std::sync::Arc::new(vec![bound]),
+                        locomotion: None,
+                        animator: Default::default(),
+                        cues: Vec::new(),
+                        aim: None,
+                        two_handed: false,
+                        ..k.rig.clone()
+                    };
+                    rig.animator.play(0);
+                    let look = (i, vehicle_model, hash);
+                    let outfit = match self.rider_looks.get(&look) {
+                        Some(o) => o.clone(),
+                        None => {
+                            let o = game.scene.people.dress_as(kind, &who);
+                            self.rider_looks.insert(look, o.clone());
+                            o
+                        }
+                    };
+                    riders.retain(|r| !(r.vehicle == i && r.seat == hash));
+                    riders.push(Rider {
+                        vehicle: i,
+                        seat: hash,
+                        kind,
+                        rig,
+                        outfit,
+                        frame: Mat4::IDENTITY,
+                    });
+                    riders.len() - 1
+                }
+            };
+            let Some(at) = game
+                .scene
+                .world
+                .as_ref()
+                .zip(game.scene.vehicles[i].id)
+                .and_then(|(w, id)| w.physics.vehicle_transform(id))
+            else {
+                continue;
+            };
+            let r = &mut riders[index];
+            r.rig.advance(dt);
+            r.frame = at * Mat4::from_translation(seat.at + seat_offset(&r.rig, 0));
+            tally.drawn += 1;
+        }
+        // A vehicle gone (or its index reused) takes its riders' looks.
+        let vehicles = &game.scene.vehicles;
+        self.rider_looks
+            .retain(|&(i, model, _), _| vehicles.get(i).is_some_and(|v| v.spec.model == model));
+        game.scene.riders = riders;
+        self.riders = tally;
+        if tally.drawn != self.told_riders.drawn {
+            eprintln!("riders: {tally:?}");
+            self.told_riders = tally;
+        }
+    }
+
     /// While she drives (and no hijack plays), she sits in the driver's
     /// seat, playing the clip the tables give that seat, turned and
     /// tilted with the vehicle. Runs after the game's tick, like
@@ -719,6 +921,10 @@ impl Hijacks {
             return;
         };
         dress(game, &mut self.dressed, &loaded.clips);
+        self.seat_riders(game, dt);
+        let State::Ready(loaded) = &self.state else {
+            return;
+        };
         if self.active.is_some() {
             return;
         }
@@ -736,7 +942,7 @@ impl Hijacks {
         // soft-top and gun M151s share a model, not their seats.
         let key = (v.spec.model, v.spec.label.to_ascii_lowercase());
         if !self.seats.contains_key(&key) {
-            let seat = find_seat(game, &mut self.points, &loaded.clips, i);
+            let seat = find_seat(game, &mut self.points, &loaded.clips, i, None);
             eprintln!("seat: model {:08x} ({}) {seat:?}", key.0, key.1);
             // Where the clip has her from its origin (pinned as a walk
             // is, her pelvis would go on the seat point).
@@ -1162,11 +1368,17 @@ fn dress(
 /// `None` (she is not drawn) without a template with
 /// an animation set, a seated clip or a place for the seat. Each says
 /// why in the log.
+///
+/// With `wanted` (a rider's seat by name hash) that seat's own `SeatLink`
+/// and hardpoint instead, with no stand-in: a seat the template doesn't
+/// link, or whose hardpoint the model lacks, is `None`. A rider seen there
+/// unless it is the driver's seat under a `DriverHatch`.
 fn find_seat(
     game: &mut Game,
     points: &mut HashMap<(u32, u32), Option<Vec3>>,
     clips: &ClipTimes,
     i: usize,
+    wanted: Option<u32>,
 ) -> Option<Seat> {
     let scene = &mut game.scene;
     let v = scene.vehicles.get(i)?;
@@ -1193,7 +1405,15 @@ fn find_seat(
     let set = clips.sets[name];
     let driver = m2_assets::name_hash("seat_driver");
     let links = clips.seats.get(name.as_str());
-    let link = links.and_then(|l| l.iter().find(|s| s.0 == driver).or(l.first()));
+    let link = match wanted {
+        Some(seat) => links.and_then(|l| l.iter().find(|s| s.0 == seat)),
+        None => links.and_then(|l| l.iter().find(|s| s.0 == driver).or(l.first())),
+    };
+    if let (Some(seat), None) = (wanted, link) {
+        eprintln!("seat: {name}: no SeatLink for seat {seat:08x}: its rider is not drawn");
+        return None;
+    }
+    let marker = marker.filter(|_| wanted.is_none_or(|w| w == driver));
     let hardpoint = link
         .and_then(|l| l.1)
         .and_then(|h| point(points, scene.source.as_mut(), model, h));
@@ -1262,7 +1482,8 @@ fn find_seat(
                 .iter()
                 .find_map(|(n, t)| Some((n.as_str(), db.entrance_points.get(t)?)))
         });
-    let hatch = entrances.is_some_and(|(_, p)| p.contains(&hatch_point));
+    let hatch = entrances.is_some_and(|(_, p)| p.contains(&hatch_point))
+        && link.is_none_or(|l| l.0 == driver);
     eprintln!(
         "seat: {name}: entrances {}: {}",
         entrances.map_or_else(
@@ -1340,6 +1561,18 @@ fn play(game: &mut Game, hash: u32) -> Option<usize> {
     let (_, rig) = game.scene.player.as_mut()?.model.as_mut()?;
     rig.animator.play_once(index);
     Some(index)
+}
+
+/// A seat's name hash: the name the population table gives
+/// ([`m2_engine::population::seat_name`]), or its hash when that name is
+/// unknown and so written in hex.
+fn seat_hash(seat: &str) -> u32 {
+    if seat.len() == 8
+        && let Ok(h) = u32::from_str_radix(seat, 16)
+    {
+        return h;
+    }
+    m2_assets::name_hash(seat)
 }
 
 /// The template of whoever drives (the rider of the seat named for the
@@ -1436,6 +1669,16 @@ impl Flat for Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seats_by_name_or_by_hex_hash() {
+        assert_eq!(seat_hash("seat_driver"), 0xf8b8_325f);
+        assert_eq!(seat_hash("d0559110"), 0xd055_9110);
+        assert_eq!(
+            seat_hash(&m2_engine::population::seat_name(0xf8b8_325f)),
+            0xf8b8_325f
+        );
+    }
 
     #[test]
     fn the_scripts_hud_calls_are_kept_with_their_nils() {

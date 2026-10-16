@@ -840,6 +840,9 @@ pub struct Scene {
     pub park: bool,
     /// The people the layers place.
     pub people: People,
+    /// The vehicles' riders, drawn in their seats
+    /// ([`crate::hijack::Rider`]).
+    pub riders: Vec<crate::hijack::Rider>,
     pub arsenal: Arsenal,
     /// Fuel tanks and barrels that blow up when hit.
     pub explosives: Vec<crate::combat::Explosive>,
@@ -887,7 +890,8 @@ pub struct ParkedVehicle {
     pub spot: Option<(u32, Vec3, f32)>,
     /// Who rides in it, as its template's `Rider` records say: each
     /// seat's name (`seat_driver`) and its rider's template name
-    /// (`Guerilla Soldier`). Not drawn or seated yet.
+    /// (`Guerilla Soldier`). Drawn in their seats near her
+    /// ([`crate::hijack::Rider`]).
     pub crew: Vec<(String, String)>,
     /// How far its turret is turned from straight ahead, radians
     /// (anticlockwise from above).
@@ -1469,6 +1473,7 @@ impl Scene {
             vehicles: Vec::new(),
             park: true,
             people: People::default(),
+            riders: Vec::new(),
             arsenal: Arsenal::default(),
             explosives: Vec::new(),
             props: Props::default(),
@@ -2578,6 +2583,18 @@ impl Scene {
             {
                 w.model.draw(queue, at);
             }
+        }
+        for r in &self.riders {
+            let Some(k) = self.people.kinds.get(r.kind) else {
+                continue;
+            };
+            if r.frame.transform_point3(Vec3::ZERO).distance(eye) > npc::DRAW_DISTANCE {
+                continue;
+            }
+            let outfit = Some(&r.outfit[..]).filter(|o| !o.is_empty());
+            let (nodes, skin) = r.rig.posed();
+            k.model
+                .draw_posed_as(backend, queue, r.frame, &nodes, &skin, outfit)?;
         }
         for (what, at, velocity) in fight.projectiles() {
             let model = match what {
