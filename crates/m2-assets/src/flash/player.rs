@@ -16,6 +16,7 @@
 //! scripts ([`Player::take_scripts`]), as the Flash player runs them.
 //! [`Player::draw`] lays out what is on stage as triangles.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
@@ -374,6 +375,12 @@ pub struct Clip {
     pub drawing: Vec<Triangle>,
     /// A text field's inline images (`setImageSubstitutions`).
     pub substitutions: Vec<super::text::Substitution>,
+    /// A text field's box as its scripts sized it (`_width`, `_height`,
+    /// `autoSize`), in place of its definition's.
+    pub text_box: Option<[f32; 4]>,
+    /// A text field fits its box to its text (`autoSize`), from its left
+    /// edge (0), centre (0.5) or right edge (1), each time its text is set.
+    pub auto_size: Option<f32>,
 }
 
 impl Clip {
@@ -404,7 +411,24 @@ impl Clip {
             children: BTreeMap::new(),
             drawing: Vec::new(),
             substitutions: Vec::new(),
+            text_box: None,
+            auto_size: None,
         }
+    }
+
+    /// A text field's definition, with its box as its scripts sized it.
+    pub fn text_def(&self) -> Option<Cow<'_, EditText>> {
+        let Kind::Text(def, _) = &self.kind else {
+            return None;
+        };
+        let t = self.lib.texts.get(def)?;
+        Some(match self.text_box {
+            Some(bounds) => Cow::Owned(EditText {
+                bounds,
+                ..t.clone()
+            }),
+            None => Cow::Borrowed(t),
+        })
     }
 
     /// Frames in its timeline (1 for one without).
@@ -902,6 +926,31 @@ impl Player {
         }
     }
 
+    /// A text field's `textWidth` and `textHeight`: its text as drawn
+    /// (the ids looked up, [`Player::translate`]) laid out with its font,
+    /// or estimated without the fonts.
+    pub fn text_size(&self, id: ClipId) -> Option<(f32, f32)> {
+        let c = self.clip(id)?;
+        let Kind::Text(_, s) = &c.kind else {
+            return None;
+        };
+        let Some(t) = c.text_def() else {
+            return Some((0.0, 12.0 * 1.2));
+        };
+        let shown = match &self.translate {
+            Some(tr) if s.contains('[') => (tr.0)(s),
+            _ => s.clone(),
+        };
+        let font = self
+            .fonts
+            .as_deref()
+            .and_then(|book| t.font.and_then(|f| Self::font_for(&c.lib, f, book)));
+        Some(match font {
+            Some(font) => super::text::measure(&t, &shown, font),
+            None => t.text_size(&shown),
+        })
+    }
+
     /// The font a text field's font id stands for: the movie's own if it
     /// is drawn in a texture, else the one it imports by that name, else
     /// the font library's of its style.
@@ -952,15 +1001,15 @@ impl Player {
                     draw_shape(shape, mesh, &c.lib.images, &m, &col, clip, out);
                 }
             }
-            Kind::Text(def, s) => {
-                if let Some(t) = c.lib.texts.get(def)
+            Kind::Text(_, s) => {
+                if let Some(t) = c.text_def()
                     && let Some(font) = t.font.and_then(|f| Self::font_for(&c.lib, f, fonts))
                 {
                     match &self.translate {
                         Some(tr) if s.contains('[') => {
-                            layout(t, &(tr.0)(s), &c.substitutions, font, &m, &col, clip, out);
+                            layout(&t, &(tr.0)(s), &c.substitutions, font, &m, &col, clip, out);
                         }
-                        _ => layout(t, s, &c.substitutions, font, &m, &col, clip, out),
+                        _ => layout(&t, s, &c.substitutions, font, &m, &col, clip, out),
                     }
                 }
             }

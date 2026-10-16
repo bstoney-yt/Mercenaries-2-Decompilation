@@ -55,6 +55,7 @@ mod held;
 mod hero;
 mod hijack;
 mod input;
+mod keytable;
 mod loading;
 mod mission;
 mod movie;
@@ -4932,6 +4933,9 @@ struct Running {
     released: bool,
     /// Keyboard input is ignored while another window has focus.
     focused: bool,
+    /// The pause menu's keyboard table waits for a key or mouse button:
+    /// the next one pressed goes to it, not to play.
+    capturing: bool,
     culling: bool,
     last: Instant,
     lag: Duration,
@@ -5052,6 +5056,7 @@ impl App {
             mouse_look: false,
             released: false,
             focused,
+            capturing: false,
             culling: !self.double_sided,
             last: Instant::now(),
             lag: Duration::ZERO,
@@ -5387,6 +5392,7 @@ impl Running {
             m.close_shop();
         }
         self.hud.menu = false;
+        self.capturing = false;
         self.input.clear();
         self.released = false;
         self.keep_mouse();
@@ -5422,6 +5428,7 @@ impl Running {
             resolution: format!("{} x {}", size.width, size.height),
             refresh: refresh.to_string(),
             saves: pause_saves(self.game.scene.hero),
+            keys: keytable::KeyTable::of(&config.keys),
         }
     }
 
@@ -5463,6 +5470,17 @@ impl Running {
         }
         for unused in &news.unused {
             eprintln!("pause: {unused} kept in the menu; the alpha has nothing for it");
+        }
+        if let Some(c) = news.capture {
+            self.capturing = c;
+        }
+        if let Some(table) = news.keys {
+            table.apply(&mut config.keys);
+            let path = config::Config::default_path();
+            match std::fs::write(&path, config.to_toml()) {
+                Ok(()) => eprintln!("pause: keys kept, saved to {}", path.display()),
+                Err(e) => eprintln!("pause: could not save {}: {e}", path.display()),
+            }
         }
         if let Some(s) = news.settings {
             let o = &mut config.options;
@@ -5826,6 +5844,36 @@ impl ApplicationHandler for App {
                 state.focused = focused;
                 state.input.clear();
                 state.keep_mouse();
+            }
+            // The pause menu's keyboard table takes the next key or button.
+            WindowEvent::KeyboardInput { event, .. } if state.focused && state.capturing => {
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                {
+                    state.capturing = false;
+                    state.hud.pause_captured.push(code.into());
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } if state.focused && state.capturing => {
+                let control = match button {
+                    winit::event::MouseButton::Left => Some(input::Mouse::Left),
+                    winit::event::MouseButton::Right => Some(input::Mouse::Right),
+                    winit::event::MouseButton::Middle => Some(input::Mouse::Middle),
+                    _ => None,
+                };
+                if let Some(c) = control {
+                    state.capturing = false;
+                    state.hud.pause_captured.push(c.into());
+                }
+            }
+            WindowEvent::MouseWheel { .. } if state.focused && state.capturing => {
+                state.capturing = false;
+                state.hud.pause_captured.push(input::Mouse::WheelUp.into());
             }
             WindowEvent::KeyboardInput { event, .. }
                 if state.focused && state.flow.as_ref().is_some_and(flow::Flow::holds) =>

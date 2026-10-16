@@ -138,6 +138,9 @@ pub struct Hud {
     /// The player's settings and saves for the game's own pause menu
     /// ([`crate::pause`]), set as it opens.
     pub pause_settings: crate::pause::Settings,
+    /// Keys and mouse buttons for the pause menu's keyboard table, not yet
+    /// passed on.
+    pub pause_captured: Vec<crate::input::Control>,
 }
 
 impl std::fmt::Debug for Hud {
@@ -179,6 +182,7 @@ impl Hud {
             wait: false,
             dev: true,
             pause_settings: crate::pause::Settings::default(),
+            pause_captured: Vec::new(),
         }
     }
 
@@ -195,6 +199,7 @@ impl Hud {
         // The menu is the game's own pause menu, but in the shop.
         state.pause = self.menu && self.shop.is_none();
         state.pause_settings = self.pause_settings.clone();
+        state.pause_captured = std::mem::take(&mut self.pause_captured);
         let message = info.mission.as_ref().and_then(|m| m.game_message.as_ref());
         state.messages.extend(game.message(message));
         state.blips = blips(info);
