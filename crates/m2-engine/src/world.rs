@@ -341,6 +341,9 @@ pub struct Templates {
     pub damage: Option<DamageTable>,
     /// Every gun, thrown weapon and vehicle armament ([`crate::weapons`]).
     pub arms: crate::weapons::Arms,
+    /// Each template's parts' health and the part that burns, by id
+    /// ([`crate::vehicle_damage::read`]).
+    pub part_healths: HashMap<u32, crate::vehicle_damage::PartHealths>,
 }
 
 impl Templates {
@@ -521,6 +524,30 @@ impl Templates {
             .or_else(|| self.tuning_for_model(model))
     }
 
+    /// The parts' health of template `name` (a vehicle's own), else of
+    /// the first by name of `model`'s templates that give them.
+    pub fn part_healths_for(
+        &self,
+        name: &str,
+        model: u32,
+    ) -> Option<&crate::vehicle_damage::PartHealths> {
+        if let Some(p) = self
+            .ids(name)
+            .iter()
+            .find_map(|id| self.part_healths.get(id))
+        {
+            return Some(p);
+        }
+        let mut ids: Vec<(String, u32)> = self
+            .names
+            .iter()
+            .filter(|(_, n)| self.get(n).is_some_and(|t| t.model == Some(model)))
+            .map(|(&id, n)| (n.to_ascii_lowercase(), id))
+            .collect();
+        ids.sort();
+        ids.iter().find_map(|(_, id)| self.part_healths.get(id))
+    }
+
     /// The armament of template `name` (a vehicle's own), else of the
     /// first by name of `model`'s templates whose driver fires something,
     /// else that mounts anything.
@@ -677,6 +704,7 @@ impl Templates {
                 .map(|(id, name)| (id, name.to_owned()))
                 .collect(),
             tuning: crate::tuning::read(&db, damage.as_ref()),
+            part_healths: crate::vehicle_damage::read(&db),
             leavings: crate::pickup::read(&db),
             ruined: ruined(&db),
             motions: crate::motion::read_templates(&db),

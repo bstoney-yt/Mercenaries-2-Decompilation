@@ -468,6 +468,9 @@ const BLAST_ON_VEHICLE: (f32, f32, f32) = (200.0, 50.0, 5.0);
 /// Below its `TickDamage` health a vehicle burns down this fast, health a
 /// second (the template's 1 every 0.5 s, read as seconds).
 const BURN_DOWN: f32 = 2.0;
+/// How often the effects vehicles' parts keep going are kept up, seconds
+/// (well inside a held effect's life).
+const PART_FX_EVERY: f32 = 0.3;
 /// What the bomb leaves burning: this many fires within this far
 /// (metres), each for between these (seconds; the videos: 4 to 6 s).
 const BOMB_FIRES: usize = 5;
@@ -1027,11 +1030,13 @@ pub struct GameFx {
     pub hold: Option<u64>,
 }
 
-/// A template, by id or by name.
+/// A template, by id, by name, or by its name's hash (a state machine's
+/// `StartEmitter` names its effect so).
 #[derive(Clone, Debug, PartialEq)]
 pub enum FxTemplate {
     Id(u32),
     Name(String),
+    Hash(u32),
 }
 
 /// A sound the fight makes.
@@ -1308,6 +1313,8 @@ pub struct Combat {
     sounds: Vec<Sound>,
     /// Wrecks smoke: (vehicle index, seconds to the next puff).
     wrecks: Vec<(usize, f32)>,
+    /// Seconds to the next keeping-up of vehicles' parts' effects.
+    part_fx_next: f32,
     /// What happened to her since [`take_remarks`](Self::take_remarks).
     remarks: Vec<Remark>,
     /// People shot and blasts set off, for the screenshot check.
@@ -1488,6 +1495,7 @@ impl Default for Combat {
             game_fx: Vec::new(),
             sounds: Vec::new(),
             wrecks: Vec::new(),
+            part_fx_next: 0.0,
             remarks: Vec::new(),
             hits: 0,
             blasts: 0,
@@ -3104,9 +3112,13 @@ impl Combat {
                 Round::Bullet => r.bullet,
                 Round::BulletLarge => r.bullet_large,
             });
-            let damage = damage * scale;
-            if damage > 0.0 {
-                self.hurt_vehicle(f.physics, v, i, damage);
+            if damage * scale > 0.0 {
+                // The part it struck takes the round's own damage (the
+                // table's scale is the whole vehicle's; invented).
+                if let Some(body) = f.physics.vehicle_transform(id) {
+                    v.hit_parts(body, from + dir * t, damage);
+                }
+                self.hurt_vehicle(f.physics, v, i, damage * scale);
             }
         }
     }
@@ -3583,6 +3595,7 @@ impl Combat {
             let (heart, edge, radius) = BLAST_ON_VEHICLE;
             if d < radius && !v.wrecked {
                 let damage = heart + (edge - heart) * d / radius;
+                v.blast_parts(body, at, radius, heart);
                 self.hurt_vehicle(
                     f.physics,
                     v,
@@ -3724,6 +3737,7 @@ impl Combat {
             let d = (centre.distance(at) - (hi - lo).max_element() * 0.25).max(0.0);
             if d < reach && !v.wrecked {
                 let damage = b.damage_at(d) * v.spec.tuning.blast_scale.unwrap_or(1.0);
+                v.blast_parts(body, at, reach, b.damage_at(0.0));
                 self.hurt_vehicle(f.physics, v, i, damage);
                 if v.wrecked {
                     let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
@@ -3931,6 +3945,9 @@ impl Combat {
                 continue;
             }
             let scale = v.spec.tuning.blast_scale.unwrap_or(1.0);
+            if let Some(body) = f.physics.vehicle_transform(id) {
+                v.blast_parts(body, at, radius, damage);
+            }
             self.hurt_vehicle(f.physics, v, i, damage * near * scale);
             if v.wrecked {
                 let away = (centre - at).with_y(0.0).normalize_or(Vec3::X);
@@ -3957,6 +3974,38 @@ impl Combat {
     }
 
     fn smoke_wrecks(&mut self, f: &mut Field<'_>, dt: f32) {
+        // The effects vehicles' parts keep going (a burning hood, a
+        // wreck's smoke and fire), as their state machines say.
+        self.part_fx_next -= dt;
+        let mut data_smoke = vec![false; f.vehicles.len()];
+        let mut held = Vec::new();
+        for (i, v) in f.vehicles.iter().enumerate() {
+            let (Some(p), Some(dm)) = (&v.parts, v.spec.damage.as_deref()) else {
+                continue;
+            };
+            let fx = p.emitters(dm);
+            data_smoke[i] = !fx.is_empty();
+            if self.part_fx_next > 0.0 || fx.is_empty() {
+                continue;
+            }
+            let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) else {
+                continue;
+            };
+            for (k, (part, effect, at)) in fx.into_iter().enumerate() {
+                let key = (5 << 32) | ((i as u64) << 16) | ((part as u64) << 6) | (k as u64 & 63);
+                held.push((effect, body.transform_point3(at), key));
+            }
+        }
+        for (effect, at, key) in held {
+            self.game_fx.push(GameFx {
+                template: FxTemplate::Hash(effect),
+                at,
+                hold: Some(key),
+            });
+        }
+        if self.part_fx_next <= 0.0 {
+            self.part_fx_next = PART_FX_EVERY;
+        }
         let mut puffs = Vec::new();
         for (i, next) in &mut self.wrecks {
             *next -= dt;
@@ -3964,6 +4013,10 @@ impl Combat {
                 continue;
             }
             *next = 0.4;
+            // Its parts' own smoke stands in for the made-up puffs.
+            if data_smoke.get(*i).copied().unwrap_or(false) {
+                continue;
+            }
             let v = &f.vehicles[*i];
             if let Some(body) = v.id.and_then(|id| f.physics.vehicle_transform(id)) {
                 let (lo, hi) = v.spec.bounds;
@@ -4677,6 +4730,7 @@ mod tests {
             hull,
             turret_box: None,
             rotors: Vec::new(),
+            damage: None,
             tuning: VehicleTuning {
                 gun: Some(gun),
                 ..VehicleTuning::default()
@@ -4697,6 +4751,8 @@ mod tests {
             rolled: 0.0,
             fired: 0,
             damage: 0.0,
+            parts: None,
+            loose: Vec::new(),
         }];
         assert_eq!(vehicles[0].rounds(), Some(2));
         let mut player = Player::new(0.0, 0.0, 0.0, None);

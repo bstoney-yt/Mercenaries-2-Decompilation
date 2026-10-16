@@ -164,6 +164,8 @@ struct Options {
     plough: Option<String>,
     /// With `--drive`: wreck it at speed at the end and watch it stop.
     wreck: bool,
+    /// With `--drive`: stop and put this many rifle rounds into its parts.
+    shoot_up: Option<u32>,
     /// With `--drive`: fire from the next seat with a weapon.
     gunner: bool,
     /// With `--drive`: a vehicle whose name holds this.
@@ -415,6 +417,13 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--plough" => o.plough = Some(value()?.to_ascii_lowercase()),
             "--wreck" => o.wreck = true,
+            "--shoot-up" => {
+                o.shoot_up = Some(
+                    value()?
+                        .parse()
+                        .context("--shoot-up expects a round count")?,
+                )
+            }
             "--vehicle" => o.vehicle = Some(value()?.to_ascii_lowercase()),
             "--look" => {
                 o.look = value()?
@@ -3765,6 +3774,9 @@ fn drive_for_screenshot(
     if options.wreck {
         wreck_at_speed(game, tick);
     }
+    if let Some(rounds) = options.shoot_up {
+        shoot_up(game, rounds, tick);
+    }
     if options.look != 0.0 || options.fire {
         // Stop, then swing the camera and watch the turret follow.
         let brake = Intent {
@@ -3871,6 +3883,77 @@ fn describe_vehicle_fire(game: &Game) {
         (Some(m), _, None) => eprintln!("drive: fire: muzzle {m:.2}, but no flash"),
         (Some(m), None, _) => eprintln!("drive: fire: muzzle {m:.2}, vehicle not placed"),
     }
+}
+
+/// Stops the vehicle she drives and puts `rounds` rifle rounds (9
+/// damage, a `Car` taking a fortieth) into it, one part after another at
+/// each part's middle, as the game's soldiers would; then logs what its
+/// parts came to: how many changed state and look, those thrown off, the
+/// effects running, and its health.
+fn shoot_up(game: &mut Game, rounds: u32, tick: f32) {
+    let brake = Intent {
+        hold_jump: true,
+        ..Intent::default()
+    };
+    for _ in 0..60 {
+        game.step(brake, tick);
+    }
+    let Some(i) = game.scene.player.as_ref().and_then(|p| p.driving) else {
+        eprintln!("shoot-up: not driving");
+        return;
+    };
+    let Some(body) = game.scene.vehicles[i]
+        .id
+        .and_then(|id| game.scene.world.as_ref()?.physics.vehicle_transform(id))
+    else {
+        return;
+    };
+    // Let its parts get their health from its template.
+    game.step(brake, tick);
+    let v = &mut game.scene.vehicles[i];
+    let Some(dm) = v.spec.damage.clone() else {
+        eprintln!("shoot-up: {} has no part states", v.spec.label);
+        return;
+    };
+    let targets: Vec<m2_math::glam::Vec3> = (0..dm.boxes.len())
+        .filter(|&k| Some(k) != v.parts.as_ref().and_then(|p| p.body))
+        .filter_map(|k| dm.boxes[k].map(|(lo, hi)| (lo + hi) * 0.5))
+        .collect();
+    if targets.is_empty() {
+        eprintln!("shoot-up: {} has no parts to hit", v.spec.label);
+        return;
+    }
+    let start = v
+        .parts
+        .as_ref()
+        .map(|p| p.state.clone())
+        .unwrap_or_default();
+    let looks_before = v.parts.as_ref().map(|p| p.hidden(&dm));
+    let scale = v.spec.tuning.rounds.map_or(0.0, |r| r.bullet);
+    for k in 0..rounds as usize {
+        let at = body.transform_point3(targets[k % targets.len()]);
+        v.hit_parts(body, at, 9.0);
+        v.damage = (v.damage + 9.0 * scale).min(v.most_health() - 1.0);
+    }
+    // Five seconds: long enough for a car shot down to where it burns
+    // to burn out.
+    for _ in 0..300 {
+        game.step(brake, tick);
+    }
+    let v = &game.scene.vehicles[i];
+    let Some(p) = &v.parts else { return };
+    let changed = p.state.iter().zip(&start).filter(|(a, b)| a != b).count();
+    let looks_changed = looks_before.is_some_and(|h| h != p.hidden(&dm));
+    eprintln!(
+        "shoot-up: {} took {rounds} rounds over {} parts: {changed} of {} parts changed state, look changed {looks_changed}, {} thrown off lying, {} effects running, health {:.0}, wrecked {}",
+        v.spec.label,
+        targets.len(),
+        dm.states.machines.len(),
+        v.loose.len(),
+        p.emitters(&dm).len(),
+        v.health(),
+        v.wrecked
+    );
 }
 
 /// Wrecks the vehicle she drives, as it goes, and logs how it comes to

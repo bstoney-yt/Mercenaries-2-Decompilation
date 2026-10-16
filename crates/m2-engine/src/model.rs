@@ -1044,6 +1044,13 @@ pub struct GpuModel {
     pub track_travel: f32,
     /// Its parts a vehicle breaks one at a time ([`CpuModel::parts`]).
     pub parts: Option<std::sync::Arc<ModelParts>>,
+    /// Per node, hidden as its parts stand when not wrecked (a vehicle's
+    /// dented door shown, its thrown-off hood hidden:
+    /// [`crate::vehicle_damage::PartDamage::hidden`]), in place of the
+    /// intact look.
+    pub parts_hidden: Option<Vec<bool>>,
+    /// Per node, hidden whatever the state ([`hide`](Self::hide)).
+    forced: Vec<bool>,
 }
 
 /// How far a track's texture moves per metre the track runs where its
@@ -1237,6 +1244,8 @@ impl GpuModel {
             tracks: false,
             track_travel: 0.0,
             parts: cpu.parts.clone(),
+            parts_hidden: None,
+            forced: Vec::new(),
         })
     }
 
@@ -1259,6 +1268,12 @@ impl GpuModel {
     /// parts a template puts in a state that shows nothing (the soft-top
     /// jeep's gun mount, [`crate::hijack::part_states`]).
     pub fn hide(&mut self, off: &[bool]) {
+        if self.forced.len() < off.len() {
+            self.forced.resize(off.len(), false);
+        }
+        for (f, &o) in self.forced.iter_mut().zip(off) {
+            *f |= o;
+        }
         for hidden in &mut self.hidden {
             if hidden.len() < off.len() {
                 hidden.resize(off.len(), false);
@@ -1430,10 +1445,17 @@ impl GpuModel {
 
     /// The pieces drawn as the model stands, intact or wrecked.
     fn shown(&self, wrecked: bool) -> impl Iterator<Item = &Piece> {
-        let hidden = &self.hidden[usize::from(wrecked)];
+        let parts = self.parts_hidden.as_deref().filter(|_| !wrecked);
+        let hidden = parts.unwrap_or(&self.hidden[usize::from(wrecked)]);
+        let forced = if parts.is_some() {
+            &self.forced[..]
+        } else {
+            &[]
+        };
+        let at = |h: &[bool], p: &Piece| h.get(usize::from(p.at)).copied().unwrap_or(false);
         self.pieces
             .iter()
-            .filter(|p| !hidden.get(usize::from(p.at)).copied().unwrap_or(false))
+            .filter(move |p| !at(hidden, p) && !at(forced, p))
     }
 
     fn push(&self, queue: &mut DrawQueue, piece: &Piece, world: Mat4, skin: Option<SkinHandle>) {
