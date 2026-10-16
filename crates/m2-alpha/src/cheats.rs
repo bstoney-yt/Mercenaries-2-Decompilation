@@ -66,6 +66,13 @@ pub enum Tab {
 impl Tab {
     pub const ALL: [Tab; 4] = [Tab::Weapons, Tab::Vehicles, Tab::Support, Tab::Player];
 
+    /// The page named `name` (any case), as [`name`](Self::name) writes it.
+    pub fn named(name: &str) -> Option<Tab> {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.name().eq_ignore_ascii_case(name))
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Tab::Weapons => "Weapons",
@@ -96,6 +103,9 @@ pub struct CheatScreen {
     /// Only the lines containing this (any case).
     pub filter: String,
     pub said: Option<String>,
+    /// Over plain black rather than the dimmed game (`--cheat-menu`'s
+    /// picture, which shows the menu alone).
+    pub plain: bool,
 }
 
 /// What the player does in the menu.

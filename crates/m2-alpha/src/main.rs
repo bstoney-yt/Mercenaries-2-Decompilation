@@ -257,6 +257,9 @@ struct Options {
     /// `--cheat-check`: with `--mission`, every cheat of the menu tried
     /// once she is ashore ([`cheats::Check`]), for testing.
     cheat_check: bool,
+    /// `--cheat-menu <page>`: with `--screenshot`, the cheat menu up at
+    /// that page, over plain black.
+    cheat_menu: Option<cheats::Tab>,
     /// With `--screenshot --drive`: hijack the vehicle instead of getting
     /// in, answering every prompt at once.
     hijack: bool,
@@ -484,6 +487,12 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--support" => o.support.push(value()?),
             "--cheat-check" => o.cheat_check = true,
+            "--cheat-menu" => {
+                let v = value()?;
+                o.cheat_menu = Some(cheats::Tab::named(&v).with_context(|| {
+                    format!("--cheat-menu expects weapons, vehicles, support or player, not {v}")
+                })?);
+            }
             "--shop-check" => {
                 let v = value()?;
                 o.shop_check = Some(if v == "all" {
@@ -1512,6 +1521,25 @@ fn screenshot(
             }
         }
         time = f64::from(frames + 1) / 30.0;
+    }
+    if let Some(tab) = options.cheat_menu {
+        let screen = cheats::CheatScreen::read(&game, link.as_ref());
+        eprintln!("cheat menu: {}, the {} page", screen.counts(), tab.name());
+        hud.cheats = Some(cheats::CheatScreen {
+            tab,
+            plain: true,
+            ..screen
+        });
+        hud.menu = true;
+        // The menu alone: no loading screen over it.
+        hud.loading = None;
+        info.loading = None;
+        // A new egui window sizes itself on its first frame and fades in
+        // over the next few.
+        for _ in 0..10 {
+            let _ = hud.build(ui::headless_input(w, h, time), &info, &mut settings);
+            time += 0.1;
+        }
     }
     let _ = hud.build(ui::headless_input(w, h, time), &info, &mut settings);
     render(&mut backend, &mut game, fov, aspect, Some(&mut hud))?;

@@ -182,6 +182,9 @@ m2-alpha [options]
                          keys) in a shop with cash given her, call each in
                          from the support menu, aim its designator, and log
                          what came of it (shop-check lines and a summary)
+  --cheat-menu <page>    with --screenshot: the F7 cheat menu up at that page
+                         (weapons, vehicles, support, player), alone over
+                         black
   --cheat-check          with --mission --autoplay: once she is ashore, try
                          the F7 cheat menu's cheats (every weapon, a few
                          vehicles of each kind, every support item, a

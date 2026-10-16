@@ -1490,11 +1490,15 @@ fn cheat_window(
 ) -> Option<crate::cheats::CheatAction> {
     use crate::cheats::{CheatAction as A, Tab, shown};
     let mut action = None;
-    ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::new("dim"),
-    ))
-    .rect_filled(ctx.content_rect(), 0.0, Color32::from_black_alpha(120));
+    // Plain black goes under everything egui draws (it would hide the
+    // window drawn on the same layer order).
+    let (order, dim) = if cheats.plain {
+        (egui::Order::Background, Color32::BLACK)
+    } else {
+        (egui::Order::Middle, Color32::from_black_alpha(120))
+    };
+    ctx.layer_painter(egui::LayerId::new(order, egui::Id::new("dim")))
+        .rect_filled(ctx.content_rect(), 0.0, dim);
     egui::Window::new("Cheats (test)")
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .collapsible(false)
