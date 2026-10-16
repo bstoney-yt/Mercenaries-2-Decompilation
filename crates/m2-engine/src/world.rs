@@ -932,12 +932,12 @@ pub fn is_walker(entity: u32) -> bool {
     entity & 0xff00_0000 == WALKER_BASE
 }
 
-/// One passer-by per this many metres of road in a zone with people,
-/// who walks to and fro along this much of its edge, this far out from
-/// it (metres; invented: the zones say how many are out, not where).
+/// One passer-by per this many metres of road with a walkway in a zone
+/// with people, who walks to and fro along this much of it (metres;
+/// invented: the zones say how many are out, not where; the walkway
+/// they keep to is the road's own, [`Road::walk_offsets`]).
 const WALKER_EVERY: f32 = 90.0;
 const WALKER_STRETCH: f32 = 60.0;
-const WALKER_OUT: f32 = 1.5;
 
 /// Where everything on the island is.
 #[derive(Clone, Debug, Default)]
@@ -1011,14 +1011,67 @@ pub struct WorldIndex {
 /// A road a layer places: the line its path draws in the world (its
 /// middle, as the trees cleared off it show), between two junctions'
 /// ports.
+///
+/// Its kind is the name its record gives at 4: its template's name
+/// without the leading underscore (`commercial_road10`, 57 kinds over
+/// the 3,667 roads), whose `LaneData` says what strips it has
+/// ([`RoadLanes`]). Its record's vectors at 16 and 28 are a box round it
+/// in the entity's space: its path widened by the same distance each
+/// side (read off the install, 2026-10-15: every one of the 184
+/// `commercial_road10`s whose path runs along an axis is 13.00 m wider
+/// each side, the `commercial_road20`s 22.00 m, the `commercial_road5`s
+/// 9.00 m; a `road10` junction's ports are 13 m from its middle). So
+/// that distance is taken as its half-width, the median over its kind
+/// (a bent path's box spreads less or more).
+///
+/// [`RoadLanes`]: crate::population::RoadLanes
 #[derive(Clone, Debug, PartialEq)]
 pub struct Road {
     pub entity: u32,
     /// The layer placing it, by name hash (`vz_mar_roads`).
     pub layer: u32,
     pub points: Vec<Vec3>,
-    /// Metres across ([`road_width`]).
+    /// Metres across: twice its kind's half-width, by the boxes; where
+    /// the boxes say nothing, [`road_width`].
     pub width: f32,
+    /// Its kind's name hash (the record's word at 4).
+    pub kind: u32,
+    /// Its kind's `LaneData`, if the kind has one.
+    pub lanes: Option<crate::population::RoadLanes>,
+    /// Whether its kind's template has no `LaneData` but is named a road
+    /// (`_mar_commercial_road20Clean`): driven as one lane each way.
+    pub named_road: bool,
+}
+
+impl Road {
+    /// Whether traffic drives it: it has a lane of traffic (none of the
+    /// sidewalks, curbs, walls and driveways placed as roads do), or no
+    /// `LaneData` but a road's name.
+    pub fn drivable(&self) -> bool {
+        match &self.lanes {
+            Some(l) => !l.traffic(self.width / 2.0).is_empty(),
+            None => self.named_road,
+        }
+    }
+
+    /// How far right of its line vehicles keep, metres, a lane each
+    /// (inner first): its lanes of traffic's middles, else half of its
+    /// right half.
+    pub fn lane_offsets(&self) -> Vec<f32> {
+        match &self.lanes {
+            Some(l) => l.traffic(self.width / 2.0),
+            None if self.named_road => vec![self.width / 4.0],
+            None => Vec::new(),
+        }
+    }
+
+    /// How far each side of its line people walk, metres: its walkways'
+    /// middles.
+    pub fn walk_offsets(&self) -> Vec<f32> {
+        self.lanes
+            .map(|l| l.walkways(self.width / 2.0))
+            .unwrap_or_default()
+    }
 }
 
 /// Where roads meet: each road's entity and the port, in the world, where
@@ -1179,8 +1232,8 @@ impl WorldIndex {
         };
         let mut routes = Routes::default();
         // Each road's placement and path, for clearing trees off it and
-        // for the traffic: (entity, layer, template, place, turn, path).
-        let mut roads: Vec<(u32, u32, u32, Vec3, Quat, u32)> = Vec::new();
+        // for the traffic.
+        let mut roads: Vec<PlacedRoad> = Vec::new();
         for (block, is_static) in blocks {
             let decoded = source.block(block)?;
             for (e, data) in BlockContents::parse(&decoded)?.iter() {
@@ -1194,21 +1247,27 @@ impl WorldIndex {
                 if let Some(c) = layer.component("Road") {
                     let placements = layer.placements();
                     for (entity, rec) in c.records().unwrap_or_default() {
-                        let (Some(p), Some(path)) = (
-                            placements.get(&entity),
-                            rec.get(..4)
-                                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-                        ) else {
+                        let word = |o: usize| {
+                            rec.get(o..o + 4)
+                                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        };
+                        let float =
+                            |o: usize| word(o).map(f32::from_bits).filter(|f| f.is_finite());
+                        let corner =
+                            |o: usize| Some(Vec3::new(float(o)?, float(o + 4)?, float(o + 8)?));
+                        let (Some(p), Some(path)) = (placements.get(&entity), word(0)) else {
                             continue;
                         };
-                        roads.push((
+                        roads.push(PlacedRoad {
                             entity,
-                            e.name_hash,
-                            p.parent,
-                            Vec3::from(p.position),
-                            rotation(p.rotation),
+                            layer: e.name_hash,
+                            template: p.parent,
+                            at: Vec3::from(p.position),
+                            turn: rotation(p.rotation),
                             path,
-                        ));
+                            kind: word(ROAD_KIND).unwrap_or(0),
+                            bounds: corner(ROAD_BOX).zip(corner(ROAD_BOX + 12)),
+                        });
                     }
                 }
                 world.add_junctions(&layer);
@@ -2718,14 +2777,17 @@ impl WorldIndex {
     fn add_roads<R: Read + Seek>(
         &mut self,
         source: &mut AssetSource<R>,
-        roads: &[(u32, u32, u32, Vec3, Quat, u32)],
+        roads: &[PlacedRoad],
         templates: &Templates,
     ) {
         let mut paths: HashMap<u32, Vec<Vec3>> = HashMap::new();
-        for &(entity, layer, parent, at, q, path) in roads {
-            let points = paths.entry(path).or_insert_with(|| {
+        // Each kind's half-widths, a road each, by its box.
+        let mut spreads: HashMap<u32, Vec<f32>> = HashMap::new();
+        let mut placed: Vec<(&PlacedRoad, Vec<Vec3>)> = Vec::new();
+        for road in roads {
+            let points = paths.entry(road.path).or_insert_with(|| {
                 source
-                    .asset(path, PATH_TYPE)
+                    .asset(road.path, PATH_TYPE)
                     .ok()
                     .and_then(|data| Path::parse(&data).ok())
                     .map(|p| p.points.into_iter().map(Vec3::from).collect())
@@ -2734,12 +2796,33 @@ impl WorldIndex {
             if points.len() < 2 {
                 continue;
             }
-            let template = templates.by_id(parent).map_or("", |(n, _)| n);
+            if let Some(spread) = road.bounds.and_then(|b| box_spread(points, b)) {
+                spreads.entry(road.kind).or_default().push(spread);
+            }
+            placed.push((road, points.clone()));
+        }
+        let half: HashMap<u32, f32> = spreads
+            .into_iter()
+            .filter_map(|(kind, mut s)| {
+                s.sort_by(f32::total_cmp);
+                Some((kind, *s.get(s.len() / 2)?))
+            })
+            .collect();
+        let kinds = &templates.population.road_kinds;
+        for (road, points) in placed {
+            let template = templates.by_id(road.template).map_or("", |(n, _)| n);
+            let kind = kinds.get(&road.kind);
             self.roads.push(Road {
-                entity,
-                layer,
-                points: points.iter().map(|&p| at + q * p).collect(),
-                width: road_width(template),
+                entity: road.entity,
+                layer: road.layer,
+                points: points.iter().map(|&p| road.at + road.turn * p).collect(),
+                width: half
+                    .get(&road.kind)
+                    .filter(|&&h| h > 0.0)
+                    .map_or_else(|| road_width(template), |h| 2.0 * h),
+                kind: road.kind,
+                lanes: kind.and_then(|k| k.lanes),
+                named_road: kind.is_some_and(|k| k.lanes.is_none()),
             });
         }
     }
@@ -2794,8 +2877,11 @@ impl WorldIndex {
         let mut lists: HashMap<u32, Vec<(String, u32, f32)>> = HashMap::new();
         let mut walkers = Vec::new();
         for road in &self.roads {
+            // On its outer walkway; a road without one has none walking.
+            let Some(&out) = road.walk_offsets().last() else {
+                continue;
+            };
             let length = path_length(&road.points);
-            let out = road.width / 2.0 + WALKER_OUT;
             let mut along = WALKER_EVERY / 2.0;
             while along + WALKER_STRETCH / 2.0 < length {
                 let s = along;
@@ -2881,10 +2967,42 @@ pub fn point_along(points: &[Vec3], s: f32) -> (Vec3, Vec3) {
 /// Where a `RoadIntersection` record's six port offsets start.
 const JUNCTION_PORTS: usize = 28;
 
+/// A `Road` record's kind (its template's name hash, without the
+/// underscore) and its box's two corners ([`Road`]).
+const ROAD_KIND: usize = 4;
+const ROAD_BOX: usize = 16;
+
+/// A road as its layer places it.
+struct PlacedRoad {
+    entity: u32,
+    layer: u32,
+    /// Its entity's template (the placement's parent).
+    template: u32,
+    at: Vec3,
+    turn: Quat,
+    /// Its path asset.
+    path: u32,
+    kind: u32,
+    /// Its record's box, in the entity's space.
+    bounds: Option<(Vec3, Vec3)>,
+}
+
+/// How far a road's box reaches past its path's own, the most of its
+/// four sides (x and z): its half-width where the path runs along an
+/// axis.
+fn box_spread(points: &[Vec3], (lo, hi): (Vec3, Vec3)) -> Option<f32> {
+    let first = *points.first()?;
+    let (a, b) = points
+        .iter()
+        .fold((first, first), |(a, b), &p| (a.min(p), b.max(p)));
+    let spread = (a.x - lo.x).max(hi.x - b.x).max(a.z - lo.z).max(hi.z - b.z);
+    (spread.is_finite() && spread >= 0.0).then_some(spread)
+}
+
 /// How wide a road is, metres, by its template's name: the number after
 /// "road" (`_commercial_road10t`, `_outskirt_road5`, `A8 15m Road`);
-/// 8 where the name has none. Inferred from the names, not decoded (the
-/// templates' `LaneData` may say it; its fields aren't named).
+/// 8 where the name has none. Inferred from the names: only for a road
+/// whose kind's boxes say nothing ([`Road`]).
 pub fn road_width(template: &str) -> f32 {
     let lower = template.to_ascii_lowercase();
     let after = lower.find("road").map(|i| &lower[i + 4..]);
@@ -2959,6 +3077,55 @@ mod road_tests {
         assert_eq!(road_width("A8 15m Road"), 15.0);
         assert_eq!(road_width("Road"), 8.0);
         assert_eq!(road_width(""), 8.0);
+    }
+
+    #[test]
+    fn a_roads_box_spreads_past_its_path_by_its_half_width() {
+        // A `commercial_road10` off the install: its path runs 78.42 m up
+        // z, about a metre off the axis; its box reaches 13 m past it.
+        let path = [
+            Vec3::new(-1.16, -0.11, 0.0),
+            Vec3::new(0.3, 0.0, 40.0),
+            Vec3::new(1.15, 0.0, 78.42),
+        ];
+        let b = (Vec3::new(-14.16, -0.11, 0.0), Vec3::new(14.15, 0.17, 78.42));
+        let s = box_spread(&path, b).unwrap();
+        assert!((s - 13.0).abs() < 1e-3, "{s}");
+        assert_eq!(box_spread(&[], b), None);
+    }
+
+    #[test]
+    fn only_roads_with_a_lane_of_traffic_are_driven() {
+        use crate::population::RoadLanes;
+        let mut r = Road {
+            entity: 1,
+            layer: 0,
+            points: vec![Vec3::ZERO, Vec3::Z * 50.0],
+            width: 26.0,
+            kind: 0,
+            lanes: Some(RoadLanes {
+                strips: [(3, 5.0), (0, 8.0), (1, 4.0), (3, 5.0)],
+                direction: None,
+            }),
+            named_road: false,
+        };
+        assert!(r.drivable());
+        let one = |v: Vec<f32>, want: f32| v.len() == 1 && (v[0] - want).abs() < 1e-4;
+        assert!(one(r.lane_offsets(), 13.0 * 4.0 / 12.0));
+        assert!(one(r.walk_offsets(), 13.0 * 10.0 / 12.0));
+        // A curb: no strips.
+        r.lanes = Some(RoadLanes {
+            strips: [(3, 5.0); 4],
+            direction: None,
+        });
+        assert!(!r.drivable());
+        assert!(r.walk_offsets().is_empty());
+        // No `LaneData`: driven if its template is named a road.
+        r.lanes = None;
+        assert!(!r.drivable());
+        r.named_road = true;
+        assert!(r.drivable());
+        assert_eq!(r.lane_offsets(), vec![6.5]);
     }
 
     #[test]
