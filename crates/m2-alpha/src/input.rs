@@ -192,7 +192,7 @@ impl Default for Bindings {
             (MoveRight, vec![k(KeyD)]),
             (MoveUp, vec![k(Space)]),
             (MoveDown, vec![k(KeyC)]),
-            (Sprint, vec![k(ShiftLeft), k(ShiftRight)]),
+            (Sprint, vec![k(ShiftLeft)]),
             (Walk, vec![k(ControlLeft)]),
             (ToggleFly, vec![k(F4)]),
             (ToggleMusic, vec![k(KeyM)]),

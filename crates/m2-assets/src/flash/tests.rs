@@ -389,7 +389,7 @@ fn a_mask_shows_through_its_shape_not_its_box() {
 // ---- ActionScript ---------------------------------------------------------
 
 /// Assembles action bytes.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Asm(Vec<u8>);
 
 impl Asm {
@@ -1029,6 +1029,109 @@ fn a_text_fields_x_and_y_name_its_box_corner() {
     assert_eq!(number(&var(&mut rt, "got")), 18.0);
     let t = rt.player.child(rt.player.root, "t").unwrap();
     assert_eq!(rt.player.clip(t).unwrap().matrix.ty, 52.0);
+}
+
+/// A runtime with text field `t` (character 3: `def`, showing `text`)
+/// whose first frame runs `script`.
+fn text_field(def: EditText, text: &str, script: Asm) -> (Runtime, ClipId) {
+    let mut lib = Rc::try_unwrap(library(
+        vec![vec![
+            put(1, 3, at(10.0, 20.0), "t"),
+            Control::Script(script.bytes()),
+        ]],
+        sprite_frames(),
+    ))
+    .unwrap();
+    lib.texts.insert(
+        3,
+        EditText {
+            initial: text.into(),
+            ..def
+        },
+    );
+    let rt = Runtime::new(Player::new(Rc::new(lib)));
+    let t = rt.player.child(rt.player.root, "t").unwrap();
+    (rt, t)
+}
+
+#[test]
+fn a_text_fields_width_sizes_its_box_not_its_text() {
+    // t._width = 30; got = t._width;
+    let mut a = Asm::default();
+    a.str("t").op(0x1C).str("_width").int(30).op(0x4F);
+    a.set("got", |a| {
+        a.str("t").op(0x1C).str("_width").op(0x4E);
+    });
+    let def = EditText {
+        bounds: [-2.0, -2.0, 100.0, 20.0],
+        ..EditText::default()
+    };
+    let (mut rt, t) = text_field(def, "abc", a);
+    assert_eq!(number(&var(&mut rt, "got")), 30.0);
+    let c = rt.player.clip(t).unwrap();
+    // Unscaled: the box is 30 wide from its left edge.
+    assert_eq!(c.matrix.a, 1.0);
+    assert_eq!(c.text_box, Some([-2.0, -2.0, 28.0, 20.0]));
+}
+
+#[test]
+fn auto_size_fits_the_box_round_its_text() {
+    // t.autoSize = "center";
+    let mut a = Asm::default();
+    a.str("t").op(0x1C).str("autoSize").str("center").op(0x4F);
+    let def = EditText {
+        bounds: [-2.0, -2.0, 100.0, 20.0],
+        height: 20.0,
+        ..EditText::default()
+    };
+    // Estimated 11 px a character: "abcd" 44 wide, 48 with the gutters,
+    // centred on the box's 102: from 25.
+    let (rt, t) = text_field(def.clone(), "abcd", a.clone());
+    assert_eq!(
+        rt.player.clip(t).unwrap().text_box,
+        Some([25.0, -2.0, 73.0, 26.0])
+    );
+    // A wrapping field keeps its width and grows down.
+    let wraps = EditText {
+        word_wrap: true,
+        ..def
+    };
+    let (rt, t) = text_field(wraps, "abcd", a);
+    assert_eq!(
+        rt.player.clip(t).unwrap().text_box,
+        Some([-2.0, -2.0, 100.0, 26.0])
+    );
+}
+
+#[test]
+fn auto_size_fits_again_when_the_text_is_set() {
+    // t.autoSize = "right"; t.text = "abcd";
+    let mut a = Asm::default();
+    a.str("t").op(0x1C).str("autoSize").str("right").op(0x4F);
+    a.str("t").op(0x1C).str("text").str("abcd").op(0x4F);
+    let def = EditText {
+        bounds: [-2.0, -2.0, 100.0, 20.0],
+        height: 20.0,
+        ..EditText::default()
+    };
+    // Empty, it shrank to its right edge; "abcd" grows it back leftwards.
+    let (rt, t) = text_field(def, "", a);
+    assert_eq!(
+        rt.player.clip(t).unwrap().text_box,
+        Some([52.0, -2.0, 100.0, 26.0])
+    );
+}
+
+#[test]
+fn text_width_measures_the_text_as_drawn() {
+    let def = EditText {
+        bounds: [-2.0, -2.0, 400.0, 20.0],
+        height: 20.0,
+        ..EditText::default()
+    };
+    let (mut rt, t) = text_field(def, "[0x1]", Asm::default());
+    rt.player.translate = Some(Translator(Rc::new(|s: &str| s.replace("[0x1]", "ab"))));
+    assert_eq!(rt.player.text_size(t).map(|(w, _)| w.round()), Some(22.0));
 }
 
 #[test]
