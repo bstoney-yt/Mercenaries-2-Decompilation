@@ -1010,6 +1010,8 @@ mod tests {
             at: Vec3::ZERO,
             damage,
             key: Some(StaticKey::Entity(3)),
+            round: 0.0,
+            kind: 0,
         };
         // A round chips it; a bash breaks it open.
         assert!(flights.strike(&mut physics, &[hit(34.0)], &[]).is_empty());
@@ -1111,6 +1113,8 @@ mod tests {
             at: middle,
             damage: 100.0,
             key: Some(StaticKey::Entity(3)),
+            round: 0.0,
+            kind: 0,
         };
         flights.strike(&mut physics, &[blow], &[]);
         let [first, lying] = flights.pickups() else {

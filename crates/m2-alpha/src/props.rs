@@ -104,6 +104,11 @@ pub struct Props {
     /// How far any loaded model reaches from its origin, metres (its
     /// box's middle, and half its size beyond).
     widest: f32,
+    /// The templates whose objects are physics props (`_PropPhysics`), by
+    /// id: those whose model has no body that moves come loose as one.
+    pub physics_props: HashMap<u32, m2_engine::durability::PropPhysics>,
+    /// Shown since their model came in, their collision not yet up.
+    unwalled: HashSet<u32>,
 }
 
 /// What [`Props::draw`] draws of a model broken apart.
@@ -233,9 +238,18 @@ impl Props {
             );
             added += 1;
             self.changes += 1;
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.models.entry(o.model) {
-                slot.insert(None);
-                self.waiting.insert(o.model);
+            match self.models.entry(o.model) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(None);
+                    self.waiting.insert(o.model);
+                }
+                // Its model is in already: its collision goes up at the
+                // next update (round 6b found barricades and crates put up
+                // again by a later layer standing with none).
+                std::collections::hash_map::Entry::Occupied(m) if m.get().is_some() => {
+                    self.unwalled.insert(e);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
             }
         }
         if !self.waiting.is_empty() && self.loaders.is_none() {
@@ -353,23 +367,15 @@ impl Props {
             true => self.any_loose_mass(physics, entity),
             false => self.loose_mass(physics, entity),
         };
-        if mass.is_none() {
-            return false;
-        }
-        let (Some(p), Some(loose)) = (self.shown.get(&entity), self.loose(entity)) else {
-            return false;
-        };
-        physics.remove_static(StaticKey::Entity(entity));
-        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
-        let pieces = loose
-            .pieces
-            .iter()
-            .zip(loose.starts(placed))
-            .map(|(piece, at)| physics.add_debris(piece, at, velocity, spin))
-            .collect();
-        self.knocked.insert(entity, pieces);
-        self.fresh_knocks.push(entity);
-        true
+        mass.is_some() && self.fling(physics, entity, velocity, spin)
+    }
+
+    /// Whether `entity` was knocked loose (`None` if not): broken into
+    /// its pieces, its model's [`Loose::breaks`], or gone as one.
+    pub fn knocked_loose(&self, entity: u32) -> Option<bool> {
+        self.knocked
+            .contains_key(&entity)
+            .then(|| self.loose(entity).is_some_and(|l| l.breaks))
     }
 
     /// Those knocked loose since the last call.
@@ -528,10 +534,39 @@ impl Props {
                 }
             }
         } else if !self.knocked.contains_key(&entity) {
-            // Loose pieces stay where they fell.
-            self.shown.remove(&entity);
-            self.changes += 1;
+            // No wreck to show, but it comes loose (a barricade, a café
+            // chair): it goes flying rather than vanish.
+            let (velocity, spin) = match hit {
+                Hit::Crash(velocity, spin) => (velocity, spin),
+                Hit::Blast(Some(from), _) => crate::destruct::blown(from, p.position),
+                Hit::Blast(None, _) => (Vec3::Y * 2.0, Vec3::ZERO),
+            };
+            if !self.fling(physics, entity, velocity, spin) {
+                // Loose pieces stay where they fell.
+                self.shown.remove(&entity);
+                self.changes += 1;
+            }
         }
+        true
+    }
+
+    /// Sends `entity`'s model flying as it comes loose (its standing
+    /// collision already gone): its pieces off at `velocity` (m/s),
+    /// turning at `spin`. False unless its model comes loose.
+    fn fling(&mut self, physics: &mut Physics, entity: u32, velocity: Vec3, spin: Vec3) -> bool {
+        let (Some(p), Some(loose)) = (self.shown.get(&entity), self.loose(entity)) else {
+            return false;
+        };
+        physics.remove_static(StaticKey::Entity(entity));
+        let placed = Mat4::from_rotation_translation(p.rotation, p.position);
+        let pieces = loose
+            .pieces
+            .iter()
+            .zip(loose.starts(placed))
+            .map(|(piece, at)| physics.add_debris(piece, at, velocity, spin))
+            .collect();
+        self.knocked.insert(entity, pieces);
+        self.fresh_knocks.push(entity);
         true
     }
 
@@ -930,6 +965,23 @@ impl Props {
         reach: f32,
     ) -> anyhow::Result<()> {
         self.reach = reach;
+        // Those shown since their model came in: their collision.
+        for e in std::mem::take(&mut self.unwalled) {
+            let Some(p) = self.shown.get(&e) else {
+                continue;
+            };
+            let shape = (self.models.get(&p.model))
+                .and_then(Option::as_ref)
+                .and_then(|m| m.collision.as_ref());
+            if let Some(shape) = shape
+                && stands(e)
+                && !p.wrecked
+                && !self.knocked.contains_key(&e)
+                && !physics.has_static(StaticKey::Entity(e))
+            {
+                physics.add_static(StaticKey::Entity(e), shape, p.position, p.rotation);
+            }
+        }
         let Some(loaders) = &self.loaders else {
             return Ok(());
         };
@@ -1022,7 +1074,7 @@ impl Props {
         hash: u32,
         cpu: Result<(CpuModel, Vec<u32>), String>,
     ) -> anyhow::Result<()> {
-        let (cpu, members) = match cpu {
+        let (mut cpu, members) = match cpu {
             Ok(cpu) => cpu,
             Err(e) => {
                 eprintln!("state layer model {hash:08x}: {e}");
@@ -1030,6 +1082,17 @@ impl Props {
                 return Ok(());
             }
         };
+        // A physics prop (`_PropPhysics`) whose model has no body that
+        // moves comes loose as one, of its template's mass.
+        let physics_prop = (self.shown.values())
+            .filter(|p| p.model == hash)
+            .find_map(|p| self.physics_props.get(&p.template).copied());
+        if let (Some(c), Some(prop)) = (cpu.collision.as_mut(), physics_prop)
+            && c.loose.is_none()
+            && let Some(whole) = &c.whole
+        {
+            c.loose = Some(Arc::new(whole.weighing(prop.kg())));
+        }
         materials.load_model_textures(backend, source, &cpu)?;
         let gpu = GpuModel::upload(backend, materials, &cpu)?;
         let (lo, hi) = gpu.bounds;

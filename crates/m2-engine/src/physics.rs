@@ -68,6 +68,12 @@ pub struct CollisionShape {
     /// How the model comes loose when knocked, if its `PHY2` has bodies
     /// that move.
     pub loose: Option<Arc<Loose>>,
+    /// How it comes loose as one, its box a single piece, if its `PHY2`
+    /// has no body that moves (or none at all) and it is small enough
+    /// ([`LOOSE_SIZE`]): for a template whose objects are physics props
+    /// (`_PropPhysics`: a café chair, a planter), whose mass it is given
+    /// ([`Loose::weighing`]).
+    pub whole: Option<Arc<Loose>>,
 }
 
 impl fmt::Debug for CollisionShape {
@@ -76,6 +82,7 @@ impl fmt::Debug for CollisionShape {
             .field("triangles", &self.triangles)
             .field("stand_in", &self.stand_in)
             .field("loose", &self.loose)
+            .field("whole", &self.whole)
             .finish()
     }
 }
@@ -275,6 +282,33 @@ impl Loose {
             }
         }
         Self::with_pieces(model, pieces, breaks, rest)
+    }
+
+    /// `model` coming loose as one, its collision's box `bounds` (model
+    /// space) a single piece of the lightest mass ([`Loose::weighing`]
+    /// gives it its own); `None` for one too big ([`LOOSE_SIZE`]).
+    fn whole(model: &Model<'_>, (lo, hi): (Vec3, Vec3)) -> Option<Self> {
+        let size = (hi - lo).length();
+        if !size.is_finite() || size > LOOSE_SIZE {
+            return None;
+        }
+        let half = ((hi - lo) * 0.5).max(Vec3::splat(LOOSE_HALF));
+        let piece = LoosePiece::block(None, (lo + hi) * 0.5, half, LOOSE_MASS);
+        let rest = (0..model.nodes.len())
+            .map(|n| model.node_to_model(n as u16).unwrap_or(Mat4::IDENTITY))
+            .collect();
+        Self::with_pieces(model, vec![piece], false, rest)
+    }
+
+    /// The same, weighing `kg` in all (each piece its share).
+    pub fn weighing(&self, kg: f32) -> Self {
+        let k = loose_mass(kg) / self.mass.max(f32::EPSILON);
+        let mut out = self.clone();
+        for p in &mut out.pieces {
+            p.mass *= k;
+        }
+        out.mass = out.pieces.iter().map(|p| p.mass).sum();
+        out
     }
 
     /// A model coming loose as `pieces` (breaking into them with
@@ -511,6 +545,7 @@ impl CollisionShape {
             triangles: 12,
             stand_in: false,
             loose: None,
+            whole: None,
         }
     }
 
@@ -534,6 +569,7 @@ impl CollisionShape {
             triangles: count,
             stand_in: false,
             loose: None,
+            whole: None,
         })
     }
 
@@ -659,9 +695,15 @@ impl CollisionShape {
                 }
             }
         }
-        Self::mesh(&vertices, &triangles).map(|shape| Self {
+        let shape = Self::mesh(&vertices, &triangles)?;
+        let whole = match (&loose, sub_object) {
+            (None, None) => Loose::whole(model, shape.bounds()).map(Arc::new),
+            _ => None,
+        };
+        Some(Self {
             stand_in,
             loose,
+            whole,
             ..shape
         })
     }
@@ -3557,6 +3599,7 @@ mod tests {
             triangles: 12,
             stand_in: false,
             loose: None,
+            whole: None,
         };
         let base = Vec3::new(0.0, 0.0, 12.0);
         p.add_static(StaticKey::Object(7), &pole, base, Quat::IDENTITY);

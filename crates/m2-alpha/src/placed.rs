@@ -436,6 +436,8 @@ pub fn check(game: &mut crate::game::Game, tried: &mut std::collections::HashSet
                     at,
                     damage: 1.0e4,
                     key: Some(StaticKey::Entity(e)),
+                    round: 0.0,
+                    kind: 0,
                 }];
                 let opened = match (&mut game.scene.world, &mut game.placed) {
                     (Some(world), placed) => placed.strike(

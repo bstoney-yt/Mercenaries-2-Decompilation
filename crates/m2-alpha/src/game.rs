@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use m2_engine::atmosphere::AtmosphereMix;
-use m2_engine::durability::Explosion;
+use m2_engine::durability::{CrashHow, Explosion};
 use m2_engine::physics::FLOAT_DEPTH;
 use m2_engine::{
     CatalogueEntry, Install, Physics, StaticKey, Templates, VehicleControls, VehicleSpec, World,
@@ -802,52 +802,15 @@ impl Game {
             world
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
-            blast_loose(
+            hit_world(
                 world,
                 &mut scene.props,
-                &self.combat.went_off,
-                combat::REACH,
-                false,
-            );
-            if let Some(install) = &scene.install {
-                let (radius, damage, least) = blast_strength(&world.index.template_db);
-                for &at in &self.combat.went_off {
-                    let blast = Blast {
-                        at,
-                        radius,
-                        damage,
-                        least,
-                    };
-                    self.destruction
-                        .blast(world, &mut scene.props, install, blast);
-                }
-            }
-            // A supply crate broken open: a puff of dust off its boards.
-            let mut broken = scene.flights.strike(
-                &mut world.physics,
-                &self.combat.struck,
-                &self.combat.went_off,
-            );
-            // The state layers' crates too ([`crate::placed`]).
-            broken.extend(self.placed.strike(
-                &mut scene.props,
-                &mut world.physics,
                 &mut scene.flights,
-                &world.index.template_db,
-                &self.combat.struck,
-                &self.combat.went_off,
-            ));
-            for (_, at) in broken {
-                self.combat.show(
-                    Effect::Smoke {
-                        at: at + Vec3::Y * 0.6,
-                        size: 1.4,
-                    },
-                    1.2,
-                );
-                self.combat
-                    .show_fx(crate::combat::fx::CRATE, at + Vec3::Y * 0.6);
-            }
+                scene.install.as_ref(),
+                &mut self.placed,
+                &mut self.destruction,
+                &mut self.combat,
+            );
             // What lies within her reach, taken as the real game takes it
             // ([`crate::mission::offer`]): health and the small ammunition
             // box as she walks over them, if they give her anything; an
@@ -1141,9 +1104,10 @@ impl Game {
                                 radius: e.map_or(radius, |e| e.radius),
                                 damage: e.map_or(damage, |e| e.damage),
                                 least: e.map_or(0.0, |e| e.least),
+                                kind: e.map_or(0, |e| e.kind),
                             };
                             self.destruction
-                                .blast(world, &mut scene.props, install, blast);
+                                .blast(world, &mut scene.props, Some(install), blast);
                         }
                     }
                 }
@@ -2028,6 +1992,108 @@ fn park(physics: &mut Physics, vehicles: &mut [ParkedVehicle], player: &Player, 
     }
 }
 
+/// What the fight's rounds, blows and blasts of the last step
+/// ([`Combat::struck`], [`Combat::went_off`]) do to the world: blasts
+/// knock loose what comes loose and wear down what they reach
+/// ([`Destruction::blast`]); supply crates, delivered and placed, break
+/// open (a puff of dust off their boards).
+fn hit_world(
+    world: &mut World,
+    props: &mut Props,
+    flights: &mut crate::flights::Flights,
+    install: Option<&Install>,
+    placed: &mut crate::placed::Placed,
+    destruction: &mut Destruction,
+    combat: &mut Combat,
+) {
+    // Rounds, blows and blasts wear down what they reach, each as the
+    // damage table's row for it says (a café chair breaks to a clip; a
+    // box or a wall takes nothing of a round); what still stands and
+    // comes loose is knocked loose after. A round does nothing to what
+    // has no row.
+    for s in &combat.struck {
+        if let Some(key) = s.key {
+            destruction.wear(world, props, install, key, (s.round, s.kind, 0.0), s.at);
+        }
+    }
+    for &at in &combat.went_off {
+        for blast in rocket_blasts(&world.index.template_db, at) {
+            destruction.blast(world, props, install, blast);
+        }
+    }
+    blast_loose(world, props, &combat.went_off, combat::REACH, false);
+    // What was worn down and blows up goes off a moment later.
+    for (at, size) in destruction.set_off.drain(..) {
+        combat.set_off(at, size);
+    }
+    let mut broken = flights.strike(&mut world.physics, &combat.struck, &combat.went_off);
+    // The state layers' crates too ([`crate::placed`]).
+    broken.extend(placed.strike(
+        props,
+        &mut world.physics,
+        flights,
+        &world.index.template_db,
+        &combat.struck,
+        &combat.went_off,
+    ));
+    for (_, at) in broken {
+        combat.show(
+            Effect::Smoke {
+                at: at + Vec3::Y * 0.6,
+                size: 1.4,
+            },
+            1.2,
+        );
+        combat.show_fx(crate::combat::fx::CRATE, at + Vec3::Y * 0.6);
+    }
+}
+
+impl Game {
+    /// What `struck` and `went_off` do to the world, as the fight's own
+    /// rounds and blasts would ([`hit_world`]): the props check's hits
+    /// ([`crate::breakables::check`]). The fight's own of the last step
+    /// are dropped.
+    pub fn hit_world_with(&mut self, struck: Vec<combat::Strike>, went_off: Vec<Vec3>) {
+        let scene = &mut self.scene;
+        let Some(world) = &mut scene.world else {
+            return;
+        };
+        self.combat.struck = struck;
+        self.combat.went_off = went_off;
+        hit_world(
+            world,
+            &mut scene.props,
+            &mut scene.flights,
+            scene.install.as_ref(),
+            &mut self.placed,
+            &mut self.destruction,
+            &mut self.combat,
+        );
+        self.combat.struck.clear();
+        self.combat.went_off.clear();
+    }
+
+    /// What a vehicle like `crasher` going at its velocity does to what
+    /// its box meets, as one driven would ([`run_into`]): the props
+    /// check's crashes ([`crate::breakables::check`]).
+    pub fn crash_with(&mut self, crasher: &Crasher) {
+        let scene = &mut self.scene;
+        let Some(world) = &mut scene.world else {
+            return;
+        };
+        let keys = world.physics.statics_in_box(crasher.place, crasher.bounds);
+        run_into(
+            world,
+            &mut scene.props,
+            &mut self.destruction,
+            scene.install.as_ref(),
+            crasher,
+            keys,
+            (crasher.velocity.length(), "props check's vehicle"),
+        );
+    }
+}
+
 /// Vehicles knock loose what they hit that comes loose, with the weight
 /// and speed for it ([`KNOCK_RATIO`]): it flies off ahead, and the vehicle
 /// ploughs on slowed as by the mass it shifted, rather than stopped as by
@@ -2053,64 +2119,104 @@ fn knock_loose(
             continue;
         }
         let mass = v.spec.mass;
-        let mut shifted = 0.0;
-        let mut keys = world.physics.vehicle_statics(id);
-        let mut ploughed = false;
-        let mut down = Vec::new();
-        if let (Some(install), Some(place)) = (install, world.physics.vehicle_transform(id)) {
-            let crasher = Crasher {
-                place,
-                bounds: v.model.bounds,
-                velocity: before,
-                mass,
-            };
-            // What its body touched in the step counts as run into, as
-            // what its box meets does.
-            for c in destruction.crash(world, props, install, &crasher, &keys) {
-                match c {
-                    Crashed::Down(key) => {
-                        ploughed |= keys.contains(&key);
-                        down.push(key);
-                    }
-                    Crashed::Loose(key) => {
-                        if !keys.contains(&key) {
-                            keys.push(key);
-                        }
-                    }
-                }
-            }
-        }
-        // What broke is not knocked loose as well.
-        keys.retain(|k| !down.contains(k));
-        for key in keys {
-            let loose = match key {
-                StaticKey::Object(i) => world.loose_mass(i),
-                StaticKey::Entity(e) => props.loose_mass(&world.physics, e),
-                _ => None,
-            };
-            let Some(m) = loose.filter(|&m| mass * speed >= KNOCK_RATIO * m) else {
-                continue;
-            };
-            let (fling, topple) = flung(before, mass, m);
-            let knocked = match key {
-                StaticKey::Object(i) => world.knock(i, fling, topple),
-                StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
-                _ => false,
-            };
-            if knocked {
-                shifted += m;
-                eprintln!(
-                    "knocked loose: {key:?} ({m:.0} kg) by the {} at {speed:.1} m/s",
-                    v.spec.label
-                );
-            }
-        }
+        let Some(place) = world.physics.vehicle_transform(id) else {
+            continue;
+        };
+        let crasher = Crasher {
+            place,
+            bounds: v.model.bounds,
+            velocity: before,
+            mass,
+        };
+        let keys = world.physics.vehicle_statics(id);
+        let (shifted, ploughed) = run_into(
+            world,
+            props,
+            destruction,
+            install,
+            &crasher,
+            keys,
+            (speed, &v.spec.label),
+        );
         if shifted > 0.0 || ploughed {
             world
                 .physics
                 .set_vehicle_velocity(id, before * (mass / (mass + shifted)));
         }
     }
+}
+
+/// What `vehicle` does to what it runs into: what its body touched in
+/// the step (`keys`) and what its box meets ([`Destruction::crash`]):
+/// what its weight breaks comes down, and what comes loose it knocks
+/// loose with the weight and `speed` for it ([`KNOCK_RATIO`]: as fast as
+/// it pushes, pulling against what holds it). Returns the mass it
+/// shifted (kg) and whether it ploughed on through something it broke.
+/// `label` names it for the log.
+fn run_into(
+    world: &mut World,
+    props: &mut Props,
+    destruction: &mut Destruction,
+    install: Option<&Install>,
+    vehicle: &Crasher,
+    mut keys: Vec<StaticKey>,
+    (speed, label): (f32, &str),
+) -> (f32, bool) {
+    let mass = vehicle.mass;
+    let mut shifted = 0.0;
+    let mut ploughed = false;
+    let mut down = Vec::new();
+    if let Some(install) = install {
+        // What its body touched in the step counts as run into, as
+        // what its box meets does.
+        for c in destruction.crash(world, props, install, vehicle, &keys) {
+            match c {
+                Crashed::Down(key) => {
+                    ploughed |= keys.contains(&key);
+                    down.push(key);
+                }
+                Crashed::Loose(key) => {
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+        }
+    }
+    // What broke is not knocked loose as well.
+    keys.retain(|k| !down.contains(k));
+    for key in keys {
+        let (loose, template) = match key {
+            StaticKey::Object(i) => (world.loose_mass(i), world.index.objects[i].template),
+            StaticKey::Entity(e) => (
+                props.loose_mass(&world.physics, e),
+                props.get(e).map_or(0, |(p, _)| p.template),
+            ),
+            _ => (None, 0),
+        };
+        // What its template says a vehicle this light doesn't break (a
+        // wall a jeep runs into) stands, loose or not.
+        let holds = world
+            .index
+            .template_db
+            .crashable
+            .get(&template)
+            .is_some_and(|c| c.how == CrashHow::Breaks && mass < c.takes);
+        let Some(m) = loose.filter(|&m| !holds && mass * speed >= KNOCK_RATIO * m) else {
+            continue;
+        };
+        let (fling, topple) = flung(vehicle.velocity, mass, m);
+        let knocked = match key {
+            StaticKey::Object(i) => world.knock(i, fling, topple),
+            StaticKey::Entity(e) => props.knock(&mut world.physics, e, fling, topple, false),
+            _ => false,
+        };
+        if knocked {
+            shifted += m;
+            eprintln!("knocked loose: {key:?} ({m:.0} kg) by the {label} at {speed:.1} m/s");
+        }
+    }
+    (shifted, ploughed)
 }
 
 /// How what a vehicle of `mass` (kg) going at `velocity` (m/s) knocks
@@ -2149,9 +2255,81 @@ fn explosion(db: &Templates, names: &[&str]) -> Option<Explosion> {
 
 /// An ordinary blast's reach and damage, heart to edge: a rocket's from
 /// the template database, else combat's own reach and 100 to nothing.
-fn blast_strength(db: &Templates) -> (f32, f32, f32) {
+pub(crate) fn blast_strength(db: &Templates) -> (f32, f32, f32) {
     explosion(db, &ROCKET_BLASTS).map_or((combat::REACH, 100.0, 0.0), |e| {
         (e.radius, e.damage, e.least)
+    })
+}
+
+/// The RPG's frag and its rocket (`Explosion (Handheld RPG)` links
+/// `Explosion (Handheld RPG Frag)` as its `Frag`; the `RPG Rocket` is
+/// the projectile, PC data).
+const ROCKET_FRAG: &str = "Explosion (Handheld RPG Frag)";
+const ROCKET: &str = "RPG Rocket";
+/// How near a rocket's heart what it lands on is, metres (invented): its
+/// own `Damage` is done to what it strikes, not around.
+const ROCKET_HIT: f32 = 0.5;
+
+/// What an ordinary blast (a rocket's: combat doesn't yet tell them
+/// apart) does to what stands around it, as the data has an RPG's: its
+/// explosion (`Explosion`, 200 to nothing over 5 m), its frag (`Bullet`,
+/// 300 to 40 over 15 m) and the rocket itself on what it lands on
+/// (`Rocket`, 100, within [`ROCKET_HIT`]), each at `at`. Those the data
+/// doesn't give are left out; with none, combat's own reach and 100 to
+/// nothing.
+pub(crate) fn rocket_blasts(db: &Templates, at: Vec3) -> Vec<Blast> {
+    let of = |e: Explosion| Blast {
+        at,
+        radius: e.radius,
+        damage: e.damage,
+        least: e.least,
+        kind: e.kind,
+    };
+    let mut out: Vec<Blast> = [explosion(db, &ROCKET_BLASTS), explosion(db, &[ROCKET_FRAG])]
+        .into_iter()
+        .flatten()
+        .map(of)
+        .collect();
+    if let Some(p) = db.id(ROCKET).and_then(|id| db.projectiles.get(&id)) {
+        out.push(Blast {
+            at,
+            radius: ROCKET_HIT,
+            damage: p.damage,
+            least: p.damage,
+            kind: p.kind,
+        });
+    }
+    if out.is_empty() {
+        let (radius, damage, least) = blast_strength(db);
+        out.push(Blast {
+            at,
+            radius,
+            damage,
+            least,
+            kind: 0,
+        });
+    }
+    out
+}
+
+/// Whether an ordinary blast throws loose what template `t`'s objects
+/// are: a light physics prop (`_PropPhysics`, not one of the heavy ones:
+/// a chair, a box, a barricade), or what the damage table's row for it
+/// takes something of a blast's explosion or frag (`Explosion`,
+/// `Bullet`: a lamp, a fence). A wall (`Building`) or a shipping
+/// container (`Tank`, 20,000 kg) takes nothing of either and stands, its
+/// breakable parts with it; one with no row is thrown as before.
+fn blown_loose(db: &Templates, t: u32) -> bool {
+    if let Some(p) = db.prop_physics.get(&t) {
+        return !p.heavy;
+    }
+    let (Some(&row), Some(table)) = (db.modifiers.get(&t), db.damage.as_ref()) else {
+        return true;
+    };
+    ["Explosion", "Bullet"].iter().any(|k| {
+        table
+            .scale(row, m2_assets::name_hash(k))
+            .is_some_and(|s| s > 0.0)
     })
 }
 
@@ -2165,13 +2343,20 @@ fn blast_loose(world: &mut World, props: &mut Props, blasts: &[Vec3], reach: f32
     };
     for &at in blasts {
         for (i, d) in world.loose_near(at, reach) {
-            let (velocity, spin) = thrown(at, world.index.objects[i].position, d);
+            let o = world.index.objects[i];
+            if !strike && !blown_loose(&world.index.template_db, o.template) {
+                continue;
+            }
+            let (velocity, spin) = thrown(at, o.position, d);
             world.knock(i, velocity, spin);
         }
         for (e, d) in props.loose_near(&world.physics, at, reach, strike) {
-            let Some(p) = props.get(e).map(|(p, _)| p.position) else {
+            let Some((p, template)) = props.get(e).map(|(p, _)| (p.position, p.template)) else {
                 continue;
             };
+            if !strike && !blown_loose(&world.index.template_db, template) {
+                continue;
+            }
             let (velocity, spin) = thrown(at, p, d);
             props.knock(&mut world.physics, e, velocity, spin, strike);
         }
@@ -2513,5 +2698,63 @@ mod tests {
             vehicle_name(&db, Some(&strings), "vz_veh_truck_M151", 7),
             "M151 Softtop (V2)"
         );
+    }
+
+    #[test]
+    fn an_rpg_blasts_with_its_explosion_frag_and_rocket_from_the_data() {
+        let key = m2_assets::name_hash;
+        let e = |radius, damage, least, kind: &str| Explosion {
+            radius,
+            damage,
+            least,
+            kind: key(kind),
+        };
+        let db = Templates {
+            names: HashMap::from([
+                (0x8000_0001, "Explosion (Handheld RPG)".to_owned()),
+                (0x8000_0002, "Explosion (Handheld RPG Frag)".to_owned()),
+                (0x8000_0003, "RPG Rocket".to_owned()),
+            ]),
+            explosions: HashMap::from([
+                (0x8000_0001, e(5.0, 200.0, 0.0, "Explosion")),
+                (0x8000_0002, e(15.0, 300.0, 40.0, "Bullet")),
+            ]),
+            projectiles: HashMap::from([(
+                0x8000_0003,
+                m2_engine::durability::Projectile {
+                    damage: 100.0,
+                    kind: key("Rocket"),
+                },
+            )]),
+            ..Templates::default()
+        };
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        let blasts = rocket_blasts(&db, at);
+        let kinds: Vec<u32> = blasts.iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, [key("Explosion"), key("Bullet"), key("Rocket")]);
+        assert!(blasts.iter().all(|b| b.at == at));
+        // The rocket only on what it lands on.
+        assert_eq!(blasts[2].at_distance(0.2), 100.0);
+        assert_eq!(blasts[2].at_distance(1.0), 0.0);
+        // The frag still bites at 10 m.
+        assert!(blasts[1].at_distance(10.0) > 100.0);
+        // With none in the data: one blast of combat's own, taken in full.
+        let none = rocket_blasts(&Templates::default(), at);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].kind, 0);
+    }
+
+    #[test]
+    fn a_blast_throws_light_props_not_heavy_ones() {
+        let prop = |heavy| m2_engine::durability::PropPhysics { mass: None, heavy };
+        let db = Templates {
+            prop_physics: HashMap::from([(1, prop(false)), (2, prop(true))]),
+            ..Templates::default()
+        };
+        // A café chair flies; a 20 t container stands.
+        assert!(blown_loose(&db, 1));
+        assert!(!blown_loose(&db, 2));
+        // One the data gives no damage table row: thrown, as before.
+        assert!(blown_loose(&db, 3));
     }
 }

@@ -73,6 +73,15 @@
 //!                           layers whose name holds a word (default
 //!                           vzacon001,pmccon001): their box, 150 m wider,
 //!                           over every layer; counts, then each one
+//! breakables[:<word>,..]    every placed object in the areas of the state
+//!                           layers whose name holds a word (default
+//!                           vzacon001,pmccon001; their box, 150 m wider,
+//!                           the island's layers and the contract's own),
+//!                           by template: how many (island, state), and
+//!                           the components that say how it reacts when
+//!                           hit (`Health`, `PhysicsPropertyCrashable`,
+//!                           `_PropPhysics`, `ModifierKey`, ...) with
+//!                           their fields; then a tally by components
 //! templates:<word|id>[,..]  templates whose name holds a word (or whose
 //!                           id is given, 8 hex digits), with their
 //!                           components' fields (text fields not read), a
@@ -1017,6 +1026,7 @@ fn main() -> Result<(), Error> {
                 )
             }
             "pickups" => pickups(&mut source, arg),
+            "breakables" => breakables(&mut source, &names, arg),
             "stam" => stam(&mut source, &names, arg),
             "strings" => script_strings(&mut source, &names, arg),
             "text" => texts(&mut source, &names, arg),
@@ -5591,6 +5601,184 @@ fn pickups<R: Read + Seek>(source: &mut AssetSource<R>, arg: &str) -> Result<(),
                 at.z,
                 leaves.join("; ")
             );
+        }
+    }
+    Ok(())
+}
+
+/// The components that say how a placed object reacts when hit, for the
+/// `breakables` census.
+const REACTING: [&str; 14] = [
+    "Health",
+    "PhysicsPropertyCrashable",
+    "_PropPhysics",
+    "_DebrisPhysics",
+    "ModifierKey",
+    "SoundKey",
+    "BuildingCollapseAnim",
+    "_BuildingPhysics",
+    "DamageChunks",
+    "DebrisEffect",
+    "Explosive",
+    "SpawnOnDeath",
+    "PhysicsDefaultActivator",
+    "PhysicsPropertyUncrushable",
+];
+
+/// Every placed object in the contracts' areas by template, with the
+/// components that say how it reacts when hit.
+fn breakables<R: Read + Seek>(
+    source: &mut AssetSource<R>,
+    names: &Names,
+    arg: &str,
+) -> Result<(), Error> {
+    let mut words = words_of(arg);
+    if words.is_empty() {
+        words = vec!["vzacon001".into(), "pmccon001".into()];
+    }
+    let index = source.archive().index();
+    let Some(db_hash) = index
+        .assets()
+        .iter()
+        .find(|a| index.type_hash(a) == TEMPLATE_DB_TYPE)
+        .map(|a| a.name_hash)
+    else {
+        println!("no template database");
+        return Ok(());
+    };
+    let mut blocks: Vec<usize> = index
+        .assets()
+        .iter()
+        .filter(|a| index.type_hash(a) == LAYER_TYPE)
+        .map(|a| usize::from(a.block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let paths: Vec<String> = index.blocks().iter().map(|b| b.path.clone()).collect();
+    let db_data = source.asset(db_hash, TEMPLATE_DB_TYPE)?;
+    let db = Layer::parse(&db_data)?;
+    let tnames = db.names();
+    let comps: Vec<_> = REACTING
+        .iter()
+        .filter_map(|n| db.components.iter().find(|c| c.name == *n))
+        .map(|c| (c, by_entity(c)))
+        .collect();
+    // Every placed entity: its layer, template and place.
+    let mut rows: Vec<(String, u32, Vec3)> = Vec::new();
+    let mut boxes: HashMap<String, (Vec3, Vec3)> = HashMap::new();
+    for b in blocks {
+        let decoded = source.block(b)?;
+        let layer = m2_engine::world::layer_name(&paths[b]);
+        for (e, data) in BlockContents::parse(&decoded)?.iter() {
+            if e.type_hash != LAYER_TYPE {
+                continue;
+            }
+            let Ok(l) = Layer::parse(data) else {
+                continue;
+            };
+            for (_, p) in l.placements() {
+                let at = Vec3::from_array(p.position);
+                if layer.contains("state") {
+                    let b = boxes.entry(layer.clone()).or_insert((at, at));
+                    *b = (b.0.min(at), b.1.max(at));
+                }
+                rows.push((layer.clone(), p.parent, at));
+            }
+        }
+    }
+    // The damage table: what each kind of damage does to each kind of
+    // target (a template's `ModifierKey`), of the damage.
+    use m2_engine::tuning::{DAMAGE_TABLE, DAMAGE_TABLE_TYPE, DamageTable};
+    if let Some(table) = source
+        .asset(m2_assets::name_hash(DAMAGE_TABLE), DAMAGE_TABLE_TYPE)
+        .ok()
+        .and_then(|d| DamageTable::parse(&d))
+    {
+        let (rows, columns) = table.keys();
+        let name = |k: u32| names.get(k).map_or(format!("{k:08x}"), str::to_owned);
+        let head: Vec<String> = columns.iter().map(|&c| name(c)).collect();
+        println!("damage\ttarget\t{}", head.join("\t"));
+        for &r in rows {
+            let cells: Vec<String> = columns
+                .iter()
+                .map(|&c| table.scale(r, c).map_or("-".into(), |v| format!("{v}")))
+                .collect();
+            println!("damage\t{}\t{}", name(r), cells.join("\t"));
+        }
+    }
+    const WIDER: f32 = 150.0;
+    let name_field = m2_assets::name_hash("Name");
+    for w in &words {
+        let mut lo = Vec3::splat(f32::MAX);
+        let mut hi = Vec3::splat(f32::MIN);
+        for (_, b) in boxes
+            .iter()
+            .filter(|(n, _)| n.replace('_', "").contains(w.as_str()))
+        {
+            lo = lo.min(b.0);
+            hi = hi.max(b.1);
+        }
+        if lo.x > hi.x {
+            println!("{w}: no state layer");
+            continue;
+        }
+        let (lo, hi) = (lo - Vec3::splat(WIDER), hi + Vec3::splat(WIDER));
+        let own =
+            |layer: &str| !layer.contains("state") || layer.replace('_', "").contains(w.as_str());
+        // By template: (island placements, state placements).
+        let mut by: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+        for r in rows
+            .iter()
+            .filter(|r| r.2.x >= lo.x && r.2.x <= hi.x && r.2.z >= lo.z && r.2.z <= hi.z)
+            .filter(|r| own(&r.0))
+        {
+            let n = by.entry(r.1).or_default();
+            if r.0.contains("state") {
+                n.1 += 1;
+            } else {
+                n.0 += 1;
+            }
+        }
+        let total: usize = by.values().map(|n| n.0 + n.1).sum();
+        println!(
+            "breakables\t{w}\tbox {:.0},{:.0}..{:.0},{:.0}\t{total} placed\t{} templates",
+            lo.x,
+            lo.z,
+            hi.x,
+            hi.z,
+            by.len()
+        );
+        let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+        let mut list: Vec<_> = by.into_iter().collect();
+        list.sort_by_key(|(t, n)| (std::cmp::Reverse(n.0 + n.1), *t));
+        for (t, (island, state)) in list {
+            let mut has = Vec::new();
+            let mut fields = Vec::new();
+            for (c, recs) in &comps {
+                let Some(r) = recs.get(&t).and_then(|v| v.first()) else {
+                    continue;
+                };
+                has.push(c.name);
+                let vals: Vec<String> = c
+                    .fields
+                    .iter()
+                    .filter(|f| f.name_hash != name_field)
+                    .map(|f| field_value(names, f, r))
+                    .collect();
+                fields.push(format!("{}({})", c.name, vals.join(" ")));
+            }
+            *tally.entry(has.join("+")).or_default() += island + state;
+            println!(
+                "template\t{w}\t{t:08x}\t{}\t{island}\t{state}\t{}",
+                tnames.get(&t).copied().unwrap_or("?"),
+                fields.join(" ")
+            );
+        }
+        let mut tally: Vec<_> = tally.into_iter().collect();
+        tally.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (k, n) in tally {
+            let k = if k.is_empty() { "(none)" } else { k.as_str() };
+            println!("tally\t{w}\t{n}\t{k}");
         }
     }
     Ok(())

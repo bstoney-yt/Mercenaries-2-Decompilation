@@ -56,6 +56,8 @@ pub struct Blast {
     pub radius: f32,
     pub damage: f32,
     pub least: f32,
+    /// Its `DamageKey` (name hash; 0 for none, taken in full).
+    pub kind: u32,
 }
 
 impl Blast {
@@ -183,6 +185,30 @@ enum Cause {
     Crash { velocity: Vec3, mass: f32 },
 }
 
+/// How fast a prop broken by a blast with nothing to show broken goes
+/// flying away from it, and up, m/s (invented).
+const FLY_AWAY: (f32, f32) = (5.0, 4.0);
+
+impl Cause {
+    /// How what it brought down of `mass` (kg), standing at `at`, flies
+    /// when it has no wreck to show but comes loose: on with the vehicle
+    /// ([`crate::game::flung`]), or away from the blast and up.
+    fn flings(&self, at: Vec3, mass: f32) -> (Vec3, Vec3) {
+        match *self {
+            Cause::Crash { velocity, mass: by } => crate::game::flung(velocity, by, mass),
+            Cause::Blast(from) => blown(from, at),
+        }
+    }
+}
+
+/// How something at `at` flies from a blast at `from`: away and up
+/// ([`FLY_AWAY`]), turning over the way it goes.
+pub fn blown(from: Vec3, at: Vec3) -> (Vec3, Vec3) {
+    let away = (at - from).with_y(0.0).normalize_or(Vec3::X);
+    let (out, up) = FLY_AWAY;
+    (away * out + Vec3::Y * up, Vec3::Y.cross(away) * 3.0)
+}
+
 /// The damage done to the island's placed objects, and those coming down.
 #[derive(Debug, Default)]
 pub struct Destruction {
@@ -199,6 +225,20 @@ pub struct Destruction {
     /// Breaks to be heard at the next [`update`](Self::update): where, and
     /// the template's `SoundKey`.
     heard: Vec<(Vec3, u32)>,
+    /// Damage the physics props have taken so far ([`wear`](Self::wear)).
+    worn: HashMap<StaticKey, f32>,
+    /// Worn down and blowing up, to be set off by the fight
+    /// ([`crate::combat::Combat::set_off`]): where, and how big.
+    pub set_off: Vec<(Vec3, f32)>,
+}
+
+/// Whether template `t`'s objects blow up when destroyed: what it leaves
+/// on dying (`SpawnOnDeath`) is a blast (`Explosive`).
+pub fn explodes(db: &m2_engine::Templates, t: u32) -> bool {
+    db.leavings
+        .spawns
+        .get(&t)
+        .is_some_and(|s| s.iter().any(|s| db.explosions.contains_key(s)))
 }
 
 impl Destruction {
@@ -207,40 +247,157 @@ impl Destruction {
         self.taken.get(&i).copied().unwrap_or(0.0)
     }
 
-    /// Wears down what `blast` reaches; those it destroys come down.
-    pub fn blast(&mut self, world: &mut World, props: &mut Props, install: &Install, blast: Blast) {
-        for (i, d) in world.near(blast.at, blast.radius) {
-            if self.destroyed.contains(&i)
-                || world.destroyed.contains(&i)
-                || world.loose_mass(i).is_some()
-            {
-                continue;
+    /// Wears down what `key` is (the island's placed object or a state
+    /// layer's) by `damage` of kind `kind` (a `DamageKey`'s name hash; 0
+    /// for none) landing at `at`: as much as its template's `ModifierKey`
+    /// row of the damage table takes of that kind (a `PropFragile` chair
+    /// all of a `Bullet`, half of an `Explosion`; a `Prop` box and a
+    /// `Building` wall nothing of either), or `unrowed` of it for a
+    /// template with no row. At its `Health` it breaks: its wreck if its
+    /// model has one, else it goes flying ([`blown`]). Only what has
+    /// something to show broken (a wreck, or a model that comes loose)
+    /// is worn, and not what the scripts or the pickups bring down (a
+    /// mission's gates, crates). True if it broke.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wear(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: Option<&Install>,
+        key: StaticKey,
+        (damage, kind, unrowed): (f32, u32, f32),
+        at: Vec3,
+    ) -> bool {
+        let template = match key {
+            StaticKey::Object(i) => {
+                if self.destroyed.contains(&i)
+                    || world.destroyed.contains(&i)
+                    || world.is_taken(i)
+                    || world.knocked_loose(i).is_some()
+                    || explodes(&world.index.template_db, world.index.objects[i].template)
+                    || !world
+                        .object_model(i)
+                        .is_some_and(|m| m.has_wreck() || world.loose_mass(i).is_some())
+                {
+                    return false;
+                }
+                world.index.objects[i].template
             }
-            let o = world.index.objects[i];
-            let Some(durability) = world.index.template_db.durability.get(&o.template) else {
-                continue;
-            };
-            if durability.invincible || durability.health <= 0.0 {
-                continue;
+            StaticKey::Entity(e) => match props.get(e) {
+                Some((p, _))
+                    if !p.wrecked
+                        && !adopted(e)
+                        && !props.sturdy.contains(&e)
+                        && props.knocked_loose(e).is_none() =>
+                {
+                    p.template
+                }
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let db = &world.index.template_db;
+        if crate::placed::kind(db, template).is_some()
+            || db.names.get(&template).is_some_and(|n| n.contains("Cash"))
+        {
+            return false;
+        }
+        let Some(durability) = db.durability.get(&template).filter(|d| !d.invincible) else {
+            return false;
+        };
+        let health = durability.health;
+        if health <= 0.0 {
+            return false;
+        }
+        let scale = match (db.modifiers.get(&template), db.damage.as_ref()) {
+            _ if kind == 0 => 1.0,
+            (Some(&row), Some(table)) => table.scale(row, kind).unwrap_or(0.0),
+            _ => unrowed,
+        };
+        let hit = damage * scale;
+        if hit <= 0.0 {
+            return false;
+        }
+        let taken = match key {
+            StaticKey::Object(i) => self.taken.entry(i).or_default(),
+            _ => self.worn.entry(key).or_default(),
+        };
+        *taken += hit;
+        if *taken < health {
+            return false;
+        }
+        let taken = *taken;
+        let name = db.names.get(&template).map_or("?", String::as_str);
+        eprintln!(
+            "destruct: {key:?} ({name}) broken at {at:.1}: {taken:.0} of {health:.0} health, last \
+             {hit:.0} ({damage:.0} of kind {kind:08x} x {scale})"
+        );
+        let sound = db.sound_keys.get(&template).copied();
+        // A state layer's prop whose template leaves a blast on dying
+        // (`SpawnOnDeath` an `Explosive`: `_global_explosivebarrel`) blows
+        // up where it stood, leaving nothing (the island's explosives go
+        // off as they always have, by the fight's own count).
+        if let StaticKey::Entity(e) = key
+            && explodes(db, template)
+        {
+            let centre = props.centre(e).unwrap_or(at);
+            let size = props
+                .placed_bounds(e)
+                .map_or(0.5, |(_, (lo, hi))| (hi - lo).length() * 0.5);
+            eprintln!("destruct: {key:?} blows up at {centre:.1}");
+            props.hide(&mut world.physics, [e]);
+            self.set_off.push((centre, size));
+            return true;
+        }
+        match key {
+            StaticKey::Object(i) => match install {
+                Some(install) => self.bring_down(world, props, install, i, Cause::Blast(at)),
+                None => return false,
+            },
+            StaticKey::Entity(e) => {
+                props.wreck(&mut world.physics, e, Some(at));
+                if let (Some(k), Some(c)) = (sound, props.centre(e)) {
+                    self.heard.push((c, k));
+                }
             }
-            let Some(m) = world.object_model(i) else {
-                continue;
-            };
-            if !m.has_wreck() {
-                continue;
+            _ => {}
+        }
+        true
+    }
+
+    /// Wears down what `blast` reaches ([`wear`](Self::wear)), the
+    /// island's placed objects and the state layers' props, by its damage
+    /// where it reaches each (as far as its box's middle less half its
+    /// size), of its kind; those it breaks come down.
+    pub fn blast(
+        &mut self,
+        world: &mut World,
+        props: &mut Props,
+        install: Option<&Install>,
+        blast: Blast,
+    ) {
+        let mut reached: Vec<(StaticKey, f32)> = world
+            .near(blast.at, blast.radius)
+            .into_iter()
+            .map(|(i, d)| (StaticKey::Object(i), d))
+            .collect();
+        for e in props.standing_near(blast.at, blast.radius) {
+            if let Some((at, (lo, hi))) = props.placed_bounds(e) {
+                let centre = at.transform_point3((lo + hi) * 0.5);
+                let d = (centre.distance(blast.at) - (hi - lo).length() * 0.5).max(0.0);
+                reached.push((StaticKey::Entity(e), d));
             }
-            let hit = blast.at_distance(d);
-            let taken = self.taken.entry(i).or_default();
-            *taken += hit;
-            if *taken < durability.health {
-                continue;
-            }
-            eprintln!(
-                "destruct: object {i} ({:08x}, template {:08x}) destroyed at {:.1}: {:.0} of {:.0} \
-                 health, last {hit:.0} at {d:.1} m",
-                o.model, o.template, o.position, taken, durability.health
+        }
+        for (key, d) in reached {
+            let damage = blast.at_distance(d);
+            self.wear(
+                world,
+                props,
+                install,
+                key,
+                (damage, blast.kind, 1.0),
+                blast.at,
             );
-            self.bring_down(world, props, install, i, Cause::Blast(blast.at));
         }
     }
 
@@ -256,9 +413,19 @@ impl Destruction {
     ) {
         self.destroyed.insert(i);
         let o = world.index.objects[i];
+        let loose = world.loose_mass(i);
         if world.object_model(i).is_some_and(|m| m.has_wreck()) && props.adopt(install, key(i), &o)
         {
             self.falling.push((i, cause));
+        } else if let Some(m) = loose {
+            // No wreck to show, but it comes loose (a café chair, a
+            // planter): it goes flying, as what is knocked loose does,
+            // rather than vanish.
+            let (velocity, spin) = cause.flings(o.position, m);
+            world.knock(i, velocity, spin);
+            if let Some(&k) = world.index.template_db.sound_keys.get(&o.template) {
+                self.heard.push((o.position, k));
+            }
         } else {
             // Drawn as its wreck at once: heard now, as one coming down
             // would be ([`update`](Self::update)), if it is no building.
@@ -569,5 +736,35 @@ mod tests {
         // A crate (no such property) is shoved; a rock stands.
         assert_eq!(car.does(key, None, true), Some(Crashed::Loose(key)));
         assert_eq!(car.does(key, None, false), None);
+    }
+
+    #[test]
+    fn what_a_blast_breaks_with_no_wreck_flies_away_and_up() {
+        let (velocity, spin) = blown(Vec3::ZERO, Vec3::new(3.0, 0.5, 0.0));
+        assert!(velocity.x > 0.0 && velocity.y > 0.0 && velocity.z.abs() < 1e-5);
+        assert!(spin.length() > 0.0);
+        // Right on top of it: still away (along x) and up.
+        let (velocity, _) = blown(Vec3::ONE, Vec3::ONE);
+        assert!(velocity.x > 0.0 && velocity.y > 0.0);
+    }
+
+    #[test]
+    fn what_leaves_a_blast_on_dying_blows_up() {
+        let mut db = m2_engine::Templates::default();
+        // A barrel that leaves an explosion; a crate that leaves a pickup.
+        db.leavings.spawns.insert(1, vec![10]);
+        db.leavings.spawns.insert(2, vec![20]);
+        db.explosions.insert(
+            10,
+            m2_engine::durability::Explosion {
+                radius: 6.0,
+                damage: 300.0,
+                least: 0.0,
+                kind: 0,
+            },
+        );
+        assert!(explodes(&db, 1));
+        assert!(!explodes(&db, 2));
+        assert!(!explodes(&db, 3));
     }
 }

@@ -167,6 +167,11 @@ impl DamageTable {
         self.cells.get(r * self.columns.len() + c).copied()
     }
 
+    /// Its targets' keys (rows) and its damage kinds' keys (columns).
+    pub fn keys(&self) -> (&[u32], &[u32]) {
+        (&self.rows, &self.columns)
+    }
+
     /// The rounds' scales for a target of kind `target`.
     pub fn rounds(&self, target: u32) -> Option<RoundScale> {
         Some(RoundScale {
