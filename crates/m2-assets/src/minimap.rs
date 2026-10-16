@@ -1,9 +1,19 @@
 //! The minimap's map, as the HUD's radar shows the island: the land left
 //! clear (the radar's dark backdrop shows through it), the sea blue, and
-//! over them the roads, drawn from the island's own road network: paved
-//! ones solid, dirt tracks dashed.
+//! over them the roads.
 //!
-//! The engine draws the radar's map (the layout's `"VZ"` texture, 2800 ×
+//! The radar's movie (`minimap.gfx`) holds the map itself: the sprite it
+//! places as `roads_mc` shows one shape 2,048 pixels square of the sea and
+//! rivers (a translucent blue fill) and 4,854 strokes of olive, three
+//! pixels wide in the main, the dirt tracks drawn as runs of short
+//! separate dashes ([`roads_shape`], [`MovieMap`]). Its strokes widen with
+//! the map (no line style keeps its width). It is placed on the world by
+//! [`MAP_SCALE`] and [`MAP_ORIGIN`]. Of the island's `Road` entities, the
+//! radar's strokes run along 93% of the 1,398 with a lane of traffic (half
+//! their length or more within 2 pixels) and 8% of the other 2,269
+//! (sidewalks, curbs, walls): it shows the driven roads only.
+//!
+//! Without the movie, the map is made as follows. The engine draws the radar's map (the layout's `"VZ"` texture, 2800 ×
 //! 2800, island-wide) itself; no such texture is in the archives. The sea
 //! is made here from the low-resolution terrain tiles' heights against the
 //! sea level ([`Heights`], [`radar_map`]). The roads are the layers'
@@ -30,8 +40,14 @@
 //! handle on each end of the curve) are inferred from the layers and
 //! paths of a legally installed copy: 3,667 roads, every path found, and
 //! ends 3 to 25 m short of the intersections they name. The paved
-//! classifier's thresholds are tuned by eye on `vz_lrterrain`. No bytes
-//! from the archives are committed.
+//! classifier's thresholds are tuned by eye on `vz_lrterrain`. The movie
+//! map's shape, its `roads_mc` name and its 4 m to a pixel are read from
+//! the movie (its shape and its ActionScript); where it lies on the world
+//! ([`MAP_ORIGIN`]) is fitted to the roads and the terrain (from samples).
+//! The colours stay the footage's ([`WATER`], [`ROAD`]; the movie's
+//! strokes are `#606020`, its sea `#4080ff` at 30%, before Scaleform
+//! draws them over the backdrop). No bytes from the archives are
+//! committed.
 
 /// The sea on the radar (RGBA): the mean of its blue in the footage, over
 /// different scenes alike (so opaque, or nearly).
@@ -65,6 +81,8 @@ const STEP: f32 = 4.0;
 
 use m2_math::glam::{Quat, Vec2, Vec3};
 
+use crate::flash::player::Control;
+use crate::flash::{Fill, Library, Shape, ShapeTriangle, Style};
 use crate::terrain::LowResTile;
 
 /// Terrain heights over the island, sampled on the map's own grid: what
@@ -200,11 +218,15 @@ impl RoadRecord {
 }
 
 /// A road on the radar: its centreline over the ground (world x, z) and
-/// whether it is paved (drawn solid) or a dirt track (dashed).
+/// whether it is paved (drawn solid) or a dirt track (dashed), or a
+/// stroke of the radar movie's map ([`MovieMap`]), solid and `width`
+/// metres across.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Road {
     pub points: Vec<[f32; 2]>,
     pub paved: bool,
+    /// Metres across, for a stroke of the movie's map.
+    pub width: Option<f32>,
     /// Least x and z, then greatest.
     pub bounds: [f32; 4],
 }
@@ -223,7 +245,16 @@ impl Road {
         Self {
             points,
             paved,
+            width: None,
             bounds,
+        }
+    }
+
+    /// A stroke of the movie's map, `width` metres across.
+    pub fn stroke(points: Vec<[f32; 2]>, width: f32) -> Self {
+        Self {
+            width: Some(width),
+            ..Self::new(points, true)
         }
     }
 
@@ -363,6 +394,160 @@ pub fn radar_map(heights: &Heights, sea_level: f32) -> Vec<u8> {
         .collect()
 }
 
+/// Metres of the world to one pixel of the radar movie's map: the movie
+/// moves its map by the location it is given over 4 (`currentLocation`,
+/// `insidemap_mc._x = -x / 4`), and divides its zones' points by 4 alike.
+/// Fitting the map's sea to the terrain's agrees (best at 4.00 between
+/// 3.5 and 4.5).
+pub const MAP_SCALE: f32 = 4.0;
+/// Where the world's origin lies on the radar movie's map, in its
+/// pixels. Fitted to the island (2026-10-16): the 1,398 roads with a lane
+/// of traffic lie on the map's strokes best here (84% of their length
+/// within 2 pixels), and its sea on the terrain's under the sea level
+/// best one pixel further each way (IoU 0.886); the movie's zones are
+/// placed with (35, 40) metres added, which puts them 2 to 3 pixels off
+/// this (not read in the engine).
+pub const MAP_ORIGIN: [f32; 2] = [-11.0, -13.0];
+
+/// World `(x, z)` of a point of the radar movie's map: the movie's `+x`
+/// and `+y` run towards the world's `-x` and `-z`.
+pub fn map_to_world([u, v]: [f32; 2]) -> [f32; 2] {
+    [
+        (MAP_ORIGIN[0] - u) * MAP_SCALE,
+        (MAP_ORIGIN[1] - v) * MAP_SCALE,
+    ]
+}
+
+/// The radar's map as its movie (`minimap.gfx`) has it: the shape its
+/// `roads_mc` shows, 2,048 pixels square, of the sea and rivers (a
+/// translucent blue fill) and the roads (strokes of olive, the dirt
+/// tracks as runs of short dashes), in world `(x, z)`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MovieMap {
+    /// The water's triangles.
+    pub water: Vec<[[f32; 2]; 3]>,
+    /// The strokes, each a run of edges end to end in one line style.
+    pub roads: Vec<Road>,
+}
+
+/// The shape the radar movie's `roads_mc` shows, with its triangles: the
+/// sprite placed under that name, and the first shape on its timeline.
+pub fn roads_shape(lib: &Library) -> Option<&(Shape, Vec<ShapeTriangle>)> {
+    let timelines = std::iter::once(&lib.root).chain(lib.sprites.values());
+    let sprite = timelines
+        .flat_map(|t| t.frames.iter().flatten())
+        .find_map(|c| match c {
+            Control::Place(p) if p.name.as_deref() == Some("roads_mc") => p.character,
+            _ => None,
+        })?;
+    lib.sprites
+        .get(&sprite)?
+        .frames
+        .iter()
+        .flatten()
+        .find_map(|c| match c {
+            Control::Place(p) => p.character.and_then(|id| lib.shapes.get(&id)),
+            _ => None,
+        })
+}
+
+impl MovieMap {
+    /// The map of the radar's `shape` (see [`roads_shape`]), its
+    /// triangles `mesh` ([`Shape::mesh`]): water where a translucent fill
+    /// bluer than red covers, a road along each stroke wider than
+    /// nothing.
+    pub fn new(shape: &Shape, mesh: &[ShapeTriangle]) -> Self {
+        let watery = |i: usize| matches!(shape.fills.get(i), Some(Fill::Solid([r, _, b, a])) if *a > 0.0 && *a < 1.0 && b > r);
+        let water = mesh
+            .iter()
+            .filter(|t| matches!(t.style, Style::Fill(i) if watery(i)))
+            .map(|t| t.corners.map(map_to_world))
+            .collect();
+        let mut roads: Vec<Road> = Vec::new();
+        let mut run: Vec<[f32; 2]> = Vec::new();
+        let mut run_line = 0;
+        for e in &shape.edges {
+            let width = shape.lines.get(e.line).map_or(0.0, |l| l.width);
+            let joins = e.line == run_line && run.last() == Some(&e.from);
+            if !joins && run.len() > 1 {
+                roads.push(Road::stroke(
+                    run.iter().map(|&p| map_to_world(p)).collect(),
+                    shape.lines[run_line].width * MAP_SCALE,
+                ));
+            }
+            if !joins {
+                run.clear();
+            }
+            if width <= 0.0 {
+                run_line = 0;
+                continue;
+            }
+            run_line = e.line;
+            if run.is_empty() {
+                run.push(e.from);
+            }
+            if let Some(c) = e.control {
+                // A curve, in pieces of about a pixel.
+                let span = (c[0] - e.from[0]).hypot(c[1] - e.from[1])
+                    + (e.to[0] - c[0]).hypot(e.to[1] - c[1]);
+                let n = (span.ceil() as usize).clamp(2, 32);
+                run.extend((1..n).map(|i| {
+                    let t = i as f32 / n as f32;
+                    let u = 1.0 - t;
+                    std::array::from_fn(|k| {
+                        u * u * e.from[k] + 2.0 * u * t * c[k] + t * t * e.to[k]
+                    })
+                }));
+            }
+            run.push(e.to);
+        }
+        if run.len() > 1 && run_line != 0 {
+            roads.push(Road::stroke(
+                run.iter().map(|&p| map_to_world(p)).collect(),
+                shape.lines[run_line].width * MAP_SCALE,
+            ));
+        }
+        Self { water, roads }
+    }
+
+    /// The water as the radar's map is laid ([`Heights`]' grid, `size`
+    /// pixels over an island `island` metres square): [`WATER`] where a
+    /// pixel's centre lies in the water, the rest [`LAND`].
+    pub fn image(&self, size: usize, island: f32) -> Vec<u8> {
+        let mut wet = vec![false; size * size];
+        let grid = Heights::new(size, island);
+        let max = size as f32 - 1.0;
+        for tri in &self.water {
+            let p = tri.map(|[x, z]| {
+                let [u, v] = grid.uv(x, z);
+                [u * size as f32, v * size as f32]
+            });
+            let area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1])
+                - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+            if area.abs() < 1e-9 {
+                continue;
+            }
+            let lo = |i: usize| p[0][i].min(p[1][i]).min(p[2][i]).floor().clamp(0.0, max) as usize;
+            let hi = |i: usize| p[0][i].max(p[1][i]).max(p[2][i]).ceil().clamp(0.0, max) as usize;
+            for y in lo(1)..=hi(1) {
+                for x in lo(0)..=hi(0) {
+                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let wa =
+                        ((p[1][0] - px) * (p[2][1] - py) - (p[2][0] - px) * (p[1][1] - py)) / area;
+                    let wb =
+                        ((p[2][0] - px) * (p[0][1] - py) - (p[0][0] - px) * (p[2][1] - py)) / area;
+                    if wa >= 0.0 && wb >= 0.0 && wa + wb <= 1.0 {
+                        wet[y * size + x] = true;
+                    }
+                }
+            }
+        }
+        wet.into_iter()
+            .flat_map(|w| if w { WATER } else { LAND })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +669,157 @@ mod tests {
         assert!((share - 2.0 / 3.0).abs() < 1e-6);
         let road = Road::new(points.to_vec(), true);
         assert!(road.near([1.5, 20.0], 25.0) && !road.near([1.5, 30.0], 25.0));
+    }
+
+    #[test]
+    fn the_movie_map_lies_a_quarter_metre_a_pixel_turned_half_round() {
+        assert_eq!(map_to_world(MAP_ORIGIN), [0.0, 0.0]);
+        let [x, z] = map_to_world([MAP_ORIGIN[0] + 1.0, MAP_ORIGIN[1] + 2.0]);
+        assert_eq!([x, z], [-MAP_SCALE, -2.0 * MAP_SCALE]);
+    }
+
+    /// A shape of `edges` with the radar's styles: fill 1 the sea's
+    /// translucent blue, fill 2 opaque black; line 1 three pixels wide.
+    fn radar_like(edges: Vec<crate::flash::Edge>) -> Shape {
+        use crate::flash::Line;
+        Shape {
+            bounds: [-16.0, -16.0, 16.0, 16.0],
+            fills: vec![
+                Fill::Solid([0.0; 4]),
+                Fill::Solid([0.25, 0.5, 1.0, 0.3]),
+                Fill::Solid([0.0, 0.0, 0.0, 1.0]),
+            ],
+            lines: vec![
+                Line {
+                    width: 0.0,
+                    colour: [0.0; 4],
+                },
+                Line {
+                    width: 3.0,
+                    colour: [0.38, 0.38, 0.13, 1.0],
+                },
+            ],
+            edges,
+        }
+    }
+
+    fn edge(from: [f32; 2], to: [f32; 2], fill1: usize, line: usize) -> crate::flash::Edge {
+        crate::flash::Edge {
+            from,
+            control: None,
+            to,
+            fill0: 0,
+            fill1,
+            line,
+        }
+    }
+
+    #[test]
+    fn the_movie_map_takes_the_blue_fill_as_water_and_each_run_of_strokes_as_a_road() {
+        let square = |fill| {
+            let c = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+            (0..4).map(move |i| edge(c[i], c[(i + 1) % 4], fill, 0))
+        };
+        let mut edges: Vec<_> = square(1).collect();
+        edges.extend(square(2).map(|mut e| {
+            e.from[0] += 20.0;
+            e.to[0] += 20.0;
+            e
+        }));
+        // Two strokes end to end (one road), a dash apart from them (a
+        // second), and an edge of no line (none).
+        edges.push(edge([-10.0, -10.0], [-5.0, -10.0], 0, 1));
+        edges.push(edge([-5.0, -10.0], [-5.0, -5.0], 0, 1));
+        edges.push(edge([-3.0, -5.0], [-1.0, -5.0], 0, 1));
+        edges.push(edge([-1.0, -5.0], [5.0, -5.0], 0, 0));
+        let shape = radar_like(edges);
+        let map = MovieMap::new(&shape, &shape.mesh());
+        // The blue square, not the black one: 100 square pixels of 16 m2.
+        let area: f32 = map
+            .water
+            .iter()
+            .map(|[a, b, c]| {
+                ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0
+            })
+            .sum();
+        assert!((area - 100.0 * MAP_SCALE * MAP_SCALE).abs() < 1.0, "{area}");
+        let corner = map_to_world([10.0, 10.0]);
+        assert!(map.water.iter().flatten().any(|p| *p == corner));
+        assert!(
+            map.water
+                .iter()
+                .flatten()
+                .all(|p| p[0] > map_to_world([20.0, 0.0])[0])
+        );
+        assert_eq!(map.roads.len(), 2);
+        assert_eq!(
+            map.roads[0].points,
+            [[-10.0, -10.0], [-5.0, -10.0], [-5.0, -5.0]].map(map_to_world)
+        );
+        assert_eq!(map.roads[0].width, Some(3.0 * MAP_SCALE));
+        assert_eq!(map.roads[1].points.len(), 2);
+    }
+
+    #[test]
+    fn a_curved_stroke_is_followed_in_pieces_of_about_a_pixel() {
+        let mut e = edge([0.0, 0.0], [8.0, 0.0], 0, 1);
+        e.control = Some([4.0, 4.0]);
+        let shape = radar_like(vec![e]);
+        let map = MovieMap::new(&shape, &[]);
+        let line = &map.roads[0].points;
+        assert!(line.len() >= 9, "{}", line.len());
+        // Halfway along, the curve is halfway to its control point.
+        assert!(line.contains(&map_to_world([4.0, 2.0])));
+    }
+
+    #[test]
+    fn the_roads_shape_is_the_one_placed_as_roads_mc() {
+        use crate::flash::player::{Place, Timeline};
+        use std::rc::Rc;
+        let place = |character, name: Option<&str>| {
+            Control::Place(Place {
+                depth: 1,
+                character: Some(character),
+                name: name.map(str::to_owned),
+                ..Place::default()
+            })
+        };
+        let timeline = |c| {
+            Rc::new(Timeline {
+                frames: vec![vec![c]],
+                ..Timeline::default()
+            })
+        };
+        let mut lib = Library::default();
+        let shape = radar_like(vec![edge([0.0, 0.0], [1.0, 0.0], 0, 1)]);
+        lib.shapes.insert(4, (shape.clone(), Vec::new()));
+        lib.shapes.insert(6, (Shape::default(), Vec::new()));
+        lib.sprites.insert(5, timeline(place(4, None)));
+        lib.sprites.insert(7, timeline(place(6, None)));
+        lib.sprites
+            .insert(12, timeline(place(7, Some("zoneHolder_mc"))));
+        assert!(roads_shape(&lib).is_none());
+        lib.sprites.insert(13, timeline(place(5, Some("roads_mc"))));
+        assert_eq!(roads_shape(&lib).map(|(s, _)| s), Some(&shape));
+    }
+
+    #[test]
+    fn the_map_image_is_water_where_the_movie_has_it() {
+        // One triangle over the island's top-left quarter (+x, +z).
+        let map = MovieMap {
+            water: vec![[[4000.0, 4000.0], [0.0, 4000.0], [4000.0, 0.0]]],
+            roads: Vec::new(),
+        };
+        let rgba = map.image(8, 8000.0);
+        let wet: Vec<usize> = rgba
+            .chunks(4)
+            .enumerate()
+            .filter(|(_, p)| *p == WATER)
+            .map(|(i, _)| i)
+            .collect();
+        // The pixels of the map's top-left 4 x 4 whose centres lie on or
+        // above its diagonal x + y = 4.
+        assert_eq!(wet, [0, 1, 2, 3, 8, 9, 10, 16, 17, 24]);
+        assert!(rgba.chunks(4).filter(|p| *p == LAND).count() == 64 - wet.len());
     }
 }
