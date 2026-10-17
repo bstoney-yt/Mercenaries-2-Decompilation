@@ -219,6 +219,9 @@ struct Options {
     probe: bool,
     /// `--riders`: seat the vehicles' riders before the picture.
     riders: bool,
+    /// `--take` (with `--riders`): she takes the nearest seated driver's
+    /// vehicle before the picture.
+    take: bool,
     /// With `--aim` (or `--drive --look`): fire just before the picture.
     fire: bool,
     /// With `--screenshot` on foot: hits she takes just before the
@@ -621,6 +624,7 @@ fn parse_args() -> anyhow::Result<Options> {
             }
             "--probe" => o.probe = true,
             "--riders" => o.riders = true,
+            "--take" => o.take = true,
             "--fire" => o.fire = true,
             "--look-pickup" => {
                 o.look_pickup = Some(value()?.parse().context("--look-pickup expects metres")?)
@@ -1066,13 +1070,16 @@ fn render(
 /// Plays `seconds` on, logging the traffic every five seconds.
 /// `--riders`: seats the riders of the vehicles near her, as play does
 /// every tick ([`hijack::Hijacks::seat`]), waiting up to 90 s for the
-/// clips and their people's models, and logs how they came out.
+/// clips and their people's models, and logs how they came out. `take`:
+/// then she takes the nearest seated driver's vehicle, as the use key
+/// does, and the log says where whoever was put out is 3 s on.
 fn riders_for_screenshot(
     backend: &mut WgpuBackend,
     game: &mut Game,
     install: &Install,
     fov: f32,
     aspect: f32,
+    take: bool,
 ) -> anyhow::Result<()> {
     let tick = TICK.as_secs_f32();
     let mut h = hijack::Hijacks::start(install, None);
@@ -1123,6 +1130,77 @@ fn riders_for_screenshot(
         }
     }
     eprintln!("riders: for the picture {:?}", h.riders);
+    if take {
+        take_for_screenshot(backend, game, &mut h, fov, aspect)?;
+    }
+    Ok(())
+}
+
+/// `--take`: she takes the vehicle of the nearest seated driver; 3 s on,
+/// where those put out are and what they do.
+fn take_for_screenshot(
+    backend: &mut WgpuBackend,
+    game: &mut Game,
+    h: &mut hijack::Hijacks,
+    fov: f32,
+    aspect: f32,
+) -> anyhow::Result<()> {
+    let tick = TICK.as_secs_f32();
+    let here = game.focus();
+    let driven = |v: &scene::ParkedVehicle| {
+        v.crew
+            .iter()
+            .any(|(seat, _)| seat.to_ascii_lowercase().contains("driver"))
+    };
+    let pick = game
+        .scene
+        .riders
+        .iter()
+        .filter(|r| game.scene.vehicles.get(r.vehicle).is_some_and(driven))
+        .map(|r| {
+            (
+                r.vehicle,
+                r.frame.transform_point3(m2_math::glam::Vec3::ZERO),
+            )
+        })
+        .min_by(|a, b| a.1.distance(here).total_cmp(&b.1.distance(here)));
+    let Some((i, at)) = pick else {
+        eprintln!("take: no seated driver to take a vehicle from");
+        return Ok(());
+    };
+    let before = game.scene.people.npcs.len();
+    if let Some(p) = game.scene.player.as_mut() {
+        p.character.position = at;
+        p.driving = Some(i);
+        p.landed = true;
+    }
+    game.take_from_driver(i);
+    let out = game.scene.people.npcs.len() - before;
+    eprintln!(
+        "take: the {} at {:.1?}: {out} put out",
+        game.scene.vehicles[i].spec.label,
+        at.to_array()
+    );
+    for t in 0..180 {
+        game.step(Intent::default(), tick);
+        h.seat(game, tick);
+        if t % 10 == 0 {
+            render(backend, game, fov, aspect, None)?;
+        }
+    }
+    let seated = game.scene.riders.iter().filter(|r| r.vehicle == i).count();
+    for n in &game.scene.people.npcs[before..] {
+        let p = n.character.position;
+        eprintln!(
+            "take: put out, 3 s on: {:.1} m from the seat at {:.1?}, {}, alive {}, landed {}",
+            p.distance(at),
+            p.to_array(),
+            n.doing(),
+            n.alive,
+            n.landed
+        );
+    }
+    eprintln!("take: riders still drawn in it: {seated}");
     Ok(())
 }
 
@@ -1378,7 +1456,7 @@ fn screenshot(
     if options.riders
         && let Some(install) = install
     {
-        riders_for_screenshot(&mut backend, &mut game, install, fov, aspect)?;
+        riders_for_screenshot(&mut backend, &mut game, install, fov, aspect, options.take)?;
     }
     game.scene.hide_fx = options.no_fx;
     if options.old_fx {
@@ -3808,6 +3886,7 @@ fn drive_for_screenshot(
                 .map(|(i, _)| i);
             if let (Some(i), Some(p)) = (pick, game.scene.player.as_mut()) {
                 p.driving = Some(i);
+                game.take_from_driver(i);
             }
             pick.is_some()
         }

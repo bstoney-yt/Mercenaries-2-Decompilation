@@ -797,7 +797,23 @@ impl Game {
                             // back in before the ground streamed).
                             if let Some(i) = player.driving {
                                 player.landed = true;
-                                take_seat(&mut scene.vehicles[i]);
+                                let db = &world.index.template_db;
+                                let out = take_seat(&mut scene.vehicles[i])
+                                    .into_iter()
+                                    .map(|who| {
+                                        let model = db.get(&who).and_then(|t| t.model);
+                                        (who, model)
+                                    })
+                                    .collect();
+                                put_out(
+                                    &mut scene.people,
+                                    &scene.riders,
+                                    &scene.vehicles[i],
+                                    physics,
+                                    i,
+                                    out,
+                                    player.character.position,
+                                );
                             }
                         }
                     }
@@ -1781,7 +1797,36 @@ impl Game {
             reach,
         );
         player.landed |= player.driving.is_some();
-        player.driving.is_some()
+        let Some(i) = player.driving else {
+            return false;
+        };
+        self.take_from_driver(i);
+        true
+    }
+
+    /// She sits in vehicle `i`'s driver's seat, as the use key has it:
+    /// whoever drove it is put out.
+    pub fn take_from_driver(&mut self, i: usize) {
+        let (Some(world), Some(player)) = (&self.scene.world, &self.scene.player) else {
+            return;
+        };
+        let db = &world.index.template_db;
+        let out = take_seat(&mut self.scene.vehicles[i])
+            .into_iter()
+            .map(|who| {
+                let model = db.get(&who).and_then(|t| t.model);
+                (who, model)
+            })
+            .collect();
+        put_out(
+            &mut self.scene.people,
+            &self.scene.riders,
+            &self.scene.vehicles[i],
+            &world.physics,
+            i,
+            out,
+            player.character.position,
+        );
     }
 
     /// Loads the first of `models` that drives and parks it near her, as
@@ -2886,12 +2931,54 @@ fn has_driver(crew: &[(String, String)]) -> bool {
 
 /// She gets into `v`'s driver's seat: whoever drove it is put out (its
 /// crew forgets them: playtest 4, no car could be taken from traffic).
-fn take_seat(v: &mut ParkedVehicle) {
-    let before = v.crew.len();
-    v.crew
-        .retain(|(seat, _)| !seat.to_ascii_lowercase().contains("driver"));
-    if v.crew.len() < before {
+/// The templates of those put out.
+fn take_seat(v: &mut ParkedVehicle) -> Vec<String> {
+    let (out, kept) = std::mem::take(&mut v.crew)
+        .into_iter()
+        .partition(|(seat, _)| seat.to_ascii_lowercase().contains("driver"));
+    v.crew = kept;
+    if !out.is_empty() {
         eprintln!("hijack: she takes the {} from its driver", v.spec.label);
+    }
+    out.into_iter().map(|(_, who)| who).collect()
+}
+
+/// Those put out of vehicle `v`'s (`vehicles[i]`) seats (`out`, by
+/// template and its own model) stand by its door, in the looks they had
+/// seated, and run from her (at `her`): in playtest 6 the driver she took
+/// a car from was gone.
+fn put_out(
+    people: &mut crate::npc::People,
+    riders: &[crate::hijack::Rider],
+    v: &ParkedVehicle,
+    physics: &Physics,
+    i: usize,
+    out: Vec<(String, Option<u32>)>,
+    her: Vec3,
+) {
+    let Some(at) =
+        v.id.and_then(|id| physics.vehicle_transform(id))
+            .filter(|at| at.is_finite())
+    else {
+        return;
+    };
+    let door = door_out(at, &v.spec) + Vec3::Y * 0.5;
+    for (who, model) in out {
+        let kind = people.rider_kind(&who, model);
+        let outfit = riders
+            .iter()
+            .find(|r| r.vehicle == i && Some(r.kind) == kind)
+            .map(|r| r.outfit.clone());
+        let stood = people.put_out(&who, model, outfit, door, her);
+        eprintln!(
+            "hijack: {who} put out at {:.1?}: {}",
+            door.to_array(),
+            if stood {
+                "stands there"
+            } else {
+                "their kind isn't in: not drawn"
+            }
+        );
     }
 }
 

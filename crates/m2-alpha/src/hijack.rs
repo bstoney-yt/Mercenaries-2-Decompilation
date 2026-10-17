@@ -882,7 +882,7 @@ impl Hijacks {
                     }
                     let Some(bound) = self.rider_clips[&seat.clip]
                         .clone()
-                        .and_then(|c| m2_engine::BoundClip::bind(seat.clip, c, &k.rig.skeleton))
+                        .and_then(|c| bind_rider(seat.clip, c, &k.rig.skeleton, &k.role))
                     else {
                         self.rider_unbound.insert((seat.clip, kind));
                         tally.no_clip += 1;
@@ -1586,6 +1586,30 @@ fn bind(game: &mut Game, hash: u32) -> Option<usize> {
         }
     };
     Some(index)
+}
+
+/// A rider's seat clip on the skeleton of their kind (`role`, for the
+/// log): every track on a bone, else (people's skeletons differ from the
+/// heroes' in a few bones, as [`m2_engine::BoundClip::rebind`] has it)
+/// most of them, the rest left out.
+fn bind_rider(
+    hash: u32,
+    clip: Clip,
+    skeleton: &m2_engine::Skeleton,
+    role: &str,
+) -> Option<m2_engine::BoundClip> {
+    let (found, tracks) = m2_engine::BoundClip::tracks_found(&clip, skeleton);
+    let bound = m2_engine::BoundClip::bind(hash, clip.clone(), skeleton)
+        .or_else(|| m2_engine::BoundClip::bind_family(hash, clip, skeleton));
+    if found < tracks {
+        let how = if bound.is_some() {
+            "bound without the rest"
+        } else {
+            "not bound"
+        };
+        eprintln!("rider: clip {hash:08x} on {role}: {found} of {tracks} tracks on a bone: {how}");
+    }
+    bound
 }
 
 /// Plays clip `hash` on her once; its index in her rig's clips.
