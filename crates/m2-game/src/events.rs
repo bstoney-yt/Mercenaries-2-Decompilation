@@ -149,6 +149,8 @@ struct Pending {
     /// the button it counted last.
     read: Option<usize>,
     memo: Option<u32>,
+    /// It has been checked against the world once.
+    checked: bool,
     /// The scripts' state, to make tables to pass.
     lua: LuaHandle,
 }
@@ -265,6 +267,7 @@ impl Events {
                         made: now,
                         read: None,
                         memo: None,
+                        checked: false,
                         lua: LuaHandle(lua.weak()),
                     });
                     Ok(MultiValue::from_vec(vec![Value::Number(f64::from(id))]))
@@ -564,6 +567,22 @@ impl Events {
                     // Fires for each object as the condition starts to
                     // hold for it; once only, unless persistent.
                     Check::Each(members) => {
+                        // A death over a label (alone or a filter's) counts
+                        // those dying from when it was made: who of the
+                        // label lay dead at its first check doesn't fire it
+                        // (playtest 5: the villa's wave objective, 10 of
+                        // label `VZ`, was met at once by the VZ she had
+                        // killed before). Objects named one by one still
+                        // fire, dead already or not.
+                        if !p.checked && p.kind == "ObjectDeath" {
+                            let labelled = by_label(&p.params, world);
+                            p.held_by = members
+                                .iter()
+                                .filter(|m| m.1 && labelled.contains(&m.0))
+                                .map(|m| m.0)
+                                .collect();
+                        }
+                        p.checked = true;
                         let mut rising = Vec::new();
                         let mut held_by = BTreeSet::new();
                         for (g, holds, extra) in members {
@@ -756,6 +775,26 @@ enum Check {
     Crossings(Vec<(u32, bool, Vec<Value>)>),
     /// A kind no check knows: it never fires.
     Unhandled,
+}
+
+/// The objects parameter 1 names by a label, alone or an object filter's
+/// (as they come and go), not one by one.
+fn by_label(t: &Table, world: &dyn World) -> Vec<u32> {
+    match t.raw_get::<Value>(1) {
+        Ok(Value::Table(f)) => match f.raw_get::<Option<String>>("label") {
+            Ok(Some(label)) => world.labelled(&label),
+            _ => Vec::new(),
+        },
+        Ok(Value::String(s)) => {
+            let s = s.to_string_lossy();
+            if s.eq_ignore_ascii_case("hero") {
+                Vec::new()
+            } else {
+                world.labelled(&s)
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The objects a parameter names: a guid, `"hero"` (the player), or a
@@ -1310,6 +1349,38 @@ mod tests {
             ["awake 3", "dead 7,7", "near 1", "posted x,y", "seat 1,99"]
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn deaths_of_a_label_count_from_when_the_event_was_made() {
+        let (host, events) = setup();
+        host.lua()
+            .load(
+                r#"
+                Event.CreatePersistent(Event.ObjectDeath, { "tank" },
+                    function(g) table.insert(log, "dead " .. tostring(gid(g))) end)
+                -- An object filter as `api`'s makes it, with a label.
+                local f = { objs = {}, ex = {}, players = false, label = "tank" }
+                Event.CreatePersistent(Event.ObjectDeath, { f },
+                    function(g) table.insert(log, "filter " .. tostring(gid(g))) end)
+                Event.Create(Event.ObjectDeath, { 4 },
+                    function(g) table.insert(log, "one " .. tostring(gid(g))) end)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        // 4 lay dead before: only the lone object's event fires for it.
+        let mut world = TestWorld {
+            dead: vec![4],
+            ..TestWorld::default()
+        };
+        events.update(0.1, &world);
+        assert_eq!(log(&host), ["one 4"]);
+        world.dead.push(5);
+        events.update(0.1, &world);
+        let mut got = log(&host);
+        got.sort();
+        assert_eq!(got, ["dead 5", "filter 5", "one 4"]);
     }
 
     #[test]

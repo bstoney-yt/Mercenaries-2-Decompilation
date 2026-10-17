@@ -94,6 +94,42 @@ fn main() -> Result<(), Error> {
         }
     }
 
+    // Ground the water drawn would cover (terrain vertices more than 5 cm
+    // under its surface), each point taken as the flat square from it on
+    // towards +x and +z (playtest 5) or as a corner of a surface running
+    // between the points (playtest 6); over the island and round the
+    // villa's terrace (2500, -864), where the playtest's water stood over
+    // the walkway.
+    let flat = |x: f32, z: f32| {
+        let c = ((x - water.origin[0]) / water.cell).floor();
+        let r = ((z - water.origin[1]) / water.cell).floor();
+        (c >= 0.0 && r >= 0.0)
+            .then(|| water.get(c as usize, r as usize))
+            .flatten()
+            .filter(|&h| h > sea)
+    };
+    let between = |x: f32, z: f32| water.surface(x, z).filter(|&h| h > sea);
+    for (name, model) in [
+        ("flat squares", &flat as &dyn Fn(f32, f32) -> Option<f32>),
+        ("between points", &between),
+    ] {
+        let (mut all, mut villa, mut terrace) = (0usize, 0usize, 0usize);
+        for v in &verts {
+            if model(v[0], v[2]).is_some_and(|h| v[1] < h - 0.05) {
+                all += 1;
+                if (v[0] - 2560.0).abs() < 160.0 && (v[2] + 920.0).abs() < 160.0 {
+                    villa += 1;
+                }
+                if (v[0] - 2508.0).abs() < 24.0 && (v[2] + 856.0).abs() < 24.0 {
+                    terrace += 1;
+                }
+            }
+        }
+        println!(
+            "{name}: ground under inland water {all} vertices; within 160 m of the villa {villa}; on the terrace (2508, -856) +-24 m {terrace}"
+        );
+    }
+
     if let Some(at) = args.get(1) {
         let xz: Vec<f32> = at
             .split(',')

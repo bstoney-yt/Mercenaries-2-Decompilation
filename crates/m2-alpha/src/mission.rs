@@ -2602,10 +2602,38 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
             }
             return false;
         }
+        // A person on foot sent to a place (PmcCon001's beaten soldiers
+        // running for `loc_EntourageFleePoint`): they run there.
+        Command::Goal {
+            guid,
+            goal,
+            target: Some(to),
+            ..
+        } if goal == "MoveTo"
+            && game
+                .scene
+                .world
+                .as_ref()
+                .is_some_and(|w| is_spawn(w, *guid)) =>
+        {
+            let at = mission
+                .world()
+                .borrow()
+                .objects
+                .get(to)
+                .map(|o| Vec3::from(o.position));
+            if let Some(at) = at {
+                eprintln!("mission: {guid:#x} runs to {to:#x} at {at:.1}");
+                game.scene.people.walk(*guid, vec![at]);
+            }
+            return false;
+        }
         // A driver sent along a path (PmcCon001's villa tank, through the
         // garage wall the scripts have just killed): its vehicle drives it
-        // ([`crate::paths`]). A person on foot sent along one isn't walked
-        // yet (the villa's wave soldiers).
+        // ([`crate::paths`]). A person on foot runs it ([`People::walk`]:
+        // the villa's wave soldiers).
+        //
+        // [`People::walk`]: crate::npc::People::walk
         Command::Goal {
             guid,
             goal,
@@ -2625,6 +2653,22 @@ fn obey(game: &mut Game, mission: &Mission, fleet: &mut Fleet, c: &Command) -> b
                         route[route.len() - 1]
                     );
                     game.paths.start(v, route, haste.unwrap_or(1.0));
+                }
+                // A person on foot (the villa's wave soldiers, coming in
+                // through the garage and over the walls): they run it.
+                None if !route.is_empty()
+                    && game
+                        .scene
+                        .world
+                        .as_ref()
+                        .is_some_and(|w| is_spawn(w, *guid)) =>
+                {
+                    eprintln!(
+                        "mission: {guid:#x} runs along path {path:#x} ({} points) to {:.1?}",
+                        route.len(),
+                        route[route.len() - 1]
+                    );
+                    game.scene.people.walk(*guid, route);
                 }
                 _ => eprintln!(
                     "mission: PathMove for {guid:#x} along {path:#x} not driven (vehicle \

@@ -12,8 +12,9 @@
 //!   129), then two f32 words not named (-49.83 and 0.0057).
 //! - `+0x2c` the fine grid: columns x rows f32 heights, row-major, rows
 //!   along +z: points 32 m apart from -4096 to 4096 m (257 points span
-//!   256 cells), each taken as the height of the square around it
-//!   (inferred). Round DV read them from `+0x24`, two points early, which
+//!   256 cells), taken as the corners of a surface running between them
+//!   ([`WaterHeights::surface`]; inferred, playtest 6: as flat squares
+//!   they stood water over slopes). Round DV read them from `+0x24`, two points early, which
 //!   put every pool and lake 64 m east of where the data has it: the
 //!   per-point mask below lines up with the heights only from `+0x2c`
 //!   (66,038 of 66,049 points from `+0x24`, all from `+0x2c`), and the
@@ -132,8 +133,9 @@ impl WaterHeights {
     }
 
     /// The water height over world (`x`, `z`): the point whose square,
-    /// from the point on towards +x and +z, holds it (as the alpha draws
-    /// it; inferred). `None` where there is none or outside the grid.
+    /// from the point on towards +x and +z, holds it. `None` where there is
+    /// none or outside the grid. Playtest 5's reading; [`Self::surface`]
+    /// is the one drawn.
     pub fn at(&self, x: f32, z: f32) -> Option<f32> {
         let c = ((x - self.origin[0]) / self.cell).floor();
         let r = ((z - self.origin[1]) / self.cell).floor();
@@ -142,6 +144,47 @@ impl WaterHeights {
         }
         self.get(c as usize, r as usize)
             .filter(|&h| h > NO_WATER + 1.0)
+    }
+
+    /// The four points round the cell (`column`, `row`): its corners from
+    /// the point on towards +x and +z, in the order (0, 0), (1, 0),
+    /// (1, 1), (0, 1). `None` at the grid's last row or column.
+    pub fn corners(&self, column: usize, row: usize) -> Option<[f32; 4]> {
+        Some([
+            self.get(column, row)?,
+            self.get(column + 1, row)?,
+            self.get(column + 1, row + 1)?,
+            self.get(column, row + 1)?,
+        ])
+    }
+
+    /// The water's surface over world (`x`, `z`), the points taken as the
+    /// corners of a surface running between them (bilinear across each
+    /// cell), dry points and the sea's included: where one corner has a
+    /// pool and the next none, the surface dives under the ground between
+    /// them. `None` outside the grid or where no corner has water.
+    ///
+    /// Inferred (playtest 6): read as flat squares, the points along
+    /// slopes (the villa terrace's -17.6 between the -14.9 pool and the
+    /// -36 sea, a river's steps downhill) stood water over the ground
+    /// beside them, and the squares put VzaCon001's moat a cell wider than
+    /// its banks; read between points, the moat spans x -1536..-1472
+    /// (round EA's eye fit: -1530..-1465).
+    pub fn surface(&self, x: f32, z: f32) -> Option<f32> {
+        let u = (x - self.origin[0]) / self.cell;
+        let v = (z - self.origin[1]) / self.cell;
+        if u < 0.0 || v < 0.0 {
+            return None;
+        }
+        let (c, r) = (u.floor(), v.floor());
+        let [h00, h10, h11, h01] = self.corners(c as usize, r as usize)?;
+        if [h00, h10, h11, h01].iter().all(|&h| h <= NO_WATER + 1.0) {
+            return None;
+        }
+        let (fu, fv) = (u - c, v - r);
+        let bottom = h00 + (h10 - h00) * fu;
+        let top = h01 + (h11 - h01) * fu;
+        Some(bottom + (top - bottom) * fv)
     }
 }
 
@@ -200,6 +243,29 @@ mod tests {
             w.wet,
             [false, true, false, true, true, false, false, false, true]
         );
+    }
+
+    #[test]
+    fn the_surface_runs_between_the_points() {
+        let w = WaterHeights::parse_section(&section(
+            3,
+            2,
+            32.0,
+            &[
+                -14.9, -36.0, -50.0, //
+                -14.9, -14.9, -50.0,
+            ],
+        ))
+        .unwrap();
+        // On a point, its height; halfway to the sea's, halfway down.
+        assert_eq!(w.surface(-32.0, -16.0), Some(-14.9));
+        assert!((w.surface(-16.0, -16.0).unwrap() - -25.45).abs() < 1e-4);
+        // Between a pool's point and a dry one, under both.
+        assert!(w.surface(16.0, 0.0).unwrap() < -30.0);
+        // The last row and column bound no cell.
+        assert_eq!(w.corners(2, 0), None);
+        assert_eq!(w.surface(40.0, 0.0), None);
+        assert_eq!(w.surface(-40.0, 0.0), None);
     }
 
     #[test]
