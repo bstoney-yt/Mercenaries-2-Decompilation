@@ -331,8 +331,10 @@ pub fn armed_seats(v: &ParkedVehicle) -> Vec<u32> {
     seats
 }
 
-/// Seconds a clip takes to change (invented, until her reload clip is
-/// measured).
+/// Seconds a clip takes to change when she has no reload clip to play
+/// (invented); with one, the change lasts as long as it (playtest 8: the
+/// rifle's `ReloadIdle` 49288f7f, 1.0 s; inferred, as no gun template
+/// field gives a reload time).
 const RIFLE_RELOAD: f32 = 2.0;
 const RIFLE_RANGE: f32 = 400.0;
 /// What a carbine round does to crates and explosive props (theirs is

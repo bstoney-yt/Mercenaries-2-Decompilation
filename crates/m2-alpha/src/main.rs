@@ -155,6 +155,8 @@ struct Options {
     throw: bool,
     /// With `--screenshot` on foot: bash just before it.
     bash: bool,
+    /// With `--screenshot` on foot: change the rifle's clip just before it.
+    reload: bool,
     /// With `--bash`: the clip (by hash) to bash with, rather than the one
     /// chosen.
     bash_clip: Option<u32>,
@@ -437,6 +439,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--jump" => o.jump = true,
             "--throw" => o.throw = true,
             "--bash" => o.bash = true,
+            "--reload" => o.reload = true,
             "--bash-clip" => {
                 let v = value()?;
                 o.bash_clip = Some(
@@ -1542,6 +1545,11 @@ fn screenshot(
             game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
             game.combat.weapon = options.weapon.unwrap_or(combat::Weapon::Rifle);
         }
+        // `--reload`: rounds spent first, so the clip has room.
+        if options.reload {
+            let r = &mut game.combat.rifle_rounds;
+            r.clip = r.clip.saturating_sub(5);
+        }
         for i in 0..180 {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
@@ -1581,6 +1589,7 @@ fn screenshot(
                 fire: options.fire && i == 177,
                 throw: options.throw && i == 180 - lead,
                 melee: options.bash && i == 180 - lead,
+                reload: options.reload && i == 180 - lead,
                 select: options.weapon.filter(|_| i == 0).or_else(|| {
                     (options.switch && i == 180 - lead).then_some(match game.combat.weapon {
                         combat::Weapon::Rifle => combat::Weapon::Rpg,
