@@ -52,7 +52,7 @@ m2-alpha [options]
   --config <file>        settings file (default m2-alpha.toml)
   --size <w>x<h>         window size
   --vsync on|off
-  --fullscreen
+  --fullscreen           start fullscreen (at the mode the pause menu kept)
   --sea <metres>         sea level (default -36, the game's water shader)
   --double-sided         start with back-face culling off (as F3)
   --screenshot <out.ppm> render one frame offscreen and exit
@@ -270,11 +270,14 @@ itself after a contract (m2-alpha-autosave.toml, with her cash, stock and
 the scripts' own data); putting the scripts back from it on loading is
 not done yet.
 The contract done, Enter closes its fanfare and the flow goes on.
-M music on/off, a click captures the mouse (F2 lets it go), F11 fullscreen,
+M music on/off, a click captures the mouse (F2 lets it go), F11 or
+Alt+Enter fullscreen,
 Escape opens the game's own pause menu (its movie, once the HUD's scripts
 run; up/down through it, left/right a setting, Enter): resume, save,
-options (game, video, audio, controls) and quit. Its kept settings go to
-the settings file. The alpha's own settings (hero, field of view, mouse,
+options (game, video, audio, controls) and quit. Video's Resolution and
+Refresh Rate step through the monitor's modes; a rate is fullscreen at
+that mode, Windowed a window of that size. Its kept settings go to the
+settings file. The alpha's own settings (hero, field of view, mouse,
 vsync, quit to desktop) fold in the top right. Escape closes it.
 An Xbox pad (One, Series or 360) plays as the game's own layout has it:
 left stick move (L3 sprint), right stick look, A jump, B melee, X reload,
