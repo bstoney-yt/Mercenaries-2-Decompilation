@@ -5421,6 +5421,7 @@ mod tests {
             road_wheels: Vec::new(),
             rest: Vec::new(),
             node_wheel: Vec::new(),
+            node_rolls: Vec::new(),
             mass: 32_000.0,
             turret: Vec::new(),
             pivot: None,
