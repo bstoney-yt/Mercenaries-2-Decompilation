@@ -60,6 +60,20 @@ impl SoundBuffer {
         (sum / self.samples.len() as f64).sqrt() as f32
     }
 
+    /// Root-mean-square level of its loudest tenth of a second, 0 to 1:
+    /// how loud a short sound (a shot) strikes, whatever its tail.
+    pub fn punch(&self) -> f32 {
+        let ch = usize::from(self.channels.max(1));
+        let n = (self.rate as usize / 10).max(1) * ch;
+        self.samples
+            .chunks(n)
+            .map(|w| {
+                let sum: f64 = w.iter().map(|&s| (f64::from(s) / 32768.0).powi(2)).sum();
+                (sum / w.len() as f64).sqrt() as f32
+            })
+            .fold(0.0, f32::max)
+    }
+
     /// Level of each tenth of the sound, dB below full scale (silence is
     /// -100).
     pub fn tenths_db(&self) -> Vec<f32> {
@@ -972,6 +986,14 @@ impl KeySounds {
         })
     }
 
+    /// The loudest of its sounds' [`SoundBuffer::punch`].
+    pub fn punch(&self) -> f32 {
+        self.sounds
+            .iter()
+            .map(|(s, _)| s.punch())
+            .fold(0.0, f32::max)
+    }
+
     /// One of its sounds, `pick` (0 to 1) choosing by weight.
     pub fn pick(&self, pick: f32) -> Option<&SoundBuffer> {
         let total: f32 = self.sounds.iter().map(|s| s.1).sum();
@@ -1620,6 +1642,27 @@ mod tests {
         m.set_listener(Vec3::ZERO, -Vec3::Z);
         let turned = m.gains(&right);
         assert!(turned.0 > turned.1);
+    }
+
+    // A shot's punch is its loudest tenth of a second, whatever its tail:
+    // a 0.1 s burst at half scale then 0.9 s at a tenth.
+    #[test]
+    fn punch_is_the_loudest_tenth_of_a_second() {
+        let mut samples = vec![16384_i16; 100];
+        samples.extend(std::iter::repeat_n(3277_i16, 900));
+        let s = SoundBuffer {
+            hash: 1,
+            channels: 1,
+            rate: 1000,
+            samples: samples.into(),
+        };
+        assert!((s.punch() - 0.5).abs() < 1e-3, "{}", s.punch());
+        assert!(s.loudness() < 0.2);
+        let k = KeySounds {
+            sounds: vec![(s, 1.0)],
+            ..KeySounds::default()
+        };
+        assert!((k.punch() - 0.5).abs() < 1e-3);
     }
 
     #[test]

@@ -904,6 +904,8 @@ pub struct ParkedVehicle {
     pub rolled: f32,
     /// Shells its cannon has fired.
     pub fired: u32,
+    /// Rounds its machine gun has fired.
+    pub mg_fired: u32,
     /// Damage it has taken, of its [`most_health`](Self::most_health).
     pub damage: f32,
     /// Its parts as they stand: dented, broken, thrown off
@@ -1224,6 +1226,23 @@ impl ParkedVehicle {
     pub fn rounds(&self) -> Option<u32> {
         let gun = self.spec.tuning.gun.filter(|_| self.spec.cannon())?;
         Some(gun.rounds.saturating_sub(self.fired))
+    }
+
+    /// The machine gun a tank mounts beside its cannon (as
+    /// [`m2_engine::weapons::machine_gun`] finds it: the AMX-30's "Mounted
+    /// Heavy MG (Tank) (VZ)"), and the rounds left in it, of its template's
+    /// `iClipSize` (300, no reserve), as the gun box counts them down;
+    /// `None` without a cannon or such a gun.
+    pub fn machine_gun(&self) -> Option<(&m2_engine::weapons::WeaponSpec, u32)> {
+        if !self.spec.cannon() {
+            return None;
+        }
+        match m2_engine::weapons::machine_gun(&self.spec.armed) {
+            m2_engine::weapons::MachineGun::Mounted(w) if w.clip > 0 => {
+                Some((w, w.clip.saturating_sub(self.mg_fired)))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2151,6 +2170,7 @@ impl Scene {
                 gun: 0.0,
                 rolled: 0.0,
                 fired: 0,
+                mg_fired: 0,
                 damage: 0.0,
                 parts: None,
                 loose: Vec::new(),
@@ -2175,6 +2195,7 @@ impl Scene {
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
+                    mg_fired: 0,
                     damage: 0.0,
                     parts: None,
                     loose: Vec::new(),
@@ -2194,6 +2215,7 @@ impl Scene {
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
+                    mg_fired: 0,
                     damage: 0.0,
                     parts: None,
                     loose: Vec::new(),
