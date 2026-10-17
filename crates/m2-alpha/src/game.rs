@@ -881,7 +881,11 @@ impl Game {
                             },
                             None => intent,
                         };
+                        let waiting = !player.landed;
                         player.update(physics, intent, dt);
+                        if waiting && player.landed && std::mem::take(&mut player.floor_landed) {
+                            log_floor(&scene.props, physics, player.character.position);
+                        }
                     }
                 }
                 // A turret turns after the camera, at its own pace, and
@@ -2921,6 +2925,36 @@ fn shown_name(
         .or_else(|| or.and_then(localized))
         .or_else(|| db.names.get(&t).cloned())
         .unwrap_or_else(|| format!("{t:#x}"))
+}
+
+/// Once she has landed after her floor was taken down: the layers' models
+/// near her and whether each stands with collision, to see what (if
+/// anything) came in its place.
+fn log_floor(props: &Props, physics: &Physics, at: Vec3) {
+    let mut near: Vec<_> = props
+        .shown()
+        .filter(|(_, p)| (p.position - at).with_y(0.0).length() < 40.0)
+        .map(|(e, p)| {
+            let loaded = props.get(e).is_some_and(|(_, l)| l);
+            format!(
+                "{e:#x} model {:08x} at y {:.1} layer {} loaded {loaded} collision {}{}",
+                p.model,
+                p.position.y,
+                props.layer(e).unwrap_or("-"),
+                physics.has_static(m2_engine::physics::StaticKey::Entity(e)),
+                if p.wrecked { " wrecked" } else { "" }
+            )
+        })
+        .collect();
+    near.sort();
+    eprintln!(
+        "player: landed at {:.1?} after her floor went; {} layer models within 40 m:",
+        at.to_array(),
+        near.len()
+    );
+    for n in near {
+        eprintln!("  {n}");
+    }
 }
 
 /// Whether someone sits in the driver's seat of a crew.

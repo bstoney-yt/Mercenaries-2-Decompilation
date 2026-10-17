@@ -1040,10 +1040,22 @@ impl Props {
     /// and failed.
     pub fn counts(&self) -> PropCounts {
         let within = self.reach * self.reach;
+        // Props put up since the nearness was last taken (a state layer's,
+        // before the next update asks for their models) are counted too
+        // (playtest 7: the villa's buildings, put up again as PmcCon001
+        // ended, were not, and she landed 41 m under them).
+        let fresh;
+        let by_model = match &self.near {
+            Some(n) if n.changes == self.changes => Some(&n.by_model),
+            Some(n) => {
+                fresh = self.nearness(n.focus);
+                Some(&fresh)
+            }
+            None => None,
+        };
         let near = self.waiting.iter().filter(|h| {
-            self.near
-                .as_ref()
-                .and_then(|n| n.by_model.get(h))
+            by_model
+                .and_then(|n| n.get(h))
                 .is_some_and(|&d| d <= within)
         });
         PropCounts {
