@@ -561,6 +561,35 @@ impl Rig {
         })
     }
 
+    /// Its idle clip in words, and how far it turns on the spot; and the
+    /// one picked when a turning clip could be (for checking, playtest 8).
+    pub fn idle_line(&self) -> String {
+        let turn = |i: usize| {
+            let c = &self.clips[i];
+            format!("{:08x} (turns {:.0} deg)", c.hash, c.info.turn.to_degrees())
+        };
+        let Some(now) = self
+            .locomotion
+            .as_ref()
+            .and_then(|l| l.clips.get(&Gait::Idle))
+        else {
+            return "no idle clip".to_owned();
+        };
+        let any = Locomotion::choose_turning(&self.clips, |_| true, f32::INFINITY)
+            .and_then(|l| l.clips.get(&Gait::Idle).copied());
+        let held: Vec<String> = [crate::npc::FightClips::READY, crate::npc::FightClips::AIM]
+            .iter()
+            .filter_map(|&h| self.clips.iter().position(|c| c.hash == h))
+            .map(turn)
+            .collect();
+        format!(
+            "idle {}; with turning clips allowed, {}; rifle ready and aimed {}",
+            turn(*now),
+            any.map_or("none".to_owned(), turn),
+            held.join(", ")
+        )
+    }
+
     fn new(skeleton: Skeleton, clips: Vec<BoundClip>, gait: Gait) -> Self {
         let locomotion = Locomotion::choose(&clips);
         let mut rig = Self {
@@ -599,6 +628,7 @@ impl Rig {
             ..self.clone()
         };
         rig.set_gait(Gait::Idle);
+        eprintln!("people's rig: {}", rig.idle_line());
         rig
     }
 
