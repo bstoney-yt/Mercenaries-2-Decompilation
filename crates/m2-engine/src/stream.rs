@@ -1164,9 +1164,23 @@ impl World {
                                 let o = &self.index.objects[i];
                                 // A prop placed by name with no collision
                                 // of its own (a bush, a plant) has none:
-                                // vehicles and people go through it.
+                                // vehicles and people go through it. Nor
+                                // has a blocker for the AI alone
+                                // ([`crate::world::ai_collision`]).
+                                let ai_only = self
+                                    .index
+                                    .template_db
+                                    .names
+                                    .get(&o.template)
+                                    .is_some_and(|n| crate::world::ai_collision(n));
+                                if ai_only && m.collision.is_some() {
+                                    eprintln!(
+                                        "collision: object {i} at {:.0?}: the AI's alone, not in her way",
+                                        o.position
+                                    );
+                                }
                                 if let Some(shape) = m.collision.as_ref().filter(|s| {
-                                    !(o.named && s.stand_in) && !self.taken.contains(&i)
+                                    !(o.named && s.stand_in) && !self.taken.contains(&i) && !ai_only
                                 }) {
                                     self.physics.add_static(
                                         StaticKey::Object(i),
@@ -2103,28 +2117,29 @@ fn inland_water<R: std::io::Read + std::io::Seek>(
     let mut indices: Vec<u32> = Vec::new();
     for row in 0..water.rows {
         for column in 0..water.columns {
-            let Some(h) = water.get(column, row) else {
+            let Some(corners) = water.corners(column, row) else {
                 continue;
             };
             // The sea (and the land it lies under) reads the sea level;
-            // cells with no water read far below it.
-            if h <= sea_level + 0.5 {
+            // cells with no water read far below it. A cell none of whose
+            // corners rises above the sea is the sea's.
+            if corners.iter().all(|&h| h <= sea_level + 0.5) {
                 continue;
             }
-            // The square from the point on towards +x and +z. Round DW
-            // centred it on the point by eye while the heights were read
-            // two points early; read right, the square from the point fits
-            // the villa moat's banks (x -1536 against -1530, z 3008
-            // against 3015) and leaves the fewest dry squares beside water
-            // with ground below it (16.4%, against 18.1% centred;
-            // `waterfit` example). Inferred.
+            // The points are the corners of a surface running between
+            // them ([`WaterHeights::surface`]): beside a dry point or the
+            // sea it dives under the ground. Playtest 5 drew each point as
+            // a flat square from it on towards +x and +z, which stood the
+            // villa terrace's -17.6 over its walkway (ground under the
+            // water there, `waterfit` example: 181 terrain vertices
+            // against 13 between points). Inferred.
             let x = water.origin[0] + column as f32 * water.cell;
             let z = water.origin[1] + row as f32 * water.cell;
-            water_square(
+            water_cell(
                 &mut vertices,
                 &mut indices,
                 [x, z, x + water.cell, z + water.cell],
-                h,
+                corners,
             );
         }
     }
@@ -2160,7 +2175,8 @@ fn inland_water<R: std::io::Read + std::io::Seek>(
 /// Water once added by hand where the grid, read two points early, had
 /// none: the moat under the villa's bridge (VzaCon001), height and bounds
 /// fitted by eye (round EA). Read right, the grid's own points there say
-/// 17.51 over x -1536..-1440, z 3008..3136, so it is no longer added.
+/// 17.51 at x -1536..-1472, z 3008..3104, the surface between them
+/// spanning just that, so it is no longer added.
 /// `M2_MOAT=x0,z0,x1,z1,h` still adds a square of water, for trying
 /// spots by eye. As (x0, z0, x1, z1) bounds and height.
 fn missing_water() -> Vec<([f32; 4], f32)> {
@@ -2183,9 +2199,24 @@ fn missing_water() -> Vec<([f32; 4], f32)> {
 /// A flat square of water over `bounds` (x0, z0, x1, z1) at height `h`,
 /// in the simple layout (position, normal up, uv 0).
 fn water_square(vertices: &mut Vec<f32>, indices: &mut Vec<u32>, bounds: [f32; 4], h: f32) {
+    water_cell(vertices, indices, bounds, [h; 4]);
+}
+
+/// A cell of water over `bounds` (x0, z0, x1, z1) whose corners (x0, z0),
+/// (x1, z0), (x1, z1), (x0, z1) stand at `heights`, in the simple layout
+/// (position, normal up as the sea's, uv 0).
+fn water_cell(
+    vertices: &mut Vec<f32>,
+    indices: &mut Vec<u32>,
+    bounds: [f32; 4],
+    heights: [f32; 4],
+) {
     let [x0, z0, x1, z1] = bounds;
     let first = (vertices.len() / 8) as u32;
-    for (x, z) in [(x0, z0), (x1, z0), (x1, z1), (x0, z1)] {
+    for ((x, z), h) in [(x0, z0), (x1, z0), (x1, z1), (x0, z1)]
+        .into_iter()
+        .zip(heights)
+    {
         vertices.extend([x, h, z, 0.0, 1.0, 0.0, 0.0, 0.0]);
     }
     indices.extend([first, first + 1, first + 2, first, first + 2, first + 3]);

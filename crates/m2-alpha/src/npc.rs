@@ -218,6 +218,9 @@ pub(crate) enum Brain {
     },
     /// Strolling to `target`, near `home`.
     Wander { home: Vec3, target: Vec3, wait: f32 },
+    /// Sent along a path by the scripts (`Ai.Goal` `PathMove`, `MoveTo`):
+    /// running to point `next`, then at a post at its end.
+    Route { route: Vec<Vec3>, next: usize },
 }
 
 /// A clip carrying an event: its index, when in it the event comes, and
@@ -1259,6 +1262,7 @@ impl Npc {
             Brain::Patrol { .. } => "patrolling",
             Brain::Wander { wait, .. } if *wait > 0.0 => "pausing",
             Brain::Wander { .. } => "strolling",
+            Brain::Route { .. } => "running where the scripts sent them",
         }
     }
 
@@ -1343,6 +1347,7 @@ impl Npc {
                 speed = FLEE;
             }
         }
+        let mut arrived = false;
         match &mut self.brain {
             _ if self.flee.is_some() => {}
             Brain::Post { facing } => face = Some(*facing),
@@ -1391,6 +1396,24 @@ impl Npc {
                     }
                 }
             }
+            Brain::Route { route, next } => {
+                let flat = (route[*next] - at).with_y(0.0);
+                if flat.length() < 0.8 {
+                    if *next + 1 < route.len() {
+                        *next += 1;
+                    } else {
+                        arrived = true;
+                    }
+                } else {
+                    // At a run, as the scripts' `Haste` 1 asks.
+                    wanted = flat.normalize() * FLEE;
+                }
+            }
+        }
+        if arrived {
+            self.brain = Brain::Post {
+                facing: self.facing,
+            };
         }
         physics.move_character(&mut self.character, wanted, None, dt);
         // Walked into something: give up on that point (strolls) or wait
@@ -1416,7 +1439,7 @@ impl Npc {
                 }
                 (None, Brain::Wander { home, target, .. }) => *target = *home + rng.disc(WANDER),
                 (None, Brain::Patrol { wait, .. }) => *wait = 1.0,
-                (None, Brain::Post { .. }) => {}
+                (None, Brain::Post { .. } | Brain::Route { .. }) => {}
             }
         }
         if wanted.length_squared() > 0.01 {
@@ -1480,6 +1503,9 @@ pub struct People {
     /// Where the scripts last put people, by spawn entity: there they
     /// stand, not where their layer has them.
     moved: HashMap<u32, Vec3>,
+    /// Where the scripts last sent people ([`People::walk`]), by spawn
+    /// entity.
+    routes: HashMap<u32, Vec<Vec3>>,
     active: HashSet<u32>,
     /// Spawners sending from a list, by entity: their `SecondsPerCycle`
     /// (filled on first use).
@@ -2001,6 +2027,27 @@ impl People {
         eprintln!("people: the scripts put {entity:08x} at {at:.1}");
     }
 
+    /// The scripts send the person of spawn `entity` along `route`
+    /// (`Ai.Goal` `PathMove`, or `MoveTo` a point): they run it, then stand
+    /// at its end. One not yet in play runs it when they come.
+    pub fn walk(&mut self, entity: u32, route: Vec<Vec3>) {
+        if route.is_empty() {
+            return;
+        }
+        self.routes.insert(entity, route.clone());
+        for n in self
+            .npcs
+            .iter_mut()
+            .filter(|n| n.spawn == Some(entity) && n.alive)
+        {
+            n.flee = None;
+            n.brain = Brain::Route {
+                route: route.clone(),
+                next: 0,
+            };
+        }
+    }
+
     /// The scripts killed the soldier of spawn `entity` (or took it away,
     /// `gone`): dead where they stand, or not there at all. Either way they
     /// don't come back.
@@ -2217,7 +2264,12 @@ impl People {
             *room = room.saturating_sub(1);
             let forward = s.rotation * Vec3::Z;
             let facing = forward.x.atan2(forward.z);
-            let brain = if s.route.len() >= 2 && !self.moved.contains_key(&s.entity) {
+            let brain = if let Some(route) = self.routes.get(&s.entity) {
+                Brain::Route {
+                    route: route.clone(),
+                    next: 0,
+                }
+            } else if s.route.len() >= 2 && !self.moved.contains_key(&s.entity) {
                 Brain::Patrol {
                     route: s.route.clone(),
                     next: 0,
@@ -3152,10 +3204,11 @@ pub(crate) mod tests {
         assert!(people.npcs[0].alive);
     }
 
-    // With the damage table, a car hurts as its ram times their row's
-    // `Car` cell: a tonne at 10 m/s does 30 to a `Human` (3x), who is
-    // shoved aside and not hurt again at once; two tonnes at 20 m/s do
-    // 120 and kill; a `HumanArmor` (1x) takes 40 of that and lives.
+    // With the damage table, a car hurts as its ram, times what people
+    // take of it, times their row's `Car` cell: a tonne at 3 m/s does 45
+    // to a `Human` (3x), who is shoved aside and not hurt again at once;
+    // two tonnes at 8 m/s do 240 and kill; a `HumanArmor` (1x) takes 80
+    // of that and lives.
     #[test]
     fn a_car_hurts_people_by_the_damage_table() {
         let (human, armor, car_key) = (
@@ -3187,15 +3240,15 @@ pub(crate) mod tests {
         };
         let mut people = People::default();
         people.npcs.push(person(None));
-        let slow = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 10.0), bounds, 1000.0);
+        let slow = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 3.0), bounds, 1000.0);
         assert_eq!(people.traffic(&[slow], Some(&table)), 0);
         let n = &people.npcs[0];
-        assert!(n.alive && n.hp == 70.0 && n.rammed == RAM_GAP);
+        assert!(n.alive && n.hp == 55.0 && n.rammed == RAM_GAP);
         assert!(n.character.velocity.x > 0.0, "shoved off its line");
         people.traffic(&[slow], Some(&table));
-        assert_eq!(people.npcs[0].hp, 70.0, "not again at once");
+        assert_eq!(people.npcs[0].hp, 55.0, "not again at once");
         // Faster and heavier: a soldier dies, a heavy lives.
-        let fast = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 20.0), bounds, 2000.0);
+        let fast = (Mat4::IDENTITY, Vec3::new(0.0, 0.0, 8.0), bounds, 2000.0);
         let mut people = People::default();
         people.npcs.push(person(Some(human)));
         people.npcs.push(person(Some(armor)));
@@ -3204,7 +3257,7 @@ pub(crate) mod tests {
         }
         assert_eq!(people.traffic(&[fast], Some(&table)), 1);
         assert!(!people.npcs[0].alive);
-        assert!(people.npcs[1].alive && people.npcs[1].hp == 60.0);
+        assert!(people.npcs[1].alive && people.npcs[1].hp == 20.0);
     }
 
     // Running from a car into a wall, they run along it, not stand

@@ -542,6 +542,11 @@ pub struct WeaponModel {
     /// The hand `grip` is relative to: the rear (trigger) hand of the aim
     /// pose.
     pub grip_hand: Option<usize>,
+    /// The aim pose's front hand, and where the grip sits in the rear
+    /// hand (its space): held in both hands, the barrel runs from the
+    /// rear hand towards the front one in whatever pose she is in
+    /// ([`Self::in_hand`]).
+    pub grip_front: Option<(usize, Vec3)>,
     /// Carried low in the right hand alone, muzzle forward and down as
     /// the game's player carries a rifle: where the grip sits in the hand
     /// (hand space), and the weapon's turn in the body's space, so it
@@ -644,6 +649,7 @@ impl Arsenal {
             eject,
             grip: Mat4::IDENTITY,
             grip_hand: None,
+            grip_front: None,
             carry: None,
             hang: if launcher { HANG_LAUNCHER } else { HANG_DOWN },
         };
@@ -793,7 +799,19 @@ impl Arsenal {
             }
             _ => {
                 let rear = weapon.grip_hand.and_then(|h| nodes.get(h)).unwrap_or(right);
-                Some(body * *rear * weapon.grip)
+                // The barrel from the rear hand towards the front one as
+                // they are posed now: the aim's grip fitted the aim pose
+                // alone, and running (its own clip, the rifle low across
+                // her) it pointed down between her legs (playtest 5).
+                let between = weapon.grip_front.and_then(|(front, at)| {
+                    let dir = nodes.get(front)?.w_axis.truncate() - rear.w_axis.truncate();
+                    let turn = turn(weapon.muzzle, dir)?;
+                    Some(Mat4::from_rotation_translation(
+                        turn,
+                        rear.transform_point3(at),
+                    ))
+                });
+                Some(body * between.unwrap_or(*rear * weapon.grip))
             }
         }
     }
@@ -900,17 +918,18 @@ fn palm(skeleton: &Skeleton, nodes: &[Mat4], hand: usize) -> Vec3 {
 /// Weapon `w`'s hold in `rig`'s hands, two-handed and carried
 /// ([`grip`], [`carry`]).
 fn fit(w: &mut WeaponModel, rig: &Rig) {
-    (w.grip, w.grip_hand) = match grip(rig, w.muzzle) {
-        Some((m, hand)) => (m, Some(hand)),
-        None => (Mat4::IDENTITY, None),
+    (w.grip, w.grip_hand, w.grip_front) = match grip(rig, w.muzzle) {
+        Some((m, hand, front)) => (m, Some(hand), Some(front)),
+        None => (Mat4::IDENTITY, None, None),
     };
     w.carry = carry(rig, w.muzzle);
 }
 
 /// Where a weapon with its muzzle at `muzzle` sits in the aim clip's
 /// pose: grip in the rear hand, barrel towards the front one, upright
-/// about the barrel; and the rear hand's node.
-fn grip(rig: &Rig, muzzle: Vec3) -> Option<(Mat4, usize)> {
+/// about the barrel; the rear hand's node; and the front hand's, with
+/// where the grip sits in the rear hand (its space).
+fn grip(rig: &Rig, muzzle: Vec3) -> Option<(Mat4, usize, (usize, Vec3))> {
     let skeleton = &rig.skeleton;
     let (rear, front) = rig.aim_hands()?;
     let aim = aim_clip(rig)?;
@@ -918,9 +937,11 @@ fn grip(rig: &Rig, muzzle: Vec3) -> Option<(Mat4, usize)> {
     let nodes = skeleton.model_matrices(&pose);
     let pr = nodes[rear].transform_point3(Vec3::ZERO);
     let pl = nodes[front].transform_point3(Vec3::ZERO);
+    let at = palm(skeleton, &nodes, rear);
     Some((
-        place(nodes[rear], palm(skeleton, &nodes, rear), muzzle, pl - pr)?,
+        place(nodes[rear], at, muzzle, pl - pr)?,
         rear,
+        (front, nodes[rear].inverse().transform_point3(at)),
     ))
 }
 
@@ -2958,7 +2979,9 @@ impl Combat {
     /// ram counts, its size and the gap are invented, as for people.
     pub fn vehicles_hit_her(&mut self, f: &mut Field<'_>, dt: f32) {
         self.rammed -= dt;
-        if self.rammed > 0.0 {
+        // Only on foot: seated, her own vehicle's hull holds her (playtest
+        // 5: driving hurt her once a second, 22 times in one drive).
+        if self.rammed > 0.0 || f.player.driving.is_some() {
             return;
         }
         let hero = m2_assets::name_hash("Hero");
@@ -5248,6 +5271,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(at.w_axis.x, 8.0);
+    }
+
+    // Held in both hands, the barrel runs from the rear hand to the front
+    // one as they are posed now, whatever the aim's grip was fitted to,
+    // with the grip where it sits in the rear hand.
+    #[test]
+    fn both_hands_point_the_barrel_from_rear_to_front() {
+        let w = WeaponModel {
+            model: crate::npc::tests::empty_model(),
+            muzzle: Vec3::Z,
+            eject: None,
+            // As fitted to an aim pose: barrel along +z from the hand.
+            grip: Mat4::IDENTITY,
+            grip_hand: Some(0),
+            grip_front: Some((1, Vec3::new(0.0, -0.05, 0.0))),
+            carry: None,
+            hang: HANG_DOWN,
+        };
+        // Running: the front hand low and to her left of the rear one.
+        let nodes = [
+            Mat4::from_translation(Vec3::new(0.2, 1.0, 0.1)),
+            Mat4::from_translation(Vec3::new(-0.2, 0.8, 0.4)),
+        ];
+        let at = Arsenal::default()
+            .in_hand(&w, Mat4::IDENTITY, &nodes, (Some(0), None), true)
+            .unwrap();
+        let barrel = at.transform_vector3(Vec3::Z).normalize();
+        let want = (Vec3::new(-0.2, 0.8, 0.4) - Vec3::new(0.2, 1.0, 0.1)).normalize();
+        assert!(barrel.distance(want) < 1e-5, "{barrel} against {want}");
+        assert!(at.w_axis.truncate().distance(Vec3::new(0.2, 0.95, 0.1)) < 1e-5);
     }
 
     #[test]
