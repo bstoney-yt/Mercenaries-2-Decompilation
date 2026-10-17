@@ -78,6 +78,7 @@ mod scene;
 mod shell;
 mod shopcheck;
 mod sound;
+mod spans;
 mod startup;
 mod strikes;
 mod subtitles;
@@ -1052,15 +1053,18 @@ fn render(
         view.lighting.fog_density = 0.00025;
     }
     let focus = game.focus();
-    game.scene.update(backend, focus)?;
+    spans::time("stream", || game.scene.update(backend, focus))?;
     let mut queue = DrawQueue::new();
-    backend.begin_frame(&view)?;
-    game.scene.draw(backend, &mut queue, &view, &game.combat)?;
-    queue.flush(&view, backend)?;
-    match hud {
-        Some(hud) => backend.end_frame_with(&mut |t| hud.paint(t))?,
-        None => backend.end_frame()?,
-    }
+    spans::time("draw", || -> anyhow::Result<()> {
+        backend.begin_frame(&view)?;
+        game.scene.draw(backend, &mut queue, &view, &game.combat)?;
+        queue.flush(&view, backend)?;
+        Ok(())
+    })?;
+    spans::time("present", || match hud {
+        Some(hud) => backend.end_frame_with(&mut |t| hud.paint(t)),
+        None => backend.end_frame(),
+    })?;
     Ok(())
 }
 
@@ -2653,6 +2657,7 @@ fn front_end_offscreen(
     )?;
     let mut hud = ui::Hud::new();
     let mut shell = gamehud::GameHud::start_shell(install);
+    let modes = display::primary_modes();
     let ffmpeg = movie::ffmpeg();
     let mut backdrop: Option<(movie::Movie, [f32; 4])> = None;
     let mut texture: Option<egui::TextureHandle> = None;
@@ -2674,8 +2679,13 @@ fn front_end_offscreen(
                 let at = 3.0 + 2.0 * i as f64;
                 // Key 0 only waits.
                 if since < at && since + step >= at && k != 0 {
-                    pressed.extend([(k, true), (k, false)]);
+                    pressed.push((k, true));
                     eprintln!("front end: key {k} at {t:.1} s");
+                }
+                // Let go a fifth of a second on, as a hand does.
+                let up = at + 0.2;
+                if since < up && since + step >= up && k != 0 {
+                    pressed.push((k, false));
                 }
             }
             for i in 0..=keys.len() {
@@ -2717,12 +2727,20 @@ fn front_end_offscreen(
             }
         }
         let input = ui::headless_input(w, h, t);
-        let state = gamehud::HudState {
+        let mut state = gamehud::HudState {
             size: [w as f32, h as f32],
             dt: if up_at.is_some() { step } else { 0.0 },
             keys: pressed,
             ..Default::default()
         };
+        // The video screen as for a window of the picture's size, its
+        // lists the primary monitor's modes.
+        state.pause_settings.video = pause::Video {
+            width: w,
+            height: h,
+            fullscreen: None,
+        };
+        state.pause_settings.modes = modes.clone();
         let _ = hud.build_screen(input, |ui| {
             let ctx = ui.ctx().clone();
             shell.update_and_wait(&ctx, state.clone(), Duration::from_secs(5));
@@ -2761,6 +2779,18 @@ fn front_end_offscreen(
         if up_at.is_none() && shell.ready() {
             eprintln!("front end: the menus are up after {t:.1} s");
             up_at = Some(t);
+        }
+        if let Some(v) = shell.take_video() {
+            eprintln!(
+                "front end: video kept: {}, {} (a window would now be {})",
+                v.resolution_text(),
+                v.refresh_text(),
+                if v.fullscreen.is_some() {
+                    "fullscreen at that mode"
+                } else {
+                    "resized to it"
+                }
+            );
         }
         if let Some(who) = shell.take_new_game() {
             eprintln!(
@@ -5181,10 +5211,12 @@ struct Pace {
 
 impl Pace {
     /// A frame drawn at `now` in a window `size` pixels: the line to log
-    /// when a span is over.
-    fn frame(&mut self, now: Instant, size: (u32, u32)) -> Option<String> {
+    /// when a span is over, and its seconds.
+    fn frame(&mut self, now: Instant, size: (u32, u32)) -> Option<(String, f32)> {
         let Some((start, last)) = self.since else {
             self.since = Some((now, now));
+            // What was timed before play (loading) is not the span's.
+            let _ = spans::take();
             return None;
         };
         let took = now - last;
@@ -5210,7 +5242,7 @@ impl Pace {
             since: Some((now, now)),
             ..Self::default()
         };
-        Some(line)
+        Some((line, span))
     }
 }
 
@@ -5497,7 +5529,7 @@ impl Running {
         self.last = now;
         while self.lag >= TICK {
             self.lag -= TICK;
-            self.tick(config, event_loop);
+            spans::time("ticks", || self.tick(config, event_loop));
         }
         self.keep_mouse();
         let vsync = config.window.vsync;
@@ -5543,7 +5575,7 @@ impl Running {
             state.pad = self.input.pad();
             info.game = Some(state);
         }
-        let (action, output) = self.hud.build(input, &info, config);
+        let (action, output) = spans::time("hud", || self.hud.build(input, &info, config));
         self.platform_output(output);
         if let Some(news) = self
             .hud
@@ -5627,16 +5659,17 @@ impl Running {
             ));
             self.fps = (now, 0);
         }
-        if let Some(line) = self.pace.frame(now, (w, h)) {
+        if let Some((line, span)) = self.pace.frame(now, (w, h)) {
             let s = &self.game.scene;
             let p = self.game.focus();
             eprintln!(
-                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders",
+                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders; ms a second: {}",
                 p.x,
                 p.z,
                 s.vehicles.len(),
                 s.people.npcs.len(),
-                s.riders.len()
+                s.riders.len(),
+                spans::describe(&spans::take(), span, 12)
             );
         }
         Ok(())
@@ -5760,6 +5793,25 @@ impl Running {
         }
     }
 
+    /// The window as a video screen kept it (`menu`'s: the pause menu's
+    /// or the front end's), into the settings: a size, or fullscreen at
+    /// a mode.
+    fn keep_video(window: &Window, menu: &str, v: pause::Video, config: &mut Config) {
+        if v == display::current(window) {
+            return;
+        }
+        let how = display::apply(window, v);
+        eprintln!(
+            "{menu}: video kept: {}, {}: {how}",
+            v.resolution_text(),
+            v.refresh_text()
+        );
+        let w = &mut config.window;
+        (w.width, w.height) = (v.width, v.height);
+        w.fullscreen = v.fullscreen.is_some();
+        w.refresh = v.fullscreen.unwrap_or(0);
+    }
+
     /// Applies the player's options that live outside the settings file's
     /// readers: the volumes, the pad, the scripts' subtitles and tips.
     fn apply_options(&mut self, config: &Config) {
@@ -5831,19 +5883,8 @@ impl Running {
             config.window.vsync = s.vsync;
             // The video screen's Resolution and Refresh Rate, as kept
             // (only on keeping: dropped changes leave the window be).
-            if let Some(v) = news.video
-                && v != display::current(&self.window)
-            {
-                let how = display::apply(&self.window, v);
-                eprintln!(
-                    "pause: video kept: {}, {}: {how}",
-                    v.resolution_text(),
-                    v.refresh_text()
-                );
-                let w = &mut config.window;
-                (w.width, w.height) = (v.width, v.height);
-                w.fullscreen = v.fullscreen.is_some();
-                w.refresh = v.fullscreen.unwrap_or(0);
+            if let Some(v) = news.video {
+                Self::keep_video(&self.window, "pause", v, config);
             }
             self.apply_options(config);
             let path = config::Config::default_path();
@@ -6044,8 +6085,22 @@ impl Running {
 
     fn tick(&mut self, config: &mut Config, _event_loop: &ActiveEventLoop) {
         if let Some(flow) = &mut self.flow {
+            // The front end's video screen: the window as it is, and the
+            // monitor's modes (asked once).
+            let modes = flow
+                .wants_window()
+                .then(|| display::modes(self.window.current_monitor().as_ref()));
+            flow.window(display::current(&self.window), modes);
             if let Ok(mut mixer) = self.audio.out.mixer.lock() {
                 flow.tick(self.mission.as_mut(), &mut mixer);
+            }
+            if let Some(v) = flow.take_video() {
+                Self::keep_video(&self.window, "front end", v, config);
+                let path = config::Config::default_path();
+                match std::fs::write(&path, config.to_toml()) {
+                    Ok(()) => eprintln!("front end: settings saved to {}", path.display()),
+                    Err(e) => eprintln!("front end: could not save {}: {e}", path.display()),
+                }
             }
             // The hero picked in the front end, before the scripts start;
             // the pause menu offers them as the settings' hero.
@@ -6130,21 +6185,25 @@ impl Running {
             );
         }
         if let Some(h) = &mut self.hijacks {
-            h.tick(&mut self.game, &mut self.input, TICK.as_secs_f32());
+            spans::time("hijacks", || {
+                h.tick(&mut self.game, &mut self.input, TICK.as_secs_f32())
+            });
         }
-        self.game.tick(
-            &mut self.input,
-            &config.camera,
-            self.mouse_look,
-            TICK.as_secs_f32(),
-        );
+        spans::time("game", || {
+            self.game.tick(
+                &mut self.input,
+                &config.camera,
+                self.mouse_look,
+                TICK.as_secs_f32(),
+            );
+        });
         cheats::keep_up(&mut self.game, self.cheats);
         if let Some(h) = &mut self.hijacks {
             h.place(&mut self.game);
             h.seat(&mut self.game, TICK.as_secs_f32());
         }
         if let Some(m) = &mut self.mission {
-            m.tick(&mut self.game, TICK.as_secs_f32());
+            spans::time("scripts", || m.tick(&mut self.game, TICK.as_secs_f32()));
             let (lines, hushed) = m.take_lines();
             for (id, cue, at) in lines {
                 if let Some(seconds) = self.audio.say(id, &cue, at) {
@@ -6405,7 +6464,7 @@ mod tests {
         // 16 ms frames, one of 80 ms, until the span is over.
         for k in 0.. {
             t += Duration::from_millis(if k == 10 { 80 } else { 16 });
-            line = pace.frame(t, (1280, 720));
+            line = pace.frame(t, (1280, 720)).map(|(l, _)| l);
             if line.is_some() {
                 break;
             }

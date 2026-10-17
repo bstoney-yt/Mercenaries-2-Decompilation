@@ -76,6 +76,11 @@ pub struct Flow {
     shell_keys: Vec<(i32, bool)>,
     /// The box the backdrop up plays in, when the shell put it there.
     backdrop: Option<[f32; 4]>,
+    /// How the window is shown and the monitor's modes, for the shell's
+    /// video screen ([`Flow::window`]).
+    window: Option<(crate::pause::Video, Vec<crate::pause::Mode>)>,
+    /// The Resolution and Refresh Rate that screen kept, not yet taken.
+    video: Option<crate::pause::Video>,
 }
 
 impl Flow {
@@ -113,6 +118,8 @@ impl Flow {
             shell: None,
             shell_keys: Vec::new(),
             backdrop: None,
+            window: None,
+            video: None,
         }
     }
 
@@ -120,6 +127,27 @@ impl Flow {
     /// a movie is up.
     pub fn holds(&self) -> bool {
         self.stage != Stage::Game || self.movie.is_some()
+    }
+
+    /// Whether the front end's menus want the window's modes
+    /// ([`Flow::window`]): up, and not yet told.
+    pub fn wants_window(&self) -> bool {
+        self.stage == Stage::FrontEnd && self.window.is_none()
+    }
+
+    /// How the window is shown (`video`) and the modes its monitor offers,
+    /// for the front end's video screen.
+    pub fn window(&mut self, video: crate::pause::Video, modes: Option<Vec<crate::pause::Mode>>) {
+        let modes = modes
+            .or_else(|| self.window.take().map(|(_, m)| m))
+            .unwrap_or_default();
+        self.window = Some((video, modes));
+    }
+
+    /// The Resolution and Refresh Rate the front end's video screen kept,
+    /// once.
+    pub fn take_video(&mut self) -> Option<crate::pause::Video> {
+        self.video.take()
     }
 
     /// The hero a new game was started as in the front end, once.
@@ -232,6 +260,9 @@ impl Flow {
                 if let Some(shell) = &mut self.shell
                     && shell.ready()
                 {
+                    if let Some(v) = shell.take_video() {
+                        self.video = Some(v);
+                    }
                     if let Some(who) = shell.take_new_game() {
                         // The scripts have left their menus: a character
                         // naming no hero (logged) starts as the stand-in's
@@ -374,12 +405,16 @@ impl Flow {
         let shell = self.stage == Stage::FrontEnd && self.shell_up();
         if shell && let Some(s) = &mut self.shell {
             let dt = s.frame_time(Some(ui.ctx().input(|i| i.time)));
-            let state = HudState {
+            let mut state = HudState {
                 size: [screen.width(), screen.height()],
                 dt,
                 keys: std::mem::take(&mut self.shell_keys),
                 ..HudState::default()
             };
+            if let Some((video, modes)) = &self.window {
+                state.pause_settings.video = *video;
+                state.pause_settings.modes = modes.clone();
+            }
             s.update(ui.ctx(), state);
         } else if let Some(s) = &mut self.shell {
             // Loading: told the size, so it draws once it is up.
