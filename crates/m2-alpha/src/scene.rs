@@ -621,7 +621,8 @@ impl Rig {
     /// Moves at `gait` holding a rifle as `carry` says. Aiming, it is
     /// shouldered: by the whole body standing, by the upper body over the
     /// legs' gait when moving. Running, it is held low across the body in
-    /// both hands; otherwise the plain gait carries it low in the right
+    /// both hands, and sprinting too (the player's [`npc::FightClips::sprint`]);
+    /// otherwise the plain gait carries it low in the right
     /// hand, except that a soldier at the ready standing holds it across
     /// the chest. Falls back to the plain gait without the clips.
     pub fn hold_rifle(&mut self, gait: Gait, clips: &npc::FightClips, carry: Carry) {
@@ -630,6 +631,7 @@ impl Rig {
             (_, Carry::Aim) => (None, clips.aim),
             (Gait::Idle, Carry::Ready) => (clips.ready, None),
             (Gait::Run, _) => (clips.run_low, None),
+            (Gait::Sprint, _) => (clips.sprint, None),
             _ => (None, None),
         };
         match whole {

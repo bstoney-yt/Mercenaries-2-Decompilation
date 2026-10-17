@@ -1522,21 +1522,37 @@ fn vehicle_nodes(
 /// seconds, and every node under them: (node, matrix).
 fn clip_nodes(nodes: &VehicleNodes, clip: &Clip, t: f32) -> Vec<(usize, Mat4)> {
     let sample = clip.sample(t.clamp(0.0, clip.header.duration));
+    let moved: Vec<(usize, Mat4)> = clip
+        .track_nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(track, &name)| {
+            let i = nodes.names.iter().position(|&n| n == name)?;
+            let s = sample.get(track)?;
+            let (p, r) = (s.translation, s.rotation);
+            Some((
+                i,
+                Mat4::from_rotation_translation(
+                    m2_math::glam::Quat::from_xyzw(r.x, r.y, r.z, r.w).normalize(),
+                    Vec3::new(p.x, p.y, p.z),
+                ),
+            ))
+        })
+        .collect();
+    posed_under(nodes, &moved)
+}
+
+/// The model-space matrices of nodes given new local transforms
+/// (`moved`: node, local), and of every node under them; the rest are
+/// left out (they stand as posed).
+fn posed_under(nodes: &VehicleNodes, moved_locals: &[(usize, Mat4)]) -> Vec<(usize, Mat4)> {
     let mut locals = nodes.locals.clone();
     let mut moved = vec![false; locals.len()];
-    for (track, &name) in clip.track_nodes.iter().enumerate() {
-        let (Some(i), Some(s)) = (
-            nodes.names.iter().position(|&n| n == name),
-            sample.get(track),
-        ) else {
-            continue;
-        };
-        let (p, r) = (s.translation, s.rotation);
-        locals[i] = Mat4::from_rotation_translation(
-            m2_math::glam::Quat::from_xyzw(r.x, r.y, r.z, r.w).normalize(),
-            Vec3::new(p.x, p.y, p.z),
-        );
-        moved[i] = true;
+    for &(i, m) in moved_locals {
+        if let Some(l) = locals.get_mut(i) {
+            *l = m;
+            moved[i] = true;
+        }
     }
     let mut out = Vec::new();
     for i in 0..locals.len() {
@@ -2031,6 +2047,28 @@ mod tests {
         let toggle: mlua::Table = calls.get(2).unwrap();
         assert_eq!(toggle.get::<String>(1).unwrap(), "MrxGuiManager");
         assert_eq!(toggle.get::<String>(5).unwrap(), "hijack");
+    }
+
+    #[test]
+    fn the_vehicle_clip_moves_the_hatch_and_what_hangs_on_it() {
+        // Hull (0), hatch on it (1), handle on the hatch (2), gun (3).
+        let t = |x: f32, y: f32| Mat4::from_translation(Vec3::new(x, y, 0.0));
+        let nodes = VehicleNodes {
+            locals: vec![Mat4::IDENTITY, t(0.0, 2.0), t(0.5, 0.0), t(0.0, 1.0)],
+            parents: vec![None, Some(0), Some(1), Some(0)],
+            names: vec![1, 2, 3, 4],
+        };
+        // The hatch thrown up a metre.
+        let posed = posed_under(&nodes, &[(1, t(0.0, 3.0))]);
+        let at: Vec<(usize, Vec3)> = posed
+            .iter()
+            .map(|&(i, m)| (i, m.transform_point3(Vec3::ZERO)))
+            .collect();
+        assert_eq!(
+            at,
+            vec![(1, Vec3::new(0.0, 3.0, 0.0)), (2, Vec3::new(0.5, 3.0, 0.0))],
+            "the hatch and its handle move; the hull and gun stand as posed"
+        );
     }
 
     #[test]
