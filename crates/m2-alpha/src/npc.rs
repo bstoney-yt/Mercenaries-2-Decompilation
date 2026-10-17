@@ -731,6 +731,9 @@ pub struct Npc {
     since_shot: f32,
     /// Running from gunfire: where to, and for how much longer.
     flee: Option<(Vec3, f32)>,
+    /// Put out of a vehicle's seat ([`People::put_out`]): no spawn keeps
+    /// them, so they go once out of range.
+    put_out: bool,
     brain: Brain,
     /// The aim and fall clips in this person's rig.
     clips: FightClips,
@@ -834,6 +837,7 @@ impl Npc {
             burst: 0,
             since_shot: f32::INFINITY,
             flee: None,
+            put_out: false,
             brain,
         }
     }
@@ -1696,6 +1700,38 @@ impl People {
         None
     }
 
+    /// A rider of template `template` (its own model `model`) put out of
+    /// their seat at `at`: they stand there, in the looks their seat had
+    /// (`outfit`), and run from `from` (invented: no car hijack in the
+    /// data says what a driver does). False when their kind isn't in.
+    pub(crate) fn put_out(
+        &mut self,
+        template: &str,
+        model: Option<u32>,
+        outfit: Option<Vec<bool>>,
+        at: Vec3,
+        from: Vec3,
+    ) -> bool {
+        let Some(kind) = self.rider_kind(template, model) else {
+            return false;
+        };
+        let away = (at - from).with_y(0.0);
+        let facing = away.x.atan2(away.z);
+        let mut n = Npc::new(
+            kind,
+            &self.kinds[kind].rig,
+            at,
+            facing,
+            Brain::Post { facing },
+            None,
+        );
+        n.outfit = outfit.unwrap_or_else(|| self.dress_as(kind, template));
+        n.put_out = true;
+        n.panic(from);
+        self.npcs.push(n);
+        true
+    }
+
     /// Template `template`'s own model `model` won't do (it didn't load,
     /// or the clips don't fit its skeleton): its soldiers stand as their
     /// name's role instead, the rest not at all.
@@ -2160,6 +2196,13 @@ impl People {
                 active.remove(&id);
                 if !n.alive {
                     killed.insert(id);
+                }
+                false
+            }
+            // Put out of a seat, they go once out of range too.
+            None if n.put_out && far(n.character.position, INACTIVE) => {
+                if let Some(doll) = n.ragdoll {
+                    physics.remove_ragdoll(doll);
                 }
                 false
             }
@@ -3337,5 +3380,30 @@ pub(crate) mod tests {
             let d = p.length();
             assert!((14.99..120.01).contains(&d), "{d}");
         }
+    }
+
+    #[test]
+    fn a_driver_put_out_stands_by_the_door_runs_and_goes_out_of_range() {
+        let mut physics = ground();
+        let mut people = People::default();
+        people.add_kind(kind("Civ Driver", true));
+        let door = Vec3::new(2.0, 1.0, 0.0);
+        let her = Vec3::new(0.0, 1.0, 0.0);
+        assert!(people.put_out("Civ Driver", Some(1), Some(vec![true]), door, her));
+        // One whose kind isn't in can't be drawn.
+        assert!(!people.put_out("VZ Nobody", None, None, door, her));
+        assert_eq!(people.npcs.len(), 1);
+        let n = &people.npcs[0];
+        assert!(!n.soldier && n.put_out);
+        assert_eq!(n.outfit, vec![true], "the looks they had seated");
+        for _ in 0..120 {
+            people.update(&mut physics, &[], her, None, 1.0 / 60.0);
+        }
+        let p = people.npcs[0].character.position;
+        assert!(p.x > door.x + 1.0, "ran from her: {p}");
+        // No spawn keeps them: out of range, they go.
+        let far = her + Vec3::X * (INACTIVE + 50.0);
+        people.update(&mut physics, &[], far, None, 1.0 / 60.0);
+        assert!(people.npcs.is_empty());
     }
 }

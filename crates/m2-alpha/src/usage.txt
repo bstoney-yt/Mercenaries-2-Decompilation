@@ -97,6 +97,9 @@ m2-alpha [options]
   --riders               with --screenshot on the island: seat the riders of
                          the vehicles near her before the picture, and log
                          how many were drawn
+  --take                 with --riders: she then takes the vehicle of the
+                         nearest seated driver, who is put out by its door,
+                         and logs where they went
   --spawns <n>           with --screenshot: list the n spawns nearest where
                          she starts (name, place, who they spawn)
   --face <degrees>       with --screenshot on foot: face this way first

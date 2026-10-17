@@ -797,7 +797,23 @@ impl Game {
                             // back in before the ground streamed).
                             if let Some(i) = player.driving {
                                 player.landed = true;
-                                take_seat(&mut scene.vehicles[i]);
+                                let db = &world.index.template_db;
+                                let out = take_seat(&mut scene.vehicles[i])
+                                    .into_iter()
+                                    .map(|who| {
+                                        let model = db.get(&who).and_then(|t| t.model);
+                                        (who, model)
+                                    })
+                                    .collect();
+                                put_out(
+                                    &mut scene.people,
+                                    &scene.riders,
+                                    &scene.vehicles[i],
+                                    physics,
+                                    i,
+                                    out,
+                                    player.character.position,
+                                );
                             }
                         }
                     }
@@ -865,7 +881,11 @@ impl Game {
                             },
                             None => intent,
                         };
+                        let waiting = !player.landed;
                         player.update(physics, intent, dt);
+                        if waiting && player.landed && std::mem::take(&mut player.floor_landed) {
+                            log_floor(&scene.props, physics, player.character.position);
+                        }
                     }
                 }
                 // A turret turns after the camera, at its own pace, and
@@ -1781,7 +1801,36 @@ impl Game {
             reach,
         );
         player.landed |= player.driving.is_some();
-        player.driving.is_some()
+        let Some(i) = player.driving else {
+            return false;
+        };
+        self.take_from_driver(i);
+        true
+    }
+
+    /// She sits in vehicle `i`'s driver's seat, as the use key has it:
+    /// whoever drove it is put out.
+    pub fn take_from_driver(&mut self, i: usize) {
+        let (Some(world), Some(player)) = (&self.scene.world, &self.scene.player) else {
+            return;
+        };
+        let db = &world.index.template_db;
+        let out = take_seat(&mut self.scene.vehicles[i])
+            .into_iter()
+            .map(|who| {
+                let model = db.get(&who).and_then(|t| t.model);
+                (who, model)
+            })
+            .collect();
+        put_out(
+            &mut self.scene.people,
+            &self.scene.riders,
+            &self.scene.vehicles[i],
+            &world.physics,
+            i,
+            out,
+            player.character.position,
+        );
     }
 
     /// Loads the first of `models` that drives and parks it near her, as
@@ -2878,6 +2927,36 @@ fn shown_name(
         .unwrap_or_else(|| format!("{t:#x}"))
 }
 
+/// Once she has landed after her floor was taken down: the layers' models
+/// near her and whether each stands with collision, to see what (if
+/// anything) came in its place.
+fn log_floor(props: &Props, physics: &Physics, at: Vec3) {
+    let mut near: Vec<_> = props
+        .shown()
+        .filter(|(_, p)| (p.position - at).with_y(0.0).length() < 40.0)
+        .map(|(e, p)| {
+            let loaded = props.get(e).is_some_and(|(_, l)| l);
+            format!(
+                "{e:#x} model {:08x} at y {:.1} layer {} loaded {loaded} collision {}{}",
+                p.model,
+                p.position.y,
+                props.layer(e).unwrap_or("-"),
+                physics.has_static(m2_engine::physics::StaticKey::Entity(e)),
+                if p.wrecked { " wrecked" } else { "" }
+            )
+        })
+        .collect();
+    near.sort();
+    eprintln!(
+        "player: landed at {:.1?} after her floor went; {} layer models within 40 m:",
+        at.to_array(),
+        near.len()
+    );
+    for n in near {
+        eprintln!("  {n}");
+    }
+}
+
 /// Whether someone sits in the driver's seat of a crew.
 fn has_driver(crew: &[(String, String)]) -> bool {
     crew.iter()
@@ -2886,12 +2965,54 @@ fn has_driver(crew: &[(String, String)]) -> bool {
 
 /// She gets into `v`'s driver's seat: whoever drove it is put out (its
 /// crew forgets them: playtest 4, no car could be taken from traffic).
-fn take_seat(v: &mut ParkedVehicle) {
-    let before = v.crew.len();
-    v.crew
-        .retain(|(seat, _)| !seat.to_ascii_lowercase().contains("driver"));
-    if v.crew.len() < before {
+/// The templates of those put out.
+fn take_seat(v: &mut ParkedVehicle) -> Vec<String> {
+    let (out, kept) = std::mem::take(&mut v.crew)
+        .into_iter()
+        .partition(|(seat, _)| seat.to_ascii_lowercase().contains("driver"));
+    v.crew = kept;
+    if !out.is_empty() {
         eprintln!("hijack: she takes the {} from its driver", v.spec.label);
+    }
+    out.into_iter().map(|(_, who)| who).collect()
+}
+
+/// Those put out of vehicle `v`'s (`vehicles[i]`) seats (`out`, by
+/// template and its own model) stand by its door, in the looks they had
+/// seated, and run from her (at `her`): in playtest 6 the driver she took
+/// a car from was gone.
+fn put_out(
+    people: &mut crate::npc::People,
+    riders: &[crate::hijack::Rider],
+    v: &ParkedVehicle,
+    physics: &Physics,
+    i: usize,
+    out: Vec<(String, Option<u32>)>,
+    her: Vec3,
+) {
+    let Some(at) =
+        v.id.and_then(|id| physics.vehicle_transform(id))
+            .filter(|at| at.is_finite())
+    else {
+        return;
+    };
+    let door = door_out(at, &v.spec) + Vec3::Y * 0.5;
+    for (who, model) in out {
+        let kind = people.rider_kind(&who, model);
+        let outfit = riders
+            .iter()
+            .find(|r| r.vehicle == i && Some(r.kind) == kind)
+            .map(|r| r.outfit.clone());
+        let stood = people.put_out(&who, model, outfit, door, her);
+        eprintln!(
+            "hijack: {who} put out at {:.1?}: {}",
+            door.to_array(),
+            if stood {
+                "stands there"
+            } else {
+                "their kind isn't in: not drawn"
+            }
+        );
     }
 }
 
