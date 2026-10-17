@@ -896,6 +896,10 @@ pub struct ParkedVehicle {
     /// How far its turret is turned from straight ahead, radians
     /// (anticlockwise from above).
     pub turret: f32,
+    /// While a hijack plays on it: the nodes its hijack clip moves (the
+    /// hatch thrown open) and those under them, model space, over its
+    /// posed nodes ([`crate::hijack::Hijacks::place`]).
+    pub hijack_nodes: Vec<(usize, Mat4)>,
     /// How far its gun is raised, radians (down is negative).
     pub gun: f32,
     /// How far it has rolled, metres (backwards less), for turning a
@@ -2167,6 +2171,7 @@ impl Scene {
                 spot: None,
                 crew: Vec::new(),
                 turret: 0.0,
+                hijack_nodes: Vec::new(),
                 gun: 0.0,
                 rolled: 0.0,
                 fired: 0,
@@ -2192,6 +2197,7 @@ impl Scene {
                     spot: None,
                     crew,
                     turret: 0.0,
+                    hijack_nodes: Vec::new(),
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
@@ -2212,6 +2218,7 @@ impl Scene {
                     spot: Some((entity, at, yaw)),
                     crew,
                     turret: 0.0,
+                    hijack_nodes: Vec::new(),
                     gun: 0.0,
                     rolled: 0.0,
                     fired: 0,
@@ -2498,6 +2505,11 @@ impl Scene {
                     v.gun,
                 );
                 v.spec.spin_rotors(&mut nodes, v.rolled);
+                for &(i, m) in &v.hijack_nodes {
+                    if let Some(n) = nodes.get_mut(i) {
+                        *n = m;
+                    }
+                }
                 v.model.draw_posed(backend, queue, at, &nodes, &[])?;
             }
         }
