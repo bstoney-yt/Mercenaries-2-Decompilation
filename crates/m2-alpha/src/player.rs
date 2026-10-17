@@ -960,6 +960,7 @@ mod tests {
             road_wheels: Vec::new(),
             rest: Vec::new(),
             node_wheel: Vec::new(),
+            node_rolls: Vec::new(),
             mass: 32_000.0,
             turret: vec![true],
             pivot: Some(Vec3::new(0.0, 1.53, 0.55)),

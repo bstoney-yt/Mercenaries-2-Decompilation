@@ -2289,7 +2289,11 @@ fn disassemble(code: &[u8], indent: &str) {
                 "{indent}gotoFrame {}",
                 u16::from_le_bytes([body[0], body[1]]) + 1
             ),
-            0x83 => println!("{indent}{at:5} getURL {:?}", cstr(body)),
+            0x83 => {
+                let url = cstr(body);
+                let target = cstr(body.get(url.len() + 1..).unwrap_or_default());
+                println!("{indent}{at:5} getURL {url:?} into {target:?}");
+            }
             0x9A => println!("{indent}{at:5} getURL2"),
             0x99 | 0x9D => {
                 let off = i16::from_le_bytes([body[0], body[1]]) as i64;

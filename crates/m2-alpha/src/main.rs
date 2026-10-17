@@ -27,7 +27,7 @@
 //! Shift speeds up. With `--model` it shows those models on a ground grid
 //! instead, characters playing the game's locomotion clips in place (N
 //! steps through idle, walk, run and sprint; `--gait` picks the first).
-//! A click captures the mouse (F2 lets it go), F11 toggles
+//! A click captures the mouse (F2 lets it go), F11 or Alt+Enter toggles
 //! fullscreen, F3 toggles back-face culling, Escape releases the mouse,
 //! then quits.
 //!
@@ -47,6 +47,7 @@ mod cheats;
 mod combat;
 mod config;
 mod destruct;
+mod display;
 mod drops;
 mod flights;
 mod flow;
@@ -100,7 +101,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use camera::FlyCamera;
 use config::Config;
@@ -1619,10 +1620,26 @@ fn screenshot(
     let mut settings = config.clone();
     let mut info = hud_info(&game, link.as_ref(), fov, aspect);
     if hud.game.is_some() {
+        // The video screen as for a window of the picture's size, its
+        // lists the primary monitor's modes.
+        let video = pause::Video {
+            width: w,
+            height: h,
+            fullscreen: None,
+        };
+        let modes = if options.pause {
+            display::primary_modes()
+        } else {
+            Vec::new()
+        };
+        if options.pause {
+            eprintln!("pause: the monitor offers {} modes", modes.len());
+        }
         let mut state = gamehud::HudState::of(&mut game);
         state.pause = options.pause;
         state.pause_settings.profile = game.scene.hero.full_name().into();
-        state.pause_settings.resolution = format!("{w} x {h}");
+        state.pause_settings.video = video;
+        state.pause_settings.modes = modes.clone();
         info.game = Some(state);
         let seconds = options
             .hud_seconds
@@ -1642,11 +1659,24 @@ fn screenshot(
         let mut state = gamehud::HudState::of(&mut game);
         state.pause = options.pause;
         state.pause_settings.profile = game.scene.hero.full_name().into();
-        state.pause_settings.resolution = format!("{w} x {h}");
+        state.pause_settings.video = video;
+        state.pause_settings.modes = modes;
         info.game = Some(state);
         // What the game's pause menu asked of play, for the log.
         if let Some(g) = hud.game.as_mut() {
             let news = g.take_pause_news();
+            if let Some(v) = news.video.filter(|&v| v != video) {
+                // Offscreen there is no window to put into it.
+                eprintln!(
+                    "pause: video kept: {}, {} (a window would now be {})",
+                    v.resolution_text(),
+                    v.refresh_text(),
+                    match v.fullscreen {
+                        Some(_) => "fullscreen at that mode",
+                        None => "resized to it",
+                    }
+                );
+            }
             if news != pause::News::default() {
                 eprintln!("pause news: {news:?}");
             }
@@ -5053,6 +5083,58 @@ fn demolish_for_screenshot(
     Ok(())
 }
 
+/// Seconds between the frame-rate lines play logs ([`Pace`]).
+const PACE_EVERY: f32 = 30.0;
+
+/// The frame rate in play, logged every [`PACE_EVERY`] seconds as a
+/// `pace:` line: frames a second, the slowest frame, and how many frames
+/// took over 50 ms (under 20 fps), so a playtest's log says where play
+/// slowed, which a title bar's count can't (playtest 5's report of a
+/// lower frame rate had no numbers behind it).
+#[derive(Debug, Default)]
+struct Pace {
+    /// When the current span started, and the last frame.
+    since: Option<(Instant, Instant)>,
+    frames: u32,
+    slowest: Duration,
+    slow: u32,
+}
+
+impl Pace {
+    /// A frame drawn at `now` in a window `size` pixels: the line to log
+    /// when a span is over.
+    fn frame(&mut self, now: Instant, size: (u32, u32)) -> Option<String> {
+        let Some((start, last)) = self.since else {
+            self.since = Some((now, now));
+            return None;
+        };
+        let took = now - last;
+        self.frames += 1;
+        self.slowest = self.slowest.max(took);
+        if took > Duration::from_millis(50) {
+            self.slow += 1;
+        }
+        self.since = Some((start, now));
+        let span = (now - start).as_secs_f32();
+        if span < PACE_EVERY {
+            return None;
+        }
+        let line = format!(
+            "pace: {:.0} fps over {span:.0} s, slowest frame {:.0} ms, {} over 50 ms, {}x{}",
+            self.frames as f32 / span,
+            self.slowest.as_secs_f32() * 1000.0,
+            self.slow,
+            size.0,
+            size.1
+        );
+        *self = Self {
+            since: Some((now, now)),
+            ..Self::default()
+        };
+        Some(line)
+    }
+}
+
 struct Running {
     window: Arc<Window>,
     backend: WgpuBackend,
@@ -5071,6 +5153,8 @@ struct Running {
     released: bool,
     /// Keyboard input is ignored while another window has focus.
     focused: bool,
+    /// Alt is held (Alt+Enter toggles fullscreen).
+    alt: bool,
     /// The pause menu's keyboard table waits for a key or mouse button:
     /// the next one pressed goes to it, not to play.
     capturing: bool,
@@ -5078,6 +5162,8 @@ struct Running {
     last: Instant,
     lag: Duration,
     fps: (Instant, u32),
+    /// The frame rate as logged ([`Pace`]).
+    pace: Pace,
     title: String,
     hud: ui::Hud,
     egui: egui_winit::State,
@@ -5142,7 +5228,11 @@ impl App {
             .with_title("Mercenaries 2 (alpha)")
             .with_inner_size(PhysicalSize::new(w.width, w.height));
         if w.fullscreen {
-            attributes = attributes.with_fullscreen(Some(Fullscreen::Borderless(None)));
+            // At the kept mode (the pause menu's video screen), or
+            // borderless at the monitor's own.
+            let full =
+                display::fullscreen_at(event_loop.primary_monitor(), w.width, w.height, w.refresh);
+            attributes = attributes.with_fullscreen(Some(full));
         }
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
@@ -5201,11 +5291,13 @@ impl App {
             mouse_look: false,
             released: false,
             focused,
+            alt: false,
             capturing: false,
             culling: !self.double_sided,
             last: Instant::now(),
             lag: Duration::ZERO,
             fps: (Instant::now(), 0),
+            pace: Pace::default(),
             egui,
             hud,
             mission: match (&self.install, &self.mode) {
@@ -5456,6 +5548,18 @@ impl Running {
             ));
             self.fps = (now, 0);
         }
+        if let Some(line) = self.pace.frame(now, (w, h)) {
+            let s = &self.game.scene;
+            let p = self.game.focus();
+            eprintln!(
+                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders",
+                p.x,
+                p.z,
+                s.vehicles.len(),
+                s.people.npcs.len(),
+                s.riders.len()
+            );
+        }
         Ok(())
     }
 
@@ -5553,11 +5657,6 @@ impl Running {
     fn pause_settings(&self, config: &Config) -> pause::Settings {
         let o = &config.options;
         let size = self.window.inner_size();
-        let refresh = self
-            .window
-            .current_monitor()
-            .and_then(|m| m.refresh_rate_millihertz())
-            .map_or(60, |r| (r + 500) / 1000);
         pause::Settings {
             profile: self.game.scene.hero.full_name().into(),
             subtitles: o.subtitles,
@@ -5575,8 +5674,8 @@ impl Running {
             music: o.music_volume,
             dialog: o.dialog_volume,
             wide: size.width * 2 > size.height * 3,
-            resolution: format!("{} x {}", size.width, size.height),
-            refresh: refresh.to_string(),
+            video: display::current(&self.window),
+            modes: display::modes(self.window.current_monitor().as_ref()),
             saves: pause_saves(self.game.scene.hero),
             keys: keytable::KeyTable::of(&config.keys),
         }
@@ -5651,6 +5750,22 @@ impl Running {
             config.camera.invert_y = s.invert_mouse;
             config.camera.mouse_sensitivity = pause::mouse_radians(s.mouse);
             config.window.vsync = s.vsync;
+            // The video screen's Resolution and Refresh Rate, as kept
+            // (only on keeping: dropped changes leave the window be).
+            if let Some(v) = news.video
+                && v != display::current(&self.window)
+            {
+                let how = display::apply(&self.window, v);
+                eprintln!(
+                    "pause: video kept: {}, {}: {how}",
+                    v.resolution_text(),
+                    v.refresh_text()
+                );
+                let w = &mut config.window;
+                (w.width, w.height) = (v.width, v.height);
+                w.fullscreen = v.fullscreen.is_some();
+                w.refresh = v.fullscreen.unwrap_or(0);
+            }
             self.apply_options(config);
             let path = config::Config::default_path();
             match std::fs::write(&path, config.to_toml()) {
@@ -5900,9 +6015,7 @@ impl Running {
             self.released = self.mouse_look;
         }
         if self.input.take_pressed(Action::Fullscreen) {
-            let full = self.window.fullscreen().is_none();
-            self.window
-                .set_fullscreen(full.then_some(Fullscreen::Borderless(None)));
+            display::toggle(&self.window);
         }
         // The developer's keys are taken either way, and do nothing
         // without `--dev` in the whole game's launch.
@@ -6025,6 +6138,23 @@ impl ApplicationHandler for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        // Alt+Enter toggles fullscreen, as F11 does (the PC convention),
+        // in play and menus alike; its Enter goes no further.
+        if let WindowEvent::ModifiersChanged(m) = &event {
+            state.alt = m.state().alt_key();
+        }
+        if let WindowEvent::KeyboardInput { event: key, .. } = &event
+            && state.alt
+            && matches!(
+                key.physical_key,
+                PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter)
+            )
+        {
+            if key.state == ElementState::Pressed && !key.repeat {
+                display::toggle(&state.window);
+            }
+            return;
+        }
         // The menu takes the mouse and keys while it is open (Escape still
         // closes it).
         let to_menu = state.hud.menu
@@ -6046,6 +6176,7 @@ impl ApplicationHandler for App {
                 // Keys pressed or released elsewhere never reach us, so start
                 // clean either way.
                 state.focused = focused;
+                state.alt = false;
                 state.input.clear();
                 state.keep_mouse();
             }
@@ -6178,5 +6309,37 @@ impl ApplicationHandler for App {
         if let Some(state) = &self.state {
             state.window.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pace_logs_each_span_with_its_slowest_frame() {
+        let mut pace = Pace::default();
+        let t0 = Instant::now();
+        assert!(pace.frame(t0, (1280, 720)).is_none());
+        let mut t = t0;
+        let mut line = None;
+        // 16 ms frames, one of 80 ms, until the span is over.
+        for k in 0.. {
+            t += Duration::from_millis(if k == 10 { 80 } else { 16 });
+            line = pace.frame(t, (1280, 720));
+            if line.is_some() {
+                break;
+            }
+        }
+        let line = line.unwrap();
+        assert!(line.starts_with("pace: 6"), "{line}");
+        assert!(
+            line.contains("slowest frame 80 ms, 1 over 50 ms, 1280x720"),
+            "{line}"
+        );
+        // The next span starts clean.
+        t += Duration::from_millis(16);
+        assert!(pace.frame(t, (1280, 720)).is_none());
+        assert_eq!((pace.frames, pace.slow), (1, 0));
     }
 }

@@ -9,6 +9,15 @@
 //! dust, dirt), back to front, and added (fire, flashes, sparks). Blended
 //! particles are drawn unlit, their colour keys' brightness times
 //! [`SHADE`] standing in for the sun (invented).
+//!
+//! The added batch always draws after the blended one, sorted in front of
+//! it ([`AHEAD`]), whatever its own centre: the draw queue orders
+//! translucent draws by depth alone, and a fireball sorted first was
+//! hidden under its own dust (playtest 5's satellite bomb: a near-black
+//! dome with a glowing rim). Drawing glows over the smoke is inferred
+//! from the footage's fireballs, which blow out to yellow-white rather
+//! than show through dust; the game's own particle draw order is not
+//! read.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -37,6 +46,10 @@ const VERTEX: usize = 3 + 2 + 4;
 /// lighting (invented: the keys' grey smoke read dark against the
 /// footage's at 1, washed out at 1.2).
 const SHADE: f32 = 0.85;
+/// How far nearer the eye the added batch is sorted than the blended one
+/// when its own centre isn't, metres (invented: any step the queue's
+/// 24-bit depth keeps apart will do).
+const AHEAD: f32 = 0.5;
 
 /// How a template's effects resolved, for the log and the round's
 /// numbers.
@@ -267,11 +280,22 @@ impl ParticleDraw {
         let blended = self.sprites.iter().filter(|s| !s.glow).count();
         let centre =
             |range: &[Sprite]| range.iter().map(|s| s.at).sum::<Vec3>() / range.len().max(1) as f32;
+        let smoke = centre(&self.sprites[..blended]);
+        let glow = centre(&self.sprites[blended..]);
+        // The draw queue sorts translucent draws by their sort origins'
+        // depth alone, so the added batch is placed in front of the blended
+        // one: by its own centre it can sit a hair behind, and then the
+        // smoke drawn over it hides the fireball (playtest 5's black dome).
+        let glow = if blended > 0 {
+            in_front_of(view, smoke, glow)
+        } else {
+            glow
+        };
         let batches = [
-            (self.blended, 0, blended),
-            (self.glowing, blended, self.sprites.len() - blended),
+            (self.blended, 0, blended, smoke),
+            (self.glowing, blended, self.sprites.len() - blended, glow),
         ];
-        for (material, first, n) in batches {
+        for (material, first, n, sort_origin) in batches {
             if n == 0 {
                 continue;
             }
@@ -293,11 +317,24 @@ impl ParticleDraw {
                 },
                 layer: Layer::WORLD,
                 translucent: true,
-                sort_origin: centre(&self.sprites[first..first + n]),
+                sort_origin,
                 user: 0,
             });
         }
         Ok(())
+    }
+}
+
+/// Where to sort a batch that must draw after one sorted at `behind`:
+/// `own` if that is already nearer in `view`'s depth, else `behind`
+/// brought [`AHEAD`] towards the eye.
+fn in_front_of(view: &View, behind: Vec3, own: Vec3) -> Vec3 {
+    let eye = view.eye();
+    let ahead = behind + (eye - behind).normalize_or_zero() * AHEAD;
+    if view.normalized_depth(own) < view.normalized_depth(ahead) {
+        own
+    } else {
+        ahead
     }
 }
 
@@ -351,5 +388,34 @@ mod tests {
         let mut b = Vec::new();
         quad(&mut b, &Sprite { glow: false, ..s }, Vec3::X, Vec3::Y);
         assert_eq!(b[5], 2.0 * SHADE);
+    }
+
+    /// Playtest 5's bomb: the fireball's centre a centimetre behind its
+    /// smoke's sorted it first, and the smoke drawn over it hid it.
+    #[test]
+    fn the_added_batch_sorts_in_front_of_the_blended_one() {
+        let eye = Vec3::new(10.0, 2.0, 0.0);
+        let view = View::perspective(eye, Vec3::NEG_Z, 1.0, 16.0 / 9.0, 0.1, 4000.0);
+        let smoke = Vec3::new(10.0, 8.0, -45.0);
+        let behind = Vec3::new(10.0, 3.0, -45.01);
+        let at = in_front_of(&view, smoke, behind);
+        // Nearer by more than the queue's 24-bit depth step, many times over.
+        let step = 1.0 / (1u32 << 24) as f32;
+        assert!(
+            view.normalized_depth(smoke) - view.normalized_depth(at) > 100.0 * step,
+            "{at}"
+        );
+        // One already in front keeps its own centre.
+        let before = Vec3::new(9.0, 3.0, -30.0);
+        assert_eq!(in_front_of(&view, smoke, before), before);
+        // Seen from the side, depth is what counts, not distance.
+        let side = View::perspective(eye, Vec3::X, 1.0, 1.0, 0.1, 4000.0);
+        let ahead_on_axis = Vec3::new(40.0, 2.0, 0.0);
+        let off_to_one_side = Vec3::new(35.0, 2.0, -45.0);
+        assert!(off_to_one_side.distance(eye) > ahead_on_axis.distance(eye));
+        assert_eq!(
+            in_front_of(&side, ahead_on_axis, off_to_one_side),
+            off_to_one_side
+        );
     }
 }

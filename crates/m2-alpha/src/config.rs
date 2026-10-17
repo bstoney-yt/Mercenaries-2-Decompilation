@@ -105,9 +105,13 @@ impl Default for WorldConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowConfig {
+    /// The window's size; fullscreen, the mode's.
     pub width: u32,
     pub height: u32,
     pub fullscreen: bool,
+    /// Fullscreen, the mode's refresh rate in hertz (the pause menu's
+    /// Refresh Rate); 0 is the monitor's own mode, borderless.
+    pub refresh: u32,
     pub vsync: bool,
 }
 
@@ -117,6 +121,7 @@ impl Default for WindowConfig {
             width: 1600,
             height: 900,
             fullscreen: false,
+            refresh: 0,
             vsync: true,
         }
     }
