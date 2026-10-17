@@ -816,6 +816,10 @@ pub struct Scene {
     /// that are ruins of one ([`crate::mission::is_ruin`]): they stand
     /// wrecked when they load.
     pub ruins: std::collections::HashSet<u32>,
+    /// The crews the mission scripts' layers seat in their vehicles, by
+    /// guid ([`m2_game::mission::Mission::crew_of`]): an entity's own
+    /// riders (the HQ interior's Fiona) where its template has none.
+    pub mission_crews: std::collections::HashMap<u32, Vec<(String, String)>>,
     pub world: Option<World>,
     pub models: Vec<Placed>,
     pub materials: MaterialCache,
@@ -1480,6 +1484,7 @@ impl Scene {
         let effects = Effects::new(backend, &mut materials)?;
         Ok(Self {
             ruins: Default::default(),
+            mission_crews: Default::default(),
             ground,
             world: None,
             models: Vec::new(),
@@ -2178,11 +2183,17 @@ impl Scene {
             }),
             Loaded::MissionVehicle(guid, spec, _) => {
                 eprintln!("mission vehicle {guid:#x}: {}", spec.label);
-                let crew = self
-                    .world
-                    .as_ref()
-                    .map(|w| w.index.template_db.crew(&spec.label))
-                    .unwrap_or_default();
+                let crew = match self.mission_crews.get(&guid) {
+                    Some(own) if !own.is_empty() => {
+                        eprintln!("mission vehicle {guid:#x}: its own crew {own:?}");
+                        own.clone()
+                    }
+                    _ => self
+                        .world
+                        .as_ref()
+                        .map(|w| w.index.template_db.crew(&spec.label))
+                        .unwrap_or_default(),
+                };
                 self.vehicles.push(ParkedVehicle {
                     spec: tune(spec),
                     model,

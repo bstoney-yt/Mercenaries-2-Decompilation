@@ -974,6 +974,26 @@ impl MissionLink {
         // beeps, its correct and failed presses).
         self.sounds
             .extend(game.support.cues.iter().map(|&c| (c.to_owned(), false)));
+        // The scripts' context actions (the HQ's exits, a starter's talk):
+        // the one she stands at is offered, and taken with the use key.
+        if let Some(g) = game.context_taken.take() {
+            mission.take_context_action(g);
+        }
+        let on_foot = game
+            .scene
+            .player
+            .as_ref()
+            .filter(|p| p.driving.is_none())
+            .map(|p| p.character.position);
+        let offered = on_foot.and_then(|at| nearest_context(&mission.context_actions(), at));
+        let offered = offered.map(|(g, id)| (g, mission.text(&id)));
+        if offered != game.context {
+            match &offered {
+                Some((g, text)) => eprintln!("context: {text:?} offered at {g:#x}"),
+                None => eprintln!("context: none offered"),
+            }
+            game.context = offered;
+        }
         self.lag += dt;
         let mut lines = Vec::new();
         while self.lag >= STEP {
@@ -1311,6 +1331,21 @@ impl MissionLink {
         eprintln!("mission: {why}");
         self.write([why.clone()]);
         self.state = State::Failed(why);
+    }
+
+    /// The first context action on offer whose prompt reads `text` (as
+    /// shown, any case): its object and where that stands. For
+    /// `--context`.
+    pub fn context_spot(&self, text: &str) -> Option<(u32, Vec3)> {
+        let State::Running(mission) = &self.state else {
+            return None;
+        };
+        let text = text.to_ascii_lowercase();
+        mission
+            .context_actions()
+            .into_iter()
+            .filter(|(_, _, id, _)| mission.text(id).to_ascii_lowercase().contains(&text))
+            .find_map(|(g, at, _, _)| Some((g, Vec3::from(at?))))
     }
 
     /// Scripted voice lines to play (id, cue, where said) and to stop,
@@ -1674,6 +1709,30 @@ impl MissionLink {
 /// scripts' or the HUD's) `hero`, whole at `max` health: their name, the
 /// labels their template has in the data, and their health
 /// ([`Mission::set_hero`]). Says so on stderr after `who`.
+/// How far above or below a context action's object she may stand and
+/// still be offered it (metres; invented: a floor's height, so the HQ's
+/// upper landing doesn't offer what stands below it).
+const CONTEXT_RISE: f32 = 2.5;
+
+/// The context action (`(object, position, text id, reach)`, as
+/// [`m2_game::mission::Mission::context_actions`] lists them) nearest `at`
+/// within its reach, measured flat, and within [`CONTEXT_RISE`] of it up
+/// or down: its object and text id.
+fn nearest_context(
+    actions: &[(u32, Option<[f32; 3]>, String, f32)],
+    at: Vec3,
+) -> Option<(u32, String)> {
+    actions
+        .iter()
+        .filter_map(|(g, pos, text, reach)| {
+            let p = Vec3::from(pos.as_ref()?.to_owned());
+            let flat = p.with_y(0.0).distance(at.with_y(0.0));
+            (flat <= *reach && (p.y - at.y).abs() <= CONTEXT_RISE).then_some((flat, g, text))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, &g, text)| (g, text.clone()))
+}
+
 pub fn set_hero(mission: &mut Mission, hero: Hero, max: f32, who: &str) {
     let labels = mission.set_hero(hero.name(), hero.template(), max);
     eprintln!(
@@ -1855,6 +1914,10 @@ impl Fleet {
                 && is_ruin(&island.index.template_db, &o.name)
             {
                 game.scene.ruins.insert(g);
+            }
+            let crew = mission.crew_of(g);
+            if !crew.is_empty() {
+                game.scene.mission_crews.insert(g, crew);
             }
             game.scene.load_vehicle(g, models);
         }
@@ -3241,6 +3304,46 @@ pub(crate) fn vehicle_models(name: &str, catalogue: &[CatalogueEntry]) -> Vec<Ca
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    #[test]
+    fn the_nearest_context_action_in_reach_is_offered() {
+        // The HQ's exits stand at its doors, a floor up in the sky
+        // (y 450); its starter's talk reaches 4 m.
+        let actions = vec![
+            (
+                1,
+                Some([0.0, 450.0, 0.0]),
+                "[ContextAction.Exit]".into(),
+                2.0,
+            ),
+            (
+                2,
+                Some([3.0, 450.0, 0.0]),
+                "[ContextAction.Talk]".into(),
+                4.0,
+            ),
+            (3, None, "[ContextAction.Exit]".into(), 2.0),
+            (
+                4,
+                Some([1.0, 446.0, 0.0]),
+                "[ContextAction.Exit]".into(),
+                2.0,
+            ),
+        ];
+        let at = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+        let near = |p| nearest_context(&actions, p).map(|(g, _)| g);
+        // Beside the exit: it, though the talk reaches too.
+        assert_eq!(near(at(0.5, 450.0)), Some(1));
+        // Nearer the starter.
+        assert_eq!(near(at(2.5, 450.0)), Some(2));
+        // Out of reach of all; one a floor below never offered.
+        assert_eq!(near(at(10.0, 450.0)), None);
+        assert_eq!(near(at(1.0, 446.0 - CONTEXT_RISE - 0.5)), None);
+        assert_eq!(
+            nearest_context(&actions, at(0.0, 450.0)),
+            Some((1, "[ContextAction.Exit]".to_owned()))
+        );
+    }
 
     use super::*;
 

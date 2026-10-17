@@ -361,6 +361,26 @@ pub enum Command {
     },
 }
 
+/// An action the player can take beside an object (`Pg.AddContextAction`):
+/// the HQ's exits and entrances, talking to a starter, the wardrobe.
+///
+/// From the scripts: `Pg.AddContextAction(guid, text, reach, 0, 0, 255,
+/// reach, false)`; the HQ's exits pass 2 (twice), a starter's talk 4, the
+/// wardrobe only its guid, text and 1. The third argument is taken as how
+/// near (metres) she must stand: inferred, as the only distance-like value
+/// every call gives, growing with the size of what is used; the rest are
+/// not read. `Event.ContextAction` `{ 0, guid }` waits for her to take it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextAction {
+    /// The prompt's text id (`[ContextAction.Exit]`).
+    pub text: String,
+    /// Metres from the object within which it is offered.
+    pub reach: f32,
+}
+
+/// Reach (metres) for a context action whose call gives none (invented).
+pub const CONTEXT_REACH: f32 = 2.0;
+
 /// The scripts' view of the game, and what they asked of it.
 #[derive(Debug, Default)]
 pub struct ScriptWorld {
@@ -451,6 +471,16 @@ pub struct ScriptWorld {
     /// The player's latest presses of the GUI's named buttons, with
     /// their game time ([`crate::events::World::button_presses`]).
     pub buttons: Vec<(f64, String)>,
+    /// The context actions on offer, by object ([`ContextAction`]).
+    pub context_actions: std::collections::BTreeMap<u32, ContextAction>,
+    /// The player's latest takings of a context action, by object, with
+    /// their game time ([`crate::events::World::context_presses`]).
+    pub context_presses: Vec<(f64, u32)>,
+    /// The crews the layers' vehicles came into play with, by vehicle:
+    /// (seat, rider template), as each entity's own `Rider` records say
+    /// (the HQ interior's `HqInterior` seats Fiona, its PMC boss), else
+    /// its template's.
+    pub crews: HashMap<u32, Vec<(String, String)>>,
     /// Strikes and designators under way.
     pub strikes: crate::airstrike::Strikes,
     /// Whether vehicle disguises work (`Player.SetVehicleDisguise`): the
@@ -779,6 +809,10 @@ impl World for ScriptWorld {
 
     fn button_presses(&self) -> &[(f64, String)] {
         &self.buttons
+    }
+
+    fn context_presses(&self) -> &[(f64, u32)] {
+        &self.context_presses
     }
 
     fn hijack_held_since(&self, button: u32) -> Option<f64> {
@@ -1865,6 +1899,28 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
         values([])
     })?;
     add(&pg, "UnloadAsset", |_, _, _| values([]))?;
+    // Pg.AddContextAction(guid, text[, reach, ...]) and
+    // Pg.RemoveContextAction(guid): see [`ContextAction`].
+    add(&pg, "AddContextAction", |w, _, a| {
+        let (Some(guid), Some(Value::String(text))) = (id(a.first()), a.get(1)) else {
+            return values([]);
+        };
+        let reach = num(a.get(2)).filter(|r| *r > 0.0).unwrap_or(CONTEXT_REACH);
+        w.context_actions.insert(
+            guid,
+            ContextAction {
+                text: text.to_string_lossy(),
+                reach,
+            },
+        );
+        values([])
+    })?;
+    add(&pg, "RemoveContextAction", |w, _, a| {
+        if let Some(guid) = id(a.first()) {
+            w.context_actions.remove(&guid);
+        }
+        values([])
+    })?;
     add(&ai, "Goal", |w, _, a| {
         let Some(Value::Table(t)) = a.first() else {
             return values([]);
@@ -2819,6 +2875,38 @@ mod tests {
                     region: 1,
                     setting: "night".into()
                 }
+            ]
+        );
+    }
+
+    #[test]
+    fn context_actions_are_offered_until_removed() {
+        let (host, world) = setup();
+        host.lua()
+            .load(
+                r#"
+                -- WifPmcInterior's exit, its starter's talk, the wardrobe.
+                Pg.AddContextAction(11, "[ContextAction.Exit]", 2, 0, 0, 255, 2, false)
+                Pg.AddContextAction(12, "[ContextAction.Talk]", 4, 0, 0, 255, 4, false)
+                Pg.AddContextAction(13, "[ContextAction.ChangeOutfit]", 1)
+                Pg.AddContextAction(14, "[ContextAction.Enter]")
+                Pg.RemoveContextAction(12)
+                "#,
+            )
+            .exec()
+            .unwrap();
+        let w = world.borrow();
+        let offered: Vec<(u32, &str, f32)> = w
+            .context_actions
+            .iter()
+            .map(|(&g, a)| (g, a.text.as_str(), a.reach))
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                (11, "[ContextAction.Exit]", 2.0),
+                (13, "[ContextAction.ChangeOutfit]", 1.0),
+                (14, "[ContextAction.Enter]", CONTEXT_REACH),
             ]
         );
     }

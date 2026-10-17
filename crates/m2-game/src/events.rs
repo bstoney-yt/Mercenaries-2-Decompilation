@@ -100,6 +100,11 @@ pub trait World {
     fn button_presses(&self) -> &[(f64, String)] {
         &[]
     }
+    /// The player's takings of context actions (`Pg.AddContextAction`),
+    /// by object, each with its game time, for `ContextAction` events.
+    fn context_presses(&self) -> &[(f64, u32)] {
+        &[]
+    }
 }
 
 /// The kinds the scripts use, by how often.
@@ -1089,6 +1094,19 @@ fn check(
         // { player, button, "press", ... }: when the player presses the
         // named button (`"selection"`: the fanfare's skip), after the
         // event was made (persistent: after it last fired).
+        // { 0, object }: as the player takes the context action offered
+        // beside the object (`Pg.AddContextAction`: the HQ's exits, a
+        // starter's talk). Passes nothing of its own.
+        "ContextAction" => match guid(&p.params, 2) {
+            Some(g) => {
+                let taken = world
+                    .context_presses()
+                    .iter()
+                    .any(|(t, o)| *o == g && *t >= p.last && (*t > p.last || !p.persistent));
+                if taken { Check::Fire(Vec::new()) } else { no }
+            }
+            None => no,
+        },
         "Button" => match text(&p.params, 2) {
             Some(button) => {
                 let pressed = world
@@ -1183,6 +1201,8 @@ mod tests {
         /// Whether the camera is known, and what it sees.
         camera: bool,
         visible: Vec<u32>,
+        /// Context actions taken: (game time, object).
+        context: Vec<(f64, u32)>,
     }
 
     impl World for TestWorld {
@@ -1203,6 +1223,9 @@ mod tests {
         }
         fn is_awake(&self, guid: u32) -> bool {
             self.positions.contains_key(&guid)
+        }
+        fn context_presses(&self) -> &[(f64, u32)] {
+            &self.context
         }
         fn inside(&self, _: u32, _: u32) -> Option<bool> {
             None
@@ -1284,6 +1307,35 @@ mod tests {
         host.lua().load("Event.Delete(id)").exec().unwrap();
         events.update(1.0, &world);
         assert_eq!(log(&host).len(), 3);
+    }
+
+    #[test]
+    fn a_context_action_fires_when_taken_at_its_object() {
+        let (host, events) = setup();
+        // As the HQ's portals wait on their exits (`WifPmcInterior`).
+        host.lua()
+            .load(
+                "Event.CreatePersistent(Event.ContextAction, { 0, 7 }, \
+                 function(d) table.insert(log, 'exit ' .. d) end, { 'A' })",
+            )
+            .exec()
+            .unwrap();
+        let mut world = TestWorld {
+            // Taken before it was waited for, and at another object.
+            context: vec![(-1.0, 7), (0.25, 8)],
+            ..TestWorld::default()
+        };
+        events.update(0.5, &world);
+        assert!(log(&host).is_empty());
+        world.context.push((0.75, 7));
+        events.update(0.5, &world);
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["exit A"]);
+        // Persistent: taken again, it fires again.
+        world.context.push((1.25, 7));
+        events.update(0.5, &world);
+        assert_eq!(log(&host), ["exit A", "exit A"]);
+        assert!(events.take_unhandled().is_empty());
     }
 
     #[test]

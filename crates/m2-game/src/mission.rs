@@ -1627,6 +1627,40 @@ end
         w.buttons.drain(..extra);
     }
 
+    /// The context actions on offer (`Pg.AddContextAction`): each one's
+    /// object, where it stands (if known), its prompt's text id and reach.
+    pub fn context_actions(&self) -> Vec<(u32, Option<[f32; 3]>, String, f32)> {
+        let w = self.world.borrow();
+        w.context_actions
+            .iter()
+            .map(|(&g, a)| {
+                let at = w.objects.get(&g).map(|o| o.position);
+                (g, at, a.text.clone(), a.reach)
+            })
+            .collect()
+    }
+
+    /// Who a layer's vehicle `guid` came into play with: (seat, rider
+    /// template), as its entity's own `Rider` records say, else its
+    /// template's; empty for none.
+    pub fn crew_of(&self, guid: u32) -> Vec<(String, String)> {
+        self.world
+            .borrow()
+            .crews
+            .get(&guid)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The player took the context action offered beside `guid`, for the
+    /// scripts' `ContextAction` events.
+    pub fn take_context_action(&mut self, guid: u32) {
+        let mut w = self.world.borrow_mut();
+        w.context_presses.push((self.now, guid));
+        let extra = w.context_presses.len().saturating_sub(16);
+        w.context_presses.drain(..extra);
+    }
+
     /// Everything the scripts asked the game to do since the last call.
     pub fn take_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.outbox)
@@ -1860,7 +1894,11 @@ fn place(world: &Shared, entities: &[Entity], load: bool) {
                 w.regions.insert(e.guid, r.clone());
             }
             seat_crew(&mut w, e.guid, e.at, &e.crew);
+            if !e.crew.is_empty() {
+                w.crews.insert(e.guid, e.crew.clone());
+            }
         } else {
+            w.crews.remove(&e.guid);
             w.objects.remove(&e.guid);
             w.regions.remove(&e.guid);
             // Its crew goes with it.

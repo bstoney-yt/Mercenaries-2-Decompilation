@@ -177,6 +177,13 @@ pub struct Game {
     /// over its height the last frame was drawn with: what the scripts'
     /// camera sees (`Event.ObjectIsVisible`).
     pub lens: (f32, f32),
+    /// The scripts' context action she stands at (`Pg.AddContextAction`:
+    /// an HQ exit, a starter's talk), its object and prompt, as the
+    /// mission last found it; the use key takes it before anything else.
+    pub context: Option<(u32, String)>,
+    /// The context action she took with the use key, for the mission to
+    /// tell the scripts.
+    pub context_taken: Option<u32>,
 }
 
 /// A soldier's pickup is told from the others by its "crate": this, plus
@@ -273,6 +280,8 @@ impl Game {
             hijack_only: HashSet::new(),
             support_hp: 0.0,
             lens: (60.0, 16.0 / 9.0),
+            context: None,
+            context_taken: None,
         }
     }
 
@@ -504,6 +513,14 @@ impl Game {
             self.toggle_fly();
         }
         if self.on_foot {
+            // A context action she stands at takes the use key first.
+            if let Some((g, _)) = &self.context
+                && !self.input_locked
+                && input.take_pressed(Action::Use)
+            {
+                eprintln!("context: she takes the action at {g:#x}");
+                self.context_taken = Some(*g);
+            }
             let mut intent = Intent::from_input(input, config, mouse_look);
             let toggle = input.take_pressed(Action::Binoculars);
             let zoom = i32::from(input.take_pressed(Action::ZoomIn))
@@ -1794,7 +1811,13 @@ impl Game {
             }
             .map(|r| (r.clip, r.stored)),
             // Looking through the satellite, its own overlay is shown.
-            prompt: prompt.filter(|_| !self.support.busy()),
+            prompt: self
+                .context
+                .as_ref()
+                .filter(|_| self.on_foot && !self.input_locked)
+                .map(|(_, text)| text.clone())
+                .or(prompt)
+                .filter(|_| !self.support.busy()),
             driving,
             crosshair: crosshair.filter(|_| self.support.looking().is_none()),
             can_enter: can_enter.filter(|_| !self.support.busy()),

@@ -287,6 +287,11 @@ struct Options {
     /// With `--mission`: try every placed pickup, crate and emplaced gun
     /// as the layers put them out ([`placed::check`]), for testing.
     placed_check: bool,
+    /// With `--mission`: once the scripts offer a context action whose
+    /// prompt reads this (`exit`, `talk`), put her at its object and take
+    /// it with the use key, logging where she is after
+    /// ([`context_check`]), for testing.
+    context: Option<String>,
     /// With `--mission`: hit every placed prop as `--props-check` says
     /// (`vehicle`, `gun` or `blast`), once she stands in `--props-area`
     /// (x, z corners) if given, and stop ([`breakables::check`]).
@@ -487,6 +492,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--hijack-crew" => o.hijack_crew = Some(value()?),
             "--hijack" => o.hijack = true,
             "--placed-check" => o.placed_check = true,
+            "--context" => o.context = Some(value()?),
             "--props-check" => {
                 let v = value()?;
                 o.props_check = Some(breakables::HitKind::parse(&v).with_context(|| {
@@ -3033,6 +3039,7 @@ fn mission_for_screenshot(
     let mut props_ready = 0.0;
     let mut shop_check = options.shop_check.clone().map(shopcheck::ShopCheck::new);
     let mut cheat_check = options.cheat_check.then(cheats::Check::default);
+    let mut context = ContextCheck::default();
     for i in 0..(seconds / tick).round() as u32 {
         let intent = match auto.as_mut().filter(|_| contract_done.is_none()) {
             Some(a) => {
@@ -3082,6 +3089,9 @@ fn mission_for_screenshot(
         }
         game.step(intent, tick);
         link.tick(game, tick);
+        if let Some(want) = &options.context {
+            context_check(game, &link, want, &mut context, tick);
+        }
         // The saves the scripts ask for are written, as in play.
         for slot in link.take_saves() {
             write_save(game, Some(&link), &save::SaveGame::slot_path(&slot));
@@ -3741,6 +3751,76 @@ fn hijack_for_screenshot(
     eprintln!("hijack: over after {t:.1} s; driving it: {driving}");
     render(backend, game, fov, aspect, None)?;
     Ok(())
+}
+
+/// Where `--context` is: seconds since she was put at the action's object,
+/// and since she took it (each `None` until then).
+#[derive(Debug, Default)]
+struct ContextCheck {
+    put: Option<f32>,
+    taken: Option<(f32, m2_math::glam::Vec3)>,
+    /// Her place was logged this long after taking it.
+    logged: Vec<f32>,
+}
+
+/// With `--context`: once the scripts offer a context action whose prompt
+/// reads `want`, she is put 0.5 m from its object; once the game offers it
+/// her (a second on), she takes it as the use key does. Her place is
+/// logged 1, 4 and 10 s after (`context-check:` lines): an HQ exit takes
+/// her out of the interior, 450 m up, to the villa's grounds.
+fn context_check(
+    game: &mut Game,
+    link: &mission::MissionLink,
+    want: &str,
+    c: &mut ContextCheck,
+    tick: f32,
+) {
+    use m2_math::glam::Vec3;
+    let here = game.scene.player.as_ref().map(|p| p.character.position);
+    if let Some((since, from)) = &mut c.taken {
+        *since += tick;
+        for after in [1.0, 4.0, 10.0] {
+            if *since >= after && !c.logged.contains(&after) {
+                c.logged.push(after);
+                eprintln!(
+                    "context-check: {after:.0} s after taking {want:?} (at {from:.1}) she is at {:.1}",
+                    here.unwrap_or(Vec3::NAN)
+                );
+            }
+        }
+        return;
+    }
+    let Some((g, at)) = link.context_spot(want) else {
+        return;
+    };
+    match &mut c.put {
+        None => {
+            if let Some(p) = game.scene.player.as_mut() {
+                p.character.position = at + Vec3::new(0.5, 0.0, 0.0);
+                p.character.velocity = Vec3::ZERO;
+            }
+            eprintln!("context-check: {want:?} offered at {g:#x} ({at:.1}): she is put by it");
+            c.put = Some(0.0);
+        }
+        Some(t) => {
+            *t += tick;
+            let offered = game.context.as_ref().filter(|(o, _)| *o == g);
+            if *t >= 1.0
+                && let Some((_, text)) = offered
+            {
+                eprintln!("context-check: the prompt reads {text:?}; she takes it");
+                game.context_taken = Some(g);
+                c.taken = Some((0.0, here.unwrap_or(at)));
+            } else if *t >= 10.0 && c.logged.is_empty() {
+                c.logged.push(0.0);
+                eprintln!(
+                    "context-check: not offered her in 10 s (she is at {:.1}; offered {:?})",
+                    here.unwrap_or(Vec3::NAN),
+                    game.context
+                );
+            }
+        }
+    }
 }
 
 /// Parks the vehicle she drives 12 m short of the nearest placed object
