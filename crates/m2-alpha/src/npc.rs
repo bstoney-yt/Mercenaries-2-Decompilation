@@ -756,6 +756,18 @@ pub struct Npc {
     shouted: bool,
     /// Killed since [`People::take_deaths`] last looked.
     died: bool,
+    /// Turning done standing still lately, radians, fading by half every
+    /// [`SPIN_FADE`] seconds (for checking: someone spinning on the spot).
+    spun: f32,
+    /// On a route the scripts gave: how near its next point they have
+    /// been, metres, and the seconds since they last got nearer.
+    route_near: f32,
+    route_stall: f32,
+    /// Got to the end of a route the scripts gave (for checking).
+    reached: bool,
+    /// On such a route, going over or through what stopped them to its
+    /// next point ([`ROUTE_STALL`]).
+    through: bool,
 }
 
 /// What a person shouts.
@@ -839,6 +851,11 @@ impl Npc {
             flee: None,
             put_out: false,
             brain,
+            spun: 0.0,
+            route_near: f32::INFINITY,
+            route_stall: 0.0,
+            reached: false,
+            through: false,
         }
     }
 
@@ -1325,7 +1342,11 @@ impl Npc {
                 }
             }
         }
-        if self.alert {
+        // Sent along a route by the scripts (their goals are `hiPri`): they
+        // run it to its end first, and fight from there (inferred: the
+        // villa's waves come in to the hall).
+        let sent = matches!(self.brain, Brain::Route { .. });
+        if self.alert && !sent {
             match threat {
                 Some(t) if self.fight(physics, t, rng, dt) => return,
                 _ => self.calm(),
@@ -1352,6 +1373,7 @@ impl Npc {
             }
         }
         let mut arrived = false;
+        let mut glide = None;
         match &mut self.brain {
             _ if self.flee.is_some() => {}
             Brain::Post { facing } => face = Some(*facing),
@@ -1401,16 +1423,43 @@ impl Npc {
                 }
             }
             Brain::Route { route, next } => {
-                let flat = (route[*next] - at).with_y(0.0);
+                let point = route[*next];
+                let flat = (point - at).with_y(0.0);
                 if flat.length() < 0.8 {
+                    self.route_near = f32::INFINITY;
+                    self.route_stall = 0.0;
+                    // Over what stopped them: onto the floor under the
+                    // point they made for.
+                    if std::mem::take(&mut self.through) {
+                        self.landed = false;
+                    }
                     if *next + 1 < route.len() {
                         *next += 1;
                     } else {
                         arrived = true;
                     }
                 } else {
-                    // At a run, as the scripts' `Haste` 1 asks.
-                    wanted = flat.normalize() * FLEE;
+                    if flat.length() < self.route_near - 0.1 {
+                        self.route_near = flat.length();
+                        self.route_stall = 0.0;
+                    } else {
+                        self.route_stall += dt;
+                    }
+                    // Getting no nearer the next point (a wall, a door, a
+                    // ledge their path climbs, which the game's own
+                    // vaults and climbs would take): they go on over or
+                    // through it to the point (invented: the alpha has no
+                    // climbing, nor the game's navigation).
+                    if self.route_stall > ROUTE_STALL {
+                        self.through = true;
+                    }
+                    if self.through {
+                        glide = Some(point);
+                        face = Some(flat.x.atan2(flat.z));
+                    } else {
+                        // At a run, as the scripts' `Haste` 1 asks.
+                        wanted = flat.normalize() * FLEE;
+                    }
                 }
             }
         }
@@ -1418,8 +1467,18 @@ impl Npc {
             self.brain = Brain::Post {
                 facing: self.facing,
             };
+            self.reached = true;
         }
-        physics.move_character(&mut self.character, wanted, None, dt);
+        match glide {
+            Some(point) => {
+                let to = point - self.character.position;
+                let d = to.length();
+                let step = to / d.max(1e-3) * (FLEE * dt).min(d);
+                self.character.position += step;
+                self.character.velocity = step / dt;
+            }
+            None => physics.move_character(&mut self.character, wanted, None, dt),
+        }
         // Walked into something: give up on that point (strolls) or wait
         // and try again (routes).
         let moved = Vec2::new(self.character.velocity.x, self.character.velocity.z).length();
@@ -1524,6 +1583,8 @@ pub struct People {
     pub smarter: SmarterAi,
     /// What soldiers near her have been at (for checking).
     pub idle: IdleTally,
+    /// What shouldn't happen to anyone (for checking).
+    pub checks: Checks,
     /// Each person template's mixer profile, by name, lower case
     /// ([`m2_engine::world::Templates::mixer_profiles`]).
     pub mixer_profiles: HashMap<String, u32>,
@@ -1586,6 +1647,111 @@ impl IdleTally {
             }
         } else if !n.alert && d < UNAWARE_RANGE && n.sees(physics, threat, true) {
             self.unaware += dt;
+        }
+    }
+}
+
+/// Seconds over which turning on the spot fades by half, for
+/// [`Checks`]: someone who turns a whole circle and more standing still
+/// within a few seconds is spinning (one turn to face somewhere is half
+/// a circle at most).
+const SPIN_FADE: f32 = 2.0;
+/// How deep in the sea someone's feet may be before they count as stood
+/// in it, metres (a wade at the water's edge is fine).
+const WET: f32 = 1.0;
+/// Seconds without getting nearer the next point of a route the scripts
+/// gave before a runner counts as stuck.
+const STALL: f32 = 3.0;
+/// Seconds a runner on such a route gets no nearer its next point before
+/// going over or through what stops them (invented).
+const ROUTE_STALL: f32 = 1.5;
+
+/// What shouldn't happen to people, tallied (for checking, playtest 8):
+/// spinning on the spot, standing in the sea, and runners the scripts
+/// sent along a route not getting to its end. Each by the spawn entities
+/// it happened to, and person-seconds.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Checks {
+    pub spinning: f32,
+    pub spinners: HashSet<u32>,
+    pub wet: f32,
+    pub wetted: HashSet<u32>,
+    /// Runners sent along a route, those who got to its end, and those
+    /// who stuck on the way (once each).
+    pub sent: HashSet<u32>,
+    pub arrived: HashSet<u32>,
+    pub stuck: HashSet<u32>,
+}
+
+impl Checks {
+    /// The tally in a line.
+    pub fn line(&self) -> String {
+        format!(
+            "people checks: spinning {:.1} s ({} people), in the sea {:.1} s ({} people); runners {} sent, {} at their route's end, {} stuck on the way",
+            self.spinning,
+            self.spinners.len(),
+            self.wet,
+            self.wetted.len(),
+            self.sent.len(),
+            self.arrived.len(),
+            self.stuck.len()
+        )
+    }
+
+    /// Counts `n`'s tick: they faced `facing` before it, and the sea is at
+    /// `sea`.
+    fn count(&mut self, n: &mut Npc, facing: f32, sea: Option<f32>, dt: f32) {
+        let fade = 0.5f32.powf(dt / SPIN_FADE);
+        n.spun *= fade;
+        if !n.alive || !n.landed {
+            n.spun = 0.0;
+            return;
+        }
+        let id = n.spawn.unwrap_or(u32::MAX);
+        let speed = Vec2::new(n.character.velocity.x, n.character.velocity.z).length();
+        if speed < 0.3 {
+            let turn = (n.facing - facing + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI;
+            n.spun += turn.abs();
+        }
+        if n.spun > std::f32::consts::TAU {
+            self.spinning += dt;
+            if self.spinners.insert(id) {
+                eprintln!(
+                    "people check: {id:08x} spins on the spot at {:.1} ({})",
+                    n.character.position,
+                    n.doing()
+                );
+            }
+        }
+        if sea.is_some_and(|s| n.character.position.y < s - WET) {
+            self.wet += dt;
+            if self.wetted.insert(id) {
+                eprintln!(
+                    "people check: {id:08x} stands in the sea at {:.1} ({})",
+                    n.character.position,
+                    n.doing()
+                );
+            }
+        }
+        if std::mem::take(&mut n.reached) && self.arrived.insert(id) {
+            eprintln!(
+                "people check: {id:08x} at its route's end, {:.1}",
+                n.character.position
+            );
+        }
+        if let Brain::Route { route, next } = &n.brain {
+            self.sent.insert(id);
+            let d = (route[*next] - n.character.position).with_y(0.0).length();
+            if n.route_stall > STALL && self.stuck.insert(id) {
+                eprintln!(
+                    "people check: {id:08x} stuck on its route at {:.1}, {:.1} m short of point {} of {}",
+                    n.character.position,
+                    d,
+                    next + 1,
+                    route.len()
+                );
+            }
         }
     }
 }
@@ -1886,10 +2052,13 @@ impl People {
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
         let mut callouts = Vec::new();
+        let sea = physics.water();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
             npc.rammed = (npc.rammed - dt).max(0.0);
+            let facing = npc.facing;
             npc.update(physics, &mut self.rng, threat, dt);
+            self.checks.count(npc, facing, sea, dt);
             if let Some(t) = threat {
                 self.idle.count(physics, npc, t, dt);
             }
@@ -2058,6 +2227,7 @@ impl People {
             n.character.velocity = Vec3::ZERO;
             n.landed = false;
             n.flee = None;
+            n.through = false;
             n.brain = Brain::Post { facing: n.facing };
         }
         eprintln!("people: the scripts put {entity:08x} at {at:.1}");
@@ -2071,16 +2241,34 @@ impl People {
             return;
         }
         self.routes.insert(entity, route.clone());
+        let mut here = false;
         for n in self
             .npcs
             .iter_mut()
             .filter(|n| n.spawn == Some(entity) && n.alive)
         {
+            here = true;
+            eprintln!(
+                "people: {entity:08x} sent from {:.1} along {} points, first {:.1}",
+                n.character.position,
+                route.len(),
+                route[0]
+            );
             n.flee = None;
+            n.route_near = f32::INFINITY;
+            n.route_stall = 0.0;
+            n.through = false;
             n.brain = Brain::Route {
                 route: route.clone(),
                 next: 0,
             };
+        }
+        if !here {
+            eprintln!(
+                "people: {entity:08x} sent along {} points, first {:.1}, not in play yet",
+                route.len(),
+                route[0]
+            );
         }
     }
 

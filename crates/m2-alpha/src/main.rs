@@ -3255,6 +3255,11 @@ fn mission_for_screenshot(
                 game.scene.people.idle.line(),
                 game.scene.people.fight_summary()
             );
+            eprintln!(
+                "after contract checks {:.0} s: {}",
+                i as f32 * tick,
+                game.scene.people.checks.line()
+            );
         }
         // And the strike is pictured 2 s and 6 s after its first ordnance
         // goes off (`-strike`, `-strike-late`).
