@@ -906,28 +906,27 @@ impl Npc {
         self.flee = Some((at + away * FLEE * FLEE_TIME, FLEE_TIME));
     }
 
-    /// Moves them at `wanted` (m/s) for `dt`, but not out into the sea
-    /// deeper than [`WET`]: they stop at the water's edge, as at a wall
-    /// (invented: nobody in the alpha swims; playtest 8).
+    /// Moves them at `wanted` (m/s) for `dt`, but not out into water (the
+    /// sea, or the game's water heights: the villa's pool, rivers) deeper
+    /// than [`WET`]: they stop at the water's edge, as at a wall (invented:
+    /// nobody in the alpha swims; playtest 8).
     fn move_dry(&mut self, physics: &Physics, wanted: Vec3, dt: f32) {
         let before = self.character.position;
         physics.move_character(&mut self.character, wanted, None, dt);
-        let Some(sea) = physics.water() else {
-            return;
-        };
         let now = self.character.position;
-        // Well above the sea (no ground that deep below): nothing to stop.
-        if now.y > sea + SEA_LOOK {
-            return;
-        }
         // In it deeper than a wade, or over ground that is (stepping off a
         // dock or a bank): back where they were, unless they were in it
-        // already (then they may walk out).
+        // already (then they may walk out). Well above the water (no ground
+        // that deep below), nothing to stop.
         let deep = |at: Vec3| {
-            at.y < sea - WET
-                || physics
-                    .cast_ray(at + Vec3::Y, -Vec3::Y, SEA_LOOK + WET + 1.0)
-                    .is_some_and(|(d, _)| at.y + 1.0 - d < sea - WET)
+            let Some(water) = physics.water_at(at.x, at.z) else {
+                return false;
+            };
+            at.y < water - WET
+                || (at.y < water + SEA_LOOK
+                    && physics
+                        .cast_ray(at + Vec3::Y, -Vec3::Y, SEA_LOOK + WET + 1.0)
+                        .is_some_and(|(d, _)| at.y + 1.0 - d < water - WET))
         };
         if deep(now) && !deep(before) {
             self.character.position = before;
@@ -1359,7 +1358,7 @@ impl Npc {
             // Never onto the sea bed: placed on a dock or deck whose
             // collision isn't in yet, they wait for it (not drawn while
             // they do), and nobody stands under the water (playtest 8).
-            let dry = |y: f32| physics.water().is_none_or(|sea| y >= sea - WET);
+            let dry = |y: f32| physics.water_at(p.x, p.z).is_none_or(|w| y >= w - WET);
             if let Some(y) = hit.filter(|&y| dry(y)) {
                 self.character.position.y = y + 0.05;
                 self.landed = true;
@@ -1739,7 +1738,7 @@ impl Checks {
     /// The tally in a line.
     pub fn line(&self) -> String {
         format!(
-            "people checks: spinning {:.1} s ({} people), in the sea {:.1} s ({} people); runners {} sent, {} at their route's end, {} stuck on the way",
+            "people checks: spinning {:.1} s ({} people), in water {:.1} s ({} people); runners {} sent, {} at their route's end, {} stuck on the way",
             self.spinning,
             self.spinners.len(),
             self.wet,
@@ -2105,13 +2104,14 @@ impl People {
         self.refill(spawns, focus, dt);
         self.populate(physics, spawns, focus);
         let mut callouts = Vec::new();
-        let sea = physics.water();
         for npc in &mut self.npcs {
             npc.smart = self.smarter;
             npc.rammed = (npc.rammed - dt).max(0.0);
             let facing = npc.facing;
             npc.update(physics, &mut self.rng, threat, dt);
-            self.checks.count(npc, facing, sea, dt);
+            let p = npc.character.position;
+            self.checks
+                .count(npc, facing, physics.water_at(p.x, p.z), dt);
             if let Some(t) = threat {
                 self.idle.count(physics, npc, t, dt);
             }
@@ -3810,5 +3810,53 @@ pub(crate) mod tests {
         }
         assert!(checks.spinners.contains(&7));
         assert!(checks.spinning > 1.0, "{}", checks.spinning);
+    }
+
+    // Playtest 8 (his clip at 16:57): a soldier stood in the villa
+    // garden's pool, water the game's heights give but the sea isn't.
+    // Nobody lands in it nor walks into it.
+    #[test]
+    fn nobody_stands_in_a_pool_the_water_heights_give() {
+        let mut physics = ground();
+        // A pool 1.5 m deep over the ground's middle (x, z -16..16).
+        let pool = m2_assets::water::WaterHeights {
+            columns: 2,
+            rows: 2,
+            cell: 32.0,
+            origin: [-16.0, -16.0],
+            heights: vec![1.5; 4],
+            wet: Vec::new(),
+        };
+        physics.set_inland(Arc::new(pool));
+        let mut rng = Rng::default();
+        let mut npc = Npc::new(
+            0,
+            &rig(),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.0,
+            Brain::Post { facing: 0.0 },
+            Some(1),
+        );
+        for _ in 0..30 {
+            npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        }
+        assert!(!npc.landed);
+        // One beside it, sent across it, stops at its edge.
+        let brain = Brain::Patrol {
+            route: vec![Vec3::new(30.0, 0.0, 0.0), Vec3::ZERO],
+            next: 1,
+            step: 1,
+            wait: 0.0,
+        };
+        let mut npc = Npc::new(0, &rig(), Vec3::new(30.0, 1.0, 0.0), 0.0, brain, Some(2));
+        for _ in 0..60 * 15 {
+            npc.update(&physics, &mut rng, None, 1.0 / 60.0);
+        }
+        assert!(npc.landed);
+        assert!(
+            npc.character.position.x > 15.0,
+            "{}",
+            npc.character.position
+        );
     }
 }
