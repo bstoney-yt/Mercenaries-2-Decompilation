@@ -1145,6 +1145,11 @@ pub enum Sound {
         at: Vec3,
         set: Option<u32>,
     },
+    /// Her gun reloaded (heard as her own, flat): its template's sound set, whose
+    /// reload cue the `Sounds` table gives ([`m2_engine::gun_sounds::GunCues::reload`]).
+    Reload {
+        set: Option<u32>,
+    },
     /// The satellite-guided bomb landing.
     Bomb(Vec3),
     /// A building the bomb brought down coming apart.
@@ -2651,6 +2656,9 @@ impl Combat {
             }
             None if r.stored > 0 && r.clip < self.rifle.clip && (trigger.reload || r.clip == 0) => {
                 self.changing = Some(RIFLE_RELOAD);
+                self.sounds.push(Sound::Reload {
+                    set: self.rifle.feel.sound_set,
+                });
             }
             None => {}
         }
@@ -3430,6 +3438,16 @@ impl Combat {
                     .and_then(|f| f.sound_set),
             });
         } else if let Some(w) = mg {
+            // A tank's machine gun carries its template's clip and no more
+            // (300 rounds, counted down in the gun box); run out, it is
+            // silent, as the cannon is.
+            if cannon {
+                match f.vehicles.get_mut(i).filter(|v| v.machine_gun().is_some()) {
+                    Some(v) if v.machine_gun().is_some_and(|(_, left)| left == 0) => return,
+                    Some(v) => v.mg_fired += 1,
+                    None => {}
+                }
+            }
             // Its own machine gun's rate, round and look and sound.
             if coax {
                 self.mg_reload = w.gap();
@@ -5452,6 +5470,7 @@ mod tests {
             gun: 0.0,
             rolled: 0.0,
             fired: 0,
+            mg_fired: 0,
             damage: 0.0,
             parts: None,
             loose: Vec::new(),

@@ -212,6 +212,8 @@ pub struct GameAudio {
     /// and the shot cues heard so far (each logged once).
     gun_cues: GunCues,
     shots_heard: HashSet<u32>,
+    /// Each gun cue's punch ([`KeySounds::punch`]), once measured.
+    punches: HashMap<u32, f32>,
     /// Shots heard with their own cue, and with the rifle's standing in.
     shots: (u32, u32),
     /// Launches, lobs and cannon shots heard with their weapon's own cue,
@@ -241,6 +243,21 @@ const SPIN_SAME: f32 = 4.0;
 
 /// A sound key read: the key, and what it plays.
 type KeyLoad = (u32, Option<KeySounds>);
+
+/// The world's cue tables, read from `source` by the first thread to
+/// want them and kept in `held` for every later one.
+fn held_tables(
+    held: &Mutex<Option<Arc<Vec<m2_assets::CueTable>>>>,
+    source: &mut m2_engine::AssetSource<std::io::BufReader<std::fs::File>>,
+) -> Arc<Vec<m2_assets::CueTable>> {
+    let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+    held.get_or_insert_with(|| {
+        let t = m2_engine::audio::world_cue_tables(source);
+        eprintln!("sound: {} cue tables in the world archive", t.len());
+        Arc::new(t)
+    })
+    .clone()
+}
 
 /// How long a break waits for its key's sounds to be read before it is
 /// let go unheard (a key read late shouldn't sound seconds after the
@@ -874,7 +891,7 @@ impl GameAudio {
         // The recorded ambience (ambience.pws) isn't played: which of its
         // tracks is which place is not known, and the first is a tank
         // rolling by. The banks' short sounds stand in, as in the viewer.
-        Self {
+        let mut audio = Self {
             out,
             streams,
             music: None,
@@ -952,10 +969,11 @@ impl GameAudio {
                     Ok(c) => {
                         eprintln!(
                             "sound: Sounds table: {} gun sound sets fire, {} as others, {} with \
-                             variants by shooter",
+                             variants by shooter, {} reload",
                             c.sets_with(m2_engine::gun_sounds::FIRE),
                             c.sets_with(m2_engine::gun_sounds::FIRE_NPC),
-                            c.varied()
+                            c.varied(),
+                            c.reloading()
                         );
                         c
                     }
@@ -966,10 +984,60 @@ impl GameAudio {
                 }
             }),
             shots_heard: HashSet::new(),
+            punches: HashMap::new(),
             shots: (0, 0),
             launches: (0, 0),
             spins: Vec::new(),
+        };
+        audio.prime_guns();
+        audio
+    }
+
+    /// Starts reading every gun's firing cues ([`GunCues::firing_cues`]) on
+    /// one thread, so that a gun's first shot plays its own cue rather than
+    /// the rifle's standing in while the cue is read (playtest 5: the
+    /// shotgun's and the assault rifle's first shots "almost silent").
+    fn prime_guns(&mut self) {
+        let Some(install) = self.install.clone() else {
+            return;
+        };
+        let keys: Vec<u32> = self
+            .gun_cues
+            .firing_cues()
+            .into_iter()
+            .filter(|&k| self.key_asked.insert(k))
+            .collect();
+        if keys.is_empty() {
+            return;
         }
+        let tx = self.key_loads.0.clone();
+        let tables = self.key_tables.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let Ok(mut source) = install.open_world() else {
+                return;
+            };
+            let tables = held_tables(&tables, &mut source);
+            let (mut found, mut bytes) = (0, 0);
+            for &key in &keys {
+                let sounds = KeySounds::resolve(&mut source, &tables, key);
+                if let Some(k) = &sounds {
+                    found += 1;
+                    bytes += k
+                        .sounds
+                        .iter()
+                        .map(|(s, _)| s.samples.len() * 2)
+                        .sum::<usize>();
+                }
+                drop(tx.send((key, sounds)));
+            }
+            eprintln!(
+                "sound: read {found} of {} gun firing cues ahead ({:.1} MB) in {:.2} s",
+                keys.len(),
+                bytes as f32 / 1e6,
+                started.elapsed().as_secs_f32()
+            );
+        });
     }
 
     fn ui_loaded(&mut self) {
@@ -1390,6 +1458,10 @@ impl GameAudio {
                     self.play_key(key, at);
                     continue;
                 }
+                Sound::Reload { set } => {
+                    self.play_reload(set);
+                    continue;
+                }
             };
             if let Some(buffer) = self.fight[i].clone() {
                 self.out.with(|m| m.play(Play::at(buffer, at).gain(gain)));
@@ -1465,8 +1537,9 @@ impl GameAudio {
                         );
                     }
                     // As far as its cue's record carries (the carbine's 29
-                    // to 1000 m), else the mixer's default.
-                    let play = Play::at(buffer, at).gain(found.volume);
+                    // to 1000 m), else the mixer's default; levelled.
+                    let gain = self.shot_volume(cue, &found);
+                    let play = Play::at(buffer, at).gain(gain);
                     let play = match found.falloff {
                         Some(f) => play.falloff(f),
                         None => play,
@@ -1488,6 +1561,38 @@ impl GameAudio {
         false
     }
 
+    /// Her gun of sound set `set` reloaded: its reload cue
+    /// ([`GunCues::reload`]), heard as her own (flat), at its volume. A
+    /// cue not yet read is read on a thread and this reload goes unheard.
+    fn play_reload(&mut self, set: Option<u32>) {
+        let Some(cue) = set.and_then(|s| self.gun_cues.reload(s)) else {
+            return;
+        };
+        match self.keys.get(&cue) {
+            Some(Some(found)) => {
+                let found = found.clone();
+                let pick = self.random();
+                if let Some(buffer) = found.pick(pick).cloned() {
+                    if self.shots_heard.insert(cue) {
+                        eprintln!(
+                            "sound: reload, set {:08x}, cue {cue:08x}: sound {:08x} ({:.2} s)",
+                            set.unwrap_or(0),
+                            buffer.hash,
+                            buffer.seconds()
+                        );
+                    }
+                    self.out
+                        .with(|m| m.play(Play::flat(buffer).gain(found.volume.clamp(0.0, 2.0))));
+                }
+            }
+            Some(None) => {}
+            None => {
+                if self.install.is_some() {
+                    self.ask_key(cue);
+                }
+            }
+        }
+    }
     /// A spinning gun of sound set `set` fired a round at `at`: its loop
     /// (`cue`) plays on, moved to `at`, or starts. Whether it is heard.
     fn spin(&mut self, cue: u32, set: u32, npc: bool, at: Vec3) -> bool {
@@ -1517,7 +1622,8 @@ impl GameAudio {
                         buffer.seconds()
                     );
                 }
-                let play = Play::at(buffer, at).looped().gain(found.volume);
+                let gain = self.shot_volume(cue, &found);
+                let play = Play::at(buffer, at).looped().gain(gain);
                 let play = match found.falloff {
                     Some(f) => play.falloff(f),
                     None => play,
@@ -1562,7 +1668,8 @@ impl GameAudio {
                 Some(Some(found)) => {
                     let found = found.clone();
                     if let Some(buffer) = found.pick(0.0).cloned() {
-                        let play = Play::at(buffer, s.at).gain(found.volume);
+                        let gain = self.shot_volume(tail, &found);
+                        let play = Play::at(buffer, s.at).gain(gain);
                         let play = match found.falloff {
                             Some(f) => play.falloff(f),
                             None => play,
@@ -1580,6 +1687,13 @@ impl GameAudio {
         }
     }
 
+    /// The gain gun cue `cue` (read as `found`) plays at: its volume,
+    /// levelled ([`m2_engine::gun_sounds::shot_gain`]).
+    fn shot_volume(&mut self, cue: u32, found: &KeySounds) -> f32 {
+        let punch = *self.punches.entry(cue).or_insert_with(|| found.punch());
+        m2_engine::gun_sounds::shot_gain(found.volume, punch)
+    }
+
     /// Starts reading what sound key `key` plays on a thread, once.
     fn ask_key(&mut self, key: u32) {
         let Some(install) = self.install.clone() else {
@@ -1593,15 +1707,7 @@ impl GameAudio {
         let tables = self.key_tables.clone();
         std::thread::spawn(move || {
             let found = install.open_world().ok().and_then(|mut source| {
-                let tables = {
-                    let mut held = tables.lock().unwrap_or_else(|e| e.into_inner());
-                    held.get_or_insert_with(|| {
-                        let t = m2_engine::audio::world_cue_tables(&mut source);
-                        eprintln!("sound: {} cue tables in the world archive", t.len());
-                        Arc::new(t)
-                    })
-                    .clone()
-                };
+                let tables = held_tables(&tables, &mut source);
                 KeySounds::resolve(&mut source, &tables, key)
             });
             match &found {

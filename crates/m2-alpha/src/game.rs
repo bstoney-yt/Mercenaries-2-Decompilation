@@ -1049,7 +1049,13 @@ impl Game {
             // the use key, taken up ("Equip").
             use crate::mission::Offer;
             let templates = &world.index.template_db;
-            let near = scene.flights.within(player.character.position).map(|p| {
+            // What she would take comes ahead of what she would leave
+            // lying ([`crate::flights::Flights::within_by`]).
+            let chosen = scene.flights.within_by(player.character.position, |p| {
+                would_leave(templates, &self.combat, p)
+            });
+            let chosen_key = chosen.map(crate::flights::Pickup::key);
+            let near = chosen.map(|p| {
                 let refill = crate::mission::refill(templates, &self.combat, &p.what);
                 let usable = p.what.is_money() || self.combat.can_use(refill, p.what.health);
                 let offer = crate::mission::offer(templates, &self.combat, &p.what);
@@ -1075,7 +1081,7 @@ impl Game {
             if player.driving.is_none()
                 && self.combat.manned.is_none()
                 && take
-                && let Some(p) = scene.flights.take_within(player.character.position)
+                && let Some(p) = chosen_key.and_then(|k| scene.flights.take(k))
             {
                 let walked = near.is_some_and(|n| n.0 != Offer::Equip);
                 let from = p.from;
@@ -1669,7 +1675,11 @@ impl Game {
                         .and_then(|s| s.strings.get(&key).cloned())
                         .unwrap_or_else(|| english.to_owned())
                 };
-                match self.scene.flights.within(p.character.position) {
+                match self
+                    .scene
+                    .flights
+                    .within_by(p.character.position, |l| would_leave(db, &self.combat, l))
+                {
                     Some(lying) => match crate::mission::offer(db, &self.combat, &lying.what) {
                         // Walked over, unworded.
                         Offer::Walk => None,
@@ -2940,6 +2950,21 @@ pub(crate) fn get_out(physics: &Physics, v: &ParkedVehicle, player: &mut Player)
 /// the free camera's.
 fn view_heading(player: Option<&Player>, fly: &FlyCamera) -> f32 {
     player.map_or(fly.yaw, |p| p.yaw)
+}
+
+/// How far down the pickups she stands at `p` comes
+/// ([`crate::flights::Flights::within_by`]): 0 for what she would take
+/// (walked over or with the use key, given room for it, or a weapon to
+/// equip), 1 for what she would leave lying.
+fn would_leave(
+    templates: &m2_engine::Templates,
+    combat: &Combat,
+    p: &crate::flights::Pickup,
+) -> u8 {
+    let refill = crate::mission::refill(templates, combat, &p.what);
+    let usable = p.what.is_money() || combat.can_use(refill, p.what.health);
+    let offer = crate::mission::offer(templates, combat, &p.what);
+    u8::from(!usable && offer != crate::mission::Offer::Equip)
 }
 
 #[cfg(test)]

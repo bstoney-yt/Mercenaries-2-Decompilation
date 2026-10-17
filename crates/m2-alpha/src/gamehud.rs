@@ -49,7 +49,7 @@ use m2_math::glam::Vec3;
 use mlua::{IntoLuaMulti, Lua, Table, Value};
 
 use crate::binoculars;
-use crate::combat::{Combat, Fired, Picked, RIFLE_CLIP, Rounds, Weapon};
+use crate::combat::{Combat, Fired, Picked, Rounds, Weapon};
 use crate::config::Config;
 use crate::game::Game;
 use crate::hero::Hero;
@@ -447,6 +447,9 @@ pub struct HudState {
     pub fired: Fired,
     /// The rifle's rounds: in the clip, stored.
     pub rifle: Rounds,
+    /// Rounds the gun in her hands holds a clip (the carbine's 30, the
+    /// shotgun's own).
+    pub rifle_clip: u32,
     /// Rounds picked up (a supply crate's rockets).
     pub picked: Picked,
     /// The grenade launcher's rounds, while she carries one.
@@ -466,6 +469,10 @@ pub struct HudState {
     /// Its cannon's shells, when they run out: left, and how many it
     /// carries (the AMX-30's 40, counted down in the gun box).
     pub cannon: Option<(u32, u32)>,
+    /// Its machine gun, while she has it chosen (the weapon switch, as
+    /// the game's tank controls have it): its `WeaponUI`, the rounds left
+    /// and how many it carries.
+    pub machine_gun: Option<(m2_engine::weapons::GunUi, u32, u32)>,
     /// Which way the camera that draws the frame looks, degrees, growing
     /// as it turns left (`Player.GetCameraXZHeading`): hers in play, on
     /// foot or driving ([`crate::game::Game::view_heading`]). The radar's
@@ -714,6 +721,7 @@ impl HudState {
             picked: game.combat.picked,
             launcher: game.combat.launcher_rounds,
             rifle: game.combat.rifle_rounds,
+            rifle_clip: game.combat.rifle.clip,
             grenades: game.combat.explosive_left().1,
             vehicle: vehicle.map(|v| v.spec.label.clone()),
             vehicle_templates: vehicle
@@ -729,6 +737,10 @@ impl HudState {
                 })
                 .unwrap_or_default(),
             cannon: vehicle.and_then(|v| Some((v.rounds()?, v.spec.tuning.gun?.rounds))),
+            machine_gun: vehicle
+                .filter(|_| game.combat.vehicle_gun == 1)
+                .and_then(|v| v.machine_gun())
+                .and_then(|(w, left)| Some((w.ui?, left, w.clip))),
             heading: game.view_heading().to_degrees(),
             target,
             position: at.map(|p| p.to_array()),
@@ -1637,7 +1649,7 @@ struct Told {
     hp: Option<(i32, bool)>,
     /// The gun in her hands, whether she holds the designator, and whether
     /// she drives a vehicle with a cannon.
-    weapon: Option<(Weapon, bool, bool)>,
+    weapon: Option<(Weapon, bool, bool, bool)>,
     /// The template of the gun in her rifle's place ([`HudState::gun`]).
     gun: Option<u32>,
     ammo: Option<[i64; 5]>,
@@ -3133,7 +3145,9 @@ impl Thread {
                 .call::<()>((s.trespass.inside, s.trespass.faction.clone()))?;
         }
         let holding = s.support.designator.is_some();
-        let cannon = s.in_vehicle && s.cannon.is_some();
+        // In a tank, the gun chosen: its machine gun, else its cannon.
+        let mg = s.in_vehicle && s.machine_gun.is_some();
+        let cannon = s.in_vehicle && s.cannon.is_some() && !mg;
         // Out of a vehicle, she has her gun in hand again, and the HUD is
         // told so as for a change of gun, and her rounds after it: the
         // gun box (shown by `GuiWeaponEquippedUpdate`) had been shown only
@@ -3141,8 +3155,8 @@ impl Thread {
         // gun was changed after (PC playtest, 2026-10-08).
         self.told.seat(s.in_vehicle);
         let gun = s.gun.as_ref().map(|g| g.0);
-        if self.told.weapon != Some((s.weapon, holding, cannon)) || self.told.gun != gun {
-            self.told.weapon = Some((s.weapon, holding, cannon));
+        if self.told.weapon != Some((s.weapon, holding, cannon, mg)) || self.told.gun != gun {
+            self.told.weapon = Some((s.weapon, holding, cannon, mg));
             self.told.gun = gun;
             // The gun in her rifle's place shows as its `WeaponUI` says,
             // and the gun box names it (playtest 4: her pistol showed the
@@ -3190,23 +3204,34 @@ impl Thread {
             };
             // The designator up in her hands: the gun box names it; the
             // reticle stays the gun's. In a tank, its cannon.
-            let (icon, guid, reticle, crosshair) = if cannon {
-                (
-                    CANNON_ICON.to_owned(),
-                    CANNON_GUID,
-                    CANNON_RETICLE.to_owned(),
-                    false,
-                )
-            } else if holding {
-                (
-                    DESIGNATOR_ICON.to_owned(),
-                    DESIGNATOR_GUID,
-                    reticle,
-                    crosshair,
-                )
-            } else {
-                (icon, guid, reticle, crosshair)
-            };
+            let (icon, guid, reticle, crosshair) =
+                if let Some((ui, _, _)) = s.machine_gun.filter(|_| mg) {
+                    // The tank's machine gun as its own `WeaponUI` shows it
+                    // (playtest 5: chosen, the gun box still showed the
+                    // cannon).
+                    (
+                        by_hash(ui.icon),
+                        CANNON_GUID,
+                        by_hash(ui.reticle),
+                        ui.crosshair,
+                    )
+                } else if cannon {
+                    (
+                        CANNON_ICON.to_owned(),
+                        CANNON_GUID,
+                        CANNON_RETICLE.to_owned(),
+                        false,
+                    )
+                } else if holding {
+                    (
+                        DESIGNATOR_ICON.to_owned(),
+                        DESIGNATOR_GUID,
+                        reticle,
+                        crosshair,
+                    )
+                } else {
+                    (icon, guid, reticle, crosshair)
+                };
             // What `MrxGuiHudReticle.HandleReticleGunSwitchEvent` reads:
             // without a type it leaves the reticle as it was. No target
             // health type: that bar shows only on a target. The crosshair
@@ -3228,7 +3253,16 @@ impl Thread {
             fire(lua, "GuiWeaponEquippedUpdate", t)?;
         }
         let ammo = ammo(
-            s.weapon, s.fired, s.picked, s.rifle, s.launcher, s.cannon, s.grenades,
+            s.weapon,
+            s.fired,
+            s.picked,
+            (s.rifle, s.rifle_clip),
+            s.launcher,
+            match s.machine_gun {
+                Some((_, left, carried)) if mg => Some((left, carried)),
+                _ => s.cannon,
+            },
+            s.grenades,
         );
         if self.told.ammo != Some(ammo) {
             self.told.ammo = Some(ammo);
@@ -3904,7 +3938,9 @@ fn probe_line(
 
 /// Clip, in the clip, stored, grenades, grenades stored: as
 /// `GuiAmmoUpdate` takes them. The rifle's are the play's (`rifle`: in
-/// the clip, stored). Rockets picked up add to their store; they count
+/// the clip, stored, and the clip of the gun in her hands: the shotgun's
+/// own, not the carbine's 30, or its full clip reads as low and its count
+/// flashes red, playtest 5). Rockets picked up add to their store; they count
 /// down from that and, run out, start again full. The grenade launcher's
 /// are its own (`launcher`: in the clip, stored). In
 /// a vehicle whose cannon runs out, its shells (`cannon`: left, carried)
@@ -3915,7 +3951,7 @@ fn ammo(
     weapon: Weapon,
     fired: Fired,
     picked: Picked,
-    rifle: Rounds,
+    (rifle, rifle_clip): (Rounds, u32),
     launcher: Option<Rounds>,
     cannon: Option<(u32, u32)>,
     grenades: u32,
@@ -3924,7 +3960,7 @@ fn ammo(
         return [0, i64::from(left), -1, i64::from(grenades), 0];
     }
     let ammo = match weapon {
-        Weapon::Rifle => [RIFLE_CLIP, rifle.clip, rifle.stored, grenades, 0],
+        Weapon::Rifle => [rifle_clip, rifle.clip, rifle.stored, grenades, 0],
         Weapon::Rpg => {
             let stock = RPG_STORED + picked.rockets;
             [1, 1, stock - fired.rockets % stock, grenades, 0]
@@ -5094,6 +5130,7 @@ fn text(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::combat::RIFLE_CLIP;
 
     #[test]
     fn a_texture_named_by_hash_is_that_hash() {
@@ -5124,7 +5161,7 @@ mod tests {
     #[test]
     fn getting_out_of_a_vehicle_tells_her_gun_again() {
         let mut told = Told::default();
-        let gun = Some((Weapon::Rifle, false, false));
+        let gun = Some((Weapon::Rifle, false, false, false));
         // On the boat at the start: the gun told once.
         told.seat(true);
         told.weapon = gun;
@@ -5215,7 +5252,15 @@ mod tests {
         // The rifle's rounds are the play's: a full clip and nine spare.
         let full = Rounds::of(RIFLE_CLIP + crate::combat::RIFLE_SPARE, RIFLE_CLIP);
         assert_eq!(
-            ammo(Weapon::Rifle, fired(0, 0, 0), none, full, None, None, 0)[..3],
+            ammo(
+                Weapon::Rifle,
+                fired(0, 0, 0),
+                none,
+                (full, RIFLE_CLIP),
+                None,
+                None,
+                0
+            )[..3],
             [30, 30, 270]
         );
         let used = Rounds {
@@ -5223,24 +5268,79 @@ mod tests {
             stored: 120,
         };
         assert_eq!(
-            ammo(Weapon::Rifle, fired(29, 0, 0), none, used, None, None, 0)[..3],
+            ammo(
+                Weapon::Rifle,
+                fired(29, 0, 0),
+                none,
+                (used, RIFLE_CLIP),
+                None,
+                None,
+                0
+            )[..3],
             [30, 1, 120]
         );
+        // A shotgun reloaded: its own clip size, so its count is full,
+        // not 8 of the carbine's 30.
+        let shells = Rounds::of(8 + 32, 8);
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 0, 0), none, full, None, None, 0)[..3],
+            ammo(
+                Weapon::Rifle,
+                fired(0, 0, 0),
+                none,
+                (shells, 8),
+                None,
+                None,
+                0
+            )[..3],
+            [8, 8, 32]
+        );
+        assert_eq!(
+            ammo(
+                Weapon::Rpg,
+                fired(0, 0, 0),
+                none,
+                (full, RIFLE_CLIP),
+                None,
+                None,
+                0
+            )[..3],
             [1, 1, i64::from(RPG_STORED)]
         );
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 1, 0), none, full, None, None, 0)[2],
+            ammo(
+                Weapon::Rpg,
+                fired(0, 1, 0),
+                none,
+                (full, RIFLE_CLIP),
+                None,
+                None,
+                0
+            )[2],
             i64::from(RPG_STORED) - 1
         );
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 4, 0), none, full, None, None, 0)[2],
+            ammo(
+                Weapon::Rpg,
+                fired(0, 4, 0),
+                none,
+                (full, RIFLE_CLIP),
+                None,
+                None,
+                0
+            )[2],
             i64::from(RPG_STORED)
         );
         // Her own grenades, whatever she has thrown.
         assert_eq!(
-            ammo(Weapon::Rifle, fired(0, 0, 1), none, full, None, None, 3)[3],
+            ammo(
+                Weapon::Rifle,
+                fired(0, 0, 1),
+                none,
+                (full, RIFLE_CLIP),
+                None,
+                None,
+                3
+            )[3],
             3
         );
         // A crate's 20 rockets after three fired: 21 left.
@@ -5249,7 +5349,15 @@ mod tests {
             ..Picked::default()
         };
         assert_eq!(
-            ammo(Weapon::Rpg, fired(0, 3, 0), crate_, full, None, None, 0)[2],
+            ammo(
+                Weapon::Rpg,
+                fired(0, 3, 0),
+                crate_,
+                (full, RIFLE_CLIP),
+                None,
+                None,
+                0
+            )[2],
             i64::from(RPG_STORED) + 17
         );
         // The launcher's own rounds: "6 / 12" as the crate gives it.
@@ -5262,7 +5370,7 @@ mod tests {
                 Weapon::GrenadeLauncher,
                 fired(0, 0, 0),
                 none,
-                full,
+                (full, RIFLE_CLIP),
                 launcher,
                 None,
                 0
@@ -5275,7 +5383,7 @@ mod tests {
                 Weapon::Rifle,
                 fired(0, 0, 0),
                 none,
-                full,
+                (full, RIFLE_CLIP),
                 None,
                 Some((37, 40)),
                 0
