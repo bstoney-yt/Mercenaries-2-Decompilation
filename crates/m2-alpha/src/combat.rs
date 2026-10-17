@@ -185,6 +185,8 @@ pub struct Rifle {
     pub feel: Feel,
     /// What the HUD shows of it (`WeaponUI`), if its template says.
     pub ui: Option<m2_engine::weapons::GunUi>,
+    /// Its aim assist (`HumanCameraModifier`), if its template says.
+    pub assist: Option<m2_engine::weapons::AimAssist>,
 }
 
 impl Default for Rifle {
@@ -206,6 +208,7 @@ impl Default for Rifle {
             class: None,
             feel: Feel::default(),
             ui: None,
+            assist: None,
         }
     }
 }
@@ -258,6 +261,7 @@ impl Rifle {
             class: spec.class,
             feel: spec.feel,
             ui: spec.ui,
+            assist: spec.assist,
         }
     }
 
@@ -2817,8 +2821,12 @@ impl Combat {
         // Each of its rounds a shot (the shotgun's 10), scattered over its
         // cone (degrees across: `ScatterMin`, more each shot held, to
         // `ScatterMax`; [`Feel::cone`]).
-        // Each anywhere in the round cone, evenly over it
-        // ([`m2_engine::weapons::stray_in_cone`]).
+        // Each round anywhere in the round cone, evenly over it
+        // ([`m2_engine::weapons::stray_in_cone`]); then her gun's aim
+        // assist draws a round that strays within its window of an enemy
+        // onto him (playtest 8: at range the cone alone left soldiers
+        // nearly impossible to hit; the rifles' windows are widest far).
+        let assist = self.rifle.assist;
         let cone = self.rifle.feel.cone(self.bloom.added);
         let feel = self.rifle.feel;
         self.bloom.shot(&feel);
@@ -2827,6 +2835,7 @@ impl Combat {
         for _ in 0..self.rifle.pellets.max(1) {
             let (a, b) = (self.random(), self.random());
             let dir = m2_engine::weapons::stray_in_cone(aim, cone, a, b);
+            let dir = assist.map_or(dir, |s| assisted_aim(&s, f.people, eye, dir, RIFLE_RANGE));
             let hit = cast_shot(f.physics, f.people, eye, dir, RIFLE_RANGE, None, None);
             let to = hit.map_or(eye + dir * RIFLE_RANGE, |h| eye + dir * h.0);
             first.get_or_insert(to);
@@ -4792,6 +4801,38 @@ fn cast_shot(
     best
 }
 
+/// A round from `eye` along unit `aim`, drawn by her gun's aim assist
+/// `assist` onto the enemy (a soldier turned on her) whose chest lies
+/// nearest its line within the assist's window and `far` metres
+/// ([`m2_engine::weapons::AimAssist::draw`]); `aim` itself with none.
+/// That the assist draws each round (after its stray), who counts as a
+/// target (the soldiers the reticle marks as enemies) and that it draws
+/// onto the chest are invented.
+fn assisted_aim(
+    assist: &m2_engine::weapons::AimAssist,
+    people: &People,
+    eye: Vec3,
+    aim: Vec3,
+    far: f32,
+) -> Vec3 {
+    people
+        .npcs
+        .iter()
+        .filter(|n| n.alive && n.landed && n.soldier && n.alert)
+        .map(|n| n.character.position + Vec3::Y * ASSIST_CHEST - eye)
+        .filter(|off| off.length() <= far)
+        .filter_map(|off| {
+            let drawn = assist.draw(aim, off);
+            (drawn != aim).then(|| (off.normalize_or_zero().dot(aim), drawn))
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or(aim, |(_, drawn)| drawn)
+}
+
+/// Where on a target the aim assist draws her aim: his chest, metres up
+/// from his feet (invented).
+const ASSIST_CHEST: f32 = 1.2;
+
 /// Distance along the ray (unit `dir`) to where it passes within `radius`
 /// of the segment from `a` to `a + seg`, or `None`.
 fn ray_capsule(origin: Vec3, dir: Vec3, a: Vec3, seg: Vec3, radius: f32) -> Option<f32> {
@@ -5882,6 +5923,32 @@ mod tests {
         assert!(lob_velocity(from, Vec3::new(0.0, 0.0, 60.0), LOB_SPEED, g).is_none());
         let far = farthest(Vec3::Z * 60.0, LOB_SPEED);
         assert!((far.y - far.z).abs() < 1e-4 && far.x == 0.0);
+    }
+
+    #[test]
+    fn her_aim_is_drawn_onto_an_enemy_near_the_crosshair() {
+        let assist = m2_engine::weapons::AimAssist {
+            level: 3,
+            close: [0.65, 1.0],
+            far: [1.5, 1.5],
+        };
+        let eye = Vec3::Y * ASSIST_CHEST;
+        let aim = Vec3::Z;
+        // 1 m beside her line at 100 m (0.57 degrees).
+        let at = Vec3::new(1.0, 0.0, 100.0);
+        let mut people = People::default();
+        let mut n = Npc::new(0, &rig(), at, 0.0, Brain::Post { facing: 0.0 }, Some(1));
+        n.landed = true;
+        n.soldier = true;
+        n.alert = false;
+        people.npcs.push(n);
+        // Not turned on her: the aim stays.
+        assert_eq!(assisted_aim(&assist, &people, eye, aim, 400.0), aim);
+        people.npcs[0].alert = true;
+        let drawn = assisted_aim(&assist, &people, eye, aim, 400.0);
+        assert!(drawn.angle_between(at.normalize()) < 1e-4, "{drawn}");
+        // Out of reach: the aim stays.
+        assert_eq!(assisted_aim(&assist, &people, eye, aim, 50.0), aim);
     }
 
     #[test]

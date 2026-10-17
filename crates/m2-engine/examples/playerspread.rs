@@ -145,5 +145,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+
+    // Aim assist (`HumanCameraModifier`): the held cone's hit share with
+    // the crosshair on his chest, without and with the gun's assist
+    // drawing each round that strays within its window onto him (as
+    // `combat::assisted_aim` does).
+    let assisted: Vec<_> = guns.iter().filter(|w| w.assist.is_some()).collect();
+    println!(
+        "{} of the {} guns have an aim assist; crosshair on his chest, held cone:",
+        assisted.len(),
+        guns.len()
+    );
+    let mut sums = [[0.0f32; 4]; 2];
+    for w in &assisted {
+        let a = w.assist.expect("filtered");
+        let cone = w.feel.scatter_max();
+        let mut row = [[0.0f32; 4]; 2];
+        for (k, &d) in RANGES.iter().enumerate() {
+            let target = Vec3::new(0.0, 0.0, d);
+            for (j, assist) in [false, true].into_iter().enumerate() {
+                let n = (0..SHOTS)
+                    .filter(|_| {
+                        let dir = stray_in_cone(Vec3::Z, cone, rng.next(), rng.next());
+                        hits(d, if assist { a.draw(dir, target) } else { dir })
+                    })
+                    .count();
+                row[j][k] = n as f32 / SHOTS as f32;
+                sums[j][k] += row[j][k];
+            }
+        }
+        if each {
+            println!(
+                "  {}\tassist {} close {:?} far {:?}\twithout {:.2?}\twith {:.2?}",
+                w.name, a.level, a.close, a.far, row[0], row[1]
+            );
+        }
+    }
+    let m = assisted.len().max(1) as f32;
+    for (k, d) in RANGES.iter().enumerate() {
+        println!(
+            "mean hit share held, assisted guns, at {d} m: without assist {:.3}, with {:.3}",
+            sums[0][k] / m,
+            sums[1][k] / m
+        );
+    }
     Ok(())
 }

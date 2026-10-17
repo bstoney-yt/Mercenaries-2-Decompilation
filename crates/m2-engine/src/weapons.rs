@@ -392,7 +392,75 @@ pub struct WeaponSpec {
     /// What the HUD shows of it in her hands (`WeaponUI`), if its
     /// template says.
     pub ui: Option<GunUi>,
+    /// How far its aim is helped onto a target (`HumanCameraModifier`),
+    /// if its template says.
+    pub assist: Option<AimAssist>,
 }
+
+/// A gun's aim assist, from its `HumanCameraModifier`: the named fields
+/// `AimAssist`, `HorizontalAimAssistClose`, `VerticalAimAssistClose`,
+/// `HorizontalAimAssistFar` and `VerticalAimAssistFar` (names from
+/// samples: found by hashing, gap rounds 1 and 13).
+///
+/// Provenance: the values are the template's. What they mean is
+/// invented, as the 360 code is not read: the four windows are taken as
+/// degrees either side of the crosshair, sideways and up, within which a
+/// target draws her rounds onto him ([`AimAssist::window`]), close at
+/// [`AimAssist::CLOSE`] metres or nearer and far at [`AimAssist::FAR`] or
+/// beyond, between the two in proportion. That the windows are close and
+/// far is borne out by the values: the machine pistols' 2 degrees close
+/// fall to 0 and 0.2 far, the rifles' 0.5 to 1 grow to 1.5. `AimAssist`
+/// is a whole number (3 on all 24 guns that have one), taken as on when
+/// not 0; a round that strays within the window of a target is then
+/// drawn onto him (the alpha's `combat::assisted_aim`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AimAssist {
+    pub level: u32,
+    pub close: [f32; 2],
+    pub far: [f32; 2],
+}
+
+impl AimAssist {
+    /// Metres at which the close and the far windows hold (invented).
+    pub const CLOSE: f32 = 10.0;
+    pub const FAR: f32 = 100.0;
+
+    /// The window, degrees sideways and up, at `distance` metres.
+    pub fn window(&self, distance: f32) -> [f32; 2] {
+        let t = ((distance - Self::CLOSE) / (Self::FAR - Self::CLOSE)).clamp(0.0, 1.0);
+        [0, 1].map(|k| (self.close[k] + (self.far[k] - self.close[k]) * t).max(0.0))
+    }
+
+    /// The way to aim along unit `aim` given a target `off` that way:
+    /// onto him if the assist is on and he is within the window, else
+    /// `aim` as it is.
+    pub fn draw(&self, aim: Vec3, off: Vec3) -> Vec3 {
+        if self.level == 0 {
+            return aim;
+        }
+        let distance = off.length();
+        let Some(to) = off.try_normalize() else {
+            return aim;
+        };
+        if aim.dot(to) <= 0.0 {
+            return aim;
+        }
+        let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
+        let up = side.cross(aim).normalize_or(Vec3::Y);
+        let ahead = aim.dot(to);
+        let across = [side.dot(to).atan2(ahead), up.dot(to).atan2(ahead)].map(f32::to_degrees);
+        let [h, v] = self.window(distance);
+        if across[0].abs() > h || across[1].abs() > v {
+            return aim;
+        }
+        to
+    }
+}
+
+/// `HumanCameraModifier`'s aim-assist fields ([`AimAssist`]).
+const ASSIST: &str = "AimAssist";
+const ASSIST_CLOSE: [&str; 2] = ["HorizontalAimAssistClose", "VerticalAimAssistClose"];
+const ASSIST_FAR: [&str; 2] = ["HorizontalAimAssistFar", "VerticalAimAssistFar"];
 
 /// A gun's `WeaponUI`: the gun box's picture of it and its reticle, as
 /// name hashes of their textures (the pistol's `weapons_pistol_1` and
@@ -914,6 +982,15 @@ pub fn read(db: &Layer<'_>) -> Arms {
     let effects = Table::new(db, "WeaponEffects");
     let sound = Table::new(db, "SoundEffect");
     let ui = Table::new(db, "WeaponUI");
+    let camera = Table::new(db, "HumanCameraModifier");
+    let assist_of = |id: u32| {
+        let f = |name: &str| Parts::float(&camera, id, name_hash(name));
+        Some(AimAssist {
+            level: Parts::first(&camera, id, name_hash(ASSIST))?,
+            close: [f(ASSIST_CLOSE[0])?, f(ASSIST_CLOSE[1])?],
+            far: [f(ASSIST_FAR[0])?, f(ASSIST_FAR[1])?],
+        })
+    };
     let name_of = |id: u32| names.get(&id).map_or(String::new(), |n| (*n).to_owned());
     let model_of = |id: u32| parts.models.get(&id).copied().filter(|&m| m != 0);
     let class_of = |id: u32| Parts::first(&equipment, id, CLASS).filter(|&c| c != 0);
@@ -980,6 +1057,7 @@ pub fn read(db: &Layer<'_>) -> Arms {
                                 .is_some_and(|c| c & 0xff != 0),
                         })
                     })(),
+                    assist: assist_of(id),
                 },
             ))
         })
@@ -1105,6 +1183,39 @@ pub fn read(db: &Layer<'_>) -> Arms {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aim_assist_draws_her_aim_onto_a_target_within_its_window() {
+        // The fields' names hash as the survey found them (gap round 13).
+        let found = [0xbcf5_4d6b, 0x4bba_9acc, 0x8b11_d32d, 0xee17_304a];
+        for name in ASSIST_CLOSE.iter().chain(&ASSIST_FAR) {
+            assert!(found.contains(&name_hash(name)), "{name}");
+        }
+        // The carbine's: 0.65 and 1 degrees close, 1.5 far.
+        let a = AimAssist {
+            level: 3,
+            close: [0.65, 1.0],
+            far: [1.5, 1.5],
+        };
+        assert_eq!(a.window(5.0), [0.65, 1.0]);
+        assert_eq!(a.window(200.0), [1.5, 1.5]);
+        let mid = a.window(55.0);
+        assert!((mid[0] - 1.075).abs() < 1e-4 && (mid[1] - 1.25).abs() < 1e-4);
+        // A soldier 1 degree beside the crosshair at 100 m: onto him.
+        let aim = Vec3::Z;
+        let him = Vec3::new(1f32.to_radians().tan(), 0.0, 1.0) * 100.0;
+        let drawn = a.draw(aim, him);
+        assert!(drawn.angle_between(him.normalize()) < 1e-4);
+        // 2 degrees off: past the window, the aim stays.
+        let wide = Vec3::new(2f32.to_radians().tan(), 0.0, 1.0) * 100.0;
+        assert_eq!(a.draw(aim, wide), aim);
+        // Close, 1 degree is past the 0.65; behind her, nothing.
+        assert_eq!(a.draw(aim, him * 0.05), aim);
+        assert_eq!(a.draw(aim, -him), aim);
+        // Off (level 0): nothing.
+        let off = AimAssist { level: 0, ..a };
+        assert_eq!(off.draw(aim, him), aim);
+    }
 
     #[test]
     fn rounds_stray_evenly_over_the_round_cone() {
@@ -1254,6 +1365,7 @@ mod tests {
                 feel: Default::default(),
                 hint: None,
                 ui: None,
+                assist: None,
             },
             nodes: vec![Some(0)],
         }
@@ -1413,6 +1525,7 @@ mod tests {
             feel: Default::default(),
             hint: None,
             ui: None,
+            assist: None,
         };
         let arms = Arms {
             weapons: HashMap::from([(7, spec)]),
