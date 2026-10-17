@@ -2455,7 +2455,15 @@ impl Combat {
         }
         f.player.launcher = self.weapon == Weapon::Rpg;
         f.player.in_hand = self.in_hand();
-        self.change_clip(trigger, on_foot, dt);
+        // A clip changed starts her reload clip over her upper body, and
+        // the rifle's change lasts as long as it (playtest 8: only the
+        // reload's sound was heard).
+        if self.change_clip(trigger, on_foot, dt)
+            && let Some(length) = f.player.start_reload()
+            && self.changing.is_some()
+        {
+            self.changing = Some(length);
+        }
         // A grenade leaves her hand at its moment in the throw; knocked
         // down or in a vehicle by then, she never let go.
         if let Some(t) = &mut self.throw_in {
@@ -2647,8 +2655,9 @@ impl Combat {
 
     /// The rifle's clip: changed when she asks or once it is empty (as the
     /// game does), while she holds it on foot with rounds to spare; put
-    /// away or out of her hands, the change starts over next time.
-    fn change_clip(&mut self, trigger: Trigger, on_foot: bool, dt: f32) {
+    /// away or out of her hands, the change starts over next time. True
+    /// when a change (the rifle's, or the launcher's) starts this tick.
+    fn change_clip(&mut self, trigger: Trigger, on_foot: bool, dt: f32) -> bool {
         // The launcher reloads on R too, its magazine part spent
         // (playtest 4: only once empty).
         if on_foot
@@ -2660,12 +2669,13 @@ impl Combat {
         {
             *r = full;
             self.reload = LAUNCHER_RELOAD;
+            return true;
         }
         let r = self.rifle_rounds;
         let holding = on_foot && self.weapon == Weapon::Rifle && !self.designator;
         if !holding {
             self.changing = None;
-            return;
+            return false;
         }
         match &mut self.changing {
             Some(t) => {
@@ -2680,9 +2690,11 @@ impl Combat {
                 self.sounds.push(Sound::Reload {
                     set: self.rifle.feel.sound_set,
                 });
+                return true;
             }
             None => {}
         }
+        false
     }
 
     /// Fires the emplaced gun she mans ([`Manned`]): a round of its
@@ -2803,20 +2815,16 @@ impl Combat {
         // Each of its rounds a shot (the shotgun's 10), scattered over its
         // cone (degrees across: `ScatterMin`, more each shot held, to
         // `ScatterMax`; [`Feel::cone`]).
-        let spread = self.rifle.feel.cone(self.bloom.added).to_radians();
+        // Each anywhere in the round cone, evenly over it
+        // ([`m2_engine::weapons::stray_in_cone`]).
+        let cone = self.rifle.feel.cone(self.bloom.added);
         let feel = self.rifle.feel;
         self.bloom.shot(&feel);
         let mut killed = false;
         let mut first = None;
         for _ in 0..self.rifle.pellets.max(1) {
-            let dir = if spread > 0.0 {
-                let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
-                let up = side.cross(aim).normalize_or(Vec3::Y);
-                (aim + side * (self.random() * spread) + up * (self.random() * spread))
-                    .normalize_or(aim)
-            } else {
-                aim
-            };
+            let (a, b) = (self.random(), self.random());
+            let dir = m2_engine::weapons::stray_in_cone(aim, cone, a, b);
             let hit = cast_shot(f.physics, f.people, eye, dir, RIFLE_RANGE, None, None);
             let to = hit.map_or(eye + dir * RIFLE_RANGE, |h| eye + dir * h.0);
             first.get_or_insert(to);
@@ -5885,12 +5893,13 @@ mod tests {
             ..Default::default()
         };
         // Not while driving.
-        combat.change_clip(ask, false, 0.1);
+        assert!(!combat.change_clip(ask, false, 0.1));
         assert!(combat.changing.is_none());
-        combat.change_clip(ask, true, 0.1);
+        // Started: her reload clip is played for it (playtest 8).
+        assert!(combat.change_clip(ask, true, 0.1));
         assert!(combat.changing.is_some());
         for _ in 0..30 {
-            combat.change_clip(Trigger::default(), true, 0.1);
+            assert!(!combat.change_clip(Trigger::default(), true, 0.1));
         }
         assert_eq!(
             combat.rifle_rounds,

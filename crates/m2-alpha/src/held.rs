@@ -13,7 +13,10 @@
 //!   putting away what she holds, standing or on the move;
 //! - `EquipRightIdle`, ... `EquipLeftRun`: taking up the next;
 //! - `PickupWeapon`: picking a weapon up off the ground (whole body; the
-//!   heroes each have their own).
+//!   heroes each have their own);
+//! - `ReloadIdle`, `ReloadRun`: changing the clip, standing or on the
+//!   move (upper body; the rifle, the pistol and the rocket each have
+//!   their own; playtest 8).
 //!
 //! Their rows lay the switch's moves over the upper body (`ActionMask`
 //! `UpperBody`) and the pickup over the whole (`FullBody`). Right and
@@ -72,6 +75,19 @@ pub struct Held {
     /// Putting it away and taking it up, by side and standing or running.
     pub stow: HashMap<(Side, bool), usize>,
     pub equip: HashMap<(Side, bool), usize>,
+    /// Changing its clip, running (true) or standing.
+    pub reload: HashMap<bool, usize>,
+}
+
+impl Held {
+    /// The reload to play, running or standing as `running` says (the
+    /// other where the table gives only one).
+    pub fn reload_clip(&self, running: bool) -> Option<usize> {
+        self.reload
+            .get(&running)
+            .or_else(|| self.reload.get(&!running))
+            .copied()
+    }
 }
 
 /// Every class's [`Held`], and her pickup.
@@ -222,6 +238,12 @@ pub fn resolve(
         };
         let mut stow = HashMap::new();
         let mut equip = HashMap::new();
+        let mut reload = HashMap::new();
+        for (running, action) in [(false, "ReloadIdle"), (true, "ReloadRun")] {
+            if let Some(c) = by_action(action, class) {
+                reload.insert(running, c);
+            }
+        }
         for side in [Side::Right, Side::Left] {
             for running in [false, true] {
                 let gait = if running { "Run" } else { "Idle" };
@@ -240,6 +262,7 @@ pub fn resolve(
             gaits,
             stow,
             equip,
+            reload,
         });
     }
     Moves {
@@ -318,6 +341,23 @@ mod tests {
         let none = Switch::new(&m, to_rocket, to_rocket, false);
         assert_eq!(none.at(0.0), Phase::Done);
         assert!(none.swapped());
+    }
+
+    #[test]
+    fn a_reload_plays_running_or_standing_as_the_table_has_it() {
+        let both = Held {
+            reload: [(false, 11), (true, 12)].into(),
+            ..Held::default()
+        };
+        assert_eq!(both.reload_clip(false), Some(11));
+        assert_eq!(both.reload_clip(true), Some(12));
+        // Only standing: running plays that too.
+        let standing = Held {
+            reload: [(false, 11)].into(),
+            ..Held::default()
+        };
+        assert_eq!(standing.reload_clip(true), Some(11));
+        assert_eq!(Held::default().reload_clip(false), None);
     }
 
     #[test]

@@ -141,6 +141,29 @@ impl Feel {
     }
 }
 
+/// The way a round goes for an aim along unit `aim` out of a cone `cone`
+/// degrees across ([`Feel::cone`]), given two uniform picks `a` and `b`
+/// in [-0.5, 0.5): anywhere in the round cone, evenly over its area.
+///
+/// Provenance: that the cone is round and its rounds spread evenly over
+/// it is invented (the 360 code that strays a round was not read). Before
+/// playtest 8 the alpha took each round sideways and up on their own, in
+/// a square as wide as the cone, whose corners reach 1.41 times as far
+/// out, so more rounds went wide of a soldier at range (`playerspread`
+/// example, the carbine at rest at 100 m: 31% of rounds on him, 40%
+/// now; her 56 guns' mean at 100 m: 19% to 25%).
+pub fn stray_in_cone(aim: Vec3, cone: f32, a: f32, b: f32) -> Vec3 {
+    let radius = 0.5 * cone.max(0.0).to_radians();
+    if radius <= 0.0 {
+        return aim;
+    }
+    let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
+    let up = side.cross(aim).normalize_or(Vec3::Y);
+    let r = radius * (a + 0.5).clamp(0.0, 1.0).sqrt();
+    let turn = (b + 0.5) * std::f32::consts::TAU;
+    (aim + side * (r * turn.cos()) + up * (r * turn.sin())).normalize_or(aim)
+}
+
 /// What a gun's shots have added to its cone ([`Feel::cone`]): each
 /// shot `ScatterPerShot`, up to `ScatterMax`. Once the gun has gone
 /// [`Bloom::REST`] seconds without firing, the cone settles back to
@@ -1082,6 +1105,35 @@ pub fn read(db: &Layer<'_>) -> Arms {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rounds_stray_evenly_over_the_round_cone() {
+        // A 2-degree cone: no round more than 1 degree out, corners
+        // included (the old square reached 1.41), and half of them
+        // within 0.71 degrees (half the disc's area).
+        let aim = Vec3::Z;
+        let off = |a: f32, b: f32| {
+            stray_in_cone(aim, 2.0, a, b)
+                .angle_between(aim)
+                .to_degrees()
+        };
+        let mut inside = 0;
+        let n = 40;
+        for i in 0..n {
+            for j in 0..n {
+                let (a, b) = (i as f32 / n as f32 - 0.5, j as f32 / n as f32 - 0.5);
+                let d = off(a, b);
+                assert!(d <= 1.0 + 1e-3, "{d}");
+                inside += usize::from(d < 0.5f32.sqrt());
+            }
+        }
+        let share = inside as f32 / (n * n) as f32;
+        assert!((share - 0.5).abs() < 0.03, "{share}");
+        // The corner pick: at the rim, not past it.
+        assert!((off(0.4999, -0.5) - 1.0).abs() < 1e-2);
+        // No cone: along the aim.
+        assert_eq!(stray_in_cone(aim, 0.0, 0.3, 0.2), aim);
+    }
 
     // The carbine's `WeaponScatter` as its template has it: 1, 0, 1, 1.5,
     // then `ScatterMin` 1, `ScatterMax` 2, `ScatterPerShot` 0.2.

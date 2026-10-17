@@ -4218,6 +4218,14 @@ fn drive_for_screenshot(
         }
         let swing = 10;
         for i in 0..90 {
+            // `--switch`: the weapon switch pressed as a player presses it
+            // (Tab, the pad's right bumper), through the input and the
+            // game's tick, to the vehicle's other gun (playtest 8).
+            if options.switch && i == 0 {
+                let mut input = input::Input::default();
+                input.button(input::Action::SwitchWeapon, true);
+                game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+            }
             let look = if i < swing {
                 m2_math::glam::Vec2::new(options.look / swing as f32, 0.0)
             } else {
@@ -4285,6 +4293,26 @@ fn describe_vehicle_fire(game: &Game) {
     else {
         return;
     };
+    // The gun chosen, and what the HUD's gun box counts for it
+    // ([`gamehud::HudState::of`]: the machine gun's while it is chosen
+    // and has a `WeaponUI`).
+    let mg = v
+        .machine_gun()
+        .filter(|_| game.combat.vehicle_gun == 1)
+        .and_then(|(w, left)| Some((w.ui?, left, w.clip)));
+    eprintln!(
+        "drive: fire: {} chosen; gun box {}",
+        if game.combat.vehicle_gun == 1 {
+            "machine gun"
+        } else {
+            "main gun"
+        },
+        match (mg, v.rounds()) {
+            (Some((_, left, of)), _) => format!("machine gun, {left} of {of} rounds"),
+            (None, Some(left)) => format!("cannon, {left} shells"),
+            _ => "none".to_owned(),
+        }
+    );
     let body =
         v.id.zip(game.scene.world.as_ref())
             .and_then(|(id, w)| w.physics.vehicle_transform(id));
