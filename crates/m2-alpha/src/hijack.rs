@@ -1221,8 +1221,8 @@ fn follow(
     if a.first.is_none() {
         a.first = a.clip;
     }
-    if started && let Some((gap, spread)) = lift(a, game) {
-        eprintln!("hijack: hand to pistol {gap:.2} m, spread {spread:.2}");
+    if started && let Some((gap, spread, across)) = lift(a, game) {
+        eprintln!("hijack: hand to pistol {gap:.2} m, spread {spread:.2}, across {across:.2} m");
         if a.lift.is_none() && a.clip == a.first {
             a.lift = Some(gap - FIRST_GAP);
             eprintln!("hijack: her clips {:.2} m up", gap - FIRST_GAP);
@@ -1303,28 +1303,36 @@ const FIRST_GAP: f32 = 1.1;
 
 /// How high her clip must play for her right hand to be where the
 /// vehicle's clip puts the pistol: the median over the two clips' frames,
-/// in height only, and how far it strays (max - min). None without both
-/// clips or the prop.
-fn lift(a: &Active, game: &Game) -> Option<(f32, f32)> {
+/// in height only, how far it strays (max - min), and the median distance
+/// between them across (x, z, as her clip plays in the vehicle's space).
+/// None without both clips or the prop.
+fn lift(a: &Active, game: &Game) -> Option<(f32, f32, f32)> {
     let (vehicle, parent) = (a.vehicle_clip.as_ref()?, a.pistol_parent?);
     let track = vehicle.track_nodes.iter().position(|&n| n == PISTOL)?;
     let (_, rig) = game.scene.player.as_ref()?.model.as_ref()?;
     let hers = rig.clips.get(a.clip?)?;
     let (hand, _) = crate::combat::hands(&rig.skeleton)?;
     let end = hers.info.duration.min(vehicle.header.duration);
-    let mut ups = Vec::new();
+    let (mut ups, mut across) = (Vec::new(), Vec::new());
     let mut t = 0.0;
     while t <= end {
-        let mut pose = hers.sample(&rig.skeleton, t);
-        pose.strip_root_motion(rig.skeleton.root(), hers.info.pin);
-        let hand_y = rig.skeleton.model_matrices(&pose)[hand].w_axis.y;
+        // Unpinned, her clip's root where it carries her about the
+        // vehicle ([`Hijacks::place`]).
+        let pose = hers.sample(&rig.skeleton, t);
+        let hand_at = rig.skeleton.model_matrices(&pose)[hand].w_axis.truncate();
         let at = vehicle.sample(t).get(track)?.translation;
         let pistol = parent.transform_point3(Vec3::new(at.x, at.y, at.z));
-        ups.push(pistol.y - hand_y);
+        ups.push(pistol.y - hand_at.y);
+        across.push((pistol - hand_at).truncate_y().length());
         t += STEP;
     }
     ups.sort_by(f32::total_cmp);
-    Some((*ups.get(ups.len() / 2)?, ups.last()? - ups.first()?))
+    across.sort_by(f32::total_cmp);
+    Some((
+        *ups.get(ups.len() / 2)?,
+        ups.last()? - ups.first()?,
+        *across.get(across.len() / 2)?,
+    ))
 }
 
 /// Hides the parts each newly seen vehicle's template starts in a state

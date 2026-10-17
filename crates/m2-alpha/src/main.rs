@@ -151,6 +151,9 @@ struct Options {
     drive: bool,
     /// With `--screenshot` on foot: jump just before the picture.
     jump: bool,
+    /// With `--screenshot` on foot: press jump ten times a second all the
+    /// way (a player spamming it), each take-off in the log.
+    jump_spam: bool,
     /// With `--screenshot` on foot: throw a grenade just before it.
     throw: bool,
     /// With `--screenshot` on foot: bash just before it.
@@ -435,6 +438,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--drive" => o.drive = true,
             "--gunner" => o.gunner = true,
             "--jump" => o.jump = true,
+            "--jump-spam" => o.jump_spam = true,
             "--throw" => o.throw = true,
             "--bash" => o.bash = true,
             "--bash-clip" => {
@@ -1574,7 +1578,7 @@ fn screenshot(
             // A jump takes the picture on the way up (by default), a
             // throw with the grenade still in her hand; aiming, the
             // weapon comes up for the last second.
-            let jump = options.jump && i == 180 - lead;
+            let jump = (options.jump && i == 180 - lead) || (options.jump_spam && i % 6 == 0);
             let trigger = combat::Trigger {
                 aim: options.aim && i >= 120,
                 // The last shot's flash is still up for the picture.

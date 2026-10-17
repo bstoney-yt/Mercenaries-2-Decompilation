@@ -645,6 +645,16 @@ impl Player {
                 } else {
                     clips.takeoff_still.or(clips.takeoff)
                 };
+                // How the jump before it ended, for the log: in the air,
+                // landing (how far into the landing clip), or done.
+                let was = match self.leap {
+                    Leap::No => "on her feet".to_owned(),
+                    Leap::Air(t) => format!("in the air {t:.2} s"),
+                    Leap::Land(t, c) => {
+                        format!("landing {t:.2} of {:.2} s", rig.clips[c].info.duration)
+                    }
+                };
+                eprintln!("jump: take-off at {:.2} m/s, {was}", moved);
                 self.leap = Leap::Air(0.0);
                 if let Some(clip) = takeoff.or(clips.jump) {
                     // At the height she stands at, so the take-off's
