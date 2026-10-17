@@ -5,7 +5,9 @@
 //! names, and [`VehicleSpec`] reads one model's wheels, seat and door with
 //! the heuristics in `m2_assets::vehicle`. [`Physics`](crate::Physics)
 //! drives a spec as a Rapier rigid body on ray-cast wheels: each wheel is a
-//! suspension ray, the front axle steers, every wheel drives.
+//! suspension ray, the front axle steers, every wheel drives. Of the parts
+//! turning with a wheel only the round ones spin; a fork or fender steers
+//! with its wheel without spinning (`m2_assets::vehicle::rolls_with_wheel`).
 //!
 //! # Provenance
 //!
@@ -216,6 +218,12 @@ pub struct VehicleSpec {
     /// The wheel each node turns with, if any: an index into `wheels`, or
     /// into `road_wheels` when tracked.
     pub node_wheel: Vec<Option<usize>>,
+    /// Whether each node turning with a wheel also spins with it (its
+    /// round tyre, rim and hub) rather than only steering with it (a
+    /// bike's fork and fender, a suspension arm): see
+    /// `m2_assets::vehicle::rolls_with_wheel`. Empty, or a node past
+    /// its end: every such node spins.
+    pub node_rolls: Vec<bool>,
     /// Mass, kg (by kind; invented).
     pub mass: f32,
     /// The nodes that turn with the turret (its mount, every node under
@@ -420,6 +428,30 @@ impl VehicleSpec {
         } else {
             return None;
         };
+        // Of the nodes turning with a wheel, only its round parts (tyre,
+        // rim, hub) spin; the rest (a bike's fork and fender, a truck's
+        // suspension arms) only steer with it (playtest 5: the chopper's
+        // front fender and fork are its front tyre's parent and sibling).
+        let axles: Vec<(Vec3, f32)> = if tracked {
+            road_wheels.clone()
+        } else {
+            wheels.iter().map(|w| (w.centre, w.radius)).collect()
+        };
+        let reaches: Vec<Vec<vehicle::AxleReach>> = axles
+            .iter()
+            .map(|&(c, _)| vehicle::node_reach(model, c.to_array()))
+            .collect();
+        let node_rolls: Vec<bool> = node_wheel
+            .iter()
+            .enumerate()
+            .map(|(k, w)| {
+                let Some(w) = *w else { return true };
+                reaches
+                    .get(w)
+                    .and_then(|r| r.iter().find(|a| usize::from(a.node) == k))
+                    .is_none_or(|a| vehicle::rolls_with_wheel(a, axles[w].1))
+            })
+            .collect();
         let rest = (0..n)
             .map(|i| model.node_to_model(i as u16).unwrap_or(Mat4::IDENTITY))
             .collect();
@@ -579,6 +611,7 @@ impl VehicleSpec {
             road_wheels,
             rest,
             node_wheel,
+            node_rolls,
             mass,
             turret,
             pivot,
@@ -632,6 +665,13 @@ impl VehicleSpec {
             self.elevation = turret.pitch;
         }
         self
+    }
+
+    /// Whether node `node` spins with its wheel (not just steers with it,
+    /// or stays put).
+    pub fn spins(&self, node: usize) -> bool {
+        self.node_wheel.get(node).copied().flatten().is_some()
+            && self.node_rolls.get(node).copied().unwrap_or(true)
     }
 
     /// Whether it rides on two wheels in line (a motorbike): it is held
@@ -812,17 +852,20 @@ impl VehicleSpec {
                 * Mat4::from_rotation_x(spin)
                 * Mat4::from_translation(-centre)
         };
-        let turns: Vec<Mat4> = if self.tracked {
+        // Each wheel spun and steered (its round parts), and only steered
+        // (the parts beside it: see `node_rolls`).
+        let turns: Vec<(Mat4, Mat4)> = if self.tracked {
             self.road_wheels
                 .iter()
-                .map(|&(centre, radius)| about(centre, 0.0, rolled / radius))
+                .map(|&(centre, radius)| (about(centre, 0.0, rolled / radius), Mat4::IDENTITY))
                 .collect()
         } else {
             self.wheels
                 .iter()
                 .zip(wheels)
                 .map(|(w, &(steer, spin))| {
-                    about(w.centre, if w.steers { steer } else { 0.0 }, spin)
+                    let steer = if w.steers { steer } else { 0.0 };
+                    (about(w.centre, steer, spin), about(w.centre, steer, 0.0))
                 })
                 .collect()
         };
@@ -834,7 +877,13 @@ impl VehicleSpec {
             .enumerate()
             .map(|(i, (&m, w))| {
                 let m = match w.and_then(|i| turns.get(i)) {
-                    Some(&t) => t * m,
+                    Some(&(spun, steered)) => {
+                        if self.node_rolls.get(i).copied().unwrap_or(true) {
+                            spun * m
+                        } else {
+                            steered * m
+                        }
+                    }
                     None => m,
                 };
                 let m = if self.gun.get(i).copied().unwrap_or(false) {
@@ -972,6 +1021,7 @@ mod tests {
                 Mat4::from_translation(Vec3::new(-0.9, 0.35, 1.4)),
             ],
             node_wheel: vec![None, Some(0)],
+            node_rolls: Vec::new(),
             mass: 1400.0,
             turret: vec![false, false],
             pivot: None,
@@ -986,6 +1036,40 @@ mod tests {
             damage: None,
             tuning: VehicleTuning::default(),
         }
+    }
+
+    #[test]
+    fn a_fender_steers_with_its_wheel_but_does_not_spin() {
+        // Node 1 is the front-left tyre; node 2 a fender over it, turning
+        // with the same wheel but not round about its axle.
+        let mut s = spec();
+        let centre = Vec3::new(-0.9, 0.35, 1.4);
+        let fender = centre + Vec3::new(0.0, 0.4, 0.1);
+        s.rest.push(Mat4::from_translation(fender));
+        s.node_wheel.push(Some(0));
+        s.node_rolls = vec![true, true, false];
+        s.turret.push(false);
+        s.gun.push(false);
+        assert!(s.spins(1) && !s.spins(2) && !s.spins(0));
+        let (steer, spin) = (0.3, 1.0);
+        let mut wheels = [(0.0, spin); 4];
+        wheels[0].0 = steer;
+        let posed = s.posed_nodes(&wheels, 0.0, 0.0, 0.0);
+        let turned = |m: Mat4| m.to_scale_rotation_translation().1;
+        let both = Quat::from_rotation_y(steer) * Quat::from_rotation_x(spin);
+        assert!(turned(posed[1]).angle_between(both) < 1e-4);
+        assert!(
+            turned(posed[2]).angle_between(Quat::from_rotation_y(steer)) < 1e-4,
+            "the fender only steers"
+        );
+        // Steered about the wheel's centre: it stays above the tyre.
+        let at = posed[2].w_axis.truncate();
+        let want = centre + Quat::from_rotation_y(steer) * (fender - centre);
+        assert!(at.abs_diff_eq(want, 1e-5), "{at}");
+        // A rear wheel's fender stays put.
+        s.node_wheel[2] = Some(2);
+        let posed = s.posed_nodes(&wheels, 0.0, 0.0, 0.0);
+        assert!(posed[2].abs_diff_eq(s.rest[2], 1e-5));
     }
 
     #[test]

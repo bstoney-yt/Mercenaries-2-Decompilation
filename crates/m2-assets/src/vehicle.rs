@@ -11,8 +11,13 @@
 //!   is round seen from the side (as tall as it is long), thinner than it
 //!   is tall, reaches down to the model's floor, and is centred on a node
 //!   whose subtree can be turned to spin or steer it.
+//! - Of the nodes turning with a wheel, only its round parts spin
+//!   ([`rolls_with_wheel`]): the tyre, rim and hub lie within the wheel's
+//!   radius of the axle and are centred on it, while a bike's fork and
+//!   fender (the chopper's are its front tyre's parent and sibling) and a
+//!   truck's suspension arms reach past the tyre or sit off the axle.
 //!
-//! Both are heuristics over the data, not records the game stores in this
+//! All three are heuristics over the data, not records the game stores in this
 //! form; [`find_wheels`] reports what it found and the caller decides what
 //! to do without wheels.
 //!
@@ -22,6 +27,12 @@
 //! from the vehicle models and textures of a legally installed copy (for
 //! example a PMC car whose four wheel nodes sit at x ±0.92, y 0.35, z -1.32
 //! and +1.39 with 0.35 m wheels). No bytes from the archives are committed.
+//!
+//! The round-part test's margins are invented, fitted to the samples: over
+//! all 117 wheeled and tracked vehicle models in the catalogue, the round
+//! parts reach at most 1.10 wheel radii from the axle and sit at most 0.13
+//! radii off it; the 37 other parts turning with a wheel (fenders, forks,
+//! suspension arms and tie rods) all fail one test or the other.
 
 use m2_math::glam::{Mat4, Vec3};
 
@@ -301,6 +312,77 @@ pub fn node_boxes(model: &Model) -> Vec<NodeBox> {
     out
 }
 
+/// One node's own geometry seen from a wheel's axle (see [`node_reach`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AxleReach {
+    pub node: u16,
+    /// Its farthest vertex's distance from the axle, metres.
+    pub reach: f32,
+    /// How far the middle of its box (in y and z) sits off the axle,
+    /// metres: about zero for anything round about it.
+    pub off: f32,
+}
+
+/// How each node's own geometry (the finest complete level of detail, as
+/// [`node_boxes`]) sits about the axle through `centre` (along the
+/// model's x axis): how far it reaches from it and how far off it its
+/// middle is, in y and z.
+pub fn node_reach(model: &Model, centre: [f32; 3]) -> Vec<AxleReach> {
+    let lod = (0..model.info.lod_count)
+        .find(|&l| model.has_lod(l))
+        .unwrap_or(0);
+    // node -> (farthest, y-z box)
+    let mut seen: Vec<(u16, f32, [f32; 4])> = Vec::new();
+    for (segment, geom) in model.lod(lod) {
+        if geom.kind == GeometryKind::Skin {
+            continue;
+        }
+        let to_model = model.node_to_model(segment.node).unwrap_or(Mat4::IDENTITY);
+        for g in &geom.groups {
+            let Some(pos) = g
+                .decl
+                .find(DeclUsage::Position, 0)
+                .and_then(|e| g.vertices.read(e))
+            else {
+                continue;
+            };
+            for p in pos {
+                let v = to_model.transform_point3(Vec3::new(p[0], p[1], p[2]));
+                if !v.is_finite() {
+                    continue;
+                }
+                let (y, z) = (v.y - centre[1], v.z - centre[2]);
+                let far = y.hypot(z);
+                match seen.iter_mut().find(|s| s.0 == segment.node) {
+                    Some(s) => {
+                        s.1 = s.1.max(far);
+                        s.2 = [s.2[0].min(y), s.2[1].max(y), s.2[2].min(z), s.2[3].max(z)];
+                    }
+                    None => seen.push((segment.node, far, [y, y, z, z])),
+                }
+            }
+        }
+    }
+    seen.into_iter()
+        .map(|(node, reach, b)| AxleReach {
+            node,
+            reach,
+            off: (0.5 * (b[0] + b[1])).hypot(0.5 * (b[2] + b[3])),
+        })
+        .collect()
+}
+
+/// Whether a node's geometry (`at`, about a wheel's axle) is part of the
+/// round wheel (tyre, rim, hub, brake disc), which spins, rather than
+/// something beside it that only steers with it or stays put (a fender
+/// over the tyre, a fork up to the handlebars, a suspension arm): all of
+/// it within the wheel's `radius` of the axle, give or take a little
+/// (tyres bulge past the measured radius by a few centimetres), and
+/// centred on the axle.
+pub fn rolls_with_wheel(at: &AxleReach, radius: f32) -> bool {
+    at.reach <= radius * 1.08 + 0.03 && at.off <= 0.1 * radius + 0.02
+}
+
 /// The wheels of a vehicle model (with its streamed chunks added).
 pub fn find_wheels(model: &Model) -> Vec<Wheel> {
     let n = model.nodes.len();
@@ -421,6 +503,28 @@ mod tests {
         let w = wheels_from_boxes(&origins, &parents, &[tyre(1), tyre(2)], 0.0);
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].nodes, [1, 2]);
+    }
+
+    #[test]
+    fn only_the_round_parts_roll_with_a_wheel() {
+        let at = |reach, off| AxleReach {
+            node: 0,
+            reach,
+            off,
+        };
+        // The chopper's front wheel (r 0.32): its tyre rolls; its fork
+        // (reaching 0.57 m, 0.27 m off the axle) and fender (0.55, 0.21)
+        // do not.
+        assert!(rolls_with_wheel(&at(0.32, 0.0), 0.32));
+        assert!(!rolls_with_wheel(&at(0.57, 0.27), 0.32));
+        assert!(!rolls_with_wheel(&at(0.55, 0.21), 0.32));
+        // A tyre bulging past the measured radius (the KLR650's, 0.38 m
+        // on a 0.35 m wheel) and a hub: round.
+        assert!(rolls_with_wheel(&at(0.38, 0.03), 0.35));
+        assert!(rolls_with_wheel(&at(0.11, 0.03), 0.44));
+        // A suspension arm inside the tyre but off the axle (the monster
+        // truck's, 0.30 m off a 0.79 m wheel's axle): not round.
+        assert!(!rolls_with_wheel(&at(0.32, 0.30), 0.79));
     }
 
     #[test]
