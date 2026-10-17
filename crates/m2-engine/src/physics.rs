@@ -41,6 +41,10 @@ pub const STEP_HEIGHT: f32 = 0.5;
 pub const MAX_SLOPE: f32 = 50.0 * std::f32::consts::PI / 180.0;
 /// Downward acceleration, m/s².
 pub const GRAVITY: f32 = 9.81;
+/// Slowest a vehicle's wheels and tracks are seen to roll, m/s: under
+/// it a vehicle is settling, not driving
+/// ([`Physics::vehicle_rolling`]). Invented.
+pub const ROLL_REST: f32 = 0.05;
 
 fn vector(v: Vec3) -> r::Vector {
     r::Vector::from_array(v.to_array())
@@ -2284,12 +2288,36 @@ impl Physics {
             .map_or(Vec3::ZERO, |b| vec3(b.linvel()))
     }
 
-    /// Signed forward speed, m/s.
+    /// Signed forward speed, m/s. None while held
+    /// ([`hold_vehicle`](Self::hold_vehicle)): the controller isn't run
+    /// then, so its own reading is the one from before it was held.
     pub fn vehicle_speed(&self, id: VehicleId) -> f32 {
         self.vehicles
             .get(id.0)
             .and_then(Option::as_ref)
+            .filter(|v| !v.held)
             .map_or(0.0, |v| v.controller.current_vehicle_speed)
+    }
+
+    /// How fast a vehicle's wheels and tracks roll, m/s: its chassis's
+    /// velocity along its own forward axis, signed (the controller's
+    /// [`vehicle_speed`](Self::vehicle_speed) is the whole velocity's
+    /// length, so a parked tank bobbing on its springs reads as moving).
+    /// None while held, nor under [`ROLL_REST`].
+    pub fn vehicle_rolling(&self, id: VehicleId) -> f32 {
+        let Some(v) = self.vehicles.get(id.0).and_then(Option::as_ref) else {
+            return 0.0;
+        };
+        if v.held {
+            return 0.0;
+        }
+        let Some(at) = self.vehicle_transform(id) else {
+            return 0.0;
+        };
+        let along = self
+            .vehicle_velocity(id)
+            .dot(at.z_axis.truncate().normalize_or_zero());
+        if along.abs() < ROLL_REST { 0.0 } else { along }
     }
 
     /// The forward gear a wheeled vehicle's engine drives in (0 is first)
@@ -4645,6 +4673,45 @@ mod tests {
         }
         let now = p.vehicle_transform(id).unwrap().w_axis.truncate();
         assert!(now.distance(rest) < 0.1, "{rest} -> {now}");
+    }
+
+    #[test]
+    fn wheels_stop_rolling_when_a_vehicle_stops_or_is_held() {
+        let mut p = ready();
+        p.step(DT);
+        let id = p.add_vehicle(&car(), Vec3::new(0.0, 0.1, 0.0), 0.0);
+        let go = |p: &mut Physics, controls: VehicleControls, steps: usize| {
+            for _ in 0..steps {
+                p.drive(id, controls);
+                p.step(DT);
+            }
+        };
+        go(
+            &mut p,
+            VehicleControls {
+                throttle: 1.0,
+                ..Default::default()
+            },
+            120,
+        );
+        assert!(p.vehicle_rolling(id) > 2.0, "{}", p.vehicle_rolling(id));
+        // Held while moving: the controller's reading stays as it was,
+        // the wheels don't turn.
+        p.hold_vehicle(id, true);
+        p.step(DT);
+        assert_eq!(p.vehicle_speed(id), 0.0);
+        assert_eq!(p.vehicle_rolling(id), 0.0);
+        p.hold_vehicle(id, false);
+        // Parked and settled: still.
+        go(
+            &mut p,
+            VehicleControls {
+                parked: true,
+                ..Default::default()
+            },
+            300,
+        );
+        assert_eq!(p.vehicle_rolling(id), 0.0);
     }
 
     #[test]

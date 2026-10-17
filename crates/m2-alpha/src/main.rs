@@ -5053,6 +5053,58 @@ fn demolish_for_screenshot(
     Ok(())
 }
 
+/// Seconds between the frame-rate lines play logs ([`Pace`]).
+const PACE_EVERY: f32 = 30.0;
+
+/// The frame rate in play, logged every [`PACE_EVERY`] seconds as a
+/// `pace:` line: frames a second, the slowest frame, and how many frames
+/// took over 50 ms (under 20 fps), so a playtest's log says where play
+/// slowed, which a title bar's count can't (playtest 5's report of a
+/// lower frame rate had no numbers behind it).
+#[derive(Debug, Default)]
+struct Pace {
+    /// When the current span started, and the last frame.
+    since: Option<(Instant, Instant)>,
+    frames: u32,
+    slowest: Duration,
+    slow: u32,
+}
+
+impl Pace {
+    /// A frame drawn at `now` in a window `size` pixels: the line to log
+    /// when a span is over.
+    fn frame(&mut self, now: Instant, size: (u32, u32)) -> Option<String> {
+        let Some((start, last)) = self.since else {
+            self.since = Some((now, now));
+            return None;
+        };
+        let took = now - last;
+        self.frames += 1;
+        self.slowest = self.slowest.max(took);
+        if took > Duration::from_millis(50) {
+            self.slow += 1;
+        }
+        self.since = Some((start, now));
+        let span = (now - start).as_secs_f32();
+        if span < PACE_EVERY {
+            return None;
+        }
+        let line = format!(
+            "pace: {:.0} fps over {span:.0} s, slowest frame {:.0} ms, {} over 50 ms, {}x{}",
+            self.frames as f32 / span,
+            self.slowest.as_secs_f32() * 1000.0,
+            self.slow,
+            size.0,
+            size.1
+        );
+        *self = Self {
+            since: Some((now, now)),
+            ..Self::default()
+        };
+        Some(line)
+    }
+}
+
 struct Running {
     window: Arc<Window>,
     backend: WgpuBackend,
@@ -5078,6 +5130,8 @@ struct Running {
     last: Instant,
     lag: Duration,
     fps: (Instant, u32),
+    /// The frame rate as logged ([`Pace`]).
+    pace: Pace,
     title: String,
     hud: ui::Hud,
     egui: egui_winit::State,
@@ -5206,6 +5260,7 @@ impl App {
             last: Instant::now(),
             lag: Duration::ZERO,
             fps: (Instant::now(), 0),
+            pace: Pace::default(),
             egui,
             hud,
             mission: match (&self.install, &self.mode) {
@@ -5455,6 +5510,18 @@ impl Running {
                 self.title, p.x, p.y, p.z
             ));
             self.fps = (now, 0);
+        }
+        if let Some(line) = self.pace.frame(now, (w, h)) {
+            let s = &self.game.scene;
+            let p = self.game.focus();
+            eprintln!(
+                "{line}; at ({:.0}, {:.0}), {} vehicles, {} people, {} riders",
+                p.x,
+                p.z,
+                s.vehicles.len(),
+                s.people.npcs.len(),
+                s.riders.len()
+            );
         }
         Ok(())
     }
@@ -6178,5 +6245,37 @@ impl ApplicationHandler for App {
         if let Some(state) = &self.state {
             state.window.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pace_logs_each_span_with_its_slowest_frame() {
+        let mut pace = Pace::default();
+        let t0 = Instant::now();
+        assert!(pace.frame(t0, (1280, 720)).is_none());
+        let mut t = t0;
+        let mut line = None;
+        // 16 ms frames, one of 80 ms, until the span is over.
+        for k in 0.. {
+            t += Duration::from_millis(if k == 10 { 80 } else { 16 });
+            line = pace.frame(t, (1280, 720));
+            if line.is_some() {
+                break;
+            }
+        }
+        let line = line.unwrap();
+        assert!(line.starts_with("pace: 6"), "{line}");
+        assert!(
+            line.contains("slowest frame 80 ms, 1 over 50 ms, 1280x720"),
+            "{line}"
+        );
+        // The next span starts clean.
+        t += Duration::from_millis(16);
+        assert!(pace.frame(t, (1280, 720)).is_none());
+        assert_eq!((pace.frames, pace.slow), (1, 0));
     }
 }

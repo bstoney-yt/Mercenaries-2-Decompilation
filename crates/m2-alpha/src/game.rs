@@ -929,7 +929,9 @@ impl Game {
                         v.rolled += ROTOR_SPIN * dt;
                     }
                 } else {
-                    v.rolled += world.physics.vehicle_speed(id) * dt;
+                    // As the chassis moves forward: a parked or held
+                    // vehicle's tracks stand still (playtest 5).
+                    v.rolled += world.physics.vehicle_rolling(id) * dt;
                 }
                 // Nobody at the wheel: it brakes to a stop and stays put,
                 // on a hill too (a wreck drags on its rims, driven by

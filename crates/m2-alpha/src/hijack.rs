@@ -221,6 +221,8 @@ pub struct Hijacks {
     rider_seats: HashMap<(u32, String, u32), Option<Seat>>,
     /// Seated clips read for riders, by hash.
     rider_clips: HashMap<u32, Option<Clip>>,
+    /// Seated clips (hash) that don't bind to a people's kind (index).
+    rider_unbound: std::collections::HashSet<(u32, usize)>,
     /// The riders' looks, by vehicle (index, model) and seat: kept while
     /// the vehicle is.
     rider_looks: HashMap<(usize, u32, u32), Vec<bool>>,
@@ -312,6 +314,7 @@ impl Hijacks {
             dressed: Default::default(),
             rider_seats: HashMap::new(),
             rider_clips: HashMap::new(),
+            rider_unbound: Default::default(),
             rider_looks: HashMap::new(),
             riders: RiderTally::default(),
             told_riders: RiderTally::default(),
@@ -848,10 +851,17 @@ impl Hijacks {
                         e.insert(load(game, seat.clip));
                     }
                     let k = &game.scene.people.kinds[kind];
+                    // A clip that won't bind to a kind's skeleton is tried
+                    // once, not cloned and bound again every tick.
+                    if self.rider_unbound.contains(&(seat.clip, kind)) {
+                        tally.no_clip += 1;
+                        continue;
+                    }
                     let Some(bound) = self.rider_clips[&seat.clip]
                         .clone()
                         .and_then(|c| m2_engine::BoundClip::bind(seat.clip, c, &k.rig.skeleton))
                     else {
+                        self.rider_unbound.insert((seat.clip, kind));
                         tally.no_clip += 1;
                         continue;
                     };
