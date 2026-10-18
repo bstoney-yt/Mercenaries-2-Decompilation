@@ -3471,6 +3471,7 @@ mod tests {
             feel: Default::default(),
             hint: None,
             ui: None,
+            assist: None,
         };
         let db = Templates {
             infos: HashMap::from([(

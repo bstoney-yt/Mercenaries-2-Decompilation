@@ -3068,6 +3068,7 @@ impl Thread {
             let mut screen = screen.borrow_mut();
             screen.set_camera_heading(heading);
             screen.set_pad(s.pad);
+            screen.set_driving(s.in_vehicle);
         }
         // The keys the texts' control words name, as the bindings are (and
         // again should they change): before any text this frame is set.

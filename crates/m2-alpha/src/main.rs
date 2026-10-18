@@ -155,6 +155,8 @@ struct Options {
     throw: bool,
     /// With `--screenshot` on foot: bash just before it.
     bash: bool,
+    /// With `--screenshot` on foot: change the rifle's clip just before it.
+    reload: bool,
     /// With `--bash`: the clip (by hash) to bash with, rather than the one
     /// chosen.
     bash_clip: Option<u32>,
@@ -442,6 +444,7 @@ fn parse_args() -> anyhow::Result<Options> {
             "--jump" => o.jump = true,
             "--throw" => o.throw = true,
             "--bash" => o.bash = true,
+            "--reload" => o.reload = true,
             "--bash-clip" => {
                 let v = value()?;
                 o.bash_clip = Some(
@@ -1548,6 +1551,11 @@ fn screenshot(
             game.combat.equip(w, 3 * combat::LAUNCHER_CLIP);
             game.combat.weapon = options.weapon.unwrap_or(combat::Weapon::Rifle);
         }
+        // `--reload`: rounds spent first, so the clip has room.
+        if options.reload {
+            let r = &mut game.combat.rifle_rounds;
+            r.clip = r.clip.saturating_sub(5);
+        }
         for i in 0..180 {
             if let (Some(face), Some(p)) = (options.face, game.scene.player.as_mut()) {
                 p.yaw = face;
@@ -1608,6 +1616,7 @@ fn screenshot(
                 fire: options.fire && i == 177,
                 throw: options.throw && i == 180 - lead,
                 melee: options.bash && i == 180 - lead,
+                reload: options.reload && i == 180 - lead,
                 select: options.weapon.filter(|_| i == 0).or_else(|| {
                     (options.switch && i == 180 - lead).then_some(match game.combat.weapon {
                         combat::Weapon::Rifle => combat::Weapon::Rpg,
@@ -4326,6 +4335,14 @@ fn drive_for_screenshot(
         }
         let swing = 10;
         for i in 0..90 {
+            // `--switch`: the weapon switch pressed as a player presses it
+            // (Tab, the pad's right bumper), through the input and the
+            // game's tick, to the vehicle's other gun (playtest 8).
+            if options.switch && i == 0 {
+                let mut input = input::Input::default();
+                input.button(input::Action::SwitchWeapon, true);
+                game.tick(&mut input, &config::CameraConfig::default(), false, tick);
+            }
             let look = if i < swing {
                 m2_math::glam::Vec2::new(options.look / swing as f32, 0.0)
             } else {
@@ -4393,6 +4410,26 @@ fn describe_vehicle_fire(game: &Game) {
     else {
         return;
     };
+    // The gun chosen, and what the HUD's gun box counts for it
+    // ([`gamehud::HudState::of`]: the machine gun's while it is chosen
+    // and has a `WeaponUI`).
+    let mg = v
+        .machine_gun()
+        .filter(|_| game.combat.vehicle_gun == 1)
+        .and_then(|(w, left)| Some((w.ui?, left, w.clip)));
+    eprintln!(
+        "drive: fire: {} chosen; gun box {}",
+        if game.combat.vehicle_gun == 1 {
+            "machine gun"
+        } else {
+            "main gun"
+        },
+        match (mg, v.rounds()) {
+            (Some((_, left, of)), _) => format!("machine gun, {left} of {of} rounds"),
+            (None, Some(left)) => format!("cannon, {left} shells"),
+            _ => "none".to_owned(),
+        }
+    );
     let body =
         v.id.zip(game.scene.world.as_ref())
             .and_then(|(id, w)| w.physics.vehicle_transform(id));

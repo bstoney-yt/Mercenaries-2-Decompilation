@@ -517,31 +517,28 @@ impl Game {
                 self.step(intent, dt);
                 return;
             }
-            // The pad's switch: the other of the rifle and what she
-            // carries in the launcher's place.
-            if switch && intent.trigger.select.is_none() {
-                intent.trigger.select = Some(match self.combat.weapon {
-                    Weapon::Rifle => Weapon::Rpg,
-                    _ => Weapon::Rifle,
-                });
+            let driving = self
+                .scene
+                .player
+                .as_ref()
+                .is_some_and(|p| p.driving.is_some());
+            match switch_weapon(switch, driving, self.combat.weapon, self.combat.vehicle_gun) {
+                Some(Switched::VehicleGun(gun)) => {
+                    self.combat.vehicle_gun = gun;
+                    eprintln!(
+                        "vehicle: {} chosen",
+                        if gun == 1 { "machine gun" } else { "main gun" }
+                    );
+                }
+                Some(Switched::Hands(w)) if intent.trigger.select.is_none() => {
+                    intent.trigger.select = Some(w);
+                }
+                _ => {}
             }
             self.step(intent, dt);
         } else {
             if let Some(p) = self.scene.player.as_mut() {
                 p.binoculars = None;
-            }
-            // In a vehicle the weapon switch picks its gun: the main gun or
-            // the machine gun.
-            if input.take_pressed(Action::SwitchWeapon) {
-                self.combat.vehicle_gun = (self.combat.vehicle_gun + 1) % 2;
-                eprintln!(
-                    "vehicle: {} chosen",
-                    if self.combat.vehicle_gun == 1 {
-                        "machine gun"
-                    } else {
-                        "main gun"
-                    }
-                );
             }
             self.camera.update(input, config, mouse_look, dt);
             self.step(Intent::default(), dt);
@@ -3175,9 +3172,71 @@ fn would_leave(
     u8::from(!usable && offer != crate::mission::Offer::Equip)
 }
 
+/// What a press of the weapon switch picks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Switched {
+    /// Of the vehicle she drives: 0 its main gun, 1 the machine gun.
+    VehicleGun(usize),
+    /// In her hands.
+    Hands(Weapon),
+}
+
+/// The weapon switch (Tab, the wheel, the pad's right bumper), `pressed`
+/// this tick: at the wheel it picks the vehicle's other gun, the main gun
+/// or the machine gun (the game's pad layout for a tank has no button of
+/// its own for the machine gun, only `Switch_Primary`, from the pause
+/// screen's `tControlMap.tank`, vz.wad); on foot the other of the rifle
+/// and what she carries in the launcher's place (invented: the layout's
+/// `Switch_Primary` steps through her guns). Playtest 8: the vehicle's
+/// switch had been left in the free camera's branch, so at the wheel the
+/// press went to her hands and the machine gun could not be chosen.
+fn switch_weapon(
+    pressed: bool,
+    driving: bool,
+    weapon: Weapon,
+    vehicle_gun: usize,
+) -> Option<Switched> {
+    if !pressed {
+        return None;
+    }
+    Some(if driving {
+        Switched::VehicleGun((vehicle_gun + 1) % 2)
+    } else {
+        Switched::Hands(match weapon {
+            Weapon::Rifle => Weapon::Rpg,
+            _ => Weapon::Rifle,
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    #[test]
+    fn the_switch_picks_the_vehicles_gun_at_the_wheel() {
+        use super::{Switched, Weapon, switch_weapon};
+        // Playtest 8: at the wheel the switch steps main gun, machine
+        // gun, main gun; her hands are left alone.
+        assert_eq!(
+            switch_weapon(true, true, Weapon::Rifle, 0),
+            Some(Switched::VehicleGun(1))
+        );
+        assert_eq!(
+            switch_weapon(true, true, Weapon::Rifle, 1),
+            Some(Switched::VehicleGun(0))
+        );
+        // On foot, her rifle and launcher.
+        assert_eq!(
+            switch_weapon(true, false, Weapon::Rifle, 0),
+            Some(Switched::Hands(Weapon::Rpg))
+        );
+        assert_eq!(
+            switch_weapon(true, false, Weapon::Rpg, 0),
+            Some(Switched::Hands(Weapon::Rifle))
+        );
+        assert_eq!(switch_weapon(false, true, Weapon::Rifle, 0), None);
+    }
 
     #[test]
     fn a_crew_has_a_driver_by_its_seat() {

@@ -66,6 +66,8 @@ m2-alpha [options]
                          just before the picture
   --bash                 with --screenshot on the island: a melee bash just
                          before the picture
+  --reload               with --screenshot on foot: change the rifle's clip
+                         --lead seconds before the picture
   --bash-clip <hash>     with --bash: bash with this clip (one of those the
                          "player meleebash clips:" line lists)
   --lead <s>             with --jump, --throw or --bash: seconds before the
@@ -115,7 +117,9 @@ m2-alpha [options]
   --weapon rifle|rpg|gl  with --screenshot on foot: the weapon she has up
                          (gl: the supply crate's grenade launcher)
   --switch               with --screenshot on foot: switch weapons --lead
-                         seconds before the picture (stow, then take up)
+                         seconds before the picture (stow, then take up);
+                         with --drive --fire: press the weapon switch (to
+                         the machine gun) before firing
   --pickup               with --screenshot on foot: pick a weapon up --lead
                          seconds before the picture
   --satellite <stage>    with --screenshot on foot: call a Satellite Guided
