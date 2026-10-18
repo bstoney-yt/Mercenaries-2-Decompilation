@@ -6760,6 +6760,9 @@ impl Running {
             if let Some(cue) = m.take_music() {
                 self.audio.music_cue(cue.as_deref());
             }
+            if let Some(preset) = m.take_reverb() {
+                self.audio.set_reverb(preset);
+            }
         }
         self.answer_saves(config.options.autosave);
         let (ear, facing) = self.game.listener();

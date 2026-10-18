@@ -44,6 +44,8 @@
 //! spot:<x>,<z>[,<r>]        what stands near a spot (default 30 m): models
 //!                           with their techniques and textures, and the
 //!                           layer entities with their components' fields
+//! music                     every music region (faction, area); the score's
+//!                           faction over a 25 m grid and at each start point
 //! atmospheres[:<word>,..]   every atmosphere region (area, centre) with
 //!                           its records' time of day, sunlight, clouds,
 //!                           top ambient light and haze; then the region
@@ -1129,6 +1131,13 @@ fn main() -> Result<(), Error> {
                 atmospheres(world.as_ref().expect("just built"), &names, arg);
                 Ok(())
             }
+            "music" => {
+                if world.is_none() {
+                    world = Some(WorldIndex::build(&mut source)?);
+                }
+                music_regions(world.as_ref().expect("just built"), &names);
+                Ok(())
+            }
             "find" => {
                 for h in arg.split(',').filter_map(hex) {
                     println!("  {h:08x} {}", names.show(h));
@@ -1215,6 +1224,85 @@ fn atmospheres(world: &WorldIndex, names: &Names, arg: &str) {
             "start {} at {:.0},{:.0},{:.0}: {over}",
             s.name, s.position.x, s.position.y, s.position.z
         );
+    }
+}
+
+/// Every music region (faction, area, centre); then the free-play score's
+/// faction over a 25 m grid across the regions' bounds, and at every
+/// start point (outside every region the root, `freeplay_city`).
+fn music_regions(world: &WorldIndex, names: &Names) {
+    use m2_engine::music_regions::region_at;
+    let regions = &world.music_regions;
+    let faction = |r: Option<&m2_engine::music_regions::MusicRegion>| {
+        r.map_or("freeplay_city (root)".to_owned(), |r| {
+            names.show(r.faction).to_owned()
+        })
+    };
+    let (mut lo, mut hi) = (m2_math::glam::Vec2::MAX, m2_math::glam::Vec2::MIN);
+    for r in regions {
+        let n = r.outline.len().max(1) as f32;
+        let c = r
+            .outline
+            .iter()
+            .fold(m2_math::glam::Vec2::ZERO, |s, p| s + *p)
+            / n;
+        for p in &r.outline {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        println!(
+            "region {} ({:08x}) {} area {:.0} km2 centre {:.0},{:.0}, {} corners",
+            r.name,
+            r.entity,
+            names.show(r.faction),
+            r.area / 1e6,
+            c.x,
+            c.y,
+            r.outline.len()
+        );
+    }
+    let mut grid: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut cells = 0;
+    let mut z = lo.y;
+    while z <= hi.y {
+        let mut x = lo.x;
+        while x <= hi.x {
+            *grid.entry(faction(region_at(regions, x, z))).or_default() += 1;
+            cells += 1;
+            x += 25.0;
+        }
+        z += 25.0;
+    }
+    println!(
+        "{} regions; grid {:.0},{:.0} to {:.0},{:.0}, {cells} cells of 25 m:",
+        regions.len(),
+        lo.x,
+        lo.y,
+        hi.x,
+        hi.y
+    );
+    for (f, n) in &grid {
+        println!(
+            "  {f}: {n} ({:.1} %)",
+            100.0 * *n as f32 / cells.max(1) as f32
+        );
+    }
+    let mut starts: std::collections::BTreeMap<String, usize> = Default::default();
+    for s in &world.starts {
+        let r = region_at(regions, s.position.x, s.position.z);
+        *starts.entry(faction(r)).or_default() += 1;
+        println!(
+            "start {} at {:.0},{:.0}: {} ({})",
+            s.name,
+            s.position.x,
+            s.position.z,
+            faction(r),
+            r.map_or("no region", |r| r.name.as_str())
+        );
+    }
+    println!("{} start points:", world.starts.len());
+    for (f, n) in &starts {
+        println!("  {f}: {n}");
     }
 }
 

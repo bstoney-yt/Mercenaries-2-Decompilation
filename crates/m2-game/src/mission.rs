@@ -1543,6 +1543,21 @@ impl Mission {
         }
     }
 
+    /// The player is in the music region naming faction `faction` (name
+    /// hash; `None`: in none): the free-play score follows it
+    /// ([`crate::music::Music::enter_region`]).
+    pub fn music_region(&mut self, faction: Option<u32>) {
+        let mut w = self.world.borrow_mut();
+        if let Some(c) = w.music.enter_region(faction) {
+            w.commands.push(c);
+        }
+    }
+
+    /// The faction the score plays now (`freeplay_city`, `pmc`, ...).
+    pub fn music_faction(&self) -> String {
+        self.world.borrow().music.faction().to_owned()
+    }
+
     /// The game spent or picked up ammunition: the player's weapon of
     /// template `weapon` now has `rounds` in reserve, as scripts read it
     /// (`Weapon.GetReserveAmmo`).

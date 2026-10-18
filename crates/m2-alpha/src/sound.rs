@@ -1049,6 +1049,26 @@ impl GameAudio {
         }
     }
 
+    /// Runs the world's placed sounds through the scripts' reverb preset
+    /// (the bootstrap's `CITY_KG_LIGHT_REFLECTIONS`), or none.
+    pub fn set_reverb(&mut self, preset: Option<m2_engine::reverb::ReverbPreset>) {
+        match &preset {
+            Some(p) => eprintln!(
+                "sound: reverb {} (room {} mB, decay {} s, reflections {} mB at {} s, \
+                 reverb {} mB {} s later)",
+                p.name,
+                p.room,
+                p.decay_time,
+                p.reflections,
+                p.reflections_delay,
+                p.reverb,
+                p.reverb_delay
+            ),
+            None => eprintln!("sound: reverb off"),
+        }
+        self.out.with(|m| m.set_reverb(preset));
+    }
+
     /// Plays the scripts' music cue `cue` (`mu_fac_pmc_explore_01`) in
     /// place of what plays, looped unless it is a one-shot (a fanfare);
     /// `None` stops the music.
