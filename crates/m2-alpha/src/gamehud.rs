@@ -73,6 +73,28 @@ LTILibName = setmetatable({}, {
     end,
 })
 "#;
+/// The calls to the PC's library the scripts queued (`__m2_lti`, as
+/// [`LTI_LIBRARY`] and the shell's queue them), each its name and
+/// argument, taken.
+fn take_library_calls(lua: &mlua::Lua) -> Vec<(String, String)> {
+    let globals = lua.globals();
+    let calls: Vec<(String, String)> = globals
+        .raw_get::<Option<mlua::Table>>("__m2_lti")
+        .ok()
+        .flatten()
+        .map(|t| {
+            t.sequence_values::<mlua::Table>()
+                .flatten()
+                .filter_map(|c| Some((c.get(1).ok()?, c.get(2).ok()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !calls.is_empty() {
+        let _ = globals.raw_set("__m2_lti", lua.create_table().ok());
+    }
+    calls
+}
+
 /// The fonts the HUD's text widgets use.
 const FONTS: [&str; 2] = ["english_18", "english_20"];
 /// The player's guid as the scripts know her (`Sys.StringToGuid("0x1")`).
@@ -924,6 +946,8 @@ pub struct ShellNews {
     /// A new game was started, as this character (`MrxGuiShellBootstrap.
     /// GetSelectedCharacter`: `Chris`, `Jen` or `mattias`).
     pub new_game: Option<String>,
+    /// The Resolution and Refresh Rate its video screen kept.
+    pub video: Option<crate::pause::Video>,
 }
 
 /// What a [`GameHud`] thread runs.
@@ -1062,6 +1086,12 @@ impl GameHud {
         self.shell.new_game.take()
     }
 
+    /// The Resolution and Refresh Rate the front end's video screen kept,
+    /// once.
+    pub fn take_video(&mut self) -> Option<crate::pause::Video> {
+        self.shell.video.take()
+    }
+
     /// Logs to `path` instead of `m2-alpha-hud.log` (a second HUD in one
     /// run, kept apart from the first's).
     pub fn log_to(&mut self, path: &std::path::Path) {
@@ -1192,7 +1222,12 @@ impl GameHud {
                     return;
                 }
                 let new_game = self.shell.new_game.take().or(shell.new_game);
-                self.shell = ShellNews { new_game, ..shell };
+                let video = shell.video.or(self.shell.video.take());
+                self.shell = ShellNews {
+                    new_game,
+                    video,
+                    ..shell
+                };
                 self.dropped_fanfare |= log.iter().any(|l| fanfare_failed(l));
                 let broken = log.iter().find(|l| broken_lua(l)).cloned();
                 self.write(log);
@@ -2550,6 +2585,16 @@ impl Thread {
                 log.push(format!("shell: the engine hears {command}({arg})"));
             }
         }
+        let video = state.pause_settings.video;
+        for (name, arg) in take_library_calls(self.mission.lua()) {
+            let answered = self
+                .native
+                .library(&name, video, &state.pause_settings.modes);
+            log.push(format!(
+                "shell: LTILibName.{name}({arg}){}",
+                if answered { "" } else { " not answered" }
+            ));
+        }
         let Some(screen) = gui_runtime::screen(self.mission.lua()) else {
             return Output::Failed("no GUI runtime".into());
         };
@@ -2617,6 +2662,7 @@ impl Thread {
                 movie,
                 under,
                 new_game,
+                video: self.native.take_video(),
             },
             pause: Box::default(),
         }
@@ -2666,23 +2712,7 @@ impl Thread {
     /// The scripts' calls to the PC's library ([`LTI_LIBRARY`]) and the
     /// pause movie's commands no script heard, for the engine.
     fn pause_answers(&mut self, log: &mut Vec<String>) {
-        let lua = self.mission.lua();
-        let globals = lua.globals();
-        let calls: Vec<(String, String)> = globals
-            .raw_get::<Option<mlua::Table>>("__m2_lti")
-            .ok()
-            .flatten()
-            .map(|t| {
-                t.sequence_values::<mlua::Table>()
-                    .flatten()
-                    .filter_map(|c| Some((c.get(1).ok()?, c.get(2).ok()?)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !calls.is_empty() {
-            let _ = globals.raw_set("__m2_lti", lua.create_table().ok());
-        }
-        for (name, arg) in calls {
+        for (name, arg) in take_library_calls(self.mission.lua()) {
             let answered = self.pause_native.library(&name, &arg);
             log.push(format!(
                 "pause: LTILibName.{name}({arg}){}",

@@ -77,6 +77,13 @@ pub struct Props {
     near: Option<Near>,
     /// Changes to those shown (put up, taken down, moved, gone).
     changes: u64,
+    /// Those of [`changes`](Self::changes) that put props up or took
+    /// them down (not the scripts' moves, which may come every tick).
+    placed: u64,
+    /// The nearness [`counts`](Self::counts) worked out of the waiting
+    /// models, as of change [`placed`](Self::placed): taken again only
+    /// when props are put up or taken down.
+    fresh: std::cell::RefCell<Option<(u64, HashMap<u32, f32>)>>,
     /// How far from the focus models were last wanted (metres).
     reach: f32,
     /// Those knocked loose: their pieces, in [`Loose`] order.
@@ -179,6 +186,8 @@ impl std::fmt::Display for PropCounts {
 struct Near {
     focus: Vec3,
     changes: u64,
+    /// [`Props::placed`] then.
+    placed: u64,
     by_model: HashMap<u32, f32>,
 }
 
@@ -277,7 +286,7 @@ impl Props {
         }
         down.hidden = parts.hidden(&down.wrecked);
         let wrecked = down.wrecked.clone();
-        self.changes += 1;
+        self.changed();
         // Its collision without the broken parts' shapes (one cut from
         // its drawn triangles stays whole).
         if !parts.meshes.is_empty()
@@ -340,7 +349,7 @@ impl Props {
                 },
             );
             added += 1;
-            self.changes += 1;
+            self.changed();
             match self.models.entry(o.model) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(None);
@@ -385,7 +394,7 @@ impl Props {
                 named: o.named,
             },
         );
-        self.changes += 1;
+        self.changed();
         if let std::collections::hash_map::Entry::Vacant(slot) = self.models.entry(o.model) {
             slot.insert(None);
             self.waiting.insert(o.model);
@@ -415,7 +424,7 @@ impl Props {
         for e in entities {
             if self.shown.remove(&e).is_some() {
                 physics.remove_static(StaticKey::Entity(e));
-                self.changes += 1;
+                self.changed();
             }
             self.parts_down.remove(&e);
             self.sinking.remove(&e);
@@ -650,7 +659,7 @@ impl Props {
             if !self.fling(physics, entity, velocity, spin) {
                 // Loose pieces stay where they fell.
                 self.shown.remove(&entity);
-                self.changes += 1;
+                self.changed();
             }
         }
         true
@@ -1043,26 +1052,41 @@ impl Props {
         // Props put up since the nearness was last taken (a state layer's,
         // before the next update asks for their models) are counted too
         // (playtest 7: the villa's buildings, put up again as PmcCon001
-        // ended, were not, and she landed 41 m under them).
-        let fresh;
-        let by_model = match &self.near {
-            Some(n) if n.changes == self.changes => Some(&n.by_model),
+        // ended, were not, and she landed 41 m under them). That nearness
+        // is kept till props are put up or taken down again: worked out
+        // anew at each call, it went over every shown prop (89,000 on the
+        // island) several times a tick while the update had not taken it
+        // again, which it doesn't while nothing is asked of the loaders,
+        // and play ran at 1 fps (playtest 7).
+        let waiting_near = match &self.near {
+            _ if self.waiting.is_empty() => 0,
+            None => 0,
+            Some(n) if n.placed == self.placed => self
+                .waiting
+                .iter()
+                .filter(|h| n.by_model.get(h).is_some_and(|&d| d <= within))
+                .count(),
             Some(n) => {
-                fresh = self.nearness(n.focus);
-                Some(&fresh)
+                let mut fresh = self.fresh.borrow_mut();
+                if fresh.as_ref().is_none_or(|(at, _)| *at != self.placed) {
+                    *fresh = Some((self.placed, self.waiting_nearness(n.focus)));
+                }
+                let by_model = fresh.as_ref().map(|(_, m)| m);
+                self.waiting
+                    .iter()
+                    .filter(|h| {
+                        by_model
+                            .and_then(|m| m.get(h))
+                            .is_some_and(|&d| d <= within)
+                    })
+                    .count()
             }
-            None => None,
         };
-        let near = self.waiting.iter().filter(|h| {
-            by_model
-                .and_then(|n| n.get(h))
-                .is_some_and(|&d| d <= within)
-        });
         PropCounts {
             shown: self.shown.len(),
             loaded: self.models.values().filter(|m| m.is_some()).count(),
             loading: self.asked.len() + self.decoded.len(),
-            waiting_near: near.count(),
+            waiting_near,
             waiting: self.waiting.len(),
             failed: self.failed.len(),
         }
@@ -1120,6 +1144,7 @@ impl Props {
             _ => Near {
                 focus,
                 changes: self.changes,
+                placed: self.placed,
                 by_model: self.nearness(focus),
             },
         };
@@ -1171,6 +1196,27 @@ impl Props {
         }
         self.near = Some(near);
         Ok(())
+    }
+
+    /// [`nearness`](Self::nearness) of the waiting models alone.
+    fn waiting_nearness(&self, focus: Vec3) -> HashMap<u32, f32> {
+        let mut near = HashMap::new();
+        for p in self.shown.values() {
+            if !self.waiting.contains(&p.model) {
+                continue;
+            }
+            let d = p.position.distance_squared(focus);
+            near.entry(p.model)
+                .and_modify(|n: &mut f32| *n = n.min(d))
+                .or_insert(d);
+        }
+        near
+    }
+
+    /// A prop was put up or taken down (or broke).
+    fn changed(&mut self) {
+        self.changes += 1;
+        self.placed += 1;
     }
 
     /// For each model not yet loaded, how far (squared) its nearest shown

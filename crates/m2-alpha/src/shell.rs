@@ -31,9 +31,18 @@
 //!
 //! `LTILibName` is the PC version's own library behind its options
 //! screens (video modes, key bindings, the profile): the engine's, not the
-//! scripts'. Its functions answer nothing here (each noted once), but
-//! `FirstRun`, which says this profile has run before (no wait before the
-//! legal screen can be skipped).
+//! scripts'. Its calls are queued for the engine ([`Native::library`]),
+//! which answers the video screen's (below) and logs the rest; `FirstRun`
+//! says this profile has run before (no wait before the legal screen can
+//! be skipped).
+//!
+//! The Options' video screen works as the pause menu's
+//! ([`crate::pause`]): its arrows ask the library to step Resolution and
+//! Refresh Rate (`LTIVideoNextRes`, `LTIVideoPrevRefresh`...), the movie
+//! shows the text handed back (`LTIVideoSetRes`, `LTIVideoSetRefresh`:
+//! this movie's names, not the pause movie's), and Accept keeps them
+//! ([`VIDEO_ACCEPT`]). Until playtest 7 nothing answered, so both items
+//! stayed blank and neither fullscreen nor a size could be picked there.
 //!
 //! # Provenance
 //!
@@ -42,6 +51,8 @@
 //! executable.
 
 use m2_game::gui_runtime;
+
+use crate::pause::{self, Mode, Video};
 use m2_game::mission::Mission;
 use mlua::Lua;
 
@@ -52,16 +63,14 @@ for _, f in ipairs({ "GetLocalPlayer", "GetPrimaryPlayer" }) do
     rawset(Player, f, function() return me end)
 end
 rawset(Player, "GetAllPlayers", function() return { me } end)
-local noted = {}
+__m2_lti = {}
 LTILibName = setmetatable({
     FirstRun = function() return false end,
 }, {
     __index = function(_, k)
-        return function()
-            if not noted[k] then
-                noted[k] = true
-                __m2_note("LTILibName." .. tostring(k))
-            end
+        return function(a)
+            local q = __m2_lti
+            q[#q + 1] = { tostring(k), a == nil and "" or tostring(a) }
         end
     end,
 })
@@ -160,6 +169,11 @@ pub struct Native {
     /// (`onlineSetParameters` with `profileCharacter`): see
     /// [`Native::character`].
     character: Option<&'static str>,
+    /// The video screen's Resolution and Refresh Rate as stepped, while
+    /// it is open.
+    video: Option<Video>,
+    /// Those it kept, not yet taken.
+    kept: Option<Video>,
 }
 
 /// The menu movie's name.
@@ -275,6 +289,73 @@ impl Native {
         }
         Vec::new()
     }
+
+    /// A call to the PC's library (`LTILibName.<name>(arg)`) from the
+    /// scripts' handlers: whether it is answered. `window` is how the
+    /// window is shown now and `modes` the monitor's.
+    pub fn library(&mut self, name: &str, window: Video, modes: &[Mode]) -> bool {
+        match name {
+            // The video screen opened: its items read as the window is.
+            "LTIVideoEnter" => {
+                self.video = Some(window);
+                self.pending.extend(video_calls(window));
+                true
+            }
+            // Its arrows: the engine steps the item and says what it reads
+            // now (as the pause menu's, [`crate::pause::step_resolution`]).
+            "LTIVideoNextRes"
+            | "LTIVideoPrevRes"
+            | "LTIVideoNextRefresh"
+            | "LTIVideoPrevRefresh" => {
+                let step = if name.contains("Next") { 1 } else { -1 };
+                let at = self.video.unwrap_or(window);
+                let video = if name.ends_with("Res") {
+                    pause::step_resolution(at, modes, (window.width, window.height), step)
+                } else {
+                    pause::step_rate(at, modes, step)
+                };
+                self.video = Some(video);
+                self.pending.extend(video_calls(video));
+                true
+            }
+            n if n == VIDEO_ACCEPT => {
+                self.kept = self.video.take().filter(|&v| v != window);
+                true
+            }
+            "LTIVideoCancel" => {
+                self.video = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The Resolution and Refresh Rate the video screen kept since last
+    /// asked, for the window to take.
+    pub fn take_video(&mut self) -> Option<Video> {
+        self.kept.take()
+    }
+}
+
+/// The library call the video screen's Accept makes (seen in the log of a
+/// front-end run: [`Native::library`] logs each).
+pub const VIDEO_ACCEPT: &str = "LTIVideoApplyChanges";
+
+/// The calls that show `video` on the video screen: this movie's setters
+/// (`LTIVideoSetRes`, `LTIVideoSetRefresh` in its `_videotrans` frame),
+/// the texts as the pause menu's ([`Video::resolution_text`]).
+fn video_calls(video: Video) -> [Call; 2] {
+    use m2_assets::flash::avm1::Value;
+    [
+        (
+            "LTIVideoSetRes",
+            vec![Value::Str(video.resolution_text().into())],
+        ),
+        (
+            "LTIVideoSetRefresh",
+            vec![Value::Str(video.refresh_text().into())],
+        ),
+    ]
 }
 
 /// The scripts' name for the movie's `profileCharacterVar`: 1, 2 and 3 are
@@ -325,6 +406,81 @@ mod tests {
         assert_eq!(names(n.key(13)), ["startShell"]);
         assert!(n.key(13).is_empty());
         assert!(!n.command("startMovie", "x"));
+    }
+
+    #[test]
+    fn the_video_screen_steps_the_monitors_modes_and_accept_keeps_them() {
+        use m2_assets::flash::avm1::Value;
+        let modes = [
+            Mode {
+                width: 1920,
+                height: 1080,
+                hz: 60,
+            },
+            Mode {
+                width: 2560,
+                height: 1440,
+                hz: 144,
+            },
+            Mode {
+                width: 2560,
+                height: 1440,
+                hz: 60,
+            },
+        ];
+        // Playtest 7: a maximised window, not one of the modes.
+        let window = Video {
+            width: 2560,
+            height: 1351,
+            fullscreen: None,
+        };
+        let shown = |calls: Vec<Call>| -> Vec<String> {
+            calls
+                .into_iter()
+                .map(|(n, a)| match a.as_slice() {
+                    [Value::Str(s)] => format!("{n} {s}"),
+                    _ => n.to_owned(),
+                })
+                .collect()
+        };
+        let mut n = Native::default();
+        n.calls();
+        assert!(n.library("LTIVideoEnter", window, &modes));
+        assert_eq!(
+            shown(n.calls()),
+            ["LTIVideoSetRes 2560 x 1351", "LTIVideoSetRefresh Windowed"]
+        );
+        assert!(n.library("LTIVideoNextRes", window, &modes));
+        assert_eq!(
+            shown(n.calls()),
+            ["LTIVideoSetRes 2560 x 1440", "LTIVideoSetRefresh Windowed"]
+        );
+        // The rate's first entry is the fastest: fullscreen at it.
+        assert!(n.library("LTIVideoPrevRefresh", window, &modes));
+        assert_eq!(shown(n.calls())[1], "LTIVideoSetRefresh 60 Hz");
+        assert!(n.library("LTIVideoNextRefresh", window, &modes));
+        assert_eq!(shown(n.calls())[1], "LTIVideoSetRefresh Windowed");
+        assert!(n.library("LTIVideoNextRefresh", window, &modes));
+        assert_eq!(shown(n.calls())[1], "LTIVideoSetRefresh 144 Hz");
+        assert_eq!(n.take_video(), None, "not kept till accepted");
+        assert!(n.library(VIDEO_ACCEPT, window, &modes));
+        assert_eq!(
+            n.take_video(),
+            Some(Video {
+                width: 2560,
+                height: 1440,
+                fullscreen: Some(144),
+            })
+        );
+        assert_eq!(n.take_video(), None);
+        // Cancelled: nothing kept, and the next visit starts from the
+        // window again.
+        assert!(n.library("LTIVideoEnter", window, &modes));
+        assert!(n.library("LTIVideoPrevRes", window, &modes));
+        assert!(n.library("LTIVideoCancel", window, &modes));
+        assert!(n.library(VIDEO_ACCEPT, window, &modes));
+        assert_eq!(n.take_video(), None);
+        assert!(!n.library("LTIGetStartButton", window, &modes));
     }
 
     #[test]

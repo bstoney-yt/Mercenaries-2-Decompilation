@@ -662,10 +662,16 @@ impl Game {
                 eprintln!("life at {run:.0} s: {}", self.life_census());
             }
         }
+        let mut lap = std::time::Instant::now();
+        let mut split = |name: &'static str| {
+            crate::spans::add(name, lap.elapsed());
+            lap = std::time::Instant::now();
+        };
         self.update_sky(dt);
         let focus = self.focus();
         self.moving.update(&mut self.scene, focus, dt);
         self.startup_props();
+        split("game: moving");
         self.fetch_world_vehicles(dt);
         self.arrive(dt);
         let intent = if self.input_locked {
@@ -696,6 +702,7 @@ impl Game {
             self.roads.spawn(&mut self.scene, focus, layer_in, dt);
         }
         let intent = self.call_support(intent, dt);
+        split("game: arrival");
         // The use key at what lies within reach: taken with the fight's.
         let mut taking = false;
         let scene = &mut self.scene;
@@ -921,6 +928,7 @@ impl Game {
                 physics.step(dt);
             }
         }
+        split("game: player and physics");
         let focus = self.focus();
         if let Some(world) = &mut self.scene.world {
             let driven = self
@@ -1020,6 +1028,7 @@ impl Game {
                 spray(world, &self.scene.vehicles, &mut self.combat);
             }
         }
+        split("game: vehicles");
         let threat = self
             .scene
             .player
@@ -1050,6 +1059,7 @@ impl Game {
                 eprintln!("run over: {run_over} soldier(s) killed by a vehicle");
             }
         }
+        split("game: people");
         let scene = &mut self.scene;
         if self.on_foot
             && let (Some(world), Some(player)) = (&mut scene.world, &mut scene.player)
@@ -1062,20 +1072,26 @@ impl Game {
                 arsenal: &scene.arsenal,
                 explosives: &mut scene.explosives,
             };
-            self.combat.step(&mut field, intent.trigger, dt);
-            self.combat.vehicles_hit_her(&mut field, dt);
+            crate::spans::time("on foot: combat", || {
+                self.combat.step(&mut field, intent.trigger, dt);
+            });
+            crate::spans::time("on foot: vehicles hit her", || {
+                self.combat.vehicles_hit_her(&mut field, dt);
+            });
             world
                 .destroyed
                 .extend(scene.explosives.iter().filter(|e| e.gone).map(|e| e.object));
-            hit_world(
-                world,
-                &mut scene.props,
-                &mut scene.flights,
-                scene.install.as_ref(),
-                &mut self.placed,
-                &mut self.destruction,
-                &mut self.combat,
-            );
+            crate::spans::time("on foot: hit world", || {
+                hit_world(
+                    world,
+                    &mut scene.props,
+                    &mut scene.flights,
+                    scene.install.as_ref(),
+                    &mut self.placed,
+                    &mut self.destruction,
+                    &mut self.combat,
+                );
+            });
             // What lies within her reach, taken as the real game takes it
             // ([`crate::mission::offer`]): health and the small ammunition
             // box as she walks over them, if they give her anything; an
@@ -1156,6 +1172,7 @@ impl Game {
                 self.combat.manned = None;
             }
         }
+        split("game: on foot");
         self.drop_pickups();
         // What the state layers place, as they come and go.
         if let Some(world) = &self.scene.world {
@@ -1172,10 +1189,13 @@ impl Game {
                 );
             }
         }
+        split("game: pickups");
         self.support_impacts();
         self.strike_impacts(dt);
         self.run_particles(dt);
+        split("game: effects");
         self.scene.tick(dt);
+        split("game: scene");
     }
 
     /// Sets off the game's effects the fight asked for and runs them.

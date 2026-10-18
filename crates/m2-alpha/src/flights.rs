@@ -428,11 +428,16 @@ impl Flights {
     /// grenade, ammunition and gun fall together, and the grenade she has
     /// no room for hid the gun from her (playtest 5: the machine pistol
     /// could not be taken up at all).
+    ///
+    /// Only those within reach are ranked: ranking each of the island's
+    /// placed pickups (800 once the first contract is up) every tick took
+    /// most of a second, and play ran at 1 fps (playtest 7).
     pub fn within_by(&self, at: Vec3, rank: impl Fn(&Pickup) -> u8) -> Option<&Pickup> {
         self.pickups
             .iter()
-            .map(|p| (p, rank(p), (p.at - at).with_y(0.0).length()))
-            .filter(|&(p, _, d)| d <= p.what.reach && (p.at.y - at.y).abs() < TAKE_HEIGHT)
+            .map(|p| (p, (p.at - at).with_y(0.0).length()))
+            .filter(|&(p, d)| d <= p.what.reach && (p.at.y - at.y).abs() < TAKE_HEIGHT)
+            .map(|(p, d)| (p, rank(p), d))
             .min_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2)))
             .map(|(p, _, _)| p)
     }
@@ -1223,6 +1228,20 @@ mod tests {
         assert_eq!(flights.within_by(her, rank), Some(&near));
         assert_eq!(flights.take(pistol.key()), Some(pistol));
         assert_eq!(flights.take(pistol.key()), None);
+        // Those out of reach aren't ranked at all (playtest 7: ranking
+        // all 800 of the island's every tick ran play at 1 fps).
+        for i in 0..800 {
+            let mut far = lying(100 + i, 0x8000_6b59);
+            far.at = at + Vec3::X * (50.0 + i as f32);
+            flights.leave(far);
+        }
+        let ranked = std::cell::Cell::new(0);
+        let counting = |p: &Pickup| {
+            ranked.set(ranked.get() + 1);
+            rank(p)
+        };
+        assert_eq!(flights.within_by(her, counting), Some(&near));
+        assert_eq!(ranked.get(), 2, "the grenade and the near one");
     }
 
     #[test]
