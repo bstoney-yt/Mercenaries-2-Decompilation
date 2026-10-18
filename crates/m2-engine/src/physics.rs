@@ -1243,6 +1243,9 @@ pub struct Physics {
     debris: Vec<Option<r::RigidBodyHandle>>,
     /// The water's surface boats float on, if there is any.
     water: Option<f32>,
+    /// The game's water heights: rivers, pools and lakes above the sea
+    /// ([`Physics::water_at`]).
+    inland: Option<std::sync::Arc<m2_assets::water::WaterHeights>>,
 }
 
 /// A loose prop's piece in the physics world ([`Physics::add_debris`]).
@@ -1300,6 +1303,7 @@ impl Physics {
             ragdolls: Vec::new(),
             debris: Vec::new(),
             water: None,
+            inland: None,
         }
     }
 
@@ -1311,6 +1315,21 @@ impl Physics {
     /// The height of the water boats float on, if there is any.
     pub fn water(&self) -> Option<f32> {
         self.water
+    }
+
+    /// Sets the game's water heights (rivers, pools, lakes above the sea).
+    pub fn set_inland(&mut self, heights: std::sync::Arc<m2_assets::water::WaterHeights>) {
+        self.inland = Some(heights);
+    }
+
+    /// The water's surface over (`x`, `z`): the higher of the sea and the
+    /// water heights' surface there (a pool, a river), if either.
+    pub fn water_at(&self, x: f32, z: f32) -> Option<f32> {
+        let inland = self.inland.as_ref().and_then(|w| w.surface(x, z));
+        match (self.water, inland) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Adds `shape` at `position` and `rotation` under `key`, replacing
