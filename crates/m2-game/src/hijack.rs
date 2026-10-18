@@ -834,6 +834,20 @@ impl ClipTimes {
         Some((clip, self.lengths.get(&clip).copied()))
     }
 
+    /// [`clip`](Self::clip) for a character in `seat` (a name hash): the
+    /// crewman a hijack throws out is in the driver's.
+    pub fn seat_clip(
+        &self,
+        state: &str,
+        action: &str,
+        set: (u32, u32),
+        seat: u32,
+    ) -> Option<(u32, Option<f64>)> {
+        let (a, b) = self.tables.as_ref()?;
+        let clip = animation_table::seat_clip(a, b, state, action, set, Some(seat))?;
+        Some((clip, self.lengths.get(&clip).copied()))
+    }
+
     /// The clip a character sits in `seat` (a name hash) of a vehicle of
     /// this animation set with: the scripts' `InVehicle`, `Idle`.
     pub fn seated(&self, set: (u32, u32), seat: Option<u32>) -> Option<u32> {

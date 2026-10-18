@@ -3666,6 +3666,23 @@ fn hijack_for_screenshot(
         return Ok(());
     };
     eprintln!("hijack: prompt \"Hijack {}\"", view.vehicle);
+    // As a player walks up, the crewman's model streams in.
+    let waiting = Instant::now();
+    while !hijacks.crew_in(game) && waiting.elapsed() < Duration::from_secs(60) {
+        let focus = game.focus();
+        game.scene.update(backend, focus)?;
+        hijacks.tick(game, &mut input, tick);
+        game.step(Intent::default(), tick);
+    }
+    eprintln!(
+        "hijack: crewman {} after {:.1} s",
+        if hijacks.crew_in(game) {
+            "in"
+        } else {
+            "not in"
+        },
+        waiting.elapsed().as_secs_f32()
+    );
     // The HUD up before she starts (its scripts load in the background).
     if hud.game.is_some() {
         let mut info = hud_info(game, None, fov, aspect);

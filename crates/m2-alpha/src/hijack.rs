@@ -22,20 +22,25 @@
 //! under a `DriverHatch` is inside, out of sight. From the data; the
 //! 200 m reach is the people's.
 //!
-//! Her clips, the crewman's and the vehicle's play together, all cut in
-//! the vehicle's space: she and the crewman (drawn as a rider is, his
-//! kind's skeleton) from its origin, lifted alike so her hand is on the
-//! pistol prop the vehicle's clip carries ([`GRIP_SPREAD`]); the
-//! vehicle's clip moves its own nodes (the hatch thrown open). The camera
-//! sits close at her chest, as the footage's does. The scripts' own calls
+//! Her clips, the crewman's and the vehicle's play together. The
+//! vehicle's clip moves its own nodes (the hatch thrown open). Her clips
+//! play from the vehicle's origin, lifted so that, holding the pistol at
+//! the hatch, she stands on the roof the hatch hinges in (the M1A2 0.9 m,
+//! the AMX30 2.1 m). The crewman (drawn as a rider is, on his kind's
+//! skeleton) plays his so that in his struggle loop his pelvis is at the
+//! hatch: half out of it. The camera sits close at her chest, from her
+//! side of the vehicle, as the footage's does. The scripts' own calls
 //! to the HUD (the buttons to press) go to the game's HUD
 //! ([`Hijacks::take_gui_calls`]).
 //!
-//! Provenance: which clips play is the tables' (from samples); that the
-//! three share the vehicle's space is inferred (the pistol prop meets her
-//! hand within centimetres across, round H20 and playtest 8); the lift
-//! from the pistol and the camera's distance are inferred from samples
-//! and the footage.
+//! Provenance: which clips play is the tables' (from samples; the
+//! crewman's by the driver's seat). Where they play is inferred from
+//! samples against the footage (the hijack video's M1A2: her on the
+//! turret roof, the crewman half out of the hatch): her clips sat 0.9 m
+//! (M1A2) to 2.1 m (AMX30) under that roof, his some 6 m behind the tank
+//! (his loop's pelvis then lands within 0.1 m of the hatch across and
+//! up, both tanks). How the game places them was not read from the 360
+//! code. The camera's distance and angle are from the footage.
 //!
 //! [`ParkedVehicle::crew`]: crate::scene::ParkedVehicle::crew
 //!
@@ -77,6 +82,12 @@ const CAMERA_DISTANCE: f32 = 2.8;
 const CAMERA_PITCH: f32 = -0.35;
 /// Her chest above her pelvis, metres.
 const CHEST: f32 = 0.35;
+/// The camera goes to her side of the vehicle once she is this far off
+/// its middle, metres; and looks back at her from this far ahead for
+/// each metre out to the side. From the footage's framing; invented
+/// numbers.
+const SIDE_SWITCH: f32 = 0.3;
+const CAMERA_AHEAD: f32 = 0.6;
 /// How far above the vehicle's top (later her feet) the camera looks,
 /// metres.
 const CAMERA_LIFT: f32 = 1.0;
@@ -205,8 +216,21 @@ struct Active {
     crew: String,
     /// The crewman drawn playing his hijack clips, once one binds.
     hijackee: Option<Hijackee>,
-    /// Her hand-to-pistol heights while she holds it (her clips after the
-    /// first whose gap strays under [`GRIP_SPREAD`]): what lifts her clips.
+    /// His clip while his model loads (hash, looped, seconds since).
+    pending: Option<(u32, bool, f32)>,
+    /// The height of the roof the hijack's hatch is set in (the vehicle's
+    /// space): where its clip's hatch hinges.
+    roof: Option<f32>,
+    /// Where that hatch hinges (the vehicle's space).
+    hatch: Option<Vec3>,
+    /// The crewman's struggle loop, and how far his clips are moved to
+    /// put him half out of the hatch there.
+    crew_loop: Option<u32>,
+    crew_offset: Option<Vec3>,
+    /// The lift worked out ahead from her pistol loop, once.
+    lift_known: Option<f32>,
+    /// The lifts that put her feet on the hatch's roof in her clips holding
+    /// the pistol (hand-to-pistol height straying under [`GRIP_SPREAD`]).
     grips: Vec<f32>,
     /// The vehicle's own nodes (local transforms and parents), for its
     /// hijack clip to move (the hatch thrown open), and when that clip
@@ -482,6 +506,11 @@ impl Hijacks {
         } else {
             drain(input);
             self.near = self.find(game);
+            // In reach, the crewman's model is asked for: it takes some
+            // seconds to come in, and he is drawn once it has.
+            if let Some(c) = &self.near {
+                let _ = crew_kind(game, &c.crew);
+            }
             if self.near.is_some() && input.take_pressed(Action::Use) {
                 self.begin(game);
             }
@@ -655,6 +684,10 @@ impl Hijacks {
         }
         if m.start_hijack(hero, crewman, vehicle, c.entrance.script) {
             eprintln!("hijack: {} started", c.template);
+            eprintln!(
+                "hijack: hull {:.2?}, turret box {:.2?}",
+                v.spec.hull, v.spec.turret_box
+            );
             game.input_locked = true;
             self.lag = 0.0;
             let pistol_parent = game
@@ -667,11 +700,29 @@ impl Hijacks {
                 .source
                 .as_mut()
                 .and_then(|source| vehicle_nodes(source, model));
+            // The crewman's struggle at the hatch, by the driver's seat.
+            let set = l.clips.sets.get(&c.template.to_ascii_lowercase()).copied();
+            let crew_loop = set.and_then(|s| {
+                l.clips
+                    .seat_clip(
+                        "InVehicle",
+                        "ActionHijackHijackeeBLoopA",
+                        s,
+                        m2_assets::name_hash("seat_driver"),
+                    )
+                    .map(|c| c.0)
+            });
             self.active = Some(Active {
                 pistol_parent,
                 crewman,
                 crew: c.crew.clone(),
                 hijackee: None,
+                pending: None,
+                roof: None,
+                hatch: None,
+                crew_loop,
+                crew_offset: None,
+                lift_known: None,
                 grips: Vec::new(),
                 vehicle_nodes,
                 vehicle_started: 0.0,
@@ -681,7 +732,7 @@ impl Hijacks {
                 shown: None,
                 vehicle: c.vehicle,
                 hero,
-                set: l.clips.sets.get(&c.template.to_ascii_lowercase()).copied(),
+                set,
                 actions: Vec::new(),
                 held: Vec::new(),
                 flicked: false,
@@ -862,6 +913,15 @@ impl Hijacks {
             p.character.position + Vec3::Y * (pelvis + CHEST),
             CAMERA_DISTANCE,
         ));
+        // From her side of the hull and a little ahead, as the footage's
+        // camera looks across her at the crewman (from the entrance's side
+        // the turret hid her: round H20, playtest 8).
+        if root.x.abs() > SIDE_SWITCH {
+            let out = at
+                .transform_vector3(Vec3::new(root.x.signum(), 0.0, CAMERA_AHEAD))
+                .normalize_or(Vec3::X);
+            p.yaw = (-out.x).atan2(-out.z);
+        }
         p.character.velocity = Vec3::ZERO;
     }
 
@@ -1147,6 +1207,14 @@ impl Hijacks {
         ))
     }
 
+    /// Whether the crewman of the hijack in reach is loaded to be drawn
+    /// (asking for him if not). For testing: a player walks up to it.
+    pub fn crew_in(&self, game: &mut Game) -> bool {
+        self.near
+            .as_ref()
+            .is_some_and(|c| crew_kind(game, &c.crew).is_some())
+    }
+
     /// Whether the scripts have loaded (or failed to).
     pub fn loading(&self) -> bool {
         matches!(self.state, State::Loading(_))
@@ -1199,6 +1267,40 @@ fn follow(
             && channel == "hijack"
         {
             a.vehicle_clip = load(game, m2_assets::name_hash(clip));
+            // The hatch is thrown open in one of the vehicle's sections
+            // (the scripts name them `..._section01_fb` to `06`): the
+            // first that turns it gives its roof.
+            if a.roof.is_none()
+                && let Some(n) = &a.vehicle_nodes
+            {
+                let lower = clip.to_ascii_lowercase();
+                let sections: Vec<String> = match lower.find("section") {
+                    Some(at) => (1..=6)
+                        .map(|k| format!("{}section{k:02}{}", &lower[..at], &lower[at + 9..]))
+                        .collect(),
+                    None => vec![lower.clone()],
+                };
+                a.hatch = sections.iter().find_map(|s| {
+                    let c = load(game, m2_assets::name_hash(s))?;
+                    hatch_at(n, &c)
+                });
+                a.roof = a.hatch.map(|h| h.y);
+                eprintln!("hijack: the hatch's roof {:.2?} m up", a.roof);
+            }
+            // From her first clip at the hatch on (the climb up), she stands
+            // on its roof as she does holding the pistol there.
+            if a.lift_known.is_none()
+                && let (Some(roof), Some(set)) = (a.roof, a.set)
+                && let Some((hash, _)) = clips.clip("InVehicle", "ActionHijackHijackerDLoopA", set)
+                && let Some(feet) = bind(game, hash).and_then(|i| her_feet(Some(i), game))
+            {
+                a.lift = Some(roof - feet);
+                a.lift_known = Some(roof - feet);
+                eprintln!(
+                    "hijack: her clips {:.2} m up (her feet {feet:.2} m in her pistol loop {hash:08x}, on the hatch's roof)",
+                    roof - feet
+                );
+            }
             a.vehicle_started = now;
             started = true;
         }
@@ -1230,7 +1332,18 @@ fn follow(
                 action,
             } => {
                 a.actions.retain(|x| x.0 != guid);
-                let clip = a.set.and_then(|set| clips.clip(&state, &action, set));
+                // The crewman's, as the driver's seat has them (the tables
+                // give the hijackee's actions by seat), else anyone's.
+                let driver = m2_assets::name_hash("seat_driver");
+                let clip = a.set.and_then(|set| {
+                    (guid == a.crewman)
+                        .then(|| clips.seat_clip(&state, &action, set, driver))
+                        .flatten()
+                        .or_else(|| clips.clip(&state, &action, set))
+                });
+                if guid == a.crewman && clip.is_none() {
+                    eprintln!("hijack: no clip for the crewman's {state} {action}");
+                }
                 if guid == a.hero
                     && let Some((hash, _)) = clip
                 {
@@ -1313,19 +1426,29 @@ fn follow(
         // Holding the pistol (her hand keeps one height from it all
         // clip long), her hand is where it is: that height lifts her
         // clips from then on.
-        if a.clip != a.first && spread < GRIP_SPREAD {
-            a.grips.push(gap);
+        // Holding the pistol at the hatch, she stands on the roof the
+        // hatch is set in (the footage: on the turret, the crewman half
+        // out of the hatch): her feet there lift her clips from then on.
+        if a.clip != a.first
+            && spread < GRIP_SPREAD
+            && let Some(roof) = a.roof
+            && let Some(feet) = her_feet(a.clip, game)
+        {
+            a.grips.push(roof - feet);
             let mut g = a.grips.clone();
             g.sort_by(f32::total_cmp);
             let lift = g[g.len() / 2];
             if a.lift != Some(lift) {
                 eprintln!(
-                    "hijack: her clips {lift:.2} m up (her hand on the pistol, {} clips)",
+                    "hijack: her clips {lift:.2} m up (her feet {feet:.2} m on the hatch's roof {roof:.2} m, {} clips)",
                     g.len()
                 );
             }
             a.lift = Some(lift);
         }
+    }
+    if started && let Some(g) = feet_over_hull(a, game) {
+        eprintln!("hijack: her feet {g:.2} m over the hull under them");
     }
     let (done, left): (Vec<_>, Vec<_>) = a.actions.iter().partition(|x| x.1 <= now);
     a.actions = left;
@@ -1412,16 +1535,35 @@ const GRIP_SPREAD: f32 = 0.25;
 
 /// The crewman's clip `hash` bound to his kind's skeleton and playing
 /// (looped, or once): he is drawn from now on, if his kind is in.
-fn hijackee(a: &mut Active, game: &mut Game, hash: u32, looping: bool) {
+/// The kind the crewman of template `template` is drawn as, asking for
+/// his model the first time (`None` till it is in). A template with no
+/// model of its own and no people's kind by name (the testing aid's
+/// `Mook`) is drawn as a plain VZ soldier (invented stand-in).
+fn crew_kind(game: &mut Game, template: &str) -> Option<usize> {
     let model = game
         .scene
         .world
         .as_ref()
-        .and_then(|w| w.index.template_db.get(&a.crew).and_then(|t| t.model));
-    let Some(kind) = game.scene.people.rider_kind(&a.crew, model) else {
-        eprintln!("hijack: the crewman ({}) isn't loaded: not drawn", a.crew);
+        .and_then(|w| w.index.template_db.get(template).and_then(|t| t.model));
+    let people = &mut game.scene.people;
+    people.rider_kind(template, model).or_else(|| {
+        model
+            .is_none()
+            .then(|| people.kind_for("VZ Soldier"))
+            .flatten()
+    })
+}
+
+fn hijackee(a: &mut Active, game: &mut Game, hash: u32, looping: bool) {
+    let Some(kind) = crew_kind(game, &a.crew) else {
+        // His model is still loading: he takes this clip up once it is in.
+        if a.pending.is_none() {
+            eprintln!("hijack: the crewman ({}) isn't loaded yet", a.crew);
+        }
+        a.pending = Some((hash, looping, 0.0));
         return;
     };
+    a.pending = None;
     let Some(clip) = load(game, hash) else {
         return;
     };
@@ -1451,6 +1593,18 @@ fn hijackee(a: &mut Active, game: &mut Game, hash: u32, looping: bool) {
         Some(h) if h.kind == kind => (h.shown, h.outfit),
         _ => (true, game.scene.people.dress_as(kind, &a.crew)),
     };
+    // Where his clip has him (the vehicle's space, unlifted), for the log.
+    let c = &rig.clips[0];
+    let mid = c.sample(&rig.skeleton, c.info.duration * 0.5);
+    let pelvis = rig
+        .skeleton
+        .pelvis()
+        .map(|i| rig.skeleton.model_matrices(&mid)[i].w_axis.truncate());
+    eprintln!(
+        "hijack: the crewman ({}) plays {hash:08x}, his pelvis mid-clip at {:.2?}",
+        game.scene.people.kinds[kind].role,
+        pelvis.map(|p| p.to_array())
+    );
     a.hijackee = Some(Hijackee {
         kind,
         outfit,
@@ -1463,8 +1617,57 @@ fn hijackee(a: &mut Active, game: &mut Game, hash: u32, looping: bool) {
 /// him: cut in the vehicle's space as hers are, from its origin, lifted
 /// as hers are.
 fn draw_hijackee(a: &mut Active, game: &mut Game, dt: f32) {
+    // His clip waiting on his model: taken up as far in as it has got.
+    if let Some((hash, looping, waited)) = a.pending {
+        a.pending = Some((hash, looping, waited + dt));
+        if crew_kind(game, &a.crew).is_some() {
+            hijackee(a, game, hash, looping);
+            if let Some(h) = &mut a.hijackee {
+                h.rig.animator.seek(waited + dt);
+                eprintln!(
+                    "hijack: the crewman is in, {:.1} s into his clip",
+                    waited + dt
+                );
+            }
+        }
+    }
     let Some(h) = &mut a.hijackee else { return };
     h.rig.advance(dt);
+    // His clips don't share hers' place in the vehicle (his pelvis plays
+    // some 6.5 m behind the tank, M1A2 and AMX30 alike): in his struggle
+    // loop his pelvis goes to the hatch, half out of it as the footage
+    // has him.
+    if a.crew_offset.is_none()
+        && let (Some(hatch), Some(hash)) = (a.hatch, a.crew_loop)
+        && let Some(clip) = load(game, hash)
+    {
+        let skeleton = &game.scene.people.kinds[h.kind].rig.skeleton;
+        let pelvis = m2_engine::BoundClip::bind(hash, clip.clone(), skeleton)
+            .or_else(|| m2_engine::BoundClip::bind_family(hash, clip, skeleton))
+            .and_then(|c| {
+                let i = skeleton.pelvis()?;
+                let mut at: Vec<Vec3> = (0..8)
+                    .map(|k| {
+                        let pose = c.sample(skeleton, c.info.duration * k as f32 / 7.0);
+                        skeleton.model_matrices(&pose)[i].w_axis.truncate()
+                    })
+                    .collect();
+                at.sort_by(|p, q| p.y.total_cmp(&q.y));
+                Some(at[at.len() / 2])
+            });
+        if let Some(p) = pelvis {
+            a.crew_offset = Some(hatch - p);
+            eprintln!(
+                "hijack: the crewman's clips moved {:.2?} (his loop's pelvis {:.2?} to the hatch {:.2?})",
+                (hatch - p).to_array(),
+                p.to_array(),
+                hatch.to_array()
+            );
+        }
+    }
+    let Some(offset) = a.crew_offset else {
+        return;
+    };
     if !h.shown {
         return;
     }
@@ -1489,11 +1692,7 @@ fn draw_hijackee(a: &mut Active, game: &mut Game, dt: f32) {
     let Some(root) = pose.0.get(h.rig.skeleton.root()).map(|l| l.translation) else {
         return;
     };
-    let off = Vec3::new(
-        root.x - c.info.pin.x,
-        a.lift.unwrap_or(0.0),
-        root.z - c.info.pin.y,
-    );
+    let off = Vec3::new(root.x - c.info.pin.x, 0.0, root.z - c.info.pin.y) + offset;
     scene.riders.push(Rider {
         vehicle: a.vehicle,
         seat: 0,
@@ -1578,6 +1777,19 @@ fn posed_under(nodes: &VehicleNodes, moved_locals: &[(usize, Mat4)]) -> Vec<(usi
 fn lift(a: &Active, game: &Game) -> Option<(f32, f32, f32)> {
     let (vehicle, parent) = (a.vehicle_clip.as_ref()?, a.pistol_parent?);
     let track = vehicle.track_nodes.iter().position(|&n| n == PISTOL)?;
+    // The pistol where the vehicle's clip has it, through every node
+    // above it that the clip moves too; else under its parent at rest.
+    let nodes = a.vehicle_nodes.as_ref();
+    let node = nodes.and_then(|n| n.names.iter().position(|&h| h == PISTOL));
+    let pistol_at = |t: f32| -> Option<Vec3> {
+        if let (Some(nodes), Some(i)) = (nodes, node)
+            && let Some(&(_, m)) = clip_nodes(nodes, vehicle, t).iter().find(|x| x.0 == i)
+        {
+            return Some(m.transform_point3(Vec3::ZERO));
+        }
+        let at = vehicle.sample(t).get(track)?.translation;
+        Some(parent.transform_point3(Vec3::new(at.x, at.y, at.z)))
+    };
     let (_, rig) = game.scene.player.as_ref()?.model.as_ref()?;
     let hers = rig.clips.get(a.clip?)?;
     let (hand, _) = crate::combat::hands(&rig.skeleton)?;
@@ -1589,8 +1801,14 @@ fn lift(a: &Active, game: &Game) -> Option<(f32, f32, f32)> {
         // vehicle ([`Hijacks::place`]).
         let pose = hers.sample(&rig.skeleton, t);
         let hand_at = rig.skeleton.model_matrices(&pose)[hand].w_axis.truncate();
-        let at = vehicle.sample(t).get(track)?.translation;
-        let pistol = parent.transform_point3(Vec3::new(at.x, at.y, at.z));
+        let pistol = pistol_at(t)?;
+        if (t - end * 0.5).abs() < STEP * 0.5 {
+            eprintln!(
+                "hijack: mid-clip hand {:.2?}, pistol {:.2?} (the vehicle's space)",
+                hand_at.to_array(),
+                pistol.to_array()
+            );
+        }
         ups.push(pistol.y - hand_at.y);
         across.push((pistol - hand_at).truncate_y().length());
         t += STEP;
@@ -1602,6 +1820,94 @@ fn lift(a: &Active, game: &Game) -> Option<(f32, f32, f32)> {
         ups.last()? - ups.first()?,
         *across.get(across.len() / 2)?,
     ))
+}
+
+/// Where (the vehicle's space, at rest) the node its hijack clip
+/// turns furthest: the hatch lid thrown open, hinged on the roof it is
+/// set in. The props the clip carries (the pistol, the grenade) are left
+/// out. None when the clip turns nothing.
+fn hatch_at(nodes: &VehicleNodes, clip: &Clip) -> Option<Vec3> {
+    let props = [PISTOL, m2_assets::name_hash("bone_grenade")];
+    let (first, last) = (clip.sample(0.0), clip.sample(clip.header.duration));
+    let quat = |r: m2_math::RawQuat| m2_math::glam::Quat::from_xyzw(r.x, r.y, r.z, r.w);
+    let (track, _) = clip
+        .track_nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| !props.contains(n))
+        .filter_map(|(k, _)| {
+            let (a, b) = (quat(first.get(k)?.rotation), quat(last.get(k)?.rotation));
+            Some((k, a.normalize().angle_between(b.normalize())))
+        })
+        .filter(|&(_, turn)| turn > 0.2)
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    let i = nodes
+        .names
+        .iter()
+        .position(|&n| n == clip.track_nodes[track])?;
+    let mut at = Some(i as u16);
+    let mut m = Mat4::IDENTITY;
+    while let Some(n) = at {
+        m = nodes.locals[usize::from(n)] * m;
+        at = nodes.parents[usize::from(n)];
+    }
+    Some(m.w_axis.truncate())
+}
+
+/// Her feet's height in her clip as it plays (the vehicle's space, not
+/// lifted): the lowest of her nodes, the median over the clip.
+fn her_feet(clip: Option<usize>, game: &Game) -> Option<f32> {
+    let (_, rig) = game.scene.player.as_ref()?.model.as_ref()?;
+    let hers = rig.clips.get(clip?)?;
+    let mut lows: Vec<f32> = (0..8)
+        .filter_map(|k| {
+            let pose = hers.sample(&rig.skeleton, hers.info.duration * k as f32 / 7.0);
+            rig.skeleton
+                .model_matrices(&pose)
+                .iter()
+                .map(|m| m.w_axis.y)
+                .min_by(f32::total_cmp)
+        })
+        .collect();
+    lows.sort_by(f32::total_cmp);
+    lows.get(lows.len() / 2).copied()
+}
+
+/// How far her lowest point (her feet, mostly) is above the vehicle
+/// under it, metres, at the middle of her clip as she is placed: the
+/// median of a few frames of it that are over the vehicle. For the log:
+/// standing on the hull it is about 0.
+fn feet_over_hull(a: &Active, game: &Game) -> Option<f32> {
+    let scene = &game.scene;
+    let world = scene.world.as_ref()?;
+    let id = scene.vehicles.get(a.vehicle)?.id?;
+    let at = world.physics.vehicle_transform(id)?;
+    let (_, rig) = scene.player.as_ref()?.model.as_ref()?;
+    let hers = rig.clips.get(a.clip?)?;
+    let lift = if a.clip == a.first {
+        0.0
+    } else {
+        a.lift.unwrap_or(0.0)
+    };
+    let mut gaps: Vec<f32> = (1..8)
+        .filter_map(|k| {
+            let pose = hers.sample(&rig.skeleton, hers.info.duration * k as f32 / 8.0);
+            let low = rig
+                .skeleton
+                .model_matrices(&pose)
+                .iter()
+                .map(|m| m.w_axis.truncate())
+                .min_by(|p, q| p.y.total_cmp(&q.y))?;
+            let foot = at.transform_point3(low + Vec3::Y * lift);
+            let (d, hit) =
+                world
+                    .physics
+                    .cast_ray_vehicle(foot + Vec3::Y * 5.0, -Vec3::Y, 10.0, None)?;
+            (hit == Some(id)).then_some(5.0 - d)
+        })
+        .collect();
+    gaps.sort_by(f32::total_cmp);
+    gaps.get(gaps.len() / 2).copied()
 }
 
 /// Hides the parts each newly seen vehicle's template starts in a state
