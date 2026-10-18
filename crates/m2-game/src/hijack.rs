@@ -207,6 +207,12 @@ pub struct HijackWorld {
 }
 
 impl HijackWorld {
+    /// `guid` starts keyed action `action` (`Human.DoAction`: the
+    /// verify's `VerifyCamera`), to end when the game says so.
+    pub fn start_action(&mut self, guid: u32, action: &str) {
+        self.actions.insert(guid, (action.to_owned(), false));
+    }
+
     /// The game finished `guid`'s action (its clip ended).
     pub fn action_finished(&mut self, guid: u32) {
         if let Some(a) = self.actions.get_mut(&guid) {

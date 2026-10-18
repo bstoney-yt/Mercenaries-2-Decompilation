@@ -211,6 +211,13 @@ pub enum Command {
     /// A locked or custom pursuit ends (`Pg.ClearPursuitLock`,
     /// `Pg.ClearCustomPursuit`).
     PursuitClear,
+    /// Character `guid` plays keyed action `action` (`Human.DoAction`).
+    DoAction {
+        guid: u32,
+        action: String,
+    },
+    /// Character `guid` puts down whom it carries (`Human.Drop`).
+    Drop(u32),
     /// Seat a character in a vehicle (seat as the scripts name it, `"d"`
     /// for the driver); `instant` skips the climb-in.
     EnterVehicle {
@@ -546,6 +553,12 @@ pub struct ScriptWorld {
     /// The player's latest takings of a context action, by object, with
     /// their game time ([`crate::events::World::context_presses`]).
     pub context_presses: Vec<(f64, u32)>,
+    /// Characters' human states (`Stance.Action`; `Upright.Idle` when
+    /// none is set), their changes for `HumanStateTransition` events, and
+    /// who carries whom (`Human.IsCarrying`) ([`crate::mission::Mission::set_human_state`]).
+    pub human_states: HashMap<u32, String>,
+    pub state_changes: Vec<crate::events::StateChange>,
+    pub carrying: HashMap<u32, u32>,
     /// The crews the layers' vehicles came into play with, by vehicle:
     /// (seat, rider template), as each entity's own `Rider` records say
     /// (the HQ interior's `HqInterior` seats Fiona, its PMC boss), else
@@ -896,6 +909,10 @@ impl World for ScriptWorld {
 
     fn context_presses(&self) -> &[(f64, u32)] {
         &self.context_presses
+    }
+
+    fn state_changes(&self) -> &[crate::events::StateChange] {
+        &self.state_changes
     }
 
     fn hijack_held_since(&self, button: u32) -> Option<f64> {
@@ -1582,6 +1599,30 @@ pub fn install(lua: &Lua, world: &Shared) -> mlua::Result<()> {
     // Weapons as objects: a loadout of templates, each weapon with its own
     // reserve of ammunition.
     let human = lib("Human")?;
+    // Human.DoAction(character, action): a keyed action of the human state
+    // table (`VerifyCamera`, the verify's photo; `Cower`), played once;
+    // `HumanActionComplete` fires as it ends.
+    add(&human, "DoAction", |w, _, a| {
+        if let (Some(guid), Some(Value::String(action))) = (id(a.first()), a.get(1)) {
+            let action = action.to_string_lossy();
+            w.hijack.start_action(guid, &action);
+            w.commands.push(Command::DoAction { guid, action });
+        }
+        values([])
+    })?;
+    add(&human, "IsCarrying", |w, _, a| {
+        let carrying = id(a.first()).is_some_and(|g| w.carrying.contains_key(&g));
+        values([Value::Boolean(carrying)])
+    })?;
+    // Human.Drop(character): puts down whom it carries.
+    add(&human, "Drop", |w, _, a| {
+        if let Some(guid) = id(a.first())
+            && w.carrying.contains_key(&guid)
+        {
+            w.commands.push(Command::Drop(guid));
+        }
+        values([])
+    })?;
     // Human.DisableWeapons(character) / EnableWeapons(character).
     add(&human, "DisableWeapons", |w, _, a| {
         if let Some(guid) = id(a.first()) {

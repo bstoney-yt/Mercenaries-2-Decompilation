@@ -105,10 +105,34 @@ pub trait World {
     fn context_presses(&self) -> &[(f64, u32)] {
         &[]
     }
+    /// Characters' state changes (`Stance.Action`, as the human state
+    /// table names them: `Upright.Idle` to `KnockedDown.Idle`), each with
+    /// its game time, for `HumanStateTransition` events.
+    fn state_changes(&self) -> &[StateChange] {
+        &[]
+    }
 }
 
+/// A character's state change: game time, character, from, to.
+pub type StateChange = (f64, u32, String, String);
+
+/// Whether a state (`KnockedDown.Idle`) matches a `HumanStateTransition`
+/// pattern: `*` any, `KnockedDown.*` any of that stance, else the same
+/// (case aside).
+pub fn state_matches(pattern: &str, state: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    match pattern.strip_suffix(".*") {
+        Some(stance) => state
+            .split('.')
+            .next()
+            .is_some_and(|s| s.eq_ignore_ascii_case(stance)),
+        None => pattern.eq_ignore_ascii_case(state),
+    }
+}
 /// The kinds the scripts use, by how often.
-pub const KINDS: [&str; 16] = [
+pub const KINDS: [&str; 17] = [
     "TimerRelative",
     "ObjectHibernation",
     "Boundary",
@@ -125,6 +149,7 @@ pub const KINDS: [&str; 16] = [
     "ObjectWinched",
     "ObjectIsVisible",
     "ObjectDelete",
+    "HumanStateTransition",
 ];
 
 /// Kinds the game delivers itself through `Event.__m2_fire` (besides
@@ -1088,6 +1113,27 @@ fn check(
                 }
             }
             no
+        }
+        // { character (or filter), from, to }: as one of them goes from a
+        // state matching `from` to one matching `to` ([`state_matches`]:
+        // the verify objective's `{ target, "*", "KnockedDown.Idle" }`),
+        // after the event was made. Passes the character.
+        "HumanStateTransition" => {
+            let (Some(from), Some(to)) = (text(&p.params, 2), text(&p.params, 3)) else {
+                return no;
+            };
+            let who = objects(&p.params, 1, world);
+            let hit = world.state_changes().iter().find(|(t, g, a, b)| {
+                *t >= p.last
+                    && (*t > p.last || !p.persistent)
+                    && who.contains(g)
+                    && state_matches(&from, a)
+                    && state_matches(&to, b)
+            });
+            match hit {
+                Some((_, g, _, _)) => Check::Fire(vec![id(*g)]),
+                None => no,
+            }
         }
         // { character }: when the action `Human.SetState` gave it has
         // played to its end.
